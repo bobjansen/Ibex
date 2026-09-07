@@ -506,6 +506,25 @@ auto like_kernel(const ir::CallExpr& call, const Table& input, std::size_t rows,
 // Semantics mirror the per-row eval exactly: Bool -> 0/1 for Int, non-integer
 // Float -> Int errors, null cells propagate untouched (their payload is never
 // read, so a garbage NaN in a null slot cannot fail the integrality check).
+// Broadcast a scalar cast result into a full column. A null (monostate) scalar
+// becomes an all-null column of the cast's target type -- `Int64(null)` is null,
+// not an error.
+auto broadcast_cast_result(const ScalarValue& value, bool to_int, std::size_t rows)
+    -> ComputedColumn {
+    if (is_null_scalar(value)) {
+        ValidityBitmap none(rows, false);
+        if (to_int) {
+            Column<std::int64_t> col;
+            col.resize(rows, 0);
+            return ComputedColumn{.column = ColumnValue{std::move(col)}, .validity = std::move(none)};
+        }
+        Column<double> col;
+        col.resize(rows, 0.0);
+        return ComputedColumn{.column = ColumnValue{std::move(col)}, .validity = std::move(none)};
+    }
+    return ComputedColumn{.column = broadcast_scalar_column(value, rows), .validity = std::nullopt};
+}
+
 auto numeric_cast_kernel(const ir::CallExpr& call, const Table& input, std::size_t rows,
                          const ColumnEvalCtx& ctx) -> std::expected<ComputedColumn, std::string> {
     if (call.args.size() != 1) {
@@ -527,9 +546,7 @@ auto numeric_cast_kernel(const ir::CallExpr& call, const Table& input, std::size
                     if (!value) {
                         return std::unexpected(value.error());
                     }
-                    return ComputedColumn{
-                        .column = broadcast_scalar_column(*scalar_from_expr(*value), rows),
-                        .validity = std::nullopt};
+                    return broadcast_cast_result(scalar_from_expr(*value), to_int, rows);
                 }
             }
             return std::unexpected(call.callee + "(): unknown column '" + ref->name + "'");
@@ -542,8 +559,7 @@ auto numeric_cast_kernel(const ir::CallExpr& call, const Table& input, std::size
         if (!value) {
             return std::unexpected(value.error());
         }
-        return ComputedColumn{.column = broadcast_scalar_column(*scalar_from_expr(*value), rows),
-                              .validity = std::nullopt};
+        return broadcast_cast_result(scalar_from_expr(*value), to_int, rows);
     }
 
     const ValidityBitmap* validity = entry->validity.has_value() ? &*entry->validity : nullptr;
@@ -2168,10 +2184,10 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
                 return value;
             }
             auto scalar = scalar_from_expr(value.value());
-            if (!scalar.has_value()) {
+            if (is_null_scalar(scalar)) {
                 return std::unexpected(call->callee + ": null argument in extern function call");
             }
-            arg_values.push_back(std::move(*scalar));
+            arg_values.push_back(std::move(scalar));
         }
         auto result = fn->func(arg_values);
         if (!result) {

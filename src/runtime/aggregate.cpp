@@ -2323,8 +2323,8 @@ auto eval_aggregate_scalar(const ir::Expr& expr, const Table& input, const Scala
                 if (std::holds_alternative<Null>(*lhs) || std::holds_alternative<Null>(*rhs)) {
                     return ExprValue{Null{}};
                 }
-                const ColumnValue lhs_col = broadcast_scalar_column(*scalar_from_expr(*lhs), 1);
-                const ColumnValue rhs_col = broadcast_scalar_column(*scalar_from_expr(*rhs), 1);
+                const ColumnValue lhs_col = broadcast_scalar_column(scalar_from_expr(*lhs), 1);
+                const ColumnValue rhs_col = broadcast_scalar_column(scalar_from_expr(*rhs), 1);
                 auto result = arith_vec(node.op, lhs_col, 0, rhs_col, 0, 1);
                 if (!result) {
                     return std::unexpected(result.error());
@@ -2405,7 +2405,7 @@ auto fold_aggregates_to_columns(ir::Expr& expr, const Table& group_input, Table&
                         working.add_column(name, default_column_for(*ty, working.rows()),
                                            ValidityBitmap(working.rows(), false));
                     } else {
-                        working.add_column(name, broadcast_scalar_column(*scalar_from_expr(*scalar),
+                        working.add_column(name, broadcast_scalar_column(scalar_from_expr(*scalar),
                                                                          working.rows()));
                     }
                     expr.node = ir::ColumnRef{.name = std::move(name)};
@@ -2541,7 +2541,7 @@ auto broadcast_aggregate_column(const Table& input, const ir::FieldSpec& field,
         return std::optional<BroadcastAggregateColumn>{std::move(result)};
     }
     BroadcastAggregateColumn result{
-        .column = broadcast_scalar_column(*scalar_from_expr(*scalar), input.rows()),
+        .column = broadcast_scalar_column(scalar_from_expr(*scalar), input.rows()),
         .validity = std::nullopt,
     };
     return std::optional<BroadcastAggregateColumn>{std::move(result)};

@@ -912,12 +912,16 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             bool args_ok = true;
             for (const auto& arg : ec.args()) {
                 auto val = eval_expr(arg, Table{}, 0, scalars, externs);
-                auto scalar = val.has_value() ? scalar_from_expr(val.value()) : std::nullopt;
-                if (!scalar.has_value()) {
+                if (!val.has_value()) {
                     args_ok = false;
                     break;
                 }
-                args.push_back(std::move(*scalar));
+                auto scalar = scalar_from_expr(val.value());
+                if (is_null_scalar(scalar)) {
+                    args_ok = false;
+                    break;
+                }
+                args.push_back(std::move(scalar));
             }
             if (args_ok) {
                 auto op = fn->chunked_table_func(args);

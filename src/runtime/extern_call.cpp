@@ -93,12 +93,14 @@ auto eval_extern_args(const std::vector<ir::Expr>& exprs, const ScalarRegistry* 
         if (!val.has_value()) {
             return std::unexpected(std::move(val.error()));
         }
-        // Externs take null-free ScalarValue arguments (see the null-arm plan).
+        // Externs take null-free ScalarValue arguments: a null is rejected here,
+        // in front of the call, rather than reaching extern code. Static typing
+        // catches most; this is the runtime backstop.
         auto scalar = scalar_from_expr(val.value());
-        if (!scalar.has_value()) {
+        if (is_null_scalar(scalar)) {
             return std::unexpected("null argument in extern function call");
         }
-        args.push_back(std::move(*scalar));
+        args.push_back(std::move(scalar));
     }
     return args;
 }

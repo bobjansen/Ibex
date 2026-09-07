@@ -1583,13 +1583,27 @@ auto eval_value_vec(const ir::Expr& expr, const PredicateInput& input,
                 if (scalars != nullptr) {
                     auto it = scalars->find(node.name);
                     if (it != scalars->end()) {
+                        // A null scalar broadcasts as an all-invalid column; a
+                        // comparison against it is null for every row, so the
+                        // predicate drops them all (SPEC section 3).
+                        if (is_null_scalar(it->second)) {
+                            Column<std::int64_t> col;
+                            col.resize(n, 0);
+                            ColResult r{ColumnValue{std::move(col)}};
+                            r.owned_validity = ValidityBitmap(n, false);
+                            return r;
+                        }
                         // Broadcast scalar into a full column.
                         ColumnValue cv = std::visit(
                             [n](const auto& v) -> ColumnValue {
                                 using U = std::decay_t<decltype(v)>;
-                                Column<U> col;
-                                col.resize(n, v);
-                                return ColumnValue{std::move(col)};
+                                if constexpr (std::is_same_v<U, std::monostate>) {
+                                    return ColumnValue{Column<std::int64_t>{}};  // unreachable
+                                } else {
+                                    Column<U> col;
+                                    col.resize(n, v);
+                                    return ColumnValue{std::move(col)};
+                                }
                             },
                             it->second);
                         return ColResult{std::move(cv)};

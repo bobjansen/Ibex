@@ -44,7 +44,19 @@ enum class ScalarKind : std::uint8_t {
 using ColumnValue =
     std::variant<Column<std::int64_t>, Column<double>, Column<std::string>, Column<Categorical>,
                  Column<Date>, Column<Timestamp>, Column<bool>>;
-using ScalarValue = std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>;
+// A scalar value, or null. `std::monostate` is the null alternative (a
+// default-constructed ScalarValue is null); it maps to the internal
+// ExprValue::Null across the row-eval boundary. Historically ScalarValue was
+// null-free; see plans/parse-args-and-nullable-scalars-plan.md Part 1 for why
+// that changed. Extern arguments remain null-free -- the type system rejects a
+// null before the call, it never reaches an extern.
+using ScalarValue =
+    std::variant<std::monostate, std::int64_t, double, bool, std::string, Date, Timestamp>;
+
+/// True when a ScalarValue holds the null alternative.
+[[nodiscard]] inline auto is_null_scalar(const ScalarValue& v) -> bool {
+    return std::holds_alternative<std::monostate>(v);
+}
 
 /// Copy the value-metadata of `src` onto a column derived from it.
 ///
@@ -889,7 +901,12 @@ class ExternRegistry;
     const ir::JoinExpect& expect = {}, ir::MatchSelection take = ir::MatchSelection::All)
     -> std::expected<Table, std::string>;
 
-[[nodiscard]] auto extract_scalar(const Table& table, const std::string& column)
+/// Extract the single cell of `column` from a one-row table. A null cell yields
+/// a null scalar (monostate). With `zero_rows_is_null`, an empty table also
+/// yields null (the one-argument `scalar(<table>)` form, SPEC 5.7); otherwise a
+/// row count other than 1 is an error.
+[[nodiscard]] auto extract_scalar(const Table& table, const std::string& column,
+                                  bool zero_rows_is_null = false)
     -> std::expected<ScalarValue, std::string>;
 
 /// Row-wise scalar builtins (abs, sqrt, the transcendentals, ceil/floor/trunc,

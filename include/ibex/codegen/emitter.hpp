@@ -24,7 +24,12 @@ namespace ibex::codegen {
 class Emitter {
    public:
     struct Config {
-        using ScalarValue = std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>;
+        // Must stay identical to ibex::runtime::ScalarValue and
+        // ibex::parser::ScalarValue. Leading std::monostate is the null
+        // alternative; codegen support for emitting null scalar bindings is a
+        // later slice (plans/parse-args-and-nullable-scalars-plan.md).
+        using ScalarValue = std::variant<std::monostate, std::int64_t, double, bool, std::string,
+                                         Date, Timestamp>;
 
         /// Header files to #include (from extern fn declarations).
         std::vector<std::string> extern_headers;

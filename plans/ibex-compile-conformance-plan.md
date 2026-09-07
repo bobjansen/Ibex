@@ -236,17 +236,36 @@ S2/S3; S2 plans `map` prefixes; one expression evaluator instead of two.
 
 ---
 
-## W2 — non-literal extern-call arguments (general)
+## W2 — non-literal extern-call arguments
 
-W1a's `emit_raw_expr` extension already makes the *emitter* half work in a
-`map` body. W2 finishes it for **top-level** `ExternCallNode` args so
-`read_parquet(^path)[filter …]` / `write_parquet(t, ^out)` compile and
-whole-script-plan: emit the arg as a C++ expression (or an `ibex::ops::eval_scalar`
-call), lift `src/codegen/emitter.cpp:1422/1469` and the whole-script
-`literal_args` guard (`src/repl/repl.cpp:5010`, `~5000`) to evaluate against the
-`ScalarRegistry`/`DeferredScalarBinding` set. The S2 half shares W1b's runtime
-evaluator. Coordinate with `plans/extern-series-arguments-plan.md` (`Series<T>`
-extern-arg ABI).
+### W2-S1 — **DONE** (2026-09-07, uncommitted)
+
+`emit_raw_expr` no longer hard-throws on a non-literal argument. The emitter
+already builds `_ibex_scalars` (compile-time + deferred bindings) and calls
+`set_scalars`, so the fix is small: emit `ibex::ops::scalar_arg(<emit_expr>)` —
+a proxy (`ScalarArg` in `ops.hpp`) whose templated `operator T()` converts the
+registry value to whatever scalar C++ type the call site needs (the extern
+signature / the `static_cast` under a row count is the type authority). Guarded
+so a **bare** reference emits a lookup only when the name is a known
+`scalar(...)` deferred `let` (`runtime_scalar_names_`); any other unbound bare
+name is still a compile-time error. Computed argument expressions (arithmetic /
+nested calls over bound scalars) always emit the lookup.
+
+Covers: `read_csv(scalar(manifest[...]))`, `Table(scalar(...))` row counts,
+`read_parquet(dir ++ name)`. Does **not** cover raw `^path` CLI args — those
+need `parse_args`/`libs/args` support in compiled mode (separate).
+
+Tests: `tests/parity/cases/construct_deferred_row_count.ibex`, `test_codegen`
+(bound → `scalar_arg`, unbound → throws), `tests/data/compile_scalar_arg.ibex`
++ `ibex-e2e.sh`.
+
+### W2-S2 — not started
+
+Lift the whole-script `literal_args` guard (`src/repl/repl.cpp:5010`) to
+resolve args against the materialized `ScalarRegistry` (keep a guard for the
+circular `let p = scalar(read_parquet(...)[...])` case). Perf only — those
+scripts already run correctly via the S3 fallback. Coordinate with
+`plans/extern-series-arguments-plan.md` (`Series<T>` extern-arg ABI).
 
 ---
 
@@ -324,8 +343,8 @@ has been chased one combo at a time — W5 is finishing that list. Lower priorit
    route, not native loop; see the W1a section above). `emit_raw_expr`-as-C++
    was *not* built, so W2/W4 do not inherit it.
 3. ~~**W3** (functions)~~ — **DONE**: S2 decline removed + `inline_table_udf`.
-4. **W2** (top-level non-literal extern args) — emitter half falls out of
-   W1a's `emit_raw_expr`; S2 half needs W1b.
+4. **W2** — S1 (emitter, `ibex::ops::scalar_arg`) **DONE**; S2 (whole-script
+   `literal_args`) not started, perf-only.
 5. **W1b** (runtime extern-expr evaluator) — only if S2 `map` planning or
    evaluator unification is wanted. Deprioritised by the reframe.
 6. **W4 / W5** — lower priority, independent.

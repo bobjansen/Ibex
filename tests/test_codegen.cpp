@@ -487,6 +487,29 @@ TEST_CASE("emitter: map node - row-wise fields", "[codegen]") {
     CHECK(contains(out, "ibex::ops::col_ref(\"label\")"));
 }
 
+TEST_CASE("emitter: non-literal row-count argument resolves at run time", "[codegen]") {
+    ir::Builder b;
+    // Table(n) where `n` is a `scalar(...)` deferred `let`: emitted as a
+    // run-time registry lookup rather than a hard error.
+    auto construct = b.construct_rows(ir::Expr{ir::ColumnRef{.name = "n"}});
+
+    codegen::Emitter::Config cfg;
+    cfg.deferred_scalar_bindings.push_back(
+        ir::DeferredScalarBinding{.name = "n",
+                                  .sources = {},
+                                  .value = ir::Expr{ir::Literal{std::int64_t{3}}}});
+    auto out = emit_to_string(*construct, cfg);
+    CHECK(contains(out, "ibex::ops::scalar_arg("));
+    CHECK(contains(out, "ibex::ops::col_ref(\"n\")"));
+    CHECK_FALSE(contains(out, "non-literal argument"));
+}
+
+TEST_CASE("emitter: a bare unbound name in an extern argument is still an error", "[codegen]") {
+    ir::Builder b;
+    auto construct = b.construct_rows(ir::Expr{ir::ColumnRef{.name = "mystery"}});
+    CHECK_THROWS(emit_to_string(*construct));
+}
+
 // --- Chained pipeline --------------------------------------------------------
 
 TEST_CASE("emitter: filter then project pipeline", "[codegen]") {

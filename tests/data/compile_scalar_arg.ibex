@@ -1,0 +1,9 @@
+extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+
+// A `scalar(...)` deferred `let` used as an extern-call argument (conformance
+// plan W2): the emitter resolves it from the scalar registry at run time via
+// `ibex::ops::scalar_arg`, rather than rejecting it as a non-literal argument.
+let manifest = Table { path = ["data/iris.csv"] };
+let src = scalar(manifest[select { path }]);
+
+read_csv(src)[head 3];

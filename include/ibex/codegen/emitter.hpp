@@ -75,6 +75,11 @@ class Emitter {
     /// extern-call argument position emits the literal value (extern calls in
     /// generated code take plain C++ arguments, not a scalar registry lookup).
     robin_hood::unordered_map<std::string, Config::ScalarValue> compile_time_scalars_;
+    /// Names of `scalar(...)` deferred `let` bindings. A bare reference to one in
+    /// an extern-call / row-count argument position emits a run-time scalar
+    /// registry lookup (`ibex::ops::scalar_arg`); a bare reference to any other
+    /// unbound name there is still a hard error.
+    robin_hood::unordered_set<std::string> runtime_scalar_names_;
 
     auto fresh_var() -> std::string;
 

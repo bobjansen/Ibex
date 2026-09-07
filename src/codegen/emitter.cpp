@@ -90,6 +90,10 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
     for (const auto& [name, value] : config.scalar_bindings) {
         compile_time_scalars_.emplace(name, value);
     }
+    runtime_scalar_names_.clear();
+    for (const auto& binding : config.deferred_scalar_bindings) {
+        runtime_scalar_names_.insert(binding.name);
+    }
 
     // Preamble
     if (!config.source_name.empty()) {
@@ -1433,11 +1437,18 @@ auto Emitter::emit_raw_expr(const ir::Expr& expr) -> std::string {
         [&](const auto& node) -> std::string {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, ir::ColumnRef>) {
-                // Only a compile-time scalar `let` is valid here; emit its value.
+                // A compile-time scalar `let` is emitted as its value. Anything
+                // else — a `scalar(...)` deferred `let`, a `let` bound to a
+                // computed expression, a `^` lexical binding — is resolved at
+                // run time from the scalar registry the generated `main` builds.
                 const auto it = compile_time_scalars_.find(node.name);
                 if (it == compile_time_scalars_.end()) {
-                    throw std::runtime_error("ibex_compile: non-literal argument in extern call: '" +
-                                             node.name + "'");
+                    if (!runtime_scalar_names_.contains(node.name)) {
+                        throw std::runtime_error(
+                            "ibex_compile: non-literal argument in extern call: '" + node.name +
+                            "'");
+                    }
+                    return "ibex::ops::scalar_arg(" + emit_expr(expr) + ")";
                 }
                 return std::visit(
                     [&](const auto& v) -> std::string {
@@ -1483,7 +1494,10 @@ auto Emitter::emit_raw_expr(const ir::Expr& expr) -> std::string {
                     },
                     node.value);
             }
-            throw std::runtime_error("ibex_compile: non-literal argument in extern call");
+            // A computed argument (arithmetic / a nested call over bound
+            // scalars): resolve it against the scalar registry at run time,
+            // the same way the interpreter evaluates the argument expression.
+            return "ibex::ops::scalar_arg(" + emit_expr(expr) + ")";
         },
         expr.node);
 }

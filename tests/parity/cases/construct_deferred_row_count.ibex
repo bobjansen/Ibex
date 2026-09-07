@@ -1,0 +1,9 @@
+// A non-literal argument in a value position the emitter treats like an extern
+// argument: `Table(n)`'s row count, where `n` is a runtime `scalar(...)` `let`
+// (conformance plan W2). `ibex_compile` used to throw "non-literal argument in
+// extern call"; it now emits `ibex::ops::scalar_arg(...)`, resolved from the
+// same scalar registry the interpreter reference uses.
+let src = Table { v = [5, 5, 5, 5, 5] };
+let n = scalar(src[select { c = count() }]);
+
+Table(n)[update { k = 7 }];

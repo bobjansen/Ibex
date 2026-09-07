@@ -3121,7 +3121,7 @@ TEST_CASE("aggregates over an all-null column reduce to null, not garbage",
             }
         }
     }
-    SECTION("extract_scalar refuses a null cell") {
+    SECTION("extract_scalar yields a null scalar for a null cell") {
         auto ir = require_ir("t[select { f = first(x) }, by g];");
         auto result = runtime::interpret(*ir, registry);
         REQUIRE(result.has_value());
@@ -3137,8 +3137,16 @@ TEST_CASE("aggregates over an all-null column reduce to null, not garbage",
         one_row.add_column("f", runtime::ColumnValue{std::move(f_col)},
                            runtime::ValidityBitmap(1, false));
         auto scalar = runtime::extract_scalar(one_row, "f");
-        REQUIRE_FALSE(scalar.has_value());
-        CHECK(scalar.error().find("null") != std::string::npos);
+        REQUIRE(scalar.has_value());
+        CHECK(runtime::is_null_scalar(*scalar));
+    }
+    SECTION("extract_scalar: empty table is null only for the one-argument form") {
+        runtime::Table empty;
+        empty.add_column("f", runtime::ColumnValue{Column<double>{}});
+        CHECK_FALSE(runtime::extract_scalar(empty, "f").has_value());
+        auto as_null = runtime::extract_scalar(empty, "f", /*zero_rows_is_null=*/true);
+        REQUIRE(as_null.has_value());
+        CHECK(runtime::is_null_scalar(*as_null));
     }
 }
 

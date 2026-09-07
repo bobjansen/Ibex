@@ -130,7 +130,12 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
             std::visit(
                 [&](const auto& v) {
                     using V = std::decay_t<decltype(v)>;
-                    if constexpr (std::is_same_v<V, std::int64_t>) {
+                    if constexpr (std::is_same_v<V, std::monostate>) {
+                        // Null scalar bindings are not yet emitted by codegen
+                        // (plans/parse-args-and-nullable-scalars-plan.md, later
+                        // slice); collect_scalar_bindings never produces one.
+                        out << "ibex::runtime::ScalarValue{std::monostate{}}";
+                    } else if constexpr (std::is_same_v<V, std::int64_t>) {
                         out << "std::int64_t{" << v << "}";
                     } else if constexpr (std::is_same_v<V, double>) {
                         out << format_double(v);

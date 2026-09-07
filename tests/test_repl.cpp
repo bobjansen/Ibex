@@ -207,6 +207,45 @@ TEST_CASE("REPL evaluates scalar math builtins at top level", "[repl][math]") {
     REQUIRE_FALSE(ibex::repl::execute_script("print(bogus(1.0));", registry));
 }
 
+TEST_CASE("REPL: scalar() of an empty one-column table is null, and propagates", "[repl][null]") {
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+
+    const auto setup = session.execute("let t = Table { x = [10, 20], y = [\"a\", \"b\"] };");
+    REQUIRE(setup.ok);
+
+    SECTION("bare null") {
+        const auto r = session.execute("scalar(t[filter x > 100, select { x }]);");
+        REQUIRE(r.ok);
+        REQUIRE(r.scalar.has_value());
+        CHECK(ibex::runtime::is_null_scalar(*r.scalar));
+    }
+    SECTION("coalesce recovers a default") {
+        const auto r = session.execute("coalesce(scalar(t[filter x > 100, select { x }]), 999);");
+        REQUIRE(r.ok);
+        REQUIRE(r.scalar.has_value());
+        REQUIRE(std::holds_alternative<std::int64_t>(*r.scalar));
+        CHECK(std::get<std::int64_t>(*r.scalar) == 999);
+    }
+    SECTION("cast of null is null, not an error") {
+        const auto r = session.execute("Int64(scalar(t[filter x > 100, select { x }]));");
+        REQUIRE(r.ok);
+        REQUIRE(r.scalar.has_value());
+        CHECK(ibex::runtime::is_null_scalar(*r.scalar));
+    }
+    SECTION("a present value still extracts") {
+        const auto r = session.execute("scalar(t[filter x == 10, select { x }]);");
+        REQUIRE(r.ok);
+        REQUIRE(r.scalar.has_value());
+        REQUIRE(std::holds_alternative<std::int64_t>(*r.scalar));
+        CHECK(std::get<std::int64_t>(*r.scalar) == 10);
+    }
+    SECTION("two-argument scalar() still requires exactly one row") {
+        const auto r = session.execute("scalar(t[filter x > 100], x);");
+        CHECK_FALSE(r.ok);
+    }
+}
+
 TEST_CASE("REPL aggregates reduce a series to a scalar", "[repl][series]") {
     ibex::runtime::ExternRegistry registry;
     REQUIRE(ibex::repl::execute_script("let s = [1, 5, 3]; print(max(s));", registry));

@@ -1080,7 +1080,9 @@ auto format_scalar(const runtime::ScalarValue& value) -> std::string {
     return std::visit(
         [](const auto& v) -> std::string {
             using T = std::decay_t<decltype(v)>;
-            if constexpr (std::is_same_v<T, Date>) {
+            if constexpr (std::is_same_v<T, std::monostate>) {
+                return "null";
+            } else if constexpr (std::is_same_v<T, Date>) {
                 return runtime::format_date(v);
             } else if constexpr (std::is_same_v<T, Timestamp>) {
                 return runtime::format_timestamp(v);
@@ -1972,6 +1974,10 @@ auto is_cast_callee(std::string_view callee) -> bool {
 /// Applies a scalar type cast. `callee` must be a cast name (checked by is_cast_callee).
 auto apply_scalar_cast(const runtime::ScalarValue& val, std::string_view callee)
     -> std::expected<runtime::ScalarValue, std::string> {
+    // Casting null yields null of the target type, as with every scalar function.
+    if (runtime::is_null_scalar(val)) {
+        return val;
+    }
     if (callee == "Date") {
         if (const auto* ts = std::get_if<Timestamp>(&val)) {
             return runtime::ScalarValue{timestamp_to_date(*ts)};
@@ -3230,12 +3236,8 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             return eval_model_scalar_accessor(*call, models);
         }
         if (call->callee == "scalar") {
-            if (call->args.size() != 2) {
-                return std::unexpected("scalar() expects (table, column)");
-            }
-            auto column_name = column_name_from_expr(*call->args[1]);
-            if (!column_name.has_value()) {
-                return std::unexpected("scalar() column must be identifier or string");
+            if (call->args.size() != 1 && call->args.size() != 2) {
+                return std::unexpected("scalar() expects (table) or (table, column)");
             }
             auto table =
                 eval_table_expr(*call->args[0], tables, lazy_tables, scalars, columns, models,
@@ -3243,7 +3245,24 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             if (!table) {
                 return std::unexpected(table.error());
             }
-            auto scalar = runtime::extract_scalar(table.value(), *column_name);
+            // One-argument form: the table must have exactly one column, and an
+            // empty result yields null (SPEC 5.7 / 12.2) rather than erroring.
+            std::string column_name;
+            const bool one_arg = call->args.size() == 1;
+            if (one_arg) {
+                if (table->columns.size() != 1) {
+                    return std::unexpected("scalar(<table>): table must have exactly one column");
+                }
+                column_name = table->columns.front().name;
+            } else {
+                auto named = column_name_from_expr(*call->args[1]);
+                if (!named.has_value()) {
+                    return std::unexpected("scalar() column must be identifier or string");
+                }
+                column_name = std::move(*named);
+            }
+            auto scalar = runtime::extract_scalar(table.value(), column_name,
+                                                  /*zero_rows_is_null=*/one_arg);
             if (!scalar) {
                 return std::unexpected(scalar.error());
             }
@@ -3406,16 +3425,20 @@ auto column_from_scalars(const std::vector<runtime::ScalarValue>& vals)
     return std::visit(
         [&](const auto& first) -> std::expected<runtime::ColumnValue, std::string> {
             using T = std::decay_t<decltype(first)>;
-            Column<T> col;
-            col.reserve(vals.size());
-            for (const auto& v : vals) {
-                const auto* p = std::get_if<T>(&v);
-                if (p == nullptr) {
-                    return std::unexpected("element-wise result has inconsistent types");
+            if constexpr (std::is_same_v<T, std::monostate>) {
+                return std::unexpected("element-wise result is null");
+            } else {
+                Column<T> col;
+                col.reserve(vals.size());
+                for (const auto& v : vals) {
+                    const auto* p = std::get_if<T>(&v);
+                    if (p == nullptr) {
+                        return std::unexpected("element-wise result has inconsistent types");
+                    }
+                    col.push_back(*p);
                 }
-                col.push_back(*p);
+                return runtime::ColumnValue{std::move(col)};
             }
-            return runtime::ColumnValue{std::move(col)};
         },
         vals.front());
 }

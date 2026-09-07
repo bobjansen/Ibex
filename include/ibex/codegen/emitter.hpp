@@ -28,8 +28,8 @@ class Emitter {
         // ibex::parser::ScalarValue. Leading std::monostate is the null
         // alternative; codegen support for emitting null scalar bindings is a
         // later slice (plans/parse-args-and-nullable-scalars-plan.md).
-        using ScalarValue = std::variant<std::monostate, std::int64_t, double, bool, std::string,
-                                         Date, Timestamp>;
+        using ScalarValue =
+            std::variant<std::monostate, std::int64_t, double, bool, std::string, Date, Timestamp>;
 
         /// Header files to #include (from extern fn declarations).
         std::vector<std::string> extern_headers;
@@ -53,6 +53,9 @@ class Emitter {
         /// Emit a callable Table-returning entry point instead of main().
         bool table_entry_point = false;
         std::string entry_point_name = "ibex_generated_execute";
+        /// The script calls `parse_args`: emit `main(int argc, char** argv)` and
+        /// forward the process argv to `IBEX_ARGS` before the query runs.
+        bool forward_cli_args = false;
     };
 
     /// Emit a complete C++ translation unit to `out`.

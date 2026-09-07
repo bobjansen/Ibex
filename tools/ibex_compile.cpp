@@ -111,6 +111,12 @@ int main(int argc, char* argv[]) {
         robin_hood::unordered_set<std::string> seen_headers;
         for (const auto& stmt : program->statements) {
             if (const auto* ext = std::get_if<ibex::parser::ExternDecl>(&stmt)) {
+                // `parse_args` reads the process argv (via IBEX_ARGS); the
+                // generated `main` must forward its own argv, the compiled
+                // equivalent of `ibex script.ibex -- <args>`.
+                if (ext->name == "parse_args") {
+                    config.forward_cli_args = true;
+                }
                 if (!ext->source_path.empty()) {
                     std::string header = ext->source_path;
                     if (!std::filesystem::path(header).has_extension()) {

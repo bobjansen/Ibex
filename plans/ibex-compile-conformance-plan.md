@@ -252,12 +252,27 @@ name is still a compile-time error. Computed argument expressions (arithmetic /
 nested calls over bound scalars) always emit the lookup.
 
 Covers: `read_csv(scalar(manifest[...]))`, `Table(scalar(...))` row counts,
-`read_parquet(dir ++ name)`. Does **not** cover raw `^path` CLI args — those
-need `parse_args`/`libs/args` support in compiled mode (separate).
+`read_parquet(dir ++ name)`.
 
 Tests: `tests/parity/cases/construct_deferred_row_count.ibex`, `test_codegen`
 (bound → `scalar_arg`, unbound → throws), `tests/data/compile_scalar_arg.ibex`
 + `ibex-e2e.sh`.
+
+### W2-S1b — `parse_args` in compiled mode — **DONE** (2026-09-07, uncommitted)
+
+`parse_args` reads the process argv from `IBEX_ARGS` (one entry per line); the
+`ibex` runner sets it from everything after `--`. For a compiled binary the
+natural UX is `./binary <args>` directly, so when the script declares a
+`parse_args` extern the emitter emits `main(int argc, char** argv)` and, as the
+first statement, `ibex::ops::forward_cli_args(argc, argv)` — joins argv[1..]
+with newlines into `IBEX_ARGS` (no-op when `argc <= 1`, so an inherited
+`IBEX_ARGS` still applies to an argument-less run). Zero plugin changes: the
+emitted `parse_args(spec, "")` call already falls through to the env-var path.
+`ibex_compile.cpp` sets `Config::forward_cli_args` when it sees the extern.
+
+Test: `tests/data/compile_parse_args.ibex` + `ibex-e2e.sh` (transpile, compile,
+run with and without argv, check row count + label). `test_codegen` for the
+`main` signature switch.
 
 ### W2-S2 — not started
 
@@ -343,8 +358,8 @@ has been chased one combo at a time — W5 is finishing that list. Lower priorit
    route, not native loop; see the W1a section above). `emit_raw_expr`-as-C++
    was *not* built, so W2/W4 do not inherit it.
 3. ~~**W3** (functions)~~ — **DONE**: S2 decline removed + `inline_table_udf`.
-4. **W2** — S1 (emitter, `ibex::ops::scalar_arg`) **DONE**; S2 (whole-script
-   `literal_args`) not started, perf-only.
+4. **W2** — S1 (`ibex::ops::scalar_arg`) + S1b (`parse_args` argv forwarding)
+   **DONE**; S2 (whole-script `literal_args`) not started, perf-only.
 5. **W1b** (runtime extern-expr evaluator) — only if S2 `map` planning or
    evaluator unification is wanted. Deprioritised by the reframe.
 6. **W4 / W5** — lower priority, independent.

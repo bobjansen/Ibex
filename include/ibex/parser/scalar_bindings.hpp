@@ -32,8 +32,8 @@ namespace ibex::parser {
 // Must stay identical to ibex::runtime::ScalarValue and
 // ibex::codegen::Emitter::Config::ScalarValue -- see the note there. The
 // leading std::monostate is the null alternative.
-using ScalarValue = std::variant<std::monostate, std::int64_t, double, bool, std::string, ibex::Date,
-                                 ibex::Timestamp>;
+using ScalarValue = std::variant<std::monostate, std::int64_t, double, bool, std::string,
+                                 ibex::Date, ibex::Timestamp>;
 
 [[nodiscard]] inline auto eval_scalar_expr(
     const Expr& expr, const robin_hood::unordered_map<std::string, ScalarValue>& env)
@@ -326,9 +326,8 @@ struct DeferredWrap {
             continue;
         }
 
-        if (auto deferred =
-                try_build_deferred_scalar_binding(let_stmt->name, *let_stmt->value, lower_ctx,
-                                                  deferred_counter);
+        if (auto deferred = try_build_deferred_scalar_binding(let_stmt->name, *let_stmt->value,
+                                                              lower_ctx, deferred_counter);
             deferred.has_value()) {
             if (!deferred->has_value()) {
                 return std::unexpected(deferred->error());

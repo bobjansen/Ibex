@@ -92,6 +92,13 @@ IBEX_LIBS=(
 TMPDIR_WORK="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR_WORK"' EXIT
 
+# Conformance gate (see cases/README.md): every `<name>.ibex` the interpreter
+# runs must also transpile+match on ibex_compile, OR carry a sibling
+# `<name>.unsupported` marker whose first line is a one-line reason. A marked
+# case is checked two ways instead — the interpreter must still accept it, and
+# ibex_compile must still reject it (a marker that has gone stale fails the
+# suite so it gets deleted). An unmarked case that does not transpile fails with
+# instructions.
 fail=0
 for case_file in "$CASES_DIR"/*.ibex; do
     name="$(basename "${case_file%.ibex}")"
@@ -100,7 +107,36 @@ for case_file in "$CASES_DIR"/*.ibex; do
     fi
     cpp_file="$TMPDIR_WORK/$name.cpp"
     bin_file="$TMPDIR_WORK/$name.bin"
-    "$IBEX_COMPILE" "$case_file" --table-entry-point -o "$cpp_file"
+    marker="$CASES_DIR/$name.unsupported"
+    compile_err="$TMPDIR_WORK/$name.compile.err"
+
+    if [[ -f "$marker" ]]; then
+        reason="$(head -n 1 "$marker")"
+        if ! "$IBEX_EVAL" "$case_file" >/dev/null 2>&1; then
+            echo "parity: $name is marked .unsupported but the interpreter rejects it" >&2
+            echo "    marker reason: $reason" >&2
+            echo "    a parity case must be valid Ibex the interpreter runs" >&2
+            fail=1
+            continue
+        fi
+        if "$IBEX_COMPILE" "$case_file" --table-entry-point -o "$cpp_file" >/dev/null 2>&1; then
+            echo "parity: $name.unsupported is STALE — ibex_compile now handles this case" >&2
+            echo "    delete tests/parity/cases/$name.unsupported and let the case run for real" >&2
+            fail=1
+            continue
+        fi
+        echo "parity skip: $name (unsupported: $reason)"
+        continue
+    fi
+
+    if ! "$IBEX_COMPILE" "$case_file" --table-entry-point -o "$cpp_file" 2>"$compile_err"; then
+        echo "parity: $name does not transpile —" >&2
+        sed 's/^/    /' "$compile_err" >&2
+        echo "    fix ibex_compile, or add tests/parity/cases/$name.unsupported" >&2
+        echo "    with a one-line reason (see cases/README.md)" >&2
+        fail=1
+        continue
+    fi
     "$CXX" "${EXTRA_CXXFLAGS[@]}" -std="$CXX_STD_FLAG" \
         "${IBEX_INCS[@]}" "$cpp_file" "$STRUCTURED_RUNNER" "${IBEX_LIBS[@]}" "${EXTRA_LDFLAGS[@]}" -o "$bin_file"
     if ! "$bin_file" "$case_file"; then
@@ -108,6 +144,15 @@ for case_file in "$CASES_DIR"/*.ibex; do
         fail=1
     else
         echo "parity ok: $name"
+    fi
+done
+
+# Orphan markers (no matching case) are almost always a rename left half-done.
+for marker in "$CASES_DIR"/*.unsupported; do
+    [[ -e "$marker" ]] || break
+    if [[ ! -f "${marker%.unsupported}.ibex" ]]; then
+        echo "parity: $(basename "$marker") has no matching .ibex case" >&2
+        fail=1
     fi
 done
 

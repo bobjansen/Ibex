@@ -12,7 +12,10 @@
 #include <cstdint>
 #include <iostream>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
+#include <variant>
 #include <vector>
 
 namespace ibex::ops {
@@ -40,6 +43,54 @@ void set_scalars(const runtime::ScalarRegistry* scalars);
 /// (set via set_scalars). Used by deferred scalar `let`s for the residual
 /// expression (a cast / coalesce over the extracted value).
 [[nodiscard]] auto eval_scalar(const ir::Expr& expr) -> runtime::ScalarValue;
+
+/// A non-literal extern-call / row-count argument, resolved at run time from the
+/// scalar registry (a `scalar(...)` deferred `let`, or a `let` bound to a
+/// computed expression). Implicitly converts to whatever scalar C++ type the
+/// call site needs — the extern signature (or the `static_cast` a row count
+/// sits under) is the type authority, exactly as it is for a literal argument.
+struct ScalarArg {
+    runtime::ScalarValue value;
+
+    template <class T>
+    operator T() const {  // NOLINT(google-explicit-constructor): mirrors a literal argument
+        // `std::get_if<T>` is only well-formed for a variant alternative, so
+        // dispatch on the target C++ type rather than probing the variant with
+        // an arbitrary `T` (e.g. a call site wanting `std::size_t`).
+        if constexpr (std::is_same_v<T, std::string>) {
+            if (const auto* s = std::get_if<std::string>(&value)) {
+                return *s;
+            }
+        } else if constexpr (std::is_same_v<T, bool>) {
+            if (const auto* b = std::get_if<bool>(&value)) {
+                return *b;
+            }
+        } else if constexpr (std::is_same_v<T, Date>) {
+            if (const auto* d = std::get_if<Date>(&value)) {
+                return *d;
+            }
+        } else if constexpr (std::is_same_v<T, Timestamp>) {
+            if (const auto* t = std::get_if<Timestamp>(&value)) {
+                return *t;
+            }
+        } else if constexpr (std::is_arithmetic_v<T>) {
+            if (const auto* i = std::get_if<std::int64_t>(&value)) {
+                return static_cast<T>(*i);
+            }
+            if (const auto* d = std::get_if<double>(&value)) {
+                return static_cast<T>(*d);
+            }
+            if (const auto* b = std::get_if<bool>(&value)) {
+                return static_cast<T>(*b);
+            }
+        }
+        throw std::runtime_error("extern scalar argument has the wrong type");
+    }
+};
+
+/// Evaluate `expr` against the scalar registry set by `set_scalars` and wrap the
+/// result so the generated call site can convert it to the parameter's type.
+[[nodiscard]] auto scalar_arg(const ir::Expr& expr) -> ScalarArg;
 
 // ─── Core table operations ────────────────────────────────────────────────────
 //  These are the functions emitted by ibex_compile into the generated C++ file.

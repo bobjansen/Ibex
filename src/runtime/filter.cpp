@@ -2164,7 +2164,7 @@ auto compute_mask(const ir::Expr& expr, const PredicateInput& input, const Scala
                     uint8_t* out = m.value.data();
                     constexpr std::size_t kBits = 64;
                     if (!bm->is_external() && rows.begin % kBits == 0) {
-                        const std::uint64_t* words = bm->words_data() + rows.begin / kBits;
+                        const std::uint64_t* words = bm->words_data() + (rows.begin / kBits);
                         const std::uint64_t flip = want_null ? ~std::uint64_t{0} : 0;
                         for (std::size_t base = 0; base < n; base += kBits) {
                             const std::uint64_t w = words[base / kBits] ^ flip;

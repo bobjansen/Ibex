@@ -169,14 +169,16 @@ namespace detail {
     if (const auto lparen = head.find('('); lparen != std::string::npos) {
         const auto rparen = head.find(')', lparen);
         if (rparen == std::string::npos) {
-            throw std::runtime_error("parse_args: unmatched '(' in spec line -> " + std::string(line));
+            throw std::runtime_error("parse_args: unmatched '(' in spec line -> " +
+                                     std::string(line));
         }
         aliases = head.substr(lparen + 1, rparen - lparen - 1);
         head = trim(head.substr(0, lparen));
     }
     spec.name = trim(head);
     if (spec.name.empty()) {
-        throw std::runtime_error("parse_args: spec line has no option name -> " + std::string(line));
+        throw std::runtime_error("parse_args: spec line has no option name -> " +
+                                 std::string(line));
     }
 
     // Default value: everything after the first '='.
@@ -235,7 +237,8 @@ namespace detail {
         next = 1;
     }
     if (next < tokens.size()) {
-        throw std::runtime_error("parse_args: trailing tokens in spec line -> " + std::string(line));
+        throw std::runtime_error("parse_args: trailing tokens in spec line -> " +
+                                 std::string(line));
     }
 
     // Spellings (for non-positional options).
@@ -245,7 +248,7 @@ namespace detail {
             spec.spellings.push_back("--" + dashed);
         }
         for (auto& alias : split_ws(aliases)) {
-            while (!alias.empty() && (alias.back() == ',' )) {
+            while (!alias.empty() && (alias.back() == ',')) {
                 alias.pop_back();
             }
             std::string a;
@@ -377,7 +380,7 @@ inline void validate_value(const OptionSpec& spec, const std::string& value) {
     // Environment values keep embedded spaces in a single argument only when
     // separated by newlines; fall back to whitespace splitting otherwise.
     std::string text(raw);
-    if (text.find('\n') != std::string::npos) {
+    if (text.contains('\n')) {
         std::vector<std::string> out;
         std::string line;
         std::istringstream stream(text);
@@ -422,8 +425,8 @@ inline void validate_value(const OptionSpec& spec, const std::string& value) {
 
     const auto take_positional = [&](const std::string& value) {
         if (positionals.empty()) {
-            rows.push_back(ArgRow{.kind = "positional", .name = "", .index = bare_ordinal++,
-                                  .value = value});
+            rows.push_back(
+                ArgRow{.kind = "positional", .name = "", .index = bare_ordinal++, .value = value});
             return;
         }
         if (pos_idx >= positionals.size()) {
@@ -482,7 +485,9 @@ inline void validate_value(const OptionSpec& spec, const std::string& value) {
                 }
                 value = *inline_value;
             }
-            rows.push_back(ArgRow{.kind = "flag", .name = spec->name, .index = occ[spec->name]++,
+            rows.push_back(ArgRow{.kind = "flag",
+                                  .name = spec->name,
+                                  .index = occ[spec->name]++,
                                   .value = std::move(value)});
             continue;
         }
@@ -499,15 +504,16 @@ inline void validate_value(const OptionSpec& spec, const std::string& value) {
         validate_value(*spec, value);
         const std::int64_t index = occ[spec->name]++;
         if (index > 0 && spec->arity == ArgArity::Single) {
-            throw std::runtime_error("parse_args: option --" + spec->name + " given more than once");
+            throw std::runtime_error("parse_args: option --" + spec->name +
+                                     " given more than once");
         }
-        rows.push_back(ArgRow{.kind = "option", .name = spec->name, .index = index,
-                              .value = std::move(value)});
+        rows.push_back(ArgRow{
+            .kind = "option", .name = spec->name, .index = index, .value = std::move(value)});
     }
 
     // Defaults, flag fallbacks, and required checks.
     for (auto& spec : specs) {
-        const bool seen = occ.find(spec.name) != occ.end() && occ[spec.name] > 0;
+        const bool seen = occ.contains(spec.name) && occ[spec.name] > 0;
         if (spec.is_flag()) {
             if (!seen) {
                 std::string value = spec.default_value.value_or("false");
@@ -515,8 +521,8 @@ inline void validate_value(const OptionSpec& spec, const std::string& value) {
                     throw std::runtime_error("parse_args: flag --" + spec.name +
                                              " default must be true/false");
                 }
-                rows.push_back(
-                    ArgRow{.kind = "flag", .name = spec.name, .index = 0, .value = std::move(value)});
+                rows.push_back(ArgRow{
+                    .kind = "flag", .name = spec.name, .index = 0, .value = std::move(value)});
             }
             continue;
         }
@@ -526,7 +532,9 @@ inline void validate_value(const OptionSpec& spec, const std::string& value) {
         if (spec.default_value.has_value()) {
             validate_value(spec, *spec.default_value);
             rows.push_back(ArgRow{.kind = spec.is_positional() ? "positional" : "option",
-                                  .name = spec.name, .index = 0, .value = *spec.default_value});
+                                  .name = spec.name,
+                                  .index = 0,
+                                  .value = *spec.default_value});
             continue;
         }
         if (spec.optional) {
@@ -539,8 +547,9 @@ inline void validate_value(const OptionSpec& spec, const std::string& value) {
             continue;  // `positional*`
         }
         throw std::runtime_error(
-            spec.is_positional() ? ("parse_args: missing required positional argument: " + spec.name)
-                                 : ("parse_args: missing required option: --" + spec.name));
+            spec.is_positional()
+                ? ("parse_args: missing required positional argument: " + spec.name)
+                : ("parse_args: missing required option: --" + spec.name));
     }
 
     return rows;

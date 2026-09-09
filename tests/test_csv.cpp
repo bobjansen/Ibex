@@ -382,9 +382,10 @@ TEST_CASE(
     // dbgen emits a trailing '|' on every row; the last field is therefore empty.
     write_csv(path, "1|17|1996-03-13|\n2|36|1996-04-12|\n3|8|1996-01-29|\n");
 
-    ChunkedCsvSourceOperator op(
+    ibex::csv::detail::ChunkedCsvSourceOperator op(
         path.string(), {"id", "qty", "shipdate", "trailing"},
-        {CsvColumnKind::Int, CsvColumnKind::Int, CsvColumnKind::Date, CsvColumnKind::String}, '|',
+        {ibex::csv::detail::CsvColumnKind::Int, ibex::csv::detail::CsvColumnKind::Int,
+         ibex::csv::detail::CsvColumnKind::Date, ibex::csv::detail::CsvColumnKind::String}, '|',
         /*rows_per_chunk=*/64);
 
     auto first = op.next();

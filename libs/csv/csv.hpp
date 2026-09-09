@@ -79,7 +79,7 @@
 #define IBEX_CSV_HAVE_MMAP 0
 #endif
 
-namespace {
+namespace ibex::csv::detail {
 
 enum class CsvColumnKind : std::uint8_t {
     Infer,
@@ -635,9 +635,9 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
     std::vector<std::shared_ptr<ibex::Column<ibex::Categorical>::index_map>> shared_indices_;
 };
 
-}  // namespace
+}  // namespace ibex::csv::detail
 
-namespace {
+namespace ibex::csv::detail {
 
 inline auto is_https_uri(std::string_view path) -> bool {
     return path.starts_with("https://") || path.starts_with("http://");
@@ -807,8 +807,6 @@ inline auto resolve_csv_path(std::string_view path) -> CsvLocalPath {
     out.path.assign(path);
     return out;
 }
-
-}  // namespace
 
 inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& options)
     -> ibex::runtime::Table {
@@ -1338,39 +1336,42 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
     return table;
 }
 
+}  // namespace ibex::csv::detail
+
 inline auto read_csv(std::string_view path) -> ibex::runtime::Table {
-    return read_csv_with_options(path, CsvReadOptions{});
+    return ibex::csv::detail::read_csv_with_options(path, ibex::csv::detail::CsvReadOptions{});
 }
 
 inline auto read_csv(std::string_view path, std::string_view null_spec) -> ibex::runtime::Table {
-    return read_csv_with_options(path, csv_parse_null_spec(null_spec));
+    return ibex::csv::detail::read_csv_with_options(
+        path, ibex::csv::detail::csv_parse_null_spec(null_spec));
 }
 
 inline auto read_csv(std::string_view path, std::string_view null_spec, std::string_view delimiter)
     -> ibex::runtime::Table {
-    auto options = csv_parse_null_spec(null_spec);
-    options.delimiter = csv_parse_delimiter(delimiter);
-    return read_csv_with_options(path, options);
+    auto options = ibex::csv::detail::csv_parse_null_spec(null_spec);
+    options.delimiter = ibex::csv::detail::csv_parse_delimiter(delimiter);
+    return ibex::csv::detail::read_csv_with_options(path, options);
 }
 
 inline auto read_csv(std::string_view path, std::string_view null_spec, std::string_view delimiter,
                      bool has_header) -> ibex::runtime::Table {
-    auto options = csv_parse_null_spec(null_spec);
-    options.delimiter = csv_parse_delimiter(delimiter);
+    auto options = ibex::csv::detail::csv_parse_null_spec(null_spec);
+    options.delimiter = ibex::csv::detail::csv_parse_delimiter(delimiter);
     options.has_header = has_header;
-    return read_csv_with_options(path, options);
+    return ibex::csv::detail::read_csv_with_options(path, options);
 }
 
 inline auto read_csv(std::string_view path, std::string_view null_spec, std::string_view delimiter,
                      bool has_header, std::string_view schema) -> ibex::runtime::Table {
-    auto options = csv_parse_null_spec(null_spec);
-    options.delimiter = csv_parse_delimiter(delimiter);
+    auto options = ibex::csv::detail::csv_parse_null_spec(null_spec);
+    options.delimiter = ibex::csv::detail::csv_parse_delimiter(delimiter);
     options.has_header = has_header;
-    options.schema = csv_parse_schema(schema);
-    return read_csv_with_options(path, options);
+    options.schema = ibex::csv::detail::csv_parse_schema(schema);
+    return ibex::csv::detail::read_csv_with_options(path, options);
 }
 
-namespace {
+namespace ibex::csv::detail {
 
 /// Write a single CSV field, quoting it when necessary (RFC 4180).
 inline void csv_write_field(std::ostream& out, std::string_view value) {
@@ -1426,7 +1427,7 @@ inline void csv_write_cell(std::ostream& out, const ibex::runtime::ColumnEntry& 
         *entry.column);
 }
 
-}  // namespace
+}  // namespace ibex::csv::detail
 
 /// Write `table` to a CSV file at `path`.
 ///
@@ -1454,7 +1455,7 @@ inline auto write_csv(const ibex::runtime::Table& table, std::string_view path) 
         if (c > 0) {
             ofs.put(',');
         }
-        csv_write_field(ofs, cols[c].name);
+        ibex::csv::detail::csv_write_field(ofs, cols[c].name);
     }
     ofs.put('\n');
 
@@ -1464,7 +1465,7 @@ inline auto write_csv(const ibex::runtime::Table& table, std::string_view path) 
             if (c > 0) {
                 ofs.put(',');
             }
-            csv_write_cell(ofs, cols[c], r);
+            ibex::csv::detail::csv_write_cell(ofs, cols[c], r);
         }
         ofs.put('\n');
     }

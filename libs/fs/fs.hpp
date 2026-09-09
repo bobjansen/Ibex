@@ -131,7 +131,7 @@ struct Entry {
 }  // namespace detail
 
 [[nodiscard]] inline auto list_files(const std::string& dir, const std::string& pattern,
-                                    bool recursive) -> ibex::runtime::Table {
+                                     bool recursive) -> ibex::runtime::Table {
     namespace stdfs = std::filesystem;
     std::error_code ec;
     if (!stdfs::exists(dir, ec) || ec) {
@@ -160,9 +160,8 @@ struct Entry {
             keep(*it);
         }
     }
-    std::ranges::sort(entries, [](const detail::Entry& a, const detail::Entry& b) {
-        return a.path < b.path;
-    });
+    std::ranges::sort(
+        entries, [](const detail::Entry& a, const detail::Entry& b) { return a.path < b.path; });
 
     ibex::Column<std::string> path;
     ibex::Column<std::string> name;

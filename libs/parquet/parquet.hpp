@@ -3560,8 +3560,8 @@ inline auto string_chunk_budget() -> std::size_t {
 inline auto single_chunk(std::shared_ptr<arrow::Array> arr)
     -> std::shared_ptr<arrow::ChunkedArray> {
     auto type = arr->type();
-    return std::make_shared<arrow::ChunkedArray>(
-        arrow::ArrayVector{std::move(arr)}, std::move(type));
+    return std::make_shared<arrow::ChunkedArray>(arrow::ArrayVector{std::move(arr)},
+                                                 std::move(type));
 }
 
 /// Build a chunked UTF8 array from `n` values, splitting chunks so no single
@@ -3663,8 +3663,7 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                 // string_view from the dictionary
                 return build_string_chunks(
                     n, [&](std::size_t i) { return col[i]; },
-                    [&](std::size_t i) { return ibex::runtime::is_null(entry, i); },
-                    "categorical");
+                    [&](std::size_t i) { return ibex::runtime::is_null(entry, i); }, "categorical");
             } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Date>>) {
                 arrow::Date32Builder builder;
                 auto st = builder.Reserve(static_cast<int64_t>(n));
@@ -3788,8 +3787,7 @@ inline auto write_parquet(const ibex::runtime::Table& table, std::string_view pa
         arrays.push_back(build_arrow_array(entry));
     }
 
-    auto arrow_table = arrow::Table::Make(schema, arrays,
-                                          static_cast<int64_t>(table.rows()));
+    auto arrow_table = arrow::Table::Make(schema, arrays, static_cast<int64_t>(table.rows()));
 
     // Open output file, creating the parent directory if it does not exist yet
     // (so `csv_dir_to_parquet` can write into a fresh output directory).

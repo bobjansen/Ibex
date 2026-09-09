@@ -139,7 +139,7 @@ auto gen_ticks(const runtime::RngBridge& rng, std::int64_t n, const std::string&
         ts_col.push_back(Timestamp{static_cast<std::int64_t>(ts_ms * 1'000'000.0)});
         const auto sym = static_cast<std::size_t>(symbol_idx[i]);
         double price = symbol_price[sym] + price_steps[i] +
-                       kReversion * (symbol_base[sym] - symbol_price[sym]);
+                       (kReversion * (symbol_base[sym] - symbol_price[sym]));
         price = std::max(price, 0.01);
         symbol_price[sym] = price;
         price_col.push_back(price);

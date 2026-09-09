@@ -15,6 +15,8 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/operator.hpp>
 
+namespace csv_detail = ibex::csv::detail;
+
 namespace {
 
 /// Chunk size for the streaming csv reader. 65536 rows keeps a typical
@@ -31,6 +33,7 @@ auto try_make_chunked_csv_source(const ibex::runtime::ExternArgs& args)
     if (args.size() != 5) {
         return std::nullopt;
     }
+    // NOLINTNEXTLINE(readability-container-data-pointer) // Consistency
     const auto* path = std::get_if<std::string>(&args[0]);
     const auto* null_spec = std::get_if<std::string>(&args[1]);
     const auto* delimiter = std::get_if<std::string>(&args[2]);
@@ -45,31 +48,31 @@ auto try_make_chunked_csv_source(const ibex::runtime::ExternArgs& args)
     }
     char delim{};
     try {
-        delim = csv_parse_delimiter(*delimiter);
+        delim = csv_detail::csv_parse_delimiter(*delimiter);
     } catch (const std::exception&) {
         return std::nullopt;
     }
-    CsvSchemaHint hint;
+    csv_detail::CsvSchemaHint hint;
     try {
-        hint = csv_parse_schema(*schema);
+        hint = csv_detail::csv_parse_schema(*schema);
     } catch (const std::exception& e) {
         return std::expected<ibex::runtime::OperatorPtr, std::string>{
             std::unexpected(std::string(e.what()))};
     }
     std::vector<std::string> col_names;
-    std::vector<CsvColumnKind> col_kinds;
+    std::vector<csv_detail::CsvColumnKind> col_kinds;
     col_names.reserve(hint.entries.size());
     col_kinds.reserve(hint.entries.size());
     for (std::size_t i = 0; i < hint.entries.size(); ++i) {
         const auto& entry = hint.entries[i];
-        if (entry.kind == CsvColumnKind::Infer) {
+        if (entry.kind == csv_detail::CsvColumnKind::Infer) {
             return std::nullopt;
         }
         col_names.push_back(entry.name.value_or("col" + std::to_string(i + 1)));
         col_kinds.push_back(entry.kind);
     }
     try {
-        auto op = std::make_unique<ChunkedCsvSourceOperator>(
+        auto op = std::make_unique<csv_detail::ChunkedCsvSourceOperator>(
             *path, std::move(col_names), std::move(col_kinds), delim, kChunkedCsvRowsPerChunk);
         return std::expected<ibex::runtime::OperatorPtr, std::string>{std::move(op)};
     } catch (const std::exception& e) {
@@ -85,10 +88,10 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
         "read_csv",
         [](const ibex::runtime::ExternArgs& args)
             -> std::expected<ibex::runtime::ExternValue, std::string> {
-            if (args.size() < 1 || args.size() > 5) {
+            if (args.empty() || args.size() > 5) {
                 return std::unexpected("read_csv() expects 1 to 5 arguments");
             }
-            const auto* path = std::get_if<std::string>(&args[0]);
+            const auto* path = std::get_if<std::string>(args.data());
             if (path == nullptr) {
                 return std::unexpected("read_csv() expects a string path");
             }
@@ -190,7 +193,7 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
                 return std::unexpected(
                     "write_csv(df, path) expects exactly 1 scalar argument (path)");
             }
-            const auto* path = std::get_if<std::string>(&args[0]);
+            const auto* path = std::get_if<std::string>(args.data());
             if (path == nullptr) {
                 return std::unexpected("write_csv(df, path) expects a string path");
             }

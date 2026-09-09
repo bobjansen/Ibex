@@ -162,6 +162,8 @@ thread_local std::uint64_t t_pool_park_ns = 0;
             return "filter_tail";
         case TopK:
             return "topk";
+        case Map:
+            return "map";
     }
     return "unknown";
 }

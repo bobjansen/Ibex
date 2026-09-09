@@ -23,7 +23,7 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
                 return std::unexpected(
                     "list_files(dir[, pattern[, recursive]]) expects 1 to 3 arguments");
             }
-            const auto* dir = std::get_if<std::string>(&args[0]);
+            const auto* dir = std::get_if<std::string>(args.data());
             if (dir == nullptr) {
                 return std::unexpected("list_files: dir must be a string");
             }

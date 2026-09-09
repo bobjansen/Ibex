@@ -96,9 +96,7 @@ inline auto sha1(const std::uint8_t* data, std::size_t len) -> Sha1Digest {
     std::uint32_t h3 = 0x10325476U;
     std::uint32_t h4 = 0xC3D2E1F0U;
 
-    auto rol32 = [](std::uint32_t v, int n) -> std::uint32_t {
-        return (v << n) | (v >> (32 - n));
-    };
+    auto rol32 = [](std::uint32_t v, int n) -> std::uint32_t { return (v << n) | (v >> (32 - n)); };
 
     // Pre-processing: append 0x80, pad to 56 mod 64 bytes, append big-endian bit length.
     std::vector<std::uint8_t> msg(data, data + len);

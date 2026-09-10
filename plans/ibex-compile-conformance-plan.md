@@ -83,7 +83,7 @@ Nothing tells you the surfaces have diverged until a user hits it.
 
 ---
 
-## W1a — **DONE** (2026-09-07, uncommitted)
+## W1a — **DONE** (2026-09-07)
 
 `map { }` transpiles. Decision at implementation time (deviating from the
 "native `for` loop" sketch below): the emitter emits a call to a new
@@ -135,13 +135,11 @@ constructs get a marked case as their workstream is picked up** — adding a
 broken `model {}` / window case now, before W4/W5, just risks a flaky
 `ibex_eval` sanity check. Closing a workstream = deleting its marker(s).
 
-**Known Slice-1 limitation surfaced while writing the case:** the S3 `map`
-peel only fires on the *outermost trailing* clause, so `t[map{}][order{}]`
-still hits the lowering guard. W1a's real `MapNode` lowering removes this.
+That initial peel has since been removed. All surfaces lower a real `MapNode`.
 
 ---
 
-## W1 — `map { }` on surface 1 (transpile), then optionally 2
+## W1 — `map { }` on every surface — DONE
 
 Slice 1 (the `map { }` clause on surface 3) is **landed** — see
 `[[project_fs_plugin_and_map_clause]]`.
@@ -154,9 +152,10 @@ runtime expression-level extern evaluator) is only needed to make the
 a trivial `list_files(...)`, so whole-script-planning it buys nothing, and S3
 already runs `map` via the peel.
 
-So W1 splits into a **required** emitter track and a **deferred** runtime track.
+This was the original split. W1b was subsequently completed and replaced the
+surface-specific peel with shared runtime execution.
 
-### W1a — `MapNode` + native-loop emit (surface 1) — REQUIRED
+### Superseded W1a design sketch
 
 1. **`include/ibex/ir/node.hpp`:** `NodeKind::Map` + `class MapNode` — one child
    + `std::vector<ir::FieldSpec>` (`ir::FieldSpec` at `node.hpp:264`), mirroring
@@ -232,7 +231,7 @@ S2/S3; S2 plans `map` prefixes; one expression evaluator instead of two.
 
 ## W2 — non-literal extern-call arguments
 
-### W2-S1 — **DONE** (2026-09-07, uncommitted)
+### W2-S1 — **DONE** (2026-09-07)
 
 `emit_raw_expr` no longer hard-throws on a non-literal argument. The emitter
 already builds `_ibex_scalars` (compile-time + deferred bindings) and calls
@@ -252,7 +251,7 @@ Tests: `tests/parity/cases/construct_deferred_row_count.ibex`, `test_codegen`
 (bound → `scalar_arg`, unbound → throws), `tests/data/compile_scalar_arg.ibex`
 + `ibex-e2e.sh`.
 
-### W2-S1b — `parse_args` in compiled mode — **DONE** (2026-09-07, uncommitted)
+### W2-S1b — `parse_args` in compiled mode — **DONE** (2026-09-07)
 
 `parse_args` reads the process argv from `IBEX_ARGS` (one entry per line); the
 `ibex` runner sets it from everything after `--`. For a compiled binary the
@@ -268,7 +267,7 @@ Test: `tests/data/compile_parse_args.ibex` + `ibex-e2e.sh` (transpile, compile,
 run with and without argv, check row count + label). `test_codegen` for the
 `main` signature switch.
 
-### W2-S2 — **DONE** (2026-09-10, uncommitted)
+### W2-S2 — **DONE** (2026-09-10)
 
 The whole-script path now collects compile-time and deferred scalar bindings,
 materializes them before source construction, and evaluates source/sink args
@@ -284,7 +283,7 @@ scheduling beyond W1b. `Series<T>` extern arguments remain the separate ABI proj
 
 ---
 
-## W3 — user functions on surfaces 1 & 2 — **DONE** (2026-09-07, uncommitted)
+## W3 — user functions on surfaces 1 & 2 — **DONE** (2026-09-07)
 
 Both halves landed:
 - **S2 decline removed** (`try_execute_whole_script`): `fn` declarations no
@@ -399,9 +398,6 @@ Build `cmake --build build -j6` (`[[feedback_cap_build_parallelism]]`).
   surface. A pass that
   reorders/drops work across it is a silent miscompile. `NodeKind::Stream` is
   the existing "opaque, ordered, effectful" node; match it everywhere.
-- **W3 decline removal** needs a full parity + e2e pass before trusting it —
-  the July-2026 guard may hide a real `lower_script` gap for some function
-  shape.
 - **`map` field returning a table** stays rejected — a rbind-the-results
   `map(table, fn)` is a *different* feature, deferred, do not conflate.
 

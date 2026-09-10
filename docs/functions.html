@@ -59,6 +59,7 @@
           <tr><td><code>df[select { x = sum(col) }, by key]</code></td><td>Standard aggregate usage.</td></tr>
           <tr><td><code>tf[window 5m, update { x = rolling_mean(price) }]</code></td><td>Typical rolling-window usage.</td></tr>
           <tr><td><code>df[update { x = fill_forward(x) }]</code></td><td>Typical null-fill usage.</td></tr>
+          <tr><td><code>df[map { y = effect(x) }]</code></td><td>Ordered row-wise scalar evaluation, including effectful extern calls.</td></tr>
           <tr><td><code>df[order key]</code></td><td>Standard ordering syntax (instead of <code>order(df, key)</code>).</td></tr>
           <tr><td><code>import "csv"; read_csv("file.csv")</code></td><td>Typical file I/O usage.</td></tr>
           <tr><td><code>df[cov]</code> / <code>df[corr]</code></td><td>Covariance or correlation matrix of numeric columns.</td></tr>
@@ -78,7 +79,8 @@
         <table class="repl-table">
           <tbody>
             <tr><td><code>as_timeframe(df, "time_col")</code></td><td>Convert a table to a time-indexed table using <code>time_col</code>.</td></tr>
-            <tr><td><code>scalar(df, col)</code></td><td>Extract one value from a one-row table.</td></tr>
+            <tr><td><code>scalar(df, col)</code></td><td>Extract one value from a one-row table. A null cell yields a null scalar.</td></tr>
+            <tr><td><code>scalar(one_col_df)</code></td><td>Extract from a one-column table; an empty table yields a null scalar, which can be handled with <code>coalesce</code>.</td></tr>
             <tr><td><code>order(df, key1, ...)</code></td><td>Return a table ordered by keys. Usually written as <code>df[order key1, ...]</code>.</td></tr>
             <tr><td><code>print(value)</code></td><td>Print a human-readable value in scripts and REPL sessions.</td></tr>
           </tbody>
@@ -377,6 +379,16 @@
             <tr><td><code>ws_recv(port, schema[, options])</code></td><td>Receive JSON WebSocket messages as one-row DataFrames, decoded with an explicit schema.</td></tr>
             <tr><td><code>ws_connect(url, schema[, options])</code></td><td>Connect to an external WebSocket feed (<code>ws://…</code>) and receive JSON messages as one-row DataFrames.</td></tr>
             <tr><td><code>ws_send(df, port)</code></td><td>Broadcast a DataFrame batch to connected WebSocket clients.</td></tr>
+          </tbody>
+        </table>
+      </article>
+      <article class="card">
+        <h3>Arguments and filesystems</h3>
+        <p>Import <code>"args"</code> for declarative command-line parsing and <code>"fs"</code> for deterministic directory enumeration.</p>
+        <table class="repl-table">
+          <tbody>
+            <tr><td><code>parse_args(spec[, argv])</code></td><td>Return one row per parsed option, flag, or positional argument with fixed columns <code>kind</code>, <code>name</code>, <code>index</code>, and <code>value</code>. Values are strings and optional missing arguments produce no row.</td></tr>
+            <tr><td><code>list_files(dir[, pattern[, recursive]])</code></td><td>Return directory entries ordered by path, with path, name, stem, extension, size, and directory status.</td></tr>
           </tbody>
         </table>
       </article>

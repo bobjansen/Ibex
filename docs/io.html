@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Ibex | CSV, Parquet, SQLite, and Kafka I/O</title>
-  <meta name="description" content="CSV, Parquet, SQLite/ADBC, and Kafka/Redpanda I/O in Ibex: plugin imports, schema hints, and practical batch and streaming examples." />
+  <title>Ibex | Files, Arguments, Databases, and Streams</title>
+  <meta name="description" content="CSV, Parquet, filesystem, command-line argument, SQLite/ADBC, and Kafka/Redpanda I/O in Ibex." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
@@ -30,11 +30,11 @@
   <section class="hero">
     <img class="hero-logo" src="./Ibex.png" alt="Ibex logo" />
     <p class="eyebrow">I/O Guide</p>
-    <h1>CSV, Parquet, SQLite, and Kafka I/O</h1>
+    <h1>Files, arguments, databases, and streams</h1>
     <p class="lead">
       Ibex keeps file I/O in plugins, not in core syntax. That means CSV and
-      Parquet read/write functions, plus SQLite reads through ADBC and Kafka
-      streams through the Kafka plugin, are loaded with <code>import</code>
+      Parquet read/write functions, filesystem enumeration, command-line
+      parsing, SQLite reads through ADBC, and Kafka streams are loaded with <code>import</code>
       and then called like any other function in
       scripts, the REPL, notebooks, and transpiled binaries.
     </p>
@@ -83,6 +83,22 @@
           pipelines or WebSocket dashboards.
         </p>
       </article>
+      <article class="card">
+        <h3>Filesystem plugin</h3>
+        <p>
+          <code>list_files</code> returns directory entries in path order. Its
+          fixed schema includes path, name, stem, extension, size, and directory
+          status, making it a natural input to row-wise <code>map</code> jobs.
+        </p>
+      </article>
+      <article class="card">
+        <h3>Arguments plugin</h3>
+        <p>
+          <code>parse_args</code> validates a declarative option specification
+          and returns one row per option, flag, or positional. Optional missing
+          values pair with nullable scalar extraction instead of sentinel strings.
+        </p>
+      </article>
     </div>
   </section>
 
@@ -96,6 +112,8 @@
       </p>
 <pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
 <span class="kw">import</span> <span class="str">"parquet"</span>;
+<span class="kw">import</span> <span class="str">"fs"</span>;
+<span class="kw">import</span> <span class="str">"args"</span>;
 <span class="kw">import</span> <span class="str">"adbc"</span>;
 <span class="kw">import</span> <span class="str">"kafka"</span>;
 
@@ -114,6 +132,52 @@
           <code>kafka_recv_avro(..., schema, registry_url[, options])</code>.
         </p>
     </article>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Batch orchestration</p>
+    <h2>Turn directories and command lines into ordinary tables</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3>Convert every matching file</h3>
+        <p>
+          Row-wise <code>map</code> processes entries in input order. Each field
+          is scalar-valued, but an effectful field may compose a reader with a
+          writer. The result below records one row per source file.
+        </p>
+<pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
+<span class="kw">import</span> <span class="str">"fs"</span>;
+<span class="kw">import</span> <span class="str">"parquet"</span>;
+
+<span class="fn-name">list_files</span>(<span class="str">"incoming"</span>, <span class="str">"*.csv"</span>)[<span class="kw">map</span> {
+    source = path,
+    rows = <span class="fn-name">write_parquet</span>(
+        <span class="fn-name">read_csv</span>(path),
+        <span class="str">`archive/${stem}.parquet`</span>
+    )
+}];</code></pre>
+      </article>
+      <article class="card">
+        <h3>Parse script arguments</h3>
+        <p>
+          <code>parse_args</code> always returns
+          <code>kind, name, index, value</code>; <code>value</code> is a string.
+          A missing optional argument emits no row, so the one-argument
+          <code>scalar</code> form yields null and <code>coalesce</code> can apply
+          a script-level default. Pass script arguments after <code>--</code>.
+        </p>
+<pre><code><span class="kw">import</span> <span class="str">"args"</span>;
+
+<span class="kw">let</span> args = <span class="fn-name">parse_args</span>(<span class="str">"
+    limit (n) : int?
+    input     : positional+
+"</span>);
+<span class="kw">let</span> raw = <span class="fn-name">scalar</span>(args[<span class="kw">filter</span> name == <span class="str">"limit"</span>, <span class="kw">select</span> { value }]);
+<span class="kw">let</span> limit = <span class="fn-name">Int64</span>(<span class="fn-name">coalesce</span>(raw, <span class="str">"100"</span>));
+
+<span class="cm">// Run as: ibex job.ibex -- --limit 25 input.parquet</span></code></pre>
+      </article>
+    </div>
   </section>
 
   <section class="section">

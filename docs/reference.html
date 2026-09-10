@@ -67,6 +67,7 @@
           <tr><td><code>filter predicate</code></td><td>Keep rows for which the predicate is true.</td></tr>
           <tr><td><code>select { fields }</code></td><td>Project fields, create computed fields, or aggregate with <code>by</code>.</td></tr>
           <tr><td><code>update { fields }</code></td><td>Add or replace fields while preserving the remaining columns.</td></tr>
+          <tr><td><code>map { name = expr, ... }</code></td><td>Evaluate scalar fields once per input row and return exactly the named columns. Rows and fields run in order, so effectful extern calls are supported.</td></tr>
           <tr><td><code>by key</code></td><td>Group a <code>select</code> or <code>update</code>.</td></tr>
           <tr><td><code>order { keys }</code></td><td>Sort rows using ascending or descending keys.</td></tr>
           <tr><td><code>rename</code>, <code>distinct</code>, <code>head</code>, <code>tail</code></td><td>Rename, deduplicate, or limit rows.</td></tr>
@@ -80,10 +81,10 @@
     <p class="section-label">Functionality</p>
     <h2>Find an operation by task</h2>
     <div class="grid-3">
-      <article class="card"><h3>Expressions and types</h3><p>Arithmetic, comparisons, boolean logic, <code>case</code>, casts, nullable values, strings, dates, and typed scalar / series / table values.</p><p><a href="./functions.html">Browse built-in functions &rarr;</a></p></article>
+      <article class="card"><h3>Expressions and types</h3><p>Arithmetic, comparisons, boolean logic, <code>case</code>, casts, nullable columns and scalar bindings, strings, dates, and typed scalar / series / table values.</p><p><a href="./functions.html">Browse built-in functions &rarr;</a></p></article>
       <article class="card"><h3>Aggregation and windows</h3><p>Grouped reduction, grouped update, ranking, cumulative functions, rolling windows, resampling, and TimeFrames.</p><p><a href="./language.html#analytics">Read the language guide &rarr;</a></p></article>
       <article class="card"><h3>Joins and reshaping</h3><p>Inner, outer, semi, anti, cross, and as-of joins; row and column binding; wide-to-long and long-to-wide reshaping.</p><p><a href="./language.html#joins">Read the language guide &rarr;</a></p></article>
-      <article class="card"><h3>Input and output</h3><p>CSV, JSON, Parquet, SQLite/ADBC, Kafka, schema hints, null handling, and cloud-backed Parquet paths through plugins.</p><p><a href="./io.html">Read the I/O guide &rarr;</a></p></article>
+      <article class="card"><h3>Input and output</h3><p>CSV, JSON, Parquet, directory enumeration, command-line argument parsing, SQLite/ADBC, Kafka, and cloud-backed paths through plugins.</p><p><a href="./io.html">Read the I/O guide &rarr;</a></p></article>
       <article class="card"><h3>Functions and metaprogramming</h3><p>Typed user functions, native extern functions, compile-time <code>map</code> expansion, and table-schema introspection.</p><p><a href="./functions.html">Function reference &rarr;</a></p></article>
       <article class="card"><h3>Interactive and host use</h3><p>The REPL, script execution, C++23 transpilation, Python notebooks, and the R/dplyr integration.</p><p><a href="./notebooks.html">Read integration guides &rarr;</a></p></article>
       <article class="card"><h3>Advanced workflows</h3><p>C++ code generation, continuous streams, producer queues, and formula-based model specifications.</p><p><a href="./advanced.html">Read advanced workflows &rarr;</a></p></article>

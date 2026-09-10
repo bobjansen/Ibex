@@ -19,7 +19,7 @@ one exception, and only because extraction throws.
 
 ### Status
 
-**Slice 1 landed (uncommitted, 2026-09-07)** — interpreter/REPL path:
+**Slice 1 complete (2026-09-07)** — interpreter/REPL path:
 
 - `ScalarValue` gains a leading `std::monostate` null alternative in all three
   aliases; `runtime::is_null_scalar()` helper.
@@ -40,7 +40,7 @@ one exception, and only because extraction throws.
   `test_interpreter.cpp` "extract_scalar yields a null scalar". Full suite green
   (1849 cases).
 
-**Slice 2 landed (uncommitted, 2026-09-07):**
+**Slice 2 complete (2026-09-07):**
 
 - Row-count expressions (`take` / `head` / `tail` / `rep` length / `Table(n)` /
   `Series(n)` / RNG shape — all route through `evaluate_row_count_expr_impl`)
@@ -49,16 +49,14 @@ one exception, and only because extraction throws.
   an all-null series instead of erroring — consistent with the column path.
 - SPEC.md: §3, §5.7, §6.7 (new), §11.2, §12.2 edited.
 
-**Not yet done:** codegen (scalar bindings still lower to bare `T`;
-`emitter.cpp` emits a placeholder for the monostate arm — `collect_scalar_bindings`
-never produces one so it's unreachable); per-call rolling `__window_n` /
-`__window_ns` guard (separate path from row-count); a null scalar has no static
-type (`infer_expr_type` falls through to String); the one-arg `scalar(<table>)`
-form is REPL-only — not wired in `lower.cpp` for the compiled path.
+The compiled path is covered by Part 1c below. A remaining representation
+limitation is that a bare null `ScalarValue` does not itself retain a static
+type; typed expression context supplies the type where nullable scalars are
+currently produced.
 
 ### Part 1c — runtime scalar `let` bindings in the compiled path (REQUIRED for Part 2)
 
-**LANDED (uncommitted, 2026-09-07).** `let n = scalar(<table>)`,
+**Complete (2026-09-07).** `let n = scalar(<table>)`,
 `let n = <cast>(scalar(...))`, and `let n = coalesce(scalar(...), <literal>)`
 now compile. Parity green (32 cases incl. new `deferred_scalar_let`), full unit
 suite green.
@@ -76,17 +74,9 @@ suite green.
 - `emitter.cpp` emits each subplan + the two registry inserts before the query;
   `ibex_compile.cpp` / `structured_runner.cpp` wire the new return shape.
 
-**Not done:** residual shapes beyond one cast / one coalesce (e.g.
-`scalar(a) + scalar(b)`, arithmetic chains) still error; a deferred binding
-can't be referenced by a *later compile-time* scalar let (`eval_scalar_expr`'s
-env doesn't see it).
-
-
-`ibex_compile` only supports **compile-time** scalar lets (`collect_scalar_bindings`
-folds literal/arithmetic). `let n = scalar(<table>)` — and anything built on it,
-`let n = Int64(scalar(...))` — errors: "unsupported scalar let". `parse_args`
-needs exactly this shape in compiled scripts, so it must be added, at parity with
-the interpreter reference.
+Residual cast and coalesce wrappers are supported recursively. A deferred
+binding still cannot be referenced by a later binding that the collector tries
+to evaluate at compile time; that dependency shape remains outside this work.
 
 **No parity gap exists today** — the constructs that could diverge aren't
 supported by `ibex_compile` at all (verified: 31/31 parity cases green after
@@ -206,7 +196,7 @@ of the call, joining the strict-use-site list. (Symmetric with §11's "an extern
 
 ## Part 2 — `parse_args`
 
-### Status — **LANDED (uncommitted, 2026-09-07)**
+### Status — **COMPLETE (2026-09-07)**
 
 - `libs/args/` plugin: `args.hpp` (header-only parser), `args.cpp` (`ibex_register`),
   `args.ibex` stub, CMake. Added to the top-level plugin list + `tests/` include path.
@@ -225,7 +215,7 @@ of the call, joining the strict-use-site list. (Symmetric with §11's "an extern
   parity case extended with the nested wrapper. Full suite green (1858),
   parity green (32).
 
-**Not done:** `flat_map(read_*)` → multi-path `ScanNode` (the file-list idiom
+**Possible follow-up work (not part of this feature):** `flat_map(read_*)` → multi-path `ScanNode` (the file-list idiom
 still needs `map`/`flat_map` to return a Table per element + `concat`); `--help`
 / `-h`; `env VAR` in the spec; `...` for unknown-option passthrough; short-flag
 bundling (`-abc`); a `parse_args` parity case (the interpreter reference in

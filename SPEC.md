@@ -1215,8 +1215,8 @@ Within a single block:
 | C21 | At most **one** of `cov`, `corr`, `transpose` per block. |
 | C22 | `cov`, `corr`, and `transpose` are mutually exclusive with each other and with `select`, `update`, `by`, `distinct`, `melt`, `dcast`, `window`, and `resample`. |
 | C23 | `cov` and `corr` silently drop non-numeric columns; at least one numeric column must remain. |
-| C23 | `transpose` requires all data columns to share the same type (error on mixed types). |
-| C24 | At most **one** `map { }` clause, and it must be the **last** clause of the block. |
+| C24 | `transpose` requires all data columns to share the same type (error on mixed types). |
+| C25 | At most **one** `map { }` clause, and it must be the **only** clause of the block. |
 
 Violation of any constraint is a **compile-time error**.
 
@@ -1537,6 +1537,10 @@ Because evaluation is per-row and scalar, `map` field expressions may call
 table-consuming writer:
 
 ```
+import "csv";
+import "fs";
+import "parquet";
+
 list_files("data/csv", "*.csv")[map {
     source = path,
     target = `data/parquet/${stem}.parquet`,
@@ -1546,13 +1550,13 @@ list_files("data/csv", "*.csv")[map {
 
 Rows are processed in input order and fields left-to-right, so side effects
 occur in a defined order. An error in any row aborts the block (effects from
-earlier rows are not rolled back). `map` must be the last clause of its block
-(C24); chain further work as `let out = base[map { ... }]; out[...]`.
+earlier rows are not rolled back). `map` must be the only clause of its block
+(C25); chain further work as `let out = base[map { ... }]; out[...]`.
 
-*Current implementation status:* `map` runs on the interpreter / statement
-execution path (scripts and the REPL). The distinction from the existing
-compile-time `map v in list => ...` expansion (valid only **inside**
-`select`/`update` braces, Section 5.3) is grammatical position.
+The interpreter, whole-script planner, and C++ transpiler use the same
+row-major `Map` semantics. The distinction from the compile-time
+`map v in list => ...` expansion (valid only **inside** `select`/`update`
+braces, Section 5.3) is grammatical position.
 
 **`rename { new_name = old_name, ... }`**
 
@@ -2549,7 +2553,7 @@ extern whose declared return type admits null.
 A null scalar **propagates** through arithmetic, comparison, scalar functions,
 and `${}` interpolation under the ordinary null rules of Section 3
 (`null + x = null`, `null > x = null`, `abs(null) = null`,
-`` `px=${null}` `` renders `null`). `is null` / `is not null`, `coalesce`, and
+`` `px=${null}` `` evaluates to null). `is null` / `is not null`, `coalesce`, and
 `fill_null` consume it. A cast of null is null of the target type.
 
 A null scalar is a **runtime error** only where a value must be present:
@@ -3524,7 +3528,9 @@ Combined with the row-wise `map { }` clause (Section 5.3), this is how a whole
 directory is transformed — e.g. every CSV to Parquet:
 
 ```
+import "csv";
 import "fs";
+import "parquet";
 list_files("data/csv", "*.csv")[map {
     source = path,
     rows   = write_parquet(read_csv(path), `data/parquet/${stem}.parquet`)

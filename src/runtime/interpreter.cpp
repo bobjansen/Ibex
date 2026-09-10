@@ -365,6 +365,67 @@ auto expr_type_for_column(const ColumnValue& column) -> ExprType {
     return ExprType::String;
 }
 
+auto map_column_from_scalars(const std::vector<ScalarValue>& values)
+    -> std::expected<ComputedColumn, std::string> {
+    const auto build = [&]<class T>() -> std::expected<ComputedColumn, std::string> {
+        Column<T> column;
+        column.reserve(values.size());
+        ValidityBitmap validity;
+        validity.reserve(values.size());
+        bool any_null = false;
+        for (const auto& value : values) {
+            if (is_null_scalar(value)) {
+                column.push_back(T{});
+                validity.push_back(false);
+                any_null = true;
+                continue;
+            }
+            if (const auto* typed = std::get_if<T>(&value)) {
+                column.push_back(*typed);
+            } else if constexpr (std::is_same_v<T, double>) {
+                if (const auto* integer = std::get_if<std::int64_t>(&value)) {
+                    column.push_back(static_cast<double>(*integer));
+                } else {
+                    return std::unexpected("mixed value types in one map field");
+                }
+            } else {
+                return std::unexpected("mixed value types in one map field");
+            }
+            validity.push_back(true);
+        }
+        return ComputedColumn{.column = ColumnValue{std::move(column)},
+                              .validity = any_null
+                                              ? std::optional<ValidityBitmap>{std::move(validity)}
+                                              : std::nullopt};
+    };
+
+    for (const auto& value : values) {
+        if (std::holds_alternative<std::int64_t>(value)) {
+            const bool has_double = std::ranges::any_of(values, [](const ScalarValue& candidate) {
+                return std::holds_alternative<double>(candidate);
+            });
+            return has_double ? build.template operator()<double>()
+                              : build.template operator()<std::int64_t>();
+        }
+        if (std::holds_alternative<double>(value)) {
+            return build.template operator()<double>();
+        }
+        if (std::holds_alternative<bool>(value)) {
+            return build.template operator()<bool>();
+        }
+        if (std::holds_alternative<std::string>(value)) {
+            return build.template operator()<std::string>();
+        }
+        if (std::holds_alternative<Date>(value)) {
+            return build.template operator()<Date>();
+        }
+        if (std::holds_alternative<Timestamp>(value)) {
+            return build.template operator()<Timestamp>();
+        }
+    }
+    return build.template operator()<std::int64_t>();
+}
+
 auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,
                     const ExecutionContext& exec, ModelResult* model_out)
@@ -569,10 +630,6 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return result;
         }
         case ir::NodeKind::Map: {
-            // Emitter-only node (see MapNode's doc comment): reached only when
-            // emitted `ibex::ops::map` re-enters the interpreter. Evaluate the
-            // fields row-wise with the shared update evaluator, then keep only
-            // the named columns, in order.
             const auto& map_node = ir::node_cast<ir::MapNode>(node);
             if (map_node.children().empty()) {
                 return std::unexpected("map node missing child");
@@ -582,19 +639,46 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (!child) {
                 return std::unexpected(child.error());
             }
-            auto merged =
-                update_table(std::move(child.value()), map_node.fields(), scalars, externs, exec);
-            if (!merged) {
-                return std::unexpected(merged.error());
+            // Map is deliberately row-major and serial: field expressions may
+            // perform observable I/O, so both row and declaration order are
+            // language semantics rather than a parallelization opportunity.
+            std::vector<std::vector<ScalarValue>> values(map_node.fields().size());
+            for (auto& field_values : values) {
+                field_values.reserve(child->rows());
+            }
+            for (std::size_t row = 0; row < child->rows(); ++row) {
+                if (interrupt_requested()) {
+                    return std::unexpected(interrupt_message());
+                }
+                for (std::size_t field = 0; field < map_node.fields().size(); ++field) {
+                    auto value =
+                        eval_expr(map_node.fields()[field].expr, *child, row, scalars, externs);
+                    if (!value) {
+                        if (const auto* ref =
+                                std::get_if<ir::ColumnRef>(&map_node.fields()[field].expr.node);
+                            ref != nullptr && registry.contains(ref->name)) {
+                            return std::unexpected("map field '" + map_node.fields()[field].alias +
+                                                   "' must evaluate to a scalar, not a table");
+                        }
+                        return std::unexpected("map field '" + map_node.fields()[field].alias +
+                                               "': " + value.error());
+                    }
+                    values[field].push_back(scalar_from_expr(*value));
+                }
             }
             Table out;
-            for (const auto& field : map_node.fields()) {
-                const auto* entry = merged->find_entry(field.alias);
-                if (entry == nullptr) {
-                    return std::unexpected("map: field '" + field.alias +
-                                           "' missing after evaluation");
+            for (std::size_t field = 0; field < map_node.fields().size(); ++field) {
+                auto column = map_column_from_scalars(values[field]);
+                if (!column) {
+                    return std::unexpected("map field '" + map_node.fields()[field].alias +
+                                           "': " + column.error());
                 }
-                out.add_column_from(field.alias, *entry);
+                if (column->validity) {
+                    out.add_column(map_node.fields()[field].alias, std::move(column->column),
+                                   std::move(*column->validity));
+                } else {
+                    out.add_column(map_node.fields()[field].alias, std::move(column->column));
+                }
             }
             return out;
         }

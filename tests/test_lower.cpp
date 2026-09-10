@@ -82,9 +82,10 @@ TEST_CASE("Lower map { } to a MapNode on the transpile path") {
     REQUIRE(map_node->children().size() == 1);
     CHECK(map_node->children()[0]->kind() == ir::NodeKind::Scan);
 
-    // Surface 2 (whole-script) declines: the REPL peels a map clause instead.
+    // Surface 2 uses the same MapNode and runtime evaluator.
     auto script = parser::lower_script(program);
-    REQUIRE_FALSE(script.has_value());
+    REQUIRE(script.has_value());
+    CHECK(as_node<ir::MapNode>(script->result.get()) != nullptr);
 }
 
 TEST_CASE("Lower rejects map { } combined with another clause") {

@@ -243,6 +243,42 @@ TEST_CASE("Interpret Program executes preamble extern calls before main node") {
     REQUIRE(result->find("x") != nullptr);
 }
 
+TEST_CASE("Runtime scalar expressions compose table externs into consumers",
+          "[interpreter][extern][map]") {
+    runtime::ExternRegistry externs;
+    externs.register_table(
+        "read_rows",
+        [](const runtime::ExternArgs& args) -> std::expected<runtime::ExternValue, std::string> {
+            REQUIRE(args.size() == 1);
+            REQUIRE(std::get<std::string>(args[0]) == "input");
+            runtime::Table table;
+            table.add_column("x", Column<std::int64_t>{1, 2, 3});
+            return runtime::ExternValue{std::move(table)};
+        });
+    externs.register_scalar_table_consumer(
+        "write_rows", runtime::ScalarKind::Int,
+        [](const runtime::Table& table,
+           const runtime::ExternArgs& args) -> std::expected<runtime::ExternValue, std::string> {
+            REQUIRE(args.size() == 1);
+            REQUIRE(std::get<std::string>(args[0]) == "output");
+            return runtime::ExternValue{
+                runtime::ScalarValue{static_cast<std::int64_t>(table.rows())}};
+        });
+
+    ir::CallExpr reader;
+    reader.callee = "read_rows";
+    reader.args.push_back(ir::make_expr_ptr(ir::Expr{ir::Literal{.value = std::string{"input"}}}));
+    ir::CallExpr writer;
+    writer.callee = "write_rows";
+    writer.args.push_back(ir::make_expr_ptr(ir::Expr{.node = std::move(reader)}));
+    writer.args.push_back(ir::make_expr_ptr(ir::Expr{ir::Literal{.value = std::string{"output"}}}));
+
+    auto result =
+        runtime::evaluate_scalar_expr(ir::Expr{.node = std::move(writer)}, nullptr, &externs);
+    REQUIRE(result.has_value());
+    CHECK(std::get<std::int64_t>(*result) == 3);
+}
+
 TEST_CASE("Interpret filter with scalar predicate") {
     runtime::Table table;
     table.add_column("price", Column<std::int64_t>{10, 20, 30});

@@ -2178,15 +2178,15 @@ count_rows(read_fake());
 )";
     CHECK(capture_planner_line(with_fn, registry, config) == "planner: whole-script");
 
-    // A map body containing an extern call still needs W1b. Removing the
-    // blanket import-stub decline exposes the precise lowering boundary rather
-    // than blaming the presence of an otherwise valid function declaration.
+    // Imported helpers with map bodies use the same whole-script MapNode path
+    // as directly written clauses, including runtime extern expressions.
     {
         std::ofstream stub{dir / "maplib.ibex"};
         stub << "extern fn read_fake() -> DataFrame from \"fake.hpp\";\n"
              << "extern fn touch(x: Int) -> Int from \"fake.hpp\";\n"
+             << "extern fn consume(df: DataFrame) -> Int from \"fake.hpp\";\n"
              << "fn touch_rows(df: DataFrame) -> DataFrame {\n"
-             << "  df[map { value = touch(a) }];\n}\n";
+             << "  df[map { value = touch(a), rows = consume(read_fake()) }];\n}\n";
     }
     registry.register_scalar(
         "touch", ibex::runtime::ScalarKind::Int,
@@ -2200,13 +2200,22 @@ count_rows(read_fake());
                                 table.add_column("b", ibex::Column<std::int64_t>{10, 20, 30});
                                 return ibex::runtime::ExternValue{std::move(table)};
                             });
+    int consume_calls = 0;
+    registry.register_scalar_table_consumer(
+        "consume", ibex::runtime::ScalarKind::Int,
+        [&consume_calls](const ibex::runtime::Table& table, const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            ++consume_calls;
+            return ibex::runtime::ExternValue{
+                ibex::runtime::ScalarValue{static_cast<std::int64_t>(table.rows())}};
+        });
     register_recording_lazy_source(registry, decode_calls);
     const std::string with_effectful_map = R"(
 import "maplib";
 touch_rows(read_fake());
 )";
-    CHECK(capture_planner_line(with_effectful_map, registry, config) ==
-          "planner: statements (script did not lower: map { } runs only on the interpreter path)");
+    CHECK(capture_planner_line(with_effectful_map, registry, config) == "planner: whole-script");
+    CHECK(consume_calls == 3);
 
     std::filesystem::remove_all(dir);
 }

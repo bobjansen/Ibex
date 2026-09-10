@@ -69,9 +69,9 @@ Nothing tells you the surfaces have diverged until a user hits it.
 
 | Construct | S2 whole-script | S1 transpile | Symptom |
 |---|---|---|---|
-| `map { }` clause (pure cells) | via S3 peel; S2 declines | **yes** — `MapNode` → `ibex::ops::map` (**W1a DONE**) | effectful cells: W1b |
+| `map { }` clause | **yes** — shared `MapNode` evaluator (**W1b DONE**) | **yes** — `MapNode` → `ibex::ops::map` (**W1a DONE**) | — |
 | non-literal extern-call args (`read_csv(runtime_path)`) | **yes** — materialized scalar bindings feed lazy-source construction (**W2-S2 DONE**) | **yes** — `ibex::ops::scalar_arg` (**W2-S1 DONE**) | deferred scalar sourced by the same lazy-reader graph still declines |
-| top-level `fn … -> DataFrame` as the result | **yes** — table UDF is inlined (**W3 DONE**) | **yes** — same inliner (**W3 DONE**) | effectful `map` bodies remain W1b |
+| top-level `fn … -> DataFrame` as the result | **yes** — table UDF is inlined (**W3 DONE**) | **yes** — same inliner (**W3 DONE**) | — |
 | `model { }` clause | yes | **no** — `src/codegen/emitter.cpp:860` "model clause is not yet supported in compiled mode" | W4 |
 | `window` + `select` | yes | **no** — `emitter.cpp:509` | W5 |
 | `aligned` window | yes | **no** — `emitter.cpp:513` | W5 |
@@ -90,33 +90,30 @@ Nothing tells you the surfaces have diverged until a user hits it.
 `ibex::ops::map` kernel that re-enters the interpreter's row-wise `update`
 evaluator, then keeps only the named columns. `MapNode` gained a real
 `interpret()` case (not emitter-only after all — the emitted `ibex::ops::map`
-re-enters it). Byte-identical to surface 3 for pure cells; **effectful cells
-(externs in a `map` field) stay unsupported until W1b** — `lower_expr_to_ir`
-rejects a table-extern call in a field, so such a script simply fails to
-transpile, exactly as before.
+re-enters it). Byte-identical to surface 3 for pure cells. W1b subsequently
+extended that interpreter case to effectful extern cells and made it the shared
+implementation for all surfaces.
 
 Landed:
 - `ir::NodeKind::Map` + `ir::MapNode` (one child + `std::vector<FieldSpec>`),
   `Builder::map`, `node_kind_v`.
-- `src/parser/lower.cpp`: `MapClause` → `MapNode`, gated on `allow_map_` (set
-  only by `lower_program`, i.e. surface 1). Surface 2 (`lower_script` free fn)
-  and surface 3 (`lower_expr`) still error "map { } runs only on the
-  interpreter path" — so whole-script *declines* (→ REPL peel) with no extra
-  code. `map { }` must be the sole clause of its block.
+- `src/parser/lower.cpp`: `MapClause` → `MapNode`; `map { }` must be the sole
+  clause of its block. W1b enabled this lowering on every surface.
 - IR visitors: `schema.cpp` (output = field list only; also `check_column_refs`),
   `cardinality.cpp` (row-count-preserving), `required_columns.cpp` (demand =
   field-expr columns), plus `infer_output_column_names` / `clone_node` in
   `lower.cpp`.
-- `interpret_node` `case Map`: `update_table` then project to the aliases.
+- `interpret_node` `case Map`: serial row-major evaluation, then construction
+  of exactly the named result columns.
 - `ibex::ops::map` (`ops.hpp` / `ops.cpp`); emitter `case Map`.
-- Tests: `tests/test_lower.cpp` (S1 builds a MapNode, S2 declines, map+other
+- Tests: `tests/test_lower.cpp` (S1/S2 build a MapNode, map+other
   clause rejected), `tests/test_codegen.cpp` (emit string-match),
   `tests/data/compile_map.ibex` + `scripts/ibex-e2e.sh` check. Parity gate
   `ibex_parity_interpreter_vs_transpiled` runs `map_rows.ibex` for real
   (marker deleted).
 
-Not done (moved to / stays in W1b): native-loop emit, effectful cells,
-retiring the S3 peel, unifying the two expression evaluators.
+The native-loop emit was intentionally not pursued; the shared runtime route
+keeps the three surfaces on one implementation.
 
 ## Step 0 — make divergence loud — **DONE** (`tests/parity/`)
 
@@ -214,12 +211,9 @@ So W1 splits into a **required** emitter track and a **deferred** runtime track.
 produces output byte-identical to S3. Delete
 `tests/parity/cases/map*.unsupported`.
 
-### W1b — runtime expression-level extern evaluator (surfaces 2 & 3) — DEFERRED
+### W1b — runtime expression-level extern evaluator (surfaces 2 & 3) — DONE
 
-Only worth doing to (a) let S2 whole-script-plan a `map` prefix (low value) or
-(b) retire the S3 peel and unify the two expression evaluators (cleanliness).
-Shares its core with **W2**. `eval_expr` (`src/runtime/expr.cpp`) gains an
-extern arm — dispatch an `ir::CallExpr` whose callee is a registered extern to
+The runtime evaluator now dispatches registered extern `ir::CallExpr`s through
 `eval_extern_expr(call, table, row, scalars, externs)`:
 - scalar extern → eval args, call `fn->func`.
 - scalar extern, `first_arg_is_table` → arg 0 is a `CallExpr` to a
@@ -227,9 +221,9 @@ extern arm — dispatch an `ir::CallExpr` whose callee is a registered extern to
 - table extern → valid only as arg 0 of a consumer (lift the
   `first_arg_is_table` guard in `invoke_extern_call` to be position-aware).
 Home: `extern_call.cpp` (has the registry), forward-declared for `expr.cpp`.
-Then `src/runtime/interpreter.cpp` gets a `case ir::NodeKind::Map` (port the
-Slice-1 row loop onto the runtime `eval_expr`), the S2 decline is removed, and
-the S3 peel is deleted. Not on the critical path.
+`src/runtime/interpreter.cpp` evaluates `MapNode` fields in serial row-major
+order, preserving the ordering of observable effects. The S2 lowering guard
+and S3 peel are gone; all three surfaces use the same node and evaluator.
 
 **Deliverable (if done):** `let n = write_parquet(read_csv(^p), ^o);` runs on
 S2/S3; S2 plans `map` prefixes; one expression evaluator instead of two.
@@ -284,8 +278,8 @@ also passed through pushed-filter decoding and final interpretation.
 
 The circular case remains an explicit, observable decline: a deferred scalar
 whose own subplan calls a lazy reader stays on the statement path. Resolving
-that graph without eager or duplicated effects belongs to W1b. `Series<T>`
-extern arguments remain the separate ABI project in
+that graph without eager or duplicated effects requires dependency-aware source
+scheduling beyond W1b. `Series<T>` extern arguments remain the separate ABI project in
 `plans/extern-series-arguments-plan.md`.
 
 ---
@@ -313,11 +307,8 @@ scripts. Test: `tests/parity/cases/table_udf.ibex` (transpile+match),
 
 Import stubs containing `fn` declarations no longer force a whole-script
 decline; their declarations are supplied to both scalar-binding collection and
-script lowering. A helper whose body can be inlined therefore stays on the
-whole-script path. Still open: `ibex_compile` on `import "fs";
-csv_dir_to_parquet(…)` — `csv_dir_to_parquet` uses `map` with an **effectful**
-cell, which is W1b, not W3. It now declines for that precise lowering gap rather
-than merely because its stub contains a function.
+script lowering. Helpers whose bodies contain effectful `map` cells now remain
+on that path through W1b's shared evaluator.
 
 ### original plan (kept for history)
 
@@ -370,8 +361,7 @@ has been chased one combo at a time — W5 is finishing that list. Lower priorit
 3. ~~**W3** (functions)~~ — **DONE**: S2 decline removed + `inline_table_udf`.
 4. ~~**W2** — S1 (`ibex::ops::scalar_arg`), S1b (`parse_args` argv forwarding),
    and S2 (whole-script scalar extern args)~~ — **DONE**.
-5. **W1b** (runtime extern-expr evaluator) — only if S2 `map` planning or
-   evaluator unification is wanted. Deprioritised by the reframe.
+5. ~~**W1b** (runtime extern-expr evaluator + shared `map` execution)~~ — **DONE**.
 6. **W4 / W5** — lower priority, independent.
 
 Each workstream is a landable unit and deletes its `.unsupported` markers.
@@ -387,9 +377,9 @@ Build `cmake --build build -j6` (`[[feedback_cap_build_parallelism]]`).
   `.cpp` → assert stdout equals `build/tools/ibex` on the same script
   (`scripts/ibex-e2e.sh`, `tests/test_codegen.cpp`). Effectful `map` (csv→csv
   round-trip) and pure `map` (arithmetic) both.
-- **W1b (if done):** `tests/test_extern_expr.cpp` — runtime `eval_expr` of
-  `write_csv(read_csv(^p), ^o)` against a hand-built registry (mirror
-  `tests/test_fs.cpp`); the S3 peel deletion must leave `[map]` green.
+- **W1b:** `tests/test_interpreter.cpp` exercises nested table-reader/consumer
+  extern expressions; `tests/test_fs.cpp` covers the effectful file round trip;
+  the import planner test asserts an effectful map helper stays whole-script.
 - **W2 / W3 / W4 / W5:** a parity case per construct;
   `scripts/check-object-equivalence.sh` (`[[project_object_equivalence_script]]`)
   for codegen-neutrality.
@@ -405,11 +395,8 @@ Build `cmake --build build -j6` (`[[feedback_cap_build_parallelism]]`).
   Keep it conservative: only what a `map` field needs, error clearly on the
   rest. This is the emitter's first real codegen — do it carefully, it's the
   seam everything else (W2, W4) reuses.
-- **`MapNode` as an emitter-only IR node.** Unusual but honest given the
-  reframe: S3 peels, S2 declines, so `interpret()` never sees it. Document it
-  loudly at the `MapNode` definition and in `try_execute_whole_script`.
-- **Optimizer barrier correctness** — even emitter-only, `MapNode` sits in the
-  IR that `ir::optimize_plan` walks (surface 1 runs the optimizer). A pass that
+- **Optimizer barrier correctness** — `MapNode` sits in the IR on every
+  surface. A pass that
   reorders/drops work across it is a silent miscompile. `NodeKind::Stream` is
   the existing "opaque, ordered, effectful" node; match it everywhere.
 - **W3 decline removal** needs a full parity + e2e pass before trusting it —

@@ -1739,6 +1739,9 @@ enum class FloatCleanMode : std::uint8_t {
 [[nodiscard]] auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
                              const ScalarRegistry* scalars, const ExternRegistry* externs)
     -> std::expected<ExprValue, std::string>;
+[[nodiscard]] auto eval_extern_expr(const ir::CallExpr& call, const Table& input, std::size_t row,
+                                    const ScalarRegistry* scalars, const ExternRegistry* externs)
+    -> std::expected<ExprValue, std::string>;
 [[nodiscard]] auto evaluate_row_count_expr_impl(const ir::Expr& expr, const ScalarRegistry* scalars,
                                                 const ExternRegistry* externs)
     -> std::expected<std::size_t, std::string>;

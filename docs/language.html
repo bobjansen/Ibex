@@ -38,6 +38,7 @@
   <span class="kw">order</span> { total <span class="kw">desc</span> }
 ];</code></pre>
     <p>Use <code>rename</code>, <code>distinct</code>, <code>head</code>, and <code>tail</code> for common schema and row-shape operations. A conditional <code>where predicate update { ... }</code> replaces values only on matching rows.</p>
+    <p>When an operation is inherently row-wise, <code>map { name = expr, ... }</code> evaluates scalar fields in input order and returns exactly those fields. It may contain effectful extern calls, such as reading and converting each path returned by <code>list_files</code>. Bind the map result before applying another clause.</p>
   </section>
 
   <section class="section" id="joins">
@@ -67,8 +68,8 @@ tf[<span class="kw">window</span> <span class="num">5m</span>, <span class="kw">
     <p class="section-label">Values and expressions</p><h2>Types, nulls, and reusable logic</h2>
     <div class="grid-3">
       <article class="card"><h3>Types</h3><p>Ibex has static scalar, <code>Series</code>, <code>Table</code>, and <code>TimeFrame</code> types. Use explicit constructors such as <code>Int64(x)</code> and <code>Float64(x)</code> where conversion is required.</p></article>
-      <article class="card"><h3>Nulls</h3><p>Predicates use three-valued logic. Use <code>is_null</code>, <code>fill_null</code>, <code>fill_forward</code>, and <code>fill_backward</code> to inspect and repair missing values.</p></article>
-      <article class="card"><h3>Functions</h3><p>Declare typed <code>fn</code> functions for reusable expressions. <code>case</code> chooses the first matching branch; <code>map</code> expands repeated fields at compile time inside <code>select</code> and <code>update</code>.</p></article>
+      <article class="card"><h3>Nulls</h3><p>Columns and scalar bindings can be null, and predicates use three-valued logic. A null or empty optional lookup stays null through casts and expressions; use <code>coalesce</code>, <code>is_null</code>, <code>fill_null</code>, <code>fill_forward</code>, and <code>fill_backward</code> to inspect or recover it.</p></article>
+      <article class="card"><h3>Functions</h3><p>Declare typed <code>fn</code> functions for reusable expressions. <code>case</code> chooses the first matching branch. Row-wise <code>map { ... }</code> performs ordered scalar work; <code>map x in names =&gt; ...</code> separately expands fields at compile time inside <code>select</code> and <code>update</code>.</p></article>
     </div>
   </section>
 

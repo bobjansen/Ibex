@@ -167,9 +167,17 @@
       <span><code>filter</code></span>
       <span><code>select</code></span>
       <span><code>update</code></span>
+      <span><code>map</code></span>
       <span><code>by</code></span>
       <span><code>order</code></span>
     </div>
+    <p class="section-sub" style="margin-top: 1rem;">
+      Use <code>map { name = expr }</code> when work is genuinely row-wise,
+      including ordered file conversions and other effectful extern calls.
+      The same script runs in the REPL, whole-script planner, and generated
+      C++ binary. Scalar lookups may be null, so optional configuration can be
+      recovered explicitly with <code>coalesce</code>.
+    </p>
   </section>
 
   <!-- Install -->

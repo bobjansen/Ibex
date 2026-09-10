@@ -149,6 +149,23 @@ prices[select { mean_price = mean(price) }, by symbol];
 prices[update { price_doubled = price * 2.0 }];
 ```
 
+### Row-wise map
+
+Use `map` for ordered per-row scalar work, including effectful extern calls.
+It returns exactly the named fields and runs rows in input order, fields
+left-to-right:
+
+```ibex
+import "csv";
+import "fs";
+import "parquet";
+
+list_files("incoming", "*.csv")[map {
+    source = path,
+    rows = write_parquet(read_csv(path), `archive/${stem}.parquet`)
+}];
+```
+
 ### Distinct
 
 ```
@@ -224,7 +241,17 @@ logs[order id][
 
 ```
 let total = scalar(prices[select { total = sum(price) }], total);
+
+// One-argument scalar() returns null for an empty one-column table.
+import "args";
+let args = parse_args("limit (n) : int?");
+let optional = scalar(args[filter name == "limit", select { value }]);
+let limit = Int64(coalesce(optional, "100"));
 ```
+
+A null cell also produces a null scalar. Null propagates through scalar
+arithmetic, comparisons, casts, functions, and interpolation; row counts and
+non-nullable extern arguments reject it.
 
 ### Joins
 

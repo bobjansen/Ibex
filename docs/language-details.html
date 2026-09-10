@@ -167,6 +167,46 @@ prices[
         </div>
       </div>
 
+      <!-- 1c. Row-wise map -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Row-wise Map</span>
+          <h3>Use ordered scalar evaluation when each row triggers work</h3>
+          <p>
+            <code>map&nbsp;{&nbsp;name&nbsp;=&nbsp;expr,&nbsp;&hellip;&nbsp;}</code>
+            evaluates every field once per input row and returns exactly the
+            named columns. Input columns are scalars in the field expression;
+            an outer scalar with the same name is shadowed.
+          </p>
+          <p>
+            Rows run in input order and fields run left-to-right. That makes
+            effectful extern calls predictable: a table reader may feed a
+            table-consuming writer in a field. Earlier effects are not rolled
+            back if a later row fails. <code>map</code> must be the sole clause
+            in its block; bind its result before applying another clause.
+          </p>
+          <p>
+            This is distinct from compile-time
+            <code>map&nbsp;x&nbsp;in&nbsp;names&nbsp;=&gt;&nbsp;&hellip;</code>
+            field generation inside <code>select</code> or <code>update</code>.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
+<span class="kw">import</span> <span class="str">"fs"</span>;
+<span class="kw">import</span> <span class="str">"parquet"</span>;
+
+<span class="fn-name">list_files</span>(<span class="str">"data/csv"</span>, <span class="str">"*.csv"</span>)[<span class="kw">map</span> {
+    source = path,
+    target = <span class="str">`data/parquet/${stem}.parquet`</span>,
+    rows   = <span class="fn-name">write_parquet</span>(
+        <span class="fn-name">read_csv</span>(path),
+        <span class="str">`data/parquet/${stem}.parquet`</span>
+    )
+}];</code></pre>
+        </div>
+      </div>
+
       <!-- 2. Aggregate -->
       <div class="tour-item">
         <div class="tour-text">
@@ -679,6 +719,16 @@ supply[
             <code>null_if_not_finite</code> to convert them into nulls before
             grouped reductions.
           </p>
+          <p>
+            Scalar bindings can be null too. A null cell extracted with
+            <code>scalar(df, col)</code> stays null; the one-argument
+            <code>scalar(one_column_table)</code> also returns null when its
+            input has no rows. Null then propagates through scalar arithmetic,
+            casts, comparisons, functions, and interpolation. Recover an
+            optional value explicitly with <code>coalesce</code>. Positions
+            that require a present value, such as row counts and extern
+            arguments, report an error instead.
+          </p>
         </div>
         <div class="tour-code">
 <pre><code><span class="cm">// Left join introduces nulls for unmatched rows</span>
@@ -696,7 +746,11 @@ enriched[<span class="kw">select</span> { name, bonus = salary <span class="op">
 enriched[<span class="kw">filter</span> { dept_name <span class="kw">is not null</span> <span class="op">||</span> salary <span class="op">&gt;</span> <span class="num">80000</span> }];
 
 <span class="cm">// Aggregates skip null rows automatically</span>
-enriched[<span class="kw">select</span> { avg_sal = <span class="fn-name">mean</span>(salary) }, <span class="kw">by</span> dept_name];</code></pre>
+enriched[<span class="kw">select</span> { avg_sal = <span class="fn-name">mean</span>(salary) }, <span class="kw">by</span> dept_name];
+
+<span class="cm">// An optional lookup is a nullable scalar</span>
+<span class="kw">let</span> selected = <span class="fn-name">scalar</span>(args[<span class="kw">filter</span> name == <span class="str">"limit"</span>, <span class="kw">select</span> { value }]);
+<span class="kw">let</span> limit = <span class="fn-name">Int64</span>(<span class="fn-name">coalesce</span>(selected, <span class="str">"100"</span>));</code></pre>
         </div>
       </div>
 

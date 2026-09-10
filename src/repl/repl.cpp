@@ -21,6 +21,7 @@
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
+#include <ibex/parser/scalar_bindings.hpp>
 #include <ibex/repl/repl.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -4997,34 +4998,46 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
     return true;
 }
 
-auto literal_args(const std::vector<ir::Expr>& exprs)
+auto literal_args(const std::vector<ir::Expr>& exprs, const runtime::ScalarRegistry& scalars,
+                  const runtime::ExternRegistry& externs)
     -> std::expected<runtime::ExternArgs, std::string> {
     runtime::ExternArgs args;
     args.reserve(exprs.size());
     for (const auto& expr : exprs) {
-        const auto* literal = std::get_if<ir::Literal>(&expr.node);
-        if (literal == nullptr) {
-            return std::unexpected("whole-script execution requires literal extern arguments");
+        auto value = runtime::evaluate_scalar_expr(expr, &scalars, &externs);
+        if (!value.has_value()) {
+            return std::unexpected("whole-script extern argument: " + value.error());
         }
-        runtime::ScalarValue value;
-        const bool supported = std::visit(
-            [&](const auto& source) {
-                using T = std::decay_t<decltype(source)>;
-                if constexpr (std::is_same_v<T, std::int64_t> || std::is_same_v<T, double> ||
-                              std::is_same_v<T, bool> || std::is_same_v<T, std::string> ||
-                              std::is_same_v<T, Date> || std::is_same_v<T, Timestamp>) {
-                    value = source;
-                    return true;
-                }
-                return false;
-            },
-            literal->value);
-        if (!supported) {
-            return std::unexpected("unsupported literal extern argument");
+        if (runtime::is_null_scalar(*value)) {
+            return std::unexpected("null argument in extern function call");
         }
-        args.push_back(std::move(value));
+        args.push_back(std::move(*value));
     }
     return args;
+}
+
+auto plan_calls_any_extern(const ir::Node& node, const std::set<std::string>& callees) -> bool {
+    if (node.kind() == ir::NodeKind::ExternCall &&
+        callees.contains(ir::node_cast<ir::ExternCallNode>(node).callee())) {
+        return true;
+    }
+    if (node.kind() == ir::NodeKind::Program) {
+        const auto& program = ir::node_cast<ir::ProgramNode>(node);
+        for (const auto& preamble : program.preamble()) {
+            if (preamble != nullptr && plan_calls_any_extern(*preamble, callees)) {
+                return true;
+            }
+        }
+        if (plan_calls_any_extern(program.main_node(), callees)) {
+            return true;
+        }
+    }
+    for (const auto& child : node.children()) {
+        if (child != nullptr && plan_calls_any_extern(*child, callees)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// Highest NodeId anywhere in `node`'s subtree. Used to mint a fresh id for a
@@ -5049,6 +5062,7 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
                                              const runtime::TableRegistry& base_tables,
                                              const std::set<std::string>& lazy_callees,
                                              runtime::ExternRegistry& externs,
+                                             const runtime::ScalarRegistry& scalars,
                                              bool root_order_insensitive = false)
     -> std::expected<runtime::Table, std::string> {
     auto [rewritten, sources] = ir::hoist_extern_sources(std::move(plan), lazy_callees);
@@ -5066,7 +5080,7 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
     }
     for (const auto& source : sources) {
         const auto* function = externs.find(source.callee);
-        auto args = literal_args(source.args);
+        auto args = literal_args(source.args, scalars, externs);
         if (function == nullptr || !function->lazy_table_func) {
             return std::unexpected("lazy source unavailable: " + source.callee);
         }
@@ -5241,9 +5255,8 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
     };
     // Absorb scan filters before computing demand, so a column referenced
     // only by a pushed filter is decoded for the selection but never
-    // gathered into the scan's output. No ScalarRegistry is passed to
-    // project_where: batch-eligible scripts cannot bind scalars, so a
-    // pushed conjunct can never reference one.
+    // gathered into the scan's output. Scalar lets are resolved before this
+    // plan is built, so pushed predicates can evaluate lexical scalar refs.
     const auto absorbed = absorb_lazy_scan_filters(
         rewritten, [&](const std::string& name) { return resolve_lazy(name) != nullptr; });
     // What absorption just took out of the tree. The deferred-probe gate
@@ -5353,17 +5366,17 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
     // Everything not deferred or streamed is decoded eagerly into the
     // registry now, narrowed to its demand with its absorbed filter applied.
     if (auto ok = decode_demanded_lazy_sources(
-            demand, absorbed, resolve_lazy, exec, nullptr, tables,
+            demand, absorbed, resolve_lazy, exec, &scalars, tables,
             [&](const std::string& name) { return deferred_scans.contains(name); });
         !ok.has_value()) {
         return std::unexpected(ok.error());
     }
-    return runtime::interpret(*rewritten, tables, nullptr, &externs, nullptr, exec);
+    return runtime::interpret(*rewritten, tables, &scalars, &externs, nullptr, exec);
 }
 
 /// Executes relational batch scripts whose top-level effects are represented
-/// by ScriptPlan. Scalar, tuple, import, and function semantics remain on the
-/// mature statement-at-a-time path until they have equivalent plan nodes.
+/// by ScriptPlan. Tuple destructuring and expression-level effects that cannot
+/// be represented in the plan remain on the mature statement-at-a-time path.
 /// Returns nullopt when the script is not eligible for whole-script planning
 /// and the caller must fall back to statement-at-a-time execution. Declining is
 /// silent and the two paths differ in speed, so `decline_reason` (when non-null)
@@ -5442,9 +5455,6 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
                 !std::holds_alternative<parser::FunctionDecl>(imported)) {
                 return decline("import stub has statements beyond declarations");
             }
-            if (std::holds_alternative<parser::FunctionDecl>(imported)) {
-                return decline("import stub declares a function");
-            }
         }
         imported_units.push_back(std::move(*parsed));
         prelude.push_back(&imported_units.back());
@@ -5491,6 +5501,36 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         return decline("script has no lazy table sources to plan against");
     }
 
+    auto scalar_bindings = parser::collect_scalar_binding_set(program, prelude);
+    if (!scalar_bindings.has_value()) {
+        return decline(
+            ibex::formatting::format("scalar bindings did not lower: {}", scalar_bindings.error()));
+    }
+
+    // A deferred scalar whose own subquery opens a lazy reader would have to
+    // instantiate that reader before the whole-script planner has resolved its
+    // sources. Keep this circular shape on the statement path until W1b gives
+    // expression evaluation an effect-aware extern route.
+    for (const auto& binding : scalar_bindings->deferred) {
+        for (const auto& source : binding.sources) {
+            if (source.plan != nullptr && plan_calls_any_extern(*source.plan, lazy_callees)) {
+                return decline("a deferred scalar depends on a lazy table source");
+            }
+        }
+    }
+
+    runtime::TableRegistry base_tables = build_builtin_tables();
+    runtime::ScalarRegistry scalars;
+    for (auto& [name, value] : scalar_bindings->compile_time) {
+        scalars.insert_or_assign(name, std::move(value));
+    }
+    if (auto materialized = runtime::materialize_deferred_scalar_bindings(
+            scalar_bindings->deferred, base_tables, scalars, &externs);
+        !materialized.has_value()) {
+        ibex::formatting::print("error: {}\n", materialized.error());
+        return false;
+    }
+
     // Resolve the readers BEFORE lowering, so lowering knows what they return.
     //
     // Join filter pushdown runs inside lower_script -- it has to, because it
@@ -5526,7 +5566,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
                     continue;
                 }
                 const auto* function = externs.find(source.callee);
-                auto args = literal_args(source.args);
+                auto args = literal_args(source.args, scalars, externs);
                 if (function == nullptr || !function->lazy_table_func || !args.has_value()) {
                     continue;
                 }
@@ -5634,7 +5674,6 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
     // declaration order (a later one may scan an earlier one), before any sink
     // or result plan. Their plans are pure relational expressions, so running
     // them ahead of the sinks does not reorder any observable effect.
-    runtime::TableRegistry base_tables = build_builtin_tables();
     std::map<std::string, bool> shared_order_insensitive;
     for (const auto& shared : script->shared_bindings) {
         ir::BindingOrderUses uses;
@@ -5660,7 +5699,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
     for (auto& shared : script->shared_bindings) {
         const bool root_order_insensitive = shared_order_insensitive.at(shared.name);
         auto table = optimize_and_execute_plan(std::move(shared.plan), base_tables, lazy_callees,
-                                               externs, root_order_insensitive);
+                                               externs, scalars, root_order_insensitive);
         if (!table.has_value()) {
             ibex::formatting::print("error: {}\n", table.error());
             return false;
@@ -5679,7 +5718,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         }
         if (!input.has_value()) {
             input = optimize_and_execute_plan(std::move(sink.input), base_tables, lazy_callees,
-                                              externs);
+                                              externs, scalars);
             if (input.has_value() && sink.input_binding.has_value()) {
                 cached_bindings.insert_or_assign(*sink.input_binding, input.value());
             }
@@ -5688,7 +5727,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             ibex::formatting::print("error: {}\n", input.error());
             return false;
         }
-        auto args = literal_args(sink.args);
+        auto args = literal_args(sink.args, scalars, externs);
         if (!args.has_value()) {
             ibex::formatting::print("error: {}\n", args.error());
             return false;
@@ -5708,7 +5747,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
     }
     if (!result.has_value()) {
         result = optimize_and_execute_plan(std::move(script->result), base_tables, lazy_callees,
-                                           externs);
+                                           externs, scalars);
     }
     if (!result.has_value()) {
         ibex::formatting::print("error: {}\n", result.error());

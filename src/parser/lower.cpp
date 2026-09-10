@@ -1555,7 +1555,12 @@ class Lowerer {
                 if (!value.has_value()) {
                     // Not a table expression — check whether it's a scalar call
                     // (e.g. ws_listen(8765)) used purely for its side effect.
-                    if (const auto* call = std::get_if<CallExpr>(&expr_stmt.expr->node)) {
+                    if (const auto* call = std::get_if<CallExpr>(&expr_stmt.expr->node);
+                        call != nullptr && !table_externs_.contains(call->callee) &&
+                        !(functions_.contains(call->callee) &&
+                          (functions_.at(call->callee)->return_type.kind == Type::Kind::DataFrame ||
+                           functions_.at(call->callee)->return_type.kind ==
+                               Type::Kind::TimeFrame))) {
                         std::vector<ir::Expr> args;
                         args.reserve(call->args.size());
                         bool args_ok = true;

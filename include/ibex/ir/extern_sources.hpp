@@ -26,9 +26,9 @@ struct ExternSource {
 /// script as one plan: required-column and predicate passes can now compute a
 /// single demand for every physical source.
 ///
-/// Only calls whose arguments are literals are hoisted.  A dynamic argument
-/// could depend on evaluation order or a scalar binding, so keeping it as an
-/// ExternCall is the conservative choice.
+/// Calls with literal arguments are coalesced by value. Calls with dynamic
+/// scalar arguments are hoisted as distinct sources; the whole-script driver
+/// resolves those arguments before constructing the LazyTable.
 [[nodiscard]] auto hoist_extern_sources(NodePtr root, const std::set<std::string>& eligible_callees)
     -> std::pair<NodePtr, std::vector<ExternSource>>;
 

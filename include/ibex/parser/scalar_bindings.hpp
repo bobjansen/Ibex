@@ -20,6 +20,7 @@
 #include <expected>
 #include <optional>
 #include <robin_hood.h>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -272,7 +273,8 @@ struct DeferredWrap {
 // Walk a program's top-level statements and classify every scalar `let`.
 // Table-valued lets are lowered (so later scalar lets and subqueries can
 // reference them via the shared LowerContext) but not returned.
-[[nodiscard]] inline auto collect_scalar_binding_set(const Program& program)
+[[nodiscard]] inline auto collect_scalar_binding_set(const Program& program,
+                                                     std::span<const Program* const> prelude = {})
     -> std::expected<ScalarBindingSet, std::string> {
     ScalarBindingSet out;
     robin_hood::unordered_map<std::string, ScalarValue> env;
@@ -280,7 +282,7 @@ struct DeferredWrap {
 
     LowerContext lower_ctx;
 
-    for (const auto& stmt : program.statements) {
+    const auto collect_declaration = [&](const Stmt& stmt) {
         if (const auto* ext = std::get_if<ExternDecl>(&stmt)) {
             if (ext->return_type.kind == Type::Kind::DataFrame ||
                 ext->return_type.kind == Type::Kind::TimeFrame) {
@@ -290,6 +292,23 @@ struct DeferredWrap {
             if (!ext->params.empty() && ext->params[0].type.kind == Type::Kind::DataFrame) {
                 lower_ctx.sink_externs.insert(ext->name);
             }
+        } else if (const auto* fn = std::get_if<FunctionDecl>(&stmt)) {
+            lower_ctx.functions.insert_or_assign(fn->name, fn);
+        }
+    };
+    for (const auto* unit : prelude) {
+        for (const auto& stmt : unit->statements) {
+            collect_declaration(stmt);
+        }
+    }
+
+    for (const auto& stmt : program.statements) {
+        if (std::holds_alternative<ExternDecl>(stmt)) {
+            collect_declaration(stmt);
+            continue;
+        }
+        if (std::holds_alternative<FunctionDecl>(stmt)) {
+            collect_declaration(stmt);
             continue;
         }
 

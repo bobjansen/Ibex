@@ -71,15 +71,23 @@ void rewrite(NodePtr& node, const std::set<std::string>& eligible,
             return;
         }
         const auto key = call_key(call);
-        if (!key.has_value()) {
-            return;
-        }
-        auto [it, inserted] = names.emplace(*key, "__ibex_source_" + std::to_string(names.size()));
-        if (inserted) {
+        if (key.has_value()) {
+            auto [it, inserted] =
+                names.emplace(*key, "__ibex_source_" + std::to_string(names.size()));
+            if (inserted) {
+                sources.push_back(ExternSource{
+                    .source_name = it->second, .callee = call.callee(), .args = call.args()});
+            }
+            node = std::make_unique<ScanNode>(node->id(), it->second);
+        } else {
+            // A dynamic call cannot be safely coalesced syntactically: two
+            // expressions may evaluate to the same value, or an extern scalar
+            // expression may be effectful. Give each call site its own source.
+            const auto source_name = "__ibex_source_dynamic_" + std::to_string(node->id().value);
             sources.push_back(ExternSource{
-                .source_name = it->second, .callee = call.callee(), .args = call.args()});
+                .source_name = source_name, .callee = call.callee(), .args = call.args()});
+            node = std::make_unique<ScanNode>(node->id(), source_name);
         }
-        node = std::make_unique<ScanNode>(node->id(), it->second);
         return;
     }
 

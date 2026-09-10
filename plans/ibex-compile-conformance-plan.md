@@ -70,8 +70,8 @@ Nothing tells you the surfaces have diverged until a user hits it.
 | Construct | S2 whole-script | S1 transpile | Symptom |
 |---|---|---|---|
 | `map { }` clause (pure cells) | via S3 peel; S2 declines | **yes** — `MapNode` → `ibex::ops::map` (**W1a DONE**) | effectful cells: W1b |
-| non-literal extern-call args (`read_csv(runtime_path)`) | **no** — `src/repl/repl.cpp:5010` "whole-script execution requires literal extern arguments" | **no** — `src/codegen/emitter.cpp:1422/1469` "non-literal argument in extern call" | S1 half falls out of W1a's `emit_raw_expr`; general lift W2; S2 half W1b |
-| top-level `fn … -> DataFrame` as the result | S2 declines on **any** `fn` (`src/repl/repl.cpp:~5216`) → runs on S3 | **no** — "no expression to lower" / "unsupported scalar let" | W3 |
+| non-literal extern-call args (`read_csv(runtime_path)`) | **yes** — materialized scalar bindings feed lazy-source construction (**W2-S2 DONE**) | **yes** — `ibex::ops::scalar_arg` (**W2-S1 DONE**) | deferred scalar sourced by the same lazy-reader graph still declines |
+| top-level `fn … -> DataFrame` as the result | **yes** — table UDF is inlined (**W3 DONE**) | **yes** — same inliner (**W3 DONE**) | effectful `map` bodies remain W1b |
 | `model { }` clause | yes | **no** — `src/codegen/emitter.cpp:860` "model clause is not yet supported in compiled mode" | W4 |
 | `window` + `select` | yes | **no** — `emitter.cpp:509` | W5 |
 | `aligned` window | yes | **no** — `emitter.cpp:513` | W5 |
@@ -274,13 +274,19 @@ Test: `tests/data/compile_parse_args.ibex` + `ibex-e2e.sh` (transpile, compile,
 run with and without argv, check row count + label). `test_codegen` for the
 `main` signature switch.
 
-### W2-S2 — not started
+### W2-S2 — **DONE** (2026-09-10, uncommitted)
 
-Lift the whole-script `literal_args` guard (`src/repl/repl.cpp:5010`) to
-resolve args against the materialized `ScalarRegistry` (keep a guard for the
-circular `let p = scalar(read_parquet(...)[...])` case). Perf only — those
-scripts already run correctly via the S3 fallback. Coordinate with
-`plans/extern-series-arguments-plan.md` (`Series<T>` extern-arg ABI).
+The whole-script path now collects compile-time and deferred scalar bindings,
+materializes them before source construction, and evaluates source/sink args
+against that `ScalarRegistry`. Dynamic readers are hoisted into distinct lazy
+sources (literal readers retain value-based coalescing), and the registry is
+also passed through pushed-filter decoding and final interpretation.
+
+The circular case remains an explicit, observable decline: a deferred scalar
+whose own subplan calls a lazy reader stays on the statement path. Resolving
+that graph without eager or duplicated effects belongs to W1b. `Series<T>`
+extern arguments remain the separate ABI project in
+`plans/extern-series-arguments-plan.md`.
 
 ---
 
@@ -305,9 +311,13 @@ table-returning `fn`, and the whole-script planner plans function-organised
 scripts. Test: `tests/parity/cases/table_udf.ibex` (transpile+match),
 `tests/test_lower.cpp` (inline shape, recursion rejected).
 
-Still open: `ibex_compile` on `import "fs"; csv_dir_to_parquet(…)` — the stub
-declares a `fn`, and `csv_dir_to_parquet`'s body uses `map` with an **effectful**
-cell, which is W1b, not W3.
+Import stubs containing `fn` declarations no longer force a whole-script
+decline; their declarations are supplied to both scalar-binding collection and
+script lowering. A helper whose body can be inlined therefore stays on the
+whole-script path. Still open: `ibex_compile` on `import "fs";
+csv_dir_to_parquet(…)` — `csv_dir_to_parquet` uses `map` with an **effectful**
+cell, which is W1b, not W3. It now declines for that precise lowering gap rather
+than merely because its stub contains a function.
 
 ### original plan (kept for history)
 
@@ -358,8 +368,8 @@ has been chased one combo at a time — W5 is finishing that list. Lower priorit
    route, not native loop; see the W1a section above). `emit_raw_expr`-as-C++
    was *not* built, so W2/W4 do not inherit it.
 3. ~~**W3** (functions)~~ — **DONE**: S2 decline removed + `inline_table_udf`.
-4. **W2** — S1 (`ibex::ops::scalar_arg`) + S1b (`parse_args` argv forwarding)
-   **DONE**; S2 (whole-script `literal_args`) not started, perf-only.
+4. ~~**W2** — S1 (`ibex::ops::scalar_arg`), S1b (`parse_args` argv forwarding),
+   and S2 (whole-script scalar extern args)~~ — **DONE**.
 5. **W1b** (runtime extern-expr evaluator) — only if S2 `map` planning or
    evaluator unification is wanted. Deprioritised by the reframe.
 6. **W4 / W5** — lower priority, independent.

@@ -850,7 +850,8 @@ extern fn capture(df: DataFrame, tag: String) -> Int from "fake.hpp";
 
 let input = read_fake();
 let early = input[filter a > 1, select { a }];
-capture(early, "early");
+let early_tag = "early";
+capture(early, early_tag);
 let result = input[filter a > 2, select { a }];
 capture(result, "result");
 result;
@@ -1984,6 +1985,118 @@ rows[filter a > 1, select { n = count() }];
     CHECK(capture_planner_line(source, registry) == "planner: whole-script");
 }
 
+TEST_CASE("REPL whole-script planner resolves scalar reader arguments",
+          "[repl][lazy][planner][scalar]") {
+    const auto register_sources = [](ibex::runtime::ExternRegistry& registry,
+                                     std::vector<std::string>& paths) {
+        registry.register_table("manifest",
+                                [](const ibex::runtime::ExternArgs&)
+                                    -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                    ibex::runtime::Table table;
+                                    table.add_column("path", ibex::Column<std::string>{"chosen"});
+                                    return ibex::runtime::ExternValue{std::move(table)};
+                                });
+        registry.register_table(
+            "read_path",
+            [](const ibex::runtime::ExternArgs& args)
+                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                const auto* path = args.size() == 1 ? std::get_if<std::string>(&args[0]) : nullptr;
+                if (path == nullptr) {
+                    return std::unexpected("read_path expects one String argument");
+                }
+                ibex::runtime::Table table;
+                if (*path == "manifest") {
+                    table.add_column("path", ibex::Column<std::string>{"chosen"});
+                } else {
+                    table.add_column("a", ibex::Column<std::int64_t>{1, 2, 3});
+                }
+                return ibex::runtime::ExternValue{std::move(table)};
+            });
+        registry.register_lazy_table(
+            "read_path",
+            [&paths](const ibex::runtime::ExternArgs& args)
+                -> std::expected<ibex::runtime::LazyTablePtr, std::string> {
+                const auto* path = args.size() == 1 ? std::get_if<std::string>(&args[0]) : nullptr;
+                if (path == nullptr) {
+                    return std::unexpected("read_path expects one String argument");
+                }
+                paths.push_back(*path);
+                const bool is_manifest = *path == "manifest";
+                ibex::runtime::Table schema;
+                if (is_manifest) {
+                    schema.add_column("path", ibex::Column<std::string>{});
+                } else {
+                    schema.add_column("a", ibex::Column<std::int64_t>{});
+                }
+                return std::make_shared<ibex::runtime::LazyTable>(
+                    std::move(schema), is_manifest ? 1 : 3,
+                    [is_manifest](const std::vector<std::string>& names,
+                                  const ibex::runtime::Selection* selection)
+                        -> std::expected<ibex::runtime::Table, std::string> {
+                        const ibex::runtime::Selection all{0, 1, 2};
+                        const auto& rows = selection == nullptr ? all : *selection;
+                        ibex::runtime::Table table;
+                        if (is_manifest && std::ranges::find(names, "path") != names.end()) {
+                            table.add_column("path", ibex::Column<std::string>{"chosen"});
+                            table.logical_rows = 1;
+                        } else if (!is_manifest && std::ranges::find(names, "a") != names.end()) {
+                            std::vector<std::int64_t> values;
+                            for (const auto row : rows) {
+                                values.push_back(static_cast<std::int64_t>(row + 1));
+                            }
+                            table.add_column("a", ibex::Column<std::int64_t>{std::move(values)});
+                            table.logical_rows = rows.size();
+                        }
+                        return table;
+                    });
+            });
+    };
+
+    SECTION("compile-time scalar expression") {
+        ibex::runtime::ExternRegistry registry;
+        std::vector<std::string> paths;
+        register_sources(registry, paths);
+        const std::string source = R"(
+extern fn read_path(path: String) -> DataFrame from "fake.hpp";
+let prefix = "cho";
+let threshold = 1;
+read_path(`${prefix}sen`)[filter a > threshold, select { n = count() }];
+)";
+        CHECK(capture_planner_line(source, registry) == "planner: whole-script");
+        REQUIRE_FALSE(paths.empty());
+        CHECK(std::ranges::all_of(paths, [](const auto& path) { return path == "chosen"; }));
+    }
+
+    SECTION("deferred scalar expression") {
+        ibex::runtime::ExternRegistry registry;
+        std::vector<std::string> paths;
+        register_sources(registry, paths);
+        const std::string source = R"(
+extern fn manifest() -> DataFrame from "fake.hpp";
+extern fn read_path(path: String) -> DataFrame from "fake.hpp";
+let paths = manifest();
+let path = scalar(paths[select { path }]);
+read_path(path)[select { n = count() }];
+)";
+        CHECK(capture_planner_line(source, registry) == "planner: whole-script");
+        REQUIRE_FALSE(paths.empty());
+        CHECK(std::ranges::all_of(paths, [](const auto& path) { return path == "chosen"; }));
+    }
+
+    SECTION("a scalar sourced from the lazy reader stays on the statement path") {
+        ibex::runtime::ExternRegistry registry;
+        std::vector<std::string> paths;
+        register_sources(registry, paths);
+        const std::string source = R"(
+extern fn read_path(path: String) -> DataFrame from "fake.hpp";
+let path = scalar(read_path("manifest")[select { path }]);
+read_path(path)[select { n = count() }];
+)";
+        CHECK(capture_planner_line(source, registry) ==
+              "planner: statements (a deferred scalar depends on a lazy table source)");
+    }
+}
+
 TEST_CASE("REPL reports why the whole-script planner declined", "[repl][lazy][planner]") {
     // Declining is otherwise invisible, and the fallback path has different
     // performance -- a benchmark that cannot see the mode reads a gate change
@@ -2051,19 +2164,49 @@ read_fake()[select { n = count() }];
     config.plugin_search_paths = {dir.string()};
     CHECK(capture_planner_line(source, registry, config) == "planner: whole-script");
 
-    // A stub is read for declarations only, so anything else in one has to send
-    // the script back to the path that executes it.
+    // Function declarations in a stub are part of the lowering prelude, just
+    // like functions declared in the main script.
     {
         std::ofstream stub{dir / "fnlib.ibex"};
         stub << "extern fn read_fake() -> DataFrame from \"fake.hpp\";\n"
-             << "fn double_it(x: Int) -> Int {\n  x * 2;\n}\n";
+             << "fn count_rows(df: DataFrame) -> DataFrame {\n"
+             << "  df[select { n = count() }];\n}\n";
     }
     const std::string with_fn = R"(
 import "fnlib";
-read_fake()[select { n = count() }];
+count_rows(read_fake());
 )";
-    CHECK(capture_planner_line(with_fn, registry, config) ==
-          "planner: statements (import stub declares a function)");
+    CHECK(capture_planner_line(with_fn, registry, config) == "planner: whole-script");
+
+    // A map body containing an extern call still needs W1b. Removing the
+    // blanket import-stub decline exposes the precise lowering boundary rather
+    // than blaming the presence of an otherwise valid function declaration.
+    {
+        std::ofstream stub{dir / "maplib.ibex"};
+        stub << "extern fn read_fake() -> DataFrame from \"fake.hpp\";\n"
+             << "extern fn touch(x: Int) -> Int from \"fake.hpp\";\n"
+             << "fn touch_rows(df: DataFrame) -> DataFrame {\n"
+             << "  df[map { value = touch(a) }];\n}\n";
+    }
+    registry.register_scalar(
+        "touch", ibex::runtime::ScalarKind::Int,
+        [](const ibex::runtime::ExternArgs& args)
+            -> std::expected<ibex::runtime::ExternValue, std::string> { return args.at(0); });
+    registry.register_table("read_fake",
+                            [](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                ibex::runtime::Table table;
+                                table.add_column("a", ibex::Column<std::int64_t>{1, 2, 3});
+                                table.add_column("b", ibex::Column<std::int64_t>{10, 20, 30});
+                                return ibex::runtime::ExternValue{std::move(table)};
+                            });
+    register_recording_lazy_source(registry, decode_calls);
+    const std::string with_effectful_map = R"(
+import "maplib";
+touch_rows(read_fake());
+)";
+    CHECK(capture_planner_line(with_effectful_map, registry, config) ==
+          "planner: statements (script did not lower: map { } runs only on the interpreter path)");
 
     std::filesystem::remove_all(dir);
 }

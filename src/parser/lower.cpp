@@ -1604,9 +1604,6 @@ class Lowerer {
     }
 
     auto lower_program(const Program& program) -> LowerResult {
-        // Surface 1 (`ibex_compile`) is the only path allowed to lower a
-        // `map { }` clause into a `MapNode`; see the note on `MapNode`.
-        allow_map_ = true;
         auto plan = lower_script(program);
         if (!plan.has_value()) {
             return std::unexpected(plan.error());
@@ -2224,15 +2221,8 @@ class Lowerer {
         }
 
         // `map { }` is the terminal, standalone clause of a block: it replaces
-        // the column set outright and evaluates its fields row-wise. Surfaces 2
-        // (whole-script) and 3 (REPL statement) never lower one — the REPL peels
-        // it and the whole-script driver declines — so a `MapNode` is only ever
-        // built here, on the `ibex_compile` path (`allow_map_`).
+        // the column set outright and evaluates its fields row-wise.
         if (state.map != nullptr) {
-            if (!allow_map_) {
-                return std::unexpected(
-                    LowerError{.message = "map { } runs only on the interpreter path"});
-            }
             const bool has_other_clause = state.filter || state.select || state.distinct ||
                                           state.update || state.rename || state.order ||
                                           state.head || state.tail || state.by || state.window ||
@@ -5351,7 +5341,6 @@ class Lowerer {
     TableRefCounts let_counts_;
     std::vector<SharedBinding> shared_bindings_;
     bool share_repeated_bindings_ = false;
-    bool allow_map_ = false;
     robin_hood::unordered_map<std::string, std::vector<std::string>> compile_time_lists_;
     robin_hood::unordered_set<std::string> table_externs_;
     robin_hood::unordered_set<std::string> sink_externs_;

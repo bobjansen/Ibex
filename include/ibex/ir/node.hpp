@@ -597,9 +597,8 @@ enum class NodeKind : std::uint8_t {
     FilterTail,  ///< Fused Tail(Filter(x)) — produced by canonicalize R8.
     TopK,        ///< Fused Head(Order(x)) / Tail(Order(x)) — produced by canonicalize R16.
     Map,         ///< Row-wise `map { name = expr, ... }`: one row per input row, only the
-                 ///< named columns. Emitter-only today — `parser::lower` (surface 1) is the
-                 ///< only producer; whole-script declines and the REPL peels a `map` clause
-                 ///< before lowering, so the optimizer treats it as an ordered barrier.
+                 ///< named columns. All surfaces produce it; the optimizer treats it as an
+                 ///< ordered, effectful barrier.
 };
 
 /// How a StreamNode triggers output emission.
@@ -1235,12 +1234,9 @@ class TransposeNode final : public Node {
 /// frame with one row per input row and exactly the named columns (unlike
 /// `update`, which retains every input column). Row order is preserved.
 ///
-/// This is an emitter-only IR node: `parser::lower` (surface 1, `ibex_compile`)
-/// is the only path that builds one. `try_execute_whole_script` declines on a
-/// `map` clause and the REPL statement path peels it before lowering, so
-/// `interpret()` only ever sees a `MapNode` when re-entered from emitted
-/// `ibex::ops::map`. Because surface 1 still runs `ir::optimize_plan`, every
-/// pass must treat it as opaque, ordered and effectful (mirror `NodeKind::Stream`).
+/// Every execution surface lowers this node. Because its expressions may call
+/// effectful externs, every optimizer pass must treat it as opaque, ordered and
+/// effectful (mirror `NodeKind::Stream`).
 class MapNode final : public Node {
    public:
     MapNode(NodeId id, std::vector<FieldSpec> fields)

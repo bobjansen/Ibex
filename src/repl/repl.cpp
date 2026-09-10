@@ -3613,156 +3613,6 @@ auto eval_series_call(parser::CallExpr& call, runtime::TableRegistry& tables,
     return EvalValue{std::move(col.value())};
 }
 
-// Read one cell of a table column as a ScalarValue, honouring the validity
-// bitmap (a null cell becomes the monostate alternative). Mirrors
-// runtime::scalar_from_column, kept local so repl.cpp needs no runtime-internal
-// header.
-auto map_cell_scalar(const runtime::ColumnEntry& entry, std::size_t row) -> runtime::ScalarValue {
-    if (entry.validity.has_value() && !(*entry.validity)[row]) {
-        return runtime::ScalarValue{std::monostate{}};
-    }
-    return std::visit(
-        [&](const auto& col) -> runtime::ScalarValue {
-            using ColT = std::decay_t<decltype(col)>;
-            if constexpr (std::is_same_v<ColT, Column<Categorical>> ||
-                          std::is_same_v<ColT, Column<std::string>>) {
-                return std::string(col[row]);
-            } else {
-                return col[row];
-            }
-        },
-        *entry.column);
-}
-
-// Build one output column of a `map { }` result from the per-row scalar values.
-// Type comes from the first non-null value (int widens to double if a later
-// value is double); a genuinely mixed column is an error. Empty / all-null ->
-// an all-null Int64 column.
-auto map_column_from_scalars(const std::vector<runtime::ScalarValue>& vals)
-    -> std::expected<runtime::ColumnEntry, std::string> {
-    const auto build = [&]<class T>(T /*tag*/) -> std::expected<runtime::ColumnEntry, std::string> {
-        Column<T> col;
-        col.reserve(vals.size());
-        runtime::ValidityBitmap validity;
-        bool any_null = false;
-        for (const auto& v : vals) {
-            if (std::holds_alternative<std::monostate>(v)) {
-                col.push_back(T{});
-                validity.push_back(false);
-                any_null = true;
-                continue;
-            }
-            if (const auto* p = std::get_if<T>(&v)) {
-                col.push_back(*p);
-            } else if constexpr (std::is_same_v<T, double>) {
-                if (const auto* i = std::get_if<std::int64_t>(&v)) {
-                    col.push_back(static_cast<double>(*i));
-                } else {
-                    return std::unexpected("mixed value types in one column");
-                }
-            } else {
-                return std::unexpected("mixed value types in one column");
-            }
-            validity.push_back(true);
-        }
-        runtime::ColumnEntry entry;
-        entry.column = std::make_shared<runtime::ColumnValue>(std::move(col));
-        if (any_null) {
-            entry.validity = std::move(validity);
-        }
-        return entry;
-    };
-
-    for (const auto& v : vals) {
-        if (std::holds_alternative<std::int64_t>(v)) {
-            // Look ahead: a double anywhere promotes the whole column.
-            for (const auto& w : vals) {
-                if (std::holds_alternative<double>(w)) {
-                    return build(double{});
-                }
-            }
-            return build(std::int64_t{});
-        }
-        if (std::holds_alternative<double>(v)) {
-            return build(double{});
-        }
-        if (std::holds_alternative<bool>(v)) {
-            return build(bool{});
-        }
-        if (std::holds_alternative<std::string>(v)) {
-            return build(std::string{});
-        }
-        if (std::holds_alternative<Date>(v)) {
-            return build(Date{});
-        }
-        if (std::holds_alternative<Timestamp>(v)) {
-            return build(Timestamp{});
-        }
-    }
-    return build(std::int64_t{});  // empty or all-null
-}
-
-// Row-wise `map { name = expr, ... }` — the terminal clause of a block. Evaluate
-// the field expressions once per input row with that row's columns bound as
-// scalars, permitting effectful extern calls (`read_csv` / `write_parquet`) in
-// the cell expressions. Output is one row per input row with the named columns.
-auto eval_map_clause(parser::MapClause& clause, const runtime::Table& input,
-                     runtime::TableRegistry& tables, LazyTableRegistry& lazy_tables,
-                     runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                     ModelRegistry& models, const FunctionRegistry& functions,
-                     CompileTimeListRegistry& compile_time_lists,
-                     const ExternDeclRegistry& extern_decls, const runtime::ExternRegistry& externs)
-    -> std::expected<runtime::Table, std::string> {
-    if (clause.fields.empty()) {
-        return std::unexpected("map { } needs at least one field");
-    }
-    const std::size_t n = input.rows();
-    const std::size_t nf = clause.fields.size();
-    std::vector<std::vector<runtime::ScalarValue>> acc(nf);
-    for (auto& column : acc) {
-        column.reserve(n);
-    }
-
-    for (std::size_t r = 0; r < n; ++r) {
-        if (runtime::interrupt_requested()) {
-            return std::unexpected(runtime::interrupt_message());
-        }
-        runtime::ScalarRegistry row_scalars = scalars;
-        for (const auto& entry : input.columns) {
-            row_scalars[entry.name] = map_cell_scalar(entry, r);
-        }
-        for (std::size_t f = 0; f < nf; ++f) {
-            auto value =
-                eval_expr_value(*clause.fields[f].expr, tables, lazy_tables, row_scalars, columns,
-                                models, functions, compile_time_lists, extern_decls, externs);
-            if (!value) {
-                return std::unexpected(value.error());
-            }
-            if (auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
-                acc[f].push_back(std::move(*scalar));
-                continue;
-            }
-            return std::unexpected("map field '" + clause.fields[f].name +
-                                   "' must evaluate to a scalar, not a table or column");
-        }
-    }
-
-    runtime::Table out;
-    for (std::size_t f = 0; f < nf; ++f) {
-        auto entry = map_column_from_scalars(acc[f]);
-        if (!entry) {
-            return std::unexpected("map field '" + clause.fields[f].name + "': " + entry.error());
-        }
-        if (entry->validity.has_value()) {
-            out.add_column(clause.fields[f].name, std::move(*entry->column),
-                           std::move(*entry->validity));
-        } else {
-            out.add_column(clause.fields[f].name, std::move(*entry->column));
-        }
-    }
-    return out;
-}
-
 auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                      LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
                      ColumnRegistry& columns, ModelRegistry& models,
@@ -3859,28 +3709,6 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     };
 
     if (auto* block = std::get_if<parser::BlockExpr>(&expr.node)) {
-        // A trailing `map { }` is peeled off and run row-wise here: its cell
-        // expressions compose effectful externs (read_csv / write_parquet) that
-        // only compose in this eval layer, not in the IR interpreter. The
-        // prefix (everything before `map`) is evaluated by re-entering this
-        // function with the clause removed, then restored so a second
-        // evaluation of the same Expr still sees it.
-        if (!block->clauses.empty() &&
-            std::holds_alternative<parser::MapClause>(block->clauses.back())) {
-            parser::MapClause map_clause =
-                std::move(std::get<parser::MapClause>(block->clauses.back()));
-            block->clauses.pop_back();
-            auto input =
-                eval_table_expr(expr, tables, lazy_tables, scalars, columns, models, functions,
-                                compile_time_lists, extern_decls, externs, nullptr);
-            block->clauses.emplace_back(std::move(map_clause));
-            if (!input) {
-                return std::unexpected(input.error());
-            }
-            return eval_map_clause(std::get<parser::MapClause>(block->clauses.back()),
-                                   input.value(), tables, lazy_tables, scalars, columns, models,
-                                   functions, compile_time_lists, extern_decls, externs);
-        }
         if (block->base && std::holds_alternative<parser::CallExpr>(block->base->node)) {
             auto* call = std::get_if<parser::CallExpr>(&block->base->node);
             if (call != nullptr && functions.contains(call->callee)) {
@@ -5509,8 +5337,8 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
 
     // A deferred scalar whose own subquery opens a lazy reader would have to
     // instantiate that reader before the whole-script planner has resolved its
-    // sources. Keep this circular shape on the statement path until W1b gives
-    // expression evaluation an effect-aware extern route.
+    // sources. Keep this circular shape on the statement path until source
+    // planning can resolve that dependency graph without eager duplicate I/O.
     for (const auto& binding : scalar_bindings->deferred) {
         for (const auto& source : binding.sources) {
             if (source.plan != nullptr && plan_calls_any_extern(*source.plan, lazy_callees)) {

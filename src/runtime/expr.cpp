@@ -2052,7 +2052,23 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
         if (fn->kind != ExternReturnKind::Scalar || !fn->scalar_kind.has_value()) {
             return std::unexpected("function not usable in expression: " + call->callee);
         }
-        for (const auto& arg : call->args) {
+        std::size_t scalar_begin = 0;
+        if (fn->first_arg_is_table) {
+            if (call->args.empty()) {
+                return std::unexpected(call->callee + " requires a table first argument");
+            }
+            const auto* table_call = std::get_if<ir::CallExpr>(&call->args.front()->node);
+            const auto* table_fn =
+                table_call == nullptr ? nullptr : externs->find(table_call->callee);
+            if (table_fn == nullptr || table_fn->kind != ExternReturnKind::Table ||
+                table_fn->first_arg_is_table) {
+                return std::unexpected(call->callee +
+                                       ": first argument must be a table-returning extern call");
+            }
+            scalar_begin = 1;
+        }
+        for (std::size_t i = scalar_begin; i < call->args.size(); ++i) {
+            const auto& arg = call->args[i];
             auto arg_type = infer_expr_type(*arg, input, scalars, externs);
             if (!arg_type) {
                 return arg_type;
@@ -2276,29 +2292,7 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
         if (fn->kind != ExternReturnKind::Scalar) {
             return std::unexpected("function not usable in expression: " + call->callee);
         }
-        // Extern scalar functions take null-free ScalarValue arguments; a
-        // Null argument has no image there (externs never see null).
-        std::vector<ScalarValue> arg_values;
-        arg_values.reserve(call->args.size());
-        for (const auto& arg : call->args) {
-            auto value = eval_expr(*arg, input, row, scalars, externs);
-            if (!value) {
-                return value;
-            }
-            auto scalar = scalar_from_expr(value.value());
-            if (is_null_scalar(scalar)) {
-                return std::unexpected(call->callee + ": null argument in extern function call");
-            }
-            arg_values.push_back(std::move(scalar));
-        }
-        auto result = fn->func(arg_values);
-        if (!result) {
-            return std::unexpected(result.error());
-        }
-        if (auto* scalar = std::get_if<ScalarValue>(&result.value())) {
-            return expr_from_scalar(*scalar);
-        }
-        return std::unexpected("function returned table in expression: " + call->callee);
+        return eval_extern_expr(*call, input, row, scalars, externs);
     }
     return std::unexpected("unsupported expression");
 }

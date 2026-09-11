@@ -1557,10 +1557,10 @@ class Lowerer {
                     // (e.g. ws_listen(8765)) used purely for its side effect.
                     if (const auto* call = std::get_if<CallExpr>(&expr_stmt.expr->node);
                         call != nullptr && !table_externs_.contains(call->callee) &&
-                        !(functions_.contains(call->callee) &&
-                          (functions_.at(call->callee)->return_type.kind == Type::Kind::DataFrame ||
-                           functions_.at(call->callee)->return_type.kind ==
-                               Type::Kind::TimeFrame))) {
+                        (!functions_.contains(call->callee) ||
+                         (functions_.at(call->callee)->return_type.kind != Type::Kind::DataFrame &&
+                          functions_.at(call->callee)->return_type.kind !=
+                              Type::Kind::TimeFrame))) {
                         std::vector<ir::Expr> args;
                         args.reserve(call->args.size());
                         bool args_ok = true;
@@ -3096,8 +3096,8 @@ class Lowerer {
             bound[i] = call.args[i].get();
         }
         for (const auto& narg : call.named_args) {
-            const auto param = std::find_if(fn.params.begin(), fn.params.end(),
-                                            [&](const Param& p) { return p.name == narg.name; });
+            const auto param = std::ranges::find_if(
+                fn.params, [&](const Param& p) { return p.name == narg.name; });
             if (param == fn.params.end()) {
                 return std::unexpected(LowerError{
                     .message = fn.name + ": unknown named argument '" + narg.name + "'"});

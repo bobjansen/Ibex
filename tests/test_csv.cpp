@@ -385,7 +385,8 @@ TEST_CASE(
     ibex::csv::detail::ChunkedCsvSourceOperator op(
         path.string(), {"id", "qty", "shipdate", "trailing"},
         {ibex::csv::detail::CsvColumnKind::Int, ibex::csv::detail::CsvColumnKind::Int,
-         ibex::csv::detail::CsvColumnKind::Date, ibex::csv::detail::CsvColumnKind::String}, '|',
+         ibex::csv::detail::CsvColumnKind::Date, ibex::csv::detail::CsvColumnKind::String},
+        '|',
         /*rows_per_chunk=*/64);
 
     auto first = op.next();

@@ -15,15 +15,28 @@
 #include <fstream>
 #include <string>
 #include <variant>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 #include <vector>
 
 namespace {
 
 namespace stdfs = std::filesystem;
 
+auto current_process_id() -> int {
+#ifdef _WIN32
+    return _getpid();
+#else
+    return getpid();
+#endif
+}
+
 auto make_temp_dir(const std::string& tag) -> stdfs::path {
-    const auto dir =
-        stdfs::temp_directory_path() / ("ibex_fs_test_" + tag + "_" + std::to_string(::getpid()));
+    const auto dir = stdfs::temp_directory_path() /
+                     ("ibex_fs_test_" + tag + "_" + std::to_string(current_process_id()));
     std::error_code ec;
     stdfs::remove_all(dir, ec);
     stdfs::create_directories(dir);

@@ -1727,8 +1727,8 @@ auto eval_scalar_builtin(std::string_view name, const std::vector<ScalarValue>& 
     if (argc < found->min_args || (found->max_args >= 0 && argc > found->max_args)) {
         return std::unexpected(std::string(name) + ": wrong number of arguments");
     }
-    // The registry's eval takes ExprValue (which adds a Null alternative);
-    // REPL scalars are null-free, so this widening never fails.
+    // The registry evaluates ExprValue; conversion to and from ScalarValue is
+    // lossless, including ScalarValue's std::monostate null alternative.
     std::vector<ExprValue> expr_args;
     expr_args.reserve(args.size());
     for (const auto& a : args) {

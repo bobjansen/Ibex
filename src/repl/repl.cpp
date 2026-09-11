@@ -49,6 +49,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <ranges>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -2040,7 +2041,7 @@ auto apply_scalar_cast(const runtime::ScalarValue& val, std::string_view callee)
             std::string trimmed = *s;
             const auto not_space = [](unsigned char c) { return std::isspace(c) == 0; };
             trimmed.erase(trimmed.begin(), std::ranges::find_if(trimmed, not_space));
-            trimmed.erase(std::find_if(trimmed.rbegin(), trimmed.rend(), not_space).base(),
+            trimmed.erase(std::ranges::find_if(std::views::reverse(trimmed), not_space).base(),
                           trimmed.end());
             std::int64_t out{};
             const char* begin = trimmed.c_str();
@@ -4860,12 +4861,9 @@ auto plan_calls_any_extern(const ir::Node& node, const std::set<std::string>& ca
             return true;
         }
     }
-    for (const auto& child : node.children()) {
-        if (child != nullptr && plan_calls_any_extern(*child, callees)) {
-            return true;
-        }
-    }
-    return false;
+    return std::ranges::any_of(node.children(), [&callees](const auto& child) {
+        return child != nullptr && plan_calls_any_extern(*child, callees);
+    });
 }
 
 /// Highest NodeId anywhere in `node`'s subtree. Used to mint a fresh id for a

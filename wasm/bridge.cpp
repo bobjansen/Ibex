@@ -99,7 +99,9 @@ auto scalar_json(const ibex::runtime::ScalarValue& value) -> json {
     return std::visit(
         [](const auto& scalar) -> json {
             using T = std::decay_t<decltype(scalar)>;
-            if constexpr (std::same_as<T, Date>) {
+            if constexpr (std::same_as<T, std::monostate>) {
+                return nullptr;
+            } else if constexpr (std::same_as<T, Date>) {
                 return ibex::runtime::format_date(scalar);
             } else if constexpr (std::same_as<T, Timestamp>) {
                 return ibex::runtime::format_timestamp(scalar);

@@ -1688,7 +1688,7 @@ auto materialize_deferred_scalar_bindings(std::span<const ir::DeferredScalarBind
             if (!table) {
                 return std::unexpected("deferred scalar '" + binding.name + "': " + table.error());
             }
-            std::string column = source.column.value_or(
+            const std::string column = source.column.value_or(
                 table->columns.empty() ? std::string{} : table->columns.front().name);
             if (!source.column.has_value() && table->columns.size() != 1) {
                 return std::unexpected("scalar(<table>): '" + binding.name +

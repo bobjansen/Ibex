@@ -1656,19 +1656,18 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                    ", but asof requires Timestamp, Date, or Int";
         };
 
-        // The two-pointer merge only needs the time keys as int64. Timestamp is
-        // layout-compatible with int64_t (a single `nanos` member), so for the
-        // common Timestamp case read the column storage directly and skip
-        // materialising two int64 arrays — the right one spans the whole right
-        // table (128 MB at 16M rows). Date/Int convert into a backing buffer.
+        // Keep Timestamp storage typed: treating its `nanos` members as an
+        // int64_t array would make pointer arithmetic cross distinct subobjects.
+        // The merge below is instantiated for Timestamp or int64_t storage, so
+        // Timestamp remains zero-copy without compromising the hot loops.
         std::vector<std::int64_t> left_times_buf;
         std::vector<std::int64_t> right_times_buf;
-        auto as_int64_view =
-            [&](const ColumnValue& col, std::size_t n, std::vector<std::int64_t>& buf,
-                const char* label) -> std::expected<const std::int64_t*, std::string> {
+        using TimeStorage = std::variant<const Timestamp*, const std::int64_t*>;
+        auto as_time_storage = [&](const ColumnValue& col, std::size_t n,
+                                   std::vector<std::int64_t>& buf,
+                                   const char* label) -> std::expected<TimeStorage, std::string> {
             if (const auto* ts = std::get_if<Column<Timestamp>>(&col)) {
-                static_assert(sizeof(Timestamp) == sizeof(std::int64_t));
-                return reinterpret_cast<const std::int64_t*>(ts->data());
+                return ts->data();
             }
             buf.reserve(n);
             for (std::size_t i = 0; i < n; ++i) {
@@ -1681,218 +1680,238 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             return buf.data();
         };
 
-        auto left_times_v = as_int64_view(*left_time_col, n_left, left_times_buf, "left");
+        auto left_times_v = as_time_storage(*left_time_col, n_left, left_times_buf, "left");
         if (!left_times_v) {
             return std::unexpected(left_times_v.error());
         }
-        auto right_times_v = as_int64_view(*right_time_col, n_right, right_times_buf, "right");
+        auto right_times_v = as_time_storage(*right_time_col, n_right, right_times_buf, "right");
         if (!right_times_v) {
             return std::unexpected(right_times_v.error());
         }
-        const std::int64_t* left_times = *left_times_v;
-        const std::int64_t* right_times = *right_times_v;
-
-        const bool left_sorted = std::is_sorted(left_times, left_times + n_left);
-        const bool right_sorted = std::is_sorted(right_times, right_times + n_right);
-        if (!left_sorted || !right_sorted) {
-            const char* which = (!left_sorted && !right_sorted)
-                                    ? "both sides are"
-                                    : (!left_sorted ? "left is" : "right is");
-            const std::string sort_key = !left_sorted ? keys[time_pos].left : keys[time_pos].right;
-            return std::unexpected(
-                std::string("asof join: ") + which + " not sorted ascending by time index '" +
-                sort_key +
-                "' — silent look-ahead bias would be the result if this were allowed"
-                "\n  hint: order the offending side first, e.g. `<table>[order " +
-                sort_key + "]` before promoting with as_timeframe()");
-        }
-
-        std::vector<const ColumnValue*> left_eq_keys;
-        std::vector<const ColumnValue*> right_eq_keys;
-        left_eq_keys.reserve(keys.size() - 1);
-        right_eq_keys.reserve(keys.size() - 1);
-        std::vector<const ValidityBitmap*> left_eq_validity;
-        std::vector<const ValidityBitmap*> right_eq_validity;
-        bool has_null_eq_keys = false;
-        for (std::size_t i = 0; i < keys.size(); ++i) {
-            if (i == time_pos) {
-                continue;
-            }
-            left_eq_keys.push_back(left_keys[i]);
-            right_eq_keys.push_back(right_keys[i]);
-            left_eq_validity.push_back(left_key_validity[i]);
-            right_eq_validity.push_back(right_key_validity[i]);
-            has_null_eq_keys = has_null_eq_keys || left_key_validity[i] != nullptr ||
-                               right_key_validity[i] != nullptr;
-        }
-        // As in an equi-join, a null equality key matches nothing — not even
-        // another null. A null-keyed right row is never a candidate, and a
-        // null-keyed left row is left unmatched.
-        const auto left_eq_is_null = [&](std::size_t l) {
-            return has_null_eq_keys && skip_null_keys && row_key_is_null(left_eq_validity, l);
-        };
-        const auto right_eq_is_null = [&](std::size_t r) {
-            return has_null_eq_keys && skip_null_keys && row_key_is_null(right_eq_validity, r);
-        };
-        // `Key` carries one null bit per column, so a null equality key groups
-        // with the nulls rather than with the zero its cell physically holds.
-        // Past 64 columns the bit is dropped and nulls would silently rejoin the
-        // zero group, so that case is refused instead of answered wrongly.
-        if (!skip_null_keys && has_null_eq_keys && left_eq_keys.size() > kMaxKeyColumns) {
-            return std::unexpected("asof join: `nulls equal` supports at most " +
-                                   std::to_string(kMaxKeyColumns) + " equality keys");
-        }
-        const auto mark_nulls = [&](Key& key, const std::vector<const ValidityBitmap*>& validity,
-                                    std::size_t row) {
-            if (skip_null_keys) {
-                return;
-            }
-            for (std::size_t i = 0; i < validity.size(); ++i) {
-                if (validity[i] != nullptr && !(*validity[i])[row]) {
-                    key.set_null(i);
-                }
-            }
-        };
-
-        // Asof keeps every left row exactly once in input order, so the left
-        // side is the identity permutation — only the matched right row per left
-        // row varies. We therefore build just right_idx and materialise the left
-        // columns wholesale (no identity gather, no n_left index array).
-        std::vector<std::size_t> right_idx(n_left);
-        bool grouped_done = false;
-
-        if (left_eq_keys.empty()) {
-            // Time-only asof (the canonical case): with no equality keys every
-            // right row is a candidate, so a single two-pointer merge over the
-            // already-sorted time arrays finds the latest right row at-or-before
-            // each left time in O(n_left + n_right). Skips the per-row Key
-            // construction + hashing that otherwise builds one giant group over
-            // the entire right table and dominates the cost for large rights.
-            std::size_t pos = 0;  // # right rows with time <= current left time
-            for (std::size_t l = 0; l < n_left; ++l) {
-                while (pos < n_right && right_times[pos] <= left_times[l]) {
-                    ++pos;
-                }
-                right_idx[l] = (pos == 0) ? kNull : pos - 1;
-            }
-            grouped_done = true;
-        } else if (left_eq_keys.size() == 1 && !has_null_eq_keys) {
-            // Single equality key (the common asof-by case, e.g. by symbol):
-            // factorise the key column into dense codes by hashing its native
-            // values into a small dictionary (one entry per distinct key), bucket
-            // the right rows by code in ascending-time order, then two-pointer
-            // merge per bucket. No per-row Key/ScalarValue heap allocation or
-            // string copy — just value hashing into a dictionary sized to the key
-            // cardinality, and one cursor per group instead of a second hash map.
-            // Falls through to the generic path for key column types without a
-            // usable hash (Timestamp/Date) or a left/right column type mismatch.
-            const ColumnValue& rcol = *right_eq_keys[0];
-            const ColumnValue& lcol = *left_eq_keys[0];
-            std::visit(
-                [&](const auto& rc) {
-                    using ColT = std::decay_t<decltype(rc)>;
-                    using KeyV = std::decay_t<decltype(rc[std::size_t{0}])>;
-                    if constexpr (std::is_same_v<KeyV, std::string_view> ||
-                                  std::is_arithmetic_v<KeyV>) {
-                        const auto* lcp = std::get_if<ColT>(&lcol);
-                        if (lcp == nullptr) {
-                            return;  // left/right key types differ -> generic path
-                        }
-                        const auto& lc = *lcp;
-                        robin_hood::unordered_map<KeyV, std::size_t> dict;
-                        std::vector<std::vector<std::size_t>> buckets;
-                        for (std::size_t r = 0; r < n_right; ++r) {
-                            auto [it, inserted] = dict.try_emplace(rc[r], buckets.size());
-                            if (inserted) {
-                                buckets.emplace_back();
-                            }
-                            buckets[it->second].push_back(r);
-                        }
-                        // per-key merge cursors advance through `pos`.
-                        // NOLINTNEXTLINE(misc-const-correctness)
-                        std::vector<std::size_t> cursor(buckets.size(), 0);
-                        for (std::size_t l = 0; l < n_left; ++l) {
-                            auto it = dict.find(lc[l]);
-                            if (it == dict.end()) {
-                                right_idx[l] = kNull;
-                                continue;
-                            }
-                            const auto& rows = buckets[it->second];
-                            std::size_t& pos = cursor[it->second];
-                            while (pos < rows.size() && right_times[rows[pos]] <= left_times[l]) {
-                                ++pos;
-                            }
-                            right_idx[l] = (pos == 0) ? kNull : rows[pos - 1];
-                        }
-                        grouped_done = true;
+        return std::visit(
+            [&]<typename LeftTime, typename RightTime>(
+                const LeftTime* left_times,
+                const RightTime* right_times) -> std::expected<Table, std::string> {
+                const auto time_value = [](const auto& value) -> std::int64_t {
+                    using TimeT = std::decay_t<decltype(value)>;
+                    if constexpr (std::is_same_v<TimeT, Timestamp>) {
+                        return value.nanos;
+                    } else {
+                        return value;
                     }
-                },
-                rcol);
-        }
-
-        if (!grouped_done) {
-            robin_hood::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq> right_groups;
-            right_groups.reserve(n_right);
-            for (std::size_t r = 0; r < n_right; ++r) {
-                if (right_eq_is_null(r)) {
-                    continue;  // never a candidate for any left row
-                }
-                Key group;
-                group.values.reserve(right_eq_keys.size());
-                for (const auto* col : right_eq_keys) {
-                    group.values.push_back(scalar_from_column(*col, r));
-                }
-                mark_nulls(group, right_eq_validity, r);
-                right_groups[group].push_back(r);
-            }
-
-            robin_hood::unordered_map<Key, std::size_t, KeyHash, KeyEq> right_pos;
-            right_pos.reserve(right_groups.size());
-
-            for (std::size_t l = 0; l < n_left; ++l) {
-                if (left_eq_is_null(l)) {
-                    right_idx[l] = kNull;  // matches nothing, including another null
-                    continue;
-                }
-                Key group;
-                group.values.reserve(left_eq_keys.size());
-                for (const auto* col : left_eq_keys) {
-                    group.values.push_back(scalar_from_column(*col, l));
-                }
-                mark_nulls(group, left_eq_validity, l);
-
-                auto it = right_groups.find(group);
-                if (it == right_groups.end()) {
-                    right_idx[l] = kNull;
-                    continue;
+                };
+                const bool left_sorted = std::is_sorted(left_times, left_times + n_left);
+                const bool right_sorted = std::is_sorted(right_times, right_times + n_right);
+                if (!left_sorted || !right_sorted) {
+                    const char* which = (!left_sorted && !right_sorted)
+                                            ? "both sides are"
+                                            : (!left_sorted ? "left is" : "right is");
+                    const std::string sort_key =
+                        !left_sorted ? keys[time_pos].left : keys[time_pos].right;
+                    return std::unexpected(
+                        std::string("asof join: ") + which +
+                        " not sorted ascending by time index '" + sort_key +
+                        "' — silent look-ahead bias would be the result if this were allowed"
+                        "\n  hint: order the offending side first, e.g. `<table>[order " +
+                        sort_key + "]` before promoting with as_timeframe()");
                 }
 
-                auto [pos_it, inserted] = right_pos.try_emplace(group, 0);
-                (void)inserted;
-                std::size_t& pos = pos_it->second;
-                const auto& rows = it->second;
-                while (pos < rows.size() && right_times[rows[pos]] <= left_times[l]) {
-                    ++pos;
+                std::vector<const ColumnValue*> left_eq_keys;
+                std::vector<const ColumnValue*> right_eq_keys;
+                left_eq_keys.reserve(keys.size() - 1);
+                right_eq_keys.reserve(keys.size() - 1);
+                std::vector<const ValidityBitmap*> left_eq_validity;
+                std::vector<const ValidityBitmap*> right_eq_validity;
+                bool has_null_eq_keys = false;
+                for (std::size_t i = 0; i < keys.size(); ++i) {
+                    if (i == time_pos) {
+                        continue;
+                    }
+                    left_eq_keys.push_back(left_keys[i]);
+                    right_eq_keys.push_back(right_keys[i]);
+                    left_eq_validity.push_back(left_key_validity[i]);
+                    right_eq_validity.push_back(right_key_validity[i]);
+                    has_null_eq_keys = has_null_eq_keys || left_key_validity[i] != nullptr ||
+                                       right_key_validity[i] != nullptr;
+                }
+                // As in an equi-join, a null equality key matches nothing — not even
+                // another null. A null-keyed right row is never a candidate, and a
+                // null-keyed left row is left unmatched.
+                const auto left_eq_is_null = [&](std::size_t l) {
+                    return has_null_eq_keys && skip_null_keys &&
+                           row_key_is_null(left_eq_validity, l);
+                };
+                const auto right_eq_is_null = [&](std::size_t r) {
+                    return has_null_eq_keys && skip_null_keys &&
+                           row_key_is_null(right_eq_validity, r);
+                };
+                // `Key` carries one null bit per column, so a null equality key groups
+                // with the nulls rather than with the zero its cell physically holds.
+                // Past 64 columns the bit is dropped and nulls would silently rejoin the
+                // zero group, so that case is refused instead of answered wrongly.
+                if (!skip_null_keys && has_null_eq_keys && left_eq_keys.size() > kMaxKeyColumns) {
+                    return std::unexpected("asof join: `nulls equal` supports at most " +
+                                           std::to_string(kMaxKeyColumns) + " equality keys");
+                }
+                const auto mark_nulls = [&](Key& key,
+                                            const std::vector<const ValidityBitmap*>& validity,
+                                            std::size_t row) {
+                    if (skip_null_keys) {
+                        return;
+                    }
+                    for (std::size_t i = 0; i < validity.size(); ++i) {
+                        if (validity[i] != nullptr && !(*validity[i])[row]) {
+                            key.set_null(i);
+                        }
+                    }
+                };
+
+                // Asof keeps every left row exactly once in input order, so the left
+                // side is the identity permutation — only the matched right row per left
+                // row varies. We therefore build just right_idx and materialise the left
+                // columns wholesale (no identity gather, no n_left index array).
+                std::vector<std::size_t> right_idx(n_left);
+                bool grouped_done = false;
+
+                if (left_eq_keys.empty()) {
+                    // Time-only asof (the canonical case): with no equality keys every
+                    // right row is a candidate, so a single two-pointer merge over the
+                    // already-sorted time arrays finds the latest right row at-or-before
+                    // each left time in O(n_left + n_right). Skips the per-row Key
+                    // construction + hashing that otherwise builds one giant group over
+                    // the entire right table and dominates the cost for large rights.
+                    std::size_t pos = 0;  // # right rows with time <= current left time
+                    for (std::size_t l = 0; l < n_left; ++l) {
+                        while (pos < n_right &&
+                               time_value(right_times[pos]) <= time_value(left_times[l])) {
+                            ++pos;
+                        }
+                        right_idx[l] = (pos == 0) ? kNull : pos - 1;
+                    }
+                    grouped_done = true;
+                } else if (left_eq_keys.size() == 1 && !has_null_eq_keys) {
+                    // Single equality key (the common asof-by case, e.g. by symbol):
+                    // factorise the key column into dense codes by hashing its native
+                    // values into a small dictionary (one entry per distinct key), bucket
+                    // the right rows by code in ascending-time order, then two-pointer
+                    // merge per bucket. No per-row Key/ScalarValue heap allocation or
+                    // string copy — just value hashing into a dictionary sized to the key
+                    // cardinality, and one cursor per group instead of a second hash map.
+                    // Falls through to the generic path for key column types without a
+                    // usable hash (Timestamp/Date) or a left/right column type mismatch.
+                    const ColumnValue& rcol = *right_eq_keys[0];
+                    const ColumnValue& lcol = *left_eq_keys[0];
+                    std::visit(
+                        [&](const auto& rc) {
+                            using ColT = std::decay_t<decltype(rc)>;
+                            using KeyV = std::decay_t<decltype(rc[std::size_t{0}])>;
+                            if constexpr (std::is_same_v<KeyV, std::string_view> ||
+                                          std::is_arithmetic_v<KeyV>) {
+                                const auto* lcp = std::get_if<ColT>(&lcol);
+                                if (lcp == nullptr) {
+                                    return;  // left/right key types differ -> generic path
+                                }
+                                const auto& lc = *lcp;
+                                robin_hood::unordered_map<KeyV, std::size_t> dict;
+                                std::vector<std::vector<std::size_t>> buckets;
+                                for (std::size_t r = 0; r < n_right; ++r) {
+                                    auto [it, inserted] = dict.try_emplace(rc[r], buckets.size());
+                                    if (inserted) {
+                                        buckets.emplace_back();
+                                    }
+                                    buckets[it->second].push_back(r);
+                                }
+                                // per-key merge cursors advance through `pos`.
+                                // NOLINTNEXTLINE(misc-const-correctness)
+                                std::vector<std::size_t> cursor(buckets.size(), 0);
+                                for (std::size_t l = 0; l < n_left; ++l) {
+                                    auto it = dict.find(lc[l]);
+                                    if (it == dict.end()) {
+                                        right_idx[l] = kNull;
+                                        continue;
+                                    }
+                                    const auto& rows = buckets[it->second];
+                                    std::size_t& pos = cursor[it->second];
+                                    while (pos < rows.size() &&
+                                           time_value(right_times[rows[pos]]) <=
+                                               time_value(left_times[l])) {
+                                        ++pos;
+                                    }
+                                    right_idx[l] = (pos == 0) ? kNull : rows[pos - 1];
+                                }
+                                grouped_done = true;
+                            }
+                        },
+                        rcol);
                 }
 
-                right_idx[l] = (pos == 0) ? kNull : rows[pos - 1];
-            }
-        }
+                if (!grouped_done) {
+                    robin_hood::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq>
+                        right_groups;
+                    right_groups.reserve(n_right);
+                    for (std::size_t r = 0; r < n_right; ++r) {
+                        if (right_eq_is_null(r)) {
+                            continue;  // never a candidate for any left row
+                        }
+                        Key group;
+                        group.values.reserve(right_eq_keys.size());
+                        for (const auto* col : right_eq_keys) {
+                            group.values.push_back(scalar_from_column(*col, r));
+                        }
+                        mark_nulls(group, right_eq_validity, r);
+                        right_groups[group].push_back(r);
+                    }
 
-        materialize_left_identity(right_idx);
-        // One output row per left row, in left order: a `Preserve` with respect
-        // to the left input. So the left's ordering and group-major claim carry
-        // over too, not just its time index -- each surviving only if the column
-        // naming it is still present after the join's column merge.
-        apply_table_properties(output, TableProperties::derive(
-                                           table_properties_of(left),
-                                           [&](const std::string& name) -> KeyFate {
-                                               return output.index.contains(name)
-                                                          ? KeyFate::kept(name)
-                                                          : KeyFate::dropped();
-                                           },
-                                           RowTransform::Preserve));
-        return join_failure(output);
+                    robin_hood::unordered_map<Key, std::size_t, KeyHash, KeyEq> right_pos;
+                    right_pos.reserve(right_groups.size());
+
+                    for (std::size_t l = 0; l < n_left; ++l) {
+                        if (left_eq_is_null(l)) {
+                            right_idx[l] = kNull;  // matches nothing, including another null
+                            continue;
+                        }
+                        Key group;
+                        group.values.reserve(left_eq_keys.size());
+                        for (const auto* col : left_eq_keys) {
+                            group.values.push_back(scalar_from_column(*col, l));
+                        }
+                        mark_nulls(group, left_eq_validity, l);
+
+                        auto it = right_groups.find(group);
+                        if (it == right_groups.end()) {
+                            right_idx[l] = kNull;
+                            continue;
+                        }
+
+                        auto [pos_it, inserted] = right_pos.try_emplace(group, 0);
+                        (void)inserted;
+                        std::size_t& pos = pos_it->second;
+                        const auto& rows = it->second;
+                        while (pos < rows.size() &&
+                               time_value(right_times[rows[pos]]) <= time_value(left_times[l])) {
+                            ++pos;
+                        }
+
+                        right_idx[l] = (pos == 0) ? kNull : rows[pos - 1];
+                    }
+                }
+
+                materialize_left_identity(right_idx);
+                // One output row per left row, in left order: a `Preserve` with respect
+                // to the left input. So the left's ordering and group-major claim carry
+                // over too, not just its time index -- each surviving only if the column
+                // naming it is still present after the join's column merge.
+                apply_table_properties(output, TableProperties::derive(
+                                                   table_properties_of(left),
+                                                   [&](const std::string& name) -> KeyFate {
+                                                       return output.index.contains(name)
+                                                                  ? KeyFate::kept(name)
+                                                                  : KeyFate::dropped();
+                                                   },
+                                                   RowTransform::Preserve));
+                return join_failure(output);
+            },
+            *left_times_v, *right_times_v);
     }
 
     // ── Generic multi-key fallback ───────────────────────────────────────

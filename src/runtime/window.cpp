@@ -185,6 +185,13 @@ class SlidingQuantile {
             set_capacity(initial_capacity);
     }
 
+    // Heap keeps a reference to this object's position table. Copying or
+    // moving would leave those references bound to the source object.
+    SlidingQuantile(const SlidingQuantile&) = delete;
+    auto operator=(const SlidingQuantile&) -> SlidingQuantile& = delete;
+    SlidingQuantile(SlidingQuantile&&) = delete;
+    auto operator=(SlidingQuantile&&) -> SlidingQuantile& = delete;
+
     [[nodiscard]] auto empty() const noexcept -> bool { return lo_.empty() && hi_.empty(); }
 
     void push(double x) {
@@ -367,6 +374,8 @@ class SlidingQuantile {
 
         std::vector<double> val_;
         std::vector<std::uint32_t> slot_;
+        // Aliases the owning SlidingQuantile's slot table.
+        // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
         std::vector<std::size_t>& pos_;
         std::size_t bit_;
     };
@@ -868,6 +877,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             while (lo < i && drop_pred(lo, i)) {
                                 if (!kHasNulls || valid_at(lo)) {
                                     const T w = col_values[lo];
+                                    // NOLINTNEXTLINE(misc-const-correctness) // constexpr lint bug
                                     bool is_nan = false;
                                     if constexpr (std::is_floating_point_v<T>) {
                                         is_nan = std::isnan(w);
@@ -896,14 +906,16 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                                 // `lo <= i` always, so the window holds at least
                                 // row i: there is no empty-window case here.
                                 result_values[i] = sum;
-                            } else if (val_cnt > 0) {
-                                result_values[i] = sum;
                             } else {
-                                result_values[i] = T{};  // window of only nulls -> null
-                                if (!out_valid) {
-                                    out_valid.emplace(rows, true);
+                                if (val_cnt > 0) {
+                                    result_values[i] = sum;
+                                } else {
+                                    result_values[i] = T{};  // window of only nulls -> null
+                                    if (!out_valid) {
+                                        out_valid.emplace(rows, true);
+                                    }
+                                    out_valid->set(i, false);
                                 }
-                                out_valid->set(i, false);
                             }
                         }
                     };
@@ -1518,6 +1530,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                 // for `Column<bool>`, which is bit-packed and has no dense
                 // `data()`. The numeric instantiations still get the hoisted
                 // pointer; bool keeps the per-element path it has to use.
+                // Only dense-column instantiations assign through this pointer.
+                // NOLINTNEXTLINE(misc-const-correctness)
                 T* result_values = nullptr;
                 if constexpr (is_dense_column_v<ColT>) {
                     result_values = result.data();

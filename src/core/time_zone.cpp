@@ -18,6 +18,18 @@
 #include <string_view>
 #include <utility>
 
+// libc++ on macOS does not yet expose chrono's tzdb. Keep the headers for its
+// POSIX-backed fallback out of the normal chrono-tzdb configuration so
+// include-what-you-use can analyse each configuration independently.
+#ifndef IBEX_HAS_STD_CHRONO_TIME_ZONES
+#include <algorithm>
+#include <cstdint>
+#include <filesystem>
+#include <limits>
+#include <optional>
+#include <system_error>
+#endif
+
 namespace ibex {
 
 namespace {

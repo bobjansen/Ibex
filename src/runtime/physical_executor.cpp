@@ -1,8 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/ir/node.hpp>
+#include <ibex/runtime/extern_registry.hpp>
+#include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/operator.hpp>
+
+#include <expected>
+#include <string>
+
 #include "interpreter_internal.hpp"
 #include "physical_executor_internal.hpp"
+#include "physical_plan.hpp"
 
 namespace ibex::runtime {
 

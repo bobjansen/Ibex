@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -351,8 +352,9 @@ void apply_membership_filter(const KeyColumn& key, const DynamicScanFilter& filt
                                       [&](std::size_t i) { return selected[i]; });
         return;
     }
-    auto end = std::remove_if(selected.begin(), selected.end(),
-                              [&](std::size_t row) { return !key_passes(key, filter, row); });
+    auto end = std::ranges::remove_if(selected, [&](std::size_t row) {
+                   return !key_passes(key, filter, row);
+               }).begin();
     selected.erase(end, selected.end());
 }
 
@@ -835,9 +837,10 @@ auto LazyTable::project_where(const std::set<std::string>& names,
             gathered.column = std::make_shared<ColumnValue>(
                 gather_column(*entry.column, selected->data(), selected->size(), &exec));
             if (entry.validity.has_value()) {
+                const auto& source_validity = entry.validity.value();
                 ValidityBitmap validity(selected->size(), true);
                 for (std::size_t row = 0; row < selected->size(); ++row) {
-                    validity.set(row, (*entry.validity)[(*selected)[row]]);
+                    validity.set(row, source_validity[(*selected)[row]]);
                 }
                 gathered.validity = std::move(validity);
             }
@@ -1145,9 +1148,10 @@ auto LazyTable::project_where_unit(const std::set<std::string>& names,
             gathered.column = std::make_shared<ColumnValue>(
                 gather_column(*entry.column, selected->data(), selected->size(), &exec));
             if (entry.validity.has_value()) {
+                const auto& source_validity = entry.validity.value();
                 ValidityBitmap validity(selected->size(), true);
                 for (std::size_t row = 0; row < selected->size(); ++row) {
-                    validity.set(row, (*entry.validity)[(*selected)[row]]);
+                    validity.set(row, source_validity[(*selected)[row]]);
                 }
                 gathered.validity = std::move(validity);
             }
@@ -1258,9 +1262,10 @@ auto LazyTable::project_rows(const std::set<std::string>& names, const Selection
                     gather_column(*entry.column, selected.data(), selected.size(), &exec));
                 std::optional<ValidityBitmap> validity;
                 if (entry.validity.has_value()) {
+                    const auto& source_validity = entry.validity.value();
                     ValidityBitmap bits(selected.size(), true);
                     for (std::size_t row = 0; row < selected.size(); ++row) {
-                        bits.set(row, (*entry.validity)[selected[row]]);
+                        bits.set(row, source_validity[selected[row]]);
                     }
                     validity = std::move(bits);
                 }
@@ -1332,7 +1337,7 @@ auto LazyTable::stageable_conjunct_columns(const std::vector<ir::Expr>& conjunct
 ///
 /// nullopt = the conjuncts reference no column of this source, which this shape
 /// cannot stage; the caller keeps its whole-column path.
-auto LazyTable::narrow_selection(Selection selected, const std::vector<ir::Expr>& conjuncts,
+auto LazyTable::narrow_selection(const Selection& selected, const std::vector<ir::Expr>& conjuncts,
                                  const ExecutionContext& exec, const ScalarRegistry* scalars)
     -> std::expected<std::optional<Selection>, std::string> {
     const auto names = stageable_conjunct_columns(conjuncts);
@@ -1340,7 +1345,7 @@ auto LazyTable::narrow_selection(Selection selected, const std::vector<ir::Expr>
         return std::optional<Selection>{};
     }
     if (selected.empty()) {
-        return std::optional{std::move(selected)};
+        return std::optional{Selection{}};
     }
 
     auto stage = project_rows(*names, selected, exec);
@@ -1391,7 +1396,7 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
             Selection selected = std::move(**scan);
             bool narrowed = true;
             if (!conjuncts.empty()) {
-                auto rest = narrow_selection(std::move(selected), conjuncts, exec, scalars);
+                auto rest = narrow_selection(selected, conjuncts, exec, scalars);
                 if (!rest) {
                     return std::unexpected(rest.error());
                 }
@@ -1408,12 +1413,12 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
                 if (!keys) {
                     return std::unexpected(keys.error());
                 }
-                auto* entry = keys->find_entry(key_name);
+                const auto* entry = keys->find_entry(key_name);
                 if (entry == nullptr ||
                     !std::holds_alternative<Column<std::int64_t>>(*entry->column)) {
                     return std::optional<JoinKeySelection>{};
                 }
-                out.keys = std::move(*entry);
+                out.keys = *entry;
                 return std::optional{std::move(out)};
             }
         }

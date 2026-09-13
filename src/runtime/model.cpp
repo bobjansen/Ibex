@@ -27,6 +27,7 @@ namespace {
 
 // libstdc++ and libc++ do not ship std::numbers on the same schedules; this
 // literal rounds to the IEEE-754 double value of sqrt(2).
+// NOLINTNEXTLINE(modernize-use-std-numbers)
 constexpr double kSqrt2 = 1.4142135623730950488;
 
 /// Build a design matrix from a DataFrame using a model formula.
@@ -140,7 +141,7 @@ auto build_model_matrix(const Table& input, const ir::ModelFormula& formula)
                                     }
                                 }
                                 std::string dummy_name = entry.name;
-                                dummy_name += "_";
+                                dummy_name += '_';
                                 dummy_name += levels[li];
                                 col_names.push_back(std::move(dummy_name));
                                 columns.push_back(std::move(dummy));
@@ -211,7 +212,7 @@ auto build_model_matrix(const Table& input, const ir::ModelFormula& formula)
                                 }
                             }
                             std::string dummy_name = name;
-                            dummy_name += "_";
+                            dummy_name += '_';
                             dummy_name += levels[li];
                             col_names.push_back(std::move(dummy_name));
                             columns.push_back(std::move(dummy));
@@ -234,7 +235,7 @@ auto build_model_matrix(const Table& input, const ir::ModelFormula& formula)
             for (std::size_t fi = 0; fi < term.columns.size(); ++fi) {
                 const auto& name = term.columns[fi];
                 if (fi > 0) {
-                    interaction_name += ":";
+                    interaction_name += ':';
                 }
                 interaction_name += name;
                 const auto* entry = input.find_entry(name);
@@ -574,14 +575,14 @@ auto eval_model_param_scalar(const ir::Expr& expr, const ScalarRegistry* scalars
         if (scalars == nullptr) {
             std::string message = "unknown scalar binding '";
             message += ref->name;
-            message += "'";
+            message += '\'';
             return std::unexpected(std::move(message));
         }
         auto it = scalars->find(ref->name);
         if (it == scalars->end()) {
             std::string message = "unknown scalar binding '";
             message += ref->name;
-            message += "'";
+            message += '\'';
             return std::unexpected(std::move(message));
         }
         return it->second;
@@ -716,7 +717,7 @@ auto fit_model(const Table& input, const ir::ModelFormula& formula, const std::s
         message += std::to_string(n);
         message += ") than parameters (";
         message += std::to_string(p);
-        message += ")";
+        message += ')';
         return std::unexpected(std::move(message));
     }
 

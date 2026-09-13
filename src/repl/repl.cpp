@@ -67,7 +67,7 @@
 #include <dlfcn.h>
 // NOLINTNEXTLINE(modernize-deprecated-headers) // Required for fdopen and fileno.
 #include <stdio.h>
-// NOLINTNEXTLINE(modernize-deprecated-headers) // Required for strdup.
+// NOLINTNEXTLINE(modernize-deprecated-headers, misc-include-cleaner) // Required for strdup.
 #include <string.h>
 #include <unistd.h>
 #endif
@@ -303,13 +303,13 @@ struct CompletionContext {
 enum class ReadLineStatus : std::uint8_t { Line, Eof, Interrupted };
 
 #ifdef IBEX_HAS_READLINE
-constexpr std::string_view kColonCommands[] = {
+constexpr auto kColonCommands = std::to_array<std::string_view>({
     ":q",       ":quit",     ":exit", ":help",   ":tables",   ":scalars", ":functions",
     ":imports", ":schema",   ":head", ":peek",   ":describe", ":load",    ":timing",
     ":time",    ":comments", ":doc",  ":source", ":run",      ":explain",
-};
+});
 
-constexpr std::string_view kCompletionBuiltins[] = {
+constexpr auto kCompletionBuiltins = std::to_array<std::string_view>({
     "Bool",
     "Date",
     "Float32",
@@ -382,9 +382,9 @@ constexpr std::string_view kCompletionBuiltins[] = {
     "rolling_ewma",
     "rolling_kurtosis",
     "rolling_max",
-};
+});
 
-constexpr std::string_view kMoreCompletionBuiltins[] = {
+constexpr auto kMoreCompletionBuiltins = std::to_array<std::string_view>({
     "rolling_mean", "rolling_median",
     "rolling_min",  "rolling_quantile",
     "rolling_skew", "rolling_std",
@@ -406,7 +406,7 @@ constexpr std::string_view kMoreCompletionBuiltins[] = {
     "atan",         "sinh",
     "cosh",         "tanh",
     "log2",         "log10",
-};
+});
 
 CompletionContext g_completion_context;
 std::vector<std::string> g_completion_candidates;
@@ -2402,7 +2402,7 @@ void print_imports(const ImportRegistry& imports, const ExternDeclRegistry& exte
     ibex::formatting::print("extern origins:\n");
     for (const auto& source : sources) {
         auto& names = by_source[source];
-        std::sort(names.begin(), names.end());
+        std::ranges::sort(names);
         ibex::formatting::print("  {}:", source);
         for (const auto& name : names) {
             ibex::formatting::print(" {}", name);

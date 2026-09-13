@@ -1257,9 +1257,9 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     if (!is_timeout) {
                         const auto& batch = std::get<Table>(src_result.value());
                         for (std::size_t r = 0; r < batch.rows(); ++r) {
-                            Table row_tbl = slice_row(batch, r);
+                            const Table row_tbl = slice_row(batch, r);
                             const auto ts_opt = get_last_ts_ns(row_tbl);
-                            std::int64_t row_bucket =
+                            const std::int64_t row_bucket =
                                 ts_opt ? ((*ts_opt / bucket_ns) * bucket_ns) : -1;
 
                             if (open_bucket_ns >= 0 && row_bucket >= 0 &&

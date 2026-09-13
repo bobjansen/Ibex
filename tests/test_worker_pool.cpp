@@ -578,25 +578,51 @@ TEST_CASE("a real pool reports the idle its threads actually took",
     // of wall time — because that is what subtracts out the background pool,
     // which idles at the same rate in both windows. An absolute comparison would
     // be measuring whatever else the test binary happens to have spun up.
-    const auto busy_begin = runtime::sample_pool_idle();
-    const auto busy_start = std::chrono::steady_clock::now();
+    std::mutex busy_mutex;
+    std::condition_variable busy_ready;
+    std::condition_variable busy_release;
+    std::size_t ready_workers = 0;
+    bool release_workers = false;
+    bool all_ready = false;
+    double busy_rate = 0.0;
     {
-        auto batch = pool.submit(kThreads, [](std::size_t) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        auto batch = pool.submit(kThreads, [&](std::size_t) {
+            std::unique_lock lock(busy_mutex);
+            ++ready_workers;
+            busy_ready.notify_one();
+            busy_release.wait(lock, [&] { return release_workers; });
         });
+
+        {
+            std::unique_lock lock(busy_mutex);
+            all_ready = busy_ready.wait_for(lock, std::chrono::seconds(1),
+                                            [&] { return ready_workers == kThreads; });
+        }
+
+        if (all_ready) {
+            const auto busy_begin = runtime::sample_pool_idle();
+            const auto busy_start = std::chrono::steady_clock::now();
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            const auto busy_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - busy_start)
+                                     .count();
+            const auto busy_idle =
+                runtime::idle_between(busy_begin, runtime::sample_pool_idle()).count();
+            busy_rate = static_cast<double>(busy_idle) / static_cast<double>(busy_ns);
+        }
+
+        {
+            const std::lock_guard lock(busy_mutex);
+            release_workers = true;
+        }
+        busy_release.notify_all();
         batch.wait();
     }
-    const auto busy_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                             std::chrono::steady_clock::now() - busy_start)
-                             .count();
-    const auto busy_idle = runtime::idle_between(busy_begin, runtime::sample_pool_idle()).count();
-
+    REQUIRE(all_ready);
     const double quiet_rate = static_cast<double>(idle) / static_cast<double>(wall_ns);
-    const double busy_rate = static_cast<double>(busy_idle) / static_cast<double>(busy_ns);
-    // All four threads were occupied for nearly the whole busy window; require at
-    // least two threads' worth of idle to have disappeared. The nominal drop is
-    // four, but the margin over the process-wide background pool is thin, so
-    // demand two rather than three to stay robust on a loaded macOS CI box.
+    // All four threads have reached their task before the busy window opens.
+    // The nominal drop is four threads' worth of idle; retain a two-thread
+    // margin for the process-wide background pool.
     CHECK(busy_rate < quiet_rate - 2.0);
 }
 

@@ -36,9 +36,11 @@ set(IBEX_UI_INDEX "${IBEX_UI_OUTPUT_DIR}/index.html")
 add_custom_command(
     OUTPUT "${IBEX_UI_INDEX}"
     COMMAND "${IBEX_NPM_EXECUTABLE}" ci --no-audit --no-fund
-    COMMAND "${IBEX_NPM_EXECUTABLE}" run build
-    COMMAND "${CMAKE_COMMAND}" -E make_directory "${IBEX_UI_OUTPUT_DIR}"
-    COMMAND "${CMAKE_COMMAND}" -E copy_directory "${IBEX_UI_SOURCE_DIR}/dist" "${IBEX_UI_OUTPUT_DIR}"
+    # Build directly into the declared custom-command output directory.  A
+    # separate Vite dist/ directory followed by `cmake -E copy_directory` can
+    # appear to succeed under the Visual Studio generator while leaving the
+    # declared OUTPUT absent, which in turn installs an empty bin/ui directory.
+    COMMAND "${IBEX_NPM_EXECUTABLE}" run build -- --outDir "${IBEX_UI_OUTPUT_DIR}"
     WORKING_DIRECTORY "${IBEX_UI_SOURCE_DIR}"
     DEPENDS
         "${IBEX_UI_SOURCE_DIR}/package.json"

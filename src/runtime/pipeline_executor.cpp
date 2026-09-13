@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
-#include <ibex/ir/expr_predicates.hpp>
+#include <ibex/core/column.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -25,13 +25,14 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <new>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "physical_plan.hpp"
@@ -44,8 +45,6 @@
 #include "execution_profile_internal.hpp"
 #include "interpreter_internal.hpp"
 #include "join_chunked_internal.hpp"
-#include "kernel_filter.hpp"
-#include "kernel_types.hpp"
 #include "physical_executor_internal.hpp"
 #include "pipeline_executor_internal.hpp"
 #include "runtime_internal.hpp"

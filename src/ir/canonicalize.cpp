@@ -747,8 +747,7 @@ auto try_filter_past_aggregate(NodePtr node) -> TryResult {
     robin_hood::unordered_set<std::string> pred_cols;
     collect_filter_column_refs(filter.predicate(), pred_cols);
     const bool only_group_by =
-        std::all_of(pred_cols.begin(), pred_cols.end(),
-                    [&](const std::string& c) { return gb_names.contains(c); });
+        std::ranges::all_of(pred_cols, [&](const std::string& c) { return gb_names.contains(c); });
     if (!only_group_by) {
         return {.changed = false, .node = std::move(node)};
     }

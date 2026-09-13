@@ -917,7 +917,7 @@ auto infer_output_column_names(const ir::Node& node) -> std::optional<std::vecto
             const auto& rs = ir::node_cast<ir::ResampleNode>(node);
             std::vector<std::string> names;
             names.reserve(rs.group_by().size() + rs.aggregations().size() + 1);
-            names.push_back("_bucket");
+            names.emplace_back("_bucket");
             for (const auto& col : rs.group_by()) {
                 names.push_back(col.name);
             }
@@ -2949,8 +2949,8 @@ class Lowerer {
             bound[i] = call.args[i].get();
         }
         for (const auto& narg : call.named_args) {
-            const auto param = std::find_if(fn.params.begin(), fn.params.end(),
-                                            [&](const Param& p) { return p.name == narg.name; });
+            const auto param = std::ranges::find_if(
+                fn.params, [&](const Param& p) { return p.name == narg.name; });
             if (param == fn.params.end()) {
                 return std::unexpected(LowerError{
                     .message = fn.name + ": unknown named argument '" + narg.name + "'"});
@@ -3015,8 +3015,8 @@ class Lowerer {
             bound[i] = call.args[i].get();
         }
         for (const auto& narg : call.named_args) {
-            const auto param = std::find_if(fn.params.begin(), fn.params.end(),
-                                            [&](const Param& p) { return p.name == narg.name; });
+            const auto param = std::ranges::find_if(
+                fn.params, [&](const Param& p) { return p.name == narg.name; });
             if (param == fn.params.end()) {
                 return std::unexpected(LowerError{
                     .message = fn.name + ": unknown named argument '" + narg.name + "'"});
@@ -4485,7 +4485,7 @@ class Lowerer {
     /// contains at least one built-in aggregate call, returns the trailing
     /// expression. This is the inference rule that distinguishes an aggregate
     /// UDF from an ordinary scalar UDF; see `plans/done/aggregate-udf-plan.md`.
-    auto aggregate_udf_body(const std::string& name) const -> const Expr* {
+    [[nodiscard]] auto aggregate_udf_body(const std::string& name) const -> const Expr* {
         auto it = functions_.find(name);
         if (it == functions_.end()) {
             return nullptr;
@@ -4523,7 +4523,7 @@ class Lowerer {
         return shape->final_expr;
     }
 
-    auto expr_contains_builtin_aggregate(const Expr& expr) const -> bool {
+    [[nodiscard]] auto expr_contains_builtin_aggregate(const Expr& expr) const -> bool {
         if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
             if (parse_agg_func(call->callee).has_value()) {
                 return true;
@@ -4551,7 +4551,7 @@ class Lowerer {
         return false;
     }
 
-    auto select_has_aggregate(const std::vector<Field>& fields) const -> bool {
+    [[nodiscard]] auto select_has_aggregate(const std::vector<Field>& fields) const -> bool {
         return std::ranges::any_of(fields, [&](const auto& field) {
             return field.expr != nullptr && expr_contains_builtin_aggregate(*field.expr);
         });

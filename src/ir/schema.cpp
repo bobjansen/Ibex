@@ -177,7 +177,7 @@ auto expr_type(const Expr& expr, const SchemaInfo& input) -> std::optional<Colum
                     return std::nullopt;
                 }
                 if (!result.has_value()) {
-                    result = *type;
+                    result = type;
                 } else if (is_numeric(*result) && is_numeric(*type)) {
                     result = is_float(*result) || is_float(*type) ? ColumnType::Float64
                                                                   : ColumnType::Int64;

@@ -76,6 +76,9 @@ struct AdoptedArrayOwner {
             array.release(&array);
         }
     }
+
+    AdoptedArrayOwner(AdoptedArrayOwner&&) = delete;
+    auto operator=(AdoptedArrayOwner&&) -> AdoptedArrayOwner& = delete;
 };
 
 auto clear_schema(ArrowSchema* schema) noexcept -> void {
@@ -452,8 +455,7 @@ auto validate_child(const ArrowArray& array, const ArrowSchema& schema, std::str
 template <typename T>
 auto import_plain_column(const ArrowArray& array, std::size_t data_buffer_index)
     -> std::expected<Column<T>, std::string> {
-    if (array.buffers == nullptr ||
-        array.n_buffers <= static_cast<std::int64_t>(data_buffer_index) ||
+    if (array.buffers == nullptr || std::cmp_less_equal(array.n_buffers, data_buffer_index) ||
         array.buffers[data_buffer_index] == nullptr) {
         return std::unexpected("Arrow array is missing a primitive data buffer");
     }
@@ -472,8 +474,7 @@ auto import_primitive_column(const ArrowArray& array, std::size_t data_buffer_in
                              const std::shared_ptr<const void>& owner)
     -> std::expected<runtime::ColumnValue, std::string> {
     if (owner) {
-        if (array.buffers == nullptr ||
-            array.n_buffers <= static_cast<std::int64_t>(data_buffer_index) ||
+        if (array.buffers == nullptr || std::cmp_less_equal(array.n_buffers, data_buffer_index) ||
             array.buffers[data_buffer_index] == nullptr) {
             return std::unexpected("Arrow array is missing a primitive data buffer");
         }
@@ -988,7 +989,8 @@ auto export_column_array(const runtime::ColumnEntry& entry,
     return std::visit(
         [&](const auto& col) -> std::expected<void, std::string> {
             using ColT = std::decay_t<decltype(col)>;
-            std::int64_t null_count = entry.validity.has_value() ? count_nulls(*entry.validity) : 0;
+            const std::int64_t null_count =
+                entry.validity.has_value() ? count_nulls(*entry.validity) : 0;
 
             if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
                 auto state = primitive_buffers(entry, col);

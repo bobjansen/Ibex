@@ -34,7 +34,7 @@ enum class ZoneId : std::uint16_t;
 /// Whether `name` is available in the host's IANA time-zone database.
 [[nodiscard]] auto is_known_zone(std::string_view name) -> bool;
 
-#if !defined(IBEX_HAS_STD_CHRONO_TIME_ZONES)
+#ifndef IBEX_HAS_STD_CHRONO_TIME_ZONES
 /// Convert a wall-clock Timestamp in `zone` to its instant. A nonexistent
 /// local time returns nullopt; an ambiguous one selects its earlier instant.
 [[nodiscard]] auto local_time_to_sys(std::string_view zone, std::int64_t nanos)

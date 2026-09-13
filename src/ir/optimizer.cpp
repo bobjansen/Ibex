@@ -121,8 +121,8 @@ auto can_cse(const CallableSummary& callable) -> bool {
     if (!is_elidable(callable.effects)) {
         return false;
     }
-    return std::all_of(callable.arg_modes.begin(), callable.arg_modes.end(),
-                       [](ArgMode mode) { return mode == ArgMode::Const; });
+    return std::ranges::all_of(callable.arg_modes,
+                               [](ArgMode mode) { return mode == ArgMode::Const; });
 }
 
 auto is_reorderable(const EffectSummary& lhs, const EffectSummary& rhs) -> bool {

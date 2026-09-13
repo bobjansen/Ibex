@@ -196,7 +196,7 @@ auto find_join_chain(NodePtr& slot) -> NodePtr* {
         if (!is_row_wise(**current) || (*current)->mutable_children().size() != 1) {
             return nullptr;
         }
-        current = &(*current)->mutable_children()[0];
+        current = (*current)->mutable_children().data();
     }
     return nullptr;
 }

@@ -13,6 +13,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -200,7 +201,7 @@ auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSche
                     std::optional<std::size_t> bound;
                     if (right.rows.has_value() &&
                         side_schema(0).is_unique_within(left_join_key_names(join.keys()))) {
-                        bound = *right.rows;
+                        bound = right.rows;
                     }
                     if (left.rows.has_value() &&
                         side_schema(1).is_unique_within(right_join_key_names(join.keys()))) {
@@ -209,7 +210,7 @@ auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSche
                     if (!bound.has_value()) {
                         return {};
                     }
-                    return {.rows = *bound, .heuristic = true};
+                    return {.rows = bound, .heuristic = true};
                 }
                 case JoinKind::Left:
                 case JoinKind::Right:
@@ -331,7 +332,7 @@ auto compound_selectivity(const Expr& predicate, double filter_selectivity) -> d
 auto estimate_cardinality(const Node& root, const SourceRowCounts& sources,
                           const SourceSchemas& schemas, CardinalityOptions options)
     -> CardinalityEstimate {
-    return estimate(root, sources, schemas, options);
+    return estimate(root, sources, schemas, std::move(options));
 }
 
 auto distinct_estimate(const Node& node, const std::string& column, const SourceStats& stats)

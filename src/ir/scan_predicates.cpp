@@ -286,9 +286,8 @@ auto match_probe_chain(const Node& node, std::string key)
                 return std::pair{node_cast<ScanNode>(*cur).source_name(), std::move(key)};
             case NodeKind::Project: {
                 const auto& cols = node_cast<ProjectNode>(*cur).columns();
-                const bool keeps_key =
-                    std::any_of(cols.begin(), cols.end(),
-                                [&](const ColumnRef& col) { return col.name == key; });
+                const bool keeps_key = std::ranges::any_of(
+                    cols, [&](const ColumnRef& col) { return col.name == key; });
                 if (!keeps_key) {
                     return std::nullopt;
                 }

@@ -3,25 +3,19 @@
 
 #include <ibex/core/time_zone.hpp>
 
-#include <algorithm>
 // `locate_zone` lives here, and it is used under `IBEX_HAS_STD_CHRONO_TIME_ZONES`.
 // A tool that prunes includes cannot see into a disabled branch, so this one has
 // to survive an include-what-you-use pass run with the macro off.
 #include <chrono>
-#include <cstdint>
 #include <cstdlib>
 #include <ctime>
 #include <deque>
 #include <exception>
-#include <filesystem>
-#include <limits>
 #include <mutex>
-#include <optional>
 #include <robin_hood.h>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <utility>
 
 namespace ibex {
@@ -73,9 +67,9 @@ auto zone_name(ZoneId id) -> const std::string& {
 }
 
 auto is_known_zone(std::string_view name) -> bool {
-#if defined(IBEX_HAS_STD_CHRONO_TIME_ZONES)
+#ifdef IBEX_HAS_STD_CHRONO_TIME_ZONES
     try {
-        static_cast<void>(std::chrono::locate_zone(std::string(name)));
+        static_cast<void>(std::chrono::locate_zone(name));
         return true;
     } catch (const std::exception&) {
         return false;
@@ -114,7 +108,7 @@ auto is_known_zone(std::string_view name) -> bool {
 #endif
 }
 
-#if !defined(IBEX_HAS_STD_CHRONO_TIME_ZONES)
+#ifndef IBEX_HAS_STD_CHRONO_TIME_ZONES
 namespace {
 
 auto floor_div(std::int64_t value, std::int64_t divisor) -> std::int64_t {

@@ -9,18 +9,15 @@
 // `build_physical_filter_head_tail`). Split out of chunked.cpp; the operator
 // classes are fully private to this translation unit.
 
-#include <ibex/core/column.hpp>
-#include <ibex/core/time.hpp>
 #include <ibex/ir/column_name_map.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
-#include <ibex/ir/schema.hpp>
 #include <ibex/runtime/interpreter.hpp>
-#include <ibex/runtime/morsel.hpp>
 #include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/pipeline.hpp>
 #include <ibex/runtime/table_properties.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -29,10 +26,10 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <robin_hood.h>
 #include <string>
 #include <string_view>
 #include <utility>
-#include <variant>
 #include <vector>
 
 #include "chunk_conversion_internal.hpp"
@@ -44,6 +41,7 @@
 #include "physical_executor_internal.hpp"
 #include "physical_plan.hpp"
 #include "pipeline_executor_internal.hpp"
+#include "runtime_internal.hpp"
 
 namespace ibex::runtime {
 

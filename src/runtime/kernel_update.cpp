@@ -8,6 +8,7 @@
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/like.hpp>
 #include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/safe_arith.hpp>
 #include <ibex/runtime/table_format.hpp>

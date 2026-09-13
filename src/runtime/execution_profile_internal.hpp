@@ -131,7 +131,7 @@ class ExecutionProfileState {
     explicit ExecutionProfileState(std::size_t worker_budget = 1, bool report = true);
     ExecutionProfileState(const ExecutionProfileState&) = delete;
     auto operator=(const ExecutionProfileState&) -> ExecutionProfileState& = delete;
-    ~ExecutionProfileState();
+    ~ExecutionProfileState() noexcept;
 
     [[nodiscard]] auto entry(std::uint64_t node_id, std::string label) -> ExecutionProfileEntry*;
     [[nodiscard]] auto stage(std::string_view label) -> ExecutionProfileEntry*;

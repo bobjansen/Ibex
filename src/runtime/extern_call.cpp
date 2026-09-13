@@ -10,7 +10,6 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
-#include <ibex/runtime/pipeline.hpp>
 
 #include <cmath>
 #include <cstddef>
@@ -20,8 +19,6 @@
 #include <ctime>
 #include <expected>
 #include <memory>
-#include <pdqsort.h>
-#include <robin_hood.h>
 #include <string>
 #include <string_view>
 #include <utility>

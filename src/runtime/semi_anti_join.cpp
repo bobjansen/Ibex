@@ -12,11 +12,10 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
-#include <ibex/ir/join_output.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/interrupt.hpp>
 #include <ibex/runtime/operator.hpp>
-#include <ibex/runtime/table_properties.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>

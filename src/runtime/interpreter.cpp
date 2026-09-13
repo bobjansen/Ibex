@@ -426,6 +426,7 @@ auto map_column_from_scalars(const std::vector<ScalarValue>& values)
     return build.template operator()<std::int64_t>();
 }
 
+// NOLINTNEXTLINE(readability-function-size)
 auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,
                     const ExecutionContext& exec, ModelResult* model_out)
@@ -1109,7 +1110,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             auto source_args_res = eval_scalar_args(sn.source_args());
             if (!source_args_res)
                 return std::unexpected(source_args_res.error());
-            ExternArgs source_args = std::move(*source_args_res);
+            const ExternArgs source_args = std::move(*source_args_res);
             const auto sink_args_res = eval_scalar_args(sn.sink_args());
             if (!sink_args_res)
                 return std::unexpected(sink_args_res.error());

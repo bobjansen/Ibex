@@ -3319,9 +3319,10 @@ auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conj
                 auto column =
                     gather_column(*entry->column, selected.data(), selected.size(), &exec);
                 if (entry->validity.has_value()) {
+                    const auto& source_validity = entry->validity.value();
                     ValidityBitmap validity(selected.size(), true);
                     for (std::size_t row = 0; row < selected.size(); ++row) {
-                        validity.set(row, (*entry->validity)[selected[row]]);
+                        validity.set(row, source_validity[selected[row]]);
                     }
                     stage.add_column(name, std::move(column), std::move(validity));
                 } else {
@@ -3331,10 +3332,11 @@ auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conj
             stage.logical_rows = selected.size();
 
             using ConjunctDiff = std::vector<ir::Expr>::difference_type;
-            std::vector<ir::Expr> stage_conjuncts(
+            const std::vector<ir::Expr> stage_conjuncts(
                 conjuncts.begin() + static_cast<ConjunctDiff>(conjunct_index),
                 conjuncts.begin() + static_cast<ConjunctDiff>(group_end));
             std::vector<std::size_t> local(selected.size());
+            // NOLINTNEXTLINE(modernize-use-ranges): Because Apple libc++
             std::iota(local.begin(), local.end(), std::size_t{0});
             auto local_selected =
                 filter_selection_impl(stage, stage_conjuncts, exec, scalars, std::move(local));
@@ -3343,7 +3345,7 @@ auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conj
             }
             std::vector<std::size_t> next;
             next.reserve(local_selected->size());
-            for (std::size_t row : *local_selected) {
+            for (const std::size_t row : *local_selected) {
                 next.push_back(selected[row]);
             }
             selected = std::move(next);
@@ -3360,9 +3362,9 @@ auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conj
             return std::unexpected(mask.error());
         }
         const auto* valid = mask->valid ? mask->valid->data() : nullptr;
-        auto end = std::remove_if(selected.begin(), selected.end(), [&](std::size_t row) {
-            return mask->value[row] == 0 || (valid != nullptr && valid[row] == 0);
-        });
+        auto end = std::ranges::remove_if(selected, [&](std::size_t row) {
+                       return mask->value[row] == 0 || (valid != nullptr && valid[row] == 0);
+                   }).begin();
         selected.erase(end, selected.end());
         if (selected.empty()) {
             break;

@@ -4672,7 +4672,7 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                             // front also drops the per-element re-test of
                             // whether the column holds adopted (Arrow) buffers,
                             // which cost more than the store it guarded.
-                            using Value = typename Col::value_type;
+                            using Value = Col::value_type;
                             if constexpr (std::is_trivially_default_constructible_v<Value>) {
                                 out.resize_for_overwrite(n);
                             } else {

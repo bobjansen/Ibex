@@ -140,7 +140,7 @@ auto cov_table(const Table& input) -> std::expected<Table, std::string> {
         mean[j] /= static_cast<double>(rows);
     }
 
-    const double denom = static_cast<double>(rows - 1);
+    const auto denom = static_cast<double>(rows - 1);
     std::vector<std::vector<double>> cov(n, std::vector<double>(n, 0.0));
     for (std::size_t a = 0; a < n; ++a) {
         for (std::size_t b = a; b < n; ++b) {
@@ -185,7 +185,7 @@ auto corr_table(const Table& input) -> std::expected<Table, std::string> {
         mean[j] /= static_cast<double>(rows);
     }
 
-    const double denom = static_cast<double>(rows - 1);
+    const auto denom = static_cast<double>(rows - 1);
     std::vector<std::vector<double>> cov(n, std::vector<double>(n, 0.0));
     for (std::size_t a = 0; a < n; ++a) {
         for (std::size_t b = a; b < n; ++b) {
@@ -268,11 +268,11 @@ auto transpose_table(const Table& input) -> std::expected<Table, std::string> {
         const auto& label_entry = input.columns[static_cast<std::size_t>(label_idx)];
         if (const auto* sc = std::get_if<Column<std::string>>(&*label_entry.column)) {
             for (std::size_t i = 0; i < n_rows; ++i) {
-                out_col_names.push_back(std::string((*sc)[i]));
+                out_col_names.emplace_back((*sc)[i]);
             }
         } else if (const auto* cc = std::get_if<Column<Categorical>>(&*label_entry.column)) {
             for (std::size_t i = 0; i < n_rows; ++i) {
-                out_col_names.push_back(std::string((*cc)[i]));
+                out_col_names.emplace_back((*cc)[i]);
             }
         }
     } else {
@@ -696,8 +696,8 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                     std::size_t out_char = 0;
                     auto emit_repeat_n = [&]<std::size_t N>() {
                         for (std::size_t r = 0; r < rows; ++r) {
-                            const std::size_t start = static_cast<std::size_t>(src_offs[r]);
-                            const std::size_t end = static_cast<std::size_t>(src_offs[r + 1]);
+                            const auto start = static_cast<std::size_t>(src_offs[r]);
+                            const auto end = static_cast<std::size_t>(src_offs[r + 1]);
                             const std::size_t len = end - start;
                             const char* p = src_chars + start;
                             const std::size_t row_char_base = out_char;
@@ -748,8 +748,8 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                             break;
                         default:
                             for (std::size_t r = 0; r < rows; ++r) {
-                                const std::size_t start = static_cast<std::size_t>(src_offs[r]);
-                                const std::size_t end = static_cast<std::size_t>(src_offs[r + 1]);
+                                const auto start = static_cast<std::size_t>(src_offs[r]);
+                                const auto end = static_cast<std::size_t>(src_offs[r + 1]);
                                 const std::size_t len = end - start;
                                 const char* p = src_chars + start;
                                 const std::size_t row_char_base = out_char;
@@ -955,8 +955,8 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                     for (std::size_t mi = 0; mi < n_measures; ++mi) {
                         const auto* src_offs = measures[mi]->offsets_data();
                         const char* src_chars = measures[mi]->chars_data();
-                        const std::size_t start = static_cast<std::size_t>(src_offs[r]);
-                        const std::size_t end = static_cast<std::size_t>(src_offs[r + 1]);
+                        const auto start = static_cast<std::size_t>(src_offs[r]);
+                        const auto end = static_cast<std::size_t>(src_offs[r + 1]);
                         const std::size_t len = end - start;
                         if (len > 0) {
                             std::memcpy(dst_chars + out_char, src_chars + start, len);

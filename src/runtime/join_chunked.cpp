@@ -24,35 +24,24 @@
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
-#include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <deque>
-#include <exception>
 #include <expected>
 #include <functional>
 #include <limits>
 #include <memory>
-#include <mutex>
-#include <new>
-#include <numeric>
 #include <optional>
 #include <pdqsort.h>
-#include <ratio>
 #include <robin_hood.h>
 #include <span>
 #include <string>
 #include <string_view>
-#include <thread>
-#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -64,15 +53,9 @@
 #endif
 
 #include "chunk_conversion_internal.hpp"
-#include "execution_profile_internal.hpp"
 #include "interpreter_internal.hpp"
 #include "join_chunked_internal.hpp"
 #include "join_internal.hpp"
-#include "kernel_filter.hpp"
-#include "kernel_types.hpp"
-#include "kernel_update.hpp"
-#include "model_internal.hpp"
-#include "reshape_internal.hpp"
 #include "runtime_internal.hpp"
 
 namespace ibex::runtime {

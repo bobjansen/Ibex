@@ -12,18 +12,18 @@
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
-#include <ibex/ir/schema.hpp>
 #include <ibex/runtime/interpreter.hpp>
-#include <ibex/runtime/morsel.hpp>
 #include <ibex/runtime/operator.hpp>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -31,6 +31,7 @@
 #include "chunk_conversion_internal.hpp"
 #include "interpreter_internal.hpp"
 #include "physical_executor_internal.hpp"
+#include "runtime_internal.hpp"
 
 namespace ibex::runtime {
 

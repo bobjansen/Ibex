@@ -333,7 +333,7 @@ auto gather_rows_parallel(const Table& input, const std::vector<Idx>& idx,
 
     std::atomic<std::size_t> cursor{0};
     {
-        auto batch = process_worker_pool().submit(threads, [&](std::size_t) noexcept {
+        auto batch = process_worker_pool().submit(threads, [&](std::size_t) {
             while (true) {
                 const std::size_t t = cursor.fetch_add(1, std::memory_order_relaxed);
                 if (t >= tasks.size()) {

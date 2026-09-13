@@ -25,6 +25,10 @@ namespace ibex::runtime {
 
 namespace {
 
+// libstdc++ and libc++ do not ship std::numbers on the same schedules; this
+// literal rounds to the IEEE-754 double value of sqrt(2).
+constexpr double kSqrt2 = 1.4142135623730950488;
+
 /// Build a design matrix from a DataFrame using a model formula.
 /// Returns column names and a column-major matrix (vector of column vectors).
 /// Categorical/String columns are dummy-encoded (treatment coding: first level dropped when
@@ -456,7 +460,7 @@ auto build_model_result(const std::vector<std::string>& col_names,
         summary_std_error.push_back(std_errors[j]);
         const double t = (std_errors[j] > 0.0) ? beta[j] / std_errors[j] : 0.0;
         summary_t_stat.push_back(t);
-        summary_p_value.push_back(2.0 * std::erfc(std::abs(t) / std::sqrt(2.0)));
+        summary_p_value.push_back(2.0 * std::erfc(std::abs(t) / kSqrt2));
     }
     summary_table.add_column("term", std::move(summary_term));
     summary_table.add_column("estimate", std::move(summary_estimate));

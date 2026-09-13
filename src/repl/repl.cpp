@@ -45,11 +45,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <expected>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <ranges>
+// NOLINTNEXTLINE(modernize-deprecated-headers) // Required for sigaction, sigemptyset, etc
+#include <signal.h>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -62,6 +65,10 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+// NOLINTNEXTLINE(modernize-deprecated-headers) // Required for fdopen and fileno.
+#include <stdio.h>
+// NOLINTNEXTLINE(modernize-deprecated-headers) // Required for strdup.
+#include <string.h>
 #include <unistd.h>
 #endif
 #ifdef __linux__
@@ -798,7 +805,7 @@ auto read_repl_line(const std::string& prompt, std::string& out) -> ReadLineStat
 #else
 void configure_line_editing() {}
 
-void set_completion_context(CompletionContext) {}
+void set_completion_context([[maybe_unused]] CompletionContext context) {}
 
 auto read_repl_line(const std::string& prompt, std::string& out) -> ReadLineStatus {
     runtime::clear_interrupt();
@@ -1220,7 +1227,7 @@ void print_scalars(const runtime::ScalarRegistry& scalars) {
     for (const auto& entry : scalars) {
         names.push_back(entry.first);
     }
-    std::sort(names.begin(), names.end());
+    std::ranges::sort(names);
     ibex::formatting::print("scalars:\n");
     for (const auto& name : names) {
         ibex::formatting::print("  {} = ", name);
@@ -1239,7 +1246,7 @@ std::string format_scalar_names(const runtime::ScalarRegistry& scalars) {
     for (const auto& entry : scalars) {
         names.push_back(entry.first);
     }
-    std::sort(names.begin(), names.end());
+    std::ranges::sort(names);
     std::string out;
     for (std::size_t i = 0; i < names.size(); ++i) {
         if (i > 0) {
@@ -1263,7 +1270,7 @@ std::string format_table_names(const runtime::TableRegistry& tables,
     for (const auto& entry : lazy_tables) {
         names.push_back(entry.first);
     }
-    std::sort(names.begin(), names.end());
+    std::ranges::sort(names);
     std::string out;
     for (std::size_t i = 0; i < names.size(); ++i) {
         if (i > 0) {
@@ -1287,8 +1294,8 @@ std::string format_function_names(const FunctionRegistry& functions,
     if (names.empty()) {
         return "<none>";
     }
-    std::sort(names.begin(), names.end());
-    names.erase(std::unique(names.begin(), names.end()), names.end());
+    std::ranges::sort(names);
+    names.erase(std::ranges::unique(names).begin(), names.end());
     std::string out;
     for (std::size_t i = 0; i < names.size(); ++i) {
         if (i > 0) {
@@ -2214,7 +2221,7 @@ struct BuiltinDoc {
     std::string_view example;
 };
 
-constexpr BuiltinDoc kBuiltinDocs[] = {
+constexpr auto kBuiltinDocs = std::to_array<BuiltinDoc>({
     {.name = "mean",
      .signature = "mean(col) -> Float64",
      .summary = "Aggregate mean over each group.",
@@ -2293,7 +2300,7 @@ constexpr BuiltinDoc kBuiltinDocs[] = {
      .signature = "print(value) -> value",
      .summary = "Print a human-readable value in scripts and REPL sessions.",
      .example = "print(trades[select { n = count() }])"},
-};
+});
 
 auto find_builtin_doc(std::string_view name) -> const BuiltinDoc* {
     for (const auto& doc : kBuiltinDocs) {
@@ -2343,7 +2350,7 @@ void print_functions(const FunctionRegistry& functions, const ExternDeclRegistry
     for (const auto& entry : functions) {
         names.push_back(entry.first);
     }
-    std::sort(names.begin(), names.end());
+    std::ranges::sort(names);
     if (!names.empty()) {
         ibex::formatting::print("user functions:\n");
         for (const auto& name : names) {
@@ -2355,7 +2362,7 @@ void print_functions(const FunctionRegistry& functions, const ExternDeclRegistry
     for (const auto& entry : extern_decls) {
         names.push_back(entry.first);
     }
-    std::sort(names.begin(), names.end());
+    std::ranges::sort(names);
     if (!names.empty()) {
         ibex::formatting::print("extern functions:\n");
         for (const auto& name : names) {
@@ -2369,7 +2376,7 @@ void print_imports(const ImportRegistry& imports, const ExternDeclRegistry& exte
         ibex::formatting::print("imports: <none>\n");
     } else {
         std::vector<std::string> names(imports.begin(), imports.end());
-        std::sort(names.begin(), names.end());
+        std::ranges::sort(names);
         ibex::formatting::print("imports:");
         for (const auto& name : names) {
             ibex::formatting::print(" {}", name);
@@ -2391,7 +2398,7 @@ void print_imports(const ImportRegistry& imports, const ExternDeclRegistry& exte
     for (const auto& [source, _] : by_source) {
         sources.push_back(source);
     }
-    std::sort(sources.begin(), sources.end());
+    std::ranges::sort(sources);
     ibex::formatting::print("extern origins:\n");
     for (const auto& source : sources) {
         auto& names = by_source[source];
@@ -2776,7 +2783,7 @@ auto extract_compile_time_string_list(const runtime::Table& table)
     std::vector<std::string> values;
     values.reserve(names->size());
     for (const auto& value : *names) {
-        values.push_back(std::string(value));
+        values.emplace_back(value);
     }
     return values;
 }
@@ -6134,7 +6141,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             // With :timing on this prints ONE time line for the whole script,
             // which is what the benchmark harness's whole-script mode reads.
             auto arg_view = trim(line_view.substr(std::string_view(":run").size()));
-            std::string path = parse_load_path(arg_view);
+            const std::string path = parse_load_path(arg_view);
             if (path.empty()) {
                 ibex::formatting::print("usage: :run <file>\n");
                 report_timing();

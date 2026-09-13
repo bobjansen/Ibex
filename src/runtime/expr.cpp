@@ -38,6 +38,7 @@
 #include <robin_hood.h>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -2183,8 +2184,8 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
                     return std::fmod(lhs, rhs);
             }
         } else {
-            std::int64_t lhs = std::get<std::int64_t>(left.value());
-            std::int64_t rhs = std::get<std::int64_t>(right.value());
+            const std::int64_t lhs = std::get<std::int64_t>(left.value());
+            const std::int64_t rhs = std::get<std::int64_t>(right.value());
             switch (bin->op) {
                 case ir::ArithmeticOp::Add:
                     return lhs + rhs;

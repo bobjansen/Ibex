@@ -844,12 +844,14 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     auto run_rows = [&](auto drop_pred, auto has_nulls_tag) {
                         constexpr bool kHasNulls = decltype(has_nulls_tag)::value;
                         T sum{};
+                        // NOLINTNEXTLINE(misc-const-correctness) // constexpr lint bug
                         std::size_t val_cnt = 0;  // non-null, non-NaN in window
                         std::size_t nan_cnt = 0;  // valid-but-NaN (Float only)
                         std::size_t lo = 0;
                         for (std::size_t i = 0; i < rows; ++i) {
                             if (!kHasNulls || valid_at(i)) {
                                 const T v = col_values[i];
+                                // NOLINTNEXTLINE(misc-const-correctness) // constexpr lint bug
                                 bool is_nan = false;
                                 if constexpr (std::is_floating_point_v<T>) {
                                     is_nan = std::isnan(v);
@@ -1613,7 +1615,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
 /// The caches are `thread_local` rather than captured state because the
 /// resample paths are threaded. Offsets change twice a year and consecutive
 /// rows share a bucket, so both hit on nearly every row of sorted input.
-#if defined(IBEX_HAS_STD_CHRONO_TIME_ZONES)
+#ifdef IBEX_HAS_STD_CHRONO_TIME_ZONES
 [[nodiscard]] auto zoned_bucket_start(const std::chrono::time_zone* zone, std::int64_t nanos,
                                       std::int64_t dur_ns) -> std::int64_t {
     thread_local const std::chrono::time_zone* cached_zone = nullptr;
@@ -1671,7 +1673,7 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
 
     // A zoned time index buckets on LOCAL boundaries; an unzoned one is an
     // instant with no wall clock attached, so it keeps the UTC grid (SPEC 2.4).
-#if defined(IBEX_HAS_STD_CHRONO_TIME_ZONES)
+#ifdef IBEX_HAS_STD_CHRONO_TIME_ZONES
     const std::chrono::time_zone* zone = nullptr;
 #else
     std::optional<std::string_view> zone;
@@ -1682,7 +1684,7 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
             return std::unexpected("resample: unknown time zone '" + name + "' on time index '" +
                                    ts_name + "'");
         }
-#if defined(IBEX_HAS_STD_CHRONO_TIME_ZONES)
+#ifdef IBEX_HAS_STD_CHRONO_TIME_ZONES
         zone = std::chrono::locate_zone(name);
 #else
         zone = name;
@@ -1692,7 +1694,7 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
     const auto rows = input.rows();
     const auto bucket_of = [&](std::size_t i) -> std::int64_t {
         const std::int64_t nanos = (*ts_col)[i].nanos;
-#if defined(IBEX_HAS_STD_CHRONO_TIME_ZONES)
+#ifdef IBEX_HAS_STD_CHRONO_TIME_ZONES
         if (zone != nullptr) {
             return zoned_bucket_start(zone, nanos, dur_ns);
         }
@@ -1752,7 +1754,7 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
         bvals.reserve(1024);
         std::int64_t prev = 0;
         for (std::size_t i = 0; i < rows; ++i) {
-            std::int64_t b = bucket_of(i);
+            const std::int64_t b = bucket_of(i);
             if (i == 0 || b != prev) {
                 starts.push_back(i);
                 bvals.push_back(b);
@@ -1765,7 +1767,7 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
         Table out;
         Column<Timestamp> ts_out;
         ts_out.reserve(ng);
-        for (std::int64_t b : bvals)
+        for (const std::int64_t b : bvals)
             ts_out.push_back(Timestamp{b});
         // Bucket starts are instants in the same zone as the index they came from.
         ts_out.set_meta(ts_col->meta());

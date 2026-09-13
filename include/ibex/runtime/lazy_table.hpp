@@ -394,7 +394,7 @@ using LazyTablePtr = std::shared_ptr<LazyTable>;
 /// ordinary path.
 [[nodiscard]] auto materialize_deferred_scan_rows(const DeferredScan& scan, const Selection& rows,
                                                   const ExecutionContext& exec,
-                                                  ColumnEntry key_column)
+                                                  const ColumnEntry& key_column)
     -> std::expected<Table, std::string>;
 
 }  // namespace ibex::runtime

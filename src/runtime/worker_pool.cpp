@@ -716,9 +716,8 @@ auto compute_thread_count() -> std::size_t {
     const auto raw = env_value("IBEX_CORES");
     if (!raw.empty() && raw != "auto") {
         std::size_t parsed = 0;
-        const auto* end = raw.data() + raw.size();
-        const auto result = std::from_chars(raw.data(), end, parsed);
-        if (result.ec == std::errc{} && result.ptr == end && parsed > 0) {
+        const auto result = std::from_chars(raw.begin(), raw.end(), parsed);
+        if (result.ec == std::errc{} && result.ptr == raw.end() && parsed > 0) {
             return parsed;
         }
         return 1;
@@ -737,9 +736,8 @@ auto env_size(const char* name, std::size_t fallback) -> std::size_t {
         return fallback;
     }
     std::size_t parsed = 0;
-    const auto* end = raw.data() + raw.size();
-    const auto result = std::from_chars(raw.data(), end, parsed);
-    return (result.ec == std::errc{} && result.ptr == end && parsed > 0) ? parsed : fallback;
+    const auto result = std::from_chars(raw.begin(), raw.end(), parsed);
+    return (result.ec == std::errc{} && result.ptr == raw.end() && parsed > 0) ? parsed : fallback;
 }
 
 }  // namespace
@@ -875,9 +873,8 @@ auto source_chunk_rows_from_env() -> std::size_t {
         return 0;
     }
     std::size_t parsed = 0;
-    const auto* end = raw.data() + raw.size();
-    const auto result = std::from_chars(raw.data(), end, parsed);
-    if (result.ec == std::errc{} && result.ptr == end) {
+    const auto result = std::from_chars(raw.begin(), raw.end(), parsed);
+    if (result.ec == std::errc{} && result.ptr == raw.end()) {
         return parsed;
     }
     return 0;
@@ -889,9 +886,8 @@ auto morsel_rows_from_env() -> std::size_t {
         return 0;
     }
     std::size_t parsed = 0;
-    const auto* end = raw.data() + raw.size();
-    const auto result = std::from_chars(raw.data(), end, parsed);
-    if (result.ec == std::errc{} && result.ptr == end) {
+    const auto result = std::from_chars(raw.begin(), raw.end(), parsed);
+    if (result.ec == std::errc{} && result.ptr == raw.end()) {
         return parsed;
     }
     return 0;

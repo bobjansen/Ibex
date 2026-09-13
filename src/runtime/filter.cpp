@@ -3470,6 +3470,7 @@ auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts
     }
 
     std::vector<std::size_t> selected(input.rows());
+    // NOLINTNEXTLINE(modernize-use-ranges): Because Apple libc++
     std::iota(selected.begin(), selected.end(), std::size_t{0});
     return filter_selection_impl(input, conjuncts, exec, scalars, std::move(selected));
 }

@@ -1421,11 +1421,12 @@ auto effects_to_string(const std::optional<std::vector<parser::EffectSpec>>& eff
         return {};
     }
     std::string out = " effects {";
-    for (std::size_t i = 0; i < effects->size(); ++i) {
-        if (i > 0) {
+    bool first = true;
+    for (const auto& effect : *effects) {
+        if (!std::exchange(first, false)) {
             out += ", ";
         }
-        switch ((*effects)[i].kind) {
+        switch (effect.kind) {
             case parser::EffectKind::IoRead:
                 out += "io_read";
                 break;
@@ -1445,9 +1446,9 @@ auto effects_to_string(const std::optional<std::vector<parser::EffectSpec>>& eff
                 out += "may_fail";
                 break;
         }
-        if ((*effects)[i].resource.has_value()) {
+        if (const auto& resource = effect.resource; resource.has_value()) {
             out += "(\"";
-            out += *(*effects)[i].resource;
+            out += *resource;
             out += "\")";
         }
     }

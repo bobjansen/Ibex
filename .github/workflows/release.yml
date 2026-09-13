@@ -123,7 +123,11 @@ jobs:
             find build-release/tools -maxdepth 1 \( -name '*.so' -o -name '*.so.*' -o -name '*.dylib' -o -name '*.ibex' \) -exec cp {} stage/plugins/ \;
           fi
 
-          test -f stage/bin/ibex
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            test -f stage/bin/ibex.exe
+          else
+            test -f stage/bin/ibex
+          fi
           test -f stage/bin/ui/index.html
 
           cat > stage/README.txt <<EOF

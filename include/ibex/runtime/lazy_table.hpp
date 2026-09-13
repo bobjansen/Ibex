@@ -345,7 +345,8 @@ class LazyTable {
         -> std::optional<std::set<std::string>>;
     /// AND static conjuncts into an existing selection, decoding their columns
     /// through it. nullopt = the conjuncts name no column to stage.
-    [[nodiscard]] auto narrow_selection(Selection selected, const std::vector<ir::Expr>& conjuncts,
+    [[nodiscard]] auto narrow_selection(const Selection& selected,
+                                        const std::vector<ir::Expr>& conjuncts,
                                         const ExecutionContext& exec, const ScalarRegistry* scalars)
         -> std::expected<std::optional<Selection>, std::string>;
     /// The predicate columns for one unit, never cached and never read from

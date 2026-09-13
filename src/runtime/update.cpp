@@ -313,7 +313,7 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, RowRange r
     }
     if (output_kind == ExprType::Int) {
         if (!left->is_column && !right->is_column) {
-            std::int64_t value =
+            const std::int64_t value =
                 apply_int_op(bin->op, get_int_value(*left, 0), get_int_value(*right, 0));
             Column<std::int64_t> out;
             out.assign(rows, value);
@@ -325,8 +325,8 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, RowRange r
         const std::int64_t* rp = (right->is_column && right->kind == ExprType::Int)
                                      ? std::get<Column<std::int64_t>>(*right->column).data() + begin
                                      : nullptr;
-        std::int64_t ls = left->is_column ? 0 : get_int_value(*left, 0);
-        std::int64_t rs = right->is_column ? 0 : get_int_value(*right, 0);
+        const std::int64_t ls = left->is_column ? 0 : get_int_value(*left, 0);
+        const std::int64_t rs = right->is_column ? 0 : get_int_value(*right, 0);
         const bool left_ok = !left->is_column || lp != nullptr;
         const bool right_ok = !right->is_column || rp != nullptr;
         if (left_ok && right_ok) {
@@ -2077,22 +2077,21 @@ struct GroupedRows {
             };
             std::vector<Local> locals(bucket_workers);
             {
-                auto batch =
-                    process_worker_pool().submit(bucket_workers, [&](std::size_t w) noexcept {
-                        const std::size_t lo = w * span;
-                        const std::size_t hi = std::min(lo + span, rows);
-                        if (lo >= hi) {
-                            return;
-                        }
-                        KeyRowIndex index;
-                        auto& local = locals[w];
-                        for (std::size_t r = lo; r < hi; ++r) {
-                            row_gid[r] = index.find_or_insert(local.keys, key_cols, r, [&] {
-                                local.keys.push_back(make_key_at(r));
-                                return static_cast<std::uint32_t>(local.keys.size() - 1);
-                            });
-                        }
-                    });
+                auto batch = process_worker_pool().submit(bucket_workers, [&](std::size_t w) {
+                    const std::size_t lo = w * span;
+                    const std::size_t hi = std::min(lo + span, rows);
+                    if (lo >= hi) {
+                        return;
+                    }
+                    KeyRowIndex index;
+                    auto& local = locals[w];
+                    for (std::size_t r = lo; r < hi; ++r) {
+                        row_gid[r] = index.find_or_insert(local.keys, key_cols, r, [&] {
+                            local.keys.push_back(make_key_at(r));
+                            return static_cast<std::uint32_t>(local.keys.size() - 1);
+                        });
+                    }
+                });
                 batch.wait();
             }
 

@@ -2014,7 +2014,7 @@ auto try_in_list_mask(const ir::Expr& expr, const PredicateInput& input, RowRang
     std::vector<std::uint8_t> code_ok(dict.size(), 0U);
     for (std::size_t code = 0; code < dict.size(); ++code) {
         code_ok[code] = static_cast<std::uint8_t>(
-            std::find(values.begin(), values.end(), std::string_view{dict[code]}) != values.end());
+            std::ranges::find(values, std::string_view{dict[code]}) != values.end());
     }
 
     Mask mask;
@@ -2844,7 +2844,7 @@ void restrict_allowed(SetSpec& spec, const std::vector<std::string_view>& values
     }
     std::vector<std::string_view> both;
     for (const auto& value : spec.allowed) {
-        if (std::find(values.begin(), values.end(), value) != values.end()) {
+        if (std::ranges::find(values, value) != values.end()) {
             both.push_back(value);
         }
     }

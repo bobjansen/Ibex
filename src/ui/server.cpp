@@ -54,7 +54,6 @@
 #include <ws2tcpip.h>
 #pragma comment(lib, "Ws2_32.lib")
 #else
-#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -660,6 +659,9 @@ auto run_server(const ServerConfig& config, runtime::ExternRegistry& registry) -
     static_cast<void>(setsockopt(listener, SOL_SOCKET, SO_REUSEADDR,
                                  reinterpret_cast<const char*>(&reuse), sizeof(reuse)));
 #else
+    // sys/socket.h directly provides these POSIX socket-option macros. Clang's
+    // include-cleaner cannot trace their glibc internal definition back to it.
+    // NOLINTNEXTLINE(misc-include-cleaner)
     static_cast<void>(setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)));
 #endif
     sockaddr_in address{};

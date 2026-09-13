@@ -30,8 +30,6 @@
 #include <expected>
 #include <memory>
 #include <optional>
-#include <pdqsort.h>
-#include <robin_hood.h>
 #include <string>
 #include <type_traits>
 #include <utility>

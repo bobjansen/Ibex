@@ -819,7 +819,7 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
         return lhs < rhs;
     };
     std::vector<std::size_t> idx(rows);
-    std::iota(idx.begin(), idx.end(), std::size_t{0});
+    std::ranges::iota(idx, std::size_t{0});
     pdqsort(idx.begin(), idx.end(), compare_row);
     return gather_rows_parallel(input, idx, &resolved_keys, exec);
 }
@@ -908,7 +908,7 @@ auto head_table(const Table& input, std::size_t count, const std::vector<ir::Col
 
     if (group_by.empty()) {
         std::vector<std::size_t> idx(std::min(rows, count));
-        std::iota(idx.begin(), idx.end(), std::size_t{0});
+        std::ranges::iota(idx, std::size_t{0});
         return gather_rows(input, idx);
     }
 
@@ -969,7 +969,7 @@ auto tail_table(const Table& input, std::size_t count, const std::vector<ir::Col
         const std::size_t keep = std::min(rows, count);
         std::vector<std::size_t> idx(keep);
         const std::size_t start = rows - keep;
-        std::iota(idx.begin(), idx.end(), start);
+        std::ranges::iota(idx, start);
         return gather_rows(input, idx);
     }
 

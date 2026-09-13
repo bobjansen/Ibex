@@ -762,7 +762,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 } else if (item.str_col != nullptr) {
                     std::vector<std::string> acc(n_groups);
                     for (std::size_t row = 0; row < rows; ++row) {
-                        std::uint32_t g = gids[row];
+                        const std::uint32_t g = gids[row];
                         if (found[g] == 0U) {
                             acc[g] = (*item.str_col)[row];
                             found[g] = 1U;

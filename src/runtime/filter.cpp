@@ -158,19 +158,16 @@ auto pack_mask_word_scalar(const std::uint8_t* mp, const std::uint8_t* vp, std::
 #ifdef __AVX2__
 namespace {
 
+auto load_mask_vector(const std::uint8_t* src) noexcept -> __m256i {
+    __m256i value;
+    std::memcpy(&value, src, sizeof(value));
+    return value;
+}
+
 auto pack_mask_word_avx2(const std::uint8_t* mp) noexcept -> std::uint64_t {
     const __m256i zero = _mm256_setzero_si256();
-#if defined(_MSC_VER) && !defined(__clang__)
-    // MSVC's intrinsic takes __m256i*, while GCC and Clang expose their
-    // one-byte-aligned __m256i_u parameter type for the unaligned load.
-    using LoadPtr = const __m256i*;
-#else
-    using LoadPtr = const __m256i_u*;
-#endif
-    const auto* lo_ptr = static_cast<LoadPtr>(static_cast<const void*>(mp));
-    const auto* hi_ptr = static_cast<LoadPtr>(static_cast<const void*>(mp + 32));
-    const __m256i lo = _mm256_loadu_si256(lo_ptr);
-    const __m256i hi = _mm256_loadu_si256(hi_ptr);
+    const __m256i lo = load_mask_vector(mp);
+    const __m256i hi = load_mask_vector(mp + 32);
     const auto lo_bits =
         static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_cmpgt_epi8(lo, zero)));
     const auto hi_bits =

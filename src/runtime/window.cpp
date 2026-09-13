@@ -191,6 +191,7 @@ class SlidingQuantile {
     auto operator=(const SlidingQuantile&) -> SlidingQuantile& = delete;
     SlidingQuantile(SlidingQuantile&&) = delete;
     auto operator=(SlidingQuantile&&) -> SlidingQuantile& = delete;
+    ~SlidingQuantile() = default;
 
     [[nodiscard]] auto empty() const noexcept -> bool { return lo_.empty() && hi_.empty(); }
 

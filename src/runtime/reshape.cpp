@@ -229,7 +229,7 @@ auto transpose_table(const Table& input) -> std::expected<Table, std::string> {
     }
 
     int label_idx = -1;
-    for (int i = 0; i < static_cast<int>(input.columns.size()); ++i) {
+    for (int i = 0; std::cmp_less(i, input.columns.size()); ++i) {
         const auto& cv = *input.columns[static_cast<std::size_t>(i)].column;
         if (std::holds_alternative<Column<std::string>>(cv) ||
             std::holds_alternative<Column<Categorical>>(cv)) {
@@ -242,7 +242,7 @@ auto transpose_table(const Table& input) -> std::expected<Table, std::string> {
 
     std::vector<std::size_t> data_idxs;
     for (std::size_t i = 0; i < input.columns.size(); ++i) {
-        if (static_cast<int>(i) != label_idx) {
+        if (std::cmp_not_equal(i, label_idx)) {
             data_idxs.push_back(i);
         }
     }

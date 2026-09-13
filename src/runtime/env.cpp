@@ -6,6 +6,12 @@
 #include <cstdlib>
 #include <string>
 
+#ifndef _WIN32
+// POSIX declares setenv/unsetenv here; <cstdlib> does not guarantee them.
+// NOLINTNEXTLINE(modernize-deprecated-headers)
+#include <stdlib.h>
+#endif
+
 namespace ibex::runtime {
 
 void set_env(const std::string& name, const std::string& value) {

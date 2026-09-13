@@ -630,12 +630,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     }
     const auto row_key_is_null = [](const std::vector<const ValidityBitmap*>& validity,
                                     std::size_t row) {
-        for (const auto* bitmap : validity) {
-            if (bitmap != nullptr && !(*bitmap)[row]) {
-                return true;
-            }
-        }
-        return false;
+        return std::ranges::any_of(
+            validity, [&row](const auto* bitmap) { return bitmap != nullptr && !(*bitmap)[row]; });
     };
     // Under `Never` a null-keyed row is kept out of the index and never looked
     // up -- the pair of half-measures that makes it match nothing. Under
@@ -1152,16 +1148,16 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             Table batch;
             batch.columns.reserve(left.columns.size() + nlj_right.size());
 
-            for (std::size_t ci = 0; ci < left.columns.size(); ++ci) {
-                auto col = make_empty_like(*left.columns[ci].column);
+            for (const auto& column : left.columns) {
+                auto col = make_empty_like(*column.column);
                 for (std::size_t j = 0; j < n_right; ++j) {
-                    append_value(col, *left.columns[ci].column, l);
+                    append_value(col, *column.column, l);
                 }
                 // The predicate reads the *inputs* (SPEC.md Section 5.6), so
                 // the batch carries the left column's own name. Using the
                 // output name here was invisible until a suffix clause made
                 // the two differ, and then `left(v)` could not find `v`.
-                batch.add_column(left.columns[ci].name, std::move(col));
+                batch.add_column(column.name, std::move(col));
             }
             for (const auto& item : nlj_right) {
                 batch.add_column(item.batch_name, *item.column);

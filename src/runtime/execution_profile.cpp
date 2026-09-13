@@ -251,100 +251,107 @@ struct ExecutionProfileScope::Frame {
 ExecutionProfileState::ExecutionProfileState(std::size_t worker_budget, bool report)
     : impl_(std::make_unique<Impl>(worker_budget, report)) {}
 
-ExecutionProfileState::~ExecutionProfileState() {
-    if (!impl_->report) {
-        return;
-    }
-    const double total_ms = static_cast<double>(ns_since(impl_->start)) / 1.0e6;
-    std::vector<ExecutionProfileEntry*> rows;
-    {
-        const std::lock_guard lock(impl_->mutex);
-        rows.reserve(impl_->entries.size());
-        for (const auto& [_, entry] : impl_->entries) {
-            rows.push_back(entry.get());
+ExecutionProfileState::~ExecutionProfileState() noexcept {
+    try {
+        if (!impl_->report) {
+            return;
         }
-    }
-    std::ranges::sort(rows, [](const auto* a, const auto* b) {
-        const auto cost = [](const auto* entry) {
-            return entry->build_self_ns.load(std::memory_order_relaxed) +
-                   entry->next_self_ns.load(std::memory_order_relaxed) +
-                   entry->source_self_ns.load(std::memory_order_relaxed);
+        const double total_ms = static_cast<double>(ns_since(impl_->start)) / 1.0e6;
+        std::vector<ExecutionProfileEntry*> rows;
+        {
+            const std::lock_guard lock(impl_->mutex);
+            rows.reserve(impl_->entries.size());
+            for (const auto& [_, entry] : impl_->entries) {
+                rows.push_back(entry.get());
+            }
+        }
+        std::ranges::sort(rows, [](const auto* a, const auto* b) {
+            const auto cost = [](const auto* entry) {
+                return entry->build_self_ns.load(std::memory_order_relaxed) +
+                       entry->next_self_ns.load(std::memory_order_relaxed) +
+                       entry->source_self_ns.load(std::memory_order_relaxed);
+            };
+            return cost(a) > cost(b);
+        });
+        const std::size_t budget = impl_->worker_budget;
+        const auto summary = summarize_execution_profile(snapshot(), total_ms, budget);
+        // `existing_worker_pool_size()`, not `process_worker_pool().size()`: the
+        // latter constructs the pool as a side effect of asking. For a statement
+        // that never otherwise touches the pool (a bare `extern fn` declaration,
+        // say), that construction would happen HERE, after `pool_idle_begin` was
+        // already sampled empty at construction -- so the new workers' own
+        // thread-startup latency reads as idle time against a window whose
+        // capacity is computed from that statement's near-zero wall time,
+        // producing `pool_unqueued_ms` many multiples of `pool_capacity_ms`.
+        // Reading a pool that was never created as zero threads (zero capacity)
+        // is correct: the pool played no role in this window.
+        const std::size_t pool_threads = existing_worker_pool_size();
+        // Measured directly, rather than inferred as capacity-minus-accounted. Those
+        // two agreeing is the whole point: `pool_unqueued_ms` is what the pool says
+        // about itself, `pool_capacity_ms` is what the clock says was available, and
+        // work + backpressure + unqueued should exhaust it. A shortfall means a
+        // fourth bucket nothing is measuring — which this profiler has had four
+        // times already, so the closure is printed rather than assumed.
+        const auto window_ms = [](const IdleSample& begin, const IdleSample& end) {
+            return static_cast<double>(idle_between(begin, end).count()) / 1.0e6;
         };
-        return cost(a) > cost(b);
-    });
-    const std::size_t budget = impl_->worker_budget;
-    const auto summary = summarize_execution_profile(snapshot(), total_ms, budget);
-    // `existing_worker_pool_size()`, not `process_worker_pool().size()`: the
-    // latter constructs the pool as a side effect of asking. For a statement
-    // that never otherwise touches the pool (a bare `extern fn` declaration,
-    // say), that construction would happen HERE, after `pool_idle_begin` was
-    // already sampled empty at construction -- so the new workers' own
-    // thread-startup latency reads as idle time against a window whose
-    // capacity is computed from that statement's near-zero wall time,
-    // producing `pool_unqueued_ms` many multiples of `pool_capacity_ms`.
-    // Reading a pool that was never created as zero threads (zero capacity)
-    // is correct: the pool played no role in this window.
-    const std::size_t pool_threads = existing_worker_pool_size();
-    // Measured directly, rather than inferred as capacity-minus-accounted. Those
-    // two agreeing is the whole point: `pool_unqueued_ms` is what the pool says
-    // about itself, `pool_capacity_ms` is what the clock says was available, and
-    // work + backpressure + unqueued should exhaust it. A shortfall means a
-    // fourth bucket nothing is measuring — which this profiler has had four
-    // times already, so the closure is printed rather than assumed.
-    const auto window_ms = [](const IdleSample& begin, const IdleSample& end) {
-        return static_cast<double>(idle_between(begin, end).count()) / 1.0e6;
-    };
-    const double pool_unqueued_ms = window_ms(impl_->pool_idle_begin, sample_pool_idle());
-    const double pool_capacity_ms = total_ms * static_cast<double>(pool_threads);
-    // The stage thread's own accounting, on the same closure principle: a
-    // producer's park had no home at all before this — it sits outside every
-    // profile scope, so unlike a worker's park there was nothing to subtract it
-    // from. `stage_live_ms` is what makes the other two checkable.
-    const double stage_park_ms = window_ms(impl_->stage_park_begin_sample, sample_stage_park());
-    const double stage_live_ms = window_ms(impl_->stage_live_begin_sample, sample_stage_live());
-    ibex::formatting::print(
-        stderr,
-        "operator profile: wall_ms={:.3f} entries={} workers={} self_ms={:.3f} "
-        "serial_self_ms={:.3f} serial_fraction={:.3f} amdahl_ceiling={:.2f}x "
-        "barriers={} barrier_wait_ms={:.3f} ring_wait_ms={:.3f} "
-        "pool_work_ms={:.3f} pool_idle_ms={:.3f} pool_unqueued_ms={:.3f} "
-        "pool_capacity_ms={:.3f} occupancy={:.3f} "
-        "pool_threads={} stage_threads_peak={} stage_self_ms={:.3f} "
-        "stage_park_ms={:.3f} stage_ring_wait_ms={:.3f} stage_live_ms={:.3f}\n",
-        total_ms, rows.size(), budget, summary.self_ms, summary.serial_self_ms,
-        summary.serial_fraction, summary.amdahl_ceiling, summary.barriers, summary.barrier_wait_ms,
-        summary.ring_wait_ms, summary.pool_work_ms, summary.pool_idle_ms, pool_unqueued_ms,
-        pool_capacity_ms, summary.occupancy, pool_threads, stage_thread_peak(),
-        summary.stage_self_ms, stage_park_ms, summary.stage_ring_wait_ms, stage_live_ms);
-    for (const auto* row : rows) {
-        ExecutionProfileSnapshotRow occupancy_row;
-        occupancy_row.span_ns = row->span_ns.load(std::memory_order_relaxed);
-        occupancy_row.pool_work_ns = row->pool_work_ns.load(std::memory_order_relaxed);
-        const double row_occupancy = profile_row_occupancy(occupancy_row, budget);
+        const double pool_unqueued_ms = window_ms(impl_->pool_idle_begin, sample_pool_idle());
+        const double pool_capacity_ms = total_ms * static_cast<double>(pool_threads);
+        // The stage thread's own accounting, on the same closure principle: a
+        // producer's park had no home at all before this — it sits outside every
+        // profile scope, so unlike a worker's park there was nothing to subtract it
+        // from. `stage_live_ms` is what makes the other two checkable.
+        const double stage_park_ms = window_ms(impl_->stage_park_begin_sample, sample_stage_park());
+        const double stage_live_ms = window_ms(impl_->stage_live_begin_sample, sample_stage_live());
         ibex::formatting::print(
             stderr,
-            "profile node={} op=\"{}\" build_self_ms={:.3f} next_self_ms={:.3f} "
-            "source_self_ms={:.3f} span_ms={:.3f} pool_next_ms={:.3f} pool_source_ms={:.3f} "
-            "pool_work_ms={:.3f} occupancy={:.3f} calls={} "
-            "chunks={} rows={} pool_calls={} pool_tasks={} barriers={} barrier_wait_ms={:.3f} "
-            "stage_self_ms={:.3f} ring_wait_ms={:.3f} pool_idle_ms={:.3f}\n",
-            row->node_id, row->label,
-            static_cast<double>(row->build_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
-            static_cast<double>(row->next_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
-            static_cast<double>(row->source_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
-            static_cast<double>(row->span_ns.load(std::memory_order_relaxed)) / 1.0e6,
-            static_cast<double>(row->pool_next_ns.load(std::memory_order_relaxed)) / 1.0e6,
-            static_cast<double>(row->pool_source_ns.load(std::memory_order_relaxed)) / 1.0e6,
-            static_cast<double>(row->pool_work_ns.load(std::memory_order_relaxed)) / 1.0e6,
-            row_occupancy, row->calls.load(std::memory_order_relaxed),
-            row->chunks.load(std::memory_order_relaxed), row->rows.load(std::memory_order_relaxed),
-            row->pool_thread_calls.load(std::memory_order_relaxed),
-            row->pool_tasks.load(std::memory_order_relaxed),
-            row->barriers.load(std::memory_order_relaxed),
-            static_cast<double>(row->barrier_wait_ns.load(std::memory_order_relaxed)) / 1.0e6,
-            static_cast<double>(row->stage_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
-            static_cast<double>(row->ring_wait_ns.load(std::memory_order_relaxed)) / 1.0e6,
-            static_cast<double>(row->pool_idle_ns.load(std::memory_order_relaxed)) / 1.0e6);
+            "operator profile: wall_ms={:.3f} entries={} workers={} self_ms={:.3f} "
+            "serial_self_ms={:.3f} serial_fraction={:.3f} amdahl_ceiling={:.2f}x "
+            "barriers={} barrier_wait_ms={:.3f} ring_wait_ms={:.3f} "
+            "pool_work_ms={:.3f} pool_idle_ms={:.3f} pool_unqueued_ms={:.3f} "
+            "pool_capacity_ms={:.3f} occupancy={:.3f} "
+            "pool_threads={} stage_threads_peak={} stage_self_ms={:.3f} "
+            "stage_park_ms={:.3f} stage_ring_wait_ms={:.3f} stage_live_ms={:.3f}\n",
+            total_ms, rows.size(), budget, summary.self_ms, summary.serial_self_ms,
+            summary.serial_fraction, summary.amdahl_ceiling, summary.barriers,
+            summary.barrier_wait_ms, summary.ring_wait_ms, summary.pool_work_ms,
+            summary.pool_idle_ms, pool_unqueued_ms, pool_capacity_ms, summary.occupancy,
+            pool_threads, stage_thread_peak(), summary.stage_self_ms, stage_park_ms,
+            summary.stage_ring_wait_ms, stage_live_ms);
+        for (const auto* row : rows) {
+            ExecutionProfileSnapshotRow occupancy_row;
+            occupancy_row.span_ns = row->span_ns.load(std::memory_order_relaxed);
+            occupancy_row.pool_work_ns = row->pool_work_ns.load(std::memory_order_relaxed);
+            const double row_occupancy = profile_row_occupancy(occupancy_row, budget);
+            ibex::formatting::print(
+                stderr,
+                "profile node={} op=\"{}\" build_self_ms={:.3f} next_self_ms={:.3f} "
+                "source_self_ms={:.3f} span_ms={:.3f} pool_next_ms={:.3f} pool_source_ms={:.3f} "
+                "pool_work_ms={:.3f} occupancy={:.3f} calls={} "
+                "chunks={} rows={} pool_calls={} pool_tasks={} barriers={} barrier_wait_ms={:.3f} "
+                "stage_self_ms={:.3f} ring_wait_ms={:.3f} pool_idle_ms={:.3f}\n",
+                row->node_id, row->label,
+                static_cast<double>(row->build_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
+                static_cast<double>(row->next_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
+                static_cast<double>(row->source_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
+                static_cast<double>(row->span_ns.load(std::memory_order_relaxed)) / 1.0e6,
+                static_cast<double>(row->pool_next_ns.load(std::memory_order_relaxed)) / 1.0e6,
+                static_cast<double>(row->pool_source_ns.load(std::memory_order_relaxed)) / 1.0e6,
+                static_cast<double>(row->pool_work_ns.load(std::memory_order_relaxed)) / 1.0e6,
+                row_occupancy, row->calls.load(std::memory_order_relaxed),
+                row->chunks.load(std::memory_order_relaxed),
+                row->rows.load(std::memory_order_relaxed),
+                row->pool_thread_calls.load(std::memory_order_relaxed),
+                row->pool_tasks.load(std::memory_order_relaxed),
+                row->barriers.load(std::memory_order_relaxed),
+                static_cast<double>(row->barrier_wait_ns.load(std::memory_order_relaxed)) / 1.0e6,
+                static_cast<double>(row->stage_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
+                static_cast<double>(row->ring_wait_ns.load(std::memory_order_relaxed)) / 1.0e6,
+                static_cast<double>(row->pool_idle_ns.load(std::memory_order_relaxed)) / 1.0e6);
+        }
+    } catch (...) {
+        // Profiling is diagnostic-only; teardown must not terminate a query
+        // because formatting or allocating its optional report failed.
     }
 }
 

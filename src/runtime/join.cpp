@@ -526,6 +526,7 @@ auto resolve_predicate_sides(const ir::Expr& predicate, const Table& left, const
 
 }  // namespace
 
+// NOLINTNEXTLINE(readability-function-size)
 auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                      const std::vector<ir::JoinKey>& keys, const ir::Expr* predicate,
                      const ScalarRegistry* scalars, PredicateMaskEvaluator mask_evaluator,
@@ -1807,6 +1808,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                             }
                             buckets[it->second].push_back(r);
                         }
+                        // per-key merge cursors advance through `pos`.
+                        // NOLINTNEXTLINE(misc-const-correctness)
                         std::vector<std::size_t> cursor(buckets.size(), 0);
                         for (std::size_t l = 0; l < n_left; ++l) {
                             auto it = dict.find(lc[l]);

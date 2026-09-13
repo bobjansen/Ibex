@@ -733,7 +733,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 if (item.int_col != nullptr) {
                     std::vector<std::int64_t> acc(n_groups, 0);
                     for (std::size_t row = 0; row < rows; ++row) {
-                        std::uint32_t g = gids[row];
+                        const std::uint32_t g = gids[row];
                         if (found[g] == 0U) {
                             acc[g] = (*item.int_col)[row];
                             found[g] = 1U;
@@ -748,7 +748,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     std::vector<double> acc(n_groups, 0.0);
                     const double* data = item.dbl_col->data();
                     for (std::size_t row = 0; row < rows; ++row) {
-                        std::uint32_t g = gids[row];
+                        const std::uint32_t g = gids[row];
                         if (found[g] == 0U) {
                             acc[g] = data[row];
                             found[g] = 1U;
@@ -776,7 +776,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 } else if (item.cat_col != nullptr) {
                     std::vector<std::string> acc(n_groups);
                     for (std::size_t row = 0; row < rows; ++row) {
-                        std::uint32_t g = gids[row];
+                        const std::uint32_t g = gids[row];
                         if (found[g] == 0U) {
                             acc[g] = std::string((*item.cat_col)[row]);
                             found[g] = 1U;
@@ -853,7 +853,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         std::vector<double> acc(n_groups, 0.0);
                         std::vector<std::int64_t> counts(n_groups, 0);
                         for (std::size_t row = 0; row < rows; ++row) {
-                            std::uint32_t g = gids[row];
+                            const std::uint32_t g = gids[row];
                             acc[g] += data[row];
                             counts[g]++;
                         }
@@ -866,7 +866,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::Min: {
                         std::vector<double> acc(n_groups, std::numeric_limits<double>::infinity());
                         for (std::size_t row = 0; row < rows; ++row) {
-                            std::uint32_t g = gids[row];
+                            const std::uint32_t g = gids[row];
                             acc[g] = std::min(data[row], acc[g]);
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
@@ -878,7 +878,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::Max: {
                         std::vector<double> acc(n_groups, -std::numeric_limits<double>::infinity());
                         for (std::size_t row = 0; row < rows; ++row) {
-                            std::uint32_t g = gids[row];
+                            const std::uint32_t g = gids[row];
                             acc[g] = std::max(data[row], acc[g]);
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
@@ -908,7 +908,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         std::vector<double> acc(n_groups, 0.0);
                         std::vector<std::int64_t> counts(n_groups, 0);
                         for (std::size_t row = 0; row < rows; ++row) {
-                            std::uint32_t g = gids[row];
+                            const std::uint32_t g = gids[row];
                             acc[g] += static_cast<double>(data[row]);
                             counts[g]++;
                         }
@@ -922,7 +922,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         std::vector<std::int64_t> acc(n_groups,
                                                       std::numeric_limits<std::int64_t>::max());
                         for (std::size_t row = 0; row < rows; ++row) {
-                            std::uint32_t g = gids[row];
+                            const std::uint32_t g = gids[row];
                             acc[g] = std::min(data[row], acc[g]);
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
@@ -935,7 +935,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         std::vector<std::int64_t> acc(n_groups,
                                                       std::numeric_limits<std::int64_t>::min());
                         for (std::size_t row = 0; row < rows; ++row) {
-                            std::uint32_t g = gids[row];
+                            const std::uint32_t g = gids[row];
                             acc[g] = std::max(data[row], acc[g]);
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
@@ -1452,7 +1452,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             std::vector<AggSlot> flat_slots_i64;
             flat_slots_i64.reserve(rows * (n_aggs_i64 == 0 ? 1 : n_aggs_i64));
             for (std::size_t row = 0; row < rows; ++row) {
-                std::int64_t key = col[row];
+                const std::int64_t key = col[row];
                 auto it = index.find(key);
                 std::size_t slot_index = 0;
                 if (it == index.end()) {
@@ -1945,7 +1945,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 row_codes[ci] = per_col[ci].code_at(row);
             }
             const std::uint64_t hash = hash_codes(row_codes.data(), n_keys);
-            std::size_t mask = slots.size() - 1;
+            const std::size_t mask = slots.size() - 1;
             std::size_t probe = static_cast<std::size_t>(hash) & mask;
             std::uint32_t gid = 0;
             while (true) {

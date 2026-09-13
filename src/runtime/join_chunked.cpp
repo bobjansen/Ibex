@@ -8,19 +8,13 @@
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/format.hpp>
-#include <ibex/ir/column_name_map.hpp>
-#include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/join_output.hpp>
 #include <ibex/ir/node.hpp>
-#include <ibex/ir/schema.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/interrupt.hpp>
 #include <ibex/runtime/lazy_table.hpp>
-#include <ibex/runtime/morsel.hpp>
 #include <ibex/runtime/operator.hpp>
-#include <ibex/runtime/pipeline.hpp>
-#include <ibex/runtime/table_properties.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
@@ -37,7 +31,6 @@
 #include <limits>
 #include <memory>
 #include <optional>
-#include <pdqsort.h>
 #include <robin_hood.h>
 #include <span>
 #include <string>

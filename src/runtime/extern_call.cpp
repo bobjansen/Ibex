@@ -6,79 +6,33 @@
 // leading extern-call statements a Program runs before its plan). Split out of
 // runtime_entry.cpp (formerly chunked.cpp); declared in interpreter_internal.hpp.
 
-#include <ibex/core/column.hpp>
-#include <ibex/core/time.hpp>
-#include <ibex/format.hpp>
-#include <ibex/ir/column_name_map.hpp>
-#include <ibex/ir/expr_predicates.hpp>
-#include <ibex/ir/join_output.hpp>
 #include <ibex/ir/node.hpp>
-#include <ibex/ir/schema.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
-#include <ibex/runtime/interrupt.hpp>
-#include <ibex/runtime/lazy_table.hpp>
-#include <ibex/runtime/morsel.hpp>
 #include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/pipeline.hpp>
-#include <ibex/runtime/table_properties.hpp>
-#include <ibex/runtime/worker_pool.hpp>
 
-#include <algorithm>
-#include <array>
-#include <atomic>
-#include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <cstddef>
-#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <deque>
-#include <exception>
 #include <expected>
-#include <functional>
-#include <limits>
 #include <memory>
-#include <mutex>
-#include <new>
-#include <numeric>
-#include <optional>
 #include <pdqsort.h>
-#include <ratio>
 #include <robin_hood.h>
-#include <span>
 #include <string>
 #include <string_view>
-#include <thread>
-#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
-
-#include "physical_plan.hpp"
 
 #if defined(__AVX2__) || defined(__BMI2__)
 #include <immintrin.h>
 #endif
 
-#include "aggregate_chunked_internal.hpp"
-#include "chunk_conversion_internal.hpp"
-#include "execution_profile_internal.hpp"
 #include "interpreter_internal.hpp"
-#include "join_chunked_internal.hpp"
-#include "join_internal.hpp"
-#include "kernel_filter.hpp"
-#include "kernel_types.hpp"
-#include "kernel_update.hpp"
-#include "model_internal.hpp"
-#include "packed_key_encoder_internal.hpp"
-#include "physical_executor_internal.hpp"
-#include "pipeline_executor_internal.hpp"
-#include "reshape_internal.hpp"
-#include "runtime_internal.hpp"
 
 namespace ibex::runtime {
 

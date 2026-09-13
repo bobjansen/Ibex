@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <deque>
 #include <expected>
+#include <memory>
 #include <optional>
 #include <robin_hood.h>
 #include <string>

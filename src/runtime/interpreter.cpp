@@ -4,7 +4,6 @@
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/column_name_map.hpp>
-#include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -29,6 +28,7 @@
 #include <optional>
 #include <robin_hood.h>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -273,7 +273,7 @@ auto deferred_scan_key_selection(const DeferredScan& scan, const ExecutionContex
 }
 
 auto materialize_deferred_scan_rows(const DeferredScan& scan, const Selection& rows,
-                                    const ExecutionContext& exec, ColumnEntry key_column)
+                                    const ExecutionContext& exec, const ColumnEntry& key_column)
     -> std::expected<Table, std::string> {
     std::set<std::string> names = scan.demand;
     if (scan.demand_all) {
@@ -1110,10 +1110,10 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (!source_args_res)
                 return std::unexpected(source_args_res.error());
             ExternArgs source_args = std::move(*source_args_res);
-            auto sink_args_res = eval_scalar_args(sn.sink_args());
+            const auto sink_args_res = eval_scalar_args(sn.sink_args());
             if (!sink_args_res)
                 return std::unexpected(sink_args_res.error());
-            ExternArgs sink_scalar_args = std::move(*sink_args_res);
+            ExternArgs sink_scalar_args = *sink_args_res;
 
             const ir::Node& transform_ir = sn.transform_ir();
 
@@ -1135,7 +1135,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                         }
                         auto& dst_col = dst.mutable_column(col);
                         append_value(dst_col, *src.columns[col].column, row);
-                        bool null = is_null(src.columns[col], row);
+                        const bool null = is_null(src.columns[col], row);
                         if (null) {
                             if (!dst.columns[col].validity.has_value()) {
                                 dst.columns[col].validity =
@@ -1177,7 +1177,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 const auto* col = t.find(*t.time_index());
                 if (col == nullptr)
                     return std::nullopt;
-                std::size_t last = t.rows() - 1;
+                const std::size_t last = t.rows() - 1;
                 return std::visit(
                     [last](const auto& c) -> std::optional<std::int64_t> {
                         using C = std::decay_t<decltype(c)>;
@@ -1258,7 +1258,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                         const auto& batch = std::get<Table>(src_result.value());
                         for (std::size_t r = 0; r < batch.rows(); ++r) {
                             Table row_tbl = slice_row(batch, r);
-                            auto ts_opt = get_last_ts_ns(row_tbl);
+                            const auto ts_opt = get_last_ts_ns(row_tbl);
                             std::int64_t row_bucket =
                                 ts_opt ? ((*ts_opt / bucket_ns) * bucket_ns) : -1;
 
@@ -1361,11 +1361,11 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             }
             // Validate that all columns have the same length.
             if (!result.columns.empty()) {
-                std::size_t n_rows =
+                const std::size_t n_rows =
                     std::visit([](const auto& c) { return c.size(); }, *result.columns[0].column);
                 for (std::size_t i = 1; i < result.columns.size(); ++i) {
-                    std::size_t len = std::visit([](const auto& c) { return c.size(); },
-                                                 *result.columns[i].column);
+                    const std::size_t len = std::visit([](const auto& c) { return c.size(); },
+                                                       *result.columns[i].column);
                     if (len != n_rows) {
                         return std::unexpected(
                             "Table constructor: all columns must have the same length ('" +

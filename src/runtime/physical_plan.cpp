@@ -3,8 +3,8 @@
 
 #include "physical_plan.hpp"
 
+#include <ibex/core/column.hpp>
 #include <ibex/format.hpp>
-#include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/schema.hpp>
 #include <ibex/runtime/extern_registry.hpp>
@@ -18,10 +18,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "interpreter_internal.hpp"

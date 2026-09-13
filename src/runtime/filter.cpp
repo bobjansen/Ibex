@@ -2355,6 +2355,7 @@ void presize_filter_output(Table& output, const Table& input,
                     // is what makes the offsets array well-formed no matter how
                     // the rows are divided up.
                     dst.offsets_data()[0] = 0;
+                    // NOLINTNEXTLINE(bugprone-branch-clone)
                 } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
                     // Zero-filled on purpose: the bit appender ORs into its
                     // destination word rather than assigning it.
@@ -2484,6 +2485,7 @@ auto filter_gather_is_thread_safe(const Table& input, const std::vector<std::siz
         return std::visit(
             [](const auto& col) {
                 using ColT = std::decay_t<decltype(col)>;
+                // NOLINTNEXTLINE(bugprone-branch-clone)
                 if constexpr (std::is_same_v<ColT, Column<bool>>) {
                     return true;  // bit-packed; shared-word rule
                 } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {

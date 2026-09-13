@@ -713,25 +713,6 @@ auto ExecutionContext::compute_budget() const -> std::size_t {
 }
 
 auto compute_thread_count() -> std::size_t {
-    // `IBEX_THREADS` was this knob's name until the compute budget and the pool
-    // size were split apart. Left unhandled the rename fails SILENTLY and in the
-    // worst possible direction: the old name is ignored, the fallback is
-    // `hardware_concurrency()`, and a run meant to be pinned to one core quietly
-    // spawns twenty-four threads. That cost a measurement here before the
-    // warning existed, and a benchmark script is exactly the kind of caller that
-    // would never notice. Warn once rather than aliasing, so stale callers get
-    // fixed instead of silently kept working.
-    static const bool warned = [] {
-        if (!env_value("IBEX_THREADS").empty() && env_value("IBEX_CORES").empty()) {
-            std::fputs(
-                "ibex: IBEX_THREADS is no longer read; it was split into "
-                "IBEX_CORES (compute budget) and IBEX_DECODE_THREADS (pool size). "
-                "Ignoring it and using the detected core count.\n",
-                stderr);
-        }
-        return true;
-    }();
-    (void)warned;
     const auto raw = env_value("IBEX_CORES");
     if (!raw.empty() && raw != "auto") {
         std::size_t parsed = 0;

@@ -541,20 +541,21 @@ auto import_temporal_column(const ArrowArray& array, const std::shared_ptr<const
         return std::unexpected("Arrow temporal array is missing a data buffer");
     }
 
-    const auto* values = static_cast<const Raw*>(array.buffers[1]);
+    const void* values = array.buffers[1];
     if (owner) {
         return runtime::ColumnValue{Column<Temporal>::from_external(
-            owner, reinterpret_cast<const Temporal*>(values),
-            static_cast<std::size_t>(array.offset), static_cast<std::size_t>(array.length))};
+            owner, static_cast<const Temporal*>(values), static_cast<std::size_t>(array.offset),
+            static_cast<std::size_t>(array.length))};
     }
 
+    const auto* raw_values = static_cast<const Raw*>(values);
     Column<Temporal> column;
     column.reserve(static_cast<std::size_t>(array.length));
     for (std::int64_t i = 0; i < array.length; ++i) {
         if constexpr (std::is_same_v<Temporal, Date>) {
-            column.push_back(Date{values[array.offset + i]});
+            column.push_back(Date{raw_values[array.offset + i]});
         } else {
-            column.push_back(Timestamp{values[array.offset + i]});
+            column.push_back(Timestamp{raw_values[array.offset + i]});
         }
     }
     return runtime::ColumnValue{std::move(column)};
@@ -629,7 +630,8 @@ auto import_string_column(const ArrowArray& array, const std::shared_ptr<const v
         return std::unexpected("Arrow utf8 array is missing offsets or char buffers");
     }
 
-    const auto* offsets = static_cast<const std::int32_t*>(array.buffers[1]);
+    const void* offset_buffer = array.buffers[1];
+    const auto* offsets = static_cast<const std::int32_t*>(offset_buffer);
     const auto* chars = static_cast<const char*>(array.buffers[2]);
     const auto start_base = offsets[array.offset];
     if (start_base < 0) {
@@ -650,8 +652,10 @@ auto import_string_column(const ArrowArray& array, const std::shared_ptr<const v
     }
 
     if (owner) {
+        // Validated nonnegative int32 offsets have the same unsigned values;
+        // C++ permits accessing an integer through its corresponding unsigned type.
         return runtime::ColumnValue{Column<std::string>::from_external(
-            owner, reinterpret_cast<const std::uint32_t*>(offsets), chars,
+            owner, static_cast<const std::uint32_t*>(offset_buffer), chars,
             static_cast<std::size_t>(array.offset), static_cast<std::size_t>(array.length))};
     }
 
@@ -742,7 +746,8 @@ auto import_categorical_column(const ArrowArray& array, const ArrowSchema& schem
         dictionary.buffers[1] == nullptr) {
         return std::unexpected("Arrow dictionary array is missing utf8 buffers");
     }
-    const auto* dict_offsets = static_cast<const std::int32_t*>(dictionary.buffers[1]);
+    const void* dict_offset_buffer = dictionary.buffers[1];
+    const auto* dict_offsets = static_cast<const std::int32_t*>(dict_offset_buffer);
     const auto* dict_chars = static_cast<const char*>(dictionary.buffers[2]);
     if (dict_chars == nullptr && dict_offsets[dictionary.offset + dictionary.length] != 0) {
         return std::unexpected("Arrow dictionary array is missing a character buffer");
@@ -775,7 +780,7 @@ auto import_categorical_column(const ArrowArray& array, const ArrowSchema& schem
         return runtime::ColumnValue{Column<Categorical>::from_external(
             owner, codes, static_cast<std::size_t>(array.offset),
             static_cast<std::size_t>(array.length),
-            reinterpret_cast<const std::uint32_t*>(dict_offsets), dict_chars,
+            static_cast<const std::uint32_t*>(dict_offset_buffer), dict_chars,
             static_cast<std::size_t>(dictionary.offset),
             static_cast<std::size_t>(dictionary.length))};
     }

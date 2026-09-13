@@ -582,12 +582,9 @@ auto contains_expensive_node(const ir::Node& node) -> bool {
         default:
             break;
     }
-    for (const auto& child : node.children()) {
-        if (child != nullptr && contains_expensive_node(*child)) {
-            return true;
-        }
-    }
-    return false;
+    return std::ranges::any_of(node.children(), [](const auto& child) {
+        return child != nullptr && contains_expensive_node(*child);
+    });
 }
 
 /// Look through redundant parentheses.
@@ -3349,10 +3346,17 @@ class Lowerer {
         }
         auto scalar_ref = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = alias}});
         auto value_ref = ir::make_expr_ptr(std::move(lowered_value.value()));
+        if (on_left) {
+            return ir::Expr{.node = ir::CompareExpr{
+                                .op = to_compare_op(comparison->op),
+                                .left = std::move(scalar_ref),
+                                .right = std::move(value_ref),
+                            }};
+        }
         return ir::Expr{.node = ir::CompareExpr{
                             .op = to_compare_op(comparison->op),
-                            .left = on_left ? std::move(scalar_ref) : std::move(value_ref),
-                            .right = on_left ? std::move(value_ref) : std::move(scalar_ref),
+                            .left = std::move(value_ref),
+                            .right = std::move(scalar_ref),
                         }};
     }
 

@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/core/time_zone.hpp>
 #include <ibex/interop/arrow_c_data.hpp>
@@ -1233,4 +1234,86 @@ TEST_CASE("Arrow import puts nulls last when checking a claimed ordering",
     };
     CHECK(import_with_claim(build(false)).has_value());
     CHECK_FALSE(import_with_claim(build(true)).has_value());
+}
+
+// ── Schema-only import ──────────────────────────────────────────────────────
+//
+// A stream can report a schema and then end without a single batch (an empty
+// SQL result). The table built from the schema alone must have the columns a
+// non-empty import would have had, type for type.
+
+TEST_CASE("Arrow C Data builds an empty table from a schema alone", "[interop][arrow][empty]") {
+    ibex::runtime::Table table;
+    table.add_column("id", ibex::Column<std::int64_t>{10, 20});
+    table.add_column("px", ibex::Column<double>{1.5, 2.5});
+    table.add_column("name", ibex::Column<std::string>{"a", ""},
+                     ibex::runtime::ValidityBitmap{true, false});
+    table.add_column("flag", ibex::Column<bool>{true, false});
+    table.add_column("day", ibex::Column<ibex::Date>{{ibex::Date{1}, ibex::Date{2}}});
+    table.add_column("ts", ibex::Column<ibex::Timestamp>{{ibex::Timestamp{1}, ibex::Timestamp{2}}});
+    ibex::Column<ibex::Categorical> symbols;
+    symbols.push_back("AAPL");
+    symbols.push_back("MSFT");
+    table.add_column("symbol", std::move(symbols));
+    const ibex::DecimalType amount_type{.precision = 12, .scale = 3};
+    auto amounts = ibex::runtime::make_decimal_column(amount_type);
+    amounts.push_back(ibex::Decimal{1234});
+    amounts.push_back(ibex::Decimal{-5});
+    table.add_column("amount", std::move(amounts));
+
+    ArrowArray array{};
+    ArrowSchema schema{};
+    REQUIRE(ibex::interop::export_table_to_arrow(table, &array, &schema).has_value());
+
+    auto empty = ibex::interop::empty_table_from_arrow_schema(schema);
+    INFO((empty.has_value() ? std::string{} : empty.error()));
+    REQUIRE(empty.has_value());
+    CHECK(empty->rows() == 0);
+    REQUIRE(empty->columns.size() == table.columns.size());
+    for (std::size_t i = 0; i < table.columns.size(); ++i) {
+        INFO(table.columns[i].name);
+        CHECK(empty->columns[i].name == table.columns[i].name);
+        CHECK(empty->columns[i].column->index() == table.columns[i].column->index());
+    }
+    const auto* imported_amounts = std::get_if<ibex::Column<ibex::Decimal>>(empty->find("amount"));
+    REQUIRE(imported_amounts != nullptr);
+    const auto imported_type = ibex::runtime::decimal_type_of(*imported_amounts);
+    CHECK(imported_type.precision == 12);
+    CHECK(imported_type.scale == 3);
+
+    schema.release(&schema);
+    array.release(&array);
+}
+
+TEST_CASE("Arrow C Data schema-only import refuses what a batch import refuses",
+          "[interop][arrow][empty]") {
+    const auto release_schema = [](ArrowSchema* self) { self->release = nullptr; };
+    ArrowSchema blob{};
+    blob.format = "z";  // binary: not an Ibex column type
+    blob.name = "blob";
+    blob.release = release_schema;
+    std::array<ArrowSchema*, 1> children{&blob};
+    ArrowSchema root{};
+    root.format = "+s";
+    root.name = "";
+    root.n_children = 1;
+    root.children = children.data();
+    root.release = release_schema;
+
+    auto empty = ibex::interop::empty_table_from_arrow_schema(root);
+    REQUIRE_FALSE(empty.has_value());
+    CHECK(empty.error().find("unsupported") != std::string::npos);
+}
+
+TEST_CASE("Arrow C Data schema-only import of a column-less struct is empty",
+          "[interop][arrow][empty]") {
+    const auto release_schema = [](ArrowSchema* self) { self->release = nullptr; };
+    ArrowSchema root{};
+    root.format = "+s";
+    root.name = "";
+    root.release = release_schema;
+
+    auto empty = ibex::interop::empty_table_from_arrow_schema(root);
+    REQUIRE(empty.has_value());
+    CHECK(empty->columns.empty());
 }

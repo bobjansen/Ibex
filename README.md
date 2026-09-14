@@ -980,10 +980,14 @@ import "adbc";
 let df = read_adbc("adbc_driver_sqlite", "", "select 1 as x");
 ```
 
-The 4th optional argument is a `;` or newline-separated `key=value` string.
-Prefix keys with `db.`, `conn.`, or `stmt.` to target database, connection, or
-statement options, and use `entrypoint=...` to override the driver entrypoint
-symbol.
+The 4th optional argument (default `""`) is a `;` or newline-separated
+`key=value` string. Prefix keys with `db.`, `conn.`, or `stmt.` to target
+database, connection, or statement options; the rest of the key is passed to
+the driver unchanged, so use full ADBC names such as
+`conn.adbc.connection.autocommit=true`. `conn.post.` sets a connection option
+after the connection is opened (e.g. `conn.post.adbc.sqlite.load_extension.enabled=true`).
+A backslash escapes `;`, `=` and `\`. Use `entrypoint=...` to override the
+driver entrypoint symbol.
 
 `kafka.so` is optional and built with `-DIBEX_BUILD_KAFKA=ON` when
 `librdkafka` development files are available. It exposes live Kafka streaming

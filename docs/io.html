@@ -516,16 +516,27 @@ measurements[<span class="kw">select</span> {
     <article class="card" style="margin-top:1rem;">
       <h3>Optional ADBC options string</h3>
       <p>
-        The 4th argument is an optional <code>key=value</code> string separated
-        by semicolons or newlines. Prefix keys with <code>db.</code>,
-        <code>conn.</code>, or <code>stmt.</code> to target database,
-        connection, or statement options.
+        The 4th argument is optional (it defaults to <code>""</code>): a
+        <code>key=value</code> string separated by semicolons or newlines.
+        Prefix keys with <code>db.</code>, <code>conn.</code>, or
+        <code>stmt.</code> to target database, connection, or statement
+        options. The rest of the key reaches the driver unchanged, so use the
+        full ADBC name: <code>conn.adbc.connection.autocommit</code>, not
+        <code>conn.autocommit</code>.
       </p>
-<pre><code><span class="kw">let</span> remote = <span class="fn-name">read_adbc</span>(
-    <span class="str">"adbc_driver_postgresql"</span>,
-    <span class="str">"postgresql://user:pass@host/db"</span>,
-    <span class="str">"select * from trades where qty &gt; 0"</span>,
-    <span class="str">"conn.autocommit=true;stmt.query_timeout_ms=5000"</span>
+      <p>
+        <code>conn.post.</code> sets a connection option after the connection
+        is opened, for options a driver only accepts on an open connection
+        (SQLite extension loading, for example). A backslash escapes
+        <code>;</code>, <code>=</code> and <code>\</code> inside keys and
+        values. Option names beyond the standard <code>adbc.*</code> keys are
+        driver-specific; check the driver's documentation.
+      </p>
+<pre><code><span class="kw">let</span> trades = <span class="fn-name">read_adbc</span>(
+    <span class="str">"/path/to/libadbc_driver_sqlite.so"</span>,
+    <span class="str">"/tmp/trades.sqlite"</span>,
+    <span class="str">"select symbol, qty, px from trades"</span>,
+    <span class="str">"stmt.adbc.sqlite.query.batch_rows=10000;conn.post.adbc.sqlite.load_extension.enabled=true"</span>
 );</code></pre>
     </article>
   </section>

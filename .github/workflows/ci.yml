@@ -160,7 +160,7 @@ jobs:
             -DADBC_DRIVER_SQLITE_LIBRARY="$CONDA_PREFIX/lib/libadbc_driver_sqlite.so"
 
       - name: Build
-        run: cmake --build build --parallel --target ibex_adbc_plugin ibex_adbc_tests
+        run: cmake --build build --parallel --target ibex_adbc_plugin ibex_adbc_tests ibex_repl_bin ibex_args_plugin ibex_csv_plugin
 
       - name: Test
         run: ctest --test-dir build --output-on-failure --no-tests=error -R '^adbc:'

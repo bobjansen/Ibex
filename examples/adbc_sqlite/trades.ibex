@@ -1,0 +1,43 @@
+// SQLite → Ibex walkthrough over ADBC. Run everything with:
+//   examples/adbc_sqlite/run.sh
+// or by hand:
+//   ibex examples/adbc_sqlite/trades.ibex -- --db trades.sqlite --out summary.csv
+import "adbc";
+import "args";
+import "csv";
+
+let args = parse_args("
+    driver (d) : string?
+    db         : string
+    out        : string
+");
+let driver = coalesce(scalar(args[filter name == "driver", select { value }]), "adbc_driver_sqlite");
+let db = scalar(args[filter name == "db", select { value }]);
+let out = scalar(args[filter name == "out", select { value }]);
+
+// 1. Read the whole table. batch_rows=4 makes the driver hand Ibex the 11
+//    rows as three Arrow batches (4 + 4 + 3); the result is one table.
+let trades = read_adbc(driver, db,
+    "select id, ts, symbol, side, qty, price from trades order by id",
+    "stmt.adbc.sqlite.query.batch_rows=4");
+trades;
+
+// 2. SQL NULLs arrive as Ibex nulls. count() counts rows, count(col) counts
+//    non-null values: trade 4 has no price, trade 7 has no quantity.
+trades[select { rows = count(), priced = count(price), sized = count(qty) }, by symbol, order symbol];
+
+// 3. Keep complete trades (a comparison with null is not true), compute the
+//    notional per trade, and aggregate per symbol — all in Ibex.
+let summary = trades[filter qty > 0 && price > 0]
+    [update { notional = qty * price }]
+    [select { trades = count(), shares = sum(qty), notional = sum(notional) }, by symbol, order symbol]
+    [update { vwap = notional / shares }];
+summary;
+
+// 4. Export the result.
+write_csv(summary, out);
+
+// 5. A query with no matching rows still has its columns and types, so the
+//    rest of the pipeline type-checks and returns an empty table.
+read_adbc(driver, db, "select symbol, qty, price from trades where symbol = 'TSLA'")
+    [update { notional = qty * price }];

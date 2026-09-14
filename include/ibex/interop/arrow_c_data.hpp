@@ -108,4 +108,13 @@ auto release_arrow_stream(ArrowArrayStream* stream) noexcept -> void;
 [[nodiscard]] auto adopt_table_from_arrow(ArrowArray* array, const ArrowSchema& schema)
     -> std::expected<runtime::Table, std::string>;
 
+/// Build a zero-row Ibex table from an Arrow struct schema alone.
+///
+/// For producers that report a schema but deliver no batches (an ARROW stream
+/// that ends immediately, e.g. an empty SQL result). The columns get exactly
+/// the types a non-empty import of the same schema would, and schemas the
+/// importer cannot represent are refused with the same error.
+[[nodiscard]] auto empty_table_from_arrow_schema(const ArrowSchema& schema)
+    -> std::expected<runtime::Table, std::string>;
+
 }  // namespace ibex::interop

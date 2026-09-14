@@ -10,7 +10,6 @@
 //   import "adbc";
 //   let df = read_adbc("adbc_driver_sqlite", "", "select 1 as x");
 
-#include <ibex/core/text.hpp>
 #include <ibex/interop/arrow_c_data.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/operator.hpp>
@@ -26,14 +25,12 @@
 #include <utility>
 #include <vector>
 
+#include "adbc_options.hpp"
+
 namespace {
 
-struct ParsedAdbcOptions {
-    std::string entrypoint;
-    std::vector<std::pair<std::string, std::string>> database;
-    std::vector<std::pair<std::string, std::string>> connection;
-    std::vector<std::pair<std::string, std::string>> statement;
-};
+using ibex::adbc::OptionList;
+using ibex::adbc::ParsedOptions;
 
 auto release_adbc_error(AdbcError* error) noexcept -> void {
     if (error != nullptr && error->release != nullptr) {
@@ -71,11 +68,11 @@ auto call_adbc(std::string_view context, Fn&& fn) -> std::expected<void, std::st
 }
 
 template <typename Handle, typename Setter>
-auto apply_adbc_options(std::string_view context, Handle* handle,
-                        const std::vector<std::pair<std::string, std::string>>& options,
+auto apply_adbc_options(std::string_view context, Handle* handle, const OptionList& options,
                         Setter&& setter) -> std::expected<void, std::string> {
     for (const auto& [key, value] : options) {
-        auto status = call_adbc(context, [&](AdbcError* error) {
+        const std::string where = std::string(context) + "(" + key + ")";
+        auto status = call_adbc(where, [&](AdbcError* error) {
             return setter(handle, key.c_str(), value.c_str(), error);
         });
         if (!status) {
@@ -85,53 +82,15 @@ auto apply_adbc_options(std::string_view context, Handle* handle,
     return {};
 }
 
-auto parse_adbc_options(std::string_view spec) -> std::expected<ParsedAdbcOptions, std::string> {
-    ParsedAdbcOptions parsed;
-    std::size_t pos = 0;
-    while (pos <= spec.size()) {
-        const std::size_t next = spec.find_first_of(";\n", pos);
-        std::string_view item =
-            next == std::string_view::npos ? spec.substr(pos) : spec.substr(pos, next - pos);
-        item = ibex::trim(item);
-        if (!item.empty()) {
-            const std::size_t eq = item.find('=');
-            if (eq == std::string_view::npos || eq == 0 || eq + 1 >= item.size()) {
-                return std::unexpected(
-                    "read_adbc options must be key=value entries separated by ';' or newlines");
-            }
-            const std::string_view raw_key = ibex::trim(item.substr(0, eq));
-            const std::string_view raw_value = ibex::trim(item.substr(eq + 1));
-            const std::string key(raw_key);
-            const std::string value(raw_value);
-            if (key == "entrypoint") {
-                parsed.entrypoint = value;
-            } else if (key.rfind("db.", 0) == 0) {
-                parsed.database.emplace_back(key.substr(3), value);
-            } else if (key.rfind("conn.", 0) == 0) {
-                parsed.connection.emplace_back(key.substr(5), value);
-            } else if (key.rfind("stmt.", 0) == 0) {
-                parsed.statement.emplace_back(key.substr(5), value);
-            } else {
-                parsed.database.emplace_back(key, value);
-            }
-        }
-        if (next == std::string_view::npos) {
-            break;
-        }
-        pos = next + 1;
-    }
-    return parsed;
-}
-
 class AdbcSourceOperator final : public ibex::runtime::Operator {
    public:
-    static auto create(std::string driver, std::string uri, std::string sql,
-                       ParsedAdbcOptions options)
+    static auto create(std::string driver, std::string uri, std::string sql, ParsedOptions options)
         -> std::expected<ibex::runtime::OperatorPtr, std::string> {
         auto op = std::unique_ptr<AdbcSourceOperator>(new AdbcSourceOperator());
         auto init = op->init(std::move(driver), std::move(uri), std::move(sql), std::move(options));
         if (!init) {
-            return std::unexpected(std::move(init.error()));
+            // `op` is destroyed here, releasing whatever handles init acquired.
+            return std::unexpected("read_adbc: " + init.error());
         }
         return ibex::runtime::OperatorPtr(std::move(op));
     }
@@ -142,6 +101,7 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
     AdbcSourceOperator& operator=(AdbcSourceOperator&&) noexcept = delete;
 
     ~AdbcSourceOperator() override {
+        // Children before parents: stream, statement, connection, database.
         ibex::interop::release_arrow_stream(&stream_);
         ibex::interop::release_arrow_schema(&schema_);
         if (statement_acquired_) {
@@ -185,7 +145,17 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
             }
             if (batch.release == nullptr) {
                 finished_ = true;
-                return std::optional<ibex::runtime::Chunk>{};
+                if (emitted_chunk_) {
+                    return std::optional<ibex::runtime::Chunk>{};
+                }
+                // No rows at all. Emit one empty chunk so the result keeps the
+                // query's columns instead of collapsing to a column-less table.
+                auto empty = ibex::interop::empty_table_from_arrow_schema(schema_);
+                if (!empty) {
+                    return std::unexpected("read_adbc: result schema import failed: " +
+                                           empty.error());
+                }
+                return make_chunk(std::move(*empty));
             }
 
             auto batch_guard = std::unique_ptr<::ArrowArray, void (*)(::ArrowArray*)>(
@@ -194,16 +164,12 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
             auto imported = ibex::interop::adopt_table_from_arrow(&batch, schema_);
             if (!imported) {
                 finished_ = true;
-                return std::unexpected("ADBC stream batch import failed: " + imported.error());
+                return std::unexpected("read_adbc: batch import failed: " + imported.error());
             }
             if (imported->rows() == 0) {
                 continue;
             }
-
-            ibex::runtime::Chunk chunk;
-            chunk.columns = std::move(imported->columns);
-            chunk.set_properties(imported->properties());
-            return std::optional<ibex::runtime::Chunk>{std::move(chunk)};
+            return make_chunk(std::move(*imported));
         }
     }
 
@@ -216,7 +182,16 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
         std::memset(&schema_, 0, sizeof(schema_));
     }
 
-    auto init(std::string driver, std::string uri, std::string sql, ParsedAdbcOptions options)
+    auto make_chunk(ibex::runtime::Table table)
+        -> std::expected<std::optional<ibex::runtime::Chunk>, std::string> {
+        emitted_chunk_ = true;
+        ibex::runtime::Chunk chunk;
+        chunk.columns = std::move(table.columns);
+        chunk.set_properties(table.properties());
+        return std::optional<ibex::runtime::Chunk>{std::move(chunk)};
+    }
+
+    auto init(std::string driver, std::string uri, std::string sql, ParsedOptions options)
         -> std::expected<void, std::string> {
         auto status = call_adbc("AdbcDatabaseNew", [&](AdbcError* error) {
             return AdbcDatabaseNew(&database_, error);
@@ -224,6 +199,9 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
         if (!status) {
             return status;
         }
+        // From here on the database must be released on every exit path,
+        // including a rejected option below.
+        database_acquired_ = true;
 
         status = call_adbc("AdbcDatabaseSetOption(driver)", [&](AdbcError* error) {
             return AdbcDatabaseSetOption(&database_, "driver", driver.c_str(), error);
@@ -260,8 +238,6 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
             return status;
         }
 
-        database_acquired_ = true;
-
         status = call_adbc("AdbcDatabaseInit",
                            [&](AdbcError* error) { return AdbcDatabaseInit(&database_, error); });
         if (!status) {
@@ -276,11 +252,12 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
         }
         connection_acquired_ = true;
 
-        status = apply_adbc_options(
-            "AdbcConnectionSetOption", &connection_, options.connection,
-            [](AdbcConnection* connection, const char* key, const char* value, AdbcError* error) {
-                return AdbcConnectionSetOption(connection, key, value, error);
-            });
+        const auto set_connection_option = [](AdbcConnection* connection, const char* key,
+                                              const char* value, AdbcError* error) {
+            return AdbcConnectionSetOption(connection, key, value, error);
+        };
+        status = apply_adbc_options("AdbcConnectionSetOption", &connection_, options.connection,
+                                    set_connection_option);
         if (!status) {
             return status;
         }
@@ -288,6 +265,12 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
         status = call_adbc("AdbcConnectionInit", [&](AdbcError* error) {
             return AdbcConnectionInit(&connection_, &database_, error);
         });
+        if (!status) {
+            return status;
+        }
+
+        status = apply_adbc_options("AdbcConnectionSetOption", &connection_,
+                                    options.connection_post, set_connection_option);
         if (!status) {
             return status;
         }
@@ -327,7 +310,8 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
     }
 
     [[nodiscard]] auto stream_error(std::string_view context, int status) -> std::string {
-        std::string message(context);
+        std::string message = "read_adbc: ";
+        message += context;
         message += " failed";
         if (stream_.get_last_error != nullptr) {
             if (const char* error = stream_.get_last_error(&stream_);
@@ -352,6 +336,7 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
     bool connection_acquired_ = false;
     bool statement_acquired_ = false;
     bool schema_loaded_ = false;
+    bool emitted_chunk_ = false;
     bool finished_ = false;
 };
 
@@ -367,14 +352,14 @@ auto make_adbc_source(const ibex::runtime::ExternArgs& args)
         return std::unexpected("read_adbc(driver, uri, sql[, options]) expects string arguments");
     }
 
-    ParsedAdbcOptions options;
+    ParsedOptions options;
     if (args.size() == 4) {
         const auto* option_spec = std::get_if<std::string>(&args[3]);
         if (option_spec == nullptr) {
             return std::unexpected(
                 "read_adbc(driver, uri, sql, options) expects a string options spec");
         }
-        auto parsed = parse_adbc_options(*option_spec);
+        auto parsed = ibex::adbc::parse_options(*option_spec);
         if (!parsed) {
             return std::unexpected(parsed.error());
         }

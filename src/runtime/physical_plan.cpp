@@ -4,7 +4,9 @@
 #include "physical_plan.hpp"
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/format.hpp>
+#include <ibex/ir/join_output.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/schema.hpp>
 #include <ibex/runtime/extern_registry.hpp>
@@ -18,7 +20,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <expected>
+#include <iterator>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -28,6 +33,7 @@
 
 #include "interpreter_internal.hpp"
 #include "join_internal.hpp"
+#include "runtime_internal.hpp"
 
 namespace ibex::runtime::physical {
 
@@ -1143,10 +1149,10 @@ void append_phase_lines(std::string& out, const std::vector<BreakerPhase>& phase
                 out += "child";
                 break;
             case RowEstimate::Source::None:
-                out += "?";
+                out += '?';
                 break;
         }
-        out += ")";
+        out += ')';
     }
 }
 }  // namespace

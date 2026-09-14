@@ -15,6 +15,7 @@
 #include <optional>
 #include <ostream>
 #include <stdexcept>
+#include <stdlib.h>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -700,13 +701,14 @@ void stream_append_row(runtime::Table& dst, const runtime::Table& src, std::size
             dst_col);
 
         const bool null = runtime::is_null(src.columns[ci], row);
+        auto& validity = dst.columns[ci].validity;
         if (null) {
-            if (!dst.columns[ci].validity.has_value()) {
-                dst.columns[ci].validity = runtime::ValidityBitmap(prev_size, true);
+            if (!validity.has_value()) {
+                validity = runtime::ValidityBitmap(prev_size, true);
             }
-            dst.columns[ci].validity->push_back(false);
-        } else if (dst.columns[ci].validity.has_value()) {
-            dst.columns[ci].validity->push_back(true);
+            validity.value().push_back(false);
+        } else if (validity.has_value()) {
+            validity.value().push_back(true);
         }
     }
 }

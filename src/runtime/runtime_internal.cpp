@@ -4,6 +4,7 @@
 #include "runtime_internal.hpp"
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -168,6 +169,8 @@ auto scalar_from_column(const ColumnValue& column, std::size_t row) -> ScalarVal
             if constexpr (std::is_same_v<ColType, Column<Categorical>> ||
                           std::is_same_v<ColType, Column<std::string>>) {
                 return std::string(col[row]);
+            } else if constexpr (std::is_same_v<ColType, Column<Decimal>>) {
+                return DecimalValue{.units = col[row].units, .type = decimal_type_of(col)};
             } else {
                 return col[row];
             }
@@ -176,6 +179,9 @@ auto scalar_from_column(const ColumnValue& column, std::size_t row) -> ScalarVal
 }
 
 auto column_kind(const ColumnValue& column) -> ExprType {
+    if (std::holds_alternative<Column<Decimal>>(column)) {
+        return ExprType::Decimal;
+    }
     if (std::holds_alternative<Column<std::int64_t>>(column)) {
         return ExprType::Int;
     }

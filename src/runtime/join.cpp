@@ -28,6 +28,7 @@
 #include <variant>
 #include <vector>
 
+#include "decimal_ops.hpp"
 #include "interpreter_internal.hpp"
 #include "join_internal.hpp"
 #include "runtime_internal.hpp"
@@ -127,6 +128,13 @@ auto key_rows_equal(const std::vector<KeyCol>& a, std::size_t ra, const std::vec
             continue;  // both null in this component: equal, and no value to read
         }
         switch (ca.kind) {
+            case KeyCol::Kind::Dec:
+                // Units compare as values only at one scale; key setup aligns
+                // two Decimal key columns to a common scale before this runs.
+                if (ca.dec[ra].units != cb.dec[rb].units) {
+                    return false;
+                }
+                break;
             case KeyCol::Kind::Int64:
                 if (ca.i64[ra] != cb.i64[rb]) {
                     return false;
@@ -359,6 +367,8 @@ auto format_expr_type(ExprType kind) -> std::string {
             return "String";
         case ExprType::Categorical:
             return "Categorical";
+        case ExprType::Decimal:
+            return "Decimal";
     }
     return "?";
 }
@@ -600,6 +610,10 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             return std::unexpected("join key type mismatch: left '" + key.left + "' is " +
                                    format_expr_type(column_kind(*left_col)) + " but right '" +
                                    key.right + "' is " + format_expr_type(column_kind(*right_col)));
+        }
+        if (auto mismatch =
+                decimal_key_scale_mismatch(*left_col, *right_col, key.left, key.right)) {
+            return std::unexpected(*mismatch);
         }
         left_keys.push_back(left_col);
         right_keys.push_back(right_col);

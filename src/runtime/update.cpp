@@ -7,6 +7,7 @@
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
@@ -75,10 +76,19 @@ struct FastOperand {
 
 auto resolve_fast_operand(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars)
     -> std::optional<FastOperand> {
+    // Every fast path below reads operands as int64 or double, which would
+    // round an exact decimal (or, for a column, reach an invariant). Declining
+    // hands a Decimal operand to the per-row evaluator, which is exact.
+    const auto is_decimal = [](const ScalarValue& v) {
+        return std::holds_alternative<DecimalValue>(v);
+    };
     if (const auto* col = std::get_if<ir::ColumnRef>(&expr.node)) {
         // `^name` skips column scope and resolves in the scalar registry below.
         if (const auto* source = col->lexical ? nullptr : input.find(col->name);
             source != nullptr) {
+            if (std::holds_alternative<Column<Decimal>>(*source)) {
+                return std::nullopt;
+            }
             return FastOperand{
                 .is_column = true,
                 .column = source,
@@ -88,6 +98,9 @@ auto resolve_fast_operand(const ir::Expr& expr, const Table& input, const Scalar
         }
         if (scalars != nullptr) {
             if (auto it = scalars->find(col->name); it != scalars->end()) {
+                if (is_decimal(it->second)) {
+                    return std::nullopt;
+                }
                 return FastOperand{
                     .is_column = false,
                     .column = nullptr,
@@ -100,6 +113,9 @@ auto resolve_fast_operand(const ir::Expr& expr, const Table& input, const Scalar
     }
     if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
         const ScalarValue value = scalar_from_literal(*lit);
+        if (is_decimal(value)) {
+            return std::nullopt;
+        }
         return FastOperand{
             .is_column = false,
             .column = nullptr,

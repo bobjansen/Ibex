@@ -585,6 +585,62 @@ inline void append_timestamp_column(const std::shared_ptr<arrow::ChunkedArray>& 
 /// from an already-read Arrow table. Shared by the whole-file `read_parquet()`
 /// path and the row-group/batch streaming `ChunkedParquetSourceOperator` so a
 /// single, tested conversion path handles both.
+/// The Decimal(p, s) an Arrow decimal type maps to. Arrow allows what Ibex does
+/// not store -- 256-bit, more than 38 digits, a negative scale -- and each is
+/// refused by name rather than read approximately.
+inline auto decimal_type_from_arrow(const arrow::DataType& type, const std::string& name)
+    -> ibex::DecimalType {
+    const auto& dec = static_cast<const arrow::DecimalType&>(type);
+    if (type.id() == arrow::Type::DECIMAL256) {
+        throw std::runtime_error(
+            "read_parquet: column '" + name + "' is Decimal256(" + std::to_string(dec.precision()) +
+            ", " + std::to_string(dec.scale()) + "); Ibex decimals hold at most 38 digits");
+    }
+    if (dec.precision() < 1 || dec.precision() > ibex::decimal::kMaxPrecision || dec.scale() < 0 ||
+        dec.scale() > dec.precision()) {
+        throw std::runtime_error("read_parquet: column '" + name + "' has unsupported decimal(" +
+                                 std::to_string(dec.precision()) + ", " +
+                                 std::to_string(dec.scale()) +
+                                 "): precision must be 1..38 and scale 0..precision");
+    }
+    return ibex::DecimalType{.precision = static_cast<std::uint8_t>(dec.precision()),
+                             .scale = static_cast<std::uint8_t>(dec.scale())};
+}
+
+/// Copy an Arrow decimal32/64/128 column into a `Column<Decimal>`. Arrow keeps
+/// every width little-endian two's complement, so each value is a widening
+/// load; a null slot is zeroed, like every other column type here.
+inline auto decimal_column_from_arrow(const arrow::ChunkedArray& col, ibex::DecimalType type)
+    -> ibex::Column<ibex::Decimal> {
+    ibex::Column<ibex::Decimal> out = ibex::runtime::make_decimal_column(type);
+    out.resize(static_cast<std::size_t>(col.length()));
+    ibex::Decimal* dst = out.data();
+    std::size_t row = 0;
+    for (const auto& chunk : col.chunks()) {
+        const auto& fixed = static_cast<const arrow::FixedSizeBinaryArray&>(*chunk);
+        const int width = fixed.byte_width();
+        for (int64_t i = 0; i < chunk->length(); ++i, ++row) {
+            if (chunk->IsNull(i)) {
+                dst[row] = ibex::Decimal{};
+                continue;
+            }
+            const std::uint8_t* src = fixed.GetValue(i);
+            if (width == 16) {
+                std::memcpy(&dst[row].units, src, sizeof(ibex::Int128));
+            } else if (width == 8) {
+                std::int64_t v = 0;
+                std::memcpy(&v, src, sizeof(v));
+                dst[row].units = ibex::Int128{v};
+            } else {
+                std::int32_t v = 0;
+                std::memcpy(&v, src, sizeof(v));
+                dst[row].units = ibex::Int128{v};
+            }
+        }
+    }
+    return out;
+}
+
 template <typename Sink>
 inline void populate_from_arrow_table(const std::shared_ptr<arrow::Table>& table, Sink& sink) {
     for (int i = 0; i < table->num_columns(); ++i) {
@@ -666,6 +722,14 @@ inline void populate_from_arrow_table(const std::shared_ptr<arrow::Table>& table
                 emit(ibex::Column<ibex::Timestamp>{std::move(values)});
                 break;
             }
+            case arrow::Type::DECIMAL32:
+            case arrow::Type::DECIMAL64:
+            case arrow::Type::DECIMAL128:
+            case arrow::Type::DECIMAL256: {
+                const auto type = decimal_type_from_arrow(*col->type(), field->name());
+                emit(decimal_column_from_arrow(*col, type));
+                break;
+            }
             default:
                 throw std::runtime_error("read_parquet: unsupported column type for " +
                                          field->name());
@@ -711,6 +775,14 @@ inline auto schema_table_from_arrow(const arrow::Schema& schema) -> ibex::runtim
                 break;
             case arrow::Type::TIMESTAMP:
                 out.add_column(field->name(), ibex::Column<ibex::Timestamp>{});
+                break;
+            case arrow::Type::DECIMAL32:
+            case arrow::Type::DECIMAL64:
+            case arrow::Type::DECIMAL128:
+            case arrow::Type::DECIMAL256:
+                out.add_column(field->name(),
+                               ibex::runtime::make_decimal_column(
+                                   decimal_type_from_arrow(*field->type(), field->name())));
                 break;
             default:
                 throw std::runtime_error("read_parquet: unsupported column type for " +
@@ -1928,6 +2000,81 @@ inline auto direct_column(parquet::arrow::FileReader& reader, const arrow::Field
                 emitted = decode_numeric_column<parquet::Int64Type, ibex::Timestamp, false>(
                     reader, leaf_index, selection, groups, out, validity,
                     [scale](std::int64_t value) { return ibex::Timestamp{value * scale}; });
+            }
+            verify(emitted);
+            entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(out));
+            break;
+        }
+        case arrow::Type::DECIMAL32:
+        case arrow::Type::DECIMAL64:
+        case arrow::Type::DECIMAL128:
+        case arrow::Type::DECIMAL256: {
+            // Parquet stores a decimal as INT32 / INT64 (unscaled, little
+            // endian) or as big-endian two's complement bytes (fixed or
+            // variable length). Every encoding is exact; each is widened to
+            // the 128-bit unit count here.
+            auto out = ibex::runtime::make_decimal_column(
+                decimal_type_from_arrow(*field.type(), field.name()));
+            out.reserve(output_rows);
+            const auto* descr = reader.parquet_reader()->metadata()->schema()->Column(leaf_index);
+            const auto big_endian = [&](const std::uint8_t* bytes, std::size_t len) {
+                // Sign-extend from the first byte, then shift the rest in. More
+                // than 16 bytes is legal only as sign padding.
+                ibex::Int128 value = (len > 0 && (bytes[0] & 0x80U) != 0) ? -1 : 0;
+                for (std::size_t i = 0; i < len; ++i) {
+                    if (len - i > 16) {
+                        const std::uint8_t pad = (value < 0) ? 0xFF : 0x00;
+                        if (bytes[i] != pad) {
+                            throw std::runtime_error("read_parquet: decimal in '" + field.name() +
+                                                     "' exceeds 128 bits");
+                        }
+                        continue;
+                    }
+                    value = (value * 256) + bytes[i];
+                }
+                return value;
+            };
+            const auto push = [&](bool present, ibex::Int128 units) {
+                validity.append(present);
+                out.push_back(ibex::Decimal{present ? units : ibex::Int128{0}});
+            };
+            std::size_t emitted = 0;
+            switch (descr->physical_type()) {
+                case parquet::Type::INT32:
+                    emitted = decode_physical_column<parquet::Int32Type>(
+                        reader, leaf_index, selection, groups, [&](const std::int32_t* value) {
+                            push(value != nullptr, value == nullptr ? 0 : ibex::Int128{*value});
+                        });
+                    break;
+                case parquet::Type::INT64:
+                    emitted = decode_physical_column<parquet::Int64Type>(
+                        reader, leaf_index, selection, groups, [&](const std::int64_t* value) {
+                            push(value != nullptr, value == nullptr ? 0 : ibex::Int128{*value});
+                        });
+                    break;
+                case parquet::Type::FIXED_LEN_BYTE_ARRAY: {
+                    const auto width = static_cast<std::size_t>(descr->type_length());
+                    emitted = decode_physical_column<parquet::FLBAType>(
+                        reader, leaf_index, selection, groups,
+                        [&](const parquet::FixedLenByteArray* value) {
+                            push(value != nullptr,
+                                 value == nullptr ? 0 : big_endian(value->ptr, width));
+                        });
+                    break;
+                }
+                case parquet::Type::BYTE_ARRAY:
+                    emitted = decode_physical_column<parquet::ByteArrayType>(
+                        reader, leaf_index, selection, groups,
+                        [&](const parquet::ByteArray* value) {
+                            push(value != nullptr,
+                                 value == nullptr ? 0 : big_endian(value->ptr, value->len));
+                        });
+                    break;
+                default:
+                    throw std::runtime_error(
+                        "read_parquet: unsupported physical type for decimal "
+                        "column " +
+                        field.name());
             }
             verify(emitted);
             entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(out));
@@ -3722,6 +3869,31 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                 if (!st.ok())
                     throw std::runtime_error("write_parquet: finish bool failed");
                 return single_chunk(std::move(arr));
+            } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Decimal>>) {
+                // decimal128 with the column's own precision and scale; the
+                // units are written as-is, so the values round-trip exactly.
+                const ibex::DecimalType t = ibex::runtime::decimal_type_of(col);
+                arrow::Decimal128Builder builder(arrow::decimal128(t.precision, t.scale),
+                                                 arrow::default_memory_pool());
+                auto st = builder.Reserve(static_cast<int64_t>(n));
+                if (!st.ok())
+                    throw std::runtime_error("write_parquet: reserve failed");
+                for (std::size_t i = 0; i < n; ++i) {
+                    if (ibex::runtime::is_null(entry, i)) {
+                        st = builder.AppendNull();
+                    } else {
+                        const ibex::Int128 units = col[i].units;
+                        st = builder.Append(arrow::Decimal128(static_cast<int64_t>(units >> 64),
+                                                              static_cast<uint64_t>(units)));
+                    }
+                    if (!st.ok())
+                        throw std::runtime_error("write_parquet: append decimal failed");
+                }
+                std::shared_ptr<arrow::Array> arr;
+                st = builder.Finish(&arr);
+                if (!st.ok())
+                    throw std::runtime_error("write_parquet: finish decimal failed");
+                return single_chunk(std::move(arr));
             } else {
                 static_assert(std::is_same_v<ColT, void>, "unhandled column type in write_parquet");
             }
@@ -3745,6 +3917,9 @@ inline auto column_to_arrow_field(const ibex::runtime::ColumnEntry& entry)
                 return arrow::field(entry.name, arrow::timestamp(arrow::TimeUnit::NANO));
             } else if constexpr (std::is_same_v<ColT, ibex::Column<bool>>) {
                 return arrow::field(entry.name, arrow::boolean());
+            } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Decimal>>) {
+                const ibex::DecimalType t = ibex::runtime::decimal_type_of(col);
+                return arrow::field(entry.name, arrow::decimal128(t.precision, t.scale));
             } else {
                 // string, categorical → UTF-8
                 return arrow::field(entry.name, arrow::utf8());
@@ -3765,6 +3940,7 @@ inline auto column_to_arrow_field(const ibex::runtime::ColumnEntry& entry)
 ///   Date        → Parquet DATE32
 ///   Timestamp   → Parquet TIMESTAMP (nanoseconds, UTC)
 ///   Bool        → Parquet BOOLEAN
+///   Decimal     → Parquet DECIMAL (Arrow decimal128, precision and scale kept)
 ///
 /// Returns the number of rows written.
 inline auto write_parquet(const ibex::runtime::Table& table, std::string_view path)

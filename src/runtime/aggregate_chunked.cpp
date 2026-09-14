@@ -6,6 +6,7 @@
 // not split hot templates or state across compilation boundaries.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/format.hpp>
 #include <ibex/ir/node.hpp>
@@ -50,6 +51,7 @@
 #endif
 
 #include "aggregate_chunked_internal.hpp"
+#include "chunk_conversion_internal.hpp"
 #include "execution_profile_internal.hpp"
 #include "interpreter_internal.hpp"
 #include "packed_key_encoder_internal.hpp"
@@ -5445,16 +5447,6 @@ class HashAggregatePhaseOperator final : public Operator {
     bool emitted_ = false;
 };
 
-auto make_hash_aggregate_operator(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
-                                  const std::vector<ir::AggSpec>* aggregations,
-                                  const ExecutionContext& exec, physical::AggregateParallelism par,
-                                  std::optional<physical::AggregateColumnMapping> columns)
-    -> OperatorPtr {
-    auto state = std::make_unique<HashAggregateState>(std::move(child), group_by, aggregations,
-                                                      exec, par, std::move(columns));
-    return std::make_unique<HashAggregatePhaseOperator>(std::move(state));
-}
-
 /// Replays one buffered chunk ahead of the rest of a child stream. Used by
 /// ChunkedSortedAggregateOperator to hand the already-pulled first chunk back
 /// to a fallback operator without losing it.
@@ -5476,6 +5468,104 @@ class PrependChunkOperator final : public Operator {
     OperatorPtr rest_;
     bool emitted_first_ = false;
 };
+
+/// A child that has already ended, for handing an empty input to an operator.
+class ExhaustedOperator final : public Operator {
+   public:
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        return std::optional<Chunk>{};
+    }
+};
+
+/// Routes an aggregate with a Decimal input to the materialized path.
+///
+/// The streaming state keeps fixed-width numeric slots; a Decimal sum needs an
+/// int128 accumulator checked against 38 digits on every add. So the first
+/// chunk decides, as for the sorted operator's fallback: a Decimal aggregate
+/// input materializes the stream and runs `aggregate_table`, which takes the
+/// decimal path; anything else streams through the hash state unchanged.
+class DecimalAwareAggregateOperator final : public Operator {
+   public:
+    DecimalAwareAggregateOperator(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
+                                  const std::vector<ir::AggSpec>* aggregations,
+                                  const ExecutionContext& exec, physical::AggregateParallelism par,
+                                  std::optional<physical::AggregateColumnMapping> columns)
+        : child_(std::move(child)),
+          group_by_(group_by),
+          aggregations_(aggregations),
+          exec_(&exec),
+          par_(par),
+          columns_(std::move(columns)) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (delegate_) {
+            return delegate_->next();
+        }
+        if (done_) {
+            return std::optional<Chunk>{};
+        }
+        auto first = child_->next();
+        if (!first.has_value()) {
+            return std::unexpected(std::move(first.error()));
+        }
+        OperatorPtr rest;
+        if (!first->has_value()) {
+            rest = std::make_unique<ExhaustedOperator>();
+        } else if (has_decimal_input(**first)) {
+            auto table = materialize_operator(
+                std::make_unique<PrependChunkOperator>(std::move(**first), std::move(child_)));
+            if (!table.has_value()) {
+                return std::unexpected(std::move(table.error()));
+            }
+            auto result = aggregate_table(*table, *group_by_, *aggregations_, exec_);
+            if (!result.has_value()) {
+                return std::unexpected(std::move(result.error()));
+            }
+            done_ = true;
+            return std::optional<Chunk>{table_to_chunk(std::move(*result))};
+        } else {
+            rest = std::make_unique<PrependChunkOperator>(std::move(**first), std::move(child_));
+        }
+        auto state = std::make_unique<HashAggregateState>(std::move(rest), group_by_, aggregations_,
+                                                          *exec_, par_, std::move(columns_));
+        delegate_ = std::make_unique<HashAggregatePhaseOperator>(std::move(state));
+        return delegate_->next();
+    }
+
+   private:
+    [[nodiscard]] auto has_decimal_input(const Chunk& chunk) const -> bool {
+        for (const auto& agg : *aggregations_) {
+            if (agg.func == ir::AggFunc::Count) {
+                continue;
+            }
+            for (const auto& column : chunk.columns) {
+                if (column.name == agg.column.name &&
+                    std::holds_alternative<Column<Decimal>>(*column.column)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    OperatorPtr child_;
+    const std::vector<ir::ColumnRef>* group_by_;
+    const std::vector<ir::AggSpec>* aggregations_;
+    const ExecutionContext* exec_;
+    physical::AggregateParallelism par_;
+    std::optional<physical::AggregateColumnMapping> columns_;
+    OperatorPtr delegate_;
+    bool done_ = false;
+};
+
+auto make_hash_aggregate_operator(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
+                                  const std::vector<ir::AggSpec>* aggregations,
+                                  const ExecutionContext& exec, physical::AggregateParallelism par,
+                                  std::optional<physical::AggregateColumnMapping> columns)
+    -> OperatorPtr {
+    return std::make_unique<DecimalAwareAggregateOperator>(std::move(child), group_by, aggregations,
+                                                           exec, par, std::move(columns));
+}
 
 /// Streaming aggregate for input already sorted on the group-by keys.
 ///
@@ -5635,6 +5725,12 @@ class ChunkedSortedAggregateOperator final : public Operator {
             // CountDistinct keeps per-group value sets; only the hash operator
             // streams it. The sorted path has no incremental form for it.
             if (agg.func == ir::AggFunc::CountDistinct) {
+                return true;
+            }
+            // Decimal accumulates in int128 with checked overflow; only the
+            // hash operator's materialized decimal path does that.
+            if (input_idx.has_value() &&
+                std::holds_alternative<Column<Decimal>>(*first.columns[*input_idx].column)) {
                 return true;
             }
             if ((agg.func != ir::AggFunc::First && agg.func != ir::AggFunc::Last) ||

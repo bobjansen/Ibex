@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/builder.hpp>
 #include <ibex/ir/column_name_map.hpp>
@@ -48,7 +49,7 @@ namespace {
 [[nodiscard]] auto is_deferred_scalar_let_shape(const Expr& value) -> bool {
     const auto is_cast = [](std::string_view c) {
         return c == "Int64" || c == "Int32" || c == "Int" || c == "Float64" || c == "Float32" ||
-               c == "Date" || c == "Timestamp";
+               c == "Date" || c == "Timestamp" || c == "Decimal";
     };
     const Expr* cur = &value;
     while (true) {
@@ -129,6 +130,8 @@ auto column_type_name(ir::ColumnType type) -> std::string_view {
             return "Timestamp";
         case ir::ColumnType::Categorical:
             return "Categorical";
+        case ir::ColumnType::Decimal:
+            return "Decimal";
     }
     return "?";
 }
@@ -175,6 +178,8 @@ auto to_ir_column_type(ScalarType type) -> ir::ColumnType {
             return ir::ColumnType::Date;
         case ScalarType::Timestamp:
             return ir::ColumnType::Timestamp;
+        case ScalarType::Decimal:
+            return ir::ColumnType::Decimal;
     }
     return ir::ColumnType::Int64;
 }
@@ -183,8 +188,8 @@ auto to_ir_schema_fields(const SchemaType& schema) -> std::vector<ir::SchemaFiel
     std::vector<ir::SchemaField> fields;
     fields.reserve(schema.fields.size());
     for (const auto& field : schema.fields) {
-        fields.push_back(
-            ir::SchemaField{.name = field.name, .type = to_ir_column_type(field.type)});
+        fields.push_back(ir::SchemaField{
+            .name = field.name, .type = to_ir_column_type(field.type), .decimal = field.decimal});
     }
     return fields;
 }
@@ -1754,18 +1759,17 @@ class Lowerer {
                                                                  "' has mixed element types"});
                 }
 
-                // Convert LiteralExpr value to ir::Literal
+                // Convert LiteralExpr value to ir::Literal. Every alternative
+                // but DurationLiteral (excluded above) is copied: an allow-list
+                // here once let a new literal type fall through and silently
+                // become a default-constructed Int64 zero.
                 ir::Literal ir_lit;
                 std::visit(
                     [&](const auto& v) {
                         using T = std::decay_t<decltype(v)>;
-                        if constexpr (std::is_same_v<T, std::int64_t> ||
-                                      std::is_same_v<T, double> || std::is_same_v<T, bool> ||
-                                      std::is_same_v<T, std::string> || std::is_same_v<T, Date> ||
-                                      std::is_same_v<T, Timestamp>) {
+                        if constexpr (!std::is_same_v<T, DurationLiteral>) {
                             ir_lit.value = v;
                         }
-                        // DurationLiteral already excluded above.
                     },
                     lit->value);
                 elements.push_back(std::move(ir_lit));
@@ -3596,6 +3600,9 @@ class Lowerer {
             if (const auto* ts_value = std::get_if<Timestamp>(&literal->value)) {
                 return ir::Expr{.node = ir::Literal{.value = *ts_value}};
             }
+            if (const auto* dec_value = std::get_if<DecimalValue>(&literal->value)) {
+                return ir::Expr{.node = ir::Literal{.value = *dec_value}};
+            }
             return std::unexpected(LowerError{.message = "unsupported literal in expression"});
         }
         if (const auto* case_expr = std::get_if<CaseExpr>(&expr.node)) {
@@ -4087,6 +4094,9 @@ class Lowerer {
                 }
                 if (const auto* str_value = std::get_if<std::string>(&literal->value)) {
                     return ir::Expr{.node = ir::Literal{.value = *str_value}};
+                }
+                if (const auto* dec_value = std::get_if<DecimalValue>(&literal->value)) {
+                    return ir::Expr{.node = ir::Literal{.value = *dec_value}};
                 }
                 return std::unexpected(LowerError{.message = "unsupported literal in expression"});
             }

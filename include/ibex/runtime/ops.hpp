@@ -117,6 +117,7 @@ void forward_cli_args(int argc, char** argv);
 [[nodiscard]] auto filter_str(std::string v) -> ir::Expr;
 [[nodiscard]] auto filter_date(Date v) -> ir::Expr;
 [[nodiscard]] auto filter_timestamp(Timestamp v) -> ir::Expr;
+[[nodiscard]] auto filter_decimal(DecimalValue v) -> ir::Expr;
 [[nodiscard]] auto filter_arith(ir::ArithmeticOp op, ir::Expr l, ir::Expr r) -> ir::Expr;
 [[nodiscard]] auto filter_call(std::string callee, std::vector<ir::Expr> args) -> ir::Expr;
 [[nodiscard]] auto filter_cmp(ir::CompareOp op, ir::Expr l, ir::Expr r) -> ir::Expr;
@@ -326,6 +327,7 @@ void stream_append_row(runtime::Table& dst, const runtime::Table& src, std::size
 [[nodiscard]] auto str_lit(std::string v) -> ir::Expr;
 [[nodiscard]] auto date_lit(Date v) -> ir::Expr;
 [[nodiscard]] auto timestamp_lit(Timestamp v) -> ir::Expr;
+[[nodiscard]] auto decimal_lit(DecimalValue v) -> ir::Expr;
 [[nodiscard]] auto binop(ir::ArithmeticOp op, ir::Expr lhs, ir::Expr rhs) -> ir::Expr;
 [[nodiscard]] auto fn_call(std::string callee, std::vector<ir::Expr> args,
                            std::vector<NamedArgExpr> named_args = {}) -> ir::Expr;

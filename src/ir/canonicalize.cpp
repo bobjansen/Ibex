@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/decimal.hpp>
 #include <ibex/ir/canonicalize.hpp>
 #include <ibex/ir/column_name_map.hpp>
 #include <ibex/ir/expr_predicates.hpp>
@@ -207,21 +208,41 @@ auto fold_cmp(CompareOp op, const Literal& l, const Literal& r) -> std::optional
         [&](const auto& lv) -> std::optional<bool> {
             using T = std::decay_t<decltype(lv)>;
             const auto& rv = std::get<T>(r.value);
-            switch (op) {
-                case CompareOp::Eq:
-                    return lv == rv;
-                case CompareOp::Ne:
-                    return lv != rv;
-                case CompareOp::Lt:
-                    return lv < rv;
-                case CompareOp::Le:
-                    return lv <= rv;
-                case CompareOp::Gt:
-                    return lv > rv;
-                case CompareOp::Ge:
-                    return lv >= rv;
+            if constexpr (std::is_same_v<T, DecimalValue>) {
+                // Numeric, across scales: decimal"1.0" == decimal"1.00".
+                const auto ord = decimal::compare(lv, rv);
+                switch (op) {
+                    case CompareOp::Eq:
+                        return ord == 0;
+                    case CompareOp::Ne:
+                        return ord != 0;
+                    case CompareOp::Lt:
+                        return ord < 0;
+                    case CompareOp::Le:
+                        return ord <= 0;
+                    case CompareOp::Gt:
+                        return ord > 0;
+                    case CompareOp::Ge:
+                        return ord >= 0;
+                }
+                return std::nullopt;
+            } else {
+                switch (op) {
+                    case CompareOp::Eq:
+                        return lv == rv;
+                    case CompareOp::Ne:
+                        return lv != rv;
+                    case CompareOp::Lt:
+                        return lv < rv;
+                    case CompareOp::Le:
+                        return lv <= rv;
+                    case CompareOp::Gt:
+                        return lv > rv;
+                    case CompareOp::Ge:
+                        return lv >= rv;
+                }
+                return std::nullopt;
             }
-            return std::nullopt;
         },
         l.value);
 }

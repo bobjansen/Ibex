@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 
 #include <algorithm>
@@ -105,7 +106,7 @@ class ExprPtr {
 };
 
 struct Literal {
-    std::variant<std::int64_t, double, bool, std::string, Date, Timestamp> value;
+    std::variant<std::int64_t, double, bool, std::string, Date, Timestamp, DecimalValue> value;
 };
 
 enum class ArithmeticOp : std::uint8_t {
@@ -520,6 +521,9 @@ enum class ColumnType : std::uint8_t {
     /// every comparison against a user-written type must treat `String` and
     /// `Categorical` as compatible, never merely equal.
     Categorical,
+    /// `Decimal(p, s)`; the precision and scale ride on `SchemaField::decimal`
+    /// so this enum stays one byte.
+    Decimal,
 };
 
 /// Whether a column may hold nulls.
@@ -546,6 +550,8 @@ struct SchemaField {
     std::string name;
     std::optional<ColumnType> type;
     Nullability nulls = Nullability::Maybe;
+    /// Precision and scale when `type` is `Decimal` and they are known.
+    std::optional<DecimalType> decimal = std::nullopt;
 
     /// True when this column is proved null-free.
     [[nodiscard]] auto non_null() const noexcept -> bool { return nulls == Nullability::Never; }

@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/column_name_map.hpp>
 #include <ibex/ir/node.hpp>
@@ -361,6 +362,9 @@ auto expr_type_for_column(const ColumnValue& column) -> ExprType {
     }
     if (std::holds_alternative<Column<Timestamp>>(column)) {
         return ExprType::Timestamp;
+    }
+    if (std::holds_alternative<Column<Decimal>>(column)) {
+        return ExprType::Decimal;
     }
     return ExprType::String;
 }
@@ -876,6 +880,8 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                         return std::holds_alternative<Column<Date>>(col);
                     case ir::ColumnType::Timestamp:
                         return std::holds_alternative<Column<Timestamp>>(col);
+                    case ir::ColumnType::Decimal:
+                        return std::holds_alternative<Column<Decimal>>(col);
                     case ir::ColumnType::Categorical:
                         // Unreachable here for the same reason as emitter.cpp's
                         // twin switch: no `parser::ScalarType` spells this, so a
@@ -1350,12 +1356,30 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 ColumnValue cv = std::visit(
                     [&](const auto& first_val) -> ColumnValue {
                         using T = std::decay_t<decltype(first_val)>;
-                        Column<T> col_data;
-                        col_data.reserve(col.elements.size());
-                        for (const auto& lit : col.elements) {
-                            col_data.push_back(std::get<T>(lit.value));
+                        if constexpr (std::is_same_v<T, DecimalValue>) {
+                            // One column type for the whole list: the narrowest
+                            // Decimal holding every element exactly.
+                            DecimalType unified = first_val.type;
+                            for (const auto& lit : col.elements) {
+                                if (const auto* d = std::get_if<DecimalValue>(&lit.value)) {
+                                    unified = decimal::union_type(unified, d->type);
+                                }
+                            }
+                            Column<Decimal> col_data = make_decimal_column(unified);
+                            col_data.reserve(col.elements.size());
+                            for (const auto& lit : col.elements) {
+                                col_data.push_back(
+                                    Decimal{decimal_units_for(scalar_from_literal(lit), unified)});
+                            }
+                            return col_data;
+                        } else {
+                            Column<T> col_data;
+                            col_data.reserve(col.elements.size());
+                            for (const auto& lit : col.elements) {
+                                col_data.push_back(std::get<T>(lit.value));
+                            }
+                            return col_data;
                         }
-                        return col_data;
                     },
                     col.elements[0].value);
                 result.add_column(col.name, std::move(cv));

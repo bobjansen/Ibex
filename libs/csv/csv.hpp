@@ -88,11 +88,14 @@ enum class CsvColumnKind : std::uint8_t {
     String,
     Categorical,
     Date,
+    /// `decimal(p,s)`: parsed exactly from the text, never through a double.
+    Decimal,
 };
 
 struct CsvSchemaEntry {
     std::optional<std::string> name;  // set if the entry was written as `name:type`
     CsvColumnKind kind = CsvColumnKind::Infer;
+    ibex::DecimalType decimal{};  // meaningful only when kind == Decimal
 };
 
 struct CsvSchemaHint {
@@ -164,7 +167,46 @@ inline auto csv_parse_column_kind(std::string_view type_str) -> CsvColumnKind {
     if (type_str == "date") {
         return CsvColumnKind::Date;
     }
+    if (type_str == "decimal") {
+        throw std::runtime_error(
+            "read_csv: decimal needs a precision and scale, e.g. decimal(12,2)");
+    }
     throw std::runtime_error("read_csv: unknown schema type '" + std::string(type_str) + "'");
+}
+
+/// Parse `decimal(p,s)` (spaces allowed). Returns nullopt for any other type
+/// name; throws for a malformed or unsupported decimal.
+inline auto csv_parse_decimal_type(std::string_view type_str) -> std::optional<ibex::DecimalType> {
+    if (!type_str.starts_with("decimal(")) {
+        return std::nullopt;
+    }
+    const auto fail = [&]() -> std::optional<ibex::DecimalType> {
+        throw std::runtime_error("read_csv: invalid decimal type '" + std::string(type_str) +
+                                 "' (expected decimal(precision, scale) with precision 1..38 "
+                                 "and scale 0..precision)");
+    };
+    if (!type_str.ends_with(')')) {
+        return fail();
+    }
+    const auto body = type_str.substr(8, type_str.size() - 9);
+    const auto comma = body.find(',');
+    if (comma == std::string_view::npos) {
+        return fail();
+    }
+    const auto p_text = csv_trim(body.substr(0, comma));
+    const auto s_text = csv_trim(body.substr(comma + 1));
+    int precision = 0;
+    int scale = 0;
+    const auto [p_end, p_ec] =
+        std::from_chars(p_text.data(), p_text.data() + p_text.size(), precision);
+    const auto [s_end, s_ec] = std::from_chars(s_text.data(), s_text.data() + s_text.size(), scale);
+    if (p_ec != std::errc{} || s_ec != std::errc{} || p_end != p_text.data() + p_text.size() ||
+        s_end != s_text.data() + s_text.size() || precision < 1 ||
+        precision > ibex::decimal::kMaxPrecision || scale < 0 || scale > precision) {
+        return fail();
+    }
+    return ibex::DecimalType{.precision = static_cast<std::uint8_t>(precision),
+                             .scale = static_cast<std::uint8_t>(scale)};
 }
 
 inline auto csv_parse_schema(std::string_view spec) -> CsvSchemaHint {
@@ -172,12 +214,24 @@ inline auto csv_parse_schema(std::string_view spec) -> CsvSchemaHint {
     if (spec.empty()) {
         return hint;
     }
+    // The next entry separator: a comma outside parentheses, so that
+    // `price:decimal(12,2)` stays one entry.
+    const auto next_separator = [&](std::size_t from) {
+        int depth = 0;
+        for (std::size_t i = from; i < spec.size(); ++i) {
+            if (spec[i] == '(') {
+                ++depth;
+            } else if (spec[i] == ')') {
+                --depth;
+            } else if (spec[i] == ',' && depth == 0) {
+                return i;
+            }
+        }
+        return spec.size();
+    };
     std::size_t pos = 0;
     while (pos <= spec.size()) {
-        std::size_t comma = spec.find(',', pos);
-        if (comma == std::string_view::npos) {
-            comma = spec.size();
-        }
+        const std::size_t comma = next_separator(pos);
         auto token = csv_trim(spec.substr(pos, comma - pos));
         if (!token.empty()) {
             CsvSchemaEntry entry;
@@ -189,7 +243,12 @@ inline auto csv_parse_schema(std::string_view spec) -> CsvSchemaHint {
             } else {
                 type_str = token;
             }
-            entry.kind = csv_parse_column_kind(type_str);
+            if (auto dec = csv_parse_decimal_type(type_str)) {
+                entry.kind = CsvColumnKind::Decimal;
+                entry.decimal = *dec;
+            } else {
+                entry.kind = csv_parse_column_kind(type_str);
+            }
             hint.entries.push_back(std::move(entry));
         }
         if (comma == spec.size()) {
@@ -461,14 +520,17 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
    public:
     ChunkedCsvSourceOperator(const std::string& path, std::vector<std::string> col_names,
                              std::vector<CsvColumnKind> col_kinds, char delimiter,
-                             std::size_t rows_per_chunk)
+                             std::size_t rows_per_chunk,
+                             std::vector<ibex::DecimalType> col_decimals = {})
         : source_(std::make_unique<CsvSource>(path)),
           pos_(source_->data()),
           end_(source_->data() + source_->size()),
           col_names_(std::move(col_names)),
           col_kinds_(std::move(col_kinds)),
+          col_decimals_(std::move(col_decimals)),
           delimiter_(delimiter),
           rows_per_chunk_(rows_per_chunk) {
+        col_decimals_.resize(col_kinds_.size());
         shared_dicts_.resize(col_kinds_.size());
         shared_indices_.resize(col_kinds_.size());
         for (std::size_t c = 0; c < col_kinds_.size(); ++c) {
@@ -490,9 +552,17 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
         std::vector<ibex::Column<std::string>> string_cols(n_cols);
         std::vector<std::vector<ibex::Column<ibex::Categorical>::code_type>> cat_codes(n_cols);
         std::vector<ibex::Column<ibex::Date>> date_cols(n_cols);
+        std::vector<ibex::Column<ibex::Decimal>> decimal_cols(n_cols);
 
         for (std::size_t c = 0; c < n_cols; ++c) {
             switch (col_kinds_[c]) {
+                case CsvColumnKind::Decimal: {
+                    ibex::ColumnMeta meta;
+                    meta.decimal = col_decimals_[c];
+                    decimal_cols[c].set_meta(meta);
+                    decimal_cols[c].reserve(rows_per_chunk_);
+                    break;
+                }
                 case CsvColumnKind::Int:
                     int_cols[c].reserve(rows_per_chunk_);
                     break;
@@ -526,6 +596,16 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
             for (std::size_t c = 0; c < n_cols; ++c) {
                 const auto sv = c < row_cols ? row_buf[c] : std::string_view{};
                 switch (col_kinds_[c]) {
+                    case CsvColumnKind::Decimal: {
+                        auto units = ibex::decimal::parse(sv, col_decimals_[c]);
+                        if (!units) {
+                            return std::unexpected("read_csv: column '" + col_names_[c] + "' row " +
+                                                   std::to_string(total_rows_ + rows_read) + ": " +
+                                                   units.error());
+                        }
+                        decimal_cols[c].push_back(ibex::Decimal{*units});
+                        break;
+                    }
                     case CsvColumnKind::Int: {
                         std::int64_t iv{};
                         if (!csv_try_int(sv, iv)) {
@@ -595,6 +675,9 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
         for (std::size_t c = 0; c < n_cols; ++c) {
             ibex::runtime::ColumnValue column;
             switch (col_kinds_[c]) {
+                case CsvColumnKind::Decimal:
+                    column = std::move(decimal_cols[c]);
+                    break;
                 case CsvColumnKind::Int:
                     column = std::move(int_cols[c]);
                     break;
@@ -628,6 +711,7 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
     const char* end_ = nullptr;
     std::vector<std::string> col_names_;
     std::vector<CsvColumnKind> col_kinds_;
+    std::vector<ibex::DecimalType> col_decimals_;
     char delimiter_;
     std::size_t rows_per_chunk_;
     std::size_t total_rows_ = 0;
@@ -874,6 +958,19 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
         }
         return CsvColumnKind::Infer;
     };
+    // The Decimal(p, s) of a column whose hint is Decimal, resolved the same
+    // way as `resolve_hint`.
+    auto resolve_decimal = [&](std::size_t idx, const std::string& name) -> ibex::DecimalType {
+        for (const auto& entry : options.schema.entries) {
+            if (entry.name && *entry.name == name) {
+                return entry.decimal;
+            }
+        }
+        if (idx < options.schema.entries.size() && !options.schema.entries[idx].name) {
+            return options.schema.entries[idx].decimal;
+        }
+        return ibex::DecimalType{};
+    };
 
     std::vector<std::string_view> first_row;
     bool has_first_row = csv_parse_row(pos, end, options.delimiter, row_buf, escape_storage);
@@ -908,6 +1005,8 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
             ibex::Column<double> doubles;
             ibex::Column<std::string> strings;
             ibex::Column<ibex::Date> dates;
+            ibex::DecimalType decimal_type{};
+            ibex::Column<ibex::Decimal> decimals;
             using code_type = ibex::Column<ibex::Categorical>::code_type;
             std::vector<std::string> dict;
             ibex::Column<ibex::Categorical>::index_map cat_index;
@@ -928,6 +1027,9 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                         break;
                     case CsvColumnKind::Date:
                         dates.reserve(n);
+                        break;
+                    case CsvColumnKind::Decimal:
+                        decimals.reserve(n);
                         break;
                     case CsvColumnKind::Categorical:
                         cat_codes.reserve(n);
@@ -974,6 +1076,16 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                     dates.push_back(ibex::Date{dv});
                     return;
                 }
+                if (kind == CsvColumnKind::Decimal) {
+                    auto units = ibex::decimal::parse(sv, decimal_type);
+                    if (!units) {
+                        throw std::runtime_error("read_csv: column '" + std::string(name) +
+                                                 "' row " + std::to_string(row_index) + ": " +
+                                                 units.error());
+                    }
+                    decimals.push_back(ibex::Decimal{*units});
+                    return;
+                }
                 if (kind == CsvColumnKind::Categorical) {
                     const auto it = cat_index.find(sv);
                     if (it != cat_index.end()) {
@@ -998,6 +1110,12 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                         return std::move(strings);
                     case CsvColumnKind::Date:
                         return std::move(dates);
+                    case CsvColumnKind::Decimal: {
+                        ibex::ColumnMeta meta;
+                        meta.decimal = decimal_type;
+                        decimals.set_meta(meta);
+                        return std::move(decimals);
+                    }
                     case CsvColumnKind::Categorical:
                         return ibex::Column<ibex::Categorical>(std::move(dict),
                                                                std::move(cat_codes));
@@ -1010,8 +1128,9 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
 
         std::vector<CsvSchemaColumnBuilder> builders;
         builders.reserve(n_cols);
-        for (const auto hint : resolved_hints) {
-            builders.emplace_back(hint);
+        for (std::size_t c = 0; c < resolved_hints.size(); ++c) {
+            builders.emplace_back(resolved_hints[c]);
+            builders.back().decimal_type = resolve_decimal(c, col_names[c]);
             builders.back().reserve(row_estimate);
         }
 
@@ -1127,6 +1246,34 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                                                  std::to_string(i) + " failed to parse as f64");
                     }
                     col.push_back(dv);
+                }
+                if (has_nulls) {
+                    table.add_column(name, std::move(col), std::move(validity));
+                } else {
+                    table.add_column(name, std::move(col));
+                }
+                continue;
+            }
+            if (hint == CsvColumnKind::Decimal) {
+                // Exact: the text is parsed straight to units, rounding any
+                // extra fractional digits half away from zero.
+                const ibex::DecimalType type = resolve_decimal(c, name);
+                ibex::Column<ibex::Decimal> col;
+                ibex::ColumnMeta meta;
+                meta.decimal = type;
+                col.set_meta(meta);
+                col.reserve(n);
+                for (std::size_t i = 0; i < n; ++i) {
+                    if (is_null(i)) {
+                        col.push_back(ibex::Decimal{});
+                        continue;
+                    }
+                    auto units = ibex::decimal::parse(vals[i], type);
+                    if (!units) {
+                        throw std::runtime_error("read_csv: column '" + name + "' row " +
+                                                 std::to_string(i) + ": " + units.error());
+                    }
+                    col.push_back(ibex::Decimal{*units});
                 }
                 if (has_nulls) {
                     table.add_column(name, std::move(col), std::move(validity));
@@ -1422,6 +1569,11 @@ inline void csv_write_cell(std::ostream& out, const ibex::runtime::ColumnEntry& 
                 out << col[r].days;
             } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Timestamp>>) {
                 out << col[r].nanos;
+            } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Decimal>>) {
+                // Exactly `scale` fractional digits: the text read_csv's
+                // decimal(p,s) hint parses back to the same units.
+                out << ibex::decimal::to_string(col[r].units,
+                                                ibex::runtime::decimal_type_of(col).scale);
             }
         },
         *entry.column);

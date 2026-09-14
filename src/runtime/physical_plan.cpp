@@ -4,6 +4,7 @@
 #include "physical_plan.hpp"
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/format.hpp>
 #include <ibex/ir/join_output.hpp>
@@ -131,6 +132,8 @@ auto runtime_column_type(const ColumnValue& column) -> ir::ColumnType {
                 return ir::ColumnType::Categorical;
             } else if constexpr (std::same_as<ColumnType, Column<Date>>) {
                 return ir::ColumnType::Date;
+            } else if constexpr (std::same_as<ColumnType, Column<Decimal>>) {
+                return ir::ColumnType::Decimal;
             } else {
                 static_assert(std::same_as<ColumnType, Column<Timestamp>>);
                 return ir::ColumnType::Timestamp;

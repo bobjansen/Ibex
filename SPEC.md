@@ -246,6 +246,18 @@ DATE_LIT = date"YYYY-MM-DD" ;
 Dates are parsed as calendar days in the proleptic Gregorian calendar and are
 stored as signed days since `1970-01-01`.
 
+**Decimals:**
+
+```
+DECIMAL_LIT = decimal"[+|-]DIGITS[.DIGITS][(e|E)[+|-]DIGITS]" ;
+```
+
+An exact decimal constant, never converted through a binary float. Its type is
+read off its own digits: the scale is the number of digits after the point and
+the precision is the significant integral digits plus the scale (at least 1).
+`decimal"12.30"` is `Decimal(4, 2)`, `decimal"0.05"` is `Decimal(2, 2)`, and
+`decimal"1.5e3"` is `Decimal(4, 0)`. More than 38 digits is a parse error.
+
 **Timestamps:**
 
 ```
@@ -395,6 +407,7 @@ type. All non-`NULL` value arms must have the same type, apart from the usual
 | `String`    | UTF-8 string                 | `std::string`      |
 | `Date`      | Calendar day                 | `std::int32_t`     |
 | `Timestamp` | Nanosecond-precision instant | `std::int64_t`     |
+| `Decimal(p, s)` | Exact fixed-point number, `p` digits, `s` after the point | `ibex::Decimal` (int128) |
 
 Integer literals default to `Int64`. Float literals default to `Float64`.
 Implicit narrowing conversions are prohibited; explicit widening is permitted
@@ -404,6 +417,26 @@ is also rejected — use explicit cast constructors instead (Section 3.1.1).
 `Date` values are stored as signed days since `1970-01-01` (Unix epoch).
 `Timestamp` values are stored as signed nanoseconds since
 `1970-01-01T00:00:00Z`.
+
+`Decimal(p, s)` values are stored as a signed 128-bit count of `10^-s` units,
+with `1 <= p <= 38` and `0 <= s <= p`. Precision and scale belong to the
+*column* (and to a scalar's type), never to a row, so every value in a column
+shares them and they travel with it through every operator. Arbitrary
+precision, 256-bit decimals and negative scales are not supported; a source
+that carries them is rejected by name rather than read approximately.
+
+Decimal arithmetic is exact and **checked**: a result that does not fit its
+type is a runtime error (`decimal overflow`), never a wrap and never a silent
+null. Wherever a value loses scale — a narrowing cast, text with more
+fractional digits than the target scale — it rounds **half away from zero**
+(`1.005 → 1.01`, `-1.005 → -1.01`, `2.5 → 3`).
+
+A decimal meets only exact operands. An `Int64` combines as the exact
+`Decimal(19, 0)`; a float *literal* is read back from its own text (`price >
+10.5` compares against exactly 10.5); a `Float64` column is a type error, since
+silently rounding every exact value it touches is the failure this type exists
+to prevent. Comparisons are exact across scales (`decimal"1.0" ==
+decimal"1.00"`).
 
 #### 3.1.1 Explicit Cast Constructors
 
@@ -443,6 +476,15 @@ before the epoch lands on its own day rather than rounding toward the epoch.
 Other input types are a compile-time error; there is no `Date("2024-01-15")`
 parse (use the `date"..."` literal).
 
+**Decimal casts** name the target type in the call:
+`Decimal(x, precision, scale)`, with integer-literal precision and scale. They
+accept an `Int64` (exact), a `Decimal` (rescaled), a `String` (parsed exactly,
+like `Int64("42")`) or a `Float64` (taken as its shortest round-trip text, so
+`Decimal(0.1, 10, 2)` is `0.10`). Extra fractional digits round half away from
+zero; a value that does not fit is an error. In the other direction
+`Float64(d)` is the nearest double (correctly rounded) and `Int64(d)` succeeds
+only for a whole value, like the `Float → Int` rule above.
+
 **Column casts** apply element-wise: `Int64(price_col)` produces a
 `Series<Int64>` from a `Series<Float64>`, checking every element.
 
@@ -470,6 +512,20 @@ operand types — `20 / 8` is `2.5`, and division by zero follows IEEE 754
 operands (`x % 0` is `0` by the safe-arithmetic rule). These rules hold
 identically on every evaluation path, including aggregate-broadcast
 expressions such as `sum(x*x) / sum(x)`.
+
+Decimal result types are fixed statically from the operand types
+(`Decimal(p1, s1)` and `Decimal(p2, s2)`; an `Int64` operand counts as
+`Decimal(19, 0)`), capped at 38 digits:
+
+| Expression | Result |
+|------------|--------|
+| `a + b`, `a - b` | `Decimal(min(38, max(p1-s1, p2-s2) + max(s1, s2) + 1), max(s1, s2))` |
+| `a * b` | `Decimal(min(38, p1 + p2), s1 + s2)`; an error if `s1 + s2 > 38` |
+| `a / b` | `Float64`, as for every `/` |
+| `a % b` | not defined for `Decimal` |
+| `-a` | same type |
+
+The value of every result is exact; only its magnitude is checked.
 
 ### 3.2 Compound Types
 
@@ -673,6 +729,14 @@ last(col)   // last non-null value; null for an all-null group
 std(col)    // ignores null rows; returns null if fewer than 2 non-null values
 ewma(col, alpha)  // ignores null rows; returns null for an empty group
 ```
+
+Over a `Decimal(p, s)` column, `sum` is `Decimal(38, s)` (exact, and an error
+past 38 digits); `min`, `max`, `first` and `last` keep the column's type;
+`mean` divides the exact sum in decimal (carried to 38 digits) and only then
+converts to `Float64`, so `mean` of `0.10, 0.20, 0.30` is exactly `0.2`; `count` and
+`count_distinct` are `Int64`. The statistical aggregates (`median`, `std`,
+`quantile`, `ewma`, `skew`, `kurtosis`) are not defined for `Decimal` — convert
+explicitly with `Float64(x)`, which states the rounding rather than hiding it.
 
 A null aggregate result behaves like any other null downstream: it broadcasts
 as null in an `update ... by` field (including compound expressions such as

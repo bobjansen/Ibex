@@ -61,8 +61,10 @@ auto try_make_chunked_csv_source(const ibex::runtime::ExternArgs& args)
     }
     std::vector<std::string> col_names;
     std::vector<csv_detail::CsvColumnKind> col_kinds;
+    std::vector<ibex::DecimalType> col_decimals;
     col_names.reserve(hint.entries.size());
     col_kinds.reserve(hint.entries.size());
+    col_decimals.reserve(hint.entries.size());
     for (std::size_t i = 0; i < hint.entries.size(); ++i) {
         const auto& entry = hint.entries[i];
         if (entry.kind == csv_detail::CsvColumnKind::Infer) {
@@ -70,10 +72,12 @@ auto try_make_chunked_csv_source(const ibex::runtime::ExternArgs& args)
         }
         col_names.push_back(entry.name.value_or("col" + std::to_string(i + 1)));
         col_kinds.push_back(entry.kind);
+        col_decimals.push_back(entry.decimal);
     }
     try {
         auto op = std::make_unique<csv_detail::ChunkedCsvSourceOperator>(
-            *path, std::move(col_names), std::move(col_kinds), delim, kChunkedCsvRowsPerChunk);
+            *path, std::move(col_names), std::move(col_kinds), delim, kChunkedCsvRowsPerChunk,
+            std::move(col_decimals));
         return std::expected<ibex::runtime::OperatorPtr, std::string>{std::move(op)};
     } catch (const std::exception& e) {
         return std::expected<ibex::runtime::OperatorPtr, std::string>{

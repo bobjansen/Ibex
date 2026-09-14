@@ -8,6 +8,7 @@
 // dedup fan-out policy is resolved by the caller (src/runtime/PARALLELISM.md).
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -708,6 +709,11 @@ class ChunkedDistinctOperator final : public Operator {
         if (const auto* col = std::get_if<Column<Timestamp>>(&column)) {
             return gather_distinct_rows(std::move(t), seen_timestamp_, *col);
         }
+        if (const auto* col = std::get_if<Column<Decimal>>(&column)) {
+            // Units are value identity within one column (one scale).
+            seen_decimal_type_ = decimal_type_of(*col);
+            return gather_distinct_rows(std::move(t), seen_decimal_, *col);
+        }
         if (const auto* col = std::get_if<Column<std::string>>(&column)) {
             return gather_distinct_string_rows(std::move(t), *col);
         }
@@ -818,6 +824,17 @@ class ChunkedDistinctOperator final : public Operator {
                 [](Timestamp v) { return mix_one(std::hash<Timestamp>{}(v)); });
             return true;
         }
+        if (std::holds_alternative<Column<Decimal>>(column)) {
+            // Hashed by units, exactly as hash_key_row's Dec case.
+            const DecimalType type = seen_decimal_type_;
+            seed_generic_dedup_from(
+                seen_decimal_,
+                [type](Decimal v) -> ScalarValue {
+                    return DecimalValue{.units = v.units, .type = type};
+                },
+                [](Decimal v) { return mix_one(decimal::hash_units(v.units)); });
+            return true;
+        }
         if (std::holds_alternative<Column<std::string>>(column)) {
             seed_generic_dedup_from(
                 seen_strings_, [](std::string_view v) -> ScalarValue { return std::string(v); },
@@ -869,6 +886,8 @@ class ChunkedDistinctOperator final : public Operator {
     TypedDedup<bool> seen_bool_;
     TypedDedup<Date> seen_date_;
     TypedDedup<Timestamp> seen_timestamp_;
+    TypedDedup<Decimal> seen_decimal_;
+    DecimalType seen_decimal_type_{};
     std::vector<std::uint8_t> seen_cat_flags_;
     robin_hood::unordered_flat_set<std::string_view, StringViewHash, StringViewEq> seen_strings_;
     std::deque<std::string> owned_strings_;

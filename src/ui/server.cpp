@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/text.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/repl/repl.hpp>
@@ -287,6 +288,10 @@ auto cell_json(const runtime::ColumnEntry& entry, std::size_t row) -> json {
                 return runtime::format_timestamp(column[row]);
             } else if constexpr (std::same_as<T, Categorical>) {
                 return std::string(column[row]);
+            } else if constexpr (std::same_as<T, Decimal>) {
+                // As text: JSON numbers are doubles, which would round the value.
+                return decimal::to_string(column[row].units,
+                                          runtime::decimal_type_of(column).scale);
             } else {
                 return column[row];
             }
@@ -400,6 +405,8 @@ auto scalar_json(const runtime::ScalarValue& value) -> json {
                 return runtime::format_date(scalar);
             } else if constexpr (std::same_as<T, Timestamp>) {
                 return runtime::format_timestamp(scalar);
+            } else if constexpr (std::same_as<T, DecimalValue>) {
+                return decimal::to_string(scalar);
             } else {
                 return scalar;
             }

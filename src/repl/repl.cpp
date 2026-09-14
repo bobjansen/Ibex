@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/text.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/format.hpp>
@@ -1097,6 +1098,8 @@ auto format_scalar(const runtime::ScalarValue& value) -> std::string {
                 return runtime::format_timestamp(v);
             } else if constexpr (std::is_same_v<T, double>) {
                 return runtime::format_float_mixed(v);
+            } else if constexpr (std::is_same_v<T, DecimalValue>) {
+                return decimal::to_string(v);
             } else {
                 return ibex::formatting::format("{}", v);
             }
@@ -1325,11 +1328,16 @@ std::string column_type_name(const runtime::ColumnValue& column) {
     if (std::holds_alternative<Column<Timestamp>>(column)) {
         return "Timestamp";
     }
+    if (std::holds_alternative<Column<Decimal>>(column)) {
+        return "Decimal";
+    }
     return "Unknown";
 }
 
 auto scalar_type_name(parser::ScalarType st) -> std::string_view {
     switch (st) {
+        case parser::ScalarType::Decimal:
+            return "Decimal";
         case parser::ScalarType::Int32:
             return "Int32";
         case parser::ScalarType::Int64:
@@ -1512,6 +1520,8 @@ auto scalar_type_matches(const runtime::ScalarValue& val, parser::ScalarType exp
             return std::holds_alternative<Date>(val);
         case parser::ScalarType::Timestamp:
             return std::holds_alternative<Timestamp>(val);
+        case parser::ScalarType::Decimal:
+            return std::holds_alternative<DecimalValue>(val);
     }
     return false;
 }
@@ -1548,6 +1558,8 @@ auto column_type_matches(const runtime::ColumnValue& col, parser::ScalarType exp
             return std::holds_alternative<Column<Date>>(col);
         case parser::ScalarType::Timestamp:
             return std::holds_alternative<Column<Timestamp>>(col);
+        case parser::ScalarType::Decimal:
+            return std::holds_alternative<Column<Decimal>>(col);
     }
     return false;
 }
@@ -1854,6 +1866,10 @@ auto validate_column_type(const runtime::ColumnValue& column, const parser::Type
 
 auto empty_series_for_type(parser::ScalarType type) -> runtime::ColumnValue {
     switch (type) {
+        case parser::ScalarType::Decimal:
+            // Empty, so no value depends on the type; callers that know the
+            // declared Decimal(p, s) restamp it.
+            return runtime::make_decimal_column(DecimalType{});
         case parser::ScalarType::Int32:
         case parser::ScalarType::Int64:
             return Column<std::int64_t>{};
@@ -1960,6 +1976,29 @@ auto eval_series_literal(const parser::ArrayLiteralExpr& array,
             for (const auto& element : array.elements) {
                 col.push_back(
                     std::get<Timestamp>(std::get<parser::LiteralExpr>(element->node).value));
+            }
+            out = std::move(col);
+            break;
+        }
+        case 7: {
+            // Decimal: one column type for the list, the narrowest holding
+            // every element exactly.
+            DecimalType unified =
+                std::get<DecimalValue>(
+                    std::get<parser::LiteralExpr>(array.elements.front()->node).value)
+                    .type;
+            for (const auto& element : array.elements) {
+                unified = decimal::union_type(
+                    unified,
+                    std::get<DecimalValue>(std::get<parser::LiteralExpr>(element->node).value)
+                        .type);
+            }
+            auto col = runtime::make_decimal_column(unified);
+            col.reserve(array.elements.size());
+            for (const auto& element : array.elements) {
+                col.push_back(Decimal{runtime::decimal_units_for(
+                    std::get<DecimalValue>(std::get<parser::LiteralExpr>(element->node).value),
+                    unified)});
             }
             out = std::move(col);
             break;
@@ -3475,6 +3514,9 @@ auto column_element(const runtime::ColumnValue& col, std::size_t i) -> runtime::
             using V = std::decay_t<decltype(value)>;
             if constexpr (std::is_same_v<V, std::string_view>) {
                 return runtime::ScalarValue{std::string(value)};
+            } else if constexpr (std::is_same_v<V, Decimal>) {
+                return runtime::ScalarValue{
+                    DecimalValue{.units = value.units, .type = runtime::decimal_type_of(c)}};
             } else {
                 return runtime::ScalarValue{value};
             }
@@ -3494,6 +3536,21 @@ auto column_from_scalars(const std::vector<runtime::ScalarValue>& vals)
             using T = std::decay_t<decltype(first)>;
             if constexpr (std::is_same_v<T, std::monostate>) {
                 return std::unexpected("element-wise result is null");
+            } else if constexpr (std::is_same_v<T, DecimalValue>) {
+                DecimalType unified = first.type;
+                for (const auto& v : vals) {
+                    const auto* p = std::get_if<DecimalValue>(&v);
+                    if (p == nullptr) {
+                        return std::unexpected("element-wise result has inconsistent types");
+                    }
+                    unified = decimal::union_type(unified, p->type);
+                }
+                auto col = runtime::make_decimal_column(unified);
+                col.reserve(vals.size());
+                for (const auto& v : vals) {
+                    col.push_back(Decimal{runtime::decimal_units_for(v, unified)});
+                }
+                return runtime::ColumnValue{std::move(col)};
             } else {
                 Column<T> col;
                 col.reserve(vals.size());

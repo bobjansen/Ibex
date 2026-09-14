@@ -34,7 +34,7 @@ namespace ibex::parser {
 // ibex::codegen::Emitter::Config::ScalarValue -- see the note there. The
 // leading std::monostate is the null alternative.
 using ScalarValue = std::variant<std::monostate, std::int64_t, double, bool, std::string,
-                                 ibex::Date, ibex::Timestamp>;
+                                 ibex::Date, ibex::Timestamp, ibex::DecimalValue>;
 
 [[nodiscard]] inline auto eval_scalar_expr(
     const Expr& expr, const robin_hood::unordered_map<std::string, ScalarValue>& env)
@@ -56,6 +56,8 @@ using ScalarValue = std::variant<std::monostate, std::int64_t, double, bool, std
         if (const auto* v = std::get_if<ibex::Date>(&lit->value))
             return ScalarValue{*v};
         if (const auto* v = std::get_if<ibex::Timestamp>(&lit->value))
+            return ScalarValue{*v};
+        if (const auto* v = std::get_if<ibex::DecimalValue>(&lit->value))
             return ScalarValue{*v};
         return std::unexpected("unsupported scalar literal");
     }
@@ -154,7 +156,7 @@ struct ScalarBindingSet {
 
 [[nodiscard]] inline auto is_scalar_cast_name(std::string_view callee) -> bool {
     return callee == "Int64" || callee == "Int32" || callee == "Int" || callee == "Float64" ||
-           callee == "Float32" || callee == "Date" || callee == "Timestamp";
+           callee == "Float32" || callee == "Date" || callee == "Timestamp" || callee == "Decimal";
 }
 
 [[nodiscard]] inline auto ir_literal_from_ast(const Expr& expr) -> std::optional<ir::Literal> {

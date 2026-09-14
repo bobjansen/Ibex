@@ -80,6 +80,7 @@ enum class TokenKind : std::uint8_t {
     KeywordString,
     KeywordDate,
     KeywordTimestamp,
+    KeywordDecimal,
     KeywordSeries,
     KeywordDataFrame,
     KeywordTimeFrame,

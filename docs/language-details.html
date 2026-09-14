@@ -889,6 +889,41 @@ prices[<span class="kw">update</span> { vol_int = <span class="fn-name">Int64</s
         </div>
       </div>
 
+      <!-- Exact decimals -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Type System</span>
+          <h3>Exact decimals for money and other counted quantities</h3>
+          <p>
+            <code>Decimal(p,&nbsp;s)</code> stores an exact count of
+            <code>10<sup>-s</sup></code> units (up to 38 digits, in 128 bits).
+            Literals are written <code>decimal"12.30"</code>, and CSV, Parquet
+            and Arrow columns keep their precision and scale end to end.
+          </p>
+          <p>
+            Arithmetic is exact and <strong>checked</strong>: overflow is an
+            error, never a wrap. Losing scale rounds half away from zero, and
+            only where you say so. A decimal combines with Int64 and with float
+            <em>literals</em> (read from their text), but not with a Float64
+            column &mdash; convert explicitly. <code>/</code> yields Float64 as
+            everywhere else; <code>sum</code> is <code>Decimal(38,&nbsp;s)</code>.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="kw">let</span> ledger = <span class="fn-name">read_csv</span>(<span class="str">"ledger.csv"</span>, <span class="str">""</span>, <span class="str">","</span>, true,
+                      <span class="str">"account:str,amount:decimal(12,2),tax_rate:decimal(5,4)"</span>);
+
+<span class="cm">// Exact totals: 0.10 + 0.20 + 0.30 is 0.60, not 0.6000000000000001</span>
+ledger[<span class="kw">select</span> { total = <span class="fn-name">sum</span>(amount) }, <span class="kw">by</span> account];
+
+<span class="cm">// Decimal(12,2) * Decimal(5,4) is an exact Decimal(17,6); the cast rounds to the cent</span>
+ledger[<span class="kw">update</span> { tax = <span class="fn-name">Decimal</span>(amount * tax_rate, <span class="num">12</span>, <span class="num">2</span>) }];
+
+<span class="cm">// Comparisons are exact across scales and against literals</span>
+ledger[<span class="kw">filter</span> amount &gt;= <span class="num">10.5</span>];</code></pre>
+        </div>
+      </div>
+
       <!-- 7. Vectorized RNG -->
       <div class="tour-item">
         <div class="tour-text">

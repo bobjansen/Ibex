@@ -7,6 +7,7 @@
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -548,6 +549,12 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
                     fk.str.reserve(rows);
                     for (std::size_t i = 0; i < rows; ++i)
                         fk.str.push_back(col[i]);
+                } else if constexpr (std::is_same_v<ColT, Column<Decimal>>) {
+                    // Units are exact within a column (one scale), so their
+                    // order is the value order; see decimal_order_keys for
+                    // how a >64-bit unit keeps that exact.
+                    fk.kind = FlatKind::I64;
+                    fk.u64 = decimal_order_keys(col, rows);
                 } else {
                     // Categorical: rank the DICTIONARY by value, then map each
                     // row's code through that ranking, so this becomes an

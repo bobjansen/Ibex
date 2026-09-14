@@ -117,45 +117,7 @@ jobs:
             -R '^StreamBuffered feeds a TimeBucket stream from a producer thread$' \
             --repeat until-pass:3
 
-  # The ADBC plugin builds its driver manager from the pinned Apache release;
-  # the SQLite driver comes from scripts/install_adbc_driver.sh, the pinned and
-  # hash-checked route the docs recommend. This job builds only the plugin, its
-  # integration tests and the demo (the options grammar is covered by ibex_tests).
-  adbc:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install build tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y g++-13 cmake ninja-build unzip
-
-      - name: Install the ADBC SQLite driver
-        run: scripts/install_adbc_driver.sh --dest "$RUNNER_TEMP/adbc-drivers" sqlite
-
-      - name: Configure
-        run: |
-          cmake -B build \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_CXX_COMPILER=g++-13 \
-            -DIBEX_WARNINGS_AS_ERRORS=ON \
-            -DIBEX_ENABLE_SANITIZERS=ON \
-            -DIBEX_BUILD_TESTS=ON \
-            -DIBEX_BUILD_TOOLS=ON \
-            -DIBEX_BUILD_PARQUET=OFF \
-            -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
-            -DIBEX_BUILD_LIGHTGBM=OFF \
-            -DIBEX_BUILD_KAFKA=OFF \
-            -DIBEX_BUILD_ADBC=ON \
-            -DADBC_DRIVER_SQLITE_LIBRARY="$RUNNER_TEMP/adbc-drivers/sqlite/libadbc_driver_sqlite.so"
-
-      - name: Build
-        run: cmake --build build --parallel --target ibex_adbc_plugin ibex_adbc_tests ibex_repl_bin ibex_args_plugin ibex_csv_plugin
-
-      - name: Test
-        run: ctest --test-dir build --output-on-failure --no-tests=error -R '^adbc:'
+  # The ADBC jobs (Linux and Windows) live in adbc.yml.
 
   build-and-test-windows:
     strategy:

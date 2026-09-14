@@ -8,9 +8,11 @@
 #   examples/adbc_sqlite/run.sh [BUILD_DIR]
 #
 # BUILD_DIR defaults to ./build and must have been configured with
-# -DIBEX_BUILD_ADBC=ON. The SQLite driver is found from, in order:
+# -DIBEX_BUILD_ADBC=ON. The SQLite driver is, in order:
 #   $ADBC_DRIVER_SQLITE (a path to libadbc_driver_sqlite.so),
-#   $CONDA_PREFIX/lib/libadbc_driver_sqlite.so.
+#   $CONDA_PREFIX/lib/libadbc_driver_sqlite.so if a conda env provides it,
+#   the name "sqlite", resolved through a driver manifest such as the one
+#   scripts/install_adbc_driver.sh sqlite writes.
 # Override the tool or plugin locations with $IBEX_BIN / $IBEX_PLUGIN_DIR.
 set -euo pipefail
 
@@ -20,14 +22,15 @@ ibex="${IBEX_BIN:-$build/tools/ibex}"
 plugins="${IBEX_PLUGIN_DIR:-$(dirname "$ibex")}"
 
 driver="${ADBC_DRIVER_SQLITE:-}"
-if [[ -z "$driver" && -n "${CONDA_PREFIX:-}" ]]; then
-    driver="$CONDA_PREFIX/lib/libadbc_driver_sqlite.so"
-fi
-if [[ -z "$driver" || ! -f "$driver" ]]; then
-    echo "SQLite ADBC driver not found. Install it (conda install -c conda-forge" \
-         "libadbc-driver-sqlite) and activate the env, or set ADBC_DRIVER_SQLITE." >&2
+if [[ -n "$driver" && ! -f "$driver" ]]; then
+    echo "ADBC_DRIVER_SQLITE=$driver does not exist" >&2
     exit 1
 fi
+if [[ -z "$driver" && -f "${CONDA_PREFIX:-/nonexistent}/lib/libadbc_driver_sqlite.so" ]]; then
+    driver="$CONDA_PREFIX/lib/libadbc_driver_sqlite.so"
+fi
+# Otherwise by name; if no manifest exists the read fails and names it.
+driver="${driver:-sqlite}"
 for f in "$ibex" "$plugins/adbc.so" "$plugins/args.so" "$plugins/csv.so"; do
     if [[ ! -e "$f" ]]; then
         echo "missing $f -- build with -DIBEX_BUILD_ADBC=ON first" >&2

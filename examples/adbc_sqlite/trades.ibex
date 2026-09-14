@@ -11,7 +11,9 @@ let args = parse_args("
     db         : string
     out        : string
 ");
-let driver = coalesce(scalar(args[filter name == "driver", select { value }]), "adbc_driver_sqlite");
+// A driver name resolves through an ADBC driver manifest (see
+// scripts/install_adbc_driver.sh); a path to the driver library also works.
+let driver = coalesce(scalar(args[filter name == "driver", select { value }]), "sqlite");
 let db = scalar(args[filter name == "db", select { value }]);
 let out = scalar(args[filter name == "out", select { value }]);
 

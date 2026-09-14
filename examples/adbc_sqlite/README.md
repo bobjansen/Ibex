@@ -7,25 +7,28 @@ compute notional, aggregate by symbol, and export the result.
 ## Run it
 
 ```sh
-conda install -c conda-forge libadbc-driver-manager libadbc-driver-sqlite
-conda activate <env>        # sets CONDA_PREFIX, where run.sh finds the driver
-
-cmake -B build -G Ninja -DIBEX_BUILD_ADBC=ON
+cmake -B build -G Ninja -DIBEX_BUILD_ADBC=ON   # builds the ADBC driver manager too
 cmake --build build -j 6
+scripts/install_adbc_driver.sh sqlite           # pinned, hash-checked Apache driver
 examples/adbc_sqlite/run.sh build
 ```
 
+`install_adbc_driver.sh` puts the driver in `~/.config/adbc/drivers` with a
+manifest, so `read_adbc("sqlite", ...)` finds it by name; it needs `curl`,
+`unzip` and `sha256sum`, not Python or conda. A conda env with
+`libadbc-driver-sqlite` works too, as does
+`ADBC_DRIVER_SQLITE=/path/to/libadbc_driver_sqlite.so`.
+
 `run.sh` creates the database in a temporary directory, runs `trades.ibex`,
 and diffs the exported CSV against `expected_summary.csv`. It also runs as
-the `adbc:sqlite_demo` ctest. If the driver is not in an active conda
-environment, set `ADBC_DRIVER_SQLITE=/path/to/libadbc_driver_sqlite.so`.
+the `adbc:sqlite_demo` ctest.
 
 ## What it shows
 
 | File | Role |
 | --- | --- |
 | `make_trades_db.py` | 11 trades, standard-library `sqlite3`; trade 4 has a NULL price, trade 7 a NULL quantity |
-| `trades.ibex` | The walkthrough; takes `--driver`, `--db`, `--out` via `parse_args` |
+| `trades.ibex` | The walkthrough; takes `--driver` (default `sqlite`), `--db`, `--out` via `parse_args` |
 | `expected_summary.csv` | The exported result `run.sh` checks against |
 
 1. **Batched read.** `stmt.adbc.sqlite.query.batch_rows=4` makes the driver

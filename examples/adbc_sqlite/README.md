@@ -17,7 +17,11 @@ examples/adbc_sqlite/run.sh build
 manifest, so `read_adbc("sqlite", ...)` finds it by name; it needs `curl`,
 `unzip` and `sha256sum`, not Python or conda. A conda env with
 `libadbc-driver-sqlite` works too, as does
-`ADBC_DRIVER_SQLITE=/path/to/libadbc_driver_sqlite.so`.
+`ADBC_DRIVER_SQLITE=/path/to/libadbc_driver_sqlite.so`. On Windows, install
+the driver with
+`powershell -ExecutionPolicy Bypass -File scripts\install_adbc_driver.ps1 sqlite`
+(the bypass covers that one process; Windows otherwise refuses an unsigned
+script that came from a download).
 
 `run.sh` creates the database in a temporary directory, runs `trades.ibex`,
 and diffs the exported CSV against `expected_summary.csv`. It also runs as

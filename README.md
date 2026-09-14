@@ -773,6 +773,17 @@ scripts/install_adbc_driver.sh sqlite postgresql
 The script downloads Apache's own driver builds (pinned by version and
 SHA-256), needs only `curl`, `unzip` and `sha256sum`, and writes an ADBC driver
 manifest to `~/.config/adbc/drivers` so scripts can say `read_adbc("sqlite", ...)`.
+On Windows, `scripts\install_adbc_driver.ps1` does the same with only what ships
+with Windows PowerShell, registering each driver under `HKCU\SOFTWARE\ADBC\Drivers`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_adbc_driver.ps1 sqlite
+```
+
+`-ExecutionPolicy Bypass` applies to that one PowerShell process only. Without
+it, a copy of the script that came from a download (a zip or a CI artifact, not
+a `git clone`) is refused as "not digitally signed"; `Unblock-File` on the
+script is the permanent alternative.
 Drivers from conda-forge, Apache Arrow's APT repository, or `dbc` work too, by
 path or by manifest. To link an installed driver manager instead of the bundled
 one, pass `-DIBEX_ADBC_SYSTEM_DRIVER_MANAGER=ON`.
@@ -986,7 +997,9 @@ let df = read_adbc("sqlite", "", "select 1 as x");
 The first argument is a driver name, resolved through an ADBC driver manifest
 (`scripts/install_adbc_driver.sh sqlite` writes one; `ADBC_DRIVER_PATH`,
 `$CONDA_PREFIX/etc/adbc/drivers`, `~/.config/adbc/drivers` and
-`/etc/adbc/drivers` are searched), or a path to a driver library.
+`/etc/adbc/drivers` are searched; on Windows, `scripts\install_adbc_driver.ps1`
+registers the name under `HKCU\SOFTWARE\ADBC\Drivers`), or a path to a driver
+library.
 
 The 4th optional argument (default `""`) is a `;` or newline-separated
 `key=value` string. Prefix keys with `db.`, `conn.`, or `stmt.` to target

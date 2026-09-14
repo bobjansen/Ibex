@@ -1084,9 +1084,9 @@ auto slice_table(const ibex::runtime::Table& table, std::size_t rows) -> ibex::r
                     for (std::size_t i = 0; i < n; ++i) {
                         data.push_back(col[i]);
                     }
-                    ibex::Column<ibex::Decimal> out(std::move(data));
-                    out.set_meta(col.meta());
-                    return out;
+                    ibex::Column<ibex::Decimal> copy(std::move(data));
+                    copy.set_meta(col.meta());
+                    return copy;
                 } else {
                     static_assert(std::is_same_v<ColType, void>, "Unhandled column type");
                 }

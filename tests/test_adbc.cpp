@@ -24,10 +24,10 @@
 #include <fstream>
 #include <initializer_list>
 #include <optional>
+#include <random>
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <unistd.h>
 #include <variant>
 #include <vector>
 
@@ -38,12 +38,55 @@ namespace stdfs = std::filesystem;
 constexpr std::string_view kPluginDir = IBEX_ADBC_PLUGIN_DIR;
 constexpr std::string_view kSqliteDriver = IBEX_ADBC_SQLITE_DRIVER;
 
+/// Keeps this process's temp files apart from a concurrent test run's.
+auto process_token() -> const std::string& {
+    static const std::string token = std::to_string(std::random_device{}());
+    return token;
+}
+
+// Environment access that also works on Windows, where the driver manager reads
+// the process environment (which _putenv_s updates) and std::getenv is deprecated.
+auto get_env(const char* name) -> std::optional<std::string> {
+#ifdef _WIN32
+    char* value = nullptr;
+    std::size_t size = 0;
+    if (_dupenv_s(&value, &size, name) != 0 || value == nullptr) {
+        return std::nullopt;
+    }
+    std::string result(value);
+    std::free(value);
+    return result;
+#else
+    const char* value = std::getenv(name);
+    if (value == nullptr) {
+        return std::nullopt;
+    }
+    return std::string(value);
+#endif
+}
+
+void set_env(const char* name, const std::string& value) {
+#ifdef _WIN32
+    _putenv_s(name, value.c_str());
+#else
+    setenv(name, value.c_str(), 1);
+#endif
+}
+
+void unset_env(const char* name) {
+#ifdef _WIN32
+    _putenv_s(name, "");  // an empty value removes the variable
+#else
+    unsetenv(name);
+#endif
+}
+
 /// A SQLite database file that lives for one test.
 class SqliteDb {
    public:
     SqliteDb() {
         static std::atomic<int> counter{0};
-        const std::string file = "ibex_adbc_test_" + std::to_string(getpid()) + "_" +
+        const std::string file = "ibex_adbc_test_" + process_token() + "_" +
                                  std::to_string(counter.fetch_add(1)) + ".sqlite";
         path_ = stdfs::temp_directory_path() / file;
         std::error_code ec;
@@ -58,7 +101,9 @@ class SqliteDb {
     SqliteDb(SqliteDb&&) = delete;
     SqliteDb& operator=(SqliteDb&&) = delete;
 
-    [[nodiscard]] auto path() const -> std::string { return path_.string(); }
+    /// Forward slashes on every platform: the path is embedded in Ibex string
+    /// literals, where a backslash is an escape.
+    [[nodiscard]] auto path() const -> std::string { return path_.generic_string(); }
 
    private:
     stdfs::path path_;
@@ -353,18 +398,16 @@ namespace {
 class ManifestDir {
    public:
     ManifestDir() {
-        dir_ = stdfs::temp_directory_path() / ("ibex_adbc_manifests_" + std::to_string(getpid()));
+        dir_ = stdfs::temp_directory_path() / ("ibex_adbc_manifests_" + process_token());
         stdfs::create_directories(dir_);
-        if (const char* old = std::getenv("ADBC_DRIVER_PATH")) {
-            previous_ = old;
-        }
-        setenv("ADBC_DRIVER_PATH", dir_.c_str(), 1);
+        previous_ = get_env("ADBC_DRIVER_PATH");
+        set_env("ADBC_DRIVER_PATH", dir_.string());
     }
     ~ManifestDir() {
         if (previous_.has_value()) {
-            setenv("ADBC_DRIVER_PATH", previous_->c_str(), 1);
+            set_env("ADBC_DRIVER_PATH", *previous_);
         } else {
-            unsetenv("ADBC_DRIVER_PATH");
+            unset_env("ADBC_DRIVER_PATH");
         }
         std::error_code ec;
         stdfs::remove_all(dir_, ec);

@@ -1,0 +1,32 @@
+// PostgreSQL → Ibex over ADBC: which column types arrive, and as what.
+// See examples/adbc_postgresql/README.md for the full walkthrough:
+//   ibex --plugin-path build/tools examples/adbc_postgresql/types.ibex [-- --uri URI]
+import "adbc";
+import "args";
+
+let args = parse_args("
+    driver (d) : string?
+    uri        : string?
+");
+// "postgresql" resolves through the manifest (Linux) or registry entry
+// (Windows) that scripts/install_adbc_driver.{sh,ps1} postgresql writes.
+let driver = coalesce(scalar(args[filter name == "driver", select { value }]), "postgresql");
+let uri = coalesce(scalar(args[filter name == "uri", select { value }]),
+    "postgresql://postgres:ibex@localhost:55432/postgres");
+
+// 1. Types Ibex stores natively: smallint and integer widen to Int64,
+//    timestamps become nanoseconds, timestamptz arrives in UTC. Row 3 is all
+//    NULL apart from id and label.
+read_adbc(driver, uri,
+    "select id, small_n, int_n, big_n, dbl, flag, label, code, day, ts, tstz
+     from ibex_types order by id");
+
+// 2. The driver hands numeric and jsonb over as text.
+read_adbc(driver, uri, "select id, price, doc from ibex_types order by id");
+
+// 3. Cast numeric in SQL to get a number, then aggregate in Ibex.
+read_adbc(driver, uri, "select label, price::float8 as price from ibex_types order by id")
+    [select { rows = count(), priced = count(price), total = sum(price) }, by label, order label];
+
+// 4. A query with no matching rows keeps its columns and types.
+read_adbc(driver, uri, "select id, big_n, tstz from ibex_types where false");

@@ -31,12 +31,17 @@
 #include <variant>
 #include <vector>
 
+#include "exe_path.hpp"
+
 namespace {
 
 namespace stdfs = std::filesystem;
 
-constexpr std::string_view kPluginDir = IBEX_ADBC_PLUGIN_DIR;
-constexpr std::string_view kSqliteDriver = IBEX_ADBC_SQLITE_DRIVER;
+// Where the build put the plugin and found the SQLite driver. These are the
+// build machine's paths; the helpers below also cover running the binary
+// elsewhere, such as the Windows CI artifact on a user's machine.
+constexpr std::string_view kBuildPluginDir = IBEX_ADBC_PLUGIN_DIR;
+constexpr std::string_view kBuildSqliteDriver = IBEX_ADBC_SQLITE_DRIVER;
 
 /// Keeps this process's temp files apart from a concurrent test run's.
 auto process_token() -> const std::string& {
@@ -81,6 +86,44 @@ void unset_env(const char* name) {
 #endif
 }
 
+/// Where to look for the adbc plugin: next to this binary first (the Windows
+/// artifact ships them together), then the build's plugin output directory.
+auto plugin_search_paths() -> std::vector<std::string> {
+    std::vector<std::string> paths;
+    paths.reserve(2);
+    if (const auto exe_dir = ibex::tools::executable_directory(); !exe_dir.empty()) {
+        paths.push_back(exe_dir.string());
+    }
+    paths.emplace_back(kBuildPluginDir);
+    return paths;
+}
+
+/// The SQLite driver library: $IBEX_ADBC_SQLITE_DRIVER, else the build's path,
+/// else (Windows) where install_adbc_driver.ps1 installs it by default. Forward
+/// slashes, since the path is embedded in Ibex string literals.
+auto sqlite_driver() -> const std::string& {
+    static const std::string driver = [] {
+        if (auto env = get_env("IBEX_ADBC_SQLITE_DRIVER"); env.has_value() && !env->empty()) {
+            return stdfs::path(*env).generic_string();
+        }
+        std::error_code ec;
+        if (stdfs::exists(stdfs::path(kBuildSqliteDriver), ec)) {
+            return std::string(kBuildSqliteDriver);
+        }
+#ifdef _WIN32
+        if (auto local = get_env("LOCALAPPDATA"); local.has_value()) {
+            const auto installed =
+                stdfs::path(*local) / "ADBC" / "Drivers" / "sqlite" / "adbc_driver_sqlite.dll";
+            if (stdfs::exists(installed, ec)) {
+                return installed.generic_string();
+            }
+        }
+#endif
+        return std::string(kBuildSqliteDriver);
+    }();
+    return driver;
+}
+
 /// A SQLite database file that lives for one test.
 class SqliteDb {
    public:
@@ -118,8 +161,8 @@ auto ibex_str(std::string_view text) -> std::string {
 /// `read_adbc(<sqlite driver>, <db>, <sql>[, <options>])` as Ibex source.
 auto read_call(const SqliteDb& db, std::string_view sql,
                std::optional<std::string_view> options = std::nullopt) -> std::string {
-    std::string call =
-        "read_adbc(" + ibex_str(kSqliteDriver) + ", " + ibex_str(db.path()) + ", " + ibex_str(sql);
+    std::string call = "read_adbc(" + ibex_str(sqlite_driver()) + ", " + ibex_str(db.path()) +
+                       ", " + ibex_str(sql);
     if (options.has_value()) {
         call += ", " + ibex_str(*options);
     }
@@ -150,7 +193,7 @@ struct AdbcSession {
     static auto config() -> ibex::repl::ReplConfig {
         ibex::repl::ReplConfig cfg;
         cfg.persistent_history = false;
-        cfg.plugin_search_paths = {std::string(kPluginDir)};
+        cfg.plugin_search_paths = plugin_search_paths();
         return cfg;
     }
 
@@ -221,8 +264,8 @@ TEST_CASE("read_adbc reads every batch and feeds an Ibex aggregation", "[adbc]")
     const std::string_view two_rows = "stmt.adbc.sqlite.query.batch_rows=2";
 
     SECTION("the chunked source yields one chunk per driver batch") {
-        auto source = s.function().chunked_table_func(
-            string_args({kSqliteDriver, db.path(), "select id from trades order by id", two_rows}));
+        auto source = s.function().chunked_table_func(string_args(
+            {sqlite_driver(), db.path(), "select id from trades order by id", two_rows}));
         INFO((source.has_value() ? std::string{} : source.error()));
         REQUIRE(source.has_value());
         std::vector<std::size_t> chunk_rows;
@@ -302,7 +345,7 @@ TEST_CASE("read_adbc keeps the schema of an empty result", "[adbc]") {
     }
 
     SECTION("the materialized path returns both columns") {
-        auto value = s.function().func(string_args({kSqliteDriver, db.path(), empty_sql}));
+        auto value = s.function().func(string_args({sqlite_driver(), db.path(), empty_sql}));
         INFO((value.has_value() ? std::string{} : value.error()));
         REQUIRE(value.has_value());
         const auto* table = std::get_if<ibex::runtime::Table>(&*value);
@@ -320,7 +363,7 @@ TEST_CASE("read_adbc materialized and chunked paths agree", "[adbc]") {
     seed_trades(s, db);
 
     auto value = s.function().func(
-        string_args({kSqliteDriver, db.path(), "select id from trades order by id",
+        string_args({sqlite_driver(), db.path(), "select id from trades order by id",
                      "stmt.adbc.sqlite.query.batch_rows=2"}));
     INFO((value.has_value() ? std::string{} : value.error()));
     REQUIRE(value.has_value());
@@ -438,7 +481,7 @@ TEST_CASE("read_adbc resolves a bare driver name through a manifest", "[adbc]") 
     AdbcSession s;
     seed_trades(s, db);
     const ManifestDir manifests;
-    manifests.add("ibex_test_sqlite", kSqliteDriver);
+    manifests.add("ibex_test_sqlite", sqlite_driver());
 
     SECTION("a manifest on ADBC_DRIVER_PATH names the driver") {
         const auto r = s.session.execute("read_adbc(\"ibex_test_sqlite\", " + ibex_str(db.path()) +

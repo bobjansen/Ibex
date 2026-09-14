@@ -1814,7 +1814,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             cc.codes[row] = cc.null_code;
                             continue;
                         }
-                        T key = col[row];
+                        const T key = col[row];
                         auto it = map.find(key);
                         std::uint32_t code{};
                         if (it == map.end()) {

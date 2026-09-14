@@ -15,7 +15,7 @@
 #include <optional>
 #include <ostream>
 #include <stdexcept>
-#include <stdlib.h>
+#include <stdlib.h>  // NOLINT(modernize-deprecated-headers): declares POSIX setenv.
 #include <string>
 #include <type_traits>
 #include <utility>

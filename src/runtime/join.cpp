@@ -1692,7 +1692,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             [&]<typename LeftTime, typename RightTime>(
                 const LeftTime* left_times,
                 const RightTime* right_times) -> std::expected<Table, std::string> {
-                const auto time_value = [](const auto& value) -> std::int64_t {
+                const auto time_value_to_int = [](const auto& value) -> std::int64_t {
                     using TimeT = std::decay_t<decltype(value)>;
                     if constexpr (std::is_same_v<TimeT, Timestamp>) {
                         return value.nanos;
@@ -1782,8 +1782,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                     // the entire right table and dominates the cost for large rights.
                     std::size_t pos = 0;  // # right rows with time <= current left time
                     for (std::size_t l = 0; l < n_left; ++l) {
-                        while (pos < n_right &&
-                               time_value(right_times[pos]) <= time_value(left_times[l])) {
+                        while (pos < n_right && time_value_to_int(right_times[pos]) <=
+                                                    time_value_to_int(left_times[l])) {
                             ++pos;
                         }
                         right_idx[l] = (pos == 0) ? kNull : pos - 1;
@@ -1833,8 +1833,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                                     const auto& rows = buckets[it->second];
                                     std::size_t& pos = cursor[it->second];
                                     while (pos < rows.size() &&
-                                           time_value(right_times[rows[pos]]) <=
-                                               time_value(left_times[l])) {
+                                           time_value_to_int(right_times[rows[pos]]) <=
+                                               time_value_to_int(left_times[l])) {
                                         ++pos;
                                     }
                                     right_idx[l] = (pos == 0) ? kNull : rows[pos - 1];
@@ -1887,8 +1887,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                         (void)inserted;
                         std::size_t& pos = pos_it->second;
                         const auto& rows = it->second;
-                        while (pos < rows.size() &&
-                               time_value(right_times[rows[pos]]) <= time_value(left_times[l])) {
+                        while (pos < rows.size() && time_value_to_int(right_times[rows[pos]]) <=
+                                                        time_value_to_int(left_times[l])) {
                             ++pos;
                         }
 

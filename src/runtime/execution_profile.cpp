@@ -349,7 +349,7 @@ ExecutionProfileState::~ExecutionProfileState() noexcept {
                 static_cast<double>(row->ring_wait_ns.load(std::memory_order_relaxed)) / 1.0e6,
                 static_cast<double>(row->pool_idle_ns.load(std::memory_order_relaxed)) / 1.0e6);
         }
-    } catch (...) {
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
         // Profiling is diagnostic-only; teardown must not terminate a query
         // because formatting or allocating its optional report failed.
     }

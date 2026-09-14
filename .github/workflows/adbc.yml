@@ -98,4 +98,5 @@ jobs:
             build/tools/*.dll
             build/tools/*.ibex
             scripts/install_adbc_driver.ps1
+            examples/adbc_postgresql/*
           if-no-files-found: error

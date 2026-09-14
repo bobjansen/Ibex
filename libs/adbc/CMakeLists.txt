@@ -74,6 +74,9 @@ else()
         CXX_VISIBILITY_PRESET hidden
         VISIBILITY_INLINES_HIDDEN ON
     )
+    # ADBC's own build uses C++17. Ibex sets its standard per target, and MSVC
+    # otherwise defaults to C++14 (no std::filesystem / std::string_view).
+    target_compile_features(ibex_adbc_driver_manager PRIVATE cxx_std_17)
     target_link_libraries(ibex_adbc_driver_manager PRIVATE ${CMAKE_DL_LIBS})
     if(WIN32)
         # As in ADBC's own build (cmake_modules/AdbcDefines.cmake).

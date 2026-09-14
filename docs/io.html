@@ -468,7 +468,10 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
           resolved through an ADBC driver manifest, or a path to the driver
           library. <code>scripts/install_adbc_driver.sh sqlite</code> installs
           Apache's SQLite driver (pinned and SHA-256 checked, no Python or
-          conda) and writes the manifest.
+          conda) and writes the manifest. On Windows, run
+          <code>powershell -ExecutionPolicy Bypass -File scripts\install_adbc_driver.ps1 sqlite</code>;
+          the bypass lasts for that one process and is needed because Windows
+          refuses unsigned scripts that came from a download.
         </p>
         <p>
           When using <code>import "adbc"</code> in the REPL, start Ibex with

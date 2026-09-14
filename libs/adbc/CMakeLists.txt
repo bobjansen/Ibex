@@ -76,6 +76,8 @@ else()
     )
     target_link_libraries(ibex_adbc_driver_manager PRIVATE ${CMAKE_DL_LIBS})
     if(WIN32)
+        # As in ADBC's own build (cmake_modules/AdbcDefines.cmake).
+        target_compile_definitions(ibex_adbc_driver_manager PRIVATE _CRT_SECURE_NO_WARNINGS)
         target_link_libraries(ibex_adbc_driver_manager PRIVATE advapi32 uuid shell32)
     endif()
     set(_ibex_adbc_include_dir "${_adbc_c}/include")

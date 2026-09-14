@@ -180,11 +180,15 @@ if(TARGET ibex_adbc_plugin AND ADBC_DRIVER_SQLITE_LIBRARY)
             Catch2::Catch2WithMain
             ibex_test_warning_suppressions
     )
+    # Forward slashes: the path becomes a C string literal and, inside the
+    # tests, an Ibex string literal -- a Windows backslash is an escape in both.
+    file(TO_CMAKE_PATH "${ADBC_DRIVER_SQLITE_LIBRARY}" _ibex_adbc_sqlite_driver)
     target_compile_definitions(ibex_adbc_tests
         PRIVATE
             IBEX_ADBC_PLUGIN_DIR="${IBEX_PLUGIN_OUTPUT_DIR}"
-            IBEX_ADBC_SQLITE_DRIVER="${ADBC_DRIVER_SQLITE_LIBRARY}"
+            IBEX_ADBC_SQLITE_DRIVER="${_ibex_adbc_sqlite_driver}"
     )
+    unset(_ibex_adbc_sqlite_driver)
     if(TARGET Ibex::Sanitizers)
         target_link_libraries(ibex_adbc_tests PRIVATE Ibex::Sanitizers)
     endif()

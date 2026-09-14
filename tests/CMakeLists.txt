@@ -7,6 +7,7 @@ add_library(ibex_test_warning_suppressions INTERFACE)
 
 set(IBEX_TEST_SOURCES
     catch_string_view_apple.cpp
+    test_adbc_options.cpp
     test_arrow_c_data.cpp
     test_args.cpp
     test_column.cpp
@@ -75,6 +76,8 @@ target_include_directories(ibex_tests PRIVATE
     # test_filter_range.cpp exercises the range-aware evaluators, which are
     # declared in the runtime's internal headers rather than the public API.
     "${PROJECT_SOURCE_DIR}/src/runtime"
+    # adbc_options.hpp is header-only and has no ADBC dependency.
+    "${PROJECT_SOURCE_DIR}/libs/adbc"
     "${PROJECT_SOURCE_DIR}/libs/args"
     "${PROJECT_SOURCE_DIR}/libs/csv"
     "${PROJECT_SOURCE_DIR}/libs/fs"
@@ -158,6 +161,40 @@ endif()
 
 if(IBEX_COVERAGE)
     ibex_add_coverage_target(ibex_tests)
+endif()
+
+# ADBC integration tests: load the built adbc plugin through `import "adbc"` and
+# read from a throwaway SQLite database. A separate executable so it exists only
+# when the plugin and a SQLite driver do. It deliberately does NOT link the
+# driver manager: that would put the driver's environment (e.g. a conda lib/
+# with its own libreadline) on this binary's RPATH, ahead of system libraries.
+if(TARGET ibex_adbc_plugin AND ADBC_DRIVER_SQLITE_LIBRARY)
+    add_executable(ibex_adbc_tests test_adbc.cpp)
+    add_dependencies(ibex_adbc_tests ibex_adbc_plugin)
+    target_link_libraries(ibex_adbc_tests
+        PRIVATE
+            Ibex::core
+            Ibex::runtime
+            Ibex::repl
+            Ibex::CompilerOptions
+            Catch2::Catch2WithMain
+            ibex_test_warning_suppressions
+    )
+    target_compile_definitions(ibex_adbc_tests
+        PRIVATE
+            IBEX_ADBC_PLUGIN_DIR="${IBEX_PLUGIN_OUTPUT_DIR}"
+            IBEX_ADBC_SQLITE_DRIVER="${ADBC_DRIVER_SQLITE_LIBRARY}"
+    )
+    if(TARGET Ibex::Sanitizers)
+        target_link_libraries(ibex_adbc_tests PRIVATE Ibex::Sanitizers)
+    endif()
+    if(IBEX_TARGETS_X86 AND IBEX_HAS_AVX2 AND NOT MSVC)
+        target_compile_options(ibex_adbc_tests PRIVATE -mavx2 -mfma)
+    endif()
+    # Prefixed so `ctest -R '^adbc:'` selects exactly these, without also
+    # matching ibex_tests cases such as the options-grammar tests. (No space
+    # after the colon: discovery drops it.)
+    catch_discover_tests(ibex_adbc_tests TEST_PREFIX "adbc:")
 endif()
 
 if(TARGET ibex_eval_bin AND TARGET ibex_compile_bin AND NOT WIN32)

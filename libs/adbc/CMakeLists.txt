@@ -28,6 +28,17 @@ if(NOT ADBC_INCLUDE_DIR OR NOT ADBC_DRIVER_MANAGER_LIBRARY)
     )
 endif()
 
+# The SQLite driver is only needed by the integration tests (tests/test_adbc.cpp);
+# the plugin itself loads whichever driver a script names at run time.
+find_library(ADBC_DRIVER_SQLITE_LIBRARY
+    NAMES adbc_driver_sqlite libadbc_driver_sqlite
+    HINTS ${_ibex_adbc_prefix_hints}
+    PATH_SUFFIXES lib
+)
+if(NOT ADBC_DRIVER_SQLITE_LIBRARY)
+    message(STATUS "ADBC SQLite driver not found; ADBC integration tests are disabled")
+endif()
+
 unset(_ibex_adbc_prefix_hints)
 
 set_target_properties(ibex_adbc_plugin PROPERTIES

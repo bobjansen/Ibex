@@ -3,16 +3,19 @@
 // Usage:
 //   import "adbc";
 //
-// After importing, the following functions are available without any
+// After importing, the following function is available without any
 // explicit `extern fn` declaration in the script:
-//   read_adbc(driver: String, uri: String, sql: String) -> DataFrame
-//   read_adbc(driver: String, uri: String, sql: String, options: String) -> DataFrame
+//   read_adbc(driver: String, uri: String, sql: String, options: String = "") -> DataFrame
 //
 // The optional `options` string is a `;` or newline separated list of
 // `key=value` entries. Prefix keys with `db.`, `conn.`, or `stmt.` to
-// target database, connection, or statement options; use `entrypoint=...`
-// to override the driver entrypoint symbol.
+// target database, connection, or statement options; `conn.post.` sets a
+// connection option after the connection is initialized. Use
+// `entrypoint=...` to override the driver entrypoint symbol. A backslash
+// escapes `;`, `=` and `\` inside keys and values.
+//
+// A single declaration with a default: extern declarations are keyed by name,
+// so a second overload would replace the first rather than add to it.
 
-extern fn read_adbc(driver: String, uri: String, sql: String) -> DataFrame from "adbc.hpp";
-extern fn read_adbc(driver: String, uri: String, sql: String, options: String)
+extern fn read_adbc(driver: String, uri: String, sql: String, options: String = "")
     -> DataFrame from "adbc.hpp";

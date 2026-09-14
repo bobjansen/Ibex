@@ -19,7 +19,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <optional>
 #include <string>
@@ -342,5 +344,70 @@ TEST_CASE("read_adbc reports errors instead of failing silently", "[adbc]") {
         INFO(r.error);
         REQUIRE(r.ok);
         CHECK(ints(*r.table, "n") == std::vector<std::int64_t>{5});
+    }
+}
+
+namespace {
+
+/// A throwaway ADBC_DRIVER_PATH directory; restores the previous value on exit.
+class ManifestDir {
+   public:
+    ManifestDir() {
+        dir_ = stdfs::temp_directory_path() / ("ibex_adbc_manifests_" + std::to_string(getpid()));
+        stdfs::create_directories(dir_);
+        if (const char* old = std::getenv("ADBC_DRIVER_PATH")) {
+            previous_ = old;
+        }
+        setenv("ADBC_DRIVER_PATH", dir_.c_str(), 1);
+    }
+    ~ManifestDir() {
+        if (previous_.has_value()) {
+            setenv("ADBC_DRIVER_PATH", previous_->c_str(), 1);
+        } else {
+            unsetenv("ADBC_DRIVER_PATH");
+        }
+        std::error_code ec;
+        stdfs::remove_all(dir_, ec);
+    }
+    ManifestDir(const ManifestDir&) = delete;
+    ManifestDir& operator=(const ManifestDir&) = delete;
+    ManifestDir(ManifestDir&&) = delete;
+    ManifestDir& operator=(ManifestDir&&) = delete;
+
+    /// Write `<name>.toml` pointing at `library` (single-path form: any platform).
+    void add(std::string_view name, std::string_view library) const {
+        std::ofstream manifest(dir_ / (std::string(name) + ".toml"));
+        manifest << "manifest_version = 1\n"
+                 << "name = 'Ibex test driver'\n\n"
+                 << "[Driver]\n"
+                 << "shared = '" << library << "'\n";
+    }
+
+   private:
+    stdfs::path dir_;
+    std::optional<std::string> previous_;
+};
+
+}  // namespace
+
+TEST_CASE("read_adbc resolves a bare driver name through a manifest", "[adbc]") {
+    SqliteDb db;
+    AdbcSession s;
+    seed_trades(s, db);
+    const ManifestDir manifests;
+    manifests.add("ibex_test_sqlite", kSqliteDriver);
+
+    SECTION("a manifest on ADBC_DRIVER_PATH names the driver") {
+        const auto r = s.session.execute("read_adbc(\"ibex_test_sqlite\", " + ibex_str(db.path()) +
+                                         ", \"select count(*) as n from trades\");");
+        INFO(r.error);
+        REQUIRE(r.ok);
+        CHECK(ints(*r.table, "n") == std::vector<std::int64_t>{5});
+    }
+    SECTION("an unknown name fails and says which name") {
+        const auto r = s.session.execute("read_adbc(\"ibex_no_such_driver\", " +
+                                         ibex_str(db.path()) + ", \"select 1\");");
+        CHECK_FALSE(r.ok);
+        CHECK(contains(r.error, "ibex_no_such_driver"));
     }
 }

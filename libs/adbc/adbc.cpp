@@ -15,6 +15,7 @@
 #include <ibex/runtime/operator.hpp>
 
 #include <arrow-adbc/adbc.h>
+#include <arrow-adbc/adbc_driver_manager.h>
 #include <cstdint>
 #include <cstring>
 #include <expected>
@@ -202,6 +203,16 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
         // From here on the database must be released on every exit path,
         // including a rejected option below.
         database_acquired_ = true;
+
+        // Let a bare driver name ("sqlite") resolve through driver manifests,
+        // as installed by dbc or conda: ADBC_DRIVER_PATH, $CONDA_PREFIX,
+        // ~/.config/adbc/drivers, /etc/adbc/drivers. Paths still load as-is.
+        status = call_adbc("AdbcDriverManagerDatabaseSetLoadFlags", [&](AdbcError* error) {
+            return AdbcDriverManagerDatabaseSetLoadFlags(&database_, ADBC_LOAD_FLAG_DEFAULT, error);
+        });
+        if (!status) {
+            return status;
+        }
 
         status = call_adbc("AdbcDatabaseSetOption(driver)", [&](AdbcError* error) {
             return AdbcDatabaseSetOption(&database_, "driver", driver.c_str(), error);

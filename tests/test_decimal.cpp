@@ -7,6 +7,7 @@
 
 #include <compare>
 #include <cstdint>
+#include <limits>
 #include <string>
 
 using ibex::DecimalType;
@@ -181,7 +182,14 @@ TEST_CASE("decimal numeric conversions", "[decimal]") {
     d = dec::from_double(2.675, DecimalType{.precision = 10, .scale = 2});
     REQUIRE(d.has_value());
     CHECK(*d == 268);  // text "2.675" rounds half away, though the double is 2.67499...
-    CHECK_FALSE(dec::from_double(0.0 / 0.0, DecimalType{}).has_value());
+    // numeric_limits rather than `0.0 / 0.0`: MSVC rejects a constant division
+    // by zero (C2124).
+    CHECK_FALSE(
+        dec::from_double(std::numeric_limits<double>::quiet_NaN(), DecimalType{}).has_value());
+    CHECK_FALSE(
+        dec::from_double(std::numeric_limits<double>::infinity(), DecimalType{}).has_value());
+    CHECK_FALSE(
+        dec::from_double(-std::numeric_limits<double>::infinity(), DecimalType{}).has_value());
     CHECK_FALSE(dec::from_double(1e40, DecimalType{}).has_value());
 
     auto lit = dec::literal_from_double(10.5);

@@ -8,6 +8,7 @@
 // runtime_entry.cpp (formerly chunked.cpp); declared in interpreter_internal.hpp.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -52,7 +53,10 @@ auto compare_scalar_for_order(const ScalarValue& lhs, const ScalarValue& rhs) ->
         [](const auto& l, const auto& r) -> int {
             using L = std::decay_t<decltype(l)>;
             using R = std::decay_t<decltype(r)>;
-            if constexpr (std::is_same_v<L, R>) {
+            if constexpr (std::is_same_v<L, R> && std::is_same_v<L, DecimalValue>) {
+                const auto ord = decimal::compare(l, r);
+                return ord < 0 ? -1 : (ord > 0 ? 1 : 0);
+            } else if constexpr (std::is_same_v<L, R>) {
                 if (l < r) {
                     return -1;
                 }
@@ -151,6 +155,9 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
                     fc.u64.reserve(rows);
                     for (std::size_t i = 0; i < rows; ++i)
                         fc.u64.push_back(static_cast<std::uint64_t>(col[i] ? 1 : 0) ^ kSignFlip);
+                } else if constexpr (std::is_same_v<ColT, Column<Decimal>>) {
+                    fc.kind = FlatKind::I64;
+                    fc.u64 = decimal_order_keys(col, rows);
                 } else {
                     // Column<std::string> or categorical: view, no allocation.
                     fc.kind = FlatKind::Str;

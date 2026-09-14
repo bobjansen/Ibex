@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 
 #include <cstddef>
@@ -24,11 +25,16 @@ enum class ScalarType : std::uint8_t {
     String,
     Date,
     Timestamp,
+    /// `Decimal(p, s)`; the parameters are carried beside the type
+    /// (`SchemaField::decimal`, `Type::decimal`).
+    Decimal,
 };
 
 struct SchemaField {
     std::string name;
     ScalarType type = ScalarType::Int64;
+    /// Set exactly when `type` is `Decimal`.
+    std::optional<DecimalType> decimal = std::nullopt;
 };
 
 struct SchemaType {
@@ -54,6 +60,8 @@ struct Type {
 
     Kind kind = Kind::Scalar;
     TypeArg arg = ScalarType::Int64;
+    /// Set exactly when `arg` is `ScalarType::Decimal`.
+    std::optional<DecimalType> decimal = std::nullopt;
 };
 
 struct Param {
@@ -95,7 +103,9 @@ struct IdentifierExpr {
 };
 
 struct LiteralExpr {
-    std::variant<std::int64_t, double, bool, std::string, DurationLiteral, Date, Timestamp> value;
+    std::variant<std::int64_t, double, bool, std::string, DurationLiteral, Date, Timestamp,
+                 DecimalValue>
+        value;
 };
 
 struct CaseArm {

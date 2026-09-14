@@ -1,0 +1,8 @@
+let t = Table {
+    acct = ["a", "b", "a", "b", "a"],
+    amt = [decimal"0.10", decimal"5.00", decimal"0.20", decimal"-5.00", decimal"1.005"],
+    qty = [1, 2, 3, 4, 5],
+};
+let priced = t[filter amt > decimal"-1.00" && amt < 100.5,
+               update { line = amt * qty, fee = Decimal(amt * decimal"0.0725", 12, 2) }];
+priced[select { total = sum(line), fees = sum(fee), lo = min(amt), n = count() }, by acct][order acct];

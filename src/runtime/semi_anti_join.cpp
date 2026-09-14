@@ -11,6 +11,7 @@
 // (`is_streamable_semi_anti_join`).
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -77,6 +78,9 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             while (swapped_next_ < left_buffered_.size()) {
                 auto filtered = filter_chunk(std::move(left_buffered_[swapped_next_++]));
                 if (!filtered.has_value()) {
+                    if (probe_error_.has_value()) {
+                        return std::unexpected(*probe_error_);
+                    }
                     continue;
                 }
                 return std::optional<Chunk>{table_to_chunk(std::move(*filtered))};
@@ -97,6 +101,11 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             Table t = chunk_to_table(std::move(*chunk_res.value()));
             auto filtered = filter_chunk(std::move(t));
             if (!filtered.has_value()) {
+                // `nullopt` alone means "no rows survive this chunk"; an error
+                // must not be mistaken for that and silently drop the rows.
+                if (probe_error_.has_value()) {
+                    return std::unexpected(*probe_error_);
+                }
                 continue;
             }
             return std::optional<Chunk>{table_to_chunk(std::move(*filtered))};
@@ -568,6 +577,17 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 });
             return std::nullopt;
         }
+        if (const auto* first_dec = std::get_if<Column<Decimal>>(&key)) {
+            // Units are value identity at one scale; the probe refuses a left
+            // key at another scale rather than match the wrong numbers.
+            right_kind_ = ExprType::Decimal;
+            right_decimal_type_ = decimal_type_of(*first_dec);
+            insert_all.template operator()<Decimal>(
+                [&](const Column<Decimal>& col, std::size_t row) {
+                    right_decimal_.insert(col[row]);
+                });
+            return std::nullopt;
+        }
         if (const auto* first_cat = std::get_if<Column<Categorical>>(&key)) {
             right_kind_ = ExprType::String;
             // A code only means anything against the dictionary it was built
@@ -840,6 +860,26 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 return keep_matches ? match : !match;
             });
         }
+        if (right_kind_ == ExprType::Decimal) {
+            const auto* col = std::get_if<Column<Decimal>>(key);
+            if (col == nullptr) {
+                return std::nullopt;
+            }
+            const DecimalType left_type = decimal_type_of(*col);
+            if (left_type.scale != right_decimal_type_.scale) {
+                probe_error_ = "join key scale mismatch: left '" + keys_->front().left + "' is " +
+                               decimal::type_name(left_type) + " but right '" +
+                               keys_->front().right + "' is " +
+                               decimal::type_name(right_decimal_type_) +
+                               "; cast one side to the other's scale with Decimal(x, precision, "
+                               "scale)";
+                return std::nullopt;
+            }
+            return filter_rows(std::move(t), [&](std::size_t row) {
+                const bool match = !probe_is_null(row) && right_decimal_.contains((*col)[row]);
+                return keep_matches ? match : !match;
+            });
+        }
 
         if (const auto* col = std::get_if<Column<Categorical>>(key);
             col != nullptr &&
@@ -916,6 +956,13 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     robin_hood::unordered_flat_set<bool> right_bool_;
     robin_hood::unordered_flat_set<Date> right_date_;
     robin_hood::unordered_flat_set<Timestamp> right_timestamp_;
+    /// Decimal right keys by units, valid only at `right_decimal_type_.scale`.
+    robin_hood::unordered_flat_set<Decimal> right_decimal_;
+    DecimalType right_decimal_type_{};
+    /// Set by `filter_chunk` when a chunk cannot be probed (a Decimal key at
+    /// another scale). Its `nullopt` alone means "no rows survive", so the
+    /// callers check this first rather than silently dropping the chunk.
+    std::optional<std::string> probe_error_;
     robin_hood::unordered_flat_set<Column<Categorical>::code_type> right_cat_codes_;
     robin_hood::unordered_flat_set<std::string_view, StringViewHash, StringViewEq> right_strings_;
     std::deque<std::string> owned_strings_;

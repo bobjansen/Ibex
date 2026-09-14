@@ -89,8 +89,10 @@ auto release_arrow_stream(ArrowArrayStream* stream) noexcept -> void;
 /// Import an Arrow C Data struct array plus schema as an Ibex table.
 ///
 /// The importer currently supports the Arrow layouts Ibex exports itself:
-/// int64, double, bool, utf8, dictionary-encoded utf8 categoricals, Date, and
-/// Timestamp, plus top-level table metadata for time index and ordering.
+/// int64, double, bool, utf8, dictionary-encoded utf8 categoricals, Date,
+/// Timestamp, and decimal128 (`d:p,s`), plus top-level table metadata for time
+/// index and ordering. decimal32/64 widen on import; decimal256, precision
+/// above 38 and negative scales are refused with an error naming the type.
 ///
 /// This overload borrows the Arrow descriptors and copies every column.
 [[nodiscard]] auto import_table_from_arrow(const ArrowArray& array, const ArrowSchema& schema)

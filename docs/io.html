@@ -245,7 +245,12 @@
 
 <span class="cm">// named schema</span>
 <span class="kw">let</span> typed = <span class="fn-name">read_csv</span>(<span class="str">"trades.csv"</span>, <span class="str">""</span>, <span class="str">","</span>, <span class="kw">true</span>,
-                          <span class="str">"symbol:cat,price:f64,size:i64"</span>);</code></pre>
+                          <span class="str">"symbol:cat,price:f64,size:i64"</span>);
+
+<span class="cm">// exact decimals: parsed straight to Decimal(12, 2), never through a double;</span>
+<span class="cm">// extra fractional digits round half away from zero, too many digits is an error</span>
+<span class="kw">let</span> ledger = <span class="fn-name">read_csv</span>(<span class="str">"ledger.csv"</span>, <span class="str">""</span>, <span class="str">","</span>, <span class="kw">true</span>,
+                           <span class="str">"account:str,amount:decimal(12,2)"</span>);</code></pre>
     </article>
   </section>
 
@@ -438,7 +443,11 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
         <p>
           <code>write_parquet</code> returns the number of rows written. String
           and categorical columns are stored as UTF-8. Dates and timestamps are
-          preserved as typed Parquet columns.
+          preserved as typed Parquet columns, and <code>Decimal(p,&nbsp;s)</code>
+          columns are written as Parquet <code>DECIMAL</code> with their precision
+          and scale, so the values read back exactly. Reading accepts every
+          physical encoding of a Parquet decimal up to 38 digits; a wider
+          (Decimal256) column is refused by name rather than approximated.
         </p>
 <pre><code><span class="kw">import</span> <span class="str">"parquet"</span>;
 

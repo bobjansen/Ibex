@@ -8,6 +8,7 @@
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/core/time_zone.hpp>
 #include <ibex/ir/expr_predicates.hpp>
@@ -48,6 +49,7 @@
 #include <immintrin.h>
 #endif
 
+#include "decimal_ops.hpp"
 #include "interpreter_internal.hpp"
 #include "runtime_internal.hpp"
 
@@ -125,6 +127,9 @@ auto expr_value_to_double(const ExprValue& v) -> std::optional<double> {
     if (const auto* d = std::get_if<double>(&v)) {
         return *d;
     }
+    if (const auto* dv = std::get_if<DecimalValue>(&v)) {
+        return decimal::to_double(dv->units, dv->type.scale);
+    }
     if (const auto* s = std::get_if<std::string>(&v)) {
         return parse_string_as_double(*s);
     }
@@ -153,6 +158,9 @@ auto expr_value_to_string(const ExprValue& v) -> std::string {
     }
     if (const auto* ts = std::get_if<Timestamp>(&v)) {
         return format_timestamp(*ts);
+    }
+    if (const auto* dv = std::get_if<DecimalValue>(&v)) {
+        return decimal::to_string(*dv);
     }
     return "null";  // Null — matches the table display of a missing cell
 }
@@ -312,7 +320,7 @@ auto eval_in_timezone(const ir::CallExpr& call, const Table& input)
         return std::unexpected(args.error());
     }
     Column<Timestamp> out = *args->stamps;
-    out.set_meta(ColumnMeta{.zone = intern_zone(*args->zone_text)});
+    out.set_meta(ColumnMeta{.zone = intern_zone(*args->zone_text), .decimal = std::nullopt});
     return ComputedColumn{.column = ColumnValue{std::move(out)}, .validity = args->entry->validity};
 }
 
@@ -418,7 +426,7 @@ auto eval_with_timezone(const ir::CallExpr& call, const Table& input)
         }
 #endif
     }
-    out.set_meta(ColumnMeta{.zone = intern_zone(*zone_text)});
+    out.set_meta(ColumnMeta{.zone = intern_zone(*zone_text), .decimal = std::nullopt});
 
     return ComputedColumn{.column = ColumnValue{std::move(out)}, .validity = std::move(validity)};
 }
@@ -673,9 +681,40 @@ auto numeric_cast_kernel(const ir::CallExpr& call, const Table& input, std::size
             return ComputedColumn{.column = ColumnValue{std::move(out)},
                                   .validity = std::move(out_validity)};
         }
+        if (const auto* decs = std::get_if<Column<Decimal>>(&col)) {
+            const int scale = decimal_type_of(*decs).scale;
+            Column<std::int64_t> out;
+            out.resize(rows);
+            auto* op = out.data();
+            for (std::size_t i = 0; i < rows; ++i) {
+                if (validity != nullptr && !(*validity)[i]) {
+                    op[i] = 0;
+                    continue;
+                }
+                auto whole = decimal::to_int64((*decs)[i].units, scale);
+                if (!whole) {
+                    return std::unexpected(call.callee + "(): " + whole.error() +
+                                           " (use Decimal(x, p, 0) to round first)");
+                }
+                op[i] = *whole;
+            }
+            return ComputedColumn{.column = ColumnValue{std::move(out)},
+                                  .validity = std::move(out_validity)};
+        }
         return std::unexpected(call.callee + "(): cannot cast non-numeric to Int");
     }
 
+    if (const auto* decs = std::get_if<Column<Decimal>>(&col)) {
+        const int scale = decimal_type_of(*decs).scale;
+        Column<double> out;
+        out.resize(rows);
+        auto* op = out.data();
+        for (std::size_t i = 0; i < rows; ++i) {
+            op[i] = decimal::to_double((*decs)[i].units, scale);
+        }
+        return ComputedColumn{.column = ColumnValue{std::move(out)},
+                              .validity = std::move(out_validity)};
+    }
     if (const auto* dbls = std::get_if<Column<double>>(&col)) {
         return ComputedColumn{.column = *dbls, .validity = std::move(out_validity)};
     }
@@ -1050,12 +1089,16 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
             .max_args = 1,
             .scalar_kernel = ScalarKernel::NumericCast,
             .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
-                if (a[0] == ExprType::Int || a[0] == ExprType::Double || a[0] == ExprType::String) {
+                if (a[0] == ExprType::Int || a[0] == ExprType::Double || a[0] == ExprType::String ||
+                    a[0] == ExprType::Decimal) {
                     return ExprType::Double;
                 }
                 return std::unexpected(std::string(name) + "(): cannot cast non-numeric to Float");
             },
             .exec = ScalarExec{.eval = [](std::string_view, const std::vector<ExprValue>& a) -> IV {
+                if (const auto* dv = std::get_if<DecimalValue>(a.data())) {
+                    return ExprValue{decimal::to_double(dv->units, dv->type.scale)};
+                }
                 if (const auto* s = std::get_if<std::string>(a.data())) {
                     if (auto d = parse_string_as_double(*s)) {
                         return ExprValue{*d};
@@ -1083,7 +1126,7 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                 // predicate (`sum(Int64(is_not_null(x)))`, which is what
                 // `count(x)` lowers to).
                 if (a[0] == ExprType::Int || a[0] == ExprType::Double || a[0] == ExprType::Bool ||
-                    a[0] == ExprType::String) {
+                    a[0] == ExprType::String || a[0] == ExprType::Decimal) {
                     return ExprType::Int;
                 }
                 return std::unexpected(std::string(name) + "(): cannot cast non-numeric to Int");
@@ -1092,6 +1135,14 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                                           const std::vector<ExprValue>& a) -> IV {
                 if (const auto* i = std::get_if<std::int64_t>(a.data())) {
                     return ExprValue{*i};
+                }
+                if (const auto* dv = std::get_if<DecimalValue>(a.data())) {
+                    auto whole = decimal::to_int64(dv->units, dv->type.scale);
+                    if (!whole) {
+                        return std::unexpected(std::string(name) + "(): " + whole.error() +
+                                               " (use Decimal(x, p, 0) to round first)");
+                    }
+                    return ExprValue{*whole};
                 }
                 if (const auto* b = std::get_if<bool>(a.data())) {
                     return ExprValue{static_cast<std::int64_t>(*b ? 1 : 0)};
@@ -1117,6 +1168,58 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
         m.emplace("Int64", to_int);
         m.emplace("Int32", to_int);
         m.emplace("Int", to_int);
+
+        // Decimal(x, precision, scale): Int (exact), Decimal (rescaled, half
+        // away from zero), String (exact parse), or Float64 (its shortest
+        // round-trip text) -> Decimal(p, s). The parser guarantees p and s
+        // are valid integer literals; infer_decimal_type reads them.
+        m.emplace(
+            "Decimal",
+            BuiltinFn{
+                .min_args = 3,
+                .max_args = 3,
+                .infer = [](std::string_view, const std::vector<ExprType>& a) -> IT {
+                    if (a[1] != ExprType::Int || a[2] != ExprType::Int) {
+                        return std::unexpected(
+                            "Decimal(x, precision, scale): precision and scale must be integers");
+                    }
+                    if (a[0] == ExprType::Int || a[0] == ExprType::Double ||
+                        a[0] == ExprType::String || a[0] == ExprType::Decimal) {
+                        return ExprType::Decimal;
+                    }
+                    return std::unexpected(
+                        "Decimal(): cannot cast to Decimal (expected Int, Float, String, or "
+                        "Decimal)");
+                },
+                .exec =
+                    ScalarExec{.eval = [](std::string_view, const std::vector<ExprValue>& a) -> IV {
+                        const auto* p = std::get_if<std::int64_t>(&a[1]);
+                        const auto* s = std::get_if<std::int64_t>(&a[2]);
+                        if (p == nullptr || s == nullptr || *p < 1 || *p > decimal::kMaxPrecision ||
+                            *s < 0 || *s > *p) {
+                            return std::unexpected("Decimal(x, precision, scale): invalid type");
+                        }
+                        const DecimalType t{.precision = static_cast<std::uint8_t>(*p),
+                                            .scale = static_cast<std::uint8_t>(*s)};
+                        std::expected<Int128, std::string> units =
+                            std::unexpected("Decimal(): cannot cast to Decimal");
+                        if (const auto* str = std::get_if<std::string>(a.data())) {
+                            units = decimal::parse(*str, t);
+                            if (!units) {
+                                return std::unexpected("Decimal(): cannot parse '" + *str +
+                                                       "': " + units.error());
+                            }
+                        } else if (const auto* f = std::get_if<double>(a.data())) {
+                            units = decimal::from_double(*f, t);
+                        } else {
+                            units = fit_decimal(a[0], t);
+                        }
+                        if (!units) {
+                            return std::unexpected("Decimal(): " + units.error());
+                        }
+                        return ExprValue{DecimalValue{.units = *units, .type = t}};
+                    }},
+            });
 
         // year / month / day / hour / minute / second: Date|Timestamp -> Int.
         const BuiltinFn date_part{
@@ -1909,6 +2012,8 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
                     return ExprType::Date;
                 } else if constexpr (std::is_same_v<T, Timestamp>) {
                     return ExprType::Timestamp;
+                } else if constexpr (std::is_same_v<T, DecimalValue>) {
+                    return ExprType::Decimal;
                 } else {
                     static_assert(std::is_same_v<T, std::string>);
                     return ExprType::String;
@@ -1924,6 +2029,32 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
         auto right = infer_expr_type(*bin->right, input, scalars, externs);
         if (!right) {
             return right;
+        }
+        if (left.value() == ExprType::Decimal || right.value() == ExprType::Decimal) {
+            // A decimal meets only exact operands: another decimal, an Int64
+            // (exactly Decimal(19, 0)), or a float *literal*, read back from
+            // its text. A Float64 column is rejected rather than silently
+            // rounding every exact value it touches.
+            const bool left_dec = left.value() == ExprType::Decimal;
+            const ExprType other = left_dec ? right.value() : left.value();
+            const ir::Expr& other_expr = left_dec ? *bin->right : *bin->left;
+            const bool exact_other = other == ExprType::Decimal || other == ExprType::Int ||
+                                     (other == ExprType::Double && is_float_literal(other_expr));
+            if (!exact_other) {
+                return std::unexpected(
+                    other == ExprType::Double
+                        ? "cannot mix Decimal and Float64 in arithmetic; convert one side "
+                          "explicitly with Decimal(x, precision, scale) or Float64(x)"
+                        : "Decimal arithmetic needs Decimal or Int64 operands");
+            }
+            if (bin->op == ir::ArithmeticOp::Div) {
+                return ExprType::Double;
+            }
+            auto type = infer_decimal_type(expr, input, scalars);
+            if (!type) {
+                return std::unexpected(type.error());
+            }
+            return ExprType::Decimal;
         }
         if (left.value() == ExprType::String || right.value() == ExprType::String ||
             left.value() == ExprType::Categorical || right.value() == ExprType::Categorical) {
@@ -2088,9 +2219,106 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
                 return ExprType::Date;
             case ScalarKind::Timestamp:
                 return ExprType::Timestamp;
+            case ScalarKind::Decimal:
+                return ExprType::Decimal;
         }
     }
     return std::unexpected("unsupported expression");
+}
+
+auto infer_decimal_type(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars)
+    -> std::expected<DecimalType, std::string> {
+    if (const auto* col = std::get_if<ir::ColumnRef>(&expr.node)) {
+        if (const auto* source = col->lexical ? nullptr : input.find(col->name)) {
+            if (const auto* d = std::get_if<Column<Decimal>>(source)) {
+                return decimal_type_of(*d);
+            }
+            if (std::holds_alternative<Column<std::int64_t>>(*source)) {
+                return decimal::kInt64Type;
+            }
+            return std::unexpected("column '" + col->name + "' is not Decimal");
+        }
+        if (scalars != nullptr) {
+            if (auto it = scalars->find(col->name); it != scalars->end()) {
+                if (const auto* d = std::get_if<DecimalValue>(&it->second)) {
+                    return d->type;
+                }
+                if (std::holds_alternative<std::int64_t>(it->second)) {
+                    return decimal::kInt64Type;
+                }
+            }
+        }
+        return std::unexpected("'" + col->name + "' is not Decimal");
+    }
+    if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
+        if (const auto* d = std::get_if<DecimalValue>(&lit->value)) {
+            return d->type;
+        }
+        if (std::holds_alternative<std::int64_t>(lit->value)) {
+            return decimal::kInt64Type;
+        }
+        if (const auto* f = std::get_if<double>(&lit->value)) {
+            auto v = decimal::literal_from_double(*f);
+            if (!v) {
+                return std::unexpected(v.error());
+            }
+            return v->type;
+        }
+        return std::unexpected("literal is not Decimal");
+    }
+    if (const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node)) {
+        auto left = infer_decimal_type(*bin->left, input, scalars);
+        if (!left) {
+            return left;
+        }
+        auto right = infer_decimal_type(*bin->right, input, scalars);
+        if (!right) {
+            return right;
+        }
+        return decimal_arith_type(bin->op, *left, *right);
+    }
+    if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
+        if (call->callee == "Decimal" && call->args.size() == 3) {
+            const auto* p = std::get_if<ir::Literal>(&call->args[1]->node);
+            const auto* s = std::get_if<ir::Literal>(&call->args[2]->node);
+            const auto* pi = p != nullptr ? std::get_if<std::int64_t>(&p->value) : nullptr;
+            const auto* si = s != nullptr ? std::get_if<std::int64_t>(&s->value) : nullptr;
+            if (pi == nullptr || si == nullptr) {
+                return std::unexpected(
+                    "Decimal(x, precision, scale): precision and scale must "
+                    "be integer literals");
+            }
+            const DecimalType t{.precision = static_cast<std::uint8_t>(*pi),
+                                .scale = static_cast<std::uint8_t>(*si)};
+            if (*pi < 1 || *pi > decimal::kMaxPrecision || *si < 0 || *si > *pi) {
+                return std::unexpected("unsupported " + decimal::type_name(t));
+            }
+            return t;
+        }
+        // CASE arms and coalesce arguments: the narrowest type holding every
+        // non-NULL alternative exactly.
+        if (call->callee == "__case" || call->callee == "coalesce") {
+            std::optional<DecimalType> result;
+            for (std::size_t i = 0; i < call->args.size(); ++i) {
+                if (call->callee == "__case" && i + 1 < call->args.size() && i % 2 == 0) {
+                    continue;  // a condition, not a value arm
+                }
+                const auto* null_arm = std::get_if<ir::CallExpr>(&call->args[i]->node);
+                if (null_arm != nullptr && null_arm->callee == "__null") {
+                    continue;
+                }
+                auto t = infer_decimal_type(*call->args[i], input, scalars);
+                if (!t) {
+                    return t;
+                }
+                result = result.has_value() ? decimal::union_type(*result, *t) : *t;
+            }
+            if (result.has_value()) {
+                return *result;
+            }
+        }
+    }
+    return std::unexpected("cannot determine the Decimal precision and scale of this expression");
 }
 
 auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
@@ -2122,6 +2350,9 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
                 if constexpr (std::is_same_v<ColType, Column<Categorical>> ||
                               std::is_same_v<ColType, Column<std::string>>) {
                     return std::string(column[row]);
+                } else if constexpr (std::is_same_v<ColType, Column<Decimal>>) {
+                    return DecimalValue{.units = column[row].units,
+                                        .type = decimal_type_of(column)};
                 } else {
                     return column[row];
                 }
@@ -2144,6 +2375,10 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
         if (std::holds_alternative<Null>(left.value()) ||
             std::holds_alternative<Null>(right.value())) {
             return ExprValue{Null{}};
+        }
+        if (std::holds_alternative<DecimalValue>(left.value()) ||
+            std::holds_alternative<DecimalValue>(right.value())) {
+            return decimal_arith(bin->op, left.value(), right.value());
         }
         if (std::holds_alternative<std::string>(left.value()) ||
             std::holds_alternative<std::string>(right.value())) {
@@ -2412,7 +2647,27 @@ auto evaluate_field(const ir::Expr& expr, const Table& input, RowRange range,
     // Validity-/boolean-aware fields (comparisons, logical, is_null) and
     // nested whole-column calls cannot be built per row. Evaluate them
     // through the vectorized, validity-aware path.
-    if (field_uses_vectorized_eval(expr)) {
+    // Decimal arithmetic has a vectorized, validity-aware kernel
+    // (`decimal_arith_columns`) but no fused numeric tree, so without this it
+    // fell to the per-row loop below -- ~150x an Int64 multiply, boxing every
+    // value in a variant. Only BinaryExpr roots: they always yield an owned
+    // dense column, never the borrowed leaf the branch below rejects.
+    const auto decimal_arith_root = [&] {
+        const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node);
+        if (bin == nullptr) {
+            return false;
+        }
+        if (inferred.value() == ExprType::Decimal) {
+            return true;
+        }
+        const auto is_decimal = [&](const ir::Expr& side) {
+            auto t = infer_expr_type(side, input, ctx.scalars, ctx.externs);
+            return t.has_value() && *t == ExprType::Decimal;
+        };
+        return bin->op == ir::ArithmeticOp::Div &&
+               (is_decimal(*bin->left) || is_decimal(*bin->right));
+    };
+    if (field_uses_vectorized_eval(expr) || decimal_arith_root()) {
         auto res = eval_value_vec(expr, input, ctx.scalars, range, ctx.window, ctx.window_aligned);
         if (!res) {
             return std::unexpected(res.error());
@@ -2471,6 +2726,14 @@ auto evaluate_field(const ir::Expr& expr, const Table& input, RowRange range,
         case ExprType::Timestamp:
             new_column = Column<Timestamp>{};
             break;
+        case ExprType::Decimal: {
+            auto type = infer_decimal_type(expr, input, ctx.scalars);
+            if (!type) {
+                return std::unexpected(type.error());
+            }
+            new_column = make_decimal_column(*type);
+            break;
+        }
     }
     std::visit([&](auto& col) { col.reserve(rows); }, new_column);
     // Validity is produced inline: eval_expr returns Null for a null cell and
@@ -2500,6 +2763,16 @@ auto evaluate_field(const ir::Expr& expr, const Table& input, RowRange range,
                     }
                 },
                 new_column);
+            continue;
+        }
+        // Fitting a value to the column's Decimal(p, s) can overflow, which is
+        // a query error -- so it is handled here, where one can be returned.
+        if (auto* dec_col = std::get_if<Column<Decimal>>(&new_column)) {
+            auto units = fit_decimal(value.value(), decimal_type_of(*dec_col));
+            if (!units) {
+                return std::unexpected(units.error());
+            }
+            dec_col->push_back(Decimal{*units});
             continue;
         }
         std::visit(
@@ -2603,6 +2876,9 @@ auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_
         [&](const auto& col) -> ColumnValue {
             using ColT = std::decay_t<decltype(col)>;
             ColT out;
+            // A shifted column means what its source means: a Decimal keeps
+            // its scale, a Timestamp its zone.
+            out.set_meta(col.meta());
             if constexpr (std::is_same_v<ColT, Column<Categorical>> ||
                           std::is_same_v<ColT, Column<std::string>>) {
                 // Categorical/string: element-wise fallback (no plain memcpy).
@@ -2800,6 +3076,18 @@ auto eval_fill_null(const ir::CallExpr& call, const Table& input)
             } else if constexpr (std::is_same_v<T, Timestamp>) {
                 if (const auto* v = std::get_if<Timestamp>(&fill_lit->value))
                     maybe_fill = *v;
+            } else if constexpr (std::is_same_v<T, Decimal>) {
+                // A decimal or integer literal, fitted to the column's own
+                // Decimal(p, s): the fill must not change the column's type.
+                if (std::holds_alternative<DecimalValue>(fill_lit->value) ||
+                    std::holds_alternative<std::int64_t>(fill_lit->value)) {
+                    auto units = fit_decimal(expr_from_scalar(scalar_from_literal(*fill_lit)),
+                                             decimal_type_of(col));
+                    if (!units) {
+                        return std::unexpected("fill_null: " + units.error());
+                    }
+                    maybe_fill = Decimal{*units};
+                }
             }
 
             if (!maybe_fill) {
@@ -2810,6 +3098,9 @@ auto eval_fill_null(const ir::CallExpr& call, const Table& input)
             const T fill_val = *maybe_fill;
 
             ColT result;
+            // Filling nulls does not change what the values mean: a Decimal
+            // keeps its scale, a Timestamp its zone.
+            result.set_meta(col.meta());
             ColumnAppender<ColT> out(result, rows);
             for (std::size_t i = 0; i < rows; ++i) {
                 const bool is_null_row = has_validity && !(*entry->validity)[i];
@@ -3351,6 +3642,10 @@ auto apply_rep_func(const ir::CallExpr& call, const Table& input, std::size_t ro
                         col.reserve(out_len);
                         for (std::size_t i = 0; i < out_len; ++i)
                             col.push_back(v);
+                        return col;
+                    } else if constexpr (std::is_same_v<T, DecimalValue>) {
+                        Column<Decimal> col = make_decimal_column(v.type);
+                        col.resize(out_len, Decimal{v.units});
                         return col;
                     } else {
                         static_assert(std::is_same_v<T, Timestamp>);

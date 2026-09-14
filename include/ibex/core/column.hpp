@@ -4,6 +4,7 @@
 #pragma once
 
 #include <ibex/core/compiler.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time_zone.hpp>
 
 #include <algorithm>

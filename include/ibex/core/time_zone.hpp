@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <ibex/core/decimal.hpp>
+
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -58,6 +60,13 @@ struct ColumnMeta {
     /// Set only on Timestamp columns. `nullopt` means UTC, which is also what a
     /// producer that supplies no zone means (SPEC 2.4).
     std::optional<ZoneId> zone;
+
+    /// Set only on Decimal columns: the precision and scale every row's units
+    /// are counted in. A Decimal column without it is a construction bug --
+    /// its values are meaningless without the scale -- so readers treat
+    /// absent as `Decimal(38, 0)` rather than guess, and producers always set
+    /// it (plans/decimal-plan.md).
+    std::optional<DecimalType> decimal;
 
     [[nodiscard]] auto operator==(const ColumnMeta&) const -> bool = default;
 };

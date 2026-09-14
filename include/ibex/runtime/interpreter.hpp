@@ -41,19 +41,76 @@ enum class ScalarKind : std::uint8_t {
     String,
     Date,
     Timestamp,
+    Decimal,
 };
 
+// Column<Decimal> is last so no alternative index that predates it moves.
 using ColumnValue =
     std::variant<Column<std::int64_t>, Column<double>, Column<std::string>, Column<Categorical>,
-                 Column<Date>, Column<Timestamp>, Column<bool>>;
+                 Column<Date>, Column<Timestamp>, Column<bool>, Column<Decimal>>;
 // A scalar value, or null. `std::monostate` is the null alternative (a
 // default-constructed ScalarValue is null); it maps to the internal
 // ExprValue::Null across the row-eval boundary. Historically ScalarValue was
 // null-free; see plans/parse-args-and-nullable-scalars-plan.md Part 1 for why
 // that changed. Extern arguments remain null-free -- the type system rejects a
 // null before the call, it never reaches an extern.
-using ScalarValue =
-    std::variant<std::monostate, std::int64_t, double, bool, std::string, Date, Timestamp>;
+using ScalarValue = std::variant<std::monostate, std::int64_t, double, bool, std::string, Date,
+                                 Timestamp, DecimalValue>;
+
+/// The precision and scale of a Decimal column. Absent metadata on a Decimal
+/// column is a producer bug; reading it as scale 0 is the least surprising
+/// fallback (see `ColumnMeta::decimal`).
+[[nodiscard]] inline auto decimal_type_of(const Column<Decimal>& col) noexcept -> DecimalType {
+    return col.meta().decimal.value_or(DecimalType{});
+}
+
+/// The units a scalar holds when written into a `Decimal(target)` column.
+/// Decimals are rescaled (rounding half away from zero), Int64 read exactly.
+/// A value that does not fit is a `decimal overflow` error -- thrown, since
+/// the value-appending helpers this serves have no error channel and the
+/// interpreter's entry points turn an exception into a query error.
+[[nodiscard]] inline auto decimal_units_for(const ScalarValue& value, DecimalType target)
+    -> Int128 {
+    Int128 out = 0;
+    if (const auto* d = std::get_if<DecimalValue>(&value)) {
+        if (!decimal::rescale(d->units, d->type.scale, target.scale, out) ||
+            !decimal::fits(out, target.precision)) {
+            throw std::runtime_error("decimal overflow: " + decimal::to_string(*d) +
+                                     " does not fit " + decimal::type_name(target));
+        }
+        return out;
+    }
+    if (const auto* i = std::get_if<std::int64_t>(&value)) {
+        auto r = decimal::from_int64(*i, target);
+        if (!r) {
+            throw std::runtime_error(r.error());
+        }
+        return *r;
+    }
+    throw std::runtime_error("expected a Decimal value for a " + decimal::type_name(target) +
+                             " column");
+}
+
+/// An empty Decimal column of type `t`.
+[[nodiscard]] inline auto make_decimal_column(DecimalType t) -> Column<Decimal> {
+    Column<Decimal> col;
+    ColumnMeta meta;
+    meta.decimal = t;
+    col.set_meta(meta);
+    return col;
+}
+
+/// A `Decimal(t)` column holding `values`, each fitted to `t` (see
+/// `decimal_units_for`). The spelling generated C++ uses for a decimal list.
+[[nodiscard]] inline auto decimal_column(DecimalType t, std::initializer_list<DecimalValue> values)
+    -> Column<Decimal> {
+    Column<Decimal> col = make_decimal_column(t);
+    col.reserve(values.size());
+    for (const auto& v : values) {
+        col.push_back(Decimal{decimal_units_for(ScalarValue{v}, t)});
+    }
+    return col;
+}
 
 /// True when a ScalarValue holds the null alternative.
 [[nodiscard]] inline auto is_null_scalar(const ScalarValue& v) -> bool {

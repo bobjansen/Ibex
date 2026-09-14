@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/codegen/emitter.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 
@@ -40,6 +41,13 @@ auto escape_string(const std::string& s) -> std::string {
             out += c;
     }
     return out;
+}
+
+/// C++ that reconstructs `v` exactly: the digits travel as text, so no
+/// int128 literal (which C++ lacks) and no double is involved.
+auto decimal_value_cpp(const DecimalValue& v) -> std::string {
+    return "ibex::decimal::make_value(\"" + decimal::to_string(v) + "\", " +
+           std::to_string(v.type.precision) + ", " + std::to_string(v.type.scale) + ")";
 }
 
 auto format_double(double v) -> std::string {
@@ -159,6 +167,8 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
                         out << "\"" << escape_string(v) << "\"";
                     } else if constexpr (std::is_same_v<V, Date>) {
                         out << "ibex::Date{std::int32_t{" << v.days << "}}";
+                    } else if constexpr (std::is_same_v<V, DecimalValue>) {
+                        out << decimal_value_cpp(v);
                     } else {
                         static_assert(std::is_same_v<V, Timestamp>);
                         out << "ibex::Timestamp{std::int64_t{" << v.nanos << "}}";
@@ -635,6 +645,8 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                         return "Date";
                     case ir::ColumnType::Timestamp:
                         return "Timestamp";
+                    case ir::ColumnType::Decimal:
+                        return "Decimal";
                     case ir::ColumnType::Categorical:
                         // Unreachable from parsed source: no `parser::ScalarType`
                         // spells this, so a written ascription field never carries
@@ -938,9 +950,40 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                             type_str = "std::string";
                         } else if constexpr (std::is_same_v<T, Date>) {
                             type_str = "ibex::Date";
+                        } else if constexpr (std::is_same_v<T, DecimalValue>) {
+                            type_str = "ibex::Decimal";
                         } else {
                             static_assert(std::is_same_v<T, Timestamp>);
                             type_str = "ibex::Timestamp";
+                        }
+                        if constexpr (std::is_same_v<T, DecimalValue>) {
+                            // A Decimal column carries its type as metadata, so it
+                            // is built by a helper rather than a brace list.
+                            DecimalType unified = first_val.type;
+                            for (const auto& lit : col.elements) {
+                                if (const auto* d = std::get_if<DecimalValue>(&lit.value)) {
+                                    unified = decimal::union_type(unified, d->type);
+                                }
+                            }
+                            *out_ << "    " << var << ".add_column(\"" << escape_string(col.name)
+                                  << "\", ibex::runtime::decimal_column(ibex::DecimalType{"
+                                  << static_cast<int>(unified.precision) << ", "
+                                  << static_cast<int>(unified.scale) << "}, {";
+                            bool first_elem = true;
+                            for (const auto& lit : col.elements) {
+                                if (!first_elem) {
+                                    *out_ << ", ";
+                                }
+                                first_elem = false;
+                                if (const auto* d = std::get_if<DecimalValue>(&lit.value)) {
+                                    *out_ << decimal_value_cpp(*d);
+                                } else if (const auto* i = std::get_if<std::int64_t>(&lit.value)) {
+                                    *out_ << "ibex::DecimalValue{" << *i
+                                          << ", ibex::decimal::kInt64Type}";
+                                }
+                            }
+                            *out_ << "}));\n";
+                            return;
                         }
                         *out_ << "    " << var << ".add_column(\"" << escape_string(col.name)
                               << "\", ibex::Column<" << type_str << ">{";
@@ -963,6 +1006,9 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                                     } else if constexpr (std::is_same_v<V, Date>) {
                                         *out_ << "ibex::Date{std::int32_t{"
                                               << std::to_string(v.days) << "}}";
+                                    } else if constexpr (std::is_same_v<V, DecimalValue>) {
+                                        // Unreachable: Decimal columns returned above.
+                                        *out_ << decimal_value_cpp(v);
                                     } else {
                                         static_assert(std::is_same_v<V, Timestamp>);
                                         *out_ << "ibex::Timestamp{std::int64_t{"
@@ -1225,6 +1271,8 @@ auto Emitter::emit_filter_expr(const ir::Expr& expr) -> std::string {
                         } else if constexpr (std::is_same_v<V, Date>) {
                             return "ibex::ops::filter_date(ibex::Date{std::int32_t{" +
                                    std::to_string(v.days) + "}})";
+                        } else if constexpr (std::is_same_v<V, DecimalValue>) {
+                            return "ibex::ops::filter_decimal(" + decimal_value_cpp(v) + ")";
                         } else {
                             static_assert(std::is_same_v<V, Timestamp>);
                             return "ibex::ops::filter_timestamp(ibex::Timestamp{std::int64_t{" +
@@ -1296,6 +1344,8 @@ auto Emitter::emit_expr(const ir::Expr& expr) -> std::string {
                         } else if constexpr (std::is_same_v<V, Date>) {
                             return "ibex::ops::date_lit(ibex::Date{std::int32_t{" +
                                    std::to_string(v.days) + "}})";
+                        } else if constexpr (std::is_same_v<V, DecimalValue>) {
+                            return "ibex::ops::decimal_lit(" + decimal_value_cpp(v) + ")";
                         } else {
                             static_assert(std::is_same_v<V, Timestamp>);
                             return "ibex::ops::timestamp_lit(ibex::Timestamp{std::int64_t{" +
@@ -1470,6 +1520,8 @@ auto Emitter::emit_raw_expr(const ir::Expr& expr) -> std::string {
                             return "\"" + escape_string(v) + "\"";
                         } else if constexpr (std::is_same_v<V, Date>) {
                             return "ibex::Date{std::int32_t{" + std::to_string(v.days) + "}}";
+                        } else if constexpr (std::is_same_v<V, DecimalValue>) {
+                            return decimal_value_cpp(v);
                         } else {
                             static_assert(std::is_same_v<V, Timestamp>);
                             return "ibex::Timestamp{std::int64_t{" + std::to_string(v.nanos) + "}}";
@@ -1491,6 +1543,8 @@ auto Emitter::emit_raw_expr(const ir::Expr& expr) -> std::string {
                             return "\"" + escape_string(v) + "\"";
                         } else if constexpr (std::is_same_v<V, Date>) {
                             return "ibex::Date{std::int32_t{" + std::to_string(v.days) + "}}";
+                        } else if constexpr (std::is_same_v<V, DecimalValue>) {
+                            return decimal_value_cpp(v);
                         } else {
                             static_assert(std::is_same_v<V, Timestamp>);
                             return "ibex::Timestamp{std::int64_t{" + std::to_string(v.nanos) + "}}";

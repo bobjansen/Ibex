@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/decimal.hpp>
 #include <ibex/format.hpp>
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/effects.hpp>
@@ -1201,10 +1202,17 @@ class Parser {
         }
         if (match(TokenKind::Identifier)) {
             std::string name(previous().lexeme);
-            if ((name == "date" || name == "timestamp" || name == "ts") &&
+            if ((name == "date" || name == "timestamp" || name == "ts" || name == "decimal") &&
                 check(TokenKind::StringLiteral)) {
                 advance();
                 const std::string literal = unescape_string(previous().lexeme);
+                if (name == "decimal") {
+                    auto value = decimal::parse_literal(literal);
+                    if (!value.has_value()) {
+                        return fail_expr(previous(), "invalid decimal literal: " + value.error());
+                    }
+                    return make_literal(*value);
+                }
                 if (name == "date") {
                     auto value = parse_date_literal(literal);
                     if (!value.has_value()) {
@@ -1284,6 +1292,59 @@ class Parser {
             auto expr = std::make_unique<Expr>();
             expr->node = IdentifierExpr{.name = std::move(name)};
             return expr;
+        }
+        // Decimal cast: Decimal(expr, precision, scale). The type parameters are
+        // integer literals, so they are validated here and ride on the call as
+        // literal arguments.
+        if (match(TokenKind::KeywordDecimal)) {
+            if (!consume(TokenKind::LParen, "expected '(' after Decimal in cast expression")) {
+                return nullptr;
+            }
+            auto arg = parse_expression();
+            if (!arg) {
+                return nullptr;
+            }
+            if (!consume(
+                    TokenKind::Comma,
+                    "Decimal cast needs a precision and scale: Decimal(x, precision, scale)")) {
+                return nullptr;
+            }
+            // Reuses the type-parameter parser, which expects the '(' it opens
+            // with; here the value came first, so feed it the rest by hand.
+            auto read_int = [&](std::string_view what) -> std::optional<std::int64_t> {
+                if (!check(TokenKind::IntLiteral)) {
+                    error_ = make_error(peek(), "expected integer " + std::string(what) +
+                                                    " in Decimal(x, precision, scale)");
+                    return std::nullopt;
+                }
+                advance();
+                return parse_int(previous().lexeme);
+            };
+            auto precision = read_int("precision");
+            if (!precision.has_value() ||
+                !consume(TokenKind::Comma, "expected ',' in Decimal(x, precision, scale)")) {
+                return nullptr;
+            }
+            auto scale = read_int("scale");
+            if (!scale.has_value() ||
+                !consume(TokenKind::RParen, "expected ')' after Decimal cast")) {
+                return nullptr;
+            }
+            if (*precision < 1 || *precision > decimal::kMaxPrecision || *scale < 0 ||
+                *scale > *precision) {
+                return fail_expr(previous(), "unsupported Decimal(" + std::to_string(*precision) +
+                                                 ", " + std::to_string(*scale) +
+                                                 "): precision must be 1..38 and scale "
+                                                 "0..precision");
+            }
+            std::vector<ExprPtr> cast_args;
+            cast_args.push_back(std::move(arg));
+            cast_args.push_back(make_literal(*precision));
+            cast_args.push_back(make_literal(*scale));
+            auto cast_expr = std::make_unique<Expr>();
+            cast_expr->node =
+                CallExpr{.callee = "Decimal", .args = std::move(cast_args), .named_args = {}};
+            return cast_expr;
         }
         // Type-name cast: Int64(expr), Float64(expr), Int32(expr), Float32(expr),
         // Int(expr), Date(expr)
@@ -2260,7 +2321,11 @@ class Parser {
 
     auto parse_type() -> std::optional<Type> {
         if (auto scalar = parse_scalar_type()) {
-            return Type{.kind = Type::Kind::Scalar, .arg = *scalar};
+            return Type{
+                .kind = Type::Kind::Scalar, .arg = scalar->type, .decimal = scalar->decimal};
+        }
+        if (decimal_type_error_) {
+            return std::nullopt;
         }
         if (match(TokenKind::KeywordSeries)) {
             if (!consume(TokenKind::Lt, "expected '<' after 'Series'")) {
@@ -2268,13 +2333,15 @@ class Parser {
             }
             auto arg = parse_scalar_type();
             if (!arg.has_value()) {
-                error_ = make_error(peek(), "expected scalar type in Series<T>");
+                if (!decimal_type_error_) {
+                    error_ = make_error(peek(), "expected scalar type in Series<T>");
+                }
                 return std::nullopt;
             }
             if (!consume(TokenKind::Gt, "expected '>' after Series type argument")) {
                 return std::nullopt;
             }
-            return Type{.kind = Type::Kind::Series, .arg = *arg};
+            return Type{.kind = Type::Kind::Series, .arg = arg->type, .decimal = arg->decimal};
         }
         if (match(TokenKind::KeywordDataFrame)) {
             if (match(TokenKind::Lt)) {
@@ -2329,10 +2396,13 @@ class Parser {
                 }
                 auto scalar = parse_scalar_type();
                 if (!scalar.has_value()) {
-                    error_ = make_error(peek(), "expected scalar type in schema field");
+                    if (!decimal_type_error_) {
+                        error_ = make_error(peek(), "expected scalar type in schema field");
+                    }
                     return std::nullopt;
                 }
-                fields.push_back(SchemaField{.name = std::move(*name), .type = *scalar});
+                fields.push_back(SchemaField{
+                    .name = std::move(*name), .type = scalar->type, .decimal = scalar->decimal});
             } while (match(TokenKind::Comma) && !check(TokenKind::RBrace));
         }
         if (!consume(TokenKind::RBrace, "expected '}' after schema type")) {
@@ -2341,7 +2411,72 @@ class Parser {
         return SchemaType{.fields = std::move(fields), .open = open};
     }
 
-    auto parse_scalar_type() -> std::optional<ScalarType> {
+    struct ParsedScalarType {
+        ScalarType type;
+        std::optional<DecimalType> decimal = std::nullopt;
+    };
+
+    /// `Decimal(p, s)`: both parameters are integer literals, validated here so
+    /// no later stage sees an impossible type. Sets `error_` on a malformed
+    /// spelling (callers distinguish "no type here" from "bad type" by it).
+    auto parse_decimal_type_params() -> std::optional<DecimalType> {
+        if (!consume(TokenKind::LParen,
+                     "expected '(' after 'Decimal' (Decimal(precision, scale))")) {
+            return std::nullopt;
+        }
+        auto read_int = [&](std::string_view what) -> std::optional<std::int64_t> {
+            if (!check(TokenKind::IntLiteral)) {
+                error_ = make_error(peek(), "expected integer " + std::string(what) +
+                                                " in Decimal(precision, scale)");
+                return std::nullopt;
+            }
+            advance();
+            auto value = parse_int(previous().lexeme);
+            if (!value.has_value()) {
+                error_ = make_error(previous(), "invalid integer in Decimal type");
+            }
+            return value;
+        };
+        auto precision = read_int("precision");
+        if (!precision.has_value() ||
+            !consume(TokenKind::Comma, "expected ',' in Decimal(precision, scale)")) {
+            return std::nullopt;
+        }
+        auto scale = read_int("scale");
+        if (!scale.has_value() ||
+            !consume(TokenKind::RParen, "expected ')' after Decimal(precision, scale)")) {
+            return std::nullopt;
+        }
+        if (*precision < 1 || *precision > decimal::kMaxPrecision || *scale < 0 ||
+            *scale > *precision) {
+            error_ =
+                make_error(previous(), "unsupported Decimal(" + std::to_string(*precision) + ", " +
+                                           std::to_string(*scale) +
+                                           "): precision must be 1..38 and scale 0..precision");
+            return std::nullopt;
+        }
+        return DecimalType{.precision = static_cast<std::uint8_t>(*precision),
+                           .scale = static_cast<std::uint8_t>(*scale)};
+    }
+
+    auto parse_scalar_type() -> std::optional<ParsedScalarType> {
+        decimal_type_error_ = false;
+        if (match(TokenKind::KeywordDecimal)) {
+            auto params = parse_decimal_type_params();
+            if (!params.has_value()) {
+                decimal_type_error_ = true;
+                return std::nullopt;
+            }
+            return ParsedScalarType{.type = ScalarType::Decimal, .decimal = params};
+        }
+        auto simple = parse_simple_scalar_type();
+        if (!simple.has_value()) {
+            return std::nullopt;
+        }
+        return ParsedScalarType{.type = *simple};
+    }
+
+    auto parse_simple_scalar_type() -> std::optional<ScalarType> {
         if (match(TokenKind::KeywordInt)) {
             return ScalarType::Int64;
         }
@@ -2826,6 +2961,12 @@ class Parser {
         return expr;
     }
 
+    static auto make_literal(DecimalValue value) -> ExprPtr {
+        auto expr = std::make_unique<Expr>();
+        expr->node = LiteralExpr{.value = value};
+        return expr;
+    }
+
     static auto make_unary(UnaryOp op, ExprPtr expr) -> ExprPtr {
         auto node = std::make_unique<Expr>();
         node->node = UnaryExpr{.op = op, .expr = std::move(expr)};
@@ -2845,6 +2986,10 @@ class Parser {
     std::vector<Token> tokens_;
     std::size_t current_ = 0;
     ParseError error_{};
+    /// Set when `parse_scalar_type` consumed `Decimal` but its `(p, s)` was
+    /// malformed, so callers keep that precise error instead of overwriting it
+    /// with a generic "expected type".
+    bool decimal_type_error_ = false;
 };
 
 }  // namespace

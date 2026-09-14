@@ -1078,6 +1078,15 @@ auto slice_table(const ibex::runtime::Table& table, std::size_t rows) -> ibex::r
                         data.push_back(col[i]);
                     }
                     return data;
+                } else if constexpr (std::is_same_v<ColType, ibex::Column<ibex::Decimal>>) {
+                    std::vector<ibex::Decimal> data;
+                    data.reserve(n);
+                    for (std::size_t i = 0; i < n; ++i) {
+                        data.push_back(col[i]);
+                    }
+                    ibex::Column<ibex::Decimal> out(std::move(data));
+                    out.set_meta(col.meta());
+                    return out;
                 } else {
                     static_assert(std::is_same_v<ColType, void>, "Unhandled column type");
                 }
@@ -1879,6 +1888,7 @@ int main(int argc, char** argv) {
     std::size_t merge_validity_rows = 4'000'000;
     std::size_t rng_micro_rows = 4'000'000;
     std::size_t bool_rows = 4'000'000;
+    std::size_t decimal_rows = 4'000'000;
     std::size_t filter_micro_rows = 0;
     std::vector<std::string> suites;
 
@@ -1938,6 +1948,8 @@ int main(int argc, char** argv) {
     app.add_option("--filter-micro-rows", filter_micro_rows,
                    "Rows from csv-trades to use for filter_micro; 0 = all rows (default)")
         ->check(CLI::NonNegativeNumber);
+    app.add_option("--decimal-rows", decimal_rows,
+                   "Rows for the decimal micro benchmarks (Int64 vs Float64 vs Decimal)");
     app.add_option("--suite", suites,
                    "Benchmark suite(s) to run (comma-separated or repeated). "
                    "Supported: all, core, cumulative, sort, window, groupagg, pipeline, join, "
@@ -1953,7 +1965,7 @@ int main(int argc, char** argv) {
         "all",      "core",         "cumulative", "sort",      "window",         "groupagg",
         "pipeline", "join",         "rng",        "fill",      "null",           "filter",
         "multi",    "events",       "reshape",    "timeframe", "merge_validity", "rng_micro",
-        "bool",     "filter_micro", "transform",  "stats",     "scalar"};
+        "bool",     "filter_micro", "transform",  "stats",     "scalar",         "decimal"};
     for (const auto& token : suites) {
         auto normalized = normalize_suite_name(token);
         if (!allowed_suites.contains(normalized)) {
@@ -1974,7 +1986,7 @@ int main(int argc, char** argv) {
         }
         // Keep legacy --suite all behavior stable; micro suites are opt-in.
         return suite != "merge_validity" && suite != "rng_micro" && suite != "bool" &&
-               suite != "filter_micro";
+               suite != "filter_micro" && suite != "decimal";
     };
 
     int status = 0;
@@ -3713,6 +3725,80 @@ int main(int argc, char** argv) {
         };
         for (const auto& query : bool_queries) {
             status = run_benchmark(query, bool_tables, warmup_iters, iters, saved_include_parse);
+            if (status != 0) {
+                break;
+            }
+        }
+    }
+
+    // Decimal micro benchmark: the same values stored three ways -- Int64
+    // cents, Float64, Decimal(18, 2) -- so each kernel's cost is read against
+    // the fixed-width types it replaces. `w` is Decimal(38, 2) with units past
+    // int64, which exercises the wide sort path (dense ordinal keys).
+    if (status == 0 && run_suite("decimal")) {
+        ibex::runtime::Table dec_table;
+        {
+            constexpr std::int64_t kGroups = 1000;
+            const auto wide_offset = ibex::decimal::pow10(25);
+            ibex::Column<std::int64_t> cents;
+            ibex::Column<double> dollars;
+            auto dec =
+                ibex::runtime::make_decimal_column(ibex::DecimalType{.precision = 18, .scale = 2});
+            auto wide =
+                ibex::runtime::make_decimal_column(ibex::DecimalType{.precision = 38, .scale = 2});
+            ibex::Column<std::int64_t> key;
+            cents.reserve(decimal_rows);
+            dollars.reserve(decimal_rows);
+            dec.reserve(decimal_rows);
+            wide.reserve(decimal_rows);
+            key.reserve(decimal_rows);
+            for (std::size_t i = 0; i < decimal_rows; ++i) {
+                // Pseudo-random cents in [-50000, 50000): a sort has real work.
+                const auto c = static_cast<std::int64_t>((i * 2654435761ULL) % 100000ULL) - 50000;
+                cents.push_back(c);
+                dollars.push_back(static_cast<double>(c) / 100.0);
+                dec.push_back(ibex::Decimal{ibex::Int128{c}});
+                wide.push_back(ibex::Decimal{ibex::Int128{c} + wide_offset});
+                key.push_back(static_cast<std::int64_t>(i) % kGroups);
+            }
+            dec_table.add_column("i", std::move(cents));
+            dec_table.add_column("f", std::move(dollars));
+            dec_table.add_column("d", std::move(dec));
+            dec_table.add_column("w", std::move(wide));
+            dec_table.add_column("k", std::move(key));
+        }
+        ibex::runtime::TableRegistry dec_tables;
+        dec_tables.emplace("dec_data", std::move(dec_table));
+        if (print_types) {
+            print_table_types("dec_data", dec_tables.find("dec_data")->second);
+        }
+
+        ibex::formatting::print("\n-- Decimal vs Int64 vs Float64 benchmarks ({} rows) --\n",
+                                decimal_rows);
+        const std::vector<BenchQuery> dec_queries = {
+            {"sum_i64", "dec_data[select { s = sum(i) }]"},
+            {"sum_f64", "dec_data[select { s = sum(f) }]"},
+            {"sum_dec", "dec_data[select { s = sum(d) }]"},
+            {"sum_dec38", "dec_data[select { s = sum(w) }]"},
+            {"group_sum_i64", "dec_data[select { s = sum(i) }, by k]"},
+            {"group_sum_f64", "dec_data[select { s = sum(f) }, by k]"},
+            {"group_sum_dec", "dec_data[select { s = sum(d) }, by k]"},
+            {"filter_i64", "dec_data[filter i > 25000, select { k }]"},
+            {"filter_f64", "dec_data[filter f > 250.0, select { k }]"},
+            {"filter_dec", "dec_data[filter d > 250.00, select { k }]"},
+            {"mul_const_i64", "dec_data[update { x = i * 3 }]"},
+            {"mul_const_f64", "dec_data[update { x = f * 3.0 }]"},
+            {"mul_const_dec", "dec_data[update { x = d * 3 }]"},
+            {"add_cols_i64", "dec_data[update { x = i + i }]"},
+            {"add_cols_f64", "dec_data[update { x = f + f }]"},
+            {"add_cols_dec", "dec_data[update { x = d + d }]"},
+            {"sort_i64", "dec_data[order i]"},
+            {"sort_f64", "dec_data[order f]"},
+            {"sort_dec", "dec_data[order d]"},
+            {"sort_dec38", "dec_data[order w]"},
+        };
+        for (const auto& query : dec_queries) {
+            status = run_benchmark(query, dec_tables, warmup_iters, iters, saved_include_parse);
             if (status != 0) {
                 break;
             }

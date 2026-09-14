@@ -7,6 +7,7 @@
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -85,6 +86,13 @@ auto default_column_for(ExprType type, std::size_t rows) -> ColumnValue {
             c.resize(rows);
             return ColumnValue{std::move(c)};
         }
+        case ExprType::Decimal: {
+            // Payloads of a null broadcast are never read; the type is only a
+            // placeholder until a caller that knows it replaces the column.
+            Column<Decimal> c = make_decimal_column(DecimalType{});
+            c.resize(rows);
+            return ColumnValue{std::move(c)};
+        }
     }
     Column<std::int64_t> c;  // unreachable; keeps MSVC C4715 quiet
     c.resize(rows);
@@ -97,6 +105,18 @@ auto default_column_for(ExprType type, std::size_t rows) -> ColumnValue {
 auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group_by,
                      const std::vector<ir::AggSpec>& aggregations, const ExecutionContext* exec)
     -> std::expected<Table, std::string> {
+    // A Decimal input needs int128 accumulators with checked overflow, which
+    // the fixed-width slots below do not have; that path delegates any other
+    // aggregate in the query back here.
+    for (const auto& agg : aggregations) {
+        if (agg.func == ir::AggFunc::Count) {
+            continue;
+        }
+        if (const auto* col = input.find(agg.column.name);
+            col != nullptr && std::holds_alternative<Column<Decimal>>(*col)) {
+            return aggregate_table_decimal(input, group_by, aggregations, exec);
+        }
+    }
     std::vector<const ColumnValue*> group_columns;
     group_columns.reserve(group_by.size());
     for (const auto& key : group_by) {
@@ -1773,6 +1793,15 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     cc.codes.resize(rows);
                     robin_hood::unordered_flat_map<T, std::uint32_t> map;
                     map.reserve(64);
+                    // A boxed key is a ScalarValue; a decimal one needs its
+                    // column's precision and scale to mean anything.
+                    const auto box = [&](const T& v) -> ScalarValue {
+                        if constexpr (std::is_same_v<T, Decimal>) {
+                            return DecimalValue{.units = v.units, .type = decimal_type_of(col)};
+                        } else {
+                            return ScalarValue{v};
+                        }
+                    };
                     for (std::size_t row = 0; row < rows; ++row) {
                         if (is_null_row(row)) {
                             if (cc.null_code == kNoNullCode) {
@@ -1780,7 +1809,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                 // vals is indexed BY CODE; keep it aligned. The
                                 // placeholder is never read — output reconstruction
                                 // checks is_null_code first.
-                                cc.vals.emplace_back(T{});
+                                cc.vals.emplace_back(box(T{}));
                             }
                             cc.codes[row] = cc.null_code;
                             continue;
@@ -1791,7 +1820,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         if (it == map.end()) {
                             code = cc.n_distinct++;
                             map.emplace(key, code);
-                            cc.vals.emplace_back(key);
+                            cc.vals.emplace_back(box(key));
                         } else {
                             code = it->second;
                         }

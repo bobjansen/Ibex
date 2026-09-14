@@ -6,6 +6,7 @@
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/format.hpp>
 #include <ibex/ir/join_output.hpp>
@@ -195,6 +196,11 @@ struct JoinHashIndex {
     PartitionedHeads<bool> bool_heads;
     PartitionedHeads<Date> date_heads;
     PartitionedHeads<Timestamp> ts_heads;
+    /// Decimal keys hash on raw units, which is value equality only at one
+    /// scale -- so the build records its type and a probe side at another
+    /// scale is refused rather than silently matched on the wrong numbers.
+    PartitionedHeads<Decimal> dec_heads;
+    DecimalType dec_type{};
     PartitionedHeads<std::string_view, StringViewHash, StringViewEq> string_heads;
 
     /// Two-fixed-width-int-key path: both key values pack into one struct,
@@ -231,6 +237,8 @@ auto detect_join_key_kind(const ColumnValue& col, ExprType& out) -> std::optiona
         out = ExprType::Date;
     } else if (std::holds_alternative<Column<Timestamp>>(col)) {
         out = ExprType::Timestamp;
+    } else if (std::holds_alternative<Column<Decimal>>(col)) {
+        out = ExprType::Decimal;
     } else if (std::holds_alternative<Column<Categorical>>(col) ||
                std::holds_alternative<Column<std::string>>(col)) {
         out = ExprType::String;
@@ -431,6 +439,12 @@ auto build_join_hash_index(const Table& build_side, const std::string& key_name,
         if (col == nullptr)
             return std::unexpected("inner join: build-side key type mismatch");
         build_scalar(*col, index.ts_heads);
+    } else if (key_kind == ExprType::Decimal) {
+        const auto* col = std::get_if<Column<Decimal>>(key);
+        if (col == nullptr)
+            return std::unexpected("inner join: build-side key type mismatch");
+        index.dec_type = decimal_type_of(*col);
+        build_scalar(*col, index.dec_heads);
     } else if (key_kind == ExprType::String) {
         index.string_heads.partition(partitions);
         if (const auto* c_cat = std::get_if<Column<Categorical>>(key)) {
@@ -1152,6 +1166,20 @@ struct JoinProbe {
             const auto* data = col->data();
             li_identity =
                 probe_scalar(index().ts_heads, n, [&](std::size_t i) { return data[i]; }, li, ri);
+        } else if (index().key_kind == ExprType::Decimal) {
+            const auto* col = std::get_if<Column<Decimal>>(key);
+            if (col == nullptr) {
+                return std::unexpected("inner join: left key type mismatch");
+            }
+            if (decimal_type_of(*col).scale != index().dec_type.scale) {
+                return std::unexpected(
+                    "join key scale mismatch: " + decimal::type_name(decimal_type_of(*col)) +
+                    " vs " + decimal::type_name(index().dec_type) +
+                    "; cast one side to the other's scale with Decimal(x, precision, scale)");
+            }
+            const auto* data = col->data();
+            li_identity =
+                probe_scalar(index().dec_heads, n, [&](std::size_t i) { return data[i]; }, li, ri);
         } else if (index().key_kind == ExprType::String) {
             if (const auto* c_cat = std::get_if<Column<Categorical>>(key)) {
                 const auto& dict = c_cat->dictionary();
@@ -1371,6 +1399,18 @@ struct JoinProbe {
                 return std::unexpected("inner join: right key type mismatch");
             const auto* data = col->data();
             do_phase1([&](std::size_t r) { return data[r]; }, index().ts_heads);
+        } else if (index().key_kind == ExprType::Decimal) {
+            const auto* col = std::get_if<Column<Decimal>>(rkey);
+            if (col == nullptr)
+                return std::unexpected("inner join: right key type mismatch");
+            if (decimal_type_of(*col).scale != index().dec_type.scale) {
+                return std::unexpected(
+                    "join key scale mismatch: " + decimal::type_name(decimal_type_of(*col)) +
+                    " vs " + decimal::type_name(index().dec_type) +
+                    "; cast one side to the other's scale with Decimal(x, precision, scale)");
+            }
+            const auto* data = col->data();
+            do_phase1([&](std::size_t r) { return data[r]; }, index().dec_heads);
         } else if (index().key_kind == ExprType::String) {
             if (const auto* c_cat = std::get_if<Column<Categorical>>(rkey)) {
                 const auto& dict = c_cat->dictionary();

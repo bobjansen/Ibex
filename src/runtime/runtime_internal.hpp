@@ -34,6 +34,9 @@ enum class ExprType : std::uint8_t {
     Categorical,
     Date,
     Timestamp,
+    /// Precision and scale come from `infer_decimal_type`, which is only
+    /// consulted once this says Decimal.
+    Decimal,
 };
 
 struct StringViewHash {

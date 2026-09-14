@@ -4,6 +4,7 @@
 // Arrow C Data Interface requires C-style arrays for ABI compatibility.
 // NOLINTBEGIN(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays)
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/core/time_zone.hpp>
 #include <ibex/interop/arrow_c_data.hpp>
@@ -11,7 +12,9 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/table_properties.hpp>
 
+#include <array>
 #include <bit>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -21,6 +24,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -509,6 +513,116 @@ struct TimestampFormat {
 /// producer back its own data relabelled UTC. A zone-less Arrow timestamp is
 /// nominally a naive wall clock; Ibex reads it as UTC, which is the same rule
 /// the rest of the language follows.
+/// An Arrow decimal type, decomposed from `d:precision,scale[,bitwidth]`.
+struct DecimalFormat {
+    DecimalType type;
+    int bit_width = 128;
+};
+
+/// Recognize an Arrow decimal. Returns nullopt for a non-decimal format, and an
+/// error for a decimal Ibex does not store: 256-bit, precision above 38, or a
+/// negative scale or one larger than the precision (both legal in Arrow).
+/// Saying so explicitly beats "unsupported Arrow column format".
+auto parse_decimal_format(std::string_view format)
+    -> std::optional<std::expected<DecimalFormat, std::string>> {
+    if (!format.starts_with("d:")) {
+        return std::nullopt;
+    }
+    const std::string text(format);
+    auto fail = [&](std::string why) -> std::optional<std::expected<DecimalFormat, std::string>> {
+        return std::expected<DecimalFormat, std::string>{
+            std::unexpected("unsupported Arrow decimal '" + text + "': " + std::move(why))};
+    };
+    std::array<long long, 3> parts{0, 0, 128};
+    std::size_t count = 0;
+    const char* cursor = format.data() + 2;
+    const char* end = format.data() + format.size();
+    while (cursor < end && count < parts.size()) {
+        const auto [ptr, ec] = std::from_chars(cursor, end, parts[count]);
+        if (ec != std::errc{}) {
+            return fail("malformed format");
+        }
+        ++count;
+        cursor = ptr;
+        if (cursor < end) {
+            if (*cursor != ',') {
+                return fail("malformed format");
+            }
+            ++cursor;
+        }
+    }
+    if (count < 2 || cursor != end) {
+        return fail("malformed format");
+    }
+    const long long precision = parts[0];
+    const long long scale = parts[1];
+    const long long bits = parts[2];
+    if (bits == 256) {
+        return fail("Decimal256 is not supported (at most 38 digits)");
+    }
+    if (bits != 32 && bits != 64 && bits != 128) {
+        return fail("bit width must be 32, 64 or 128");
+    }
+    if (precision < 1 || precision > decimal::kMaxPrecision) {
+        return fail("precision must be 1..38");
+    }
+    if (scale < 0 || scale > precision) {
+        return fail("scale must be 0..precision");
+    }
+    return std::expected<DecimalFormat, std::string>{
+        DecimalFormat{.type = DecimalType{.precision = static_cast<std::uint8_t>(precision),
+                                          .scale = static_cast<std::uint8_t>(scale)},
+                      .bit_width = static_cast<int>(bits)}};
+}
+
+/// Import an Arrow decimal array. A 128-bit buffer is Arrow's little-endian
+/// two's complement, which is `Decimal`'s own layout, so it is adopted in
+/// place -- but only when 16-byte aligned: Arrow promises 8, and an int128
+/// load from an 8-aligned address is undefined. Anything else is copied.
+auto import_decimal_column(const ArrowArray& array, const DecimalFormat& fmt,
+                           const std::shared_ptr<const void>& owner, bool& adopted)
+    -> std::expected<runtime::ColumnValue, std::string> {
+    static_assert(sizeof(Decimal) == 16 && std::is_trivially_copyable_v<Decimal>);
+    adopted = false;
+    if (array.buffers == nullptr || array.n_buffers < 2 || array.buffers[1] == nullptr) {
+        return std::unexpected("Arrow decimal array is missing its data buffer");
+    }
+    const auto length = static_cast<std::size_t>(array.length);
+    const auto offset = static_cast<std::size_t>(array.offset);
+    ColumnMeta meta;
+    meta.decimal = fmt.type;
+    const void* raw = array.buffers[1];
+    if (fmt.bit_width == 128 && owner &&
+        reinterpret_cast<std::uintptr_t>(raw) % alignof(Decimal) == 0) {  // NOLINT
+        auto column =
+            Column<Decimal>::from_external(owner, static_cast<const Decimal*>(raw), offset, length);
+        column.set_meta(meta);
+        adopted = true;
+        return runtime::ColumnValue{std::move(column)};
+    }
+    Column<Decimal> column;
+    column.set_meta(meta);
+    column.resize(length);
+    Decimal* out = column.data();
+    const auto* bytes = static_cast<const unsigned char*>(raw);
+    const std::size_t width = static_cast<std::size_t>(fmt.bit_width) / 8;
+    for (std::size_t i = 0; i < length; ++i) {
+        const unsigned char* src = bytes + ((offset + i) * width);
+        if (fmt.bit_width == 128) {
+            std::memcpy(&out[i].units, src, sizeof(Int128));
+        } else if (fmt.bit_width == 64) {
+            std::int64_t v = 0;
+            std::memcpy(&v, src, sizeof(v));
+            out[i].units = Int128{v};
+        } else {
+            std::int32_t v = 0;
+            std::memcpy(&v, src, sizeof(v));
+            out[i].units = Int128{v};
+        }
+    }
+    return runtime::ColumnValue{std::move(column)};
+}
+
 auto parse_timestamp_format(std::string_view format) -> std::optional<TimestampFormat> {
     if (format.size() < 4 || !format.starts_with("ts") || format[3] != ':') {
         return std::nullopt;
@@ -837,6 +951,19 @@ auto import_column(const ArrowArray& array, const ArrowSchema& schema,
         }
     }
 
+    bool decimal_adopted = false;
+    if (auto dec = parse_decimal_format(format); dec.has_value()) {
+        if (!dec->has_value()) {
+            return std::unexpected(dec->error());
+        }
+        auto imported = import_decimal_column(array, **dec, owner, decimal_adopted);
+        if (!imported) {
+            return std::unexpected(imported.error());
+        }
+        return std::pair{
+            std::move(*imported),
+            import_validity(array, decimal_adopted ? owner : std::shared_ptr<const void>{})};
+    }
     if (format == "l") {
         column = import_primitive_column<std::int64_t>(array, 1, owner);
     } else if (format == "g") {
@@ -949,6 +1076,11 @@ auto export_column_schema(const runtime::ColumnEntry& entry, ArrowSchema* out_sc
                 }
             } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
                 set_format("u");
+            } else if constexpr (std::is_same_v<ColT, Column<Decimal>>) {
+                // decimal128 (Arrow's default width), precision and scale as
+                // declared -- the values need no conversion on the way out.
+                const DecimalType t = runtime::decimal_type_of(col);
+                set_format("d:" + std::to_string(t.precision) + "," + std::to_string(t.scale));
             } else if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
                 state->format = "i";
                 state->dictionary = std::make_unique<ArrowSchema>();
@@ -1040,7 +1172,10 @@ auto export_column_array(const runtime::ColumnEntry& entry,
                 (*state)->table_owner = std::move(owner);
                 finalize_array(out_array, std::move(*state), static_cast<std::int64_t>(col.size()),
                                null_count, static_cast<std::int64_t>(col.buffer_offset()));
-            } else if constexpr (std::is_same_v<ColT, Column<Timestamp>>) {
+            } else if constexpr (std::is_same_v<ColT, Column<Timestamp>> ||
+                                 std::is_same_v<ColT, Column<Decimal>>) {
+                // A Decimal column's units are decimal128's exact layout, so it
+                // exports zero-copy like any other fixed-width column.
                 auto state = primitive_buffers(entry, col);
                 if (!state) {
                     return std::unexpected(state.error());
@@ -1335,7 +1470,8 @@ auto import_table_impl(const ArrowArray& array, const ArrowSchema& schema,
             timestamp.has_value() && !timestamp->zone.empty()) {
             auto& stored = *table.columns[table.index.at(name)].column;
             if (auto* stamps = std::get_if<Column<Timestamp>>(&stored)) {
-                stamps->set_meta(ColumnMeta{.zone = intern_zone(timestamp->zone)});
+                stamps->set_meta(
+                    ColumnMeta{.zone = intern_zone(timestamp->zone), .decimal = std::nullopt});
             }
         }
     }

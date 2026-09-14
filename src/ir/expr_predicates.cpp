@@ -116,6 +116,7 @@ constexpr auto kBuiltinFunctionInfo = std::to_array<std::pair<std::string_view, 
     {"Int64", {.kind = FnKind::Scalar}},
     {"Float32", {.kind = FnKind::Scalar}},
     {"Float64", {.kind = FnKind::Scalar}},
+    {"Decimal", {.kind = FnKind::Scalar}},
 });
 
 }  // namespace

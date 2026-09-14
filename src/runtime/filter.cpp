@@ -8,6 +8,7 @@
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
@@ -41,6 +42,7 @@
 #include <variant>
 #include <vector>
 
+#include "decimal_ops.hpp"
 #include "kernel_gather.hpp"
 #include "kernel_types.hpp"
 
@@ -438,7 +440,7 @@ auto cmp_col_scalar_into_double(ir::CompareOp op, const double* __restrict cp, d
 }  // namespace
 
 // Dispatch column-vs-scalar comparison over all type combinations.
-using LitVal = std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>;
+using LitVal = std::variant<std::int64_t, double, bool, std::string, Date, Timestamp, DecimalValue>;
 namespace {
 
 // `off` is the source offset of `col` and `validity` (a borrowed column under a
@@ -449,6 +451,28 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, std::size_t of
     Mask result;
     result.value.resize(n);
     uint8_t* mp = result.value.data();
+    // Decimal: exact across scales, against a decimal, an integer, or a float
+    // literal read back from its own text (`price > 10.5` means 10.5).
+    if (std::holds_alternative<Column<Decimal>>(col) || std::holds_alternative<DecimalValue>(lit)) {
+        std::optional<DecimalValue> rhs;
+        if (const auto* d = std::get_if<DecimalValue>(&lit)) {
+            rhs = *d;
+        } else if (const auto* i = std::get_if<std::int64_t>(&lit)) {
+            rhs = DecimalValue{.units = Int128{*i}, .type = decimal::kInt64Type};
+        } else if (const auto* f = std::get_if<double>(&lit)) {
+            auto v = decimal::literal_from_double(*f);
+            if (!v) {
+                return std::unexpected("filter: " + v.error());
+            }
+            rhs = *v;
+        }
+        if (!rhs.has_value() || !decimal_compare_col_scalar(op, col, off, *rhs, mp, n)) {
+            return std::unexpected(
+                "filter: Decimal compares only with Decimal, Int64, or a numeric literal");
+        }
+        result.apply_validity(validity, off, n);
+        return result;
+    }
     if (const auto* s = std::get_if<std::string>(&lit)) {
         if (const auto* str_col = std::get_if<Column<std::string>>(&col)) {
             switch (op) {
@@ -802,6 +826,17 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, std::size_t lhs_off,
     Mask result;
     result.value.resize(n);
     uint8_t* mp = result.value.data();
+    if (std::holds_alternative<Column<Decimal>>(lhs) ||
+        std::holds_alternative<Column<Decimal>>(rhs)) {
+        if (!decimal_compare_columns(op, lhs, lhs_off, rhs, rhs_off, mp, n)) {
+            return std::unexpected(
+                "cannot compare a Decimal column with a non-Decimal, non-Int64 column; convert "
+                "one side explicitly");
+        }
+        auto merged_v = merge_validity(lv, lhs_off, rv, rhs_off, n);
+        result.apply_validity(merged_v ? &*merged_v : nullptr, 0, n);
+        return result;
+    }
     if (const auto* l = std::get_if<Column<std::int64_t>>(&lhs)) {
         if (const auto* r = std::get_if<Column<std::int64_t>>(&rhs)) {
             cmp_into(op, l->data() + lhs_off, r->data() + rhs_off, mp, n);
@@ -1599,20 +1634,9 @@ auto eval_value_vec(const ir::Expr& expr, const PredicateInput& input,
                             r.owned_validity = ValidityBitmap(n, false);
                             return r;
                         }
-                        // Broadcast scalar into a full column.
-                        ColumnValue cv = std::visit(
-                            [n](const auto& v) -> ColumnValue {
-                                using U = std::decay_t<decltype(v)>;
-                                if constexpr (std::is_same_v<U, std::monostate>) {
-                                    return ColumnValue{Column<std::int64_t>{}};  // unreachable
-                                } else {
-                                    Column<U> col;
-                                    col.resize(n, v);
-                                    return ColumnValue{std::move(col)};
-                                }
-                            },
-                            it->second);
-                        return ColResult{std::move(cv)};
+                        // Broadcast scalar into a full column (a decimal keeps
+                        // its precision and scale as column metadata).
+                        return ColResult{broadcast_scalar_column(it->second, n)};
                     }
                 }
                 if (node.lexical) {
@@ -1622,15 +1646,7 @@ auto eval_value_vec(const ir::Expr& expr, const PredicateInput& input,
                 return std::unexpected("filter: unknown column '" + node.name + "'");
             } else if constexpr (std::is_same_v<T, ir::Literal>) {
                 // Broadcast literal into a full column (fallback; common path avoids this).
-                ColumnValue cv = std::visit(
-                    [n](const auto& v) -> ColumnValue {
-                        using U = std::decay_t<decltype(v)>;
-                        Column<U> col;
-                        col.resize(n, v);
-                        return ColumnValue{std::move(col)};
-                    },
-                    node.value);
-                return ColResult{std::move(cv)};
+                return ColResult{broadcast_scalar_column(scalar_from_literal(node), n)};
             } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
                 auto lhs = eval_value_vec(*node.left, input, scalars, rows, window, window_aligned);
                 if (!lhs)
@@ -1639,6 +1655,40 @@ auto eval_value_vec(const ir::Expr& expr, const PredicateInput& input,
                     eval_value_vec(*node.right, input, scalars, rows, window, window_aligned);
                 if (!rhs)
                     return std::unexpected(rhs.error());
+                const bool left_dec = std::holds_alternative<Column<Decimal>>(deref_col(*lhs));
+                const bool right_dec = std::holds_alternative<Column<Decimal>>(deref_col(*rhs));
+                if (left_dec || right_dec) {
+                    // A float literal beside a decimal is the exact decimal it
+                    // was written as; broadcast it as one rather than as a
+                    // Float64 column, which the decimal kernel (rightly) rejects.
+                    const auto as_decimal_literal =
+                        [n](const ir::Expr& e) -> std::optional<ColumnValue> {
+                        const auto* lit = std::get_if<ir::Literal>(&e.node);
+                        const auto* f = lit != nullptr ? std::get_if<double>(&lit->value) : nullptr;
+                        if (f == nullptr) {
+                            return std::nullopt;
+                        }
+                        auto v = decimal::literal_from_double(*f);
+                        if (!v) {
+                            return std::nullopt;
+                        }
+                        return broadcast_scalar_column(ScalarValue{*v}, n);
+                    };
+                    std::optional<ColumnValue> lit_col =
+                        left_dec ? as_decimal_literal(*node.right) : as_decimal_literal(*node.left);
+                    const ColumnValue& l_col = (!left_dec && lit_col) ? *lit_col : deref_col(*lhs);
+                    const ColumnValue& r_col = (left_dec && lit_col) ? *lit_col : deref_col(*rhs);
+                    const std::size_t l_off = (!left_dec && lit_col) ? 0 : lhs->offset;
+                    const std::size_t r_off = (left_dec && lit_col) ? 0 : rhs->offset;
+                    auto dec = decimal_arith_columns(node.op, l_col, l_off, lhs->get_validity(),
+                                                     r_col, r_off, rhs->get_validity(), n);
+                    if (!dec)
+                        return std::unexpected(dec.error());
+                    ColResult res{std::move(*dec)};
+                    res.owned_validity = merge_validity(lhs->get_validity(), lhs->offset,
+                                                        rhs->get_validity(), rhs->offset, n);
+                    return res;
+                }
                 auto result = arith_vec(node.op, deref_col(*lhs), lhs->offset, deref_col(*rhs),
                                         rhs->offset, n);
                 if (!result)
@@ -1805,10 +1855,56 @@ auto eval_coalesce_column(const ir::CallExpr& call, const Table& input,
             return std::unexpected("coalesce: arguments must share one type");
         }
     }
+    if (std::holds_alternative<Column<Decimal>>(deref_col(cols[0]))) {
+        // Arguments may differ in scale (`coalesce(price, decimal"0")`): the
+        // result takes the narrowest type holding them all, and each chosen
+        // value is rescaled into it -- raw units are only comparable at one
+        // scale.
+        DecimalType unified = decimal_type_of(std::get<Column<Decimal>>(deref_col(cols[0])));
+        for (std::size_t k = 1; k < cols.size(); ++k) {
+            unified = decimal::union_type(
+                unified, decimal_type_of(std::get<Column<Decimal>>(deref_col(cols[k]))));
+        }
+        Column<Decimal> out = make_decimal_column(unified);
+        out.reserve(n);
+        ValidityBitmap valid(n, true);
+        bool any_invalid = false;
+        for (std::size_t i = 0; i < n; ++i) {
+            bool filled = false;
+            for (const auto& cr : cols) {
+                const auto* vk = cr.get_validity();
+                if (vk == nullptr || (*vk)[cr.offset + i]) {
+                    const auto& src = std::get<Column<Decimal>>(deref_col(cr));
+                    Int128 units = 0;
+                    if (!decimal::rescale(src[cr.offset + i].units, decimal_type_of(src).scale,
+                                          unified.scale, units) ||
+                        !decimal::fits(units, unified.precision)) {
+                        return std::unexpected("coalesce: " + decimal_overflow(unified));
+                    }
+                    out.push_back(Decimal{units});
+                    filled = true;
+                    break;
+                }
+            }
+            if (!filled) {
+                out.push_back(Decimal{});
+                valid.set(i, false);
+                any_invalid = true;
+            }
+        }
+        ComputedColumn r{.column = ColumnValue{std::move(out)}, .validity = std::nullopt};
+        if (any_invalid) {
+            r.validity = std::move(valid);
+        }
+        return r;
+    }
     return std::visit(
         [&](const auto& c0) -> std::expected<ComputedColumn, std::string> {
             using Col = std::decay_t<decltype(c0)>;
             Col out;
+            // A coalesced column means what its first argument means (a
+            // Timestamp keeps its zone).
+            out.set_meta(c0.meta());
             out.reserve(n);
             ValidityBitmap valid(n, true);
             bool any_invalid = false;

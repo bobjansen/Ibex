@@ -232,6 +232,7 @@
             <tr><td><code>Int(x)</code></td><td>Alias for <code>Int64(x)</code>.</td></tr>
             <tr><td><code>Float64(x)</code></td><td>Explicit cast to 64-bit float.</td></tr>
             <tr><td><code>Float32(x)</code></td><td>Explicit cast to 32-bit float.</td></tr>
+            <tr><td><code>Decimal(x, p, s)</code></td><td>Exact cast to <code>Decimal(p, s)</code> (precision 1&ndash;38, scale 0&ndash;p) from an Int, Decimal, String, or Float (read from its shortest text, so <code>Decimal(0.1, 10, 2)</code> is <code>0.10</code>). Rounds half away from zero; a value that does not fit is an error.</td></tr>
           </tbody>
         </table>
       </article>

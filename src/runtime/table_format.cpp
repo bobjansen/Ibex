@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/format.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -157,6 +158,8 @@ auto format_cell(const ColumnEntry& entry, std::size_t row) -> std::string {
                 return quote_and_escape(col[row]);
             } else if constexpr (std::is_same_v<T, double>) {
                 return format_float_mixed(col[row]);
+            } else if constexpr (std::is_same_v<T, Decimal>) {
+                return decimal::to_string(col[row].units, decimal_type_of(col).scale);
             } else {
                 return ibex::formatting::format("{}", col[row]);
             }

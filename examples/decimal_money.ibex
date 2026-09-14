@@ -1,0 +1,29 @@
+// Monetary aggregation with exact decimals.
+//
+// Run from the repository root:  ibex examples/decimal_money.ibex
+//
+// Amounts are read straight into Decimal(12, 2) -- the text is parsed to an
+// exact count of cents, never through a binary double -- so every total below
+// is exact to the cent, and the one place a value is rounded (tax to the cent)
+// says so explicitly: Decimal(x, p, s) rounds half away from zero.
+import "csv";
+
+let ledger = read_csv("examples/data/ledger.csv", "", ",", true,
+                      "account:str,category:str,amount:decimal(12,2),tax_rate:decimal(5,4)");
+
+// Per-account totals. sum over Decimal(12, 2) is Decimal(38, 2): exact, and an
+// error rather than a wrap if it ever exceeded 38 digits.
+ledger[select { total = sum(amount), lines = count() }, by account][order account];
+
+// Tax per line. amount * tax_rate is Decimal(17, 6) -- exact -- and the cast
+// states the rounding to the cent.
+let taxed = ledger[update { tax = Decimal(amount * tax_rate, 12, 2) }];
+taxed[select { net = sum(amount), tax = sum(tax), gross = sum(amount + tax) }, by account][order account];
+
+// The classic floating-point failure, side by side: ten fees of 0.10 should
+// total exactly 1. The decimal sum does; the Float64 sum misses by ~1e-16,
+// which the display's 7 significant digits would otherwise hide.
+ledger[filter category == "fee", select {
+    exact_error = sum(amount) - 1,
+    float64_error = sum(Float64(amount)) - 1.0,
+}];

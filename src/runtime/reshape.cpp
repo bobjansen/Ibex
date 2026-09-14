@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
@@ -537,9 +538,49 @@ auto rbind_table(const std::vector<const Table*>& tables,
             }
         }
 
+        // Decimal operands may differ in precision and scale; their units are
+        // only comparable at one scale. The result takes the narrowest type
+        // holding every operand exactly and rescales each row into it (null
+        // slots are never read -- their payload is undefined).
+        std::optional<ColumnValue> decimal_built;
+        if (std::holds_alternative<Column<Decimal>>(*ref_entry.column)) {
+            DecimalType unified = decimal_type_of(
+                std::get<Column<Decimal>>(*tables[0]->columns[col_pos[0][ci]].column));
+            for (std::size_t ti = 1; ti < tables.size(); ++ti) {
+                unified = decimal::union_type(unified,
+                                              decimal_type_of(std::get<Column<Decimal>>(
+                                                  *tables[ti]->columns[col_pos[ti][ci]].column)));
+            }
+            Column<Decimal> dst = make_decimal_column(unified);
+            dst.reserve(total_rows);
+            for (const auto& [ti, r] : order) {
+                const ColumnEntry& src_entry = tables[ti]->columns[col_pos[ti][ci]];
+                if (is_null(src_entry, r)) {
+                    dst.push_back(Decimal{});
+                    continue;
+                }
+                const auto& src = std::get<Column<Decimal>>(*src_entry.column);
+                Int128 units = 0;
+                if (!decimal::rescale(src[r].units, decimal_type_of(src).scale, unified.scale,
+                                      units) ||
+                    !decimal::fits(units, unified.precision)) {
+                    return std::unexpected("rbind: column '" + ref_entry.name + "' does not fit " +
+                                           decimal::type_name(unified));
+                }
+                dst.push_back(Decimal{units});
+            }
+            decimal_built = ColumnValue{std::move(dst)};
+        }
+
         ColumnValue built = std::visit(
             [&](const auto& ref_col) -> ColumnValue {
                 using Col = std::decay_t<decltype(ref_col)>;
+                if constexpr (std::is_same_v<Col, Column<Decimal>>) {
+                    // Built above, with the operands' scales unified.
+                    if (decimal_built.has_value()) {
+                        return std::move(*decimal_built);
+                    }
+                }
                 Col dst;
                 dst.reserve(total_rows);
                 if (merge_key.has_value()) {

@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/builder.hpp>
 #include <ibex/ir/node.hpp>
@@ -535,6 +536,10 @@ auto timestamp_lit(Timestamp v) -> ir::Expr {
     return ir::Expr{ir::Literal{v}};
 }
 
+auto decimal_lit(DecimalValue v) -> ir::Expr {
+    return ir::Expr{ir::Literal{v}};
+}
+
 auto binop(ir::ArithmeticOp op, ir::Expr lhs, ir::Expr rhs) -> ir::Expr {
     return ir::Expr{ir::BinaryExpr{
         .op = op,
@@ -575,7 +580,8 @@ namespace {
 auto mk_expr(ir::Expr e) -> ir::ExprPtr {
     return ir::make_expr_ptr(std::move(e));
 }
-auto lit_expr(std::variant<std::int64_t, double, bool, std::string, Date, Timestamp> v)
+auto lit_expr(
+    std::variant<std::int64_t, double, bool, std::string, Date, Timestamp, DecimalValue> v)
     -> ir::Expr {
     return ir::Expr{.node = ir::Literal{.value = std::move(v)}};
 }
@@ -605,6 +611,9 @@ auto filter_date(Date v) -> ir::Expr {
     return lit_expr(v);
 }
 auto filter_timestamp(Timestamp v) -> ir::Expr {
+    return lit_expr(v);
+}
+auto filter_decimal(DecimalValue v) -> ir::Expr {
     return lit_expr(v);
 }
 

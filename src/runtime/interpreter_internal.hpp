@@ -296,7 +296,7 @@ inline void push_key_value(Key& key, const ColumnValue& column, const ValidityBi
 /// comparing the row where it sits lets a Key be built once per *group*, which
 /// is what the group index actually needs to keep.
 struct KeyCol {
-    enum class Kind : std::uint8_t { Int64, Double, Bool, Str, Cat, Date, Ts };
+    enum class Kind : std::uint8_t { Int64, Double, Bool, Str, Cat, Date, Ts, Dec };
     Kind kind{Kind::Int64};
     const std::int64_t* i64{nullptr};
     const double* f64{nullptr};
@@ -305,6 +305,9 @@ struct KeyCol {
     const Column<Categorical>* cat{nullptr};
     const Date* date{nullptr};
     const Timestamp* ts{nullptr};
+    /// Units only: within one key column every row shares the column's scale,
+    /// so units equality is value equality.
+    const Decimal* dec{nullptr};
     const ValidityBitmap* validity{nullptr};
 
     [[nodiscard]] auto is_null(std::size_t row) const noexcept -> bool {
@@ -346,6 +349,9 @@ inline auto make_key_col(const ColumnValue& column, const ValidityBitmap* validi
     } else if (const auto* c_ts = std::get_if<Column<Timestamp>>(&column)) {
         key_col.kind = KeyCol::Kind::Ts;
         key_col.ts = c_ts->data();
+    } else if (const auto* c_dec = std::get_if<Column<Decimal>>(&column)) {
+        key_col.kind = KeyCol::Kind::Dec;
+        key_col.dec = c_dec->data();
     } else {
         return std::nullopt;
     }
@@ -420,6 +426,9 @@ inline auto hash_key_row(const std::vector<KeyCol>& cols, std::size_t row) -> st
             case KeyCol::Kind::Ts:
                 mix(std::hash<std::int64_t>{}(col.ts[row].nanos));
                 break;
+            case KeyCol::Kind::Dec:
+                mix(decimal::hash_units(col.dec[row].units));
+                break;
             case KeyCol::Kind::Str:
             case KeyCol::Kind::Cat:
                 mix(std::hash<std::string_view>{}(col.text(row)));
@@ -456,6 +465,10 @@ inline auto hash_key_value(const Key& key) -> std::uint64_t {
                 using T = std::decay_t<decltype(v)>;
                 if constexpr (std::is_same_v<T, std::string>) {
                     return std::hash<std::string_view>{}(std::string_view{v});
+                } else if constexpr (std::is_same_v<T, DecimalValue>) {
+                    // Units only, as hash_key_row's Dec case: the row side has
+                    // no per-row type to mix in.
+                    return decimal::hash_units(v.units);
                 } else {
                     return std::hash<T>{}(v);
                 }
@@ -504,6 +517,11 @@ inline auto key_equals_row(const Key& key, const std::vector<KeyCol>& cols, std:
                 break;
             case KeyCol::Kind::Ts:
                 if (std::get<Timestamp>(value).nanos != col.ts[row].nanos) {
+                    return false;
+                }
+                break;
+            case KeyCol::Kind::Dec:
+                if (std::get<DecimalValue>(value).units != col.dec[row].units) {
                     return false;
                 }
                 break;
@@ -595,7 +613,8 @@ struct Null {
     auto operator==(const Null&) const -> bool = default;
 };
 
-using ExprValue = std::variant<Null, std::int64_t, double, bool, std::string, Date, Timestamp>;
+using ExprValue =
+    std::variant<Null, std::int64_t, double, bool, std::string, Date, Timestamp, DecimalValue>;
 
 /// ScalarValue -> ExprValue: total. The monostate (null) alternative maps to
 /// ExprValue::Null.
@@ -1123,6 +1142,8 @@ inline auto append_scalar(ColumnValue& column, const ScalarValue& value) -> void
                 } else {
                     invariant_violation("append_scalar: expected String scalar for Categorical");
                 }
+            } else if constexpr (std::is_same_v<ValueType, Decimal>) {
+                col.push_back(Decimal{decimal_units_for(value, decimal_type_of(col))});
             }
         },
         column);
@@ -1138,6 +1159,10 @@ inline auto broadcast_scalar_column(const ScalarValue& value, std::size_t rows) 
                 // path is a contract violation.
                 invariant_violation("broadcast_scalar_column: null scalar has no column image");
                 return ColumnValue{Column<std::int64_t>{}};
+            } else if constexpr (std::is_same_v<V, DecimalValue>) {
+                Column<Decimal> col = make_decimal_column(v.type);
+                col.resize(rows, Decimal{v.units});
+                return ColumnValue{std::move(col)};
             } else {
                 Column<V> col;
                 col.resize(rows, v);
@@ -1163,7 +1188,54 @@ inline auto scalar_kind_from_value(const ScalarValue& value) -> ExprType {
     if (std::holds_alternative<Timestamp>(value)) {
         return ExprType::Timestamp;
     }
+    if (std::holds_alternative<DecimalValue>(value)) {
+        return ExprType::Decimal;
+    }
     return ExprType::String;
+}
+
+/// 64-bit order keys for a Decimal column, for the sort and rank paths that
+/// flatten every key to sign-flipped `uint64`. Exact either way:
+///
+///   - units that fit int64 (always, for precision <= 18) are sign-flipped
+///     directly, like an Int64 key;
+///   - otherwise each row gets its dense ordinal rank among the column's
+///     values, which preserves order and ties -- the same trick the
+///     Categorical sort key uses for its dictionary.
+///
+/// Null rows' payloads are undefined and get whatever key falls out; the
+/// consumers order nulls by the validity bitmap before they look at keys.
+inline auto decimal_order_keys(const Column<Decimal>& col, std::size_t rows)
+    -> std::vector<std::uint64_t> {
+    constexpr std::uint64_t kSignFlip = std::uint64_t{1} << 63U;
+    std::vector<std::uint64_t> out;
+    out.reserve(rows);
+    const Decimal* data = col.data();
+    const bool fits64 = std::all_of(data, data + rows, [](const Decimal& d) {
+        return d.units >= Int128{INT64_MIN} && d.units <= Int128{INT64_MAX};
+    });
+    if (fits64) {
+        for (std::size_t i = 0; i < rows; ++i) {
+            out.push_back(static_cast<std::uint64_t>(static_cast<std::int64_t>(data[i].units)) ^
+                          kSignFlip);
+        }
+        return out;
+    }
+    std::vector<std::uint32_t> order(rows);
+    for (std::size_t i = 0; i < rows; ++i) {
+        order[i] = static_cast<std::uint32_t>(i);
+    }
+    std::ranges::sort(
+        order, [&](std::uint32_t a, std::uint32_t b) { return data[a].units < data[b].units; });
+    out.resize(rows);
+    std::uint64_t rank = 0;
+    for (std::size_t r = 0; r < rows; ++r) {
+        if (r > 0 && data[order[r]].units != data[order[r - 1]].units) {
+            ++rank;
+        }
+        out[order[r]] = rank;
+    }
+    return out;
 }
 
 inline auto scalar_from_literal(const ir::Literal& literal) -> ScalarValue {
@@ -1533,6 +1605,15 @@ inline auto double_to_sortable_u64(double value) -> std::uint64_t {
 /// aggregates (median/quantile/skew/kurtosis) reduce disjoint per-group slices,
 /// which splits across workers. Callers that aggregate the whole table into one
 /// group have nothing to split and pass nothing.
+/// `aggregate_table` for a query with a Decimal aggregate input (int128
+/// accumulators, checked overflow); every non-Decimal aggregate in the query is
+/// delegated back to `aggregate_table`. decimal_aggregate.cpp.
+[[nodiscard]] auto aggregate_table_decimal(const Table& input,
+                                           const std::vector<ir::ColumnRef>& group_by,
+                                           const std::vector<ir::AggSpec>& aggregations,
+                                           const ExecutionContext* exec)
+    -> std::expected<Table, std::string>;
+
 [[nodiscard]] auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group_by,
                                    const std::vector<ir::AggSpec>& aggregations,
                                    const ExecutionContext* exec = nullptr)

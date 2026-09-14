@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/column_name_map.hpp>
 #include <ibex/ir/join_output.hpp>
@@ -85,7 +86,10 @@ auto literal_type(const Literal& lit) -> ColumnType {
                 return ColumnType::String;
             } else if constexpr (std::is_same_v<T, Date>) {
                 return ColumnType::Date;
+            } else if constexpr (std::is_same_v<T, DecimalValue>) {
+                return ColumnType::Decimal;
             } else {
+                static_assert(std::is_same_v<T, Timestamp>);
                 return ColumnType::Timestamp;
             }
         },
@@ -118,6 +122,9 @@ auto cast_target(std::string_view callee) -> std::optional<ColumnType> {
     }
     if (callee == "Date") {
         return ColumnType::Date;
+    }
+    if (callee == "Decimal") {
+        return ColumnType::Decimal;
     }
     return std::nullopt;
 }
@@ -152,6 +159,15 @@ auto expr_type(const Expr& expr, const SchemaInfo& input) -> std::optional<Colum
         const auto right = expr_type(*bin->right, input);
         if (!left.has_value() || !right.has_value()) {
             return std::nullopt;
+        }
+        if (*left == ColumnType::Decimal || *right == ColumnType::Decimal) {
+            // Mirrors the runtime rule: Decimal meets Decimal or Int exactly,
+            // `/` yields Float64. Anything else is a runtime type error.
+            const auto other = *left == ColumnType::Decimal ? *right : *left;
+            if (other != ColumnType::Decimal && !is_int(other)) {
+                return std::nullopt;
+            }
+            return bin->op == ArithmeticOp::Div ? ColumnType::Float64 : ColumnType::Decimal;
         }
         if (!is_numeric(*left) || !is_numeric(*right)) {
             return std::nullopt;  // non-numeric arithmetic is unsupported / uncertain
@@ -556,6 +572,8 @@ auto type_name(ColumnType type) -> std::string_view {
             return "Timestamp";
         case ColumnType::Categorical:
             return "Categorical";
+        case ColumnType::Decimal:
+            return "Decimal";
     }
     return "?";
 }
@@ -644,6 +662,9 @@ enum class KeyKind : std::uint8_t {
     String,
     Date,
     Timestamp,
+    /// Kept apart from Int: a decimal key joins only a decimal key (scales
+    /// are aligned at run time), never an integer one.
+    Decimal,
 };
 
 auto key_kind(ColumnType type) -> KeyKind {
@@ -665,6 +686,8 @@ auto key_kind(ColumnType type) -> KeyKind {
             return KeyKind::Date;
         case ColumnType::Timestamp:
             return KeyKind::Timestamp;
+        case ColumnType::Decimal:
+            return KeyKind::Decimal;
     }
     return KeyKind::String;
 }
@@ -782,6 +805,8 @@ auto extern_call_site_key(const std::string& callee, const std::vector<Expr>& ar
                     key += std::to_string(value);
                 } else if constexpr (std::is_same_v<T, Date>) {
                     key += "d" + std::to_string(value.days);
+                } else if constexpr (std::is_same_v<T, DecimalValue>) {
+                    key += "m" + decimal::to_string(value);
                 } else {
                     key += "t" + std::to_string(value.nanos);
                 }

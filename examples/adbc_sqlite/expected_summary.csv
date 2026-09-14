@@ -1,0 +1,4 @@
+symbol,trades,shares,notional,vwap
+AAPL,3,200,38165,190.825
+MSFT,3,80,32840,410.5
+NVDA,3,70,8430,120.42857142857143

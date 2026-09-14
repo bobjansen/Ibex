@@ -34,6 +34,8 @@ benchmarking/results/*_artifacts.tar.gz
 *.tar.gz
 *.tsv
 !examples/leetcode/data/*.csv
+# The ADBC demo's expected output, diffed by examples/adbc_sqlite/run.sh.
+!examples/adbc_sqlite/expected_summary.csv
 # Test fixtures: small CSVs that regression tests read (nulls cannot be written as
 # an Ibex array literal, so null-bearing test data has to come from a file).
 !tests/data/*.csv

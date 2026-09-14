@@ -6,9 +6,11 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cmath>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <expected>
 #include <functional>
 #include <stdexcept>
@@ -450,7 +452,9 @@ struct ParsedText {
     }
     const std::string text = to_string(units, scale);
     double out = 0.0;
-    (void)std::from_chars(text.data(), text.data() + text.size(), out);
+    // strtod, not from_chars: Apple's libc++ (Xcode 15) has no floating-point
+    // from_chars. `text` is our own NUL-terminated, locale-neutral digits.
+    out = std::strtod(text.c_str(), nullptr);
     return out;
 }
 
@@ -480,7 +484,9 @@ struct ParsedText {
 /// `Decimal(0.1, 10, 2)` is `0.10` rather than the binary expansion of 0.1.
 [[nodiscard]] inline auto from_double(double value, DecimalType target)
     -> std::expected<Int128, std::string> {
-    if (value != value || value == 1.0 / 0.0 || value == -1.0 / 0.0) {
+    // std::isfinite, not `x == 1.0 / 0.0`: MSVC rejects a constant division by
+    // zero outright (C2124).
+    if (!std::isfinite(value)) {
         return std::unexpected("cannot convert NaN or infinity to Decimal");
     }
     std::array<char, 64> buf{};
@@ -494,7 +500,7 @@ struct ParsedText {
 /// The exact decimal a double *literal* denotes, typed by its own digits.
 [[nodiscard]] inline auto literal_from_double(double value)
     -> std::expected<DecimalValue, std::string> {
-    if (value != value || value == 1.0 / 0.0 || value == -1.0 / 0.0) {
+    if (!std::isfinite(value)) {
         return std::unexpected("cannot convert NaN or infinity to Decimal");
     }
     std::array<char, 64> buf{};

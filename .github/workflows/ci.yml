@@ -117,9 +117,10 @@ jobs:
             -R '^StreamBuffered feeds a TimeBucket stream from a producer thread$' \
             --repeat until-pass:3
 
-  # The ADBC plugin needs a driver manager and a driver, which the other jobs do
-  # not install. conda-forge ships both; this job builds only the plugin and its
-  # integration tests (the options grammar is covered by ibex_tests elsewhere).
+  # The ADBC plugin builds its driver manager from the pinned Apache release;
+  # the SQLite driver comes from scripts/install_adbc_driver.sh, the pinned and
+  # hash-checked route the docs recommend. This job builds only the plugin, its
+  # integration tests and the demo (the options grammar is covered by ibex_tests).
   adbc:
     runs-on: ubuntu-24.04
     steps:
@@ -128,19 +129,12 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++-13 cmake ninja-build
+          sudo apt-get install -y g++-13 cmake ninja-build unzip
 
-      - name: Install ADBC driver manager and SQLite driver
-        uses: mamba-org/setup-micromamba@v2
-        with:
-          environment-name: adbc
-          create-args: >-
-            libadbc-driver-manager
-            libadbc-driver-sqlite
-          init-shell: bash
+      - name: Install the ADBC SQLite driver
+        run: scripts/install_adbc_driver.sh --dest "$RUNNER_TEMP/adbc-drivers" sqlite
 
       - name: Configure
-        shell: bash -el {0}
         run: |
           cmake -B build \
             -G Ninja \
@@ -155,9 +149,7 @@ jobs:
             -DIBEX_BUILD_LIGHTGBM=OFF \
             -DIBEX_BUILD_KAFKA=OFF \
             -DIBEX_BUILD_ADBC=ON \
-            -DADBC_INCLUDE_DIR="$CONDA_PREFIX/include" \
-            -DADBC_DRIVER_MANAGER_LIBRARY="$CONDA_PREFIX/lib/libadbc_driver_manager.so" \
-            -DADBC_DRIVER_SQLITE_LIBRARY="$CONDA_PREFIX/lib/libadbc_driver_sqlite.so"
+            -DADBC_DRIVER_SQLITE_LIBRARY="$RUNNER_TEMP/adbc-drivers/sqlite/libadbc_driver_sqlite.so"
 
       - name: Build
         run: cmake --build build --parallel --target ibex_adbc_plugin ibex_adbc_tests ibex_repl_bin ibex_args_plugin ibex_csv_plugin

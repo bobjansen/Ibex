@@ -464,8 +464,11 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
         <h3>Minimal SQLite query</h3>
         <p>
           <code>read_adbc</code> takes a driver, a database URI or path, and a
-          SQL query. Passing the SQLite driver shared library path is the most
-          portable shape when you are using a conda environment.
+          SQL query. The driver is a name such as <code>"sqlite"</code>,
+          resolved through an ADBC driver manifest, or a path to the driver
+          library. <code>scripts/install_adbc_driver.sh sqlite</code> installs
+          Apache's SQLite driver (pinned and SHA-256 checked, no Python or
+          conda) and writes the manifest.
         </p>
         <p>
           When using <code>import "adbc"</code> in the REPL, start Ibex with
@@ -475,7 +478,7 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
 <pre><code><span class="kw">import</span> <span class="str">"adbc"</span>;
 
 <span class="kw">let</span> trades = <span class="fn-name">read_adbc</span>(
-    <span class="str">"/path/to/libadbc_driver_sqlite.so"</span>,
+    <span class="str">"sqlite"</span>,
     <span class="str">"/tmp/trades.sqlite"</span>,
     <span class="str">"select symbol, qty, px from trades order by qty desc"</span>
 );</code></pre>
@@ -489,7 +492,7 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
           and shows that an empty result keeps its schema. One command runs it
           and checks the output; it is also the <code>adbc:sqlite_demo</code> test.
         </p>
-<pre><code><span class="cm"># with the driver installed in the active conda env</span>
+<pre><code>scripts/install_adbc_driver.sh sqlite
 examples/adbc_sqlite/run.sh build</code></pre>
       </article>
       <article class="card" style="margin-top:1rem;">
@@ -545,7 +548,7 @@ measurements[<span class="kw">select</span> {
         driver-specific; check the driver's documentation.
       </p>
 <pre><code><span class="kw">let</span> trades = <span class="fn-name">read_adbc</span>(
-    <span class="str">"/path/to/libadbc_driver_sqlite.so"</span>,
+    <span class="str">"sqlite"</span>,
     <span class="str">"/tmp/trades.sqlite"</span>,
     <span class="str">"select symbol, qty, px from trades"</span>,
     <span class="str">"stmt.adbc.sqlite.query.batch_rows=10000;conn.post.adbc.sqlite.load_extension.enabled=true"</span>

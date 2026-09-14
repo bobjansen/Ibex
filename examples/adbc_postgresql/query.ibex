@@ -1,0 +1,17 @@
+// Run one SQL query against PostgreSQL and print the result. The README uses
+// it to try each column type Ibex is expected to reject, one at a time:
+//   ibex --plugin-path build/tools examples/adbc_postgresql/query.ibex -- --sql "select ..."
+import "adbc";
+import "args";
+
+let args = parse_args("
+    driver (d) : string?
+    uri        : string?
+    sql        : string
+");
+let driver = coalesce(scalar(args[filter name == "driver", select { value }]), "postgresql");
+let uri = coalesce(scalar(args[filter name == "uri", select { value }]),
+    "postgresql://postgres:ibex@localhost:55432/postgres");
+let sql = scalar(args[filter name == "sql", select { value }]);
+
+read_adbc(driver, uri, sql);

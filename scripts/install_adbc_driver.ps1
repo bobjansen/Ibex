@@ -21,11 +21,13 @@
 # To bump a driver: change $AdbcVersion and every hash in $Wheels, taking
 # them from https://pypi.org/pypi/adbc-driver-<name>/<version>/json.
 
-[CmdletBinding()]
+# PositionalBinding off: otherwise a bare driver name binds to -Dest, the first
+# declared parameter, and -Drivers is reported missing.
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$Dest = (Join-Path $env:LOCALAPPDATA 'ADBC\Drivers'),
     [switch]$NoRegistry,
-    [Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)]
+    [Parameter(Mandatory = $true, Position = 0, ValueFromRemainingArguments = $true)]
     [string[]]$Drivers
 )
 

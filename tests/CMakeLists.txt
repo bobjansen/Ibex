@@ -189,6 +189,13 @@ if(TARGET ibex_adbc_plugin AND ADBC_DRIVER_SQLITE_LIBRARY)
             IBEX_ADBC_SQLITE_DRIVER="${_ibex_adbc_sqlite_driver}"
     )
     unset(_ibex_adbc_sqlite_driver)
+    # Both paths above are this build machine's; exe_path.hpp lets the tests
+    # also find the plugin next to the binary when it runs elsewhere (the
+    # Windows CI artifact).
+    target_include_directories(ibex_adbc_tests PRIVATE "${PROJECT_SOURCE_DIR}/tools")
+    if(WIN32)
+        target_compile_definitions(ibex_adbc_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    endif()
     if(TARGET Ibex::Sanitizers)
         target_link_libraries(ibex_adbc_tests PRIVATE Ibex::Sanitizers)
     endif()

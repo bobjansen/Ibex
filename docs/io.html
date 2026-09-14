@@ -481,6 +481,18 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
 );</code></pre>
       </article>
       <article class="card" style="margin-top:1rem;">
+        <h3>Runnable trades walkthrough</h3>
+        <p>
+          <code>examples/adbc_sqlite/</code> is self-contained: it builds an
+          11-row trades database with nulls, reads it in three Arrow batches,
+          filters, computes notional and VWAP per symbol in Ibex, exports a CSV,
+          and shows that an empty result keeps its schema. One command runs it
+          and checks the output; it is also the <code>adbc:sqlite_demo</code> test.
+        </p>
+<pre><code><span class="cm"># with the driver installed in the active conda env</span>
+examples/adbc_sqlite/run.sh build</code></pre>
+      </article>
+      <article class="card" style="margin-top:1rem;">
         <h3>1M-row measurements showcase</h3>
         <p>
           The helper script below loads the first 1,000,000 rows of the 1BRC
@@ -500,7 +512,7 @@ LD_LIBRARY_PATH=~/envs/ibex/lib:$LD_LIBRARY_PATH \
 <span class="kw">import</span> <span class="str">"adbc"</span>;
 
 <span class="kw">let</span> measurements = <span class="fn-name">read_adbc</span>(
-    <span class="str">"~/envs/ibex/lib/libadbc_driver_sqlite.so"</span>,
+    <span class="str">"/path/to/libadbc_driver_sqlite.so"</span>,
     <span class="str">"/tmp/measurements_1m.sqlite"</span>,
     <span class="str">"select station, temp from measurements"</span>
 );

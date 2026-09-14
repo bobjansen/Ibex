@@ -195,6 +195,15 @@ if(TARGET ibex_adbc_plugin AND ADBC_DRIVER_SQLITE_LIBRARY)
     # matching ibex_tests cases such as the options-grammar tests. (No space
     # after the colon: discovery drops it.)
     catch_discover_tests(ibex_adbc_tests TEST_PREFIX "adbc:")
+
+    # The examples/adbc_sqlite walkthrough, run end to end through the ibex CLI
+    # and checked against its expected summary, so the demo cannot rot.
+    if(TARGET ibex_repl_bin AND TARGET ibex_args_plugin AND TARGET ibex_csv_plugin AND NOT WIN32)
+        add_test(NAME adbc:sqlite_demo
+            COMMAND bash "${PROJECT_SOURCE_DIR}/examples/adbc_sqlite/run.sh")
+        set_tests_properties(adbc:sqlite_demo PROPERTIES
+            ENVIRONMENT "IBEX_BIN=$<TARGET_FILE:ibex_repl_bin>;IBEX_PLUGIN_DIR=${IBEX_PLUGIN_OUTPUT_DIR};ADBC_DRIVER_SQLITE=${ADBC_DRIVER_SQLITE_LIBRARY}")
+    endif()
 endif()
 
 if(TARGET ibex_eval_bin AND TARGET ibex_compile_bin AND NOT WIN32)

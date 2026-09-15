@@ -289,7 +289,7 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
             std::visit(
                 [&](const auto& sorted) {
                     for (std::size_t i = 0; i < rows; ++i)
-                        idx[i] = sorted[i];
+                        idx[i] = static_cast<std::size_t>(sorted[i]);  // Row index is below rows.
                 },
                 sort_result);
         } else {

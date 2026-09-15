@@ -3230,7 +3230,9 @@ class HashAggregateState final {
         }
         multi_cat_cell_dense_.assign(static_cast<std::size_t>(plan.total_cells), kNoGid);
         for (std::size_t g = 0; g < n_groups_; ++g) {
-            multi_cat_cell_dense_[cat_cell_of_group(plan, g)] = static_cast<std::uint32_t>(g);
+            // The dense plan is bounded by kDenseCellLimit, including on wasm32.
+            multi_cat_cell_dense_[static_cast<std::size_t>(cat_cell_of_group(plan, g))] =
+                static_cast<std::uint32_t>(g);
         }
         multi_cat_strides_ = plan.strides;
     }

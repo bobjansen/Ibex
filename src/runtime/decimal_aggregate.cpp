@@ -180,8 +180,9 @@ struct GidUnits {
 };
 struct GidUnitsHash {
     auto operator()(const GidUnits& k) const noexcept -> std::size_t {
-        return decimal::hash_units(k.units) ^
-               (static_cast<std::size_t>(k.gid) * 0x9E3779B97F4A7C15ULL);
+        return static_cast<std::size_t>(
+            decimal::hash_units(k.units) ^
+            (static_cast<std::uint64_t>(k.gid) * 0x9E3779B97F4A7C15ULL));
     }
 };
 struct GidUnitsEq {

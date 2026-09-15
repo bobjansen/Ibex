@@ -733,7 +733,7 @@ ewma(col, alpha)  // ignores null rows; returns null for an empty group
 
 Over a `Decimal(p, s)` column, `sum` is `Decimal(38, s)` (exact, and an error
 past 38 digits); `min`, `max`, `first` and `last` keep the column's type;
-`mean` divides the exact sum in decimal (carried to 38 digits) and only then
+`mean` divides the exact sum in decimal (without capping the quotient's scale at 38) and only then
 converts to `Float64`, so `mean` of `0.10, 0.20, 0.30` is exactly `0.2`; `count` and
 `count_distinct` are `Int64`. The statistical aggregates (`median`, `std`,
 `quantile`, `ewma`, `skew`, `kurtosis`) are not defined for `Decimal` — convert

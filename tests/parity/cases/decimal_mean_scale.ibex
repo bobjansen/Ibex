@@ -1,0 +1,4 @@
+let t = Table {
+    x = [decimal"1e-38", decimal"0e-38", decimal"0e-38"],
+};
+t[select { m = mean(x) }];

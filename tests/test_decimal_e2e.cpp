@@ -219,6 +219,18 @@ TEST_CASE("Decimal converts to Float64 and whole values to Int64", "[decimal][e2
     CHECK(contains(run_err("t[update { i = Int64(price) }];", tables), "not a whole number"));
 }
 
+TEST_CASE("Decimal mean preserves values at maximum scale", "[decimal][e2e]") {
+    runtime::Table t;
+    t.add_column("x", dec_col(dec_type(38, 38), {"1e-38", "0", "0"}));
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+    const auto out = run_ok("t[select { m = mean(x) }];", tables);
+    const auto* mean = std::get_if<Column<double>>(out.find("m"));
+    REQUIRE(mean != nullptr);
+    REQUIRE(mean->size() == 1);
+    CHECK((*mean)[0] == 3.3333333333333333e-39);
+}
+
 TEST_CASE("Decimal refuses to mix with Float64 columns", "[decimal][e2e]") {
     const auto tables = prices();
     CHECK(contains(run_err("t[update { z = price + f }];", tables), "Float64"));

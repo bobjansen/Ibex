@@ -73,7 +73,7 @@ fractional digits than the target scale (CSV), and float→decimal casts.
 |---|---|
 | `sum` | `Decimal(38, s)`, checked |
 | `min`, `max`, `first`, `last` | input type |
-| `mean` | `Float64`: the exact sum divided in decimal (38 digits), then converted |
+| `mean` | `Float64`: the exact sum divided in decimal, with fractional digits beyond scale 38 when needed, then converted |
 | `count`, `count_distinct` | `Int64` |
 | `median`, `std`, `var`, `quantile`, … | rejected (cast to Float64 explicitly) |
 

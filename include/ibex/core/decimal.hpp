@@ -13,6 +13,8 @@
 #include <cstdlib>
 #include <expected>
 #include <functional>
+#include <locale>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -462,26 +464,31 @@ struct ParsedText {
     return out;
 }
 
-/// The double nearest `units·10^-scale / divisor` (divisor > 0): the quotient
-/// is formed in decimal first -- the dividend widened toward 38 digits, divided
-/// exactly and rounded half away -- and only then converted. Dividing two
-/// doubles instead rounds twice, which turns an exact mean like 0.60 / 3 into
-/// 0.19999999999999998.
+/// Convert `units·10^-scale / divisor` (divisor > 0) through decimal long
+/// division. The quotient is not a stored Decimal: its fractional digits may
+/// extend beyond scale 38. Keep 128 fractional digits before applying the
+/// scale, enough to distinguish double rounding boundaries throughout the
+/// supported decimal/int64 range. Remainders stay below divisor, so multiplying
+/// them by ten fits int128. Conversion happens once, in the classic locale.
 [[nodiscard]] inline auto divide_to_double(Int128 units, int scale, std::int64_t divisor)
     -> double {
     const auto d = Int128{divisor};
-    Int128 n = units;
-    int s = scale;
-    while (s < kMaxPrecision && magnitude(n) <= kMaxUnits / 10) {
-        n = n * 10;
-        ++s;
+    const Int128 n = magnitude(units);
+    std::string text = units < 0 ? "-" : "";
+    text += to_string(n / d, 0);
+    text += '.';
+    Int128 remainder = n % d;
+    for (int i = 0; i < 128 && remainder != 0; ++i) {
+        remainder *= 10;
+        text += static_cast<char>('0' + static_cast<int>(remainder / d));
+        remainder %= d;
     }
-    Int128 q = n / d;
-    const Int128 r = magnitude(n % d);
-    if (r >= magnitude(d) - r) {
-        q = (n < 0) != (d < 0) ? q - 1 : q + 1;
-    }
-    return to_double(q, s);
+    text += "e-" + std::to_string(scale);
+    std::istringstream input(text);
+    input.imbue(std::locale::classic());
+    double result = 0.0;
+    input >> result;
+    return result;
 }
 
 /// A double fitted to `target` through its shortest round-trip text, so

@@ -219,6 +219,10 @@ TEST_CASE("decimal division to double rounds once, not twice", "[decimal]") {
     // A dividend already at 38 digits cannot widen; the quotient still rounds.
     CHECK(dec::divide_to_double(dec::kMaxUnits, 0, 1) == 1e38);
     CHECK(dec::divide_to_double(dec::pow10(37), 37, 4) == 0.25);
+    CHECK(dec::divide_to_double(1, 38, 3) == 3.3333333333333333e-39);
+    CHECK(dec::divide_to_double(-1, 38, 3) == -3.3333333333333333e-39);
+    CHECK(dec::divide_to_double(3, 38, 2) == 1.5e-38);
+    CHECK(dec::divide_to_double(1, 38, INT64_MAX) == 1.0842021724855044e-57);
 }
 
 TEST_CASE("decimal hash distinguishes high and low halves", "[decimal]") {

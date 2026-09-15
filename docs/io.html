@@ -464,8 +464,14 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
         <h3>Minimal SQLite query</h3>
         <p>
           <code>read_adbc</code> takes a driver, a database URI or path, and a
-          SQL query. Passing the SQLite driver shared library path is the most
-          portable shape when you are using a conda environment.
+          SQL query. The driver is a name such as <code>"sqlite"</code>,
+          resolved through an ADBC driver manifest, or a path to the driver
+          library. <code>scripts/install_adbc_driver.sh sqlite</code> installs
+          Apache's SQLite driver (pinned and SHA-256 checked, no Python or
+          conda) and writes the manifest. On Windows, run
+          <code>powershell -ExecutionPolicy Bypass -File scripts\install_adbc_driver.ps1 sqlite</code>;
+          the bypass lasts for that one process and is needed because Windows
+          refuses unsigned scripts that came from a download.
         </p>
         <p>
           When using <code>import "adbc"</code> in the REPL, start Ibex with
@@ -475,10 +481,22 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
 <pre><code><span class="kw">import</span> <span class="str">"adbc"</span>;
 
 <span class="kw">let</span> trades = <span class="fn-name">read_adbc</span>(
-    <span class="str">"/path/to/libadbc_driver_sqlite.so"</span>,
+    <span class="str">"sqlite"</span>,
     <span class="str">"/tmp/trades.sqlite"</span>,
     <span class="str">"select symbol, qty, px from trades order by qty desc"</span>
 );</code></pre>
+      </article>
+      <article class="card" style="margin-top:1rem;">
+        <h3>Runnable trades walkthrough</h3>
+        <p>
+          <code>examples/adbc_sqlite/</code> is self-contained: it builds an
+          11-row trades database with nulls, reads it in three Arrow batches,
+          filters, computes notional and VWAP per symbol in Ibex, exports a CSV,
+          and shows that an empty result keeps its schema. One command runs it
+          and checks the output; it is also the <code>adbc:sqlite_demo</code> test.
+        </p>
+<pre><code>scripts/install_adbc_driver.sh sqlite
+examples/adbc_sqlite/run.sh build</code></pre>
       </article>
       <article class="card" style="margin-top:1rem;">
         <h3>1M-row measurements showcase</h3>
@@ -500,7 +518,7 @@ LD_LIBRARY_PATH=~/envs/ibex/lib:$LD_LIBRARY_PATH \
 <span class="kw">import</span> <span class="str">"adbc"</span>;
 
 <span class="kw">let</span> measurements = <span class="fn-name">read_adbc</span>(
-    <span class="str">"~/envs/ibex/lib/libadbc_driver_sqlite.so"</span>,
+    <span class="str">"/path/to/libadbc_driver_sqlite.so"</span>,
     <span class="str">"/tmp/measurements_1m.sqlite"</span>,
     <span class="str">"select station, temp from measurements"</span>
 );
@@ -516,16 +534,27 @@ measurements[<span class="kw">select</span> {
     <article class="card" style="margin-top:1rem;">
       <h3>Optional ADBC options string</h3>
       <p>
-        The 4th argument is an optional <code>key=value</code> string separated
-        by semicolons or newlines. Prefix keys with <code>db.</code>,
-        <code>conn.</code>, or <code>stmt.</code> to target database,
-        connection, or statement options.
+        The 4th argument is optional (it defaults to <code>""</code>): a
+        <code>key=value</code> string separated by semicolons or newlines.
+        Prefix keys with <code>db.</code>, <code>conn.</code>, or
+        <code>stmt.</code> to target database, connection, or statement
+        options. The rest of the key reaches the driver unchanged, so use the
+        full ADBC name: <code>conn.adbc.connection.autocommit</code>, not
+        <code>conn.autocommit</code>.
       </p>
-<pre><code><span class="kw">let</span> remote = <span class="fn-name">read_adbc</span>(
-    <span class="str">"adbc_driver_postgresql"</span>,
-    <span class="str">"postgresql://user:pass@host/db"</span>,
-    <span class="str">"select * from trades where qty &gt; 0"</span>,
-    <span class="str">"conn.autocommit=true;stmt.query_timeout_ms=5000"</span>
+      <p>
+        <code>conn.post.</code> sets a connection option after the connection
+        is opened, for options a driver only accepts on an open connection
+        (SQLite extension loading, for example). A backslash escapes
+        <code>;</code>, <code>=</code> and <code>\</code> inside keys and
+        values. Option names beyond the standard <code>adbc.*</code> keys are
+        driver-specific; check the driver's documentation.
+      </p>
+<pre><code><span class="kw">let</span> trades = <span class="fn-name">read_adbc</span>(
+    <span class="str">"sqlite"</span>,
+    <span class="str">"/tmp/trades.sqlite"</span>,
+    <span class="str">"select symbol, qty, px from trades"</span>,
+    <span class="str">"stmt.adbc.sqlite.query.batch_rows=10000;conn.post.adbc.sqlite.load_extension.enabled=true"</span>
 );</code></pre>
     </article>
   </section>

@@ -26,13 +26,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ninja-build
 
       - name: Set up Emscripten
-        uses: mymindstorm/setup-emsdk@v14
+        uses: emscripten-core/setup-emsdk@v16
         with:
           version: 3.1.69
           actions-cache-folder: emsdk-cache
 
       - name: Cache ccache
-        uses: hendrikmuhs/ccache-action@v1
+        uses: hendrikmuhs/ccache-action@v1.2.24
         with:
           key: pages-wasm
 
@@ -68,7 +68,7 @@ jobs:
         uses: actions/configure-pages@v6
 
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@v5
         with:
           path: docs
 

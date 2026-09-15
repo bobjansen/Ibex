@@ -1,0 +1,102 @@
+name: ADBC
+
+# The ADBC plugin, its integration tests and the SQLite demo. Separate from
+# ci.yml so it also runs on adbc-* branches without a pull request, and can be
+# started by hand (Actions -> ADBC -> Run workflow).
+on:
+  push:
+    branches: [main, 'adbc-**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # The plugin builds its driver manager from the pinned Apache release; the
+  # SQLite driver comes from scripts/install_adbc_driver.sh, the pinned and
+  # hash-checked route the docs recommend. Builds only the plugin, its
+  # integration tests and the demo (the options grammar is covered by ibex_tests).
+  adbc-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-13 cmake ninja-build unzip
+
+      - name: Install the ADBC SQLite driver
+        run: scripts/install_adbc_driver.sh --dest "$RUNNER_TEMP/adbc-drivers" sqlite
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=g++-13 \
+            -DIBEX_WARNINGS_AS_ERRORS=ON \
+            -DIBEX_ENABLE_SANITIZERS=ON \
+            -DIBEX_BUILD_TESTS=ON \
+            -DIBEX_BUILD_TOOLS=ON \
+            -DIBEX_BUILD_PARQUET=OFF \
+            -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
+            -DIBEX_BUILD_LIGHTGBM=OFF \
+            -DIBEX_BUILD_KAFKA=OFF \
+            -DIBEX_BUILD_ADBC=ON \
+            -DADBC_DRIVER_SQLITE_LIBRARY="$RUNNER_TEMP/adbc-drivers/sqlite/libadbc_driver_sqlite.so"
+
+      - name: Build
+        run: cmake --build build --parallel --target ibex_adbc_plugin ibex_adbc_tests ibex_repl_bin ibex_args_plugin ibex_csv_plugin
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --no-tests=error -R '^adbc:'
+
+  # MSVC build of the same targets. The driver comes from
+  # scripts/install_adbc_driver.ps1, which also registers it under
+  # HKCU\SOFTWARE\ADBC\Drivers so the smoke test can load it by name. The
+  # build is uploaded for trying on a Windows machine without a compiler.
+  adbc-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install the ADBC SQLite driver
+        run: scripts/install_adbc_driver.ps1 sqlite
+
+      - name: Configure
+        run: |
+          cmake -B build `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DIBEX_WARNINGS_AS_ERRORS=ON `
+            -DIBEX_BUILD_TESTS=ON `
+            -DIBEX_BUILD_TOOLS=ON `
+            -DIBEX_BUILD_PYTHON_BRIDGE=OFF `
+            -DIBEX_BUILD_PARQUET=OFF `
+            -DIBEX_BUILD_LIGHTGBM=OFF `
+            -DIBEX_BUILD_ADBC=ON `
+            -DADBC_DRIVER_SQLITE_LIBRARY="$env:LOCALAPPDATA/ADBC/Drivers/sqlite/adbc_driver_sqlite.dll"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel --target ibex_adbc_plugin ibex_adbc_tests ibex_repl_bin ibex_args_plugin ibex_csv_plugin
+
+      - name: Test
+        run: ctest --test-dir build --build-config Release --output-on-failure --no-tests=error -R '^adbc:'
+
+      - name: Smoke test (driver found by name through the registry)
+        run: |
+          Set-Content -Path smoke.ibex -Value 'import "adbc";', 'read_adbc("sqlite", "", "select 42 as answer");'
+          $out = & build/tools/ibex.exe --plugin-path build/tools smoke.ibex 2>&1 | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0 -or $out -notmatch '\| 42 ') { exit 1 }
+
+      - name: Upload the build for manual testing
+        uses: actions/upload-artifact@v7
+        with:
+          name: ibex-windows-adbc
+          path: |
+            build/tools/*.exe
+            build/tools/*.dll
+            build/tools/*.ibex
+            scripts/install_adbc_driver.ps1
+            examples/adbc_postgresql/*
+          if-no-files-found: error

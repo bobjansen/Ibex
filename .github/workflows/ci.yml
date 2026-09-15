@@ -117,6 +117,8 @@ jobs:
             -R '^StreamBuffered feeds a TimeBucket stream from a producer thread$' \
             --repeat until-pass:3
 
+  # The ADBC jobs (Linux and Windows) live in adbc.yml.
+
   build-and-test-windows:
     strategy:
       matrix:

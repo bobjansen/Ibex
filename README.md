@@ -760,19 +760,33 @@ cmake --build build-release --config Release
 ```
 
 The bundled Parquet plugin fetches and builds Apache Arrow automatically. The
-ADBC plugin is optional and additionally requires an ADBC C/C++ driver manager
-(`adbc.h` and `libadbc_driver_manager`), so the standard build leaves it off.
-To enable it with conda-forge:
+ADBC plugin is optional and off by default. With `-DIBEX_BUILD_ADBC=ON` it
+likewise fetches and builds the ADBC driver manager from a pinned, hash-checked
+Apache release, so no conda environment or system package is needed to build
+it. Database drivers are separate and loaded at run time; install one with:
 
 ```bash
-mamba create -n ibex-adbc -c conda-forge adbc-driver-manager
-mamba activate ibex-adbc
-cmake -B build-release -DIBEX_BUILD_ADBC=ON -DCMAKE_PREFIX_PATH="$CONDA_PREFIX"
+cmake -B build-release -DIBEX_BUILD_ADBC=ON
+scripts/install_adbc_driver.sh sqlite postgresql
 ```
 
-On supported Debian/Ubuntu releases, Apache Arrow's APT repository provides
-the equivalent `libadbc-driver-manager-dev` package. The ADBC driver manager
-only supplies the API: install an appropriate ADBC database driver separately.
+The script downloads Apache's own driver builds (pinned by version and
+SHA-256), needs only `curl`, `unzip` and `sha256sum`, and writes an ADBC driver
+manifest to `~/.config/adbc/drivers` so scripts can say `read_adbc("sqlite", ...)`.
+On Windows, `scripts\install_adbc_driver.ps1` does the same with only what ships
+with Windows PowerShell, registering each driver under `HKCU\SOFTWARE\ADBC\Drivers`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_adbc_driver.ps1 sqlite
+```
+
+`-ExecutionPolicy Bypass` applies to that one PowerShell process only. Without
+it, a copy of the script that came from a download (a zip or a CI artifact, not
+a `git clone`) is refused as "not digitally signed"; `Unblock-File` on the
+script is the permanent alternative.
+Drivers from conda-forge, Apache Arrow's APT repository, or `dbc` work too, by
+path or by manifest. To link an installed driver manager instead of the bundled
+one, pass `-DIBEX_ADBC_SYSTEM_DRIVER_MANAGER=ON`.
 The experimental Python bridge is independent of the native plugins and needs
 a working Python interpreter plus development headers. The commands above turn
 it off to keep a native build from failing on systems without those headers. To
@@ -790,7 +804,8 @@ enable it, pass `-DIBEX_BUILD_PYTHON_BRIDGE=ON` and, if needed,
 | `IBEX_BUILD_TOOLS`          | `ON`    | Build REPL binary                  |
 | `IBEX_BUILD_EXAMPLES`       | `ON`    | Build example programs             |
 | `IBEX_BUILD_PARQUET`        | `ON`    | Build the bundled Parquet plugin   |
-| `IBEX_BUILD_ADBC`           | `OFF`   | Build the ADBC plugin (requires the system driver manager) |
+| `IBEX_BUILD_ADBC`           | `OFF`   | Build the ADBC plugin (fetches the ADBC driver manager) |
+| `IBEX_ADBC_SYSTEM_DRIVER_MANAGER` | `OFF` | Link an installed ADBC driver manager instead |
 | `IBEX_BUILD_PYTHON_BRIDGE`  | `ON`    | Build the experimental pyarrow Python bridge |
 | `IBEX_USE_CCACHE`           | `ON`    | Use ccache if found, to speed up rebuilds |
 
@@ -972,18 +987,28 @@ single JSON object. Type inference follows the same priority as CSV: Int64,
 Float64, Bool, String. Missing keys and JSON `null` values produce null
 bitmaps.
 
-`adbc.so` is optional and built with `-DIBEX_BUILD_ADBC=ON` when an installed
-ADBC driver manager is available. It exposes:
+`adbc.so` is optional and built with `-DIBEX_BUILD_ADBC=ON`. It exposes:
 
 ```ibex
 import "adbc";
-let df = read_adbc("adbc_driver_sqlite", "", "select 1 as x");
+let df = read_adbc("sqlite", "", "select 1 as x");
 ```
 
-The 4th optional argument is a `;` or newline-separated `key=value` string.
-Prefix keys with `db.`, `conn.`, or `stmt.` to target database, connection, or
-statement options, and use `entrypoint=...` to override the driver entrypoint
-symbol.
+The first argument is a driver name, resolved through an ADBC driver manifest
+(`scripts/install_adbc_driver.sh sqlite` writes one; `ADBC_DRIVER_PATH`,
+`$CONDA_PREFIX/etc/adbc/drivers`, `~/.config/adbc/drivers` and
+`/etc/adbc/drivers` are searched; on Windows, `scripts\install_adbc_driver.ps1`
+registers the name under `HKCU\SOFTWARE\ADBC\Drivers`), or a path to a driver
+library.
+
+The 4th optional argument (default `""`) is a `;` or newline-separated
+`key=value` string. Prefix keys with `db.`, `conn.`, or `stmt.` to target
+database, connection, or statement options; the rest of the key is passed to
+the driver unchanged, so use full ADBC names such as
+`conn.adbc.connection.autocommit=true`. `conn.post.` sets a connection option
+after the connection is opened (e.g. `conn.post.adbc.sqlite.load_extension.enabled=true`).
+A backslash escapes `;`, `=` and `\`. Use `entrypoint=...` to override the
+driver entrypoint symbol.
 
 `kafka.so` is optional and built with `-DIBEX_BUILD_KAFKA=ON` when
 `librdkafka` development files are available. It exposes live Kafka streaming

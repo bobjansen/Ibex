@@ -1533,5 +1533,64 @@ auto adopt_table_from_arrow(ArrowArray* array, const ArrowSchema& schema)
     return imported;
 }
 
+namespace {
+
+/// A zero-length ArrowArray tree shaped like a schema. Every buffer slot points
+/// at one shared zeroed block: with length 0 no value is read, and the zero
+/// block doubles as the single `0` offset a string or dictionary array needs.
+struct EmptyArrayNode {
+    ArrowArray array{};
+    std::vector<const void*> buffers;
+    std::vector<std::unique_ptr<EmptyArrayNode>> children;
+    std::vector<ArrowArray*> child_ptrs;
+    std::unique_ptr<EmptyArrayNode> dictionary;
+};
+
+auto build_empty_array(const ArrowSchema& schema, int depth) -> std::unique_ptr<EmptyArrayNode> {
+    alignas(64) static constexpr std::uint64_t kZeroBlock[8] = {};
+    // Arrow layouts use at most three buffers (validity, offsets, data).
+    constexpr std::int64_t kBuffers = 3;
+
+    auto node = std::make_unique<EmptyArrayNode>();
+    node->buffers.assign(kBuffers, static_cast<const void*>(kZeroBlock));
+    // Nesting deeper than any importable layout is cut off; the importer
+    // rejects such a column by format anyway.
+    if (depth < 8 && schema.n_children > 0 && schema.children != nullptr) {
+        node->children.reserve(static_cast<std::size_t>(schema.n_children));
+        node->child_ptrs.reserve(static_cast<std::size_t>(schema.n_children));
+        for (std::int64_t i = 0; i < schema.n_children; ++i) {
+            const ArrowSchema* child = schema.children[i];
+            node->children.push_back(child != nullptr ? build_empty_array(*child, depth + 1)
+                                                      : nullptr);
+            node->child_ptrs.push_back(child != nullptr ? &node->children.back()->array : nullptr);
+        }
+    }
+    if (depth < 8 && schema.dictionary != nullptr) {
+        node->dictionary = build_empty_array(*schema.dictionary, depth + 1);
+    }
+
+    ArrowArray& array = node->array;
+    array.length = 0;
+    array.null_count = 0;
+    array.offset = 0;
+    array.n_buffers = kBuffers;
+    array.buffers = node->buffers.data();
+    array.n_children = static_cast<std::int64_t>(node->child_ptrs.size());
+    array.children = node->child_ptrs.empty() ? nullptr : node->child_ptrs.data();
+    array.dictionary = node->dictionary != nullptr ? &node->dictionary->array : nullptr;
+    // Never released through the C interface: the node owns everything.
+    array.release = [](ArrowArray* self) { self->release = nullptr; };
+    array.private_data = nullptr;
+    return node;
+}
+
+}  // namespace
+
+auto empty_table_from_arrow_schema(const ArrowSchema& schema)
+    -> std::expected<runtime::Table, std::string> {
+    const auto root = build_empty_array(schema, 0);
+    return import_table_impl(root->array, schema, {});
+}
+
 }  // namespace ibex::interop
 // NOLINTEND(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays)

@@ -123,6 +123,7 @@ TEST_CASE("Decimal types and literals parse; impossible types are rejected", "[d
     CHECK_FALSE(parser::parse("t as DataFrame<{price: Decimal(5, 6)}>;").has_value());
     CHECK_FALSE(parser::parse("t[update { a = Decimal(qty, 0, 0) }];").has_value());
     CHECK_FALSE(parser::parse("t[update { a = decimal\"1.2.3\" }];").has_value());
+    CHECK_FALSE(parser::parse("t[update { x = decimal\"1e-39\" }];").has_value());
 }
 
 TEST_CASE("Decimal filters are exact across scales and literal kinds", "[decimal][e2e]") {

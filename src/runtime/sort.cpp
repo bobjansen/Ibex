@@ -251,7 +251,7 @@ auto lsd_multi_radix(const std::vector<std::vector<std::uint64_t>>& codes, std::
         const auto& code = codes[k];
         std::vector<std::uint64_t> gathered(rows);
         for (std::size_t i = 0; i < rows; ++i)
-            gathered[i] = code[idx[i]];
+            gathered[i] = code[static_cast<std::size_t>(idx[i])];  // Index is below rows.
         radix_sort_by_key(std::move(gathered), idx, rows);
     }
     return idx;
@@ -621,7 +621,7 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
             const auto& keys = flat_keys[0].u64;
             std::vector<std::size_t> position(buckets + 1, 0);
             for (std::size_t i = 0; i < rows; ++i) {
-                ++position[(keys[i] ^ kSignFlip) + 1];
+                ++position[static_cast<std::size_t>(keys[i] ^ kSignFlip) + 1];
             }
             if (flat_keys[0].ascending) {
                 for (std::size_t b = 1; b <= buckets; ++b) {
@@ -640,7 +640,8 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
             auto build = [&]<typename Idx>() -> SortIdx {
                 std::vector<Idx> idx(rows);
                 for (std::size_t i = 0; i < rows; ++i) {
-                    idx[position[keys[i] ^ kSignFlip]++] = static_cast<Idx>(i);
+                    idx[position[static_cast<std::size_t>(keys[i] ^ kSignFlip)]++] =
+                        static_cast<Idx>(i);
                 }
                 return SortIdx{std::move(idx)};
             };
@@ -701,7 +702,7 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
             }
         }
         std::ranges::sort(distinct);
-        for (std::uint64_t r = 0; r < distinct.size(); ++r)
+        for (std::size_t r = 0; r < distinct.size(); ++r)
             code_of[distinct[r]] = r;
         std::vector<std::uint64_t> code(rows);
         for (std::size_t i = 0; i < rows; ++i)

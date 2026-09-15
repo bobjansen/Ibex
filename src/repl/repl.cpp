@@ -3212,6 +3212,9 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         if (const auto* str_value = std::get_if<std::string>(&literal->value)) {
             return runtime::ScalarValue{*str_value};
         }
+        if (const auto* decimal_value = std::get_if<DecimalValue>(&literal->value)) {
+            return runtime::ScalarValue{*decimal_value};
+        }
         // `date"..."` / `ts"..."`. With these, the only LiteralExpr
         // alternative ScalarValue cannot hold is DurationLiteral, which is a
         // window/resample spec rather than a value, so it stays unsupported.

@@ -324,6 +324,17 @@ TEST_CASE("REPL: integer literal does NOT auto-coerce to Bool or String", "[repl
     REQUIRE_FALSE(ibex::repl::execute_script("let s: String = 5;", registry));
 }
 
+TEST_CASE("REPL preserves a Decimal scalar literal", "[repl][decimal]") {
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    const auto result = session.execute("let amount = decimal\"-12.30\"; amount;");
+    REQUIRE(result.ok);
+    REQUIRE(result.scalar.has_value());
+    const auto* value = std::get_if<ibex::DecimalValue>(&*result.scalar);
+    REQUIRE(value != nullptr);
+    CHECK(ibex::decimal::to_string(*value) == "-12.30");
+}
+
 TEST_CASE("REPL binds a date or timestamp literal as a scalar", "[repl][time]") {
     // These parse into LiteralExpr like any other literal, but the top-level
     // scalar binder only unpacked Int/Double/Bool/String and rejected the rest

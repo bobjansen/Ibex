@@ -167,6 +167,13 @@ TEST_CASE("decimal literals carry their own precision and scale", "[decimal]") {
     CHECK(v->units == 1500);
     CHECK(v->type == DecimalType{.precision = 4, .scale = 0});
     CHECK_FALSE(dec::parse_literal(std::string(39, '1')).has_value());
+    CHECK_FALSE(dec::parse_literal("1e-39").has_value());
+    CHECK_FALSE(dec::parse_literal("-5e-39").has_value());
+    CHECK_FALSE(dec::parse_literal("0." + std::string(38, '0') + "1").has_value());
+    REQUIRE(dec::parse_literal("1e-38").has_value());
+    CHECK(dec::parse_literal("1e-38")->units == 1);
+    // Explicit casts still round to the requested scale.
+    CHECK(*dec::parse("1e-39", DecimalType{.precision = 38, .scale = 38}) == 0);
 }
 
 TEST_CASE("decimal numeric conversions", "[decimal]") {

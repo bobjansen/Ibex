@@ -420,7 +420,11 @@ struct ParsedText {
     if (!parsed) {
         return std::unexpected(parsed.error());
     }
-    const int scale = std::clamp(parsed->scale, 0, kMaxPrecision);
+    if (parsed->scale > kMaxPrecision) {
+        return std::unexpected("decimal literal '" + std::string(text) +
+                               "' needs a scale greater than 38");
+    }
+    const int scale = std::max(parsed->scale, 0);
     const int precision = std::max(1, parsed->integral_digits + scale);
     if (precision > kMaxPrecision) {
         return std::unexpected("decimal literal '" + std::string(text) +

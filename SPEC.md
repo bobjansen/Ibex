@@ -256,7 +256,8 @@ An exact decimal constant, never converted through a binary float. Its type is
 read off its own digits: the scale is the number of digits after the point and
 the precision is the significant integral digits plus the scale (at least 1).
 `decimal"12.30"` is `Decimal(4, 2)`, `decimal"0.05"` is `Decimal(2, 2)`, and
-`decimal"1.5e3"` is `Decimal(4, 0)`. More than 38 digits is a parse error.
+`decimal"1.5e3"` is `Decimal(4, 0)`. More than 38 digits or a scale above 38
+is a parse error; exact literals are never rounded to fit.
 
 **Timestamps:**
 

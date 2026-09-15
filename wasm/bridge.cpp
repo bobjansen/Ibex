@@ -8,6 +8,7 @@
 // swapped with minimal change.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/repl/repl.hpp>
 #include <ibex/runtime/extern_registry.hpp>
@@ -17,13 +18,12 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <emscripten/bind.h>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
 #include <variant>
-
-#include <emscripten/bind.h>
 
 // data_gen is statically linked (see wasm/CMakeLists.txt); its shared-object
 // entry point is called directly instead of via dlopen.
@@ -54,6 +54,8 @@ auto column_type(const ibex::runtime::ColumnValue& value) -> std::string {
         return "Date";
     if (std::holds_alternative<Column<Timestamp>>(value))
         return "Timestamp";
+    if (const auto* column = std::get_if<Column<ibex::Decimal>>(&value))
+        return ibex::decimal::type_name(ibex::runtime::decimal_type_of(*column));
     return "Bool";
 }
 
@@ -69,6 +71,9 @@ auto cell_json(const ibex::runtime::ColumnEntry& entry, std::size_t row) -> json
                 return ibex::runtime::format_timestamp(column[row]);
             } else if constexpr (std::same_as<T, Categorical>) {
                 return std::string(column[row]);
+            } else if constexpr (std::same_as<T, ibex::Decimal>) {
+                return ibex::decimal::to_string(column[row].units,
+                                                ibex::runtime::decimal_type_of(column).scale);
             } else {
                 return column[row];
             }
@@ -105,6 +110,8 @@ auto scalar_json(const ibex::runtime::ScalarValue& value) -> json {
                 return ibex::runtime::format_date(scalar);
             } else if constexpr (std::same_as<T, Timestamp>) {
                 return ibex::runtime::format_timestamp(scalar);
+            } else if constexpr (std::same_as<T, ibex::DecimalValue>) {
+                return ibex::decimal::to_string(scalar);
             } else {
                 return scalar;
             }
@@ -144,7 +151,8 @@ class Bridge {
         json out;
         out["ok"] = result.ok;
         out["error"] = result.error;
-        out["error_line"] = result.error_line.has_value() ? json(*result.error_line) : json(nullptr);
+        out["error_line"] =
+            result.error_line.has_value() ? json(*result.error_line) : json(nullptr);
         out["error_column"] =
             result.error_column.has_value() ? json(*result.error_column) : json(nullptr);
         json results = json::array();

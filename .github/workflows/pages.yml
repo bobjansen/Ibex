@@ -44,6 +44,9 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           cmake --build build-wasm --target ibex_wasm
 
+      - name: Test WASM bridge
+        run: node wasm/demo/smoke.mjs
+
       - name: Stage playground artifacts
         run: |
           mkdir -p docs/playground

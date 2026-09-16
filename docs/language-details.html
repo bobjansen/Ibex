@@ -968,13 +968,19 @@ df[<span class="kw">update</span> {
       <!-- 8. rep() and boolean masks -->
       <div class="tour-item">
         <div class="tour-text">
-          <span class="tour-tag">rep &amp; Boolean Masks</span>
-          <h3>Fill, repeat, and cycle columns with named-argument syntax</h3>
+          <span class="tour-tag">rep, seq &amp; Boolean Masks</span>
+          <h3>Fill, repeat, cycle, and count columns</h3>
           <p>
             <code>rep(x)</code> mirrors R&rsquo;s <code>rep()</code>: it fills
-            a column by repeating a scalar literal or cycling an existing column.
-            Named arguments &mdash; <code>times</code>, <code>each</code>, and
-            <code>length_out</code> &mdash; control the exact repetition pattern.
+            a column by repeating a scalar literal, or by cycling a column or an
+            array literal. Named arguments &mdash; <code>times</code> and
+            <code>each</code> &mdash; control the repetition pattern. The output
+            is always one value per row of the frame.
+          </p>
+          <p>
+            Where <code>rep</code> tiles a pattern, <code>seq</code> advances:
+            <code>seq(from, by)</code> produces an arithmetic ramp, which is the
+            idiomatic way to add a row index or an evenly spaced axis.
           </p>
           <p>
             Passing a <code>Bool</code> literal produces a first-class
@@ -992,8 +998,11 @@ df[<span class="kw">update</span> { active = <span class="fn-name">rep</span>(<s
 <span class="cm">// Repeat each element of a column twice</span>
 df[<span class="kw">update</span> { rep2 = <span class="fn-name">rep</span>(price, each=<span class="num">2</span>) }];
 
-<span class="cm">// Named args: times, each, length_out</span>
-df[<span class="kw">update</span> { flag = <span class="fn-name">rep</span>(flag_col, times=<span class="num">50</span>) }];</code></pre>
+<span class="cm">// Cycle an array literal across all rows</span>
+df[<span class="kw">update</span> { g = <span class="fn-name">rep</span>([<span class="num">0</span>, <span class="num">1</span>, <span class="num">2</span>]) }];
+
+<span class="cm">// Row index, and an evenly spaced Float axis</span>
+df[<span class="kw">update</span> { i = <span class="fn-name">seq</span>(), t = <span class="fn-name">seq</span>(<span class="num">0.0</span>, <span class="num">0.5</span>) }];</code></pre>
         </div>
       </div>
 

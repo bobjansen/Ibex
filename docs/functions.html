@@ -173,7 +173,8 @@
             <tr><td><code>null_if_nan(x)</code></td><td>Turn <code>NaN</code> cells into null; existing nulls stay null.</td></tr>
             <tr><td><code>null_if_not_finite(x)</code></td><td>Turn <code>NaN</code>/<code>&plusmn;Inf</code> cells into null.</td></tr>
             <tr><td><code>is_nan(x)</code></td><td><code>Bool</code>: true for a valid <code>NaN</code> cell; null cells stay null.</td></tr>
-            <tr><td><code>rep(x, times=1, each=1, length_out=-1)</code></td><td>Repeat or cycle a value/column to build a full output column.</td></tr>
+            <tr><td><code>rep(x, times=1, each=1)</code></td><td>Repeat or cycle a value/column to build a full output column.</td></tr>
+            <tr><td><code>seq(from, by)</code></td><td>Arithmetic ramp, one value per row; positional, defaulting to <code>0</code> and <code>1</code>; <code>Float64</code> if either argument is.</td></tr>
           </tbody>
         </table>
       </article>

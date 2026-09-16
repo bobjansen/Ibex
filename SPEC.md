@@ -2801,7 +2801,7 @@ with columns sized to `n` rows, so RNG, `rep`, and sequence generators have a
 row count to emit against:
 
 ```
-Table(4000)[update { x = rand_normal(0.0, 1.0), g = rep(0, length_out=4000) }]
+Table(4000)[update { i = seq(), x = rand_normal(0.0, 1.0), g = rep([0, 1, 2]) }]
 ```
 
 A bare `Table(n)` displays as `rows: n` with no columns; once any column is
@@ -4024,7 +4024,7 @@ exactly one value per row of the current table.
 ### 12.8 `rep` — Repeat and Fill
 
 ```
-rep(x, times=1, each=1, length_out=-1)
+rep(x, times=1, each=1, length_out=<row count>)
 ```
 
 Produces a column by repeating a scalar literal or an existing column. Mirrors
@@ -4037,12 +4037,27 @@ R's `rep()` semantics within the columnar context.
 | `x` | *(required)* | Scalar literal (`Int`, `Float`, `Bool`, `String`) or column reference |
 | `times` | `1` | Repeat the whole sequence this many times |
 | `each` | `1` | Repeat each individual element this many times before advancing |
-| `length_out` | *(row count)* | Final output length; shorter sequences are cycled, longer ones truncated |
+| `length_out` | *(row count)* | Output length; **must equal the current table's row count** |
 
 `times`, `each`, and `length_out` must be positive integer literals and are
 passed as **named arguments**.  When `length_out` is omitted, the output
 length equals the number of rows in the current table (the normal case for
 `update`/`select`).
+
+**`length_out` cannot change the output length.** A field must produce exactly
+one value per row of the frame it is added to, so a `length_out` that differs
+from the row count is an error — it neither grows nor truncates the frame:
+
+```
+let t = Table { a = [1,2,3,4] };
+t[select { r = rep(1, length_out=10) }]   // error: rep: generates 10 rows but the frame has 4
+t[select { r = rep(1, length_out=2) }]    // error: rep: generates 2 rows but the frame has 4
+```
+
+The parameter is therefore redundant wherever it is legal, and is retained only
+for `rep`'s fidelity to R. Prefer omitting it; `rep(0)` and `rep([1,2,3])`
+already fill the frame. The `times`/`each` pattern is still fitted to that
+length: a short pattern is cycled and a long one truncated.
 
 **Scalar `x` — constant-fill column:**
 
@@ -4057,9 +4072,8 @@ df[update { mask = rep(true) }]
 df[update { source = rep("live") }]
 ```
 
-When `x` is a scalar the value of `times` and `each` are redundant (all
-repetitions of a scalar produce the same value); only `length_out` affects
-the output size.
+When `x` is a scalar, `times` and `each` are redundant — every repetition of a
+scalar produces the same value, and `length_out` cannot change the output size.
 
 **Column `x` — element-wise repetition:**
 
@@ -4081,6 +4095,56 @@ df[update { flag = rep(flag_col, times=50) }]
 
 **Constraint.** `rep` is not an aggregate function; it must not appear inside
 aggregate function calls (Section 7.3).
+
+### 12.9 `seq` — Arithmetic Sequence
+
+```
+seq(from, by)        // both optional: seq(), seq(from), seq(from, by)
+```
+
+Produces an arithmetic ramp with one value per row of the current table:
+`from`, `from + by`, `from + 2·by`, … Where `rep` **tiles** a pattern, `seq`
+**advances**, which is the one shape no `rep` form can produce.
+
+**Parameters:**
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `from` | `0` | First value |
+| `by` | `1` | Step between consecutive rows; may be negative or zero |
+
+Both are **positional** numeric literals. Unlike `rep`'s `times` / `each`,
+`from` and `by` are parameter names for documentation only and cannot be passed
+as named arguments — they are **reserved keywords** (§2), so `seq(from=0)` and
+`seq(0, by=1)` are parse errors. A named argument that does lex, such as
+`seq(0, step=2)`, is refused by `seq` itself. The positional form is also what
+type inference requires: the argument types decide whether the column is
+`Int64` or `Float64`, and named arguments are not visible to that pass.
+
+There is no `length_out`: the output length is always the frame's row count
+(§12.8 — the only length `rep`'s `length_out` accepts either).
+
+```
+// Row index 0,1,2,... over a generated frame
+Table(1000)[update { i = seq() }]
+
+// Start and step: 10,15,20,25,...
+Table(1000)[update { id = seq(10, 5) }]
+
+// An evenly spaced Float axis: 0.0, 0.5, 1.0, ...
+Table(1000)[update { t = seq(0.0, 0.5) }]
+
+// Descending
+Table(1000)[update { countdown = seq(999, -1) }]
+```
+
+**Return type:** `Int64` when `from` and `by` are both integer literals,
+`Float64` as soon as either is a float literal. Row *i* is computed as
+`from + by·i` rather than accumulated, so the float form does not drift.
+
+**Constraint.** `seq` is a generator, like `rep` and the RNG functions: it must
+not appear inside aggregate function calls (Section 7.3), and it is not
+row-local, so it is not evaluated under a partial row range.
 
 ---
 

@@ -17,16 +17,28 @@ jobs:
   # integration tests and the demo (the options grammar is covered by ibex_tests).
   adbc-linux:
     runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: ibex
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v6
 
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++-13 cmake ninja-build unzip
+          sudo apt-get install -y g++-13 cmake ninja-build unzip postgresql-client
 
       - name: Install the ADBC SQLite driver
-        run: scripts/install_adbc_driver.sh --dest "$RUNNER_TEMP/adbc-drivers" sqlite
+        run: scripts/install_adbc_driver.sh --dest "$RUNNER_TEMP/adbc-drivers" sqlite postgresql
 
       - name: Configure
         run: |
@@ -50,6 +62,14 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure --no-tests=error -R '^adbc:'
+
+      - name: Check PostgreSQL walkthrough
+        env:
+          ADBC_DRIVER_PATH: ${{ runner.temp }}/adbc-drivers
+          PGURI: postgresql://postgres:ibex@localhost:55432/postgres
+        run: |
+          psql "$PGURI" -v ON_ERROR_STOP=1 -f examples/adbc_postgresql/seed.sql
+          python3 examples/adbc_postgresql/check.py --uri "$PGURI"
 
   # MSVC build of the same targets. The driver comes from
   # scripts/install_adbc_driver.ps1, which also registers it under

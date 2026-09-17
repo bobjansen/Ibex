@@ -24,8 +24,9 @@ read_adbc(driver, uri,
 // 2. The driver hands numeric and jsonb over as text.
 read_adbc(driver, uri, "select id, price, doc from ibex_types order by id");
 
-// 3. Cast numeric in SQL to get a number, then aggregate in Ibex.
-read_adbc(driver, uri, "select label, price::float8 as price from ibex_types order by id")
+// 3. Convert the driver's numeric text exactly, then aggregate in Ibex.
+read_adbc(driver, uri, "select label, price from ibex_types order by id")
+    [update { price = Decimal(price, 12, 2) }]
     [select { rows = count(), priced = count(price), total = sum(price) }, by label, order label];
 
 // 4. A query with no matching rows keeps its columns and types.

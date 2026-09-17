@@ -77,10 +77,22 @@ inner quotes escaped). Expected:
 2. **Text-typed**: `price` (`numeric`) arrives as the strings `12.34`, `-0.50`
    and null; `doc` (`jsonb`) as the JSON text, shown as `"{\"k\": 1}"` and
    `"[1, 2]"`.
-3. **Aggregate** by label, with `price` cast to `float8` in SQL:
+3. **Aggregate** by label, with the driver's text converted to `Decimal(12, 2)`
+   in Ibex, preserving exact amounts without a Float64 conversion:
    `alpha` has 2 rows, 1 priced, total `12.34`; `beta` has 1 row, 1 priced,
-   total `-0.5`.
+   total `-0.50`.
 4. **Empty result**: columns `id`, `big_n` and `tstz`, zero rows.
+
+To check the seeded walkthrough automatically (also run in Linux ADBC CI):
+
+```bash
+python3 examples/adbc_postgresql/check.py --uri postgresql://postgres:ibex@localhost:55432/postgres
+```
+
+The check only reads the database. It verifies the grouped result, timestamp
+precision, exact 38-digit values, nulls, empty-result schema, and rejection of
+values exceeding Decimal precision. Use `--ibex`, `--plugins`, and `--driver`
+to override the default build paths and driver name.
 
 ## 5. Try the types Ibex refuses
 

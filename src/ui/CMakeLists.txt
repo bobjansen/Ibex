@@ -28,18 +28,26 @@ if(TARGET Ibex::Sanitizers)
     target_link_libraries(ibex_ui PRIVATE Ibex::Sanitizers)
 endif()
 
-find_program(IBEX_NPM_EXECUTABLE NAMES npm REQUIRED)
+if(WIN32)
+    # npm also ships an extensionless Unix shell script. Select the Windows
+    # launcher explicitly, using a separate cache entry from Unix discovery.
+    find_program(IBEX_NPM_CMD_EXECUTABLE NAMES npm.cmd REQUIRED)
+    set(IBEX_NPM_COMMAND cmd /d /c call "${IBEX_NPM_CMD_EXECUTABLE}")
+else()
+    find_program(IBEX_NPM_EXECUTABLE NAMES npm REQUIRED)
+    set(IBEX_NPM_COMMAND "${IBEX_NPM_EXECUTABLE}")
+endif()
 set(IBEX_UI_SOURCE_DIR "${PROJECT_SOURCE_DIR}/ui")
 set(IBEX_UI_OUTPUT_DIR "${IBEX_PLUGIN_OUTPUT_DIR}/ui")
 set(IBEX_UI_INDEX "${IBEX_UI_OUTPUT_DIR}/index.html")
 
 add_custom_command(
     OUTPUT "${IBEX_UI_INDEX}"
-    # Run npm through a child process: invoking npm.cmd directly from a Visual
-    # Studio build's batch script can skip all commands after npm ci.
-    COMMAND "${CMAKE_COMMAND}" -E env "${IBEX_NPM_EXECUTABLE}" ci --no-audit --no-fund
+    # On Windows, call npm.cmd in a child command interpreter so execution
+    # returns here after npm ci instead of skipping the asset build.
+    COMMAND ${IBEX_NPM_COMMAND} ci --no-audit --no-fund
     # Build directly into the declared custom-command output directory.
-    COMMAND "${CMAKE_COMMAND}" -E env "${IBEX_NPM_EXECUTABLE}" run build -- --outDir "${IBEX_UI_OUTPUT_DIR}"
+    COMMAND ${IBEX_NPM_COMMAND} run build -- --outDir "${IBEX_UI_OUTPUT_DIR}"
     WORKING_DIRECTORY "${IBEX_UI_SOURCE_DIR}"
     DEPENDS
         "${IBEX_UI_SOURCE_DIR}/package.json"

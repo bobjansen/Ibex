@@ -14,12 +14,6 @@
 
 namespace ibex::runtime {
 
-/// Validate and execute a plan whose root is owned by the physical executor.
-[[nodiscard]] auto build_migrated_physical_operator(
-    const physical::Plan& plan, const ir::Node& node, const TableRegistry& registry,
-    const ScalarRegistry* scalars, const ExternRegistry* externs, const ExecutionContext& exec,
-    ModelResult* model_out) -> std::expected<OperatorPtr, std::string>;
-
 /// Construction primitives supplied by the operator and pipeline families.
 /// The physical executor owns dispatch; these functions keep concrete operator
 /// types in the translation units that implement them.

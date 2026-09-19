@@ -1,6 +1,56 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+// pipeline_executor.cpp — the inter-operator parallel executors: Layers A and
+// B of src/runtime/PARALLELISM.md (read it before adding fan-out). Everything
+// here is a pull-based Operator, so a parallel pipeline plugs into the
+// ordinary next() chain. Layer C, the fan-out inside a single operator, lives
+// in the operators themselves.
+//
+// Layer B — morsel pipeline (a physical::Plan's parallel map prefix)
+//   build_map_pipeline_parallel (called from map_chunked.cpp) materializes the
+//   pipeline's input on the calling thread, then either runs the row-local
+//   chain as one whole-table chunk (is_worth_morselizing said no) or splits
+//   it into morsels:
+//     MorselPipelineOperator  one private MorselWorkerChain per worker, fed by
+//                             a MorselSource (GatherMorselSource copies the
+//                             morsel's rows, RangeFilterMorselSource evaluates
+//                             a range-native head filter in place). Results go
+//                             into an OrderedChunkRing and are released in
+//                             sequence order.
+//     TwoPhaseFilterOperator  a lone range-native filter: count survivors per
+//                             morsel, prefix-sum, then write disjoint slices of
+//                             one output chunk. No ring, no merge.
+//   try_take_join_probe / build_probe_morsel_pipeline put a streaming join's
+//   probe at the head of the worker chains (see join_chunked.cpp).
+//
+// Layer A — pipeline overlap across a breaker (called from runtime_entry.cpp)
+//   PipelinedScanOperator   workers each claim one source unit (e.g. a
+//                           Parquet row group), decode it, run a private
+//                           row-local chain over it, and publish into a bounded
+//                           OrderedChunkRing. The consumer drains the ring in
+//                           unit order. DeferredScanSourceOperator reads the
+//                           same sources without a row-local chain: workers
+//                           decode a window of units at a time, and the calling
+//                           thread serves them in unit order.
+//   PipelinedStageOperator  runs a breaker's child on its own scheduler thread
+//                           (NOT a pool thread) with a two-chunk buffer, so the
+//                           breaker overlaps with its producer. Only inserted
+//                           when has_multi_unit_deferred_scan says it can pay.
+//
+// Invariants every executor here keeps:
+//   - Output is byte-identical to the serial chain at any core count. Chunks
+//     carry `sequence` / `row_offset` and are released strictly in order, and
+//     an empty morsel is still emitted because a skipped sequence is a lost slot.
+//   - Errors are deterministic: the lowest-sequence failure wins, regardless
+//     of which thread failed first.
+//   - A worker never deadlocks the pool it runs on. A pool worker parked on a
+//     ring runs queued pool tasks while it waits (cooperative_ring_wait), so
+//     nested fan-out under it cannot be stranded. Inner parallel paths that
+//     check on_worker_pool_thread() run serially inside a task.
+//   - Per-worker operators are private copies. IR nodes, registries and the
+//     input table are shared and immutable.
+
 #include <ibex/core/column.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>

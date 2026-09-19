@@ -1,6 +1,61 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+// Lowering: Program AST (ast.hpp, see parser.cpp) -> IR node tree (ir/node.hpp).
+//
+// Entry points
+// ------------
+//   lower()        whole program -> one plan for the last expression statement
+//                  (wrapped in a ProgramNode when there are preamble calls).
+//   lower_script() whole script -> ScriptPlan { preamble, shared_bindings,
+//                  sinks, result } for the batch executor. Table-consuming
+//                  extern calls (sinks) are only allowed here.
+//   lower_expr()   one expression against a REPL-supplied LowerContext
+//                  (bindings, externs, functions, schemas already in scope).
+//
+// Each entry point runs the same four steps:
+//   1. analyze_effects() over the Program (lower_expr's caller has done it).
+//   2. Lowerer, a single-pass AST walker. Declarations (extern / fn) are
+//      collected first. Then:
+//        - identifier   -> the bound plan, cloned, if a `let` bound it,
+//                          else ScanNode(name). A let-bound table that is
+//                          referenced repeatedly and expensive to re-run
+//                          becomes a SharedBinding: materialized once, later
+//                          uses lower to Scan(name).
+//        - call         -> ExternCallNode for table-returning externs; table
+//                          UDFs are inlined (inline_table_udf).
+//        - join         -> JoinNode.
+//        - t[clauses]   -> lower_block, described below.
+//      Scalar/column expressions inside clauses go through lower_expr_to_ir
+//      into ir::Expr. Scalar and aggregate UDF calls are inlined there. A
+//      correlated scalar(...) subquery compared in a filter is decorrelated
+//      into a join (lower_filter / decorrelate / lower_scalar_subquery).
+//   3. Static checks over the finished tree: check_column_refs, check_joins.
+//   4. Schema-aware rewrites that must run before canonicalize fuses
+//      Filter(Join(..)): push_filters_into_joins, push_semi_joins_down,
+//      reduce_inner_joins_to_semi. lower() and lower_script() then run
+//      ir::optimize_plan. lower_expr() does not, because the REPL runs its own
+//      passes on the tree it returns.
+//
+// How a block lowers
+// ------------------
+// lower_block first records every clause in a ClauseState (at most one of
+// each kind) and rejects invalid combinations (select+update, resample
+// without select, dcast without by, ...). It then builds nodes bottom-up over
+// the base plan in a FIXED order, not in source order:
+//
+//   filter -> rename -> select (Aggregate if a field calls an aggregate,
+//   else Project) | distinct | update -> order -> window -> resample -> melt ->
+//   dcast -> cov | corr | transpose -> model -> head | tail
+//
+// `map { }` must be the only clause in its block and lowers to a MapNode.
+// window+select is a rolling projection handled inside the window step, not an
+// aggregation.
+//
+// The AST is not modified. Rewrites that need an edited AST (UDF parameter
+// substitution, map-field expansion) work on clones (clone_expr /
+// clone_clause).
+
 #include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/builder.hpp>

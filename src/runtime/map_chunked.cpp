@@ -66,13 +66,7 @@ struct ChunkIdentity {
     return chunk;
 }
 
-/// Per-chunk filter: pulls a chunk from the child, wraps it as a `Table`,
-/// reuses the existing `filter_table` predicate evaluator, and emits the
-/// filtered columns as the next chunk. Chunks that filter to zero rows
-/// are skipped — the operator loops until it has a non-empty chunk or
-/// the child stream ends.
-/// Keeps one zero-row chunk back so an operator that rejects every row still
-/// emits its schema.
+/// Preserves schema for operators that skip zero-row results.
 ///
 /// A stream carries its schema in its chunks, so an operator that emits no chunk
 /// emits no schema either: the result materializes as a table with no columns at
@@ -80,10 +74,10 @@ struct ChunkIdentity {
 /// a filter for the value it compares — fails with "unknown column" on what is
 /// really just an empty input.
 ///
-/// Row filters are where that bites, since they are what can reject everything.
-/// Each skips its empty chunks (forwarding them would be pure overhead), so this
-/// holds the first one back and releases it at end of stream if nothing else was
-/// ever emitted.
+/// Callers offer empty results as Tables; this helper retains the first one with
+/// columns, together with its chunk identity. At end of stream, release() converts
+/// it back to a zero-row chunk only if emitted() has never been called. The Table
+/// is storage for the empty columns and their metadata; no filtering happens here.
 class SchemaCarrier {
    public:
     /// Offer a zero-row result as the schema of last resort.
@@ -111,6 +105,14 @@ class SchemaCarrier {
     bool emitted_ = false;
 };
 
+/// Per-chunk filter: pulls from the child and delegates to kernel::filter_chunk.
+/// Supported predicates run directly on the chunk. The fallback moves its columns
+/// into a Table, builds a column-name index, calls filter_table, and converts the
+/// result back to a chunk while preserving sequence and row offset.
+///
+/// Normally skips zero-row results with columns, saving the first in SchemaCarrier
+/// so an all-rejected stream still emits its schema at end of stream. With
+/// preserve_empty_morsels enabled, forwards those empty chunks immediately instead.
 class ChunkedFilterOperator final : public Operator {
    public:
     ChunkedFilterOperator(OperatorPtr child, const ir::Expr* predicate,

@@ -62,34 +62,22 @@ auto plan_stats() -> PlanStats& {
     return stats;
 }
 
-/// The row count below which `ChunkedDistinctOperator` stays serial. It has
-/// lived as a bare `1U << 15U` inside that operator — twice, once per dedup
-/// path. The plan is now the single owner (src/runtime/PARALLELISM.md); the
-/// operator will read it in the follow-up slice.
+/// The row count below which `ChunkedDistinctOperator` stays serial.
 constexpr std::size_t kDistinctRowFloor = 1U << 15U;
 
-/// The most workers the packed-key partition strategy will use, matching the
-/// `std::size_t{64}` cap the operator applies today.
+/// Worker ceiling for the packed-key partition strategy.
 constexpr std::size_t kPackedKeyMaxWorkers = 64;
 
-/// A streaming join's two fan-out floors, matching the private constants in
-/// `chunked.cpp`: `build_partitions`'s `1U << 17U` and `probe_parallel_workers`'s
-/// `1U << 14U`. Both phases share the same `min(budget, pool, 64)` worker cap.
+/// Fan-out floors for streaming join build and probe phases. Both phases
+/// cap workers at the minimum of the compute budget, pool size, and 64.
 constexpr std::size_t kJoinBuildRowFloor = 1U << 17U;
 constexpr std::size_t kJoinProbeRowFloor = 1U << 14U;
 constexpr std::size_t kJoinMaxWorkers = 64;
 
-/// Hash-aggregate fan-out floors, matching the private constants in
-/// `chunked.cpp`. `kAggPartitionRowFloor` is Discovery's general radix path's
-/// `kDefaultPartitionMinRows` -- the row count below which `try_discover_
-/// partitioned` stays serial. `try_owned`'s lower `kPairOwnedMinRows` (65536)
-/// is not the phase floor: it is the operator-resolved "is the owned
-/// specialization worth it" gate, the same kind of runtime strategy choice the
-/// join operator makes for its build orientation, and it stays in the operator.
-/// `kAggFinalizeRowFloor` matches the `1U << 17U` group-count gate on
-/// `finalize_owned`'s parallel co-ranking merge. Discovery, Accumulation, and
-/// FinalOrdering retain the existing 64-worker ceiling; Emission is bounded by
-/// its output-column count and the shared compute budget.
+/// Hash-aggregate fan-out floors for radix partition discovery and finalization.
+/// The operator separately decides whether partition-owned key maps are worthwhile.
+/// Discovery, Accumulation, and FinalOrdering share a 64-worker ceiling; Emission
+/// is bounded by its output-column count and the shared compute budget.
 constexpr std::size_t kAggPartitionRowFloor = 1U << 18U;
 constexpr std::size_t kAggFinalizeRowFloor = 1U << 17U;
 constexpr std::size_t kAggMaxWorkers = 64;
@@ -326,9 +314,7 @@ auto node_kind_name_impl(ir::NodeKind kind) -> std::string_view {
             return "Update";
         case ir::NodeKind::Stream:
             return "Stream";
-        // The map kinds too: a chain can fall back with one of these at its
-        // root (`MalformedMapNode`), and an unlabeled bucket is exactly what
-        // made the first backlog reading unusable.
+        // Map kinds can also be fallback roots (`MalformedMapNode`).
         case ir::NodeKind::Scan:
             return "Scan";
         case ir::NodeKind::Filter:
@@ -382,14 +368,9 @@ auto kernel_null_policy_name(KernelNullPolicy policy) -> std::string_view {
     return "unknown";
 }
 
-/// Whether `node` is a map step this planner lowers. Filter-shaped kinds are
-/// maps unconditionally; an `Update` is a map exactly when the per-kind
-/// switch's own gate says so — no guard, no `by`, no tuple assignment, every
-/// field row-local (`is_row_local_update_expr`). That gate, not
-/// `execution_capability()`, is the authority here: capability encoding also
-/// declines a bare row-local Update, but for *morsel copy-cost* reasons
-/// (updates parallelize inside the operator instead), which is an execution
-/// choice the physical plan must not inherit as a shape decision.
+/// Whether `node` has a row-local map kernel. Kernel eligibility determines
+/// pipeline shape independently of morsel execution eligibility: row-local
+/// updates parallelize inside the operator to avoid morsel copy costs.
 auto is_map_step(const ir::Node& node) -> bool {
     return map_kernel_capability(node).has_value();
 }
@@ -460,16 +441,9 @@ auto fusible_chain_below(const ir::Node& node) -> FusibleChain {
             .update = ir::node_cast<ir::UpdateNode>(below)};
 }
 
-/// Decide the pipeline's execution mode from its own steps. These are the
-/// rules the deleted pipeline analysis applied while walking the IR itself;
-/// deciding them here means the chain is peeled once and its mode travels with
-/// it.
+/// Decide the pipeline's execution mode from its steps.
 void resolve_pipeline_mode(Plan& plan) {
-    // Search top-down for the outermost run of steps that may run over morsels.
-    // Outermost-first is the existing policy, not a new one: when a chain's root
-    // was ineligible, the per-kind recursion re-planned one node lower and took
-    // the first pipeline it found on the way down. This finds the same run without
-    // re-planning anything.
+    // Select the outermost eligible run of steps that can execute over morsels.
     SerialOnlyReason reason = SerialOnlyReason::NotParallelMap;
     std::size_t index = 0;
     while (index < plan.steps.size()) {
@@ -521,19 +495,8 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
     const ir::SourceSchemas schemas = planning_source_schemas(registry, source_schemas);
     plan_stats().plans_built.fetch_add(1, std::memory_order_relaxed);
 
-    // Describe a join even though the plan does not execute one yet. The plan
-    // is meant to be the single description of what a query does; letting it
-    // stay silent about 51% of the backlog until the day execution moves would
-    // mean the description and the executor land together, untested against
-    // each other.
-    // Single-implementation breakers: one operator runs each, nothing to
-    // classify, no fan-out point. The plan owns construction and `explain
-    // physical` names them; the per-kind switch's branch for each is deleted.
-    // `Head` is `ChunkedHeadOperator`; `Tail` materializes and calls
-    // `tail_table`; `TopK` is `ChunkedOrderedLimitOperator` (a serial
-    // bounded-heap select, O(n log k) -- deliberately not parallel, see
-    // src/runtime/PARALLELISM.md); `FilterHead` / `FilterTail` are the fused
-    // `ChunkedFilter{Head,Tail}Operator`.
+    // These breakers use a single operator with no fan-out phase. TopK uses
+    // a serial bounded-heap selection, O(n log k); Tail materializes its input.
     if (root.kind() == ir::NodeKind::Head || root.kind() == ir::NodeKind::Tail ||
         root.kind() == ir::NodeKind::TopK || root.kind() == ir::NodeKind::FilterHead ||
         root.kind() == ir::NodeKind::FilterTail) {
@@ -542,10 +505,8 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
         return plan;
     }
     if (root.kind() == ir::NodeKind::Distinct) {
-        // One fan-out phase. The planner sets the policy (floor, strategy,
-        // ceiling) and the estimate; `build_physical_distinct` resolves the
-        // worker cap and the operator reads it. See src/runtime/PARALLELISM.md,
-        // "Target: parallelism as a plan decision".
+        // The planner sets the dedup policy and estimate; the physical builder
+        // resolves the worker cap for the operator. See src/runtime/PARALLELISM.md.
         plan.migrated = true;
         plan.source_node = &root;
         plan.breaker_phases.push_back(
@@ -556,7 +517,7 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
     if (root.kind() == ir::NodeKind::Order) {
         // One operator runs every Order (`ChunkedOrderOperator` → `order_table`).
         // Its one fan-out point (the radix sort + row gather) is described so
-        // `explain physical` is not silent about it; the fan-out itself already
+        // `explain physical` is not silent about it; the fan-out itself
         // lives in `sort.cpp` on the shared knobs, so the phase is descriptive
         // rather than something the operator reads.
         plan.migrated = true;
@@ -567,9 +528,8 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
     if (root.kind() == ir::NodeKind::Aggregate) {
         const auto& aggregate = ir::node_cast<ir::AggregateNode>(root);
         plan.aggregate = plan_aggregate(aggregate);
-        // Streaming and fused aggregates are executed by the plan now.
-        // `MaterializeAll` is not: it still falls back and still counts, which
-        // is what keeps the backlog measuring the port rather than the label.
+        // Streaming and fused aggregates use physical operators; MaterializeAll
+        // uses the materialized fallback and contributes to fallback statistics.
         if (plan.aggregate.strategy != AggregateStrategy::MaterializeAll) {
             plan.migrated = true;
             plan.source_node = &root;
@@ -603,17 +563,15 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
     if (root.kind() == ir::NodeKind::Join) {
         const auto& join = ir::node_cast<ir::JoinNode>(root);
         plan.join = plan_join(join);
-        // A streaming join is executed by the plan now: `build_physical_join`
-        // builds it, not the per-kind switch. A materializing one is still a
-        // fallback and says so, which is why the backlog drops by the streaming
-        // joins only -- the ones actually ported.
+        // Streaming joins use physical operators; materializing joins use the
+        // fallback and contribute to fallback statistics.
         if (plan.join.strategy == JoinStrategy::StreamingProbe) {
             plan.migrated = true;
             plan.source_node = &root;
             // An inner join is two explicit physical nodes joined by a typed
             // build-output edge. Both retain the textual inputs because
             // orientation is resolved only after the build has measured them.
-            // Semi/anti still uses its separate operator and is not described
+            // Semi/anti uses its separate operator and is not described
             // by the inner join's runtime-oriented output type.
             if (plan.join.branch != JoinBranch::SemiAnti) {
                 plan.streaming_join = StreamingJoinNodes{
@@ -632,14 +590,12 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
         }
     }
 
-    // Peel map kinds top-down. `is_map_step` mirrors the per-kind switch's
-    // own routing decisions, so the plan can never admit a step the switch
-    // would build differently.
+    // Peel map kinds top-down using the shared kernel capability gates.
     const ir::Node* cur = &root;
     while (is_map_step(*cur)) {
         const auto& children = cur->children();
         if (children.size() != 1 || children.front() == nullptr) {
-            // Malformed map node: leave it to the existing executor, which
+            // Malformed map node: leave it to the fallback executor, which
             // produces the structural error message.
             plan.source_node = cur;
             plan.reason = FallbackReason::MalformedMapNode;
@@ -677,7 +633,7 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
         const MapKernelCapability capability = *step_capability;
         const MapKernelFactory factory = map_kernel_factory(capability);
         if (factory == nullptr) {
-            // Keep a malformed internal dispatch table on the established
+            // Keep a malformed internal dispatch table on the fallback
             // executor instead of constructing an invalid physical plan.
             plan.steps.clear();
             plan.source_node = cur;
@@ -698,16 +654,11 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
             plan.reason = FallbackReason::NotMapChain;
             return plan;
         }
-        // A map chain over a breaker. The chain is a pipeline; the breaker is
-        // its source, materialized by the existing executor. Constructing it is
-        // what the per-kind switch does for this subtree anyway -- the source
-        // goes through the public `build_operator` either way -- so this
-        // records the shape rather than changing it.
+        // Materialize the breaker subtree as the input to this map pipeline.
         source = SourceKind::MaterializedInput;
     }
     if (plan.steps.empty()) {
-        // A bare source: no map work to migrate, and the Scan/ExternCall
-        // branches below own its streaming decisions.
+        // A bare source has no map steps; its source operator owns streaming.
         plan.reason = FallbackReason::EmptyChain;
         return plan;
     }
@@ -791,17 +742,12 @@ auto explain_physical(const Plan& plan) -> std::string {
         }
         return out;
     }
-    // A migrated breaker at the root -- its own operator, no map steps. Route
-    // every such shape here: without it, anything `migrated` with no `steps`
-    // (order, distinct, head, a streaming join/aggregate) fell through to the
-    // MapPipeline branch below and printed `MapPipeline\n  source: TableScan()`
-    // -- a lie, since the root is not a scan and there is no pipeline.
+    // A root breaker has its own operator and no map pipeline to explain.
     if (plan.steps.empty() && plan.root != nullptr) {
         const std::string_view kind = node_kind_name_impl(plan.root->kind());
         if (plan.join.describes) {
-            // The strategy line, explicit build → probe edge, then each node's
-            // fan-out policy. `breaker_phases` remains for untyped breakers;
-            // a streaming join no longer hides its dataflow in two labels.
+            // Show the strategy, typed build-to-probe edge, and per-node fan-out
+            // policy. Untyped breakers use `breaker_phases`.
             out += "Breaker(Join)\n  " + explain_join(plan.join);
             if (plan.streaming_join.has_value()) {
                 out += "\n  edge: HashBuild.RuntimeOrientedBuildOutput -> HashProbe.build_input";
@@ -1080,8 +1026,7 @@ auto aggregate_emission_parallelism(RowEstimate estimate) -> BreakerParallelism 
 
 void resolve_breaker_parallelism(BreakerParallelism& bp, const ExecutionContext& exec,
                                  std::size_t pool_size) {
-    // A phase that names no floor of its own uses the shared knob. distinct's
-    // 32768 is a deliberate, now-visible override of it.
+    // Phases without their own floor inherit the shared minimum row count.
     if (bp.row_floor == 0) {
         bp.row_floor = exec.parallel_min_rows;
     }
@@ -1096,8 +1041,7 @@ void resolve_breaker_parallelism(BreakerParallelism& bp, const ExecutionContext&
         return;
     }
     bp.decline = FanOutDecline::None;
-    // The one place the worker cap is computed. It used to be open-coded as
-    // `std::min({budget, pool_size, 64})` inside each breaker's next().
+    // Resolve the worker cap from the compute budget, pool, and phase ceiling.
     std::size_t cap = exec.compute_budget();
     if (pool_size != 0) {
         cap = std::min(cap, pool_size);
@@ -1214,15 +1158,8 @@ auto plan_join(const ir::JoinNode& join) -> JoinPlan {
     out.kind = join.kind();
     out.key_count = join.keys().size();
 
-    // The DECISION is relayed, not restated: these are the same three functions
-    // the builder branches on. Reimplementing them is what made the first
-    // version of this planner wrong about two-key Int64 joins, and
-    // `interpreter_internal.hpp` had already written down why -- "a six-clause
-    // predicate duplicated across two files, where a later clause added to one
-    // copy silently routes a join the operator cannot handle".
-    // Ask each gate by name and remember which one answered, in the order the
-    // seam used to try them -- semi/anti first, since a semi join with one key
-    // satisfies nothing below it.
+    // Use the shared eligibility gates so planning and execution agree on
+    // supported join shapes. Check semi/anti before the inner-join strategies.
     if (is_streamable_semi_anti_join(join)) {
         out.branch = JoinBranch::SemiAnti;
     } else if (is_streamable_inner_join(join)) {
@@ -1277,13 +1214,8 @@ auto plan_join(const ir::JoinNode& join) -> JoinPlan {
         out.branch = JoinBranch::None;
         return out;
     }
-    // The two inputs, in textual order. Which one is hashed is decided by the
-    // build phase at run time from measured row counts, so the plan records
-    // the inputs and not an orientation. Which side *should* build is a cost
-    // question this plan still does not answer -- that is q12's diagnosed
-    // regression -- but the previous version of these two lines went further
-    // than "not answering" and asserted left-probes/right-builds, which the
-    // operator contradicts every time it swaps.
+    // Preserve textual input order. The build phase chooses which side to hash
+    // at run time from measured row counts.
     out.left_input = join.children()[0].get();
     out.right_input = join.children()[1].get();
     return out;
@@ -1350,14 +1282,9 @@ auto node_kind_name(ir::NodeKind kind) -> std::string_view {
 
 namespace {
 
-/// Whether a fallback kind is `accepted` (a permanent `MaterializedCall` — it is
-/// whole-table by nature or not breaker-shaped, so it will never become a
-/// streaming physical node) or `backlog` (a genuine candidate to migrate, but
-/// only once a profile shows it costing wall time — none currently does).
-///
-/// This is the disposition the kernel-pipeline plan's Phase 5 settled on: the
-/// adapter is the end state, not a way-station to zero fallbacks. `Scan` is the
-/// bare-source `EmptyChain` case, not a materialized call at all.
+/// Classify fallbacks as `accepted` materialized operations or `backlog`
+/// candidates for optimization when profiling justifies it. Bare `Scan` sources
+/// use `EmptyChain` and are excluded from this classification by the reporter.
 auto fallback_disposition(ir::NodeKind kind) -> std::string_view {
     switch (kind) {
         case ir::NodeKind::Join:  // non-equi / nulls-equal / expect — materializing by design
@@ -1385,7 +1312,7 @@ auto fallback_disposition(ir::NodeKind kind) -> std::string_view {
 
 auto physical_fallback_report() -> std::string {
     // Descending by count, each line tagged `accepted` (permanent
-    // MaterializedCall) or `backlog` (migrate only when profiled hot).
+    // MaterializedCall) or `backlog` (optimize when profiled hot).
     std::vector<std::pair<std::uint64_t, ir::NodeKind>> rows;
     for (std::size_t i = 0; i < kKindSlots; ++i) {
         const std::uint64_t n = plan_stats().fallback_by_kind[i].load(std::memory_order_relaxed);
@@ -1411,14 +1338,8 @@ auto physical_fallback_report() -> std::string {
 
 namespace {
 
-/// `IBEX_PLAN_STATS=1` prints the migration backlog at exit: how much of the
-/// query surface the physical plan describes, and what it does not.
-///
-/// The counters existed before this and nothing read them, which meant the plan
-/// document's own mitigation -- "every fallback explicit, profiled, and covered
-/// by a migration backlog keyed by its measured cost" -- was written down but
-/// not in place, and Phase 4's port order stayed the a-priori guess it was
-/// drafted as.
+/// Setting `IBEX_PLAN_STATS` enables exit-time plan counters and fallback counts
+/// by node kind, tagged with their accepted/backlog disposition.
 struct FallbackReporter {
     // The struct is only declared const in this file.
     bool enabled = std::getenv("IBEX_PLAN_STATS") != nullptr;

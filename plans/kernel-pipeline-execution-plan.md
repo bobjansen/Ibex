@@ -35,7 +35,7 @@ canonicalize table is in `include/ibex/ir/canonicalize.hpp`.
 `src/runtime/chunked.cpp` remains the residual streaming operator
 implementations and a large set of operator-specific construction rules.
 Planning lives in `physical_plan.cpp`, migrated-plan validation and dispatch in
-`physical_executor.cpp`, and generic map/morsel execution in
+`runtime_entry.cpp`, and generic map/morsel execution in
 `pipeline_executor.cpp`. Aggregate and streaming inner join have moved to
 family-owned translation units, but the remaining responsibilities are still
 grown together because
@@ -675,7 +675,7 @@ only when a profile shows it costing wall time.
    practical floor). The opt-in `IBEX_PROBE_MORSELS=1` POC retains a
    pre-existing SF4 q09 stall in both baseline and extracted trees; it remains
    disabled and is a separate correctness follow-up.
-   **Physical-plan executor DONE 2026-08-29.** `physical_executor.cpp` owns root
+   **Physical-plan executor DONE 2026-08-29.** `runtime_entry.cpp` owns root
    validation, migrated-kind dispatch, path accounting, and
    `build_operator_from_physical_plan`; concrete operator factories stay with
    their implementations. Correctness: focused physical tests (29 cases, 4.34M

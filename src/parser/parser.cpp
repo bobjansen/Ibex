@@ -1,6 +1,64 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+// Parser: Ibex source text -> Program AST (ast.hpp).
+//
+// How parsing happens
+// -------------------
+// parse() runs three passes:
+//   1. tokenize() (lexer.cpp) turns the whole source into a token vector up
+//      front. Lexing never fails outright: bad input becomes a
+//      TokenKind::Error token, which the parser reports when it reaches it.
+//   2. Parser, a hand-written recursive-descent parser over that vector, with
+//      one token of lookahead (peek / peek_next) and no backtracking. It stops
+//      at the first error: the failing routine stores it in `error_` and
+//      returns nullptr / nullopt, every caller propagates that unchanged, and
+//      parse_program() turns it into the std::unexpected result. There is no
+//      error recovery.
+//   3. analyze_effects() (effects.cpp) checks effect annotations over the
+//      finished Program. It can still reject a program that parsed correctly.
+//
+// Expression precedence, loosest to tightest (one routine per level; binary
+// levels loop, so they are left-associative):
+//   parse_join        a join b on ...   (inner/left/right/outer/semi/anti)
+//   parse_or          ||
+//   parse_and         &&
+//   parse_equality    == !=
+//   parse_comparison  < <= > >=, and postfix `is [not] null`
+//   parse_term        + -
+//   parse_factor      * / %
+//   parse_unary       prefix - !   (-<numeric literal> is folded into the literal)
+//   parse_postfix     expr[clause, ...]  and  expr as Type / expr as { schema }
+//   parse_primary     literals, identifiers, calls, (..)/{..} groups, case,
+//                     [..] arrays, Table(..), stream, ^name, left()/right()/outer()
+//
+// Shape of a parse
+// ----------------
+//   Program { vector<Stmt> }
+//   Stmt = ExternDecl | FunctionDecl | LetStmt | TupleLetStmt | ExprStmt | ImportDecl
+//     Every statement ends in ';' (except FunctionDecl, which ends at its
+//     closing '}') and records its start_line/end_line.
+//     FunctionDecl bodies are vector<FnStmt> (let / tuple-let / expression
+//     only; no nested fn, extern or control flow).
+//   Expr { variant node }: a tree owned through ExprPtr (unique_ptr<Expr>).
+//     Operators become UnaryExpr / BinaryExpr. Parentheses are kept as
+//     GroupExpr rather than dropped.
+//   A query is a BlockExpr: a base expression plus a vector<Clause>
+//   (filter, select, update, by, order, window, ...) in source order. So
+//   `t[filter x > 0, select {x}]` parses as BlockExpr{ base = t,
+//   clauses = [FilterClause, SelectClause] }. Chained brackets nest:
+//   `t[..][..]` is a BlockExpr whose base is another BlockExpr. The parser
+//   only requires `map { }` to be the last clause of a block. Lowering then
+//   requires it to be the only one.
+//
+// The AST is purely syntactic. Names are not resolved and nothing is type- or
+// schema-checked here. Some decisions are made later in lower.cpp, e.g.
+// whether left()/right() is actually inside a join predicate. The parser does
+// a few syntactic desugarings: interpolated backtick strings
+// `a${e}b` become CallExpr "__interp"(a, e, b) (the embedded expressions are
+// re-lexed and parsed by a sub-Parser), `as { .. }` becomes
+// `as DataFrame<{ .. }>`, and negated numeric literals are folded.
+
 #include <ibex/core/decimal.hpp>
 #include <ibex/format.hpp>
 #include <ibex/parser/ast.hpp>

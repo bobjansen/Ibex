@@ -1766,10 +1766,11 @@ files[map { source = path, out = `${dir}/${stem}.parquet` }];
     CHECK(map_clause->fields[1].name == "out");
 }
 
-TEST_CASE("Parse rejects map { } that is not the last clause") {
+TEST_CASE("Parse leaves map { } placement to lowering") {
+    // `map { }` must be the only clause of its block, which is a rule about
+    // clause combinations like select/update exclusivity, so lowering checks it.
     auto result = parse("t[map { y = x }, filter y > 0];");
-    REQUIRE_FALSE(result.has_value());
-    CHECK(result.error().message.find("last clause") != std::string::npos);
+    REQUIRE(result.has_value());
 }
 
 TEST_CASE("Parse rejects a bare field in map { }") {

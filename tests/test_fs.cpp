@@ -173,13 +173,17 @@ TEST_CASE("map clause: row-wise scalar evaluation", "[fs][map]") {
     }
 }
 
-TEST_CASE("map clause: must be the last clause", "[fs][map]") {
+TEST_CASE("map clause: must be the only clause", "[fs][map]") {
     auto registry = make_registry();
     ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
     REQUIRE(session.execute("let t = Table { x = [1, 2] };").ok);
-    const auto r = session.execute("t[map { y = x }, filter y > 0];");
-    CHECK_FALSE(r.ok);
-    CHECK(r.error.find("last clause") != std::string::npos);
+    // Neither before another clause nor after one: SPEC C25.
+    for (const char* query :
+         {"t[map { y = x }, filter y > 0];", "t[filter x > 0, map { y = x }];"}) {
+        const auto r = session.execute(query);
+        CHECK_FALSE(r.ok);
+        CHECK(r.error.find("only clause") != std::string::npos);
+    }
 }
 
 TEST_CASE("map clause: effectful externs run per row (csv round-trip)", "[fs][map]") {

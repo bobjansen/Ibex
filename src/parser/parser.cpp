@@ -47,9 +47,8 @@
 //   (filter, select, update, by, order, window, ...) in source order. So
 //   `t[filter x > 0, select {x}]` parses as BlockExpr{ base = t,
 //   clauses = [FilterClause, SelectClause] }. Chained brackets nest:
-//   `t[..][..]` is a BlockExpr whose base is another BlockExpr. The parser
-//   only requires `map { }` to be the last clause of a block. Lowering then
-//   requires it to be the only one.
+//   `t[..][..]` is a BlockExpr whose base is another BlockExpr. Which clauses
+//   may share a block (e.g. `map { }` must be alone) is checked in lowering.
 //
 // The AST is purely syntactic. Names are not resolved and nothing is type- or
 // schema-checked here. Some decisions are made later in lower.cpp, e.g.
@@ -1673,12 +1672,6 @@ class Parser {
                 }
                 clauses.push_back(std::move(*clause));
             } while (match(TokenKind::Comma) && !check(TokenKind::RBracket));
-        }
-        for (std::size_t i = 0; i + 1 < clauses.size(); ++i) {
-            if (std::holds_alternative<MapClause>(clauses[i])) {
-                error_ = make_error(previous(), "map { } must be the last clause of a block");
-                return std::nullopt;
-            }
         }
         return clauses;
     }

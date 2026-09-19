@@ -1,0 +1,6 @@
+// A correlated scalar() count is 0, not null, for an outer key with no inner
+// rows (SPEC 5.7, the COUNT bug): part 4 has no supply rows and must be kept.
+let parts = Table { p_partkey = [1, 2, 3, 4], p_name = ["nut", "bolt", "screw", "washer"] };
+let supply = Table { ps_partkey = [1, 1, 2, 3], ps_suppkey = [10, 11, 10, 12] };
+parts[filter 0 == scalar(supply[filter ps_partkey == outer(p_partkey), select { n = count(ps_suppkey) }]),
+      select { p_name }];

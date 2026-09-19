@@ -2449,10 +2449,22 @@ single row. That is also why a source used by both the outer query and the
 subquery should be bound once (`let partsupp = read_parquet(...)`) and named
 twice — one binding is one read.
 
-**Nulls.** When no inner row matches an outer row's captured key, the subquery's
-value is null, and a comparison against null is never true: the row is dropped.
-An uncorrelated subquery whose input is empty likewise keeps no rows. This is
-SQL's scalar-subquery behaviour.
+**Empty inputs.** A subquery over no rows has the value its aggregate has over
+no rows (Section 7.1): `0` for `count()`, `count(col)` and `count_distinct(col)`,
+null for every other aggregate. That holds both for an uncorrelated subquery
+whose input is empty and for an outer row whose captured key matches no inner
+row. A comparison against null is never true, so such a row is dropped. A
+comparison against a count of `0` is an ordinary comparison:
+
+```ibex
+// Parts nobody supplies: kept, because their count is 0, not null.
+part[filter 0 == scalar(supply[filter ps_partkey == outer(p_partkey), select { n = count() }])]
+```
+
+This is SQL's scalar-subquery behaviour. A count must be the whole selected
+column: `select { n = count() + 1 }` is rejected, because a key with no inner
+rows reaches the decorrelated plan as a missing group, and only a bare count's
+value over no rows is known there.
 
 **Result schema.** The subquery's value is not a column of the result. A filter
 yields the rows it kept, never a wider table. Naming the columns that stay is
@@ -2475,11 +2487,9 @@ refers to the query enclosing it, and subqueries do not nest.
 `scalar` keeps its two-argument form — `scalar(table, column)` extracts a value
 from a one-row table (Section 12). Arity tells the two apart.
 
-An uncorrelated subquery over an empty input, or one whose aggregate is null (an
-empty or all-null group), yields a **null scalar** (Section 6.7); in
-`filter … == scalar(…)` the comparison is then null and the row is dropped
-(Section 3), matching SQL. For a correlated subquery, a captured key with no
-matching inner rows yields null for that key.
+A subquery whose aggregate is null (no rows, or only null values, for anything
+but a count) yields a **null scalar** (Section 6.7); in `filter … == scalar(…)`
+the comparison is then null and the row is dropped (Section 3), matching SQL.
 
 ---
 
@@ -2659,16 +2669,6 @@ The following built-in functions are **aggregate functions**. They consume a
 
 `Numeric` denotes `Int32 | Int64 | Float32 | Float64`.
 
-All other functions (user-defined externs, built-in scalars) are **scalar
-functions**.
-
-### 7.2 Grouped Select Well-formedness
-
-When `by` and `select` are both present, the block performs aggregation. Each
-field in the `select` clause must satisfy the **aggregation well-formedness
-rule**:
-
-> Every column reference in the field expression must either:
 **Empty input.** Without `by`, the whole input is one group, even when it has
 no rows: the result is always exactly one row. Over no rows `count()`,
 `count(col)` and `count_distinct(col)` are `0` and every other aggregate is
@@ -2681,6 +2681,16 @@ t[filter false, select { n = count(), m = mean(v) }]   // 1 row: n = 0, m = null
 t[filter false, select { n = count() }, by g]           // 0 rows
 ```
 
+All other functions (user-defined externs, built-in scalars) are **scalar
+functions**.
+
+### 7.2 Grouped Select Well-formedness
+
+When `by` and `select` are both present, the block performs aggregation. Each
+field in the `select` clause must satisfy the **aggregation well-formedness
+rule**:
+
+> Every column reference in the field expression must either:
 >
 > **(a)** name a grouping key column (listed in the `by` clause), or
 >

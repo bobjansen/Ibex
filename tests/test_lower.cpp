@@ -1381,6 +1381,14 @@ TEST_CASE("Lower rejects unsupported correlated-subquery shapes") {
         REQUIRE_FALSE(result.has_value());
         REQUIRE(result.error().message.find("one whole side") != std::string::npos);
     }
+    SECTION("a count must be the whole selected column") {
+        // A key with no inner rows is patched from null to 0 only for a bare
+        // count; inside a larger expression the empty value would be guessed.
+        auto result = lower_filter("p_partkey == " +
+                                   subquery("ps_partkey == outer(p_partkey)", "n = count() + 1"));
+        REQUIRE_FALSE(result.has_value());
+        REQUIRE(result.error().message.find("whole selected column") != std::string::npos);
+    }
     SECTION("a subquery is not allowed outside a filter") {
         auto result =
             lower_source(std::string(kCorrelatedSources) + "parts[update { x = " +

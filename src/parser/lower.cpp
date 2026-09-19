@@ -3246,6 +3246,8 @@ class Lowerer {
     struct ScalarSubqueryPlan {
         ir::NodePtr plan;
         std::vector<std::string> keys;
+        /// The selected column is a count, whose value over no rows is 0.
+        bool counts = false;
     };
 
     /// Lower a `filter` predicate over `input`.
@@ -3382,11 +3384,11 @@ class Lowerer {
         }
 
         // A correlated subquery joins on its captured keys, so an outer row with
-        // no matching group gets a null. An uncorrelated one is a single value
-        // broadcast to every row, which is a cross join against its one row —
-        // and if the subquery's input was empty it produces no row at all, so
-        // the cross join drops every outer row, exactly as comparing against
-        // SQL's null scalar would.
+        // no matching group gets a null -- right for every aggregate except a
+        // count, which is patched to 0 below. An uncorrelated one is a single
+        // value broadcast to every row: a cross join against its one row. An
+        // aggregate with no `by` yields that row even over an empty input (a
+        // count of 0, a null otherwise), so the cross join never drops rows.
         const bool correlated = !subplan->keys.empty();
         std::vector<ir::JoinKey> join_keys;
         join_keys.reserve(subplan->keys.size());
@@ -3404,6 +3406,13 @@ class Lowerer {
             return std::unexpected(lowered_value.error());
         }
         auto scalar_ref = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = alias}});
+        if (correlated && subplan->counts) {
+            ir::CallExpr coalesce{.callee = "coalesce", .args = {}, .named_args = {}};
+            coalesce.args.push_back(std::move(scalar_ref));
+            coalesce.args.push_back(
+                ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{0}}}));
+            scalar_ref = ir::make_expr_ptr(ir::Expr{.node = std::move(coalesce)});
+        }
         auto value_ref = ir::make_expr_ptr(std::move(lowered_value.value()));
         if (on_left) {
             return ir::Expr{.node = ir::CompareExpr{
@@ -3474,6 +3483,20 @@ class Lowerer {
         if (contains_call(*block->base, "outer") || contains_call(*aggregate.expr, "outer")) {
             return std::unexpected(LowerError{
                 .message = "outer(): a capture may appear only in the subquery's filter clause"});
+        }
+        // Over no rows a count is 0 and every other aggregate is null. A key
+        // with no inner rows reaches the caller's left join as a missing group,
+        // i.e. null, so a count must be patched back to 0 there. Only a bare
+        // count is: inside a larger expression (`count() + 1`) the value over
+        // no rows would have to be evaluated, not assumed.
+        const Expr& selected = unwrap_group(*aggregate.expr);
+        const bool counts =
+            as_call(selected, "count") != nullptr || as_call(selected, "count_distinct") != nullptr;
+        if (!counts &&
+            (contains_call(selected, "count") || contains_call(selected, "count_distinct"))) {
+            return std::unexpected(
+                LowerError{.message = "scalar(): a count must be the whole selected column, e.g. "
+                                      "`select { n = count() }`, not part of a larger expression"});
         }
 
         // The filter is optional: an uncorrelated subquery has nothing to capture,
@@ -3564,7 +3587,8 @@ class Lowerer {
             rename->add_child(std::move(plan));
             plan = std::move(rename);
         }
-        return ScalarSubqueryPlan{.plan = std::move(plan), .keys = std::move(keys)};
+        return ScalarSubqueryPlan{
+            .plan = std::move(plan), .keys = std::move(keys), .counts = counts};
     }
 
     /// Read `inner_column == outer(outer_column)` (either way round).
@@ -4236,6 +4260,7 @@ class Lowerer {
                         .func = ir::AggFunc::Sum,
                         .column = ir::ColumnRef{.name = flag},
                         .alias = alias,
+                        .is_count = true,
                     });
                     temp_columns[alias] = true;
                     return ir::Expr{.node = ir::ColumnRef{.name = alias}};
@@ -4260,7 +4285,6 @@ class Lowerer {
                                 .message =
                                     "second argument of ewma() must be a numeric literal (alpha)"});
                         }
-                        .is_count = true,
                     } else {
                         return std::unexpected(LowerError{
                             .message =
@@ -4396,6 +4420,7 @@ class Lowerer {
                             .func = ir::AggFunc::Sum,
                             .column = ir::ColumnRef{.name = flag},
                             .alias = field.name,
+                            .is_count = true,
                         });
                         final_columns.push_back(field.name);
                         continue;
@@ -4420,7 +4445,6 @@ class Lowerer {
                                     .message = "second argument of ewma() must be a numeric "
                                                "literal (alpha)"});
                             }
-                            .is_count = true,
                         } else {
                             return std::unexpected(
                                 LowerError{.message = "second argument of ewma() must be a "

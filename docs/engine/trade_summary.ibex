@@ -1,0 +1,21 @@
+// A small time-series input for the operational walkthrough.
+let ticks = as_timeframe(Table {
+    ts = [ts "2026-01-02T09:30:00Z", ts "2026-01-02T09:30:01Z",
+          ts "2026-01-02T09:30:02Z", ts "2026-01-02T09:30:03Z",
+          ts "2026-01-02T09:30:04Z"],
+    symbol = ["AAPL", "MSFT", "AAPL", "AAPL", "MSFT"],
+    price = [100.0, 200.0, 102.0, 0.0, 202.0],
+    volume = [10, 5, 20, 5, 15]
+}, "ts");
+
+let instruments = Table {
+    symbol = ["AAPL", "MSFT"],
+    venue = ["XNAS", "XNAS"]
+};
+let eligible = ticks[filter price > 0.0,
+                     update { notional = price * volume }];
+let enriched = eligible join instruments on symbol;
+let totals = enriched[select { volume = sum(volume),
+                               notional = sum(notional) },
+                      by { symbol, venue }];
+totals[update { vwap = notional / volume }][order symbol];

@@ -1,0 +1,524 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=27mm]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs,tabularx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{xurl}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue!45!black,urlcolor=blue!45!black,citecolor=blue!45!black}
+\urlstyle{tt}
+\lstset{basicstyle=\small\ttfamily,columns=fullflexible,keepspaces=true,
+breaklines=true,frame=single}
+\setlength{\emergencystretch}{3em}
+\newcommand{\code}[1]{\nolinkurl{#1}}
+\newcommand{\src}[1]{\path{#1}}
+\newcommand{\evidence}[1]{\par\smallskip{\small\raggedright\noindent\textit{Implementation evidence:} #1\par}}
+\title{Ibex as an Analytics Engine\\\large Data representation, planning, and execution
+\\Working technical description}
+\author{Bob Jansen, OpenAI GPT}
+\date{\today}
+
+\begin{document}
+\maketitle
+\begin{abstract}
+  \noindent
+  Ibex exposes analytical operations through a statically typed language and
+  executes them over columnar data. This document explains the implementation
+  boundary between that language and its host analytics runtime: how table data
+  is represented, how logical operations become executable operators, where
+  intermediate results are stored, and how one query uses multiple threads.
+  It connects these mechanisms to query-processing literature while keeping
+  literature comparisons separate from claims about Ibex. This first draft is
+  deliberately incomplete: further operator specializations and design rationale
+  remain subjects for investigation and author review.
+\end{abstract}
+
+\section{Scope and evidence}
+The primary audience is external database-systems readers. The text should
+explain the design and its relationship to established techniques, with enough
+operational detail to follow how a query executes. It assumes familiarity with
+basic relational operations and programming, but not the Ibex implementation.
+\src{SPEC.md} remains the authority
+for language semantics. This document describes mechanisms behind those
+semantics; it does not introduce syntax or promise performance.
+
+Three kinds of statement are distinguished throughout. \emph{Implementation
+evidence} names code and symbols inspected for a claim. \emph{Literature
+context} explains related published techniques; similarity does not establish
+historical influence or equivalent implementation. \emph{Open questions} name
+unfinished investigations. Existing runtime notes are useful context, but
+their architectural aspirations are not treated as proof that every execution
+path satisfies them.
+
+\section{The execution architecture}
+The host runtime is a single-process, shared-memory engine. Its public
+\code{interpret} entry point claims a query-execution lease, constructs an
+operator, and drains it into a materialized result table. A concurrent or
+re-entrant top-level call is rejected with an error. This is a restriction on
+the host runtime entry point; it does not imply that a query executes on one
+thread, or specify how an embedding application manages multiple processes.
+
+Interpreted and compiled execution are functionally equivalent implementations
+of the same Ibex language. Both must implement the same specified behavior;
+a functional divergence is a bug unless explicitly designated as an intentional
+exception. As of writing there are no intentional exceptions. Different
+planning, scheduling, and code-generation mechanisms do not establish different
+language semantics or feature sets. This is the required contract, not a claim
+that the implementation is currently bug-free.
+
+There are two execution routes. The interpreted route lowers input into an
+intermediate representation (IR) and evaluates it through the runtime. A
+separate emitter translates IR into C++ source, including calls to
+\code{ibex::ops} functions. The distinction below explains how each route
+implements the shared functionality.
+
+\begin{center}
+  \begin{tabular}{c}
+    Ibex source\\
+    $\downarrow$ parsing, analysis, lowering\\
+    logical IR and rewrites\\
+    $\swarrow$ \hspace{5em} $\searrow$\\
+    \begin{tabular}{c@{\hspace{3em}}c}
+      host execution & C++ source emission\\
+      physical planning / fallback & external C++ compilation\\
+      operators and kernels & generated executable\\
+      materialized result & calls into C++ operations
+    \end{tabular}
+  \end{tabular}
+\end{center}
+This outline permits different sequences of analyses while requiring
+equivalent functionality. Rejections encountered in the emitter are recorded
+as parity bugs in Appendix~\ref{sec:backend-bugs}. An ``unsupported'' diagnostic
+documents an implementation gap; it does not by itself designate an intentional
+exception to equivalence.
+
+\evidence{\src{src/runtime/interpreter.cpp}, \code{interpret};
+\src{include/ibex/runtime/query_lease.hpp}, \code{QueryExecutionLease};
+\src{tools/ibex_compile.cpp}; \src{src/codegen/emitter.cpp},
+\code{Emitter::emit_node}, especially Filter, Project, and Window cases.}
+
+\paragraph{Literature context.}
+Neumann's query-compilation work describes data-centric code generation that
+pushes tuples through generated pipelines and aims to retain values in CPU
+registers~\cite{neumann2011}. Emitting C++ does not by itself establish that
+Ibex implements that execution model. The supported statement here is that
+Ibex has an IR-to-C++ backend alongside its host operator runtime.
+
+\section{Data representation and ownership}
+Ibex's column layouts are heavily inspired by the Apache Arrow columnar
+format~\cite{arrowColumnar}. The relevant Arrow layouts are fixed-size
+primitive arrays, variable-size binary arrays (including UTF-8 strings),
+and dictionary-encoded arrays, together with separate validity bitmaps.
+The following describes how these ideas appear in Ibex's internal storage.
+
+\subsection{Tables contain typed columns}
+A runtime \code{Table} contains an ordered vector of \code{ColumnEntry}
+objects and a name-to-position index. Each entry carries a name, shared
+ownership of a \code{ColumnValue}, and optional validity information.
+\code{ColumnValue} is a variant of concrete typed columns: 64-bit integers,
+double-precision floating point, strings, categoricals, dates, timestamps,
+and booleans in the inspected header. A statically typed language therefore
+coexists with runtime dispatch over concrete column representations.
+
+The useful physical distinction is between an element's logical meaning and
+its storage. In particular, strings can use either a flat byte representation
+or dictionary encoding.
+
+\begin{center}
+  \begin{tabularx}{\linewidth}{@{}lX@{}}
+    \toprule
+    Representation & Layout in the inspected implementation\\
+    \midrule
+    Fixed-width & Contiguous typed values; ordinary owned storage uses a vector.\\
+    Flat strings & One byte buffer and $n+1$ unsigned 32-bit offsets for $n$ rows.\\
+    Categorical strings & Signed 32-bit codes and a shared string dictionary.\\
+    Booleans & Values packed into 64-bit words.\\
+    Validity & An optional bitmap, separate from the value representation.\\
+    \bottomrule
+  \end{tabularx}
+\end{center}
+For a flat string column, row $i$ occupies bytes
+$[o_i,o_{i+1})$. For a categorical column, its value is $D[c_i]$, where $D$
+is the dictionary. The same integer code in two unrelated dictionaries need
+not mean the same string. This matters when combining chunks or comparing
+encoded keys; a code is meaningful only together with its dictionary.
+These layouts correspond to Arrow's ``Variable-size Binary Layout'' and
+``Dictionary-encoded Layout''~\cite{arrowColumnar}. Arrow's conventional
+binary/string layout uses signed 32-bit offsets (or signed 64-bit offsets
+for its large variant), whereas the Ibex storage described above uses
+unsigned 32-bit offsets. The shared design therefore does not imply that
+every internal buffer is interchangeable without checking its representation.
+
+\subsection{Nulls and sharing}
+An absent validity bitmap means every row is valid. With a bitmap, a set bit
+means valid and a cleared bit means null. This follows Arrow's validity
+convention, including permission to omit the bitmap when there are no
+nulls~\cite{arrowColumnar}. Payload storage and validity are
+distinct: inspecting a stored numeric payload alone does not establish
+whether that row contains a null. The full semantics of null propagation in
+expressions and aggregates remain to be documented separately.
+
+Column entries share their value objects through \code{shared_ptr}. The
+\code{Chunk::mutable_column} accessor copies the value object if it is
+shared before exposing mutable access. The inspected generic column also
+supports immutable external buffers with a shared lifetime owner and detaches
+on mutation. These are specific ownership mechanisms, not a blanket guarantee
+that arbitrary queries or interchange conversions are zero-copy.
+
+\evidence{\src{include/ibex/runtime/interpreter.hpp}, \code{ColumnValue},
+\code{ColumnEntry}, \code{ValidityBitmap}, and \code{Table};
+\src{include/ibex/core/column.hpp}, the generic \code{Column} and its string,
+categorical, and boolean specializations;
+\src{include/ibex/runtime/operator.hpp}, \code{Chunk::mutable_column}.}
+
+\subsection{Row layout is part of the execution contract}
+Tables also carry derived properties describing ordering, a time index, and
+grouping. \code{TableProperties} centralizes their construction and transfer.
+Its \code{RowTransform} classification distinguishes preserving rows,
+selecting a subsequence, reordering rows, and recombining rows. Preserving a
+subsequence can retain ordering; constructing rows from groups or multiple
+inputs cannot simply inherit every input claim.
+
+The time-frame constructor establishes ascending order on its time index.
+Normalization and key-fate rules constrain what survives later operations.
+Thus, time-series execution depends on facts about row layout as well as on
+timestamp values. A detailed account of window boundaries, group boundaries,
+and ordering-sensitive functions is reserved for a subsequent chapter.
+
+\evidence{\src{include/ibex/runtime/table_properties.hpp},
+\code{RowTransform}, \code{TableProperties::derive},
+\code{TableProperties::time_frame}, and \code{normalized}.}
+
+\section{From logical operations to executable work}
+\subsection{Lowering and logical rewrites}
+The whole-program \code{parser::lower} entry performs effect analysis,
+lowers the program, validates column references against known schemas, and
+checks joins. It then applies schema-aware join filter pushdown, semi-join
+pushdown, and inner-to-semi reductions before invoking the default optimizer.
+The default pass manager removes eligible unused pure preamble calls,
+canonicalizes the IR, and annotates pending order requirements.
+
+Two limits to this statement matter. First, static checks use the schemas
+available at that boundary; this is not evidence that all data-source schemas
+are known at parse time. Second, some analyses live in the calling path.
+The REPL also computes required columns and scan predicates for lazy-source
+decoding. A list of passes from \code{optimizer.cpp} alone would consequently
+be an incomplete description of optimization.
+
+Effect summaries constrain which calls may be discarded or reordered.
+\code{is_reorderable}, for example, checks non-I/O effects and conflicts
+between declared I/O resources. The implementation therefore represents
+semantic constraints beyond relational schema when deciding whether a
+transformation is permitted.
+
+\evidence{\src{src/parser/lower.cpp}, \code{lower};
+\src{src/ir/optimizer.cpp}, \code{make_default_pass_manager},
+\code{is_elidable}, and \code{is_reorderable};
+\src{src/repl/repl.cpp}, calls to \code{required_columns},
+\code{scan_predicates}, and \code{decode_demanded_lazy_sources}.}
+
+\subsection{Physical planning and fallback}
+At runtime, \code{build_operator_impl} calls \code{physical::plan_physical}.
+The resulting description can cover a chain of row-local operations or a
+supported stateful operator. The physical plan records such choices as map
+steps, fusion, source kind, parallel mode, and join or aggregate strategy.
+For a migrated plan, the executor consumes this description. Other shapes
+use explicit handling or a materialized fallback through
+\code{build_materialized_fallback}.
+
+Fallback is part of the current architecture. It lets supported pipelines
+and operators coexist with operations that consume whole tables. In
+particular, falling back for a parent need not discard physical execution of
+its children: the fallback builder routes direct children through the
+physical path. A precise account must state both the preferred strategy and
+the conditions that select another strategy.
+
+For joins, the plan distinguishes streaming probe from materializing both
+inputs. Its decline reasons include unsupported key shapes, non-equi
+predicates, null-equality semantics, cardinality assertions, and match
+selection. Textual left and right inputs are recorded separately from
+runtime build/probe orientation. For aggregates, the strategy vocabulary
+includes an adaptive sorted-stream path with a hash fallback, a fused
+left-join count, and whole-input materialization. These are strategy
+boundaries; their detailed algorithms have not yet been audited for this
+document.
+
+\evidence{\src{src/runtime/runtime_entry.cpp}, \code{build_operator_impl};
+\src{src/runtime/physical_plan.hpp}, \code{Plan}, \code{JoinPlan},
+\code{JoinDeclineReason}, and \code{AggregateStrategy};
+\src{tests/test_physical_plan.cpp}, tests for map fusion, join classification,
+aggregate classification, and pipelines over breakers.}
+
+\section{Chunks, pull execution, and materialization}
+The common operator interface is
+\begin{lstlisting}
+next() -> expected<optional<Chunk>, string>
+\end{lstlisting}
+A successful pull produces a chunk or signals end of input; an error carries
+a message. A chunk is a horizontal portion of a table, represented by its
+columns rather than by an array of row objects. It also has sequence and
+source-row-offset fields. A chunk is an interface unit, not a guarantee of
+a particular size: \code{TableSourceOperator} can emit an entire materialized
+table in one chunk.
+
+\code{MaterializeOperator::run} pulls chunks and assembles a \code{Table}.
+The first chunk donates its columns; later chunks are appended with schema
+checks and validity handling. The runtime contract requires an empty input
+to emit an empty chunk carrying its schema, so zero rows do not erase the
+result's column names and types. A dedicated physical-execution test checks
+this behavior for an empty filtered input.
+
+Incrementally draining the final sink avoids retaining every incoming chunk
+as a separate object. It does \emph{not} establish bounded memory for the
+whole query: the final result, retained inputs, hash tables, sort state,
+buffered pipeline results, and materialized fallback inputs may also occupy
+memory. This draft makes no claim about spilling to disk or a global memory
+limit.
+
+\evidence{\src{include/ibex/runtime/operator.hpp}, \code{Operator},
+\code{Chunk}, \code{TableSourceOperator}, and \code{MaterializeOperator};
+\src{src/runtime/CONTRACTS.md}, chunk and materialization contracts;
+\src{tests/test_physical_plan.cpp}, ``Migrated filter keeps the empty input's
+schema carrier''.}
+
+\paragraph{Literature context.}
+Volcano provides the classic reference for composable operators with a
+standard iterator interface~\cite{graefe1994}. Ibex's pull interface is
+comparable at that architectural level, but its transfer unit is a columnar
+chunk. MonetDB/X100 motivates vector-at-a-time processing as a way to
+amortize interpretation overhead while avoiding full-column intermediates
+at every step~\cite{boncz2005}. Ibex's chunk and kernel boundaries provide a
+useful comparison, without establishing identical vector sizes, instruction
+generation, or performance. Here, ``vector'' means a batch of values; it
+does not by itself assert use of hardware SIMD instructions.
+
+\section{A small query through the engine}
+Consider the following query over an already registered table:
+\begin{lstlisting}
+trades[filter price > 15, select { price }];
+\end{lstlisting}
+The physical-plan test for this exact expression establishes that
+\code{Project(Filter(Scan(trades)))} becomes one fused map step with
+\code{FilterProjectGather} capability and a \code{TableScan} source.
+Projection is attached to the filter step, so the physical execution need
+not preserve two independent operators merely because the logical tree
+contains them.
+
+For illustration, suppose the non-null price column is $(10,20,15,30)$.
+The predicate's survivor positions are $(1,3)$ under zero-based indexing,
+and the selected output column is $(20,30)$. The mathematical effect is
+\[
+  S = (i \mid 0\leq i<n,\ p_i>15),\qquad
+  r_j=p_{S_j}.
+\]
+These positions explain the gather operation; this notation does not claim
+that every execution path allocates a survivor-index vector.
+
+The chosen implementation can execute serially or, when eligible, use
+parallel range processing. To share the work, the engine divides the input
+into small ranges of consecutive rows called \emph{morsels}. Each morsel is
+a portion of work that a worker can process independently; for example,
+one worker can filter an earlier range while another filters a later range.
+A morsel describes which input rows to work on, while a chunk is the data
+passed between operators. Processing a morsel can produce a chunk containing
+only its surviving rows.
+
+A separate two-phase filter specialization first
+counts survivors in each morsel, computes prefix offsets, and then writes
+disjoint output slices. If morsel $k$ has $c_k$ survivors, its output begins
+at $b_k=\sum_{j<k}c_j$. This separates completion order from result position:
+the second morsel may finish first and still write after the first morsel's
+reserved output. This is an explanation of the specialization, not a claim
+that the tiny illustrative input passes its parallel thresholds.
+
+\evidence{\src{tests/test_physical_plan.cpp}, ``Physical plan lowers
+filter+select into a fused map step'';
+\src{src/runtime/pipeline_executor.cpp}, \code{TwoPhaseFilterOperator}
+and the specialization's selection in pipeline construction.}
+
+\section{Parallel execution within one query}
+Three mechanisms should be kept distinct when reasoning about concurrency.
+\emph{Operator-internal fan-out} divides work inside an operation and joins
+the tasks before that phase completes. A \emph{morsel pipeline} carries each
+small input range through a chain of eligible row-local operations, such as
+filtering followed by computing a column. Workers process these ranges of a
+materialized input independently, and their outputs are merged in sequence.
+\emph{Pipeline overlap} allows scan
+or child-stage production to overlap consumption through bounded buffers.
+
+The worker pool uses a shared task queue and completion state. In the morsel
+executor, workers obtain range sequence numbers from an atomic cursor.
+These are separate levels: the pool runs worker bodies, while the cursor
+distributes morsels among those bodies. The inspected morsel pipeline owns
+its materialized input before worker execution. Deferred scan pipelines have
+a separate source-unit mechanism; this document does not conflate them with
+partitioning an already resident table.
+
+\code{PipelinedScanOperator} processes source units and makes results
+available in sequence. \code{PipelinedStageOperator} uses a producer thread
+and bounded buffering. The latter is distinct from a short compute task
+submitted to the worker pool. Parallelism policy also distinguishes a
+compute budget from the number of available decode workers; the complete
+configuration and admission rules remain to be catalogued.
+
+\evidence{\src{src/runtime/worker_pool.cpp}, the task queue,
+\code{WorkerPool::submit}, and \code{wait_for_batch};
+\src{src/runtime/pipeline_executor.cpp}, \code{MorselPipelineOperator},
+\code{PipelinedScanOperator}, and \code{PipelinedStageOperator};
+\src{src/runtime/PARALLELISM.md}, the three layers and thread budgets.}
+
+\paragraph{Literature context.}
+Leis et al. describe scheduling small input fragments through operator
+pipelines, with NUMA locality and elastic allocation between
+queries~\cite{leis2014}. Ibex's morsel pipeline shares the fragment-through-a-
+pipeline idea. Its host query lease and shared-cursor scheduling are more
+specific constraints. The word ``morsel'' here does not establish NUMA-aware
+placement, work stealing, or elastic allocation among concurrent queries.
+
+\subsection{Determinism requires a scoped statement}
+The design priority is to preserve the row-order guarantees needed to reason
+about time-series computations. Exact floating-point reproducibility is a
+separate requirement and may be relaxed; doing so does not relax output row
+ordering. The permitted numerical differences and their scope remain to be
+specified in a later revision. This direction does not itself change the
+current language specification or establish a numerical tolerance.
+
+Ordered merges and prefix-assigned output ranges make row position
+independent of task completion order. The runtime contracts set a strong
+serial/parallel equivalence goal, but also acknowledge floating-point
+reduction exceptions. Consequently this draft does not promote the broad
+``byte-identical at any core count'' wording in runtime notes into an
+unqualified engine guarantee.
+
+For reductions, stable output order and numerical reproducibility are
+different properties: in floating-point arithmetic, $(a+b)+c$ can differ
+from $a+(b+c)$. A reproducibility claim must specify the partitioning and
+merge order, the comparison target, and the affected aggregates. Error
+selection and cancellation also require their own examination. Existing
+serial/parallel tests provide evidence for particular inputs and paths,
+not a proof covering the complete engine.
+
+\evidence{\src{src/runtime/CONTRACTS.md}, determinism contract and exceptions;
+\src{tests/test_physical_plan.cpp}, ``Migrated pipelines produce identical
+results in serial and parallel''.}
+
+\input{operations}
+\input{cost}
+
+\section{Agreed direction and next investigations}
+Author review established the following direction for developing this
+foundation. The entries distinguish agreed priorities from investigations
+that have yet to be completed.
+\begin{enumerate}
+  \item \textbf{Intended emphasis: agreed.} Address an external
+    database-systems audience, developing design rationale and literature
+    comparisons alongside the operational detail needed to understand
+    execution.
+  \item \textbf{A representative workload: time series.} Develop a verified
+    time-series example as the document's running workload. The author's
+    motivation is that this area deserves more attention in analytics-engine
+    design; this is a choice of emphasis, not a claim of demonstrated
+    superiority over other engines. Section~\ref{sec:trade-workload} establishes
+    a small trade-summary workload to extend in later revisions.
+  \item \textbf{Design intent: ordering and numerical behavior.} Preserve
+    output row-order guarantees because they are valuable for time-series
+    reasoning. Floating-point reproducibility requirements may be weakened
+    independently, with their precise scope deferred to later work.
+    Functional equivalence of the interpreted and compiled routes is an
+    established requirement. Any intentional exception should be stated
+    explicitly and distinguished from the parity bugs listed below. Whether
+    the single-query lease is a long-term constraint remains open.
+  \item \textbf{Operator algorithms: initial account added.}
+    Section~\ref{sec:operations} traces streaming equality joins, aggregate
+    phases, and sorted-input gates. Broader join kinds, key-layout
+    specializations, and their algorithm-specific literature still need audit.
+  \item \textbf{Time-series execution: deferred.} Later, trace window boundaries, ordered state,
+    group layout, resampling, and null handling against both the specification
+    and executable examples. Choosing a time-series running workload does
+    not require completing this detailed chapter immediately.
+  \item \textbf{Data boundaries and memory: initial account added.}
+    Section~\ref{sec:operations} traces lazy projection, selected decoding,
+    reader ownership, Arrow adoption, and retained state. Source-specific
+    decoder behavior, cross-chunk dictionary compatibility, and measured
+    peak memory remain open; a shared interface is insufficient evidence for
+    every plugin boundary.
+  \item \textbf{Cost explanation and existing measurements: added.}
+    Section~\ref{sec:cost} explains cost drivers using an identified published
+    benchmark snapshot. Precise numerical reproducibility rules and new
+    performance experiments remain deferred. Further measurement should target
+    gaps in the existing corpus and follow \src{MEASURING.md}.
+\end{enumerate}
+
+\appendix
+\section{Interpreted/compiled parity bug list}
+\label{sec:backend-bugs}
+This list records functional divergences encountered while preparing the
+document. Entries are open implementation bugs under the equivalence contract,
+unless an explicit design decision identifies an intentional exception.
+No such exception has been established for the entries below. The list is
+not an exhaustive parity audit, and these identifiers are local to this
+document rather than external issue numbers.
+
+\begin{description}
+  \item[PARITY-001: Window selection.] The Window case in
+    \code{Emitter::emit_node} throws when \code{win.select_only()} is true.
+    Expected behavior: compile \code{window + select} with the same semantics
+    as interpreted execution, including the selected output schema.
+  \item[PARITY-002: Aligned windows.] The same case throws when
+    \code{win.aligned()} is true. Expected behavior: compiled execution
+    implements the same epoch-aligned window boundaries and results.
+  \item[PARITY-003: Windowed tuple updates.] The same case rejects nonempty
+    \code{upd.tuple_fields()}. Expected behavior: windowed tuple assignments
+    have equivalent functionality in both routes. The existing test
+    ``emitter: window node - tuple fields are still rejected'' records the
+    current rejection; it does not make that rejection an intentional
+    semantic exception.
+  \item[PARITY-004: Model clauses.] The Model case unconditionally throws
+    ``model clause is not yet supported in compiled mode''. Expected behavior:
+    compiled execution supports the model-clause functionality provided by
+    interpreted execution.
+\end{description}
+
+\evidence{\src{src/codegen/emitter.cpp}, \code{Emitter::emit_node}, Window
+and Model cases; \src{tests/test_codegen.cpp}, the window tuple-rejection
+test. \src{SPEC.md} defines window selection, aligned windows, and tuple
+assignments. These findings are based on source inspection; end-to-end
+reproductions and fixes remain outstanding.}
+
+For each newly encountered divergence, record the triggering program or IR
+shape, expected shared behavior, observed difference, and evidence. Distinguish
+source-inspected findings from reproduced failures. Close an entry after a fix
+and a regression check comparing the two routes, or record the explicit design
+decision that makes it an intentional exception.
+
+\section{Source map for continued investigation}
+Paths are relative to the repository root. Symbols and test names above are
+preferred to line numbers because this checkout is evolving.
+\begin{description}
+  \item[Language to IR] \src{src/parser/lower.cpp};
+    \src{src/ir/optimizer.cpp}; \src{src/ir/canonicalize.cpp}.
+  \item[Caller-specific planning] \src{src/repl/repl.cpp};
+    \src{src/ir/required_columns.cpp}; \src{src/ir/scan_predicates.cpp}.
+  \item[Execution entry and decisions] \src{src/runtime/interpreter.cpp};
+    \src{src/runtime/runtime_entry.cpp}; \src{src/runtime/physical_plan.hpp};
+    \src{src/runtime/physical_plan.cpp}.
+  \item[Flow and scheduling] \src{include/ibex/runtime/operator.hpp};
+    \src{src/runtime/pipeline_executor.cpp}; \src{src/runtime/worker_pool.cpp}.
+  \item[Representation and metadata] \src{include/ibex/core/column.hpp};
+    \src{include/ibex/runtime/interpreter.hpp};
+    \src{include/ibex/runtime/table_properties.hpp}.
+  \item[Next operator investigations] \src{src/runtime/join_chunked.cpp};
+    \src{src/runtime/aggregate_chunked.cpp}; \src{src/runtime/window.cpp};
+    \src{src/runtime/ordered_chunked.cpp}. These are investigation targets,
+    not evidence of a complete audit of every strategy in these files.
+  \item[Backend and regression evidence] \src{src/codegen/emitter.cpp};
+    \src{tests/test_physical_plan.cpp}; \src{tests/test_table_properties.cpp};
+    \src{tests/test_column.cpp}.
+\end{description}
+
+\bibliographystyle{plain}
+\bibliography{references}
+\end{document}

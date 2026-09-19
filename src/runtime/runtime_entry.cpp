@@ -654,6 +654,47 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
     return std::unexpected("physical join: plan named no streaming branch");
 }
 
+/// An aggregate with no `by` yields one row even over an empty input (see
+/// `global_aggregate_of_empty`). The streaming kernels end such a stream with
+/// only zero-row schema chunks; this appends the row, typed from that schema.
+class OneGroupIfUngroupedOperator final : public Operator {
+   public:
+    OneGroupIfUngroupedOperator(OperatorPtr child, const std::vector<ir::AggSpec>* aggregations)
+        : child_(std::move(child)), aggregations_(aggregations) {}
+
+    auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (done_) {
+            return std::optional<Chunk>{};
+        }
+        auto chunk = child_->next();
+        if (!chunk.has_value()) {
+            return chunk;
+        }
+        if (!chunk->has_value()) {
+            done_ = true;
+            if (saw_rows_ || schema_.empty()) {
+                return chunk;
+            }
+            Chunk row;
+            row.columns = global_aggregate_of_empty(schema_, *aggregations_);
+            return std::optional<Chunk>{std::move(row)};
+        }
+        if ((*chunk)->rows() > 0) {
+            saw_rows_ = true;
+        } else if (!saw_rows_ && schema_.empty()) {
+            schema_ = (*chunk)->columns;
+        }
+        return chunk;
+    }
+
+   private:
+    OperatorPtr child_;
+    const std::vector<ir::AggSpec>* aggregations_;
+    std::vector<ColumnEntry> schema_;
+    bool saw_rows_ = false;
+    bool done_ = false;
+};
+
 /// Build an aggregate the plan migrated: the streaming operator, or the
 /// Join+Aggregate fusion. Phase 4 item 2.
 ///
@@ -810,7 +851,12 @@ auto build_operator_from_physical_plan(const physical::Plan& plan, const ir::Nod
     }
     if (plan.aggregate.describes) {
         physical::note_map_pipeline_executed();
-        return build_physical_aggregate(plan, node, registry, scalars, externs, exec, model_out);
+        auto op = build_physical_aggregate(plan, node, registry, scalars, externs, exec, model_out);
+        const auto& agg = ir::node_cast<ir::AggregateNode>(node);
+        if (!op.has_value() || !agg.group_by().empty()) {
+            return op;
+        }
+        return std::make_unique<OneGroupIfUngroupedOperator>(std::move(*op), &agg.aggregations());
     }
     if (plan.join.describes) {
         physical::note_map_pipeline_executed();

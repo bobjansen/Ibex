@@ -1618,6 +1618,15 @@ inline auto double_to_sortable_u64(double value) -> std::uint64_t {
                                    const std::vector<ir::AggSpec>& aggregations,
                                    const ExecutionContext* exec = nullptr)
     -> std::expected<Table, std::string>;
+/// The one row an aggregate with no `by` yields over an empty input (SQL's
+/// rule: the whole input is one group, even when it is empty). `count` and
+/// `count_distinct` are 0; every other aggregate is null. `empty_columns` is
+/// the aggregate's zero-row result, which supplies each column's type. The
+/// kernels only ever produce that zero-row result; the node-level executors
+/// (interpreter.cpp, runtime_entry.cpp) replace it with this row.
+[[nodiscard]] auto global_aggregate_of_empty(const std::vector<ColumnEntry>& empty_columns,
+                                             const std::vector<ir::AggSpec>& aggregations)
+    -> std::vector<ColumnEntry>;
 [[nodiscard]] auto parse_aggregate_func(std::string_view name) -> std::optional<ir::AggFunc>;
 [[nodiscard]] auto aggregate_call_to_spec(const ir::CallExpr& call, std::string alias)
     -> std::expected<std::optional<ir::AggSpec>, std::string>;

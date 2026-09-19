@@ -4260,6 +4260,7 @@ class Lowerer {
                                 .message =
                                     "second argument of ewma() must be a numeric literal (alpha)"});
                         }
+                        .is_count = true,
                     } else {
                         return std::unexpected(LowerError{
                             .message =
@@ -4419,6 +4420,7 @@ class Lowerer {
                                     .message = "second argument of ewma() must be a numeric "
                                                "literal (alpha)"});
                             }
+                            .is_count = true,
                         } else {
                             return std::unexpected(
                                 LowerError{.message = "second argument of ewma() must be a "
@@ -4788,8 +4790,10 @@ class Lowerer {
                 }
                 const std::string flag = make_temp();
                 lowered.preagg_updates.push_back(make_count_flag_field(ident->name, flag));
-                lowered.aggs.push_back(ir::AggSpec{
-                    .func = ir::AggFunc::Sum, .column = {.name = flag}, .alias = field.name});
+                lowered.aggs.push_back(ir::AggSpec{.func = ir::AggFunc::Sum,
+                                                   .column = {.name = flag},
+                                                   .alias = field.name,
+                                                   .is_count = true});
                 continue;
             }
             if (call->callee == "ewma") {

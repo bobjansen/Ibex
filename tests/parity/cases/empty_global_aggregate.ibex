@@ -1,0 +1,5 @@
+// An aggregate with no `by` over an empty input is still one group (SPEC 7.1):
+// one row, counts 0 -- including count(col), which is lowered as a Sum over a
+// not-null flag and carries `is_count` through codegen -- and everything else null.
+let t = Table { g = ["a", "b", "c"], v = [1.0, 2.0, 3.0] };
+t[filter v > 100.0, select { n = count(), nv = count(v), nd = count_distinct(g), s = sum(v), m = mean(v) }];

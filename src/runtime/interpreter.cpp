@@ -704,6 +704,21 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (agg.children().empty()) {
                 return std::unexpected("aggregate node missing child");
             }
+            // With no `by`, an empty input still yields one row (count 0,
+            // everything else null). The kernels return zero rows; fix it here.
+            const auto one_group_if_ungrouped =
+                [&](std::expected<Table, std::string> result) -> std::expected<Table, std::string> {
+                if (!result.has_value() || !agg.group_by().empty() || result->rows() != 0 ||
+                    result->columns.empty()) {
+                    return result;
+                }
+                Table row;
+                for (auto& entry : global_aggregate_of_empty(result->columns, agg.aggregations())) {
+                    row.add_column_shared(std::move(entry.name), std::move(entry.column),
+                                          std::move(entry.validity));
+                }
+                return row;
+            };
             // Fast path: Aggregate(Scan) — pass the registry table by const ref to skip the copy.
             const ir::Node& child_node = *agg.children().front();
             if (child_node.kind() == ir::NodeKind::Scan) {
@@ -712,7 +727,8 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 if (it == registry.end()) {
                     return std::unexpected("unknown table: " + scan.source_name());
                 }
-                return aggregate_table(it->second, agg.group_by(), agg.aggregations(), &exec);
+                return one_group_if_ungrouped(
+                    aggregate_table(it->second, agg.group_by(), agg.aggregations(), &exec));
             }
             // Same fusion the chunked path takes, from the same resolver: the
             // skip-walk and its seven clauses were written out here and there,
@@ -737,7 +753,8 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (!child) {
                 return std::unexpected(child.error());
             }
-            return aggregate_table(child.value(), agg.group_by(), agg.aggregations(), &exec);
+            return one_group_if_ungrouped(
+                aggregate_table(child.value(), agg.group_by(), agg.aggregations(), &exec));
         }
         case ir::NodeKind::Resample: {
             const auto& rs = ir::node_cast<ir::ResampleNode>(node);

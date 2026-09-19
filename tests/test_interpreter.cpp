@@ -14287,11 +14287,16 @@ TEST_CASE("Interpret empty results keep their schema") {
     }
 
     SECTION("an ungrouped aggregate over an empty input") {
-        auto ir = require_ir("t[filter v > 100.0][select { m = mean(v) }];");
+        // SQL's rule: with no `by` the whole input is one group, even when it
+        // is empty -- one row, a count of 0 and a null for everything else.
+        auto ir = require_ir("t[filter v > 100.0][select { m = mean(v), n = count() }];");
         auto result = runtime::interpret(*ir, registry);
         REQUIRE(result.has_value());
-        REQUIRE(result->rows() == 0);
-        REQUIRE(column_names(*result) == std::vector<std::string>{"m"});
+        REQUIRE(result->rows() == 1);
+        REQUIRE(column_names(*result) == std::vector<std::string>{"m", "n"});
+        REQUIRE(runtime::is_null(*result->find_entry("m"), 0));
+        REQUIRE_FALSE(runtime::is_null(*result->find_entry("n"), 0));
+        REQUIRE(std::get<Column<std::int64_t>>(*result->find("n"))[0] == 0);
     }
 
     SECTION("a grouped aggregate over an empty input") {
@@ -15918,6 +15923,8 @@ TEST_CASE("inner join beneath a declined aggregate runs the collapsed whole-tabl
     auto empty_ir = require_ir("(lhs join none on k)[select { m = median(v) }];");
     auto empty = runtime::interpret(*empty_ir, registry);
     REQUIRE(empty.has_value());
-    REQUIRE(empty->rows() == 0);
-    CHECK(empty->find("m") != nullptr);
+    // No `by`: the empty join is still one group, so one row with a null median.
+    REQUIRE(empty->rows() == 1);
+    REQUIRE(empty->find("m") != nullptr);
+    REQUIRE(runtime::is_null(*empty->find_entry("m"), 0));
 }

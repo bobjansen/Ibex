@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 // runtime_entry.cpp — the operator-build entry point: `build_operator` and its
-// per-NodeKind dispatch, the physical-plan construction sites
+// per-NodeKind dispatch, `build_operator_from_physical_plan`, the construction sites
 // (`physical_executor_detail`: join / aggregate / tail), the materialized-call
 // fallback adapter for un-migrated kinds, the small streamable-shape predicates,
 // and env-driven parallel configuration (`configure_parallel_from_env`,
@@ -771,6 +771,57 @@ auto build_physical_tail(const ir::Node& node, const TableRegistry& registry,
 
 }  // namespace physical_executor_detail
 
+auto build_operator_from_physical_plan(const physical::Plan& plan, const ir::Node& node,
+                                       const TableRegistry& registry, const ScalarRegistry* scalars,
+                                       const ExternRegistry* externs, const ExecutionContext& exec,
+                                       ModelResult* model_out)
+    -> std::expected<OperatorPtr, std::string> {
+    if (!plan.migrated) {
+        return std::unexpected("physical executor: plan does not migrate its root");
+    }
+    if (plan.root != &node) {
+        return std::unexpected("physical executor: plan root does not match execution root");
+    }
+
+    using namespace physical_executor_detail;
+    switch (node.kind()) {
+        case ir::NodeKind::Head:
+            physical::note_map_pipeline_executed();
+            return build_physical_head(node, registry, scalars, externs, exec, model_out);
+        case ir::NodeKind::Tail:
+            physical::note_map_pipeline_executed();
+            return build_physical_tail(node, registry, scalars, externs, exec, model_out);
+        case ir::NodeKind::TopK:
+            physical::note_map_pipeline_executed();
+            return build_physical_topk(node, registry, scalars, externs, exec, model_out);
+        case ir::NodeKind::FilterHead:
+        case ir::NodeKind::FilterTail:
+            physical::note_map_pipeline_executed();
+            return build_physical_filter_head_tail(node, registry, scalars, externs, exec,
+                                                   model_out);
+        case ir::NodeKind::Distinct:
+            physical::note_map_pipeline_executed();
+            return build_physical_distinct(plan, node, registry, scalars, externs, exec, model_out);
+        case ir::NodeKind::Order:
+            physical::note_map_pipeline_executed();
+            return build_physical_order(node, registry, scalars, externs, exec, model_out);
+        default:
+            break;
+    }
+    if (plan.aggregate.describes) {
+        physical::note_map_pipeline_executed();
+        return build_physical_aggregate(plan, node, registry, scalars, externs, exec, model_out);
+    }
+    if (plan.join.describes) {
+        physical::note_map_pipeline_executed();
+        return build_physical_join(plan, node, registry, scalars, externs, exec, model_out);
+    }
+    if (plan.mode != physical::PipelineMode::MorselParallel || !exec.can_fan_out()) {
+        physical::note_map_pipeline_executed();
+    }
+    return build_physical_map_step(plan, 0, registry, scalars, externs, exec, model_out);
+}
+
 namespace {
 
 auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
@@ -783,8 +834,8 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     // plan-edge mutation tests exercise the same consumer production uses.
     const physical::Plan plan = physical::plan_physical(node, registry, externs);
     if (plan.migrated) {
-        return build_migrated_physical_operator(plan, node, registry, scalars, externs, exec,
-                                                model_out);
+        return build_operator_from_physical_plan(plan, node, registry, scalars, externs, exec,
+                                                 model_out);
     }
     // Counted in every mode. It used to fire only when the query could not fan
     // out, so at two cores or more the backlog read as empty -- a migration

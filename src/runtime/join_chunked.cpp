@@ -1,9 +1,37 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
-// chunked.cpp — streaming (chunked) operator pipeline: per-chunk operators,
-// rank evaluation, extern-call execution, and build_operator plan construction.
-// Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
+// join_chunked.cpp — the streaming inner hash join (one or two equi-keys, no
+// residual predicate), split into a HashBuild and a HashProbe half.
+//
+//   HashBuild  build_join_hash_index / build_join_pair_index. Chains every
+//              row to the next row with the same key, over a PartitionedHeads
+//              head table that workers fill in parallel with no locks and no
+//              merge. The result is the immutable JoinHashIndex. Null keys are
+//              never indexed or looked up, so null matches nothing.
+//   Orientation  chosen at RUN time from measured row counts (JoinOrientation):
+//              BuildRight when the right side is small (kStreamRightThreshold)
+//              or the left is at least as big: index the right side and stream
+//              left chunks through it. Only a smaller left can become
+//              BuildLeft ("swapped", decided by choose_and_build_single_key):
+//              index the left side and scan the right once, emitting in
+//              right-scan order. The left side is drained only until it is known to be
+//              bigger than the right (BufferedThenStreamSource), so it is
+//              never copied in full.
+//   HashProbe  JoinProbe + JoinProbeOperator / SwappedHashProbeOperator /
+//              PrecomputedHashProbeOperator. They read the index through
+//              shared_ptr<const> and are picked by the HashProbeInput
+//              variant, so a probe never re-decides the orientation. Several
+//              probes can share one build (per-worker morsel chains).
+//
+// ChunkedInnerJoinOperator ties the two halves together. It also runs the
+// deferred probe: when the right side is a lazy scan the driver registered
+// (deferred_probe_scan_of), the left side is built first and a
+// DynamicScanFilter over its keys is published into that scan, so decode-time
+// pruning narrows the right side before it is materialized. The make_* entry
+// points used by runtime_entry.cpp are at the bottom of the file and are
+// declared in join_chunked_internal.hpp.
+// Background: plans/kernel-pipeline-execution-plan.md.
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/decimal.hpp>

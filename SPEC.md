@@ -2656,8 +2656,8 @@ The following built-in functions are **aggregate functions**. They consume a
 |-----------------------|--------------------|------------|-------|
 | `sum(col)`            | `Series<Numeric>`  | Same numeric type | Returns null for an all-null group. |
 | `mean(col)`           | `Series<Numeric>`  | `Float64`  | |
-| `min(col)`            | `Series<T>`        | `T`        | |
-| `max(col)`            | `Series<T>`        | `T`        | |
+| `min(col)`            | `Series<T>`        | `T`        | `T` is numeric or `String` (including categorical). Strings compare byte-wise, i.e. by UTF-8 code point, so `"Z" < "a"`. |
+| `max(col)`            | `Series<T>`        | `T`        | As `min`. |
 | `count()`             | (none)             | `Int64`    | Counts rows in the group, nulls included. |
 | `count(col)`          | `Series<T>`        | `Int64`    | Counts the **non-null** values of `col`; `0` (not null) for a group with none. The argument must be a column name. |
 | `count_distinct(col)` | `Series<T>`        | `Int64`    | Counts the number of **distinct non-null** values of `col` in the group; `0` (not null) for a group with none. `T` may be any scalar type. |

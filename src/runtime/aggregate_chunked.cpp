@@ -4577,10 +4577,11 @@ class HashAggregateState final {
     /// Global aggregate over `rows`, optionally fanned out across workers.
     auto process_rows_ungrouped(const std::vector<const ColumnEntry*>& agg_entries,
                                 std::size_t rows) -> std::optional<std::string> {
-        // An empty input must produce NO group, hence no output row — the
-        // generic path got that for free by only creating a group when a row
-        // arrived. Creating it up front turned `count()` over an empty table
-        // into a 1-row answer.
+        // An empty input produces NO group here, hence no output row, like the
+        // generic path, which only creates a group when a row arrives. The
+        // one row SQL requires for an empty global aggregate (count 0, other
+        // aggregates null) is added once, at the node level
+        // (`global_aggregate_of_empty`), rather than by every kernel.
         if (rows == 0) {
             return std::nullopt;
         }

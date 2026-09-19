@@ -101,6 +101,44 @@ auto default_column_for(ExprType type, std::size_t rows) -> ColumnValue {
 
 }  // namespace
 
+auto global_aggregate_of_empty(const std::vector<ColumnEntry>& empty_columns,
+                               const std::vector<ir::AggSpec>& aggregations)
+    -> std::vector<ColumnEntry> {
+    std::vector<ColumnEntry> row;
+    row.reserve(empty_columns.size());
+    for (const ColumnEntry& entry : empty_columns) {
+        const auto spec = std::ranges::find(aggregations, entry.name, &ir::AggSpec::alias);
+        const bool counts = spec != aggregations.end() &&
+                            (spec->func == ir::AggFunc::Count ||
+                             spec->func == ir::AggFunc::CountDistinct || spec->is_count);
+        // Copying the empty column keeps its type and metadata (a Decimal's
+        // precision/scale, a Categorical's dictionary) for the one row added.
+        ColumnValue column = *entry.column;
+        std::visit(
+            [&](auto& col) {
+                using Col = std::decay_t<decltype(col)>;
+                if constexpr (std::is_same_v<Col, Column<std::int64_t>>) {
+                    col.resize(1, 0);
+                } else if constexpr (std::is_same_v<Col, Column<Categorical>>) {
+                    // A code needs a dictionary entry to point at, even under
+                    // a null: an empty dictionary has no valid code 0.
+                    col.push_back(std::string_view{});
+                } else {
+                    col.resize(1);
+                }
+            },
+            column);
+        ColumnEntry out{.name = entry.name,
+                        .column = std::make_shared<ColumnValue>(std::move(column)),
+                        .validity = std::nullopt};
+        if (!counts) {
+            out.validity = ValidityBitmap(1, false);
+        }
+        row.push_back(std::move(out));
+    }
+    return row;
+}
+
 // NOLINTNEXTLINE(readability-function-size)
 auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group_by,
                      const std::vector<ir::AggSpec>& aggregations, const ExecutionContext* exec)

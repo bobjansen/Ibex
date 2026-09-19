@@ -340,6 +340,6 @@ void stream_append_row(runtime::Table& dst, const runtime::Table& src, std::size
 
 [[nodiscard]] auto make_field(std::string alias, ir::Expr expr) -> ir::FieldSpec;
 [[nodiscard]] auto make_agg(ir::AggFunc func, std::string col_name, std::string alias,
-                            double param = 0.0) -> ir::AggSpec;
+                            double param = 0.0, bool is_count = false) -> ir::AggSpec;
 
 }  // namespace ibex::ops

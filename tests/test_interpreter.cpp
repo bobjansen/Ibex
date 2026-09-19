@@ -14335,6 +14335,54 @@ parts[filter p_partkey > scalar(
     }
 }
 
+TEST_CASE("Interpret subquery counts a key with no inner rows as 0, not null") {
+    // The COUNT bug: decorrelating into grouped-aggregate + left join leaves an
+    // outer row with no inner rows a null, but a count of nothing is 0. Only
+    // part 4 (washer) has no EU supply rows, so it is the only row whose count
+    // is 0. Every part has two EU suppliers otherwise.
+    const auto names = [](const std::string& query) {
+        auto result = interpret_source(std::string(kSupplySources) + query);
+        const auto* column = std::get_if<Column<std::string>>(result.find("p_name"));
+        REQUIRE(column != nullptr);
+        std::vector<std::string> out;
+        out.reserve(column->size());
+        for (std::size_t i = 0; i < column->size(); ++i) {
+            out.emplace_back((*column)[i]);
+        }
+        return out;
+    };
+    const auto correlated = [](const std::string& comparison, const std::string& count) {
+        return "parts[filter " + comparison +
+               " scalar(supply[filter ps_partkey == outer(p_partkey) && ps_region == \"EU\", "
+               "select { n = " +
+               count + " }]), select { p_name }];";
+    };
+    const std::vector<std::string> washer{"washer"};
+    const std::vector<std::string> all{"nut", "bolt", "screw", "washer"};
+
+    SECTION("correlated count()") {
+        REQUIRE(names(correlated("0 ==", "count()")) == washer);
+        REQUIRE(names(correlated("2 ==", "count()")) ==
+                std::vector<std::string>{"nut", "bolt", "screw"});
+    }
+    SECTION("correlated count(col)") {
+        REQUIRE(names(correlated("0 ==", "count(ps_suppkey)")) == washer);
+    }
+    SECTION("correlated count_distinct(col)") {
+        REQUIRE(names(correlated("0 ==", "count_distinct(ps_suppkey)")) == washer);
+    }
+    SECTION("uncorrelated count() over an empty input is 0") {
+        REQUIRE(names(R"(parts[filter 0 == scalar(supply[filter ps_region == "MARS",
+                                                       select { n = count() }]),
+                            select { p_name }];)") == all);
+    }
+    SECTION("uncorrelated count(col) over an empty input is 0") {
+        REQUIRE(names(R"(parts[filter 0 == scalar(supply[filter ps_region == "MARS",
+                                                       select { n = count(ps_cost) }]),
+                            select { p_name }];)") == all);
+    }
+}
+
 // ── substring(s, start[, length]) ────────────────────────────────────────────
 // A Unicode-codepoint slice with Polars str.slice semantics: 0-based start that
 // may be negative (from the end), optional length (to the end when omitted).

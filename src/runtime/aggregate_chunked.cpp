@@ -572,18 +572,20 @@ class HashAggregateState final {
             }
             const ColumnEntry* entry = &chunk.columns[*input_idx];
             const ExprType kind = expr_type_for_column(*entry->column);
-            const bool first_or_last =
-                agg.func == ir::AggFunc::First || agg.func == ir::AggFunc::Last;
-            // First/Last also accept String (which covers Column<std::string> and
-            // Column<Categorical> — expr_type_for_column collapses both to
-            // String); CountDistinct accepts every scalar kind (fixed-width
-            // values are bit-cast, text is kept verbatim); every other function
-            // stays numeric-only.
+            const bool keeps_a_value = agg.func == ir::AggFunc::First ||
+                                       agg.func == ir::AggFunc::Last ||
+                                       agg.func == ir::AggFunc::Min || agg.func == ir::AggFunc::Max;
+            // First/Last/Min/Max also accept String (which covers
+            // Column<std::string> and Column<Categorical> — expr_type_for_column
+            // collapses both to String); CountDistinct accepts every scalar kind
+            // (fixed-width values are bit-cast, text is kept verbatim); every
+            // other function stays numeric-only.
             const bool supported = kind == ExprType::Int || kind == ExprType::Double ||
                                    agg.func == ir::AggFunc::CountDistinct ||
-                                   (first_or_last && kind == ExprType::String);
+                                   (keeps_a_value && kind == ExprType::String);
             if (!supported) {
-                return "HashAggregateState: non-numeric aggregation not supported";
+                return "aggregate of column '" + agg.column.name +
+                       "': this function does not support the column's type";
             }
             agg_entries[i] = entry;
         }
@@ -4216,7 +4218,22 @@ class HashAggregateState final {
                     }
                     return std::string(std::get<Column<std::string>>(*entry.column)[row]);
                 };
-                if (plan_[agg_i].func == ir::AggFunc::First) {
+                const ir::AggFunc text_func = plan_[agg_i].func;
+                if (text_func == ir::AggFunc::Min || text_func == ir::AggFunc::Max) {
+                    for (std::size_t row = begin; row < rows; ++row) {
+                        if (has_nulls && !(*validity)[row])
+                            continue;
+                        auto& slot = slot_for(gids[row]);
+                        ScalarValue& held =
+                            text_at((static_cast<std::size_t>(gids[row]) * n_aggs_) + agg_i);
+                        const std::string_view value = text_cell(*entry.column, row);
+                        if (!slot.present() ||
+                            text_extreme_replaces(text_func, value, std::get<std::string>(held))) {
+                            held = std::string(value);
+                            slot.mark_present();
+                        }
+                    }
+                } else if (text_func == ir::AggFunc::First) {
                     for (std::size_t row = begin; row < rows; ++row) {
                         if (has_nulls && !(*validity)[row])
                             continue;
@@ -4557,14 +4574,17 @@ class HashAggregateState final {
                     }
                     return std::string(std::get<Column<std::string>>(*entry.column)[row]);
                 };
-                if (func == ir::AggFunc::First) {
+                if (func == ir::AggFunc::Min || func == ir::AggFunc::Max) {
                     each([&](std::size_t r) {
-                        if (!slot.present()) {
-                            text_at(agg_i) = value_at(r);
+                        ScalarValue& held = text_at(agg_i);
+                        const std::string_view value = text_cell(*entry.column, r);
+                        if (!slot.present() ||
+                            text_extreme_replaces(func, value, std::get<std::string>(held))) {
+                            held = std::string(value);
                             slot.mark_present();
                         }
                     });
-                } else {
+                } else if (func == ir::AggFunc::First) {
                     each([&](std::size_t r) {
                         text_at(agg_i) = value_at(r);
                         slot.mark_present();
@@ -4726,9 +4746,9 @@ class HashAggregateState final {
             case ir::AggFunc::Kurtosis:
                 return EmitSlot::F64;
             case ir::AggFunc::Sum:
+                return kind == ExprType::Double ? EmitSlot::F64 : EmitSlot::I64;
             case ir::AggFunc::Min:
             case ir::AggFunc::Max:
-                return kind == ExprType::Double ? EmitSlot::F64 : EmitSlot::I64;
             case ir::AggFunc::First:
             case ir::AggFunc::Last:
                 if (kind == ExprType::Double) {
@@ -4835,14 +4855,14 @@ class HashAggregateState final {
                     column = Column<double>{};
                     break;
                 case ir::AggFunc::Sum:
-                case ir::AggFunc::Min:
-                case ir::AggFunc::Max:
                     if (plan_[i].kind == ExprType::Double) {
                         column = Column<double>{};
                     } else {
                         column = Column<std::int64_t>{};
                     }
                     break;
+                case ir::AggFunc::Min:
+                case ir::AggFunc::Max:
                 case ir::AggFunc::First:
                 case ir::AggFunc::Last:
                     if (plan_[i].kind == ExprType::Double) {
@@ -5028,8 +5048,6 @@ class HashAggregateState final {
                                      : slot.double_value / static_cast<double>(slot.count));
                         break;
                     case ir::AggFunc::Sum:
-                    case ir::AggFunc::Min:
-                    case ir::AggFunc::Max:
                         if (plan_[i].kind == ExprType::Double) {
                             put_d(g, slot.double_value);
                         } else {
@@ -5047,6 +5065,8 @@ class HashAggregateState final {
                         put_d(g, agg_finalize_kurtosis(slot, scratch_for(g, i)[0],
                                                        scratch_for(g, i)[2]));
                         break;
+                    case ir::AggFunc::Min:
+                    case ir::AggFunc::Max:
                     case ir::AggFunc::First:
                     case ir::AggFunc::Last:
                         if (plan_[i].kind == ExprType::Double) {
@@ -5054,7 +5074,7 @@ class HashAggregateState final {
                         } else if (plan_[i].kind == ExprType::Int) {
                             put_i(g, slot.int_value);
                         } else {
-                            append_scalar(column, text_store_[(g * n_aggs_) + i]);
+                            append_text_cell(column, text_store_[(g * n_aggs_) + i]);
                         }
                         break;
                     default:

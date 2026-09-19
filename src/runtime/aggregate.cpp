@@ -269,7 +269,6 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
 
         if (item.kind == ExprType::String &&
             (agg.func == ir::AggFunc::Sum || agg.func == ir::AggFunc::Mean ||
-             agg.func == ir::AggFunc::Min || agg.func == ir::AggFunc::Max ||
              agg.func == ir::AggFunc::Median || agg.func == ir::AggFunc::Stddev ||
              agg.func == ir::AggFunc::Ewma || agg.func == ir::AggFunc::Quantile ||
              agg.func == ir::AggFunc::Skew || agg.func == ir::AggFunc::Kurtosis)) {
@@ -322,8 +321,11 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 slot.count += 1;
                 continue;
             }
+            // Every aggregate that reads a value skips null rows: first/last
+            // are the first/last NON-null value (SPEC 3.5), not the first row.
             if ((agg.func == ir::AggFunc::Sum || agg.func == ir::AggFunc::Mean ||
                  agg.func == ir::AggFunc::Min || agg.func == ir::AggFunc::Max ||
+                 agg.func == ir::AggFunc::First || agg.func == ir::AggFunc::Last ||
                  agg.func == ir::AggFunc::Median || agg.func == ir::AggFunc::Stddev ||
                  agg.func == ir::AggFunc::Ewma || agg.func == ir::AggFunc::Quantile ||
                  agg.func == ir::AggFunc::Skew || agg.func == ir::AggFunc::Kurtosis) &&
@@ -407,6 +409,17 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     const double alpha = plan[i].param;
                     slot.double_value = (alpha * x) + ((1.0 - alpha) * slot.double_value);
                 }
+                continue;
+            }
+            if ((agg.func == ir::AggFunc::Min || agg.func == ir::AggFunc::Max) &&
+                slot.kind == ExprType::String) {
+                const std::string_view value = text_cell(column, row);
+                if (!slot.has_value ||
+                    text_extreme_replaces(agg.func, value,
+                                          std::get<std::string>(slot.text_value))) {
+                    slot.text_value = std::string(value);
+                }
+                slot.has_value = true;
                 continue;
             }
 
@@ -644,6 +657,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     }
                     if (std::holds_alternative<Column<double>>(*input_col)) {
                         column = Column<double>{};
+                    } else if (agg.func != ir::AggFunc::Sum &&
+                               expr_type_for_column(*input_col) == ExprType::String) {
+                        column = make_empty_like(*input_col);
                     } else {
                         column = Column<std::int64_t>{};
                     }
@@ -695,6 +711,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 case ir::AggFunc::Max:
                     if (slot.kind == ExprType::Double) {
                         append_scalar(*column, slot.double_value);
+                    } else if (slot.kind == ExprType::String) {
+                        append_text_cell(*column, slot.text_value);
                     } else {
                         append_scalar(*column, slot.int_value);
                     }
@@ -706,7 +724,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     } else if (slot.kind == ExprType::Double) {
                         append_scalar(*column, slot.double_value);
                     } else {
-                        append_scalar(*column, slot.text_value);
+                        append_text_cell(*column, slot.text_value);
                     }
                     break;
                 // Median/Quantile/Skew/Kurtosis are reduced in the contiguous
@@ -742,6 +760,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             case ir::AggFunc::Sum:
             case ir::AggFunc::Min:
             case ir::AggFunc::Max:
+            case ir::AggFunc::First:
+            case ir::AggFunc::Last:
                 return slot.has_value;
             // Median/Quantile/Skew/Kurtosis are reduced in the contiguous collect
             // pass, which records the group's value count in slot.count.
@@ -758,8 +778,6 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 return slot.count >= 4;
             case ir::AggFunc::Count:
             case ir::AggFunc::CountDistinct:
-            case ir::AggFunc::First:
-            case ir::AggFunc::Last:
                 return true;
         }
         return true;
@@ -887,6 +905,30 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     }
                     for (std::uint32_t g = 0; g < n_groups; ++g) {
                         slot_for(g).text_value = std::move(acc[g]);
+                        slot_for(g).has_value = true;
+                    }
+                }
+                continue;
+            }
+
+            if ((item.func == ir::AggFunc::Min || item.func == ir::AggFunc::Max) &&
+                item.kind == ExprType::String) {
+                // Hold a view per group and copy only the winner: the column
+                // outlives this pass, and most rows lose the comparison.
+                const ColumnValue& column = *agg_columns[agg_i];
+                std::vector<std::string_view> acc(n_groups);
+                std::vector<std::uint8_t> found(n_groups, 0U);
+                for (std::size_t row = 0; row < rows; ++row) {
+                    const std::uint32_t g = gids[row];
+                    const std::string_view value = text_cell(column, row);
+                    if (found[g] == 0U || text_extreme_replaces(item.func, value, acc[g])) {
+                        acc[g] = value;
+                        found[g] = 1U;
+                    }
+                }
+                for (std::uint32_t g = 0; g < n_groups; ++g) {
+                    if (found[g] != 0U) {
+                        slot_for(g).text_value = std::string(acc[g]);
                         slot_for(g).has_value = true;
                     }
                 }
@@ -1313,7 +1355,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         for (std::size_t i = 0; i < aggregations.size(); ++i) {
             const auto func = aggregations[i].func;
             if (func == ir::AggFunc::Sum || func == ir::AggFunc::Mean || func == ir::AggFunc::Min ||
-                func == ir::AggFunc::Max || func == ir::AggFunc::Median ||
+                func == ir::AggFunc::Max || func == ir::AggFunc::First ||
+                func == ir::AggFunc::Last || func == ir::AggFunc::Median ||
                 func == ir::AggFunc::Stddev || func == ir::AggFunc::Ewma ||
                 func == ir::AggFunc::Quantile || func == ir::AggFunc::Skew ||
                 func == ir::AggFunc::Kurtosis) {

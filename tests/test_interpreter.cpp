@@ -13154,6 +13154,129 @@ TEST_CASE("Categorical first/last streams via the hash aggregate operator") {
     REQUIRE((*la)[1] == "gold");
 }
 
+namespace {
+
+// k = 1: "pear", null, "Apple"   k = 2: null, null   k = 3: "fig"
+// Byte order puts "Apple" before "pear" (uppercase sorts first).
+auto text_table_with_nulls(bool categorical) -> runtime::Table {
+    runtime::Table t;
+    t.add_column("k", Column<std::int64_t>{1, 1, 1, 2, 2, 3});
+    const std::vector<std::string> values{"pear", "", "Apple", "", "", "fig"};
+    runtime::ValidityBitmap valid{true, false, true, false, false, true};
+    if (categorical) {
+        Column<Categorical> col;
+        for (const auto& v : values) {
+            col.push_back(v);
+        }
+        t.add_column("s", std::move(col), std::move(valid));
+    } else {
+        Column<std::string> col;
+        for (const auto& v : values) {
+            col.push_back(v);
+        }
+        t.add_column("s", std::move(col), std::move(valid));
+    }
+    return t;
+}
+
+// Cell `row` of a String or Categorical result column, or nullopt when null.
+auto text_or_null(const runtime::Table& table, const std::string& name, std::size_t row)
+    -> std::optional<std::string> {
+    const auto* entry = table.find_entry(name);
+    REQUIRE(entry != nullptr);
+    if (runtime::is_null(*entry, row)) {
+        return std::nullopt;
+    }
+    if (const auto* cat = std::get_if<Column<Categorical>>(entry->column.get())) {
+        return std::string((*cat)[row]);
+    }
+    return std::string(std::get<Column<std::string>>(*entry->column)[row]);
+}
+
+}  // namespace
+
+TEST_CASE("min/max over text order by bytes and skip nulls") {
+    using Cells = std::vector<std::optional<std::string>>;
+    for (const bool categorical : {false, true}) {
+        CAPTURE(categorical);
+        runtime::TableRegistry registry;
+        registry.emplace("t", text_table_with_nulls(categorical));
+
+        {  // select by: the streaming hash aggregate
+            auto ir = require_ir(
+                "t[select { lo = min(s), hi = max(s), f = first(s), l = last(s) }, by { k }]"
+                "[order { k }];");
+            auto result = runtime::interpret(*ir, registry);
+            REQUIRE(result.has_value());
+            REQUIRE(result->rows() == 3);
+            const auto column = [&](const std::string& name) {
+                return Cells{text_or_null(*result, name, 0), text_or_null(*result, name, 1),
+                             text_or_null(*result, name, 2)};
+            };
+            // k = 2 has only nulls: every aggregate is null, not "" or a crash.
+            CHECK(column("lo") == Cells{"Apple", std::nullopt, "fig"});
+            CHECK(column("hi") == Cells{"pear", std::nullopt, "fig"});
+            CHECK(column("f") == Cells{"pear", std::nullopt, "fig"});
+            CHECK(column("l") == Cells{"Apple", std::nullopt, "fig"});
+        }
+        {  // update by: the materialized aggregate
+            auto ir = require_ir("t[update { lo = min(s), hi = max(s), f = first(s) }, by { k }];");
+            auto result = runtime::interpret(*ir, registry);
+            REQUIRE(result.has_value());
+            REQUIRE(result->rows() == 6);
+            for (std::size_t row = 0; row < 6; ++row) {
+                CAPTURE(row);
+                const bool all_null_group = row == 3 || row == 4;
+                const bool k3 = row == 5;
+                CHECK(text_or_null(*result, "lo", row) ==
+                      (all_null_group ? std::nullopt
+                                      : std::optional<std::string>(k3 ? "fig" : "Apple")));
+                CHECK(text_or_null(*result, "hi", row) ==
+                      (all_null_group ? std::nullopt
+                                      : std::optional<std::string>(k3 ? "fig" : "pear")));
+                CHECK(text_or_null(*result, "f", row) ==
+                      (all_null_group ? std::nullopt
+                                      : std::optional<std::string>(k3 ? "fig" : "pear")));
+            }
+        }
+        {  // no by
+            auto ir = require_ir("t[select { lo = min(s), hi = max(s) }];");
+            auto result = runtime::interpret(*ir, registry);
+            REQUIRE(result.has_value());
+            REQUIRE(result->rows() == 1);
+            CHECK(text_or_null(*result, "lo", 0) == "Apple");
+            CHECK(text_or_null(*result, "hi", 0) == "pear");
+        }
+    }
+}
+
+TEST_CASE("first/last skip nulls and are null for an all-null group") {
+    // The materialized aggregate took the first/last ROW, null or not, and
+    // always reported it valid: an all-null group broadcast 0 through update.
+    runtime::Table t;
+    t.add_column("k", Column<std::int64_t>{1, 1, 1, 2, 2});
+    t.add_column("x", Column<double>{0.0, 2.5, 0.0, 0.0, 0.0},
+                 runtime::ValidityBitmap{false, true, false, false, false});
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+    auto ir = require_ir("t[update { f = first(x), l = last(x) }, by { k }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* f = result->find_entry("f");
+    const auto* l = result->find_entry("l");
+    REQUIRE(f != nullptr);
+    REQUIRE(l != nullptr);
+    for (std::size_t row = 0; row < 3; ++row) {
+        CHECK_FALSE(runtime::is_null(*f, row));
+        CHECK(std::get<Column<double>>(*f->column)[row] == 2.5);
+        CHECK(std::get<Column<double>>(*l->column)[row] == 2.5);
+    }
+    for (std::size_t row = 3; row < 5; ++row) {
+        CHECK(runtime::is_null(*f, row));
+        CHECK(runtime::is_null(*l, row));
+    }
+}
+
 TEST_CASE("String first/last accumulates across chunk boundaries on the hash path") {
     // No ordering advertised → the hash ChunkedAggregateOperator handles it;
     // group 2 spans both chunks, exercising cross-chunk carryover of

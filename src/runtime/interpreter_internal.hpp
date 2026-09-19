@@ -706,6 +706,23 @@ struct AggSlotCore {
 /// `has_value` inline — so it wants the wide, self-describing slot, while the
 /// chunked operator allocating by the million wants the lean one. Sharing a base
 /// only forced the wide fields onto the path that cannot afford them.
+/// The text of row `row` of a String or Categorical column (ExprType::String).
+[[nodiscard]] inline auto text_cell(const ColumnValue& column, std::size_t row)
+    -> std::string_view {
+    if (const auto* cat = std::get_if<Column<Categorical>>(&column)) {
+        return (*cat)[row];
+    }
+    return std::get<Column<std::string>>(column)[row];
+}
+
+/// Min/Max over text: whether `candidate` replaces the held value `current`.
+/// Byte-wise comparison, which for UTF-8 is code-point order (as Polars
+/// orders strings). A Categorical compares by its text, never by its codes.
+[[nodiscard]] inline auto text_extreme_replaces(ir::AggFunc func, std::string_view candidate,
+                                                std::string_view current) -> bool {
+    return func == ir::AggFunc::Min ? candidate < current : candidate > current;
+}
+
 struct AggSlot {
     ir::AggFunc func = ir::AggFunc::Sum;
     ExprType kind = ExprType::Int;
@@ -1147,6 +1164,17 @@ inline auto append_scalar(ColumnValue& column, const ScalarValue& value) -> void
             }
         },
         column);
+}
+
+/// Append a text aggregate's value. A group with no non-null value holds no
+/// text (a null scalar); its cell is masked by the null bit but still has to
+/// exist, so it is written as an empty string.
+inline void append_text_cell(ColumnValue& column, const ScalarValue& value) {
+    if (std::holds_alternative<std::monostate>(value)) {
+        append_scalar(column, ScalarValue{std::string{}});
+        return;
+    }
+    append_scalar(column, value);
 }
 
 inline auto broadcast_scalar_column(const ScalarValue& value, std::size_t rows) -> ColumnValue {

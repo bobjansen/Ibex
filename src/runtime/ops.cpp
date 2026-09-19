@@ -671,12 +671,13 @@ auto make_field(std::string alias, ir::Expr expr) -> ir::FieldSpec {
     return ir::FieldSpec{.alias = std::move(alias), .expr = std::move(expr)};
 }
 
-auto make_agg(ir::AggFunc func, std::string col_name, std::string alias, double param)
-    -> ir::AggSpec {
+auto make_agg(ir::AggFunc func, std::string col_name, std::string alias, double param,
+              bool is_count) -> ir::AggSpec {
     return ir::AggSpec{.func = func,
                        .column = ir::ColumnRef{.name = std::move(col_name)},
                        .alias = std::move(alias),
-                       .param = param};
+                       .param = param,
+                       .is_count = is_count};
 }
 
 // ─── Stream helpers ───────────────────────────────────────────────────────────

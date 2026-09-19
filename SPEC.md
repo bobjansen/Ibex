@@ -2669,6 +2669,18 @@ field in the `select` clause must satisfy the **aggregation well-formedness
 rule**:
 
 > Every column reference in the field expression must either:
+**Empty input.** Without `by`, the whole input is one group, even when it has
+no rows: the result is always exactly one row. Over no rows `count()`,
+`count(col)` and `count_distinct(col)` are `0` and every other aggregate is
+null, and expressions over them follow from that (`mean(x) / 7.0` is null).
+With `by`, groups come from the rows that exist, so an empty input has no
+groups and the result has no rows. This is SQL's rule.
+
+```
+t[filter false, select { n = count(), m = mean(v) }]   // 1 row: n = 0, m = null
+t[filter false, select { n = count() }, by g]           // 0 rows
+```
+
 >
 > **(a)** name a grouping key column (listed in the `by` clause), or
 >

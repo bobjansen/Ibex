@@ -440,7 +440,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 *out_ << "ibex::ops::make_agg("
                       << "ibex::ir::AggFunc::" << emit_agg_func(a.func) << ", \""
                       << escape_string(a.column.name) << "\", \"" << escape_string(a.alias)
-                      << "\", " << format_double(a.param) << ")";
+                      << "\", " << format_double(a.param) << (a.is_count ? ", true" : "") << ")";
             }
             *out_ << "});\n";
             return var;
@@ -608,7 +608,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 *out_ << "ibex::ops::make_agg("
                       << "ibex::ir::AggFunc::" << emit_agg_func(a.func) << ", \""
                       << escape_string(a.column.name) << "\", \"" << escape_string(a.alias)
-                      << "\", " << format_double(a.param) << ")";
+                      << "\", " << format_double(a.param) << (a.is_count ? ", true" : "") << ")";
             }
             *out_ << "});\n";
             return var;

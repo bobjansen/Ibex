@@ -494,6 +494,9 @@ struct AggSpec {
     ColumnRef column;
     std::string alias;
     double param = 0.0;  ///< Function-specific parameter (e.g. alpha for Ewma).
+    /// `count(col)`, lowered as a Sum over a 0/1 not-null flag. Only the value
+    /// over no rows differs from a plain Sum: a count of nothing is 0, not null.
+    bool is_count = false;
 };
 
 /// Rename specification: maps an old column name to a new column name.

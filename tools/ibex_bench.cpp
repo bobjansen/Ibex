@@ -51,15 +51,14 @@ namespace {
 
 auto normalize_input(std::string_view input) -> std::string {
     auto normalized = std::string(ibex::trim(input));
-    auto last_non_space = normalized.find_last_not_of(" \t\n\r");
-    if (last_non_space != std::string::npos && normalized[last_non_space] != ';') {
+    if (!normalized.empty() && normalized.back() != ';') {
         normalized.push_back(';');
     }
     return normalized;
 }
 
 auto normalize_suite_name(std::string name) -> std::string {
-    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) {
+    std::ranges::transform(name, name.begin(), [](unsigned char ch) {
         if (ch == '-') {
             return '_';
         }
@@ -424,7 +423,7 @@ auto verify_order_head_topk(const ibex::runtime::Table& table, const ibex::runti
     for (std::size_t row = 0; row < rows; ++row) {
         expected.push_back(double_at(*price_col, row));
     }
-    std::stable_sort(expected.begin(), expected.end(), std::greater<double>{});
+    std::ranges::stable_sort(expected, std::greater<double>{});
     if (expected.size() > k) {
         expected.resize(k);
     }
@@ -454,7 +453,7 @@ auto verify_order_head_topk_by_symbol(const ibex::runtime::Table& table,
 
     std::vector<std::size_t> idx(rows);
     std::iota(idx.begin(), idx.end(), std::size_t{0});
-    std::stable_sort(idx.begin(), idx.end(), [&](std::size_t lhs, std::size_t rhs) {
+    std::ranges::stable_sort(idx, [&](std::size_t lhs, std::size_t rhs) {
         return double_at(*price_col, lhs) > double_at(*price_col, rhs);
     });
 
@@ -499,7 +498,7 @@ auto verify_order_tail_topk(const ibex::runtime::Table& table, const ibex::runti
     for (std::size_t row = 0; row < rows; ++row) {
         expected.push_back(double_at(*price_col, row));
     }
-    std::stable_sort(expected.begin(), expected.end(), std::greater<double>{});
+    std::ranges::stable_sort(expected, std::greater<double>{});
     if (expected.size() > k) {
         expected.erase(expected.begin(), expected.end() - static_cast<std::ptrdiff_t>(k));
     }
@@ -529,7 +528,7 @@ auto verify_order_tail_topk_by_symbol(const ibex::runtime::Table& table,
 
     std::vector<std::size_t> idx(rows);
     std::iota(idx.begin(), idx.end(), std::size_t{0});
-    std::stable_sort(idx.begin(), idx.end(), [&](std::size_t lhs, std::size_t rhs) {
+    std::ranges::stable_sort(idx, [&](std::size_t lhs, std::size_t rhs) {
         return double_at(*price_col, lhs) > double_at(*price_col, rhs);
     });
 
@@ -588,7 +587,7 @@ auto verify_sort_price(const ibex::runtime::Table& table, const ibex::runtime::T
     for (std::size_t row = 0; row < rows; ++row) {
         expected.push_back(double_at(*price_col, row));
     }
-    std::sort(expected.begin(), expected.end());
+    std::ranges::sort(expected);
     for (std::size_t i = 0; i < rows; ++i) {
         if (std::abs(double_at(*out_price, i) - expected[i]) > 1e-9) {
             return false;
@@ -615,7 +614,7 @@ auto verify_sort_symbol_price(const ibex::runtime::Table& table, const ibex::run
     }
     std::vector<std::size_t> idx(rows);
     std::iota(idx.begin(), idx.end(), std::size_t{0});
-    std::stable_sort(idx.begin(), idx.end(), [&](std::size_t lhs, std::size_t rhs) {
+    std::ranges::stable_sort(idx, [&](std::size_t lhs, std::size_t rhs) {
         const auto ls = string_view_at(*symbol_col, lhs);
         const auto rs = string_view_at(*symbol_col, rhs);
         if (ls != rs) {
@@ -1501,12 +1500,31 @@ auto compute_stats(std::vector<double> times) -> BenchStats {
 
 // Reset the kernel's peak-RSS counter (VmHWM) so the next peak_rss_mb() read
 // reflects only the work done since this call. Writing "5" to clear_refs clears
-// the per-process peak. Linux-only; a no-op where /proc/self/clear_refs is
-// unavailable (the subsequent peak read then reports the lifetime peak).
-void reset_peak_rss() {
-    if (std::FILE* f = std::fopen("/proc/self/clear_refs", "w")) {
-        std::fputs("5\n", f);
-        std::fclose(f);
+// the per-process peak. Linux-only. Returns false when the reset did not take
+// (no /proc/self/clear_refs, or the kernel rejected the write); the subsequent
+// peak read then reports the lifetime peak, not the peak of this window.
+[[nodiscard]] auto reset_peak_rss() -> bool {
+    std::FILE* f = std::fopen("/proc/self/clear_refs", "w");
+    if (f == nullptr) {
+        return false;
+    }
+    const bool wrote = std::fputs("5\n", f) >= 0;
+    // fputs only fills the stdio buffer; the kernel validates the value when
+    // fclose flushes it, so fclose is where a rejected reset surfaces.
+    const bool closed = std::fclose(f) == 0;
+    return wrote && closed;
+}
+
+// Start a peak-RSS measurement window. If the reset fails, warn once on
+// stderr (stdout is parsed by bench_ibex.sh) that peak_rss_mb values are
+// lifetime peaks, so a large earlier query inflates every later one.
+void begin_peak_rss_window() {
+    static bool warned = false;
+    if (!reset_peak_rss() && !warned) {
+        warned = true;
+        ibex::formatting::print(stderr,
+                                "warning: could not reset peak RSS via /proc/self/clear_refs; "
+                                "peak_rss_mb reports the process lifetime peak, not per-query\n");
     }
 }
 
@@ -1528,7 +1546,7 @@ auto peak_rss_mb() -> double {
 
 // Print one benchmark result line in the key=value format that bench_ibex.sh
 // parses into a TSV row. peak_rss_mb is the absolute VmHWM during the measured
-// iterations (reset via reset_peak_rss() just before the timed loop).
+// iterations (reset via begin_peak_rss_window() just before the timed loop).
 void print_bench_line(std::string_view name, std::size_t iters, const BenchStats& s,
                       std::size_t rows, double peak_mb) {
     ibex::formatting::print(
@@ -1551,10 +1569,16 @@ auto pack_filter_micro_word_scalar(const std::uint8_t* mp, std::size_t lim) noex
 }
 
 #ifdef __AVX2__
+auto load_filter_micro_vector(const std::uint8_t* src) noexcept -> __m256i {
+    __m256i value;
+    std::memcpy(&value, src, sizeof(value));
+    return value;
+}
+
 auto pack_filter_micro_word_avx2(const std::uint8_t* mp) noexcept -> std::uint64_t {
     const __m256i zero = _mm256_setzero_si256();
-    const __m256i lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(mp));
-    const __m256i hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(mp + 32));
+    const __m256i lo = load_filter_micro_vector(mp);
+    const __m256i hi = load_filter_micro_vector(mp + 32);
     const auto lo_bits =
         static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_cmpgt_epi8(lo, zero)));
     const auto hi_bits =
@@ -1642,7 +1666,7 @@ auto run_bitmap_kernel_benchmark(std::string_view bench_name, std::size_t rows,
         }
     }
 
-    reset_peak_rss();
+    begin_peak_rss_window();
     std::vector<double> times(iters);
     for (std::size_t i = 0; i < iters; ++i) {
         auto t0 = std::chrono::steady_clock::now();
@@ -1670,7 +1694,7 @@ auto run_scalar_kernel_benchmark(std::string_view bench_name, std::size_t rows,
         run_and_touch();
     }
 
-    reset_peak_rss();
+    begin_peak_rss_window();
     std::vector<double> times(iters);
     for (std::size_t i = 0; i < iters; ++i) {
         auto t0 = std::chrono::steady_clock::now();
@@ -1741,7 +1765,7 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
             }
         }
         std::size_t last_rows = 0;
-        reset_peak_rss();
+        begin_peak_rss_window();
         std::vector<double> times(iters);
         for (std::size_t i = 0; i < iters; ++i) {
             auto t0 = std::chrono::steady_clock::now();
@@ -1784,7 +1808,7 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
         }
 
         std::size_t last_rows = 0;
-        reset_peak_rss();
+        begin_peak_rss_window();
         std::vector<double> times(iters);
         for (std::size_t i = 0; i < iters; ++i) {
             auto t0 = std::chrono::steady_clock::now();
@@ -1844,7 +1868,7 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
 
     std::size_t last_rows = 0;
     last_result = {};
-    reset_peak_rss();
+    begin_peak_rss_window();
     std::vector<double> times(iters);
     for (std::size_t i = 0; i < iters; ++i) {
         last_result = {};
@@ -3780,26 +3804,26 @@ int main(int argc, char** argv) {
         ibex::formatting::print("\n-- Decimal vs Int64 vs Float64 benchmarks ({} rows) --\n",
                                 decimal_rows);
         const std::vector<BenchQuery> dec_queries = {
-            {"sum_i64", "dec_data[select { s = sum(i) }]"},
-            {"sum_f64", "dec_data[select { s = sum(f) }]"},
-            {"sum_dec", "dec_data[select { s = sum(d) }]"},
-            {"sum_dec38", "dec_data[select { s = sum(w) }]"},
-            {"group_sum_i64", "dec_data[select { s = sum(i) }, by k]"},
-            {"group_sum_f64", "dec_data[select { s = sum(f) }, by k]"},
-            {"group_sum_dec", "dec_data[select { s = sum(d) }, by k]"},
-            {"filter_i64", "dec_data[filter i > 25000, select { k }]"},
-            {"filter_f64", "dec_data[filter f > 250.0, select { k }]"},
-            {"filter_dec", "dec_data[filter d > 250.00, select { k }]"},
-            {"mul_const_i64", "dec_data[update { x = i * 3 }]"},
-            {"mul_const_f64", "dec_data[update { x = f * 3.0 }]"},
-            {"mul_const_dec", "dec_data[update { x = d * 3 }]"},
-            {"add_cols_i64", "dec_data[update { x = i + i }]"},
-            {"add_cols_f64", "dec_data[update { x = f + f }]"},
-            {"add_cols_dec", "dec_data[update { x = d + d }]"},
-            {"sort_i64", "dec_data[order i]"},
-            {"sort_f64", "dec_data[order f]"},
-            {"sort_dec", "dec_data[order d]"},
-            {"sort_dec38", "dec_data[order w]"},
+            {.name = "sum_i64", .source = "dec_data[select { s = sum(i) }]"},
+            {.name = "sum_f64", .source = "dec_data[select { s = sum(f) }]"},
+            {.name = "sum_dec", .source = "dec_data[select { s = sum(d) }]"},
+            {.name = "sum_dec38", .source = "dec_data[select { s = sum(w) }]"},
+            {.name = "group_sum_i64", .source = "dec_data[select { s = sum(i) }, by k]"},
+            {.name = "group_sum_f64", .source = "dec_data[select { s = sum(f) }, by k]"},
+            {.name = "group_sum_dec", .source = "dec_data[select { s = sum(d) }, by k]"},
+            {.name = "filter_i64", .source = "dec_data[filter i > 25000, select { k }]"},
+            {.name = "filter_f64", .source = "dec_data[filter f > 250.0, select { k }]"},
+            {.name = "filter_dec", .source = "dec_data[filter d > 250.00, select { k }]"},
+            {.name = "mul_const_i64", .source = "dec_data[update { x = i * 3 }]"},
+            {.name = "mul_const_f64", .source = "dec_data[update { x = f * 3.0 }]"},
+            {.name = "mul_const_dec", .source = "dec_data[update { x = d * 3 }]"},
+            {.name = "add_cols_i64", .source = "dec_data[update { x = i + i }]"},
+            {.name = "add_cols_f64", .source = "dec_data[update { x = f + f }]"},
+            {.name = "add_cols_dec", .source = "dec_data[update { x = d + d }]"},
+            {.name = "sort_i64", .source = "dec_data[order i]"},
+            {.name = "sort_f64", .source = "dec_data[order f]"},
+            {.name = "sort_dec", .source = "dec_data[order d]"},
+            {.name = "sort_dec38", .source = "dec_data[order w]"},
         };
         for (const auto& query : dec_queries) {
             status = run_benchmark(query, dec_tables, warmup_iters, iters, saved_include_parse);

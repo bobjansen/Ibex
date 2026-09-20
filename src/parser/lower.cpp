@@ -3647,6 +3647,17 @@ class Lowerer {
         // The aggregate keys carry the inner names and the outer query its
         // own; the join reads each side natively and folds the pair into one
         // output column, which is what the rename here used to achieve.
+        //
+        // Two captures sharing an outer column fold two right columns into one
+        // left output column. `plan_join_output` records a folded peer on the
+        // single left column and so keeps only the first, which is sound for
+        // the Left join built below and for an Inner one: the peer is read
+        // only for a row missing its own side, and neither kind has one on the
+        // left. It would NOT be sound for a Right or Outer join, where an
+        // unmatched right row takes its key value from the right and the two
+        // inner columns need not agree. `mapped_join_keys` declines to create
+        // this shape for the same family of reasons; decorrelation is its only
+        // producer, and it must keep emitting Left.
         std::vector<ir::JoinKey> keys;
         keys.reserve(captures.size());
         for (const auto& capture : captures) {

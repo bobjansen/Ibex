@@ -2472,3 +2472,98 @@ capture(ordered[head 3]);
     CHECK(topk == std::vector<std::int64_t>{9, 9, 7});
     CHECK(topk == sorted_head);
 }
+
+namespace {
+
+/// Records, for one column, whether each row is valid — the one thing a plain
+/// value capture cannot see.
+auto register_validity_capture(ibex::runtime::ExternRegistry& registry, const std::string& column,
+                               std::vector<bool>& captured) -> void {
+    registry.register_scalar_table_consumer(
+        "capture", ibex::runtime::ScalarKind::Int,
+        [&captured, column](const ibex::runtime::Table& table, const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            auto it = table.index.find(column);
+            if (it == table.index.end()) {
+                return std::unexpected("capture expected a column named " + column);
+            }
+            const auto& entry = table.columns[it->second];
+            captured.clear();
+            for (std::size_t row = 0; row < table.rows(); ++row) {
+                captured.push_back(!ibex::runtime::is_null(entry, row));
+            }
+            return ibex::runtime::ExternValue{std::int64_t{0}};
+        });
+}
+
+}  // namespace
+
+TEST_CASE("REPL Table literal: a null element makes that cell null", "[repl][null][construct]") {
+    // `null` has no type of its own, so the column takes the type of its first
+    // non-null element and the null becomes a cleared validity bit. Both REPL
+    // paths build the column, so both are checked.
+    ibex::runtime::ExternRegistry registry;
+    std::vector<bool> valid;
+    std::vector<std::int64_t> values;
+    register_validity_capture(registry, "v", valid);
+
+    SECTION("batch planner path") {
+        const char* src = R"(
+extern fn capture(df: DataFrame) -> Int from "fake.hpp";
+capture(Table { v = [1, null, 3] });
+)";
+        REQUIRE(ibex::repl::execute_script(src, registry));
+        CHECK(valid == std::vector<bool>{true, false, true});
+    }
+
+    SECTION("statement-at-a-time path") {
+        // A `let`-bound table is executed statement by statement.
+        const char* src = R"(
+extern fn capture(df: DataFrame) -> Int from "fake.hpp";
+let t = Table { v = [1, null, 3], s = ["a", null, "c"] };
+let n = scalar(t[select { c = count() }]);
+capture(t);
+)";
+        REQUIRE(ibex::repl::execute_script(src, registry));
+        CHECK(valid == std::vector<bool>{true, false, true});
+    }
+
+    SECTION("null survives arithmetic and is testable with is null") {
+        register_int_capture(registry, "v", values);
+        const char* src = R"(
+extern fn capture(df: DataFrame) -> Int from "fake.hpp";
+capture(Table { x = [1, null, 3] }[filter { x is not null }, select { v = x + 1 }]);
+)";
+        REQUIRE(ibex::repl::execute_script(src, registry));
+        CHECK(values == std::vector<std::int64_t>{2, 4});
+    }
+}
+
+TEST_CASE("REPL Table literal: an all-null column is an all-null Int64 column",
+          "[repl][null][construct]") {
+    // With no non-null element there is no type to take, so the column falls
+    // back to Int64 — the same default `col = []` uses.
+    ibex::runtime::ExternRegistry registry;
+    std::vector<bool> valid;
+    register_validity_capture(registry, "v", valid);
+
+    const char* src = R"(
+extern fn capture(df: DataFrame) -> Int from "fake.hpp";
+capture(Table { v = [null, null] });
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+    CHECK(valid == std::vector<bool>{false, false});
+}
+
+TEST_CASE("REPL a null element still has to agree with the column's type",
+          "[repl][null][construct]") {
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplConfig config;
+    config.persistent_history = false;
+
+    // A standalone Series binding is a bare column with no validity bitmap, so
+    // there is nowhere to record the null.
+    CHECK_FALSE(ibex::repl::execute_script("let s = [1, null];", registry, config));
+    // Nulls do not excuse mixed element types.
+    CHECK_FALSE(ibex::repl::execute_script("Table { v = [1, null, \"a\"] };", registry, config));
+}

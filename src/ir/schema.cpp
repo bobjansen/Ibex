@@ -1119,10 +1119,18 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                 std::optional<ColumnType> type;
                 Nullability nulls = Nullability::Maybe;
                 if (!col.elements.empty()) {
+                    // Reading the type off element 0 is safe even when element
+                    // 0 is a `null`: lowering fills a null's slot with a
+                    // placeholder of the column's own type, so every element
+                    // answers `literal_type` the same way. That invariant lives
+                    // in `lower_table_expr`; a null's slot holding a
+                    // default-constructed Literal instead would silently retype
+                    // a null-leading column to Int64.
                     type = literal_type(col.elements.front());
-                    // A literal list is written out value by value, and the
-                    // surface language has no null literal to write.
-                    nulls = Nullability::Never;
+                    // A literal list is written out value by value, so it is
+                    // null-free unless it was written with `null` elements —
+                    // which are the cleared bits of `valid`.
+                    nulls = col.valid.empty() ? Nullability::Never : Nullability::Maybe;
                 } else if (col.expr_node != nullptr) {
                     const SchemaInfo sub = infer_schema(*col.expr_node, sources);
                     if (sub.is_known() && sub.fields().size() == 1) {

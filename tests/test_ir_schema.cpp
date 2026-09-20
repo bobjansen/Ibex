@@ -698,6 +698,30 @@ TEST_CASE("schema: a source's nullability survives the row-shaping operators", "
     }
 }
 
+TEST_CASE("schema: a Table literal is null-free only without null elements", "[ir][schema]") {
+    // `Never` here is a proof a later pass may fold `is null` against, so a
+    // literal list written with `null` elements must not claim it.
+    auto s = schema_of("Table { a = [1, 2], b = [1, null], c = [null, null] };");
+    REQUIRE(s.is_known());
+    CHECK(nulls_of(s, "a") == Nullability::Never);
+    CHECK(nulls_of(s, "b") == Nullability::Maybe);
+    CHECK(nulls_of(s, "c") == Nullability::Maybe);
+}
+
+TEST_CASE("schema: a leading null does not retype the column", "[ir][schema]") {
+    // The type is read off element 0, which for these columns is a null. It
+    // holds a placeholder of the column's own type, so the answer is the type
+    // the first *written* value implies -- not the Int64 a default-constructed
+    // placeholder would give. Only an all-null column falls back to Int64.
+    auto s = schema_of(
+        "Table { f = [null, 1.5], s = [null, \"a\"], b = [null, true], n = [null, null] };");
+    REQUIRE(s.is_known());
+    CHECK(type_of(s, "f") == ColumnType::Float64);
+    CHECK(type_of(s, "s") == ColumnType::String);
+    CHECK(type_of(s, "b") == ColumnType::Bool);
+    CHECK(type_of(s, "n") == ColumnType::Int64);
+}
+
 TEST_CASE("schema: a filter proves the columns its predicate had to read", "[ir][schema]") {
     // A null `b` makes `b > 0` null, and null is not true, so no row with a
     // null `b` survives. `c` is untouched by the predicate and stays unproven.

@@ -935,6 +935,23 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                           << "\", ibex::Column<std::int64_t>{});\n";
                     continue;
                 }
+                // A column with `null` elements is added with an explicit
+                // validity bitmap; without one, add_column marks every row valid.
+                auto emit_validity = [&] {
+                    if (col.valid.empty()) {
+                        return;
+                    }
+                    *out_ << ", ibex::runtime::ValidityBitmap{std::vector<bool>{";
+                    bool first = true;
+                    for (const bool v : col.valid) {
+                        if (!first) {
+                            *out_ << ", ";
+                        }
+                        first = false;
+                        *out_ << (v ? "true" : "false");
+                    }
+                    *out_ << "}}";
+                };
                 // Determine column type from first element and emit the add_column call.
                 std::visit(
                     [&](const auto& first_val) {
@@ -982,7 +999,9 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                                           << ", ibex::decimal::kInt64Type}";
                                 }
                             }
-                            *out_ << "}));\n";
+                            *out_ << "})";
+                            emit_validity();
+                            *out_ << ");\n";
                             return;
                         }
                         *out_ << "    " << var << ".add_column(\"" << escape_string(col.name)
@@ -1017,7 +1036,9 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                                 },
                                 lit.value);
                         }
-                        *out_ << "});\n";
+                        *out_ << "}";
+                        emit_validity();
+                        *out_ << ");\n";
                     },
                     col.elements[0].value);
             }

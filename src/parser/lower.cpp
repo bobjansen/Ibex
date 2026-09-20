@@ -874,6 +874,29 @@ auto substitute_params(const Expr& expr,
         expr.node);
 }
 
+/// True if `expr` is the `null` keyword, which the parser lowers to `__null()`.
+auto is_null_literal(const Expr& expr) -> bool {
+    const auto* call = std::get_if<CallExpr>(&expr.node);
+    return call != nullptr && call->callee == "__null" && call->args.empty() &&
+           call->named_args.empty();
+}
+
+/// A zero-valued literal of the same type as `like` — the stand-in stored for a
+/// `null` series element, which the validity bitmap masks out. A Decimal keeps
+/// `like`'s precision and scale so the column's unified type is unaffected.
+auto placeholder_for(const ir::Literal& like) -> ir::Literal {
+    return std::visit(
+        [](const auto& v) -> ir::Literal {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, DecimalValue>) {
+                return ir::Literal{.value = DecimalValue{.units = 0, .type = v.type}};
+            } else {
+                return ir::Literal{.value = T{}};
+            }
+        },
+        like.value);
+}
+
 auto extract_string_list(const Expr& expr) -> std::optional<std::vector<std::string>> {
     const auto* array = std::get_if<ArrayLiteralExpr>(&expr.node);
     if (array == nullptr) {
@@ -1783,12 +1806,24 @@ class Lowerer {
                 continue;
             }
 
+            // `null` elements have no type of their own, so they are recorded
+            // as holes here and filled with a well-typed placeholder once the
+            // column's type is known (from the first non-null element).
             std::vector<ir::Literal> elements;
+            std::vector<bool> valid;
             elements.reserve(arr->elements.size());
+            bool any_null = false;
 
             // Determine the type from the first element and validate uniformity.
             int type_tag = -1;  // 0=int, 1=double, 2=bool, 3=string, 4=Date, 5=Timestamp
             for (const auto& elem_ptr : arr->elements) {
+                if (is_null_literal(*elem_ptr)) {
+                    any_null = true;
+                    valid.resize(elements.size(), true);
+                    valid.push_back(false);
+                    elements.emplace_back();
+                    continue;
+                }
                 const auto* lit = std::get_if<LiteralExpr>(&elem_ptr->node);
                 if (lit == nullptr) {
                     return std::unexpected(LowerError{.message = "Table constructor: column '" +
@@ -1828,11 +1863,35 @@ class Lowerer {
                     },
                     lit->value);
                 elements.push_back(std::move(ir_lit));
+                if (any_null) {
+                    valid.push_back(true);
+                }
+            }
+
+            if (any_null) {
+                // Give every hole a value of the column's type, so downstream
+                // consumers can read `elements` without a per-element null
+                // check. An all-null column has no type to take; it defaults to
+                // Int64, matching the `col = []` rule.
+                const auto placeholder = [&] {
+                    for (std::size_t i = 0; i < elements.size(); ++i) {
+                        if (valid[i]) {
+                            return placeholder_for(elements[i]);
+                        }
+                    }
+                    return ir::Literal{.value = std::int64_t{0}};
+                }();
+                for (std::size_t i = 0; i < elements.size(); ++i) {
+                    if (!valid[i]) {
+                        elements[i] = placeholder;
+                    }
+                }
             }
 
             construct_cols.push_back(ir::ConstructColumn{
                 .name = col_def.name,
                 .elements = std::move(elements),
+                .valid = std::move(valid),
                 .expr_node = nullptr,
             });
         }
@@ -5122,6 +5181,7 @@ class Lowerer {
                 ir::ConstructColumn cc;
                 cc.name = col.name;
                 cc.elements = col.elements;
+                cc.valid = col.valid;
                 if (col.expr_node) {
                     cc.expr_node = clone_node(*col.expr_node);
                 }

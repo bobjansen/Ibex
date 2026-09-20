@@ -556,6 +556,10 @@ require a `Series<T>` annotation outside `Table { ... }`; inside a table
 constructor, `col = []` produces a zero-row `Int64` series by default.
 Duration literals (`1m`, `30s`) are not valid series elements.
 
+`null` is also a valid element, but only inside a `Table { ... }` column: a
+standalone Series binding is a bare column with no validity bitmap, so it has
+nowhere to record the null. See Section 8.2.
+
 `TimeFrame<S>` is a `DataFrame<S>` with the additional invariant that exactly
 one column of type `Timestamp` is designated as the time index, and rows are
 sorted by that index in ascending order.
@@ -2826,6 +2830,25 @@ Supported element types and their inferred column types:
 All elements within one series literal must have the same literal kind; mixing types
 is a lowering error. Duration literals (`1m`, `30s`) are not valid array
 elements.
+
+`null` may appear as an element, producing a null cell — it clears that row's
+validity bit (Section 3.5) rather than storing a value:
+
+```
+Table {
+    symbol = ["AAPL", null, "MSFT"],   // String, row 1 null
+    price  = [150.0, 140.0, null],     // Float64, row 2 null
+}
+```
+
+`null` carries no type of its own, so the column's type comes from its first
+non-null element and a `null` in a column of any other kind is not a type
+mismatch. A column whose elements are *all* `null` has no type to take, and
+falls back to `Int64` — the same default `col = []` uses:
+
+```
+Table { a = [null, null] }   // Int64, both rows null
+```
 
 ### 8.3 Expression Columns
 

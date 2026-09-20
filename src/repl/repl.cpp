@@ -1888,26 +1888,54 @@ auto empty_series_for_type(parser::ScalarType type) -> runtime::ColumnValue {
     return Column<std::int64_t>{};
 }
 
+/// A series literal evaluated to a column, plus its validity when the literal
+/// contained `null` elements (nullopt means every element is valid).
+struct SeriesLiteral {
+    runtime::ColumnValue column;
+    std::optional<runtime::ValidityBitmap> validity;
+};
+
+/// A standalone Series binding is a bare column with no validity bitmap, so a
+/// `null` element has nowhere to live; only a `Table { }` column can hold one.
+constexpr std::string_view kNullSeriesBindingError =
+    "null is only allowed in a Table { } column literal, not a standalone series";
+
+/// True if `expr` is the `null` keyword, which the parser lowers to `__null()`.
+auto is_null_literal_expr(const parser::Expr& expr) -> bool {
+    const auto* call = std::get_if<parser::CallExpr>(&expr.node);
+    return call != nullptr && call->callee == "__null" && call->args.empty() &&
+           call->named_args.empty();
+}
+
 auto eval_series_literal(const parser::ArrayLiteralExpr& array,
                          std::optional<parser::ScalarType> expected = std::nullopt)
-    -> std::expected<runtime::ColumnValue, std::string> {
+    -> std::expected<SeriesLiteral, std::string> {
     if (array.elements.empty()) {
         if (!expected.has_value()) {
             return std::unexpected("empty series literal requires a Series<T> annotation");
         }
-        return empty_series_for_type(*expected);
+        return SeriesLiteral{.column = empty_series_for_type(*expected), .validity = std::nullopt};
     }
 
-    const auto* first_lit = std::get_if<parser::LiteralExpr>(&array.elements.front()->node);
-    if (first_lit == nullptr) {
-        return std::unexpected("series literal elements must be literals");
-    }
+    // `null` elements have no type of their own: the column's type comes from
+    // the first non-null element, and each null is stored as a zero of that
+    // type which the validity bitmap masks out. An all-null literal has no type
+    // to take, so it falls back to Int64 — the `[]` rule.
+    using LiteralValue = decltype(parser::LiteralExpr::value);
+    std::vector<LiteralValue> values;
+    values.reserve(array.elements.size());
+    std::vector<bool> valid;
+    bool any_null = false;
+    std::optional<std::size_t> type_index;
 
-    const std::size_t type_index = first_lit->value.index();
-    if (type_index == 4) {
-        return std::unexpected("duration literals are not valid series elements");
-    }
     for (const auto& element : array.elements) {
+        if (is_null_literal_expr(*element)) {
+            any_null = true;
+            valid.resize(values.size(), true);
+            valid.push_back(false);
+            values.emplace_back();
+            continue;
+        }
         const auto* lit = std::get_if<parser::LiteralExpr>(&element->node);
         if (lit == nullptr) {
             return std::unexpected("series literal elements must be literals");
@@ -1915,103 +1943,82 @@ auto eval_series_literal(const parser::ArrayLiteralExpr& array,
         if (lit->value.index() == 4) {
             return std::unexpected("duration literals are not valid series elements");
         }
-        if (lit->value.index() != type_index) {
+        if (!type_index.has_value()) {
+            type_index = lit->value.index();
+        } else if (lit->value.index() != *type_index) {
             return std::unexpected("series literal has mixed element types");
+        }
+        values.push_back(lit->value);
+        if (any_null) {
+            valid.push_back(true);
         }
     }
 
-    runtime::ColumnValue out;
-    switch (type_index) {
-        case 0: {
-            Column<std::int64_t> col;
-            col.reserve(array.elements.size());
-            for (const auto& element : array.elements) {
-                col.push_back(
-                    std::get<std::int64_t>(std::get<parser::LiteralExpr>(element->node).value));
+    std::optional<runtime::ValidityBitmap> validity;
+    if (any_null) {
+        // Give every hole a value of the column's type, so the builders below
+        // can read `values` without a per-element null check.
+        LiteralValue placeholder{std::int64_t{0}};
+        if (type_index.has_value()) {
+            std::size_t first_valid = 0;
+            while (!valid[first_valid]) {
+                ++first_valid;
             }
-            out = std::move(col);
-            break;
+            placeholder = std::visit(
+                [](const auto& v) -> LiteralValue {
+                    using T = std::decay_t<decltype(v)>;
+                    if constexpr (std::is_same_v<T, DecimalValue>) {
+                        return DecimalValue{.units = 0, .type = v.type};
+                    } else {
+                        return T{};
+                    }
+                },
+                values[first_valid]);
         }
-        case 1: {
-            Column<double> col;
-            col.reserve(array.elements.size());
-            for (const auto& element : array.elements) {
-                col.push_back(std::get<double>(std::get<parser::LiteralExpr>(element->node).value));
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            if (!valid[i]) {
+                values[i] = placeholder;
             }
-            out = std::move(col);
-            break;
         }
-        case 2: {
-            Column<bool> col;
-            col.reserve(array.elements.size());
-            for (const auto& element : array.elements) {
-                col.push_back(std::get<bool>(std::get<parser::LiteralExpr>(element->node).value));
-            }
-            out = std::move(col);
-            break;
-        }
-        case 3: {
-            Column<std::string> col;
-            col.reserve(array.elements.size());
-            for (const auto& element : array.elements) {
-                const auto& value =
-                    std::get<std::string>(std::get<parser::LiteralExpr>(element->node).value);
-                col.push_back(std::string_view{value});
-            }
-            out = std::move(col);
-            break;
-        }
-        case 5: {
-            Column<Date> col;
-            col.reserve(array.elements.size());
-            for (const auto& element : array.elements) {
-                col.push_back(std::get<Date>(std::get<parser::LiteralExpr>(element->node).value));
-            }
-            out = std::move(col);
-            break;
-        }
-        case 6: {
-            Column<Timestamp> col;
-            col.reserve(array.elements.size());
-            for (const auto& element : array.elements) {
-                col.push_back(
-                    std::get<Timestamp>(std::get<parser::LiteralExpr>(element->node).value));
-            }
-            out = std::move(col);
-            break;
-        }
-        case 7: {
-            // Decimal: one column type for the list, the narrowest holding
-            // every element exactly.
-            DecimalType unified =
-                std::get<DecimalValue>(
-                    std::get<parser::LiteralExpr>(array.elements.front()->node).value)
-                    .type;
-            for (const auto& element : array.elements) {
-                unified = decimal::union_type(
-                    unified,
-                    std::get<DecimalValue>(std::get<parser::LiteralExpr>(element->node).value)
-                        .type);
-            }
-            auto col = runtime::make_decimal_column(unified);
-            col.reserve(array.elements.size());
-            for (const auto& element : array.elements) {
-                col.push_back(Decimal{runtime::decimal_units_for(
-                    std::get<DecimalValue>(std::get<parser::LiteralExpr>(element->node).value),
-                    unified)});
-            }
-            out = std::move(col);
-            break;
-        }
-        default:
-            return std::unexpected("unsupported series literal element type");
+        validity = runtime::ValidityBitmap{valid};
     }
+    // An all-null list left every value at the Int64 placeholder, so the visit
+    // below builds the Int64 column the fallback calls for.
+    runtime::ColumnValue out = std::visit(
+        [&](const auto& first_val) -> runtime::ColumnValue {
+            using T = std::decay_t<decltype(first_val)>;
+            if constexpr (std::is_same_v<T, parser::DurationLiteral>) {
+                return Column<std::int64_t>{};  // excluded above
+            } else if constexpr (std::is_same_v<T, DecimalValue>) {
+                // Decimal: one column type for the list, the narrowest holding
+                // every element exactly.
+                DecimalType unified = first_val.type;
+                for (const auto& value : values) {
+                    unified = decimal::union_type(unified, std::get<DecimalValue>(value).type);
+                }
+                auto col = runtime::make_decimal_column(unified);
+                col.reserve(values.size());
+                for (const auto& value : values) {
+                    col.push_back(Decimal{
+                        runtime::decimal_units_for(std::get<DecimalValue>(value), unified)});
+                }
+                return col;
+            } else {
+                Column<T> col;
+                col.reserve(values.size());
+                for (const auto& value : values) {
+                    col.push_back(std::get<T>(value));
+                }
+                return col;
+            }
+        },
+        values.front());
 
     if (expected.has_value() && !column_type_matches(out, *expected)) {
         return std::unexpected("series literal has wrong type (expected " +
                                std::string(scalar_type_name(*expected)) + ")");
     }
-    return out;
+    return SeriesLiteral{.column = std::move(out), .validity = std::move(validity)};
 }
 
 /// Validates that `table` satisfies the schema declared in `type`.
@@ -3007,7 +3014,10 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
         if (!series) {
             return std::unexpected(series.error());
         }
-        return EvalValue{std::move(series.value())};
+        if (series->validity.has_value()) {
+            return std::unexpected(std::string{kNullSeriesBindingError});
+        }
+        return EvalValue{std::move(series->column)};
     }
     // String interpolation (`...${expr}...`) lowers to a __interp call; it always
     // produces a scalar string.
@@ -3693,46 +3703,60 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         table_expr != nullptr && table_expr->row_count == nullptr) {
         runtime::Table out;
         for (const auto& col_def : table_expr->columns) {
-            std::expected<EvalValue, std::string> value = std::unexpected("");
-            if (const auto* array = std::get_if<parser::ArrayLiteralExpr>(&col_def.expr->node);
-                array != nullptr && array->elements.empty()) {
-                auto series = eval_series_literal(*array, parser::ScalarType::Int64);
+            runtime::ColumnValue column;
+            std::optional<runtime::ValidityBitmap> validity;
+            // A series literal is evaluated here rather than through
+            // eval_expr_value, which yields a bare column: only this path can
+            // carry the validity a `null` element produces. An empty literal
+            // takes the Int64 default the table constructor promises.
+            if (const auto* array = std::get_if<parser::ArrayLiteralExpr>(&col_def.expr->node)) {
+                auto series = eval_series_literal(
+                    *array, array->elements.empty() ? std::optional{parser::ScalarType::Int64}
+                                                    : std::nullopt);
                 if (!series) {
                     return std::unexpected(series.error());
                 }
-                value = EvalValue{std::move(series.value())};
+                column = std::move(series->column);
+                validity = std::move(series->validity);
             } else {
-                value =
+                auto value =
                     eval_expr_value(*col_def.expr, tables, lazy_tables, scalars, columns, models,
                                     functions, compile_time_lists, extern_decls, externs);
-            }
-            if (!value) {
-                return std::unexpected(value.error());
-            }
-
-            runtime::ColumnValue column;
-            if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
-                column = std::move(*col);
-            } else if (auto* table = std::get_if<runtime::Table>(&value.value())) {
-                if (table->columns.size() == 1) {
-                    column = *table->columns.front().column;
-                } else if (const auto* found = table->find(col_def.name); found != nullptr) {
-                    column = *found;
+                if (!value) {
+                    return std::unexpected(value.error());
+                }
+                if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
+                    column = std::move(*col);
+                } else if (auto* table = std::get_if<runtime::Table>(&value.value())) {
+                    const runtime::ColumnEntry* entry = nullptr;
+                    if (table->columns.size() == 1) {
+                        entry = &table->columns.front();
+                    } else if (auto it = table->index.find(col_def.name);
+                               it != table->index.end()) {
+                        entry = &table->columns[it->second];
+                    } else {
+                        return std::unexpected("Table constructor: expression for column '" +
+                                               col_def.name +
+                                               "' produced a table with no matching column");
+                    }
+                    column = *entry->column;
+                    validity = entry->validity;
                 } else {
                     return std::unexpected("Table constructor: expression for column '" +
                                            col_def.name +
-                                           "' produced a table with no matching column");
+                                           "' must evaluate to a Series or DataFrame");
                 }
-            } else {
-                return std::unexpected("Table constructor: expression for column '" + col_def.name +
-                                       "' must evaluate to a Series or DataFrame");
             }
 
             if (!out.columns.empty() && runtime::column_size(column) != out.rows()) {
                 return std::unexpected("Table constructor: column '" + col_def.name +
                                        "' length does not match previous columns");
             }
-            out.add_column(col_def.name, std::move(column));
+            if (validity.has_value()) {
+                out.add_column(col_def.name, std::move(column), std::move(*validity));
+            } else {
+                out.add_column(col_def.name, std::move(column));
+            }
         }
         return out;
     }
@@ -4174,7 +4198,10 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                     if (!series) {
                         return std::unexpected(series.error());
                     }
-                    value = EvalValue{std::move(series.value())};
+                    if (series->validity.has_value()) {
+                        return std::unexpected(std::string{kNullSeriesBindingError});
+                    }
+                    value = EvalValue{std::move(series->column)};
                 } else {
                     value = eval_expr_value(*let_stmt.value, local_tables, local_lazy_tables,
                                             local_scalars, local_columns, local_models, functions,
@@ -4764,7 +4791,11 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                             ibex::formatting::print("error: {}\n", series.error());
                             return false;
                         }
-                        value = EvalValue{std::move(series.value())};
+                        if (series->validity.has_value()) {
+                            ibex::formatting::print("error: {}\n", kNullSeriesBindingError);
+                            return false;
+                        }
+                        value = EvalValue{std::move(series->column)};
                     } else {
                         value = eval_expr_value(*let_stmt.value, tables, lazy_tables, scalars,
                                                 columns, models, functions, compile_time_lists,

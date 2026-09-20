@@ -1018,3 +1018,21 @@ TEST_CASE("empty order retains typed columns", "[schema][order]") {
         CHECK(runtime::is_null(*total.find_entry("s"), 0));
     }
 }
+
+TEST_CASE("empty distinct retains typed columns", "[schema][distinct]") {
+    runtime::Table table;
+    table.add_column("k", Column<std::int64_t>{});
+    table.add_column("v", Column<std::int64_t>{});
+    table.add_column("s", Column<std::string>{});
+    for (const char* query : {"t[distinct k];", "t[distinct { k, v }];", "t[distinct { k, s }];"}) {
+        INFO(query);
+        auto out = run(query, {{"t", table}});
+        CHECK(out.rows() == 0);
+        REQUIRE(out.find("k") != nullptr);
+        CHECK(std::holds_alternative<Column<std::int64_t>>(*out.find("k")));
+        auto total = run("t[select { n = count(), s = sum(k) }];", {{"t", out}});
+        REQUIRE(total.rows() == 1);
+        CHECK(std::get<Column<std::int64_t>>(*total.find("n"))[0] == 0);
+        CHECK(runtime::is_null(*total.find_entry("s"), 0));
+    }
+}

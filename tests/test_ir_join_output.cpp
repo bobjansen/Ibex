@@ -123,6 +123,27 @@ TEST_CASE("join output plan: a folded key can preserve a logical label", "[ir][j
     CHECK((*plan)[0].folded_peer_index == 0);
 }
 
+TEST_CASE("join output plan: two folded keys sharing one left column", "[ir][join][schema]") {
+    // The shape a correlated subquery emits for `a == outer(k) && b ==
+    // outer(k)`: one outer column compared against two inner ones. Both right
+    // columns are absorbed and the output carries a single `k`. Only one peer
+    // index is recorded, since there is one left column to record it on --
+    // sound because the peer is read only for a row missing its own side,
+    // which a Left or Inner join never has on the left. A Right or Outer join
+    // with this shape would read one peer and ignore the other, and nothing
+    // builds one.
+    const auto plan =
+        plan_of(JoinKind::Left, {{"k", "ps_partkey", true}, {"k", "ps_suppkey", true}},
+                {"k", "tag"}, {"ps_partkey", "ps_suppkey", "m"});
+    REQUIRE(plan.has_value());
+    REQUIRE(plan->size() == 3);
+    CHECK((*plan)[0].name == "k");
+    CHECK((*plan)[0].side == JoinOutputSide::Left);
+    CHECK((*plan)[1].name == "tag");
+    // Neither inner key survives as its own column.
+    CHECK((*plan)[2].name == "m");
+}
+
 TEST_CASE("join output plan: semi and anti joins return the left columns only",
           "[ir][join][schema]") {
     for (const JoinKind kind : {JoinKind::Semi, JoinKind::Anti}) {

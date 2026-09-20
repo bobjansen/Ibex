@@ -1352,6 +1352,36 @@ parts[filter p_partkey == scalar(
     CHECK(semi->keys()[0].right == "p_partkey");
 }
 
+TEST_CASE("Lower does not restrict a subquery whose outer cannot be replayed") {
+    // The restriction collects the outer's keys by evaluating it a SECOND
+    // time. A plan that draws from an RNG gives a different answer each time,
+    // so the keys would not be the ones the join above is built from and rows
+    // would be dropped. Transpiled, this query answered 0 of 3 rows before the
+    // guard, because `rand_uniform` was emitted twice and drawn twice.
+    auto result = lower_source(R"(
+let wide = Table { a = [1, 2, 3], v = [1, 1, 1] };
+let o = Table { j = [1, 2, 3] }[update { k = Int64(floor(rand_uniform(1.0, 3.99))) }];
+o[filter 0 < scalar(wide[filter a == outer(k), select { m = min(v) }])];
+)");
+    REQUIRE(result.has_value());
+
+    const ir::JoinNode* semi = nullptr;
+    const auto find_semi = [&](auto&& self, const ir::Node& n) -> void {
+        if (const auto* j = dynamic_cast<const ir::JoinNode*>(&n);
+            j != nullptr && j->kind() == ir::JoinKind::Semi) {
+            semi = j;
+            return;
+        }
+        for (const auto& c : n.children()) {
+            if (c != nullptr && semi == nullptr) {
+                self(self, *c);
+            }
+        }
+    };
+    find_semi(find_semi, *result.value());
+    CHECK(semi == nullptr);
+}
+
 TEST_CASE("Lower takes a subquery's keys from the outer below any earlier join") {
     // Two subqueries: the second one's key source must be the outer as it
     // entered the FIRST decorrelation join, not the join's output. Every such

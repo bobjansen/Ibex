@@ -206,10 +206,6 @@ class ChunkedFilterHeadOperator final : public Operator {
             return std::optional<Chunk>{};
         }
         while (true) {
-            if (remaining_ == 0) {
-                done_ = true;
-                return std::optional<Chunk>{};
-            }
             auto chunk_res = child_->next();
             if (!chunk_res.has_value()) {
                 return std::unexpected(std::move(chunk_res.error()));
@@ -217,6 +213,14 @@ class ChunkedFilterHeadOperator final : public Operator {
             if (!chunk_res.value().has_value()) {
                 done_ = true;
                 return schema_.release();
+            }
+            if (count_ == 0) {
+                // Pull once for the schema, without evaluating the predicate.
+                done_ = true;
+                const auto identity = chunk_identity_of(*chunk_res.value());
+                const Table input = chunk_to_table(std::move(*chunk_res.value()));
+                return std::optional<Chunk>{
+                    table_to_chunk(gather_rows(input, std::vector<std::size_t>{}), identity)};
             }
             auto out = kernel::filter_limit_chunk(std::move(*chunk_res.value()), *predicate_,
                                                   remaining_, scalars_);
@@ -232,7 +236,6 @@ class ChunkedFilterHeadOperator final : public Operator {
             if (remaining_ == 0) {
                 done_ = true;
             }
-            (void)count_;
             schema_.emitted();
             return std::optional<Chunk>{std::move(out.value())};
         }
@@ -537,11 +540,6 @@ class ChunkedHeadOperator final : public Operator {
         if (done_) {
             return std::optional<Chunk>{};
         }
-        if (count_ == 0 && group_by_->empty()) {
-            done_ = true;
-            return std::optional<Chunk>{};
-        }
-
         while (true) {
             auto chunk_res = child_->next();
             if (!chunk_res.has_value()) {
@@ -555,9 +553,10 @@ class ChunkedHeadOperator final : public Operator {
             Chunk chunk = std::move(*chunk_res.value());
             if (count_ == 0) {
                 done_ = true;
+                const auto identity = chunk_identity_of(chunk);
                 const Table t = chunk_to_table(std::move(chunk));
                 const std::vector<std::size_t> idx;
-                return std::optional<Chunk>{table_to_chunk(gather_rows(t, idx))};
+                return std::optional<Chunk>{table_to_chunk(gather_rows(t, idx), identity)};
             }
 
             if (group_by_->empty()) {

@@ -978,3 +978,23 @@ TEST_CASE("chunked aggregate: clustered integer counts merge runs across chunks"
         FAIL(mismatch->message());
     }
 }
+
+TEST_CASE("zero fused tail retains typed columns", "[schema][tail]") {
+    for (const char* grain : {"1", "16"}) {
+        ChunkGrainGuard guard(grain);
+        for (const char* predicate : {"v > 0", "v > 100"}) {
+            INFO(grain << ": " << predicate);
+            runtime::Table table;
+            table.add_column("v", Column<std::int64_t>{10, 20});
+            auto out = run(std::string("t[filter ") + predicate + ", tail 0];", {{"t", table}});
+            CHECK(out.rows() == 0);
+            REQUIRE(out.columns.size() == 1);
+            CHECK(out.columns[0].name == "v");
+            CHECK(std::holds_alternative<Column<std::int64_t>>(*out.find("v")));
+            auto total = run("t[select { n = count(), s = sum(v) }];", {{"t", out}});
+            REQUIRE(total.rows() == 1);
+            CHECK(std::get<Column<std::int64_t>>(*total.find("n"))[0] == 0);
+            CHECK(runtime::is_null(*total.find_entry("s"), 0));
+        }
+    }
+}

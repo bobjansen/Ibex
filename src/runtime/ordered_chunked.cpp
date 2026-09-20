@@ -75,7 +75,7 @@ class ChunkedOrderOperator final : public Operator {
             sorted_result_.reset();
             return std::optional<Chunk>{std::move(out)};
         }
-        return std::optional<Chunk>{};
+        return schema_.release();
     }
 
    private:
@@ -92,6 +92,14 @@ class ChunkedOrderOperator final : public Operator {
             }
             Chunk chunk = std::move(*chunk_res.value());
             if (chunk.rows() == 0) {
+                if (!schema_.holding()) {
+                    const auto identity = chunk_identity_of(chunk);
+                    auto empty = order_table(chunk_to_table(std::move(chunk)), *keys_, *exec_);
+                    if (!empty.has_value()) {
+                        return std::unexpected(std::move(empty.error()));
+                    }
+                    schema_.hold(std::move(*empty), identity);
+                }
                 continue;
             }
             if (resolved_keys_.empty()) {
@@ -134,6 +142,7 @@ class ChunkedOrderOperator final : public Operator {
                     }
                 }
             }
+            schema_.emitted();
             buffered_.push_back(std::move(chunk));
         }
 
@@ -388,6 +397,7 @@ class ChunkedOrderOperator final : public Operator {
     const std::vector<ir::OrderKey>* keys_;
     const ExecutionContext* exec_;
     Mode mode_ = Mode::Ingest;
+    SchemaCarrier schema_;
     std::vector<Chunk> buffered_;
     std::vector<ir::OrderKey> resolved_keys_;
     std::vector<ScalarValue> prev_last_;

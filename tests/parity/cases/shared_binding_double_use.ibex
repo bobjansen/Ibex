@@ -1,0 +1,19 @@
+// A `let` referenced from two table positions and expensive enough that the
+// batch executor materializes it once. The compiled path has no registry to
+// resolve such a binding against, so whole-program lowering splices the plan
+// back in at each reference -- it used to drop it, and the emitter aborted with
+// "ScanNode cannot be emitted".
+//
+// Unlike a lowering bug, this one IS visible here: a dropped plan leaves a
+// dangling scan the emitter refuses outright rather than an answer both sides
+// agree on.
+let scaffold = Table(3)[update { k = 7 }];
+(scaffold join scaffold on k)[select { n = count() }];
+
+// The same binding reached from two separate statements rather than from two
+// arms of one expression. Both sides of the join carry `v`, so one is renamed
+// away first -- the point here is the shared binding, not name collision.
+let base = Table { k = [1, 2, 3], v = [10, 20, 30] };
+let doubled = base[update { w = v * 2 }][filter w > 20][select { k = k, w = w }];
+doubled[select { n = count() }];
+(doubled join base on k)[order { k asc }];

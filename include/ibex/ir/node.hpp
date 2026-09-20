@@ -827,6 +827,12 @@ class UpdateNode final : public Node {
     [[nodiscard]] auto tuple_fields() const noexcept -> const std::vector<TupleFieldSpec>& {
         return tuple_fields_;
     }
+    /// A tuple field's `source` is a nested plan that hangs off the field
+    /// rather than off `children()`, so a pass that rewrites subplans needs to
+    /// reach it here.
+    [[nodiscard]] auto mutable_tuple_fields() noexcept -> std::vector<TupleFieldSpec>& {
+        return tuple_fields_;
+    }
     [[nodiscard]] auto group_by() const noexcept -> const std::vector<ColumnRef>& {
         return group_by_;
     }
@@ -1133,6 +1139,12 @@ class ConstructNode final : public Node {
         : Node(NodeKind::Construct, id), row_count_(std::move(row_count)) {}
 
     [[nodiscard]] auto columns() const noexcept -> const std::vector<ConstructColumn>& {
+        return columns_;
+    }
+    /// A column's `expr_node` is a nested plan that hangs off the column rather
+    /// than off `children()`, so a pass that rewrites subplans needs to reach
+    /// it here.
+    [[nodiscard]] auto mutable_columns() noexcept -> std::vector<ConstructColumn>& {
         return columns_;
     }
 

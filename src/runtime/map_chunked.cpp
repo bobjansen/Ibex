@@ -276,6 +276,13 @@ class ChunkedFilterTailOperator final : public Operator {
             if (!chunk_res.value().has_value()) {
                 break;
             }
+            if (count_ == 0) {
+                done_ = true;
+                const auto identity = chunk_identity_of(*chunk_res.value());
+                const Table input = chunk_to_table(std::move(*chunk_res.value()));
+                return std::optional<Chunk>{
+                    table_to_chunk(gather_rows(input, std::vector<std::size_t>{}), identity)};
+            }
             auto filtered =
                 kernel::filter_chunk(std::move(*chunk_res.value()), *predicate_, scalars_);
             if (!filtered.has_value()) {

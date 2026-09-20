@@ -1036,3 +1036,27 @@ TEST_CASE("empty distinct retains typed columns", "[schema][distinct]") {
         CHECK(runtime::is_null(*total.find_entry("s"), 0));
     }
 }
+
+TEST_CASE("empty swapped inner join retains typed columns", "[schema][join]") {
+    runtime::Table left;
+    left.add_column("k", Column<std::int64_t>{1, 2});
+    left.add_column("v", Column<double>{10.0, 20.0});
+    runtime::Table right;
+    right.add_column("k", Column<std::int64_t>{std::vector<std::int64_t>(70'000, 7)});
+    right.add_column("s", Column<std::string>{std::vector<std::string>(70'000, "x")});
+    for (const char* grain : {"0", "1024"}) {
+        ChunkGrainGuard guard(grain);
+        auto out = run("a join b on k;", {{"a", left}, {"b", right}});
+        CHECK(out.rows() == 0);
+        REQUIRE(out.columns.size() == 3);
+        REQUIRE(out.find("k") != nullptr);
+        REQUIRE(out.find("v") != nullptr);
+        REQUIRE(out.find("s") != nullptr);
+        CHECK(std::holds_alternative<Column<double>>(*out.find("v")));
+        CHECK(std::holds_alternative<Column<std::string>>(*out.find("s")));
+        auto total = run("t[select { n = count(), s = sum(v) }];", {{"t", out}});
+        REQUIRE(total.rows() == 1);
+        CHECK(std::get<Column<std::int64_t>>(*total.find("n"))[0] == 0);
+        CHECK(runtime::is_null(*total.find_entry("s"), 0));
+    }
+}

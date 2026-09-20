@@ -1,0 +1,15 @@
+// A correlated subquery whose OUTER draws from an RNG. The key restriction
+// that trims the subquery's groups works by evaluating the outer a second time
+// to collect its keys -- which cannot be done here, because the second draw is
+// a different one. Transpiled without that guard this answered 0 of 3 rows:
+// `rand_uniform` was emitted twice, the semi join kept the groups for the
+// second draw's keys, and the rows built from the first draw matched nothing.
+//
+// Every drawn key is in `wide`, so all three rows must survive however the
+// draw falls -- the count is stable even though the values are not.
+let wide = Table { a = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                   v = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1] };
+let o = Table { j = [1, 2, 3] }[update { k = Int64(floor(rand_uniform(1.0, 10.99))) }];
+o[filter 0 < scalar(wide[filter a == outer(k), select { m = min(v) }])][
+    select { n = count() }
+];

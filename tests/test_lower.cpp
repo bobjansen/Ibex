@@ -1307,6 +1307,86 @@ parts[filter
     REQUIRE(aliases == std::vector<std::string>{"__ibex_scalar_0", "__ibex_scalar_1"});
 }
 
+TEST_CASE("Lower restricts a subquery to the keys the outer rows use") {
+    // Without this the aggregate groups the whole inner relation while the
+    // left join reads only the groups the outer keys into. A semi join against
+    // the outer's keys drops the rest; each surviving group keeps ALL its rows,
+    // so no aggregate changes.
+    auto result = lower_source(std::string(kCorrelatedSources) +
+                               R"(
+parts[filter p_partkey == scalar(
+    supply[filter ps_partkey == outer(p_partkey), select { m = min(ps_cost) }]
+)];
+)");
+    REQUIRE(result.has_value());
+
+    const auto* join = find_join(*result.value());
+    REQUIRE(join != nullptr);
+    REQUIRE(join->kind() == ir::JoinKind::Left);
+
+    // Under the left join's aggregate sits the restriction.
+    const auto* aggregate = as_node<ir::AggregateNode>(join->children()[1].get());
+    REQUIRE(aggregate != nullptr);
+    REQUIRE(aggregate->children().size() == 1);
+    // The restriction sits under the aggregate. Its exact depth is not the
+    // point -- later passes move projections around it -- so this looks for
+    // the semi join anywhere below, and checks how it is keyed.
+    const ir::JoinNode* semi = nullptr;
+    const auto find_semi = [&](auto&& self, const ir::Node& n) -> void {
+        if (const auto* j = dynamic_cast<const ir::JoinNode*>(&n);
+            j != nullptr && j->kind() == ir::JoinKind::Semi) {
+            semi = j;
+            return;
+        }
+        for (const auto& c : n.children()) {
+            if (c != nullptr && semi == nullptr) {
+                self(self, *c);
+            }
+        }
+    };
+    find_semi(find_semi, *aggregate);
+    REQUIRE(semi != nullptr);
+    // Inner column on the left, the outer's own name on the right.
+    REQUIRE(semi->keys().size() == 1);
+    CHECK(semi->keys()[0].left == "ps_partkey");
+    CHECK(semi->keys()[0].right == "p_partkey");
+}
+
+TEST_CASE("Lower takes a subquery's keys from the outer below any earlier join") {
+    // Two subqueries: the second one's key source must be the outer as it
+    // entered the FIRST decorrelation join, not the join's output. Every such
+    // join is a LEFT join, so the captured column holds the same values either
+    // way -- but cloning the output would re-run the first subquery's
+    // aggregate to find them, and again for each subquery after it.
+    auto result = lower_source(std::string(kCorrelatedSources) +
+                               R"(
+parts[filter
+    p_partkey == scalar(supply[filter ps_partkey == outer(p_partkey), select { a = min(ps_cost) }])
+    && p_partkey != scalar(supply[filter ps_partkey == outer(p_partkey), select { b = max(ps_cost) }])
+];
+)");
+    REQUIRE(result.has_value());
+
+    // One aggregate per subquery, plus one per restriction -- and no copy of
+    // an earlier subquery's aggregate, which is what compounding would add.
+    std::vector<std::string> aliases;
+    const auto walk = [&](auto&& self, const ir::Node& node) -> void {
+        if (const auto* aggregate = dynamic_cast<const ir::AggregateNode*>(&node)) {
+            for (const auto& spec : aggregate->aggregations()) {
+                aliases.push_back(spec.alias);
+            }
+        }
+        for (const auto& child : node.children()) {
+            if (child != nullptr) {
+                self(self, *child);
+            }
+        }
+    };
+    walk(walk, *result.value());
+    std::ranges::sort(aliases);
+    REQUIRE(aliases == std::vector<std::string>{"__ibex_scalar_0", "__ibex_scalar_1"});
+}
+
 TEST_CASE("Lower decorrelates two captures that share one outer column") {
     // `a == outer(x) && b == outer(x)` was rejected as a "duplicate capture":
     // decorrelation renamed each inner key to its outer name, and two columns

@@ -2455,7 +2455,8 @@ one row, so an uncorrelated subquery can never multiply the rows it filters.
 **Evaluation.** The subquery is *decorrelated*, never run once per outer row. A
 correlated one becomes an aggregate grouped by the captured column, left-joined
 back onto the outer rows; an uncorrelated one becomes a cross join against its
-single row. That is also why a source used by both the outer query and the
+single row. The correlated form aggregates only the groups the outer rows key
+into, not every group of the inner relation. That is also why a source used by both the outer query and the
 subquery should be bound once (`let partsupp = read_parquet(...)`) and named
 twice — one binding is one read.
 

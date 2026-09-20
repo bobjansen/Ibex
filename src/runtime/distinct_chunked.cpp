@@ -69,6 +69,11 @@ class ChunkedDistinctOperator final : public Operator {
                 return std::optional<Chunk>{};
             }
 
+            // An empty input still carries typed columns and metadata. No
+            // deduplication is needed, and returning it preserves its identity.
+            if (chunk_res.value()->rows() == 0) {
+                return std::move(chunk_res.value());
+            }
             Table t = chunk_to_table(std::move(*chunk_res.value()));
             if (t.columns.empty()) {
                 // `distinct` keeps the first occurrence of each row in input order and

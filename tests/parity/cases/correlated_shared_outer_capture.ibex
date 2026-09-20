@@ -1,0 +1,31 @@
+// Two captures sharing one outer column: `ps_partkey == outer(k) &&
+// ps_suppkey == outer(k)`. This was rejected as a "duplicate capture" while
+// decorrelation renamed each inner key to its outer name -- two columns cannot
+// both be named `k`. The join now carries the pair per key, so the same outer
+// column can appear as the `left` of more than one key.
+//
+// The data discriminates: for k = 1 the first capture alone matches cost
+// {5.0, 3.0} (min 3.0), and both together match only the row with
+// ps_suppkey = 1, cost 5.0. So a plan that dropped the second capture would
+// answer 3.0 here.
+let keys = Table { k = [1, 2, 3] };
+let supply = Table {
+    ps_partkey = [1, 1, 2, 2, 3],
+    ps_suppkey = [1, 2, 2, 3, 9],
+    ps_cost    = [5.0, 3.0, 4.0, 8.0, 1.0]
+};
+
+keys[filter 5.0 == scalar(
+    supply[filter ps_partkey == outer(k) && ps_suppkey == outer(k),
+           select { m = min(ps_cost) }]
+)];
+
+// The mirror case: one inner column captured against two outer columns, which
+// matches only where the two outer values agree.
+let pairs = Table { lo = [1, 2], hi = [1, 3] };
+// For (lo=1, hi=1) the group is ps_partkey = 1, whose minimum cost is 3.0;
+// (lo=2, hi=3) can match no row at all, so its null comparison drops it.
+pairs[filter 3.0 == scalar(
+    supply[filter ps_partkey == outer(lo) && ps_partkey == outer(hi),
+           select { m = min(ps_cost) }]
+)];

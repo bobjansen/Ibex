@@ -2434,6 +2434,12 @@ must be an aggregate. A `filter` may hold *capture equalities* —
 `inner_column == outer(outer_column)`, in either order — alongside any number of
 ordinary local predicates.
 
+Captures need not name distinct columns. Two may share the outer column
+(`a == outer(x) && b == outer(x)`: inner rows where both columns equal that
+outer row's `x`) or the inner one (`a == outer(x) && a == outer(y)`: matching
+only where the two outer values agree). An exactly repeated capture is
+redundant and ignored.
+
 **Correlated or not.** A subquery that captures with `outer(...)` is evaluated
 per captured key. One that captures nothing is *uncorrelated*: a single value,
 the same for every row, evaluated once and broadcast.

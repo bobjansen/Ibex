@@ -1,0 +1,24 @@
+// `null` as a series-literal element in a `Table { }` column. The column's type
+// comes from the first non-null element; an all-null column has no type to take
+// and falls back to Int64, matching the `col = []` rule. The interpreter builds
+// the validity bitmap directly, the emitter writes it out as an add_column
+// argument — this case keeps the two in step.
+let t = Table {
+    i = [1, null, 3],
+    f = [1.5, null, 2.5],
+    s = ["a", null, "c"],
+    b = [true, null, false],
+    all_null = [null, null, null],
+    // A null in element 0 is the case that tells a well-typed placeholder
+    // apart from a default-constructed one: `lead_f` must stay Float64 and
+    // `lead_s` String, not collapse to Int64.
+    lead_f = [null, 1.5, 2.5],
+    lead_s = [null, "b", "c"]
+};
+
+t;
+t[filter { i is null }];
+t[select { flag = i is null, bumped = i + 1 }];
+t[select { total = sum(i), seen = count(f), any_all_null = count(all_null) }];
+t[select { scaled = lead_f * 2.0, tagged = lead_s }];
+t[select { lead_total = sum(lead_f), lead_seen = count(lead_s) }];

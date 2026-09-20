@@ -542,7 +542,7 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
     }
 
     auto next() -> std::expected<std::optional<ibex::runtime::Chunk>, std::string> override {
-        if (pos_ >= end_) {
+        if (pos_ >= end_ && emitted_) {
             return std::optional<ibex::runtime::Chunk>{};
         }
 
@@ -666,7 +666,7 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
 
         source_->advise_dontneed(chunk_start, pos_);
 
-        if (rows_read == 0) {
+        if (rows_read == 0 && emitted_) {
             return std::optional<ibex::runtime::Chunk>{};
         }
 
@@ -701,6 +701,8 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
             }
             chunk.add_column(col_names_[c], std::move(column));
         }
+        // The first chunk carries the declared schema even for an empty file.
+        emitted_ = true;
         total_rows_ += rows_read;
         return std::optional<ibex::runtime::Chunk>{std::move(chunk)};
     }
@@ -715,6 +717,7 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
     char delimiter_;
     std::size_t rows_per_chunk_;
     std::size_t total_rows_ = 0;
+    bool emitted_ = false;
     std::vector<std::shared_ptr<std::vector<std::string>>> shared_dicts_;
     std::vector<std::shared_ptr<ibex::Column<ibex::Categorical>::index_map>> shared_indices_;
 };
@@ -981,6 +984,13 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
             for (std::size_t i = 0; i < first_row.size(); ++i) {
                 col_names.push_back("col" + std::to_string(i + 1));
             }
+        }
+    } else if (!options.has_header) {
+        // With no row to discover columns from, the supplied schema is the
+        // layout. Feed it through the ordinary typed column builders below.
+        for (std::size_t i = 0; i < options.schema.entries.size(); ++i) {
+            col_names.push_back(
+                options.schema.entries[i].name.value_or("col" + std::to_string(i + 1)));
         }
     }
 

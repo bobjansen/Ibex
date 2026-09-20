@@ -3,6 +3,7 @@
 
 #include <ibex/ir/count_distinct_reduction.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/ir/replayable.hpp>
 #include <ibex/ir/schema.hpp>
 
 #include <algorithm>
@@ -15,24 +16,6 @@
 
 namespace ibex::ir {
 namespace {
-
-void collect_max_id(const Node& node, std::uint64_t& max_id) {
-    max_id = std::max(max_id, node.id().value);
-    for (const auto& child : node.children()) {
-        if (child) {
-            collect_max_id(*child, max_id);
-        }
-    }
-    if (node.kind() == NodeKind::Program) {
-        const auto& prog = node_cast<ProgramNode>(node);
-        for (const auto& pre : prog.preamble()) {
-            if (pre) {
-                collect_max_id(*pre, max_id);
-            }
-        }
-        collect_max_id(prog.main_node(), max_id);
-    }
-}
 
 /// `node` is an Aggregate; return its fused replacement, or `node` unchanged.
 auto try_fuse(NodePtr node, std::uint64_t& next_id, const SourceSchemas& sources) -> NodePtr {
@@ -126,9 +109,7 @@ auto fuse_distinct_count_to_count_distinct(NodePtr root, const SourceSchemas& so
     if (!root) {
         return root;
     }
-    std::uint64_t next_id = 0;
-    collect_max_id(*root, next_id);
-    ++next_id;
+    std::uint64_t next_id = max_node_id(*root) + 1;
     return walk(std::move(root), next_id, sources);
 }
 

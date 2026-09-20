@@ -18,24 +18,6 @@
 namespace ibex::ir {
 namespace {
 
-void collect_max_id(const Node& node, std::uint64_t& max) {
-    max = std::max(max, node.id().value);
-    for (const auto& child : node.children()) {
-        if (child != nullptr) {
-            collect_max_id(*child, max);
-        }
-    }
-    if (node.kind() == NodeKind::Program) {
-        const auto& program = node_cast<ProgramNode>(node);
-        for (const auto& pre : program.preamble()) {
-            if (pre != nullptr) {
-                collect_max_id(*pre, max);
-            }
-        }
-        collect_max_id(program.main_node(), max);
-    }
-}
-
 /// The join keys that name one of the aggregate's group keys on the right.
 ///
 /// Only those can be restricted: the semi join runs against the aggregate's
@@ -245,9 +227,7 @@ auto restrict_aggregates_to_probed_keys(NodePtr root, const SourceStats& stats) 
     if (root == nullptr) {
         return root;
     }
-    std::uint64_t next = 0;
-    collect_max_id(*root, next);
-    ++next;
+    std::uint64_t next = max_node_id(*root) + 1;
     rewrite(*root, stats, next);
     return root;
 }

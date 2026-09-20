@@ -66,6 +66,7 @@
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/optimizer.hpp>
 #include <ibex/ir/pending_order.hpp>
+#include <ibex/ir/replayable.hpp>
 #include <ibex/ir/schema.hpp>
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/effects.hpp>
@@ -1428,6 +1429,158 @@ auto build_optimization_context(const EffectAnalysis& analysis) -> ir::Optimizat
     return context;
 }
 
+/// How many times `name` is scanned anywhere in `node`'s subtree.
+auto count_scans_of(const ir::Node& node, const std::string& name) -> std::size_t {
+    std::size_t count = 0;
+    if (node.kind() == ir::NodeKind::Scan &&
+        ir::node_cast<ir::ScanNode>(node).source_name() == name) {
+        ++count;
+    }
+    for (const auto& child : node.children()) {
+        if (child != nullptr) {
+            count += count_scans_of(*child, name);
+        }
+    }
+    // Two node kinds own a nested plan that hangs off a field rather than off
+    // children(): a Construct column (`Table { c = binding[...] }`) and an
+    // Update tuple field. `splice_shared_plan` walks exactly the same set, so
+    // the count and the replacement cannot disagree.
+    if (node.kind() == ir::NodeKind::Construct) {
+        for (const auto& column : ir::node_cast<ir::ConstructNode>(node).columns()) {
+            if (column.expr_node != nullptr) {
+                count += count_scans_of(*column.expr_node, name);
+            }
+        }
+    }
+    if (node.kind() == ir::NodeKind::Update) {
+        for (const auto& field : ir::node_cast<ir::UpdateNode>(node).tuple_fields()) {
+            if (field.source != nullptr) {
+                count += count_scans_of(*field.source, name);
+            }
+        }
+    }
+    return count;
+}
+
+/// Replace every `Scan(name)` in `node` with `plan`.
+///
+/// `remaining` counts the scans still to be replaced across the whole script.
+/// The last one takes `plan` itself; each earlier one gets a clone, and a clone
+/// is a second evaluation, so it goes through `clone_replayable_subplan`. A
+/// refused clone sets `failed` and stops the walk.
+auto splice_shared_plan(ir::NodePtr node, const std::string& name, ir::NodePtr& plan,
+                        std::size_t& remaining, std::uint64_t& next, bool& failed) -> ir::NodePtr {
+    if (node == nullptr || failed) {
+        return node;
+    }
+    if (node->kind() == ir::NodeKind::Scan &&
+        ir::node_cast<ir::ScanNode>(*node).source_name() == name) {
+        --remaining;
+        if (remaining == 0) {
+            return std::move(plan);
+        }
+        auto clone = ir::clone_replayable_subplan(*plan, next);
+        if (clone == nullptr) {
+            failed = true;
+            return node;
+        }
+        return clone;
+    }
+    for (auto& child : node->mutable_children()) {
+        child = splice_shared_plan(std::move(child), name, plan, remaining, next, failed);
+    }
+    if (node->kind() == ir::NodeKind::Construct) {
+        for (auto& column : ir::node_cast<ir::ConstructNode>(*node).mutable_columns()) {
+            if (column.expr_node != nullptr) {
+                column.expr_node = splice_shared_plan(std::move(column.expr_node), name, plan,
+                                                      remaining, next, failed);
+            }
+        }
+    }
+    if (node->kind() == ir::NodeKind::Update) {
+        for (auto& field : ir::node_cast<ir::UpdateNode>(*node).mutable_tuple_fields()) {
+            if (field.source != nullptr) {
+                field.source = splice_shared_plan(std::move(field.source), name, plan, remaining,
+                                                  next, failed);
+            }
+        }
+    }
+    return node;
+}
+
+/// Splice each shared binding's plan back in where its references scan it.
+///
+/// `lower_script` shares a `let` that the batch executor materializes once,
+/// leaving every reference to it as a `Scan(name)` the executor resolves
+/// through its registry. `lower()` has to hand back ONE self-contained tree and
+/// its callers -- the emitter, the parity runner -- have no such registry: the
+/// emitter aborts with "ScanNode cannot be emitted". The plans used to be
+/// dropped on the floor here, so `let t = Table(3)[update { k = 7 }];
+/// (t join t on k)` aborted the compiler.
+///
+/// A shared binding has two or more references by construction, so all but one
+/// are clones, and a clone is a second evaluation. A binding drawing from
+/// `rand_uniform()` would then answer differently per reference, while the
+/// batch executor -- materializing once -- answers the same everywhere. That is
+/// an error here rather than a quiet divergence between the two engines.
+///
+/// Bindings are spliced in declaration order, into the preamble, the result and
+/// each other's plans, since a later binding may reference an earlier one.
+auto inline_shared_bindings(ScriptPlan& plan) -> std::optional<LowerError> {
+    std::uint64_t next = 0;
+    const auto note_ids = [&next](const ir::NodePtr& node) {
+        if (node != nullptr) {
+            next = std::max(next, ir::max_node_id(*node));
+        }
+    };
+    for (const auto& node : plan.preamble) {
+        note_ids(node);
+    }
+    for (const auto& shared : plan.shared_bindings) {
+        note_ids(shared.plan);
+    }
+    note_ids(plan.result);
+    ++next;
+
+    for (std::size_t i = 0; i < plan.shared_bindings.size(); ++i) {
+        auto& shared = plan.shared_bindings[i];
+        const auto count_in = [&shared](const ir::NodePtr& node) -> std::size_t {
+            return node == nullptr ? 0 : count_scans_of(*node, shared.name);
+        };
+        std::size_t remaining = count_in(plan.result);
+        for (const auto& node : plan.preamble) {
+            remaining += count_in(node);
+        }
+        for (std::size_t j = i + 1; j < plan.shared_bindings.size(); ++j) {
+            remaining += count_in(plan.shared_bindings[j].plan);
+        }
+        if (remaining == 0) {
+            // Every reference was rewritten away; the binding is dead.
+            continue;
+        }
+        bool failed = false;
+        for (auto& node : plan.preamble) {
+            node = splice_shared_plan(std::move(node), shared.name, shared.plan, remaining, next,
+                                      failed);
+        }
+        for (std::size_t j = i + 1; j < plan.shared_bindings.size(); ++j) {
+            plan.shared_bindings[j].plan =
+                splice_shared_plan(std::move(plan.shared_bindings[j].plan), shared.name,
+                                   shared.plan, remaining, next, failed);
+        }
+        plan.result = splice_shared_plan(std::move(plan.result), shared.name, shared.plan,
+                                         remaining, next, failed);
+        if (failed) {
+            return LowerError{.message = "let '" + shared.name +
+                                         "' is referenced more than once but cannot be "
+                                         "evaluated twice: it draws from a generator or an "
+                                         "unclassified extern"};
+        }
+    }
+    plan.shared_bindings.clear();
+    return std::nullopt;
+}
+
 class Lowerer {
    public:
     explicit Lowerer(
@@ -1691,6 +1844,9 @@ class Lowerer {
         if (!plan->sinks.empty()) {
             return std::unexpected(
                 LowerError{.message = "table-consuming extern calls require lower_script()"});
+        }
+        if (auto err = inline_shared_bindings(*plan); err.has_value()) {
+            return std::unexpected(*err);
         }
         if (!plan->preamble.empty()) {
             return builder_.program(std::move(plan->preamble), std::move(plan->result));

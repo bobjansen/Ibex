@@ -40,4 +40,12 @@ namespace ibex::ir {
 /// True if `expr` may be evaluated a second time for the same reasons.
 [[nodiscard]] auto is_replayable_expr(const Expr& expr) -> bool;
 
+/// The largest node id anywhere in `node`'s subtree, including a Program's
+/// preamble and main node.
+///
+/// It lives beside the clone because every caller of one needs the other:
+/// `clone_replayable_subplan` hands out fresh ids from a counter, and the
+/// counter has to start past every id already in the plan.
+[[nodiscard]] auto max_node_id(const Node& node) -> std::uint64_t;
+
 }  // namespace ibex::ir

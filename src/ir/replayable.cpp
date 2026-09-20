@@ -122,6 +122,32 @@ auto clone_node_shallow(const Node& node, std::uint64_t& next) -> NodePtr {
             return std::make_unique<AggregateNode>(id, aggregate.group_by(),
                                                    aggregate.aggregations());
         }
+        case NodeKind::Construct: {
+            const auto& construct = node_cast<ConstructNode>(node);
+            if (const auto& rows = construct.row_count(); rows.has_value()) {
+                // `Table(n)`: no columns at all, the size lives here. Copying
+                // it from its columns is what broke inlining a `let` over one.
+                if (!is_replayable_expr(*rows)) {
+                    return nullptr;
+                }
+                return std::make_unique<ConstructNode>(id, *rows);
+            }
+            // A literal column is just data. A column built from a nested plan
+            // owns it through a move-only handle, so -- as with a tuple field
+            // -- the node cannot be copied while it has one.
+            std::vector<ConstructColumn> columns;
+            columns.reserve(construct.columns().size());
+            for (const auto& column : construct.columns()) {
+                if (column.expr_node != nullptr) {
+                    return nullptr;
+                }
+                columns.push_back(ConstructColumn{.name = column.name,
+                                                  .elements = column.elements,
+                                                  .valid = column.valid,
+                                                  .expr_node = nullptr});
+            }
+            return std::make_unique<ConstructNode>(id, std::move(columns));
+        }
         case NodeKind::Update: {
             const auto& update = node_cast<UpdateNode>(node);
             // A tuple field owns a sub-plan through a move-only handle, so the
@@ -163,6 +189,25 @@ auto clone_replayable_subplan(const Node& node, std::uint64_t& next) -> NodePtr 
         clone->add_child(std::move(child_clone));
     }
     return clone;
+}
+
+auto max_node_id(const Node& node) -> std::uint64_t {
+    std::uint64_t max = node.id().value;
+    for (const auto& child : node.children()) {
+        if (child != nullptr) {
+            max = std::max(max, max_node_id(*child));
+        }
+    }
+    if (node.kind() == NodeKind::Program) {
+        const auto& program = node_cast<ProgramNode>(node);
+        for (const auto& pre : program.preamble()) {
+            if (pre != nullptr) {
+                max = std::max(max, max_node_id(*pre));
+            }
+        }
+        max = std::max(max, max_node_id(program.main_node()));
+    }
+    return max;
 }
 
 }  // namespace ibex::ir

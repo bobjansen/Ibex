@@ -43,6 +43,8 @@
 #include <variant>
 #include <vector>
 
+#include "join_chunked_internal.hpp"
+
 using namespace ibex;
 
 namespace {
@@ -1058,5 +1060,36 @@ TEST_CASE("empty swapped inner join retains typed columns", "[schema][join]") {
         REQUIRE(total.rows() == 1);
         CHECK(std::get<Column<std::int64_t>>(*total.find("n"))[0] == 0);
         CHECK(runtime::is_null(*total.find_entry("s"), 0));
+    }
+}
+
+TEST_CASE("empty join probe retains the first chunk identity", "[schema][join][identity]") {
+    runtime::Table right;
+    right.add_column("k", Column<std::int64_t>{7});
+    std::vector<runtime::Chunk> inputs;
+    for (std::size_t i = 0; i < 2; ++i) {
+        runtime::Chunk chunk;
+        chunk.add_column("k", Column<std::int64_t>{1});
+        chunk.add_column("v", Column<double>{10.0});
+        chunk.sequence = 42 + i;
+        chunk.row_offset = 100 + i;
+        inputs.push_back(std::move(chunk));
+    }
+    const std::vector<ir::JoinKey> keys{"k"};
+    runtime::ExecutionContext exec;
+    exec.parallel_threads = 1;
+    auto op = runtime::make_chunked_inner_join_operator(
+        std::make_unique<VectorSource>(std::move(inputs)), std::move(right), &keys, exec);
+    auto first = op->next();
+    REQUIRE(first.has_value());
+    REQUIRE(first->has_value());
+    CHECK((**first).rows() == 0);
+    CHECK((**first).columns.size() == 2);
+    CHECK((**first).sequence == 42);
+    CHECK((**first).row_offset == 100);
+    for (int i = 0; i < 2; ++i) {
+        auto end = op->next();
+        REQUIRE(end.has_value());
+        CHECK_FALSE(end->has_value());
     }
 }

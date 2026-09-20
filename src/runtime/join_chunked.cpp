@@ -1721,12 +1721,7 @@ class JoinProbeOperator final : public Operator {
                 return std::unexpected(std::move(chunk_res.error()));
             }
             if (!chunk_res.value().has_value()) {
-                if (!emitted_nonempty_ && empty_schema_.has_value()) {
-                    auto schema = std::move(*empty_schema_);
-                    empty_schema_.reset();
-                    return std::optional<Chunk>{table_to_chunk(std::move(schema))};
-                }
-                return std::optional<Chunk>{};
+                return schema_.release();
             }
             Chunk input = std::move(*chunk_res.value());
             // A morsel's identity travels with it. `sequence` and `row_offset`
@@ -1735,8 +1730,7 @@ class JoinProbeOperator final : public Operator {
             // both change the row count, and neither changes which morsel it
             // is answering for. The ordered ring rejects a chunk that arrives
             // without them.
-            const std::uint64_t sequence = input.sequence;
-            const std::size_t row_offset = input.row_offset;
+            const auto identity = chunk_identity_of(input);
             auto out = probe_.probe_chunk_against_right(chunk_to_table(std::move(input)));
             if (!out.has_value()) {
                 return std::unexpected(std::move(out.error()));
@@ -1745,14 +1739,11 @@ class JoinProbeOperator final : public Operator {
                 // Keep the planned empty table as a schema carrier. A join
                 // with no matches still has its left and right output columns;
                 // without this, a materializing sink sees no chunks at all.
-                empty_schema_ = std::move(*out);
+                schema_.hold(std::move(*out), identity);
                 continue;
             }
-            emitted_nonempty_ = true;
-            Chunk result = table_to_chunk(std::move(*out));
-            result.sequence = sequence;
-            result.row_offset = row_offset;
-            return std::optional<Chunk>{std::move(result)};
+            schema_.emitted();
+            return std::optional<Chunk>{table_to_chunk(std::move(*out), identity)};
         }
     }
 
@@ -1760,8 +1751,7 @@ class JoinProbeOperator final : public Operator {
     OperatorPtr child_;
     JoinProbe probe_;
     bool preserve_empty_ = false;
-    std::optional<Table> empty_schema_;
-    bool emitted_nonempty_ = false;
+    SchemaCarrier schema_;
 };
 
 auto make_probe_factory(JoinProbe probe) -> JoinProbeFactory {

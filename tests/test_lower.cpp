@@ -1216,6 +1216,41 @@ auto find_join(const ir::Node& node) -> const ir::JoinNode* {
 
 }  // namespace
 
+TEST_CASE("Lower keeps a row-count frame's size when a let is inlined") {
+    // `Table(n)` holds its size in `row_count` and has no columns at all, so a
+    // clone rebuilt from its COLUMNS is an empty frame. Whole-program lowering
+    // inlines a `let` by cloning, which silently cost `let t = Table(3)` its
+    // three rows -- the transpiled program printed none.
+    //
+    // Parity cannot catch this: its reference side lowers the same way, so both
+    // engines lose the rows together and agree. It has to be checked here.
+    auto result = lower_source(R"(
+let scaffold = Table(3)[update { k = 7 }];
+scaffold;
+)");
+    REQUIRE(result.has_value());
+
+    const ir::ConstructNode* construct = nullptr;
+    const auto find_construct = [&](auto&& self, const ir::Node& node) -> void {
+        if (const auto* c = dynamic_cast<const ir::ConstructNode*>(&node)) {
+            construct = c;
+            return;
+        }
+        for (const auto& child : node.children()) {
+            if (child != nullptr && construct == nullptr) {
+                self(self, *child);
+            }
+        }
+    };
+    find_construct(find_construct, *result.value());
+    REQUIRE(construct != nullptr);
+    REQUIRE(construct->columns().empty());  // a row-count frame carries none
+    REQUIRE(construct->row_count().has_value());
+    const auto* count = std::get_if<ir::Literal>(&construct->row_count()->node);
+    REQUIRE(count != nullptr);
+    CHECK(std::get<std::int64_t>(count->value) == 3);
+}
+
 TEST_CASE("Lower decorrelates a scalar subquery into an aggregate plus a left join") {
     auto result = lower_source(std::string(kCorrelatedSources) +
                                R"(

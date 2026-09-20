@@ -5351,8 +5351,14 @@ class Lowerer {
                 break;
             }
             case ir::NodeKind::Construct: {
+                // `Table(n)` keeps its count in `row_count` with NO columns, so
+                // rebuilding one from its columns alone produces an empty frame
+                // rather than an n-row one. A `let` is inlined by cloning, so
+                // `let t = Table(3)[update { k = 7 }]` lost its three rows.
                 const auto& cn = ir::node_cast<ir::ConstructNode>(node);
-                clone = builder_.construct(clone_construct_columns(cn.columns()));
+                clone = cn.row_count().has_value()
+                            ? builder_.construct_rows(*cn.row_count())
+                            : builder_.construct(clone_construct_columns(cn.columns()));
                 break;
             }
             case ir::NodeKind::Stream: {

@@ -1238,17 +1238,16 @@ parts[filter p_partkey == scalar(
     const auto* join = find_join(*result.value());
     REQUIRE(join != nullptr);
     REQUIRE(join->kind() == ir::JoinKind::Left);
-    REQUIRE(join->keys() == std::vector<ir::JoinKey>{{"p_partkey", "p_partkey"}});
+    // Each side keeps its own spelling of the key; the pair folds into one
+    // output column. Renaming the inner key to the outer name instead would
+    // make two captures sharing an outer column inexpressible.
+    REQUIRE(join->keys() == std::vector<ir::JoinKey>{{"p_partkey", "ps_partkey", true}});
     REQUIRE(join->predicate() == std::nullopt);  // a theta join would be a nested loop
 
-    // Right side: Rename(ps_partkey -> p_partkey) over the aggregate.
-    const auto* rename = as_node<ir::RenameNode>(join->children()[1].get());
-    REQUIRE(rename != nullptr);
-    REQUIRE(rename->renames().size() == 1);
-    REQUIRE(rename->renames()[0].old_name == "ps_partkey");
-    REQUIRE(rename->renames()[0].new_name == "p_partkey");
+    // Right side: the aggregate itself, with no rename in between.
+    REQUIRE(as_node<ir::RenameNode>(join->children()[1].get()) == nullptr);
 
-    const auto* aggregate = as_node<ir::AggregateNode>(rename->children()[0].get());
+    const auto* aggregate = as_node<ir::AggregateNode>(join->children()[1].get());
     REQUIRE(aggregate != nullptr);
     REQUIRE(aggregate->group_by().size() == 1);
     REQUIRE(aggregate->group_by()[0].name == "ps_partkey");
@@ -1308,6 +1307,78 @@ parts[filter
     REQUIRE(aliases == std::vector<std::string>{"__ibex_scalar_0", "__ibex_scalar_1"});
 }
 
+TEST_CASE("Lower decorrelates two captures that share one outer column") {
+    // `a == outer(x) && b == outer(x)` was rejected as a "duplicate capture":
+    // decorrelation renamed each inner key to its outer name, and two columns
+    // cannot both be named `p_partkey`. Carrying the pair on the join key
+    // instead expresses it -- one `left` per key, repeated across keys.
+    auto result = lower_source(R"(
+let parts = Table { p_partkey = [1, 2] };
+let supply = Table { ps_partkey = [1, 1], ps_suppkey = [1, 2], ps_cost = [5.0, 3.0] };
+parts[filter p_partkey == scalar(
+    supply[filter ps_partkey == outer(p_partkey) && ps_suppkey == outer(p_partkey),
+           select { m = min(ps_cost) }]
+)];
+)");
+    REQUIRE(result.has_value());
+
+    const auto* join = find_join(*result.value());
+    REQUIRE(join != nullptr);
+    REQUIRE(join->kind() == ir::JoinKind::Left);
+    // One outer column compared against two distinct inner ones.
+    REQUIRE(join->keys() == std::vector<ir::JoinKey>{{"p_partkey", "ps_partkey", true},
+                                                     {"p_partkey", "ps_suppkey", true}});
+    REQUIRE(join->predicate() == std::nullopt);
+
+    // Both captured columns are group keys: the subquery still runs once.
+    const auto* aggregate = as_node<ir::AggregateNode>(join->children()[1].get());
+    REQUIRE(aggregate != nullptr);
+    std::vector<std::string> group_keys;
+    for (const auto& key : aggregate->group_by()) {
+        group_keys.push_back(key.name);
+    }
+    REQUIRE(group_keys == std::vector<std::string>{"ps_partkey", "ps_suppkey"});
+}
+
+TEST_CASE("Lower groups one inner column captured against two outer columns once") {
+    // The mirror case: `a == outer(x) && a == outer(y)` is one group key
+    // compared against two outer columns, and matches only where the two outer
+    // values agree. Grouping by `a` twice would be a degenerate aggregate.
+    auto result = lower_source(R"(
+let parts = Table { p_partkey = [1, 2], p_altkey = [1, 3] };
+let supply = Table { ps_partkey = [1, 1], ps_cost = [5.0, 3.0] };
+parts[filter p_partkey == scalar(
+    supply[filter ps_partkey == outer(p_partkey) && ps_partkey == outer(p_altkey),
+           select { m = min(ps_cost) }]
+)];
+)");
+    REQUIRE(result.has_value());
+
+    const auto* join = find_join(*result.value());
+    REQUIRE(join != nullptr);
+    REQUIRE(join->keys() == std::vector<ir::JoinKey>{{"p_partkey", "ps_partkey", true},
+                                                     {"p_altkey", "ps_partkey", true}});
+
+    const auto* aggregate = as_node<ir::AggregateNode>(join->children()[1].get());
+    REQUIRE(aggregate != nullptr);
+    REQUIRE(aggregate->group_by().size() == 1);
+    REQUIRE(aggregate->group_by()[0].name == "ps_partkey");
+}
+
+TEST_CASE("Lower treats an exactly repeated capture as redundant, not an error") {
+    auto result = lower_source(std::string(kCorrelatedSources) +
+                               R"(
+parts[filter p_partkey == scalar(
+    supply[filter ps_partkey == outer(p_partkey) && ps_partkey == outer(p_partkey),
+           select { m = min(ps_cost) }]
+)];
+)");
+    REQUIRE(result.has_value());
+    const auto* join = find_join(*result.value());
+    REQUIRE(join != nullptr);
+    REQUIRE(join->keys() == std::vector<ir::JoinKey>{{"p_partkey", "ps_partkey", true}});
+}
+
 TEST_CASE("Lower avoids a generated name the enclosing query already uses") {
     auto result = lower_source(R"(
 let parts = Table { p_partkey = [1, 2], __ibex_scalar_0 = [7, 8] };
@@ -1330,9 +1401,7 @@ parts[filter p_partkey == scalar(
 
     const auto* join = find_join(*result.value());
     REQUIRE(join != nullptr);
-    const auto* rename = as_node<ir::RenameNode>(join->children()[1].get());
-    REQUIRE(rename != nullptr);
-    const auto* aggregate = as_node<ir::AggregateNode>(rename->children()[0].get());
+    const auto* aggregate = as_node<ir::AggregateNode>(join->children()[1].get());
     REQUIRE(aggregate != nullptr);
     REQUIRE(aggregate->aggregations()[0].alias == "__ibex_scalar_1");
 }

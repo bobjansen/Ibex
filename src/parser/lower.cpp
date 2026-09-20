@@ -3304,7 +3304,12 @@ class Lowerer {
     /// (which are the left-join keys).
     struct ScalarSubqueryPlan {
         ir::NodePtr plan;
-        std::vector<std::string> keys;
+        /// Outer-to-inner key pairs for the caller's left join. Carrying both
+        /// names -- rather than renaming the inner key to the outer one -- is
+        /// what lets two captures share one outer column (`a == outer(x) && b
+        /// == outer(x)`): one name cannot be two columns, but one join key's
+        /// `left` can be repeated across two keys.
+        std::vector<ir::JoinKey> keys;
         /// The selected column is a count, whose value over no rows is 0.
         bool counts = false;
     };
@@ -3320,10 +3325,14 @@ class Lowerer {
     ///     ...])
     ///
     ///     Filter(ps_supplycost == __ibex_scalar_0)
-    ///       Join(Left, on p_partkey)
+    ///       Join(Left, on p_partkey = ps_partkey)
     ///         Filter(local)(outer)
-    ///         Rename(ps_partkey -> p_partkey)
-    ///           Aggregate(by ps_partkey: min(ps_supplycost) as __ibex_scalar_0)(inner)
+    ///         Aggregate(by ps_partkey: min(ps_supplycost) as __ibex_scalar_0)(inner)
+    ///
+    /// The join reads each side's key under its own name and folds the pair
+    /// into one output column. An earlier shape renamed the inner key to the
+    /// outer name and joined on the one name, which could not express two
+    /// captures sharing an outer column (`a == outer(x) && b == outer(x)`).
     ///
     /// The left join is what gives the subquery SQL's scalar semantics: an
     /// outer row whose key matches no inner group gets a null, and the
@@ -3449,13 +3458,8 @@ class Lowerer {
         // aggregate with no `by` yields that row even over an empty input (a
         // count of 0, a null otherwise), so the cross join never drops rows.
         const bool correlated = !subplan->keys.empty();
-        std::vector<ir::JoinKey> join_keys;
-        join_keys.reserve(subplan->keys.size());
-        for (const auto& key : subplan->keys) {
-            join_keys.emplace_back(key);
-        }
         auto join = builder_.join(correlated ? ir::JoinKind::Left : ir::JoinKind::Cross,
-                                  std::move(join_keys));
+                                  std::move(subplan->keys));
         join->add_child(std::move(input));
         join->add_child(std::move(subplan->plan));
         input = std::move(join);
@@ -3576,12 +3580,16 @@ class Lowerer {
             if (!capture.has_value()) {
                 return std::unexpected(capture.error());
             }
-            const bool duplicate = std::ranges::any_of(captures, [&](const CapturedKey& seen) {
-                return seen.inner == capture->inner || seen.outer == capture->outer;
+            // Only an exact repeat is dropped, as the redundancy it is. Two
+            // captures that share just one side are meaningful and supported:
+            // `a == outer(x) && b == outer(x)` asks for inner rows where both
+            // columns equal that outer row's `x`, and the join carries one
+            // `left` per key rather than one shared name.
+            const bool repeat = std::ranges::any_of(captures, [&](const CapturedKey& seen) {
+                return seen.inner == capture->inner && seen.outer == capture->outer;
             });
-            if (duplicate) {
-                return std::unexpected(LowerError{.message = "scalar(): duplicate outer(" +
-                                                             capture->outer + ") capture"});
+            if (repeat) {
+                continue;
             }
             captures.push_back(std::move(capture.value()));
         }
@@ -3614,7 +3622,13 @@ class Lowerer {
             by.is_braced = true;
             by.keys.reserve(captures.size());
             for (const auto& capture : captures) {
-                by.keys.push_back(Field{.name = capture.inner, .expr = nullptr});
+                // `a == outer(x) && a == outer(y)` captures one inner column
+                // twice; it is one group key, compared against two outer ones.
+                const bool grouped_already = std::ranges::any_of(
+                    by.keys, [&](const Field& key) { return key.name == capture.inner; });
+                if (!grouped_already) {
+                    by.keys.push_back(Field{.name = capture.inner, .expr = nullptr});
+                }
             }
             grouped.clauses.emplace_back(std::move(by));
         }
@@ -3630,21 +3644,13 @@ class Lowerer {
         }
         auto plan = std::move(lowered.value());
 
-        // The aggregate keys carry the inner names; the join needs the outer ones.
-        std::vector<ir::RenameSpec> renames;
-        std::vector<std::string> keys;
+        // The aggregate keys carry the inner names and the outer query its
+        // own; the join reads each side natively and folds the pair into one
+        // output column, which is what the rename here used to achieve.
+        std::vector<ir::JoinKey> keys;
         keys.reserve(captures.size());
         for (const auto& capture : captures) {
-            if (capture.inner != capture.outer) {
-                renames.push_back(
-                    ir::RenameSpec{.new_name = capture.outer, .old_name = capture.inner});
-            }
-            keys.push_back(capture.outer);
-        }
-        if (!renames.empty()) {
-            auto rename = builder_.rename(std::move(renames));
-            rename->add_child(std::move(plan));
-            plan = std::move(rename);
+            keys.emplace_back(capture.outer, capture.inner, /*fold=*/true);
         }
         return ScalarSubqueryPlan{
             .plan = std::move(plan), .keys = std::move(keys), .counts = counts};

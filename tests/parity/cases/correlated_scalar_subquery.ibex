@@ -1,7 +1,8 @@
-// A correlated scalar subquery decorrelates into aggregate + rename + left
-// join, so the interpreter and the emitted C++ must agree on it. Part 2's
-// minimum is tied (both suppliers survive) and part 4's only supplier is US,
-// so its EU subquery finds no group at all and the null comparison drops it.
+// A correlated scalar subquery decorrelates into an aggregate plus a left join
+// keyed on the capture, so the interpreter and the emitted C++ must agree on
+// it. Part 2's minimum is tied (both suppliers survive) and part 4's only
+// supplier is US, so its EU subquery finds no group at all and the null
+// comparison drops it.
 let parts = Table {
     p_partkey = [1, 2, 3, 4],
     p_name    = ["nut", "bolt", "screw", "washer"]

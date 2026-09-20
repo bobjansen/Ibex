@@ -1251,6 +1251,55 @@ scaffold;
     CHECK(std::get<std::int64_t>(count->value) == 3);
 }
 
+TEST_CASE("Lower inlines a shared binding referenced from several places") {
+    // A `let` referenced twice and expensive enough to be worth materializing
+    // is SHARED: `lower_script` hands the plan back separately and leaves every
+    // reference as a `Scan(name)` for the batch executor to resolve through its
+    // registry. Whole-program `lower()` has no registry and must return one
+    // self-contained tree, so it splices the plan back in. It used to drop the
+    // plan instead, and the emitter aborted on the dangling scan with
+    // "ScanNode cannot be emitted".
+    auto result = lower_source(R"(
+let scaffold = Table(3)[update { k = 7 }];
+(scaffold join scaffold on k)[select { n = count() }];
+)");
+    REQUIRE(result.has_value());
+
+    std::size_t scans = 0;
+    std::size_t constructs = 0;
+    const auto count_kinds = [&](auto&& self, const ir::Node& node) -> void {
+        if (node.kind() == ir::NodeKind::Scan) {
+            ++scans;
+        }
+        if (node.kind() == ir::NodeKind::Construct) {
+            ++constructs;
+        }
+        for (const auto& child : node.children()) {
+            if (child != nullptr) {
+                self(self, *child);
+            }
+        }
+    };
+    count_kinds(count_kinds, *result.value());
+    // Nothing left for a registry to resolve, and both sides of the join have
+    // their own copy of the frame.
+    CHECK(scans == 0);
+    CHECK(constructs == 2);
+}
+
+TEST_CASE("Lower refuses to inline a shared binding it cannot evaluate twice") {
+    // Splicing gives every reference but one a clone, and a clone is a second
+    // evaluation. The batch executor materializes a shared binding ONCE, so a
+    // binding that draws fresh values per evaluation would answer differently
+    // under the two engines. That is an error, not a silent divergence.
+    auto result = lower_source(R"(
+let noisy = Table(3)[update { k = rand_uniform() }];
+(noisy join noisy on k)[select { n = count() }];
+)");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().message.find("noisy") != std::string::npos);
+}
+
 TEST_CASE("Lower decorrelates a scalar subquery into an aggregate plus a left join") {
     auto result = lower_source(std::string(kCorrelatedSources) +
                                R"(

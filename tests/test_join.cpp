@@ -2431,3 +2431,72 @@ TEST_CASE("join: take takes only first, last or any", "[join][take]") {
     auto err = interpret_error_at_parse("lhs join rhs on k take some;");
     CHECK(err.find("'first', 'last' or 'any'") != std::string::npos);
 }
+
+TEST_CASE("join: a semi join that keeps no row still reports its columns", "[join][semi][schema]") {
+    // A consumer builds its result from the chunks an operator hands it, so an
+    // operator that filters every row away and then yields no chunk at all
+    // reports a table with no COLUMNS rather than no ROWS. Downstream that is a
+    // missing schema, not an empty answer: `sum(v)` failed with "column 'v' not
+    // found in input" for a column the input plainly has. A plain filter that
+    // keeps nothing has always reported its columns; so must these.
+    runtime::TableRegistry tables;
+
+    SECTION("no key matches") {
+        auto out = interpret_expr(R"(
+let a = Table { k = [1, 2], v = [10, 20] };
+let b = Table { k = [7, 8] };
+(a semi join b on k)[select { n = count(), s = sum(v) }];
+)",
+                                  tables);
+        REQUIRE(out.rows() == 1);
+        CHECK(col_i64(out, "n") == std::vector<std::int64_t>{0});
+        CHECK(runtime::is_null(out.columns[out.index.at("s")], 0));
+    }
+
+    SECTION("the left side is already empty") {
+        auto out = interpret_expr(R"(
+let a = Table { k = [1, 2], v = [10, 20] };
+let b = Table { k = [1, 2] };
+(a[filter v > 999] semi join b on k)[select { n = count(), s = sum(v) }];
+)",
+                                  tables);
+        REQUIRE(out.rows() == 1);
+        CHECK(col_i64(out, "n") == std::vector<std::int64_t>{0});
+    }
+
+    SECTION("an anti join that removes everything") {
+        auto out = interpret_expr(R"(
+let a = Table { k = [1, 2], v = [10, 20] };
+let b = Table { k = [1, 2] };
+(a anti join b on k)[select { n = count(), s = sum(v) }];
+)",
+                                  tables);
+        REQUIRE(out.rows() == 1);
+        CHECK(col_i64(out, "n") == std::vector<std::int64_t>{0});
+    }
+
+    SECTION("the swapped path, whose right side is over the buffering threshold") {
+        // Above 65536 right rows the operator buffers the left and filters it
+        // from the other side -- a second place the last chunk can vanish.
+        auto out = interpret_expr(R"(
+let big = Table(70000)[update { k = 1 }];
+let small = Table { k = [7, 8], v = [10, 20] };
+(small semi join big on k)[select { n = count(), s = sum(v) }];
+)",
+                                  tables);
+        REQUIRE(out.rows() == 1);
+        CHECK(col_i64(out, "n") == std::vector<std::int64_t>{0});
+    }
+
+    SECTION("a surviving row is still passed through") {
+        auto out = interpret_expr(R"(
+let a = Table { k = [1, 2], v = [10, 20] };
+let b = Table { k = [2] };
+(a semi join b on k)[select { n = count(), s = sum(v) }];
+)",
+                                  tables);
+        REQUIRE(out.rows() == 1);
+        CHECK(col_i64(out, "n") == std::vector<std::int64_t>{1});
+        CHECK(col_i64(out, "s") == std::vector<std::int64_t>{20});
+    }
+}

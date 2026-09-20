@@ -16099,3 +16099,29 @@ TEST_CASE("inner join beneath a declined aggregate runs the collapsed whole-tabl
     REQUIRE(empty->find("m") != nullptr);
     REQUIRE(runtime::is_null(*empty->find_entry("m"), 0));
 }
+
+TEST_CASE("zero head retains typed columns", "[schema][head]") {
+    runtime::Table table;
+    table.add_column("k", Column<std::int64_t>{1, 2});
+    table.add_column("v", Column<double>{10.0, 20.0});
+    const runtime::TableRegistry registry{{"t", table}};
+    for (const char* source :
+         {"t[head 0];", "t[filter v > 0.0, head 0];", "t[filter v > 100.0, head 0];"}) {
+        INFO(source);
+        auto tree = require_ir(source);
+        auto result = runtime::interpret(*tree, registry);
+        REQUIRE(result.has_value());
+        CHECK(result->rows() == 0);
+        REQUIRE(result->columns.size() == 2);
+        CHECK(result->columns[0].name == "k");
+        CHECK(result->columns[1].name == "v");
+        CHECK(std::holds_alternative<Column<std::int64_t>>(*result->find("k")));
+        CHECK(std::holds_alternative<Column<double>>(*result->find("v")));
+        auto aggregate = require_ir("empty[select { n = count(), s = sum(v) }];");
+        auto out = runtime::interpret(*aggregate, runtime::TableRegistry{{"empty", *result}});
+        REQUIRE(out.has_value());
+        REQUIRE(out->rows() == 1);
+        CHECK(std::get<Column<std::int64_t>>(*out->find("n"))[0] == 0);
+        CHECK(runtime::is_null(*out->find_entry("s"), 0));
+    }
+}

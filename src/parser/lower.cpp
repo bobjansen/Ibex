@@ -66,6 +66,7 @@
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/optimizer.hpp>
 #include <ibex/ir/pending_order.hpp>
+#include <ibex/ir/replayable.hpp>
 #include <ibex/ir/schema.hpp>
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/effects.hpp>
@@ -3677,7 +3678,13 @@ class Lowerer {
         // subtree is evaluated a second time to supply the keys, which is why
         // this is worth it only when the outer is the selective side -- the
         // shape a correlated subquery is normally written in.
-        if (!captures.empty()) {
+        // Only when the keys can be collected without changing the answer.
+        // The restriction evaluates the outer a second time, so a plan that
+        // draws from an RNG or calls out to a plugin would be asked for its
+        // keys and give a DIFFERENT set than the join above is built from --
+        // dropping groups the real outer rows need. It measured as
+        // `Table(n)[update { k = rand_uniform(..) }]` losing every row.
+        if (!captures.empty() && ir::is_replayable_subplan(key_source)) {
             if (auto* agg = find_aggregate(plan.get());
                 agg != nullptr && agg->children().size() == 1) {
                 std::vector<ir::JoinKey> semi_keys;

@@ -24,6 +24,7 @@ add_library(ibex_ir STATIC
     distinct_key_reduction.cpp
     group_key_reduction.cpp
     scan_predicates.cpp
+    replayable.cpp
     schema.cpp
 )
 add_library(Ibex::ir ALIAS ibex_ir)

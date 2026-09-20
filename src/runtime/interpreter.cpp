@@ -1399,7 +1399,11 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                         }
                     },
                     col.elements[0].value);
-                result.add_column(col.name, std::move(cv));
+                if (col.valid.empty()) {
+                    result.add_column(col.name, std::move(cv));
+                } else {
+                    result.add_column(col.name, std::move(cv), ValidityBitmap{col.valid});
+                }
             }
             // Validate that all columns have the same length.
             if (!result.columns.empty()) {

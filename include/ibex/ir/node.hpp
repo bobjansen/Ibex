@@ -1106,7 +1106,13 @@ class DcastNode final : public Node {
 ///     extracted from that Table (single-column result, or column named `name`).
 struct ConstructColumn {
     std::string name;
-    std::vector<Literal> elements;    ///< non-empty iff expr_node is null
+    std::vector<Literal> elements;  ///< non-empty iff expr_node is null
+    /// Validity of `elements`, parallel to it. Empty means every element is
+    /// valid — the common case. A `null` element still carries a well-typed
+    /// placeholder in `elements` (the column's type comes from the first
+    /// non-null element), so consumers may read `elements` uniformly and
+    /// consult `valid` only to build the column's validity bitmap.
+    std::vector<bool> valid;
     std::unique_ptr<Node> expr_node;  ///< non-null iff elements is empty
 };
 

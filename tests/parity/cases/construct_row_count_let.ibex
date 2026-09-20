@@ -1,0 +1,24 @@
+// `Table(n)` bound to a `let`, through the shapes the row count has to survive.
+//
+// This does NOT guard the bug it was written for. Whole-program lowering
+// inlines a binding by cloning it, and the clone rebuilt a Construct from its
+// COLUMNS -- which a row-count frame has none of, keeping its size in
+// `row_count` instead -- so the clone was an empty frame. Parity cannot see
+// that: the reference side here runs `parser::lower` too, so both engines lost
+// the rows together and agreed on zero. `Lower keeps a row-count frame's size
+// when a let is inlined` in test_lower.cpp is what catches it.
+//
+// What this does cover is the emitter and the interpreter agreeing on these
+// shapes once lowering is right.
+let scaffold = Table(3)[update { k = 7 }];
+scaffold;
+scaffold[select { n = count(), total = sum(k) }];
+
+// The same through a second update, where the row count has to survive the
+// first one to reach the second.
+let widened = Table(4)[update { a = 1 }][update { b = a + 1 }];
+widened[select { rows = count(), sum_b = sum(b) }];
+
+// A bare row-count frame keeps its rows with no columns at all.
+let empty_frame = Table(2);
+empty_frame;

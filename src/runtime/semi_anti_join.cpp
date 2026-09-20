@@ -76,6 +76,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         // time went 113ms -> 211ms, which was that copy and nothing else.
         if (swapped_) {
             while (swapped_next_ < left_buffered_.size()) {
+                note_schema(left_buffered_[swapped_next_]);
                 auto filtered = filter_chunk(std::move(left_buffered_[swapped_next_++]));
                 if (!filtered.has_value()) {
                     if (probe_error_.has_value()) {
@@ -83,10 +84,11 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                     }
                     continue;
                 }
+                emitted_ = true;
                 return std::optional<Chunk>{table_to_chunk(std::move(*filtered))};
             }
             left_buffered_.clear();
-            return std::optional<Chunk>{};
+            return end_of_stream();
         }
 
         while (true) {
@@ -95,10 +97,11 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 return std::unexpected(std::move(chunk_res.error()));
             }
             if (!chunk_res.value().has_value()) {
-                return std::optional<Chunk>{};
+                return end_of_stream();
             }
 
             Table t = chunk_to_table(std::move(*chunk_res.value()));
+            note_schema(t);
             auto filtered = filter_chunk(std::move(t));
             if (!filtered.has_value()) {
                 // `nullopt` alone means "no rows survive this chunk"; an error
@@ -108,11 +111,48 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 }
                 continue;
             }
+            emitted_ = true;
             return std::optional<Chunk>{table_to_chunk(std::move(*filtered))};
         }
     }
 
    private:
+    /// Remember the left's column layout, once, so the operator can still say
+    /// what its output looks like when no row survives.
+    void note_schema(const Table& left_chunk) {
+        if (empty_template_.has_value() || left_chunk.columns.empty()) {
+            return;
+        }
+        Table empty;
+        empty.columns.reserve(left_chunk.columns.size());
+        for (const auto& entry : left_chunk.columns) {
+            empty.add_column(entry.name, make_empty_like(*entry.column));
+        }
+        // Every order-sensitive claim is vacuously true of a row-less table,
+        // so the left's properties carry over as they are.
+        empty.set_properties(left_chunk.properties());
+        empty_template_ = std::move(empty);
+    }
+
+    /// End the stream, but never by emitting nothing at all: a consumer builds
+    /// its result from the chunks it receives, so an operator that filters
+    /// every row away and then yields no chunk reports a table with no COLUMNS
+    /// rather than no ROWS. Downstream that is not an empty answer, it is a
+    /// missing schema -- `aggregate: column 'v' not found in input` for a
+    /// column the input plainly has. One row-less chunk carrying the left's
+    /// layout is the difference, and it is emitted only when nothing else was.
+    ///
+    /// A left that yields no chunk at all leaves nothing to take a layout from,
+    /// so that case is unchanged: the schema has to come from somewhere, and
+    /// the operator's own inputs are the only place it could.
+    auto end_of_stream() -> std::expected<std::optional<Chunk>, std::string> {
+        if (emitted_ || !empty_template_.has_value()) {
+            return std::optional<Chunk>{};
+        }
+        emitted_ = true;
+        return std::optional<Chunk>{table_to_chunk(std::move(*empty_template_))};
+    }
+
     // Above this many right rows, building a hash set of every right key is the
     // dominant cost of the whole operator (q04: 3.8M inserts into a robin_hood
     // set, ~40% of the query). Past it, materialize the left and swap.
@@ -936,6 +976,10 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     const std::vector<ir::JoinKey>* keys_;
     bool initialized_ = false;
     bool swapped_ = false;
+    /// Whether any chunk has been handed downstream, and the left's layout to
+    /// fall back on when none has. See `end_of_stream`.
+    bool emitted_ = false;
+    std::optional<Table> empty_template_;
     /// The left side, buffered as chunks rather than concatenated.
     std::vector<Table> left_buffered_;
     std::size_t swapped_next_ = 0;

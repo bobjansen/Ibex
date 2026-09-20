@@ -554,3 +554,34 @@ TEST_CASE("Write CSV - empty table writes only header") {
     REQUIRE(line == "a,b");
     REQUIRE_FALSE(std::getline(f, line));  // no data rows
 }
+
+TEST_CASE("empty chunked CSV retains typed columns", "[schema][csv]") {
+    const auto path = tmp("ibex_test_empty_chunked_schema.csv");
+    write_csv(path, "");
+    const auto eager = read_csv(path.string(), "", ",", false, "v:i64,s:string,d:date,c:cat");
+    REQUIRE(eager.columns.size() == 4);
+    CHECK(eager.rows() == 0);
+    CHECK(std::holds_alternative<ibex::Column<std::int64_t>>(*eager.find("v")));
+    CHECK(std::holds_alternative<ibex::Column<std::string>>(*eager.find("s")));
+    CHECK(std::holds_alternative<ibex::Column<ibex::Date>>(*eager.find("d")));
+    CHECK(std::holds_alternative<ibex::Column<ibex::Categorical>>(*eager.find("c")));
+    using Kind = ibex::csv::detail::CsvColumnKind;
+    ibex::csv::detail::ChunkedCsvSourceOperator op(
+        path.string(), {"v", "s", "d", "c"},
+        {Kind::Int, Kind::String, Kind::Date, Kind::Categorical}, ',', 64);
+    auto first = op.next();
+    REQUIRE(first.has_value());
+    REQUIRE(first->has_value());
+    CHECK((**first).rows() == 0);
+    REQUIRE((**first).columns.size() == 4);
+    CHECK((**first).columns[0].name == "v");
+    CHECK(std::holds_alternative<ibex::Column<std::int64_t>>(*(**first).columns[0].column));
+    CHECK(std::holds_alternative<ibex::Column<std::string>>(*(**first).columns[1].column));
+    CHECK(std::holds_alternative<ibex::Column<ibex::Date>>(*(**first).columns[2].column));
+    CHECK(std::holds_alternative<ibex::Column<ibex::Categorical>>(*(**first).columns[3].column));
+    for (int i = 0; i < 2; ++i) {
+        auto end = op.next();
+        REQUIRE(end.has_value());
+        CHECK_FALSE(end->has_value());
+    }
+}

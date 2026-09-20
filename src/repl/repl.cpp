@@ -16,6 +16,7 @@
 #include <ibex/ir/join_semi_reduction.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/optimizer.hpp>
+#include <ibex/ir/probed_key_restriction.hpp>
 #include <ibex/ir/required_columns.hpp>
 #include <ibex/ir/scan_predicates.hpp>
 #include <ibex/ir/schema.hpp>
@@ -5131,6 +5132,11 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
         rewritten =
             ir::reorder_inner_joins_for_order_insensitive_root(std::move(rewritten), source_stats);
     }
+    // After the reorder, so it sees which side of each join actually probes,
+    // and after hoisting, which is what turns a reader into the Scan this can
+    // recognise as replayable. It re-evaluates the probe side to collect keys,
+    // so it is costed against `source_stats` and declines without an estimate.
+    rewritten = ir::restrict_aggregates_to_probed_keys(std::move(rewritten), source_stats);
     std::set<std::string> lazy_names;
     for (const auto& [name, lazy] : lazy_sources) {
         lazy_names.insert(name);

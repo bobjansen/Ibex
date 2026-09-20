@@ -27,6 +27,7 @@ set(IBEX_TEST_SOURCES
     test_ir_join_pushdown.cpp
     test_ir_count_distinct_reduction.cpp
     test_ir_join_semi_reduction.cpp
+    test_ir_probed_key_restriction.cpp
     test_ir_mapped_join_keys.cpp
     test_ir_join_order.cpp
     test_ir_join_output.cpp

@@ -66,7 +66,6 @@
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/optimizer.hpp>
 #include <ibex/ir/pending_order.hpp>
-#include <ibex/ir/replayable.hpp>
 #include <ibex/ir/schema.hpp>
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/effects.hpp>
@@ -3328,17 +3327,15 @@ class Lowerer {
     ///     Filter(ps_supplycost == __ibex_scalar_0)
     ///       Join(Left, on p_partkey = ps_partkey)
     ///         Filter(local)(outer)
-    ///         Aggregate(by ps_partkey: min(ps_supplycost) as __ibex_scalar_0)
-    ///           Join(Semi, on ps_partkey = p_partkey)
-    ///             (inner)
-    ///             Project(p_partkey)(outer)
+    ///         Aggregate(by ps_partkey: min(ps_supplycost) as __ibex_scalar_0)(inner)
     ///
-    /// The semi join is the key restriction: the aggregate would otherwise
-    /// group the whole inner relation while the left join reads only the
-    /// groups the outer keys into. Its right side is the outer as it entered
-    /// the first decorrelation join, which is the same set of keys -- a left
-    /// join neither adds nor removes an outer row -- and costs one evaluation
-    /// however many subqueries the filter holds.
+    /// The aggregate groups the WHOLE inner relation here, though the join
+    /// reads only the groups the outer keys into.
+    /// `ir::restrict_aggregates_to_probed_keys` trims it, as a pass over the
+    /// planned tree rather than a step here: it needs the scans
+    /// `hoist_extern_sources` leaves behind to tell a file read from a plugin
+    /// call, and the source statistics to cost the second evaluation of the
+    /// outer that collecting the keys costs. Neither exists at lowering.
     ///
     /// The join reads each side's key under its own name and folds the pair
     /// into one output column. An earlier shape renamed the inner key to the
@@ -3400,18 +3397,10 @@ class Lowerer {
             input = std::move(filter);
         }
 
-        // The outer as it enters the FIRST decorrelation join, kept for the
-        // key restriction each subquery applies to its own input. Every join
-        // added below is a LEFT join, which neither adds nor removes an outer
-        // row, so the captured column holds the same values here as it does
-        // above them -- and taking the keys from here means the second
-        // subquery does not re-run the first one's aggregate to find them.
-        ir::NodePtr key_source = clone_node(*input);
-
         std::vector<ir::Expr> residual;
         residual.reserve(correlated.size());
         for (const auto* conjunct : correlated) {
-            auto rewritten = decorrelate(*conjunct, input, *key_source);
+            auto rewritten = decorrelate(*conjunct, input);
             if (!rewritten.has_value()) {
                 return std::unexpected(rewritten.error());
             }
@@ -3434,7 +3423,7 @@ class Lowerer {
 
     /// Join the subquery in `conjunct` onto `input` and return the comparison
     /// rewritten against the generated scalar column.
-    auto decorrelate(const Expr& conjunct, ir::NodePtr& input, const ir::Node& key_source)
+    auto decorrelate(const Expr& conjunct, ir::NodePtr& input)
         -> std::expected<ir::Expr, LowerError> {
         const auto* comparison = std::get_if<BinaryExpr>(&conjunct.node);
         if (comparison == nullptr || !is_compare_op(comparison->op)) {
@@ -3465,7 +3454,7 @@ class Lowerer {
         }
 
         const std::string alias = next_scalar_alias(*input);
-        auto subplan = lower_scalar_subquery(*subquery, *input, key_source, alias);
+        auto subplan = lower_scalar_subquery(*subquery, *input, alias);
         if (!subplan.has_value()) {
             return std::unexpected(subplan.error());
         }
@@ -3518,7 +3507,7 @@ class Lowerer {
     /// Without one the subquery is a single value: the aggregate is ungrouped
     /// and the returned keys are empty, for the caller's cross join.
     auto lower_scalar_subquery(const CallExpr& call, const ir::Node& outer_input,
-                               const ir::Node& key_source, const std::string& alias)
+                               const std::string& alias)
         -> std::expected<ScalarSubqueryPlan, LowerError> {
         const Expr& argument = unwrap_group(*call.args.front());
         if (contains_call(argument, "scalar")) {
@@ -3663,48 +3652,6 @@ class Lowerer {
         }
         auto plan = std::move(lowered.value());
 
-        // Restrict the subquery to the keys the outer rows actually use.
-        //
-        // Without this the aggregate groups the WHOLE inner relation, while
-        // the left join below reads only the groups the outer rows key into.
-        // On a q17-shaped query -- a selective outer filter over a large inner
-        // table -- that is most of the work: at TPC-H SF-8 the correlated form
-        // measured 1.6s against 0.12s for the same query decorrelated by hand,
-        // and the difference is groups nobody reads.
-        //
-        // A semi join keeps every inner row whose key appears in the outer, so
-        // each surviving group keeps ALL of its rows and its aggregate is
-        // unchanged; groups it drops could never have been matched. The outer
-        // subtree is evaluated a second time to supply the keys, which is why
-        // this is worth it only when the outer is the selective side -- the
-        // shape a correlated subquery is normally written in.
-        // Only when the keys can be collected without changing the answer.
-        // The restriction evaluates the outer a second time, so a plan that
-        // draws from an RNG or calls out to a plugin would be asked for its
-        // keys and give a DIFFERENT set than the join above is built from --
-        // dropping groups the real outer rows need. It measured as
-        // `Table(n)[update { k = rand_uniform(..) }]` losing every row.
-        if (!captures.empty() && ir::is_replayable_subplan(key_source)) {
-            if (auto* agg = find_aggregate(plan.get());
-                agg != nullptr && agg->children().size() == 1) {
-                std::vector<ir::JoinKey> semi_keys;
-                semi_keys.reserve(captures.size());
-                std::vector<ir::ColumnRef> key_columns;
-                key_columns.reserve(captures.size());
-                for (const auto& capture : captures) {
-                    semi_keys.emplace_back(capture.inner, capture.outer);
-                    key_columns.push_back(ir::ColumnRef{.name = capture.outer});
-                }
-                auto outer_keys = builder_.project(std::move(key_columns));
-                outer_keys->add_child(clone_node(key_source));
-
-                auto semi = builder_.join(ir::JoinKind::Semi, std::move(semi_keys));
-                semi->add_child(std::move(agg->mutable_children()[0]));
-                semi->add_child(std::move(outer_keys));
-                agg->mutable_children()[0] = std::move(semi);
-            }
-        }
-
         // The aggregate keys carry the inner names and the outer query its
         // own; the join reads each side natively and folds the pair into one
         // output column, which is what the rename here used to achieve.
@@ -3726,22 +3673,6 @@ class Lowerer {
         }
         return ScalarSubqueryPlan{
             .plan = std::move(plan), .keys = std::move(keys), .counts = counts};
-    }
-
-    /// The AggregateNode inside a freshly lowered subquery plan, or null.
-    /// The grouped block lowers to an Aggregate, sometimes under a Project, so
-    /// this walks the single-child spine rather than assuming a shape.
-    static auto find_aggregate(ir::Node* node) -> ir::AggregateNode* {
-        while (node != nullptr) {
-            if (node->kind() == ir::NodeKind::Aggregate) {
-                return &ir::node_cast<ir::AggregateNode>(*node);
-            }
-            if (node->children().size() != 1) {
-                return nullptr;
-            }
-            node = node->mutable_children()[0].get();
-        }
-        return nullptr;
     }
 
     /// Read `inner_column == outer(outer_column)` (either way round).

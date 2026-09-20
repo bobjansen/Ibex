@@ -998,3 +998,23 @@ TEST_CASE("zero fused tail retains typed columns", "[schema][tail]") {
         }
     }
 }
+
+TEST_CASE("empty order retains typed columns", "[schema][order]") {
+    runtime::Table table;
+    table.add_column("v", Column<std::int64_t>{});
+    table.add_column("s", Column<std::string>{});
+    for (const char* query : {"t[order v];", "t[order s desc];", "t[order];"}) {
+        INFO(query);
+        auto out = run(query, {{"t", table}});
+        CHECK(out.rows() == 0);
+        REQUIRE(out.columns.size() == 2);
+        CHECK(out.columns[0].name == "v");
+        CHECK(out.columns[1].name == "s");
+        CHECK(std::holds_alternative<Column<std::int64_t>>(*out.find("v")));
+        CHECK(std::holds_alternative<Column<std::string>>(*out.find("s")));
+        auto total = run("t[select { n = count(), s = sum(v) }];", {{"t", out}});
+        REQUIRE(total.rows() == 1);
+        CHECK(std::get<Column<std::int64_t>>(*total.find("n"))[0] == 0);
+        CHECK(runtime::is_null(*total.find_entry("s"), 0));
+    }
+}

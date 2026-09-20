@@ -47,64 +47,6 @@ namespace ibex::runtime {
 
 namespace {
 
-/// Morsel identity survives every one-input/one-output parallel-map operator.
-/// It is intentionally separate from Table metadata: sequence/row offset are
-/// executor transport state, never user-visible table properties.
-struct ChunkIdentity {
-    std::uint64_t sequence = 0;
-    std::size_t row_offset = 0;
-};
-
-[[nodiscard]] auto chunk_identity_of(const Chunk& chunk) -> ChunkIdentity {
-    return ChunkIdentity{.sequence = chunk.sequence, .row_offset = chunk.row_offset};
-}
-
-[[nodiscard]] auto table_to_chunk(Table table, ChunkIdentity identity) -> Chunk {
-    auto chunk = table_to_chunk(std::move(table));
-    chunk.sequence = identity.sequence;
-    chunk.row_offset = identity.row_offset;
-    return chunk;
-}
-
-/// Preserves schema for operators that skip zero-row results.
-///
-/// A stream carries its schema in its chunks, so an operator that emits no chunk
-/// emits no schema either: the result materializes as a table with no columns at
-/// all, and anything downstream that names a column — a join looking for its key,
-/// a filter for the value it compares — fails with "unknown column" on what is
-/// really just an empty input.
-///
-/// Callers offer empty results as Tables; this helper retains the first one with
-/// columns, together with its chunk identity. At end of stream, release() converts
-/// it back to a zero-row chunk only if emitted() has never been called. The Table
-/// is storage for the empty columns and their metadata; no filtering happens here.
-class SchemaCarrier {
-   public:
-    /// Offer a zero-row result as the schema of last resort.
-    void hold(Table&& empty, ChunkIdentity identity = {}) {
-        if (!held_.has_value() && !empty.columns.empty()) {
-            held_ = Held{.table = std::move(empty), .identity = identity};
-        }
-    }
-    void emitted() { emitted_ = true; }
-    /// The held chunk — once, and only if nothing else was ever emitted.
-    [[nodiscard]] auto release() -> std::optional<Chunk> {
-        if (emitted_ || !held_.has_value()) {
-            return std::nullopt;
-        }
-        emitted_ = true;
-        return table_to_chunk(std::move(held_->table), held_->identity);
-    }
-
-   private:
-    struct Held {
-        Table table;
-        ChunkIdentity identity;
-    };
-    std::optional<Held> held_;
-    bool emitted_ = false;
-};
-
 /// Per-chunk filter: pulls from the child and delegates to kernel::filter_chunk.
 /// Supported predicates run directly on the chunk. The fallback moves its columns
 /// into a Table, builds a column-name index, calls filter_table, and converts the

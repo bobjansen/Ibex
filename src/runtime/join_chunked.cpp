@@ -1897,9 +1897,6 @@ class ChunkedInnerJoinOperator final : public Operator {
                 return std::optional<Chunk>{};
             }
             swapped_emitted_ = true;
-            if (precomputed_output_.rows() == 0) {
-                return std::optional<Chunk>{};
-            }
             return std::optional<Chunk>{table_to_chunk(std::move(precomputed_output_))};
         }
 
@@ -1915,9 +1912,6 @@ class ChunkedInnerJoinOperator final : public Operator {
             auto out = probe_.emit_swapped(*left_table_);
             if (!out.has_value()) {
                 return std::unexpected(std::move(out.error()));
-            }
-            if (out->rows() == 0) {
-                return std::optional<Chunk>{};
             }
             return std::optional<Chunk>{table_to_chunk(std::move(*out))};
         }
@@ -2877,9 +2871,6 @@ class SwappedHashProbeOperator final : public Operator {
         if (!out.has_value()) {
             return std::unexpected(std::move(out.error()));
         }
-        if (out->rows() == 0) {
-            return std::optional<Chunk>{};
-        }
         return std::optional<Chunk>{table_to_chunk(std::move(*out))};
     }
 
@@ -2901,9 +2892,6 @@ class PrecomputedHashProbeOperator final : public Operator {
             return std::optional<Chunk>{};
         }
         emitted_ = true;
-        if (output_.rows() == 0) {
-            return std::optional<Chunk>{};
-        }
         return std::optional<Chunk>{table_to_chunk(std::move(output_))};
     }
 

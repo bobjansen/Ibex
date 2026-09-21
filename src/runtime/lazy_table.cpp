@@ -28,6 +28,7 @@
 
 #include "execution_profile_internal.hpp"
 #include "runtime_internal.hpp"
+#include "static_range_filter.hpp"
 
 namespace ibex::runtime {
 
@@ -422,90 +423,6 @@ auto as_like_predicate(const ir::Expr& expr, bool negated)
                      StringScanFilter{.pattern = std::move(*compiled), .negated = negated}};
 }
 
-auto inverted_compare(ir::CompareOp op) -> ir::CompareOp {
-    switch (op) {
-        case ir::CompareOp::Lt:
-            return ir::CompareOp::Gt;
-        case ir::CompareOp::Le:
-            return ir::CompareOp::Ge;
-        case ir::CompareOp::Gt:
-            return ir::CompareOp::Lt;
-        case ir::CompareOp::Ge:
-            return ir::CompareOp::Le;
-        default:
-            return op;
-    }
-}
-
-auto integer_literal(const ir::Expr& expr) -> std::optional<std::int64_t> {
-    const auto* literal = std::get_if<ir::Literal>(&expr.node);
-    if (literal == nullptr)
-        return std::nullopt;
-    if (const auto* integer = std::get_if<std::int64_t>(&literal->value))
-        return *integer;
-    if (const auto* date = std::get_if<Date>(&literal->value))
-        return date->days;
-    return std::nullopt;
-}
-
-/// A conjunction made solely of literal comparisons on one integer-like source
-/// column. The result is an inclusive interval accepted by DynamicScanFilter.
-auto static_range_filter(const std::vector<ir::Expr>& conjuncts)
-    -> std::optional<std::pair<std::string, DynamicScanFilter>> {
-    if (conjuncts.empty())
-        return std::nullopt;
-    std::optional<std::string> name;
-    DynamicScanFilter filter;
-    for (const auto& expr : conjuncts) {
-        const auto* comparison = std::get_if<ir::CompareExpr>(&expr.node);
-        if (comparison == nullptr || comparison->left == nullptr || comparison->right == nullptr ||
-            comparison->op == ir::CompareOp::Ne)
-            return std::nullopt;
-        const auto* column = ir::as_column_ref(*comparison->left);
-        auto value = integer_literal(*comparison->right);
-        auto op = comparison->op;
-        if (column == nullptr || !value.has_value()) {
-            column = ir::as_column_ref(*comparison->right);
-            value = integer_literal(*comparison->left);
-            op = inverted_compare(op);
-        }
-        if (column == nullptr || column->lexical || !value.has_value())
-            return std::nullopt;
-        if (name.has_value() && *name != column->name)
-            return std::nullopt;
-        name = column->name;
-        switch (op) {
-            case ir::CompareOp::Eq:
-                filter.min = filter.min.has_value() ? std::max(*filter.min, *value) : *value;
-                filter.max = filter.max.has_value() ? std::min(*filter.max, *value) : *value;
-                break;
-            case ir::CompareOp::Le:
-                filter.max = filter.max.has_value() ? std::min(*filter.max, *value) : *value;
-                break;
-            case ir::CompareOp::Ge:
-                filter.min = filter.min.has_value() ? std::max(*filter.min, *value) : *value;
-                break;
-            case ir::CompareOp::Lt:
-                if (*value == std::numeric_limits<std::int64_t>::min())
-                    return std::nullopt;
-                --*value;
-                filter.max = filter.max.has_value() ? std::min(*filter.max, *value) : *value;
-                break;
-            case ir::CompareOp::Gt:
-                if (*value == std::numeric_limits<std::int64_t>::max())
-                    return std::nullopt;
-                ++*value;
-                filter.min = filter.min.has_value() ? std::max(*filter.min, *value) : *value;
-                break;
-            case ir::CompareOp::Ne:
-                return std::nullopt;
-        }
-    }
-    if (!name.has_value())
-        return std::nullopt;
-    return std::pair{std::move(*name), std::move(filter)};
-}
-
 }  // namespace
 
 auto LazyTable::fusable_string_conjuncts(const std::vector<ir::Expr>& conjuncts,
@@ -662,7 +579,7 @@ auto LazyTable::project_where(const std::set<std::string>& names,
     // This is intentionally all-or-nothing: a source decline falls through to
     // the established decode-and-filter path unchanged.
     if (reader_factory_ && !conjuncts.empty()) {
-        if (auto range = static_range_filter(conjuncts);
+        if (auto range = static_range_filter(conjuncts, schema_);
             range.has_value() && !names.contains(range->first) && !cache_.contains(range->first)) {
             auto scan = scan_key_filter(range->first, range->second, nullptr, exec);
             if (!scan)
@@ -962,7 +879,7 @@ auto LazyTable::project_where_unit(const std::set<std::string>& names,
     }
 
     if (reader_factory_ && !conjuncts.empty()) {
-        if (auto range = static_range_filter(conjuncts);
+        if (auto range = static_range_filter(conjuncts, schema_);
             range.has_value() && !names.contains(range->first) && !cache_.contains(range->first)) {
             auto scan = scan_key_filter(range->first, range->second, &unit, exec);
             if (!scan)

@@ -23,6 +23,7 @@ add_library(ibex_runtime STATIC
     kernel_filter.cpp
     kernel_update.cpp
     lazy_table.cpp
+    static_range_filter.cpp
     model.cpp
     ops.cpp
     physical_plan.cpp

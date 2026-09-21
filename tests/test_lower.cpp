@@ -1634,3 +1634,85 @@ TEST_CASE("Lower rejects left(...) / right(...) outside a join predicate") {
         CHECK(result.error().message.find("only valid in a join predicate") != std::string::npos);
     }
 }
+
+TEST_CASE("Lower reuses identical scalar subqueries within a filter", "[lower][scalar_reuse]") {
+    std::string subquery;
+    SECTION("correlated") {
+        subquery =
+            "scalar(supply[filter ps_partkey == outer(p_partkey), select { m = min(ps_cost) }])";
+    }
+    SECTION("uncorrelated") {
+        subquery = "scalar(supply[select { m = min(ps_cost) }])";
+    }
+    SECTION("joined inner table") {
+        subquery =
+            "scalar((supply join Table { key = [1, 2] } on { ps_partkey = key })"
+            "[filter ps_partkey == outer(p_partkey), select { m = min(ps_cost) }])";
+    }
+    auto result = lower_source(std::string(kCorrelatedSources) + "parts[filter p_partkey < " +
+                               subquery + " && (" + subquery + ") > p_partkey];");
+    REQUIRE(result.has_value());
+    std::vector<ir::NodeKind> kinds;
+    collect_kinds(**result, kinds);
+    REQUIRE(std::ranges::count(kinds, ir::NodeKind::Aggregate) == 1);
+    REQUIRE(std::ranges::count(kinds, ir::NodeKind::Join) ==
+            (subquery.find(" join ") == std::string::npos ? 1 : 2));
+}
+
+TEST_CASE("Lower does not reuse volatile scalar subqueries", "[lower][scalar_reuse]") {
+    const std::string subquery =
+        "scalar(supply[filter rand_uniform(0.0, 1.0) > 0.5, select { m = min(ps_cost) }])";
+    auto result = lower_source(std::string(kCorrelatedSources) + "parts[filter p_partkey < " +
+                               subquery + " && p_partkey < " + subquery + "];");
+    REQUIRE(result.has_value());
+    std::vector<ir::NodeKind> kinds;
+    collect_kinds(**result, kinds);
+    REQUIRE(std::ranges::count(kinds, ir::NodeKind::Aggregate) == 2);
+}
+
+TEST_CASE("Lower keeps different scalar subqueries independent", "[lower][scalar_reuse]") {
+    const std::string first =
+        "scalar(supply[filter ps_partkey == outer(p_partkey), select { m = min(ps_cost) }])";
+    std::string second;
+    SECTION("aggregate differs") {
+        second =
+            "scalar(supply[filter ps_partkey == outer(p_partkey), select { m = max(ps_cost) }])";
+    }
+    SECTION("local filter differs") {
+        second =
+            "scalar(supply[filter ps_partkey == outer(p_partkey) && ps_cost > 4.0, select { m = "
+            "min(ps_cost) }])";
+    }
+    SECTION("capture differs") {
+        second = "scalar(supply[filter ps_partkey == outer(other), select { m = min(ps_cost) }])";
+    }
+    auto result = lower_source(std::string(kCorrelatedSources) +
+                               "parts[update { other = p_partkey + 1 }][filter p_partkey < " +
+                               first + " && p_partkey < " + second + "];");
+    REQUIRE(result.has_value());
+    std::vector<ir::NodeKind> kinds;
+    collect_kinds(**result, kinds);
+    REQUIRE(std::ranges::count(kinds, ir::NodeKind::Aggregate) == 2);
+}
+
+TEST_CASE("Lower does not reuse scalar subqueries calling externs", "[lower][scalar_reuse]") {
+    const std::string subquery =
+        "scalar(supply[filter sample(ps_cost) > 0.5, select { m = min(ps_cost) }])";
+    auto result = lower_source("extern fn sample(v: Float64) -> Float64 from \"sample.hpp\";\n" +
+                               std::string(kCorrelatedSources) + "parts[filter p_partkey < " +
+                               subquery + " && p_partkey < " + subquery + "];");
+    REQUIRE(result.has_value());
+    std::vector<ir::NodeKind> kinds;
+    collect_kinds(**result, kinds);
+    REQUIRE(std::ranges::count(kinds, ir::NodeKind::Aggregate) == 2);
+}
+
+TEST_CASE("Scalar subquery reuse is scoped to one filter", "[lower][scalar_reuse]") {
+    const std::string q = "scalar(supply[select { m = min(ps_cost) }])";
+    auto result = lower_source(std::string(kCorrelatedSources) + "parts[filter p_partkey < " + q +
+                               "][filter p_partkey < " + q + "];");
+    REQUIRE(result.has_value());
+    std::vector<ir::NodeKind> kinds;
+    collect_kinds(**result, kinds);
+    REQUIRE(std::ranges::count(kinds, ir::NodeKind::Aggregate) == 2);
+}

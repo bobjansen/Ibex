@@ -73,6 +73,7 @@
 #include <ibex/parser/lower.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <cctype>
 #include <charconv>
 #include <cstddef>
@@ -655,6 +656,133 @@ auto unwrap_group(const Expr& expr) -> const Expr& {
         current = group->expr.get();
     }
     return *current;
+}
+
+/// Conservative structural identity for scalar-subquery reuse. Parentheses do
+/// not matter; names, literal types and every supported clause field do. An
+/// unhandled AST form simply misses this optimization. Purity is checked on
+/// the lowered plan separately, so matching syntax never implies safe reuse.
+auto same_subquery_expr(const Expr* lhs, const Expr* rhs) -> bool;
+
+auto same_subquery_fields(const std::vector<Field>& lhs, const std::vector<Field>& rhs) -> bool {
+    return std::ranges::equal(lhs, rhs, [](const Field& a, const Field& b) {
+        return a.name == b.name && same_subquery_expr(a.expr.get(), b.expr.get());
+    });
+}
+
+auto same_subquery_clause(const Clause& lhs, const Clause& rhs) -> bool {
+    return std::visit(
+        [&](const auto& a) -> bool {
+            using T = std::decay_t<decltype(a)>;
+            const auto* b = std::get_if<T>(&rhs);
+            if (b == nullptr)
+                return false;
+            if constexpr (std::is_same_v<T, FilterClause>) {
+                return same_subquery_expr(a.predicate.get(), b->predicate.get());
+            } else if constexpr (std::is_same_v<T, SelectClause> ||
+                                 std::is_same_v<T, UpdateClause>) {
+                if (!a.tuple_fields.empty() || !b->tuple_fields.empty() || !a.map_fields.empty() ||
+                    !b->map_fields.empty())
+                    return false;
+                if constexpr (std::is_same_v<T, UpdateClause>) {
+                    if (!same_subquery_expr(a.merge_expr.get(), b->merge_expr.get()) ||
+                        !same_subquery_expr(a.guard.get(), b->guard.get()))
+                        return false;
+                }
+                return same_subquery_fields(a.fields, b->fields);
+            } else if constexpr (std::is_same_v<T, DistinctClause> ||
+                                 std::is_same_v<T, RenameClause>) {
+                return same_subquery_fields(a.fields, b->fields);
+            } else if constexpr (std::is_same_v<T, ByClause>) {
+                return same_subquery_fields(a.keys, b->keys);
+            } else if constexpr (std::is_same_v<T, OrderClause>) {
+                return std::ranges::equal(a.keys, b->keys,
+                                          [](const OrderKey& x, const OrderKey& y) {
+                                              return x.name == y.name && x.ascending == y.ascending;
+                                          });
+            } else if constexpr (std::is_same_v<T, HeadClause> || std::is_same_v<T, TailClause>) {
+                return same_subquery_expr(a.count.get(), b->count.get());
+            } else {
+                return false;
+            }
+        },
+        lhs);
+}
+
+auto same_subquery_expr(const Expr* lhs, const Expr* rhs) -> bool {
+    if (lhs == nullptr || rhs == nullptr)
+        return lhs == rhs;
+    const Expr& left = unwrap_group(*lhs);
+    const Expr& right = unwrap_group(*rhs);
+    return std::visit(
+        [&](const auto& a) -> bool {
+            using T = std::decay_t<decltype(a)>;
+            const auto* b = std::get_if<T>(&right.node);
+            if (b == nullptr)
+                return false;
+            if constexpr (std::is_same_v<T, IdentifierExpr>) {
+                return a.name == b->name && a.lexical == b->lexical;
+            } else if constexpr (std::is_same_v<T, LiteralExpr>) {
+                return std::visit(
+                    [&](const auto& value) -> bool {
+                        using V = std::decay_t<decltype(value)>;
+                        const auto* other = std::get_if<V>(&b->value);
+                        if (other == nullptr)
+                            return false;
+                        if constexpr (std::is_same_v<V, DurationLiteral>) {
+                            return value.text == other->text;
+                        } else if constexpr (std::is_same_v<V, double>) {
+                            return std::bit_cast<std::uint64_t>(value) ==
+                                   std::bit_cast<std::uint64_t>(*other);
+                        } else {
+                            return value == *other;
+                        }
+                    },
+                    a.value);
+            } else if constexpr (std::is_same_v<T, CallExpr>) {
+                return a.callee == b->callee &&
+                       std::ranges::equal(a.args, b->args,
+                                          [](const ExprPtr& x, const ExprPtr& y) {
+                                              return same_subquery_expr(x.get(), y.get());
+                                          }) &&
+                       std::ranges::equal(
+                           a.named_args, b->named_args, [](const NamedArg& x, const NamedArg& y) {
+                               return x.name == y.name &&
+                                      same_subquery_expr(x.value.get(), y.value.get());
+                           });
+            } else if constexpr (std::is_same_v<T, UnaryExpr>) {
+                return a.op == b->op && same_subquery_expr(a.expr.get(), b->expr.get());
+            } else if constexpr (std::is_same_v<T, BinaryExpr>) {
+                return a.op == b->op && same_subquery_expr(a.left.get(), b->left.get()) &&
+                       same_subquery_expr(a.right.get(), b->right.get());
+            } else if constexpr (std::is_same_v<T, BlockExpr>) {
+                return same_subquery_expr(a.base.get(), b->base.get()) &&
+                       std::ranges::equal(a.clauses, b->clauses, same_subquery_clause);
+            } else if constexpr (std::is_same_v<T, JoinExpr>) {
+                return a.kind == b->kind && a.keys == b->keys && a.suffix == b->suffix &&
+                       a.null_match == b->null_match && a.expect == b->expect &&
+                       a.take == b->take && same_subquery_expr(a.left.get(), b->left.get()) &&
+                       same_subquery_expr(a.right.get(), b->right.get()) &&
+                       a.predicate.has_value() == b->predicate.has_value() &&
+                       (!a.predicate.has_value() ||
+                        same_subquery_expr(a.predicate->get(), b->predicate->get()));
+            } else if constexpr (std::is_same_v<T, ArrayLiteralExpr>) {
+                return std::ranges::equal(a.elements, b->elements,
+                                          [](const ExprPtr& x, const ExprPtr& y) {
+                                              return same_subquery_expr(x.get(), y.get());
+                                          });
+            } else if constexpr (std::is_same_v<T, TableExpr>) {
+                return same_subquery_expr(a.row_count.get(), b->row_count.get()) &&
+                       std::ranges::equal(a.columns, b->columns,
+                                          [](const TableColumnDef& x, const TableColumnDef& y) {
+                                              return x.name == y.name &&
+                                                     same_subquery_expr(x.expr.get(), y.expr.get());
+                                          });
+            } else {
+                return false;
+            }
+        },
+        left.node);
 }
 
 /// The call `expr` is, if it calls `callee`; null otherwise.
@@ -3470,11 +3598,18 @@ class Lowerer {
         bool counts = false;
     };
 
+    struct ReusableScalarSubquery {
+        const Expr* argument;
+        std::string alias;
+        bool coalesce_count;
+    };
+
     /// Lower a `filter` predicate over `input`.
     ///
     /// A predicate with no `scalar(...)` subquery becomes a plain FilterNode.
     /// One with subqueries is decorrelated: each subquery is evaluated once, as
     /// an aggregate over its captured key, and left-joined to the outer rows.
+    /// Identical repeatable subqueries in this filter share that result column.
     /// The subquery must never be run per outer row.
     ///
     ///     filter local && ps_supplycost == scalar(inner[filter ps_partkey == outer(p_partkey),
@@ -3554,9 +3689,10 @@ class Lowerer {
         }
 
         std::vector<ir::Expr> residual;
+        std::vector<ReusableScalarSubquery> reusable;
         residual.reserve(correlated.size());
         for (const auto* conjunct : correlated) {
-            auto rewritten = decorrelate(*conjunct, input);
+            auto rewritten = decorrelate(*conjunct, input, reusable);
             if (!rewritten.has_value()) {
                 return std::unexpected(rewritten.error());
             }
@@ -3579,7 +3715,8 @@ class Lowerer {
 
     /// Join the subquery in `conjunct` onto `input` and return the comparison
     /// rewritten against the generated scalar column.
-    auto decorrelate(const Expr& conjunct, ir::NodePtr& input)
+    auto decorrelate(const Expr& conjunct, ir::NodePtr& input,
+                     std::vector<ReusableScalarSubquery>& reusable)
         -> std::expected<ir::Expr, LowerError> {
         const auto* comparison = std::get_if<BinaryExpr>(&conjunct.node);
         if (comparison == nullptr || !is_compare_op(comparison->op)) {
@@ -3609,31 +3746,45 @@ class Lowerer {
                 .message = "outer(): a capture is only valid inside a scalar(...) subquery"});
         }
 
-        const std::string alias = next_scalar_alias(*input);
-        auto subplan = lower_scalar_subquery(*subquery, *input, alias);
-        if (!subplan.has_value()) {
-            return std::unexpected(subplan.error());
-        }
+        std::string alias;
+        bool coalesce_count = false;
+        const auto found = std::ranges::find_if(reusable, [&](const ReusableScalarSubquery& prior) {
+            return same_subquery_expr(prior.argument, subquery->args.front().get());
+        });
+        if (found != reusable.end()) {
+            alias = found->alias;
+            coalesce_count = found->coalesce_count;
+        } else {
+            alias = next_scalar_alias(*input);
+            auto subplan = lower_scalar_subquery(*subquery, *input, alias);
+            if (!subplan.has_value()) {
+                return std::unexpected(subplan.error());
+            }
+            const bool correlated = !subplan->keys.empty();
+            coalesce_count = correlated && subplan->counts;
+            // Reuse only repeatable plans. In particular, identical calls to a
+            // generator or an extern must keep their independent evaluations.
+            std::uint64_t unused_id = 0;
+            if (ir::clone_replayable_subplan(*subplan->plan, unused_id) != nullptr) {
+                reusable.push_back({subquery->args.front().get(), alias, coalesce_count});
+            }
 
-        // A correlated subquery joins on its captured keys, so an outer row with
-        // no matching group gets a null -- right for every aggregate except a
-        // count, which is patched to 0 below. An uncorrelated one is a single
-        // value broadcast to every row: a cross join against its one row. An
-        // aggregate with no `by` yields that row even over an empty input (a
-        // count of 0, a null otherwise), so the cross join never drops rows.
-        const bool correlated = !subplan->keys.empty();
-        auto join = builder_.join(correlated ? ir::JoinKind::Left : ir::JoinKind::Cross,
-                                  std::move(subplan->keys));
-        join->add_child(std::move(input));
-        join->add_child(std::move(subplan->plan));
-        input = std::move(join);
+            // Missing correlated groups are null (coalesced to 0 for counts).
+            // An uncorrelated aggregate always has one row, even over an empty
+            // input, so a cross join broadcasts it without dropping outer rows.
+            auto join = builder_.join(correlated ? ir::JoinKind::Left : ir::JoinKind::Cross,
+                                      std::move(subplan->keys));
+            join->add_child(std::move(input));
+            join->add_child(std::move(subplan->plan));
+            input = std::move(join);
+        }
 
         auto lowered_value = lower_expr_to_ir(value);
         if (!lowered_value.has_value()) {
             return std::unexpected(lowered_value.error());
         }
         auto scalar_ref = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = alias}});
-        if (correlated && subplan->counts) {
+        if (coalesce_count) {
             ir::CallExpr coalesce{.callee = "coalesce", .args = {}, .named_args = {}};
             coalesce.args.push_back(std::move(scalar_ref));
             coalesce.args.push_back(

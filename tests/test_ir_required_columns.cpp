@@ -436,14 +436,24 @@ TEST_CASE("deferrable_probe_scans: bare right-side scan of an inner join is elig
     CHECK_FALSE(ir::deferrable_probe_scans(*plan, {"build"}).contains("build"));
 }
 
-TEST_CASE("deferrable_probe_scans: a `nulls equal` join is declined",
+TEST_CASE("deferrable_probe_scans: joins the streaming path declines are not deferred",
           "[ir][scan_predicates][deferred_scan][regression]") {
-    auto join = std::make_unique<ir::JoinNode>(
-        ir::NodeId{20}, ir::JoinKind::Inner, std::vector<ir::JoinKey>{ir::JoinKey{"id"}},
-        std::nullopt, ir::JoinSuffixPolicy{}, ir::NullMatch::Equal);
-    join->add_child(make_scan("build"));
-    join->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
-    CHECK_FALSE(ir::deferrable_probe_scans(*join, {"t"}).contains("t"));
+    // The runtime publishes the build-key filter only from its streaming inner
+    // joins, which exclude these clauses; deferring their probe would pay for
+    // the registration and never filter.
+    for (int clause = 0; clause < 3; ++clause) {
+        CAPTURE(clause);
+        ir::NullMatch nulls = clause == 0 ? ir::NullMatch::Equal : ir::NullMatch::Never;
+        ir::JoinExpect expect;
+        expect.right = clause == 1 ? ir::JoinMultiplicity::One : ir::JoinMultiplicity::Many;
+        const auto take = clause == 2 ? ir::MatchSelection::Any : ir::MatchSelection::All;
+        auto join = std::make_unique<ir::JoinNode>(
+            ir::NodeId{20}, ir::JoinKind::Inner, std::vector<ir::JoinKey>{ir::JoinKey{"id"}},
+            std::nullopt, ir::JoinSuffixPolicy{}, nulls, expect, take);
+        join->add_child(make_scan("build"));
+        join->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
+        CHECK_FALSE(ir::deferrable_probe_scans(*join, {"t"}).contains("t"));
+    }
 }
 
 TEST_CASE("deferrable_probe_scans: an unfiltered build side is declined",

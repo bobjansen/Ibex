@@ -427,11 +427,15 @@ auto build_side_worth_deferring(const JoinNode& join, const std::string& probe_s
 
 /// The inner-join / key-arity / no-predicate shape a deferrable probe needs.
 auto is_probe_shaped_join(const JoinNode& join) -> bool {
-    // `nulls equal` lets a null build key match a null probe key, which the
-    // dynamic filter over the build side's keys would have to admit; the
-    // deferred path does not model that, so such a join reads its probe whole.
+    // The runtime publishes a build-key filter only from its streaming inner
+    // joins, which take a plain `nulls never`, unasserted, take-all join: the
+    // filter skips null keys and cannot see which match `take` or `expect`
+    // would pick. A join outside that set never publishes one, so registering
+    // its probe as deferred would only rename the scan and skip nothing. Keep
+    // this in step with `is_streamable_inner_join` in runtime_entry.cpp.
     return join.kind() == JoinKind::Inner && (join.keys().size() == 1 || join.keys().size() == 2) &&
-           join.null_match() == NullMatch::Never && !join.predicate().has_value() &&
+           join.null_match() == NullMatch::Never && join.take() == MatchSelection::All &&
+           !join.expect().asserts_anything() && !join.predicate().has_value() &&
            join.children().size() == 2 && join.children()[0] != nullptr &&
            join.children()[1] != nullptr;
 }

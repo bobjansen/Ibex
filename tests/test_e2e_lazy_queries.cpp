@@ -86,11 +86,20 @@ void register_lazy_source(ExternRegistry& registry, std::string name, Table data
                     const Selection& want = selection == nullptr ? all : *selection;
                     Table out;
                     for (const auto& col_name : names) {
-                        const auto* col = data.find(col_name);
-                        if (col == nullptr) {
+                        const auto* entry = data.find_entry(col_name);
+                        if (entry == nullptr) {
                             return std::unexpected("lazy source: unknown column " + col_name);
                         }
-                        out.add_column(col_name, slice_column(*col, want));
+                        if (entry->validity.has_value()) {
+                            ibex::runtime::ValidityBitmap validity(want.size(), true);
+                            for (std::size_t i = 0; i < want.size(); ++i) {
+                                validity.set(i, (*entry->validity)[want[i]]);
+                            }
+                            out.add_column(col_name, slice_column(*entry->column, want),
+                                           std::move(validity));
+                        } else {
+                            out.add_column(col_name, slice_column(*entry->column, want));
+                        }
                     }
                     out.logical_rows = want.size();
                     return out;
@@ -243,6 +252,84 @@ result;
     // cust 3 -> order 13 -> line 400.
     REQUIRE(rows_of(out, {"c_custkey", "rev"}) ==
             std::set<std::vector<std::int64_t>>{{1, 350}, {3, 400}});
+}
+
+TEST_CASE("e2e lazy: `nulls equal` join over a deferrable probe keeps null-keyed rows",
+          "[e2e][lazy][join][regression]") {
+    // A selective build side over a much larger probe source is the shape the
+    // deferred-probe pass targets. Its key filter skips null keys, which is
+    // right for `nulls never` and would lose every null-to-null pair here, so
+    // a `nulls equal` join must not be narrowed by it.
+    constexpr std::size_t probe_rows = 4000;
+    constexpr std::size_t build_rows = 400;
+    Table probe;
+    Table build;
+    {
+        Column<std::int64_t> id;
+        Column<std::int64_t> v;
+        ibex::runtime::ValidityBitmap valid(probe_rows, true);
+        for (std::size_t i = 0; i < probe_rows; ++i) {
+            id.push_back(static_cast<std::int64_t>(i % 100));
+            v.push_back(static_cast<std::int64_t>(i));
+            valid.set(i, i % 10 != 0);
+        }
+        probe.add_column("id", std::move(id), valid);
+        probe.add_column("v", std::move(v));
+    }
+    {
+        Column<std::int64_t> id;
+        Column<std::int64_t> flag;
+        ibex::runtime::ValidityBitmap valid(build_rows, true);
+        for (std::size_t i = 0; i < build_rows; ++i) {
+            id.push_back(static_cast<std::int64_t>(i % 5));
+            flag.push_back(i < 8 ? 1 : 0);
+            valid.set(i, i % 4 != 0);
+        }
+        build.add_column("id", std::move(id), valid);
+        build.add_column("flag", std::move(flag));
+    }
+
+    // The 8 flagged build rows carry keys null,1,2,3,null,0,1,2. Probe keys
+    // are null on every tenth row and i % 100 otherwise.
+    std::int64_t expected_equal = 0;
+    std::int64_t expected_never = 0;
+    for (std::size_t i = 0; i < probe_rows; ++i) {
+        const bool probe_null = i % 10 == 0;
+        const auto key = static_cast<std::int64_t>(i % 100);
+        for (std::size_t b = 0; b < 8; ++b) {
+            const bool build_null = b % 4 == 0;
+            const auto build_key = static_cast<std::int64_t>(b % 5);
+            if (probe_null && build_null) {
+                ++expected_equal;
+            } else if (!probe_null && !build_null && key == build_key) {
+                ++expected_equal;
+                ++expected_never;
+            }
+        }
+    }
+    REQUIRE(expected_equal > expected_never);
+
+    for (const bool nulls_equal : {true, false}) {
+        CAPTURE(nulls_equal);
+        const std::string src = std::string(R"(
+extern fn read_build() -> DataFrame from "x.hpp";
+extern fn read_probe() -> DataFrame from "x.hpp";
+extern fn capture(df: DataFrame) -> Int from "x.hpp";
+
+let build = read_build();
+let probe = read_probe();
+let small = build[filter flag == 1, select { id }];
+let joined = small join probe on id)") +
+                                (nulls_equal ? " nulls equal" : "") +
+                                R"(;
+let result = joined[select { n = count() }];
+capture(result);
+result;
+)";
+        Table out = run_lazy_script(src.c_str(), {{"read_build", build}, {"read_probe", probe}});
+        REQUIRE(i64(out, "n") ==
+                std::vector<std::int64_t>{nulls_equal ? expected_equal : expected_never});
+    }
 }
 
 TEST_CASE("e2e lazy: deferred probe against a self-referenced source", "[e2e][lazy]") {

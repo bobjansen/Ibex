@@ -5,9 +5,9 @@
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/probed_key_restriction.hpp>
 #include <ibex/ir/replayable.hpp>
-#include <ibex/ir/schema.hpp>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -147,14 +147,11 @@ auto probed_distinct(const Node& node, const std::string& column, const SourceSt
 /// probe side that may dwarf what it saves.
 auto restriction_pays(const Node& probe_side, const Node& aggregate_input,
                       const std::vector<JoinKey>& keys, const SourceStats& stats) -> bool {
-    for (const auto& key : keys) {
+    return std::ranges::any_of(keys, [&](const JoinKey& key) {
         const auto probed = probed_distinct(probe_side, key.left, stats);
         const auto groups = distinct_estimate(aggregate_input, key.right, stats);
-        if (probed.has_value() && groups.has_value() && *probed < *groups) {
-            return true;
-        }
-    }
-    return false;
+        return probed.has_value() && groups.has_value() && *probed < *groups;
+    });
 }
 
 void rewrite(Node& node, const SourceStats& stats, std::uint64_t& next) {

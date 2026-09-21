@@ -285,8 +285,12 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             has_complex_agg = true;
             numeric_only = false;
         } else if (agg.func == ir::AggFunc::First || agg.func == ir::AggFunc::Last) {
-            // numeric First/Last are handled in the fast path; only fall back for strings
-            if (item.kind == ExprType::String) {
+            // Numeric First/Last use fixed-width slots. Boolean values need
+            // the generic scalar path, including when no other aggregate does.
+            if (item.kind == ExprType::Bool) {
+                has_complex_agg = true;
+            }
+            if (item.kind != ExprType::Int && item.kind != ExprType::Double) {
                 numeric_only = false;
             }
         } else if (agg.func != ir::AggFunc::Count && agg.func != ir::AggFunc::Sum &&
@@ -723,6 +727,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         append_scalar(*column, slot.int_value);
                     } else if (slot.kind == ExprType::Double) {
                         append_scalar(*column, slot.double_value);
+                    } else if (slot.kind == ExprType::Bool) {
+                        append_scalar(*column,
+                                      slot.has_value ? slot.text_value : ScalarValue{false});
                     } else {
                         append_text_cell(*column, slot.text_value);
                     }
@@ -1179,8 +1186,10 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 if (const auto* ic = std::get_if<Column<std::int64_t>>(&col)) {
                     count_with([&](std::size_t row) { return (*ic)[row]; });
                 } else if (const auto* dc = std::get_if<Column<double>>(&col)) {
-                    count_with(
-                        [&](std::size_t row) { return std::bit_cast<std::uint64_t>((*dc)[row]); });
+                    count_with([&](std::size_t row) {
+                        const double value = (*dc)[row];
+                        return std::bit_cast<std::uint64_t>(value == 0.0 ? 0.0 : value);
+                    });
                 } else if (const auto* bc = std::get_if<Column<bool>>(&col)) {
                     count_with(
                         [&](std::size_t row) -> std::uint8_t { return (*bc)[row] ? 1U : 0U; });

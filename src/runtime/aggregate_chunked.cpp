@@ -579,10 +579,13 @@ class HashAggregateState final {
             // Column<std::string> and Column<Categorical> — expr_type_for_column
             // collapses both to String); CountDistinct accepts every scalar kind
             // (fixed-width values are bit-cast, text is kept verbatim); every
-            // other function stays numeric-only.
-            const bool supported = kind == ExprType::Int || kind == ExprType::Double ||
-                                   agg.func == ir::AggFunc::CountDistinct ||
-                                   (keeps_a_value && kind == ExprType::String);
+            // other function stays numeric-only. Boolean First/Last use integer slots.
+            const bool supported =
+                kind == ExprType::Int || kind == ExprType::Double ||
+                agg.func == ir::AggFunc::CountDistinct ||
+                (keeps_a_value && kind == ExprType::String) ||
+                ((agg.func == ir::AggFunc::First || agg.func == ir::AggFunc::Last) &&
+                 kind == ExprType::Bool);
             if (!supported) {
                 return "aggregate of column '" + agg.column.name +
                        "': this function does not support the column's type";
@@ -3583,6 +3586,8 @@ class HashAggregateState final {
                 slot.double_value = std::get<Column<double>>(*entry.column)[row];
             } else if (plan_[a].kind == ExprType::Int) {
                 slot.int_value = std::get<Column<std::int64_t>>(*entry.column)[row];
+            } else if (plan_[a].kind == ExprType::Bool) {
+                slot.int_value = std::get<Column<bool>>(*entry.column)[row] ? 1 : 0;
             } else {
                 std::string value;
                 if (plan_[a].categorical) {
@@ -3934,9 +3939,10 @@ class HashAggregateState final {
             const ExprType kind = plan_[a].kind;
             const auto bits_at = [&](std::size_t row) -> std::uint64_t {
                 switch (kind) {
-                    case ExprType::Double:
-                        return std::bit_cast<std::uint64_t>(
-                            std::get<Column<double>>(*entry.column).data()[row]);
+                    case ExprType::Double: {
+                        const double value = std::get<Column<double>>(*entry.column).data()[row];
+                        return std::bit_cast<std::uint64_t>(value == 0.0 ? 0.0 : value);
+                    }
                     case ExprType::Date:
                         return static_cast<std::uint32_t>(
                             std::get<Column<Date>>(*entry.column)[row].days);
@@ -4040,7 +4046,19 @@ class HashAggregateState final {
                 entry.validity.has_value() ? &*entry.validity : nullptr;
             const bool has_nulls = validity != nullptr;
 
-            if (plan_[agg_i].kind == ExprType::Double) {
+            if (plan_[agg_i].kind == ExprType::Bool) {
+                const auto& values = std::get<Column<bool>>(*entry.column);
+                for (std::size_t row = begin; row < rows; ++row) {
+                    if (has_nulls && !(*validity)[row]) {
+                        continue;
+                    }
+                    auto& slot = slot_for(gids[row]);
+                    if (plan_[agg_i].func == ir::AggFunc::Last || !slot.present()) {
+                        slot.int_value = values[row] ? 1 : 0;
+                        slot.mark_present();
+                    }
+                }
+            } else if (plan_[agg_i].kind == ExprType::Double) {
                 const double* data = std::get<Column<double>>(*entry.column).data();
                 switch (plan_[agg_i].func) {
                     case ir::AggFunc::Sum:
@@ -4443,7 +4461,15 @@ class HashAggregateState final {
                 }
             };
 
-            if (plan_[agg_i].kind == ExprType::Double) {
+            if (plan_[agg_i].kind == ExprType::Bool) {
+                const auto& values = std::get<Column<bool>>(*entry.column);
+                each([&](std::size_t row) {
+                    if (func == ir::AggFunc::Last || !slot.present()) {
+                        slot.int_value = values[row] ? 1 : 0;
+                        slot.mark_present();
+                    }
+                });
+            } else if (plan_[agg_i].kind == ExprType::Double) {
                 const double* data = std::get<Column<double>>(*entry.column).data();
                 switch (func) {
                     case ir::AggFunc::Sum:
@@ -4869,6 +4895,8 @@ class HashAggregateState final {
                         column = Column<double>{};
                     } else if (plan_[i].kind == ExprType::Int) {
                         column = Column<std::int64_t>{};
+                    } else if (plan_[i].kind == ExprType::Bool) {
+                        column = Column<bool>{};
                     } else if (plan_[i].categorical) {
                         column = Column<Categorical>{};
                     } else {
@@ -5073,6 +5101,8 @@ class HashAggregateState final {
                             put_d(g, slot.double_value);
                         } else if (plan_[i].kind == ExprType::Int) {
                             put_i(g, slot.int_value);
+                        } else if (plan_[i].kind == ExprType::Bool) {
+                            std::get<Column<bool>>(column).push_back(slot.int_value != 0);
                         } else {
                             append_text_cell(column, text_store_[(g * n_aggs_) + i]);
                         }
@@ -5659,7 +5689,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
             if (chunk_res.value()->rows() == 0) {
                 // Empty, but it still carries the input's columns and their
                 // types. Keep the first one in case no chunk ever has rows.
-                if (!schema_only.has_value() && !chunk_res.value()->columns.empty()) {
+                if (!schema_only.has_value()) {
                     schema_only = std::move(*chunk_res.value());
                 }
                 continue;
@@ -5708,8 +5738,8 @@ class ChunkedSortedAggregateOperator final : public Operator {
 
     // The input is grouped-contiguous iff the first |group_by| ordering keys
     // are exactly the group_by columns (as a set; direction and intra-prefix
-    // order don't matter for contiguity). Nullable group keys fall back, since
-    // the streaming key compare ignores validity.
+    // order don't matter for contiguity). Initially nullable keys use the hash
+    // path; sorted comparisons also handle validity introduced in later chunks.
     [[nodiscard]] auto sorted_on_group_by(const Chunk& chunk) const -> bool {
         if (!columns_.has_value() || group_by_->empty()) {
             return false;  // unbound, or a global aggregate: let the hash path handle it
@@ -5718,10 +5748,12 @@ class ChunkedSortedAggregateOperator final : public Operator {
             return false;
         }
         const auto& ordering = *chunk.ordering();
-        for (std::size_t i = 0; i < group_by_->size(); ++i) {
+        std::vector<bool> matched(group_by_->size(), false);
+        for (const auto& g : *group_by_) {
             bool in_group = false;
-            for (const auto& g : *group_by_) {
-                if (g.name == ordering[i].name) {
+            for (std::size_t i = 0; i < group_by_->size(); ++i) {
+                if (!matched[i] && g.name == ordering[i].name) {
+                    matched[i] = true;
                     in_group = true;
                     break;
                 }
@@ -5735,7 +5767,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
         });
     }
 
-    // Non-numeric First/Last (string/categorical) has no group-at-a-time
+    // Non-numeric First/Last/Min/Max has no group-at-a-time
     // implementation here — route it to the hash operator, which handles any
     // type. Numeric First/Last streams natively (see accumulate_typed).
     [[nodiscard]] auto needs_hash_fallback(const Chunk& first) const -> bool {
@@ -5756,7 +5788,8 @@ class ChunkedSortedAggregateOperator final : public Operator {
                 std::holds_alternative<Column<Decimal>>(*first.columns[*input_idx].column)) {
                 return true;
             }
-            if ((agg.func != ir::AggFunc::First && agg.func != ir::AggFunc::Last) ||
+            if ((agg.func != ir::AggFunc::First && agg.func != ir::AggFunc::Last &&
+                 agg.func != ir::AggFunc::Min && agg.func != ir::AggFunc::Max) ||
                 !input_idx.has_value()) {
                 continue;
             }
@@ -5901,10 +5934,10 @@ class ChunkedSortedAggregateOperator final : public Operator {
         if (!columns_.has_value()) {
             return "ChunkedSortedAggregateOperator: column mapping not bound";
         }
-        std::vector<const ColumnValue*> key_cols;
+        std::vector<const ColumnEntry*> key_cols;
         key_cols.reserve(group_by_->size());
         for (const std::size_t index : columns_->group_by) {
-            key_cols.push_back(chunk.columns[index].column.get());
+            key_cols.push_back(&chunk.columns[index]);
         }
         std::vector<const ColumnEntry*> agg_entries(n_aggs_, nullptr);
         for (std::size_t i = 0; i < n_aggs_; ++i) {
@@ -5939,11 +5972,13 @@ class ChunkedSortedAggregateOperator final : public Operator {
         return std::nullopt;
     }
 
-    void start_group(const std::vector<const ColumnValue*>& key_cols, std::size_t row) {
+    void start_group(const std::vector<const ColumnEntry*>& key_cols, std::size_t row) {
         open_key_.clear();
         open_key_.reserve(key_cols.size());
+        open_key_null_.clear();
         for (const auto* col : key_cols) {
-            open_key_.push_back(scalar_from_column(*col, row));
+            open_key_.push_back(scalar_from_column(*col->column, row));
+            open_key_null_.push_back(is_null(*col, row));
         }
         std::ranges::fill(cur_slots_, AggSlotCore{});
         std::ranges::fill(cur_scratch_, 0.0);
@@ -5953,10 +5988,12 @@ class ChunkedSortedAggregateOperator final : public Operator {
     // Whether `row` continues the currently open group. Only called at run
     // anchors (group boundaries and chunk starts), so the scalar build is
     // paid per group, not per row.
-    [[nodiscard]] auto row_matches_open(const std::vector<const ColumnValue*>& key_cols,
+    [[nodiscard]] auto row_matches_open(const std::vector<const ColumnEntry*>& key_cols,
                                         std::size_t row) const -> bool {
         for (std::size_t i = 0; i < key_cols.size(); ++i) {
-            if (scalar_from_column(*key_cols[i], row) != open_key_[i]) {
+            const bool null = is_null(*key_cols[i], row);
+            if (null != open_key_null_[i] ||
+                (!null && scalar_from_column(*key_cols[i]->column, row) != open_key_[i])) {
                 return false;
             }
         }
@@ -5980,10 +6017,13 @@ class ChunkedSortedAggregateOperator final : public Operator {
             col);
     }
 
-    [[nodiscard]] static auto cells_equal(const std::vector<const ColumnValue*>& key_cols,
+    [[nodiscard]] static auto cells_equal(const std::vector<const ColumnEntry*>& key_cols,
                                           std::size_t a, std::size_t b) -> bool {
-        return std::ranges::all_of(key_cols,
-                                   [a, b](const auto* col) { return cell_equal(*col, a, b); });
+        return std::ranges::all_of(key_cols, [a, b](const auto* col) {
+            const bool a_null = is_null(*col, a);
+            const bool b_null = is_null(*col, b);
+            return a_null == b_null && (a_null || cell_equal(*col->column, a, b));
+        });
     }
 
     // Accumulate the contiguous row range [start, end) — all one group — into
@@ -6124,6 +6164,13 @@ class ChunkedSortedAggregateOperator final : public Operator {
     void close_group() {
         for (std::size_t i = 0; i < group_by_->size(); ++i) {
             append_scalar(*out_columns_[i].column, open_key_[i]);
+            auto& validity = out_columns_[i].validity;
+            if (open_key_null_[i] && !validity.has_value()) {
+                validity = ValidityBitmap(pending_rows_, true);
+            }
+            if (validity.has_value()) {
+                validity->push_back(!open_key_null_[i]);
+            }
         }
         for (std::size_t i = 0; i < n_aggs_; ++i) {
             ColumnValue& column = *out_columns_[group_by_->size() + i].column;
@@ -6227,6 +6274,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
     static constexpr std::size_t kMomentScratch = 3;
     std::vector<double> cur_scratch_;
     std::vector<ScalarValue> open_key_;
+    std::vector<bool> open_key_null_;
 
     // Output buffers for closed groups awaiting emission.
     std::vector<ColumnEntry> out_columns_;

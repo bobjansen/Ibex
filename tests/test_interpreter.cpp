@@ -16125,3 +16125,35 @@ TEST_CASE("zero head retains typed columns", "[schema][head]") {
         CHECK(runtime::is_null(*out->find_entry("s"), 0));
     }
 }
+
+TEST_CASE("Repeated scalar subqueries preserve missing and empty group semantics",
+          "[scalar_reuse]") {
+    std::string predicate;
+    std::vector<std::int64_t> expected;
+    SECTION("correlated minimum") {
+        const std::string q =
+            "scalar(supply[filter ps_partkey == outer(p_partkey) && ps_region == \"EU\", select { "
+            "m = min(ps_cost) }])";
+        predicate = q + " > 0.0 && " + q + " < 5.0";
+        expected = {1, 3};
+    }
+    SECTION("correlated count supplies zero on both uses") {
+        const std::string q =
+            "scalar(supply[filter ps_partkey == outer(p_partkey) && ps_region == \"EU\", select { "
+            "n = count() }])";
+        predicate = "0 == " + q + " && " + q + " < 1";
+        expected = {4};
+    }
+    SECTION("empty uncorrelated count") {
+        const std::string q = "scalar(supply[filter ps_cost < 0.0, select { n = count() }])";
+        predicate = "0 == " + q + " && " + q + " < 1";
+        expected = {1, 2, 3, 4};
+    }
+    SECTION("empty uncorrelated minimum") {
+        const std::string q = "scalar(supply[filter ps_cost < 0.0, select { m = min(ps_cost) }])";
+        predicate = "0.0 < " + q + " && " + q + " < 1.0";
+    }
+    auto out = interpret_source(std::string(kSupplySources) + "parts[filter " + predicate + "];");
+    REQUIRE(out.columns.size() == 2);
+    REQUIRE(int_column(out, "p_partkey") == expected);
+}

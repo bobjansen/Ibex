@@ -26,4 +26,11 @@ namespace ibex::parquet_stats {
     return usable_signed_range(min, max) && (max < lo || min > hi);
 }
 
+/// Whether every value of a row group whose footer range is [min, max] lies
+/// inside the inclusive interval [lo, hi]. False for an unusable range.
+[[nodiscard]] constexpr auto group_covered(std::int64_t min, std::int64_t max, std::int64_t lo,
+                                           std::int64_t hi) noexcept -> bool {
+    return usable_signed_range(min, max) && min >= lo && max <= hi;
+}
+
 }  // namespace ibex::parquet_stats

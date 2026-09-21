@@ -237,7 +237,7 @@ struct JoinHashIndex {
     struct PairKey {
         std::uint64_t a = 0;
         std::uint64_t b = 0;
-        [[nodiscard]] friend auto operator==(const PairKey&, const PairKey&) -> bool = default;
+        [[nodiscard]] auto operator==(const PairKey&) const -> bool = default;
     };
     struct PairKeyHash {
         auto operator()(const PairKey& key) const noexcept -> std::size_t {
@@ -1818,7 +1818,7 @@ struct PrecomputedHashProbeInput {
 using HashProbeInput =
     std::variant<StreamingHashProbeInput, SwappedHashProbeInput, PrecomputedHashProbeInput>;
 
-/// Inner hash join for single-key no-predicate joins.
+/// Inner hash join for no-predicate joins on a single key or two Int64 keys.
 ///
 /// Two execution modes:
 /// - Stream: right is small (<= kStreamRightThreshold). Build a chained

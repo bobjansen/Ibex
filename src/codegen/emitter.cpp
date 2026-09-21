@@ -283,6 +283,7 @@ auto Emitter::fresh_var() -> std::string {
     return "t" + std::to_string(tmp_counter_++);
 }
 
+// NOLINTNEXTLINE(readability-function-size): one exhaustive dispatcher keeps IR emission local.
 auto Emitter::emit_node(const ir::Node& node) -> std::string {
     const auto require_single_child = [](const ir::Node& parent,
                                          std::string_view node_name) -> const ir::Node& {

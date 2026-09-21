@@ -25,6 +25,7 @@
 #include <ctime>
 #include <expected>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <robin_hood.h>
 #include <string>

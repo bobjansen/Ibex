@@ -9,6 +9,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -145,4 +146,74 @@ TEST_CASE("static range: a zero-row schema table still reports a type error in a
         empty, {compare(ir::CompareOp::Gt, col("i"), lit(5))}, exec, nullptr);
     REQUIRE(fine.has_value());
     CHECK(fine->empty());
+}
+
+namespace {
+
+auto real(double x) -> ir::Expr {
+    return ir::Expr{ir::Literal{.value = x}};
+}
+
+auto bounds_of(ir::CompareOp op, double x) {
+    return split({compare(op, col("i"), real(x))});
+}
+
+}  // namespace
+
+TEST_CASE("static range: a double literal against an int column becomes integer bounds",
+          "[runtime][static_range]") {
+    const auto gt = bounds_of(ir::CompareOp::Gt, 5.5);
+    REQUIRE(gt.has_value());
+    CHECK(gt->filter.min == 6);
+    CHECK(bounds_of(ir::CompareOp::Ge, 5.5)->filter.min == 6);
+    CHECK(bounds_of(ir::CompareOp::Lt, 5.5)->filter.max == 5);
+    CHECK(bounds_of(ir::CompareOp::Le, 5.5)->filter.max == 5);
+    // An integral double is the integer itself.
+    CHECK(bounds_of(ir::CompareOp::Gt, 5.0)->filter.min == 6);
+    CHECK(bounds_of(ir::CompareOp::Ge, 5.0)->filter.min == 5);
+    CHECK(bounds_of(ir::CompareOp::Lt, 5.0)->filter.max == 4);
+    CHECK(bounds_of(ir::CompareOp::Le, 5.0)->filter.max == 5);
+    const auto eq = bounds_of(ir::CompareOp::Eq, 5.0);
+    CHECK(eq->filter.min == 5);
+    CHECK(eq->filter.max == 5);
+    // Negative literals round toward the correct side.
+    CHECK(bounds_of(ir::CompareOp::Gt, -5.5)->filter.min == -5);
+    CHECK(bounds_of(ir::CompareOp::Ge, -5.5)->filter.min == -5);
+    CHECK(bounds_of(ir::CompareOp::Lt, -5.5)->filter.max == -6);
+    CHECK(bounds_of(ir::CompareOp::Le, -5.5)->filter.max == -6);
+}
+
+TEST_CASE("static range: a fractional equality is an empty interval", "[runtime][static_range]") {
+    const auto eq = bounds_of(ir::CompareOp::Eq, 5.5);
+    REQUIRE(eq.has_value());
+    CHECK(*eq->filter.min > *eq->filter.max);
+    // Later bounds cannot reopen it.
+    const auto later = split({compare(ir::CompareOp::Eq, col("i"), real(5.5)),
+                              compare(ir::CompareOp::Ge, col("i"), lit(0)),
+                              compare(ir::CompareOp::Le, col("i"), lit(10))});
+    REQUIRE(later.has_value());
+    CHECK(*later->filter.min > *later->filter.max);
+}
+
+TEST_CASE("static range: a double literal combines with integer bounds and flips on the left",
+          "[runtime][static_range]") {
+    const auto range = split({compare(ir::CompareOp::Lt, real(4.5), col("i")),
+                              compare(ir::CompareOp::Lt, col("i"), lit(10))});
+    REQUIRE(range.has_value());
+    CHECK(range->filter.min == 5);
+    CHECK(range->filter.max == 9);
+    CHECK(range->rest.empty());
+}
+
+TEST_CASE("static range: double literals that cannot stay exact are conjuncts",
+          "[runtime][static_range]") {
+    // 2^53 - 1 is the last magnitude below the exactness limit.
+    CHECK(bounds_of(ir::CompareOp::Gt, 9007199254740991.0).has_value());
+    CHECK_FALSE(bounds_of(ir::CompareOp::Gt, 9007199254740992.0).has_value());
+    CHECK_FALSE(bounds_of(ir::CompareOp::Gt, 1e30).has_value());
+    CHECK_FALSE(bounds_of(ir::CompareOp::Lt, -1e30).has_value());
+    CHECK_FALSE(bounds_of(ir::CompareOp::Gt, std::numeric_limits<double>::infinity()).has_value());
+    CHECK_FALSE(bounds_of(ir::CompareOp::Gt, std::numeric_limits<double>::quiet_NaN()).has_value());
+    // A double literal is never compared with a Date column by the interval.
+    CHECK_FALSE(split({compare(ir::CompareOp::Gt, col("d"), real(5.5))}).has_value());
 }

@@ -8,6 +8,7 @@
 #include <ibex/ir/expr_predicates.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <utility>
@@ -32,21 +33,27 @@ auto inverted_compare(ir::CompareOp op) -> ir::CompareOp {
     }
 }
 
-struct IntegerLiteral {
-    std::int64_t value = 0;
-    bool is_date = false;
+/// A literal the interval can be built from.
+struct RangeLiteral {
+    enum class Kind : std::uint8_t { Int, Date, Double };
+    Kind kind = Kind::Int;
+    std::int64_t value = 0;  // Int and Date
+    double real = 0.0;       // Double
 };
 
-auto integer_literal(const ir::Expr& expr) -> std::optional<IntegerLiteral> {
+auto range_literal(const ir::Expr& expr) -> std::optional<RangeLiteral> {
     const auto* literal = std::get_if<ir::Literal>(&expr.node);
     if (literal == nullptr) {
         return std::nullopt;
     }
     if (const auto* integer = std::get_if<std::int64_t>(&literal->value)) {
-        return IntegerLiteral{.value = *integer, .is_date = false};
+        return RangeLiteral{.kind = RangeLiteral::Kind::Int, .value = *integer};
     }
     if (const auto* date = std::get_if<Date>(&literal->value)) {
-        return IntegerLiteral{.value = date->days, .is_date = true};
+        return RangeLiteral{.kind = RangeLiteral::Kind::Date, .value = date->days};
+    }
+    if (const auto* real = std::get_if<double>(&literal->value)) {
+        return RangeLiteral{.kind = RangeLiteral::Kind::Double, .real = *real};
     }
     return std::nullopt;
 }
@@ -56,7 +63,7 @@ auto integer_literal(const ir::Expr& expr) -> std::optional<IntegerLiteral> {
 struct Term {
     std::string column;
     ir::CompareOp op = ir::CompareOp::Eq;
-    IntegerLiteral literal;
+    RangeLiteral literal;
 };
 
 auto as_term(const ir::Expr& expr) -> std::optional<Term> {
@@ -65,11 +72,11 @@ auto as_term(const ir::Expr& expr) -> std::optional<Term> {
         return std::nullopt;
     }
     const auto* column = ir::as_column_ref(*comparison->left);
-    auto literal = integer_literal(*comparison->right);
+    auto literal = range_literal(*comparison->right);
     auto op = comparison->op;
     if (column == nullptr || !literal.has_value()) {
         column = ir::as_column_ref(*comparison->right);
-        literal = integer_literal(*comparison->left);
+        literal = range_literal(*comparison->left);
         op = inverted_compare(op);
     }
     if (column == nullptr || column->lexical || !literal.has_value()) {
@@ -79,21 +86,82 @@ auto as_term(const ir::Expr& expr) -> std::optional<Term> {
 }
 
 /// Whether the ordinary filter compares these operands, so answering the
-/// comparison from raw int64 bits cannot change what the query means.
+/// comparison from raw int64 bits cannot change what the query means. A Date
+/// literal needs a Date column and a Double literal an Int column; an Int
+/// literal is compared with either.
 auto comparable(const Table& schema, const Term& term) -> bool {
     const auto* entry = schema.find_entry(term.column);
     if (entry == nullptr) {
         return false;
     }
-    if (std::holds_alternative<Column<Date>>(*entry->column)) {
-        return true;
+    const bool is_date = std::holds_alternative<Column<Date>>(*entry->column);
+    const bool is_int = std::holds_alternative<Column<std::int64_t>>(*entry->column);
+    switch (term.literal.kind) {
+        case RangeLiteral::Kind::Int:
+            return is_date || is_int;
+        case RangeLiteral::Kind::Date:
+            return is_date;
+        case RangeLiteral::Kind::Double:
+            return is_int;
     }
-    return !term.literal.is_date && std::holds_alternative<Column<std::int64_t>>(*entry->column);
+    return false;
+}
+
+/// Below this magnitude every integer bound derived from a double literal is
+/// exactly representable, and rounding an int64 to double is monotone, so
+/// comparing the column with the literal agrees with comparing it with the
+/// derived integer bound whether the comparison is exact or goes through
+/// double. Beyond it the literal stays an ordinary conjunct.
+constexpr double kExactDoubleLimit = 9007199254740992.0;  // 2^53
+
+/// Fold a comparison against a double literal into `filter` as integer bounds.
+auto absorb_real(ir::CompareOp op, double x, DynamicScanFilter& filter) -> bool {
+    if (!std::isfinite(x) || std::fabs(x) >= kExactDoubleLimit) {
+        return false;
+    }
+    const auto floor_x = static_cast<std::int64_t>(std::floor(x));
+    const auto ceil_x = static_cast<std::int64_t>(std::ceil(x));
+    const auto raise_min = [&](std::int64_t v) {
+        filter.min = filter.min.has_value() ? std::max(*filter.min, v) : v;
+    };
+    const auto lower_max = [&](std::int64_t v) {
+        filter.max = filter.max.has_value() ? std::min(*filter.max, v) : v;
+    };
+    switch (op) {
+        case ir::CompareOp::Gt:
+            raise_min(floor_x + 1);
+            return true;
+        case ir::CompareOp::Ge:
+            raise_min(ceil_x);
+            return true;
+        case ir::CompareOp::Lt:
+            lower_max(ceil_x - 1);
+            return true;
+        case ir::CompareOp::Le:
+            lower_max(floor_x);
+            return true;
+        case ir::CompareOp::Eq:
+            if (floor_x == ceil_x) {
+                raise_min(floor_x);
+                lower_max(floor_x);
+            } else {
+                // No integer equals a fractional literal: an empty interval.
+                filter.min = std::numeric_limits<std::int64_t>::max();
+                filter.max = std::numeric_limits<std::int64_t>::min();
+            }
+            return true;
+        case ir::CompareOp::Ne:
+            return false;
+    }
+    return false;
 }
 
 /// Fold `term` into `filter`. False when the interval cannot express it (`!=`,
 /// or a strict bound at the int64 extreme), and the term stays a conjunct.
 auto absorb(const Term& term, DynamicScanFilter& filter) -> bool {
+    if (term.literal.kind == RangeLiteral::Kind::Double) {
+        return absorb_real(term.op, term.literal.real, filter);
+    }
     std::int64_t value = term.literal.value;
     switch (term.op) {
         case ir::CompareOp::Eq:

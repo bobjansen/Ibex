@@ -77,6 +77,7 @@
 #include <vector>
 
 #include "dictionary_policy.hpp"
+#include "stats_range.hpp"
 
 namespace {
 
@@ -2347,6 +2348,10 @@ inline auto merge_column_stats(const parquet::FileMetaData& metadata, int leaf_i
             range_known = false;  // not an integer column
             continue;
         }
+        if (!ibex::parquet_stats::usable_signed_range(chunk_low, chunk_high)) {
+            range_known = false;
+            continue;
+        }
         if (group == 0 || chunk_low < low) {
             low = chunk_low;
         }
@@ -2593,7 +2598,8 @@ inline auto filtered_key_scan_groups(const parquet::FileMetaData& metadata, int 
                         static_cast<const parquet::TypedStatistics<DType>&>(*stats);
                     const auto group_min = static_cast<std::int64_t>(typed_stats.min());
                     const auto group_max = static_cast<std::int64_t>(typed_stats.max());
-                    skip = group_max < *filter.min || group_min > *filter.max;
+                    skip = ibex::parquet_stats::group_excluded(group_min, group_max, *filter.min,
+                                                               *filter.max);
                 }
             }
         }

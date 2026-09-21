@@ -9,6 +9,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -134,6 +135,19 @@ TEST_CASE("probed key restriction: only Left and Inner joins", "[ir][probed-keys
     auto inner = ir::restrict_aggregates_to_probed_keys(
         plan(ir::JoinKind::Inner, make_scan(ir::NodeId{3}, "probes")), stats());
     CHECK(restriction_of(*inner) != nullptr);
+}
+
+TEST_CASE("probed key restriction: declined when null keys match each other",
+          "[ir][probed-keys][regression]") {
+    // The inserted semi join uses `nulls never`, which would remove the
+    // aggregate's null-keyed group that a `nulls equal` join must still match.
+    auto join = std::make_unique<ir::JoinNode>(
+        ir::NodeId{10}, ir::JoinKind::Left, std::vector<ir::JoinKey>{ir::JoinKey{"k"}},
+        std::nullopt, ir::JoinSuffixPolicy{}, ir::NullMatch::Equal);
+    join->add_child(make_scan(ir::NodeId{3}, "probes"));
+    join->add_child(aggregate_over_facts());
+    auto root = ir::restrict_aggregates_to_probed_keys(std::move(join), stats());
+    CHECK(restriction_of(*root) == nullptr);
 }
 
 TEST_CASE("probed key restriction: declined when the probe side cannot be replayed",

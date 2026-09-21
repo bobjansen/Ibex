@@ -6,7 +6,12 @@
 #include <ibex/ir/replayable.hpp>
 
 #include <algorithm>
+#include <cstdint>
+#include <memory>
+#include <type_traits>
+#include <utility>
 #include <variant>
+#include <vector>
 
 namespace ibex::ir {
 namespace {

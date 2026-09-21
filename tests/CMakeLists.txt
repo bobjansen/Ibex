@@ -41,6 +41,7 @@ set(IBEX_TEST_SOURCES
     test_ir_column_origins.cpp
     test_parquet_dictionary_policy.cpp
     test_parquet_stats_range.cpp
+    test_static_range_filter.cpp
     test_ir_distinct_key_reduction.cpp
     test_ir_group_key_reduction.cpp
     test_ir_required_columns.cpp

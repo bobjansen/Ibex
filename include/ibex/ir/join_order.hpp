@@ -13,6 +13,11 @@
 
 namespace ibex::ir {
 
+/// Shared eligibility for costing and rebuilding a left-deep join chain.
+/// Only default equijoins can be rearranged without changing match selection,
+/// null matching, cardinality checks, or output naming.
+[[nodiscard]] auto is_reorderable_inner_join(const JoinNode& join) -> bool;
+
 /// A cost-driven order over the leaf relations of a left-deep inner equijoin
 /// chain. Indices refer to the chain's original left-to-right leaf order.
 /// `nullopt` means the tree is not a safe/known join graph yet, OR that some

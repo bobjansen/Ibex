@@ -152,6 +152,12 @@ auto rewrite_filter_over_join(NodePtr node, const SourceSchemas& sources) -> Nod
     auto& filter = node_cast<FilterNode>(*node);
     auto& join = node_cast<JoinNode>(*node->mutable_children().front());
     const JoinKind kind = join.kind();
+    // Filtering candidates before match selection can select a different
+    // right row instead of discarding the already-selected result. Filtering
+    // before a cardinality assertion can hide duplicate matches as well.
+    if (join.take() != MatchSelection::All || join.expect().asserts_anything()) {
+        return node;
+    }
     if (kind != JoinKind::Inner && kind != JoinKind::Left && kind != JoinKind::Right &&
         kind != JoinKind::Semi && kind != JoinKind::Anti) {
         return node;  // Outer/Cross/Asof: see the header's safety table.
@@ -298,7 +304,11 @@ auto rewrite_semi_over_join(NodePtr node, const SourceSchemas& sources) -> NodeP
     auto& inner = node_cast<JoinNode>(*outer.mutable_children()[0]);
     // Only an equi Inner join is safe to push through: Left/Right/Outer decide
     // which left rows survive, which the semi/anti filter would then race.
+    // Membership must be tested after choosing the match, too: pushing it
+    // into the right input can replace a rejected first/last match or hide
+    // duplicate matches that a cardinality assertion must reject.
     if (inner.kind() != JoinKind::Inner || inner.predicate().has_value() ||
+        inner.take() != MatchSelection::All || inner.expect().asserts_anything() ||
         inner.children().size() != 2 || inner.children()[0] == nullptr ||
         inner.children()[1] == nullptr) {
         return node;

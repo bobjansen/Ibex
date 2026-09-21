@@ -1138,14 +1138,13 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         // capture a reference meant for the left one; the predicate's column
         // references are rewritten to match, once, before the row loop.
         struct NLJRightCol {
-            const ColumnValue* column = nullptr;
+            const ColumnEntry* entry = nullptr;
             std::string batch_name;
         };
         std::vector<NLJRightCol> nlj_right;
         nlj_right.reserve(right.columns.size());
         for (const auto& entry : right.columns) {
-            nlj_right.push_back(
-                {.column = entry.column.get(), .batch_name = nlj_right_batch_name(entry.name)});
+            nlj_right.push_back({.entry = &entry, .batch_name = nlj_right_batch_name(entry.name)});
         }
 
         // Resolved once, above, so its diagnostics precede the output plan's.
@@ -1173,9 +1172,14 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 // output name here was invisible until a suffix clause made
                 // the two differ, and then `left(v)` could not find `v`.
                 batch.add_column(column.name, std::move(col));
+                // Broadcast validity along with the value. A null's stored
+                // payload must not become a real value in the predicate.
+                if (is_null(column, l)) {
+                    batch.columns.back().validity = ValidityBitmap(n_right, false);
+                }
             }
             for (const auto& item : nlj_right) {
-                batch.add_column(item.batch_name, *item.column);
+                batch.add_column_from(item.batch_name, *item.entry);
             }
 
             auto mask_res =

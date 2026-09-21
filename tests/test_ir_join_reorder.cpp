@@ -3,6 +3,7 @@
 
 #include <ibex/ir/builder.hpp>
 #include <ibex/ir/cardinality.hpp>
+#include <ibex/ir/join_order.hpp>
 #include <ibex/ir/join_reorder.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/schema.hpp>
@@ -88,6 +89,63 @@ TEST_CASE("join reorder changes an explicitly order-insensitive root chain", "[i
         ir::reorder_inner_joins_for_order_insensitive_root(std::move(chain), misordered_stats());
     REQUIRE(out->kind() == ir::NodeKind::Join);
     CHECK(scan_name(*out->children()[1]) == "customer");
+}
+
+TEST_CASE("join reorder declines semantic clauses anywhere in a chain",
+          "[ir][join_reorder][regression]") {
+    for (int clause = 0; clause < 8; ++clause) {
+        for (const bool on_inner : {false, true}) {
+            ir::Builder builder;
+            const auto make = [&](bool guarded, const std::string& key) {
+                ir::MatchSelection take = ir::MatchSelection::All;
+                ir::NullMatch nulls = ir::NullMatch::Never;
+                ir::JoinExpect expect;
+                ir::JoinSuffixPolicy suffix;
+                if (guarded) {
+                    switch (clause) {
+                        case 0:
+                            take = ir::MatchSelection::First;
+                            break;
+                        case 1:
+                            take = ir::MatchSelection::Last;
+                            break;
+                        case 2:
+                            take = ir::MatchSelection::Any;
+                            break;
+                        case 3:
+                            nulls = ir::NullMatch::Equal;
+                            break;
+                        case 4:
+                            expect.left = ir::JoinMultiplicity::One;
+                            break;
+                        case 5:
+                            expect.right = ir::JoinMultiplicity::One;
+                            break;
+                        case 6:
+                            expect.left = ir::JoinMultiplicity::One;
+                            expect.right = ir::JoinMultiplicity::One;
+                            break;
+                        case 7:
+                            suffix = {.present = true, .left = "_l", .right = "_r"};
+                            break;
+                    }
+                }
+                return std::make_unique<ir::JoinNode>(
+                    ir::NodeId{guarded ? 100U : 101U}, ir::JoinKind::Inner,
+                    std::vector<ir::JoinKey>{key}, std::nullopt, suffix, nulls, expect, take);
+            };
+            auto first = make(on_inner, "c_custkey");
+            first->add_child(builder.scan("customer"));
+            first->add_child(builder.scan("orders"));
+            auto chain = make(!on_inner, "o_orderkey");
+            chain->add_child(std::move(first));
+            chain->add_child(builder.scan("lineitem"));
+            CHECK_FALSE(ir::choose_inner_join_order(*chain, misordered_stats()).has_value());
+            auto out = ir::reorder_inner_joins_for_order_insensitive_root(std::move(chain),
+                                                                          misordered_stats());
+            CHECK(scan_name(*out->children()[1]) == "lineitem");
+        }
+    }
 }
 
 TEST_CASE("binding order proof requires every use to erase encounter order", "[ir][join_reorder]") {

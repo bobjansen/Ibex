@@ -16,6 +16,16 @@
 #include <vector>
 
 namespace ibex::ir {
+
+auto is_reorderable_inner_join(const JoinNode& join) -> bool {
+    return join.kind() == JoinKind::Inner && !join.predicate().has_value() &&
+           !join.keys().empty() && join_keys_are_folded(join.keys()) &&
+           join.take() == MatchSelection::All && join.null_match() == NullMatch::Never &&
+           !join.expect().asserts_anything() && !join.suffix().present &&
+           join.children().size() == 2 && join.children()[0] != nullptr &&
+           join.children()[1] != nullptr && join.children()[1]->kind() != NodeKind::Join;
+}
+
 namespace {
 
 struct Relation {
@@ -130,10 +140,7 @@ auto collect_left_deep(const Node& node, const SourceStats& stats, std::vector<R
     // `normalize_mapped_join_keys` supplies that name for safe mapped keys;
     // one that remains non-folded keeps its source order rather than being
     // costed on a guess.
-    if (join.kind() != JoinKind::Inner || join.predicate().has_value() || join.keys().empty() ||
-        !join_keys_are_folded(join.keys()) || join.children().size() != 2 ||
-        join.children()[0] == nullptr || join.children()[1] == nullptr ||
-        join.children()[1]->kind() == NodeKind::Join) {
+    if (!is_reorderable_inner_join(join)) {
         return false;
     }
     if (!collect_left_deep(*join.children()[0], stats, relations, edges, all_filters_sampled) ||

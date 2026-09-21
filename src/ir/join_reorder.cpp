@@ -68,10 +68,7 @@ auto scan_left_deep(const Node& node, std::vector<const Node*>& leaves, std::vec
     // `Edge::keys` are logical folded-output names. A mapped key that
     // `normalize_mapped_join_keys` could not safely fold keeps the order its
     // author wrote.
-    if (join.kind() != JoinKind::Inner || join.predicate().has_value() || join.keys().empty() ||
-        !join_keys_are_folded(join.keys()) || join.children().size() != 2 ||
-        join.children()[0] == nullptr || join.children()[1] == nullptr ||
-        join.children()[1]->kind() == NodeKind::Join) {
+    if (!is_reorderable_inner_join(join)) {
         return false;
     }
     if (!scan_left_deep(*join.children()[0], leaves, edges, leaf_key_names)) {
@@ -94,10 +91,7 @@ auto take_left_deep(NodePtr node, std::vector<NodePtr>& leaves, std::vector<Edge
     auto* join = node_cast<JoinNode>(node.get());
     // Must stay in lockstep with `scan_left_deep` above, including its reason
     // for rejecting mapped keys.
-    if (join->kind() != JoinKind::Inner || join->predicate().has_value() || join->keys().empty() ||
-        !join_keys_are_folded(join->keys()) || join->mutable_children().size() != 2 ||
-        join->mutable_children()[0] == nullptr || join->mutable_children()[1] == nullptr ||
-        join->mutable_children()[1]->kind() == NodeKind::Join) {
+    if (!is_reorderable_inner_join(*join)) {
         return false;
     }
     NodePtr left = std::move(join->mutable_children()[0]);

@@ -3,6 +3,8 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
+#include <ibex/ir/join_pushdown.hpp>
+#include <ibex/ir/join_reorder.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/schema.hpp>
 #include <ibex/parser/lower.hpp>
@@ -91,6 +93,154 @@ auto interpret_error_at_parse(std::string_view src) -> std::string {
 }
 
 }  // namespace
+
+TEST_CASE("join: nullable predicates preserve unmatched rows for every kind",
+          "[join][non-equijoin][regression]") {
+    for (const std::string kind : {"", "left ", "right ", "outer ", "semi ", "anti "}) {
+        for (const bool null_left : {false, true}) {
+            for (const bool null_right : {false, true}) {
+                CAPTURE(kind, null_left, null_right);
+                runtime::Table lhs;
+                lhs.add_column("lid", Column<std::int64_t>{1});
+                lhs.add_column("x", Column<std::int64_t>{0},
+                               runtime::ValidityBitmap(1, !null_left));
+                runtime::Table rhs;
+                rhs.add_column("rid", Column<std::int64_t>{2});
+                rhs.add_column("y", Column<std::int64_t>{1},
+                               runtime::ValidityBitmap(1, !null_right));
+                runtime::TableRegistry tables;
+                tables.emplace("lhs", std::move(lhs));
+                tables.emplace("rhs", std::move(rhs));
+                const auto out = interpret_expr("lhs " + kind + "join rhs on x < y;", tables);
+                const bool matched = !null_left && !null_right;
+                const bool membership = kind == "semi " || kind == "anti ";
+                const std::size_t expected =
+                    matched
+                        ? (kind == "anti " ? 0 : 1)
+                        : (kind == "outer "
+                               ? 2
+                               : (kind == "left " || kind == "right " || kind == "anti " ? 1 : 0));
+                REQUIRE(out.rows() == expected);
+                REQUIRE(out.columns.size() == (membership ? 2 : 4));
+                if (!matched && expected != 0 && !membership) {
+                    for (std::size_t row = 0; row < out.rows(); ++row) {
+                        CHECK(runtime::is_null(*out.find_entry("lid"), row) !=
+                              runtime::is_null(*out.find_entry("rid"), row));
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("join: pushdown preserves match selection before membership and filters",
+          "[join][ir][join_pushdown][regression]") {
+    runtime::Table a;
+    a.add_column("k", Column<std::int64_t>{1});
+    runtime::Table b;
+    b.add_column("k", Column<std::int64_t>{1, 1});
+    b.add_column("v", Column<std::int64_t>{10, 20});
+    runtime::Table z;
+    z.add_column("v", Column<std::int64_t>{10});
+    runtime::TableRegistry tables;
+    tables.emplace("a", std::move(a));
+    tables.emplace("b", std::move(b));
+    tables.emplace("z", std::move(z));
+    ir::SourceSchemas schemas;
+    schemas.emplace("a", ir::SchemaInfo::known({{.name = "k", .type = ir::ColumnType::Int64}}));
+    schemas.emplace("b", ir::SchemaInfo::known({{.name = "k", .type = ir::ColumnType::Int64},
+                                                {.name = "v", .type = ir::ColumnType::Int64}}));
+    schemas.emplace("z", ir::SchemaInfo::known({{.name = "v", .type = ir::ColumnType::Int64}}));
+    for (const std::string take : {"first", "last"}) {
+        for (const std::string tail :
+             {" anti join z on v", " semi join z on v", "[filter v == 10]", "[filter v == 20]"}) {
+            const std::string src =
+                "(a join b[order { v asc }] on k take " + take + ")" + tail + ";";
+            CAPTURE(src);
+            const auto expected = interpret_expr(src, tables);
+            auto parsed = parser::parse(src);
+            REQUIRE(parsed.has_value());
+            auto lowered = parser::lower(*parsed);
+            REQUIRE(lowered.has_value());
+            auto optimized = ir::push_filters_into_joins(std::move(*lowered), schemas);
+            optimized = ir::push_semi_joins_down(std::move(optimized), schemas);
+            const auto actual = runtime::interpret(*optimized, tables, nullptr, nullptr);
+            REQUIRE(actual.has_value());
+            CHECK(col_i64(*actual, "v") == col_i64(expected, "v"));
+        }
+    }
+}
+
+TEST_CASE("join: reordering preserves match selection null policy and assertions",
+          "[join][join_reorder][regression]") {
+    ir::SourceStats stats;
+    stats.schemas = {
+        {"a", ir::SchemaInfo::known({{.name = "k", .type = ir::ColumnType::Int64}})},
+        {"b", ir::SchemaInfo::known({{.name = "k", .type = ir::ColumnType::Int64},
+                                     {.name = "bid", .type = ir::ColumnType::Int64}})},
+        {"c", ir::SchemaInfo::known({{.name = "bid", .type = ir::ColumnType::Int64}})}};
+    stats.rows = {{"a", 6}, {"b", 7}, {"c", 1}};
+    stats.distinct = {{"a", {{"k", 6}}}, {"b", {{"k", 6}, {"bid", 7}}}, {"c", {{"bid", 1}}}};
+    for (const std::string clause : {"take first", "take last", "nulls equal", "expect n:1"}) {
+        CAPTURE(clause);
+        runtime::Table a, b, c;
+        runtime::ValidityBitmap av(6, true), bv(7, true);
+        if (clause == "nulls equal") {
+            av.set(0, false);
+            bv.set(0, false);
+            bv.set(1, false);
+        }
+        a.add_column("k", Column<std::int64_t>{1, 2, 3, 4, 5, 6}, av);
+        b.add_column("k", Column<std::int64_t>{1, 1, 2, 3, 4, 5, 6}, bv);
+        b.add_column("bid", Column<std::int64_t>{11, 12, 20, 30, 40, 50, 60});
+        c.add_column("bid", Column<std::int64_t>{clause == "take last" ? 11 : 12});
+        runtime::TableRegistry tables{
+            {"a", std::move(a)}, {"b", std::move(b)}, {"c", std::move(c)}};
+        const std::string src = "((a join b[order { bid asc }] on k " + clause +
+                                ") join c on bid)[select { n = count() }];";
+        auto parsed = parser::parse(src);
+        REQUIRE(parsed.has_value());
+        auto lowered = parser::lower(*parsed);
+        REQUIRE(lowered.has_value());
+        auto optimized = ir::reorder_inner_joins_for_aggregates(std::move(*lowered), stats);
+        auto out = runtime::interpret(*optimized, tables);
+        if (clause == "expect n:1") {
+            REQUIRE_FALSE(out.has_value());
+            CHECK(out.error().find("matches more than one") != std::string::npos);
+        } else {
+            REQUIRE(out.has_value());
+            CHECK(col_i64(*out, "n") == std::vector<std::int64_t>{clause == "nulls equal" ? 1 : 0});
+        }
+    }
+}
+
+TEST_CASE("join: pushdown cannot hide cardinality violations",
+          "[join][join_pushdown][regression]") {
+    runtime::Table a, b, z;
+    a.add_column("k", Column<std::int64_t>{1});
+    b.add_column("k", Column<std::int64_t>{1, 1});
+    b.add_column("v", Column<std::int64_t>{10, 20});
+    z.add_column("v", Column<std::int64_t>{10});
+    runtime::TableRegistry tables{{"a", std::move(a)}, {"b", std::move(b)}, {"z", std::move(z)}};
+    ir::SourceSchemas schemas{
+        {"a", ir::SchemaInfo::known({{.name = "k", .type = ir::ColumnType::Int64}})},
+        {"b", ir::SchemaInfo::known({{.name = "k", .type = ir::ColumnType::Int64},
+                                     {.name = "v", .type = ir::ColumnType::Int64}})},
+        {"z", ir::SchemaInfo::known({{.name = "v", .type = ir::ColumnType::Int64}})}};
+    for (const std::string tail :
+         {"[filter v == 10]", "[filter k == 2]", " semi join z on v", " anti join z on v"}) {
+        CAPTURE(tail);
+        auto parsed = parser::parse("(a join b on k expect n:1)" + tail + ";");
+        REQUIRE(parsed.has_value());
+        auto lowered = parser::lower(*parsed);
+        REQUIRE(lowered.has_value());
+        auto optimized = ir::push_filters_into_joins(std::move(*lowered), schemas);
+        optimized = ir::push_semi_joins_down(std::move(optimized), schemas);
+        auto out = runtime::interpret(*optimized, tables);
+        REQUIRE_FALSE(out.has_value());
+        CHECK(out.error().find("matches more than one") != std::string::npos);
+    }
+}
 
 TEST_CASE("join: inner join on single key", "[join]") {
     runtime::Table lhs;

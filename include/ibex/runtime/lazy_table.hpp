@@ -339,6 +339,20 @@ class LazyTable {
     [[nodiscard]] auto scan_key_filter(const std::string& key, const DynamicScanFilter& filter,
                                        const SourceUnit* unit, const ExecutionContext& exec)
         -> std::expected<std::optional<Selection>, std::string>;
+    /// Rows of `unit` (the whole source when null) that satisfy `conjuncts`,
+    /// decided inside the reader's decoder: the literal range on one integer
+    /// column is a fused key scan (footer statistics prune whole row groups),
+    /// and any conjuncts it does not express narrow the result. nullopt means
+    /// this source cannot answer and the ordinary path stands. With
+    /// `exact_shape_only` (a dynamic membership filter also applies, which
+    /// this path would drop) only a predicate that is entirely such a range over
+    /// a column `names` does not need is taken.
+    [[nodiscard]] auto static_range_selection(const std::vector<ir::Expr>& conjuncts,
+                                              const std::set<std::string>& names,
+                                              bool exact_shape_only, const SourceUnit* unit,
+                                              const ExecutionContext& exec,
+                                              const ScalarRegistry* scalars)
+        -> std::expected<std::optional<Selection>, std::string>;
     /// The conjunct columns eligible for staging through a selection; nullopt
     /// when any of them is variable-width and the staged path must be declined.
     [[nodiscard]] auto stageable_conjunct_columns(const std::vector<ir::Expr>& conjuncts) const

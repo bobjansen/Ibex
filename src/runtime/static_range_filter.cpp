@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <utility>
 #include <variant>
 
 namespace ibex::runtime {
@@ -50,85 +51,123 @@ auto integer_literal(const ir::Expr& expr) -> std::optional<IntegerLiteral> {
     return std::nullopt;
 }
 
+/// One `column <op> literal` comparison, normalized so the column is on the
+/// left.
+struct Term {
+    std::string column;
+    ir::CompareOp op = ir::CompareOp::Eq;
+    IntegerLiteral literal;
+};
+
+auto as_term(const ir::Expr& expr) -> std::optional<Term> {
+    const auto* comparison = std::get_if<ir::CompareExpr>(&expr.node);
+    if (comparison == nullptr || comparison->left == nullptr || comparison->right == nullptr) {
+        return std::nullopt;
+    }
+    const auto* column = ir::as_column_ref(*comparison->left);
+    auto literal = integer_literal(*comparison->right);
+    auto op = comparison->op;
+    if (column == nullptr || !literal.has_value()) {
+        column = ir::as_column_ref(*comparison->right);
+        literal = integer_literal(*comparison->left);
+        op = inverted_compare(op);
+    }
+    if (column == nullptr || column->lexical || !literal.has_value()) {
+        return std::nullopt;
+    }
+    return Term{.column = column->name, .op = op, .literal = *literal};
+}
+
 /// Whether the ordinary filter compares these operands, so answering the
 /// comparison from raw int64 bits cannot change what the query means.
-auto comparable(const Table& schema, const std::string& column, bool date_literal) -> bool {
-    const auto* entry = schema.find_entry(column);
+auto comparable(const Table& schema, const Term& term) -> bool {
+    const auto* entry = schema.find_entry(term.column);
     if (entry == nullptr) {
         return false;
     }
     if (std::holds_alternative<Column<Date>>(*entry->column)) {
         return true;
     }
-    return !date_literal && std::holds_alternative<Column<std::int64_t>>(*entry->column);
+    return !term.literal.is_date && std::holds_alternative<Column<std::int64_t>>(*entry->column);
+}
+
+/// Fold `term` into `filter`. False when the interval cannot express it (`!=`,
+/// or a strict bound at the int64 extreme), and the term stays a conjunct.
+auto absorb(const Term& term, DynamicScanFilter& filter) -> bool {
+    std::int64_t value = term.literal.value;
+    switch (term.op) {
+        case ir::CompareOp::Eq:
+            filter.min = filter.min.has_value() ? std::max(*filter.min, value) : value;
+            filter.max = filter.max.has_value() ? std::min(*filter.max, value) : value;
+            return true;
+        case ir::CompareOp::Le:
+            filter.max = filter.max.has_value() ? std::min(*filter.max, value) : value;
+            return true;
+        case ir::CompareOp::Ge:
+            filter.min = filter.min.has_value() ? std::max(*filter.min, value) : value;
+            return true;
+        case ir::CompareOp::Lt:
+            if (value == std::numeric_limits<std::int64_t>::min()) {
+                return false;
+            }
+            --value;
+            filter.max = filter.max.has_value() ? std::min(*filter.max, value) : value;
+            return true;
+        case ir::CompareOp::Gt:
+            if (value == std::numeric_limits<std::int64_t>::max()) {
+                return false;
+            }
+            ++value;
+            filter.min = filter.min.has_value() ? std::max(*filter.min, value) : value;
+            return true;
+        case ir::CompareOp::Ne:
+            return false;
+    }
+    return false;
 }
 
 }  // namespace
 
-auto static_range_filter(const std::vector<ir::Expr>& conjuncts, const Table& schema)
-    -> std::optional<std::pair<std::string, DynamicScanFilter>> {
-    if (conjuncts.empty()) {
+auto split_static_range(const std::vector<ir::Expr>& conjuncts, const Table& schema)
+    -> std::optional<StaticRange> {
+    std::vector<std::optional<Term>> terms;
+    terms.reserve(conjuncts.size());
+    for (const auto& conjunct : conjuncts) {
+        terms.push_back(as_term(conjunct));
+    }
+
+    // The first column the reader can answer.
+    std::optional<std::string> column;
+    for (const auto& term : terms) {
+        if (term.has_value() && comparable(schema, *term)) {
+            column = term->column;
+            break;
+        }
+    }
+    if (!column.has_value()) {
         return std::nullopt;
     }
-    std::optional<std::string> name;
-    bool any_date_literal = false;
-    DynamicScanFilter filter;
-    for (const auto& expr : conjuncts) {
-        const auto* comparison = std::get_if<ir::CompareExpr>(&expr.node);
-        if (comparison == nullptr || comparison->left == nullptr || comparison->right == nullptr ||
-            comparison->op == ir::CompareOp::Ne) {
-            return std::nullopt;
-        }
-        const auto* column = ir::as_column_ref(*comparison->left);
-        auto literal = integer_literal(*comparison->right);
-        auto op = comparison->op;
-        if (column == nullptr || !literal.has_value()) {
-            column = ir::as_column_ref(*comparison->right);
-            literal = integer_literal(*comparison->left);
-            op = inverted_compare(op);
-        }
-        if (column == nullptr || column->lexical || !literal.has_value()) {
-            return std::nullopt;
-        }
-        if (name.has_value() && *name != column->name) {
-            return std::nullopt;
-        }
-        name = column->name;
-        any_date_literal = any_date_literal || literal->is_date;
-        std::int64_t value = literal->value;
-        switch (op) {
-            case ir::CompareOp::Eq:
-                filter.min = filter.min.has_value() ? std::max(*filter.min, value) : value;
-                filter.max = filter.max.has_value() ? std::min(*filter.max, value) : value;
-                break;
-            case ir::CompareOp::Le:
-                filter.max = filter.max.has_value() ? std::min(*filter.max, value) : value;
-                break;
-            case ir::CompareOp::Ge:
-                filter.min = filter.min.has_value() ? std::max(*filter.min, value) : value;
-                break;
-            case ir::CompareOp::Lt:
-                if (value == std::numeric_limits<std::int64_t>::min()) {
-                    return std::nullopt;
-                }
-                --value;
-                filter.max = filter.max.has_value() ? std::min(*filter.max, value) : value;
-                break;
-            case ir::CompareOp::Gt:
-                if (value == std::numeric_limits<std::int64_t>::max()) {
-                    return std::nullopt;
-                }
-                ++value;
-                filter.min = filter.min.has_value() ? std::max(*filter.min, value) : value;
-                break;
-            case ir::CompareOp::Ne:
+
+    StaticRange out;
+    out.column = *column;
+    bool absorbed_any = false;
+    for (std::size_t i = 0; i < conjuncts.size(); ++i) {
+        const auto& term = terms[i];
+        if (term.has_value() && term->column == *column) {
+            if (!comparable(schema, *term)) {
                 return std::nullopt;
+            }
+            if (absorb(*term, out.filter)) {
+                absorbed_any = true;
+                continue;
+            }
         }
+        out.rest.push_back(conjuncts[i]);
     }
-    if (!name.has_value() || !comparable(schema, *name, any_date_literal)) {
+    if (!absorbed_any) {
         return std::nullopt;
     }
-    return std::pair{std::move(*name), std::move(filter)};
+    return out;
 }
 
 }  // namespace ibex::runtime

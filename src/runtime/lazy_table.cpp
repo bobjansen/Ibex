@@ -574,29 +574,30 @@ auto LazyTable::project_where(const std::set<std::string>& names,
         return project(names, exec);
     }
 
-    // A predicate-only literal range can be decided by a reader while it
-    // decodes the key, leaving only the selected payload columns to decode.
-    // This is intentionally all-or-nothing: a source decline falls through to
-    // the established decode-and-filter path unchanged.
+    // A literal range on one integer column can be decided by the reader while
+    // it decodes that key, and its footer statistics skip whole row groups; what
+    // the range does not express narrows the result afterwards. A source that
+    // declines falls through to the established decode-and-filter path.
     if (reader_factory_ && !conjuncts.empty()) {
-        if (auto range = static_range_filter(conjuncts, schema_);
-            range.has_value() && !names.contains(range->first) && !cache_.contains(range->first)) {
-            auto scan = scan_key_filter(range->first, range->second, nullptr, exec);
-            if (!scan)
-                return std::unexpected(scan.error());
-            if (scan->has_value()) {
-                const Selection& selected = **scan;
-                const bool all_rows = selected.size() == rows_;
-                std::vector<std::string> wanted;
-                for (const auto& field : schema_.columns)
-                    if (names.contains(field.name))
-                        wanted.push_back(field.name);
-                auto decoded =
-                    decode_columns(wanted, all_rows ? nullptr : &selected, nullptr, exec);
-                if (!decoded)
-                    return std::unexpected(decoded.error());
-                return std::move(*decoded);
+        auto answered =
+            static_range_selection(conjuncts, names, membership, nullptr, exec, scalars);
+        if (!answered) {
+            return std::unexpected(answered.error());
+        }
+        if (answered->has_value()) {
+            const Selection& selected = **answered;
+            const bool all_rows = selected.size() == rows_;
+            std::vector<std::string> wanted;
+            for (const auto& field : schema_.columns) {
+                if (names.contains(field.name)) {
+                    wanted.push_back(field.name);
+                }
             }
+            auto decoded = decode_columns(wanted, all_rows ? nullptr : &selected, nullptr, exec);
+            if (!decoded) {
+                return std::unexpected(decoded.error());
+            }
+            return std::move(*decoded);
         }
     }
 
@@ -879,23 +880,24 @@ auto LazyTable::project_where_unit(const std::set<std::string>& names,
     }
 
     if (reader_factory_ && !conjuncts.empty()) {
-        if (auto range = static_range_filter(conjuncts, schema_);
-            range.has_value() && !names.contains(range->first) && !cache_.contains(range->first)) {
-            auto scan = scan_key_filter(range->first, range->second, &unit, exec);
-            if (!scan)
-                return std::unexpected(scan.error());
-            if (scan->has_value()) {
-                const Selection& selected = **scan;
-                const bool all_rows = selected.size() == unit.rows;
-                std::vector<std::string> wanted;
-                for (const auto& field : schema_.columns)
-                    if (names.contains(field.name))
-                        wanted.push_back(field.name);
-                auto decoded = decode_columns(wanted, all_rows ? nullptr : &selected, &unit, exec);
-                if (!decoded)
-                    return std::unexpected(decoded.error());
-                return std::move(*decoded);
+        auto answered = static_range_selection(conjuncts, names, membership, &unit, exec, scalars);
+        if (!answered) {
+            return std::unexpected(answered.error());
+        }
+        if (answered->has_value()) {
+            const Selection& selected = **answered;
+            const bool all_rows = selected.size() == unit.rows;
+            std::vector<std::string> wanted;
+            for (const auto& field : schema_.columns) {
+                if (names.contains(field.name)) {
+                    wanted.push_back(field.name);
+                }
             }
+            auto decoded = decode_columns(wanted, all_rows ? nullptr : &selected, &unit, exec);
+            if (!decoded) {
+                return std::unexpected(decoded.error());
+            }
+            return std::move(*decoded);
         }
     }
 
@@ -1254,6 +1256,57 @@ auto LazyTable::stageable_conjunct_columns(const std::vector<ir::Expr>& conjunct
 ///
 /// nullopt = the conjuncts reference no column of this source, which this shape
 /// cannot stage; the caller keeps its whole-column path.
+auto LazyTable::static_range_selection(const std::vector<ir::Expr>& conjuncts,
+                                       const std::set<std::string>& names, bool exact_shape_only,
+                                       const SourceUnit* unit, const ExecutionContext& exec,
+                                       const ScalarRegistry* scalars)
+    -> std::expected<std::optional<Selection>, std::string> {
+    auto range = split_static_range(conjuncts, schema_);
+    if (!range.has_value() || cache_.contains(range->column)) {
+        return std::optional<Selection>{};  // a cached key is cheaper tested in memory
+    }
+    if (exact_shape_only && (!range->rest.empty() || names.contains(range->column))) {
+        return std::optional<Selection>{};
+    }
+    // Decided before scanning: an unstageable remainder would waste the scan.
+    if (!range->rest.empty() && !stageable_conjunct_columns(range->rest).has_value()) {
+        return std::optional<Selection>{};
+    }
+    // When the key is also an output column it is decoded a second time for the
+    // rows that pass, so the scan has to reject more to pay for itself.
+    if (names.contains(range->column)) {
+        range->filter.footer_pass_rate_limit = 0.5;
+    }
+    auto scan = scan_key_filter(range->column, range->filter, unit, exec);
+    if (!scan) {
+        return std::unexpected(scan.error());
+    }
+    if (!scan->has_value()) {
+        return std::optional<Selection>{};  // unsupported type, or nothing rejected
+    }
+    Selection selected = std::move(**scan);
+    if (range->rest.empty()) {
+        return std::optional{std::move(selected)};
+    }
+    // The range left no row to evaluate the remainder on, and most streamed
+    // units are like this. The ordinary path evaluates every conjunct over the
+    // whole column, so it reports a type error in one that the range emptied;
+    // evaluating them over the zero-row schema table reports it here too,
+    // without decoding anything.
+    if (selected.empty()) {
+        auto checked = filter_selection(schema_, range->rest, exec, scalars);
+        if (!checked) {
+            return std::unexpected(checked.error());
+        }
+        return std::optional{std::move(selected)};
+    }
+    auto narrowed = narrow_selection(selected, range->rest, exec, scalars);
+    if (!narrowed) {
+        return std::unexpected(narrowed.error());
+    }
+    return narrowed;
+}
+
 auto LazyTable::narrow_selection(const Selection& selected, const std::vector<ir::Expr>& conjuncts,
                                  const ExecutionContext& exec, const ScalarRegistry* scalars)
     -> std::expected<std::optional<Selection>, std::string> {

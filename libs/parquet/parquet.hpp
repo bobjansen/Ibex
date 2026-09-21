@@ -54,6 +54,7 @@
 #include <curl/curl.h>
 #endif
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -2588,7 +2589,9 @@ inline auto filtered_key_scan_groups(const parquet::FileMetaData& metadata, int 
     for (int group = 0; group < metadata.num_row_groups(); ++group) {
         const auto group_rows = static_cast<std::size_t>(metadata.RowGroup(group)->num_rows());
         bool skip = false;
-        if (filter.min.has_value() && filter.max.has_value()) {
+        // One bound is enough to prune: `ts >= X` over a sorted key skips every
+        // group below X without a max to compare against.
+        if (filter.min.has_value() || filter.max.has_value()) {
             const auto chunk = metadata.RowGroup(group)->ColumnChunk(leaf_index);
             if (chunk->is_stats_set()) {
                 const auto stats = chunk->statistics();
@@ -2598,8 +2601,10 @@ inline auto filtered_key_scan_groups(const parquet::FileMetaData& metadata, int 
                         static_cast<const parquet::TypedStatistics<DType>&>(*stats);
                     const auto group_min = static_cast<std::int64_t>(typed_stats.min());
                     const auto group_max = static_cast<std::int64_t>(typed_stats.max());
-                    skip = ibex::parquet_stats::group_excluded(group_min, group_max, *filter.min,
-                                                               *filter.max);
+                    skip = ibex::parquet_stats::group_excluded(
+                        group_min, group_max,
+                        filter.min.value_or(std::numeric_limits<std::int64_t>::min()),
+                        filter.max.value_or(std::numeric_limits<std::int64_t>::max()));
                 }
             }
         }
@@ -2609,6 +2614,50 @@ inline auto filtered_key_scan_groups(const parquet::FileMetaData& metadata, int 
         base += group_rows;
     }
     return groups;
+}
+
+/// Fraction of the rows in scope (the file, or `unit`'s row group) that sit in
+/// row groups whose footer range lies wholly inside the filter's interval, i.e.
+/// rows the interval cannot reject. Nulls are ignored: they only make the true
+/// pass rate lower, and this decides whether to skip a scan, never which rows
+/// pass.
+template <typename DType>
+inline auto footer_covered_fraction(const parquet::FileMetaData& metadata, int leaf_index,
+                                    const ibex::runtime::DynamicScanFilter& filter,
+                                    const ibex::runtime::SourceUnit* unit) -> double {
+    if (!filter.min.has_value() && !filter.max.has_value()) {
+        return 0.0;
+    }
+    const auto lo = filter.min.value_or(std::numeric_limits<std::int64_t>::min());
+    const auto hi = filter.max.value_or(std::numeric_limits<std::int64_t>::max());
+    std::size_t total = 0;
+    std::size_t covered = 0;
+    std::size_t base = 0;
+    for (int group = 0; group < metadata.num_row_groups(); ++group) {
+        const auto group_rows = static_cast<std::size_t>(metadata.RowGroup(group)->num_rows());
+        const bool in_scope =
+            unit == nullptr || (base >= unit->start && base < unit->start + unit->rows);
+        base += group_rows;
+        if (!in_scope) {
+            continue;
+        }
+        total += group_rows;
+        const auto chunk = metadata.RowGroup(group)->ColumnChunk(leaf_index);
+        if (!chunk->is_stats_set()) {
+            continue;
+        }
+        const auto stats = chunk->statistics();
+        if (stats == nullptr || !stats->HasMinMax() || stats->physical_type() != DType::type_num) {
+            continue;
+        }
+        const auto& typed_stats = static_cast<const parquet::TypedStatistics<DType>&>(*stats);
+        if (ibex::parquet_stats::group_covered(static_cast<std::int64_t>(typed_stats.min()),
+                                               static_cast<std::int64_t>(typed_stats.max()), lo,
+                                               hi)) {
+            covered += group_rows;
+        }
+    }
+    return total == 0 ? 0.0 : static_cast<double>(covered) / static_cast<double>(total);
 }
 
 /// The abandon rule itself, over totals accumulated in file order. Both the
@@ -3263,6 +3312,17 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
                                       ->Column(leaf_index)
                                       ->physical_type();
             const auto& metadata = *reader_->parquet_reader()->metadata();
+            // A range that leaves most rows in place is answered by the ordinary
+            // path without paying for a scan to find that out. Only for a
+            // range-only filter: a Bloom can reject inside the interval.
+            if (!filter.bloom.has_value() &&
+                (physical == parquet::Type::INT64
+                     ? footer_covered_fraction<parquet::Int64Type>(metadata, leaf_index, filter,
+                                                                   unit)
+                     : footer_covered_fraction<parquet::Int32Type>(
+                           metadata, leaf_index, filter, unit)) > filter.footer_pass_rate_limit) {
+                return std::optional<ibex::runtime::Selection>{};
+            }
             const auto target = scan_shard_target(unit, exec);
             if (physical == parquet::Type::INT64) {
                 const auto groups = restrict_to_unit(

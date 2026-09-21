@@ -1,0 +1,5 @@
+// Reject the selected match, without selecting a replacement from b.
+let a = Table { k = [1, 2] };
+let b = Table { k = [1, 1, 2], v = [10, 20, 30] };
+let z = Table { v = [10] };
+((a join b[order { v asc }] on k take first) anti join z on v)[order { k asc }];

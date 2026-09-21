@@ -7,6 +7,7 @@ add_library(ibex_test_warning_suppressions INTERFACE)
 
 set(IBEX_TEST_SOURCES
     catch_string_view_apple.cpp
+    test_aggregate_regressions.cpp
     test_adbc_options.cpp
     test_arrow_c_data.cpp
     test_args.cpp

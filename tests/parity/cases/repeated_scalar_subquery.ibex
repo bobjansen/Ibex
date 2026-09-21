@@ -1,0 +1,10 @@
+// Both comparisons reuse each scalar result. Missing correlated groups must
+// still read as count 0, and an empty uncorrelated count must broadcast 0.
+let parts = Table { k = [1, 2, 3], name = ["one", "two", "three"] };
+let supply = Table { k = [1, 1], v = [5, 7] };
+parts[filter
+    0 == scalar(supply[filter k == outer(k), select { n = count() }]) &&
+    scalar(supply[filter k == outer(k), select { n = count() }]) < 1 &&
+    0 == scalar(supply[filter v < 0, select { n = count() }]) &&
+    scalar(supply[filter v < 0, select { n = count() }]) < 1
+];

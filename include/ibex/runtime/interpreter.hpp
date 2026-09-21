@@ -509,6 +509,12 @@ struct DynamicScanFilter {
     std::vector<std::int64_t> in_list;
     /// Approximate membership; false positives only.
     std::optional<JoinBloomFilter> bloom;
+    /// A range-only filter (no `bloom`) is not worth a fused scan when the
+    /// interval leaves most rows in place, and the source can tell from its
+    /// footer before reading a page: it declines when row groups lying wholly
+    /// inside [min, max] hold more than this fraction of the rows. Lower when
+    /// the caller will decode the key again for the rows that pass.
+    double footer_pass_rate_limit = 0.75;
 
     [[nodiscard]] auto has_membership() const noexcept -> bool { return bloom.has_value(); }
 

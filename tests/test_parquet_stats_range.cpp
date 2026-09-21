@@ -40,3 +40,27 @@ TEST_CASE("parquet stats: a range wholly above 2^63 still orders consistently",
     CHECK(stats::group_excluded(low, high, 0, 100));
     CHECK_FALSE(stats::group_excluded(low, high, low, low));
 }
+
+TEST_CASE("parquet stats: an unbounded side never excludes a group", "[parquet][stats]") {
+    // `ts >= 100` has no upper bound and `ts <= 5` no lower one; the scan passes
+    // the missing side as the int64 extreme.
+    constexpr auto lo = std::numeric_limits<std::int64_t>::min();
+    constexpr auto hi = std::numeric_limits<std::int64_t>::max();
+    CHECK(stats::group_excluded(0, 50, 100, hi));  // whole group below the bound
+    CHECK_FALSE(stats::group_excluded(0, 150, 100, hi));
+    CHECK(stats::group_excluded(10, 50, lo, 5));  // whole group above the bound
+    CHECK_FALSE(stats::group_excluded(0, 50, lo, 5));
+    CHECK_FALSE(stats::group_excluded(0, 50, lo, hi));
+}
+
+TEST_CASE("parquet stats: a group is covered only when its whole range is inside the interval",
+          "[parquet][stats]") {
+    CHECK(stats::group_covered(10, 20, 0, 100));
+    CHECK(stats::group_covered(0, 100, 0, 100));
+    CHECK_FALSE(stats::group_covered(-1, 20, 0, 100));
+    CHECK_FALSE(stats::group_covered(10, 101, 0, 100));
+    // An inverted (unsigned, 2^63-spanning) range is never trusted either way.
+    CHECK_FALSE(stats::group_covered(0, std::numeric_limits<std::int64_t>::min() + 3,
+                                     std::numeric_limits<std::int64_t>::min(),
+                                     std::numeric_limits<std::int64_t>::max()));
+}

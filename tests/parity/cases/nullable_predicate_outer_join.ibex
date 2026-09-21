@@ -1,0 +1,6 @@
+// A null on either side must not compare as its underlying zero payload.
+let ids = Table { id = [1, 2] };
+let values = Table { id = [1], x = [0] };
+let l = (ids left join values on id)[select { lid = id, x }];
+let r = (ids left join values on id)[select { rid = id, y = x }];
+(l outer join r on x == y)[order { lid asc, rid asc }];

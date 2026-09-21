@@ -1,0 +1,4 @@
+// Both k = 2 left rows pick the same right row; the other one is padded, not dropped.
+let a = Table { k = [1, 2, 2, 3], x = [1, 2, 3, 4] };
+let b = Table { k = [2, 2, 3, 4], y = [10, 20, 30, 40] };
+(a outer join b[order { y asc }] on k take first)[order { y asc, x asc }];

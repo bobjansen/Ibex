@@ -436,6 +436,16 @@ TEST_CASE("deferrable_probe_scans: bare right-side scan of an inner join is elig
     CHECK_FALSE(ir::deferrable_probe_scans(*plan, {"build"}).contains("build"));
 }
 
+TEST_CASE("deferrable_probe_scans: a `nulls equal` join is declined",
+          "[ir][scan_predicates][deferred_scan][regression]") {
+    auto join = std::make_unique<ir::JoinNode>(
+        ir::NodeId{20}, ir::JoinKind::Inner, std::vector<ir::JoinKey>{ir::JoinKey{"id"}},
+        std::nullopt, ir::JoinSuffixPolicy{}, ir::NullMatch::Equal);
+    join->add_child(make_scan("build"));
+    join->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
+    CHECK_FALSE(ir::deferrable_probe_scans(*join, {"t"}).contains("t"));
+}
+
 TEST_CASE("deferrable_probe_scans: an unfiltered build side is declined",
           "[ir][scan_predicates][deferred_scan]") {
     // The row-count gate alone says yes -- 1.5M build rows against 12M probe

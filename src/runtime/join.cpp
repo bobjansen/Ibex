@@ -849,7 +849,9 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
     /// Rewrite the emitted pairs so each left row keeps one match. Rows with no
     /// match (an outer join's padding) are left alone: there is nothing to
-    /// choose between.
+    /// choose between. A preserved right row that loses all its matches to
+    /// other left rows is padded, since a right or outer join keeps every
+    /// right row.
     auto apply_take = [&](MutableJoinIndices indices) {
         auto& left_idx = *indices.left;
         auto& right_idx = *indices.right;
@@ -875,6 +877,10 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             return;  // nothing had a second match
         }
         std::vector<std::uint8_t> emitted(n_left, 0U);
+        std::vector<std::uint8_t> right_kept;
+        if (preserve_right_rows) {
+            right_kept.assign(n_right, 0U);
+        }
         std::vector<std::size_t> out_left;
         std::vector<std::size_t> out_right;
         std::vector<std::size_t> out_key;
@@ -893,6 +899,24 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             out_right.push_back(r);
             if (!key_right_idx.empty()) {
                 out_key.push_back(key_right_idx[i]);
+            }
+            if (preserve_right_rows && r != kNull) {
+                right_kept[r] = 1U;
+            }
+        }
+        // `take` picks pairs; it does not decide which rows a right or outer
+        // join preserves. A right row whose every match went to some other
+        // left row now has no pair, so it is emitted as the unmatched row it
+        // has become, exactly as if it had never matched.
+        if (preserve_right_rows) {
+            for (std::size_t r = 0; r < n_right; ++r) {
+                if (right_kept[r] != 0U) {
+                    continue;
+                }
+                out_key.resize(out_left.size(), kNull);
+                out_left.push_back(kNull);
+                out_right.push_back(r);
+                out_key.push_back(r);
             }
         }
         left_idx = std::move(out_left);

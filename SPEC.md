@@ -2309,6 +2309,9 @@ trades join quotes[order { ts asc }] on symbol take first
   row — that is a property of this implementation, not a promise.
 - A row with no match has nothing to choose between, so an outer join's padded
   rows are unaffected.
+- `take` chooses pairs; it never changes which rows a join preserves. On a
+  `right` or `outer` join, a right row whose every match was taken by other left
+  rows is emitted null-padded, exactly as an unmatched right row is.
 - `expect` describes how the inputs match, so it is checked **before** `take`
   drops anything. Otherwise `take first` would satisfy every `expect n:1` by
   construction.

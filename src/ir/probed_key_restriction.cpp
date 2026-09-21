@@ -170,6 +170,11 @@ void rewrite(Node& node, const SourceStats& stats, std::uint64_t& next) {
     if (join.kind() != JoinKind::Left && join.kind() != JoinKind::Inner) {
         return;
     }
+    // The restriction is a `nulls never` semi join, so it would drop a
+    // null-keyed group the probe side's null key is entitled to match.
+    if (join.null_match() != NullMatch::Never) {
+        return;
+    }
     if (join.children().size() != 2 || join.children()[1] == nullptr) {
         return;
     }

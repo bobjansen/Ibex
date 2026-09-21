@@ -15,6 +15,7 @@
 #include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -211,6 +212,64 @@ TEST_CASE("join: reordering preserves match selection null policy and assertions
             REQUIRE(out.has_value());
             CHECK(col_i64(*out, "n") == std::vector<std::int64_t>{clause == "nulls equal" ? 1 : 0});
         }
+    }
+}
+
+TEST_CASE("join: take keeps right rows that lose every match on right and outer joins",
+          "[join][take][regression]") {
+    // Both k=2 left rows pick the same right row, so the other k=2 right row
+    // has no selected pair. A right or outer join preserves every right row,
+    // so it must come back padded rather than vanish.
+    const auto make_tables = [] {
+        runtime::Table a;
+        a.add_column("k", Column<std::int64_t>{1, 2, 2, 3});
+        a.add_column("x", Column<std::int64_t>{1, 2, 3, 4});
+        runtime::Table b;
+        b.add_column("k", Column<std::int64_t>{2, 2, 3, 4});
+        b.add_column("y", Column<std::int64_t>{10, 20, 30, 40});
+        runtime::TableRegistry tables;
+        tables.emplace("a", std::move(a));
+        tables.emplace("b", std::move(b));
+        return tables;
+    };
+    struct Case {
+        std::string kind;
+        std::string take;
+        std::int64_t picked;
+        std::int64_t dropped;
+    };
+    for (const auto& c : {Case{"right", "first", 10, 20}, Case{"right", "last", 20, 10},
+                          Case{"outer", "first", 10, 20}, Case{"outer", "last", 20, 10}}) {
+        CAPTURE(c.kind, c.take);
+        auto tables = make_tables();
+        const auto out = interpret_expr("(a " + c.kind + " join b[order { y asc }] on k take " +
+                                            c.take + ")[order { y asc, x asc }];",
+                                        tables);
+        // Every right row is present exactly once as a pair or as padding.
+        auto ys = col_i64(out, "y");
+        std::vector<std::int64_t> present;
+        for (std::size_t row = 0; row < out.rows(); ++row) {
+            if (!runtime::is_null(*out.find_entry("y"), row)) {
+                present.push_back(ys[row]);
+            }
+        }
+        std::ranges::sort(present);
+        // `picked` serves both k=2 left rows; `dropped` appears once, padded.
+        std::vector<std::int64_t> expected{10, 20, 20, 30, 40};
+        if (c.picked == 10) {
+            expected = {10, 10, 20, 30, 40};
+        }
+        CHECK(present == expected);
+        std::size_t dropped_rows = 0;
+        for (std::size_t row = 0; row < out.rows(); ++row) {
+            if (!runtime::is_null(*out.find_entry("y"), row) && ys[row] == c.dropped) {
+                ++dropped_rows;
+                CHECK(runtime::is_null(*out.find_entry("x"), row));
+                CHECK(col_i64(out, "k")[row] == 2);  // the folded key comes from the right row
+            }
+        }
+        CHECK(dropped_rows == 1);
+        CHECK(out.rows() == (c.kind == "outer" ? 6U : 5U));
     }
 }
 

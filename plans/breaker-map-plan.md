@@ -534,26 +534,52 @@ takes closure from 674–754% down to 98.7%. This is §4.3's own diagnosis
 would close it is pushing the aggregate into the scan pipeline's workers")
 confirmed from a second angle — and it is item 5 below, still unbuilt.
 
-**Root cause, found in code, not just measured:** `cooperative_ring_wait`
-(`pipeline_executor.cpp`) — landed by
-[[project_cooperative_pipeline_waits]] — lets a thread parked on
+**Root cause, found in code, not just measured — then corrected
+(2026-09-22).** The first pass read `cooperative_ring_wait`
+(`pipeline_executor.cpp`, landed by
+[[project_cooperative_pipeline_waits]]) as letting a thread parked on
 `Aggregate.Discovery`'s own barrier run the SCAN's queued decode tasks while
-it waits (that's the whole point of the mechanism, and it is a real win).
-But that plan's own risk section called for an `AssistScope` profiling split
-to keep the two operators' time separate, and it was never built (verified:
-`AssistScope`/`AssistIdleScope` do not exist in the tree). So that assist
-interval is outside `RingWaitScope` (correct for the wait accounting) but
-still inside Discovery's `ExecutionProfileScope` (wraps the whole `next()`
-call) — it reads as Discovery's own exclusive `self_ms` on Discovery's row,
-while `worker_pool.cpp::run_task` *also* correctly credits the identical
-interval as `pool_work_ms` on the scan's row. The same physical time is
-double-booked across two rows, and `idle_core_ms = self*workers - pool_work`
-multiplies the borrowed half by `workers` on Discovery's side. This is not a
-`breaker_map.py` bug (§4.7's earlier fixes stand) — it is a real gap between
-that plan's design and what shipped. Building the `AssistScope` split there
-would likely fix q01/q11/q15's closure at the source, is scoped to one file
-(`execution_profile.cpp`/`pipeline_executor.cpp`), and is unrelated to item 5
-below — worth doing before item 5, not instead of it.
+it waits, and diagnosed the double-booking as living on Discovery's own row.
+That diagnosis was too quick. `Aggregate.Discovery`'s wait (`wait_for_batch`)
+only takes the cooperative-assist path when the waiting thread is itself a
+pool worker (`on_worker_pool_thread()`); for q01, Discovery runs on the
+**main thread**, not a pool thread, so its own wait never calls
+`try_run_one_pending` at all. Nothing on Discovery's row was double-counted.
+
+The double-booking is real, but it sits on the **scan's** row instead: a scan
+worker that hits ring backpressure inside its own task body calls
+`cooperative_ring_wait` from a pool thread and can pick up one of Discovery's
+queued tasks — that nesting runs inside `worker_pool.cpp::run_task`, which
+had no nesting-aware exclusive-time subtraction (unlike
+`ExecutionProfileScope`, which tracks `child_ns` for exactly this). A scan
+worker's outer `run_task` call that nests into running one of Discovery's
+tasks got that interval credited twice: correctly to Discovery's
+`pool_work_ns` (the inner, nested call), and again folded into the scan's own
+outer `pool_work_ns` (which had no way to subtract the nested portion). That
+inflated the scan's row, making its idle read more negative than it should —
+a real, narrow, now-fixed bug (commit `0fbb5e95`, thread-local nesting frame
+mirroring `ExecutionProfileScope::Frame::child_ns`).
+
+**This fix does not close q01/q11/q15's closure.** Discovery's own huge
+positive idle was never a self/child_ns accounting gap — its submitted batch
+genuinely has to queue behind the scan's long-lived worker tasks (which
+occupy the pool for the whole scan, not per-chunk), so Discovery's `self_ms`
+is dominated by real queueing delay under shared-pool contention.
+`idle_core_ms = self*workers - pool_work` has no way to distinguish "waiting
+my turn on a pool another operator is using" from "the pool being idle," and
+no per-row profiler fix changes that — it is the same structural limit
+described when this was first found. `is_reliable` (already shipped, above)
+remains the right mitigation: flag and exclude, don't try to make the row-
+level formula model cross-operator pool sharing.
+
+**Conclusion: closing q01/q11/q15's closure needs an architecture change, not
+a profiler fix — no-go for now.** The only way to make the row-level idle
+formula honest here is to stop the two operators from sharing one pool's
+queue during Discovery's wait (e.g. item 5's per-row-group private-state
+accumulation, which removes Discovery's fan-out entirely rather than
+asking the profiler to model its contention). No further profiler-side work
+is planned against this; the map's `UNRELIABLE` flag on these three queries
+stands as the intended long-term treatment. Proceeding to item 5.
 
 **Tool now flags rather than silently ranks.** Closure outside 50–175% marks a
 query `UNRELIABLE`, excludes it from the suite-wide family/boundary/label
@@ -612,13 +638,15 @@ join 46.7% / aggregate 33.7% / scan 15.8% / map 2.8%, `partial` boundary still
 4. **`Aggregate.FinalOrdering`** (§4.2's other half, 1,461 core-ms) — untouched,
    and the harder half: it already runs at occupancy 0.63–0.70, so the headroom
    is real but thinner than Emission's was.
-5. **The q01 shape: aggregate inside the scan pipeline.** §4.3's negative result
-   points at it — a breaker that fans out *while its producer is fanned out*
-   spends its time queueing, and no amount of work removed from either side
-   fixes that. Accumulating into per-row-group private state on the scan
-   worker removes the second fan-out entirely. This is the largest unbuilt
-   idea the map has produced, and the first one that is a scheduling change
-   rather than an operator change.
+5. **The q01 shape: aggregate inside the scan pipeline — next up (§4.7).**
+   §4.3's negative result points at it — a breaker that fans out *while its
+   producer is fanned out* spends its time queueing, and no amount of work
+   removed from either side fixes that. Accumulating into per-row-group
+   private state on the scan worker removes the second fan-out entirely.
+   This is the largest unbuilt idea the map has produced, and the first one
+   that is a scheduling change rather than an operator change. §4.7 confirmed
+   (2026-09-22) that closing q01/q11/q15's closure has no profiler-side fix —
+   this item is the only remaining path, and item 4 is deferred behind it.
 6. Re-measure the map. Every item above moves capacity between rows; the
    ranking after step 3 is not the ranking now.
 

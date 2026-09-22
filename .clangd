@@ -23,6 +23,7 @@ Diagnostics:
       - cppcoreguidelines-avoid-do-while
       - readability-trailing-comma
       - misc-non-private-member-variables-in-classes
+      - cppcoreguidelines-non-private-member-variables-in-classes
       - readability-implicit-bool-conversion
       - misc-no-recursion
       - readability-function-cognitive-complexity

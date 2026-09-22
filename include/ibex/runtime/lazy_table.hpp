@@ -68,6 +68,11 @@ struct StringScanFilter {
 /// each product owns its decoder cursor and other mutable backend state.
 class LazySourceReader {
    public:
+    LazySourceReader() = default;
+    LazySourceReader(const LazySourceReader&) = delete;
+    LazySourceReader(LazySourceReader&&) = delete;
+    auto operator=(const LazySourceReader&) -> LazySourceReader& = delete;
+    auto operator=(LazySourceReader&&) -> LazySourceReader& = delete;
     virtual ~LazySourceReader() = default;
 
     /// The source's streaming decomposition, in ascending row order and

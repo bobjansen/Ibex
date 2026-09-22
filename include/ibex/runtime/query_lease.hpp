@@ -41,7 +41,7 @@ auto release_query_execution() noexcept -> void;
 /// exception.
 class QueryExecutionLease {
    public:
-    QueryExecutionLease() noexcept { held_ = detail::try_claim_query_execution(); }
+    QueryExecutionLease() noexcept : held_(detail::try_claim_query_execution()) {}
     QueryExecutionLease(const QueryExecutionLease&) = delete;
     QueryExecutionLease(QueryExecutionLease&&) = delete;
     auto operator=(const QueryExecutionLease&) -> QueryExecutionLease& = delete;

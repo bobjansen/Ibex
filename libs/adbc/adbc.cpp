@@ -163,6 +163,10 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
             auto batch_guard = std::unique_ptr<::ArrowArray, void (*)(::ArrowArray*)>(
                 &batch, ibex::interop::release_arrow_array);
 
+            // ADBC record batches use the same Arrow C Data importer as direct
+            // Arrow input, including its zero-copy decimal128 `d:p,s` mapping.
+            // Keep decimal type interpretation in that shared boundary so the
+            // ADBC path cannot drift from Arrow C Data or Parquet semantics.
             auto imported = ibex::interop::adopt_table_from_arrow(&batch, schema_);
             if (!imported) {
                 finished_ = true;

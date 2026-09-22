@@ -16,6 +16,7 @@
 // Both were invisible at one chunk and wrong at two.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/env.hpp>
@@ -789,6 +790,30 @@ TEST_CASE("chunked aggregate: moment aggregates agree serially and in parallel",
             REQUIRE((*col)[i] != 0.0);
         }
     }
+}
+
+TEST_CASE("chunked Decimal sum and mean stream without materializing input",
+          "[runtime][chunked][aggregate][decimal]") {
+    constexpr std::size_t kRows = 200'000;
+    const DecimalType type{.precision = 8, .scale = 2};
+    auto value = runtime::make_decimal_column(type);
+    value.resize(kRows, Decimal{1});  // 0.01 per row
+    runtime::Table table;
+    table.add_column("x", std::move(value));
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(table));
+
+    const ChunkGrainGuard guard{"1024"};
+    const auto sum = run("t[select { total = sum(x) }];", registry);
+    const auto* total = std::get_if<Column<Decimal>>(sum.find("total"));
+    REQUIRE(total != nullptr);
+    CHECK(runtime::decimal_type_of(*total) == (DecimalType{.precision = 38, .scale = 2}));
+    CHECK((*total)[0].units == 200'000);
+
+    const auto mean = run("t[select { average = mean(x) }];", registry);
+    const auto* average = std::get_if<Column<double>>(mean.find("average"));
+    REQUIRE(average != nullptr);
+    CHECK((*average)[0] == 0.01);
 }
 
 TEST_CASE("chunked aggregate: output emission agrees serially and in parallel",

@@ -3093,6 +3093,9 @@ window argument (below); `lag` and `lead` do not.
 
 Rolling functions are **aggregate-like**: they produce one scalar per row
 (evaluated over the window) and are valid in both `select` and `update`.
+For Decimal inputs, `rolling_sum` returns `Decimal(38, s)`; `rolling_min`,
+`rolling_max`, `rolling_first`, and `rolling_last` preserve `Decimal(p, s)`.
+The statistical rolling functions still require an explicit `Float64` cast.
 
 **Window bounds.** `window_start()` and `window_end()` return the *nominal*
 bounds of the window a row belongs to (as `Timestamp`, or `Date` for a Date time
@@ -3175,9 +3178,11 @@ For `TimeFrame`, the current row order is the time-index ordering.
 | `cumsum(col)`   | Running sum: result[i] = col[0] + col[1] + ... + col[i]           |
 | `cumprod(col)`  | Running product: result[i] = col[0] * col[1] * ... * col[i]       |
 
-Both functions accept `Int` or `Float` columns and return the same type as the
-input. They are valid in both `select` and `update` blocks (DataFrame or
-TimeFrame), with or without a `window` clause.
+`cumsum` accepts `Int`, `Float`, and Decimal columns. Decimal cumulative sums
+return `Decimal(38, s)` and check every prefix for overflow. `cumprod` accepts
+`Int` and `Float`; Decimal multiplication changes scale at every step, so
+Decimal `cumprod` is not defined. The functions are valid in both `select` and
+`update` blocks (DataFrame or TimeFrame), with or without a `window` clause.
 
 ```
 df[select { cs = cumsum(price) }]
@@ -3770,7 +3775,7 @@ extern implementations. The recommended path for custom scalar logic is
 | `hour(t)`       | `Timestamp -> Int32`               |
 | `minute(t)`     | `Timestamp -> Int32`               |
 | `second(t)`     | `Timestamp -> Int32`               |
-| `round(x, mode)`| `Float -> Int64`                   |
+| `round(x, mode)`| `Float64/Int64 -> Int64`; `Decimal(p,s) -> Decimal(p',0)` |
 
 These scalar functions, the cast constructors of Section 3.1.1
 (`Int64`/`Float64`/…), and `round` are row-wise: they may be used uniformly in
@@ -3792,8 +3797,11 @@ null). The null-handling exceptions are `is_null`/`is_not_null`, `coalesce`,
 and the fill/clean functions of Section 3.5 (`fill_null`, `null_if_nan`,
 `null_if_not_finite`), whose purpose is to consume null.
 
-`round(x, mode)` converts a `Float64` scalar or `Series<Float64>` to `Int64` /
-`Series<Int64>`. The mode is a bare identifier (not a string):
+`round(x, mode)` converts a `Float64` scalar or series to `Int64`; an `Int64`
+value is returned unchanged. For Decimal input it returns an exact scale-zero
+Decimal; the result precision is `min(38, max(1, p - s + 1))`. Decimal rounding
+applies to the scaled integer units without converting through Float64. The
+mode is a bare identifier (not a string):
 
 | Mode      | Behaviour                                  | C++ equivalent         |
 |-----------|--------------------------------------------|------------------------|
@@ -3813,8 +3821,8 @@ for contexts such as `select { hi = max(price) }, by symbol`. Row-wise
 `pmin` / `pmax` require comparable arguments of one type; `Int64` and
 `Float64` may be mixed and widen to `Float64`.
 
-Passing an `Int` or `Int` column is a type error. An unknown mode identifier
-is a runtime error.
+Passing a non-numeric value is a type error. An unknown mode identifier is a
+runtime error.
 
 ```
 round(3.7, nearest)   // → 4

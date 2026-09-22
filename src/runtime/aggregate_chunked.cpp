@@ -5565,6 +5565,14 @@ class DecimalAwareAggregateOperator final : public Operator {
         if (!first->has_value()) {
             rest = std::make_unique<ExhaustedOperator>();
         } else if (has_decimal_input(**first)) {
+            if (can_stream_decimal_sum(**first)) {
+                auto result = stream_decimal_sum(**first);
+                if (!result) {
+                    return std::unexpected(result.error());
+                }
+                done_ = true;
+                return std::optional<Chunk>{std::move(*result)};
+            }
             auto table = materialize_operator(
                 std::make_unique<PrependChunkOperator>(std::move(**first), std::move(child_)));
             if (!table.has_value()) {
@@ -5586,6 +5594,91 @@ class DecimalAwareAggregateOperator final : public Operator {
     }
 
    private:
+    [[nodiscard]] auto can_stream_decimal_sum(const Chunk& chunk) const -> bool {
+        if (!group_by_->empty() || aggregations_->size() != 1) {
+            return false;
+        }
+        const auto& agg = aggregations_->front();
+        if (agg.func != ir::AggFunc::Sum && agg.func != ir::AggFunc::Mean) {
+            return false;
+        }
+        return std::ranges::any_of(chunk.columns, [&](const ColumnEntry& column) {
+            return column.name == agg.column.name &&
+                   std::holds_alternative<Column<Decimal>>(*column.column);
+        });
+    }
+
+    [[nodiscard]] auto stream_decimal_sum(const Chunk& first) -> std::expected<Chunk, std::string> {
+        const auto& agg = aggregations_->front();
+        std::optional<DecimalType> input_type;
+        Int128 sum = 0;
+        std::int64_t valid_count = 0;
+        const auto consume = [&](const Chunk& chunk) -> std::expected<void, std::string> {
+            const auto it = std::ranges::find(chunk.columns, agg.column.name, &ColumnEntry::name);
+            if (it == chunk.columns.end() || it->column == nullptr) {
+                return std::unexpected("aggregate column not found: " + agg.column.name);
+            }
+            const auto* decimal_col = std::get_if<Column<Decimal>>(it->column.get());
+            if (decimal_col == nullptr) {
+                return std::unexpected("Decimal aggregate input changed type between chunks");
+            }
+            const DecimalType current_type = decimal_type_of(*decimal_col);
+            if (input_type.has_value() && *input_type != current_type) {
+                return std::unexpected("Decimal aggregate type changed between chunks");
+            }
+            input_type = current_type;
+            const Decimal* values = decimal_col->data();
+            for (std::size_t row = 0; row < decimal_col->size(); ++row) {
+                if (it->validity.has_value() && !(*it->validity)[row]) {
+                    continue;
+                }
+                if (!decimal::checked_add(sum, values[row].units, sum)) {
+                    return std::unexpected("decimal overflow: aggregate sum exceeds Decimal(38)");
+                }
+                ++valid_count;
+            }
+            return {};
+        };
+        if (auto consumed = consume(first); !consumed) {
+            return std::unexpected(consumed.error());
+        }
+        while (true) {
+            auto next = child_->next();
+            if (!next) {
+                return std::unexpected(next.error());
+            }
+            if (!next->has_value()) {
+                break;
+            }
+            if (auto consumed = consume(**next); !consumed) {
+                return std::unexpected(consumed.error());
+            }
+        }
+        const DecimalType type = input_type.value_or(DecimalType{});
+        Table output;
+        if (agg.func == ir::AggFunc::Sum) {
+            Column<Decimal> result = make_decimal_column(decimal::sum_result_type(type));
+            result.push_back(Decimal{sum});
+            std::optional<ValidityBitmap> validity;
+            if (valid_count == 0) {
+                validity.emplace(1, false);
+            }
+            output.add_column(agg.alias, ColumnValue{std::move(result)});
+            output.columns.back().validity = std::move(validity);
+        } else {
+            Column<double> result;
+            result.push_back(
+                valid_count > 0 ? decimal::divide_to_double(sum, type.scale, valid_count) : 0.0);
+            std::optional<ValidityBitmap> validity;
+            if (valid_count == 0) {
+                validity.emplace(1, false);
+            }
+            output.add_column(agg.alias, ColumnValue{std::move(result)});
+            output.columns.back().validity = std::move(validity);
+        }
+        return table_to_chunk(std::move(output));
+    }
+
     [[nodiscard]] auto has_decimal_input(const Chunk& chunk) const -> bool {
         for (const auto& agg : *aggregations_) {
             if (agg.func == ir::AggFunc::Count) {

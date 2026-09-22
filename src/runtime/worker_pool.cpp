@@ -100,12 +100,34 @@ struct Task {
     std::uint64_t gen = 0;
 };
 
+// Mirrors `ExecutionProfileScope`'s `Frame::child_ns`, but one level up: a
+// pool worker that hits ring backpressure inside its own task body can
+// cooperatively run a *nested* `run_task` (see `cooperative_ring_wait`). That
+// nested call records its own busy time into its own entry's `pool_work_ns`.
+// Without this, the outer task's own recording — `elapsed - parked` — still
+// includes the nested call's entire wall-clock span (both its busy and its
+// parked time; the nested call's own `take_pool_park_ns` drains the shared
+// counter before the outer task gets to read it), so that span is credited
+// twice: correctly to the nested entry, and again, folded in, to the outer
+// entry. `child_ns` here is the total wall time this thread spent inside
+// nested `run_task` calls while running the current one; the outer task
+// subtracts it before recording its own self time, the same way
+// `ExecutionProfileScope` subtracts child scopes.
+struct TaskProfileFrame {
+    TaskProfileFrame* parent = nullptr;
+    std::uint64_t child_ns = 0;
+};
+thread_local TaskProfileFrame* t_current_task_frame = nullptr;
+
 /// Runs one worker body and settles its slot in the batch. Exceptions are
 /// captured rather than propagated: a throw out of a pool thread would
 /// terminate the process, and the batch's owner rethrows deterministically
 /// (lowest worker id wins) from `wait()`.
 void run_task(const Task& task) {
     auto& state = *task.state;
+    TaskProfileFrame frame;
+    frame.parent = t_current_task_frame;
+    t_current_task_frame = &frame;
     const auto profile_start = state.profile_entry == nullptr
                                    ? std::chrono::steady_clock::time_point{}
                                    : std::chrono::steady_clock::now();
@@ -123,6 +145,7 @@ void run_task(const Task& task) {
         caught = std::current_exception();
     }
     t_running_gen = outer_gen;
+    t_current_task_frame = frame.parent;
     // Attribute the worker's time BEFORE settling the batch. `profile_entry`
     // points into the query's profile state, and nothing here keeps that alive:
     // the moment `remaining` reaches zero the waiter may return, finish the
@@ -138,8 +161,16 @@ void run_task(const Task& task) {
         // Clamped: the two are sampled by the same clock but the subtraction
         // must not underflow on an unsigned duration.
         const auto parked = std::min(take_pool_park_ns(), elapsed);
-        record_execution_profile_worker(state.profile_entry, elapsed - parked);
+        const auto own = elapsed - parked;
+        // See `TaskProfileFrame`: subtract time this task's body spent inside
+        // a nested `run_task`, which already recorded itself.
+        const auto nested = std::chrono::nanoseconds{
+            std::min<std::uint64_t>(frame.child_ns, static_cast<std::uint64_t>(own.count()))};
+        record_execution_profile_worker(state.profile_entry, own - nested);
         record_execution_profile_pool_idle(state.profile_entry, parked);
+        if (frame.parent != nullptr) {
+            frame.parent->child_ns += static_cast<std::uint64_t>(elapsed.count());
+        }
     }
     std::atomic<std::int32_t>* debit_to_settle = nullptr;
     {

@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <expected>
 #include <optional>
+#include <ranges>
 #include <robin_hood.h>
 #include <span>
 #include <string>
@@ -254,12 +255,12 @@ struct DeferredWrap {
     std::string tmp = "__ibex_scalar_src_" + std::to_string(counter++);
     ir::Expr residual{.node = ir::ColumnRef{.name = tmp, .lexical = true}};
     // Rebuild the wrapper layers inside-out.
-    for (auto it = wraps.rbegin(); it != wraps.rend(); ++it) {
+    for (auto& wrap : wraps | std::views::reverse) {
         ir::CallExpr call;
-        call.callee = it->callee;
+        call.callee = wrap.callee;
         call.args.emplace_back(std::move(residual));
-        if (it->extra_arg.has_value()) {
-            call.args.emplace_back(ir::Expr{.node = std::move(*it->extra_arg)});
+        if (wrap.extra_arg.has_value()) {
+            call.args.emplace_back(ir::Expr{.node = std::move(*wrap.extra_arg)});
         }
         residual = ir::Expr{.node = std::move(call)};
     }

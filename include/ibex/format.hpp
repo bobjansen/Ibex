@@ -25,7 +25,7 @@ auto format(format_string<Args...> pattern, Args&&... args) -> std::string {
 template <typename... Args>
 void print(std::FILE* stream, format_string<Args...> pattern, Args&&... args) {
     const auto text = std::format(pattern, std::forward<Args>(args)...);
-    std::fputs(text.c_str(), stream);
+    (void)std::fputs(text.c_str(), stream);
 }
 
 template <typename... Args>

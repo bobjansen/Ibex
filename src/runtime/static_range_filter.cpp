@@ -5,14 +5,18 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
-#include <ibex/ir/expr_predicates.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/runtime/interpreter.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
-#include <utility>
+#include <optional>
+#include <string>
 #include <variant>
+#include <vector>
 
 namespace ibex::runtime {
 

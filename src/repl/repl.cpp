@@ -526,8 +526,8 @@ void add_static_candidates(std::vector<std::string>& candidates) {
 }
 
 auto unique_sorted(std::vector<std::string> candidates) -> std::vector<std::string> {
-    std::sort(candidates.begin(), candidates.end());
-    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+    std::ranges::sort(candidates);
+    candidates.erase(std::ranges::unique(candidates).begin(), candidates.end());
     return candidates;
 }
 
@@ -535,8 +535,8 @@ auto any_prefix_match(const std::vector<std::string>& candidates, std::string_vi
     if (prefix.empty()) {
         return false;
     }
-    return std::any_of(candidates.begin(), candidates.end(),
-                       [&](const auto& candidate) { return candidate.starts_with(prefix); });
+    return std::ranges::any_of(
+        candidates, [&](const auto& candidate) { return candidate.starts_with(prefix); });
 }
 
 auto completion_generator(const char* text, int state) -> char* {

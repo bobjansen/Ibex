@@ -329,6 +329,7 @@ class ValidityBitmap {
         if (is_external()) {
             return external_data_;
         }
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
         return reinterpret_cast<const std::uint8_t*>(words_.data());
     }
     [[nodiscard]] auto buffer_offset() const noexcept -> size_type {
@@ -342,6 +343,7 @@ class ValidityBitmap {
         return words_.data();
     }
     [[nodiscard]] auto words_data() const noexcept -> const word_type* {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
         return reinterpret_cast<const word_type*>(buffer_data());
     }
 };
@@ -359,7 +361,9 @@ struct ColumnEntry {
     return entry.validity.has_value() && !(*entry.validity)[row];
 }
 
-/// Returns the number of elements in a type-erased column.
+/// Returns the number of elements in a type-erased column. Every Column<T> move is
+/// noexcept, so ColumnValue never becomes valueless-by-exception; std::visit cannot throw.
+// NOLINTNEXTLINE(bugprone-exception-escape)
 [[nodiscard]] inline auto column_size(const ColumnValue& column) noexcept -> std::size_t {
     return std::visit([](const auto& col) { return col.size(); }, column);
 }
@@ -531,7 +535,7 @@ struct DynamicScanFilter {
         if (!bloom->contains(key)) {
             return false;
         }
-        return in_list.empty() || std::binary_search(in_list.begin(), in_list.end(), key);
+        return in_list.empty() || std::ranges::binary_search(in_list, key);
     }
 };
 
@@ -688,6 +692,10 @@ struct ExecutionContext {
     /// configure_parallel_from_env() when IBEX_PROFILE_OPERATORS is present.
     /// Shared ownership keeps the report alive across streamed operators and
     /// prints it when the query's last execution context/operator releases it.
+    /// The explicit {} keeps this field silenced under
+    /// -Wmissing-designated-field-initializers, matching every other field here; see the
+    /// note on JoinExpect (node.hpp) for why that matters.
+    // NOLINTNEXTLINE(readability-redundant-member-init)
     std::shared_ptr<ExecutionProfileState> execution_profile{};
 
     /// Morsel row-grain for the pipeline source when `parallel` is set. The input

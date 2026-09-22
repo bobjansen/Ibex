@@ -5757,9 +5757,8 @@ void print_physical_explain(parser::Expr& expr, const runtime::TableRegistry& ta
 }  // namespace
 
 auto normalize_input(std::string_view input) -> std::string {
-    std::string normalized(input);
-    auto last_non_space = normalized.find_last_not_of(" \t\r\n");
-    if (last_non_space != std::string::npos && normalized[last_non_space] != ';') {
+    auto normalized = std::string(ibex::trim(input));
+    if (!normalized.empty() && normalized.back() != ';') {
         normalized.push_back(';');
     }
     return normalized;

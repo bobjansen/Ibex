@@ -2,7 +2,10 @@
 
 Status: **measured, nothing built** (2026-09-03, SF-8, `IBEX_CORES=8`, branch
 `better-plans`); re-measured 2026-09-22 on `main` after fixing the tool itself
-(§4.7) — ranking holds, item 5 (aggregate inside the scan pipeline) is next.
+(§4.7) — ranking holds. Item 5 (aggregate inside the scan pipeline) was sized
+and is a no-go for now (§4.8): removing the overlap it targets costs more
+than the contention it would save. Item 4 (`Aggregate.FinalOrdering`) is
+next.
 
 Companion to [`src/runtime/PARALLELISM.md`](../src/runtime/PARALLELISM.md) (the
 model) and [parallelism-overview.md](parallelism-overview.md) (the inconsistency
@@ -593,6 +596,59 @@ interleaved-min-wall convention — read as directional):** idle 20,696 core-ms,
 join 46.7% / aggregate 33.7% / scan 15.8% / map 2.8%, `partial` boundary still
 64.7%. Same ranking order as §4.6, on a trustworthy base this time.
 
+### 4.8 Item 5 sized cheaply before being built — the overlap it would remove is the win, not the waste (2026-09-22)
+
+Before spending multi-day effort on item 5 (fuse `Aggregate.Discovery`'s
+hashing into the scan worker's own task, eliminating the second fan-out that
+queues behind the scan's), the cheap version of the experiment: what does
+q01/q11/q15 cost with the scan/aggregate overlap simply turned off
+(`IBEX_STREAM_SCAN=0`)? If the contention were pure waste, removing the
+overlap should be close to free — the aggregate would run serially after the
+scan instead of racing it for pool workers, but it would stop paying the
+queueing cost §4.7 traced.
+
+Interleaved A/B, `benchmarking/ab_queries.py`, SF-8, 8 cores, `taskset 0-7`,
+byte-identical on all three, run twice (8 then 20 repeats, same result both
+times):
+
+| query | stream-on (default) | stream-off | effect | verdict |
+|---|---|---|---|---|
+| q01 | 659.5ms | 947.5ms | **+44.0%** | SLOWER, p<0.001 |
+| q11 | 61.5ms | 60.1ms | +5.2% | unclear, p=0.43 (too small — §5's noise-floor caveat applies) |
+| q15 | 95.7ms | 162.7ms | **+61.4%** | SLOWER, p<0.001 |
+
+**This inverts the premise.** Removing the overlap doesn't just remove the
+contention — it removes the overlap, and the overlap is worth far more than
+the contention costs. Most of what `idle_core_ms` counted as Discovery's
+"waste" is the accounting cost of a real win happening concurrently (scan
+decode and aggregate hashing overlapping), not time actually lost. The naive
+way to eliminate the contention (stop overlapping) is a clear, large
+regression on both queries big enough to trust.
+
+**What this means for item 5, and for the AST-fusion idea discussed
+alongside it.** True fusion (a new IR node collapsing `Scan`+`Discovery` into
+one physical operator via a `fuse_checked_ascriptions`-shaped canonicalization
+pass, so the fused pair legitimately owns one fan-out under
+`PARALLELISM.md`'s model rather than reaching across an operator boundary at
+runtime) is not the same thing as disabling the overlap — it would, in
+principle, keep the overlap *and* remove only the redundant second fan-out.
+That's a narrower, unmeasured slice of the idle number, and this experiment
+cannot isolate it without the thing existing. But it does establish the
+ceiling is well below the raw idle-core-ms figures: a large share of what
+looked idle turns out to be the overlap paying for itself, and fusion (like
+disabling) still forces the aggregate's discovery to run inside the scan's
+worker cadence rather than the aggregate's own — the mechanism that makes the
+naive version a 44–61% regression is present, in smaller form, in the fused
+version too, and there's no cheap way to size how much smaller.
+
+**No-go for now, on both item 5 and its fusion design.** Building the
+per-worker mutable-accumulator-and-merge primitive (which does not exist
+anywhere in the runtime today — the missing piece identified when surveying
+`JoinProbeFactory` as the nearest precedent, itself only stateless/immutable)
+is multi-day work for a payoff that just got smaller and remains unsized.
+Revisit only if a cheap way to isolate the redundant-fan-out cost specifically
+(without losing the overlap) turns up — not scheduled as a next step.
+
 ## 5. What the map does not say
 
 * **Small-query attribution is soft.** Per-query closure runs 95–104% on the
@@ -638,15 +694,19 @@ join 46.7% / aggregate 33.7% / scan 15.8% / map 2.8%, `partial` boundary still
 4. **`Aggregate.FinalOrdering`** (§4.2's other half, 1,461 core-ms) — untouched,
    and the harder half: it already runs at occupancy 0.63–0.70, so the headroom
    is real but thinner than Emission's was.
-5. **The q01 shape: aggregate inside the scan pipeline — next up (§4.7).**
-   §4.3's negative result points at it — a breaker that fans out *while its
-   producer is fanned out* spends its time queueing, and no amount of work
-   removed from either side fixes that. Accumulating into per-row-group
-   private state on the scan worker removes the second fan-out entirely.
-   This is the largest unbuilt idea the map has produced, and the first one
-   that is a scheduling change rather than an operator change. §4.7 confirmed
-   (2026-09-22) that closing q01/q11/q15's closure has no profiler-side fix —
-   this item is the only remaining path, and item 4 is deferred behind it.
+5. **The q01 shape: aggregate inside the scan pipeline — sized, no-go for now
+   (§4.8).** §4.3's negative result points at it — a breaker that fans out
+   *while its producer is fanned out* spends its time queueing. §4.7 confirmed
+   the closure gap has no profiler-side fix; §4.8 then cheaply sized the
+   actual opportunity by measuring `IBEX_STREAM_SCAN=0` (removing the overlap
+   entirely) against default on q01/q11/q15 — q01 +44%, q15 +61% *slower*,
+   both p<0.001. The overlap this item would partially give up is worth more
+   than the contention it would remove, and the fusion design (a
+   `fuse_checked_ascriptions`-shaped IR canonicalization producing one fused
+   Scan+Discovery operator) needs the same unbuilt per-worker
+   accumulator-and-merge primitive either way. Not scheduled; revisit only if
+   a cheap way appears to isolate the redundant-fan-out cost specifically
+   without losing the overlap. Item 4 is next instead.
 6. Re-measure the map. Every item above moves capacity between rows; the
    ranking after step 3 is not the ranking now.
 

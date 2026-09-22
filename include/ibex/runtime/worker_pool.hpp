@@ -57,7 +57,7 @@ class WorkerPool {
         Batch(const Batch&) = delete;
         auto operator=(const Batch&) -> Batch& = delete;
         Batch(Batch&&) noexcept;
-        auto operator=(Batch&&) noexcept -> Batch&;
+        auto operator=(Batch&& /*other*/) noexcept -> Batch&;
         ~Batch();
 
         /// Blocks until every worker body has returned. Rethrows the first
@@ -84,7 +84,7 @@ class WorkerPool {
         TaskGroup(const TaskGroup&) = delete;
         auto operator=(const TaskGroup&) -> TaskGroup& = delete;
         TaskGroup(TaskGroup&&) noexcept;
-        auto operator=(TaskGroup&&) noexcept -> TaskGroup&;
+        auto operator=(TaskGroup&& /*other*/) noexcept -> TaskGroup&;
         ~TaskGroup();
 
         /// Queue one task. Tasks may run concurrently and in any order.

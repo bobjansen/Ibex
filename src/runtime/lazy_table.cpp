@@ -2,7 +2,6 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/core/column.hpp>
-#include <ibex/core/time.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -15,7 +14,6 @@
 #include <cstdint>
 #include <expected>
 #include <iterator>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>

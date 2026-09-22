@@ -13,6 +13,7 @@ Checks: >
   -cppcoreguidelines-avoid-do-while,
   -readability-trailing-comma,
   -misc-non-private-member-variables-in-classes,
+  -cppcoreguidelines-non-private-member-variables-in-classes,
   -readability-implicit-bool-conversion,
   -misc-no-recursion,
   -readability-function-cognitive-complexity,
@@ -28,6 +29,24 @@ Checks: >
   -cppcoreguidelines-pro-type-union-access,
   -cppcoreguidelines-pro-type-vararg,
   -misc-use-internal-linkage
+# cppcoreguidelines-pro-bounds-avoid-unchecked-container-access and
+# readability-trailing-comma: unknown to the standalone clang-tidy-20/18 apt
+# packages CI uses (excluding them there is a harmless no-op), but real,
+# firing checks under clangd's bundled clang-tidy despite reporting the same
+# "20.1.2" version string -- same package version, different check registry.
+# Confirmed live in the editor: without these, operator[] bounds-access noise
+# floods every file, contradicting the already-excluded pro-bounds-* siblings.
+# Do not remove based on `clang-tidy-20 --list-checks` alone.
+# Without this, clang-tidy parses included headers but only reports
+# diagnostics located in the main file (the .cpp) being compiled, so issues
+# inside our own headers were silently dropped in CI even though every
+# header is pulled in by some TU. Match only our own headers, not
+# FetchContent'd third-party ones under build/.
+# NOTE: as of clang-tidy-20, setting this here is not sufficient on its own —
+# --dump-config shows it loaded, but it has no effect on `-p <builddir>`
+# invocations unless the identical value is ALSO passed via --header-filter
+# on the command line. CI's clang-tidy step does that; keep both in sync.
+HeaderFilterRegex: '^.*/include/ibex/.*\.hpp$'
 CheckOptions:
   # libstdc++ implementation headers are not portable include providers.
   # Prefer the public standard-library header for every standard declaration.

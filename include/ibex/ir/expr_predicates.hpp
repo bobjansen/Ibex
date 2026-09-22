@@ -61,6 +61,13 @@ enum class NullBehavior : std::uint8_t {
 /// lowering context. Unknown functions are deliberately unclassified: planning
 /// must not assume that arbitrary plugin code is row-local, deterministic, or
 /// safe to duplicate.
+///
+/// `kind` has no default member initializer, deliberately: every entry in the
+/// classification table below sets it explicitly via designated-initializer
+/// syntax, and a default would let a future entry silently omit it (see the
+/// rationale on `JoinExpect` in node.hpp for the concrete bug that pattern
+/// caused elsewhere).
+// NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
 struct BuiltinFunctionInfo {
     FnKind kind;
     /// Only meaningful for `kind == Scalar`; see `NullBehavior`.

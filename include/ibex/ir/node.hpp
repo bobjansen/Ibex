@@ -232,10 +232,12 @@ struct DeferredScalarBinding {
                  ///< tmp_name
 };
 
+// NOLINTNEXTLINE(readability-redundant-inline-specifier) -- out-of-class, not implicitly inline.
 inline ExprPtr::ExprPtr() = default;
 
 inline ExprPtr::ExprPtr(std::nullptr_t) noexcept {}
 
+// NOLINTNEXTLINE(readability-redundant-inline-specifier) -- see ExprPtr() above
 inline ExprPtr::~ExprPtr() = default;
 
 inline ExprPtr::ExprPtr(std::unique_ptr<Expr> ptr) noexcept : ptr_(std::move(ptr)) {}
@@ -245,6 +247,7 @@ inline ExprPtr::ExprPtr(Expr expr) : ptr_(std::make_unique<Expr>(std::move(expr)
 inline ExprPtr::ExprPtr(const ExprPtr& other)
     : ptr_(other.ptr_ ? std::make_unique<Expr>(*other.ptr_) : nullptr) {}
 
+// NOLINTNEXTLINE(readability-redundant-inline-specifier) -- see ExprPtr() above
 inline ExprPtr::ExprPtr(ExprPtr&&) noexcept = default;
 
 inline auto ExprPtr::operator=(const ExprPtr& other) -> ExprPtr& {
@@ -254,6 +257,7 @@ inline auto ExprPtr::operator=(const ExprPtr& other) -> ExprPtr& {
     return *this;
 }
 
+// NOLINTNEXTLINE(readability-redundant-inline-specifier) -- see ExprPtr() above
 inline auto ExprPtr::operator=(ExprPtr&&) noexcept -> ExprPtr& = default;
 
 [[nodiscard]] inline auto make_expr_ptr(Expr expr) -> ExprPtr {
@@ -440,6 +444,7 @@ struct JoinKey {
 /// side's name alone. Suffixes apply to collisions only, never to every
 /// column.
 /// No member has a default, for the reason given on `JoinExpect`.
+// NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
 struct JoinSuffixPolicy {
     bool present;
     std::string left;

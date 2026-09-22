@@ -247,6 +247,28 @@ nested task. Add a `g_cooperative_waiters` atomic incremented across the
   `pool_unqueued_ms` all shift meaning. The `AssistScope` split (§3) is the
   minimum; the closure checks in `profile_suite.py` must still close. Do not
   land B without re-validating the accounting against a known query.
+
+  **This was never built.** `cooperative_ring_wait` (`pipeline_executor.cpp`,
+  step B) wraps only the genuine-park interval in `RingWaitScope` — the
+  `pool.try_run_one_pending()` call itself (where the thread runs someone
+  else's queued task) is deliberately left outside it, per the function's own
+  comment ("the only interval that IS ring wait"). That's correct for
+  `RingWaitScope`'s own accounting, but no replacement `AssistScope` was ever
+  added, so that interval is invisible to `barrier_wait_ms`/`ring_wait_ms` on
+  the CALLER's row while still being inside the calling operator's
+  `ExecutionProfileScope` (which wraps the whole `next()` call) — so it counts
+  as that operator's own `self_ms`, exclusive work, when the thread was
+  actually running a DIFFERENT operator's task. `worker_pool.cpp`'s
+  `run_task` correctly attributes the same interval's `pool_work_ms` to the
+  task's real owner via `state.profile_entry` — so the identical physical time
+  is now double-booked: once as the assisting operator's own exclusive `self`,
+  once as the assisted operator's `pool_work`. `benchmarking/breaker_map.py`'s
+  `idle_core_ms = self_ms * workers - pool_work_ms` then multiplies the
+  borrowed time by `workers`, which is exactly the closure break §4.7 of
+  [[project_breaker_map]] found on q01/q11/q15 — those are the queries where
+  `Aggregate.Discovery`'s barrier wait cooperatively assists its own streaming
+  scan's decode tasks most. Confirmed by grepping the tree for `AssistScope`/
+  `AssistIdleScope`: neither exists (2026-09-22).
 - **Determinism.** Cooperative execution reorders which thread runs which task.
   Results must not depend on it (tasks are independent; sequence ordering is
   preserved by the ring). Verify byte-identical at every step

@@ -534,6 +534,27 @@ takes closure from 674–754% down to 98.7%. This is §4.3's own diagnosis
 would close it is pushing the aggregate into the scan pipeline's workers")
 confirmed from a second angle — and it is item 5 below, still unbuilt.
 
+**Root cause, found in code, not just measured:** `cooperative_ring_wait`
+(`pipeline_executor.cpp`) — landed by
+[[project_cooperative_pipeline_waits]] — lets a thread parked on
+`Aggregate.Discovery`'s own barrier run the SCAN's queued decode tasks while
+it waits (that's the whole point of the mechanism, and it is a real win).
+But that plan's own risk section called for an `AssistScope` profiling split
+to keep the two operators' time separate, and it was never built (verified:
+`AssistScope`/`AssistIdleScope` do not exist in the tree). So that assist
+interval is outside `RingWaitScope` (correct for the wait accounting) but
+still inside Discovery's `ExecutionProfileScope` (wraps the whole `next()`
+call) — it reads as Discovery's own exclusive `self_ms` on Discovery's row,
+while `worker_pool.cpp::run_task` *also* correctly credits the identical
+interval as `pool_work_ms` on the scan's row. The same physical time is
+double-booked across two rows, and `idle_core_ms = self*workers - pool_work`
+multiplies the borrowed half by `workers` on Discovery's side. This is not a
+`breaker_map.py` bug (§4.7's earlier fixes stand) — it is a real gap between
+that plan's design and what shipped. Building the `AssistScope` split there
+would likely fix q01/q11/q15's closure at the source, is scoped to one file
+(`execution_profile.cpp`/`pipeline_executor.cpp`), and is unrelated to item 5
+below — worth doing before item 5, not instead of it.
+
 **Tool now flags rather than silently ranks.** Closure outside 50–175% marks a
 query `UNRELIABLE`, excludes it from the suite-wide family/boundary/label
 totals, and still prints its per-query detail for inspection. Three of 22 are

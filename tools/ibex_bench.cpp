@@ -10,8 +10,6 @@
 
 #include <CLI/CLI.hpp>
 
-#include <algorithm>
-
 // When jemalloc is linked, prevent large allocations from being returned to the OS
 // between benchmark iterations.  By default jemalloc decays dirty pages after 10 s,
 // but on WSL2 huge allocations (>= 2 MB) are munmap'd immediately on free, so every

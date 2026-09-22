@@ -1,7 +1,8 @@
 # The breaker map: where the cores go
 
 Status: **measured, nothing built** (2026-09-03, SF-8, `IBEX_CORES=8`, branch
-`better-plans`).
+`better-plans`); re-measured 2026-09-22 on `main` after fixing the tool itself
+(§4.7) — ranking holds, item 5 (aggregate inside the scan pipeline) is next.
 
 Companion to [`src/runtime/PARALLELISM.md`](../src/runtime/PARALLELISM.md) (the
 model) and [parallelism-overview.md](parallelism-overview.md) (the inconsistency
@@ -491,6 +492,59 @@ character range plus a rebased offsets copy took q10's append 57 → 45ms and th
 suite **0.999** — flat. The concat's cost is bulk memcpy of fixed-width columns
 (q12: 11M rows at ~6ns/row), not the string encoding, so this was the wrong
 half of the problem. Reverted; the finding is (b).
+
+### 4.7 The tool itself had two bugs, and closure exposed a real overlap finding (2026-09-22)
+
+Re-running `benchmarking/breaker_map.py` cold on `main` (three weeks of
+unrelated work landed since §4.6 — lints, nullable scalars, the `fs` plugin,
+Decimal, scan-fusion/FD-payload work) surfaced a closure identity badly broken
+on several large queries: q01 508–754%, q11 290–337%, q15 305–355%, plus q06,
+q20, q22 drifting 62–143%. §5 already documented small queries reading noisy;
+this was different — q01 (600ms+) and q21 (800ms+) are exactly the queries §5
+says should read 95–104%, and they didn't.
+
+Two independent bugs in `attribute()`, both now fixed in the tool:
+
+1. **Undercounted pool work.** The idle formula only read `pool_work_ms`,
+   ignoring `pool_next_ms`/`pool_source_ms` — real pool-side work the profile
+   already reports for source/decode sub-phase rows. A row like `source decode
+   selected` can run 100% on pool threads (`pool_source_ms` in the hundreds of
+   ms) while showing `pool_work_ms=0`, which the old formula read as pure idle
+   rather than pure utilization. Fixed by summing all three.
+2. **That fix broke a different case worse.** Some rows (`source decode
+   selected`, `source dynamic key scan`) have `self_ms == 0` by construction —
+   pure pool-side sub-phases that never touch the calling thread. Folding
+   `pool_next_ms`/`pool_source_ms` into those rows' `pool` produced a phantom
+   deep-negative idle (`0 * workers - pool`), since there is no self window for
+   that capacity to be idle relative to. Fixed: `idle_core_ms = 0` whenever
+   `self_ms == 0`, no matter what pool time the row reports.
+
+Together these two fixed q06/q10/q12/q18/q20/q22 outright (closure 76–143%,
+all now inside a reliable band). **q01, q11 and q15 stayed broken after both
+fixes** — that's not a third tool bug, it's real. All three are
+`Aggregate.Discovery`-heavy queries where the aggregate genuinely runs
+concurrently with its own streaming scan producer, and `self_ms` is an
+accounting construct (call-stack exclusive time), not a wall-clock-exclusivity
+guarantee — the row-level `idle = self*workers - pool` formula assumes an
+operator's self window has the pool to itself, which stops being true exactly
+when the multicore work succeeds at overlapping pipeline stages. Isolated
+directly: `IBEX_STREAM_SCAN=0` on q01 (removing the scan/aggregate overlap)
+takes closure from 674–754% down to 98.7%. This is §4.3's own diagnosis
+("q01 is limited by pool contention with its own scan... the mechanism that
+would close it is pushing the aggregate into the scan pipeline's workers")
+confirmed from a second angle — and it is item 5 below, still unbuilt.
+
+**Tool now flags rather than silently ranks.** Closure outside 50–175% marks a
+query `UNRELIABLE`, excludes it from the suite-wide family/boundary/label
+totals, and still prints its per-query detail for inspection. Three of 22 are
+excluded on the fresh run (q01, q11, q15) rather than the previous
+size-based caveat in §5, which is now the wrong rule (large queries drift too,
+for a different and more informative reason).
+
+**Re-measured totals, 19/22 reliable queries, SF-8/8c, single run (not the
+interleaved-min-wall convention — read as directional):** idle 20,696 core-ms,
+join 46.7% / aggregate 33.7% / scan 15.8% / map 2.8%, `partial` boundary still
+64.7%. Same ranking order as §4.6, on a trustworthy base this time.
 
 ## 5. What the map does not say
 

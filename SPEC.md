@@ -3575,7 +3575,10 @@ let iris = read_csv("iris.csv");
 ```
 
 `read_csv` infers column types from the input file (Int64, Float64, or String
-per column). The resulting schema is implementation-defined.
+per column). The resulting schema is implementation-defined. A bare empty
+field (`a,,c`) reads as null rather than forcing an otherwise-numeric column
+to String; a column with no non-empty values, or one with a non-numeric
+value in any row, still infers as String, with empty fields kept as `""`.
 
 The standard CLI, REPL, and Python hosts link the first-party Parquet backend
 directly; an optional thin compatibility plugin delegates to that same backend.

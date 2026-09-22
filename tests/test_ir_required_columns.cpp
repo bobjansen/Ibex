@@ -444,8 +444,9 @@ TEST_CASE("deferrable_probe_scans: joins the streaming path declines are not def
     for (int clause = 0; clause < 3; ++clause) {
         CAPTURE(clause);
         ir::NullMatch nulls = clause == 0 ? ir::NullMatch::Equal : ir::NullMatch::Never;
-        ir::JoinExpect expect;
-        expect.right = clause == 1 ? ir::JoinMultiplicity::One : ir::JoinMultiplicity::Many;
+        ir::JoinExpect expect{
+            .left = ir::JoinMultiplicity::Many,
+            .right = clause == 1 ? ir::JoinMultiplicity::One : ir::JoinMultiplicity::Many};
         const auto take = clause == 2 ? ir::MatchSelection::Any : ir::MatchSelection::All;
         auto join = std::make_unique<ir::JoinNode>(
             ir::NodeId{20}, ir::JoinKind::Inner, std::vector<ir::JoinKey>{ir::JoinKey{"id"}},

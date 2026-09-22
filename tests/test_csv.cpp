@@ -199,6 +199,49 @@ TEST_CASE("Read CSV - mixed numeric/non-numeric falls back to string") {
     REQUIRE(get_string_at(table, "price", 2) == "N/A");
 }
 
+TEST_CASE("Read CSV - bare empty field in numeric column infers as null, not string") {
+    auto path = tmp("ibex_test_empty_numeric.csv");
+    // No null spec passed: an empty cell in an otherwise-double column must
+    // still infer as Float64 with a null, not demote the column to String.
+    // A second, always-populated column keeps the middle row from being a
+    // blank line (which the parser treats as a row separator, not a row of
+    // empty fields).
+    write_csv(path, "price,tag\n1.5,a\n,b\n2.5,c\n");
+
+    auto table = read_csv(path.string());
+    REQUIRE(table.rows() == 3);
+    const auto* prices = std::get_if<ibex::Column<double>>(table.find("price"));
+    REQUIRE(prices != nullptr);
+    REQUIRE((*prices)[0] == Catch::Approx(1.5));
+    REQUIRE_FALSE(is_null_at(table, "price", 0));
+    REQUIRE(is_null_at(table, "price", 1));
+    REQUIRE_FALSE(is_null_at(table, "price", 2));
+    REQUIRE((*prices)[2] == Catch::Approx(2.5));
+}
+
+TEST_CASE("Read CSV - bare empty field in int column infers as nullable Int64") {
+    auto path = tmp("ibex_test_empty_int.csv");
+    write_csv(path, "qty,tag\n10,a\n,b\n30,c\n");
+
+    auto table = read_csv(path.string());
+    REQUIRE(table.rows() == 3);
+    const auto* qtys = std::get_if<ibex::Column<std::int64_t>>(table.find("qty"));
+    REQUIRE(qtys != nullptr);
+    REQUIRE((*qtys)[0] == 10);
+    REQUIRE(is_null_at(table, "qty", 1));
+    REQUIRE((*qtys)[2] == 30);
+}
+
+TEST_CASE("Read CSV - column of only empty fields still falls back to string") {
+    auto path = tmp("ibex_test_all_empty.csv");
+    write_csv(path, "a,tag\n,x\n,y\n");
+
+    auto table = read_csv(path.string());
+    REQUIRE(table.rows() == 2);
+    REQUIRE(get_string_at(table, "a", 0) == "");
+    REQUIRE(get_string_at(table, "a", 1) == "");
+}
+
 TEST_CASE("Read CSV - single data row") {
     auto path = tmp("ibex_test_onerow.csv");
     write_csv(path, "a,b\n42,hello\n");

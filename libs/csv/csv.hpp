@@ -1370,14 +1370,35 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
         }
 
         // Try int64 with a fused build pass: if every non-null value parses,
-        // we keep the built column directly.
+        // we keep the built column directly. A bare empty field reads as
+        // null in an otherwise-numeric column, even without an explicit
+        // null spec ("<empty>"), rather than forcing the whole column to
+        // String; a column that instead resolves to String below leaves
+        // empty fields as empty strings, unaffected by this. The probe
+        // works on a local copy of the validity bitmap so a failed probe
+        // (or the double probe that follows) never leaks empty-as-null
+        // bits into a column that ends up String.
         if (n > 0) {
             ibex::Column<std::int64_t> int_col;
             int_col.reserve(n);
             bool all_int = true;
             bool any_valid = false;
+            bool any_empty = false;
+            ibex::runtime::ValidityBitmap probe_validity;
             for (std::size_t i = 0; i < n; ++i) {
                 if (is_null(i)) {
+                    int_col.push_back(0);
+                    continue;
+                }
+                if (vals[i].empty()) {
+                    if (!any_empty) {
+                        probe_validity = has_nulls ? validity : ibex::runtime::ValidityBitmap{};
+                        if (!has_nulls) {
+                            probe_validity.assign(n, true);
+                        }
+                        any_empty = true;
+                    }
+                    probe_validity.set(i, false);
                     int_col.push_back(0);
                     continue;
                 }
@@ -1390,8 +1411,9 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                 any_valid = true;
             }
             if (all_int && any_valid) {
-                if (has_nulls) {
-                    table.add_column(name, std::move(int_col), std::move(validity));
+                if (has_nulls || any_empty) {
+                    table.add_column(name, std::move(int_col),
+                                     any_empty ? std::move(probe_validity) : std::move(validity));
                 } else {
                     table.add_column(name, std::move(int_col));
                 }
@@ -1399,14 +1421,29 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
             }
         }
 
-        // Try double with a fused build pass.
+        // Try double with a fused build pass. Same empty-as-null treatment
+        // as the int64 probe above, also on a local validity copy.
         if (n > 0) {
             ibex::Column<double> dbl_col;
             dbl_col.reserve(n);
             bool all_double = true;
             bool any_valid = false;
+            bool any_empty = false;
+            ibex::runtime::ValidityBitmap probe_validity;
             for (std::size_t i = 0; i < n; ++i) {
                 if (is_null(i)) {
+                    dbl_col.push_back(0.0);
+                    continue;
+                }
+                if (vals[i].empty()) {
+                    if (!any_empty) {
+                        probe_validity = has_nulls ? validity : ibex::runtime::ValidityBitmap{};
+                        if (!has_nulls) {
+                            probe_validity.assign(n, true);
+                        }
+                        any_empty = true;
+                    }
+                    probe_validity.set(i, false);
                     dbl_col.push_back(0.0);
                     continue;
                 }
@@ -1419,8 +1456,9 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                 any_valid = true;
             }
             if (all_double && any_valid) {
-                if (has_nulls) {
-                    table.add_column(name, std::move(dbl_col), std::move(validity));
+                if (has_nulls || any_empty) {
+                    table.add_column(name, std::move(dbl_col),
+                                     any_empty ? std::move(probe_validity) : std::move(validity));
                 } else {
                     table.add_column(name, std::move(dbl_col));
                 }

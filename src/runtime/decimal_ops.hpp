@@ -10,7 +10,9 @@
 
 #include <ibex/core/decimal.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
+#include <atomic>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
@@ -179,6 +181,9 @@ struct DecimalColumnView {
     }
 };
 
+template <typename F>
+[[nodiscard]] inline auto for_each_decimal_range(std::size_t rows, F&& body) -> std::size_t;
+
 [[nodiscard]] inline auto decimal_column_view(const ColumnValue& col, std::size_t off)
     -> std::optional<DecimalColumnView> {
     if (const auto* d = std::get_if<Column<Decimal>>(&col)) {
@@ -216,14 +221,18 @@ struct DecimalColumnView {
         Column<double> out;
         out.resize(n);
         double* op_out = out.data();
-        for (std::size_t i = 0; i < n; ++i) {
-            if (!is_row_valid(lv, lhs_off, i) || !is_row_valid(rv, rhs_off, i)) {
-                op_out[i] = 0.0;
-                continue;
+        const auto run = [&](std::size_t begin, std::size_t end) {
+            for (std::size_t i = begin; i < end; ++i) {
+                if (!is_row_valid(lv, lhs_off, i) || !is_row_valid(rv, rhs_off, i)) {
+                    op_out[i] = 0.0;
+                    continue;
+                }
+                op_out[i] = decimal::to_double(a->units(i), a->type.scale) /
+                            decimal::to_double(b->units(i), b->type.scale);
             }
-            op_out[i] = decimal::to_double(a->units(i), a->type.scale) /
-                        decimal::to_double(b->units(i), b->type.scale);
-        }
+            return n;
+        };
+        (void)for_each_decimal_range(n, run);
         return ColumnValue{std::move(out)};
     }
     auto rt = decimal_arith_type(op, a->type, b->type);
@@ -233,19 +242,54 @@ struct DecimalColumnView {
     Column<Decimal> out = make_decimal_column(*rt);
     out.resize(n);
     Decimal* dst = out.data();
-    for (std::size_t i = 0; i < n; ++i) {
-        if (!is_row_valid(lv, lhs_off, i) || !is_row_valid(rv, rhs_off, i)) {
-            dst[i] = Decimal{};
-            continue;
+    const auto run = [&](std::size_t begin, std::size_t end) {
+        for (std::size_t i = begin; i < end; ++i) {
+            if (!is_row_valid(lv, lhs_off, i) || !is_row_valid(rv, rhs_off, i)) {
+                dst[i] = Decimal{};
+                continue;
+            }
+            Int128 r = 0;
+            if (!decimal_arith_units(op, a->units(i), a->type.scale, b->units(i), b->type.scale,
+                                     *rt, r)) {
+                return i;
+            }
+            dst[i] = Decimal{r};
         }
-        Int128 r = 0;
-        if (!decimal_arith_units(op, a->units(i), a->type.scale, b->units(i), b->type.scale, *rt,
-                                 r)) {
-            return std::unexpected(decimal_overflow(*rt));
-        }
-        dst[i] = Decimal{r};
+        return n;
+    };
+    const std::size_t failed = for_each_decimal_range(n, run);
+    if (failed != n) {
+        return std::unexpected(decimal_overflow(*rt));
     }
     return ColumnValue{std::move(out)};
+}
+
+template <typename F>
+[[nodiscard]] inline auto for_each_decimal_range(std::size_t rows, F&& body) -> std::size_t {
+    constexpr std::size_t kMinRowsPerWorker = 65536;
+    if (rows < kMinRowsPerWorker || on_worker_pool_thread()) {
+        return body(0, rows);
+    }
+    auto& pool = process_worker_pool();
+    const std::size_t workers =
+        std::min(pool.size(), std::max<std::size_t>(1, rows / kMinRowsPerWorker));
+    if (workers < 2) {
+        return body(0, rows);
+    }
+    std::atomic<std::size_t> first_failure{rows};
+    auto batch = pool.submit(workers, [&](std::size_t worker) {
+        const std::size_t begin = rows * worker / workers;
+        const std::size_t end = rows * (worker + 1) / workers;
+        const std::size_t failure = body(begin, end);
+        if (failure < rows) {
+            std::size_t seen = first_failure.load(std::memory_order_relaxed);
+            while (failure < seen &&
+                   !first_failure.compare_exchange_weak(seen, failure, std::memory_order_relaxed)) {
+            }
+        }
+    });
+    batch.wait();
+    return first_failure.load(std::memory_order_relaxed);
 }
 
 /// A join/semi-join key pair that cannot be matched on raw units: two Decimal

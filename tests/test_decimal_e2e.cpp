@@ -205,6 +205,85 @@ TEST_CASE("Decimal casts round half away from zero at the boundary", "[decimal][
     CHECK(contains(run_err("t[update { x = Decimal(\"abc\", 10, 2) }];", tables), "abc"));
 }
 
+TEST_CASE("Decimal abs and round preserve exact scale semantics", "[decimal][e2e]") {
+    runtime::Table t;
+    t.add_column("x", dec_col(dec_type(6, 2), {"1.50", "-1.50", "1.25", "-1.25", "0.50"}));
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+    auto out = run_ok(
+        "t[update { magnitude = abs(x), nearest = round(x, nearest), "
+        "bankers = round(x, bankers), low = round(x, floor), high = round(x, ceil), "
+        "toward_zero = round(x, trunc) }];",
+        tables);
+    CHECK(texts(out, "magnitude") ==
+          std::vector<std::string>{"1.50", "1.50", "1.25", "1.25", "0.50"});
+    CHECK(type_of(out, "magnitude") == dec_type(6, 2));
+    CHECK(texts(out, "nearest") == std::vector<std::string>{"2", "-2", "1", "-1", "1"});
+    CHECK(texts(out, "bankers") == std::vector<std::string>{"2", "-2", "1", "-1", "0"});
+    CHECK(texts(out, "low") == std::vector<std::string>{"1", "-2", "1", "-2", "0"});
+    CHECK(texts(out, "high") == std::vector<std::string>{"2", "-1", "2", "-1", "1"});
+    CHECK(texts(out, "toward_zero") == std::vector<std::string>{"1", "-1", "1", "-1", "0"});
+    CHECK(type_of(out, "nearest") == dec_type(5, 0));
+}
+
+TEST_CASE("Decimal cumulative and rolling kernels preserve exact values and types",
+          "[decimal][e2e][rolling]") {
+    runtime::Table t;
+    t.add_column("x", dec_col(dec_type(5, 2), {"1.20", "-0.05", "2.30", "0.10"}));
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+    auto out = run_ok(
+        "t[update { cumulative = cumsum(x), rs = rolling_sum(x, 2), "
+        "rmin = rolling_min(x, 2), rmax = rolling_max(x, 2), "
+        "first = rolling_first(x, 2), last = rolling_last(x, 2) }];",
+        tables);
+    CHECK(texts(out, "cumulative") == std::vector<std::string>{"1.20", "1.15", "3.45", "3.55"});
+    CHECK(type_of(out, "cumulative") == dec_type(38, 2));
+    CHECK(texts(out, "rs") == std::vector<std::string>{"1.20", "1.15", "2.25", "2.40"});
+    CHECK(type_of(out, "rs") == dec_type(38, 2));
+    CHECK(texts(out, "rmin") == std::vector<std::string>{"1.20", "-0.05", "-0.05", "0.10"});
+    CHECK(texts(out, "rmax") == std::vector<std::string>{"1.20", "1.20", "2.30", "2.30"});
+    CHECK(texts(out, "first") == std::vector<std::string>{"1.20", "1.20", "-0.05", "2.30"});
+    CHECK(texts(out, "last") == std::vector<std::string>{"1.20", "-0.05", "2.30", "0.10"});
+    for (const auto* name : {"rmin", "rmax", "first", "last"}) {
+        CHECK(type_of(out, name) == dec_type(5, 2));
+    }
+}
+
+TEST_CASE("Decimal cumulative and rolling kernels skip null payloads safely",
+          "[decimal][e2e][rolling][null]") {
+    runtime::Table t;
+    t.add_column("x", dec_col(dec_type(4, 2), {"1.00", "9.99", "2.00"}),
+                 runtime::ValidityBitmap{true, false, true});
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+    const auto out =
+        run_ok("t[update { cumulative = cumsum(x), rs = rolling_sum(x, 2) }];", tables);
+    CHECK(texts(out, "cumulative") == std::vector<std::string>{"1.00", "null", "3.00"});
+    CHECK(texts(out, "rs") == std::vector<std::string>{"1.00", "1.00", "2.00"});
+}
+
+TEST_CASE("Decimal aggregates work in broadcasts and scalar series reduction",
+          "[decimal][e2e][aggregate]") {
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{1, 1, 2, 2});
+    auto amounts = dec_col(dec_type(8, 2), {"0.10", "0.20", "1.25", "-0.25"});
+    t.add_column("x", amounts);
+    auto sum = runtime::aggregate_series("sum", runtime::ColumnValue{amounts});
+    REQUIRE(sum.has_value());
+    const auto* scalar_sum = std::get_if<DecimalValue>(&*sum);
+    REQUIRE(scalar_sum != nullptr);
+    CHECK(scalar_sum->type == dec_type(38, 2));
+    CHECK(decimal::to_string(*scalar_sum) == "1.30");
+
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+    auto out = run_ok("t[update { total = sum(x), centered = x - sum(x) }, by g];", tables);
+    CHECK(texts(out, "total") == std::vector<std::string>{"0.30", "0.30", "1.00", "1.00"});
+    CHECK(type_of(out, "total") == dec_type(38, 2));
+    CHECK(texts(out, "centered") == std::vector<std::string>{"-0.20", "-0.10", "0.25", "-1.25"});
+}
+
 TEST_CASE("Decimal converts to Float64 and whole values to Int64", "[decimal][e2e]") {
     const auto tables = prices();
     auto out = run_ok("t[update { d = Float64(price) }];", tables);
@@ -260,16 +339,31 @@ TEST_CASE("Decimal sorts by value, including negatives and wide values", "[decim
     CHECK(texts(run_ok("t[order { price desc }];", tables), "price") ==
           std::vector<std::string>{"100.00", "10.50", "10.49", "-3.25"});
 
-    // More than 18 digits: units no longer fit int64, so the ordinal path.
+    // More than 18 digits: units no longer fit int64, so sorting must use
+    // both halves of the direct decimal128 radix key.
     runtime::Table wide;
     wide.add_column(
         "v", dec_col(dec_type(38, 0), {"12345678901234567890123", "-99999999999999999999", "5",
                                        "12345678901234567890122"}));
+    wide.add_column("g", Column<std::int64_t>{2, 1, 1, 2});
     runtime::TableRegistry wide_tables;
     wide_tables.emplace("t", std::move(wide));
     CHECK(texts(run_ok("t[order v];", wide_tables), "v") ==
           std::vector<std::string>{"-99999999999999999999", "5", "12345678901234567890122",
                                    "12345678901234567890123"});
+    CHECK(texts(run_ok("t[order { v desc }];", wide_tables), "v") ==
+          std::vector<std::string>{"12345678901234567890123", "12345678901234567890122", "5",
+                                   "-99999999999999999999"});
+    auto multi = run_ok("t[order { g, v }];", wide_tables);
+    const auto* groups = std::get_if<Column<std::int64_t>>(multi.find("g"));
+    REQUIRE(groups != nullptr);
+    CHECK((*groups)[0] == 1);
+    CHECK((*groups)[1] == 1);
+    CHECK((*groups)[2] == 2);
+    CHECK((*groups)[3] == 2);
+    CHECK(texts(multi, "v") == std::vector<std::string>{"-99999999999999999999", "5",
+                                                        "12345678901234567890122",
+                                                        "12345678901234567890123"});
 }
 
 TEST_CASE("Decimal grouping and aggregates", "[decimal][e2e]") {

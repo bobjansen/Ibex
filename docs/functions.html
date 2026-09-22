@@ -136,10 +136,10 @@
         <table class="repl-table">
           <tbody>
             <tr><td><code>rolling_count()</code></td><td>Row count in the active window.</td></tr>
-            <tr><td><code>rolling_sum(col)</code></td><td>Rolling sum over the active window.</td></tr>
+            <tr><td><code>rolling_sum(col)</code></td><td>Rolling sum over the active window; <code>Decimal(p, s)</code> input sums to <code>Decimal(38, s)</code>.</td></tr>
             <tr><td><code>rolling_mean(col)</code></td><td>Rolling mean over the active window.</td></tr>
-            <tr><td><code>rolling_min(col)</code></td><td>Rolling minimum over the active window.</td></tr>
-            <tr><td><code>rolling_max(col)</code></td><td>Rolling maximum over the active window.</td></tr>
+            <tr><td><code>rolling_min(col)</code></td><td>Rolling minimum over the active window (keeps a Decimal input&rsquo;s type).</td></tr>
+            <tr><td><code>rolling_max(col)</code></td><td>Rolling maximum over the active window (keeps a Decimal input&rsquo;s type).</td></tr>
             <tr><td><code>rolling_median(col)</code></td><td>Rolling median over the active window.</td></tr>
             <tr><td><code>rolling_std(col)</code></td><td>Rolling sample standard deviation.</td></tr>
             <tr><td><code>rolling_ewma(col, alpha)</code></td><td>Rolling EWMA within each window.</td></tr>
@@ -149,8 +149,8 @@
             <tr><td><code>lag(col, n)</code></td><td>Shift backward by <code>n</code> rows in current row order; <code>n</code> may be an <code>Int64</code> scalar expression.</td></tr>
             <tr><td><code>lead(col, n)</code></td><td>Shift forward by <code>n</code> rows in current row order; <code>n</code> may be an <code>Int64</code> scalar expression.</td></tr>
             <tr><td><code>Date - Date</code></td><td>Calendar day delta as <code>Int64</code>, useful with <code>lag</code>/<code>lead</code>.</td></tr>
-            <tr><td><code>cumsum(col)</code></td><td>Prefix sum, one output per row.</td></tr>
-            <tr><td><code>cumprod(col)</code></td><td>Prefix product, one output per row.</td></tr>
+            <tr><td><code>cumsum(col)</code></td><td>Prefix sum, one output per row; <code>Decimal(p, s)</code> input sums to <code>Decimal(38, s)</code>, overflow-checked.</td></tr>
+            <tr><td><code>cumprod(col)</code></td><td>Prefix product, one output per row (<code>Int</code> or <code>Float</code>; not Decimal).</td></tr>
           </tbody>
         </table>
       </article>
@@ -206,7 +206,7 @@
         <p>Use in expressions, filters, and updates, e.g. <code>df[filter year(ts) = 2025]</code>.</p>
         <table class="repl-table">
           <tbody>
-            <tr><td><code>abs(x)</code></td><td>Absolute value.</td></tr>
+            <tr><td><code>abs(x)</code></td><td>Absolute value (a Decimal keeps its type).</td></tr>
             <tr><td><code>log(x)</code></td><td>Natural logarithm.</td></tr>
             <tr><td><code>sqrt(x)</code></td><td>Square root.</td></tr>
             <tr><td><code>year(t)</code></td><td>Year component from Date/Timestamp.</td></tr>
@@ -215,7 +215,7 @@
             <tr><td><code>hour(t)</code></td><td>Hour component from Timestamp.</td></tr>
             <tr><td><code>minute(t)</code></td><td>Minute component from Timestamp.</td></tr>
             <tr><td><code>second(t)</code></td><td>Second component from Timestamp.</td></tr>
-            <tr><td><code>round(x, mode)</code></td><td>Round Float to Int with mode: <code>nearest</code>, <code>bankers</code>, <code>floor</code>, <code>ceil</code>, or <code>trunc</code>.</td></tr>
+            <tr><td><code>round(x, mode)</code></td><td>Round Float to Int with mode: <code>nearest</code>, <code>bankers</code>, <code>floor</code>, <code>ceil</code>, or <code>trunc</code>. An Int is returned unchanged; a <code>Decimal(p, s)</code> rounds exactly to a scale-zero Decimal.</td></tr>
             <tr><td><code>like(s, pattern)</code></td><td><code>Bool</code>: SQL-LIKE match over the whole string. See below.</td></tr>
             <tr><td><code>length(s)</code></td><td><code>Int64</code>: Unicode code-point count.</td></tr>
             <tr><td><code>byte_length(s)</code></td><td><code>Int64</code>: UTF-8 byte count; use for wire/SQL compatibility.</td></tr>

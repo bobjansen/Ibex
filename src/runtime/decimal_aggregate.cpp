@@ -16,7 +16,9 @@
 #include <ibex/core/decimal.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -210,17 +212,69 @@ auto aggregate_decimal_column(const ir::AggSpec& agg, const ColumnEntry& entry,
             // overflow is past 38 digits -- an error, never a wrap.
             std::vector<Int128> sums(groups, 0);
             std::vector<std::int64_t> counts(groups, 0);
-            for (std::size_t row = 0; row < rows; ++row) {
-                if (!present(row)) {
-                    continue;
+            constexpr std::size_t kMinRowsPerWorker = 65536;
+            const bool parallel = rows >= kMinRowsPerWorker && !on_worker_pool_thread();
+            WorkerPool* pool = parallel ? &process_worker_pool() : nullptr;
+            const std::size_t workers =
+                parallel ? std::min(pool->size(), rows / kMinRowsPerWorker) : 1;
+            // A private group array per worker avoids atomics in the row loop.
+            // Bound the scratch size; very high-cardinality inputs keep the
+            // serial path rather than multiplying an already large state table.
+            const bool use_parallel = workers > 1 && groups <= (1U << 20) / workers;
+            if (use_parallel) {
+                std::vector<std::vector<Int128>> partial_sums(workers,
+                                                              std::vector<Int128>(groups, 0));
+                std::vector<std::vector<std::int64_t>> partial_counts(
+                    workers, std::vector<std::int64_t>(groups, 0));
+                std::vector<std::uint8_t> overflow(workers, 0);
+                auto batch = pool->submit(workers, [&](std::size_t worker) {
+                    const std::size_t begin = rows * worker / workers;
+                    const std::size_t end = rows * (worker + 1) / workers;
+                    auto& local_sums = partial_sums[worker];
+                    auto& local_counts = partial_counts[worker];
+                    for (std::size_t row = begin; row < end; ++row) {
+                        if (!present(row)) {
+                            continue;
+                        }
+                        const std::uint32_t g = gids[row];
+                        if (!decimal::checked_add(local_sums[g], data[row].units, local_sums[g])) {
+                            overflow[worker] = 1;
+                            return;
+                        }
+                        ++local_counts[g];
+                    }
+                });
+                batch.wait();
+                for (std::size_t worker = 0; worker < workers; ++worker) {
+                    if (overflow[worker] != 0) {
+                        return std::unexpected(
+                            std::string(agg_name(agg.func)) + "(" + agg.column.name +
+                            "): " + decimal_overflow(decimal::sum_result_type(in_type)));
+                    }
                 }
-                const std::uint32_t g = gids[row];
-                if (!decimal::checked_add(sums[g], data[row].units, sums[g])) {
-                    return std::unexpected(
-                        std::string(agg_name(agg.func)) + "(" + agg.column.name +
-                        "): " + decimal_overflow(decimal::sum_result_type(in_type)));
+                for (std::size_t worker = 0; worker < workers; ++worker) {
+                    for (std::size_t g = 0; g < groups; ++g) {
+                        if (!decimal::checked_add(sums[g], partial_sums[worker][g], sums[g])) {
+                            return std::unexpected(
+                                std::string(agg_name(agg.func)) + "(" + agg.column.name +
+                                "): " + decimal_overflow(decimal::sum_result_type(in_type)));
+                        }
+                        counts[g] += partial_counts[worker][g];
+                    }
                 }
-                ++counts[g];
+            } else {
+                for (std::size_t row = 0; row < rows; ++row) {
+                    if (!present(row)) {
+                        continue;
+                    }
+                    const std::uint32_t g = gids[row];
+                    if (!decimal::checked_add(sums[g], data[row].units, sums[g])) {
+                        return std::unexpected(
+                            std::string(agg_name(agg.func)) + "(" + agg.column.name +
+                            "): " + decimal_overflow(decimal::sum_result_type(in_type)));
+                    }
+                    ++counts[g];
+                }
             }
             std::vector<std::uint8_t> seen(groups, 0);
             for (std::size_t g = 0; g < groups; ++g) {

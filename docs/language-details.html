@@ -1014,8 +1014,11 @@ df[<span class="kw">update</span> { i = <span class="fn-name">seq</span>(), t = 
           <p>
             <code>cumsum(col)</code> and <code>cumprod(col)</code> compute
             prefix sums and products over any <code>Int</code> or
-            <code>Float</code> column. Both return the same type as their input
-            and are valid in <code>select</code> and <code>update</code> blocks
+            <code>Float</code> column. Both return the same type as their input.
+            <code>cumsum</code> also takes a <code>Decimal(p,&nbsp;s)</code>
+            column and returns <code>Decimal(38,&nbsp;s)</code>, checking every
+            prefix for overflow; <code>cumprod</code> is not defined for
+            Decimal, whose scale would grow at every step. Both are valid in <code>select</code> and <code>update</code> blocks
             &mdash; DataFrame or TimeFrame &mdash; with or without a
             <code>window</code> clause.
           </p>

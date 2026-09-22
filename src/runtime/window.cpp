@@ -6,6 +6,7 @@
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -609,6 +610,7 @@ auto window_bound_column(const Table& table, ir::Duration duration, bool aligned
 // pair in the output expression, which may be sampling skid -- the next step is
 // a cycle-accurate profile, which this box cannot give (WSL2 has no hardware
 // counters).
+// NOLINTNEXTLINE(readability-function-size)
 auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec spec, bool aligned)
     -> std::expected<ComputedColumn, std::string> {
     std::size_t rows = table.rows();
@@ -739,7 +741,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                 } else {
                     const auto* values = col.data();
                     Column<double> result;
-                    result.resize_for_overwrite(rows);
+                    result.resize(rows);
                     auto* result_values = result.data();
                     if (sv == nullptr) {
                         double sum = 0.0;
@@ -834,7 +836,57 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
             [&](const auto& col) -> std::expected<ComputedColumn, std::string> {
                 using ColT = std::decay_t<decltype(col)>;
                 using T = ColT::value_type;
-                if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
+                if constexpr (std::is_same_v<T, Decimal>) {
+                    const DecimalType input_type = decimal_type_of(col);
+                    const DecimalType result_type = decimal::sum_result_type(input_type);
+                    Column<Decimal> result = make_decimal_column(result_type);
+                    result.resize(rows);
+                    Decimal* output = result.data();
+                    const Decimal* values = col.data();
+                    std::optional<ValidityBitmap> out_valid;
+                    Int128 sum = 0;
+                    std::size_t valid_count = 0;
+                    std::size_t lo = 0;
+                    for (std::size_t i = 0; i < rows; ++i) {
+                        while (lo < i && should_drop(lo, i)) {
+                            if (valid_at(lo)) {
+                                Int128 next = 0;
+                                if (!decimal::checked_sub(sum, values[lo].units, next)) {
+                                    return std::unexpected(
+                                        call.callee + ": decimal overflow: result does not fit " +
+                                        decimal::type_name(result_type));
+                                }
+                                sum = next;
+                                --valid_count;
+                            }
+                            ++lo;
+                        }
+                        if (valid_at(i)) {
+                            Int128 next = 0;
+                            if (!decimal::checked_add(sum, values[i].units, next) ||
+                                !decimal::fits(next, result_type.precision)) {
+                                return std::unexpected(call.callee +
+                                                       ": decimal overflow: result "
+                                                       "does not fit " +
+                                                       decimal::type_name(result_type));
+                            }
+                            sum = next;
+                            ++valid_count;
+                        }
+                        if (valid_count == 0) {
+                            output[i] = Decimal{};
+                            if (!out_valid) {
+                                out_valid.emplace(rows, true);
+                            }
+                            out_valid->set(i, false);
+                        } else {
+                            output[i] = Decimal{sum};
+                        }
+                    }
+                    return ComputedColumn{.column = std::move(result),
+                                          .validity = std::move(out_valid)};
+                } else if constexpr (!std::is_same_v<T, std::int64_t> &&
+                                     !std::is_same_v<T, double>) {
                     return std::unexpected("rolling_sum: column must be numeric (Int or Float)");
                 } else {
                     ColT result;
@@ -1479,6 +1531,9 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     return std::unexpected(call.callee + ": categorical columns are not supported");
                 } else {
                     ColT result;
+                    if constexpr (std::is_same_v<ColT, Column<Decimal>>) {
+                        result.set_meta(col.meta());
+                    }
                     std::optional<ValidityBitmap> out_valid;
                     if constexpr (!std::is_same_v<ColT, Column<std::string>>) {
                         result.resize(rows);
@@ -1519,6 +1574,9 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
             } else {
                 using T = ColT::value_type;
                 ColT result;
+                if constexpr (std::is_same_v<ColT, Column<Decimal>>) {
+                    result.set_meta(col.meta());
+                }
                 // Unlike the other rolling kernels this one also instantiates for
                 // Date/Timestamp/bool, which have no uninitialised resize.
                 if constexpr (requires { result.resize_for_overwrite(rows); }) {

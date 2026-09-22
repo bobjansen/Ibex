@@ -518,6 +518,43 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
         FlatKey fk;
         fk.ascending = key.ascending;
         fk.validity = entry != nullptr && entry->validity.has_value() ? &*entry->validity : nullptr;
+        if (const auto* decimal_col = std::get_if<Column<Decimal>>(column)) {
+            const Decimal* values = decimal_col->data();
+            const bool fits64 = std::all_of(values, values + rows, [](const Decimal& value) {
+                return value.units >= Int128{INT64_MIN} && value.units <= Int128{INT64_MAX};
+            });
+            if (fits64) {
+                fk.kind = FlatKind::I64;
+                fk.u64 = decimal_order_keys(*decimal_col, rows);
+                flat_keys.push_back(std::move(fk));
+            } else {
+                // Encode the signed 128-bit unit count as two order-preserving
+                // u64 keys. Splitting after flipping the sign bit preserves
+                // full signed order; the existing stable multi-key radix sorts
+                // the low half first and the high half second. Dense ordinal
+                // ranking sorted all rows once before sorting them again.
+                constexpr Int128 kWord = Int128{1} << 64;
+                FlatKey high;
+                high.kind = FlatKind::I64;
+                high.ascending = key.ascending;
+                high.validity = fk.validity;
+                high.u64.reserve(rows);
+                fk.u64.reserve(rows);
+                for (const Decimal& value : *decimal_col) {
+                    Int128 upper = value.units / kWord;
+                    const Int128 lower = value.units % kWord;
+                    if (lower < 0) {
+                        --upper;
+                    }
+                    high.u64.push_back(static_cast<std::uint64_t>(upper) ^ kSignFlip);
+                    fk.u64.push_back(static_cast<std::uint64_t>(value.units));
+                }
+                // Both halves must be complemented for descending order.
+                flat_keys.push_back(std::move(high));
+                flat_keys.push_back(std::move(fk));
+            }
+            continue;
+        }
         std::visit(
             [&](const auto& col) {
                 using ColT = std::decay_t<decltype(col)>;

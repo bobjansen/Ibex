@@ -10162,6 +10162,98 @@ TEST_CASE("rep array literal string labels", "[rep]") {
     }
 }
 
+TEST_CASE("seq with no arguments ramps from zero", "[seq]") {
+    runtime::Table table;
+    table.logical_rows = 5;
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { i = seq() }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& i_col = std::get<Column<std::int64_t>>(*result->find("i"));
+    REQUIRE(i_col.size() == 5);
+    for (std::size_t i = 0; i < 5; ++i) {
+        CHECK(i_col[i] == static_cast<std::int64_t>(i));
+    }
+}
+
+TEST_CASE("seq honours from and by", "[seq]") {
+    runtime::Table table;
+    table.logical_rows = 5;
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { a = seq(10), b = seq(10, 5), c = seq(0, -2) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& a = std::get<Column<std::int64_t>>(*result->find("a"));
+    const auto& b = std::get<Column<std::int64_t>>(*result->find("b"));
+    const auto& c = std::get<Column<std::int64_t>>(*result->find("c"));
+    const std::int64_t expect_a[] = {10, 11, 12, 13, 14};
+    const std::int64_t expect_b[] = {10, 15, 20, 25, 30};
+    const std::int64_t expect_c[] = {0, -2, -4, -6, -8};
+    for (std::size_t i = 0; i < 5; ++i) {
+        CHECK(a[i] == expect_a[i]);
+        CHECK(b[i] == expect_b[i]);
+        CHECK(c[i] == expect_c[i]);
+    }
+}
+
+TEST_CASE("seq yields Float64 when either argument is a Float", "[seq]") {
+    runtime::Table table;
+    table.logical_rows = 4;
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { t0 = seq(0.0, 0.5), t1 = seq(1, 0.25) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& t0 = std::get<Column<double>>(*result->find("t0"));
+    const auto& t1 = std::get<Column<double>>(*result->find("t1"));
+    const double expect_t0[] = {0.0, 0.5, 1.0, 1.5};
+    const double expect_t1[] = {1.0, 1.25, 1.5, 1.75};
+    for (std::size_t i = 0; i < 4; ++i) {
+        CHECK(t0[i] == Catch::Approx(expect_t0[i]));
+        CHECK(t1[i] == Catch::Approx(expect_t1[i]));
+    }
+}
+
+TEST_CASE("seq rejects named arguments and non-numeric literals", "[seq]") {
+    runtime::Table table;
+    table.logical_rows = 4;
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    SECTION("the named form cannot be written: from and by are reserved keywords") {
+        // Not a seq diagnostic at all — the lexer takes `from` and `by` as
+        // keywords (KeywordFrom / KeywordBy), so these fail in the parser and
+        // never reach lowering. Asserted through parser::parse rather than
+        // require_ir, which REQUIREs a successful lower.
+        CHECK_FALSE(parser::parse("t[update { i = seq(from=0) }];").has_value());
+        CHECK_FALSE(parser::parse("t[update { i = seq(0, by=1) }];").has_value());
+    }
+    SECTION("a named argument that does lex is still refused") {
+        auto ir = require_ir("t[update { i = seq(0, step=2) }];");
+        CHECK_FALSE(runtime::interpret(*ir, registry).has_value());
+    }
+    SECTION("length_out is not a seq parameter") {
+        auto ir = require_ir("t[update { i = seq(0, length_out=4) }];");
+        CHECK_FALSE(runtime::interpret(*ir, registry).has_value());
+    }
+    SECTION("too many positional arguments") {
+        auto ir = require_ir("t[update { i = seq(0, 1, 2) }];");
+        CHECK_FALSE(runtime::interpret(*ir, registry).has_value());
+    }
+    SECTION("a string literal is not numeric") {
+        auto ir = require_ir("t[update { i = seq(\"a\") }];");
+        CHECK_FALSE(runtime::interpret(*ir, registry).has_value());
+    }
+}
+
 TEST_CASE("string interpolation builds a String column in update", "[interp]") {
     // `row ${id}: ${g}` desugars to __interp(...) and produces a String column
     // per row. This also exercises the per-row String-column builder.

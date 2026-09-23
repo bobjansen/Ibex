@@ -1537,6 +1537,37 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                     }},
             });
 
+        // seq(from=0, by=1): an arithmetic ramp the length of the frame. Both
+        // parameters are positional because `infer` is handed positional types
+        // only — Int when both are Int, Float as soon as either one is.
+        m.emplace(
+            "seq",
+            BuiltinFn{
+                .min_args = 0,
+                .max_args = 2,
+                .infer = [](std::string_view, const std::vector<ExprType>& a) -> IT {
+                    for (const auto t : a) {
+                        if (t == ExprType::Double) {
+                            return ExprType::Double;
+                        }
+                        if (t != ExprType::Int) {
+                            return std::unexpected(
+                                std::string("seq: from and by must be Int or Float"));
+                        }
+                    }
+                    return ExprType::Int;
+                },
+                .exec = GeneratorExec{.column_eval = [](const ir::CallExpr& call, const Table&,
+                                                        std::size_t rows, const ColumnEvalCtx&)
+                                          -> std::expected<ComputedColumn, std::string> {
+                    auto col = apply_seq_func(call, rows);
+                    if (!col) {
+                        return std::unexpected(col.error());
+                    }
+                    return ComputedColumn{.column = std::move(*col), .validity = std::nullopt};
+                }},
+            });
+
         // ── Transforms (N→N, ordered/validity-aware): the output row i depends
         // on other rows (rolling/cum/lag/lead/fill_forward/fill_backward) or on
         // column validity (fill_null, null_if_*), so they evaluate at column
@@ -3758,6 +3789,87 @@ auto apply_rep_func(const ir::CallExpr& call, const Table& input, std::size_t ro
     }
 
     return std::unexpected("rep: first argument must be a scalar literal or column reference");
+}
+
+// seq(from=0, by=1) — an arithmetic ramp over the frame's rows.
+//
+//   seq()          – 0, 1, 2, ...
+//   seq(10)        – 10, 11, 12, ...
+//   seq(10, 5)     – 10, 15, 20, ...
+//   seq(0.0, 0.5)  – 0.0, 0.5, 1.0, ...
+//
+// `from` and `by` are positional, not named: `infer` receives only positional
+// argument types (see infer_expr_type), so a named `from=0.0` would type the
+// column Int and then be filled with Doubles. Named args are refused rather
+// than ignored, so that mismatch cannot be written.
+//
+// There is no `length_out`. The output is always the frame's row count, which
+// is the only length `rep`'s `length_out` accepts either — evaluate_field's
+// generator guard rejects a generated length that differs from the frame.
+auto apply_seq_func(const ir::CallExpr& call, std::size_t rows)
+    -> std::expected<ColumnValue, std::string> {
+    if (call.args.size() > 2) {
+        return std::unexpected("seq: expected at most 2 arguments (from, by)");
+    }
+    if (!call.named_args.empty()) {
+        return std::unexpected("seq: unknown named argument '" + call.named_args.front().name +
+                               "'; from and by are positional — seq(from, by)");
+    }
+
+    // Whether either literal was written as a Float decides the column type:
+    // Int only when both are Int, which is what `infer` concludes from these
+    // same two literals.
+    std::int64_t from_i = 0;
+    std::int64_t by_i = 1;
+    double from_d = 0.0;
+    double by_d = 1.0;
+    bool is_double = false;
+    std::string err;
+
+    const auto read = [&](std::size_t pos, std::int64_t& out_i, double& out_d) {
+        if (pos >= call.args.size() || !err.empty()) {
+            return;
+        }
+        const auto* lit = std::get_if<ir::Literal>(&call.args[pos]->node);
+        if (lit == nullptr) {
+            err = "seq: argument " + std::to_string(pos + 1) + " must be a numeric literal";
+            return;
+        }
+        if (const auto* i = std::get_if<std::int64_t>(&lit->value)) {
+            out_i = *i;
+            out_d = static_cast<double>(*i);
+            return;
+        }
+        if (const auto* d = std::get_if<double>(&lit->value)) {
+            out_d = *d;
+            out_i = static_cast<std::int64_t>(*d);
+            is_double = true;
+            return;
+        }
+        err = "seq: argument " + std::to_string(pos + 1) + " must be numeric";
+    };
+    read(0, from_i, from_d);
+    read(1, by_i, by_d);
+    if (!err.empty()) {
+        return std::unexpected(err);
+    }
+
+    // Row i is computed from i rather than accumulated: a running `+= by` would
+    // drift on the Float path.
+    if (is_double) {
+        Column<double> col;
+        col.reserve(rows);
+        for (std::size_t i = 0; i < rows; ++i) {
+            col.push_back(from_d + (by_d * static_cast<double>(i)));
+        }
+        return col;
+    }
+    Column<std::int64_t> col;
+    col.reserve(rows);
+    for (std::size_t i = 0; i < rows; ++i) {
+        col.push_back(from_i + (by_i * static_cast<std::int64_t>(i)));
+    }
+    return col;
 }
 
 }  // namespace ibex::runtime

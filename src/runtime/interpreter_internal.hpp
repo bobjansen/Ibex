@@ -1885,6 +1885,8 @@ enum class FloatCleanMode : std::uint8_t {
     -> std::expected<ColumnValue, std::string>;
 [[nodiscard]] auto apply_rep_func(const ir::CallExpr& call, const Table& input, std::size_t rows)
     -> std::expected<ColumnValue, std::string>;
+[[nodiscard]] auto apply_seq_func(const ir::CallExpr& call, std::size_t rows)
+    -> std::expected<ColumnValue, std::string>;
 [[nodiscard]] auto expr_value_to_double(const ExprValue& v) -> std::optional<double>;
 [[nodiscard]] auto expr_value_to_string(const ExprValue& v) -> std::string;
 

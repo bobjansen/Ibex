@@ -82,6 +82,10 @@ namespace {
 // a ring wait pick up a *sibling* from its own batch, which then parks on the
 // same ring and recurses without bound (a `MorselPipelineOperator` worker in
 // `OrderedChunkRing::acquire` grabbing another `run_worker` was exactly that).
+// The gate covers `wait_for_batch`'s assist too. Left ungated there, a waiter
+// picked up an unrelated older scan-worker task that parked on its ring and
+// stranded the nested decode the waiter was blocked on (q19 hung about one run
+// in three).
 std::atomic<std::uint64_t> g_submit_gen{0};
 
 // The generation of the task this thread is running, or 0 on a thread that is

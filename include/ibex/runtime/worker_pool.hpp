@@ -18,8 +18,8 @@ namespace ibex::runtime {
 /// it has nothing to assist with but its own wait condition is still unmet.
 /// Short enough that the "work was enqueued the instant after I last looked"
 /// window costs nothing on a path that is already a backpressure stall; long
-/// enough not to spin. Shared by `wait_for_batch` and the pipeline ring waits —
-/// see `plans/cooperative-pipeline-waits-plan.md`.
+/// enough not to spin. Shared by `wait_for_batch` and the pipeline ring waits
+/// (`cooperative_ring_wait` in `pipeline_executor.cpp`).
 inline constexpr auto kCoopPollInterval = std::chrono::microseconds(250);
 
 /// Process-owned worker pool for the runtime's morsel pipelines
@@ -128,15 +128,17 @@ class WorkerPool {
     /// tasks must finish before the pool is destroyed.
     [[nodiscard]] auto task_group() -> TaskGroup;
 
-    /// Run one queued task on the calling thread, or return false when the queue
-    /// is empty. The caller need not be a pool worker.
+    /// Run one queued task on the calling thread, or return false when there is
+    /// none it may run. The caller need not be a pool worker.
     ///
-    /// Every queued task belongs to the current query (the one-query-at-a-time
-    /// lease), so running an arbitrary one is always safe. This is the primitive
-    /// that lets a thread blocked in a pipeline backpressure wait keep the pool
-    /// moving instead of stranding nested work — `wait_for_batch` and the
-    /// pipeline ring waits share it. See
-    /// `plans/cooperative-pipeline-waits-plan.md`.
+    /// Only strictly nested work qualifies: a task whose submit generation is
+    /// newer than the task this thread is running. A sibling or an older
+    /// pipeline worker can park on the very ring the caller waits on, which
+    /// strands the nested work (see `g_submit_gen` in `worker_pool.cpp`). This is
+    /// the primitive that lets a thread blocked in a pipeline backpressure wait
+    /// keep the pool moving instead of stranding nested work.
+    /// `wait_for_batch` and `cooperative_ring_wait` (`pipeline_executor.cpp`)
+    /// share it.
     [[nodiscard]] auto try_run_one_pending() noexcept -> bool;
 
    private:

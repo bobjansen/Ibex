@@ -181,7 +181,7 @@ TEST_CASE("try_run_one_pending drains nested work when every worker is otherwise
     // sleep through. `Batch::wait` already cooperates; `OrderedChunkRing`'s
     // waits did not, so a nested `submit` under a scan worker stranded its
     // tasks with no thread in the pool's dispatch loop to run them
-    // (`plans/cooperative-pipeline-waits-plan.md`). The fix: the ring wait calls
+    // (`cooperative_ring_wait` in `pipeline_executor.cpp`). The fix: the ring wait calls
     // `try_run_one_pending` while parked. This exercises that primitive under
     // the exact topology — replace the `try_run_one_pending` call below with a
     // bare `yield()` and this test hangs.

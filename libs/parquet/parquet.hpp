@@ -3494,11 +3494,15 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
     /// A call already on a pool thread (a nested decode — a dimension table
     /// scanned from inside a pipeline worker) used to bail to serial: `submit`
     /// from a worker could strand its tasks against a saturated pool. The
-    /// cooperative ring waits (`plans/cooperative-pipeline-waits-plan.md`) fixed
-    /// that — a parked worker now runs queued tasks — so a nested decode fans
-    /// out too, bounded by the workers actually free (`pool.size() - busy`).
-    /// This is the lever for the small dimension tables (customer/part, 1-2 row
-    /// groups) whose 5-7 columns otherwise decode on one worker while six idle.
+    /// cooperative ring waits (`cooperative_ring_wait` in
+    /// `pipeline_executor.cpp`) fixed that — a parked worker now runs queued
+    /// tasks — so a nested decode fans out too, capped at `kNestedDecodeFanout`
+    /// and only for a file with fewer row groups than the pool has threads (see
+    /// the gate below). This is the lever for the small dimension tables
+    /// (customer/part, 1-2 row groups) whose 5-7 columns otherwise decode on one
+    /// worker while six idle: q18 −10%, q02 −5%, q10 −3%. An earlier cut sized
+    /// the cap from a live `pool.size() - busy` counter; the per-task atomic
+    /// cost more than the fixed cap.
     ///
     /// The settings come from the query's `ExecutionContext`, never from the
     /// environment — a decoder that read `IBEX_PARALLEL` itself would be a

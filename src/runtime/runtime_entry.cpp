@@ -200,6 +200,10 @@ auto materialize_row_local(const ir::Node& node, const TableRegistry& registry,
 // A kind not listed here (or one whose children are template/expression nodes)
 // gets no pre-build: `interpret_node` evaluates it whole, which is the prior
 // behaviour.
+//
+// This allowlist matters. A first cut that also pre-built `Window`'s direct
+// child and `Stream`'s template failed 51 tests, because each of those was then
+// evaluated on its own.
 auto fallback_relational_inputs(const ir::Node& node) -> std::vector<const ir::Node*> {
     std::vector<const ir::Node*> inputs;
     switch (node.kind()) {
@@ -241,6 +245,9 @@ auto fallback_relational_inputs(const ir::Node& node) -> std::vector<const ir::N
 // `pre_materialized_children` -- so a `Filter`/`Project` feeding the breaker is
 // not re-evaluated whole-table and serial. `interpret_node` still recurses for
 // anything deeper, and for any kind `fallback_relational_inputs` leaves empty.
+// Sending the whole subtree to `interpret_node` without this pre-build cost
+// `join_filter_rank` 14.7%: the filter between the join and the grouped rank
+// lost its fused parallel scan.
 auto build_materialized_fallback(const ir::Node& node, const TableRegistry& registry,
                                  const ScalarRegistry* scalars, const ExternRegistry* externs,
                                  const ExecutionContext& exec, ModelResult* model_out)

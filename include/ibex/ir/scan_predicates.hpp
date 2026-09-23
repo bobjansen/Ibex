@@ -70,6 +70,21 @@ struct ScanInstanceSplit {
 /// for it. Every other repeated scan is left shared: it is decoded once, and
 /// occurrence identity for FD reduction comes from `ColumnOrigin::scan`, not a
 /// rename.
+///
+/// Without this pass TPC-H q18 regresses 83%: its main `lineitem` join is a
+/// deferrable probe, and `collect_deferrable` requires the probe source to be
+/// scanned exactly once, which a self-referenced `lineitem` is not.
+///
+/// The `source#k` name does more than carry identity, which makes the pass hard
+/// to delete. Keying deferred probes by `Scan` node id and dropping the
+/// `count == 1` guard (tried 2026-08-31) passed the fast tests but broke 6-10
+/// TPC-H answers, for three reasons. `interpret_node`'s Scan handler resolves
+/// `registry.find(name)` before any node-keyed probe, so the probe read the eager
+/// full decode. `interpret_wrapped_right`'s `local[name] = probe_table` shadow
+/// collides with the source's other uses once the name is the real one. And
+/// without the guard `collect_deferrable` fired on ineligible scans. Removing
+/// the rename means making `interpret_node`, `build_operator` and the repl demand
+/// loop node-aware together.
 [[nodiscard]] auto isolate_deferrable_probe_scans(NodePtr root,
                                                   const std::set<std::string>& sources)
     -> ScanInstanceSplit;

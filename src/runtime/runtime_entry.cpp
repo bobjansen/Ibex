@@ -121,6 +121,13 @@ auto is_streamable_pair_int_join(const ir::JoinNode& join) -> bool {
         join.expect().asserts_anything() || join.take() != ir::MatchSelection::All) {
         return false;
     }
+    return join_keys_provably_int64(join);
+}
+
+auto join_keys_provably_int64(const ir::JoinNode& join) -> bool {
+    if (join.children().size() != 2) {
+        return false;
+    }
     const ir::SchemaInfo left_schema = ir::infer_schema(*join.children()[0]);
     const ir::SchemaInfo right_schema = ir::infer_schema(*join.children()[1]);
     if (!left_schema.is_known() || !right_schema.is_known()) {

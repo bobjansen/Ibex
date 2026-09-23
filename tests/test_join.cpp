@@ -24,6 +24,8 @@
 #include <variant>
 #include <vector>
 
+#include "interpreter_internal.hpp"
+
 using namespace ibex;
 
 namespace {
@@ -1053,6 +1055,130 @@ TEST_CASE("join: multi-key semi join preserves left row order when left side is 
     CHECK(col_i64(out, "id") == std::vector<std::int64_t>{1, 2});
     CHECK(col_i64(out, "bucket") == std::vector<std::int64_t>{20, 10});
     CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{200, 300});
+}
+
+// Two provably-Int64 keys stream through the semi/anti operator's pair set
+// (q20's `probed_key_restriction` shape) instead of `join_table_impl`. The
+// ascriptions are what make the key types provable; without them the join
+// declines and the test above is the one that runs.
+TEST_CASE("join: two-Int64-key semi and anti stream with null and duplicate keys", "[join]") {
+    constexpr const char* kSemi =
+        "(lhs as DataFrame<{ id: Int64, bucket: Int64, lval: Int64 }>) semi join "
+        "(rhs as DataFrame<{ id: Int64, bucket: Int64 }>) on { id, bucket };";
+    constexpr const char* kAnti =
+        "(lhs as DataFrame<{ id: Int64, bucket: Int64, lval: Int64 }>) anti join "
+        "(rhs as DataFrame<{ id: Int64, bucket: Int64 }>) on { id, bucket };";
+    {
+        // The fast path must fire, or both expectations below would be met by
+        // the old materializing join and guard nothing.
+        auto parsed = parser::parse(kSemi);
+        REQUIRE(parsed.has_value());
+        auto lowered = parser::lower(*parsed);
+        REQUIRE(lowered.has_value());
+        const ir::Node* node = lowered->get();
+        while (node->kind() != ir::NodeKind::Join) {
+            REQUIRE(node->children().size() == 1);
+            node = node->children().front().get();
+        }
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+        CHECK(runtime::is_streamable_semi_anti_join(static_cast<const ir::JoinNode&>(*node)));
+    }
+
+    SECTION("small: nulls match nothing, one-key matches do not count") {
+        // Row  id  bucket  lval   vs rhs pairs {(1,10) x2, (2,20), (0,0), null-id (3,30)}
+        //  0    1    10    100    match (duplicated on the right)
+        //  1    1    20    101    id matches, bucket does not
+        //  2    2    20    102    match
+        //  3    5   null   103    null bucket; its stored value 0 must not match
+        //  4    0     0    104    match
+        //  5    3    30    105    right's (3,30) row has a null id
+        //  6    0   null   106    null bucket vs right (0,0)
+        runtime::ValidityBitmap lbucket(7, true);
+        lbucket.set(3, false);
+        lbucket.set(6, false);
+        runtime::Table lhs;
+        lhs.add_column("id", Column<std::int64_t>{1, 1, 2, 5, 0, 3, 0});
+        lhs.add_column("bucket", Column<std::int64_t>{10, 20, 20, 0, 0, 30, 0}, lbucket);
+        lhs.add_column("lval", Column<std::int64_t>{100, 101, 102, 103, 104, 105, 106});
+        runtime::ValidityBitmap rid(5, true);
+        rid.set(4, false);
+        runtime::Table rhs;
+        rhs.add_column("id", Column<std::int64_t>{1, 1, 2, 0, 3}, rid);
+        rhs.add_column("bucket", Column<std::int64_t>{10, 10, 20, 0, 30});
+        runtime::TableRegistry tables;
+        tables.emplace("lhs", std::move(lhs));
+        tables.emplace("rhs", std::move(rhs));
+
+        auto semi = interpret_expr(kSemi, tables);
+        CHECK(col_i64(semi, "lval") == std::vector<std::int64_t>{100, 102, 104});
+        auto anti = interpret_expr(kAnti, tables);
+        CHECK(col_i64(anti, "lval") == std::vector<std::int64_t>{101, 103, 105, 106});
+    }
+
+    SECTION("empty right: semi keeps nothing, anti keeps everything") {
+        runtime::Table lhs;
+        lhs.add_column("id", Column<std::int64_t>{1, 2});
+        lhs.add_column("bucket", Column<std::int64_t>{1, 2});
+        lhs.add_column("lval", Column<std::int64_t>{7, 8});
+        runtime::Table rhs;
+        rhs.add_column("id", Column<std::int64_t>{});
+        rhs.add_column("bucket", Column<std::int64_t>{});
+        runtime::TableRegistry tables;
+        tables.emplace("lhs", std::move(lhs));
+        tables.emplace("rhs", std::move(rhs));
+
+        CHECK(interpret_expr(kSemi, tables).rows() == 0);
+        CHECK(col_i64(interpret_expr(kAnti, tables), "lval") == std::vector<std::int64_t>{7, 8});
+    }
+
+    SECTION("large: the threaded predicate keeps left order and agrees with join_tables") {
+        constexpr std::int64_t kRows = 300000;  // over the operator's fan-out gate
+        Column<std::int64_t> ids;
+        Column<std::int64_t> buckets;
+        Column<std::int64_t> lvals;
+        for (std::int64_t i = 0; i < kRows; ++i) {
+            const std::int64_t id = kRows - 1 - i;  // descending, so order errors show
+            ids.push_back(id);
+            buckets.push_back(id % 7);
+            lvals.push_back(id * 10);
+        }
+        // Every third id, with the right bucket only when id is even: an odd
+        // multiple of three matches on id alone and must be dropped.
+        Column<std::int64_t> rids;
+        Column<std::int64_t> rbuckets;
+        for (std::int64_t id = 0; id < kRows; id += 3) {
+            rids.push_back(id);
+            rbuckets.push_back(id % 2 == 0 ? id % 7 : (id % 7) + 1);
+        }
+        runtime::Table lhs;
+        lhs.add_column("id", std::move(ids));
+        lhs.add_column("bucket", std::move(buckets));
+        lhs.add_column("lval", std::move(lvals));
+        runtime::Table rhs;
+        rhs.add_column("id", std::move(rids));
+        rhs.add_column("bucket", std::move(rbuckets));
+
+        std::vector<std::int64_t> want_semi;
+        std::vector<std::int64_t> want_anti;
+        for (std::int64_t i = 0; i < kRows; ++i) {
+            const std::int64_t id = kRows - 1 - i;
+            (id % 6 == 0 ? want_semi : want_anti).push_back(id * 10);
+        }
+        auto ref_semi = runtime::join_tables(lhs, rhs, ir::JoinKind::Semi, {"id", "bucket"});
+        auto ref_anti = runtime::join_tables(lhs, rhs, ir::JoinKind::Anti, {"id", "bucket"});
+        REQUIRE(ref_semi.has_value());
+        REQUIRE(ref_anti.has_value());
+
+        runtime::TableRegistry tables;
+        tables.emplace("lhs", std::move(lhs));
+        tables.emplace("rhs", std::move(rhs));
+        auto semi = interpret_expr(kSemi, tables);
+        auto anti = interpret_expr(kAnti, tables);
+        CHECK(col_i64(semi, "lval") == want_semi);
+        CHECK(col_i64(anti, "lval") == want_anti);
+        CHECK(col_i64(*ref_semi, "lval") == want_semi);
+        CHECK(col_i64(*ref_anti, "lval") == want_anti);
+    }
 }
 
 TEST_CASE("join: outer join row count and key values", "[join]") {

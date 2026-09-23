@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
-// semi_anti_join.cpp — `ChunkedSemiAntiJoinOperator`: the streaming single-key
-// `nulls never` semi/anti join. Split out of join_chunked.cpp (which was
-// approaching the size chunked.cpp had before it was dismantled) so its own
-// code no longer perturbs the inner-join operators' codegen — an earlier
-// change here measured a repeatable q18 wall-time regression with no
-// per-operator cause, see project_semi_anti_gather_parallel. Declared in
-// join_chunked_internal.hpp (factory) and interpreter_internal.hpp
+// semi_anti_join.cpp — `ChunkedSemiAntiJoinOperator`: the streaming
+// `nulls never` semi/anti join, on one key or on two Int64 keys. Split out of
+// join_chunked.cpp (which was approaching the size chunked.cpp had before it
+// was dismantled) so its own code no longer perturbs the inner-join operators'
+// codegen — an earlier change here measured a repeatable q18 wall-time
+// regression with no per-operator cause, see project_semi_anti_gather_parallel.
+// Declared in join_chunked_internal.hpp (factory) and interpreter_internal.hpp
 // (`is_streamable_semi_anti_join`).
 
 #include <ibex/core/column.hpp>
@@ -246,6 +246,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     /// and only ever scans it.
     auto drain_right_keys() -> std::optional<std::string> {
         const std::string& key_name = keys_->front().right;
+        const std::string* key2_name = keys_->size() == 2 ? &(*keys_)[1].right : nullptr;
         const std::size_t* type_index = nullptr;
         std::size_t first_index = 0;
         while (true) {
@@ -280,6 +281,19 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 type_index = &first_index;
             } else if (entry->column->index() != first_index) {
                 return "ChunkedSemiAntiJoinOperator: right key column type differs across chunks";
+            }
+            if (key2_name != nullptr) {
+                ColumnEntry* entry2 = nullptr;
+                for (auto& column : chunk.columns) {
+                    if (column.name == *key2_name) {
+                        entry2 = &column;
+                        break;
+                    }
+                }
+                if (entry2 == nullptr) {
+                    return "join key not found in right table: " + *key2_name;
+                }
+                right_key2_chunks_.push_back(std::move(*entry2));
             }
             right_rows_ += column_size(*entry->column);
             right_key_chunks_.push_back(std::move(*entry));
@@ -537,12 +551,47 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         return std::nullopt;
     }
 
+    /// Two Int64 keys: a set of packed pairs, built from the drained key
+    /// columns. Never swapped -- the swap exists because a multi-million-row
+    /// right made the single-key set build dominate (q04), and the only
+    /// two-key semi join PDS-H plans (q20, via `probed_key_restriction`) has a
+    /// 68k-row right against a 7.28M-row left, the direction this build suits.
+    auto init_pair() -> std::optional<std::string> {
+        pair_mode_ = true;
+        right_pairs_.reserve(right_rows_);
+        for (std::size_t c = 0; c < right_key_chunks_.size(); ++c) {
+            const ColumnEntry& e0 = right_key_chunks_[c];
+            const ColumnEntry& e1 = right_key2_chunks_[c];
+            const auto* c0 = std::get_if<Column<std::int64_t>>(e0.column.get());
+            const auto* c1 = std::get_if<Column<std::int64_t>>(e1.column.get());
+            if (c0 == nullptr || c1 == nullptr) {
+                return "two-key join currently requires both keys to be Int64";
+            }
+            for (std::size_t row = 0; row < c0->size(); ++row) {
+                // A null in either key matches nothing, so the pair never
+                // enters the set.
+                if (chunk_is_null(e0, row) || chunk_is_null(e1, row)) {
+                    continue;
+                }
+                right_pairs_.insert(JoinPairKey{.a = static_cast<std::uint64_t>((*c0)[row]),
+                                                .b = static_cast<std::uint64_t>((*c1)[row])});
+            }
+        }
+        return std::nullopt;
+    }
+
     auto initialize() -> std::optional<std::string> {
-        if (keys_->size() != 1) {
-            return "ChunkedSemiAntiJoinOperator only supports single-key joins";
+        if (keys_->empty() || keys_->size() > 2) {
+            return "ChunkedSemiAntiJoinOperator supports one key or two Int64 keys";
         }
         if (auto err = drain_right_keys()) {
             return err;
+        }
+        if (keys_->size() == 2) {
+            // Set even with an empty right, so `filter_chunk` takes the pair
+            // path (and an anti join keeps every row) rather than probing
+            // one key of two.
+            return init_pair();
         }
         if (right_key_chunks_.empty()) {
             return std::nullopt;
@@ -816,11 +865,28 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     }
 
     auto filter_chunk(Table t) -> std::optional<Table> {
+        const bool keep_matches = (kind_ == ir::JoinKind::Semi);
+        if (pair_mode_) {
+            auto cols = pair_key_columns(t, (*keys_)[0].left, (*keys_)[1].left, "left");
+            if (!cols.has_value()) {
+                probe_error_ = std::move(cols.error());
+                return std::nullopt;
+            }
+            const PairKeyColumns k = *cols;
+            return filter_rows(std::move(t), [&](std::size_t row) {
+                const bool null_key =
+                    (k.v0 != nullptr && !(*k.v0)[row]) || (k.v1 != nullptr && !(*k.v1)[row]);
+                const bool match =
+                    !null_key && right_pairs_.contains(
+                                     JoinPairKey{.a = static_cast<std::uint64_t>((*k.col0)[row]),
+                                                 .b = static_cast<std::uint64_t>((*k.col1)[row])});
+                return keep_matches ? match : !match;
+            });
+        }
         const ColumnValue* key = t.find(keys_->front().left);
         if (key == nullptr) {
             return std::nullopt;
         }
-        const bool keep_matches = (kind_ == ir::JoinKind::Semi);
         // A null key matches nothing, not even another null. The set below is
         // keyed by VALUE and a null cell holds its type's zero, so without this
         // a null-keyed row would match a genuine zero on the other side --
@@ -959,6 +1025,9 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     /// else. Dropping the other columns here is why q21's `n_supp_by_order`
     /// and q22's `o_custkey` are never copied at all.
     std::vector<ColumnEntry> right_key_chunks_;
+    /// The second key's column, one entry per right chunk, parallel to
+    /// `right_key_chunks_`. Empty unless the join has two keys.
+    std::vector<ColumnEntry> right_key2_chunks_;
     std::size_t right_rows_ = 0;
     ir::JoinKind kind_;
     const std::vector<ir::JoinKey>* keys_;
@@ -974,6 +1043,10 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     const ExecutionContext* exec_ = nullptr;
 
     robin_hood::unordered_flat_set<std::int64_t> right_i64_;
+    /// Two-Int64-key joins: the right's non-null key pairs. `pair_mode_`
+    /// routes `filter_chunk` here instead of the single-key sets.
+    bool pair_mode_ = false;
+    robin_hood::unordered_flat_set<JoinPairKey, JoinPairKeyHash> right_pairs_;
     /// Dense bit-packed membership over `[dense_i64_min_, dense_i64_min_ +
     /// dense_i64_nbits_)`, used in place of `right_i64_` when the integer key
     /// span is boundable and dense enough for the bitmap to stay
@@ -1012,10 +1085,13 @@ auto make_chunked_semi_anti_join_operator(OperatorPtr left, OperatorPtr right, i
 }
 
 auto is_streamable_semi_anti_join(const ir::JoinNode& join) -> bool {
+    // One key of any type the operator sets, or two keys that are provably
+    // Int64 on both sides -- the pair shape `right_pairs_` holds. Checked
+    // last because it is the only clause that infers a schema.
     return (join.kind() == ir::JoinKind::Semi || join.kind() == ir::JoinKind::Anti) &&
-           !join.predicate().has_value() && join.keys().size() == 1 &&
-           join.null_match() == ir::NullMatch::Never && !join.expect().asserts_anything() &&
-           join.take() == ir::MatchSelection::All;
+           !join.predicate().has_value() && join.null_match() == ir::NullMatch::Never &&
+           !join.expect().asserts_anything() && join.take() == ir::MatchSelection::All &&
+           (join.keys().size() == 1 || (join.keys().size() == 2 && join_keys_provably_int64(join)));
 }
 
 }  // namespace ibex::runtime

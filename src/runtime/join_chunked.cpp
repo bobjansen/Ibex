@@ -234,18 +234,8 @@ struct JoinHashIndex {
     /// Two-fixed-width-int-key path: both key values pack into one struct,
     /// injective with no knowledge of their domains -- same trick as the
     /// aggregate's own `PairIntKey`.
-    struct PairKey {
-        std::uint64_t a = 0;
-        std::uint64_t b = 0;
-        [[nodiscard]] auto operator==(const PairKey&) const -> bool = default;
-    };
-    struct PairKeyHash {
-        auto operator()(const PairKey& key) const noexcept -> std::size_t {
-            std::uint64_t h = key.a * 0x9e3779b97f4a7c15ULL;
-            h ^= key.b + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-            return static_cast<std::size_t>(h);
-        }
-    };
+    using PairKey = JoinPairKey;
+    using PairKeyHash = JoinPairKeyHash;
     PartitionedHeads<PairKey, PairKeyHash> pair_heads;
 
     /// Borrowed from the build table; null when the key column has no nulls. A
@@ -581,42 +571,6 @@ auto choose_and_build_single_key(const Table& left, const Table& right, const st
         return build_join_side(left, left_key, key_kind, JoinOrientation::BuildLeft, partitions);
     }
     return build_join_side(right, right_key, key_kind, JoinOrientation::BuildRight, partitions);
-}
-
-/// One side's two Int64 key columns and their validity, or the error a join
-/// reports for them. `side_name` is "left" or "right" only so the message
-/// keeps naming the side the caller was asking about.
-struct PairKeyColumns {
-    const Column<std::int64_t>* col0 = nullptr;
-    const Column<std::int64_t>* col1 = nullptr;
-    const ValidityBitmap* v0 = nullptr;
-    const ValidityBitmap* v1 = nullptr;
-};
-
-auto pair_key_columns(const Table& side, const std::string& name0, const std::string& name1,
-                      std::string_view side_name) -> std::expected<PairKeyColumns, std::string> {
-    const ColumnValue* key0 = side.find(name0);
-    if (key0 == nullptr) {
-        return std::unexpected("join key not found in " + std::string(side_name) +
-                               " table: " + name0);
-    }
-    const ColumnValue* key1 = side.find(name1);
-    if (key1 == nullptr) {
-        return std::unexpected("join key not found in " + std::string(side_name) +
-                               " table: " + name1);
-    }
-    PairKeyColumns out;
-    out.col0 = std::get_if<Column<std::int64_t>>(key0);
-    out.col1 = std::get_if<Column<std::int64_t>>(key1);
-    if (out.col0 == nullptr || out.col1 == nullptr) {
-        return std::unexpected(
-            "ChunkedInnerJoinOperator: two-key join currently requires both keys to be Int64");
-    }
-    const auto* entry0 = side.find_entry(name0);
-    const auto* entry1 = side.find_entry(name1);
-    out.v0 = entry0 != nullptr && entry0->validity.has_value() ? &*entry0->validity : nullptr;
-    out.v1 = entry1 != nullptr && entry1->validity.has_value() ? &*entry1->validity : nullptr;
-    return out;
 }
 
 /// The two-Int64-key build phase. Same contract as the single-key one, with a

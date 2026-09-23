@@ -1363,6 +1363,11 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 /// alone: it calls `infer_schema` on both children.
 [[nodiscard]] auto is_streamable_pair_int_join(const ir::JoinNode& join) -> bool;
 
+/// Every key of `join` is Int64 on both sides, schema-provable -- the type
+/// half of `is_streamable_pair_int_join`, shared with the semi/anti gate's
+/// two-key case. Calls `infer_schema` on both children.
+[[nodiscard]] auto join_keys_provably_int64(const ir::JoinNode& join) -> bool;
+
 /// Whole-table single-key inner join, implemented over
 /// `ChunkedInnerJoinOperator`. Callers must check `is_streamable_inner_join`
 /// first; richer join semantics remain in `join_table_impl`, which is the

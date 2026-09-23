@@ -1,14 +1,15 @@
 # The breaker map: where the cores go
 
-Status: **items 1–4 built, 5 no-go, item 7 open** — first measured (2026-09-03, SF-8, `IBEX_CORES=8`, branch
-`better-plans`); re-measured 2026-09-22 on `main` after fixing the tool itself
+Status: **CLOSED 2026-09-23** — items 1–4 and 7 built, 5 no-go. First
+measured 2026-09-03 (SF-8, `IBEX_CORES=8`, branch `better-plans`); re-measured 2026-09-22 on `main` after fixing the tool itself
 (§4.7) — ranking holds. Item 5 (aggregate inside the scan pipeline) was sized
 and is a no-go for now (§4.8): removing the overlap it targets costs more
 than the contention it would save. Item 4 (`Aggregate.FinalOrdering` alloc
 phase) landed 2026-09-23. Re-measured the same day (§4.9): aggregate idle
 roughly halved, join is 59% of what is left, and one new single-mechanism
-breaker surfaced — two-key semi joins never stream (item 7). The plan closes
-after item 7.
+breaker surfaced — two-key semi joins never stream (item 7), built the same
+day: q20 −21%. What the map still shows belongs to other plans (§6's closing
+note).
 
 Companion to [`src/runtime/PARALLELISM.md`](../src/runtime/PARALLELISM.md) (the
 model) and [parallelism-overview.md](parallelism-overview.md) (the inconsistency
@@ -816,16 +817,21 @@ estimate until built. Still one mechanism, one query — that is item 7.
 6. ~~Re-measure the map.~~ — **done, 2026-09-23 (§4.9).** Aggregate fell from
    33.7% to 18.3% of idle; join is now 59%. FinalOrdering's remaining fanout
    (536 core-ms, q18 only) is not worth an item.
-7. **Stream two-Int64-key semi/anti joins** (§4.9, q20's 1,207 core-ms). Join
+7. ~~**Stream two-Int64-key semi/anti joins** (§4.9, q20's 1,207 core-ms)~~ —
+   **done, 2026-09-23: q20 −21.0%** (279.4 → 225.9ms min, 30/30 pairs,
+   p<0.001; full suite geomean −1.0%, no regression survives a re-run,
+   byte-identical at 1c and 8c on all 22 queries). Join
    §4.1's streaming semi/anti operator with the pair-key hashing
    `PairIntInner` already has, so two-key semi/anti stops falling to
    `MaterializeBoth`. Timed (§4.9): the fallback spends 101–142ms collecting
    7.28M lineitem rows against a ~70ms scan floor, then 25ms in a serial
-   `join_table_impl` — sized at ≈50–90ms of q20 (≈20–35%). q02 takes the same
-   path but at 0.3ms self; the other PDS-H join fallbacks (q11/q15/q22) are
-   `join cross keys=0`, a different decline, each under 10 core-ms.
+   `join_table_impl` — sized at ≈50–90ms of q20 (≈20–35%). q20 is the only
+   PDS-H query it reaches: q02's `join semi keys=2` is on
+   `(p_partkey, ps_supplycost: Float64)`, not the Int64 pair, and stays on the
+   fallback at 0.3ms; the other join fallbacks (q11/q15/q22) are
+   `join cross keys=0`, each under 10 core-ms.
 
-**After item 7 the plan closes.** What remains on the map belongs elsewhere:
+**The plan is closed.** What remains on the map belongs elsewhere:
 q04/q10/q12 decode width (§4.5, row-group size at write time), q21 occupancy,
 and §4.4's inner-join slices (join parallelism).
 

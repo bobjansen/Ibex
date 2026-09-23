@@ -224,9 +224,10 @@ boundary mutations fail it now.
 *Still there, and not addressed:* the `seen` map build and the `right_i64_`
 rebuild are serial (12ms + 23ms on q04). Small next to what was removed.
 
-### 4.2 Hash-aggregate `FinalOrdering` + `Emission` — 3,251 core-ms (13.6%) — Emission BUILT
+### 4.2 Hash-aggregate `FinalOrdering` + `Emission` — 3,251 core-ms (13.6%) — Emission BUILT, FinalOrdering alloc-phase FIXED
 
-**Status: Emission done (2026-09-03, uncommitted). `FinalOrdering` untouched.**
+**Status: Emission done (2026-09-03, uncommitted). `FinalOrdering`'s alloc phase
+fixed (2026-09-23); its fanout/frontier sub-phases untouched.**
 
 q18 (743 + 638), q21 (272 + 651 + 202 + 24), q20 (422 + 217), q10 (104). These
 are the two phases *after* accumulation: `finalize_owned_active()` transfers
@@ -284,6 +285,46 @@ at 8 cores; 1837 tests pass; a new test covers the shape the change is for
 asserts a **hand-computed** answer rather than serial-vs-parallel agreement —
 the two now share one task grid, so an index wrong in both would agree with
 itself. Mutation-checked: an off-by-one within a range fails it.
+
+*`FinalOrdering`'s alloc phase (fixed 2026-09-03 → committed 2026-09-23):*
+timing `finalize_owned`'s phases directly on q18 (SF-8, 8 cores) split the
+1,278.8 core-ms of idle into alloc 101.2ms / frontier 0.6ms / fanout 50.3ms.
+The alloc phase was `int_order_.resize(total)` — a plain
+`std::vector<int64_t>::resize()` value-initializing ~12M elements **serially**,
+immediately before `merge_segment`'s parallel fan-out overwrites every one of
+them via `store_key`. Pure redundant work, the same tax `SlotArray` already
+avoids via `grow_uninitialized` right next to it.
+
+*Fix:* `int_order_` and `pair_order_` now use a `default_init_allocator`
+(minimal C++ idiom: skip value-init on `resize()`'s new elements, leave
+`push_back`/indexing/iteration untouched). Every `resize()` call site funnels
+through one of two verified-safe patterns before this landed: (a)
+`try_discover_partitioned`'s `resize_keys`/`store_key` pair, which resizes to
+`n_groups_` then writes exactly the newly-grown `[base, n_groups_)` range via
+`store_key` before any read reaches it; (b) `finalize_owned_ordered_runs`'s two
+direct resize sites, which write every index sequentially in ascending order
+before it is ever read back. No site reads a freshly-grown, unwritten element.
+
+*Verification:* full `ctest` 1999/1999 pass (including the slow parity suite);
+byte-identical output at `IBEX_CORES=1` and `=8` across all 22 TPC-H queries
+against the pre-change binary.
+
+*Measured*, SF-8 / 8 cores, interleaved `ab_queries.py`, min-based:
+
+| query | delta | p | verdict |
+|---|---:|---:|---|
+| q18 | −7.2% | 0.006 | **FASTER**, survives correction |
+| q20 | +0.4% | 0.796 | same |
+| q10 | −0.4% | 0.756 | same |
+| q21 | −2.1% | 0.196 | unclear (trending faster, not significant) |
+
+Full 22-query suite (noisier box, 33% dispersion caution): geomean **−0.2%**,
+byte-identical everywhere, nothing regresses past Holm-Bonferroni correction.
+q18 is the query this fix targets (1.5M+ groups, largest `FinalOrdering`
+share) and is the only one with a clean, corrected-significant win — expected,
+since the alloc phase is ~8% of q18's own wall time and a much smaller share
+of queries dominated by scan/join. Fanout (50.3ms) and frontier (0.6ms) are
+unchanged — not in scope for this fix.
 
 ### 4.3 `Aggregate.Discovery` — 1,835 core-ms (7.7%) — BUILT, and it did not pay
 
@@ -691,9 +732,14 @@ Revisit only if a cheap way to isolate the redundant-fan-out cost specifically
 3. ~~**Worker-local low-cardinality aggregate** (§4.3)~~ — **built, −2%.** The
    serial pass was real and is gone; q01 is limited by pool contention with its
    own scan, not by the aggregate. Do not re-attack the aggregate here.
-4. **`Aggregate.FinalOrdering`** (§4.2's other half, 1,461 core-ms) — untouched,
-   and the harder half: it already runs at occupancy 0.63–0.70, so the headroom
-   is real but thinner than Emission's was.
+4. ~~**`Aggregate.FinalOrdering`** (§4.2's other half, 1,461 core-ms)~~ — **alloc
+   phase fixed, 2026-09-23.** The 101.2ms/1,278.8 core-ms alloc phase on q18 was
+   a redundant serial `resize()` value-init immediately overwritten by the
+   parallel merge; `default_init_allocator` on `int_order_`/`pair_order_`
+   removes it. q18 −7.2% (p=0.006, survives correction), no regressions,
+   byte-identical, full ctest pass. Fanout (50.3ms) and frontier (0.6ms) remain
+   — it still runs at occupancy 0.63–0.70, so real headroom is left, just
+   thinner now that the free alloc win is gone.
 5. **The q01 shape: aggregate inside the scan pipeline — sized, no-go for now
    (§4.8).** §4.3's negative result points at it — a breaker that fans out
    *while its producer is fanned out* spends its time queueing. §4.7 confirmed

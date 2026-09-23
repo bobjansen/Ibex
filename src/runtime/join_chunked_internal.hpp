@@ -9,14 +9,70 @@
 #include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/operator.hpp>
 
+#include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include "physical_plan.hpp"
 
 namespace ibex::runtime {
+
+/// Two fixed-width int keys packed into one struct, injective with no
+/// knowledge of their domains -- same trick as the aggregate's own
+/// `PairIntKey`. Shared by the two-key inner join's hash index and the
+/// two-key semi/anti join's key set.
+struct JoinPairKey {
+    std::uint64_t a = 0;
+    std::uint64_t b = 0;
+    [[nodiscard]] auto operator==(const JoinPairKey&) const -> bool = default;
+};
+struct JoinPairKeyHash {
+    auto operator()(const JoinPairKey& key) const noexcept -> std::size_t {
+        std::uint64_t h = key.a * 0x9e3779b97f4a7c15ULL;
+        h ^= key.b + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        return static_cast<std::size_t>(h);
+    }
+};
+
+/// One side's two Int64 key columns and their validity, or the error a join
+/// reports for them. `side_name` is "left" or "right" only so the message
+/// keeps naming the side the caller was asking about.
+struct PairKeyColumns {
+    const Column<std::int64_t>* col0 = nullptr;
+    const Column<std::int64_t>* col1 = nullptr;
+    const ValidityBitmap* v0 = nullptr;
+    const ValidityBitmap* v1 = nullptr;
+};
+
+inline auto pair_key_columns(const Table& side, const std::string& name0, const std::string& name1,
+                             std::string_view side_name)
+    -> std::expected<PairKeyColumns, std::string> {
+    const ColumnValue* key0 = side.find(name0);
+    if (key0 == nullptr) {
+        return std::unexpected("join key not found in " + std::string(side_name) +
+                               " table: " + name0);
+    }
+    const ColumnValue* key1 = side.find(name1);
+    if (key1 == nullptr) {
+        return std::unexpected("join key not found in " + std::string(side_name) +
+                               " table: " + name1);
+    }
+    PairKeyColumns out;
+    out.col0 = std::get_if<Column<std::int64_t>>(key0);
+    out.col1 = std::get_if<Column<std::int64_t>>(key1);
+    if (out.col0 == nullptr || out.col1 == nullptr) {
+        return std::unexpected("two-key join currently requires both keys to be Int64");
+    }
+    const auto* entry0 = side.find_entry(name0);
+    const auto* entry1 = side.find_entry(name1);
+    out.v0 = entry0 != nullptr && entry0->validity.has_value() ? &*entry0->validity : nullptr;
+    out.v1 = entry1 != nullptr && entry1->validity.has_value() ? &*entry1->validity : nullptr;
+    return out;
+}
 
 /// Copyable construction handle for one worker-private streaming join probe.
 /// Attaching normally clones the pristine probe state for a worker; the

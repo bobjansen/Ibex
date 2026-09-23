@@ -701,6 +701,34 @@ TEST_CASE("The plan classifies a join and builds the streaming ones", "[physical
         CHECK(plan_of("(a anti join b on k);").branch == JoinBranch::SemiAnti);
     }
 
+    SECTION("two-key semi and anti stream when both keys are provably Int64") {
+        // q20's shape: `probed_key_restriction` pushes a two-key semi join
+        // under an aggregate. It used to decline for its key count alone and
+        // materialize 7.28M lineitem rows into `join_table_impl`.
+        for (const char* src :
+             {"(a as DataFrame<{ k1: Int64, k2: Int64 }> "
+              " semi join b as DataFrame<{ k1: Int64, k2: Int64 }> on { k1, k2 });",
+              "(a as DataFrame<{ k1: Int64, k2: Int64 }> "
+              " anti join b as DataFrame<{ k1: Int64, k2: Int64 }> on { k1, k2 });"}) {
+            CAPTURE(src);
+            const auto plan = plan_of(src);
+            CHECK(plan.strategy == JoinStrategy::StreamingProbe);
+            CHECK(plan.branch == JoinBranch::SemiAnti);
+            CHECK(plan.decline == JoinDeclineReason::None);
+            CHECK(plan.key_count == 2);
+        }
+        // Unprovable or non-Int64 key types still decline, for the type.
+        CHECK(plan_of("(a semi join b on { k1, k2 });").decline ==
+              JoinDeclineReason::KeyTypesUnsupported);
+        const auto typed = plan_of(
+            "(a as DataFrame<{ k1: Int64, k2: String }> "
+            " semi join b as DataFrame<{ k1: Int64, k2: String }> on { k1, k2 });");
+        CHECK(typed.strategy == JoinStrategy::MaterializeBoth);
+        CHECK(typed.decline == JoinDeclineReason::KeyTypesUnsupported);
+        CHECK(plan_of("(a semi join b on { k1, k2, k3 });").decline ==
+              JoinDeclineReason::MultipleKeys);
+    }
+
     SECTION("the branch is named, so the seam never infers it from key count") {
         // The seam dispatches on this. It used to deduce the operator from
         // `key_count == 1` vs `== 2`, which held only while StreamingProbe

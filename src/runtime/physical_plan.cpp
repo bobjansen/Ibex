@@ -1183,15 +1183,10 @@ auto plan_join(const ir::JoinNode& join) -> JoinPlan {
         // NOLINTNEXTLINE(bugprone-branch-clone)
     } else if (join.keys().size() > 2) {
         out.decline = JoinDeclineReason::MultipleKeys;
-    } else if (join.keys().size() == 2 && !is_streamable_pair_int_join(join)) {
-        // Two keys stream only as the all-Int64 pair shape, and only the
-        // semi/anti and single-key gates admit one key. A two-key semi join is
-        // therefore not streamable even though each half of that sentence
-        // sounds like it should be.
-        out.decline = join.kind() == ir::JoinKind::Inner ? JoinDeclineReason::KeyTypesUnsupported
-                                                         : JoinDeclineReason::MultipleKeys;
-    } else if (join.keys().size() == 2 && join.kind() != ir::JoinKind::Inner) {
-        out.decline = JoinDeclineReason::MultipleKeys;
+    } else if (join.keys().size() == 2 && !join_keys_provably_int64(join)) {
+        // Two keys stream only as the all-Int64 pair shape -- inner through
+        // `PairIntInner`, semi/anti through the semi/anti operator's pair set.
+        out.decline = JoinDeclineReason::KeyTypesUnsupported;
     } else if (join.null_match() != ir::NullMatch::Never) {
         out.decline = JoinDeclineReason::NullsEqual;
     } else if (join.expect().asserts_anything()) {

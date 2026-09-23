@@ -1,11 +1,14 @@
 # The breaker map: where the cores go
 
-Status: **measured, nothing built** (2026-09-03, SF-8, `IBEX_CORES=8`, branch
+Status: **items 1–4 built, 5 no-go, item 7 open** — first measured (2026-09-03, SF-8, `IBEX_CORES=8`, branch
 `better-plans`); re-measured 2026-09-22 on `main` after fixing the tool itself
 (§4.7) — ranking holds. Item 5 (aggregate inside the scan pipeline) was sized
 and is a no-go for now (§4.8): removing the overlap it targets costs more
-than the contention it would save. Item 4 (`Aggregate.FinalOrdering`) is
-next.
+than the contention it would save. Item 4 (`Aggregate.FinalOrdering` alloc
+phase) landed 2026-09-23. Re-measured the same day (§4.9): aggregate idle
+roughly halved, join is 59% of what is left, and one new single-mechanism
+breaker surfaced — two-key semi joins never stream (item 7). The plan closes
+after item 7.
 
 Companion to [`src/runtime/PARALLELISM.md`](../src/runtime/PARALLELISM.md) (the
 model) and [parallelism-overview.md](parallelism-overview.md) (the inconsistency
@@ -690,6 +693,63 @@ is multi-day work for a payoff that just got smaller and remains unsized.
 Revisit only if a cheap way to isolate the redundant-fan-out cost specifically
 (without losing the overlap) turns up — not scheduled as a next step.
 
+### 4.9 Re-measure, 2026-09-23 (after item 4) — aggregate is done, a two-key semi join surfaces
+
+Fresh full `build-release`, quiet box, SF-8/8c, single run (directional, not
+the interleaved-min-wall convention). **18/22 reliable** — q13 joins q01/q11/q15
+as `UNRELIABLE` (closure 232%: its `aggregate keys=1` overlaps its string-filter
+scan, the same concurrent-execution signature §4.7 describes).
+
+Idle **13,963 core-ms** over the reliable set (§4.7: 20,696 over 19/22 — not
+like-for-like, q13 moved out). Families: **join 59.0%** (was 46.7), scan 18.6%,
+**aggregate 18.3%** (was 33.7). `Aggregate.FinalOrdering` is down to 594
+core-ms (4.3%), 536 of it q18 — its remaining fanout is not a plan-level item.
+
+The top rows, read against what they are:
+
+| row | idle | self / barrier / ring / pool (ms) | reading |
+|---|---:|---|---|
+| q04 `join semi keys=1` | 1,262 | 175.9 / 21.9 / 175.8 / 145.0 | all self is ring wait — starved by its scan, §4.5 decode width |
+| **q20 `join semi keys=2`** | **1,207** | **175.0 / 29.1 / 0.0 / 192.9** | **new — but inflated by overlap, see below** |
+| q21 `join semi keys=1` | 1,090 | 206.0 / 74.2 / 0.0 / 558.4 | q21 occupancy ([[project_q21_is_occupancy_bound]]) |
+| q19 `join inner keys=1` | 710 | 122.3 / 43.2 / 48.4 / 268.0 | §4.4, spread thin |
+| q10 `source decode whole` | 573 | 115.4 / 44.5 / 0.0 / 350.1 | decode width |
+
+**q20's semi join is a planner gap, not a slow kernel.** q20's source has no
+semi join; `probed_key_restriction` (`src/ir/probed_key_restriction.cpp`)
+pushes one under q1's aggregate, restricting the date-filtered lineitem
+(7,280,281 rows) by partsupp's `(ps_partkey, ps_suppkey)` before grouping.
+`plan_join` (`physical_plan.cpp`) streams two keys only as an all-Int64
+**inner** join (`PairIntInner`); §4.1's streaming semi/anti operator admits
+one key. So this two-key semi join falls to `MaterializeBoth` — the code says
+so itself (*"A two-key semi join is therefore not streamable even though each
+half of that sentence sounds like it should be"*). `IBEX_PLAN_STATS` shows it
+as q20's one `plan fallback: kind=Join`.
+
+**The 1,207 is not 1,207 of serial work.** Materializing the left side is what
+pulls the lineitem scan, so the scan's parallel decode runs inside the semi
+join's `self` window: it is credited to the scan's row (−383, and −322 on
+`source decode selected`) while the semi join's row reads the same window as
+idle — §1's overlap caveat, on a query whose closure (84%) still passes.
+On-CPU, the calling thread spends only ~35ms in the join itself
+(`join_table_impl` ~15, `memmove` ~13, `hash_key_row` ~5; perf, 4kHz).
+
+*Timed* (temporary `steady_clock` around `build_materialized_fallback`'s
+phases, reverted; 8c, warm, 4 runs):
+
+| phase | ms |
+|---|---:|
+| materialize left — filtered lineitem, 7.28M rows | 101–142 |
+| materialize right — 68,812 rows | ~6 |
+| `join_table_impl` semi, serial | ~25 |
+
+The same filtered lineitem scan alone (scan + four sums, no join) is ~70ms of
+**process** wall, startup included — the decode floor a streaming semi join
+still pays. What streaming removes is the collect above that floor (~30–70ms)
+plus the serial join (~25ms), with the chunk filter itself running on the
+pool: **sized at roughly 50–90ms of q20's ~240–270ms (≈20–35%)**, an upper-ish
+estimate until built. Still one mechanism, one query — that is item 7.
+
 ## 5. What the map does not say
 
 * **Small-query attribution is soft.** Per-query closure runs 95–104% on the
@@ -752,9 +812,22 @@ Revisit only if a cheap way to isolate the redundant-fan-out cost specifically
    Scan+Discovery operator) needs the same unbuilt per-worker
    accumulator-and-merge primitive either way. Not scheduled; revisit only if
    a cheap way appears to isolate the redundant-fan-out cost specifically
-   without losing the overlap. Item 4 is next instead.
-6. Re-measure the map. Every item above moves capacity between rows; the
-   ranking after step 3 is not the ranking now.
+   without losing the overlap.
+6. ~~Re-measure the map.~~ — **done, 2026-09-23 (§4.9).** Aggregate fell from
+   33.7% to 18.3% of idle; join is now 59%. FinalOrdering's remaining fanout
+   (536 core-ms, q18 only) is not worth an item.
+7. **Stream two-Int64-key semi/anti joins** (§4.9, q20's 1,207 core-ms). Join
+   §4.1's streaming semi/anti operator with the pair-key hashing
+   `PairIntInner` already has, so two-key semi/anti stops falling to
+   `MaterializeBoth`. Timed (§4.9): the fallback spends 101–142ms collecting
+   7.28M lineitem rows against a ~70ms scan floor, then 25ms in a serial
+   `join_table_impl` — sized at ≈50–90ms of q20 (≈20–35%). q02 takes the same
+   path but at 0.3ms self; the other PDS-H join fallbacks (q11/q15/q22) are
+   `join cross keys=0`, a different decline, each under 10 core-ms.
+
+**After item 7 the plan closes.** What remains on the map belongs elsewhere:
+q04/q10/q12 decode width (§4.5, row-group size at write time), q21 occupancy,
+and §4.4's inner-join slices (join parallelism).
 
 The map is regenerated, not maintained by hand:
 

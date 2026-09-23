@@ -61,6 +61,41 @@ namespace ibex::runtime {
 
 namespace {
 
+/// Allocator adaptor that skips value-initialization for `resize()`'s new
+/// elements, i.e. `resize()` behaves like `reserve()` + leaving the tail
+/// default-initialized rather than zero-filled. Everything else (push_back,
+/// emplace_back, indexing, iteration) is unaffected: they still
+/// default-construct or copy/move exactly as `std::allocator` would.
+///
+/// Only safe when every newly-grown element is written before it is read --
+/// see the call sites of `int_order_`/`pair_order_` below, which merge-write
+/// the full grown range (via `try_discover_partitioned`'s resize_keys/
+/// store_key pair, or `finalize_owned_ordered_runs`'s sequential group scan)
+/// before any read reaches it. Standard idiom; avoids the same redundant
+/// value-init tax `SlotArray::grow_uninitialized` (above) exists to avoid.
+template <typename T, typename A = std::allocator<T>>
+class default_init_allocator : public A {
+    using AT = std::allocator_traits<A>;
+
+   public:
+    using A::A;
+
+    template <typename U>
+    struct rebind {
+        using other = default_init_allocator<U, typename AT::template rebind_alloc<U>>;
+    };
+
+    template <typename U>
+    void construct(U* ptr) noexcept(std::is_nothrow_default_constructible_v<U>) {
+        ::new (static_cast<void*>(ptr)) U;
+    }
+
+    template <typename U, typename... Args>
+    void construct(U* ptr, Args&&... args) {
+        AT::construct(static_cast<A&>(*this), ptr, std::forward<Args>(args)...);
+    }
+};
+
 // Whether a streamed aggregate slot has enough observations to be non-null.
 // Mirrors the materializing aggregate's `agg_result_is_valid`.
 auto chunked_agg_valid(ir::AggFunc func, const AggSlotCore& slot) -> bool {
@@ -5348,7 +5383,10 @@ class HashAggregateState final {
     bool int_fast_path_ = false;
     IntKeyKind int_key_kind_ = IntKeyKind::Int64;
     robin_hood::unordered_flat_map<std::int64_t, std::uint32_t> int_index_;
-    std::vector<std::int64_t> int_order_;  ///< group keys, as raw integers, in first-seen order
+    /// Group keys, as raw integers, in first-seen order. Default-init
+    /// allocator: `resize()`'s new elements are always fully overwritten by
+    /// the caller before being read (see the class docstring above).
+    std::vector<std::int64_t, default_init_allocator<std::int64_t>> int_order_;
 
     // Two fixed-width-integer keys are packed into a two-word composite key
     // and grouped exactly as one integer key: `(l_partkey, l_suppkey)` on
@@ -5366,7 +5404,10 @@ class HashAggregateState final {
     PackedGroups<PackedKeyEncoder::Packed256, PackedKeyEncoder::PackedWordsHash<4>> packed256_;
     IntKeyKind int_key_kind_b_ = IntKeyKind::Int64;
     robin_hood::unordered_flat_map<PairIntKey, std::uint32_t, PairIntKeyHash> pair_index_;
-    std::vector<std::pair<std::int64_t, std::int64_t>> pair_order_;
+    /// Same default-init-allocator invariant as `int_order_` above.
+    std::vector<std::pair<std::int64_t, std::int64_t>,
+                default_init_allocator<std::pair<std::int64_t, std::int64_t>>>
+        pair_order_;
     /// Parallel group discovery (see `try_discover_partitioned`). `rows_seen_`
     /// makes a group's first-row index global across chunks, which is what the
     /// first-occurrence numbering is merged on.

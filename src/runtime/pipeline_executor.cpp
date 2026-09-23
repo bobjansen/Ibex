@@ -425,8 +425,9 @@ struct MorselWorkerChain {
 ///
 /// Without this a pool worker blocked on a pipeline ring strands any nested
 /// `pool.submit` under it: its child tasks sit in the queue while every other
-/// worker is parked in its own ring wait, none in the pool's dispatch loop. See
-/// `plans/cooperative-pipeline-waits-plan.md`.
+/// worker is parked in its own ring wait, none in the pool's dispatch loop. That
+/// deadlock was real: q19 at SF-8 hung with one scan worker in `Batch::wait()`
+/// on its nested decode and the other seven in `OrderedChunkRing::acquire`.
 ///
 /// Assist only when this thread is a pool worker AND a fan-out it started is
 /// still running — the sole case with queued work to run. A non-pool caller (the
@@ -434,6 +435,17 @@ struct MorselWorkerChain {
 /// worker that has nested nothing has an empty-for-it queue. Both take the plain
 /// `cv.wait`, so the common backpressure park costs exactly what it did before
 /// this existed, and the stage-ledger accounting in `RingWaitScope` is unchanged.
+/// Without that gate the 250µs poll spins on the pool mutex and burns about one
+/// extra core on q18 (+3% standalone wall, and more in an interleaved A/B, where
+/// the extra CPU biases the paired comparison).
+///
+/// Other `on_worker_pool_thread()` serial fallbacks (`scan_shard_target`,
+/// `DeferredScanSourceOperator::unit_window`, `for_row_ranges`,
+/// `evaluate_field_maybe_parallel`) were surveyed 2026-09-01 and left serial on
+/// purpose. PDS-H never reaches the first two on its streaming path, and the
+/// last two are per-row compute, where Ibex already wins. Lift one only when a
+/// profile shows a specific nested serial decode that `parallel_readers` does
+/// not reach.
 template <typename Pred>
 void cooperative_ring_wait(std::condition_variable& cv, std::unique_lock<std::mutex>& lock,
                            Pred pred) {

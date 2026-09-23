@@ -752,6 +752,24 @@ IEEE floating-point `NaN`, `+Inf`, and `-Inf` values are **not** null. They are
 stored as ordinary `Float64` payloads and are therefore not skipped
 automatically by aggregate functions.
 
+#### Null Keys
+
+A null in a key column is its own value, never the zero its cell physically
+holds:
+
+- **`by` and `distinct`**: nulls are equal to each other and different from
+  every present value. They form one null group and one null distinct row.
+  With a composite key, `{0, null}`, `{null, 0}` and `{0, 0}` are three
+  different keys. The same rule applies to `update ... by`, `head`/`tail ... by`
+  and `dcast` row keys.
+- **`order`**: nulls sort last under both `asc` and `desc`. Their position does
+  not flip with the direction.
+- **Joins**: a null key matches nothing, not even another null, unless the
+  join says `nulls equal` (Section 5.6).
+
+Grouping and joining disagree on purpose. SQL makes the same split, and so do
+Polars and pandas by default.
+
 #### Null-Fill Functions
 
 Three built-in functions replace or propagate null values within a column.

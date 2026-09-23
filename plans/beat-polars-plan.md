@@ -664,8 +664,9 @@ pds.md baseline because they are recorded nowhere else:
   `Int64(o_orderpriority == …)` on 12M `orders` rows to save gathering 1.3M.
   The mechanism is real in both directions and the pass cannot tell them apart:
   it needs join-output cardinality against each side's post-filter row count.
-  A cost gate is the prerequisite, not a refinement — same missing estimate as
-  the scan-fusion gate in `query-shape-conformance-plan.md`. See §8.6.
+  A cost gate is the prerequisite, not a refinement. It needs a cardinality
+  estimate, which the scan-fusion gate (keyed on column type, and closed
+  2026-09-02) never had. See §8.6.
 
 ## 7. What winning looks like
 

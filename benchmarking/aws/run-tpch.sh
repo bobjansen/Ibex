@@ -26,6 +26,9 @@
 #   --volume-size GB     root volume (default 250; the launch refuses to start
 #                        if the SF list cannot fit -- ~1.6 GB per SF-unit,
 #                        cumulative, since .tbl and Parquet both persist)
+#   --profile            no timing suite: run breaker_map.py and profile_suite.py
+#                        per --cores count (Ibex only), to rank serial and idle
+#                        time on physical cores. The output is in results/profile/.
 #   --no-polars-in-memory  drop the whole-table Polars passes (they OOM at high
 #                        SF) and run the streaming reference instead
 #   --warmup N / --iters N / --key KEY / --region R / --on-demand
@@ -60,6 +63,7 @@ CORES=""
 THREADS_PER_CORE=""
 VOLUME_SIZE=250
 POLARS_IN_MEMORY=1
+PROFILE=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -71,10 +75,11 @@ while [[ $# -gt 0 ]]; do
         --threads-per-core) THREADS_PER_CORE="$2"; shift 2 ;;
         --volume-size) VOLUME_SIZE="$2"; shift 2 ;;
         --no-polars-in-memory) POLARS_IN_MEMORY=0; shift ;;
+        --profile) PROFILE=1; shift ;;
         --key) KEY_NAME="$2"; shift 2 ;;
         --region) REGION="$2"; shift 2 ;;
         --on-demand) ON_DEMAND=1; shift ;;
-        -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -151,6 +156,7 @@ echo "Result : s3://$S3_BUCKET/$RESULT_KEY"
 USER_DATA=$(bench_user_data "$REPO_URL" "$COMMIT" \
     "IBEX_TPCH_MODE=1" "IBEX_TPCH_SCALES=${SCALES}" "IBEX_WARMUP=${WARMUP}" "IBEX_ITERS=${ITERS}" \
     "IBEX_TPCH_CORES=${CORES}" "IBEX_TPCH_POLARS_IN_MEMORY=${POLARS_IN_MEMORY}" \
+    "IBEX_TPCH_PROFILE=${PROFILE}" \
     "IBEX_S3_BUCKET=${S3_BUCKET}" "IBEX_RESULT_KEY=${RESULT_KEY}" "IBEX_REGION=${REGION}")
 INSTANCE_ID=$(aws ec2 run-instances --region "$REGION" --instance-type "$INSTANCE_TYPE" --image-id "$AMI" \
     "${MARKET_ARGS[@]}" "${CPU_ARGS[@]}" --instance-initiated-shutdown-behavior terminate \

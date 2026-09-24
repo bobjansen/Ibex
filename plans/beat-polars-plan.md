@@ -648,10 +648,11 @@ The breaker-map arc took aggregate from 33.7% to 18.3% of idle. What is left:
   samples) is instruction-for-instruction identical between the two binaries
   (146 instructions, 551 bytes) and only starts at a different 64-byte offset
   (16 → 0). Moving the new file to the end of the link order does not change it.
-  For ClickBench: its two HAVING queries (Q27/Q28 in the ClickBench plan)
-  still need `length()` and regex replacement. Q27 groups by `CounterID`
-  (thousands of groups), where pruning saves little. Q28's regex-derived keys
-  are the shape it helps.
+  For ClickBench: its two HAVING queries are Q27/Q28 in the ClickBench plan.
+  Q27 runs today (`byte_length` is SQL `STRLEN`), and the prefilter fires on
+  it. But it groups by `CounterID`, a few thousand groups, so pruning saves
+  little. Q28 still needs regex replacement; its regex-derived keys are the
+  shape the prefilter helps.
 - q01's aggregate queues behind its own scan. Sized and judged a no-go for now:
   removing the overlap costs q01 44% (memory:
   `project_q01_scan_aggregate_contention`).

@@ -124,12 +124,14 @@ def main() -> int:
             rows.append((f"q{query_number:02d}", samples))
 
     with args.out.open("w") as f:
-        f.write("framework\tquery\tavg_ms\tmin_ms\tmax_ms\tstddev_ms\tp95_ms\tp99_ms\n")
+        # samples_ms: every timed iteration in run order, as in bench_ibex.py.
+        f.write("framework\tquery\tavg_ms\tmin_ms\tmax_ms\tstddev_ms\tp95_ms\tp99_ms\tsamples_ms\n")
         for query, samples in rows:
             f.write(
                 f"{framework}\t{query}\t{statistics.mean(samples):.3f}\t{min(samples):.3f}\t"
                 f"{max(samples):.3f}\t{statistics.pstdev(samples) if len(samples) > 1 else 0.0:.3f}\t"
-                f"{percentile(samples, .95):.3f}\t{percentile(samples, .99):.3f}\n"
+                f"{percentile(samples, .95):.3f}\t{percentile(samples, .99):.3f}\t"
+                f"{','.join(f'{d:.3f}' for d in samples)}\n"
             )
     return 0
 

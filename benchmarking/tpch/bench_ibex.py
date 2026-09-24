@@ -243,15 +243,20 @@ def main() -> int:
             "p95_ms": percentile(durations, 0.95),
             "p99_ms": percentile(durations, 0.99),
             "mode": mode,
+            "samples": durations,
         })
 
     with open(out_path, "w") as f:
-        f.write("framework\tquery\tavg_ms\tmin_ms\tmax_ms\tstddev_ms\tp95_ms\tp99_ms\tmode\n")
+        # samples_ms keeps every timed iteration in run order (comma-separated), so
+        # a noisy or bimodal query can be diagnosed from the artifact alone: the
+        # summary columns cannot tell a lucky minimum from a second mode.
+        f.write("framework\tquery\tavg_ms\tmin_ms\tmax_ms\tstddev_ms\tp95_ms\tp99_ms\tmode\t"
+                "samples_ms\n")
         for r in rows:
             f.write(
                 f"{r['framework']}\t{r['query']}\t{r['avg_ms']:.3f}\t{r['min_ms']:.3f}\t"
                 f"{r['max_ms']:.3f}\t{r['stddev_ms']:.3f}\t{r['p95_ms']:.3f}\t{r['p99_ms']:.3f}\t"
-                f"{r['mode']}\n"
+                f"{r['mode']}\t{','.join(f'{d:.3f}' for d in r['samples'])}\n"
             )
     print(f"results written to {out_path}", file=sys.stderr)
 

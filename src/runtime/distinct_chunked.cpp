@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "chunk_conversion_internal.hpp"
+#include "hyperloglog.hpp"
 #include "interpreter_internal.hpp"
 #include "packed_key_encoder_internal.hpp"
 #include "physical_executor_internal.hpp"
@@ -386,6 +387,21 @@ class ChunkedDistinctOperator final : public Operator {
         return gather_rows(t, idx);
     }
 
+    /// How many more entries partition `p`'s set should make room for before this
+    /// chunk's inserts, from the chunk's distinct-count estimate. Hash
+    /// partitioning spreads distinct keys evenly, so each partition expects
+    /// its share; the 15% margin absorbs the sketch's error and the spread
+    /// between partitions. Capped by the chunk's rows, which bounds the new
+    /// keys even when the estimate runs high. Pre-sizing removes the doubling
+    /// the set otherwise does on its way up (on PDS-H q16's 947k-row distinct,
+    /// robin_hood's rehash moves were 13% of the query's CPU); an estimate that
+    /// is off only brings some of that back, never a different answer.
+    [[nodiscard]] static auto reserve_share(double estimate, std::size_t rows,
+                                            std::size_t part_count) -> std::size_t {
+        const double expected = std::min(estimate, static_cast<double>(rows));
+        return static_cast<std::size_t>(expected / static_cast<double>(part_count) * 1.15);
+    }
+
     /// Everything one packed width needs: the serial set, the per-partition
     /// sets the parallel path owns, and the per-chunk key buffer.
     ///
@@ -479,6 +495,9 @@ class ChunkedDistinctOperator final : public Operator {
         part_of_row_.resize(rows);
         const std::size_t ranges = std::max<std::size_t>(1, std::min(workers, rows));
         const std::size_t grain = (rows + ranges - 1) / ranges;
+        // Each range also sketches its keys' distinct count, from the hash it
+        // computes anyway, so pass 2 can pre-size (see `reserve_share`).
+        std::vector<HyperLogLog> sketches(ranges);
         {
             auto batch = pool.submit(ranges, [&](std::size_t r) {
                 const std::size_t begin = r * grain;
@@ -488,13 +507,19 @@ class ChunkedDistinctOperator final : public Operator {
                 }
                 PackedKeyEncoder::build_keys<Packed>(cols, begin, end, state.keys.data());
                 Hash hasher;
+                auto& sketch = sketches[r];
                 for (std::size_t row = begin; row < end; ++row) {
-                    part_of_row_[row] =
-                        static_cast<std::uint8_t>(hasher(state.keys[row]) & part_mask);
+                    const auto hash = static_cast<std::uint64_t>(hasher(state.keys[row]));
+                    part_of_row_[row] = static_cast<std::uint8_t>(hash & part_mask);
+                    sketch.add(key_hash_finalize(hash));
                 }
             });
             batch.wait();
         }
+        for (std::size_t r = 1; r < ranges; ++r) {
+            sketches[0].merge(sketches[r]);
+        }
+        const std::size_t share = reserve_share(sketches[0].estimate(), rows, part_count);
 
         // Pass 2: one worker per partition, each scanning the whole chunk and
         // touching only its own rows and its own set.
@@ -503,6 +528,7 @@ class ChunkedDistinctOperator final : public Operator {
             auto batch = pool.submit(part_count, [&](std::size_t p) {
                 auto& seen = state.parts[p];
                 const auto tag = static_cast<std::uint8_t>(p);
+                seen.reserve(seen.size() + share);
                 for (std::size_t row = 0; row < rows; ++row) {
                     if (part_of_row_[row] != tag) {
                         continue;
@@ -571,17 +597,25 @@ class ChunkedDistinctOperator final : public Operator {
         part_of_row_.resize(rows);
         const std::size_t ranges = std::max<std::size_t>(1, std::min(part_count, rows));
         const std::size_t grain = (rows + ranges - 1) / ranges;
+        std::vector<HyperLogLog> sketches(ranges);
         {
             auto batch = pool.submit(ranges, [&](std::size_t r) {
                 const std::size_t begin = r * grain;
                 const std::size_t end = std::min(rows, begin + grain);
                 const robin_hood::hash<T> hasher;
+                auto& sketch = sketches[r];
                 for (std::size_t row = begin; row < end; ++row) {
-                    part_of_row_[row] = static_cast<std::uint8_t>(hasher(col[row]) & part_mask);
+                    const auto hash = static_cast<std::uint64_t>(hasher(col[row]));
+                    part_of_row_[row] = static_cast<std::uint8_t>(hash & part_mask);
+                    sketch.add(key_hash_finalize(hash));
                 }
             });
             batch.wait();
         }
+        for (std::size_t r = 1; r < ranges; ++r) {
+            sketches[0].merge(sketches[r]);
+        }
+        const std::size_t share = reserve_share(sketches[0].estimate(), rows, part_count);
 
         // Pass 2: one worker per partition, each scanning the whole chunk and
         // touching only its own rows and its own set.
@@ -590,6 +624,7 @@ class ChunkedDistinctOperator final : public Operator {
             auto batch = pool.submit(part_count, [&](std::size_t p) {
                 auto& seen = state.parts[p];
                 const auto tag = static_cast<std::uint8_t>(p);
+                seen.reserve(seen.size() + share);
                 for (std::size_t row = 0; row < rows; ++row) {
                     if (part_of_row_[row] != tag) {
                         continue;

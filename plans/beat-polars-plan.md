@@ -113,13 +113,18 @@ Per query, sorted by the 8-core ratio (ms, min of 5; 1c is the pooled median):
 | q18 | 1,746 | 2,127 | 0.82 | 378 | 471 | 0.80 | 4.61 | 4.51 | 0.93 | 4.51 | 5.14 |
 | q09 | 1,129 | 2,420 | 0.47 | 401 | 502 | 0.80 | 2.81 | 4.82 | 0.89 | 2.67 | 5.07 |
 | q12 | 463 | 847 | 0.55 | 136 | 185 | 0.74 | 3.39 | 4.58 | 0.75 | 3.94 | 5.41 |
-| q11 † | 72 | 183 | 0.39 | 38 | 53 | 0.72 | 1.89 | 3.45 | 0.66 | 1.80 | 3.01 |
+| q11 † | 67 | 191 | 0.35 | 39 | 58 | 0.67 | 1.74 | 3.29 | 0.66 | 1.61 | 2.98 |
 | q20 | 455 | 1,106 | 0.41 | 164 | 236 | 0.70 | 2.77 | 4.69 | 0.79 | 2.63 | 5.01 |
 | q22 | 178 | 350 | 0.51 | 56 | 80 | 0.69 | 3.18 | 4.34 | 0.61 | 3.68 | 4.45 |
 | q21 | 3,188 | 6,822 | 0.47 | 581 | 1,357 | 0.43 | 5.48 | 5.03 | 0.52 | 5.63 | 6.28 |
 
-† Invalid above SF-1: Ibex's q11 does not scale `FRACTION` by SF and returns
-zero rows (W0 item 6).
+† Re-measured after the q11 fix (`c1b9855e`, runs
+`20260924T0{70231,70811}Z_c1b9855e_sf8`, the same day and box). The original
+row timed a q11 that returned zero rows at SF-8 (W0 item 6). The fix barely
+moves it: Ibex was 0.72 at 8c on the broken query and is 0.67 on the correct
+one. The suite totals above keep the original q11 figures, which shifts them
+by less than 0.1%. Those two runs also re-measure the suite: 0.91 at 8c and
+0.96 at 16c, against 0.92 and 0.99 above, so the curve holds across sittings.
 
 Read it in two columns, as before. **Per-core losses** (1c ratio above 1) are
 q06, q15 and q14. **Scaling losses** are q10, q16, q19, q03, q01 and q07, which
@@ -281,17 +286,22 @@ because it decides the ranking of the others.
    - **Output: only q11 differs,** and legitimately. Both sides return zero
      rows. The base printed a column-less `<empty>` table, and HEAD keeps the
      schema.
-6. **New: q11 is not the same query as Polars' above SF-1.**
+6. **DONE 2026-09-24 (`c1b9855e`): q11 was not the same query as Polars'
+   above SF-1.**
    `queries/q11.ibex` hardcodes `FRACTION = 0.0001`. TPC-H and the Polars
    reference (`0.0001 / settings.scale_factor`) scale it by SF. At SF-8, Ibex
    filters with a threshold 8× too high and returns zero rows, while Polars
    returns the real answer. q11's ratio in §1 (0.72 at 8c) is invalid until
    the query takes the scale factor. It is the only SF-dependent parameter
-   in PDS-H.
+   in PDS-H. Fixed: the query reads SF off the supplier count. And
+   `run_bench.sh` now diffs every answer against Polars at the benchmarked SF
+   before timing (`check_against_polars.py`), which is the check that would
+   have caught this. The official answers are SF-1 only, and every other
+   check compared Ibex with Ibex.
 
 Exit: §1 and §2 rewritten from measurement, with the implied fraction at
-1/2/4/8/12/16 for both engines (met locally 2026-09-24). Items 3 (AWS) and 6
-(q11) are still open, as is the q21 1-core bisect from item 5.
+1/2/4/8/12/16 for both engines (met locally 2026-09-24). Item 3 (AWS) is
+still open, as is the q21 1-core bisect from item 5.
 
 ### W1: Constants and gates tuned at 8 cores (new; do before trusting W0's 16-core point)
 
@@ -394,7 +404,11 @@ profile before starting.
   the widest W0 count) for every change. The serial-vs-parallel diff has
   exactly three legitimate exceptions, q01, q09 and q15, which differ in the
   last ulp from the parallel float reduction. A fourth file in that diff is a
-  bug, not drift.
+  bug, not drift. Byte-identity compares Ibex with Ibex, so it cannot catch a
+  query that is wrong on both sides. `run_bench.sh` therefore also diffs every
+  answer against upstream Polars at the benchmarked SF before timing
+  (`check_against_polars.py`; the SF-1 official answers are
+  `check_answers.py`). Don't pass `--no-answer-check` for a published number.
 - **The leading metric is the implied parallel fraction** from an interleaved
   sweep at 1/2/4/8 (plus 12/16 once W0 lands). A wall-time win that does not
   move the fraction must say so.

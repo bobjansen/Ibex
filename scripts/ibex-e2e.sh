@@ -411,6 +411,29 @@ if [[ "$SKIP_REPL" == false ]]; then
             exit 1
         fi
         rm -f "$null_out"
+
+        echo "▸ whole-script (parquet plugin, a file written by Polars)"
+        # The PDS-H benchmark data is written by Polars, whose files differ
+        # from Arrow's where the reader had three bugs: no per-page encoding
+        # stats (a dictionary column must read dense), a dense read of a
+        # dictionary column decoding to more characters than its chunk stores,
+        # and ZSTD string pages read in stripes. IBEX_CORES=8 so the fused
+        # string filter stripes its pages even on a small runner.
+        uv run --project "$IBEX_ROOT" python \
+            "$IBEX_ROOT/tests/data/gen_parquet_polars_writer.py" \
+            "$IBEX_ROOT/tests/data/parquet_polars_writer_out.parquet" >/dev/null
+        polars_out="$(mktemp)"
+        IBEX_CORES=8 "$BUILD_DIR/tools/ibex_eval" --plugin-path "$BUILD_DIR/tools" \
+            "$IBEX_ROOT/tests/data/parquet_polars_writer_check.ibex" >"$polars_out" 2>&1
+        rm -f "$IBEX_ROOT/tests/data/parquet_polars_writer_out.parquet"
+        # Five segments of 40,000 rows, 20,000 past row 100,000, 28,572 needles.
+        if rg -n "error:" "$polars_out" >/dev/null \
+            || [[ "$(rg -c '\| 40000 +\| 20000 +\| 28572 +\|' "$polars_out")" != "5" ]]; then
+            cat "$polars_out" >&2
+            rm -f "$polars_out"
+            exit 1
+        fi
+        rm -f "$polars_out"
     fi
 fi
 

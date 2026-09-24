@@ -1185,7 +1185,8 @@ class Column<std::string> {
     /// Usage: `auto w = begin_bulk_append(rows, chars_upper_bound);` then
     /// `w.append(sv)` exactly `rows` times, then `finish_bulk_append(w)`, which
     /// trims the character buffer to what was actually written. Writing more
-    /// than `rows` values or more than `chars_upper_bound` bytes is undefined.
+    /// than `rows` values, or more than `chars_upper_bound` bytes without first
+    /// raising it through `ensure_bulk_capacity`, is undefined.
     class BulkAppender {
         friend class Column<std::string>;
         char* chars_ = nullptr;             // write cursor
@@ -1215,6 +1216,22 @@ class Column<std::string> {
         writer.chars_ = chars_.data() + old_chars;
         writer.offsets_ = offsets_.data() + old_rows + 1;
         return writer;
+    }
+
+    /// Make room for `bytes` more characters through `writer`, keeping what it
+    /// has written. For a producer whose bound can be exceeded -- a dictionary-
+    /// encoded Parquet chunk decodes to more characters than it stores, since
+    /// every repeat of a value is one more copy -- to call before each batch.
+    /// Grows geometrically, so a column that needs it pays a few reallocations,
+    /// not one per batch.
+    void ensure_bulk_capacity(BulkAppender& writer, size_type bytes) {
+        const auto used = static_cast<size_type>(writer.chars_ - writer.chars_begin_);
+        if (used + bytes <= chars_.size()) {
+            return;
+        }
+        chars_.resize(std::max(used + bytes, chars_.size() * 2));
+        writer.chars_begin_ = chars_.data();
+        writer.chars_ = chars_.data() + used;
     }
 
     void finish_bulk_append(const BulkAppender& writer) {

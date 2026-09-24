@@ -1,0 +1,19 @@
+// Reads the Polars-written fixture from gen_parquet_polars_writer.py. Each of
+// the five segments holds 40,000 rows (`rows`, a dense read of a dictionary
+// column that has no encoding stats), 20,000 of them past row 100,000 (`late`,
+// the same column read under a row selection), and 28,572 notes carry the
+// needle (`needles`, the fused string filter over PLAIN ZSTD pages).
+//
+// One final statement on purpose: the whole-script planner runs only what the
+// result depends on, so a separate statement per check would be dropped.
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+
+let t = read_parquet("tests/data/parquet_polars_writer_out.parquet") as DataFrame<{
+    id: Int64,
+    seg: String,
+    note: String
+}>;
+let whole = t[select { rows = count() }, by { seg }];
+let late = t[filter id >= 100000][select { late = count() }, by { seg }];
+let needles = t[filter like(note, "%needle%")][select { needles = count() }];
+((whole join late on { seg }) cross join needles)[order { seg }];

@@ -365,6 +365,22 @@ Order, by share of the 16-core gap:
    Scaling 4.6–6.5× against 12–13×. One mechanism, W2's inner-join probe and
    output assembly (`join-perf-plan.md`, memory `project_join_parallelism`),
    so fix it once and measure all four.
+   **Measured 2026-09-24: not one mechanism.** q19's time is in the join itself
+   (lineitem ⋈ part, 1.7M rows out). For q03/q05/q07 it is the deferred-probe
+   **scan of lineitem** that feeds the join. First the `dynamic key scan`, which
+   tests every row's key against the build side's keys: 48M membership tests,
+   100 ms at 8 cores for q03's lineitem. Then `decode selected`, whose parallel
+   section is balanced to within a few percent of ideal. What was left in
+   between was serial calling-thread work: merging the key-scan parts (1–7
+   ms), validating the selection (two full passes, up to 6 ms) and planning
+   (up to 5 ms), per call and flat with cores. Moving the validation into the
+   tasks (`08caeea4`) gave q03 −4.0%, q05 −2.3% and q07 −3.1% at 8 cores. Next,
+   in order: the membership probe itself (is the cheap `l_shipdate` range
+   applied before it? how cache-friendly is the key set?), then q19's join.
+   The key-scan merge was not parallelized: `Selection` zero-fills when sized,
+   so doing it properly means changing the type or consuming the parts
+   directly. Instrumentation for these phases is not committed; the timers
+   were a temporary `IBEX_DECODE_PHASES` patch.
 3. **q16 +86 (8%) and q13 +86 (8%).** q16 scales 2.85×: its
    composite-categorical `distinct` (the I3 gap in `parallelism-overview.md`).
    q13: 182 ms serial, the aggregate row, and the fused non-anchored LIKE scan

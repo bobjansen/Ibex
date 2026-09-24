@@ -350,25 +350,33 @@ fixing it moves the total and does nothing for the geomean.
 At 8 cores, four queries' closure fell outside the trusted band (q01, q11, q13,
 q15), so read the 8-core map without them.
 
-**Re-ranking W2–W5 from the physical-core view.** The **total** and the
-**geomean** want different work, so rank each separately:
+**Re-ranking W2–W5 from the physical-core view: work on the losers.** At 16
+cores the losing queries account for the whole gap. Per query, Ibex minus
+Polars on AWS: **losers +1,117 ms, winners −129 ms** (q21 −103), for a total
+of +988. q21's lead also shrinks with cores (−526 ms at 8, −103 at 16), so
+speeding it up would widen a shrinking win and close none of the gap. Polars
+scales the losers 7–13× at 16 cores, so that work demonstrably parallelizes.
+Order, by share of the 16-core gap:
 
-1. **For the total: q21, as its own item.** 708 ms serial, plus the top idle
-   row (semi join), the third (`Aggregate.Discovery`) and the fourth (whole
-   decode). Everything in q21 is W2 (join occupancy), W5 (Discovery) and W3
-   (decode) at once. Take it as one query-level project, not three workstream
-   slices (memory: `project_q21_is_occupancy_bound`).
-2. **For the total: the serial part of q13, q10, q18 and q01** (569 ms
-   together). q13 is the aggregate plus the LIKE scan. q10's serial time
-   predates the join build/probe split and was last timed at SF-2 (W2 says
-   re-time it); its decode is W3. q18 is `FinalOrdering`/`Emission` (W5). q01
-   is its `update` and its scan contention (W5; the no-go on removing the
-   overlap still stands).
-3. **For the geomean: the scaling losers,** where Ibex speeds up less than 3×
-   at 16 cores: q02, q11, q10, q16. Then q20, q03, q07 and q05 (under 5×).
-   These are W4 plus W2's inner-join probe (q19, q03, q05, q07).
-4. **W1 (constants) comes after these.** On physical cores there is no 16-core
-   cliff for a gate to explain.
+1. **q10: +263 ms (24%).** Scales 2.68× against Polars' 7.65×. 182 ms serial,
+   the serial hash build (predates the build/probe split, re-time it first),
+   and `source decode whole` (W3), the sixth-largest idle row.
+2. **The inner-join group: q07 +117, q03 +106, q05 +75, q19 +67 (33%).**
+   Scaling 4.6–6.5× against 12–13×. One mechanism, W2's inner-join probe and
+   output assembly (`join-perf-plan.md`, memory `project_join_parallelism`),
+   so fix it once and measure all four.
+3. **q16 +86 (8%) and q13 +86 (8%).** q16 scales 2.85×: its
+   composite-categorical `distinct` (the I3 gap in `parallelism-overview.md`).
+   q13: 182 ms serial, the aggregate row, and the fused non-anchored LIKE scan
+   (`query-shape-conformance-plan.md` item 1).
+4. **q01 +83 (7%).** `update` plus scan/aggregate contention; removing the
+   overlap is a measured no-go (§6), so look elsewhere.
+5. **The tail: q09, q20, q14, q15, q08, q04, q02, q11** (+234 together). q14 and
+   q15 are also per-core losses (W4).
+6. **q21: a watch item, not a target.** It is still the largest serial term (708
+   ms, 38%) and will turn into a loser somewhere past 16 cores at this rate.
+   Revisit when the target goes beyond 16 cores.
+7. **W1 (constants) after these.** Physical cores show no 16-core cliff.
 
 *Dev box, 16 cores (same day, for contrast):* 41,090 idle core-ms, split join
 43.6%, scan 22.3%, aggregate 26.1%; serial 1,729 ms; barrier 2,922 ms. Its

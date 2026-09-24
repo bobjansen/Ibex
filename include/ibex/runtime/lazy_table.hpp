@@ -15,6 +15,7 @@
 #include <optional>
 #include <robin_hood.h>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -61,6 +62,11 @@ struct StringScanFilter {
         return like_match(pattern, value) != negated;
     }
 };
+
+/// Keep-flags for one dictionary: entry i passes when the result's element i is
+/// non-zero. Called once per dictionary page, never per row.
+using DictionaryPredicate =
+    std::function<std::vector<char>(std::span<const std::string_view> dictionary)>;
 
 /// One independently mutable reader/decoder for a lazy source.
 ///
@@ -120,6 +126,30 @@ class LazySourceReader {
                                                   const StringScanFilter& /*filter*/,
                                                   const SourceUnit* /*unit*/,
                                                   const ExecutionContext& /*exec*/)
+        -> std::expected<std::optional<Selection>, std::string> {
+        return std::optional<Selection>{};
+    }
+
+    /// Evaluate a predicate on the DICTIONARY of a dictionary-encoded string
+    /// column rather than on its rows: `keep` receives each dictionary page's
+    /// distinct values (a handful for a flag or mode column) and answers one
+    /// flag per entry, and the source then scans only the integer codes. So a
+    /// string predicate costs a code comparison per row, and no string column
+    /// is built. Null rows never pass; the caller must only use this for a
+    /// predicate that is not TRUE on null. nullopt means no fused answer (not
+    /// dictionary-encoded throughout, or unsupported), and the caller falls
+    /// back to decode-then-filter.
+    ///
+    /// `within`, when given, is a sorted candidate selection (a key scan's
+    /// answer): only those rows are tested and emitted, so the result is never
+    /// larger than it. Without it a common value's matches would be a large
+    /// fraction of the file (q10's `l_returnflag == "R"` is a quarter of
+    /// lineitem), built only to be intersected away.
+    [[nodiscard]] virtual auto dictionary_filter_scan(const std::string& /*column*/,
+                                                      const DictionaryPredicate& /*keep*/,
+                                                      const Selection* /*within*/,
+                                                      const SourceUnit* /*unit*/,
+                                                      const ExecutionContext& /*exec*/)
         -> std::expected<std::optional<Selection>, std::string> {
         return std::optional<Selection>{};
     }
@@ -384,6 +414,21 @@ class LazyTable {
     /// ordinary way (a partial answer would silently drop the rest).
     [[nodiscard]] auto scan_string_filters(const std::vector<FusedStringConjunct>& fused,
                                            const SourceUnit* unit, const ExecutionContext& exec)
+        -> std::expected<std::optional<Selection>, std::string>;
+    /// Conjuncts that read exactly one dictionary-encoded (Categorical) column,
+    /// are row-local, and are not TRUE on null: those can be decided per
+    /// dictionary entry by `scan_dictionary_filters`. The rest go to `rest`.
+    void split_dictionary_conjuncts(const std::vector<ir::Expr>& conjuncts,
+                                    const ScalarRegistry* scalars,
+                                    std::vector<ir::Expr>& dictionary,
+                                    std::vector<ir::Expr>& rest) const;
+    /// Every conjunct from `split_dictionary_conjuncts` through the source's
+    /// `dictionary_filter_scan`, intersected. nullopt = no fused answer for at
+    /// least one, and the caller evaluates them the ordinary way.
+    [[nodiscard]] auto scan_dictionary_filters(const std::vector<ir::Expr>& conjuncts,
+                                               const Selection* within,
+                                               const ScalarRegistry* scalars,
+                                               const ExecutionContext& exec)
         -> std::expected<std::optional<Selection>, std::string>;
     [[nodiscard]] auto acquire_reader() -> std::expected<LazySourceReaderPtr, std::string>;
     void release_reader(LazySourceReaderPtr reader);

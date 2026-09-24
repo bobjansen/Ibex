@@ -414,7 +414,13 @@ Order, by share of the 16-core gap:
    so doing it properly means changing the type or consuming the parts
    directly. Instrumentation for these phases is not committed; the timers
    were a temporary `IBEX_DECODE_PHASES` patch.
-3. **q16 +86 (8%) and q13 +86 (8%).** q16 scales 2.85×: its
+3. **q16 +86 (8%) and q13 +86 (8%).** **q16 −11% at 8 cores (2026-09-24):**
+   its distinct's partition sets now pre-size from a HyperLogLog estimate.
+   Range-compressed packed keys measured a further −2 to −5% in the
+   prototype (`/home/brj/ibex-parked/q16_keycompress_reserve_prototype.patch`);
+   doing it properly needs footer bounds through column origins plus a fixed
+   16-bit categorical id. The count_distinct reduction is still unwired, by
+   design (fed64e70). Before the change: q16 scales 2.85×: its
    composite-categorical `distinct` (the I3 gap in `parallelism-overview.md`).
    q13: 182 ms serial, the aggregate row, and the fused non-anchored LIKE scan
    (`query-shape-conformance-plan.md` item 1).
@@ -622,8 +628,10 @@ profile before starting.
 - **The leading metric is the implied parallel fraction** from an interleaved
   sweep at 1/2/4/8 (plus 12/16 once W0 lands). A wall-time win that does not
   move the fraction must say so.
-- **The 1-core total is a hard floor.** The single-core lead is the strategy
-  up to 8 cores, and §2 shows it still matters at 16.
+- **The 1-core total is a soft floor (revised 2026-09-24).** Ibex's
+  single-core lead is large (0.61× Polars on AWS), so a small 1-core cost is
+  acceptable for a clear 8-core win. Report it; do not veto on it. A large
+  1-core regression still needs discussion.
 - **The 2-core point must not be a loss.** It was the weakest point on the
   curve until decode got its own thread budget (`IBEX_CORES` versus the
   decode pool; see `decode_thread_count`).

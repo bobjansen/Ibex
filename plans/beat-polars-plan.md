@@ -280,79 +280,100 @@ for either engine:
   still means lifting the fraction from about 79% to the mid-80s, turning
   roughly a quarter of the remaining serial time into parallel work.
 
-## 3. Where the idle time is (re-measured at 16 cores, 2026-09-24)
+## 3. Where the time goes (AWS physical cores, 2026-09-24)
 
-Both tools were re-run at the widest W0 count, `taskset -c 0-15` with
-`IBEX_CORES=16`, on the same build and in the same sitting as §1. Neither
-script pins cores itself, so pass `taskset` explicitly. The same caveat as §2
-applies: at 16 cores on this box, some of the cores are E-cores or SMT
-siblings.
+`run-tpch.sh --profile --cores 8,16` on the §1a box type (r7i.8xlarge, SMT off,
+`de99061c`). It runs `breaker_map.py` and `profile_suite.py` under `taskset`,
+with no timing suite. Artifact:
+`benchmarking/results/tpch_aws_20260924T120611.tar.gz` (`results/profile/`).
+The dev-box 16-core profile from the same day is summarized at the end of this
+section, for contrast only.
 
-**The breaker map** (`benchmarking/breaker_map.py 16`, 21 of 22 queries with
-reliable closure; q11 excluded): **41,090 idle core-ms**, against 13,963 at
-8 cores on 2026-09-23 (18 of 22 reliable). Doubling the width roughly triples
-the idle capacity.
+**Serial time is the Amdahl term, and it does not shrink with cores.**
+`profile_suite.py`, summed over the suite:
 
-| family | 8c (09-23) | 16c (09-24) |
-|---|---:|---:|
-| join | 59% | **43.6%** (17,920) |
-| aggregate | 18.3% | **26.1%** (10,719) |
-| scan | 18.6% | 22.3% (9,173) |
-| map | | 7.0% (2,889) |
+| | AWS 8c | AWS 16c | dev box 16c |
+|---|---:|---:|---:|
+| wall | 6,258 | 4,739 | 5,991 |
+| serial self | **1,833** | **1,869** | 1,729 |
+| barrier wait | 3,126 | 1,842 | 2,922 |
+| ring wait | 1,282 | 1,014 | 1,329 |
+| pool unqueued (share of capacity) | 42% | 55% | 42% |
+| perfect-scheduling ceiling (`serial + pool_work/N`) | 5,088 (−19%) | 3,930 (−17%) | 5,086 (−15%) |
 
-By boundary kind, 62% of the idle time is at `partial` breakers, 34% at
-`pipeline` and 4% at `hard`. The largest rows:
+At 16 cores, serial self time is **39% of Ibex's wall time**. Perfectly
+scheduling the parallel work that exists would buy 17%. Parity needs about
+26% (§1a: 3,768 → 2,780 ms), so **the gap cannot be closed by scheduling
+alone. Serial work has to become parallel.** The dev box overstated barrier
+wait by about 60% (2,922 against 1,842 ms at 16 cores): on heterogeneous cores
+a fan-out waits on a slower straggler.
 
-| query | operator | idle core-ms | reading |
-|---|---|---:|---|
-| q21 | `join semi keys=1` | 2,810 | occupancy (memory `project_q21_is_occupancy_bound`) |
-| q04 | `join semi keys=1` | 2,672 | ring wait = self; starved by its scan, as at 8c |
-| q13 | `aggregate keys=1` | 2,624 | closure 172%, close to the cut-off, so treat with care |
-| q13 | `scan __ibex_source_1` | 2,369 | the fused non-anchored LIKE scan |
-| q21 | `Aggregate.Discovery` | 2,236 | new at the top; not in the 8c top rows |
-| q19 | `join inner keys=1` | 1,892 | inner probe and output assembly |
-| q01 | `update` | 1,852 | closure 166%, borderline; the 12-core point in §1 shows q01 still scaling |
-| q21 | `source decode whole` | 1,702 | decode width |
-| q20 | `join semi keys=2` | 1,642 | the item-7 stream, now wide enough to idle |
-| q10 | `source decode whole` | 1,551 | decode width, as at 8c |
-| q18 | `Aggregate.FinalOrdering` | 1,161 | W5's `FinalOrdering` fanout |
+**Serial time by query (AWS 16c, ms; barrier wait and wall beside it):**
 
-The map ranks idle capacity, not waste. Pair it with task-clock at 1 core
-against N cores to find work that parallelism multiplies (memory:
-`project_task_clock_finds_multiplied_work`). Three closures in the table (q01
-166%, q13 172%, q22 170%) sit just inside the 175% cut-off, so their rows are
-upper bounds.
+| query | serial | barrier | wall |
+|---|---:|---:|---:|
+| q21 | **708** | 252 | 961 |
+| q13 | 182 | 36 | 360 |
+| q10 | 182 | 157 | 379 |
+| q18 | 113 | 215 | 376 |
+| q01 | 92 | 168 | 315 |
+| q07 | 84 | 140 | 249 |
+| q03 | 75 | 124 | 222 |
+| q20 | 72 | 44 | 214 |
+| q05 | 68 | 120 | 189 |
+| q09 | 59 | 219 | 367 |
+| q19 / q16 / q15 / q11 | 48 / 47 / 35 / 30 | | |
+| the other eight | ≤ 23 each | | |
 
-**The ceiling** (`benchmarking/profile_suite.py 16`, all 22 queries closing at
-99–100%): summed over the suite, serial self time is 1,729 ms, barrier wait
-2,922 ms and ring wait 1,329 ms, against 5,991 ms of wall time. The pool sat
-unqueued (nothing to run) for 42.2% of its capacity. Bounding wall time at
-`serial + pool_work/16` = 1,729 + 3,357 = 5,086 ms puts **perfect scheduling
-of the existing parallel work at 15%**. That is about the same as the 16%
-measured on 2026-08-25 (SF-2, 8c). The rest still has to come from turning
-serial work into parallel work. q21 alone is 532 ms of the 1,729 serial ms
-(its wall is 901 ms), and the next largest are q13 (155), q10 (149), q18 (138)
-and q01 (126). **Barrier wait (2,922 ms) is the largest single bucket.** Part
-of that is the dev box's heterogeneous cores, where the slowest task in a
-fan-out is slower. The §2 join regression it seemed to explain does not happen
-on AWS (§1a). Re-take this profile on the AWS box before sizing anything from
-the barrier bucket.
+q21 alone is 38% of all serial time. The top five (q21, q13, q10, q18, q01)
+are 68%. q21 is also Ibex's best query against Polars at every core count, so
+fixing it moves the total and does nothing for the geomean.
 
-**Re-ranking W2–W5 from the 16-core view:**
+**The breaker map (AWS 16c, 20 of 22 reliable; q11 and q15 excluded):**
+43,516 idle core-ms. By family: **join 41.2%**, **scan 27.0%**, **aggregate
+25.7%**, map 4.9%. These are close to the dev box's shares (43.6 / 22.3 /
+26.1), so the family ranking transfers. The top rows:
 
-- **W2 (join) stays first**, down from 59% to 44% of idle. q21, q04 and q20
-  (semi) and q19, q10 and q07 (inner) lead. (The 8→16 join
-  regressions in §2 were a dev-box artefact; §1a has no such regression.)
-- **W5 (aggregate) reopens.** Its own reopen condition was "if W0 moves
-  aggregate back up the map at 16 cores", and it did: 18% → 26%. The rows are
-  q21 `Aggregate.Discovery`, q13's aggregate, q18 `FinalOrdering` / `Emission`
-  and q15 `Discovery`. This is at least level with W3.
-- **W3 (decode width)** holds at 22% scan. q10 and q21 `decode whole`,
-  q03/q05/q07 `decode selected` and q13's LIKE scan are the rows. It grows
-  with cores as predicted, but not faster than aggregate.
-- **W4 (small and mid queries)**: q14 and q15 get *worse* relative to Polars
-  above 8 cores (2.29 and 2.20 at 16c), and they are also per-core losses.
-  q16 and q10 improve relative to Polars above 8.
+| query | operator | idle core-ms |
+|---|---|---:|
+| q21 | `join semi keys=1` | 3,514 |
+| q13 | `aggregate keys=1 aggs=1` | 2,929 |
+| q21 | `Aggregate.Discovery` | 2,456 |
+| q21 | `source decode whole` | 2,078 |
+| q04 | `join semi keys=1` (scan-starved, as before) | 2,063 |
+| q10 | `source decode whole` | 1,652 |
+| q20 | `join semi keys=2` | 1,614 |
+| q13 | `scan __ibex_source_1` (the LIKE scan) | 1,614 |
+| q19 | `join inner keys=1` | 1,592 |
+| q01 | `update` | 1,101 |
+
+At 8 cores, four queries' closure fell outside the trusted band (q01, q11, q13,
+q15), so read the 8-core map without them.
+
+**Re-ranking W2–W5 from the physical-core view.** The **total** and the
+**geomean** want different work, so rank each separately:
+
+1. **For the total: q21, as its own item.** 708 ms serial, plus the top idle
+   row (semi join), the third (`Aggregate.Discovery`) and the fourth (whole
+   decode). Everything in q21 is W2 (join occupancy), W5 (Discovery) and W3
+   (decode) at once. Take it as one query-level project, not three workstream
+   slices (memory: `project_q21_is_occupancy_bound`).
+2. **For the total: the serial part of q13, q10, q18 and q01** (569 ms
+   together). q13 is the aggregate plus the LIKE scan. q10's serial time
+   predates the join build/probe split and was last timed at SF-2 (W2 says
+   re-time it); its decode is W3. q18 is `FinalOrdering`/`Emission` (W5). q01
+   is its `update` and its scan contention (W5; the no-go on removing the
+   overlap still stands).
+3. **For the geomean: the scaling losers,** where Ibex speeds up less than 3×
+   at 16 cores: q02, q11, q10, q16. Then q20, q03, q07 and q05 (under 5×).
+   These are W4 plus W2's inner-join probe (q19, q03, q05, q07).
+4. **W1 (constants) comes after these.** On physical cores there is no 16-core
+   cliff for a gate to explain.
+
+*Dev box, 16 cores (same day, for contrast):* 41,090 idle core-ms, split join
+43.6%, scan 22.3%, aggregate 26.1%; serial 1,729 ms; barrier 2,922 ms. Its
+per-query serial ranking matches AWS's top five. Its barrier bucket, and the
+join regression it seemed to explain, do not transfer.
 
 ## 4. Workstreams
 
@@ -379,7 +400,9 @@ because it decides the ranking of the others.
    first, and both were harness bugs that only a fresh clone exposes: the exit
    handler could not ship its log (`76271a6d`), and the answer check needed the
    `scale-<sf>` path (`461c0963`). About $4 in total.
-4. **DONE 2026-09-24: breaker map and `profile_suite.py` at 16 cores** (§3).
+4. **DONE 2026-09-24: breaker map and `profile_suite.py` at 16 cores**, on the
+   dev box and then on AWS at 8 and 16 physical cores (`run-tpch.sh --profile`,
+   `de99061c`). §3 is the AWS version.
 5. **DONE 2026-09-24: interleaved A/B of the 2026-09-04 baseline against
    HEAD.** Run as `ab_queries.py` with 8 repeats, `taskset -c 0-7`, and each
    side on its own plugins (the plugin ABI changed in between). The base is

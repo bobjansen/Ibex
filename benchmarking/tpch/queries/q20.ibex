@@ -42,7 +42,7 @@ let part_raw = read_parquet("benchmarking/data/tpch/parquet/part.parquet") as Da
 let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
     l_partkey: Int64,
     l_suppkey: Int64,
-    l_quantity: Float64,
+    l_quantity: Int64,
     l_shipdate: Date
 }>;
 

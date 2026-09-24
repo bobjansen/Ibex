@@ -27,7 +27,7 @@ extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
 let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
     l_partkey: Int64,
-    l_quantity: Float64,
+    l_quantity: Int64,
     l_extendedprice: Float64,
     l_discount: Float64,
     l_shipinstruct: String,
@@ -49,17 +49,17 @@ let result = (part_raw join lineitem_raw on { p_partkey = l_partkey })[
             (p_brand == "Brand#12"
                 && (p_container == "SM CASE" || p_container == "SM BOX"
                     || p_container == "SM PACK" || p_container == "SM PKG")
-                && l_quantity >= 1.0 && l_quantity <= 11.0
+                && l_quantity >= 1 && l_quantity <= 11
                 && p_size >= 1 && p_size <= 5)
             || (p_brand == "Brand#23"
                 && (p_container == "MED BAG" || p_container == "MED BOX"
                     || p_container == "MED PKG" || p_container == "MED PACK")
-                && l_quantity >= 10.0 && l_quantity <= 20.0
+                && l_quantity >= 10 && l_quantity <= 20
                 && p_size >= 1 && p_size <= 10)
             || (p_brand == "Brand#34"
                 && (p_container == "LG CASE" || p_container == "LG BOX"
                     || p_container == "LG PACK" || p_container == "LG PKG")
-                && l_quantity >= 20.0 && l_quantity <= 30.0
+                && l_quantity >= 20 && l_quantity <= 30
                 && p_size >= 1 && p_size <= 15)
         ),
     select { revenue = sum(l_extendedprice * (1.0 - l_discount)) }

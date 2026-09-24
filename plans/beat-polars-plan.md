@@ -631,6 +631,27 @@ The breaker-map arc took aggregate from 33.7% to 18.3% of idle. What is left:
   the async path needs two workers. All 22 answers are byte-identical. The one
   other flag, q06 +5.2% at 8 cores, is a query with no group-by, so it is
   layout or noise.
+  **Then the filter over it moved into the aggregate (2026-09-24).** q18's
+  `big_orders` keeps 57 of 12M groups (`sum_quantity > 300.0`). Ordering and
+  emitting the rest was the next cost: a warm prototype put it at −15%. A
+  filter directly over a grouped aggregate now hands the aggregate its
+  `output <op> numeric literal` conjuncts (`src/runtime/aggregate_prefilter.*`,
+  via `build_pipeline_source`). The aggregate drops the groups that will
+  certainly fail: inside each owned partition before the first-occurrence
+  merge, or on the finished group arrays for every other key shape. The filter
+  stays, so an uncertain group (a null aggregate, a NaN, an inexact comparison)
+  is simply kept. q18 −24.4% at 8 cores (20 of 20, byte-identical).
+  Suite at 8 pairs: q18 −32.1% (8 of 8), geomean −1.2% at 8 cores and −0.6%
+  at 1 core. All 22 answers byte-identical. q22 is +4.3% at 8 cores (20
+  pairs, 19 slower) with no filter over an aggregate. The cause is code
+  placement: the anti-join probe lambda that gains the time (26.6% → 33.5% of
+  samples) is instruction-for-instruction identical between the two binaries
+  (146 instructions, 551 bytes) and only starts at a different 64-byte offset
+  (16 → 0). Moving the new file to the end of the link order does not change it.
+  For ClickBench: its two HAVING queries (Q27/Q28 in the ClickBench plan)
+  still need `length()` and regex replacement. Q27 groups by `CounterID`
+  (thousands of groups), where pruning saves little. Q28's regex-derived keys
+  are the shape it helps.
 - q01's aggregate queues behind its own scan. Sized and judged a no-go for now:
   removing the overlap costs q01 44% (memory:
   `project_q01_scan_aggregate_contention`).

@@ -835,7 +835,7 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
     }
     const auto build_child = [&] -> std::expected<OperatorPtr, std::string> {
         if (index + 1 == plan.steps.size()) {
-            return build_operator(*plan.source_node, registry, scalars, externs, exec, model_out);
+            return build_pipeline_source(plan, registry, scalars, externs, exec, model_out);
         }
         return build_physical_map_step(plan, index + 1, registry, scalars, externs, exec,
                                        model_out);

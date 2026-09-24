@@ -10,6 +10,7 @@
 #include <expected>
 #include <string>
 
+#include "aggregate_prefilter.hpp"
 #include "physical_plan.hpp"
 
 namespace ibex::runtime {
@@ -39,7 +40,8 @@ namespace physical_executor_detail {
                                             const TableRegistry& registry,
                                             const ScalarRegistry* scalars,
                                             const ExternRegistry* externs,
-                                            const ExecutionContext& exec, ModelResult* model_out)
+                                            const ExecutionContext& exec, ModelResult* model_out,
+                                            const AggregatePrefilter& prefilter = {})
     -> std::expected<OperatorPtr, std::string>;
 
 [[nodiscard]] auto build_physical_order(const ir::Node& node, const TableRegistry& registry,

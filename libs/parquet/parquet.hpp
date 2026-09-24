@@ -805,8 +805,11 @@ inline auto schema_table_from_arrow(const arrow::Schema& schema) -> ibex::runtim
 /// for: on TPC-H it selects l_returnflag, l_linestatus, l_shipinstruct,
 /// l_shipmode, p_brand, p_container … and rejects l_comment and p_name.
 ///
-/// Getting this wrong is a performance choice, not a correctness one: a column
-/// read either way holds the same values.
+/// Declining is always safe: a column read dense holds the same values. Claiming
+/// is not. The dictionary read goes through Arrow's `ColumnWithExposeEncoding`,
+/// which throws off the read ("dictionary column changed encoding") for any
+/// chunk Arrow itself will not prove fully dictionary-encoded, so the test here
+/// must never be looser than Arrow's.
 /// A column's dictionary size in bytes, summed over row groups, from metadata
 /// alone. The dictionary page runs from its own offset to the first data page.
 inline auto dictionary_bytes(const parquet::FileMetaData& metadata, int col) -> std::int64_t {
@@ -858,7 +861,14 @@ inline auto dictionary_column_indices(parquet::ParquetFileReader& reader) -> std
         bool fully_dictionary = metadata.num_row_groups() > 0;
         for (int group = 0; group < metadata.num_row_groups() && fully_dictionary; ++group) {
             auto chunk = metadata.RowGroup(group)->ColumnChunk(col);
-            if (!chunk->has_dictionary_page()) {
+            // Without per-page encoding stats nothing says the data pages stayed
+            // dictionary-encoded: a writer may fall back to PLAIN mid-chunk, and
+            // the encodings list cannot tell (the dictionary page is PLAIN
+            // itself). Arrow's `ColumnWithExposeEncoding` declines to expose the
+            // dictionary in exactly this case, so claiming the column here would
+            // only fail later with "dictionary column changed encoding". Polars
+            // writes no encoding stats at all, so its string columns read dense.
+            if (!chunk->has_dictionary_page() || chunk->encoding_stats().empty()) {
                 fully_dictionary = false;
                 break;
             }
@@ -1226,10 +1236,14 @@ inline auto decode_string_column(parquet::arrow::FileReader& reader, int leaf_in
             });
     }
 
-    // The chunk's uncompressed byte size bounds the characters it can decode to
-    // (it also carries a 4-byte length per value, so it overshoots slightly).
-    // That bound is what lets the values be written straight through cursors
-    // instead of one push_back — see Column<std::string>::begin_bulk_append.
+    // A PLAIN chunk's uncompressed byte size bounds the characters it decodes
+    // to (it also carries a 4-byte length per value, so it overshoots
+    // slightly). That bound is what lets the values be written straight
+    // through cursors instead of one push_back -- see
+    // Column<std::string>::begin_bulk_append. A chunk with a dictionary page
+    // has no such bound: each distinct value is stored once and decodes once
+    // per row (Polars' `c_mktsegment`: 150,000 rows from a 178-byte
+    // dictionary). Those batches reserve their own bytes first.
     std::size_t chars_bound = 0;
     for (int group = groups.begin; group < groups.end; ++group) {
         chars_bound += static_cast<std::size_t>(
@@ -1249,6 +1263,8 @@ inline auto decode_string_column(parquet::arrow::FileReader& reader, int leaf_in
         }
         auto typed = std::static_pointer_cast<parquet::ByteArrayReader>(column);
         const auto group_rows = static_cast<std::size_t>(metadata.RowGroup(group)->num_rows());
+        const bool unbounded =
+            metadata.RowGroup(group)->ColumnChunk(leaf_index)->has_dictionary_page();
         std::size_t row = 0;
         while (row < group_rows && typed->HasNext()) {
             const auto request = static_cast<std::int64_t>(std::min<std::size_t>(
@@ -1262,6 +1278,13 @@ inline auto decode_string_column(parquet::arrow::FileReader& reader, int leaf_in
                     "that contradicts the column statistics");
             }
             const auto count = static_cast<std::size_t>(values_read);
+            if (unbounded) {
+                std::size_t bytes = 0;
+                for (std::size_t i = 0; i < count; ++i) {
+                    bytes += values[i].len;
+                }
+                out.ensure_bulk_capacity(writer, bytes);
+            }
             // The ByteArray points into the page's decompression buffer, so the
             // copy has to happen before the next ReadBatch reuses it.
             for (std::size_t i = 0; i < count; ++i) {
@@ -3242,12 +3265,14 @@ inline auto filtered_string_page_stripe(const StringPageStripe& task,
                                         ibex::runtime::Selection& selected) -> bool {
     std::shared_ptr<arrow::io::InputStream> stream;
     if (task.dictionary_size == 0) {
-        auto result =
-            arrow::io::RandomAccessFile::GetStream(input, task.data_offset, task.data_size);
-        if (!result.ok())
-            throw std::runtime_error("read_parquet: failed to open string page stripe (" +
-                                     result.status().ToString() + ")");
-        stream = std::move(*result);
+        // Read the stripe into a buffer, as the dictionary case does: the page
+        // reader Peeks at each page header, and the segment stream
+        // `RandomAccessFile::GetStream` returns does not implement Peek.
+        auto data = input->ReadAt(task.data_offset, task.data_size);
+        if (!data.ok())
+            throw std::runtime_error("read_parquet: failed to read string page stripe (" +
+                                     data.status().ToString() + ")");
+        stream = std::make_shared<arrow::io::BufferReader>(std::move(*data));
     } else {
         auto dictionary = input->ReadAt(task.dictionary_offset, task.dictionary_size);
         auto data = input->ReadAt(task.data_offset, task.data_size);

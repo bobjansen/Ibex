@@ -873,32 +873,15 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, std::size_t lhs_off,
             }
         }
     }
+    // Date and Timestamp go through cmp_into like the numeric types. The
+    // per-row `switch (op)` this replaced was only fast while the optimizer
+    // hoisted it out of the loop; once compare_vec grew and was inlined into
+    // compute_mask it stopped doing so, and the loop went scalar and reloaded
+    // both column pointers every row. That cost q04 6% at one core (7a9cdd54).
+    // cmp_into's per-op loops and __restrict pointers don't depend on that.
     if (const auto* l = std::get_if<Column<Date>>(&lhs)) {
         if (const auto* r = std::get_if<Column<Date>>(&rhs)) {
-            for (std::size_t i = 0; i < n; ++i) {
-                const auto left_value = l->data()[lhs_off + i].days;
-                const auto right_value = r->data()[rhs_off + i].days;
-                switch (op) {
-                    case ir::CompareOp::Eq:
-                        mp[i] = left_value == right_value;
-                        break;
-                    case ir::CompareOp::Ne:
-                        mp[i] = left_value != right_value;
-                        break;
-                    case ir::CompareOp::Lt:
-                        mp[i] = left_value < right_value;
-                        break;
-                    case ir::CompareOp::Le:
-                        mp[i] = left_value <= right_value;
-                        break;
-                    case ir::CompareOp::Gt:
-                        mp[i] = left_value > right_value;
-                        break;
-                    case ir::CompareOp::Ge:
-                        mp[i] = left_value >= right_value;
-                        break;
-                }
-            }
+            cmp_into(op, l->data() + lhs_off, r->data() + rhs_off, mp, n);
             {
                 auto merged_v = merge_validity(lv, lhs_off, rv, rhs_off, n);
                 result.apply_validity(merged_v ? &*merged_v : nullptr, 0, n);
@@ -908,30 +891,7 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, std::size_t lhs_off,
     }
     if (const auto* l = std::get_if<Column<Timestamp>>(&lhs)) {
         if (const auto* r = std::get_if<Column<Timestamp>>(&rhs)) {
-            for (std::size_t i = 0; i < n; ++i) {
-                const auto left_value = l->data()[lhs_off + i].nanos;
-                const auto right_value = r->data()[rhs_off + i].nanos;
-                switch (op) {
-                    case ir::CompareOp::Eq:
-                        mp[i] = left_value == right_value;
-                        break;
-                    case ir::CompareOp::Ne:
-                        mp[i] = left_value != right_value;
-                        break;
-                    case ir::CompareOp::Lt:
-                        mp[i] = left_value < right_value;
-                        break;
-                    case ir::CompareOp::Le:
-                        mp[i] = left_value <= right_value;
-                        break;
-                    case ir::CompareOp::Gt:
-                        mp[i] = left_value > right_value;
-                        break;
-                    case ir::CompareOp::Ge:
-                        mp[i] = left_value >= right_value;
-                        break;
-                }
-            }
+            cmp_into(op, l->data() + lhs_off, r->data() + rhs_off, mp, n);
             {
                 auto merged_v = merge_validity(lv, lhs_off, rv, rhs_off, n);
                 result.apply_validity(merged_v ? &*merged_v : nullptr, 0, n);

@@ -283,6 +283,21 @@ because it decides the ranking of the others.
      `IBEX_CORES=1` over `f06e6da3..HEAD`. Confirm it first with `perf stat`
      elapsed time: the decode pool still gets 2 threads at 1 core, so
      `ab_queries`' CPU-burn bias could apply.
+   - **Bisected 2026-09-24.** `perf stat` pairs at 1 core put q04 at +6.1%
+     (10 of 10 pairs, task-clock +6.3%) and q21 at only +2.1% (8 of 10). So the
+     bisect ran on q04. The first bad commit is `7a9cdd54` (Add Decimal(p, s)):
+     30 of 30 pairs, +6.1% against its parent. It did not change the loop that
+     got slower. `compare_vec`'s Date/Timestamp column-vs-column branch kept a
+     `switch (op)` inside its per-row loop, and that was only fast while the
+     optimizer hoisted the switch out. Decimal grew `compare_vec`, which then
+     got inlined into `compute_mask`. The loop went scalar and reloaded both
+     column pointers every row: 81 → 277 samples. **Fixed** by routing
+     Date/Timestamp through `cmp_into` like the numeric types: q04 −6.5% and
+     q07 −4.0% at 1 core, geomean −1.2%, 8 cores neutral, answers
+     byte-identical. q04 ends up 4.7% faster than before Decimal. q21's +2% is
+     not this and was not recovered; it is too small to bisect reliably.
+     Lesson: a kernel whose speed depends on the optimizer unswitching a loop
+     is fragile. Write the per-op loops out, as `cmp_into` does.
    - **Output: only q11 differs,** and legitimately. Both sides return zero
      rows. The base printed a column-less `<empty>` table, and HEAD keeps the
      schema.

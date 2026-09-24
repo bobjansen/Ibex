@@ -1,7 +1,8 @@
 # Beating Polars multi-core
 
-Status: **ongoing umbrella plan. Rebaselined 2026-09-23; §1–§3 re-measured
-2026-09-24 (W0 local).** It sets the target,
+Status: **ongoing umbrella plan. Rebaselined 2026-09-23; re-measured
+2026-09-24 on the dev box and on 16 physical cores on AWS (W0).** It sets the
+target,
 says where the gap is, and ranks the workstreams. Mechanism lives in the plans
 it points to: `kernel-pipeline-execution-plan.md`,
 `runtime-multithreading-plan.md`, `owned-agg-per-chunk-barrier-plan.md`,
@@ -12,16 +13,117 @@ to 60–65%") has been met and is superseded. Its full text, including the W1
 join / W1b / W3.1 decode-budget / q22 / q10 write-ups and the 2026-08-11
 per-query standings, is at `git show e82f679d:plans/beat-polars-plan.md`.
 
-The rebaseline changes the question. At 8 cores Ibex is now level with or
-ahead of Polars on suite total, and it gets there on a single-core lead, not
-on scaling. **The single-core lead covers the gap up to about 8 cores. Beyond
-that, only the parallel fraction counts.** The first measurement past 8 cores
-(§2, exploratory, dev box) does not show the gap reopening: Polars loses more
-than Ibex on the E-cores and SMT siblings. But Ibex gets slower from 12 to 16
-cores, and on equal physical cores the projection is still the prior until
-AWS says otherwise.
+**On physical cores, Ibex loses from about 6 cores upward, and the gap grows
+with every core** (§1a): 1.08 at 8, 1.26 at 12, 1.36 at 16 (geomean 1.45; 1.51
+without q21). The single-core lead is real (0.61) but fixed. Polars' implied
+parallel fraction is about 98%, Ibex's about 87–88%, and both follow Amdahl
+closely from 8 to 16 cores. **The whole problem is Ibex's serial time:** about
+2.8 s of its 21.5 s single-core suite does not parallelize, against 0.4 s of
+Polars' 35 s. Parity at 16 cores needs that halved.
+
+The dev box (§1b) said otherwise: 0.92 at 8 cores, and the gap not reopening
+past 8. Both conclusions came from the box. Its hybrid P/E-core topology under
+WSL2 held Polars to 4.7× at 8 cores, where physical cores give it 7.4×. Do
+not use the dev box for cross-engine claims at any core count above about 4.
+It stays useful for A/B work on Ibex alone.
 
 ## 1. Baseline (W0, measured 2026-09-24)
+
+### 1a. Physical cores, AWS (the baseline)
+
+PDS-H **SF-8** on one `r7i.8xlarge` with SMT disabled (`--threads-per-core 1`):
+16 physical Sapphire Rapids cores (Xeon Platinum 8488C), 256 GiB, commit
+`461c0963` (clean). One box ran every core count in turn
+(`run-tpch.sh --cores 2,4,8,12,16 --no-polars-in-memory`), each with its own
+1-core rows, all engines `taskset` to cores `0..N-1`, min of 5 after 1
+warm-up. Before timing, every core count passed the answer check against
+Polars (22 of 22). Artifact:
+`benchmarking/results/tpch_aws_20260924T102939.tar.gz`
+(`s3://…/benchmarks/20260924T102939_461c0963/`), runs
+`20260924T1{05232,10459,11554,12622,13645}Z_461c0963_sf8`. DuckDB ran too and
+is in the TSVs, but is not analyzed here.
+
+The five 1-core samples agree within 1.0% (Ibex 21,369–21,594 ms; Polars
+34,350–35,901). A clean box does not drift the way WSL2 does.
+
+| cores | Ibex ms | Polars ms | Ibex/Polars | geomean | Ibex scaling | Polars scaling | Ibex fraction | Polars fraction |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 21,487 | 35,108 | **0.61** | 0.70 | | | | |
+| 2 | 11,626 | 17,432 | **0.67** | 0.78 | 1.85× | 2.01× | 91.8% | 100.7% |
+| 4 | 7,137 | 9,107 | **0.78** | 0.93 | 3.01× | 3.86× | 89.0% | 98.7% |
+| 8 | 5,134 | 4,767 | **1.08** | 1.20 | 4.19× | 7.36× | 87.0% | 98.8% |
+| 12 | 4,323 | 3,429 | **1.26** | 1.35 | 4.97× | 10.24× | 87.1% | 98.4% |
+| 16 | 3,768 | 2,780 | **1.36** | 1.45 | 5.70× | 12.63× | 88.0% | 98.2% |
+
+Without q21:
+
+| cores | Ibex ms | Polars ms | Ibex/Polars | geomean | Ibex scaling | Polars scaling | Ibex fraction | Polars fraction |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 16,974 | 25,371 | **0.67** | 0.72 | | | | |
+| 2 | 10,297 | 12,907 | **0.80** | 0.82 | 1.65× | 1.97× | 78.7% | 98.3% |
+| 4 | 6,221 | 6,677 | **0.93** | 0.97 | 2.73× | 3.80× | 84.5% | 98.2% |
+| 8 | 4,468 | 3,575 | **1.25** | 1.24 | 3.80× | 7.10× | 84.2% | 98.2% |
+| 12 | 3,719 | 2,583 | **1.44** | 1.39 | 4.56× | 9.82× | 85.2% | 98.0% |
+| 16 | 3,213 | 2,121 | **1.51** | 1.49 | 5.28× | 11.96× | 86.5% | 97.7% |
+
+**What the physical-core curve says:**
+
+- **Parity is at about 6 cores, and the gap widens from there.** The 1-core
+  lead (0.61, 0.70 geomean) is intact. Polars' near-linear scaling erases it
+  between 4 and 8 cores.
+- **Both engines follow Amdahl.** Fitted at 8 cores and projected, Ibex comes in
+  5% *better* than projection at 16 and Polars 7% worse. So the ratio at 16 is
+  1.36, not the projected 1.53. The dev box's 12→16 Ibex regression (§2) does
+  not happen here: 4,323 → 3,768 ms.
+- **What parity takes.** At 16 cores Ibex needs an implied fraction of about
+  **92.9%** for parity on total (93.3% without q21) and **94.2%** to win by
+  10%. At 8 cores parity needs 88.9%, against 87.0% today. In time terms, Ibex's
+  non-parallel share is about 2.8 s of 21.5 s and must fall to about 1.5 s.
+  Polars' is about 0.4 s of 35 s.
+- **The 2-core point is Ibex's worst without q21** (78.7%), as on the dev box.
+  q21 is Ibex's best query at 2 cores (0.29), because Polars' q21 barely scales
+  there.
+
+Per query at 16 cores, sorted by the 16-core ratio (ms, min of 5; 1c is the
+median of the five 1-core samples):
+
+| query | ibex 1c | polars 1c | ratio 1c | ratio 8c | ibex 16c | polars 16c | ratio 16c | ibex scal 16c | polars scal 16c |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| q16 | 374 | 365 | 1.02 | 2.35 | 131 | 45 | **2.89** | 2.85 | 8.04 |
+| q10 | 1,161 | 1,298 | 0.89 | 2.05 | 433 | 170 | **2.55** | 2.68 | 7.65 |
+| q14 | 380 | 329 | 1.16 | 1.84 | 61 | 25 | **2.40** | 6.25 | 12.96 |
+| q15 | 372 | 268 | 1.39 | 1.86 | 56 | 24 | **2.27** | 6.70 | 10.99 |
+| q19 | 788 | 705 | 1.12 | 1.76 | 122 | 55 | **2.23** | 6.45 | 12.88 |
+| q07 | 1,024 | 1,219 | 0.84 | 1.60 | 216 | 98 | **2.19** | 4.75 | 12.39 |
+| q03 | 924 | 1,234 | 0.75 | 1.56 | 201 | 95 | **2.12** | 4.61 | 13.05 |
+| q05 | 841 | 1,293 | 0.65 | 1.30 | 176 | 101 | **1.74** | 4.77 | 12.76 |
+| q13 | 1,367 | 2,360 | 0.58 | 1.07 | 274 | 188 | **1.46** | 5.00 | 12.56 |
+| q20 | 666 | 1,548 | 0.43 | 0.83 | 157 | 111 | **1.41** | 4.24 | 13.92 |
+| q01 | 1,855 | 2,809 | 0.66 | 1.84 | 290 | 207 | **1.40** | 6.41 | 13.60 |
+| q02 | 81 | 104 | 0.79 | 1.28 | 33 | 24 | **1.38** | 2.47 | 4.33 |
+| q08 | 728 | 1,102 | 0.66 | 1.00 | 137 | 107 | **1.29** | 5.30 | 10.33 |
+| q09 | 1,641 | 3,497 | 0.47 | 0.93 | 320 | 263 | **1.22** | 5.13 | 13.32 |
+| q04 | 748 | 1,356 | 0.55 | 0.96 | 128 | 106 | **1.21** | 5.84 | 12.84 |
+| q11 | 97 | 272 | 0.36 | 0.85 | 37 | 35 | **1.05** | 2.62 | 7.66 |
+| q06 | 369 | 218 | 1.69 | 1.36 | 36 | 37 | **0.98** | 10.28 | 5.98 |
+| q18 | 2,261 | 2,999 | 0.75 | 0.89 | 210 | 214 | **0.98** | 10.79 | 13.99 |
+| q17 | 397 | 628 | 0.63 | 0.75 | 58 | 61 | **0.94** | 6.89 | 10.28 |
+| q12 | 663 | 1,193 | 0.56 | 0.82 | 91 | 102 | **0.89** | 7.26 | 11.67 |
+| q22 | 237 | 574 | 0.41 | 0.83 | 47 | 53 | **0.89** | 5.03 | 10.81 |
+| q21 | 4,513 | 9,737 | 0.46 | 0.56 | 555 | 659 | **0.84** | 8.12 | 14.78 |
+
+**Scaling losers at 16 cores** (Ibex scaling below 5×): q02 2.47×, q11 2.62×,
+q10 2.68×, q16 2.85×, q20 4.24×, q03 4.61×, q07 4.75×, q05 4.77×. Joins and
+the small queries, as the dev-box breaker map said. **Per-core losses** are
+unchanged: q06 1.69, q15 1.39, q14 1.16, q19 1.12, q16 1.02. **Ibex still wins
+at 16 cores** on q06, q18, q22, q12, q17 and q21. q06 and q18 scale about 10×.
+
+### 1b. Dev box sweep (i7-13700 under WSL2): superseded as a cross-engine baseline
+
+Kept for the record and for single-engine work. Its cross-engine ratios above
+about 4 cores are box artefacts (see the intro): Polars scales 4.70× at 8
+cores here against 7.36× on physical cores, so every dev-box ratio at 8 and up
+flatters Ibex.
 
 PDS-H **SF-8**, dev box (i7-13700 under WSL2), commit `2f57078d` (clean),
 `run_bench.sh --sf 8 --cores N --polars-streaming --no-polars-in-memory
@@ -131,7 +233,14 @@ q06, q15 and q14. **Scaling losses** are q10, q16, q19, q03, q01 and q07, which
 win or tie at one core and lose at eight. q10 and q16 scale less than 2× at 8
 cores.
 
-## 2. Past 8 cores (measured, exploratory)
+## 2. Past 8 cores on the dev box (measured, exploratory; SUPERSEDED by §1a)
+
+**Read §1a instead.** This section concluded that the gap does not reopen past
+8 cores and that Ibex regresses from 12 to 16 on joins. On physical cores
+neither holds: the gap grows (1.08 → 1.36) and Ibex keeps scaling (12→16c:
+−13%). Both were effects of the E-cores and SMT siblings, which cost Polars
+more than Ibex. The text is kept as the record of what the dev box shows.
+
 
 The 2026-09-23 version of this section projected each engine's 8-core Amdahl
 fit to 12 and 16 cores and concluded that the gap reopens: 1.08 on total and
@@ -223,15 +332,17 @@ of the existing parallel work at 15%**. That is about the same as the 16%
 measured on 2026-08-25 (SF-2, 8c). The rest still has to come from turning
 serial work into parallel work. q21 alone is 532 ms of the 1,729 serial ms
 (its wall is 901 ms), and the next largest are q13 (155), q10 (149), q18 (138)
-and q01 (126). **Barrier wait (2,922 ms) is the largest single bucket.** That
-fits §2's join regression from 8 to 16 cores: fan-outs waiting on their
-slowest task, and on heterogeneous cores the slowest task is slower.
+and q01 (126). **Barrier wait (2,922 ms) is the largest single bucket.** Part
+of that is the dev box's heterogeneous cores, where the slowest task in a
+fan-out is slower. The §2 join regression it seemed to explain does not happen
+on AWS (§1a). Re-take this profile on the AWS box before sizing anything from
+the barrier bucket.
 
 **Re-ranking W2–W5 from the 16-core view:**
 
 - **W2 (join) stays first**, down from 59% to 44% of idle. q21, q04 and q20
-  (semi) and q19, q10 and q07 (inner) lead. The 8→16 join regressions in §2 make
-  the barrier and straggler side of join fan-out a new item.
+  (semi) and q19, q10 and q07 (inner) lead. (The 8→16 join
+  regressions in §2 were a dev-box artefact; §1a has no such regression.)
 - **W5 (aggregate) reopens.** Its own reopen condition was "if W0 moves
   aggregate back up the map at 16 cores", and it did: 18% → 26%. The rows are
   q21 `Aggregate.Discovery`, q13's aggregate, q18 `FinalOrdering` / `Emission`
@@ -262,12 +373,12 @@ because it decides the ranking of the others.
    `project_bench_core_count_cap`). Above 8, some cores will be E-cores or SMT
    siblings. These points show the shape of the curve, not a number to
    publish.
-3. **The publishable curve on AWS**, physical cores only
-   (`--threads-per-core 1`). `r7i.4xlarge` gives 8 physical cores and
-   `r7i.8xlarge` gives 16. The harness exists
-   (`benchmarking/aws/run-thread-scaling.sh`; memory:
-   `project_bench_two_tier_framework`). Refresh the AMI first (memory:
-   `project_aws_baked_ami_goes_stale`).
+3. **DONE 2026-09-24: the publishable curve on AWS** (§1a). One
+   `r7i.8xlarge` with SMT off, `run-tpch.sh --cores 2,4,8,12,16` (the list form
+   was added for this, `994b017c`). The stale AMI was fine. Two launches failed
+   first, and both were harness bugs that only a fresh clone exposes: the exit
+   handler could not ship its log (`76271a6d`), and the answer check needed the
+   `scale-<sf>` path (`461c0963`). About $4 in total.
 4. **DONE 2026-09-24: breaker map and `profile_suite.py` at 16 cores** (§3).
 5. **DONE 2026-09-24: interleaved A/B of the 2026-09-04 baseline against
    HEAD.** Run as `ab_queries.py` with 8 repeats, `taskset -c 0-7`, and each
@@ -315,10 +426,10 @@ because it decides the ranking of the others.
    check compared Ibex with Ibex.
 
 Exit: §1 and §2 rewritten from measurement, with the implied fraction at
-1/2/4/8/12/16 for both engines (met locally 2026-09-24). Item 3 (AWS) is
-still open, as is the q21 1-core bisect from item 5.
+1/2/4/8/12/16 for both engines. Met 2026-09-24, locally and on AWS. W0 is
+closed; q21's residual +2% at 1 core (item 5) is too small to bisect.
 
-### W1: Constants and gates tuned at 8 cores (new; do before trusting W0's 16-core point)
+### W1: Constants and gates tuned at 8 cores (still worth a sweep, but §1a shows no 16-core cliff)
 
 Every scale-dependent threshold in the engine was calibrated on the 8-core dev
 box. Audit each of these against the W0 sweep:
@@ -526,7 +637,12 @@ sitting as a fresh Polars run:
 
 - faster than Polars on suite total **at every core count from 1 to 16**, and
   also without q21;
-- geomean at or below parity at 8 cores (1.05 on 2026-09-24);
+- geomean at or below parity at 8 cores.
+
+Status on 2026-09-24 (§1a): the 1-core lead holds (0.61), but Ibex trails from
+about 6 cores on: 1.08 at 8, 1.36 at 16 on total, and a geomean of 1.20 at 8
+and 1.45 at 16. Winning at 16 needs an implied fraction of about 94%, against
+88% today.
 - the 1-core total no worse than today's baseline.
 
 Re-check at SF-2 before publishing, since thresholds were calibrated there and

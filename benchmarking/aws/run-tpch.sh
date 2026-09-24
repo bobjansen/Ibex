@@ -15,9 +15,13 @@
 # Options:
 #   --sf LIST            comma-separated scale factors (default: 1)
 #   --type TYPE          instance type (default: r7i.2xlarge)
-#   --cores N            pin every engine to N cores (default: the box's
+#   --cores N[,N...]     pin every engine to N cores (default: the box's
 #                        physical core count; 0 = unpinned, not a valid
-#                        cross-engine comparison)
+#                        cross-engine comparison). A list runs the whole suite
+#                        once per count on the SAME box, which is the way to
+#                        measure a scaling curve: every point shares one box
+#                        and each run carries its own 1-core rows. Each
+#                        finished count is uploaded as a partial artifact.
 #   --threads-per-core N 1 disables SMT, for a clean physical-core number
 #   --volume-size GB     root volume (default 250; the launch refuses to start
 #                        if the SF list cannot fit -- ~1.6 GB per SF-unit,
@@ -30,6 +34,8 @@
 #   ./benchmarking/aws/run-tpch.sh --on-demand --sf 1 --warmup 1 --iters 5
 #   ./benchmarking/aws/run-tpch.sh --on-demand --type r7i.8xlarge \
 #       --sf 1,8,30,100 --threads-per-core 1 --volume-size 400
+#   ./benchmarking/aws/run-tpch.sh --on-demand --type r7i.8xlarge --sf 8 \
+#       --threads-per-core 1 --cores 2,4,8,12,16 --no-polars-in-memory
 
 set -euo pipefail
 
@@ -95,6 +101,18 @@ if [[ -z "$CORES" ]]; then
         exit 1
     fi
     CORES="$_cores"
+fi
+
+# A count above the box's physical cores would silently pin two engines'
+# threads onto SMT siblings (or fail taskset outright): refuse it here.
+read -r _vcpus _phys _tpc _mem <<< "$(bench_instance_topology "$REGION" "$INSTANCE_TYPE")"
+if [[ "$_phys" != "?" ]]; then
+    for _n in ${CORES//,/ }; do
+        if (( _n > _phys )); then
+            echo "error: --cores ${_n} exceeds ${INSTANCE_TYPE}'s ${_phys} physical cores" >&2
+            exit 1
+        fi
+    done
 fi
 
 CPU_ARGS=()

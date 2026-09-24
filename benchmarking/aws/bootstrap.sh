@@ -777,6 +777,16 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
     }
     trap finish_tpch EXIT
 
+    # A separate key from the final artifact: the launcher's wait loop exits the
+    # moment the final key appears, so a partial there would pass for a finished
+    # run (the same rule as window-OHLC's partials).
+    push_partial_tpch() {
+        mkdir -p /ibex/benchmarking/results
+        tar -C /ibex/benchmarking/tpch -czf "$ARTIFACT" results 2>/dev/null || return 0
+        aws s3 cp "$ARTIFACT" "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY%.tar.gz}.partial.tar.gz" \
+            --region "${IBEX_REGION}" >/dev/null 2>&1 || true
+    }
+
     build_ibex
     if [[ ! -d "$PDSH_ROOT/.git" ]]; then
         git clone "$PDSH_REPO" "$PDSH_ROOT"
@@ -796,15 +806,24 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
         # unpinned".
         TPCH_ARGS=(--sf "$scale" --warmup "${IBEX_WARMUP:-1}" --iters "${IBEX_ITERS:-5}"
                    --pdsh-root "$PDSH_ROOT")
-        if [[ -n "${IBEX_TPCH_CORES:-}" && "${IBEX_TPCH_CORES}" != "0" ]]; then
-            TPCH_ARGS+=(--cores "${IBEX_TPCH_CORES}")
-        fi
         # The in-memory Polars executor materialises whole tables and OOMs the
         # box at high scale factors; the streaming pass still gives a reference.
         if [[ "${IBEX_TPCH_POLARS_IN_MEMORY:-1}" == "0" ]]; then
             TPCH_ARGS+=(--no-polars-in-memory --polars-streaming)
         fi
-        bash /ibex/benchmarking/tpch/run_bench.sh "${TPCH_ARGS[@]}"
+        # IBEX_TPCH_CORES may be a list (2,4,8,16): one full run per count on
+        # this box -- a scaling curve whose points share the hardware, each with
+        # its own 1-core rows. Every finished count is pushed as a partial
+        # artifact, so a stall late in the curve loses one point, not all.
+        IFS=',' read -r -a TPCH_CORE_LIST <<< "${IBEX_TPCH_CORES:-0}"
+        for cores in "${TPCH_CORE_LIST[@]}"; do
+            CORE_ARGS=()
+            if [[ -n "$cores" && "$cores" != "0" ]]; then
+                CORE_ARGS=(--cores "$cores" --label "aws sf${scale} ${cores}c")
+            fi
+            bash /ibex/benchmarking/tpch/run_bench.sh "${TPCH_ARGS[@]}" "${CORE_ARGS[@]}"
+            push_partial_tpch
+        done
     done
     exit 0
 fi

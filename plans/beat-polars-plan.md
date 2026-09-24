@@ -71,13 +71,14 @@ carries the total: 581 ms against 1,357 at 8 cores.
 
 **What the 1-to-8 curve says:**
 
-- **Nothing moved at 8 cores.** Total 0.92, geomean 1.05 and fraction 78.8%,
-  against 0.92, 1.06 and 78.5% on 2026-09-04. The breaker-map arc's wins are
-  real (q20 is 259 → 164 ms, and q06 81 → 68), but other queries rose by about
-  the same amount: q10 +12%, q04 +8%, q05 +6%, q07 +6%, q01 +4%. Over the same
-  period Polars moved by ±5% or less. That comparison is across sittings,
-  so it is a lead to check with an interleaved A/B of `b492f707` against HEAD,
-  not an established regression. q10 is the first query to look at.
+- **The 8-core total did not move against 2026-09-04,** but the code did get
+  faster. Total 0.92, geomean 1.05 and fraction 78.8%, against 0.92, 1.06 and
+  78.5% on 2026-09-04. Across those two sittings q10 (+12%), q04 (+8%) and
+  q05/q07 (+6%) seemed to rise by about what q20 gained. The interleaved A/B
+  (W0 item 5) does not reproduce any of those rises. At 8 cores HEAD is 3.3%
+  faster by geomean, with nothing significantly slower. The flat total is
+  cross-sitting drift plus the uncommitted changes in the 2026-09-04 run,
+  which was marked dirty.
 - **Ibex's fraction peaks at 2–4 cores and falls after that** (81 → 79%),
   while Polars holds about 89–90% from 2 to 8 cores. The August pattern, where
   the fraction climbed with cores, is gone. What remains is ordinary serial
@@ -112,10 +113,13 @@ Per query, sorted by the 8-core ratio (ms, min of 5; 1c is the pooled median):
 | q18 | 1,746 | 2,127 | 0.82 | 378 | 471 | 0.80 | 4.61 | 4.51 | 0.93 | 4.51 | 5.14 |
 | q09 | 1,129 | 2,420 | 0.47 | 401 | 502 | 0.80 | 2.81 | 4.82 | 0.89 | 2.67 | 5.07 |
 | q12 | 463 | 847 | 0.55 | 136 | 185 | 0.74 | 3.39 | 4.58 | 0.75 | 3.94 | 5.41 |
-| q11 | 72 | 183 | 0.39 | 38 | 53 | 0.72 | 1.89 | 3.45 | 0.66 | 1.80 | 3.01 |
+| q11 † | 72 | 183 | 0.39 | 38 | 53 | 0.72 | 1.89 | 3.45 | 0.66 | 1.80 | 3.01 |
 | q20 | 455 | 1,106 | 0.41 | 164 | 236 | 0.70 | 2.77 | 4.69 | 0.79 | 2.63 | 5.01 |
 | q22 | 178 | 350 | 0.51 | 56 | 80 | 0.69 | 3.18 | 4.34 | 0.61 | 3.68 | 4.45 |
 | q21 | 3,188 | 6,822 | 0.47 | 581 | 1,357 | 0.43 | 5.48 | 5.03 | 0.52 | 5.63 | 6.28 |
+
+† Invalid above SF-1: Ibex's q11 does not scale `FRACTION` by SF and returns
+zero rows (W0 item 6).
 
 Read it in two columns, as before. **Per-core losses** (1c ratio above 1) are
 q06, q15 and q14. **Scaling losses** are q10, q16, q19, q03, q01 and q07, which
@@ -260,14 +264,34 @@ because it decides the ranking of the others.
    `project_bench_two_tier_framework`). Refresh the AMI first (memory:
    `project_aws_baked_ami_goes_stale`).
 4. **DONE 2026-09-24: breaker map and `profile_suite.py` at 16 cores** (§3).
-5. **New: an interleaved A/B of `b492f707` against HEAD at 8 cores.** The 8c
-   total is flat since 2026-09-04 because q10 (+12%), q04 (+8%), q05/q07 (+6%)
-   and q01 (+4%) rose by about what q20 gained (§1). That comparison is across
-   sittings. Confirm or dismiss it with `compare_ibex_git.sh` before W1.
+5. **DONE 2026-09-24: interleaved A/B of the 2026-09-04 baseline against
+   HEAD.** Run as `ab_queries.py` with 8 repeats, `taskset -c 0-7`, and each
+   side on its own plugins (the plugin ABI changed in between). The base is
+   `f06e6da3`, the rebased copy of `b492f707` with identical code.
+   - **8 cores: geomean −3.3%, nothing significantly slower.** q20 −40%, q06
+     −23% and q18 −9% are faster. q10 (+2.1%, p=0.95), q04, q01 and q13 are
+     "unclear" and within 3%. The cross-sitting rises in §1 are dismissed.
+   - **1 core: geomean −2.9%, but two real regressions.** q21 is **+6.1%**
+     (1 of 8 pairs faster, p=0.039; about 170 ms on the 1-core floor) and q04
+     is +3.1% (0 of 8, p=0.008). Faster: q20 −54%, q16 −7%, q13 −4%. §5 makes
+     the 1-core total a hard floor, and q21 carries it, so bisect q21 at
+     `IBEX_CORES=1` over `f06e6da3..HEAD`. Confirm it first with `perf stat`
+     elapsed time: the decode pool still gets 2 threads at 1 core, so
+     `ab_queries`' CPU-burn bias could apply.
+   - **Output: only q11 differs,** and legitimately. Both sides return zero
+     rows. The base printed a column-less `<empty>` table, and HEAD keeps the
+     schema.
+6. **New: q11 is not the same query as Polars' above SF-1.**
+   `queries/q11.ibex` hardcodes `FRACTION = 0.0001`. TPC-H and the Polars
+   reference (`0.0001 / settings.scale_factor`) scale it by SF. At SF-8, Ibex
+   filters with a threshold 8× too high and returns zero rows, while Polars
+   returns the real answer. q11's ratio in §1 (0.72 at 8c) is invalid until
+   the query takes the scale factor. It is the only SF-dependent parameter
+   in PDS-H.
 
 Exit: §1 and §2 rewritten from measurement, with the implied fraction at
-1/2/4/8/12/16 for both engines (met locally 2026-09-24). Items 3 and 5 are
-still open.
+1/2/4/8/12/16 for both engines (met locally 2026-09-24). Items 3 (AWS) and 6
+(q11) are still open, as is the q21 1-core bisect from item 5.
 
 ### W1: Constants and gates tuned at 8 cores (new; do before trusting W0's 16-core point)
 

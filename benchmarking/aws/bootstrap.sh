@@ -764,7 +764,16 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
 
     finish_tpch() {
         local code=$?
-        mkdir -p /ibex/benchmarking/results
+        # Nothing in here may abort the upload. tpch/results does not exist in
+        # a fresh clone until run_bench.sh first writes to it, so a failure
+        # before that point made the tar below fail, and under set -e the handler
+        # died before the upload: no artifact and no log, and the failure's
+        # evidence was lost with it (2026-09-24). The bench log and exit code
+        # now always ship.
+        set +e
+        mkdir -p /ibex/benchmarking/results /ibex/benchmarking/tpch/results
+        echo "exit_code=$code" > /ibex/benchmarking/tpch/results/exit_code.txt
+        cp /var/log/ibex-bench.log /ibex/benchmarking/tpch/results/ibex-bench.log 2>/dev/null
         {
             echo "ibex_commit=$(git -C /ibex rev-parse HEAD)"
             echo "pdsh_commit=$PDSH_COMMIT"

@@ -384,6 +384,24 @@ Order, by share of the 16-core gap:
    1 core. Remembering the last key was a measured dead end: repeated keys
    already hit L1. The whole story, as a teaching note, is in
    `src/runtime/JOIN_FILTERS.md`. Next: q19's join; reconfirm q03/q07 on AWS.
+   **q19, investigated 2026-09-24, parked.** q19 joins all 1.6M parts with
+   lineitem and only then applies its 3-branch OR. The right planner rule is to
+   derive, per join side, the OR of each disjunct's one-side conjuncts
+   (PostgreSQL's `extract_restriction_or_clauses`). It is sound under 3VL, and
+   the original stays above the join. That shrinks the part side to the few
+   thousand parts that can qualify. It is built and correct (SF-1 answers,
+   Polars at SF-8) and the join drops from ~79 ms to 0.3 ms, **but q19 gets
+   slower overall: ~230 → 320–410 ms at 8 cores.** A filtered, small build
+   side flips two runtime choices. (1) The join takes its two-phase probe, and
+   `join_key_selection` skips the fused key scan because lineitem's conjuncts
+   read strings (`stageable_conjunct_columns`, deliberately), so it decodes
+   `l_shipinstruct`/`l_shipmode` whole. (2) Declining that path is not enough:
+   the join then materializes lineitem whole instead of streaming it (the
+   `scan __ibex_source_1` node disappears; 316 ms on the calling thread). The
+   patches (derivation; derivation plus the decline) are out of tree. To
+   resume: find where the join decides to materialize its probe side when the
+   build side is a filtered scan, and make a small build side stream the
+   probe with the fused per-unit scan.
    The key-scan merge was not parallelized: `Selection` zero-fills when sized,
    so doing it properly means changing the type or consuming the parts
    directly. Instrumentation for these phases is not committed; the timers

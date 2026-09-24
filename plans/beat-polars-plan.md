@@ -558,6 +558,10 @@ profile before starting.
   answer against upstream Polars at the benchmarked SF before timing
   (`check_against_polars.py`; the SF-1 official answers are
   `check_answers.py`). Don't pass `--no-answer-check` for a published number.
+- **Warm and fresh.** `run_bench.sh` times a warm in-process loop for both
+  engines. Ibex gains far more from warmth than Polars (q21: ~38% against ~8%,
+  from first-touch page faults), so a large Ibex win should also be quoted
+  fresh-process (`plans/allocator-and-huge-pages.md`).
 - **The leading metric is the implied parallel fraction** from an interleaved
   sweep at 1/2/4/8 (plus 12/16 once W0 lands). A wall-time win that does not
   move the fraction must say so.
@@ -607,6 +611,11 @@ floor); a work-stealing probe cursor at 2 cores (a wash).
   q01 is limited by contention with its own scan.
 - **Aggregate inside the scan pipeline** (breaker map item 5): sized and a
   no-go. Removing the overlap costs q01 44% and q15 61%.
+
+- **jemalloc for the Ibex executables:** +3.7% on fresh 1-core PDS-H, a wash at
+  8 cores. **Huge pages for column buffers only:** −0.6% / −1.8%, with q04 and
+  q18 slower. Whole-heap huge pages are the lever
+  (`plans/allocator-and-huge-pages.md`, parked).
 
 The full list with mechanisms is in memory `project_reverted_perf_dead_ends`.
 

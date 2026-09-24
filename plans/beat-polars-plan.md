@@ -358,7 +358,15 @@ speeding it up would widen a shrinking win and close none of the gap. Polars
 scales the losers 7–13× at 16 cores, so that work demonstrably parallelizes.
 Order, by share of the 16-core gap:
 
-1. **q10: +263 ms (24%).** Scales 2.68× against Polars' 7.65×. 182 ms serial,
+1. **q10: +263 ms (24%).** **2026-09-24 (`96d974dc`): −23% at 8 cores.**
+   Its phase A was the whole-column path, because `l_returnflag == "R"` is a
+   string conjunct and `stageable_conjunct_columns` refuses strings. That rule
+   (789e5573) guards the staged step; it never endorsed the fallback, which the
+   same commit measured as serial and non-scaling. A conjunct over one
+   dictionary-encoded column is now decided on its dictionary, with the key
+   scan's rows as candidates (`dictionary_filter_scan`). Cost: q10 +2.8% at 1
+   core, where both fused passes still touch every row. What remains below is
+   the pre-change breakdown. Scales 2.68× against Polars' 7.65×. 182 ms serial,
    the serial hash build (predates the build/probe split, re-time it first),
    and `source decode whole` (W3), the sixth-largest idle row.
 2. **The inner-join group: q07 +117, q03 +106, q05 +75, q19 +67 (33%).**

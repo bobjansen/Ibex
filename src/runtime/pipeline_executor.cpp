@@ -1456,7 +1456,12 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
         }
     }
     if (owned == nullptr) {
-        auto input_op = build_operator(*input_node, registry, scalars, externs, exec, model_out);
+        // When the run reaches the pipeline's own source, build it the way the
+        // serial composer does, so an aggregate under a filter gets its prefilter.
+        auto input_op =
+            input_node == plan.source_node
+                ? build_pipeline_source(plan, registry, scalars, externs, exec, model_out)
+                : build_operator(*input_node, registry, scalars, externs, exec, model_out);
         if (!input_op.has_value()) {
             return std::unexpected(std::move(input_op.error()));
         }

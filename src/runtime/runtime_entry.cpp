@@ -718,7 +718,8 @@ class OneGroupIfUngroupedOperator final : public Operator {
 auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
                               const TableRegistry& registry, const ScalarRegistry* scalars,
                               const ExternRegistry* externs, const ExecutionContext& exec,
-                              ModelResult* model_out) -> std::expected<OperatorPtr, std::string> {
+                              ModelResult* model_out, const AggregatePrefilter& prefilter)
+    -> std::expected<OperatorPtr, std::string> {
     const auto& agg = ir::node_cast<ir::AggregateNode>(node);
     if (agg.children().empty()) {
         return std::unexpected("aggregate node missing child");
@@ -797,7 +798,8 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         // retains only data-dependent gates such as actual row counts and
         // strategy-specific usefulness thresholds.
         return make_chunked_aggregate_operator(std::move(child_op.value()), &agg.group_by(),
-                                               &agg.aggregations(), exec, *parallelism, ap.columns);
+                                               &agg.aggregations(), exec, *parallelism, ap.columns,
+                                               prefilter);
     }
 
     return std::unexpected("physical aggregate: plan named no executable strategy");
@@ -1042,6 +1044,44 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
 }
 
 }  // namespace
+
+auto build_pipeline_source(const physical::Plan& pipeline, const TableRegistry& registry,
+                           const ScalarRegistry* scalars, const ExternRegistry* externs,
+                           const ExecutionContext& exec, ModelResult* model_out)
+    -> std::expected<OperatorPtr, std::string> {
+    const ir::Node& node = *pipeline.source_node;
+    // A filter directly over a grouped aggregate hands the aggregate the
+    // comparisons it can decide on its own groups (aggregate_prefilter.hpp).
+    // The filter step still runs, so this changes which groups are emitted,
+    // never which rows the pipeline returns.
+    AggregatePrefilter prefilter = aggregate_prefilter_for_source(pipeline);
+    if (prefilter.empty()) {
+        return build_operator(node, registry, scalars, externs, exec, model_out);
+    }
+    const physical::Plan plan = physical::plan_physical(node, registry, externs);
+    if (!plan.migrated || plan.root != &node || !plan.aggregate.describes ||
+        ir::node_cast<ir::AggregateNode>(node).group_by().empty()) {
+        return build_operator(node, registry, scalars, externs, exec, model_out);
+    }
+    const auto build = [&] {
+        physical::note_map_pipeline_executed();
+        return physical_executor_detail::build_physical_aggregate(
+            plan, node, registry, scalars, externs, exec, model_out, prefilter);
+    };
+    if (exec.execution_profile == nullptr) {
+        return build();
+    }
+    auto* entry = execution_profile_entry(exec.execution_profile, node);
+    std::expected<OperatorPtr, std::string> result;
+    {
+        const ExecutionProfileScope scope(entry, ProfilePhase::Build);
+        result = build();
+    }
+    if (!result.has_value()) {
+        return result;
+    }
+    return profile_operator(std::move(result.value()), exec.execution_profile, node);
+}
 
 auto build_operator(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,

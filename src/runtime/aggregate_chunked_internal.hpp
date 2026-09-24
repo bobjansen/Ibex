@@ -10,6 +10,7 @@
 #include <optional>
 #include <vector>
 
+#include "aggregate_prefilter.hpp"
 #include "physical_plan.hpp"
 
 namespace ibex::ir {
@@ -26,6 +27,7 @@ namespace ibex::runtime {
     OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
     const std::vector<ir::AggSpec>* aggregations, const ExecutionContext& exec,
     physical::AggregateParallelism parallelism,
-    std::optional<physical::AggregateColumnMapping> columns) -> OperatorPtr;
+    std::optional<physical::AggregateColumnMapping> columns, AggregatePrefilter prefilter = {})
+    -> OperatorPtr;
 
 }  // namespace ibex::runtime

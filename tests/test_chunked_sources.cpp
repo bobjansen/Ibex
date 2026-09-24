@@ -981,6 +981,74 @@ TEST_CASE("chunked aggregate: clustered integer counts merge runs across chunks"
     }
 }
 
+TEST_CASE("chunked aggregate: a clustered sum's map-free merge equals serial, in order or not",
+          "[runtime][chunked][aggregate]") {
+    // q18's shape: sum(Double) by one Int64 key, streamed in chunks, which
+    // takes the async hot path. Its cold merge skips the hash map while a
+    // partition's keys never decrease, and indexes what it has the moment one
+    // does. Chunks of 70001 rows cut three-row key runs, so a group's rows
+    // arrive in two jobs. The second shape goes backwards part way through,
+    // into groups that already exist, then on to new ones: without the switch
+    // to the map those rows would become duplicate groups. The sums are
+    // order-sensitive, so bit equality also pins the order records are added.
+    constexpr std::int64_t kRows = 400'000;
+    const auto clustered = [](std::int64_t row) { return row / 3; };
+    const auto backwards = [](std::int64_t row) {
+        if (row >= 240'000 && row < 300'000) {
+            return (row / 3) % 5'000;
+        }
+        return row / 3;
+    };
+    for (const bool goes_backwards : {false, true}) {
+        INFO("goes backwards: " << goes_backwards);
+        runtime::TableRegistry registry;
+        {
+            Column<std::int64_t> g;
+            Column<double> v;
+            for (std::int64_t row = 0; row < kRows; ++row) {
+                g.push_back(goes_backwards ? backwards(row) : clustered(row));
+                v.push_back(1e9 + (static_cast<double>(row % 991) * 0.125));
+            }
+            runtime::Table t;
+            t.add_column("g", std::move(g));
+            t.add_column("v", std::move(v));
+            registry.emplace("t", std::move(t));
+        }
+        auto program = parser::parse("t[select { s = sum(v) }, by { g }];");
+        REQUIRE(program.has_value());
+        auto ir = parser::lower(program.value());
+        REQUIRE(ir.has_value());
+
+        const ChunkGrainGuard guard{"70001"};
+        runtime::ExecutionContext serial;
+        serial.parallel_threads = 1;
+        runtime::ParallelPipelineStats stats;
+        runtime::ExecutionContext parallel;
+        parallel.parallel_threads = 8;
+        parallel.parallel_min_rows = 0;
+        parallel.parallel_stats = &stats;
+        const auto s = runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, serial);
+        const auto p =
+            runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+        REQUIRE(s.has_value());
+        REQUIRE(p.has_value());
+        REQUIRE(stats.parallel_aggregate_partitions.load() > 0);
+        // The backwards stretch revisits keys 0..4999, so keys 80000..99999
+        // never occur.
+        REQUIRE(s->rows() == (goes_backwards ? std::size_t{113'334} : std::size_t{133'334}));
+        REQUIRE(p->rows() == s->rows());
+        const auto& sg = std::get<Column<std::int64_t>>(*s->find("g"));
+        const auto& pg = std::get<Column<std::int64_t>>(*p->find("g"));
+        const auto& sv = std::get<Column<double>>(*s->find("s"));
+        const auto& pv = std::get<Column<double>>(*p->find("s"));
+        for (std::size_t i = 0; i < s->rows(); ++i) {
+            INFO("group " << i);
+            REQUIRE(sg[i] == pg[i]);
+            REQUIRE(sv[i] == pv[i]);
+        }
+    }
+}
+
 TEST_CASE("zero fused tail retains typed columns", "[schema][tail]") {
     for (const char* grain : {"1", "16"}) {
         ChunkGrainGuard guard(grain);

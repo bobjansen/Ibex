@@ -158,6 +158,19 @@ def main() -> int:
         print(f"error: no polars-benchmark checkout at {args.pdsh_root}", file=sys.stderr)
         return 2
 
+    # Upstream reads PATH_TABLES/scale-<float SF>/<table>.parquet. Expose Ibex's
+    # parquet_sf<sf> under that name, as bench_pdsh.py does. A fresh clone (the
+    # EC2 box) has no such path until something creates it, and this check runs
+    # before bench_pdsh.py, whose job that used to be.
+    parquet = DATA_ROOT / expected_link
+    pdsh_data = DATA_ROOT / f"scale-{float(args.sf)}"
+    if pdsh_data.exists() or pdsh_data.is_symlink():
+        if not pdsh_data.is_symlink() or pdsh_data.resolve() != parquet.resolve():
+            print(f"error: refusing to replace existing PDS data path: {pdsh_data}", file=sys.stderr)
+            return 2
+    else:
+        pdsh_data.symlink_to(parquet.name)
+
     # polars-benchmark reads its settings from the environment at import time.
     os.environ.update({
         "SCALE_FACTOR": str(args.sf),
@@ -191,4 +204,12 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # Exit codes: 0 all match, 1 an answer differs, 2 a setup error, 3 the check
+    # itself crashed. An uncaught exception would also exit 1 and read as a
+    # disagreement, which it is not (the missing scale-<sf> path on a fresh box).
+    try:
+        raise SystemExit(main())
+    except Exception:  # noqa: BLE001 -- report any crash as a crash
+        import traceback
+        traceback.print_exc()
+        raise SystemExit(3)

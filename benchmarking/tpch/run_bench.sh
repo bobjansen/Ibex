@@ -217,9 +217,15 @@ echo "=== scale factor: SF-${SCALE} (parquet -> parquet_sf${SCALE}) ==="
 ANSWERS_CHECKED=skipped
 if [[ "$ANSWER_CHECK" -eq 1 ]]; then
     echo "=== answers vs upstream Polars (SF-${SCALE}) ==="
-    if ! "${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/check_against_polars.py" \
-        --sf "$SCALE" --pdsh-root "$PDSH_ROOT"; then
+    check_rc=0
+    "${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/check_against_polars.py" \
+        --sf "$SCALE" --pdsh-root "$PDSH_ROOT" || check_rc=$?
+    if [[ "$check_rc" -eq 1 ]]; then
         echo "error: Ibex and Polars disagree at SF-${SCALE}; not timing. Fix the query, or pass --no-answer-check." >&2
+        exit 1
+    elif [[ "$check_rc" -ne 0 ]]; then
+        # A crash or a setup error is not a disagreement; say which it was.
+        echo "error: the answer check itself failed (exit ${check_rc}) at SF-${SCALE}; not timing. See its output above." >&2
         exit 1
     fi
     ANSWERS_CHECKED=polars

@@ -2913,6 +2913,165 @@ inline auto filtered_dictionary_int32_selection(
     return merge_key_scan_parts(parts);
 }
 
+/// One row group of `dictionary_filter_scan`: ask `keep` about each dictionary
+/// page's values, then select rows by code. False when the group is not
+/// dictionary-encoded throughout (the whole scan then declines).
+inline auto filtered_dictionary_string_group_scan(parquet::arrow::FileReader& reader,
+                                                  int leaf_index, const KeyScanGroup& group,
+                                                  const ibex::runtime::DictionaryPredicate& keep_fn,
+                                                  const ibex::runtime::Selection* within,
+                                                  ibex::runtime::Selection& selected) -> bool {
+    auto row_group = reader.parquet_reader()->RowGroup(group.index);
+    auto column =
+        row_group->ColumnWithExposeEncoding(leaf_index, parquet::ExposedEncoding::DICTIONARY);
+    if (column->GetExposedEncoding() != parquet::ExposedEncoding::DICTIONARY) {
+        return false;
+    }
+    const auto* descriptor = column->descr();
+    if (descriptor->max_repetition_level() != 0 || descriptor->max_definition_level() > 1 ||
+        group.skip != 0) {
+        return false;
+    }
+    const bool optional = descriptor->max_definition_level() != 0;
+    auto typed =
+        std::static_pointer_cast<parquet::TypedColumnReader<parquet::ByteArrayType>>(column);
+    std::unique_ptr<std::int32_t[]> codes(new std::int32_t[kDirectDecodeBatchRows]);
+    std::unique_ptr<std::int16_t[]> definitions(new std::int16_t[kDirectDecodeBatchRows]);
+    std::vector<char> keep;
+    std::vector<std::string_view> views;
+    // Candidate rows of this group, when the caller narrowed the scan: a cursor
+    // into `within`, advanced batch by batch.
+    std::size_t next = 0;
+    std::size_t candidates_end = 0;
+    if (within != nullptr) {
+        next = static_cast<std::size_t>(std::ranges::lower_bound(*within, group.base) -
+                                        within->begin());
+        candidates_end = static_cast<std::size_t>(
+            std::ranges::lower_bound(*within, group.base + group.rows) - within->begin());
+        if (next == candidates_end) {
+            return true;  // no candidate here: nothing to read
+        }
+    }
+    std::vector<char> row_pass;  // per-row flags, only for a nullable column with candidates
+    std::size_t row = 0;
+    while (row < group.rows && typed->HasNext()) {
+        const auto request = static_cast<std::int64_t>(
+            std::min<std::size_t>(kDirectDecodeBatchRows, group.rows - row));
+        std::int64_t codes_read = 0;
+        const parquet::ByteArray* dictionary = nullptr;
+        std::int32_t dictionary_size = 0;
+        const auto levels =
+            typed->ReadBatchWithDictionary(request, optional ? definitions.get() : nullptr, nullptr,
+                                           codes.get(), &codes_read, &dictionary, &dictionary_size);
+        if (levels <= 0) {
+            throw std::runtime_error("read_parquet: dictionary string scan made no progress");
+        }
+        if (dictionary != nullptr) {
+            views.clear();
+            views.reserve(static_cast<std::size_t>(dictionary_size));
+            for (std::int32_t i = 0; i < dictionary_size; ++i) {
+                views.emplace_back(reinterpret_cast<const char*>(dictionary[i].ptr),
+                                   dictionary[i].len);
+            }
+            keep = keep_fn(views);
+            if (keep.size() != views.size()) {
+                throw std::runtime_error(
+                    "read_parquet: dictionary predicate answered the wrong size");
+            }
+        }
+        if (keep.empty() && codes_read != 0) {
+            throw std::runtime_error("read_parquet: dictionary string page was not exposed");
+        }
+        const auto passes_code = [&](std::int32_t value) {
+            if (value < 0 || static_cast<std::size_t>(value) >= keep.size()) {
+                throw std::runtime_error("read_parquet: invalid dictionary string code");
+            }
+            return keep[static_cast<std::size_t>(value)] != 0;
+        };
+        const std::size_t batch_first = group.base + row;
+        const std::size_t batch_end = batch_first + static_cast<std::size_t>(levels);
+        if (within != nullptr && !optional) {
+            // No nulls: a row's code is at its offset, so only candidates are
+            // looked at.
+            if (codes_read != levels) {
+                throw std::runtime_error("read_parquet: inconsistent dictionary string levels");
+            }
+            for (; next < candidates_end && (*within)[next] < batch_end; ++next) {
+                const std::size_t offset = (*within)[next] - batch_first;
+                if (passes_code(codes[offset])) {
+                    selected.push_back((*within)[next]);
+                }
+            }
+        } else {
+            std::size_t code = 0;
+            if (within != nullptr) {
+                row_pass.assign(static_cast<std::size_t>(levels), 0);
+            }
+            for (std::int64_t offset = 0; offset < levels; ++offset) {
+                if (optional && definitions[static_cast<std::size_t>(offset)] == 0) {
+                    continue;  // null: never passes (the caller checked the predicate on null)
+                }
+                if (passes_code(codes[code++])) {
+                    if (within == nullptr) {
+                        selected.push_back(batch_first + static_cast<std::size_t>(offset));
+                    } else {
+                        row_pass[static_cast<std::size_t>(offset)] = 1;
+                    }
+                }
+            }
+            if (code != static_cast<std::size_t>(codes_read)) {
+                throw std::runtime_error("read_parquet: inconsistent dictionary string levels");
+            }
+            if (within != nullptr) {
+                for (; next < candidates_end && (*within)[next] < batch_end; ++next) {
+                    if (row_pass[(*within)[next] - batch_first] != 0) {
+                        selected.push_back((*within)[next]);
+                    }
+                }
+            }
+        }
+        row += static_cast<std::size_t>(levels);
+    }
+    if (row != group.rows) {
+        throw std::runtime_error("read_parquet: dictionary string column ended early");
+    }
+    return true;
+}
+
+/// Drives `filtered_dictionary_string_group_scan` over whole row groups, one
+/// reader per worker, parts concatenated in file order (the same shape as the
+/// dictionary date scan).
+inline auto filtered_dictionary_string_selection(
+    std::span<parquet::arrow::FileReader* const> readers, int leaf_index,
+    const ibex::runtime::DictionaryPredicate& keep, const ibex::runtime::Selection* within,
+    const std::vector<KeyScanGroup>& groups) -> std::optional<ibex::runtime::Selection> {
+    std::vector<ibex::runtime::Selection> parts(groups.size());
+    std::atomic<std::size_t> cursor{0};
+    std::atomic<bool> unsupported{false};
+    const auto run = [&](std::size_t worker) {
+        for (;;) {
+            const auto i = cursor.fetch_add(1, std::memory_order_relaxed);
+            if (i >= groups.size() || unsupported.load(std::memory_order_relaxed)) {
+                return;
+            }
+            if (!filtered_dictionary_string_group_scan(*readers[worker], leaf_index, groups[i],
+                                                       keep, within, parts[i])) {
+                unsupported.store(true, std::memory_order_relaxed);
+                return;
+            }
+        }
+    };
+    if (readers.size() <= 1 || groups.size() <= 1) {
+        run(0);
+    } else {
+        ibex::runtime::process_worker_pool().submit(readers.size(), run).wait();
+    }
+    if (unsupported.load(std::memory_order_relaxed)) {
+        return std::nullopt;
+    }
+    return merge_key_scan_parts(parts);
+}
+
 /// ── Fused string filter scan ────────────────────────────────────────────────
 ///
 /// The same trade as the key scan, for the column a query references only from
@@ -3448,6 +3607,41 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
             return filtered_string_selection(std::span{readers}, leaf_index, filter, fallback);
         } catch (const std::exception& e) {
             return std::unexpected("read_parquet: fused string filter scan failed on " + path_ +
+                                   " (" + e.what() + ")");
+        }
+    }
+
+    auto dictionary_filter_scan(const std::string& column,
+                                const ibex::runtime::DictionaryPredicate& keep,
+                                const ibex::runtime::Selection* within,
+                                const ibex::runtime::SourceUnit* unit,
+                                const ibex::runtime::ExecutionContext& exec)
+        -> std::expected<std::optional<ibex::runtime::Selection>, std::string> override {
+        auto it = indices_->find(column);
+        if (it == indices_->end()) {
+            return std::unexpected("read_parquet: no column '" + column + "' in " + path_);
+        }
+        const auto& manifest = reader_->manifest();
+        if (it->second >= static_cast<int>(manifest.schema_fields.size()) ||
+            !manifest.schema_fields[static_cast<std::size_t>(it->second)].is_leaf()) {
+            return std::optional<ibex::runtime::Selection>{};
+        }
+        const int leaf_index =
+            manifest.schema_fields[static_cast<std::size_t>(it->second)].column_index;
+        try {
+            const auto& metadata = *reader_->parquet_reader()->metadata();
+            if (metadata.schema()->Column(leaf_index)->physical_type() !=
+                parquet::Type::BYTE_ARRAY) {
+                return std::optional<ibex::runtime::Selection>{};
+            }
+            // Whole row groups only: a dictionary page belongs to its row group,
+            // so there is nothing smaller to split into.
+            const auto groups = restrict_to_unit(whole_file_scan_groups(metadata), unit);
+            auto readers = parallel_readers(groups.size(), exec);
+            return filtered_dictionary_string_selection(std::span{readers}, leaf_index, keep,
+                                                        within, groups);
+        } catch (const std::exception& e) {
+            return std::unexpected("read_parquet: dictionary filter scan failed on " + path_ +
                                    " (" + e.what() + ")");
         }
     }

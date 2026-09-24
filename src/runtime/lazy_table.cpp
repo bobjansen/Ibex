@@ -10,6 +10,7 @@
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -19,7 +20,9 @@
 #include <optional>
 #include <robin_hood.h>
 #include <set>
+#include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -501,6 +504,111 @@ auto LazyTable::scan_string_filters(const std::vector<FusedStringConjunct>& fuse
         both.reserve(std::min(selected->size(), (*part)->size()));
         std::ranges::set_intersection(*selected, **part, std::back_inserter(both));
         selected = std::move(both);
+    }
+    release_reader(std::move(*reader));
+    return selected;
+}
+
+namespace {
+
+/// The one-column table a dictionary predicate is evaluated on: the column's
+/// name, its dictionary values as plain strings, and optionally a trailing null.
+auto dictionary_table(const std::string& column, std::span<const std::string_view> values,
+                      bool trailing_null) -> Table {
+    std::vector<std::string> strings(values.begin(), values.end());
+    if (trailing_null) {
+        strings.emplace_back();
+    }
+    Table table;
+    if (trailing_null) {
+        ValidityBitmap validity(strings.size(), true);
+        validity.set(strings.size() - 1, false);
+        table.add_column(column, Column<std::string>{std::move(strings)}, std::move(validity));
+    } else {
+        table.add_column(column, Column<std::string>{std::move(strings)});
+    }
+    return table;
+}
+
+}  // namespace
+
+void LazyTable::split_dictionary_conjuncts(const std::vector<ir::Expr>& conjuncts,
+                                           const ScalarRegistry* scalars,
+                                           std::vector<ir::Expr>& dictionary,
+                                           std::vector<ir::Expr>& rest) const {
+    const ExecutionContext serial{};
+    for (const auto& conjunct : conjuncts) {
+        robin_hood::unordered_set<std::string> refs;
+        ir::collect_expr_column_refs(conjunct, refs);
+        const auto* entry = refs.size() == 1 ? schema_.find_entry(*refs.begin()) : nullptr;
+        bool fusable = entry != nullptr && entry->column != nullptr &&
+                       std::holds_alternative<Column<Categorical>>(*entry->column) &&
+                       !cache_.contains(*refs.begin()) && ir::is_subset_evaluable_expr(conjunct);
+        if (fusable) {
+            // Probe once before any scan: a type error must surface the way the
+            // ordinary path reports it (so decline here, don't swallow it), and
+            // rows that are null in the file are dropped by the scan, which is
+            // only right when the predicate is not TRUE on null.
+            const std::string_view probe_values[] = {std::string_view{}};
+            const auto probe = filter_selection(dictionary_table(*refs.begin(), probe_values, true),
+                                                {conjunct}, serial, scalars);
+            fusable = probe.has_value() &&
+                      std::ranges::find(*probe, std::size_t{1}) == probe->end();  // row 1 = null
+        }
+        (fusable ? dictionary : rest).push_back(conjunct);
+    }
+}
+
+auto LazyTable::scan_dictionary_filters(const std::vector<ir::Expr>& conjuncts,
+                                        const Selection* within, const ScalarRegistry* scalars,
+                                        const ExecutionContext& exec)
+    -> std::expected<std::optional<Selection>, std::string> {
+    auto* profile_entry = exec.execution_profile == nullptr
+                              ? nullptr
+                              : exec.execution_profile->stage("source dictionary filter scan");
+    const ExecutionProfileScope profile_scope(profile_entry, ProfilePhase::Source);
+
+    auto reader = acquire_reader();
+    if (!reader) {
+        return std::unexpected(reader.error());
+    }
+    std::optional<Selection> selected;
+    for (const auto& conjunct : conjuncts) {
+        robin_hood::unordered_set<std::string> refs;
+        ir::collect_expr_column_refs(conjunct, refs);
+        const std::string column = *refs.begin();
+        // Evaluated on the few distinct values of one dictionary page, never per
+        // row, and possibly from several workers at once: a serial context
+        // keeps it off the pool. An error here (the probe in
+        // split_dictionary_conjuncts makes one unlikely) cannot cross the pool,
+        // so it is flagged and the whole answer discarded.
+        std::atomic<bool> failed{false};
+        const DictionaryPredicate keep = [&](std::span<const std::string_view> values) {
+            std::vector<char> flags(values.size(), 0);
+            const ExecutionContext serial{};
+            auto passing = filter_selection(dictionary_table(column, values, false), {conjunct},
+                                            serial, scalars);
+            if (!passing) {
+                failed.store(true, std::memory_order_relaxed);
+                return flags;
+            }
+            for (const std::size_t i : *passing) {
+                flags[i] = 1;
+            }
+            return flags;
+        };
+        // Each conjunct narrows the previous one's answer rather than building
+        // its own and intersecting: candidates first, then this column's test.
+        const Selection* candidates = selected.has_value() ? &*selected : within;
+        auto part = (*reader)->dictionary_filter_scan(column, keep, candidates, nullptr, exec);
+        if (!part) {
+            return std::unexpected(part.error());
+        }
+        if (!part->has_value() || failed.load(std::memory_order_relaxed)) {
+            release_reader(std::move(*reader));
+            return std::optional<Selection>{};
+        }
+        selected = std::move(**part);
     }
     release_reader(std::move(*reader));
     return selected;
@@ -1354,17 +1462,55 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
     // them. Here the fused scan answers membership first and the conjuncts are
     // evaluated through its selection, so every later step is sized by what
     // survived rather than by the file.
+    //
+    // A conjunct over a dictionary-encoded string column (q10's
+    // `l_returnflag == "R"`, q19's `l_shipmode` list) used to send this whole
+    // phase to the whole-column path below: strings are not stageable (see
+    // `stageable_conjunct_columns`), and the alternative decoded the key and
+    // the string column for every row. Instead it is decided on the column's
+    // DICTIONARY, a handful of values per row group, and the source scans only
+    // the codes (`scan_dictionary_filters`), testing only the rows the key scan
+    // kept. Only the remaining conjuncts are staged.
+    std::vector<ir::Expr> dictionary_conjuncts;
+    std::vector<ir::Expr> staged_conjuncts;
+    if (reader_factory_) {
+        split_dictionary_conjuncts(conjuncts, scalars, dictionary_conjuncts, staged_conjuncts);
+    } else {
+        staged_conjuncts = conjuncts;
+    }
+    const std::vector<ir::Expr>& staged =
+        dictionary_conjuncts.empty() ? conjuncts : staged_conjuncts;
     if ((key_filter_scan_ != nullptr || reader_factory_) && !cache_.contains(key_name) &&
-        (conjuncts.empty() || stageable_conjunct_columns(conjuncts).has_value())) {
+        (staged.empty() || stageable_conjunct_columns(staged).has_value())) {
         auto scan = scan_key_filter(key_name, dynamic, nullptr, exec);
         if (!scan) {
             return std::unexpected(scan.error());
         }
+        bool dictionary_ok = true;
+        std::optional<Selection> key_selection;
         if (scan->has_value()) {
-            Selection selected = std::move(**scan);
+            key_selection = std::move(**scan);
+            if (!dictionary_conjuncts.empty()) {
+                // The key scan's answer is the candidate list: the dictionary
+                // test only looks at those rows, and its answer is the
+                // intersection already.
+                auto dict =
+                    scan_dictionary_filters(dictionary_conjuncts, &*key_selection, scalars, exec);
+                if (!dict) {
+                    return std::unexpected(dict.error());
+                }
+                if (dict->has_value()) {
+                    key_selection = std::move(**dict);
+                } else {
+                    dictionary_ok = false;  // no fused answer: the old path below
+                }
+            }
+        }
+        if (key_selection.has_value() && dictionary_ok) {
+            Selection selected = std::move(*key_selection);
             bool narrowed = true;
-            if (!conjuncts.empty()) {
-                auto rest = narrow_selection(selected, conjuncts, exec, scalars);
+            if (!staged.empty()) {
+                auto rest = narrow_selection(selected, staged, exec, scalars);
                 if (!rest) {
                     return std::unexpected(rest.error());
                 }

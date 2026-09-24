@@ -3365,8 +3365,8 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
             const auto& metadata = *reader_->parquet_reader()->metadata();
             // A range that leaves most rows in place is answered by the ordinary
             // path without paying for a scan to find that out. Only for a
-            // range-only filter: a Bloom can reject inside the interval.
-            if (!filter.bloom.has_value() &&
+            // range-only filter: a Bloom or bitmap can reject inside the interval.
+            if (!filter.has_membership() &&
                 (physical == parquet::Type::INT64
                      ? footer_covered_fraction<parquet::Int64Type>(metadata, leaf_index, filter,
                                                                    unit)

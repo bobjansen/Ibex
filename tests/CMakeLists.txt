@@ -40,6 +40,7 @@ set(IBEX_TEST_SOURCES
     test_ir_pending_order.cpp
     test_ir_column_origins.cpp
     test_parquet_dictionary_policy.cpp
+    test_join_key_bitmap.cpp
     test_parquet_selection_check.cpp
     test_parquet_stats_range.cpp
     test_static_range_filter.cpp

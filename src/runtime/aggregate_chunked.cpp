@@ -1935,13 +1935,46 @@ class HashAggregateState final {
                 // calling-thread reserve experiment, it neither serializes the
                 // partitions nor guesses from total input rows; the exact
                 // pre-aggregate count is a safe upper bound on distinct keys.
-                partition.index.reserve(records);
                 partition.keys.reserve(records);
                 partition.first_rows.reserve(records);
                 partition.slots.reserve(records);
 
+                const auto add_into = [](AggSlotCore& slot, const AggSlotCore& from) {
+                    if (from.present()) {
+                        slot.double_value += from.double_value;
+                        slot.mark_present();
+                    }
+                };
+
+                // Clustered keys (q18's l_orderkey): records reach this owner
+                // in first-row order, so while their keys never decrease, a
+                // key is either the newest group's (a run split across chunk
+                // jobs) or a new group, and no map is needed. That map was the
+                // whole cost here: ~1.5M random inserts per owner, bound on
+                // memory latency. The first key that goes backwards indexes
+                // the groups so far and hands the rest to the map below, which
+                // puts every record in the same group, in the same order.
+                bool in_order = true;
                 for (const auto& job : owned_async_jobs_) {
                     for (const auto& record : job->records_by_partition[p]) {
+                        if (in_order) {
+                            if (!partition.keys.empty() && record.key == partition.keys.back()) {
+                                add_into(partition.slots.back(), record.slot);
+                                continue;
+                            }
+                            if (partition.keys.empty() || record.key > partition.keys.back()) {
+                                partition.keys.push_back(record.key);
+                                partition.first_rows.push_back(record.first_row);
+                                partition.slots.push_back(record.slot);
+                                continue;
+                            }
+                            in_order = false;
+                            partition.index.reserve(records);
+                            for (std::size_t g = 0; g < partition.keys.size(); ++g) {
+                                partition.index.emplace(partition.keys[g],
+                                                        static_cast<std::uint32_t>(g));
+                            }
+                        }
                         auto it = partition.index.find(record.key);
                         std::uint32_t local{};
                         if (it == partition.index.end()) {
@@ -1952,11 +1985,7 @@ class HashAggregateState final {
                             partition.slots.push_back(record.slot);
                         } else {
                             local = it->second;
-                            if (record.slot.present()) {
-                                auto& slot = partition.slots[local];
-                                slot.double_value += record.slot.double_value;
-                                slot.mark_present();
-                            }
+                            add_into(partition.slots[local], record.slot);
                         }
                     }
                 }

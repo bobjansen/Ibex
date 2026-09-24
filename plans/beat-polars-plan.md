@@ -118,6 +118,39 @@ the small queries, as the dev-box breaker map said. **Per-core losses** are
 unchanged: q06 1.69, q15 1.39, q14 1.16, q19 1.12, q16 1.02. **Ibex still wins
 at 16 cores** on q06, q18, q22, q12, q17 and q21. q06 and q18 scale about 10×.
 
+### 1c. AWS re-run after the loser work (`ac8f5648` against `461c0963`, 8 and 16 cores)
+
+Same box type, a new sitting. Artifact
+`benchmarking/results/tpch_aws_20260924T172419.tar.gz`. **Read ratios, not
+Ibex-against-Ibex:** at 8 cores this sitting ran Polars 11.5% faster with no
+change on its side, so the box itself moved about 10%.
+
+| | 8c total ratio | 8c geomean | 16c total ratio | 16c geomean |
+|---|---:|---:|---:|---:|
+| `461c0963` | 1.08 | 1.20 | 1.36 | 1.45 |
+| `ac8f5648` | 1.09 | 1.18 | **1.16** | **1.25** |
+
+The targeted queries moved at both core counts (16c ratio): q03 2.12 → 1.72,
+q07 2.19 → 1.53, q05 1.74 → 1.39, q09 1.22 → 0.98, q10 2.55 → 2.18, q16 2.89 →
+2.38. At 8 cores q18 hides the total's gain (0.89 → 1.27).
+
+**q18's apparent regression is mostly baseline noise.** Both tables use each
+run's minimum. On `461c0963`, q18 was the noisiest query in the suite at every
+core count from 4 up (coefficient of variation 14–19%, against about 1% for
+most queries). Its minimum was a lucky outlier: 361 ms at 8 cores against a
+435 ms mean. On `ac8f5648` it is tight (3–6%). Mean against mean it is +7% at
+8 cores and +4% at 16. The dev box agrees with the small number: bisected over
+the four commits, the selection-validation step is +6.9% and the bitmap −4.1%,
+netting about +1.4%. Selection validation leaves q18's CPU time unchanged.
+**Where the noise lives (dev box, warm REPL):** the async hot aggregate's cold
+merge (`finalize_owned_async_hot`). It is bimodal at about 110 or 190 ms,
+because every partition task burns twice the CPU on identical input. It is
+not page faults (they do not correlate), not descheduling (thread CPU time
+equals wall), and not work doubling up on one worker. It is memory-latency
+sensitivity: one random hash insert per group. W5 now removes that map for
+clustered keys. The TSVs keep only summary statistics; keep raw iterations
+before chasing a bimodal query on AWS again.
+
 ### 1b. Dev box sweep (i7-13700 under WSL2): superseded as a cross-engine baseline
 
 Kept for the record and for single-engine work. Its cross-engine ratios above
@@ -588,6 +621,16 @@ q14, q15, q16, q10 and q19 lose 1.5–2.2× at 8 cores.
 The breaker-map arc took aggregate from 33.7% to 18.3% of idle. What is left:
 
 - `FinalOrdering`'s fanout on q18 (536 core-ms, occupancy 0.63–0.70).
+  **2026-09-24: the cold merge inside it no longer builds a hash map for
+  clustered keys.** Records reach each owner in first-row order, so while a
+  partition's keys never decrease, each record either extends the newest group
+  or starts one. The first key that goes backwards indexes the groups so far
+  and switches to the map, so the output is unchanged. q18 −19.6% at 8 cores
+  (18 of 20 pairs, byte-identical). Suite at 8 pairs: q18 −26.3% (8 of 8),
+  geomean −1.1% at 8 cores. At 1 core it is −0.1%, and it cannot fire there:
+  the async path needs two workers. All 22 answers are byte-identical. The one
+  other flag, q06 +5.2% at 8 cores, is a query with no group-by, so it is
+  layout or noise.
 - q01's aggregate queues behind its own scan. Sized and judged a no-go for now:
   removing the overlap costs q01 44% (memory:
   `project_q01_scan_aggregate_contention`).

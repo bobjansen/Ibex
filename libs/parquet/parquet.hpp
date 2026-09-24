@@ -78,6 +78,7 @@
 #include <vector>
 
 #include "dictionary_policy.hpp"
+#include "selection_check.hpp"
 #include "stats_range.hpp"
 
 namespace {
@@ -2127,13 +2128,9 @@ inline auto direct_decode_table(std::span<parquet::arrow::FileReader* const> rea
         throw std::runtime_error("read_parquet: no reader for decode");
     }
     auto& reader = *readers.front();
-    if (selection != nullptr) {
-        if (!std::is_sorted(selection->begin(), selection->end()) ||
-            std::adjacent_find(selection->begin(), selection->end()) != selection->end() ||
-            (!selection->empty() && selection->back() >= source_rows)) {
-            throw std::runtime_error("read_parquet: invalid row selection");
-        }
-    }
+    // The selection must be strictly increasing and inside the source. Where
+    // it is checked depends on whether the decode splits by row group: see
+    // `slice_bounds` below.
 
     if (groups.begin < 0 || groups.end < groups.begin ||
         groups.end > reader.parquet_reader()->metadata()->num_row_groups() ||
@@ -2216,8 +2213,58 @@ inline auto direct_decode_table(std::span<parquet::arrow::FileReader* const> rea
         }
     }
 
+    // Validating the selection used to be two full passes over it on the
+    // calling thread -- up to ~6 ms per call on SF-8 lineitem, serial while
+    // the pool waited, and the same at 16 cores as at 1. When every column
+    // splits by row group, the check moves into the tasks instead: the slice
+    // boundaries are found once here (one binary search per group), the
+    // pieces outside the decoded groups (normally empty) are checked here, and
+    // each task checks its own slice before decoding it. Slices whose values
+    // lie inside their own group's range and increase strictly, laid end to
+    // end in group order, are exactly a strictly increasing selection, so the
+    // guarantee is the same one the whole-selection check gave. A task checks
+    // before it decodes, so an invalid slice is never read.
+    std::vector<std::size_t> slice_bounds;
+    std::atomic<bool> invalid_selection{false};
+    if (selection != nullptr) {
+        const std::span<const std::size_t> sel{*selection};
+        const bool all_planned =
+            may_shard && std::all_of(planned.begin(), planned.end(),
+                                     [](const auto& column) { return column.has_value(); });
+        if (!all_planned) {
+            if (!ibex::parquet_selection::whole_valid(sel, source_rows)) {
+                throw std::runtime_error("read_parquet: invalid row selection");
+            }
+        } else {
+            std::vector<std::size_t> group_ends;
+            group_ends.reserve(static_cast<std::size_t>(groups.end - groups.begin));
+            std::size_t end = groups.source_start;
+            for (int group = groups.begin; group < groups.end; ++group) {
+                end += static_cast<std::size_t>(
+                    reader.parquet_reader()->metadata()->RowGroup(group)->num_rows());
+                group_ends.push_back(end);
+            }
+            slice_bounds =
+                ibex::parquet_selection::slice_bounds(sel, groups.source_start, group_ends);
+            if (!ibex::parquet_selection::outside_valid(sel, slice_bounds, groups.source_start, end,
+                                                        source_rows)) {
+                throw std::runtime_error("read_parquet: invalid row selection");
+            }
+        }
+    }
+    auto slice_valid = [&](const DecodeTask& task) {
+        const auto k = static_cast<std::size_t>(task.range.begin - groups.begin);
+        return ibex::parquet_selection::slice_valid(
+            std::span<const std::size_t>{*selection}, slice_bounds[k], slice_bounds[k + 1],
+            task.range.source_start, task.range.source_start + task.range.rows);
+    };
+
     auto run_task = [&](const DecodeTask& task, parquet::arrow::FileReader& worker_reader) {
         if (planned[task.column].has_value()) {
+            if (!slice_bounds.empty() && !slice_valid(task)) {
+                invalid_selection.store(true, std::memory_order_relaxed);
+                return;
+            }
             planned[task.column]->decode_range(worker_reader, task.range, task.output_start,
                                                task.rows);
             return;
@@ -2244,6 +2291,10 @@ inline auto direct_decode_table(std::span<parquet::arrow::FileReader* const> rea
             }
         });
         batch.wait();
+    }
+
+    if (invalid_selection.load(std::memory_order_relaxed)) {
+        throw std::runtime_error("read_parquet: invalid row selection");
     }
 
     // Every shard for every column has now decoded. Dictionary is the only

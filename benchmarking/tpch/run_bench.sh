@@ -38,7 +38,14 @@
 # Usage:
 #   ./run_bench.sh [--sf N] [--warmup N] [--iters N] [--pdsh-root DIR]
 #                  [--polars-streaming] [--no-polars-in-memory] [--no-duckdb]
-#                  [--cores N] [--label TEXT] [--no-archive]
+#                  [--cores N] [--label TEXT] [--no-archive] [--no-answer-check]
+#
+# Before timing anything, every Ibex answer is diffed against upstream Polars
+# at this scale (check_against_polars.py), and a mismatch aborts the run. The
+# official answers only exist at SF-1, and the timing passes discard output, so
+# without this a query can be wrong at the benchmarked scale and still be timed
+# against Polars computing the right answer. q11 was, for two months.
+# --no-answer-check skips it, and the manifest records that it was skipped.
 
 set -euo pipefail
 
@@ -54,6 +61,7 @@ POLARS_STREAMING=0
 POLARS_IN_MEMORY=1
 DUCKDB=1
 ARCHIVE=1
+ANSWER_CHECK=1
 LABEL=""
 # Cores the whole comparison is pinned to. Unset means "every core on the box",
 # which is the wrong default for a CROSS-ENGINE run on a big local machine:
@@ -73,6 +81,7 @@ while [[ $# -gt 0 ]]; do
         --cores)  CORES="$2"; shift 2 ;;
         --label)  LABEL="$2"; shift 2 ;;
         --no-archive) ARCHIVE=0; shift ;;
+        --no-answer-check) ANSWER_CHECK=0; shift ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -180,6 +189,7 @@ archive_run() {
         printf '  "kernel": "%s",\n' "$(uname -r)"
         printf '  "cpu": "%s",\n' "$(LC_ALL=C lscpu 2>/dev/null | sed -n 's/^Model name: *//p' | head -1)"
         printf '  "nproc": %s,\n' "$(nproc)"
+        printf '  "answers_checked": "%s",\n' "$ANSWERS_CHECKED"
         printf '  "label": "%s"\n' "$LABEL"
         printf '}\n'
     } > "$dir/manifest.json"
@@ -200,6 +210,20 @@ archive_run() {
 # Point the path the queries read at this scale's data.
 ln -sfn "parquet_sf${SCALE}" "$DATA_ROOT/parquet"
 echo "=== scale factor: SF-${SCALE} (parquet -> parquet_sf${SCALE}) ==="
+
+# A timing comparison between two different answers means nothing, so the
+# answers are diffed against Polars first, over the same Parquet and pinned the
+# same way. This takes about 15 s at SF-8.
+ANSWERS_CHECKED=skipped
+if [[ "$ANSWER_CHECK" -eq 1 ]]; then
+    echo "=== answers vs upstream Polars (SF-${SCALE}) ==="
+    if ! "${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/check_against_polars.py" \
+        --sf "$SCALE" --pdsh-root "$PDSH_ROOT"; then
+        echo "error: Ibex and Polars disagree at SF-${SCALE}; not timing. Fix the query, or pass --no-answer-check." >&2
+        exit 1
+    fi
+    ANSWERS_CHECKED=polars
+fi
 
 # Results are suffixed by scale so runs at different scales do not clobber.
 SUFFIX="_sf${SCALE}"

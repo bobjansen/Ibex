@@ -5,6 +5,15 @@
 //  whose stock value exceeds 0.01% of the total across all German suppliers.
 //  Standard TPC-H qualification parameters: NATION='GERMANY', FRACTION=0.0001.
 //
+//  FRACTION is 0.0001 / SF, not 0.0001 (TPC-H 2.4.11.3). The threshold is a
+//  share of the total over ALL German parts, which grows with the scale factor,
+//  while one part's value does not (each part has four suppliers at every SF).
+//  With the bare 0.0001 the query is right at SF-1 and wrong everywhere else:
+//  10 rows instead of 1,850 at SF-2, and none instead of 7,508 at SF-8. The
+//  query reads the scale factor off the data, since dbgen generates exactly
+//  10,000 suppliers per SF, so one file serves every scale. At SF-1 the divisor
+//  is exactly 1.0, so the SF-1 answer does not move.
+//
 //  The SQL puts an UNCORRELATED scalar subquery in a HAVING clause:
 //
 //      having sum(ps_supplycost * ps_availqty) > (
@@ -56,9 +65,10 @@ let q1 = (
     join nation_raw on { s_nationkey = n_nationkey }
 )[filter n_name == "GERMANY"];
 
-let q2 = q1[
-    select { tmp = sum(ps_supplycost * ps_availqty) * 0.0001 }
-];
+let q2 = (
+    q1[select { total = sum(ps_supplycost * ps_availqty) }]
+    cross join supplier_raw[select { suppliers = count() }]
+)[select { tmp = total * 0.0001 / (suppliers / 10000) }];
 
 let result = (q1[
     select { value = sum(ps_supplycost * ps_availqty) },

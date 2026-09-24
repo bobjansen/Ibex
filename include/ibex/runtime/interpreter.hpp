@@ -458,14 +458,15 @@ class LazyTable;
 class JoinBloomFilter {
    public:
     explicit JoinBloomFilter(std::size_t expected_keys) {
-        // 16 bits/key = 4 keys per 64-bit word, rounded up to a power of two
-        // so the word index is a mask, not a modulo.
-        std::size_t words = 8;
-        while (words * 4 < expected_keys) {
-            words *= 2;
-        }
+        const std::size_t words = words_for(expected_keys);
         words_.assign(words, 0);
         mask_ = words - 1;
+    }
+
+    /// The size a filter for `expected_keys` would have, without building it,
+    /// so a caller can compare it with an alternative first.
+    [[nodiscard]] static auto bits_for(std::size_t expected_keys) noexcept -> std::size_t {
+        return words_for(expected_keys) * 64;
     }
 
     void insert(std::int64_t key) noexcept {
@@ -473,12 +474,24 @@ class JoinBloomFilter {
         words_[word] |= bits;
     }
 
-    [[nodiscard]] auto contains(std::int64_t key) const noexcept -> bool {
+    [[nodiscard]] IBEX_ALWAYS_INLINE auto contains(std::int64_t key) const noexcept -> bool {
         const auto [word, bits] = position(key);
         return (words_[word] & bits) == bits;
     }
 
+    [[nodiscard]] auto bit_count() const noexcept -> std::size_t { return words_.size() * 64; }
+
    private:
+    // 16 bits/key = 4 keys per 64-bit word, rounded up to a power of two so
+    // the word index is a mask, not a modulo.
+    [[nodiscard]] static auto words_for(std::size_t expected_keys) noexcept -> std::size_t {
+        std::size_t words = 8;
+        while (words * 4 < expected_keys) {
+            words *= 2;
+        }
+        return words;
+    }
+
     // splitmix64 finalizer: cheap, and mixes well enough that the word index
     // (low bits) and the two bit choices (high bits) are independent.
     [[nodiscard]] auto position(std::int64_t key) const noexcept
@@ -494,6 +507,61 @@ class JoinBloomFilter {
 
     std::vector<std::uint64_t> words_;
     std::uint64_t mask_ = 0;
+};
+
+/// Exact membership over a DENSE int64 key range: one bit per possible key
+/// between the build side's min and max. Where the Bloom above hashes a key to
+/// a random word (a cache miss per distinct probe key once the table outgrows
+/// L2), this indexes by `key - min`, so a probe side sorted or clustered by the
+/// key walks the bitmap in address order and the hardware prefetcher streams
+/// it: one 64-byte line answers 512 consecutive keys. It is also exact, so
+/// false positives never reach the join. Only built when the range is dense
+/// enough that the bitmap is not much bigger than the Bloom; see
+/// `JoinKeyBitmap::worth_building`.
+class JoinKeyBitmap {
+   public:
+    /// `max >= min` required; build only after `worth_building` said yes.
+    JoinKeyBitmap(std::int64_t min, std::int64_t max)
+        : base_(min),
+          bits_(static_cast<std::uint64_t>(max) - static_cast<std::uint64_t>(min) + 1),
+          words_(static_cast<std::size_t>((bits_ + 63) / 64), 0) {}
+
+    /// Dense enough to pay: at most `ratio` times the Bloom's bits (a sparse
+    /// range would cost more memory than it saves misses) and an absolute cap.
+    [[nodiscard]] static auto worth_building(std::int64_t min, std::int64_t max,
+                                             std::size_t bloom_bits) noexcept -> bool {
+        constexpr std::uint64_t kMaxBits = std::uint64_t{1} << 29;  // 64 MiB
+        constexpr std::uint64_t kMaxRatio = 4;
+        if (max < min) {
+            return false;
+        }
+        const std::uint64_t span =
+            static_cast<std::uint64_t>(max) - static_cast<std::uint64_t>(min);
+        if (span >= kMaxBits) {  // also rejects the full-int64 span, whose +1 wraps
+            return false;
+        }
+        return span + 1 <= kMaxRatio * static_cast<std::uint64_t>(bloom_bits);
+    }
+
+    void insert(std::int64_t key) noexcept {
+        const std::uint64_t offset =
+            static_cast<std::uint64_t>(key) - static_cast<std::uint64_t>(base_);
+        words_[static_cast<std::size_t>(offset >> 6U)] |= std::uint64_t{1} << (offset & 63U);
+    }
+
+    /// Keys outside [min, max] are simply absent (the unsigned offset wraps
+    /// above `bits_`), so this is safe to call without a separate range check.
+    [[nodiscard]] IBEX_ALWAYS_INLINE auto contains(std::int64_t key) const noexcept -> bool {
+        const std::uint64_t offset =
+            static_cast<std::uint64_t>(key) - static_cast<std::uint64_t>(base_);
+        return offset < bits_ &&
+               ((words_[static_cast<std::size_t>(offset >> 6U)] >> (offset & 63U)) & 1U) != 0;
+    }
+
+   private:
+    std::int64_t base_;
+    std::uint64_t bits_;
+    std::vector<std::uint64_t> words_;
 };
 
 /// Key filter a join derives from its build side for a deferred probe scan.
@@ -513,6 +581,10 @@ struct DynamicScanFilter {
     std::vector<std::int64_t> in_list;
     /// Approximate membership; false positives only.
     std::optional<JoinBloomFilter> bloom;
+    /// Exact membership for a dense key range, published INSTEAD of `bloom`
+    /// when it pays (`JoinKeyBitmap::worth_building`): it is exact, so a Bloom
+    /// beside it would only cost a second pass over the build keys.
+    std::shared_ptr<const JoinKeyBitmap> bitmap;
     /// A range-only filter (no `bloom`) is not worth a fused scan when the
     /// interval leaves most rows in place, and the source can tell from its
     /// footer before reading a page: it declines when row groups lying wholly
@@ -520,12 +592,21 @@ struct DynamicScanFilter {
     /// the caller will decode the key again for the rows that pass.
     double footer_pass_rate_limit = 0.75;
 
-    [[nodiscard]] auto has_membership() const noexcept -> bool { return bloom.has_value(); }
+    [[nodiscard]] auto has_membership() const noexcept -> bool {
+        return bloom.has_value() || bitmap != nullptr;
+    }
 
     /// Only meaningful when `has_membership()`; false means "cannot match".
-    [[nodiscard]] auto passes(std::int64_t key) const noexcept -> bool {
+    /// Called per probe row inside the scan loops, so it must stay inlined
+    /// there. It is small, but growing it (the bitmap branch) was enough to
+    /// push it over the compiler's inline threshold: an out-of-line call per
+    /// row made q18 18% slower while its filter did not change at all.
+    [[nodiscard]] IBEX_ALWAYS_INLINE auto passes(std::int64_t key) const noexcept -> bool {
         if ((min.has_value() && key < *min) || (max.has_value() && key > *max)) {
             return false;
+        }
+        if (bitmap != nullptr) {
+            return bitmap->contains(key);  // exact: no Bloom, no list
         }
         // Static literal ranges share the source-side scan machinery but do
         // not publish a join Bloom filter.

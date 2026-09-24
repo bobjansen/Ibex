@@ -377,6 +377,13 @@ Order, by share of the 16-core gap:
    tasks (`08caeea4`) gave q03 −4.0%, q05 −2.3% and q07 −3.1% at 8 cores. Next,
    in order: the membership probe itself (is the cheap `l_shipdate` range
    applied before it? how cache-friendly is the key set?), then q19's join.
+   **Membership probe done (`a925b814`):** the cost was one random Bloom miss
+   per distinct key (a 4 MB table for q03's lineitem). Dense keys now get an
+   exact bitmap, streamed in order when the probe side is sorted by its key:
+   q03 −7.5% / q07 −7.5% / q09 −9.2% / q05 −4.4% at 8 cores, and q03 −18% at
+   1 core. Remembering the last key was a measured dead end: repeated keys
+   already hit L1. The whole story, as a teaching note, is in
+   `src/runtime/JOIN_FILTERS.md`. Next: q19's join; reconfirm q03/q07 on AWS.
    The key-scan merge was not parallelized: `Selection` zero-fills when sized,
    so doing it properly means changing the type or consuming the parts
    directly. Instrumentation for these phases is not committed; the timers

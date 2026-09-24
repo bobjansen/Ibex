@@ -825,6 +825,31 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
         # its own 1-core rows. Every finished count is pushed as a partial
         # artifact, so a stall late in the curve loses one point, not all.
         IFS=',' read -r -a TPCH_CORE_LIST <<< "${IBEX_TPCH_CORES:-0}"
+        # Profile mode (run-tpch.sh --profile): no timing suite. Run the two
+        # attribution tools per core count instead -- breaker_map.py (idle
+        # capacity per operator) and profile_suite.py (serial / barrier / ring /
+        # pool buckets per query) -- so the serial time is ranked on physical
+        # cores rather than on the dev box's hybrid ones. Neither tool pins
+        # itself, hence the taskset. The queries read the `parquet` symlink,
+        # which run_bench.sh would normally have pointed at this scale.
+        if [[ "${IBEX_TPCH_PROFILE:-0}" == "1" ]]; then
+            ln -sfn "parquet_sf${scale}" /ibex/benchmarking/data/tpch/parquet
+            PROFILE_OUT=/ibex/benchmarking/tpch/results/profile
+            mkdir -p "$PROFILE_OUT"
+            lscpu > "$PROFILE_OUT/lscpu.txt" 2>&1 || true
+            for cores in "${TPCH_CORE_LIST[@]}"; do
+                [[ -n "$cores" && "$cores" != "0" ]] || continue
+                for tool in breaker_map profile_suite; do
+                    echo "=== profile: ${tool} SF-${scale} ${cores}c ==="
+                    taskset -c "0-$((cores - 1))" python3 "/ibex/benchmarking/${tool}.py" "$cores" \
+                        > "$PROFILE_OUT/${tool}_sf${scale}_${cores}c.txt" 2>&1 \
+                        || echo "${tool} ${cores}c exited $?" >> "$PROFILE_OUT/failures.txt"
+                    tail -3 "$PROFILE_OUT/${tool}_sf${scale}_${cores}c.txt"
+                done
+                push_partial_tpch
+            done
+            continue
+        fi
         for cores in "${TPCH_CORE_LIST[@]}"; do
             CORE_ARGS=()
             if [[ -n "$cores" && "$cores" != "0" ]]; then

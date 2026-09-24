@@ -384,6 +384,41 @@ auto cmp_col_scalar_into(ir::CompareOp op, const ColT* __restrict cp, LitT rv,
     }
 }
 
+// cmp_col_scalar_into over a projection of each element: a Date's days or a
+// Timestamp's nanos, widened to the literal's type where it differs. One loop
+// per operator, not a `switch (op)` per row, so the loop stays vectorizable
+// however the caller gets inlined (see compare_vec's Date branch, 64dc786b).
+template <typename ColT, typename LitT, typename Proj>
+auto cmp_col_scalar_proj_into(ir::CompareOp op, const ColT* __restrict cp, Proj proj, LitT rv,
+                              uint8_t* __restrict mp, std::size_t n) -> void {
+    switch (op) {
+        case ir::CompareOp::Eq:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = proj(cp[i]) == rv;
+            break;
+        case ir::CompareOp::Ne:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = proj(cp[i]) != rv;
+            break;
+        case ir::CompareOp::Lt:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = proj(cp[i]) < rv;
+            break;
+        case ir::CompareOp::Le:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = proj(cp[i]) <= rv;
+            break;
+        case ir::CompareOp::Gt:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = proj(cp[i]) > rv;
+            break;
+        case ir::CompareOp::Ge:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = proj(cp[i]) >= rv;
+            break;
+    }
+}
+
 }  // namespace
 
 namespace {
@@ -570,30 +605,8 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, std::size_t of
 
     if (const auto* date_value = std::get_if<Date>(&lit)) {
         if (const auto* date_col = std::get_if<Column<Date>>(&col)) {
-            const auto rhs = date_value->days;
-            for (std::size_t idx = 0; idx < n; ++idx) {
-                const auto lhs = date_col->data()[off + idx].days;
-                switch (op) {
-                    case ir::CompareOp::Eq:
-                        mp[idx] = lhs == rhs;
-                        break;
-                    case ir::CompareOp::Ne:
-                        mp[idx] = lhs != rhs;
-                        break;
-                    case ir::CompareOp::Lt:
-                        mp[idx] = lhs < rhs;
-                        break;
-                    case ir::CompareOp::Le:
-                        mp[idx] = lhs <= rhs;
-                        break;
-                    case ir::CompareOp::Gt:
-                        mp[idx] = lhs > rhs;
-                        break;
-                    case ir::CompareOp::Ge:
-                        mp[idx] = lhs >= rhs;
-                        break;
-                }
-            }
+            cmp_col_scalar_proj_into(
+                op, date_col->data() + off, [](Date v) { return v.days; }, date_value->days, mp, n);
             result.apply_validity(validity, off, n);
             return result;
         }
@@ -602,30 +615,9 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, std::size_t of
 
     if (const auto* ts_value = std::get_if<Timestamp>(&lit)) {
         if (const auto* ts_col = std::get_if<Column<Timestamp>>(&col)) {
-            const auto rhs = ts_value->nanos;
-            for (std::size_t idx = 0; idx < n; ++idx) {
-                const auto lhs = ts_col->data()[off + idx].nanos;
-                switch (op) {
-                    case ir::CompareOp::Eq:
-                        mp[idx] = lhs == rhs;
-                        break;
-                    case ir::CompareOp::Ne:
-                        mp[idx] = lhs != rhs;
-                        break;
-                    case ir::CompareOp::Lt:
-                        mp[idx] = lhs < rhs;
-                        break;
-                    case ir::CompareOp::Le:
-                        mp[idx] = lhs <= rhs;
-                        break;
-                    case ir::CompareOp::Gt:
-                        mp[idx] = lhs > rhs;
-                        break;
-                    case ir::CompareOp::Ge:
-                        mp[idx] = lhs >= rhs;
-                        break;
-                }
-            }
+            cmp_col_scalar_proj_into(
+                op, ts_col->data() + off, [](Timestamp v) { return v.nanos; }, ts_value->nanos, mp,
+                n);
             result.apply_validity(validity, off, n);
             return result;
         }
@@ -660,116 +652,30 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, std::size_t of
     }
     if (const auto* date_col = std::get_if<Column<Date>>(&col)) {
         if (const auto* i = std::get_if<std::int64_t>(&lit)) {
-            const std::int64_t rhs = *i;
-            for (std::size_t idx = 0; idx < n; ++idx) {
-                const std::int64_t lhs = date_col->data()[off + idx].days;
-                switch (op) {
-                    case ir::CompareOp::Eq:
-                        mp[idx] = lhs == rhs;
-                        break;
-                    case ir::CompareOp::Ne:
-                        mp[idx] = lhs != rhs;
-                        break;
-                    case ir::CompareOp::Lt:
-                        mp[idx] = lhs < rhs;
-                        break;
-                    case ir::CompareOp::Le:
-                        mp[idx] = lhs <= rhs;
-                        break;
-                    case ir::CompareOp::Gt:
-                        mp[idx] = lhs > rhs;
-                        break;
-                    case ir::CompareOp::Ge:
-                        mp[idx] = lhs >= rhs;
-                        break;
-                }
-            }
+            cmp_col_scalar_proj_into(
+                op, date_col->data() + off, [](Date v) { return std::int64_t{v.days}; }, *i, mp, n);
             result.apply_validity(validity, off, n);
             return result;
         }
         if (const auto* d = std::get_if<double>(&lit)) {
-            const double rhs = *d;
-            for (std::size_t idx = 0; idx < n; ++idx) {
-                const auto lhs = static_cast<double>(date_col->data()[off + idx].days);
-                switch (op) {
-                    case ir::CompareOp::Eq:
-                        mp[idx] = lhs == rhs;
-                        break;
-                    case ir::CompareOp::Ne:
-                        mp[idx] = lhs != rhs;
-                        break;
-                    case ir::CompareOp::Lt:
-                        mp[idx] = lhs < rhs;
-                        break;
-                    case ir::CompareOp::Le:
-                        mp[idx] = lhs <= rhs;
-                        break;
-                    case ir::CompareOp::Gt:
-                        mp[idx] = lhs > rhs;
-                        break;
-                    case ir::CompareOp::Ge:
-                        mp[idx] = lhs >= rhs;
-                        break;
-                }
-            }
+            cmp_col_scalar_proj_into(
+                op, date_col->data() + off, [](Date v) { return static_cast<double>(v.days); }, *d,
+                mp, n);
             result.apply_validity(validity, off, n);
             return result;
         }
     }
     if (const auto* ts_col = std::get_if<Column<Timestamp>>(&col)) {
         if (const auto* i = std::get_if<std::int64_t>(&lit)) {
-            const std::int64_t rhs = *i;
-            for (std::size_t idx = 0; idx < n; ++idx) {
-                const std::int64_t lhs = ts_col->data()[off + idx].nanos;
-                switch (op) {
-                    case ir::CompareOp::Eq:
-                        mp[idx] = lhs == rhs;
-                        break;
-                    case ir::CompareOp::Ne:
-                        mp[idx] = lhs != rhs;
-                        break;
-                    case ir::CompareOp::Lt:
-                        mp[idx] = lhs < rhs;
-                        break;
-                    case ir::CompareOp::Le:
-                        mp[idx] = lhs <= rhs;
-                        break;
-                    case ir::CompareOp::Gt:
-                        mp[idx] = lhs > rhs;
-                        break;
-                    case ir::CompareOp::Ge:
-                        mp[idx] = lhs >= rhs;
-                        break;
-                }
-            }
+            cmp_col_scalar_proj_into(
+                op, ts_col->data() + off, [](Timestamp v) { return v.nanos; }, *i, mp, n);
             result.apply_validity(validity, off, n);
             return result;
         }
         if (const auto* d = std::get_if<double>(&lit)) {
-            const double rhs = *d;
-            for (std::size_t idx = 0; idx < n; ++idx) {
-                const auto lhs = static_cast<double>(ts_col->data()[off + idx].nanos);
-                switch (op) {
-                    case ir::CompareOp::Eq:
-                        mp[idx] = lhs == rhs;
-                        break;
-                    case ir::CompareOp::Ne:
-                        mp[idx] = lhs != rhs;
-                        break;
-                    case ir::CompareOp::Lt:
-                        mp[idx] = lhs < rhs;
-                        break;
-                    case ir::CompareOp::Le:
-                        mp[idx] = lhs <= rhs;
-                        break;
-                    case ir::CompareOp::Gt:
-                        mp[idx] = lhs > rhs;
-                        break;
-                    case ir::CompareOp::Ge:
-                        mp[idx] = lhs >= rhs;
-                        break;
-                }
-            }
+            cmp_col_scalar_proj_into(
+                op, ts_col->data() + off, [](Timestamp v) { return static_cast<double>(v.nanos); },
+                *d, mp, n);
             result.apply_validity(validity, off, n);
             return result;
         }

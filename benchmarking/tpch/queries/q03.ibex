@@ -4,9 +4,8 @@
 //  3-table equijoin chain + group-by + `order ..., head 10` (top-k). Standard
 //  TPC-H qualification parameters: SEGMENT='BUILDING', DATE='1995-03-15'.
 //  Join keys are renamed to match across tables before joining so both joins
-//  are equijoins (hash-join), not theta joins. Reads Parquet (converted once
-//  via convert_to_parquet.ibex), matching what Polars' own PDS-H benchmark
-//  scans. `by` (aggregation) and `order`+`head` (top-k) must be in separate
+//  are equijoins (hash-join), not theta joins. Reads the Parquet that Polars'
+//  own PDS-H benchmark generates and scans. `by` (aggregation) and `order`+`head` (top-k) must be in separate
 //  blocks — `head` combined with `by` in the same block means "head per
 //  group", not "head of the overall result".
 //

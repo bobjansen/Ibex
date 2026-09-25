@@ -3,8 +3,8 @@
 //
 //  2-table equijoin + a compound &&/|| filter (three OR'd AND-blocks, each
 //  with several IN-lists expanded to OR-chains of equality since Ibex has no
-//  `in` operator yet). No group-by. Reads Parquet (converted once via
-//  convert_to_parquet.ibex), matching what Polars' own PDS-H benchmark scans.
+//  `in` operator yet). No group-by. Reads the Parquet that Polars'
+//  own PDS-H benchmark generates and scans.
 //  `l_partkey`/`p_partkey` already share a join-friendly relationship, but
 //  the column names differ, so `part`'s key is renamed to `l_partkey` before
 //  the join so it's a plain equijoin (hash-join) rather than a theta join

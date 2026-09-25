@@ -4,9 +4,8 @@
 //  Single-table multi-column group-by with 8 aggregates + order. The
 //  "90 days before 1998-12-01" cutoff in the standard TPC-H query text is a
 //  fixed constant (not a variable), so it's inlined here as a literal Date
-//  rather than needing date-interval arithmetic. Reads Parquet (converted
-//  once via convert_to_parquet.ibex), matching what Polars' own PDS-H
-//  benchmark scans.
+//  rather than needing date-interval arithmetic. Reads the Parquet that
+//  Polars' own PDS-H benchmark generates and scans.
 //
 //  Run:
 //    ./build-release/tools/ibex_eval --plugin-path build-release/tools \

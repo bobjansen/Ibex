@@ -2,9 +2,8 @@
 //  PDS-H / TPC-H Q6 — Forecasting Revenue Change
 //
 //  Single-table filter + sum. Simplest query in the suite; used as the first
-//  smoke test for the whole pipeline. Reads Parquet (converted once via
-//  convert_to_parquet.ibex) rather than the raw dbgen CSV, matching what
-//  Polars' own PDS-H benchmark scans.
+//  smoke test for the whole pipeline. Reads the Parquet that Polars'
+//  own PDS-H benchmark generates and scans.
 //
 //  Run:
 //    ./build-release/tools/ibex_eval --plugin-path build-release/tools \

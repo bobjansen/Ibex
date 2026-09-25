@@ -33,8 +33,9 @@ Usage (from the repo root, inside the project's uv environment):
   uv run --project . benchmarking/tpch/check_against_polars.py --sf 8 [--pdsh-root DIR] [q01 q11 ...]
 
 The `benchmarking/data/tpch/parquet` symlink must already point at
-`parquet_sf<sf>` (run_bench.sh sets it). The script refuses to run otherwise,
-rather than silently comparing two scales.
+`<pdsh-root>/data/tables/scale-<sf>` (run_bench.sh sets it), the tables
+polars-benchmark generated itself. The script refuses to run otherwise, rather
+than silently comparing two scales or two datasets.
 """
 
 import argparse
@@ -55,6 +56,9 @@ OUT_DIR = DATA_ROOT / "out"
 QUERIES_DIR = SCRIPT_DIR / "queries"
 IBEX_EVAL = IBEX_ROOT / "build-release/tools/ibex_eval"
 PLUGIN_DIR = IBEX_ROOT / "build-release/tools"
+
+sys.path.insert(0, str(SCRIPT_DIR.parent))
+import bench_env  # noqa: E402
 
 EPOCH = datetime.date(1970, 1, 1)
 ABS_TOL = 0.01
@@ -142,14 +146,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--sf", required=True, help="scale factor, as passed to run_bench.sh")
     parser.add_argument("--pdsh-root", type=pathlib.Path,
-                        default=pathlib.Path(os.environ.get("PDSH_ROOT", pathlib.Path.home() / "polars-benchmark")))
+                        default=bench_env.default_pdsh_root())
     parser.add_argument("queries", nargs="*", help="query stems (default: every qNN.ibex)")
     args = parser.parse_args()
 
-    expected_link = f"parquet_sf{args.sf}"
-    actual_link = os.readlink(PARQUET_LINK) if PARQUET_LINK.is_symlink() else None
-    if actual_link != expected_link:
-        print(f"error: {PARQUET_LINK} -> {actual_link}, expected {expected_link}", file=sys.stderr)
+    tables = bench_env.pdsh_scale_dir(args.pdsh_root, args.sf)
+    if not bench_env.parquet_link_points_at(tables):
+        actual_link = os.readlink(PARQUET_LINK) if PARQUET_LINK.is_symlink() else None
+        print(f"error: {PARQUET_LINK} -> {actual_link}, expected {tables}", file=sys.stderr)
         return 2
     if not IBEX_EVAL.exists():
         print(f"error: {IBEX_EVAL} not found; build build-release first", file=sys.stderr)
@@ -158,23 +162,10 @@ def main() -> int:
         print(f"error: no polars-benchmark checkout at {args.pdsh_root}", file=sys.stderr)
         return 2
 
-    # Upstream reads PATH_TABLES/scale-<float SF>/<table>.parquet. Expose Ibex's
-    # parquet_sf<sf> under that name, as bench_pdsh.py does. A fresh clone (the
-    # EC2 box) has no such path until something creates it, and this check runs
-    # before bench_pdsh.py, whose job that used to be.
-    parquet = DATA_ROOT / expected_link
-    pdsh_data = DATA_ROOT / f"scale-{float(args.sf)}"
-    if pdsh_data.exists() or pdsh_data.is_symlink():
-        if not pdsh_data.is_symlink() or pdsh_data.resolve() != parquet.resolve():
-            print(f"error: refusing to replace existing PDS data path: {pdsh_data}", file=sys.stderr)
-            return 2
-    else:
-        pdsh_data.symlink_to(parquet.name)
-
     # polars-benchmark reads its settings from the environment at import time.
     os.environ.update({
         "SCALE_FACTOR": str(args.sf),
-        "PATH_TABLES": str(DATA_ROOT),
+        "PATH_TABLES": str(bench_env.pdsh_tables_root(args.pdsh_root)),
         "RUN_IO_TYPE": "parquet",
     })
     sys.path.insert(0, str(args.pdsh_root))

@@ -1515,6 +1515,7 @@ auto make_dict_lazy(const std::shared_ptr<DictSourceState>& state) -> runtime::L
     runtime::Table schema;
     schema.add_column("k", Column<std::int64_t>{});
     schema.add_column("flag", Column<Categorical>{std::vector<std::string>{}});
+    schema.add_column("v", Column<std::int64_t>{});
     return runtime::LazyTable{
         std::move(schema), kFlags.size(),
         [state]() -> std::expected<runtime::LazySourceReaderPtr, std::string> {
@@ -1633,10 +1634,10 @@ TEST_CASE("LazyTable: join_key_selection takes the key values from the key scan"
     CHECK_FALSE(decoded_key(state));
 }
 
-// A conjunct narrows the key scan's rows, usually to a small fraction, so the
-// scan is not asked for values it would mostly collect for nothing; the
-// survivors' keys are decoded instead.
-TEST_CASE("LazyTable: join_key_selection decodes the key when a conjunct narrows the scan",
+// A conjunct narrows the key scan's rows; the survivors' keys are picked out of
+// the scan's values rather than decoded again. That beat the second decode even
+// on q03, whose conjunct keeps 1 in 20 key-scan rows.
+TEST_CASE("LazyTable: join_key_selection keeps the scan's keys through a dictionary conjunct",
           "[runtime][lazy_table][deferred_scan][dictionary]") {
     auto state = std::make_shared<DictSourceState>();
     state->key_values = true;
@@ -1649,7 +1650,27 @@ TEST_CASE("LazyTable: join_key_selection decodes the key when a conjunct narrows
     runtime::Table keys;
     keys.add_column_from("k", (*phase)->keys);
     CHECK(int_column(keys, "k") == std::vector<std::int64_t>{10, 13, 15});
-    CHECK(decoded_key(state));
+    CHECK_FALSE(decoded_key(state));
+}
+
+// Same through a staged conjunct, which is evaluated on decoded rows: only the
+// conjunct's column is decoded, never the key.
+TEST_CASE("LazyTable: join_key_selection keeps the scan's keys through a staged conjunct",
+          "[runtime][lazy_table][deferred_scan]") {
+    auto state = std::make_shared<DictSourceState>();
+    state->key_values = true;
+    auto lazy = make_dict_lazy(state);
+
+    // v = 10 + row, so v > 13 keeps rows 4 and 5 of the key rows {0, 3, 4, 5}.
+    auto phase =
+        lazy.join_key_selection({greater_than("v", 13)}, kExec, nullptr, key_membership(), "k");
+    REQUIRE(phase);
+    REQUIRE(phase->has_value());
+    CHECK((*phase)->selected == runtime::Selection{4, 5});
+    runtime::Table keys;
+    keys.add_column_from("k", (*phase)->keys);
+    CHECK(int_column(keys, "k") == std::vector<std::int64_t>{14, 15});
+    CHECK_FALSE(decoded_key(state));
 }
 
 // A source that keeps its values to itself still gets a correct key column:

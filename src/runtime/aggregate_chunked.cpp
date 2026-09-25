@@ -1479,6 +1479,8 @@ class HashAggregateState final {
         std::shared_ptr<ColumnValue> second_column;
         std::shared_ptr<ColumnValue> sum_column;
         std::optional<ValidityBitmap> sum_validity;
+        /// As `OwnedHotChunk::sum_is_int`.
+        bool sum_is_int = false;
         std::uint64_t row_base = 0;
         std::size_t rows = 0;
         std::size_t part_count = 0;
@@ -1487,10 +1489,19 @@ class HashAggregateState final {
     };
 
     static void process_owned_pair_chunk(OwnedPairChunk& job) noexcept {
+        if (job.sum_is_int) {
+            process_owned_pair_chunk_typed<std::int64_t>(job);
+        } else {
+            process_owned_pair_chunk_typed<double>(job);
+        }
+    }
+
+    template <typename ValueT>
+    static void process_owned_pair_chunk_typed(OwnedPairChunk& job) noexcept {
         try {
             const auto* first = std::get<Column<std::int64_t>>(*job.first_column).data();
             const auto* second = std::get<Column<std::int64_t>>(*job.second_column).data();
-            const auto* values = std::get<Column<double>>(*job.sum_column).data();
+            const auto* values = std::get<Column<ValueT>>(*job.sum_column).data();
             const ValidityBitmap* validity =
                 job.sum_validity.has_value() ? &*job.sum_validity : nullptr;
             const PairIntKeyHash hasher;
@@ -1515,7 +1526,7 @@ class HashAggregateState final {
                               .second = static_cast<std::uint64_t>(second[row])};
                 record.first_row = job.row_base + row;
                 if (validity == nullptr || (*validity)[row]) {
-                    record.slot.double_value = values[row];
+                    hot_sum_value<ValueT>(record.slot) = values[row];
                     record.slot.mark_present();
                 }
                 job.records_by_partition[hasher(record.key) & mask].push_back(record);
@@ -1537,7 +1548,8 @@ class HashAggregateState final {
         if (!owned_async_pair_mode_) {
             if (std::getenv("IBEX_DISABLE_ASYNC_PAIR_AGG") != nullptr || n_groups_ > 0 ||
                 partitioned_active_ || owned_mode_ || n_aggs_ != 1 ||
-                plan_[0].func != ir::AggFunc::Sum || plan_[0].kind != ExprType::Double ||
+                plan_[0].func != ir::AggFunc::Sum ||
+                (plan_[0].kind != ExprType::Double && plan_[0].kind != ExprType::Int) ||
                 pair_packs_u64_ || scratch_stride_ != 0 || exec_ == nullptr ||
                 on_worker_pool_thread() || std::max(rows_offered_, rows) < kPairOwnedMinRows ||
                 group_entries.size() != 2 ||
@@ -1568,6 +1580,7 @@ class HashAggregateState final {
         if (agg0.validity.has_value()) {
             job->sum_validity = *agg0.validity;
         }
+        job->sum_is_int = plan_[0].kind == ExprType::Int;
         job->row_base = owned_rows_seen_;
         job->rows = rows;
         job->part_count = owned_async_pair_part_count_;
@@ -2199,6 +2212,7 @@ class HashAggregateState final {
             auto batch =
                 process_worker_pool().submit(owned_async_pair_part_count_, [&](std::size_t p) {
                     auto& partition = owned_pair_partitions_[p];
+                    const bool sum_is_int = plan_[0].kind == ExprType::Int;
                     std::size_t records = 0;
                     for (const auto& job : owned_async_pair_jobs_) {
                         records += job->records_by_partition[p].size();
@@ -2219,7 +2233,11 @@ class HashAggregateState final {
                                 partition.slots.push_back(record.slot);
                             } else if (record.slot.present()) {
                                 auto& slot = partition.slots[it->second];
-                                slot.double_value += record.slot.double_value;
+                                if (sum_is_int) {
+                                    slot.int_value += record.slot.int_value;
+                                } else {
+                                    slot.double_value += record.slot.double_value;
+                                }
                                 slot.mark_present();
                             }
                         }

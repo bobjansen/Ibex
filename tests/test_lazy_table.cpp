@@ -260,7 +260,8 @@ class TextReader final : public runtime::LazySourceReader {
     }
 
     auto key_filter_scan(const std::string& column, const runtime::DynamicScanFilter& filter,
-                         const runtime::SourceUnit* unit, const runtime::ExecutionContext& /*exec*/)
+                         const runtime::SourceUnit* unit, const runtime::ExecutionContext& /*exec*/,
+                         std::vector<std::int64_t>* /*values*/)
         -> std::expected<std::optional<runtime::Selection>, std::string> override {
         state_->key_scan_calls.push_back(column);
         if (column != "n")
@@ -1399,6 +1400,8 @@ struct DictSourceState {
     /// The candidate list each dictionary scan received (empty = none).
     std::vector<runtime::Selection> candidates_seen;
     bool dictionary_fused = true;
+    /// Whether the key scan hands back the passing keys it decoded.
+    bool key_values = false;
 };
 
 constexpr std::array<const char*, 6> kFlags{"R", "A", "N", "R", nullptr, "R"};
@@ -1452,12 +1455,16 @@ class DictReader final : public runtime::LazySourceReader {
 
     auto key_filter_scan(const std::string& /*key*/, const runtime::DynamicScanFilter& filter,
                          const runtime::SourceUnit* /*unit*/,
-                         const runtime::ExecutionContext& /*exec*/)
+                         const runtime::ExecutionContext& /*exec*/,
+                         std::vector<std::int64_t>* values)
         -> std::expected<std::optional<runtime::Selection>, std::string> override {
         runtime::Selection selected;
         for (std::size_t r = 0; r < kFlags.size(); ++r) {
             if (filter.passes(static_cast<std::int64_t>(10 + r))) {
                 selected.push_back(r);
+                if (values != nullptr && state_->key_values) {
+                    values->push_back(static_cast<std::int64_t>(10 + r));
+                }
             }
         }
         return std::optional{std::move(selected)};
@@ -1594,4 +1601,69 @@ TEST_CASE("LazyTable: join_key_selection falls back when the dictionary scan dec
     REQUIRE(phase->has_value());
     CHECK((*phase)->selected == runtime::Selection{0, 3, 5});
     CHECK(state->dictionary_scans == std::vector<std::string>{"flag"});
+}
+
+namespace {
+
+auto decoded_key(const std::shared_ptr<DictSourceState>& state) -> bool {
+    return std::ranges::any_of(state->decode_calls, [](const auto& call) {
+        return std::ranges::find(call, "k") != call.end();
+    });
+}
+
+}  // namespace
+
+// The key scan already decoded every passing key to test it. When the source
+// hands those values back, the probe side takes them as its key column rather
+// than decoding the key a second time for the same rows (q17 re-read l_partkey:
+// 40% of its decompressed bytes).
+TEST_CASE("LazyTable: join_key_selection takes the key values from the key scan",
+          "[runtime][lazy_table][deferred_scan]") {
+    auto state = std::make_shared<DictSourceState>();
+    state->key_values = true;
+    auto lazy = make_dict_lazy(state);
+
+    auto phase = lazy.join_key_selection({}, kExec, nullptr, key_membership(), "k");
+    REQUIRE(phase);
+    REQUIRE(phase->has_value());
+    CHECK((*phase)->selected == runtime::Selection{0, 3, 4, 5});
+    runtime::Table keys;
+    keys.add_column_from("k", (*phase)->keys);
+    CHECK(int_column(keys, "k") == std::vector<std::int64_t>{10, 13, 14, 15});
+    CHECK_FALSE(decoded_key(state));
+}
+
+// A conjunct narrows the key scan's rows, usually to a small fraction, so the
+// scan is not asked for values it would mostly collect for nothing; the
+// survivors' keys are decoded instead.
+TEST_CASE("LazyTable: join_key_selection decodes the key when a conjunct narrows the scan",
+          "[runtime][lazy_table][deferred_scan][dictionary]") {
+    auto state = std::make_shared<DictSourceState>();
+    state->key_values = true;
+    auto lazy = make_dict_lazy(state);
+
+    auto phase = lazy.join_key_selection({flag_equals("R")}, kExec, nullptr, key_membership(), "k");
+    REQUIRE(phase);
+    REQUIRE(phase->has_value());
+    CHECK((*phase)->selected == runtime::Selection{0, 3, 5});
+    runtime::Table keys;
+    keys.add_column_from("k", (*phase)->keys);
+    CHECK(int_column(keys, "k") == std::vector<std::int64_t>{10, 13, 15});
+    CHECK(decoded_key(state));
+}
+
+// A source that keeps its values to itself still gets a correct key column:
+// the caller decodes it.
+TEST_CASE("LazyTable: join_key_selection decodes the key when the scan returns no values",
+          "[runtime][lazy_table][deferred_scan]") {
+    auto state = std::make_shared<DictSourceState>();
+    auto lazy = make_dict_lazy(state);
+
+    auto phase = lazy.join_key_selection({}, kExec, nullptr, key_membership(), "k");
+    REQUIRE(phase);
+    REQUIRE(phase->has_value());
+    runtime::Table keys;
+    keys.add_column_from("k", (*phase)->keys);
+    CHECK(int_column(keys, "k") == std::vector<std::int64_t>{10, 13, 14, 15});
+    CHECK(decoded_key(state));
 }

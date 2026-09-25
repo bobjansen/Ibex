@@ -804,10 +804,22 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
     git -C "$PDSH_ROOT" checkout --force "$PDSH_COMMIT"
     uv sync --project /ibex
 
+    # The data comes from polars-benchmark's own generator (tpchgen-cli, then
+    # Polars' parquet writer, pinned by its requirements.txt), never from Ibex,
+    # so the layout cannot be said to favour Ibex. Its venv needs CPython 3.12
+    # (no `ray` wheel for newer); uv fetches one if the box lacks it. --seed
+    # because the Makefile's install-deps bootstraps uv through pip.
+    command -v make >/dev/null || apt_get_retry install -y --no-install-recommends make
+    if [[ ! -x "$PDSH_ROOT/.venv/bin/tpchgen-cli" ]]; then
+        rm -rf "$PDSH_ROOT/.venv"
+        uv venv --seed --python 3.12 "$PDSH_ROOT/.venv"
+        make -C "$PDSH_ROOT" install-deps
+    fi
+
     IFS=',' read -r -a TPCH_SCALES <<< "${IBEX_TPCH_SCALES:-1}"
     for scale in "${TPCH_SCALES[@]}"; do
-        bash /ibex/benchmarking/tpch/gen_data.sh "$scale"
-        bash /ibex/benchmarking/tpch/gen_parquet.sh "$scale"
+        pdsh_scale="$(python3 -c 'import sys; print(float(sys.argv[1]))' "$scale")"
+        make -C "$PDSH_ROOT" data-tables SCALE_FACTOR="$pdsh_scale"
         # --cores is load-bearing on a big box: run_bench.sh pins every engine to
         # the same set, and without it Polars sizes its pool from nproc, thrashes
         # above ~8 threads, and inflates Ibex's lead. run-tpch.sh resolves the
@@ -833,7 +845,7 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
         # itself, hence the taskset. The queries read the `parquet` symlink,
         # which run_bench.sh would normally have pointed at this scale.
         if [[ "${IBEX_TPCH_PROFILE:-0}" == "1" ]]; then
-            ln -sfn "parquet_sf${scale}" /ibex/benchmarking/data/tpch/parquet
+            ln -sfn "$PDSH_ROOT/data/tables/scale-${pdsh_scale}" /ibex/benchmarking/data/tpch/parquet
             PROFILE_OUT=/ibex/benchmarking/tpch/results/profile
             mkdir -p "$PROFILE_OUT"
             lscpu > "$PROFILE_OUT/lscpu.txt" 2>&1 || true

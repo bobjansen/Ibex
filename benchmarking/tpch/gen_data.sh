@@ -2,7 +2,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Bob Jansen
 
-# gen_data.sh — fetch/build tpch-dbgen and generate SF-1 PDS-H data.
+# gen_data.sh — fetch/build tpch-dbgen for the official SF-1 answers that
+# check_answers.py diffs against.
+#
+# NOT benchmark data. The Parquet the queries read comes from the
+# polars-benchmark checkout itself (`make data-tables SCALE_FACTOR=<sf>.0`),
+# so the comparison with Polars runs on Polars-written files.
 #
 # Usage:
 #   ./gen_data.sh [scale_factor]   # default scale_factor=1

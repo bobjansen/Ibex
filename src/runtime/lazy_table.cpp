@@ -94,7 +94,8 @@ auto LazyTable::scan_units() -> std::vector<SourceUnit> {
 }
 
 auto LazyTable::scan_key_filter(const std::string& key, const DynamicScanFilter& filter,
-                                const SourceUnit* unit, const ExecutionContext& exec)
+                                const SourceUnit* unit, const ExecutionContext& exec,
+                                std::vector<std::int64_t>* values)
     -> std::expected<std::optional<Selection>, std::string> {
     auto* profile_entry = exec.execution_profile == nullptr
                               ? nullptr
@@ -105,7 +106,7 @@ auto LazyTable::scan_key_filter(const std::string& key, const DynamicScanFilter&
         if (!reader) {
             return std::unexpected(reader.error());
         }
-        auto result = (*reader)->key_filter_scan(key, filter, unit, exec);
+        auto result = (*reader)->key_filter_scan(key, filter, unit, exec, values);
         if (result) {
             release_reader(std::move(*reader));
         }
@@ -1482,10 +1483,21 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
         dictionary_conjuncts.empty() ? conjuncts : staged_conjuncts;
     if ((key_filter_scan_ != nullptr || reader_factory_) && !cache_.contains(key_name) &&
         (staged.empty() || stageable_conjunct_columns(staged).has_value())) {
-        auto scan = scan_key_filter(key_name, dynamic, nullptr, exec);
+        // The scan decodes every passing key to test it; asking for those
+        // values spares a second decode of the key column for the same rows
+        // (q17 re-read l_partkey, 40% of its compressed bytes). Only when
+        // nothing narrows the scan's rows afterwards: a conjunct usually
+        // drops most of them (q03 keeps 1 in 20), and collecting values for
+        // rows that are then thrown away costs more than decoding the few
+        // survivors' keys again.
+        const bool want_keys = conjuncts.empty();
+        std::vector<std::int64_t> scanned_keys;
+        auto scan =
+            scan_key_filter(key_name, dynamic, nullptr, exec, want_keys ? &scanned_keys : nullptr);
         if (!scan) {
             return std::unexpected(scan.error());
         }
+        const bool have_keys = scan->has_value() && !scanned_keys.empty();
         bool dictionary_ok = true;
         std::optional<Selection> key_selection;
         if (scan->has_value()) {
@@ -1523,6 +1535,16 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
             if (narrowed) {
                 JoinKeySelection out;
                 out.selected = std::move(selected);
+                if (have_keys) {
+                    if (scanned_keys.size() != out.selected.size()) {
+                        return std::unexpected(
+                            "lazy source produced a key value count that differs from its rows");
+                    }
+                    out.keys.name = key_name;
+                    out.keys.column = std::make_shared<ColumnValue>(
+                        Column<std::int64_t>{std::move(scanned_keys)});
+                    return std::optional{std::move(out)};
+                }
                 auto keys = project_rows({key_name}, out.selected, exec);
                 if (!keys) {
                     return std::unexpected(keys.error());

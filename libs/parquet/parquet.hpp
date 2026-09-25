@@ -2585,12 +2585,20 @@ constexpr double kAbandonPassRate = 0.75;
 constexpr std::size_t kAbandonMinRows = 1 << 18;
 
 /// One row group's contribution, appended to `selected` as absolute row
-/// indices. False means the column is nested, which has no fused answer at all.
+/// indices, and each passing key to `values` when it is non-null. False means
+/// the column is nested, which has no fused answer at all.
+///
+/// The values are gathered from the batch buffer after the filter loop, never
+/// stored inside it. The filter loop bounds a scan that passes many rows, and
+/// an `int64_t` store there may alias the filter's own words, so the compiler
+/// reloads them per row: collecting values inline nearly tripled the loop on
+/// q16 (15% of partsupp passes).
 template <typename DType>
 inline auto filtered_key_group_scan(parquet::arrow::FileReader& reader, int leaf_index, int group,
                                     std::size_t shard_rows, std::size_t base, std::size_t skip,
                                     const ibex::runtime::DynamicScanFilter& filter,
-                                    ibex::runtime::Selection& selected) -> bool {
+                                    ibex::runtime::Selection& selected,
+                                    std::vector<std::int64_t>* values) -> bool {
     using Raw = typename DType::c_type;
 
     auto column = reader.parquet_reader()->RowGroup(group)->Column(leaf_index);
@@ -2608,7 +2616,7 @@ inline auto filtered_key_group_scan(parquet::arrow::FileReader& reader, int leaf
         throw std::runtime_error("read_parquet: key column shard skip ended before its start");
     }
 
-    std::unique_ptr<Raw[]> values(new Raw[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
+    std::unique_ptr<Raw[]> decoded(new Raw[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
     std::unique_ptr<std::int16_t[]> definitions(
         new std::int16_t[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
 
@@ -2618,14 +2626,22 @@ inline auto filtered_key_group_scan(parquet::arrow::FileReader& reader, int leaf
             static_cast<std::size_t>(kDirectDecodeBatchRows), shard_rows - row));
         std::int64_t values_read = 0;
         const std::int64_t levels_read = typed->ReadBatch(
-            request, optional ? definitions.get() : nullptr, nullptr, values.get(), &values_read);
+            request, optional ? definitions.get() : nullptr, nullptr, decoded.get(), &values_read);
         if (levels_read <= 0) {
             throw std::runtime_error("read_parquet: key column ended before its row group");
         }
+        const std::size_t batch_start = selected.size();
         if (!optional || values_read == levels_read) {
             for (std::int64_t i = 0; i < values_read; ++i) {
-                if (filter.passes(static_cast<std::int64_t>(values[static_cast<std::size_t>(i)]))) {
+                if (filter.passes(
+                        static_cast<std::int64_t>(decoded[static_cast<std::size_t>(i)]))) {
                     selected.push_back(base + row + static_cast<std::size_t>(i));
+                }
+            }
+            if (values != nullptr) {
+                // No nulls: a passing row's value sits at its batch offset.
+                for (std::size_t k = batch_start; k < selected.size(); ++k) {
+                    values->push_back(static_cast<std::int64_t>(decoded[selected[k] - base - row]));
                 }
             }
         } else {
@@ -2636,8 +2652,12 @@ inline auto filtered_key_group_scan(parquet::arrow::FileReader& reader, int leaf
                 if (definitions[static_cast<std::size_t>(i)] == 0) {
                     continue;
                 }
-                if (filter.passes(static_cast<std::int64_t>(values[value_index]))) {
+                const auto key = static_cast<std::int64_t>(decoded[value_index]);
+                if (filter.passes(key)) {
                     selected.push_back(base + row + static_cast<std::size_t>(i));
+                    if (values != nullptr) {
+                        values->push_back(key);
+                    }
                 }
                 ++value_index;
             }
@@ -2836,14 +2856,15 @@ inline auto key_scan_abandons(std::size_t scanned, std::size_t passing) -> bool 
 /// Concatenate the per-group results in file order. Each part is ascending and
 /// the groups partition the file in order, so the result is sorted ascending —
 /// identical to what a single-threaded scan would have built, not merely
-/// equivalent to it.
-inline auto merge_key_scan_parts(const std::vector<ibex::runtime::Selection>& parts)
-    -> ibex::runtime::Selection {
+/// equivalent to it. The passing key values, kept per group alongside the
+/// rows, concatenate the same way.
+template <typename T>
+inline auto merge_key_scan_parts(const std::vector<std::vector<T>>& parts) -> std::vector<T> {
     std::size_t total = 0;
     for (const auto& part : parts) {
         total += part.size();
     }
-    ibex::runtime::Selection selected;
+    std::vector<T> selected;
     selected.reserve(total);
     for (const auto& part : parts) {
         selected.insert(selected.end(), part.begin(), part.end());
@@ -2870,12 +2891,26 @@ inline auto merge_key_scan_parts(const std::vector<ibex::runtime::Selection>& pa
 /// concurrently with the one that triggered the check. That is the trade for
 /// not serializing a leading group on every scan, including the far more
 /// common one that never abandons at all.
+///
+/// `values`, when non-null, receives the passing keys in the same order as the
+/// returned rows (left untouched when the scan gives no answer).
 template <typename DType>
 inline auto filtered_key_selection(std::span<parquet::arrow::FileReader* const> readers,
                                    int leaf_index, const ibex::runtime::DynamicScanFilter& filter,
-                                   const std::vector<KeyScanGroup>& groups)
+                                   const std::vector<KeyScanGroup>& groups,
+                                   std::vector<std::int64_t>* values)
     -> std::optional<ibex::runtime::Selection> {
     std::vector<ibex::runtime::Selection> parts(groups.size());
+    std::vector<std::vector<std::int64_t>> value_parts(values != nullptr ? groups.size() : 0);
+    const auto values_of = [&](std::size_t i) {
+        return values != nullptr ? &value_parts[i] : nullptr;
+    };
+    const auto answer = [&] {
+        if (values != nullptr) {
+            *values = merge_key_scan_parts(value_parts);
+        }
+        return merge_key_scan_parts(parts);
+    };
 
     if (readers.size() <= 1 || groups.size() <= 1) {
         std::size_t scanned = 0;
@@ -2883,7 +2918,7 @@ inline auto filtered_key_selection(std::span<parquet::arrow::FileReader* const> 
         for (std::size_t i = 0; i < groups.size(); ++i) {
             if (!filtered_key_group_scan<DType>(*readers.front(), leaf_index, groups[i].index,
                                                 groups[i].rows, groups[i].base, groups[i].skip,
-                                                filter, parts[i])) {
+                                                filter, parts[i], values_of(i))) {
                 return std::nullopt;
             }
             scanned += groups[i].rows;
@@ -2892,7 +2927,7 @@ inline auto filtered_key_selection(std::span<parquet::arrow::FileReader* const> 
                 return std::nullopt;
             }
         }
-        return merge_key_scan_parts(parts);
+        return answer();
     }
 
     std::atomic<std::size_t> cursor{0};
@@ -2913,7 +2948,7 @@ inline auto filtered_key_selection(std::span<parquet::arrow::FileReader* const> 
                 }
                 if (!filtered_key_group_scan<DType>(*readers[worker], leaf_index, groups[i].index,
                                                     groups[i].rows, groups[i].base, groups[i].skip,
-                                                    filter, parts[i])) {
+                                                    filter, parts[i], values_of(i))) {
                     nested.store(true, std::memory_order_relaxed);
                     stop.store(true, std::memory_order_relaxed);
                     return;
@@ -2936,7 +2971,7 @@ inline auto filtered_key_selection(std::span<parquet::arrow::FileReader* const> 
     if (nested.load(std::memory_order_relaxed) || stop.load(std::memory_order_relaxed)) {
         return std::nullopt;
     }
-    return merge_key_scan_parts(parts);
+    return answer();
 }
 
 /// DATE32 is dictionary-encoded in every SF-8 lineitem row group. Evaluate the
@@ -3619,7 +3654,8 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
 
     auto key_filter_scan(const std::string& key, const ibex::runtime::DynamicScanFilter& filter,
                          const ibex::runtime::SourceUnit* unit,
-                         const ibex::runtime::ExecutionContext& exec)
+                         const ibex::runtime::ExecutionContext& exec,
+                         std::vector<std::int64_t>* values)
         -> std::expected<std::optional<ibex::runtime::Selection>, std::string> override {
         auto it = indices_->find(key);
         if (it == indices_->end()) {
@@ -3666,8 +3702,11 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
                         target),
                     unit);
                 auto readers = parallel_readers(groups.size(), exec);
-                return filtered_key_selection<parquet::Int64Type>(std::span{readers}, leaf_index,
-                                                                  filter, groups);
+                // The raw values are the column's values only when it
+                // decodes as Int64 (UINT64 is a different column type).
+                return filtered_key_selection<parquet::Int64Type>(
+                    std::span{readers}, leaf_index, filter, groups,
+                    id == arrow::Type::INT64 ? values : nullptr);
             }
             if (physical == parquet::Type::INT32) {
                 const auto groups = restrict_to_unit(
@@ -3681,7 +3720,7 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
                                                                filter, groups);
                 }
                 return filtered_key_selection<parquet::Int32Type>(std::span{readers}, leaf_index,
-                                                                  filter, groups);
+                                                                  filter, groups, nullptr);
             }
             return std::optional<ibex::runtime::Selection>{};
         } catch (const std::exception& e) {

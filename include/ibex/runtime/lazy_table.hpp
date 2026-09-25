@@ -104,10 +104,18 @@ class LazySourceReader {
 
     /// Passing rows for `filter`, in source-global indices; `unit` restricts
     /// the scan the same way it restricts `decode`.
+    ///
+    /// `values`, when non-null, asks for the passing keys too: the scan decoded
+    /// them to test them, and a caller that needs them (a join's probe side)
+    /// would otherwise decode the key column a second time for the same rows.
+    /// A source fills it with exactly one value per selected row, equal to what
+    /// an Int64 `decode` of those rows would hold, or leaves it empty; empty is
+    /// always correct and means the caller decodes the key itself.
     [[nodiscard]] virtual auto key_filter_scan(const std::string& /*key*/,
                                                const DynamicScanFilter& /*filter*/,
                                                const SourceUnit* /*unit*/,
-                                               const ExecutionContext& /*exec*/)
+                                               const ExecutionContext& /*exec*/,
+                                               std::vector<std::int64_t>* /*values*/)
         -> std::expected<std::optional<Selection>, std::string> {
         return std::optional<Selection>{};
     }
@@ -372,7 +380,8 @@ class LazyTable {
                                       const ExecutionContext& exec)
         -> std::expected<Table, std::string>;
     [[nodiscard]] auto scan_key_filter(const std::string& key, const DynamicScanFilter& filter,
-                                       const SourceUnit* unit, const ExecutionContext& exec)
+                                       const SourceUnit* unit, const ExecutionContext& exec,
+                                       std::vector<std::int64_t>* values = nullptr)
         -> std::expected<std::optional<Selection>, std::string>;
     /// Rows of `unit` (the whole source when null) that satisfy `conjuncts`,
     /// decided inside the reader's decoder: the literal range on one integer

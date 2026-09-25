@@ -10,13 +10,13 @@ the reader:
 
 - It writes no per-page encoding stats. A low-cardinality string column has a
   dictionary page, but nothing says every data page used it, and Arrow then
-  declines to expose the dictionary. The reader used to claim such a column as
-  Categorical anyway and failed with "dictionary column changed encoding".
-  `seg` is that column.
-- Read dense instead, `seg` decodes to far more characters than its chunk
-  stores (five values repeated 200,000 times from a tiny dictionary). The dense
-  decoder sized its buffer from the chunk's uncompressed size and wrote past
-  it.
+  declines to expose the dictionary. The reader first failed on such a column
+  ("dictionary column changed encoding"), then read it dense; it now reads it
+  as Categorical and checks each page as it decodes. `seg` is that column.
+- Read dense, `seg` decoded to far more characters than its chunk stores (five
+  values repeated 200,000 times from a tiny dictionary), and the dense decoder
+  wrote past a buffer sized from the chunk's uncompressed size. `seg` no longer
+  reads dense; gen_parquet_dictionary_fallback.py covers that decode now.
 - A high-cardinality string column has no dictionary and spans several ZSTD
   pages, so a fused `like` filter reads it in page stripes; that path handed
   the page reader a stream without Peek. `note` is that column.

@@ -1,0 +1,20 @@
+// Reads the fixture from gen_parquet_dictionary_fallback.py, whose `seg` pages
+// fall back from the dictionary to PLAIN half way through the chunk. Run with
+// IBEX_PARQUET_IGNORE_ENCODING_STATS=1, `seg` is Categorical (as on a Polars
+// file) and the decoder meets the PLAIN pages mid-chunk.
+//
+// Expected, whole column: 5 segments of 20,000 rows and 2,000 codes of 50
+// rows. Under a row selection (id >= 150,000, all past the fallback): 2,000
+// codes of 25 rows.
+//
+// One final statement on purpose: the whole-script planner runs only what the
+// result depends on, so a separate statement per check would be dropped.
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+
+let t = read_parquet("tests/data/parquet_dictionary_fallback_out.parquet") as DataFrame<{
+    id: Int64,
+    seg: String
+}>;
+let whole = t[select { n = count() }, by { seg }][select { groups = count() }, by { n }];
+let late = t[filter id >= 150000][select { n = count() }, by { seg }][select { groups = count() }, by { n }];
+rbind(whole, late)[order { n }];

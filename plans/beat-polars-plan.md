@@ -101,8 +101,15 @@ sitting):**
    dictionary-encoded and decodes it as plain strings. The queries that group or
    filter on low-cardinality strings lost the most and do not react to layout:
    q01 (flags, 1.44 → 2.82), q16 (brand/type/size, 1.67 → 3.90), q12 (shipmode,
-   0.74 → 1.55), q19 (container/shipmode, 1.56 → 2.49), q10 (1.74 → 2.19). This
-   is inferred from that pattern, not yet A/B'd.
+   0.74 → 1.55), q19 (container/shipmode, 1.56 → 2.49), q10 (1.74 → 2.19).
+   **Confirmed and fixed** in the commit after 5933c883: a stats-less column
+   with a dictionary page is read as Categorical again, each page checked as it
+   decodes (Arrow's per-page check in `ReadBatchWithDictionary`; a page that
+   fell back to PLAIN is interned). Interleaved A/B at 8c against 46d4e749:
+   suite 10,931 → 8,693 ms (−20.5%); q16 −68%, q01 −55%, q19 −49%, q10 −40%,
+   q12 −25%, q09 −11%, nothing slower. The dictionary *date* scan stays
+   stats-gated: on a pyarrow copy with stats it cost q06 about +20% on
+   122,880-row groups.
 4. **Smaller row groups did not help.** At 8c, 1M-row groups against 122,880
    (both ZSTD): q18 1,913 vs 2,630 (the barrier-per-chunk path above), q15 193
    vs 254, everything else within noise. The expected parallel-width gain does

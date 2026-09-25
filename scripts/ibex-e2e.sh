@@ -414,26 +414,69 @@ if [[ "$SKIP_REPL" == false ]]; then
 
         echo "▸ whole-script (parquet plugin, a file written by Polars)"
         # The PDS-H benchmark data is written by Polars, whose files differ
-        # from Arrow's where the reader had three bugs: no per-page encoding
-        # stats (a dictionary column must read dense), a dense read of a
-        # dictionary column decoding to more characters than its chunk stores,
-        # and ZSTD string pages read in stripes. IBEX_CORES=8 so the fused
-        # string filter stripes its pages even on a small runner.
+        # from Arrow's: no per-page encoding stats (a dictionary column is
+        # still read as Categorical, its pages checked as they decode), a
+        # dense read of a dictionary column decoding to more characters than
+        # its chunk stores (now covered by the fallback step below), and
+        # ZSTD string pages read in stripes. IBEX_CORES=8 so the fused string
+        # filter stripes its pages even on a small runner.
         uv run --project "$IBEX_ROOT" python \
             "$IBEX_ROOT/tests/data/gen_parquet_polars_writer.py" \
             "$IBEX_ROOT/tests/data/parquet_polars_writer_out.parquet" >/dev/null
         polars_out="$(mktemp)"
-        IBEX_CORES=8 "$BUILD_DIR/tools/ibex_eval" --plugin-path "$BUILD_DIR/tools" \
+        IBEX_CORES=8 IBEX_DICT_ENTRY_DEBUG=1 "$BUILD_DIR/tools/ibex_eval" \
+            --plugin-path "$BUILD_DIR/tools" \
             "$IBEX_ROOT/tests/data/parquet_polars_writer_check.ibex" >"$polars_out" 2>&1
-        rm -f "$IBEX_ROOT/tests/data/parquet_polars_writer_out.parquet"
-        # Five segments of 40,000 rows, 20,000 past row 100,000, 28,572 needles.
+        # Five segments of 40,000 rows, 20,000 past row 100,000, 28,572 needles,
+        # with `seg` read as Categorical despite the missing encoding stats.
         if rg -n "error:" "$polars_out" >/dev/null \
-            || [[ "$(rg -c '\| 40000 +\| 20000 +\| 28572 +\|' "$polars_out")" != "5" ]]; then
+            || [[ "$(rg -c '\| 40000 +\| 20000 +\| 28572 +\|' "$polars_out")" != "5" ]] \
+            || ! rg -n 'col=seg .*-> categorical' "$polars_out" >/dev/null; then
             cat "$polars_out" >&2
-            rm -f "$polars_out"
+            rm -f "$polars_out" "$IBEX_ROOT/tests/data/parquet_polars_writer_out.parquet"
             exit 1
         fi
-        rm -f "$polars_out"
+        rm -f "$polars_out" "$IBEX_ROOT/tests/data/parquet_polars_writer_out.parquet"
+
+        echo "▸ whole-script (parquet plugin, a dictionary chunk that falls back to PLAIN)"
+        # A stats-less dictionary column is read as Categorical, and a page
+        # that fell back to PLAIN mid-chunk has its values interned. No writer
+        # at hand is both stats-less and falls back, so this pyarrow file has
+        # the stats and IBEX_PARQUET_IGNORE_ENCODING_STATS hides them. With
+        # them honoured `seg` reads dense: the proof that the pages fall back,
+        # and the dense decode of a dictionary chunk whose strings (1.4 MB)
+        # outgrow its uncompressed bytes (0.95 MB), which the Polars fixture
+        # covered while its `seg` still read dense.
+        uv run --project "$IBEX_ROOT" python \
+            "$IBEX_ROOT/tests/data/gen_parquet_dictionary_fallback.py" \
+            "$IBEX_ROOT/tests/data/parquet_dictionary_fallback_out.parquet"
+        fallback_out="$(mktemp)"
+        for mode in honoured ignored; do
+            if [[ "$mode" == ignored ]]; then
+                want='col=seg .*-> categorical'
+                export IBEX_PARQUET_IGNORE_ENCODING_STATS=1
+            else
+                want='col=seg .*-> dense'
+            fi
+            IBEX_CORES=8 IBEX_DICT_ENTRY_DEBUG=1 "$BUILD_DIR/tools/ibex_eval" \
+                --plugin-path "$BUILD_DIR/tools" \
+                "$IBEX_ROOT/tests/data/parquet_dictionary_fallback_check.ibex" \
+                >"$fallback_out" 2>&1
+            unset IBEX_PARQUET_IGNORE_ENCODING_STATS
+            # 2,000 codes of 25 rows past the selection; 2,000 of 50 and five
+            # segments of 20,000 over the whole column.
+            if rg -n "error:" "$fallback_out" >/dev/null \
+                || ! rg -n "$want" "$fallback_out" >/dev/null \
+                || ! rg -n '\| 25 +\| 2000 +\|' "$fallback_out" >/dev/null \
+                || ! rg -n '\| 50 +\| 2000 +\|' "$fallback_out" >/dev/null \
+                || ! rg -n '\| 20000 +\| 5 +\|' "$fallback_out" >/dev/null; then
+                echo "stats $mode:" >&2
+                cat "$fallback_out" >&2
+                rm -f "$fallback_out" "$IBEX_ROOT/tests/data/parquet_dictionary_fallback_out.parquet"
+                exit 1
+            fi
+        done
+        rm -f "$fallback_out" "$IBEX_ROOT/tests/data/parquet_dictionary_fallback_out.parquet"
     fi
 fi
 

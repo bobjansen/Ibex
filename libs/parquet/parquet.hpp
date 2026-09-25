@@ -58,6 +58,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <parquet/arrow/reader.h>
 #include <parquet/arrow/schema.h>
@@ -806,10 +807,11 @@ inline auto schema_table_from_arrow(const arrow::Schema& schema) -> ibex::runtim
 /// l_shipmode, p_brand, p_container … and rejects l_comment and p_name.
 ///
 /// Declining is always safe: a column read dense holds the same values. Claiming
-/// is not. The dictionary read goes through Arrow's `ColumnWithExposeEncoding`,
-/// which throws off the read ("dictionary column changed encoding") for any
-/// chunk Arrow itself will not prove fully dictionary-encoded, so the test here
-/// must never be looser than Arrow's.
+/// a column the stats prove is safe too. A chunk with no encoding stats (Polars
+/// writes none) is claimed on the strength of its dictionary page, and the
+/// decoder checks each data page as it goes: one that fell back to PLAIN has
+/// its values interned into the same Categorical (`decode_dictionary_column`).
+/// Stats that show a PLAIN data page rule the column out.
 /// A column's dictionary size in bytes, summed over row groups, from metadata
 /// alone. The dictionary page runs from its own offset to the first data page.
 inline auto dictionary_bytes(const parquet::FileMetaData& metadata, int col) -> std::int64_t {
@@ -851,6 +853,65 @@ inline auto dictionary_entry_count(parquet::ParquetFileReader& reader, int col)
     return entries;
 }
 
+/// Does this chunk say how every data page was encoded? Polars writes no
+/// per-page encoding stats at all. IBEX_PARQUET_IGNORE_ENCODING_STATS treats
+/// every chunk as stats-less: a test hook, since no writer at hand produces a
+/// stats-less file whose data pages fall back from the dictionary to PLAIN.
+inline auto has_encoding_stats(const parquet::ColumnChunkMetaData& chunk) -> bool {
+    static const bool ignore = std::getenv("IBEX_PARQUET_IGNORE_ENCODING_STATS") != nullptr;
+    return !ignore && !chunk.encoding_stats().empty();
+}
+
+/// Do the chunk's stats prove every data page dictionary-encoded?
+inline auto stats_prove_dictionary(const parquet::ColumnChunkMetaData& chunk) -> bool {
+    for (const auto& stats : chunk.encoding_stats()) {
+        // Only data pages count: the dictionary page is itself PLAIN-encoded,
+        // so a column's encoding list always mentions PLAIN.
+        const bool is_data = stats.page_type == parquet::PageType::DATA_PAGE ||
+                             stats.page_type == parquet::PageType::DATA_PAGE_V2;
+        if (is_data && stats.encoding != parquet::Encoding::RLE_DICTIONARY &&
+            stats.encoding != parquet::Encoding::PLAIN_DICTIONARY) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// A reader for one row group's column whose dictionary codes can be read with
+/// `ReadBatchWithDictionary`, or null when the chunk's stats show a data page
+/// that is not dictionary-encoded.
+///
+/// With stats, Arrow's own check decides. Without them (Polars' files) nothing
+/// is known up front, so the plain reader is returned and each page proves
+/// itself: `ReadBatchWithDictionary` checks every page's encoding and throws on
+/// one that is not dictionary-encoded, before consuming anything from it (see
+/// `is_dictionary_page_mismatch`). Arrow's exposure flag is only that up-front
+/// gate; decoding codes does not consult it.
+inline auto dictionary_column_reader(parquet::RowGroupReader& row_group, int leaf_index)
+    -> std::shared_ptr<parquet::ColumnReader> {
+    const auto chunk = row_group.metadata()->ColumnChunk(leaf_index);
+    if (!chunk->has_dictionary_page()) {
+        return nullptr;
+    }
+    if (!has_encoding_stats(*chunk)) {
+        return row_group.Column(leaf_index);
+    }
+    auto column =
+        row_group.ColumnWithExposeEncoding(leaf_index, parquet::ExposedEncoding::DICTIONARY);
+    if (column->GetExposedEncoding() != parquet::ExposedEncoding::DICTIONARY) {
+        return nullptr;
+    }
+    return column;
+}
+
+/// `ReadBatchWithDictionary` reached a data page that is not dictionary-encoded
+/// -- a writer's fallback to PLAIN, in a chunk with no stats to warn of it. The
+/// check runs before the page is consumed, so the reader can carry on with
+/// `ReadBatch` from the same position. Any other exception is a real failure.
+inline auto is_dictionary_page_mismatch(const parquet::ParquetException& error) -> bool {
+    return std::string_view{error.what()}.find("not dictionary encoded") != std::string_view::npos;
+}
+
 inline auto dictionary_column_indices(parquet::ParquetFileReader& reader) -> std::vector<int> {
     const auto& metadata = *reader.metadata();
     std::vector<int> out;
@@ -861,27 +922,20 @@ inline auto dictionary_column_indices(parquet::ParquetFileReader& reader) -> std
         bool fully_dictionary = metadata.num_row_groups() > 0;
         for (int group = 0; group < metadata.num_row_groups() && fully_dictionary; ++group) {
             auto chunk = metadata.RowGroup(group)->ColumnChunk(col);
-            // Without per-page encoding stats nothing says the data pages stayed
-            // dictionary-encoded: a writer may fall back to PLAIN mid-chunk, and
-            // the encodings list cannot tell (the dictionary page is PLAIN
-            // itself). Arrow's `ColumnWithExposeEncoding` declines to expose the
-            // dictionary in exactly this case, so claiming the column here would
-            // only fail later with "dictionary column changed encoding". Polars
-            // writes no encoding stats at all, so its string columns read dense.
-            if (!chunk->has_dictionary_page() || chunk->encoding_stats().empty()) {
+            if (!chunk->has_dictionary_page()) {
                 fully_dictionary = false;
                 break;
             }
-            for (const auto& stats : chunk->encoding_stats()) {
-                // Only data pages count: the dictionary page is itself PLAIN-encoded,
-                // so a column's encoding list always mentions PLAIN.
-                const bool is_data = stats.page_type == parquet::PageType::DATA_PAGE ||
-                                     stats.page_type == parquet::PageType::DATA_PAGE_V2;
-                if (is_data && stats.encoding != parquet::Encoding::RLE_DICTIONARY &&
-                    stats.encoding != parquet::Encoding::PLAIN_DICTIONARY) {
-                    fully_dictionary = false;
-                    break;
-                }
+            // Without per-page encoding stats (Polars writes none) nothing says
+            // the data pages stayed dictionary-encoded: a writer may fall back
+            // to PLAIN mid-chunk, and the encodings list cannot tell, since the
+            // dictionary page is PLAIN itself. Such a column is still claimed:
+            // `decode_dictionary_column` checks each page as it reads and
+            // interns a fallen-back page's values instead. Stats that show a
+            // PLAIN data page do rule the column out.
+            if (has_encoding_stats(*chunk) && !stats_prove_dictionary(*chunk)) {
+                fully_dictionary = false;
+                break;
             }
         }
         // A dictionary must be small to be worth having. Reading a column as
@@ -1324,6 +1378,8 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
         new std::int32_t[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
     std::unique_ptr<std::int16_t[]> definitions(
         new std::int16_t[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
+    // Only for a row group whose pages fall back to PLAIN (see below).
+    std::unique_ptr<parquet::ByteArray[]> plain_values;
     const auto& metadata = *reader.parquet_reader()->metadata();
     std::size_t group_start = groups.source_start;
     std::size_t selected_pos =
@@ -1349,9 +1405,8 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
         }
 
         auto row_group = reader.parquet_reader()->RowGroup(group);
-        auto column =
-            row_group->ColumnWithExposeEncoding(leaf_index, parquet::ExposedEncoding::DICTIONARY);
-        if (column->GetExposedEncoding() != parquet::ExposedEncoding::DICTIONARY) {
+        auto column = dictionary_column_reader(*row_group, leaf_index);
+        if (column == nullptr) {
             throw std::runtime_error("read_parquet: dictionary column changed encoding");
         }
         const auto* descriptor = column->descr();
@@ -1364,6 +1419,13 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
         const bool use_defs = optional && !chunk_has_no_nulls(metadata, group, leaf_index);
         auto typed = std::static_pointer_cast<parquet::ByteArrayReader>(column);
         std::vector<std::int32_t> local_to_global;
+        // Set when a data page turns out not to be dictionary-encoded, which a
+        // chunk without encoding stats cannot rule out: a writer's fallback to
+        // PLAIN, for the rest of the chunk. The column is Categorical already,
+        // so the remaining values are read as strings and interned. Their
+        // "local" codes are then global codes, and `local_to_global` becomes
+        // the identity so the emit loops below serve both cases.
+        bool plain_pages = false;
 
         std::size_t row = 0;
         while (row < group_rows && typed->HasNext()) {
@@ -1372,9 +1434,38 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
             std::int64_t codes_read = 0;
             const parquet::ByteArray* local_dictionary = nullptr;
             std::int32_t dictionary_size = 0;
-            const std::int64_t levels_read = typed->ReadBatchWithDictionary(
-                request, use_defs ? definitions.get() : nullptr, nullptr, local_codes.get(),
-                &codes_read, &local_dictionary, &dictionary_size);
+            std::int64_t levels_read = 0;
+            if (!plain_pages) {
+                try {
+                    levels_read = typed->ReadBatchWithDictionary(
+                        request, use_defs ? definitions.get() : nullptr, nullptr, local_codes.get(),
+                        &codes_read, &local_dictionary, &dictionary_size);
+                } catch (const parquet::ParquetException& error) {
+                    if (!is_dictionary_page_mismatch(error)) {
+                        throw;
+                    }
+                    plain_pages = true;
+                }
+            }
+            if (plain_pages) {
+                if (plain_values == nullptr) {
+                    plain_values.reset(
+                        new parquet::ByteArray[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
+                }
+                levels_read = typed->ReadBatch(request, use_defs ? definitions.get() : nullptr,
+                                               nullptr, plain_values.get(), &codes_read);
+                for (std::int64_t i = 0; i < codes_read; ++i) {
+                    const auto& value = plain_values[static_cast<std::size_t>(i)];
+                    local_codes[static_cast<std::size_t>(i)] = intern(std::string(
+                        reinterpret_cast<const char*>(value.ptr),  // NOLINT(*-reinterpret-cast)
+                        value.len));
+                }
+                // Rebuilt whole each batch: the dictionary is small (that is
+                // why the column is Categorical), and the map it replaces was
+                // the row group's local-to-global one, not an identity.
+                local_to_global.resize(dictionary.size());
+                std::iota(local_to_global.begin(), local_to_global.end(), 0);
+            }
             if (levels_read <= 0) {
                 throw std::runtime_error("read_parquet: dictionary decoder made no progress");
             }
@@ -2945,9 +3036,8 @@ inline auto filtered_dictionary_string_group_scan(parquet::arrow::FileReader& re
                                                   const ibex::runtime::Selection* within,
                                                   ibex::runtime::Selection& selected) -> bool {
     auto row_group = reader.parquet_reader()->RowGroup(group.index);
-    auto column =
-        row_group->ColumnWithExposeEncoding(leaf_index, parquet::ExposedEncoding::DICTIONARY);
-    if (column->GetExposedEncoding() != parquet::ExposedEncoding::DICTIONARY) {
+    auto column = dictionary_column_reader(*row_group, leaf_index);
+    if (column == nullptr) {
         return false;
     }
     const auto* descriptor = column->descr();
@@ -2983,9 +3073,19 @@ inline auto filtered_dictionary_string_group_scan(parquet::arrow::FileReader& re
         std::int64_t codes_read = 0;
         const parquet::ByteArray* dictionary = nullptr;
         std::int32_t dictionary_size = 0;
-        const auto levels =
-            typed->ReadBatchWithDictionary(request, optional ? definitions.get() : nullptr, nullptr,
-                                           codes.get(), &codes_read, &dictionary, &dictionary_size);
+        std::int64_t levels = 0;
+        try {
+            levels = typed->ReadBatchWithDictionary(request, optional ? definitions.get() : nullptr,
+                                                    nullptr, codes.get(), &codes_read, &dictionary,
+                                                    &dictionary_size);
+        } catch (const parquet::ParquetException& error) {
+            // A page fell back to PLAIN in a chunk with no stats to say so:
+            // the scan declines, as for a chunk whose stats show it.
+            if (is_dictionary_page_mismatch(error)) {
+                return false;
+            }
+            throw;
+        }
         if (levels <= 0) {
             throw std::runtime_error("read_parquet: dictionary string scan made no progress");
         }

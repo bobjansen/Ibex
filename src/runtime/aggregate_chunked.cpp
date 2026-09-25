@@ -1070,7 +1070,7 @@ class HashAggregateState final {
             return 0;
         };
 
-        // The q18 shape (one Int64 key and one Double sum) is a streaming sink,
+        // The q18 shape (one Int64 key and one Int64 or Double sum) is a streaming sink,
         // not a sequence of per-chunk fork/join pipelines. Each chunk becomes
         // one independent hot-table task; the caller immediately pulls the
         // next chunk, and all tasks join once at end-of-stream. Besides removing
@@ -1203,6 +1203,9 @@ class HashAggregateState final {
         std::shared_ptr<ColumnValue> key_column;
         std::shared_ptr<ColumnValue> sum_column;
         std::optional<ValidityBitmap> sum_validity;
+        /// The sum's `plan_` kind: Int64 accumulates in `slot.int_value`,
+        /// Double in `slot.double_value` (they share storage).
+        bool sum_is_int = false;
         std::uint64_t row_base = 0;
         std::size_t rows = 0;
         std::size_t part_count = 0;
@@ -1229,10 +1232,29 @@ class HashAggregateState final {
         return x;
     }
 
+    /// The slot accumulator a `ValueT` sum lives in.
+    template <typename ValueT>
+    [[nodiscard]] static auto hot_sum_value(AggSlotCore& slot) noexcept -> ValueT& {
+        if constexpr (std::is_same_v<ValueT, std::int64_t>) {
+            return slot.int_value;
+        } else {
+            return slot.double_value;
+        }
+    }
+
     static void process_owned_hot_chunk(OwnedHotChunk& job) noexcept {
+        if (job.sum_is_int) {
+            process_owned_hot_chunk_typed<std::int64_t>(job);
+        } else {
+            process_owned_hot_chunk_typed<double>(job);
+        }
+    }
+
+    template <typename ValueT>
+    static void process_owned_hot_chunk_typed(OwnedHotChunk& job) noexcept {
         try {
             const auto* keys = std::get<Column<std::int64_t>>(*job.key_column).data();
-            const auto* values = std::get<Column<double>>(*job.sum_column).data();
+            const auto* values = std::get<Column<ValueT>>(*job.sum_column).data();
             const ValidityBitmap* validity =
                 job.sum_validity.has_value() ? &*job.sum_validity : nullptr;
             constexpr std::uint32_t kEmpty = std::numeric_limits<std::uint32_t>::max();
@@ -1254,7 +1276,7 @@ class HashAggregateState final {
                 record.key = keys[row];
                 record.first_row = job.row_base + row;
                 if (validity == nullptr || (*validity)[row]) {
-                    record.slot.double_value = values[row];
+                    hot_sum_value<ValueT>(record.slot) = values[row];
                     record.slot.mark_present();
                 }
                 records.push_back(record);
@@ -1263,7 +1285,7 @@ class HashAggregateState final {
             const auto update_record = [&](std::uint32_t record, std::size_t row) {
                 if (validity == nullptr || (*validity)[row]) {
                     auto& slot = records[record].slot;
-                    slot.double_value += values[row];
+                    hot_sum_value<ValueT>(slot) += values[row];
                     slot.mark_present();
                 }
             };
@@ -1376,7 +1398,8 @@ class HashAggregateState final {
             if (std::getenv("IBEX_DISABLE_OWNED_PAIR_AGG") != nullptr ||
                 std::getenv("IBEX_DISABLE_ASYNC_HOT_AGG") != nullptr || n_groups_ > 0 ||
                 partitioned_active_ || owned_mode_ || n_aggs_ != 1 ||
-                plan_[0].func != ir::AggFunc::Sum || plan_[0].kind != ExprType::Double ||
+                plan_[0].func != ir::AggFunc::Sum ||
+                (plan_[0].kind != ExprType::Double && plan_[0].kind != ExprType::Int) ||
                 int_key_kind_ != IntKeyKind::Int64 || scratch_stride_ != 0 || exec_ == nullptr ||
                 on_worker_pool_thread() || std::max(rows_offered_, rows) < kIntOwnedMinRows) {
                 return false;
@@ -1408,6 +1431,7 @@ class HashAggregateState final {
         if (agg0.validity.has_value()) {
             job->sum_validity = *agg0.validity;
         }
+        job->sum_is_int = plan_[0].kind == ExprType::Int;
         job->row_base = owned_rows_seen_;
         job->rows = rows;
         job->part_count = owned_async_part_count_;
@@ -2063,9 +2087,14 @@ class HashAggregateState final {
                 partition.first_rows.reserve(records);
                 partition.slots.reserve(records);
 
-                const auto add_into = [](AggSlotCore& slot, const AggSlotCore& from) {
+                const bool sum_is_int = plan_[0].kind == ExprType::Int;
+                const auto add_into = [sum_is_int](AggSlotCore& slot, const AggSlotCore& from) {
                     if (from.present()) {
-                        slot.double_value += from.double_value;
+                        if (sum_is_int) {
+                            slot.int_value += from.int_value;
+                        } else {
+                            slot.double_value += from.double_value;
+                        }
                         slot.mark_present();
                     }
                 };

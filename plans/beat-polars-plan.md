@@ -88,7 +88,9 @@ sitting):**
    (`src/runtime/aggregate_chunked.cpp`) requires a Double sum, so q18 falls
    back to three barriers per chunk; with 391 row groups that is 1,556
    barriers at 9% occupancy. With q18 at its Float64 speed the 8c total would
-   be about 1.19, not 1.42 (estimate).
+   be about 1.19, not 1.42 (estimate). **Fixed** in the commit after 190b5dd7:
+   the hot table now admits Int64 sums; q18 at 8c 2,662 → 396 ms median
+   (interleaved A/B, same sitting), 1c unchanged (the path needs 2+ workers).
 2. **ZSTD roughly doubles the scan-bound queries, for both engines.**
    Uncompressed against ZSTD at the same 122,880-row groups: q06 119 vs 225,
    q14 140 vs 296, q19 595 vs 761, q12 310 vs 346. Polars pays the same kind of

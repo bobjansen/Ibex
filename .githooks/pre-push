@@ -1,5 +1,17 @@
 #!/usr/bin/env bash
-# Pre-push: structural fusion-invariant gate.
+# Pre-push: include check (clang-tidy misc-include-cleaner) on the pushed
+# src/*.cpp, then the structural fusion-invariant gate.
+#
+# The include check mirrors one check of CI's clang-tidy job, which treats
+# every diagnostic as an error. It is the one that fails most often -- a new
+# helper used from another file without including its header -- and it is
+# cheap (~4 s on the largest TU; CI's full check set takes ~40 s per file),
+# so it runs here and the rest stays in CI. `scripts/tidy-fix.sh <files>`
+# adds the missing includes.
+#
+#   Skip for one push:   IBEX_SKIP_TIDY_CHECK=1 git push
+#
+# Fusion-invariant gate:
 #
 # Mirrors the "Fusion invariants" step in CI's clang-werror leg, but runs
 # BEFORE the push completes. On a direct-to-main workflow CI only catches a
@@ -21,17 +33,92 @@
 
 set -uo pipefail
 
-[[ -n "${IBEX_SKIP_FUSION_CHECK:-}" ]] && exit 0
-
 ROOT="$(git rev-parse --show-toplevel)"
 ZERO="0000000000000000000000000000000000000000"
 
-# Run only when a commit being pushed touches code that could affect fusion.
 # Pre-push feeds "<local_ref> <local_oid> <remote_ref> <remote_oid>" on stdin.
+# Both checks read it, so take it once.
+push_lines="$(cat)"
+
+# --- include check -----------------------------------------------------------
+
+# The pushed src/*.cpp files. A new remote ref has no remote side to diff
+# against, so diff from where it left origin/main.
+tidy_changed_files() {
+    local _local_ref local_oid _remote_ref remote_oid base
+    while read -r _local_ref local_oid _remote_ref remote_oid; do
+        [[ -z "${local_oid:-}" || "$local_oid" == "$ZERO" ]] && continue
+        base="$remote_oid"
+        if [[ "$base" == "$ZERO" ]]; then
+            base="$(git merge-base origin/main "$local_oid" 2>/dev/null)" || continue
+        fi
+        git diff --name-only --diff-filter=ACMR "$base" "$local_oid" -- 'src/*.cpp' 2>/dev/null
+    done <<<"$push_lines" | sort -u
+}
+
+tidy_check() {
+    local build="$ROOT/build"
+    local files=()
+    local f
+    while IFS= read -r f; do
+        [[ -n "$f" && -f "$ROOT/$f" ]] && files+=("$ROOT/$f")
+    done < <(tidy_changed_files)
+    [[ "${#files[@]}" -eq 0 ]] && return 0
+
+    if [[ ! -f "$build/compile_commands.json" ]]; then
+        echo "[tidy] build/compile_commands.json missing — skipping the include check." >&2
+        echo "[tidy]   Configure build/ so it can run; CI's clang-tidy job still checks." >&2
+        return 0
+    fi
+    local tidy=""
+    for candidate in clang-tidy-20 clang-tidy-19 clang-tidy-18 clang-tidy; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            tidy="$candidate"
+            break
+        fi
+    done
+    if [[ -z "$tidy" ]]; then
+        echo "[tidy] clang-tidy not found — skipping the include check." >&2
+        return 0
+    fi
+
+    echo "[tidy] checking includes in ${#files[@]} file(s)…" >&2
+    # Same invocation as CI, narrowed to the one check; its options
+    # (IgnoreHeaders) still come from .clang-tidy.
+    local out
+    out="$(printf '%s\0' "${files[@]}" |
+        xargs -0 -P 6 -n1 "$tidy" -p "$build" --quiet --checks='-*,misc-include-cleaner' \
+            --warnings-as-errors='*' --header-filter='^.*/include/ibex/.*\.hpp$' 2>&1)"
+    local status=$?
+    if [[ "$status" -eq 0 ]]; then
+        return 0
+    fi
+    local errors
+    errors="$(grep -E 'error:' <<<"$out" | sed "s|$ROOT/||" | sort -u)"
+    echo "$errors" >&2
+    echo >&2
+    echo "[tidy] PUSH BLOCKED: CI's clang-tidy job would fail on the includes above." >&2
+    echo "[tidy] Fix them with:" >&2
+    echo "[tidy]   scripts/tidy-fix.sh $(cut -d: -f1 <<<"$errors" | sort -u | tr '\n' ' ')" >&2
+    echo "[tidy] or bypass once with:" >&2
+    echo "[tidy]   IBEX_SKIP_TIDY_CHECK=1 git push" >&2
+    return 1
+}
+
+if [[ -z "${IBEX_SKIP_TIDY_CHECK:-}" ]]; then
+    tidy_check || exit 1
+fi
+
+# --- fusion-invariant gate ---------------------------------------------------
+
+[[ -n "${IBEX_SKIP_FUSION_CHECK:-}" ]] && exit 0
+
+# Run only when a commit being pushed touches code that could affect fusion.
 RELEVANT_RE='^(src/runtime/|src/codegen/|src/ir/|include/ibex/|tools/ibex_fusion_bench)'
 relevant=0
 saw_line=0
 while read -r _local_ref local_oid _remote_ref remote_oid; do
+    [[ -z "${local_oid:-}" ]] && continue
     saw_line=1
     [[ "$local_oid" == "$ZERO" ]] && continue # branch deletion: nothing to check
     if [[ "$remote_oid" == "$ZERO" ]]; then
@@ -43,7 +130,7 @@ while read -r _local_ref local_oid _remote_ref remote_oid; do
     else
         relevant=1 # couldn't compute the range; fail safe toward running
     fi
-done
+done <<<"$push_lines"
 
 # No stdin (e.g. invoked by hand) → run anyway.
 [[ "$saw_line" -eq 0 ]] && relevant=1

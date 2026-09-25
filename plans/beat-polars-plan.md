@@ -1,7 +1,9 @@
 # Beating Polars multi-core
 
-Status: **ongoing umbrella plan. Rebaselined 2026-09-23; re-measured
-2026-09-24 on the dev box and on 16 physical cores on AWS (W0).** It sets the
+Status: **ongoing umbrella plan. Rebaselined 2026-09-25 on polars-benchmark's
+own data (§1.0); every earlier number in this plan was measured on
+Ibex-written Parquet.** Re-measured 2026-09-24 on the dev box and on 16
+physical cores on AWS (W0), both on Ibex-written data. It sets the
 target,
 says where the gap is, and ranks the workstreams. Mechanism lives in the plans
 it points to: `kernel-pipeline-execution-plan.md`,
@@ -27,9 +29,118 @@ WSL2 held Polars to 4.7× at 8 cores, where physical cores give it 7.4×. Do
 not use the dev box for cross-engine claims at any core count above about 4.
 It stays useful for A/B work on Ibex alone.
 
-## 1. Baseline (W0, measured 2026-09-24)
+## 1. Baseline
 
-### 1a. Physical cores, AWS (the baseline)
+**Data provenance.** Until 2026-09-25 both engines read Parquet that Ibex wrote
+itself (`gen_data.sh` + the since-deleted `gen_parquet.sh`): 1,048,576-row row
+groups, uncompressed, Ibex's dictionary encoding with page encoding stats, and
+`l_quantity` as Float64. **§1a, §1b, §1c, §2, §3 and §7 are all on that data**,
+and so is every per-query figure elsewhere in this plan dated before
+2026-09-25. From f69f26d4 on, `run_bench.sh` reads the tables polars-benchmark
+generates itself (`make data-tables SCALE_FACTOR=<sf>.0`: tpchgen-cli 2.0.2,
+then Polars 1.41.2's parquet writer): 122,880-row row groups, ZSTD, no page
+encoding stats, `l_quantity` Int64 (memory: `project_pdsh_polars_data`). Do
+not compare a number from before that line with one after it.
+
+### 1.0 Dev box on polars-benchmark data (2026-09-25): the current baseline
+
+PDS-H **SF-8**, dev box (i7-13700 under WSL2), commit `f69f26d4` (clean),
+`run_bench.sh --sf 8 --cores N --polars-streaming --no-polars-in-memory
+--no-duckdb` for N = 2, 4, 8, both engines `taskset` to cores `0..N-1`, min of
+5 after 1 warm-up, same sitting. 1c is the per-query median of the three
+runs' 1-core rows. Runs `20260925T0{70027,71232,72330}Z_f69f26d4_sf8`. All 22
+answers matched Polars at every core count. The dev-box caveat from the intro
+still applies above about 4 cores; the AWS re-run is pending.
+
+| cores | Ibex ms | Polars ms | Ibex/Polars | geomean | Ibex scaling | Polars scaling | Ibex fraction | Polars fraction |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 36,393 | 43,972 | **0.83** | 0.87 | | | | |
+| 2 | 20,518 | 23,176 | **0.89** | 0.92 | 1.77× | 1.90× | 87.2% | 94.6% |
+| 4 | 14,699 | 13,071 | **1.12** | 1.10 | 2.48× | 3.36× | 79.5% | 93.7% |
+| 8 | 11,435 | 8,035 | **1.42** | 1.26 | 3.18× | 5.47× | 78.4% | 93.4% |
+
+Without q21:
+
+| cores | Ibex ms | Polars ms | Ibex/Polars | geomean | Ibex scaling | Polars scaling | Ibex fraction | Polars fraction |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 32,310 | 35,673 | **0.91** | 0.89 | | | | |
+| 2 | 19,171 | 18,759 | **1.02** | 0.97 | 1.69× | 1.90× | 81.3% | 94.8% |
+| 4 | 13,759 | 10,638 | **1.29** | 1.16 | 2.35× | 3.35× | 76.6% | 93.6% |
+| 8 | 10,687 | 6,519 | **1.64** | 1.32 | 3.02× | 5.47× | 76.5% | 93.4% |
+
+Against the same box on Ibex-written data (§1b, `2f57078d`, recomputed over its
+2/4/8-core runs): 8c total 0.92 → **1.42**, geomean 1.05 → **1.26**; 1c total
+0.62 → **0.83**. Both engines got slower in absolute terms (1c: Ibex 15.7 s →
+36.4 s, Polars 25.1 s → 44.0 s), so the data is heavier for everyone, and
+heavier for Ibex. The move is a mix of the data and the commits since
+`2f57078d` (q18 prefilter, parquet reader fixes, `l_quantity` Int64); HEAD
+cannot run on the old files (their `l_quantity` is Float64), so the split
+below comes from targeted A/Bs, not from one clean diff.
+
+**Why it moved (8c, interleaved A/Bs on rewritten copies of lineitem, same
+sitting):**
+
+1. **q18: the Int64 `l_quantity` switched off its fast path. It alone is about
+   half the regression.** 8c 378 → 2,283 ms, ratio 0.80 → 4.31. On an identical
+   layout, the same query is 1,746 ms with `l_quantity: Int64` and 364 ms with
+   Float64 (4.8×); no other query that reads `l_quantity` moves (q01, q06, q09,
+   q17, q19, q20: 0.88–0.99). Cause: `try_async_hot_int_sum`
+   (`src/runtime/aggregate_chunked.cpp`) requires a Double sum, so q18 falls
+   back to three barriers per chunk; with 391 row groups that is 1,556
+   barriers at 9% occupancy. With q18 at its Float64 speed the 8c total would
+   be about 1.19, not 1.42 (estimate).
+2. **ZSTD roughly doubles the scan-bound queries, for both engines.**
+   Uncompressed against ZSTD at the same 122,880-row groups: q06 119 vs 225,
+   q14 140 vs 296, q19 595 vs 761, q12 310 vs 346. Polars pays the same kind of
+   bill (q14 1c +460%, q15 +428%, q06 +370%), which is why q06/q14/q15's ratios
+   *improved* (q14 1.95 → 1.29, q15 1.69 → 1.20).
+3. **String columns are no longer categorical.** Polars writes no page encoding
+   stats, so since 5649376d the reader cannot prove a column is fully
+   dictionary-encoded and decodes it as plain strings. The queries that group or
+   filter on low-cardinality strings lost the most and do not react to layout:
+   q01 (flags, 1.44 → 2.82), q16 (brand/type/size, 1.67 → 3.90), q12 (shipmode,
+   0.74 → 1.55), q19 (container/shipmode, 1.56 → 2.49), q10 (1.74 → 2.19). This
+   is inferred from that pattern, not yet A/B'd.
+4. **Smaller row groups did not help.** At 8c, 1M-row groups against 122,880
+   (both ZSTD): q18 1,913 vs 2,630 (the barrier-per-chunk path above), q15 193
+   vs 254, everything else within noise. The expected parallel-width gain does
+   not show at 8 cores on this box.
+
+Per query at 8 cores, sorted by the new ratio (ms, min of 5):
+
+| query | ibex 8c old | ibex 8c new | polars 8c old | polars 8c new | ratio old | ratio new | main cause |
+|---|---:|---:|---:|---:|---:|---:|---|
+| q18 | 378 | 2,283 | 471 | 529 | 0.80 | **4.31** | Int64 sum gate |
+| q16 | 126 | 365 | 76 | 94 | 1.67 | **3.90** | strings not categorical |
+| q01 | 612 | 1,768 | 427 | 626 | 1.44 | **2.82** | strings not categorical |
+| q19 | 163 | 698 | 105 | 280 | 1.56 | **2.49** | ZSTD + strings |
+| q10 | 429 | 835 | 246 | 382 | 1.74 | **2.19** | strings |
+| q12 | 136 | 329 | 185 | 212 | 0.74 | **1.55** | strings not categorical |
+| q14 | 93 | 280 | 48 | 218 | 1.95 | **1.29** | ZSTD (both engines) |
+| q06 | 68 | 195 | 74 | 158 | 0.92 | **1.24** | ZSTD (both engines) |
+| q15 | 79 | 240 | 47 | 200 | 1.69 | **1.20** | ZSTD (both engines) |
+| q17 | 99 | 257 | 115 | 219 | 0.86 | **1.17** | |
+| q03 | 227 | 388 | 155 | 347 | 1.46 | **1.12** | |
+| q07 | 247 | 415 | 174 | 383 | 1.42 | **1.08** | |
+| q05 | 211 | 420 | 189 | 391 | 1.12 | **1.08** | |
+| q08 | 193 | 493 | 191 | 466 | 1.01 | **1.06** | |
+| q13 | 329 | 348 | 288 | 356 | 1.14 | **0.98** | |
+| q22 | 56 | 94 | 80 | 100 | 0.69 | **0.94** | |
+| q09 | 401 | 699 | 502 | 780 | 0.80 | **0.90** | |
+| q02 | 40 | 49 | 39 | 63 | 1.02 | **0.79** | |
+| q04 | 191 | 209 | 232 | 266 | 0.82 | **0.79** | |
+| q20 | 164 | 269 | 236 | 377 | 0.70 | **0.71** | |
+| q11 | 38 | 53 | 53 | 74 | 0.72 | **0.71** | |
+| q21 | 581 | 747 | 1,357 | 1,515 | 0.43 | **0.49** | |
+
+**What it changes in the workstreams.** Two levers now come before the
+scaling work, because they are single-core losses the old data hid: extend the
+async hot aggregate to Int64 sums (q18), and recover categorical columns from
+files without encoding stats (own page-header check plus dictionary decode;
+q01/q16/q12/q19/q10). ZSTD decode cost is shared with Polars and is not a gap
+by itself.
+
+### 1a. Physical cores, AWS (Ibex-written data, 2026-09-24)
 
 PDS-H **SF-8** on one `r7i.8xlarge` with SMT disabled (`--threads-per-core 1`):
 16 physical Sapphire Rapids cores (Xeon Platinum 8488C), 256 GiB, commit
@@ -118,7 +229,7 @@ the small queries, as the dev-box breaker map said. **Per-core losses** are
 unchanged: q06 1.69, q15 1.39, q14 1.16, q19 1.12, q16 1.02. **Ibex still wins
 at 16 cores** on q06, q18, q22, q12, q17 and q21. q06 and q18 scale about 10×.
 
-### 1c. AWS re-run after the loser work (`ac8f5648` against `461c0963`, 8 and 16 cores)
+### 1c. AWS re-run after the loser work (`ac8f5648` against `461c0963`, 8 and 16 cores; Ibex-written data)
 
 Same box type, a new sitting. Artifact
 `benchmarking/results/tpch_aws_20260924T172419.tar.gz`. **Read ratios, not
@@ -151,7 +262,7 @@ sensitivity: one random hash insert per group. W5 now removes that map for
 clustered keys. The TSVs keep only summary statistics; keep raw iterations
 before chasing a bimodal query on AWS again.
 
-### 1b. Dev box sweep (i7-13700 under WSL2): superseded as a cross-engine baseline
+### 1b. Dev box sweep (i7-13700 under WSL2, Ibex-written data): superseded as a cross-engine baseline
 
 Kept for the record and for single-engine work. Its cross-engine ratios above
 about 4 cores are box artefacts (see the intro): Polars scales 4.70× at 8
@@ -709,8 +820,9 @@ profile before starting.
   Polars in the same sitting. For changes that add threads or spinning, use
   `perf stat` elapsed time plus standalone min-wall, not `ab_queries`. Measure
   allocation-shaped changes cold as well as warm.
-- **Pin explicit `parquet_sf<N>` paths.** The `benchmarking/data/tpch/parquet`
-  symlink flips per scale factor (memory: `project_tpch_sf_symlink`).
+- **Check the dataset line.** The `benchmarking/data/tpch/parquet` symlink
+  points at `~/polars-benchmark/data/tables/scale-<sf>.0` and flips per scale
+  factor; every harness prints `# dataset:` (memory: `project_tpch_sf_symlink`).
 - **`self_ms` is not serial time.** Confirm any target sized from the operator
   table with phase timers before building. Both breaker-map items diagnosed
   from reading code alone were wrong.

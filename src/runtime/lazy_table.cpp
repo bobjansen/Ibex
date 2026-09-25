@@ -1485,78 +1485,96 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
         (staged.empty() || stageable_conjunct_columns(staged).has_value())) {
         // The scan decodes every passing key to test it; asking for those
         // values spares a second decode of the key column for the same rows
-        // (q17 re-read l_partkey, 40% of its compressed bytes). Only when
-        // nothing narrows the scan's rows afterwards: a conjunct usually
-        // drops most of them (q03 keeps 1 in 20), and collecting values for
-        // rows that are then thrown away costs more than decoding the few
-        // survivors' keys again.
-        const bool want_keys = conjuncts.empty();
+        // (q17 re-read l_partkey, 40% of its compressed bytes). Asked even
+        // when a conjunct narrows the rows afterwards: the survivors' keys are
+        // picked out of the scan's in memory, and that beat decoding them
+        // again even on q03, whose conjunct keeps 1 in 20 key-scan rows (a
+        // gate on "no conjunct follows" left q03/q07/q10/q21 2-7% slower).
         std::vector<std::int64_t> scanned_keys;
-        auto scan =
-            scan_key_filter(key_name, dynamic, nullptr, exec, want_keys ? &scanned_keys : nullptr);
+        auto scan = scan_key_filter(key_name, dynamic, nullptr, exec, &scanned_keys);
         if (!scan) {
             return std::unexpected(scan.error());
         }
         const bool have_keys = scan->has_value() && !scanned_keys.empty();
-        bool dictionary_ok = true;
-        std::optional<Selection> key_selection;
-        if (scan->has_value()) {
-            key_selection = std::move(**scan);
+        // The key scan's own rows stay whole: `scanned_keys` is indexed by
+        // them, and each narrowing step below builds a new selection anyway.
+        Selection scan_rows;
+        std::optional<Selection> narrowed_rows;
+        bool fused = scan->has_value();
+        if (fused) {
+            scan_rows = std::move(**scan);
             if (!dictionary_conjuncts.empty()) {
                 // The key scan's answer is the candidate list: the dictionary
                 // test only looks at those rows, and its answer is the
                 // intersection already.
                 auto dict =
-                    scan_dictionary_filters(dictionary_conjuncts, &*key_selection, scalars, exec);
+                    scan_dictionary_filters(dictionary_conjuncts, &scan_rows, scalars, exec);
                 if (!dict) {
                     return std::unexpected(dict.error());
                 }
                 if (dict->has_value()) {
-                    key_selection = std::move(**dict);
+                    narrowed_rows = std::move(**dict);
                 } else {
-                    dictionary_ok = false;  // no fused answer: the old path below
+                    fused = false;  // no fused answer: the old path below
                 }
             }
         }
-        if (key_selection.has_value() && dictionary_ok) {
-            Selection selected = std::move(*key_selection);
-            bool narrowed = true;
-            if (!staged.empty()) {
-                auto rest = narrow_selection(selected, staged, exec, scalars);
-                if (!rest) {
-                    return std::unexpected(rest.error());
+        if (fused && !staged.empty()) {
+            auto rest = narrow_selection(narrowed_rows.has_value() ? *narrowed_rows : scan_rows,
+                                         staged, exec, scalars);
+            if (!rest) {
+                return std::unexpected(rest.error());
+            }
+            if (rest->has_value()) {
+                narrowed_rows = std::move(**rest);
+            } else {
+                fused = false;  // conjuncts not evaluable here
+            }
+        }
+        if (fused) {
+            JoinKeySelection out;
+            if (have_keys) {
+                if (scanned_keys.size() != scan_rows.size()) {
+                    return std::unexpected(
+                        "lazy source produced a key value count that differs from its rows");
                 }
-                if (rest->has_value()) {
-                    selected = std::move(**rest);
-                } else {
-                    narrowed = false;  // conjuncts not evaluable here
+                if (narrowed_rows.has_value()) {
+                    // Keep the survivors' keys: both lists ascend, and every
+                    // survivor is one of the scan's rows.
+                    std::vector<std::int64_t> kept;
+                    kept.reserve(narrowed_rows->size());
+                    std::size_t j = 0;
+                    for (const std::size_t row : *narrowed_rows) {
+                        while (j < scan_rows.size() && scan_rows[j] != row) {
+                            ++j;
+                        }
+                        if (j == scan_rows.size()) {
+                            return std::unexpected(
+                                "lazy source narrowed to a row its key scan did not pass");
+                        }
+                        kept.push_back(scanned_keys[j++]);
+                    }
+                    scanned_keys = std::move(kept);
                 }
             }
-            if (narrowed) {
-                JoinKeySelection out;
-                out.selected = std::move(selected);
-                if (have_keys) {
-                    if (scanned_keys.size() != out.selected.size()) {
-                        return std::unexpected(
-                            "lazy source produced a key value count that differs from its rows");
-                    }
-                    out.keys.name = key_name;
-                    out.keys.column = std::make_shared<ColumnValue>(
-                        Column<std::int64_t>{std::move(scanned_keys)});
-                    return std::optional{std::move(out)};
-                }
-                auto keys = project_rows({key_name}, out.selected, exec);
-                if (!keys) {
-                    return std::unexpected(keys.error());
-                }
-                const auto* entry = keys->find_entry(key_name);
-                if (entry == nullptr ||
-                    !std::holds_alternative<Column<std::int64_t>>(*entry->column)) {
-                    return std::optional<JoinKeySelection>{};
-                }
-                out.keys = *entry;
+            out.selected =
+                narrowed_rows.has_value() ? std::move(*narrowed_rows) : std::move(scan_rows);
+            if (have_keys) {
+                out.keys.name = key_name;
+                out.keys.column =
+                    std::make_shared<ColumnValue>(Column<std::int64_t>{std::move(scanned_keys)});
                 return std::optional{std::move(out)};
             }
+            auto keys = project_rows({key_name}, out.selected, exec);
+            if (!keys) {
+                return std::unexpected(keys.error());
+            }
+            const auto* entry = keys->find_entry(key_name);
+            if (entry == nullptr || !std::holds_alternative<Column<std::int64_t>>(*entry->column)) {
+                return std::optional<JoinKeySelection>{};
+            }
+            out.keys = *entry;
+            return std::optional{std::move(out)};
         }
         // No fused answer (unsupported key type, or the filter stopped
         // rejecting and the scan abandoned): the whole-column path stands.

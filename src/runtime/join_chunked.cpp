@@ -34,6 +34,7 @@
 // Background: plans/kernel-pipeline-execution-plan.md.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/compiler.hpp>
 #include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/format.hpp>

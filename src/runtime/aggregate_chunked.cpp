@@ -45,6 +45,7 @@
 #include <variant>
 #include <vector>
 
+#include "aggregate_prefilter.hpp"
 #include "physical_plan.hpp"
 
 #if defined(__AVX2__) || defined(__BMI2__)

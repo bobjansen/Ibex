@@ -10,6 +10,7 @@
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -516,17 +517,22 @@ namespace {
 /// name, its dictionary values as plain strings, and optionally a trailing null.
 auto dictionary_table(const std::string& column, std::span<const std::string_view> values,
                       bool trailing_null) -> Table {
-    std::vector<std::string> strings(values.begin(), values.end());
+    const std::size_t rows = values.size() + (trailing_null ? 1 : 0);
+    Column<std::string> strings;
+    strings.reserve(rows);
+    for (const std::string_view value : values) {
+        strings.push_back(value);
+    }
     if (trailing_null) {
-        strings.emplace_back();
+        strings.push_back(std::string_view{});
     }
     Table table;
     if (trailing_null) {
-        ValidityBitmap validity(strings.size(), true);
-        validity.set(strings.size() - 1, false);
-        table.add_column(column, Column<std::string>{std::move(strings)}, std::move(validity));
+        ValidityBitmap validity(rows, true);
+        validity.set(rows - 1, false);
+        table.add_column(column, std::move(strings), std::move(validity));
     } else {
-        table.add_column(column, Column<std::string>{std::move(strings)});
+        table.add_column(column, std::move(strings));
     }
     return table;
 }
@@ -550,7 +556,7 @@ void LazyTable::split_dictionary_conjuncts(const std::vector<ir::Expr>& conjunct
             // ordinary path reports it (so decline here, don't swallow it), and
             // rows that are null in the file are dropped by the scan, which is
             // only right when the predicate is not TRUE on null.
-            const std::string_view probe_values[] = {std::string_view{}};
+            const std::array<std::string_view, 1> probe_values{};
             const auto probe = filter_selection(dictionary_table(*refs.begin(), probe_values, true),
                                                 {conjunct}, serial, scalars);
             fusable = probe.has_value() &&

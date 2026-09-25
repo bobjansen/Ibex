@@ -216,7 +216,10 @@ archive_run() {
     return 0
 }
 
-# Point the path the queries read at this scale's data.
+# Point the path the queries read at this scale's data. The directory is
+# untracked and nothing else creates it any more (gen_data.sh used to, as a
+# side effect), so a clean checkout -- every AWS box -- does not have it.
+mkdir -p "$DATA_ROOT"
 ln -sfn "$PARQUET_DIR" "$DATA_ROOT/parquet"
 echo "=== scale factor: SF-${SCALE} (parquet -> ${PARQUET_DIR}) ==="
 

@@ -845,6 +845,7 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
         # itself, hence the taskset. The queries read the `parquet` symlink,
         # which run_bench.sh would normally have pointed at this scale.
         if [[ "${IBEX_TPCH_PROFILE:-0}" == "1" ]]; then
+            mkdir -p /ibex/benchmarking/data/tpch  # untracked: absent on a fresh clone
             ln -sfn "$PDSH_ROOT/data/tables/scale-${pdsh_scale}" /ibex/benchmarking/data/tpch/parquet
             PROFILE_OUT=/ibex/benchmarking/tpch/results/profile
             mkdir -p "$PROFILE_OUT"

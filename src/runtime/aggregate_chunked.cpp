@@ -520,8 +520,8 @@ class HashAggregateState final {
         const auto one = [&](std::size_t p) {
             auto& partition = partitions[p];
             const std::size_t groups = partition.keys.size();
-            const auto keep = prefilter->survivors(partition.slots.data(), groups, n_aggs_,
-                                                   nullptr, 1);
+            const auto keep =
+                prefilter->survivors(partition.slots.data(), groups, n_aggs_, nullptr, 1);
             if (keep.size() == groups) {
                 return;
             }
@@ -570,9 +570,9 @@ class HashAggregateState final {
         const bool fan = exec_ != nullptr && !on_worker_pool_thread() &&
                          par_.final_ordering.decline == physical::FanOutDecline::None &&
                          par_.final_ordering.worker_cap >= 2;
-        const auto keep = prefilter->survivors(
-            flat_slots_.data(), n_groups_, n_aggs_, fan ? &process_worker_pool() : nullptr,
-            fan ? par_.final_ordering.worker_cap : 1);
+        const auto keep = prefilter->survivors(flat_slots_.data(), n_groups_, n_aggs_,
+                                               fan ? &process_worker_pool() : nullptr,
+                                               fan ? par_.final_ordering.worker_cap : 1);
         if (keep.size() * 4 > n_groups_) {
             return;
         }
@@ -5867,11 +5867,10 @@ auto make_hash_aggregate_operator(OperatorPtr child, const std::vector<ir::Colum
                                   const std::vector<ir::AggSpec>* aggregations,
                                   const ExecutionContext& exec, physical::AggregateParallelism par,
                                   std::optional<physical::AggregateColumnMapping> columns,
-                                  AggregatePrefilter prefilter)
-    -> OperatorPtr {
-    return std::make_unique<DecimalAwareAggregateOperator>(
-        std::move(child), group_by, aggregations, exec, par, std::move(columns),
-        std::move(prefilter));
+                                  AggregatePrefilter prefilter) -> OperatorPtr {
+    return std::make_unique<DecimalAwareAggregateOperator>(std::move(child), group_by, aggregations,
+                                                           exec, par, std::move(columns),
+                                                           std::move(prefilter));
 }
 
 /// Streaming aggregate for input already sorted on the group-by keys.
@@ -5963,11 +5962,10 @@ class ChunkedSortedAggregateOperator final : public Operator {
             // columns from the input's types, so hand it the empty chunk and let
             // it produce a properly-shaped empty result.
             if (schema_only.has_value()) {
-                fallback_ =
-                    make_hash_aggregate_operator(std::make_unique<PrependChunkOperator>(
-                                                     std::move(*schema_only), std::move(child_)),
-                                                 group_by_, aggregations_, *exec_, par_, columns_,
-                                                 prefilter_);
+                fallback_ = make_hash_aggregate_operator(
+                    std::make_unique<PrependChunkOperator>(std::move(*schema_only),
+                                                           std::move(child_)),
+                    group_by_, aggregations_, *exec_, par_, columns_, prefilter_);
                 return {};
             }
             done_ = true;
@@ -6550,9 +6548,9 @@ auto make_chunked_aggregate_operator(OperatorPtr child, const std::vector<ir::Co
                                      physical::AggregateParallelism parallelism,
                                      std::optional<physical::AggregateColumnMapping> columns,
                                      AggregatePrefilter prefilter) -> OperatorPtr {
-    return std::make_unique<ChunkedSortedAggregateOperator>(std::move(child), group_by,
-                                                            aggregations, exec, parallelism,
-                                                            std::move(columns), std::move(prefilter));
+    return std::make_unique<ChunkedSortedAggregateOperator>(
+        std::move(child), group_by, aggregations, exec, parallelism, std::move(columns),
+        std::move(prefilter));
 }
 
 }  // namespace ibex::runtime

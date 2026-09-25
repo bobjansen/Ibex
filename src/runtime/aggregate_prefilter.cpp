@@ -108,7 +108,8 @@ auto aggregate_prefilter_terms(const ir::Expr& predicate, const ir::AggregateNod
             continue;
         }
         const bool is_output = std::ranges::any_of(
-            aggregate.aggregations(), [&](const ir::AggSpec& spec) { return spec.alias == column->name; });
+            aggregate.aggregations(),
+            [&](const ir::AggSpec& spec) { return spec.alias == column->name; });
         // A group-by key with the same name as an aggregate cannot happen (the
         // output would have two columns of that name), but a key alone is not
         // an aggregate output, so it is not read from the slots.
@@ -131,8 +132,7 @@ auto aggregate_prefilter_for_source(const physical::Plan& plan) -> AggregatePref
     // means.
     const MapStep& step = plan.steps.back();
     if (step.node == nullptr || step.node->kind() != ir::NodeKind::Filter ||
-        step.node->children().empty() ||
-        step.node->children().front().get() != plan.source_node) {
+        step.node->children().empty() || step.node->children().front().get() != plan.source_node) {
         return {};
     }
     const auto& filter = ir::node_cast<ir::FilterNode>(*step.node);
@@ -210,11 +210,10 @@ auto GroupPrefilter::may_pass(const AggSlotCore* slots) const noexcept -> bool {
         switch (term.read) {
             case Read::Count: {
                 const std::int64_t value = slot.count;
-                if (term.literal_is_int ? !holds(term.op, value, term.int_literal)
-                                        : (std::fabs(static_cast<double>(value)) <
-                                               kExactDoubleLimit &&
-                                           !holds(term.op, static_cast<double>(value),
-                                                  term.real_literal))) {
+                if (term.literal_is_int
+                        ? !holds(term.op, value, term.int_literal)
+                        : (std::fabs(static_cast<double>(value)) < kExactDoubleLimit &&
+                           !holds(term.op, static_cast<double>(value), term.real_literal))) {
                     return false;
                 }
                 break;
@@ -225,11 +224,10 @@ auto GroupPrefilter::may_pass(const AggSlotCore* slots) const noexcept -> bool {
                     break;
                 }
                 const std::int64_t value = slot.int_value;
-                if (term.literal_is_int ? !holds(term.op, value, term.int_literal)
-                                        : (std::fabs(static_cast<double>(value)) <
-                                               kExactDoubleLimit &&
-                                           !holds(term.op, static_cast<double>(value),
-                                                  term.real_literal))) {
+                if (term.literal_is_int
+                        ? !holds(term.op, value, term.int_literal)
+                        : (std::fabs(static_cast<double>(value)) < kExactDoubleLimit &&
+                           !holds(term.op, static_cast<double>(value), term.real_literal))) {
                     return false;
                 }
                 break;
@@ -246,8 +244,8 @@ auto GroupPrefilter::may_pass(const AggSlotCore* slots) const noexcept -> bool {
                 if (std::isnan(value)) {
                     break;
                 }
-                const double literal = term.literal_is_int ? static_cast<double>(term.int_literal)
-                                                           : term.real_literal;
+                const double literal =
+                    term.literal_is_int ? static_cast<double>(term.int_literal) : term.real_literal;
                 if (!holds(term.op, value, literal)) {
                     return false;
                 }

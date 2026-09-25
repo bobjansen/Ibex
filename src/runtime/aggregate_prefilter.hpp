@@ -55,8 +55,7 @@ using AggregatePrefilter = std::vector<AggregatePrefilterTerm>;
 
 /// The terms for a map pipeline whose source is an aggregate and whose first
 /// step over it is a filter (fused or not). Empty otherwise.
-[[nodiscard]] auto aggregate_prefilter_for_source(const physical::Plan& plan)
-    -> AggregatePrefilter;
+[[nodiscard]] auto aggregate_prefilter_for_source(const physical::Plan& plan) -> AggregatePrefilter;
 
 /// The terms resolved against one aggregate's slot layout.
 class GroupPrefilter {

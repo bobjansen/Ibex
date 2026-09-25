@@ -178,8 +178,8 @@ auto contexts() -> std::vector<std::pair<std::string, runtime::ExecutionContext>
 /// precisely the groups that pass.
 void check_prefilter(const runtime::TableRegistry& registry, const std::string& select,
                      const std::string& by, const std::string& predicate, bool exact) {
-    const std::string query = "t[select { " + select + " }, by { " + by + " }][filter " +
-                              predicate + "];";
+    const std::string query =
+        "t[select { " + select + " }, by { " + by + " }][filter " + predicate + "];";
     INFO(query);
     const auto ir = lower_query(query);
     const auto* filter = find_filter_over_aggregate(*ir);
@@ -215,8 +215,8 @@ void check_prefilter(const runtime::TableRegistry& registry, const std::string& 
 TEST_CASE("aggregate prefilter: terms are the filter's aggregate-vs-literal conjuncts",
           "[aggregate][prefilter]") {
     const auto terms_of = [](const std::string& predicate) {
-        const auto ir = lower_query(
-            "t[select { s = sum(v), n = count() }, by { k }][filter " + predicate + "];");
+        const auto ir = lower_query("t[select { s = sum(v), n = count() }, by { k }][filter " +
+                                    predicate + "];");
         const auto* filter = find_filter_over_aggregate(*ir);
         REQUIRE(filter != nullptr);
         return runtime::aggregate_prefilter_terms(
@@ -325,19 +325,18 @@ TEST_CASE("aggregate prefilter: a group fails only when a term is definitely fal
     CHECK_FALSE(passes(one("lo", ir::CompareOp::Ne, 1.0)));
 
     // A text max, an unknown name and a non-finite literal are not terms.
-    CHECK_FALSE(
-        runtime::GroupPrefilter::resolve({{.output = "txt", .op = ir::CompareOp::Gt, .literal = 1.0}},
-                                         aggs, kinds)
-            .has_value());
+    CHECK_FALSE(runtime::GroupPrefilter::resolve(
+                    {{.output = "txt", .op = ir::CompareOp::Gt, .literal = 1.0}}, aggs, kinds)
+                    .has_value());
     CHECK_FALSE(runtime::GroupPrefilter::resolve(
                     {{.output = "nope", .op = ir::CompareOp::Gt, .literal = 1.0}}, aggs, kinds)
                     .has_value());
-    CHECK_FALSE(runtime::GroupPrefilter::resolve(
-                    {{.output = "sd",
-                      .op = ir::CompareOp::Gt,
-                      .literal = std::numeric_limits<double>::infinity()}},
-                    aggs, kinds)
-                    .has_value());
+    CHECK_FALSE(
+        runtime::GroupPrefilter::resolve({{.output = "sd",
+                                           .op = ir::CompareOp::Gt,
+                                           .literal = std::numeric_limits<double>::infinity()}},
+                                         aggs, kinds)
+            .has_value());
 }
 
 TEST_CASE("aggregate prefilter: every key representation keeps exactly what the filter keeps",
@@ -381,7 +380,8 @@ TEST_CASE("aggregate prefilter: whole queries answer as the aggregate then the f
     // Also an ungrouped aggregate, which always emits one row and is never
     // prefiltered.
     const auto registry = make_registry(/*null_values=*/true);
-    for (const auto& [aggregate, predicate, tail] : std::vector<std::tuple<std::string, std::string, std::string>>{
+    for (const auto& [aggregate, predicate, tail] :
+         std::vector<std::tuple<std::string, std::string, std::string>>{
              {"t[select { s = sum(v), n = count() }, by { k }]", "s > 2700.0 && n > 5", ""},
              {"t[select { s = sum(v) }, by { k }]", "s > 2700.0", "[select { k }]"},
              {"t[select { s = sum(v) }, by { ks }]", "s < 60.0", "[select { ks }]"},
@@ -408,24 +408,22 @@ TEST_CASE("aggregate prefilter: whole queries answer as the aggregate then the f
                 // executor built it with the prefilter, on this path too.
                 if (aggregate.find("by {") != std::string::npos) {
                     const auto rows = profile->snapshot();
-                    const auto row = std::ranges::find_if(rows, [](const auto& r) {
-                        return r.label.starts_with("aggregate");
-                    });
+                    const auto row = std::ranges::find_if(
+                        rows, [](const auto& r) { return r.label.starts_with("aggregate"); });
                     REQUIRE(row != rows.end());
                     CHECK(row->rows < 50'000);
                 }
                 exec.execution_profile = nullptr;
                 // The reference: the aggregate materialized on its own, then
                 // the filter and the tail over the table.
-                auto grouped =
-                    runtime::interpret(*lower_query(aggregate + ";"), registry, nullptr, nullptr,
-                                       nullptr, exec);
+                auto grouped = runtime::interpret(*lower_query(aggregate + ";"), registry, nullptr,
+                                                  nullptr, nullptr, exec);
                 REQUIRE(grouped.has_value());
                 runtime::TableRegistry staged;
                 staged.emplace("a", std::move(grouped.value()));
-                const auto expected = runtime::interpret(
-                    *lower_query("a[filter " + predicate + "]" + tail + ";"), staged, nullptr,
-                    nullptr, nullptr, exec);
+                const auto expected =
+                    runtime::interpret(*lower_query("a[filter " + predicate + "]" + tail + ";"),
+                                       staged, nullptr, nullptr, nullptr, exec);
                 REQUIRE(expected.has_value());
                 require_same(*expected, *whole);
             }

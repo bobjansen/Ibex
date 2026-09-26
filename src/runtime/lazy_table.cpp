@@ -10,6 +10,8 @@
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -19,7 +21,9 @@
 #include <optional>
 #include <robin_hood.h>
 #include <set>
+#include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -91,7 +95,8 @@ auto LazyTable::scan_units() -> std::vector<SourceUnit> {
 }
 
 auto LazyTable::scan_key_filter(const std::string& key, const DynamicScanFilter& filter,
-                                const SourceUnit* unit, const ExecutionContext& exec)
+                                const SourceUnit* unit, const ExecutionContext& exec,
+                                std::vector<std::int64_t>* values)
     -> std::expected<std::optional<Selection>, std::string> {
     auto* profile_entry = exec.execution_profile == nullptr
                               ? nullptr
@@ -102,7 +107,7 @@ auto LazyTable::scan_key_filter(const std::string& key, const DynamicScanFilter&
         if (!reader) {
             return std::unexpected(reader.error());
         }
-        auto result = (*reader)->key_filter_scan(key, filter, unit, exec);
+        auto result = (*reader)->key_filter_scan(key, filter, unit, exec, values);
         if (result) {
             release_reader(std::move(*reader));
         }
@@ -501,6 +506,116 @@ auto LazyTable::scan_string_filters(const std::vector<FusedStringConjunct>& fuse
         both.reserve(std::min(selected->size(), (*part)->size()));
         std::ranges::set_intersection(*selected, **part, std::back_inserter(both));
         selected = std::move(both);
+    }
+    release_reader(std::move(*reader));
+    return selected;
+}
+
+namespace {
+
+/// The one-column table a dictionary predicate is evaluated on: the column's
+/// name, its dictionary values as plain strings, and optionally a trailing null.
+auto dictionary_table(const std::string& column, std::span<const std::string_view> values,
+                      bool trailing_null) -> Table {
+    const std::size_t rows = values.size() + (trailing_null ? 1 : 0);
+    Column<std::string> strings;
+    strings.reserve(rows);
+    for (const std::string_view value : values) {
+        strings.push_back(value);
+    }
+    if (trailing_null) {
+        strings.push_back(std::string_view{});
+    }
+    Table table;
+    if (trailing_null) {
+        ValidityBitmap validity(rows, true);
+        validity.set(rows - 1, false);
+        table.add_column(column, std::move(strings), std::move(validity));
+    } else {
+        table.add_column(column, std::move(strings));
+    }
+    return table;
+}
+
+}  // namespace
+
+void LazyTable::split_dictionary_conjuncts(const std::vector<ir::Expr>& conjuncts,
+                                           const ScalarRegistry* scalars,
+                                           std::vector<ir::Expr>& dictionary,
+                                           std::vector<ir::Expr>& rest) const {
+    const ExecutionContext serial{};
+    for (const auto& conjunct : conjuncts) {
+        robin_hood::unordered_set<std::string> refs;
+        ir::collect_expr_column_refs(conjunct, refs);
+        const auto* entry = refs.size() == 1 ? schema_.find_entry(*refs.begin()) : nullptr;
+        bool fusable = entry != nullptr && entry->column != nullptr &&
+                       std::holds_alternative<Column<Categorical>>(*entry->column) &&
+                       !cache_.contains(*refs.begin()) && ir::is_subset_evaluable_expr(conjunct);
+        if (fusable) {
+            // Probe once before any scan: a type error must surface the way the
+            // ordinary path reports it (so decline here, don't swallow it), and
+            // rows that are null in the file are dropped by the scan, which is
+            // only right when the predicate is not TRUE on null.
+            const std::array<std::string_view, 1> probe_values{};
+            const auto probe = filter_selection(dictionary_table(*refs.begin(), probe_values, true),
+                                                {conjunct}, serial, scalars);
+            fusable = probe.has_value() &&
+                      std::ranges::find(*probe, std::size_t{1}) == probe->end();  // row 1 = null
+        }
+        (fusable ? dictionary : rest).push_back(conjunct);
+    }
+}
+
+auto LazyTable::scan_dictionary_filters(const std::vector<ir::Expr>& conjuncts,
+                                        const Selection* within, const ScalarRegistry* scalars,
+                                        const ExecutionContext& exec)
+    -> std::expected<std::optional<Selection>, std::string> {
+    auto* profile_entry = exec.execution_profile == nullptr
+                              ? nullptr
+                              : exec.execution_profile->stage("source dictionary filter scan");
+    const ExecutionProfileScope profile_scope(profile_entry, ProfilePhase::Source);
+
+    auto reader = acquire_reader();
+    if (!reader) {
+        return std::unexpected(reader.error());
+    }
+    std::optional<Selection> selected;
+    for (const auto& conjunct : conjuncts) {
+        robin_hood::unordered_set<std::string> refs;
+        ir::collect_expr_column_refs(conjunct, refs);
+        const std::string column = *refs.begin();
+        // Evaluated on the few distinct values of one dictionary page, never per
+        // row, and possibly from several workers at once: a serial context
+        // keeps it off the pool. An error here (the probe in
+        // split_dictionary_conjuncts makes one unlikely) cannot cross the pool,
+        // so it is flagged and the whole answer discarded.
+        std::atomic<bool> failed{false};
+        const DictionaryPredicate keep = [&](std::span<const std::string_view> values) {
+            std::vector<char> flags(values.size(), 0);
+            const ExecutionContext serial{};
+            auto passing = filter_selection(dictionary_table(column, values, false), {conjunct},
+                                            serial, scalars);
+            if (!passing) {
+                failed.store(true, std::memory_order_relaxed);
+                return flags;
+            }
+            for (const std::size_t i : *passing) {
+                flags[i] = 1;
+            }
+            return flags;
+        };
+        // Each conjunct narrows the previous one's answer rather than building
+        // its own and intersecting: candidates first, then this column's test.
+        const Selection* candidates = selected.has_value() ? &*selected : within;
+        auto part = (*reader)->dictionary_filter_scan(column, keep, candidates, nullptr, exec);
+        if (!part) {
+            return std::unexpected(part.error());
+        }
+        if (!part->has_value() || failed.load(std::memory_order_relaxed)) {
+            release_reader(std::move(*reader));
+            return std::optional<Selection>{};
+        }
+        selected = std::move(**part);
     }
     release_reader(std::move(*reader));
     return selected;
@@ -1354,41 +1469,118 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
     // them. Here the fused scan answers membership first and the conjuncts are
     // evaluated through its selection, so every later step is sized by what
     // survived rather than by the file.
+    //
+    // A conjunct over a dictionary-encoded string column (q10's
+    // `l_returnflag == "R"`, q19's `l_shipmode` list) used to send this whole
+    // phase to the whole-column path below: strings are not stageable (see
+    // `stageable_conjunct_columns`), and the alternative decoded the key and
+    // the string column for every row. Instead it is decided on the column's
+    // DICTIONARY, a handful of values per row group, and the source scans only
+    // the codes (`scan_dictionary_filters`), testing only the rows the key scan
+    // kept. Only the remaining conjuncts are staged.
+    std::vector<ir::Expr> dictionary_conjuncts;
+    std::vector<ir::Expr> staged_conjuncts;
+    if (reader_factory_) {
+        split_dictionary_conjuncts(conjuncts, scalars, dictionary_conjuncts, staged_conjuncts);
+    } else {
+        staged_conjuncts = conjuncts;
+    }
+    const std::vector<ir::Expr>& staged =
+        dictionary_conjuncts.empty() ? conjuncts : staged_conjuncts;
     if ((key_filter_scan_ != nullptr || reader_factory_) && !cache_.contains(key_name) &&
-        (conjuncts.empty() || stageable_conjunct_columns(conjuncts).has_value())) {
-        auto scan = scan_key_filter(key_name, dynamic, nullptr, exec);
+        (staged.empty() || stageable_conjunct_columns(staged).has_value())) {
+        // The scan decodes every passing key to test it; asking for those
+        // values spares a second decode of the key column for the same rows
+        // (q17 re-read l_partkey, 40% of its compressed bytes). Asked even
+        // when a conjunct narrows the rows afterwards: the survivors' keys are
+        // picked out of the scan's in memory, and that beat decoding them
+        // again even on q03, whose conjunct keeps 1 in 20 key-scan rows (a
+        // gate on "no conjunct follows" left q03/q07/q10/q21 2-7% slower).
+        std::vector<std::int64_t> scanned_keys;
+        auto scan = scan_key_filter(key_name, dynamic, nullptr, exec, &scanned_keys);
         if (!scan) {
             return std::unexpected(scan.error());
         }
-        if (scan->has_value()) {
-            Selection selected = std::move(**scan);
-            bool narrowed = true;
-            if (!conjuncts.empty()) {
-                auto rest = narrow_selection(selected, conjuncts, exec, scalars);
-                if (!rest) {
-                    return std::unexpected(rest.error());
+        const bool have_keys = scan->has_value() && !scanned_keys.empty();
+        // The key scan's own rows stay whole: `scanned_keys` is indexed by
+        // them, and each narrowing step below builds a new selection anyway.
+        Selection scan_rows;
+        std::optional<Selection> narrowed_rows;
+        bool fused = scan->has_value();
+        if (fused) {
+            scan_rows = std::move(**scan);
+            if (!dictionary_conjuncts.empty()) {
+                // The key scan's answer is the candidate list: the dictionary
+                // test only looks at those rows, and its answer is the
+                // intersection already.
+                auto dict =
+                    scan_dictionary_filters(dictionary_conjuncts, &scan_rows, scalars, exec);
+                if (!dict) {
+                    return std::unexpected(dict.error());
                 }
-                if (rest->has_value()) {
-                    selected = std::move(**rest);
+                if (dict->has_value()) {
+                    narrowed_rows = std::move(**dict);
                 } else {
-                    narrowed = false;  // conjuncts not evaluable here
+                    fused = false;  // no fused answer: the old path below
                 }
             }
-            if (narrowed) {
-                JoinKeySelection out;
-                out.selected = std::move(selected);
-                auto keys = project_rows({key_name}, out.selected, exec);
-                if (!keys) {
-                    return std::unexpected(keys.error());
+        }
+        if (fused && !staged.empty()) {
+            auto rest = narrow_selection(narrowed_rows.has_value() ? *narrowed_rows : scan_rows,
+                                         staged, exec, scalars);
+            if (!rest) {
+                return std::unexpected(rest.error());
+            }
+            if (rest->has_value()) {
+                narrowed_rows = std::move(**rest);
+            } else {
+                fused = false;  // conjuncts not evaluable here
+            }
+        }
+        if (fused) {
+            JoinKeySelection out;
+            if (have_keys) {
+                if (scanned_keys.size() != scan_rows.size()) {
+                    return std::unexpected(
+                        "lazy source produced a key value count that differs from its rows");
                 }
-                const auto* entry = keys->find_entry(key_name);
-                if (entry == nullptr ||
-                    !std::holds_alternative<Column<std::int64_t>>(*entry->column)) {
-                    return std::optional<JoinKeySelection>{};
+                if (narrowed_rows.has_value()) {
+                    // Keep the survivors' keys: both lists ascend, and every
+                    // survivor is one of the scan's rows.
+                    std::vector<std::int64_t> kept;
+                    kept.reserve(narrowed_rows->size());
+                    std::size_t j = 0;
+                    for (const std::size_t row : *narrowed_rows) {
+                        while (j < scan_rows.size() && scan_rows[j] != row) {
+                            ++j;
+                        }
+                        if (j == scan_rows.size()) {
+                            return std::unexpected(
+                                "lazy source narrowed to a row its key scan did not pass");
+                        }
+                        kept.push_back(scanned_keys[j++]);
+                    }
+                    scanned_keys = std::move(kept);
                 }
-                out.keys = *entry;
+            }
+            out.selected =
+                narrowed_rows.has_value() ? std::move(*narrowed_rows) : std::move(scan_rows);
+            if (have_keys) {
+                out.keys.name = key_name;
+                out.keys.column =
+                    std::make_shared<ColumnValue>(Column<std::int64_t>{std::move(scanned_keys)});
                 return std::optional{std::move(out)};
             }
+            auto keys = project_rows({key_name}, out.selected, exec);
+            if (!keys) {
+                return std::unexpected(keys.error());
+            }
+            const auto* entry = keys->find_entry(key_name);
+            if (entry == nullptr || !std::holds_alternative<Column<std::int64_t>>(*entry->column)) {
+                return std::optional<JoinKeySelection>{};
+            }
+            out.keys = *entry;
+            return std::optional{std::move(out)};
         }
         // No fused answer (unsupported key type, or the filter stopped
         // rejecting and the scan abandoned): the whole-column path stands.

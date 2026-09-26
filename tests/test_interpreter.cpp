@@ -16157,3 +16157,78 @@ TEST_CASE("Repeated scalar subqueries preserve missing and empty group semantics
     REQUIRE(out.columns.size() == 2);
     REQUIRE(int_column(out, "p_partkey") == expected);
 }
+
+// Date and Timestamp columns against a literal of their own type, an Int64 and
+// a Float64, through compute_mask directly (a planner rewrite could otherwise
+// route a bound into a range kernel and leave this path untested). Values are
+// 0..9, so each expected bit is a plain comparison against the row index. The
+// sub-range case checks the source offset: inputs are read at begin + i,
+// outputs written at i.
+TEST_CASE("compute_mask: Date and Timestamp columns against literals", "[filter][mask]") {
+    std::vector<Date> dates;
+    std::vector<Timestamp> stamps;
+    dates.reserve(10);
+    stamps.reserve(10);
+    for (std::int32_t i = 0; i < 10; ++i) {
+        dates.push_back(Date{i});
+        stamps.push_back(Timestamp{i});
+    }
+    runtime::Table table;
+    table.add_column("dt", Column<Date>{std::move(dates)});
+    table.add_column("ts", Column<Timestamp>{std::move(stamps)});
+
+    const auto reference = [](ir::CompareOp op, double lhs, double rhs) -> bool {
+        switch (op) {
+            case ir::CompareOp::Eq:
+                return lhs == rhs;
+            case ir::CompareOp::Ne:
+                return lhs != rhs;
+            case ir::CompareOp::Lt:
+                return lhs < rhs;
+            case ir::CompareOp::Le:
+                return lhs <= rhs;
+            case ir::CompareOp::Gt:
+                return lhs > rhs;
+            case ir::CompareOp::Ge:
+                return lhs >= rhs;
+        }
+        return false;
+    };
+    struct Case {
+        const char* column;
+        ir::Literal literal;
+        double value;  // the literal as a number, for the reference
+    };
+    const std::vector<Case> cases = {
+        {"dt", ir::Literal{.value = Date{4}}, 4.0},
+        {"dt", ir::Literal{.value = std::int64_t{4}}, 4.0},
+        {"dt", ir::Literal{.value = 4.5}, 4.5},
+        {"ts", ir::Literal{.value = Timestamp{4}}, 4.0},
+        {"ts", ir::Literal{.value = std::int64_t{4}}, 4.0},
+        {"ts", ir::Literal{.value = 4.5}, 4.5},
+    };
+    const std::vector<ir::CompareOp> ops = {ir::CompareOp::Eq, ir::CompareOp::Ne,
+                                            ir::CompareOp::Lt, ir::CompareOp::Le,
+                                            ir::CompareOp::Gt, ir::CompareOp::Ge};
+    for (const auto& c : cases) {
+        for (const auto op : ops) {
+            for (const runtime::RowRange rows :
+                 {runtime::RowRange::whole(10), runtime::RowRange{.begin = 2, .count = 6}}) {
+                INFO(c.column << " op " << static_cast<int>(op) << " literal " << c.value
+                              << " rows " << rows.begin << "+" << rows.count);
+                const ir::Expr expr{.node = ir::CompareExpr{
+                                        .op = op,
+                                        .left = ir::make_expr_ptr(
+                                            ir::Expr{.node = ir::ColumnRef{.name = c.column}}),
+                                        .right = ir::make_expr_ptr(ir::Expr{.node = c.literal})}};
+                auto mask = runtime::compute_mask(expr, table, nullptr, rows);
+                REQUIRE(mask.has_value());
+                REQUIRE(mask->value.size() == rows.count);
+                for (std::size_t i = 0; i < rows.count; ++i) {
+                    const auto row = static_cast<double>(rows.begin + i);
+                    CHECK(static_cast<bool>(mask->value[i]) == reference(op, row, c.value));
+                }
+            }
+        }
+    }
+}

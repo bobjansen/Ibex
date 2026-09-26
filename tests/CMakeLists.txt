@@ -40,6 +40,9 @@ set(IBEX_TEST_SOURCES
     test_ir_pending_order.cpp
     test_ir_column_origins.cpp
     test_parquet_dictionary_policy.cpp
+    test_hyperloglog.cpp
+    test_join_key_bitmap.cpp
+    test_parquet_selection_check.cpp
     test_parquet_stats_range.cpp
     test_static_range_filter.cpp
     test_ir_distinct_key_reduction.cpp
@@ -63,6 +66,7 @@ set(IBEX_TEST_SOURCES
     test_join.cpp
     test_lazy_table.cpp
     test_chunked_sources.cpp
+    test_aggregate_prefilter.cpp
     test_operator.cpp
     test_table_compare.cpp
     test_worker_pool.cpp

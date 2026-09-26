@@ -6,6 +6,7 @@
 // not split hot templates or state across compilation boundaries.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/compiler.hpp>
 #include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/format.hpp>
@@ -44,6 +45,7 @@
 #include <variant>
 #include <vector>
 
+#include "aggregate_prefilter.hpp"
 #include "physical_plan.hpp"
 
 #if defined(__AVX2__) || defined(__BMI2__)
@@ -60,6 +62,41 @@
 namespace ibex::runtime {
 
 namespace {
+
+/// Allocator adaptor that skips value-initialization for `resize()`'s new
+/// elements, i.e. `resize()` behaves like `reserve()` + leaving the tail
+/// default-initialized rather than zero-filled. Everything else (push_back,
+/// emplace_back, indexing, iteration) is unaffected: they still
+/// default-construct or copy/move exactly as `std::allocator` would.
+///
+/// Only safe when every newly-grown element is written before it is read --
+/// see the call sites of `int_order_`/`pair_order_` below, which merge-write
+/// the full grown range (via `try_discover_partitioned`'s resize_keys/
+/// store_key pair, or `finalize_owned_ordered_runs`'s sequential group scan)
+/// before any read reaches it. Standard idiom; avoids the same redundant
+/// value-init tax `SlotArray::grow_uninitialized` (above) exists to avoid.
+template <typename T, typename A = std::allocator<T>>
+class default_init_allocator : public A {
+    using AT = std::allocator_traits<A>;
+
+   public:
+    using A::A;
+
+    template <typename U>
+    struct rebind {
+        using other = default_init_allocator<U, typename AT::template rebind_alloc<U>>;
+    };
+
+    template <typename U>
+    void construct(U* ptr) noexcept(std::is_nothrow_default_constructible_v<U>) {
+        ::new (static_cast<void*>(ptr)) U;
+    }
+
+    template <typename U, typename... Args>
+    void construct(U* ptr, Args&&... args) {
+        AT::construct(static_cast<A&>(*this), ptr, std::forward<Args>(args)...);
+    }
+};
 
 // Whether a streamed aggregate slot has enough observations to be non-null.
 // Mirrors the materializing aggregate's `agg_result_is_valid`.
@@ -365,12 +402,14 @@ class HashAggregateState final {
     HashAggregateState(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
                        const std::vector<ir::AggSpec>* aggregations, const ExecutionContext& exec,
                        physical::AggregateParallelism par = {},
-                       std::optional<physical::AggregateColumnMapping> columns = std::nullopt)
+                       std::optional<physical::AggregateColumnMapping> columns = std::nullopt,
+                       AggregatePrefilter prefilter = {})
         : child_(std::move(child)),
           group_by_(group_by),
           aggregations_(aggregations),
           exec_(&exec),
           columns_(std::move(columns)),
+          prefilter_terms_(std::move(prefilter)),
           par_(par),
           discovery_profile_(exec.execution_profile == nullptr
                                  ? nullptr
@@ -443,8 +482,128 @@ class HashAggregateState final {
                 return owned_async_pair_error_;
             }
         }
+        prefilter_groups();
         ordering_finalized_ = true;
         return std::nullopt;
+    }
+
+    /// The filter-over-aggregate terms resolved against `plan_`, or null when
+    /// there is nothing to apply (aggregate_prefilter.hpp). Resolved once, after
+    /// the input has fixed every aggregate's kind. Only for a grouped aggregate:
+    /// an ungrouped one always emits its one row, and dropping its group would
+    /// replace the real row with an empty one.
+    auto group_prefilter() -> const GroupPrefilter* {
+        if (!prefilter_resolved_) {
+            prefilter_resolved_ = true;
+            if (!prefilter_terms_.empty() && initialized_ && !group_by_->empty() &&
+                plan_.size() == n_aggs_) {
+                std::vector<ExprType> kinds;
+                kinds.reserve(plan_.size());
+                for (const auto& p : plan_) {
+                    kinds.push_back(p.kind);
+                }
+                prefilter_ = GroupPrefilter::resolve(prefilter_terms_, *aggregations_, kinds);
+            }
+        }
+        return prefilter_.has_value() ? &*prefilter_ : nullptr;
+    }
+
+    /// Drop, from each owned partition, the groups the filter above would
+    /// drop, before the first-occurrence merge orders them. One owner per
+    /// partition, in place; `first_rows` stays ascending because the kept
+    /// groups keep their order.
+    template <typename Partitions>
+    IBEX_NOINLINE void prefilter_owned_partitions(Partitions& partitions) {
+        const GroupPrefilter* prefilter = group_prefilter();
+        if (prefilter == nullptr) {
+            return;
+        }
+        const auto one = [&](std::size_t p) {
+            auto& partition = partitions[p];
+            const std::size_t groups = partition.keys.size();
+            const auto keep =
+                prefilter->survivors(partition.slots.data(), groups, n_aggs_, nullptr, 1);
+            if (keep.size() == groups) {
+                return;
+            }
+            compact_by_index(partition.keys.data(), keep);
+            compact_by_index(partition.first_rows.data(), keep);
+            compact_by_index(partition.slots.data(), keep, n_aggs_);
+            partition.keys.resize(keep.size());
+            partition.first_rows.resize(keep.size());
+            partition.slots.resize(keep.size() * n_aggs_);
+        };
+        const std::size_t parts = partitions.size();
+        if (exec_ != nullptr && parts >= 2 && !on_worker_pool_thread() &&
+            par_.final_ordering.decline == physical::FanOutDecline::None &&
+            par_.final_ordering.worker_cap >= 2) {
+            std::atomic<std::size_t> cursor{0};
+            auto batch = process_worker_pool().submit(
+                std::min(parts, par_.final_ordering.worker_cap), [&](std::size_t) {
+                    for (std::size_t p = cursor.fetch_add(1, std::memory_order_relaxed); p < parts;
+                         p = cursor.fetch_add(1, std::memory_order_relaxed)) {
+                        one(p);
+                    }
+                });
+            batch.wait();
+        } else {
+            for (std::size_t p = 0; p < parts; ++p) {
+                one(p);
+            }
+        }
+        prefiltered_ = true;
+    }
+
+    /// The same for every other strategy, on the finished group arrays, so
+    /// Emission writes only what may pass. Declined when an aggregate keeps
+    /// per-group state beside its slot (text values, moment scratch, distinct
+    /// sets), and when most groups pass: the compaction is serial, and at that
+    /// point the filter above does the same work on emitted rows.
+    IBEX_NOINLINE void prefilter_groups() {
+        if (prefiltered_ || n_groups_ == 0) {
+            return;
+        }
+        const GroupPrefilter* prefilter = group_prefilter();
+        if (prefilter == nullptr || !text_store_.empty() || !scratch_.empty() ||
+            has_count_distinct_) {
+            return;
+        }
+        const bool fan = exec_ != nullptr && !on_worker_pool_thread() &&
+                         par_.final_ordering.decline == physical::FanOutDecline::None &&
+                         par_.final_ordering.worker_cap >= 2;
+        const auto keep = prefilter->survivors(flat_slots_.data(), n_groups_, n_aggs_,
+                                               fan ? &process_worker_pool() : nullptr,
+                                               fan ? par_.final_ordering.worker_cap : 1);
+        if (keep.size() * 4 > n_groups_) {
+            return;
+        }
+        compact_by_index(flat_slots_.data(), keep, n_aggs_);
+        (void)flat_slots_.grow_uninitialized(keep.size() * n_aggs_);
+        // The key array Emission reads, chosen in Emission's own order.
+        const std::size_t n_keys = group_by_->size();
+        if (cat_fast_path_) {
+            if (n_keys == 1) {
+                compact_by_index(cat_order_.data(), keep);
+                cat_order_.resize(keep.size());
+            } else {
+                compact_by_index(multi_cat_codes_flat_.data(), keep, n_keys);
+                multi_cat_codes_flat_.resize(keep.size() * n_keys);
+            }
+        } else if (str_fast_path_) {
+            compact_by_index(str_order_.data(), keep);
+            str_order_.resize(keep.size());
+        } else if (int_fast_path_) {
+            compact_by_index(int_order_.data(), keep);
+            int_order_.resize(keep.size());
+        } else if (pair_int_fast_path_) {
+            compact_by_index(pair_order_.data(), keep);
+            pair_order_.resize(keep.size());
+        } else {
+            compact_by_index(group_order_.data(), keep);
+            group_order_.resize(keep.size());
+        }
+        n_groups_ = keep.size();
+        prefiltered_ = true;
     }
 
     /// Structural Emission entry. It consumes only finalized, globally ordered
@@ -912,7 +1071,7 @@ class HashAggregateState final {
             return 0;
         };
 
-        // The q18 shape (one Int64 key and one Double sum) is a streaming sink,
+        // The q18 shape (one Int64 key and one Int64 or Double sum) is a streaming sink,
         // not a sequence of per-chunk fork/join pipelines. Each chunk becomes
         // one independent hot-table task; the caller immediately pulls the
         // next chunk, and all tasks join once at end-of-stream. Besides removing
@@ -1045,6 +1204,9 @@ class HashAggregateState final {
         std::shared_ptr<ColumnValue> key_column;
         std::shared_ptr<ColumnValue> sum_column;
         std::optional<ValidityBitmap> sum_validity;
+        /// The sum's `plan_` kind: Int64 accumulates in `slot.int_value`,
+        /// Double in `slot.double_value` (they share storage).
+        bool sum_is_int = false;
         std::uint64_t row_base = 0;
         std::size_t rows = 0;
         std::size_t part_count = 0;
@@ -1071,10 +1233,29 @@ class HashAggregateState final {
         return x;
     }
 
+    /// The slot accumulator a `ValueT` sum lives in.
+    template <typename ValueT>
+    [[nodiscard]] static auto hot_sum_value(AggSlotCore& slot) noexcept -> ValueT& {
+        if constexpr (std::is_same_v<ValueT, std::int64_t>) {
+            return slot.int_value;
+        } else {
+            return slot.double_value;
+        }
+    }
+
     static void process_owned_hot_chunk(OwnedHotChunk& job) noexcept {
+        if (job.sum_is_int) {
+            process_owned_hot_chunk_typed<std::int64_t>(job);
+        } else {
+            process_owned_hot_chunk_typed<double>(job);
+        }
+    }
+
+    template <typename ValueT>
+    static void process_owned_hot_chunk_typed(OwnedHotChunk& job) noexcept {
         try {
             const auto* keys = std::get<Column<std::int64_t>>(*job.key_column).data();
-            const auto* values = std::get<Column<double>>(*job.sum_column).data();
+            const auto* values = std::get<Column<ValueT>>(*job.sum_column).data();
             const ValidityBitmap* validity =
                 job.sum_validity.has_value() ? &*job.sum_validity : nullptr;
             constexpr std::uint32_t kEmpty = std::numeric_limits<std::uint32_t>::max();
@@ -1096,7 +1277,7 @@ class HashAggregateState final {
                 record.key = keys[row];
                 record.first_row = job.row_base + row;
                 if (validity == nullptr || (*validity)[row]) {
-                    record.slot.double_value = values[row];
+                    hot_sum_value<ValueT>(record.slot) = values[row];
                     record.slot.mark_present();
                 }
                 records.push_back(record);
@@ -1105,7 +1286,7 @@ class HashAggregateState final {
             const auto update_record = [&](std::uint32_t record, std::size_t row) {
                 if (validity == nullptr || (*validity)[row]) {
                     auto& slot = records[record].slot;
-                    slot.double_value += values[row];
+                    hot_sum_value<ValueT>(slot) += values[row];
                     slot.mark_present();
                 }
             };
@@ -1218,7 +1399,8 @@ class HashAggregateState final {
             if (std::getenv("IBEX_DISABLE_OWNED_PAIR_AGG") != nullptr ||
                 std::getenv("IBEX_DISABLE_ASYNC_HOT_AGG") != nullptr || n_groups_ > 0 ||
                 partitioned_active_ || owned_mode_ || n_aggs_ != 1 ||
-                plan_[0].func != ir::AggFunc::Sum || plan_[0].kind != ExprType::Double ||
+                plan_[0].func != ir::AggFunc::Sum ||
+                (plan_[0].kind != ExprType::Double && plan_[0].kind != ExprType::Int) ||
                 int_key_kind_ != IntKeyKind::Int64 || scratch_stride_ != 0 || exec_ == nullptr ||
                 on_worker_pool_thread() || std::max(rows_offered_, rows) < kIntOwnedMinRows) {
                 return false;
@@ -1250,6 +1432,7 @@ class HashAggregateState final {
         if (agg0.validity.has_value()) {
             job->sum_validity = *agg0.validity;
         }
+        job->sum_is_int = plan_[0].kind == ExprType::Int;
         job->row_base = owned_rows_seen_;
         job->rows = rows;
         job->part_count = owned_async_part_count_;
@@ -1297,6 +1480,8 @@ class HashAggregateState final {
         std::shared_ptr<ColumnValue> second_column;
         std::shared_ptr<ColumnValue> sum_column;
         std::optional<ValidityBitmap> sum_validity;
+        /// As `OwnedHotChunk::sum_is_int`.
+        bool sum_is_int = false;
         std::uint64_t row_base = 0;
         std::size_t rows = 0;
         std::size_t part_count = 0;
@@ -1305,10 +1490,19 @@ class HashAggregateState final {
     };
 
     static void process_owned_pair_chunk(OwnedPairChunk& job) noexcept {
+        if (job.sum_is_int) {
+            process_owned_pair_chunk_typed<std::int64_t>(job);
+        } else {
+            process_owned_pair_chunk_typed<double>(job);
+        }
+    }
+
+    template <typename ValueT>
+    static void process_owned_pair_chunk_typed(OwnedPairChunk& job) noexcept {
         try {
             const auto* first = std::get<Column<std::int64_t>>(*job.first_column).data();
             const auto* second = std::get<Column<std::int64_t>>(*job.second_column).data();
-            const auto* values = std::get<Column<double>>(*job.sum_column).data();
+            const auto* values = std::get<Column<ValueT>>(*job.sum_column).data();
             const ValidityBitmap* validity =
                 job.sum_validity.has_value() ? &*job.sum_validity : nullptr;
             const PairIntKeyHash hasher;
@@ -1333,7 +1527,7 @@ class HashAggregateState final {
                               .second = static_cast<std::uint64_t>(second[row])};
                 record.first_row = job.row_base + row;
                 if (validity == nullptr || (*validity)[row]) {
-                    record.slot.double_value = values[row];
+                    hot_sum_value<ValueT>(record.slot) = values[row];
                     record.slot.mark_present();
                 }
                 job.records_by_partition[hasher(record.key) & mask].push_back(record);
@@ -1355,7 +1549,8 @@ class HashAggregateState final {
         if (!owned_async_pair_mode_) {
             if (std::getenv("IBEX_DISABLE_ASYNC_PAIR_AGG") != nullptr || n_groups_ > 0 ||
                 partitioned_active_ || owned_mode_ || n_aggs_ != 1 ||
-                plan_[0].func != ir::AggFunc::Sum || plan_[0].kind != ExprType::Double ||
+                plan_[0].func != ir::AggFunc::Sum ||
+                (plan_[0].kind != ExprType::Double && plan_[0].kind != ExprType::Int) ||
                 pair_packs_u64_ || scratch_stride_ != 0 || exec_ == nullptr ||
                 on_worker_pool_thread() || std::max(rows_offered_, rows) < kPairOwnedMinRows ||
                 group_entries.size() != 2 ||
@@ -1386,6 +1581,7 @@ class HashAggregateState final {
         if (agg0.validity.has_value()) {
             job->sum_validity = *agg0.validity;
         }
+        job->sum_is_int = plan_[0].kind == ExprType::Int;
         job->row_base = owned_rows_seen_;
         job->rows = rows;
         job->part_count = owned_async_pair_part_count_;
@@ -1711,6 +1907,7 @@ class HashAggregateState final {
             return;
         }
         owned_finalized_ = true;
+        prefilter_owned_partitions(partitions);
         const std::size_t part_count = partitions.size();
         std::size_t total = 0;
         for (const auto& partition : partitions) {
@@ -1900,13 +2097,51 @@ class HashAggregateState final {
                 // calling-thread reserve experiment, it neither serializes the
                 // partitions nor guesses from total input rows; the exact
                 // pre-aggregate count is a safe upper bound on distinct keys.
-                partition.index.reserve(records);
                 partition.keys.reserve(records);
                 partition.first_rows.reserve(records);
                 partition.slots.reserve(records);
 
+                const bool sum_is_int = plan_[0].kind == ExprType::Int;
+                const auto add_into = [sum_is_int](AggSlotCore& slot, const AggSlotCore& from) {
+                    if (from.present()) {
+                        if (sum_is_int) {
+                            slot.int_value += from.int_value;
+                        } else {
+                            slot.double_value += from.double_value;
+                        }
+                        slot.mark_present();
+                    }
+                };
+
+                // Clustered keys (q18's l_orderkey): records reach this owner
+                // in first-row order, so while their keys never decrease, a
+                // key is either the newest group's (a run split across chunk
+                // jobs) or a new group, and no map is needed. That map was the
+                // whole cost here: ~1.5M random inserts per owner, bound on
+                // memory latency. The first key that goes backwards indexes
+                // the groups so far and hands the rest to the map below, which
+                // puts every record in the same group, in the same order.
+                bool in_order = true;
                 for (const auto& job : owned_async_jobs_) {
                     for (const auto& record : job->records_by_partition[p]) {
+                        if (in_order) {
+                            if (!partition.keys.empty() && record.key == partition.keys.back()) {
+                                add_into(partition.slots.back(), record.slot);
+                                continue;
+                            }
+                            if (partition.keys.empty() || record.key > partition.keys.back()) {
+                                partition.keys.push_back(record.key);
+                                partition.first_rows.push_back(record.first_row);
+                                partition.slots.push_back(record.slot);
+                                continue;
+                            }
+                            in_order = false;
+                            partition.index.reserve(records);
+                            for (std::size_t g = 0; g < partition.keys.size(); ++g) {
+                                partition.index.emplace(partition.keys[g],
+                                                        static_cast<std::uint32_t>(g));
+                            }
+                        }
                         auto it = partition.index.find(record.key);
                         std::uint32_t local{};
                         if (it == partition.index.end()) {
@@ -1917,11 +2152,7 @@ class HashAggregateState final {
                             partition.slots.push_back(record.slot);
                         } else {
                             local = it->second;
-                            if (record.slot.present()) {
-                                auto& slot = partition.slots[local];
-                                slot.double_value += record.slot.double_value;
-                                slot.mark_present();
-                            }
+                            add_into(partition.slots[local], record.slot);
                         }
                     }
                 }
@@ -1982,6 +2213,7 @@ class HashAggregateState final {
             auto batch =
                 process_worker_pool().submit(owned_async_pair_part_count_, [&](std::size_t p) {
                     auto& partition = owned_pair_partitions_[p];
+                    const bool sum_is_int = plan_[0].kind == ExprType::Int;
                     std::size_t records = 0;
                     for (const auto& job : owned_async_pair_jobs_) {
                         records += job->records_by_partition[p].size();
@@ -2002,7 +2234,11 @@ class HashAggregateState final {
                                 partition.slots.push_back(record.slot);
                             } else if (record.slot.present()) {
                                 auto& slot = partition.slots[it->second];
-                                slot.double_value += record.slot.double_value;
+                                if (sum_is_int) {
+                                    slot.int_value += record.slot.int_value;
+                                } else {
+                                    slot.double_value += record.slot.double_value;
+                                }
                                 slot.mark_present();
                             }
                         }
@@ -5271,6 +5507,13 @@ class HashAggregateState final {
     const std::vector<ir::AggSpec>* aggregations_;
     const ExecutionContext* exec_;
     std::optional<physical::AggregateColumnMapping> columns_;
+    /// The filter-over-aggregate terms (aggregate_prefilter.hpp), resolved
+    /// against `plan_` once the groups are complete. `prefiltered_` records
+    /// that the owned-partition merge already applied them.
+    AggregatePrefilter prefilter_terms_;
+    std::optional<GroupPrefilter> prefilter_;
+    bool prefilter_resolved_ = false;
+    bool prefiltered_ = false;
     bool columns_bound_ = false;
     bool input_consumed_ = false;
     bool ordering_finalized_ = false;
@@ -5348,7 +5591,10 @@ class HashAggregateState final {
     bool int_fast_path_ = false;
     IntKeyKind int_key_kind_ = IntKeyKind::Int64;
     robin_hood::unordered_flat_map<std::int64_t, std::uint32_t> int_index_;
-    std::vector<std::int64_t> int_order_;  ///< group keys, as raw integers, in first-seen order
+    /// Group keys, as raw integers, in first-seen order. Default-init
+    /// allocator: `resize()`'s new elements are always fully overwritten by
+    /// the caller before being read (see the class docstring above).
+    std::vector<std::int64_t, default_init_allocator<std::int64_t>> int_order_;
 
     // Two fixed-width-integer keys are packed into a two-word composite key
     // and grouped exactly as one integer key: `(l_partkey, l_suppkey)` on
@@ -5366,7 +5612,10 @@ class HashAggregateState final {
     PackedGroups<PackedKeyEncoder::Packed256, PackedKeyEncoder::PackedWordsHash<4>> packed256_;
     IntKeyKind int_key_kind_b_ = IntKeyKind::Int64;
     robin_hood::unordered_flat_map<PairIntKey, std::uint32_t, PairIntKeyHash> pair_index_;
-    std::vector<std::pair<std::int64_t, std::int64_t>> pair_order_;
+    /// Same default-init-allocator invariant as `int_order_` above.
+    std::vector<std::pair<std::int64_t, std::int64_t>,
+                default_init_allocator<std::pair<std::int64_t, std::int64_t>>>
+        pair_order_;
     /// Parallel group discovery (see `try_discover_partitioned`). `rows_seen_`
     /// makes a group's first-row index global across chunks, which is what the
     /// first-occurrence numbering is merged on.
@@ -5542,13 +5791,15 @@ class DecimalAwareAggregateOperator final : public Operator {
     DecimalAwareAggregateOperator(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
                                   const std::vector<ir::AggSpec>* aggregations,
                                   const ExecutionContext& exec, physical::AggregateParallelism par,
-                                  std::optional<physical::AggregateColumnMapping> columns)
+                                  std::optional<physical::AggregateColumnMapping> columns,
+                                  AggregatePrefilter prefilter)
         : child_(std::move(child)),
           group_by_(group_by),
           aggregations_(aggregations),
           exec_(&exec),
           par_(par),
-          columns_(std::move(columns)) {}
+          columns_(std::move(columns)),
+          prefilter_(std::move(prefilter)) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (delegate_) {
@@ -5587,8 +5838,9 @@ class DecimalAwareAggregateOperator final : public Operator {
         } else {
             rest = std::make_unique<PrependChunkOperator>(std::move(**first), std::move(child_));
         }
-        auto state = std::make_unique<HashAggregateState>(std::move(rest), group_by_, aggregations_,
-                                                          *exec_, par_, std::move(columns_));
+        auto state =
+            std::make_unique<HashAggregateState>(std::move(rest), group_by_, aggregations_, *exec_,
+                                                 par_, std::move(columns_), std::move(prefilter_));
         delegate_ = std::make_unique<HashAggregatePhaseOperator>(std::move(state));
         return delegate_->next();
     }
@@ -5700,6 +5952,7 @@ class DecimalAwareAggregateOperator final : public Operator {
     const ExecutionContext* exec_;
     physical::AggregateParallelism par_;
     std::optional<physical::AggregateColumnMapping> columns_;
+    AggregatePrefilter prefilter_;
     OperatorPtr delegate_;
     bool done_ = false;
 };
@@ -5707,10 +5960,11 @@ class DecimalAwareAggregateOperator final : public Operator {
 auto make_hash_aggregate_operator(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
                                   const std::vector<ir::AggSpec>* aggregations,
                                   const ExecutionContext& exec, physical::AggregateParallelism par,
-                                  std::optional<physical::AggregateColumnMapping> columns)
-    -> OperatorPtr {
+                                  std::optional<physical::AggregateColumnMapping> columns,
+                                  AggregatePrefilter prefilter) -> OperatorPtr {
     return std::make_unique<DecimalAwareAggregateOperator>(std::move(child), group_by, aggregations,
-                                                           exec, par, std::move(columns));
+                                                           exec, par, std::move(columns),
+                                                           std::move(prefilter));
 }
 
 /// Streaming aggregate for input already sorted on the group-by keys.
@@ -5735,13 +5989,15 @@ class ChunkedSortedAggregateOperator final : public Operator {
         OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
         const std::vector<ir::AggSpec>* aggregations, const ExecutionContext& exec,
         physical::AggregateParallelism par = {},
-        std::optional<physical::AggregateColumnMapping> columns = std::nullopt)
+        std::optional<physical::AggregateColumnMapping> columns = std::nullopt,
+        AggregatePrefilter prefilter = {})
         : child_(std::move(child)),
           group_by_(group_by),
           aggregations_(aggregations),
           exec_(&exec),
           par_(par),
-          columns_(std::move(columns)) {}
+          columns_(std::move(columns)),
+          prefilter_(std::move(prefilter)) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (fallback_) {
@@ -5800,10 +6056,10 @@ class ChunkedSortedAggregateOperator final : public Operator {
             // columns from the input's types, so hand it the empty chunk and let
             // it produce a properly-shaped empty result.
             if (schema_only.has_value()) {
-                fallback_ =
-                    make_hash_aggregate_operator(std::make_unique<PrependChunkOperator>(
-                                                     std::move(*schema_only), std::move(child_)),
-                                                 group_by_, aggregations_, *exec_, par_, columns_);
+                fallback_ = make_hash_aggregate_operator(
+                    std::make_unique<PrependChunkOperator>(std::move(*schema_only),
+                                                           std::move(child_)),
+                    group_by_, aggregations_, *exec_, par_, columns_, prefilter_);
                 return {};
             }
             done_ = true;
@@ -5817,7 +6073,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
         if (!sorted_on_group_by(first) || needs_hash_fallback(first)) {
             fallback_ = make_hash_aggregate_operator(
                 std::make_unique<PrependChunkOperator>(std::move(first), std::move(child_)),
-                group_by_, aggregations_, *exec_, par_, columns_);
+                group_by_, aggregations_, *exec_, par_, columns_, prefilter_);
             return {};
         }
         if (auto err = init_plan(first)) {
@@ -6340,6 +6596,9 @@ class ChunkedSortedAggregateOperator final : public Operator {
     /// the sorted stream itself has no fan-out point (it emits group-at-a-time).
     physical::AggregateParallelism par_{};
     std::optional<physical::AggregateColumnMapping> columns_;
+    /// Also forwarded to the fallback only: the sorted stream emits each group
+    /// as its run ends, and the filter above it sees every group anyway.
+    AggregatePrefilter prefilter_;
     bool columns_bound_ = false;
 
     bool decided_ = false;
@@ -6381,10 +6640,11 @@ auto make_chunked_aggregate_operator(OperatorPtr child, const std::vector<ir::Co
                                      const std::vector<ir::AggSpec>* aggregations,
                                      const ExecutionContext& exec,
                                      physical::AggregateParallelism parallelism,
-                                     std::optional<physical::AggregateColumnMapping> columns)
-    -> OperatorPtr {
+                                     std::optional<physical::AggregateColumnMapping> columns,
+                                     AggregatePrefilter prefilter) -> OperatorPtr {
     return std::make_unique<ChunkedSortedAggregateOperator>(
-        std::move(child), group_by, aggregations, exec, parallelism, std::move(columns));
+        std::move(child), group_by, aggregations, exec, parallelism, std::move(columns),
+        std::move(prefilter));
 }
 
 }  // namespace ibex::runtime

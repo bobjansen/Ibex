@@ -5,11 +5,13 @@
 """Run the implemented PDS-H queries through ibex_eval and diff their output
 against the official TPC-H SF-1 qualification answers (tpch-dbgen/answers/).
 
-Those answer files are valid only at scale factor 1 (see gen_data.sh), which
-is what benchmarking/tpch/queries/*.ibex are written against.
+Those answer files are valid only at scale factor 1 (gen_data.sh fetches
+them). The data is polars-benchmark's own SF-1 tables
+(`make data-tables SCALE_FACTOR=1.0` in the checkout), the same generator the
+timed runs use.
 
 Usage:
-  uv run benchmarking/tpch/check_answers.py [q1 q3 q5 q6 q10 q19 ...]
+  uv run benchmarking/tpch/check_answers.py [--pdsh-root DIR] [q1 q3 q5 q6 q10 q19 ...]
   (defaults to all implemented queries if none are given)
 """
 import argparse
@@ -27,11 +29,15 @@ ANSWERS_DIR = IBEX_ROOT / "benchmarking/data/tpch/dbgen/answers"
 OUT_DIR = IBEX_ROOT / "benchmarking/data/tpch/out"
 IBEX_EVAL = IBEX_ROOT / "build-release/tools/ibex_eval"
 PLUGIN_DIR = IBEX_ROOT / "build-release/tools"
-PARQUET_LINK = IBEX_ROOT / "benchmarking/data/tpch/parquet"
+
+sys.path.insert(0, str(SCRIPT_DIR.parent))
+import bench_env  # noqa: E402
+
+PARQUET_LINK = bench_env.PARQUET_LINK
 
 
 @contextlib.contextmanager
-def scale_factor_1():
+def scale_factor_1(pdsh_root: pathlib.Path):
     """Point the parquet symlink at SF-1 for the check, then put it back.
 
     The official answers are SF-1 only, so this script used to be run by
@@ -41,19 +47,21 @@ def scale_factor_1():
     being written down as a machine-contamination finding before it was caught.
     Owning the flip here means the trap cannot be left armed.
     """
+    sf1 = bench_env.pdsh_scale_dir(pdsh_root, 1)
     previous = PARQUET_LINK.readlink() if PARQUET_LINK.is_symlink() else None
-    if previous is not None and previous.name != "parquet_sf1":
-        print(f"# repointing {PARQUET_LINK.name} -> parquet_sf1 "
-              f"(was {previous.name}); will restore on exit")
-        PARQUET_LINK.unlink()
-        PARQUET_LINK.symlink_to("parquet_sf1")
+    flip = not bench_env.parquet_link_points_at(sf1)
+    if flip:
+        print(f"# repointing {PARQUET_LINK.name} -> {sf1} "
+              f"(was {previous}); will restore on exit")
+        bench_env.point_parquet_link(sf1)
     try:
         yield
     finally:
-        if previous is not None and previous.name != "parquet_sf1":
+        if flip:
             PARQUET_LINK.unlink()
-            PARQUET_LINK.symlink_to(previous)
-            print(f"# restored {PARQUET_LINK.name} -> {previous.name}")
+            if previous is not None:
+                PARQUET_LINK.symlink_to(previous)
+            print(f"# restored {PARQUET_LINK.name} -> {previous}")
 
 # query number -> (ibex query file stem, revenue-scale columns get a looser
 # tolerance since the official answers are rounded to 2 decimal places)
@@ -192,8 +200,15 @@ def check_query(qnum: str, stem: str) -> list[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--pdsh-root", type=pathlib.Path, default=bench_env.default_pdsh_root())
     parser.add_argument("queries", nargs="*", default=list(IMPLEMENTED.keys()))
     args = parser.parse_args()
+
+    sf1 = bench_env.pdsh_scale_dir(args.pdsh_root, 1)
+    if not sf1.is_dir():
+        print(f"error: {sf1} not found — run `make data-tables SCALE_FACTOR=1.0` in {args.pdsh_root}",
+              file=sys.stderr)
+        return 1
 
     if not IBEX_EVAL.exists():
         print(f"error: {IBEX_EVAL} not found — run cmake --build build-release first", file=sys.stderr)
@@ -201,7 +216,7 @@ def main() -> int:
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    with scale_factor_1():
+    with scale_factor_1(args.pdsh_root):
         return run_checks(args.queries)
 
 

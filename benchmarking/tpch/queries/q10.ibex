@@ -4,9 +4,8 @@
 //  4-table equijoin chain + group-by + `order ..., head 20` (top-k). Standard
 //  TPC-H qualification parameter: DATE='1993-10-01'. The "+ interval '3'
 //  month" bound is a fixed constant (1994-01-01), inlined as a literal Date
-//  rather than needing date-interval arithmetic. Reads Parquet (converted
-//  once via convert_to_parquet.ibex), matching what Polars' own PDS-H
-//  benchmark scans. `by` (aggregation) and `order`+`head` (top-k) must be in
+//  rather than needing date-interval arithmetic. Reads the Parquet that
+//  Polars' own PDS-H benchmark generates and scans. `by` (aggregation) and `order`+`head` (top-k) must be in
 //  separate blocks — `head` combined with `by` in the same block means "head
 //  per group", not "head of the overall result".
 //

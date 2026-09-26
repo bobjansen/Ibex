@@ -260,7 +260,8 @@ class TextReader final : public runtime::LazySourceReader {
     }
 
     auto key_filter_scan(const std::string& column, const runtime::DynamicScanFilter& filter,
-                         const runtime::SourceUnit* unit, const runtime::ExecutionContext& /*exec*/)
+                         const runtime::SourceUnit* unit, const runtime::ExecutionContext& /*exec*/,
+                         std::vector<std::int64_t>* /*values*/)
         -> std::expected<std::optional<runtime::Selection>, std::string> override {
         state_->key_scan_calls.push_back(column);
         if (column != "n")
@@ -1379,4 +1380,311 @@ TEST_CASE("LazyTable: a source with no decomposition reports no units",
     auto whole = lazy.project_where({"n", "s"}, {}, kExec);
     REQUIRE(whole);
     CHECK(int_column(*whole, "n").size() == kText.size());
+}
+
+namespace {
+
+/// A source with an Int64 key `k` and a dictionary-encoded string `flag`,
+/// stored as two "row groups" whose dictionaries differ, with one null flag.
+/// It records dictionary scans and decodes, so a test can assert that `flag`
+/// was decided on its dictionary and never decoded.
+///
+///   row:   0    1    2    3    4     5
+///   k:     10   11   12   13   14    15
+///   flag:  R    A    N    R    null  R      group 0 = rows 0-2, group 1 = 3-5
+struct DictSourceState {
+    std::vector<std::vector<std::string>> decode_calls;
+    std::vector<std::string> dictionary_scans;
+    /// Dictionaries the predicate was asked about, in call order.
+    std::vector<std::vector<std::string>> dictionaries_seen;
+    /// The candidate list each dictionary scan received (empty = none).
+    std::vector<runtime::Selection> candidates_seen;
+    bool dictionary_fused = true;
+    /// Whether the key scan hands back the passing keys it decoded.
+    bool key_values = false;
+};
+
+constexpr std::array<const char*, 6> kFlags{"R", "A", "N", "R", nullptr, "R"};
+
+class DictReader final : public runtime::LazySourceReader {
+   public:
+    explicit DictReader(std::shared_ptr<DictSourceState> state) : state_(std::move(state)) {}
+
+    auto decode(const std::vector<std::string>& names, const runtime::Selection* selection,
+                const runtime::SourceUnit* /*unit*/, const runtime::ExecutionContext& /*exec*/)
+        -> std::expected<runtime::Table, std::string> override {
+        state_->decode_calls.push_back(names);
+        runtime::Selection rows;
+        if (selection != nullptr) {
+            rows = *selection;
+        } else {
+            for (std::size_t r = 0; r < kFlags.size(); ++r) {
+                rows.push_back(r);
+            }
+        }
+        runtime::Table out;
+        for (const auto& name : names) {
+            if (name == "flag") {
+                std::vector<Column<Categorical>::code_type> codes;
+                runtime::ValidityBitmap validity(rows.size(), true);
+                for (std::size_t i = 0; i < rows.size(); ++i) {
+                    const char* v = kFlags[rows[i]];
+                    if (v == nullptr) {
+                        codes.push_back(0);
+                        validity.set(i, false);
+                        continue;
+                    }
+                    const std::string_view s{v};
+                    codes.push_back(s == "R" ? 0 : (s == "A" ? 1 : 2));
+                }
+                out.add_column(
+                    "flag",
+                    Column<Categorical>{std::vector<std::string>{"R", "A", "N"}, std::move(codes)},
+                    std::move(validity));
+            } else {
+                std::vector<std::int64_t> keys;
+                for (const auto row : rows) {
+                    keys.push_back(static_cast<std::int64_t>(10 + row));
+                }
+                out.add_column(name, Column<std::int64_t>{std::move(keys)});
+            }
+        }
+        out.logical_rows = rows.size();
+        return out;
+    }
+
+    auto key_filter_scan(const std::string& /*key*/, const runtime::DynamicScanFilter& filter,
+                         const runtime::SourceUnit* /*unit*/,
+                         const runtime::ExecutionContext& /*exec*/,
+                         std::vector<std::int64_t>* values)
+        -> std::expected<std::optional<runtime::Selection>, std::string> override {
+        runtime::Selection selected;
+        for (std::size_t r = 0; r < kFlags.size(); ++r) {
+            if (filter.passes(static_cast<std::int64_t>(10 + r))) {
+                selected.push_back(r);
+                if (values != nullptr && state_->key_values) {
+                    values->push_back(static_cast<std::int64_t>(10 + r));
+                }
+            }
+        }
+        return std::optional{std::move(selected)};
+    }
+
+    auto dictionary_filter_scan(const std::string& column, const runtime::DictionaryPredicate& keep,
+                                const runtime::Selection* within,
+                                const runtime::SourceUnit* /*unit*/,
+                                const runtime::ExecutionContext& /*exec*/)
+        -> std::expected<std::optional<runtime::Selection>, std::string> override {
+        state_->dictionary_scans.push_back(column);
+        state_->candidates_seen.push_back(within == nullptr ? runtime::Selection{} : *within);
+        if (!state_->dictionary_fused) {
+            return std::optional<runtime::Selection>{};
+        }
+        // Two row groups with their own dictionaries, as Parquet pages have.
+        const std::array<std::vector<std::string>, 2> dictionaries{
+            std::vector<std::string>{"R", "A", "N"}, std::vector<std::string>{"R"}};
+        runtime::Selection selected;
+        for (std::size_t group = 0; group < 2; ++group) {
+            state_->dictionaries_seen.push_back(dictionaries[group]);
+            std::vector<std::string_view> views(dictionaries[group].begin(),
+                                                dictionaries[group].end());
+            const auto flags = keep(views);
+            REQUIRE(flags.size() == views.size());
+            for (std::size_t r = group * 3; r < group * 3 + 3; ++r) {
+                if (kFlags[r] == nullptr) {
+                    continue;  // null never passes
+                }
+                if (within != nullptr && !std::ranges::binary_search(*within, r)) {
+                    continue;  // only candidates are tested
+                }
+                const auto it = std::ranges::find(dictionaries[group], std::string{kFlags[r]});
+                REQUIRE(it != dictionaries[group].end());
+                if (flags[static_cast<std::size_t>(it - dictionaries[group].begin())] != 0) {
+                    selected.push_back(r);
+                }
+            }
+        }
+        return std::optional{std::move(selected)};
+    }
+
+   private:
+    std::shared_ptr<DictSourceState> state_;
+};
+
+auto make_dict_lazy(const std::shared_ptr<DictSourceState>& state) -> runtime::LazyTable {
+    runtime::Table schema;
+    schema.add_column("k", Column<std::int64_t>{});
+    schema.add_column("flag", Column<Categorical>{std::vector<std::string>{}});
+    schema.add_column("v", Column<std::int64_t>{});
+    return runtime::LazyTable{
+        std::move(schema), kFlags.size(),
+        [state]() -> std::expected<runtime::LazySourceReaderPtr, std::string> {
+            return runtime::LazySourceReaderPtr{std::make_unique<DictReader>(state)};
+        }};
+}
+
+auto flag_equals(std::string value) -> ir::Expr {
+    return ir::Expr{
+        .node = ir::CompareExpr{
+            .op = ir::CompareOp::Eq,
+            .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "flag"}}),
+            .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::move(value)}})}};
+}
+
+/// Membership over keys 10, 13, 14, 15: rows 0, 3, 4, 5.
+auto key_membership() -> runtime::DynamicScanFilter {
+    runtime::DynamicScanFilter filter;
+    filter.ready = true;
+    filter.bloom.emplace(8);
+    filter.in_list = {10, 13, 14, 15};
+    for (const auto key : filter.in_list) {
+        filter.bloom->insert(key);
+    }
+    return filter;
+}
+
+}  // namespace
+
+// q10's shape: a join-key membership plus an equality on a dictionary-encoded
+// string. The string predicate is decided per dictionary entry and intersected
+// with the key scan; the string column is never decoded.
+TEST_CASE("LazyTable: join_key_selection decides a string conjunct on its dictionary",
+          "[runtime][lazy_table][deferred_scan][dictionary]") {
+    auto state = std::make_shared<DictSourceState>();
+    auto lazy = make_dict_lazy(state);
+    const auto filter = key_membership();
+
+    auto phase = lazy.join_key_selection({flag_equals("R")}, kExec, nullptr, filter, "k");
+    REQUIRE(phase);
+    REQUIRE(phase->has_value());
+    // R rows {0, 3, 5} AND key rows {0, 3, 4, 5}.
+    CHECK((*phase)->selected == runtime::Selection{0, 3, 5});
+    CHECK(state->dictionary_scans == std::vector<std::string>{"flag"});
+    // It was handed the key scan's rows as candidates.
+    REQUIRE(state->candidates_seen.size() == 1);
+    CHECK(state->candidates_seen.front() == runtime::Selection{0, 3, 4, 5});
+    // Asked once per dictionary page, with that page's own values.
+    CHECK(state->dictionaries_seen ==
+          std::vector<std::vector<std::string>>{{"R", "A", "N"}, {"R"}});
+    for (const auto& call : state->decode_calls) {
+        CHECK(std::ranges::find(call, "flag") == call.end());
+    }
+}
+
+// A predicate that is TRUE on null cannot be decided per dictionary entry: the
+// scan drops null rows. It must take the ordinary path, and still be right.
+TEST_CASE("LazyTable: join_key_selection keeps a null-accepting conjunct off the dictionary",
+          "[runtime][lazy_table][deferred_scan][dictionary]") {
+    auto state = std::make_shared<DictSourceState>();
+    auto lazy = make_dict_lazy(state);
+    const auto filter = key_membership();
+    const ir::Expr is_null{.node = ir::IsNullExpr{.operand = ir::make_expr_ptr(ir::Expr{
+                                                      .node = ir::ColumnRef{.name = "flag"}}),
+                                                  .negated = false}};
+
+    auto phase = lazy.join_key_selection({is_null}, kExec, nullptr, filter, "k");
+    REQUIRE(phase);
+    REQUIRE(phase->has_value());
+    CHECK((*phase)->selected == runtime::Selection{4});  // the null flag, key 14
+    CHECK(state->dictionary_scans.empty());
+}
+
+// A source with no fused dictionary answer falls back to the ordinary path.
+TEST_CASE("LazyTable: join_key_selection falls back when the dictionary scan declines",
+          "[runtime][lazy_table][deferred_scan][dictionary]") {
+    auto state = std::make_shared<DictSourceState>();
+    state->dictionary_fused = false;
+    auto lazy = make_dict_lazy(state);
+    const auto filter = key_membership();
+
+    auto phase = lazy.join_key_selection({flag_equals("R")}, kExec, nullptr, filter, "k");
+    REQUIRE(phase);
+    REQUIRE(phase->has_value());
+    CHECK((*phase)->selected == runtime::Selection{0, 3, 5});
+    CHECK(state->dictionary_scans == std::vector<std::string>{"flag"});
+}
+
+namespace {
+
+auto decoded_key(const std::shared_ptr<DictSourceState>& state) -> bool {
+    return std::ranges::any_of(state->decode_calls, [](const auto& call) {
+        return std::ranges::find(call, "k") != call.end();
+    });
+}
+
+}  // namespace
+
+// The key scan already decoded every passing key to test it. When the source
+// hands those values back, the probe side takes them as its key column rather
+// than decoding the key a second time for the same rows (q17 re-read l_partkey:
+// 40% of its decompressed bytes).
+TEST_CASE("LazyTable: join_key_selection takes the key values from the key scan",
+          "[runtime][lazy_table][deferred_scan]") {
+    auto state = std::make_shared<DictSourceState>();
+    state->key_values = true;
+    auto lazy = make_dict_lazy(state);
+
+    auto phase = lazy.join_key_selection({}, kExec, nullptr, key_membership(), "k");
+    REQUIRE(phase);
+    REQUIRE(phase->has_value());
+    CHECK((*phase)->selected == runtime::Selection{0, 3, 4, 5});
+    runtime::Table keys;
+    keys.add_column_from("k", (*phase)->keys);
+    CHECK(int_column(keys, "k") == std::vector<std::int64_t>{10, 13, 14, 15});
+    CHECK_FALSE(decoded_key(state));
+}
+
+// A conjunct narrows the key scan's rows; the survivors' keys are picked out of
+// the scan's values rather than decoded again. That beat the second decode even
+// on q03, whose conjunct keeps 1 in 20 key-scan rows.
+TEST_CASE("LazyTable: join_key_selection keeps the scan's keys through a dictionary conjunct",
+          "[runtime][lazy_table][deferred_scan][dictionary]") {
+    auto state = std::make_shared<DictSourceState>();
+    state->key_values = true;
+    auto lazy = make_dict_lazy(state);
+
+    auto phase = lazy.join_key_selection({flag_equals("R")}, kExec, nullptr, key_membership(), "k");
+    REQUIRE(phase);
+    REQUIRE(phase->has_value());
+    CHECK((*phase)->selected == runtime::Selection{0, 3, 5});
+    runtime::Table keys;
+    keys.add_column_from("k", (*phase)->keys);
+    CHECK(int_column(keys, "k") == std::vector<std::int64_t>{10, 13, 15});
+    CHECK_FALSE(decoded_key(state));
+}
+
+// Same through a staged conjunct, which is evaluated on decoded rows: only the
+// conjunct's column is decoded, never the key.
+TEST_CASE("LazyTable: join_key_selection keeps the scan's keys through a staged conjunct",
+          "[runtime][lazy_table][deferred_scan]") {
+    auto state = std::make_shared<DictSourceState>();
+    state->key_values = true;
+    auto lazy = make_dict_lazy(state);
+
+    // v = 10 + row, so v > 13 keeps rows 4 and 5 of the key rows {0, 3, 4, 5}.
+    auto phase =
+        lazy.join_key_selection({greater_than("v", 13)}, kExec, nullptr, key_membership(), "k");
+    REQUIRE(phase);
+    REQUIRE(phase->has_value());
+    CHECK((*phase)->selected == runtime::Selection{4, 5});
+    runtime::Table keys;
+    keys.add_column_from("k", (*phase)->keys);
+    CHECK(int_column(keys, "k") == std::vector<std::int64_t>{14, 15});
+    CHECK_FALSE(decoded_key(state));
+}
+
+// A source that keeps its values to itself still gets a correct key column:
+// the caller decodes it.
+TEST_CASE("LazyTable: join_key_selection decodes the key when the scan returns no values",
+          "[runtime][lazy_table][deferred_scan]") {
+    auto state = std::make_shared<DictSourceState>();
+    auto lazy = make_dict_lazy(state);
+
+    auto phase = lazy.join_key_selection({}, kExec, nullptr, key_membership(), "k");
+    REQUIRE(phase);
+    REQUIRE(phase->has_value());
+    runtime::Table keys;
+    keys.add_column_from("k", (*phase)->keys);
+    CHECK(int_column(keys, "k") == std::vector<std::int64_t>{10, 13, 14, 15});
+    CHECK(decoded_key(state));
 }

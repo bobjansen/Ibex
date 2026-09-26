@@ -377,10 +377,16 @@ Its own FAIL lines are a prompt to investigate, not evidence — confirm with
 
 ### PDS-H data
 
-`benchmarking/data/tpch/parquet` is a **symlink** the scale scripts flip between
-`parquet_sf1` / `parquet_sf2` / `parquet_sf4`. For an A/B, pin the explicit
-`parquet_sf<N>` path rather than trusting the symlink to still point where it
-did when you started.
+The tables come from the polars-benchmark checkout's own generator
+(`make data-tables SCALE_FACTOR=<sf>.0` in `~/polars-benchmark`: tpchgen-cli,
+then Polars' parquet writer), never from Ibex, so nobody can call the comparison
+fudged by an Ibex-friendly layout. They live at
+`~/polars-benchmark/data/tables/scale-<sf>.0/`.
+
+`benchmarking/data/tpch/parquet` is a **symlink** that `run_bench.sh` and
+`check_answers.py` point at one of those directories. For an A/B, check which
+one it points at (every harness prints a `# dataset:` line) rather than trusting
+it to still point where it did when you started.
 
 ## 2. Vary two dimensions, not one
 

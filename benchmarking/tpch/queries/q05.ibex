@@ -5,8 +5,8 @@
 //  Ibex join benchmarks only exercise up to 4-table chains. Standard TPC-H
 //  qualification parameters: REGION='ASIA', DATE='1994-01-01'; the "+
 //  interval '1' year" bound is a fixed constant (1995-01-01), inlined as a
-//  literal Date. Reads Parquet (converted once via convert_to_parquet.ibex),
-//  matching what Polars' own PDS-H benchmark scans.
+//  literal Date. Reads the Parquet that Polars'
+//  own PDS-H benchmark generates and scans.
 //
 //  Supplier locality is expressed directly as a two-column hash join on
 //  (supplier key, nation key), avoiding a larger supplier join followed by a

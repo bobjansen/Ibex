@@ -35,6 +35,7 @@
 #include <utility>
 #include <vector>
 
+#include "aggregate_prefilter.hpp"
 #include "physical_plan.hpp"
 
 #if defined(__AVX2__) || defined(__BMI2__)
@@ -121,6 +122,13 @@ auto is_streamable_pair_int_join(const ir::JoinNode& join) -> bool {
         join.expect().asserts_anything() || join.take() != ir::MatchSelection::All) {
         return false;
     }
+    return join_keys_provably_int64(join);
+}
+
+auto join_keys_provably_int64(const ir::JoinNode& join) -> bool {
+    if (join.children().size() != 2) {
+        return false;
+    }
     const ir::SchemaInfo left_schema = ir::infer_schema(*join.children()[0]);
     const ir::SchemaInfo right_schema = ir::infer_schema(*join.children()[1]);
     if (!left_schema.is_known() || !right_schema.is_known()) {
@@ -193,6 +201,10 @@ auto materialize_row_local(const ir::Node& node, const TableRegistry& registry,
 // A kind not listed here (or one whose children are template/expression nodes)
 // gets no pre-build: `interpret_node` evaluates it whole, which is the prior
 // behaviour.
+//
+// This allowlist matters. A first cut that also pre-built `Window`'s direct
+// child and `Stream`'s template failed 51 tests, because each of those was then
+// evaluated on its own.
 auto fallback_relational_inputs(const ir::Node& node) -> std::vector<const ir::Node*> {
     std::vector<const ir::Node*> inputs;
     switch (node.kind()) {
@@ -234,6 +246,9 @@ auto fallback_relational_inputs(const ir::Node& node) -> std::vector<const ir::N
 // `pre_materialized_children` -- so a `Filter`/`Project` feeding the breaker is
 // not re-evaluated whole-table and serial. `interpret_node` still recurses for
 // anything deeper, and for any kind `fallback_relational_inputs` leaves empty.
+// Sending the whole subtree to `interpret_node` without this pre-build cost
+// `join_filter_rank` 14.7%: the filter between the join and the grouped rank
+// lost its fused parallel scan.
 auto build_materialized_fallback(const ir::Node& node, const TableRegistry& registry,
                                  const ScalarRegistry* scalars, const ExternRegistry* externs,
                                  const ExecutionContext& exec, ModelResult* model_out)
@@ -704,7 +719,8 @@ class OneGroupIfUngroupedOperator final : public Operator {
 auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
                               const TableRegistry& registry, const ScalarRegistry* scalars,
                               const ExternRegistry* externs, const ExecutionContext& exec,
-                              ModelResult* model_out) -> std::expected<OperatorPtr, std::string> {
+                              ModelResult* model_out, const AggregatePrefilter& prefilter)
+    -> std::expected<OperatorPtr, std::string> {
     const auto& agg = ir::node_cast<ir::AggregateNode>(node);
     if (agg.children().empty()) {
         return std::unexpected("aggregate node missing child");
@@ -783,7 +799,8 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         // retains only data-dependent gates such as actual row counts and
         // strategy-specific usefulness thresholds.
         return make_chunked_aggregate_operator(std::move(child_op.value()), &agg.group_by(),
-                                               &agg.aggregations(), exec, *parallelism, ap.columns);
+                                               &agg.aggregations(), exec, *parallelism, ap.columns,
+                                               prefilter);
     }
 
     return std::unexpected("physical aggregate: plan named no executable strategy");
@@ -1028,6 +1045,44 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
 }
 
 }  // namespace
+
+auto build_pipeline_source(const physical::Plan& pipeline, const TableRegistry& registry,
+                           const ScalarRegistry* scalars, const ExternRegistry* externs,
+                           const ExecutionContext& exec, ModelResult* model_out)
+    -> std::expected<OperatorPtr, std::string> {
+    const ir::Node& node = *pipeline.source_node;
+    // A filter directly over a grouped aggregate hands the aggregate the
+    // comparisons it can decide on its own groups (aggregate_prefilter.hpp).
+    // The filter step still runs, so this changes which groups are emitted,
+    // never which rows the pipeline returns.
+    AggregatePrefilter prefilter = aggregate_prefilter_for_source(pipeline);
+    if (prefilter.empty()) {
+        return build_operator(node, registry, scalars, externs, exec, model_out);
+    }
+    const physical::Plan plan = physical::plan_physical(node, registry, externs);
+    if (!plan.migrated || plan.root != &node || !plan.aggregate.describes ||
+        ir::node_cast<ir::AggregateNode>(node).group_by().empty()) {
+        return build_operator(node, registry, scalars, externs, exec, model_out);
+    }
+    const auto build = [&] {
+        physical::note_map_pipeline_executed();
+        return physical_executor_detail::build_physical_aggregate(
+            plan, node, registry, scalars, externs, exec, model_out, prefilter);
+    };
+    if (exec.execution_profile == nullptr) {
+        return build();
+    }
+    auto* entry = execution_profile_entry(exec.execution_profile, node);
+    std::expected<OperatorPtr, std::string> result;
+    {
+        const ExecutionProfileScope scope(entry, ProfilePhase::Build);
+        result = build();
+    }
+    if (!result.has_value()) {
+        return result;
+    }
+    return profile_operator(std::move(result.value()), exec.execution_profile, node);
+}
 
 auto build_operator(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,

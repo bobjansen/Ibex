@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Bob Jansen
 
-"""Time the upstream Polars PDS-H implementations against Ibex's Parquet data.
+"""Time the upstream Polars PDS-H implementations on polars-benchmark's own data.
 
 This deliberately invokes the upstream query modules unchanged, so the
 reference is the PDS project's own Polars lazy expressions and DuckDB SQL.
@@ -23,7 +23,8 @@ import tempfile
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 IBEX_ROOT = SCRIPT_DIR.parent.parent
-DATA_ROOT = IBEX_ROOT / "benchmarking/data/tpch"
+sys.path.insert(0, str(SCRIPT_DIR.parent))
+import bench_env  # noqa: E402
 
 
 def percentile(data: list[float], p: float) -> float:
@@ -55,23 +56,14 @@ def main() -> int:
     if args.polars_engine != "in-memory" and args.engine != "polars":
         parser.error("--polars-engine applies to --engine polars")
 
-    parquet = DATA_ROOT / f"parquet_sf{args.sf}"
-    if not parquet.is_dir():
-        parser.error(f"missing {parquet}; run gen_data.sh {args.sf} then gen_parquet.sh {args.sf}")
     if not (args.pdsh_root / "queries" / args.engine).is_dir():
         parser.error(f"{args.pdsh_root} is not a Polars PDS-H checkout")
-
-    # PDS derives table locations as PATH_TABLES/scale-<factor>/<table>.parquet.
-    # Keep the data in Ibex's scale-specific location and expose that layout by
-    # a symlink, avoiding an extra multi-GB copy on the EC2 benchmark box.
-    # Pydantic parses SCALE_FACTOR as float, so PDS formats SF-1 as
-    # ``scale-1.0`` (not ``scale-1``).
-    pdsh_data = DATA_ROOT / f"scale-{float(args.sf)}"
-    if pdsh_data.exists() or pdsh_data.is_symlink():
-        if not pdsh_data.is_symlink() or pdsh_data.resolve() != parquet.resolve():
-            parser.error(f"refusing to replace existing PDS data path: {pdsh_data}")
-    else:
-        pdsh_data.symlink_to(parquet.name)
+    # The tables polars-benchmark generated itself, read where it put them:
+    # PATH_TABLES/scale-<float SF>/<table>.parquet.
+    tables = bench_env.pdsh_scale_dir(args.pdsh_root, args.sf)
+    if not tables.is_dir():
+        parser.error(f"missing {tables}; run `make data-tables SCALE_FACTOR={float(args.sf)}` "
+                     f"in {args.pdsh_root}")
 
     # Upstream's `obtain_engine_config()` returns "in-memory" EXPLICITLY unless
     # `RUN_POLARS_STREAMING` is set -- it is a selected configuration, not a
@@ -90,7 +82,7 @@ def main() -> int:
             timing_file = timing_dir / f"{args.engine}_q{query_number}.csv"
             env = os.environ | {
                 "SCALE_FACTOR": args.sf,
-                "PATH_TABLES": str(DATA_ROOT),
+                "PATH_TABLES": str(bench_env.pdsh_tables_root(args.pdsh_root)),
                 "PATH_TIMINGS": str(timing_dir),
                 "PATH_TIMINGS_FILENAME": timing_file.name,
                 "RUN_IO_TYPE": "parquet",
@@ -124,12 +116,14 @@ def main() -> int:
             rows.append((f"q{query_number:02d}", samples))
 
     with args.out.open("w") as f:
-        f.write("framework\tquery\tavg_ms\tmin_ms\tmax_ms\tstddev_ms\tp95_ms\tp99_ms\n")
+        # samples_ms: every timed iteration in run order, as in bench_ibex.py.
+        f.write("framework\tquery\tavg_ms\tmin_ms\tmax_ms\tstddev_ms\tp95_ms\tp99_ms\tsamples_ms\n")
         for query, samples in rows:
             f.write(
                 f"{framework}\t{query}\t{statistics.mean(samples):.3f}\t{min(samples):.3f}\t"
                 f"{max(samples):.3f}\t{statistics.pstdev(samples) if len(samples) > 1 else 0.0:.3f}\t"
-                f"{percentile(samples, .95):.3f}\t{percentile(samples, .99):.3f}\n"
+                f"{percentile(samples, .95):.3f}\t{percentile(samples, .99):.3f}\t"
+                f"{','.join(f'{d:.3f}' for d in samples)}\n"
             )
     return 0
 

@@ -34,6 +34,7 @@
 // Background: plans/kernel-pipeline-execution-plan.md.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/compiler.hpp>
 #include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/format.hpp>
@@ -234,18 +235,8 @@ struct JoinHashIndex {
     /// Two-fixed-width-int-key path: both key values pack into one struct,
     /// injective with no knowledge of their domains -- same trick as the
     /// aggregate's own `PairIntKey`.
-    struct PairKey {
-        std::uint64_t a = 0;
-        std::uint64_t b = 0;
-        [[nodiscard]] auto operator==(const PairKey&) const -> bool = default;
-    };
-    struct PairKeyHash {
-        auto operator()(const PairKey& key) const noexcept -> std::size_t {
-            std::uint64_t h = key.a * 0x9e3779b97f4a7c15ULL;
-            h ^= key.b + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-            return static_cast<std::size_t>(h);
-        }
-    };
+    using PairKey = JoinPairKey;
+    using PairKeyHash = JoinPairKeyHash;
     PartitionedHeads<PairKey, PairKeyHash> pair_heads;
 
     /// Borrowed from the build table; null when the key column has no nulls. A
@@ -581,42 +572,6 @@ auto choose_and_build_single_key(const Table& left, const Table& right, const st
         return build_join_side(left, left_key, key_kind, JoinOrientation::BuildLeft, partitions);
     }
     return build_join_side(right, right_key, key_kind, JoinOrientation::BuildRight, partitions);
-}
-
-/// One side's two Int64 key columns and their validity, or the error a join
-/// reports for them. `side_name` is "left" or "right" only so the message
-/// keeps naming the side the caller was asking about.
-struct PairKeyColumns {
-    const Column<std::int64_t>* col0 = nullptr;
-    const Column<std::int64_t>* col1 = nullptr;
-    const ValidityBitmap* v0 = nullptr;
-    const ValidityBitmap* v1 = nullptr;
-};
-
-auto pair_key_columns(const Table& side, const std::string& name0, const std::string& name1,
-                      std::string_view side_name) -> std::expected<PairKeyColumns, std::string> {
-    const ColumnValue* key0 = side.find(name0);
-    if (key0 == nullptr) {
-        return std::unexpected("join key not found in " + std::string(side_name) +
-                               " table: " + name0);
-    }
-    const ColumnValue* key1 = side.find(name1);
-    if (key1 == nullptr) {
-        return std::unexpected("join key not found in " + std::string(side_name) +
-                               " table: " + name1);
-    }
-    PairKeyColumns out;
-    out.col0 = std::get_if<Column<std::int64_t>>(key0);
-    out.col1 = std::get_if<Column<std::int64_t>>(key1);
-    if (out.col0 == nullptr || out.col1 == nullptr) {
-        return std::unexpected(
-            "ChunkedInnerJoinOperator: two-key join currently requires both keys to be Int64");
-    }
-    const auto* entry0 = side.find_entry(name0);
-    const auto* entry1 = side.find_entry(name1);
-    out.v0 = entry0 != nullptr && entry0->validity.has_value() ? &*entry0->validity : nullptr;
-    out.v1 = entry1 != nullptr && entry1->validity.has_value() ? &*entry1->validity : nullptr;
-    return out;
 }
 
 /// The two-Int64-key build phase. Same contract as the single-key one, with a
@@ -2677,6 +2632,27 @@ class ChunkedInnerJoinOperator final : public Operator {
     // (`resolve_deferred_probe_pair`): publishes a filter over exactly one
     // named build-side column instead of always `keys_->front().left`, since
     // the pair join's scan filter only ever covers one of the two keys.
+    /// The exact-membership bitmap for a dense build key range (see
+    /// JoinKeyBitmap). Out of line: publishing is not a hot path, and keeping
+    /// it separate keeps publish_build_filter_column's own code small.
+    /// (Measured aside, 2026-09-24: the inline version of this loop happened
+    /// to slow q18's unrelated aggregate by 16% at 8 cores through code layout
+    /// alone, while this identical-behavior version did not. That is layout
+    /// luck, not a property of either version.)
+    IBEX_NOINLINE static auto build_key_bitmap(const std::int64_t* data, std::size_t n,
+                                               const ValidityBitmap* validity, std::int64_t mn,
+                                               std::int64_t mx)
+        -> std::shared_ptr<const JoinKeyBitmap> {
+        auto bitmap = std::make_shared<JoinKeyBitmap>(mn, mx);
+        for (std::size_t r = 0; r < n; ++r) {
+            if (validity != nullptr && !(*validity)[r]) {
+                continue;
+            }
+            bitmap->insert(data[r]);
+        }
+        return bitmap;
+    }
+
     static void publish_build_filter_column(const Table& build, const std::string& key_name,
                                             DynamicScanFilter& slot) {
         const auto* entry = build.find_entry(key_name);
@@ -2705,11 +2681,22 @@ class ChunkedInnerJoinOperator final : public Operator {
             return;
         }
 
-        // Every build side gets a Bloom — even alongside an exact list, the
-        // Bloom is the probe fast path (see DynamicScanFilter::passes).
-        // Duplicate inserts are harmless. A small build side (dimension
-        // chains: nation, region, filtered part) additionally dedups cheaply
-        // into an exact list, cancelling the Bloom's false positives.
+        // One membership structure per build side. A dense key range gets an
+        // exact bitmap (see JoinKeyBitmap); anything else a Bloom. Deciding
+        // from min/max first keeps this one pass over the keys, and a bitmap
+        // insert (an index and a bit set) is cheaper than a Bloom insert (a
+        // hash and a random miss), so the dense case builds faster too.
+        if (JoinKeyBitmap::worth_building(mn, mx, JoinBloomFilter::bits_for(valid_rows))) {
+            slot.bitmap = build_key_bitmap(data, n, validity, mn, mx);
+            slot.min = mn;
+            slot.max = mx;
+            return;  // exact already: no Bloom, no in-list
+        }
+        // Otherwise a Bloom -- even alongside an exact list, the Bloom is the
+        // probe fast path (see DynamicScanFilter::passes). Duplicate inserts
+        // are harmless. A small build side (dimension chains: nation, region,
+        // filtered part) additionally dedups cheaply into an exact list,
+        // cancelling the Bloom's false positives.
         constexpr std::size_t kInListBuildMax = 4096;
         constexpr std::size_t kInListMax = 1024;
         JoinBloomFilter bloom(valid_rows);

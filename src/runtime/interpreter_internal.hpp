@@ -1363,6 +1363,11 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 /// alone: it calls `infer_schema` on both children.
 [[nodiscard]] auto is_streamable_pair_int_join(const ir::JoinNode& join) -> bool;
 
+/// Every key of `join` is Int64 on both sides, schema-provable -- the type
+/// half of `is_streamable_pair_int_join`, shared with the semi/anti gate's
+/// two-key case. Calls `infer_schema` on both children.
+[[nodiscard]] auto join_keys_provably_int64(const ir::JoinNode& join) -> bool;
+
 /// Whole-table single-key inner join, implemented over
 /// `ChunkedInnerJoinOperator`. Callers must check `is_streamable_inner_join`
 /// first; richer join semantics remain in `join_table_impl`, which is the
@@ -1894,6 +1899,15 @@ enum class FloatCleanMode : std::uint8_t {
 [[nodiscard]] auto build_operator(const ir::Node& node, const TableRegistry& registry,
                                   const ScalarRegistry* scalars, const ExternRegistry* externs,
                                   const ExecutionContext& exec, ModelResult* model_out)
+    -> std::expected<OperatorPtr, std::string>;
+/// Build a map pipeline's source (`pipeline.source_node`): `build_operator`,
+/// except that an aggregate under a filter receives the filter's aggregate
+/// comparisons as a prefilter (aggregate_prefilter.hpp).
+[[nodiscard]] auto build_pipeline_source(const physical::Plan& pipeline,
+                                         const TableRegistry& registry,
+                                         const ScalarRegistry* scalars,
+                                         const ExternRegistry* externs,
+                                         const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string>;
 /// Execute an already-built migrated physical plan. Production's normal
 /// `build_operator` path calls the same implementation after planning; keeping

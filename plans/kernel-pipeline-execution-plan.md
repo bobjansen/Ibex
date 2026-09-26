@@ -265,8 +265,8 @@ separate streaming operator.
    `MaterializedCall`) or `backlog` (revisit only when profiled hot);
    `ChunkedAsTimeframeOperator` (dead since `as_timeframe` moved to a whole-table
    path) was deleted. Reopen only on a measured hot fallback.
-   **Phase 5 item 3 DONE 2026-08-29** (`5f7afc59`, `94957719`,
-   `d1204b63`; `plans/physical-fallback-adapter-plan.md`): the 15-branch
+   **Phase 5 item 3 DONE 2026-08-29** (`a5183b9a`, `d7f2d59f`,
+   `4923c02e`; see Phase 5 item 3 below for what remains): the 15-branch
    materializing per-kind switch in `build_operator_impl` is gone. Every
    non-migrated kind resolves through one `build_materialized_fallback` →
    `interpret_node`; `build_materialized_fallback` still builds the breaker's
@@ -604,12 +604,25 @@ at all (a one-valued strategy enum would be ceremony).
    `FilterProject` / `FilterUpdateProject`: both legacy types and their
    compatibility lowering are deleted.
 3. Remove obsolete `build_operator` recursion; migrate `interpret_node` to an
-   explicit physical fallback adapter. **DONE 2026-08-29** (`5f7afc59`,
-   `94957719`, `d1204b63`; `plans/physical-fallback-adapter-plan.md`). The
+   explicit physical fallback adapter. **DONE 2026-08-29** (`a5183b9a`,
+   `d7f2d59f`, `4923c02e`, `cb2888cd`; the sub-plan was retired 2026-09-23 and
+   its rules now live on `fallback_relational_inputs` /
+   `build_materialized_fallback` in `runtime_entry.cpp`). The
    materializing per-kind switch is one `build_materialized_fallback` seam;
    `build_operator` no longer recurses through a fallback subtree (only through
    the pre-built relational inputs). `interpret_node` keeps its own recursion as
-   the fallback interpreter.
+   the fallback interpreter. Two small cleanups remain, neither affecting
+   performance:
+   - *Bare streaming sources inflate the backlog counter.* A deferred `Scan`
+     (`stream_scans`) and a chunked `ExternCall` are real streaming operators,
+     but `note_materialized_call` fires for them before `build_operator_impl`
+     branches. Either have `plan_physical` mark a bare streaming source
+     `migrated`, or leave the `EmptyChain` bare-source case out of the count.
+   - *The `Filter` / `Project` / `Rename` branches in `build_operator_impl` are
+     probably dead.* A root of those kinds over a classifiable input becomes a
+     migrated `MapPipeline`. Confirm they are reachable only on
+     `MalformedMapNode`, then delete them or replace them with
+     `invariant_violation`.
 4. Make planner / executor / kernel tests independently runnable — **DEFERRED
    2026-08-31.** `ibex_tests` is one binary linking every lib (codegen, interop,
    kafka, ...); only 9 of ~55 files need the heavy deps, and `ibex_runtime` has

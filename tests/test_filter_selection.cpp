@@ -422,3 +422,61 @@ TEST_CASE("filter_selection: the fused pass splits into row ranges without chang
         CHECK(select(table, conjuncts, parallel) == want);
     }
 }
+
+namespace {
+
+auto cmp_cols(const std::string& left, ir::CompareOp op, const std::string& right) -> ir::Expr {
+    return ir::Expr{
+        .node = ir::CompareExpr{
+            .op = op,
+            .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = left}}),
+            .right = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = right}})}};
+}
+
+// a = 0..9 against b = 4 in every row, for Date and Timestamp, so each
+// operator's answer is a row range that can be read off by hand.
+auto column_pair_table() -> runtime::Table {
+    std::vector<Date> date_a;
+    std::vector<Date> date_b;
+    std::vector<Timestamp> ts_a;
+    std::vector<Timestamp> ts_b;
+    date_a.reserve(10);
+    date_b.reserve(10);
+    ts_a.reserve(10);
+    ts_b.reserve(10);
+    for (std::int32_t i = 0; i < 10; ++i) {
+        date_a.push_back(Date{i});
+        date_b.push_back(Date{4});
+        ts_a.push_back(Timestamp{i});
+        ts_b.push_back(Timestamp{4});
+    }
+    runtime::Table table;
+    table.add_column("da", Column<Date>{std::move(date_a)});
+    table.add_column("db", Column<Date>{std::move(date_b)});
+    table.add_column("ta", Column<Timestamp>{std::move(ts_a)});
+    table.add_column("tb", Column<Timestamp>{std::move(ts_b)});
+    return table;
+}
+
+}  // namespace
+
+// The q04/q12/q21 shape (`l_commitdate < l_receiptdate`): two columns of the
+// same temporal type, which goes through compare_vec's column-vs-column
+// kernel rather than any literal fast path.
+TEST_CASE("filter_selection: Date and Timestamp column-vs-column comparisons",
+          "[filter][selection]") {
+    const auto table = column_pair_table();
+    using Rows = std::vector<std::size_t>;
+    for (const auto& [left, right] : {std::pair{"da", "db"}, std::pair{"ta", "tb"}}) {
+        INFO(left << " vs " << right);
+        CHECK(select(table, {cmp_cols(left, ir::CompareOp::Lt, right)}) == Rows{0, 1, 2, 3});
+        CHECK(select(table, {cmp_cols(left, ir::CompareOp::Le, right)}) == Rows{0, 1, 2, 3, 4});
+        CHECK(select(table, {cmp_cols(left, ir::CompareOp::Eq, right)}) == Rows{4});
+        CHECK(select(table, {cmp_cols(left, ir::CompareOp::Ne, right)}) ==
+              Rows{0, 1, 2, 3, 5, 6, 7, 8, 9});
+        CHECK(select(table, {cmp_cols(left, ir::CompareOp::Gt, right)}) == Rows{5, 6, 7, 8, 9});
+        CHECK(select(table, {cmp_cols(left, ir::CompareOp::Ge, right)}) == Rows{4, 5, 6, 7, 8, 9});
+        // Swapped operands flip the answer.
+        CHECK(select(table, {cmp_cols(right, ir::CompareOp::Lt, left)}) == Rows{5, 6, 7, 8, 9});
+    }
+}

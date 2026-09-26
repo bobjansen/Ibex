@@ -764,7 +764,16 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
 
     finish_tpch() {
         local code=$?
-        mkdir -p /ibex/benchmarking/results
+        # Nothing in here may abort the upload. tpch/results does not exist in
+        # a fresh clone until run_bench.sh first writes to it, so a failure
+        # before that point made the tar below fail, and under set -e the handler
+        # died before the upload: no artifact and no log, and the failure's
+        # evidence was lost with it (2026-09-24). The bench log and exit code
+        # now always ship.
+        set +e
+        mkdir -p /ibex/benchmarking/results /ibex/benchmarking/tpch/results
+        echo "exit_code=$code" > /ibex/benchmarking/tpch/results/exit_code.txt
+        cp /var/log/ibex-bench.log /ibex/benchmarking/tpch/results/ibex-bench.log 2>/dev/null
         {
             echo "ibex_commit=$(git -C /ibex rev-parse HEAD)"
             echo "pdsh_commit=$PDSH_COMMIT"
@@ -777,6 +786,16 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
     }
     trap finish_tpch EXIT
 
+    # A separate key from the final artifact: the launcher's wait loop exits the
+    # moment the final key appears, so a partial there would pass for a finished
+    # run (the same rule as window-OHLC's partials).
+    push_partial_tpch() {
+        mkdir -p /ibex/benchmarking/results
+        tar -C /ibex/benchmarking/tpch -czf "$ARTIFACT" results 2>/dev/null || return 0
+        aws s3 cp "$ARTIFACT" "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY%.tar.gz}.partial.tar.gz" \
+            --region "${IBEX_REGION}" >/dev/null 2>&1 || true
+    }
+
     build_ibex
     if [[ ! -d "$PDSH_ROOT/.git" ]]; then
         git clone "$PDSH_REPO" "$PDSH_ROOT"
@@ -785,10 +804,22 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
     git -C "$PDSH_ROOT" checkout --force "$PDSH_COMMIT"
     uv sync --project /ibex
 
+    # The data comes from polars-benchmark's own generator (tpchgen-cli, then
+    # Polars' parquet writer, pinned by its requirements.txt), never from Ibex,
+    # so the layout cannot be said to favour Ibex. Its venv needs CPython 3.12
+    # (no `ray` wheel for newer); uv fetches one if the box lacks it. --seed
+    # because the Makefile's install-deps bootstraps uv through pip.
+    command -v make >/dev/null || apt_get_retry install -y --no-install-recommends make
+    if [[ ! -x "$PDSH_ROOT/.venv/bin/tpchgen-cli" ]]; then
+        rm -rf "$PDSH_ROOT/.venv"
+        uv venv --seed --python 3.12 "$PDSH_ROOT/.venv"
+        make -C "$PDSH_ROOT" install-deps
+    fi
+
     IFS=',' read -r -a TPCH_SCALES <<< "${IBEX_TPCH_SCALES:-1}"
     for scale in "${TPCH_SCALES[@]}"; do
-        bash /ibex/benchmarking/tpch/gen_data.sh "$scale"
-        bash /ibex/benchmarking/tpch/gen_parquet.sh "$scale"
+        pdsh_scale="$(python3 -c 'import sys; print(float(sys.argv[1]))' "$scale")"
+        make -C "$PDSH_ROOT" data-tables SCALE_FACTOR="$pdsh_scale"
         # --cores is load-bearing on a big box: run_bench.sh pins every engine to
         # the same set, and without it Polars sizes its pool from nproc, thrashes
         # above ~8 threads, and inflates Ibex's lead. run-tpch.sh resolves the
@@ -796,15 +827,50 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
         # unpinned".
         TPCH_ARGS=(--sf "$scale" --warmup "${IBEX_WARMUP:-1}" --iters "${IBEX_ITERS:-5}"
                    --pdsh-root "$PDSH_ROOT")
-        if [[ -n "${IBEX_TPCH_CORES:-}" && "${IBEX_TPCH_CORES}" != "0" ]]; then
-            TPCH_ARGS+=(--cores "${IBEX_TPCH_CORES}")
-        fi
         # The in-memory Polars executor materialises whole tables and OOMs the
         # box at high scale factors; the streaming pass still gives a reference.
         if [[ "${IBEX_TPCH_POLARS_IN_MEMORY:-1}" == "0" ]]; then
             TPCH_ARGS+=(--no-polars-in-memory --polars-streaming)
         fi
-        bash /ibex/benchmarking/tpch/run_bench.sh "${TPCH_ARGS[@]}"
+        # IBEX_TPCH_CORES may be a list (2,4,8,16): one full run per count on
+        # this box -- a scaling curve whose points share the hardware, each with
+        # its own 1-core rows. Every finished count is pushed as a partial
+        # artifact, so a stall late in the curve loses one point, not all.
+        IFS=',' read -r -a TPCH_CORE_LIST <<< "${IBEX_TPCH_CORES:-0}"
+        # Profile mode (run-tpch.sh --profile): no timing suite. Run the two
+        # attribution tools per core count instead -- breaker_map.py (idle
+        # capacity per operator) and profile_suite.py (serial / barrier / ring /
+        # pool buckets per query) -- so the serial time is ranked on physical
+        # cores rather than on the dev box's hybrid ones. Neither tool pins
+        # itself, hence the taskset. The queries read the `parquet` symlink,
+        # which run_bench.sh would normally have pointed at this scale.
+        if [[ "${IBEX_TPCH_PROFILE:-0}" == "1" ]]; then
+            mkdir -p /ibex/benchmarking/data/tpch  # untracked: absent on a fresh clone
+            ln -sfn "$PDSH_ROOT/data/tables/scale-${pdsh_scale}" /ibex/benchmarking/data/tpch/parquet
+            PROFILE_OUT=/ibex/benchmarking/tpch/results/profile
+            mkdir -p "$PROFILE_OUT"
+            lscpu > "$PROFILE_OUT/lscpu.txt" 2>&1 || true
+            for cores in "${TPCH_CORE_LIST[@]}"; do
+                [[ -n "$cores" && "$cores" != "0" ]] || continue
+                for tool in breaker_map profile_suite; do
+                    echo "=== profile: ${tool} SF-${scale} ${cores}c ==="
+                    taskset -c "0-$((cores - 1))" python3 "/ibex/benchmarking/${tool}.py" "$cores" \
+                        > "$PROFILE_OUT/${tool}_sf${scale}_${cores}c.txt" 2>&1 \
+                        || echo "${tool} ${cores}c exited $?" >> "$PROFILE_OUT/failures.txt"
+                    tail -3 "$PROFILE_OUT/${tool}_sf${scale}_${cores}c.txt"
+                done
+                push_partial_tpch
+            done
+            continue
+        fi
+        for cores in "${TPCH_CORE_LIST[@]}"; do
+            CORE_ARGS=()
+            if [[ -n "$cores" && "$cores" != "0" ]]; then
+                CORE_ARGS=(--cores "$cores" --label "aws sf${scale} ${cores}c")
+            fi
+            bash /ibex/benchmarking/tpch/run_bench.sh "${TPCH_ARGS[@]}" "${CORE_ARGS[@]}"
+            push_partial_tpch
+        done
     done
     exit 0
 fi

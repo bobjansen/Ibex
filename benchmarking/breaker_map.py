@@ -7,18 +7,41 @@
 "how much capacity did this query waste". This tool answers the next question:
 *which operator wasted it*, and what kind of boundary that operator is.
 
-The decomposition that makes this work is an identity, not an estimate. Each
-`profile node=` row reports `self_ms` (exclusive time on the calling thread --
-the row's own work, children excluded) and `pool_work_ms` (work its own fan-out
-ran on pool threads). During one operator's exclusive window the pool offers
-`self_ms * workers` core-milliseconds, so
+The decomposition is an approximation, not an identity, and it is worth being
+honest about which. Each `profile node=` row reports `self_ms` (exclusive time
+on the calling thread) and pool utilization: `pool_work_ms` (its own fan-out's
+tasks), plus `pool_next_ms`/`pool_source_ms` (time this operator's own scope
+spent running ON a pool thread, as part of someone ELSE's fan-out -- excluded
+from `self_ms` for that reason, but real utilization this operator's row
+should still get credit for, so all three are summed here). During one
+operator's exclusive window the pool offers `self_ms * workers`
+core-milliseconds, so
 
-    idle_core_ms = self_ms * workers - pool_work_ms
+    idle_core_ms = self_ms * workers - pool_work_ms - pool_next_ms - pool_source_ms
 
-is the capacity that operator left on the floor. Because the self times
-partition the wall clock, these sum to the query's `pool_unqueued_ms` -- the
-closure is printed per query and a drift means the attribution is wrong, in
-exactly the spirit of profile_suite.py's own closure column.
+is the capacity that operator left on the floor -- ASSUMING that window did
+not overlap another operator's. `self_ms` is an accounting construct (call-
+stack exclusive time), not a wall-clock-exclusivity guarantee: two operators
+can legitimately run at the same physical time (a streaming scan still
+decoding while its consumer runs, a semi join's build overlapping a sibling's
+probe -- precisely the overlap the multicore work is trying to create). When
+that happens, capacity a donor operator borrowed from a concurrent window
+shows up as a large NEGATIVE row for the donor (it did more work than its own
+window could explain -- overlap succeeding, not an error) without a matching
+reduction on the operator(s) it overlapped, which reads that shared capacity
+as unused when it was not. The result inflates idle on the concurrent side.
+
+So the identity to check is `sum(idle_core_ms) == pool_unqueued_ms` (the
+pool's own directly-sampled "nothing queued" time, not attributable per row),
+and it is printed as `closure` per query. Near 100% means this query's
+operators ran close enough to sequentially that the per-row breakdown means
+what it says. A query whose closure drifts hard (either direction) means
+enough concurrent execution happened that the per-row attribution cannot be
+trusted for that query -- it is flagged in the report and excluded from the
+suite-wide family/boundary/label totals rather than silently corrupting them.
+This is NOT the same caveat as "small queries are noisy" (query_shape docs
+used to say that): large queries drift too, exactly because they are the ones
+with real overlap to attribute.
 
 Ranking by this rather than by elapsed time is the point: a breaker that is
 internally parallel but starves behind its producer shows up here, and a serial
@@ -147,7 +170,27 @@ def attribute(summary: dict, rows: list[dict]) -> list[dict]:
         self_ms = row.get("build_self_ms", 0.0) + row.get("next_self_ms", 0.0) + row.get(
             "source_self_ms", 0.0
         )
-        pool = row.get("pool_work_ms", 0.0)
+        # All three pool signals count as capacity this operator's row used:
+        # `pool_work_ms` is its own submitted batch; `pool_next_ms`/
+        # `pool_source_ms` is this operator's own scope running on a pool
+        # thread as part of someone else's fan-out. Only `pool_work_ms` used
+        # to be counted, which read a "source decode selected"-style row as
+        # entirely idle even when it was 100% pool-side work end to end.
+        pool = (
+            row.get("pool_work_ms", 0.0)
+            + row.get("pool_next_ms", 0.0)
+            + row.get("pool_source_ms", 0.0)
+        )
+        # A row with no self window at all (some "source decode
+        # selected"/"source dynamic key scan" rows are pure pool-side
+        # sub-phases that never touch the calling thread, by construction --
+        # self_ms is always 0) has nothing for `idle_core_ms` to be relative
+        # to. self_ms * workers is 0 regardless, so folding pool_next_ms/
+        # pool_source_ms into `pool` for these rows would only ever produce a
+        # phantom negative -- there is no window whose capacity that pool time
+        # could have been idle relative to. Report their pool time (real
+        # utilization, worth seeing) without pricing it as idle.
+        idle = 0.0 if self_ms == 0.0 else self_ms * workers - pool
         family, boundary = classify(row["label"])
         out.append(
             {
@@ -157,7 +200,7 @@ def attribute(summary: dict, rows: list[dict]) -> list[dict]:
                 "boundary": boundary,
                 "self_ms": self_ms,
                 "pool_work_ms": pool,
-                "idle_core_ms": self_ms * workers - pool,
+                "idle_core_ms": idle,
                 "barrier_wait_ms": row.get("barrier_wait_ms", 0.0),
                 "ring_wait_ms": row.get("ring_wait_ms", 0.0),
                 "barriers": row.get("barriers", 0.0),
@@ -166,6 +209,23 @@ def attribute(summary: dict, rows: list[dict]) -> list[dict]:
             }
         )
     return sorted(out, key=lambda r: -r["idle_core_ms"])
+
+
+# Below this closure band, the per-row breakdown for a query is not a reading
+# of that query's operators any more -- it is measuring how much concurrent,
+# overlapping execution happened, which this row-level model cannot attribute.
+# The band is wide on purpose: closure is a noisy quantity even for a
+# genuinely sequential query (timer granularity, thread-startup latency on
+# short runs), and the goal is to catch the qualitative break (2-7x off, as
+# seen on queries with a streaming scan under a concurrent consumer), not to
+# police every few percent.
+CLOSURE_RELIABLE = (50.0, 175.0)
+
+
+def is_reliable(closure: float, unqueued: float) -> bool:
+    if unqueued <= 0.0:
+        return True
+    return CLOSURE_RELIABLE[0] <= closure <= CLOSURE_RELIABLE[1]
 
 
 def main() -> int:
@@ -191,6 +251,7 @@ def main() -> int:
     per_boundary = collections.defaultdict(float)
     grand_idle = 0.0
     grand_wall = 0.0
+    unreliable: list[str] = []
     print(
         f"\n{'query':6}{'wall':>8}{'workers':>8}{'idle':>10}{'unqueued':>10}{'closure':>9}"
         f"   top operators by idle core-ms"
@@ -209,23 +270,38 @@ def main() -> int:
         idle = sum(r["idle_core_ms"] for r in attributed)
         unqueued = summary.get("pool_unqueued_ms", 0.0)
         closure = 100.0 * idle / unqueued if unqueued > 0 else 0.0
-        grand_idle += idle
+        reliable = is_reliable(closure, unqueued)
         grand_wall += summary.get("wall_ms", 0.0)
-        for row in attributed:
-            per_family[row["family"]] += row["idle_core_ms"]
-            per_boundary[row["boundary"]] += row["idle_core_ms"]
-            per_label[row["label"].split(" ")[0]] += row["idle_core_ms"]
+        if reliable:
+            grand_idle += idle
+            for row in attributed:
+                per_family[row["family"]] += row["idle_core_ms"]
+                per_boundary[row["boundary"]] += row["idle_core_ms"]
+                per_label[row["label"].split(" ")[0]] += row["idle_core_ms"]
+        else:
+            unreliable.append(query.stem)
         top = ", ".join(
             f"{r['label'][:28]} {r['idle_core_ms']:.0f}" for r in attributed[:3]
             if r["idle_core_ms"] > 1.0
         )
+        flag = "" if reliable else "  UNRELIABLE (concurrent execution broke attribution)"
         print(
             f"{query.stem:6}{summary.get('wall_ms', 0.0):8.1f}"
             f"{summary.get('workers', 0.0):8.0f}{idle:10.1f}{unqueued:10.1f}"
-            f"{closure:8.1f}%   {top}"
+            f"{closure:8.1f}%   {top}{flag}"
         )
 
-    print(f"\n{'TOTAL':6}{grand_wall:8.1f}{'':8}{grand_idle:10.1f}")
+    if unreliable:
+        print(
+            f"\n# {len(unreliable)} quer{'y is' if len(unreliable) == 1 else 'ies are'} "
+            f"excluded from the totals below (closure outside "
+            f"{CLOSURE_RELIABLE[0]:.0f}-{CLOSURE_RELIABLE[1]:.0f}%, meaning enough of this "
+            f"query overlapped concurrently that the self_ms*workers-pool_work split cannot "
+            f"be trusted): {', '.join(unreliable)}. Their per-query detail is still printed "
+            f"below for inspection, not as a ranking."
+        )
+    print(f"\n{'TOTAL':6}{grand_wall:8.1f}{'':8}{grand_idle:10.1f}"
+          f"   (reliable queries only, {len(details) - len(unreliable)}/{len(details)})")
 
     print("\n# idle core-ms by breaker family")
     for family, idle in sorted(per_family.items(), key=lambda kv: -kv[1]):
@@ -242,7 +318,8 @@ def main() -> int:
 
     print("\n# per-query operator detail (idle core-ms, > 1ms)")
     for name, rows in details.items():
-        print(f"\n  {name}")
+        note = "  [UNRELIABLE -- see closure above]" if name in unreliable else ""
+        print(f"\n  {name}{note}")
         print(
             f"    {'operator':32}{'family':10}{'bound':9}{'self':>9}{'pool':>10}"
             f"{'idle':>9}{'barrier':>9}{'ring':>9}{'rows':>12}"

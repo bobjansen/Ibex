@@ -44,6 +44,7 @@
 #include <variant>
 #include <vector>
 
+#include "execution_profile_internal.hpp"
 #include "join_chunked_internal.hpp"
 
 using namespace ibex;
@@ -1003,6 +1004,221 @@ TEST_CASE("chunked aggregate: clustered integer counts merge runs across chunks"
     auto mismatch = runtime::compare_tables(whole, chunked);
     if (mismatch.has_value()) {
         FAIL(mismatch->message());
+    }
+}
+
+TEST_CASE("chunked aggregate: a clustered sum's map-free merge equals serial, in order or not",
+          "[runtime][chunked][aggregate]") {
+    // q18's shape: sum(Double) by one Int64 key, streamed in chunks, which
+    // takes the async hot path. Its cold merge skips the hash map while a
+    // partition's keys never decrease, and indexes what it has the moment one
+    // does. Chunks of 70001 rows cut three-row key runs, so a group's rows
+    // arrive in two jobs. The second shape goes backwards part way through,
+    // into groups that already exist, then on to new ones: without the switch
+    // to the map those rows would become duplicate groups. The sums are
+    // order-sensitive, so bit equality also pins the order records are added.
+    constexpr std::int64_t kRows = 400'000;
+    const auto clustered = [](std::int64_t row) { return row / 3; };
+    const auto backwards = [](std::int64_t row) {
+        if (row >= 240'000 && row < 300'000) {
+            return (row / 3) % 5'000;
+        }
+        return row / 3;
+    };
+    for (const bool goes_backwards : {false, true}) {
+        INFO("goes backwards: " << goes_backwards);
+        runtime::TableRegistry registry;
+        {
+            Column<std::int64_t> g;
+            Column<double> v;
+            for (std::int64_t row = 0; row < kRows; ++row) {
+                g.push_back(goes_backwards ? backwards(row) : clustered(row));
+                v.push_back(1e9 + (static_cast<double>(row % 991) * 0.125));
+            }
+            runtime::Table t;
+            t.add_column("g", std::move(g));
+            t.add_column("v", std::move(v));
+            registry.emplace("t", std::move(t));
+        }
+        auto program = parser::parse("t[select { s = sum(v) }, by { g }];");
+        REQUIRE(program.has_value());
+        auto ir = parser::lower(program.value());
+        REQUIRE(ir.has_value());
+
+        const ChunkGrainGuard guard{"70001"};
+        runtime::ExecutionContext serial;
+        serial.parallel_threads = 1;
+        runtime::ParallelPipelineStats stats;
+        runtime::ExecutionContext parallel;
+        parallel.parallel_threads = 8;
+        parallel.parallel_min_rows = 0;
+        parallel.parallel_stats = &stats;
+        const auto s = runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, serial);
+        const auto p =
+            runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+        REQUIRE(s.has_value());
+        REQUIRE(p.has_value());
+        REQUIRE(stats.parallel_aggregate_partitions.load() > 0);
+        // The backwards stretch revisits keys 0..4999, so keys 80000..99999
+        // never occur.
+        REQUIRE(s->rows() == (goes_backwards ? std::size_t{113'334} : std::size_t{133'334}));
+        REQUIRE(p->rows() == s->rows());
+        const auto& sg = std::get<Column<std::int64_t>>(*s->find("g"));
+        const auto& pg = std::get<Column<std::int64_t>>(*p->find("g"));
+        const auto& sv = std::get<Column<double>>(*s->find("s"));
+        const auto& pv = std::get<Column<double>>(*p->find("s"));
+        for (std::size_t i = 0; i < s->rows(); ++i) {
+            INFO("group " << i);
+            REQUIRE(sg[i] == pg[i]);
+            REQUIRE(sv[i] == pv[i]);
+        }
+    }
+}
+
+TEST_CASE("chunked aggregate: an Int64 sum by one Int64 key streams through the hot table",
+          "[runtime][chunked][aggregate]") {
+    // q18 since l_quantity became Int64: sum(Int64) by one Int64 key. The
+    // async hot table used to admit only Double sums, so this shape fell back
+    // to three pool barriers per chunk -- 1,556 of them at SF-8 on Polars'
+    // 122,880-row row groups, and 4.8x the Double query's time. The values
+    // sit above 2^53, so a sum that went through `double_value` anywhere
+    // (they share storage in AggSlotCore) cannot come out exact. Expected
+    // sums are computed here, in first-seen order, not by another engine run.
+    constexpr std::int64_t kRows = 400'000;
+    constexpr std::int64_t kBase = std::int64_t{3'000'000'000'000'000};
+    const auto clustered = [](std::int64_t row) { return row / 3; };
+    const auto backwards = [](std::int64_t row) {
+        if (row >= 240'000 && row < 300'000) {
+            return (row / 3) % 5'000;
+        }
+        return row / 3;
+    };
+    for (const bool goes_backwards : {false, true}) {
+        INFO("goes backwards: " << goes_backwards);
+        runtime::TableRegistry registry;
+        std::vector<std::int64_t> want_keys;
+        std::map<std::int64_t, std::int64_t> want_sums;
+        {
+            Column<std::int64_t> g;
+            Column<std::int64_t> v;
+            for (std::int64_t row = 0; row < kRows; ++row) {
+                const std::int64_t key = goes_backwards ? backwards(row) : clustered(row);
+                const std::int64_t value = kBase + (row % 991);
+                g.push_back(key);
+                v.push_back(value);
+                if (!want_sums.contains(key)) {
+                    want_keys.push_back(key);
+                }
+                want_sums[key] += value;
+            }
+            runtime::Table t;
+            t.add_column("g", std::move(g));
+            t.add_column("v", std::move(v));
+            registry.emplace("t", std::move(t));
+        }
+        auto program = parser::parse("t[select { s = sum(v) }, by { g }];");
+        REQUIRE(program.has_value());
+        auto ir = parser::lower(program.value());
+        REQUIRE(ir.has_value());
+
+        const ChunkGrainGuard guard{"70001"};
+        runtime::ExecutionContext parallel;
+        parallel.parallel_threads = 8;
+        parallel.parallel_min_rows = 0;
+        auto profile = std::make_shared<runtime::ExecutionProfileState>(/*worker_budget=*/8,
+                                                                        /*report=*/false);
+        parallel.execution_profile = profile;
+        const auto p =
+            runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+        REQUIRE(p.has_value());
+
+        // The hot table submits one task per chunk and joins once at end of
+        // stream (the Double path counts the same single barrier). The
+        // per-chunk fallback parks at two barriers per chunk: 12 here.
+        const auto rows = profile->snapshot();
+        const auto discovery = std::ranges::find_if(
+            rows, [](const auto& r) { return r.label == "Aggregate.Discovery"; });
+        const std::uint64_t discovery_barriers = discovery == rows.end() ? 0 : discovery->barriers;
+        CHECK(discovery_barriers <= 1);
+
+        REQUIRE(p->rows() == want_keys.size());
+        const auto& pg = std::get<Column<std::int64_t>>(*p->find("g"));
+        const auto& pv = std::get<Column<std::int64_t>>(*p->find("s"));
+        for (std::size_t i = 0; i < want_keys.size(); ++i) {
+            INFO("group " << i);
+            REQUIRE(pg[i] == want_keys[i]);
+            REQUIRE(pv[i] == want_sums.at(want_keys[i]));
+        }
+    }
+}
+
+TEST_CASE("chunked aggregate: an Int64 sum by two Int64 keys streams through the pair path",
+          "[runtime][chunked][aggregate]") {
+    // q20's shape since l_quantity became Int64: sum(Int64) by (l_partkey,
+    // l_suppkey). The async pair path (one task per chunk routing records to
+    // their owner, one join at end of stream) admitted only Double sums, like
+    // the hot table above did. Keys repeat far apart, so every group's rows
+    // span several chunk jobs and the owners' merge adds them. Values sit
+    // above 2^53, so a sum that went through `double_value` cannot come out
+    // exact. Expected sums are computed here, in first-seen order.
+    constexpr std::int64_t kRows = 400'000;
+    constexpr std::int64_t kBase = std::int64_t{3'000'000'000'000'000};
+    runtime::TableRegistry registry;
+    std::vector<std::pair<std::int64_t, std::int64_t>> want_keys;
+    std::map<std::pair<std::int64_t, std::int64_t>, std::int64_t> want_sums;
+    {
+        Column<std::int64_t> a;
+        Column<std::int64_t> b;
+        Column<std::int64_t> v;
+        for (std::int64_t row = 0; row < kRows; ++row) {
+            const std::pair<std::int64_t, std::int64_t> key{(row * 7) % 20'011, row % 4};
+            const std::int64_t value = kBase + (row % 991);
+            a.push_back(key.first);
+            b.push_back(key.second);
+            v.push_back(value);
+            if (!want_sums.contains(key)) {
+                want_keys.push_back(key);
+            }
+            want_sums[key] += value;
+        }
+        runtime::Table t;
+        t.add_column("a", std::move(a));
+        t.add_column("b", std::move(b));
+        t.add_column("v", std::move(v));
+        registry.emplace("t", std::move(t));
+    }
+    auto program = parser::parse("t[select { s = sum(v) }, by { a, b }];");
+    REQUIRE(program.has_value());
+    auto ir = parser::lower(program.value());
+    REQUIRE(ir.has_value());
+
+    const ChunkGrainGuard guard{"70001"};
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 8;
+    parallel.parallel_min_rows = 0;
+    auto profile = std::make_shared<runtime::ExecutionProfileState>(/*worker_budget=*/8,
+                                                                    /*report=*/false);
+    parallel.execution_profile = profile;
+    const auto p = runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+    REQUIRE(p.has_value());
+
+    // One end-of-stream join, however many chunks; the per-chunk fallback
+    // parks at pool barriers for every chunk.
+    const auto rows = profile->snapshot();
+    const auto discovery =
+        std::ranges::find_if(rows, [](const auto& r) { return r.label == "Aggregate.Discovery"; });
+    const std::uint64_t discovery_barriers = discovery == rows.end() ? 0 : discovery->barriers;
+    CHECK(discovery_barriers <= 1);
+
+    REQUIRE(p->rows() == want_keys.size());
+    const auto& pa = std::get<Column<std::int64_t>>(*p->find("a"));
+    const auto& pb = std::get<Column<std::int64_t>>(*p->find("b"));
+    const auto& pv = std::get<Column<std::int64_t>>(*p->find("s"));
+    for (std::size_t i = 0; i < want_keys.size(); ++i) {
+        INFO("group " << i);
+        REQUIRE(pa[i] == want_keys[i].first);
+        REQUIRE(pb[i] == want_keys[i].second);
+        REQUIRE(pv[i] == want_sums.at(want_keys[i]));
     }
 }
 

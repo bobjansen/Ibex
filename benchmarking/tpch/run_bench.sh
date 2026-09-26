@@ -9,12 +9,15 @@
 # the MT row and disabled for the ST row, making the comparison reproducible
 # even when the caller has ambient IBEX_* settings.
 #
-# Prerequisite (once per scale factor):
-#   ./gen_data.sh <scale> && ./gen_parquet.sh <scale>
+# Prerequisite (once per scale factor), in the polars-benchmark checkout:
+#   make data-tables SCALE_FACTOR=<scale>.0
+# The data is polars-benchmark's own (tpchgen-cli, then Polars' parquet writer),
+# never Ibex-written, so the layout cannot be said to favour Ibex.
 #
 # The queries read benchmarking/data/tpch/parquet/, a symlink this script points
-# at parquet_sf<scale>/ for the scale it is timing. Correctness (check_answers.py)
-# is only defined at SF-1; higher scales are timing-only.
+# at <pdsh-root>/data/tables/scale-<scale>/ for the scale it is timing.
+# check_answers.py (official answers) is only defined at SF-1; at every scale
+# the answers are diffed against Polars before timing (below).
 #
 # Every run is also ARCHIVED under results/runs/<utc>_<commit>/ with a manifest
 # recording the commit, the settings and the box. results/ itself keeps holding
@@ -38,7 +41,14 @@
 # Usage:
 #   ./run_bench.sh [--sf N] [--warmup N] [--iters N] [--pdsh-root DIR]
 #                  [--polars-streaming] [--no-polars-in-memory] [--no-duckdb]
-#                  [--cores N] [--label TEXT] [--no-archive]
+#                  [--cores N] [--label TEXT] [--no-archive] [--no-answer-check]
+#
+# Before timing anything, every Ibex answer is diffed against upstream Polars
+# at this scale (check_against_polars.py), and a mismatch aborts the run. The
+# official answers only exist at SF-1, and the timing passes discard output, so
+# without this a query can be wrong at the benchmarked scale and still be timed
+# against Polars computing the right answer. q11 was, for two months.
+# --no-answer-check skips it, and the manifest records that it was skipped.
 
 set -euo pipefail
 
@@ -54,6 +64,7 @@ POLARS_STREAMING=0
 POLARS_IN_MEMORY=1
 DUCKDB=1
 ARCHIVE=1
+ANSWER_CHECK=1
 LABEL=""
 # Cores the whole comparison is pinned to. Unset means "every core on the box",
 # which is the wrong default for a CROSS-ENGINE run on a big local machine:
@@ -73,6 +84,7 @@ while [[ $# -gt 0 ]]; do
         --cores)  CORES="$2"; shift 2 ;;
         --label)  LABEL="$2"; shift 2 ;;
         --no-archive) ARCHIVE=0; shift ;;
+        --no-answer-check) ANSWER_CHECK=0; shift ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -89,16 +101,19 @@ if [[ -z "$PDSH_ROOT" ]]; then
     done
 fi
 
-PARQUET_DIR="$DATA_ROOT/parquet_sf${SCALE}"
-if [[ ! -d "$PARQUET_DIR" ]]; then
-    echo "error: $PARQUET_DIR not found — run ./gen_data.sh $SCALE && ./gen_parquet.sh $SCALE first" >&2
-    exit 1
-fi
-
 if [[ -z "$PDSH_ROOT" || ! -d "$PDSH_ROOT/queries/polars" ]]; then
     echo "error: no pola-rs/polars-benchmark checkout found." >&2
     echo "       git clone https://github.com/pola-rs/polars-benchmark.git ~/polars-benchmark" >&2
     echo "       (or pass --pdsh-root DIR / set PDSH_ROOT). For ibex-only timing use bench_ibex.py." >&2
+    exit 1
+fi
+PDSH_ROOT="$(cd "$PDSH_ROOT" && pwd)"
+
+# polars-benchmark names the directory after the float scale: SF 8 -> scale-8.0.
+PDSH_SCALE="$(python3 -c 'import sys; print(float(sys.argv[1]))' "$SCALE")"
+PARQUET_DIR="$PDSH_ROOT/data/tables/scale-${PDSH_SCALE}"
+if [[ ! -d "$PARQUET_DIR" ]]; then
+    echo "error: $PARQUET_DIR not found — run \`make data-tables SCALE_FACTOR=${PDSH_SCALE}\` in $PDSH_ROOT first" >&2
     exit 1
 fi
 
@@ -180,6 +195,10 @@ archive_run() {
         printf '  "kernel": "%s",\n' "$(uname -r)"
         printf '  "cpu": "%s",\n' "$(LC_ALL=C lscpu 2>/dev/null | sed -n 's/^Model name: *//p' | head -1)"
         printf '  "nproc": %s,\n' "$(nproc)"
+        printf '  "answers_checked": "%s",\n' "$ANSWERS_CHECKED"
+        printf '  "dataset": "%s",\n' "$PARQUET_DIR"
+        printf '  "pdsh_commit": "%s",\n' "$(git -C "$PDSH_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+        printf '  "tpchgen_cli": "%s",\n' "$("$PDSH_ROOT/.venv/bin/tpchgen-cli" --version 2>/dev/null | head -1 || echo unknown)"
         printf '  "label": "%s"\n' "$LABEL"
         printf '}\n'
     } > "$dir/manifest.json"
@@ -197,9 +216,32 @@ archive_run() {
     return 0
 }
 
-# Point the path the queries read at this scale's data.
-ln -sfn "parquet_sf${SCALE}" "$DATA_ROOT/parquet"
-echo "=== scale factor: SF-${SCALE} (parquet -> parquet_sf${SCALE}) ==="
+# Point the path the queries read at this scale's data. The directory is
+# untracked and nothing else creates it any more (gen_data.sh used to, as a
+# side effect), so a clean checkout -- every AWS box -- does not have it.
+mkdir -p "$DATA_ROOT"
+ln -sfn "$PARQUET_DIR" "$DATA_ROOT/parquet"
+echo "=== scale factor: SF-${SCALE} (parquet -> ${PARQUET_DIR}) ==="
+
+# A timing comparison between two different answers means nothing, so the
+# answers are diffed against Polars first, over the same Parquet and pinned the
+# same way. This takes about 15 s at SF-8.
+ANSWERS_CHECKED=skipped
+if [[ "$ANSWER_CHECK" -eq 1 ]]; then
+    echo "=== answers vs upstream Polars (SF-${SCALE}) ==="
+    check_rc=0
+    "${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/check_against_polars.py" \
+        --sf "$SCALE" --pdsh-root "$PDSH_ROOT" || check_rc=$?
+    if [[ "$check_rc" -eq 1 ]]; then
+        echo "error: Ibex and Polars disagree at SF-${SCALE}; not timing. Fix the query, or pass --no-answer-check." >&2
+        exit 1
+    elif [[ "$check_rc" -ne 0 ]]; then
+        # A crash or a setup error is not a disagreement; say which it was.
+        echo "error: the answer check itself failed (exit ${check_rc}) at SF-${SCALE}; not timing. See its output above." >&2
+        exit 1
+    fi
+    ANSWERS_CHECKED=polars
+fi
 
 # Results are suffixed by scale so runs at different scales do not clobber.
 SUFFIX="_sf${SCALE}"

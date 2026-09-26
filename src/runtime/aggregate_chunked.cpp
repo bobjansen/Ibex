@@ -3462,11 +3462,19 @@ class HashAggregateState final {
         return cell;
     }
 
-    /// Rebuild the cell -> gid array when the strides changed, which happens
-    /// when a chunk introduces new dictionary entries. Rare: Categorical dicts
-    /// are usually stable.
+    /// Rebuild the cell -> gid array when a chunk introduced new dictionary
+    /// entries. Rare: Categorical dicts are usually stable.
+    ///
+    /// The strides alone do not tell. A key's stride is the product of the
+    /// dictionary sizes AFTER it, so growing the FIRST key's dictionary adds
+    /// cells without moving any stride: `{f, s}` with |f| 3 -> 4 and |s| = 2
+    /// keeps strides {2, 1} while the cells go 6 -> 8. Checking only the
+    /// strides left the array at 6 and indexed the new value's cells past its
+    /// end -- the rows of a key value first seen in a later chunk landed in
+    /// another group or vanished.
     void ensure_multi_cat_dense(const CatCellPlan& plan) {
-        if (multi_cat_strides_ == plan.strides) {
+        if (multi_cat_strides_ == plan.strides &&
+            multi_cat_cell_dense_.size() >= static_cast<std::size_t>(plan.total_cells)) {
             return;
         }
         multi_cat_cell_dense_.assign(static_cast<std::size_t>(plan.total_cells), kNoGid);

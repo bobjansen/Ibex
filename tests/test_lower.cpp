@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/column.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/schema.hpp>
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
+#include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/pipeline.hpp>
 
 #include <catch2/catch_message.hpp>
@@ -14,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <utility>
@@ -154,8 +157,19 @@ namespace {
 /// The pipeline the runtime seam would plan for this root. An empty registry is
 /// enough: these cases are about chain shape and expressions, not about which
 /// scan kind the source resolves to.
+/// Plan over an empty registry: every scan is a LAZY source.
 auto pipeline_of(const ir::Node& root) -> runtime::physical::Plan {
     return runtime::physical::plan_physical(root, runtime::TableRegistry{}, nullptr);
+}
+
+/// Plan with `df` registered as a table, so its scan is a materialized
+/// `TableScan` rather than a lazy source.
+auto pipeline_over_table(const ir::Node& root) -> runtime::physical::Plan {
+    runtime::Table df;
+    df.add_column("price", Column<std::int64_t>{1, 2, 3});
+    runtime::TableRegistry registry;
+    registry.emplace("df", std::move(df));
+    return runtime::physical::plan_physical(root, registry, nullptr);
 }
 
 auto runs_over_morsels(const runtime::physical::Plan& plan) -> bool {
@@ -193,9 +207,24 @@ TEST_CASE("A bare update bounds the parallel run", "[runtime][pipeline]") {
         auto result = parser::lower(program);
         REQUIRE(result.has_value());
 
-        const auto plan = pipeline_of(**result);
+        const auto plan = pipeline_over_table(**result);
         CHECK_FALSE(runs_over_morsels(plan));
         CHECK(plan.serial_reason == runtime::physical::SerialOnlyReason::NotParallelMap);
+        CHECK(plan.stream_only_updates == 0);
+    }
+    {
+        // Over a LAZY source the same update forms a run of its own, admitted
+        // only for a streamed scan: a streaming worker computes it in place
+        // over the unit it decoded, with none of the copies above.
+        auto program = require_parse("df[update { n = price * 2 }];");
+        auto result = parser::lower(program);
+        REQUIRE(result.has_value());
+
+        const auto plan = pipeline_of(**result);
+        REQUIRE(runs_over_morsels(plan));
+        CHECK(plan.parallel_begin == 0);
+        CHECK(plan.parallel_end == 1);
+        CHECK(plan.stream_only_updates == 1);
     }
     {
         // An update above a filter does not drag the filter out of a parallel
@@ -207,7 +236,7 @@ TEST_CASE("A bare update bounds the parallel run", "[runtime][pipeline]") {
         auto result = parser::lower(program);
         REQUIRE(result.has_value());
 
-        const auto plan = pipeline_of(**result);
+        const auto plan = pipeline_over_table(**result);
         REQUIRE(runs_over_morsels(plan));
         REQUIRE(plan.steps.size() == 2);
         CHECK(plan.steps[0].node->kind() == ir::NodeKind::Update);
@@ -215,9 +244,35 @@ TEST_CASE("A bare update bounds the parallel run", "[runtime][pipeline]") {
         // The run starts below the update, not at the root.
         CHECK(plan.parallel_begin == 1);
         CHECK(plan.parallel_end == 2);
+        CHECK(plan.stream_only_updates == 0);
         const ir::Node* input = runtime::physical::parallel_input_node(plan);
         REQUIRE(input != nullptr);
         CHECK(input->kind() == ir::NodeKind::Scan);
+    }
+    {
+        // Over a lazy source the run reaches the scan, so it takes the update
+        // too -- for a streamed run only, which `stream_only_updates` records.
+        auto program = require_parse("df[filter price > 5][update { n = price * 2 }];");
+        auto result = parser::lower(program);
+        REQUIRE(result.has_value());
+
+        const auto plan = pipeline_of(**result);
+        REQUIRE(runs_over_morsels(plan));
+        CHECK(plan.parallel_begin == 0);
+        CHECK(plan.parallel_end == 2);
+        CHECK(plan.stream_only_updates == 1);
+    }
+    {
+        // A run bounded from below by another step does not reach the scan
+        // and so never streams: the update above it stays out.
+        auto program =
+            require_parse("df[filter price > 5][update { n = price * 2 }][filter n > 12];");
+        auto result = parser::lower(program);
+        REQUIRE(result.has_value());
+
+        const auto plan = pipeline_of(**result);
+        REQUIRE(runs_over_morsels(plan));
+        CHECK(plan.stream_only_updates == 0);
     }
 }
 

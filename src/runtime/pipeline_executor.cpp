@@ -1397,45 +1397,14 @@ auto parallel_pipeline_operators(const physical::Plan& plan) -> std::vector<MapS
     return operators;
 }
 
-/// Run a physical map pipeline over morsels. The plan says which steps may run
-/// in parallel (`parallel_steps`) and what feeds them (`parallel_input_node`);
-/// this builds that input, materializes it, and executes the prefix over its
-/// morsels. It is the pipeline's parallel *mode*, not a separate executor with
-/// its own idea of what is eligible.
-///
-/// `steps` inside a plan are sink-first; the operators here run source-to-sink,
-/// so the prefix is reversed once, on the build thread.
-auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry& registry,
-                                 const ScalarRegistry* scalars, const ExternRegistry* externs,
-                                 const ExecutionContext& exec, ModelResult* model_out)
+/// The morsel run over a MATERIALIZED input: a fused join probe, a two-phase
+/// filter, morsel workers, or one whole-table chunk when splitting is not worth
+/// it. `operators` are the run's steps, source-to-sink.
+auto build_materialized_map_run(const physical::Plan& plan, const std::vector<MapStep>& operators,
+                                const ir::Node* input_node, const TableRegistry& registry,
+                                const ScalarRegistry* scalars, const ExternRegistry* externs,
+                                const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
-    const std::vector<MapStep> operators = parallel_pipeline_operators(plan);
-    const ir::Node* input_node = physical::parallel_input_node(plan);
-    if (input_node == nullptr) {
-        return std::unexpected("map pipeline: parallel mode without an input");
-    }
-
-    // Source strategy, decided here because it is a property of this run's
-    // input rather than of the query's root. A decomposable deferred scan can
-    // feed the run one unit at a time -- decode and maps in the same worker
-    // task, the ordered ring feeding whatever is above -- instead of being
-    // decoded whole and morselized. Probe scans keep their join-owned dynamic
-    // filter timing (a null filter slot is what distinguishes them) and so do
-    // not stream here.
-    if (exec.stream_scans && input_node->kind() == ir::NodeKind::Scan) {
-        const auto& scan = ir::node_cast<ir::ScanNode>(*input_node);
-        if (!registry.contains(scan.source_name())) {
-            if (const auto* deferred = exec.deferred_scan(scan.source_name());
-                deferred != nullptr && deferred->filter == nullptr) {
-                auto units = deferred_scan_units(*deferred);
-                if (units.size() > 1 && scan_pipeline_worker_count(units.size()) >= 2) {
-                    return build_pipelined_scan(operators, true, *deferred, std::move(units),
-                                                scalars, externs, exec);
-                }
-            }
-        }
-    }
-
     // Fused probe: when this pipeline's input is a streaming join, take its
     // build and its probe side and run the probe at the head of every worker
     // chain, instead of materializing the join's OUTPUT and morselizing that.
@@ -1596,6 +1565,77 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
 
     chain = std::make_unique<SerialMorselOrderValidator>(std::move(chain), expected_morsels, grain);
     return std::make_unique<OwningMorselPipelineOperator>(std::move(owned), std::move(chain));
+}
+
+/// Run a physical map pipeline over morsels. The plan says which steps may run
+/// in parallel (`parallel_steps`) and what feeds them (`parallel_input_node`);
+/// this builds that input, materializes it, and executes the prefix over its
+/// morsels. It is the pipeline's parallel *mode*, not a separate executor with
+/// its own idea of what is eligible.
+///
+/// `steps` inside a plan are sink-first; the operators here run source-to-sink,
+/// so the prefix is reversed once, on the build thread.
+auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry& registry,
+                                 const ScalarRegistry* scalars, const ExternRegistry* externs,
+                                 const ExecutionContext& exec, ModelResult* model_out)
+    -> std::expected<OperatorPtr, std::string> {
+    const std::vector<MapStep> operators = parallel_pipeline_operators(plan);
+    const ir::Node* input_node = physical::parallel_input_node(plan);
+    if (input_node == nullptr) {
+        return std::unexpected("map pipeline: parallel mode without an input");
+    }
+
+    // Source strategy, decided here because it is a property of this run's
+    // input rather than of the query's root. A decomposable deferred scan can
+    // feed the run one unit at a time -- decode and maps in the same worker
+    // task, the ordered ring feeding whatever is above -- instead of being
+    // decoded whole and morselized. Probe scans keep their join-owned dynamic
+    // filter timing (a null filter slot is what distinguishes them) and so do
+    // not stream here.
+    if (exec.stream_scans && input_node->kind() == ir::NodeKind::Scan) {
+        const auto& scan = ir::node_cast<ir::ScanNode>(*input_node);
+        if (!registry.contains(scan.source_name())) {
+            if (const auto* deferred = exec.deferred_scan(scan.source_name());
+                deferred != nullptr && deferred->filter == nullptr) {
+                auto units = deferred_scan_units(*deferred);
+                if (units.size() > 1 && scan_pipeline_worker_count(units.size()) >= 2) {
+                    return build_pipelined_scan(operators, true, *deferred, std::move(units),
+                                                scalars, externs, exec);
+                }
+            }
+        }
+    }
+
+    if (plan.stream_only_updates == 0) {
+        return build_materialized_map_run(plan, operators, input_node, registry, scalars, externs,
+                                          exec, model_out);
+    }
+    // The plan admitted the run's top updates for a streamed run only (see
+    // `Plan::stream_only_updates`). This one materializes its input, so they
+    // come back out and run above it, exactly as the serial composer would
+    // have placed them -- the whole-table update splits itself across threads.
+    const auto split = operators.end() - static_cast<std::ptrdiff_t>(plan.stream_only_updates);
+    const std::vector<MapStep> below(operators.begin(), split);
+    auto run = below.empty()
+                   ? build_pipeline_source(plan, registry, scalars, externs, exec, model_out)
+                   : build_materialized_map_run(plan, below, input_node, registry, scalars, externs,
+                                                exec, model_out);
+    if (!run.has_value()) {
+        return run;
+    }
+    OperatorPtr chain = std::move(run.value());
+    for (auto it = split; it != operators.end(); ++it) {
+        const MapStep& step = *it;
+        auto next = step.factory(step, std::move(chain), scalars, externs, exec,
+                                 &plan.source_signature, false);
+        if (!next.has_value()) {
+            return next;
+        }
+        chain = exec.execution_profile == nullptr
+                    ? std::move(next.value())
+                    : profile_operator(std::move(next.value()), exec.execution_profile, *step.node);
+    }
+    return chain;
 }
 
 /// Streams a deferred lazy scan one source unit at a time instead of decoding

@@ -33,10 +33,12 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <optional>
 #include <ratio>
 #include <robin_hood.h>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -58,6 +60,7 @@
 #include "interpreter_internal.hpp"
 #include "packed_key_encoder_internal.hpp"
 #include "runtime_internal.hpp"
+#include "scan_worker_sink_internal.hpp"
 
 namespace ibex::runtime {
 
@@ -360,6 +363,109 @@ auto bind_aggregate_columns(std::optional<physical::AggregateColumnMapping>& col
     return std::nullopt;
 }
 
+/// Per-morsel private state of one dense fused chunk: an `n_cells x
+/// n_aggs` slot array (and its moment scratch) per morsel, plus the cells
+/// each morsel met in first-occurrence order. The morsel cut is the row
+/// count's alone, so the partials -- and the merge below -- are the same
+/// arithmetic whether the morsels ran inline, fanned out, or on the scan
+/// pipeline worker that produced the chunk.
+struct DensePartials {
+    DensePartials(std::size_t morsels_in, std::size_t n_cells_in, std::size_t n_aggs,
+                  std::size_t scratch_stride)
+        : morsels(morsels_in),
+          n_cells(n_cells_in),
+          slots(morsels_in * n_cells_in * n_aggs),
+          scratch(morsels_in * n_cells_in * scratch_stride, 0.0),
+          seen(morsels_in) {}
+    std::size_t morsels;
+    std::size_t n_cells;
+    std::vector<AggSlotCore> slots;
+    std::vector<double> scratch;
+    std::vector<std::vector<std::uint32_t>> seen;
+};
+
+/// One source unit's dense aggregate partials, computed on the scan pipeline
+/// worker that produced the unit. Its cells are over the unit's OWN
+/// Categorical dictionaries, which the pipeline remaps onto shared ones only
+/// when it emits the chunk; `first_rows` (parallel to `partials.seen`) names a
+/// row of each cell, where the merge reads the shared codes instead.
+struct WorkerDensePartial {
+    std::size_t rows = 0;
+    DensePartials partials;
+    std::vector<std::vector<std::uint32_t>> first_rows;
+};
+
+/// The aggregate's `ScanWorkerSink`: while active, each pipeline worker runs
+/// the dense accumulation over the chunk it just produced -- cache-hot, on the
+/// core that decoded it -- and the aggregate merges the result instead of
+/// accumulating the chunk itself. See `HashAggregateState::activate_scan_sink`.
+class DenseAggregateScanSink final : public ScanWorkerSink {
+   public:
+    using Producer = std::function<std::unique_ptr<WorkerDensePartial>(const Chunk&)>;
+
+    void activate(Producer producer) {
+        const std::unique_lock lock(producer_mutex_);
+        producer_ = std::move(producer);
+    }
+
+    /// Waits out any worker still inside the producer: after this returns,
+    /// nothing will call into the state that installed it.
+    void deactivate() {
+        const std::unique_lock lock(producer_mutex_);
+        producer_ = nullptr;
+    }
+
+    void on_worker_chunk(std::size_t unit, const Chunk& chunk) noexcept override {
+        std::unique_ptr<WorkerDensePartial> partial;
+        {
+            const std::shared_lock lock(producer_mutex_);
+            if (!producer_) {
+                return;
+            }
+            try {
+                partial = producer_(chunk);
+            } catch (...) {  // NOLINT(bugprone-empty-catch) -- a hint; the chunk still flows
+                return;
+            }
+        }
+        if (partial == nullptr) {
+            return;
+        }
+        const std::lock_guard lock(pending_mutex_);
+        try {
+            pending_[unit] = std::move(partial);
+        } catch (...) {  // NOLINT(bugprone-empty-catch) -- as above
+        }
+    }
+
+    void on_emit(std::size_t unit, const Chunk& chunk) noexcept override {
+        const std::lock_guard lock(pending_mutex_);
+        current_.reset();
+        const auto it = pending_.find(unit);
+        if (it == pending_.end()) {
+            return;
+        }
+        if (it->second->rows == chunk.rows()) {
+            current_ = std::move(it->second);
+        }
+        pending_.erase(it);
+    }
+
+    /// The partial for the chunk the pipeline emitted last, if its worker made
+    /// one. Consuming thread only, between that emission and the next.
+    [[nodiscard]] auto take_current() -> std::unique_ptr<WorkerDensePartial> {
+        const std::lock_guard lock(pending_mutex_);
+        return std::move(current_);
+    }
+
+   private:
+    std::shared_mutex producer_mutex_;
+    Producer producer_;
+    std::mutex pending_mutex_;
+    robin_hood::unordered_map<std::size_t, std::unique_ptr<WorkerDensePartial>> pending_;
+    std::unique_ptr<WorkerDensePartial> current_;
+};
+
 class HashAggregateState final {
    public:
     /// `Cat` carries a Categorical's *code*, which the pair path may treat as
@@ -403,7 +509,8 @@ class HashAggregateState final {
                        const std::vector<ir::AggSpec>* aggregations, const ExecutionContext& exec,
                        physical::AggregateParallelism par = {},
                        std::optional<physical::AggregateColumnMapping> columns = std::nullopt,
-                       AggregatePrefilter prefilter = {})
+                       AggregatePrefilter prefilter = {},
+                       std::shared_ptr<DenseAggregateScanSink> scan_sink = nullptr)
         : child_(std::move(child)),
           group_by_(group_by),
           aggregations_(aggregations),
@@ -422,7 +529,19 @@ class HashAggregateState final {
                                       : exec.execution_profile->stage("Aggregate.FinalOrdering")),
           emission_profile_(exec.execution_profile == nullptr
                                 ? nullptr
-                                : exec.execution_profile->stage("Aggregate.Emission")) {}
+                                : exec.execution_profile->stage("Aggregate.Emission")),
+          scan_sink_(std::move(scan_sink)) {}
+
+    // Stop the scan workers computing partials nobody will merge.
+    ~HashAggregateState() {
+        if (scan_sink_ != nullptr) {
+            scan_sink_->deactivate();
+        }
+    }
+    HashAggregateState(const HashAggregateState&) = delete;
+    HashAggregateState(HashAggregateState&&) = delete;
+    auto operator=(const HashAggregateState&) -> HashAggregateState& = delete;
+    auto operator=(HashAggregateState&&) -> HashAggregateState& = delete;
 
     /// Pull and run the structural Discovery node for one chunk. The chunk is
     /// retained until `accumulate_discovery` consumes its transfer, so the
@@ -463,6 +582,32 @@ class HashAggregateState final {
         }
         active_chunk_.reset();
         return {};
+    }
+
+    /// Whether the first chunk put this operator on the path worker partials
+    /// are made for: multi-key Categorical, dense cells, slot-combinable
+    /// aggregates. The same test a scan worker's shadow applies to its own
+    /// first chunk (`prepare_worker_shadow`).
+    [[nodiscard]] auto on_worker_partial_path() const -> bool {
+        return initialized_ && columns_.has_value() && cat_fast_path_ && group_by_->size() >= 2 &&
+               multi_dense_ && !has_count_distinct_ && aggs_are_slot_combinable();
+    }
+
+    /// Prepare this operator as a scan worker's SHADOW: fixed from the first
+    /// chunk a worker produced, then only read (`compute_worker_dense_partial`).
+    /// It accumulates nothing; its plan and slot layout are what the real
+    /// operator derives from the same stream.
+    auto prepare_worker_shadow(const Chunk& chunk) -> bool {
+        std::vector<const ColumnEntry*> group_entries;
+        std::vector<const ColumnEntry*> agg_entries;
+        return !prepare_chunk(chunk, group_entries, agg_entries).has_value() &&
+               on_worker_partial_path();
+    }
+
+    /// A prepared shadow's partial for one chunk; see
+    /// `compute_worker_dense_partial`. Safe to call from several workers.
+    auto worker_partial(const Chunk& chunk) -> std::unique_ptr<WorkerDensePartial> {
+        return compute_worker_dense_partial(chunk);
     }
 
     /// Structural FinalOrdering entry. Owned-partition strategies transfer
@@ -697,16 +842,12 @@ class HashAggregateState final {
         return std::nullopt;
     }
 
-    auto discover_chunk(const Chunk& chunk) -> std::optional<std::string> {
-        discovery_transfer_ = {};
-        if (std::getenv("IBEX_AGG_PARTITION_DEBUG") != nullptr) {
-            ibex::formatting::print(stderr, "[agg_process_chunk] rows={} group_by_size={}\n",
-                                    chunk.rows(), group_by_->size());
-        }
-        // Counted here, once per chunk, because the partition gate below asks
-        // how much input this OPERATOR has — a question the per-call row count
-        // stopped answering the moment sources began arriving in pieces.
-        rows_offered_ += chunk.rows();
+    /// Bind the column mapping, resolve this chunk's key and aggregate entries,
+    /// and on the first chunk fix the aggregate plan, slot layout and key path;
+    /// on later chunks, check the types still match. Everything a chunk needs
+    /// before it can be accumulated, and nothing that accumulates it.
+    auto prepare_chunk(const Chunk& chunk, std::vector<const ColumnEntry*>& group_entries,
+                       std::vector<const ColumnEntry*>& agg_entries) -> std::optional<std::string> {
         if (auto err = bind_aggregate_columns(columns_, columns_bound_, *group_by_, *aggregations_,
                                               chunk)) {
             return err;
@@ -716,13 +857,13 @@ class HashAggregateState final {
             return "HashAggregateState: column mapping not bound";
         }
         const physical::AggregateColumnMapping& cols = *columns_;
-        std::vector<const ColumnEntry*> group_entries;
+        group_entries.clear();
         group_entries.reserve(group_by_->size());
         for (const std::size_t index : cols.group_by) {
             group_entries.push_back(&chunk.columns[index]);
         }
 
-        std::vector<const ColumnEntry*> agg_entries(aggregations_->size(), nullptr);
+        agg_entries.assign(aggregations_->size(), nullptr);
         for (std::size_t i = 0; i < aggregations_->size(); ++i) {
             const auto& agg = (*aggregations_)[i];
             const std::optional<std::size_t>& input_idx = cols.aggregate_inputs[i];
@@ -890,6 +1031,28 @@ class HashAggregateState final {
                     return "HashAggregateState: group-by column type changed across chunks";
                 }
             }
+        }
+        return std::nullopt;
+    }
+
+    auto discover_chunk(const Chunk& chunk) -> std::optional<std::string> {
+        discovery_transfer_ = {};
+        if (std::getenv("IBEX_AGG_PARTITION_DEBUG") != nullptr) {
+            ibex::formatting::print(stderr, "[agg_process_chunk] rows={} group_by_size={}\n",
+                                    chunk.rows(), group_by_->size());
+        }
+        // Counted here, once per chunk, because the partition gate below asks
+        // how much input this OPERATOR has — a question the per-call row count
+        // stopped answering the moment sources began arriving in pieces.
+        rows_offered_ += chunk.rows();
+        std::vector<const ColumnEntry*> group_entries;
+        std::vector<const ColumnEntry*> agg_entries;
+        if (auto err = prepare_chunk(chunk, group_entries, agg_entries)) {
+            return err;
+        }
+        if (scan_sink_ != nullptr && !scan_sink_decided_) {
+            scan_sink_decided_ = true;
+            scan_sink_active_ = on_worker_partial_path();
         }
 
         const std::size_t rows = chunk.rows();
@@ -3486,6 +3649,42 @@ class HashAggregateState final {
         multi_cat_strides_ = plan.strides;
     }
 
+    /// Cells of rows [begin, end) from their key codes: `sum_i code_i * s_i`.
+    static void fill_multi_cat_cells(const std::vector<const Column<Categorical>::code_type*>& raws,
+                                     const std::vector<std::uint64_t>& strides,
+                                     std::uint32_t* cells, std::size_t begin, std::size_t end) {
+        const std::size_t n_keys = raws.size();
+        if (n_keys == 2) {
+            const auto* k0 = raws[0];
+            const auto* k1 = raws[1];
+            const std::uint64_t s0 = strides[0];
+            const std::uint64_t s1 = strides[1];
+            for (std::size_t row = begin; row < end; ++row) {
+                cells[row] = static_cast<std::uint32_t>((static_cast<std::uint64_t>(k0[row]) * s0) +
+                                                        (static_cast<std::uint64_t>(k1[row]) * s1));
+            }
+            return;
+        }
+        for (std::size_t row = begin; row < end; ++row) {
+            std::uint64_t cell = 0;
+            for (std::size_t c = 0; c < n_keys; ++c) {
+                cell += static_cast<std::uint64_t>(raws[c][row]) * strides[c];
+            }
+            cells[row] = static_cast<std::uint32_t>(cell);
+        }
+    }
+
+    /// Allocate the group for `cell` under `plan`. The cell is invertible:
+    /// c_i = (cell / s_i) % dict_size_i.
+    auto new_multi_cat_group(const CatCellPlan& plan, std::size_t cell) -> std::uint32_t {
+        for (std::size_t c = 0; c < plan.strides.size(); ++c) {
+            const std::uint64_t code =
+                (static_cast<std::uint64_t>(cell) / plan.strides[c]) % plan.dict_sizes[c];
+            multi_cat_codes_flat_.push_back(static_cast<Column<Categorical>::code_type>(code));
+        }
+        return alloc_group();
+    }
+
     /// Multi-key Categorical, fused and parallel -- the same private-slot pass
     /// the single-key path uses, over the Cartesian cell instead of the code.
     ///
@@ -3494,7 +3693,7 @@ class HashAggregateState final {
     /// back: two passes and two pool barriers per chunk over the same rows, on
     /// top of materializing a gid array nothing else wanted. PDS-H q01 is 47M
     /// rows by `{l_returnflag, l_linestatus}` -- 6 cells -- and spent every one
-    /// of its 46 chunks that way.
+    /// of its chunks that way.
     auto try_process_rows_cat_multi_parallel(
         const std::vector<const Column<Categorical>*>& cat_cols,
         const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows) -> bool {
@@ -3513,10 +3712,20 @@ class HashAggregateState final {
             return false;
         }
         ensure_multi_cat_dense(plan);
+        if (scan_sink_active_) {
+            // The worker cut its morsels from the same row count, but sized them
+            // against its unit-local cell count; the merge is only the same
+            // arithmetic as accumulating here if both cuts agree.
+            if (auto partial = scan_sink_->take_current(); partial != nullptr &&
+                                                           partial->rows == rows &&
+                                                           partial->partials.morsels == morsels) {
+                merge_worker_dense_partial(*partial, plan, cat_cols);
+                return true;
+            }
+        }
 
-        const std::size_t n_keys = cat_cols.size();
-        std::vector<const Column<Categorical>::code_type*> raws(n_keys);
-        for (std::size_t c = 0; c < n_keys; ++c) {
+        std::vector<const Column<Categorical>::code_type*> raws(cat_cols.size());
+        for (std::size_t c = 0; c < cat_cols.size(); ++c) {
             raws[c] = cat_cols[c]->codes_data();
         }
         multi_cat_cells_.resize(rows);
@@ -3525,37 +3734,108 @@ class HashAggregateState final {
             cells, n_cells, agg_entries, rows, multi_cat_cell_dense_, morsels,
             [&](std::size_t begin, std::size_t end) {
                 // Computed on the morsel's own worker, into its own slice.
-                if (n_keys == 2) {
-                    const auto* k0 = raws[0];
-                    const auto* k1 = raws[1];
-                    const std::uint64_t s0 = plan.strides[0];
-                    const std::uint64_t s1 = plan.strides[1];
-                    for (std::size_t row = begin; row < end; ++row) {
-                        cells[row] =
-                            static_cast<std::uint32_t>((static_cast<std::uint64_t>(k0[row]) * s0) +
-                                                       (static_cast<std::uint64_t>(k1[row]) * s1));
-                    }
-                    return;
-                }
-                for (std::size_t row = begin; row < end; ++row) {
-                    std::uint64_t cell = 0;
-                    for (std::size_t c = 0; c < n_keys; ++c) {
-                        cell += static_cast<std::uint64_t>(raws[c][row]) * plan.strides[c];
-                    }
-                    cells[row] = static_cast<std::uint32_t>(cell);
-                }
+                fill_multi_cat_cells(raws, plan.strides, cells, begin, end);
             },
-            [&](std::size_t cell) {
-                // The cell is invertible: c_i = (cell / s_i) % dict_size_i.
-                for (std::size_t c = 0; c < n_keys; ++c) {
-                    const std::uint64_t code =
-                        (static_cast<std::uint64_t>(cell) / plan.strides[c]) % plan.dict_sizes[c];
-                    multi_cat_codes_flat_.push_back(
-                        static_cast<Column<Categorical>::code_type>(code));
-                }
-                return alloc_group();
-            });
+            [&](std::size_t cell) { return new_multi_cat_group(plan, cell); });
         return true;
+    }
+
+    /// Fold a worker's partial for this chunk into the groups. Its slots are
+    /// indexed by unit-local cells; each cell's shared codes are read from the
+    /// (already remapped) chunk at the row where the worker first saw it, which
+    /// gives the cell the synchronous path would have used. Same morsels, same
+    /// first-occurrence order, same combine order: the same answer.
+    void merge_worker_dense_partial(const WorkerDensePartial& worker, const CatCellPlan& plan,
+                                    const std::vector<const Column<Categorical>*>& cat_cols) {
+        std::vector<const Column<Categorical>::code_type*> raws(cat_cols.size());
+        for (std::size_t c = 0; c < cat_cols.size(); ++c) {
+            raws[c] = cat_cols[c]->codes_data();
+        }
+        auto new_group = [&](std::size_t cell) { return new_multi_cat_group(plan, cell); };
+        merge_dense_partials(worker.partials, multi_cat_cell_dense_, new_group,
+                             [&](std::size_t m, std::size_t k, std::size_t /*local*/) {
+                                 const std::size_t row = worker.first_rows[m][k];
+                                 std::uint64_t cell = 0;
+                                 for (std::size_t c = 0; c < raws.size(); ++c) {
+                                     cell +=
+                                         static_cast<std::uint64_t>(raws[c][row]) * plan.strides[c];
+                                 }
+                                 return static_cast<std::size_t>(cell);
+                             });
+    }
+
+    /// The dense accumulation of one chunk, on the scan pipeline worker that
+    /// produced it (`DenseAggregateScanSink`). Called on a worker SHADOW, which
+    /// every worker shares once prepared, so it reads only what preparation
+    /// fixed -- the column mapping, `plan_`, the slot layout -- and writes only
+    /// the partial it returns. Null when the chunk does not fit that shape; the
+    /// chunk then takes the ordinary path.
+    auto compute_worker_dense_partial(const Chunk& chunk) -> std::unique_ptr<WorkerDensePartial> {
+        const std::size_t rows = chunk.rows();
+        if (rows == 0 || rows > std::numeric_limits<std::uint32_t>::max()) {
+            return nullptr;
+        }
+        // The mapping's indices name the aggregate's input columns; a worker
+        // chunk laid out differently is not that input, whatever it holds.
+        const physical::AggregateColumnMapping& cols = *columns_;
+        std::vector<const Column<Categorical>*> cat_cols;
+        cat_cols.reserve(cols.group_by.size());
+        for (std::size_t g = 0; g < cols.group_by.size(); ++g) {
+            const std::size_t index = cols.group_by[g];
+            if (index >= chunk.columns.size() ||
+                chunk.columns[index].name != (*group_by_)[g].name ||
+                chunk.columns[index].validity.has_value()) {
+                return nullptr;
+            }
+            const auto* cat = std::get_if<Column<Categorical>>(chunk.columns[index].column.get());
+            if (cat == nullptr) {
+                return nullptr;
+            }
+            cat_cols.push_back(cat);
+        }
+        std::vector<const ColumnEntry*> agg_entries(n_aggs_, nullptr);
+        for (std::size_t i = 0; i < n_aggs_; ++i) {
+            if (plan_[i].func == ir::AggFunc::Count) {
+                continue;
+            }
+            const std::optional<std::size_t>& input = cols.aggregate_inputs[i];
+            if (!input.has_value() || *input >= chunk.columns.size() ||
+                chunk.columns[*input].name != (*aggregations_)[i].column.name) {
+                return nullptr;
+            }
+            const ColumnEntry* entry = &chunk.columns[*input];
+            if (expr_type_for_column(*entry->column) != plan_[i].kind) {
+                return nullptr;
+            }
+            agg_entries[i] = entry;
+        }
+        const CatCellPlan plan = cat_cell_plan(cat_cols);
+        if (!plan.dense_possible) {
+            return nullptr;
+        }
+        const auto n_cells = static_cast<std::size_t>(plan.total_cells);
+        const std::size_t morsels = dense_morsel_count(n_cells, rows);
+        if (morsels == 0) {
+            return nullptr;
+        }
+        auto worker = std::make_unique<WorkerDensePartial>(WorkerDensePartial{
+            .rows = rows,
+            .partials = DensePartials(morsels, n_cells, n_aggs_, scratch_stride_),
+            .first_rows = std::vector<std::vector<std::uint32_t>>(morsels)});
+        std::vector<const Column<Categorical>::code_type*> raws(cat_cols.size());
+        for (std::size_t c = 0; c < cat_cols.size(); ++c) {
+            raws[c] = cat_cols[c]->codes_data();
+        }
+        std::vector<std::uint32_t> cells(rows);
+        auto prepare = [&](std::size_t begin, std::size_t end) {
+            fill_multi_cat_cells(raws, plan.strides, cells.data(), begin, end);
+        };
+        std::vector<std::uint8_t> local_seen(n_cells, 0);
+        for (std::size_t m = 0; m < morsels; ++m) {
+            run_dense_morsel(cells.data(), agg_entries, rows, m, prepare, worker->partials,
+                             local_seen, &worker->first_rows[m]);
+        }
+        return worker;
     }
 
     auto process_rows_cat(const std::vector<const ColumnEntry*>& group_entries,
@@ -4538,6 +4818,86 @@ class HashAggregateState final {
     /// merging them in ascending order while walking each morsel's own
     /// first-seen code list visits codes in precisely the order a serial scan
     /// would have met them.
+
+    /// Accumulate morsel `m` of `rows` into its private slice of `partials`.
+    /// Reads only state fixed by the first chunk (`plan_`, the slot layout),
+    /// so it may run on any worker while the operator keeps pulling input.
+    ///
+    /// `first_rows`, when given, records the row where each cell in
+    /// `partials.seen[m]` first appeared: a worker computing partials over
+    /// unit-local dictionary codes hands those rows to the merge, which reads
+    /// the shared codes there instead of remapping every row.
+    template <typename IndexT, typename Prepare>
+    void run_dense_morsel(const IndexT* index_of_row,
+                          const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows,
+                          std::size_t m, Prepare& prepare_range, DensePartials& partials,
+                          std::vector<std::uint8_t>& local_seen,
+                          std::vector<std::uint32_t>* first_rows = nullptr) {
+        const std::size_t grain = (rows + partials.morsels - 1) / partials.morsels;
+        const std::size_t begin = m * grain;
+        const std::size_t end = std::min(rows, begin + grain);
+        if (begin >= end) {
+            return;
+        }
+        prepare_range(begin, end);
+        std::ranges::fill(local_seen, std::uint8_t{0});
+        auto& order = partials.seen[m];
+        for (std::size_t row = begin; row < end; ++row) {
+            const auto cell = static_cast<std::size_t>(index_of_row[row]);
+            if (local_seen[cell] == 0) {
+                local_seen[cell] = 1;
+                order.push_back(static_cast<std::uint32_t>(cell));
+                if (first_rows != nullptr) {
+                    first_rows->push_back(static_cast<std::uint32_t>(row));
+                }
+            }
+        }
+        accumulate_columns_into(index_of_row, agg_entries, begin, end,
+                                &partials.slots[m * partials.n_cells * n_aggs_],
+                                partials.scratch.data() + (m * partials.n_cells * scratch_stride_));
+    }
+
+    /// Fold one chunk's morsel partials into `flat_slots_`, morsels in
+    /// ascending order, assigning a gid the first time a cell is seen. Serial,
+    /// and the only step that touches group state.
+    template <typename NewGroup>
+    void merge_dense_partials(const DensePartials& partials, std::vector<std::uint32_t>& dense_gid,
+                              NewGroup& new_group) {
+        merge_dense_partials(
+            partials, dense_gid, new_group,
+            [](std::size_t /*m*/, std::size_t /*k*/, std::size_t cell) { return cell; });
+    }
+
+    /// As above, where a partial's cell (which indexes its slots) and the cell
+    /// the operator's dense index knows the group by can differ:
+    /// `dense_cell_of(m, k, cell)` maps the k-th cell morsel m saw to the latter.
+    template <typename NewGroup, typename DenseCellOf>
+    void merge_dense_partials(const DensePartials& partials, std::vector<std::uint32_t>& dense_gid,
+                              NewGroup& new_group, const DenseCellOf& dense_cell_of) {
+        const std::size_t n_cells = partials.n_cells;
+        for (std::size_t m = 0; m < partials.morsels; ++m) {
+            const AggSlotCore* src = &partials.slots[m * n_cells * n_aggs_];
+            const double* src_scratch = partials.scratch.data() + (m * n_cells * scratch_stride_);
+            for (std::size_t k = 0; k < partials.seen[m].size(); ++k) {
+                const auto idx = static_cast<std::size_t>(partials.seen[m][k]);
+                const std::size_t dense = dense_cell_of(m, k, idx);
+                std::uint32_t gid = dense_gid[dense];
+                if (gid == kNoGid) {
+                    gid = new_group(dense);
+                    dense_gid[dense] = gid;
+                }
+                AggSlotCore* dst = &flat_slots_[(static_cast<std::size_t>(gid) * n_aggs_)];
+                for (std::size_t a = 0; a < n_aggs_; ++a) {
+                    agg_combine(dst[a], src[(idx * n_aggs_) + a], plan_[a].func, plan_[a].kind,
+                                scratch_stride_ == 0 ? nullptr : scratch_for(gid, a),
+                                scratch_stride_ == 0
+                                    ? nullptr
+                                    : src_scratch + (idx * scratch_stride_) + scratch_offset_[a]);
+                }
+            }
+        }
+    }
+
     /// Fused discovery + accumulation over a DENSE per-row group index.
     ///
     /// A Categorical code is a dense index into its dictionary; a tuple of
@@ -4561,31 +4921,10 @@ class HashAggregateState final {
                          const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows,
                          std::vector<std::uint32_t>& dense_gid, std::size_t morsels,
                          Prepare prepare_range, NewGroup new_group) {
-        const std::size_t grain = (rows + morsels - 1) / morsels;
-        std::vector<AggSlotCore> partials(morsels * n_cells * n_aggs_);
-        std::vector<double> partial_scratch(morsels * n_cells * scratch_stride_, 0.0);
-        // Per morsel, the cells it saw in first-occurrence order.
-        std::vector<std::vector<std::uint32_t>> seen(morsels);
-
+        DensePartials partials(morsels, n_cells, n_aggs_, scratch_stride_);
         const auto run_morsel = [&](std::size_t m, std::vector<std::uint8_t>& local_seen) {
-            const std::size_t begin = m * grain;
-            const std::size_t end = std::min(rows, begin + grain);
-            if (begin >= end) {
-                return;
-            }
-            prepare_range(begin, end);
-            std::ranges::fill(local_seen, std::uint8_t{0});
-            auto& order = seen[m];
-            for (std::size_t row = begin; row < end; ++row) {
-                const auto cell = static_cast<std::size_t>(index_of_row[row]);
-                if (local_seen[cell] == 0) {
-                    local_seen[cell] = 1;
-                    order.push_back(static_cast<std::uint32_t>(cell));
-                }
-            }
-            accumulate_columns_into(index_of_row, agg_entries, begin, end,
-                                    &partials[m * n_cells * n_aggs_],
-                                    partial_scratch.data() + (m * n_cells * scratch_stride_));
+            run_dense_morsel(index_of_row, agg_entries, rows, m, prepare_range, partials,
+                             local_seen);
         };
         const std::size_t threads =
             exec_ != nullptr && par_.accumulation.decline == physical::FanOutDecline::None
@@ -4613,26 +4952,7 @@ class HashAggregateState final {
             }
         }
 
-        for (std::size_t m = 0; m < morsels; ++m) {
-            const AggSlotCore* src = &partials[m * n_cells * n_aggs_];
-            const double* src_scratch = partial_scratch.data() + (m * n_cells * scratch_stride_);
-            for (const auto cell : seen[m]) {
-                const auto idx = static_cast<std::size_t>(cell);
-                std::uint32_t gid = dense_gid[idx];
-                if (gid == kNoGid) {
-                    gid = new_group(idx);
-                    dense_gid[idx] = gid;
-                }
-                AggSlotCore* dst = &flat_slots_[(static_cast<std::size_t>(gid) * n_aggs_)];
-                for (std::size_t a = 0; a < n_aggs_; ++a) {
-                    agg_combine(dst[a], src[(idx * n_aggs_) + a], plan_[a].func, plan_[a].kind,
-                                scratch_stride_ == 0 ? nullptr : scratch_for(gid, a),
-                                scratch_stride_ == 0
-                                    ? nullptr
-                                    : src_scratch + (idx * scratch_stride_) + scratch_offset_[a]);
-                }
-            }
-        }
+        merge_dense_partials(partials, dense_gid, new_group);
         if (fanned_out && exec_ != nullptr && exec_->parallel_stats != nullptr) {
             // Counts a fan-out, not a partition. The morsels are cut the same
             // way either way, so counting them when they ran inline would
@@ -5717,6 +6037,9 @@ class HashAggregateState final {
     /// order only for the `CountDistinct` aggs. Empty when the node has none.
     std::vector<DistinctAgg> distinct_;
     bool has_count_distinct_ = false;
+    std::shared_ptr<DenseAggregateScanSink> scan_sink_;
+    bool scan_sink_decided_ = false;
+    bool scan_sink_active_ = false;
 };
 
 /// Serial executor for the hash fallback's typed structural chain. Discovery
@@ -5800,14 +6123,16 @@ class DecimalAwareAggregateOperator final : public Operator {
                                   const std::vector<ir::AggSpec>* aggregations,
                                   const ExecutionContext& exec, physical::AggregateParallelism par,
                                   std::optional<physical::AggregateColumnMapping> columns,
-                                  AggregatePrefilter prefilter)
+                                  AggregatePrefilter prefilter,
+                                  std::shared_ptr<DenseAggregateScanSink> scan_sink)
         : child_(std::move(child)),
           group_by_(group_by),
           aggregations_(aggregations),
           exec_(&exec),
           par_(par),
           columns_(std::move(columns)),
-          prefilter_(std::move(prefilter)) {}
+          prefilter_(std::move(prefilter)),
+          scan_sink_(std::move(scan_sink)) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (delegate_) {
@@ -5838,9 +6163,9 @@ class DecimalAwareAggregateOperator final : public Operator {
         } else {
             rest = std::make_unique<PrependChunkOperator>(std::move(**first), std::move(child_));
         }
-        auto state =
-            std::make_unique<HashAggregateState>(std::move(rest), group_by_, aggregations_, *exec_,
-                                                 par_, std::move(columns_), std::move(prefilter_));
+        auto state = std::make_unique<HashAggregateState>(
+            std::move(rest), group_by_, aggregations_, *exec_, par_, std::move(columns_),
+            std::move(prefilter_), std::move(scan_sink_));
         delegate_ = std::make_unique<HashAggregatePhaseOperator>(std::move(state));
         return delegate_->next();
     }
@@ -5868,6 +6193,7 @@ class DecimalAwareAggregateOperator final : public Operator {
     physical::AggregateParallelism par_;
     std::optional<physical::AggregateColumnMapping> columns_;
     AggregatePrefilter prefilter_;
+    std::shared_ptr<DenseAggregateScanSink> scan_sink_;
     OperatorPtr delegate_;
     bool done_ = false;
 };
@@ -5876,10 +6202,12 @@ auto make_hash_aggregate_operator(OperatorPtr child, const std::vector<ir::Colum
                                   const std::vector<ir::AggSpec>* aggregations,
                                   const ExecutionContext& exec, physical::AggregateParallelism par,
                                   std::optional<physical::AggregateColumnMapping> columns,
-                                  AggregatePrefilter prefilter) -> OperatorPtr {
-    return std::make_unique<DecimalAwareAggregateOperator>(std::move(child), group_by, aggregations,
-                                                           exec, par, std::move(columns),
-                                                           std::move(prefilter));
+                                  AggregatePrefilter prefilter,
+                                  std::shared_ptr<DenseAggregateScanSink> scan_sink = nullptr)
+    -> OperatorPtr {
+    return std::make_unique<DecimalAwareAggregateOperator>(
+        std::move(child), group_by, aggregations, exec, par, std::move(columns),
+        std::move(prefilter), std::move(scan_sink));
 }
 
 /// Streaming aggregate for input already sorted on the group-by keys.
@@ -5905,14 +6233,16 @@ class ChunkedSortedAggregateOperator final : public Operator {
         const std::vector<ir::AggSpec>* aggregations, const ExecutionContext& exec,
         physical::AggregateParallelism par = {},
         std::optional<physical::AggregateColumnMapping> columns = std::nullopt,
-        AggregatePrefilter prefilter = {})
+        AggregatePrefilter prefilter = {},
+        std::shared_ptr<DenseAggregateScanSink> scan_sink = nullptr)
         : child_(std::move(child)),
           group_by_(group_by),
           aggregations_(aggregations),
           exec_(&exec),
           par_(par),
           columns_(std::move(columns)),
-          prefilter_(std::move(prefilter)) {}
+          prefilter_(std::move(prefilter)),
+          scan_sink_(std::move(scan_sink)) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (fallback_) {
@@ -5974,7 +6304,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                 fallback_ = make_hash_aggregate_operator(
                     std::make_unique<PrependChunkOperator>(std::move(*schema_only),
                                                            std::move(child_)),
-                    group_by_, aggregations_, *exec_, par_, columns_, prefilter_);
+                    group_by_, aggregations_, *exec_, par_, columns_, prefilter_, scan_sink_);
                 return {};
             }
             done_ = true;
@@ -5988,7 +6318,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
         if (!sorted_on_group_by(first) || needs_hash_fallback(first)) {
             fallback_ = make_hash_aggregate_operator(
                 std::make_unique<PrependChunkOperator>(std::move(first), std::move(child_)),
-                group_by_, aggregations_, *exec_, par_, columns_, prefilter_);
+                group_by_, aggregations_, *exec_, par_, columns_, prefilter_, scan_sink_);
             return {};
         }
         if (auto err = init_plan(first)) {
@@ -6514,6 +6844,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
     /// Also forwarded to the fallback only: the sorted stream emits each group
     /// as its run ends, and the filter above it sees every group anyway.
     AggregatePrefilter prefilter_;
+    std::shared_ptr<DenseAggregateScanSink> scan_sink_;
     bool columns_bound_ = false;
 
     bool decided_ = false;
@@ -6556,10 +6887,45 @@ auto make_chunked_aggregate_operator(OperatorPtr child, const std::vector<ir::Co
                                      const ExecutionContext& exec,
                                      physical::AggregateParallelism parallelism,
                                      std::optional<physical::AggregateColumnMapping> columns,
-                                     AggregatePrefilter prefilter) -> OperatorPtr {
+                                     AggregatePrefilter prefilter,
+                                     std::shared_ptr<ScanWorkerSink> scan_sink) -> OperatorPtr {
+    // Only a sink this TU made is ever offered to it; anything else is ignored.
     return std::make_unique<ChunkedSortedAggregateOperator>(
         std::move(child), group_by, aggregations, exec, parallelism, std::move(columns),
-        std::move(prefilter));
+        std::move(prefilter), std::dynamic_pointer_cast<DenseAggregateScanSink>(scan_sink));
+}
+
+auto make_aggregate_scan_worker_sink(const std::vector<ir::ColumnRef>* group_by,
+                                     const std::vector<ir::AggSpec>* aggregations,
+                                     const ExecutionContext& exec,
+                                     physical::AggregateParallelism parallelism,
+                                     std::optional<physical::AggregateColumnMapping> columns)
+    -> std::shared_ptr<ScanWorkerSink> {
+    // The workers share one shadow of the aggregate, prepared from whichever
+    // unit a worker finishes first. It exists before the pipeline starts, so
+    // every unit -- the first ones included -- can carry a partial.
+    struct Shadow {
+        Shadow(const std::vector<ir::ColumnRef>* group_by,
+               const std::vector<ir::AggSpec>* aggregations, const ExecutionContext& exec,
+               physical::AggregateParallelism parallelism,
+               std::optional<physical::AggregateColumnMapping> columns)
+            : state(nullptr, group_by, aggregations, exec, parallelism, std::move(columns)) {}
+        HashAggregateState state;
+        std::once_flag prepared;
+        bool ready = false;
+    };
+    auto shadow =
+        std::make_shared<Shadow>(group_by, aggregations, exec, parallelism, std::move(columns));
+    auto sink = std::make_shared<DenseAggregateScanSink>();
+    sink->activate([shadow](const Chunk& chunk) -> std::unique_ptr<WorkerDensePartial> {
+        std::call_once(shadow->prepared,
+                       [&] { shadow->ready = shadow->state.prepare_worker_shadow(chunk); });
+        if (!shadow->ready) {
+            return nullptr;
+        }
+        return shadow->state.worker_partial(chunk);
+    });
+    return sink;
 }
 
 }  // namespace ibex::runtime

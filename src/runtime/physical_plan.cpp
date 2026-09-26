@@ -442,21 +442,6 @@ auto fusible_chain_below(const ir::Node& node) -> FusibleChain {
             .update = ir::node_cast<ir::UpdateNode>(below)};
 }
 
-/// A row-local update a streaming run may absorb. The row-local kernel alone
-/// is not enough: `is_row_local_update_expr` admits a whole-column aggregate
-/// (`price - mean(price)`), which a worker would silently compute per unit.
-/// Every field must be subset-evaluable -- the test a filter in a run passes.
-auto is_stream_admissible_update(const ir::Node& node) -> bool {
-    const auto capability = map_kernel_capability(node);
-    if (!capability.has_value() || *capability != MapKernelCapability::RowLocalUpdate) {
-        return false;
-    }
-    const auto& fields = ir::node_cast<ir::UpdateNode>(node).fields();
-    return std::ranges::all_of(fields, [](const ir::FieldSpec& field) {
-        return ir::is_subset_evaluable_expr(field.expr);
-    });
-}
-
 /// Extend a run that reaches a lazy source upward over the row-local updates
 /// directly above it, recording them as `stream_only_updates`. With no run at
 /// all, the updates at the bottom of the chain form one of their own.
@@ -544,6 +529,21 @@ void resolve_pipeline_mode(Plan& plan) {
 }
 
 }  // namespace
+
+/// A row-local update a streaming run may absorb. The row-local kernel alone
+/// is not enough: `is_row_local_update_expr` admits a whole-column aggregate
+/// (`price - mean(price)`), which a worker would silently compute per unit.
+/// Every field must be subset-evaluable -- the test a filter in a run passes.
+auto is_stream_admissible_update(const ir::Node& node) -> bool {
+    const auto capability = map_kernel_capability(node);
+    if (!capability.has_value() || *capability != MapKernelCapability::RowLocalUpdate) {
+        return false;
+    }
+    const auto& fields = ir::node_cast<ir::UpdateNode>(node).fields();
+    return std::ranges::all_of(fields, [](const ir::FieldSpec& field) {
+        return ir::is_subset_evaluable_expr(field.expr);
+    });
+}
 
 auto plan_physical(const ir::Node& root, const TableRegistry& registry,
                    const ExternRegistry* externs, const ir::SourceSchemas& source_schemas) -> Plan {

@@ -7,6 +7,7 @@
 #include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/format.hpp>
+#include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/join_output.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/schema.hpp>
@@ -441,8 +442,57 @@ auto fusible_chain_below(const ir::Node& node) -> FusibleChain {
             .update = ir::node_cast<ir::UpdateNode>(below)};
 }
 
-/// Decide the pipeline's execution mode from its steps.
-void resolve_pipeline_mode(Plan& plan) {
+/// A row-local update a streaming run may absorb. The row-local kernel alone
+/// is not enough: `is_row_local_update_expr` admits a whole-column aggregate
+/// (`price - mean(price)`), which a worker would silently compute per unit.
+/// Every field must be subset-evaluable -- the test a filter in a run passes.
+auto is_stream_admissible_update(const ir::Node& node) -> bool {
+    const auto capability = map_kernel_capability(node);
+    if (!capability.has_value() || *capability != MapKernelCapability::RowLocalUpdate) {
+        return false;
+    }
+    const auto& fields = ir::node_cast<ir::UpdateNode>(node).fields();
+    return std::ranges::all_of(fields, [](const ir::FieldSpec& field) {
+        return ir::is_subset_evaluable_expr(field.expr);
+    });
+}
+
+/// Extend a run that reaches a lazy source upward over the row-local updates
+/// directly above it, recording them as `stream_only_updates`. With no run at
+/// all, the updates at the bottom of the chain form one of their own.
+///
+/// Only a lazy source can stream, and only a run that reaches it is the one
+/// that streams -- a run bounded from below by another step materializes that
+/// step's output. Whether it actually streams (enough units, streaming enabled,
+/// not a join's probe side) is known only at execution; the executor strips
+/// these steps back out when it does not.
+void admit_stream_only_updates(Plan& plan, bool found_run) {
+    if (plan.source != SourceKind::LazyScan) {
+        return;
+    }
+    if (found_run && plan.parallel_end != plan.steps.size()) {
+        return;
+    }
+    std::size_t begin = found_run ? plan.parallel_begin : plan.steps.size();
+    std::size_t admitted = 0;
+    while (begin > 0 && is_stream_admissible_update(*plan.steps[begin - 1].node)) {
+        --begin;
+        ++admitted;
+    }
+    if (admitted == 0) {
+        return;
+    }
+    if (!found_run) {
+        plan.parallel_end = plan.steps.size();
+    }
+    plan.mode = PipelineMode::MorselParallel;
+    plan.serial_reason = SerialOnlyReason::None;
+    plan.parallel_begin = begin;
+    plan.stream_only_updates = admitted;
+}
+
+/// Select the run of steps that may execute over morsels, if any.
+auto resolve_parallel_run(Plan& plan) -> bool {
     // Select the outermost eligible run of steps that can execute over morsels.
     SerialOnlyReason reason = SerialOnlyReason::NotParallelMap;
     std::size_t index = 0;
@@ -480,10 +530,17 @@ void resolve_pipeline_mode(Plan& plan) {
         plan.serial_reason = SerialOnlyReason::None;
         plan.parallel_begin = index;
         plan.parallel_end = end;
-        return;
+        return true;
     }
     plan.mode = PipelineMode::Serial;
     plan.serial_reason = reason;
+    return false;
+}
+
+/// Decide the pipeline's execution mode from its steps.
+void resolve_pipeline_mode(Plan& plan) {
+    const bool found_run = resolve_parallel_run(plan);
+    admit_stream_only_updates(plan, found_run);
 }
 
 }  // namespace
@@ -857,6 +914,11 @@ auto explain_physical(const Plan& plan) -> std::string {
         out += std::to_string(plan.parallel_end);
         out += " of ";
         out += std::to_string(plan.steps.size());
+        if (plan.stream_only_updates > 0) {
+            out += "; top ";
+            out += std::to_string(plan.stream_only_updates);
+            out += " update(s) only when streamed";
+        }
         out += ')';
     } else {
         out += "serial(";

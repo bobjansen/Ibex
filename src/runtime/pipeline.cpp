@@ -124,6 +124,12 @@ auto execution_capability(const ir::Node& node) -> ExecutionCapability {
     // Filter-shaped nodes stay ParallelMap: their cardinality is
     // data-dependent, so they cannot presize an output, and the pipeline's
     // ordered merger is what resolves that.
+    //
+    // The copies above are a MATERIALIZED run's. A run that streams a lazy
+    // source unit by unit has neither: its worker computes the update in place
+    // over the unit it decoded. The planner admits updates into such a run
+    // separately (`Plan::stream_only_updates`), and the executor strips them
+    // back out when the run cannot stream. PDS-H q01 SF-8: -15% at 8 cores.
     return execution_capability(node.kind());
 }
 

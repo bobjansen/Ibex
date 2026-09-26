@@ -47,6 +47,7 @@
 #include <vector>
 
 #include "interpreter_internal.hpp"
+#include "physical_plan.hpp"
 #include "runtime_internal.hpp"
 
 namespace {
@@ -14787,6 +14788,9 @@ struct PipelineReaderState {
     std::atomic<int> active{0};
     std::atomic<int> max_active{0};
     std::atomic<int> products{0};
+    /// Accept a whole-source decode. Off by default, so a test that expects
+    /// the scan to stream fails loudly if it silently decodes whole instead.
+    bool allow_whole_decode = false;
 };
 
 class PipelineReader final : public runtime::LazySourceReader {
@@ -14804,8 +14808,12 @@ class PipelineReader final : public runtime::LazySourceReader {
     auto decode(const std::vector<std::string>& names, const runtime::Selection* selection,
                 const runtime::SourceUnit* unit, const runtime::ExecutionContext&)
         -> std::expected<runtime::Table, std::string> override {
+        const runtime::SourceUnit whole{.start = 0, .rows = 4000};
         if (unit == nullptr) {
-            return std::unexpected("pipeline reader expected a source unit");
+            if (!state_->allow_whole_decode) {
+                return std::unexpected("pipeline reader expected a source unit");
+            }
+            unit = &whole;
         }
         const int active = state_->active.fetch_add(1) + 1;
         int observed = state_->max_active.load();
@@ -15033,11 +15041,10 @@ TEST_CASE("Scan pipeline decodes source units through row-local maps without mat
     CHECK((*x)[x->size() - 1] == 3999);
 }
 
-// A run with a serial step above it can stream its source too. The pipelined
-// scan used to be chosen at the construction seam, which could only offer it to
-// a chain that was parallel end to end; it is now the run's own source strategy,
-// so `df[filter ...][update ...]` -- filter run, update composed above it --
-// streams the scan instead of decoding it whole and morselizing.
+// A run with an update above it streams its source, and over a lazy source the
+// update joins the run (`Plan::stream_only_updates`): each streaming worker
+// computes it over the unit it just decoded, so the consumer never runs a
+// per-chunk fork-join for it.
 TEST_CASE("Scan pipeline feeds a run that has a serial step above it",
           "[runtime][parallel][pipeline]") {
     auto state = std::make_shared<PipelineReaderState>();
@@ -15050,11 +15057,19 @@ TEST_CASE("Scan pipeline feeds a run that has a serial step above it",
     exec.parallel_threads = 4;
     exec.parallel_min_rows = 0;
     exec.parallel_min_cells = 0;
+    // A small grain, so an update that runs on the consumer thread always
+    // splits itself -- and counts in `parallel_fields` -- while one inside a
+    // streaming worker (a pool thread) never does.
+    exec.parallel_grain = 256;
     exec.parallel_stats = &stats;
 
+    REQUIRE(runtime::physical::plan_physical(*ir, empty, nullptr).stream_only_updates == 1);
     auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
     REQUIRE(out.has_value());
     CHECK(stats.pipelined_scans.load() == 1);
+    // The update ran inside the streaming workers: on a pool thread it never
+    // splits itself, so no update fan-out was counted.
+    CHECK(stats.parallel_fields.load() == 0);
 
     const auto* x = std::get_if<Column<std::int64_t>>(out->find("x"));
     const auto* y = std::get_if<Column<std::int64_t>>(out->find("y"));
@@ -15062,7 +15077,7 @@ TEST_CASE("Scan pipeline feeds a run that has a serial step above it",
     REQUIRE(y != nullptr);
     REQUIRE(x->size() == 3499);
     REQUIRE(y->size() == 3499);
-    // The update ran over the streamed, reassembled output — in order.
+    // The update ran over each streamed unit, reassembled in order.
     CHECK((*x)[0] == 501);
     CHECK((*y)[0] == 1002);
     CHECK((*x)[x->size() - 1] == 3999);
@@ -15077,6 +15092,70 @@ TEST_CASE("Scan pipeline feeds a run that has a serial step above it",
     REQUIRE(reference_y != nullptr);
     CHECK(std::vector<std::int64_t>(y->begin(), y->end()) ==
           std::vector<std::int64_t>(reference_y->begin(), reference_y->end()));
+
+    // With streaming off the run materializes its input instead, so the
+    // stream-only update comes back out and runs above it, splitting itself
+    // across threads the way a whole-table update does.
+    state->allow_whole_decode = true;
+    runtime::ParallelPipelineStats unstreamed_stats;
+    runtime::ExecutionContext unstreamed{.deferred_scans = &deferred, .execution_profile = nullptr};
+    unstreamed.parallel_threads = 4;
+    unstreamed.parallel_min_rows = 0;
+    unstreamed.parallel_min_cells = 0;
+    unstreamed.parallel_grain = 256;
+    unstreamed.parallel_stats = &unstreamed_stats;
+    unstreamed.stream_scans = false;
+    auto whole = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, unstreamed);
+    INFO((whole.has_value() ? std::string{} : whole.error()));
+    REQUIRE(whole.has_value());
+    CHECK(unstreamed_stats.pipelined_scans.load() == 0);
+    CHECK(unstreamed_stats.parallel_fields.load() >= 1);
+    const auto* whole_y = std::get_if<Column<std::int64_t>>(whole->find("y"));
+    REQUIRE(whole_y != nullptr);
+    CHECK(std::vector<std::int64_t>(whole_y->begin(), whole_y->end()) ==
+          std::vector<std::int64_t>(reference_y->begin(), reference_y->end()));
+}
+
+// A bare update over a lazy source is a run of stream-only steps and nothing
+// else. Streamed, the workers compute it; not streamed, there is no run left
+// once it is stripped, so the source feeds the update directly.
+TEST_CASE("Scan pipeline streams a bare row-local update", "[runtime][parallel][pipeline]") {
+    auto state = std::make_shared<PipelineReaderState>();
+    auto deferred = make_pipeline_deferred(state);
+    const runtime::TableRegistry empty;
+    auto ir = require_ir("df[update { y = x * 3 }];");
+    REQUIRE(runtime::physical::plan_physical(*ir, empty, nullptr).stream_only_updates == 1);
+
+    const auto run = [&](bool stream, runtime::ParallelPipelineStats& stats) {
+        runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+        exec.parallel_threads = 4;
+        exec.parallel_min_rows = 0;
+        exec.parallel_min_cells = 0;
+        exec.parallel_grain = 256;
+        exec.parallel_stats = &stats;
+        exec.stream_scans = stream;
+        auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
+        INFO((out.has_value() ? std::string{} : out.error()));
+        REQUIRE(out.has_value());
+        const auto* y = std::get_if<Column<std::int64_t>>(out->find("y"));
+        REQUIRE(y != nullptr);
+        return std::vector<std::int64_t>(y->begin(), y->end());
+    };
+    std::vector<std::int64_t> expected(4000);
+    for (std::size_t row = 0; row < expected.size(); ++row) {
+        expected[row] = static_cast<std::int64_t>(row) * 3;
+    }
+
+    runtime::ParallelPipelineStats streamed_stats;
+    CHECK(run(true, streamed_stats) == expected);
+    CHECK(streamed_stats.pipelined_scans.load() == 1);
+    CHECK(streamed_stats.parallel_fields.load() == 0);
+
+    state->allow_whole_decode = true;
+    runtime::ParallelPipelineStats unstreamed_stats;
+    CHECK(run(false, unstreamed_stats) == expected);
+    CHECK(unstreamed_stats.pipelined_scans.load() == 0);
+    CHECK(unstreamed_stats.parallel_fields.load() >= 1);
 }
 
 TEST_CASE("Scan pipeline preserves the schema when every unit is filtered out",

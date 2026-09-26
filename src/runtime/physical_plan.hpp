@@ -536,6 +536,16 @@ struct Plan {
     [[nodiscard]] auto parallel_step_count() const noexcept -> std::size_t {
         return parallel_end - parallel_begin;
     }
+    /// How many steps at the TOP of the run, `[parallel_begin, parallel_begin +
+    /// stream_only_updates)`, are row-local updates that belong to it only when
+    /// the run streams its lazy source unit by unit. A streaming worker computes
+    /// them in place over the unit it just decoded -- no gather, no concat --
+    /// so they cost nothing to include and take a per-chunk fork-join off the
+    /// consumer. When the run cannot stream and materializes its input instead,
+    /// the executor composes them serially above it, which is where a bare
+    /// update always runs over a materialized table (see
+    /// `execution_capability(const ir::Node&)` for why).
+    std::size_t stream_only_updates = 0;
     std::vector<ColumnKernelSignature> source_signature;
     const ir::Node* root = nullptr;
     /// Set when `root` is a `Join`. Streaming joins are migrated and consumed

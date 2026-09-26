@@ -14877,6 +14877,110 @@ auto make_pipeline_deferred(const std::shared_ptr<PipelineReaderState>& state)
     return deferred;
 }
 
+// Streams four large units whose Categorical keys each carry their OWN
+// dictionary, in a different order per unit, the way Parquet row groups do; the
+// last unit adds a key value the others never saw. Values are exact in binary
+// (quarters), so any sum order agrees -- the byte comparison below is about
+// which rows landed in which group.
+constexpr std::size_t kCatUnitRows = 140'000;  // > 2 morsels of 65536 rows
+constexpr std::size_t kCatUnits = 4;
+
+class CatPipelineReader final : public runtime::LazySourceReader {
+   public:
+    auto decode_units() -> std::vector<runtime::SourceUnit> override {
+        std::vector<runtime::SourceUnit> units;
+        for (std::size_t u = 0; u < kCatUnits; ++u) {
+            units.push_back({.start = u * kCatUnitRows, .rows = kCatUnitRows});
+        }
+        return units;
+    }
+
+    auto decode(const std::vector<std::string>& names, const runtime::Selection* selection,
+                const runtime::SourceUnit* unit, const runtime::ExecutionContext&)
+        -> std::expected<runtime::Table, std::string> override {
+        const runtime::SourceUnit whole{.start = 0, .rows = kCatUnits * kCatUnitRows};
+        const runtime::SourceUnit& range = unit == nullptr ? whole : *unit;
+        std::vector<std::size_t> rows;
+        for (std::size_t row = range.start; row < range.start + range.rows; ++row) {
+            if (selection == nullptr || std::ranges::binary_search(*selection, row)) {
+                rows.push_back(row);
+            }
+        }
+        // Per unit, a rotated dictionary; a whole-source decode uses unit 0's.
+        const std::size_t u = unit == nullptr ? 0 : range.start / kCatUnitRows;
+        const bool last = u + 1 == kCatUnits;
+        const auto flag_of = [&](std::size_t row) -> std::string {
+            if (row % 1000 == 7 && row >= (kCatUnits - 1) * kCatUnitRows) {
+                return "X";  // only ever in the last unit
+            }
+            return std::array<std::string, 3>{"A", "N", "R"}[(row * 7) % 3];
+        };
+        runtime::Table out;
+        for (const auto& name : names) {
+            if (name == "f" || name == "s") {
+                std::vector<std::string> dict = name == "f"
+                                                    ? std::vector<std::string>{"A", "N", "R"}
+                                                    : std::vector<std::string>{"F", "O"};
+                std::ranges::rotate(dict,
+                                    dict.begin() + static_cast<std::ptrdiff_t>(u % dict.size()));
+                if (name == "f" && last && unit != nullptr) {
+                    dict.insert(dict.begin(), "X");
+                }
+                if (name == "f" && unit == nullptr) {
+                    dict.push_back("X");
+                }
+                std::vector<std::int32_t> codes;
+                codes.reserve(rows.size());
+                for (const std::size_t row : rows) {
+                    const std::string value =
+                        name == "f" ? flag_of(row)
+                                    : std::array<std::string, 2>{"F", "O"}[(row / 3) % 2];
+                    codes.push_back(
+                        static_cast<std::int32_t>(std::ranges::find(dict, value) - dict.begin()));
+                }
+                out.add_column(name, Column<Categorical>{std::move(dict), std::move(codes)});
+            } else if (name == "v") {
+                std::vector<double> values;
+                for (const std::size_t row : rows) {
+                    values.push_back(static_cast<double>(row % 97) * 0.25);
+                }
+                out.add_column("v", Column<double>{std::move(values)});
+            } else if (name == "q") {
+                std::vector<std::int64_t> values;
+                for (const std::size_t row : rows) {
+                    values.push_back(static_cast<std::int64_t>(row % 13));
+                }
+                out.add_column("q", Column<std::int64_t>{std::move(values)});
+            } else {
+                return std::unexpected("cat pipeline reader: unknown column " + name);
+            }
+        }
+        out.logical_rows = rows.size();
+        return out;
+    }
+};
+
+auto make_cat_pipeline_deferred() -> runtime::DeferredScanRegistry {
+    runtime::Table schema;
+    schema.add_column("f", Column<Categorical>{std::vector<std::string>{}});
+    schema.add_column("s", Column<Categorical>{std::vector<std::string>{}});
+    schema.add_column("v", Column<double>{});
+    schema.add_column("q", Column<std::int64_t>{});
+    auto lazy = std::make_shared<runtime::LazyTable>(
+        std::move(schema), kCatUnits * kCatUnitRows,
+        []() -> std::expected<runtime::LazySourceReaderPtr, std::string> {
+            return runtime::LazySourceReaderPtr{std::make_unique<CatPipelineReader>()};
+        });
+    runtime::DeferredScanRegistry deferred;
+    deferred.emplace("df", runtime::DeferredScan{.lazy = std::move(lazy),
+                                                 .conjuncts = {},
+                                                 .demand = {"f", "s", "v", "q"},
+                                                 .demand_all = false,
+                                                 .key_column = {},
+                                                 .filter = nullptr});
+    return deferred;
+}
+
 // Run `program` over a two-column int table `t(k, v)` and return the result's
 // order-sensitive metadata for the table-properties rule tests below.
 auto metadata_of(const char* program) -> runtime::Table {
@@ -15156,6 +15260,44 @@ TEST_CASE("Scan pipeline streams a bare row-local update", "[runtime][parallel][
     CHECK(run(false, unstreamed_stats) == expected);
     CHECK(unstreamed_stats.pipelined_scans.load() == 0);
     CHECK(unstreamed_stats.parallel_fields.load() >= 1);
+}
+
+// A multi-key Categorical group-by must keep a key value that first appears in
+// a later chunk. Growing the FIRST key's dictionary adds cells without moving
+// any stride, and the dense cell index was only rebuilt on a stride change: the
+// new value's cells were read and written past the end of the index, so its
+// rows joined another group or vanished (93 `X/O` rows counted as `A/F`, the 47
+// `X/F` rows lost). The counts below are computed from the fixture by hand.
+TEST_CASE("Multi-key Categorical group-by keeps a key value first seen in a later chunk",
+          "[runtime][aggregate]") {
+    const runtime::TableRegistry empty;
+    for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+        INFO("threads=" << threads);
+        auto deferred = make_cat_pipeline_deferred();
+        auto ir = require_ir("df[select { n = count() }, by { f, s }];");
+        runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+        exec.parallel_threads = threads;
+        auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        const auto* f = std::get_if<Column<Categorical>>(out->find("f"));
+        const auto* st = std::get_if<Column<Categorical>>(out->find("s"));
+        const auto* n = std::get_if<Column<std::int64_t>>(out->find("n"));
+        REQUIRE(f != nullptr);
+        REQUIRE(st != nullptr);
+        REQUIRE(n != nullptr);
+        std::map<std::string, std::int64_t> counts;
+        for (std::size_t row = 0; row < f->size(); ++row) {
+            counts[std::string((*f)[row]) + "/" + std::string((*st)[row])] = (*n)[row];
+        }
+        CHECK(counts == std::map<std::string, std::int64_t>{{"A/F", 93'334},
+                                                            {"A/O", 93'287},
+                                                            {"N/F", 93'287},
+                                                            {"N/O", 93'333},
+                                                            {"R/F", 93'333},
+                                                            {"R/O", 93'286},
+                                                            {"X/F", 47},
+                                                            {"X/O", 93}});
+    }
 }
 
 TEST_CASE("Scan pipeline preserves the schema when every unit is filtered out",

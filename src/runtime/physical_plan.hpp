@@ -489,6 +489,10 @@ struct HashAggregateNodes {
 [[nodiscard]] auto validate_hash_aggregate_edges(const HashAggregateNodes& nodes)
     -> std::optional<std::string>;
 
+/// A row-local update a streaming run may absorb (`Plan::stream_only_updates`):
+/// the row-local update kernel, and every field subset-evaluable.
+[[nodiscard]] auto is_stream_admissible_update(const ir::Node& node) -> bool;
+
 /// Fill `bp`'s resolved half. `pool_size` is `process_worker_pool().size()`, or
 /// 0 when the caller declined to construct the pool for a serial query. The one
 /// implementation of the worker-cap clamp that used to be open-coded per

@@ -41,6 +41,7 @@
 #include "physical_plan.hpp"
 #include "pipeline_executor_internal.hpp"
 #include "runtime_internal.hpp"
+#include "scan_worker_sink_internal.hpp"
 
 namespace ibex::runtime {
 
@@ -829,6 +830,12 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
     // `IBEX_CORES=1` is.
     if (exec.can_fan_out() && plan.mode == physical::PipelineMode::MorselParallel &&
         index == plan.parallel_begin) {
+        if (plan.parallel_begin > 0) {
+            // Steps above the run execute on its output, after its workers are
+            // done with each chunk; a consumer's worker sink would see a chunk
+            // that is not the consumer's input. Withdraw any offer.
+            (void)take_offered_scan_worker_sink();
+        }
         physical::note_map_pipeline_executed();
         return pipeline_executor_detail::build_map_pipeline_parallel(plan, registry, scalars,
                                                                      externs, exec, model_out);
@@ -840,6 +847,9 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
         return build_physical_map_step(plan, index + 1, registry, scalars, externs, exec,
                                        model_out);
     };
+    // This step is composed serially over its child, so whatever pipeline
+    // builds the child does not produce the consumer's input.
+    (void)take_offered_scan_worker_sink();
     const MapStep& step = plan.steps[index];
     const ir::Node& node = *step.node;
     if (exec.execution_profile == nullptr) {

@@ -12,6 +12,7 @@
 
 #include "aggregate_prefilter.hpp"
 #include "physical_plan.hpp"
+#include "scan_worker_sink_internal.hpp"
 
 namespace ibex::ir {
 struct AggSpec;
@@ -27,7 +28,15 @@ namespace ibex::runtime {
     OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
     const std::vector<ir::AggSpec>* aggregations, const ExecutionContext& exec,
     physical::AggregateParallelism parallelism,
-    std::optional<physical::AggregateColumnMapping> columns, AggregatePrefilter prefilter = {})
-    -> OperatorPtr;
+    std::optional<physical::AggregateColumnMapping> columns, AggregatePrefilter prefilter = {},
+    std::shared_ptr<ScanWorkerSink> scan_sink = nullptr) -> OperatorPtr;
+
+/// A sink the aggregate can use to accumulate on its input's scan workers.
+/// Offer it (`ScanWorkerSinkOffer`) while building the aggregate's input, and
+/// pass it to `make_chunked_aggregate_operator`; unused if nothing takes it.
+[[nodiscard]] auto make_aggregate_scan_worker_sink(
+    const std::vector<ir::ColumnRef>* group_by, const std::vector<ir::AggSpec>* aggregations,
+    const ExecutionContext& exec, physical::AggregateParallelism parallelism,
+    std::optional<physical::AggregateColumnMapping> columns) -> std::shared_ptr<ScanWorkerSink>;
 
 }  // namespace ibex::runtime

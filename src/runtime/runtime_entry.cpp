@@ -17,6 +17,7 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/morsel.hpp>
 #include <ibex/runtime/operator.hpp>
+#include <ibex/runtime/pipeline.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
@@ -710,6 +711,38 @@ class OneGroupIfUngroupedOperator final : public Operator {
     bool done_ = false;
 };
 
+/// `node` is a chain of map nodes (possibly empty) ending in a scan of a lazy
+/// source, where every node is one a streamed scan run executes inside its
+/// workers -- the shape whose input is one streamed scan pipeline and nothing
+/// else. A node that would run above the pipeline (a transform update, a
+/// filter a morsel cannot evaluate) disqualifies it: its output is not what the
+/// pipeline's workers see.
+auto is_row_local_chain_over_lazy_scan(const ir::Node& node, const TableRegistry& registry)
+    -> bool {
+    const ir::Node* cur = &node;
+    while (true) {
+        bool runs_in_stream = false;
+        switch (cur->kind()) {
+            case ir::NodeKind::Filter:
+            case ir::NodeKind::Project:
+            case ir::NodeKind::Rename:
+                runs_in_stream = map_step_expressions_are_subset_evaluable(*cur);
+                break;
+            case ir::NodeKind::Update:
+                runs_in_stream = physical::is_stream_admissible_update(*cur);
+                break;
+            case ir::NodeKind::Scan:
+                return !registry.contains(ir::node_cast<ir::ScanNode>(*cur).source_name());
+            default:
+                return false;
+        }
+        if (!runs_in_stream || cur->children().size() != 1 || cur->children().front() == nullptr) {
+            return false;
+        }
+        cur = cur->children().front().get();
+    }
+}
+
 /// Build an aggregate the plan migrated: the streaming operator, or the
 /// Join+Aggregate fusion. Phase 4 item 2.
 ///
@@ -780,8 +813,21 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         if (!parallelism.has_value()) {
             return std::unexpected(std::move(parallelism.error()));
         }
-        auto child_op =
-            build_operator(*agg.children().front(), registry, scalars, externs, exec, model_out);
+        // Offer the aggregate a hook into its input's scan workers, so a dense
+        // grouping accumulates on the core that decoded each unit. Only when
+        // the input is a row-local chain directly over a lazy scan: the one
+        // streamed pipeline built under the offer is then the aggregate's own.
+        std::shared_ptr<ScanWorkerSink> scan_sink;
+        if (!agg.group_by().empty() && exec.can_fan_out() && exec.stream_scans &&
+            is_row_local_chain_over_lazy_scan(*agg.children().front(), registry)) {
+            scan_sink = make_aggregate_scan_worker_sink(&agg.group_by(), &agg.aggregations(), exec,
+                                                        *parallelism, ap.columns);
+        }
+        auto child_op = [&] {
+            const ScanWorkerSinkOffer offer(scan_sink);
+            return build_operator(*agg.children().front(), registry, scalars, externs, exec,
+                                  model_out);
+        }();
         if (!child_op.has_value()) {
             return std::unexpected(std::move(child_op.error()));
         }
@@ -800,7 +846,7 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         // strategy-specific usefulness thresholds.
         return make_chunked_aggregate_operator(std::move(child_op.value()), &agg.group_by(),
                                                &agg.aggregations(), exec, *parallelism, ap.columns,
-                                               prefilter);
+                                               prefilter, std::move(scan_sink));
     }
 
     return std::unexpected("physical aggregate: plan named no executable strategy");

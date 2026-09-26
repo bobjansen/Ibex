@@ -97,6 +97,7 @@
 #include "physical_executor_internal.hpp"
 #include "pipeline_executor_internal.hpp"
 #include "runtime_internal.hpp"
+#include "scan_worker_sink_internal.hpp"
 
 namespace ibex::runtime::pipeline_executor_detail {
 
@@ -1606,6 +1607,10 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
         }
     }
 
+    // Not streamed: the run's steps execute over a materialized input, after
+    // any scan pipeline beneath has finished with each chunk. A consumer's
+    // worker sink offered for this input would see the wrong chunks.
+    (void)take_offered_scan_worker_sink();
     if (plan.stream_only_updates == 0) {
         return build_materialized_map_run(plan, operators, input_node, registry, scalars, externs,
                                           exec, model_out);
@@ -2010,13 +2015,14 @@ class PipelinedScanOperator final : public Operator {
    public:
     PipelinedScanOperator(const DeferredScan& scan, std::vector<SourceUnit> units,
                           std::vector<ScanPipelineWorker> workers, const ExecutionContext& exec,
-                          WorkerPool& pool)
+                          WorkerPool& pool, std::shared_ptr<ScanWorkerSink> sink = nullptr)
         : scan_(&scan),
           plan_(plan_deferred_scan(scan)),
           units_(std::move(units)),
           workers_(std::move(workers)),
           exec_(&exec),
           pool_(&pool),
+          sink_(std::move(sink)),
           window_(std::max<std::size_t>(workers_.size() * 2, 2)),
           ring_(window_, workers_.size()) {}
 
@@ -2056,6 +2062,9 @@ class PipelinedScanOperator final : public Operator {
 
             empty_schema_carrier_.reset();
             normalize_categorical_dictionaries(chunk);
+            if (sink_ != nullptr) {
+                sink_->on_emit(next_sequence_ - 1, chunk);
+            }
             restamp(chunk);
             return std::optional<Chunk>{std::move(chunk)};
         }
@@ -2112,6 +2121,9 @@ class PipelinedScanOperator final : public Operator {
                 if (!result.has_value()) {
                     ring_.record_error(sequence, std::move(result.error()));
                     return;
+                }
+                if (sink_ != nullptr && result->rows() != 0) {
+                    sink_->on_worker_chunk(sequence, *result);
                 }
                 ring_.publish(sequence, std::move(*result));
             }
@@ -2243,6 +2255,7 @@ class PipelinedScanOperator final : public Operator {
     std::vector<ScanPipelineWorker> workers_;
     const ExecutionContext* exec_;
     WorkerPool* pool_;
+    std::shared_ptr<ScanWorkerSink> sink_;
     std::size_t window_ = 2;
     // The same ordered handoff the morsel executor uses: one implementation of
     // the bounded, sequence-ordered producer/consumer shape.
@@ -2516,7 +2529,8 @@ auto make_deferred_scan_source(const DeferredScan& scan, std::vector<SourceUnit>
         exec.parallel_stats->pipelined_scans.fetch_add(1, std::memory_order_relaxed);
     }
     return std::make_unique<PipelinedScanOperator>(scan, std::move(units), std::move(workers), exec,
-                                                   process_worker_pool());
+                                                   process_worker_pool(),
+                                                   take_offered_scan_worker_sink());
 }
 
 /// A breaker only earns a scheduler thread when its probe input can actually
@@ -2542,5 +2556,21 @@ auto make_deferred_scan_source(const DeferredScan& scan, std::vector<SourceUnit>
 }
 
 }  // namespace pipeline_executor_detail
+
+namespace {
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+thread_local std::shared_ptr<ScanWorkerSink> offered_scan_worker_sink;
+}  // namespace
+
+ScanWorkerSinkOffer::ScanWorkerSinkOffer(std::shared_ptr<ScanWorkerSink> sink)
+    : previous_(std::exchange(offered_scan_worker_sink, std::move(sink))) {}
+
+ScanWorkerSinkOffer::~ScanWorkerSinkOffer() {
+    offered_scan_worker_sink = std::move(previous_);
+}
+
+auto take_offered_scan_worker_sink() -> std::shared_ptr<ScanWorkerSink> {
+    return std::exchange(offered_scan_worker_sink, nullptr);
+}
 
 }  // namespace ibex::runtime

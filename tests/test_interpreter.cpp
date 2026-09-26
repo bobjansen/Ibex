@@ -15300,6 +15300,64 @@ TEST_CASE("Multi-key Categorical group-by keeps a key value first seen in a late
     }
 }
 
+// A dense multi-key Categorical group-by over a streamed scan accumulates on
+// the pipeline workers (`DenseAggregateScanSink`): each unit's partials are
+// computed over its OWN dictionary codes and merged by the aggregate, which
+// reads the shared codes at the rows the worker recorded. The answer must be
+// the serial one to the byte, and the aggregate itself must not fan out.
+TEST_CASE("Scan pipeline workers accumulate a dense Categorical aggregate",
+          "[runtime][parallel][pipeline][aggregate]") {
+    const runtime::TableRegistry empty;
+    const auto run = [&](const char* program, std::size_t threads,
+                         runtime::ParallelPipelineStats& stats) {
+        auto deferred = make_cat_pipeline_deferred();
+        auto ir = require_ir(program);
+        runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+        exec.parallel_threads = threads;
+        exec.parallel_stats = &stats;
+        auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
+        INFO((out.has_value() ? std::string{} : out.error()));
+        REQUIRE(out.has_value());
+        return std::move(*out);
+    };
+    const auto same_columns = [](const runtime::Table& actual, const runtime::Table& expected) {
+        const auto mismatch = runtime::compare_tables(expected, actual);
+        INFO((mismatch.has_value() ? mismatch->message() : std::string{}));
+        CHECK_FALSE(mismatch.has_value());
+    };
+
+    const char* fused = "df[select { total = sum(v), n = count(), avg_q = mean(q) }, by { f, s }];";
+    runtime::ParallelPipelineStats serial_stats;
+    const auto reference = run(fused, 1, serial_stats);
+    CHECK(reference.rows() == 8);  // {A,N,R} x {F,O} plus X in both statuses
+
+    runtime::ParallelPipelineStats stats;
+    const auto streamed = run(fused, 4, stats);
+    CHECK(stats.pipelined_scans.load() == 1);
+    // Every unit's accumulation ran on its scan worker: the aggregate never
+    // split a chunk across the pool itself.
+    CHECK(stats.parallel_fields.load() == 0);
+    same_columns(streamed, reference);
+
+    // One key is not the fused shape: the aggregate accumulates as before.
+    const char* single = "df[select { total = sum(v), n = count() }, by { f }];";
+    runtime::ParallelPipelineStats single_serial;
+    runtime::ParallelPipelineStats single_stats;
+    same_columns(run(single, 4, single_stats), run(single, 1, single_serial));
+
+    // An update the pipeline cannot absorb (a row guard) runs above it and
+    // overwrites `v` under the same name, so what the scan workers see is not
+    // the aggregate's input. No worker partial may be merged for it; the answer
+    // must be the serial one. (Today that update also gathers its input into
+    // one chunk, which no unit's partial can match; the offer's withdrawal and
+    // the shape check guard the chunk-preserving case.)
+    const char* above =
+        "df[where q > 6 update { v = 0.0 }][select { total = sum(v), n = count() }, by { f, s }];";
+    runtime::ParallelPipelineStats above_serial;
+    runtime::ParallelPipelineStats above_stats;
+    same_columns(run(above, 4, above_stats), run(above, 1, above_serial));
+}
+
 TEST_CASE("Scan pipeline preserves the schema when every unit is filtered out",
           "[runtime][parallel][pipeline]") {
     auto state = std::make_shared<PipelineReaderState>();

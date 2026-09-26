@@ -3602,21 +3602,33 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
           indices_(std::move(indices)),
           schema_(std::move(schema)),
           rows_(rows),
-          path_(std::move(path)) {}
+          path_(std::move(path)),
+          unit_count_(coalesced_units(*reader_->parquet_reader()->metadata()).size()) {}
 
-    /// One unit per row group: the row group is the file's own decode
-    /// boundary, so a unit is exactly what the decoder can already read
-    /// without touching anything else, and no unit ever straddles a
-    /// dictionary.
     auto decode_units() -> std::vector<ibex::runtime::SourceUnit> override {
-        const auto& metadata = *reader_->parquet_reader()->metadata();
+        return coalesced_units(*reader_->parquet_reader()->metadata());
+    }
+
+    /// Whole row groups, coalesced until a unit holds `unit_target_rows`. The
+    /// row group is the file's own decode boundary, so a unit never splits one,
+    /// but it may span several: a unit is the chunk every downstream breaker
+    /// fans out over, and one per small row group (Polars writes 122,880 rows)
+    /// left each breaker a fork-join per tiny chunk. q01 accumulated serially
+    /// because a chunk that small is a single morsel.
+    static auto coalesced_units(const parquet::FileMetaData& metadata)
+        -> std::vector<ibex::runtime::SourceUnit> {
+        const std::size_t target = unit_target_rows(static_cast<std::size_t>(metadata.num_rows()));
         std::vector<ibex::runtime::SourceUnit> units;
         units.reserve(static_cast<std::size_t>(metadata.num_row_groups()));
         std::size_t start = 0;
+        std::size_t unit_rows = 0;
         for (int group = 0; group < metadata.num_row_groups(); ++group) {
-            const auto rows = static_cast<std::size_t>(metadata.RowGroup(group)->num_rows());
-            units.push_back(ibex::runtime::SourceUnit{.start = start, .rows = rows});
-            start += rows;
+            unit_rows += static_cast<std::size_t>(metadata.RowGroup(group)->num_rows());
+            if (unit_rows >= target || group + 1 == metadata.num_row_groups()) {
+                units.push_back(ibex::runtime::SourceUnit{.start = start, .rows = unit_rows});
+                start += unit_rows;
+                unit_rows = 0;
+            }
         }
         return units;
     }
@@ -3759,8 +3771,12 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
             const auto groups = restrict_to_unit(whole_file_scan_groups(metadata), unit);
             const auto page_target = page_stripe_target(unit, exec);
             if (page_target > 1) {
+                // Inside a unit the fallback below runs serial (one shard), so any
+                // split beats it; for the whole file the fallback already fans out
+                // by row group, and stripes only pay when they cut finer.
+                const std::size_t fallback_width = unit == nullptr ? groups.size() : 1;
                 if (auto stripes = string_page_stripes(*reader_, leaf_index, groups, page_target);
-                    stripes.has_value() && stripes->size() > groups.size()) {
+                    stripes.has_value() && stripes->size() > fallback_width) {
                     return filtered_string_page_stripes(factory_->input(), filter, *stripes,
                                                         std::min(page_target, stripes->size()));
                 }
@@ -3811,22 +3827,40 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
     }
 
    private:
+    /// Rows a coalesced unit aims for: large enough that downstream breakers
+    /// fan out within a chunk, small enough that the file still yields about
+    /// `kMinUnits` units for the scan workers to balance. A fixed 1M target
+    /// left orders (98 groups at SF-8) 11 units and q13 +25%: the last wave
+    /// idled most workers. A function of the DATA alone, never the thread
+    /// count, because the unit is the chunk and the chunk decides where
+    /// reductions cut: same file, same answer, any machine.
+    static auto unit_target_rows(std::size_t file_rows) -> std::size_t {
+        constexpr std::size_t kMaxUnitRows = std::size_t{1} << 20;
+        constexpr std::size_t kMinUnits = 64;
+        return std::min(kMaxUnitRows, file_rows / kMinUnits);
+    }
+
     /// The row-group range covering exactly `unit`. `decode_units` builds units
-    /// from row-group boundaries, so this always lands on one; a unit that did
+    /// from row-group boundaries, so this always lands on them; a unit that did
     /// not is a caller mixing units from a different source, which is a bug
     /// rather than something to round.
     static auto unit_decode_groups(const parquet::FileMetaData& metadata,
                                    const ibex::runtime::SourceUnit& unit) -> DirectDecodeGroups {
         std::size_t start = 0;
+        int begin = -1;
         for (int group = 0; group < metadata.num_row_groups(); ++group) {
-            const auto rows = static_cast<std::size_t>(metadata.RowGroup(group)->num_rows());
-            if (start == unit.start && rows == unit.rows) {
-                return DirectDecodeGroups{
-                    .begin = group, .end = group + 1, .source_start = start, .rows = rows};
+            if (start == unit.start) {
+                begin = group;
             }
-            start += rows;
+            start += static_cast<std::size_t>(metadata.RowGroup(group)->num_rows());
+            if (begin >= 0 && start == unit.start + unit.rows) {
+                return DirectDecodeGroups{.begin = begin,
+                                          .end = group + 1,
+                                          .source_start = unit.start,
+                                          .rows = unit.rows};
+            }
         }
-        throw std::runtime_error("read_parquet: decode unit does not match a row group");
+        throw std::runtime_error("read_parquet: decode unit does not match row groups");
     }
 
     /// The scan groups lying inside `unit`. Both fused scans plan over the
@@ -3923,15 +3957,12 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
         std::size_t want = 1;
         const bool nested = ibex::runtime::on_worker_pool_thread();
         // A nested decode (under a pipeline worker) only fans out when the
-        // ROW-GROUP axis can't already fill the pool — i.e. the file has fewer
-        // row groups than the pool has threads. lineitem (46 groups at SF-8)
-        // fills the pool by row group and a per-unit column fan-out would just
-        // oversubscribe it (measured: q01 +21%); customer / part (1-2 groups)
+        // UNIT axis can't already fill the pool — i.e. the file has fewer
+        // units than the pool has threads. lineitem (tens of units at SF-8)
+        // fills the pool by unit and a per-unit column fan-out would just
+        // oversubscribe it (measured: q01 +21%); customer / part (1-2 units)
         // leave most of the pool idle and are exactly what this recovers.
-        const bool nested_worth_it =
-            nested && factory_ != nullptr &&
-            static_cast<std::size_t>(reader_->parquet_reader()->metadata()->num_row_groups()) <
-                pool.size();
+        const bool nested_worth_it = nested && factory_ != nullptr && unit_count_ < pool.size();
         if (factory_ != nullptr && units > 1 && exec.can_fan_out() &&
             rows_ >= std::max(exec.parallel_min_rows, kParallelDecodeMinRows) &&
             (!nested || nested_worth_it)) {
@@ -3969,6 +4000,7 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
     std::shared_ptr<arrow::Schema> schema_;
     std::size_t rows_;
     std::string path_;
+    std::size_t unit_count_;
 };
 
 inline auto read_parquet_lazy(std::string_view path) -> ibex::runtime::LazyTablePtr {

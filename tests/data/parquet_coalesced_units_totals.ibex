@@ -1,0 +1,7 @@
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+
+// The plain decode over streaming units that span several row groups (see
+// parquet_coalesced_units_check.ibex). A unit decoded from the wrong groups
+// drops or repeats rows, which moves every total.
+let fact = read_parquet("tests/data/parquet_coalesced_units_out.parquet");
+fact[select { rows = count(), id_total = sum(id), id_hi = max(id), x_total = sum(x) }];

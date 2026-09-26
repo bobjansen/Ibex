@@ -438,6 +438,53 @@ if [[ "$SKIP_REPL" == false ]]; then
         fi
         rm -f "$polars_out" "$IBEX_ROOT/tests/data/parquet_polars_writer_out.parquet"
 
+        echo "▸ whole-script (parquet plugin, streaming units spanning several row groups)"
+        # Small row groups are coalesced into units of about rows/64, so a unit
+        # is a RANGE of row groups. 320 groups of 14,000 rows make 64 units of
+        # five groups each: the scan must stream exactly 64 chunks (one per
+        # row group would be 320), and the fused `like` must stripe a
+        # multi-group unit across the pool (its pool work stays zero when it
+        # falls back to the serial per-unit scan). IBEX_CORES=4 on purpose:
+        # the stripe target is the core count, and only a target below the
+        # unit's five groups leaves one stripe per group — the shape that used
+        # to decline. Single- and multi-threaded runs must agree byte for byte.
+        uv run --project "$IBEX_ROOT" python \
+            "$IBEX_ROOT/tests/data/gen_parquet_coalesced_units.py" \
+            "$IBEX_ROOT/tests/data/parquet_coalesced_units_out.parquet" >/dev/null
+        cu_st="$(mktemp)"
+        cu_mt="$(mktemp)"
+        cu_tot="$(mktemp)"
+        IBEX_CORES=1 "$BUILD_DIR/tools/ibex_eval" \
+            --plugin-path "$BUILD_DIR/tools" \
+            "$IBEX_ROOT/tests/data/parquet_coalesced_units_check.ibex" >"$cu_st" 2>&1
+        IBEX_CORES=4 IBEX_PROFILE_OPERATORS=1 "$BUILD_DIR/tools/ibex_eval" \
+            --plugin-path "$BUILD_DIR/tools" \
+            "$IBEX_ROOT/tests/data/parquet_coalesced_units_check.ibex" >"$cu_mt" 2>&1
+        IBEX_CORES=8 IBEX_PROFILE_OPERATORS=1 "$BUILD_DIR/tools/ibex_eval" \
+            --plugin-path "$BUILD_DIR/tools" \
+            "$IBEX_ROOT/tests/data/parquet_coalesced_units_totals.ibex" >"$cu_tot" 2>&1
+        rm -f "$IBEX_ROOT/tests/data/parquet_coalesced_units_out.parquet"
+        # Constants printed by the generator: k=0 is 212,746 needles past row
+        # 12,345 summing to 477,863,789,193; the file sums id to n(n-1)/2.
+        if rg -n "error:" "$cu_st" "$cu_mt" "$cu_tot" >/dev/null \
+            || ! rg -n "\| 0 +\| 212746 +\| 477863789193 +\|" "$cu_st" >/dev/null \
+            || ! rg -n "\| 6 +\| 212746 +\| 477865065669 +\|" "$cu_st" >/dev/null \
+            || ! diff -q "$cu_st" <(rg -v "^(operator )?profile" "$cu_mt") >/dev/null \
+            || ! rg -n 'op="scan [^"]*".* chunks=64 ' "$cu_mt" >/dev/null \
+            || ! rg -n 'op="source string filter scan".* pool_work_ms=[1-9]' "$cu_mt" >/dev/null \
+            || ! rg -n "\| 4480000 +\| 10035197760000 +\| 4479999 +\| 1680000 +\|" "$cu_tot" >/dev/null \
+            || ! rg -n 'op="scan [^"]*".* chunks=64 ' "$cu_tot" >/dev/null; then
+            echo "--- single-threaded ---" >&2
+            cat "$cu_st" >&2
+            echo "--- multi-threaded ---" >&2
+            cat "$cu_mt" >&2
+            echo "--- totals ---" >&2
+            cat "$cu_tot" >&2
+            rm -f "$cu_st" "$cu_mt" "$cu_tot"
+            exit 1
+        fi
+        rm -f "$cu_st" "$cu_mt" "$cu_tot"
+
         echo "▸ whole-script (parquet plugin, a dictionary chunk that falls back to PLAIN)"
         # A stats-less dictionary column is read as Categorical, and a page
         # that fell back to PLAIN mid-chunk has its values interned. No writer

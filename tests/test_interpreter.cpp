@@ -16750,3 +16750,144 @@ TEST_CASE("compute_mask: Date and Timestamp columns against literals", "[filter]
         }
     }
 }
+
+// first/last/min/max over Date and Timestamp columns, grouped and not. They
+// used to be refused ("this function does not support the column's type"),
+// which also broke any plan the group-key reduction produced for a Date key it
+// had proved determined (it carries a dropped key as `first()`). They keep the
+// value in the integer slot as days / nanoseconds, which order the same way.
+TEST_CASE("Date and Timestamp first/last/min/max grouped and global", "[runtime][aggregate]") {
+    const auto run = [](const runtime::TableRegistry& registry, const char* program,
+                        std::size_t threads) {
+        auto ir = require_ir(program);
+        runtime::ExecutionContext exec;
+        exec.parallel_threads = threads;
+        exec.parallel_min_rows = threads > 1 ? 0 : exec.parallel_min_rows;
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        INFO((out.has_value() ? std::string{} : out.error()));
+        REQUIRE(out.has_value());
+        return std::move(*out);
+    };
+    struct Want {
+        std::int32_t first = 0;
+        std::int32_t last = 0;
+        std::int32_t min = 0;
+        std::int32_t max = 0;
+        bool any = false;
+    };
+    const auto fold = [](Want& w, std::int32_t v) {
+        if (!w.any) {
+            w = Want{.first = v, .last = v, .min = v, .max = v, .any = true};
+            return;
+        }
+        w.last = v;
+        w.min = std::min(w.min, v);
+        w.max = std::max(w.max, v);
+    };
+
+    SECTION("with nulls, which are skipped") {
+        constexpr std::size_t kRows = 1000;
+        Column<std::int64_t> k;
+        Column<Date> d;
+        runtime::ValidityBitmap valid;
+        std::map<std::int64_t, Want> want;
+        Want all;
+        for (std::size_t i = 0; i < kRows; ++i) {
+            const auto key = static_cast<std::int64_t>(i % 3);
+            const auto days = static_cast<std::int32_t>((i * 37) % 101) - 50;
+            const bool is_valid = i % 7 != 0;
+            k.push_back(key);
+            d.push_back(Date{days});
+            valid.push_back(is_valid);
+            if (is_valid) {
+                fold(want[key], days);
+                fold(all, days);
+            }
+        }
+        runtime::Table t;
+        t.add_column("k", std::move(k));
+        t.add_column("d", std::move(d));
+        t.columns.back().validity = std::move(valid);
+        runtime::TableRegistry registry;
+        registry.emplace("t", std::move(t));
+
+        const auto out =
+            run(registry,
+                "t[select { f = first(d), l = last(d), lo = min(d), hi = max(d) }, by { k }];", 1);
+        REQUIRE(out.rows() == 3);
+        const auto& ok = std::get<Column<std::int64_t>>(*out.find("k"));
+        const auto& of = std::get<Column<Date>>(*out.find("f"));
+        const auto& ol = std::get<Column<Date>>(*out.find("l"));
+        const auto& olo = std::get<Column<Date>>(*out.find("lo"));
+        const auto& ohi = std::get<Column<Date>>(*out.find("hi"));
+        for (std::size_t g = 0; g < out.rows(); ++g) {
+            const Want& w = want.at(ok[g]);
+            CHECK(of[g].days == w.first);
+            CHECK(ol[g].days == w.last);
+            CHECK(olo[g].days == w.min);
+            CHECK(ohi[g].days == w.max);
+        }
+
+        const auto global =
+            run(registry, "t[select { f = first(d), l = last(d), lo = min(d), hi = max(d) }];", 1);
+        REQUIRE(global.rows() == 1);
+        CHECK(std::get<Column<Date>>(*global.find("f"))[0].days == all.first);
+        CHECK(std::get<Column<Date>>(*global.find("l"))[0].days == all.last);
+        CHECK(std::get<Column<Date>>(*global.find("lo"))[0].days == all.min);
+        CHECK(std::get<Column<Date>>(*global.find("hi"))[0].days == all.max);
+    }
+
+    SECTION("many groups, partitioned discovery seeding first() from each group's first row") {
+        constexpr std::size_t kRows = 300'000;
+        constexpr std::size_t kGroups = 50'000;
+        Column<std::int64_t> k;
+        Column<Date> d;
+        Column<Timestamp> ts;
+        std::map<std::int64_t, Want> want;
+        std::map<std::int64_t, std::pair<std::int64_t, std::int64_t>> want_ts;  // first, max
+        for (std::size_t i = 0; i < kRows; ++i) {
+            const auto key = static_cast<std::int64_t>((i * 7919) % kGroups);
+            const auto days = static_cast<std::int32_t>((i * 104'729) % 20'000);
+            const auto nanos = (static_cast<std::int64_t>(i) * 1'000'003) - 1'000'000'000;
+            k.push_back(key);
+            d.push_back(Date{days});
+            ts.push_back(Timestamp{nanos});
+            fold(want[key], days);
+            auto [it, inserted] = want_ts.emplace(key, std::pair{nanos, nanos});
+            if (!inserted) {
+                it->second.second = std::max(it->second.second, nanos);
+            }
+        }
+        runtime::Table t;
+        t.add_column("k", std::move(k));
+        t.add_column("d", std::move(d));
+        t.add_column("ts", std::move(ts));
+        runtime::TableRegistry registry;
+        registry.emplace("t", std::move(t));
+
+        for (const std::size_t threads : {std::size_t{1}, std::size_t{8}}) {
+            INFO("threads " << threads);
+            const auto out = run(registry,
+                                 "t[select { f = first(d), l = last(d), lo = min(d), hi = max(d), "
+                                 "tf = first(ts), thi = max(ts) }, by { k }];",
+                                 threads);
+            REQUIRE(out.rows() == kGroups);
+            const auto& ok = std::get<Column<std::int64_t>>(*out.find("k"));
+            const auto& of = std::get<Column<Date>>(*out.find("f"));
+            const auto& ol = std::get<Column<Date>>(*out.find("l"));
+            const auto& olo = std::get<Column<Date>>(*out.find("lo"));
+            const auto& ohi = std::get<Column<Date>>(*out.find("hi"));
+            const auto& otf = std::get<Column<Timestamp>>(*out.find("tf"));
+            const auto& othi = std::get<Column<Timestamp>>(*out.find("thi"));
+            for (std::size_t g = 0; g < out.rows(); ++g) {
+                const Want& w = want.at(ok[g]);
+                REQUIRE(of[g].days == w.first);
+                REQUIRE(ol[g].days == w.last);
+                REQUIRE(olo[g].days == w.min);
+                REQUIRE(ohi[g].days == w.max);
+                REQUIRE(otf[g].nanos == want_ts.at(ok[g]).first);
+                REQUIRE(othi[g].nanos == want_ts.at(ok[g]).second);
+            }
+        }
+    }
+}

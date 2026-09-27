@@ -1422,6 +1422,7 @@ class HashAggregateState final {
                 kind == ExprType::Int || kind == ExprType::Double ||
                 agg.func == ir::AggFunc::CountDistinct ||
                 (keeps_a_value && kind == ExprType::String) ||
+                (keeps_a_value && (kind == ExprType::Date || kind == ExprType::Timestamp)) ||
                 ((agg.func == ir::AggFunc::First || agg.func == ir::AggFunc::Last) &&
                  kind == ExprType::Bool);
             if (!supported) {
@@ -3847,6 +3848,40 @@ class HashAggregateState final {
         return true;
     }
 
+    /// Date and Timestamp keep their first/last/min/max in the integer slot,
+    /// as days and nanoseconds: both order exactly as those integers do.
+    [[nodiscard]] static auto is_temporal(ExprType kind) noexcept -> bool {
+        return kind == ExprType::Date || kind == ExprType::Timestamp;
+    }
+    [[nodiscard]] static auto temporal_raw(const ColumnValue& column, std::size_t row)
+        -> std::int64_t {
+        if (const auto* dates = std::get_if<Column<Date>>(&column)) {
+            return (*dates)[row].days;
+        }
+        return std::get<Column<Timestamp>>(column)[row].nanos;
+    }
+    static void keep_temporal(AggSlotCore& slot, ir::AggFunc func, std::int64_t value) {
+        switch (func) {
+            case ir::AggFunc::First:
+                if (!slot.present()) {
+                    slot.int_value = value;
+                }
+                break;
+            case ir::AggFunc::Last:
+                slot.int_value = value;
+                break;
+            case ir::AggFunc::Min:
+                slot.int_value = slot.present() ? std::min(slot.int_value, value) : value;
+                break;
+            case ir::AggFunc::Max:
+                slot.int_value = slot.present() ? std::max(slot.int_value, value) : value;
+                break;
+            default:
+                return;
+        }
+        slot.mark_present();
+    }
+
     void size_group_arrays() {
         auto tail = flat_slots_.grow_uninitialized(n_groups_ * n_aggs_);
         if (!fill_slots_parallel(tail)) {
@@ -4929,6 +4964,8 @@ class HashAggregateState final {
                 slot.int_value = std::get<Column<std::int64_t>>(*entry.column)[row];
             } else if (plan_[a].kind == ExprType::Bool) {
                 slot.int_value = std::get<Column<bool>>(*entry.column)[row] ? 1 : 0;
+            } else if (is_temporal(plan_[a].kind)) {
+                slot.int_value = temporal_raw(*entry.column, row);
             } else {
                 std::string value;
                 if (plan_[a].categorical) {
@@ -5399,6 +5436,14 @@ class HashAggregateState final {
                         slot.mark_present();
                     }
                 }
+            } else if (is_temporal(plan_[agg_i].kind)) {
+                const ir::AggFunc func = plan_[agg_i].func;
+                for (std::size_t row = begin; row < rows; ++row) {
+                    if (has_nulls && !(*validity)[row]) {
+                        continue;
+                    }
+                    keep_temporal(slot_for(gids[row]), func, temporal_raw(*entry.column, row));
+                }
             } else if (plan_[agg_i].kind == ExprType::Double) {
                 const double* data = std::get<Column<double>>(*entry.column).data();
                 switch (plan_[agg_i].func) {
@@ -5850,6 +5895,10 @@ class HashAggregateState final {
                         slot.mark_present();
                     }
                 });
+            } else if (is_temporal(plan_[agg_i].kind)) {
+                each([&](std::size_t row) {
+                    keep_temporal(slot, func, temporal_raw(*entry.column, row));
+                });
             } else if (plan_[agg_i].kind == ExprType::Double) {
                 const double* data = std::get<Column<double>>(*entry.column).data();
                 switch (func) {
@@ -6278,6 +6327,10 @@ class HashAggregateState final {
                         column = Column<std::int64_t>{};
                     } else if (plan_[i].kind == ExprType::Bool) {
                         column = Column<bool>{};
+                    } else if (plan_[i].kind == ExprType::Date) {
+                        column = Column<Date>{};
+                    } else if (plan_[i].kind == ExprType::Timestamp) {
+                        column = Column<Timestamp>{};
                     } else if (plan_[i].categorical) {
                         column = Column<Categorical>{};
                     } else {
@@ -6483,6 +6536,12 @@ class HashAggregateState final {
                             put_i(g, slot.int_value);
                         } else if (plan_[i].kind == ExprType::Bool) {
                             std::get<Column<bool>>(column).push_back(slot.int_value != 0);
+                        } else if (plan_[i].kind == ExprType::Date) {
+                            std::get<Column<Date>>(column).push_back(
+                                Date{static_cast<std::int32_t>(slot.int_value)});
+                        } else if (plan_[i].kind == ExprType::Timestamp) {
+                            std::get<Column<Timestamp>>(column).push_back(
+                                Timestamp{slot.int_value});
                         } else {
                             append_text_cell(column, text_store_[(g * n_aggs_) + i]);
                         }

@@ -59,6 +59,7 @@ history).
 
 | Plan | Notes |
 |---|---|
+| [beat-duckdb-plan.md](beat-duckdb-plan.md) | **Parked until ADBC is finished (2026-09-27).** Successor target to beat-polars: on PDS-H SF-10 (AWS, 16 physical cores, `546ce652`) Ibex is ahead of Polars (0.67 / 0.64 total at 8 / 16 cores) and DuckDB is the faster reference. Ibex/DuckDB 0.86 at 1 core, 1.02 at 8, 1.17 at 16; implied fraction 95.0% against DuckDB's 98.1%, parity needs ~96.7%. Workstreams: W1 scaling losers by ms lost (q01, q10, q21, q03, q04, q19, q12…; start with q12), W2 scale-cliff sweep over fixed thresholds, W3 canonical-plan audit, W4 q01 per-core cost, W5 small items. |
 | [radix-partitioned-groupby.md](radix-partitioned-groupby.md) | Noted, not built. High-cardinality group-by is memory-bound; radix partitioning remains a q18/q20 mechanism. Q10 no longer reaches the generic mixed-key ceiling (2026-08-27: FD reduction + discovery-time `First` gathering handle that shape). **But the `First` gathering was itself the measured q10 cost** — late-materialize-fd-payload (retired, see Complete) LANDED (`568c4974`, q10 −32.8%) and lifts that payload above the top-k. |
 | [exists-subquery-plan.md](exists-subquery-plan.md) | Proposal: `exists(table_expr)` as a boolean subquery term — semi/anti/mark joins and the residual-predicate case |
 | [in-subquery-plan.md](in-subquery-plan.md) | Proposal: `x in (table_expr)` / `not in` as semi / null-aware anti join — the subquery family, not a scalar like `like()` |

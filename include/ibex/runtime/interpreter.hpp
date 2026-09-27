@@ -761,6 +761,13 @@ struct ParallelPipelineStats {
     /// contract) still answers correctly, on the per-group gather-and-rebuild
     /// evaluator, at many times the cost.
     std::atomic<std::uint64_t> grouped_lifted_group_state{0};
+    /// Categorical columns a streamed scan emitted over their unit's own
+    /// dictionary, skipping the per-row remap onto the shared one, because the
+    /// consumer took that unit's worker partial and reads a handful of rows'
+    /// codes itself (`ScanWorkerSink::untranslated_columns`). Silent like the
+    /// others: a sink that stopped accepting would cost the remap again with
+    /// every test green.
+    std::atomic<std::uint64_t> untranslated_categorical_columns{0};
 };
 
 struct ExecutionContext {

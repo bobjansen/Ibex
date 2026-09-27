@@ -38,6 +38,7 @@
 
 #include "aggregate_prefilter.hpp"
 #include "physical_plan.hpp"
+#include "scan_worker_sink_internal.hpp"
 
 #if defined(__AVX2__) || defined(__BMI2__)
 #include <immintrin.h>
@@ -382,7 +383,8 @@ auto process_pipeline_stats() -> ParallelPipelineStats* {
                     "parallel_fields={} parallel_direct_numeric_fields={} parallel_probes={} "
                     "parallel_hash_builds={} parallel_aggregate_partitions={} "
                     "parallel_aggregate_finalizes={} "
-                    "grouped_lifted_group_state={} chunk_direct_updates={}\n",
+                    "grouped_lifted_group_state={} chunk_direct_updates={} "
+                    "untranslated_categorical_columns={}\n",
                     stats.parallel_pipelines.load(), stats.serial_pipelines.load(),
                     stats.morsels.load(), stats.pipelined_scans.load(),
                     stats.pipelined_stages.load(), stats.range_heads.load(),
@@ -390,7 +392,8 @@ auto process_pipeline_stats() -> ParallelPipelineStats* {
                     stats.parallel_direct_numeric_fields.load(), stats.parallel_probes.load(),
                     stats.parallel_hash_builds.load(), stats.parallel_aggregate_partitions.load(),
                     stats.parallel_aggregate_finalizes.load(),
-                    stats.grouped_lifted_group_state.load(), stats.chunk_direct_updates.load());
+                    stats.grouped_lifted_group_state.load(), stats.chunk_direct_updates.load(),
+                    stats.untranslated_categorical_columns.load());
             } catch (...) {  // NOLINT(bugprone-empty-catch)
             }
         }

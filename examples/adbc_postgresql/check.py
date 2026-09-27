@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 """Check the walkthrough against a PostgreSQL database already seeded with seed.sql.
 
 Only reads the database. Pass --uri explicitly; no database is created or reset.

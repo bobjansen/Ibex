@@ -397,11 +397,24 @@ TEST_CASE("read_adbc reports errors instead of failing silently", "[adbc]") {
     AdbcSession s;
     seed_trades(s, db);
 
-    SECTION("an unloadable driver") {
+    SECTION("a driver path that does not exist is named, whole") {
         const auto r = s.session.execute(
             "read_adbc(\"/nonexistent/libadbc_driver_nothing.so\", \"\", \"select 1\");");
         CHECK_FALSE(r.ok);
         CHECK(contains(r.error, "read_adbc"));
+        CHECK(
+            contains(r.error, "driver library not found: /nonexistent/libadbc_driver_nothing.so"));
+        // Left to the driver manager, a second dlopen for an invented name.
+        CHECK_FALSE(contains(r.error, ".so.so"));
+    }
+    SECTION("a Windows drive path is not read as a driver:uri prefix") {
+        // ADBC reads `C:` as a scheme and reported "Could not load `C`".
+        const auto r = s.session.execute(
+            "read_adbc(\"C:/nonexistent/adbc_driver_nothing.dll\", \"\", \"select 1\");");
+        CHECK_FALSE(r.ok);
+        CHECK(
+            contains(r.error, "driver library not found: C:/nonexistent/adbc_driver_nothing.dll"));
+        CHECK_FALSE(contains(r.error, "`C`"));
     }
     SECTION("a malformed options string") {
         const auto r = s.session.execute(read_call(db, "select 1 as x", "novalue") + ";");
@@ -490,10 +503,21 @@ TEST_CASE("read_adbc resolves a bare driver name through a manifest", "[adbc]") 
         REQUIRE(r.ok);
         CHECK(ints(*r.table, "n") == std::vector<std::int64_t>{5});
     }
-    SECTION("an unknown name fails and says which name") {
+    SECTION("an unknown name fails, says how to install one and where it looked") {
+        // A session keeps an error's first line only, so the verdict and what
+        // to do must both be on it.
         const auto r = s.session.execute("read_adbc(\"ibex_no_such_driver\", " +
                                          ibex_str(db.path()) + ", \"select 1\");");
+        INFO(r.error);
         CHECK_FALSE(r.ok);
-        CHECK(contains(r.error, "ibex_no_such_driver"));
+        CHECK(contains(r.error, "ADBC driver `ibex_no_such_driver` not found"));
+        CHECK(contains(r.error, "install_adbc_driver"));
+        // The full message keeps the driver manager's own search list.
+        const auto direct =
+            s.function().func(string_args({"ibex_no_such_driver", db.path(), "select 1"}));
+        REQUIRE_FALSE(direct.has_value());
+        INFO(direct.error());
+        CHECK(contains(direct.error(), "Searched for a driver manifest in:"));
+        CHECK(contains(direct.error(), "ADBC_DRIVER_PATH"));
     }
 }

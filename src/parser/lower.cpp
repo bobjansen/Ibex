@@ -804,18 +804,17 @@ auto as_scalar_subquery(const Expr& expr) -> const CallExpr* {
     return call;
 }
 
-auto clause_contains_call(const Clause& clause, std::string_view callee) -> bool;
+}  // namespace
 
-/// True when any node anywhere in `expr` calls `callee`.
-auto contains_call(const Expr& expr, std::string_view callee) -> bool {
+auto contains_call_if(const Expr& expr, const CallPredicate& matches) -> bool {
     return std::visit(
         [&](const auto& node) -> bool {
             using T = std::decay_t<decltype(node)>;
             const auto in = [&](const ExprPtr& child) {
-                return child != nullptr && contains_call(*child, callee);
+                return child != nullptr && contains_call_if(*child, matches);
             };
             if constexpr (std::is_same_v<T, CallExpr>) {
-                if (node.callee == callee) {
+                if (matches(node.callee)) {
                     return true;
                 }
                 return std::ranges::any_of(node.args, in) ||
@@ -843,7 +842,7 @@ auto contains_call(const Expr& expr, std::string_view callee) -> bool {
                                            [&](const TableColumnDef& c) { return in(c.expr); });
             } else if constexpr (std::is_same_v<T, BlockExpr>) {
                 return in(node.base) || std::ranges::any_of(node.clauses, [&](const Clause& c) {
-                           return clause_contains_call(c, callee);
+                           return clause_contains_call_if(c, matches);
                        });
             } else if constexpr (std::is_same_v<T, JoinExpr>) {
                 return in(node.left) || in(node.right) ||
@@ -851,7 +850,7 @@ auto contains_call(const Expr& expr, std::string_view callee) -> bool {
             } else if constexpr (std::is_same_v<T, StreamExpr>) {
                 return in(node.source) || std::ranges::any_of(node.sink_args, in) ||
                        std::ranges::any_of(node.transform, [&](const Clause& c) {
-                           return clause_contains_call(c, callee);
+                           return clause_contains_call_if(c, matches);
                        });
             } else {
                 return false;  // IdentifierExpr, LiteralExpr
@@ -860,12 +859,12 @@ auto contains_call(const Expr& expr, std::string_view callee) -> bool {
         expr.node);
 }
 
-auto clause_contains_call(const Clause& clause, std::string_view callee) -> bool {
+auto clause_contains_call_if(const Clause& clause, const CallPredicate& matches) -> bool {
     return std::visit(
         [&](const auto& c) -> bool {
             using T = std::decay_t<decltype(c)>;
             const auto in = [&](const ExprPtr& expr) {
-                return expr != nullptr && contains_call(*expr, callee);
+                return expr != nullptr && contains_call_if(*expr, matches);
             };
             const auto in_fields = [&](const std::vector<Field>& fields) {
                 return std::ranges::any_of(fields, [&](const Field& f) { return in(f.expr); });
@@ -900,6 +899,13 @@ auto clause_contains_call(const Clause& clause, std::string_view callee) -> bool
             }
         },
         clause);
+}
+
+namespace {
+
+/// True when any node anywhere in `expr` calls `callee`.
+auto contains_call(const Expr& expr, std::string_view callee) -> bool {
+    return contains_call_if(expr, [callee](std::string_view name) { return name == callee; });
 }
 
 /// Flatten a top-level `&&` chain into its conjuncts. Parentheses are looked

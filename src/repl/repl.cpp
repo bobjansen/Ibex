@@ -107,6 +107,11 @@ using ColumnRegistry = robin_hood::unordered_map<std::string, runtime::ColumnVal
 /// A binding lives in exactly one of the two registries.
 using LazyTableRegistry = robin_hood::unordered_map<std::string, runtime::LazyTablePtr>;
 using ModelRegistry = robin_hood::unordered_map<std::string, runtime::ModelResult>;
+/// Resource bindings (`let db = adbc_connect(...)`). Only statement-level code
+/// in `execute_statements` sees this registry, never the expression
+/// evaluators, which is what keeps resources out of query expressions and
+/// function bodies. A binding lives in exactly one registry.
+using ResourceRegistry = robin_hood::unordered_map<std::string, runtime::ResourcePtr>;
 
 /// Decode exactly the columns `needed` from one lazy source, applying its
 /// pushable scan predicate when `filter_applied`. The single place both
@@ -2976,6 +2981,44 @@ auto eval_model_scalar_accessor(const parser::CallExpr& call, const ModelRegistr
     return runtime::ScalarValue{model.value()->r_squared};
 }
 
+auto is_resource_extern(const parser::ExternDecl& decl) -> bool {
+    return decl.return_type.kind == parser::Type::Kind::Resource ||
+           std::ranges::any_of(decl.params, [](const parser::Param& param) {
+               return param.type.kind == parser::Type::Kind::Resource;
+           });
+}
+
+auto find_resource_extern(std::string_view callee, const ExternDeclRegistry& extern_decls)
+    -> const parser::ExternDecl* {
+    auto it = extern_decls.find(std::string(callee));
+    if (it == extern_decls.end() || !is_resource_extern(it->second)) {
+        return nullptr;
+    }
+    return &it->second;
+}
+
+/// True when `expr` calls, anywhere, an extern that takes or returns a resource.
+auto calls_resource_extern(const parser::Expr& expr, const ExternDeclRegistry& extern_decls)
+    -> bool {
+    return parser::contains_call_if(expr, [&](std::string_view callee) {
+        return find_resource_extern(callee, extern_decls) != nullptr;
+    });
+}
+
+/// The first resource extern `expr` calls, for the placement error.
+auto first_resource_callee(const parser::Expr& expr, const ExternDeclRegistry& extern_decls)
+    -> std::optional<std::string> {
+    std::optional<std::string> found;
+    (void)parser::contains_call_if(expr, [&](std::string_view callee) {
+        if (find_resource_extern(callee, extern_decls) != nullptr) {
+            found = std::string(callee);
+            return true;
+        }
+        return false;
+    });
+    return found;
+}
+
 auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                      LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
                      ColumnRegistry& columns, ModelRegistry& models,
@@ -4148,6 +4191,28 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                                format_function_names(functions, extern_decls) + ")");
     }
     const auto& fn = it->second;
+    // Resource calls run only on the statement coordinator (execute_statements),
+    // which never sees a function body.
+    for (const auto& body_stmt : fn.body) {
+        const parser::Expr* value = std::visit(
+            [](const auto& s) -> const parser::Expr* {
+                using T = std::decay_t<decltype(s)>;
+                if constexpr (std::is_same_v<T, parser::ExprStmt>) {
+                    return s.expr.get();
+                } else {
+                    return s.value.get();
+                }
+            },
+            body_stmt);
+        if (value == nullptr) {
+            continue;
+        }
+        if (auto callee = first_resource_callee(*value, extern_decls)) {
+            return std::unexpected("function '" + fn.name + "' calls " + *callee +
+                                   ", but resource functions cannot be called inside a "
+                                   "function yet");
+        }
+    }
     auto bound_args = bind_call_arguments(call.callee, call, fn.params);
     if (!bound_args) {
         return std::unexpected(bound_args.error());
@@ -4674,11 +4739,385 @@ auto rewrite_inline_sources(parser::Expr& expr, InlineSourceRewrites& rewrites,
     return std::nullopt;
 }
 
+constexpr std::string_view kResourcePlacementError =
+    "can be called only as a statement's value, as a table operand, or as an argument of "
+    "another call, not inside a query clause";
+
+/// Undoes the rewrites `ResourceCalls::hoist` made to one statement: restores
+/// the replaced calls and drops their temporary bindings, so the statement's
+/// AST comes back unchanged.
+struct HoistedResourceCalls {
+    runtime::TableRegistry* tables;
+    runtime::ScalarRegistry* scalars;
+    std::vector<std::pair<parser::ExprPtr*, parser::ExprPtr>> replaced;
+    std::vector<std::string> temp_names;
+
+    HoistedResourceCalls(runtime::TableRegistry* table_registry,
+                         runtime::ScalarRegistry* scalar_registry)
+        : tables(table_registry), scalars(scalar_registry) {}
+    HoistedResourceCalls(const HoistedResourceCalls&) = delete;
+    auto operator=(const HoistedResourceCalls&) -> HoistedResourceCalls& = delete;
+    HoistedResourceCalls(HoistedResourceCalls&&) = delete;
+    auto operator=(HoistedResourceCalls&&) -> HoistedResourceCalls& = delete;
+
+    ~HoistedResourceCalls() {
+        for (auto& [slot, original] : replaced) {
+            *slot = std::move(original);
+        }
+        for (const auto& name : temp_names) {
+            tables->erase(name);
+            scalars->erase(name);
+        }
+    }
+};
+
+/// Runs calls to extern functions whose signature has a resource type. They
+/// run here, on the statement coordinator, one statement at a time and in
+/// source order, never inside query execution: a resource call in a table
+/// operand is evaluated first and its result bound as a materialized
+/// temporary, so the query that follows sees an ordinary table.
+class ResourceCalls {
+   public:
+    ResourceCalls(ResourceRegistry& resources, runtime::TableRegistry& tables,
+                  LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
+                  ColumnRegistry& columns, ModelRegistry& models, const FunctionRegistry& functions,
+                  CompileTimeListRegistry& compile_time_lists,
+                  const ExternDeclRegistry& extern_decls, const runtime::ExternRegistry& externs)
+        : resources_(resources),
+          tables_(tables),
+          lazy_tables_(lazy_tables),
+          scalars_(scalars),
+          columns_(columns),
+          models_(models),
+          functions_(functions),
+          compile_time_lists_(compile_time_lists),
+          extern_decls_(extern_decls),
+          externs_(externs) {}
+
+    /// The call `expr` is, when it calls a resource extern.
+    [[nodiscard]] auto as_resource_call(parser::Expr& expr) const -> parser::CallExpr* {
+        auto* call = std::get_if<parser::CallExpr>(&expr.node);
+        if (call == nullptr || find_resource_extern(call->callee, extern_decls_) == nullptr) {
+            return nullptr;
+        }
+        return call;
+    }
+
+    /// The first resource call in `expr` that `hoist` (or, for `expr` itself,
+    /// the statement) would not run, checked before any of them runs so that
+    /// a misplaced call makes no plugin call at all.
+    [[nodiscard]] auto misplaced_call(const parser::Expr& expr) const
+        -> std::optional<std::string> {
+        const auto* call = std::get_if<parser::CallExpr>(&expr.node);
+        if (call != nullptr && find_resource_extern(call->callee, extern_decls_) != nullptr) {
+            return misplaced_in_resource_call(*call);
+        }
+        return misplaced_below(expr);
+    }
+
+    auto call(parser::CallExpr& call) -> std::expected<runtime::ExternValue, std::string> {
+        const auto* decl = find_resource_extern(call.callee, extern_decls_);
+        const auto* fn = externs_.find(call.callee);
+        if (decl == nullptr || fn == nullptr) {
+            return std::unexpected("extern function not registered: " + call.callee);
+        }
+        if (fn->first_arg_is_table || !fn->func) {
+            return std::unexpected(call.callee +
+                                   ": a resource function must be registered as a plain extern");
+        }
+        auto bound_args = bind_call_arguments(call.callee, call, decl->params);
+        if (!bound_args) {
+            return std::unexpected(bound_args.error());
+        }
+        runtime::ExternArgs args;
+        args.reserve(bound_args->size());
+        for (const auto& arg : *bound_args) {
+            if (arg.param->type.kind == parser::Type::Kind::Resource) {
+                auto resource = resource_argument(*arg.expr, *arg.param, call.callee);
+                if (!resource) {
+                    return std::unexpected(std::move(resource.error()));
+                }
+                args.push_resource(std::move(*resource));
+                continue;
+            }
+            if (calls_resource_extern(*arg.expr, extern_decls_)) {
+                return std::unexpected(call.callee + ": argument '" + arg.param->name +
+                                       "' calls a resource function; bind its result with "
+                                       "`let` first");
+            }
+            auto value =
+                eval_scalar_expr(*arg.expr, tables_, lazy_tables_, scalars_, columns_, models_,
+                                 functions_, compile_time_lists_, extern_decls_, externs_);
+            if (!value) {
+                return std::unexpected(std::move(value.error()));
+            }
+            if (runtime::is_null_scalar(*value)) {
+                return std::unexpected(call.callee + ": null argument in extern function call");
+            }
+            args.push_back(std::move(*value));
+        }
+        auto result = fn->func(args);
+        if (!result) {
+            return std::unexpected(std::move(result.error()));
+        }
+        const bool returns_resource = decl->return_type.kind == parser::Type::Kind::Resource;
+        const auto* resource = std::get_if<runtime::ResourcePtr>(&*result);
+        if (returns_resource) {
+            if (resource == nullptr || *resource == nullptr ||
+                (*resource)->type_name() != decl->return_type.resource) {
+                return std::unexpected(call.callee + ": the plugin did not return a " +
+                                       decl->return_type.resource);
+            }
+        } else if (resource != nullptr) {
+            return std::unexpected(call.callee + ": the plugin returned a resource, but the " +
+                                   "declaration says " + type_to_string(decl->return_type));
+        }
+        return result;
+    }
+
+    /// Evaluates every resource call in a table-operand or call-argument
+    /// position of `expr`, in source order, and replaces it with a temporary
+    /// binding of its result. `expr` itself is the caller's to handle.
+    auto hoist(parser::Expr& expr, HoistedResourceCalls& rewrites) -> std::optional<std::string> {
+        auto visit_slot = [&](parser::ExprPtr& slot) -> std::optional<std::string> {
+            if (!slot) {
+                return std::nullopt;
+            }
+            auto* resource_call = as_resource_call(*slot);
+            if (resource_call == nullptr) {
+                return hoist(*slot, rewrites);
+            }
+            auto value = call(*resource_call);
+            if (!value) {
+                return value.error();
+            }
+            auto temp_name = make_temp_table_name();
+            if (auto* table = std::get_if<runtime::Table>(&*value)) {
+                tables_.insert_or_assign(temp_name, std::move(*table));
+            } else if (auto* scalar = std::get_if<runtime::ScalarValue>(&*value)) {
+                scalars_.insert_or_assign(temp_name, std::move(*scalar));
+            } else {
+                return resource_call->callee +
+                       " returns a resource, which can only be bound with `let` or passed "
+                       "to a resource parameter";
+            }
+            rewrites.temp_names.push_back(temp_name);
+            rewrites.replaced.emplace_back(&slot, std::move(slot));
+            slot = std::make_unique<parser::Expr>(
+                parser::Expr{parser::IdentifierExpr{.name = std::move(temp_name)}});
+            return std::nullopt;
+        };
+        if (auto* block = std::get_if<parser::BlockExpr>(&expr.node)) {
+            return visit_slot(block->base);
+        }
+        if (auto* join = std::get_if<parser::JoinExpr>(&expr.node)) {
+            if (auto err = visit_slot(join->left)) {
+                return err;
+            }
+            return visit_slot(join->right);
+        }
+        if (auto* group = std::get_if<parser::GroupExpr>(&expr.node)) {
+            return visit_slot(group->expr);
+        }
+        if (auto* ascribe = std::get_if<parser::AscribeExpr>(&expr.node)) {
+            return visit_slot(ascribe->base);
+        }
+        if (auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
+            for (auto& arg : call->args) {
+                if (auto err = visit_slot(arg)) {
+                    return err;
+                }
+            }
+            for (auto& named : call->named_args) {
+                if (auto err = visit_slot(named.value)) {
+                    return err;
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+   private:
+    // A resource call's own arguments: a nested resource call is allowed
+    // (it can open the resource a parameter takes); anything else that hides
+    // one is not.
+    [[nodiscard]] auto misplaced_in_resource_call(const parser::CallExpr& call) const
+        -> std::optional<std::string> {
+        const auto check = [&](const parser::ExprPtr& arg) -> std::optional<std::string> {
+            if (!arg) {
+                return std::nullopt;
+            }
+            const auto* nested = std::get_if<parser::CallExpr>(&arg->node);
+            if (nested != nullptr &&
+                find_resource_extern(nested->callee, extern_decls_) != nullptr) {
+                return misplaced_in_resource_call(*nested);
+            }
+            return first_resource_callee(*arg, extern_decls_);
+        };
+        for (const auto& arg : call.args) {
+            if (auto found = check(arg)) {
+                return found;
+            }
+        }
+        for (const auto& named : call.named_args) {
+            if (auto found = check(named.value)) {
+                return found;
+            }
+        }
+        return std::nullopt;
+    }
+
+    // Mirrors `hoist`: its slots may hold resource calls, everything else may not.
+    [[nodiscard]] auto misplaced_below(const parser::Expr& expr) const
+        -> std::optional<std::string> {
+        const auto slot = [&](const parser::ExprPtr& child) -> std::optional<std::string> {
+            return child ? misplaced_call(*child) : std::nullopt;
+        };
+        const auto anywhere = [&](const parser::ExprPtr& child) -> std::optional<std::string> {
+            return child ? first_resource_callee(*child, extern_decls_) : std::nullopt;
+        };
+        if (const auto* block = std::get_if<parser::BlockExpr>(&expr.node)) {
+            if (auto found = slot(block->base)) {
+                return found;
+            }
+            std::optional<std::string> found;
+            for (const auto& clause : block->clauses) {
+                (void)parser::clause_contains_call_if(clause, [&](std::string_view callee) {
+                    if (find_resource_extern(callee, extern_decls_) != nullptr) {
+                        found = std::string(callee);
+                        return true;
+                    }
+                    return false;
+                });
+                if (found) {
+                    return found;
+                }
+            }
+            return std::nullopt;
+        }
+        if (const auto* join = std::get_if<parser::JoinExpr>(&expr.node)) {
+            if (auto found = slot(join->left)) {
+                return found;
+            }
+            if (auto found = slot(join->right)) {
+                return found;
+            }
+            return join->predicate.has_value() ? anywhere(*join->predicate) : std::nullopt;
+        }
+        if (const auto* group = std::get_if<parser::GroupExpr>(&expr.node)) {
+            return slot(group->expr);
+        }
+        if (const auto* ascribe = std::get_if<parser::AscribeExpr>(&expr.node)) {
+            return slot(ascribe->base);
+        }
+        if (const auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
+            for (const auto& arg : call->args) {
+                if (auto found = slot(arg)) {
+                    return found;
+                }
+            }
+            for (const auto& named : call->named_args) {
+                if (auto found = slot(named.value)) {
+                    return found;
+                }
+            }
+            return std::nullopt;
+        }
+        return first_resource_callee(expr, extern_decls_);
+    }
+
+    auto resource_argument(parser::Expr& expr, const parser::Param& param,
+                           const std::string& callee)
+        -> std::expected<runtime::ResourcePtr, std::string> {
+        const auto& expected_type = param.type.resource;
+        const auto mismatch = [&](std::string_view what, std::string_view actual) {
+            return std::unexpected(
+                ibex::formatting::format("{}: argument '{}' expects {}, but {} is {}", callee,
+                                         param.name, expected_type, what, actual));
+        };
+        if (const auto* ident = std::get_if<parser::IdentifierExpr>(&expr.node)) {
+            auto it = resources_.find(ident->name);
+            if (it == resources_.end()) {
+                return mismatch("'" + ident->name + "'", "not a resource binding");
+            }
+            if (it->second->type_name() != expected_type) {
+                return mismatch("'" + ident->name + "'",
+                                "a " + std::string(it->second->type_name()));
+            }
+            return it->second;
+        }
+        if (auto* resource_call = as_resource_call(expr)) {
+            const auto* decl = find_resource_extern(resource_call->callee, extern_decls_);
+            if (decl->return_type.kind != parser::Type::Kind::Resource) {
+                return mismatch(resource_call->callee + "(...)", "not a resource");
+            }
+            auto value = call(*resource_call);
+            if (!value) {
+                return std::unexpected(std::move(value.error()));
+            }
+            auto resource = std::get<runtime::ResourcePtr>(std::move(*value));
+            if (resource->type_name() != expected_type) {
+                return mismatch(resource_call->callee + "(...)",
+                                "a " + std::string(resource->type_name()));
+            }
+            return resource;
+        }
+        return std::unexpected(callee + ": argument '" + param.name + "' expects a " +
+                               expected_type + " binding");
+    }
+
+    ResourceRegistry& resources_;
+    runtime::TableRegistry& tables_;
+    LazyTableRegistry& lazy_tables_;
+    runtime::ScalarRegistry& scalars_;
+    ColumnRegistry& columns_;
+    ModelRegistry& models_;
+    const FunctionRegistry& functions_;
+    CompileTimeListRegistry& compile_time_lists_;
+    const ExternDeclRegistry& extern_decls_;
+    const runtime::ExternRegistry& externs_;
+};
+
+/// A name lives in exactly one registry. When a `let` that did not bind a
+/// resource succeeds, this drops the resource binding it shadows; a `let` that
+/// fails leaves it in place.
+struct ResourceShadowing {
+    ResourceRegistry& resources;
+    const runtime::TableRegistry& tables;
+    const LazyTableRegistry& lazy_tables;
+    const runtime::ScalarRegistry& scalars;
+    const ColumnRegistry& columns;
+    std::string name;
+
+    ResourceShadowing(ResourceRegistry& resource_registry,
+                      const runtime::TableRegistry& table_registry,
+                      const LazyTableRegistry& lazy_table_registry,
+                      const runtime::ScalarRegistry& scalar_registry,
+                      const ColumnRegistry& column_registry, std::string bound_name)
+        : resources(resource_registry),
+          tables(table_registry),
+          lazy_tables(lazy_table_registry),
+          scalars(scalar_registry),
+          columns(column_registry),
+          name(std::move(bound_name)) {}
+    ResourceShadowing(const ResourceShadowing&) = delete;
+    auto operator=(const ResourceShadowing&) -> ResourceShadowing& = delete;
+    ResourceShadowing(ResourceShadowing&&) = delete;
+    auto operator=(ResourceShadowing&&) -> ResourceShadowing& = delete;
+    ~ResourceShadowing() {
+        if (!name.empty() && (tables.contains(name) || lazy_tables.contains(name) ||
+                              scalars.contains(name) || columns.contains(name))) {
+            resources.erase(name);
+        }
+    }
+};
+
 auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableRegistry& tables,
                         LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
                         ColumnRegistry& columns, ModelRegistry& models, FunctionRegistry& functions,
                         CompileTimeListRegistry& compile_time_lists,
                         ExternDeclRegistry& extern_decls, runtime::ExternRegistry& externs,
+                        ResourceRegistry& resources,
                         const std::vector<std::string>& plugin_search_paths,
                         robin_hood::unordered_set<std::string>& loaded_plugins,
                         const std::vector<std::string>& import_search_paths = {},
@@ -4803,9 +5242,9 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
             // only contain extern fn and fn declarations).
             if (!execute_statements(parsed->statements, tables, lazy_tables, scalars, columns,
                                     models, functions, compile_time_lists, extern_decls, externs,
-                                    plugin_search_paths, loaded_plugins, import_search_paths,
-                                    nullptr, &import_doc_groups, function_sources, declaration_docs,
-                                    imports, *source)) {
+                                    resources, plugin_search_paths, loaded_plugins,
+                                    import_search_paths, nullptr, &import_doc_groups,
+                                    function_sources, declaration_docs, imports, *source)) {
                 return false;
             }
             continue;
@@ -4814,6 +5253,102 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
             // Already registered by the pre-pass above.
             continue;
         }
+
+        // Resource functions run here, before anything else sees the
+        // statement: a direct call is the whole statement, and a call in a
+        // table operand is replaced by its materialized result for the rest of
+        // the statement (restored when `hoisted` goes out of scope).
+        HoistedResourceCalls hoisted(&tables, &scalars);
+        auto* let_stmt_ptr = std::get_if<parser::LetStmt>(&stmt);
+        auto* tuple_let_ptr = std::get_if<parser::TupleLetStmt>(&stmt);
+        auto* expr_stmt_ptr = std::get_if<parser::ExprStmt>(&stmt);
+        parser::Expr* statement_value = let_stmt_ptr != nullptr    ? let_stmt_ptr->value.get()
+                                        : tuple_let_ptr != nullptr ? tuple_let_ptr->value.get()
+                                        : expr_stmt_ptr != nullptr ? expr_stmt_ptr->expr.get()
+                                                                   : nullptr;
+        const ResourceShadowing shadowing(resources, tables, lazy_tables, scalars, columns,
+                                          let_stmt_ptr != nullptr ? let_stmt_ptr->name : "");
+        if (statement_value != nullptr) {
+            ResourceCalls resource_calls(resources, tables, lazy_tables, scalars, columns, models,
+                                         functions, compile_time_lists, extern_decls, externs);
+            const auto bind_resource = [&](const std::string& name, runtime::ResourcePtr value) {
+                resources.insert_or_assign(name, std::move(value));
+                tables.erase(name);
+                lazy_tables.erase(name);
+                scalars.erase(name);
+                columns.erase(name);
+                models.erase(name);
+                compile_time_lists.erase(name);
+            };
+            const auto* alias = std::get_if<parser::IdentifierExpr>(&statement_value->node);
+            if (let_stmt_ptr != nullptr && alias != nullptr && resources.contains(alias->name)) {
+                if (let_stmt_ptr->type.has_value()) {
+                    ibex::formatting::print(
+                        "error: '{}': a resource binding takes no type "
+                        "annotation\n",
+                        let_stmt_ptr->name);
+                    return false;
+                }
+                bind_resource(let_stmt_ptr->name, resources.at(alias->name));
+                continue;
+            }
+            if (auto callee = resource_calls.misplaced_call(*statement_value)) {
+                ibex::formatting::print("error: {} {}\n", *callee, kResourcePlacementError);
+                return false;
+            }
+            if (auto* direct = resource_calls.as_resource_call(*statement_value)) {
+                if (tuple_let_ptr != nullptr) {
+                    ibex::formatting::print(
+                        "error: bind the result of {} with `let` before destructuring it\n",
+                        direct->callee);
+                    return false;
+                }
+                if (let_stmt_ptr != nullptr && let_stmt_ptr->type.has_value()) {
+                    ibex::formatting::print(
+                        "error: '{}': the result of {} takes no type annotation; its type is "
+                        "the declaration's\n",
+                        let_stmt_ptr->name, direct->callee);
+                    return false;
+                }
+                auto value = resource_calls.call(*direct);
+                if (!value) {
+                    ibex::formatting::print("error: {}\n", value.error());
+                    return false;
+                }
+                if (let_stmt_ptr == nullptr) {
+                    if (auto* table = std::get_if<runtime::Table>(&*value)) {
+                        render_eval_value(EvalValue{std::move(*table)});
+                    } else if (auto* scalar = std::get_if<runtime::ScalarValue>(&*value)) {
+                        render_eval_value(EvalValue{std::move(*scalar)});
+                    } else if (auto* resource = std::get_if<runtime::ResourcePtr>(&*value)) {
+                        ibex::formatting::print("<{}>\n", (*resource)->type_name());
+                    }
+                    continue;
+                }
+                const auto& name = let_stmt_ptr->name;
+                if (auto* resource = std::get_if<runtime::ResourcePtr>(&*value)) {
+                    bind_resource(name, std::move(*resource));
+                    continue;
+                }
+                lazy_tables.erase(name);
+                columns.erase(name);
+                models.erase(name);
+                compile_time_lists.erase(name);
+                if (auto* table = std::get_if<runtime::Table>(&*value)) {
+                    scalars.erase(name);
+                    tables.insert_or_assign(name, std::move(*table));
+                } else if (auto* scalar = std::get_if<runtime::ScalarValue>(&*value)) {
+                    tables.erase(name);
+                    scalars.insert_or_assign(name, std::move(*scalar));
+                }
+                continue;
+            }
+            if (auto err = resource_calls.hoist(*statement_value, hoisted)) {
+                ibex::formatting::print("error: {}\n", *err);
+                return false;
+            }
+        }
+
         if (std::holds_alternative<parser::LetStmt>(stmt)) {
             const auto& let_stmt = std::get<parser::LetStmt>(stmt);
             if (!let_stmt.type.has_value()) {
@@ -5527,6 +6062,52 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         imported_units.push_back(std::move(*parsed));
         prelude.push_back(&imported_units.back());
     }
+    // Resource functions run one statement at a time on the statement path,
+    // in source order; the whole-script planner would reorder or fuse them.
+    {
+        std::set<std::string, std::less<>> resource_functions;
+        const auto collect_decls = [&](const parser::Program& unit) {
+            for (const auto& stmt : unit.statements) {
+                if (const auto* decl = std::get_if<parser::ExternDecl>(&stmt);
+                    decl != nullptr && is_resource_extern(*decl)) {
+                    resource_functions.insert(decl->name);
+                }
+            }
+        };
+        collect_decls(program);
+        for (const auto& unit : imported_units) {
+            collect_decls(unit);
+        }
+        const auto calls_resource = [&](const parser::ExprPtr& expr) {
+            return expr != nullptr && parser::contains_call_if(*expr, [&](std::string_view callee) {
+                       return resource_functions.contains(callee);
+                   });
+        };
+        for (const auto& stmt : program.statements) {
+            bool uses_resource = false;
+            if (const auto* let = std::get_if<parser::LetStmt>(&stmt)) {
+                uses_resource = calls_resource(let->value);
+            } else if (const auto* expr_stmt = std::get_if<parser::ExprStmt>(&stmt)) {
+                uses_resource = calls_resource(expr_stmt->expr);
+            } else if (const auto* fn = std::get_if<parser::FunctionDecl>(&stmt)) {
+                uses_resource = std::ranges::any_of(fn->body, [&](const parser::FnStmt& body) {
+                    return std::visit(
+                        [&](const auto& s) {
+                            using T = std::decay_t<decltype(s)>;
+                            if constexpr (std::is_same_v<T, parser::ExprStmt>) {
+                                return calls_resource(s.expr);
+                            } else {
+                                return calls_resource(s.value);
+                            }
+                        },
+                        body);
+                });
+            }
+            if (uses_resource) {
+                return decline("script calls a resource function");
+            }
+        }
+    }
     // `imported_units` must not reallocate after `prelude` points into it.
     prelude.clear();
     prelude.reserve(imported_units.size());
@@ -5934,8 +6515,11 @@ auto execute_script(std::string_view source, runtime::ExternRegistry& registry,
     auto comments = collect_script_comment_lines(source);
     auto doc_comment_groups = build_statement_comment_groups(parsed->statements, comments);
     robin_hood::unordered_set<std::string> loaded_plugins;
+    // Declared last so resources close before the bindings that may hold
+    // their results.
+    ResourceRegistry resources;
     return execute_statements(parsed->statements, tables, lazy_tables, scalars, columns, models,
-                              functions, compile_time_lists, extern_decls, registry,
+                              functions, compile_time_lists, extern_decls, registry, resources,
                               config.plugin_search_paths, loaded_plugins,
                               config.import_search_paths, nullptr, &doc_comment_groups,
                               &function_sources, &declaration_docs, &imports, source);
@@ -6031,6 +6615,8 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
     DeclarationDocRegistry declaration_docs;
     ImportRegistry imports;
     robin_hood::unordered_set<std::string> loaded_plugins;
+    // Declared after the other bindings so resources close first.
+    ResourceRegistry resources;
     bool timing_enabled = false;
     bool load_comments_enabled = false;
     configure_line_editing();
@@ -6052,7 +6638,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             return;
         }
         execute_statements(parsed->statements, tables, lazy_tables, scalars, columns, models,
-                           functions, compile_time_lists, extern_decls, registry,
+                           functions, compile_time_lists, extern_decls, registry, resources,
                            config.plugin_search_paths, loaded_plugins, config.import_search_paths,
                            nullptr, nullptr, &function_sources, &declaration_docs, &imports,
                            normalized);
@@ -6420,11 +7006,12 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 print_comment_groups = doc_comment_groups;
                 print_comment_groups_ptr = &print_comment_groups;
             }
-            if (!execute_statements(
-                    parsed->statements, tables, lazy_tables, scalars, columns, models, functions,
-                    compile_time_lists, extern_decls, registry, config.plugin_search_paths,
-                    loaded_plugins, config.import_search_paths, print_comment_groups_ptr,
-                    &doc_comment_groups, &function_sources, &declaration_docs, &imports, source)) {
+            if (!execute_statements(parsed->statements, tables, lazy_tables, scalars, columns,
+                                    models, functions, compile_time_lists, extern_decls, registry,
+                                    resources, config.plugin_search_paths, loaded_plugins,
+                                    config.import_search_paths, print_comment_groups_ptr,
+                                    &doc_comment_groups, &function_sources, &declaration_docs,
+                                    &imports, source)) {
                 report_timing();
                 continue;
             }
@@ -6607,6 +7194,8 @@ class ReplSession::Impl {
     DeclarationDocRegistry declaration_docs;
     ImportRegistry imports;
     robin_hood::unordered_set<std::string> loaded_plugins;
+    // Declared last so resources close first when the session ends.
+    ResourceRegistry resources;
 };
 
 ReplSession::ReplSession(const ReplConfig& config, runtime::ExternRegistry& registry)
@@ -6635,9 +7224,9 @@ auto ReplSession::execute(std::string_view source) -> ExecutionResult {
     const bool ok = execute_statements(
         parsed->statements, impl_->tables, impl_->lazy_tables, impl_->scalars, impl_->columns,
         impl_->models, impl_->functions, impl_->compile_time_lists, impl_->extern_decls,
-        *impl_->registry, impl_->config.plugin_search_paths, impl_->loaded_plugins,
-        impl_->config.import_search_paths, nullptr, &doc_comment_groups, &impl_->function_sources,
-        &impl_->declaration_docs, &impl_->imports, normalized);
+        *impl_->registry, impl_->resources, impl_->config.plugin_search_paths,
+        impl_->loaded_plugins, impl_->config.import_search_paths, nullptr, &doc_comment_groups,
+        &impl_->function_sources, &impl_->declaration_docs, &impl_->imports, normalized);
     active_execution_result() = nullptr;
     const std::string output = capture.take();
     result.ok = ok;
@@ -6678,7 +7267,8 @@ auto ReplSession::erase(std::string_view name) -> bool {
     return impl_->tables.erase(key) != 0 || impl_->lazy_tables.erase(key) != 0 ||
            impl_->scalars.erase(key) != 0 || impl_->columns.erase(key) != 0 ||
            impl_->models.erase(key) != 0 || impl_->functions.erase(key) != 0 ||
-           impl_->compile_time_lists.erase(key) != 0 || impl_->extern_decls.erase(key) != 0;
+           impl_->compile_time_lists.erase(key) != 0 || impl_->extern_decls.erase(key) != 0 ||
+           impl_->resources.erase(key) != 0;
 }
 
 }  // namespace ibex::repl

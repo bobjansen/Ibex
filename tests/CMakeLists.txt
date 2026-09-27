@@ -55,6 +55,7 @@ set(IBEX_TEST_SOURCES
     test_lexer.cpp
     test_parser.cpp
     test_repl.cpp
+    test_repl_resources.cpp
     test_lower.cpp
     test_null_keys.cpp
     test_interpreter.cpp

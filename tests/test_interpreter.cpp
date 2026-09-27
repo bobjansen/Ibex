@@ -14981,6 +14981,99 @@ auto make_cat_pipeline_deferred() -> runtime::DeferredScanRegistry {
     return deferred;
 }
 
+// Three units: the middle one gives `f` thousands of values, so the SHARED
+// dictionary outgrows the dense merge's budget while the last unit's own
+// dictionary is back to three. That unit's worker still makes a partial, and
+// the pipeline may leave its keys untranslated -- but the aggregate cannot
+// merge it and must translate the keys before accumulating the rows.
+constexpr std::size_t kWideUnitRows = 140'000;
+constexpr std::size_t kWideUnits = 3;
+constexpr std::size_t kWideValues = 9'000;  // 2 morsels x 2 x 9003 cells > rows / 4
+
+class WideDictCatReader final : public runtime::LazySourceReader {
+   public:
+    auto decode_units() -> std::vector<runtime::SourceUnit> override {
+        std::vector<runtime::SourceUnit> units;
+        for (std::size_t u = 0; u < kWideUnits; ++u) {
+            units.push_back({.start = u * kWideUnitRows, .rows = kWideUnitRows});
+        }
+        return units;
+    }
+
+    auto decode(const std::vector<std::string>& names, const runtime::Selection* selection,
+                const runtime::SourceUnit* unit, const runtime::ExecutionContext&)
+        -> std::expected<runtime::Table, std::string> override {
+        const runtime::SourceUnit whole{.start = 0, .rows = kWideUnits * kWideUnitRows};
+        const runtime::SourceUnit& range = unit == nullptr ? whole : *unit;
+        std::vector<std::size_t> rows;
+        for (std::size_t row = range.start; row < range.start + range.rows; ++row) {
+            if (selection == nullptr || std::ranges::binary_search(*selection, row)) {
+                rows.push_back(row);
+            }
+        }
+        const auto flag_of = [](std::size_t row) -> std::string {
+            if (row / kWideUnitRows == 1) {
+                return "W" + std::to_string(row % kWideValues);
+            }
+            return std::array<std::string, 3>{"A", "N", "R"}[(row * 7) % 3];
+        };
+        runtime::Table out;
+        for (const auto& name : names) {
+            if (name == "f" || name == "s") {
+                // Each column's dictionary in first-occurrence order, rotated
+                // per unit for `s`, as a Parquet row group writes it.
+                std::vector<std::string> dict;
+                robin_hood::unordered_map<std::string, std::int32_t> code_of;
+                std::vector<std::int32_t> codes;
+                codes.reserve(rows.size());
+                for (const std::size_t row : rows) {
+                    std::string value =
+                        name == "f" ? flag_of(row)
+                                    : std::array<std::string, 2>{"F", "O"}[((row / 5) + 1) % 2];
+                    const auto [it, inserted] =
+                        code_of.try_emplace(value, static_cast<std::int32_t>(dict.size()));
+                    if (inserted) {
+                        dict.push_back(std::move(value));
+                    }
+                    codes.push_back(it->second);
+                }
+                out.add_column(name, Column<Categorical>{std::move(dict), std::move(codes)});
+            } else if (name == "v") {
+                std::vector<double> values;
+                values.reserve(rows.size());
+                for (const std::size_t row : rows) {
+                    values.push_back(static_cast<double>(row % 97) * 0.25);
+                }
+                out.add_column("v", Column<double>{std::move(values)});
+            } else {
+                return std::unexpected("wide cat reader: unknown column " + name);
+            }
+        }
+        out.logical_rows = rows.size();
+        return out;
+    }
+};
+
+auto make_wide_cat_deferred() -> runtime::DeferredScanRegistry {
+    runtime::Table schema;
+    schema.add_column("f", Column<Categorical>{std::vector<std::string>{}});
+    schema.add_column("s", Column<Categorical>{std::vector<std::string>{}});
+    schema.add_column("v", Column<double>{});
+    auto lazy = std::make_shared<runtime::LazyTable>(
+        std::move(schema), kWideUnits * kWideUnitRows,
+        []() -> std::expected<runtime::LazySourceReaderPtr, std::string> {
+            return runtime::LazySourceReaderPtr{std::make_unique<WideDictCatReader>()};
+        });
+    runtime::DeferredScanRegistry deferred;
+    deferred.emplace("df", runtime::DeferredScan{.lazy = std::move(lazy),
+                                                 .conjuncts = {},
+                                                 .demand = {"f", "s", "v"},
+                                                 .demand_all = false,
+                                                 .key_column = {},
+                                                 .filter = nullptr});
+    return deferred;
+}
+
 // Run `program` over a two-column int table `t(k, v)` and return the result's
 // order-sensitive metadata for the table-properties rule tests below.
 auto metadata_of(const char* program) -> runtime::Table {
@@ -15337,6 +15430,9 @@ TEST_CASE("Scan pipeline workers accumulate a dense Categorical aggregate",
     // Every unit's accumulation ran on its scan worker: the aggregate never
     // split a chunk across the pool itself.
     CHECK(stats.parallel_fields.load() == 0);
+    // And past the first unit, which decides the path, the pipeline left both
+    // keys over their unit's dictionary: the merge remapped only first rows.
+    CHECK(stats.untranslated_categorical_columns.load() == 2 * (kCatUnits - 1));
     same_columns(streamed, reference);
 
     // One key is not the fused shape: the aggregate accumulates as before.
@@ -15344,6 +15440,7 @@ TEST_CASE("Scan pipeline workers accumulate a dense Categorical aggregate",
     runtime::ParallelPipelineStats single_serial;
     runtime::ParallelPipelineStats single_stats;
     same_columns(run(single, 4, single_stats), run(single, 1, single_serial));
+    CHECK(single_stats.untranslated_categorical_columns.load() == 0);
 
     // An update the pipeline cannot absorb (a row guard) runs above it and
     // overwrites `v` under the same name, so what the scan workers see is not
@@ -15356,6 +15453,56 @@ TEST_CASE("Scan pipeline workers accumulate a dense Categorical aggregate",
     runtime::ParallelPipelineStats above_serial;
     runtime::ParallelPipelineStats above_stats;
     same_columns(run(above, 4, above_stats), run(above, 1, above_serial));
+}
+
+// The pipeline left the last unit's keys over its own dictionary, expecting
+// the merge; the aggregate could not merge (the shared dictionary had grown
+// past the dense budget) and had to translate them itself. Counts are checked
+// by hand: a key read through the wrong dictionary moves rows between groups.
+TEST_CASE("Aggregate translates untranslated scan keys it cannot merge",
+          "[runtime][parallel][pipeline][aggregate]") {
+    const runtime::TableRegistry empty;
+    const auto run = [&](std::size_t threads, runtime::ParallelPipelineStats& stats) {
+        auto deferred = make_wide_cat_deferred();
+        auto ir = require_ir("df[select { n = count(), total = sum(v) }, by { f, s }];");
+        runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+        exec.parallel_threads = threads;
+        exec.parallel_stats = &stats;
+        auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
+        INFO((out.has_value() ? std::string{} : out.error()));
+        REQUIRE(out.has_value());
+        return std::move(*out);
+    };
+    runtime::ParallelPipelineStats serial_stats;
+    const auto reference = run(1, serial_stats);
+    runtime::ParallelPipelineStats stats;
+    const auto streamed = run(4, stats);
+    CHECK(stats.pipelined_scans.load() == 1);
+    CHECK(stats.untranslated_categorical_columns.load() == 2);  // the last unit's f and s
+
+    const auto mismatch = runtime::compare_tables(reference, streamed);
+    INFO((mismatch.has_value() ? mismatch->message() : std::string{}));
+    CHECK_FALSE(mismatch.has_value());
+
+    // By hand, per (f, s): the rows of units 0 and 2 with that flag and status.
+    std::map<std::pair<std::string, std::string>, std::int64_t> expected;
+    for (std::size_t row = 0; row < kWideUnits * kWideUnitRows; ++row) {
+        const std::string f = row / kWideUnitRows == 1
+                                  ? "W" + std::to_string(row % kWideValues)
+                                  : std::array<std::string, 3>{"A", "N", "R"}[(row * 7) % 3];
+        const std::string s = std::array<std::string, 2>{"F", "O"}[((row / 5) + 1) % 2];
+        ++expected[{f, s}];
+    }
+    REQUIRE(streamed.rows() == expected.size());
+    const auto& f_col = std::get<Column<Categorical>>(*streamed.find("f"));
+    const auto& s_col = std::get<Column<Categorical>>(*streamed.find("s"));
+    const auto& n_col = std::get<Column<std::int64_t>>(*streamed.find("n"));
+    for (std::size_t row = 0; row < streamed.rows(); ++row) {
+        const std::pair<std::string, std::string> key{std::string(f_col[row]),
+                                                      std::string(s_col[row])};
+        INFO(key.first << "/" << key.second);
+        CHECK(n_col[row] == expected[key]);
+    }
 }
 
 TEST_CASE("Scan pipeline preserves the schema when every unit is filtered out",

@@ -395,6 +395,14 @@ struct WorkerDensePartial {
     std::vector<std::vector<std::uint32_t>> first_rows;
 };
 
+/// What the aggregate takes for one emitted chunk: its worker's partial, and
+/// the remaps of the key columns the pipeline left over the unit's own
+/// dictionary (`DenseAggregateScanSink::defer_translation`).
+struct EmittedWorkerPartial {
+    std::unique_ptr<WorkerDensePartial> partial;
+    std::vector<DeferredCategoricalRemap> deferred;
+};
+
 /// The aggregate's `ScanWorkerSink`: while active, each pipeline worker runs
 /// the dense accumulation over the chunk it just produced -- cache-hot, on the
 /// core that decoded it -- and the aggregate merges the result instead of
@@ -411,8 +419,11 @@ class DenseAggregateScanSink final : public ScanWorkerSink {
     /// Waits out any worker still inside the producer: after this returns,
     /// nothing will call into the state that installed it.
     void deactivate() {
-        const std::unique_lock lock(producer_mutex_);
-        producer_ = nullptr;
+        {
+            const std::unique_lock lock(producer_mutex_);
+            producer_ = nullptr;
+        }
+        defer_translation({});
     }
 
     void on_worker_chunk(std::size_t unit, const Chunk& chunk) noexcept override {
@@ -438,24 +449,57 @@ class DenseAggregateScanSink final : public ScanWorkerSink {
         }
     }
 
-    void on_emit(std::size_t unit, const Chunk& chunk) noexcept override {
+    /// Consuming thread: from now on, the pipeline may emit `columns` over
+    /// each unit's own dictionary whenever that unit carries a partial -- the
+    /// aggregate merging it reads those columns' codes at a handful of rows,
+    /// and translates the column itself on any other path. Empty stops it.
+    void defer_translation(std::vector<std::size_t> columns) {
         const std::lock_guard lock(pending_mutex_);
-        current_.reset();
+        deferred_columns_ = std::move(columns);
+    }
+
+    [[nodiscard]] auto untranslated_columns(std::size_t unit, const Chunk& chunk) noexcept
+        -> std::vector<std::size_t> override {
+        const std::lock_guard lock(pending_mutex_);
+        if (deferred_columns_.empty()) {
+            return {};
+        }
+        const auto it = pending_.find(unit);
+        if (it == pending_.end() || it->second->rows != chunk.rows()) {
+            return {};
+        }
+        try {
+            return deferred_columns_;
+        } catch (...) {  // NOLINT(bugprone-empty-catch) -- nothing deferred then
+            return {};
+        }
+    }
+
+    [[nodiscard]] auto on_emit(std::size_t unit, const Chunk& chunk,
+                               std::vector<DeferredCategoricalRemap> deferred) noexcept
+        -> bool override {
+        const std::lock_guard lock(pending_mutex_);
+        current_ = {};
         const auto it = pending_.find(unit);
         if (it == pending_.end()) {
-            return;
+            return deferred.empty();
         }
         if (it->second->rows == chunk.rows()) {
-            current_ = std::move(it->second);
+            current_.partial = std::move(it->second);
+            current_.deferred = std::move(deferred);
+            pending_.erase(it);
+            return true;
         }
         pending_.erase(it);
+        return deferred.empty();
     }
 
     /// The partial for the chunk the pipeline emitted last, if its worker made
-    /// one. Consuming thread only, between that emission and the next.
-    [[nodiscard]] auto take_current() -> std::unique_ptr<WorkerDensePartial> {
+    /// one, with the remaps of the columns it emitted untranslated. Consuming
+    /// thread only, between that emission and the next.
+    [[nodiscard]] auto take_current() -> EmittedWorkerPartial {
         const std::lock_guard lock(pending_mutex_);
-        return std::move(current_);
+        return std::exchange(current_, {});
     }
 
    private:
@@ -463,7 +507,8 @@ class DenseAggregateScanSink final : public ScanWorkerSink {
     Producer producer_;
     std::mutex pending_mutex_;
     robin_hood::unordered_map<std::size_t, std::unique_ptr<WorkerDensePartial>> pending_;
-    std::unique_ptr<WorkerDensePartial> current_;
+    std::vector<std::size_t> deferred_columns_;
+    EmittedWorkerPartial current_;
 };
 
 class HashAggregateState final {
@@ -564,8 +609,19 @@ class HashAggregateState final {
         }
         active_chunk_ = std::move(*chunk_res.value());
         const ExecutionProfileScope scope(discovery_profile_, ProfilePhase::Next);
+        if (scan_sink_ != nullptr) {
+            worker_emission_ = scan_sink_->take_current();
+            if (auto err = settle_deferred_translation()) {
+                return std::unexpected(*err);
+            }
+        }
         if (auto err = discover_chunk(*active_chunk_)) {
             return std::unexpected(*err);
+        }
+        if (!worker_emission_.deferred.empty()) {
+            return std::unexpected(
+                "physical aggregate: a key column left untranslated by the scan pipeline was "
+                "neither merged nor translated");
         }
         return true;
     }
@@ -581,6 +637,7 @@ class HashAggregateState final {
             return std::unexpected(*err);
         }
         active_chunk_.reset();
+        worker_emission_ = {};
         return {};
     }
 
@@ -1053,6 +1110,9 @@ class HashAggregateState final {
         if (scan_sink_ != nullptr && !scan_sink_decided_) {
             scan_sink_decided_ = true;
             scan_sink_active_ = on_worker_partial_path();
+            if (scan_sink_active_) {
+                scan_sink_->defer_translation(untranslatable_key_columns());
+            }
         }
 
         const std::size_t rows = chunk.rows();
@@ -1100,6 +1160,11 @@ class HashAggregateState final {
             } else if (packed_fast_path_) {
                 migrate_packed_fast_path_to_generic();
             }
+        }
+        // Only the multi-key Categorical path can merge a partial over
+        // untranslated keys; every other one reads the codes.
+        if (!(cat_fast_path_ && group_entries.size() >= 2)) {
+            translate_deferred_keys();
         }
         if (cat_fast_path_) {
             return process_rows_cat(group_entries, agg_entries, rows);
@@ -3716,10 +3781,15 @@ class HashAggregateState final {
             // The worker cut its morsels from the same row count, but sized them
             // against its unit-local cell count; the merge is only the same
             // arithmetic as accumulating here if both cuts agree.
-            if (auto partial = scan_sink_->take_current(); partial != nullptr &&
-                                                           partial->rows == rows &&
-                                                           partial->partials.morsels == morsels) {
-                merge_worker_dense_partial(*partial, plan, cat_cols);
+            if (auto partial = std::move(worker_emission_.partial);
+                partial != nullptr && partial->rows == rows &&
+                partial->partials.morsels == morsels) {
+                std::vector<const Column<Categorical>::code_type*> raws(cat_cols.size());
+                for (std::size_t c = 0; c < cat_cols.size(); ++c) {
+                    raws[c] = cat_cols[c]->codes_data();
+                }
+                merge_worker_dense_partial(
+                    *partial, plan, [&](std::size_t c, std::size_t row) { return raws[c][row]; });
                 return true;
             }
         }
@@ -3741,27 +3811,125 @@ class HashAggregateState final {
     }
 
     /// Fold a worker's partial for this chunk into the groups. Its slots are
-    /// indexed by unit-local cells; each cell's shared codes are read from the
-    /// (already remapped) chunk at the row where the worker first saw it, which
-    /// gives the cell the synchronous path would have used. Same morsels, same
+    /// indexed by unit-local cells; each cell's shared codes -- `code_at(key,
+    /// row)` -- are read at the row where the worker first saw it, which gives
+    /// the cell the synchronous path would have used. Same morsels, same
     /// first-occurrence order, same combine order: the same answer.
+    template <typename CodeAt>
     void merge_worker_dense_partial(const WorkerDensePartial& worker, const CatCellPlan& plan,
-                                    const std::vector<const Column<Categorical>*>& cat_cols) {
-        std::vector<const Column<Categorical>::code_type*> raws(cat_cols.size());
-        for (std::size_t c = 0; c < cat_cols.size(); ++c) {
-            raws[c] = cat_cols[c]->codes_data();
-        }
+                                    const CodeAt& code_at) {
+        const std::size_t n_keys = plan.strides.size();
         auto new_group = [&](std::size_t cell) { return new_multi_cat_group(plan, cell); };
         merge_dense_partials(worker.partials, multi_cat_cell_dense_, new_group,
                              [&](std::size_t m, std::size_t k, std::size_t /*local*/) {
                                  const std::size_t row = worker.first_rows[m][k];
                                  std::uint64_t cell = 0;
-                                 for (std::size_t c = 0; c < raws.size(); ++c) {
-                                     cell +=
-                                         static_cast<std::uint64_t>(raws[c][row]) * plan.strides[c];
+                                 for (std::size_t c = 0; c < n_keys; ++c) {
+                                     cell += static_cast<std::uint64_t>(code_at(c, row)) *
+                                             plan.strides[c];
                                  }
                                  return static_cast<std::size_t>(cell);
                              });
+    }
+
+    /// The key columns the scan pipeline may leave over each unit's own
+    /// dictionary once this operator merges worker partials: every group key
+    /// that is not also an aggregate's input, which would read all its rows.
+    [[nodiscard]] auto untranslatable_key_columns() const -> std::vector<std::size_t> {
+        std::vector<std::size_t> keys;
+        keys.reserve(columns_->group_by.size());
+        for (const std::size_t index : columns_->group_by) {
+            if (std::ranges::find(columns_->aggregate_inputs, std::optional<std::size_t>{index}) ==
+                columns_->aggregate_inputs.end()) {
+                keys.push_back(index);
+            }
+        }
+        return keys;
+    }
+
+    /// Check the untranslated key columns the pipeline emitted with this
+    /// chunk, and translate them now unless this chunk is headed for the one
+    /// path that does not read them (`try_merge_untranslated_keys`).
+    auto settle_deferred_translation() -> std::optional<std::string> {
+        if (worker_emission_.deferred.empty()) {
+            return std::nullopt;
+        }
+        const Chunk& chunk = *active_chunk_;
+        bool keys_valid = true;
+        for (const auto& deferred : worker_emission_.deferred) {
+            const Column<Categorical>* local =
+                deferred.column < chunk.columns.size()
+                    ? std::get_if<Column<Categorical>>(chunk.columns[deferred.column].column.get())
+                    : nullptr;
+            if (local == nullptr || local->dictionary_size() != deferred.remap.size()) {
+                return "physical aggregate: an untranslated key column does not match its remap";
+            }
+        }
+        for (const std::size_t index : columns_->group_by) {
+            keys_valid = keys_valid && index < chunk.columns.size() &&
+                         !chunk.columns[index].validity.has_value();
+        }
+        if (!(scan_sink_active_ && on_worker_partial_path() && keys_valid &&
+              worker_emission_.partial != nullptr &&
+              worker_emission_.partial->rows == chunk.rows())) {
+            translate_deferred_keys();
+        }
+        return std::nullopt;
+    }
+
+    /// The per-row translation the pipeline skipped. The ColumnEntry objects
+    /// stay put, so pointers taken to them remain valid.
+    void translate_deferred_keys() {
+        for (const auto& deferred : worker_emission_.deferred) {
+            auto& entry = active_chunk_->columns[deferred.column];
+            entry.column = std::make_shared<ColumnValue>(translate_deferred_categorical(
+                std::get<Column<Categorical>>(*entry.column), deferred));
+        }
+        worker_emission_.deferred.clear();
+    }
+
+    /// `try_process_rows_cat_multi_parallel`'s merge, over keys the pipeline
+    /// left untranslated: the cell plan is the shared dictionaries', and a
+    /// first row's shared code is its local code remapped. False, touching
+    /// nothing, when the synchronous path would not have merged this partial.
+    auto try_merge_untranslated_keys(const std::vector<const Column<Categorical>*>& cat_cols,
+                                     std::size_t rows) -> bool {
+        const auto& partial = worker_emission_.partial;
+        if (!multi_dense_ || rows == 0 || !aggs_are_slot_combinable() || partial == nullptr ||
+            partial->rows != rows) {
+            return false;
+        }
+        std::vector<const Column<Categorical>*> shared_cols = cat_cols;
+        std::vector<const std::vector<Column<Categorical>::code_type>*> remaps(cat_cols.size(),
+                                                                               nullptr);
+        for (const auto& deferred : worker_emission_.deferred) {
+            for (std::size_t g = 0; g < columns_->group_by.size(); ++g) {
+                if (columns_->group_by[g] == deferred.column) {
+                    shared_cols[g] = &deferred.shared;
+                    remaps[g] = &deferred.remap;
+                }
+            }
+        }
+        const CatCellPlan plan = cat_cell_plan(shared_cols);
+        if (!plan.dense_possible) {
+            return false;
+        }
+        const auto n_cells = static_cast<std::size_t>(plan.total_cells);
+        const std::size_t morsels = dense_morsel_count(n_cells, rows);
+        if (morsels == 0 || partial->partials.morsels != morsels) {
+            return false;
+        }
+        ensure_multi_cat_dense(plan);
+        std::vector<const Column<Categorical>::code_type*> raws(cat_cols.size());
+        for (std::size_t c = 0; c < cat_cols.size(); ++c) {
+            raws[c] = cat_cols[c]->codes_data();
+        }
+        merge_worker_dense_partial(*partial, plan, [&](std::size_t c, std::size_t row) {
+            const auto code = raws[c][row];
+            return remaps[c] == nullptr ? code : (*remaps[c])[static_cast<std::size_t>(code)];
+        });
+        worker_emission_ = {};
+        return true;
     }
 
     /// The dense accumulation of one chunk, on the scan pipeline worker that
@@ -3853,6 +4021,16 @@ class HashAggregateState final {
             try_process_rows_cat_parallel(*cat_cols[0], agg_entries, rows)) {
             publish_fused_accumulation();
             return std::nullopt;
+        }
+        if (!single_key && !worker_emission_.deferred.empty()) {
+            if (try_merge_untranslated_keys(cat_cols, rows)) {
+                publish_fused_accumulation();
+                return std::nullopt;
+            }
+            translate_deferred_keys();
+            for (std::size_t c = 0; c < n_keys; ++c) {
+                cat_cols[c] = &std::get<Column<Categorical>>(*group_entries[c]->column);
+            }
         }
         if (!single_key && try_process_rows_cat_multi_parallel(cat_cols, agg_entries, rows)) {
             publish_fused_accumulation();
@@ -6040,6 +6218,8 @@ class HashAggregateState final {
     std::shared_ptr<DenseAggregateScanSink> scan_sink_;
     bool scan_sink_decided_ = false;
     bool scan_sink_active_ = false;
+    /// What the scan pipeline handed over with the active chunk.
+    EmittedWorkerPartial worker_emission_;
 };
 
 /// Serial executor for the hash fallback's typed structural chain. Discovery

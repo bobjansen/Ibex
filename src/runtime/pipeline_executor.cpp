@@ -2061,9 +2061,23 @@ class PipelinedScanOperator final : public Operator {
             }
 
             empty_schema_carrier_.reset();
-            normalize_categorical_dictionaries(chunk);
-            if (sink_ != nullptr) {
-                sink_->on_emit(next_sequence_ - 1, chunk);
+            const std::size_t unit = next_sequence_ - 1;
+            if (sink_ == nullptr) {
+                normalize_categorical_dictionaries(chunk);
+            } else {
+                std::vector<DeferredCategoricalRemap> deferred;
+                normalize_categorical_dictionaries(chunk, sink_->untranslated_columns(unit, chunk),
+                                                   &deferred);
+                if (!sink_->on_emit(unit, chunk, deferred)) {
+                    for (const auto& remap : deferred) {
+                        auto& entry = chunk.columns[remap.column];
+                        entry.column = std::make_shared<ColumnValue>(translate_deferred_categorical(
+                            std::get<Column<Categorical>>(*entry.column), remap));
+                    }
+                } else if (!deferred.empty() && exec_->parallel_stats != nullptr) {
+                    exec_->parallel_stats->untranslated_categorical_columns.fetch_add(
+                        deferred.size(), std::memory_order_relaxed);
+                }
             }
             restamp(chunk);
             return std::optional<Chunk>{std::move(chunk)};
@@ -2177,7 +2191,14 @@ class PipelinedScanOperator final : public Operator {
     // Parquet dictionaries are local to row groups. Ordered publication is the
     // one serial point where chunks are remapped onto one shared dictionary,
     // preserving the existing streamed-source contract for downstream keys.
-    void normalize_categorical_dictionaries(Chunk& chunk) {
+    //
+    // A column listed in `untranslated` (and without validity) still joins the
+    // shared dictionary -- the dictionary grows exactly as if it had been
+    // remapped -- but keeps its unit-local codes; its remap goes to `deferred`
+    // for the sink's consumer, which translates the rows only if it reads them.
+    void normalize_categorical_dictionaries(
+        Chunk& chunk, const std::vector<std::size_t>& untranslated = {},
+        std::vector<DeferredCategoricalRemap>* deferred = nullptr) {
         using code_type = Column<Categorical>::code_type;
         if (cat_states_.size() < chunk.columns.size()) {
             cat_states_.resize(chunk.columns.size());
@@ -2204,13 +2225,17 @@ class PipelinedScanOperator final : public Operator {
                 remap[entry] = state->code_at(entry);
             }
             state->clear();
-            const auto& local_codes = local->codes();
-            std::vector<code_type> codes(local_codes.size());
-            for (std::size_t row = 0; row < local_codes.size(); ++row) {
-                codes[row] = remap[static_cast<std::size_t>(local_codes[row])];
+            DeferredCategoricalRemap translation{
+                .column = i,
+                .shared = Column<Categorical>{state->dictionary_ptr(), state->index_ptr()},
+                .remap = std::move(remap)};
+            if (deferred != nullptr && !chunk.columns[i].validity.has_value() &&
+                std::ranges::find(untranslated, i) != untranslated.end()) {
+                deferred->push_back(std::move(translation));
+                continue;
             }
-            chunk.columns[i].column = std::make_shared<ColumnValue>(
-                Column<Categorical>{state->dictionary_ptr(), state->index_ptr(), std::move(codes)});
+            chunk.columns[i].column =
+                std::make_shared<ColumnValue>(translate_deferred_categorical(*local, translation));
         }
     }
 
@@ -2567,6 +2592,21 @@ ScanWorkerSinkOffer::ScanWorkerSinkOffer(std::shared_ptr<ScanWorkerSink> sink)
 
 ScanWorkerSinkOffer::~ScanWorkerSinkOffer() {
     offered_scan_worker_sink = std::move(previous_);
+}
+
+auto translate_deferred_categorical(const Column<Categorical>& local,
+                                    const DeferredCategoricalRemap& deferred)
+    -> Column<Categorical> {
+    using code_type = Column<Categorical>::code_type;
+    const std::size_t rows = local.size();
+    const code_type* local_codes = local.codes_data();
+    const code_type* remap = deferred.remap.data();
+    std::vector<code_type> codes(rows);
+    for (std::size_t row = 0; row < rows; ++row) {
+        codes[row] = remap[static_cast<std::size_t>(local_codes[row])];
+    }
+    return Column<Categorical>{deferred.shared.dictionary_ptr(), deferred.shared.index_ptr(),
+                               std::move(codes)};
 }
 
 auto take_offered_scan_worker_sink() -> std::shared_ptr<ScanWorkerSink> {

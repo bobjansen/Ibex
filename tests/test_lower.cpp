@@ -453,6 +453,54 @@ result;
     CHECK(scans == 2);
 }
 
+TEST_CASE("lower_script optimizes a shared binding's plan like the result's", "[parser][lower]") {
+    // A binding used twice is planned once, as a shared binding -- which is
+    // what every PDS-H script's `write_csv(result, ...); result;` makes of the
+    // whole query. Its plan must get the optimizer the result gets: skipping it
+    // left `[order ...][head n]` an Order feeding a Head (a full sort) where
+    // canonicalize R16 fuses a TopK (a heap-select), along with every other
+    // canonicalize rewrite.
+    auto program = require_parse(R"(
+let top = t[select { b, s = sum(a) }, by { b }][order { s desc }, head 3];
+let lo = top[filter b == 1];
+let hi = top[filter b == 2];
+let result = lo join hi on b suffix { "_lo", "_hi" };
+result;
+)");
+
+    auto lowered = parser::lower_script(program);
+    REQUIRE(lowered.has_value());
+    REQUIRE(lowered->shared_bindings.size() == 1);
+    CHECK(lowered->shared_bindings[0].name == "top");
+    const ir::Node* plan = lowered->shared_bindings[0].plan.get();
+    REQUIRE(plan != nullptr);
+    CHECK(plan->kind() == ir::NodeKind::TopK);
+}
+
+TEST_CASE("lower_script optimizes a sink's input like the result", "[parser][lower]") {
+    // Every PDS-H script ends `write_csv(result, ...); result;`. The batch
+    // driver runs the sink's input plan and serves the final `result` from
+    // that table, so the plan that actually executes is the sink's -- and it
+    // must be optimized as the result's is. It was not: `[order ...][head n]`
+    // ran as a full sort feeding a Head, never R16's TopK.
+    auto program = require_parse(R"(
+extern fn read(path: String) -> DataFrame from "reader.hpp";
+extern fn write(df: DataFrame, path: String) -> Int from "writer.hpp";
+let source = read("input");
+let result = source[select { s = sum(a) }, by { b }][order { s desc }, head 3];
+write(result, "output");
+result;
+)");
+
+    auto lowered = parser::lower_script(program);
+    REQUIRE(lowered.has_value());
+    REQUIRE(lowered->sinks.size() == 1);
+    REQUIRE(lowered->sinks[0].input != nullptr);
+    CHECK(lowered->sinks[0].input->kind() == ir::NodeKind::TopK);
+    REQUIRE(lowered->result != nullptr);
+    CHECK(lowered->result->kind() == ir::NodeKind::TopK);
+}
+
 TEST_CASE("lower_script keeps a cheap repeated binding inlined", "[parser][lower]") {
     // A scan/filter chain is cheap to re-run and inlining preserves each
     // consumer's own selection pushdown, so it is not shared.

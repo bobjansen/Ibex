@@ -5929,6 +5929,14 @@ auto lower_script(const Program& program, const ir::SourceSchemas& reader_schema
     // checks and rewrites as the result, and each contributes its inferred
     // schema for the plans that scan it (an Unknown schema is sound — checks
     // just fall back to runtime there).
+    //
+    // That includes the optimizer. It used to run on the result alone, so a
+    // binding used twice -- every PDS-H script's `write_csv(result, ...);
+    // result;` makes the whole query one -- kept its un-canonicalized plan:
+    // `[order ...][head n]` stayed a full sort feeding a Head instead of R16's
+    // TopK heap-select, and no other canonicalize rewrite reached it either.
+    const auto optimization_context = build_optimization_context(*effects);
+    ir::OptimizationStats optimization_stats;
     for (auto& shared : lowered->shared_bindings) {
         if (auto err = ir::check_column_refs(*shared.plan, source_schemas)) {
             return std::unexpected(LowerError{.message = *err});
@@ -5939,8 +5947,25 @@ auto lower_script(const Program& program, const ir::SourceSchemas& reader_schema
         shared.plan = ir::push_filters_into_joins(std::move(shared.plan), source_schemas);
         shared.plan = ir::push_semi_joins_down(std::move(shared.plan), source_schemas);
         shared.plan = ir::reduce_inner_joins_to_semi(std::move(shared.plan), source_schemas);
+        shared.plan =
+            ir::optimize_plan(std::move(shared.plan), optimization_context, &optimization_stats);
         source_schemas.insert_or_assign(shared.name,
                                         ir::infer_schema(*shared.plan, source_schemas));
+    }
+    // A sink's input is a plan the executor runs, too -- and for a script
+    // ending `write_csv(result, ...); result;`, the one that runs the query:
+    // the batch driver serves the final `result` from the table the sink's
+    // input produced. It gets the result's rewrites and optimizer. It got
+    // neither, so every such script (all of PDS-H) ran un-canonicalized.
+    for (auto& sink : lowered->sinks) {
+        if (sink.input == nullptr) {
+            continue;
+        }
+        sink.input = ir::push_filters_into_joins(std::move(sink.input), source_schemas);
+        sink.input = ir::push_semi_joins_down(std::move(sink.input), source_schemas);
+        sink.input = ir::reduce_inner_joins_to_semi(std::move(sink.input), source_schemas);
+        sink.input =
+            ir::optimize_plan(std::move(sink.input), optimization_context, &optimization_stats);
     }
     if (auto err = ir::check_column_refs(*lowered->result, source_schemas)) {
         return std::unexpected(LowerError{.message = *err});
@@ -5952,8 +5977,6 @@ auto lower_script(const Program& program, const ir::SourceSchemas& reader_schema
     lowered->result = ir::push_semi_joins_down(std::move(lowered->result), source_schemas);
     lowered->result = ir::reduce_inner_joins_to_semi(std::move(lowered->result), source_schemas);
 
-    const auto optimization_context = build_optimization_context(*effects);
-    ir::OptimizationStats optimization_stats;
     lowered->result =
         ir::optimize_plan(std::move(lowered->result), optimization_context, &optimization_stats);
     return lowered;

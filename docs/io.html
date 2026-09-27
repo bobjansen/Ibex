@@ -487,6 +487,42 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
 );</code></pre>
       </article>
       <article class="card" style="margin-top:1rem;">
+        <h3>Reuse one connection</h3>
+        <p>
+          <code>read_adbc</code> opens and closes a connection on every call.
+          <code>adbc_connect</code> opens one that later statements share: one
+          login, and session state such as temporary tables.
+          <code>adbc_query</code> runs a query on it and returns a table, which
+          can be used as any other table. <code>adbc_close</code> closes the
+          connection for every binding of it, returning <code>1</code> the
+          first time and <code>0</code> after; a query on a closed connection
+          is an error. A connection also closes when its last binding goes
+          away.
+        </p>
+        <p>
+          Connection functions run one statement at a time, in order, at the
+          top level of a script: not inside a query clause or a function. A
+          query's result is read in full before the statement uses it.
+        </p>
+<pre><code><span class="kw">import</span> <span class="str">"adbc"</span>;
+
+<span class="kw">let</span> db = <span class="fn-name">adbc_connect</span>(<span class="str">"sqlite"</span>, <span class="str">":memory:"</span>);
+<span class="fn-name">adbc_query</span>(db, <span class="str">"create table trades (symbol text, qty integer)"</span>);
+<span class="fn-name">adbc_query</span>(db, <span class="str">"insert into trades values ('AAPL', 10), ('MSFT', 5)"</span>);
+
+<span class="fn-name">adbc_query</span>(db, <span class="str">"select symbol, qty from trades"</span>)[
+    <span class="kw">select</span> { total = <span class="fn-name">sum</span>(qty) }, <span class="kw">by</span> symbol
+];
+
+<span class="fn-name">adbc_close</span>(db);</code></pre>
+        <p>
+          <code>adbc_connect(driver, uri, options = "")</code> takes the same
+          options string as <code>read_adbc</code>; <code>stmt.</code> options
+          apply to every query on the connection.
+          <code>examples/adbc_connection.ibex</code> is a runnable version.
+        </p>
+      </article>
+      <article class="card" style="margin-top:1rem;">
         <h3>Runnable trades walkthrough</h3>
         <p>
           <code>examples/adbc_sqlite/</code> is self-contained: it builds an

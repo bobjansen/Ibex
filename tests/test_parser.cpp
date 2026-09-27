@@ -162,6 +162,46 @@ TEST_CASE("Parse extern declaration with schema types") {
     REQUIRE(decl.source_path == "csv.hpp");
 }
 
+TEST_CASE("Parse extern type declaration and resource-typed extern fn") {
+    const char* source =
+        "extern type AdbcConnection from \"adbc.hpp\";\n"
+        "extern fn adbc_connect(driver: String) -> AdbcConnection from \"adbc.hpp\";\n"
+        "extern fn adbc_query(mutable db: AdbcConnection, sql: String) -> DataFrame"
+        " from \"adbc.hpp\";";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 3);
+
+    const auto* type_decl = std::get_if<ExternTypeDecl>(&result->statements[0]);
+    REQUIRE(type_decl != nullptr);
+    REQUIRE(type_decl->name == "AdbcConnection");
+    REQUIRE(type_decl->source_path == "adbc.hpp");
+
+    const auto& connect = std::get<ExternDecl>(result->statements[1]);
+    REQUIRE(connect.return_type.kind == Type::Kind::Resource);
+    REQUIRE(connect.return_type.resource == "AdbcConnection");
+
+    const auto& query = std::get<ExternDecl>(result->statements[2]);
+    REQUIRE(query.params.size() == 2);
+    REQUIRE(query.params[0].type.kind == Type::Kind::Resource);
+    REQUIRE(query.params[0].type.resource == "AdbcConnection");
+    REQUIRE(query.params[0].effect == Param::Effect::Mutable);
+    REQUIRE(query.return_type.kind == Type::Kind::DataFrame);
+}
+
+TEST_CASE("Resource types are rejected outside extern fn signatures") {
+    auto result = parse("fn f(db: AdbcConnection) -> Int { 1; }");
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().message.find("unknown type 'AdbcConnection'") != std::string::npos);
+}
+
+TEST_CASE("'type' stays an ordinary identifier") {
+    auto result = parse("let type = 1;\nt[select type];");
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 2);
+}
+
 TEST_CASE("Parse extern declaration with inferred schema") {
     const char* source = "extern fn read_csv(path: String) -> DataFrame from \"csv.hpp\";";
 

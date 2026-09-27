@@ -1768,7 +1768,9 @@ class Lowerer {
             functions_.insert_or_assign(fn->name, fn);
             return true;
         }
-        return false;
+        // `extern type` only makes a name usable in `extern fn` signatures;
+        // nothing to lower.
+        return std::holds_alternative<ExternTypeDecl>(stmt);
     }
 
     auto lower_script(const Program& program) -> ScriptPlanResult {

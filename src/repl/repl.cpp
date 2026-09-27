@@ -1400,6 +1400,9 @@ auto type_to_string(const parser::Type& type) -> std::string {
         }
         return "Unknown";
     }
+    if (type.kind == parser::Type::Kind::Resource) {
+        return type.resource;
+    }
     if (type.kind == parser::Type::Kind::Series) {
         std::string out = "Series";
         if (const auto* scalar = std::get_if<parser::ScalarType>(&type.arg)) {
@@ -4196,6 +4199,12 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                 local_tables.insert_or_assign(param.name, std::move(value.value()));
                 break;
             }
+            case parser::Type::Kind::Resource:
+                // The parser admits resource types only in `extern fn`
+                // signatures until functions get scoped ownership.
+                return std::unexpected(call.callee + ": parameter '" + param.name +
+                                       "' has resource type " + param.type.resource +
+                                       ", which a function cannot take yet");
             case parser::Type::Kind::Series:
                 auto value = eval_expr_value(arg, tables, lazy_tables, scalars, columns, models,
                                              functions, compile_time_lists, extern_decls, externs);
@@ -4738,6 +4747,18 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                         "warning: could not find plugin '{}.so' in search path\n", stem);
 #endif
                 } else if (result.status == PluginLoadStatus::LoadError) {
+                    ibex::formatting::print("warning: {}\n", result.message);
+                }
+            }
+            continue;
+        }
+        if (const auto* type_decl = std::get_if<parser::ExternTypeDecl>(&stmt)) {
+            // The plugin that provides the type is loaded as for an `extern
+            // fn`; the name itself only matters to `extern fn` signatures.
+            if (!type_decl->source_path.empty()) {
+                auto result = try_load_plugin(plugin_stem(type_decl->source_path),
+                                              plugin_search_paths, loaded_plugins, externs);
+                if (result.status == PluginLoadStatus::LoadError) {
                     ibex::formatting::print("warning: {}\n", result.message);
                 }
             }
@@ -5498,6 +5519,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         // anything else would silently lose it.
         for (const auto& imported : parsed->statements) {
             if (!std::holds_alternative<parser::ExternDecl>(imported) &&
+                !std::holds_alternative<parser::ExternTypeDecl>(imported) &&
                 !std::holds_alternative<parser::FunctionDecl>(imported)) {
                 return decline("import stub has statements beyond declarations");
             }

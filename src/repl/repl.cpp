@@ -1666,10 +1666,85 @@ auto table_schema_info(const runtime::Table& table) -> ir::SchemaInfo {
     return static_cast<std::uint64_t>(value) - static_cast<std::uint64_t>(base);
 }
 
+/// Every column name an expression reads.
+// NOLINTNEXTLINE(misc-no-recursion)
+void collect_expr_columns(const ir::Expr& expr, std::set<std::string>& out) {
+    const auto sub = [&](const ir::ExprPtr& e) {
+        if (e != nullptr) {
+            collect_expr_columns(*e, out);
+        }
+    };
+    std::visit(
+        [&](const auto& n) {
+            using T = std::decay_t<decltype(n)>;
+            if constexpr (std::is_same_v<T, ir::ColumnRef>) {
+                out.insert(n.name);
+            } else if constexpr (std::is_same_v<T, ir::BinaryExpr> ||
+                                 std::is_same_v<T, ir::CompareExpr> ||
+                                 std::is_same_v<T, ir::LogicalExpr>) {
+                sub(n.left);
+                sub(n.right);
+            } else if constexpr (std::is_same_v<T, ir::IsNullExpr>) {
+                sub(n.operand);
+            } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
+                for (const auto& arg : n.args) {
+                    sub(arg);
+                }
+                for (const auto& named : n.named_args) {
+                    sub(named.value);
+                }
+            } else if constexpr (std::is_same_v<T, ir::RankExpr>) {
+                for (const auto& key : n.order_keys) {
+                    out.insert(key.name);
+                }
+            }
+        },
+        expr.node);
+}
+
+/// Every column name a filter or join predicate anywhere under `node` reads.
+// NOLINTNEXTLINE(misc-no-recursion)
+void collect_predicate_columns(const ir::Node& node, std::set<std::string>& out) {
+    switch (node.kind()) {
+        case ir::NodeKind::Filter:
+            collect_expr_columns(ir::node_cast<ir::FilterNode>(node).predicate(), out);
+            break;
+        case ir::NodeKind::FilterHead:
+            collect_expr_columns(ir::node_cast<ir::FilterHeadNode>(node).predicate(), out);
+            break;
+        case ir::NodeKind::FilterTail:
+            collect_expr_columns(ir::node_cast<ir::FilterTailNode>(node).predicate(), out);
+            break;
+        case ir::NodeKind::Join:
+            if (const auto& predicate = ir::node_cast<ir::JoinNode>(node).predicate();
+                predicate.has_value()) {
+                collect_expr_columns(*predicate, out);
+            }
+            break;
+        default:
+            break;
+    }
+    for (const auto& child : node.children()) {
+        if (child != nullptr) {
+            collect_predicate_columns(*child, out);
+        }
+    }
+    if (node.kind() == ir::NodeKind::Program) {
+        const auto& program = ir::node_cast<ir::ProgramNode>(node);
+        collect_predicate_columns(program.main_node(), out);
+        for (const auto& pre : program.preamble()) {
+            if (pre != nullptr) {
+                collect_predicate_columns(*pre, out);
+            }
+        }
+    }
+}
+
 auto prove_unique_columns(runtime::LazyTable& lazy, const std::set<std::string>& wanted,
                           const runtime::ExecutionContext& exec,
                           const std::string* deferred_probe_key = nullptr,
-                          bool expanded_group_key_proof = false) -> std::vector<std::string> {
+                          bool expanded_group_key_proof = false, bool read_in_full = false)
+    -> std::vector<std::string> {
     /// Cap on the bitset, in values. A candidate wider than this is left
     /// unproven rather than allocating without bound for a plan-time fact.
     constexpr std::uint64_t kMaxSpanValues = 1ULL << 28U;  // 32 MiB of bits
@@ -1688,9 +1763,20 @@ auto prove_unique_columns(runtime::LazyTable& lazy, const std::set<std::string>&
     /// keys. Keep the ordinary join-planning budget above unchanged, so merely
     /// joining a larger source never buys an otherwise unused full decode.
     constexpr std::size_t kMaxGroupKeyProofRows = 5U << 18U;  // 10 MiB of int64
+    /// ...and no row cap at all when the plan reads the column in full anyway
+    /// (`read_in_full`: every scan of the source unfiltered, none a deferred
+    /// probe). Then the proof's decode is the scan's own, done early and
+    /// cached for it, and all the proof adds is one bitset pass -- a cost that
+    /// grows with the data exactly as the scan does. A fixed row count cannot
+    /// say that: PDS-H q10's customer is 150k rows per scale factor, so from
+    /// SF-8.7 up it missed the cap and q10 aggregated seven keys (four wide
+    /// strings) instead of one, 2x slower at SF-10. The span cap above still
+    /// bounds the bitset's memory.
     std::vector<std::string> proved;
     const auto rows = lazy.rows();
-    const std::size_t max_rows = expanded_group_key_proof ? kMaxGroupKeyProofRows : kMaxProofRows;
+    const std::size_t max_rows = !expanded_group_key_proof ? kMaxProofRows
+                                 : read_in_full            ? std::numeric_limits<std::size_t>::max()
+                                                           : kMaxGroupKeyProofRows;
     if (rows == 0 || rows > max_rows || (expanded_group_key_proof && rows <= kMaxProofRows)) {
         return proved;
     }
@@ -5103,7 +5189,28 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
         // Re-evaluate after the bounded pass: small dimension-key proofs
         // may be the transitive link that makes a larger determinant useful.
         // Spend the wider budget only where assuming that determinant
-        // unique would collapse the complete multi-column group key.
+        // unique would collapse the complete multi-column group key -- and no
+        // row cap where the plan reads the source in full anyway: any scan
+        // with a pushable filter decodes selectively, so a whole-column proof
+        // there would be real extra work.
+        //
+        // "Filtered" is decided by column NAME, conservatively: a source is
+        // filtered if any filter or join predicate anywhere in the plan reads a
+        // column it has. Its scans cannot be asked instead: this runs before
+        // the ascriptions are checked, and an unchecked ascription hides the
+        // filters beneath it (PDS-H q03's `orders` looked unfiltered and paid
+        // a 12M-row proof decode). A false "filtered" only keeps the old cap.
+        std::set<std::string> predicate_columns;
+        collect_predicate_columns(*rewritten, predicate_columns);
+        std::set<std::string> filtered_sources;
+        for (const auto& [source_name, schema] : schemas) {
+            if (!schema.is_known() ||
+                std::ranges::any_of(schema.fields(), [&](const ir::SchemaField& field) {
+                    return predicate_columns.contains(field.name);
+                })) {
+                filtered_sources.insert(source_name);
+            }
+        }
         for (const auto& [source_name, columns] :
              ir::group_key_proof_candidates(*rewritten, schemas)) {
             const auto lazy = lazy_sources.find(source_name);
@@ -5114,8 +5221,10 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
             const auto probe = deferred_probes.find(source_name);
             const std::string* probe_key =
                 probe == deferred_probes.end() ? nullptr : &probe->second.key_column;
-            for (auto& column :
-                 prove_unique_columns(*lazy->second, columns, proof_exec, probe_key, true)) {
+            const bool read_in_full =
+                probe_key == nullptr && !filtered_sources.contains(source_name);
+            for (auto& column : prove_unique_columns(*lazy->second, columns, proof_exec, probe_key,
+                                                     true, read_in_full)) {
                 schema->second.add_unique_key(ir::UniqueKey{std::move(column)});
             }
         }

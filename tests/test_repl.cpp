@@ -3,6 +3,7 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/repl/repl.hpp>
+#include <ibex/runtime/env.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/lazy_table.hpp>
@@ -1982,6 +1983,154 @@ auto capture_planner_line(std::string_view source, ibex::runtime::ExternRegistry
 }
 
 }  // namespace
+
+namespace {
+
+/// Runs `source` and returns everything it wrote to stderr.
+auto capture_script_stderr(std::string_view source, ibex::runtime::ExternRegistry& registry)
+    -> std::string {
+    const auto path = std::filesystem::temp_directory_path() /
+                      ("ibex_stderr_capture_" + std::to_string(current_process_id()) + ".txt");
+    ibex::repl::ReplConfig config;
+    config.persistent_history = false;
+    std::fflush(stderr);
+    const int saved = duplicate_file_descriptor(file_descriptor(stderr));
+    REQUIRE(std::freopen(path.string().c_str(), "w", stderr) != nullptr);
+    const bool ok = ibex::repl::execute_script(source, registry, config);
+    std::fflush(stderr);
+    REQUIRE(replace_file_descriptor(saved, file_descriptor(stderr)) != -1);
+    static_cast<void>(close_file_descriptor(saved));
+    std::ifstream in{path};
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::filesystem::remove(path);
+    INFO(text);
+    REQUIRE(ok);
+    return text;
+}
+
+/// A lazy `customer`-like source of `rows` rows: `c_custkey` = 1..rows (unique,
+/// with footer min/max as a Parquet reader reports them) and `c_group`, which
+/// the key determines.
+void register_keyed_source(ibex::runtime::ExternRegistry& registry, const std::string& name,
+                           std::size_t rows) {
+    registry.register_lazy_table(
+        name,
+        [rows](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::LazyTablePtr, std::string> {
+            ibex::runtime::Table schema;
+            schema.add_column("c_custkey", ibex::Column<std::int64_t>{});
+            schema.add_column("c_group", ibex::Column<std::int64_t>{});
+            ibex::runtime::SourceColumnStats stats;
+            stats.emplace("c_custkey", ibex::runtime::ColumnStats{
+                                           .min = 1,
+                                           .max = static_cast<std::int64_t>(rows),
+                                           .null_count = 0,
+                                       });
+            return std::make_shared<ibex::runtime::LazyTable>(
+                std::move(schema), rows,
+                [rows](const std::vector<std::string>& names,
+                       const ibex::runtime::Selection* selection)
+                    -> std::expected<ibex::runtime::Table, std::string> {
+                    const std::size_t n = selection == nullptr ? rows : selection->size();
+                    ibex::runtime::Table table;
+                    for (const auto& col : names) {
+                        std::vector<std::int64_t> values;
+                        values.reserve(n);
+                        for (std::size_t i = 0; i < n; ++i) {
+                            const std::size_t row = selection == nullptr ? i : (*selection)[i];
+                            values.push_back(col == "c_custkey"
+                                                 ? static_cast<std::int64_t>(row + 1)
+                                                 : static_cast<std::int64_t>((row + 1) % 7));
+                        }
+                        table.add_column(col, ibex::Column<std::int64_t>{std::move(values)});
+                    }
+                    table.logical_rows = n;
+                    return table;
+                },
+                std::move(stats));
+        });
+}
+
+}  // namespace
+
+TEST_CASE("group-key uniqueness is proved at any size when the key is read in full",
+          "[repl][lazy][batch]") {
+    // A multi-key aggregate whose keys one column determines is reduced to that
+    // column once it is proved unique -- PDS-H q10's `c_custkey`. The proof is
+    // a whole-column decode, and used to be capped at 1,310,720 rows, so q10
+    // lost the reduction from SF-8.7 up (customer is 150k rows per SF) and ran
+    // 2x slower at SF-10. When every scan of the source reads the key in full
+    // anyway, the decode is the scan's own and the cap is gone; a filtered
+    // source, which the scan decodes selectively, keeps it.
+    constexpr std::size_t kRows = 1'400'000;  // past the old 1,310,720-row cap
+    ibex::runtime::ExternRegistry registry;
+    register_keyed_source(registry, "read_customer", kRows);
+    registry.register_lazy_table(
+        "read_orders",
+        [](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::LazyTablePtr, std::string> {
+            constexpr std::size_t kOrders = 1000;
+            ibex::runtime::Table schema;
+            schema.add_column("o_custkey", ibex::Column<std::int64_t>{});
+            schema.add_column("o_value", ibex::Column<std::int64_t>{});
+            return std::make_shared<ibex::runtime::LazyTable>(
+                std::move(schema), kOrders,
+                [](const std::vector<std::string>& names, const ibex::runtime::Selection* selection)
+                    -> std::expected<ibex::runtime::Table, std::string> {
+                    const std::size_t n = selection == nullptr ? kOrders : selection->size();
+                    ibex::runtime::Table table;
+                    for (const auto& col : names) {
+                        std::vector<std::int64_t> values;
+                        values.reserve(n);
+                        for (std::size_t i = 0; i < n; ++i) {
+                            const std::size_t row = selection == nullptr ? i : (*selection)[i];
+                            values.push_back(col == "o_custkey" ? static_cast<std::int64_t>(
+                                                                      ((row * 997) % kRows) + 1)
+                                                                : static_cast<std::int64_t>(row));
+                        }
+                        table.add_column(col, ibex::Column<std::int64_t>{std::move(values)});
+                    }
+                    table.logical_rows = n;
+                    return table;
+                });
+        });
+
+    const auto script = [](std::string_view customer) {
+        return std::string{R"(
+extern fn read_customer() -> DataFrame from "x.hpp";
+extern fn read_orders() -> DataFrame from "x.hpp";
+let customer = read_customer();
+let orders = read_orders();
+let result = ()"} +
+               std::string{customer} + R"( join orders on { c_custkey = o_custkey })[
+    select { total = sum(o_value) },
+    by { c_custkey, c_group }
+][order { total desc }, head 3];
+result;
+)";
+    };
+
+    const std::optional<std::string> saved = [] -> std::optional<std::string> {
+        if (const char* value = std::getenv("IBEX_UNIQUE_KEY_STATS"); value != nullptr) {
+            return value;
+        }
+        return std::nullopt;
+    }();
+    ibex::runtime::set_env("IBEX_UNIQUE_KEY_STATS", "1");
+    const std::string proved = "[unique] c_custkey rows=" + std::to_string(kRows);
+
+    const auto full = capture_script_stderr(script("customer"), registry);
+    CHECK(full.find(proved) != std::string::npos);
+
+    const auto filtered = capture_script_stderr(script("customer[filter c_group != 3]"), registry);
+    CHECK(filtered.find(proved) == std::string::npos);
+
+    if (saved.has_value()) {
+        ibex::runtime::set_env("IBEX_UNIQUE_KEY_STATS", *saved);
+    } else {
+        ibex::runtime::unset_env("IBEX_UNIQUE_KEY_STATS");
+    }
+}
 
 TEST_CASE("REPL reports which planner path a script took", "[repl][lazy][planner]") {
     std::vector<std::vector<std::string>> decode_calls;

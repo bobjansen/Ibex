@@ -72,6 +72,16 @@ auto topk(ir::NodePtr input, const std::string& by, std::size_t n) -> ir::NodePt
     return head;
 }
 
+/// The same top-k as canonicalize fuses it (R16): one `TopK` node.
+auto fused_topk(ir::NodePtr input, const std::string& by, std::size_t n,
+                ir::TopKNode::KeepMode mode = ir::TopKNode::KeepMode::First) -> ir::NodePtr {
+    auto node = std::make_unique<ir::TopKNode>(
+        ir::NodeId{22}, std::vector<ir::OrderKey>{ir::OrderKey{.name = by, .ascending = false}}, n,
+        std::vector<ir::ColumnRef>{}, mode);
+    node->add_child(std::move(input));
+    return node;
+}
+
 /// The JoinNode in `plan`, or nullptr -- the lift's re-fetch.
 // NOLINTNEXTLINE(misc-no-recursion)
 auto find_join(const ir::Node& plan) -> const ir::JoinNode* {
@@ -433,4 +443,140 @@ TEST_CASE("payload lift declines when the top-k sorts on a lifted column") {
     plan = ir::reduce_functionally_dependent_group_keys(std::move(plan), sources);
 
     CHECK(find_join(*plan) == nullptr);
+}
+
+TEST_CASE("payload lift fires on the fused TopK canonicalize produces") {
+    // A canonicalized plan has no Head over an Order: R16 fused them into a
+    // TopK. The lift matched only the unfused pair, so q10 lost it -- and ran
+    // +34% slower -- whenever its plan went through the optimizer.
+    ir::SourceSchemas sources;
+    sources.emplace("customer", source({"c_custkey", "c_name", "c_phone", "v"}, "c_custkey"));
+
+    auto plan =
+        fused_topk(aggregate({"c_custkey", "c_name", "c_phone"}, scan("customer")), "total", 20);
+    plan = ir::reduce_functionally_dependent_group_keys(std::move(plan), sources);
+
+    const auto* agg = find_aggregate(*plan);
+    REQUIRE(agg != nullptr);
+    REQUIRE(agg->group_by().size() == 1);
+    REQUIRE(agg->aggregations().size() == 1);
+    CHECK(agg->aggregations().front().alias == "total");
+    REQUIRE(find_join(*plan) != nullptr);
+
+    // Same output columns, and the TopK's own order re-established above the
+    // re-fetch join.
+    REQUIRE(plan->kind() == ir::NodeKind::Project);
+    const auto& columns = static_cast<const ir::ProjectNode&>(*plan).columns();
+    REQUIRE(columns.size() == 4);
+    CHECK(columns[0].name == "c_custkey");
+    CHECK(columns[3].name == "total");
+    const auto& under_project = *plan->children().front();
+    REQUIRE(under_project.kind() == ir::NodeKind::Order);
+    const auto& keys = static_cast<const ir::OrderNode&>(under_project).keys();
+    REQUIRE(keys.size() == 1);
+    CHECK(keys.front().name == "total");
+    CHECK_FALSE(keys.front().ascending);
+    const auto& join = *under_project.children().front();
+    REQUIRE(join.kind() == ir::NodeKind::Join);
+    CHECK(join.children().front()->kind() == ir::NodeKind::TopK);
+}
+
+TEST_CASE("payload lift over a TopK declines on a lifted sort key or a tail") {
+    ir::SourceSchemas sources;
+    sources.emplace("customer", source({"c_custkey", "c_name", "v"}, "c_custkey"));
+
+    auto sorts_on_lifted =
+        fused_topk(aggregate({"c_custkey", "c_name"}, scan("customer")), "c_name", 20);
+    sorts_on_lifted =
+        ir::reduce_functionally_dependent_group_keys(std::move(sorts_on_lifted), sources);
+    CHECK(find_join(*sorts_on_lifted) == nullptr);
+
+    auto keeps_last = fused_topk(aggregate({"c_custkey", "c_name"}, scan("customer")), "total", 20,
+                                 ir::TopKNode::KeepMode::Last);
+    keeps_last = ir::reduce_functionally_dependent_group_keys(std::move(keeps_last), sources);
+    CHECK(find_join(*keeps_last) == nullptr);
+}
+
+namespace {
+
+/// `aggregate({keys}, Update{extra = <reads>}(Project{cols}(scan)))` -- the
+/// shape canonicalize leaves below q10's aggregate: a projection under the
+/// update that computes the aggregate's input.
+auto aggregate_over_projected_update(const std::vector<std::string>& keys,
+                                     const std::vector<std::string>& projected,
+                                     const std::string& update_reads) -> ir::NodePtr {
+    std::vector<ir::ColumnRef> cols;
+    for (const auto& name : projected) {
+        cols.push_back(ir::ColumnRef{.name = name});
+    }
+    auto project = std::make_unique<ir::ProjectNode>(ir::NodeId{3}, std::move(cols));
+    project->add_child(scan("customer"));
+    std::vector<ir::FieldSpec> fields;
+    fields.push_back(ir::FieldSpec{.alias = "extra",
+                                   .expr = ir::Expr{.node = ir::ColumnRef{.name = update_reads}}});
+    auto update = std::make_unique<ir::UpdateNode>(ir::NodeId{4}, std::move(fields));
+    update->add_child(std::move(project));
+    return aggregate(keys, std::move(update));
+}
+
+/// The first ProjectNode under the plan's aggregate.
+// NOLINTNEXTLINE(misc-no-recursion)
+auto project_below(const ir::Node& node) -> const ir::ProjectNode* {
+    if (node.kind() == ir::NodeKind::Project) {
+        return static_cast<const ir::ProjectNode*>(&node);
+    }
+    for (const auto& child : node.children()) {
+        if (child != nullptr) {
+            if (const auto* found = project_below(*child); found != nullptr) {
+                return found;
+            }
+        }
+    }
+    return nullptr;
+}
+
+auto names_of(const ir::ProjectNode& project) -> std::vector<std::string> {
+    std::vector<std::string> out;
+    for (const auto& col : project.columns()) {
+        out.push_back(col.name);
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("payload lift drops lifted columns from a projection below the aggregate") {
+    // Projection pushdown decodes whatever a projection names, so a projection
+    // below the aggregate that still lists c_name keeps the scan decoding it --
+    // and the joins carrying it -- after the lift moved it above the top-k.
+    ir::SourceSchemas sources;
+    sources.emplace("customer", source({"c_custkey", "c_name", "v"}, "c_custkey"));
+
+    auto plan = fused_topk(
+        aggregate_over_projected_update({"c_custkey", "c_name"}, {"c_custkey", "c_name", "v"}, "v"),
+        "total", 20);
+    plan = ir::reduce_functionally_dependent_group_keys(std::move(plan), sources);
+    REQUIRE(find_join(*plan) != nullptr);
+    const auto* agg = find_aggregate(*plan);
+    REQUIRE(agg != nullptr);
+    const auto* project = project_below(*agg);
+    REQUIRE(project != nullptr);
+    CHECK(names_of(*project) == std::vector<std::string>{"c_custkey", "v"});
+}
+
+TEST_CASE("payload lift keeps a lifted column a node below the aggregate still reads") {
+    ir::SourceSchemas sources;
+    sources.emplace("customer", source({"c_custkey", "c_name", "v"}, "c_custkey"));
+
+    // The update between the aggregate and the projection reads c_name.
+    auto plan = fused_topk(aggregate_over_projected_update({"c_custkey", "c_name"},
+                                                           {"c_custkey", "c_name", "v"}, "c_name"),
+                           "total", 20);
+    plan = ir::reduce_functionally_dependent_group_keys(std::move(plan), sources);
+    REQUIRE(find_join(*plan) != nullptr);
+    const auto* agg = find_aggregate(*plan);
+    REQUIRE(agg != nullptr);
+    const auto* project = project_below(*agg);
+    REQUIRE(project != nullptr);
+    CHECK(names_of(*project) == std::vector<std::string>{"c_custkey", "c_name", "v"});
 }

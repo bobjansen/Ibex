@@ -63,7 +63,8 @@ unchanged.
 - ~~Cherry-pick `01189d96` and `06d2875e`~~ done on `adbc` (`2acc5a22`,
   `b8ab0f5f`). Still to do: push `adbc` and confirm the PostgreSQL CI job
   passes on GitHub (it has never run).
-- Clearer "driver not found" errors, offered in September and never done:
+- ~~Clearer "driver not found" errors~~ done (see the commit after
+  `197bb707`). Offered in September and never done:
   name the driver, the manifest search path it tried, and the install command.
   ADBC 24 on Windows reads a nonexistent `C:/…` path as `driver:uri` and reports
   "Could not load `C`"; that case in particular.

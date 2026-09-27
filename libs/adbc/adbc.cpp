@@ -15,11 +15,13 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/operator.hpp>
 
+#include <array>
 #include <arrow-adbc/adbc.h>
 #include <arrow-adbc/adbc_driver_manager.h>
 #include <cstdint>
 #include <cstring>
 #include <expected>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
@@ -67,6 +69,70 @@ auto call_adbc(std::string_view context, Fn&& fn) -> std::expected<void, std::st
     }
     release_adbc_error(&error);
     return {};
+}
+
+/// Drivers `scripts/install_adbc_driver.{sh,ps1}` can install. Keep in step
+/// with the scripts' `wheel_for` tables.
+constexpr std::array<std::string_view, 2> kInstallableDrivers{"sqlite", "postgresql"};
+
+/// Whether `driver` names a library file, which the driver manager loads
+/// as-is, rather than a name it resolves through manifests and the loader's
+/// search path.
+auto looks_like_path(std::string_view driver) -> bool {
+    if (driver.find('/') != std::string_view::npos || driver.find('\\') != std::string_view::npos) {
+        return true;
+    }
+    return driver.ends_with(".so") || driver.ends_with(".dylib") || driver.ends_with(".dll");
+}
+
+/// A driver given as a path that does not exist, reported before the driver
+/// manager sees it. Left to the manager, a missing path produced two `dlopen`
+/// failures, the second for a name it invented (`lib/nope/x.so.so`), and a
+/// Windows path lost everything after the drive letter: ADBC reads `C:` as a
+/// `driver:uri` prefix and reported "Could not load `C`".
+auto missing_driver_file(const std::string& driver) -> std::optional<std::string> {
+    if (!looks_like_path(driver)) {
+        return std::nullopt;
+    }
+    std::error_code ec;
+    if (std::filesystem::exists(std::filesystem::path(driver), ec)) {
+        return std::nullopt;
+    }
+    return "driver library not found: " + driver +
+           " (a path is loaded as given; pass a bare driver name such as \"sqlite\" to "
+           "use an installed driver instead)";
+}
+
+/// Rewrite the driver manager's "Could not load" for a bare driver name. The
+/// first line says what happened and what to do, because consumers that show
+/// one line (`ReplSession`, and so the R and Python bridges) keep only that;
+/// the driver manager's own list of where it looked for manifests follows.
+auto explain_driver_not_found(std::string_view driver, std::string_view manager_message)
+    -> std::string {
+    std::string message = "ADBC driver `" + std::string(driver) + "` not found; ";
+    const bool installable =
+        std::ranges::find(kInstallableDrivers, driver) != kInstallableDrivers.end();
+    if (installable) {
+        message += "install it with `scripts/install_adbc_driver.sh " + std::string(driver) +
+                   "` (Linux, macOS) or `powershell -ExecutionPolicy Bypass -File "
+                   "scripts\\install_adbc_driver.ps1 " +
+                   std::string(driver) + "` (Windows)";
+    } else {
+        message += "scripts/install_adbc_driver.sh (and .ps1) install ";
+        for (std::size_t i = 0; i < kInstallableDrivers.size(); ++i) {
+            message += i == 0 ? "" : ", ";
+            message += kInstallableDrivers[i];
+        }
+        message +=
+            "; for another driver, install it with an ADBC driver manifest, or pass the "
+            "path to its library";
+    }
+    constexpr std::string_view kSearched = "Also searched these paths for manifests:";
+    if (const auto at = manager_message.find(kSearched); at != std::string_view::npos) {
+        message += "\nSearched for a driver manifest in:";
+        message += manager_message.substr(at + kSearched.size());
+    }
+    return message;
 }
 
 template <typename Handle, typename Setter>
@@ -199,6 +265,9 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
 
     auto init(std::string driver, std::string uri, std::string sql, ParsedOptions options)
         -> std::expected<void, std::string> {
+        if (auto missing = missing_driver_file(driver); missing.has_value()) {
+            return std::unexpected(std::move(*missing));
+        }
         auto status = call_adbc("AdbcDatabaseNew", [&](AdbcError* error) {
             return AdbcDatabaseNew(&database_, error);
         });
@@ -257,6 +326,13 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
         status = call_adbc("AdbcDatabaseInit",
                            [&](AdbcError* error) { return AdbcDatabaseInit(&database_, error); });
         if (!status) {
+            // The driver is loaded here. A bare name the manager could not
+            // resolve gets an explanation; anything else (a library that
+            // exists but fails to load, a bad option) keeps its own message.
+            if (!looks_like_path(driver) &&
+                status.error().find("Could not load `") != std::string::npos) {
+                return std::unexpected(explain_driver_not_found(driver, status.error()));
+            }
             return status;
         }
 

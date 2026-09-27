@@ -1335,9 +1335,11 @@ auto release_arrow_schema(ArrowSchema* schema) noexcept -> void {
         return;
     }
     if (schema->release != &release_arrow_schema) {
-        auto* release = schema->release;
-        schema->release = nullptr;
-        release(schema);
+        // A foreign producer's release, called as the Arrow C Data contract
+        // has it: with `release` still installed, for the producer itself to
+        // clear. Clearing it first made a producer that checks it (the ADBC
+        // driver manager's stream wrapper) return without freeing anything.
+        schema->release(schema);
         clear_schema(schema);
         return;
     }
@@ -1362,9 +1364,8 @@ auto release_arrow_array(ArrowArray* array) noexcept -> void {
         return;
     }
     if (array->release != &release_arrow_array) {
-        auto* release = array->release;
-        array->release = nullptr;
-        release(array);
+        // As for a foreign schema above: the producer clears `release`.
+        array->release(array);
         clear_array(array);
         return;
     }
@@ -1388,9 +1389,11 @@ auto release_arrow_stream(ArrowArrayStream* stream) noexcept -> void {
     if (stream == nullptr || stream->release == nullptr) {
         return;
     }
-    auto* release = stream->release;
-    stream->release = nullptr;
-    release(stream);
+    // The producer's release, with `release` still installed: the ADBC driver
+    // manager wraps a driver's stream in one that frees itself (and the
+    // driver's stream inside it) only when `stream->release` is still its own
+    // function. Clearing it first leaked both on every PostgreSQL read.
+    stream->release(stream);
     clear_stream(stream);
 }
 

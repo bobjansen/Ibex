@@ -849,7 +849,7 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         // strategy-specific usefulness thresholds.
         return make_chunked_aggregate_operator(std::move(child_op.value()), &agg.group_by(),
                                                &agg.aggregations(), exec, *parallelism, ap.columns,
-                                               prefilter, std::move(scan_sink));
+                                               prefilter, scan_sink);
     }
 
     return std::unexpected("physical aggregate: plan named no executable strategy");

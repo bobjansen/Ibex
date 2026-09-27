@@ -607,15 +607,15 @@ class HashAggregateState final {
             input_consumed_ = true;
             return false;
         }
-        active_chunk_ = std::move(*chunk_res.value());
+        const Chunk& chunk = active_chunk_.emplace(std::move(*chunk_res.value()));
         const ExecutionProfileScope scope(discovery_profile_, ProfilePhase::Next);
         if (scan_sink_ != nullptr) {
             worker_emission_ = scan_sink_->take_current();
-            if (auto err = settle_deferred_translation()) {
+            if (auto err = settle_deferred_translation(chunk)) {
                 return std::unexpected(*err);
             }
         }
-        if (auto err = discover_chunk(*active_chunk_)) {
+        if (auto err = discover_chunk(chunk)) {
             return std::unexpected(*err);
         }
         if (!worker_emission_.deferred.empty()) {
@@ -1163,7 +1163,7 @@ class HashAggregateState final {
         }
         // Only the multi-key Categorical path can merge a partial over
         // untranslated keys; every other one reads the codes.
-        if (!(cat_fast_path_ && group_entries.size() >= 2)) {
+        if (!cat_fast_path_ || group_entries.size() < 2) {
             translate_deferred_keys();
         }
         if (cat_fast_path_) {
@@ -3836,11 +3836,15 @@ class HashAggregateState final {
     /// dictionary once this operator merges worker partials: every group key
     /// that is not also an aggregate's input, which would read all its rows.
     [[nodiscard]] auto untranslatable_key_columns() const -> std::vector<std::size_t> {
+        if (!columns_.has_value()) {
+            return {};
+        }
+        const physical::AggregateColumnMapping& cols = *columns_;
         std::vector<std::size_t> keys;
-        keys.reserve(columns_->group_by.size());
-        for (const std::size_t index : columns_->group_by) {
-            if (std::ranges::find(columns_->aggregate_inputs, std::optional<std::size_t>{index}) ==
-                columns_->aggregate_inputs.end()) {
+        keys.reserve(cols.group_by.size());
+        for (const std::size_t index : cols.group_by) {
+            if (std::ranges::find(cols.aggregate_inputs, std::optional<std::size_t>{index}) ==
+                cols.aggregate_inputs.end()) {
                 keys.push_back(index);
             }
         }
@@ -3850,11 +3854,10 @@ class HashAggregateState final {
     /// Check the untranslated key columns the pipeline emitted with this
     /// chunk, and translate them now unless this chunk is headed for the one
     /// path that does not read them (`try_merge_untranslated_keys`).
-    auto settle_deferred_translation() -> std::optional<std::string> {
+    auto settle_deferred_translation(const Chunk& chunk) -> std::optional<std::string> {
         if (worker_emission_.deferred.empty()) {
             return std::nullopt;
         }
-        const Chunk& chunk = *active_chunk_;
         bool keys_valid = true;
         for (const auto& deferred : worker_emission_.deferred) {
             const Column<Categorical>* local =
@@ -3865,13 +3868,16 @@ class HashAggregateState final {
                 return "physical aggregate: an untranslated key column does not match its remap";
             }
         }
-        for (const std::size_t index : columns_->group_by) {
-            keys_valid = keys_valid && index < chunk.columns.size() &&
-                         !chunk.columns[index].validity.has_value();
+        if (!columns_.has_value()) {
+            keys_valid = false;
+        } else {
+            for (const std::size_t index : columns_->group_by) {
+                keys_valid = keys_valid && index < chunk.columns.size() &&
+                             !chunk.columns[index].validity.has_value();
+            }
         }
-        if (!(scan_sink_active_ && on_worker_partial_path() && keys_valid &&
-              worker_emission_.partial != nullptr &&
-              worker_emission_.partial->rows == chunk.rows())) {
+        if (!scan_sink_active_ || !on_worker_partial_path() || !keys_valid ||
+            worker_emission_.partial == nullptr || worker_emission_.partial->rows != chunk.rows()) {
             translate_deferred_keys();
         }
         return std::nullopt;
@@ -3880,8 +3886,13 @@ class HashAggregateState final {
     /// The per-row translation the pipeline skipped. The ColumnEntry objects
     /// stay put, so pointers taken to them remain valid.
     void translate_deferred_keys() {
+        if (!active_chunk_.has_value()) {
+            worker_emission_.deferred.clear();
+            return;
+        }
+        Chunk& chunk = *active_chunk_;
         for (const auto& deferred : worker_emission_.deferred) {
-            auto& entry = active_chunk_->columns[deferred.column];
+            auto& entry = chunk.columns[deferred.column];
             entry.column = std::make_shared<ColumnValue>(translate_deferred_categorical(
                 std::get<Column<Categorical>>(*entry.column), deferred));
         }
@@ -3895,16 +3906,17 @@ class HashAggregateState final {
     auto try_merge_untranslated_keys(const std::vector<const Column<Categorical>*>& cat_cols,
                                      std::size_t rows) -> bool {
         const auto& partial = worker_emission_.partial;
-        if (!multi_dense_ || rows == 0 || !aggs_are_slot_combinable() || partial == nullptr ||
-            partial->rows != rows) {
+        if (!columns_.has_value() || !multi_dense_ || rows == 0 || !aggs_are_slot_combinable() ||
+            partial == nullptr || partial->rows != rows) {
             return false;
         }
+        const physical::AggregateColumnMapping& cols = *columns_;
         std::vector<const Column<Categorical>*> shared_cols = cat_cols;
         std::vector<const std::vector<Column<Categorical>::code_type>*> remaps(cat_cols.size(),
                                                                                nullptr);
         for (const auto& deferred : worker_emission_.deferred) {
-            for (std::size_t g = 0; g < columns_->group_by.size(); ++g) {
-                if (columns_->group_by[g] == deferred.column) {
+            for (std::size_t g = 0; g < cols.group_by.size(); ++g) {
+                if (cols.group_by[g] == deferred.column) {
                     shared_cols[g] = &deferred.shared;
                     remaps[g] = &deferred.remap;
                 }
@@ -3945,6 +3957,9 @@ class HashAggregateState final {
         }
         // The mapping's indices name the aggregate's input columns; a worker
         // chunk laid out differently is not that input, whatever it holds.
+        if (!columns_.has_value()) {
+            return nullptr;
+        }
         const physical::AggregateColumnMapping& cols = *columns_;
         std::vector<const Column<Categorical>*> cat_cols;
         cat_cols.reserve(cols.group_by.size());
@@ -7068,7 +7083,8 @@ auto make_chunked_aggregate_operator(OperatorPtr child, const std::vector<ir::Co
                                      physical::AggregateParallelism parallelism,
                                      std::optional<physical::AggregateColumnMapping> columns,
                                      AggregatePrefilter prefilter,
-                                     std::shared_ptr<ScanWorkerSink> scan_sink) -> OperatorPtr {
+                                     const std::shared_ptr<ScanWorkerSink>& scan_sink)
+    -> OperatorPtr {
     // Only a sink this TU made is ever offered to it; anything else is ignored.
     return std::make_unique<ChunkedSortedAggregateOperator>(
         std::move(child), group_by, aggregations, exec, parallelism, std::move(columns),

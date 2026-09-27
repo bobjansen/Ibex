@@ -150,120 +150,114 @@ auto apply_adbc_options(std::string_view context, Handle* handle, const OptionLi
     return {};
 }
 
-class AdbcSourceOperator final : public ibex::runtime::Operator {
+/// One open ADBC database and connection: the value behind an Ibex
+/// `AdbcConnection`. Shared by every binding of it and by the query running on
+/// it (a statement lease), so the handles outlive whichever of them drops
+/// first. Allows one active statement at a time.
+///
+/// Tables imported from a query may keep zero-copy buffers whose release
+/// callbacks live in the driver library. The pinned driver manager never
+/// unloads a driver (`ManagedLibrary::Release` is a no-op, apache/arrow-adbc#204),
+/// so those buffers stay valid after `adbc_close` and after this object is gone.
+class AdbcSession final : public ibex::runtime::Resource {
    public:
-    static auto create(std::string driver, std::string uri, std::string sql, ParsedOptions options)
-        -> std::expected<ibex::runtime::OperatorPtr, std::string> {
-        auto op = std::unique_ptr<AdbcSourceOperator>(new AdbcSourceOperator());
-        auto init = op->init(std::move(driver), std::move(uri), std::move(sql), std::move(options));
+    static constexpr std::string_view kTypeName = "AdbcConnection";
+
+    static auto open(const std::string& driver, const std::string& uri,
+                     const ParsedOptions& options)
+        -> std::expected<std::shared_ptr<AdbcSession>, std::string> {
+        auto session = std::shared_ptr<AdbcSession>(new AdbcSession());
+        session->statement_options_ = options.statement;
+        auto init = session->init(driver, uri, options);
         if (!init) {
-            // `op` is destroyed here, releasing whatever handles init acquired.
-            return std::unexpected("read_adbc: " + init.error());
+            // `session` is destroyed here, releasing whatever init acquired.
+            return std::unexpected(init.error());
         }
-        return ibex::runtime::OperatorPtr(std::move(op));
+        return session;
     }
 
-    AdbcSourceOperator(const AdbcSourceOperator&) = delete;
-    AdbcSourceOperator& operator=(const AdbcSourceOperator&) = delete;
-    AdbcSourceOperator(AdbcSourceOperator&&) noexcept = delete;
-    AdbcSourceOperator& operator=(AdbcSourceOperator&&) noexcept = delete;
+    AdbcSession(const AdbcSession&) = delete;
+    AdbcSession& operator=(const AdbcSession&) = delete;
+    AdbcSession(AdbcSession&&) noexcept = delete;
+    AdbcSession& operator=(AdbcSession&&) noexcept = delete;
 
-    ~AdbcSourceOperator() override {
-        // Children before parents: stream, statement, connection, database.
-        ibex::interop::release_arrow_stream(&stream_);
-        ibex::interop::release_arrow_schema(&schema_);
-        if (statement_acquired_) {
-            AdbcError error{};
-            AdbcStatementRelease(&statement_, &error);
-            release_adbc_error(&error);
+    ~AdbcSession() override { (void)release_handles(); }
+
+    [[nodiscard]] auto type_name() const noexcept -> std::string_view override { return kTypeName; }
+
+    /// Start a statement. Fails when the connection is closed or another
+    /// statement is still running on it.
+    auto acquire_lease() -> std::expected<void, std::string> {
+        if (closed_) {
+            return std::unexpected("connection is closed");
         }
-        if (connection_acquired_) {
-            AdbcError error{};
-            AdbcConnectionRelease(&connection_, &error);
-            release_adbc_error(&error);
+        if (busy_) {
+            return std::unexpected("connection busy: another query on it has not finished");
         }
-        if (database_acquired_) {
-            AdbcError error{};
-            AdbcDatabaseRelease(&database_, &error);
-            release_adbc_error(&error);
+        busy_ = true;
+        return {};
+    }
+
+    /// End a statement. A close requested while it ran releases the handles now.
+    void release_lease() noexcept {
+        busy_ = false;
+        if (closed_) {
+            (void)release_handles();
         }
     }
 
-    [[nodiscard]] auto next()
-        -> std::expected<std::optional<ibex::runtime::Chunk>, std::string> override {
-        if (finished_) {
-            return std::optional<ibex::runtime::Chunk>{};
+    /// Mark the connection closed; every binding of it rejects new queries.
+    /// Returns false when it already was. The handles are released now, or when
+    /// the running statement ends.
+    auto close() -> std::expected<bool, std::string> {
+        if (closed_) {
+            return false;
         }
-
-        if (!schema_loaded_) {
-            const int status = stream_.get_schema(&stream_, &schema_);
-            if (status != 0) {
-                finished_ = true;
-                return std::unexpected(stream_error("ADBC stream get_schema", status));
-            }
-            schema_loaded_ = true;
+        closed_ = true;
+        if (busy_) {
+            return true;
         }
-
-        while (true) {
-            ::ArrowArray batch{};
-            const int status = stream_.get_next(&stream_, &batch);
-            if (status != 0) {
-                finished_ = true;
-                return std::unexpected(stream_error("ADBC stream get_next", status));
-            }
-            if (batch.release == nullptr) {
-                finished_ = true;
-                if (emitted_chunk_) {
-                    return std::optional<ibex::runtime::Chunk>{};
-                }
-                // No rows at all. Emit one empty chunk so the result keeps the
-                // query's columns instead of collapsing to a column-less table.
-                auto empty = ibex::interop::empty_table_from_arrow_schema(schema_);
-                if (!empty) {
-                    return std::unexpected("read_adbc: result schema import failed: " +
-                                           empty.error());
-                }
-                return make_chunk(std::move(*empty));
-            }
-
-            auto batch_guard = std::unique_ptr<::ArrowArray, void (*)(::ArrowArray*)>(
-                &batch, ibex::interop::release_arrow_array);
-
-            // ADBC record batches use the same Arrow C Data importer as direct
-            // Arrow input, including its zero-copy decimal128 `d:p,s` mapping.
-            // Keep decimal type interpretation in that shared boundary so the
-            // ADBC path cannot drift from Arrow C Data or Parquet semantics.
-            auto imported = ibex::interop::adopt_table_from_arrow(&batch, schema_);
-            if (!imported) {
-                finished_ = true;
-                return std::unexpected("read_adbc: batch import failed: " + imported.error());
-            }
-            if (imported->rows() == 0) {
-                continue;
-            }
-            return make_chunk(std::move(*imported));
+        auto released = release_handles();
+        if (!released) {
+            return std::unexpected(released.error());
         }
+        return true;
+    }
+
+    [[nodiscard]] auto connection() noexcept -> AdbcConnection* { return &connection_; }
+    [[nodiscard]] auto statement_options() const noexcept -> const OptionList& {
+        return statement_options_;
     }
 
    private:
-    AdbcSourceOperator() {
+    AdbcSession() {
         std::memset(&database_, 0, sizeof(database_));
         std::memset(&connection_, 0, sizeof(connection_));
-        std::memset(&statement_, 0, sizeof(statement_));
-        std::memset(&stream_, 0, sizeof(stream_));
-        std::memset(&schema_, 0, sizeof(schema_));
     }
 
-    auto make_chunk(ibex::runtime::Table table)
-        -> std::expected<std::optional<ibex::runtime::Chunk>, std::string> {
-        emitted_chunk_ = true;
-        ibex::runtime::Chunk chunk;
-        chunk.columns = std::move(table.columns);
-        chunk.set_properties(table.properties());
-        return std::optional<ibex::runtime::Chunk>{std::move(chunk)};
+    /// Connection before database. Reports the first failure; both are
+    /// released either way.
+    auto release_handles() noexcept -> std::expected<void, std::string> {
+        std::expected<void, std::string> result;
+        if (connection_acquired_) {
+            connection_acquired_ = false;
+            result = call_adbc("AdbcConnectionRelease", [&](AdbcError* error) {
+                return AdbcConnectionRelease(&connection_, error);
+            });
+        }
+        if (database_acquired_) {
+            database_acquired_ = false;
+            auto status = call_adbc("AdbcDatabaseRelease", [&](AdbcError* error) {
+                return AdbcDatabaseRelease(&database_, error);
+            });
+            if (result && !status) {
+                result = std::move(status);
+            }
+        }
+        return result;
     }
 
-    auto init(std::string driver, std::string uri, std::string sql, ParsedOptions options)
+    auto init(const std::string& driver, const std::string& uri, const ParsedOptions& options)
         -> std::expected<void, std::string> {
         if (auto missing = missing_driver_file(driver); missing.has_value()) {
             return std::unexpected(std::move(*missing));
@@ -361,14 +355,134 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
             return status;
         }
 
-        status = apply_adbc_options("AdbcConnectionSetOption", &connection_,
-                                    options.connection_post, set_connection_option);
-        if (!status) {
-            return status;
+        return apply_adbc_options("AdbcConnectionSetOption", &connection_, options.connection_post,
+                                  set_connection_option);
+    }
+
+    AdbcDatabase database_{};
+    AdbcConnection connection_{};
+    OptionList statement_options_;
+    bool database_acquired_ = false;
+    bool connection_acquired_ = false;
+    bool closed_ = false;
+    bool busy_ = false;
+};
+
+/// Streams one query's result. Holds a statement lease on its session for as
+/// long as it lives.
+class AdbcSourceOperator final : public ibex::runtime::Operator {
+   public:
+    static auto create(std::shared_ptr<AdbcSession> session, const std::string& sql,
+                       std::string_view function)
+        -> std::expected<ibex::runtime::OperatorPtr, std::string> {
+        const std::string prefix = std::string(function) + ": ";
+        if (auto lease = session->acquire_lease(); !lease) {
+            return std::unexpected(prefix + lease.error());
+        }
+        auto op = std::unique_ptr<AdbcSourceOperator>(
+            new AdbcSourceOperator(std::move(session), std::string(function)));
+        auto init = op->init(sql);
+        if (!init) {
+            // `op` is destroyed here, releasing the statement and the lease.
+            return std::unexpected(prefix + init.error());
+        }
+        return ibex::runtime::OperatorPtr(std::move(op));
+    }
+
+    AdbcSourceOperator(const AdbcSourceOperator&) = delete;
+    AdbcSourceOperator& operator=(const AdbcSourceOperator&) = delete;
+    AdbcSourceOperator(AdbcSourceOperator&&) noexcept = delete;
+    AdbcSourceOperator& operator=(AdbcSourceOperator&&) noexcept = delete;
+
+    ~AdbcSourceOperator() override {
+        // Children before parents: stream, statement, then the lease on the
+        // connection.
+        ibex::interop::release_arrow_stream(&stream_);
+        ibex::interop::release_arrow_schema(&schema_);
+        if (statement_acquired_) {
+            AdbcError error{};
+            AdbcStatementRelease(&statement_, &error);
+            release_adbc_error(&error);
+        }
+        session_->release_lease();
+    }
+
+    [[nodiscard]] auto next()
+        -> std::expected<std::optional<ibex::runtime::Chunk>, std::string> override {
+        if (finished_) {
+            return std::optional<ibex::runtime::Chunk>{};
         }
 
-        status = call_adbc("AdbcStatementNew", [&](AdbcError* error) {
-            return AdbcStatementNew(&connection_, &statement_, error);
+        if (!schema_loaded_) {
+            const int status = stream_.get_schema(&stream_, &schema_);
+            if (status != 0) {
+                finished_ = true;
+                return std::unexpected(stream_error("ADBC stream get_schema", status));
+            }
+            schema_loaded_ = true;
+        }
+
+        while (true) {
+            ::ArrowArray batch{};
+            const int status = stream_.get_next(&stream_, &batch);
+            if (status != 0) {
+                finished_ = true;
+                return std::unexpected(stream_error("ADBC stream get_next", status));
+            }
+            if (batch.release == nullptr) {
+                finished_ = true;
+                if (emitted_chunk_) {
+                    return std::optional<ibex::runtime::Chunk>{};
+                }
+                // No rows at all. Emit one empty chunk so the result keeps the
+                // query's columns instead of collapsing to a column-less table.
+                auto empty = ibex::interop::empty_table_from_arrow_schema(schema_);
+                if (!empty) {
+                    return std::unexpected(function_ +
+                                           ": result schema import failed: " + empty.error());
+                }
+                return make_chunk(std::move(*empty));
+            }
+
+            auto batch_guard = std::unique_ptr<::ArrowArray, void (*)(::ArrowArray*)>(
+                &batch, ibex::interop::release_arrow_array);
+
+            // ADBC record batches use the same Arrow C Data importer as direct
+            // Arrow input, including its zero-copy decimal128 `d:p,s` mapping.
+            // Keep decimal type interpretation in that shared boundary so the
+            // ADBC path cannot drift from Arrow C Data or Parquet semantics.
+            auto imported = ibex::interop::adopt_table_from_arrow(&batch, schema_);
+            if (!imported) {
+                finished_ = true;
+                return std::unexpected(function_ + ": batch import failed: " + imported.error());
+            }
+            if (imported->rows() == 0) {
+                continue;
+            }
+            return make_chunk(std::move(*imported));
+        }
+    }
+
+   private:
+    AdbcSourceOperator(std::shared_ptr<AdbcSession> session, std::string function)
+        : session_(std::move(session)), function_(std::move(function)) {
+        std::memset(&statement_, 0, sizeof(statement_));
+        std::memset(&stream_, 0, sizeof(stream_));
+        std::memset(&schema_, 0, sizeof(schema_));
+    }
+
+    auto make_chunk(ibex::runtime::Table table)
+        -> std::expected<std::optional<ibex::runtime::Chunk>, std::string> {
+        emitted_chunk_ = true;
+        ibex::runtime::Chunk chunk;
+        chunk.columns = std::move(table.columns);
+        chunk.set_properties(table.properties());
+        return std::optional<ibex::runtime::Chunk>{std::move(chunk)};
+    }
+
+    auto init(const std::string& sql) -> std::expected<void, std::string> {
+        auto status = call_adbc("AdbcStatementNew", [&](AdbcError* error) {
+            return AdbcStatementNew(session_->connection(), &statement_, error);
         });
         if (!status) {
             return status;
@@ -376,7 +490,7 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
         statement_acquired_ = true;
 
         status = apply_adbc_options(
-            "AdbcStatementSetOption", &statement_, options.statement,
+            "AdbcStatementSetOption", &statement_, session_->statement_options(),
             [](AdbcStatement* statement, const char* key, const char* value, AdbcError* error) {
                 return AdbcStatementSetOption(statement, key, value, error);
             });
@@ -392,17 +506,13 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
         }
 
         std::int64_t rows_affected = -1;
-        status = call_adbc("AdbcStatementExecuteQuery", [&](AdbcError* error) {
+        return call_adbc("AdbcStatementExecuteQuery", [&](AdbcError* error) {
             return AdbcStatementExecuteQuery(&statement_, &stream_, &rows_affected, error);
         });
-        if (!status) {
-            return status;
-        }
-        return {};
     }
 
     [[nodiscard]] auto stream_error(std::string_view context, int status) -> std::string {
-        std::string message = "read_adbc: ";
+        std::string message = function_ + ": ";
         message += context;
         message += " failed";
         if (stream_.get_last_error != nullptr) {
@@ -419,18 +529,28 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
         return message;
     }
 
-    AdbcDatabase database_{};
-    AdbcConnection connection_{};
+    std::shared_ptr<AdbcSession> session_;
+    std::string function_;
     AdbcStatement statement_{};
     ::ArrowArrayStream stream_{};
     ::ArrowSchema schema_{};
-    bool database_acquired_ = false;
-    bool connection_acquired_ = false;
     bool statement_acquired_ = false;
     bool schema_loaded_ = false;
     bool emitted_chunk_ = false;
     bool finished_ = false;
 };
+
+auto parse_option_arg(const ibex::runtime::ExternArgs& args, std::size_t index,
+                      std::string_view usage) -> std::expected<ParsedOptions, std::string> {
+    if (args.size() <= index) {
+        return ParsedOptions{};
+    }
+    const auto* option_spec = std::get_if<std::string>(&args[index]);
+    if (option_spec == nullptr) {
+        return std::unexpected(std::string(usage) + " expects a string options spec");
+    }
+    return ibex::adbc::parse_options(*option_spec);
+}
 
 auto make_adbc_source(const ibex::runtime::ExternArgs& args)
     -> std::expected<ibex::runtime::OperatorPtr, std::string> {
@@ -443,45 +563,101 @@ auto make_adbc_source(const ibex::runtime::ExternArgs& args)
     if (driver == nullptr || uri == nullptr || sql == nullptr) {
         return std::unexpected("read_adbc(driver, uri, sql[, options]) expects string arguments");
     }
-
-    ParsedOptions options;
-    if (args.size() == 4) {
-        const auto* option_spec = std::get_if<std::string>(&args[3]);
-        if (option_spec == nullptr) {
-            return std::unexpected(
-                "read_adbc(driver, uri, sql, options) expects a string options spec");
-        }
-        auto parsed = ibex::adbc::parse_options(*option_spec);
-        if (!parsed) {
-            return std::unexpected(parsed.error());
-        }
-        options = std::move(*parsed);
+    auto options = parse_option_arg(args, 3, "read_adbc(driver, uri, sql, options)");
+    if (!options) {
+        return std::unexpected(options.error());
     }
+    // A connection of its own, released with the source.
+    auto session = AdbcSession::open(*driver, *uri, *options);
+    if (!session) {
+        return std::unexpected("read_adbc: " + session.error());
+    }
+    return AdbcSourceOperator::create(std::move(*session), *sql, "read_adbc");
+}
 
-    return AdbcSourceOperator::create(*driver, *uri, *sql, std::move(options));
+auto materialize(std::expected<ibex::runtime::OperatorPtr, std::string> source)
+    -> std::expected<ibex::runtime::ExternValue, std::string> {
+    if (!source) {
+        return std::unexpected(source.error());
+    }
+    ibex::runtime::MaterializeOperator sink(std::move(*source));
+    auto table = sink.run();
+    if (!table) {
+        return std::unexpected(table.error());
+    }
+    return ibex::runtime::ExternValue{std::move(*table)};
+}
+
+auto session_arg(const ibex::runtime::ExternArgs& args, std::string_view function)
+    -> std::expected<std::shared_ptr<AdbcSession>, std::string> {
+    auto session = args.resource_as<AdbcSession>(0);
+    if (session == nullptr) {
+        return std::unexpected(std::string(function) + ": the first argument must be an " +
+                               std::string(AdbcSession::kTypeName));
+    }
+    return session;
+}
+
+auto adbc_connect(const ibex::runtime::ExternArgs& args)
+    -> std::expected<ibex::runtime::ExternValue, std::string> {
+    if (args.size() != 2 && args.size() != 3) {
+        return std::unexpected("adbc_connect(driver, uri[, options]) expects 2 or 3 arguments");
+    }
+    const auto* driver = std::get_if<std::string>(&args[0]);
+    const auto* uri = std::get_if<std::string>(&args[1]);
+    if (driver == nullptr || uri == nullptr) {
+        return std::unexpected("adbc_connect(driver, uri[, options]) expects string arguments");
+    }
+    auto options = parse_option_arg(args, 2, "adbc_connect(driver, uri, options)");
+    if (!options) {
+        return std::unexpected(options.error());
+    }
+    auto session = AdbcSession::open(*driver, *uri, *options);
+    if (!session) {
+        return std::unexpected("adbc_connect: " + session.error());
+    }
+    return ibex::runtime::ExternValue{ibex::runtime::ResourcePtr(std::move(*session))};
+}
+
+auto adbc_query(const ibex::runtime::ExternArgs& args)
+    -> std::expected<ibex::runtime::ExternValue, std::string> {
+    auto session = session_arg(args, "adbc_query");
+    if (!session) {
+        return std::unexpected(session.error());
+    }
+    const auto* sql = args.size() == 2 ? std::get_if<std::string>(&args[1]) : nullptr;
+    if (sql == nullptr) {
+        return std::unexpected("adbc_query(db, sql) expects a string query");
+    }
+    return materialize(AdbcSourceOperator::create(std::move(*session), *sql, "adbc_query"));
+}
+
+auto adbc_close(const ibex::runtime::ExternArgs& args)
+    -> std::expected<ibex::runtime::ExternValue, std::string> {
+    auto session = session_arg(args, "adbc_close");
+    if (!session) {
+        return std::unexpected(session.error());
+    }
+    auto closed = (*session)->close();
+    if (!closed) {
+        return std::unexpected("adbc_close: " + closed.error());
+    }
+    return ibex::runtime::ExternValue{ibex::runtime::ScalarValue{std::int64_t{*closed ? 1 : 0}}};
 }
 
 }  // namespace
 
 extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* registry) {
-    registry->register_table("read_adbc",
-                             [](const ibex::runtime::ExternArgs& args)
-                                 -> std::expected<ibex::runtime::ExternValue, std::string> {
-                                 auto source = make_adbc_source(args);
-                                 if (!source) {
-                                     return std::unexpected(source.error());
-                                 }
-                                 ibex::runtime::MaterializeOperator sink(std::move(*source));
-                                 auto table = sink.run();
-                                 if (!table) {
-                                     return std::unexpected(table.error());
-                                 }
-                                 return ibex::runtime::ExternValue{std::move(*table)};
-                             });
-
+    registry->register_table("read_adbc", [](const ibex::runtime::ExternArgs& args) {
+        return materialize(make_adbc_source(args));
+    });
     registry->register_chunked_table("read_adbc",
                                      [](const ibex::runtime::ExternArgs& args)
                                          -> std::expected<ibex::runtime::OperatorPtr, std::string> {
                                          return make_adbc_source(args);
                                      });
+
+    registry->register_resource("adbc_connect", adbc_connect);
+    registry->register_table("adbc_query", adbc_query);
+    registry->register_scalar("adbc_close", ibex::runtime::ScalarKind::Int, adbc_close);
 }

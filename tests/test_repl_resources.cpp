@@ -229,7 +229,7 @@ TEST_CASE("Resource arguments are checked by type and binding", "[repl][resource
 
     const auto wrong_type = session.execute("fake_query(other, 1);");
     REQUIRE_FALSE(wrong_type.ok);
-    REQUIRE(wrong_type.error.contains("expects FakeConn, but 'other' is a OtherConn"));
+    REQUIRE(wrong_type.error.contains("expects FakeConn, but 'other' is OtherConn"));
 
     const auto scalar = session.execute("fake_query(x, 1);");
     REQUIRE_FALSE(scalar.ok);

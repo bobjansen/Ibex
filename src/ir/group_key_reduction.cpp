@@ -15,7 +15,9 @@
 #include <ranges>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace ibex::ir {
@@ -290,9 +292,9 @@ auto walk(NodePtr node, const SourceSchemas& sources) -> NodePtr {
 /// **Gated structurally, never on a cost estimate.** A payload re-fetch has the
 /// same failure shape as the deferred-probe join that regressed q12: attractive
 /// on paper, negative when many rows survive the aggregate. The rewrite applies
-/// only when a `Head` with a literal count sits above, and the intervening
-/// `order` does not sort on a lifted column. That is a pattern match, so it
-/// cannot misfire on a shape it was never measured on.
+/// only when a `Head` with a literal count (or the `TopK` it fuses into) sits above, and the
+/// intervening `order` does not sort on a lifted column. That is a pattern match, so it cannot
+/// misfire on a shape it was never measured on.
 ///
 /// v1 lifts only columns belonging to the retained key's OWN source occurrence,
 /// which needs a single join keyed directly on the surviving group key. A
@@ -340,14 +342,47 @@ auto find_scan(const Node& node, NodeId id) -> const ScanNode* {
     return nullptr;
 }
 
-/// Decide what a `Head` node can lift, or nullopt.
+/// The top-k a lift rewrites: a `Head` over a chain holding the `Order`, or
+/// the `TopK` canonicalize fuses from exactly that (R16), which carries the
+/// order itself. A `TopK` is what a canonicalized plan has; matching only the
+/// unfused pair left q10's lift unfired whenever the plan went through the
+/// optimizer (+34%).
+auto is_limit_node(const Node& node) -> bool {
+    return node.kind() == NodeKind::Head || node.kind() == NodeKind::TopK;
+}
+
+/// The sort keys of the top-k at `limit_node`: a `TopK`'s own, or those of
+/// the first `Order` in the chain below a `Head`.
+auto limit_sort_keys(const Node& limit_node, const std::vector<Node*>& chain)
+    -> std::vector<OrderKey> {
+    if (limit_node.kind() == NodeKind::TopK) {
+        return node_cast<TopKNode>(limit_node).keys();
+    }
+    for (const Node* link : chain) {
+        if (link->kind() == NodeKind::Order) {
+            return node_cast<OrderNode>(*link).keys();
+        }
+    }
+    return {};
+}
+
+/// Decide what a `Head` or `TopK` node can lift, or nullopt.
 auto plan_lift(Node& head_node, const Node& root, const SourceSchemas& sources)
     -> std::optional<LiftPlan> {
-    const auto& head = node_cast<HeadNode>(head_node);
     // A literal count bounds the re-fetch input; an expression could be
-    // anything, and `head ..., by k` is per-group, a different query.
-    if (!head.count_literal().has_value() || !head.group_by().empty()) {
-        return std::nullopt;
+    // anything, and `head ..., by k` is per-group, a different query. A
+    // `TopK`'s count is always a literal; one that keeps the LAST rows is a
+    // `tail`, which this was never measured on.
+    if (head_node.kind() == NodeKind::TopK) {
+        const auto& topk = node_cast<TopKNode>(head_node);
+        if (topk.keep_mode() != TopKNode::KeepMode::First || !topk.group_by().empty()) {
+            return std::nullopt;
+        }
+    } else {
+        const auto& head = node_cast<HeadNode>(head_node);
+        if (!head.count_literal().has_value() || !head.group_by().empty()) {
+            return std::nullopt;
+        }
     }
     if (head_node.children().empty() || head_node.mutable_children().front() == nullptr) {
         return std::nullopt;
@@ -399,16 +434,20 @@ auto plan_lift(Node& head_node, const Node& root, const SourceSchemas& sources)
     // The top-k must not sort on anything being lifted: those columns will not
     // exist until after the join, and re-sorting cannot recover a k chosen by a
     // different ordering.
-    for (const Node* link : chain) {
-        if (link->kind() != NodeKind::Order) {
-            continue;
-        }
-        for (const auto& order_key : node_cast<OrderNode>(*link).keys()) {
-            const bool lifts_sort_key = std::ranges::any_of(
+    const auto sorts_on_lifted = [&](const std::vector<OrderKey>& keys) {
+        return std::ranges::any_of(keys, [&](const OrderKey& order_key) {
+            return std::ranges::any_of(
                 lifted, [&](const AggSpec& spec) { return spec.alias == order_key.name; });
-            if (lifts_sort_key) {
-                return std::nullopt;
-            }
+        });
+    };
+    if (head_node.kind() == NodeKind::TopK &&
+        sorts_on_lifted(node_cast<TopKNode>(head_node).keys())) {
+        return std::nullopt;
+    }
+    for (const Node* link : chain) {
+        if (link->kind() == NodeKind::Order &&
+            sorts_on_lifted(node_cast<OrderNode>(*link).keys())) {
+            return std::nullopt;
         }
     }
 
@@ -417,8 +456,106 @@ auto plan_lift(Node& head_node, const Node& root, const SourceSchemas& sources)
                     .lifted = std::move(lifted)};
 }
 
-/// Rewrite `head_node` into `Project(Order(Join(head, scan)))`, with the lifted
-/// columns removed from everything below.
+/// Whether `expr` reads any column in `names`. Conservative: an expression
+/// kind this does not know reads everything.
+// NOLINTNEXTLINE(misc-no-recursion)
+auto expr_reads_any(const Expr& expr, const std::set<std::string>& names) -> bool {
+    const auto reads = [&](const ExprPtr& sub) {
+        return sub != nullptr && expr_reads_any(*sub, names);
+    };
+    return std::visit(
+        [&](const auto& n) -> bool {
+            using T = std::decay_t<decltype(n)>;
+            if constexpr (std::is_same_v<T, ColumnRef>) {
+                return !n.lexical && names.contains(n.name);
+            } else if constexpr (std::is_same_v<T, Literal>) {
+                return false;
+            } else if constexpr (std::is_same_v<T, BinaryExpr> || std::is_same_v<T, CompareExpr> ||
+                                 std::is_same_v<T, LogicalExpr>) {
+                return reads(n.left) || reads(n.right);
+            } else if constexpr (std::is_same_v<T, IsNullExpr>) {
+                return reads(n.operand);
+            } else if constexpr (std::is_same_v<T, CallExpr>) {
+                return std::ranges::any_of(n.args, reads) ||
+                       std::ranges::any_of(n.named_args,
+                                           [&](const auto& named) { return reads(named.value); });
+            } else if constexpr (std::is_same_v<T, RankExpr>) {
+                return std::ranges::any_of(
+                    n.order_keys, [&](const OrderKey& key) { return names.contains(key.name); });
+            } else {
+                return true;
+            }
+        },
+        expr.node);
+}
+
+/// Drop the lifted columns' source names from the projections in the
+/// aggregate's row-local input.
+///
+/// Stripping them from the aggregate is not enough when a projection BELOW it
+/// still lists them: projection pushdown decodes whatever a projection names,
+/// so the source keeps decoding the wide columns the lift exists to skip, and
+/// the joins carry them. The unoptimized plan happened to have no such
+/// projection; canonicalize puts one there (q10: under the revenue update),
+/// which left q10 decoding and joining all of customer's text again.
+///
+/// Walks down through Project, Update and Filter only, and never drops a
+/// column the aggregate or a node on the way still reads -- or one an update
+/// redefines, whose name below it is a different column.
+void prune_lifted_inputs(AggregateNode& agg, const LiftPlan& plan) {
+    std::set<std::string> droppable;
+    for (const auto& spec : plan.lifted) {
+        droppable.insert(spec.column.name);
+    }
+    for (const auto& key : agg.group_by()) {
+        droppable.erase(key.name);
+    }
+    for (const auto& spec : agg.aggregations()) {
+        droppable.erase(spec.column.name);
+    }
+    NodePtr* slot = agg.children().empty() ? nullptr : &agg.mutable_children().front();
+    while (slot != nullptr && *slot != nullptr && !droppable.empty()) {
+        Node& node = **slot;
+        if (node.kind() == NodeKind::Project) {
+            const auto& project = node_cast<ProjectNode>(node);
+            std::vector<ColumnRef> kept;
+            for (const auto& col : project.columns()) {
+                if (!droppable.contains(col.name)) {
+                    kept.push_back(col);
+                }
+            }
+            if (!kept.empty() && kept.size() != project.columns().size() &&
+                !node.children().empty()) {
+                auto narrowed = std::make_unique<ProjectNode>(node.id(), std::move(kept));
+                narrowed->add_child(std::move(node.mutable_children().front()));
+                *slot = std::move(narrowed);
+            }
+        } else if (node.kind() == NodeKind::Update) {
+            const auto& update = node_cast<UpdateNode>(node);
+            // A grouped or tuple-assigning update reads more than its field
+            // expressions say; stop rather than reason about it.
+            if (!update.group_by().empty() || !update.tuple_fields().empty()) {
+                return;
+            }
+            for (const auto& field : update.fields()) {
+                droppable.erase(field.alias);
+                if (expr_reads_any(field.expr, droppable)) {
+                    return;
+                }
+            }
+        } else if (node.kind() == NodeKind::Filter) {
+            if (expr_reads_any(node_cast<FilterNode>(node).predicate(), droppable)) {
+                return;
+            }
+        } else {
+            return;
+        }
+        slot = (*slot)->children().empty() ? nullptr : &(*slot)->mutable_children().front();
+    }
+}
+
+/// Rewrite `head_node` (a `Head` or `TopK`) into `Project(Order(Join(head,
+/// scan)))`, with the lifted columns removed from everything below.
 auto apply_lift(NodePtr head_node, const Node& root, const LiftPlan& plan, std::uint64_t& next)
     -> NodePtr {
     const auto is_lifted = [&](const std::string& name) {
@@ -466,6 +603,7 @@ auto apply_lift(NodePtr head_node, const Node& root, const LiftPlan& plan, std::
         auto narrowed =
             std::make_unique<AggregateNode>(agg->id(), agg->group_by(), std::move(kept));
         narrowed->add_child(std::move(agg->mutable_children().front()));
+        prune_lifted_inputs(*narrowed, plan);
 
         // Rebuild the chain bottom-up, dropping lifted columns from projections.
         NodePtr rebuilt = std::move(narrowed);
@@ -530,17 +668,13 @@ auto apply_lift(NodePtr head_node, const Node& root, const LiftPlan& plan, std::
     NodePtr top = std::move(join);
     {
         std::vector<Node*> chain;
-        // Re-read the order keys from the rebuilt chain under the join's left.
+        // Re-read the order keys from the rebuilt top-k under the join's left.
         Node* left = top->mutable_children().front().get();
         aggregate_below(*left->mutable_children().front(), chain);
-        for (const Node* link : chain) {
-            if (link->kind() == NodeKind::Order) {
-                auto order =
-                    std::make_unique<OrderNode>(NodeId{next++}, node_cast<OrderNode>(*link).keys());
-                order->add_child(std::move(top));
-                top = std::move(order);
-                break;
-            }
+        if (auto sort_keys = limit_sort_keys(*left, chain); !sort_keys.empty()) {
+            auto order = std::make_unique<OrderNode>(NodeId{next++}, std::move(sort_keys));
+            order->add_child(std::move(top));
+            top = std::move(order);
         }
     }
 
@@ -558,7 +692,7 @@ auto lift_walk(NodePtr node, const Node& root, const SourceSchemas& sources, std
     for (auto& child : node->mutable_children()) {
         child = lift_walk(std::move(child), root, sources, next);
     }
-    if (node->kind() == NodeKind::Head) {
+    if (is_limit_node(*node)) {
         if (auto plan = plan_lift(*node, root, sources); plan.has_value()) {
             return apply_lift(std::move(node), root, *plan, next);
         }

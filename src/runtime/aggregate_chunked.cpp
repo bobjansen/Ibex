@@ -816,6 +816,54 @@ class GroupKeyStore {
         }
     }
 
+    /// Where a group's key is to be copied from: group `index` of `store`.
+    struct Source {
+        const GroupKeyStore* store = nullptr;
+        std::uint32_t index = 0;
+    };
+
+    /// Groups `first .. first + sources.size()` take the keys of `sources`, in
+    /// order -- the partitioned discovery's new groups, whose keys already sit
+    /// in their partitions' stores. Split so the copy can run a column per
+    /// worker: `prepare_fill` (serial) sizes and types every column, then
+    /// `fill_column(c, ...)` for each column may run concurrently, since each
+    /// touches only its own column.
+    void prepare_fill(std::size_t first, std::span<const Source> sources) {
+        if (size() < first + sources.size()) {
+            resize(first + sources.size());
+        }
+        for (const Source& src : sources) {
+            ensure_columns(src.store->cols_.size());
+        }
+        for (std::size_t c = 0; c < cols_.size(); ++c) {
+            for (const Source& src : sources) {
+                if (c < src.store->cols_.size() && src.store->cols_[c].kind != Kind::Unset) {
+                    cols_[c].claim(src.store->cols_[c].kind, size());
+                    break;
+                }
+            }
+        }
+        for (std::size_t n = 0; n < sources.size(); ++n) {
+            null_masks_[first + n] = sources[n].store->null_masks_[sources[n].index];
+        }
+    }
+
+    void fill_column(std::size_t c, std::size_t first, std::span<const Source> sources) {
+        Col& col = cols_[c];
+        if (col.kind == Kind::Text) {
+            // Size the buffer once: growing it per value re-copied everything
+            // written so far, serially, which was most of this copy's cost.
+            std::size_t bytes = 0;
+            for (const Source& src : sources) {
+                bytes += src.store->cols_[c].text_lengths[src.index];
+            }
+            col.chars.reserve(col.chars.size() + bytes);
+        }
+        for (std::size_t n = 0; n < sources.size(); ++n) {
+            col.copy_from(sources[n].store->cols_[c], sources[n].index, first + n, size());
+        }
+    }
+
     /// Keep only the groups in `keep`, in that order (the filter-over-aggregate
     /// compaction; see `compact_by_index`).
     void compact(std::span<const std::uint32_t> keep) {
@@ -4792,14 +4840,69 @@ class HashAggregateState final {
             return GenericGroupSlot{
                 .hash = group_keys_.hash(gid), .index = gid, .store = &group_keys_};
         };
+        // New groups' keys are copied into `group_keys_` after the call, in
+        // bulk, not one per group inside its numbering loop: that loop is
+        // serial, and at q10's 381k groups the per-group copy was ~60-80 ms of
+        // main-thread time with every worker idle. Each partition's new groups
+        // are the entries past what it held before.
+        const std::size_t groups_before = n_groups_;
+        std::vector<std::size_t> held_before(generic_partitions_.size());
+        for (std::size_t p = 0; p < generic_partitions_.size(); ++p) {
+            held_before[p] = generic_partitions_[p].keys.size();
+        }
         const bool ran = try_discover_partitioned<GenericGroupSlot, GenericKeyHash, GenericKeyEq>(
             key_at, rows, gids, generic_partitions_, [&](std::size_t n) { group_keys_.resize(n); },
-            [&](const GenericGroupSlot&, std::uint32_t gid, std::size_t row) {
-                group_keys_.set_row(gid, group_entries, row);
-            },
-            kPackedPartitionMinRows, key_of_group);
+            [](const GenericGroupSlot&, std::uint32_t, std::size_t) {}, kPackedPartitionMinRows,
+            key_of_group);
+        if (ran) {
+            fill_new_generic_keys(groups_before, held_before);
+        }
         generic_partitioned_ = generic_partitioned_ || ran;
         return ran;
+    }
+
+    /// Copy the groups a partitioned call just numbered, `first ..
+    /// n_groups_`, from their partitions' stores into `group_keys_`. Their
+    /// ids are consecutive, so each key column is written front to back, and
+    /// the columns go to separate workers.
+    void fill_new_generic_keys(std::size_t first, const std::vector<std::size_t>& held_before) {
+        if (n_groups_ <= first) {
+            return;
+        }
+        std::vector<GroupKeyStore::Source> sources(n_groups_ - first);
+        for (std::size_t p = 0; p < generic_partitions_.size(); ++p) {
+            const auto& partition = generic_partitions_[p];
+            const std::size_t from = p < held_before.size() ? held_before[p] : 0;
+            for (std::size_t i = from; i < partition.keys.size(); ++i) {
+                // Groups carried over from the serial loop are added to the
+                // partitions by the same call, under their old ids; their keys
+                // are already in `group_keys_`.
+                if (partition.gids[i] < first) {
+                    continue;
+                }
+                const GenericGroupSlot& slot = partition.keys[i];
+                sources[partition.gids[i] - first] =
+                    GroupKeyStore::Source{.store = slot.store, .index = slot.index};
+            }
+        }
+        const std::span<const GroupKeyStore::Source> view{sources};
+        group_keys_.prepare_fill(first, view);
+        const std::size_t columns = group_keys_.columns();
+        const std::size_t workers = std::min(columns, par_.discovery.worker_cap);
+        if (workers >= 2) {
+            std::atomic<std::size_t> next{0};
+            auto batch = process_worker_pool().submit(workers, [&](std::size_t) {
+                for (std::size_t c = next.fetch_add(1, std::memory_order_relaxed); c < columns;
+                     c = next.fetch_add(1, std::memory_order_relaxed)) {
+                    group_keys_.fill_column(c, first, view);
+                }
+            });
+            batch.wait();
+            return;
+        }
+        for (std::size_t c = 0; c < columns; ++c) {
+            group_keys_.fill_column(c, first, view);
+        }
     }
 
     /// Store non-null First aggregates at the row that creates each new group.

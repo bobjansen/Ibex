@@ -29,7 +29,7 @@ namespace ibex::runtime {
     const std::vector<ir::AggSpec>* aggregations, const ExecutionContext& exec,
     physical::AggregateParallelism parallelism,
     std::optional<physical::AggregateColumnMapping> columns, AggregatePrefilter prefilter = {},
-    std::shared_ptr<ScanWorkerSink> scan_sink = nullptr) -> OperatorPtr;
+    const std::shared_ptr<ScanWorkerSink>& scan_sink = nullptr) -> OperatorPtr;
 
 /// A sink the aggregate can use to accumulate on its input's scan workers.
 /// Offer it (`ScanWorkerSinkOffer`) while building the aggregate's input, and

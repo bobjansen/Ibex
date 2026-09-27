@@ -4,8 +4,8 @@ Status: **proposed, next up** (2026-09-27; performance work is parked behind it,
 see `beat-duckdb-plan.md`). This plan says what "finished" means for the ADBC
 plugin, what exists today, and the order to build the rest in. The design of
 reusable connections already exists as a separate plan
-(`opaque-resource-lifetime-plan.md`, still only on a local branch; see Phase 0)
-and is referenced, not repeated.
+(`opaque-resource-lifetime-plan.md`) and is referenced, not repeated. The work
+happens on the `adbc` branch.
 
 ## What "finished" means
 
@@ -41,8 +41,9 @@ remote query, connection pooling, bulk ingestion tuning, and Decimal256.
 | CI | `.github/workflows/adbc.yml`: Linux (g++) and Windows (MSVC) jobs, SQLite; the Windows job publishes the `ibex-windows-adbc` artifact. |
 | Docs | `docs/io.html` covers SQLite only. SPEC.md does not describe `read_adbc`. `examples/adbc_postgresql/` is a walkthrough with a type matrix. |
 
-**Stranded work.** Two commits exist only on the local `adbc-reliability`
-branch, not on `origin` or `main`:
+**Stranded work, now on the `adbc` branch.** Two commits existed only on the
+local `adbc-reliability` branch, not on `origin` or `main`; they are
+cherry-picked onto `adbc` as `2acc5a22` and `b8ab0f5f`:
 
 - `01189d96` "ADBC postgresql work": a PostgreSQL service in `adbc.yml`, the
   driver installed in CI, and `examples/adbc_postgresql/check.py`, which checks
@@ -59,8 +60,9 @@ unchanged.
 
 ### Phase 0 — land what exists
 
-- Cherry-pick `01189d96` and `06d2875e` onto main; confirm the PostgreSQL CI
-  job passes on GitHub.
+- ~~Cherry-pick `01189d96` and `06d2875e`~~ done on `adbc` (`2acc5a22`,
+  `b8ab0f5f`). Still to do: push `adbc` and confirm the PostgreSQL CI job
+  passes on GitHub (it has never run).
 - Clearer "driver not found" errors, offered in September and never done:
   name the driver, the manifest search path it tried, and the install command.
   ADBC 24 on Windows reads a nonexistent `C:/…` path as `driver:uri` and reports

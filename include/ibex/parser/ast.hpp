@@ -56,12 +56,18 @@ struct Type {
         Series,
         DataFrame,
         TimeFrame,
+        /// An opaque resource a plugin declares with `extern type` (an ADBC
+        /// connection, say): it can be bound, passed and returned, never
+        /// inspected, computed on, or put in a column. `resource` names it.
+        Resource,
     };
 
     Kind kind = Kind::Scalar;
     TypeArg arg = ScalarType::Int64;
     /// Set exactly when `arg` is `ScalarType::Decimal`.
     std::optional<DecimalType> decimal = std::nullopt;
+    /// The declared name when `kind` is `Resource`; empty otherwise.
+    std::string resource = {};
 };
 
 struct Param {
@@ -511,6 +517,16 @@ struct ExternDecl {
     std::size_t end_line = 0;
 };
 
+/// `extern type Name from "plugin.hpp";` — declares an opaque resource type a
+/// plugin provides, so `extern fn` signatures can name it. The name is nominal:
+/// two resource types are never interchangeable.
+struct ExternTypeDecl {
+    std::string name;
+    std::string source_path;
+    std::size_t start_line = 0;
+    std::size_t end_line = 0;
+};
+
 /// `import "name";` — import all extern fn declarations from a library file
 /// (<name>.ibex) found on the import search path.
 struct ImportDecl {
@@ -519,7 +535,8 @@ struct ImportDecl {
     std::size_t end_line = 0;
 };
 
-using Stmt = std::variant<ExternDecl, FunctionDecl, LetStmt, TupleLetStmt, ExprStmt, ImportDecl>;
+using Stmt = std::variant<ExternDecl, FunctionDecl, LetStmt, TupleLetStmt, ExprStmt, ImportDecl,
+                          ExternTypeDecl>;
 
 struct Program {
     std::vector<Stmt> statements;

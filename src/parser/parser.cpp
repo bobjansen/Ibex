@@ -156,7 +156,13 @@ class Parser {
 
     auto parse_extern_decl() -> std::optional<Stmt> {
         const std::size_t start_line = previous().line;
-        if (!consume(TokenKind::KeywordFn, "expected 'fn' after 'extern'")) {
+        // `type` is contextual here, not a keyword: scripts keep using it as
+        // a column or binding name everywhere else.
+        if (check(TokenKind::Identifier) && peek().lexeme == "type") {
+            advance();
+            return parse_extern_type_decl(start_line);
+        }
+        if (!consume(TokenKind::KeywordFn, "expected 'fn' or 'type' after 'extern'")) {
             return std::nullopt;
         }
         auto name = consume_identifier("expected extern function name");
@@ -169,7 +175,7 @@ class Parser {
         std::vector<Param> params;
         if (!check(TokenKind::RParen)) {
             do {
-                auto param = parse_param();
+                auto param = parse_param(/*allow_resource=*/true);
                 if (!param.has_value()) {
                     return std::nullopt;
                 }
@@ -185,7 +191,7 @@ class Parser {
         if (!consume(TokenKind::Arrow, "expected '->' after extern parameter list")) {
             return std::nullopt;
         }
-        auto return_type = parse_type();
+        auto return_type = parse_type(/*allow_resource=*/true);
         if (!return_type.has_value()) {
             return std::nullopt;
         }
@@ -208,6 +214,29 @@ class Parser {
             .params = std::move(params),
             .return_type = std::move(*return_type),
             .effects = std::move(effects),
+            .source_path = std::move(source_path),
+            .start_line = start_line,
+            .end_line = previous().line,
+        };
+    }
+
+    auto parse_extern_type_decl(std::size_t start_line) -> std::optional<Stmt> {
+        auto name = consume_identifier("expected type name after 'extern type'");
+        if (!name.has_value()) {
+            return std::nullopt;
+        }
+        if (!consume(TokenKind::KeywordFrom, "expected 'from' after extern type name")) {
+            return std::nullopt;
+        }
+        if (!consume(TokenKind::StringLiteral, "expected string literal after 'from'")) {
+            return std::nullopt;
+        }
+        std::string source_path = unescape_string(previous().lexeme);
+        if (!consume(TokenKind::Semicolon, "expected ';' after extern type declaration")) {
+            return std::nullopt;
+        }
+        return ExternTypeDecl{
+            .name = std::move(*name),
             .source_path = std::move(source_path),
             .start_line = start_line,
             .end_line = previous().line,
@@ -362,7 +391,7 @@ class Parser {
         return spec;
     }
 
-    auto parse_param() -> std::optional<Param> {
+    auto parse_param(bool allow_resource = false) -> std::optional<Param> {
         Param::Effect effect = Param::Effect::Const;
         if (check(TokenKind::Identifier) && peek_next().kind == TokenKind::Identifier) {
             if (auto parsed = param_effect_from_name(peek().lexeme); parsed.has_value()) {
@@ -378,7 +407,7 @@ class Parser {
         if (!consume(TokenKind::Colon, "expected ':' after parameter name")) {
             return std::nullopt;
         }
-        auto param_type = parse_type();
+        auto param_type = parse_type(allow_resource);
         if (!param_type.has_value()) {
             return std::nullopt;
         }
@@ -2370,7 +2399,10 @@ class Parser {
         return ClauseFields{.fields = std::move(fields), .tuple_fields = {}, .map_fields = {}};
     }
 
-    auto parse_type() -> std::optional<Type> {
+    /// `allow_resource`: a bare identifier names an `extern type` resource.
+    /// Only `extern fn` signatures take one for now; resources in `fn`
+    /// parameters and `let` annotations come with scoped ownership.
+    auto parse_type(bool allow_resource = false) -> std::optional<Type> {
         if (auto scalar = parse_scalar_type()) {
             return Type{
                 .kind = Type::Kind::Scalar, .arg = scalar->type, .decimal = scalar->decimal};
@@ -2419,6 +2451,17 @@ class Parser {
                 return Type{.kind = Type::Kind::TimeFrame, .arg = std::move(*schema)};
             }
             return Type{.kind = Type::Kind::TimeFrame, .arg = SchemaType{}};
+        }
+        if (check(TokenKind::Identifier)) {
+            if (allow_resource) {
+                advance();
+                return Type{.kind = Type::Kind::Resource,
+                            .resource = std::string(previous().lexeme)};
+            }
+            error_ = make_error(peek(), "unknown type '" + std::string(peek().lexeme) +
+                                            "' (a resource type declared with 'extern type' "
+                                            "can appear only in 'extern fn' signatures for now)");
+            return std::nullopt;
         }
         error_ = make_error(peek(), "expected type");
         return std::nullopt;

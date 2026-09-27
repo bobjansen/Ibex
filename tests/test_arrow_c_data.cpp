@@ -835,6 +835,61 @@ TEST_CASE("Arrow C release wrappers handle foreign arrays and schemas", "[intero
     REQUIRE(schema.private_data == nullptr);
 }
 
+namespace {
+
+// Producers that, like the ADBC driver manager's error-reporting stream
+// wrapper, release only while their own release is still installed. The
+// Arrow C Data contract has the CONSUMER call `x->release(x)` and the
+// PRODUCER mark the struct released; a consumer that cleared `release` first
+// made these return without freeing (a real leak under PostgreSQL's driver).
+int guarded_releases = 0;
+
+void guarded_stream_release(ArrowArrayStream* stream) {
+    if (stream->release != &guarded_stream_release) {
+        return;
+    }
+    ++guarded_releases;
+    stream->release = nullptr;
+}
+
+void guarded_array_release(ArrowArray* array) {
+    if (array->release != &guarded_array_release) {
+        return;
+    }
+    ++guarded_releases;
+    array->release = nullptr;
+}
+
+void guarded_schema_release(ArrowSchema* schema) {
+    if (schema->release != &guarded_schema_release) {
+        return;
+    }
+    ++guarded_releases;
+    schema->release = nullptr;
+}
+
+}  // namespace
+
+TEST_CASE("Arrow C release wrappers call a producer's release with it still installed",
+          "[interop][arrow]") {
+    guarded_releases = 0;
+    ArrowArrayStream stream{};
+    stream.release = guarded_stream_release;
+    ArrowArray array{};
+    array.release = guarded_array_release;
+    ArrowSchema schema{};
+    schema.release = guarded_schema_release;
+
+    ibex::interop::release_arrow_stream(&stream);
+    ibex::interop::release_arrow_array(&array);
+    ibex::interop::release_arrow_schema(&schema);
+
+    CHECK(guarded_releases == 3);
+    CHECK(stream.release == nullptr);
+    CHECK(array.release == nullptr);
+    CHECK(schema.release == nullptr);
+}
+
 // ── Timestamp resolutions ───────────────────────────────────────────────────
 //
 // Arrow timestamps come in four resolutions and may carry an IANA zone, so the

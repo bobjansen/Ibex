@@ -1,6 +1,8 @@
 # Opaque resources: scope, lifetime, and ADBC connections
 
-Status: proposal, 2026-09-16. No language/runtime changes implemented here.
+Status: slice 1 implemented on the `adbc` branch (2026-09-27): resources at
+the top level of a script, end to end with ADBC. See "Slice 1 as built" below;
+functions, returns from user functions, and compile support are still to do.
 
 ## Decision proposed
 
@@ -238,6 +240,45 @@ counts, plus Docker PostgreSQL for real behavior:
 - lease and Arrow-buffer lifetimes survive dropping the original binding;
 - cleanup failure does not replace a query error; plugins unload after cleanup;
 - repeated helper calls returning ordinary values keep live connection count bounded.
+
+## Slice 1 as built (2026-09-27)
+
+Commits on `adbc`: `6d6c2db4` parser, `8c1be262` runtime, `e7d0bedf` REPL,
+`16cc5c38` ADBC adapter, then SPEC/docs/example and the compile rejection.
+
+- **Syntax.** `extern type Name from "x.hpp";` (`type` is contextual). A resource
+  type may appear only in `extern fn` parameter and return types; a user `fn`
+  cannot take or return one yet.
+- **Runtime.** `ibex::runtime::Resource` (virtual `type_name()`, cleanup in the
+  destructor) behind `ResourcePtr = shared_ptr<Resource>`. `ExternValue` gained
+  a `ResourcePtr` alternative. `ExternArgs` is now a class deriving from
+  `vector<ScalarValue>` that keeps resource arguments by position (the scalar
+  slot is null), so scalar-only plugins compiled unchanged; a resource-taking
+  extern reads `args.resource_as<T>(i)`. `register_resource` registers a
+  resource-returning function (`ExternReturnKind::Resource`).
+- **REPL.** A `ResourceRegistry` that only `execute_statements` and the session
+  hold, instead of threading a registry through every evaluator. Resource calls
+  run on the statement coordinator: a direct call is the statement; a call in a
+  table operand or call argument is evaluated first, in source order, and bound
+  as a materialized temporary (restored after the statement, like
+  `InlineSourceRewrites`). Placement is validated before any call runs, with the
+  same traversal as the hoisting, so a misplaced call makes zero plugin calls.
+  Function bodies are checked when called; the whole-script planner declines
+  scripts that call resource functions; `ibex_compile` rejects them.
+- **ADBC.** `AdbcSession` is the `AdbcConnection` resource (database +
+  connection, closed/busy flags); the query operator holds a lease. Close marks
+  closed at once and releases now or when the lease ends. Driver-module
+  retention: the pinned driver manager never unloads a driver
+  (`ManagedLibrary::Release` is a no-op), so zero-copy buffers stay valid.
+
+Acceptance status: fake-resource tests (`tests/test_repl_resources.cpp`) cover
+aliases, rebinding, failed rebinding, session end, type checks, zero-call
+rejection in clauses/expressions/function bodies, and the script path; SQLite
+tests cover session state across statements, isolation from one-off reads, and
+idempotent close. Not yet: Docker PostgreSQL checks, busy-guard test through the
+language (unreachable while statements are sequential), cleanup-failure
+reporting through a diagnostic sink (cleanup errors in destructors are dropped),
+cancellation.
 
 No pooling, transactions API, parameter binding, general closure capture,
 resource-valued columns, new standalone block syntax, or lazy SQL replay in this

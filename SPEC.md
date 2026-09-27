@@ -452,7 +452,7 @@ Date(x)
 
 **Float → Int casts** succeed only when the value is already a whole number
 (i.e. `trunc(x) == x`). Passing a value with a fractional part — e.g.
-`Int64(3.9)` — is a runtime error. Use `round(x, mode)` (Section 11.6) to
+`Int64(3.9)` — is a runtime error. Use `round(x, mode)` (Section 12.6) to
 convert to the nearest integer before casting.
 
 **Int → Float casts** always succeed (subject to precision loss for very large
@@ -3472,7 +3472,8 @@ Extern function parameters may be any scalar type (`Int`, `Int64`, `Float64`,
 supported in the current runtime.
 
 Return types may be scalar or table types (`DataFrame`, `TimeFrame`). Extern
-functions cannot return `Series`. A scalar return may be null; the caller
+functions cannot return `Series`. Parameters and return types may also name a
+resource type declared with `extern type` (Section 11.5). A scalar return may be null; the caller
 receives a null scalar and the rules of Section 6.7 apply. An extern never
 receives a null argument — a null reaching a non-nullable parameter is rejected
 before the call (Section 6.7).
@@ -3514,7 +3515,68 @@ extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry);
 Use `scripts/ibex-plugin-build.sh` to compile a plugin `.cpp` with the correct
 flags and include paths for the current build tree.
 
-### 11.4 Restrictions
+### 11.5 Resource Types
+
+A plugin can provide an opaque resource, such as a database connection, as a
+nominal type:
+
+```
+extern type <Name> from <header_path> ;
+```
+
+```
+extern type AdbcConnection from "adbc.hpp";
+extern fn adbc_connect(driver: String, uri: String, options: String = "")
+    -> AdbcConnection from "adbc.hpp";
+extern fn adbc_query(mutable db: AdbcConnection, sql: String) -> DataFrame
+    from "adbc.hpp";
+extern fn adbc_close(mutable db: AdbcConnection) -> Int from "adbc.hpp";
+
+let db = adbc_connect("sqlite", ":memory:");
+adbc_query(db, "create table t as select 1 as x");
+let t = adbc_query(db, "select x from t");
+adbc_close(db);
+```
+
+`type` is contextual: it is a keyword only directly after `extern`, and stays
+usable as a name elsewhere. The plugin that implements a resource type is
+loaded like the one behind an `extern fn`. Two resource types are never
+interchangeable, and a resource is not a scalar or a table: Ibex code cannot
+inspect it, compare it, or store it in a column.
+
+A resource type may appear only in `extern fn` parameter and return types. A
+resource-typed parameter takes a resource binding, or a call that returns a
+resource of that type; the type is checked before the call.
+
+**Binding.** `let db = <call returning a resource>;` binds a resource;
+`let other = db;` makes an alias of the same resource. A `let` binding takes no
+type annotation. Rebinding the name to another value drops that binding.
+
+**Where a resource function can be called.** A function that takes or returns
+a resource is called only:
+
+- as a statement's value (`let t = adbc_query(db, "...");`, `adbc_close(db);`),
+- as a table operand, such as the base of a block or a side of a join
+  (`adbc_query(db, "...")[filter x > 1]`),
+- as an argument of another call.
+
+It cannot be called inside a query clause (`filter`, `select`, `update`, ...),
+inside a larger expression (`adbc_close(db) + 1`), or in a function body. These
+are rejected before any resource function in the statement runs.
+
+**Order and materialization.** Resource functions run one statement at a time,
+in source order, before the rest of the statement. A resource call in a table
+operand produces a complete, materialized table, which the query then reads;
+the query does not stream from the resource. A script that calls a resource
+function runs statement by statement instead of through the whole-script
+planner.
+
+**Lifetime.** A resource lives while any binding holds it. It is released when
+its last binding is rebound or erased, or when the session or script ends. A
+plugin's close function, such as `adbc_close`, closes it earlier for every
+alias.
+
+### 11.6 Restrictions
 
 | Restriction                           | Rationale                         |
 |---------------------------------------|-----------------------------------|
@@ -4563,6 +4625,7 @@ usable as identifiers elsewhere):
 where   (the `map ... where` compile-time expansion filter, and the
          `where <predicate> update { ... }` row guard — Section 5.3)
 map  get  in
+type    (only directly after `extern`: `extern type` — Section 11.5)
 ```
 
 ---
@@ -4575,7 +4638,8 @@ For implementors. The core parsing loop:
 parse_statement:
     "let"    → let_stmt
     "fn"     → fn_decl
-    "extern" → extern_decl
+    "extern" → peek "type" → extern_type_decl
+             → otherwise → extern_decl
     "import" → import_decl
     IDENT    → peek "=" (not "==") → assign_stmt
              → otherwise → expr_stmt

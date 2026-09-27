@@ -1,0 +1,32 @@
+// A reusable ADBC connection: one login, and session state (here a table in
+// an in-memory SQLite database) that lasts across queries.
+//
+// Install the driver once:  scripts/install_adbc_driver.sh sqlite
+// Run:                      ./build/tools/ibex --plugin-path build/tools examples/adbc_connection.ibex
+//
+// `import "adbc"` declares, among others:
+//   extern type AdbcConnection from "adbc.hpp";
+//   extern fn adbc_connect(driver: String, uri: String, options: String = "")
+//       -> AdbcConnection from "adbc.hpp";
+// A resource type such as AdbcConnection can be bound with `let` and passed to
+// the functions that take it, but not stored in a column or inspected.
+
+import "adbc";
+
+let db = adbc_connect("sqlite", ":memory:");
+
+// Each call runs on the same connection, so the table made here is still
+// there for the queries below. read_adbc would open a fresh database each time.
+adbc_query(db, "create table trades (symbol text, qty integer, px real)");
+adbc_query(db, "insert into trades values ('AAPL', 10, 150.0), ('MSFT', 5, 300.0), ('AAPL', 20, 151.0)");
+
+// A query result is an ordinary table operand.
+adbc_query(db, "select symbol, qty, px from trades")[
+    select { qty = sum(qty), notional = sum(qty * px) },
+    by symbol,
+    order symbol
+];
+
+// Closing is explicit and idempotent: 1 the first time, 0 after. A query on a
+// closed connection is an error.
+adbc_close(db);

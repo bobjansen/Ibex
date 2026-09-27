@@ -51,6 +51,13 @@
             Multiple clauses chain in reading order.
           </p>
           <p>
+            <code>extern type</code> declares an opaque resource a plugin
+            provides, such as the <code>AdbcConnection</code> behind
+            <code>adbc_connect</code>. A resource is bound with
+            <code>let</code> and passed to the functions that take it; it
+            cannot be inspected or stored in a column.
+          </p>
+          <p>
             Output plugins mirror the input API: <code>write_csv</code>,
             <code>write_json</code>, and <code>write_parquet</code> accept a
             DataFrame and a path and return the number of rows written.

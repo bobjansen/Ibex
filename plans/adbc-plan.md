@@ -134,6 +134,12 @@ correctly on both drivers, and a many-row batch runs as one prepared statement.
 
 ### Phase 4 — reusable connections
 
+**Slice 1 done** on `adbc` (2026-09-27): `extern type`, `adbc_connect` /
+`adbc_query` / `adbc_close` at the top level of a script, with fake-resource and
+SQLite tests; details in `opaque-resource-lifetime-plan.md` ("Slice 1 as built").
+Still to do: resources in user functions, the Docker PostgreSQL acceptance
+checks, and the connection forms below.
+
 Build `opaque-resource-lifetime-plan.md`: a typed opaque `AdbcConnection`,
 `adbc_connect` / `adbc_query` / `adbc_close`, deterministic scope and
 ownership rules, rejection of resource use inside query expressions, and one

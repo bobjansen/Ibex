@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -234,6 +235,64 @@ TEST_CASE("Column<string> clear resets state", "[core][column][string]") {
 
     REQUIRE(col.empty());
     REQUIRE(col.size() == 0);
+}
+
+TEST_CASE("Column<string> append copies another column's rows in one block",
+          "[core][column][string]") {
+    // The concat of a chunked string column (MaterializeOperator and friends)
+    // goes through here. The destination's offsets must continue from its own
+    // bytes, and the source's must be rebased from wherever they start.
+    const auto rows = [](const ibex::Column<std::string>& col) {
+        std::vector<std::string> out;
+        for (std::size_t i = 0; i < col.size(); ++i) {
+            out.emplace_back(col[i]);
+        }
+        return out;
+    };
+
+    SECTION("owned onto owned, with empty strings on both sides") {
+        ibex::Column<std::string> dst{"alpha", "", "gamma"};
+        const ibex::Column<std::string> src{"", "delta", "epsilon-past-the-small-string-buffer"};
+        dst.append(src);
+        REQUIRE(rows(dst) == std::vector<std::string>{"alpha", "", "gamma", "", "delta",
+                                                      "epsilon-past-the-small-string-buffer"});
+    }
+
+    SECTION("onto an empty column, and an empty source") {
+        ibex::Column<std::string> dst;
+        dst.append(ibex::Column<std::string>{});
+        REQUIRE(dst.empty());
+        dst.append(ibex::Column<std::string>{"x", "yz"});
+        REQUIRE(rows(dst) == std::vector<std::string>{"x", "yz"});
+    }
+
+    SECTION("an external source whose offsets do not start at zero") {
+        // Rows 1..2 of an Arrow-style buffer "aa" "bbb" "c" "dddd": offsets
+        // 0,2,5,6,10, so the viewed rows' bytes start at 2.
+        static const std::array<std::uint32_t, 5> offsets{0, 2, 5, 6, 10};
+        static const std::string chars = "aabbbcdddd";
+        const auto src = ibex::Column<std::string>::from_external(
+            std::make_shared<int>(0), offsets.data(), chars.data(), 1, 2);
+        ibex::Column<std::string> dst{"z"};
+        dst.append(src);
+        REQUIRE(rows(dst) == std::vector<std::string>{"z", "bbb", "c"});
+    }
+
+    SECTION("an external destination detaches first") {
+        static const std::array<std::uint32_t, 3> offsets{0, 3, 5};
+        static const std::string chars = "abcde";
+        auto dst = ibex::Column<std::string>::from_external(std::make_shared<int>(0),
+                                                            offsets.data(), chars.data(), 1, 1);
+        dst.append(ibex::Column<std::string>{"fg"});
+        REQUIRE_FALSE(dst.is_external());
+        REQUIRE(rows(dst) == std::vector<std::string>{"de", "fg"});
+    }
+
+    SECTION("a column appended to itself") {
+        ibex::Column<std::string> col{"ab", "c"};
+        col.append(col);
+        REQUIRE(rows(col) == std::vector<std::string>{"ab", "c", "ab", "c"});
+    }
 }
 
 TEST_CASE("Column<string> resize fills with value", "[core][column][string]") {

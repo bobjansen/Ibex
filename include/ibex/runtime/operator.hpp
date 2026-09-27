@@ -235,12 +235,13 @@ inline void append_column_values(ColumnValue& dst_value, const ColumnValue& src_
                 // `MaterializeOperator`, and the scan's own dictionary unifier).
                 const auto& codes = src.codes();
                 dst.append_codes(codes.begin(), codes.end());
-            } else if constexpr (std::is_same_v<Col, Column<std::string>> ||
-                                 std::is_same_v<Col, Column<bool>>) {
-                // Neither is a flat array of values, so neither can be copied in
-                // one go: a string's destination offset depends on every
-                // preceding row's length, and a bool packs many rows per word.
-                dst.reserve(dst.size() + src.size());
+            } else if constexpr (std::is_same_v<Col, Column<std::string>>) {
+                // One block of bytes, and the offsets shifted by a constant.
+                dst.append(src);
+            } else if constexpr (std::is_same_v<Col, Column<bool>>) {
+                // Packed many rows per word, so not a flat copy. No exact
+                // reserve first: that is the quadratic trap described above,
+                // and push_back already grows geometrically.
                 for (std::size_t r = 0; r < src.size(); ++r) {
                     dst.push_back(src[r]);
                 }

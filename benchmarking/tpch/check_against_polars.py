@@ -21,6 +21,15 @@ compares them row by row, in order. `run_bench.sh` calls it before timing
 anything, because a timing comparison between two different answers means
 nothing.
 
+Rows are compared in order, except among TIES. Each query's ORDER BY keys and
+LIMIT are listed below (`ORDERING`, as the upstream Polars queries state them).
+Consecutive rows whose keys are equal within the numeric tolerance below are a
+tie group, and the order inside a tie group is unspecified: q11 sorts only by
+`value desc`, and at SF-10 two parts share a value, which the two engines emit
+in different orders. Within a group the rows must match as a set. A group cut
+by the LIMIT may legitimately hold different rows (which of the tied rows make
+the cut is unspecified too), so there only the keys must match.
+
 Columns are aligned by name when both sides have the same set in a different
 order (q10). Otherwise they are compared by position, since the two
 implementations name a few columns differently (q18). Either case is reported
@@ -64,6 +73,30 @@ EPOCH = datetime.date(1970, 1, 1)
 ABS_TOL = 0.01
 REL_TOL = 1e-9
 MAX_REPORTED = 5
+
+# ORDER BY keys and LIMIT of each upstream Polars query, by query number. The
+# names are Polars' (q18 sorts by its `o_orderdat`). Queries not listed return
+# one row, or none are sorted (q06, q14, q17, q19).
+ORDERING: dict[int, tuple[list[str], int | None]] = {
+    1: (["l_returnflag", "l_linestatus"], None),
+    2: (["s_acctbal", "n_name", "s_name", "p_partkey"], 100),
+    3: (["revenue", "o_orderdate"], 10),
+    4: (["o_orderpriority"], None),
+    5: (["revenue"], None),
+    7: (["supp_nation", "cust_nation", "l_year"], None),
+    8: (["o_year"], None),
+    9: (["nation", "o_year"], None),
+    10: (["revenue"], 20),
+    11: (["value"], None),
+    12: (["l_shipmode"], None),
+    13: (["custdist", "c_count"], None),
+    15: (["s_suppkey"], None),
+    16: (["supplier_cnt", "p_brand", "p_type", "p_size"], None),
+    18: (["o_totalprice", "o_orderdat"], 100),
+    20: (["s_name"], None),
+    21: (["numwait", "s_name"], 100),
+    22: (["cntrycode"], None),
+}
 
 
 def run_ibex(stem: str) -> list[list[str]] | str:
@@ -114,6 +147,30 @@ def cells_match(ibex: str, polars: object) -> bool:
     return ibex.rstrip() == str(polars).rstrip()
 
 
+def values_match(a: object, b: object) -> bool:
+    """Two Polars values equal under the same tolerance `cells_match` applies."""
+    return cells_match("" if a is None else str(normalize(a)), b)
+
+
+def tie_groups(rows: list[list[object]], keys: list[int]) -> list[tuple[int, int]]:
+    """[start, end) runs of consecutive rows whose sort keys are equal."""
+    groups = []
+    start = 0
+    for i in range(1, len(rows) + 1):
+        same = i < len(rows) and all(
+            values_match(rows[i][k], rows[start][k]) for k in keys)
+        if not same:
+            groups.append((start, i))
+            start = i
+    return groups
+
+
+def rows_match(got: list[str], want: list[object],
+               columns: list[int] | None = None) -> bool:
+    indices = columns if columns is not None else range(len(want))
+    return all(cells_match(got[j], want[j]) for j in indices)
+
+
 def compare(stem: str, ibex: list[list[str]], polars: list[list[object]]) -> tuple[list[str], list[str]]:
     """Return (errors, notes)."""
     errors: list[str] = []
@@ -123,23 +180,66 @@ def compare(stem: str, ibex: list[list[str]], polars: list[list[object]]) -> tup
     if len(ibex_header) != len(polars_header):
         return [f"column count: ibex {len(ibex_header)} {ibex_header}, "
                 f"polars {len(polars_header)} {polars_header}"], notes
+    polars_names = list(polars_header)
     if ibex_header != list(polars_header) and sorted(ibex_header) == sorted(polars_header):
         # Same columns, different order (q10): align Polars to Ibex's order.
         order = [list(polars_header).index(name) for name in ibex_header]
         polars_rows = [[row[k] for k in order] for row in polars_rows]
+        polars_names = list(ibex_header)
         notes.append("column order differs (aligned by name)")
     elif ibex_header != list(polars_header):
         renamed = [f"{a}~{b}" for a, b in zip(ibex_header, polars_header) if a != b]
         notes.append("column names differ (compared by position): " + ", ".join(renamed))
     if len(ibex_rows) != len(polars_rows):
         return [f"row count: ibex {len(ibex_rows)}, polars {len(polars_rows)}"], notes
-    for i, (got, want) in enumerate(zip(ibex_rows, polars_rows)):
-        for j, (g, w) in enumerate(zip(got, want)):
+
+    def report_row(i: int) -> None:
+        for j, (g, w) in enumerate(zip(ibex_rows[i], polars_rows[i])):
             if not cells_match(g, w):
                 errors.append(f"row {i} column {ibex_header[j]!r}: ibex {g!r}, polars {normalize(w)!r}")
-                if len(errors) >= MAX_REPORTED:
-                    return errors, notes
-    return errors, notes
+
+    key_names, limit = ORDERING.get(int(stem[1:]), ([], None))
+    missing = [name for name in key_names if name not in polars_names]
+    if missing:
+        return [f"sort key {missing} not in polars columns {polars_names}"], notes
+    keys = [polars_names.index(name) for name in key_names]
+    if keys:
+        groups = tie_groups(polars_rows, keys)
+    else:
+        groups = [(i, i + 1) for i in range(len(polars_rows))]
+    reordered = 0
+    for start, end in groups:
+        if all(rows_match(ibex_rows[i], polars_rows[i]) for i in range(start, end)):
+            continue
+        if end - start == 1:
+            report_row(start)
+        elif limit is not None and end == len(polars_rows) == limit:
+            # The LIMIT cut this tie group: any of the tied rows may make it.
+            bad = [i for i in range(start, end)
+                   if not rows_match(ibex_rows[i], polars_rows[start], keys)]
+            if bad:
+                report_row(bad[0])
+            else:
+                notes.append(f"rows {start}-{end - 1} tie at the LIMIT; "
+                             "compared by sort key only")
+        else:
+            unused = list(range(start, end))
+            for i in range(start, end):
+                match = next((k for k in unused
+                              if rows_match(ibex_rows[i], polars_rows[k])), None)
+                if match is None:
+                    errors.append(
+                        f"row {i} (tied on {key_names} with rows {start}-{end - 1}): "
+                        f"ibex {ibex_rows[i]} matches no polars row in the tie")
+                    break
+                unused.remove(match)
+            else:
+                reordered += end - start
+        if len(errors) >= MAX_REPORTED:
+            return errors[:MAX_REPORTED], notes
+    if reordered:
+        notes.append(f"{reordered} tied rows in a different order (compared as sets)")
+    return errors[:MAX_REPORTED], notes
 
 
 def main() -> int:

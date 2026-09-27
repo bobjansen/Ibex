@@ -16891,3 +16891,48 @@ TEST_CASE("Date and Timestamp first/last/min/max grouped and global", "[runtime]
         }
     }
 }
+
+namespace {
+
+struct FakeResource final : ibex::runtime::Resource {
+    explicit FakeResource(int* live) : live_(live) { ++*live_; }
+    FakeResource(const FakeResource&) = delete;
+    FakeResource(FakeResource&&) = delete;
+    auto operator=(const FakeResource&) -> FakeResource& = delete;
+    auto operator=(FakeResource&&) -> FakeResource& = delete;
+    ~FakeResource() override { --*live_; }
+    [[nodiscard]] auto type_name() const noexcept -> std::string_view override {
+        return "FakeResource";
+    }
+    int* live_;
+};
+
+struct OtherResource final : ibex::runtime::Resource {
+    [[nodiscard]] auto type_name() const noexcept -> std::string_view override {
+        return "OtherResource";
+    }
+};
+
+}  // namespace
+
+TEST_CASE("ExternArgs carries resources by position", "[runtime][resource]") {
+    int live = 0;
+    {
+        ibex::runtime::ExternArgs args{std::string("before")};
+        args.push_resource(std::make_shared<FakeResource>(&live));
+        args.push_back(std::int64_t{7});
+        REQUIRE(live == 1);
+        REQUIRE(args.size() == 3);
+        REQUIRE(args.resource(0) == nullptr);
+        REQUIRE(args.resource(2) == nullptr);
+        REQUIRE(args.resource(1) != nullptr);
+        REQUIRE(args.resource(1)->type_name() == "FakeResource");
+        REQUIRE(std::holds_alternative<std::monostate>(args[1]));
+        REQUIRE(args.resource_as<FakeResource>(1) != nullptr);
+        REQUIRE(args.resource_as<OtherResource>(1) == nullptr);
+
+        const ibex::runtime::ExternArgs copy = args;
+        REQUIRE(copy.resource(1) == args.resource(1));
+    }
+    REQUIRE(live == 0);
+}

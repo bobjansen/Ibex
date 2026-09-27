@@ -1676,7 +1676,7 @@ auto interpret(const ir::Node& node, const TableRegistry& registry, const Scalar
 }
 
 auto invoke_table_consumer(const ExternRegistry& externs, const std::string& callee,
-                           const Table& input, const std::vector<ScalarValue>& args)
+                           const Table& input, const ExternArgs& args)
     -> std::expected<void, std::string> {
     const auto* function = externs.find(callee);
     if (function == nullptr) {

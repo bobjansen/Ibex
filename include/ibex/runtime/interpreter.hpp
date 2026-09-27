@@ -1015,6 +1015,7 @@ using ModelRegistry = robin_hood::unordered_map<std::string, ModelResult>;
 /// Plugins provide data/functions to the host query; they do not initiate
 /// nested query execution.
 class ExternRegistry;
+class ExternArgs;
 
 /// Interpret `node` under an ExecutionContext built from the environment
 /// (`IBEX_PARALLEL`, `IBEX_MORSEL_ROWS`, `IBEX_PARALLEL_STATS`) on top of the
@@ -1037,7 +1038,7 @@ class ExternRegistry;
 /// any, is intentionally discarded: this API is the execution seam for
 /// top-level script effects such as write_csv and write_parquet.
 [[nodiscard]] auto invoke_table_consumer(const ExternRegistry& externs, const std::string& callee,
-                                         const Table& input, const std::vector<ScalarValue>& args)
+                                         const Table& input, const ExternArgs& args)
     -> std::expected<void, std::string>;
 
 /// Evaluate row-local filter conjuncts and return the surviving row indices in

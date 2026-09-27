@@ -560,10 +560,20 @@ struct KeyRowIndex {
     template <typename MakeGroup>
     auto find_or_insert(const std::vector<Key>& groups, const std::vector<KeyCol>& cols,
                         std::size_t row, const MakeGroup& make_group) -> std::uint32_t {
+        return find_or_insert_hashed(
+            hash_key_row(cols, row),
+            [&](std::uint32_t gid) { return key_equals_row(groups[gid], cols, row); }, make_group);
+    }
+
+    /// The same probe for a caller that stores its group keys some other way:
+    /// `hash` is the row's `hash_key_row`, and `equals_group(gid)` says whether
+    /// that group's stored key is the row's.
+    template <typename EqualsGroup, typename MakeGroup>
+    auto find_or_insert_hashed(std::uint64_t hash, const EqualsGroup& equals_group,
+                               const MakeGroup& make_group) -> std::uint32_t {
         if (slots.empty()) {
             rehash(1024);
         }
-        const std::uint64_t hash = hash_key_row(cols, row);
         const std::size_t mask = slots.size() - 1;
         std::size_t probe = static_cast<std::size_t>(hash) & mask;
         while (true) {
@@ -578,7 +588,7 @@ struct KeyRowIndex {
                 return gid;
             }
             const std::uint32_t gid = slot - 1;
-            if (hashes[gid] == hash && key_equals_row(groups[gid], cols, row)) {
+            if (hashes[gid] == hash && equals_group(gid)) {
                 return gid;
             }
             probe = (probe + 1) & mask;

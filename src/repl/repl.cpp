@@ -5041,8 +5041,7 @@ class ResourceCalls {
                 return mismatch("'" + ident->name + "'", "not a resource binding");
             }
             if (it->second->type_name() != expected_type) {
-                return mismatch("'" + ident->name + "'",
-                                "a " + std::string(it->second->type_name()));
+                return mismatch("'" + ident->name + "'", std::string(it->second->type_name()));
             }
             return it->second;
         }
@@ -5058,12 +5057,12 @@ class ResourceCalls {
             auto resource = std::get<runtime::ResourcePtr>(std::move(*value));
             if (resource->type_name() != expected_type) {
                 return mismatch(resource_call->callee + "(...)",
-                                "a " + std::string(resource->type_name()));
+                                std::string(resource->type_name()));
             }
             return resource;
         }
-        return std::unexpected(callee + ": argument '" + param.name + "' expects a " +
-                               expected_type + " binding");
+        return std::unexpected(callee + ": argument '" + param.name +
+                               "' expects a binding of type " + expected_type);
     }
 
     ResourceRegistry& resources_;

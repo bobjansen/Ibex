@@ -521,3 +521,77 @@ TEST_CASE("read_adbc resolves a bare driver name through a manifest", "[adbc]") 
         CHECK(contains(direct.error(), "ADBC_DRIVER_PATH"));
     }
 }
+
+TEST_CASE("adbc_connect keeps one connection across queries", "[adbc][connection]") {
+    AdbcSession s;
+    SqliteDb db;
+    seed_trades(s, db);
+    const auto connect = s.session.execute("let db = adbc_connect(" + ibex_str(sqlite_driver()) +
+                                           ", " + ibex_str(db.path()) + ");");
+    INFO(connect.error);
+    REQUIRE(connect.ok);
+
+    // A temporary table exists only on the connection that made it.
+    const auto temp = s.session.execute(
+        "adbc_query(db, \"create temp table big as select id from trades where qty > 6\");");
+    INFO(temp.error);
+    REQUIRE(temp.ok);
+    const auto reused = s.session.execute("adbc_query(db, \"select id from big order by id\");");
+    INFO(reused.error);
+    REQUIRE(reused.ok);
+    REQUIRE(reused.table.has_value());
+    CHECK(ints(*reused.table, "id") == std::vector<std::int64_t>{1, 3, 5});
+
+    const auto one_off = s.session.execute(read_call(db, "select id from big") + ";");
+    REQUIRE_FALSE(one_off.ok);
+    CHECK(contains(one_off.error, "no such table"));
+
+    // A query result is an ordinary table operand.
+    const auto grouped = s.session.execute(
+        "adbc_query(db, \"select symbol, qty from trades where symbol is not null\")"
+        "[select { total = sum(qty) }, by symbol, order symbol];");
+    INFO(grouped.error);
+    REQUIRE(grouped.ok);
+    REQUIRE(grouped.table.has_value());
+    CHECK(grouped.table->rows() == 2);
+}
+
+TEST_CASE("adbc_close closes every alias once", "[adbc][connection]") {
+    AdbcSession s;
+    SqliteDb db;
+    seed_trades(s, db);
+    REQUIRE(s.session
+                .execute("let db = adbc_connect(" + ibex_str(sqlite_driver()) + ", " +
+                         ibex_str(db.path()) + ");\nlet alias = db;")
+                .ok);
+
+    const auto first = s.session.execute("adbc_close(alias);");
+    REQUIRE(first.ok);
+    REQUIRE(first.scalar.has_value());
+    CHECK(std::get<std::int64_t>(*first.scalar) == 1);
+    const auto second = s.session.execute("adbc_close(db);");
+    REQUIRE(second.ok);
+    CHECK(std::get<std::int64_t>(*second.scalar) == 0);
+
+    const auto after = s.session.execute("adbc_query(db, \"select 1 as x\");");
+    REQUIRE_FALSE(after.ok);
+    CHECK(contains(after.error, "adbc_query: connection is closed"));
+}
+
+TEST_CASE("adbc_connect reports failures and misuse", "[adbc][connection]") {
+    AdbcSession s;
+    SqliteDb db;
+
+    const auto missing = s.session.execute("let db = adbc_connect(\"ibex_no_such_driver\", \"\");");
+    REQUIRE_FALSE(missing.ok);
+    CHECK(contains(missing.error, "adbc_connect: ADBC driver `ibex_no_such_driver` not found"));
+
+    const auto bad_option = s.session.execute("let db = adbc_connect(" + ibex_str(sqlite_driver()) +
+                                              ", " + ibex_str(db.path()) + ", \"conn.nope=1\");");
+    REQUIRE_FALSE(bad_option.ok);
+    CHECK(contains(bad_option.error, "adbc_connect: AdbcConnectionInit failed"));
+
+    const auto not_a_connection = s.session.execute("adbc_query(\"x\", \"select 1\");");
+    REQUIRE_FALSE(not_a_connection.ok);
+    CHECK(contains(not_a_connection.error, "expects a binding of type AdbcConnection"));
+}

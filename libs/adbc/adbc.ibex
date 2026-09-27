@@ -1,21 +1,43 @@
-// ADBC plugin — standard extern fn declarations.
+// ADBC plugin — standard extern declarations.
 //
 // Usage:
 //   import "adbc";
 //
-// After importing, the following function is available without any
-// explicit `extern fn` declaration in the script:
+// After importing, these are available without any explicit declaration:
+//
 //   read_adbc(driver: String, uri: String, sql: String, options: String = "") -> DataFrame
+//     Opens a connection, runs one query, closes the connection.
+//
+//   adbc_connect(driver: String, uri: String, options: String = "") -> AdbcConnection
+//   adbc_query(db: AdbcConnection, sql: String) -> DataFrame
+//   adbc_close(db: AdbcConnection) -> Int
+//     A reusable connection: one login, and session state (temporary tables,
+//     settings) that lasts across queries. adbc_close returns 1 when it closed
+//     the connection and 0 when it was already closed; a query on a closed
+//     connection is an error. A connection also closes when its last binding
+//     goes away. Bind the connection with `let` at the top level of a script:
+//     connection functions cannot be called inside a function or a query
+//     clause yet.
 //
 // The optional `options` string is a `;` or newline separated list of
 // `key=value` entries. Prefix keys with `db.`, `conn.`, or `stmt.` to
 // target database, connection, or statement options; `conn.post.` sets a
-// connection option after the connection is initialized. Use
+// connection option after the connection is initialized. On adbc_connect,
+// `stmt.` options apply to every query on the connection. Use
 // `entrypoint=...` to override the driver entrypoint symbol. A backslash
 // escapes `;`, `=` and `\` inside keys and values.
 //
-// A single declaration with a default: extern declarations are keyed by name,
-// so a second overload would replace the first rather than add to it.
+// Declarations with defaults: extern declarations are keyed by name, so a
+// second overload would replace the first rather than add to it.
 
 extern fn read_adbc(driver: String, uri: String, sql: String, options: String = "")
     -> DataFrame from "adbc.hpp";
+
+extern type AdbcConnection from "adbc.hpp";
+
+extern fn adbc_connect(driver: String, uri: String, options: String = "")
+    -> AdbcConnection from "adbc.hpp";
+
+extern fn adbc_query(mutable db: AdbcConnection, sql: String) -> DataFrame from "adbc.hpp";
+
+extern fn adbc_close(mutable db: AdbcConnection) -> Int from "adbc.hpp";

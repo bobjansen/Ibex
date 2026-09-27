@@ -110,8 +110,8 @@ auto eval_extern_table_expr(const ir::Expr& expr, const Table& input, std::size_
     if (auto* table = std::get_if<Table>(&*result)) {
         return std::move(*table);
     }
-    return std::unexpected("extern function returned a scalar where a table was required: " +
-                           call->callee);
+    return std::unexpected(
+        "extern function returned a non-table value where a table was required: " + call->callee);
 }
 
 }  // namespace
@@ -160,6 +160,9 @@ auto eval_extern_expr(const ir::CallExpr& call, const Table& input, std::size_t 
     }
     if (auto* scalar = std::get_if<ScalarValue>(&*result)) {
         return expr_from_scalar(*scalar);
+    }
+    if (std::holds_alternative<ResourcePtr>(*result)) {
+        return std::unexpected("a resource cannot be used in a query expression: " + call.callee);
     }
     return std::unexpected("extern function returned table in expression: " + call.callee);
 }

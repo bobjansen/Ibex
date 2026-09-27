@@ -29,6 +29,7 @@
 #include <optional>
 #include <robin_hood.h>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -84,12 +85,68 @@ struct RngBridge {
 /// An empty Table (rows == 0) still signals end-of-stream (EOF).
 struct StreamTimeout {};
 
+/// An opaque, plugin-owned resource such as a database connection, declared in
+/// Ibex with `extern type Name from "plugin.hpp";`. Ibex code can bind a
+/// resource, pass it to extern functions and return it from them, but never
+/// looks inside. The plugin that creates a resource is the only code that
+/// casts it back to its concrete type (`ExternArgs::resource_as`), so the
+/// dynamic_cast never crosses a shared-library boundary. Cleanup runs in the
+/// destructor when the last reference drops; it must not throw.
+class Resource {
+   public:
+    Resource() = default;
+    Resource(const Resource&) = delete;
+    Resource(Resource&&) = delete;
+    auto operator=(const Resource&) -> Resource& = delete;
+    auto operator=(Resource&&) -> Resource& = delete;
+    virtual ~Resource() = default;
+
+    /// The name the resource's `extern type` declaration gives it. The REPL
+    /// checks it against the extern signature before every call.
+    [[nodiscard]] virtual auto type_name() const noexcept -> std::string_view = 0;
+};
+
+using ResourcePtr = std::shared_ptr<Resource>;
+
 /// Type-erased external function wrapper.
 ///
 /// Stores C++ callables for interop with Ibex queries.
 /// Functions are registered by name and can be looked up at runtime.
-using ExternValue = std::variant<Table, ScalarValue, StreamTimeout>;
-using ExternArgs = std::vector<ScalarValue>;
+using ExternValue = std::variant<Table, ScalarValue, StreamTimeout, ResourcePtr>;
+
+/// Arguments to an extern function, by position. Scalar arguments are the
+/// vector's elements. A resource argument occupies a null scalar slot and is
+/// read with `resource(i)` or `resource_as<T>(i)`.
+class ExternArgs : public std::vector<ScalarValue> {
+   public:
+    using std::vector<ScalarValue>::vector;
+
+    void push_resource(ResourcePtr value) {
+        resources_.emplace_back(size(), std::move(value));
+        push_back(ScalarValue{});
+    }
+
+    /// The resource at position `index`, or null when that argument is a scalar.
+    [[nodiscard]] auto resource(std::size_t index) const -> const ResourcePtr& {
+        static const ResourcePtr kNone;
+        for (const auto& [position, value] : resources_) {
+            if (position == index) {
+                return value;
+            }
+        }
+        return kNone;
+    }
+
+    /// The resource at position `index` as the plugin's concrete type, or null
+    /// when the argument is not a resource of that type.
+    template <typename T>
+    [[nodiscard]] auto resource_as(std::size_t index) const -> std::shared_ptr<T> {
+        return std::dynamic_pointer_cast<T>(resource(index));
+    }
+
+   private:
+    std::vector<std::pair<std::size_t, ResourcePtr>> resources_;
+};
 using ExternFn = std::function<std::expected<ExternValue, std::string>(const ExternArgs&)>;
 
 /// Function signature for extern functions whose first argument is a DataFrame.

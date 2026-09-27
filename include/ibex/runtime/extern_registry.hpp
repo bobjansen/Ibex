@@ -169,6 +169,7 @@ using ExternLazyTableFn =
 enum class ExternReturnKind : std::uint8_t {
     Scalar,
     Table,
+    Resource,  ///< returns a ResourcePtr; callable only on the statement path
 };
 
 /// A fitted model produced by a model plugin. `native` is an opaque,
@@ -252,6 +253,19 @@ class ExternRegistry {
                                                                    .lazy_table_func = {},
                                                                    .kind = ExternReturnKind::Table,
                                                                    .scalar_kind = std::nullopt});
+    }
+
+    /// Register an extern function that returns a resource (e.g. opens a
+    /// connection). Functions that only take a resource register as usual
+    /// with `register_scalar` or `register_table`.
+    void register_resource(std::string name, ExternFn func) {
+        registry_.insert_or_assign(std::move(name),
+                                   ExternFunction{.func = std::move(func),
+                                                  .table_consumer_func = {},
+                                                  .chunked_table_func = {},
+                                                  .lazy_table_func = {},
+                                                  .kind = ExternReturnKind::Resource,
+                                                  .scalar_kind = std::nullopt});
     }
 
     /// Register a chunked table source. The callback produces an operator

@@ -8,10 +8,12 @@
 #include <ibex/parser/ast.hpp>
 
 #include <expected>
+#include <functional>
 #include <optional>
 #include <robin_hood.h>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ibex::parser {
@@ -91,6 +93,14 @@ struct LowerContext {
 
 /// Lower a parsed Program into an IR node tree.
 /// Returns the IR for the last expression statement.
+using CallPredicate = std::function<bool(std::string_view)>;
+
+/// True when any call anywhere in `expr`, including inside clauses and
+/// nested blocks, has a callee that `matches`.
+[[nodiscard]] auto contains_call_if(const Expr& expr, const CallPredicate& matches) -> bool;
+[[nodiscard]] auto clause_contains_call_if(const Clause& clause, const CallPredicate& matches)
+    -> bool;
+
 [[nodiscard]] auto lower(const Program& program) -> LowerResult;
 
 /// Lower a complete script while preserving table-consuming extern calls as

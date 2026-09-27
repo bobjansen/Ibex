@@ -364,14 +364,22 @@ TEST_CASE("semi pushdown: key in the right side descends there", "[ir][join_push
     REQUIRE(scan_name(*right.children()[1]) == "c");
 }
 
-TEST_CASE("anti pushdown works the same as semi", "[ir][join_pushdown][semi]") {
+TEST_CASE("an anti join stays above the inner join", "[ir][join_pushdown][semi]") {
+    // A semi join keeps only matches, and is pushed below an inner join
+    // because it tends to be selective (q18 keeps 57 orders of millions). An
+    // anti join removes matches, and usually removes almost nothing: pushing
+    // q16's four-supplier exclusion below `part join partsupp` ran it on all
+    // 6.4M partsupp rows instead of the 948k the join keeps, and lost
+    // partsupp's key-filtered scan (+56%). So it is left where it was written.
     auto out =
         ir::push_semi_joins_down(semi_over_join_tree(ir::JoinKind::Anti, "ax"), test_sources());
     REQUIRE(out->kind() == ir::NodeKind::Join);
-    const auto& left = *out->children()[0];
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    REQUIRE(static_cast<const ir::JoinNode&>(left).kind() == ir::JoinKind::Anti);
-    REQUIRE(scan_name(*left.children()[0]) == "a");
+    REQUIRE(static_cast<const ir::JoinNode&>(*out).kind() == ir::JoinKind::Anti);
+    const auto& left = *out->children()[0];
+    REQUIRE(left.kind() == ir::NodeKind::Join);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    CHECK(static_cast<const ir::JoinNode&>(left).kind() == ir::JoinKind::Inner);
 }
 
 TEST_CASE("semi pushdown: key on both sides pushes left", "[ir][join_pushdown][semi]") {

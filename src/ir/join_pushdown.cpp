@@ -281,19 +281,26 @@ auto walk(NodePtr node, const SourceSchemas& sources) -> NodePtr {
 ///
 ///   (X ⋈ Y) ⋉ Z on k   with k ⊆ X   →   (X ⋉ Z on k) ⋈ Y
 ///
-/// A semi/anti join only tests whether the key exists in Z and adds no columns,
+/// A semi join only tests whether the key exists in Z and adds no columns,
 /// and it depends only on X's key values, which an inner join leaves untouched —
 /// so filtering X first yields the identical pair set. The win is that the inner
 /// join then materialises far fewer rows: PDS-H q18 joins all 6M line items and
 /// keeps 57 orders, versus filtering to 57 orders and joining a few hundred.
+///
+/// Semi only. An anti join would be pushed just as soundly, but the win rests
+/// on the pushed filter being selective, and an anti join -- which removes
+/// matches -- usually removes almost nothing. PDS-H q16's anti join drops four
+/// complaint suppliers; pushed below `part join partsupp` it ran on all 6.4M
+/// partsupp rows instead of the 948k that join keeps, and cost partsupp its
+/// key-filtered scan: +56% once the plan was canonicalized (which is what
+/// exposed the shape). With no cardinality here, the kind is the signal.
 auto rewrite_semi_over_join(NodePtr node, const SourceSchemas& sources) -> NodePtr {
     auto& outer = node_cast<JoinNode>(*node);
     // Same-named keys: the push moves the semi join onto X or Y, and the key
     // names it carries have to mean the same column there. Mapped keys that
     // could be folded already were, by `normalize_mapped_join_keys`; one still
     // here could not be (see `rewrite_filter_over_join` for the list of why).
-    if ((outer.kind() != JoinKind::Semi && outer.kind() != JoinKind::Anti) ||
-        outer.predicate().has_value() || outer.keys().empty() ||
+    if (outer.kind() != JoinKind::Semi || outer.predicate().has_value() || outer.keys().empty() ||
         !join_keys_are_folded(outer.keys())) {
         return node;
     }

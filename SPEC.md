@@ -2687,13 +2687,13 @@ The following built-in functions are **aggregate functions**. They consume a
 |-----------------------|--------------------|------------|-------|
 | `sum(col)`            | `Series<Numeric>`  | Same numeric type | Returns null for an all-null group. |
 | `mean(col)`           | `Series<Numeric>`  | `Float64`  | |
-| `min(col)`            | `Series<T>`        | `T`        | `T` is numeric or `String` (including categorical). Strings compare byte-wise, i.e. by UTF-8 code point, so `"Z" < "a"`. |
+| `min(col)`            | `Series<T>`        | `T`        | `T` is numeric, `Date`, `Timestamp` or `String` (including categorical). Strings compare byte-wise, i.e. by UTF-8 code point, so `"Z" < "a"`; dates and timestamps chronologically. |
 | `max(col)`            | `Series<T>`        | `T`        | As `min`. |
 | `count()`             | (none)             | `Int64`    | Counts rows in the group, nulls included. |
 | `count(col)`          | `Series<T>`        | `Int64`    | Counts the **non-null** values of `col`; `0` (not null) for a group with none. The argument must be a column name. |
 | `count_distinct(col)` | `Series<T>`        | `Int64`    | Counts the number of **distinct non-null** values of `col` in the group; `0` (not null) for a group with none. `T` may be any scalar type. |
-| `first(col)`          | `Series<T>`        | `T`        | |
-| `last(col)`           | `Series<T>`        | `T`        | |
+| `first(col)`          | `Series<T>`        | `T`        | Any of `min`'s types, and `Bool`. |
+| `last(col)`           | `Series<T>`        | `T`        | As `first`. |
 | `median(col)`         | `Series<Numeric>`  | `Float64`  | Middle value; null rows are ignored. Even-length groups return the average of the two middle values. |
 | `std(col)`            | `Series<Numeric>`  | `Float64`  | Sample standard deviation (denominator n − 1). Returns null for groups with fewer than 2 non-null values. |
 | `ewma(col, alpha)`    | `Series<Numeric>`  | `Float64`  | Exponentially weighted moving average. `alpha` ∈ (0, 1] is a numeric literal; rows are processed in storage order within each group. Returns null if the group is empty. |

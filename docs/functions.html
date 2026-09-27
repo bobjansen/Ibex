@@ -115,7 +115,7 @@
           <tbody>
             <tr><td><code>sum(col)</code></td><td>Sum of non-null values.</td></tr>
             <tr><td><code>mean(col)</code></td><td>Arithmetic mean of non-null values.</td></tr>
-            <tr><td><code>min(col)</code></td><td>Minimum non-null value.</td></tr>
+            <tr><td><code>min(col)</code></td><td>Minimum non-null value (numbers, text, dates and timestamps).</td></tr>
             <tr><td><code>max(col)</code></td><td>Maximum non-null value.</td></tr>
             <tr><td><code>count()</code></td><td>Row count for the current group/window, nulls included.</td></tr>
             <tr><td><code>count(col)</code></td><td>Count of the <strong>non-null</strong> values of <code>col</code> — <code>0</code>, not null, for a group with none. The difference from <code>count()</code> matters after a left join, where an unmatched row is still a row.</td></tr>

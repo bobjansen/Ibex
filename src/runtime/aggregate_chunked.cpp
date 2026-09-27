@@ -511,6 +511,440 @@ class DenseAggregateScanSink final : public ScanWorkerSink {
     EmittedWorkerPartial current_;
 };
 
+/// The generic group-by's keys, stored column by column.
+///
+/// The generic path used to keep one boxed `Key` per group -- a vector of
+/// variants, and a separate heap string for every text value past the small
+/// string buffer. At PDS-H q10's shape (seven key columns, four of them wide
+/// strings, 381k groups at SF-10) that is about four allocations per group,
+/// and the query paid for them three times: building them during discovery,
+/// copying them into partitions, and freeing them one by one at teardown,
+/// which alone took ~190 ms on the main thread.
+///
+/// Here each key column is one typed vector, and text lives in one character
+/// buffer addressed by offset and length, so a group costs no allocation of
+/// its own and the whole store frees in a handful of calls.
+///
+/// It is a drop-in for the boxed keys, value for value: a group holds exactly
+/// what `push_key_value` would have put in its `Key` (the payload under a null
+/// too, whatever the column held there), `hash` agrees with `hash_key_value`
+/// and so with `hash_key_row`, and `equals_row` with `key_equals_row` -- the
+/// invariants the probe, the fast-path migrations and the partitioned
+/// discovery all rest on. A group can be written out of order (`resize`, then
+/// `set_*`), which is how partitioned discovery hands out ids.
+class GroupKeyStore {
+   public:
+    [[nodiscard]] auto size() const noexcept -> std::size_t { return null_masks_.size(); }
+    [[nodiscard]] auto columns() const noexcept -> std::size_t { return cols_.size(); }
+
+    void reserve(std::size_t n) { null_masks_.reserve(n); }
+
+    /// Groups beyond the old size exist but hold nothing until written.
+    void resize(std::size_t n) {
+        null_masks_.resize(n, 0);
+        for (auto& col : cols_) {
+            col.resize(n);
+        }
+    }
+
+    void push_row(const std::vector<const ColumnEntry*>& entries, std::size_t row) {
+        resize(size() + 1);
+        set_row(size() - 1, entries, row);
+    }
+
+    /// Group `gid`'s key is the row's, as `push_key_value` reads it.
+    void set_row(std::size_t gid, const std::vector<const ColumnEntry*>& entries, std::size_t row) {
+        ensure_columns(entries.size());
+        std::uint64_t mask = 0;
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            const ColumnEntry& entry = *entries[i];
+            if (i < kMaxKeyColumns && runtime::is_null(entry, row)) {
+                mask |= std::uint64_t{1} << i;
+            }
+            Col& col = cols_[i];
+            std::visit(
+                [&](const auto& column) {
+                    using C = std::decay_t<decltype(column)>;
+                    if constexpr (std::is_same_v<C, Column<std::int64_t>>) {
+                        col.put_int(Kind::Int64, gid, column[row], size());
+                    } else if constexpr (std::is_same_v<C, Column<double>>) {
+                        col.put_double(gid, column[row], size());
+                    } else if constexpr (std::is_same_v<C, Column<bool>>) {
+                        col.put_int(Kind::Bool, gid, column[row] ? 1 : 0, size());
+                    } else if constexpr (std::is_same_v<C, Column<std::string>> ||
+                                         std::is_same_v<C, Column<Categorical>>) {
+                        col.put_text(gid, std::string_view{column[row]}, size());
+                    } else if constexpr (std::is_same_v<C, Column<Date>>) {
+                        col.put_int(Kind::Date, gid, column[row].days, size());
+                    } else if constexpr (std::is_same_v<C, Column<Timestamp>>) {
+                        col.put_int(Kind::Ts, gid, column[row].nanos, size());
+                    } else if constexpr (std::is_same_v<C, Column<Decimal>>) {
+                        col.put_decimal(gid, column[row].units, decimal_type_of(column), size());
+                    } else {
+                        invariant_violation("group key store: unsupported key column type");
+                    }
+                },
+                *entry.column);
+        }
+        null_masks_[gid] = mask;
+    }
+
+    void push_key(const Key& key) {
+        resize(size() + 1);
+        set_key(size() - 1, key);
+    }
+
+    /// Group `gid`'s key is `key` (a fast path's migrated group, say).
+    void set_key(std::size_t gid, const Key& key) {
+        ensure_columns(key.values.size());
+        for (std::size_t i = 0; i < key.values.size(); ++i) {
+            Col& col = cols_[i];
+            std::visit(
+                [&](const auto& value) {
+                    using V = std::decay_t<decltype(value)>;
+                    if constexpr (std::is_same_v<V, std::int64_t>) {
+                        col.put_int(Kind::Int64, gid, value, size());
+                    } else if constexpr (std::is_same_v<V, double>) {
+                        col.put_double(gid, value, size());
+                    } else if constexpr (std::is_same_v<V, bool>) {
+                        col.put_int(Kind::Bool, gid, value ? 1 : 0, size());
+                    } else if constexpr (std::is_same_v<V, std::string>) {
+                        col.put_text(gid, value, size());
+                    } else if constexpr (std::is_same_v<V, Date>) {
+                        col.put_int(Kind::Date, gid, value.days, size());
+                    } else if constexpr (std::is_same_v<V, Timestamp>) {
+                        col.put_int(Kind::Ts, gid, value.nanos, size());
+                    } else if constexpr (std::is_same_v<V, DecimalValue>) {
+                        col.put_decimal(gid, value.units, value.type, size());
+                    } else {
+                        invariant_violation("group key store: a key value has no type");
+                    }
+                },
+                key.values[i]);
+        }
+        null_masks_[gid] = key.null_mask;
+    }
+
+    [[nodiscard]] auto null_mask(std::size_t gid) const noexcept -> std::uint64_t {
+        return null_masks_[gid];
+    }
+
+    /// `hash_key_value` of the group's key, without building it.
+    [[nodiscard]] auto hash(std::size_t gid) const -> std::uint64_t {
+        std::uint64_t seed = 0;
+        const auto mix = [&seed](std::uint64_t value) { key_hash_mix(seed, value); };
+        for (std::size_t i = 0; i < cols_.size(); ++i) {
+            if (is_null(gid, i)) {
+                mix(0xd1b54a32d192ed03ULL + i);
+                continue;
+            }
+            const Col& col = cols_[i];
+            switch (col.kind) {
+                case Kind::Int64:
+                case Kind::Ts:
+                    mix(std::hash<std::int64_t>{}(col.ints[gid]));
+                    break;
+                case Kind::Date:
+                    mix(std::hash<std::int32_t>{}(static_cast<std::int32_t>(col.ints[gid])));
+                    break;
+                case Kind::Bool:
+                    mix(std::hash<bool>{}(col.ints[gid] != 0));
+                    break;
+                case Kind::Double:
+                    mix(std::hash<double>{}(col.doubles[gid]));
+                    break;
+                case Kind::Text:
+                    mix(std::hash<std::string_view>{}(col.text(gid)));
+                    break;
+                case Kind::Dec:
+                    mix(decimal::hash_units(col.units[gid]));
+                    break;
+                case Kind::Unset:
+                    invariant_violation("group key store: hashing a group never written");
+            }
+        }
+        return key_hash_finalize(seed);
+    }
+
+    /// `key_equals_row` against the group's key: null matches only null, and
+    /// doubles compare with `==` (NaN never matches; -0.0 finds 0.0).
+    [[nodiscard]] auto equals_row(std::size_t gid, const std::vector<KeyCol>& cols,
+                                  std::size_t row) const -> bool {
+        for (std::size_t i = 0; i < cols.size(); ++i) {
+            const KeyCol& key_col = cols[i];
+            const bool row_null = key_col.is_null(row);
+            if (row_null != is_null(gid, i)) {
+                return false;
+            }
+            if (row_null) {
+                continue;
+            }
+            const Col& col = cols_[i];
+            switch (key_col.kind) {
+                case KeyCol::Kind::Int64:
+                    if (col.ints[gid] != key_col.i64[row]) {
+                        return false;
+                    }
+                    break;
+                case KeyCol::Kind::Double:
+                    if (!(col.doubles[gid] == key_col.f64[row])) {
+                        return false;
+                    }
+                    break;
+                case KeyCol::Kind::Bool:
+                    if ((col.ints[gid] != 0) != (*key_col.boolean)[row]) {
+                        return false;
+                    }
+                    break;
+                case KeyCol::Kind::Date:
+                    if (col.ints[gid] != key_col.date[row].days) {
+                        return false;
+                    }
+                    break;
+                case KeyCol::Kind::Ts:
+                    if (col.ints[gid] != key_col.ts[row].nanos) {
+                        return false;
+                    }
+                    break;
+                case KeyCol::Kind::Dec:
+                    if (col.units[gid] != key_col.dec[row].units) {
+                        return false;
+                    }
+                    break;
+                case KeyCol::Kind::Str:
+                case KeyCol::Kind::Cat:
+                    if (col.text(gid) != key_col.text(row)) {
+                        return false;
+                    }
+                    break;
+            }
+        }
+        return true;
+    }
+
+    /// `KeyEq` between a group here and one in `other` (a decimal compares its
+    /// type too, as `DecimalValue` equality does).
+    [[nodiscard]] auto equals(std::size_t gid, const GroupKeyStore& other,
+                              std::size_t other_gid) const -> bool {
+        if (null_masks_[gid] != other.null_masks_[other_gid] ||
+            cols_.size() != other.cols_.size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < cols_.size(); ++i) {
+            if (is_null(gid, i)) {
+                continue;
+            }
+            const Col& a = cols_[i];
+            const Col& b = other.cols_[i];
+            if (a.kind != b.kind) {
+                return false;
+            }
+            switch (a.kind) {
+                case Kind::Int64:
+                case Kind::Ts:
+                case Kind::Date:
+                case Kind::Bool:
+                    if (a.ints[gid] != b.ints[other_gid]) {
+                        return false;
+                    }
+                    break;
+                case Kind::Double:
+                    if (!(a.doubles[gid] == b.doubles[other_gid])) {
+                        return false;
+                    }
+                    break;
+                case Kind::Text:
+                    if (a.text(gid) != b.text(other_gid)) {
+                        return false;
+                    }
+                    break;
+                case Kind::Dec:
+                    if (a.units[gid] != b.units[other_gid] ||
+                        a.decimal_types[gid] != b.decimal_types[other_gid]) {
+                        return false;
+                    }
+                    break;
+                case Kind::Unset:
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    /// Append key column `ci` of group `gid` to `out`, as `append_scalar` of
+    /// the boxed value would -- text straight from the buffer, with no string
+    /// built on the way.
+    void append_to(ColumnValue& out, std::size_t ci, std::size_t gid) const {
+        const Col& col = cols_[ci];
+        switch (col.kind) {
+            case Kind::Text:
+                std::visit(
+                    [&](auto& column) {
+                        using C = std::decay_t<decltype(column)>;
+                        if constexpr (std::is_same_v<C, Column<std::string>> ||
+                                      std::is_same_v<C, Column<Categorical>>) {
+                            column.push_back(col.text(gid));
+                        } else {
+                            invariant_violation(
+                                "group key store: a text key into a non-text "
+                                "output column");
+                        }
+                    },
+                    out);
+                return;
+            case Kind::Int64:
+                append_scalar(out, ScalarValue{col.ints[gid]});
+                return;
+            case Kind::Double:
+                append_scalar(out, ScalarValue{col.doubles[gid]});
+                return;
+            case Kind::Bool:
+                append_scalar(out, ScalarValue{col.ints[gid] != 0});
+                return;
+            case Kind::Date:
+                append_scalar(out, ScalarValue{Date{static_cast<std::int32_t>(col.ints[gid])}});
+                return;
+            case Kind::Ts:
+                append_scalar(out, ScalarValue{Timestamp{col.ints[gid]}});
+                return;
+            case Kind::Dec:
+                append_scalar(out, ScalarValue{DecimalValue{.units = col.units[gid],
+                                                            .type = col.decimal_types[gid]}});
+                return;
+            case Kind::Unset:
+                invariant_violation("group key store: emitting a group never written");
+        }
+    }
+
+    /// Keep only the groups in `keep`, in that order (the filter-over-aggregate
+    /// compaction; see `compact_by_index`).
+    void compact(std::span<const std::uint32_t> keep) {
+        GroupKeyStore out;
+        out.cols_.resize(cols_.size());
+        out.resize(keep.size());
+        for (std::size_t n = 0; n < keep.size(); ++n) {
+            const std::size_t gid = keep[n];
+            out.null_masks_[n] = null_masks_[gid];
+            for (std::size_t i = 0; i < cols_.size(); ++i) {
+                out.cols_[i].copy_from(cols_[i], gid, n, keep.size());
+            }
+        }
+        *this = std::move(out);
+    }
+
+   private:
+    enum class Kind : std::uint8_t { Unset, Int64, Double, Bool, Text, Date, Ts, Dec };
+
+    /// One key column. `ints` holds Int64, Bool, Date (days) and Timestamp
+    /// (nanos); text is `chars[text_offsets[g] .. + text_lengths[g]]`.
+    struct Col {
+        Kind kind = Kind::Unset;
+        std::vector<std::int64_t> ints;
+        std::vector<double> doubles;
+        std::vector<std::uint64_t> text_offsets;
+        std::vector<std::uint32_t> text_lengths;
+        std::vector<char> chars;
+        std::vector<Int128> units;
+        std::vector<DecimalType> decimal_types;
+
+        [[nodiscard]] auto text(std::size_t gid) const -> std::string_view {
+            return {chars.data() + text_offsets[gid], text_lengths[gid]};
+        }
+
+        void resize(std::size_t n) {
+            switch (kind) {
+                case Kind::Int64:
+                case Kind::Bool:
+                case Kind::Date:
+                case Kind::Ts:
+                    ints.resize(n);
+                    break;
+                case Kind::Double:
+                    doubles.resize(n);
+                    break;
+                case Kind::Text:
+                    text_offsets.resize(n);
+                    text_lengths.resize(n);
+                    break;
+                case Kind::Dec:
+                    units.resize(n);
+                    decimal_types.resize(n);
+                    break;
+                case Kind::Unset:
+                    break;
+            }
+        }
+
+        /// A column takes its type from its first value; every later one must
+        /// match, as every chunk of one key column has one type.
+        void claim(Kind wanted, std::size_t groups) {
+            if (kind == wanted) {
+                return;
+            }
+            if (kind != Kind::Unset) {
+                invariant_violation("group key store: a key column changed type");
+            }
+            kind = wanted;
+            resize(groups);
+        }
+
+        void put_int(Kind wanted, std::size_t gid, std::int64_t value, std::size_t groups) {
+            claim(wanted, groups);
+            ints[gid] = value;
+        }
+        void put_double(std::size_t gid, double value, std::size_t groups) {
+            claim(Kind::Double, groups);
+            doubles[gid] = value;
+        }
+        void put_text(std::size_t gid, std::string_view value, std::size_t groups) {
+            claim(Kind::Text, groups);
+            text_offsets[gid] = chars.size();
+            text_lengths[gid] = static_cast<std::uint32_t>(value.size());
+            chars.insert(chars.end(), value.begin(), value.end());
+        }
+        void put_decimal(std::size_t gid, Int128 value, DecimalType type, std::size_t groups) {
+            claim(Kind::Dec, groups);
+            units[gid] = value;
+            decimal_types[gid] = type;
+        }
+
+        void copy_from(const Col& src, std::size_t from, std::size_t to, std::size_t groups) {
+            switch (src.kind) {
+                case Kind::Int64:
+                case Kind::Bool:
+                case Kind::Date:
+                case Kind::Ts:
+                    put_int(src.kind, to, src.ints[from], groups);
+                    break;
+                case Kind::Double:
+                    put_double(to, src.doubles[from], groups);
+                    break;
+                case Kind::Text:
+                    put_text(to, src.text(from), groups);
+                    break;
+                case Kind::Dec:
+                    put_decimal(to, src.units[from], src.decimal_types[from], groups);
+                    break;
+                case Kind::Unset:
+                    break;
+            }
+        }
+    };
+
+    [[nodiscard]] auto is_null(std::size_t gid, std::size_t column) const noexcept -> bool {
+        return column < kMaxKeyColumns && (null_masks_[gid] & (std::uint64_t{1} << column)) != 0;
+    }
+
+    void ensure_columns(std::size_t n) {
+        if (cols_.size() < n) {
+            cols_.resize(n);
+        }
+    }
+
+    std::vector<Col> cols_;
+    std::vector<std::uint64_t> null_masks_;
+};
+
 class HashAggregateState final {
    public:
     /// `Cat` carries a Categorical's *code*, which the pair path may treat as
@@ -801,8 +1235,7 @@ class HashAggregateState final {
             compact_by_index(pair_order_.data(), keep);
             pair_order_.resize(keep.size());
         } else {
-            compact_by_index(group_order_.data(), keep);
-            group_order_.resize(keep.size());
+            group_keys_.compact(keep);
         }
         n_groups_ = keep.size();
         prefiltered_ = true;
@@ -1139,7 +1572,7 @@ class HashAggregateState final {
         // `KeyRowIndex` can be reseeded from -- `int_order_`/`str_order_`
         // directly, `cat_order_`/`multi_cat_codes_flat_` via the dictionary
         // `group_templates_` still holds, `pair_order_` via both, and the
-        // packed path's `group_order_` is already boxed `Key`s (see
+        // packed path's `group_keys_` is already written from the row (see
         // `migrate_packed_fast_path_to_generic`). Migrating only rebuilds the
         // key->gid lookup; the accumulated `flat_slots_`/`scratch_` those gids
         // already own are untouched, and this chunk then runs the generic path
@@ -3070,6 +3503,52 @@ class HashAggregateState final {
     /// position: its key is built from a ROW and is not invertible.
     struct NoGroupKeys {};
 
+    /// How many partitions `try_discover_partitioned` splits rows into: a
+    /// power of two, so a partition is `hash & (count - 1)`, capped by the
+    /// Discovery node's workers.
+    [[nodiscard]] auto discovery_partition_count() const -> std::size_t {
+        std::size_t part_count = 1;
+        while (part_count * 2 <= par_.discovery.worker_cap) {
+            part_count *= 2;
+        }
+        return part_count;
+    }
+
+    /// Whether `try_discover_partitioned` would run for a chunk of `rows`, so a
+    /// caller with per-row preparation of its own (the generic path hashes
+    /// every row first) can skip it when the answer is no.
+    [[nodiscard]] auto may_discover_partitioned(std::size_t rows, std::size_t min_rows,
+                                                bool can_seed) const -> bool {
+        // The Discovery node's worker cap and fan-out permission come from
+        // the plan (src/runtime/PARALLELISM.md); the operator keeps only the two
+        // checks it alone can make -- is it nested, did this operator's input so
+        // far clear the floor. `decline != None` folds in `!exec_->can_fan_out()`
+        // (the plan resolves `SingleCore` from it). `min_rows` is still the
+        // operator's: it is the radix strategy's own admission gate, stricter
+        // than `try_owned`'s, and lives beside the constant it names.
+        if (exec_ == nullptr || on_worker_pool_thread()) {
+            return false;
+        }
+        if (par_.discovery.decline != physical::FanOutDecline::None ||
+            par_.discovery.worker_cap < 2) {
+            return false;
+        }
+        if (!partitioned_active_) {
+            if (std::max(rows_offered_, rows) < min_rows) {
+                return false;
+            }
+            // Starting part-way through means groups already exist, and they
+            // live in the serial index this path neither reads nor writes.
+            // They have to be moved across (below) or they would be issued
+            // second ids; a caller that cannot hand back their keys cannot
+            // start late at all.
+            if (n_groups_ > 0 && !can_seed) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     template <typename Key, typename Hash, typename Eq = std::equal_to<Key>, typename KeyAt,
               typename ResizeKeys, typename StoreKey, typename KeyOfGroup = NoGroupKeys>
     auto try_discover_partitioned(const KeyAt& key_at, std::size_t rows, std::uint32_t* gids,
@@ -3105,39 +3584,12 @@ class HashAggregateState final {
         // lowering it is a measured dead end, because the break-even is set by
         // group CARDINALITY and a low-cardinality run of this size loses.
         constexpr bool can_seed = !std::is_same_v<KeyOfGroup, NoGroupKeys>;
-        // The Discovery node's worker cap and fan-out permission come from
-        // the plan (src/runtime/PARALLELISM.md); the operator keeps only the two
-        // checks it alone can make -- is it nested, did this operator's input so
-        // far clear the floor. `decline != None` folds in `!exec_->can_fan_out()`
-        // (the plan resolves `SingleCore` from it). `min_rows` is still the
-        // operator's: it is the radix strategy's own admission gate, stricter
-        // than `try_owned`'s, and lives beside the constant it names.
-        if (exec_ == nullptr || on_worker_pool_thread()) {
+        if (!may_discover_partitioned(rows, min_rows, can_seed)) {
             return false;
-        }
-        if (par_.discovery.decline != physical::FanOutDecline::None ||
-            par_.discovery.worker_cap < 2) {
-            return false;
-        }
-        if (!partitioned_active_) {
-            if (std::max(rows_offered_, rows) < min_rows) {
-                return false;
-            }
-            // Starting part-way through means groups already exist, and they
-            // live in the serial index this path neither reads nor writes.
-            // They have to be moved across (below) or they would be issued
-            // second ids; a caller that cannot hand back their keys cannot
-            // start late at all.
-            if (n_groups_ > 0 && !can_seed) {
-                return false;
-            }
         }
         auto& pool = process_worker_pool();
         const std::size_t workers = par_.discovery.worker_cap;
-        std::size_t part_count = 1;
-        while (part_count * 2 <= workers) {
-            part_count *= 2;  // a power of two, so the partition is a mask
-        }
+        const std::size_t part_count = discovery_partition_count();
         note_partition_fanout();
         const std::uint64_t part_mask = part_count - 1;
         if (partitions.size() < part_count) {
@@ -3244,10 +3696,15 @@ class HashAggregateState final {
                         std::uint32_t local{};
                         if (it == partition.index.end()) {
                             local = static_cast<std::uint32_t>(partition.gids.size());
-                            partition.index.emplace(Key(key), local);
+                            // The kept key is copied from the one just
+                            // inserted rather than built from the probe a
+                            // second time: for a key that owns a heap
+                            // allocation (the generic path's), that is one
+                            // build per group instead of two.
+                            const auto inserted = partition.index.emplace(Key(key), local).first;
                             partition.gids.push_back(0);  // filled below, in order
                             partition.first_rows.push_back(row_base + row);
-                            partition.keys.emplace_back(key);
+                            partition.keys.emplace_back(inserted->first);
                         } else {
                             local = it->second;
                         }
@@ -3403,7 +3860,7 @@ class HashAggregateState final {
         return gid;
     }
 
-    /// Seed `group_order_`/`key_index_` (the generic path's state) with `n`
+    /// Seed `group_keys_`/`key_index_` (the generic path's state) with `n`
     /// groups a fast path already discovered, in the same first-seen order
     /// the fast path used -- so gid `i` here matches the gid `flat_slots_`/
     /// `scratch_` already hold data for at index `i`. `key_at` builds the
@@ -3420,12 +3877,12 @@ class HashAggregateState final {
     /// up.
     template <typename KeyAt>
     void seed_generic_index_from_keys(std::size_t n, const KeyAt& key_at) {
-        group_order_.reserve(group_order_.size() + n);
+        group_keys_.reserve(group_keys_.size() + n);
         key_index_.hashes.reserve(key_index_.hashes.size() + n);
         for (std::size_t i = 0; i < n; ++i) {
-            Key key = key_at(i);
+            const Key key = key_at(i);
             key_index_.hashes.push_back(hash_key_value(key));
-            group_order_.push_back(std::move(key));
+            group_keys_.push_key(key);
         }
         std::size_t capacity = 1024;
         while (capacity * 7 < key_index_.hashes.size() * 10) {
@@ -3535,17 +3992,17 @@ class HashAggregateState final {
     /// Fold the packed (3+ key) fast path into the generic grouping path.
     ///
     /// Unlike every other fast path here, this one needs no decode at all:
-    /// `process_rows_packed` already builds a full boxed `Key` per group into
-    /// `group_order_` from the ROW (see its comment -- the packed word is
+    /// `process_rows_packed` already writes each group's full key into
+    /// `group_keys_` from the ROW (see its comment -- the packed word is
     /// used only for the FAST lookup, never as the group's stored identity),
-    /// so `group_order_` is already exactly what the generic path expects.
-    /// Only `key_index_`, which hashes packed words rather than `Key`s, needs
+    /// so `group_keys_` is already exactly what the generic path expects.
+    /// Only `key_index_`, which hashes packed words rather than keys, needs
     /// rebuilding from what is already there.
     void migrate_packed_fast_path_to_generic() {
         key_index_.hashes.clear();
-        key_index_.hashes.reserve(group_order_.size());
-        for (const auto& key : group_order_) {
-            key_index_.hashes.push_back(hash_key_value(key));
+        key_index_.hashes.reserve(group_keys_.size());
+        for (std::size_t gid = 0; gid < group_keys_.size(); ++gid) {
+            key_index_.hashes.push_back(group_keys_.hash(gid));
         }
         std::size_t capacity = 1024;
         while (capacity * 7 < key_index_.hashes.size() * 10) {
@@ -4179,8 +4636,8 @@ class HashAggregateState final {
 
     /// Three or more fixed-width key columns, grouped through one packed key.
     ///
-    /// **The output key store is deliberately unchanged.** `group_order_` still
-    /// holds one boxed `Key` per group, built once per GROUP, so
+    /// **The output key store is deliberately unchanged.** `group_keys_` still
+    /// holds each group's key, written once per GROUP from its first row, so
     /// `build_output_chunk` needs no packed case: this path sets none of the
     /// `*_fast_path_` flags and lands in the same branch the generic path uses.
     /// That is also why the key is rebuilt from the ROW rather than unpacked —
@@ -4194,24 +4651,15 @@ class HashAggregateState final {
         gids_buf_.resize(rows);
         auto* gids = gids_buf_.data();
 
-        // The one place a Key gets built: once per group, never per row.
-        const auto build_key_at = [&](std::size_t row) {
-            Key key;
-            key.values.reserve(group_entries.size());
-            for (const auto* entry : group_entries) {
-                push_key_value(key, *entry, row);
-            }
-            return key;
-        };
         const auto key_at = [&](std::size_t row) {
             return PackedKeyEncoder::pack_row<Packed>(cols, row);
         };
 
+        // The key is written once per group, never per row.
         if (try_discover_partitioned<Packed, Hash>(
-                key_at, rows, gids, state.partitions,
-                [&](std::size_t n) { group_order_.resize(n); },
+                key_at, rows, gids, state.partitions, [&](std::size_t n) { group_keys_.resize(n); },
                 [&](const Packed&, std::uint32_t gid, std::size_t row) {
-                    group_order_[gid] = build_key_at(row);
+                    group_keys_.set_row(gid, group_entries, row);
                 },
                 kPackedPartitionMinRows)) {
             publish_discovered(agg_entries, rows);
@@ -4232,7 +4680,7 @@ class HashAggregateState final {
             } else {
                 auto it = state.index.find(key);
                 if (it == state.index.end()) {
-                    group_order_.push_back(build_key_at(row));
+                    group_keys_.push_row(group_entries, row);
                     gid = alloc_group();
                     state.index.emplace(key, gid);
                 } else {
@@ -4264,21 +4712,94 @@ class HashAggregateState final {
 
         gids_buf_.resize(rows);
         auto* gids = gids_buf_.data();
+        if (try_discover_generic_partitioned(cols, group_entries, rows, gids)) {
+            publish_discovered(agg_entries, rows);
+            return std::nullopt;
+        }
         for (std::size_t row = 0; row < rows; ++row) {
-            gids[row] = key_index_.find_or_insert(group_order_, cols, row, [&] {
-                // The one place a Key gets built: once per group, not per row.
-                Key key;
-                key.values.reserve(group_entries.size());
-                for (const auto* entry : group_entries) {
-                    push_key_value(key, *entry, row);
-                }
-                group_order_.push_back(std::move(key));
-                return alloc_group();
-            });
+            gids[row] = key_index_.find_or_insert_hashed(
+                hash_key_row(cols, row),
+                [&](std::uint32_t gid) { return group_keys_.equals_row(gid, cols, row); },
+                [&] {
+                    // The one place a key is written: once per group, not per row.
+                    group_keys_.push_row(group_entries, row);
+                    return alloc_group();
+                });
         }
 
         publish_discovered(agg_entries, rows);
         return std::nullopt;
+    }
+
+    /// `try_discover_partitioned` for the generic key: several key columns, or
+    /// ones no fast path packs -- PDS-H q10's seven, with four wide strings,
+    /// whenever the planner cannot prove `c_custkey` unique and reduce them.
+    /// This was the one key shape whose discovery stayed wholly serial: q10 at
+    /// SF-10 spent 267 ms of its ~1 s there, on the main thread.
+    ///
+    /// Every row is hashed once, across workers, before the partitioning
+    /// passes; both the partition choice and the probe then read that hash, so
+    /// the expensive part -- hashing the string columns -- is parallel and not
+    /// repeated. The probe compares a group's stored key against the row where
+    /// it sits, and writes a key only per group, exactly as the serial
+    /// `KeyRowIndex` loop does -- into the partition's own `GroupKeyStore`, so
+    /// a new group allocates nothing of its own.
+    ///
+    /// Groups the serial loop already found are handed over by hash
+    /// (`GroupKeyStore::hash` agrees with `hash_key_row`). Declined when another key shape switched
+    /// partitioning on: those groups live in that shape's partitions, not these.
+    auto try_discover_generic_partitioned(const std::vector<KeyCol>& cols,
+                                          const std::vector<const ColumnEntry*>& group_entries,
+                                          std::size_t rows, std::uint32_t* gids) -> bool {
+        if (partitioned_active_ && !generic_partitioned_) {
+            return false;
+        }
+        // As for the packed key: probing this key costs far more per row than
+        // an int or a string probe, so partitioning pays off at the lower
+        // threshold.
+        if (!may_discover_partitioned(rows, kPackedPartitionMinRows, true)) {
+            return false;
+        }
+        row_hashes_.resize(rows);
+        {
+            const std::size_t workers = par_.discovery.worker_cap;
+            const std::size_t grain = (rows + workers - 1) / workers;
+            auto batch = process_worker_pool().submit(workers, [&](std::size_t w) {
+                const std::size_t end = std::min(rows, (w + 1) * grain);
+                for (std::size_t row = w * grain; row < end; ++row) {
+                    row_hashes_[row] = hash_key_row(cols, row);
+                }
+            });
+            batch.wait();
+        }
+        // One key store per partition, appended to only by the worker that
+        // owns the partition. Sized once: a partition's groups point into it.
+        const std::size_t part_count = discovery_partition_count();
+        if (generic_partition_keys_.size() < part_count) {
+            generic_partition_keys_.resize(part_count);
+        }
+        const auto key_at = [&](std::size_t row) {
+            return GenericRowProbe{.hash = row_hashes_[row],
+                                   .cols = &cols,
+                                   .entries = &group_entries,
+                                   .row = row,
+                                   .stores = generic_partition_keys_.data(),
+                                   .part_mask = part_count - 1};
+        };
+        // Groups the serial loop found stay where they are: their slot points
+        // into `group_keys_`, which nothing writes while the partitions probe.
+        const auto key_of_group = [&](std::uint32_t gid) {
+            return GenericGroupSlot{
+                .hash = group_keys_.hash(gid), .index = gid, .store = &group_keys_};
+        };
+        const bool ran = try_discover_partitioned<GenericGroupSlot, GenericKeyHash, GenericKeyEq>(
+            key_at, rows, gids, generic_partitions_, [&](std::size_t n) { group_keys_.resize(n); },
+            [&](const GenericGroupSlot&, std::uint32_t gid, std::size_t row) {
+                group_keys_.set_row(gid, group_entries, row);
+            },
+            kPackedPartitionMinRows, key_of_group);
+        generic_partitioned_ = generic_partitioned_ || ran;
+        return ran;
     }
 
     /// Store non-null First aggregates at the row that creates each new group.
@@ -5389,10 +5910,10 @@ class HashAggregateState final {
             return std::nullopt;
         }
         if (n_groups_ == 0) {
-            // build_output_chunk() reads group_order_[g] for the generic key
+            // build_output_chunk() reads group_keys_ for the generic key
             // layout, so the single group still needs its (empty) Key — the
             // generic path used to push one from its make_group lambda.
-            group_order_.emplace_back();
+            group_keys_.push_key(Key{});
             alloc_group();
         }
         if (has_count_distinct_) {
@@ -5721,8 +6242,8 @@ class HashAggregateState final {
         std::vector<ValidityBitmap> key_validity(group_by_->size());
         std::uint64_t any_null_keys = 0;
         if (!cat_fast_path_ && !str_fast_path_ && !int_fast_path_ && !pair_int_fast_path_) {
-            for (const auto& key : group_order_) {
-                any_null_keys |= key.null_mask;
+            for (std::size_t g = 0; g < group_keys_.size(); ++g) {
+                any_null_keys |= group_keys_.null_mask(g);
             }
             if (any_null_keys != 0) {
                 for (auto& bitmap : key_validity) {
@@ -5773,14 +6294,13 @@ class HashAggregateState final {
                     put_int_key(ci, g, ci == 0 ? pair_order_[g].first : pair_order_[g].second);
                 }
             } else {
+                if (ci >= group_keys_.columns()) {
+                    return;
+                }
                 for (std::size_t g = lo; g < hi; ++g) {
-                    const Key& key = group_order_[g];
-                    if (ci >= key.values.size()) {
-                        continue;
-                    }
-                    append_scalar(col, key.values[ci]);
+                    group_keys_.append_to(col, ci, g);
                     if (any_null_keys != 0 && ci < kMaxKeyColumns &&
-                        (key.null_mask & (std::uint64_t{1} << ci)) != 0) {
+                        (group_keys_.null_mask(g) & (std::uint64_t{1} << ci)) != 0) {
                         key_validity[ci].set(g, false);
                     }
                 }
@@ -6023,6 +6543,60 @@ class HashAggregateState final {
         }
     };
 
+    /// The generic path's partition key: where a group's key is stored (its
+    /// partition's `GroupKeyStore`, or `group_keys_` for a group carried over
+    /// from the serial loop) and its `hash_key_row` hash, so neither a probe
+    /// nor a rehash recomputes it. Carrying the store makes equality stateless,
+    /// which the partition's map needs.
+    struct GenericGroupSlot {
+        std::uint64_t hash = 0;
+        std::uint32_t index = 0;
+        const GroupKeyStore* store = nullptr;
+    };
+    /// A row probing for its group: its columns, where it sits, and its hash,
+    /// computed once per row before the partitioning passes. Converting it to
+    /// a slot -- which happens only when the row starts a new group, on the
+    /// worker that owns its partition -- writes its key into that partition's
+    /// store. `part_mask` must be the mask `try_discover_partitioned` uses
+    /// (`discovery_partition_count() - 1`).
+    struct GenericRowProbe {
+        std::uint64_t hash = 0;
+        const std::vector<KeyCol>* cols = nullptr;
+        const std::vector<const ColumnEntry*>* entries = nullptr;
+        std::size_t row = 0;
+        GroupKeyStore* stores = nullptr;
+        std::uint64_t part_mask = 0;
+
+        explicit operator GenericGroupSlot() const {
+            GroupKeyStore& store = stores[hash & part_mask];
+            store.push_row(*entries, row);
+            return GenericGroupSlot{.hash = hash,
+                                    .index = static_cast<std::uint32_t>(store.size() - 1),
+                                    .store = &store};
+        }
+    };
+    struct GenericKeyHash {
+        using is_transparent = void;
+        auto operator()(const GenericGroupSlot& k) const noexcept -> std::size_t {
+            return static_cast<std::size_t>(k.hash);
+        }
+        auto operator()(const GenericRowProbe& p) const noexcept -> std::size_t {
+            return static_cast<std::size_t>(p.hash);
+        }
+    };
+    struct GenericKeyEq {
+        using is_transparent = void;
+        auto operator()(const GenericGroupSlot& a, const GenericGroupSlot& b) const -> bool {
+            return a.hash == b.hash && a.store->equals(a.index, *b.store, b.index);
+        }
+        auto operator()(const GenericGroupSlot& a, const GenericRowProbe& b) const -> bool {
+            return a.hash == b.hash && a.store->equals_row(a.index, *b.cols, b.row);
+        }
+        auto operator()(const GenericRowProbe& a, const GenericGroupSlot& b) const -> bool {
+            return (*this)(b, a);
+        }
+    };
+
     OperatorPtr child_;
     const std::vector<ir::ColumnRef>* group_by_;
     const std::vector<ir::AggSpec>* aggregations_;
@@ -6075,7 +6649,7 @@ class HashAggregateState final {
 
     // Generic path (non-Categorical group keys).
     KeyRowIndex key_index_;
-    std::vector<Key> group_order_;
+    GroupKeyStore group_keys_;
 
     // Sentinel for "no group assigned yet" in the dense index arrays.
     static constexpr std::uint32_t kNoGid = std::numeric_limits<std::uint32_t>::max();
@@ -6143,6 +6717,12 @@ class HashAggregateState final {
     std::vector<KeyPartition<PairIntKey, PairIntKeyHash>> pair_partitions_;
     std::vector<KeyPartition<std::int64_t, robin_hood::hash<std::int64_t>>> int_partitions_;
     std::vector<KeyPartition<std::string, StrViewHash, StrViewEq>> str_partitions_;
+    std::vector<KeyPartition<GenericGroupSlot, GenericKeyHash, GenericKeyEq>> generic_partitions_;
+    std::vector<GroupKeyStore> generic_partition_keys_;
+    /// `partitioned_active_` is one flag for every key shape; this says the
+    /// generic path is the one that set it, so its partitions hold every group.
+    bool generic_partitioned_ = false;
+    std::vector<std::uint64_t> row_hashes_;
     std::vector<std::uint8_t> part_of_row_;
     std::vector<std::size_t> scatter_rows_;
     std::uint64_t rows_seen_ = 0;

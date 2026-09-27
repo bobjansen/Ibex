@@ -30,6 +30,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -40,6 +41,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -1332,5 +1334,127 @@ TEST_CASE("empty join probe retains the first chunk identity", "[schema][join][i
         auto end = op->next();
         REQUIRE(end.has_value());
         CHECK_FALSE(end->has_value());
+    }
+}
+
+TEST_CASE("generic group-by keys: partitioned discovery equals a hand-computed grouping",
+          "[runtime][chunked][aggregate][parallel]") {
+    // A key no fast path takes -- a long string, a double and a nullable int --
+    // lands on the generic path, which keeps its group keys column by column
+    // (`GroupKeyStore`) and, on enough rows, discovers groups by hash partition
+    // across workers. Both are checked against a grouping computed here by
+    // hand, in first-occurrence order: the serial path was rewritten too, so
+    // agreeing with it proves nothing on its own.
+    //
+    // The shapes that break a key store: a string past the small-string
+    // buffer (its bytes live in the store's buffer, not in a std::string),
+    // -0.0 and 0.0 (one group, holding the first row's sign), and a null key
+    // (one group, whatever payload the column holds under it). Streamed in
+    // 20000-row chunks, the first chunk is under the partitioned path's row
+    // floor and runs serially; the second starts partitioning with groups
+    // already found, which must be handed over rather than issued again.
+    constexpr std::size_t kRows = 300'000;
+    Column<std::string> s;
+    Column<double> d;
+    Column<std::int64_t> n;
+    Column<std::int64_t> q;
+    runtime::ValidityBitmap n_valid;
+    struct Group {
+        std::string s;
+        double d = 0.0;
+        std::optional<std::int64_t> n;
+        std::int64_t count = 0;
+        std::int64_t total = 0;
+    };
+    std::vector<Group> groups;
+    std::map<std::tuple<std::string, double, std::int64_t, bool>, std::size_t> index;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        const std::string sv =
+            "customer-" + std::to_string((i * 7919) % 2'003) + "-padding-past-the-sso";
+        const double dv = std::array<double, 3>{0.0, -0.0, 1.5}[i % 3];
+        const bool is_null = i % 13 == 0;
+        const auto nv = static_cast<std::int64_t>(i % 11);
+        const auto qv = static_cast<std::int64_t>(i % 97);
+        s.push_back(sv);
+        d.push_back(dv);
+        n.push_back(nv);
+        n_valid.push_back(!is_null);
+        q.push_back(qv);
+        // -0.0 == 0.0 as a map key too, so they share a group, as they must.
+        const auto key = std::make_tuple(sv, dv, is_null ? 0 : nv, is_null);
+        auto [it, inserted] = index.emplace(key, groups.size());
+        if (inserted) {
+            groups.push_back(Group{.s = sv,
+                                   .d = dv,
+                                   .n = is_null ? std::nullopt : std::optional{nv},
+                                   .count = 0,
+                                   .total = 0});
+        }
+        ++groups[it->second].count;
+        groups[it->second].total += qv;
+    }
+    runtime::Table t;
+    t.add_column("s", std::move(s));
+    t.add_column("d", std::move(d));
+    t.add_column("n", std::move(n));
+    t.columns.back().validity = std::move(n_valid);
+    t.add_column("q", std::move(q));
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto program = parser::parse("t[select { total = sum(q), c = count() }, by { s, d, n }];");
+    REQUIRE(program.has_value());
+    auto ir = parser::lower(program.value());
+    REQUIRE(ir.has_value());
+
+    const auto check = [&](const runtime::Table& out) {
+        REQUIRE(out.rows() == groups.size());
+        const auto& os = std::get<Column<std::string>>(*out.find("s"));
+        const auto& od = std::get<Column<double>>(*out.find("d"));
+        const auto& on = std::get<Column<std::int64_t>>(*out.find("n"));
+        const auto* on_valid = out.find_entry("n");
+        REQUIRE(on_valid != nullptr);
+        const auto& ot = std::get<Column<std::int64_t>>(*out.find("total"));
+        const auto& oc = std::get<Column<std::int64_t>>(*out.find("c"));
+        for (std::size_t g = 0; g < groups.size(); ++g) {
+            INFO("group " << g);
+            const Group& want = groups[g];
+            REQUIRE(std::string(os[g]) == want.s);
+            REQUIRE(od[g] == want.d);
+            REQUIRE(std::signbit(od[g]) == std::signbit(want.d));
+            REQUIRE(runtime::is_null(*on_valid, g) == !want.n.has_value());
+            if (want.n.has_value()) {
+                REQUIRE(on[g] == *want.n);
+            }
+            REQUIRE(oc[g] == want.count);
+            REQUIRE(ot[g] == want.total);
+        }
+    };
+
+    for (const bool chunked : {false, true}) {
+        INFO("chunked: " << chunked);
+        std::optional<ChunkGrainGuard> guard;
+        if (chunked) {
+            guard.emplace("20000");
+        }
+        runtime::ExecutionContext serial;
+        serial.parallel_threads = 1;
+        runtime::ParallelPipelineStats stats;
+        runtime::ExecutionContext parallel;
+        parallel.parallel_threads = 8;
+        parallel.parallel_min_rows = 0;
+        parallel.parallel_stats = &stats;
+        const auto sr =
+            runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, serial);
+        const auto pr =
+            runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+        INFO((sr.has_value() ? std::string{} : sr.error()));
+        REQUIRE(sr.has_value());
+        INFO((pr.has_value() ? std::string{} : pr.error()));
+        REQUIRE(pr.has_value());
+        // Guards the test: the parallel run really partitioned its discovery.
+        REQUIRE(stats.parallel_aggregate_partitions.load() > 0);
+        check(*sr);
+        check(*pr);
     }
 }

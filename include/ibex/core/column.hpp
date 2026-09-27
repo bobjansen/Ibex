@@ -1165,6 +1165,41 @@ class Column<std::string> {
         offsets_.push_back(static_cast<std::uint32_t>(chars_.size()));
     }
 
+    /// Append every row of `src`: its bytes as one block, its offsets shifted
+    /// by one constant. `push_back` per row did a `vector::insert` and an
+    /// offset push per value; concatenating a chunked string column that way
+    /// was a serial per-row pass (PDS-H q10 at SF-10 spent ~40 ms in it
+    /// gluing a join's build side back together). `src` may view an external
+    /// buffer, whose offsets need not start at zero.
+    void append(const Column& src) {
+        const size_type n = src.size();
+        if (n == 0) {
+            return;
+        }
+        if (&src == this) {
+            // `src` is the buffer about to grow: append from a copy.
+            // NOLINTNEXTLINE(performance-unnecessary-copy-initialization)
+            const Column copy = src;
+            append(copy);
+            return;
+        }
+        detach_external();
+        const std::uint32_t* src_offsets = src.offsets_data();
+        const char* src_chars = src.chars_data();
+        const std::uint32_t first = src_offsets[0];
+        const std::uint32_t last = src_offsets[n];
+        const auto base = static_cast<std::uint32_t>(chars_.size());
+        if (last != first) {
+            chars_.insert(chars_.end(), src_chars + first, src_chars + last);
+        }
+        const size_type old_rows = offsets_.size();
+        offsets_.resize(old_rows + n);
+        std::uint32_t* out = offsets_.data() + old_rows;
+        for (size_type i = 1; i <= n; ++i) {
+            out[i - 1] = src_offsets[i] - first + base;
+        }
+    }
+
     void reserve(size_type n, size_type chars_hint = 0) {
         detach_external();
         offsets_.reserve(n + 1);

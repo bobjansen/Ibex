@@ -1,8 +1,9 @@
 # Opaque resources: scope, lifetime, and ADBC connections
 
-Status: slice 1 implemented on the `adbc` branch (2026-09-27): resources at
-the top level of a script, end to end with ADBC. See "Slice 1 as built" below;
-functions, returns from user functions, and compile support are still to do.
+Status: slices 1 and 2 implemented on the `adbc` branch: resources at the top
+level of a script, end to end with ADBC (2026-09-27), then resources as `fn`
+parameters and return values (2026-09-28). See "Slice 1 as built" and "Slice 2
+as built" below; compile support is still to do.
 
 ## Decision proposed
 
@@ -279,6 +280,35 @@ idempotent close. Not yet: Docker PostgreSQL checks, busy-guard test through the
 language (unreachable while statements are sequential), cleanup-failure
 reporting through a diagnostic sink (cleanup errors in destructors are dropped),
 cancellation.
+
+## Slice 2 as built (2026-09-28)
+
+Commit `81ab2142` (code and tests), then SPEC/docs (`docs/connections.html`).
+
+- **Resource functions.** `parser::ResourceFunctions` decides which callees
+  are resource functions: an `extern fn` or `fn` with a resource in its
+  signature, or a `fn` whose body or parameter defaults call one, transitively
+  (a `fn` shadows an extern of the same name, as at runtime). The REPL, the
+  whole-script planner (now including functions from imported stubs) and
+  `ibex_compile` share it, so a helper that only reaches a connection through
+  another function is placed like the extern itself.
+- **Frames.** `ResourceCalls::call` runs a user resource function through
+  `run_function` (the former body of `eval_function_call`, which is now a thin
+  wrapper refusing resource functions). Each call has a `ResourceFrame` with
+  only its resource parameters and body bindings; naming a session resource
+  that was not passed gives "bound outside it; pass it as a parameter". Frame
+  resources are released in reverse binding order on any exit, after a
+  returned resource is shared. Body statements use the same
+  `ResourceCalls::run_statement` as top-level statements.
+- **Not enforced:** `mutable` on resource parameters. A resource parameter
+  cannot have a default. A resource call inside a non-resource argument is
+  refused at call time, not by the placement check (as for externs).
+
+Acceptance additions: local cleanup on return and on error, reverse release
+order, bounded live count over repeated calls, resource returns (own and
+parameter), return-type mismatches, transitive placement rejection with zero
+plugin calls, the script path, and a SQLite check that a function sees its
+caller's temporary table.
 
 No pooling, transactions API, parameter binding, general closure capture,
 resource-valued columns, new standalone block syntax, or lazy SQL replay in this

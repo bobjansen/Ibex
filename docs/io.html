@@ -456,7 +456,7 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
     </div>
   </section>
 
-  <section class="section">
+  <section class="section" id="adbc">
     <p class="section-label">SQLite via ADBC</p>
     <h2>Read database tables and query results through the chunked path</h2>
     <div>
@@ -500,9 +500,11 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
           away.
         </p>
         <p>
-          Connection functions run one statement at a time, in order, at the
-          top level of a script: not inside a query clause or a function. A
-          query's result is read in full before the statement uses it.
+          Connection functions run one statement at a time, in order, not
+          inside a query clause. Functions can take, open and return
+          connections. A query's result is read in full before the statement
+          uses it. The <a href="./connections.html">connections guide</a>
+          covers the rules in full.
         </p>
 <pre><code><span class="kw">import</span> <span class="str">"adbc"</span>;
 

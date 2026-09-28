@@ -948,7 +948,8 @@ statement       = let_stmt
 let_stmt        = "let" [ "mut" ] IDENT [ ":" type ] "=" expr ";" ;
 assign_stmt     = IDENT "=" expr ";" ;
 extern_decl     = "extern" "fn" IDENT "(" [ param_list ] ")"
-                  "->" type [ effect_decl ] "from" STRING_LIT ";" ;
+                  "->" type [ effect_decl ] "from" STRING_LIT ";"
+                | "extern" "type" IDENT "from" STRING_LIT ";" ;
 fn_decl         = "fn" IDENT "(" [ param_list ] ")" "->" type
                   [ effect_decl ]
                   "{" { fn_stmt } "}" ;
@@ -960,7 +961,9 @@ fn_stmt         = let_stmt
 (* --- Types --- *)
 
 type            = scalar_type
-                | type_ctor [ "<" type_arg ">" ] ;
+                | type_ctor [ "<" type_arg ">" ]
+                | IDENT ;  (* resource type (Section 11.5): fn and extern fn
+                              signatures only *)
 
 scalar_type     = "Int" | "Int32" | "Int64" | "Float32" | "Float64"
                 | "Bool"  | "String" | "Date" | "Timestamp" ;
@@ -3544,25 +3547,47 @@ loaded like the one behind an `extern fn`. Two resource types are never
 interchangeable, and a resource is not a scalar or a table: Ibex code cannot
 inspect it, compare it, or store it in a column.
 
-A resource type may appear only in `extern fn` parameter and return types. A
-resource-typed parameter takes a resource binding, or a call that returns a
-resource of that type; the type is checked before the call.
+A resource type may appear only in `extern fn` and `fn` parameter and return
+types, never in a `let` annotation or a column type. A resource-typed parameter
+takes a resource binding, or a call that returns a resource of that type; the
+type is checked before the call. A resource parameter has no default value.
 
 **Binding.** `let db = <call returning a resource>;` binds a resource;
 `let other = db;` makes an alias of the same resource. A `let` binding takes no
 type annotation. Rebinding the name to another value drops that binding.
 
-**Where a resource function can be called.** A function that takes or returns
-a resource is called only:
+**Resource functions.** A *resource function* is an `extern fn` or `fn` that
+takes or returns a resource, or a `fn` whose body or parameter defaults call a
+resource function, directly or through other functions:
+
+```
+fn load_trades(mutable db: AdbcConnection) -> DataFrame {
+    adbc_query(db, "select * from trades");
+}
+
+fn trade_count(uri: String) -> DataFrame {
+    let db = adbc_connect("postgresql", uri);
+    adbc_query(db, "select count(*) as n from trades");
+}
+```
+
+`trade_count` takes no resource, yet it is a resource function because it
+opens one.
+
+**Where a resource function can be called.** A resource function is called
+only:
 
 - as a statement's value (`let t = adbc_query(db, "...");`, `adbc_close(db);`),
 - as a table operand, such as the base of a block or a side of a join
   (`adbc_query(db, "...")[filter x > 1]`),
 - as an argument of another call.
 
-It cannot be called inside a query clause (`filter`, `select`, `update`, ...),
-inside a larger expression (`adbc_close(db) + 1`), or in a function body. These
-are rejected before any resource function in the statement runs.
+It cannot be called inside a query clause (`filter`, `select`, `update`, ...)
+or inside a larger expression (`adbc_close(db) + 1`). These are rejected
+before any resource function in the statement runs. The same rules apply to
+each statement of a resource function's body. A resource call in an argument
+that is not a resource parameter (`load(db, adbc_close(db))`) is rejected when
+the call is evaluated; bind its result with `let` first.
 
 **Order and materialization.** Resource functions run one statement at a time,
 in source order, before the rest of the statement. A resource call in a table
@@ -3571,10 +3596,28 @@ the query does not stream from the resource. A script that calls a resource
 function runs statement by statement instead of through the whole-script
 planner.
 
+**Resources in functions.** A function sees only the resources passed to it
+and those its body binds; naming a resource bound outside the function is an
+error, even though other outer bindings stay visible. A resource argument is
+shared with the caller, not moved: the caller's binding stays valid after the
+call. Parameter effects (`mutable`) are documentation for now and are not
+enforced for resources.
+
+A function may return a resource as its last expression. The declared return
+type is checked against the resource's type, and the caller shares the
+resource before the function's own bindings are released.
+
 **Lifetime.** A resource lives while any binding holds it. It is released when
-its last binding is rebound or erased, or when the session or script ends. A
-plugin's close function, such as `adbc_close`, closes it earlier for every
-alias.
+its last binding is rebound or erased, or when the session or script ends. The
+resources a function call binds are released when the call ends, normally or
+with an error, in reverse order of binding, unless the call returned them. A
+resource passed straight to a resource parameter
+(`adbc_query(adbc_connect(...), "...")`) is released at the end of that
+statement. A plugin's close function, such as `adbc_close`, closes it earlier
+for every alias.
+
+Programs that call resource functions run in the `ibex` REPL and script
+runner only; `ibex_compile` rejects them.
 
 ### 11.6 Restrictions
 

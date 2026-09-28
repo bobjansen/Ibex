@@ -8,8 +8,8 @@
 //   extern type AdbcConnection from "adbc.hpp";
 //   extern fn adbc_connect(driver: String, uri: String, options: String = "")
 //       -> AdbcConnection from "adbc.hpp";
-// A resource type such as AdbcConnection can be bound with `let` and passed to
-// the functions that take it, but not stored in a column or inspected.
+// A resource type such as AdbcConnection can be bound with `let`, passed to
+// and returned from functions, but not stored in a column or inspected.
 
 import "adbc";
 
@@ -26,6 +26,24 @@ adbc_query(db, "select symbol, qty, px from trades")[
     by symbol,
     order symbol
 ];
+
+// A function can take the connection. It shares the caller's connection, so
+// it sees the same table; `mutable` records that the query uses its state.
+fn positions(mutable conn: AdbcConnection) -> DataFrame {
+    adbc_query(conn, "select symbol, sum(qty) as qty from trades group by symbol order by symbol");
+}
+
+positions(db)[filter qty > 5];
+
+// A function can also open a connection of its own. It is closed when the
+// function returns, even if a query in it fails; return the connection
+// instead (`-> AdbcConnection`) to keep it open for the caller.
+fn table_count(uri: String) -> DataFrame {
+    let scratch = adbc_connect("sqlite", uri);
+    adbc_query(scratch, "select count(*) as n from sqlite_master where type = 'table'");
+}
+
+table_count(":memory:");
 
 // Closing is explicit and idempotent: 1 the first time, 0 after. A query on a
 // closed connection is an error.

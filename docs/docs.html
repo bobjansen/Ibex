@@ -42,6 +42,7 @@
         <a href="#io">Reading &amp; writing</a>
         <a href="./language.html#joins">Joins &amp; reshaping</a>
         <a href="./language.html#analytics">Aggregation &amp; windows</a>
+        <a href="./connections.html">Database connections</a>
         <p>Integration</p>
         <a href="./notebook-details.html">Python notebooks</a>
         <a href="./integrations.html#r">R</a>
@@ -68,6 +69,7 @@
           <a class="card example-card" href="./language.html"><h3>Language guide</h3><p>Table clauses, joins, reshaping, aggregation, windows, types, and nulls.</p></a>
           <a class="card example-card" href="./language-details.html"><h3>Language walkthrough</h3><p>Detailed examples for expressions, joins, nulls, reshaping, streaming, and models.</p></a>
           <a class="card example-card" href="./io.html"><h3>I/O guide</h3><p>CSV, JSON, Parquet, SQLite/ADBC, Kafka, and schema hints.</p></a>
+          <a class="card example-card" href="./connections.html"><h3>Connections guide</h3><p>Reusable database connections: open once, query many times, pass them to functions, close.</p></a>
           <a class="card example-card" href="./notebooks.html"><h3>Notebook integration</h3><p>Use Ibex from Python, R, and native application workflows.</p></a>
           <a class="card example-card" href="./notebook-details.html"><h3>Notebook examples</h3><p>Detailed Python and R notebook sessions, bindings, and persistent state.</p></a>
           <a class="card example-card" href="./advanced.html"><h3>Advanced workflows</h3><p>Compilation, streams, producer queues, and model specifications.</p></a>
@@ -85,7 +87,7 @@
       <section id="functions"><h3>Functions</h3><p>Use built-ins for common data work and typed <code>fn</code> declarations for reusable code. Browse the <a href="./functions.html">function reference</a>.</p></section>
       <section id="control-flow"><h3>Control flow</h3><p>Use expressions, <code>case</code>, and typed functions to define transformations; pipelines keep data work declarative.</p></section>
 
-      <section id="io"><h2>Data</h2><h3>Reading &amp; writing</h3><p>CSV, JSON, Parquet, and other data sources are provided through plugins. Read the <a href="./io.html">I/O guide</a>.</p></section>
+      <section id="io"><h2>Data</h2><h3>Reading &amp; writing</h3><p>CSV, JSON, Parquet, and other data sources are provided through plugins. Read the <a href="./io.html">I/O guide</a>, and the <a href="./connections.html">connections guide</a> for reusing one database connection across queries.</p></section>
       <section id="joins"><h3>Joins, reshaping, aggregation, and windows</h3><p>The <a href="./language.html">language guide</a> covers joins, binding, reshaping, grouped operations, and TimeFrames.</p></section>
 
       <section id="python"><h2>Integration</h2><h3>Python</h3><p>Use Ibex from notebook workflows while keeping tables and scalar bindings typed. See the <a href="./notebooks.html#python">notebook integration guide</a> and <a href="./notebook-details.html">detailed notebook examples</a>.</p></section>

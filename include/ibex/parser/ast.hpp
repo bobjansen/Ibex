@@ -66,8 +66,11 @@ struct Type {
     TypeArg arg = ScalarType::Int64;
     /// Set exactly when `arg` is `ScalarType::Decimal`.
     std::optional<DecimalType> decimal = std::nullopt;
-    /// The declared name when `kind` is `Resource`; empty otherwise.
-    std::string resource = {};
+    /// The declared name when `kind` is `Resource`; empty otherwise. The
+    /// explicit {} keeps designated initializers that omit it silent under
+    /// -Wmissing-designated-field-initializers.
+    // NOLINTNEXTLINE(readability-redundant-member-init)
+    std::string resource{};
 };
 
 struct Param {

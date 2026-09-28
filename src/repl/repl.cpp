@@ -2986,15 +2986,14 @@ auto eval_model_scalar_accessor(const parser::CallExpr& call, const ModelRegistr
 /// `parser::ResourceFunctions`); build a new one after declarations change.
 auto resource_functions(const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls)
     -> parser::ResourceFunctions {
-    return parser::ResourceFunctions(
-        [&extern_decls](std::string_view name) -> const parser::ExternDecl* {
-            auto it = extern_decls.find(std::string(name));
-            return it == extern_decls.end() ? nullptr : &it->second;
-        },
-        [&functions](std::string_view name) -> const parser::FunctionDecl* {
-            auto it = functions.find(std::string(name));
-            return it == functions.end() ? nullptr : &it->second;
-        });
+    return {[&extern_decls](std::string_view name) -> const parser::ExternDecl* {
+                auto it = extern_decls.find(std::string(name));
+                return it == extern_decls.end() ? nullptr : &it->second;
+            },
+            [&functions](std::string_view name) -> const parser::FunctionDecl* {
+                auto it = functions.find(std::string(name));
+                return it == functions.end() ? nullptr : &it->second;
+            }};
 }
 
 constexpr std::string_view kResourcePlacementError =
@@ -4466,8 +4465,8 @@ struct ResourceFrame {
 
     ~ResourceFrame() {
         // A rebound name appears twice; its later binding is released first.
-        for (auto name = order.rbegin(); name != order.rend(); ++name) {
-            resources.erase(*name);
+        for (const auto& name : std::ranges::reverse_view(order)) {
+            resources.erase(name);
         }
     }
 };
@@ -4490,24 +4489,24 @@ class ResourceCalls {
                   const ExternDeclRegistry& extern_decls, const runtime::ExternRegistry& externs,
                   ResourceFrame* frame = nullptr, std::string function = {},
                   const ResourceRegistry* session_resources = nullptr)
-        : resources_(resources),
-          tables_(tables),
-          lazy_tables_(lazy_tables),
-          scalars_(scalars),
-          columns_(columns),
-          models_(models),
-          functions_(functions),
-          compile_time_lists_(compile_time_lists),
-          extern_decls_(extern_decls),
-          externs_(externs),
+        : resources_(&resources),
+          tables_(&tables),
+          lazy_tables_(&lazy_tables),
+          scalars_(&scalars),
+          columns_(&columns),
+          models_(&models),
+          functions_(&functions),
+          compile_time_lists_(&compile_time_lists),
+          extern_decls_(&extern_decls),
+          externs_(&externs),
           resource_functions_(resource_functions(functions, extern_decls)),
           frame_(frame),
           function_(std::move(function)),
-          session_resources_(session_resources != nullptr ? *session_resources : resources) {}
+          session_resources_(session_resources != nullptr ? session_resources : &resources) {}
 
     /// The session's top-level resource bindings.
     [[nodiscard]] auto session_resources() const -> const ResourceRegistry& {
-        return session_resources_;
+        return *session_resources_;
     }
 
     /// The call `expr` is, when it calls a resource function.
@@ -4539,13 +4538,13 @@ class ResourceCalls {
 
     /// Binds a resource. A name lives in exactly one registry.
     void bind(const std::string& name, runtime::ResourcePtr value) {
-        resources_.insert_or_assign(name, std::move(value));
-        tables_.erase(name);
-        lazy_tables_.erase(name);
-        scalars_.erase(name);
-        columns_.erase(name);
-        models_.erase(name);
-        compile_time_lists_.erase(name);
+        resources_->insert_or_assign(name, std::move(value));
+        tables_->erase(name);
+        lazy_tables_->erase(name);
+        scalars_->erase(name);
+        columns_->erase(name);
+        models_->erase(name);
+        compile_time_lists_->erase(name);
         if (frame_ != nullptr) {
             frame_->order.push_back(name);
         }
@@ -4566,7 +4565,7 @@ class ResourceCalls {
     auto run_statement(parser::Expr& value, const parser::LetStmt* let, bool tuple_let,
                        HoistedResourceCalls& hoisted) -> std::expected<Handled, std::string> {
         if (const auto* ident = std::get_if<parser::IdentifierExpr>(&value.node)) {
-            if (auto it = resources_.find(ident->name); it != resources_.end()) {
+            if (auto it = resources_->find(ident->name); it != resources_->end()) {
                 if (tuple_let) {
                     return std::unexpected("'" + ident->name +
                                            "' is a resource and cannot be destructured");
@@ -4615,32 +4614,32 @@ class ResourceCalls {
             bind(name, std::move(*resource));
             return Handled{.done = true, .value = std::nullopt};
         }
-        lazy_tables_.erase(name);
-        tables_.erase(name);
-        scalars_.erase(name);
-        columns_.erase(name);
-        models_.erase(name);
-        compile_time_lists_.erase(name);
+        lazy_tables_->erase(name);
+        tables_->erase(name);
+        scalars_->erase(name);
+        columns_->erase(name);
+        models_->erase(name);
+        compile_time_lists_->erase(name);
         auto& evaluated = std::get<EvalValue>(*result);
         if (auto* table = std::get_if<runtime::Table>(&evaluated)) {
-            tables_.insert_or_assign(name, std::move(*table));
+            tables_->insert_or_assign(name, std::move(*table));
         } else if (auto* scalar = std::get_if<runtime::ScalarValue>(&evaluated)) {
-            scalars_.insert_or_assign(name, std::move(*scalar));
+            scalars_->insert_or_assign(name, std::move(*scalar));
         } else if (auto* column = std::get_if<runtime::ColumnValue>(&evaluated)) {
-            columns_.insert_or_assign(name, std::move(*column));
+            columns_->insert_or_assign(name, std::move(*column));
         }
         return Handled{.done = true, .value = std::nullopt};
     }
 
     auto call(parser::CallExpr& call) -> std::expected<ResourceCallValue, std::string> {
-        if (auto fn = functions_.find(call.callee); fn != functions_.end()) {
-            return run_function(call, fn->second, tables_, lazy_tables_, scalars_, columns_,
-                                models_, functions_, compile_time_lists_, extern_decls_, externs_,
-                                this);
+        if (auto fn = functions_->find(call.callee); fn != functions_->end()) {
+            return run_function(call, fn->second, *tables_, *lazy_tables_, *scalars_, *columns_,
+                                *models_, *functions_, *compile_time_lists_, *extern_decls_,
+                                *externs_, this);
         }
-        const auto decl_it = extern_decls_.find(call.callee);
-        const auto* fn = externs_.find(call.callee);
-        if (decl_it == extern_decls_.end() || fn == nullptr) {
+        const auto decl_it = extern_decls_->find(call.callee);
+        const auto* fn = externs_->find(call.callee);
+        if (decl_it == extern_decls_->end() || fn == nullptr) {
             return std::unexpected("extern function not registered: " + call.callee);
         }
         const auto& decl = decl_it->second;
@@ -4668,8 +4667,8 @@ class ResourceCalls {
                                        *callee + "; bind its result with `let` first");
             }
             auto value =
-                eval_scalar_expr(*arg.expr, tables_, lazy_tables_, scalars_, columns_, models_,
-                                 functions_, compile_time_lists_, extern_decls_, externs_);
+                eval_scalar_expr(*arg.expr, *tables_, *lazy_tables_, *scalars_, *columns_, *models_,
+                                 *functions_, *compile_time_lists_, *extern_decls_, *externs_);
             if (!value) {
                 return std::unexpected(std::move(value.error()));
             }
@@ -4731,11 +4730,11 @@ class ResourceCalls {
             }
             auto temp_name = make_temp_table_name();
             if (auto* table = std::get_if<runtime::Table>(evaluated)) {
-                tables_.insert_or_assign(temp_name, std::move(*table));
+                tables_->insert_or_assign(temp_name, std::move(*table));
             } else if (auto* scalar = std::get_if<runtime::ScalarValue>(evaluated)) {
-                scalars_.insert_or_assign(temp_name, std::move(*scalar));
+                scalars_->insert_or_assign(temp_name, std::move(*scalar));
             } else if (auto* column = std::get_if<runtime::ColumnValue>(evaluated)) {
-                columns_.insert_or_assign(temp_name, std::move(*column));
+                columns_->insert_or_assign(temp_name, std::move(*column));
             }
             rewrites.temp_names.push_back(temp_name);
             rewrites.replaced.emplace_back(&slot, std::move(slot));
@@ -4785,8 +4784,8 @@ class ResourceCalls {
                                          param.name, expected_type, what, actual));
         };
         if (const auto* ident = std::get_if<parser::IdentifierExpr>(&expr.node)) {
-            auto it = resources_.find(ident->name);
-            if (it == resources_.end()) {
+            auto it = resources_->find(ident->name);
+            if (it == resources_->end()) {
                 if (auto err = outside_frame(ident->name)) {
                     return std::unexpected(std::move(*err));
                 }
@@ -4818,19 +4817,19 @@ class ResourceCalls {
 
    private:
     [[nodiscard]] auto returns_resource(const std::string& callee) const -> bool {
-        if (auto fn = functions_.find(callee); fn != functions_.end()) {
+        if (auto fn = functions_->find(callee); fn != functions_->end()) {
             return fn->second.return_type.kind == parser::Type::Kind::Resource;
         }
-        auto decl = extern_decls_.find(callee);
-        return decl != extern_decls_.end() &&
+        auto decl = extern_decls_->find(callee);
+        return decl != extern_decls_->end() &&
                decl->second.return_type.kind == parser::Type::Kind::Resource;
     }
 
     // Inside a function, a resource the session binds is out of reach unless
     // it is passed in: the error for naming one anyway.
     [[nodiscard]] auto outside_frame(const std::string& name) const -> std::optional<std::string> {
-        if (frame_ == nullptr || !session_resources_.contains(name) || tables_.contains(name) ||
-            lazy_tables_.contains(name) || scalars_.contains(name) || columns_.contains(name)) {
+        if (frame_ == nullptr || !session_resources_->contains(name) || tables_->contains(name) ||
+            lazy_tables_->contains(name) || scalars_->contains(name) || columns_->contains(name)) {
             return std::nullopt;
         }
         return "function '" + function_ + "' uses resource '" + name +
@@ -4916,20 +4915,20 @@ class ResourceCalls {
         return resource_functions_.first_call(expr);
     }
 
-    ResourceRegistry& resources_;
-    runtime::TableRegistry& tables_;
-    LazyTableRegistry& lazy_tables_;
-    runtime::ScalarRegistry& scalars_;
-    ColumnRegistry& columns_;
-    ModelRegistry& models_;
-    const FunctionRegistry& functions_;
-    CompileTimeListRegistry& compile_time_lists_;
-    const ExternDeclRegistry& extern_decls_;
-    const runtime::ExternRegistry& externs_;
+    ResourceRegistry* resources_;
+    runtime::TableRegistry* tables_;
+    LazyTableRegistry* lazy_tables_;
+    runtime::ScalarRegistry* scalars_;
+    ColumnRegistry* columns_;
+    ModelRegistry* models_;
+    const FunctionRegistry* functions_;
+    CompileTimeListRegistry* compile_time_lists_;
+    const ExternDeclRegistry* extern_decls_;
+    const runtime::ExternRegistry* externs_;
     parser::ResourceFunctions resource_functions_;
     ResourceFrame* frame_;
     std::string function_;
-    const ResourceRegistry& session_resources_;
+    const ResourceRegistry* session_resources_;
 };
 
 /// A name lives in exactly one registry. When a `let` that did not bind a

@@ -839,6 +839,24 @@ auto import_widened_int_column(const ArrowArray& array)
     return runtime::ColumnValue{std::move(column)};
 }
 
+/// Import a float32 column, widening to the Float64 Ibex stores. Every float32
+/// value, NaN and infinities included, is exactly representable as a double,
+/// so the conversion is lossless. Like the integer widening, it copies.
+auto import_widened_float_column(const ArrowArray& array)
+    -> std::expected<runtime::ColumnValue, std::string> {
+    if (array.buffers == nullptr || array.n_buffers < 2 ||
+        (array.buffers[1] == nullptr && array.length != 0)) {
+        return std::unexpected("Arrow float array is missing a data buffer");
+    }
+    const auto* values = static_cast<const float*>(array.buffers[1]);
+    Column<double> column;
+    column.reserve(static_cast<std::size_t>(array.length));
+    for (std::int64_t i = 0; i < array.length; ++i) {
+        column.push_back(static_cast<double>(values[array.offset + i]));
+    }
+    return runtime::ColumnValue{std::move(column)};
+}
+
 auto import_categorical_column(const ArrowArray& array, const ArrowSchema& schema,
                                const std::shared_ptr<const void>& owner)
     -> std::expected<runtime::ColumnValue, std::string> {
@@ -968,6 +986,8 @@ auto import_column(const ArrowArray& array, const ArrowSchema& schema,
         column = import_primitive_column<std::int64_t>(array, 1, owner);
     } else if (format == "g") {
         column = import_primitive_column<double>(array, 1, owner);
+    } else if (format == "f") {
+        column = import_widened_float_column(array);
     } else if (format == "b") {
         column = import_bool_column(array, owner);
     } else if (format == "tdD") {

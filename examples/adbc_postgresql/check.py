@@ -67,6 +67,18 @@ def main():
         if actual != [["price"], [maximum], ["-0.01"], []]:
             raise RuntimeError(f"Decimal values or null did not survive: {actual!r}")
 
+        # real is float32 on the wire; it must widen to Float64, not be refused.
+        script.write_text('import "adbc"; import "csv";\nwrite_csv(read_adbc('
+                          + ", ".join(json.dumps(s) for s in (
+                              args.driver, args.uri,
+                              "select real_n from ibex_types order by id"))
+                          + '), ' + json.dumps(result_csv.as_posix()) + ');\n',
+                          encoding="utf-8")
+        run(script)
+        actual = list(csv.reader(io.StringIO(result_csv.read_text(encoding="utf-8"))))
+        if actual != [["real_n"], ["1.5"], ["-2.25"], []]:
+            raise RuntimeError(f"float32 real did not widen to Float64: {actual!r}")
+
         script.write_text(source("select price from (values (null::numeric(38,2))) "
                                  "as t(price) where false"), encoding="utf-8")
         run(script)
@@ -78,7 +90,8 @@ def main():
         error = run(script, success=False)
         if "decimal" not in error.lower() or "38" not in error:
             raise RuntimeError(f"Expected a decimal precision error: {error}")
-    print("PostgreSQL walkthrough, exact Decimal values, nulls, empty result and precision checks passed")
+    print("PostgreSQL walkthrough, exact Decimal values, float32 widening, nulls, empty result "
+          "and precision checks passed")
 
 
 if __name__ == "__main__":

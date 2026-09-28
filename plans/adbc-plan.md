@@ -35,7 +35,7 @@ remote query, connection pooling, bulk ingestion tuning, and Decimal256.
 | Read | `read_adbc(driver, uri, sql, options = "")` (`libs/adbc/adbc.cpp`, 411 lines), registered as both a materialized and a chunked (streaming) source. One connection per call. |
 | Options | `db.`/`conn.`/`conn.post.`/`stmt.` prefixed `key=value` list with escaping, parsed in the ADBC-free `adbc_options.hpp` (tested without a driver). `entrypoint=` override. |
 | Arrow import | Shared with Arrow C Data and Parquet (`src/interop/arrow_c_data.cpp`); zero-copy where the layout allows; `d:p,s` decimals exact. Empty results keep their schema. |
-| Types refused | `float32`, `binary` (bytea, uuid), `time64`, `month-day-nano interval`, `list` (`text[]`), each with a SQL-cast workaround in the PostgreSQL walkthrough. PostgreSQL `numeric` and `jsonb` arrive as text; the walkthrough converts `numeric` to `Decimal(p, s)` in Ibex. |
+| Types refused | `binary` (bytea, uuid), `time64`, `month-day-nano interval`, `list` (`text[]`), each with a SQL-cast workaround in the PostgreSQL walkthrough. PostgreSQL `numeric` and `jsonb` arrive as text; the walkthrough converts `numeric` to `Decimal(p, s)` in Ibex. |
 | Drivers | Bare names resolved through ADBC manifests. `scripts/install_adbc_driver.{sh,ps1}` install Apache's pinned, SHA-256-checked PyPI wheels for **sqlite** and **postgresql** on Linux x86-64/arm64, macOS x86-64/arm64 and Windows, with no Python needed. The driver manager is built from the pinned apache-arrow-adbc-24 tarball (or a system one). |
 | Tests | `tests/test_adbc.cpp` (8 cases, SQLite: batches, nulls, empty schema, materialized = chunked, options, errors, manifest names) and `tests/test_adbc_options.cpp`; ctest `adbc:sqlite_demo` runs `examples/adbc_sqlite/`. |
 | CI | `.github/workflows/adbc.yml`: Linux (g++) and Windows (MSVC) jobs, SQLite; the Windows job publishes the `ibex-windows-adbc` artifact. |
@@ -78,7 +78,7 @@ Per type, one of three answers, chosen once and documented:
 
 | Arrow type | Proposed | Why |
 |---|---|---|
-| `float32` | widen to Float64 | Lossless; the walkthrough calls it an Ibex gap, not a driver choice. |
+| `float32` | widen to Float64 | **Done** (shared Arrow C Data importer, so Parquet and Arrow input widen too). Lossless. |
 | `binary` / `large_binary` | refuse, suggest a cast | No Ibex binary column. Revisit only with a real use. |
 | `fixed_size_binary(16)` from uuid | refuse, suggest `::text` | Same. A uuid extension-type check could map it to its canonical string later. |
 | `time32` / `time64` | **decision needed**: refuse, or Int64 nanoseconds since midnight | Ibex has no time-of-day type. |

@@ -13,6 +13,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <expected>
@@ -304,8 +305,8 @@ inline void noop_release_schema(ArrowSchema* schema) {
     schema->release = nullptr;
 }
 
-/// A one-column struct array over caller-owned integer storage. Hand-built
-/// because Ibex has no narrow integer column to export from.
+/// A one-column struct array over caller-owned integer (or float32) storage.
+/// Hand-built because Ibex has no narrow numeric column to export from.
 template <typename Raw>
 struct ForeignIntColumn {
     std::vector<Raw> values;
@@ -378,6 +379,44 @@ TEST_CASE("Arrow C Data widens every lossless integer width", "[interop][arrow][
         REQUIRE(values != nullptr);
         CHECK((*values)[0] == 4'294'967'295LL);
     }
+}
+
+TEST_CASE("Arrow C Data widens float32 to Float64", "[interop][arrow][float]") {
+    const float inf = std::numeric_limits<float>::infinity();
+    ForeignIntColumn<float> source(
+        {9.0F, 1.5F, -0.1F, inf, std::numeric_limits<float>::quiet_NaN()}, "f");
+    // Slice off the first value and null out the second remaining one: both
+    // the offset and the validity bitmap must carry through the copy.
+    const std::uint8_t validity = 0b11011;  // bit 2, the -0.1, is null
+    source.child_buffers[0] = &validity;
+    source.child.offset = 1;
+    source.child.length = 4;
+    source.child.null_count = 1;
+    source.array.length = 4;
+
+    auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
+    INFO((imported.has_value() ? std::string{} : imported.error()));
+    REQUIRE(imported.has_value());
+    const auto* entry = imported->find_entry("n");
+    REQUIRE(entry != nullptr);
+    const auto* values = std::get_if<ibex::Column<double>>(entry->column.get());
+    REQUIRE(values != nullptr);
+    REQUIRE(values->size() == 4);
+    CHECK((*values)[0] == 1.5);
+    // A null slot still holds the widened payload.
+    CHECK((*values)[1] == static_cast<double>(-0.1F));
+    CHECK((*values)[2] == std::numeric_limits<double>::infinity());
+    CHECK(std::isnan((*values)[3]));
+    REQUIRE(entry->validity.has_value());
+    CHECK((*entry->validity)[0]);
+    CHECK_FALSE((*entry->validity)[1]);
+    CHECK((*entry->validity)[2]);
+    CHECK((*entry->validity)[3]);
+
+    // An empty result (schema only) gets the same column type.
+    auto empty = ibex::interop::empty_table_from_arrow_schema(source.schema);
+    REQUIRE(empty.has_value());
+    CHECK(std::holds_alternative<ibex::Column<double>>(*empty->columns.at(0).column));
 }
 
 TEST_CASE("Arrow C Data import round-trips dictionary encoded categoricals", "[interop][arrow]") {

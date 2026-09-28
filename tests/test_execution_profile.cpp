@@ -219,19 +219,20 @@ TEST_CASE("a ring park is idle, not serial work", "[runtime][profile]") {
     const auto rows = profile->snapshot();
     const auto row = std::ranges::find_if(rows, [](const auto& e) { return e.label == "ring"; });
     REQUIRE(row != rows.end());
-    CHECK(row->ring_wait_ns > 0);
+    // The sleep is at least 5ms, and all of it is inside the park.
+    CHECK(row->ring_wait_ns >= 5'000'000);
     CHECK(row->barrier_wait_ns == 0);  // a different kind of park, counted apart
     CHECK(row->ring_wait_ns <= row->next_self_ns);
 
     const auto summary = runtime::summarize_execution_profile(rows, /*wall_ms=*/5.0,
                                                               /*workers=*/4);
-    CHECK(summary.ring_wait_ms > 0.0);
-    // Idle is subtracted from serial, so a scope that only waited reports
-    // essentially no serial work. Not exactly zero: the scope's own entry and
-    // exit sit outside the wait, which is sub-microsecond but real, so this
-    // asserts the split rather than an exact zero a wall clock cannot promise.
-    CHECK(summary.serial_self_ms < 1.0);
-    CHECK(summary.ring_wait_ms > 10.0 * summary.serial_self_ms);
+    // Idle is subtracted from serial: what is left is exactly the scope's time
+    // outside the park. That residue is normally sub-microsecond, but it is
+    // wall-clock time, so a preempted thread can make it milliseconds (4ms seen
+    // on a loaded runner). Assert the split, not how small the residue is.
+    CHECK(summary.ring_wait_ms == static_cast<double>(row->ring_wait_ns) / 1.0e6);
+    CHECK(summary.serial_self_ms ==
+          static_cast<double>(row->next_self_ns - row->ring_wait_ns) / 1.0e6);
 }
 
 TEST_CASE("a pool worker's ring park is not charged to the caller", "[runtime][profile]") {

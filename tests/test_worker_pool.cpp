@@ -637,6 +637,7 @@ TEST_CASE("a stage thread's backpressure park and lifetime are both accounted",
     const auto live_begin = runtime::sample_stage_live();
 
     std::atomic<bool> release{false};
+    std::atomic<bool> entered{false};
     std::mutex mutex;
     std::condition_variable parked;
     constexpr auto kPark = std::chrono::milliseconds(60);
@@ -648,11 +649,19 @@ TEST_CASE("a stage thread's backpressure park and lifetime are both accounted",
             // Exactly what `produce()` does when the ring is full.
             const runtime::RingWaitScope ring_wait;
             std::unique_lock lock(mutex);
+            entered.store(true);
+            parked.notify_all();
             parked.wait(lock, [&] { return release.load(); });
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     });
 
+    // Time the park from when the producer is inside it: a thread that starts
+    // late under load would otherwise shorten the park the check below sees.
+    {
+        std::unique_lock lock(mutex);
+        parked.wait(lock, [&] { return entered.load(); });
+    }
     std::this_thread::sleep_for(kPark);
     {
         const std::scoped_lock lock(mutex);
@@ -665,7 +674,9 @@ TEST_CASE("a stage thread's backpressure park and lifetime are both accounted",
     const auto live_ns = runtime::idle_between(live_begin, runtime::sample_stage_live()).count();
 
     // The park is measured, not rounded to zero — the state before this change.
-    CHECK(park_ns >= std::chrono::nanoseconds(kPark).count() * 9 / 10);
+    // It began before `entered` was set and ended after the release, so it
+    // lasted at least kPark.
+    CHECK(park_ns >= std::chrono::nanoseconds(kPark).count());
     // And it is a subset of the thread's lifetime, which also covers the work
     // after the park. Both bounds matter: a ledger that double-counted, or one
     // that leaked the interval past the thread's death, would break the upper.

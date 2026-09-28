@@ -1,7 +1,7 @@
 # Finishing ADBC support
 
-Status: **in progress** (2026-09-28: Phases 0, 1 and 2 done, Phase 4 slices
-1-2 done; 2026-09-27: performance work is parked behind it,
+Status: **in progress** (2026-09-28: Phases 0 to 3 done, Phase 4 slices 1-2
+done; 2026-09-27: performance work is parked behind it,
 see `beat-duckdb-plan.md`). This plan says what "finished" means for the ADBC
 plugin, what exists today, and the order to build the rest in. The design of
 reusable connections already exists as a separate plan
@@ -150,28 +150,37 @@ text, and the declared precision/scale are not kept) or for sub-microsecond
 timestamps on PostgreSQL. Writing Decimal to SQLite needs a conversion the
 user chooses.
 
-### Phase 3 — parameters (connection form)
+### Phase 3 — parameters: **done** (2026-09-28)
 
-`adbc_query` and `adbc_execute` take an optional parameter table: one row binds
-once, `n` rows execute `n` times (batch insert/update). `AdbcStatementPrepare`,
-then `AdbcStatementBind` with the parameter table exported as Arrow. SQL
-placeholder syntax is the driver's (`?` for SQLite, `$1` for PostgreSQL);
-document that rather than rewriting it.
+`adbc_query(db, sql, params = Table {})` and `adbc_execute(db, sql, params =
+Table {})`. A table with columns is exported through Arrow C Data and bound
+after `AdbcStatementPrepare`; a column-less table (the default) binds nothing.
+The export is owned by a `BoundTable` member released after the statement,
+shared with `adbc_write`. Placeholders are the driver's (`?`, `$1`); columns
+bind by position.
 
-Signature question: a table argument, or a list of scalars. The table form
-covers batches and reuses the export path, so start there; a scalar form can be
-sugar over it.
+Measured on both drivers: one prepared statement runs once per row; a query's
+results are concatenated in row order and `adbc_execute` returns the summed
+count. Every Ibex type binds on PostgreSQL, Categorical and Decimal included;
+a quote in a value is data. Zero rows run nothing: the plugin does not
+execute (the SQLite driver, bound zero rows, returns an undescribable stream
+and leaks its reader, found by LSan) and asks `AdbcStatementExecuteSchema`
+for the columns instead: PostgreSQL answers, SQLite does not, giving a
+column-less empty table. SQLite rejects a column count
+that does not match the placeholders; PostgreSQL ignores extra columns.
 
-Done when: a quoted string, a null, a Decimal and a timestamp all bind
-correctly on both drivers, and a many-row batch runs as one prepared statement.
+Not done: a scalar-list form (sugar over a one-row table; wait for a need),
+and naming which parameter row produced which result row (select the
+parameter back, as the tests do).
 
 ### Phase 4 — reusable connections
 
 **Slice 1 done** on `adbc` (2026-09-27): `extern type`, `adbc_connect` /
 `adbc_query` / `adbc_close` at the top level of a script, with fake-resource and
 SQLite tests; details in `opaque-resource-lifetime-plan.md` ("Slice 1 as built").
-Still to do: resources in user functions, the Docker PostgreSQL acceptance
-checks, and the connection forms below.
+Slice 2 (resources in user functions) and the PostgreSQL acceptance test
+(`6c7a4f49`) are done too, and Phases 2 and 3 were built as connection forms.
+Still to do: the transaction options below.
 
 Build `opaque-resource-lifetime-plan.md`: a typed opaque `AdbcConnection`,
 `adbc_connect` / `adbc_query` / `adbc_close`, deterministic scope and
@@ -235,7 +244,8 @@ closes the arc; its driver and CI items can go in as early as useful.
 2. **Phase 4 in "finished"?** Everything else is library work; Phase 4 is a
    language feature. Without it ADBC is complete for scripting (one connection
    per call) but not for session-style use.
-3. **Parameter form:** table only, or also a scalar list?
+3. ~~**Parameter form**~~ table only for now (2026-09-28); a scalar list can be
+   sugar later.
 4. ~~**Function naming**~~ decided 2026-09-28: every function is `adbc_*`
    (`adbc_read`, `adbc_write`, `adbc_execute`, `adbc_connect`, `adbc_query`,
    ...); `read_adbc` was renamed with no alias. Namespaces are the next

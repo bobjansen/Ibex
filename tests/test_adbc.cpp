@@ -595,3 +595,46 @@ TEST_CASE("adbc_connect reports failures and misuse", "[adbc][connection]") {
     REQUIRE_FALSE(not_a_connection.ok);
     CHECK(contains(not_a_connection.error, "expects a binding of type AdbcConnection"));
 }
+
+TEST_CASE("Functions take, open and return ADBC connections", "[adbc][connection]") {
+    AdbcSession s;
+    SqliteDb db;
+    seed_trades(s, db);
+    const auto declared = s.session.execute(
+        "fn big_ids(mutable c: AdbcConnection) -> DataFrame {\n"
+        "    adbc_query(c, \"select id from big order by id\");\n"
+        "}\n"
+        "fn open_db(uri: String) -> AdbcConnection {\n"
+        "    adbc_connect(" +
+        ibex_str(sqlite_driver()) +
+        ", uri);\n"
+        "}\n"
+        "fn trade_count(uri: String) -> DataFrame {\n"
+        "    let c = open_db(uri);\n"
+        "    adbc_query(c, \"select count(*) as n from trades\");\n"
+        "}\n"
+        "let db = open_db(" +
+        ibex_str(db.path()) + ");");
+    INFO(declared.error);
+    REQUIRE(declared.ok);
+
+    // The function sees the caller's connection, and so its temporary table.
+    REQUIRE(s.session
+                .execute("adbc_query(db, \"create temp table big as select id from trades "
+                         "where qty > 6\");")
+                .ok);
+    const auto shared = s.session.execute("big_ids(db);");
+    INFO(shared.error);
+    REQUIRE(shared.ok);
+    CHECK(ints(*shared.table, "id") == std::vector<std::int64_t>{1, 3, 5});
+
+    // A connection a function opens for itself is its own.
+    const auto own = s.session.execute("trade_count(" + ibex_str(db.path()) + ");");
+    INFO(own.error);
+    REQUIRE(own.ok);
+    CHECK(ints(*own.table, "n") == std::vector<std::int64_t>{5});
+
+    const auto closed = s.session.execute("adbc_close(db);");
+    REQUIRE(closed.ok);
+    CHECK(std::get<std::int64_t>(*closed.scalar) == 1);
+}

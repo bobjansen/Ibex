@@ -29,9 +29,15 @@ endif()
 
 # Copy the library stub to the plugin output directory so that
 # `import "websocket";` works when IBEX_LIBRARY_PATH points to that directory.
-add_custom_command(TARGET ibex_websocket_plugin POST_BUILD
+set(_ibex_websocket_stub "${IBEX_PLUGIN_OUTPUT_DIR}/websocket.ibex")
+
+add_custom_command(
+    OUTPUT "${_ibex_websocket_stub}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/websocket.ibex"
-        "${IBEX_PLUGIN_OUTPUT_DIR}/websocket.ibex"
+        "${_ibex_websocket_stub}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/websocket.ibex"
     COMMENT "Installing websocket.ibex stub"
 )
+add_custom_target(ibex_websocket_stub DEPENDS "${_ibex_websocket_stub}")
+add_dependencies(ibex_websocket_plugin ibex_websocket_stub)

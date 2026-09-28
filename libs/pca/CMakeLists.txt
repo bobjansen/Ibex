@@ -26,9 +26,15 @@ if(TARGET Ibex::Sanitizers)
     target_link_libraries(ibex_pca_plugin PRIVATE Ibex::Sanitizers)
 endif()
 
-add_custom_command(TARGET ibex_pca_plugin POST_BUILD
+set(_ibex_pca_stub "${IBEX_PLUGIN_OUTPUT_DIR}/pca.ibex")
+
+add_custom_command(
+    OUTPUT "${_ibex_pca_stub}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/pca.ibex"
-        "${IBEX_PLUGIN_OUTPUT_DIR}/pca.ibex"
+        "${_ibex_pca_stub}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/pca.ibex"
     COMMENT "Installing pca.ibex stub"
 )
+add_custom_target(ibex_pca_stub DEPENDS "${_ibex_pca_stub}")
+add_dependencies(ibex_pca_plugin ibex_pca_stub)

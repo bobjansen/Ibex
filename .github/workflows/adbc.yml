@@ -1,11 +1,11 @@
 name: ADBC
 
 # The ADBC plugin, its integration tests and the SQLite demo. Separate from
-# ci.yml so it also runs on adbc-* branches without a pull request, and can be
-# started by hand (Actions -> ADBC -> Run workflow).
+# ci.yml so it also runs on the adbc and adbc-* branches without a pull request,
+# and can be started by hand (Actions -> ADBC -> Run workflow).
 on:
   push:
-    branches: [main, 'adbc-**']
+    branches: [main, adbc, 'adbc-**']
   pull_request:
     branches: [main]
   workflow_dispatch:

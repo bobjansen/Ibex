@@ -29,9 +29,15 @@ endif()
 
 # Copy the library stub to the plugin output directory so that
 # `import "udp";` works when IBEX_LIBRARY_PATH points to that directory.
-add_custom_command(TARGET ibex_udp_plugin POST_BUILD
+set(_ibex_udp_stub "${IBEX_PLUGIN_OUTPUT_DIR}/udp.ibex")
+
+add_custom_command(
+    OUTPUT "${_ibex_udp_stub}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/udp.ibex"
-        "${IBEX_PLUGIN_OUTPUT_DIR}/udp.ibex"
+        "${_ibex_udp_stub}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/udp.ibex"
     COMMENT "Installing udp.ibex stub"
 )
+add_custom_target(ibex_udp_stub DEPENDS "${_ibex_udp_stub}")
+add_dependencies(ibex_udp_plugin ibex_udp_stub)

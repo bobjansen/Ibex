@@ -26,9 +26,15 @@ if(TARGET Ibex::Sanitizers)
     target_link_libraries(ibex_kmeans_plugin PRIVATE Ibex::Sanitizers)
 endif()
 
-add_custom_command(TARGET ibex_kmeans_plugin POST_BUILD
+set(_ibex_kmeans_stub "${IBEX_PLUGIN_OUTPUT_DIR}/kmeans.ibex")
+
+add_custom_command(
+    OUTPUT "${_ibex_kmeans_stub}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/kmeans.ibex"
-        "${IBEX_PLUGIN_OUTPUT_DIR}/kmeans.ibex"
+        "${_ibex_kmeans_stub}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kmeans.ibex"
     COMMENT "Installing kmeans.ibex stub"
 )
+add_custom_target(ibex_kmeans_stub DEPENDS "${_ibex_kmeans_stub}")
+add_dependencies(ibex_kmeans_plugin ibex_kmeans_stub)

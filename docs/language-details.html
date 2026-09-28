@@ -54,8 +54,9 @@
             <code>extern type</code> declares an opaque resource a plugin
             provides, such as the <code>AdbcConnection</code> behind
             <code>adbc_connect</code>. A resource is bound with
-            <code>let</code> and passed to the functions that take it; it
-            cannot be inspected or stored in a column.
+            <code>let</code>, passed to and returned from functions, and
+            cannot be inspected or stored in a column. See the
+            <a href="./connections.html">connections guide</a>.
           </p>
           <p>
             Output plugins mirror the input API: <code>write_csv</code>,

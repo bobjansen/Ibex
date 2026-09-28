@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ibex | Connections and Resources</title>
+  <meta name="description" content="Reusable database connections in Ibex: extern type resources, adbc_connect, adbc_query, adbc_close, functions that take or return connections, and lifetime rules." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css" />
+  <script src="./code-copy.js" defer></script>
+</head>
+<body>
+<main class="page">
+
+  <nav class="nav">
+    <span class="nav-logo">Ibex</span>
+    <div class="nav-links">
+      <a class="nav-link" href="./index.html">Home</a>
+      <a class="nav-link" href="./docs.html">Docs</a>
+      <a class="nav-link" href="./examples.html">Examples</a>
+      <a class="nav-link" href="./playground.html">Playground</a>
+      <a class="nav-link" href="./benchmarks.html">Benchmarks</a>
+      <a class="nav-link" href="./reference.html">Reference</a>
+      <a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </div>
+  </nav>
+
+  <section class="hero">
+    <img class="hero-logo" src="./Ibex.png" alt="Ibex logo" />
+    <p class="eyebrow">Connections Guide</p>
+    <h1>Reusable connections and other resources</h1>
+    <p class="lead">
+      A database connection is a <em>resource</em>: a value a plugin owns, which
+      Ibex code can bind, pass to functions, return from them, and close, but
+      never look inside. One connection serves many queries, so a script logs
+      in once and keeps session state such as temporary tables between
+      statements.
+    </p>
+    <div class="cta-row">
+      <a class="button primary" href="./docs.html">Back to Docs</a>
+      <a class="button" href="./io.html#adbc">I/O guide: ADBC</a>
+    </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Overview</p>
+    <h2>One connection, many queries</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3><code>read_adbc</code>: one-off reads</h3>
+        <p>
+          Opens a connection, runs one query, reads the result and closes the
+          connection. Each call starts fresh: nothing one call creates on the
+          database connection is visible to the next.
+        </p>
+      </article>
+      <article class="card">
+        <h3><code>adbc_connect</code>: a reusable connection</h3>
+        <p>
+          Opens a connection that stays open until it is closed or its last
+          binding goes away. <code>adbc_query</code> runs a query on it and
+          returns a table; <code>adbc_close</code> closes it.
+        </p>
+      </article>
+    </div>
+<pre><code><span class="kw">import</span> <span class="str">"adbc"</span>;
+
+<span class="kw">let</span> db = <span class="fn-name">adbc_connect</span>(<span class="str">"sqlite"</span>, <span class="str">":memory:"</span>);
+<span class="fn-name">adbc_query</span>(db, <span class="str">"create table trades (symbol text, qty integer, px real)"</span>);
+<span class="fn-name">adbc_query</span>(db, <span class="str">"insert into trades values ('AAPL', 10, 150.0), ('MSFT', 5, 300.0)"</span>);
+
+<span class="cm">// A query result is an ordinary table operand.</span>
+<span class="fn-name">adbc_query</span>(db, <span class="str">"select symbol, qty, px from trades"</span>)[
+    <span class="kw">select</span> { notional = <span class="fn-name">sum</span>(qty * px) }, <span class="kw">by</span> symbol
+];
+
+<span class="fn-name">adbc_close</span>(db);   <span class="cm">// 1 the first time, 0 after</span></code></pre>
+    <p class="note">
+      <code>examples/adbc_connection.ibex</code> is a runnable version, including
+      the functions below. Install the SQLite driver once with
+      <code>scripts/install_adbc_driver.sh sqlite</code>; see the
+      <a href="./io.html">I/O guide</a> for drivers, URIs and options.
+    </p>
+  </section>
+
+  <section class="section">
+    <p class="section-label">The API</p>
+    <h2>What <code>import "adbc"</code> declares</h2>
+<pre><code><span class="kw">extern</span> <span class="kw">type</span> AdbcConnection <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
+
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_connect</span>(driver: String, uri: String, options: String = <span class="str">""</span>)
+    -&gt; AdbcConnection <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_query</span>(<span class="kw">mutable</span> db: AdbcConnection, sql: String) -&gt; DataFrame
+    <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_close</span>(<span class="kw">mutable</span> db: AdbcConnection) -&gt; Int <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;</code></pre>
+    <table class="repl-table">
+      <tbody>
+        <tr><td><code>adbc_connect(driver, uri, options)</code></td><td>Open a connection. <code>driver</code> and <code>options</code> work as for <code>read_adbc</code>; <code>stmt.</code> options apply to every query on the connection.</td></tr>
+        <tr><td><code>adbc_query(db, sql)</code></td><td>Run SQL on the connection and return the result as a table. Statements without a result set (DDL, <code>insert</code>) return an empty table.</td></tr>
+        <tr><td><code>adbc_close(db)</code></td><td>Close the connection for every binding of it. Returns <code>1</code> the first time and <code>0</code> after; a query on a closed connection is an error.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <code>extern type</code> declares a <em>nominal</em> resource type: two
+      resource types are never interchangeable, and a resource is not a scalar
+      or a table. It cannot be compared, printed as data, used in arithmetic,
+      or stored in a column. The type of each resource argument is checked
+      before the call.
+    </p>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Bindings</p>
+    <h2>Binding, aliasing and closing</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3>Aliases share one connection</h3>
+<pre><code><span class="kw">let</span> db = <span class="fn-name">adbc_connect</span>(<span class="str">"sqlite"</span>, <span class="str">":memory:"</span>);
+<span class="kw">let</span> alias = db;          <span class="cm">// same connection</span>
+<span class="fn-name">adbc_close</span>(alias);       <span class="cm">// 1</span>
+<span class="fn-name">adbc_close</span>(db);          <span class="cm">// 0: already closed</span></code></pre>
+      </article>
+      <article class="card">
+        <h3>The last binding closes it</h3>
+        <p>
+          A connection lives while any binding holds it. Rebinding the last
+          name to something else, or ending the session or script, releases it
+          without an explicit <code>adbc_close</code>. A failed rebinding
+          (<code>let db = no_such_table;</code>) keeps the old connection.
+        </p>
+        <p>
+          A resource binding takes no type annotation: its type is the
+          declared return type of the call that produced it.
+        </p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Functions</p>
+    <h2>Passing, opening and returning connections</h2>
+    <p class="section-sub">
+      A <code>fn</code> can take a resource parameter, open resources of its
+      own, and return one. Any function that takes, returns or (directly or
+      through other functions) calls something that uses a resource is a
+      <em>resource function</em>, and follows the placement rules below.
+    </p>
+    <div class="grid-2">
+      <article class="card">
+        <h3>Take the caller's connection</h3>
+<pre><code><span class="kw">fn</span> <span class="fn-name">positions</span>(<span class="kw">mutable</span> conn: AdbcConnection) -&gt; DataFrame {
+    <span class="fn-name">adbc_query</span>(conn, <span class="str">"select symbol, sum(qty) as qty
+                      from trades group by symbol"</span>);
+}
+
+<span class="fn-name">positions</span>(db)[<span class="kw">filter</span> qty &gt; <span class="num">5</span>];</code></pre>
+        <p>
+          The argument is shared, not moved: the function uses the caller's
+          connection and its session state, and <code>db</code> stays usable
+          afterwards.
+        </p>
+      </article>
+      <article class="card">
+        <h3>Open one locally</h3>
+<pre><code><span class="kw">fn</span> <span class="fn-name">table_count</span>(uri: String) -&gt; DataFrame {
+    <span class="kw">let</span> scratch = <span class="fn-name">adbc_connect</span>(<span class="str">"sqlite"</span>, uri);
+    <span class="fn-name">adbc_query</span>(scratch, <span class="str">"select count(*) as n
+                         from sqlite_master"</span>);
+}</code></pre>
+        <p>
+          A connection the function opens is closed when the call ends,
+          whether it returns normally or fails. Calling it in a loop of
+          statements does not accumulate open connections.
+        </p>
+      </article>
+      <article class="card">
+        <h3>Return a connection</h3>
+<pre><code><span class="kw">fn</span> <span class="fn-name">open_warehouse</span>(user: String) -&gt; AdbcConnection {
+    <span class="fn-name">adbc_connect</span>(<span class="str">"postgresql"</span>,
+                 <span class="str">"postgresql://${user}@warehouse/prod"</span>);
+}
+
+<span class="kw">let</span> wh = <span class="fn-name">open_warehouse</span>(<span class="str">"analyst"</span>);</code></pre>
+        <p>
+          The last expression may be a resource. Its type is checked against
+          the declared return type, and the caller takes a share of it before
+          the function's own bindings are released.
+        </p>
+      </article>
+      <article class="card">
+        <h3>Pass it explicitly</h3>
+<pre><code><span class="kw">let</span> db = <span class="fn-name">adbc_connect</span>(<span class="str">"sqlite"</span>, <span class="str">":memory:"</span>);
+
+<span class="kw">fn</span> <span class="fn-name">broken</span>() -&gt; DataFrame {
+    <span class="fn-name">adbc_query</span>(db, <span class="str">"select 1 as x"</span>);
+}
+<span class="fn-name">broken</span>();
+<span class="cm">// error: function 'broken' uses resource 'db', which is</span>
+<span class="cm">// bound outside it; pass it as a parameter</span></code></pre>
+        <p>
+          A function sees only the resources passed to it and those its body
+          binds, so which connections a call can touch is visible at the call
+          site.
+        </p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Placement</p>
+    <h2>Where resource functions can be called</h2>
+    <p class="section-sub">
+      Resource functions run one statement at a time, in source order, before
+      the rest of the statement. That is only possible where the call is
+      evaluated once, so a resource function can be called:
+    </p>
+    <table class="repl-table">
+      <tbody>
+        <tr><td><code>let t = adbc_query(db, "...");</code></td><td>As a statement's value.</td></tr>
+        <tr><td><code>adbc_query(db, "...")[filter x &gt; 1]</code></td><td>As a table operand: the base of a block or a side of a join.</td></tr>
+        <tr><td><code>adbc_query(adbc_connect(...), "...")</code></td><td>As an argument of another call. A connection opened this way is closed at the end of the statement.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      It cannot be called inside a query clause (<code>filter</code>,
+      <code>select</code>, <code>update</code>, aggregates, windows) or inside a
+      larger expression, because those run per row or per group. This also
+      covers a helper function that only reaches a connection through other
+      functions. The statement is rejected before any of its resource
+      functions run, so a misplaced call never half-executes:
+    </p>
+<pre><code><span class="kw">fn</span> <span class="fn-name">remote_count</span>(uri: String) -&gt; Int {
+    <span class="kw">let</span> db = <span class="fn-name">adbc_connect</span>(<span class="str">"sqlite"</span>, uri);
+    <span class="fn-name">scalar</span>(<span class="fn-name">adbc_query</span>(db, <span class="str">"select count(*) as n from trades"</span>), <span class="str">"n"</span>);
+}
+
+trades[<span class="kw">update</span> { n = <span class="fn-name">remote_count</span>(uri) }];   <span class="cm">// rejected</span>
+
+<span class="kw">let</span> n = <span class="fn-name">remote_count</span>(uri);                  <span class="cm">// fine: once, at statement level</span>
+trades[<span class="kw">update</span> { n = ^n }];</code></pre>
+    <p class="note">
+      A query result is read in full before the statement uses it: a table
+      operand from <code>adbc_query</code> is a materialized table, not a
+      stream from the database. Push filters and aggregations into the SQL
+      when the result would be large.
+    </p>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Lifetime</p>
+    <h2>When a connection is released</h2>
+    <table class="repl-table">
+      <tbody>
+        <tr><td><code>let alias = db</code></td><td>Another owner of the same connection; nothing new is opened.</td></tr>
+        <tr><td>Pass <code>db</code> to a function</td><td>The parameter shares the connection for the duration of the call.</td></tr>
+        <tr><td>Connection opened in a function</td><td>Released when the call ends, normally or with an error, in reverse order of binding.</td></tr>
+        <tr><td>Connection returned from a function</td><td>Owned by the caller's binding.</td></tr>
+        <tr><td>Rebinding or shadowing a name</td><td>The new value is evaluated first; on success the old connection loses that owner, on failure it is kept.</td></tr>
+        <tr><td>Unbound temporary</td><td>Released at the end of its statement.</td></tr>
+        <tr><td>REPL session or script</td><td>Top-level bindings are released when the session or script ends.</td></tr>
+        <tr><td><code>adbc_close(db)</code></td><td>Closes the connection for every owner at once; later queries on any alias fail.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Release never commits anything on its own: there is no transaction API
+      yet, so each <code>adbc_query</code> runs in the driver's default
+      (usually autocommit) mode.
+    </p>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Limits</p>
+    <h2>Not supported yet</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3>Language and tools</h3>
+        <ul>
+          <li><code>ibex_compile</code> rejects programs that call resource functions; run them with <code>ibex</code>.</li>
+          <li>Scripts that call resource functions run statement by statement rather than through the whole-script planner.</li>
+          <li>No resource-typed <code>let</code> annotations, columns, or default parameter values.</li>
+          <li><code>mutable</code> on a resource parameter documents intent but is not enforced.</li>
+        </ul>
+      </article>
+      <article class="card">
+        <h3>ADBC</h3>
+        <ul>
+          <li>One active query per connection; a second concurrent use reports the connection as busy.</li>
+          <li>No connection forms of writes, <code>execute</code>, or bound parameters yet; use <code>read_adbc</code>-style SQL strings.</li>
+          <li>No transactions, pooling, or cancellation of a running query.</li>
+          <li>An error while cleaning up a closed connection is not reported.</li>
+        </ul>
+      </article>
+    </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Plugin authors</p>
+    <h2>Providing a resource type</h2>
+    <p class="section-sub">
+      A plugin defines a resource by deriving from
+      <code>ibex::runtime::Resource</code>. Cleanup belongs in the destructor,
+      which runs when the last owner lets go and must not throw.
+    </p>
+<pre><code><span class="kw">class</span> Session <span class="kw">final</span> : <span class="kw">public</span> ibex::runtime::Resource {
+   <span class="kw">public</span>:
+    <span class="kw">auto</span> <span class="fn-name">type_name</span>() <span class="kw">const</span> <span class="kw">noexcept</span> -&gt; std::string_view <span class="kw">override</span> {
+        <span class="kw">return</span> <span class="str">"MySession"</span>;   <span class="cm">// matches `extern type MySession`</span>
+    }
+    ~<span class="fn-name">Session</span>() <span class="kw">override</span> { <span class="cm">/* close handles; never throw */</span> }
+};
+
+registry.<span class="fn-name">register_resource</span>(<span class="str">"my_open"</span>, [](<span class="kw">const</span> ExternArgs&amp; args) {
+    <span class="kw">return</span> ExternValue{std::make_shared&lt;Session&gt;(<span class="cm">/* ... */</span>)};
+});
+registry.<span class="fn-name">register_table</span>(<span class="str">"my_query"</span>, [](<span class="kw">const</span> ExternArgs&amp; args) {
+    <span class="kw">auto</span> session = args.<span class="fn-name">resource_as</span>&lt;Session&gt;(<span class="num">0</span>);   <span class="cm">// null if not a Session</span>
+    <span class="cm">// ...</span>
+});</code></pre>
+<pre><code><span class="kw">extern</span> <span class="kw">type</span> MySession <span class="kw">from</span> <span class="str">"my_plugin.hpp"</span>;
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">my_open</span>(uri: String) -&gt; MySession <span class="kw">from</span> <span class="str">"my_plugin.hpp"</span>;
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">my_query</span>(<span class="kw">mutable</span> s: MySession, sql: String) -&gt; DataFrame <span class="kw">from</span> <span class="str">"my_plugin.hpp"</span>;</code></pre>
+    <p>
+      Scalar arguments keep their positions in <code>args</code>; a resource
+      argument occupies its position as a null scalar, so existing plugins
+      that read only scalars are unaffected. The full rules are in
+      <a href="https://github.com/bobjansen/Ibex/blob/main/SPEC.md" target="_blank" rel="noopener">SPEC.md &sect;11.5</a>.
+    </p>
+  </section>
+
+  <footer class="footer">
+    <span>Ibex - typed DataFrame pipelines</span>
+    <a href="./index.html">Back to Home</a>
+  </footer>
+
+</main>
+</body>
+</html>

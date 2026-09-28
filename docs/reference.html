@@ -63,7 +63,7 @@
           <tr><td><code>fn name(args) -&gt; Type { ... }</code></td><td>Declare a typed reusable function.</td></tr>
           <tr><td><code>import "plugin"</code></td><td>Load a bundled I/O plugin.</td></tr>
           <tr><td><code>extern fn ... from "header.hpp"</code></td><td>Declare a native function or source.</td></tr>
-          <tr><td><code>extern type Name from "header.hpp"</code></td><td>Declare an opaque resource, such as a database connection, that extern functions open, use, and close.</td></tr>
+          <tr><td><code>extern type Name from "header.hpp"</code></td><td>Declare an opaque resource, such as a database connection, that functions open, pass, return, and close. See the <a href="./connections.html">connections guide</a>.</td></tr>
           <tr><td><code>Table { field = values }</code></td><td>Create a table from column expressions or literals.</td></tr>
           <tr><td><code>filter predicate</code></td><td>Keep rows for which the predicate is true.</td></tr>
           <tr><td><code>select { fields }</code></td><td>Project fields, create computed fields, or aggregate with <code>by</code>.</td></tr>

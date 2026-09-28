@@ -9,6 +9,7 @@
 #include <expected>
 #include <memory>
 #include <string>
+#include <string_view>
 
 extern "C" {
 
@@ -107,6 +108,12 @@ auto release_arrow_stream(ArrowArrayStream* stream) noexcept -> void;
 /// On failure, `array` is left untouched and remains owned by the caller.
 [[nodiscard]] auto adopt_table_from_arrow(ArrowArray* array, const ArrowSchema& schema)
     -> std::expected<runtime::Table, std::string>;
+
+/// How an import error for a column Ibex has no type for ends, unless the
+/// producer tagged the column with a type the importer can advise on. A
+/// producer that knows better (a SQL source can cast) may replace it.
+inline constexpr std::string_view kUnsupportedColumnAdvice =
+    "convert it to a supported type before reading";
 
 /// Build a zero-row Ibex table from an Arrow struct schema alone.
 ///

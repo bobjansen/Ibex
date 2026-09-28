@@ -474,6 +474,15 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
           refuses unsigned scripts that came from a download.
         </p>
         <p>
+          Columns arrive as the matching Ibex type; <code>float32</code> widens
+          to <code>Float64</code> and a <code>uuid</code> becomes its canonical
+          text. A column Ibex has no type for (<code>time</code>, intervals,
+          binary, arrays) is refused with an error that names it and the cast
+          that reads it, such as <code>CAST(t AS TEXT)</code>. PostgreSQL's
+          driver hands <code>numeric</code> over as text; convert it with
+          <code>Decimal(x, p, s)</code>.
+        </p>
+        <p>
           When using <code>import "adbc"</code> in the REPL, start Ibex with
           <code>--plugin-path ./build-release/tools</code> so it can find both
           <code>adbc.ibex</code> and <code>adbc.so</code>.

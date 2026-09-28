@@ -857,6 +857,141 @@ auto import_widened_float_column(const ArrowArray& array)
     return runtime::ColumnValue{std::move(column)};
 }
 
+/// The column's metadata value for `key`, if the producer attached one.
+/// Malformed metadata reads as absent: it only refines messages and tags.
+auto column_metadata(const ArrowSchema& schema, std::string_view key)
+    -> std::optional<std::string> {
+    auto metadata = decode_metadata(schema.metadata);
+    if (!metadata) {
+        return std::nullopt;
+    }
+    return find_metadata_value(*metadata, key);
+}
+
+/// Whether the column holds UUIDs: the canonical Arrow extension type, or the
+/// ADBC PostgreSQL driver's type name.
+auto is_uuid_column(const ArrowSchema& schema) -> bool {
+    return column_metadata(schema, "ARROW:extension:name") == "arrow.uuid" ||
+           column_metadata(schema, "ADBC:postgresql:typname") == "uuid";
+}
+
+/// Import 16-byte UUIDs, from `fixed_size_binary(16)` or `binary`, as their
+/// canonical lowercase 8-4-4-4-12 text. Null slots are not read.
+auto import_uuid_column(const ArrowArray& array, bool fixed_size)
+    -> std::expected<runtime::ColumnValue, std::string> {
+    constexpr std::size_t kBytes = 16;
+    const std::size_t data_index = fixed_size ? 1 : 2;
+    if (array.buffers == nullptr || std::cmp_less_equal(array.n_buffers, data_index) ||
+        (array.length != 0 &&
+         (array.buffers[data_index] == nullptr || (!fixed_size && array.buffers[1] == nullptr)))) {
+        return std::unexpected("Arrow uuid array is missing a buffer");
+    }
+    const auto* validity = static_cast<const std::uint8_t*>(array.buffers[0]);
+    const auto* offsets = static_cast<const std::int32_t*>(array.buffers[1]);
+    const auto* bytes = static_cast<const unsigned char*>(array.buffers[data_index]);
+    constexpr std::string_view kHex = "0123456789abcdef";
+
+    Column<std::string> column;
+    column.reserve(static_cast<std::size_t>(array.length));
+    std::string text;
+    for (std::int64_t i = 0; i < array.length; ++i) {
+        const std::int64_t row = array.offset + i;
+        if (validity != nullptr && !read_bitmap_bit(validity, row)) {
+            column.push_back(std::string_view{});
+            continue;
+        }
+        const unsigned char* value = nullptr;
+        if (fixed_size) {
+            value = bytes + (static_cast<std::size_t>(row) * kBytes);
+        } else {
+            if (offsets[row + 1] - offsets[row] != static_cast<std::int32_t>(kBytes)) {
+                return std::unexpected("Arrow uuid value is not 16 bytes");
+            }
+            value = bytes + offsets[row];
+        }
+        text.clear();
+        for (std::size_t b = 0; b < kBytes; ++b) {
+            if (b == 4 || b == 6 || b == 8 || b == 10) {
+                text.push_back('-');
+            }
+            text.push_back(kHex[value[b] >> 4U]);
+            text.push_back(kHex[value[b] & 0x0FU]);
+        }
+        column.push_back(std::string_view(text));
+    }
+    return runtime::ColumnValue{std::move(column)};
+}
+
+/// A readable name for an Arrow format string Ibex has no column type for.
+auto describe_arrow_format(std::string_view format) -> std::string {
+    static constexpr std::array<std::pair<std::string_view, std::string_view>, 20> kNames{{
+        {"n", "null"},
+        {"e", "float16"},
+        {"z", "binary"},
+        {"Z", "large_binary"},
+        {"vz", "binary_view"},
+        {"U", "large_utf8"},
+        {"vu", "utf8_view"},
+        {"tdm", "date64"},
+        {"tts", "time32[s]"},
+        {"ttm", "time32[ms]"},
+        {"ttu", "time64[us]"},
+        {"ttn", "time64[ns]"},
+        {"tiM", "interval[months]"},
+        {"tiD", "interval[days_time]"},
+        {"tin", "interval[month_day_nano]"},
+        {"+l", "list"},
+        {"+L", "large_list"},
+        {"+vl", "list_view"},
+        {"+s", "struct"},
+        {"+m", "map"},
+    }};
+    for (const auto& [code, name] : kNames) {
+        if (format == code) {
+            return std::string(name);
+        }
+    }
+    if (format.starts_with("w:")) {
+        return "fixed_size_binary(" + std::string(format.substr(2)) + ")";
+    }
+    if (format.starts_with("+w:")) {
+        return "fixed_size_list(" + std::string(format.substr(3)) + ")";
+    }
+    if (format.starts_with("tD")) {
+        return "duration";
+    }
+    if (format.starts_with("+u")) {
+        return "union";
+    }
+    return "format '" + std::string(format) + "'";
+}
+
+/// The error for a column Ibex cannot hold: which column, which type, and,
+/// when an ADBC PostgreSQL driver tagged it, the SQL that converts it.
+auto unsupported_column_error(const ArrowSchema& schema, std::string_view format) -> std::string {
+    const std::string name = schema.name != nullptr ? schema.name : "";
+    std::string message = "column `" + name + "`: ";
+    const auto pg_type = column_metadata(schema, "ADBC:postgresql:typname");
+    if (pg_type.has_value()) {
+        message += "PostgreSQL " + *pg_type + " (Arrow " + describe_arrow_format(format) + ")";
+    } else {
+        message += "Arrow " + describe_arrow_format(format);
+    }
+    message += " has no Ibex column type";
+    if (!pg_type.has_value()) {
+        return message + "; " + std::string(kUnsupportedColumnAdvice);
+    }
+    message += "; select it as " + name + "::text";
+    if (format.starts_with("tt")) {
+        message += " or extract(epoch from " + name + ")";
+    } else if (*pg_type == "bytea") {
+        message += " or encode(" + name + ", 'hex')";
+    } else if (format == "+l" || format == "+L") {
+        message += " or array_to_string(" + name + ", ',')";
+    }
+    return message;
+}
+
 auto import_categorical_column(const ArrowArray& array, const ArrowSchema& schema,
                                const std::shared_ptr<const void>& owner)
     -> std::expected<runtime::ColumnValue, std::string> {
@@ -940,7 +1075,7 @@ auto import_column(const ArrowArray& array, const ArrowSchema& schema,
 
     const std::string_view format = schema.format != nullptr ? schema.format : "";
     std::expected<runtime::ColumnValue, std::string> column =
-        std::unexpected("unsupported Arrow column format");
+        std::unexpected(unsupported_column_error(schema, format));
 
     // Any timestamp resolution is accepted; only nanoseconds can be adopted
     // without a rescaling copy.
@@ -1000,6 +1135,8 @@ auto import_column(const ArrowArray& array, const ArrowSchema& schema,
         column = (*narrow_int)(array);
     } else if (format == "i") {
         column = import_categorical_column(array, schema, owner);
+    } else if ((format == "w:16" || format == "z") && is_uuid_column(schema)) {
+        column = import_uuid_column(array, format == "w:16");
     }
 
     if (!column) {

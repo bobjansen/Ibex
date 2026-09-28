@@ -135,6 +135,27 @@ auto explain_driver_not_found(std::string_view driver, std::string_view manager_
     return message;
 }
 
+/// An import error with SQL advice: a column Ibex has no type for can be cast
+/// in the query itself. `CAST(x AS TEXT)` is standard SQL, so it holds for
+/// every driver.
+auto with_sql_advice(std::string message) -> std::string {
+    constexpr std::string_view kColumn = "column `";
+    const auto advice = message.rfind(ibex::interop::kUnsupportedColumnAdvice);
+    const auto start = message.find(kColumn);
+    if (advice == std::string::npos || start == std::string::npos) {
+        return message;
+    }
+    const auto name_start = start + kColumn.size();
+    const auto name_end = message.find('`', name_start);
+    if (name_end == std::string::npos) {
+        return message;
+    }
+    const std::string name = message.substr(name_start, name_end - name_start);
+    message.replace(advice, ibex::interop::kUnsupportedColumnAdvice.size(),
+                    "cast it in the query, e.g. CAST(" + name + " AS TEXT)");
+    return message;
+}
+
 template <typename Handle, typename Setter>
 auto apply_adbc_options(std::string_view context, Handle* handle, const OptionList& options,
                         Setter&& setter) -> std::expected<void, std::string> {
@@ -438,8 +459,8 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
                 // query's columns instead of collapsing to a column-less table.
                 auto empty = ibex::interop::empty_table_from_arrow_schema(schema_);
                 if (!empty) {
-                    return std::unexpected(function_ +
-                                           ": result schema import failed: " + empty.error());
+                    return std::unexpected(function_ + ": result schema import failed: " +
+                                           with_sql_advice(empty.error()));
                 }
                 return make_chunk(std::move(*empty));
             }
@@ -454,7 +475,8 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
             auto imported = ibex::interop::adopt_table_from_arrow(&batch, schema_);
             if (!imported) {
                 finished_ = true;
-                return std::unexpected(function_ + ": batch import failed: " + imported.error());
+                return std::unexpected(
+                    function_ + ": batch import failed: " + with_sql_advice(imported.error()));
             }
             if (imported->rows() == 0) {
                 continue;

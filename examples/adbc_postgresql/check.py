@@ -43,6 +43,15 @@ def main():
             raise RuntimeError(f"Missing walkthrough result {expected!r}:\n{output}")
     if "rows: 0" not in output or "2026-01-02 03:04:05.123456" not in output:
         raise RuntimeError(f"Missing empty result or timestamp precision:\n{output}")
+    if '"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"' not in output:
+        raise RuntimeError(f"uuid did not arrive as its canonical text:\n{output}")
+
+    # A type Ibex refuses is named, with the cast that reads it.
+    refused = run(here / "query.ibex", ["--", "--driver", args.driver, "--uri", args.uri,
+                                        "--sql", "select t from ibex_types"], success=False)
+    if "column `t`: Arrow time64[us] has no Ibex column type" not in refused \
+            or "CAST(t AS TEXT)" not in refused:
+        raise RuntimeError(f"Expected a named refusal for time: {refused}")
 
     # Exercise text -> Decimal at the precision boundary, without changing the
     # walkthrough fixture. CSV comparisons avoid the REPL's display formatting.
@@ -90,8 +99,8 @@ def main():
         error = run(script, success=False)
         if "decimal" not in error.lower() or "38" not in error:
             raise RuntimeError(f"Expected a decimal precision error: {error}")
-    print("PostgreSQL walkthrough, exact Decimal values, float32 widening, nulls, empty result "
-          "and precision checks passed")
+    print("PostgreSQL walkthrough, exact Decimal values, float32 widening, uuid, "
+          "refused-type errors, nulls, empty result and precision checks passed")
 
 
 if __name__ == "__main__":

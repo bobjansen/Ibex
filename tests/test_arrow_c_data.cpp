@@ -12,6 +12,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -417,6 +418,152 @@ TEST_CASE("Arrow C Data widens float32 to Float64", "[interop][arrow][float]") {
     auto empty = ibex::interop::empty_table_from_arrow_schema(source.schema);
     REQUIRE(empty.has_value());
     CHECK(std::holds_alternative<ibex::Column<double>>(*empty->columns.at(0).column));
+}
+
+namespace {
+
+/// Arrow's metadata encoding: int32 pair count, then length-prefixed keys and
+/// values, all little-endian.
+auto encode_test_metadata(std::initializer_list<std::pair<std::string, std::string>> pairs)
+    -> std::string {
+    std::string out;
+    const auto put = [&](std::int32_t n) {
+        for (int shift = 0; shift < 32; shift += 8) {
+            out.push_back(static_cast<char>((static_cast<std::uint32_t>(n) >> shift) & 0xFFU));
+        }
+    };
+    put(static_cast<std::int32_t>(pairs.size()));
+    for (const auto& [key, value] : pairs) {
+        put(static_cast<std::int32_t>(key.size()));
+        out += key;
+        put(static_cast<std::int32_t>(value.size()));
+        out += value;
+    }
+    return out;
+}
+
+/// A one-column struct over caller-supplied buffers, format and metadata.
+struct ForeignColumn {
+    std::vector<const void*> buffers;
+    std::string format;
+    std::string metadata;
+    std::array<ArrowArray*, 1> children{};
+    std::array<ArrowSchema*, 1> schema_children{};
+    ArrowArray child{};
+    ArrowArray array{};
+    ArrowSchema child_schema{};
+    ArrowSchema schema{};
+
+    ForeignColumn(std::vector<const void*> column_buffers, std::int64_t length,
+                  std::string column_format, std::string column_metadata = {})
+        : buffers(std::move(column_buffers)),
+          format(std::move(column_format)),
+          metadata(std::move(column_metadata)) {
+        child.length = length;
+        child.n_buffers = static_cast<std::int64_t>(buffers.size());
+        child.buffers = buffers.data();
+        child.release = noop_release_array;
+        children = {&child};
+        array.length = length;
+        array.n_children = 1;
+        array.children = children.data();
+        array.release = noop_release_array;
+
+        child_schema.format = format.c_str();
+        child_schema.name = "u";
+        child_schema.metadata = metadata.empty() ? nullptr : metadata.data();
+        child_schema.release = noop_release_schema;
+        schema_children = {&child_schema};
+        schema.format = "+s";
+        schema.n_children = 1;
+        schema.children = schema_children.data();
+        schema.release = noop_release_schema;
+    }
+};
+
+// Three UUIDs back to back: a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11, then all
+// zeros (a null slot), then ff...ff.
+constexpr std::array<unsigned char, 48> kUuidBytes{
+    0xa0, 0xee, 0xbc, 0x99, 0x9c, 0x0b, 0x4e, 0xf8, 0xbb, 0x6d, 0x6b, 0xb9, 0xbd, 0x38, 0x0a, 0x11,
+    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+
+}  // namespace
+
+TEST_CASE("Arrow C Data imports tagged UUIDs as canonical strings", "[interop][arrow][uuid]") {
+    const std::uint8_t validity = 0b101;  // the middle UUID is null
+    const auto check = [](ForeignColumn& source) {
+        auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
+        INFO((imported.has_value() ? std::string{} : imported.error()));
+        REQUIRE(imported.has_value());
+        const auto* entry = imported->find_entry("u");
+        REQUIRE(entry != nullptr);
+        const auto* values = std::get_if<ibex::Column<std::string>>(entry->column.get());
+        REQUIRE(values != nullptr);
+        REQUIRE(values->size() == 3);
+        CHECK((*values)[0] == "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
+        CHECK((*values)[2] == "ffffffff-ffff-ffff-ffff-ffffffffffff");
+        CHECK(ibex::runtime::is_null(*entry, 1));
+        CHECK_FALSE(ibex::runtime::is_null(*entry, 0));
+    };
+
+    SECTION("fixed_size_binary(16) with the arrow.uuid extension type") {
+        ForeignColumn source({&validity, kUuidBytes.data()}, 3, "w:16",
+                             encode_test_metadata({{"ARROW:extension:name", "arrow.uuid"}}));
+        source.child.null_count = 1;
+        check(source);
+    }
+
+    SECTION("binary tagged uuid by the ADBC PostgreSQL driver, sliced") {
+        // A leading value the slice skips; the null slot holds no bytes.
+        const std::array<std::int32_t, 5> offsets{0, 16, 32, 32, 48};
+        std::array<unsigned char, 48> bytes{};
+        std::copy_n(kUuidBytes.begin(), 16, bytes.begin() + 16);
+        std::copy_n(kUuidBytes.begin() + 32, 16, bytes.begin() + 32);
+        const std::uint8_t sliced_validity = 0b1011;  // row 2 of 4 is null
+        ForeignColumn source({&sliced_validity, offsets.data(), bytes.data()}, 3, "z",
+                             encode_test_metadata({{"ADBC:postgresql:typname", "uuid"}}));
+        source.child.offset = 1;
+        source.child.null_count = 1;
+        check(source);
+    }
+
+    SECTION("an empty result keeps the String type") {
+        ForeignColumn source({nullptr, nullptr}, 0, "w:16",
+                             encode_test_metadata({{"ARROW:extension:name", "arrow.uuid"}}));
+        auto empty = ibex::interop::empty_table_from_arrow_schema(source.schema);
+        REQUIRE(empty.has_value());
+        CHECK(std::holds_alternative<ibex::Column<std::string>>(*empty->columns.at(0).column));
+    }
+
+    SECTION("16 untagged bytes are not guessed to be a UUID") {
+        ForeignColumn source({nullptr, kUuidBytes.data()}, 3, "w:16");
+        auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
+        REQUIRE_FALSE(imported.has_value());
+        CHECK(imported.error() ==
+              "column `u`: Arrow fixed_size_binary(16) has no Ibex column type; convert it to a "
+              "supported type before reading");
+    }
+}
+
+TEST_CASE("A refused column is named, with its type and a way out", "[interop][arrow]") {
+    const std::array<std::int64_t, 1> micros{0};
+    SECTION("a PostgreSQL time column") {
+        ForeignColumn source({nullptr, micros.data()}, 1, "ttu",
+                             encode_test_metadata({{"ADBC:postgresql:typname", "time"}}));
+        auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
+        REQUIRE_FALSE(imported.has_value());
+        CHECK(imported.error() ==
+              "column `u`: PostgreSQL time (Arrow time64[us]) has no Ibex column type; select it "
+              "as u::text or extract(epoch from u)");
+    }
+    SECTION("an untagged interval") {
+        ForeignColumn source({nullptr, micros.data()}, 0, "tin");
+        auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
+        REQUIRE_FALSE(imported.has_value());
+        CHECK(imported.error().starts_with(
+            "column `u`: Arrow interval[month_day_nano] has no Ibex column type"));
+    }
 }
 
 TEST_CASE("Arrow C Data import round-trips dictionary encoded categoricals", "[interop][arrow]") {
@@ -1396,7 +1543,8 @@ TEST_CASE("Arrow C Data schema-only import refuses what a batch import refuses",
 
     auto empty = ibex::interop::empty_table_from_arrow_schema(root);
     REQUIRE_FALSE(empty.has_value());
-    CHECK(empty.error().find("unsupported") != std::string::npos);
+    CHECK(empty.error().find("column `blob`: Arrow binary has no Ibex column type") !=
+          std::string::npos);
 }
 
 TEST_CASE("Arrow C Data schema-only import of a column-less struct is empty",

@@ -552,6 +552,14 @@ TEST_CASE("adbc_read reports errors instead of failing silently", "[adbc]") {
         CHECK_FALSE(r.ok);
         CHECK(contains(r.error, "no_such_table"));
     }
+    SECTION("a column Ibex has no type for is named, with a SQL cast") {
+        const auto r = s.session.execute(read_call(db, "select 1 as id, x'0102' as blob") + ";");
+        REQUIRE_FALSE(r.ok);
+        CHECK(contains(r.error,
+                       "adbc_read: batch import failed: column `blob`: Arrow binary has "
+                       "no Ibex column type; cast it in the query, e.g. "
+                       "CAST(blob AS TEXT)"));
+    }
     SECTION("repeated failures leave the session usable") {
         // Each of these fails after AdbcDatabaseNew, the path that used to skip
         // AdbcDatabaseRelease. Under the sanitizer build (CI) a leak here fails
@@ -1160,4 +1168,20 @@ TEST_CASE("adbc_write and adbc_execute against PostgreSQL", "[adbc][write][postg
 
     execute("drop table ibex_write_pk");
     execute("drop table ibex_write_typed");
+
+    // uuid reads as its canonical text; time has no Ibex type, and the error
+    // names the column and the cast.
+    const auto uuids = s.query(conn,
+                               "select 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid as u "
+                               "union all select null::uuid");
+    CHECK(strings(uuids, "u").at(0) == "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
+    CHECK(nulls(uuids, "u") == std::vector<bool>{false, true});
+    ibex::runtime::ExternArgs time_args;
+    time_args.push_resource(conn);
+    time_args.emplace_back(std::string("select '12:30'::time as t"));
+    const auto times = s.plugin("adbc_query").func(time_args);
+    REQUIRE_FALSE(times.has_value());
+    CHECK(contains(times.error(),
+                   "column `t`: Arrow time64[us] has no Ibex column type; cast it "
+                   "in the query, e.g. CAST(t AS TEXT)"));
 }

@@ -72,12 +72,14 @@ inner quotes escaped). Expected:
    (`10000000000` and `-20000000000` for `big_n`), `dbl` and `real_n` are
    `1.5` / `-2.25` (`real` is float32, widened to `Float64` without loss),
    `flag` is true / false, `label` and `code` are strings, `day` is a date.
+   `uid` (`uuid`) is its canonical text, `a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11`.
    `ts` keeps its microseconds (`2026-01-02 03:04:05.123456`). `tstz` is shown
    in UTC, so row 2's `1999-12-31 23:59:59+01` reads `1999-12-31 22:59:59`.
    Row 3 is null in every column except `id` and `label`.
 2. **Text-typed**: `price` (`numeric`) arrives as the strings `12.34`, `-0.50`
    and null; `doc` (`jsonb`) as the JSON text, shown as `"{\"k\": 1}"` and
-   `"[1, 2]"`.
+   `"[1, 2]"`. The PostgreSQL driver has no option to return `numeric` as a
+   decimal, and its type carries no precision on the wire, so step 3 names it.
 3. **Aggregate** by label, with the driver's text converted to `Decimal(12, 2)`
    in Ibex, preserving exact amounts without a Float64 conversion:
    `alpha` has 2 rows, 1 priced, total `12.34`; `beta` has 1 row, 1 priced,
@@ -98,20 +100,19 @@ to override the default build paths and driver name.
 ## 5. Try the types Ibex refuses
 
 Each query reads a single column. The first form of each is expected to fail
-with an error mentioning `unsupported Arrow column format`; the second, with
-the cast, is expected to work.
+with an error that names the column and its type and suggests a cast, such as
+``column `t`: Arrow time64[us] has no Ibex column type; cast it in the query,
+e.g. CAST(t AS TEXT)``; the second, with the cast, is expected to work.
 
 | Column | PostgreSQL type | Arrives as | Workaround |
 | --- | --- | --- | --- |
 | `bytes` | `bytea` | binary | `encode(bytes, 'hex')` |
-| `uid` | `uuid` | binary | `uid::text` |
 | `t` | `time` | time64 | `t::text` |
 | `iv` | `interval` | month-day-nano interval | `iv::text` |
 | `tags` | `text[]` | list | `array_to_string(tags, ',')` |
 
 ```bash
 for sql in "select bytes from ibex_types"  "select encode(bytes, 'hex') as bytes from ibex_types" \
-           "select uid from ibex_types"    "select uid::text as uid from ibex_types" \
            "select t from ibex_types"      "select t::text as t from ibex_types" \
            "select iv from ibex_types"     "select iv::text as iv from ibex_types" \
            "select tags from ibex_types"   "select array_to_string(tags, ',') as tags from ibex_types"; do
@@ -122,7 +123,6 @@ done
 
 ```powershell
 $queries = "select bytes from ibex_types",  "select encode(bytes, 'hex') as bytes from ibex_types",
-           "select uid from ibex_types",    "select uid::text as uid from ibex_types",
            "select t from ibex_types",      "select t::text as t from ibex_types",
            "select iv from ibex_types",     "select iv::text as iv from ibex_types",
            "select tags from ibex_types",   "select array_to_string(tags, ',') as tags from ibex_types"
@@ -132,7 +132,9 @@ foreach ($sql in $queries) {
 }
 ```
 
-These are types Ibex has no column for.
+These are types Ibex has no column for. A `time` column stays refused rather
+than arriving as a number whose meaning lives only in the docs; `t::text` or
+`extract(epoch from t)` says which one you want.
 
 ## 6. Clean up
 

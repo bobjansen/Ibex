@@ -1,7 +1,7 @@
 # Finishing ADBC support
 
-Status: **in progress** (2026-09-28: Phase 0 done, Phase 2 done, Phase 4
-slices 1-2 done, `float32` widening done; 2026-09-27: performance work is parked behind it,
+Status: **in progress** (2026-09-28: Phases 0, 1 and 2 done, Phase 4 slices
+1-2 done; 2026-09-27: performance work is parked behind it,
 see `beat-duckdb-plan.md`). This plan says what "finished" means for the ADBC
 plugin, what exists today, and the order to build the rest in. The design of
 reusable connections already exists as a separate plan
@@ -36,7 +36,7 @@ remote query, connection pooling, bulk ingestion tuning, and Decimal256.
 | Read | `adbc_read(driver, uri, sql, options = "")` (`libs/adbc/adbc.cpp`, 411 lines), registered as both a materialized and a chunked (streaming) source. One connection per call. |
 | Options | `db.`/`conn.`/`conn.post.`/`stmt.` prefixed `key=value` list with escaping, parsed in the ADBC-free `adbc_options.hpp` (tested without a driver). `entrypoint=` override. |
 | Arrow import | Shared with Arrow C Data and Parquet (`src/interop/arrow_c_data.cpp`); zero-copy where the layout allows; `d:p,s` decimals exact. Empty results keep their schema. |
-| Types refused | `binary` (bytea, uuid), `time64`, `month-day-nano interval`, `list` (`text[]`), each with a SQL-cast workaround in the PostgreSQL walkthrough. PostgreSQL `numeric` and `jsonb` arrive as text; the walkthrough converts `numeric` to `Decimal(p, s)` in Ibex. |
+| Types refused | `binary` (bytea), `time64`, `month-day-nano interval`, `list` (`text[]`), each with a SQL-cast workaround in the PostgreSQL walkthrough. PostgreSQL `numeric` and `jsonb` arrive as text; the walkthrough converts `numeric` to `Decimal(p, s)` in Ibex. |
 | Drivers | Bare names resolved through ADBC manifests. `scripts/install_adbc_driver.{sh,ps1}` install Apache's pinned, SHA-256-checked PyPI wheels for **sqlite** and **postgresql** on Linux x86-64/arm64, macOS x86-64/arm64 and Windows, with no Python needed. The driver manager is built from the pinned apache-arrow-adbc-24 tarball (or a system one). |
 | Tests | `tests/test_adbc.cpp` (8 cases, SQLite: batches, nulls, empty schema, materialized = chunked, options, errors, manifest names) and `tests/test_adbc_options.cpp`; ctest `adbc:sqlite_demo` runs `examples/adbc_sqlite/`. |
 | CI | `.github/workflows/adbc.yml`: Linux (g++) and Windows (MSVC) jobs, SQLite; the Windows job publishes the `ibex-windows-adbc` artifact. |
@@ -73,26 +73,32 @@ unchanged.
 Done when: PostgreSQL runs in CI on every push, and the three not-found cases
 (bad name, bad path, Windows drive-letter path) have tests with the new message.
 
-### Phase 1 — type coverage on import
+### Phase 1 — type coverage on import: **done** (2026-09-28)
 
-Per type, one of three answers, chosen once and documented:
+Per type, one answer, chosen once and documented (decisions 2026-09-28):
 
-| Arrow type | Proposed | Why |
+| Arrow type | Behaviour | Why |
 |---|---|---|
-| `float32` | widen to Float64 | **Done** (shared Arrow C Data importer, so Parquet and Arrow input widen too). Lossless. |
-| `binary` / `large_binary` | refuse, suggest a cast | No Ibex binary column. Revisit only with a real use. |
-| `fixed_size_binary(16)` from uuid | refuse, suggest `::text` | Same. A uuid extension-type check could map it to its canonical string later. |
-| `time32` / `time64` | **decision needed**: refuse, or Int64 nanoseconds since midnight | Ibex has no time-of-day type. |
-| intervals | refuse, suggest `::text` | No Ibex interval type. |
-| `list` / `large_list` | refuse, suggest `array_to_string` | No nested columns. |
-| dictionary-encoded strings | Categorical | Check this works as it does for Parquet. |
-| `timestamp` with zone | already UTC nanoseconds | Document; Ibex timestamps carry no zone (memory: timestamps-no-TZ). |
+| `float32` | widen to Float64 | Lossless. Shared Arrow C Data importer, so Parquet and Arrow input widen too. |
+| uuid: `fixed_size_binary(16)` tagged `arrow.uuid`, or any binary the PostgreSQL driver tags `ADBC:postgresql:typname=uuid` | String, canonical lowercase 8-4-4-4-12 | Lossless, joinable, what users write in SQL. Untagged 16-byte columns are not guessed. |
+| `time32` / `time64` | refuse | No time-of-day type; Int64 nanoseconds would print as a bare number whose meaning lives only in the docs. `t::text` or `extract(epoch from t)` says which one you want. |
+| `binary` / `large_binary`, intervals, `list` / `large_list`, opaque driver types (`inet`, `timetz`, ...) | refuse | No Ibex column for them. |
+| dictionary-encoded strings | Categorical | Already, via the shared importer (`[interop][arrow]` tests). |
+| `timestamp` with zone | UTC nanoseconds, zone kept as column metadata | Unchanged. |
 
-Also check the PostgreSQL driver's option for returning `numeric` as Arrow
-decimal instead of text. If it exists, the walkthrough and the docs recommend it.
+Every refusal names the column and the Arrow type (and the PostgreSQL type
+when the driver tagged it), e.g. ``column `t`: Arrow time64[us] has no Ibex
+column type``. The importer ends it with `kUnsupportedColumnAdvice`; the ADBC
+plugin replaces that with ``cast it in the query, e.g. CAST(t AS TEXT)``
+(standard SQL, so right for every driver). A PostgreSQL-tagged column gets
+`t::text` instead, plus `extract(epoch ...)`, `encode(..., 'hex')` or
+`array_to_string` where they fit.
 
-Done when: every row above has a test with the chosen behaviour, and the
-walkthrough's "refused" table matches.
+`numeric`: the PostgreSQL driver (1.12) has no option to return it as an Arrow
+decimal (its options are `batch_size_hint_bytes`, `use_copy`,
+`disable_decimal_fast_path`, `transaction_status`), and the wire type carries
+no precision, so it stays text and the walkthrough converts it with
+`Decimal(x, p, s)`.
 
 ### Phase 2 — write and execute: **done** (2026-09-28, connection form only)
 
@@ -224,7 +230,8 @@ closes the arc; its driver and CI items can go in as early as useful.
 
 ## Decisions needed
 
-1. **`time` columns:** refuse, or Int64 nanoseconds since midnight?
+1. ~~**`time` columns**~~ decided 2026-09-28: refuse, with an error naming the
+   cast. uuid: canonical string.
 2. **Phase 4 in "finished"?** Everything else is library work; Phase 4 is a
    language feature. Without it ADBC is complete for scripting (one connection
    per call) but not for session-style use.

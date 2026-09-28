@@ -15,10 +15,11 @@ let uri = coalesce(scalar(args[filter name == "uri", select { value }]),
     "postgresql://postgres:ibex@localhost:55432/postgres");
 
 // 1. Types Ibex stores natively: smallint and integer widen to Int64, real
-//    widens to Float64, timestamps become nanoseconds, timestamptz arrives in
-//    UTC. Row 3 is all NULL apart from id and label.
+//    widens to Float64, uuid becomes its canonical text, timestamps become
+//    nanoseconds, timestamptz arrives in UTC. Row 3 is all NULL apart from id
+//    and label.
 adbc_read(driver, uri,
-    "select id, small_n, int_n, big_n, dbl, real_n, flag, label, code, day, ts, tstz
+    "select id, small_n, int_n, big_n, dbl, real_n, flag, label, code, uid, day, ts, tstz
      from ibex_types order by id");
 
 // 2. The driver hands numeric and jsonb over as text.

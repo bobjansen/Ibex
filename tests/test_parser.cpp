@@ -190,10 +190,27 @@ TEST_CASE("Parse extern type declaration and resource-typed extern fn") {
     REQUIRE(query.return_type.kind == Type::Kind::DataFrame);
 }
 
-TEST_CASE("Resource types are rejected outside extern fn signatures") {
-    auto result = parse("fn f(db: AdbcConnection) -> Int { 1; }");
-    REQUIRE_FALSE(result.has_value());
-    REQUIRE(result.error().message.find("unknown type 'AdbcConnection'") != std::string::npos);
+TEST_CASE("Resource types are accepted in fn signatures") {
+    auto result = parse(
+        "fn f(mutable db: AdbcConnection) -> AdbcConnection { db; }\n"
+        "fn g(db: AdbcConnection, n: Int = 1) -> Int { n; }");
+    REQUIRE(result.has_value());
+    const auto& f = std::get<FunctionDecl>(result->statements.at(0));
+    REQUIRE(f.params.at(0).type.kind == Type::Kind::Resource);
+    REQUIRE(f.params.at(0).type.resource == "AdbcConnection");
+    REQUIRE(f.params.at(0).effect == Param::Effect::Mutable);
+    REQUIRE(f.return_type.kind == Type::Kind::Resource);
+    REQUIRE(f.return_type.resource == "AdbcConnection");
+}
+
+TEST_CASE("Resource types are rejected outside function signatures") {
+    auto annotated = parse("let db: AdbcConnection = open();");
+    REQUIRE_FALSE(annotated.has_value());
+    REQUIRE(annotated.error().message.find("unknown type 'AdbcConnection'") != std::string::npos);
+
+    auto defaulted = parse("fn f(db: AdbcConnection = open()) -> Int { 1; }");
+    REQUIRE_FALSE(defaulted.has_value());
+    REQUIRE(defaulted.error().message.find("cannot have a default value") != std::string::npos);
 }
 
 TEST_CASE("'type' stays an ordinary identifier") {

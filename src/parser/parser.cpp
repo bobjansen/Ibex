@@ -255,8 +255,13 @@ class Parser {
         std::vector<Param> params;
         if (!check(TokenKind::RParen)) {
             do {
-                auto param = parse_param();
+                auto param = parse_param(/*allow_resource=*/true);
                 if (!param.has_value()) {
+                    return std::nullopt;
+                }
+                if (param->type.kind == Type::Kind::Resource && param->default_value != nullptr) {
+                    error_ = make_error(previous(), "resource parameter '" + param->name +
+                                                        "' cannot have a default value");
                     return std::nullopt;
                 }
                 params.push_back(std::move(*param));
@@ -271,7 +276,7 @@ class Parser {
         if (!consume(TokenKind::Arrow, "expected '->' after parameter list")) {
             return std::nullopt;
         }
-        auto return_type = parse_type();
+        auto return_type = parse_type(/*allow_resource=*/true);
         if (!return_type.has_value()) {
             return std::nullopt;
         }
@@ -2400,8 +2405,8 @@ class Parser {
     }
 
     /// `allow_resource`: a bare identifier names an `extern type` resource.
-    /// Only `extern fn` signatures take one for now; resources in `fn`
-    /// parameters and `let` annotations come with scoped ownership.
+    /// Only `extern fn` and `fn` signatures take one; a resource binding
+    /// takes its type from the call that produced it, never an annotation.
     auto parse_type(bool allow_resource = false) -> std::optional<Type> {
         if (auto scalar = parse_scalar_type()) {
             return Type{
@@ -2460,7 +2465,7 @@ class Parser {
             }
             error_ = make_error(peek(), "unknown type '" + std::string(peek().lexeme) +
                                             "' (a resource type declared with 'extern type' "
-                                            "can appear only in 'extern fn' signatures for now)");
+                                            "can appear only in function signatures)");
             return std::nullopt;
         }
         error_ = make_error(peek(), "expected type");

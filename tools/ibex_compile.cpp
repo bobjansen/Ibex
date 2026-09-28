@@ -4,6 +4,7 @@
 #include <ibex/codegen/emitter.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
+#include <ibex/parser/resource_functions.hpp>
 #include <ibex/parser/scalar_bindings.hpp>
 
 #include <CLI/CLI.hpp>
@@ -14,70 +15,51 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <optional>
 #include <robin_hood.h>
-#include <set>
 #include <string>
 #include <string_view>
-#include <type_traits>
 #include <variant>
 
 #include "import_resolver.hpp"
 
 namespace {
 
-/// The first function taking or returning a resource type that `program`
-/// calls, if any.
+/// The first resource function `program` calls, if any: one taking or
+/// returning a resource type (extern type), or a `fn` that calls one.
 auto first_resource_call(const ibex::parser::Program& program) -> std::optional<std::string> {
-    std::set<std::string, std::less<>> resource_functions;
+    std::map<std::string, const ibex::parser::ExternDecl*, std::less<>> externs;
+    std::map<std::string, const ibex::parser::FunctionDecl*, std::less<>> functions;
     for (const auto& stmt : program.statements) {
-        const auto* decl = std::get_if<ibex::parser::ExternDecl>(&stmt);
-        if (decl == nullptr) {
-            continue;
-        }
-        const auto is_resource = [](const ibex::parser::Type& type) {
-            return type.kind == ibex::parser::Type::Kind::Resource;
-        };
-        if (is_resource(decl->return_type) ||
-            std::ranges::any_of(decl->params, [&](const ibex::parser::Param& param) {
-                return is_resource(param.type);
-            })) {
-            resource_functions.insert(decl->name);
+        if (const auto* decl = std::get_if<ibex::parser::ExternDecl>(&stmt)) {
+            externs.insert_or_assign(decl->name, decl);
+        } else if (const auto* fn = std::get_if<ibex::parser::FunctionDecl>(&stmt)) {
+            functions.insert_or_assign(fn->name, fn);
         }
     }
-    std::optional<std::string> found;
-    const auto check = [&](const ibex::parser::Expr& expr) {
-        (void)ibex::parser::contains_call_if(expr, [&](std::string_view callee) {
-            if (resource_functions.contains(callee)) {
-                found = std::string(callee);
-                return true;
-            }
-            return false;
+    const ibex::parser::ResourceFunctions resource_functions(
+        [&](std::string_view name) -> const ibex::parser::ExternDecl* {
+            auto it = externs.find(name);
+            return it == externs.end() ? nullptr : it->second;
+        },
+        [&](std::string_view name) -> const ibex::parser::FunctionDecl* {
+            auto it = functions.find(name);
+            return it == functions.end() ? nullptr : it->second;
         });
-    };
     for (const auto& stmt : program.statements) {
+        const ibex::parser::Expr* value = nullptr;
         if (const auto* let = std::get_if<ibex::parser::LetStmt>(&stmt)) {
-            check(*let->value);
+            value = let->value.get();
         } else if (const auto* tuple = std::get_if<ibex::parser::TupleLetStmt>(&stmt)) {
-            check(*tuple->value);
+            value = tuple->value.get();
         } else if (const auto* expr = std::get_if<ibex::parser::ExprStmt>(&stmt)) {
-            check(*expr->expr);
-        } else if (const auto* fn = std::get_if<ibex::parser::FunctionDecl>(&stmt)) {
-            for (const auto& body : fn->body) {
-                std::visit(
-                    [&](const auto& s) {
-                        using T = std::decay_t<decltype(s)>;
-                        if constexpr (std::is_same_v<T, ibex::parser::ExprStmt>) {
-                            check(*s.expr);
-                        } else {
-                            check(*s.value);
-                        }
-                    },
-                    body);
-            }
+            value = expr->expr.get();
         }
-        if (found) {
-            return found;
+        if (value != nullptr) {
+            if (auto found = resource_functions.first_call(*value)) {
+                return found;
+            }
         }
     }
     return std::nullopt;
@@ -148,8 +130,8 @@ int main(int argc, char* argv[]) {
     // generated C++ has no runtime for them yet.
     if (auto callee = first_resource_call(*scalar_program)) {
         std::cerr << "ibex_compile: " << *callee
-                  << " takes or returns a resource (extern type), which compiled programs do not "
-                     "support yet; run the script with the ibex tool instead\n";
+                  << " uses a resource (extern type), which compiled programs do not support "
+                     "yet; run the script with the ibex tool instead\n";
         return 1;
     }
 

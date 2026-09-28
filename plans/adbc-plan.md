@@ -1,7 +1,7 @@
 # Finishing ADBC support
 
-Status: **in progress** (2026-09-28: Phase 0 done, Phase 4 slices 1-2 done,
-`float32` widening done; 2026-09-27: performance work is parked behind it,
+Status: **in progress** (2026-09-28: Phase 0 done, Phase 2 done, Phase 4
+slices 1-2 done, `float32` widening done; 2026-09-27: performance work is parked behind it,
 see `beat-duckdb-plan.md`). This plan says what "finished" means for the ADBC
 plugin, what exists today, and the order to build the rest in. The design of
 reusable connections already exists as a separate plan
@@ -94,33 +94,59 @@ decimal instead of text. If it exists, the walkthrough and the docs recommend it
 Done when: every row above has a test with the chosen behaviour, and the
 walkthrough's "refused" table matches.
 
-### Phase 2 — write and execute (one-off form)
+### Phase 2 — write and execute: **done** (2026-09-28, connection form only)
 
-Mirror `adbc_read`'s shape: one connection per call, same `options` string.
+Extern declarations are keyed by name, so one name cannot take both a
+`(driver, uri, ...)` and a `(db, ...)` form. Decided: connection form only. A
+one-off write is `adbc_connect`, `adbc_write`, `adbc_close`; `adbc_read`
+stays as the one-off streaming read.
 
-- `adbc_write(df, driver, uri, table, mode = "create", options = "")` → Int
-  (rows written). ADBC bulk ingestion: `AdbcStatementSetOption` with
-  `ADBC_INGEST_OPTION_TARGET_TABLE` and `ADBC_INGEST_OPTION_MODE`
-  (create / append / replace / create_append), then `AdbcStatementBindStream`
-  with the table exported through the existing Arrow C Data export
-  (`arrow_c_data.cpp` exports every Ibex column type, Decimal included). It is
-  a table sink like `write_csv`, so it goes through the script driver's sink
-  path (`ScriptSink`).
-- `adbc_execute(driver, uri, sql, options = "")` → Int (affected rows, or −1
-  when the driver does not report it). `AdbcStatementExecuteUpdate`. Today the
-  tests seed SQLite by running DDL through `adbc_read`, which works only by
-  accident.
+As built:
 
-Round-trip tests on SQLite and PostgreSQL: every Ibex column type, nulls, an
-empty table, Decimal precision, the four modes, and a failure halfway through a
-write.
+- `adbc_execute(db, sql)` → Int: `AdbcStatementExecuteQuery` with no output
+  stream; the affected rows, or −1 when the driver reports none. For DDL the
+  count is the driver's: PostgreSQL −1, SQLite repeats the previous
+  statement's `sqlite3_changes()`.
+- `adbc_write(db, df, table, mode = "create")` → Int (rows written: the
+  driver's count, else the table's rows). Ingest options `target_table` and
+  `mode` (create / append / replace / create_append), then
+  `AdbcStatementBind` with one struct array from `export_table_to_arrow`
+  (zero-copy; the statement is released before the export).
+- Both run on a `LeasedStatement` (statement + the session's one-statement
+  lease) in `libs/adbc/adbc.cpp`.
+- Resource functions can now take DataFrame/TimeFrame arguments:
+  `ExternArgs::push_table` / `table(i)`, filled by `ResourceCalls::call` with
+  `eval_table_expr`. Registry ABI change: rebuild plugins. A connection call
+  nested under a query clause inside another connection call's argument
+  (`adbc_write(db, adbc_query(db, ...)[filter ...], ...)`) is still refused by
+  the placement check; bind it with `let` first. Allowing it means hoisting
+  inside resource-call arguments.
 
-Done when: a script can create, fill and query a table with no other tool, and
-the round trip is byte-identical per type.
+Measured per type (tests `[adbc][write]`, PostgreSQL gated on
+`IBEX_TEST_POSTGRES_URI`):
 
-### Phase 3 — parameters (one-off form)
+| Ibex | PostgreSQL column, read back | SQLite column, read back |
+|---|---|---|
+| Int64 | bigint, Int64 | integer, Int64 |
+| Float64 | double precision, Float64 | real, Float64 |
+| Bool | boolean, Bool | integer 0/1, Int64 |
+| String / Categorical | text, String | text, String |
+| Date | date, Date | ISO text, String |
+| Timestamp | timestamp, Timestamp truncated to microseconds | ISO text with nanoseconds, String |
+| Decimal(p, s) | numeric (unconstrained), text on read (Phase 1) | refused by the driver ("unsupported type decimal128") |
 
-`adbc_read` and `adbc_execute` take an optional parameter table: one row binds
+Nulls survive in every column on both. An empty table creates its columns. A
+write that fails part way (duplicate key) leaves no rows on either driver and
+the connection usable.
+
+Open: the round trip is not byte-identical for Decimal (numeric reads back as
+text, and the declared precision/scale are not kept) or for sub-microsecond
+timestamps on PostgreSQL. Writing Decimal to SQLite needs a conversion the
+user chooses.
+
+### Phase 3 — parameters (connection form)
+
+`adbc_query` and `adbc_execute` take an optional parameter table: one row binds
 once, `n` rows execute `n` times (batch insert/update). `AdbcStatementPrepare`,
 then `AdbcStatementBind` with the parameter table exported as Arrow. SQL
 placeholder syntax is the driver's (`?` for SQLite, `$1` for PostgreSQL);
@@ -149,10 +175,9 @@ changes the language: a new nominal resource type, a resource path through
 extern dispatch (a registry ABI change, so plugins need rebuilding), and effect
 summaries in the planner. Its own acceptance list stands.
 
-Then give Phases 2 and 3 their connection forms (`adbc_write(db, df, table,
-mode)`, `adbc_execute(db, sql[, params])`, parameters on `adbc_query`), and add
-the transaction options (`adbc.connection.autocommit` off, commit, rollback),
-which only make sense on a reused connection.
+Then add parameters (Phase 3) and the transaction options
+(`adbc.connection.autocommit` off, commit, rollback), which only make sense on
+a reused connection.
 
 Done when: the plan's acceptance tests pass, including Docker PostgreSQL
 checks that one connection keeps a temporary table across statements and two
@@ -211,8 +236,8 @@ closes the arc; its driver and CI items can go in as early as useful.
 
 ## Testing
 
-- **SQLite** in every build with ADBC on: no service needed; seed through
-  `adbc_execute` once it exists.
+- **SQLite** in every build with ADBC on: no service needed; tests seed through
+  `adbc_execute`.
 - **PostgreSQL** in CI as a service (Phase 0), and locally through Docker.
   Always ask before starting a container.
 - **Round trips** per type as the core check for writing and parameters.

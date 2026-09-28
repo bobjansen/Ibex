@@ -17,15 +17,22 @@ let db = adbc_connect("sqlite", ":memory:");
 
 // Each call runs on the same connection, so the table made here is still
 // there for the queries below. adbc_read would open a fresh database each time.
-adbc_query(db, "create table trades (symbol text, qty integer, px real)");
-adbc_query(db, "insert into trades values ('AAPL', 10, 150.0), ('MSFT', 5, 300.0), ('AAPL', 20, 151.0)");
+// adbc_execute runs statements that return no rows and returns the number of
+// rows they changed.
+adbc_execute(db, "create table trades (symbol text, qty integer, px real)");
+adbc_execute(db, "insert into trades values ('AAPL', 10, 150.0), ('MSFT', 5, 300.0), ('AAPL', 20, 151.0)");
 
 // A query result is an ordinary table operand.
-adbc_query(db, "select symbol, qty, px from trades")[
+let totals = adbc_query(db, "select symbol, qty, px from trades")[
     select { qty = sum(qty), notional = sum(qty * px) },
     by symbol,
     order symbol
 ];
+
+// adbc_write stores an Ibex table in the database (mode "create" by default;
+// also "append", "replace" and "create_append") and returns the rows written.
+adbc_write(db, totals, "totals");
+adbc_query(db, "select * from totals order by symbol");
 
 // A function can take the connection. It shares the caller's connection, so
 // it sees the same table; `mutable` records that the query uses its state.

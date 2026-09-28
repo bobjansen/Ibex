@@ -116,7 +116,8 @@ using ExternValue = std::variant<Table, ScalarValue, StreamTimeout, ResourcePtr>
 
 /// Arguments to an extern function, by position. Scalar arguments are the
 /// vector's elements. A resource argument occupies a null scalar slot and is
-/// read with `resource(i)` or `resource_as<T>(i)`.
+/// read with `resource(i)` or `resource_as<T>(i)`; so does a table argument of
+/// a resource function (one that also takes a resource), read with `table(i)`.
 class ExternArgs : public std::vector<ScalarValue> {
    public:
     using std::vector<ScalarValue>::vector;
@@ -144,8 +145,24 @@ class ExternArgs : public std::vector<ScalarValue> {
         return std::dynamic_pointer_cast<T>(resource(index));
     }
 
+    void push_table(std::shared_ptr<const Table> value) {
+        tables_.emplace_back(size(), std::move(value));
+        push_back(ScalarValue{});
+    }
+
+    /// The table at position `index`, or null when that argument is not a table.
+    [[nodiscard]] auto table(std::size_t index) const -> std::shared_ptr<const Table> {
+        for (const auto& [position, value] : tables_) {
+            if (position == index) {
+                return value;
+            }
+        }
+        return nullptr;
+    }
+
    private:
     std::vector<std::pair<std::size_t, ResourcePtr>> resources_;
+    std::vector<std::pair<std::size_t, std::shared_ptr<const Table>>> tables_;
 };
 using ExternFn = std::function<std::expected<ExternValue, std::string>(const ExternArgs&)>;
 

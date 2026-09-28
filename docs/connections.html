@@ -97,9 +97,11 @@
 
 <span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_connect</span>(driver: String, uri: String, options: String = <span class="str">""</span>)
     -&gt; AdbcConnection <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
-<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_query</span>(<span class="kw">mutable</span> db: AdbcConnection, sql: String) -&gt; DataFrame
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_query</span>(<span class="kw">mutable</span> db: AdbcConnection, sql: String,
+                     params: DataFrame = Table {}) -&gt; DataFrame
     <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
-<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_execute</span>(<span class="kw">mutable</span> db: AdbcConnection, sql: String) -&gt; Int
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_execute</span>(<span class="kw">mutable</span> db: AdbcConnection, sql: String,
+                       params: DataFrame = Table {}) -&gt; Int
     <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
 <span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_write</span>(<span class="kw">mutable</span> db: AdbcConnection, df: DataFrame, table: String,
                      mode: String = <span class="str">"create"</span>) -&gt; Int <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
@@ -107,8 +109,9 @@
     <table class="repl-table">
       <tbody>
         <tr><td><code>adbc_connect(driver, uri, options)</code></td><td>Open a connection. <code>driver</code> and <code>options</code> work as for <code>adbc_read</code>; <code>stmt.</code> options apply to every query on the connection.</td></tr>
-        <tr><td><code>adbc_query(db, sql)</code></td><td>Run SQL on the connection and return the result as a table.</td></tr>
-        <tr><td><code>adbc_execute(db, sql)</code></td><td>Run a statement that returns no rows (DDL, <code>insert</code>, <code>update</code>, <code>delete</code>). Returns the affected-row count, or <code>-1</code> when the driver reports none.</td></tr>
+        <tr><td><code>adbc_query(db, sql, params)</code></td><td>Run SQL on the connection and return the result as a table.</td></tr>
+        <tr><td><code>adbc_execute(db, sql, params)</code></td><td>Run a statement that returns no rows (DDL, <code>insert</code>, <code>update</code>, <code>delete</code>). Returns the affected-row count, or <code>-1</code> when the driver reports none.</td></tr>
+        <tr><td><code>params</code></td><td>Optional. A table whose columns bind, by position, to the statement's placeholders in the driver's syntax (<code>?</code> for SQLite, <code>$1</code> for PostgreSQL). The statement is prepared once and runs once per row: a query's results follow one another in row order, and <code>adbc_execute</code> returns the summed count. A table with no rows runs nothing. SQLite rejects a column count that does not match the placeholders; PostgreSQL ignores extra columns.</td></tr>
         <tr><td><code>adbc_write(db, df, table, mode)</code></td><td>Bulk-insert <code>df</code> into <code>table</code> and return the rows written. <code>mode</code>: <code>create</code> (default; the table must not exist), <code>append</code>, <code>replace</code> or <code>create_append</code>. <code>df</code> is any table expression, but a connection call in it must be bound with <code>let</code> first.</td></tr>
         <tr><td><code>adbc_close(db)</code></td><td>Close the connection for every binding of it. Returns <code>1</code> the first time and <code>0</code> after; a query on a closed connection is an error.</td></tr>
       </tbody>
@@ -298,7 +301,6 @@ trades[<span class="kw">update</span> { n = ^n }];</code></pre>
         <h3>ADBC</h3>
         <ul>
           <li>One active query per connection; a second concurrent use reports the connection as busy.</li>
-          <li>No bound parameters yet; values go into the SQL text.</li>
           <li>No transactions, pooling, or cancellation of a running query.</li>
           <li>An error while cleaning up a closed connection is not reported.</li>
         </ul>

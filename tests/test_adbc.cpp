@@ -970,6 +970,68 @@ TEST_CASE("adbc_write takes any table expression, also inside functions", "[adbc
     CHECK(contains(closed.error, "adbc_write: connection is closed"));
 }
 
+TEST_CASE("adbc_query and adbc_execute bind a parameter table", "[adbc][params]") {
+    AdbcSession s;
+    SqliteDb db;
+    const auto exec = [&](const std::string& source) {
+        auto result = s.session.execute(source);
+        INFO(source);
+        INFO(result.error);
+        REQUIRE(result.ok);
+        return result;
+    };
+    exec("let db = adbc_connect(" + ibex_str(sqlite_driver()) + ", " + ibex_str(db.path()) + ");");
+    exec("adbc_execute(db, \"create table t (id integer, name text, px real)\");");
+
+    // One prepared statement, one execution per row; the counts add up. A
+    // quote in a value is data, not SQL.
+    const auto inserted = exec(
+        "adbc_execute(db, \"insert into t values (?, ?, ?)\", "
+        "Table { id = [1, 2, 3], name = [\"O'Hara\", null, \"c\"], px = [1.5, 2.5, null] });");
+    CHECK(std::get<std::int64_t>(*inserted.scalar) == 3);
+    const auto stored = exec("adbc_query(db, \"select id, name, px from t order by id\");");
+    CHECK(strings(*stored.table, "name").at(0) == "O'Hara");
+    CHECK(nulls(*stored.table, "name") == std::vector<bool>{false, true, false});
+    CHECK(nulls(*stored.table, "px") == std::vector<bool>{false, false, true});
+
+    // A query binds by position; its result is an ordinary table.
+    const auto one = exec(
+        "adbc_query(db, \"select id from t where id >= ? and name is not null order by id\", "
+        "Table { lo = [2] });");
+    CHECK(ints(*one.table, "id") == std::vector<std::int64_t>{3});
+
+    // Several parameter rows: the results follow one another, in row order.
+    const auto many = exec(
+        "adbc_query(db, \"select id, ? as tag from t where id = ?\", "
+        "Table { tag = [\"third\", \"first\"], id = [3, 1] });");
+    CHECK(ints(*many.table, "id") == std::vector<std::int64_t>{3, 1});
+    CHECK(strings(*many.table, "tag") == std::vector<std::string>{"third", "first"});
+
+    // No parameter rows: nothing runs.
+    const auto none = exec(
+        "adbc_query(db, \"select id from t where id = ?\", Table { id = [1] }[filter id > 5]);");
+    CHECK(none.table->rows() == 0);
+    const auto no_update = exec(
+        "adbc_execute(db, \"delete from t where id = ?\", Table { id = [1] }[filter id > 5]);");
+    CHECK(std::get<std::int64_t>(*no_update.scalar) == 0);
+
+    // The driver checks the parameter count; the connection survives.
+    const auto mismatch =
+        s.session.execute("adbc_query(db, \"select ? as a\", Table { a = [1], b = [2] });");
+    REQUIRE_FALSE(mismatch.ok);
+    CHECK(contains(mismatch.error, "adbc_query:"));
+    CHECK(contains(mismatch.error, "parameter count mismatch"));
+
+    // A function can pass a parameter table through.
+    exec(
+        "fn by_id(mutable c: AdbcConnection, ids: DataFrame) -> DataFrame {\n"
+        "    adbc_query(c, \"select name from t where id = ?\", ids);\n"
+        "}\n"
+        "let named = by_id(db, Table { id = [3, 1] });");
+    const auto named = exec("named;");
+    CHECK(strings(*named.table, "name") == std::vector<std::string>{"c", "O'Hara"});
+}
+
 // Reusable connections against a real PostgreSQL server. Runs only when
 // IBEX_TEST_POSTGRES_URI is set (the ADBC workflow's postgres service, or a
 // local `docker run -e POSTGRES_PASSWORD=ibex -p 55432:5432 postgres:17`);
@@ -1168,6 +1230,76 @@ TEST_CASE("adbc_write and adbc_execute against PostgreSQL", "[adbc][write][postg
 
     execute("drop table ibex_write_pk");
     execute("drop table ibex_write_typed");
+
+    // Parameters: every Ibex type binds, Categorical and Decimal included,
+    // and several rows run as one prepared statement.
+    execute("drop table if exists ibex_params");
+    execute(
+        "create table ibex_params (i bigint, f double precision, b boolean, s text, "
+        "sym text, d date, ts timestamp, amount numeric(12, 2))");
+    auto params = typed_table();
+    auto param_amount = ibex::runtime::make_decimal_column({.precision = 12, .scale = 2});
+    param_amount.push_back(ibex::Decimal{1234});
+    param_amount.push_back(ibex::Decimal{0});
+    param_amount.push_back(ibex::Decimal{-5});
+    params.add_column("amount", std::move(param_amount),
+                      ibex::runtime::ValidityBitmap{true, false, true});
+    {
+        ibex::runtime::ExternArgs args;
+        args.push_resource(conn);
+        args.emplace_back(
+            std::string("insert into ibex_params values ($1, $2, $3, $4, $5, $6, $7, $8)"));
+        args.push_table(std::make_shared<const ibex::runtime::Table>(std::move(params)));
+        auto inserted = s.plugin("adbc_execute").func(args);
+        INFO((inserted.has_value() ? std::string{} : inserted.error()));
+        REQUIRE(inserted.has_value());
+    }
+    const auto bound = s.query(conn,
+                               "select i, f, b, s, sym, d, ts, amount::text as amount from "
+                               "ibex_params order by i desc");
+    CHECK(ints(bound, "i") == std::vector<std::int64_t>{1, 0, -3});
+    CHECK(strings(bound, "sym").at(2) == "AAPL");
+    CHECK(strings(bound, "amount").at(0) == "12.34");
+    const auto* bound_days = std::get_if<ibex::Column<ibex::Date>>(bound.find("d"));
+    REQUIRE(bound_days != nullptr);
+    CHECK((*bound_days)[2].days == 10956);
+    const auto* bound_stamps = std::get_if<ibex::Column<ibex::Timestamp>>(bound.find("ts"));
+    REQUIRE(bound_stamps != nullptr);
+    CHECK((*bound_stamps)[0].nanos == 1767323045123456000);
+    for (const auto* name : {"f", "b", "s", "sym", "d", "ts", "amount"}) {
+        INFO(name);
+        CHECK(nulls(bound, name) == middle);
+    }
+    {
+        ibex::runtime::Table lookup;
+        lookup.add_column("i", ibex::Column<std::int64_t>{-3, 1});
+        ibex::runtime::ExternArgs args;
+        args.push_resource(conn);
+        args.emplace_back(std::string("select i, s from ibex_params where i = $1"));
+        args.push_table(std::make_shared<const ibex::runtime::Table>(std::move(lookup)));
+        auto found = s.plugin("adbc_query").func(args);
+        REQUIRE(found.has_value());
+        const auto& rows = std::get<ibex::runtime::Table>(*found);
+        CHECK(ints(rows, "i") == std::vector<std::int64_t>{-3, 1});
+        CHECK(strings(rows, "s") == std::vector<std::string>{"c", "a"});
+    }
+    {
+        // No parameter rows: nothing runs, and the driver still describes the
+        // result's columns.
+        ibex::runtime::Table no_rows;
+        no_rows.add_column("i", ibex::Column<std::int64_t>{});
+        ibex::runtime::ExternArgs args;
+        args.push_resource(conn);
+        args.emplace_back(std::string("select i, s from ibex_params where i = $1"));
+        args.push_table(std::make_shared<const ibex::runtime::Table>(std::move(no_rows)));
+        auto found = s.plugin("adbc_query").func(args);
+        REQUIRE(found.has_value());
+        const auto& rows = std::get<ibex::runtime::Table>(*found);
+        CHECK(rows.rows() == 0);
+        CHECK(rows.find("i") != nullptr);
+        CHECK(rows.find("s") != nullptr);
+    }
+    execute("drop table ibex_params");
 
     // uuid reads as its canonical text; time has no Ibex type, and the error
     // names the column and the cast.

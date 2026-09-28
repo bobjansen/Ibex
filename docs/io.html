@@ -559,7 +559,20 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
 <span class="kw">let</span> trades = <span class="fn-name">read_csv</span>(<span class="str">"data/trades.csv"</span>);
 <span class="fn-name">adbc_write</span>(db, trades, <span class="str">"trades"</span>, <span class="str">"replace"</span>);
 <span class="fn-name">adbc_execute</span>(db, <span class="str">"create index on trades (symbol)"</span>);
+
+<span class="cm">// Values bind to placeholders ($1 for PostgreSQL, ? for SQLite): one</span>
+<span class="cm">// prepared statement, one run per row, no quoting in the SQL text.</span>
+<span class="fn-name">adbc_execute</span>(db, <span class="str">"delete from trades where symbol = $1"</span>,
+             Table { symbol = [<span class="str">"TSLA"</span>, <span class="str">"GME"</span>] });
+<span class="fn-name">adbc_query</span>(db, <span class="str">"select * from trades where qty &gt; $1"</span>, Table { min_qty = [<span class="num">100</span>] });
 <span class="fn-name">adbc_close</span>(db);</code></pre>
+        <p>
+          <code>adbc_query</code> and <code>adbc_execute</code> take an
+          optional parameter table. Its columns bind by position; each row
+          runs the prepared statement once, a query's results following one
+          another and <code>adbc_execute</code>'s counts adding up. A table
+          with no rows runs nothing.
+        </p>
         <p>
           Every Ibex column type has a PostgreSQL column type: Int64 as
           <code>bigint</code>, Float64 as <code>double precision</code>, Bool,

@@ -18,6 +18,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -28,6 +29,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <variant>
 #include <vector>
 
@@ -637,4 +639,120 @@ TEST_CASE("Functions take, open and return ADBC connections", "[adbc][connection
     const auto closed = s.session.execute("adbc_close(db);");
     REQUIRE(closed.ok);
     CHECK(std::get<std::int64_t>(*closed.scalar) == 1);
+}
+
+// Reusable connections against a real PostgreSQL server. Runs only when
+// IBEX_TEST_POSTGRES_URI is set (the ADBC workflow's postgres service, or a
+// local `docker run -e POSTGRES_PASSWORD=ibex -p 55432:5432 postgres:17`);
+// IBEX_TEST_POSTGRES_DRIVER overrides the driver name. The server itself says
+// which backend serves each query (pg_backend_pid) and whether a closed
+// connection's backend is gone (pg_stat_activity).
+TEST_CASE("adbc_connect against PostgreSQL", "[adbc][connection][postgresql]") {
+    const auto uri = get_env("IBEX_TEST_POSTGRES_URI");
+    if (!uri.has_value() || uri->empty()) {
+        SKIP("IBEX_TEST_POSTGRES_URI is not set");
+    }
+    const std::string driver = get_env("IBEX_TEST_POSTGRES_DRIVER").value_or("postgresql");
+    AdbcSession s;
+    const auto exec = [&](const std::string& source) {
+        auto result = s.session.execute(source);
+        INFO(source);
+        INFO(result.error);
+        REQUIRE(result.ok);
+        return result;
+    };
+    const auto pid_of = [&](const std::string& conn) {
+        const auto r =
+            exec("adbc_query(" + conn + ", \"select pg_backend_pid()::bigint as pid\");");
+        REQUIRE(r.table.has_value());
+        return ints(*r.table, "pid").at(0);
+    };
+    // Whether backend `pid` is still connected, seen from connection `via`.
+    // A backend exits shortly after its client disconnects, so wait for it.
+    const auto backend_gone = [&](const std::string& via, std::int64_t pid) {
+        for (int attempt = 0; attempt < 50; ++attempt) {
+            const auto r = exec("adbc_query(" + via +
+                                ", \"select count(*) as n from pg_stat_activity where pid = " +
+                                std::to_string(pid) + "\");");
+            if (ints(*r.table, "n").at(0) == 0) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return false;
+    };
+
+    exec("let db = adbc_connect(" + ibex_str(driver) + ", " + ibex_str(*uri) +
+         ");\n"
+         "let other = adbc_connect(" +
+         ibex_str(driver) + ", " + ibex_str(*uri) +
+         ");\n"
+         "fn pid_via(mutable c: AdbcConnection) -> DataFrame {\n"
+         "    adbc_query(c, \"select pg_backend_pid()::bigint as pid\");\n"
+         "}\n"
+         "fn own_pid(uri: String) -> DataFrame {\n"
+         "    let c = adbc_connect(" +
+         ibex_str(driver) +
+         ", uri);\n"
+         "    adbc_query(c, \"select pg_backend_pid()::bigint as pid\");\n"
+         "}\n"
+         "fn open_db(uri: String) -> AdbcConnection {\n"
+         "    adbc_connect(" +
+         ibex_str(driver) +
+         ", uri);\n"
+         "}\n"
+         "let ready = 1;");
+
+    // One backend per connection, the same one for every query on it.
+    const auto db_pid = pid_of("db");
+    CHECK(pid_of("db") == db_pid);
+    const auto other_pid = pid_of("other");
+    CHECK(other_pid != db_pid);
+
+    // Session state lives on the connection that made it.
+    exec(
+        "adbc_query(db, \"create temp table ibex_conn_t as select generate_series(1, 3)::bigint "
+        "as id\");");
+    const auto temp = exec("adbc_query(db, \"select id from ibex_conn_t order by id\");");
+    CHECK(ints(*temp.table, "id") == std::vector<std::int64_t>{1, 2, 3});
+    const auto elsewhere = s.session.execute("adbc_query(other, \"select id from ibex_conn_t\");");
+    CHECK_FALSE(elsewhere.ok);
+    const auto one_off = s.session.execute("read_adbc(" + ibex_str(driver) + ", " + ibex_str(*uri) +
+                                           ", \"select id from ibex_conn_t\");");
+    CHECK_FALSE(one_off.ok);
+
+    // A failed query leaves the connection, and its session state, usable.
+    const auto failed = s.session.execute("adbc_query(db, \"select * from ibex_no_such_table\");");
+    CHECK_FALSE(failed.ok);
+    const auto after = exec("adbc_query(db, \"select count(*) as n from ibex_conn_t\");");
+    CHECK(ints(*after.table, "n") == std::vector<std::int64_t>{3});
+
+    // A function taking the connection uses the caller's backend.
+    const auto via = exec("pid_via(db);");
+    CHECK(ints(*via.table, "pid").at(0) == db_pid);
+
+    // A function's own connection is a new backend, gone once it returns.
+    const auto own = exec("own_pid(" + ibex_str(*uri) + ");");
+    const auto own_pid = ints(*own.table, "pid").at(0);
+    CHECK(own_pid != db_pid);
+    CHECK(backend_gone("db", own_pid));
+
+    // A returned connection stays open for the caller until its binding goes.
+    exec("let kept = open_db(" + ibex_str(*uri) + ");");
+    const auto kept_pid = pid_of("kept");
+    const auto alive =
+        exec("adbc_query(db, \"select count(*) as n from pg_stat_activity where pid = " +
+             std::to_string(kept_pid) + "\");");
+    CHECK(ints(*alive.table, "n") == std::vector<std::int64_t>{1});
+    exec("let kept = 0;");
+    CHECK(backend_gone("db", kept_pid));
+
+    // Closing through an alias closes the connection for every binding.
+    exec("let alias = other;");
+    const auto closed = exec("adbc_close(alias);");
+    CHECK(std::get<std::int64_t>(*closed.scalar) == 1);
+    const auto on_closed = s.session.execute("adbc_query(other, \"select 1 as x\");");
+    CHECK_FALSE(on_closed.ok);
+    CHECK(contains(on_closed.error, "connection is closed"));
+    CHECK(backend_gone("db", other_pid));
 }

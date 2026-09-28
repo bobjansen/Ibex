@@ -60,7 +60,13 @@ jobs:
       - name: Build
         run: cmake --build build --parallel --target ibex_adbc_plugin ibex_adbc_tests ibex_repl_bin ibex_args_plugin ibex_csv_plugin
 
+      # The PostgreSQL connection test (tests/test_adbc.cpp) runs only when
+      # IBEX_TEST_POSTGRES_URI is set; here it uses the postgres service, and
+      # the driver is found by name through ADBC_DRIVER_PATH.
       - name: Test
+        env:
+          ADBC_DRIVER_PATH: ${{ runner.temp }}/adbc-drivers
+          IBEX_TEST_POSTGRES_URI: postgresql://postgres:ibex@localhost:55432/postgres
         run: ctest --test-dir build --output-on-failure --no-tests=error -R '^adbc:'
 
       - name: Check PostgreSQL walkthrough

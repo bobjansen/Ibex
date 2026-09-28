@@ -276,7 +276,12 @@ Acceptance status: fake-resource tests (`tests/test_repl_resources.cpp`) cover
 aliases, rebinding, failed rebinding, session end, type checks, zero-call
 rejection in clauses/expressions/function bodies, and the script path; SQLite
 tests cover session state across statements, isolation from one-off reads, and
-idempotent close. Not yet: Docker PostgreSQL checks, busy-guard test through the
+idempotent close. PostgreSQL (2026-09-28): `adbc_connect against PostgreSQL` in
+`tests/test_adbc.cpp`, gated on `IBEX_TEST_POSTGRES_URI` and run by the ADBC
+workflow's postgres service, checks backends (`pg_backend_pid`,
+`pg_stat_activity`) for per-connection state, isolation, a failed query
+leaving the connection usable, function-owned connections gone on return,
+returned connections kept, and close through an alias. Not yet: busy-guard test through the
 language (unreachable while statements are sequential), cleanup-failure
 reporting through a diagnostic sink (cleanup errors in destructors are dropped),
 cancellation.

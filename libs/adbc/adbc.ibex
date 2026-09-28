@@ -10,9 +10,18 @@
 //
 //   adbc_connect(driver: String, uri: String, options: String = "") -> AdbcConnection
 //   adbc_query(db: AdbcConnection, sql: String) -> DataFrame
+//   adbc_execute(db: AdbcConnection, sql: String) -> Int
+//   adbc_write(db: AdbcConnection, df: DataFrame, table: String,
+//              mode: String = "create") -> Int
 //   adbc_close(db: AdbcConnection) -> Int
 //     A reusable connection: one login, and session state (temporary tables,
-//     settings) that lasts across queries. adbc_close returns 1 when it closed
+//     settings) that lasts across queries. adbc_execute runs a statement that
+//     returns no rows (DDL, insert, update, delete) and returns the affected
+//     row count, or -1 when the driver does not report one. adbc_write
+//     bulk-inserts a DataFrame into `table`; mode is create (the table must
+//     not exist), append (it must), replace (drop and recreate) or
+//     create_append (create if missing, then append). It returns the rows
+//     written. adbc_close returns 1 when it closed
 //     the connection and 0 when it was already closed; a query on a closed
 //     connection is an error. A connection also closes when its last binding
 //     goes away. Bind the connection with `let` at the top level of a script:
@@ -39,5 +48,10 @@ extern fn adbc_connect(driver: String, uri: String, options: String = "")
     -> AdbcConnection from "adbc.hpp";
 
 extern fn adbc_query(mutable db: AdbcConnection, sql: String) -> DataFrame from "adbc.hpp";
+
+extern fn adbc_execute(mutable db: AdbcConnection, sql: String) -> Int from "adbc.hpp";
+
+extern fn adbc_write(mutable db: AdbcConnection, df: DataFrame, table: String,
+                     mode: String = "create") -> Int from "adbc.hpp";
 
 extern fn adbc_close(mutable db: AdbcConnection) -> Int from "adbc.hpp";

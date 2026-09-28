@@ -509,8 +509,8 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
 <pre><code><span class="kw">import</span> <span class="str">"adbc"</span>;
 
 <span class="kw">let</span> db = <span class="fn-name">adbc_connect</span>(<span class="str">"sqlite"</span>, <span class="str">":memory:"</span>);
-<span class="fn-name">adbc_query</span>(db, <span class="str">"create table trades (symbol text, qty integer)"</span>);
-<span class="fn-name">adbc_query</span>(db, <span class="str">"insert into trades values ('AAPL', 10), ('MSFT', 5)"</span>);
+<span class="fn-name">adbc_execute</span>(db, <span class="str">"create table trades (symbol text, qty integer)"</span>);
+<span class="fn-name">adbc_execute</span>(db, <span class="str">"insert into trades values ('AAPL', 10), ('MSFT', 5)"</span>);   <span class="cm">// 2</span>
 
 <span class="fn-name">adbc_query</span>(db, <span class="str">"select symbol, qty from trades"</span>)[
     <span class="kw">select</span> { total = <span class="fn-name">sum</span>(qty) }, <span class="kw">by</span> symbol
@@ -522,6 +522,45 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
           options string as <code>adbc_read</code>; <code>stmt.</code> options
           apply to every query on the connection.
           <code>examples/adbc_connection.ibex</code> is a runnable version.
+        </p>
+      </article>
+      <article class="card" style="margin-top:1rem;">
+        <h3>Write tables and run statements</h3>
+        <p>
+          <code>adbc_execute(db, sql)</code> runs a statement that returns no
+          rows (DDL, <code>insert</code>, <code>update</code>,
+          <code>delete</code>) and returns the affected-row count, or
+          <code>-1</code> when the driver reports none. For DDL the count is
+          the driver's: PostgreSQL reports <code>-1</code>, SQLite repeats the
+          previous statement's count.
+        </p>
+        <p>
+          <code>adbc_write(db, df, table, mode = "create")</code> bulk-inserts
+          a DataFrame through the driver's ingestion path (PostgreSQL uses
+          <code>COPY</code>) and returns the rows written. <code>mode</code> is
+          <code>create</code> (the table must not exist), <code>append</code>
+          (it must), <code>replace</code> (drop and recreate) or
+          <code>create_append</code>. A write that fails, say on a duplicate
+          key, writes nothing on SQLite and PostgreSQL.
+        </p>
+<pre><code><span class="kw">import</span> <span class="str">"adbc"</span>;
+<span class="kw">import</span> <span class="str">"csv"</span>;
+
+<span class="kw">let</span> db = <span class="fn-name">adbc_connect</span>(<span class="str">"postgresql"</span>, <span class="str">"postgresql://localhost/markets"</span>);
+<span class="kw">let</span> trades = <span class="fn-name">read_csv</span>(<span class="str">"data/trades.csv"</span>);
+<span class="fn-name">adbc_write</span>(db, trades, <span class="str">"trades"</span>, <span class="str">"replace"</span>);
+<span class="fn-name">adbc_execute</span>(db, <span class="str">"create index on trades (symbol)"</span>);
+<span class="fn-name">adbc_close</span>(db);</code></pre>
+        <p>
+          Every Ibex column type has a PostgreSQL column type: Int64 as
+          <code>bigint</code>, Float64 as <code>double precision</code>, Bool,
+          String and Categorical as <code>boolean</code> and
+          <code>text</code>, Date, Timestamp as <code>timestamp</code>
+          (microseconds, PostgreSQL's precision), and Decimal as
+          <code>numeric</code>. SQLite has no bool, date or timestamp type: its
+          driver stores <code>0</code>/<code>1</code> and ISO 8601 text, and it
+          refuses Decimal columns; convert them with <code>Float64(x)</code>
+          first if that loss is acceptable.
         </p>
       </article>
       <article class="card" style="margin-top:1rem;">

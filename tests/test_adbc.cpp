@@ -3,13 +3,15 @@
 
 // ADBC integration tests. The built `adbc` plugin is loaded the way a user
 // loads it -- `import "adbc";` in a REPL session -- and reads a throwaway
-// SQLite database. The database is also seeded through `adbc_read` (one
-// statement per call), which keeps this binary free of any ADBC link: the
+// SQLite database. The database is also seeded through the plugin
+// (`adbc_execute`), which keeps this binary free of any ADBC link: the
 // driver manager lives only in the plugin, as it does in the ibex tool.
 //
 // Built only when IBEX_BUILD_ADBC=ON and the SQLite ADBC driver is installed.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/repl/repl.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -21,15 +23,18 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <memory>
 #include <optional>
 #include <random>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -205,14 +210,71 @@ struct AdbcSession {
         return *fn;
     }
 
-    /// Run statements that return no result set, one connection each.
+    /// Run statements that return no result set, on one connection.
     void exec(const SqliteDb& db, std::initializer_list<std::string_view> statements) {
+        const auto opened =
+            session.execute("let seed_conn = adbc_connect(" + ibex_str(sqlite_driver()) + ", " +
+                            ibex_str(db.path()) + ");");
+        INFO(opened.error);
+        REQUIRE(opened.ok);
         for (const auto sql : statements) {
-            const auto r = session.execute(read_call(db, sql) + ";");
+            const auto r = session.execute("adbc_execute(seed_conn, " + ibex_str(sql) + ");");
             INFO(sql);
             INFO(r.error);
             REQUIRE(r.ok);
         }
+        REQUIRE(session.execute("adbc_close(seed_conn);").ok);
+    }
+
+    /// A plugin function by name.
+    [[nodiscard]] auto plugin(const std::string& name) const
+        -> const ibex::runtime::ExternFunction& {
+        const auto* fn = registry.find(name);
+        REQUIRE(fn != nullptr);
+        REQUIRE(fn->func);
+        return *fn;
+    }
+
+    /// A connection opened by calling the plugin directly.
+    [[nodiscard]] auto connect(std::string_view driver, std::string_view uri) const
+        -> ibex::runtime::ResourcePtr {
+        auto opened = plugin("adbc_connect").func(string_args({driver, uri}));
+        INFO((opened.has_value() ? std::string{} : opened.error()));
+        REQUIRE(opened.has_value());
+        auto* resource = std::get_if<ibex::runtime::ResourcePtr>(&*opened);
+        REQUIRE(resource != nullptr);
+        return *resource;
+    }
+
+    /// `adbc_write(conn, table, target, mode)`, called on the plugin directly.
+    [[nodiscard]] auto write(const ibex::runtime::ResourcePtr& conn, ibex::runtime::Table table,
+                             std::string_view target, std::string_view mode) const
+        -> std::expected<std::int64_t, std::string> {
+        ibex::runtime::ExternArgs args;
+        args.push_resource(conn);
+        args.push_table(std::make_shared<const ibex::runtime::Table>(std::move(table)));
+        args.emplace_back(std::string(target));
+        args.emplace_back(std::string(mode));
+        auto written = plugin("adbc_write").func(args);
+        if (!written) {
+            return std::unexpected(written.error());
+        }
+        return std::get<std::int64_t>(std::get<ibex::runtime::ScalarValue>(*written));
+    }
+
+    /// `adbc_query(conn, sql)`, called on the plugin directly.
+    [[nodiscard]] auto query(const ibex::runtime::ResourcePtr& conn, std::string_view sql) const
+        -> ibex::runtime::Table {
+        ibex::runtime::ExternArgs args;
+        args.push_resource(conn);
+        args.emplace_back(std::string(sql));
+        auto result = plugin("adbc_query").func(args);
+        INFO(sql);
+        INFO((result.has_value() ? std::string{} : result.error()));
+        REQUIRE(result.has_value());
+        auto* table = std::get_if<ibex::runtime::Table>(&*result);
+        REQUIRE(table != nullptr);
+        return std::move(*table);
     }
 };
 
@@ -240,6 +302,62 @@ auto ints(const ibex::runtime::Table& table, const std::string& name) -> std::ve
 
 auto contains(const std::string& haystack, std::string_view needle) -> bool {
     return haystack.find(needle) != std::string::npos;
+}
+
+auto doubles(const ibex::runtime::Table& table, const std::string& name) -> std::vector<double> {
+    const auto* column = std::get_if<ibex::Column<double>>(table.find(name));
+    REQUIRE(column != nullptr);
+    return {column->begin(), column->end()};
+}
+
+auto strings(const ibex::runtime::Table& table, const std::string& name)
+    -> std::vector<std::string> {
+    const auto* column = std::get_if<ibex::Column<std::string>>(table.find(name));
+    REQUIRE(column != nullptr);
+    std::vector<std::string> values;
+    values.reserve(column->size());
+    for (std::size_t i = 0; i < column->size(); ++i) {
+        values.emplace_back((*column)[i]);
+    }
+    return values;
+}
+
+/// Which rows of column `name` are null.
+auto nulls(const ibex::runtime::Table& table, const std::string& name) -> std::vector<bool> {
+    const auto* entry = table.find_entry(name);
+    REQUIRE(entry != nullptr);
+    std::vector<bool> result;
+    result.reserve(column_size(*entry));
+    for (std::size_t i = 0; i < column_size(*entry); ++i) {
+        result.push_back(ibex::runtime::is_null(*entry, i));
+    }
+    return result;
+}
+
+/// One column of every Ibex type but Decimal, three rows, row 2 null in all
+/// but `i`. 2026-01-02 is day 20455 and 1999-12-31 day 10956; the timestamp
+/// is 2026-01-02 03:04:05.123456789.
+auto typed_table() -> ibex::runtime::Table {
+    using ibex::runtime::ValidityBitmap;
+    const ValidityBitmap middle_null{true, false, true};
+    ibex::runtime::Table table;
+    table.add_column("i", ibex::Column<std::int64_t>{1, 0, -3});
+    table.add_column("f", ibex::Column<double>{1.5, 0.0, -2.25}, middle_null);
+    table.add_column("b", ibex::Column<bool>{true, false, false}, middle_null);
+    table.add_column("s", ibex::Column<std::string>{"a", "", "c"}, middle_null);
+    ibex::Column<ibex::Categorical> sym;
+    sym.push_back("AAPL");
+    sym.push_back("MSFT");
+    sym.push_back("AAPL");
+    table.add_column("sym", std::move(sym), middle_null);
+    table.add_column(
+        "d", ibex::Column<ibex::Date>{{ibex::Date{20455}, ibex::Date{0}, ibex::Date{10956}}},
+        middle_null);
+    table.add_column("ts",
+                     ibex::Column<ibex::Timestamp>{{ibex::Timestamp{1767323045123456789},
+                                                    ibex::Timestamp{0}, ibex::Timestamp{0}}},
+                     middle_null);
+    return table;
 }
 
 }  // namespace
@@ -641,6 +759,209 @@ TEST_CASE("Functions take, open and return ADBC connections", "[adbc][connection
     CHECK(std::get<std::int64_t>(*closed.scalar) == 1);
 }
 
+TEST_CASE("adbc_execute runs statements that return no rows", "[adbc][write]") {
+    AdbcSession s;
+    SqliteDb db;
+    const auto exec = [&](const std::string& source) {
+        auto result = s.session.execute(source);
+        INFO(source);
+        INFO(result.error);
+        REQUIRE(result.ok);
+        return result;
+    };
+    exec("let db = adbc_connect(" + ibex_str(sqlite_driver()) + ", " + ibex_str(db.path()) + ");");
+    exec("adbc_execute(db, \"create table t (id integer, qty integer)\");");
+
+    const auto inserted =
+        exec("adbc_execute(db, \"insert into t values (1, 10), (2, 20), (3, 30)\");");
+    REQUIRE(inserted.scalar.has_value());
+    CHECK(std::get<std::int64_t>(*inserted.scalar) == 3);
+    const auto updated = exec("adbc_execute(db, \"update t set qty = qty + 1 where id > 1\");");
+    CHECK(std::get<std::int64_t>(*updated.scalar) == 2);
+    const auto deleted = exec("adbc_execute(db, \"delete from t where id = 3\");");
+    CHECK(std::get<std::int64_t>(*deleted.scalar) == 1);
+
+    const auto rows = exec("adbc_query(db, \"select qty from t order by id\");");
+    CHECK(ints(*rows.table, "qty") == std::vector<std::int64_t>{10, 21});
+
+    // A failed statement says which function failed and leaves the
+    // connection usable.
+    const auto bad = s.session.execute("adbc_execute(db, \"insert into nope values (1)\");");
+    REQUIRE_FALSE(bad.ok);
+    CHECK(contains(bad.error, "adbc_execute:"));
+    CHECK(contains(bad.error, "no such table"));
+    exec("adbc_execute(db, \"delete from t\");");
+
+    exec("adbc_close(db);");
+    const auto closed = s.session.execute("adbc_execute(db, \"delete from t\");");
+    REQUIRE_FALSE(closed.ok);
+    CHECK(contains(closed.error, "adbc_execute: connection is closed"));
+}
+
+TEST_CASE("adbc_write stores every Ibex column type in SQLite", "[adbc][write]") {
+    AdbcSession s;
+    SqliteDb db;
+    const auto conn = s.connect(sqlite_driver(), db.path());
+
+    const auto written = s.write(conn, typed_table(), "typed", "create");
+    INFO((written.has_value() ? std::string{} : written.error()));
+    REQUIRE(written.has_value());
+    CHECK(*written == 3);
+
+    // SQLite has no bool, date or timestamp type: the driver stores 0/1 and
+    // ISO 8601 text, and a query reads back what SQLite holds.
+    const auto back = s.query(conn, "select * from typed order by rowid");
+    CHECK(ints(back, "i") == std::vector<std::int64_t>{1, 0, -3});
+    CHECK(doubles(back, "f").at(0) == 1.5);
+    CHECK(doubles(back, "f").at(2) == -2.25);
+    CHECK(ints(back, "b").at(0) == 1);
+    CHECK(ints(back, "b").at(2) == 0);
+    CHECK(strings(back, "s").at(2) == "c");
+    CHECK(strings(back, "sym").at(0) == "AAPL");
+    CHECK(strings(back, "sym").at(2) == "AAPL");
+    CHECK(strings(back, "d").at(0) == "2026-01-02");
+    CHECK(strings(back, "d").at(2) == "1999-12-31");
+    CHECK(strings(back, "ts").at(0) == "2026-01-02T03:04:05.123456789");
+    const std::vector<bool> middle{false, true, false};
+    for (const auto* name : {"f", "b", "s", "sym", "d", "ts"}) {
+        INFO(name);
+        CHECK(nulls(back, name) == middle);
+    }
+    CHECK(nulls(back, "i") == std::vector<bool>{false, false, false});
+
+    // The SQLite driver has no decimal type; its refusal names the type.
+    ibex::runtime::Table amounts;
+    auto amount = ibex::runtime::make_decimal_column({.precision = 12, .scale = 2});
+    amount.push_back(ibex::Decimal{150});
+    amounts.add_column("amount", std::move(amount));
+    const auto refused = s.write(conn, std::move(amounts), "amounts", "create");
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(contains(refused.error(), "adbc_write:"));
+    CHECK(contains(refused.error(), "decimal128"));
+}
+
+TEST_CASE("adbc_write modes create, append, replace and create_append", "[adbc][write]") {
+    AdbcSession s;
+    SqliteDb db;
+    const auto conn = s.connect(sqlite_driver(), db.path());
+    const auto ids = [](std::initializer_list<std::int64_t> values) {
+        ibex::runtime::Table table;
+        table.add_column("id", ibex::Column<std::int64_t>(values));
+        return table;
+    };
+    const auto stored = [&] { return ints(s.query(conn, "select id from t order by id"), "id"); };
+
+    REQUIRE(s.write(conn, ids({1, 2}), "t", "create").has_value());
+    CHECK(stored() == std::vector<std::int64_t>{1, 2});
+
+    const auto again = s.write(conn, ids({9}), "t", "create");
+    REQUIRE_FALSE(again.has_value());
+    CHECK(contains(again.error(), "already exists"));
+
+    REQUIRE(s.write(conn, ids({3}), "t", "append").has_value());
+    CHECK(stored() == std::vector<std::int64_t>{1, 2, 3});
+
+    const auto missing = s.write(conn, ids({1}), "no_such_table", "append");
+    REQUIRE_FALSE(missing.has_value());
+    CHECK(contains(missing.error(), "no such table"));
+
+    REQUIRE(s.write(conn, ids({7, 8}), "t", "replace").has_value());
+    CHECK(stored() == std::vector<std::int64_t>{7, 8});
+
+    REQUIRE(s.write(conn, ids({1}), "fresh", "create_append").has_value());
+    REQUIRE(s.write(conn, ids({2}), "fresh", "create_append").has_value());
+    CHECK(ints(s.query(conn, "select id from fresh order by id"), "id") ==
+          std::vector<std::int64_t>{1, 2});
+
+    const auto bogus = s.write(conn, ids({1}), "t", "upsert");
+    REQUIRE_FALSE(bogus.has_value());
+    CHECK(contains(bogus.error(), "adbc_write: unknown mode 'upsert'"));
+
+    // An empty table still creates its columns.
+    ibex::runtime::Table empty;
+    empty.add_column("id", ibex::Column<std::int64_t>{});
+    empty.add_column("name", ibex::Column<std::string>{});
+    const auto created = s.write(conn, std::move(empty), "empty_t", "create");
+    REQUIRE(created.has_value());
+    CHECK(*created == 0);
+    const auto columns =
+        s.query(conn, "select name from pragma_table_info('empty_t') order by cid");
+    CHECK(strings(columns, "name") == std::vector<std::string>{"id", "name"});
+}
+
+TEST_CASE("A failed adbc_write writes nothing and keeps the connection", "[adbc][write]") {
+    AdbcSession s;
+    SqliteDb db;
+    s.exec(db, {"create table t (id integer primary key)"});
+    const auto conn = s.connect(sqlite_driver(), db.path());
+    ibex::runtime::Table duplicate;
+    duplicate.add_column("id", ibex::Column<std::int64_t>{1, 2, 2, 3});
+
+    const auto failed = s.write(conn, std::move(duplicate), "t", "append");
+    REQUIRE_FALSE(failed.has_value());
+    CHECK(contains(failed.error(), "UNIQUE constraint failed"));
+    CHECK(ints(s.query(conn, "select count(*) as n from t"), "n") == std::vector<std::int64_t>{0});
+
+    ibex::runtime::Table fine;
+    fine.add_column("id", ibex::Column<std::int64_t>{1, 2});
+    REQUIRE(s.write(conn, std::move(fine), "t", "append").has_value());
+    CHECK(ints(s.query(conn, "select count(*) as n from t"), "n") == std::vector<std::int64_t>{2});
+}
+
+TEST_CASE("adbc_write takes any table expression, also inside functions", "[adbc][write]") {
+    AdbcSession s;
+    SqliteDb db;
+    seed_trades(s, db);
+    const auto exec = [&](const std::string& source) {
+        auto result = s.session.execute(source);
+        INFO(source);
+        INFO(result.error);
+        REQUIRE(result.ok);
+        return result;
+    };
+    exec("let db = adbc_connect(" + ibex_str(sqlite_driver()) + ", " + ibex_str(db.path()) + ");");
+
+    // A query over a query result, written back to the same database.
+    exec(
+        "let totals = adbc_query(db, \"select symbol, qty from trades\")"
+        "[filter qty > 6, select { total = sum(qty) }, by symbol];");
+    const auto written = exec("adbc_write(db, totals, \"totals\");");
+    CHECK(std::get<std::int64_t>(*written.scalar) == 2);
+    // Inline, the query clause would run on a resource call's result inside
+    // another resource call's argument: refused before anything runs.
+    const auto inline_query = s.session.execute(
+        "adbc_write(db, adbc_query(db, \"select qty from trades\")[filter qty > 6], "
+        "\"inline_t\");");
+    REQUIRE_FALSE(inline_query.ok);
+    CHECK(contains(inline_query.error, "adbc_query can be called only as"));
+    const auto totals = exec("adbc_query(db, \"select total from totals order by total\");");
+    CHECK(ints(*totals.table, "total") == std::vector<std::int64_t>{7, 30});
+
+    // The mode defaults to create.
+    exec("let small = Table { id = [1, 2] };");
+    exec("adbc_write(db, small, \"small\");");
+    const auto again = s.session.execute("adbc_write(db, small, \"small\");");
+    REQUIRE_FALSE(again.ok);
+    CHECK(contains(again.error, "already exists"));
+
+    // A function taking the connection and a table.
+    exec(
+        "fn save(mutable c: AdbcConnection, df: DataFrame, name: String) -> Int {\n"
+        "    adbc_write(c, df, name, \"replace\");\n"
+        "}\n"
+        "let saved = save(db, small[update { id = id * 10 }], \"small\");");
+    const auto ids = exec("adbc_query(db, \"select id from small order by id\");");
+    CHECK(ints(*ids.table, "id") == std::vector<std::int64_t>{10, 20});
+
+    const auto scalar = s.session.execute("adbc_write(db, 5, \"x\");");
+    REQUIRE_FALSE(scalar.ok);
+
+    exec("adbc_close(db);");
+    const auto closed = s.session.execute("adbc_write(db, small, \"small\", \"replace\");");
+    REQUIRE_FALSE(closed.ok);
+    CHECK(contains(closed.error, "adbc_write: connection is closed"));
+}
+
 // Reusable connections against a real PostgreSQL server. Runs only when
 // IBEX_TEST_POSTGRES_URI is set (the ADBC workflow's postgres service, or a
 // local `docker run -e POSTGRES_PASSWORD=ibex -p 55432:5432 postgres:17`);
@@ -755,4 +1076,88 @@ TEST_CASE("adbc_connect against PostgreSQL", "[adbc][connection][postgresql]") {
     CHECK_FALSE(on_closed.ok);
     CHECK(contains(on_closed.error, "connection is closed"));
     CHECK(backend_gone("db", other_pid));
+}
+
+// adbc_write and adbc_execute against PostgreSQL; gated like the test above.
+// Unlike SQLite, PostgreSQL has a column type for every Ibex type.
+TEST_CASE("adbc_write and adbc_execute against PostgreSQL", "[adbc][write][postgresql]") {
+    const auto uri = get_env("IBEX_TEST_POSTGRES_URI");
+    if (!uri.has_value() || uri->empty()) {
+        SKIP("IBEX_TEST_POSTGRES_URI is not set");
+    }
+    const std::string driver = get_env("IBEX_TEST_POSTGRES_DRIVER").value_or("postgresql");
+    AdbcSession s;
+    const auto conn = s.connect(driver, *uri);
+    const auto execute = [&](std::string_view sql) {
+        ibex::runtime::ExternArgs args;
+        args.push_resource(conn);
+        args.emplace_back(std::string(sql));
+        auto result = s.plugin("adbc_execute").func(args);
+        INFO(sql);
+        INFO((result.has_value() ? std::string{} : result.error()));
+        REQUIRE(result.has_value());
+        return std::get<std::int64_t>(std::get<ibex::runtime::ScalarValue>(*result));
+    };
+
+    auto table = typed_table();
+    auto amount = ibex::runtime::make_decimal_column({.precision = 12, .scale = 2});
+    amount.push_back(ibex::Decimal{1234});
+    amount.push_back(ibex::Decimal{0});
+    amount.push_back(ibex::Decimal{-5});
+    table.add_column("amount", std::move(amount), ibex::runtime::ValidityBitmap{true, false, true});
+    const auto written = s.write(conn, std::move(table), "ibex_write_typed", "replace");
+    INFO((written.has_value() ? std::string{} : written.error()));
+    REQUIRE(written.has_value());
+    CHECK(*written == 3);
+
+    const auto types = s.query(conn,
+                               "select data_type from information_schema.columns where "
+                               "table_name = 'ibex_write_typed' order by ordinal_position");
+    CHECK(strings(types, "data_type") ==
+          std::vector<std::string>{"bigint", "double precision", "boolean", "text", "text", "date",
+                                   "timestamp without time zone", "numeric"});
+
+    // Every type reads back as itself, except numeric, which the driver hands
+    // over as text; timestamps keep PostgreSQL's microseconds.
+    const auto back = s.query(conn,
+                              "select i, f, b, s, sym, d, ts, amount::text as amount from "
+                              "ibex_write_typed order by i desc");
+    CHECK(ints(back, "i") == std::vector<std::int64_t>{1, 0, -3});
+    CHECK(doubles(back, "f").at(2) == -2.25);
+    const auto* flags = std::get_if<ibex::Column<bool>>(back.find("b"));
+    REQUIRE(flags != nullptr);
+    CHECK((*flags)[0]);
+    CHECK_FALSE((*flags)[2]);
+    CHECK(strings(back, "sym").at(2) == "AAPL");
+    const auto* days = std::get_if<ibex::Column<ibex::Date>>(back.find("d"));
+    REQUIRE(days != nullptr);
+    CHECK((*days)[0].days == 20455);
+    CHECK((*days)[2].days == 10956);
+    const auto* stamps = std::get_if<ibex::Column<ibex::Timestamp>>(back.find("ts"));
+    REQUIRE(stamps != nullptr);
+    CHECK((*stamps)[0].nanos == 1767323045123456000);
+    CHECK(strings(back, "amount").at(0) == "12.34");
+    CHECK(strings(back, "amount").at(2) == "-0.05");
+    const std::vector<bool> middle{false, true, false};
+    for (const auto* name : {"f", "b", "s", "sym", "d", "ts", "amount"}) {
+        INFO(name);
+        CHECK(nulls(back, name) == middle);
+    }
+
+    // Affected rows for DML; PostgreSQL's driver reports none (-1) for DDL.
+    CHECK(execute("update ibex_write_typed set f = 0 where i > -3") == 2);
+    CHECK(execute("drop table if exists ibex_write_pk") == -1);
+    execute("create table ibex_write_pk (id bigint primary key)");
+
+    // A failed COPY writes nothing, and the connection stays usable.
+    ibex::runtime::Table duplicate;
+    duplicate.add_column("id", ibex::Column<std::int64_t>{1, 2, 2, 3});
+    const auto failed = s.write(conn, std::move(duplicate), "ibex_write_pk", "append");
+    REQUIRE_FALSE(failed.has_value());
+    CHECK(contains(failed.error(), "duplicate key"));
+    CHECK(ints(s.query(conn, "select count(*)::bigint as n from ibex_write_pk"), "n") ==
+          std::vector<std::int64_t>{0});
+
+    execute("drop table ibex_write_pk");
+    execute("drop table ibex_write_typed");
 }

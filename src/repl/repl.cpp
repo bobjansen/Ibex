@@ -4666,6 +4666,17 @@ class ResourceCalls {
                 return std::unexpected(call.callee + ": argument '" + arg.param->name + "' calls " +
                                        *callee + "; bind its result with `let` first");
             }
+            if (arg.param->type.kind == parser::Type::Kind::DataFrame ||
+                arg.param->type.kind == parser::Type::Kind::TimeFrame) {
+                auto table = eval_table_expr(*arg.expr, *tables_, *lazy_tables_, *scalars_,
+                                             *columns_, *models_, *functions_, *compile_time_lists_,
+                                             *extern_decls_, *externs_);
+                if (!table) {
+                    return std::unexpected(std::move(table.error()));
+                }
+                args.push_table(std::make_shared<const runtime::Table>(std::move(*table)));
+                continue;
+            }
             auto value =
                 eval_scalar_expr(*arg.expr, *tables_, *lazy_tables_, *scalars_, *columns_, *models_,
                                  *functions_, *compile_time_lists_, *extern_decls_, *externs_);

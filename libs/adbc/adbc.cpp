@@ -540,6 +540,94 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
     bool finished_ = false;
 };
 
+/// One statement on a session, holding the session's statement lease for as
+/// long as it lives. For statements that return no result stream; queries use
+/// `AdbcSourceOperator`, which must outlive the statement it reads.
+class LeasedStatement {
+   public:
+    static auto open(std::shared_ptr<AdbcSession> session)
+        -> std::expected<std::unique_ptr<LeasedStatement>, std::string> {
+        if (auto lease = session->acquire_lease(); !lease) {
+            return std::unexpected(lease.error());
+        }
+        auto statement = std::unique_ptr<LeasedStatement>(new LeasedStatement(std::move(session)));
+        auto status = call_adbc("AdbcStatementNew", [&](AdbcError* error) {
+            return AdbcStatementNew(statement->session_->connection(), &statement->statement_,
+                                    error);
+        });
+        if (!status) {
+            return std::unexpected(status.error());
+        }
+        statement->acquired_ = true;
+        status = apply_adbc_options(
+            "AdbcStatementSetOption", &statement->statement_,
+            statement->session_->statement_options(),
+            [](AdbcStatement* handle, const char* key, const char* value, AdbcError* error) {
+                return AdbcStatementSetOption(handle, key, value, error);
+            });
+        if (!status) {
+            return std::unexpected(status.error());
+        }
+        return statement;
+    }
+
+    LeasedStatement(const LeasedStatement&) = delete;
+    LeasedStatement& operator=(const LeasedStatement&) = delete;
+    LeasedStatement(LeasedStatement&&) noexcept = delete;
+    LeasedStatement& operator=(LeasedStatement&&) noexcept = delete;
+
+    ~LeasedStatement() {
+        if (acquired_) {
+            AdbcError error{};
+            AdbcStatementRelease(&statement_, &error);
+            release_adbc_error(&error);
+        }
+        session_->release_lease();
+    }
+
+    auto set_option(const char* key, const char* value) -> std::expected<void, std::string> {
+        return call_adbc(std::string("AdbcStatementSetOption(") + key + ")", [&](AdbcError* error) {
+            return AdbcStatementSetOption(&statement_, key, value, error);
+        });
+    }
+
+    auto set_sql(const std::string& sql) -> std::expected<void, std::string> {
+        return call_adbc("AdbcStatementSetSqlQuery", [&](AdbcError* error) {
+            return AdbcStatementSetSqlQuery(&statement_, sql.c_str(), error);
+        });
+    }
+
+    /// Bind `array` and `schema`. The driver takes the array over; whatever
+    /// it leaves of either is the caller's to release, after this statement.
+    auto bind(::ArrowArray* array, ::ArrowSchema* schema) -> std::expected<void, std::string> {
+        return call_adbc("AdbcStatementBind", [&](AdbcError* error) {
+            return AdbcStatementBind(&statement_, array, schema, error);
+        });
+    }
+
+    /// Execute without a result stream. The affected-row count, or -1 when
+    /// the driver does not report one.
+    auto execute_update() -> std::expected<std::int64_t, std::string> {
+        std::int64_t rows_affected = -1;
+        auto status = call_adbc("AdbcStatementExecuteQuery", [&](AdbcError* error) {
+            return AdbcStatementExecuteQuery(&statement_, nullptr, &rows_affected, error);
+        });
+        if (!status) {
+            return std::unexpected(status.error());
+        }
+        return rows_affected;
+    }
+
+   private:
+    explicit LeasedStatement(std::shared_ptr<AdbcSession> session) : session_(std::move(session)) {
+        std::memset(&statement_, 0, sizeof(statement_));
+    }
+
+    std::shared_ptr<AdbcSession> session_;
+    AdbcStatement statement_{};
+    bool acquired_ = false;
+};
+
 auto parse_option_arg(const ibex::runtime::ExternArgs& args, std::size_t index,
                       std::string_view usage) -> std::expected<ParsedOptions, std::string> {
     if (args.size() <= index) {
@@ -632,6 +720,99 @@ auto adbc_query(const ibex::runtime::ExternArgs& args)
     return materialize(AdbcSourceOperator::create(std::move(*session), *sql, "adbc_query"));
 }
 
+auto adbc_execute(const ibex::runtime::ExternArgs& args)
+    -> std::expected<ibex::runtime::ExternValue, std::string> {
+    auto session = session_arg(args, "adbc_execute");
+    if (!session) {
+        return std::unexpected(session.error());
+    }
+    const auto* sql = args.size() == 2 ? std::get_if<std::string>(&args[1]) : nullptr;
+    if (sql == nullptr) {
+        return std::unexpected("adbc_execute(db, sql) expects a string statement");
+    }
+    auto statement = LeasedStatement::open(std::move(*session));
+    if (!statement) {
+        return std::unexpected("adbc_execute: " + statement.error());
+    }
+    auto rows =
+        (*statement)->set_sql(*sql).and_then([&] { return (*statement)->execute_update(); });
+    if (!rows) {
+        return std::unexpected("adbc_execute: " + rows.error());
+    }
+    return ibex::runtime::ExternValue{ibex::runtime::ScalarValue{*rows}};
+}
+
+/// The ADBC ingest mode for `adbc_write`'s `mode` argument.
+auto ingest_mode(std::string_view mode) -> std::optional<const char*> {
+    if (mode == "create") {
+        return ADBC_INGEST_OPTION_MODE_CREATE;
+    }
+    if (mode == "append") {
+        return ADBC_INGEST_OPTION_MODE_APPEND;
+    }
+    if (mode == "replace") {
+        return ADBC_INGEST_OPTION_MODE_REPLACE;
+    }
+    if (mode == "create_append") {
+        return ADBC_INGEST_OPTION_MODE_CREATE_APPEND;
+    }
+    return std::nullopt;
+}
+
+/// Bulk-ingest a table through ADBC. Returns the rows written: the driver's
+/// count, or the table's row count when the driver reports none.
+auto adbc_write(const ibex::runtime::ExternArgs& args)
+    -> std::expected<ibex::runtime::ExternValue, std::string> {
+    constexpr std::string_view kUsage = "adbc_write(db, df, table, mode)";
+    auto session = session_arg(args, "adbc_write");
+    if (!session) {
+        return std::unexpected(session.error());
+    }
+    const auto table = args.size() == 4 ? args.table(1) : nullptr;
+    const auto* target = args.size() == 4 ? std::get_if<std::string>(&args[2]) : nullptr;
+    const auto* mode = args.size() == 4 ? std::get_if<std::string>(&args[3]) : nullptr;
+    if (table == nullptr || target == nullptr || mode == nullptr) {
+        return std::unexpected(std::string(kUsage) +
+                               " expects a connection, a DataFrame and two strings");
+    }
+    const auto adbc_mode = ingest_mode(*mode);
+    if (!adbc_mode) {
+        return std::unexpected("adbc_write: unknown mode '" + *mode +
+                               "'; expected create, append, replace or create_append");
+    }
+
+    ::ArrowArray array{};
+    ::ArrowSchema schema{};
+    if (auto exported = ibex::interop::export_table_to_arrow(table, &array, &schema); !exported) {
+        return std::unexpected("adbc_write: " + exported.error());
+    }
+    // The driver may hold what it was bound until the statement is released,
+    // so the statement lives in the inner scope below and the exports outlive it.
+    const auto release_exports = [&] {
+        ibex::interop::release_arrow_array(&array);
+        ibex::interop::release_arrow_schema(&schema);
+    };
+    std::expected<std::int64_t, std::string> rows = std::unexpected(std::string{});
+    {
+        auto statement = LeasedStatement::open(std::move(*session));
+        if (!statement) {
+            release_exports();
+            return std::unexpected("adbc_write: " + statement.error());
+        }
+        auto& stmt = **statement;
+        rows = stmt.set_option(ADBC_INGEST_OPTION_TARGET_TABLE, target->c_str())
+                   .and_then([&] { return stmt.set_option(ADBC_INGEST_OPTION_MODE, *adbc_mode); })
+                   .and_then([&] { return stmt.bind(&array, &schema); })
+                   .and_then([&] { return stmt.execute_update(); });
+    }
+    release_exports();
+    if (!rows) {
+        return std::unexpected("adbc_write: " + rows.error());
+    }
+    const std::int64_t written = *rows >= 0 ? *rows : static_cast<std::int64_t>(table->rows());
+    return ibex::runtime::ExternValue{ibex::runtime::ScalarValue{written}};
+}
+
 auto adbc_close(const ibex::runtime::ExternArgs& args)
     -> std::expected<ibex::runtime::ExternValue, std::string> {
     auto session = session_arg(args, "adbc_close");
@@ -659,5 +840,7 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
 
     registry->register_resource("adbc_connect", adbc_connect);
     registry->register_table("adbc_query", adbc_query);
+    registry->register_scalar("adbc_execute", ibex::runtime::ScalarKind::Int, adbc_execute);
+    registry->register_scalar("adbc_write", ibex::runtime::ScalarKind::Int, adbc_write);
     registry->register_scalar("adbc_close", ibex::runtime::ScalarKind::Int, adbc_close);
 }

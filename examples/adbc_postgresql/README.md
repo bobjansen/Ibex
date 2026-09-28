@@ -69,7 +69,8 @@ build/tools/ibex --plugin-path build/tools examples/adbc_postgresql/types.ibex
 inner quotes escaped). Expected:
 
 1. **Native types**, 3 rows. `small_n`, `int_n` and `big_n` are integers
-   (`10000000000` and `-20000000000` for `big_n`), `dbl` is `1.5` / `-2.25`,
+   (`10000000000` and `-20000000000` for `big_n`), `dbl` and `real_n` are
+   `1.5` / `-2.25` (`real` is float32, widened to `Float64` without loss),
    `flag` is true / false, `label` and `code` are strings, `day` is a date.
    `ts` keeps its microseconds (`2026-01-02 03:04:05.123456`). `tstz` is shown
    in UTC, so row 2's `1999-12-31 23:59:59+01` reads `1999-12-31 22:59:59`.
@@ -102,7 +103,6 @@ the cast, is expected to work.
 
 | Column | PostgreSQL type | Arrives as | Workaround |
 | --- | --- | --- | --- |
-| `real_n` | `real` | float32 | `real_n::float8` |
 | `bytes` | `bytea` | binary | `encode(bytes, 'hex')` |
 | `uid` | `uuid` | binary | `uid::text` |
 | `t` | `time` | time64 | `t::text` |
@@ -110,8 +110,7 @@ the cast, is expected to work.
 | `tags` | `text[]` | list | `array_to_string(tags, ',')` |
 
 ```bash
-for sql in "select real_n from ibex_types" "select real_n::float8 as real_n from ibex_types" \
-           "select bytes from ibex_types"  "select encode(bytes, 'hex') as bytes from ibex_types" \
+for sql in "select bytes from ibex_types"  "select encode(bytes, 'hex') as bytes from ibex_types" \
            "select uid from ibex_types"    "select uid::text as uid from ibex_types" \
            "select t from ibex_types"      "select t::text as t from ibex_types" \
            "select iv from ibex_types"     "select iv::text as iv from ibex_types" \
@@ -122,8 +121,7 @@ done
 ```
 
 ```powershell
-$queries = "select real_n from ibex_types", "select real_n::float8 as real_n from ibex_types",
-           "select bytes from ibex_types",  "select encode(bytes, 'hex') as bytes from ibex_types",
+$queries = "select bytes from ibex_types",  "select encode(bytes, 'hex') as bytes from ibex_types",
            "select uid from ibex_types",    "select uid::text as uid from ibex_types",
            "select t from ibex_types",      "select t::text as t from ibex_types",
            "select iv from ibex_types",     "select iv::text as iv from ibex_types",
@@ -134,9 +132,7 @@ foreach ($sql in $queries) {
 }
 ```
 
-`real` is an Ibex gap rather than a driver choice: Ibex has no 32-bit float
-column and does not yet widen one to `Float64` on import. The others are types
-Ibex has no column for.
+These are types Ibex has no column for.
 
 ## 6. Clean up
 

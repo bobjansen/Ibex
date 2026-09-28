@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# Pre-push: include check (clang-tidy misc-include-cleaner) on the pushed
-# src/*.cpp, then the structural fusion-invariant gate.
+# Pre-push: CI's clang-tidy check on the pushed sources, then the structural
+# fusion-invariant gate.
 #
-# The include check mirrors one check of CI's clang-tidy job, which treats
-# every diagnostic as an error. It is the one that fails most often -- a new
-# helper used from another file without including its header -- and it is
-# cheap (~4 s on the largest TU; CI's full check set takes ~40 s per file),
-# so it runs here and the rest stays in CI. `scripts/tidy-fix.sh <files>`
-# adds the missing includes.
+# The tidy check runs CI's clang-tidy job -- the full .clang-tidy check set,
+# every diagnostic an error, the same header filter -- on the pushed src/*.cpp,
+# plus, for each pushed include/ibex header, one src/*.cpp that includes it:
+# a header's diagnostics only surface through a translation unit, and a
+# header-only change otherwise pushed unchecked. It once ran only
+# misc-include-cleaner (~4 s) and left the rest to CI, which then failed on
+# findings no local step could see. The full set costs ~1 min wall on
+# src/repl/repl.cpp, in parallel across files. `scripts/tidy-fix.sh <files>`
+# fixes missing includes and a few other checks automatically.
 #
 #   Skip for one push:   IBEX_SKIP_TIDY_CHECK=1 git push
 #
@@ -42,8 +45,8 @@ push_lines="$(cat)"
 
 # --- include check -----------------------------------------------------------
 
-# The pushed src/*.cpp files. A new remote ref has no remote side to diff
-# against, so diff from where it left origin/main.
+# The pushed files under src/ and include/ibex/. A new remote ref has no remote
+# side to diff against, so diff from where it left origin/main.
 tidy_changed_files() {
     local _local_ref local_oid _remote_ref remote_oid base
     while read -r _local_ref local_oid _remote_ref remote_oid; do
@@ -52,8 +55,27 @@ tidy_changed_files() {
         if [[ "$base" == "$ZERO" ]]; then
             base="$(git merge-base origin/main "$local_oid" 2>/dev/null)" || continue
         fi
-        git diff --name-only --diff-filter=ACMR "$base" "$local_oid" -- 'src/*.cpp' 2>/dev/null
+        git diff --name-only --diff-filter=ACMR "$base" "$local_oid" -- \
+            'src/*.cpp' 'include/ibex/*.hpp' 2>/dev/null
     done <<<"$push_lines" | sort -u
+}
+
+# The translation units to tidy: each pushed src/*.cpp, and for each pushed
+# header the first src/*.cpp that includes it (any one is enough for the
+# header filter to report the header's own diagnostics).
+tidy_units() {
+    local f header
+    while IFS= read -r f; do
+        [[ -z "$f" || ! -f "$ROOT/$f" ]] && continue
+        case "$f" in
+            src/*.cpp) echo "$f" ;;
+            include/*.hpp)
+                header="${f#include/}"
+                git -C "$ROOT" grep -l -F "#include <$header>" -- 'src/*.cpp' 2>/dev/null |
+                    head -n1
+                ;;
+        esac
+    done < <(tidy_changed_files) | sort -u
 }
 
 tidy_check() {
@@ -62,11 +84,11 @@ tidy_check() {
     local f
     while IFS= read -r f; do
         [[ -n "$f" && -f "$ROOT/$f" ]] && files+=("$ROOT/$f")
-    done < <(tidy_changed_files)
+    done < <(tidy_units)
     [[ "${#files[@]}" -eq 0 ]] && return 0
 
     if [[ ! -f "$build/compile_commands.json" ]]; then
-        echo "[tidy] build/compile_commands.json missing — skipping the include check." >&2
+        echo "[tidy] build/compile_commands.json missing — skipping the clang-tidy check." >&2
         echo "[tidy]   Configure build/ so it can run; CI's clang-tidy job still checks." >&2
         return 0
     fi
@@ -78,16 +100,16 @@ tidy_check() {
         fi
     done
     if [[ -z "$tidy" ]]; then
-        echo "[tidy] clang-tidy not found — skipping the include check." >&2
+        echo "[tidy] clang-tidy not found — skipping the clang-tidy check." >&2
         return 0
     fi
 
-    echo "[tidy] checking includes in ${#files[@]} file(s)…" >&2
-    # Same invocation as CI, narrowed to the one check; its options
-    # (IgnoreHeaders) still come from .clang-tidy.
+    echo "[tidy] running clang-tidy on ${#files[@]} file(s)…" >&2
+    # Same invocation as CI's clang-tidy job; checks and options come from
+    # .clang-tidy, the header filter must be passed here (see ci.yml).
     local out
     out="$(printf '%s\0' "${files[@]}" |
-        xargs -0 -P 6 -n1 "$tidy" -p "$build" --quiet --checks='-*,misc-include-cleaner' \
+        xargs -0 -P 6 -n1 "$tidy" -p "$build" --quiet \
             --warnings-as-errors='*' --header-filter='^.*/include/ibex/.*\.hpp$' 2>&1)"
     local status=$?
     if [[ "$status" -eq 0 ]]; then
@@ -97,8 +119,8 @@ tidy_check() {
     errors="$(grep -E 'error:' <<<"$out" | sed "s|$ROOT/||" | sort -u)"
     echo "$errors" >&2
     echo >&2
-    echo "[tidy] PUSH BLOCKED: CI's clang-tidy job would fail on the includes above." >&2
-    echo "[tidy] Fix them with:" >&2
+    echo "[tidy] PUSH BLOCKED: CI's clang-tidy job would fail on the findings above." >&2
+    echo "[tidy] Missing includes (and a few other checks) can be fixed with:" >&2
     echo "[tidy]   scripts/tidy-fix.sh $(cut -d: -f1 <<<"$errors" | sort -u | tr '\n' ' ')" >&2
     echo "[tidy] or bypass once with:" >&2
     echo "[tidy]   IBEX_SKIP_TIDY_CHECK=1 git push" >&2

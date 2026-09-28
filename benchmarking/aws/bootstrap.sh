@@ -624,7 +624,7 @@ fi
 
 # ── Compare-plugin mode (compare-plugin-git.sh) ────────────────────────────────
 # A/B two git commits for a plugin-backed extern function (read_parquet,
-# read_adbc, ...) on this clean box. Delegates to compare_plugin_git.sh, which
+# adbc_read, ...) on this clean box. Delegates to compare_plugin_git.sh, which
 # builds both commits (with the given plugin target, e.g. Arrow/Parquet ON —
 # unlike IBEX_COMPARE_MODE above, which builds with it OFF) and drives the
 # real REPL + --plugin-path, since ibex_bench never loads a plugin. Skips

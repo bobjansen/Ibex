@@ -19,7 +19,7 @@ let out = scalar(args[filter name == "out", select { value }]);
 
 // 1. Read the whole table. batch_rows=4 makes the driver hand Ibex the 11
 //    rows as three Arrow batches (4 + 4 + 3); the result is one table.
-let trades = read_adbc(driver, db,
+let trades = adbc_read(driver, db,
     "select id, ts, symbol, side, qty, price from trades order by id",
     "stmt.adbc.sqlite.query.batch_rows=4");
 trades;
@@ -41,5 +41,5 @@ write_csv(summary, out);
 
 // 5. A query with no matching rows still has its columns and types, so the
 //    rest of the pipeline type-checks and returns an empty table.
-read_adbc(driver, db, "select symbol, qty, price from trades where symbol = 'TSLA'")
+adbc_read(driver, db, "select symbol, qty, price from trades where symbol = 'TSLA'")
     [update { notional = qty * price }];

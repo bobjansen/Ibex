@@ -49,7 +49,7 @@
     <h2>One connection, many queries</h2>
     <div class="grid-2">
       <article class="card">
-        <h3><code>read_adbc</code>: one-off reads</h3>
+        <h3><code>adbc_read</code>: one-off reads</h3>
         <p>
           Opens a connection, runs one query, reads the result and closes the
           connection. Each call starts fresh: nothing one call creates on the
@@ -97,7 +97,7 @@
 <span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_close</span>(<span class="kw">mutable</span> db: AdbcConnection) -&gt; Int <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;</code></pre>
     <table class="repl-table">
       <tbody>
-        <tr><td><code>adbc_connect(driver, uri, options)</code></td><td>Open a connection. <code>driver</code> and <code>options</code> work as for <code>read_adbc</code>; <code>stmt.</code> options apply to every query on the connection.</td></tr>
+        <tr><td><code>adbc_connect(driver, uri, options)</code></td><td>Open a connection. <code>driver</code> and <code>options</code> work as for <code>adbc_read</code>; <code>stmt.</code> options apply to every query on the connection.</td></tr>
         <tr><td><code>adbc_query(db, sql)</code></td><td>Run SQL on the connection and return the result as a table. Statements without a result set (DDL, <code>insert</code>) return an empty table.</td></tr>
         <tr><td><code>adbc_close(db)</code></td><td>Close the connection for every binding of it. Returns <code>1</code> the first time and <code>0</code> after; a query on a closed connection is an error.</td></tr>
       </tbody>
@@ -287,7 +287,7 @@ trades[<span class="kw">update</span> { n = ^n }];</code></pre>
         <h3>ADBC</h3>
         <ul>
           <li>One active query per connection; a second concurrent use reports the connection as busy.</li>
-          <li>No connection forms of writes, <code>execute</code>, or bound parameters yet; use <code>read_adbc</code>-style SQL strings.</li>
+          <li>No connection forms of writes, <code>execute</code>, or bound parameters yet; use <code>adbc_read</code>-style SQL strings.</li>
           <li>No transactions, pooling, or cancellation of a running query.</li>
           <li>An error while cleaning up a closed connection is not reported.</li>
         </ul>

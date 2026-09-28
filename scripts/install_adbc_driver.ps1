@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Bob Jansen
 #
-# Install an Apache ADBC driver on Windows so `read_adbc("<name>", ...)` finds
+# Install an Apache ADBC driver on Windows so `adbc_read("<name>", ...)` finds
 # it by name. The Windows counterpart of scripts/install_adbc_driver.sh.
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\install_adbc_driver.ps1 sqlite postgresql
@@ -110,7 +110,7 @@ try {
             )
             # TOML: no byte-order mark (Windows PowerShell's UTF8 encoding adds one).
             [System.IO.File]::WriteAllLines($manifest, $lines, (New-Object System.Text.UTF8Encoding $false))
-            Write-Host "  manifest $manifest -> set ADBC_DRIVER_PATH=$Dest, then read_adbc(`"$name`", ...)"
+            Write-Host "  manifest $manifest -> set ADBC_DRIVER_PATH=$Dest, then adbc_read(`"$name`", ...)"
         } else {
             $key = "HKCU:\SOFTWARE\ADBC\Drivers\$name"
             New-Item -Path $key -Force | Out-Null
@@ -119,7 +119,7 @@ try {
             New-ItemProperty -Path $key -Name 'version' -Value $AdbcVersion -PropertyType String -Force | Out-Null
             New-ItemProperty -Path $key -Name 'source' -Value $source -PropertyType String -Force | Out-Null
             New-ItemProperty -Path $key -Name 'manifest_version' -Value 1 -PropertyType DWord -Force | Out-Null
-            Write-Host "  registered $key -> read_adbc(`"$name`", ...)"
+            Write-Host "  registered $key -> adbc_read(`"$name`", ...)"
         }
     }
 } finally {

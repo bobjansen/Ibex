@@ -49,7 +49,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install_adbc_driver.ps1 postgre
 ```
 
 The driver is Apache's own build, pinned and SHA-256 checked, with `libpq`
-linked in; nothing else is installed. `read_adbc("postgresql", ...)` then finds
+linked in; nothing else is installed. `adbc_read("postgresql", ...)` then finds
 it by name.
 
 ## 4. Read the supported types

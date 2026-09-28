@@ -3,7 +3,7 @@
 
 // ADBC integration tests. The built `adbc` plugin is loaded the way a user
 // loads it -- `import "adbc";` in a REPL session -- and reads a throwaway
-// SQLite database. The database is also seeded through `read_adbc` (one
+// SQLite database. The database is also seeded through `adbc_read` (one
 // statement per call), which keeps this binary free of any ADBC link: the
 // driver manager lives only in the plugin, as it does in the ibex tool.
 //
@@ -160,10 +160,10 @@ auto ibex_str(std::string_view text) -> std::string {
     return "\"" + std::string(text) + "\"";
 }
 
-/// `read_adbc(<sqlite driver>, <db>, <sql>[, <options>])` as Ibex source.
+/// `adbc_read(<sqlite driver>, <db>, <sql>[, <options>])` as Ibex source.
 auto read_call(const SqliteDb& db, std::string_view sql,
                std::optional<std::string_view> options = std::nullopt) -> std::string {
-    std::string call = "read_adbc(" + ibex_str(sqlite_driver()) + ", " + ibex_str(db.path()) +
+    std::string call = "adbc_read(" + ibex_str(sqlite_driver()) + ", " + ibex_str(db.path()) +
                        ", " + ibex_str(sql);
     if (options.has_value()) {
         call += ", " + ibex_str(*options);
@@ -189,7 +189,7 @@ struct AdbcSession {
         const auto imported = session.execute("import \"adbc\";");
         INFO(imported.error);
         REQUIRE(imported.ok);
-        REQUIRE(registry.find("read_adbc") != nullptr);
+        REQUIRE(registry.find("adbc_read") != nullptr);
     }
 
     static auto config() -> ibex::repl::ReplConfig {
@@ -200,7 +200,7 @@ struct AdbcSession {
     }
 
     [[nodiscard]] auto function() const -> const ibex::runtime::ExternFunction& {
-        const auto* fn = registry.find("read_adbc");
+        const auto* fn = registry.find("adbc_read");
         REQUIRE(fn != nullptr);
         return *fn;
     }
@@ -244,7 +244,7 @@ auto contains(const std::string& haystack, std::string_view needle) -> bool {
 
 }  // namespace
 
-TEST_CASE("read_adbc accepts the documented three-argument form", "[adbc]") {
+TEST_CASE("adbc_read accepts the documented three-argument form", "[adbc]") {
     SqliteDb db;
     AdbcSession s;
     seed_trades(s, db);
@@ -259,7 +259,7 @@ TEST_CASE("read_adbc accepts the documented three-argument form", "[adbc]") {
     CHECK(r.table->find("symbol") != nullptr);
 }
 
-TEST_CASE("read_adbc reads every batch and feeds an Ibex aggregation", "[adbc]") {
+TEST_CASE("adbc_read reads every batch and feeds an Ibex aggregation", "[adbc]") {
     SqliteDb db;
     AdbcSession s;
     seed_trades(s, db);
@@ -306,7 +306,7 @@ TEST_CASE("read_adbc reads every batch and feeds an Ibex aggregation", "[adbc]")
     }
 }
 
-TEST_CASE("read_adbc carries SQL NULLs as validity", "[adbc]") {
+TEST_CASE("adbc_read carries SQL NULLs as validity", "[adbc]") {
     SqliteDb db;
     AdbcSession s;
     seed_trades(s, db);
@@ -330,7 +330,7 @@ TEST_CASE("read_adbc carries SQL NULLs as validity", "[adbc]") {
     CHECK_FALSE((*symbol->validity)[4]);
 }
 
-TEST_CASE("read_adbc keeps the schema of an empty result", "[adbc]") {
+TEST_CASE("adbc_read keeps the schema of an empty result", "[adbc]") {
     SqliteDb db;
     AdbcSession s;
     seed_trades(s, db);
@@ -359,7 +359,7 @@ TEST_CASE("read_adbc keeps the schema of an empty result", "[adbc]") {
     }
 }
 
-TEST_CASE("read_adbc materialized and chunked paths agree", "[adbc]") {
+TEST_CASE("adbc_read materialized and chunked paths agree", "[adbc]") {
     SqliteDb db;
     AdbcSession s;
     seed_trades(s, db);
@@ -374,7 +374,7 @@ TEST_CASE("read_adbc materialized and chunked paths agree", "[adbc]") {
     CHECK(ints(*table, "id") == std::vector<std::int64_t>{1, 2, 3, 4, 5});
 }
 
-TEST_CASE("read_adbc applies connection options before and after init", "[adbc]") {
+TEST_CASE("adbc_read applies connection options before and after init", "[adbc]") {
     SqliteDb db;
     AdbcSession s;
     seed_trades(s, db);
@@ -394,16 +394,16 @@ TEST_CASE("read_adbc applies connection options before and after init", "[adbc]"
     }
 }
 
-TEST_CASE("read_adbc reports errors instead of failing silently", "[adbc]") {
+TEST_CASE("adbc_read reports errors instead of failing silently", "[adbc]") {
     SqliteDb db;
     AdbcSession s;
     seed_trades(s, db);
 
     SECTION("a driver path that does not exist is named, whole") {
         const auto r = s.session.execute(
-            "read_adbc(\"/nonexistent/libadbc_driver_nothing.so\", \"\", \"select 1\");");
+            "adbc_read(\"/nonexistent/libadbc_driver_nothing.so\", \"\", \"select 1\");");
         CHECK_FALSE(r.ok);
-        CHECK(contains(r.error, "read_adbc"));
+        CHECK(contains(r.error, "adbc_read"));
         CHECK(
             contains(r.error, "driver library not found: /nonexistent/libadbc_driver_nothing.so"));
         // Left to the driver manager, a second dlopen for an invented name.
@@ -412,7 +412,7 @@ TEST_CASE("read_adbc reports errors instead of failing silently", "[adbc]") {
     SECTION("a Windows drive path is not read as a driver:uri prefix") {
         // ADBC reads `C:` as a scheme and reported "Could not load `C`".
         const auto r = s.session.execute(
-            "read_adbc(\"C:/nonexistent/adbc_driver_nothing.dll\", \"\", \"select 1\");");
+            "adbc_read(\"C:/nonexistent/adbc_driver_nothing.dll\", \"\", \"select 1\");");
         CHECK_FALSE(r.ok);
         CHECK(
             contains(r.error, "driver library not found: C:/nonexistent/adbc_driver_nothing.dll"));
@@ -491,7 +491,7 @@ class ManifestDir {
 
 }  // namespace
 
-TEST_CASE("read_adbc resolves a bare driver name through a manifest", "[adbc]") {
+TEST_CASE("adbc_read resolves a bare driver name through a manifest", "[adbc]") {
     SqliteDb db;
     AdbcSession s;
     seed_trades(s, db);
@@ -499,7 +499,7 @@ TEST_CASE("read_adbc resolves a bare driver name through a manifest", "[adbc]") 
     manifests.add("ibex_test_sqlite", sqlite_driver());
 
     SECTION("a manifest on ADBC_DRIVER_PATH names the driver") {
-        const auto r = s.session.execute("read_adbc(\"ibex_test_sqlite\", " + ibex_str(db.path()) +
+        const auto r = s.session.execute("adbc_read(\"ibex_test_sqlite\", " + ibex_str(db.path()) +
                                          ", \"select count(*) as n from trades\");");
         INFO(r.error);
         REQUIRE(r.ok);
@@ -508,7 +508,7 @@ TEST_CASE("read_adbc resolves a bare driver name through a manifest", "[adbc]") 
     SECTION("an unknown name fails, says how to install one and where it looked") {
         // A session keeps an error's first line only, so the verdict and what
         // to do must both be on it.
-        const auto r = s.session.execute("read_adbc(\"ibex_no_such_driver\", " +
+        const auto r = s.session.execute("adbc_read(\"ibex_no_such_driver\", " +
                                          ibex_str(db.path()) + ", \"select 1\");");
         INFO(r.error);
         CHECK_FALSE(r.ok);
@@ -717,7 +717,7 @@ TEST_CASE("adbc_connect against PostgreSQL", "[adbc][connection][postgresql]") {
     CHECK(ints(*temp.table, "id") == std::vector<std::int64_t>{1, 2, 3});
     const auto elsewhere = s.session.execute("adbc_query(other, \"select id from ibex_conn_t\");");
     CHECK_FALSE(elsewhere.ok);
-    const auto one_off = s.session.execute("read_adbc(" + ibex_str(driver) + ", " + ibex_str(*uri) +
+    const auto one_off = s.session.execute("adbc_read(" + ibex_str(driver) + ", " + ibex_str(*uri) +
                                            ", \"select id from ibex_conn_t\");");
     CHECK_FALSE(one_off.ok);
 

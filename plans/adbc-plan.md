@@ -1,6 +1,7 @@
 # Finishing ADBC support
 
-Status: **proposed, next up** (2026-09-27; performance work is parked behind it,
+Status: **in progress** (2026-09-28: Phase 0 done, Phase 4 slices 1-2 done,
+`float32` widening done; 2026-09-27: performance work is parked behind it,
 see `beat-duckdb-plan.md`). This plan says what "finished" means for the ADBC
 plugin, what exists today, and the order to build the rest in. The design of
 reusable connections already exists as a separate plan
@@ -32,14 +33,14 @@ remote query, connection pooling, bulk ingestion tuning, and Decimal256.
 
 | Area | State |
 |---|---|
-| Read | `read_adbc(driver, uri, sql, options = "")` (`libs/adbc/adbc.cpp`, 411 lines), registered as both a materialized and a chunked (streaming) source. One connection per call. |
+| Read | `adbc_read(driver, uri, sql, options = "")` (`libs/adbc/adbc.cpp`, 411 lines), registered as both a materialized and a chunked (streaming) source. One connection per call. |
 | Options | `db.`/`conn.`/`conn.post.`/`stmt.` prefixed `key=value` list with escaping, parsed in the ADBC-free `adbc_options.hpp` (tested without a driver). `entrypoint=` override. |
 | Arrow import | Shared with Arrow C Data and Parquet (`src/interop/arrow_c_data.cpp`); zero-copy where the layout allows; `d:p,s` decimals exact. Empty results keep their schema. |
 | Types refused | `binary` (bytea, uuid), `time64`, `month-day-nano interval`, `list` (`text[]`), each with a SQL-cast workaround in the PostgreSQL walkthrough. PostgreSQL `numeric` and `jsonb` arrive as text; the walkthrough converts `numeric` to `Decimal(p, s)` in Ibex. |
 | Drivers | Bare names resolved through ADBC manifests. `scripts/install_adbc_driver.{sh,ps1}` install Apache's pinned, SHA-256-checked PyPI wheels for **sqlite** and **postgresql** on Linux x86-64/arm64, macOS x86-64/arm64 and Windows, with no Python needed. The driver manager is built from the pinned apache-arrow-adbc-24 tarball (or a system one). |
 | Tests | `tests/test_adbc.cpp` (8 cases, SQLite: batches, nulls, empty schema, materialized = chunked, options, errors, manifest names) and `tests/test_adbc_options.cpp`; ctest `adbc:sqlite_demo` runs `examples/adbc_sqlite/`. |
 | CI | `.github/workflows/adbc.yml`: Linux (g++) and Windows (MSVC) jobs, SQLite; the Windows job publishes the `ibex-windows-adbc` artifact. |
-| Docs | `docs/io.html` covers SQLite only. SPEC.md does not describe `read_adbc`. `examples/adbc_postgresql/` is a walkthrough with a type matrix. |
+| Docs | `docs/io.html` covers SQLite only. SPEC.md does not describe `adbc_read`. `examples/adbc_postgresql/` is a walkthrough with a type matrix. |
 
 **Stranded work, now on the `adbc` branch.** Two commits existed only on the
 local `adbc-reliability` branch, not on `origin` or `main`; they are
@@ -55,7 +56,7 @@ cherry-picked onto `adbc` as `2acc5a22` and `b8ab0f5f`:
 
 ## Phases
 
-Each phase lands on its own, with tests, and leaves the one-off `read_adbc`
+Each phase lands on its own, with tests, and leaves the one-off `adbc_read`
 unchanged.
 
 ### Phase 0 — land what exists
@@ -95,9 +96,9 @@ walkthrough's "refused" table matches.
 
 ### Phase 2 — write and execute (one-off form)
 
-Mirror `read_adbc`'s shape: one connection per call, same `options` string.
+Mirror `adbc_read`'s shape: one connection per call, same `options` string.
 
-- `write_adbc(df, driver, uri, table, mode = "create", options = "")` → Int
+- `adbc_write(df, driver, uri, table, mode = "create", options = "")` → Int
   (rows written). ADBC bulk ingestion: `AdbcStatementSetOption` with
   `ADBC_INGEST_OPTION_TARGET_TABLE` and `ADBC_INGEST_OPTION_MODE`
   (create / append / replace / create_append), then `AdbcStatementBindStream`
@@ -105,9 +106,9 @@ Mirror `read_adbc`'s shape: one connection per call, same `options` string.
   (`arrow_c_data.cpp` exports every Ibex column type, Decimal included). It is
   a table sink like `write_csv`, so it goes through the script driver's sink
   path (`ScriptSink`).
-- `execute_adbc(driver, uri, sql, options = "")` → Int (affected rows, or −1
+- `adbc_execute(driver, uri, sql, options = "")` → Int (affected rows, or −1
   when the driver does not report it). `AdbcStatementExecuteUpdate`. Today the
-  tests seed SQLite by running DDL through `read_adbc`, which works only by
+  tests seed SQLite by running DDL through `adbc_read`, which works only by
   accident.
 
 Round-trip tests on SQLite and PostgreSQL: every Ibex column type, nulls, an
@@ -119,7 +120,7 @@ the round trip is byte-identical per type.
 
 ### Phase 3 — parameters (one-off form)
 
-`read_adbc` and `execute_adbc` take an optional parameter table: one row binds
+`adbc_read` and `adbc_execute` take an optional parameter table: one row binds
 once, `n` rows execute `n` times (batch insert/update). `AdbcStatementPrepare`,
 then `AdbcStatementBind` with the parameter table exported as Arrow. SQL
 placeholder syntax is the driver's (`?` for SQLite, `$1` for PostgreSQL);
@@ -183,7 +184,7 @@ reason in the schema listing before any query is run.
 - **`docs/io.html`**: PostgreSQL next to SQLite, writing, parameters,
   connections. Use `import "adbc"` in examples (AGENTS.md).
 - **`ibex_compile`**: generated C++ either supports the ADBC functions or
-  rejects them with a clear message. Check what it does with `read_adbc` today.
+  rejects them with a clear message. Check what it does with `adbc_read` today.
 
 Done when: the four drivers install by name on the three platforms, and SPEC,
 docs and the walkthroughs cover every function.
@@ -203,15 +204,15 @@ closes the arc; its driver and CI items can go in as early as useful.
    language feature. Without it ADBC is complete for scripting (one connection
    per call) but not for session-style use.
 3. **Parameter form:** table only, or also a scalar list?
-4. **Function naming:** `write_adbc`/`execute_adbc` mirror `read_adbc`; the
-   opaque-resource plan uses `adbc_query`/`adbc_close` for the connection
-   forms. Keep both families, or rename the one-off ones `adbc_read` etc. while
-   there are few users?
+4. ~~**Function naming**~~ decided 2026-09-28: every function is `adbc_*`
+   (`adbc_read`, `adbc_write`, `adbc_execute`, `adbc_connect`, `adbc_query`,
+   ...); `read_adbc` was renamed with no alias. Namespaces are the next
+   question, to be considered separately.
 
 ## Testing
 
 - **SQLite** in every build with ADBC on: no service needed; seed through
-  `execute_adbc` once it exists.
+  `adbc_execute` once it exists.
 - **PostgreSQL** in CI as a service (Phase 0), and locally through Docker.
   Always ask before starting a container.
 - **Round trips** per type as the core check for writing and parameters.

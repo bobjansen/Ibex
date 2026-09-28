@@ -28,7 +28,7 @@ adds the disk-spill and pushdown-read layer on top of it.
 | `Join` (the common general case) | `ChunkedInnerJoinOperator`/`ChunkedSemiAntiJoinOperator` materialize the **build side** into an in-memory hash table; multi-key/predicated joins materialize **both sides** via `join_table_impl` | Fine while the smaller side fits; wrong assumption for large-fact-to-large-fact joins (e.g. two multi-day history tables) |
 | `read_parquet` | `parquet::arrow::FileReader::ReadTable` — whole file decoded into one Arrow table, then converted; registered only via `register_table` (no `register_chunked_table`) | Can't stream row groups; no column projection or row-group-statistics pushdown; a single large Parquet file can't be processed in bounded memory at all |
 | Parquet dataset scanning | Single-file path only, no glob/directory, no Hive partitioning | Real archives are directories of many partitioned files — there's no way to point Ibex at one logical dataset |
-| `read_adbc` | Already streams: `AdbcSourceOperator::next()` pulls one `ArrowArray` batch at a time and is registered via `register_chunked_table` — this is the reference implementation for a well-behaved chunked source | No gap on the *read* side |
+| `adbc_read` | Already streams: `AdbcSourceOperator::next()` pulls one `ArrowArray` batch at a time and is registered via `register_chunked_table` — this is the reference implementation for a well-behaved chunked source | No gap on the *read* side |
 | ADBC / Parquet write | `write_parquet` and the ADBC plugin both go through one-shot `MaterializeOperator` → single Arrow table → single write call | A `source → transform → sink` pipeline still holds the entire result in memory before it can write anything out |
 | Memory budgeting | No concept anywhere in the runtime of a memory ceiling, spill directory, or disk-backed intermediate. `grep spill` only turns up the categorical grouping "dense array vs hash map" *representation* switch (`src/runtime/chunked.cpp`), which is an in-memory algorithmic choice, not disk spill | Every "materializing" fallback above has no escape valve — it either fits or it OOMs |
 
@@ -142,7 +142,7 @@ into the remote SQL statement itself (the query engine on the other end does
 the row-group-equivalent work), whereas Parquet pushdown has to be
 implemented locally against row-group metadata since there's no remote
 engine to delegate to. Worth flagging as a design difference, not a gap —
-pushing predicates into the SQL text sent to `read_adbc` is a planner
+pushing predicates into the SQL text sent to `adbc_read` is a planner
 concern (tier-2 pushdown in `project_execution_roadmap` memory), not
 something this phase needs to solve for ADBC.
 
@@ -153,7 +153,7 @@ something this phase needs to solve for ADBC.
   giving bounded chunk size independent of the file's own row-group sizing —
   important since a naively-written Parquet file can have one giant row
   group. Registered via `register_chunked_table` alongside the untouched
-  whole-file `read_parquet()`/`register_table` path, exactly like `read_adbc`
+  whole-file `read_parquet()`/`register_table` path, exactly like `adbc_read`
   — purely additive, zero behavior change on paths that don't reach it.
   One deviation from the original plan text: rather than routing through
   `ibex::interop::import_table_from_arrow` (the Arrow C Data Interface
@@ -185,7 +185,7 @@ something this phase needs to solve for ADBC.
   | new (chunked) | local 318ms / AWS 455ms | local 113MB / AWS 112MB |
 
   **~6.4–6.5× lower peak RSS, ~1.7× faster**, no regression. This harness is
-  reusable for any future plugin-backed extern function (`read_adbc`,
+  reusable for any future plugin-backed extern function (`adbc_read`,
   `kafka_recv`, ...), not just this checkpoint.
 - **Column projection pushdown**: thread the set of columns actually
   referenced by the query down into the Parquet reader so unread columns are
@@ -212,11 +212,11 @@ something this phase needs to solve for ADBC.
 
 ### Phase 5 — ADBC + Parquet chunked sinks
 
-`read_adbc` is already the reference chunked source. Nothing streams *out*
+`adbc_read` is already the reference chunked source. Nothing streams *out*
 today — both the ADBC plugin and `write_parquet` route through
 `MaterializeOperator` first. Add:
 
-- `write_adbc`/`to_adbc`: a chunked sink operator that binds each Ibex chunk
+- `adbc_write`/`to_adbc`: a chunked sink operator that binds each Ibex chunk
   as an Arrow `RecordBatch` and drives `AdbcStatementBind` +
   `AdbcStatementExecuteQuery` (or the bulk-ingestion path if the driver
   supports it) per batch, so the statement handle is reused across the whole

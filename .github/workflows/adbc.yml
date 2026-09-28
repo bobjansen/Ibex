@@ -110,7 +110,7 @@ jobs:
 
       - name: Smoke test (driver found by name through the registry)
         run: |
-          Set-Content -Path smoke.ibex -Value 'import "adbc";', 'read_adbc("sqlite", "", "select 42 as answer");'
+          Set-Content -Path smoke.ibex -Value 'import "adbc";', 'adbc_read("sqlite", "", "select 42 as answer");'
           $out = & build/tools/ibex.exe --plugin-path build/tools smoke.ibex 2>&1 | Out-String
           Write-Host $out
           if ($LASTEXITCODE -ne 0 -or $out -notmatch '\| 42 ') { exit 1 }

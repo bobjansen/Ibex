@@ -14,4 +14,4 @@ let uri = coalesce(scalar(args[filter name == "uri", select { value }]),
     "postgresql://postgres:ibex@localhost:55432/postgres");
 let sql = scalar(args[filter name == "sql", select { value }]);
 
-read_adbc(driver, uri, sql);
+adbc_read(driver, uri, sql);

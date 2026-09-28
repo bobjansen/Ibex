@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Bob Jansen
 #
-# Install an Apache ADBC driver so `read_adbc("<name>", ...)` finds it by name.
+# Install an Apache ADBC driver so `adbc_read("<name>", ...)` finds it by name.
 #
 #   scripts/install_adbc_driver.sh [--dest DIR] sqlite|postgresql ...
 #
@@ -159,7 +159,7 @@ url = 'https://arrow.apache.org/adbc/'
 ${plat} = '${dest}/${name}/${lib}'
 EOF
     echo "Installed $dest/$name/$lib"
-    echo "  manifest $dest/$name.toml -> read_adbc(\"$name\", ...)"
+    echo "  manifest $dest/$name.toml -> adbc_read(\"$name\", ...)"
 done
 
 default_dir="${XDG_CONFIG_HOME:-$HOME/.config}/adbc/drivers"

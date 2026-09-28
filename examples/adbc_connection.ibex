@@ -16,7 +16,7 @@ import "adbc";
 let db = adbc_connect("sqlite", ":memory:");
 
 // Each call runs on the same connection, so the table made here is still
-// there for the queries below. read_adbc would open a fresh database each time.
+// there for the queries below. adbc_read would open a fresh database each time.
 adbc_query(db, "create table trades (symbol text, qty integer, px real)");
 adbc_query(db, "insert into trades values ('AAPL', 10, 150.0), ('MSFT', 5, 300.0), ('AAPL', 20, 151.0)");
 

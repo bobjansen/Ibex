@@ -129,9 +129,15 @@ if(TARGET Ibex::Sanitizers)
     target_link_libraries(ibex_adbc_plugin PRIVATE Ibex::Sanitizers)
 endif()
 
-add_custom_command(TARGET ibex_adbc_plugin POST_BUILD
+set(_ibex_adbc_stub "${IBEX_PLUGIN_OUTPUT_DIR}/adbc.ibex")
+
+add_custom_command(
+    OUTPUT "${_ibex_adbc_stub}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/adbc.ibex"
-        "${IBEX_PLUGIN_OUTPUT_DIR}/adbc.ibex"
+        "${_ibex_adbc_stub}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/adbc.ibex"
     COMMENT "Installing adbc.ibex stub"
 )
+add_custom_target(ibex_adbc_stub DEPENDS "${_ibex_adbc_stub}")
+add_dependencies(ibex_adbc_plugin ibex_adbc_stub)

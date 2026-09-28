@@ -90,9 +90,15 @@ if(TARGET Ibex::Sanitizers)
     target_link_libraries(ibex_kafka_plugin PRIVATE Ibex::Sanitizers)
 endif()
 
-add_custom_command(TARGET ibex_kafka_plugin POST_BUILD
+set(_ibex_kafka_stub "${IBEX_PLUGIN_OUTPUT_DIR}/kafka.ibex")
+
+add_custom_command(
+    OUTPUT "${_ibex_kafka_stub}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/kafka.ibex"
-        "${IBEX_PLUGIN_OUTPUT_DIR}/kafka.ibex"
+        "${_ibex_kafka_stub}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kafka.ibex"
     COMMENT "Installing kafka.ibex stub"
 )
+add_custom_target(ibex_kafka_stub DEPENDS "${_ibex_kafka_stub}")
+add_dependencies(ibex_kafka_plugin ibex_kafka_stub)

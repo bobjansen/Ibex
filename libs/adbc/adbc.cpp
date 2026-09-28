@@ -8,7 +8,7 @@
 // script declares:
 //
 //   import "adbc";
-//   let df = read_adbc("adbc_driver_sqlite", "", "select 1 as x");
+//   let df = adbc_read("adbc_driver_sqlite", "", "select 1 as x");
 
 #include <ibex/core/text.hpp>
 #include <ibex/interop/arrow_c_data.hpp>
@@ -555,24 +555,24 @@ auto parse_option_arg(const ibex::runtime::ExternArgs& args, std::size_t index,
 auto make_adbc_source(const ibex::runtime::ExternArgs& args)
     -> std::expected<ibex::runtime::OperatorPtr, std::string> {
     if (args.size() != 3 && args.size() != 4) {
-        return std::unexpected("read_adbc() expects 3 or 4 string arguments");
+        return std::unexpected("adbc_read() expects 3 or 4 string arguments");
     }
     const auto* driver = std::get_if<std::string>(&args[0]);
     const auto* uri = std::get_if<std::string>(&args[1]);
     const auto* sql = std::get_if<std::string>(&args[2]);
     if (driver == nullptr || uri == nullptr || sql == nullptr) {
-        return std::unexpected("read_adbc(driver, uri, sql[, options]) expects string arguments");
+        return std::unexpected("adbc_read(driver, uri, sql[, options]) expects string arguments");
     }
-    auto options = parse_option_arg(args, 3, "read_adbc(driver, uri, sql, options)");
+    auto options = parse_option_arg(args, 3, "adbc_read(driver, uri, sql, options)");
     if (!options) {
         return std::unexpected(options.error());
     }
     // A connection of its own, released with the source.
     auto session = AdbcSession::open(*driver, *uri, *options);
     if (!session) {
-        return std::unexpected("read_adbc: " + session.error());
+        return std::unexpected("adbc_read: " + session.error());
     }
-    return AdbcSourceOperator::create(std::move(*session), *sql, "read_adbc");
+    return AdbcSourceOperator::create(std::move(*session), *sql, "adbc_read");
 }
 
 auto materialize(std::expected<ibex::runtime::OperatorPtr, std::string> source)
@@ -648,10 +648,10 @@ auto adbc_close(const ibex::runtime::ExternArgs& args)
 }  // namespace
 
 extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* registry) {
-    registry->register_table("read_adbc", [](const ibex::runtime::ExternArgs& args) {
+    registry->register_table("adbc_read", [](const ibex::runtime::ExternArgs& args) {
         return materialize(make_adbc_source(args));
     });
-    registry->register_chunked_table("read_adbc",
+    registry->register_chunked_table("adbc_read",
                                      [](const ibex::runtime::ExternArgs& args)
                                          -> std::expected<ibex::runtime::OperatorPtr, std::string> {
                                          return make_adbc_source(args);

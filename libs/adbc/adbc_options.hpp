@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
-// Parser for the `options` string of `read_adbc`.
+// Parser for the `options` string of `adbc_read` and `adbc_connect`.
 //
 // Header-only and free of any ADBC dependency so the parsing rules can be
 // tested in builds that do not have a driver manager installed.
@@ -86,7 +86,7 @@ inline auto add_unique(OptionList& list, std::string key, std::string value,
                        std::string_view original) -> std::expected<void, std::string> {
     for (const auto& [existing, ignored] : list) {
         if (existing == key) {
-            return std::unexpected("read_adbc options: duplicate option '" + std::string(original) +
+            return std::unexpected("ADBC options: duplicate option '" + std::string(original) +
                                    "'");
         }
     }
@@ -97,20 +97,20 @@ inline auto add_unique(OptionList& list, std::string key, std::string value,
 inline auto route(ParsedOptions& parsed, std::string key, std::string value, bool& have_entrypoint)
     -> std::expected<void, std::string> {
     if (!valid_key(key)) {
-        return std::unexpected("read_adbc options: invalid key '" + key +
+        return std::unexpected("ADBC options: invalid key '" + key +
                                "' (keys must be non-empty and contain no whitespace)");
     }
     if (key == "entrypoint") {
         if (have_entrypoint) {
-            return std::unexpected("read_adbc options: duplicate option 'entrypoint'");
+            return std::unexpected("ADBC options: duplicate option 'entrypoint'");
         }
         have_entrypoint = true;
         parsed.entrypoint = std::move(value);
         return {};
     }
     if (key == "driver" || key == "uri" || key == "db.driver" || key == "db.uri") {
-        return std::unexpected("read_adbc options: '" + key +
-                               "' must be passed as a positional argument of read_adbc");
+        return std::unexpected("ADBC options: '" + key +
+                               "' must be passed as a positional argument, not an option");
     }
 
     struct Scope {
@@ -128,8 +128,7 @@ inline auto route(ParsedOptions& parsed, std::string key, std::string value, boo
         if (key.starts_with(scope.prefix)) {
             std::string stripped = key.substr(scope.prefix.size());
             if (stripped.empty()) {
-                return std::unexpected("read_adbc options: '" + key +
-                                       "' is missing an option name");
+                return std::unexpected("ADBC options: '" + key + "' is missing an option name");
             }
             return add_unique(*scope.list, std::move(stripped), std::move(value), key);
         }
@@ -159,8 +158,7 @@ inline auto parse_options(std::string_view spec) -> std::expected<ParsedOptions,
             if (k.empty() && !had_text) {
                 return {};  // blank entry, e.g. a trailing `;`
             }
-            return std::unexpected("read_adbc options: entry '" + k +
-                                   "' is not of the form key=value");
+            return std::unexpected("ADBC options: entry '" + k + "' is not of the form key=value");
         }
         return detail::route(parsed, std::move(k), std::move(v), have_entrypoint);
     };
@@ -170,7 +168,7 @@ inline auto parse_options(std::string_view spec) -> std::expected<ParsedOptions,
         detail::Field& field = in_value ? value : key;
         if (c == '\\') {
             if (i + 1 == spec.size()) {
-                return std::unexpected("read_adbc options: trailing backslash");
+                return std::unexpected("ADBC options: trailing backslash");
             }
             const char next = spec[++i];
             char literal = next;
@@ -179,7 +177,7 @@ inline auto parse_options(std::string_view spec) -> std::expected<ParsedOptions,
             } else if (next == 't') {
                 literal = '\t';
             } else if (next != ';' && next != '=' && next != '\\') {
-                return std::unexpected(std::string("read_adbc options: unknown escape '\\") + next +
+                return std::unexpected(std::string("ADBC options: unknown escape '\\") + next +
                                        "'");
             }
             field.append(literal, true);

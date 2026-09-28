@@ -58,8 +58,8 @@ hashing, serialization, or user-visible address. Display is just the type and
 open/closed state, never a URI or credentials.
 
 Use `adbc_query` for the handle-taking form initially. Keep
-`read_adbc(driver, uri, sql[, options])` unchanged. Extern declarations are
-currently keyed by name; adding overloaded `read_adbc` signatures would require
+`adbc_read(driver, uri, sql[, options])` unchanged. Extern declarations are
+currently keyed by name; adding overloaded `adbc_read` signatures would require
 separate overload-resolution work and previously broke its optional argument.
 
 `adbc_close` is idempotent: return Int64 1 for the first successful close request,

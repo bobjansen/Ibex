@@ -14,7 +14,7 @@ examples/adbc_sqlite/run.sh build
 ```
 
 `install_adbc_driver.sh` puts the driver in `~/.config/adbc/drivers` with a
-manifest, so `read_adbc("sqlite", ...)` finds it by name; it needs `curl`,
+manifest, so `adbc_read("sqlite", ...)` finds it by name; it needs `curl`,
 `unzip` and `sha256sum`, not Python or conda. A conda env with
 `libadbc-driver-sqlite` works too, as does
 `ADBC_DRIVER_SQLITE=/path/to/libadbc_driver_sqlite.so`. On Windows, install
@@ -64,5 +64,5 @@ the `adbc:sqlite_demo` ctest.
 
 This is a functional demo, not a benchmark: Apache describes the SQLite
 driver as a reference implementation with little optimization work. Every
-`read_adbc` call opens its own connection; there are no reusable
+`adbc_read` call opens its own connection; there are no reusable
 connections, bound parameters, or writes back to the database yet.

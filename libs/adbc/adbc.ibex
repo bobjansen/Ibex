@@ -5,7 +5,7 @@
 //
 // After importing, these are available without any explicit declaration:
 //
-//   read_adbc(driver: String, uri: String, sql: String, options: String = "") -> DataFrame
+//   adbc_read(driver: String, uri: String, sql: String, options: String = "") -> DataFrame
 //     Opens a connection, runs one query, closes the connection.
 //
 //   adbc_connect(driver: String, uri: String, options: String = "") -> AdbcConnection
@@ -30,7 +30,7 @@
 // Declarations with defaults: extern declarations are keyed by name, so a
 // second overload would replace the first rather than add to it.
 
-extern fn read_adbc(driver: String, uri: String, sql: String, options: String = "")
+extern fn adbc_read(driver: String, uri: String, sql: String, options: String = "")
     -> DataFrame from "adbc.hpp";
 
 extern type AdbcConnection from "adbc.hpp";

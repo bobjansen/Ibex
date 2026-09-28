@@ -96,7 +96,7 @@ def bench_ibex(driver: str, sqlite_db: str, ibex_bin: str, plugin_path: str, ld_
     """Run the SQLite-backed aggregation through the release REPL."""
     script = (
         'import "adbc";\n'
-        f'read_adbc("{driver}", "{sqlite_db}", "select station, temp from measurements")'
+        f'adbc_read("{driver}", "{sqlite_db}", "select station, temp from measurements")'
         '[select { min_temp = min(temp), avg_temp = mean(temp), max_temp = max(temp) }, '
         'by station, order station];\n'
     )

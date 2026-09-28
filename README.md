@@ -772,7 +772,7 @@ scripts/install_adbc_driver.sh sqlite postgresql
 
 The script downloads Apache's own driver builds (pinned by version and
 SHA-256), needs only `curl`, `unzip` and `sha256sum`, and writes an ADBC driver
-manifest to `~/.config/adbc/drivers` so scripts can say `read_adbc("sqlite", ...)`.
+manifest to `~/.config/adbc/drivers` so scripts can say `adbc_read("sqlite", ...)`.
 On Windows, `scripts\install_adbc_driver.ps1` does the same with only what ships
 with Windows PowerShell, registering each driver under `HKCU\SOFTWARE\ADBC\Drivers`:
 
@@ -934,7 +934,7 @@ hosts that use dynamic plugins.
 | `csv`  | `read_csv`, `write_csv` | RFC 4180 CSV with type inference |
 | `json` | `read_json`, `write_json` | JSON array-of-objects, JSON-Lines, single object |
 | `parquet` | `read_parquet`, `write_parquet` | Apache Parquet, including HTTPS and `s3://` reads |
-| `adbc` | `read_adbc` | Optional ADBC/Arrow driver-manager source plugin |
+| `adbc` | `adbc_read` | Optional ADBC/Arrow driver-manager source plugin |
 | `kafka` | `kafka_recv`, `kafka_recv_avro`, `kafka_send` | Optional Kafka streaming plugin for JSON and Schema-Registry-backed Avro |
 | `udp`  | `udp_recv`, `udp_send` | JSON-over-UDP streaming |
 | `websocket` | `ws_recv`, `ws_connect`, `ws_send`, `ws_listen` | JSON-over-WebSocket streaming: server source/sink plus client mode for external feeds |
@@ -991,7 +991,7 @@ bitmaps.
 
 ```ibex
 import "adbc";
-let df = read_adbc("sqlite", "", "select 1 as x");
+let df = adbc_read("sqlite", "", "select 1 as x");
 ```
 
 The first argument is a driver name, resolved through an ADBC driver manifest

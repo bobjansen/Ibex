@@ -121,7 +121,7 @@
 <span class="kw">let</span> prices = <span class="fn-name">read_parquet</span>(<span class="str">"data/prices.parquet"</span>);
 <span class="kw">let</span> public_prices = <span class="fn-name">read_parquet</span>(<span class="str">"https://data.example.com/prices.parquet"</span>);
 <span class="kw">let</span> cloud_prices = <span class="fn-name">read_parquet</span>(<span class="str">"s3://market-data/prices.parquet?region=us-east-1"</span>);
-<span class="kw">let</span> db_prices = <span class="fn-name">read_adbc</span>(<span class="str">"/path/to/libadbc_driver_sqlite.so"</span>,
+<span class="kw">let</span> db_prices = <span class="fn-name">adbc_read</span>(<span class="str">"/path/to/libadbc_driver_sqlite.so"</span>,
                                <span class="str">"data/prices.sqlite"</span>,
                                <span class="str">"select * from prices"</span>);
 <span class="kw">let</span> tick = <span class="fn-name">kafka_recv</span>(<span class="str">"localhost:19092"</span>, <span class="str">"ticks"</span>,
@@ -463,7 +463,7 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
       <article class="card">
         <h3>Minimal SQLite query</h3>
         <p>
-          <code>read_adbc</code> takes a driver, a database URI or path, and a
+          <code>adbc_read</code> takes a driver, a database URI or path, and a
           SQL query. The driver is a name such as <code>"sqlite"</code>,
           resolved through an ADBC driver manifest, or a path to the driver
           library. <code>scripts/install_adbc_driver.sh sqlite</code> installs
@@ -480,7 +480,7 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
         </p>
 <pre><code><span class="kw">import</span> <span class="str">"adbc"</span>;
 
-<span class="kw">let</span> trades = <span class="fn-name">read_adbc</span>(
+<span class="kw">let</span> trades = <span class="fn-name">adbc_read</span>(
     <span class="str">"sqlite"</span>,
     <span class="str">"/tmp/trades.sqlite"</span>,
     <span class="str">"select symbol, qty, px from trades order by qty desc"</span>
@@ -489,7 +489,7 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
       <article class="card" style="margin-top:1rem;">
         <h3>Reuse one connection</h3>
         <p>
-          <code>read_adbc</code> opens and closes a connection on every call.
+          <code>adbc_read</code> opens and closes a connection on every call.
           <code>adbc_connect</code> opens one that later statements share: one
           login, and session state such as temporary tables.
           <code>adbc_query</code> runs a query on it and returns a table, which
@@ -519,7 +519,7 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
 <span class="fn-name">adbc_close</span>(db);</code></pre>
         <p>
           <code>adbc_connect(driver, uri, options = "")</code> takes the same
-          options string as <code>read_adbc</code>; <code>stmt.</code> options
+          options string as <code>adbc_read</code>; <code>stmt.</code> options
           apply to every query on the connection.
           <code>examples/adbc_connection.ibex</code> is a runnable version.
         </p>
@@ -555,7 +555,7 @@ LD_LIBRARY_PATH=~/envs/ibex/lib:$LD_LIBRARY_PATH \
 <span class="cm"># ibex</span>
 <span class="kw">import</span> <span class="str">"adbc"</span>;
 
-<span class="kw">let</span> measurements = <span class="fn-name">read_adbc</span>(
+<span class="kw">let</span> measurements = <span class="fn-name">adbc_read</span>(
     <span class="str">"/path/to/libadbc_driver_sqlite.so"</span>,
     <span class="str">"/tmp/measurements_1m.sqlite"</span>,
     <span class="str">"select station, temp from measurements"</span>
@@ -588,7 +588,7 @@ measurements[<span class="kw">select</span> {
         values. Option names beyond the standard <code>adbc.*</code> keys are
         driver-specific; check the driver's documentation.
       </p>
-<pre><code><span class="kw">let</span> trades = <span class="fn-name">read_adbc</span>(
+<pre><code><span class="kw">let</span> trades = <span class="fn-name">adbc_read</span>(
     <span class="str">"sqlite"</span>,
     <span class="str">"/tmp/trades.sqlite"</span>,
     <span class="str">"select symbol, qty, px from trades"</span>,

@@ -8,7 +8,7 @@
 //   ./build-release/tools/ibex --plugin-path ./build-release/tools
 import "adbc";
 
-read_adbc(
+adbc_read(
     "/home/brj/miniforge3/envs/ibex/lib/libadbc_driver_sqlite.so",
     "/tmp/measurements_1m.sqlite",
     "select station, temp from measurements"

@@ -922,10 +922,23 @@ auto import_uuid_column(const ArrowArray& array, bool fixed_size)
     return runtime::ColumnValue{std::move(column)};
 }
 
-/// A readable name for an Arrow format string Ibex has no column type for.
+/// A readable name for an Arrow format string.
 auto describe_arrow_format(std::string_view format) -> std::string {
-    static constexpr std::array<std::pair<std::string_view, std::string_view>, 20> kNames{{
+    static constexpr std::array<std::pair<std::string_view, std::string_view>, 34> kNames{{
         {"n", "null"},
+        {"b", "bool"},
+        {"c", "int8"},
+        {"C", "uint8"},
+        {"s", "int16"},
+        {"S", "uint16"},
+        {"i", "int32"},
+        {"I", "uint32"},
+        {"l", "int64"},
+        {"L", "uint64"},
+        {"f", "float32"},
+        {"g", "float64"},
+        {"u", "utf8"},
+        {"tdD", "date32"},
         {"e", "float16"},
         {"z", "binary"},
         {"Z", "large_binary"},
@@ -954,6 +967,35 @@ auto describe_arrow_format(std::string_view format) -> std::string {
     if (format.starts_with("w:")) {
         return "fixed_size_binary(" + std::string(format.substr(2)) + ")";
     }
+    // Timestamps: `ts<unit>:<timezone>`, the timezone possibly empty.
+    if (format.size() >= 4 && format.starts_with("ts") && format[3] == ':') {
+        static constexpr std::array<std::pair<char, std::string_view>, 4> kUnits{
+            {{'s', "s"}, {'m', "ms"}, {'u', "us"}, {'n', "ns"}}};
+        for (const auto& [code, unit] : kUnits) {
+            if (format[2] == code) {
+                std::string name = "timestamp[" + std::string(unit);
+                if (format.size() > 4) {
+                    name += ", " + std::string(format.substr(4));
+                }
+                return name + "]";
+            }
+        }
+    }
+    // Decimals: `d:<precision>,<scale>[,<bit width>]`, 128 bits by default.
+    if (format.starts_with("d:")) {
+        const std::string_view spec = format.substr(2);
+        const auto first = spec.find(',');
+        const auto second = spec.find(',', first == std::string_view::npos ? 0 : first + 1);
+        if (first != std::string_view::npos) {
+            const std::string_view width =
+                second == std::string_view::npos ? "128" : spec.substr(second + 1);
+            const std::string_view scale =
+                spec.substr(first + 1, second == std::string_view::npos ? std::string_view::npos
+                                                                        : second - first - 1);
+            return "decimal" + std::string(width) + "(" + std::string(spec.substr(0, first)) +
+                   ", " + std::string(scale) + ")";
+        }
+    }
     if (format.starts_with("+w:")) {
         return "fixed_size_list(" + std::string(format.substr(3)) + ")";
     }
@@ -965,6 +1007,27 @@ auto describe_arrow_format(std::string_view format) -> std::string {
     }
     return "format '" + std::string(format) + "'";
 }
+
+}  // namespace
+
+auto describe_arrow_type(const ArrowSchema& schema) -> std::string {
+    const std::string_view format = schema.format != nullptr ? schema.format : "";
+    std::string name = describe_arrow_format(format);
+    const bool is_list =
+        format == "+l" || format == "+L" || format == "+vl" || format.starts_with("+w:");
+    if (is_list && schema.n_children == 1 && schema.children[0] != nullptr) {
+        name += "<" + describe_arrow_type(*schema.children[0]) + ">";
+    }
+    if (schema.dictionary != nullptr) {
+        name = "dictionary<" + describe_arrow_type(*schema.dictionary) + ", " + name + ">";
+    }
+    if (auto extension = column_metadata(schema, "ARROW:extension:name"); extension.has_value()) {
+        name = *extension + " (" + name + ")";
+    }
+    return name;
+}
+
+namespace {
 
 /// The error for a column Ibex cannot hold: which column, which type, and,
 /// when an ADBC PostgreSQL driver tagged it, the SQL that converts it.

@@ -22,6 +22,12 @@ let db = adbc_connect("sqlite", ":memory:");
 adbc_execute(db, "create table trades (symbol text, qty integer, px real)");
 adbc_execute(db, "insert into trades values ('AAPL', 10, 150.0), ('MSFT', 5, 300.0), ('AAPL', 20, 151.0)");
 
+// Discovery: the tables and views the connection sees, and a table's columns
+// with the Ibex type a query would give each one (or why it has none). The
+// SQLite driver infers column types from the rows, so describe a filled table.
+adbc_tables(db);
+adbc_table_schema(db, "trades");
+
 // A query result is an ordinary table operand.
 let totals = adbc_query(db, "select symbol, qty, px from trades")[
     select { qty = sum(qty), notional = sum(qty * px) },

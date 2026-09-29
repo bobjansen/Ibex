@@ -26,9 +26,11 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
+#include "adbc_objects.hpp"
 #include "adbc_options.hpp"
 
 namespace {
@@ -245,6 +247,18 @@ class AdbcSession final : public ibex::runtime::Resource {
         return true;
     }
 
+    /// Run `fn` holding the statement lease, so that nothing else runs on the
+    /// connection meanwhile and a closed connection is refused.
+    template <typename Fn>
+    auto with_lease(Fn&& fn) -> std::expected<void, std::string> {
+        if (auto lease = acquire_lease(); !lease) {
+            return lease;
+        }
+        auto result = fn();
+        release_lease();
+        return result;
+    }
+
     /// Start a transaction: turn autocommit off. Fails when one is open.
     auto begin() -> std::expected<void, std::string> {
         return with_lease([&]() -> std::expected<void, std::string> {
@@ -323,18 +337,6 @@ class AdbcSession final : public ibex::runtime::Resource {
     AdbcSession() {
         std::memset(&database_, 0, sizeof(database_));
         std::memset(&connection_, 0, sizeof(connection_));
-    }
-
-    /// Run `fn` holding the statement lease, so a transaction never changes
-    /// under a running statement or on a closed connection.
-    template <typename Fn>
-    auto with_lease(Fn&& fn) -> std::expected<void, std::string> {
-        if (auto lease = acquire_lease(); !lease) {
-            return lease;
-        }
-        auto result = fn();
-        release_lease();
-        return result;
     }
 
     auto set_autocommit(const char* value) -> std::expected<void, std::string> {
@@ -884,6 +886,223 @@ class LeasedStatement {
     bool acquired_ = false;
 };
 
+/// A string column with nulls, filled row by row.
+struct NullableStrings {
+    ibex::Column<std::string> values;
+    std::vector<bool> valid;
+
+    void push(const std::optional<std::string>& value) {
+        values.push_back(value.value_or(std::string{}));
+        valid.push_back(value.has_value());
+    }
+
+    void add_to(ibex::runtime::Table& table, std::string name) {
+        table.add_column(std::move(name), std::move(values), ibex::runtime::ValidityBitmap(valid));
+    }
+};
+
+/// Why reading a driver's Arrow stream failed.
+auto stream_failure(::ArrowArrayStream& stream, std::string_view context, int status)
+    -> std::string {
+    std::string message = std::string(context) + " failed";
+    if (stream.get_last_error != nullptr) {
+        if (const char* error = stream.get_last_error(&stream);
+            error != nullptr && std::strlen(error) > 0) {
+            return message + ": " + error;
+        }
+    }
+    return message + " (status " + std::to_string(status) + ")";
+}
+
+/// One row per table and view the connection can see: catalog, schema, table
+/// and type, as `AdbcConnectionGetObjects` reports them. SQLite has catalogs
+/// (`main`, `temp`) and no schemas; PostgreSQL the reverse, within the one
+/// database it is connected to.
+auto list_tables(AdbcSession& session) -> std::expected<ibex::runtime::Table, std::string> {
+    ::ArrowArrayStream stream{};
+    auto status = call_adbc("AdbcConnectionGetObjects", [&](AdbcError* error) {
+        return AdbcConnectionGetObjects(session.connection(), ADBC_OBJECT_DEPTH_TABLES, nullptr,
+                                        nullptr, nullptr, nullptr, nullptr, &stream, error);
+    });
+    if (!status) {
+        return std::unexpected(status.error());
+    }
+    const auto stream_guard = std::unique_ptr<::ArrowArrayStream, void (*)(::ArrowArrayStream*)>(
+        &stream, ibex::interop::release_arrow_stream);
+    ::ArrowSchema schema{};
+    if (const int code = stream.get_schema(&stream, &schema); code != 0) {
+        return std::unexpected(stream_failure(stream, "AdbcConnectionGetObjects get_schema", code));
+    }
+    const auto schema_guard = std::unique_ptr<::ArrowSchema, void (*)(::ArrowSchema*)>(
+        &schema, ibex::interop::release_arrow_schema);
+
+    NullableStrings catalogs;
+    NullableStrings schemas;
+    NullableStrings names;
+    NullableStrings types;
+    while (true) {
+        ::ArrowArray batch{};
+        if (const int code = stream.get_next(&stream, &batch); code != 0) {
+            return std::unexpected(
+                stream_failure(stream, "AdbcConnectionGetObjects get_next", code));
+        }
+        if (batch.release == nullptr) {
+            break;
+        }
+        const auto batch_guard = std::unique_ptr<::ArrowArray, void (*)(::ArrowArray*)>(
+            &batch, ibex::interop::release_arrow_array);
+
+        auto walked =
+            ibex::adbc::read_object_rows(batch, schema, [&](const ibex::adbc::ObjectRow& row) {
+                catalogs.push(row.catalog);
+                schemas.push(row.db_schema);
+                names.push(row.table);
+                types.push(row.type);
+            });
+        if (!walked) {
+            return std::unexpected("AdbcConnectionGetObjects returned an unexpected layout: " +
+                                   walked.error());
+        }
+    }
+
+    ibex::runtime::Table table;
+    catalogs.add_to(table, "catalog");
+    schemas.add_to(table, "schema");
+    names.add_to(table, "table");
+    types.add_to(table, "type");
+    return table;
+}
+
+/// The Ibex type name of an imported column, as a declaration spells it.
+auto ibex_type_name(const ibex::runtime::ColumnValue& column) -> std::string {
+    return std::visit(
+        [](const auto& values) -> std::string {
+            using C = std::decay_t<decltype(values)>;
+            if constexpr (std::is_same_v<C, ibex::Column<std::int64_t>>) {
+                return "Int64";
+            } else if constexpr (std::is_same_v<C, ibex::Column<double>>) {
+                return "Float64";
+            } else if constexpr (std::is_same_v<C, ibex::Column<bool>>) {
+                return "Bool";
+            } else if constexpr (std::is_same_v<C, ibex::Column<std::string>>) {
+                return "String";
+            } else if constexpr (std::is_same_v<C, ibex::Column<ibex::Categorical>>) {
+                return "Categorical";
+            } else if constexpr (std::is_same_v<C, ibex::Column<ibex::Date>>) {
+                return "Date";
+            } else if constexpr (std::is_same_v<C, ibex::Column<ibex::Timestamp>>) {
+                return "Timestamp";
+            } else {
+                static_assert(std::is_same_v<C, ibex::Column<ibex::Decimal>>);
+                const auto type = ibex::runtime::decimal_type_of(values);
+                return "Decimal(" + std::to_string(type.precision) + ", " +
+                       std::to_string(type.scale) + ")";
+            }
+        },
+        column);
+}
+
+/// The Ibex type a query would give a column of this Arrow type, or the
+/// reason it has none. Imports a zero-row table of that one field, so the
+/// answer is the importer's own, error message included.
+auto ibex_type_of(const ::ArrowSchema& field) -> std::expected<std::string, std::string> {
+    std::array<::ArrowSchema*, 1> children{const_cast<::ArrowSchema*>(&field)};
+    ::ArrowSchema wrapper{};
+    wrapper.format = "+s";
+    wrapper.name = "";
+    wrapper.n_children = 1;
+    wrapper.children = children.data();
+    wrapper.release = [](::ArrowSchema* schema) { schema->release = nullptr; };
+    auto imported = ibex::interop::empty_table_from_arrow_schema(wrapper);
+    if (!imported) {
+        return std::unexpected(imported.error());
+    }
+    if (imported->columns.size() != 1) {
+        return std::unexpected("imports as " + std::to_string(imported->columns.size()) +
+                               " columns");
+    }
+    return ibex_type_name(*imported->columns.front().column);
+}
+
+/// One row per column of a table: its name, Arrow type, the Ibex type a query
+/// would give it (null when there is none, with the reason, and the SQL that
+/// converts it, in `reason`), and whether it may hold nulls.
+auto describe_table(AdbcSession& session, const std::string& table, const std::string& db_schema,
+                    const std::string& catalog)
+    -> std::expected<ibex::runtime::Table, std::string> {
+    ::ArrowSchema schema{};
+    auto status = call_adbc("AdbcConnectionGetTableSchema", [&](AdbcError* error) {
+        return AdbcConnectionGetTableSchema(
+            session.connection(), catalog.empty() ? nullptr : catalog.c_str(),
+            db_schema.empty() ? nullptr : db_schema.c_str(), table.c_str(), &schema, error);
+    });
+    if (!status) {
+        return std::unexpected(status.error());
+    }
+    const auto schema_guard = std::unique_ptr<::ArrowSchema, void (*)(::ArrowSchema*)>(
+        &schema, ibex::interop::release_arrow_schema);
+
+    ibex::Column<std::string> names;
+    ibex::Column<std::string> arrow_types;
+    NullableStrings ibex_types;
+    NullableStrings reasons;
+    ibex::Column<bool> nullable;
+    for (std::int64_t i = 0; i < schema.n_children; ++i) {
+        const ::ArrowSchema& field = *schema.children[i];
+        const std::string name = field.name != nullptr ? field.name : "";
+        names.push_back(name);
+        arrow_types.push_back(ibex::interop::describe_arrow_type(field));
+        // ARROW_FLAG_NULLABLE: Ibex's Arrow header, included first, defines
+        // the structs without the flag macros.
+        constexpr std::int64_t kArrowFlagNullable = 2;
+        nullable.push_back((field.flags & kArrowFlagNullable) != 0);
+        auto type = ibex_type_of(field);
+        if (type) {
+            ibex_types.push(*type);
+            reasons.push(std::nullopt);
+            continue;
+        }
+        // The importer's message starts with the column; the row says that.
+        std::string reason = with_sql_advice(type.error());
+        const std::string prefix = "column `" + name + "`: ";
+        if (reason.starts_with(prefix)) {
+            reason.erase(0, prefix.size());
+        }
+        ibex_types.push(std::nullopt);
+        reasons.push(std::move(reason));
+    }
+
+    ibex::runtime::Table result;
+    result.add_column("column", std::move(names));
+    result.add_column("arrow_type", std::move(arrow_types));
+    ibex_types.add_to(result, "ibex_type");
+    result.add_column("nullable", std::move(nullable));
+    reasons.add_to(result, "reason");
+    return result;
+}
+
+/// Run a metadata call on a session under its statement lease. A failure
+/// inside a transaction counts like a failed statement: on PostgreSQL the
+/// driver's catalog queries share the transaction.
+template <typename Fn>
+auto run_metadata(AdbcSession& session, std::string_view function, Fn&& fn)
+    -> std::expected<ibex::runtime::ExternValue, std::string> {
+    std::optional<ibex::runtime::Table> table;
+    auto ran = session.with_lease([&]() -> std::expected<void, std::string> {
+        auto result = fn();
+        if (!result) {
+            session.statement_failed();
+            return std::unexpected(result.error());
+        }
+        table = std::move(*result);
+        return {};
+    });
+    if (!ran) {
+        return std::unexpected(std::string(function) + ": " + ran.error());
+    }
+    return ibex::runtime::ExternValue{std::move(*table)};
+}
+
 auto parse_option_arg(const ibex::runtime::ExternArgs& args, std::size_t index,
                       std::string_view usage) -> std::expected<ParsedOptions, std::string> {
     if (args.size() <= index) {
@@ -1070,6 +1289,39 @@ auto adbc_write(const ibex::runtime::ExternArgs& args)
     return ibex::runtime::ExternValue{ibex::runtime::ScalarValue{written}};
 }
 
+auto adbc_tables(const ibex::runtime::ExternArgs& args)
+    -> std::expected<ibex::runtime::ExternValue, std::string> {
+    auto session = session_arg(args, "adbc_tables");
+    if (!session) {
+        return std::unexpected(session.error());
+    }
+    if (args.size() != 1) {
+        return std::unexpected("adbc_tables(db) expects one argument");
+    }
+    return run_metadata(**session, "adbc_tables", [&] { return list_tables(**session); });
+}
+
+auto adbc_table_schema(const ibex::runtime::ExternArgs& args)
+    -> std::expected<ibex::runtime::ExternValue, std::string> {
+    auto session = session_arg(args, "adbc_table_schema");
+    if (!session) {
+        return std::unexpected(session.error());
+    }
+    const auto string_at = [&](std::size_t i) -> const std::string* {
+        return args.size() == 4 ? std::get_if<std::string>(&args[i]) : nullptr;
+    };
+    const auto* table = string_at(1);
+    const auto* db_schema = string_at(2);
+    const auto* catalog = string_at(3);
+    if (table == nullptr || db_schema == nullptr || catalog == nullptr) {
+        return std::unexpected(
+            "adbc_table_schema(db, table, schema, catalog) expects a connection and three "
+            "strings");
+    }
+    return run_metadata(**session, "adbc_table_schema",
+                        [&] { return describe_table(**session, *table, *db_schema, *catalog); });
+}
+
 /// `adbc_begin`, `adbc_commit` and `adbc_rollback`: a connection's only
 /// argument, and 1 when the call changed the transaction state.
 template <typename Op>
@@ -1138,6 +1390,8 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
     registry->register_table("adbc_query", adbc_query);
     registry->register_scalar("adbc_execute", ibex::runtime::ScalarKind::Int, adbc_execute);
     registry->register_scalar("adbc_write", ibex::runtime::ScalarKind::Int, adbc_write);
+    registry->register_table("adbc_tables", adbc_tables);
+    registry->register_table("adbc_table_schema", adbc_table_schema);
     registry->register_scalar("adbc_begin", ibex::runtime::ScalarKind::Int, adbc_begin);
     registry->register_scalar("adbc_commit", ibex::runtime::ScalarKind::Int, adbc_commit);
     registry->register_scalar("adbc_rollback", ibex::runtime::ScalarKind::Int, adbc_rollback);

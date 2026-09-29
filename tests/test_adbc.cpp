@@ -1032,6 +1032,145 @@ TEST_CASE("adbc_query and adbc_execute bind a parameter table", "[adbc][params]"
     CHECK(strings(*named.table, "name") == std::vector<std::string>{"c", "O'Hara"});
 }
 
+TEST_CASE("adbc_begin, adbc_commit and adbc_rollback", "[adbc][transaction]") {
+    AdbcSession s;
+    SqliteDb db;
+    const auto exec = [&](const std::string& source) {
+        auto result = s.session.execute(source);
+        INFO(source);
+        INFO(result.error);
+        REQUIRE(result.ok);
+        return result;
+    };
+    const auto int_of = [](const ibex::repl::ExecutionResult& result) {
+        REQUIRE(result.scalar.has_value());
+        return std::get<std::int64_t>(*result.scalar);
+    };
+    const std::string connect =
+        "adbc_connect(" + ibex_str(sqlite_driver()) + ", " + ibex_str(db.path()) + ")";
+    exec("let db = " + connect + ";\nlet other = " + connect + ";");
+    exec("adbc_execute(db, \"create table t (id integer)\");");
+    // Rows `other` sees: only what `db` has committed.
+    const auto committed_ids = [&] {
+        return ints(*exec("adbc_query(other, \"select id from t order by id\");").table, "id");
+    };
+
+    SECTION("commit makes a transaction's rows visible to other connections") {
+        CHECK(int_of(exec("adbc_begin(db);")) == 1);
+        exec("adbc_execute(db, \"insert into t values (1), (2)\");");
+        CHECK(int_of(exec("adbc_write(db, Table { id = [3] }, \"t\", \"append\");")) == 1);
+        CHECK(ints(*exec("adbc_query(db, \"select id from t order by id\");").table, "id") ==
+              std::vector<std::int64_t>{1, 2, 3});
+        CHECK(committed_ids().empty());
+        CHECK(int_of(exec("adbc_commit(db);")) == 1);
+        CHECK(committed_ids() == std::vector<std::int64_t>{1, 2, 3});
+
+        // Back in autocommit: a statement is visible as soon as it ran.
+        exec("adbc_execute(db, \"insert into t values (4)\");");
+        CHECK(committed_ids() == std::vector<std::int64_t>{1, 2, 3, 4});
+    }
+
+    SECTION("rollback discards a transaction's statements") {
+        exec("adbc_execute(db, \"insert into t values (1)\");");
+        exec("adbc_begin(db);");
+        exec("adbc_execute(db, \"insert into t values (2)\");");
+        exec("adbc_execute(db, \"delete from t where id = 1\");");
+        CHECK(int_of(exec("adbc_rollback(db);")) == 1);
+        CHECK(ints(*exec("adbc_query(db, \"select id from t order by id\");").table, "id") ==
+              std::vector<std::int64_t>{1});
+
+        // Back in autocommit.
+        exec("adbc_execute(db, \"insert into t values (7)\");");
+        CHECK(committed_ids() == std::vector<std::int64_t>{1, 7});
+
+        // Nothing open: rollback says so, commit refuses.
+        CHECK(int_of(exec("adbc_rollback(db);")) == 0);
+        const auto commit = s.session.execute("adbc_commit(db);");
+        REQUIRE_FALSE(commit.ok);
+        CHECK(contains(commit.error, "adbc_commit: no transaction is open"));
+    }
+
+    SECTION("a transaction does not nest") {
+        exec("adbc_begin(db);");
+        exec("adbc_execute(db, \"insert into t values (1)\");");
+        const auto again = s.session.execute("adbc_begin(db);");
+        REQUIRE_FALSE(again.ok);
+        CHECK(contains(again.error, "adbc_begin: a transaction is already open"));
+        // The first transaction is still open and intact.
+        exec("adbc_commit(db);");
+        CHECK(committed_ids() == std::vector<std::int64_t>{1});
+    }
+
+    SECTION("a failed statement means the transaction can only roll back") {
+        // SQLite would commit the statements that worked; Ibex rolls back, as
+        // PostgreSQL does, so a script means the same on every driver.
+        exec("adbc_begin(db);");
+        exec("adbc_execute(db, \"insert into t values (1)\");");
+        const auto bad = s.session.execute("adbc_execute(db, \"insert into nope values (1)\");");
+        REQUIRE_FALSE(bad.ok);
+        exec("adbc_execute(db, \"insert into t values (2)\");");
+        const auto commit = s.session.execute("adbc_commit(db);");
+        REQUIRE_FALSE(commit.ok);
+        CHECK(contains(commit.error, "adbc_commit: a statement in the transaction failed"));
+        CHECK(committed_ids().empty());
+
+        // Also a failed query or write, and only inside the transaction: a
+        // failure before adbc_begin does not carry over.
+        for (const std::string failing :
+             {"adbc_query(db, \"select * from nope\");",
+              "adbc_write(db, Table { id = [1] }, \"t\", \"create\");"}) {
+            REQUIRE_FALSE(s.session.execute(failing).ok);
+            exec("adbc_begin(db);");
+            exec("adbc_execute(db, \"insert into t values (3)\");");
+            REQUIRE_FALSE(s.session.execute(failing).ok);
+            REQUIRE_FALSE(s.session.execute("adbc_commit(db);").ok);
+            CHECK(committed_ids().empty());
+        }
+        exec("adbc_begin(db);");
+        exec("adbc_execute(db, \"insert into t values (4)\");");
+        exec("adbc_commit(db);");
+        CHECK(committed_ids() == std::vector<std::int64_t>{4});
+    }
+
+    SECTION("closing a connection rolls back, never commits") {
+        exec("adbc_begin(db);");
+        exec("adbc_execute(db, \"insert into t values (1)\");");
+        CHECK(int_of(exec("adbc_close(db);")) == 1);
+        CHECK(committed_ids().empty());
+        const auto after = s.session.execute("adbc_begin(db);");
+        REQUIRE_FALSE(after.ok);
+        CHECK(contains(after.error, "adbc_begin: connection is closed"));
+    }
+
+    SECTION("dropping the last binding rolls back") {
+        exec("adbc_begin(db);");
+        exec("adbc_execute(db, \"insert into t values (1)\");");
+        exec("let db = 0;");
+        CHECK(committed_ids().empty());
+    }
+
+    SECTION("a function can wrap a transaction") {
+        exec(
+            "fn load(mutable c: AdbcConnection, rows: DataFrame) -> Int {\n"
+            "    adbc_begin(c);\n"
+            "    adbc_execute(c, \"delete from t\");\n"
+            "    adbc_write(c, rows, \"t\", \"append\");\n"
+            "    adbc_commit(c);\n"
+            "}\n"
+            "load(db, Table { id = [5, 6] });");
+        CHECK(committed_ids() == std::vector<std::int64_t>{5, 6});
+    }
+
+    SECTION("autocommit cannot be set through options") {
+        const auto rejected = s.session.execute("adbc_connect(" + ibex_str(sqlite_driver()) + ", " +
+                                                ibex_str(db.path()) +
+                                                ", \"conn.adbc.connection.autocommit=false\");");
+        REQUIRE_FALSE(rejected.ok);
+        CHECK(contains(rejected.error, "adbc.connection.autocommit option only accepts true"));
+        CHECK(contains(rejected.error, "adbc_begin"));
+    }
+}
+
 // Reusable connections against a real PostgreSQL server. Runs only when
 // IBEX_TEST_POSTGRES_URI is set (the ADBC workflow's postgres service, or a
 // local `docker run -e POSTGRES_PASSWORD=ibex -p 55432:5432 postgres:17`);
@@ -1150,6 +1289,70 @@ TEST_CASE("adbc_connect against PostgreSQL", "[adbc][connection][postgresql]") {
 
 // adbc_write and adbc_execute against PostgreSQL; gated like the test above.
 // Unlike SQLite, PostgreSQL has a column type for every Ibex type.
+TEST_CASE("Transactions against PostgreSQL", "[adbc][transaction][postgresql]") {
+    const auto uri = get_env("IBEX_TEST_POSTGRES_URI");
+    if (!uri.has_value() || uri->empty()) {
+        SKIP("IBEX_TEST_POSTGRES_URI is not set");
+    }
+    const std::string driver = get_env("IBEX_TEST_POSTGRES_DRIVER").value_or("postgresql");
+    AdbcSession s;
+    const auto exec = [&](const std::string& source) {
+        auto result = s.session.execute(source);
+        INFO(source);
+        INFO(result.error);
+        REQUIRE(result.ok);
+        return result;
+    };
+    const std::string connect = "adbc_connect(" + ibex_str(driver) + ", " + ibex_str(*uri) + ")";
+    exec("let db = " + connect + ";\nlet other = " + connect + ";");
+    exec("adbc_execute(db, \"drop table if exists ibex_txn\");");
+    exec("adbc_execute(db, \"create table ibex_txn (id bigint primary key)\");");
+    const auto committed_ids = [&] {
+        return ints(*exec("adbc_query(other, \"select id from ibex_txn order by id\");").table,
+                    "id");
+    };
+
+    exec("adbc_begin(db);");
+    exec("adbc_execute(db, \"insert into ibex_txn values (1)\");");
+    exec("adbc_write(db, Table { id = [2] }, \"ibex_txn\", \"append\");");
+    CHECK(committed_ids().empty());
+    exec("adbc_commit(db);");
+    CHECK(committed_ids() == std::vector<std::int64_t>{1, 2});
+
+    exec("adbc_begin(db);");
+    exec("adbc_execute(db, \"delete from ibex_txn\");");
+    exec("adbc_rollback(db);");
+    CHECK(committed_ids() == std::vector<std::int64_t>{1, 2});
+
+    // A failed statement aborts a PostgreSQL transaction. Its COMMIT then
+    // rolls back, and adbc_commit must say so rather than report success.
+    exec("adbc_begin(db);");
+    exec("adbc_execute(db, \"insert into ibex_txn values (3)\");");
+    const auto duplicate =
+        s.session.execute("adbc_execute(db, \"insert into ibex_txn values (1)\");");
+    REQUIRE_FALSE(duplicate.ok);
+    const auto aborted =
+        s.session.execute("adbc_execute(db, \"insert into ibex_txn values (4)\");");
+    REQUIRE_FALSE(aborted.ok);
+    const auto commit = s.session.execute("adbc_commit(db);");
+    REQUIRE_FALSE(commit.ok);
+    CHECK(contains(commit.error,
+                   "adbc_commit: a statement in the transaction failed, so it "
+                   "was rolled back and nothing was committed"));
+    CHECK(committed_ids() == std::vector<std::int64_t>{1, 2});
+    // Either way the connection is back in autocommit and usable.
+    exec("adbc_execute(db, \"insert into ibex_txn values (5)\");");
+    CHECK(committed_ids() == std::vector<std::int64_t>{1, 2, 5});
+
+    // Closing with a transaction open rolls it back.
+    exec("adbc_begin(db);");
+    exec("adbc_execute(db, \"insert into ibex_txn values (6)\");");
+    exec("adbc_close(db);");
+    CHECK(committed_ids() == std::vector<std::int64_t>{1, 2, 5});
+
+    exec("adbc_execute(other, \"drop table ibex_txn\");");
+}
+
 TEST_CASE("adbc_write and adbc_execute against PostgreSQL", "[adbc][write][postgresql]") {
     const auto uri = get_env("IBEX_TEST_POSTGRES_URI");
     if (!uri.has_value() || uri->empty()) {

@@ -245,6 +245,75 @@ class AdbcSession final : public ibex::runtime::Resource {
         return true;
     }
 
+    /// Start a transaction: turn autocommit off. Fails when one is open.
+    auto begin() -> std::expected<void, std::string> {
+        return with_lease([&]() -> std::expected<void, std::string> {
+            if (in_transaction_) {
+                return std::unexpected("a transaction is already open");
+            }
+            auto status = set_autocommit(ADBC_OPTION_VALUE_DISABLED);
+            if (status) {
+                in_transaction_ = true;
+                statement_failed_ = false;
+            }
+            return status;
+        });
+    }
+
+    /// Commit the open transaction and return to autocommit. A transaction in
+    /// which a statement failed is rolled back instead, on every driver:
+    /// PostgreSQL would do so anyway, but reports a successful COMMIT. When
+    /// the commit itself fails the transaction is rolled back too, so the
+    /// connection never stays in a transaction the script believes has ended.
+    auto commit() -> std::expected<void, std::string> {
+        return with_lease([&]() -> std::expected<void, std::string> {
+            if (!in_transaction_) {
+                return std::unexpected("no transaction is open; start one with adbc_begin");
+            }
+            if (statement_failed_) {
+                auto rolled_back = end_with_rollback();
+                return std::unexpected(
+                    std::string("a statement in the transaction failed, so it was rolled back "
+                                "and nothing was committed") +
+                    (rolled_back ? "" : "; rolling back failed too: " + rolled_back.error()));
+            }
+            in_transaction_ = false;
+            auto committed = call_adbc("AdbcConnectionCommit", [&](AdbcError* error) {
+                return AdbcConnectionCommit(&connection_, error);
+            });
+            if (!committed) {
+                auto rolled_back = end_with_rollback();
+                return std::unexpected(
+                    committed.error() +
+                    (rolled_back ? "; the transaction was rolled back"
+                                 : "; rolling it back failed too: " + rolled_back.error()));
+            }
+            return set_autocommit(ADBC_OPTION_VALUE_ENABLED);
+        });
+    }
+
+    /// Roll back the open transaction and return to autocommit. Returns false
+    /// when no transaction was open.
+    auto rollback() -> std::expected<bool, std::string> {
+        bool was_open = false;
+        auto rolled_back = with_lease([&]() -> std::expected<void, std::string> {
+            was_open = in_transaction_;
+            return was_open ? end_with_rollback() : std::expected<void, std::string>{};
+        });
+        if (!rolled_back) {
+            return std::unexpected(rolled_back.error());
+        }
+        return was_open;
+    }
+
+    /// Record that a query or statement on this connection failed. Inside a
+    /// transaction, that leaves adbc_commit only able to roll back.
+    void statement_failed() noexcept {
+        if (in_transaction_) {
+            statement_failed_ = true;
+        }
+    }
+
     [[nodiscard]] auto connection() noexcept -> AdbcConnection* { return &connection_; }
     [[nodiscard]] auto statement_options() const noexcept -> const OptionList& {
         return statement_options_;
@@ -256,15 +325,58 @@ class AdbcSession final : public ibex::runtime::Resource {
         std::memset(&connection_, 0, sizeof(connection_));
     }
 
-    /// Connection before database. Reports the first failure; both are
+    /// Run `fn` holding the statement lease, so a transaction never changes
+    /// under a running statement or on a closed connection.
+    template <typename Fn>
+    auto with_lease(Fn&& fn) -> std::expected<void, std::string> {
+        if (auto lease = acquire_lease(); !lease) {
+            return lease;
+        }
+        auto result = fn();
+        release_lease();
+        return result;
+    }
+
+    auto set_autocommit(const char* value) -> std::expected<void, std::string> {
+        return call_adbc("AdbcConnectionSetOption(" ADBC_CONNECTION_OPTION_AUTOCOMMIT ")",
+                         [&](AdbcError* error) {
+                             return AdbcConnectionSetOption(
+                                 &connection_, ADBC_CONNECTION_OPTION_AUTOCOMMIT, value, error);
+                         });
+    }
+
+    /// Roll back and turn autocommit back on. The transaction counts as
+    /// ended whatever this returns; a failure is reported.
+    auto end_with_rollback() -> std::expected<void, std::string> {
+        in_transaction_ = false;
+        auto rolled_back = call_adbc("AdbcConnectionRollback", [&](AdbcError* error) {
+            return AdbcConnectionRollback(&connection_, error);
+        });
+        if (!rolled_back) {
+            return rolled_back;
+        }
+        return set_autocommit(ADBC_OPTION_VALUE_ENABLED);
+    }
+
+    /// Connection before database. An open transaction is rolled back first:
+    /// closing never commits. Reports the first failure; everything is
     /// released either way.
     auto release_handles() noexcept -> std::expected<void, std::string> {
         std::expected<void, std::string> result;
+        if (connection_acquired_ && in_transaction_) {
+            in_transaction_ = false;
+            result = call_adbc("AdbcConnectionRollback", [&](AdbcError* error) {
+                return AdbcConnectionRollback(&connection_, error);
+            });
+        }
         if (connection_acquired_) {
             connection_acquired_ = false;
-            result = call_adbc("AdbcConnectionRelease", [&](AdbcError* error) {
+            auto status = call_adbc("AdbcConnectionRelease", [&](AdbcError* error) {
                 return AdbcConnectionRelease(&connection_, error);
             });
+            if (result && !status) {
+                result = std::move(status);
+            }
         }
         if (database_acquired_) {
             database_acquired_ = false;
@@ -282,6 +394,19 @@ class AdbcSession final : public ibex::runtime::Resource {
         -> std::expected<void, std::string> {
         if (auto missing = missing_driver_file(driver); missing.has_value()) {
             return std::unexpected(std::move(*missing));
+        }
+        for (const auto* list : {&options.connection, &options.connection_post}) {
+            for (const auto& [key, value] : *list) {
+                // Turning autocommit off opens a transaction adbc_commit
+                // and adbc_close would not know about.
+                if (key == ADBC_CONNECTION_OPTION_AUTOCOMMIT &&
+                    value != ADBC_OPTION_VALUE_ENABLED) {
+                    return std::unexpected(
+                        "the " ADBC_CONNECTION_OPTION_AUTOCOMMIT
+                        " option only accepts true; start a transaction with adbc_begin and "
+                        "end it with adbc_commit or adbc_rollback");
+                }
+            }
         }
         auto status = call_adbc("AdbcDatabaseNew", [&](AdbcError* error) {
             return AdbcDatabaseNew(&database_, error);
@@ -387,6 +512,8 @@ class AdbcSession final : public ibex::runtime::Resource {
     bool connection_acquired_ = false;
     bool closed_ = false;
     bool busy_ = false;
+    bool in_transaction_ = false;
+    bool statement_failed_ = false;
 };
 
 /// A table exported through Arrow C Data for `AdbcStatementBind`. The driver
@@ -457,6 +584,7 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
             new AdbcSourceOperator(std::move(session), std::string(function)));
         auto init = op->init(sql, params);
         if (!init) {
+            op->session_->statement_failed();
             // `op` is destroyed here, releasing the statement and the lease.
             return std::unexpected(prefix + init.error());
         }
@@ -502,8 +630,7 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
         if (!schema_loaded_) {
             const int status = stream_.get_schema(&stream_, &schema_);
             if (status != 0) {
-                finished_ = true;
-                return std::unexpected(stream_error("ADBC stream get_schema", status));
+                return fail(stream_error("ADBC stream get_schema", status));
             }
             schema_loaded_ = true;
         }
@@ -512,8 +639,7 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
             ::ArrowArray batch{};
             const int status = stream_.get_next(&stream_, &batch);
             if (status != 0) {
-                finished_ = true;
-                return std::unexpected(stream_error("ADBC stream get_next", status));
+                return fail(stream_error("ADBC stream get_next", status));
             }
             if (batch.release == nullptr) {
                 finished_ = true;
@@ -524,8 +650,8 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
                 // query's columns instead of collapsing to a column-less table.
                 auto empty = ibex::interop::empty_table_from_arrow_schema(schema_);
                 if (!empty) {
-                    return std::unexpected(function_ + ": result schema import failed: " +
-                                           with_sql_advice(empty.error()));
+                    return fail(function_ +
+                                ": result schema import failed: " + with_sql_advice(empty.error()));
                 }
                 return make_chunk(std::move(*empty));
             }
@@ -539,9 +665,8 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
             // ADBC path cannot drift from Arrow C Data or Parquet semantics.
             auto imported = ibex::interop::adopt_table_from_arrow(&batch, schema_);
             if (!imported) {
-                finished_ = true;
-                return std::unexpected(
-                    function_ + ": batch import failed: " + with_sql_advice(imported.error()));
+                return fail(function_ +
+                            ": batch import failed: " + with_sql_advice(imported.error()));
             }
             if (imported->rows() == 0) {
                 continue;
@@ -556,6 +681,13 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
         std::memset(&statement_, 0, sizeof(statement_));
         std::memset(&stream_, 0, sizeof(stream_));
         std::memset(&schema_, 0, sizeof(schema_));
+    }
+
+    auto fail(std::string message)
+        -> std::expected<std::optional<ibex::runtime::Chunk>, std::string> {
+        finished_ = true;
+        session_->statement_failed();
+        return std::unexpected(std::move(message));
     }
 
     auto make_chunk(ibex::runtime::Table table)
@@ -699,6 +831,9 @@ class LeasedStatement {
         }
         session_->release_lease();
     }
+
+    /// Record a failure on the connection (see `AdbcSession::statement_failed`).
+    void failed() noexcept { session_->statement_failed(); }
 
     auto set_option(const char* key, const char* value) -> std::expected<void, std::string> {
         return call_adbc(std::string("AdbcStatementSetOption(") + key + ")", [&](AdbcError* error) {
@@ -873,6 +1008,7 @@ auto adbc_execute(const ibex::runtime::ExternArgs& args)
                     })
                     .and_then([&] { return stmt.execute_update(); });
     if (!rows) {
+        stmt.failed();
         return std::unexpected("adbc_execute: " + rows.error());
     }
     return ibex::runtime::ExternValue{ibex::runtime::ScalarValue{*rows}};
@@ -927,10 +1063,50 @@ auto adbc_write(const ibex::runtime::ExternArgs& args)
                     .and_then([&] { return stmt.bind(table); })
                     .and_then([&] { return stmt.execute_update(); });
     if (!rows) {
+        stmt.failed();
         return std::unexpected("adbc_write: " + rows.error());
     }
     const std::int64_t written = *rows >= 0 ? *rows : static_cast<std::int64_t>(table->rows());
     return ibex::runtime::ExternValue{ibex::runtime::ScalarValue{written}};
+}
+
+/// `adbc_begin`, `adbc_commit` and `adbc_rollback`: a connection's only
+/// argument, and 1 when the call changed the transaction state.
+template <typename Op>
+auto transaction_call(const ibex::runtime::ExternArgs& args, std::string_view function, Op&& op)
+    -> std::expected<ibex::runtime::ExternValue, std::string> {
+    auto session = session_arg(args, function);
+    if (!session) {
+        return std::unexpected(session.error());
+    }
+    if (args.size() != 1) {
+        return std::unexpected(std::string(function) + "(db) expects one argument");
+    }
+    auto changed = op(**session);
+    if (!changed) {
+        return std::unexpected(std::string(function) + ": " + changed.error());
+    }
+    return ibex::runtime::ExternValue{ibex::runtime::ScalarValue{std::int64_t{*changed ? 1 : 0}}};
+}
+
+auto adbc_begin(const ibex::runtime::ExternArgs& args)
+    -> std::expected<ibex::runtime::ExternValue, std::string> {
+    return transaction_call(args, "adbc_begin", [](AdbcSession& session) {
+        return session.begin().transform([] { return true; });
+    });
+}
+
+auto adbc_commit(const ibex::runtime::ExternArgs& args)
+    -> std::expected<ibex::runtime::ExternValue, std::string> {
+    return transaction_call(args, "adbc_commit", [](AdbcSession& session) {
+        return session.commit().transform([] { return true; });
+    });
+}
+
+auto adbc_rollback(const ibex::runtime::ExternArgs& args)
+    -> std::expected<ibex::runtime::ExternValue, std::string> {
+    return transaction_call(args, "adbc_rollback",
+                            [](AdbcSession& session) { return session.rollback(); });
 }
 
 auto adbc_close(const ibex::runtime::ExternArgs& args)
@@ -962,5 +1138,8 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
     registry->register_table("adbc_query", adbc_query);
     registry->register_scalar("adbc_execute", ibex::runtime::ScalarKind::Int, adbc_execute);
     registry->register_scalar("adbc_write", ibex::runtime::ScalarKind::Int, adbc_write);
+    registry->register_scalar("adbc_begin", ibex::runtime::ScalarKind::Int, adbc_begin);
+    registry->register_scalar("adbc_commit", ibex::runtime::ScalarKind::Int, adbc_commit);
+    registry->register_scalar("adbc_rollback", ibex::runtime::ScalarKind::Int, adbc_rollback);
     registry->register_scalar("adbc_close", ibex::runtime::ScalarKind::Int, adbc_close);
 }

@@ -574,6 +574,13 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
           with no rows runs nothing.
         </p>
         <p>
+          <code>adbc_begin(db)</code>, <code>adbc_commit(db)</code> and
+          <code>adbc_rollback(db)</code> make the calls between them one
+          transaction. If any of them fails, <code>adbc_commit</code> rolls
+          back instead, on every driver, and closing a connection never
+          commits; see <a href="./connections.html#transactions">Transactions</a>.
+        </p>
+        <p>
           Every Ibex column type has a PostgreSQL column type: Int64 as
           <code>bigint</code>, Float64 as <code>double precision</code>, Bool,
           String and Categorical as <code>boolean</code> and

@@ -468,7 +468,10 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
           resolved through an ADBC driver manifest, or a path to the driver
           library. <code>scripts/install_adbc_driver.sh sqlite</code> installs
           Apache's SQLite driver (pinned and SHA-256 checked, no Python or
-          conda) and writes the manifest. On Windows, run
+          conda) and writes the manifest; <code>postgresql</code>,
+          <code>duckdb</code> and <code>mysql</code> install the same way, the
+          last two from the public driver registry <code>dbc</code> uses,
+          without needing <code>dbc</code>. On Windows, run
           <code>powershell -ExecutionPolicy Bypass -File scripts\install_adbc_driver.ps1 sqlite</code>;
           the bypass lasts for that one process and is needed because Windows
           refuses unsigned scripts that came from a download.
@@ -550,7 +553,8 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
           <code>create</code> (the table must not exist), <code>append</code>
           (it must), <code>replace</code> (drop and recreate) or
           <code>create_append</code>. A write that fails, say on a duplicate
-          key, writes nothing on SQLite and PostgreSQL.
+          key, writes nothing on SQLite and PostgreSQL. DuckDB appends whole
+          rows only: <code>df</code> needs every column of an existing table.
         </p>
 <pre><code><span class="kw">import</span> <span class="str">"adbc"</span>;
 <span class="kw">import</span> <span class="str">"csv"</span>;

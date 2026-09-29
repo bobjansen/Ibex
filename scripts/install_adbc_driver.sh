@@ -2,23 +2,30 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Bob Jansen
 #
-# Install an Apache ADBC driver so `adbc_read("<name>", ...)` finds it by name.
+# Install an ADBC driver so `adbc_connect("<name>", ...)` finds it by name.
 #
-#   scripts/install_adbc_driver.sh [--dest DIR] sqlite|postgresql ...
+#   scripts/install_adbc_driver.sh [--dest DIR] sqlite|postgresql|duckdb|mysql ...
 #
-# The drivers are Apache Arrow ADBC's own builds, taken from their PyPI wheels
-# (a wheel is a zip; the C driver inside needs only libc/libstdc++, and Python
-# is not involved). Every download is pinned by version and SHA-256 below and
-# verified before anything is unpacked. Needs curl (or wget), unzip, and
-# sha256sum (or shasum).
+# sqlite and postgresql are Apache Arrow ADBC's own builds, taken from their
+# PyPI wheels (a wheel is a zip; the C driver inside needs only
+# libc/libstdc++, and Python is not involved). duckdb (DuckDB Foundation, MIT)
+# and mysql (ADBC Driver Foundry, Apache-2.0) are the tarballs of Columnar's
+# public driver registry, the ones `dbc install` fetches; dbc is not needed.
+# Every download is pinned by version and SHA-256 below and verified before
+# anything is unpacked. Needs curl (or wget), unzip, tar, and sha256sum (or
+# shasum).
 #
 # Each driver goes to DIR/<name>/ with a manifest DIR/<name>.toml. DIR is, in
 # order: --dest, the first entry of $ADBC_DRIVER_PATH, or
 # ${XDG_CONFIG_HOME:-~/.config}/adbc/drivers -- all places the ADBC driver
 # manager searches. A --dest elsewhere needs ADBC_DRIVER_PATH=DIR at run time.
 #
-# To bump a driver: change ADBC_VERSION and every hash in wheel_for(), taking
-# them from https://pypi.org/pypi/adbc-driver-<name>/<version>/json.
+# To bump a wheel driver: change ADBC_VERSION and every hash in wheel_for(),
+# taking them from https://pypi.org/pypi/adbc-driver-<name>/<version>/json.
+# To bump a registry driver: change its version in registry_driver() and every
+# hash in tarball_for(). The registry index
+# (https://dbc-cdn.columnar.tech/index.yaml) lists versions but no checksums:
+# download each tarball once and record its SHA-256.
 set -euo pipefail
 
 ADBC_VERSION="1.12.0"
@@ -61,10 +68,36 @@ wheel_for() {
     esac
 }
 
+REGISTRY="https://dbc-cdn.columnar.tech"
+
+# registry_driver NAME -> "VERSION LICENSE ENTRYPOINT PUBLISHER...", or nothing.
+# ENTRYPOINT is "-" for the default (AdbcDriverInit).
+registry_driver() {
+    case "$1" in
+    duckdb) echo "v1.5.6 MIT duckdb_adbc_init DuckDB Foundation" ;;
+    mysql) echo "v0.6.1 Apache-2.0 - ADBC Driver Foundry" ;;
+    esac
+}
+
+# tarball_for NAME PLATFORM -> "SHA256 LIBRARY", or nothing if unsupported.
+tarball_for() {
+    case "$1/$2" in
+    duckdb/linux_amd64) echo "bef6e5e5ea2f5a1f0b2a29915a1a614c97d28392590275ed99d67a4bbf4bdd27 libduckdb.so" ;;
+    duckdb/linux_arm64) echo "513478625a429b6fabdb4e5d4b807e0b0c5d924360ba49810f02a49bf7bc2e86 libduckdb.so" ;;
+    duckdb/macos_amd64) echo "2e7acaf724f1347defbc3ef3cf608ee708e64419a9da01334906fad4c9cb95f8 libduckdb.dylib" ;;
+    duckdb/macos_arm64) echo "7544265abbc4615228b83771360c107cdadf12f1d64c0a914f778d2ed66d3c52 libduckdb.dylib" ;;
+    mysql/linux_amd64) echo "ae0dbc60fde99528d1823087e7d952177a2841fddc4760634502ad9483895539 libadbc_driver_mysql.so" ;;
+    mysql/linux_arm64) echo "bc47b508fbb19df7338624bfca2d1743df01403bf67116bf25f2eba86911456e libadbc_driver_mysql.so" ;;
+    mysql/macos_arm64) echo "b9c3b97b7c3274470077666039e15883d9ecaeb4252be00c8e2ddf464df4ae58 libadbc_driver_mysql.dylib" ;;
+    esac
+}
+
+KNOWN="sqlite, postgresql, duckdb, mysql"
+
 die() { echo "install_adbc_driver: $*" >&2; exit 1; }
 
 usage() {
-    sed -n '5,20p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '5,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -115,7 +148,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 [[ ${#drivers[@]} -gt 0 ]] || usage 2
-command -v unzip >/dev/null || die "need unzip"
 
 if [[ -z "$dest" ]]; then
     if [[ -n "${ADBC_DRIVER_PATH:-}" ]]; then
@@ -131,35 +163,68 @@ plat="$(platform)"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-for name in "${drivers[@]}"; do
-    spec="$(wheel_for "$name" "$plat")"
-    [[ -n "$spec" ]] || die "no pinned '$name' driver for $plat (known: sqlite, postgresql)"
-    read -r file sha url <<<"$spec"
+# write_manifest NAME VERSION PUBLISHER LICENSE URL LIBRARY ENTRYPOINT
+write_manifest() {
+    {
+        echo "manifest_version = 1"
+        echo
+        echo "name = 'ADBC $1 driver'"
+        echo "version = '$2'"
+        echo "publisher = '$3'"
+        echo "license = '$4'"
+        echo "url = '$5'"
+        if [[ "$7" != "-" ]]; then
+            echo
+            echo "[Driver]"
+            echo "entrypoint = '$7'"
+        fi
+        echo
+        echo "[Driver.shared]"
+        echo "${plat} = '${dest}/$1/$6'"
+    } >"$dest/$1.toml"
+    echo "Installed $dest/$1/$6"
+    echo "  manifest $dest/$1.toml -> adbc_connect(\"$1\", ...)"
+}
 
+for name in "${drivers[@]}"; do
+    if spec="$(wheel_for "$name" "$plat")" && [[ -n "$spec" ]]; then
+        command -v unzip >/dev/null || die "need unzip"
+        read -r file sha url <<<"$spec"
+        echo "Downloading $file"
+        fetch "$url" "$work/$file"
+        actual="$(sha256_of "$work/$file")"
+        [[ "$actual" == "$sha" ]] || die "$file: SHA-256 mismatch (expected $sha, got $actual)"
+
+        lib="libadbc_driver_${name}.so"
+        unzip -q -o -j "$work/$file" "adbc_driver_${name}/$lib" -d "$work/$name"
+        mkdir -p "$dest/$name"
+        install -m 0755 "$work/$name/$lib" "$dest/$name/$lib"
+        write_manifest "$name" "$ADBC_VERSION" \
+            "Apache Arrow ADBC (PyPI wheel ${file}, sha256 ${sha})" \
+            Apache-2.0 https://arrow.apache.org/adbc/ "$lib" -
+        continue
+    fi
+
+    meta="$(registry_driver "$name")"
+    [[ -n "$meta" ]] || die "unknown driver '$name' (known: $KNOWN)"
+    spec="$(tarball_for "$name" "$plat")"
+    [[ -n "$spec" ]] || die "no pinned '$name' driver for $plat"
+    command -v tar >/dev/null || die "need tar"
+    read -r version license entrypoint publisher <<<"$meta"
+    read -r sha lib <<<"$spec"
+    file="${name}_${plat}_${version}.tar.gz"
     echo "Downloading $file"
-    fetch "$url" "$work/$file"
+    fetch "$REGISTRY/$name/$version/$file" "$work/$file"
     actual="$(sha256_of "$work/$file")"
     [[ "$actual" == "$sha" ]] || die "$file: SHA-256 mismatch (expected $sha, got $actual)"
 
-    lib="libadbc_driver_${name}.so"
-    unzip -q -o -j "$work/$file" "adbc_driver_${name}/$lib" -d "$work/$name"
+    mkdir -p "$work/$name"
+    tar -xzf "$work/$file" -C "$work/$name" "$lib"
     mkdir -p "$dest/$name"
     install -m 0755 "$work/$name/$lib" "$dest/$name/$lib"
-
-    cat >"$dest/$name.toml" <<EOF
-manifest_version = 1
-
-name = 'ADBC ${name} driver'
-version = '${ADBC_VERSION}'
-publisher = 'Apache Arrow ADBC (PyPI wheel ${file}, sha256 ${sha})'
-license = 'Apache-2.0'
-url = 'https://arrow.apache.org/adbc/'
-
-[Driver.shared]
-${plat} = '${dest}/${name}/${lib}'
-EOF
-    echo "Installed $dest/$name/$lib"
-    echo "  manifest $dest/$name.toml -> adbc_read(\"$name\", ...)"
+    write_manifest "$name" "$version" \
+        "$publisher (driver registry ${file}, sha256 ${sha})" \
+        "$license" "$REGISTRY/$name/$version/$file" "$lib" "$entrypoint"
 done
 
 default_dir="${XDG_CONFIG_HOME:-$HOME/.config}/adbc/drivers"

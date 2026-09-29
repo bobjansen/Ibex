@@ -37,8 +37,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y g++-13 cmake ninja-build unzip postgresql-client
 
-      - name: Install the ADBC SQLite driver
-        run: scripts/install_adbc_driver.sh --dest "$RUNNER_TEMP/adbc-drivers" sqlite postgresql
+      - name: Install the ADBC drivers
+        run: scripts/install_adbc_driver.sh --dest "$RUNNER_TEMP/adbc-drivers" sqlite postgresql duckdb
 
       - name: Configure
         run: |
@@ -60,13 +60,15 @@ jobs:
       - name: Build
         run: cmake --build build --parallel --target ibex_adbc_plugin ibex_adbc_tests ibex_repl_bin ibex_args_plugin ibex_csv_plugin
 
-      # The PostgreSQL connection test (tests/test_adbc.cpp) runs only when
-      # IBEX_TEST_POSTGRES_URI is set; here it uses the postgres service, and
-      # the driver is found by name through ADBC_DRIVER_PATH.
+      # The PostgreSQL and DuckDB tests (tests/test_adbc.cpp) run only when
+      # IBEX_TEST_POSTGRES_URI and IBEX_TEST_DUCKDB_DRIVER are set; here
+      # PostgreSQL is the postgres service, and the drivers are found by name
+      # through ADBC_DRIVER_PATH.
       - name: Test
         env:
           ADBC_DRIVER_PATH: ${{ runner.temp }}/adbc-drivers
           IBEX_TEST_POSTGRES_URI: postgresql://postgres:ibex@localhost:55432/postgres
+          IBEX_TEST_DUCKDB_DRIVER: duckdb
         run: ctest --test-dir build --output-on-failure --no-tests=error -R '^adbc:'
 
       - name: Check PostgreSQL walkthrough
@@ -86,8 +88,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install the ADBC SQLite driver
-        run: scripts/install_adbc_driver.ps1 sqlite
+      - name: Install the ADBC drivers
+        run: scripts/install_adbc_driver.ps1 sqlite duckdb
 
       - name: Configure
         run: |
@@ -105,7 +107,11 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel --target ibex_adbc_plugin ibex_adbc_tests ibex_repl_bin ibex_args_plugin ibex_csv_plugin
 
+      # DuckDB is found by name through the registry key the script wrote,
+      # which also checks that the key carries its entrypoint.
       - name: Test
+        env:
+          IBEX_TEST_DUCKDB_DRIVER: duckdb
         run: ctest --test-dir build --build-config Release --output-on-failure --no-tests=error -R '^adbc:'
 
       - name: Smoke test (driver found by name through the registry)

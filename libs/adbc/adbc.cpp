@@ -74,8 +74,9 @@ auto call_adbc(std::string_view context, Fn&& fn) -> std::expected<void, std::st
 }
 
 /// Drivers `scripts/install_adbc_driver.{sh,ps1}` can install. Keep in step
-/// with the scripts' `wheel_for` tables.
-constexpr std::array<std::string_view, 2> kInstallableDrivers{"sqlite", "postgresql"};
+/// with the scripts' driver tables.
+constexpr std::array<std::string_view, 4> kInstallableDrivers{"sqlite", "postgresql", "duckdb",
+                                                              "mysql"};
 
 /// Whether `driver` names a library file, which the driver manager loads
 /// as-is, rather than a name it resolves through manifests and the loader's

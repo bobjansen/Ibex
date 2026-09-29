@@ -240,6 +240,18 @@ like a failed statement.
 
 ### Phase 6 — drivers, platforms, docs
 
+- **DuckDB: done (2026-09-29).** `install_adbc_driver.{sh,ps1} duckdb`
+  (registry v1.5.6, manifest/registry key carry `duckdb_adbc_init`); test
+  gated on `IBEX_TEST_DUCKDB_DRIVER`, run in both CI jobs. Measured, and read
+  in DuckDB's `src/common/adbc/adbc.cpp`: GetTableSchema is `SELECT * ...
+  LIMIT 0`, so declared types (decimal(p,s) survives) but every column
+  nullable; table type `BASE TABLE`; ingest appends whole rows only (a
+  DataFrame with fewer columns than the table is refused); a bound parameter
+  table must have ONE row (`NOT_IMPLEMENTED` otherwise; the driver executes
+  per 1-row batch and keeps only the last result). OPEN DECISION: have the
+  plugin loop over parameter rows itself (prepare once, bind a 1-row slice,
+  execute, concatenate) so every driver behaves alike. Cost: SQLite would
+  infer result types per row, so the concatenation can disagree on types.
 - **Next drivers (decided 2026-09-29): MySQL/MariaDB and DuckDB first.**
   Both are open source (MySQL: ADBC Driver Foundry, Apache-2.0, source in
   `adbc-drivers/mysql`; DuckDB: MIT, the driver is libduckdb itself, with a
@@ -252,7 +264,10 @@ like a failed statement.
   discovery checks: a `not null` column reads `nullable = false`, and declared
   types survive on an empty table. MySQL/MariaDB needs a server container
   (ask first).
-- **SQL Server later** (the user has an installation idea). Columnar's driver is
+- **SQL Server later**: the user will finish it on a licensed Windows machine
+  (with Claude there) and use Ibex on a real SQL Server database. Blocker for
+  that use: **filter pushdown** into the SQL a query sends (reading whole
+  tables to filter in Ibex will not do); to be designed. Columnar's driver is
   binary-only (Permissive Binary License, no reverse engineering; no source),
   in the public registry; its docs say GetTableSchema marks NOT NULL. Redshift
   has the same terms. Flight SQL after that; Snowflake and BigQuery need

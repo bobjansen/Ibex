@@ -1482,6 +1482,92 @@ TEST_CASE("Discovery against PostgreSQL", "[adbc][discovery][postgresql]") {
     exec("adbc_execute(db, \"drop table ibex_disc\");");
 }
 
+// DuckDB, in memory. Runs only when IBEX_TEST_DUCKDB_DRIVER names the driver
+// (`duckdb` once `scripts/install_adbc_driver.sh duckdb` has installed it, or
+// a path to libduckdb): it needs no server, but the driver is 70 MB.
+TEST_CASE("adbc_connect against DuckDB", "[adbc][connection][duckdb]") {
+    const auto driver = get_env("IBEX_TEST_DUCKDB_DRIVER");
+    if (!driver.has_value() || driver->empty()) {
+        SKIP("IBEX_TEST_DUCKDB_DRIVER is not set");
+    }
+    AdbcSession s;
+    const auto exec = [&](const std::string& source) {
+        auto result = s.session.execute(source);
+        INFO(source);
+        INFO(result.error);
+        REQUIRE(result.ok);
+        return result;
+    };
+    exec("let db = adbc_connect(" + ibex_str(*driver) + ", \"\");");
+    exec(
+        "adbc_execute(db, \"create table trades (id bigint not null, symbol varchar, px "
+        "double, d date, ts timestamp, amount decimal(12, 2), tm time, flag boolean, qty "
+        "integer)\");");
+
+    SECTION("discovery gives declared types, before any row exists") {
+        const auto tables = exec("adbc_tables(db);");
+        CHECK(strings(*tables.table, "table") == std::vector<std::string>{"trades"});
+        CHECK(strings(*tables.table, "schema") == std::vector<std::string>{"main"});
+        // DuckDB names types as information_schema does.
+        CHECK(strings(*tables.table, "type") == std::vector<std::string>{"BASE TABLE"});
+
+        const auto schema = exec("adbc_table_schema(db, \"trades\");");
+        const auto& t = *schema.table;
+        CHECK(strings(t, "arrow_type") ==
+              std::vector<std::string>{"int64", "utf8", "float64", "date32", "timestamp[us]",
+                                       "decimal128(12, 2)", "time64[us]", "bool", "int32"});
+        CHECK(nulls(t, "ibex_type") ==
+              std::vector<bool>{false, false, false, false, false, false, true, false, false});
+        CHECK(strings(t, "ibex_type").at(5) == "Decimal(12, 2)");
+        CHECK(strings(t, "ibex_type").at(8) == "Int64");
+        CHECK(contains(strings(t, "reason").at(6), "CAST(tm AS TEXT)"));
+        // The driver describes a `select * ... limit 0`, whose columns DuckDB
+        // always marks nullable: NOT NULL on `id` is not reported.
+        const auto* nullable = std::get_if<ibex::Column<bool>>(t.find("nullable"));
+        REQUIRE(nullable != nullptr);
+        CHECK((*nullable)[0]);
+    }
+
+    SECTION("write, parameters and transactions") {
+        exec(
+            "let rows = Table { id = [1, 2], symbol = [\"a\", null], a = [1.25, -3.5] }"
+            "[update { amount = Decimal(a, 12, 2) }][select { id, symbol, amount }];");
+        // DuckDB appends whole rows only: a table with fewer columns than
+        // `trades` is refused, so the write creates its own table.
+        const auto partial = s.session.execute("adbc_write(db, rows, \"trades\", \"append\");");
+        REQUIRE_FALSE(partial.ok);
+        CHECK(contains(partial.error, "expected 9, got 3"));
+        CHECK(std::get<std::int64_t>(*exec("adbc_write(db, rows, \"notes\");").scalar) == 2);
+        const auto notes =
+            exec("adbc_query(db, \"select id, symbol, amount from notes order by id\");");
+        CHECK(nulls(*notes.table, "symbol") == std::vector<bool>{false, true});
+        const auto* amounts = std::get_if<ibex::Column<ibex::Decimal>>(notes.table->find("amount"));
+        REQUIRE(amounts != nullptr);
+        CHECK(ibex::runtime::decimal_type_of(*amounts).scale == 2);
+        CHECK((*amounts)[1] == ibex::Decimal{-350});
+
+        // DuckDB binds one parameter row per execution; a table of several is
+        // refused (the SQLite and PostgreSQL drivers run each row).
+        const auto many = s.session.execute(
+            "adbc_execute(db, \"insert into trades (id, symbol) values (?, ?)\", "
+            "Table { id = [7, 8], symbol = [\"x\", null] });");
+        REQUIRE_FALSE(many.ok);
+        CHECK(contains(many.error, "Binding multiple rows at once is not supported"));
+        exec(
+            "adbc_execute(db, \"insert into trades (id, symbol) values (?, ?)\", "
+            "Table { id = [7], symbol = [\"x\"] });");
+        exec(
+            "adbc_execute(db, \"insert into trades (id, symbol) values (?, ?)\", "
+            "Table { id = [8, 9], symbol = [null, \"z\"] }[filter id == 8]);");
+        exec("adbc_begin(db);");
+        exec("adbc_execute(db, \"delete from trades\");");
+        exec("adbc_rollback(db);");
+        const auto kept = exec("adbc_query(db, \"select id, symbol from trades order by id\");");
+        CHECK(ints(*kept.table, "id") == std::vector<std::int64_t>{7, 8});
+        CHECK(nulls(*kept.table, "symbol") == std::vector<bool>{false, true});
+    }
+}
+
 TEST_CASE("adbc_write and adbc_execute against PostgreSQL", "[adbc][write][postgresql]") {
     const auto uri = get_env("IBEX_TEST_POSTGRES_URI");
     if (!uri.has_value() || uri->empty()) {

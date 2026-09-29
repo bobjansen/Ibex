@@ -785,6 +785,23 @@ table.bench {
   color: var(--muted);
 }
 
+/* A several-column variant: a header row, and room between every column. */
+.repl-table.matrix th {
+  text-align: left;
+  font-weight: 600;
+  padding: 0.35rem 1rem 0.35rem 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.repl-table.matrix td {
+  padding-right: 1rem;
+  color: var(--muted);
+}
+
+.repl-table.matrix td:first-child {
+  color: inherit;
+}
+
 /* ── Footer ──────────────────────────────────────────────────────────────── */
 
 .footer {

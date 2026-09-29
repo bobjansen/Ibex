@@ -33,11 +33,13 @@
 //     query's results following one another in row order and adbc_execute's
 //     counts adding up. No rows: nothing runs. adbc_tables lists the tables
 //     and views the connection sees (catalog, schema, table, type).
-//     adbc_table_schema describes one table's columns without running a
-//     query: column, arrow_type, ibex_type (the type a query would give it;
-//     null when there is none), nullable, and reason (why not, and the SQL
-//     cast that reads it). An empty schema or catalog means the driver's
-//     default. adbc_begin starts a
+//     adbc_table_schema describes one table's columns before you query it:
+//     column, arrow_type, ibex_type (the type a query would give it; null
+//     when there is none), nullable (false only when the driver reports NOT
+//     NULL), and reason (why not, and the SQL cast that reads it). An empty
+//     schema or catalog means the driver's default. Both report what the
+//     driver reports: the SQLite driver guesses types from the first rows
+//     and never reports NOT NULL; PostgreSQL's never reports NOT NULL. adbc_begin starts a
 //     transaction (an error when one is open); adbc_commit commits it (an
 //     error when none is open; a failed commit rolls back) and adbc_rollback
 //     discards it, returning 1, or 0 when none was open. Both return the

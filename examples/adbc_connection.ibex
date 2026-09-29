@@ -24,7 +24,8 @@ adbc_execute(db, "insert into trades values ('AAPL', 10, 150.0), ('MSFT', 5, 300
 
 // Discovery: the tables and views the connection sees, and a table's columns
 // with the Ibex type a query would give each one (or why it has none). The
-// SQLite driver infers column types from the rows, so describe a filled table.
+// SQLite driver guesses column types from the first rows (an empty table reads
+// as all Int64), so describe a filled table.
 adbc_tables(db);
 adbc_table_schema(db, "trades");
 

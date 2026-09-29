@@ -123,7 +123,7 @@
         <tr><td><code>params</code></td><td>Optional. A table whose columns bind, by position, to the statement's placeholders in the driver's syntax (<code>?</code> for SQLite, <code>$1</code> for PostgreSQL). The statement is prepared once and runs once per row: a query's results follow one another in row order, and <code>adbc_execute</code> returns the summed count. A table with no rows runs nothing. SQLite rejects a column count that does not match the placeholders; PostgreSQL ignores extra columns.</td></tr>
         <tr><td><code>adbc_write(db, df, table, mode)</code></td><td>Bulk-insert <code>df</code> into <code>table</code> and return the rows written. <code>mode</code>: <code>create</code> (default; the table must not exist), <code>append</code>, <code>replace</code> or <code>create_append</code>. <code>df</code> is any table expression, but a connection call in it must be bound with <code>let</code> first.</td></tr>
         <tr><td><code>adbc_tables(db)</code></td><td>The tables and views the connection sees: one row each, with <code>catalog</code>, <code>schema</code>, <code>table</code> and <code>type</code>. See <a href="#discovery">Discovery</a>.</td></tr>
-        <tr><td><code>adbc_table_schema(db, table, schema, catalog)</code></td><td>One row per column of <code>table</code>, without running a query: <code>column</code>, <code>arrow_type</code>, <code>ibex_type</code>, <code>nullable</code> and <code>reason</code>. An empty <code>schema</code> or <code>catalog</code> (the default) means the driver's default.</td></tr>
+        <tr><td><code>adbc_table_schema(db, table, schema, catalog)</code></td><td>One row per column of <code>table</code>, without running your query: <code>column</code>, <code>arrow_type</code>, <code>ibex_type</code>, <code>nullable</code> and <code>reason</code>. An empty <code>schema</code> or <code>catalog</code> (the default) means the driver's default.</td></tr>
         <tr><td><code>adbc_begin(db)</code></td><td>Start a transaction; returns <code>1</code>. An error when one is already open: transactions do not nest.</td></tr>
         <tr><td><code>adbc_commit(db)</code></td><td>Commit the transaction and return to autocommit; returns <code>1</code>. An error when none is open, and when a statement in it failed: then the transaction is rolled back instead (see <a href="#transactions">Transactions</a>).</td></tr>
         <tr><td><code>adbc_rollback(db)</code></td><td>Discard the transaction and return to autocommit. Returns <code>1</code>, or <code>0</code> when none was open.</td></tr>
@@ -194,13 +194,28 @@
           <code>Decimal(12, 2)</code>, ...). When there is none it is null and
           <code>reason</code> says why, with the SQL cast that reads the
           column: the same message the query would fail with, found before
-          running it. <code>nullable</code> is the driver's word: PostgreSQL
-          reports every column nullable, <code>not null</code> or not. The
-          SQLite driver infers types from the table's rows, so an empty table
-          reads as all <code>int64</code>.
+          running it. <code>nullable</code> is <code>false</code> when the
+          driver reports the column <code>NOT NULL</code>, and
+          <code>true</code> when it may hold nulls or the driver does not say.
         </p>
       </article>
     </div>
+    <h3>What each driver reports</h3>
+    <p>
+      Both functions pass on what the driver reports, unchanged. A database
+      with a catalog of declared types and constraints can report them; the
+      two drivers tested so far report less, by design of the drivers
+      (ADBC 1.12):
+    </p>
+    <table class="repl-table matrix">
+      <thead>
+        <tr><th>Driver</th><th>Column types</th><th><code>nullable</code></th><th>Schema names</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>SQLite</td><td>SQLite columns have no fixed type, so the driver guesses from the first 64 rows of <code>SELECT *</code>, both here and in queries: every column starts as <code>int64</code> and widens to <code>float64</code> or <code>utf8</code> as values need. An empty table reads as all <code>int64</code>; a <code>CAST</code> in the query fixes a type.</td><td>Always <code>true</code>.</td><td><code>""</code>: SQLite has catalogs (<code>main</code>, <code>temp</code>, attached databases) and one unnamed schema in each.</td></tr>
+        <tr><td>PostgreSQL</td><td>The declared types, from <code>pg_attribute</code>; the table is not read.</td><td>Always <code>true</code>: the driver does not read <code>NOT NULL</code>.</td><td>The schemas of the connected database, <code>pg_catalog</code> and <code>information_schema</code> included.</td></tr>
+      </tbody>
+    </table>
   </section>
 
   <section class="section" id="transactions">

@@ -226,19 +226,37 @@ cannot carry a one-off and a connection form):
   same. Arrow types are named by `interop::describe_arrow_type` (new, public),
   which import errors now use too (`uint64` rather than `format 'L'`).
 
-Measured: SQLite infers GetTableSchema types from the rows (an empty table is
-all int64) and reports an empty schema name; PostgreSQL reports every column
-nullable, maps int4 → Int64 and numeric/uuid → String, and refuses time and
-arrays with their casts. A failed metadata call inside a transaction dooms it,
+Measured, and confirmed in the driver source (ADBC 1.12.0): the SQLite
+driver's GetTableSchema runs `SELECT *` and infers types from the first 64
+rows, every column starting as int64 (its own to-do list includes using the
+declared type), never marks a field non-nullable, and reports one unnamed
+(`""`) schema per catalog. The PostgreSQL driver reads only name and type OID
+from `pg_attribute`, never `attnotnull`, so every column is nullable; it maps
+int4 → Int64 and numeric/uuid → String, and refuses time and arrays with their
+casts. Neither is how the API should be judged: `nullable` stays, defined as
+"false only when the driver reports NOT NULL", and catalog-backed drivers
+(Phase 6) are expected to report it; docs carry a per-driver table. A failed metadata call inside a transaction dooms it,
 like a failed statement.
 
 ### Phase 6 — drivers, platforms, docs
 
-- Add **duckdb** and **flightsql** to `install_adbc_driver.{sh,ps1}` (pinned
-  wheels, as for the other two), each with a smoke test. DuckDB's driver needs
-  a non-default entrypoint (`duckdb_adbc_init`); check the manifest the script
-  writes carries it. Snowflake and BigQuery follow the same mechanism but need
-  accounts, so they stay documented-but-untested.
+- **Next drivers (decided 2026-09-29): MySQL/MariaDB and DuckDB first.**
+  Both are open source (MySQL: ADBC Driver Foundry, Apache-2.0, source in
+  `adbc-drivers/mysql`; DuckDB: MIT, the driver is libduckdb itself, with a
+  non-default entrypoint `duckdb_adbc_init` the manifest must carry). Both are
+  in Columnar's public driver registry as plain tarballs
+  (`https://dbc-cdn.columnar.tech/<driver>/v<ver>/<driver>_<platform>_v<ver>.tar.gz`,
+  index at `/index.yaml`), so `install_adbc_driver.{sh,ps1}` can fetch them
+  without `dbc` or a login. The index publishes no checksums: pin our own
+  SHA-256 per version, as for the wheels. Each gets a smoke test plus the
+  discovery checks: a `not null` column reads `nullable = false`, and declared
+  types survive on an empty table. MySQL/MariaDB needs a server container
+  (ask first).
+- **SQL Server later** (the user has an installation idea). Columnar's driver is
+  binary-only (Permissive Binary License, no reverse engineering; no source),
+  in the public registry; its docs say GetTableSchema marks NOT NULL. Redshift
+  has the same terms. Flight SQL after that; Snowflake and BigQuery need
+  accounts and stay documented-but-untested.
 - **macOS in CI**: the install script supports it, but no job runs it.
 - **SPEC.md**: a section for the ADBC functions, the `options` grammar, the type
   mapping table, and the connection rules once Phase 4 lands.

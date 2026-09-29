@@ -180,7 +180,17 @@ parameter back, as the tests do).
 SQLite tests; details in `opaque-resource-lifetime-plan.md` ("Slice 1 as built").
 Slice 2 (resources in user functions) and the PostgreSQL acceptance test
 (`6c7a4f49`) are done too, and Phases 2 and 3 were built as connection forms.
-Still to do: the transaction options below.
+Transactions are done too (2026-09-29): `adbc_begin` / `adbc_commit` /
+`adbc_rollback`, built on `adbc.connection.autocommit`, `AdbcConnectionCommit`
+and `AdbcConnectionRollback`; commit and rollback return to autocommit. A
+failed query, statement or write inside a transaction dooms it on every driver:
+`adbc_commit` rolls back and reports an error. PostgreSQL rolls back an aborted
+transaction on `COMMIT` but reports success, and SQLite would commit the
+statements that worked. Closing (explicitly, by the last binding, or at session
+end) rolls back and never commits; SQLite and PostgreSQL would roll back on
+disconnect anyway, so the tests cannot tell the explicit rollback apart. The
+`adbc.connection.autocommit` option is refused unless `true`. No nesting or
+savepoints.
 
 Build `opaque-resource-lifetime-plan.md`: a typed opaque `AdbcConnection`,
 `adbc_connect` / `adbc_query` / `adbc_close`, deterministic scope and

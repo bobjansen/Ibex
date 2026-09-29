@@ -52,6 +52,15 @@ fn table_count(uri: String) -> DataFrame {
 
 table_count(":memory:");
 
+// A transaction groups statements: adbc_commit keeps all of them,
+// adbc_rollback none. If any statement in it fails, adbc_commit rolls back
+// and reports the failure. Closing never commits.
+adbc_begin(db);
+adbc_execute(db, "delete from trades where symbol = 'MSFT'");
+adbc_write(db, Table { symbol = ["NVDA"], qty = [3], px = [120.0] }, "trades", "append");
+adbc_rollback(db);
+adbc_query(db, "select symbol, count(*) as n from trades group by symbol order by symbol");
+
 // Closing is explicit and idempotent: 1 the first time, 0 after. A query on a
 // closed connection is an error.
 adbc_close(db);

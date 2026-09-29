@@ -13,6 +13,9 @@
 //   adbc_execute(db: AdbcConnection, sql: String, params: DataFrame = Table {}) -> Int
 //   adbc_write(db: AdbcConnection, df: DataFrame, table: String,
 //              mode: String = "create") -> Int
+//   adbc_begin(db: AdbcConnection) -> Int
+//   adbc_commit(db: AdbcConnection) -> Int
+//   adbc_rollback(db: AdbcConnection) -> Int
 //   adbc_close(db: AdbcConnection) -> Int
 //     A reusable connection: one login, and session state (temporary tables,
 //     settings) that lasts across queries. adbc_execute runs a statement that
@@ -25,12 +28,16 @@
 //     driver's syntax (`?` for SQLite, `$1` for PostgreSQL), by column
 //     position: the statement is prepared once and runs once per row, a
 //     query's results following one another in row order and adbc_execute's
-//     counts adding up. No rows: nothing runs. adbc_close returns 1 when it closed
-//     the connection and 0 when it was already closed; a query on a closed
+//     counts adding up. No rows: nothing runs. adbc_begin starts a
+//     transaction (an error when one is open); adbc_commit commits it (an
+//     error when none is open; a failed commit rolls back) and adbc_rollback
+//     discards it, returning 1, or 0 when none was open. Both return the
+//     connection to autocommit. adbc_close returns 1 when it closed the
+//     connection and 0 when it was already closed; a query on a closed
 //     connection is an error. A connection also closes when its last binding
-//     goes away. Bind the connection with `let` at the top level of a script:
-//     connection functions cannot be called inside a function or a query
-//     clause yet.
+//     goes away. Closing never commits: an open transaction is rolled back.
+//     Connection functions are called as a statement or `let` value, in a
+//     script or a function, not inside a query clause.
 //
 // The optional `options` string is a `;` or newline separated list of
 // `key=value` entries. Prefix keys with `db.`, `conn.`, or `stmt.` to
@@ -59,5 +66,11 @@ extern fn adbc_execute(mutable db: AdbcConnection, sql: String, params: DataFram
 
 extern fn adbc_write(mutable db: AdbcConnection, df: DataFrame, table: String,
                      mode: String = "create") -> Int from "adbc.hpp";
+
+extern fn adbc_begin(mutable db: AdbcConnection) -> Int from "adbc.hpp";
+
+extern fn adbc_commit(mutable db: AdbcConnection) -> Int from "adbc.hpp";
+
+extern fn adbc_rollback(mutable db: AdbcConnection) -> Int from "adbc.hpp";
 
 extern fn adbc_close(mutable db: AdbcConnection) -> Int from "adbc.hpp";

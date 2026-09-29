@@ -934,7 +934,7 @@ hosts that use dynamic plugins.
 | `csv`  | `read_csv`, `write_csv` | RFC 4180 CSV with type inference |
 | `json` | `read_json`, `write_json` | JSON array-of-objects, JSON-Lines, single object |
 | `parquet` | `read_parquet`, `write_parquet` | Apache Parquet, including HTTPS and `s3://` reads |
-| `adbc` | `adbc_read`, `adbc_connect`, `adbc_query`, `adbc_execute`, `adbc_write`, `adbc_close` | Optional ADBC/Arrow driver-manager plugin: read, write and run SQL |
+| `adbc` | `adbc_read`, `adbc_connect`, `adbc_query`, `adbc_execute`, `adbc_write`, `adbc_begin`, `adbc_commit`, `adbc_rollback`, `adbc_close` | Optional ADBC/Arrow driver-manager plugin: read, write and run SQL, in transactions |
 | `kafka` | `kafka_recv`, `kafka_recv_avro`, `kafka_send` | Optional Kafka streaming plugin for JSON and Schema-Registry-backed Avro |
 | `udp`  | `udp_recv`, `udp_send` | JSON-over-UDP streaming |
 | `websocket` | `ws_recv`, `ws_connect`, `ws_send`, `ws_listen` | JSON-over-WebSocket streaming: server source/sink plus client mode for external feeds |

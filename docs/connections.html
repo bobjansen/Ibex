@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Ibex | Connections and Resources</title>
-  <meta name="description" content="Reusable database connections in Ibex: extern type resources, adbc_connect, adbc_query, adbc_close, functions that take or return connections, and lifetime rules." />
+  <meta name="description" content="Reusable database connections in Ibex: extern type resources, adbc_connect, adbc_query, adbc_close, transactions, functions that take or return connections, and lifetime rules." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
@@ -62,7 +62,9 @@
           Opens a connection that stays open until it is closed or its last
           binding goes away. <code>adbc_query</code> runs a query on it and
           returns a table, <code>adbc_execute</code> runs a statement,
-          <code>adbc_write</code> writes a table into the database, and
+          <code>adbc_write</code> writes a table into the database,
+          <code>adbc_begin</code> / <code>adbc_commit</code> /
+          <code>adbc_rollback</code> group them into a transaction, and
           <code>adbc_close</code> closes it.
         </p>
       </article>
@@ -105,6 +107,9 @@
     <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
 <span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_write</span>(<span class="kw">mutable</span> db: AdbcConnection, df: DataFrame, table: String,
                      mode: String = <span class="str">"create"</span>) -&gt; Int <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_begin</span>(<span class="kw">mutable</span> db: AdbcConnection) -&gt; Int <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_commit</span>(<span class="kw">mutable</span> db: AdbcConnection) -&gt; Int <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_rollback</span>(<span class="kw">mutable</span> db: AdbcConnection) -&gt; Int <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
 <span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_close</span>(<span class="kw">mutable</span> db: AdbcConnection) -&gt; Int <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;</code></pre>
     <table class="repl-table">
       <tbody>
@@ -113,6 +118,9 @@
         <tr><td><code>adbc_execute(db, sql, params)</code></td><td>Run a statement that returns no rows (DDL, <code>insert</code>, <code>update</code>, <code>delete</code>). Returns the affected-row count, or <code>-1</code> when the driver reports none.</td></tr>
         <tr><td><code>params</code></td><td>Optional. A table whose columns bind, by position, to the statement's placeholders in the driver's syntax (<code>?</code> for SQLite, <code>$1</code> for PostgreSQL). The statement is prepared once and runs once per row: a query's results follow one another in row order, and <code>adbc_execute</code> returns the summed count. A table with no rows runs nothing. SQLite rejects a column count that does not match the placeholders; PostgreSQL ignores extra columns.</td></tr>
         <tr><td><code>adbc_write(db, df, table, mode)</code></td><td>Bulk-insert <code>df</code> into <code>table</code> and return the rows written. <code>mode</code>: <code>create</code> (default; the table must not exist), <code>append</code>, <code>replace</code> or <code>create_append</code>. <code>df</code> is any table expression, but a connection call in it must be bound with <code>let</code> first.</td></tr>
+        <tr><td><code>adbc_begin(db)</code></td><td>Start a transaction; returns <code>1</code>. An error when one is already open: transactions do not nest.</td></tr>
+        <tr><td><code>adbc_commit(db)</code></td><td>Commit the transaction and return to autocommit; returns <code>1</code>. An error when none is open, and when a statement in it failed: then the transaction is rolled back instead (see <a href="#transactions">Transactions</a>).</td></tr>
+        <tr><td><code>adbc_rollback(db)</code></td><td>Discard the transaction and return to autocommit. Returns <code>1</code>, or <code>0</code> when none was open.</td></tr>
         <tr><td><code>adbc_close(db)</code></td><td>Close the connection for every binding of it. Returns <code>1</code> the first time and <code>0</code> after; a query on a closed connection is an error.</td></tr>
       </tbody>
     </table>
@@ -147,6 +155,50 @@
         <p>
           A resource binding takes no type annotation: its type is the
           declared return type of the call that produced it.
+        </p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section" id="transactions">
+    <p class="section-label">Transactions</p>
+    <h2>All of the statements, or none</h2>
+    <p class="section-sub">
+      A connection runs in autocommit: each statement is kept as soon as it
+      has run. Between <code>adbc_begin</code> and <code>adbc_commit</code>,
+      queries, statements and writes on the connection are one transaction.
+      Other connections see none of it until the commit, and
+      <code>adbc_rollback</code> discards it.
+    </p>
+<pre><code><span class="kw">fn</span> <span class="fn-name">reload</span>(<span class="kw">mutable</span> db: AdbcConnection, rows: DataFrame) -&gt; Int {
+    <span class="fn-name">adbc_begin</span>(db);
+    <span class="fn-name">adbc_execute</span>(db, <span class="str">"delete from positions"</span>);
+    <span class="fn-name">adbc_write</span>(db, rows, <span class="str">"positions"</span>, <span class="str">"append"</span>);
+    <span class="fn-name">adbc_commit</span>(db);
+}</code></pre>
+    <div class="grid-2">
+      <article class="card">
+        <h3>A failure dooms the transaction</h3>
+        <p>
+          When any query, statement or write in a transaction fails,
+          <code>adbc_commit</code> rolls the transaction back and reports an
+          error; nothing is committed. PostgreSQL behaves this way on its own
+          (and would report the <code>COMMIT</code> as a success); SQLite
+          would keep the statements that worked. Ibex applies the rule on every
+          driver, so a script means the same everywhere. A failure before
+          <code>adbc_begin</code> does not count.
+        </p>
+      </article>
+      <article class="card">
+        <h3>Closing never commits</h3>
+        <p>
+          <code>adbc_close</code>, the last binding going away, or the end of
+          the session or script rolls back an open transaction. A script that
+          stops on an error inside a function like <code>reload</code> leaves
+          the transaction open on the caller's connection until one of those,
+          or an explicit <code>adbc_rollback</code>. The
+          <code>adbc.connection.autocommit</code> option is refused unless it
+          is <code>true</code>: use <code>adbc_begin</code>.
         </p>
       </article>
     </div>

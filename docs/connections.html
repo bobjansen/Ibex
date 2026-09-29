@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Ibex | Connections and Resources</title>
-  <meta name="description" content="Reusable database connections in Ibex: extern type resources, adbc_connect, adbc_query, adbc_close, transactions, functions that take or return connections, and lifetime rules." />
+  <meta name="description" content="Reusable database connections in Ibex: extern type resources, adbc_connect, adbc_query, adbc_close, discovery, transactions, functions that take or return connections, and lifetime rules." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
@@ -107,6 +107,10 @@
     <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
 <span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_write</span>(<span class="kw">mutable</span> db: AdbcConnection, df: DataFrame, table: String,
                      mode: String = <span class="str">"create"</span>) -&gt; Int <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_tables</span>(<span class="kw">mutable</span> db: AdbcConnection) -&gt; DataFrame <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_table_schema</span>(<span class="kw">mutable</span> db: AdbcConnection, table: String,
+                            schema: String = <span class="str">""</span>, catalog: String = <span class="str">""</span>) -&gt; DataFrame
+    <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
 <span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_begin</span>(<span class="kw">mutable</span> db: AdbcConnection) -&gt; Int <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
 <span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_commit</span>(<span class="kw">mutable</span> db: AdbcConnection) -&gt; Int <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
 <span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_rollback</span>(<span class="kw">mutable</span> db: AdbcConnection) -&gt; Int <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
@@ -118,6 +122,8 @@
         <tr><td><code>adbc_execute(db, sql, params)</code></td><td>Run a statement that returns no rows (DDL, <code>insert</code>, <code>update</code>, <code>delete</code>). Returns the affected-row count, or <code>-1</code> when the driver reports none.</td></tr>
         <tr><td><code>params</code></td><td>Optional. A table whose columns bind, by position, to the statement's placeholders in the driver's syntax (<code>?</code> for SQLite, <code>$1</code> for PostgreSQL). The statement is prepared once and runs once per row: a query's results follow one another in row order, and <code>adbc_execute</code> returns the summed count. A table with no rows runs nothing. SQLite rejects a column count that does not match the placeholders; PostgreSQL ignores extra columns.</td></tr>
         <tr><td><code>adbc_write(db, df, table, mode)</code></td><td>Bulk-insert <code>df</code> into <code>table</code> and return the rows written. <code>mode</code>: <code>create</code> (default; the table must not exist), <code>append</code>, <code>replace</code> or <code>create_append</code>. <code>df</code> is any table expression, but a connection call in it must be bound with <code>let</code> first.</td></tr>
+        <tr><td><code>adbc_tables(db)</code></td><td>The tables and views the connection sees: one row each, with <code>catalog</code>, <code>schema</code>, <code>table</code> and <code>type</code>. See <a href="#discovery">Discovery</a>.</td></tr>
+        <tr><td><code>adbc_table_schema(db, table, schema, catalog)</code></td><td>One row per column of <code>table</code>, without running a query: <code>column</code>, <code>arrow_type</code>, <code>ibex_type</code>, <code>nullable</code> and <code>reason</code>. An empty <code>schema</code> or <code>catalog</code> (the default) means the driver's default.</td></tr>
         <tr><td><code>adbc_begin(db)</code></td><td>Start a transaction; returns <code>1</code>. An error when one is already open: transactions do not nest.</td></tr>
         <tr><td><code>adbc_commit(db)</code></td><td>Commit the transaction and return to autocommit; returns <code>1</code>. An error when none is open, and when a statement in it failed: then the transaction is rolled back instead (see <a href="#transactions">Transactions</a>).</td></tr>
         <tr><td><code>adbc_rollback(db)</code></td><td>Discard the transaction and return to autocommit. Returns <code>1</code>, or <code>0</code> when none was open.</td></tr>
@@ -155,6 +161,43 @@
         <p>
           A resource binding takes no type annotation: its type is the
           declared return type of the call that produced it.
+        </p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section" id="discovery">
+    <p class="section-label">Discovery</p>
+    <h2>What is in the database, and how Ibex will read it</h2>
+    <p class="section-sub">
+      Both return ordinary tables, so they can be filtered, ordered and joined
+      like any other.
+    </p>
+<pre><code><span class="fn-name">adbc_tables</span>(db)[<span class="kw">filter</span> schema == <span class="str">"public"</span>, <span class="kw">order</span> table];
+<span class="fn-name">adbc_table_schema</span>(db, <span class="str">"events"</span>)[<span class="kw">filter</span> ibex_type <span class="kw">is</span> <span class="kw">null</span>];</code></pre>
+    <div class="grid-2">
+      <article class="card">
+        <h3><code>adbc_tables</code></h3>
+        <p>
+          One row per table and view, as the driver reports them. SQLite has
+          catalogs (<code>main</code>, <code>temp</code>, attached databases)
+          and an empty schema; PostgreSQL has one catalog, the database it is
+          connected to, and its schemas, <code>pg_catalog</code> and
+          <code>information_schema</code> included.
+        </p>
+      </article>
+      <article class="card">
+        <h3><code>adbc_table_schema</code></h3>
+        <p>
+          <code>ibex_type</code> is the type a query would give the column,
+          decided by the same importer queries use (<code>Int64</code>,
+          <code>Decimal(12, 2)</code>, ...). When there is none it is null and
+          <code>reason</code> says why, with the SQL cast that reads the
+          column: the same message the query would fail with, found before
+          running it. <code>nullable</code> is the driver's word: PostgreSQL
+          reports every column nullable, <code>not null</code> or not. The
+          SQLite driver infers types from the table's rows, so an empty table
+          reads as all <code>int64</code>.
         </p>
       </article>
     </div>

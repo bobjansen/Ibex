@@ -1171,6 +1171,82 @@ TEST_CASE("adbc_begin, adbc_commit and adbc_rollback", "[adbc][transaction]") {
     }
 }
 
+TEST_CASE("adbc_tables and adbc_table_schema describe a SQLite database", "[adbc][discovery]") {
+    AdbcSession s;
+    SqliteDb db;
+    const auto exec = [&](const std::string& source) {
+        auto result = s.session.execute(source);
+        INFO(source);
+        INFO(result.error);
+        REQUIRE(result.ok);
+        return result;
+    };
+    exec("let db = adbc_connect(" + ibex_str(sqlite_driver()) + ", " + ibex_str(db.path()) + ");");
+    exec("adbc_execute(db, \"create table trades (id integer, symbol text, px real, raw blob)\");");
+    exec("adbc_execute(db, \"insert into trades values (1, 'AAPL', 150.5, x'00')\");");
+    exec("adbc_execute(db, \"create view big as select id from trades where px > 100\");");
+    exec("adbc_execute(db, \"create temp table scratch (x integer)\");");
+
+    SECTION("adbc_tables lists tables and views, with their catalog") {
+        const auto tables = exec("adbc_tables(db)[order table];");
+        REQUIRE(tables.table.has_value());
+        CHECK(strings(*tables.table, "table") ==
+              std::vector<std::string>{"big", "scratch", "trades"});
+        CHECK(strings(*tables.table, "type") == std::vector<std::string>{"view", "table", "table"});
+        CHECK(strings(*tables.table, "catalog") ==
+              std::vector<std::string>{"main", "temp", "main"});
+        REQUIRE(tables.table->find("schema") != nullptr);
+
+        // An ordinary table: filter it like any other.
+        const auto views = exec("adbc_tables(db)[filter type == \"view\", select { table }];");
+        CHECK(strings(*views.table, "table") == std::vector<std::string>{"big"});
+    }
+
+    SECTION("adbc_table_schema gives each column's Ibex type, or why it has none") {
+        const auto schema = exec("adbc_table_schema(db, \"trades\");");
+        REQUIRE(schema.table.has_value());
+        const auto& t = *schema.table;
+        CHECK(strings(t, "column") == std::vector<std::string>{"id", "symbol", "px", "raw"});
+        CHECK(strings(t, "arrow_type") ==
+              std::vector<std::string>{"int64", "utf8", "float64", "binary"});
+        CHECK(nulls(t, "ibex_type") == std::vector<bool>{false, false, false, true});
+        CHECK(strings(t, "ibex_type").at(2) == "Float64");
+        CHECK(nulls(t, "reason") == std::vector<bool>{true, true, true, false});
+        REQUIRE(t.find("nullable") != nullptr);
+
+        // The reason is the error the query would give, minus the column.
+        const std::string reason = strings(t, "reason").at(3);
+        CHECK(reason ==
+              "Arrow binary has no Ibex column type; cast it in the query, e.g. "
+              "CAST(raw AS TEXT)");
+        const auto query = s.session.execute("adbc_query(db, \"select * from trades\");");
+        REQUIRE_FALSE(query.ok);
+        CHECK(contains(query.error, "column `raw`: " + reason));
+
+        // A catalog picks the database: the temporary one here.
+        const auto temp = exec("adbc_table_schema(db, \"scratch\", \"\", \"temp\");");
+        CHECK(strings(*temp.table, "column") == std::vector<std::string>{"x"});
+    }
+
+    SECTION("failures name the function and count inside a transaction") {
+        const auto missing = s.session.execute("adbc_table_schema(db, \"nope\");");
+        REQUIRE_FALSE(missing.ok);
+        CHECK(contains(missing.error, "adbc_table_schema: AdbcConnectionGetTableSchema failed"));
+
+        exec("adbc_begin(db);");
+        exec("adbc_execute(db, \"insert into trades values (2, 'MSFT', 300.0, null)\");");
+        REQUIRE_FALSE(s.session.execute("adbc_table_schema(db, \"nope\");").ok);
+        const auto commit = s.session.execute("adbc_commit(db);");
+        REQUIRE_FALSE(commit.ok);
+        CHECK(contains(commit.error, "a statement in the transaction failed"));
+
+        exec("adbc_close(db);");
+        const auto closed = s.session.execute("adbc_tables(db);");
+        REQUIRE_FALSE(closed.ok);
+        CHECK(contains(closed.error, "adbc_tables: connection is closed"));
+    }
+}
+
 // Reusable connections against a real PostgreSQL server. Runs only when
 // IBEX_TEST_POSTGRES_URI is set (the ADBC workflow's postgres service, or a
 // local `docker run -e POSTGRES_PASSWORD=ibex -p 55432:5432 postgres:17`);
@@ -1351,6 +1427,59 @@ TEST_CASE("Transactions against PostgreSQL", "[adbc][transaction][postgresql]") 
     CHECK(committed_ids() == std::vector<std::int64_t>{1, 2, 5});
 
     exec("adbc_execute(other, \"drop table ibex_txn\");");
+}
+
+TEST_CASE("Discovery against PostgreSQL", "[adbc][discovery][postgresql]") {
+    const auto uri = get_env("IBEX_TEST_POSTGRES_URI");
+    if (!uri.has_value() || uri->empty()) {
+        SKIP("IBEX_TEST_POSTGRES_URI is not set");
+    }
+    const std::string driver = get_env("IBEX_TEST_POSTGRES_DRIVER").value_or("postgresql");
+    AdbcSession s;
+    const auto exec = [&](const std::string& source) {
+        auto result = s.session.execute(source);
+        INFO(source);
+        INFO(result.error);
+        REQUIRE(result.ok);
+        return result;
+    };
+    exec("let db = adbc_connect(" + ibex_str(driver) + ", " + ibex_str(*uri) + ");");
+    exec("adbc_execute(db, \"drop table if exists ibex_disc\");");
+    exec("adbc_execute(db, \"drop schema if exists ibex_disc_s cascade\");");
+    exec(
+        "adbc_execute(db, \"create table ibex_disc (id bigint not null, amount numeric(12, 2), "
+        "at time, ts timestamptz, tags int[], n int4)\");");
+    exec("adbc_execute(db, \"create schema ibex_disc_s\");");
+    exec("adbc_execute(db, \"create table ibex_disc_s.ibex_disc (other text)\");");
+
+    const auto tables = exec("adbc_tables(db)[filter table == \"ibex_disc\", order schema];");
+    CHECK(strings(*tables.table, "schema") == std::vector<std::string>{"ibex_disc_s", "public"});
+    CHECK(strings(*tables.table, "type") == std::vector<std::string>{"table", "table"});
+    const auto database = exec("adbc_query(db, \"select current_database() as name\");");
+    CHECK(strings(*tables.table, "catalog").at(0) == strings(*database.table, "name").at(0));
+
+    // Before any query: time and arrays are refused with the cast that
+    // reads them; numeric reads as text; int4 widens.
+    const auto described = exec("adbc_table_schema(db, \"ibex_disc\");");
+    const auto& t = *described.table;
+    CHECK(strings(t, "column") ==
+          std::vector<std::string>{"id", "amount", "at", "ts", "tags", "n"});
+    CHECK(strings(t, "arrow_type").at(3) == "timestamp[us, UTC]");
+    CHECK(strings(t, "arrow_type").at(4) == "list<int32>");
+    CHECK(nulls(t, "ibex_type") == std::vector<bool>{false, false, true, false, true, false});
+    CHECK(strings(t, "ibex_type").at(0) == "Int64");
+    CHECK(strings(t, "ibex_type").at(1) == "String");
+    CHECK(strings(t, "ibex_type").at(3) == "Timestamp");
+    CHECK(strings(t, "ibex_type").at(5) == "Int64");
+    CHECK(contains(strings(t, "reason").at(2), "time64[us] has no Ibex column type"));
+    CHECK(contains(strings(t, "reason").at(2), "CAST(at AS TEXT)"));
+
+    // A schema picks the other table of that name.
+    const auto other = exec("adbc_table_schema(db, \"ibex_disc\", \"ibex_disc_s\");");
+    CHECK(strings(*other.table, "column") == std::vector<std::string>{"other"});
+
+    exec("adbc_execute(db, \"drop schema ibex_disc_s cascade\");");
+    exec("adbc_execute(db, \"drop table ibex_disc\");");
 }
 
 TEST_CASE("adbc_write and adbc_execute against PostgreSQL", "[adbc][write][postgresql]") {

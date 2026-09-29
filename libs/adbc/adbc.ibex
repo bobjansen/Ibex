@@ -13,6 +13,9 @@
 //   adbc_execute(db: AdbcConnection, sql: String, params: DataFrame = Table {}) -> Int
 //   adbc_write(db: AdbcConnection, df: DataFrame, table: String,
 //              mode: String = "create") -> Int
+//   adbc_tables(db: AdbcConnection) -> DataFrame
+//   adbc_table_schema(db: AdbcConnection, table: String, schema: String = "",
+//                     catalog: String = "") -> DataFrame
 //   adbc_begin(db: AdbcConnection) -> Int
 //   adbc_commit(db: AdbcConnection) -> Int
 //   adbc_rollback(db: AdbcConnection) -> Int
@@ -28,7 +31,13 @@
 //     driver's syntax (`?` for SQLite, `$1` for PostgreSQL), by column
 //     position: the statement is prepared once and runs once per row, a
 //     query's results following one another in row order and adbc_execute's
-//     counts adding up. No rows: nothing runs. adbc_begin starts a
+//     counts adding up. No rows: nothing runs. adbc_tables lists the tables
+//     and views the connection sees (catalog, schema, table, type).
+//     adbc_table_schema describes one table's columns without running a
+//     query: column, arrow_type, ibex_type (the type a query would give it;
+//     null when there is none), nullable, and reason (why not, and the SQL
+//     cast that reads it). An empty schema or catalog means the driver's
+//     default. adbc_begin starts a
 //     transaction (an error when one is open); adbc_commit commits it (an
 //     error when none is open; a failed commit rolls back) and adbc_rollback
 //     discards it, returning 1, or 0 when none was open. Both return the
@@ -66,6 +75,11 @@ extern fn adbc_execute(mutable db: AdbcConnection, sql: String, params: DataFram
 
 extern fn adbc_write(mutable db: AdbcConnection, df: DataFrame, table: String,
                      mode: String = "create") -> Int from "adbc.hpp";
+
+extern fn adbc_tables(mutable db: AdbcConnection) -> DataFrame from "adbc.hpp";
+
+extern fn adbc_table_schema(mutable db: AdbcConnection, table: String, schema: String = "",
+                            catalog: String = "") -> DataFrame from "adbc.hpp";
 
 extern fn adbc_begin(mutable db: AdbcConnection) -> Int from "adbc.hpp";
 

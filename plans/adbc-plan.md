@@ -208,18 +208,29 @@ Done when: the plan's acceptance tests pass, including Docker PostgreSQL
 checks that one connection keeps a temporary table across statements and two
 connections stay isolated.
 
-### Phase 5 — discovery
+### Phase 5 — discovery: **done** (2026-09-29)
 
-- `adbc_tables(...)` → a table of catalog / schema / table / type, from
-  `AdbcConnectionGetObjects` (depth `tables`).
-- `adbc_table_schema(..., table)` → one row per column: name, Arrow type, the
-  Ibex type it would import as (or why it would not), nullability. From
-  `AdbcConnectionGetTableSchema`.
+Connection forms only, as for `adbc_execute` and `adbc_write` (one name
+cannot carry a one-off and a connection form):
 
-One-off forms first (driver, uri), connection forms once Phase 4 lands.
+- `adbc_tables(db)` → catalog / schema / table / type, from
+  `AdbcConnectionGetObjects` (depth tables). The result is nested lists the
+  table importer does not take; `libs/adbc/adbc_objects.hpp` walks the
+  layout the specification fixes, header-only so `ibex_tests` checks it
+  against hand-built batches with offsets (the drivers only produce offset 0).
+  No name patterns: filter the result in Ibex.
+- `adbc_table_schema(db, table, schema = "", catalog = "")` → column,
+  arrow_type, ibex_type, nullable, reason, from `AdbcConnectionGetTableSchema`.
+  `ibex_type` comes from importing a zero-row table of that one field, so it
+  and `reason` are exactly what a query would give; the SQL cast advice is the
+  same. Arrow types are named by `interop::describe_arrow_type` (new, public),
+  which import errors now use too (`uint64` rather than `format 'L'`).
 
-Done when: both work on SQLite and PostgreSQL, and a refused type shows its
-reason in the schema listing before any query is run.
+Measured: SQLite infers GetTableSchema types from the rows (an empty table is
+all int64) and reports an empty schema name; PostgreSQL reports every column
+nullable, maps int4 → Int64 and numeric/uuid → String, and refuses time and
+arrays with their casts. A failed metadata call inside a transaction dooms it,
+like a failed statement.
 
 ### Phase 6 — drivers, platforms, docs
 

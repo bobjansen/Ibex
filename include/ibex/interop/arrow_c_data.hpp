@@ -115,6 +115,12 @@ auto release_arrow_stream(ArrowArrayStream* stream) noexcept -> void;
 inline constexpr std::string_view kUnsupportedColumnAdvice =
     "convert it to a supported type before reading";
 
+/// A readable name for the Arrow type `schema` describes, whether or not Ibex
+/// can import it: `int64`, `timestamp[us, UTC]`, `decimal128(12, 2)`,
+/// `dictionary<utf8, int32>`, `list<int32>`, `arrow.uuid (fixed_size_binary(16))`.
+/// Import errors use the same names.
+[[nodiscard]] auto describe_arrow_type(const ArrowSchema& schema) -> std::string;
+
 /// Build a zero-row Ibex table from an Arrow struct schema alone.
 ///
 /// For producers that report a schema but deliver no batches (an ARROW stream

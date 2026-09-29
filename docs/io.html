@@ -574,6 +574,13 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
           with no rows runs nothing.
         </p>
         <p>
+          <code>adbc_tables(db)</code> lists the tables and views a connection
+          sees, and <code>adbc_table_schema(db, table)</code> gives each column's
+          Arrow type and the Ibex type a query would give it, or why it has
+          none, without running the query; see
+          <a href="./connections.html#discovery">Discovery</a>.
+        </p>
+        <p>
           <code>adbc_begin(db)</code>, <code>adbc_commit(db)</code> and
           <code>adbc_rollback(db)</code> make the calls between them one
           transaction. If any of them fails, <code>adbc_commit</code> rolls

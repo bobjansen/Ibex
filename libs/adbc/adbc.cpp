@@ -13,13 +13,17 @@
 #include <ibex/core/text.hpp>
 #include <ibex/interop/arrow_c_data.hpp>
 #include <ibex/runtime/extern_registry.hpp>
+#include <ibex/runtime/morsel.hpp>
 #include <ibex/runtime/operator.hpp>
 
+#include <algorithm>
 #include <array>
 #include <arrow-adbc/adbc.h>
 #include <arrow-adbc/adbc_driver_manager.h>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <expected>
 #include <filesystem>
 #include <memory>
@@ -174,6 +178,28 @@ auto apply_adbc_options(std::string_view context, Handle* handle, const OptionLi
     return {};
 }
 
+/// Where a driver departs from what the other drivers do, worked around so
+/// that a script means the same on each. Found from the vendor name the
+/// driver reports for itself, not the name it was loaded by, which may be a
+/// path.
+struct DriverQuirks {
+    /// Binds one parameter row per execution (DuckDB): the plugin runs a
+    /// parameter table row by row itself.
+    bool one_param_row = false;
+    /// Commits a bulk ingest batch by batch (MySQL): outside a transaction a
+    /// failed write would keep the batches before the failing one, so the
+    /// plugin wraps it in one.
+    bool batched_ingest = false;
+};
+
+auto quirks_of_vendor(std::string vendor) -> DriverQuirks {
+    std::ranges::transform(vendor, vendor.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return {.one_param_row = vendor.find("duckdb") != std::string::npos,
+            .batched_ingest = vendor.find("mysql") != std::string::npos ||
+                              vendor.find("mariadb") != std::string::npos};
+}
+
 /// One open ADBC database and connection: the value behind an Ibex
 /// `AdbcConnection`. Shared by every binding of it and by the query running on
 /// it (a statement lease), so the handles outlive whichever of them drops
@@ -197,6 +223,7 @@ class AdbcSession final : public ibex::runtime::Resource {
             // `session` is destroyed here, releasing whatever init acquired.
             return std::unexpected(init.error());
         }
+        session->quirks_ = quirks_of_vendor(session->vendor_name());
         return session;
     }
 
@@ -321,6 +348,40 @@ class AdbcSession final : public ibex::runtime::Resource {
         return was_open;
     }
 
+    /// Run `write`, a bulk ingest on this connection, in a transaction of its
+    /// own when the driver commits ingests batch by batch and none is open,
+    /// so that a failed write writes nothing (see `DriverQuirks`). `write`
+    /// must not run DDL, which would end the transaction. Called holding the
+    /// statement lease.
+    template <typename Fn>
+    auto ingest_atomically(Fn&& write) -> std::expected<std::int64_t, std::string> {
+        if (!quirks_.batched_ingest || in_transaction_) {
+            return write();
+        }
+        if (auto off = set_autocommit(ADBC_OPTION_VALUE_DISABLED); !off) {
+            return std::unexpected(off.error());
+        }
+        auto rows = write();
+        auto ended = rows ? call_adbc("AdbcConnectionCommit",
+                                      [&](AdbcError* error) {
+                                          return AdbcConnectionCommit(&connection_, error);
+                                      })
+                          : std::expected<void, std::string>{};
+        if (!rows || !ended) {
+            auto rolled_back = call_adbc("AdbcConnectionRollback", [&](AdbcError* error) {
+                return AdbcConnectionRollback(&connection_, error);
+            });
+            (void)set_autocommit(ADBC_OPTION_VALUE_ENABLED);
+            return std::unexpected(
+                (rows ? ended.error() : rows.error()) +
+                (rolled_back ? "" : "; rolling back failed too: " + rolled_back.error()));
+        }
+        if (auto on = set_autocommit(ADBC_OPTION_VALUE_ENABLED); !on) {
+            return std::unexpected(on.error());
+        }
+        return rows;
+    }
+
     /// Record that a query or statement on this connection failed. Inside a
     /// transaction, that leaves adbc_commit only able to roll back.
     void statement_failed() noexcept {
@@ -330,11 +391,51 @@ class AdbcSession final : public ibex::runtime::Resource {
     }
 
     [[nodiscard]] auto connection() noexcept -> AdbcConnection* { return &connection_; }
+    [[nodiscard]] auto quirks() const noexcept -> const DriverQuirks& { return quirks_; }
+    [[nodiscard]] auto in_transaction() const noexcept -> bool { return in_transaction_; }
     [[nodiscard]] auto statement_options() const noexcept -> const OptionList& {
         return statement_options_;
     }
 
    private:
+    /// The vendor name the driver reports through GetInfo, or "" when it
+    /// reports none or the call fails: then no workaround applies.
+    auto vendor_name() -> std::string {
+        const std::uint32_t codes[] = {ADBC_INFO_VENDOR_NAME};
+        ::ArrowArrayStream stream{};
+        auto status = call_adbc("AdbcConnectionGetInfo", [&](AdbcError* error) {
+            return AdbcConnectionGetInfo(&connection_, codes, 1, &stream, error);
+        });
+        if (!status) {
+            return {};
+        }
+        const auto stream_guard =
+            std::unique_ptr<::ArrowArrayStream, void (*)(::ArrowArrayStream*)>(
+                &stream, ibex::interop::release_arrow_stream);
+        ::ArrowSchema schema{};
+        if (stream.get_schema(&stream, &schema) != 0) {
+            return {};
+        }
+        const auto schema_guard = std::unique_ptr<::ArrowSchema, void (*)(::ArrowSchema*)>(
+            &schema, ibex::interop::release_arrow_schema);
+        std::string vendor;
+        while (true) {
+            ::ArrowArray batch{};
+            if (stream.get_next(&stream, &batch) != 0 || batch.release == nullptr) {
+                break;
+            }
+            const auto batch_guard = std::unique_ptr<::ArrowArray, void (*)(::ArrowArray*)>(
+                &batch, ibex::interop::release_arrow_array);
+            (void)ibex::adbc::read_info_strings(
+                batch, schema, [&](std::uint32_t code, const std::optional<std::string>& text) {
+                    if (code == ADBC_INFO_VENDOR_NAME && text.has_value()) {
+                        vendor = *text;
+                    }
+                });
+        }
+        return vendor;
+    }
+
     AdbcSession() {
         std::memset(&database_, 0, sizeof(database_));
         std::memset(&connection_, 0, sizeof(connection_));
@@ -517,6 +618,7 @@ class AdbcSession final : public ibex::runtime::Resource {
     bool busy_ = false;
     bool in_transaction_ = false;
     bool statement_failed_ = false;
+    DriverQuirks quirks_;
 };
 
 /// A table exported through Arrow C Data for `AdbcStatementBind`. The driver
@@ -558,17 +660,32 @@ auto has_params(const std::shared_ptr<const ibex::runtime::Table>& params) -> bo
     return params != nullptr && !params->columns.empty();
 }
 
-/// Prepare `statement` (its SQL already set) and bind `params` to it.
-auto prepare_and_bind(AdbcStatement* statement,
-                      const std::shared_ptr<const ibex::runtime::Table>& params, BoundTable& bound)
-    -> std::expected<void, std::string> {
-    auto prepared = call_adbc("AdbcStatementPrepare", [&](AdbcError* error) {
-        return AdbcStatementPrepare(statement, error);
-    });
-    if (!prepared) {
-        return prepared;
+/// Every table bound to one statement. The driver may keep each until the
+/// statement is released, so they live as long as it does.
+using BoundTables = std::deque<BoundTable>;
+
+/// Prepare `statement` (its SQL already set).
+auto prepare_statement(AdbcStatement* statement) -> std::expected<void, std::string> {
+    return call_adbc("AdbcStatementPrepare",
+                     [&](AdbcError* error) { return AdbcStatementPrepare(statement, error); });
+}
+
+/// Rows `[begin, end)` of `table`, as a table of their own.
+auto table_rows(const ibex::runtime::Table& table, std::size_t begin, std::size_t end)
+    -> std::shared_ptr<const ibex::runtime::Table> {
+    auto chunk = ibex::runtime::make_morsel_chunk(table, begin, end, 0);
+    auto out = std::make_shared<ibex::runtime::Table>();
+    for (const auto& entry : chunk.columns) {
+        out->add_column_from(entry.name, entry);
     }
-    return bound.bind(statement, params);
+    return out;
+}
+
+/// Whether `params` is run row by row in the plugin rather than bound whole:
+/// on a driver that binds one row per execution (see `DriverQuirks`).
+auto runs_rows_one_by_one(const AdbcSession& session,
+                          const std::shared_ptr<const ibex::runtime::Table>& params) -> bool {
+    return session.quirks().one_param_row && has_params(params) && params->rows() != 1;
 }
 
 /// Streams one query's result. Holds a statement lease on its session for as
@@ -645,6 +762,14 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
                 return fail(stream_error("ADBC stream get_next", status));
             }
             if (batch.release == nullptr) {
+                if (row_params_ != nullptr && next_row_ < row_params_->rows()) {
+                    // The next parameter row's results follow this one's.
+                    auto ran = next_execution();
+                    if (!ran) {
+                        return fail(function_ + ": " + ran.error());
+                    }
+                    continue;
+                }
                 finished_ = true;
                 if (emitted_chunk_) {
                     return std::optional<ibex::runtime::Chunk>{};
@@ -746,16 +871,55 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
             return {};
         }
         if (has_params(params)) {
-            status = prepare_and_bind(&statement_, params, params_);
+            status = prepare_statement(&statement_);
+            if (!status) {
+                return status;
+            }
+            if (runs_rows_one_by_one(*session_, params)) {
+                row_params_ = params;
+                return execute_row();
+            }
+            status = bound_.emplace_back().bind(&statement_, params);
             if (!status) {
                 return status;
             }
         }
+        return execute();
+    }
 
+    auto execute() -> std::expected<void, std::string> {
         std::int64_t rows_affected = -1;
         return call_adbc("AdbcStatementExecuteQuery", [&](AdbcError* error) {
             return AdbcStatementExecuteQuery(&statement_, &stream_, &rows_affected, error);
         });
+    }
+
+    /// Bind parameter row `next_row_` alone and execute it.
+    auto execute_row() -> std::expected<void, std::string> {
+        auto bound = bound_.emplace_back().bind(&statement_,
+                                                table_rows(*row_params_, next_row_, next_row_ + 1));
+        ++next_row_;
+        if (!bound) {
+            return bound;
+        }
+        return execute();
+    }
+
+    /// End the current result stream and start the next parameter row's.
+    auto next_execution() -> std::expected<void, std::string> {
+        ibex::interop::release_arrow_stream(&stream_);
+        ibex::interop::release_arrow_schema(&schema_);
+        std::memset(&stream_, 0, sizeof(stream_));
+        std::memset(&schema_, 0, sizeof(schema_));
+        schema_loaded_ = false;
+        if (auto ran = execute_row(); !ran) {
+            return ran;
+        }
+        if (const int status = stream_.get_schema(&stream_, &schema_); status != 0) {
+            return std::unexpected(stream_error("ADBC stream get_schema", status));
+        }
+        schema_loaded_ = true;
+        return {};
     }
 
     [[nodiscard]] auto stream_error(std::string_view context, int status) -> std::string {
@@ -778,8 +942,8 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
 
     std::shared_ptr<AdbcSession> session_;
     std::string function_;
-    // Outlives the statement: the destructor releases the statement first.
-    BoundTable params_;
+    // Outlive the statement: the destructor releases the statement first.
+    BoundTables bound_;
     AdbcStatement statement_{};
     ::ArrowArrayStream stream_{};
     ::ArrowSchema schema_{};
@@ -788,6 +952,9 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
     bool emitted_chunk_ = false;
     bool finished_ = false;
     bool no_executions_ = false;
+    // Parameters run row by row (`runs_rows_one_by_one`), and the next row.
+    std::shared_ptr<const ibex::runtime::Table> row_params_;
+    std::size_t next_row_ = 0;
 };
 
 /// One statement on a session, holding the session's statement lease for as
@@ -850,16 +1017,15 @@ class LeasedStatement {
         });
     }
 
-    /// Bind `table` for ingestion.
+    [[nodiscard]] auto session() -> AdbcSession& { return *session_; }
+
+    auto prepare() -> std::expected<void, std::string> { return prepare_statement(&statement_); }
+
+    /// Bind `table`: for ingestion, or as parameters of the prepared
+    /// statement, one execution per row.
     auto bind(const std::shared_ptr<const ibex::runtime::Table>& table)
         -> std::expected<void, std::string> {
-        return bound_.bind(&statement_, table);
-    }
-
-    /// Prepare the statement and bind `params`, one execution per row.
-    auto bind_params(const std::shared_ptr<const ibex::runtime::Table>& params)
-        -> std::expected<void, std::string> {
-        return prepare_and_bind(&statement_, params, bound_);
+        return bound_.emplace_back().bind(&statement_, table);
     }
 
     /// Execute without a result stream. The affected-row count, or -1 when
@@ -881,8 +1047,8 @@ class LeasedStatement {
     }
 
     std::shared_ptr<AdbcSession> session_;
-    // Outlives the statement: the destructor releases the statement first.
-    BoundTable bound_;
+    // Outlive the statement: the destructor releases the statement first.
+    BoundTables bound_;
     AdbcStatement statement_{};
     bool acquired_ = false;
 };
@@ -1219,14 +1385,31 @@ auto adbc_execute(const ibex::runtime::ExternArgs& args)
         return std::unexpected("adbc_execute: " + statement.error());
     }
     auto& stmt = **statement;
-    auto rows = stmt.set_sql(*sql)
-                    .and_then([&]() -> std::expected<void, std::string> {
-                        if (!has_params(params)) {
-                            return {};
-                        }
-                        return stmt.bind_params(params);
-                    })
-                    .and_then([&] { return stmt.execute_update(); });
+    auto rows = stmt.set_sql(*sql).and_then([&]() -> std::expected<std::int64_t, std::string> {
+        if (!has_params(params)) {
+            return stmt.execute_update();
+        }
+        if (!runs_rows_one_by_one(stmt.session(), params)) {
+            return stmt.prepare().and_then([&] { return stmt.bind(params); }).and_then([&] {
+                return stmt.execute_update();
+            });
+        }
+        // One execution per row; the count is unknown if any row's is.
+        if (auto prepared = stmt.prepare(); !prepared) {
+            return std::unexpected(prepared.error());
+        }
+        std::int64_t total = 0;
+        for (std::size_t row = 0; row < params->rows(); ++row) {
+            auto count = stmt.bind(table_rows(*params, row, row + 1)).and_then([&] {
+                return stmt.execute_update();
+            });
+            if (!count) {
+                return count;
+            }
+            total = total < 0 || *count < 0 ? -1 : total + *count;
+        }
+        return total;
+    });
     if (!rows) {
         stmt.failed();
         return std::unexpected("adbc_execute: " + rows.error());
@@ -1273,15 +1456,45 @@ auto adbc_write(const ibex::runtime::ExternArgs& args)
                                "'; expected create, append, replace or create_append");
     }
 
+    // MySQL commits at CREATE TABLE and DROP TABLE, which ends a transaction
+    // without a word: the rows after it would be committed one batch at a
+    // time, whatever the script does next.
+    const bool batched = (*session)->quirks().batched_ingest;
+    const bool creates = *adbc_mode != std::string_view(ADBC_INGEST_OPTION_MODE_APPEND);
+    if (batched && creates && (*session)->in_transaction()) {
+        return std::unexpected(
+            "adbc_write: MySQL commits the open transaction when it creates or drops a table, "
+            "so inside adbc_begin only mode \"append\" is supported; create the table "
+            "before adbc_begin");
+    }
+
     auto statement = LeasedStatement::open(std::move(*session));
     if (!statement) {
         return std::unexpected("adbc_write: " + statement.error());
     }
     auto& stmt = **statement;
-    auto rows = stmt.set_option(ADBC_INGEST_OPTION_TARGET_TABLE, target->c_str())
-                    .and_then([&] { return stmt.set_option(ADBC_INGEST_OPTION_MODE, *adbc_mode); })
-                    .and_then([&] { return stmt.bind(table); })
-                    .and_then([&] { return stmt.execute_update(); });
+    const auto ingest = [&](const char* ingest_mode,
+                            const std::shared_ptr<const ibex::runtime::Table>& rows) {
+        return stmt.set_option(ADBC_INGEST_OPTION_MODE, ingest_mode)
+            .and_then([&] { return stmt.bind(rows); })
+            .and_then([&] { return stmt.execute_update(); });
+    };
+    auto rows =
+        stmt.set_option(ADBC_INGEST_OPTION_TARGET_TABLE, target->c_str())
+            .and_then([&]() -> std::expected<std::int64_t, std::string> {
+                if (!batched) {
+                    return ingest(*adbc_mode, table);
+                }
+                // The table's DDL first, through a write of no rows, so
+                // that the rows go in one transaction that nothing ends.
+                if (creates) {
+                    if (auto created = ingest(*adbc_mode, table_rows(*table, 0, 0)); !created) {
+                        return created;
+                    }
+                }
+                return stmt.session().ingest_atomically(
+                    [&] { return ingest(ADBC_INGEST_OPTION_MODE_APPEND, table); });
+            });
     if (!rows) {
         stmt.failed();
         return std::unexpected("adbc_write: " + rows.error());

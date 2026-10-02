@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
-// Reading the result of `AdbcConnectionGetObjects` (depth tables): nested
-// Arrow lists that Ibex's table importer does not take, walked here by hand.
+// Reading the results of `AdbcConnectionGetObjects` (depth tables) and
+// `AdbcConnectionGetInfo`: nested lists and a union, which Ibex's table
+// importer does not take, walked here by hand.
 //
 // Header-only and free of any ADBC dependency so the walk, including arrays
 // with offsets that the SQLite and PostgreSQL drivers never produce, can be
@@ -13,6 +14,7 @@
 #include <ibex/interop/arrow_c_data.hpp>
 
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
 #include <expected>
 #include <initializer_list>
@@ -20,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace ibex::adbc {
 
@@ -82,6 +85,11 @@ class ArrowView {
         const auto [begin, end] = offsets(row);
         const auto* data = static_cast<const char*>(array_->buffers[2]);
         return std::string(data + begin, static_cast<std::size_t>(end - begin));
+    }
+
+    /// A `uint32` value; the caller checks the format.
+    [[nodiscard]] auto uint32_at(std::int64_t row) const -> std::uint32_t {
+        return static_cast<const std::uint32_t*>(array_->buffers[1])[position(row)];
     }
 
     /// The `[begin, end)` range of `list_values()` a list row holds; empty
@@ -170,6 +178,87 @@ auto read_object_rows(const ::ArrowArray& batch, const ::ArrowSchema& schema, Em
                                .type = table_type->text(t)});
             }
         }
+    }
+    return {};
+}
+
+/// Call `emit(code, text)` with each string entry of one GetInfo batch, in
+/// order. The layout is the one the ADBC specification fixes: info_name:
+/// uint32, info_value: dense_union<string_value: utf8, ...>. Entries of the
+/// union's other kinds are skipped; a different layout is an error.
+template <typename Emit>
+auto read_info_strings(const ::ArrowArray& batch, const ::ArrowSchema& schema, Emit&& emit)
+    -> std::expected<void, std::string> {
+    const ArrowView root(batch, schema, 0, batch.length);
+    auto names = root.field("info_name", {std::string_view("I")});
+    if (!names) {
+        return std::unexpected(names.error());
+    }
+    const ::ArrowArray* values = nullptr;
+    const ::ArrowSchema* values_schema = nullptr;
+    for (std::int64_t i = 0; i < schema.n_children && i < batch.n_children; ++i) {
+        if (schema.children[i]->name != nullptr &&
+            std::string_view(schema.children[i]->name) == "info_value") {
+            values = batch.children[i];
+            values_schema = schema.children[i];
+        }
+    }
+    constexpr std::string_view kDenseUnion = "+ud:";
+    if (values == nullptr) {
+        return std::unexpected("field `info_value` is missing");
+    }
+    const std::string_view format = values_schema->format != nullptr ? values_schema->format : "";
+    if (!format.starts_with(kDenseUnion) || values->n_buffers < 2) {
+        return std::unexpected("field `info_value` has unexpected type " +
+                               ibex::interop::describe_arrow_type(*values_schema));
+    }
+    // The format lists each child's type id: "+ud:0,1,2,...".
+    std::vector<std::int8_t> type_ids;
+    for (std::string_view rest = format.substr(kDenseUnion.size()); !rest.empty();) {
+        const auto comma = rest.find(',');
+        const auto id = rest.substr(0, comma);
+        int value = 0;
+        const auto [end, error] = std::from_chars(id.data(), id.data() + id.size(), value);
+        if (error != std::errc{} || end != id.data() + id.size()) {
+            return std::unexpected("field `info_value` has malformed union type ids");
+        }
+        type_ids.push_back(static_cast<std::int8_t>(value));
+        rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+    }
+    if (static_cast<std::int64_t>(type_ids.size()) != values_schema->n_children ||
+        values->n_children != values_schema->n_children) {
+        return std::unexpected("field `info_value` has mismatched union children");
+    }
+    std::optional<std::int8_t> string_id;
+    std::optional<ArrowView> strings;
+    for (std::size_t c = 0; c < type_ids.size(); ++c) {
+        const ::ArrowSchema& child = *values_schema->children[c];
+        if (child.name != nullptr && std::string_view(child.name) == "string_value") {
+            const ArrowView view(*values->children[c], child, 0, values->children[c]->length);
+            if (view.format() != "u") {
+                return std::unexpected("field `string_value` has unexpected type " +
+                                       ibex::interop::describe_arrow_type(child));
+            }
+            string_id = type_ids[c];
+            strings = view;
+        }
+    }
+    if (!strings.has_value()) {
+        return std::unexpected("field `string_value` is missing");
+    }
+    // Union children are not offset by the union: its offsets index them.
+    const auto* ids = static_cast<const std::int8_t*>(values->buffers[0]);
+    const auto* offsets = static_cast<const std::int32_t*>(values->buffers[1]);
+    for (std::int64_t row = 0; row < root.length(); ++row) {
+        const std::int64_t at = values->offset + batch.offset + row;
+        if (ids[at] != *string_id) {
+            continue;
+        }
+        const std::int64_t index = offsets[at];
+        if (index < 0 || index >= strings->length()) {
+            return std::unexpected("a string value is out of range");
+        }
+        emit(names->uint32_at(row), strings->text(index));
     }
     return {};
 }

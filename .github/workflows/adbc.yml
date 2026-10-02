@@ -29,6 +29,18 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: ibex
+          MARIADB_DATABASE: ibex
+        ports:
+          - 53306:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v6
 
@@ -38,7 +50,7 @@ jobs:
           sudo apt-get install -y g++-13 cmake ninja-build unzip postgresql-client
 
       - name: Install the ADBC drivers
-        run: scripts/install_adbc_driver.sh --dest "$RUNNER_TEMP/adbc-drivers" sqlite postgresql duckdb
+        run: scripts/install_adbc_driver.sh --dest "$RUNNER_TEMP/adbc-drivers" sqlite postgresql duckdb mysql
 
       - name: Configure
         run: |
@@ -60,14 +72,16 @@ jobs:
       - name: Build
         run: cmake --build build --parallel --target ibex_adbc_plugin ibex_adbc_tests ibex_repl_bin ibex_args_plugin ibex_csv_plugin
 
-      # The PostgreSQL and DuckDB tests (tests/test_adbc.cpp) run only when
-      # IBEX_TEST_POSTGRES_URI and IBEX_TEST_DUCKDB_DRIVER are set; here
-      # PostgreSQL is the postgres service, and the drivers are found by name
-      # through ADBC_DRIVER_PATH.
+      # The PostgreSQL, MySQL and DuckDB tests (tests/test_adbc.cpp) run only
+      # when IBEX_TEST_POSTGRES_URI, IBEX_TEST_MYSQL_URI and
+      # IBEX_TEST_DUCKDB_DRIVER are set; here the servers are the postgres and
+      # mariadb services, and the drivers are found by name through
+      # ADBC_DRIVER_PATH.
       - name: Test
         env:
           ADBC_DRIVER_PATH: ${{ runner.temp }}/adbc-drivers
           IBEX_TEST_POSTGRES_URI: postgresql://postgres:ibex@localhost:55432/postgres
+          IBEX_TEST_MYSQL_URI: mysql://root:ibex@localhost:53306/ibex
           IBEX_TEST_DUCKDB_DRIVER: duckdb
         run: ctest --test-dir build --output-on-failure --no-tests=error -R '^adbc:'
 

@@ -1218,7 +1218,7 @@ TEST_CASE("adbc_tables and adbc_table_schema describe a SQLite database", "[adbc
         const std::string reason = strings(t, "reason").at(3);
         CHECK(reason ==
               "Arrow binary has no Ibex column type; cast it in the query, e.g. "
-              "CAST(raw AS TEXT)");
+              "CAST(raw AS TEXT) (AS CHAR on MySQL)");
         const auto query = s.session.execute("adbc_query(db, \"select * from trades\");");
         REQUIRE_FALSE(query.ok);
         CHECK(contains(query.error, "column `raw`: " + reason));
@@ -1566,6 +1566,147 @@ TEST_CASE("adbc_connect against DuckDB", "[adbc][connection][duckdb]") {
         CHECK(ints(*kept.table, "id") == std::vector<std::int64_t>{7, 8});
         CHECK(nulls(*kept.table, "symbol") == std::vector<bool>{false, true});
     }
+}
+
+// MySQL and MariaDB. Runs only when IBEX_TEST_MYSQL_URI is set (the ADBC
+// workflow's mariadb service, or a local `docker run -e
+// MARIADB_ROOT_PASSWORD=ibex -e MARIADB_DATABASE=ibex -p 53306:3306
+// mariadb:11` with mysql://root:ibex@localhost:53306/ibex);
+// IBEX_TEST_MYSQL_DRIVER overrides the driver name. MySQL has no schemas: a
+// database is a catalog, and the schema is "".
+TEST_CASE("adbc_connect against MySQL", "[adbc][connection][mysql]") {
+    const auto uri = get_env("IBEX_TEST_MYSQL_URI");
+    if (!uri.has_value() || uri->empty()) {
+        SKIP("IBEX_TEST_MYSQL_URI is not set");
+    }
+    const std::string driver = get_env("IBEX_TEST_MYSQL_DRIVER").value_or("mysql");
+    AdbcSession s;
+    const auto exec = [&](const std::string& source) {
+        auto result = s.session.execute(source);
+        INFO(source);
+        INFO(result.error);
+        REQUIRE(result.ok);
+        return result;
+    };
+    const std::string connect = "adbc_connect(" + ibex_str(driver) + ", " + ibex_str(*uri) + ")";
+    exec("let db = " + connect + ";\nlet other = " + connect + ";");
+    exec("adbc_execute(db, \"drop table if exists ibex_my_trades\");");
+    exec(
+        "adbc_execute(db, \"create table ibex_my_trades (id bigint not null primary key, symbol "
+        "varchar(10), px double, d date, ts datetime(6), amount decimal(12, 2), tm time, flag "
+        "boolean, qty int)\");");
+
+    SECTION("connections keep their own session") {
+        const auto id_of = [&](const std::string& conn) {
+            const auto r = exec("adbc_query(" + conn + ", \"select connection_id() as id\");");
+            return ints(*r.table, "id").at(0);
+        };
+        const auto db_id = id_of("db");
+        CHECK(id_of("db") == db_id);
+        CHECK(id_of("other") != db_id);
+
+        exec("adbc_execute(db, \"create temporary table ibex_my_tmp as select 1 as id\");");
+        const auto temp = exec("adbc_query(db, \"select id from ibex_my_tmp\");");
+        CHECK(ints(*temp.table, "id") == std::vector<std::int64_t>{1});
+        CHECK_FALSE(s.session.execute("adbc_query(other, \"select id from ibex_my_tmp\");").ok);
+    }
+
+    SECTION("discovery gives declared types and NOT NULL") {
+        exec("adbc_execute(db, \"create database if not exists ibex_my_other\");");
+        exec("adbc_execute(db, \"drop table if exists ibex_my_other.ibex_my_trades\");");
+        exec("adbc_execute(db, \"create table ibex_my_other.ibex_my_trades (other text)\");");
+        const auto tables =
+            exec("adbc_tables(db)[filter table == \"ibex_my_trades\", order catalog];");
+        const auto database = exec("adbc_query(db, \"select database() as name\");");
+        CHECK(strings(*tables.table, "catalog") ==
+              std::vector<std::string>{strings(*database.table, "name").at(0), "ibex_my_other"});
+        CHECK(strings(*tables.table, "schema") == std::vector<std::string>{"", ""});
+        CHECK(strings(*tables.table, "type") ==
+              std::vector<std::string>{"BASE TABLE", "BASE TABLE"});
+
+        const auto schema = exec("adbc_table_schema(db, \"ibex_my_trades\");");
+        const auto& t = *schema.table;
+        CHECK(strings(t, "arrow_type") ==
+              std::vector<std::string>{"int64", "utf8", "float64", "date32", "timestamp[us]",
+                                       "decimal64(12, 2)", "time32[s]", "int8", "int32"});
+        CHECK(nulls(t, "ibex_type") ==
+              std::vector<bool>{false, false, false, false, false, false, true, false, false});
+        CHECK(strings(t, "ibex_type").at(5) == "Decimal(12, 2)");
+        // boolean is tinyint(1) in MySQL.
+        CHECK(strings(t, "ibex_type").at(7) == "Int64");
+        CHECK(contains(strings(t, "reason").at(6), "CAST(tm AS TEXT) (AS CHAR on MySQL)"));
+        // The first driver tested that reports NOT NULL.
+        const auto* nullable = std::get_if<ibex::Column<bool>>(t.find("nullable"));
+        REQUIRE(nullable != nullptr);
+        CHECK_FALSE((*nullable)[0]);
+        CHECK((*nullable)[1]);
+
+        const auto elsewhere =
+            exec("adbc_table_schema(db, \"ibex_my_trades\", \"\", \"ibex_my_other\");");
+        CHECK(strings(*elsewhere.table, "column") == std::vector<std::string>{"other"});
+        exec("adbc_execute(db, \"drop database ibex_my_other\");");
+    }
+
+    SECTION("write, parameters and transactions") {
+        exec(
+            "let rows = Table { id = [1, 2], symbol = [\"a\", null], a = [1.25, -3.5] }"
+            "[update { amount = Decimal(a, 12, 2) }][select { id, symbol, amount }];");
+        // Like DuckDB, an append must supply every column of the table.
+        const auto partial =
+            s.session.execute("adbc_write(db, rows, \"ibex_my_trades\", \"append\");");
+        REQUIRE_FALSE(partial.ok);
+        CHECK(contains(partial.error, "Column count doesn't match value count"));
+        CHECK(std::get<std::int64_t>(
+                  *exec("adbc_write(db, rows, \"ibex_my_notes\", \"replace\");").scalar) == 2);
+        const auto notes =
+            exec("adbc_query(db, \"select id, symbol, amount from ibex_my_notes order by id\");");
+        CHECK(nulls(*notes.table, "symbol") == std::vector<bool>{false, true});
+        const auto* amounts = std::get_if<ibex::Column<ibex::Decimal>>(notes.table->find("amount"));
+        REQUIRE(amounts != nullptr);
+        CHECK(ibex::runtime::decimal_type_of(*amounts).scale == 2);
+        CHECK((*amounts)[1] == ibex::Decimal{-350});
+        // A column without nulls is created NOT NULL.
+        const auto declared = exec(
+            "adbc_query(db, \"select is_nullable from information_schema.columns where "
+            "table_schema = database() and table_name = 'ibex_my_notes' order by "
+            "ordinal_position\");");
+        CHECK(strings(*declared.table, "is_nullable") ==
+              std::vector<std::string>{"NO", "YES", "NO"});
+        exec("adbc_execute(db, \"drop table ibex_my_notes\");");
+
+        // Unlike DuckDB, the driver runs each parameter row.
+        CHECK(std::get<std::int64_t>(
+                  *exec("adbc_execute(db, \"insert into ibex_my_trades (id, symbol) values (?, "
+                        "?)\", Table { id = [7, 8], symbol = [\"x\", null] });")
+                       .scalar) == 2);
+        const auto ids = [&] {
+            return ints(
+                *exec("adbc_query(other, \"select id from ibex_my_trades order by id\");").table,
+                "id");
+        };
+        CHECK(ids() == std::vector<std::int64_t>{7, 8});
+
+        exec("adbc_begin(db);");
+        exec("adbc_execute(db, \"delete from ibex_my_trades\");");
+        CHECK(ids() == std::vector<std::int64_t>{7, 8});
+        exec("adbc_rollback(db);");
+        CHECK(ids() == std::vector<std::int64_t>{7, 8});
+
+        // A failed statement leaves a MySQL transaction open, and COMMIT would
+        // keep the statements that succeeded; adbc_commit rolls back instead,
+        // as on PostgreSQL.
+        exec("adbc_begin(db);");
+        exec("adbc_execute(db, \"insert into ibex_my_trades (id) values (9)\");");
+        REQUIRE_FALSE(
+            s.session.execute("adbc_execute(db, \"insert into ibex_my_trades (id) values (7)\");")
+                .ok);
+        const auto commit = s.session.execute("adbc_commit(db);");
+        REQUIRE_FALSE(commit.ok);
+        CHECK(contains(commit.error, "nothing was committed"));
+        CHECK(ids() == std::vector<std::int64_t>{7, 8});
+    }
+
+    exec("adbc_execute(other, \"drop table ibex_my_trades\");");
 }
 
 TEST_CASE("adbc_write and adbc_execute against PostgreSQL", "[adbc][write][postgresql]") {

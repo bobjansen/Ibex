@@ -481,7 +481,8 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
           to <code>Float64</code> and a <code>uuid</code> becomes its canonical
           text. A column Ibex has no type for (<code>time</code>, intervals,
           binary, arrays) is refused with an error that names it and the cast
-          that reads it, such as <code>CAST(t AS TEXT)</code>. PostgreSQL's
+          that reads it, such as <code>CAST(t AS TEXT)</code> (<code>AS CHAR</code>
+          on MySQL, which has no <code>TEXT</code> cast). PostgreSQL's
           driver hands <code>numeric</code> over as text; convert it with
           <code>Decimal(x, p, s)</code>.
         </p>
@@ -553,8 +554,11 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
           <code>create</code> (the table must not exist), <code>append</code>
           (it must), <code>replace</code> (drop and recreate) or
           <code>create_append</code>. A write that fails, say on a duplicate
-          key, writes nothing on SQLite and PostgreSQL. DuckDB appends whole
-          rows only: <code>df</code> needs every column of an existing table.
+          key, writes nothing on SQLite and PostgreSQL. MySQL's driver inserts
+          and commits in batches, so there the batches before the failing one
+          stay; inside <code>adbc_begin</code> and <code>adbc_commit</code>
+          none do. DuckDB and MySQL append whole rows only: <code>df</code>
+          needs every column of an existing table.
         </p>
 <pre><code><span class="kw">import</span> <span class="str">"adbc"</span>;
 <span class="kw">import</span> <span class="str">"csv"</span>;
@@ -564,7 +568,7 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
 <span class="fn-name">adbc_write</span>(db, trades, <span class="str">"trades"</span>, <span class="str">"replace"</span>);
 <span class="fn-name">adbc_execute</span>(db, <span class="str">"create index on trades (symbol)"</span>);
 
-<span class="cm">// Values bind to placeholders ($1 for PostgreSQL, ? for SQLite): one</span>
+<span class="cm">// Values bind to placeholders ($1 for PostgreSQL, ? for SQLite, MySQL): one</span>
 <span class="cm">// prepared statement, one run per row, no quoting in the SQL text.</span>
 <span class="fn-name">adbc_execute</span>(db, <span class="str">"delete from trades where symbol = $1"</span>,
              Table { symbol = [<span class="str">"TSLA"</span>, <span class="str">"GME"</span>] });

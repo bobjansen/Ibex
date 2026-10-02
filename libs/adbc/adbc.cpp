@@ -139,8 +139,8 @@ auto explain_driver_not_found(std::string_view driver, std::string_view manager_
 }
 
 /// An import error with SQL advice: a column Ibex has no type for can be cast
-/// in the query itself. `CAST(x AS TEXT)` is standard SQL, so it holds for
-/// every driver.
+/// in the query itself. No one cast type works everywhere: MySQL rejects
+/// `TEXT` in a cast, and PostgreSQL's `CHAR` is `char(1)`, so both are named.
 auto with_sql_advice(std::string message) -> std::string {
     constexpr std::string_view kColumn = "column `";
     const auto advice = message.rfind(ibex::interop::kUnsupportedColumnAdvice);
@@ -155,7 +155,7 @@ auto with_sql_advice(std::string message) -> std::string {
     }
     const std::string name = message.substr(name_start, name_end - name_start);
     message.replace(advice, ibex::interop::kUnsupportedColumnAdvice.size(),
-                    "cast it in the query, e.g. CAST(" + name + " AS TEXT)");
+                    "cast it in the query, e.g. CAST(" + name + " AS TEXT) (AS CHAR on MySQL)");
     return message;
 }
 

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <robin_hood.h>
 #include <span>
@@ -86,6 +87,8 @@ struct ResourceStep {
     std::size_t position = 0;
 };
 
+struct FunctionPlan;
+
 struct ScriptPlan {
     std::vector<ir::NodePtr> preamble;
     /// Statement index of each `preamble` call, parallel to it. A consumer that
@@ -103,6 +106,21 @@ struct ScriptPlan {
     ir::NodePtr result;
     /// Set when the final expression is a simple identifier.
     std::optional<std::string> result_binding;
+    /// A function body whose value is not a table (a connection, a scalar): the
+    /// call that is its value, or the expression (a name or a literal). Exactly
+    /// one of `result`, `return_call`, `return_expr` is set for a function.
+    ir::NodePtr return_call;
+    std::optional<ir::Expr> return_expr;
+    /// The `fn`s of the program that take, open or return a resource: they run
+    /// statements, so they cannot be inlined into a plan. Each is lowered as a
+    /// small script of its own, emitted as a function of the program.
+    std::vector<std::unique_ptr<FunctionPlan>> functions;
+};
+
+/// A resource `fn`, lowered. `body` holds its statements and its value.
+struct FunctionPlan {
+    const FunctionDecl* decl = nullptr;
+    ScriptPlan body;
 };
 
 using ScriptPlanResult = std::expected<ScriptPlan, LowerError>;

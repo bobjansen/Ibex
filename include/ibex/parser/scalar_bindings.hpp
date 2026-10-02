@@ -15,6 +15,7 @@
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
+#include <ibex/parser/resource_functions.hpp>
 
 #include <cstdint>
 #include <expected>
@@ -296,9 +297,21 @@ struct DeferredWrap {
     lower_ctx.table_args_as_bindings = true;
     // Externs that return a scalar, by name.
     robin_hood::unordered_set<std::string> scalar_externs;
+    // Every extern, for the resource-function test below.
+    robin_hood::unordered_map<std::string, const ExternDecl*> all_externs;
+    const ResourceFunctions resource_functions(
+        [&](std::string_view name) -> const ExternDecl* {
+            const auto it = all_externs.find(std::string(name));
+            return it == all_externs.end() ? nullptr : it->second;
+        },
+        [&](std::string_view name) -> const FunctionDecl* {
+            const auto it = lower_ctx.functions.find(std::string(name));
+            return it == lower_ctx.functions.end() ? nullptr : it->second;
+        });
 
     const auto collect_declaration = [&](const Stmt& stmt) {
         if (const auto* ext = std::get_if<ExternDecl>(&stmt)) {
+            all_externs.insert_or_assign(ext->name, ext);
             if (ext->return_type.kind == Type::Kind::DataFrame ||
                 ext->return_type.kind == Type::Kind::TimeFrame) {
                 lower_ctx.table_externs.insert(ext->name);
@@ -337,6 +350,20 @@ struct DeferredWrap {
 
         // Stream lets are never scalar; let the full lowering phase validate them.
         if (std::holds_alternative<StreamExpr>(let_stmt->value->node)) {
+            continue;
+        }
+
+        // `let x = f(...)` with `f` a resource `fn`: a call of the program, run
+        // where it is. Its result is a table, a scalar or a resource by its
+        // declared type; the call is not lowered here (a plan would inline it).
+        if (const auto* fn_call = std::get_if<CallExpr>(&let_stmt->value->node);
+            fn_call != nullptr && lower_ctx.functions.contains(fn_call->callee) &&
+            resource_functions.contains(fn_call->callee)) {
+            const auto kind = lower_ctx.functions.at(fn_call->callee)->return_type.kind;
+            if (kind != Type::Kind::DataFrame && kind != Type::Kind::TimeFrame) {
+                out.extern_calls.push_back(let_stmt->name);
+            }
+            lower_ctx.lexical_names.insert(let_stmt->name);
             continue;
         }
 

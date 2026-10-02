@@ -491,7 +491,7 @@ the driver manager when the generated code includes `adbc.hpp`.
 
 ### W6c — resource values in the emitter
 
-**Status (2026-10-02): top-level resources done; functions not.** A script's
+**Status (2026-10-02): done, including functions.** A script's
 connections compile: `let db = adbc_connect(...)` is a C++ variable
 (`auto _res0_db = adbc_connect(...);`), `let b = a;` copies it (copies alias, the
 last closes), and every call on it -- `adbc_execute`, `adbc_write` (its table
@@ -510,10 +510,29 @@ Parity (`tests/parity/effect_cases/`): `adbc_connection`, `adbc_alias_and_rebind
 `adbc_transaction`, `adbc_release` -- the last fails ("database is locked") if the
 release is not emitted. A connection opened inside another call's argument
 (`adbc_execute(adbc_connect(...), "...")`) is a temporary of the statement: it runs
-first and is released after (`adbc_nested_call`). Not done, and refused with a
-message: a `fn` that takes, opens or returns a resource (it needs a C++ function
-with a statement body and its own lowering, or inlining at the call site with
-hygiene for names), and a nested call that returns a scalar or table argument.
+first and is released after (`adbc_nested_call`).
+
+A `fn` that takes, opens or returns a resource (or calls one that does) is a C++
+function of the program: `_ibex_fn_<name>`, declared ahead of `main` so functions
+call one another in any order. Its body is lowered by a lowerer of its own as a
+small script (`lower_resource_function`), so everything above works inside it, and
+its locals are C++ locals: released at the return, in reverse order, by the
+destructors -- the REPL's frame. Parameters are the C++ types of their language
+types (a connection is the extern type's name, a table `const Table&`, scalars
+`std::int64_t` / `double` / `std::string` / ...); scalars are also published in a
+`ScalarScope`, a copy of the caller's registry plus the parameters, restored at the
+return, which is how the REPL's local registries behave. The value is the last
+statement: a table plan, a connection name, a literal, or a call (including a call
+of another function). A call of a function from the program is a bound call or a
+pinned binding like any call of a resource function. Parity: `adbc_function_table`,
+`adbc_function_connection`, `adbc_function_scope` (a function's connection is
+released at the return, so its open transaction cannot lock the table).
+
+Not done, and refused with a message: a scalar `let` in a function body (scalar
+bindings are collected for the program, not per function), a value that is none of
+the forms above, a Decimal or column parameter, a function reading the program's
+tables or connections (the REPL gives it no connections either), and a nested call
+that returns a scalar or table argument.
 
 Original design, kept for the record:
 

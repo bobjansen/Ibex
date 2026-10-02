@@ -31,6 +31,30 @@ struct TupleSource {
 };
 
 void set_scalars(const runtime::ScalarRegistry* scalars);
+
+/// The registry `set_scalars` published, or null.
+[[nodiscard]] auto current_scalars() -> const runtime::ScalarRegistry*;
+
+/// A function body's scalars: a copy of the caller's registry at the call, with
+/// the function's parameters added, published for the body and restored however
+/// the body ends. The REPL runs a function against a copy of the caller's scalars
+/// the same way, so a name a body reads that is not its own resolves as it would
+/// there, and the body's own bindings never reach the caller.
+class ScalarScope {
+   public:
+    ScalarScope();
+    ~ScalarScope();
+    ScalarScope(const ScalarScope&) = delete;
+    auto operator=(const ScalarScope&) -> ScalarScope& = delete;
+    ScalarScope(ScalarScope&&) = delete;
+    auto operator=(ScalarScope&&) -> ScalarScope& = delete;
+
+    void set(const std::string& name, runtime::ScalarValue value);
+
+   private:
+    runtime::ScalarRegistry own_;
+    const runtime::ScalarRegistry* previous_;
+};
 [[nodiscard]] auto eval_row_count(const ir::Expr& expr) -> std::size_t;
 
 /// Extract a scalar (possibly null) from a subquery result table. With
@@ -60,6 +84,12 @@ struct ScalarArg {
         if constexpr (std::is_same_v<T, std::string>) {
             if (const auto* s = std::get_if<std::string>(&value)) {
                 return *s;
+            }
+        } else if constexpr (std::is_same_v<T, std::string_view>) {
+            // A view of this argument's own string: good for the full expression
+            // the call is in, which is as long as the call needs it.
+            if (const auto* s = std::get_if<std::string>(&value)) {
+                return std::string_view{*s};
             }
         } else if constexpr (std::is_same_v<T, bool>) {
             if (const auto* b = std::get_if<bool>(&value)) {

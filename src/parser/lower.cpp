@@ -82,6 +82,7 @@
 #include <expected>
 #include <functional>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <optional>
 #include <robin_hood.h>
@@ -1867,22 +1868,74 @@ class Lowerer {
             .position = position};
     }
 
-    /// True when `expr` is a call of an `extern fn` that returns a scalar: not a
-    /// table reader, not a `fn` (which shadows an extern of the same name).
+    /// The call `expr` is, when it is a call of something that runs for its
+    /// effect and returns a scalar or a resource: an `extern fn`, or a resource
+    /// `fn` (which runs statements, so is a call of the program, not inlined).
+    /// A table reader is not one, and neither is a `fn` that is plan-shaped.
     [[nodiscard]] auto is_scalar_extern_call(const Expr& expr) const -> const CallExpr* {
         const auto* call = std::get_if<CallExpr>(&expr.node);
-        if (call == nullptr || !extern_decls_.contains(call->callee) ||
-            functions_.contains(call->callee) || table_externs_.contains(call->callee)) {
+        if (call == nullptr) {
+            return nullptr;
+        }
+        const auto* sig = find_callable(call->callee);
+        if (sig == nullptr || sig->return_type.kind == Type::Kind::DataFrame ||
+            sig->return_type.kind == Type::Kind::TimeFrame) {
             return nullptr;
         }
         return call;
     }
 
-    auto lower_script(const Program& program) -> ScriptPlanResult {
+    /// The value of a function whose last statement is not a table: the connection
+    /// or scalar it returns. A name, a literal, or a call that returns one.
+    auto lower_function_return(const Expr& expr) -> std::expected<void, LowerError> {
+        const bool returns_resource = function_->return_type.kind == Type::Kind::Resource;
+        const auto fail = [&](std::string_view why) {
+            return std::unexpected(
+                LowerError{.message = std::string("the value of a function "
+                                                  "returning ") +
+                                      (returns_resource ? "a resource" : "a scalar") + " must be " +
+                                      std::string(why)});
+        };
+        if (const auto* ident = std::get_if<IdentifierExpr>(&expr.node)) {
+            if (returns_resource != resource_names_.contains(ident->name)) {
+                return fail(returns_resource ? "a connection bound in the function or passed to it"
+                                             : "a scalar, not a connection");
+            }
+            return_expr_ = ir::Expr{.node = ir::ColumnRef{.name = ident->name}};
+            return {};
+        }
+        if (const auto* call = is_scalar_extern_call(expr)) {
+            const auto* sig = find_callable(call->callee);
+            if ((sig->return_type.kind == Type::Kind::Resource) != returns_resource) {
+                return fail(returns_resource ? "a call that returns a resource"
+                                             : "a call that returns a scalar");
+            }
+            auto args = lower_extern_args(*call);
+            if (!args.has_value()) {
+                return std::unexpected(args.error());
+            }
+            return_call_ = builder_.extern_call(call->callee, std::move(*args));
+            return {};
+        }
+        if (!returns_resource && std::holds_alternative<LiteralExpr>(expr.node)) {
+            auto literal = lower_expr_to_ir(expr);
+            if (!literal.has_value()) {
+                return std::unexpected(literal.error());
+            }
+            return_expr_ = std::move(*literal);
+            return {};
+        }
+        return fail("a name, a literal, or a call");
+    }
+
+    /// Lower a statement list -- a program's, or a function body's -- as a script.
+    template <typename StmtT>
+    auto lower_statement_list(const std::vector<StmtT>& statements) -> ScriptPlanResult {
+        constexpr bool kProgram = std::is_same_v<StmtT, Stmt>;
         ir::NodePtr last_expr;
         std::vector<ScriptSink> sinks;
         share_repeated_bindings_ = true;
-        for (const auto& stmt : program.statements) {
+        for (const auto& stmt : statements) {
             if (const auto* let_stmt = std::get_if<LetStmt>(&stmt)) {
                 ++let_counts_[let_stmt->name];
                 count_table_refs(*let_stmt->value, /*table_position=*/true, table_ref_counts_);
@@ -1915,11 +1968,13 @@ class Lowerer {
         // The script's own externs are registered as the main loop reaches
         // them, which is after this pass needs their effect declarations and
         // to know which of them are sinks.
-        for (const auto& stmt : program.statements) {
-            if (const auto* ext = std::get_if<ExternDecl>(&stmt)) {
-                extern_decls_.insert_or_assign(ext->name, ext);
-                if (!ext->params.empty() && ext->params[0].type.kind == Type::Kind::DataFrame) {
-                    sink_externs_.insert(ext->name);
+        if constexpr (kProgram) {
+            for (const auto& stmt : statements) {
+                if (const auto* ext = std::get_if<ExternDecl>(&stmt)) {
+                    extern_decls_.insert_or_assign(ext->name, ext);
+                    if (!ext->params.empty() && ext->params[0].type.kind == Type::Kind::DataFrame) {
+                        sink_externs_.insert(ext->name);
+                    }
                 }
             }
         }
@@ -1929,9 +1984,9 @@ class Lowerer {
                 it->second = std::min(it->second, position);
             }
         };
-        for (std::size_t i = 0; i < program.statements.size(); ++i) {
+        for (std::size_t i = 0; i < statements.size(); ++i) {
             const Expr* value = nullptr;
-            const auto& stmt = program.statements[i];
+            const auto& stmt = statements[i];
             if (const auto* let_stmt = std::get_if<LetStmt>(&stmt)) {
                 value = let_stmt->value.get();
                 // `let n = sink(df, ...)` is a sink too: it writes where it sits.
@@ -2007,8 +2062,8 @@ class Lowerer {
             return infer_output_column_names(*lowered.value());
         };
         std::optional<ResourceStep> pending_unbind;
-        for (std::size_t position = 0; position < program.statements.size(); ++position) {
-            const auto& stmt = program.statements[position];
+        for (std::size_t position = 0; position < statements.size(); ++position) {
+            const auto& stmt = statements[position];
             current_position_ = position;
             // A name rebound to something that is not a resource releases it
             // AFTER the statement that rebinds it (whose value may read it).
@@ -2016,13 +2071,15 @@ class Lowerer {
                 resource_steps_.push_back(std::move(*pending_unbind));
                 pending_unbind.reset();
             }
-            if (collect_declaration(stmt)) {
-                continue;
-            }
-            if (std::holds_alternative<ImportDecl>(stmt)) {
-                // Import declarations are resolved by the REPL before lowering;
-                // they have no IR representation.
-                continue;
+            if constexpr (kProgram) {
+                if (collect_declaration(stmt)) {
+                    continue;
+                }
+                if (std::holds_alternative<ImportDecl>(stmt)) {
+                    // Import declarations are resolved by the REPL before
+                    // lowering; they have no IR representation.
+                    continue;
+                }
             }
             if (std::holds_alternative<LetStmt>(stmt)) {
                 const auto& let_stmt = std::get<LetStmt>(stmt);
@@ -2044,10 +2101,8 @@ class Lowerer {
                 // one; otherwise it stops being one when the statement is done.
                 const auto* resource_call = is_scalar_extern_call(*let_stmt.value);
                 const bool binds_resource =
-                    resource_call != nullptr &&
-                    find_extern_decl(resource_call->callee) != nullptr &&
-                    find_extern_decl(resource_call->callee)->return_type.kind ==
-                        Type::Kind::Resource;
+                    resource_call != nullptr && find_callable(resource_call->callee) != nullptr &&
+                    find_callable(resource_call->callee)->return_type.kind == Type::Kind::Resource;
                 if (resource_names_.contains(let_stmt.name) && !binds_resource) {
                     pending_unbind = ResourceStep{.kind = ResourceStep::Kind::Unbind,
                                                   .name = let_stmt.name,
@@ -2066,7 +2121,20 @@ class Lowerer {
                     // Scalar let bindings are handled by the REPL/tooling layer;
                     // the IR lowerer only needs to accept them so later table
                     // expressions can still be lowered.
+                    // A scalar `let` of a function body would be dropped, not
+                    // evaluated: scalar bindings are collected for the program,
+                    // not for a function.
+                    const auto scalar_let_in_function = [&]() {
+                        return std::unexpected(LowerError{
+                            .message = "`let " + let_stmt.name +
+                                       "` is a scalar binding inside a function, which compiled "
+                                       "programs do not support yet; compute it in the program, "
+                                       "or call a function for it"});
+                    };
                     if (is_deferred_scalar_let_shape(*let_stmt.value)) {
+                        if (function_ != nullptr) {
+                            return scalar_let_in_function();
+                        }
                         // A runtime scalar(<table>) binding: collected separately
                         // into ir::DeferredScalarBinding; nothing to lower here.
                         continue;
@@ -2104,6 +2172,9 @@ class Lowerer {
                             continue;
                         }
                         return std::unexpected(value.error());
+                    }
+                    if (function_ != nullptr) {
+                        return scalar_let_in_function();
                     }
                     continue;
                 }
@@ -2157,6 +2228,17 @@ class Lowerer {
             }
             if (std::holds_alternative<ExprStmt>(stmt)) {
                 const auto& expr_stmt = std::get<ExprStmt>(stmt);
+                // The last statement of a function that does not return a table
+                // is its value: a connection, or a scalar.
+                if (function_ != nullptr && position + 1 == statements.size() &&
+                    function_->return_type.kind != Type::Kind::DataFrame &&
+                    function_->return_type.kind != Type::Kind::TimeFrame) {
+                    if (auto returned = lower_function_return(*expr_stmt.expr);
+                        !returned.has_value()) {
+                        return std::unexpected(returned.error());
+                    }
+                    continue;
+                }
                 if (const auto* call = std::get_if<CallExpr>(&expr_stmt.expr->node);
                     call != nullptr && sink_externs_.contains(call->callee)) {
                     auto sink = lower_sink_call(*call, position, std::nullopt);
@@ -2179,7 +2261,7 @@ class Lowerer {
                         std::vector<ir::Expr> args;
                         args.reserve(call->args.size());
                         bool args_ok = true;
-                        if (find_extern_decl(call->callee) != nullptr) {
+                        if (find_callable(call->callee) != nullptr) {
                             // Defaults and names bound, table arguments made
                             // into bindings of their own.
                             auto bound = lower_extern_args(*call);
@@ -2209,7 +2291,7 @@ class Lowerer {
                 }
                 // A statement whose value is dropped still runs when it calls a
                 // resource function: `adbc_query(db, "...");` executes once.
-                if (position + 1 != program.statements.size() &&
+                if (position + 1 != statements.size() &&
                     plan_calls_resource_function(*value.value())) {
                     shared_bindings_.push_back(
                         SharedBinding{.name = "__ibex_stmt_" + std::to_string(synthetic_counter_++),
@@ -2223,7 +2305,7 @@ class Lowerer {
         if (pending_unbind.has_value()) {
             resource_steps_.push_back(std::move(*pending_unbind));
         }
-        if (!last_expr) {
+        if (!last_expr && return_call_ == nullptr && !return_expr_.has_value()) {
             return std::unexpected(LowerError{.message = "no expression to lower"});
         }
         return ScriptPlan{
@@ -2235,7 +2317,7 @@ class Lowerer {
             .sinks = std::move(sinks),
             .result = std::move(last_expr),
             .result_binding = [&]() -> std::optional<std::string> {
-                const auto* last = std::get_if<ExprStmt>(&program.statements.back());
+                const auto* last = std::get_if<ExprStmt>(&statements.back());
                 if (last == nullptr) {
                     return std::nullopt;
                 }
@@ -2243,7 +2325,64 @@ class Lowerer {
                     return ident->name;
                 }
                 return std::nullopt;
-            }()};
+            }(),
+            .return_call = std::move(return_call_),
+            .return_expr = std::move(return_expr_),
+            .functions = {}};
+    }
+
+    auto lower_script(const Program& program) -> ScriptPlanResult {
+        // A resource `fn` runs statements, so it is a function of the program,
+        // not something a plan can inline. Register every one before the
+        // statements are lowered, so a call to it is recognised.
+        for (const auto& stmt : program.statements) {
+            if (const auto* fn = std::get_if<FunctionDecl>(&stmt)) {
+                functions_.insert_or_assign(fn->name, fn);
+            }
+        }
+        auto plan = lower_statement_list(program.statements);
+        if (!plan.has_value()) {
+            return plan;
+        }
+        for (const auto& stmt : program.statements) {
+            const auto* fn = std::get_if<FunctionDecl>(&stmt);
+            if (fn == nullptr || !resource_functions_.has_value() ||
+                !resource_functions_->contains(fn->name)) {
+                continue;
+            }
+            auto lowered = lower_resource_function(*fn);
+            if (!lowered.has_value()) {
+                return std::unexpected(lowered.error());
+            }
+            plan->functions.push_back(std::move(*lowered));
+        }
+        return plan;
+    }
+
+    /// A resource `fn` as a script of its own: lowered by a lowerer that sees the
+    /// same declarations, with the function's resource parameters bound as
+    /// resources. What the body evaluates to is its return value.
+    auto lower_resource_function(const FunctionDecl& fn)
+        -> std::expected<std::unique_ptr<FunctionPlan>, LowerError> {
+        robin_hood::unordered_map<std::string, ir::NodePtr> bindings;
+        Lowerer body(&bindings, {}, table_externs_, sink_externs_, table_extern_decls_, {},
+                     functions_);
+        body.extern_decls_ = extern_decls_;
+        body.function_ = &fn;
+        for (const auto& param : fn.params) {
+            if (param.type.kind == Type::Kind::Resource) {
+                body.resource_names_.insert(param.name);
+            }
+        }
+        auto plan = body.lower_statement_list(fn.body);
+        if (!plan.has_value()) {
+            return std::unexpected(
+                LowerError{.message = "function '" + fn.name + "': " + plan.error().message});
+        }
+        auto out = std::make_unique<FunctionPlan>();
+        out->decl = &fn;
+        out->body = std::move(*plan);
+        return out;
     }
 
     auto lower_program(const Program& program) -> LowerResult {
@@ -2541,6 +2680,18 @@ class Lowerer {
             node->add_child(std::move(base.value()));
             return node;
         }
+        if (const auto* sig = find_callable(call.callee);
+            script_mode_ && sig != nullptr && functions_.contains(call.callee) &&
+            (sig->return_type.kind == Type::Kind::DataFrame ||
+             sig->return_type.kind == Type::Kind::TimeFrame)) {
+            // A resource `fn` runs statements: it is a call of the program, run
+            // where it is and never inlined into the plan around it.
+            auto args = lower_extern_args(call);
+            if (!args.has_value()) {
+                return std::unexpected(std::move(args.error()));
+            }
+            return builder_.extern_call(call.callee, std::move(*args));
+        }
         if (!table_externs_.contains(call.callee)) {
             if (auto fn = functions_.find(call.callee); fn != functions_.end()) {
                 return inline_table_udf(*fn->second, call);
@@ -2566,7 +2717,7 @@ class Lowerer {
         if (!bound.has_value()) {
             return std::unexpected(std::move(bound.error()));
         }
-        const ExternDecl* const decl = find_extern_decl(call.callee);
+        const CallableSig* const decl = find_callable(call.callee);
         std::vector<ir::Expr> args;
         args.reserve(bound->size());
         for (std::size_t i = 0; i < bound->size(); ++i) {
@@ -2577,9 +2728,8 @@ class Lowerer {
             if (script_mode_ && resource_functions_.has_value()) {
                 if (const auto* nested_call = std::get_if<CallExpr>(&arg.node);
                     nested_call != nullptr && resource_functions_->contains(nested_call->callee) &&
-                    find_extern_decl(nested_call->callee) != nullptr &&
-                    find_extern_decl(nested_call->callee)->return_type.kind ==
-                        Type::Kind::Resource) {
+                    find_callable(nested_call->callee) != nullptr &&
+                    find_callable(nested_call->callee)->return_type.kind == Type::Kind::Resource) {
                     // `run(open("file:x"), ...)`: the inner call runs first and its
                     // connection is the argument. It is a temporary of this
                     // statement: released when the statement is done.
@@ -2651,20 +2801,42 @@ class Lowerer {
         return false;
     }
 
-    /// The declaration of the extern `callee`, if it is one.
-    [[nodiscard]] auto find_extern_decl(const std::string& callee) const -> const ExternDecl* {
+    /// What a call of `callee` takes and returns: a resource `fn` (which shadows
+    /// an extern of the same name, as it does at run time), else an `extern fn`.
+    struct CallableSig {
+        const std::vector<Param>& params;
+        const Type& return_type;
+    };
+
+    [[nodiscard]] auto find_callable(const std::string& callee) const -> const CallableSig* {
+        if (const auto it = callable_cache_.find(callee); it != callable_cache_.end()) {
+            return &it->second;
+        }
+        if (const auto fn = functions_.find(callee); fn != functions_.end() &&
+                                                     resource_functions_.has_value() &&
+                                                     resource_functions_->contains(callee)) {
+            return &callable_cache_
+                        .emplace(callee, CallableSig{fn->second->params, fn->second->return_type})
+                        .first->second;
+        }
+        const ExternDecl* extern_decl = nullptr;
         if (const auto it = extern_decls_.find(callee); it != extern_decls_.end()) {
-            return it->second;
+            extern_decl = it->second;
+        } else if (const auto it = table_extern_decls_.find(callee);
+                   it != table_extern_decls_.end()) {
+            extern_decl = it->second;
         }
-        if (const auto it = table_extern_decls_.find(callee); it != table_extern_decls_.end()) {
-            return it->second;
+        if (extern_decl == nullptr || functions_.contains(callee)) {
+            return nullptr;
         }
-        return nullptr;
+        return &callable_cache_
+                    .emplace(callee, CallableSig{extern_decl->params, extern_decl->return_type})
+                    .first->second;
     }
 
     auto bind_extern_call_args(const CallExpr& call)
         -> std::expected<std::vector<const Expr*>, LowerError> {
-        const ExternDecl* const decl = find_extern_decl(call.callee);
+        const CallableSig* const decl = find_callable(call.callee);
         if (decl == nullptr) {
             if (!call.named_args.empty()) {
                 return std::unexpected(LowerError{
@@ -6242,6 +6414,11 @@ class Lowerer {
     std::vector<std::optional<CallBind>> preamble_binds_;
     std::size_t synthetic_counter_ = 0;
     std::optional<ResourceFunctions> resource_functions_;
+    mutable std::map<std::string, CallableSig> callable_cache_;
+    /// The function whose body this lowerer is lowering, or null for the program.
+    const FunctionDecl* function_ = nullptr;
+    ir::NodePtr return_call_;
+    std::optional<ir::Expr> return_expr_;
     robin_hood::unordered_map<std::string, std::vector<std::string>> compile_time_lists_;
     robin_hood::unordered_set<std::string> table_externs_;
     robin_hood::unordered_set<std::string> sink_externs_;

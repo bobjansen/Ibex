@@ -1,0 +1,28 @@
+// A `fn` that opens a connection and returns it (kept open for the caller), one
+// that returns its argument, one that runs a statement on a connection and returns
+// the count, and one that calls another. The connection a function returns is the
+// caller's: what it wrote is read back through it.
+import "adbc";
+
+fn opened(uri: String) -> AdbcConnection {
+    adbc_connect("@SQLITE_DRIVER@", uri);
+}
+
+fn same(c: AdbcConnection) -> AdbcConnection {
+    c;
+}
+
+fn add_row(mutable conn: AdbcConnection, v: Int) -> Int {
+    adbc_execute(conn, "insert into t values (100)");
+}
+
+fn add_twice(mutable conn: AdbcConnection) -> Int {
+    add_row(conn, 1);
+}
+
+let db = opened("file:/tmp/ibex_parity_adbc_function_connection.db");
+adbc_execute(db, "create table t (x integer)");
+let kept = same(db);
+let first = add_twice(kept);
+let second = add_row(db, 2);
+adbc_query(kept, "select count(*) as n, sum(x) as total from t");

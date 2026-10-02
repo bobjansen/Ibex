@@ -1878,8 +1878,8 @@ class Lowerer {
             return nullptr;
         }
         const auto* sig = find_callable(call->callee);
-        if (sig == nullptr || sig->return_type.kind == Type::Kind::DataFrame ||
-            sig->return_type.kind == Type::Kind::TimeFrame) {
+        if (sig == nullptr || sig->return_type->kind == Type::Kind::DataFrame ||
+            sig->return_type->kind == Type::Kind::TimeFrame) {
             return nullptr;
         }
         return call;
@@ -1906,7 +1906,7 @@ class Lowerer {
         }
         if (const auto* call = is_scalar_extern_call(expr)) {
             const auto* sig = find_callable(call->callee);
-            if ((sig->return_type.kind == Type::Kind::Resource) != returns_resource) {
+            if ((sig->return_type->kind == Type::Kind::Resource) != returns_resource) {
                 return fail(returns_resource ? "a call that returns a resource"
                                              : "a call that returns a scalar");
             }
@@ -2102,7 +2102,7 @@ class Lowerer {
                 const auto* resource_call = is_scalar_extern_call(*let_stmt.value);
                 const bool binds_resource =
                     resource_call != nullptr && find_callable(resource_call->callee) != nullptr &&
-                    find_callable(resource_call->callee)->return_type.kind == Type::Kind::Resource;
+                    find_callable(resource_call->callee)->return_type->kind == Type::Kind::Resource;
                 if (resource_names_.contains(let_stmt.name) && !binds_resource) {
                     pending_unbind = ResourceStep{.kind = ResourceStep::Kind::Unbind,
                                                   .name = let_stmt.name,
@@ -2310,7 +2310,7 @@ class Lowerer {
         const bool did_something = !sinks.empty() || !preamble_calls_.empty() ||
                                    !shared_bindings_.empty() || !resource_steps_.empty();
         if (!last_expr && return_call_ == nullptr && !return_expr_.has_value() &&
-            !(function_ == nullptr && did_something)) {
+            (function_ != nullptr || !did_something)) {
             return std::unexpected(LowerError{.message = "no expression to lower"});
         }
         return ScriptPlan{
@@ -2692,8 +2692,8 @@ class Lowerer {
         }
         if (const auto* sig = find_callable(call.callee);
             script_mode_ && sig != nullptr && functions_.contains(call.callee) &&
-            (sig->return_type.kind == Type::Kind::DataFrame ||
-             sig->return_type.kind == Type::Kind::TimeFrame)) {
+            (sig->return_type->kind == Type::Kind::DataFrame ||
+             sig->return_type->kind == Type::Kind::TimeFrame)) {
             // A resource `fn` runs statements: it is a call of the program, run
             // where it is and never inlined into the plan around it.
             auto args = lower_extern_args(call);
@@ -2739,7 +2739,7 @@ class Lowerer {
                 if (const auto* nested_call = std::get_if<CallExpr>(&arg.node);
                     nested_call != nullptr && resource_functions_->contains(nested_call->callee) &&
                     find_callable(nested_call->callee) != nullptr &&
-                    find_callable(nested_call->callee)->return_type.kind == Type::Kind::Resource) {
+                    find_callable(nested_call->callee)->return_type->kind == Type::Kind::Resource) {
                     // `run(open("file:x"), ...)`: the inner call runs first and its
                     // connection is the argument. It is a temporary of this
                     // statement: released when the statement is done.
@@ -2769,9 +2769,9 @@ class Lowerer {
                 }
             }
             const bool is_table_param = script_mode_ && decl != nullptr &&
-                                        i < decl->params.size() &&
-                                        (decl->params[i].type.kind == Type::Kind::DataFrame ||
-                                         decl->params[i].type.kind == Type::Kind::TimeFrame);
+                                        i < decl->params->size() &&
+                                        ((*decl->params)[i].type.kind == Type::Kind::DataFrame ||
+                                         (*decl->params)[i].type.kind == Type::Kind::TimeFrame);
             if (is_table_param) {
                 auto plan = lower_expr(arg);
                 if (!plan.has_value()) {
@@ -2803,19 +2803,16 @@ class Lowerer {
             resource_functions_->contains(ir::node_cast<ir::ExternCallNode>(plan).callee())) {
             return true;
         }
-        for (const auto& child : plan.children()) {
-            if (child != nullptr && plan_calls_resource_function(*child)) {
-                return true;
-            }
-        }
-        return false;
+        return std::ranges::any_of(plan.children(), [this](const auto& child) {
+            return child != nullptr && plan_calls_resource_function(*child);
+        });
     }
 
     /// What a call of `callee` takes and returns: a resource `fn` (which shadows
     /// an extern of the same name, as it does at run time), else an `extern fn`.
     struct CallableSig {
-        const std::vector<Param>& params;
-        const Type& return_type;
+        const std::vector<Param>* params = nullptr;
+        const Type* return_type = nullptr;
     };
 
     [[nodiscard]] auto find_callable(const std::string& callee) const -> const CallableSig* {
@@ -2826,7 +2823,8 @@ class Lowerer {
                                                      resource_functions_.has_value() &&
                                                      resource_functions_->contains(callee)) {
             return &callable_cache_
-                        .emplace(callee, CallableSig{fn->second->params, fn->second->return_type})
+                        .emplace(callee, CallableSig{.params = &fn->second->params,
+                                                     .return_type = &fn->second->return_type})
                         .first->second;
         }
         const ExternDecl* extern_decl = nullptr;
@@ -2840,7 +2838,8 @@ class Lowerer {
             return nullptr;
         }
         return &callable_cache_
-                    .emplace(callee, CallableSig{extern_decl->params, extern_decl->return_type})
+                    .emplace(callee, CallableSig{.params = &extern_decl->params,
+                                                 .return_type = &extern_decl->return_type})
                     .first->second;
     }
 
@@ -2860,7 +2859,7 @@ class Lowerer {
             return positional;
         }
 
-        const auto& params = decl->params;
+        const auto& params = *decl->params;
         std::vector<const Expr*> bound(params.size(), nullptr);
         robin_hood::unordered_map<std::string, std::size_t> param_index;
         param_index.reserve(params.size());

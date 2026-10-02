@@ -75,7 +75,7 @@ class Emitter {
     /// step produced. The plans are borrowed; the caller keeps them alive.
     struct Script {
         struct Step {
-            enum class Kind {
+            enum class Kind : std::uint8_t {
                 /// Materialize `plan` once, under `name`; later plans scan it.
                 SharedBinding,
                 /// Run `plan`, then `callee(<that table>, args...)`.

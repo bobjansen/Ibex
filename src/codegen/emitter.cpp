@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>

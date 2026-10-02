@@ -153,6 +153,7 @@ done
 # interpreter and compare what each prints. A case reads back what it writes, so
 # a statement that ran out of order changes the printed table.
 EFFECT_CASES_DIR="$SCRIPT_DIR/effect_cases"
+SQLITE_DRIVER="$(sed -n 's/^ADBC_DRIVER_SQLITE_LIBRARY:FILEPATH=//p' "$BUILD_DIR/CMakeCache.txt" 2>/dev/null)"
 FAST_FLOAT_INC="$BUILD_DIR/_deps/fast_float-src/include"
 EFFECT_INCS=("${IBEX_INCS[@]}")
 if [[ -d "$FAST_FLOAT_INC" ]]; then
@@ -167,6 +168,17 @@ if [[ -d "$EFFECT_CASES_DIR" ]]; then
         fi
         cpp_file="$TMPDIR_WORK/effect_$name.cpp"
         bin_file="$TMPDIR_WORK/effect_$name.bin"
+        # A case that reads a database names the SQLite ADBC driver by placeholder:
+        # the driver is wherever this build found it, and a build without it skips
+        # the case rather than failing.
+        if grep -q '@SQLITE_DRIVER@' "$case_file"; then
+            if [[ -z "$SQLITE_DRIVER" || ! -f "$SQLITE_DRIVER" ]]; then
+                echo "parity skip: effect case $name (ADBC SQLite driver not found)"
+                continue
+            fi
+            sed "s#@SQLITE_DRIVER@#$SQLITE_DRIVER#g" "$case_file" >"$TMPDIR_WORK/effect_$name.ibex"
+            case_file="$TMPDIR_WORK/effect_$name.ibex"
+        fi
         if ! "$IBEX_COMPILE" "$case_file" --import-path "$BUILD_DIR/tools" -o "$cpp_file" \
             2>"$TMPDIR_WORK/effect_$name.compile.err"; then
             echo "parity: effect case $name does not transpile —" >&2
@@ -174,8 +186,15 @@ if [[ -d "$EFFECT_CASES_DIR" ]]; then
             fail=1
             continue
         fi
+        # A program that includes adbc.hpp links the ADBC client library, the Arrow
+        # bridge and the driver manager (see scripts/ibex-build.sh).
+        EFFECT_LIBS=("${IBEX_LIBS[@]}")
+        if grep -q '#include "adbc.hpp"' "$cpp_file"; then
+            EFFECT_LIBS=("$BUILD_DIR/libs/adbc/libibex_adbc.a" "$BUILD_DIR/src/interop/libibex_interop.a"
+                "$BUILD_DIR/libs/adbc/libibex_adbc_driver_manager.a" "${IBEX_LIBS[@]}" -ldl)
+        fi
         "$CXX" "${EXTRA_CXXFLAGS[@]}" -std="$CXX_STD_FLAG" "${EFFECT_INCS[@]}" "$cpp_file" \
-            "${IBEX_LIBS[@]}" "${EXTRA_LDFLAGS[@]}" -o "$bin_file"
+            "${EFFECT_LIBS[@]}" "${EXTRA_LDFLAGS[@]}" -o "$bin_file"
         rm -f /tmp/ibex_parity_"$name"*.csv
         if ! "$bin_file" >"$TMPDIR_WORK/effect_$name.compiled.out" 2>&1; then
             echo "parity mismatch: effect case $name — the transpiled program failed:" >&2

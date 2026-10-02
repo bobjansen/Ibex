@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Bob Jansen
 
+# The client is a static library (adbc_client.cpp): the plugin links it, and so
+# does a program built by ibex_compile that includes adbc.hpp. Position-independent
+# because the plugin is a shared library.
+add_library(ibex_adbc STATIC adbc_client.cpp)
 add_library(ibex_adbc_plugin SHARED adbc.cpp)
 
 # The driver manager (the library that loads ADBC drivers) is built from a
@@ -108,24 +112,43 @@ set_target_properties(ibex_adbc_plugin PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${IBEX_PLUGIN_OUTPUT_DIR}"
 )
 
+set_target_properties(ibex_adbc PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# The ADBC C headers are the library's own business: adbc_client.hpp and adbc.hpp
+# name no ADBC type, so a program including them needs only the Ibex runtime.
+target_include_directories(ibex_adbc
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${PROJECT_SOURCE_DIR}/include"
+    PRIVATE
+        "${_ibex_adbc_include_dir}"
+)
+
+target_link_libraries(ibex_adbc
+    PUBLIC
+        Ibex::interop
+        "${_ibex_adbc_manager}"
+    PRIVATE
+        Ibex::CompilerOptions
+)
+
 target_include_directories(ibex_adbc_plugin
     PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}"
         "${PROJECT_SOURCE_DIR}/include"
-        "${_ibex_adbc_include_dir}"
 )
 
 target_link_libraries(ibex_adbc_plugin
     PRIVATE
-        Ibex::interop
+        ibex_adbc
         Ibex::CompilerOptions
-        "${_ibex_adbc_manager}"
 )
 
 unset(_ibex_adbc_include_dir)
 unset(_ibex_adbc_manager)
 
 if(TARGET Ibex::Sanitizers)
+    target_link_libraries(ibex_adbc PRIVATE Ibex::Sanitizers)
     target_link_libraries(ibex_adbc_plugin PRIVATE Ibex::Sanitizers)
 endif()
 

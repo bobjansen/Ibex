@@ -217,6 +217,31 @@ if(TARGET ibex_adbc_plugin AND ADBC_DRIVER_SQLITE_LIBRARY)
     # after the colon: discovery drops it.)
     catch_discover_tests(ibex_adbc_tests TEST_PREFIX "adbc:")
 
+    # The client as a C++ library, called through adbc.hpp the way a compiled
+    # program calls it: no plugin, no REPL. Links the static library (and with it
+    # the driver manager); the SQLite driver is still loaded at run time.
+    add_executable(ibex_adbc_client_tests test_adbc_client.cpp)
+    target_link_libraries(ibex_adbc_client_tests
+        PRIVATE
+            ibex_adbc
+            Ibex::runtime
+            Ibex::core
+            Ibex::CompilerOptions
+            Catch2::Catch2WithMain
+            ibex_test_warning_suppressions
+    )
+    file(TO_CMAKE_PATH "${ADBC_DRIVER_SQLITE_LIBRARY}" _ibex_adbc_client_sqlite_driver)
+    target_compile_definitions(ibex_adbc_client_tests
+        PRIVATE IBEX_ADBC_SQLITE_DRIVER="${_ibex_adbc_client_sqlite_driver}")
+    unset(_ibex_adbc_client_sqlite_driver)
+    if(TARGET Ibex::Sanitizers)
+        target_link_libraries(ibex_adbc_client_tests PRIVATE Ibex::Sanitizers)
+    endif()
+    if(IBEX_TARGETS_X86 AND IBEX_HAS_AVX2 AND NOT MSVC)
+        target_compile_options(ibex_adbc_client_tests PRIVATE -mavx2 -mfma)
+    endif()
+    catch_discover_tests(ibex_adbc_client_tests TEST_PREFIX "adbc_client:")
+
     # The examples/adbc_sqlite walkthrough, run end to end through the ibex CLI
     # and checked against its expected summary, so the demo cannot rot.
     if(TARGET ibex_repl_bin AND TARGET ibex_args_plugin AND TARGET ibex_csv_plugin AND NOT WIN32)

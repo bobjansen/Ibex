@@ -455,6 +455,30 @@ call are refused for now.
 
 ### W6b — ADBC as a linkable library
 
+**Status (2026-10-02): done.** `libs/adbc/adbc.cpp` is split in two. The client
+(sessions, statements, driver quirks, discovery) is the static library
+`ibex_adbc` (`adbc_client.cpp`), with a typed C++ API in `adbc_client.hpp`
+(`ibex::adbc::connect/read/query/execute/write/tables/table_schema/begin/commit/
+rollback/close`, and `ibex::adbc::Connection`, a value type holding the shared
+session, so copies alias and the last one closes). That header names no ADBC
+type. The plugin (`adbc.cpp`) is `ExternArgs` parsing over it. `adbc.hpp` is
+what generated code includes: global functions named like the externs
+(`adbc_read`, `adbc_connect`, ...) over the same API, throwing
+`std::runtime_error` with the REPL's message, and `AdbcConnection` as an alias of
+`Connection`. `scripts/ibex-build.sh` links `libibex_adbc.a`, the Arrow bridge
+and the driver manager (and `-ldl`) when the generated code includes
+`adbc.hpp`; the parity harness does the same.
+
+`adbc_read` compiles and matches the interpreter (two `effect_cases`, which
+substitute the SQLite driver path and skip when the build has none).
+`tests/test_adbc_client.cpp` exercises the library through `adbc.hpp` without the
+plugin or the REPL. Not yet: `ibex_compile` still refuses a script that uses a
+resource (`adbc_connect`); that is W6c. A build with
+`IBEX_ADBC_SYSTEM_DRIVER_MANAGER=ON` links the system manager, which
+`ibex-build.sh` does not know to find.
+
+Original design, kept for the record:
+
 Independent of W6-0 and W6a. Split `libs/adbc/adbc.cpp` into `ibex_adbc`
 (static library: the session, statements, quirks, discovery, all of today's
 logic, with a C++ API in a new `libs/adbc/adbc.hpp`) and the plugin

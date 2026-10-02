@@ -81,6 +81,10 @@ if [[ -d "$IBEX_ROOT/libs" ]]; then
     done < <(find "$IBEX_ROOT/libs" -mindepth 1 -maxdepth 1 -type d -print0)
 fi
 
+# csv.hpp parses floats with fast_float, which the build fetches rather than installs.
+[[ -d "$BUILD_DIR/_deps/fast_float-src/include" ]] &&
+    IBEX_INCS+=("-isystem" "$BUILD_DIR/_deps/fast_float-src/include")
+
 _fmt_lib="$BUILD_DIR/_deps/fmt-build/libfmt.a"
 [[ -f "$_fmt_lib" ]] || _fmt_lib="$BUILD_DIR/_deps/fmt-build/libfmtd.a"
 
@@ -117,6 +121,23 @@ CPP_FILE="$TMPDIR_WORK/$BASE.cpp"
 
 echo "▸ transpiling $IBEX_FILE → $CPP_FILE"
 "$IBEX_COMPILE" "$IBEX_FILE" -o "$CPP_FILE"
+
+# A program that includes adbc.hpp calls the ADBC client library: it needs that
+# library, the Arrow bridge it uses, and the ADBC driver manager, which loads the
+# database drivers at run time (hence -ldl).
+if grep -q '#include "adbc.hpp"' "$CPP_FILE"; then
+    for _lib in "$BUILD_DIR/libs/adbc/libibex_adbc.a" \
+                "$BUILD_DIR/src/interop/libibex_interop.a" \
+                "$BUILD_DIR/libs/adbc/libibex_adbc_driver_manager.a"; do
+        if [[ ! -f "$_lib" ]]; then
+            echo "error: $_lib not found; the program uses ADBC, so build the adbc plugin first:" >&2
+            echo "       cmake --build $BUILD_DIR --target ibex_adbc_plugin" >&2
+            exit 1
+        fi
+        IBEX_LIBS+=("$_lib")
+    done
+    IBEX_LIBS+=("-ldl")
+fi
 
 echo "▸ compiling   → $OUTPUT"
 "$CXX" -std="$CXX_STD_FLAG" "${IBEX_INCS[@]}" "$CPP_FILE" "${IBEX_LIBS[@]}" -o "$OUTPUT"

@@ -38,3 +38,13 @@ Current markers:
 | _(none)_ | |
 
 W1a (`map { }` on `ibex_compile`) is closed — `map_rows` runs for real.
+
+## `../effect_cases/` — scripts whose statement order is the point
+
+Scripts with effects (`write_csv(...)` between two reads) cannot be compared by
+`structured_runner`, which interprets one lowered plan and so has no sinks. Each
+`../effect_cases/<name>.ibex` is run as a transpiled program and through
+`ibex_eval`, and the final printed table is compared. A case reads back what it
+writes, so a statement that ran out of order changes the table. Temporary files
+must be named `/tmp/ibex_parity_<name>*.csv` — the harness deletes those between
+runs, and a stale file would otherwise hide an ordering bug.

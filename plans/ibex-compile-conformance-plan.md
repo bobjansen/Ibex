@@ -428,6 +428,18 @@ emitter is its only consumer:
 
 ### W6a — sinks and extern scalars (no resources)
 
+**Status (2026-10-02): sinks and scalar-call statements done; `let n = f(...)`
+not yet.** `ibex_compile` lowers a script that has a table sink with
+`lower_script` and emits it with `Emitter::Script` (`emit(out, Script, config)`):
+steps in statement order, `Scan` of a shared binding resolved to the table its
+step built, a `write(x, ...); x;` result served from the sink's input. Scripts
+without a sink keep the single-plan path. `ScriptPlan` carries the statement
+position of preamble calls too (`preamble_positions`). Parity: three cases in
+`tests/parity/effect_cases/` run the transpiled program and the interpreter and
+compare the final table; the two ordering cases fail if shared bindings are
+emitted first. Not done: `let n = f(...)` (scalar from an extern call), and the
+deferred-scalar `let`s, which still run before every step.
+
 `ibex_compile` lowers with `lower_script` and emits the ordered `ScriptPlan`
 from W6-0, in order: shared bindings (materialized once, into a named C++
 variable a `Scan` of that name resolves to — the emitter's `ScanNode` case

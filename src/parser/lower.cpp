@@ -1834,6 +1834,7 @@ class Lowerer {
     auto lower_script(const Program& program) -> ScriptPlanResult {
         ir::NodePtr last_expr;
         std::vector<ir::NodePtr> preamble_calls;
+        std::vector<std::size_t> preamble_positions;
         std::vector<ScriptSink> sinks;
         share_repeated_bindings_ = true;
         for (const auto& stmt : program.statements) {
@@ -2073,6 +2074,7 @@ class Lowerer {
                         if (args_ok) {
                             preamble_calls.push_back(
                                 builder_.extern_call(call->callee, std::move(args)));
+                            preamble_positions.push_back(position);
                             continue;
                         }
                     }
@@ -2086,6 +2088,7 @@ class Lowerer {
         }
         return ScriptPlan{
             .preamble = std::move(preamble_calls),
+            .preamble_positions = std::move(preamble_positions),
             .shared_bindings = std::move(shared_bindings_),
             .sinks = std::move(sinks),
             .result = std::move(last_expr),

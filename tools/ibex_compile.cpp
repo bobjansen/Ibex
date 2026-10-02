@@ -20,7 +20,9 @@
 #include <robin_hood.h>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
+#include <vector>
 
 #include "import_resolver.hpp"
 
@@ -147,11 +149,22 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Lower to IR
-    auto ir = ibex::parser::lower(*program);
-    if (!ir) {
-        std::cerr << "ibex_compile: " << ir.error().message << "\n";
-        return 1;
+    // Lower to IR. A script whose statements have effects (a table sink such as
+    // `write_csv(df, path);`) cannot be one query plus constants: it is lowered
+    // as a whole script and emitted in statement order. Everything else keeps
+    // the single-plan path.
+    std::optional<ibex::parser::ScriptPlan> script_plan;
+    if (auto scripted = ibex::parser::lower_script(*program);
+        scripted.has_value() && !scripted->sinks.empty()) {
+        script_plan = std::move(*scripted);
+    }
+    ibex::parser::LowerResult ir = ibex::ir::NodePtr{};
+    if (!script_plan.has_value()) {
+        ir = ibex::parser::lower(*program);
+        if (!ir) {
+            std::cerr << "ibex_compile: " << ir.error().message << "\n";
+            return 1;
+        }
     }
 
     // Collect extern headers from the program (deduplicated)
@@ -189,16 +202,55 @@ int main(int argc, char* argv[]) {
 
     // Emit
     ibex::codegen::Emitter emitter;
-    if (output_path.empty()) {
-        emitter.emit(std::cout, **ir, config);
-    } else {
-        std::ofstream out_file(output_path);
+    std::ofstream out_file;
+    if (!output_path.empty()) {
+        out_file.open(output_path);
         if (!out_file) {
             std::cerr << "ibex_compile: cannot write to '" << output_path << "'\n";
             return 1;
         }
-        emitter.emit(out_file, **ir, config);
+    }
+    std::ostream& out = output_path.empty() ? std::cout : out_file;
+    if (!script_plan.has_value()) {
+        emitter.emit(out, **ir, config);
+        return 0;
     }
 
+    // Steps run in the order of their statements. The plan keeps preamble calls,
+    // shared bindings and sinks in separate lists, each with its statement
+    // index, so merge them back by that index.
+    std::vector<std::pair<std::size_t, ibex::codegen::Emitter::Script::Step>> ordered;
+    for (std::size_t i = 0; i < script_plan->preamble.size(); ++i) {
+        ibex::codegen::Emitter::Script::Step step;
+        step.kind = ibex::codegen::Emitter::Script::Step::Kind::Call;
+        step.plan = script_plan->preamble[i].get();
+        ordered.emplace_back(script_plan->preamble_positions.at(i), std::move(step));
+    }
+    for (const auto& shared : script_plan->shared_bindings) {
+        ibex::codegen::Emitter::Script::Step step;
+        step.kind = ibex::codegen::Emitter::Script::Step::Kind::SharedBinding;
+        step.name = shared.name;
+        step.plan = shared.plan.get();
+        ordered.emplace_back(shared.position, std::move(step));
+    }
+    for (auto& sink : script_plan->sinks) {
+        ibex::codegen::Emitter::Script::Step step;
+        step.kind = ibex::codegen::Emitter::Script::Step::Kind::Sink;
+        step.callee = sink.callee;
+        step.plan = sink.input.get();
+        step.args = std::move(sink.args);
+        step.input_binding = sink.input_binding;
+        ordered.emplace_back(sink.position, std::move(step));
+    }
+    std::ranges::stable_sort(ordered, {},
+                             &std::pair<std::size_t, ibex::codegen::Emitter::Script::Step>::first);
+    ibex::codegen::Emitter::Script script;
+    script.steps.reserve(ordered.size());
+    for (auto& entry : ordered) {
+        script.steps.push_back(std::move(entry.second));
+    }
+    script.result = script_plan->result.get();
+    script.result_binding = script_plan->result_binding;
+    emitter.emit(out, script, config);
     return 0;
 }

@@ -9,8 +9,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <optional>
 #include <robin_hood.h>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -58,10 +60,47 @@ class Emitter {
         bool forward_cli_args = false;
     };
 
+    /// A script whose statements have effects, in the order they run.
+    ///
+    /// `emit(root)` takes one query plus constants, so a program that writes a
+    /// file or calls an extern for its effect has no way to say "this, then
+    /// that". A Script does: each step runs where its statement was, and a
+    /// plan's `Scan` of a shared binding resolves to the table that binding's
+    /// step produced. The plans are borrowed; the caller keeps them alive.
+    struct Script {
+        struct Step {
+            enum class Kind {
+                /// Materialize `plan` once, under `name`; later plans scan it.
+                SharedBinding,
+                /// Run `plan`, then `callee(<that table>, args...)`.
+                Sink,
+                /// `plan`, an ExternCall node, run for its effect with its
+                /// result discarded.
+                Call,
+            };
+            Kind kind = Kind::Call;
+            std::string name;
+            const ir::Node* plan = nullptr;
+            /// Sink only.
+            std::string callee;
+            std::vector<ir::Expr> args;
+            /// Sink only: the binding the source passed as the table, so a
+            /// later `result` naming it reuses the table rather than rerunning.
+            std::optional<std::string> input_binding;
+        };
+        std::vector<Step> steps;
+        const ir::Node* result = nullptr;
+        std::optional<std::string> result_binding;
+    };
+
     /// Emit a complete C++ translation unit to `out`.
     ///
     /// The last IR node's result is passed to ibex::ops::print().
     void emit(std::ostream& out, const ir::Node& root, const Config& config);
+
+    /// Emit a translation unit that runs `script`'s steps in order, then
+    /// produces its result. Benchmark mode is not supported for a script.
+    void emit(std::ostream& out, const Script& script, const Config& config);
 
     void emit(std::ostream& out, const ir::Node& root) { emit(out, root, Config{}); }
 
@@ -83,6 +122,15 @@ class Emitter {
     /// registry lookup (`ibex::ops::scalar_arg`); a bare reference to any other
     /// unbound name there is still a hard error.
     robin_hood::unordered_set<std::string> runtime_scalar_names_;
+
+    /// Tables produced by a Script's shared-binding steps, by binding name.
+    robin_hood::unordered_map<std::string, std::string> named_tables_;
+
+    /// Everything before the query: includes, `main`/entry-point opening, and
+    /// the scalar registry. `emit_footer` closes what this opens.
+    void emit_header(std::ostream& out, const Config& config);
+    void emit_query(std::ostream& out, const ir::Node& root, const Config& config);
+    void emit_footer(std::ostream& out, const Config& config);
 
     auto fresh_var() -> std::string;
 

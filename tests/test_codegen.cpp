@@ -861,3 +861,84 @@ TEST_CASE("emitter: a boolean-valued field emits its predicate node", "[codegen]
     CHECK(contains(out, "ibex::ops::filter_not("));
     CHECK(contains(out, "ibex::ops::fn_call(\"like\""));
 }
+
+// --- Scripts with effects -----------------------------------------------------
+
+namespace {
+
+auto emit_script_to_string(const codegen::Emitter::Script& script) -> std::string {
+    std::ostringstream oss;
+    codegen::Emitter emitter;
+    emitter.emit(oss, script, codegen::Emitter::Config{});
+    return oss.str();
+}
+
+}  // namespace
+
+TEST_CASE("emitter: a script runs its steps in order and a sink sees its input", "[codegen]") {
+    ir::Builder b;
+    auto first = make_source(b, "in.csv");
+    auto result = make_source(b, "out.csv");
+
+    codegen::Emitter::Script script;
+    codegen::Emitter::Script::Step sink;
+    sink.kind = codegen::Emitter::Script::Step::Kind::Sink;
+    sink.callee = "write_csv";
+    sink.plan = first.get();
+    sink.args.emplace_back(ir::Literal{std::string("copy.csv")});
+    script.steps.push_back(std::move(sink));
+    script.result = result.get();
+
+    const auto out = emit_script_to_string(script);
+    const auto read_in = out.find("read_csv(\"in.csv\")");
+    const auto write = out.find("write_csv(t0, \"copy.csv\")");
+    const auto read_out = out.find("read_csv(\"out.csv\")");
+    REQUIRE(read_in != std::string::npos);
+    REQUIRE(write != std::string::npos);
+    REQUIRE(read_out != std::string::npos);
+    // The sink's input is read, written, and only then is the result's source read.
+    CHECK(read_in < write);
+    CHECK(write < read_out);
+}
+
+TEST_CASE("emitter: a script's result reuses the table its sink consumed", "[codegen]") {
+    // `write(result, ...); result;` -- the source must be read once.
+    ir::Builder b;
+    auto plan = make_source(b, "in.csv");
+    auto again = make_source(b, "in.csv");
+
+    codegen::Emitter::Script script;
+    codegen::Emitter::Script::Step sink;
+    sink.kind = codegen::Emitter::Script::Step::Kind::Sink;
+    sink.callee = "write_csv";
+    sink.plan = plan.get();
+    sink.args.emplace_back(ir::Literal{std::string("copy.csv")});
+    sink.input_binding = "result";
+    script.steps.push_back(std::move(sink));
+    script.result = again.get();
+    script.result_binding = "result";
+
+    const auto out = emit_script_to_string(script);
+    const auto first = out.find("read_csv(\"in.csv\")");
+    REQUIRE(first != std::string::npos);
+    CHECK(out.find("read_csv(\"in.csv\")", first + 1) == std::string::npos);
+    CHECK(contains(out, "ibex::ops::print(t0)"));
+}
+
+TEST_CASE("emitter: a scan of a shared binding resolves to the step that built it", "[codegen]") {
+    ir::Builder b;
+    auto shared = make_source(b, "in.csv");
+    auto result = b.scan("shared");
+
+    codegen::Emitter::Script script;
+    codegen::Emitter::Script::Step step;
+    step.kind = codegen::Emitter::Script::Step::Kind::SharedBinding;
+    step.name = "shared";
+    step.plan = shared.get();
+    script.steps.push_back(std::move(step));
+    script.result = result.get();
+
+    const auto out = emit_script_to_string(script);
+    CHECK(contains(out, "auto t0 = read_csv(\"in.csv\")"));
+    CHECK(contains(out, "ibex::ops::print(t0)"));
+}

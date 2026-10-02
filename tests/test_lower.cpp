@@ -575,6 +575,25 @@ r;
     CHECK(lowered->shared_bindings.empty());
 }
 
+TEST_CASE("lower_script records the statement position of each preamble call", "[parser][lower]") {
+    auto program = require_parse(R"(
+extern fn ping(n: Int) -> Int effects { io_write } from "x.hpp";
+extern fn read(path: String) -> DataFrame from "reader.hpp";
+let a = read("f");
+ping(1);
+let b = a[filter x > 0];
+ping(2);
+b;
+)");
+
+    auto lowered = parser::lower_script(program);
+    REQUIRE(lowered.has_value());
+    REQUIRE(lowered->preamble.size() == 2);
+    REQUIRE(lowered->preamble_positions.size() == 2);
+    CHECK(lowered->preamble_positions[0] == 3);
+    CHECK(lowered->preamble_positions[1] == 5);
+}
+
 TEST_CASE("lower_script keeps a cheap repeated binding inlined", "[parser][lower]") {
     // A scan/filter chain is cheap to re-run and inlining preserves each
     // consumer's own selection pushdown, so it is not shared.

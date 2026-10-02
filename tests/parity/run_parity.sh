@@ -147,6 +147,68 @@ for case_file in "$CASES_DIR"/*.ibex; do
     fi
 done
 
+# Effect cases: scripts whose statements have effects (a table sink between two
+# reads), where the order the statements run in is the thing under test. The
+# table comparison above cannot see it, so run the transpiled program and the
+# interpreter and compare what each prints. A case reads back what it writes, so
+# a statement that ran out of order changes the printed table.
+EFFECT_CASES_DIR="$SCRIPT_DIR/effect_cases"
+FAST_FLOAT_INC="$BUILD_DIR/_deps/fast_float-src/include"
+EFFECT_INCS=("${IBEX_INCS[@]}")
+if [[ -d "$FAST_FLOAT_INC" ]]; then
+    EFFECT_INCS+=("-isystem" "$FAST_FLOAT_INC")
+fi
+if [[ -d "$EFFECT_CASES_DIR" ]]; then
+    for case_file in "$EFFECT_CASES_DIR"/*.ibex; do
+        [[ -e "$case_file" ]] || break
+        name="$(basename "${case_file%.ibex}")"
+        if [[ -n "${PARITY_CASE:-}" && "$name" != "$PARITY_CASE" ]]; then
+            continue
+        fi
+        cpp_file="$TMPDIR_WORK/effect_$name.cpp"
+        bin_file="$TMPDIR_WORK/effect_$name.bin"
+        if ! "$IBEX_COMPILE" "$case_file" --import-path "$BUILD_DIR/tools" -o "$cpp_file" \
+            2>"$TMPDIR_WORK/effect_$name.compile.err"; then
+            echo "parity: effect case $name does not transpile —" >&2
+            sed 's/^/    /' "$TMPDIR_WORK/effect_$name.compile.err" >&2
+            fail=1
+            continue
+        fi
+        "$CXX" "${EXTRA_CXXFLAGS[@]}" -std="$CXX_STD_FLAG" "${EFFECT_INCS[@]}" "$cpp_file" \
+            "${IBEX_LIBS[@]}" "${EXTRA_LDFLAGS[@]}" -o "$bin_file"
+        rm -f /tmp/ibex_parity_"$name"*.csv
+        if ! "$bin_file" >"$TMPDIR_WORK/effect_$name.compiled.out" 2>&1; then
+            echo "parity mismatch: effect case $name — the transpiled program failed:" >&2
+            sed 's/^/    /' "$TMPDIR_WORK/effect_$name.compiled.out" >&2
+            fail=1
+            rm -f /tmp/ibex_parity_"$name"*.csv
+            continue
+        fi
+        rm -f /tmp/ibex_parity_"$name"*.csv
+        if ! "$IBEX_EVAL" "$case_file" --plugin-path "$BUILD_DIR/tools" \
+            >"$TMPDIR_WORK/effect_$name.interp.out" 2>&1; then
+            echo "parity: effect case $name — the interpreter failed:" >&2
+            sed 's/^/    /' "$TMPDIR_WORK/effect_$name.interp.out" >&2
+            fail=1
+            rm -f /tmp/ibex_parity_"$name"*.csv
+            continue
+        fi
+        rm -f /tmp/ibex_parity_"$name"*.csv
+        # The interpreter also prints each effect statement's own value (a sink's
+        # row count); the final table, from its `rows:` line on, is the result.
+        for side in interp compiled; do
+            sed -n '/^rows: /,$p' "$TMPDIR_WORK/effect_$name.$side.out" \
+                >"$TMPDIR_WORK/effect_$name.$side.table"
+        done
+        if ! diff -u "$TMPDIR_WORK/effect_$name.interp.table" "$TMPDIR_WORK/effect_$name.compiled.table"; then
+            echo "parity mismatch: effect case $name (interpreted vs transpiled)" >&2
+            fail=1
+        else
+            echo "parity ok: effect case $name"
+        fi
+    done
+fi
+
 # Orphan markers (no matching case) are almost always a rename left half-done.
 for marker in "$CASES_DIR"/*.unsupported; do
     [[ -e "$marker" ]] || break

@@ -8003,6 +8003,99 @@ TEST_CASE("nullable fixed-width writes return parallel range validity", "[update
     CHECK(stats.parallel_fields.load() >= 3);
 }
 
+TEST_CASE("fill_null and coalesce match a naive reference over adopted validity and ranges",
+          "[update][parallel]") {
+    // The planned fill_null / coalesce writer resolves each operand's data
+    // pointer and bitmap base once and indexes by output offset. Held to a
+    // naive per-row reference, over an adopted bitmap at a bit offset (it breaks
+    // if the offset is dropped or applied twice), a range that does not start
+    // at row 0 (grain 65 splits the table), a column that is entirely valid,
+    // and a row no operand covers.
+    constexpr std::size_t kRows = 1000;
+    constexpr std::size_t kOffset = 5;
+    const auto a_valid = [](std::size_t row) { return row % 3 != 0 && row % 17 != 4; };
+    const auto b_valid = [](std::size_t row) { return row % 5 != 0 && row % 3 == 0; };
+
+    const auto adopt = [&](auto valid) {
+        auto bytes = std::make_shared<std::vector<std::uint8_t>>((kOffset + kRows + 7) / 8, 0);
+        for (std::size_t row = 0; row < kRows; ++row) {
+            if (valid(row)) {
+                (*bytes)[(kOffset + row) / 8] |=
+                    static_cast<std::uint8_t>(1U << ((kOffset + row) % 8));
+            }
+        }
+        return runtime::ValidityBitmap::from_external(bytes, bytes->data(), kOffset, kRows);
+    };
+
+    Column<double> a;
+    Column<double> b;
+    Column<double> c;
+    for (std::size_t row = 0; row < kRows; ++row) {
+        a.push_back(static_cast<double>(row));
+        b.push_back(1000.5 + static_cast<double>(row));
+        c.push_back(5000.25 + static_cast<double>(row));
+    }
+    runtime::Table input;
+    input.add_column("a", std::move(a));
+    input.add_column("b", std::move(b));
+    input.add_column("c", std::move(c));
+    input.columns[0].validity = adopt(a_valid);
+    input.columns[1].validity = adopt(b_valid);
+    REQUIRE(input.columns[0].validity->is_external());
+
+    const auto col = [](std::string name) {
+        return ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = std::move(name)}});
+    };
+    ir::CallExpr fill{
+        .callee = "fill_null",
+        .args = {col("a"), ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = -1.5}})},
+        .named_args = {}};
+    ir::CallExpr both{.callee = "coalesce", .args = {col("a"), col("b")}, .named_args = {}};
+    ir::CallExpr three{
+        .callee = "coalesce", .args = {col("a"), col("b"), col("c")}, .named_args = {}};
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "filled", .expr = ir::Expr{.node = std::move(fill)}},
+        {.alias = "ab", .expr = ir::Expr{.node = std::move(both)}},
+        {.alias = "abc", .expr = ir::Expr{.node = std::move(three)}}};
+
+    for (const bool parallel : {false, true}) {
+        runtime::ExecutionContext exec;
+        exec.parallel_threads = parallel ? 4 : 1;
+        exec.parallel_grain = 65;
+        exec.parallel_min_rows = 0;
+        exec.parallel_min_cells = 0;
+        auto out = runtime::update_table(runtime::Table{input}, fields, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        const auto column_of = [&](std::string name) -> const Column<double>& {
+            const auto* values = std::get_if<Column<double>>(out->find(name));
+            REQUIRE(values != nullptr);
+            return *values;
+        };
+        const auto& filled = column_of("filled");
+        const auto& ab = column_of("ab");
+        const auto& abc = column_of("abc");
+        const auto* ab_entry = out->find_entry("ab");
+        REQUIRE(ab_entry != nullptr);
+        for (std::size_t row = 0; row < kRows; ++row) {
+            INFO((parallel ? "parallel" : "serial") << " row " << row);
+            CHECK(filled[row] == (a_valid(row) ? static_cast<double>(row) : -1.5));
+            const bool ab_valid = a_valid(row) || b_valid(row);
+            CHECK(runtime::is_null(*ab_entry, row) == !ab_valid);
+            if (ab_valid) {
+                CHECK(ab[row] == (a_valid(row) ? static_cast<double>(row)
+                                               : 1000.5 + static_cast<double>(row)));
+            }
+            // `c` has no bitmap, so a row neither `a` nor `b` covers falls to it.
+            CHECK(abc[row] == (a_valid(row)   ? static_cast<double>(row)
+                               : b_valid(row) ? 1000.5 + static_cast<double>(row)
+                                              : 5000.25 + static_cast<double>(row)));
+        }
+        const auto* abc_entry = out->find_entry("abc");
+        REQUIRE(abc_entry != nullptr);
+        CHECK_FALSE(abc_entry->validity.has_value());
+    }
+}
+
 TEST_CASE("categorical CASE and coalesce use planned dictionary remaps", "[update][parallel]") {
     constexpr std::size_t kRows = 4096;
     Column<Categorical> a({"B", "A"});

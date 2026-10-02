@@ -1831,10 +1831,57 @@ class Lowerer {
         }
     }
 
+    /// A table sink call as a ScriptSink, shared by `sink(df, ...);` and
+    /// `let n = sink(df, ...);` (which binds the sink's scalar result).
+    auto lower_sink_call(const CallExpr& call, std::size_t position,
+                         std::optional<std::string> bind) -> std::expected<ScriptSink, LowerError> {
+        if (call.args.empty() || !call.named_args.empty()) {
+            return std::unexpected(LowerError{
+                .message = call.callee + ": table sink requires a positional table argument and "
+                                         "does not yet support named arguments"});
+        }
+        auto input = lower_expr(*call.args.front());
+        if (!input.has_value()) {
+            return std::unexpected(input.error());
+        }
+        std::vector<ir::Expr> args;
+        args.reserve(call.args.size() - 1);
+        for (std::size_t i = 1; i < call.args.size(); ++i) {
+            auto arg = lower_expr_to_ir(*call.args[i]);
+            if (!arg.has_value()) {
+                return std::unexpected(arg.error());
+            }
+            args.push_back(std::move(arg.value()));
+        }
+        return ScriptSink{
+            .callee = call.callee,
+            .input = std::move(input.value()),
+            .args = std::move(args),
+            .input_binding =
+                std::get_if<IdentifierExpr>(&call.args.front()->node)
+                    ? std::optional<std::string>{std::get<IdentifierExpr>(call.args.front()->node)
+                                                     .name}
+                    : std::nullopt,
+            .bind = std::move(bind),
+            .position = position};
+    }
+
+    /// True when `expr` is a call of an `extern fn` that returns a scalar: not a
+    /// table reader, not a `fn` (which shadows an extern of the same name).
+    [[nodiscard]] auto is_scalar_extern_call(const Expr& expr) const -> const CallExpr* {
+        const auto* call = std::get_if<CallExpr>(&expr.node);
+        if (call == nullptr || !extern_decls_.contains(call->callee) ||
+            functions_.contains(call->callee) || table_externs_.contains(call->callee)) {
+            return nullptr;
+        }
+        return call;
+    }
+
     auto lower_script(const Program& program) -> ScriptPlanResult {
         ir::NodePtr last_expr;
         std::vector<ir::NodePtr> preamble_calls;
         std::vector<std::size_t> preamble_positions;
+        std::vector<std::optional<std::string>> preamble_binds;
         std::vector<ScriptSink> sinks;
         share_repeated_bindings_ = true;
         for (const auto& stmt : program.statements) {
@@ -1879,6 +1926,17 @@ class Lowerer {
             const auto& stmt = program.statements[i];
             if (const auto* let_stmt = std::get_if<LetStmt>(&stmt)) {
                 value = let_stmt->value.get();
+                // `let n = sink(df, ...)` is a sink too: it writes where it sits.
+                if (const auto* call = std::get_if<CallExpr>(&value->node);
+                    call != nullptr && sink_externs_.contains(call->callee) &&
+                    !functions_.contains(call->callee)) {
+                    sink_effects.emplace_back(i, extern_effects(call->callee));
+                    if (!call->args.empty()) {
+                        if (const auto* ident = std::get_if<IdentifierExpr>(&call->args[0]->node)) {
+                            note_consumer(ident->name, i);
+                        }
+                    }
+                }
             } else if (const auto* tuple_let = std::get_if<TupleLetStmt>(&stmt)) {
                 value = tuple_let->value.get();
             } else if (const auto* expr_stmt = std::get_if<ExprStmt>(&stmt)) {
@@ -1968,6 +2026,40 @@ class Lowerer {
                         // into ir::DeferredScalarBinding; nothing to lower here.
                         continue;
                     }
+                    // `let n = f(...)` with `f` an extern: the call is an effect
+                    // that must run where the statement is, and its result is a
+                    // scalar later statements read. Dropping it as an "accepted
+                    // scalar" would never call `f`.
+                    if (const auto* call = is_scalar_extern_call(*let_stmt.value)) {
+                        if (sink_externs_.contains(call->callee)) {
+                            auto sink = lower_sink_call(*call, position, let_stmt.name);
+                            if (!sink.has_value()) {
+                                return std::unexpected(sink.error());
+                            }
+                            sinks.push_back(std::move(*sink));
+                            continue;
+                        }
+                        if (!call->named_args.empty()) {
+                            return std::unexpected(LowerError{
+                                .message = call->callee +
+                                           ": `let` of an extern call does not yet support "
+                                           "named arguments"});
+                        }
+                        std::vector<ir::Expr> args;
+                        args.reserve(call->args.size());
+                        for (const auto& arg : call->args) {
+                            auto lowered_arg = lower_expr_to_ir(*arg);
+                            if (!lowered_arg.has_value()) {
+                                return std::unexpected(lowered_arg.error());
+                            }
+                            args.push_back(std::move(*lowered_arg));
+                        }
+                        preamble_calls.push_back(
+                            builder_.extern_call(call->callee, std::move(args)));
+                        preamble_positions.push_back(position);
+                        preamble_binds.emplace_back(let_stmt.name);
+                        continue;
+                    }
                     auto scalar = lower_expr_to_ir(*let_stmt.value);
                     if (!scalar.has_value()) {
                         if (infer_compile_time_list(*let_stmt.value).has_value()) {
@@ -2018,36 +2110,11 @@ class Lowerer {
                 const auto& expr_stmt = std::get<ExprStmt>(stmt);
                 if (const auto* call = std::get_if<CallExpr>(&expr_stmt.expr->node);
                     call != nullptr && sink_externs_.contains(call->callee)) {
-                    if (call->args.empty() || !call->named_args.empty()) {
-                        return std::unexpected(LowerError{
-                            .message = call->callee +
-                                       ": table sink requires a positional table argument and "
-                                       "does not yet support named arguments"});
+                    auto sink = lower_sink_call(*call, position, std::nullopt);
+                    if (!sink.has_value()) {
+                        return std::unexpected(sink.error());
                     }
-                    auto input = lower_expr(*call->args.front());
-                    if (!input.has_value()) {
-                        return std::unexpected(input.error());
-                    }
-                    std::vector<ir::Expr> args;
-                    args.reserve(call->args.size() - 1);
-                    for (std::size_t i = 1; i < call->args.size(); ++i) {
-                        auto arg = lower_expr_to_ir(*call->args[i]);
-                        if (!arg.has_value()) {
-                            return std::unexpected(arg.error());
-                        }
-                        args.push_back(std::move(arg.value()));
-                    }
-                    sinks.push_back(ScriptSink{
-                        .callee = call->callee,
-                        .input = std::move(input.value()),
-                        .args = std::move(args),
-                        .input_binding =
-                            std::get_if<IdentifierExpr>(&call->args.front()->node)
-                                ? std::optional<std::string>{std::get<IdentifierExpr>(
-                                                                 call->args.front()->node)
-                                                                 .name}
-                                : std::nullopt,
-                        .position = position});
+                    sinks.push_back(std::move(*sink));
                     continue;
                 }
                 auto value = lower_expr(*expr_stmt.expr);
@@ -2075,6 +2142,7 @@ class Lowerer {
                             preamble_calls.push_back(
                                 builder_.extern_call(call->callee, std::move(args)));
                             preamble_positions.push_back(position);
+                            preamble_binds.emplace_back(std::nullopt);
                             continue;
                         }
                     }
@@ -2089,6 +2157,7 @@ class Lowerer {
         return ScriptPlan{
             .preamble = std::move(preamble_calls),
             .preamble_positions = std::move(preamble_positions),
+            .preamble_binds = std::move(preamble_binds),
             .shared_bindings = std::move(shared_bindings_),
             .sinks = std::move(sinks),
             .result = std::move(last_expr),
@@ -2112,6 +2181,11 @@ class Lowerer {
         if (!plan->sinks.empty()) {
             return std::unexpected(
                 LowerError{.message = "table-consuming extern calls require lower_script()"});
+        }
+        if (std::ranges::any_of(plan->preamble_binds,
+                                [](const auto& bind) { return bind.has_value(); })) {
+            return std::unexpected(
+                LowerError{.message = "`let` of an extern call's result requires lower_script()"});
         }
         if (auto err = inline_shared_bindings(*plan); err.has_value()) {
             return std::unexpected(*err);

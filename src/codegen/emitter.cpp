@@ -126,6 +126,18 @@ void Emitter::emit(std::ostream& out, const Script& script, const Config& config
         return text;
     };
 
+    // `callee(args)` run for its effect. A bound call stores its result as a
+    // scalar the later steps read through the registry; an unbound one drops it.
+    const auto emit_effect_call = [&](const std::optional<std::string>& bind,
+                                      const std::string& callee, const std::string& args) {
+        if (bind.has_value()) {
+            out << "    _ibex_scalars[\"" << escape_string(*bind)
+                << "\"] = ibex::runtime::ScalarValue(" << callee << "(" << args << "));\n";
+        } else {
+            out << "    (void)" << callee << "(" << args << ");\n";
+        }
+    };
+
     for (const auto& step : script.steps) {
         switch (step.kind) {
             case Script::Step::Kind::SharedBinding: {
@@ -152,8 +164,8 @@ void Emitter::emit(std::ostream& out, const Script& script, const Config& config
                         sink_inputs[*step.input_binding] = input;
                     }
                 }
-                out << "    (void)" << step.callee << "("
-                    << emit_call_args(step.args, /*leading_comma=*/true, input) << ");\n";
+                emit_effect_call(step.bind, step.callee,
+                                 emit_call_args(step.args, /*leading_comma=*/true, input));
                 break;
             }
             case Script::Step::Kind::Call: {
@@ -161,8 +173,15 @@ void Emitter::emit(std::ostream& out, const Script& script, const Config& config
                     throw std::runtime_error("ibex_compile: a call step needs an ExternCall node");
                 }
                 const auto& call = ir::node_cast<ir::ExternCallNode>(*step.plan);
-                out << "    (void)" << call.callee() << "("
-                    << emit_call_args(call.args(), /*leading_comma=*/false, "") << ");\n";
+                emit_effect_call(step.bind, call.callee(),
+                                 emit_call_args(call.args(), /*leading_comma=*/false, ""));
+                break;
+            }
+            case Script::Step::Kind::DeferredScalar: {
+                if (step.deferred == nullptr) {
+                    throw std::runtime_error("ibex_compile: deferred step has no binding");
+                }
+                emit_deferred_scalar(*step.deferred);
                 break;
             }
         }
@@ -199,6 +218,9 @@ void Emitter::emit_header(std::ostream& out, const Config& config) {
     runtime_scalar_names_.clear();
     for (const auto& binding : config.deferred_scalar_bindings) {
         runtime_scalar_names_.insert(binding.name);
+    }
+    for (const auto& name : config.runtime_scalar_names) {
+        runtime_scalar_names_.insert(name);
     }
 
     // Preamble
@@ -240,8 +262,9 @@ void Emitter::emit_header(std::ostream& out, const Config& config) {
         out << "int main() {\n";
     }
 
-    const bool has_scalars =
-        !config.scalar_bindings.empty() || !config.deferred_scalar_bindings.empty();
+    const bool has_scalars = !config.scalar_bindings.empty() ||
+                             !config.deferred_scalar_bindings.empty() ||
+                             !config.runtime_scalar_names.empty();
     if (has_scalars) {
         out << "    ibex::runtime::ScalarRegistry _ibex_scalars;\n";
         for (const auto& [name, value] : config.scalar_bindings) {
@@ -280,22 +303,27 @@ void Emitter::emit_header(std::ostream& out, const Config& config) {
         // residual expression against the registry. Same order and semantics as
         // runtime::materialize_deferred_scalar_bindings.
         for (const auto& binding : config.deferred_scalar_bindings) {
-            for (const auto& source : binding.sources) {
-                out << "    {\n";
-                auto src_var = emit_node(*source.plan);
-                out << "        _ibex_scalars[\"" << escape_string(source.tmp_name)
-                    << "\"] = ibex::ops::scalar_of_table(" << src_var << ", \""
-                    << escape_string(source.column.value_or("")) << "\", "
-                    << (source.column.has_value() ? "false" : "true") << ");\n";
-                out << "    }\n";
-            }
-            out << "    _ibex_scalars[\"" << escape_string(binding.name)
-                << "\"] = ibex::ops::eval_scalar(" << emit_expr(binding.value) << ");\n";
+            emit_deferred_scalar(binding);
         }
         if (!config.deferred_scalar_bindings.empty()) {
             out << "\n";
         }
     }
+}
+
+void Emitter::emit_deferred_scalar(const ir::DeferredScalarBinding& binding) {
+    auto& out = *out_;
+    for (const auto& source : binding.sources) {
+        out << "    {\n";
+        auto src_var = emit_node(*source.plan);
+        out << "        _ibex_scalars[\"" << escape_string(source.tmp_name)
+            << "\"] = ibex::ops::scalar_of_table(" << src_var << ", \""
+            << escape_string(source.column.value_or("")) << "\", "
+            << (source.column.has_value() ? "false" : "true") << ");\n";
+        out << "    }\n";
+    }
+    out << "    _ibex_scalars[\"" << escape_string(binding.name) << "\"] = ibex::ops::eval_scalar("
+        << emit_expr(binding.value) << ");\n";
 }
 
 void Emitter::emit_query(std::ostream& out, const ir::Node& root, const Config& config) {

@@ -594,6 +594,60 @@ b;
     CHECK(lowered->preamble_positions[1] == 5);
 }
 
+TEST_CASE("lower_script binds the result of a sink and of a scalar extern call",
+          "[parser][lower]") {
+    auto program = require_parse(R"(
+extern fn write(df: DataFrame, path: String) -> Int from "writer.hpp";
+extern fn ping(n: Int) -> Int effects { io_write } from "x.hpp";
+let rows = write(t, "out");
+let pong = ping(rows);
+ping(2);
+t[filter a > rows];
+)");
+
+    auto lowered = parser::lower_script(program);
+    REQUIRE(lowered.has_value());
+    REQUIRE(lowered->sinks.size() == 1);
+    CHECK(lowered->sinks[0].callee == "write");
+    CHECK(lowered->sinks[0].bind == std::optional<std::string>{"rows"});
+    CHECK(lowered->sinks[0].position == 2);
+    REQUIRE(lowered->preamble.size() == 2);
+    REQUIRE(lowered->preamble_binds.size() == 2);
+    CHECK(lowered->preamble_binds[0] == std::optional<std::string>{"pong"});
+    CHECK(lowered->preamble_positions[0] == 3);
+    // An unbound call statement binds nothing.
+    CHECK_FALSE(lowered->preamble_binds[1].has_value());
+}
+
+TEST_CASE("lower() refuses a let that binds an extern call's result", "[parser][lower]") {
+    // The single-plan path would drop the call, so the name would be unbound.
+    auto program = require_parse(R"(
+extern fn ping(n: Int) -> Int effects { io_write } from "x.hpp";
+let pong = ping(1);
+t[filter a > pong];
+)");
+    auto lowered = parser::lower(program);
+    REQUIRE_FALSE(lowered.has_value());
+    CHECK(lowered.error().message.find("lower_script") != std::string::npos);
+}
+
+TEST_CASE("lower_script treats a bound sink as a sink when ordering reads", "[parser][lower]") {
+    // `let n = write(...)` rewrites the file `r` reads, so `r` must be read
+    // before it just as it would be for a bare `write(...);`.
+    auto program = require_parse(R"(
+extern fn read(path: String) -> DataFrame from "reader.hpp";
+extern fn write(df: DataFrame, path: String) -> Int from "writer.hpp";
+let r = read("f")[select { total = sum(x) }];
+let fresh = read("g");
+let n = write(fresh, "f");
+r;
+)");
+    auto lowered = parser::lower_script(program);
+    REQUIRE(lowered.has_value());
+    REQUIRE(lowered->shared_bindings.size() == 1);
+    CHECK(lowered->shared_bindings[0].name == "r");
+}
+
 TEST_CASE("lower_script keeps a cheap repeated binding inlined", "[parser][lower]") {
     // A scan/filter chain is cheap to re-run and inlining preserves each
     // consumer's own selection pushdown, so it is not shared.

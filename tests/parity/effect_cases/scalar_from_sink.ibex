@@ -1,0 +1,7 @@
+// `let n = write_csv(...)` binds the row count the write returns. A later query
+// reads that scalar, and reads back the file the write produced.
+import "csv";
+let src = Table { x = [3, 1, 2, 5] };
+let n = write_csv(src, "/tmp/ibex_parity_scalar_from_sink.csv");
+let back = read_csv("/tmp/ibex_parity_scalar_from_sink.csv");
+back[filter x < n];

@@ -150,12 +150,15 @@ int main(int argc, char* argv[]) {
     }
 
     // Lower to IR. A script whose statements have effects (a table sink such as
-    // `write_csv(df, path);`) cannot be one query plus constants: it is lowered
-    // as a whole script and emitted in statement order. Everything else keeps
-    // the single-plan path.
+    // `write_csv(df, path);`, or `let n = f(...);` binding an extern's result)
+    // cannot be one query plus constants: it is lowered as a whole script and
+    // emitted in statement order. Everything else keeps the single-plan path.
     std::optional<ibex::parser::ScriptPlan> script_plan;
     if (auto scripted = ibex::parser::lower_script(*program);
-        scripted.has_value() && !scripted->sinks.empty()) {
+        scripted.has_value() &&
+        (!scripted->sinks.empty() ||
+         std::ranges::any_of(scripted->preamble_binds,
+                             [](const auto& bind) { return bind.has_value(); }))) {
         script_plan = std::move(*scripted);
     }
     ibex::parser::LowerResult ir = ibex::ir::NodePtr{};
@@ -176,7 +179,17 @@ int main(int argc, char* argv[]) {
     config.bench_warmup = bench_warmup;
     config.bench_iters = bench_iters;
     config.scalar_bindings = std::move(scalar_bindings->compile_time);
-    config.deferred_scalar_bindings = std::move(scalar_bindings->deferred);
+    if (script_plan.has_value()) {
+        // The script orders its deferred scalars itself, among its other steps.
+        for (const auto& binding : scalar_bindings->deferred) {
+            config.runtime_scalar_names.push_back(binding.name);
+        }
+    } else {
+        config.deferred_scalar_bindings = std::move(scalar_bindings->deferred);
+    }
+    for (const auto& name : scalar_bindings->extern_calls) {
+        config.runtime_scalar_names.push_back(name);
+    }
     {
         robin_hood::unordered_set<std::string> seen_headers;
         for (const auto& stmt : program->statements) {
@@ -224,6 +237,9 @@ int main(int argc, char* argv[]) {
         ibex::codegen::Emitter::Script::Step step;
         step.kind = ibex::codegen::Emitter::Script::Step::Kind::Call;
         step.plan = script_plan->preamble[i].get();
+        if (i < script_plan->preamble_binds.size()) {
+            step.bind = script_plan->preamble_binds[i];
+        }
         ordered.emplace_back(script_plan->preamble_positions.at(i), std::move(step));
     }
     for (const auto& shared : script_plan->shared_bindings) {
@@ -240,7 +256,14 @@ int main(int argc, char* argv[]) {
         step.plan = sink.input.get();
         step.args = std::move(sink.args);
         step.input_binding = sink.input_binding;
+        step.bind = sink.bind;
         ordered.emplace_back(sink.position, std::move(step));
+    }
+    for (std::size_t i = 0; i < scalar_bindings->deferred.size(); ++i) {
+        ibex::codegen::Emitter::Script::Step step;
+        step.kind = ibex::codegen::Emitter::Script::Step::Kind::DeferredScalar;
+        step.deferred = &scalar_bindings->deferred[i];
+        ordered.emplace_back(scalar_bindings->deferred_positions.at(i), std::move(step));
     }
     std::ranges::stable_sort(ordered, {},
                              &std::pair<std::size_t, ibex::codegen::Emitter::Script::Step>::first);

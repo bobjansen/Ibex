@@ -428,27 +428,30 @@ emitter is its only consumer:
 
 ### W6a — sinks and extern scalars (no resources)
 
-**Status (2026-10-02): sinks and scalar-call statements done; `let n = f(...)`
-not yet.** `ibex_compile` lowers a script that has a table sink with
-`lower_script` and emits it with `Emitter::Script` (`emit(out, Script, config)`):
-steps in statement order, `Scan` of a shared binding resolved to the table its
-step built, a `write(x, ...); x;` result served from the sink's input. Scripts
-without a sink keep the single-plan path. `ScriptPlan` carries the statement
-position of preamble calls too (`preamble_positions`). Parity: three cases in
-`tests/parity/effect_cases/` run the transpiled program and the interpreter and
-compare the final table; the two ordering cases fail if shared bindings are
-emitted first. Not done: `let n = f(...)` (scalar from an extern call), and the
-deferred-scalar `let`s, which still run before every step.
+**Status (2026-10-02): W6a done.** `ibex_compile` lowers a script that has a
+table sink, or a `let n = f(...)` binding an extern's result, with `lower_script`
+and emits it with `Emitter::Script` (`emit(out, Script, config)`): steps in
+statement order, `Scan` of a shared binding resolved to the table its step built,
+a `write(x, ...); x;` result served from the sink's input, a bound call stored in
+the scalar registry where it runs (`_ibex_scalars["n"] = ScalarValue(f(...))`) so
+later queries and extern arguments read it, and `scalar(<table>)` lets run at
+their own statement instead of before every step. Scripts with none of these keep
+the single-plan path. `ScriptPlan` carries the statement position of preamble
+calls (`preamble_positions`) and the name each call's result binds
+(`preamble_binds`, `ScriptSink::bind`); `ScalarBindingSet` carries the position of
+each deferred scalar and the names bound to extern calls.
 
-`ibex_compile` lowers with `lower_script` and emits the ordered `ScriptPlan`
-from W6-0, in order: shared bindings (materialized once, into a named C++
-variable a `Scan` of that name resolves to — the emitter's `ScanNode` case
-throws today), sinks, result. A `let` whose value is an extern call returning
-a scalar emits a C++ local and registers it in `_ibex_scalars`, so later query
-expressions see it, as the deferred-scalar path already does for table
-subplans. The emitter follows the plan; it does not decide order. Parity cases:
-`write_csv` mid-script, `let n = write_csv(...)` used in a later filter, a read
-of a file after the `write_csv` that produces it.
+Guards: the whole-script batch executor declines a script that binds an extern
+call's result (it has no step for it, and planning it would never call the
+function); `lower()` refuses one. Before this, `lower_script` accepted such a
+`let` as a scalar and dropped the call.
+
+Parity: four cases in `tests/parity/effect_cases/` run the transpiled program and
+the interpreter and compare the final table; the two ordering cases fail if shared
+bindings are emitted first. Not covered by a parity case: a bound call of a
+non-sink extern (no bundled one returns a scalar without a resource) -- it has
+lowering and emitter unit tests only. Named arguments in a `let` of an extern
+call are refused for now.
 
 ### W6b — ADBC as a linkable library
 

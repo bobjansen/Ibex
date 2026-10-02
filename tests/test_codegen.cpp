@@ -942,3 +942,86 @@ TEST_CASE("emitter: a scan of a shared binding resolves to the step that built i
     CHECK(contains(out, "auto t0 = read_csv(\"in.csv\")"));
     CHECK(contains(out, "ibex::ops::print(t0)"));
 }
+
+TEST_CASE("emitter: a bound sink and a bound call store their results as scalars", "[codegen]") {
+    ir::Builder b;
+    auto input = make_source(b, "in.csv");
+    auto call = b.extern_call("ping", {ir::Expr{ir::Literal{std::int64_t{7}}}});
+    auto result = make_source(b, "out.csv");
+
+    codegen::Emitter::Script script;
+    codegen::Emitter::Script::Step sink;
+    sink.kind = codegen::Emitter::Script::Step::Kind::Sink;
+    sink.callee = "write_csv";
+    sink.plan = input.get();
+    sink.args.emplace_back(ir::Literal{std::string("copy.csv")});
+    sink.bind = "rows";
+    script.steps.push_back(std::move(sink));
+    codegen::Emitter::Script::Step ping;
+    ping.kind = codegen::Emitter::Script::Step::Kind::Call;
+    ping.plan = call.get();
+    ping.bind = "pong";
+    script.steps.push_back(std::move(ping));
+    script.result = result.get();
+
+    codegen::Emitter::Config config;
+    config.runtime_scalar_names = {"rows", "pong"};
+    std::ostringstream oss;
+    codegen::Emitter emitter;
+    emitter.emit(oss, script, config);
+    const auto out = oss.str();
+
+    // The registry exists, and each call's result lands in it, in step order.
+    const auto registry = out.find("ibex::runtime::ScalarRegistry _ibex_scalars;");
+    const auto rows = out.find(
+        "_ibex_scalars[\"rows\"] = ibex::runtime::ScalarValue(write_csv(t0, "
+        "\"copy.csv\"))");
+    const auto pong = out.find("_ibex_scalars[\"pong\"] = ibex::runtime::ScalarValue(ping(");
+    REQUIRE(registry != std::string::npos);
+    REQUIRE(rows != std::string::npos);
+    REQUIRE(pong != std::string::npos);
+    CHECK(registry < rows);
+    CHECK(rows < pong);
+}
+
+TEST_CASE("emitter: a deferred scalar step runs where it is, not before the other steps",
+          "[codegen]") {
+    ir::Builder b;
+    auto first = make_source(b, "first.csv");
+    auto second = make_source(b, "second.csv");
+    auto deferred_plan = make_source(b, "scalar_source.csv");
+    auto result = make_source(b, "out.csv");
+
+    ir::DeferredScalarBinding binding;
+    binding.name = "k";
+    binding.sources.push_back(ir::DeferredScalarSource{
+        .tmp_name = "__ibex_scalar_src_0", .plan = std::move(deferred_plan), .column = "v"});
+    binding.value = ir::Expr{.node = ir::ColumnRef{.name = "__ibex_scalar_src_0", .lexical = true}};
+
+    codegen::Emitter::Script script;
+    codegen::Emitter::Script::Step sink;
+    sink.kind = codegen::Emitter::Script::Step::Kind::Sink;
+    sink.callee = "write_csv";
+    sink.plan = first.get();
+    sink.args.emplace_back(ir::Literal{std::string("rewritten.csv")});
+    script.steps.push_back(std::move(sink));
+    codegen::Emitter::Script::Step step;
+    step.kind = codegen::Emitter::Script::Step::Kind::DeferredScalar;
+    step.deferred = &binding;
+    script.steps.push_back(std::move(step));
+    script.result = second.get();
+
+    codegen::Emitter::Config config;
+    config.runtime_scalar_names = {"k"};
+    std::ostringstream oss;
+    codegen::Emitter emitter;
+    emitter.emit(oss, script, config);
+    const auto out = oss.str();
+
+    const auto write = out.find("write_csv(t0, \"rewritten.csv\")");
+    const auto scalar_read = out.find("read_csv(\"scalar_source.csv\")");
+    REQUIRE(write != std::string::npos);
+    REQUIRE(scalar_read != std::string::npos);
+    CHECK(write < scalar_read);
+    CHECK(contains(out, "_ibex_scalars[\"k\"] = ibex::ops::eval_scalar("));
+}

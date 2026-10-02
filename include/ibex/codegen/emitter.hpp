@@ -44,6 +44,11 @@ class Emitter {
         /// subplans run and the value is extracted into the registry at run
         /// time, in order, after `scalar_bindings` and before the query.
         std::vector<ir::DeferredScalarBinding> deferred_scalar_bindings;
+        /// Scalars a Script's steps set at run time (`let n = f(...)`, and the
+        /// deferred `scalar(<table>)` lets it orders itself): their names, so a
+        /// bare reference in an extern-call argument resolves through the
+        /// registry, and the registry itself is emitted.
+        std::vector<std::string> runtime_scalar_names;
         /// Whether to emit ibex::ops::print() for the final result.
         bool print_result = true;
         /// Emit a self-contained benchmark harness: data is loaded once
@@ -74,9 +79,12 @@ class Emitter {
                 SharedBinding,
                 /// Run `plan`, then `callee(<that table>, args...)`.
                 Sink,
-                /// `plan`, an ExternCall node, run for its effect with its
-                /// result discarded.
+                /// `plan`, an ExternCall node, run for its effect; its result
+                /// is bound to `bind` when set and discarded otherwise.
                 Call,
+                /// A `let n = scalar(<table>)` binding, evaluated here rather
+                /// than before every other step.
+                DeferredScalar,
             };
             Kind kind = Kind::Call;
             std::string name;
@@ -87,6 +95,10 @@ class Emitter {
             /// Sink only: the binding the source passed as the table, so a
             /// later `result` naming it reuses the table rather than rerunning.
             std::optional<std::string> input_binding;
+            /// Sink and Call: the scalar the call's result is bound to.
+            std::optional<std::string> bind;
+            /// DeferredScalar only; borrowed.
+            const ir::DeferredScalarBinding* deferred = nullptr;
         };
         std::vector<Step> steps;
         const ir::Node* result = nullptr;
@@ -129,6 +141,10 @@ class Emitter {
     /// Everything before the query: includes, `main`/entry-point opening, and
     /// the scalar registry. `emit_footer` closes what this opens.
     void emit_header(std::ostream& out, const Config& config);
+    /// Run a deferred scalar's subplans, extract each, then evaluate the
+    /// residual expression: the same order and semantics as
+    /// runtime::materialize_deferred_scalar_bindings.
+    void emit_deferred_scalar(const ir::DeferredScalarBinding& binding);
     void emit_query(std::ostream& out, const ir::Node& root, const Config& config);
     void emit_footer(std::ostream& out, const Config& config);
 

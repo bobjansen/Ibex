@@ -2308,6 +2308,28 @@ t[select { c = count() }];
               "planner: statements (`let n` binds the result of an extern call)");
     }
 
+    SECTION("a script that ends in an effect") {
+        // `lower_script` lets a program end in an effect (a compiled program may);
+        // the batch executor has no result plan to run, so it stays on the
+        // statement path.
+        ibex::runtime::ExternRegistry registry;
+        register_recording_lazy_source(registry, decode_calls);
+        registry.register_scalar_table_consumer(
+            "count_rows", ibex::runtime::ScalarKind::Int,
+            [](const ibex::runtime::Table& t, const ibex::runtime::ExternArgs&)
+                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                return ibex::runtime::ExternValue{static_cast<std::int64_t>(t.rows())};
+            });
+        const std::string source = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+extern fn count_rows(df: DataFrame) -> Int from "fake.hpp";
+let t = read_fake();
+count_rows(t);
+)";
+        CHECK(capture_planner_line(source, registry) ==
+              "planner: statements (script ends in an effect, with no result plan)");
+    }
+
     SECTION("a non-DataFrame type annotation") {
         ibex::runtime::ExternRegistry registry;
         register_recording_lazy_source(registry, decode_calls);

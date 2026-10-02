@@ -102,15 +102,18 @@ void Emitter::emit(std::ostream& out, const Script& script, const Config& config
         throw std::runtime_error(
             "ibex_compile: a script with effects cannot be a benchmark harness");
     }
-    if (script.result == nullptr) {
-        throw std::runtime_error("ibex_compile: script has no result plan");
-    }
     emit_header(out, config, &script);
 
     named_tables_.clear();
     resource_vars_.clear();
     const std::string result_var = emit_script_steps(script);
-    if (config.table_entry_point) {
+    if (result_var.empty()) {
+        // The script ends in an effect (`adbc_close(db);`): there is no table to
+        // print or return.
+        if (config.table_entry_point) {
+            out << "    return ibex::runtime::Table{};\n";
+        }
+    } else if (config.table_entry_point) {
         out << "    return " << result_var << ";\n";
     } else if (config.print_result) {
         out << "    ibex::ops::print(" << result_var << ");\n";
@@ -261,7 +264,7 @@ auto Emitter::emit_script_steps(const Script& script) -> std::string {
             result_var = named->second;
         }
     }
-    if (result_var.empty()) {
+    if (result_var.empty() && script.result != nullptr) {
         result_var = emit_node(*script.result);
     }
     return result_var;

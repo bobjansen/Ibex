@@ -2305,7 +2305,12 @@ class Lowerer {
         if (pending_unbind.has_value()) {
             resource_steps_.push_back(std::move(*pending_unbind));
         }
-        if (!last_expr && return_call_ == nullptr && !return_expr_.has_value()) {
+        // A program that ends in an effect (`adbc_close(db);`) has no table to
+        // give: that is fine when it did something, and an error when it did not.
+        const bool did_something = !sinks.empty() || !preamble_calls_.empty() ||
+                                   !shared_bindings_.empty() || !resource_steps_.empty();
+        if (!last_expr && return_call_ == nullptr && !return_expr_.has_value() &&
+            !(function_ == nullptr && did_something)) {
             return std::unexpected(LowerError{.message = "no expression to lower"});
         }
         return ScriptPlan{
@@ -2393,6 +2398,11 @@ class Lowerer {
         if (!plan->sinks.empty()) {
             return std::unexpected(
                 LowerError{.message = "table-consuming extern calls require lower_script()"});
+        }
+        if (plan->result == nullptr) {
+            // `lower_script` lets a program end in an effect; a single plan needs
+            // a table to be.
+            return std::unexpected(LowerError{.message = "no expression to lower"});
         }
         if (!plan->resource_steps.empty() ||
             std::ranges::any_of(plan->preamble_binds,
@@ -6551,6 +6561,10 @@ auto lower_script(const Program& program, const ir::SourceSchemas& reader_schema
         sink.input = ir::reduce_inner_joins_to_semi(std::move(sink.input), source_schemas);
         sink.input =
             ir::optimize_plan(std::move(sink.input), optimization_context, &optimization_stats);
+    }
+    if (lowered->result == nullptr) {
+        // A program that ends in an effect has no result plan to check.
+        return lowered;
     }
     if (auto err = ir::check_column_refs(*lowered->result, source_schemas)) {
         return std::unexpected(LowerError{.message = *err});

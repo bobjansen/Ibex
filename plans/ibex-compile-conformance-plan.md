@@ -528,6 +528,11 @@ pinned binding like any call of a resource function. Parity: `adbc_function_tabl
 `adbc_function_connection`, `adbc_function_scope` (a function's connection is
 released at the return, so its open transaction cannot lock the table).
 
+A program may now end in an effect (`adbc_close(db);`, as `examples/adbc_connection.ibex`
+does): `lower_script` gives no result plan, the compiled program prints nothing for
+it, and `lower()` and the REPL's batch executor decline. `scripts/ibex-e2e.sh`
+builds and runs a connection-and-function program with `ibex-build.sh`.
+
 Not done, and refused with a message: a scalar `let` in a function body (scalar
 bindings are collected for the program, not per function), a value that is none of
 the forms above, a Decimal or column parameter, a function reading the program's

@@ -35,6 +35,9 @@ struct ScriptSink {
     /// Set when the source syntax passed a simple `let` binding to the sink.
     /// The batch executor uses this to avoid evaluating the final result twice.
     std::optional<std::string> input_binding;
+    /// Set for `let n = sink(df, ...);`: the name the sink's scalar result is
+    /// bound to. The batch executor does not bind it, so it declines such scripts.
+    std::optional<std::string> bind;
     /// Index of the sink's statement in the program. Sinks and shared bindings
     /// run in `position` order, so a binding that reads a file never moves
     /// above an earlier statement that writes it.
@@ -64,6 +67,9 @@ struct ScriptPlan {
     /// it; one that runs the script in order interleaves the calls with the
     /// sinks and shared bindings by this index.
     std::vector<std::size_t> preamble_positions;
+    /// Parallel to `preamble`: the name a call's scalar result is bound to
+    /// (`let n = f(...);`), if any.
+    std::vector<std::optional<std::string>> preamble_binds;
     std::vector<SharedBinding> shared_bindings;
     std::vector<ScriptSink> sinks;
     ir::NodePtr result;

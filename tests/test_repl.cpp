@@ -2285,6 +2285,29 @@ read_fake()[select { n = count() }];
         CHECK(capture_planner_line(source, registry) == "planner: whole-script");
     }
 
+    SECTION("a let that binds an extern call's result") {
+        // The plan has no step for `let n = f(...)`: planning it would skip the
+        // call and leave `n` unbound, so it stays on the statement path, which
+        // runs the call where the statement is.
+        ibex::runtime::ExternRegistry registry;
+        register_recording_lazy_source(registry, decode_calls);
+        registry.register_scalar_table_consumer(
+            "count_rows", ibex::runtime::ScalarKind::Int,
+            [](const ibex::runtime::Table& t, const ibex::runtime::ExternArgs&)
+                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                return ibex::runtime::ExternValue{static_cast<std::int64_t>(t.rows())};
+            });
+        const std::string source = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+extern fn count_rows(df: DataFrame) -> Int from "fake.hpp";
+let t = read_fake();
+let n = count_rows(t);
+t[select { c = count() }];
+)";
+        CHECK(capture_planner_line(source, registry) ==
+              "planner: statements (`let n` binds the result of an extern call)");
+    }
+
     SECTION("a non-DataFrame type annotation") {
         ibex::runtime::ExternRegistry registry;
         register_recording_lazy_source(registry, decode_calls);

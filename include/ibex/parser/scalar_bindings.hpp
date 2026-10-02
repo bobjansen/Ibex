@@ -153,6 +153,15 @@ using ScalarValue = std::variant<std::monostate, std::int64_t, double, bool, std
 struct ScalarBindingSet {
     std::vector<std::pair<std::string, ScalarValue>> compile_time;
     std::vector<ir::DeferredScalarBinding> deferred;
+    /// Statement index of each `deferred` binding, parallel to it. A consumer
+    /// that runs the script in order runs the binding there; one that evaluates
+    /// all of them up front (the single-plan path) ignores it.
+    std::vector<std::size_t> deferred_positions;
+    /// `let n = f(...)` where `f` is an `extern fn` returning a scalar: the call
+    /// runs at its statement and its result is the scalar `n`. Not evaluated here
+    /// -- `lower_script` lowers the call -- so only the names are recorded, for a
+    /// consumer to know they are runtime scalars.
+    std::vector<std::string> extern_calls;
 };
 
 [[nodiscard]] inline auto is_scalar_cast_name(std::string_view callee) -> bool {
@@ -284,6 +293,8 @@ struct DeferredWrap {
     int deferred_counter = 0;
 
     LowerContext lower_ctx;
+    // Externs that return a scalar, by name.
+    robin_hood::unordered_set<std::string> scalar_externs;
 
     const auto collect_declaration = [&](const Stmt& stmt) {
         if (const auto* ext = std::get_if<ExternDecl>(&stmt)) {
@@ -291,6 +302,8 @@ struct DeferredWrap {
                 ext->return_type.kind == Type::Kind::TimeFrame) {
                 lower_ctx.table_externs.insert(ext->name);
                 lower_ctx.table_extern_decls.insert_or_assign(ext->name, ext);
+            } else {
+                scalar_externs.insert(ext->name);
             }
             if (!ext->params.empty() && ext->params[0].type.kind == Type::Kind::DataFrame) {
                 lower_ctx.sink_externs.insert(ext->name);
@@ -305,7 +318,8 @@ struct DeferredWrap {
         }
     }
 
-    for (const auto& stmt : program.statements) {
+    for (std::size_t position = 0; position < program.statements.size(); ++position) {
+        const auto& stmt = program.statements[position];
         if (std::holds_alternative<ExternDecl>(stmt)) {
             collect_declaration(stmt);
             continue;
@@ -355,6 +369,17 @@ struct DeferredWrap {
                 return std::unexpected(deferred->error());
             }
             out.deferred.push_back(std::move(deferred->value()));
+            out.deferred_positions.push_back(position);
+            lower_ctx.lexical_names.insert(let_stmt->name);
+            continue;
+        }
+
+        // `let n = f(...)` with an extern `f` (a `fn` of the same name shadows
+        // it): a runtime scalar, produced by the call.
+        if (const auto* call = std::get_if<CallExpr>(&let_stmt->value->node);
+            call != nullptr && scalar_externs.contains(call->callee) &&
+            !lower_ctx.functions.contains(call->callee)) {
+            out.extern_calls.push_back(let_stmt->name);
             lower_ctx.lexical_names.insert(let_stmt->name);
             continue;
         }

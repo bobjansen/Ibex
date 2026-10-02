@@ -6345,6 +6345,14 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             ibex::formatting::format("scalar bindings did not lower: {}", scalar_bindings.error()));
     }
 
+    // `let n = f(...)` calls an extern for its result at its statement, in order
+    // with the sinks; the plan has no step for it, and skipping it would never
+    // call `f` and leave `n` unbound.
+    if (!scalar_bindings->extern_calls.empty()) {
+        return decline(ibex::formatting::format("`let {}` binds the result of an extern call",
+                                                scalar_bindings->extern_calls.front()));
+    }
+
     // A deferred scalar whose own subquery opens a lazy reader would have to
     // instantiate that reader before the whole-script planner has resolved its
     // sources. Keep this circular shape on the statement path until source

@@ -120,7 +120,7 @@
         <tr><td><code>adbc_connect(driver, uri, options)</code></td><td>Open a connection. <code>driver</code> and <code>options</code> work as for <code>adbc_read</code>; <code>stmt.</code> options apply to every query on the connection.</td></tr>
         <tr><td><code>adbc_query(db, sql, params)</code></td><td>Run SQL on the connection and return the result as a table.</td></tr>
         <tr><td><code>adbc_execute(db, sql, params)</code></td><td>Run a statement that returns no rows (DDL, <code>insert</code>, <code>update</code>, <code>delete</code>). Returns the affected-row count, or <code>-1</code> when the driver reports none.</td></tr>
-        <tr><td><code>params</code></td><td>Optional. A table whose columns bind, by position, to the statement's placeholders in the driver's syntax (<code>?</code> for SQLite and MySQL, <code>$1</code> for PostgreSQL). The statement is prepared once and runs once per row: a query's results follow one another in row order, and <code>adbc_execute</code> returns the summed count. A table with no rows runs nothing. SQLite rejects a column count that does not match the placeholders; PostgreSQL ignores extra columns. DuckDB's driver takes one row only: a table of several is refused.</td></tr>
+        <tr><td><code>params</code></td><td>Optional. A table whose columns bind, by position, to the statement's placeholders in the driver's syntax (<code>?</code> for SQLite and MySQL, <code>$1</code> for PostgreSQL). The statement is prepared once and runs once per row: a query's results follow one another in row order, and <code>adbc_execute</code> returns the summed count. A table with no rows runs nothing. SQLite rejects a column count that does not match the placeholders; PostgreSQL ignores extra columns. DuckDB's driver binds one row per execution, so there Ibex runs the rows one by one itself, with the same result.</td></tr>
         <tr><td><code>adbc_write(db, df, table, mode)</code></td><td>Bulk-insert <code>df</code> into <code>table</code> and return the rows written. <code>mode</code>: <code>create</code> (default; the table must not exist), <code>append</code>, <code>replace</code> or <code>create_append</code>. <code>df</code> is any table expression, but a connection call in it must be bound with <code>let</code> first.</td></tr>
         <tr><td><code>adbc_tables(db)</code></td><td>The tables and views the connection sees: one row each, with <code>catalog</code>, <code>schema</code>, <code>table</code> and <code>type</code>. See <a href="#discovery">Discovery</a>.</td></tr>
         <tr><td><code>adbc_table_schema(db, table, schema, catalog)</code></td><td>One row per column of <code>table</code>, without running your query: <code>column</code>, <code>arrow_type</code>, <code>ibex_type</code>, <code>nullable</code> and <code>reason</code>. An empty <code>schema</code> or <code>catalog</code> (the default) means the driver's default.</td></tr>
@@ -264,6 +264,13 @@
         </p>
       </article>
     </div>
+    <p>
+      MySQL commits the open transaction whenever it creates, alters or drops
+      a table, and goes on in autocommit. Ibex cannot see that in SQL passed
+      to <code>adbc_execute</code>, so keep DDL out of a MySQL transaction;
+      <code>adbc_write</code> refuses its <code>create</code>,
+      <code>replace</code> and <code>create_append</code> modes there.
+    </p>
   </section>
 
   <section class="section">

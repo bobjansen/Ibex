@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
-// Walking an AdbcConnectionGetObjects result. Header-only, so this runs in
+// Walking AdbcConnectionGetObjects and GetInfo results. Header-only, so this runs in
 // every build, including those without an ADBC driver manager. The SQLite and
 // PostgreSQL drivers only produce arrays with offset 0; the batches here have
 // offsets at every level that can carry one.
@@ -18,6 +18,7 @@
 namespace {
 
 using ibex::adbc::ObjectRow;
+using ibex::adbc::read_info_strings;
 using ibex::adbc::read_object_rows;
 
 /// Owns the nodes and buffers of a hand-built Arrow array, which only borrow.
@@ -51,6 +52,29 @@ class Builder {
             bits = &bitmaps_.emplace_back(*validity);
         }
         return node(name, "+l", offset, length, {bits, stored.data()}, {values});
+    }
+
+    /// A uint32 array over `values`, all valid.
+    auto uint32s(const char* name, std::vector<std::uint32_t> values, std::int64_t offset,
+                 std::int64_t length) -> Node {
+        auto& stored = uint32s_.emplace_back(std::move(values));
+        return node(name, "I", offset, length, {nullptr, stored.data()}, {});
+    }
+
+    /// An int64 array over `values`, all valid.
+    auto int64s(const char* name, std::vector<std::int64_t> values) -> Node {
+        auto& stored = int64s_.emplace_back(std::move(values));
+        const auto length = static_cast<std::int64_t>(stored.size());
+        return node(name, "l", 0, length, {nullptr, stored.data()}, {});
+    }
+
+    /// A dense union of `children`; `format` lists their type ids.
+    auto dense_union(const char* name, const char* format, std::vector<std::int8_t> type_ids,
+                     std::vector<std::int32_t> offsets, std::int64_t offset, std::int64_t length,
+                     std::vector<Node> children) -> Node {
+        auto& ids = int8s_.emplace_back(std::move(type_ids));
+        auto& stored = int32s_.emplace_back(std::move(offsets));
+        return node(name, format, offset, length, {ids.data(), stored.data()}, std::move(children));
     }
 
     auto structure(const char* name, std::int64_t offset, std::int64_t length,
@@ -90,6 +114,9 @@ class Builder {
     std::deque<std::vector<::ArrowArray*>> child_arrays_;
     std::deque<std::vector<::ArrowSchema*>> child_schemas_;
     std::deque<std::vector<std::int32_t>> int32s_;
+    std::deque<std::vector<std::uint32_t>> uint32s_;
+    std::deque<std::vector<std::int64_t>> int64s_;
+    std::deque<std::vector<std::int8_t>> int8s_;
     std::deque<std::string> bytes_;
     std::deque<std::uint8_t> bitmaps_;
 };
@@ -156,4 +183,47 @@ TEST_CASE("A GetObjects batch of another layout is refused", "[adbc][discovery]"
     auto status = read_object_rows(*root.array, *root.schema, [](const ObjectRow&) {});
     REQUIRE_FALSE(status.has_value());
     CHECK(status.error() == "field `catalog_name` has unexpected type list<struct>");
+}
+
+namespace {
+
+using InfoEntry = std::pair<std::uint32_t, std::optional<std::string>>;
+
+auto read_info(const Builder::Node& root) -> std::vector<InfoEntry> {
+    std::vector<InfoEntry> entries;
+    auto status = read_info_strings(
+        *root.array, *root.schema, [&](std::uint32_t code, const std::optional<std::string>& text) {
+            entries.emplace_back(code, text);
+        });
+    INFO((status ? std::string{} : status.error()));
+    REQUIRE(status.has_value());
+    return entries;
+}
+
+}  // namespace
+
+TEST_CASE("GetInfo strings are read through the union", "[adbc][discovery]") {
+    Builder b;
+    // Type ids 3 (string_value) and 7 (int64_value), not the child indexes.
+    // The struct has offset 1, the union another 1: logical rows 0..2 are
+    // physical rows 2..4, of which the int64 one is skipped.
+    auto values = b.dense_union("info_value", "+ud:3,7", {0, 0, 3, 7, 3}, {0, 0, 1, 0, 0}, 1, 4,
+                                {b.utf8("string_value", {"junk", "duckdb", "v1.5.6"}, 1, 2),
+                                 b.int64s("int64_value", {42})});
+    auto root = b.structure("", 1, 3, {b.uint32s("info_name", {9, 0, 100, 101, 1}, 1, 4), values});
+    // Union offsets index the string child, whose own offset of 1 applies.
+    const auto entries = read_info(root);
+    REQUIRE(entries.size() == 2);
+    CHECK(entries[0] == InfoEntry{100, "v1.5.6"});
+    CHECK(entries[1] == InfoEntry{1, "duckdb"});
+}
+
+TEST_CASE("A GetInfo batch of another layout is refused", "[adbc][discovery]") {
+    Builder b;
+    auto root = b.structure("", 0, 1,
+                            {b.uint32s("info_name", {0}, 0, 1), b.utf8("info_value", {"x"}, 0, 1)});
+    auto status = read_info_strings(*root.array, *root.schema,
+                                    [](std::uint32_t, const std::optional<std::string>&) {});
+    REQUIRE_FALSE(status.has_value());
+    CHECK(status.error() == "field `info_value` has unexpected type utf8");
 }

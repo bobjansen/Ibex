@@ -1546,19 +1546,27 @@ TEST_CASE("adbc_connect against DuckDB", "[adbc][connection][duckdb]") {
         CHECK(ibex::runtime::decimal_type_of(*amounts).scale == 2);
         CHECK((*amounts)[1] == ibex::Decimal{-350});
 
-        // DuckDB binds one parameter row per execution; a table of several is
-        // refused (the SQLite and PostgreSQL drivers run each row).
-        const auto many = s.session.execute(
+        // DuckDB's driver binds one parameter row per execution, so the
+        // plugin runs the rows one by one, as the other drivers do.
+        const auto many = exec(
             "adbc_execute(db, \"insert into trades (id, symbol) values (?, ?)\", "
             "Table { id = [7, 8], symbol = [\"x\", null] });");
-        REQUIRE_FALSE(many.ok);
-        CHECK(contains(many.error, "Binding multiple rows at once is not supported"));
-        exec(
-            "adbc_execute(db, \"insert into trades (id, symbol) values (?, ?)\", "
-            "Table { id = [7], symbol = [\"x\"] });");
-        exec(
-            "adbc_execute(db, \"insert into trades (id, symbol) values (?, ?)\", "
-            "Table { id = [8, 9], symbol = [null, \"z\"] }[filter id == 8]);");
+        CHECK(std::get<std::int64_t>(*many.scalar) == 2);
+        CHECK(
+            std::get<std::int64_t>(*exec("adbc_execute(db, \"insert into trades (id) values (?)\", "
+                                         "Table { id = [9] }[filter id > 9]);")
+                                        .scalar) == 0);
+        // A query's results follow one another in row order; a row with none
+        // adds nothing.
+        const auto per_row = exec(
+            "adbc_query(db, \"select id * 10 as x, ? as tag from trades where id <= ? order by "
+            "id\", Table { tag = [\"p\", \"q\", \"r\"], upto = [7, 0, 8] });");
+        CHECK(ints(*per_row.table, "x") == std::vector<std::int64_t>{70, 70, 80});
+        CHECK(strings(*per_row.table, "tag") == std::vector<std::string>{"p", "r", "r"});
+        const auto none =
+            exec("adbc_query(db, \"select id from trades where id = ?\", Table { id = [1, 2] });");
+        CHECK(none.table->rows() == 0);
+        CHECK(none.table->find("id") != nullptr);
         exec("adbc_begin(db);");
         exec("adbc_execute(db, \"delete from trades\");");
         exec("adbc_rollback(db);");
@@ -1674,7 +1682,6 @@ TEST_CASE("adbc_connect against MySQL", "[adbc][connection][mysql]") {
               std::vector<std::string>{"NO", "YES", "NO"});
         exec("adbc_execute(db, \"drop table ibex_my_notes\");");
 
-        // Unlike DuckDB, the driver runs each parameter row.
         CHECK(std::get<std::int64_t>(
                   *exec("adbc_execute(db, \"insert into ibex_my_trades (id, symbol) values (?, "
                         "?)\", Table { id = [7, 8], symbol = [\"x\", null] });")
@@ -1704,6 +1711,51 @@ TEST_CASE("adbc_connect against MySQL", "[adbc][connection][mysql]") {
         REQUIRE_FALSE(commit.ok);
         CHECK(contains(commit.error, "nothing was committed"));
         CHECK(ids() == std::vector<std::int64_t>{7, 8});
+    }
+
+    SECTION("a failed write writes nothing") {
+        // The driver inserts in batches of 1000 rows; the date it cannot
+        // send is in the third. Outside a transaction the plugin opens one,
+        // so the first two batches do not stay.
+        exec(
+            "let rows = Table(2500)[update { n = seq(1) }]"
+            "[select { id = n, d = Date(n - Int64(n >= 2400) * 800000) }];");
+        const auto count = [&] {
+            return ints(*exec("adbc_query(other, \"select count(*) as n from ibex_my_w\");").table,
+                        "n")
+                .at(0);
+        };
+        exec("adbc_execute(db, \"drop table if exists ibex_my_w\");");
+        // CREATE TABLE ends a MySQL transaction, so the table comes first,
+        // empty, and only the rows are all or nothing.
+        const auto created = s.session.execute("adbc_write(db, rows, \"ibex_my_w\");");
+        REQUIRE_FALSE(created.ok);
+        CHECK(contains(created.error, "year is not in the range"));
+        CHECK(count() == 0);
+        for (const char* mode : {"append", "create_append", "replace"}) {
+            INFO(mode);
+            CHECK_FALSE(
+                s.session
+                    .execute(std::string("adbc_write(db, rows, \"ibex_my_w\", \"") + mode + "\");")
+                    .ok);
+            CHECK(count() == 0);
+        }
+        CHECK(std::get<std::int64_t>(
+                  *exec("adbc_write(db, rows[filter id <= 2000], \"ibex_my_w\", \"replace\");")
+                       .scalar) == 2000);
+        CHECK(count() == 2000);
+
+        // Inside adbc_begin a mode that creates a table would end the
+        // transaction, so it is refused; append stays in it.
+        exec("adbc_begin(db);");
+        const auto refused =
+            s.session.execute("adbc_write(db, rows[filter id == 1], \"ibex_my_w\", \"replace\");");
+        REQUIRE_FALSE(refused.ok);
+        CHECK(contains(refused.error, "inside adbc_begin only mode \"append\""));
+        exec("adbc_write(db, rows[filter id == 2001], \"ibex_my_w\", \"append\");");
+        exec("adbc_rollback(db);");
+        CHECK(count() == 2000);
+        exec("adbc_execute(db, \"drop table ibex_my_w\");");
     }
 
     exec("adbc_execute(other, \"drop table ibex_my_trades\");");

@@ -1,0 +1,4 @@
+// `where <predicate> update`: only the rows the predicate selects change. The
+// compiled path used to drop the guard and update every row.
+let t = Table { x = [1, 2, 3, 4], y = [10, 20, 30, 40] };
+t[where x > 2 update { y = 0, z = x * 2 }];

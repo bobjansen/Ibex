@@ -162,6 +162,10 @@ class Emitter {
     /// unbound name there is still a hard error.
     robin_hood::unordered_set<std::string> runtime_scalar_names_;
 
+    /// The C++ variable holding each fitted model a Script's steps bound, by name,
+    /// and the one the Model node just emitted declared.
+    robin_hood::unordered_map<std::string, std::string> model_vars_;
+    std::string last_model_;
     /// The C++ variable holding each resource a Script's steps bound, by the
     /// name the script knows it by. A name rebound gets a fresh variable; the
     /// old one is released.

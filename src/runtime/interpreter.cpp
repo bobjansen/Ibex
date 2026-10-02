@@ -772,6 +772,12 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     "window: only 'update' is currently supported inside a window block");
             }
             const auto& update_node = ir::node_cast<ir::UpdateNode>(child_node);
+            // Neither is applied by the windowed evaluators; dropping them quietly
+            // returned a table with the columns or rows the user asked for missing.
+            if (!update_node.tuple_fields().empty() || update_node.guard() != nullptr) {
+                return std::unexpected(
+                    "window: a window update does not support tuple fields or a `where` guard");
+            }
             // Evaluate the source (grandchild) without the window context.
             auto source =
                 interpret_node(*child_node.children().front(), registry, scalars, externs, exec);

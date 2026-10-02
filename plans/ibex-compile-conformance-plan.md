@@ -333,21 +333,43 @@ function-organised script compiling.
 
 ## W4 — `model { }` in codegen
 
-`src/codegen/emitter.cpp:860` throws. Model fitting needs the model registry +
-plugin dispatch at runtime; the `ops` layer would need `ibex::ops::model_fit` /
-`model_predict` wrappers over the same `ModelOps` the interpreter calls
-(`include/ibex/runtime/extern_registry.hpp` `ModelOps`). Scope: fit + the
-`model_*` accessors (`model_summary`, `model_predict`, `.r_squared`).
+**Status (2026-10-02): built-in methods done.** `let m = df[model { ... }]` is a
+fitted model of the program: a script binding at its statement (the plan's root is
+the Model node), emitted as `ibex::runtime::ModelResult _modelN;` and
+`ibex::ops::fit_model(table, ModelFormula{...}, "method", {params}, _modelN)`, which
+runs the interpreter's own Model evaluation, so a compiled fit is the interpreter's
+fit. `m` is also the coefficients table, as in the REPL. The accessors read the model
+by name: `coef` / `summary` / `fitted` / `residuals` / `importance` (a table: a call
+on the name, pinned where it is written so a refit under the same name does not change
+an earlier accessor) and `r_squared` (a scalar, a bound call), under either spelling,
+through the ops layer's `model_*` functions. `ibex_compile` takes the script path when
+a model is fitted; `lower()` and the batch executor decline it.
+
+Refused with a message: a model method from a plugin (`lightgbm`, `kmeans`, `pca`:
+the compiled program has no registry to load a plugin into -- built in are `ols`,
+`ridge`, `wls`), so `predict(m, newdata)` (plugin models only) has nothing to read; a
+model fitted inside a function. Parity (`effect_cases/`): `model_ols`,
+`model_accessors` (a refit under the same name; both fits' accessors and scalar),
+`model_wls`.
+
+Found on the way: the interpreter's `summary(m)` reports p-values outside [0, 1]
+(`1.6`, `3.8e-243` for t = 33 at 3 degrees of freedom). Compiled and interpreted
+agree because they are one code path; the p-value computation itself is wrong.
 
 ---
 
 ## W5 — window / resample edge combos
 
-`emitter.cpp:509/513/518`: `window + select`, `aligned` window, windowed
-`update` with tuple fields. The interpreter supports these; the emitter
-rejects. `plans/count-window-plan.md` records that per-construct codegen parity
-has been chased one combo at a time — W5 is finishing that list. Lower priority
-(narrow shapes).
+**Status (2026-10-02): done, and a wrong answer fixed.** `window + select` and
+`aligned` windows emit through `ibex::ops::window_update(..., select_only, aligned)`
+(parity: `window_select`, `window_aligned`); the plain `window + update` keeps its
+short form. A windowed update with tuple fields is not an emitter gap: the interpreter
+dropped the tuple's columns silently, so it now rejects it, and so does the compiler,
+with the same message (a `where` guard on a window update likewise).
+
+The same pass found `where <predicate> update { ... }` compiled WITHOUT its guard --
+every row was updated -- since `UpdateNode::guard()` was never read by the emitter. It
+now emits `ibex::ops::update_where` (parity: `update_where`).
 
 ## W6 — effects and resources in compiled programs (ADBC)
 

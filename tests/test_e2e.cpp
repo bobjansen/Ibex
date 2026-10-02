@@ -3430,3 +3430,32 @@ TEST_CASE("partitioned group discovery matches the serial groups on string keys"
     REQUIRE(serial.rows() == 40'009);
     require_tables_equal(serial, parallel);
 }
+
+TEST_CASE("E2E: a window update rejects tuple fields and a where guard instead of dropping them",
+          "[e2e][window]") {
+    // Both used to be ignored by the windowed evaluators: the query "succeeded"
+    // with the tuple's columns missing, or with the guard not applied.
+    auto tables = make_grouped_window_table(8, 2);
+    const auto run = [&](const char* src) {
+        auto parsed = parser::parse(src);
+        REQUIRE(parsed.has_value());
+        auto lowered = parser::lower(*parsed);
+        REQUIRE(lowered.has_value());
+        return runtime::interpret(*lowered.value(), tables, nullptr, nullptr);
+    };
+
+    auto tuple =
+        run("t[window 2s, update { m = rolling_sum(price), (u, v) = Table { u = [1, 2, 3, 4, 5, 6, "
+            "7, 8], v = [1, 2, 3, 4, 5, 6, 7, 8] } }];");
+    REQUIRE_FALSE(tuple.has_value());
+    CHECK(tuple.error().find("tuple fields") != std::string::npos);
+
+    auto guarded = run("t[window 2s, where price > 10.0 update { m = rolling_sum(price) }];");
+    if (guarded.has_value()) {
+        // The parser may not accept this combination at all; if it does, the
+        // guard must not be dropped silently.
+        FAIL("a guarded window update ran");
+    } else {
+        CHECK(guarded.error().find("where") != std::string::npos);
+    }
+}

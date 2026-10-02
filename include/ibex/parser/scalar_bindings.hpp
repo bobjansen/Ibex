@@ -12,6 +12,7 @@
 // are interchangeable with both without conversion).
 
 #include <ibex/core/time.hpp>
+#include <ibex/ir/model_accessors.hpp>
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
@@ -361,6 +362,18 @@ struct DeferredWrap {
             resource_functions.contains(fn_call->callee)) {
             const auto kind = lower_ctx.functions.at(fn_call->callee)->return_type.kind;
             if (kind != Type::Kind::DataFrame && kind != Type::Kind::TimeFrame) {
+                out.extern_calls.push_back(let_stmt->name);
+            }
+            lower_ctx.lexical_names.insert(let_stmt->name);
+            continue;
+        }
+
+        // `let c = coef(m)` / `let r = r_squared(m)`: read off a fitted model, in
+        // order with the statements that fit it; lowered by the script, not here.
+        if (const auto* accessor = std::get_if<CallExpr>(&let_stmt->value->node);
+            accessor != nullptr && (ir::is_model_table_accessor(accessor->callee) ||
+                                    ir::is_model_scalar_accessor(accessor->callee))) {
+            if (ir::is_model_scalar_accessor(accessor->callee)) {
                 out.extern_calls.push_back(let_stmt->name);
             }
             lower_ctx.lexical_names.insert(let_stmt->name);

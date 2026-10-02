@@ -192,6 +192,14 @@ void forward_cli_args(int argc, char** argv);
                           const std::vector<TupleSource>& tuple_sources,
                           const std::vector<std::string>& group_by) -> runtime::Table;
 
+/// `where <guard> update { ... }`: the update applies only to rows where `guard`
+/// is true; the others keep their values. `tuple_sources` and `group_by` are as
+/// in `update` above.
+[[nodiscard]] auto update_where(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields,
+                                const std::vector<TupleSource>& tuple_sources,
+                                const std::vector<std::string>& group_by, ir::Expr guard)
+    -> runtime::Table;
+
 [[nodiscard]] auto rename(const runtime::Table& t, const std::vector<ir::RenameSpec>& renames)
     -> runtime::Table;
 
@@ -211,6 +219,14 @@ void forward_cli_args(int argc, char** argv);
 [[nodiscard]] auto windowed_update(const runtime::Table& t, ir::Duration duration,
                                    const std::vector<ir::FieldSpec>& fields,
                                    const std::vector<std::string>& group_by = {}) -> runtime::Table;
+
+/// A `window` clause with its `select` form (rolling aggregates projected to the
+/// time index, keys and the fields) and `aligned` grid windows. `windowed_update`
+/// above is the common `window + update`.
+[[nodiscard]] auto window_update(const runtime::Table& t, ir::Duration duration,
+                                 const std::vector<ir::FieldSpec>& fields,
+                                 const std::vector<std::string>& group_by, bool select_only,
+                                 bool aligned) -> runtime::Table;
 
 [[nodiscard]] auto melt(const runtime::Table& t, const std::vector<std::string>& id_cols,
                         const std::vector<std::string>& measure_cols) -> runtime::Table;
@@ -239,6 +255,13 @@ void forward_cli_args(int argc, char** argv);
 /// Row-bind: vertically concatenate operands sharing the same column schema
 /// (matched by name and type). Output carries the first operand's column order.
 [[nodiscard]] auto rbind(const std::vector<runtime::Table>& tables) -> runtime::Table;
+
+/// Fit `formula` by `method` on `t` (built-in methods only: no plugin registry is
+/// available in a compiled program). The fitted model goes in `out`; the returned
+/// table is what the `model` clause evaluates to (the coefficients).
+[[nodiscard]] auto fit_model(const runtime::Table& t, ir::ModelFormula formula, std::string method,
+                             std::vector<ir::ModelParamSpec> params, runtime::ModelResult& out)
+    -> runtime::Table;
 
 /// Model accessor functions — extract sub-tables from a ModelResult.
 [[nodiscard]] auto model_coef(const runtime::ModelResult& m) -> runtime::Table;

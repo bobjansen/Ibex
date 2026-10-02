@@ -1,0 +1,9 @@
+// `window` + `select`: rolling aggregates projected to the time index, the group
+// keys and the listed fields, row-preserving.
+let t = Table {
+    sym = ["A", "A", "A", "B", "B", "B"],
+    ts = [0, 1000000000, 2000000000, 0, 1000000000, 2000000000],
+    px = [1.0, 2.0, 3.0, 10.0, 20.0, 30.0]
+};
+let tf = as_timeframe(t, "ts");
+tf[window 2s, select { m = rolling_mean(px), s = rolling_sum(px) }, by sym];

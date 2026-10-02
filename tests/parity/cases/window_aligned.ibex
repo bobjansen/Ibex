@@ -1,0 +1,8 @@
+// `aligned` windows: reset on the epoch grid, so each row is the bar in progress.
+let t = Table {
+    sym = ["A", "A", "A", "A", "B", "B"],
+    ts = [0, 1000000000, 2000000000, 3000000000, 0, 2500000000],
+    px = [1.0, 4.0, 2.0, 8.0, 10.0, 30.0]
+};
+let tf = as_timeframe(t, "ts");
+tf[select { open = first(px), high = max(px), close = last(px) }, by sym, window 2s aligned];

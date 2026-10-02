@@ -1928,3 +1928,121 @@ TEST_CASE("adbc_write and adbc_execute against PostgreSQL", "[adbc][write][postg
                    "column `t`: Arrow time64[us] has no Ibex column type; cast it "
                    "in the query, e.g. CAST(t AS TEXT)"));
 }
+
+// The same script against every driver that is configured: SQLite always,
+// PostgreSQL, DuckDB and MySQL when their variables are set (see the tests
+// above). Each section is a promise the docs make for all drivers; where a
+// driver departs from it, the plugin works around it (see DriverQuirks in
+// libs/adbc/adbc.cpp), so a departure here is a bug, not a driver note.
+TEST_CASE("Every driver behaves alike", "[adbc][conformance]") {
+    struct Driver {
+        std::string name;
+        std::string driver;
+        std::string uri;
+        // The i-th (1-based) placeholder in the driver's syntax.
+        std::string (*placeholder)(int);
+    };
+    const auto question = [](int) { return std::string("?"); };
+    const auto dollar = [](int i) { return "$" + std::to_string(i); };
+    SqliteDb sqlite;
+    std::vector<Driver> drivers{{"SQLite", sqlite_driver(), sqlite.path(), question}};
+    if (auto uri = get_env("IBEX_TEST_POSTGRES_URI"); uri.has_value() && !uri->empty()) {
+        drivers.push_back({"PostgreSQL",
+                           get_env("IBEX_TEST_POSTGRES_DRIVER").value_or("postgresql"), *uri,
+                           dollar});
+    }
+    if (auto driver = get_env("IBEX_TEST_DUCKDB_DRIVER"); driver.has_value() && !driver->empty()) {
+        drivers.push_back({"DuckDB", *driver, "", question});
+    }
+    if (auto uri = get_env("IBEX_TEST_MYSQL_URI"); uri.has_value() && !uri->empty()) {
+        drivers.push_back(
+            {"MySQL", get_env("IBEX_TEST_MYSQL_DRIVER").value_or("mysql"), *uri, question});
+    }
+
+    for (const auto& d : drivers) {
+        DYNAMIC_SECTION(d.name) {
+            AdbcSession s;
+            const auto exec = [&](const std::string& source) {
+                auto result = s.session.execute(source);
+                INFO(source);
+                INFO(result.error);
+                REQUIRE(result.ok);
+                return result;
+            };
+            const auto int_of = [&](const std::string& source) {
+                const auto result = exec(source);
+                REQUIRE(result.scalar.has_value());
+                return std::get<std::int64_t>(*result.scalar);
+            };
+            const auto ids = [&] {
+                return ints(
+                    *exec("adbc_query(db, \"select id from ibex_conf order by id\");").table, "id");
+            };
+            exec("let db = adbc_connect(" + ibex_str(d.driver) + ", " + ibex_str(d.uri) + ");");
+            exec("adbc_execute(db, \"drop table if exists ibex_conf\");");
+            exec(
+                "adbc_execute(db, \"create table ibex_conf (id bigint primary key, s "
+                "varchar(20), x double precision)\");");
+
+            // Writes: nulls survive, and so does every value.
+            CHECK(int_of("adbc_write(db, Table { id = [1, 2, 3], s = [\"a\", null, \"c\"], "
+                         "x = [0.5, -1.0, 2.25] }, \"ibex_conf\", \"append\");") == 3);
+            const auto back =
+                exec("adbc_query(db, \"select id, s, x from ibex_conf order by id\");");
+            CHECK(ints(*back.table, "id") == std::vector<std::int64_t>{1, 2, 3});
+            CHECK(nulls(*back.table, "s") == std::vector<bool>{false, true, false});
+            CHECK(strings(*back.table, "s").at(2) == "c");
+            CHECK(doubles(*back.table, "x") == std::vector<double>{0.5, -1.0, 2.25});
+
+            // Discovery sees the table and its columns.
+            const auto tables = exec("adbc_tables(db)[filter table == \"ibex_conf\"];");
+            CHECK(tables.table->rows() == 1);
+            const auto schema = exec("adbc_table_schema(db, \"ibex_conf\");");
+            CHECK(strings(*schema.table, "column") == std::vector<std::string>{"id", "s", "x"});
+            CHECK(strings(*schema.table, "ibex_type") ==
+                  std::vector<std::string>{"Int64", "String", "Float64"});
+
+            // Parameters: one execution per row, counts adding up and query
+            // results following one another in row order.
+            CHECK(int_of("adbc_execute(db, \"insert into ibex_conf (id, s) values (" +
+                         d.placeholder(1) + ", " + d.placeholder(2) +
+                         ")\", Table { id = [4, 5], s = [\"d\", \"e\"] });") == 2);
+            const auto per_row =
+                exec("adbc_query(db, \"select id from ibex_conf where id >= " + d.placeholder(1) +
+                     " and id <= " + d.placeholder(2) +
+                     " order by id\", Table { lo = [4, 1, 9], hi = [5, 1, 9] });");
+            CHECK(ints(*per_row.table, "id") == std::vector<std::int64_t>{4, 5, 1});
+            CHECK(int_of("adbc_execute(db, \"delete from ibex_conf where id = " + d.placeholder(1) +
+                         "\", Table { id = [7] }[filter id > 7]);") == 0);
+            CHECK(ids() == std::vector<std::int64_t>{1, 2, 3, 4, 5});
+
+            // A failed write writes nothing, even after batches went through:
+            // the duplicate (id 1) is the last of 2500 rows.
+            const auto failed = s.session.execute(
+                "adbc_write(db, Table(2500)[update { n = seq(1) }][select { id = n % 2500 + 100, "
+                "s = \"w\", x = 0.0 }][update { id = Int64(id == 100) * -99 + id }], "
+                "\"ibex_conf\", \"append\");");
+            CHECK_FALSE(failed.ok);
+            CHECK(ids() == std::vector<std::int64_t>{1, 2, 3, 4, 5});
+
+            // Transactions: rollback discards; a failed statement makes the
+            // commit roll back and say so.
+            CHECK(int_of("adbc_begin(db);") == 1);
+            exec("adbc_execute(db, \"delete from ibex_conf\");");
+            CHECK(int_of("adbc_rollback(db);") == 1);
+            CHECK(ids() == std::vector<std::int64_t>{1, 2, 3, 4, 5});
+            exec("adbc_begin(db);");
+            exec("adbc_execute(db, \"insert into ibex_conf (id) values (6)\");");
+            CHECK_FALSE(
+                s.session.execute("adbc_execute(db, \"insert into ibex_conf (id) values (1)\");")
+                    .ok);
+            const auto commit = s.session.execute("adbc_commit(db);");
+            REQUIRE_FALSE(commit.ok);
+            CHECK(contains(commit.error, "nothing was committed"));
+            CHECK(ids() == std::vector<std::int64_t>{1, 2, 3, 4, 5});
+
+            exec("adbc_execute(db, \"drop table ibex_conf\");");
+            CHECK(int_of("adbc_close(db);") == 1);
+        }
+    }
+}

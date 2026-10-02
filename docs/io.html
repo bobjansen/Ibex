@@ -554,13 +554,14 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
           <code>create</code> (the table must not exist), <code>append</code>
           (it must), <code>replace</code> (drop and recreate) or
           <code>create_append</code>. A write that fails, say on a duplicate
-          key, writes no rows. MySQL's driver inserts in batches of 1000, so
-          there Ibex runs the rows in a transaction of their own; as MySQL
-          commits whenever it creates or drops a table, a failed
-          <code>create</code> or <code>replace</code> leaves the new table,
-          empty. For the same reason, inside <code>adbc_begin</code> MySQL
-          takes <code>append</code> only. DuckDB and MySQL append whole rows
-          only: <code>df</code> needs every column of an existing table.
+          key, writes no rows; DuckDB's driver drops the reason, so there the
+          error only says that the write failed. MySQL's driver inserts in
+          batches of 1000, so there Ibex runs the rows in a transaction of
+          their own; as MySQL commits whenever it creates or drops a table, a
+          failed <code>create</code> or <code>replace</code> leaves the new
+          table, empty. For the same reason, inside <code>adbc_begin</code>
+          MySQL takes <code>append</code> only. DuckDB and MySQL append whole
+          rows only: <code>df</code> needs every column of an existing table.
         </p>
 <pre><code><span class="kw">import</span> <span class="str">"adbc"</span>;
 <span class="kw">import</span> <span class="str">"csv"</span>;

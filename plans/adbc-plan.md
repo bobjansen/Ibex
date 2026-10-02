@@ -248,10 +248,22 @@ like a failed statement.
   nullable; table type `BASE TABLE`; ingest appends whole rows only (a
   DataFrame with fewer columns than the table is refused); a bound parameter
   table must have ONE row (`NOT_IMPLEMENTED` otherwise; the driver executes
-  per 1-row batch and keeps only the last result). OPEN DECISION: have the
-  plugin loop over parameter rows itself (prepare once, bind a 1-row slice,
-  execute, concatenate) so every driver behaves alike. Cost: SQLite would
-  infer result types per row, so the concatenation can disagree on types.
+  per 1-row batch and keeps only the last result). DECIDED 2026-10-02 (user:
+  driver-specific code for known issues): the plugin loops over parameter
+  rows on DuckDB only (`DriverQuirks` in `libs/adbc/adbc.cpp`, keyed on the
+  GetInfo vendor name).
+- **MySQL/MariaDB: done (2026-10-02).** Tested against MariaDB 11 (CI service
+  `mariadb:11`). First driver that reports NOT NULL. The driver commits an
+  ingest per 1000-row batch and turns autocommit off with START TRANSACTION,
+  which CREATE/DROP end: writes run in a plugin transaction after a zero-row
+  DDL ingest; create/replace/create_append are refused inside adbc_begin.
+- **Cross-driver conformance test (2026-10-02)**, `Every driver behaves
+  alike` in `tests/test_adbc.cpp`. Found two driver bugs, both worked around
+  as quirks and both worth reporting upstream: PostgreSQL leaves a COPY's last
+  result unread (ingest and query), so the BEGIN after it is skipped and the
+  transaction's first statement autocommits; DuckDB's ingest drops a failed
+  appender flush (e.g. duplicate key) and reports success with nothing
+  written.
 - **Next drivers (decided 2026-09-29): MySQL/MariaDB and DuckDB first.**
   Both are open source (MySQL: ADBC Driver Foundry, Apache-2.0, source in
   `adbc-drivers/mysql`; DuckDB: MIT, the driver is libduckdb itself, with a

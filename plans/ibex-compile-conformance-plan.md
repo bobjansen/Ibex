@@ -349,6 +349,70 @@ rejects. `plans/count-window-plan.md` records that per-construct codegen parity
 has been chased one combo at a time — W5 is finishing that list. Lower priority
 (narrow shapes).
 
+## W6 — effects and resources in compiled programs (ADBC)
+
+Added 2026-10-02. The promise is that a script that works in `ibex` can be
+productized with `ibex_compile`; for database scripts it does not hold yet.
+Measured on 2026-10-02:
+
+- `write_csv(a, "x.csv");` as a statement: "table-consuming extern calls
+  require lower_script()" — `ibex_compile` calls `lower()`, which takes one
+  result plan and no sinks.
+- `let n = write_csv(...);`: "unsupported scalar let" — a scalar that comes
+  from an extern call is neither a compile-time constant nor a deferred
+  table-subplan scalar.
+- Any resource (`extern type`, e.g. `AdbcConnection`): refused up front by
+  `first_resource_call` (`tools/ibex_compile.cpp`). Resources only exist on
+  surface 3; `lower_script` does not take them either.
+- `adbc_read` alone transpiles, but the generated code includes `adbc.hpp`,
+  which does not exist: the program fails in the C++ compiler. Every other
+  bundled plugin (csv, json, args, fs, data_gen, parquet) ships a header with a
+  C++ entry point per extern; ADBC was built as a plugin `.so` only.
+
+### W6a — sinks and extern scalars (no resources)
+
+`ibex_compile` lowers with `lower_script` and emits its `ScriptPlan` in order:
+preamble, shared bindings (materialized once, into a named C++ variable a
+`Scan` of that name resolves to — the emitter's `ScanNode` case throws today),
+sinks, result. A `let` whose value is an extern call returning a scalar emits a
+C++ local and registers it in `_ibex_scalars`, so later query expressions see
+it, as the deferred-scalar path already does for table subplans. Parity cases:
+`write_csv` mid-script, `let n = write_csv(...)` used in a later filter.
+
+### W6b — ADBC as a linkable library
+
+Split `libs/adbc/adbc.cpp` into `ibex_adbc` (static library: the session,
+statements, quirks, discovery, all of today's logic, with a C++ API in a new
+`libs/adbc/adbc.hpp`) and the plugin (`ExternArgs` ↔ C++ wrappers only). The
+C++ API mirrors the externs: `AdbcConnection` is a value type holding a
+`shared_ptr` to the session (copies alias, the last copy closes — the REPL's
+binding semantics for free); `adbc_query(AdbcConnection&, std::string,
+Table)`, etc. `adbc_read` is usable on its own after this slice (it needs no
+resource support). `scripts/ibex-build.sh` links `libibex_adbc.a` and the
+driver manager when the generated code includes `adbc.hpp`.
+
+### W6c — resources in the emitter
+
+The statement-ordered emit of W6a, extended to resource values:
+`let db = adbc_connect(...)` → `auto db = adbc_connect(...);`; a resource call
+as a statement or `let` value emits a C++ call in source order, its table
+result bound to a variable later plans `Scan`; rebinding a name (`let kept =
+0;`) emits a new scope or resets the handle so the old connection closes where
+the REPL closes it. A `fn` that takes, opens or returns a resource emits as a
+C++ function with a statement body (the REPL runs these on the statement path;
+they cannot be inlined into a plan). The resource checks the REPL applies
+(no resource call inside a query clause; placement validated before hoisting)
+must run in the compiler too — reuse `ResourceFunctions`, do not re-derive.
+
+### W6 verification
+
+Parity cases against SQLite (always available when ADBC is built):
+connect/execute/write/params/query+filter, transactions, a `fn` taking a
+connection, a returned connection, `adbc_close` through an alias. The parity
+runner needs the ADBC driver path in its environment; cases skip (marker) when
+ADBC is not built. A Release-build smoke in `scripts/ibex-e2e.sh`: compile an
+ADBC script with `ibex-build.sh` and run the binary.
+
 ---
 
 ## Sequencing
@@ -362,6 +426,8 @@ has been chased one combo at a time — W5 is finishing that list. Lower priorit
    and S2 (whole-script scalar extern args)~~ — **DONE**.
 5. ~~**W1b** (runtime extern-expr evaluator + shared `map` execution)~~ — **DONE**.
 6. **W4 / W5** — lower priority, independent.
+7. **W6** (2026-10-02, user priority: ADBC fully supported in compiled
+   programs) — W6a, then W6b (independent of W6a), then W6c.
 
 Each workstream is a landable unit and deletes its `.unsupported` markers.
 
@@ -412,6 +478,7 @@ Build `cmake --build build -j6` (`[[feedback_cap_build_parallelism]]`).
 | W3 | `src/repl/repl.cpp` (`try_execute_whole_script`), `tools/ibex_compile.cpp`, `src/parser/lower.cpp` (UDF inlining) | parity cases |
 | W4 | `src/codegen/emitter.cpp:860`, `src/runtime/ops.cpp`, `include/ibex/runtime/ops.hpp` | `tests/test_codegen.cpp` |
 | W5 | `src/codegen/emitter.cpp:509/513/518` | `tests/test_codegen.cpp`, `plans/count-window-plan.md` |
+| W6 | `tools/ibex_compile.cpp`, `src/codegen/emitter.cpp`, `libs/adbc/` (split), `scripts/ibex-build.sh` | `include/ibex/parser/resource_functions.hpp`, `tests/parity/`, `scripts/ibex-e2e.sh` |
 
 ## Related
 

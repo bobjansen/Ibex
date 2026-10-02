@@ -2649,8 +2649,26 @@ auto compute_grouped_ordered_column(const NativeGroupedOrderedCall& ordered,
     std::vector<std::uint8_t> invalid(rows, 0U);
     const auto write = [&]<typename T>(const Column<T>& values) -> ColumnValue {
         Column<T> result;
-        result.resize(rows);
-        const auto* source_validity = source.validity ? &*source.validity : nullptr;
+        // Every row is in exactly one CSR group and every kernel below writes
+        // every row of its group, so the output needs no zero-fill first.
+        result.resize_for_overwrite(rows);
+        // Resolve the input, output and bitmap storage once. Through
+        // `values[row]`, `result[row]` and `(*validity)[row]` each access tests
+        // for adopted Arrow storage and reloads its buffer pointer, and the
+        // stores to the output may alias what those read, so none of it hoists:
+        // that is the per-row cost of a gather that should be a load and a store.
+        const T* const in = values.data();
+        T* const out = result.data();
+        const std::uint8_t* const validity_bits =
+            source.validity ? source.validity->buffer_data() : nullptr;
+        const std::size_t validity_base = source.validity ? source.validity->buffer_offset() : 0;
+        const auto row_is_valid = [validity_bits, validity_base](std::size_t row) {
+            if (validity_bits == nullptr) {
+                return true;
+            }
+            const std::size_t bit = validity_base + row;
+            return ((validity_bits[bit >> 3] >> (bit & 7U)) & 1U) != 0U;
+        };
         const auto run_group = [&](std::size_t group) noexcept {
             const auto indices = group_rows[group];
             if (kind == NativeGroupedOrderedKind::Lag || kind == NativeGroupedOrderedKind::Lead) {
@@ -2660,12 +2678,12 @@ auto compute_grouped_ordered_column(const NativeGroupedOrderedCall& ordered,
                                                : local + offset < indices.size();
                     const std::size_t row = indices[local];
                     if (!in_bounds) {
-                        result[row] = T{};
+                        out[row] = T{};
                         invalid[row] = 1U;
                     } else {
                         const std::size_t source_local =
                             kind == NativeGroupedOrderedKind::Lag ? local - offset : local + offset;
-                        result[row] = values[indices[source_local]];
+                        out[row] = in[indices[source_local]];
                     }
                 }
                 return;
@@ -2675,11 +2693,11 @@ auto compute_grouped_ordered_column(const NativeGroupedOrderedCall& ordered,
                 T accumulator = kind == NativeGroupedOrderedKind::CumProd ? T{1} : T{};
                 for (const auto row : indices) {
                     if (kind == NativeGroupedOrderedKind::CumProd) {
-                        accumulator *= values[row];
+                        accumulator *= in[row];
                     } else {
-                        accumulator += values[row];
+                        accumulator += in[row];
                     }
-                    result[row] = accumulator;
+                    out[row] = accumulator;
                 }
                 return;
             }
@@ -2689,15 +2707,14 @@ auto compute_grouped_ordered_column(const NativeGroupedOrderedCall& ordered,
             for (std::size_t pos = 0; pos < indices.size(); ++pos) {
                 const std::size_t local = forward ? pos : indices.size() - 1 - pos;
                 const std::size_t row = indices[local];
-                const bool valid = source_validity == nullptr || (*source_validity)[row];
-                if (valid) {
-                    result[row] = values[row];
-                    carry = values[row];
+                if (row_is_valid(row)) {
+                    out[row] = in[row];
+                    carry = in[row];
                     have_carry = true;
                 } else if (have_carry) {
-                    result[row] = carry;
+                    out[row] = carry;
                 } else {
-                    result[row] = T{};
+                    out[row] = T{};
                     invalid[row] = 1U;
                 }
             }

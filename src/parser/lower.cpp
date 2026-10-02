@@ -1756,6 +1756,7 @@ class Lowerer {
     /// file it came from.
     auto collect_declaration(const Stmt& stmt) -> bool {
         if (const auto* ext = std::get_if<ExternDecl>(&stmt)) {
+            extern_decls_.insert_or_assign(ext->name, ext);
             // Track externs that return a table so lower_table_call can
             // produce ExternCallNodes for them.
             if (ext->return_type.kind == Type::Kind::DataFrame ||
@@ -1779,6 +1780,57 @@ class Lowerer {
         return std::holds_alternative<ExternTypeDecl>(stmt);
     }
 
+    /// What calling `callee` does, from its `effects` declaration. An extern
+    /// that declares none, or one this lowerer never saw, is assumed to do
+    /// everything: a missing annotation must not let a statement move.
+    [[nodiscard]] auto extern_effects(const std::string& callee) const -> ir::EffectSummary {
+        const auto it = extern_decls_.find(callee);
+        if (it == extern_decls_.end() || !it->second->effects.has_value()) {
+            ir::EffectSummary everything;
+            everything.mask = kEffAllCore;
+            everything.io_read_unscoped = true;
+            everything.io_write_unscoped = true;
+            return everything;
+        }
+        return to_ir_effect_summary(effect_summary_from_specs(it->second->effects));
+    }
+
+    /// The union of the effects of every extern `plan` calls when it runs. A
+    /// Scan reads a table that is already materialized, so it adds nothing.
+    void collect_plan_effects(const ir::Node& plan, ir::EffectSummary& into) const {
+        if (plan.kind() == ir::NodeKind::ExternCall) {
+            const auto effects = extern_effects(ir::node_cast<ir::ExternCallNode>(plan).callee());
+            into.mask |= effects.mask;
+            into.io_read_unscoped = into.io_read_unscoped || effects.io_read_unscoped;
+            into.io_write_unscoped = into.io_write_unscoped || effects.io_write_unscoped;
+            into.io_read_resources.insert(effects.io_read_resources.begin(),
+                                          effects.io_read_resources.end());
+            into.io_write_resources.insert(effects.io_write_resources.begin(),
+                                           effects.io_write_resources.end());
+        }
+        for (const auto& child : plan.children()) {
+            if (child != nullptr) {
+                collect_plan_effects(*child, into);
+            }
+        }
+        // The two node kinds that own a plan outside children(); see
+        // count_scans_of.
+        if (plan.kind() == ir::NodeKind::Construct) {
+            for (const auto& column : ir::node_cast<ir::ConstructNode>(plan).columns()) {
+                if (column.expr_node != nullptr) {
+                    collect_plan_effects(*column.expr_node, into);
+                }
+            }
+        }
+        if (plan.kind() == ir::NodeKind::Update) {
+            for (const auto& field : ir::node_cast<ir::UpdateNode>(plan).tuple_fields()) {
+                if (field.source != nullptr) {
+                    collect_plan_effects(*field.source, into);
+                }
+            }
+        }
+    }
+
     auto lower_script(const Program& program) -> ScriptPlanResult {
         ir::NodePtr last_expr;
         std::vector<ir::NodePtr> preamble_calls;
@@ -1799,6 +1851,78 @@ class Lowerer {
                 count_table_refs(*tuple_let->value, /*table_position=*/true, table_ref_counts_);
             }
         }
+        // Where each effectful sink sits, and where each name is first read, so
+        // a `let` that reads an external source is not left to run after a
+        // statement that conflicts with it (see `must_run_before_sinks`).
+        std::vector<std::pair<std::size_t, ir::EffectSummary>> sink_effects;
+        robin_hood::unordered_map<std::string, std::size_t> first_consumer;
+        // The script's own externs are registered as the main loop reaches
+        // them, which is after this pass needs their effect declarations and
+        // to know which of them are sinks.
+        for (const auto& stmt : program.statements) {
+            if (const auto* ext = std::get_if<ExternDecl>(&stmt)) {
+                extern_decls_.insert_or_assign(ext->name, ext);
+                if (!ext->params.empty() && ext->params[0].type.kind == Type::Kind::DataFrame) {
+                    sink_externs_.insert(ext->name);
+                }
+            }
+        }
+        const auto note_consumer = [&](const std::string& name, std::size_t position) {
+            const auto [it, inserted] = first_consumer.try_emplace(name, position);
+            if (!inserted) {
+                it->second = std::min(it->second, position);
+            }
+        };
+        for (std::size_t i = 0; i < program.statements.size(); ++i) {
+            const Expr* value = nullptr;
+            const auto& stmt = program.statements[i];
+            if (const auto* let_stmt = std::get_if<LetStmt>(&stmt)) {
+                value = let_stmt->value.get();
+            } else if (const auto* tuple_let = std::get_if<TupleLetStmt>(&stmt)) {
+                value = tuple_let->value.get();
+            } else if (const auto* expr_stmt = std::get_if<ExprStmt>(&stmt)) {
+                value = expr_stmt->expr.get();
+                if (const auto* ident = std::get_if<IdentifierExpr>(&value->node)) {
+                    note_consumer(ident->name, i);
+                }
+                if (const auto* call = std::get_if<CallExpr>(&value->node);
+                    call != nullptr && sink_externs_.contains(call->callee)) {
+                    sink_effects.emplace_back(i, extern_effects(call->callee));
+                    if (!call->args.empty()) {
+                        if (const auto* ident = std::get_if<IdentifierExpr>(&call->args[0]->node)) {
+                            note_consumer(ident->name, i);
+                        }
+                    }
+                }
+            }
+            if (value != nullptr) {
+                TableRefCounts refs;
+                count_table_refs(*value, /*table_position=*/true, refs);
+                for (const auto& [name, count] : refs) {
+                    note_consumer(name, i);
+                }
+            }
+        }
+        // True when `plan`, declared at `position`, would run after a sink it
+        // does not commute with if it were left to its first reader. A binding
+        // is read lazily when it is inlined, so `let r = read(f); write(x, f);
+        // r;` would see the new file; source order says it reads the old one.
+        const auto must_run_before_sinks = [&](const ir::Node& plan, std::size_t position,
+                                               const std::string& name) {
+            ir::EffectSummary effects;
+            collect_plan_effects(plan, effects);
+            if (effects.is_pure()) {
+                return false;
+            }
+            const auto consumer = first_consumer.find(name);
+            if (consumer == first_consumer.end()) {
+                return false;
+            }
+            return std::ranges::any_of(sink_effects, [&](const auto& sink) {
+                return sink.first > position && sink.first < consumer->second &&
+                       !ir::is_reorderable(effects, sink.second);
+            });
+        };
         const auto infer_compile_time_list =
             [this](const Expr& expr) -> std::optional<std::vector<std::string>> {
             if (auto string_list = extract_string_list(expr); string_list.has_value()) {
@@ -1815,7 +1939,8 @@ class Lowerer {
             }
             return infer_output_column_names(*lowered.value());
         };
-        for (const auto& stmt : program.statements) {
+        for (std::size_t position = 0; position < program.statements.size(); ++position) {
+            const auto& stmt = program.statements[position];
             if (collect_declaration(stmt)) {
                 continue;
             }
@@ -1853,8 +1978,10 @@ class Lowerer {
                 }
                 if (bindings_ != nullptr) {
                     if (share_repeated_bindings_ && !let_stmt.is_mut &&
-                        let_counts_[let_stmt.name] == 1 && table_ref_counts_[let_stmt.name] >= 2 &&
-                        contains_expensive_node(*value.value())) {
+                        let_counts_[let_stmt.name] == 1 &&
+                        ((table_ref_counts_[let_stmt.name] >= 2 &&
+                          contains_expensive_node(*value.value())) ||
+                         must_run_before_sinks(*value.value(), position, let_stmt.name))) {
                         // Referenced from several places and expensive to
                         // re-run: materialized once by the executor. Later
                         // references miss bindings_ and lower to Scan(name).
@@ -1872,8 +1999,9 @@ class Lowerer {
                             schema.is_known()) {
                             binding_schemas_.insert_or_assign(let_stmt.name, schema);
                         }
-                        shared_bindings_.push_back(
-                            SharedBinding{.name = let_stmt.name, .plan = std::move(value.value())});
+                        shared_bindings_.push_back(SharedBinding{.name = let_stmt.name,
+                                                                 .plan = std::move(value.value()),
+                                                                 .position = position});
                     } else {
                         (*bindings_)[let_stmt.name] = std::move(value.value());
                     }
@@ -1917,7 +2045,8 @@ class Lowerer {
                                 ? std::optional<std::string>{std::get<IdentifierExpr>(
                                                                  call->args.front()->node)
                                                                  .name}
-                                : std::nullopt});
+                                : std::nullopt,
+                        .position = position});
                     continue;
                 }
                 auto value = lower_expr(*expr_stmt.expr);
@@ -5848,6 +5977,8 @@ class Lowerer {
     robin_hood::unordered_set<std::string> table_externs_;
     robin_hood::unordered_set<std::string> sink_externs_;
     robin_hood::unordered_map<std::string, const ExternDecl*> table_extern_decls_;
+    /// Every extern seen by collect_declaration, for its effect declaration.
+    robin_hood::unordered_map<std::string, const ExternDecl*> extern_decls_;
     ir::SourceSchemas binding_schemas_;
     robin_hood::unordered_map<std::string, const FunctionDecl*> functions_;
     // Scratch for inlining scalar UDF calls in clause expressions: a stack of

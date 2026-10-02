@@ -64,20 +64,25 @@ auto empty_like(const ibex::runtime::ColumnValue& src) -> ibex::runtime::ColumnV
 /// Register `data` as a lazy source named `name`. The decode honours the
 /// selection (so `project_where` and deferred-probe filters exercise the real
 /// gather path) and returns exactly the requested columns.
-void register_lazy_source(ExternRegistry& registry, std::string name, Table data) {
+///
+/// `live` is read when a scan decodes, not when the source is opened, so a sink
+/// that replaces `*live` is seen by every scan that runs after it -- the way a
+/// file rewritten between two reads behaves.
+void register_live_source(ExternRegistry& registry, std::string name, std::shared_ptr<Table> live) {
     registry.register_lazy_table(
         std::move(name),
-        [data = std::move(data)](const ibex::runtime::ExternArgs&)
+        [live = std::move(live)](const ibex::runtime::ExternArgs&)
             -> std::expected<ibex::runtime::LazyTablePtr, std::string> {
             Table schema;
-            for (const auto& col : data.columns) {
+            for (const auto& col : live->columns) {
                 schema.add_column(col.name, empty_like(*col.column));
             }
-            const std::size_t rows = data.rows();
+            const std::size_t rows = live->rows();
             return std::make_shared<ibex::runtime::LazyTable>(
                 std::move(schema), rows,
-                [data](const std::vector<std::string>& names,
+                [live](const std::vector<std::string>& names,
                        const Selection* selection) -> std::expected<Table, std::string> {
+                    const Table& data = *live;
                     Selection all;
                     all.reserve(data.rows());
                     for (std::size_t i = 0; i < data.rows(); ++i) {
@@ -105,6 +110,10 @@ void register_lazy_source(ExternRegistry& registry, std::string name, Table data
                     return out;
                 });
         });
+}
+
+void register_lazy_source(ExternRegistry& registry, std::string name, Table data) {
+    register_live_source(registry, std::move(name), std::make_shared<Table>(std::move(data)));
 }
 
 /// Run `script` through the whole-script planner and return the table handed to
@@ -420,4 +429,82 @@ total;
 )";
     Table global = run_lazy_script(global_src, {{"read_hits", std::move(hits)}});
     REQUIRE(i64(global, "nd") == std::vector<std::int64_t>{5});
+}
+
+namespace {
+
+/// A script over a "disk": `read_disk()` reads the current table, `store(df)`
+/// replaces it, `capture(df)` records what it is handed.
+struct DiskScript {
+    ExternRegistry registry;
+    std::shared_ptr<Table> disk;
+    Table captured;
+
+    explicit DiskScript(Table initial, Table fresh) : disk(std::make_shared<Table>(initial)) {
+        register_live_source(registry, "read_disk", disk);
+        register_lazy_source(registry, "read_fresh", std::move(fresh));
+        registry.register_scalar_table_consumer(
+            "store", ibex::runtime::ScalarKind::Int,
+            [this](const Table& t, const ibex::runtime::ExternArgs&)
+                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                *disk = t;
+                return ibex::runtime::ExternValue{std::int64_t{0}};
+            });
+        registry.register_scalar_table_consumer(
+            "capture", ibex::runtime::ScalarKind::Int,
+            [this](const Table& t, const ibex::runtime::ExternArgs&)
+                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                captured = t;
+                return ibex::runtime::ExternValue{std::int64_t{0}};
+            });
+    }
+};
+
+}  // namespace
+
+TEST_CASE("e2e lazy: a shared binding is read after the sink that rewrites its source",
+          "[e2e][lazy][effects]") {
+    // `total` is read twice, so the lowerer shares it: materialized once by the
+    // executor. That used to happen before every sink, so it read the OLD disk
+    // (sum 3) although `store` rewrote it first in the source.
+    DiskScript script(make_table({{"x", {1, 2}}}), make_table({{"x", {10, 20}}}));
+    const char* src = R"(
+extern fn read_disk() -> DataFrame from "x.hpp";
+extern fn read_fresh() -> DataFrame from "x.hpp";
+extern fn store(df: DataFrame) -> Int from "x.hpp";
+extern fn capture(df: DataFrame) -> Int from "x.hpp";
+
+let fresh = read_fresh();
+store(fresh);
+let total = read_disk()[select { s = sum(x) }];
+let lo = total[filter s > 0];
+let hi = total[filter s > 1];
+let both = lo join hi on s;
+capture(both);
+both;
+)";
+    REQUIRE(ibex::repl::execute_script(src, script.registry));
+    REQUIRE(i64(script.captured, "s") == std::vector<std::int64_t>{30});
+}
+
+TEST_CASE("e2e lazy: a binding is read before the sink declared after it rewrites its source",
+          "[e2e][lazy][effects]") {
+    // `r` is used once, so it used to be inlined into the plan of `capture(r)`
+    // and read AFTER `store` had rewritten the disk (sum 30). In source order
+    // `r` reads the old disk (sum 3).
+    DiskScript script(make_table({{"x", {1, 2}}}), make_table({{"x", {10, 20}}}));
+    const char* src = R"(
+extern fn read_disk() -> DataFrame from "x.hpp";
+extern fn read_fresh() -> DataFrame from "x.hpp";
+extern fn store(df: DataFrame) -> Int from "x.hpp";
+extern fn capture(df: DataFrame) -> Int from "x.hpp";
+
+let r = read_disk()[select { s = sum(x) }];
+let fresh = read_fresh();
+store(fresh);
+capture(r);
+r;
+)";
+    REQUIRE(ibex::repl::execute_script(src, script.registry));
+    REQUIRE(i64(script.captured, "s") == std::vector<std::int64_t>{3});
 }

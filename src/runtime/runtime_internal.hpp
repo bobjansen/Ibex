@@ -267,6 +267,13 @@ void gather_range_into(ColumnValue& dst_v, const ColumnValue& src_v, std::span<c
                 auto* dst_off = dst.offsets_data();
                 auto* dst_char = dst.chars_data();
                 dst_off[0] = 0;
+                // All strings empty: the char buffers may be null, and
+                // memcpy from null is undefined even for zero bytes.
+                if (total_chars == 0) {
+                    std::fill_n(dst_off + 1, hi, 0U);
+                    dst_v = std::move(dst);
+                    return;
+                }
                 std::uint32_t cur = 0;
                 for (std::size_t pos = 0; pos < hi; ++pos) {
                     auto si = static_cast<std::size_t>(idx[pos]);

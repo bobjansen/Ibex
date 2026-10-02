@@ -966,6 +966,62 @@ TEST_CASE("join: dense right bitmap preserves membership when the buffered left 
     }
 }
 
+TEST_CASE("join: dense right bitmap never matches a null probe key (adopted bitmap, bit offset)",
+          "[join]") {
+    // The dense probe resolves the left key column and its validity bitmap once.
+    // A null cell holds its type's zero, and 0 is a real right key here, so a
+    // dropped or doubled bit offset would match null rows (semi) or drop them
+    // (anti) -- silently.
+    constexpr std::int64_t kRightRows = 200'000;
+    constexpr std::int64_t kLeftRows = 260'000;
+    constexpr std::size_t kOffset = 5;
+    const auto is_null = [](std::int64_t row) { return row % 7 == 0; };
+
+    Column<std::int64_t> right_ids;
+    right_ids.reserve(kRightRows);
+    for (std::int64_t row = 0; row < kRightRows; ++row) {
+        right_ids.push_back(row * 3);
+    }
+    Column<std::int64_t> left_ids;
+    left_ids.reserve(kLeftRows);
+    auto bytes = std::make_shared<std::vector<std::uint8_t>>((kOffset + kLeftRows + 7) / 8, 0);
+    for (std::int64_t row = 0; row < kLeftRows; ++row) {
+        // Even rows land on a real right key, odd rows between two. A null
+        // cell stores zero, which IS a right key.
+        left_ids.push_back(
+            is_null(row) ? 0
+                         : (row % 2 == 0 ? (row % kRightRows) * 3 : (row % kRightRows) * 3 + 1));
+        if (!is_null(row)) {
+            const auto bit = kOffset + static_cast<std::size_t>(row);
+            (*bytes)[bit / 8] |= static_cast<std::uint8_t>(1U << (bit % 8));
+        }
+    }
+    runtime::Table lhs;
+    lhs.add_column("id", std::move(left_ids));
+    lhs.columns[0].validity = runtime::ValidityBitmap::from_external(
+        bytes, bytes->data(), kOffset, static_cast<std::size_t>(kLeftRows));
+    runtime::Table rhs;
+    rhs.add_column("id", std::move(right_ids));
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    std::size_t want_semi = 0;
+    for (std::int64_t row = 0; row < kLeftRows; ++row) {
+        if (!is_null(row) && row % 2 == 0) {
+            ++want_semi;
+        }
+    }
+    auto semi = interpret_expr("lhs semi join rhs on id;", tables);
+    auto anti = interpret_expr("lhs anti join rhs on id;", tables);
+    CHECK(semi.rows() == want_semi);
+    // Every row that is not a semi match, null rows included, survives the anti join.
+    CHECK(anti.rows() == static_cast<std::size_t>(kLeftRows) - want_semi);
+    for (const std::int64_t id : col_i64(semi, "id")) {
+        CHECK(id % 3 == 0);
+    }
+}
+
 TEST_CASE("join: anti join keeps non-matching left rows only", "[join]") {
     runtime::Table lhs;
     lhs.add_column("id", Column<std::int64_t>{1, 2, 3, 4});

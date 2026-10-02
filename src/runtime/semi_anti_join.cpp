@@ -905,12 +905,37 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             if (col == nullptr) {
                 return std::nullopt;
             }
+            if (dense_active()) {
+                // The dense probe is a few instructions against a cache-resident
+                // bitmap, so what surrounds it is the cost. Read through the
+                // operator's members and the column's accessors, every row
+                // reloads the bitmap's base, span and minimum, and tests the
+                // column and the validity bitmap for adopted Arrow storage:
+                // `select_rows` stores each surviving index, which may alias
+                // those members, so none of it hoists. Resolve them once.
+                const std::int64_t* const keys = col->data();
+                const std::uint64_t dense_min = static_cast<std::uint64_t>(dense_i64_min_);
+                const std::uint64_t dense_slots = dense_i64_nbits_;
+                const std::uint64_t* const hits = dense_i64_hits_.data();
+                const std::uint8_t* const null_bits =
+                    probe_validity != nullptr ? probe_validity->buffer_data() : nullptr;
+                const std::size_t null_base =
+                    probe_validity != nullptr ? probe_validity->buffer_offset() : 0;
+                return filter_rows(std::move(t), [=](std::size_t row) {
+                    bool match = false;
+                    if (null_bits == nullptr ||
+                        ((null_bits[(null_base + row) >> 3] >> ((null_base + row) & 7U)) & 1U) !=
+                            0U) {
+                        const std::uint64_t slot =
+                            static_cast<std::uint64_t>(keys[row]) - dense_min;
+                        match =
+                            slot < dense_slots && (hits[dense_word(slot)] & dense_bit(slot)) != 0;
+                    }
+                    return keep_matches ? match : !match;
+                });
+            }
             return filter_rows(std::move(t), [&](std::size_t row) {
-                bool match = false;
-                if (!probe_is_null(row)) {
-                    match = dense_active() ? dense_contains((*col)[row])
-                                           : right_i64_.contains((*col)[row]);
-                }
+                const bool match = !probe_is_null(row) && right_i64_.contains((*col)[row]);
                 return keep_matches ? match : !match;
             });
         }

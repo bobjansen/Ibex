@@ -35,6 +35,10 @@ struct ScriptSink {
     /// Set when the source syntax passed a simple `let` binding to the sink.
     /// The batch executor uses this to avoid evaluating the final result twice.
     std::optional<std::string> input_binding;
+    /// Index of the sink's statement in the program. Sinks and shared bindings
+    /// run in `position` order, so a binding that reads a file never moves
+    /// above an earlier statement that writes it.
+    std::size_t position = 0;
 };
 
 /// A `let` binding whose plan the executor materializes exactly once, in
@@ -47,6 +51,10 @@ struct ScriptSink {
 struct SharedBinding {
     std::string name;
     ir::NodePtr plan;
+    /// Index of the `let` statement in the program: the executor materializes
+    /// the binding after every sink with a smaller `position` and before every
+    /// sink with a larger one.
+    std::size_t position = 0;
 };
 
 struct ScriptPlan {

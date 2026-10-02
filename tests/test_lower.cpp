@@ -501,6 +501,80 @@ result;
     CHECK(lowered->result->kind() == ir::NodeKind::TopK);
 }
 
+TEST_CASE("lower_script records statement positions of sinks and shared bindings",
+          "[parser][lower]") {
+    auto program = require_parse(R"(
+extern fn read(path: String) -> DataFrame from "reader.hpp";
+extern fn write(df: DataFrame, path: String) -> Int from "writer.hpp";
+let agg = t[select { b, s = sum(a) }, by { b }];
+let lo = agg[filter b == 1];
+write(lo, "out");
+let hi = agg[filter b == 2];
+let result = lo join hi on b suffix { "_lo", "_hi" };
+result;
+)");
+
+    auto lowered = parser::lower_script(program);
+    REQUIRE(lowered.has_value());
+    REQUIRE(lowered->shared_bindings.size() == 1);
+    REQUIRE(lowered->sinks.size() == 1);
+    // `extern`, `extern`, `let agg` is statement 2; the sink is statement 4.
+    CHECK(lowered->shared_bindings[0].position == 2);
+    CHECK(lowered->sinks[0].position == 4);
+}
+
+TEST_CASE("lower_script keeps a read from moving past a write it conflicts with",
+          "[parser][lower]") {
+    // `r` is used once, so it would be inlined into the result plan and read
+    // `f` after the sink had rewritten it. Source order reads the old file.
+    auto program = require_parse(R"(
+extern fn read(path: String) -> DataFrame from "reader.hpp";
+extern fn write(df: DataFrame, path: String) -> Int from "writer.hpp";
+let r = read("f")[select { total = sum(x) }];
+let fresh = read("g");
+write(fresh, "f");
+r;
+)");
+
+    auto lowered = parser::lower_script(program);
+    REQUIRE(lowered.has_value());
+    REQUIRE(lowered->shared_bindings.size() == 1);
+    CHECK(lowered->shared_bindings[0].name == "r");
+    CHECK(lowered->shared_bindings[0].position == 2);
+    REQUIRE(lowered->sinks.size() == 1);
+    CHECK(lowered->sinks[0].position == 4);
+}
+
+TEST_CASE("lower_script inlines a read no write separates from its reader", "[parser][lower]") {
+    // The sink writes the very table its input names; nothing sits between
+    // the `let` and the sink, so there is nothing to move past.
+    auto program = require_parse(R"(
+extern fn read(path: String) -> DataFrame from "reader.hpp";
+extern fn write(df: DataFrame, path: String) -> Int from "writer.hpp";
+let r = read("f")[select { total = sum(x) }];
+write(r, "out");
+r;
+)");
+
+    auto lowered = parser::lower_script(program);
+    REQUIRE(lowered.has_value());
+    CHECK(lowered->shared_bindings.empty());
+}
+
+TEST_CASE("lower_script lets a pure binding move past a sink", "[parser][lower]") {
+    // `fresh` reads nothing external, so the write cannot change it.
+    auto program = require_parse(R"(
+extern fn write(df: DataFrame, path: String) -> Int from "writer.hpp";
+let r = t[select { total = sum(x) }];
+write(t, "out");
+r;
+)");
+
+    auto lowered = parser::lower_script(program);
+    REQUIRE(lowered.has_value());
+    CHECK(lowered->shared_bindings.empty());
+}
+
 TEST_CASE("lower_script keeps a cheap repeated binding inlined", "[parser][lower]") {
     // A scan/filter chain is cheap to re-run and inlining preserves each
     // consumer's own selection pushdown, so it is not shared.

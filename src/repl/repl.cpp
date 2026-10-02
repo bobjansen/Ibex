@@ -6509,9 +6509,10 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
     }
 
     // Bindings the lowerer marked as shared are evaluated exactly once, in
-    // declaration order (a later one may scan an earlier one), before any sink
-    // or result plan. Their plans are pure relational expressions, so running
-    // them ahead of the sinks does not reorder any observable effect.
+    // declaration order (a later one may scan an earlier one), each at its
+    // `let`'s place among the sinks. The lowerer also marks a binding that
+    // reads an external source when a conflicting sink sits between it and
+    // its first reader, so inlining it cannot move the read past the write.
     std::map<std::string, bool> shared_order_insensitive;
     for (const auto& shared : script->shared_bindings) {
         ir::BindingOrderUses uses;
@@ -6534,19 +6535,33 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         }
         shared_order_insensitive.emplace(shared.name, uses.count > 0 && uses.all_order_insensitive);
     }
-    for (auto& shared : script->shared_bindings) {
-        const bool root_order_insensitive = shared_order_insensitive.at(shared.name);
-        auto table = optimize_and_execute_plan(std::move(shared.plan), base_tables, lazy_callees,
-                                               externs, scalars, root_order_insensitive);
-        if (!table.has_value()) {
-            ibex::formatting::print("error: {}\n", table.error());
-            return false;
+    // Shared bindings and sinks run in statement order. A binding reads its
+    // sources when its `let` runs, so it sees the files written by the sinks
+    // before it and none written by the sinks after it. Bindings after the last
+    // sink run before the result plan.
+    std::size_t next_shared = 0;
+    const auto materialize_shared_before = [&](std::size_t position) -> bool {
+        while (next_shared < script->shared_bindings.size() &&
+               script->shared_bindings[next_shared].position < position) {
+            auto& shared = script->shared_bindings[next_shared++];
+            const bool root_order_insensitive = shared_order_insensitive.at(shared.name);
+            auto table =
+                optimize_and_execute_plan(std::move(shared.plan), base_tables, lazy_callees,
+                                          externs, scalars, root_order_insensitive);
+            if (!table.has_value()) {
+                ibex::formatting::print("error: {}\n", table.error());
+                return false;
+            }
+            base_tables.insert_or_assign(shared.name, std::move(table.value()));
         }
-        base_tables.insert_or_assign(shared.name, std::move(table.value()));
-    }
+        return true;
+    };
 
     runtime::TableRegistry cached_bindings;
     for (auto& sink : script->sinks) {
+        if (!materialize_shared_before(sink.position)) {
+            return false;
+        }
         std::expected<runtime::Table, std::string> input = std::unexpected("");
         if (sink.input_binding.has_value()) {
             if (const auto cached = cached_bindings.find(*sink.input_binding);
@@ -6575,6 +6590,9 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             ibex::formatting::print("error: {}\n", invoked.error());
             return false;
         }
+    }
+    if (!materialize_shared_before(std::numeric_limits<std::size_t>::max())) {
+        return false;
     }
     std::expected<runtime::Table, std::string> result = std::unexpected("");
     if (script->result_binding.has_value()) {

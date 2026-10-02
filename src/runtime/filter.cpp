@@ -2121,8 +2121,9 @@ auto compute_mask(const ir::Expr& expr, const PredicateInput& input, const Scala
                     Mask m;
                     m.value.resize(n);
                     // No validity bitmap → every row is valid, one constant fill.
+                    // fill_n, not memset: with no rows the buffer is null.
                     if (bm == nullptr) {
-                        std::memset(m.value.data(), want_null ? 0 : 1, n);
+                        std::fill_n(m.value.data(), n, want_null ? 0 : 1);
                         return m;
                     }
                     // Expand the bitmap a word at a time. Probing bit by bit

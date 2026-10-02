@@ -1740,8 +1740,11 @@ inline constexpr bool is_dense_column_v<Column<std::string>> = false;
 /// kernels could not simply hoist.
 ///
 /// The row count must be exact: dense columns are sized up front, so pushing
-/// more than `rows` writes out of bounds. Kernels that emit one value per input
-/// row (which is all of them here) satisfy that by construction.
+/// more than `rows` writes out of bounds, and pushing fewer leaves the rest
+/// uninitialized (the up-front sizing does not zero them: `resize` would be a
+/// second full pass over the output, a memset of the whole column that the
+/// kernel then overwrites). Kernels that emit one value per input row (which
+/// is all of them here) satisfy both by construction.
 template <typename ColT>
 class ColumnAppender {
    public:
@@ -1749,7 +1752,11 @@ class ColumnAppender {
 
     ColumnAppender(ColT& column, std::size_t rows) : column_(&column) {
         if constexpr (is_dense_column_v<ColT>) {
-            column_->resize(rows);
+            if constexpr (std::is_trivially_default_constructible_v<value_type>) {
+                column_->resize_for_overwrite(rows);
+            } else {
+                column_->resize(rows);
+            }
             out_ = column_->data();
         } else {
             column_->reserve(rows);

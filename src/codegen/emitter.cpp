@@ -92,6 +92,103 @@ auto Emitter::indent_code(const std::string& code, size_t spaces) -> std::string
 }
 
 void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config) {
+    emit_header(out, config);
+    emit_query(out, root, config);
+    emit_footer(out, config);
+}
+
+void Emitter::emit(std::ostream& out, const Script& script, const Config& config) {
+    if (config.bench_mode) {
+        throw std::runtime_error(
+            "ibex_compile: a script with effects cannot be a benchmark harness");
+    }
+    if (script.result == nullptr) {
+        throw std::runtime_error("ibex_compile: script has no result plan");
+    }
+    emit_header(out, config);
+
+    named_tables_.clear();
+    // The table a sink consumed, by the binding that named it: the result of a
+    // script ending `write(result, ...); result;` is that same table, and must
+    // not be computed (or read from its source) a second time.
+    robin_hood::unordered_map<std::string, std::string> sink_inputs;
+    const auto emit_call_args = [&](const std::vector<ir::Expr>& args, bool leading_comma,
+                                    std::string_view first) {
+        std::string text{first};
+        bool need_comma = leading_comma;
+        for (const auto& arg : args) {
+            if (need_comma) {
+                text += ", ";
+            }
+            need_comma = true;
+            text += emit_raw_expr(arg);
+        }
+        return text;
+    };
+
+    for (const auto& step : script.steps) {
+        switch (step.kind) {
+            case Script::Step::Kind::SharedBinding: {
+                if (step.plan == nullptr) {
+                    throw std::runtime_error("ibex_compile: shared binding has no plan");
+                }
+                named_tables_[step.name] = emit_node(*step.plan);
+                break;
+            }
+            case Script::Step::Kind::Sink: {
+                std::string input;
+                if (step.input_binding.has_value()) {
+                    if (const auto it = sink_inputs.find(*step.input_binding);
+                        it != sink_inputs.end()) {
+                        input = it->second;
+                    }
+                }
+                if (input.empty()) {
+                    if (step.plan == nullptr) {
+                        throw std::runtime_error("ibex_compile: sink has no input plan");
+                    }
+                    input = emit_node(*step.plan);
+                    if (step.input_binding.has_value()) {
+                        sink_inputs[*step.input_binding] = input;
+                    }
+                }
+                out << "    (void)" << step.callee << "("
+                    << emit_call_args(step.args, /*leading_comma=*/true, input) << ");\n";
+                break;
+            }
+            case Script::Step::Kind::Call: {
+                if (step.plan == nullptr || step.plan->kind() != ir::NodeKind::ExternCall) {
+                    throw std::runtime_error("ibex_compile: a call step needs an ExternCall node");
+                }
+                const auto& call = ir::node_cast<ir::ExternCallNode>(*step.plan);
+                out << "    (void)" << call.callee() << "("
+                    << emit_call_args(call.args(), /*leading_comma=*/false, "") << ");\n";
+                break;
+            }
+        }
+    }
+
+    std::string result_var;
+    if (script.result_binding.has_value()) {
+        if (const auto it = sink_inputs.find(*script.result_binding); it != sink_inputs.end()) {
+            result_var = it->second;
+        } else if (const auto named = named_tables_.find(*script.result_binding);
+                   named != named_tables_.end()) {
+            result_var = named->second;
+        }
+    }
+    if (result_var.empty()) {
+        result_var = emit_node(*script.result);
+    }
+    if (config.table_entry_point) {
+        out << "    return " << result_var << ";\n";
+    } else if (config.print_result) {
+        out << "    ibex::ops::print(" << result_var << ");\n";
+    }
+    emit_footer(out, config);
+}
+
+void Emitter::emit_header(std::ostream& out, const Config& config) {
     out_ = &out;
     tmp_counter_ = 0;
     cached_vars_.clear();
@@ -199,7 +296,9 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
             out << "\n";
         }
     }
+}
 
+void Emitter::emit_query(std::ostream& out, const ir::Node& root, const Config& config) {
     if (config.bench_mode) {
         // Phase 1: emit ExternCall (data loading) nodes into main buffer (setup).
         collect_extern_calls(root);
@@ -243,7 +342,9 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
             out << "    ibex::ops::print(" << result_var << ");\n";
         }
     }
+}
 
+void Emitter::emit_footer(std::ostream& out, const Config& config) {
     if (!config.table_entry_point)
         out << "    return 0;\n";
     out << "}\n";
@@ -299,6 +400,10 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             const auto& scan = ir::node_cast<ir::ScanNode>(node);
             if (scan.source_name() == "__stream_input__" && !stream_scan_var_.empty()) {
                 return stream_scan_var_;
+            }
+            if (const auto named = named_tables_.find(scan.source_name());
+                named != named_tables_.end()) {
+                return named->second;
             }
             throw std::runtime_error(
                 "ibex_compile: ScanNode cannot be emitted — use 'extern fn' to declare data "

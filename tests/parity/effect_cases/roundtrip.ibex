@@ -1,0 +1,6 @@
+// A table sink mid-script: the file is written before the read that follows it.
+import "csv";
+let src = Table { x = [3, 1, 2] };
+write_csv(src, "/tmp/ibex_parity_roundtrip.csv");
+let back = read_csv("/tmp/ibex_parity_roundtrip.csv");
+back[select { total = sum(x) }];

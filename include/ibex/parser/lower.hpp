@@ -59,6 +59,11 @@ struct SharedBinding {
 
 struct ScriptPlan {
     std::vector<ir::NodePtr> preamble;
+    /// Statement index of each `preamble` call, parallel to it. A consumer that
+    /// runs the preamble up front (the REPL declines such scripts) can ignore
+    /// it; one that runs the script in order interleaves the calls with the
+    /// sinks and shared bindings by this index.
+    std::vector<std::size_t> preamble_positions;
     std::vector<SharedBinding> shared_bindings;
     std::vector<ScriptSink> sinks;
     ir::NodePtr result;

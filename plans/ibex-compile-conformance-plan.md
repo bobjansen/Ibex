@@ -382,50 +382,49 @@ preserve statement ordering in planning". The REPL and `ibex_compile` must get
 ordering from that one mechanism. A compiled mode that merely runs statements
 in source order would be a second implementation of the same rule.
 
-State of that step 2, checked 2026-10-02:
+State of that step 2, checked 2026-10-02 (rechecked after the first slice):
 
 | Part | State |
 |---|---|
 | Placement validation (zero plugin calls on a misplaced call) | **Done**, REPL statement path; `ResourceFunctions` shared by REPL, planner, `ibex_compile` |
-| Effect mask with resource-scoped `io_read`/`io_write` | Exists (`effects.hpp`), unused for resources: no ADBC extern declares `effects {}`, so each carries all core effects, unscoped |
-| Resource summary (acquire / use / close), transitive | **Not built** |
-| `ir::is_reorderable(lhs, rhs)` | Written and unit-tested; **no caller** |
-| Planner treats effectful statements as barriers | **Not built.** `ScriptPlan` is split into `preamble`, `shared_bindings`, `sinks`, `result`; shared bindings run before sinks, so there is no single statement order across the lists |
-| REPL and `lower_script` share an `OptimizationContext` | **No.** `lower_script` builds it from `analyze_effects`; the REPL passes a default-constructed one (`repl.cpp:4112`, `:6655`) |
-| Only consumer of summaries today | `DeadPurePreamblePass` (drops pure unused preamble calls) |
+| Statement order between sinks and shared bindings | **Done** (`6fdc72bd`): `position` on `SharedBinding`/`ScriptSink`; executor runs them in order |
+| Reads that must not move past a conflicting write | **Done** (`6fdc72bd`): a `let` calling an effectful extern is pinned when a non-commuting sink separates it from its first reader; `ir::is_reorderable` now has its first caller |
+| ADBC externs' effects | Undeclared, so each carries all core effects, unscoped: already a barrier against every non-pure statement and against each other |
+| Resource summary (acquire / use / close) | **Not needed for correctness** — see below |
+| REPL `OptimizationContext` | **Not a gap.** The statement path optimizes one expression at a time; the default context is deliberate (`repl.cpp`: "every effect, so the effect-sensitive passes stay conservative"), and the only pass that reads summaries acts on `ProgramNode` preambles, which a single expression never has |
+| `ScriptPlan` represents non-sink effectful statements | **Not built**: scalar-call statements go to `preamble`, which runs before everything regardless of position, and `let n = extern(...)` is "unsupported scalar let". The batch executor declines such scripts (`script has statements that must run before the plan`) |
+| Whole-script planner accepts resource scripts | **Declined on purpose**; the statement path owns resources |
 
 ### W6-0 — effect-ordered planning (prerequisite; finishes step 2)
 
-1. **Resource summary.** Add acquire / use / close to the effect summary,
-   propagated through `fn` calls like the mask (`effects.cpp`). A resource
-   function without one is unknown and counts as a conflict with everything.
-   Resources are identified by *type* (all `AdbcConnection` operations share
-   one resource), not by binding name: aliases (`let b = a;`) must not escape
-   the check, and one type is the conservative answer until there is an alias
-   analysis. Declare `effects {...}` on the ADBC externs (arbitrary SQL is
-   `io_read` + `io_write` + `state` + `blocking` + `may_fail`, per the plan).
-2. **Statement order in `ScriptPlan`.** Give every element (preamble call,
-   shared binding, sink, result) its source position, or replace the four lists
-   with one ordered list. A shared binding may be hoisted over a statement only
-   when `ir::is_reorderable` says the two commute. Effectful statements are
-   barriers by default.
-3. **Wire `is_reorderable`** into that hoisting, and extend it for the resource
-   summary (two operations on the same resource type never commute; `state`,
-   `nondet`, `blocking`, `may_fail` stay pinned, as it already does).
-4. **One `OptimizationContext`.** Both frontends build it from
-   `analyze_effects`; delete the default-constructed context in the REPL.
-5. **Tests.** A pure `let` still hoists and shares across an effectful
-   statement; a `let` reading a table written earlier does *not* move above the
-   write; two `adbc_execute` on one connection keep order; a shared binding
-   containing `adbc_query` stays after the `adbc_write` before it. Each fails
-   on the unfixed tree (the REPL also runs them through the whole-script path
-   once it stops declining resource scripts).
-6. **Whole-script planner stops declining resource scripts** once 1-4 hold.
-   That is the point where resources reach the batch path, and so `lower_script`
-   — which both the interpreter and the compiler consume.
+Revised after the first slice. What the first slice showed:
 
-W6-0 is the large piece (est. 2-4 days) and is not ADBC-specific; every
-effectful extern (`write_csv`, `write_parquet`, the network plugins) benefits.
+- Ordering needs no new analysis for resources. Undeclared externs already
+  carry every effect, so `is_reorderable` pins them against each other and
+  against any non-pure statement. A transitive acquire/use/close summary would
+  only buy *finer* commuting (two connections never conflicting), which needs
+  alias analysis first. It is an optimization; defer it until a measured script
+  wants it. Placement is already enforced by `ResourceFunctions`.
+- Declaring `effects { ... }` on the ADBC externs only helps once the file
+  readers and writers are declared too (an undeclared extern conflicts with
+  everything, scoped or not). Do that together, not for ADBC alone.
+- The REPL statement path needs nothing: it executes in source order by
+  construction.
+
+What remains is the representation, and it is W6a's first step because the
+emitter is its only consumer:
+
+1. **Ordered effectful statements in `ScriptPlan`.** Scalar-call statements and
+   `let n = extern(...)` get a `position` like sinks and shared bindings; the
+   `preamble` list (which runs first, whatever the source order) goes away.
+   Resource calls are statements of the same kind, carrying the resource
+   function's name and its resource arguments by binding name.
+2. **Both consumers follow the order.** The batch executor keeps declining
+   scripts with such statements until it grows a resource registry (it does not
+   need one for scalar statements and can take those now); the emitter takes all
+   of them.
+3. **Tests** that fail on the unfixed tree: a scalar statement between two
+   sinks runs between them; `let n = f(...)` is visible to a later filter.
 
 ### W6a — sinks and extern scalars (no resources)
 

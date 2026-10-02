@@ -3289,24 +3289,61 @@ auto eval_fill_forward(const ir::CallExpr& call, const Table& input)
             ColumnAppender<ColT> out(result, rows);
             std::optional<ValidityBitmap> out_validity;
 
-            // carry: last seen valid value (safe for string_view: points into source col).
-            T carry{};
-            bool have_carry = false;
+            if constexpr (is_dense_column_v<ColT>) {
+                // The input storage is resolved once, here, and the carry lives in
+                // a register. Reading through `col[i]` and `validity[i]` re-tests
+                // "is this adopted Arrow storage?" and reloads both buffer
+                // pointers on every row, because the store to the output may
+                // alias the members they read -- about twenty instructions and a
+                // spilled carry per row for one load, one bit test and one store.
+                const T* const in = col.data();
+                T* const dst = result.data();
+                const std::uint8_t* const bits = validity.buffer_data();
+                const std::size_t bit_base = validity.buffer_offset();
+                const auto is_valid = [bits, bit_base](std::size_t row) {
+                    const std::size_t bit = bit_base + row;
+                    return ((bits[bit >> 3] >> (bit & 7U)) & 1U) != 0U;
+                };
 
-            for (std::size_t i = 0; i < rows; ++i) {
-                if (validity[i]) {
-                    out.push(col[i]);
-                    carry = col[i];
-                    have_carry = true;
-                } else if (have_carry) {
-                    out.push(carry);
-                } else {
-                    // Leading null — no value to carry; stays null.
-                    out.push(T{});
-                    if (!out_validity) {
-                        out_validity.emplace(rows, true);
+                // Leading nulls have no value to carry; they stay null.
+                std::size_t i = 0;
+                while (i < rows && !is_valid(i)) {
+                    dst[i] = T{};
+                    ++i;
+                }
+                if (i > 0) {
+                    out_validity.emplace(rows, true);
+                    for (std::size_t row = 0; row < i; ++row) {
+                        out_validity->set(row, false);
                     }
-                    out_validity->set(i, false);
+                }
+                if (i < rows) {
+                    T carry = in[i];
+                    for (; i < rows; ++i) {
+                        carry = is_valid(i) ? in[i] : carry;
+                        dst[i] = carry;
+                    }
+                }
+            } else {
+                // carry: last seen valid value (safe for string_view: points into source col).
+                T carry{};
+                bool have_carry = false;
+
+                for (std::size_t i = 0; i < rows; ++i) {
+                    if (validity[i]) {
+                        out.push(col[i]);
+                        carry = col[i];
+                        have_carry = true;
+                    } else if (have_carry) {
+                        out.push(carry);
+                    } else {
+                        // Leading null — no value to carry; stays null.
+                        out.push(T{});
+                        if (!out_validity) {
+                            out_validity.emplace(rows, true);
+                        }
+                        out_validity->set(i, false);
+                    }
                 }
             }
             return FillResult{std::move(result), std::move(out_validity)};
@@ -3343,37 +3380,73 @@ auto eval_fill_backward(const ir::CallExpr& call, const Table& input)
             using ColT = std::decay_t<decltype(col)>;
             using T = ColT::value_type;
 
-            // Scan right-to-left to compute (value, valid) for each row,
-            // storing in plain vectors so we can then push_back into ColT.
-            std::vector<T> vals(rows);
             std::optional<ValidityBitmap> out_validity;
 
-            bool have_val = false;
-            T next_val{};
-            for (std::size_t ri = 0; ri < rows; ++ri) {
-                const std::size_t i = rows - 1 - ri;
-                if (validity[i]) {
-                    vals[i] = col[i];
-                    next_val = col[i];
-                    have_val = true;
-                } else if (have_val) {
-                    vals[i] = next_val;
-                } else {
-                    // Trailing null — no following value; stays null.
-                    vals[i] = T{};
-                    if (!out_validity) {
-                        out_validity.emplace(rows, true);
-                    }
-                    out_validity->set(i, false);
+            if constexpr (is_dense_column_v<ColT>) {
+                // One right-to-left pass straight into the output, with the
+                // storage resolved once; see eval_fill_forward.
+                ColT result;
+                ColumnAppender<ColT> out(result, rows);
+                const T* const in = col.data();
+                T* const dst = result.data();
+                const std::uint8_t* const bits = validity.buffer_data();
+                const std::size_t bit_base = validity.buffer_offset();
+                const auto is_valid = [bits, bit_base](std::size_t row) {
+                    const std::size_t bit = bit_base + row;
+                    return ((bits[bit >> 3] >> (bit & 7U)) & 1U) != 0U;
+                };
+
+                // Trailing nulls have no following value; they stay null.
+                std::size_t end = rows;
+                while (end > 0 && !is_valid(end - 1)) {
+                    dst[--end] = T{};
                 }
+                if (end < rows) {
+                    out_validity.emplace(rows, true);
+                    for (std::size_t row = end; row < rows; ++row) {
+                        out_validity->set(row, false);
+                    }
+                }
+                if (end > 0) {
+                    T next = in[end - 1];
+                    for (std::size_t i = end; i-- > 0;) {
+                        next = is_valid(i) ? in[i] : next;
+                        dst[i] = next;
+                    }
+                }
+                return FillResult{std::move(result), std::move(out_validity)};
+            } else {
+                // Scan right-to-left to compute (value, valid) for each row,
+                // storing in plain vectors so we can then push_back into ColT.
+                std::vector<T> vals(rows);
+
+                bool have_val = false;
+                T next_val{};
+                for (std::size_t ri = 0; ri < rows; ++ri) {
+                    const std::size_t i = rows - 1 - ri;
+                    if (validity[i]) {
+                        vals[i] = col[i];
+                        next_val = col[i];
+                        have_val = true;
+                    } else if (have_val) {
+                        vals[i] = next_val;
+                    } else {
+                        // Trailing null — no following value; stays null.
+                        vals[i] = T{};
+                        if (!out_validity) {
+                            out_validity.emplace(rows, true);
+                        }
+                        out_validity->set(i, false);
+                    }
+                }
+                // Build the output column, resolving its storage once.
+                ColT result;
+                ColumnAppender<ColT> out(result, rows);
+                for (std::size_t i = 0; i < rows; ++i) {
+                    out.push(vals[i]);
+                }
+                return FillResult{std::move(result), std::move(out_validity)};
             }
-            // Build the output column, resolving its storage once.
-            ColT result;
-            ColumnAppender<ColT> out(result, rows);
-            for (std::size_t i = 0; i < rows; ++i) {
-                out.push(vals[i]);
-            }
-            return FillResult{std::move(result), std::move(out_validity)};
         },
         *entry->column);
 }

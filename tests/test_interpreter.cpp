@@ -9693,6 +9693,150 @@ TEST_CASE("fill_forward leaves leading nulls as null", "[null][fill]") {
     CHECK(fwd[3] == 5);
 }
 
+namespace {
+
+/// LOCF / NOCB over `values` with `valid` as the validity, written the obvious
+/// way: the reference the hoisted fill loops are held to.
+struct FillReference {
+    std::vector<std::int64_t> values;
+    std::vector<bool> valid;
+};
+
+auto fill_reference(const std::vector<std::int64_t>& values, const std::vector<bool>& valid,
+                    bool forward) -> FillReference {
+    FillReference out{.values = values, .valid = std::vector<bool>(values.size(), true)};
+    const auto n = values.size();
+    bool have = false;
+    std::int64_t carry = 0;
+    for (std::size_t step = 0; step < n; ++step) {
+        const std::size_t i = forward ? step : n - 1 - step;
+        if (valid[i]) {
+            carry = values[i];
+            have = true;
+            out.values[i] = values[i];
+        } else if (have) {
+            out.values[i] = carry;
+        } else {
+            out.values[i] = 0;
+            out.valid[i] = false;
+        }
+    }
+    return out;
+}
+
+/// A column of `n` rows whose validity pattern crosses several 64-bit words,
+/// starts with nulls, and (when `trailing_nulls`) ends with them.
+auto make_fill_input(std::size_t n, bool trailing_nulls)
+    -> std::pair<std::vector<std::int64_t>, std::vector<bool>> {
+    std::vector<std::int64_t> values(n);
+    std::vector<bool> valid(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        values[i] = static_cast<std::int64_t>(i * 7 + 1);
+        valid[i] = i >= 5 && (i % 3 != 0) && (i % 11 != 4);
+        if (trailing_nulls && i + 4 >= n) {
+            valid[i] = false;
+        }
+    }
+    return {values, valid};
+}
+
+void check_fill_matches_reference(const runtime::Table& input,
+                                  const std::vector<std::int64_t>& values,
+                                  const std::vector<bool>& valid) {
+    runtime::TableRegistry registry;
+    registry.emplace("t", input);
+    for (const bool forward : {true, false}) {
+        auto ir = require_ir(forward ? "t[update { r = fill_forward(val) }];"
+                                     : "t[update { r = fill_backward(val) }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* entry = result->find_entry("r");
+        REQUIRE(entry != nullptr);
+        const auto expected = fill_reference(values, valid, forward);
+        const auto& got = std::get<Column<std::int64_t>>(*entry->column);
+        REQUIRE(got.size() == values.size());
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            INFO((forward ? "fill_forward" : "fill_backward") << " row " << i);
+            CHECK(runtime::is_null(*entry, i) == !expected.valid[i]);
+            if (expected.valid[i]) {
+                CHECK(got[i] == expected.values[i]);
+            }
+        }
+    }
+}
+
+}  // namespace
+
+TEST_CASE("fill_forward and fill_backward match a naive fill across word boundaries",
+          "[null][fill]") {
+    for (const bool trailing_nulls : {false, true}) {
+        const auto [values, valid] = make_fill_input(200, trailing_nulls);
+        runtime::Table t;
+        Column<std::int64_t> col;
+        for (const auto v : values) {
+            col.push_back(v);
+        }
+        t.add_column("val", std::move(col));
+        t.columns[t.index.at("val")].validity = valid;
+        check_fill_matches_reference(t, values, valid);
+    }
+}
+
+TEST_CASE("fill_forward and fill_backward read an adopted validity bitmap at its bit offset",
+          "[null][fill]") {
+    // The loops resolve the bitmap's base pointer and bit offset once. An
+    // adopted (Arrow) bitmap sliced at a non-zero offset is the case that
+    // breaks if the offset is dropped or applied twice.
+    constexpr std::size_t kOffset = 3;
+    const auto [values, valid] = make_fill_input(150, /*trailing_nulls=*/true);
+    auto bytes = std::make_shared<std::vector<std::uint8_t>>((kOffset + valid.size() + 7) / 8, 0);
+    for (std::size_t i = 0; i < valid.size(); ++i) {
+        if (valid[i]) {
+            (*bytes)[(kOffset + i) / 8] |= static_cast<std::uint8_t>(1U << ((kOffset + i) % 8));
+        }
+    }
+    runtime::Table t;
+    Column<std::int64_t> col;
+    for (const auto v : values) {
+        col.push_back(v);
+    }
+    t.add_column("val", std::move(col));
+    t.columns[t.index.at("val")].validity =
+        runtime::ValidityBitmap::from_external(bytes, bytes->data(), kOffset, valid.size());
+    REQUIRE(t.columns[t.index.at("val")].validity->is_external());
+    check_fill_matches_reference(t, values, valid);
+}
+
+TEST_CASE("fill_forward and fill_backward leave an all-null column null", "[null][fill]") {
+    runtime::Table t;
+    t.add_column("val", Column<std::int64_t>{1, 2, 3, 4});
+    t.columns[t.index.at("val")].validity = std::vector<bool>{false, false, false, false};
+    check_fill_matches_reference(t, {1, 2, 3, 4}, {false, false, false, false});
+}
+
+TEST_CASE("fill_forward and fill_backward fill a Float64 column", "[null][fill]") {
+    runtime::Table t;
+    t.add_column("val", Column<double>{1.5, 0.0, 0.0, 4.5, 0.0});
+    t.columns[t.index.at("val")].validity = std::vector<bool>{true, false, false, true, false};
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto fwd = runtime::interpret(*require_ir("t[update { r = fill_forward(val) }];"), registry);
+    REQUIRE(fwd.has_value());
+    const auto& f = std::get<Column<double>>(*fwd->find_entry("r")->column);
+    CHECK(f[1] == 1.5);
+    CHECK(f[2] == 1.5);
+    CHECK(f[4] == 4.5);
+
+    auto bwd = runtime::interpret(*require_ir("t[update { r = fill_backward(val) }];"), registry);
+    REQUIRE(bwd.has_value());
+    const auto* entry = bwd->find_entry("r");
+    const auto& b = std::get<Column<double>>(*entry->column);
+    CHECK(b[1] == 4.5);
+    CHECK(b[2] == 4.5);
+    CHECK(runtime::is_null(*entry, 4));  // trailing null: nothing follows
+}
+
 TEST_CASE("fill_forward on column with no nulls is a no-op", "[null][fill]") {
     runtime::Table t;
     t.add_column("val", Column<std::int64_t>{1, 2, 3});

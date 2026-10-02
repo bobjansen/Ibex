@@ -905,6 +905,48 @@ t;
     }
 }
 
+TEST_CASE("lower_script binds a fitted model and reads it by name", "[parser][lower]") {
+    auto program = require_parse(R"IBEX(
+let m = t[model { y ~ x, method = ols }];
+let c = coef(m);
+let r2 = r_squared(m);
+summary(m);
+)IBEX");
+    auto lowered = parser::lower_script(program);
+    REQUIRE(lowered.has_value());
+    // The fit is a binding at its statement, whatever reads it, and `m` is the model.
+    REQUIRE_FALSE(lowered->shared_bindings.empty());
+    const auto fit = std::ranges::find_if(lowered->shared_bindings,
+                                          [](const auto& binding) { return binding.name == "m"; });
+    REQUIRE(fit != lowered->shared_bindings.end());
+    CHECK(fit->plan->kind() == ir::NodeKind::Model);
+    // An accessor of a table is a call on the name; of a scalar, a bound call.
+    const auto coef_binding = std::ranges::find_if(
+        lowered->shared_bindings, [](const auto& binding) { return binding.name == "c"; });
+    REQUIRE(coef_binding != lowered->shared_bindings.end());
+    const auto* coef_call = as_node<ir::ExternCallNode>(coef_binding->plan.get());
+    REQUIRE(coef_call != nullptr);
+    CHECK(coef_call->callee() == "coef");
+    REQUIRE(lowered->preamble.size() == 1);
+    REQUIRE(lowered->preamble_binds[0].has_value());
+    CHECK(lowered->preamble_binds[0]->name == "r2");
+    // The result reads the model too.
+    const auto* result = as_node<ir::ExternCallNode>(lowered->result.get());
+    REQUIRE(result != nullptr);
+    CHECK(result->callee() == "summary");
+}
+
+TEST_CASE("lower_script refuses an accessor of something that is not a fitted model",
+          "[parser][lower]") {
+    auto program = require_parse("coef(t);\n");
+    auto lowered = parser::lower_script(program);
+    REQUIRE_FALSE(lowered.has_value());
+    CHECK(lowered.error().message.find("name of a model") != std::string::npos);
+
+    auto single = require_parse("let m = t[model { y ~ x, method = ols }];\nm;\n");
+    REQUIRE_FALSE(parser::lower(single).has_value());
+}
+
 TEST_CASE("lower_script keeps a cheap repeated binding inlined", "[parser][lower]") {
     // A scan/filter chain is cheap to re-run and inlining preserves each
     // consumer's own selection pushdown, so it is not shared.

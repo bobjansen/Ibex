@@ -4,6 +4,7 @@
 #include <ibex/codegen/emitter.hpp>
 #include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
+#include <ibex/ir/model_accessors.hpp>
 #include <ibex/ir/node.hpp>
 
 #include <cmath>
@@ -107,6 +108,7 @@ void Emitter::emit(std::ostream& out, const Script& script, const Config& config
 
     named_tables_.clear();
     resource_vars_.clear();
+    model_vars_.clear();
     const std::string result_var = emit_script_steps(script);
     if (result_var.empty()) {
         // The script ends in an effect (`adbc_close(db);`): there is no table to
@@ -123,6 +125,10 @@ void Emitter::emit(std::ostream& out, const Script& script, const Config& config
 }
 
 auto Emitter::callee_name(const std::string& callee) const -> std::string {
+    // `coef(m)` and `model_coef(m)` are the same call, of the ops layer.
+    if (ir::is_model_table_accessor(callee) || ir::is_model_scalar_accessor(callee)) {
+        return "ibex::ops::" + (callee.starts_with("model_") ? callee : "model_" + callee);
+    }
     return user_functions_.contains(callee) ? "_ibex_fn_" + callee : callee;
 }
 
@@ -186,7 +192,14 @@ auto Emitter::emit_script_steps(const Script& script) -> std::string {
                 if (step.plan == nullptr) {
                     throw std::runtime_error("ibex_compile: shared binding has no plan");
                 }
+                last_model_.clear();
                 named_tables_[step.name] = emit_node(*step.plan);
+                // A binding that fits a model is also that model, by the same name.
+                if (step.plan->kind() == ir::NodeKind::Model) {
+                    model_vars_[step.name] = last_model_;
+                } else {
+                    model_vars_.erase(step.name);
+                }
                 break;
             }
             case Script::Step::Kind::Sink: {
@@ -734,7 +747,9 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 tuple_sources.emplace_back(tf.aliases, emit_node(*tf.source));
             }
 
-            *out_ << "    auto " << var << " = ibex::ops::update(" << child << ", {\n";
+            *out_ << "    auto " << var
+                  << " = ibex::ops::" << (upd.guard() != nullptr ? "update_where" : "update") << "("
+                  << child << ", {\n";
             bool first = true;
             for (const auto& f : upd.fields()) {
                 if (!first)
@@ -769,7 +784,11 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 first_group = false;
                 *out_ << '"' << escape_string(key.name) << '"';
             }
-            *out_ << "});\n";
+            *out_ << "}";
+            if (upd.guard() != nullptr) {
+                *out_ << ", " << emit_expr(*upd.guard());
+            }
+            *out_ << ");\n";
             return var;
         }
 
@@ -813,23 +832,22 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             if (window_child.kind() != ir::NodeKind::Update) {
                 throw std::runtime_error("ibex_compile: WindowNode must have an UpdateNode child");
             }
-            if (win.select_only()) {
-                throw std::runtime_error(
-                    "ibex_compile: window + select is not yet supported in the compiled path");
-            }
-            if (win.aligned()) {
-                throw std::runtime_error(
-                    "ibex_compile: aligned window is not yet supported in the compiled path");
-            }
             const auto& upd = ir::node_cast<ir::UpdateNode>(window_child);
-            if (!upd.tuple_fields().empty()) {
+            // The interpreter rejects these too; saying so here beats a program
+            // that always fails when it runs.
+            if (!upd.tuple_fields().empty() || upd.guard() != nullptr) {
                 throw std::runtime_error(
-                    "ibex_compile: windowed update with tuple fields is not supported in the "
-                    "compiled path");
+                    "ibex_compile: a window update does not support tuple fields or a "
+                    "`where` guard");
             }
             auto source = emit_node(require_single_child(upd, "UpdateNode (window payload)"));
             auto var = fresh_var();
-            *out_ << "    auto " << var << " = ibex::ops::windowed_update(" << source << ",\n";
+            // The common `window + update` keeps its short form; the `select` and
+            // `aligned` forms take the full one.
+            const bool full = win.select_only() || win.aligned();
+            *out_ << "    auto " << var
+                  << " = ibex::ops::" << (full ? "window_update" : "windowed_update") << "("
+                  << source << ",\n";
             *out_ << "        ibex::ir::Duration(" << win.duration().count() << "LL),\n";
             *out_ << "        {";
             bool first = true;
@@ -848,7 +866,12 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 first_group = false;
                 *out_ << '"' << escape_string(key.name) << '"';
             }
-            *out_ << "});\n";
+            *out_ << "}";
+            if (full) {
+                *out_ << ", " << (win.select_only() ? "true" : "false") << ", "
+                      << (win.aligned() ? "true" : "false");
+            }
+            *out_ << ");\n";
             return var;
         }
 
@@ -1166,9 +1189,49 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
         }
 
         case ir::NodeKind::Model: {
-            // Model fitting is not yet supported in codegen — it requires the full
-            // runtime interpreter.  Emit a placeholder that errors at compile time.
-            throw std::runtime_error("model clause is not yet supported in compiled mode");
+            const auto& mn = ir::node_cast<ir::ModelNode>(node);
+            // Only the built-in methods fit in a compiled program: a plugin's
+            // method lives in a plugin the program has no registry to load.
+            if (mn.method() != "ols" && mn.method() != "ridge" && mn.method() != "wls") {
+                throw std::runtime_error("ibex_compile: model method '" + mn.method() +
+                                         "' comes from a plugin, which compiled programs do not "
+                                         "support yet (built in: ols, ridge, wls)");
+            }
+            auto child = emit_node(require_single_child(mn, "ModelNode"));
+            const std::string model_var = "_model" + std::to_string(tmp_counter_++);
+            auto var = fresh_var();
+            *out_ << "    ibex::runtime::ModelResult " << model_var << ";\n";
+            *out_ << "    auto " << var << " = ibex::ops::fit_model(" << child
+                  << ", ibex::ir::ModelFormula{\"" << escape_string(mn.formula().response)
+                  << "\", {";
+            bool first_term = true;
+            for (const auto& term : mn.formula().terms) {
+                if (!first_term)
+                    *out_ << ", ";
+                first_term = false;
+                *out_ << "ibex::ir::ModelTerm{{";
+                bool first_column = true;
+                for (const auto& column : term.columns) {
+                    if (!first_column)
+                        *out_ << ", ";
+                    first_column = false;
+                    *out_ << '"' << escape_string(column) << '"';
+                }
+                *out_ << "}, " << (term.is_dot ? "true" : "false") << "}";
+            }
+            *out_ << "}, " << (mn.formula().has_intercept ? "true" : "false") << "}, \""
+                  << escape_string(mn.method()) << "\", {";
+            bool first_param = true;
+            for (const auto& param : mn.params()) {
+                if (!first_param)
+                    *out_ << ", ";
+                first_param = false;
+                *out_ << "ibex::ir::ModelParamSpec{\"" << escape_string(param.name) << "\", "
+                      << emit_expr(param.value) << "}";
+            }
+            *out_ << "}, " << model_var << ");\n";
+            last_model_ = model_var;
+            return var;
         }
 
         case ir::NodeKind::Construct: {
@@ -1792,6 +1855,9 @@ auto Emitter::emit_raw_expr(const ir::Expr& expr) -> std::string {
                 if (const auto held = resource_vars_.find(node.name);
                     held != resource_vars_.end()) {
                     return held->second;
+                }
+                if (const auto model = model_vars_.find(node.name); model != model_vars_.end()) {
+                    return model->second;
                 }
                 if (const auto table = named_tables_.find(node.name);
                     table != named_tables_.end()) {

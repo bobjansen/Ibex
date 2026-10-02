@@ -1,0 +1,5 @@
+// A fitted model: `let m = df[model { ... }]` fits once, where the statement is, and
+// `summary(m)` reads it. The same fit as the interpreter, through ibex::ops::fit_model.
+let t = Table { x = [1.0, 2.0, 3.0, 4.0, 5.0], y = [2.1, 3.9, 6.2, 7.8, 10.1] };
+let m = t[model { y ~ x, method = ols }];
+summary(m);

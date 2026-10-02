@@ -10,6 +10,7 @@
 #include <ibex/runtime/ops.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <cstdint>
 #include <optional>
@@ -372,7 +373,53 @@ TEST_CASE("emitter: window node - tuple fields are still rejected", "[codegen]")
     auto win = b.window(ir::Duration(min_ns));
     win->add_child(std::move(upd));
 
-    REQUIRE_THROWS(emit_to_string(*win));
+    // The interpreter rejects them too, so the compiler says so up front.
+    REQUIRE_THROWS_WITH(emit_to_string(*win), Catch::Matchers::ContainsSubstring("tuple fields"));
+}
+
+TEST_CASE("emitter: window + select and aligned windows take the full form", "[codegen]") {
+    ir::Builder b;
+    constexpr std::int64_t ns = 2LL * 1'000'000'000LL;
+    const auto make = [&](bool select_only, bool aligned) {
+        auto price_arg = ir::make_expr_ptr(ir::Expr{ir::ColumnRef{.name = "price"}});
+        auto upd = b.update(
+            {ir::FieldSpec{.alias = "m",
+                           .expr = ir::Expr{ir::CallExpr{
+                               .callee = "rolling_mean", .args = {price_arg}, .named_args = {}}}}});
+        upd->add_child(make_source(b, "ticks.csv"));
+        auto win = b.window(ir::Duration(ns), select_only, aligned);
+        win->add_child(std::move(upd));
+        return win;
+    };
+
+    const auto select_form = emit_to_string(*make(/*select_only=*/true, /*aligned=*/false));
+    CHECK(contains(select_form, "ibex::ops::window_update("));
+    CHECK(contains(select_form, "}, true, false);"));
+
+    const auto aligned_form = emit_to_string(*make(false, true));
+    CHECK(contains(aligned_form, "ibex::ops::window_update("));
+    CHECK(contains(aligned_form, "}, false, true);"));
+
+    // The plain `window + update` keeps its short form.
+    const auto plain = emit_to_string(*make(false, false));
+    CHECK(contains(plain, "ibex::ops::windowed_update("));
+    CHECK_FALSE(contains(plain, "window_update("));
+}
+
+TEST_CASE("emitter: a guarded update keeps its guard", "[codegen]") {
+    ir::Builder b;
+    auto upd = b.update(
+        {ir::FieldSpec{.alias = "y", .expr = ir::Expr{ir::Literal{.value = std::int64_t{0}}}}});
+    upd->set_guard(ir::Expr{ir::CompareExpr{
+        .op = ir::CompareOp::Gt,
+        .left = ir::make_expr_ptr(ir::Expr{ir::ColumnRef{.name = "x"}}),
+        .right = ir::make_expr_ptr(ir::Expr{ir::Literal{.value = std::int64_t{2}}})}});
+    upd->add_child(make_source(b, "in.csv"));
+
+    const auto out = emit_to_string(*upd);
+    // Dropping the guard updated every row.
+    CHECK(contains(out, "ibex::ops::update_where("));
+    CHECK(contains(out, "CompareOp::Gt"));
 }
 
 // --- Update ------------------------------------------------------------------
@@ -1174,4 +1221,50 @@ TEST_CASE("emitter: a program function is declared, takes its parameters, and is
     // The call from the program is spelled with the prefix.
     CHECK(contains(out, "auto _res"));
     CHECK(contains(out, "_ibex_fn_pick(_res"));
+}
+
+TEST_CASE("emitter: a fitted model is a variable, and its accessors read it", "[codegen]") {
+    ir::Builder b;
+    auto fit = b.model(ir::ModelFormula{"y", {ir::ModelTerm{{"x1", "x2"}, false}}, true}, "ridge",
+                       {ir::ModelParamSpec{"lambda", ir::Expr{ir::Literal{.value = 0.5}}}});
+    fit->add_child(make_source(b, "in.csv"));
+    auto coef = b.extern_call("coef", {ir::Expr{ir::ColumnRef{.name = "m"}}});
+    auto r2 = b.extern_call("r_squared", {ir::Expr{ir::ColumnRef{.name = "m"}}});
+
+    codegen::Emitter::Script script;
+    codegen::Emitter::Script::Step fit_step;
+    fit_step.kind = codegen::Emitter::Script::Step::Kind::SharedBinding;
+    fit_step.name = "m";
+    fit_step.plan = fit.get();
+    script.steps.push_back(std::move(fit_step));
+    codegen::Emitter::Script::Step r2_step;
+    r2_step.kind = codegen::Emitter::Script::Step::Kind::Call;
+    r2_step.plan = r2.get();
+    r2_step.bind = "r2";
+    script.steps.push_back(std::move(r2_step));
+    script.result = coef.get();
+
+    codegen::Emitter::Config config;
+    config.runtime_scalar_names = {"r2"};
+    std::ostringstream oss;
+    codegen::Emitter emitter;
+    emitter.emit(oss, script, config);
+    const auto out = oss.str();
+
+    CHECK(contains(out, "ibex::runtime::ModelResult _model"));
+    CHECK(contains(out, "ibex::ops::fit_model("));
+    CHECK(contains(
+        out,
+        "ibex::ir::ModelFormula{\"y\", {ibex::ir::ModelTerm{{\"x1\", \"x2\"}, false}}, true}"));
+    CHECK(contains(out, "\"ridge\", {ibex::ir::ModelParamSpec{\"lambda\""));
+    // `coef` and `r_squared` are the ops layer's `model_coef` / `model_r_squared`.
+    CHECK(contains(out, "ibex::ops::model_coef(_model"));
+    CHECK(contains(out, "ibex::runtime::ScalarValue(ibex::ops::model_r_squared(_model"));
+}
+
+TEST_CASE("emitter: a model method that comes from a plugin is refused", "[codegen]") {
+    ir::Builder b;
+    auto fit = b.model(ir::ModelFormula{"y", {ir::ModelTerm{{"x"}, false}}, true}, "lightgbm", {});
+    fit->add_child(make_source(b, "in.csv"));
+    REQUIRE_THROWS_WITH(emit_to_string(*fit), Catch::Matchers::ContainsSubstring("plugin"));
 }

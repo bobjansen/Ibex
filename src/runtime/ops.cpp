@@ -246,22 +246,21 @@ auto map(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields) -> r
     return delegate(std::move(map_node), t);
 }
 
-auto update(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields,
-            const std::vector<TupleSource>& tuple_sources, const std::vector<std::string>& group_by)
-    -> runtime::Table {
-    if (tuple_sources.empty() && group_by.empty()) {
-        return update(t, fields);
-    }
+namespace {
 
-    ir::Builder b;
-    auto scan_node = b.scan(kSrcKey);
-
-    runtime::TableRegistry reg;
+/// An Update node over the scratch source, with its tuple sources registered in
+/// `reg` under names of their own. Shared by every form of update that needs a
+/// registry rather than one scratch table.
+auto make_update_node(ir::Builder& b, const runtime::Table& t,
+                      const std::vector<ir::FieldSpec>& fields,
+                      const std::vector<TupleSource>& tuple_sources,
+                      const std::vector<std::string>& group_by,
+                      const std::optional<ir::Expr>& guard, runtime::TableRegistry& reg)
+    -> ir::NodePtr {
     reg.emplace(kSrcKey, t);
 
     std::vector<ir::TupleFieldSpec> tuple_specs;
     tuple_specs.reserve(tuple_sources.size());
-
     for (std::size_t i = 0; i < tuple_sources.size(); ++i) {
         const auto source_name = "__ibex_tuple_" + std::to_string(i);
         reg.emplace(source_name, tuple_sources[i].table);
@@ -272,8 +271,47 @@ auto update(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields,
     }
 
     auto upd_node = b.update(fields, std::move(tuple_specs), to_col_refs(group_by));
-    upd_node->add_child(std::move(scan_node));
+    if (guard.has_value()) {
+        upd_node->set_guard(*guard);
+    }
+    upd_node->add_child(b.scan(kSrcKey));
+    return upd_node;
+}
+
+}  // namespace
+
+auto update(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields,
+            const std::vector<TupleSource>& tuple_sources, const std::vector<std::string>& group_by)
+    -> runtime::Table {
+    if (tuple_sources.empty() && group_by.empty()) {
+        return update(t, fields);
+    }
+    ir::Builder b;
+    runtime::TableRegistry reg;
+    auto upd_node = make_update_node(b, t, fields, tuple_sources, group_by, std::nullopt, reg);
     return delegate_with_registry(std::move(upd_node), reg);
+}
+
+auto update_where(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields,
+                  const std::vector<TupleSource>& tuple_sources,
+                  const std::vector<std::string>& group_by, ir::Expr guard) -> runtime::Table {
+    ir::Builder b;
+    runtime::TableRegistry reg;
+    auto upd_node = make_update_node(b, t, fields, tuple_sources, group_by, std::move(guard), reg);
+    return delegate_with_registry(std::move(upd_node), reg);
+}
+
+auto window_update(const runtime::Table& t, ir::Duration duration,
+                   const std::vector<ir::FieldSpec>& fields,
+                   const std::vector<std::string>& group_by, bool select_only, bool aligned)
+    -> runtime::Table {
+    ir::Builder b;
+    auto scan_node = b.scan(kSrcKey);
+    auto upd_node = b.update(fields, {}, to_col_refs(group_by));
+    upd_node->add_child(std::move(scan_node));
+    auto win_node = b.window(duration, select_only, aligned);
+    win_node->add_child(std::move(upd_node));
+    return delegate(std::move(win_node), t);
 }
 
 auto rename(const runtime::Table& t, const std::vector<ir::RenameSpec>& renames) -> runtime::Table {
@@ -387,6 +425,21 @@ auto rbind(const std::vector<runtime::Table>& tables) -> runtime::Table {
         reg.emplace(std::move(key), tables[i]);
     }
     return delegate_with_registry(std::move(node), reg);
+}
+
+auto fit_model(const runtime::Table& t, ir::ModelFormula formula, std::string method,
+               std::vector<ir::ModelParamSpec> params, runtime::ModelResult& out)
+    -> runtime::Table {
+    ir::Builder b;
+    auto node = b.model(std::move(formula), std::move(method), std::move(params));
+    node->add_child(b.scan(kSrcKey));
+    runtime::TableRegistry reg;
+    reg.emplace(kSrcKey, t);
+    auto result = runtime::interpret(*node, reg, scalars_ptr(), nullptr, &out);
+    if (!result) {
+        throw std::runtime_error(result.error());
+    }
+    return std::move(*result);
 }
 
 auto model_coef(const runtime::ModelResult& m) -> runtime::Table {

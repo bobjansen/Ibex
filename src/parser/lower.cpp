@@ -63,6 +63,7 @@
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/join_pushdown.hpp>
 #include <ibex/ir/join_semi_reduction.hpp>
+#include <ibex/ir/model_accessors.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/optimizer.hpp>
 #include <ibex/ir/pending_order.hpp>
@@ -1877,6 +1878,14 @@ class Lowerer {
         if (call == nullptr) {
             return nullptr;
         }
+        // `r_squared(m)`: a scalar read off a fitted model, in order with the
+        // statements that fit it.
+        if (script_mode_ && ir::is_model_scalar_accessor(call->callee) && call->args.size() == 1) {
+            const auto* name = std::get_if<IdentifierExpr>(&call->args[0]->node);
+            if (name != nullptr && model_names_.contains(name->name)) {
+                return call;
+            }
+        }
         const auto* sig = find_callable(call->callee);
         if (sig == nullptr || sig->return_type->kind == Type::Kind::DataFrame ||
             sig->return_type->kind == Type::Kind::TimeFrame) {
@@ -2097,6 +2106,7 @@ class Lowerer {
                     }
                     continue;
                 }
+                model_names_.erase(let_stmt.name);
                 // Does this `let` bind a resource? Then a name that was one stays
                 // one; otherwise it stops being one when the statement is done.
                 const auto* resource_call = is_scalar_extern_call(*let_stmt.value);
@@ -2179,7 +2189,16 @@ class Lowerer {
                     continue;
                 }
                 if (bindings_ != nullptr) {
-                    if (plan_calls_resource_function(*value.value())) {
+                    if (value.value()->kind() == ir::NodeKind::Model) {
+                        // A fitted model is a value of the program: fitted once,
+                        // where the `let` is, and read by name afterwards.
+                        bindings_->erase(let_stmt.name);
+                        binding_schemas_.erase(let_stmt.name);
+                        model_names_.insert(let_stmt.name);
+                        shared_bindings_.push_back(SharedBinding{.name = let_stmt.name,
+                                                                 .plan = std::move(value.value()),
+                                                                 .position = position});
+                    } else if (plan_calls_resource_function(*value.value())) {
                         // A plan that calls a resource function runs at its
                         // statement, once, whatever the number of readers: the
                         // call may write, and a second run would write twice.
@@ -2250,6 +2269,15 @@ class Lowerer {
                 }
                 auto value = lower_expr(*expr_stmt.expr);
                 if (!value.has_value()) {
+                    // An accessor of something that is not a fitted model: say so,
+                    // rather than taking it for a call of an unknown function.
+                    if (const auto* accessor = std::get_if<CallExpr>(&expr_stmt.expr->node);
+                        accessor != nullptr && (ir::is_model_table_accessor(accessor->callee) ||
+                                                ir::is_model_scalar_accessor(accessor->callee))) {
+                        return std::unexpected(LowerError{
+                            .message = accessor->callee +
+                                       ": expected the name of a model bound with `let`"});
+                    }
                     // Not a table expression — check whether it's a scalar call
                     // (e.g. ws_listen(8765)) used purely for its side effect.
                     if (const auto* call = std::get_if<CallExpr>(&expr_stmt.expr->node);
@@ -2403,6 +2431,12 @@ class Lowerer {
             // `lower_script` lets a program end in an effect; a single plan needs
             // a table to be.
             return std::unexpected(LowerError{.message = "no expression to lower"});
+        }
+        if (std::ranges::any_of(plan->shared_bindings, [](const SharedBinding& binding) {
+                return binding.plan != nullptr && binding.plan->kind() == ir::NodeKind::Model;
+            })) {
+            return std::unexpected(
+                LowerError{.message = "a fitted model `let` requires lower_script()"});
         }
         if (!plan->resource_steps.empty() ||
             std::ranges::any_of(plan->preamble_binds,
@@ -2678,6 +2712,18 @@ class Lowerer {
             }
             return node;
         }
+        if (script_mode_ && ir::is_model_table_accessor(call.callee)) {
+            const auto* name = call.args.size() == 1 && call.named_args.empty()
+                                   ? std::get_if<IdentifierExpr>(&call.args[0]->node)
+                                   : nullptr;
+            if (name == nullptr || !model_names_.contains(name->name)) {
+                return std::unexpected(LowerError{
+                    .message = call.callee + ": expected the name of a model bound with `let`"});
+            }
+            std::vector<ir::Expr> args;
+            args.push_back(ir::Expr{.node = ir::ColumnRef{.name = name->name}});
+            return builder_.extern_call(call.callee, std::move(args));
+        }
         if (call.callee == "columns") {
             if (call.args.size() != 1 || !call.named_args.empty()) {
                 return std::unexpected(LowerError{.message = "columns expects exactly 1 argument"});
@@ -2799,9 +2845,13 @@ class Lowerer {
         if (!resource_functions_.has_value()) {
             return false;
         }
-        if (plan.kind() == ir::NodeKind::ExternCall &&
-            resource_functions_->contains(ir::node_cast<ir::ExternCallNode>(plan).callee())) {
-            return true;
+        if (plan.kind() == ir::NodeKind::ExternCall) {
+            const auto& callee = ir::node_cast<ir::ExternCallNode>(plan).callee();
+            // A model accessor names a model by its binding, so it must read the
+            // model that is bound where it is written, not one bound later.
+            if (resource_functions_->contains(callee) || ir::is_model_table_accessor(callee)) {
+                return true;
+            }
         }
         return std::ranges::any_of(plan.children(), [this](const auto& child) {
             return child != nullptr && plan_calls_resource_function(*child);
@@ -6423,6 +6473,9 @@ class Lowerer {
     std::vector<std::optional<CallBind>> preamble_binds_;
     std::size_t synthetic_counter_ = 0;
     std::optional<ResourceFunctions> resource_functions_;
+    /// Names bound to a fitted model (`let m = df[model { ... }]`), as of the
+    /// statement being lowered.
+    robin_hood::unordered_set<std::string> model_names_;
     mutable std::map<std::string, CallableSig> callable_cache_;
     /// The function whose body this lowerer is lowering, or null for the program.
     const FunctionDecl* function_ = nullptr;

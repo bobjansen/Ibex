@@ -311,7 +311,10 @@ int main(int argc, char* argv[]) {
         scripted.has_value() &&
         (!scripted->sinks.empty() ||
          std::ranges::any_of(scripted->preamble_binds,
-                             [](const auto& bind) { return bind.has_value(); }))) {
+                             [](const auto& bind) { return bind.has_value(); }) ||
+         std::ranges::any_of(scripted->shared_bindings, [](const auto& binding) {
+             return binding.plan != nullptr && binding.plan->kind() == ibex::ir::NodeKind::Model;
+         }))) {
         script_plan = std::move(*scripted);
     }
     ibex::parser::LowerResult ir = ibex::ir::NodePtr{};

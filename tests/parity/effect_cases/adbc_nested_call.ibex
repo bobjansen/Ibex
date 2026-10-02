@@ -1,0 +1,7 @@
+// A connection opened inside another call's argument is a temporary of that
+// statement: the inner call runs first, its connection is the argument, and it is
+// released when the statement is done. The data it wrote is there for the next one.
+import "adbc";
+adbc_execute(adbc_connect("@SQLITE_DRIVER@", "file:/tmp/ibex_parity_adbc_nested_call.db"), "create table t as select 7 as x");
+let db = adbc_connect("@SQLITE_DRIVER@", "file:/tmp/ibex_parity_adbc_nested_call.db");
+adbc_query(db, "select x from t");

@@ -251,11 +251,16 @@ int main(int argc, char* argv[]) {
         ibex::codegen::Emitter::Script::Step step;
         step.kind = ibex::codegen::Emitter::Script::Step::Kind::Call;
         step.plan = script_plan->preamble[i].get();
+        bool hoisted = false;
         if (i < script_plan->preamble_binds.size() && script_plan->preamble_binds[i].has_value()) {
             step.bind = script_plan->preamble_binds[i]->name;
             step.bind_resource = script_plan->preamble_binds[i]->resource;
+            hoisted = script_plan->preamble_binds[i]->hoisted;
         }
-        ordered.emplace_back(script_plan->preamble_positions.at(i) * 4 + 1, std::move(step));
+        // A call nested in another's argument runs before the statement's own
+        // bindings, which may need it.
+        ordered.emplace_back(script_plan->preamble_positions.at(i) * 4 + (hoisted ? 0U : 1U),
+                             std::move(step));
     }
     for (const auto& shared : script_plan->shared_bindings) {
         ibex::codegen::Emitter::Script::Step step;

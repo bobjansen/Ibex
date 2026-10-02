@@ -8608,6 +8608,94 @@ TEST_CASE("grouped update mixes native reductions and materialized fields in dec
     }
 }
 
+TEST_CASE("grouped ordered kernels match a naive per-group reference over adopted validity",
+          "[update][groupby][fill]") {
+    // lag / lead / cumsum / fill_forward / fill_backward over CSR groups read the
+    // input, output and bitmap through pointers resolved once. Held to a per-
+    // group reference over an adopted bitmap at a bit offset (it breaks if the
+    // offset is dropped) and interleaved groups, so each group's rows are
+    // scattered across the table.
+    constexpr std::size_t kRows = 300;
+    constexpr std::size_t kOffset = 6;
+    const auto valid_at = [](std::size_t row) { return row % 4 != 1 && row % 9 != 2; };
+
+    auto bytes = std::make_shared<std::vector<std::uint8_t>>((kOffset + kRows + 7) / 8, 0);
+    for (std::size_t row = 0; row < kRows; ++row) {
+        if (valid_at(row)) {
+            (*bytes)[(kOffset + row) / 8] |= static_cast<std::uint8_t>(1U << ((kOffset + row) % 8));
+        }
+    }
+    Column<std::int64_t> g;
+    Column<std::int64_t> v;
+    for (std::size_t row = 0; row < kRows; ++row) {
+        g.push_back(static_cast<std::int64_t>(row % 7));
+        v.push_back(static_cast<std::int64_t>(row * 3 + 1));
+    }
+    runtime::Table t;
+    t.add_column("g", std::move(g));
+    t.add_column("v", std::move(v));
+    t.columns[1].validity =
+        runtime::ValidityBitmap::from_external(bytes, bytes->data(), kOffset, kRows);
+    REQUIRE(t.columns[1].validity->is_external());
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir(
+        "t[update { ff = fill_forward(v), fb = fill_backward(v), cs = cumsum(v), "
+        "lg = lag(v, 2), ld = lead(v, 1) }, by g];");
+    auto out = runtime::interpret(*ir, registry);
+    REQUIRE(out.has_value());
+
+    const auto col = [&](const char* name) -> const Column<std::int64_t>& {
+        return std::get<Column<std::int64_t>>(*out->find(name));
+    };
+    const auto value = [](std::size_t row) { return static_cast<std::int64_t>(row * 3 + 1); };
+    for (std::size_t group = 0; group < 7; ++group) {
+        std::vector<std::size_t> rows;
+        for (std::size_t row = group; row < kRows; row += 7) {
+            rows.push_back(row);
+        }
+        std::int64_t carry = 0;
+        bool have = false;
+        std::int64_t sum = 0;
+        for (std::size_t k = 0; k < rows.size(); ++k) {
+            const auto row = rows[k];
+            INFO("group " << group << " row " << row);
+            // cumsum adds the stored value whether or not the cell is null.
+            sum += value(row);
+            CHECK(col("cs")[row] == sum);
+            if (valid_at(row)) {
+                carry = value(row);
+                have = true;
+            }
+            if (have) {
+                CHECK(col("ff")[row] == carry);
+            }
+            CHECK(runtime::is_null(*out->find_entry("ff"), row) == !have);
+            if (k >= 2) {
+                CHECK(col("lg")[row] == value(rows[k - 2]));
+            }
+            CHECK(runtime::is_null(*out->find_entry("lg"), row) == (k < 2));
+            if (k + 1 < rows.size()) {
+                CHECK(col("ld")[row] == value(rows[k + 1]));
+            }
+        }
+        have = false;
+        for (std::size_t k = rows.size(); k-- > 0;) {
+            const auto row = rows[k];
+            INFO("group " << group << " row " << row << " (backward)");
+            if (valid_at(row)) {
+                carry = value(row);
+                have = true;
+            }
+            if (have) {
+                CHECK(col("fb")[row] == carry);
+            }
+            CHECK(runtime::is_null(*out->find_entry("fb"), row) == !have);
+        }
+    }
+}
+
 TEST_CASE("grouped row-local update bypasses group materialization",
           "[update][groupby][row_local]") {
     runtime::Table t;

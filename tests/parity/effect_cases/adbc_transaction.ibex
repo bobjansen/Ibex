@@ -1,0 +1,14 @@
+// A transaction across statements of one connection: what is rolled back is gone,
+// what is committed stays.
+import "adbc";
+let db = adbc_connect("@SQLITE_DRIVER@", "file:/tmp/ibex_parity_adbc_transaction.db");
+adbc_execute(db, "create table t (x integer)");
+adbc_begin(db);
+adbc_execute(db, "insert into t values (1)");
+adbc_rollback(db);
+let after_rollback = adbc_query(db, "select count(*) as n from t");
+adbc_begin(db);
+adbc_execute(db, "insert into t values (2), (3)");
+adbc_commit(db);
+let after_commit = adbc_query(db, "select count(*) as n from t");
+rbind(after_rollback, after_commit);

@@ -412,7 +412,7 @@ trades[<span class="kw">update</span> { n = ^n }];</code></pre>
       <article class="card">
         <h3>Language and tools</h3>
         <ul>
-          <li><code>ibex_compile</code> rejects programs that call resource functions; run them with <code>ibex</code>.</li>
+          <li><code>ibex_compile</code> compiles connections used at the top level of a script (<code>let db = adbc_connect(...)</code>, aliases, <code>adbc_execute</code> / <code>adbc_query</code> / transactions on it, and releasing it by rebinding the name), but not a <code>fn</code> that takes, opens or returns a connection, nor a connection call nested inside another call's arguments; bind it with <code>let</code> first, or run the script with <code>ibex</code>.</li>
           <li>Scripts that call resource functions run statement by statement rather than through the whole-script planner.</li>
           <li>No resource-typed <code>let</code> annotations, columns, or default parameter values.</li>
           <li><code>mutable</code> on a resource parameter documents intent but is not enforced.</li>

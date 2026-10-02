@@ -293,6 +293,7 @@ struct DeferredWrap {
     int deferred_counter = 0;
 
     LowerContext lower_ctx;
+    lower_ctx.table_args_as_bindings = true;
     // Externs that return a scalar, by name.
     robin_hood::unordered_set<std::string> scalar_externs;
 

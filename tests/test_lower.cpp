@@ -613,7 +613,9 @@ t[filter a > rows];
     CHECK(lowered->sinks[0].position == 2);
     REQUIRE(lowered->preamble.size() == 2);
     REQUIRE(lowered->preamble_binds.size() == 2);
-    CHECK(lowered->preamble_binds[0] == std::optional<std::string>{"pong"});
+    REQUIRE(lowered->preamble_binds[0].has_value());
+    CHECK(lowered->preamble_binds[0]->name == "pong");
+    CHECK_FALSE(lowered->preamble_binds[0]->resource);
     CHECK(lowered->preamble_positions[0] == 3);
     // An unbound call statement binds nothing.
     CHECK_FALSE(lowered->preamble_binds[1].has_value());
@@ -646,6 +648,114 @@ r;
     REQUIRE(lowered.has_value());
     REQUIRE(lowered->shared_bindings.size() == 1);
     CHECK(lowered->shared_bindings[0].name == "r");
+}
+
+namespace {
+
+constexpr std::string_view kResourceDecls = R"IBEX(
+extern type Conn from "x.hpp";
+extern fn open(uri: String) -> Conn from "x.hpp";
+extern fn run(mutable db: Conn, sql: String, params: DataFrame = Table {}) -> Int from "x.hpp";
+extern fn load(mutable db: Conn, sql: String) -> DataFrame from "x.hpp";
+extern fn put(mutable db: Conn, df: DataFrame, name: String) -> Int from "x.hpp";
+)IBEX";
+
+auto lower_resource_script(std::string_view body) -> parser::ScriptPlanResult {
+    static std::vector<parser::Program> keep_alive;
+    keep_alive.push_back(require_parse((std::string(kResourceDecls) + std::string(body)).c_str()));
+    return parser::lower_script(keep_alive.back());
+}
+
+}  // namespace
+
+TEST_CASE("lower_script binds a resource, and a call on it sees defaults and table arguments",
+          "[parser][lower][resource]") {
+    auto lowered = lower_resource_script(R"IBEX(
+let db = open("file:x");
+run(db, "create table t (x integer)");
+let n = run(db, "insert into t values (1)");
+put(db, Table { x = [1, 2] }, "t");
+t;
+)IBEX");
+    REQUIRE(lowered.has_value());
+    REQUIRE(lowered->preamble.size() == 4);
+    REQUIRE(lowered->preamble_binds[0].has_value());
+    CHECK(lowered->preamble_binds[0]->name == "db");
+    CHECK(lowered->preamble_binds[0]->resource);
+    // A scalar result of a call on the connection is still a scalar.
+    REQUIRE(lowered->preamble_binds[2].has_value());
+    CHECK(lowered->preamble_binds[2]->name == "n");
+    CHECK_FALSE(lowered->preamble_binds[2]->resource);
+
+    // `run`'s defaulted `params` is a table, and so is `put`'s `df`: each is a
+    // binding of its own at the statement, named by the argument.
+    const auto* run_call = as_node<ir::ExternCallNode>(lowered->preamble[1].get());
+    REQUIRE(run_call != nullptr);
+    CHECK(run_call->args().size() == 3);
+    const auto* params = std::get_if<ir::ColumnRef>(&run_call->args()[2].node);
+    REQUIRE(params != nullptr);
+    std::size_t synthetic = 0;
+    for (const auto& shared : lowered->shared_bindings) {
+        synthetic += shared.name.starts_with("__ibex_arg_") ? 1U : 0U;
+    }
+    CHECK(synthetic == 3);  // run's params (twice) and put's df, plus the insert's params
+}
+
+TEST_CASE("lower_script runs a resource table call once, where it is, however it is used",
+          "[parser][lower][resource]") {
+    auto lowered = lower_resource_script(R"IBEX(
+let db = open("file:x");
+let once = load(db, "select 1");
+let unused = load(db, "select 2");
+load(db, "select 3");
+once join once on x;
+)IBEX");
+    REQUIRE(lowered.has_value());
+    // `once` is read twice and `unused` never, yet each is a shared binding at
+    // its own statement, and the dropped statement runs too.
+    std::vector<std::string> shared;
+    for (const auto& binding : lowered->shared_bindings) {
+        shared.push_back(binding.name);
+    }
+    REQUIRE(shared.size() >= 3);
+    CHECK(std::ranges::find(shared, "once") != shared.end());
+    CHECK(std::ranges::find(shared, "unused") != shared.end());
+    CHECK(std::ranges::any_of(shared,
+                              [](const auto& name) { return name.starts_with("__ibex_stmt_"); }));
+}
+
+TEST_CASE("lower_script records resource aliases and releases", "[parser][lower][resource]") {
+    auto lowered = lower_resource_script(R"IBEX(
+let a = open("file:x");
+let b = a;
+let a = 0;
+let t = Table { x = [1] };
+t;
+)IBEX");
+    REQUIRE(lowered.has_value());
+    REQUIRE(lowered->resource_steps.size() == 2);
+    CHECK(lowered->resource_steps[0].kind == parser::ResourceStep::Kind::Alias);
+    CHECK(lowered->resource_steps[0].name == "b");
+    CHECK(lowered->resource_steps[0].source == "a");
+    CHECK(lowered->resource_steps[0].position == 6);
+    // `let a = 0;` is not a resource, so it releases `a`: after its statement.
+    CHECK(lowered->resource_steps[1].kind == parser::ResourceStep::Kind::Unbind);
+    CHECK(lowered->resource_steps[1].name == "a");
+    CHECK(lowered->resource_steps[1].position == 7);
+}
+
+TEST_CASE("lower_script refuses a resource call nested in another call's argument",
+          "[parser][lower][resource]") {
+    // The REPL runs the inner call first and passes its result. A compiled
+    // program has no slot for that yet, and lowering the inner call as an
+    // expression would never make it.
+    auto lowered = lower_resource_script(R"IBEX(
+run(open("file:x"), "select 1");
+t;
+)IBEX");
+    REQUIRE_FALSE(lowered.has_value());
+    CHECK(lowered.error().message.find("open") != std::string::npos);
+    CHECK(lowered.error().message.find("bind its result with `let`") != std::string::npos);
 }
 
 TEST_CASE("lower_script keeps a cheap repeated binding inlined", "[parser][lower]") {

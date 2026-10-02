@@ -43,7 +43,21 @@ class ResourceFunctions {
     /// The first resource function `fn`'s body or parameter defaults call.
     [[nodiscard]] auto first_call(const FunctionDecl& fn) const -> std::optional<std::string>;
 
+    /// The first resource call in a statement's value `expr` that nothing would
+    /// run: a call may be the statement's value, a table operand (the base of a
+    /// block, either side of a join, a group or an ascription), or an argument
+    /// of another call; it may not sit inside a query clause, where it would run
+    /// once per row or group. Checked before any call runs, so a misplaced call
+    /// makes no plugin call at all. `kPlacementError` completes the message.
+    [[nodiscard]] auto first_misplaced(const Expr& expr) const -> std::optional<std::string>;
+
+    static constexpr std::string_view kPlacementError =
+        "can be called only as a statement's value, as a table operand, or as an argument of "
+        "another call, not inside a query clause";
+
    private:
+    [[nodiscard]] auto misplaced_in_call(const CallExpr& call) const -> std::optional<std::string>;
+    [[nodiscard]] auto misplaced_below(const Expr& expr) const -> std::optional<std::string>;
     [[nodiscard]] auto contains(std::string_view callee,
                                 robin_hood::unordered_set<std::string>& visiting) const -> bool;
     [[nodiscard]] auto first_call(const FunctionDecl& fn,

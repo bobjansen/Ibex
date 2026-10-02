@@ -1,0 +1,14 @@
+// `let b = a;` is the same connection under a second name; rebinding `a` to a new
+// connection leaves `b` on the old one. Each query goes to the database its name
+// held when the statement ran.
+import "adbc";
+let a = adbc_connect("@SQLITE_DRIVER@", "file:/tmp/ibex_parity_adbc_alias_and_rebind_1.db");
+adbc_execute(a, "create table t (x integer)");
+let b = a;
+adbc_execute(b, "insert into t values (1), (2)");
+let a = adbc_connect("@SQLITE_DRIVER@", "file:/tmp/ibex_parity_adbc_alias_and_rebind_2.db");
+adbc_execute(a, "create table t (x integer)");
+adbc_execute(a, "insert into t values (100)");
+let first = adbc_query(b, "select sum(x) as total from t");
+let second = adbc_query(a, "select sum(x) as total from t");
+rbind(first, second);

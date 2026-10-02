@@ -1025,3 +1025,88 @@ TEST_CASE("emitter: a deferred scalar step runs where it is, not before the othe
     CHECK(write < scalar_read);
     CHECK(contains(out, "_ibex_scalars[\"k\"] = ibex::ops::eval_scalar("));
 }
+
+TEST_CASE("emitter: a resource is a variable, aliased, passed to calls and released", "[codegen]") {
+    ir::Builder b;
+    auto open = b.extern_call("open", {ir::Expr{ir::Literal{std::string("file:x")}}});
+    auto use_a = b.extern_call("run", {ir::Expr{ir::ColumnRef{.name = "a"}},
+                                       ir::Expr{ir::Literal{std::string("select 1")}}});
+    auto use_b = b.extern_call("run", {ir::Expr{ir::ColumnRef{.name = "b"}},
+                                       ir::Expr{ir::Literal{std::string("select 2")}}});
+    auto result = make_source(b, "out.csv");
+
+    codegen::Emitter::Script script;
+    const auto call_step = [](const ir::Node* plan, std::optional<std::string> bind,
+                              bool resource) {
+        codegen::Emitter::Script::Step step;
+        step.kind = codegen::Emitter::Script::Step::Kind::Call;
+        step.plan = plan;
+        step.bind = std::move(bind);
+        step.bind_resource = resource;
+        return step;
+    };
+    script.steps.push_back(call_step(open.get(), "a", true));
+    codegen::Emitter::Script::Step alias;
+    alias.kind = codegen::Emitter::Script::Step::Kind::ResourceAlias;
+    alias.name = "b";
+    alias.alias_of = "a";
+    script.steps.push_back(std::move(alias));
+    script.steps.push_back(call_step(use_b.get(), std::nullopt, false));
+    codegen::Emitter::Script::Step release;
+    release.kind = codegen::Emitter::Script::Step::Kind::ResourceUnbind;
+    release.name = "b";
+    script.steps.push_back(std::move(release));
+    script.steps.push_back(call_step(use_a.get(), std::nullopt, false));
+    script.result = result.get();
+
+    std::ostringstream oss;
+    codegen::Emitter emitter;
+    emitter.emit(oss, script, codegen::Emitter::Config{});
+    const auto out = oss.str();
+
+    const auto opened = out.find("auto _res0_a = open(\"file:x\");");
+    const auto aliased = out.find("auto _res1_b = _res0_a;");
+    const auto used_b = out.find("(void)run(_res1_b, \"select 2\");");
+    const auto released = out.find("_res1_b = {};");
+    const auto used_a = out.find("(void)run(_res0_a, \"select 1\");");
+    REQUIRE(opened != std::string::npos);
+    REQUIRE(aliased != std::string::npos);
+    REQUIRE(used_b != std::string::npos);
+    REQUIRE(released != std::string::npos);
+    REQUIRE(used_a != std::string::npos);
+    CHECK(opened < aliased);
+    CHECK(aliased < used_b);
+    CHECK(used_b < released);
+    // Releasing `b` leaves `a`'s variable alone: a name is released, not the connection.
+    CHECK(released < used_a);
+    CHECK_FALSE(contains(out, "_res0_a = {};"));
+}
+
+TEST_CASE("emitter: rebinding a resource name releases the old variable after the new value",
+          "[codegen]") {
+    ir::Builder b;
+    auto first = b.extern_call("open", {ir::Expr{ir::Literal{std::string("file:1")}}});
+    auto second = b.extern_call("open", {ir::Expr{ir::Literal{std::string("file:2")}}});
+    auto result = make_source(b, "out.csv");
+
+    codegen::Emitter::Script script;
+    for (const ir::Node* plan : {first.get(), second.get()}) {
+        codegen::Emitter::Script::Step step;
+        step.kind = codegen::Emitter::Script::Step::Kind::Call;
+        step.plan = plan;
+        step.bind = "db";
+        step.bind_resource = true;
+        script.steps.push_back(std::move(step));
+    }
+    script.result = result.get();
+
+    std::ostringstream oss;
+    codegen::Emitter emitter;
+    emitter.emit(oss, script, codegen::Emitter::Config{});
+    const auto out = oss.str();
+    const auto second_open = out.find("auto _res1_db = open(\"file:2\");");
+    const auto release_first = out.find("_res0_db = {};");
+    REQUIRE(second_open != std::string::npos);
+    REQUIRE(release_first != std::string::npos);
+    CHECK(second_open < release_first);
+}

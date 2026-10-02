@@ -491,6 +491,30 @@ the driver manager when the generated code includes `adbc.hpp`.
 
 ### W6c — resource values in the emitter
 
+**Status (2026-10-02): top-level resources done; functions not.** A script's
+connections compile: `let db = adbc_connect(...)` is a C++ variable
+(`auto _res0_db = adbc_connect(...);`), `let b = a;` copies it (copies alias, the
+last closes), and every call on it -- `adbc_execute`, `adbc_write` (its table
+argument and every defaulted `params` become bindings of their own at the
+statement), `adbc_query`, transactions, `adbc_close` -- runs where the statement
+is. A plan that calls a resource function is pinned at its statement and runs once
+however many readers it has, or none; a bare `adbc_query(db, "...");` runs too.
+Rebinding a name to a new connection releases the old variable after the new value
+is computed; rebinding it to something that is not a resource releases it right
+after that statement (`ResourceStep::Unbind`), so an open transaction rolls back
+where the REPL rolls it back. The placement rule is `ResourceFunctions::first_
+misplaced`, moved out of the REPL and shared with `ibex_compile`; a call inside a
+query clause is refused with the REPL's message before anything is emitted.
+
+Parity (`tests/parity/effect_cases/`): `adbc_connection`, `adbc_alias_and_rebind`,
+`adbc_transaction`, `adbc_release` -- the last fails ("database is locked") if the
+release is not emitted. Not done, and refused with a message: a `fn` that takes,
+opens or returns a resource (it needs a C++ function with a statement body and its
+own lowering), and a resource call nested inside another call's argument (the REPL
+runs it first; the compiler asks for a `let`).
+
+Original design, kept for the record:
+
 Needs W6-0, W6a and W6b. The emitter follows the same ordered plan, extended
 with resource values: `let db = adbc_connect(...)` -> `auto db =
 adbc_connect(...);`; a resource call as a statement or `let` value emits a C++

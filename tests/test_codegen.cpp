@@ -932,7 +932,7 @@ TEST_CASE("emitter: a script runs its steps in order and a sink sees its input",
     sink.kind = codegen::Emitter::Script::Step::Kind::Sink;
     sink.callee = "write_csv";
     sink.plan = first.get();
-    sink.args.emplace_back(ir::Literal{std::string("copy.csv")});
+    sink.args.push_back(ir::Expr{ir::Literal{std::string("copy.csv")}});
     script.steps.push_back(std::move(sink));
     script.result = result.get();
 
@@ -959,7 +959,7 @@ TEST_CASE("emitter: a script's result reuses the table its sink consumed", "[cod
     sink.kind = codegen::Emitter::Script::Step::Kind::Sink;
     sink.callee = "write_csv";
     sink.plan = plan.get();
-    sink.args.emplace_back(ir::Literal{std::string("copy.csv")});
+    sink.args.push_back(ir::Expr{ir::Literal{std::string("copy.csv")}});
     sink.input_binding = "result";
     script.steps.push_back(std::move(sink));
     script.result = again.get();
@@ -1001,7 +1001,7 @@ TEST_CASE("emitter: a bound sink and a bound call store their results as scalars
     sink.kind = codegen::Emitter::Script::Step::Kind::Sink;
     sink.callee = "write_csv";
     sink.plan = input.get();
-    sink.args.emplace_back(ir::Literal{std::string("copy.csv")});
+    sink.args.push_back(ir::Expr{ir::Literal{std::string("copy.csv")}});
     sink.bind = "rows";
     script.steps.push_back(std::move(sink));
     codegen::Emitter::Script::Step ping;
@@ -1050,7 +1050,7 @@ TEST_CASE("emitter: a deferred scalar step runs where it is, not before the othe
     sink.kind = codegen::Emitter::Script::Step::Kind::Sink;
     sink.callee = "write_csv";
     sink.plan = first.get();
-    sink.args.emplace_back(ir::Literal{std::string("rewritten.csv")});
+    sink.args.push_back(ir::Expr{ir::Literal{std::string("rewritten.csv")}});
     script.steps.push_back(std::move(sink));
     codegen::Emitter::Script::Step step;
     step.kind = codegen::Emitter::Script::Step::Kind::DeferredScalar;

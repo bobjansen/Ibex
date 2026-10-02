@@ -1954,6 +1954,146 @@ auto try_plan_direct_validity_field(const ir::Expr& expr, const PredicateInput& 
     return plan;
 }
 
+namespace {
+
+/// One FillNull / Coalesce operand with its storage resolved: the typed data
+/// pointer and the validity bitmap's base and bit offset, both advanced to the
+/// range's first row so the loop indexes by output offset.
+///
+/// The generic loop below asks, per row, "is this operand available?" through
+/// `ColumnEntry`: an optional bitmap that tests for adopted Arrow storage on
+/// every `operator[]`, and a `std::get<Column<T>>` on the type-erased column
+/// whose result is then indexed through another adopted-storage test. None of
+/// that can be hoisted -- the stores to the output may alias what it reads --
+/// so it ran at ~2 ns per row where the work is a bit test and a load.
+template <typename T>
+struct ResolvedOperand {
+    const T* data = nullptr;             // null for a literal
+    const std::uint8_t* bits = nullptr;  // null: every row valid
+    std::size_t bit_base = 0;
+    T literal{};
+    bool is_null = false;
+
+    [[nodiscard]] auto available(std::size_t offset) const noexcept -> bool {
+        if (is_null) {
+            return false;
+        }
+        if (data == nullptr || bits == nullptr) {
+            return true;
+        }
+        const std::size_t bit = bit_base + offset;
+        return ((bits[bit >> 3] >> (bit & 7U)) & 1U) != 0U;
+    }
+    [[nodiscard]] auto value(std::size_t offset) const noexcept -> T {
+        return data != nullptr ? data[offset] : literal;
+    }
+};
+
+/// Resolve every operand of a FillNull / Coalesce plan for `T`, or nullopt when
+/// one does not have the expected shape (the generic loop then decides, and
+/// reports whatever error it always did).
+template <typename T>
+auto resolve_validity_operands(const DirectValidityPlan& plan, std::size_t range_begin)
+    -> std::optional<std::vector<ResolvedOperand<T>>> {
+    std::vector<ResolvedOperand<T>> operands;
+    operands.reserve(plan.values.size());
+    for (const auto& value : plan.values) {
+        ResolvedOperand<T> operand;
+        operand.is_null = value.is_null;
+        if (value.is_null) {
+            // Never available; nothing to resolve.
+        } else if (value.is_literal) {
+            const auto* literal = std::get_if<T>(&value.literal);
+            if (literal == nullptr) {
+                return std::nullopt;
+            }
+            operand.literal = *literal;
+        } else {
+            if (value.column == nullptr) {
+                return std::nullopt;
+            }
+            const auto* column = std::get_if<Column<T>>(value.column->column.get());
+            if (column == nullptr) {
+                return std::nullopt;
+            }
+            operand.data = column->data() + range_begin;
+            if (value.column->validity.has_value()) {
+                operand.bits = value.column->validity->buffer_data();
+                operand.bit_base = value.column->validity->buffer_offset() + range_begin;
+            }
+        }
+        operands.push_back(operand);
+    }
+    return operands;
+}
+
+/// FillNull and Coalesce over resolved operands: the first available operand
+/// wins, and a row none of them covers is null (written as zero). `fill_null(a,
+/// b)` is `coalesce(a, b)` -- the generic loop picks `values[0]` when it is
+/// available and otherwise `values[1]`, then checks that one is available too.
+template <typename T>
+auto write_resolved_validity_range(const std::vector<ResolvedOperand<T>>& operands,
+                                   std::size_t count, T* out) -> std::optional<ValidityBitmap> {
+    // `fill_null(column, literal)`, the common shape: a literal always covers a
+    // row, so nothing is ever null and no bitmap is built. A byte of the
+    // column's bitmap selects eight rows at once, which the compiler turns into
+    // blends; the head and tail rows that do not fill a byte go one by one.
+    if (operands.size() == 2 && operands[0].data != nullptr && !operands[0].is_null &&
+        operands[1].data == nullptr && !operands[1].is_null) {
+        const T* const in = operands[0].data;
+        const T fill = operands[1].literal;
+        const std::uint8_t* const bits = operands[0].bits;
+        if (bits == nullptr) {
+            std::copy(in, in + count, out);
+            return std::nullopt;
+        }
+        const std::size_t base = operands[0].bit_base;
+        const auto bit = [bits, base](std::size_t offset) {
+            const std::size_t at = base + offset;
+            return ((bits[at >> 3] >> (at & 7U)) & 1U) != 0U;
+        };
+        std::size_t offset = 0;
+        for (; offset < count && ((base + offset) & 7U) != 0; ++offset) {
+            out[offset] = bit(offset) ? in[offset] : fill;
+        }
+        for (; offset + 8 <= count; offset += 8) {
+            const unsigned byte = bits[(base + offset) >> 3];
+            for (unsigned lane = 0; lane < 8; ++lane) {
+                out[offset + lane] = ((byte >> lane) & 1U) != 0U ? in[offset + lane] : fill;
+            }
+        }
+        for (; offset < count; ++offset) {
+            out[offset] = bit(offset) ? in[offset] : fill;
+        }
+        return std::nullopt;
+    }
+    ValidityBitmap validity(count, true);
+    auto* const words = validity.words_data();
+    bool any_invalid = false;
+    const ResolvedOperand<T>* const first = operands.data();
+    const std::size_t n = operands.size();
+    for (std::size_t offset = 0; offset < count; ++offset) {
+        const ResolvedOperand<T>* selected = nullptr;
+        for (std::size_t index = 0; index < n; ++index) {
+            if (first[index].available(offset)) {
+                selected = first + index;
+                break;
+            }
+        }
+        if (selected != nullptr) {
+            out[offset] = selected->value(offset);
+        } else {
+            out[offset] = T{};
+            words[offset >> 6] &= ~(std::uint64_t{1} << (offset & 63U));
+            any_invalid = true;
+        }
+    }
+    return any_invalid ? std::optional<ValidityBitmap>{std::move(validity)}
+                       : std::optional<ValidityBitmap>{};
+}
+
+}  // namespace
+
 auto write_direct_validity_field_range(const DirectValidityPlan& plan, const PredicateInput& input,
                                        ::ibex::runtime::RowRange range,
                                        const ScalarRegistry* scalars, DirectOutputWindow output)
@@ -1961,6 +2101,16 @@ auto write_direct_validity_field_range(const DirectValidityPlan& plan, const Pre
     if ((plan.numeric_kind == FixedWidthNumericKind::Int && output.numeric.ints == nullptr) ||
         (plan.numeric_kind == FixedWidthNumericKind::Double && output.numeric.doubles == nullptr)) {
         return std::unexpected("write_direct_validity_field_range: output window shape mismatch");
+    }
+    if (plan.kind != DirectValidityKind::Case &&
+        (plan.kind != DirectValidityKind::FillNull || plan.values.size() == 2)) {
+        if (plan.numeric_kind == FixedWidthNumericKind::Int) {
+            if (auto operands = resolve_validity_operands<std::int64_t>(plan, range.begin)) {
+                return write_resolved_validity_range(*operands, range.count, output.numeric.ints);
+            }
+        } else if (auto operands = resolve_validity_operands<double>(plan, range.begin)) {
+            return write_resolved_validity_range(*operands, range.count, output.numeric.doubles);
+        }
     }
     std::vector<Mask> conditions;
     conditions.reserve(plan.conditions.size());

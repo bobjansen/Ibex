@@ -2880,9 +2880,9 @@ class Lowerer {
         const ExternDecl* extern_decl = nullptr;
         if (const auto it = extern_decls_.find(callee); it != extern_decls_.end()) {
             extern_decl = it->second;
-        } else if (const auto it = table_extern_decls_.find(callee);
-                   it != table_extern_decls_.end()) {
-            extern_decl = it->second;
+        } else if (const auto table_it = table_extern_decls_.find(callee);
+                   table_it != table_extern_decls_.end()) {
+            extern_decl = table_it->second;
         }
         if (extern_decl == nullptr || functions_.contains(callee)) {
             return nullptr;

@@ -785,6 +785,106 @@ t;
     CHECK(lowered.error().message.find("bind its result with `let`") != std::string::npos);
 }
 
+TEST_CASE("lower_script lowers a resource fn as a function of the program",
+          "[parser][lower][resource]") {
+    auto lowered = lower_resource_script(R"IBEX(
+fn load_all(mutable db: Conn, n: Int) -> DataFrame {
+    load(db, "select 1");
+}
+fn open_named(uri: String) -> Conn {
+    open(uri);
+}
+fn same(c: Conn) -> Conn {
+    c;
+}
+fn count_rows(mutable db: Conn) -> Int {
+    run(db, "select 1");
+}
+let db = open_named("file:x");
+let kept = same(db);
+let rows = load_all(kept, 3);
+let n = count_rows(db);
+rows;
+)IBEX");
+    REQUIRE(lowered.has_value());
+    REQUIRE(lowered->functions.size() == 4);
+
+    const auto function_named = [&](std::string_view name) -> const parser::FunctionPlan* {
+        for (const auto& fn : lowered->functions) {
+            if (fn->decl->name == name) {
+                return fn.get();
+            }
+        }
+        return nullptr;
+    };
+    // A table: the value is the plan of the last statement.
+    const auto* table_fn = function_named("load_all");
+    REQUIRE(table_fn != nullptr);
+    CHECK(table_fn->body.result != nullptr);
+    // A connection opened by a call, and one that is a name.
+    const auto* opened = function_named("open_named");
+    REQUIRE(opened != nullptr);
+    REQUIRE(opened->body.return_call != nullptr);
+    CHECK(as_node<ir::ExternCallNode>(opened->body.return_call.get())->callee() == "open");
+    const auto* aliased = function_named("same");
+    REQUIRE(aliased != nullptr);
+    REQUIRE(aliased->body.return_expr.has_value());
+    const auto* name = std::get_if<ir::ColumnRef>(&aliased->body.return_expr->node);
+    REQUIRE(name != nullptr);
+    CHECK(name->name == "c");
+    // A scalar from a call on the connection.
+    const auto* counted = function_named("count_rows");
+    REQUIRE(counted != nullptr);
+    CHECK(counted->body.return_call != nullptr);
+
+    // In the program, a call of a function is a call of the program: a table
+    // result is a binding at its statement, a connection or scalar a bound call.
+    REQUIRE(lowered->preamble_binds.size() >= 3);
+    std::vector<std::string> bound;
+    for (const auto& bind : lowered->preamble_binds) {
+        if (bind.has_value()) {
+            bound.push_back(bind->name + (bind->resource ? "*" : ""));
+        }
+    }
+    CHECK(std::ranges::find(bound, "db*") != bound.end());
+    CHECK(std::ranges::find(bound, "n") != bound.end());
+    const auto shared = std::ranges::find_if(
+        lowered->shared_bindings, [](const auto& binding) { return binding.name == "rows"; });
+    REQUIRE(shared != lowered->shared_bindings.end());
+    const auto* call = as_node<ir::ExternCallNode>(shared->plan.get());
+    REQUIRE(call != nullptr);
+    CHECK(call->callee() == "load_all");
+}
+
+TEST_CASE("lower_script refuses what a function body cannot do yet", "[parser][lower][resource]") {
+    SECTION("a scalar binding in the body") {
+        auto lowered = lower_resource_script(R"IBEX(
+fn f(mutable db: Conn) -> Int {
+    let k = 5;
+    run(db, "select 1");
+}
+let db = open("file:x");
+let n = f(db);
+t;
+)IBEX");
+        REQUIRE_FALSE(lowered.has_value());
+        CHECK(lowered.error().message.find("scalar binding inside a function") !=
+              std::string::npos);
+    }
+    SECTION("a value of the wrong kind") {
+        auto lowered = lower_resource_script(R"IBEX(
+fn f(mutable db: Conn) -> Conn {
+    run(db, "select 1");
+}
+let db = open("file:x");
+let c = f(db);
+t;
+)IBEX");
+        REQUIRE_FALSE(lowered.has_value());
+        CHECK(lowered.error().message.find("a call that returns a resource") != std::string::npos);
+    }
+}
+
 TEST_CASE("lower_script keeps a cheap repeated binding inlined", "[parser][lower]") {
     // A scan/filter chain is cheap to re-run and inlining preserves each
     // consumer's own selection pushdown, so it is not shared.

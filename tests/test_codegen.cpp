@@ -1110,3 +1110,68 @@ TEST_CASE("emitter: rebinding a resource name releases the old variable after th
     REQUIRE(release_first != std::string::npos);
     CHECK(second_open < release_first);
 }
+
+TEST_CASE("emitter: a program function is declared, takes its parameters, and is called by prefix",
+          "[codegen]") {
+    ir::Builder b;
+    // fn pick(c: Conn, uri: String) -> Conn { open(uri); }
+    auto inner_call = b.extern_call("open", {ir::Expr{ir::ColumnRef{.name = "uri"}}});
+    auto fn = std::make_unique<codegen::Emitter::Script::Function>();
+    fn->name = "pick";
+    fn->params = {{.name = "c",
+                   .cpp_type = "Conn",
+                   .kind = codegen::Emitter::Script::Function::Param::Kind::Resource},
+                  {.name = "uri",
+                   .cpp_type = "std::string",
+                   .kind = codegen::Emitter::Script::Function::Param::Kind::Scalar}};
+    fn->return_type = "Conn";
+    fn->body.return_call = inner_call.get();
+
+    // The program: let db = pick(a, "file:x");
+    auto opened = b.extern_call("open", {ir::Expr{ir::Literal{std::string("file:a")}}});
+    auto use = b.extern_call("pick", {ir::Expr{ir::ColumnRef{.name = "a"}},
+                                      ir::Expr{ir::Literal{std::string("file:x")}}});
+    auto result = make_source(b, "out.csv");
+    codegen::Emitter::Script script;
+    codegen::Emitter::Script::Step open_step;
+    open_step.kind = codegen::Emitter::Script::Step::Kind::Call;
+    open_step.plan = opened.get();
+    open_step.bind = "a";
+    open_step.bind_resource = true;
+    script.steps.push_back(std::move(open_step));
+    codegen::Emitter::Script::Step pick_step;
+    pick_step.kind = codegen::Emitter::Script::Step::Kind::Call;
+    pick_step.plan = use.get();
+    pick_step.bind = "db";
+    pick_step.bind_resource = true;
+    script.steps.push_back(std::move(pick_step));
+    script.result = result.get();
+    script.functions.push_back(std::move(fn));
+
+    std::ostringstream oss;
+    codegen::Emitter emitter;
+    codegen::Emitter::Config config;
+    config.runtime_scalar_names = {};
+    emitter.emit(oss, script, config);
+    const auto out = oss.str();
+
+    // Declared, then defined, ahead of main; the parameters are prefixed; a scalar
+    // parameter is published in the function's own scope; the function's value is
+    // its call.
+    const auto declaration =
+        out.find("static auto _ibex_fn_pick(Conn _p_c, std::string _p_uri) -> Conn;");
+    const auto definition =
+        out.find("static auto _ibex_fn_pick(Conn _p_c, std::string _p_uri) -> Conn {");
+    const auto main_at = out.find("int main()");
+    REQUIRE(declaration != std::string::npos);
+    REQUIRE(definition != std::string::npos);
+    REQUIRE(main_at != std::string::npos);
+    CHECK(declaration < definition);
+    CHECK(definition < main_at);
+    CHECK(contains(out, "ibex::ops::ScalarScope _ibex_scope;"));
+    CHECK(contains(out, "_ibex_scope.set(\"uri\", ibex::runtime::ScalarValue(_p_uri));"));
+    CHECK(contains(out, "return open(ibex::ops::scalar_arg(ibex::ops::col_ref(\"uri\")));"));
+    // The call from the program is spelled with the prefix.
+    CHECK(contains(out, "auto _res"));
+    CHECK(contains(out, "_ibex_fn_pick(_res"));
+}

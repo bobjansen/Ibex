@@ -1,0 +1,24 @@
+// A table passed to a function that writes it through the connection it was given;
+// and a function that opens a connection of its own, starts a transaction and
+// returns: the connection is released at the return, so the transaction rolls back
+// and the caller's connection can drop the table (it would fail with a locked
+// database if the function's connection outlived the call).
+import "adbc";
+
+fn store(mutable conn: AdbcConnection, df: DataFrame) -> Int {
+    adbc_write(conn, df, "t", "append");
+}
+
+fn leave_open_transaction(uri: String) -> Int {
+    let c = adbc_connect("@SQLITE_DRIVER@", uri);
+    adbc_begin(c);
+    adbc_execute(c, "insert into t values (999)");
+}
+
+let db = adbc_connect("@SQLITE_DRIVER@", "file:/tmp/ibex_parity_adbc_function_scope.db");
+adbc_execute(db, "create table t (x integer)");
+let written = store(db, Table { x = [1, 2, 3] });
+let pending = leave_open_transaction("file:/tmp/ibex_parity_adbc_function_scope.db");
+adbc_execute(db, "create table done as select count(*) as n from t");
+adbc_execute(db, "drop table t");
+adbc_query(db, "select n from done");

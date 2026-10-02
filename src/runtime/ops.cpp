@@ -76,6 +76,25 @@ void set_scalars(const runtime::ScalarRegistry* scalars) {
     scalars_ptr() = scalars;
 }
 
+auto current_scalars() -> const runtime::ScalarRegistry* {
+    return scalars_ptr();
+}
+
+ScalarScope::ScalarScope() : previous_(scalars_ptr()) {
+    if (previous_ != nullptr) {
+        own_ = *previous_;
+    }
+    scalars_ptr() = &own_;
+}
+
+ScalarScope::~ScalarScope() {
+    scalars_ptr() = previous_;
+}
+
+void ScalarScope::set(const std::string& name, runtime::ScalarValue value) {
+    own_.insert_or_assign(name, std::move(value));
+}
+
 auto eval_row_count(const ir::Expr& expr) -> std::size_t {
     auto count = runtime::evaluate_row_count_expr(expr, scalars_ptr(), nullptr);
     if (!count) {

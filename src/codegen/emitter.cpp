@@ -105,10 +105,33 @@ void Emitter::emit(std::ostream& out, const Script& script, const Config& config
     if (script.result == nullptr) {
         throw std::runtime_error("ibex_compile: script has no result plan");
     }
-    emit_header(out, config);
+    emit_header(out, config, &script);
 
     named_tables_.clear();
     resource_vars_.clear();
+    const std::string result_var = emit_script_steps(script);
+    if (config.table_entry_point) {
+        out << "    return " << result_var << ";\n";
+    } else if (config.print_result) {
+        out << "    ibex::ops::print(" << result_var << ");\n";
+    }
+    emit_footer(out, config);
+}
+
+auto Emitter::callee_name(const std::string& callee) const -> std::string {
+    return user_functions_.contains(callee) ? "_ibex_fn_" + callee : callee;
+}
+
+void Emitter::emit_scalar_store(const std::string& name, const std::string& value) {
+    if (in_function_) {
+        *out_ << "    _ibex_scope.set(\"" << escape_string(name) << "\", " << value << ");\n";
+    } else {
+        *out_ << "    _ibex_scalars[\"" << escape_string(name) << "\"] = " << value << ";\n";
+    }
+}
+
+auto Emitter::emit_script_steps(const Script& script) -> std::string {
+    auto& out = *out_;
     // The table a sink consumed, by the binding that named it: the result of a
     // script ending `write(result, ...); result;` is that same table, and must
     // not be computed (or read from its source) a second time.
@@ -127,8 +150,6 @@ void Emitter::emit(std::ostream& out, const Script& script, const Config& config
         return text;
     };
 
-    // `callee(args)` run for its effect. A bound call stores its result as a
-    // scalar the later steps read through the registry; an unbound one drops it.
     // Bind `name` to a new resource variable and let go of the one it held: the
     // new value may have been computed from the old (`let db = f(db)`), so the
     // old is released only after.
@@ -140,15 +161,18 @@ void Emitter::emit(std::ostream& out, const Script& script, const Config& config
         }
         resource_vars_.insert_or_assign(name, variable);
     };
+    // `callee(args)` run for its effect. A bound call stores its result as a
+    // scalar the later steps read through the registry, or as a resource
+    // variable; an unbound one drops it.
     const auto emit_effect_call = [&](const std::optional<std::string>& bind, bool resource,
                                       const std::string& callee, const std::string& args) {
+        const std::string call = callee_name(callee) + "(" + args + ")";
         if (bind.has_value() && resource) {
-            bind_resource_var(*bind, callee + "(" + args + ")");
+            bind_resource_var(*bind, call);
         } else if (bind.has_value()) {
-            out << "    _ibex_scalars[\"" << escape_string(*bind)
-                << "\"] = ibex::runtime::ScalarValue(" << callee << "(" << args << "));\n";
+            emit_scalar_store(*bind, "ibex::runtime::ScalarValue(" + call + ")");
         } else {
-            out << "    (void)" << callee << "(" << args << ");\n";
+            out << "    (void)" << call << ";\n";
         }
     };
 
@@ -218,6 +242,16 @@ void Emitter::emit(std::ostream& out, const Script& script, const Config& config
         }
     }
 
+    if (script.return_call != nullptr) {
+        const auto& call = ir::node_cast<ir::ExternCallNode>(*script.return_call);
+        out << "    return " << callee_name(call.callee()) << "("
+            << emit_call_args(call.args(), /*leading_comma=*/false, "") << ");\n";
+        return {};
+    }
+    if (script.return_expr != nullptr) {
+        out << "    return " << emit_raw_expr(*script.return_expr) << ";\n";
+        return {};
+    }
     std::string result_var;
     if (script.result_binding.has_value()) {
         if (const auto it = sink_inputs.find(*script.result_binding); it != sink_inputs.end()) {
@@ -230,15 +264,83 @@ void Emitter::emit(std::ostream& out, const Script& script, const Config& config
     if (result_var.empty()) {
         result_var = emit_node(*script.result);
     }
-    if (config.table_entry_point) {
-        out << "    return " << result_var << ";\n";
-    } else if (config.print_result) {
-        out << "    ibex::ops::print(" << result_var << ");\n";
-    }
-    emit_footer(out, config);
+    return result_var;
 }
 
-void Emitter::emit_header(std::ostream& out, const Config& config) {
+void Emitter::emit_functions(const Script& script) {
+    auto& out = *out_;
+    for (const auto& fn : script.functions) {
+        user_functions_.insert(fn->name);
+    }
+    const auto signature = [&](const Script::Function& fn) {
+        std::string text = "auto " + callee_name(fn.name) + "(";
+        for (std::size_t i = 0; i < fn.params.size(); ++i) {
+            const auto& param = fn.params[i];
+            text += i == 0 ? "" : ", ";
+            text += param.kind == Script::Function::Param::Kind::Table
+                        ? "const ibex::runtime::Table&"
+                        : param.cpp_type;
+            text += " _p_" + param.name;
+        }
+        return text + ") -> " + fn.return_type;
+    };
+    // Declared first so that functions may call one another in any order.
+    for (const auto& fn : script.functions) {
+        out << "static " << signature(*fn) << ";\n";
+    }
+    if (!script.functions.empty()) {
+        out << "\n";
+    }
+    for (const auto& fn : script.functions) {
+        out << "static " << signature(*fn) << " {\n";
+        emit_function(*fn);
+        out << "}\n\n";
+    }
+}
+
+void Emitter::emit_function(const Script::Function& fn) {
+    auto& out = *out_;
+    // A function sees the program's constants and its own parameters, nothing of
+    // the program's tables or connections.
+    const auto saved_tables = std::move(named_tables_);
+    const auto saved_resources = std::move(resource_vars_);
+    const auto saved_names = runtime_scalar_names_;
+    const auto saved_constants = compile_time_scalars_;
+    named_tables_.clear();
+    resource_vars_.clear();
+    in_function_ = true;
+
+    out << "    ibex::ops::ScalarScope _ibex_scope;\n";
+    for (const auto& param : fn.params) {
+        const std::string variable = "_p_" + param.name;
+        switch (param.kind) {
+            case Script::Function::Param::Kind::Resource:
+                resource_vars_[param.name] = variable;
+                break;
+            case Script::Function::Param::Kind::Table:
+                named_tables_[param.name] = variable;
+                break;
+            case Script::Function::Param::Kind::Scalar:
+                runtime_scalar_names_.insert(param.name);
+                compile_time_scalars_.erase(param.name);
+                out << "    _ibex_scope.set(\"" << escape_string(param.name)
+                    << "\", ibex::runtime::ScalarValue(" << variable << "));\n";
+                break;
+        }
+    }
+    const std::string result_var = emit_script_steps(fn.body);
+    if (!result_var.empty()) {
+        out << "    return " << result_var << ";\n";
+    }
+
+    in_function_ = false;
+    named_tables_ = saved_tables;
+    resource_vars_ = saved_resources;
+    runtime_scalar_names_ = saved_names;
+    compile_time_scalars_ = saved_constants;
+}
+
+void Emitter::emit_header(std::ostream& out, const Config& config, const Script* script) {
     out_ = &out;
     tmp_counter_ = 0;
     cached_vars_.clear();
@@ -282,6 +384,10 @@ void Emitter::emit_header(std::ostream& out, const Config& config) {
     }
 
     out << "\n";
+    user_functions_.clear();
+    if (script != nullptr) {
+        emit_functions(*script);
+    }
     if (config.table_entry_point) {
         if (config.bench_mode)
             throw std::runtime_error("table entry point cannot be a benchmark harness");
@@ -347,14 +453,13 @@ void Emitter::emit_deferred_scalar(const ir::DeferredScalarBinding& binding) {
     for (const auto& source : binding.sources) {
         out << "    {\n";
         auto src_var = emit_node(*source.plan);
-        out << "        _ibex_scalars[\"" << escape_string(source.tmp_name)
-            << "\"] = ibex::ops::scalar_of_table(" << src_var << ", \""
-            << escape_string(source.column.value_or("")) << "\", "
-            << (source.column.has_value() ? "false" : "true") << ");\n";
+        emit_scalar_store(source.tmp_name, "ibex::ops::scalar_of_table(" + src_var + ", \"" +
+                                               escape_string(source.column.value_or("")) + "\", " +
+                                               (source.column.has_value() ? "false" : "true") +
+                                               ")");
         out << "    }\n";
     }
-    out << "    _ibex_scalars[\"" << escape_string(binding.name) << "\"] = ibex::ops::eval_scalar("
-        << emit_expr(binding.value) << ");\n";
+    emit_scalar_store(binding.name, "ibex::ops::eval_scalar(" + emit_expr(binding.value) + ")");
 }
 
 void Emitter::emit_query(std::ostream& out, const ir::Node& root, const Config& config) {
@@ -852,7 +957,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 return it->second;
             const auto& ec = ir::node_cast<ir::ExternCallNode>(node);
             auto var = fresh_var();
-            *out_ << "    auto " << var << " = " << ec.callee() << "(";
+            *out_ << "    auto " << var << " = " << callee_name(ec.callee()) << "(";
             bool first = true;
             for (const auto& arg : ec.args()) {
                 if (!first)

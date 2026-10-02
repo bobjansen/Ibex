@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <robin_hood.h>
 #include <string>
@@ -114,6 +115,16 @@ class Emitter {
         std::vector<Step> steps;
         const ir::Node* result = nullptr;
         std::optional<std::string> result_binding;
+        /// A function whose value is not a table: the call that is its value, or
+        /// the expression (a name, a literal). Otherwise `result` is the value.
+        const ir::Node* return_call = nullptr;
+        const ir::Expr* return_expr = nullptr;
+
+        /// A program function: a `fn` that runs statements (it takes, opens or
+        /// returns a connection), emitted as a C++ function ahead of `main`. Its
+        /// body is a Script of its own; a call to it is an ExternCall of its name.
+        struct Function;
+        std::vector<std::unique_ptr<Function>> functions;
     };
 
     /// Emit a complete C++ translation unit to `out`.
@@ -129,6 +140,11 @@ class Emitter {
 
    private:
     std::ostream* out_{nullptr};
+    /// Names of the program's own functions, which a call spells with a prefix.
+    robin_hood::unordered_set<std::string> user_functions_;
+    /// Inside a function body, a scalar the script binds goes in the function's
+    /// own scope rather than the program's registry.
+    bool in_function_{false};
     int tmp_counter_{0};
     /// Cache of nodes already emitted (used in bench mode to avoid re-emitting
     /// ExternCall nodes inside the timing loop).
@@ -155,7 +171,18 @@ class Emitter {
 
     /// Everything before the query: includes, `main`/entry-point opening, and
     /// the scalar registry. `emit_footer` closes what this opens.
-    void emit_header(std::ostream& out, const Config& config);
+    void emit_header(std::ostream& out, const Config& config, const Script* script = nullptr);
+    /// The steps of a script body, in order; the variable holding its table
+    /// result, or empty when its value is not a table.
+    auto emit_script_steps(const Script& script) -> std::string;
+    void emit_functions(const Script& script);
+    void emit_function(const Script::Function& fn);
+    /// Store a scalar the script bound: in the program's registry, or in the
+    /// scope of the function being emitted.
+    void emit_scalar_store(const std::string& name, const std::string& value);
+    /// How a call of `callee` is spelled: the program's own functions are prefixed
+    /// so they cannot collide with anything the generated code names.
+    [[nodiscard]] auto callee_name(const std::string& callee) const -> std::string;
     /// Run a deferred scalar's subplans, extract each, then evaluate the
     /// residual expression: the same order and semantics as
     /// runtime::materialize_deferred_scalar_bindings.
@@ -197,6 +224,22 @@ class Emitter {
 
     /// Prefix every line in `code` with `spaces` additional spaces.
     static auto indent_code(const std::string& code, size_t spaces) -> std::string;
+};
+
+/// See Script::functions.
+struct Emitter::Script::Function {
+    struct Param {
+        enum class Kind : std::uint8_t { Resource, Table, Scalar };
+        std::string name;
+        /// The C++ type, for a Resource or a Scalar; a Table is always
+        /// `ibex::runtime::Table`.
+        std::string cpp_type;
+        Kind kind = Kind::Scalar;
+    };
+    std::string name;
+    std::vector<Param> params;
+    std::string return_type;
+    Script body;
 };
 
 }  // namespace ibex::codegen

@@ -28,9 +28,11 @@
 
 namespace {
 
-/// The first resource function `program` calls, if any: one taking or
-/// returning a resource type (extern type), or a `fn` that calls one.
-auto first_resource_call(const ibex::parser::Program& program) -> std::optional<std::string> {
+/// What stops a program with resources from compiling, if anything: a resource
+/// call where nothing would run it (inside a query clause), or a `fn` that
+/// takes, opens or returns a resource, which compiled programs do not support
+/// yet. The same placement rule the REPL applies, before any call runs.
+auto resource_problem(const ibex::parser::Program& program) -> std::optional<std::string> {
     std::map<std::string, const ibex::parser::ExternDecl*, std::less<>> externs;
     std::map<std::string, const ibex::parser::FunctionDecl*, std::less<>> functions;
     for (const auto& stmt : program.statements) {
@@ -49,6 +51,15 @@ auto first_resource_call(const ibex::parser::Program& program) -> std::optional<
             auto it = functions.find(name);
             return it == functions.end() ? nullptr : it->second;
         });
+    for (const auto& [name, fn] : functions) {
+        (void)fn;
+        if (resource_functions.contains(name)) {
+            return "function '" + name +
+                   "' uses a resource (extern type), which compiled programs support only at "
+                   "the top level of a script, not in a function yet; run the script with the "
+                   "ibex tool instead";
+        }
+    }
     for (const auto& stmt : program.statements) {
         const ibex::parser::Expr* value = nullptr;
         if (const auto* let = std::get_if<ibex::parser::LetStmt>(&stmt)) {
@@ -58,10 +69,15 @@ auto first_resource_call(const ibex::parser::Program& program) -> std::optional<
         } else if (const auto* expr = std::get_if<ibex::parser::ExprStmt>(&stmt)) {
             value = expr->expr.get();
         }
-        if (value != nullptr) {
-            if (auto found = resource_functions.first_call(*value)) {
-                return found;
-            }
+        if (value == nullptr) {
+            continue;
+        }
+        if (std::holds_alternative<ibex::parser::TupleLetStmt>(stmt) &&
+            resource_functions.first_call(*value).has_value()) {
+            return "a resource cannot be destructured";
+        }
+        if (auto misplaced = resource_functions.first_misplaced(*value)) {
+            return *misplaced + " " + std::string(ibex::parser::ResourceFunctions::kPlacementError);
         }
     }
     return std::nullopt;
@@ -128,12 +144,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Resources (`extern type`) live on the REPL's statement path only; the
-    // generated C++ has no runtime for them yet.
-    if (auto callee = first_resource_call(*scalar_program)) {
-        std::cerr << "ibex_compile: " << *callee
-                  << " uses a resource (extern type), which compiled programs do not support "
-                     "yet; run the script with the ibex tool instead\n";
+    if (auto problem = resource_problem(*scalar_program)) {
+        std::cerr << "ibex_compile: " << *problem << "\n";
         return 1;
     }
 
@@ -231,23 +243,26 @@ int main(int argc, char* argv[]) {
 
     // Steps run in the order of their statements. The plan keeps preamble calls,
     // shared bindings and sinks in separate lists, each with its statement
-    // index, so merge them back by that index.
+    // index, so merge them back by that index (each statement has three slots: the
+    // bindings its expression needs, the statement itself, and the release of a
+    // name it rebinds).
     std::vector<std::pair<std::size_t, ibex::codegen::Emitter::Script::Step>> ordered;
     for (std::size_t i = 0; i < script_plan->preamble.size(); ++i) {
         ibex::codegen::Emitter::Script::Step step;
         step.kind = ibex::codegen::Emitter::Script::Step::Kind::Call;
         step.plan = script_plan->preamble[i].get();
-        if (i < script_plan->preamble_binds.size()) {
-            step.bind = script_plan->preamble_binds[i];
+        if (i < script_plan->preamble_binds.size() && script_plan->preamble_binds[i].has_value()) {
+            step.bind = script_plan->preamble_binds[i]->name;
+            step.bind_resource = script_plan->preamble_binds[i]->resource;
         }
-        ordered.emplace_back(script_plan->preamble_positions.at(i), std::move(step));
+        ordered.emplace_back(script_plan->preamble_positions.at(i) * 4 + 1, std::move(step));
     }
     for (const auto& shared : script_plan->shared_bindings) {
         ibex::codegen::Emitter::Script::Step step;
         step.kind = ibex::codegen::Emitter::Script::Step::Kind::SharedBinding;
         step.name = shared.name;
         step.plan = shared.plan.get();
-        ordered.emplace_back(shared.position, std::move(step));
+        ordered.emplace_back(shared.position * 4, std::move(step));
     }
     for (auto& sink : script_plan->sinks) {
         ibex::codegen::Emitter::Script::Step step;
@@ -257,13 +272,27 @@ int main(int argc, char* argv[]) {
         step.args = std::move(sink.args);
         step.input_binding = sink.input_binding;
         step.bind = sink.bind;
-        ordered.emplace_back(sink.position, std::move(step));
+        ordered.emplace_back(sink.position * 4 + 1, std::move(step));
+    }
+    for (const auto& resource : script_plan->resource_steps) {
+        ibex::codegen::Emitter::Script::Step step;
+        step.kind = resource.kind == ibex::parser::ResourceStep::Kind::Alias
+                        ? ibex::codegen::Emitter::Script::Step::Kind::ResourceAlias
+                        : ibex::codegen::Emitter::Script::Step::Kind::ResourceUnbind;
+        step.name = resource.name;
+        step.alias_of = resource.source;
+        // A release comes after the statement that rebinds the name: its value
+        // may read the old connection. Everything else orders by statement.
+        ordered.emplace_back(
+            resource.position * 4 +
+                (resource.kind == ibex::parser::ResourceStep::Kind::Unbind ? 2U : 1U),
+            std::move(step));
     }
     for (std::size_t i = 0; i < scalar_bindings->deferred.size(); ++i) {
         ibex::codegen::Emitter::Script::Step step;
         step.kind = ibex::codegen::Emitter::Script::Step::Kind::DeferredScalar;
         step.deferred = &scalar_bindings->deferred[i];
-        ordered.emplace_back(scalar_bindings->deferred_positions.at(i), std::move(step));
+        ordered.emplace_back(scalar_bindings->deferred_positions.at(i) * 4 + 1, std::move(step));
     }
     std::ranges::stable_sort(ordered, {},
                              &std::pair<std::size_t, ibex::codegen::Emitter::Script::Step>::first);

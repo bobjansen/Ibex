@@ -85,6 +85,12 @@ class Emitter {
                 /// A `let n = scalar(<table>)` binding, evaluated here rather
                 /// than before every other step.
                 DeferredScalar,
+                /// `let name = other;` where `other` is a resource: the same
+                /// connection under a second name.
+                ResourceAlias,
+                /// `name` stops being a resource here: its variable lets go of
+                /// the connection, which closes if no other name holds it.
+                ResourceUnbind,
             };
             Kind kind = Kind::Call;
             std::string name;
@@ -97,6 +103,11 @@ class Emitter {
             std::optional<std::string> input_binding;
             /// Sink and Call: the scalar the call's result is bound to.
             std::optional<std::string> bind;
+            /// Call only: the bound result is a resource (a variable of the
+            /// program), not a scalar in the registry.
+            bool bind_resource = false;
+            /// ResourceAlias: the resource `name` becomes another name for.
+            std::string alias_of;
             /// DeferredScalar only; borrowed.
             const ir::DeferredScalarBinding* deferred = nullptr;
         };
@@ -135,6 +146,10 @@ class Emitter {
     /// unbound name there is still a hard error.
     robin_hood::unordered_set<std::string> runtime_scalar_names_;
 
+    /// The C++ variable holding each resource a Script's steps bound, by the
+    /// name the script knows it by. A name rebound gets a fresh variable; the
+    /// old one is released.
+    robin_hood::unordered_map<std::string, std::string> resource_vars_;
     /// Tables produced by a Script's shared-binding steps, by binding name.
     robin_hood::unordered_map<std::string, std::string> named_tables_;
 

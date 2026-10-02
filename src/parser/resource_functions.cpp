@@ -78,6 +78,92 @@ auto ResourceFunctions::first_call(const Clause& clause) const -> std::optional<
     return found;
 }
 
+auto ResourceFunctions::first_misplaced(const Expr& expr) const -> std::optional<std::string> {
+    const auto* call = std::get_if<CallExpr>(&expr.node);
+    if (call != nullptr && contains(call->callee)) {
+        return misplaced_in_call(*call);
+    }
+    return misplaced_below(expr);
+}
+
+// A resource call's own arguments: a nested resource call is allowed (it can
+// open the resource a parameter takes); anything else that hides one is not.
+auto ResourceFunctions::misplaced_in_call(const CallExpr& call) const
+    -> std::optional<std::string> {
+    const auto check = [&](const ExprPtr& arg) -> std::optional<std::string> {
+        if (!arg) {
+            return std::nullopt;
+        }
+        const auto* nested = std::get_if<CallExpr>(&arg->node);
+        if (nested != nullptr && contains(nested->callee)) {
+            return misplaced_in_call(*nested);
+        }
+        return first_call(*arg);
+    };
+    for (const auto& arg : call.args) {
+        if (auto found = check(arg)) {
+            return found;
+        }
+    }
+    for (const auto& named : call.named_args) {
+        if (auto found = check(named.value)) {
+            return found;
+        }
+    }
+    return std::nullopt;
+}
+
+// The positions a statement may hold a resource call in: exactly the slots the
+// REPL hoists from, and the compiler's pre-pass; everything else may not.
+auto ResourceFunctions::misplaced_below(const Expr& expr) const -> std::optional<std::string> {
+    const auto slot = [&](const ExprPtr& child) -> std::optional<std::string> {
+        return child ? first_misplaced(*child) : std::nullopt;
+    };
+    const auto anywhere = [&](const ExprPtr& child) -> std::optional<std::string> {
+        return child ? first_call(*child) : std::nullopt;
+    };
+    if (const auto* block = std::get_if<BlockExpr>(&expr.node)) {
+        if (auto found = slot(block->base)) {
+            return found;
+        }
+        for (const auto& clause : block->clauses) {
+            if (auto found = first_call(clause)) {
+                return found;
+            }
+        }
+        return std::nullopt;
+    }
+    if (const auto* join = std::get_if<JoinExpr>(&expr.node)) {
+        if (auto found = slot(join->left)) {
+            return found;
+        }
+        if (auto found = slot(join->right)) {
+            return found;
+        }
+        return join->predicate.has_value() ? anywhere(*join->predicate) : std::nullopt;
+    }
+    if (const auto* group = std::get_if<GroupExpr>(&expr.node)) {
+        return slot(group->expr);
+    }
+    if (const auto* ascribe = std::get_if<AscribeExpr>(&expr.node)) {
+        return slot(ascribe->base);
+    }
+    if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
+        for (const auto& arg : call->args) {
+            if (auto found = slot(arg)) {
+                return found;
+            }
+        }
+        for (const auto& named : call->named_args) {
+            if (auto found = slot(named.value)) {
+                return found;
+            }
+        }
+        return std::nullopt;
+    }
+    return first_call(expr);
+}
+
 auto ResourceFunctions::first_call(const FunctionDecl& fn) const -> std::optional<std::string> {
     robin_hood::unordered_set<std::string> visiting{fn.name};
     return first_call(fn, visiting);

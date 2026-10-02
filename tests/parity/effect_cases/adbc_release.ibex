@@ -1,0 +1,14 @@
+// Rebinding a name to something that is not a resource releases the connection at
+// that statement. The open transaction rolls back then, so the second connection
+// can drop the table; had the first stayed open until the end of the program the
+// drop would fail with a locked database.
+import "adbc";
+let db = adbc_connect("@SQLITE_DRIVER@", "file:/tmp/ibex_parity_adbc_release.db");
+adbc_execute(db, "create table t (x integer)");
+adbc_begin(db);
+adbc_execute(db, "insert into t values (1)");
+let db = 0;
+let other = adbc_connect("@SQLITE_DRIVER@", "file:/tmp/ibex_parity_adbc_release.db");
+adbc_execute(other, "drop table t");
+let tables = adbc_tables(other);
+tables[select { n = count() }];

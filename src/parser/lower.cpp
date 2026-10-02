@@ -71,6 +71,7 @@
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/effects.hpp>
 #include <ibex/parser/lower.hpp>
+#include <ibex/parser/resource_functions.hpp>
 
 #include <algorithm>
 #include <bit>
@@ -1881,7 +1882,7 @@ class Lowerer {
         ir::NodePtr last_expr;
         std::vector<ir::NodePtr> preamble_calls;
         std::vector<std::size_t> preamble_positions;
-        std::vector<std::optional<std::string>> preamble_binds;
+        std::vector<std::optional<CallBind>> preamble_binds;
         std::vector<ScriptSink> sinks;
         share_repeated_bindings_ = true;
         for (const auto& stmt : program.statements) {
@@ -1904,6 +1905,16 @@ class Lowerer {
         // statement that conflicts with it (see `must_run_before_sinks`).
         std::vector<std::pair<std::size_t, ir::EffectSummary>> sink_effects;
         robin_hood::unordered_map<std::string, std::size_t> first_consumer;
+        script_mode_ = true;
+        resource_functions_.emplace(
+            [this](std::string_view name) -> const ExternDecl* {
+                const auto it = extern_decls_.find(std::string(name));
+                return it == extern_decls_.end() ? nullptr : it->second;
+            },
+            [this](std::string_view name) -> const FunctionDecl* {
+                const auto it = functions_.find(std::string(name));
+                return it == functions_.end() ? nullptr : it->second;
+            });
         // The script's own externs are registered as the main loop reaches
         // them, which is after this pass needs their effect declarations and
         // to know which of them are sinks.
@@ -1998,8 +2009,16 @@ class Lowerer {
             }
             return infer_output_column_names(*lowered.value());
         };
+        std::optional<ResourceStep> pending_unbind;
         for (std::size_t position = 0; position < program.statements.size(); ++position) {
             const auto& stmt = program.statements[position];
+            current_position_ = position;
+            // A name rebound to something that is not a resource releases it
+            // AFTER the statement that rebinds it (whose value may read it).
+            if (pending_unbind.has_value()) {
+                resource_steps_.push_back(std::move(*pending_unbind));
+                pending_unbind.reset();
+            }
             if (collect_declaration(stmt)) {
                 continue;
             }
@@ -2010,6 +2029,35 @@ class Lowerer {
             }
             if (std::holds_alternative<LetStmt>(stmt)) {
                 const auto& let_stmt = std::get<LetStmt>(stmt);
+                // `let b = a;` with `a` a resource: the same connection under a
+                // second name.
+                if (const auto* ident = std::get_if<IdentifierExpr>(&let_stmt.value->node);
+                    ident != nullptr && resource_names_.contains(ident->name)) {
+                    resource_steps_.push_back(ResourceStep{.kind = ResourceStep::Kind::Alias,
+                                                           .name = let_stmt.name,
+                                                           .source = ident->name,
+                                                           .position = position});
+                    resource_names_.insert(let_stmt.name);
+                    if (bindings_ != nullptr) {
+                        bindings_->erase(let_stmt.name);
+                    }
+                    continue;
+                }
+                // Does this `let` bind a resource? Then a name that was one stays
+                // one; otherwise it stops being one when the statement is done.
+                const auto* resource_call = is_scalar_extern_call(*let_stmt.value);
+                const bool binds_resource =
+                    resource_call != nullptr &&
+                    find_extern_decl(resource_call->callee) != nullptr &&
+                    find_extern_decl(resource_call->callee)->return_type.kind ==
+                        Type::Kind::Resource;
+                if (resource_names_.contains(let_stmt.name) && !binds_resource) {
+                    pending_unbind = ResourceStep{.kind = ResourceStep::Kind::Unbind,
+                                                  .name = let_stmt.name,
+                                                  .source = {},
+                                                  .position = position};
+                    resource_names_.erase(let_stmt.name);
+                }
                 if (auto compile_time_list = infer_compile_time_list(*let_stmt.value);
                     compile_time_list.has_value()) {
                     compile_time_lists_[let_stmt.name] = std::move(*compile_time_list);
@@ -2039,25 +2087,18 @@ class Lowerer {
                             sinks.push_back(std::move(*sink));
                             continue;
                         }
-                        if (!call->named_args.empty()) {
-                            return std::unexpected(LowerError{
-                                .message = call->callee +
-                                           ": `let` of an extern call does not yet support "
-                                           "named arguments"});
-                        }
-                        std::vector<ir::Expr> args;
-                        args.reserve(call->args.size());
-                        for (const auto& arg : call->args) {
-                            auto lowered_arg = lower_expr_to_ir(*arg);
-                            if (!lowered_arg.has_value()) {
-                                return std::unexpected(lowered_arg.error());
-                            }
-                            args.push_back(std::move(*lowered_arg));
+                        auto args = lower_extern_args(*call);
+                        if (!args.has_value()) {
+                            return std::unexpected(args.error());
                         }
                         preamble_calls.push_back(
-                            builder_.extern_call(call->callee, std::move(args)));
+                            builder_.extern_call(call->callee, std::move(*args)));
                         preamble_positions.push_back(position);
-                        preamble_binds.emplace_back(let_stmt.name);
+                        preamble_binds.emplace_back(
+                            CallBind{.name = let_stmt.name, .resource = binds_resource});
+                        if (binds_resource) {
+                            resource_names_.insert(let_stmt.name);
+                        }
                         continue;
                     }
                     auto scalar = lower_expr_to_ir(*let_stmt.value);
@@ -2070,11 +2111,22 @@ class Lowerer {
                     continue;
                 }
                 if (bindings_ != nullptr) {
-                    if (share_repeated_bindings_ && !let_stmt.is_mut &&
-                        let_counts_[let_stmt.name] == 1 &&
-                        ((table_ref_counts_[let_stmt.name] >= 2 &&
-                          contains_expensive_node(*value.value())) ||
-                         must_run_before_sinks(*value.value(), position, let_stmt.name))) {
+                    if (plan_calls_resource_function(*value.value())) {
+                        // A plan that calls a resource function runs at its
+                        // statement, once, whatever the number of readers: the
+                        // call may write, and a second run would write twice.
+                        // Later references scan the name; the executor binds the
+                        // latest table of that name, which is the one in force.
+                        bindings_->erase(let_stmt.name);
+                        binding_schemas_.erase(let_stmt.name);
+                        shared_bindings_.push_back(SharedBinding{.name = let_stmt.name,
+                                                                 .plan = std::move(value.value()),
+                                                                 .position = position});
+                    } else if (share_repeated_bindings_ && !let_stmt.is_mut &&
+                               let_counts_[let_stmt.name] == 1 &&
+                               ((table_ref_counts_[let_stmt.name] >= 2 &&
+                                 contains_expensive_node(*value.value())) ||
+                                must_run_before_sinks(*value.value(), position, let_stmt.name))) {
                         // Referenced from several places and expensive to
                         // re-run: materialized once by the executor. Later
                         // references miss bindings_ and lower to Scan(name).
@@ -2130,13 +2182,23 @@ class Lowerer {
                         std::vector<ir::Expr> args;
                         args.reserve(call->args.size());
                         bool args_ok = true;
-                        for (const auto& arg : call->args) {
-                            auto a = lower_expr_to_ir(*arg);
-                            if (!a.has_value()) {
-                                args_ok = false;
-                                break;
+                        if (find_extern_decl(call->callee) != nullptr) {
+                            // Defaults and names bound, table arguments made
+                            // into bindings of their own.
+                            auto bound = lower_extern_args(*call);
+                            if (!bound.has_value()) {
+                                return std::unexpected(bound.error());
                             }
-                            args.push_back(std::move(*a));
+                            args = std::move(*bound);
+                        } else {
+                            for (const auto& arg : call->args) {
+                                auto a = lower_expr_to_ir(*arg);
+                                if (!a.has_value()) {
+                                    args_ok = false;
+                                    break;
+                                }
+                                args.push_back(std::move(*a));
+                            }
                         }
                         if (args_ok) {
                             preamble_calls.push_back(
@@ -2148,8 +2210,21 @@ class Lowerer {
                     }
                     return std::unexpected(value.error());
                 }
+                // A statement whose value is dropped still runs when it calls a
+                // resource function: `adbc_query(db, "...");` executes once.
+                if (position + 1 != program.statements.size() &&
+                    plan_calls_resource_function(*value.value())) {
+                    shared_bindings_.push_back(
+                        SharedBinding{.name = "__ibex_stmt_" + std::to_string(synthetic_counter_++),
+                                      .plan = std::move(value.value()),
+                                      .position = position});
+                    continue;
+                }
                 last_expr = std::move(value.value());
             }
+        }
+        if (pending_unbind.has_value()) {
+            resource_steps_.push_back(std::move(*pending_unbind));
         }
         if (!last_expr) {
             return std::unexpected(LowerError{.message = "no expression to lower"});
@@ -2158,6 +2233,7 @@ class Lowerer {
             .preamble = std::move(preamble_calls),
             .preamble_positions = std::move(preamble_positions),
             .preamble_binds = std::move(preamble_binds),
+            .resource_steps = std::move(resource_steps_),
             .shared_bindings = std::move(shared_bindings_),
             .sinks = std::move(sinks),
             .result = std::move(last_expr),
@@ -2182,7 +2258,8 @@ class Lowerer {
             return std::unexpected(
                 LowerError{.message = "table-consuming extern calls require lower_script()"});
         }
-        if (std::ranges::any_of(plan->preamble_binds,
+        if (!plan->resource_steps.empty() ||
+            std::ranges::any_of(plan->preamble_binds,
                                 [](const auto& bind) { return bind.has_value(); })) {
             return std::unexpected(
                 LowerError{.message = "`let` of an extern call's result requires lower_script()"});
@@ -2197,6 +2274,8 @@ class Lowerer {
     }
 
     auto lower_expression(const Expr& expr) -> LowerResult { return lower_expr(expr); }
+
+    void set_script_mode(bool on) { script_mode_ = on; }
 
    private:
     auto lower_expr(const Expr& expr) -> LowerResult {
@@ -2471,26 +2550,99 @@ class Lowerer {
             }
             return std::unexpected(LowerError{.message = "unknown table function: " + call.callee});
         }
-        auto bound_args = bind_extern_call_args(call);
-        if (!bound_args.has_value()) {
-            return std::unexpected(std::move(bound_args.error()));
+        auto args = lower_extern_args(call);
+        if (!args.has_value()) {
+            return std::unexpected(std::move(args.error()));
         }
+        return builder_.extern_call(call.callee, std::move(*args));
+    }
+
+    /// The arguments of an extern call, with names and defaults bound and each
+    /// lowered for the call's declaration. A table argument -- a `DataFrame`
+    /// parameter that is not the callee's first, like `adbc_write`'s -- cannot be
+    /// an expression of the call, so in a script it becomes a binding of its own
+    /// at this statement and the argument names it. Elsewhere the argument is
+    /// lowered as it always was.
+    auto lower_extern_args(const CallExpr& call)
+        -> std::expected<std::vector<ir::Expr>, LowerError> {
+        auto bound = bind_extern_call_args(call);
+        if (!bound.has_value()) {
+            return std::unexpected(std::move(bound.error()));
+        }
+        const ExternDecl* const decl = find_extern_decl(call.callee);
         std::vector<ir::Expr> args;
-        args.reserve(bound_args->size());
-        for (const auto* arg : *bound_args) {
-            auto expr = lower_expr_to_ir(*arg);
-            if (!expr.has_value()) {
-                return std::unexpected(expr.error());
+        args.reserve(bound->size());
+        for (std::size_t i = 0; i < bound->size(); ++i) {
+            const Expr& arg = *(*bound)[i];
+            // The REPL runs a resource call in an argument first and passes its
+            // result; a compiled program has no slot for that yet, and lowering
+            // the call as an expression would not call it at all.
+            if (script_mode_ && resource_functions_.has_value()) {
+                if (auto nested = resource_functions_->first_call(arg)) {
+                    return std::unexpected(LowerError{
+                        .message = call.callee + ": the argument calls " + *nested +
+                                   ", which compiled programs cannot yet run inside another "
+                                   "call; bind its result with `let` first"});
+                }
             }
-            args.push_back(std::move(expr.value()));
+            const bool is_table_param = script_mode_ && decl != nullptr &&
+                                        i < decl->params.size() &&
+                                        (decl->params[i].type.kind == Type::Kind::DataFrame ||
+                                         decl->params[i].type.kind == Type::Kind::TimeFrame);
+            if (is_table_param) {
+                auto plan = lower_expr(arg);
+                if (!plan.has_value()) {
+                    return std::unexpected(plan.error());
+                }
+                std::string name = "__ibex_arg_" + std::to_string(synthetic_counter_++);
+                shared_bindings_.push_back(SharedBinding{
+                    .name = name, .plan = std::move(plan.value()), .position = current_position_});
+                args.push_back(ir::Expr{.node = ir::ColumnRef{.name = std::move(name)}});
+                continue;
+            }
+            auto lowered = lower_expr_to_ir(arg);
+            if (!lowered.has_value()) {
+                return std::unexpected(lowered.error());
+            }
+            args.push_back(std::move(lowered.value()));
         }
-        return builder_.extern_call(call.callee, std::move(args));
+        return args;
+    }
+
+    /// True when `plan` calls a resource function. Such a plan runs where its
+    /// statement is, once: it cannot be inlined into a later consumer (which
+    /// would run it there, and once per consumer) or dropped as unused.
+    [[nodiscard]] auto plan_calls_resource_function(const ir::Node& plan) const -> bool {
+        if (!resource_functions_.has_value()) {
+            return false;
+        }
+        if (plan.kind() == ir::NodeKind::ExternCall &&
+            resource_functions_->contains(ir::node_cast<ir::ExternCallNode>(plan).callee())) {
+            return true;
+        }
+        for (const auto& child : plan.children()) {
+            if (child != nullptr && plan_calls_resource_function(*child)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// The declaration of the extern `callee`, if it is one.
+    [[nodiscard]] auto find_extern_decl(const std::string& callee) const -> const ExternDecl* {
+        if (const auto it = extern_decls_.find(callee); it != extern_decls_.end()) {
+            return it->second;
+        }
+        if (const auto it = table_extern_decls_.find(callee); it != table_extern_decls_.end()) {
+            return it->second;
+        }
+        return nullptr;
     }
 
     auto bind_extern_call_args(const CallExpr& call)
         -> std::expected<std::vector<const Expr*>, LowerError> {
-        const auto decl_it = table_extern_decls_.find(call.callee);
-        if (decl_it == table_extern_decls_.end()) {
+        const ExternDecl* const decl = find_extern_decl(call.callee);
+        if (decl == nullptr) {
             if (!call.named_args.empty()) {
                 return std::unexpected(LowerError{
                     .message = call.callee + ": named arguments require an extern declaration"});
@@ -2503,7 +2655,7 @@ class Lowerer {
             return positional;
         }
 
-        const auto& params = decl_it->second->params;
+        const auto& params = decl->params;
         std::vector<const Expr*> bound(params.size(), nullptr);
         robin_hood::unordered_map<std::string, std::size_t> param_index;
         param_index.reserve(params.size());
@@ -6050,6 +6202,18 @@ class Lowerer {
     TableRefCounts let_counts_;
     std::vector<SharedBinding> shared_bindings_;
     bool share_repeated_bindings_ = false;
+    /// True inside lower_script: a table argument of an extern call becomes a
+    /// shared binding at its statement, which only a script has a place to put.
+    bool script_mode_ = false;
+    /// The statement being lowered, so a synthetic binding made deep inside its
+    /// expression lands at the statement's place in the order.
+    std::size_t current_position_ = 0;
+    /// Names bound to a resource (`let db = adbc_connect(...)`), as of the
+    /// statement being lowered.
+    robin_hood::unordered_set<std::string> resource_names_;
+    std::vector<ResourceStep> resource_steps_;
+    std::size_t synthetic_counter_ = 0;
+    std::optional<ResourceFunctions> resource_functions_;
     robin_hood::unordered_map<std::string, std::vector<std::string>> compile_time_lists_;
     robin_hood::unordered_set<std::string> table_externs_;
     robin_hood::unordered_set<std::string> sink_externs_;
@@ -6202,6 +6366,7 @@ auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult {
     Lowerer lowerer(&context.bindings, context.compile_time_lists, context.table_externs,
                     context.sink_externs, context.table_extern_decls, context.source_schemas,
                     context.functions);
+    lowerer.set_script_mode(context.table_args_as_bindings);
     auto lowered = lowerer.lower_expression(expr);
     if (lowered.has_value()) {
         // The REPL supplies the complete set of in-scope lexical names and the

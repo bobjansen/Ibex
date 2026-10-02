@@ -108,6 +108,7 @@ void Emitter::emit(std::ostream& out, const Script& script, const Config& config
     emit_header(out, config);
 
     named_tables_.clear();
+    resource_vars_.clear();
     // The table a sink consumed, by the binding that named it: the result of a
     // script ending `write(result, ...); result;` is that same table, and must
     // not be computed (or read from its source) a second time.
@@ -128,9 +129,22 @@ void Emitter::emit(std::ostream& out, const Script& script, const Config& config
 
     // `callee(args)` run for its effect. A bound call stores its result as a
     // scalar the later steps read through the registry; an unbound one drops it.
-    const auto emit_effect_call = [&](const std::optional<std::string>& bind,
+    // Bind `name` to a new resource variable and let go of the one it held: the
+    // new value may have been computed from the old (`let db = f(db)`), so the
+    // old is released only after.
+    const auto bind_resource_var = [&](const std::string& name, const std::string& value) {
+        const std::string variable = "_res" + std::to_string(tmp_counter_++) + "_" + name;
+        out << "    auto " << variable << " = " << value << ";\n";
+        if (const auto old = resource_vars_.find(name); old != resource_vars_.end()) {
+            out << "    " << old->second << " = {};\n";
+        }
+        resource_vars_.insert_or_assign(name, variable);
+    };
+    const auto emit_effect_call = [&](const std::optional<std::string>& bind, bool resource,
                                       const std::string& callee, const std::string& args) {
-        if (bind.has_value()) {
+        if (bind.has_value() && resource) {
+            bind_resource_var(*bind, callee + "(" + args + ")");
+        } else if (bind.has_value()) {
             out << "    _ibex_scalars[\"" << escape_string(*bind)
                 << "\"] = ibex::runtime::ScalarValue(" << callee << "(" << args << "));\n";
         } else {
@@ -164,7 +178,7 @@ void Emitter::emit(std::ostream& out, const Script& script, const Config& config
                         sink_inputs[*step.input_binding] = input;
                     }
                 }
-                emit_effect_call(step.bind, step.callee,
+                emit_effect_call(step.bind, false, step.callee,
                                  emit_call_args(step.args, /*leading_comma=*/true, input));
                 break;
             }
@@ -173,8 +187,25 @@ void Emitter::emit(std::ostream& out, const Script& script, const Config& config
                     throw std::runtime_error("ibex_compile: a call step needs an ExternCall node");
                 }
                 const auto& call = ir::node_cast<ir::ExternCallNode>(*step.plan);
-                emit_effect_call(step.bind, call.callee(),
+                emit_effect_call(step.bind, step.bind_resource, call.callee(),
                                  emit_call_args(call.args(), /*leading_comma=*/false, ""));
+                break;
+            }
+            case Script::Step::Kind::ResourceAlias: {
+                const auto source = resource_vars_.find(step.alias_of);
+                if (source == resource_vars_.end()) {
+                    throw std::runtime_error("ibex_compile: '" + step.alias_of +
+                                             "' is not a resource");
+                }
+                bind_resource_var(step.name, source->second);
+                break;
+            }
+            case Script::Step::Kind::ResourceUnbind: {
+                if (const auto held = resource_vars_.find(step.name);
+                    held != resource_vars_.end()) {
+                    out << "    " << held->second << " = {};\n";
+                    resource_vars_.erase(held);
+                }
                 break;
             }
             case Script::Step::Kind::DeferredScalar: {
@@ -1646,6 +1677,17 @@ auto Emitter::emit_raw_expr(const ir::Expr& expr) -> std::string {
         [&](const auto& node) -> std::string {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, ir::ColumnRef>) {
+                // A resource a script bound is the C++ variable that holds it,
+                // and a table a script step produced is its variable too (a
+                // table argument of a call, bound at its statement).
+                if (const auto held = resource_vars_.find(node.name);
+                    held != resource_vars_.end()) {
+                    return held->second;
+                }
+                if (const auto table = named_tables_.find(node.name);
+                    table != named_tables_.end()) {
+                    return table->second;
+                }
                 // A compile-time scalar `let` is emitted as its value. Anything
                 // else — a `scalar(...)` deferred `let`, a `let` bound to a
                 // computed expression, a `^` lexical binding — is resolved at

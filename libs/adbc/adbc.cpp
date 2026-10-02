@@ -126,7 +126,7 @@ struct SqlCall {
 
 auto sql_call(const ExternArgs& args, std::string_view usage)
     -> std::expected<SqlCall, std::string> {
-    SqlCall call{.db = connection_arg(args)};
+    SqlCall call{.db = connection_arg(args), .sql = nullptr, .params = nullptr};
     call.sql = args.size() >= 2 && args.size() <= 3 ? string_arg(args, 1) : nullptr;
     call.params = args.size() == 3 ? args.table(2) : nullptr;
     if (call.sql == nullptr || (args.size() == 3 && call.params == nullptr)) {

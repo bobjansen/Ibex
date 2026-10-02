@@ -2996,9 +2996,7 @@ auto resource_functions(const FunctionRegistry& functions, const ExternDeclRegis
             }};
 }
 
-constexpr std::string_view kResourcePlacementError =
-    "can be called only as a statement's value, as a table operand, or as an argument of "
-    "another call, not inside a query clause";
+constexpr std::string_view kResourcePlacementError = parser::ResourceFunctions::kPlacementError;
 
 auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                      LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
@@ -4529,11 +4527,7 @@ class ResourceCalls {
     /// a misplaced call makes no plugin call at all.
     [[nodiscard]] auto misplaced_call(const parser::Expr& expr) const
         -> std::optional<std::string> {
-        const auto* call = std::get_if<parser::CallExpr>(&expr.node);
-        if (call != nullptr && resource_functions_.contains(call->callee)) {
-            return misplaced_in_resource_call(*call);
-        }
-        return misplaced_below(expr);
+        return resource_functions_.first_misplaced(expr);
     }
 
     /// Binds a resource. A name lives in exactly one registry.
@@ -4845,85 +4839,6 @@ class ResourceCalls {
         }
         return "function '" + function_ + "' uses resource '" + name +
                "', which is bound outside it; pass it as a parameter";
-    }
-
-    // A resource call's own arguments: a nested resource call is allowed
-    // (it can open the resource a parameter takes); anything else that hides
-    // one is not.
-    [[nodiscard]] auto misplaced_in_resource_call(const parser::CallExpr& call) const
-        -> std::optional<std::string> {
-        const auto check = [&](const parser::ExprPtr& arg) -> std::optional<std::string> {
-            if (!arg) {
-                return std::nullopt;
-            }
-            const auto* nested = std::get_if<parser::CallExpr>(&arg->node);
-            if (nested != nullptr && resource_functions_.contains(nested->callee)) {
-                return misplaced_in_resource_call(*nested);
-            }
-            return resource_functions_.first_call(*arg);
-        };
-        for (const auto& arg : call.args) {
-            if (auto found = check(arg)) {
-                return found;
-            }
-        }
-        for (const auto& named : call.named_args) {
-            if (auto found = check(named.value)) {
-                return found;
-            }
-        }
-        return std::nullopt;
-    }
-
-    // Mirrors `hoist`: its slots may hold resource calls, everything else may not.
-    [[nodiscard]] auto misplaced_below(const parser::Expr& expr) const
-        -> std::optional<std::string> {
-        const auto slot = [&](const parser::ExprPtr& child) -> std::optional<std::string> {
-            return child ? misplaced_call(*child) : std::nullopt;
-        };
-        const auto anywhere = [&](const parser::ExprPtr& child) -> std::optional<std::string> {
-            return child ? resource_functions_.first_call(*child) : std::nullopt;
-        };
-        if (const auto* block = std::get_if<parser::BlockExpr>(&expr.node)) {
-            if (auto found = slot(block->base)) {
-                return found;
-            }
-            for (const auto& clause : block->clauses) {
-                if (auto found = resource_functions_.first_call(clause)) {
-                    return found;
-                }
-            }
-            return std::nullopt;
-        }
-        if (const auto* join = std::get_if<parser::JoinExpr>(&expr.node)) {
-            if (auto found = slot(join->left)) {
-                return found;
-            }
-            if (auto found = slot(join->right)) {
-                return found;
-            }
-            return join->predicate.has_value() ? anywhere(*join->predicate) : std::nullopt;
-        }
-        if (const auto* group = std::get_if<parser::GroupExpr>(&expr.node)) {
-            return slot(group->expr);
-        }
-        if (const auto* ascribe = std::get_if<parser::AscribeExpr>(&expr.node)) {
-            return slot(ascribe->base);
-        }
-        if (const auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
-            for (const auto& arg : call->args) {
-                if (auto found = slot(arg)) {
-                    return found;
-                }
-            }
-            for (const auto& named : call->named_args) {
-                if (auto found = slot(named.value)) {
-                    return found;
-                }
-            }
-            return std::nullopt;
-        }
-        return resource_functions_.first_call(expr);
     }
 
     ResourceRegistry* resources_;

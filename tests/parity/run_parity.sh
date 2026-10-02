@@ -195,24 +195,24 @@ if [[ -d "$EFFECT_CASES_DIR" ]]; then
         fi
         "$CXX" "${EXTRA_CXXFLAGS[@]}" -std="$CXX_STD_FLAG" "${EFFECT_INCS[@]}" "$cpp_file" \
             "${EFFECT_LIBS[@]}" "${EXTRA_LDFLAGS[@]}" -o "$bin_file"
-        rm -f /tmp/ibex_parity_"$name"*.csv
+        rm -f /tmp/ibex_parity_"$name"*
         if ! "$bin_file" >"$TMPDIR_WORK/effect_$name.compiled.out" 2>&1; then
             echo "parity mismatch: effect case $name — the transpiled program failed:" >&2
             sed 's/^/    /' "$TMPDIR_WORK/effect_$name.compiled.out" >&2
             fail=1
-            rm -f /tmp/ibex_parity_"$name"*.csv
+            rm -f /tmp/ibex_parity_"$name"*
             continue
         fi
-        rm -f /tmp/ibex_parity_"$name"*.csv
+        rm -f /tmp/ibex_parity_"$name"*
         if ! "$IBEX_EVAL" "$case_file" --plugin-path "$BUILD_DIR/tools" \
             >"$TMPDIR_WORK/effect_$name.interp.out" 2>&1; then
             echo "parity: effect case $name — the interpreter failed:" >&2
             sed 's/^/    /' "$TMPDIR_WORK/effect_$name.interp.out" >&2
             fail=1
-            rm -f /tmp/ibex_parity_"$name"*.csv
+            rm -f /tmp/ibex_parity_"$name"*
             continue
         fi
-        rm -f /tmp/ibex_parity_"$name"*.csv
+        rm -f /tmp/ibex_parity_"$name"*
         # The interpreter also prints each effect statement's own value (a sink's
         # row count); the final table, from its `rows:` line on, is the result.
         for side in interp compiled; do

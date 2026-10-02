@@ -7,6 +7,7 @@
 #include <ibex/ir/schema.hpp>
 #include <ibex/parser/ast.hpp>
 
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <optional>
@@ -60,6 +61,28 @@ struct SharedBinding {
     std::size_t position = 0;
 };
 
+/// What a preamble call's result is bound to: a scalar, which later queries read
+/// through the scalar registry, or a resource (`let db = adbc_connect(...)`),
+/// which is a variable of the program that only resource parameters take.
+struct CallBind {
+    std::string name;
+    bool resource = false;
+};
+
+/// A statement about a resource binding that is not a call: `let b = a;` makes
+/// `b` the same connection as `a`, and rebinding `a` to something that is not a
+/// resource releases it. A binding's name lives in one place, so a name that
+/// stops being a resource must say so.
+struct ResourceStep {
+    enum class Kind : std::uint8_t { Alias, Unbind };
+    Kind kind = Kind::Alias;
+    /// Alias: the new name. Unbind: the name being released.
+    std::string name;
+    /// Alias: the resource it names.
+    std::string source;
+    std::size_t position = 0;
+};
+
 struct ScriptPlan {
     std::vector<ir::NodePtr> preamble;
     /// Statement index of each `preamble` call, parallel to it. A consumer that
@@ -69,7 +92,9 @@ struct ScriptPlan {
     std::vector<std::size_t> preamble_positions;
     /// Parallel to `preamble`: the name a call's scalar result is bound to
     /// (`let n = f(...);`), if any.
-    std::vector<std::optional<std::string>> preamble_binds;
+    std::vector<std::optional<CallBind>> preamble_binds;
+    /// Resource aliases and releases, each at its statement.
+    std::vector<ResourceStep> resource_steps;
     std::vector<SharedBinding> shared_bindings;
     std::vector<ScriptSink> sinks;
     ir::NodePtr result;
@@ -108,6 +133,12 @@ struct LowerContext {
     /// from its function registry; the whole-program `lower()` collects them
     /// from the program's `fn` statements.
     robin_hood::unordered_map<std::string, const FunctionDecl*> functions;
+    /// Lower a table argument of an extern call (`adbc_write(db, df, ...)`'s `df`)
+    /// as a binding of its own that the argument names, the way a script does.
+    /// Set by a caller that only wants to know whether an expression is a table
+    /// (the scalar-binding classifier); the bindings made are dropped with the
+    /// lowerer.
+    bool table_args_as_bindings = false;
 };
 
 /// Lower a parsed Program into an IR node tree.

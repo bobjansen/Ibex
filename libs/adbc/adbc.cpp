@@ -190,6 +190,20 @@ struct DriverQuirks {
     /// failed write would keep the batches before the failing one, so the
     /// plugin wraps it in one.
     bool batched_ingest = false;
+    /// Leaves the last result of a COPY unread, after a bulk ingest and after
+    /// a query alike (PostgreSQL: one PQgetResult where libpq wants them read
+    /// to the end, in ADBC 24 and on main as of 2026-10-02). libpq then
+    /// reports the connection busy, and the driver skips the BEGIN of the
+    /// next transaction, whose first statement then commits on its own and
+    /// survives a rollback. adbc_begin runs a query first, which makes libpq
+    /// discard the result.
+    bool leaves_result_unread = false;
+    /// Drops the error of a failed bulk ingest (DuckDB 1.5.6: the appender
+    /// flushes in its destructor, whose error is discarded, typically a
+    /// constraint violation such as a duplicate key) and reports the rows as
+    /// written when none are. Inside a transaction the failure aborts it, so
+    /// the plugin ingests in one and checks it with a query afterwards.
+    bool ingest_hides_failure = false;
 };
 
 auto quirks_of_vendor(std::string vendor) -> DriverQuirks {
@@ -197,7 +211,9 @@ auto quirks_of_vendor(std::string vendor) -> DriverQuirks {
                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return {.one_param_row = vendor.find("duckdb") != std::string::npos,
             .batched_ingest = vendor.find("mysql") != std::string::npos ||
-                              vendor.find("mariadb") != std::string::npos};
+                              vendor.find("mariadb") != std::string::npos,
+            .leaves_result_unread = vendor.find("postgresql") != std::string::npos,
+            .ingest_hides_failure = vendor.find("duckdb") != std::string::npos};
 }
 
 /// One open ADBC database and connection: the value behind an Ibex
@@ -293,6 +309,10 @@ class AdbcSession final : public ibex::runtime::Resource {
             if (in_transaction_) {
                 return std::unexpected("a transaction is already open");
             }
+            if (quirks_.leaves_result_unread) {
+                // Still in autocommit, so it opens nothing (see DriverQuirks).
+                (void)run_trivial_query();
+            }
             auto status = set_autocommit(ADBC_OPTION_VALUE_DISABLED);
             if (status) {
                 in_transaction_ = true;
@@ -349,19 +369,32 @@ class AdbcSession final : public ibex::runtime::Resource {
     }
 
     /// Run `write`, a bulk ingest on this connection, in a transaction of its
-    /// own when the driver commits ingests batch by batch and none is open,
-    /// so that a failed write writes nothing (see `DriverQuirks`). `write`
-    /// must not run DDL, which would end the transaction. Called holding the
-    /// statement lease.
+    /// own when the driver needs one for a failed write to write nothing, or
+    /// to report its failure, and none is open (see `DriverQuirks`). On MySQL
+    /// `write` must not run DDL, which would end the transaction. Called
+    /// holding the statement lease.
     template <typename Fn>
     auto ingest_atomically(Fn&& write) -> std::expected<std::int64_t, std::string> {
-        if (!quirks_.batched_ingest || in_transaction_) {
-            return write();
+        auto checked = [&]() -> std::expected<std::int64_t, std::string> {
+            auto rows = write();
+            if (rows && quirks_.ingest_hides_failure) {
+                if (auto probe = run_trivial_query(); !probe) {
+                    return std::unexpected(
+                        "the driver reported the write as done, but writing the rows failed "
+                        "(typically a constraint such as a duplicate key; the driver drops "
+                        "the reason): " +
+                        probe.error());
+                }
+            }
+            return rows;
+        };
+        if (!(quirks_.batched_ingest || quirks_.ingest_hides_failure) || in_transaction_) {
+            return checked();
         }
         if (auto off = set_autocommit(ADBC_OPTION_VALUE_DISABLED); !off) {
             return std::unexpected(off.error());
         }
-        auto rows = write();
+        auto rows = checked();
         auto ended = rows ? call_adbc("AdbcConnectionCommit",
                                       [&](AdbcError* error) {
                                           return AdbcConnectionCommit(&connection_, error);
@@ -398,6 +431,30 @@ class AdbcSession final : public ibex::runtime::Resource {
     }
 
    private:
+    /// Run `SELECT 1` on the connection, without a result stream.
+    auto run_trivial_query() -> std::expected<void, std::string> {
+        AdbcStatement statement{};
+        auto status = call_adbc("AdbcStatementNew", [&](AdbcError* error) {
+            return AdbcStatementNew(&connection_, &statement, error);
+        });
+        if (!status) {
+            return status;
+        }
+        status = call_adbc("AdbcStatementSetSqlQuery", [&](AdbcError* error) {
+            return AdbcStatementSetSqlQuery(&statement, "SELECT 1", error);
+        });
+        if (status) {
+            std::int64_t rows_affected = -1;
+            status = call_adbc("AdbcStatementExecuteQuery", [&](AdbcError* error) {
+                return AdbcStatementExecuteQuery(&statement, nullptr, &rows_affected, error);
+            });
+        }
+        AdbcError error{};
+        AdbcStatementRelease(&statement, &error);
+        release_adbc_error(&error);
+        return status;
+    }
+
     /// The vendor name the driver reports through GetInfo, or "" when it
     /// reports none or the call fails: then no workaround applies.
     auto vendor_name() -> std::string {
@@ -1482,6 +1539,10 @@ auto adbc_write(const ibex::runtime::ExternArgs& args)
     auto rows =
         stmt.set_option(ADBC_INGEST_OPTION_TARGET_TABLE, target->c_str())
             .and_then([&]() -> std::expected<std::int64_t, std::string> {
+                if (stmt.session().quirks().ingest_hides_failure) {
+                    return stmt.session().ingest_atomically(
+                        [&] { return ingest(*adbc_mode, table); });
+                }
                 if (!batched) {
                     return ingest(*adbc_mode, table);
                 }

@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <limits>
 #include <optional>
 #include <robin_hood.h>
 #include <string>
@@ -25,10 +26,75 @@ namespace ibex::runtime {
 
 namespace {
 
-// libstdc++ and libc++ do not ship std::numbers on the same schedules; this
-// literal rounds to the IEEE-754 double value of sqrt(2).
-// NOLINTNEXTLINE(modernize-use-std-numbers)
-constexpr double kSqrt2 = 1.4142135623730950488;
+/// Continued fraction for the regularized incomplete beta function (modified
+/// Lentz; converges fast for x < (a + 1) / (a + b + 2), which `incomplete_beta`
+/// arranges by symmetry).
+auto incomplete_beta_fraction(double a, double b, double x) -> double {
+    constexpr double kTiny = 1e-300;
+    constexpr double kEpsilon = 1e-15;
+    constexpr int kMaxIterations = 500;
+    const double qab = a + b;
+    const double qap = a + 1.0;
+    const double qam = a - 1.0;
+    double c = 1.0;
+    double d = 1.0 - ((qab * x) / qap);
+    d = std::abs(d) < kTiny ? kTiny : d;
+    d = 1.0 / d;
+    double h = d;
+    for (int m = 1; m <= kMaxIterations; ++m) {
+        const auto dm = static_cast<double>(m);
+        const double m2 = 2.0 * dm;
+        double aa = dm * (b - dm) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        d = std::abs(d) < kTiny ? kTiny : d;
+        c = 1.0 + aa / c;
+        c = std::abs(c) < kTiny ? kTiny : c;
+        d = 1.0 / d;
+        h *= d * c;
+        aa = -(a + dm) * (qab + dm) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        d = std::abs(d) < kTiny ? kTiny : d;
+        c = 1.0 + aa / c;
+        c = std::abs(c) < kTiny ? kTiny : c;
+        d = 1.0 / d;
+        const double delta = d * c;
+        h *= delta;
+        if (std::abs(delta - 1.0) < kEpsilon) {
+            break;
+        }
+    }
+    return h;
+}
+
+/// The regularized incomplete beta function I_x(a, b), for 0 <= x <= 1.
+auto incomplete_beta(double a, double b, double x) -> double {
+    if (x <= 0.0) {
+        return 0.0;
+    }
+    if (x >= 1.0) {
+        return 1.0;
+    }
+    const double log_front = std::lgamma(a + b) - std::lgamma(a) - std::lgamma(b) +
+                             (a * std::log(x)) + (b * std::log1p(-x));
+    const double front = std::exp(log_front);
+    if (x < (a + 1.0) / (a + b + 2.0)) {
+        return front * incomplete_beta_fraction(a, b, x) / a;
+    }
+    return 1.0 - ((front * incomplete_beta_fraction(b, a, 1.0 - x)) / b);
+}
+
+/// P(|T| > |t|) for Student's t with `df` degrees of freedom: the two-sided p-value
+/// of a coefficient's t statistic. With no residual degrees of freedom there is no
+/// distribution to ask, so the p-value is NaN rather than a number that looks real.
+auto two_sided_t_p_value(double t, double df) -> double {
+    if (!(df > 0.0)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    if (t == 0.0) {
+        return 1.0;
+    }
+    return incomplete_beta(df / 2.0, 0.5, df / (df + t * t));
+}
 
 /// Build a design matrix from a DataFrame using a model formula.
 /// Returns column names and a column-major matrix (vector of column vectors).
@@ -461,7 +527,11 @@ auto build_model_result(const std::vector<std::string>& col_names,
         summary_std_error.push_back(std_errors[j]);
         const double t = (std_errors[j] > 0.0) ? beta[j] / std_errors[j] : 0.0;
         summary_t_stat.push_back(t);
-        summary_p_value.push_back(2.0 * std::erfc(std::abs(t) / kSqrt2));
+        // Student's t with the residual degrees of freedom, as every regression
+        // summary reports it. (This was `2 * erfc(|t| / sqrt 2)`: a normal tail
+        // with a spurious factor of two, so a p-value could exceed 1.)
+        summary_p_value.push_back(
+            two_sided_t_p_value(t, static_cast<double>(n) - static_cast<double>(p)));
     }
     summary_table.add_column("term", std::move(summary_term));
     summary_table.add_column("estimate", std::move(summary_estimate));

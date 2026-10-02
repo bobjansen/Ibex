@@ -327,7 +327,7 @@
       <table class="repl-table">
         <tbody>
           <tr><td><code>model_coef(m)</code></td><td>Coefficient table with columns <code>term: String</code> and <code>estimate: Float64</code>.</td></tr>
-          <tr><td><code>model_summary(m)</code></td><td>Full summary: <code>term</code>, <code>estimate</code>, <code>std_error</code>, <code>t_stat</code>, <code>p_value</code>.</td></tr>
+          <tr><td><code>model_summary(m)</code></td><td>Full summary: <code>term</code>, <code>estimate</code>, <code>std_error</code>, <code>t_stat</code>, <code>p_value</code> (two-sided, Student&rsquo;s t with n&minus;p degrees of freedom).</td></tr>
           <tr><td><code>model_fitted(m)</code></td><td>Fitted values (ŷ) as a single-column table.</td></tr>
           <tr><td><code>model_residuals(m)</code></td><td>Residuals (y − ŷ) as a single-column table.</td></tr>
           <tr><td><code>model_r_squared(m)</code></td><td>R² and adjusted R² as a single-row table.</td></tr>

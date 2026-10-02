@@ -744,17 +744,44 @@ t;
     CHECK(lowered->resource_steps[1].position == 7);
 }
 
-TEST_CASE("lower_script refuses a resource call nested in another call's argument",
+TEST_CASE("lower_script runs a resource call nested in an argument first, as a temporary",
           "[parser][lower][resource]") {
-    // The REPL runs the inner call first and passes its result. A compiled
-    // program has no slot for that yet, and lowering the inner call as an
-    // expression would never make it.
+    // The REPL runs the inner call and passes its result; so does a compiled
+    // program: the connection is bound to a name of the statement's own, before
+    // it, and released after it.
     auto lowered = lower_resource_script(R"IBEX(
 run(open("file:x"), "select 1");
 t;
 )IBEX");
+    REQUIRE(lowered.has_value());
+    REQUIRE(lowered->preamble.size() == 2);
+    const auto* opened = as_node<ir::ExternCallNode>(lowered->preamble[0].get());
+    REQUIRE(opened != nullptr);
+    CHECK(opened->callee() == "open");
+    REQUIRE(lowered->preamble_binds[0].has_value());
+    CHECK(lowered->preamble_binds[0]->resource);
+    CHECK(lowered->preamble_binds[0]->hoisted);
+    CHECK_FALSE(lowered->preamble_binds[1].has_value());
+    const auto* used = as_node<ir::ExternCallNode>(lowered->preamble[1].get());
+    REQUIRE(used != nullptr);
+    const auto* connection = std::get_if<ir::ColumnRef>(&used->args()[0].node);
+    REQUIRE(connection != nullptr);
+    CHECK(connection->name == lowered->preamble_binds[0]->name);
+    REQUIRE(lowered->resource_steps.size() == 1);
+    CHECK(lowered->resource_steps[0].kind == parser::ResourceStep::Kind::Unbind);
+    CHECK(lowered->resource_steps[0].name == connection->name);
+}
+
+TEST_CASE("lower_script refuses a nested resource call that does not return a resource",
+          "[parser][lower][resource]") {
+    // A scalar from a call on a connection, passed as an argument, has nowhere to
+    // go in a compiled program yet.
+    auto lowered = lower_resource_script(R"IBEX(
+let db = open("file:x");
+put(db, Table { x = [1] }, run(db, "select 1"));
+t;
+)IBEX");
     REQUIRE_FALSE(lowered.has_value());
-    CHECK(lowered.error().message.find("open") != std::string::npos);
     CHECK(lowered.error().message.find("bind its result with `let`") != std::string::npos);
 }
 

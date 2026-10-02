@@ -1880,9 +1880,6 @@ class Lowerer {
 
     auto lower_script(const Program& program) -> ScriptPlanResult {
         ir::NodePtr last_expr;
-        std::vector<ir::NodePtr> preamble_calls;
-        std::vector<std::size_t> preamble_positions;
-        std::vector<std::optional<CallBind>> preamble_binds;
         std::vector<ScriptSink> sinks;
         share_repeated_bindings_ = true;
         for (const auto& stmt : program.statements) {
@@ -2091,10 +2088,10 @@ class Lowerer {
                         if (!args.has_value()) {
                             return std::unexpected(args.error());
                         }
-                        preamble_calls.push_back(
+                        preamble_calls_.push_back(
                             builder_.extern_call(call->callee, std::move(*args)));
-                        preamble_positions.push_back(position);
-                        preamble_binds.emplace_back(
+                        preamble_positions_.push_back(position);
+                        preamble_binds_.emplace_back(
                             CallBind{.name = let_stmt.name, .resource = binds_resource});
                         if (binds_resource) {
                             resource_names_.insert(let_stmt.name);
@@ -2201,10 +2198,10 @@ class Lowerer {
                             }
                         }
                         if (args_ok) {
-                            preamble_calls.push_back(
+                            preamble_calls_.push_back(
                                 builder_.extern_call(call->callee, std::move(args)));
-                            preamble_positions.push_back(position);
-                            preamble_binds.emplace_back(std::nullopt);
+                            preamble_positions_.push_back(position);
+                            preamble_binds_.emplace_back(std::nullopt);
                             continue;
                         }
                     }
@@ -2230,9 +2227,9 @@ class Lowerer {
             return std::unexpected(LowerError{.message = "no expression to lower"});
         }
         return ScriptPlan{
-            .preamble = std::move(preamble_calls),
-            .preamble_positions = std::move(preamble_positions),
-            .preamble_binds = std::move(preamble_binds),
+            .preamble = std::move(preamble_calls_),
+            .preamble_positions = std::move(preamble_positions_),
+            .preamble_binds = std::move(preamble_binds_),
             .resource_steps = std::move(resource_steps_),
             .shared_bindings = std::move(shared_bindings_),
             .sinks = std::move(sinks),
@@ -2578,11 +2575,37 @@ class Lowerer {
             // result; a compiled program has no slot for that yet, and lowering
             // the call as an expression would not call it at all.
             if (script_mode_ && resource_functions_.has_value()) {
+                if (const auto* nested_call = std::get_if<CallExpr>(&arg.node);
+                    nested_call != nullptr && resource_functions_->contains(nested_call->callee) &&
+                    find_extern_decl(nested_call->callee) != nullptr &&
+                    find_extern_decl(nested_call->callee)->return_type.kind ==
+                        Type::Kind::Resource) {
+                    // `run(open("file:x"), ...)`: the inner call runs first and its
+                    // connection is the argument. It is a temporary of this
+                    // statement: released when the statement is done.
+                    auto inner_args = lower_extern_args(*nested_call);
+                    if (!inner_args.has_value()) {
+                        return std::unexpected(inner_args.error());
+                    }
+                    std::string name = "__ibex_res_" + std::to_string(synthetic_counter_++);
+                    preamble_calls_.push_back(
+                        builder_.extern_call(nested_call->callee, std::move(*inner_args)));
+                    preamble_positions_.push_back(current_position_);
+                    preamble_binds_.emplace_back(
+                        CallBind{.name = name, .resource = true, .hoisted = true});
+                    resource_steps_.push_back(ResourceStep{.kind = ResourceStep::Kind::Unbind,
+                                                           .name = name,
+                                                           .source = {},
+                                                           .position = current_position_});
+                    args.push_back(ir::Expr{.node = ir::ColumnRef{.name = std::move(name)}});
+                    continue;
+                }
                 if (auto nested = resource_functions_->first_call(arg)) {
                     return std::unexpected(LowerError{
                         .message = call.callee + ": the argument calls " + *nested +
                                    ", which compiled programs cannot yet run inside another "
-                                   "call; bind its result with `let` first"});
+                                   "call unless it returns a resource; bind its result with "
+                                   "`let` first"});
                 }
             }
             const bool is_table_param = script_mode_ && decl != nullptr &&
@@ -6212,6 +6235,11 @@ class Lowerer {
     /// statement being lowered.
     robin_hood::unordered_set<std::string> resource_names_;
     std::vector<ResourceStep> resource_steps_;
+    /// The script's calls for their effect, in the order they were lowered. A
+    /// call nested in another's argument is added here first, so it runs first.
+    std::vector<ir::NodePtr> preamble_calls_;
+    std::vector<std::size_t> preamble_positions_;
+    std::vector<std::optional<CallBind>> preamble_binds_;
     std::size_t synthetic_counter_ = 0;
     std::optional<ResourceFunctions> resource_functions_;
     robin_hood::unordered_map<std::string, std::vector<std::string>> compile_time_lists_;

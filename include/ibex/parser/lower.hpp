@@ -67,6 +67,9 @@ struct SharedBinding {
 struct CallBind {
     std::string name;
     bool resource = false;
+    /// A temporary the lowerer made for a call nested in another's argument:
+    /// it runs before the statement's own bindings and call.
+    bool hoisted = false;
 };
 
 /// A statement about a resource binding that is not a call: `let b = a;` makes

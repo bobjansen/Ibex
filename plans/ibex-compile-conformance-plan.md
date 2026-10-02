@@ -508,10 +508,12 @@ query clause is refused with the REPL's message before anything is emitted.
 
 Parity (`tests/parity/effect_cases/`): `adbc_connection`, `adbc_alias_and_rebind`,
 `adbc_transaction`, `adbc_release` -- the last fails ("database is locked") if the
-release is not emitted. Not done, and refused with a message: a `fn` that takes,
-opens or returns a resource (it needs a C++ function with a statement body and its
-own lowering), and a resource call nested inside another call's argument (the REPL
-runs it first; the compiler asks for a `let`).
+release is not emitted. A connection opened inside another call's argument
+(`adbc_execute(adbc_connect(...), "...")`) is a temporary of the statement: it runs
+first and is released after (`adbc_nested_call`). Not done, and refused with a
+message: a `fn` that takes, opens or returns a resource (it needs a C++ function
+with a statement body and its own lowering, or inlining at the call site with
+hygiene for names), and a nested call that returns a scalar or table argument.
 
 Original design, kept for the record:
 

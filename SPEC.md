@@ -2098,7 +2098,7 @@ Accessor functions extract sub-tables from a `ModelResult`:
 | Accessor | Returns |
 |----------|---------|
 | `coef(m)` / `model_coef(m)` | `Table`: term, estimate (empty for tree models) |
-| `summary(m)` / `model_summary(m)` | `Table`: term, estimate, std_error, t_stat, p_value |
+| `summary(m)` / `model_summary(m)` | `Table`: term, estimate, std_error, t_stat, p_value (two-sided, Student's t with n − p degrees of freedom) |
 | `fitted(m)` / `model_fitted(m)` | `Table`: fitted (in-sample predicted values) |
 | `residuals(m)` / `model_residuals(m)` | `Table`: residual (y − ŷ) |
 | `importance(m)` / `model_importance(m)` | `Table`: term, gain (tree models; empty otherwise) |

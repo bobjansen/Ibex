@@ -12690,6 +12690,64 @@ TEST_CASE("model: ModelResult accessor tables", "[model]") {
     REQUIRE(resid[4] == Catch::Approx(0.0).margin(1e-10));
 }
 
+TEST_CASE("model: summary p-values are Student's t two-sided tails", "[model]") {
+    // The p-value of a coefficient is P(|T| > |t|) for Student's t with n - p
+    // degrees of freedom. It was `2 * erfc(|t| / sqrt 2)`: a normal tail with a
+    // spurious factor of two, so it could exceed 1 and ignored the sample size.
+    // Closed forms exist for 1, 2 and 3 degrees of freedom, which pins the
+    // incomplete-beta code to values that need no library to state.
+    constexpr double kPi = 3.14159265358979323846;
+    const auto fit = [](std::vector<double> xs, std::vector<double> ys) {
+        runtime::Table t;
+        t.add_column("x", Column<double>(xs));
+        t.add_column("y", Column<double>(ys));
+        runtime::TableRegistry registry;
+        registry.emplace("t", t);
+        auto ir = require_ir("t[model { y ~ x, method = ols }];");
+        runtime::ModelResult model;
+        auto result = runtime::interpret(*ir, registry, nullptr, nullptr, &model);
+        REQUIRE(result.has_value());
+        return model.summary;
+    };
+    const auto column = [](const runtime::Table& summary, const char* name) {
+        return std::get<Column<double>>(*summary.find(name));
+    };
+
+    SECTION("1 degree of freedom") {
+        const auto summary = fit({1.0, 2.0, 3.0}, {1.2, 1.9, 3.4});
+        const auto t_stat = column(summary, "t_stat");
+        const auto p = column(summary, "p_value");
+        for (std::size_t row = 0; row < p.size(); ++row) {
+            CHECK(p[row] == Catch::Approx(1.0 - (2.0 / kPi) * std::atan(std::abs(t_stat[row]))));
+        }
+    }
+    SECTION("2 degrees of freedom") {
+        const auto summary = fit({1.0, 2.0, 3.0, 4.0}, {1.1, 2.3, 2.8, 4.4});
+        const auto t_stat = column(summary, "t_stat");
+        const auto p = column(summary, "p_value");
+        for (std::size_t row = 0; row < p.size(); ++row) {
+            const double t = std::abs(t_stat[row]);
+            CHECK(p[row] == Catch::Approx(1.0 - t / std::sqrt(2.0 + t * t)));
+        }
+    }
+    SECTION("3 degrees of freedom") {
+        const auto summary = fit({1.0, 2.0, 3.0, 4.0, 5.0}, {2.1, 3.9, 6.2, 7.8, 10.1});
+        const auto t_stat = column(summary, "t_stat");
+        const auto p = column(summary, "p_value");
+        for (std::size_t row = 0; row < p.size(); ++row) {
+            const double t = std::abs(t_stat[row]);
+            const double root3 = std::sqrt(3.0);
+            CHECK(p[row] == Catch::Approx(1.0 - (2.0 / kPi) * (std::atan(t / root3) +
+                                                               t * root3 / (3.0 + t * t)))
+                                .epsilon(1e-6));
+            CHECK(p[row] >= 0.0);
+            CHECK(p[row] <= 1.0);
+        }
+        // The intercept's statistic is small, so its p-value is large (and was 1.6).
+        CHECK(p[0] == Catch::Approx(0.817).epsilon(1e-3));
+    }
+}
+
 TEST_CASE("model: integer columns widened", "[model]") {
     runtime::Table t;
     t.add_column("x", Column<std::int64_t>{1, 2, 3, 4, 5});

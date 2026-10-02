@@ -1,0 +1,14 @@
+// A connection in a compiled program: opened, written through, queried by a
+// function, closed. SQLITE_DRIVER is substituted by scripts/ibex-e2e.sh.
+import "adbc";
+
+fn total(mutable conn: AdbcConnection) -> DataFrame {
+    adbc_query(conn, "select sum(x) as total from t");
+}
+
+let db = adbc_connect("@SQLITE_DRIVER@", ":memory:");
+adbc_execute(db, "create table t (x integer)");
+adbc_write(db, Table { x = [3, 4, 5] }, "t", "append");
+let answer = total(db);
+adbc_close(db);
+answer;

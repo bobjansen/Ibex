@@ -581,6 +581,26 @@ if [[ "$SKIP_COMPILE" == false ]]; then
     rg -n "read_parquet\\(\\\"https://data.example.com/flights-1m.parquet\\\"\\)" "$out_cpp" >/dev/null
     rm -f "$out_cpp"
 
+    # A connection in a compiled program: built with ibex-build.sh, which links the
+    # ADBC client library, and run against the SQLite driver the build found.
+    sqlite_driver="$(sed -n 's/^ADBC_DRIVER_SQLITE_LIBRARY:FILEPATH=//p' "$BUILD_DIR/CMakeCache.txt")"
+    if [[ -n "$sqlite_driver" && -f "$sqlite_driver" && -f "$BUILD_DIR/libs/adbc/libibex_adbc.a" ]]; then
+        echo "▸ transpile + run (ADBC connection and function)"
+        adbc_ibex="$(mktemp --suffix=.ibex)"
+        adbc_bin="$(mktemp -u)"
+        sed "s#@SQLITE_DRIVER@#$sqlite_driver#g" "$IBEX_ROOT/tests/data/compile_adbc.ibex" >"$adbc_ibex"
+        BUILD_DIR="$BUILD_DIR" "$IBEX_ROOT/scripts/ibex-build.sh" "$adbc_ibex" -o "$adbc_bin" >/dev/null
+        adbc_out="$("$adbc_bin")"
+        if ! grep -q '| 12' <<<"$adbc_out"; then
+            echo "error: ADBC compiled program printed the wrong total:" >&2
+            echo "$adbc_out" >&2
+            exit 1
+        fi
+        rm -f "$adbc_ibex" "$adbc_bin"
+    else
+        echo "▸ skip ADBC transpile (no SQLite driver or ibex_adbc library)"
+    fi
+
     echo "▸ transpile (parquet s3)"
     out_cpp="$(mktemp --suffix=.cpp)"
     "$BUILD_DIR/tools/ibex_compile" "$IBEX_ROOT/tests/data/compile_parquet_s3.ibex" -o "$out_cpp"

@@ -785,6 +785,26 @@ t;
     CHECK(lowered.error().message.find("bind its result with `let`") != std::string::npos);
 }
 
+TEST_CASE("lower_script lets a program end in an effect, and lower() does not",
+          "[parser][lower][resource]") {
+    const char* source = R"IBEX(
+extern fn write(df: DataFrame, path: String) -> Int from "writer.hpp";
+write(Table { x = [1] }, "out");
+)IBEX";
+    auto program = require_parse(source);
+    auto scripted = parser::lower_script(program);
+    REQUIRE(scripted.has_value());
+    CHECK(scripted->result == nullptr);
+    CHECK(scripted->sinks.size() == 1);
+    // A single plan needs a table to be.
+    auto program_again = require_parse(source);
+    REQUIRE_FALSE(parser::lower(program_again).has_value());
+
+    // Nothing to do and nothing to give is still an error.
+    auto empty = require_parse("let k = 1;\n");
+    REQUIRE_FALSE(parser::lower_script(empty).has_value());
+}
+
 TEST_CASE("lower_script lowers a resource fn as a function of the program",
           "[parser][lower][resource]") {
     auto lowered = lower_resource_script(R"IBEX(

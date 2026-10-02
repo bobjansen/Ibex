@@ -6351,6 +6351,9 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
     if (!script->preamble.empty()) {
         return decline("script has statements that must run before the plan");
     }
+    if (script->result == nullptr) {
+        return decline("script ends in an effect, with no result plan");
+    }
 
     // A shared binding's plan is evaluated on its own, inside `evaluate`,
     // where `ir::required_columns` has no consumer above the plan's root and

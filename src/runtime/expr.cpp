@@ -3297,7 +3297,7 @@ auto eval_fill_forward(const ir::CallExpr& call, const Table& input)
                 // alias the members they read -- about twenty instructions and a
                 // spilled carry per row for one load, one bit test and one store.
                 const T* const in = col.data();
-                T* const dst = result.data();
+                T* const dst = out.data();
                 const std::uint8_t* const bits = validity.buffer_data();
                 const std::size_t bit_base = validity.buffer_offset();
                 const auto is_valid = [bits, bit_base](std::size_t row) {
@@ -3388,7 +3388,7 @@ auto eval_fill_backward(const ir::CallExpr& call, const Table& input)
                 ColT result;
                 ColumnAppender<ColT> out(result, rows);
                 const T* const in = col.data();
-                T* const dst = result.data();
+                T* const dst = out.data();
                 const std::uint8_t* const bits = validity.buffer_data();
                 const std::size_t bit_base = validity.buffer_offset();
                 const auto is_valid = [bits, bit_base](std::size_t row) {

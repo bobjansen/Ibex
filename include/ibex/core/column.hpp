@@ -1763,6 +1763,14 @@ class ColumnAppender {
         }
     }
 
+    /// The output storage of a dense column, for a kernel that writes it by
+    /// index rather than by `push`. Same obligation: every slot is written.
+    [[nodiscard]] auto data() noexcept -> value_type*
+        requires is_dense_column_v<ColT>
+    {
+        return out_;
+    }
+
     void push(const value_type& value) {
         if constexpr (is_dense_column_v<ColT>) {
             out_[next_++] = value;

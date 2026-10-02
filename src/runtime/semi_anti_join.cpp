@@ -914,7 +914,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 // `select_rows` stores each surviving index, which may alias
                 // those members, so none of it hoists. Resolve them once.
                 const std::int64_t* const keys = col->data();
-                const std::uint64_t dense_min = static_cast<std::uint64_t>(dense_i64_min_);
+                const auto dense_min = static_cast<std::uint64_t>(dense_i64_min_);
                 const std::uint64_t dense_slots = dense_i64_nbits_;
                 const std::uint64_t* const hits = dense_i64_hits_.data();
                 const std::uint8_t* const null_bits =

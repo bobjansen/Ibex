@@ -37,6 +37,26 @@ LOG="$ROOT/build-release/post_commit_perf.log"
 COMMIT="$(git rev-parse --short HEAD)"
 SUBJECT="$(git log -1 --format=%s HEAD)"
 
+# The benchmark runs the binary in build-release, not the tree. If that binary
+# is older than the sources it was built from, the numbers describe an older
+# commit and say nothing about this one -- and a log full of confident
+# "Geometric mean ... 0.36x" lines for commits it never measured is worse than
+# no log. Report the staleness instead and skip the run.
+STALE_SOURCE="$(find "$ROOT/src" "$ROOT/include" "$ROOT/libs" \
+    \( -name '*.cpp' -o -name '*.hpp' \) -newer "$BENCH" -print -quit 2>/dev/null)"
+if [[ -n "$STALE_SOURCE" ]]; then
+    {
+        echo "=== $COMMIT  $(date -Is)  ${SUBJECT}"
+        echo "[perf] SKIPPED: build-release/tools/ibex_bench ($(date -r "$BENCH" -Is)) is older than"
+        echo "[perf]   ${STALE_SOURCE#"$ROOT"/} -- it does not contain this commit."
+        echo "[perf]   Rebuild build-release (cmake --build build-release -j 6) and re-run"
+        echo "[perf]   benchmarking/run_scale_regression.sh, or A/B with compare_ibex_git.sh."
+        echo
+    } >>"$LOG" 2>&1
+    echo "[perf] skipped: build-release is stale (older than ${STALE_SOURCE#"$ROOT"/}); see $LOG" >&2
+    exit 0
+fi
+
 # TODO(perf-hook): this runs the full scale regression, incl. the
 # bandwidth-heavy dcast/melt benchmarks, whose absolute numbers swing widely
 # under load and produce noisy false-positive FAILs. If the FAIL line proves

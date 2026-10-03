@@ -10,7 +10,9 @@
 
 #include <ibex/runtime/extern_registry.hpp>
 
+#include <cstdint>
 #include <exception>
+#include <expected>
 #include <string>
 #include <variant>
 

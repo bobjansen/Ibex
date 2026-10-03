@@ -10,9 +10,11 @@
 #include <ibex/runtime/ops.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -1244,8 +1246,12 @@ TEST_CASE("emitter: a program function is declared, takes its parameters, and is
 
 TEST_CASE("emitter: a fitted model is a variable, and its accessors read it", "[codegen]") {
     ir::Builder b;
-    auto fit = b.model(ir::ModelFormula{"y", {ir::ModelTerm{{"x1", "x2"}, false}}, true}, "ridge",
-                       {ir::ModelParamSpec{"lambda", ir::Expr{ir::Literal{.value = 0.5}}}});
+    auto fit = b.model(
+        ir::ModelFormula{.response = "y",
+                         .terms = {ir::ModelTerm{.columns = {"x1", "x2"}, .is_dot = false}},
+                         .has_intercept = true},
+        "ridge",
+        {ir::ModelParamSpec{.name = "lambda", .value = ir::Expr{ir::Literal{.value = 0.5}}}});
     fit->add_child(make_source(b, "in.csv"));
     auto coef = b.extern_call("coef", {ir::Expr{ir::ColumnRef{.name = "m"}}});
     auto r2 = b.extern_call("r_squared", {ir::Expr{ir::ColumnRef{.name = "m"}}});
@@ -1283,7 +1289,10 @@ TEST_CASE("emitter: a fitted model is a variable, and its accessors read it", "[
 
 TEST_CASE("emitter: a model method that comes from a plugin is refused", "[codegen]") {
     ir::Builder b;
-    auto fit = b.model(ir::ModelFormula{"y", {ir::ModelTerm{{"x"}, false}}, true}, "lightgbm", {});
+    auto fit = b.model(ir::ModelFormula{.response = "y",
+                                        .terms = {ir::ModelTerm{.columns = {"x"}, .is_dot = false}},
+                                        .has_intercept = true},
+                       "lightgbm", {});
     fit->add_child(make_source(b, "in.csv"));
     REQUIRE_THROWS_WITH(emit_to_string(*fit), Catch::Matchers::ContainsSubstring("plugin"));
 }

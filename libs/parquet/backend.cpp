@@ -3,6 +3,9 @@
 
 #include <ibex/parquet/backend.hpp>
 #include <ibex/runtime/extern_registry.hpp>
+#include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/lazy_table.hpp>
+#include <ibex/runtime/operator.hpp>
 
 #include <cstdint>
 #include <exception>

@@ -12,6 +12,14 @@
 #include "websocket.hpp"
 
 #include <ibex/runtime/extern_registry.hpp>
+#include <ibex/runtime/interpreter.hpp>
+
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <expected>
+#include <string>
+#include <variant>
 
 namespace {
 

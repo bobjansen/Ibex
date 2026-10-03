@@ -3,10 +3,13 @@
 
 #include <CLI/CLI.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <ratio>
 #include <string>
 
 #include "../libs/csv/csv.hpp"

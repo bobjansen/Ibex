@@ -6,14 +6,22 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <csv.hpp>
 #include <exception>
+#include <expected>
 #include <filesystem>
 #include <fs.hpp>
 #include <fstream>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <variant>
 #ifdef _WIN32
 #include <process.h>
@@ -232,7 +240,7 @@ extern fn csv::write(df: DataFrame, path: String) -> Int from "csv.hpp";
 )")
                 .ok);
 
-    const std::string script = "fs::list(\"" + src.string() + "\", \"*.csv\")[map { " +
+    const std::string script = R"(fs::list(")" + src.string() + R"(", "*.csv")[map { )" +
                                "source = path, " + "target = `" + dst.string() +
                                "/${stem}.out.csv`, " + "rows = csv::write(csv::read(path), `" +
                                dst.string() + "/${stem}.out.csv`) }];";

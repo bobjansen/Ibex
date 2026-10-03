@@ -108,7 +108,7 @@ inline auto import_search_paths(const std::filesystem::path& entry_file,
 inline auto import_candidates(const std::string& name, const std::filesystem::path& base_dir)
     -> std::vector<std::filesystem::path> {
     std::vector<std::filesystem::path> candidates;
-    std::filesystem::path module{name};
+    const std::filesystem::path module{name};
     std::filesystem::path direct = module;
     if (!direct.has_extension()) {
         direct += ".ibex";
@@ -238,7 +238,7 @@ inline auto expand_imports(parser::Program program, const std::string& entry_fil
                            const std::vector<std::string>& explicit_paths = {})
     -> std::expected<parser::Program, std::string> {
     namespace fs = std::filesystem;
-    fs::path entry = fs::absolute(fs::path(entry_file));
+    const fs::path entry = fs::absolute(fs::path(entry_file));
     auto paths = detail::import_search_paths(entry, explicit_paths);
 
     robin_hood::unordered_set<std::string> imported_paths;

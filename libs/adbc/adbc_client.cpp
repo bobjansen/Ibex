@@ -7,9 +7,13 @@
 
 #include "adbc_client.hpp"
 
+#include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/core/text.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/interop/arrow_c_data.hpp>
 #include <ibex/runtime/extern_registry.hpp>
+#include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/morsel.hpp>
 #include <ibex/runtime/operator.hpp>
 
@@ -27,8 +31,10 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "adbc_objects.hpp"
@@ -1125,7 +1131,7 @@ struct NullableStrings {
 /// Why reading a driver's Arrow stream failed.
 auto stream_failure(::ArrowArrayStream& stream, std::string_view context, int status)
     -> std::string {
-    std::string message = std::string(context) + " failed";
+    const std::string message = std::string(context) + " failed";
     if (stream.get_last_error != nullptr) {
         if (const char* error = stream.get_last_error(&stream);
             error != nullptr && std::strlen(error) > 0) {

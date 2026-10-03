@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/codegen/emitter.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/parser/ast.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/names.hpp>
 #include <ibex/parser/parser.hpp>
@@ -11,9 +13,12 @@
 #include <CLI/CLI.hpp>
 
 #include <algorithm>
+#include <cstddef>
+#include <exception>
 #include <expected>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <map>
@@ -93,14 +98,16 @@ auto build_script(ibex::parser::ScriptPlan& plan, ibex::parser::ScalarBindingSet
         step.kind = Step::Kind::Call;
         step.plan = plan.preamble[i].get();
         bool hoisted = false;
-        if (i < plan.preamble_binds.size() && plan.preamble_binds[i].has_value()) {
-            step.bind = plan.preamble_binds[i]->name;
-            step.bind_resource = plan.preamble_binds[i]->resource;
-            hoisted = plan.preamble_binds[i]->hoisted;
+        if (i < plan.preamble_binds.size()) {
+            if (const auto& bind = plan.preamble_binds[i]; bind.has_value()) {
+                step.bind = bind->name;
+                step.bind_resource = bind->resource;
+                hoisted = bind->hoisted;
+            }
         }
         // A call nested in another's argument runs before the statement's own
         // bindings, which may need it.
-        ordered.emplace_back(plan.preamble_positions.at(i) * 4 + (hoisted ? 0U : 1U),
+        ordered.emplace_back((plan.preamble_positions.at(i) * 4) + (hoisted ? 0U : 1U),
                              std::move(step));
     }
     for (const auto& shared : plan.shared_bindings) {
@@ -118,7 +125,7 @@ auto build_script(ibex::parser::ScriptPlan& plan, ibex::parser::ScalarBindingSet
         step.args = std::move(sink.args);
         step.input_binding = sink.input_binding;
         step.bind = sink.bind;
-        ordered.emplace_back(sink.position * 4 + 1, std::move(step));
+        ordered.emplace_back((sink.position * 4) + 1, std::move(step));
     }
     for (const auto& resource : plan.resource_steps) {
         Step step;
@@ -130,7 +137,7 @@ auto build_script(ibex::parser::ScriptPlan& plan, ibex::parser::ScalarBindingSet
         // A release comes after the statement that rebinds the name: its value
         // may read the old connection. Everything else orders by statement.
         ordered.emplace_back(
-            resource.position * 4 +
+            (resource.position * 4) +
                 (resource.kind == ibex::parser::ResourceStep::Kind::Unbind ? 2U : 1U),
             std::move(step));
     }
@@ -139,7 +146,7 @@ auto build_script(ibex::parser::ScriptPlan& plan, ibex::parser::ScalarBindingSet
             Step step;
             step.kind = Step::Kind::DeferredScalar;
             step.deferred = &scalars->deferred[i];
-            ordered.emplace_back(scalars->deferred_positions.at(i) * 4 + 1, std::move(step));
+            ordered.emplace_back((scalars->deferred_positions.at(i) * 4) + 1, std::move(step));
         }
     }
     std::ranges::stable_sort(ordered, {}, &std::pair<std::size_t, Step>::first);
@@ -225,9 +232,7 @@ auto build_function(ibex::parser::FunctionPlan& plan)
     return fn;
 }
 
-}  // namespace
-
-int main(int argc, char* argv[]) {
+auto run(int argc, char** argv) -> int {
     CLI::App app{"ibex compiler — transpile .ibex source to C++23"};
     app.set_version_flag("--version", "ibex_compile 0.1.0");
 
@@ -263,7 +268,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "ibex_compile: cannot open '" << input_path << "'\n";
         return 1;
     }
-    std::string source(std::istreambuf_iterator<char>{in_file}, {});
+    const std::string source(std::istreambuf_iterator<char>{in_file}, {});
 
     const auto parse_and_expand =
         [&](const std::string& src) -> std::expected<ibex::parser::Program, std::string> {
@@ -409,4 +414,17 @@ int main(int argc, char* argv[]) {
     }
     emitter.emit(out, script, config);
     return 0;
+}
+
+}  // namespace
+
+int main(int argc, char* argv[]) {
+    // Anything the compiler throws is reported like its other errors, not left
+    // to terminate the process.
+    try {
+        return run(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << "ibex_compile: " << e.what() << "\n";
+        return 1;
+    }
 }

@@ -265,9 +265,9 @@ ibex_read_parquet <- function(path, session = ibex_default_session(), name = NUL
     # session loader finds parquet.so in default_plugin_paths() and registers it
     # once. Repeating the declaration in a session is harmless.
     session_eval(session,
-                 'extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";')
+                 'extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";')
     binding <- ibex_new_binding_name(session, "parquet")
-    session_eval(session, paste0("let ", binding, " = read_parquet(",
+    session_eval(session, paste0("let ", binding, " = parquet::read(",
                                  ibex_quote_string(path), ");"))
     info <- ibex_table_info(session, binding)
     new_ibex_tbl(

@@ -153,7 +153,7 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
 
         case NodeKind::Program: {
             const auto& program = node_cast<ProgramNode>(node);
-            // Preamble entries are side-effecting calls (write_csv, …) whose
+            // Preamble entries are side-effecting calls (csv::write, …) whose
             // results are discarded; each consumes its own subtree in full.
             ColumnDemand all;
             all.widen();

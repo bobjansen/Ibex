@@ -1,0 +1,28 @@
+// Namespaces: library functions are called by qualified name, `using` brings
+// them into scope, and a script can declare a namespace of its own.
+//
+//   ibex examples/namespaces.ibex      (from the repository root)
+
+import "csv";
+
+// `import` brings in qualified names only: csv::read, csv::write.
+let iris = csv::read("data/iris.csv");
+
+// A namespace of our own. Inside it, siblings are called without the prefix.
+namespace stats {
+    fn wide(df: DataFrame) -> DataFrame {
+        df[filter `Sepal.Width` > 3.5];
+    }
+    fn wide_count(df: DataFrame) -> DataFrame {
+        wide(df)[select { n = count() }, by Species];
+    }
+}
+
+// A column or binding named like a namespace never shadows a qualified call.
+let stats = 1;
+stats::wide_count(iris);
+
+// `using` makes the names of a namespace callable without the prefix, from
+// here to the end of the script.
+using stats;
+wide(iris)[select { mean_petal = mean(`Petal.Length`) }];

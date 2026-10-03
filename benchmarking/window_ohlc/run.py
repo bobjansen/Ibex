@@ -46,7 +46,7 @@ DATA_DIR = HERE / "data"
 
 # Mean gap between consecutive ticks, in milliseconds, across ALL symbols.
 #
-# Pinned rather than left to `gen_ticks`'s own default, which is 1000.0 -- one
+# Pinned rather than left to `gen::ticks`'s own default, which is 1000.0 -- one
 # tick per SECOND for the whole feed. At that rate a 5M-row/100-symbol file
 # spans 57.8 days, a 10-second bar holds 1.1 ticks, and `resample` produces
 # 4.76M groups from 5M rows: an identity operation wearing the name of an
@@ -71,10 +71,10 @@ def gen_data(rows: int, nsym: int, interval_ms: float = TICK_INTERVAL_MS) -> Pat
     script = HERE / "data" / f"_gen_{tag}.ibex"
     script.write_text(
         'import data_gen;\n'
-        'extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";\n'
+        'extern fn parquet::write(df: DataFrame, path: String) -> Int from "parquet.hpp";\n'
         'seed_rng(42);\n'
-        f'let t = gen_ticks({rows}, "{symbols}", 100.0, 0.5, {interval_ms}, 0);\n'
-        f'write_parquet(t, "{path}");\n'
+        f'let t = gen::ticks({rows}, "{symbols}", 100.0, 0.5, {interval_ms}, 0);\n'
+        f'parquet::write(t, "{path}");\n'
     )
     subprocess.run([str(IBEX_BIN), str(script)], check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -94,8 +94,8 @@ def bench_ibex(parquet: Path, window: str, iters: int,
                budget_s: float) -> tuple[float, float, bool]:
     q = _ibex_query(window)
     setup = [
-        'extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";',
-        f'let t = as_timeframe(read_parquet("{parquet}"), "timestamp");',
+        'extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";',
+        f'let t = as_timeframe(parquet::read("{parquet}"), "timestamp");',
         ':timing on',
     ]
     pid, fd = pty.fork()
@@ -400,11 +400,11 @@ def verify_engines(parquet: Path, window: str, tol: float = 1e-9) -> list[str]:
     out = HERE / "data" / f"_verify_{window}.parquet"
     script = HERE / "data" / f"_verify_{window}.ibex"
     script.write_text(
-        'extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";\n'
-        'extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";\n'
-        f'let t = as_timeframe(read_parquet("{parquet}"), "timestamp");\n'
+        'extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";\n'
+        'extern fn parquet::write(df: DataFrame, path: String) -> Int from "parquet.hpp";\n'
+        f'let t = as_timeframe(parquet::read("{parquet}"), "timestamp");\n'
         f'let r = {_ibex_query(window)[:-1]};\n'
-        f'write_parquet(r, "{out}");\n'
+        f'parquet::write(r, "{out}");\n'
     )
     subprocess.run([str(IBEX_BIN), str(script)], check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

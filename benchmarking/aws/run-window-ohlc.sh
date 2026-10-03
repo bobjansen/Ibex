@@ -21,7 +21,7 @@
 #
 # The artifact is a tarball of per-sweep TSVs plus a versions.txt recording
 # engine versions AND the tick interval (which is part of the result: at
-# gen_ticks' 1000ms default a 10s bar holds ~1 tick and the bar suites measure
+# gen::ticks' 1000ms default a 10s bar holds ~1 tick and the bar suites measure
 # group-by cardinality rather than aggregation). A partial tarball is refreshed
 # after every sweep under a separate key, so a run that stalls or is
 # interrupted still yields every sweep that finished.

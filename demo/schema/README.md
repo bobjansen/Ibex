@@ -45,5 +45,5 @@ reader may return more columns than it names.
 Static checking applies wherever the operand's schema is statically known —
 `Table { ... }` literals, `as`-ascribed expressions, typed readers, let-bound
 tables built from any of these, and pipelines over them. A source with an
-unknown schema (e.g. an untyped `read_csv`) or an open (`*`) schema falls back
+unknown schema (e.g. an untyped `csv::read`) or an open (`*`) schema falls back
 to run-time validation.

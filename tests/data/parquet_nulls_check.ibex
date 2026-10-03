@@ -1,8 +1,8 @@
-extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
-extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn csv::read(path: String, nulls: String) -> DataFrame from "csv.hpp";
+extern fn parquet::write(df: DataFrame, path: String) -> Int from "parquet.hpp";
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
 
-// read_parquet used to drop null-ness entirely: a null row came back as 0 (or
+// parquet::read used to drop null-ness entirely: a null row came back as 0 (or
 // as an empty string), with no validity bitmap attached. The values looked
 // plausible, so nothing failed loudly — aggregates just silently counted the
 // nulls as zeroes.
@@ -10,9 +10,9 @@ extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 // Round-trip a null-bearing frame through Parquet and check the nulls are still
 // nulls on the way back. CSV is the source because Ibex array literals cannot
 // express a null.
-let src = read_csv("tests/data/parquet_nulls_check.csv", "NA");
-write_parquet(src, "tests/data/parquet_nulls_check_out.parquet");
-let back = read_parquet("tests/data/parquet_nulls_check_out.parquet");
+let src = csv::read("tests/data/parquet_nulls_check.csv", "NA");
+parquet::write(src, "tests/data/parquet_nulls_check_out.parquet");
+let back = parquet::read("tests/data/parquet_nulls_check_out.parquet");
 
 // i is 10, null, 30, 40, null.
 //   sum  = 80 either way (a null read as 0 adds nothing), so sum proves nothing.

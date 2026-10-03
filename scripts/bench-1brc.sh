@@ -111,9 +111,9 @@ POLARS_MEMORY_RUNNER="$TMP_DIR/polars_memory_runner.sh"
 UV_CACHE_DIR_BENCH="${UV_CACHE_DIR:-$TMP_DIR/uv-cache}"
 
 cat > "$BENCH_QUERY" <<'EOF'
-extern fn read_csv(path: String, nulls: String, delimiter: String, has_header: Bool, schema: String) -> DataFrame from "csv.hpp";
+extern fn csv::read(path: String, nulls: String, delimiter: String, has_header: Bool, schema: String) -> DataFrame from "csv.hpp";
 
-read_csv("__INPUT__", "", ";", false, "cat,f64")[select {
+csv::read("__INPUT__", "", ";", false, "cat,f64")[select {
     min_temp = min(col2),
     avg_temp = mean(col2),
     max_temp = max(col2)

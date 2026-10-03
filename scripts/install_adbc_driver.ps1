@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Bob Jansen
 #
-# Install an ADBC driver on Windows so `adbc_connect("<name>", ...)` finds it
+# Install an ADBC driver on Windows so `adbc::connect("<name>", ...)` finds it
 # by name. The Windows counterpart of scripts/install_adbc_driver.sh.
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\install_adbc_driver.ps1 sqlite postgresql duckdb mysql
@@ -121,7 +121,7 @@ function Register-Driver([string]$name, [string]$Target, [string]$Version, [stri
         $lines += @('[Driver.shared]', "windows_amd64 = '$Target'")
         # TOML: no byte-order mark (Windows PowerShell's UTF8 encoding adds one).
         [System.IO.File]::WriteAllLines($manifest, $lines, (New-Object System.Text.UTF8Encoding $false))
-        Write-Host "  manifest $manifest -> set ADBC_DRIVER_PATH=$Dest, then adbc_connect(`"$name`", ...)"
+        Write-Host "  manifest $manifest -> set ADBC_DRIVER_PATH=$Dest, then adbc::connect(`"$name`", ...)"
     } else {
         $key = "HKCU:\SOFTWARE\ADBC\Drivers\$name"
         New-Item -Path $key -Force | Out-Null
@@ -135,7 +135,7 @@ function Register-Driver([string]$name, [string]$Target, [string]$Version, [stri
         } else {
             Remove-ItemProperty -Path $key -Name 'entrypoint' -ErrorAction SilentlyContinue
         }
-        Write-Host "  registered $key -> adbc_connect(`"$name`", ...)"
+        Write-Host "  registered $key -> adbc::connect(`"$name`", ...)"
     }
 }
 

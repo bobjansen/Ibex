@@ -590,7 +590,7 @@ class Column {
 inline constexpr double kCategoricalPromotionRatio = 0.10;
 
 /// Distinct-value budget for promoting a null-free string column to
-/// Categorical, given its row count. Every importer (read_csv, the JSON
+/// Categorical, given its row count. Every importer (csv::read, the JSON
 /// table builder its plugins share) must decide this the same way: the two
 /// representations take different join and group-by paths, so the same data
 /// arriving over two formats would otherwise perform differently for no

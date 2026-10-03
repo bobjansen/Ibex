@@ -1768,7 +1768,7 @@ class Lowerer {
                 table_extern_decls_.insert_or_assign(ext->name, ext);
             }
             // Track externs whose first argument is a DataFrame — these are sink candidates
-            // (e.g. write_csv, udp_send).  lower_stream uses this to validate sink calls.
+            // (e.g. csv::write, udp::send).  lower_stream uses this to validate sink calls.
             if (!ext->params.empty() && ext->params[0].type.kind == Type::Kind::DataFrame) {
                 sink_externs_.insert(ext->name);
             }
@@ -2281,7 +2281,7 @@ class Lowerer {
                                        ": expected the name of a model bound with `let`"});
                     }
                     // Not a table expression — check whether it's a scalar call
-                    // (e.g. ws_listen(8765)) used purely for its side effect.
+                    // (e.g. ws::listen(8765)) used purely for its side effect.
                     if (const auto* call = std::get_if<CallExpr>(&expr_stmt.expr->node);
                         call != nullptr && !table_externs_.contains(call->callee) &&
                         (!functions_.contains(call->callee) ||
@@ -2320,7 +2320,7 @@ class Lowerer {
                     return std::unexpected(value.error());
                 }
                 // A statement whose value is dropped still runs when it calls a
-                // resource function: `adbc_query(db, "...");` executes once.
+                // resource function: `adbc::query(db, "...");` executes once.
                 if (position + 1 != statements.size() &&
                     plan_calls_resource_function(*value.value())) {
                     shared_bindings_.push_back(
@@ -2335,7 +2335,7 @@ class Lowerer {
         if (pending_unbind.has_value()) {
             resource_steps_.push_back(std::move(*pending_unbind));
         }
-        // A program that ends in an effect (`adbc_close(db);`) has no table to
+        // A program that ends in an effect (`adbc::close(db);`) has no table to
         // give: that is fine when it did something, and an error when it did not.
         const bool did_something = !sinks.empty() || !preamble_calls_.empty() ||
                                    !shared_bindings_.empty() || !resource_steps_.empty();
@@ -2765,7 +2765,7 @@ class Lowerer {
 
     /// The arguments of an extern call, with names and defaults bound and each
     /// lowered for the call's declaration. A table argument -- a `DataFrame`
-    /// parameter that is not the callee's first, like `adbc_write`'s -- cannot be
+    /// parameter that is not the callee's first, like `adbc::write`'s -- cannot be
     /// an expression of the call, so in a script it becomes a binding of its own
     /// at this statement and the argument names it. Elsewhere the argument is
     /// lowered as it always was.
@@ -6464,7 +6464,7 @@ class Lowerer {
     /// The statement being lowered, so a synthetic binding made deep inside its
     /// expression lands at the statement's place in the order.
     std::size_t current_position_ = 0;
-    /// Names bound to a resource (`let db = adbc_connect(...)`), as of the
+    /// Names bound to a resource (`let db = adbc::connect(...)`), as of the
     /// statement being lowered.
     robin_hood::unordered_set<std::string> resource_names_;
     std::vector<ResourceStep> resource_steps_;
@@ -6580,7 +6580,7 @@ auto lower_script(const Program& program, const ir::SourceSchemas& reader_schema
     // just fall back to runtime there).
     //
     // That includes the optimizer. It used to run on the result alone, so a
-    // binding used twice -- every PDS-H script's `write_csv(result, ...);
+    // binding used twice -- every PDS-H script's `csv::write(result, ...);
     // result;` makes the whole query one -- kept its un-canonicalized plan:
     // `[order ...][head n]` stayed a full sort feeding a Head instead of R16's
     // TopK heap-select, and no other canonicalize rewrite reached it either.
@@ -6602,7 +6602,7 @@ auto lower_script(const Program& program, const ir::SourceSchemas& reader_schema
                                         ir::infer_schema(*shared.plan, source_schemas));
     }
     // A sink's input is a plan the executor runs, too -- and for a script
-    // ending `write_csv(result, ...); result;`, the one that runs the query:
+    // ending `csv::write(result, ...); result;`, the one that runs the query:
     // the batch driver serves the final `result` from the table the sink's
     // input produced. It gets the result's rewrites and optimizer. It got
     // neither, so every such script (all of PDS-H) ran un-canonicalized.

@@ -9,9 +9,9 @@
 //   speedup > 1.0  -> Ibex is faster
 //   speedup < 1.0  -> Ibex is slower
 
-extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+extern fn csv::read(path: String) -> DataFrame from "csv.hpp";
 
-let raw = read_csv("benchmarking/results/scales.csv");
+let raw = csv::read("benchmarking/results/scales.csv");
 
 // Keep only execution-time rows (exclude ibex+parse).
 let ibex = raw[filter framework == "ibex"]

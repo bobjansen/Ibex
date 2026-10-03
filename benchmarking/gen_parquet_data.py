@@ -2,14 +2,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Bob Jansen
 
-"""Generate a synthetic Parquet fixture for benchmarking read_parquet.
+"""Generate a synthetic Parquet fixture for benchmarking parquet::read.
 
 Writes a single file with a handful of numeric/string columns and an
 explicit row_group_size, so the file has genuine multi-row-group structure
 independent of the reader's own batch size
 (ChunkedParquetSourceOperator::kParquetRowsPerChunk = 65536). Row count
 defaults large enough to show a real peak-RSS gap between "materialize whole
-file" (old read_parquet) and "stream batches" (new chunked read_parquet) —
+file" (old parquet::read) and "stream batches" (new chunked parquet::read) —
 same order of magnitude as the CSV chunking phase-1 win (100M-row 1BRC:
 3.5GB -> 15MB RSS).
 

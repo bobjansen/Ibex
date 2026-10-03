@@ -22,8 +22,8 @@
 
 import "csv";
 
-let ticks = read_csv("examples/quant_demo/data/ticks.csv");
-let reference_raw = read_csv("examples/quant_demo/data/reference.csv");
+let ticks = csv::read("examples/quant_demo/data/ticks.csv");
+let reference_raw = csv::read("examples/quant_demo/data/reference.csv");
 
 // Promote both to TimeFrames so the asof join is type-checked.
 let tick_stream = as_timeframe(ticks, "ts");
@@ -88,6 +88,6 @@ coefficients;
 //    horizontal concat; today we hand the consumer the row-aligned pair.)
 let predictions = model_fitted(fit);
 
-write_csv(coefficients, "examples/quant_demo/data/coefficients.csv");
-write_csv(labelled,     "examples/quant_demo/data/features.csv");
-write_csv(predictions,  "examples/quant_demo/data/predictions.csv");
+csv::write(coefficients, "examples/quant_demo/data/coefficients.csv");
+csv::write(labelled,     "examples/quant_demo/data/features.csv");
+csv::write(predictions,  "examples/quant_demo/data/predictions.csv");

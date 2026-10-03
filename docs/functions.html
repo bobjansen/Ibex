@@ -61,7 +61,7 @@
           <tr><td><code>df[update { x = fill_forward(x) }]</code></td><td>Typical null-fill usage.</td></tr>
           <tr><td><code>df[map { y = effect(x) }]</code></td><td>Ordered row-wise scalar evaluation, including effectful extern calls.</td></tr>
           <tr><td><code>df[order key]</code></td><td>Standard ordering syntax (instead of <code>order(df, key)</code>).</td></tr>
-          <tr><td><code>import "csv"; read_csv("file.csv")</code></td><td>Typical file I/O usage.</td></tr>
+          <tr><td><code>import "csv"; csv::read("file.csv")</code></td><td>Typical file I/O usage.</td></tr>
           <tr><td><code>df[cov]</code> / <code>df[corr]</code></td><td>Covariance or correlation matrix of numeric columns.</td></tr>
           <tr><td><code>df[transpose]</code></td><td>Swap rows and columns (homogeneous column types required).</td></tr>
           <tr><td><code>matmul(a, b)</code></td><td>Matrix multiply two DataFrames.</td></tr>
@@ -358,10 +358,10 @@
         <p>Typical workflow: <code>import "csv"</code> or <code>import "json"</code>, then call these directly.</p>
         <table class="repl-table">
           <tbody>
-            <tr><td><code>read_csv(path)</code></td><td>Load a CSV file into a DataFrame.</td></tr>
-            <tr><td><code>write_csv(df, path)</code></td><td>Write a DataFrame as CSV and return row count.</td></tr>
-            <tr><td><code>read_json(path)</code></td><td>Load JSON (array, object, or JSON-lines) into a DataFrame.</td></tr>
-            <tr><td><code>write_json(df, path)</code></td><td>Write a DataFrame to JSON and return row count.</td></tr>
+            <tr><td><code>csv::read(path)</code></td><td>Load a CSV file into a DataFrame.</td></tr>
+            <tr><td><code>csv::write(df, path)</code></td><td>Write a DataFrame as CSV and return row count.</td></tr>
+            <tr><td><code>json::read(path)</code></td><td>Load JSON (array, object, or JSON-lines) into a DataFrame.</td></tr>
+            <tr><td><code>json::write(df, path)</code></td><td>Write a DataFrame to JSON and return row count.</td></tr>
           </tbody>
         </table>
       </article>
@@ -370,17 +370,17 @@
         <p>Use parquet for local batch files, HTTPS URLs, and S3-compatible object reads; UDP, WebSocket, and Kafka functions are commonly used in <code>Stream { ... }</code> pipelines.</p>
         <table class="repl-table">
           <tbody>
-            <tr><td><code>read_parquet(path)</code></td><td>Load Apache Parquet from disk, <code>https://</code>, or <code>s3://</code> into a DataFrame.</td></tr>
-            <tr><td><code>write_parquet(df, path)</code></td><td>Write a DataFrame to Parquet and return row count.</td></tr>
-            <tr><td><code>kafka_recv(brokers, topic, group, schema[, options])</code></td><td>Poll one JSON Kafka message, decode it with an explicit schema, and return a one-row DataFrame or <code>StreamTimeout</code>.</td></tr>
-            <tr><td><code>kafka_recv_avro(brokers, topic, group, schema, registry_url[, options])</code></td><td>Poll one Schema-Registry-framed Avro Kafka message, decode it with an explicit schema plus registry URL, and return a one-row DataFrame or <code>StreamTimeout</code>.</td></tr>
-            <tr><td><code>kafka_send(df, brokers, topic[, options])</code></td><td>Serialize each DataFrame row to one JSON Kafka message and return sent-row count.</td></tr>
-            <tr><td><code>udp_recv(port, schema[, options])</code></td><td>Read JSON datagrams into a DataFrame batch, decoded with an explicit schema.</td></tr>
-            <tr><td><code>udp_send(df, host, port)</code></td><td>Send a DataFrame batch via UDP and return sent-row count.</td></tr>
-            <tr><td><code>ws_listen(port)</code></td><td>Start a WebSocket listener.</td></tr>
-            <tr><td><code>ws_recv(port, schema[, options])</code></td><td>Receive JSON WebSocket messages as one-row DataFrames, decoded with an explicit schema.</td></tr>
-            <tr><td><code>ws_connect(url, schema[, options])</code></td><td>Connect to an external WebSocket feed (<code>ws://…</code>) and receive JSON messages as one-row DataFrames.</td></tr>
-            <tr><td><code>ws_send(df, port)</code></td><td>Broadcast a DataFrame batch to connected WebSocket clients.</td></tr>
+            <tr><td><code>parquet::read(path)</code></td><td>Load Apache Parquet from disk, <code>https://</code>, or <code>s3://</code> into a DataFrame.</td></tr>
+            <tr><td><code>parquet::write(df, path)</code></td><td>Write a DataFrame to Parquet and return row count.</td></tr>
+            <tr><td><code>kafka::recv(brokers, topic, group, schema[, options])</code></td><td>Poll one JSON Kafka message, decode it with an explicit schema, and return a one-row DataFrame or <code>StreamTimeout</code>.</td></tr>
+            <tr><td><code>kafka::recv_avro(brokers, topic, group, schema, registry_url[, options])</code></td><td>Poll one Schema-Registry-framed Avro Kafka message, decode it with an explicit schema plus registry URL, and return a one-row DataFrame or <code>StreamTimeout</code>.</td></tr>
+            <tr><td><code>kafka::send(df, brokers, topic[, options])</code></td><td>Serialize each DataFrame row to one JSON Kafka message and return sent-row count.</td></tr>
+            <tr><td><code>udp::recv(port, schema[, options])</code></td><td>Read JSON datagrams into a DataFrame batch, decoded with an explicit schema.</td></tr>
+            <tr><td><code>udp::send(df, host, port)</code></td><td>Send a DataFrame batch via UDP and return sent-row count.</td></tr>
+            <tr><td><code>ws::listen(port)</code></td><td>Start a WebSocket listener.</td></tr>
+            <tr><td><code>ws::recv(port, schema[, options])</code></td><td>Receive JSON WebSocket messages as one-row DataFrames, decoded with an explicit schema.</td></tr>
+            <tr><td><code>ws::connect(url, schema[, options])</code></td><td>Connect to an external WebSocket feed (<code>ws://…</code>) and receive JSON messages as one-row DataFrames.</td></tr>
+            <tr><td><code>ws::send(df, port)</code></td><td>Broadcast a DataFrame batch to connected WebSocket clients.</td></tr>
           </tbody>
         </table>
       </article>
@@ -389,8 +389,8 @@
         <p>Import <code>"args"</code> for declarative command-line parsing and <code>"fs"</code> for deterministic directory enumeration.</p>
         <table class="repl-table">
           <tbody>
-            <tr><td><code>parse_args(spec[, argv])</code></td><td>Return one row per parsed option, flag, or positional argument with fixed columns <code>kind</code>, <code>name</code>, <code>index</code>, and <code>value</code>. Values are strings and optional missing arguments produce no row.</td></tr>
-            <tr><td><code>list_files(dir[, pattern[, recursive]])</code></td><td>Return directory entries ordered by path, with path, name, stem, extension, size, and directory status.</td></tr>
+            <tr><td><code>args::parse(spec[, argv])</code></td><td>Return one row per parsed option, flag, or positional argument with fixed columns <code>kind</code>, <code>name</code>, <code>index</code>, and <code>value</code>. Values are strings and optional missing arguments produce no row.</td></tr>
+            <tr><td><code>fs::list(dir[, pattern[, recursive]])</code></td><td>Return directory entries ordered by path, with path, name, stem, extension, size, and directory status.</td></tr>
           </tbody>
         </table>
       </article>

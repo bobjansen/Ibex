@@ -86,7 +86,7 @@
       <article class="card">
         <h3>Filesystem plugin</h3>
         <p>
-          <code>list_files</code> returns directory entries in path order. Its
+          <code>fs::list</code> returns directory entries in path order. Its
           fixed schema includes path, name, stem, extension, size, and directory
           status, making it a natural input to row-wise <code>map</code> jobs.
         </p>
@@ -94,7 +94,7 @@
       <article class="card">
         <h3>Arguments plugin</h3>
         <p>
-          <code>parse_args</code> validates a declarative option specification
+          <code>args::parse</code> validates a declarative option specification
           and returns one row per option, flag, or positional. Optional missing
           values pair with nullable scalar extraction instead of sentinel strings.
         </p>
@@ -117,19 +117,19 @@
 <span class="kw">import</span> <span class="str">"adbc"</span>;
 <span class="kw">import</span> <span class="str">"kafka"</span>;
 
-<span class="kw">let</span> trades = <span class="fn-name">read_csv</span>(<span class="str">"data/trades.csv"</span>);
-<span class="kw">let</span> prices = <span class="fn-name">read_parquet</span>(<span class="str">"data/prices.parquet"</span>);
-<span class="kw">let</span> public_prices = <span class="fn-name">read_parquet</span>(<span class="str">"https://data.example.com/prices.parquet"</span>);
-<span class="kw">let</span> cloud_prices = <span class="fn-name">read_parquet</span>(<span class="str">"s3://market-data/prices.parquet?region=us-east-1"</span>);
-<span class="kw">let</span> db_prices = <span class="fn-name">adbc_read</span>(<span class="str">"/path/to/libadbc_driver_sqlite.so"</span>,
+<span class="kw">let</span> trades = <span class="fn-name">csv::read</span>(<span class="str">"data/trades.csv"</span>);
+<span class="kw">let</span> prices = <span class="fn-name">parquet::read</span>(<span class="str">"data/prices.parquet"</span>);
+<span class="kw">let</span> public_prices = <span class="fn-name">parquet::read</span>(<span class="str">"https://data.example.com/prices.parquet"</span>);
+<span class="kw">let</span> cloud_prices = <span class="fn-name">parquet::read</span>(<span class="str">"s3://market-data/prices.parquet?region=us-east-1"</span>);
+<span class="kw">let</span> db_prices = <span class="fn-name">adbc::read</span>(<span class="str">"/path/to/libadbc_driver_sqlite.so"</span>,
                                <span class="str">"data/prices.sqlite"</span>,
                                <span class="str">"select * from prices"</span>);
-<span class="kw">let</span> tick = <span class="fn-name">kafka_recv</span>(<span class="str">"localhost:19092"</span>, <span class="str">"ticks"</span>,
+<span class="kw">let</span> tick = <span class="fn-name">kafka::recv</span>(<span class="str">"localhost:19092"</span>, <span class="str">"ticks"</span>,
                           <span class="str">"ibex-demo"</span>,
                           <span class="str">"ts:timestamp,symbol:str,price:f64,size:i64"</span>);</code></pre>
         <p style="margin-top:0.75rem;">
           For Schema Registry-backed Avro, use
-          <code>kafka_recv_avro(..., schema, registry_url[, options])</code>.
+          <code>kafka::recv_avro(..., schema, registry_url[, options])</code>.
         </p>
     </article>
   </section>
@@ -149,10 +149,10 @@
 <span class="kw">import</span> <span class="str">"fs"</span>;
 <span class="kw">import</span> <span class="str">"parquet"</span>;
 
-<span class="fn-name">list_files</span>(<span class="str">"incoming"</span>, <span class="str">"*.csv"</span>)[<span class="kw">map</span> {
+<span class="fn-name">fs::list</span>(<span class="str">"incoming"</span>, <span class="str">"*.csv"</span>)[<span class="kw">map</span> {
     source = path,
-    rows = <span class="fn-name">write_parquet</span>(
-        <span class="fn-name">read_csv</span>(path),
+    rows = <span class="fn-name">parquet::write</span>(
+        <span class="fn-name">csv::read</span>(path),
         <span class="str">`archive/${stem}.parquet`</span>
     )
 }];</code></pre>
@@ -160,7 +160,7 @@
       <article class="card">
         <h3>Parse script arguments</h3>
         <p>
-          <code>parse_args</code> always returns
+          <code>args::parse</code> always returns
           <code>kind, name, index, value</code>; <code>value</code> is a string.
           A missing optional argument emits no row, so the one-argument
           <code>scalar</code> form yields null and <code>coalesce</code> can apply
@@ -168,7 +168,7 @@
         </p>
 <pre><code><span class="kw">import</span> <span class="str">"args"</span>;
 
-<span class="kw">let</span> args = <span class="fn-name">parse_args</span>(<span class="str">"
+<span class="kw">let</span> args = <span class="fn-name">args::parse</span>(<span class="str">"
     limit (n) : int?
     input     : positional+
 "</span>);
@@ -193,7 +193,7 @@
         </p>
 <pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
 
-<span class="kw">let</span> trades = <span class="fn-name">read_csv</span>(<span class="str">"data/trades.csv"</span>);</code></pre>
+<span class="kw">let</span> trades = <span class="fn-name">csv::read</span>(<span class="str">"data/trades.csv"</span>);</code></pre>
       </article>
       <article class="card">
         <h3>Null tokens</h3>
@@ -203,7 +203,7 @@
         </p>
 <pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
 
-<span class="kw">let</span> train = <span class="fn-name">read_csv</span>(<span class="str">"train.csv"</span>, <span class="str">"&lt;empty&gt;,NA"</span>);</code></pre>
+<span class="kw">let</span> train = <span class="fn-name">csv::read</span>(<span class="str">"train.csv"</span>, <span class="str">"&lt;empty&gt;,NA"</span>);</code></pre>
       </article>
     </div>
 
@@ -216,7 +216,7 @@
         </p>
 <pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
 
-<span class="kw">let</span> raw = <span class="fn-name">read_csv</span>(<span class="str">"quotes.txt"</span>, <span class="str">""</span>, <span class="str">";"</span>);</code></pre>
+<span class="kw">let</span> raw = <span class="fn-name">csv::read</span>(<span class="str">"quotes.txt"</span>, <span class="str">""</span>, <span class="str">";"</span>);</code></pre>
       </article>
       <article class="card">
         <h3>Headerless files</h3>
@@ -227,7 +227,7 @@
         </p>
 <pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
 
-<span class="kw">let</span> raw = <span class="fn-name">read_csv</span>(<span class="str">"measurements.txt"</span>, <span class="str">""</span>, <span class="str">";"</span>, <span class="kw">false</span>)
+<span class="kw">let</span> raw = <span class="fn-name">csv::read</span>(<span class="str">"measurements.txt"</span>, <span class="str">""</span>, <span class="str">";"</span>, <span class="kw">false</span>)
     [<span class="kw">select</span> { station = col1, temp = col2 }];</code></pre>
       </article>
     </div>
@@ -241,15 +241,15 @@
 <pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
 
 <span class="cm">// positional schema</span>
-<span class="kw">let</span> fast = <span class="fn-name">read_csv</span>(<span class="str">"measurements.txt"</span>, <span class="str">""</span>, <span class="str">";"</span>, <span class="kw">false</span>, <span class="str">"cat,f64"</span>);
+<span class="kw">let</span> fast = <span class="fn-name">csv::read</span>(<span class="str">"measurements.txt"</span>, <span class="str">""</span>, <span class="str">";"</span>, <span class="kw">false</span>, <span class="str">"cat,f64"</span>);
 
 <span class="cm">// named schema</span>
-<span class="kw">let</span> typed = <span class="fn-name">read_csv</span>(<span class="str">"trades.csv"</span>, <span class="str">""</span>, <span class="str">","</span>, <span class="kw">true</span>,
+<span class="kw">let</span> typed = <span class="fn-name">csv::read</span>(<span class="str">"trades.csv"</span>, <span class="str">""</span>, <span class="str">","</span>, <span class="kw">true</span>,
                           <span class="str">"symbol:cat,price:f64,size:i64"</span>);
 
 <span class="cm">// exact decimals: parsed straight to Decimal(12, 2), never through a double;</span>
 <span class="cm">// extra fractional digits round half away from zero, too many digits is an error</span>
-<span class="kw">let</span> ledger = <span class="fn-name">read_csv</span>(<span class="str">"ledger.csv"</span>, <span class="str">""</span>, <span class="str">","</span>, <span class="kw">true</span>,
+<span class="kw">let</span> ledger = <span class="fn-name">csv::read</span>(<span class="str">"ledger.csv"</span>, <span class="str">""</span>, <span class="str">","</span>, <span class="kw">true</span>,
                            <span class="str">"account:str,amount:decimal(12,2)"</span>);</code></pre>
     </article>
   </section>
@@ -297,10 +297,10 @@ python3 demo/kafka/ohlc_ws_client.py</code></pre>
 <pre><code><span class="kw">import</span> <span class="str">"kafka"</span>;
 <span class="kw">import</span> <span class="str">"websocket"</span>;
 
-<span class="fn-name">ws_listen</span>(<span class="num">8765</span>);
+<span class="fn-name">ws::listen</span>(<span class="num">8765</span>);
 
 <span class="kw">let</span> summary = Stream {
-    source = <span class="fn-name">kafka_recv</span>(
+    source = <span class="fn-name">kafka::recv</span>(
         brokers = <span class="str">"localhost:19092"</span>,
         topic = <span class="str">"ticks"</span>,
         group = <span class="str">"ibex-demo-summary"</span>,
@@ -312,7 +312,7 @@ python3 demo/kafka/ohlc_ws_client.py</code></pre>
         last_px = <span class="fn-name">last</span>(price),
         total_size = <span class="fn-name">sum</span>(size)
     }],
-    sink = <span class="fn-name">ws_send</span>(<span class="num">8765</span>)
+    sink = <span class="fn-name">ws::send</span>(<span class="num">8765</span>)
 };</code></pre>
         <p>
           The OHLC job in <code>demo/kafka/kafka_ohlc.ibex</code> uses the same
@@ -352,10 +352,10 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
 <pre><code><span class="kw">import</span> <span class="str">"kafka"</span>;
 <span class="kw">import</span> <span class="str">"websocket"</span>;
 
-<span class="fn-name">ws_listen</span>(<span class="num">8775</span>);
+<span class="fn-name">ws::listen</span>(<span class="num">8775</span>);
 
 <span class="kw">let</span> summary = Stream {
-    source = <span class="fn-name">kafka_recv_avro</span>(
+    source = <span class="fn-name">kafka::recv_avro</span>(
         brokers = <span class="str">"localhost:19092"</span>,
         topic = <span class="str">"ticks_avro"</span>,
         group = <span class="str">"ibex-demo-summary-avro"</span>,
@@ -368,7 +368,7 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
         last_px = <span class="fn-name">last</span>(price),
         total_size = <span class="fn-name">sum</span>(size)
     }],
-    sink = <span class="fn-name">ws_send</span>(<span class="num">8775</span>)
+    sink = <span class="fn-name">ws::send</span>(<span class="num">8775</span>)
 };</code></pre>
         <p>
           The matching OHLC job in <code>demo/kafka/kafka_ohlc_avro.ibex</code>
@@ -384,7 +384,7 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
           <li>For live dashboards, prefer <code>consumer.auto.offset.reset=latest</code> so the stream starts at current traffic instead of replaying old messages.</li>
           <li><code>poll_timeout_ms</code> is only the wait between polls. It is not a lifetime timeout for the stream.</li>
           <li>For per-message live streams, <code>str</code> is a better demo key type than <code>cat</code>; it avoids per-message categorical dictionary churn.</li>
-          <li><code>kafka_recv_avro(...)</code> requires a Schema Registry base URL and currently supports flat records only.</li>
+          <li><code>kafka::recv_avro(...)</code> requires a Schema Registry base URL and currently supports flat records only.</li>
           <li>The Avro v1 path does not support schema references or null-valued unions yet.</li>
         </ul>
       </article>
@@ -396,7 +396,7 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
     <h2>Write CSV back out</h2>
     <article class="card">
       <p>
-        <code>write_csv</code> writes a header row plus all data rows and
+        <code>csv::write</code> writes a header row plus all data rows and
         returns the number of data rows written. Nulls become empty fields and
         strings are quoted according to RFC 4180.
       </p>
@@ -408,7 +408,7 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
     <span class="kw">order</span> symbol
 ];
 
-<span class="kw">let</span> n = <span class="fn-name">write_csv</span>(summary, <span class="str">"out/summary.csv"</span>);</code></pre>
+<span class="kw">let</span> n = <span class="fn-name">csv::write</span>(summary, <span class="str">"out/summary.csv"</span>);</code></pre>
     </article>
   </section>
 
@@ -433,15 +433,15 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
         </p>
 <pre><code><span class="kw">import</span> <span class="str">"parquet"</span>;
 
-<span class="kw">let</span> prices = <span class="fn-name">read_parquet</span>(<span class="str">"data/prices.parquet"</span>);
+<span class="kw">let</span> prices = <span class="fn-name">parquet::read</span>(<span class="str">"data/prices.parquet"</span>);
 <span class="kw">let</span> liquid = prices[<span class="kw">filter</span> size &gt; 1000, <span class="kw">select</span> { ts, symbol, price }];
-<span class="kw">let</span> public_prices = <span class="fn-name">read_parquet</span>(<span class="str">"https://data.example.com/prices.parquet"</span>);
-<span class="kw">let</span> cloud = <span class="fn-name">read_parquet</span>(<span class="str">"s3://market-data/prices.parquet?region=us-east-1"</span>);</code></pre>
+<span class="kw">let</span> public_prices = <span class="fn-name">parquet::read</span>(<span class="str">"https://data.example.com/prices.parquet"</span>);
+<span class="kw">let</span> cloud = <span class="fn-name">parquet::read</span>(<span class="str">"s3://market-data/prices.parquet?region=us-east-1"</span>);</code></pre>
       </article>
       <article class="card" style="margin-top:1rem;">
         <h3>Write Parquet</h3>
         <p>
-          <code>write_parquet</code> returns the number of rows written. String
+          <code>parquet::write</code> returns the number of rows written. String
           and categorical columns are stored as UTF-8. Dates and timestamps are
           preserved as typed Parquet columns, and <code>Decimal(p,&nbsp;s)</code>
           columns are written as Parquet <code>DECIMAL</code> with their precision
@@ -451,7 +451,7 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
         </p>
 <pre><code><span class="kw">import</span> <span class="str">"parquet"</span>;
 
-<span class="kw">let</span> n = <span class="fn-name">write_parquet</span>(prices, <span class="str">"out/prices.parquet"</span>);</code></pre>
+<span class="kw">let</span> n = <span class="fn-name">parquet::write</span>(prices, <span class="str">"out/prices.parquet"</span>);</code></pre>
       </article>
     </div>
   </section>
@@ -463,7 +463,7 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
       <article class="card">
         <h3>Minimal SQLite query</h3>
         <p>
-          <code>adbc_read</code> takes a driver, a database URI or path, and a
+          <code>adbc::read</code> takes a driver, a database URI or path, and a
           SQL query. The driver is a name such as <code>"sqlite"</code>,
           resolved through an ADBC driver manifest, or a path to the driver
           library. <code>scripts/install_adbc_driver.sh sqlite</code> installs
@@ -493,7 +493,7 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
         </p>
 <pre><code><span class="kw">import</span> <span class="str">"adbc"</span>;
 
-<span class="kw">let</span> trades = <span class="fn-name">adbc_read</span>(
+<span class="kw">let</span> trades = <span class="fn-name">adbc::read</span>(
     <span class="str">"sqlite"</span>,
     <span class="str">"/tmp/trades.sqlite"</span>,
     <span class="str">"select symbol, qty, px from trades order by qty desc"</span>
@@ -502,11 +502,11 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
       <article class="card" style="margin-top:1rem;">
         <h3>Reuse one connection</h3>
         <p>
-          <code>adbc_read</code> opens and closes a connection on every call.
-          <code>adbc_connect</code> opens one that later statements share: one
+          <code>adbc::read</code> opens and closes a connection on every call.
+          <code>adbc::connect</code> opens one that later statements share: one
           login, and session state such as temporary tables.
-          <code>adbc_query</code> runs a query on it and returns a table, which
-          can be used as any other table. <code>adbc_close</code> closes the
+          <code>adbc::query</code> runs a query on it and returns a table, which
+          can be used as any other table. <code>adbc::close</code> closes the
           connection for every binding of it, returning <code>1</code> the
           first time and <code>0</code> after; a query on a closed connection
           is an error. A connection also closes when its last binding goes
@@ -521,18 +521,18 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
         </p>
 <pre><code><span class="kw">import</span> <span class="str">"adbc"</span>;
 
-<span class="kw">let</span> db = <span class="fn-name">adbc_connect</span>(<span class="str">"sqlite"</span>, <span class="str">":memory:"</span>);
-<span class="fn-name">adbc_execute</span>(db, <span class="str">"create table trades (symbol text, qty integer)"</span>);
-<span class="fn-name">adbc_execute</span>(db, <span class="str">"insert into trades values ('AAPL', 10), ('MSFT', 5)"</span>);   <span class="cm">// 2</span>
+<span class="kw">let</span> db = <span class="fn-name">adbc::connect</span>(<span class="str">"sqlite"</span>, <span class="str">":memory:"</span>);
+<span class="fn-name">adbc::execute</span>(db, <span class="str">"create table trades (symbol text, qty integer)"</span>);
+<span class="fn-name">adbc::execute</span>(db, <span class="str">"insert into trades values ('AAPL', 10), ('MSFT', 5)"</span>);   <span class="cm">// 2</span>
 
-<span class="fn-name">adbc_query</span>(db, <span class="str">"select symbol, qty from trades"</span>)[
+<span class="fn-name">adbc::query</span>(db, <span class="str">"select symbol, qty from trades"</span>)[
     <span class="kw">select</span> { total = <span class="fn-name">sum</span>(qty) }, <span class="kw">by</span> symbol
 ];
 
-<span class="fn-name">adbc_close</span>(db);</code></pre>
+<span class="fn-name">adbc::close</span>(db);</code></pre>
         <p>
-          <code>adbc_connect(driver, uri, options = "")</code> takes the same
-          options string as <code>adbc_read</code>; <code>stmt.</code> options
+          <code>adbc::connect(driver, uri, options = "")</code> takes the same
+          options string as <code>adbc::read</code>; <code>stmt.</code> options
           apply to every query on the connection.
           <code>examples/adbc_connection.ibex</code> is a runnable version.
         </p>
@@ -540,7 +540,7 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
       <article class="card" style="margin-top:1rem;">
         <h3>Write tables and run statements</h3>
         <p>
-          <code>adbc_execute(db, sql)</code> runs a statement that returns no
+          <code>adbc::execute(db, sql)</code> runs a statement that returns no
           rows (DDL, <code>insert</code>, <code>update</code>,
           <code>delete</code>) and returns the affected-row count, or
           <code>-1</code> when the driver reports none. For DDL the count is
@@ -548,7 +548,7 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
           previous statement's count.
         </p>
         <p>
-          <code>adbc_write(db, df, table, mode = "create")</code> bulk-inserts
+          <code>adbc::write(db, df, table, mode = "create")</code> bulk-inserts
           a DataFrame through the driver's ingestion path (PostgreSQL uses
           <code>COPY</code>) and returns the rows written. <code>mode</code> is
           <code>create</code> (the table must not exist), <code>append</code>
@@ -559,42 +559,42 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
           batches of 1000, so there Ibex runs the rows in a transaction of
           their own; as MySQL commits whenever it creates or drops a table, a
           failed <code>create</code> or <code>replace</code> leaves the new
-          table, empty. For the same reason, inside <code>adbc_begin</code>
+          table, empty. For the same reason, inside <code>adbc::begin</code>
           MySQL takes <code>append</code> only. DuckDB and MySQL append whole
           rows only: <code>df</code> needs every column of an existing table.
         </p>
 <pre><code><span class="kw">import</span> <span class="str">"adbc"</span>;
 <span class="kw">import</span> <span class="str">"csv"</span>;
 
-<span class="kw">let</span> db = <span class="fn-name">adbc_connect</span>(<span class="str">"postgresql"</span>, <span class="str">"postgresql://localhost/markets"</span>);
-<span class="kw">let</span> trades = <span class="fn-name">read_csv</span>(<span class="str">"data/trades.csv"</span>);
-<span class="fn-name">adbc_write</span>(db, trades, <span class="str">"trades"</span>, <span class="str">"replace"</span>);
-<span class="fn-name">adbc_execute</span>(db, <span class="str">"create index on trades (symbol)"</span>);
+<span class="kw">let</span> db = <span class="fn-name">adbc::connect</span>(<span class="str">"postgresql"</span>, <span class="str">"postgresql://localhost/markets"</span>);
+<span class="kw">let</span> trades = <span class="fn-name">csv::read</span>(<span class="str">"data/trades.csv"</span>);
+<span class="fn-name">adbc::write</span>(db, trades, <span class="str">"trades"</span>, <span class="str">"replace"</span>);
+<span class="fn-name">adbc::execute</span>(db, <span class="str">"create index on trades (symbol)"</span>);
 
 <span class="cm">// Values bind to placeholders ($1 for PostgreSQL, ? for SQLite, MySQL): one</span>
 <span class="cm">// prepared statement, one run per row, no quoting in the SQL text.</span>
-<span class="fn-name">adbc_execute</span>(db, <span class="str">"delete from trades where symbol = $1"</span>,
+<span class="fn-name">adbc::execute</span>(db, <span class="str">"delete from trades where symbol = $1"</span>,
              Table { symbol = [<span class="str">"TSLA"</span>, <span class="str">"GME"</span>] });
-<span class="fn-name">adbc_query</span>(db, <span class="str">"select * from trades where qty &gt; $1"</span>, Table { min_qty = [<span class="num">100</span>] });
-<span class="fn-name">adbc_close</span>(db);</code></pre>
+<span class="fn-name">adbc::query</span>(db, <span class="str">"select * from trades where qty &gt; $1"</span>, Table { min_qty = [<span class="num">100</span>] });
+<span class="fn-name">adbc::close</span>(db);</code></pre>
         <p>
-          <code>adbc_query</code> and <code>adbc_execute</code> take an
+          <code>adbc::query</code> and <code>adbc::execute</code> take an
           optional parameter table. Its columns bind by position; each row
           runs the prepared statement once, a query's results following one
-          another and <code>adbc_execute</code>'s counts adding up. A table
+          another and <code>adbc::execute</code>'s counts adding up. A table
           with no rows runs nothing.
         </p>
         <p>
-          <code>adbc_tables(db)</code> lists the tables and views a connection
-          sees, and <code>adbc_table_schema(db, table)</code> gives each column's
+          <code>adbc::tables(db)</code> lists the tables and views a connection
+          sees, and <code>adbc::table_schema(db, table)</code> gives each column's
           Arrow type and the Ibex type a query would give it, or why it has
           none, before you run a query; see
           <a href="./connections.html#discovery">Discovery</a>.
         </p>
         <p>
-          <code>adbc_begin(db)</code>, <code>adbc_commit(db)</code> and
-          <code>adbc_rollback(db)</code> make the calls between them one
-          transaction. If any of them fails, <code>adbc_commit</code> rolls
+          <code>adbc::begin(db)</code>, <code>adbc::commit(db)</code> and
+          <code>adbc::rollback(db)</code> make the calls between them one
+          transaction. If any of them fails, <code>adbc::commit</code> rolls
           back instead, on every driver, and closing a connection never
           commits; see <a href="./connections.html#transactions">Transactions</a>.
         </p>
@@ -641,7 +641,7 @@ LD_LIBRARY_PATH=~/envs/ibex/lib:$LD_LIBRARY_PATH \
 <span class="cm"># ibex</span>
 <span class="kw">import</span> <span class="str">"adbc"</span>;
 
-<span class="kw">let</span> measurements = <span class="fn-name">adbc_read</span>(
+<span class="kw">let</span> measurements = <span class="fn-name">adbc::read</span>(
     <span class="str">"/path/to/libadbc_driver_sqlite.so"</span>,
     <span class="str">"/tmp/measurements_1m.sqlite"</span>,
     <span class="str">"select station, temp from measurements"</span>
@@ -674,7 +674,7 @@ measurements[<span class="kw">select</span> {
         values. Option names beyond the standard <code>adbc.*</code> keys are
         driver-specific; check the driver's documentation.
       </p>
-<pre><code><span class="kw">let</span> trades = <span class="fn-name">adbc_read</span>(
+<pre><code><span class="kw">let</span> trades = <span class="fn-name">adbc::read</span>(
     <span class="str">"sqlite"</span>,
     <span class="str">"/tmp/trades.sqlite"</span>,
     <span class="str">"select symbol, qty, px from trades"</span>,
@@ -690,7 +690,7 @@ measurements[<span class="kw">select</span> {
 <pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
 <span class="kw">import</span> <span class="str">"parquet"</span>;
 
-<span class="kw">let</span> raw = <span class="fn-name">read_csv</span>(<span class="str">"measurements.txt"</span>, <span class="str">""</span>, <span class="str">";"</span>, <span class="kw">false</span>, <span class="str">"cat,f64"</span>)
+<span class="kw">let</span> raw = <span class="fn-name">csv::read</span>(<span class="str">"measurements.txt"</span>, <span class="str">""</span>, <span class="str">";"</span>, <span class="kw">false</span>, <span class="str">"cat,f64"</span>)
     [<span class="kw">select</span> { station = col1, temp = col2 }];
 
 <span class="kw">let</span> summary = raw[<span class="kw">select</span> {
@@ -699,7 +699,7 @@ measurements[<span class="kw">select</span> {
     max_temp = <span class="fn-name">max</span>(temp)
 }, <span class="kw">by</span> station, <span class="kw">order</span> station];
 
-<span class="fn-name">write_parquet</span>(summary, <span class="str">"out/summary.parquet"</span>);</code></pre>
+<span class="fn-name">parquet::write</span>(summary, <span class="str">"out/summary.parquet"</span>);</code></pre>
     </article>
   </section>
 

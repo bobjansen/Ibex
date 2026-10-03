@@ -109,7 +109,7 @@ using ColumnRegistry = robin_hood::unordered_map<std::string, runtime::ColumnVal
 /// A binding lives in exactly one of the two registries.
 using LazyTableRegistry = robin_hood::unordered_map<std::string, runtime::LazyTablePtr>;
 using ModelRegistry = robin_hood::unordered_map<std::string, runtime::ModelResult>;
-/// Resource bindings (`let db = adbc_connect(...)`). Only statement-level code
+/// Resource bindings (`let db = adbc::connect(...)`). Only statement-level code
 /// in `execute_statements` sees this registry, never the expression
 /// evaluators, which is what keeps resources out of query expressions and
 /// function bodies. A binding lives in exactly one registry.
@@ -3973,7 +3973,7 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         }
     }
 
-    // Every inline source in this expression — `read_parquet(p)` wherever it
+    // Every inline source in this expression — `parquet::read(p)` wherever it
     // appears, not merely as the outermost base — is bound to a temp lazy binding
     // and replaced by that name, so it reaches `interpret` as an ordinary Scan and
     // picks up the same projection pushdown a `let`-bound source gets.
@@ -3981,7 +3981,7 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     // Walking the whole tree is the point. A query written as one expression puts
     // its sources inside join operands:
     //
-    //     (read_parquet(a)[select …] join read_parquet(b)[select …] on k)[filter …]
+    //     (parquet::read(a)[select …] join parquet::read(b)[select …] on k)[filter …]
     //
     // Rewriting only the outermost base would leave those two reads eager, and the
     // single-expression form — the one the optimizer can actually see through —
@@ -4330,7 +4330,7 @@ auto find_library_source(const std::string& name, const std::vector<std::string>
 }
 
 /// Bind `expr` lazily if it is a bare call to an extern table source that can
-/// decode its columns selectively (`read_parquet`). Reads the source's schema
+/// decode its columns selectively (`parquet::read`). Reads the source's schema
 /// and nothing else; the columns are decoded later, per query, by whatever
 /// subset that query references.
 ///
@@ -4376,13 +4376,13 @@ auto try_bind_lazy_source(parser::Expr& expr, runtime::TableRegistry& tables,
     return fn->lazy_table_func(args);
 }
 
-/// Replace every inline lazy source in `expr` — `read_parquet(p)` in any table
+/// Replace every inline lazy source in `expr` — `parquet::read(p)` in any table
 /// position — with a temp lazy binding, so the whole expression lowers to Scans
 /// and projection pushdown reaches all of them.
 ///
 /// Recursion is over the positions where a *table* can appear: a block's base, a
 /// join's operands, a parenthesised group, an ascription, and a call's arguments
-/// (`write_csv(read_parquet(p)[…], out)`). A source nested in a join operand is
+/// (`csv::write(parquet::read(p)[…], out)`). A source nested in a join operand is
 /// the case that matters — see the caller.
 ///
 /// Returns an error message on failure; nullopt on success. Every replacement is

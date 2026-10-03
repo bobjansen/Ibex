@@ -1,4 +1,4 @@
-extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+extern fn csv::read(path: String) -> DataFrame from "csv.hpp";
 
 // A `scalar(...)` deferred `let` used as an extern-call argument (conformance
 // plan W2): the emitter resolves it from the scalar registry at run time via
@@ -6,4 +6,4 @@ extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
 let manifest = Table { path = ["data/iris.csv"] };
 let src = scalar(manifest[select { path }]);
 
-read_csv(src)[head 3];
+csv::read(src)[head 3];

@@ -1,7 +1,7 @@
 import "csv";
 
 let logs =
-    read_csv("examples/leetcode/data/logs.csv",
+    csv::read("examples/leetcode/data/logs.csv",
              schema = "id:int,num:str");
 
 let n = 1;

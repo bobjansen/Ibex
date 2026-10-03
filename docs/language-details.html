@@ -52,15 +52,15 @@
           </p>
           <p>
             <code>extern type</code> declares an opaque resource a plugin
-            provides, such as the <code>AdbcConnection</code> behind
-            <code>adbc_connect</code>. A resource is bound with
+            provides, such as the <code>adbc::Connection</code> behind
+            <code>adbc::connect</code>. A resource is bound with
             <code>let</code>, passed to and returned from functions, and
             cannot be inspected or stored in a column. See the
             <a href="./connections.html">connections guide</a>.
           </p>
           <p>
-            Output plugins mirror the input API: <code>write_csv</code>,
-            <code>write_json</code>, and <code>write_parquet</code> accept a
+            Output plugins mirror the input API: <code>csv::write</code>,
+            <code>json::write</code>, and <code>parquet::write</code> accept a
             DataFrame and a path and return the number of rows written.
           </p>
           <p>
@@ -72,19 +72,19 @@
           </p>
         </div>
         <div class="tour-code">
-<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_csv</span>(
+<pre><code><span class="kw">extern fn</span> <span class="fn-name">csv::read</span>(
     <span class="fn-name">path</span>: String,
     <span class="fn-name">nulls</span>: String = <span class="str">""</span>,
     <span class="fn-name">delimiter</span>: String = <span class="str">","</span>,
     <span class="fn-name">has_header</span>: Bool = <span class="kw">true</span>
 ) -&gt; DataFrame
     <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
-<span class="kw">extern fn</span> <span class="fn-name">read_json</span>(<span class="fn-name">path</span>: String) -&gt; DataFrame
+<span class="kw">extern fn</span> <span class="fn-name">json::read</span>(<span class="fn-name">path</span>: String) -&gt; DataFrame
     <span class="kw">from</span> <span class="str">"json.hpp"</span>;
 
-<span class="kw">let</span> prices = <span class="fn-name">read_csv</span>(<span class="str">"prices.csv"</span>);
-<span class="kw">let</span> headerless = <span class="fn-name">read_csv</span>(<span class="str">"ticks.csv"</span>, <span class="fn-name">has_header</span> = <span class="kw">false</span>);
-<span class="kw">let</span> config = <span class="fn-name">read_json</span>(<span class="str">"config.json"</span>);
+<span class="kw">let</span> prices = <span class="fn-name">csv::read</span>(<span class="str">"prices.csv"</span>);
+<span class="kw">let</span> headerless = <span class="fn-name">csv::read</span>(<span class="str">"ticks.csv"</span>, <span class="fn-name">has_header</span> = <span class="kw">false</span>);
+<span class="kw">let</span> config = <span class="fn-name">json::read</span>(<span class="str">"config.json"</span>);
 
 <span class="cm">// Keep rows where price exceeds 1.0</span>
 <span class="kw">let</span> active = prices[<span class="kw">filter</span> price &gt; <span class="num">1.0</span>];
@@ -100,17 +100,63 @@ prices[
 <span class="kw">import</span> <span class="str">"json"</span>;
 <span class="kw">import</span> <span class="str">"parquet"</span>;
 
-<span class="kw">let</span> n = <span class="fn-name">write_csv</span>(active, <span class="str">"out/active.csv"</span>);
-<span class="fn-name">write_json</span>(active, <span class="str">"out/active.json"</span>);
-<span class="fn-name">write_parquet</span>(active, <span class="str">"out/active.parquet"</span>);</code></pre>
+<span class="kw">let</span> n = <span class="fn-name">csv::write</span>(active, <span class="str">"out/active.csv"</span>);
+<span class="fn-name">json::write</span>(active, <span class="str">"out/active.json"</span>);
+<span class="fn-name">parquet::write</span>(active, <span class="str">"out/active.parquet"</span>);</code></pre>
           <p>
             The first-party Parquet backend also reads directly from public HTTPS
             URLs, presigned URLs, and S3-compatible object storage with the same
-            <code>read_parquet(path)</code> call:
-            <code>read_parquet("https://data.example.com/prices.parquet")</code>
+            <code>parquet::read(path)</code> call:
+            <code>parquet::read("https://data.example.com/prices.parquet")</code>
             or
-            <code>read_parquet("s3://market-data/prices.parquet?region=us-east-1")</code>.
+            <code>parquet::read("s3://market-data/prices.parquet?region=us-east-1")</code>.
           </p>
+        </div>
+      </div>
+
+      <!-- 1a. Namespaces -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Namespaces</span>
+          <h3>Library functions live in namespaces</h3>
+          <p>
+            Each bundled library declares its functions in a namespace:
+            <code>import "csv"</code> makes <code>csv::read</code> and
+            <code>csv::write</code> callable, and brings no bare name with it.
+            A qualified name is looked up only among declarations, so a column
+            or <code>let</code> named <code>csv</code> never shadows it, even
+            inside a query clause.
+          </p>
+          <p>
+            <code>using csv;</code> brings every name of a namespace into scope
+            from that statement on; <code>using csv::read;</code> brings one.
+            A name two <code>using</code>s disagree on is an error where it is
+            used, and the qualified form always works.
+          </p>
+          <p>
+            Scripts and libraries can declare their own:
+            <code>namespace stats { fn ... }</code>. Inside a namespace,
+            siblings are called without the prefix. Two files may add to the
+            same namespace; declaring the same name twice is an error.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
+<span class="kw">let</span> iris = <span class="fn-name">csv::read</span>(<span class="str">"data/iris.csv"</span>);
+
+<span class="kw">namespace</span> stats {
+    <span class="kw">fn</span> <span class="fn-name">wide</span>(df: DataFrame) -&gt; DataFrame {
+        df[<span class="kw">filter</span> `Sepal.Width` &gt; <span class="num">3.5</span>];
+    }
+    <span class="kw">fn</span> <span class="fn-name">wide_count</span>(df: DataFrame) -&gt; DataFrame {
+        <span class="fn-name">wide</span>(df)[<span class="kw">select</span> { n = <span class="fn-name">count</span>() }, <span class="kw">by</span> Species];
+    }
+}
+
+<span class="fn-name">stats::wide_count</span>(iris);
+
+<span class="kw">using</span> stats;
+<span class="fn-name">wide</span>(iris)[<span class="kw">select</span> { mean_petal = <span class="fn-name">mean</span>(`Petal.Length`) }];</code></pre>
         </div>
       </div>
 
@@ -204,11 +250,11 @@ prices[
 <span class="kw">import</span> <span class="str">"fs"</span>;
 <span class="kw">import</span> <span class="str">"parquet"</span>;
 
-<span class="fn-name">list_files</span>(<span class="str">"data/csv"</span>, <span class="str">"*.csv"</span>)[<span class="kw">map</span> {
+<span class="fn-name">fs::list</span>(<span class="str">"data/csv"</span>, <span class="str">"*.csv"</span>)[<span class="kw">map</span> {
     source = path,
     target = <span class="str">`data/parquet/${stem}.parquet`</span>,
-    rows   = <span class="fn-name">write_parquet</span>(
-        <span class="fn-name">read_csv</span>(path),
+    rows   = <span class="fn-name">parquet::write</span>(
+        <span class="fn-name">csv::read</span>(path),
         <span class="str">`data/parquet/${stem}.parquet`</span>
     )
 }];</code></pre>
@@ -918,7 +964,7 @@ prices[<span class="kw">update</span> { vol_int = <span class="fn-name">Int64</s
           </p>
         </div>
         <div class="tour-code">
-<pre><code><span class="kw">let</span> ledger = <span class="fn-name">read_csv</span>(<span class="str">"ledger.csv"</span>, <span class="str">""</span>, <span class="str">","</span>, true,
+<pre><code><span class="kw">let</span> ledger = <span class="fn-name">csv::read</span>(<span class="str">"ledger.csv"</span>, <span class="str">""</span>, <span class="str">","</span>, true,
                       <span class="str">"account:str,amount:decimal(12,2),tax_rate:decimal(5,4)"</span>);
 
 <span class="cm">// Exact totals: 0.10 + 0.20 + 0.30 is 0.60, not 0.6000000000000001</span>
@@ -1296,40 +1342,40 @@ scripts/ibex-run.sh examples/quant.ibex</code></pre>
           </p>
         </div>
         <div class="tour-code">
-<pre><code><span class="cm">// Load the UDP plugin (registers udp_recv / udp_send)</span>
+<pre><code><span class="cm">// Load the UDP plugin (registers udp::recv / udp::send)</span>
 <span class="kw">import</span> <span class="str">"udp"</span>;
 
 <span class="cm">// Receive ticks, resample to 1-minute OHLC bars, forward over UDP</span>
 <span class="kw">let</span> ohlc_stream = Stream {
-    source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>, <span class="str">"ts:ts,symbol:str,price:f64,volume:i64"</span>),
+    source    = <span class="fn-name">udp::recv</span>(<span class="num">9001</span>, <span class="str">"ts:ts,symbol:str,price:f64,volume:i64"</span>),
     transform = [<span class="kw">resample</span> <span class="num">1m</span>, <span class="kw">select</span> {
         open  = <span class="fn-name">first</span>(price),
         high  = <span class="fn-name">max</span>(price),
         low   = <span class="fn-name">min</span>(price),
         close = <span class="fn-name">last</span>(price)
     }],
-    sink = <span class="fn-name">udp_send</span>(<span class="str">"127.0.0.1"</span>, <span class="num">9002</span>)
+    sink = <span class="fn-name">udp::send</span>(<span class="str">"127.0.0.1"</span>, <span class="num">9002</span>)
 };
 
 <span class="cm">// PerRow stream: forward filtered rows with no buffering</span>
 <span class="kw">let</span> live_filter = Stream {
-    source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>, <span class="str">"ts:ts,symbol:str,price:f64,volume:i64"</span>),
+    source    = <span class="fn-name">udp::recv</span>(<span class="num">9001</span>, <span class="str">"ts:ts,symbol:str,price:f64,volume:i64"</span>),
     transform = [<span class="kw">filter</span> price &gt; <span class="num">100.0</span>, <span class="kw">rename</span> p = price],
-    sink      = <span class="fn-name">udp_send</span>(<span class="str">"127.0.0.1"</span>, <span class="num">9003</span>)
+    sink      = <span class="fn-name">udp::send</span>(<span class="str">"127.0.0.1"</span>, <span class="num">9003</span>)
 };</code></pre>
 <pre style="margin-top:0.6rem;"><code><span class="cm">// WebSocket sink: push OHLC bars to browser dashboards</span>
 <span class="kw">import</span> <span class="str">"websocket"</span>;
 
 <span class="kw">let</span> ws_stream = Stream {
-    source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>, <span class="str">"ts:ts,symbol:str,price:f64,volume:i64"</span>),
+    source    = <span class="fn-name">udp::recv</span>(<span class="num">9001</span>, <span class="str">"ts:ts,symbol:str,price:f64,volume:i64"</span>),
     transform = [<span class="kw">resample</span> <span class="num">1m</span>, <span class="kw">select</span> {
         open  = <span class="fn-name">first</span>(price),
         high  = <span class="fn-name">max</span>(price),
         low   = <span class="fn-name">min</span>(price),
         close = <span class="fn-name">last</span>(price)
     }],
-    <span class="cm">// ws_send starts a TCP listener; browsers connect with new WebSocket("ws://…")</span>
-    sink = <span class="fn-name">ws_send</span>(<span class="num">8080</span>)
+    <span class="cm">// ws::send starts a TCP listener; browsers connect with new WebSocket("ws://…")</span>
+    sink = <span class="fn-name">ws::send</span>(<span class="num">8080</span>)
 };</code></pre>
         </div>
       </div>

@@ -93,9 +93,9 @@ def main() -> int:
         "ibex",
         "--as pyarrow --out iris_count --quiet",
         f"""
-        extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+        extern fn csv::read(path: String) -> DataFrame from "csv.hpp";
 
-        read_csv("{iris_csv}")[select total = count()];
+        csv::read("{iris_csv}")[select total = count()];
         """,
     )
     assert isinstance(csv_result, pa.Table)

@@ -1,7 +1,7 @@
 import "csv";
 
 let employee =
-    read_csv("examples/leetcode/data/employee_second_highest.csv",
+    csv::read("examples/leetcode/data/employee_second_highest.csv",
              schema = "id:int,salary:int");
 
 // LeetCode 176: Second Highest Salary.

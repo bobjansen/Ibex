@@ -5,69 +5,69 @@
 // Run:                      ./build/tools/ibex --plugin-path build/tools examples/adbc_connection.ibex
 //
 // `import "adbc"` declares, among others:
-//   extern type AdbcConnection from "adbc.hpp";
-//   extern fn adbc_connect(driver: String, uri: String, options: String = "")
-//       -> AdbcConnection from "adbc.hpp";
-// A resource type such as AdbcConnection can be bound with `let`, passed to
+//   extern type adbc::Connection from "adbc.hpp";
+//   extern fn adbc::connect(driver: String, uri: String, options: String = "")
+//       -> adbc::Connection from "adbc.hpp";
+// A resource type such as adbc::Connection can be bound with `let`, passed to
 // and returned from functions, but not stored in a column or inspected.
 
 import "adbc";
 
-let db = adbc_connect("sqlite", ":memory:");
+let db = adbc::connect("sqlite", ":memory:");
 
 // Each call runs on the same connection, so the table made here is still
-// there for the queries below. adbc_read would open a fresh database each time.
-// adbc_execute runs statements that return no rows and returns the number of
+// there for the queries below. adbc::read would open a fresh database each time.
+// adbc::execute runs statements that return no rows and returns the number of
 // rows they changed.
-adbc_execute(db, "create table trades (symbol text, qty integer, px real)");
-adbc_execute(db, "insert into trades values ('AAPL', 10, 150.0), ('MSFT', 5, 300.0), ('AAPL', 20, 151.0)");
+adbc::execute(db, "create table trades (symbol text, qty integer, px real)");
+adbc::execute(db, "insert into trades values ('AAPL', 10, 150.0), ('MSFT', 5, 300.0), ('AAPL', 20, 151.0)");
 
 // Discovery: the tables and views the connection sees, and a table's columns
 // with the Ibex type a query would give each one (or why it has none). The
 // SQLite driver guesses column types from the first rows (an empty table reads
 // as all Int64), so describe a filled table.
-adbc_tables(db);
-adbc_table_schema(db, "trades");
+adbc::tables(db);
+adbc::table_schema(db, "trades");
 
 // A query result is an ordinary table operand.
-let totals = adbc_query(db, "select symbol, qty, px from trades")[
+let totals = adbc::query(db, "select symbol, qty, px from trades")[
     select { qty = sum(qty), notional = sum(qty * px) },
     by symbol,
     order symbol
 ];
 
-// adbc_write stores an Ibex table in the database (mode "create" by default;
+// adbc::write stores an Ibex table in the database (mode "create" by default;
 // also "append", "replace" and "create_append") and returns the rows written.
-adbc_write(db, totals, "totals");
-adbc_query(db, "select * from totals order by symbol");
+adbc::write(db, totals, "totals");
+adbc::query(db, "select * from totals order by symbol");
 
 // A function can take the connection. It shares the caller's connection, so
 // it sees the same table; `mutable` records that the query uses its state.
-fn positions(mutable conn: AdbcConnection) -> DataFrame {
-    adbc_query(conn, "select symbol, sum(qty) as qty from trades group by symbol order by symbol");
+fn positions(mutable conn: adbc::Connection) -> DataFrame {
+    adbc::query(conn, "select symbol, sum(qty) as qty from trades group by symbol order by symbol");
 }
 
 positions(db)[filter qty > 5];
 
 // A function can also open a connection of its own. It is closed when the
 // function returns, even if a query in it fails; return the connection
-// instead (`-> AdbcConnection`) to keep it open for the caller.
+// instead (`-> adbc::Connection`) to keep it open for the caller.
 fn table_count(uri: String) -> DataFrame {
-    let scratch = adbc_connect("sqlite", uri);
-    adbc_query(scratch, "select count(*) as n from sqlite_master where type = 'table'");
+    let scratch = adbc::connect("sqlite", uri);
+    adbc::query(scratch, "select count(*) as n from sqlite_master where type = 'table'");
 }
 
 table_count(":memory:");
 
-// A transaction groups statements: adbc_commit keeps all of them,
-// adbc_rollback none. If any statement in it fails, adbc_commit rolls back
+// A transaction groups statements: adbc::commit keeps all of them,
+// adbc::rollback none. If any statement in it fails, adbc::commit rolls back
 // and reports the failure. Closing never commits.
-adbc_begin(db);
-adbc_execute(db, "delete from trades where symbol = 'MSFT'");
-adbc_write(db, Table { symbol = ["NVDA"], qty = [3], px = [120.0] }, "trades", "append");
-adbc_rollback(db);
-adbc_query(db, "select symbol, count(*) as n from trades group by symbol order by symbol");
+adbc::begin(db);
+adbc::execute(db, "delete from trades where symbol = 'MSFT'");
+adbc::write(db, Table { symbol = ["NVDA"], qty = [3], px = [120.0] }, "trades", "append");
+adbc::rollback(db);
+adbc::query(db, "select symbol, count(*) as n from trades group by symbol order by symbol");
 
 // Closing is explicit and idempotent: 1 the first time, 0 after. A query on a
 // closed connection is an error.
-adbc_close(db);
+adbc::close(db);

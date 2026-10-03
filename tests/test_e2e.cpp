@@ -1764,7 +1764,7 @@ df[update = compute_extras()];
 // --- Proof: read symbols from a file, generate 250-day correlated returns ----
 //
 // Mirrors the real-world pattern:
-//   let data    = read_csv("symbols.csv");
+//   let data    = csv::read("symbols.csv");
 //   let symbols = scalar(data, "symbol");   // e.g. "AAPL,MSFT,GOOG"
 //   days[update = gen_correlated_returns(symbols)]
 //
@@ -1778,7 +1778,7 @@ df[update = compute_extras()];
 
 TEST_CASE("Proof: 250-day correlated returns via update = expr", "[e2e]") {
     // -- 1. "symbols.csv" content ---------------------------------------------
-    // In production: let data = read_csv("symbols.csv");
+    // In production: let data = csv::read("symbols.csv");
     //                let symbols = scalar(data, "symbol");
     // Here we put the scalar directly into the registry.
     runtime::ScalarRegistry scalars;

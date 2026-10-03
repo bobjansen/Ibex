@@ -22,7 +22,7 @@ Distinct groups:
   events:       100 000    (by user_id — high-cardinality group-by and the
                             large side of the inner-join benchmark)
 
-Categorical promotion is a RATIO, not a fixed count: read_csv promotes a
+Categorical promotion is a RATIO, not a fixed count: csv::read promotes a
 null-free string column when its distinct values are at most 10% of its rows
 (kMaxCategoricalRatio, libs/csv/csv.hpp). So user_id's storage depends on the
 scale being generated — at N = 1M its 100 000 distinct values are exactly at
@@ -106,7 +106,7 @@ def generate(out_dir: pathlib.Path, n: int = N, force: bool = False) -> None:
 
     # ── prices_ts.csv ────────────────────────────────────────────────────────
     # Timestamped prices for the time-windowed pipeline benchmark
-    # (log_return_momentum): symbol (str), ts (int64 ns), price (f64). read_csv
+    # (log_return_momentum): symbol (str), ts (int64 ns), price (f64). csv::read
     # loads ts as int64; as_timeframe promotes Int → Timestamp (ns). ts is a
     # globally monotonic sequence so as_timeframe hits its pre-sorted fast path,
     # and since symbols are random each symbol's rows stay time-ordered within

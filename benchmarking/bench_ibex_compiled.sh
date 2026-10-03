@@ -100,8 +100,8 @@ compile_query() {
     local bin_path="$TMP_DIR/$name"
 
     cat > "$ibex_path" <<EOF
-extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
-let ${table_name} = read_csv("${csv_file}");
+extern fn csv::read(path: String) -> DataFrame from "csv.hpp";
+let ${table_name} = csv::read("${csv_file}");
 ${query};
 EOF
 

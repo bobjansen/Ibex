@@ -142,7 +142,7 @@ def read_ibex_output(stem: str) -> list[dict[str, str]]:
 
 
 def values_match(expected: str, actual: str, tol: float) -> bool:
-    # Date columns: the official answer renders "YYYY-MM-DD"; write_csv emits
+    # Date columns: the official answer renders "YYYY-MM-DD"; csv::write emits
     # Ibex's internal Date representation (signed days since 1970-01-01).
     if DATE_RE.match(expected):
         expected_days = (datetime.date.fromisoformat(expected) - EPOCH).days

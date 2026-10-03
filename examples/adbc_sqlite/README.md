@@ -14,7 +14,7 @@ examples/adbc_sqlite/run.sh build
 ```
 
 `install_adbc_driver.sh` puts the driver in `~/.config/adbc/drivers` with a
-manifest, so `adbc_read("sqlite", ...)` finds it by name; it needs `curl`,
+manifest, so `adbc::read("sqlite", ...)` finds it by name; it needs `curl`,
 `unzip` and `sha256sum`, not Python or conda. A conda env with
 `libadbc-driver-sqlite` works too, as does
 `ADBC_DRIVER_SQLITE=/path/to/libadbc_driver_sqlite.so`. On Windows, install
@@ -32,7 +32,7 @@ the `adbc:sqlite_demo` ctest.
 | File | Role |
 | --- | --- |
 | `make_trades_db.py` | 11 trades, standard-library `sqlite3`; trade 4 has a NULL price, trade 7 a NULL quantity |
-| `trades.ibex` | The walkthrough; takes `--driver` (default `sqlite`), `--db`, `--out` via `parse_args` |
+| `trades.ibex` | The walkthrough; takes `--driver` (default `sqlite`), `--db`, `--out` via `args::parse` |
 | `expected_summary.csv` | The exported result `run.sh` checks against |
 
 1. **Batched read.** `stmt.adbc.sqlite.query.batch_rows=4` makes the driver
@@ -56,7 +56,7 @@ the `adbc:sqlite_demo` ctest.
    | MSFT | 3 | 80 | 32840 | 410.5 |
    | NVDA | 3 | 70 | 8430 | 120.4286 |
 
-4. **Export.** `write_csv(summary, out)`.
+4. **Export.** `csv::write(summary, out)`.
 5. **Empty result.** A query matching no rows keeps its columns and types, so
    downstream steps still type-check and return an empty table.
 
@@ -64,5 +64,5 @@ the `adbc:sqlite_demo` ctest.
 
 This is a functional demo, not a benchmark: Apache describes the SQLite
 driver as a reference implementation with little optimization work. Every
-`adbc_read` call opens its own connection; there are no reusable
+`adbc::read` call opens its own connection; there are no reusable
 connections, bound parameters, or writes back to the database yet.

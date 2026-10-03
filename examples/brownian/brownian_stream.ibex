@@ -22,12 +22,12 @@ import "websocket";
 
 // Bind the WebSocket port eagerly so monitor.py can connect before the first
 // bar is emitted.
-ws_listen(8765);
+ws::listen(8765);
 
 let bars = Stream {
     // Receive a batch of tick datagrams per call; blocks until data arrives.
     // The schema string maps JSON fields to typed columns.
-    source    = udp_recv(9001, "ts:ts,symbol:str,price:f64,volume:i64"),
+    source    = udp::recv(9001, "ts:ts,symbol:str,price:f64,volume:i64"),
 
     // Group ticks into 10-second buckets per symbol and compute OHLC.
     transform = [resample 10s, by symbol, select {
@@ -38,7 +38,7 @@ let bars = Stream {
     }],
 
     // Push each completed bar to all connected WebSocket clients.
-    sink = ws_send(8765)
+    sink = ws::send(8765)
 };
 
 bars;

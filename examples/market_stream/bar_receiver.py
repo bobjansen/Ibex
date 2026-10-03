@@ -5,7 +5,7 @@
 """
 bar_receiver.py — prints OHLC bars forwarded by the Ibex UDP stream demo.
 
-Listens on localhost:9002 for JSON bar datagrams produced by the udp_send plugin:
+Listens on localhost:9002 for JSON bar datagrams produced by the udp::send plugin:
 
     {"ts":<ns_since_epoch>,"open":<float>,"high":<float>,"low":<float>,"close":<float>}
 

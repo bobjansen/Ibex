@@ -16,7 +16,7 @@ in-memory tables).
 
 Two timing modes:
   default      -- each query is ONE `:run <file>` of the query file (minus its
-                  write_csv sink) in the warm REPL, so the batch planner
+                  csv::write sink) in the warm REPL, so the batch planner
                   (source hoisting, whole-plan pushdown, join rewrites) executes
                   it the way `ibex file.ibex` does. This is the default because
                   it is the path real scripts take: `execute_script` always
@@ -95,7 +95,7 @@ def extract_setup_and_body(qname: str) -> tuple[str, str, int]:
     """Split a query file into (declaration setup, repeatable body, body statement count).
 
     Setup = `extern fn` and `import` declarations (declared once, outside the timed
-    section). Body = everything else minus the trailing `write_csv(...)`
+    section). Body = everything else minus the trailing `csv::write(...)`
     and bare `result;` statements, which exist only for check_answers.py
     and would otherwise add CSV-write + result-print noise to the timing.
     """
@@ -107,7 +107,7 @@ def extract_setup_and_body(qname: str) -> tuple[str, str, int]:
     body_statements = [
         s for s in statements
         if not s.startswith("extern fn") and not s.startswith("import ")
-        and not s.startswith("write_csv(") and s != "result;"
+        and not s.startswith("csv::write(") and s != "result;"
     ]
 
     return "\n".join(setup), "\n".join(body_statements) + "\n", len(body_statements)
@@ -168,13 +168,13 @@ def run_query(qname: str, warmup: int, iters: int) -> tuple[list[float], tuple[s
 def run_query_whole_script(
     qname: str, warmup: int, iters: int, tmpdir: pathlib.Path
 ) -> tuple[list[float], tuple[str, str]]:
-    """Time the query as ONE :run of the whole file (minus its write_csv sink),
+    """Time the query as ONE :run of the whole file (minus its csv::write sink),
     so the REPL's batch planner sees the complete script: source hoisting,
     whole-plan projection/selection pushdown, and join rewrites all engage,
     exactly as they would for `ibex file.ibex`. One `time:` line per run.
     """
     text = (QUERIES_DIR / f"{qname}.ibex").read_text()
-    lines = [line for line in text.splitlines() if not line.strip().startswith("write_csv(")]
+    lines = [line for line in text.splitlines() if not line.strip().startswith("csv::write(")]
     script_path = tmpdir / f"{qname}_whole.ibex"
     script_path.write_text("\n".join(lines) + "\n")
 

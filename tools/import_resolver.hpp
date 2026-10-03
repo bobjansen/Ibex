@@ -164,7 +164,8 @@ inline auto stable_path_key(const std::filesystem::path& path) -> std::string {
 
 inline auto expand_imports_impl(parser::Program program, const std::filesystem::path& current_dir,
                                 const std::vector<std::filesystem::path>& search_paths,
-                                robin_hood::unordered_set<std::string>& imported_paths)
+                                robin_hood::unordered_set<std::string>& imported_paths,
+                                robin_hood::unordered_set<std::string>& library_names)
     -> std::expected<parser::Program, std::string> {
     parser::Program out;
     out.statements.reserve(program.statements.size());
@@ -202,22 +203,23 @@ inline auto expand_imports_impl(parser::Program program, const std::filesystem::
         }
 
         auto expanded = expand_imports_impl(std::move(*parsed), resolved->parent_path(),
-                                            search_paths, imported_paths);
+                                            search_paths, imported_paths, library_names);
         if (!expanded.has_value()) {
             return std::unexpected(expanded.error());
         }
 
         // A library resolves its names on its own: its `using`s apply to it
         // alone, so they are applied here and not spliced into the importer.
+        // It sees every library expanded so far, since one it imports may
+        // already have been spliced in (and skipped here) by an earlier import.
         {
-            robin_hood::unordered_set<std::string> names;
-            parser::collect_declared_names(*expanded, names);
+            parser::collect_declared_names(*expanded, library_names);
             parser::UsingScope usings;
-            if (auto resolved =
-                    parser::resolve_names(*expanded, usings, parser::declared_names_of(names));
-                !resolved) {
+            if (auto names_resolved = parser::resolve_names(
+                    *expanded, usings, parser::declared_names_of(library_names));
+                !names_resolved) {
                 return std::unexpected("import '" + import.name +
-                                       "': " + resolved.error().format());
+                                       "': " + names_resolved.error().format());
             }
         }
         for (auto& imported_stmt : expanded->statements) {
@@ -240,8 +242,9 @@ inline auto expand_imports(parser::Program program, const std::string& entry_fil
     auto paths = detail::import_search_paths(entry, explicit_paths);
 
     robin_hood::unordered_set<std::string> imported_paths;
+    robin_hood::unordered_set<std::string> library_names;
     return detail::expand_imports_impl(std::move(program), entry.parent_path(), paths,
-                                       imported_paths);
+                                       imported_paths, library_names);
 }
 
 }  // namespace ibex::tools

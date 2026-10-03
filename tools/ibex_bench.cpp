@@ -1710,7 +1710,7 @@ auto run_scalar_kernel_benchmark(std::string_view bench_name, std::size_t rows,
 
 // Pair of (binding name, CSV path) for include-read mode. When non-empty,
 // each timed iteration reloads the listed CSVs into a fresh registry so the
-// timer includes read_csv() — apples-to-apples with `pl.scan_csv(...).collect()`.
+// timer includes csv::read() — apples-to-apples with `pl.scan_csv(...).collect()`.
 using ScanPaths = std::vector<std::pair<std::string, std::string>>;
 
 auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& tables,
@@ -1727,9 +1727,9 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
             ibex::runtime::TableRegistry fresh;
             for (const auto& [name, path] : scan_paths) {
                 try {
-                    fresh.emplace(name, read_csv(path));
+                    fresh.emplace(name, ibex::ext::csv::read(path));
                 } catch (const std::exception& e) {
-                    ibex::formatting::print("error: read_csv({}) failed for {}: {}\n", path,
+                    ibex::formatting::print("error: csv::read({}) failed for {}: {}\n", path,
                                             query.name, e.what());
                     return 1;
                 }
@@ -1943,7 +1943,7 @@ int main(int argc, char** argv) {
                  "Exclude parse + lower from timing (legacy mode)")
         ->excludes("--include-parse");
     app.add_flag("--include-read", include_read,
-                 "Time read_csv() inside each iteration ('data still needs to be read'); "
+                 "Time csv::read() inside each iteration ('data still needs to be read'); "
                  "matches pl.scan_csv(path).<chain>.collect(). Tagged as ibex_scan in output.");
     app.add_flag("--print-types", print_types, "Print column types for loaded benchmark tables");
     app.add_flag("--verify", verify, "Verify benchmark outputs on a sample of rows");
@@ -2017,7 +2017,7 @@ int main(int argc, char** argv) {
     if (!csv_path.empty()) {
         ibex::runtime::Table table;
         try {
-            table = read_csv(csv_path);
+            table = ibex::ext::csv::read(csv_path);
         } catch (const std::exception& e) {
             ibex::formatting::print("error: failed to read CSV: {}\n", e.what());
             return 1;
@@ -2047,7 +2047,7 @@ int main(int argc, char** argv) {
         }
         if (!prices_ts_path.empty()) {
             try {
-                tables.emplace("prices_ts", read_csv(prices_ts_path));
+                tables.emplace("prices_ts", ibex::ext::csv::read(prices_ts_path));
                 if (print_types) {
                     print_table_types("prices_ts", tables.find("prices_ts")->second);
                 }
@@ -2447,7 +2447,7 @@ int main(int argc, char** argv) {
         if (status == 0 && run_suite("null") && !csv_lookup_path.empty()) {
             ibex::runtime::Table lookup_table;
             try {
-                lookup_table = read_csv(csv_lookup_path);
+                lookup_table = ibex::ext::csv::read(csv_lookup_path);
             } catch (const std::exception& e) {
                 ibex::formatting::print("error: failed to read lookup CSV: {}\n", e.what());
                 return 1;
@@ -2529,7 +2529,7 @@ int main(int argc, char** argv) {
             if (!csv_lookup_path.empty()) {
                 ibex::runtime::Table lookup_table;
                 try {
-                    lookup_table = read_csv(csv_lookup_path);
+                    lookup_table = ibex::ext::csv::read(csv_lookup_path);
                 } catch (const std::exception& e) {
                     ibex::formatting::print("error: failed to read lookup CSV: {}\n", e.what());
                     return 1;
@@ -2555,8 +2555,8 @@ int main(int argc, char** argv) {
                 ibex::runtime::Table events_table;
                 ibex::runtime::Table users_table;
                 try {
-                    events_table = read_csv(csv_events_path);
-                    users_table = read_csv(csv_users_path);
+                    events_table = ibex::ext::csv::read(csv_events_path);
+                    users_table = ibex::ext::csv::read(csv_users_path);
                 } catch (const std::exception& e) {
                     ibex::formatting::print("error: failed to read events/users CSV: {}\n",
                                             e.what());
@@ -2606,7 +2606,7 @@ int main(int argc, char** argv) {
     if (status == 0 && run_suite("filter") && !csv_trades_path.empty()) {
         ibex::runtime::Table trades_table;
         try {
-            trades_table = read_csv(csv_trades_path);
+            trades_table = ibex::ext::csv::read(csv_trades_path);
         } catch (const std::exception& e) {
             ibex::formatting::print("error: failed to read trades CSV: {}\n", e.what());
             return 1;
@@ -2655,7 +2655,7 @@ int main(int argc, char** argv) {
     if (status == 0 && run_suite("filter_micro") && !csv_trades_path.empty()) {
         ibex::runtime::Table trades_table;
         try {
-            trades_table = read_csv(csv_trades_path);
+            trades_table = ibex::ext::csv::read(csv_trades_path);
         } catch (const std::exception& e) {
             ibex::formatting::print("error: failed to read trades CSV: {}\n", e.what());
             return 1;
@@ -3121,7 +3121,7 @@ int main(int argc, char** argv) {
     if (status == 0 && run_suite("stats") && !csv_trades_path.empty()) {
         ibex::runtime::Table trades_table;
         try {
-            trades_table = read_csv(csv_trades_path);
+            trades_table = ibex::ext::csv::read(csv_trades_path);
         } catch (const std::exception& e) {
             ibex::formatting::print("error: failed to read trades CSV: {}\n", e.what());
             return 1;
@@ -3142,7 +3142,7 @@ int main(int argc, char** argv) {
     if (status == 0 && run_suite("multi") && !csv_multi_path.empty()) {
         ibex::runtime::Table multi_table;
         try {
-            multi_table = read_csv(csv_multi_path);
+            multi_table = ibex::ext::csv::read(csv_multi_path);
         } catch (const std::exception& e) {
             ibex::formatting::print("error: failed to read multi CSV: {}\n", e.what());
             return 1;
@@ -3204,7 +3204,7 @@ int main(int argc, char** argv) {
     if (status == 0 && run_suite("events") && !csv_events_path.empty()) {
         ibex::runtime::Table events_table;
         try {
-            events_table = read_csv(csv_events_path);
+            events_table = ibex::ext::csv::read(csv_events_path);
         } catch (const std::exception& e) {
             ibex::formatting::print("error: failed to read events CSV: {}\n", e.what());
             return 1;

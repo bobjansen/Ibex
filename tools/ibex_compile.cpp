@@ -316,7 +316,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Lower to IR. A script whose statements have effects (a table sink such as
-    // `write_csv(df, path);`, or `let n = f(...);` binding an extern's result)
+    // `csv::write(df, path);`, or `let n = f(...);` binding an extern's result)
     // cannot be one query plus constants: it is lowered as a whole script and
     // emitted in statement order. Everything else keeps the single-plan path.
     std::optional<ibex::parser::ScriptPlan> script_plan;
@@ -363,10 +363,10 @@ int main(int argc, char* argv[]) {
         robin_hood::unordered_set<std::string> seen_headers;
         for (const auto& stmt : program->statements) {
             if (const auto* ext = std::get_if<ibex::parser::ExternDecl>(&stmt)) {
-                // `parse_args` reads the process argv (via IBEX_ARGS); the
+                // `args::parse` reads the process argv (via IBEX_ARGS); the
                 // generated `main` must forward its own argv, the compiled
                 // equivalent of `ibex script.ibex -- <args>`.
-                if (ext->name == "parse_args") {
+                if (ext->name == "args::parse") {
                     config.forward_cli_args = true;
                 }
                 if (!ext->source_path.empty()) {

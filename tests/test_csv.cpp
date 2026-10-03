@@ -19,7 +19,7 @@
 
 namespace {
 
-auto write_csv(const std::filesystem::path& path, const char* content) {
+auto write_text_file(const std::filesystem::path& path, const char* content) {
     std::ofstream out(path);
     out << content;
 }
@@ -49,9 +49,9 @@ auto is_null_at(const ibex::runtime::Table& table, const char* name, std::size_t
 
 TEST_CASE("Read simple CSV - int and string columns") {
     auto path = tmp("ibex_test_simple.csv");
-    write_csv(path, "price,symbol\n10,A\n20,B\n30,A\n");
+    write_text_file(path, "price,symbol\n10,A\n20,B\n30,A\n");
 
-    auto table = read_csv(path.string());
+    auto table = ibex::ext::csv::read(path.string());
     const auto* prices = std::get_if<ibex::Column<std::int64_t>>(table.find("price"));
     REQUIRE(prices != nullptr);
     REQUIRE(prices->size() == 3);
@@ -93,7 +93,7 @@ TEST_CASE("Read CSV - categorical promotion preserves single code per distinct v
         }
     }
 
-    auto table = read_csv(path.string());
+    auto table = ibex::ext::csv::read(path.string());
     const auto* sym_col = std::get_if<ibex::Column<ibex::Categorical>>(table.find("symbol"));
     REQUIRE(sym_col != nullptr);
     REQUIRE(sym_col->size() == kSymbols * kRepeats);
@@ -140,8 +140,8 @@ TEST_CASE("Read CSV - schema-hinted categorical preserves single code per distin
         }
     }
 
-    auto table = read_csv(path.string(), /*null_spec=*/"", /*delimiter=*/",",
-                          /*has_header=*/true, /*schema=*/"symbol:cat,price:int");
+    auto table = ibex::ext::csv::read(path.string(), /*null_spec=*/"", /*delimiter=*/",",
+                                      /*has_header=*/true, /*schema=*/"symbol:cat,price:int");
     const auto* sym_col = std::get_if<ibex::Column<ibex::Categorical>>(table.find("symbol"));
     REQUIRE(sym_col != nullptr);
     REQUIRE(sym_col->size() == kSymbols * kRepeats);
@@ -150,9 +150,9 @@ TEST_CASE("Read CSV - schema-hinted categorical preserves single code per distin
 
 TEST_CASE("Read CSV - float64 column detection") {
     auto path = tmp("ibex_test_float.csv");
-    write_csv(path, "price,qty\n1.5,10\n2.25,20\n0.5,5\n");
+    write_text_file(path, "price,qty\n1.5,10\n2.25,20\n0.5,5\n");
 
-    auto table = read_csv(path.string());
+    auto table = ibex::ext::csv::read(path.string());
     const auto* prices = std::get_if<ibex::Column<double>>(table.find("price"));
     const auto* qtys = std::get_if<ibex::Column<std::int64_t>>(table.find("qty"));
     REQUIRE(prices != nullptr);
@@ -167,9 +167,9 @@ TEST_CASE("Read CSV - float64 column detection") {
 TEST_CASE("Read CSV - large int64 values") {
     auto path = tmp("ibex_test_int64.csv");
     // Value exceeds int32 range
-    write_csv(path, "ts\n9999999999\n1000000000\n");
+    write_text_file(path, "ts\n9999999999\n1000000000\n");
 
-    auto table = read_csv(path.string());
+    auto table = ibex::ext::csv::read(path.string());
     const auto* ts = std::get_if<ibex::Column<std::int64_t>>(table.find("ts"));
     REQUIRE(ts != nullptr);
     REQUIRE((*ts)[0] == 9999999999LL);
@@ -178,9 +178,9 @@ TEST_CASE("Read CSV - large int64 values") {
 
 TEST_CASE("Read CSV - single column") {
     auto path = tmp("ibex_test_single.csv");
-    write_csv(path, "value\n1\n2\n3\n");
+    write_text_file(path, "value\n1\n2\n3\n");
 
-    auto table = read_csv(path.string());
+    auto table = ibex::ext::csv::read(path.string());
     REQUIRE(table.rows() == 3);
     const auto* col = std::get_if<ibex::Column<std::int64_t>>(table.find("value"));
     REQUIRE(col != nullptr);
@@ -191,9 +191,9 @@ TEST_CASE("Read CSV - single column") {
 TEST_CASE("Read CSV - mixed numeric/non-numeric falls back to string") {
     auto path = tmp("ibex_test_mixed.csv");
     // "price" column has a non-numeric value -> whole column must become string
-    write_csv(path, "price\n10\n20\nN/A\n30\n");
+    write_text_file(path, "price\n10\n20\nN/A\n30\n");
 
-    auto table = read_csv(path.string());
+    auto table = ibex::ext::csv::read(path.string());
     REQUIRE(table.rows() == 4);
     REQUIRE(get_string_at(table, "price", 0) == "10");
     REQUIRE(get_string_at(table, "price", 2) == "N/A");
@@ -206,9 +206,9 @@ TEST_CASE("Read CSV - bare empty field in numeric column infers as null, not str
     // A second, always-populated column keeps the middle row from being a
     // blank line (which the parser treats as a row separator, not a row of
     // empty fields).
-    write_csv(path, "price,tag\n1.5,a\n,b\n2.5,c\n");
+    write_text_file(path, "price,tag\n1.5,a\n,b\n2.5,c\n");
 
-    auto table = read_csv(path.string());
+    auto table = ibex::ext::csv::read(path.string());
     REQUIRE(table.rows() == 3);
     const auto* prices = std::get_if<ibex::Column<double>>(table.find("price"));
     REQUIRE(prices != nullptr);
@@ -221,9 +221,9 @@ TEST_CASE("Read CSV - bare empty field in numeric column infers as null, not str
 
 TEST_CASE("Read CSV - bare empty field in int column infers as nullable Int64") {
     auto path = tmp("ibex_test_empty_int.csv");
-    write_csv(path, "qty,tag\n10,a\n,b\n30,c\n");
+    write_text_file(path, "qty,tag\n10,a\n,b\n30,c\n");
 
-    auto table = read_csv(path.string());
+    auto table = ibex::ext::csv::read(path.string());
     REQUIRE(table.rows() == 3);
     const auto* qtys = std::get_if<ibex::Column<std::int64_t>>(table.find("qty"));
     REQUIRE(qtys != nullptr);
@@ -234,9 +234,9 @@ TEST_CASE("Read CSV - bare empty field in int column infers as nullable Int64") 
 
 TEST_CASE("Read CSV - column of only empty fields still falls back to string") {
     auto path = tmp("ibex_test_all_empty.csv");
-    write_csv(path, "a,tag\n,x\n,y\n");
+    write_text_file(path, "a,tag\n,x\n,y\n");
 
-    auto table = read_csv(path.string());
+    auto table = ibex::ext::csv::read(path.string());
     REQUIRE(table.rows() == 2);
     REQUIRE(get_string_at(table, "a", 0) == "");
     REQUIRE(get_string_at(table, "a", 1) == "");
@@ -244,9 +244,9 @@ TEST_CASE("Read CSV - column of only empty fields still falls back to string") {
 
 TEST_CASE("Read CSV - single data row") {
     auto path = tmp("ibex_test_onerow.csv");
-    write_csv(path, "a,b\n42,hello\n");
+    write_text_file(path, "a,b\n42,hello\n");
 
-    auto table = read_csv(path.string());
+    auto table = ibex::ext::csv::read(path.string());
     REQUIRE(table.rows() == 1);
     const auto* a = std::get_if<ibex::Column<std::int64_t>>(table.find("a"));
     REQUIRE(a != nullptr);
@@ -256,9 +256,9 @@ TEST_CASE("Read CSV - single data row") {
 
 TEST_CASE("Read CSV - trailing comma produces empty last field") {
     auto path = tmp("ibex_test_trailing.csv");
-    write_csv(path, "a,b,c\n1,2,\n3,4,\n");
+    write_text_file(path, "a,b,c\n1,2,\n3,4,\n");
 
-    auto table = read_csv(path.string());
+    auto table = ibex::ext::csv::read(path.string());
     REQUIRE(table.rows() == 2);
     REQUIRE(get_string_at(table, "c", 0) == "");
     REQUIRE(get_string_at(table, "c", 1) == "");
@@ -267,9 +267,9 @@ TEST_CASE("Read CSV - trailing comma produces empty last field") {
 TEST_CASE("Read CSV - RFC 4180 quoted fields with embedded commas") {
     auto path = tmp("ibex_test_quoted.csv");
     // "name" column has commas inside quotes - old parser would split incorrectly
-    write_csv(path, "id,name,score\n1,\"Smith, John\",95\n2,\"Doe, Jane\",87\n");
+    write_text_file(path, "id,name,score\n1,\"Smith, John\",95\n2,\"Doe, Jane\",87\n");
 
-    auto table = read_csv(path.string());
+    auto table = ibex::ext::csv::read(path.string());
     REQUIRE(table.rows() == 2);
     const auto* ids = std::get_if<ibex::Column<std::int64_t>>(table.find("id"));
     const auto* scores = std::get_if<ibex::Column<std::int64_t>>(table.find("score"));
@@ -284,9 +284,9 @@ TEST_CASE("Read CSV - RFC 4180 quoted fields with embedded commas") {
 TEST_CASE("Read CSV - RFC 4180 escaped quotes inside quoted field") {
     auto path = tmp("ibex_test_escaped_quotes.csv");
     // "" inside a quoted field represents a literal quote character
-    write_csv(path, "msg\n\"say \"\"hello\"\"\"\n\"world\"\n");
+    write_text_file(path, "msg\n\"say \"\"hello\"\"\"\n\"world\"\n");
 
-    auto table = read_csv(path.string());
+    auto table = ibex::ext::csv::read(path.string());
     REQUIRE(table.rows() == 2);
     REQUIRE(get_string_at(table, "msg", 0) == "say \"hello\"");
     REQUIRE(get_string_at(table, "msg", 1) == "world");
@@ -294,9 +294,9 @@ TEST_CASE("Read CSV - RFC 4180 escaped quotes inside quoted field") {
 
 TEST_CASE("Read CSV - nullable parsing via null spec") {
     auto path = tmp("ibex_test_nullable_parse.csv");
-    write_csv(path, "price,qty,note\n10,1,ok\n,2,NA\n30,NA,\n");
+    write_text_file(path, "price,qty,note\n10,1,ok\n,2,NA\n30,NA,\n");
 
-    auto table = read_csv(path.string(), "<empty>,NA");
+    auto table = ibex::ext::csv::read(path.string(), "<empty>,NA");
     REQUIRE(table.rows() == 3);
 
     const auto* prices = std::get_if<ibex::Column<std::int64_t>>(table.find("price"));
@@ -330,9 +330,9 @@ TEST_CASE("Read CSV - nullable parsing via null spec") {
 
 TEST_CASE("Read CSV - custom delimiter preserves quoted commas and numeric inference") {
     auto path = tmp("ibex_test_semicolon.csv");
-    write_csv(path, "station;temp\n\"Washington, D.C.\";12.5\nAmsterdam;-1.0\n");
+    write_text_file(path, "station;temp\n\"Washington, D.C.\";12.5\nAmsterdam;-1.0\n");
 
-    auto table = read_csv(path.string(), "", ";");
+    auto table = ibex::ext::csv::read(path.string(), "", ";");
     REQUIRE(table.rows() == 2);
     REQUIRE(get_string_at(table, "station", 0) == "Washington, D.C.");
     REQUIRE(get_string_at(table, "station", 1) == "Amsterdam");
@@ -345,9 +345,9 @@ TEST_CASE("Read CSV - custom delimiter preserves quoted commas and numeric infer
 
 TEST_CASE("Read CSV - no-header mode numbers columns and infers types") {
     auto path = tmp("ibex_test_no_header_semicolon.csv");
-    write_csv(path, "\"Washington, D.C.\";12.5\nAmsterdam;-1.0\n");
+    write_text_file(path, "\"Washington, D.C.\";12.5\nAmsterdam;-1.0\n");
 
-    auto table = read_csv(path.string(), "", ";", false);
+    auto table = ibex::ext::csv::read(path.string(), "", ";", false);
     REQUIRE(table.rows() == 2);
     REQUIRE(get_string_at(table, "col1", 0) == "Washington, D.C.");
     REQUIRE(get_string_at(table, "col1", 1) == "Amsterdam");
@@ -360,9 +360,9 @@ TEST_CASE("Read CSV - no-header mode numbers columns and infers types") {
 
 TEST_CASE("Read CSV - schema hint forces categorical and double types") {
     auto path = tmp("ibex_test_schema_hint.csv");
-    write_csv(path, "Amsterdam;12.5\nBerlin;-1.0\nAmsterdam;3.25\n");
+    write_text_file(path, "Amsterdam;12.5\nBerlin;-1.0\nAmsterdam;3.25\n");
 
-    auto table = read_csv(path.string(), "", ";", false, "cat,f64");
+    auto table = ibex::ext::csv::read(path.string(), "", ";", false, "cat,f64");
     REQUIRE(table.rows() == 3);
     const auto* stations = std::get_if<ibex::Column<ibex::Categorical>>(table.find("col1"));
     REQUIRE(stations != nullptr);
@@ -379,9 +379,9 @@ TEST_CASE("Read CSV - schema hint forces categorical and double types") {
 
 TEST_CASE("Read CSV - schema hint named columns override inference") {
     auto path = tmp("ibex_test_schema_hint_named.csv");
-    write_csv(path, "id,code\n1,100\n2,200\n3,300\n");
+    write_text_file(path, "id,code\n1,100\n2,200\n3,300\n");
 
-    auto table = read_csv(path.string(), "", ",", true, "code:str");
+    auto table = ibex::ext::csv::read(path.string(), "", ",", true, "code:str");
     const auto* codes = std::get_if<ibex::Column<std::string>>(table.find("code"));
     REQUIRE(codes != nullptr);
     REQUIRE((*codes)[0] == "100");
@@ -394,16 +394,17 @@ TEST_CASE("Read CSV - schema hint named columns override inference") {
 
 TEST_CASE("Read CSV - schema hint parse failure throws") {
     auto path = tmp("ibex_test_schema_hint_fail.csv");
-    write_csv(path, "x\nnot_a_number\n");
+    write_text_file(path, "x\nnot_a_number\n");
 
-    REQUIRE_THROWS_AS(read_csv(path.string(), "", ",", true, "f64"), std::runtime_error);
+    REQUIRE_THROWS_AS(ibex::ext::csv::read(path.string(), "", ",", true, "f64"),
+                      std::runtime_error);
 }
 
 TEST_CASE("Read CSV - schema hint 'date' parses YYYY-MM-DD into days-since-epoch") {
     auto path = tmp("ibex_test_schema_hint_date.csv");
-    write_csv(path, "id,d\n1,1970-01-01\n2,1996-03-13\n3,2026-07-12\n");
+    write_text_file(path, "id,d\n1,1970-01-01\n2,1996-03-13\n3,2026-07-12\n");
 
-    auto table = read_csv(path.string(), "", ",", true, "d:date");
+    auto table = ibex::ext::csv::read(path.string(), "", ",", true, "d:date");
     const auto* dates = std::get_if<ibex::Column<ibex::Date>>(table.find("d"));
     REQUIRE(dates != nullptr);
     REQUIRE((*dates)[0].days == 0);
@@ -413,9 +414,10 @@ TEST_CASE("Read CSV - schema hint 'date' parses YYYY-MM-DD into days-since-epoch
 
 TEST_CASE("Read CSV - schema hint 'date' parse failure throws") {
     auto path = tmp("ibex_test_schema_hint_date_fail.csv");
-    write_csv(path, "d\nnot-a-date\n");
+    write_text_file(path, "d\nnot-a-date\n");
 
-    REQUIRE_THROWS_AS(read_csv(path.string(), "", ",", true, "date"), std::runtime_error);
+    REQUIRE_THROWS_AS(ibex::ext::csv::read(path.string(), "", ",", true, "date"),
+                      std::runtime_error);
 }
 
 TEST_CASE(
@@ -423,7 +425,7 @@ TEST_CASE(
     "date column (matches TPC-H dbgen .tbl layout)") {
     auto path = tmp("ibex_test_chunked_tbl.csv");
     // dbgen emits a trailing '|' on every row; the last field is therefore empty.
-    write_csv(path, "1|17|1996-03-13|\n2|36|1996-04-12|\n3|8|1996-01-29|\n");
+    write_text_file(path, "1|17|1996-03-13|\n2|36|1996-04-12|\n3|8|1996-01-29|\n");
 
     ibex::csv::detail::ChunkedCsvSourceOperator op(
         path.string(), {"id", "qty", "shipdate", "trailing"},
@@ -466,19 +468,19 @@ TEST_CASE(
 }
 
 // ---------------------------------------------------------------------------
-// write_csv tests
+// csv::write tests
 // ---------------------------------------------------------------------------
 
 TEST_CASE("Write CSV - int and string columns round-trip") {
     auto path = tmp("ibex_test_write_simple.csv");
-    write_csv(path, "price,symbol\n10,A\n20,B\n30,A\n");
+    write_text_file(path, "price,symbol\n10,A\n20,B\n30,A\n");
 
-    auto original = read_csv(path.string());
+    auto original = ibex::ext::csv::read(path.string());
     auto out_path = tmp("ibex_test_write_simple_out.csv");
-    auto rows_written = write_csv(original, out_path.string());
+    auto rows_written = ibex::ext::csv::write(original, out_path.string());
     REQUIRE(rows_written == 3);
 
-    auto reread = read_csv(out_path.string());
+    auto reread = ibex::ext::csv::read(out_path.string());
     REQUIRE(reread.rows() == 3);
     const auto* prices = std::get_if<ibex::Column<std::int64_t>>(reread.find("price"));
     REQUIRE(prices != nullptr);
@@ -492,14 +494,14 @@ TEST_CASE("Write CSV - int and string columns round-trip") {
 
 TEST_CASE("Write CSV - double column round-trip") {
     auto path = tmp("ibex_test_write_double.csv");
-    write_csv(path, "x,y\n1.5,2.25\n0.5,3.0\n");
+    write_text_file(path, "x,y\n1.5,2.25\n0.5,3.0\n");
 
-    auto original = read_csv(path.string());
+    auto original = ibex::ext::csv::read(path.string());
     auto out_path = tmp("ibex_test_write_double_out.csv");
-    auto rows_written = write_csv(original, out_path.string());
+    auto rows_written = ibex::ext::csv::write(original, out_path.string());
     REQUIRE(rows_written == 2);
 
-    auto reread = read_csv(out_path.string());
+    auto reread = ibex::ext::csv::read(out_path.string());
     const auto* x = std::get_if<ibex::Column<double>>(reread.find("x"));
     const auto* y = std::get_if<ibex::Column<double>>(reread.find("y"));
     REQUIRE(x != nullptr);
@@ -514,14 +516,14 @@ TEST_CASE("Write CSV - double column preserves full precision for large-magnitud
     // `out << double` truncates to the stream's default 6-significant-digit
     // precision (e.g. 3083843.06 -> "3.08384e+06"), which silently corrupts
     // any sum/aggregate large enough to exceed 6 digits -- exactly the shape
-    // of TPC-H revenue totals. write_csv must round-trip exactly instead.
+    // of TPC-H revenue totals. csv::write must round-trip exactly instead.
     ibex::runtime::Table table;
     table.add_column("revenue", ibex::Column<double>({3083843.06, 55908965222.827362}));
 
     auto out_path = tmp("ibex_test_write_double_precision.csv");
-    write_csv(table, out_path.string());
+    ibex::ext::csv::write(table, out_path.string());
 
-    auto reread = read_csv(out_path.string());
+    auto reread = ibex::ext::csv::read(out_path.string());
     const auto* revenue = std::get_if<ibex::Column<double>>(reread.find("revenue"));
     REQUIRE(revenue != nullptr);
     REQUIRE((*revenue)[0] == Catch::Approx(3083843.06));
@@ -535,11 +537,11 @@ TEST_CASE("Write CSV - fields with commas are quoted") {
     table.add_column("score", ibex::Column<std::int64_t>({95, 87}));
 
     auto out_path = tmp("ibex_test_write_quoted.csv");
-    auto rows_written = write_csv(table, out_path.string());
+    auto rows_written = ibex::ext::csv::write(table, out_path.string());
     REQUIRE(rows_written == 2);
 
     // Read back and verify the commas survived the round-trip.
-    auto reread = read_csv(out_path.string());
+    auto reread = ibex::ext::csv::read(out_path.string());
     REQUIRE(reread.rows() == 2);
     REQUIRE(get_string_at(reread, "name", 0) == "Smith, John");
     REQUIRE(get_string_at(reread, "name", 1) == "Doe, Jane");
@@ -554,24 +556,24 @@ TEST_CASE("Write CSV - fields with double-quotes are escaped") {
     table.add_column("msg", ibex::Column<std::string>({"say \"hello\"", "world"}));
 
     auto out_path = tmp("ibex_test_write_escaped.csv");
-    write_csv(table, out_path.string());
+    ibex::ext::csv::write(table, out_path.string());
 
-    auto reread = read_csv(out_path.string());
+    auto reread = ibex::ext::csv::read(out_path.string());
     REQUIRE(get_string_at(reread, "msg", 0) == "say \"hello\"");
     REQUIRE(get_string_at(reread, "msg", 1) == "world");
 }
 
 TEST_CASE("Write CSV - null values written as empty fields") {
     auto src_path = tmp("ibex_test_write_nulls_src.csv");
-    write_csv(src_path, "price,note\n10,ok\n,NA\n30,\n");
+    write_text_file(src_path, "price,note\n10,ok\n,NA\n30,\n");
 
-    auto original = read_csv(src_path.string(), "<empty>,NA");
+    auto original = ibex::ext::csv::read(src_path.string(), "<empty>,NA");
     auto out_path = tmp("ibex_test_write_nulls_out.csv");
-    auto rows_written = write_csv(original, out_path.string());
+    auto rows_written = ibex::ext::csv::write(original, out_path.string());
     REQUIRE(rows_written == 3);
 
     // Re-read with the same null spec to verify round-trip.
-    auto reread = read_csv(out_path.string(), "<empty>,NA");
+    auto reread = ibex::ext::csv::read(out_path.string(), "<empty>,NA");
     REQUIRE(reread.rows() == 3);
     REQUIRE_FALSE(is_null_at(reread, "price", 0));
     REQUIRE(is_null_at(reread, "price", 1));
@@ -587,7 +589,7 @@ TEST_CASE("Write CSV - empty table writes only header") {
     table.add_column("b", ibex::Column<std::string>{});
 
     auto out_path = tmp("ibex_test_write_empty.csv");
-    auto rows_written = write_csv(table, out_path.string());
+    auto rows_written = ibex::ext::csv::write(table, out_path.string());
     REQUIRE(rows_written == 0);
 
     // File should contain only the header line.
@@ -600,8 +602,9 @@ TEST_CASE("Write CSV - empty table writes only header") {
 
 TEST_CASE("empty chunked CSV retains typed columns", "[schema][csv]") {
     const auto path = tmp("ibex_test_empty_chunked_schema.csv");
-    write_csv(path, "");
-    const auto eager = read_csv(path.string(), "", ",", false, "v:i64,s:string,d:date,c:cat");
+    write_text_file(path, "");
+    const auto eager =
+        ibex::ext::csv::read(path.string(), "", ",", false, "v:i64,s:string,d:date,c:cat");
     REQUIRE(eager.columns.size() == 4);
     CHECK(eager.rows() == 0);
     CHECK(std::holds_alternative<ibex::Column<std::int64_t>>(*eager.find("v")));

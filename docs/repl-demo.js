@@ -8,7 +8,7 @@
       elapsed: 1,
     },
     {
-      command: 'let ticks = gen_ticks(10000000, "AAPL,MSFT,NVDA");',
+      command: 'let ticks = gen::ticks(10000000, "AAPL,MSFT,NVDA");',
       output: "time: 261.4 ms",
       elapsed: 261,
     },

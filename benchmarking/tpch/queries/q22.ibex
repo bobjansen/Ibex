@@ -24,15 +24,15 @@
 //        benchmarking/tpch/queries/q22.ibex
 // ─────────────────────────────────────────────────────────────────────────────
 
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
-extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
+extern fn csv::write(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let customer_raw = read_parquet("benchmarking/data/tpch/parquet/customer.parquet") as DataFrame<{
+let customer_raw = parquet::read("benchmarking/data/tpch/parquet/customer.parquet") as DataFrame<{
     c_custkey: Int64,
     c_phone: String,
     c_acctbal: Float64
 }>;
-let orders_raw = read_parquet("benchmarking/data/tpch/parquet/orders.parquet") as DataFrame<{
+let orders_raw = parquet::read("benchmarking/data/tpch/parquet/orders.parquet") as DataFrame<{
     o_custkey: Int64
 }>;
 
@@ -58,5 +58,5 @@ cross join q2)[
 ][
     order { cntrycode }
 ];
-write_csv(result, "benchmarking/data/tpch/out/q22.csv");
+csv::write(result, "benchmarking/data/tpch/out/q22.csv");
 result;

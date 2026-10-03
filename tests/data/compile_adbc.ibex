@@ -2,13 +2,13 @@
 // function, closed. SQLITE_DRIVER is substituted by scripts/ibex-e2e.sh.
 import "adbc";
 
-fn total(mutable conn: AdbcConnection) -> DataFrame {
-    adbc_query(conn, "select sum(x) as total from t");
+fn total(mutable conn: adbc::Connection) -> DataFrame {
+    adbc::query(conn, "select sum(x) as total from t");
 }
 
-let db = adbc_connect("@SQLITE_DRIVER@", ":memory:");
-adbc_execute(db, "create table t (x integer)");
-adbc_write(db, Table { x = [3, 4, 5] }, "t", "append");
+let db = adbc::connect("@SQLITE_DRIVER@", ":memory:");
+adbc::execute(db, "create table t (x integer)");
+adbc::write(db, Table { x = [3, 4, 5] }, "t", "append");
 let answer = total(db);
-adbc_close(db);
+adbc::close(db);
 answer;

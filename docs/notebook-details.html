@@ -102,7 +102,7 @@ grouped.plot(kind=<span class="str">"bar"</span>, x=<span class="str">"symbol"</
         <div class="tour-code">
 <pre><code>%%ibex --quiet
 import "csv";
-let train = read_csv(<span class="str">"../../kaggle/data/train.csv"</span>, <span class="str">"&lt;empty&gt;"</span>);
+let train = csv::read(<span class="str">"../../kaggle/data/train.csv"</span>, <span class="str">"&lt;empty&gt;"</span>);
 
 %%ibex --as pandas --out bucket_summary
 train[<span class="kw">select</span> { rows = <span class="fn-name">count</span>() }, <span class="kw">by</span> seconds_in_bucket, <span class="kw">order</span> seconds_in_bucket];
@@ -162,7 +162,7 @@ session_eval(
   sess,
   <span class="str">'
   import "csv";
-  let iris = read_csv("data/iris.csv", "");
+  let iris = csv::read("data/iris.csv", "");
   '</span>
 )
 
@@ -208,7 +208,7 @@ result &lt;- collect(query)</code></pre>
         <div class="tour-code">
 <pre><code>import "csv";
 
-let raw = read_csv("examples/measurements.txt", "", ";", false)
+let raw = csv::read("examples/measurements.txt", "", ";", false)
     [select { station = col1, temp = col2 }];</code></pre>
         </div>
       </div>

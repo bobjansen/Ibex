@@ -139,8 +139,8 @@
     </p>
 <pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
 
-<span class="kw">let</span> ticks         = <span class="fn-name">read_csv</span>(<span class="str">"examples/quant_demo/data/ticks.csv"</span>);
-<span class="kw">let</span> reference_raw = <span class="fn-name">read_csv</span>(<span class="str">"examples/quant_demo/data/reference.csv"</span>);
+<span class="kw">let</span> ticks         = <span class="fn-name">csv::read</span>(<span class="str">"examples/quant_demo/data/ticks.csv"</span>);
+<span class="kw">let</span> reference_raw = <span class="fn-name">csv::read</span>(<span class="str">"examples/quant_demo/data/reference.csv"</span>);
 
 <span class="cm">// Promote both to TimeFrames so the asof join is type-checked.</span>
 <span class="kw">let</span> tick_stream = <span class="fn-name">as_timeframe</span>(ticks, <span class="str">"ts"</span>);
@@ -327,14 +327,14 @@ coefficients;</code></pre>
     <h2>Write the results</h2>
     <p>
       Three CSVs: the coefficients, the labelled feature matrix, and the fitted
-      values in row order. <code>write_csv</code> returns the number of rows it
+      values in row order. <code>csv::write</code> returns the number of rows it
       wrote, which is why three bare integers close out the script's stdout.
     </p>
 <pre><code><span class="kw">let</span> predictions = <span class="fn-name">model_fitted</span>(fit);
 
-<span class="fn-name">write_csv</span>(coefficients, <span class="str">"examples/quant_demo/data/coefficients.csv"</span>);
-<span class="fn-name">write_csv</span>(labelled,     <span class="str">"examples/quant_demo/data/features.csv"</span>);
-<span class="fn-name">write_csv</span>(predictions,  <span class="str">"examples/quant_demo/data/predictions.csv"</span>);</code></pre>
+<span class="fn-name">csv::write</span>(coefficients, <span class="str">"examples/quant_demo/data/coefficients.csv"</span>);
+<span class="fn-name">csv::write</span>(labelled,     <span class="str">"examples/quant_demo/data/features.csv"</span>);
+<span class="fn-name">csv::write</span>(predictions,  <span class="str">"examples/quant_demo/data/predictions.csv"</span>);</code></pre>
     <p class="out-label">Output</p>
 <pre class="out"><code>6
 2334
@@ -402,8 +402,8 @@ vol_regime,4.463433023176217</code></pre>
     </p>
 <pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
 
-<span class="kw">let</span> ticks         = <span class="fn-name">read_csv</span>(<span class="str">"examples/quant_demo/data/ticks.csv"</span>);
-<span class="kw">let</span> reference_raw = <span class="fn-name">read_csv</span>(<span class="str">"examples/quant_demo/data/reference.csv"</span>);
+<span class="kw">let</span> ticks         = <span class="fn-name">csv::read</span>(<span class="str">"examples/quant_demo/data/ticks.csv"</span>);
+<span class="kw">let</span> reference_raw = <span class="fn-name">csv::read</span>(<span class="str">"examples/quant_demo/data/reference.csv"</span>);
 
 <span class="cm">// Promote both to TimeFrames so the asof join is type-checked.</span>
 <span class="kw">let</span> tick_stream = <span class="fn-name">as_timeframe</span>(ticks, <span class="str">"ts"</span>);
@@ -456,9 +456,9 @@ coefficients;
 <span class="cm">// ── 5. Score: persist features + fitted predictions in row order ────────</span>
 <span class="kw">let</span> predictions = <span class="fn-name">model_fitted</span>(fit);
 
-<span class="fn-name">write_csv</span>(coefficients, <span class="str">"examples/quant_demo/data/coefficients.csv"</span>);
-<span class="fn-name">write_csv</span>(labelled,     <span class="str">"examples/quant_demo/data/features.csv"</span>);
-<span class="fn-name">write_csv</span>(predictions,  <span class="str">"examples/quant_demo/data/predictions.csv"</span>);</code></pre>
+<span class="fn-name">csv::write</span>(coefficients, <span class="str">"examples/quant_demo/data/coefficients.csv"</span>);
+<span class="fn-name">csv::write</span>(labelled,     <span class="str">"examples/quant_demo/data/features.csv"</span>);
+<span class="fn-name">csv::write</span>(predictions,  <span class="str">"examples/quant_demo/data/predictions.csv"</span>);</code></pre>
   </section>
 
   <footer class="footer">

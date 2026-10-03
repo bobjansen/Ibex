@@ -53,7 +53,7 @@ auto is_null_at(const ibex::runtime::Table& table, const char* name, std::size_t
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// read_json tests
+// json::read tests
 // ---------------------------------------------------------------------------
 
 TEST_CASE("Read JSON - int and string columns from array") {
@@ -61,7 +61,7 @@ TEST_CASE("Read JSON - int and string columns from array") {
     write_file(
         path, R"([{"price":10,"symbol":"A"},{"price":20,"symbol":"B"},{"price":30,"symbol":"A"}])");
 
-    auto table = read_json(path.string());
+    auto table = ibex::ext::json::read(path.string());
     REQUIRE(table.rows() == 3);
 
     const auto* prices = std::get_if<ibex::Column<std::int64_t>>(table.find("price"));
@@ -79,7 +79,7 @@ TEST_CASE("Read JSON - float64 column detection") {
     auto path = tmp("ibex_test_json_float.json");
     write_file(path, R"([{"price":1.5,"qty":10},{"price":2.25,"qty":20}])");
 
-    auto table = read_json(path.string());
+    auto table = ibex::ext::json::read(path.string());
     const auto* prices = std::get_if<ibex::Column<double>>(table.find("price"));
     const auto* qtys = std::get_if<ibex::Column<std::int64_t>>(table.find("qty"));
     REQUIRE(prices != nullptr);
@@ -93,7 +93,7 @@ TEST_CASE("Read JSON - mixed int/float widens to double") {
     auto path = tmp("ibex_test_json_widen.json");
     write_file(path, R"([{"val":1},{"val":2.5},{"val":3}])");
 
-    auto table = read_json(path.string());
+    auto table = ibex::ext::json::read(path.string());
     const auto* vals = std::get_if<ibex::Column<double>>(table.find("val"));
     REQUIRE(vals != nullptr);
     REQUIRE(vals->size() == 3);
@@ -106,7 +106,7 @@ TEST_CASE("Read JSON - boolean column") {
     auto path = tmp("ibex_test_json_bool.json");
     write_file(path, R"([{"flag":true},{"flag":false},{"flag":true}])");
 
-    auto table = read_json(path.string());
+    auto table = ibex::ext::json::read(path.string());
     const auto* flags = std::get_if<ibex::Column<bool>>(table.find("flag"));
     REQUIRE(flags != nullptr);
     REQUIRE(flags->size() == 3);
@@ -119,7 +119,7 @@ TEST_CASE("Read JSON - null values create validity bitmap") {
     auto path = tmp("ibex_test_json_null.json");
     write_file(path, R"([{"a":1,"b":"x"},{"a":null,"b":"y"},{"a":3,"b":null}])");
 
-    auto table = read_json(path.string());
+    auto table = ibex::ext::json::read(path.string());
     REQUIRE(table.rows() == 3);
 
     const auto* a = std::get_if<ibex::Column<std::int64_t>>(table.find("a"));
@@ -141,7 +141,7 @@ TEST_CASE("Read JSON - missing keys treated as null") {
     auto path = tmp("ibex_test_json_missing.json");
     write_file(path, R"([{"a":1,"b":2},{"a":3}])");
 
-    auto table = read_json(path.string());
+    auto table = ibex::ext::json::read(path.string());
     REQUIRE(table.rows() == 2);
 
     const auto* b = std::get_if<ibex::Column<std::int64_t>>(table.find("b"));
@@ -155,7 +155,7 @@ TEST_CASE("Read JSON - JSON-Lines format") {
     auto path = tmp("ibex_test_jsonl.jsonl");
     write_file(path, "{\"x\":1,\"y\":\"a\"}\n{\"x\":2,\"y\":\"b\"}\n{\"x\":3,\"y\":\"c\"}\n");
 
-    auto table = read_json(path.string());
+    auto table = ibex::ext::json::read(path.string());
     REQUIRE(table.rows() == 3);
 
     const auto* x = std::get_if<ibex::Column<std::int64_t>>(table.find("x"));
@@ -172,7 +172,7 @@ TEST_CASE("Read JSON - single object becomes one-row table") {
     auto path = tmp("ibex_test_json_single.json");
     write_file(path, R"({"name":"Alice","age":30})");
 
-    auto table = read_json(path.string());
+    auto table = ibex::ext::json::read(path.string());
     REQUIRE(table.rows() == 1);
     REQUIRE(get_string_at(table, "name", 0) == "Alice");
 
@@ -185,7 +185,7 @@ TEST_CASE("Read JSON - large int64 values") {
     auto path = tmp("ibex_test_json_int64.json");
     write_file(path, R"([{"ts":9999999999},{"ts":1000000000}])");
 
-    auto table = read_json(path.string());
+    auto table = ibex::ext::json::read(path.string());
     const auto* ts = std::get_if<ibex::Column<std::int64_t>>(table.find("ts"));
     REQUIRE(ts != nullptr);
     REQUIRE((*ts)[0] == 9999999999LL);
@@ -196,7 +196,7 @@ TEST_CASE("Read JSON - empty array produces empty table") {
     auto path = tmp("ibex_test_json_empty.json");
     write_file(path, "[]");
 
-    auto table = read_json(path.string());
+    auto table = ibex::ext::json::read(path.string());
     REQUIRE(table.rows() == 0);
 }
 
@@ -204,25 +204,25 @@ TEST_CASE("Read JSON - missing path reports file not found") {
     auto path = tmp("ibex_test_json_missing_file.json");
     std::filesystem::remove(path);
 
-    REQUIRE_THROWS_WITH(read_json(path.string()),
-                        Catch::Matchers::ContainsSubstring("read_json: file not found:") &&
+    REQUIRE_THROWS_WITH(ibex::ext::json::read(path.string()),
+                        Catch::Matchers::ContainsSubstring("json::read: file not found:") &&
                             Catch::Matchers::ContainsSubstring(path.string()));
 }
 
 // ---------------------------------------------------------------------------
-// write_json tests
+// json::write tests
 // ---------------------------------------------------------------------------
 
 TEST_CASE("Write JSON - int and string columns round-trip") {
     auto in_path = tmp("ibex_test_json_write_in.json");
     write_file(in_path, R"([{"price":10,"symbol":"A"},{"price":20,"symbol":"B"}])");
 
-    auto original = read_json(in_path.string());
+    auto original = ibex::ext::json::read(in_path.string());
     auto out_path = tmp("ibex_test_json_write_out.json");
-    auto rows_written = write_json(original, out_path.string());
+    auto rows_written = ibex::ext::json::write(original, out_path.string());
     REQUIRE(rows_written == 2);
 
-    auto reread = read_json(out_path.string());
+    auto reread = ibex::ext::json::read(out_path.string());
     REQUIRE(reread.rows() == 2);
     const auto* prices = std::get_if<ibex::Column<std::int64_t>>(reread.find("price"));
     REQUIRE(prices != nullptr);
@@ -238,10 +238,10 @@ TEST_CASE("Write JSON - double column round-trip") {
     table.add_column("y", ibex::Column<double>({0.5, 3.0}));
 
     auto out_path = tmp("ibex_test_json_write_double.json");
-    auto rows_written = write_json(table, out_path.string());
+    auto rows_written = ibex::ext::json::write(table, out_path.string());
     REQUIRE(rows_written == 2);
 
-    auto reread = read_json(out_path.string());
+    auto reread = ibex::ext::json::read(out_path.string());
     const auto* x = std::get_if<ibex::Column<double>>(reread.find("x"));
     const auto* y = std::get_if<ibex::Column<double>>(reread.find("y"));
     REQUIRE(x != nullptr);
@@ -257,10 +257,10 @@ TEST_CASE("Write JSON - bool column round-trip") {
     table.add_column("flag", ibex::Column<bool>({true, false, true}));
 
     auto out_path = tmp("ibex_test_json_write_bool.json");
-    auto rows_written = write_json(table, out_path.string());
+    auto rows_written = ibex::ext::json::write(table, out_path.string());
     REQUIRE(rows_written == 3);
 
-    auto reread = read_json(out_path.string());
+    auto reread = ibex::ext::json::read(out_path.string());
     const auto* flags = std::get_if<ibex::Column<bool>>(reread.find("flag"));
     REQUIRE(flags != nullptr);
     REQUIRE((*flags)[0] == true);
@@ -275,9 +275,9 @@ TEST_CASE("Write JSON - null values round-trip") {
     table.add_column("val", std::move(col), std::move(validity));
 
     auto out_path = tmp("ibex_test_json_write_null.json");
-    write_json(table, out_path.string());
+    ibex::ext::json::write(table, out_path.string());
 
-    auto reread = read_json(out_path.string());
+    auto reread = ibex::ext::json::read(out_path.string());
     REQUIRE(reread.rows() == 3);
     const auto* vals = std::get_if<ibex::Column<std::int64_t>>(reread.find("val"));
     REQUIRE(vals != nullptr);
@@ -293,7 +293,7 @@ TEST_CASE("Write JSON - empty table writes empty array") {
     table.add_column("a", ibex::Column<std::int64_t>{});
 
     auto out_path = tmp("ibex_test_json_write_empty.json");
-    auto rows_written = write_json(table, out_path.string());
+    auto rows_written = ibex::ext::json::write(table, out_path.string());
     REQUIRE(rows_written == 0);
 
     // File should contain an empty JSON array.
@@ -309,10 +309,10 @@ TEST_CASE("Write JSON - CSV to JSON cross-format round-trip") {
     table.add_column("score", ibex::Column<std::int64_t>({95, 87}));
 
     auto out_path = tmp("ibex_test_json_cross.json");
-    auto rows_written = write_json(table, out_path.string());
+    auto rows_written = ibex::ext::json::write(table, out_path.string());
     REQUIRE(rows_written == 2);
 
-    auto reread = read_json(out_path.string());
+    auto reread = ibex::ext::json::read(out_path.string());
     REQUIRE(reread.rows() == 2);
     REQUIRE(get_string_at(reread, "name", 0) == "Smith, John");
     REQUIRE(get_string_at(reread, "name", 1) == "Doe, Jane");
@@ -323,7 +323,7 @@ TEST_CASE("Write JSON - CSV to JSON cross-format round-trip") {
 }
 
 // Both importers must promote a string column to Categorical on the same
-// terms. They drifted once: read_csv used a 10% ratio while the JSON reader
+// terms. They drifted once: csv::read used a 10% ratio while the JSON reader
 // used a 5% ratio capped at 4096 distinct values, so identical data arriving
 // over the two formats landed in different representations — and the two take
 // different join and group-by paths, so it showed up as an unexplained
@@ -360,8 +360,8 @@ TEST_CASE("Categorical promotion agrees between the CSV and JSON readers") {
         write_file(csv_path, csv.c_str());
         write_file(json_path, json.c_str());
 
-        const auto from_csv = read_csv(csv_path.string());
-        const auto from_json = read_json(json_path.string());
+        const auto from_csv = ibex::ext::csv::read(csv_path.string());
+        const auto from_json = ibex::ext::json::read(json_path.string());
         REQUIRE(from_csv.rows() == kRows);
         REQUIRE(from_json.rows() == kRows);
 

@@ -1,5 +1,5 @@
-extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn parquet::write(df: DataFrame, path: String) -> Int from "parquet.hpp";
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
 
 // A join whose build side is small enough to publish an exact key set turns the
 // probe-side Parquet scan into a FUSED KEY SCAN: the key column is filtered
@@ -22,7 +22,7 @@ let fact_base = Table(1300000)[update {
     payload = rep([1, 2, 3, 4, 5, 6, 7], length_out = 1300000)
 }];
 let facts = fact_base[update { fact_key = rank(one, method = first) }];
-write_parquet(facts, "tests/data/parquet_key_scan_facts.parquet");
+parquet::write(facts, "tests/data/parquet_key_scan_facts.parquet");
 
 // 13 keys spread across BOTH row groups: 9 land in row group 0 (key <= 1048576)
 // and 4 in row group 1. A scan that dropped, duplicated or reordered a group
@@ -31,10 +31,10 @@ let dims = Table(13)[update {
     fact_key = rep([1, 100, 50000, 400000, 700000, 900000, 1000000, 1048576, 1048577,
                     1100000, 1200000, 1299999, 1300000], length_out = 13)
 }];
-write_parquet(dims, "tests/data/parquet_key_scan_dims.parquet");
+parquet::write(dims, "tests/data/parquet_key_scan_dims.parquet");
 
-let dim = read_parquet("tests/data/parquet_key_scan_dims.parquet");
-let fact = read_parquet("tests/data/parquet_key_scan_facts.parquet");
+let dim = parquet::read("tests/data/parquet_key_scan_dims.parquet");
+let fact = parquet::read("tests/data/parquet_key_scan_facts.parquet");
 
 // payload is `rep([1..7])` over a rank-ordered key, so payload = ((key - 1) % 7) + 1.
 // Summing it proves the selection carries the right ROWS and not merely the

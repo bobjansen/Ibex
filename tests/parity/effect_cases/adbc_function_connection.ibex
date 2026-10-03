@@ -4,25 +4,25 @@
 // caller's: what it wrote is read back through it.
 import "adbc";
 
-fn opened(uri: String) -> AdbcConnection {
-    adbc_connect("@SQLITE_DRIVER@", uri);
+fn opened(uri: String) -> adbc::Connection {
+    adbc::connect("@SQLITE_DRIVER@", uri);
 }
 
-fn same(c: AdbcConnection) -> AdbcConnection {
+fn same(c: adbc::Connection) -> adbc::Connection {
     c;
 }
 
-fn add_row(mutable conn: AdbcConnection, v: Int) -> Int {
-    adbc_execute(conn, "insert into t values (100)");
+fn add_row(mutable conn: adbc::Connection, v: Int) -> Int {
+    adbc::execute(conn, "insert into t values (100)");
 }
 
-fn add_twice(mutable conn: AdbcConnection) -> Int {
+fn add_twice(mutable conn: adbc::Connection) -> Int {
     add_row(conn, 1);
 }
 
 let db = opened("file:/tmp/ibex_parity_adbc_function_connection.db");
-adbc_execute(db, "create table t (x integer)");
+adbc::execute(db, "create table t (x integer)");
 let kept = same(db);
 let first = add_twice(kept);
 let second = add_row(db, 2);
-adbc_query(kept, "select count(*) as n, sum(x) as total from t");
+adbc::query(kept, "select count(*) as n, sum(x) as total from t");

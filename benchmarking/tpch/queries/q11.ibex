@@ -41,20 +41,20 @@
 //        benchmarking/tpch/queries/q11.ibex
 // ─────────────────────────────────────────────────────────────────────────────
 
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
-extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
+extern fn csv::write(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let partsupp_raw = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet") as DataFrame<{
+let partsupp_raw = parquet::read("benchmarking/data/tpch/parquet/partsupp.parquet") as DataFrame<{
     ps_partkey: Int64,
     ps_suppkey: Int64,
     ps_availqty: Int64,
     ps_supplycost: Float64
 }>;
-let supplier_raw = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet") as DataFrame<{
+let supplier_raw = parquet::read("benchmarking/data/tpch/parquet/supplier.parquet") as DataFrame<{
     s_suppkey: Int64,
     s_nationkey: Int64
 }>;
-let nation_raw = read_parquet("benchmarking/data/tpch/parquet/nation.parquet") as DataFrame<{
+let nation_raw = parquet::read("benchmarking/data/tpch/parquet/nation.parquet") as DataFrame<{
     n_nationkey: Int64,
     n_name: String
 }>;
@@ -79,5 +79,5 @@ cross join q2)[filter value > tmp][
 ][
     order { value desc }
 ];
-write_csv(result, "benchmarking/data/tpch/out/q11.csv");
+csv::write(result, "benchmarking/data/tpch/out/q11.csv");
 result;

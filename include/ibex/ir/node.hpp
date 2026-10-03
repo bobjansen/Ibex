@@ -1216,7 +1216,7 @@ class StreamNode final : public Node {
 
 /// Top-level program node.
 ///
-/// Holds zero or more preamble side-effect calls (e.g. `ws_listen(8765)`) as
+/// Holds zero or more preamble side-effect calls (e.g. `ws::listen(8765)`) as
 /// `ExternCallNode` children emitted before the main expression, plus a single
 /// main child node (the last expression in the program).
 class ProgramNode final : public Node {

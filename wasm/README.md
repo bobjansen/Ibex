@@ -66,5 +66,5 @@ emsdk on every push to `main` and drops `ibex.mjs` / `ibex.wasm` into
 - Wire into `ui/src/main.tsx` behind a build flag so the same UI runs against
   either the local server or the WASM module.
 - Size pass (`-Oz`, `-sSTRICT`, closure) — the spike uses `-O2`.
-- Bundle a few sample CSVs into MEMFS so `read_csv` works offline.
+- Bundle a few sample CSVs into MEMFS so `csv::read` works offline.
 - Run `smoke.mjs` in CI as a build gate.

@@ -47,11 +47,11 @@ TEST_CASE("parse_udp_options understands the malformed policy") {
     CHECK_THROWS(ibex_udp::parse_udp_options("bogus=1"));
 }
 
-// Loopback: udp_send serialises rows to JSON datagrams, udp_recv materialises
+// Loopback: udp::send serialises rows to JSON datagrams, udp::recv materialises
 // them back through the schema string.  Malformed datagrams are skipped and
 // the {"eof":true} sentinel ends the stream after any batched rows.
 
-TEST_CASE("udp_recv: schema-driven batch receive skips malformed and honours eof") {
+TEST_CASE("udp::recv: schema-driven batch receive skips malformed and honours eof") {
     constexpr int kPort = 17968;
     const std::string schema = "ts:timestamp,symbol:str,price:f64,volume:i64";
 

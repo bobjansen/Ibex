@@ -4,7 +4,7 @@
 // Expected input:
 //   benchmarking/results/r_only/<rows>/r_only.tsv
 //
-// Point `read_csv` below at another size, or at the `r_only/<rows>/r_only.tsv`
+// Point `csv::read` below at another size, or at the `r_only/<rows>/r_only.tsv`
 // inside an AWS artifact (benchmarking/aws/run-r-only.sh), to analyse those
 // instead. The artifact's `combined.tsv` carries an extra leading
 // `dataset_rows` column, so filter it to one size before joining on `query`.
@@ -18,7 +18,7 @@
 // samples the wall clock corrupts, but a forward clock step is indistinguishable
 // from a slow run and only inflates, so the minimum is the honest number.
 
-extern fn read_csv(
+extern fn csv::read(
     path: String,
     nulls: String = "",
     delimiter: String = ",",
@@ -26,7 +26,7 @@ extern fn read_csv(
     schema: String = ""
 ) -> DataFrame from "csv.hpp";
 
-let raw = read_csv("benchmarking/results/r_only/8000000/r_only.tsv", "", "\t", true, "");
+let raw = csv::read("benchmarking/results/r_only/8000000/r_only.tsv", "", "\t", true, "");
 
 let ibex = raw[filter framework == "ibex-r"][select { query, ibex_ms = min_ms }];
 let data_table = raw[filter framework == "data.table"][select { query, dt_ms = min_ms }];

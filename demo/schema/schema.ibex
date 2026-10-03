@@ -5,7 +5,7 @@
 // a schema with `as` makes the columns known, so later column references are
 // checked at compile (lowering) time instead of only when rows are evaluated.
 
-// A stand-in for `read_csv("trades.csv")`, with its schema ascribed. `as { ... }`
+// A stand-in for `csv::read("trades.csv")`, with its schema ascribed. `as { ... }`
 // is shorthand for `as DataFrame<{ ... }>`. Exact by default: the table must
 // have *exactly* these columns (a missing column, wrong type, or unlisted extra
 // is an error). Add a `*` (e.g. `as { symbol: String, * }`) to allow extras.

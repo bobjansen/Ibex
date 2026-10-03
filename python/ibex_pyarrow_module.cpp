@@ -119,8 +119,8 @@ auto expand_first_party_imports(ibex::parser::Program program)
 #if defined(IBEX_HAS_PARQUET_BACKEND)
         if (import->name == "parquet") {
             auto declarations = ibex::parser::parse(
-                "extern fn read_parquet(path: String) -> DataFrame from \"parquet.hpp\";"
-                "extern fn write_parquet(df: DataFrame, path: String) -> Int from "
+                "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";"
+                "extern fn parquet::write(df: DataFrame, path: String) -> Int from "
                 "\"parquet.hpp\";");
             if (!declarations.has_value()) {
                 return std::unexpected(declarations.error().format());

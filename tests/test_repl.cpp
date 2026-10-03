@@ -59,18 +59,18 @@ TEST_CASE("REPL loads script with inferred lets") {
     }
 
     ibex::runtime::ExternRegistry registry;
-    registry.register_table("read_csv",
+    registry.register_table("csv::read",
                             [](const ibex::runtime::ExternArgs& args)
                                 -> std::expected<ibex::runtime::ExternValue, std::string> {
                                 if (args.size() != 1) {
-                                    return std::unexpected("read_csv() expects 1 argument");
+                                    return std::unexpected("csv::read() expects 1 argument");
                                 }
                                 const auto* path = std::get_if<std::string>(args.data());
                                 if (path == nullptr) {
-                                    return std::unexpected("read_csv() expects a string path");
+                                    return std::unexpected("csv::read() expects a string path");
                                 }
                                 try {
-                                    return ibex::runtime::ExternValue{read_csv(*path)};
+                                    return ibex::runtime::ExternValue{ibex::ext::csv::read(*path)};
                                 } catch (const std::exception& e) {
                                     return std::unexpected(std::string(e.what()));
                                 }

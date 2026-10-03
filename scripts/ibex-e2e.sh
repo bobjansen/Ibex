@@ -168,7 +168,7 @@ if [[ "$SKIP_REPL" == false ]]; then
         | IBEX_LIBRARY_PATH="$BUILD_DIR/tools" "$BUILD_DIR/tools/ibex" >"$repl_out" 2>&1
     rm -f "$IBEX_ROOT/tests/data/parquet_nulls_check_out.parquet"
     # 26.66667 is mean(i) with the two nulls skipped; reading them back as 0
-    # (which read_parquet used to do, silently) gives 16 instead.
+    # (which parquet::read used to do, silently) gives 16 instead.
     if rg -n "error:" "$repl_out" >/dev/null \
         || ! rg -n "26.66667" "$repl_out" >/dev/null \
         || ! rg -n "\| \"gamma\" \| 1    \| 3.5" "$repl_out" >/dev/null; then
@@ -181,7 +181,7 @@ if [[ "$SKIP_REPL" == false ]]; then
     if command -v uv >/dev/null 2>&1; then
         echo "▸ REPL smoke (parquet plugin, sparse plain-string read across a compressed page boundary)"
         # The fixture needs pyarrow to control encoding, compression, and page
-        # size (see gen_parquet_plain_page_boundary.py); ibex's write_parquet
+        # size (see gen_parquet_plain_page_boundary.py); ibex's parquet::write
         # cannot. Without the emit-per-batch fix, row 1023 silently reads as
         # text-002047 — the reused page decompression buffer's content.
         uv run --project "$IBEX_ROOT" python "$IBEX_ROOT/tests/data/gen_parquet_plain_page_boundary.py" \
@@ -264,7 +264,7 @@ if [[ "$SKIP_REPL" == false ]]; then
     # so this is the only coverage that remap has.
     #
     # Written and read by two different scripts on purpose: only a batch-
-    # eligible script reaches the streaming path, and one with a write_parquet
+    # eligible script reaches the streaming path, and one with a parquet::write
     # side effect is not one. The writer runs first for its file.
     "$BUILD_DIR/tools/ibex_eval" --plugin-path "$BUILD_DIR/tools" \
         "$IBEX_ROOT/tests/data/parquet_categorical_check.ibex" >/dev/null 2>&1
@@ -391,7 +391,7 @@ if [[ "$SKIP_REPL" == false ]]; then
     if command -v uv >/dev/null 2>&1; then
         echo "▸ whole-script (parquet plugin, fused string filter over a nullable column)"
         # The fixture needs pyarrow to write a PLAIN *nullable* string column
-        # over several row groups; write_parquet cannot. Nulls send the fused
+        # over several row groups; parquet::write cannot. Nulls send the fused
         # scan down its level-aware branch, where values arrive compacted and
         # definition levels map them back to rows.
         uv run --project "$IBEX_ROOT" python \
@@ -531,13 +531,13 @@ if [[ "$SKIP_COMPILE" == false ]]; then
     echo "▸ transpile (csv)"
     out_cpp="$(mktemp --suffix=.cpp)"
     "$BUILD_DIR/tools/ibex_compile" "$IBEX_ROOT/tests/data/compile_csv.ibex" -o "$out_cpp"
-    rg -n "read_csv\\(\\\"data/iris.csv\\\"\\)" "$out_cpp" >/dev/null
+    rg -n "csv::read\\(\\\"data/iris.csv\\\"\\)" "$out_cpp" >/dev/null
     rm -f "$out_cpp"
 
     echo "▸ transpile (parquet)"
     out_cpp="$(mktemp --suffix=.cpp)"
     "$BUILD_DIR/tools/ibex_compile" "$IBEX_ROOT/tests/data/compile_parquet.ibex" -o "$out_cpp"
-    rg -n "read_parquet\\(\\\"data/flights-1m.parquet\\\"\\)" "$out_cpp" >/dev/null
+    rg -n "parquet::read\\(\\\"data/flights-1m.parquet\\\"\\)" "$out_cpp" >/dev/null
     rm -f "$out_cpp"
 
     echo "▸ transpile (map clause)"
@@ -549,10 +549,10 @@ if [[ "$SKIP_COMPILE" == false ]]; then
     echo "▸ transpile (scalar() extern argument)"
     out_cpp="$(mktemp --suffix=.cpp)"
     "$BUILD_DIR/tools/ibex_compile" "$IBEX_ROOT/tests/data/compile_scalar_arg.ibex" -o "$out_cpp"
-    rg -n "read_csv\\(ibex::ops::scalar_arg\\(" "$out_cpp" >/dev/null
+    rg -n "csv::read\\(ibex::ops::scalar_arg\\(" "$out_cpp" >/dev/null
     rm -f "$out_cpp"
 
-    echo "▸ transpile + run (parse_args forwards argv)"
+    echo "▸ transpile + run (args::parse forwards argv)"
     pa_cpp="$(mktemp --suffix=.cpp)"
     pa_bin="$(mktemp -u)"
     "$BUILD_DIR/tools/ibex_compile" "$IBEX_ROOT/tests/data/compile_parse_args.ibex" -o "$pa_cpp"
@@ -568,17 +568,17 @@ if [[ "$SKIP_COMPILE" == false ]]; then
     pa_default="$("$pa_bin")"
     pa_cli="$("$pa_bin" --limit 3 --tag hello)"
     if ! grep -q '"base"' <<<"$pa_default" || [[ "$(grep -c '^|' <<<"$pa_default")" -ne 3 ]]; then
-        echo "error: parse_args default run wrong:" >&2; echo "$pa_default" >&2; exit 1
+        echo "error: args::parse default run wrong:" >&2; echo "$pa_default" >&2; exit 1
     fi
     if ! grep -q '"hello"' <<<"$pa_cli" || [[ "$(grep -c '^|' <<<"$pa_cli")" -ne 4 ]]; then
-        echo "error: parse_args argv run wrong:" >&2; echo "$pa_cli" >&2; exit 1
+        echo "error: args::parse argv run wrong:" >&2; echo "$pa_cli" >&2; exit 1
     fi
     rm -f "$pa_cpp" "$pa_bin"
 
     echo "▸ transpile (parquet https)"
     out_cpp="$(mktemp --suffix=.cpp)"
     "$BUILD_DIR/tools/ibex_compile" "$IBEX_ROOT/tests/data/compile_parquet_https.ibex" -o "$out_cpp"
-    rg -n "read_parquet\\(\\\"https://data.example.com/flights-1m.parquet\\\"\\)" "$out_cpp" >/dev/null
+    rg -n "parquet::read\\(\\\"https://data.example.com/flights-1m.parquet\\\"\\)" "$out_cpp" >/dev/null
     rm -f "$out_cpp"
 
     # A connection in a compiled program: built with ibex-build.sh, which links the
@@ -604,7 +604,7 @@ if [[ "$SKIP_COMPILE" == false ]]; then
     echo "▸ transpile (parquet s3)"
     out_cpp="$(mktemp --suffix=.cpp)"
     "$BUILD_DIR/tools/ibex_compile" "$IBEX_ROOT/tests/data/compile_parquet_s3.ibex" -o "$out_cpp"
-    rg -n "read_parquet\\(\\\"s3://market-data/flights-1m.parquet\\?region=us-east-1\\\"\\)" "$out_cpp" >/dev/null
+    rg -n "parquet::read\\(\\\"s3://market-data/flights-1m.parquet\\?region=us-east-1\\\"\\)" "$out_cpp" >/dev/null
     rm -f "$out_cpp"
 fi
 

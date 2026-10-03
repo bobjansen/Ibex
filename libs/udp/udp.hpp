@@ -13,14 +13,14 @@
 //   import "udp";
 //
 //   let ohlc = Stream {
-//       source    = udp_recv(9001, "ts:ts,symbol:str,price:f64,volume:i64"),
+//       source    = udp::recv(9001, "ts:ts,symbol:str,price:f64,volume:i64"),
 //       transform = [resample 1m, select {
 //           open  = first(price),
 //           high  = max(price),
 //           low   = min(price),
 //           close = last(price)
 //       }],
-//       sink = udp_send("127.0.0.1", 9002)
+//       sink = udp::send("127.0.0.1", 9002)
 //   };
 //
 // Options (key=value pairs separated by ';'):
@@ -97,7 +97,7 @@ struct RecvSocket {
     explicit RecvSocket(int port) {
         fd = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (fd < 0) {
-            throw std::runtime_error(std::string("udp_recv: socket: ") + std::strerror(errno));
+            throw std::runtime_error(std::string("udp::recv: socket: ") + std::strerror(errno));
         }
         int reuse = 1;
         ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
@@ -115,7 +115,7 @@ struct RecvSocket {
         if (::bind(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) < 0) {
             ::close(fd);
             fd = -1;
-            throw std::runtime_error(std::string("udp_recv: bind port ") + std::to_string(port) +
+            throw std::runtime_error(std::string("udp::recv: bind port ") + std::to_string(port) +
                                      ": " + std::strerror(errno));
         }
     }
@@ -139,7 +139,7 @@ inline auto get_recv_socket(int port) -> RecvSocket& {
     return *it->second;
 }
 
-// ─── udp_recv ────────────────────────────────────────────────────────────────
+// ─── udp::recv ────────────────────────────────────────────────────────────────
 //
 // Blocks until at least one UDP datagram arrives on `port`, then drains up to
 // kBatch datagrams in a single recvmmsg syscall, parses them, and returns a
@@ -159,7 +159,7 @@ inline auto udp_recv(std::int64_t port, std::string_view schema_spec,
 
     auto schema_result = ibex::plugin::parse_schema(schema_spec);
     if (!schema_result)
-        throw std::runtime_error("udp_recv: " + schema_result.error());
+        throw std::runtime_error("udp::recv: " + schema_result.error());
     const auto& schema = *schema_result;
     const auto options = parse_udp_options(options_spec);
 
@@ -238,7 +238,7 @@ inline auto udp_recv(std::int64_t port, std::string_view schema_spec,
                 nlohmann::json::parse(payload, nullptr, /*allow_exceptions=*/false);
             if (object.is_discarded() || !object.is_object()) {
                 if (options.malformed_error)
-                    throw std::runtime_error("udp_recv: payload is not a JSON object");
+                    throw std::runtime_error("udp::recv: payload is not a JSON object");
                 continue;  // malformed — skip silently
             }
 
@@ -264,13 +264,13 @@ inline auto udp_recv(std::int64_t port, std::string_view schema_spec,
 
         auto table = ibex::plugin::table_from_json_objects(objects, schema);
         if (!table)
-            throw std::runtime_error("udp_recv: " + table.error());
+            throw std::runtime_error("udp::recv: " + table.error());
         sock.pending_eof = saw_eof;
         return std::move(*table);
     }
 }
 
-// ─── udp_send ────────────────────────────────────────────────────────────────
+// ─── udp::send ────────────────────────────────────────────────────────────────
 //
 // Serialises each row of `table` as a JSON object and sends it as a UDP
 // datagram to `host:port`.  Returns the number of rows sent.
@@ -279,7 +279,7 @@ inline auto udp_send(const ibex::runtime::Table& table, std::string_view host, s
     -> std::int64_t {
     int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
-        throw std::runtime_error(std::string("udp_send: socket: ") + std::strerror(errno));
+        throw std::runtime_error(std::string("udp::send: socket: ") + std::strerror(errno));
     }
 
     sockaddr_in addr{};
@@ -287,7 +287,7 @@ inline auto udp_send(const ibex::runtime::Table& table, std::string_view host, s
     addr.sin_port = htons(static_cast<uint16_t>(port));
     if (::inet_pton(AF_INET, std::string(host).c_str(), &addr.sin_addr) <= 0) {
         ::close(fd);
-        throw std::runtime_error("udp_send: invalid host address: " + std::string(host));
+        throw std::runtime_error("udp::send: invalid host address: " + std::string(host));
     }
 
     std::int64_t sent = 0;
@@ -297,7 +297,7 @@ inline auto udp_send(const ibex::runtime::Table& table, std::string_view host, s
         auto json = ibex::plugin::table_row_to_json(table, row);
         if (!json) {
             ::close(fd);
-            throw std::runtime_error("udp_send: " + json.error());
+            throw std::runtime_error("udp::send: " + json.error());
         }
         json->push_back('\n');
 
@@ -312,8 +312,19 @@ inline auto udp_send(const ibex::runtime::Table& table, std::string_view host, s
 
 }  // namespace ibex_udp
 
-// ─── Global aliases ───────────────────────────────────────────────────────────
-// Expose plugin functions without namespace qualification so that ibex_compile-
-// generated code can call them by their extern fn name directly.
-using ibex_udp::udp_recv;
-using ibex_udp::udp_send;
+// ─── Entry points ─────────────────────────────────────────────────────────────
+// What ibex_compile-generated code calls: Ibex's `udp::recv` is
+// `ibex::ext::udp::recv`.
+namespace ibex::ext::udp {
+
+inline auto recv(std::int64_t port, std::string_view schema_spec,
+                 std::string_view options_spec = {}) -> ibex::runtime::Table {
+    return ibex_udp::udp_recv(port, schema_spec, options_spec);
+}
+
+inline auto send(const ibex::runtime::Table& table, std::string_view host, std::int64_t port)
+    -> std::int64_t {
+    return ibex_udp::udp_send(table, host, port);
+}
+
+}  // namespace ibex::ext::udp

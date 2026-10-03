@@ -5,7 +5,7 @@
 """TimeFrame benchmark: ibex script vs C++ bench harness.
 
 Each operation is benchmarked by running a .ibex script that:
-  1. Calls data_gen's gen_ticks(rows) once to produce the synthetic table.
+  1. Calls data_gen's gen::ticks(rows) once to produce the synthetic table.
   2. Repeats the query N times (to reach min_seconds of compute).
   3. The per-operation avg_ms is (total_time - data_gen_overhead) / N.
 
@@ -48,7 +48,7 @@ def make_script(rows: int, query_expr: str, repeats: int) -> str:
     header = (
         'import data_gen;\n'
         'seed_rng(42);\n'
-        f'let tf_data = gen_ticks({rows}, "TICK", 100.0, 0.0, 1000.0, 1);\n'
+        f'let tf_data = gen::ticks({rows}, "TICK", 100.0, 0.0, 1000.0, 1);\n'
     )
     body = "\n".join(f"let r = {query_expr};" for _ in range(repeats))
     return header + body + "\n"
@@ -59,7 +59,7 @@ def make_baseline_script(rows: int) -> str:
     return (
         'import data_gen;\n'
         'seed_rng(42);\n'
-        f'let tf_data = gen_ticks({rows}, "TICK", 100.0, 0.0, 1000.0, 1);\n'
+        f'let tf_data = gen::ticks({rows}, "TICK", 100.0, 0.0, 1000.0, 1);\n'
     )
 
 

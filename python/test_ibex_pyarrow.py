@@ -337,9 +337,9 @@ def main() -> int:
 
     from_csv = ibex_pyarrow.eval_table(
         f"""
-        extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+        extern fn csv::read(path: String) -> DataFrame from "csv.hpp";
 
-        read_csv("{iris_csv}")[select total = count()];
+        csv::read("{iris_csv}")[select total = count()];
         """,
         plugin_paths=default_plugin_paths(),
     )
@@ -352,8 +352,8 @@ def main() -> int:
     define_result = ibex_pyarrow.session_eval_table(
         session,
         f"""
-        extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
-        let iris = read_csv("{iris_csv}");
+        extern fn csv::read(path: String) -> DataFrame from "csv.hpp";
+        let iris = csv::read("{iris_csv}");
         """,
     )
     assert define_result is None
@@ -381,36 +381,36 @@ def main() -> int:
     try:
         ibex_pyarrow.eval_table(
             f"""
-            extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+            extern fn csv::read(path: String) -> DataFrame from "csv.hpp";
 
-            read_csv("{missing_csv}")[select total = count()];
+            csv::read("{missing_csv}")[select total = count()];
             """,
             plugin_paths=default_plugin_paths(),
         )
     except RuntimeError as exc:
         message = str(exc)
         assert "ibex_pyarrow runtime error:" in message
-        assert "read_csv: file not found:" in message
+        assert "csv::read: file not found:" in message
         assert str(missing_csv) in message
     else:
-        raise AssertionError("expected plugin-backed read_csv() to fail for a missing CSV path")
+        raise AssertionError("expected plugin-backed csv::read() to fail for a missing CSV path")
 
     try:
         ibex_pyarrow.eval_table(
             f"""
-            extern fn read_json(path: String) -> DataFrame from "json.hpp";
+            extern fn json::read(path: String) -> DataFrame from "json.hpp";
 
-            read_json("{missing_json}")[select total = count()];
+            json::read("{missing_json}")[select total = count()];
             """,
             plugin_paths=default_plugin_paths(),
         )
     except RuntimeError as exc:
         message = str(exc)
         assert "ibex_pyarrow runtime error:" in message
-        assert "read_json: file not found:" in message
+        assert "json::read: file not found:" in message
         assert str(missing_json) in message
     else:
-        raise AssertionError("expected plugin-backed read_json() to fail for a missing JSON path")
+        raise AssertionError("expected plugin-backed json::read() to fail for a missing JSON path")
 
     if plugin_available("parquet"):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -421,7 +421,7 @@ def main() -> int:
                 parquet_session,
                 f"""
                 import "parquet";
-                read_parquet("{parquet_path}")[select total = count()];
+                parquet::read("{parquet_path}")[select total = count()];
                 """,
             )
             assert parquet_result.to_pydict() == {"total": [3]}
@@ -431,17 +431,17 @@ def main() -> int:
                 f"""
                 import "parquet";
 
-                read_parquet("{missing_parquet}")[select total = count()];
+                parquet::read("{missing_parquet}")[select total = count()];
                 """
             )
         except RuntimeError as exc:
             message = str(exc)
             assert "ibex_pyarrow runtime error:" in message
-            assert "read_parquet: file not found:" in message
+            assert "parquet::read: file not found:" in message
             assert str(missing_parquet) in message
         else:
             raise AssertionError(
-                "expected built-in read_parquet() to fail for a missing Parquet path"
+                "expected built-in parquet::read() to fail for a missing Parquet path"
             )
 
     return 0

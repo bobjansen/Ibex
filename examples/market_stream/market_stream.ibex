@@ -33,9 +33,9 @@ import "udp";
 // DataFrame (tick_sender.py sends {"eof":true} as the last packet).
 
 let ohlc_stream = Stream {
-    // Source: udp_recv(port, schema) returns a batch of ticks per call
+    // Source: udp::recv(port, schema) returns a batch of ticks per call
     // (blocks until data arrives); the schema maps JSON fields to columns.
-    source    = udp_recv(9001, "ts:ts,symbol:str,price:f64,volume:i64"),
+    source    = udp::recv(9001, "ts:ts,symbol:str,price:f64,volume:i64"),
 
     // Transform: anonymous block applied to the accumulated per-minute buffer.
     // Identical to batch usage — no stream-specific syntax needed.
@@ -46,7 +46,7 @@ let ohlc_stream = Stream {
         close = last(price)
     }],
 
-    // Sink: udp_send(df, host, port) — the output Table is prepended by the
+    // Sink: udp::send(df, host, port) — the output Table is prepended by the
     // stream runtime; host and port are the extra scalar arguments.
-    sink = udp_send("127.0.0.1", 9002)
+    sink = udp::send("127.0.0.1", 9002)
 };

@@ -238,7 +238,7 @@ auto gen_reference(const std::string& symbols) -> runtime::Table {
     }
 
     // Dimension-table string columns are Categorical: `symbol` so its type
-    // matches `gen_ticks`'s join key, and the rest so that gathering them across
+    // matches `gen::ticks`'s join key, and the rest so that gathering them across
     // a join to a large fact table copies dictionary codes rather than strings.
     Column<Categorical> symbol_col;
     Column<Categorical> name_col;
@@ -295,9 +295,9 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
     const ibex::runtime::RngBridge rng = registry->rng();
 
     registry->register_table(
-        "gen_ticks", [rng](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
+        "gen::ticks", [rng](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
             if (args.size() != 6) {
-                return std::unexpected("gen_ticks() expects 6 arguments");
+                return std::unexpected("gen::ticks() expects 6 arguments");
             }
             return ExternValue{ibex::data_gen::gen_ticks(rng, arg_int(args, 0), arg_string(args, 1),
                                                          arg_double(args, 2), arg_double(args, 3),
@@ -305,44 +305,44 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
         });
 
     registry->register_table(
-        "gen_walk", [rng](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
+        "gen::walk", [rng](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
             if (args.size() != 3) {
-                return std::unexpected("gen_walk() expects 3 arguments");
+                return std::unexpected("gen::walk() expects 3 arguments");
             }
             return ExternValue{ibex::data_gen::gen_walk(rng, arg_int(args, 0), arg_double(args, 1),
                                                         arg_double(args, 2))};
         });
 
     registry->register_table(
-        "gen_normal", [rng](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
+        "gen::normal", [rng](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
             if (args.size() != 3) {
-                return std::unexpected("gen_normal() expects 3 arguments");
+                return std::unexpected("gen::normal() expects 3 arguments");
             }
             return ExternValue{ibex::data_gen::gen_normal(
                 rng, arg_int(args, 0), arg_double(args, 1), arg_double(args, 2))};
         });
 
     registry->register_table(
-        "gen_uniform", [rng](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
+        "gen::uniform", [rng](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
             if (args.size() != 3) {
-                return std::unexpected("gen_uniform() expects 3 arguments");
+                return std::unexpected("gen::uniform() expects 3 arguments");
             }
             return ExternValue{ibex::data_gen::gen_uniform(
                 rng, arg_int(args, 0), arg_double(args, 1), arg_double(args, 2))};
         });
 
     registry->register_table(
-        "gen_ids", [](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
+        "gen::ids", [](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
             if (args.size() != 2) {
-                return std::unexpected("gen_ids() expects 2 arguments");
+                return std::unexpected("gen::ids() expects 2 arguments");
             }
             return ExternValue{ibex::data_gen::gen_ids(arg_int(args, 0), arg_string(args, 1))};
         });
 
     registry->register_table(
-        "gen_reference", [](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
+        "gen::reference", [](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
             if (args.size() != 1) {
-                return std::unexpected("gen_reference() expects 1 argument");
+                return std::unexpected("gen::reference() expects 1 argument");
             }
             return ExternValue{ibex::data_gen::gen_reference(arg_string(args, 0))};
         });

@@ -147,7 +147,7 @@ def parse(stderr: str) -> tuple[dict[str, float], list[dict]]:
     """The LAST statement's summary plus every operator row in the run.
 
     A query file is several statements (the `let` binds, then the query, then
-    write_csv); the profile prints one summary per statement. Only statements
+    csv::write); the profile prints one summary per statement. Only statements
     that did work carry rows, and rows are attributed to the summary that
     follows them, so rows are collected across the whole run and the summary
     taken from the widest window.

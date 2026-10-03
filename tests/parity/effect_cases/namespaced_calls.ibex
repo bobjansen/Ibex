@@ -2,7 +2,10 @@
 // script and from a function in the script's own namespace. The transpiled
 // program calls `ibex::ext::fs::list`; the interpreter, the plugin's `fs::list`.
 import "csv";
-import "fs";
+// Declared here rather than imported: fs.ibex also imports parquet, whose
+// header the parity build does not have.
+extern fn fs::list(dir: String, pattern: String = "*", recursive: Bool = false)
+    -> DataFrame from "fs.hpp";
 
 namespace parity {
     fn csv_names(dir: String) -> DataFrame {
@@ -10,8 +13,8 @@ namespace parity {
     }
 }
 
-write_csv(Table { x = [1] }, "/tmp/ibex_parity_namespaced_calls_a.csv");
-write_csv(Table { x = [2, 3] }, "/tmp/ibex_parity_namespaced_calls_b.csv");
+csv::write(Table { x = [1] }, "/tmp/ibex_parity_namespaced_calls_a.csv");
+csv::write(Table { x = [2, 3] }, "/tmp/ibex_parity_namespaced_calls_b.csv");
 using fs;
 let listed = list("/tmp", "ibex_parity_namespaced_calls_*.csv")[select { name, ext }];
 parity::csv_names("/tmp") join listed on name;

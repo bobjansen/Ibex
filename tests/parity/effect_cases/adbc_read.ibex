@@ -1,5 +1,5 @@
-// `adbc_read` in a compiled program: the ADBC client library behind the plugin is
+// `adbc::read` in a compiled program: the ADBC client library behind the plugin is
 // linked into the transpiled binary and reads the same rows as the interpreter.
 import "adbc";
-let t = adbc_read("@SQLITE_DRIVER@", "", "select 1 as x union all select 2 union all select 3");
+let t = adbc::read("@SQLITE_DRIVER@", "", "select 1 as x union all select 2 union all select 3");
 t[select { total = sum(x) }];

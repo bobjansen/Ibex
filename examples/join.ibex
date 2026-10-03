@@ -2,8 +2,8 @@
 
 import "csv";
 
-let iris = read_csv("data/iris.csv");
-let species_meta = read_csv("data/iris.csv");
+let iris = csv::read("data/iris.csv");
+let species_meta = csv::read("data/iris.csv");
 
 // Each result is truncated to 10 rows on display.
 

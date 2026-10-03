@@ -2,7 +2,7 @@
 // ordering work together in a compiled program.
 import "adbc";
 import "csv";
-let rows = adbc_read("@SQLITE_DRIVER@", "", "select 4 as x union all select 5 union all select 6");
-write_csv(rows, "/tmp/ibex_parity_adbc_read_sink.csv");
-let back = read_csv("/tmp/ibex_parity_adbc_read_sink.csv");
+let rows = adbc::read("@SQLITE_DRIVER@", "", "select 4 as x union all select 5 union all select 6");
+csv::write(rows, "/tmp/ibex_parity_adbc_read_sink.csv");
+let back = csv::read("/tmp/ibex_parity_adbc_read_sink.csv");
 back[select { total = sum(x) }];

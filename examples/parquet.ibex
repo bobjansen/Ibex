@@ -1,4 +1,4 @@
 import "parquet";
 
-let flights = read_parquet("data/flights-1m.parquet");
+let flights = parquet::read("data/flights-1m.parquet");
 flights;

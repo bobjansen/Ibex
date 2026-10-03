@@ -145,7 +145,7 @@ Owner: `table_properties.hpp`.
   materialized (`decode-fusion`, stage 1).
 * The extern chunked-source **contract** (stable schema, ownership/lifetime,
   dictionary expectations, EOF/error signalling) is the one source contract
-  still documented only by its implementations (`read_csv`, ADBC, Parquet);
+  still documented only by its implementations (`csv::read`, ADBC, Parquet);
   writing it down is Phase 2 contract work alongside the kernel APIs
   (tracked from the removed chunked-execution-plan).
 

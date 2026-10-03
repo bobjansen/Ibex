@@ -1,4 +1,4 @@
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
 
 // Regression check for sparse plain-string reads across compressed page
 // boundaries. The fixture (see gen_parquet_plain_page_boundary.py) puts a
@@ -10,5 +10,5 @@ extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 // reader that holds row 1023's descriptor across that read prints
 // text-002047 (the reused buffer's content) instead of text-001023 — same
 // row count, no error, wrong value.
-let t = read_parquet("tests/data/parquet_plain_page_boundary_out.parquet");
+let t = parquet::read("tests/data/parquet_plain_page_boundary_out.parquet");
 t[filter id >= 1023 && id <= 1024];

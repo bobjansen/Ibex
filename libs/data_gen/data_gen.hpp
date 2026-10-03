@@ -9,7 +9,7 @@
 // directory on IBEX_LIBRARY_PATH so the Ibex REPL can load it via:
 //
 //   import data_gen;
-//   let ticks = gen_ticks(1000);
+//   let ticks = gen::ticks(1000);
 //
 // All generators draw through ExternRegistry::rng() (see RngBridge in
 // extern_registry.hpp) rather than calling ibex::runtime::fill_* directly:
@@ -58,7 +58,7 @@ auto gen_ids(std::int64_t n, const std::string& prefix) -> runtime::Table;
 /// Static reference/master data, one row per distinct symbol in `symbols` (a
 /// comma-separated list, e.g. "AAPL,MSFT,GOOG"). Columns: symbol, name,
 /// sector, currency, lot_size, tick_size. Deterministic: a given symbol
-/// always maps to the same row, so it joins cleanly against `gen_ticks`
+/// always maps to the same row, so it joins cleanly against `gen::ticks`
 /// output on `symbol` regardless of RNG seed.
 auto gen_reference(const std::string& symbols) -> runtime::Table;
 

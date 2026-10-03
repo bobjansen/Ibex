@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Ibex | Connections and Resources</title>
-  <meta name="description" content="Reusable database connections in Ibex: extern type resources, adbc_connect, adbc_query, adbc_close, discovery, transactions, functions that take or return connections, and lifetime rules." />
+  <meta name="description" content="Reusable database connections in Ibex: extern type resources, adbc::connect, adbc::query, adbc::close, discovery, transactions, functions that take or return connections, and lifetime rules." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
@@ -49,7 +49,7 @@
     <h2>One connection, many queries</h2>
     <div class="grid-2">
       <article class="card">
-        <h3><code>adbc_read</code>: one-off reads</h3>
+        <h3><code>adbc::read</code>: one-off reads</h3>
         <p>
           Opens a connection, runs one query, reads the result and closes the
           connection. Each call starts fresh: nothing one call creates on the
@@ -57,33 +57,33 @@
         </p>
       </article>
       <article class="card">
-        <h3><code>adbc_connect</code>: a reusable connection</h3>
+        <h3><code>adbc::connect</code>: a reusable connection</h3>
         <p>
           Opens a connection that stays open until it is closed or its last
-          binding goes away. <code>adbc_query</code> runs a query on it and
-          returns a table, <code>adbc_execute</code> runs a statement,
-          <code>adbc_write</code> writes a table into the database,
-          <code>adbc_begin</code> / <code>adbc_commit</code> /
-          <code>adbc_rollback</code> group them into a transaction, and
-          <code>adbc_close</code> closes it.
+          binding goes away. <code>adbc::query</code> runs a query on it and
+          returns a table, <code>adbc::execute</code> runs a statement,
+          <code>adbc::write</code> writes a table into the database,
+          <code>adbc::begin</code> / <code>adbc::commit</code> /
+          <code>adbc::rollback</code> group them into a transaction, and
+          <code>adbc::close</code> closes it.
         </p>
       </article>
     </div>
 <pre><code><span class="kw">import</span> <span class="str">"adbc"</span>;
 
-<span class="kw">let</span> db = <span class="fn-name">adbc_connect</span>(<span class="str">"sqlite"</span>, <span class="str">":memory:"</span>);
-<span class="fn-name">adbc_execute</span>(db, <span class="str">"create table trades (symbol text, qty integer, px real)"</span>);
-<span class="fn-name">adbc_execute</span>(db, <span class="str">"insert into trades values ('AAPL', 10, 150.0), ('MSFT', 5, 300.0)"</span>);
+<span class="kw">let</span> db = <span class="fn-name">adbc::connect</span>(<span class="str">"sqlite"</span>, <span class="str">":memory:"</span>);
+<span class="fn-name">adbc::execute</span>(db, <span class="str">"create table trades (symbol text, qty integer, px real)"</span>);
+<span class="fn-name">adbc::execute</span>(db, <span class="str">"insert into trades values ('AAPL', 10, 150.0), ('MSFT', 5, 300.0)"</span>);
 
 <span class="cm">// A query result is an ordinary table operand.</span>
-<span class="kw">let</span> notional = <span class="fn-name">adbc_query</span>(db, <span class="str">"select symbol, qty, px from trades"</span>)[
+<span class="kw">let</span> notional = <span class="fn-name">adbc::query</span>(db, <span class="str">"select symbol, qty, px from trades"</span>)[
     <span class="kw">select</span> { notional = <span class="fn-name">sum</span>(qty * px) }, <span class="kw">by</span> symbol
 ];
 
 <span class="cm">// Write an Ibex table back: create, append, replace or create_append.</span>
-<span class="fn-name">adbc_write</span>(db, notional, <span class="str">"notional"</span>);
+<span class="fn-name">adbc::write</span>(db, notional, <span class="str">"notional"</span>);
 
-<span class="fn-name">adbc_close</span>(db);   <span class="cm">// 1 the first time, 0 after</span></code></pre>
+<span class="fn-name">adbc::close</span>(db);   <span class="cm">// 1 the first time, 0 after</span></code></pre>
     <p class="note">
       <code>examples/adbc_connection.ibex</code> is a runnable version, including
       the functions below. Install the SQLite driver once with
@@ -95,39 +95,39 @@
   <section class="section">
     <p class="section-label">The API</p>
     <h2>What <code>import "adbc"</code> declares</h2>
-<pre><code><span class="kw">extern</span> <span class="kw">type</span> AdbcConnection <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
+<pre><code><span class="kw">extern</span> <span class="kw">type</span> adbc::Connection <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
 
-<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_connect</span>(driver: String, uri: String, options: String = <span class="str">""</span>)
-    -&gt; AdbcConnection <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
-<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_query</span>(<span class="kw">mutable</span> db: AdbcConnection, sql: String,
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc::connect</span>(driver: String, uri: String, options: String = <span class="str">""</span>)
+    -&gt; adbc::Connection <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc::query</span>(<span class="kw">mutable</span> db: adbc::Connection, sql: String,
                      params: DataFrame = Table {}) -&gt; DataFrame
     <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
-<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_execute</span>(<span class="kw">mutable</span> db: AdbcConnection, sql: String,
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc::execute</span>(<span class="kw">mutable</span> db: adbc::Connection, sql: String,
                        params: DataFrame = Table {}) -&gt; Int
     <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
-<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_write</span>(<span class="kw">mutable</span> db: AdbcConnection, df: DataFrame, table: String,
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc::write</span>(<span class="kw">mutable</span> db: adbc::Connection, df: DataFrame, table: String,
                      mode: String = <span class="str">"create"</span>) -&gt; Int <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
-<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_tables</span>(<span class="kw">mutable</span> db: AdbcConnection) -&gt; DataFrame <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
-<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_table_schema</span>(<span class="kw">mutable</span> db: AdbcConnection, table: String,
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc::tables</span>(<span class="kw">mutable</span> db: adbc::Connection) -&gt; DataFrame <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc::table_schema</span>(<span class="kw">mutable</span> db: adbc::Connection, table: String,
                             schema: String = <span class="str">""</span>, catalog: String = <span class="str">""</span>) -&gt; DataFrame
     <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
-<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_begin</span>(<span class="kw">mutable</span> db: AdbcConnection) -&gt; Int <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
-<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_commit</span>(<span class="kw">mutable</span> db: AdbcConnection) -&gt; Int <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
-<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_rollback</span>(<span class="kw">mutable</span> db: AdbcConnection) -&gt; Int <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
-<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc_close</span>(<span class="kw">mutable</span> db: AdbcConnection) -&gt; Int <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;</code></pre>
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc::begin</span>(<span class="kw">mutable</span> db: adbc::Connection) -&gt; Int <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc::commit</span>(<span class="kw">mutable</span> db: adbc::Connection) -&gt; Int <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc::rollback</span>(<span class="kw">mutable</span> db: adbc::Connection) -&gt; Int <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">adbc::close</span>(<span class="kw">mutable</span> db: adbc::Connection) -&gt; Int <span class="kw">from</span> <span class="str">"adbc.hpp"</span>;</code></pre>
     <table class="repl-table">
       <tbody>
-        <tr><td><code>adbc_connect(driver, uri, options)</code></td><td>Open a connection. <code>driver</code> and <code>options</code> work as for <code>adbc_read</code>; <code>stmt.</code> options apply to every query on the connection.</td></tr>
-        <tr><td><code>adbc_query(db, sql, params)</code></td><td>Run SQL on the connection and return the result as a table.</td></tr>
-        <tr><td><code>adbc_execute(db, sql, params)</code></td><td>Run a statement that returns no rows (DDL, <code>insert</code>, <code>update</code>, <code>delete</code>). Returns the affected-row count, or <code>-1</code> when the driver reports none.</td></tr>
-        <tr><td><code>params</code></td><td>Optional. A table whose columns bind, by position, to the statement's placeholders in the driver's syntax (<code>?</code> for SQLite and MySQL, <code>$1</code> for PostgreSQL). The statement is prepared once and runs once per row: a query's results follow one another in row order, and <code>adbc_execute</code> returns the summed count. A table with no rows runs nothing. SQLite rejects a column count that does not match the placeholders; PostgreSQL ignores extra columns. DuckDB's driver binds one row per execution, so there Ibex runs the rows one by one itself, with the same result.</td></tr>
-        <tr><td><code>adbc_write(db, df, table, mode)</code></td><td>Bulk-insert <code>df</code> into <code>table</code> and return the rows written. <code>mode</code>: <code>create</code> (default; the table must not exist), <code>append</code>, <code>replace</code> or <code>create_append</code>. <code>df</code> is any table expression, but a connection call in it must be bound with <code>let</code> first.</td></tr>
-        <tr><td><code>adbc_tables(db)</code></td><td>The tables and views the connection sees: one row each, with <code>catalog</code>, <code>schema</code>, <code>table</code> and <code>type</code>. See <a href="#discovery">Discovery</a>.</td></tr>
-        <tr><td><code>adbc_table_schema(db, table, schema, catalog)</code></td><td>One row per column of <code>table</code>, without running your query: <code>column</code>, <code>arrow_type</code>, <code>ibex_type</code>, <code>nullable</code> and <code>reason</code>. An empty <code>schema</code> or <code>catalog</code> (the default) means the driver's default.</td></tr>
-        <tr><td><code>adbc_begin(db)</code></td><td>Start a transaction; returns <code>1</code>. An error when one is already open: transactions do not nest.</td></tr>
-        <tr><td><code>adbc_commit(db)</code></td><td>Commit the transaction and return to autocommit; returns <code>1</code>. An error when none is open, and when a statement in it failed: then the transaction is rolled back instead (see <a href="#transactions">Transactions</a>).</td></tr>
-        <tr><td><code>adbc_rollback(db)</code></td><td>Discard the transaction and return to autocommit. Returns <code>1</code>, or <code>0</code> when none was open.</td></tr>
-        <tr><td><code>adbc_close(db)</code></td><td>Close the connection for every binding of it. Returns <code>1</code> the first time and <code>0</code> after; a query on a closed connection is an error.</td></tr>
+        <tr><td><code>adbc::connect(driver, uri, options)</code></td><td>Open a connection. <code>driver</code> and <code>options</code> work as for <code>adbc::read</code>; <code>stmt.</code> options apply to every query on the connection.</td></tr>
+        <tr><td><code>adbc::query(db, sql, params)</code></td><td>Run SQL on the connection and return the result as a table.</td></tr>
+        <tr><td><code>adbc::execute(db, sql, params)</code></td><td>Run a statement that returns no rows (DDL, <code>insert</code>, <code>update</code>, <code>delete</code>). Returns the affected-row count, or <code>-1</code> when the driver reports none.</td></tr>
+        <tr><td><code>params</code></td><td>Optional. A table whose columns bind, by position, to the statement's placeholders in the driver's syntax (<code>?</code> for SQLite and MySQL, <code>$1</code> for PostgreSQL). The statement is prepared once and runs once per row: a query's results follow one another in row order, and <code>adbc::execute</code> returns the summed count. A table with no rows runs nothing. SQLite rejects a column count that does not match the placeholders; PostgreSQL ignores extra columns. DuckDB's driver binds one row per execution, so there Ibex runs the rows one by one itself, with the same result.</td></tr>
+        <tr><td><code>adbc::write(db, df, table, mode)</code></td><td>Bulk-insert <code>df</code> into <code>table</code> and return the rows written. <code>mode</code>: <code>create</code> (default; the table must not exist), <code>append</code>, <code>replace</code> or <code>create_append</code>. <code>df</code> is any table expression, but a connection call in it must be bound with <code>let</code> first.</td></tr>
+        <tr><td><code>adbc::tables(db)</code></td><td>The tables and views the connection sees: one row each, with <code>catalog</code>, <code>schema</code>, <code>table</code> and <code>type</code>. See <a href="#discovery">Discovery</a>.</td></tr>
+        <tr><td><code>adbc::table_schema(db, table, schema, catalog)</code></td><td>One row per column of <code>table</code>, without running your query: <code>column</code>, <code>arrow_type</code>, <code>ibex_type</code>, <code>nullable</code> and <code>reason</code>. An empty <code>schema</code> or <code>catalog</code> (the default) means the driver's default.</td></tr>
+        <tr><td><code>adbc::begin(db)</code></td><td>Start a transaction; returns <code>1</code>. An error when one is already open: transactions do not nest.</td></tr>
+        <tr><td><code>adbc::commit(db)</code></td><td>Commit the transaction and return to autocommit; returns <code>1</code>. An error when none is open, and when a statement in it failed: then the transaction is rolled back instead (see <a href="#transactions">Transactions</a>).</td></tr>
+        <tr><td><code>adbc::rollback(db)</code></td><td>Discard the transaction and return to autocommit. Returns <code>1</code>, or <code>0</code> when none was open.</td></tr>
+        <tr><td><code>adbc::close(db)</code></td><td>Close the connection for every binding of it. Returns <code>1</code> the first time and <code>0</code> after; a query on a closed connection is an error.</td></tr>
       </tbody>
     </table>
     <p>
@@ -145,17 +145,17 @@
     <div class="grid-2">
       <article class="card">
         <h3>Aliases share one connection</h3>
-<pre><code><span class="kw">let</span> db = <span class="fn-name">adbc_connect</span>(<span class="str">"sqlite"</span>, <span class="str">":memory:"</span>);
+<pre><code><span class="kw">let</span> db = <span class="fn-name">adbc::connect</span>(<span class="str">"sqlite"</span>, <span class="str">":memory:"</span>);
 <span class="kw">let</span> alias = db;          <span class="cm">// same connection</span>
-<span class="fn-name">adbc_close</span>(alias);       <span class="cm">// 1</span>
-<span class="fn-name">adbc_close</span>(db);          <span class="cm">// 0: already closed</span></code></pre>
+<span class="fn-name">adbc::close</span>(alias);       <span class="cm">// 1</span>
+<span class="fn-name">adbc::close</span>(db);          <span class="cm">// 0: already closed</span></code></pre>
       </article>
       <article class="card">
         <h3>The last binding closes it</h3>
         <p>
           A connection lives while any binding holds it. Rebinding the last
           name to something else, or ending the session or script, releases it
-          without an explicit <code>adbc_close</code>. A failed rebinding
+          without an explicit <code>adbc::close</code>. A failed rebinding
           (<code>let db = no_such_table;</code>) keeps the old connection.
         </p>
         <p>
@@ -173,11 +173,11 @@
       Both return ordinary tables, so they can be filtered, ordered and joined
       like any other.
     </p>
-<pre><code><span class="fn-name">adbc_tables</span>(db)[<span class="kw">filter</span> schema == <span class="str">"public"</span>, <span class="kw">order</span> table];
-<span class="fn-name">adbc_table_schema</span>(db, <span class="str">"events"</span>)[<span class="kw">filter</span> ibex_type <span class="kw">is</span> <span class="kw">null</span>];</code></pre>
+<pre><code><span class="fn-name">adbc::tables</span>(db)[<span class="kw">filter</span> schema == <span class="str">"public"</span>, <span class="kw">order</span> table];
+<span class="fn-name">adbc::table_schema</span>(db, <span class="str">"events"</span>)[<span class="kw">filter</span> ibex_type <span class="kw">is</span> <span class="kw">null</span>];</code></pre>
     <div class="grid-2">
       <article class="card">
-        <h3><code>adbc_tables</code></h3>
+        <h3><code>adbc::tables</code></h3>
         <p>
           One row per table and view, as the driver reports them. SQLite has
           catalogs (<code>main</code>, <code>temp</code>, attached databases)
@@ -188,7 +188,7 @@
         </p>
       </article>
       <article class="card">
-        <h3><code>adbc_table_schema</code></h3>
+        <h3><code>adbc::table_schema</code></h3>
         <p>
           <code>ibex_type</code> is the type a query would give the column,
           decided by the same importer queries use (<code>Int64</code>,
@@ -227,48 +227,48 @@
     <h2>All of the statements, or none</h2>
     <p class="section-sub">
       A connection runs in autocommit: each statement is kept as soon as it
-      has run. Between <code>adbc_begin</code> and <code>adbc_commit</code>,
+      has run. Between <code>adbc::begin</code> and <code>adbc::commit</code>,
       queries, statements and writes on the connection are one transaction.
       Other connections see none of it until the commit, and
-      <code>adbc_rollback</code> discards it.
+      <code>adbc::rollback</code> discards it.
     </p>
-<pre><code><span class="kw">fn</span> <span class="fn-name">reload</span>(<span class="kw">mutable</span> db: AdbcConnection, rows: DataFrame) -&gt; Int {
-    <span class="fn-name">adbc_begin</span>(db);
-    <span class="fn-name">adbc_execute</span>(db, <span class="str">"delete from positions"</span>);
-    <span class="fn-name">adbc_write</span>(db, rows, <span class="str">"positions"</span>, <span class="str">"append"</span>);
-    <span class="fn-name">adbc_commit</span>(db);
+<pre><code><span class="kw">fn</span> <span class="fn-name">reload</span>(<span class="kw">mutable</span> db: adbc::Connection, rows: DataFrame) -&gt; Int {
+    <span class="fn-name">adbc::begin</span>(db);
+    <span class="fn-name">adbc::execute</span>(db, <span class="str">"delete from positions"</span>);
+    <span class="fn-name">adbc::write</span>(db, rows, <span class="str">"positions"</span>, <span class="str">"append"</span>);
+    <span class="fn-name">adbc::commit</span>(db);
 }</code></pre>
     <div class="grid-2">
       <article class="card">
         <h3>A failure dooms the transaction</h3>
         <p>
           When any query, statement or write in a transaction fails,
-          <code>adbc_commit</code> rolls the transaction back and reports an
+          <code>adbc::commit</code> rolls the transaction back and reports an
           error; nothing is committed. PostgreSQL behaves this way on its own
           (and would report the <code>COMMIT</code> as a success); SQLite
           and MySQL would keep the statements that worked. Ibex applies the rule on every
           driver, so a script means the same everywhere. A failure before
-          <code>adbc_begin</code> does not count.
+          <code>adbc::begin</code> does not count.
         </p>
       </article>
       <article class="card">
         <h3>Closing never commits</h3>
         <p>
-          <code>adbc_close</code>, the last binding going away, or the end of
+          <code>adbc::close</code>, the last binding going away, or the end of
           the session or script rolls back an open transaction. A script that
           stops on an error inside a function like <code>reload</code> leaves
           the transaction open on the caller's connection until one of those,
-          or an explicit <code>adbc_rollback</code>. The
+          or an explicit <code>adbc::rollback</code>. The
           <code>adbc.connection.autocommit</code> option is refused unless it
-          is <code>true</code>: use <code>adbc_begin</code>.
+          is <code>true</code>: use <code>adbc::begin</code>.
         </p>
       </article>
     </div>
     <p>
       MySQL commits the open transaction whenever it creates, alters or drops
       a table, and goes on in autocommit. Ibex cannot see that in SQL passed
-      to <code>adbc_execute</code>, so keep DDL out of a MySQL transaction;
-      <code>adbc_write</code> refuses its <code>create</code>,
+      to <code>adbc::execute</code>, so keep DDL out of a MySQL transaction;
+      <code>adbc::write</code> refuses its <code>create</code>,
       <code>replace</code> and <code>create_append</code> modes there.
     </p>
   </section>
@@ -285,8 +285,8 @@
     <div class="grid-2">
       <article class="card">
         <h3>Take the caller's connection</h3>
-<pre><code><span class="kw">fn</span> <span class="fn-name">positions</span>(<span class="kw">mutable</span> conn: AdbcConnection) -&gt; DataFrame {
-    <span class="fn-name">adbc_query</span>(conn, <span class="str">"select symbol, sum(qty) as qty
+<pre><code><span class="kw">fn</span> <span class="fn-name">positions</span>(<span class="kw">mutable</span> conn: adbc::Connection) -&gt; DataFrame {
+    <span class="fn-name">adbc::query</span>(conn, <span class="str">"select symbol, sum(qty) as qty
                       from trades group by symbol"</span>);
 }
 
@@ -300,8 +300,8 @@
       <article class="card">
         <h3>Open one locally</h3>
 <pre><code><span class="kw">fn</span> <span class="fn-name">table_count</span>(uri: String) -&gt; DataFrame {
-    <span class="kw">let</span> scratch = <span class="fn-name">adbc_connect</span>(<span class="str">"sqlite"</span>, uri);
-    <span class="fn-name">adbc_query</span>(scratch, <span class="str">"select count(*) as n
+    <span class="kw">let</span> scratch = <span class="fn-name">adbc::connect</span>(<span class="str">"sqlite"</span>, uri);
+    <span class="fn-name">adbc::query</span>(scratch, <span class="str">"select count(*) as n
                          from sqlite_master"</span>);
 }</code></pre>
         <p>
@@ -312,8 +312,8 @@
       </article>
       <article class="card">
         <h3>Return a connection</h3>
-<pre><code><span class="kw">fn</span> <span class="fn-name">open_warehouse</span>(user: String) -&gt; AdbcConnection {
-    <span class="fn-name">adbc_connect</span>(<span class="str">"postgresql"</span>,
+<pre><code><span class="kw">fn</span> <span class="fn-name">open_warehouse</span>(user: String) -&gt; adbc::Connection {
+    <span class="fn-name">adbc::connect</span>(<span class="str">"postgresql"</span>,
                  <span class="str">"postgresql://${user}@warehouse/prod"</span>);
 }
 
@@ -326,10 +326,10 @@
       </article>
       <article class="card">
         <h3>Pass it explicitly</h3>
-<pre><code><span class="kw">let</span> db = <span class="fn-name">adbc_connect</span>(<span class="str">"sqlite"</span>, <span class="str">":memory:"</span>);
+<pre><code><span class="kw">let</span> db = <span class="fn-name">adbc::connect</span>(<span class="str">"sqlite"</span>, <span class="str">":memory:"</span>);
 
 <span class="kw">fn</span> <span class="fn-name">broken</span>() -&gt; DataFrame {
-    <span class="fn-name">adbc_query</span>(db, <span class="str">"select 1 as x"</span>);
+    <span class="fn-name">adbc::query</span>(db, <span class="str">"select 1 as x"</span>);
 }
 <span class="fn-name">broken</span>();
 <span class="cm">// error: function 'broken' uses resource 'db', which is</span>
@@ -353,9 +353,9 @@
     </p>
     <table class="repl-table">
       <tbody>
-        <tr><td><code>let t = adbc_query(db, "...");</code></td><td>As a statement's value.</td></tr>
-        <tr><td><code>adbc_query(db, "...")[filter x &gt; 1]</code></td><td>As a table operand: the base of a block or a side of a join.</td></tr>
-        <tr><td><code>adbc_query(adbc_connect(...), "...")</code></td><td>As an argument of another call. A connection opened this way is closed at the end of the statement.</td></tr>
+        <tr><td><code>let t = adbc::query(db, "...");</code></td><td>As a statement's value.</td></tr>
+        <tr><td><code>adbc::query(db, "...")[filter x &gt; 1]</code></td><td>As a table operand: the base of a block or a side of a join.</td></tr>
+        <tr><td><code>adbc::query(adbc::connect(...), "...")</code></td><td>As an argument of another call. A connection opened this way is closed at the end of the statement.</td></tr>
       </tbody>
     </table>
     <p>
@@ -367,8 +367,8 @@
       functions run, so a misplaced call never half-executes:
     </p>
 <pre><code><span class="kw">fn</span> <span class="fn-name">remote_count</span>(uri: String) -&gt; Int {
-    <span class="kw">let</span> db = <span class="fn-name">adbc_connect</span>(<span class="str">"sqlite"</span>, uri);
-    <span class="fn-name">scalar</span>(<span class="fn-name">adbc_query</span>(db, <span class="str">"select count(*) as n from trades"</span>), <span class="str">"n"</span>);
+    <span class="kw">let</span> db = <span class="fn-name">adbc::connect</span>(<span class="str">"sqlite"</span>, uri);
+    <span class="fn-name">scalar</span>(<span class="fn-name">adbc::query</span>(db, <span class="str">"select count(*) as n from trades"</span>), <span class="str">"n"</span>);
 }
 
 trades[<span class="kw">update</span> { n = <span class="fn-name">remote_count</span>(uri) }];   <span class="cm">// rejected</span>
@@ -377,7 +377,7 @@ trades[<span class="kw">update</span> { n = <span class="fn-name">remote_count</
 trades[<span class="kw">update</span> { n = ^n }];</code></pre>
     <p class="note">
       A query result is read in full before the statement uses it: a table
-      operand from <code>adbc_query</code> is a materialized table, not a
+      operand from <code>adbc::query</code> is a materialized table, not a
       stream from the database. Push filters and aggregations into the SQL
       when the result would be large.
     </p>
@@ -395,12 +395,12 @@ trades[<span class="kw">update</span> { n = ^n }];</code></pre>
         <tr><td>Rebinding or shadowing a name</td><td>The new value is evaluated first; on success the old connection loses that owner, on failure it is kept.</td></tr>
         <tr><td>Unbound temporary</td><td>Released at the end of its statement.</td></tr>
         <tr><td>REPL session or script</td><td>Top-level bindings are released when the session or script ends.</td></tr>
-        <tr><td><code>adbc_close(db)</code></td><td>Closes the connection for every owner at once; later queries on any alias fail.</td></tr>
+        <tr><td><code>adbc::close(db)</code></td><td>Closes the connection for every owner at once; later queries on any alias fail.</td></tr>
       </tbody>
     </table>
     <p>
       Release never commits anything on its own: there is no transaction API
-      yet, so each <code>adbc_query</code> runs in the driver's default
+      yet, so each <code>adbc::query</code> runs in the driver's default
       (usually autocommit) mode.
     </p>
   </section>
@@ -412,7 +412,7 @@ trades[<span class="kw">update</span> { n = ^n }];</code></pre>
       <article class="card">
         <h3>Language and tools</h3>
         <ul>
-          <li><code>ibex_compile</code> compiles connections (<code>let db = adbc_connect(...)</code>, aliases, <code>adbc_execute</code> / <code>adbc_query</code> / transactions on it, releasing one by rebinding the name) and functions that take, open or return one. In such a function the last statement must be a table, a connection name, or a call, and a scalar <code>let</code> in its body is not supported yet; a function sees the program's constants but not its tables or connections.</li>
+          <li><code>ibex_compile</code> compiles connections (<code>let db = adbc::connect(...)</code>, aliases, <code>adbc::execute</code> / <code>adbc::query</code> / transactions on it, releasing one by rebinding the name) and functions that take, open or return one. In such a function the last statement must be a table, a connection name, or a call, and a scalar <code>let</code> in its body is not supported yet; a function sees the program's constants but not its tables or connections.</li>
           <li>Scripts that call resource functions run statement by statement rather than through the whole-script planner.</li>
           <li>No resource-typed <code>let</code> annotations, columns, or default parameter values.</li>
           <li><code>mutable</code> on a resource parameter documents intent but is not enforced.</li>

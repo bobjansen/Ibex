@@ -1036,7 +1036,7 @@ class ExternArgs;
 
 /// Invoke an extern whose first argument is a table. The scalar result, if
 /// any, is intentionally discarded: this API is the execution seam for
-/// top-level script effects such as write_csv and write_parquet.
+/// top-level script effects such as csv::write and parquet::write.
 [[nodiscard]] auto invoke_table_consumer(const ExternRegistry& externs, const std::string& callee,
                                          const Table& input, const ExternArgs& args)
     -> std::expected<void, std::string>;

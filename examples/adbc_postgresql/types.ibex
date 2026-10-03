@@ -4,7 +4,7 @@
 import "adbc";
 import "args";
 
-let args = parse_args("
+let args = args::parse("
     driver (d) : string?
     uri        : string?
 ");
@@ -18,17 +18,17 @@ let uri = coalesce(scalar(args[filter name == "uri", select { value }]),
 //    widens to Float64, uuid becomes its canonical text, timestamps become
 //    nanoseconds, timestamptz arrives in UTC. Row 3 is all NULL apart from id
 //    and label.
-adbc_read(driver, uri,
+adbc::read(driver, uri,
     "select id, small_n, int_n, big_n, dbl, real_n, flag, label, code, uid, day, ts, tstz
      from ibex_types order by id");
 
 // 2. The driver hands numeric and jsonb over as text.
-adbc_read(driver, uri, "select id, price, doc from ibex_types order by id");
+adbc::read(driver, uri, "select id, price, doc from ibex_types order by id");
 
 // 3. Convert the driver's numeric text exactly, then aggregate in Ibex.
-adbc_read(driver, uri, "select label, price from ibex_types order by id")
+adbc::read(driver, uri, "select label, price from ibex_types order by id")
     [update { price = Decimal(price, 12, 2) }]
     [select { rows = count(), priced = count(price), total = sum(price) }, by label, order label];
 
 // 4. A query with no matching rows keeps its columns and types.
-adbc_read(driver, uri, "select id, big_n, tstz from ibex_types where false");
+adbc::read(driver, uri, "select id, big_n, tstz from ibex_types where false");

@@ -8,7 +8,7 @@
 // script declares:
 //
 //   import "adbc";
-//   let df = adbc_read("adbc_driver_sqlite", "", "select 1 as x");
+//   let df = adbc::read("adbc_driver_sqlite", "", "select 1 as x");
 //
 // The ADBC client itself is the `ibex_adbc` library (adbc_client.hpp); this file
 // turns the REPL's `ExternArgs` into calls on it and its results into
@@ -73,15 +73,15 @@ auto connection_arg(const ExternArgs& args) -> Connection {
 auto adbc_read_source(const ExternArgs& args)
     -> std::expected<ibex::runtime::OperatorPtr, std::string> {
     if (args.size() != 3 && args.size() != 4) {
-        return std::unexpected("adbc_read() expects 3 or 4 string arguments");
+        return std::unexpected("adbc::read() expects 3 or 4 string arguments");
     }
     const auto* driver = string_arg(args, 0);
     const auto* uri = string_arg(args, 1);
     const auto* sql = string_arg(args, 2);
     if (driver == nullptr || uri == nullptr || sql == nullptr) {
-        return std::unexpected("adbc_read(driver, uri, sql[, options]) expects string arguments");
+        return std::unexpected("adbc::read(driver, uri, sql[, options]) expects string arguments");
     }
-    auto options = options_arg(args, 3, "adbc_read(driver, uri, sql, options)");
+    auto options = options_arg(args, 3, "adbc::read(driver, uri, sql, options)");
     if (!options) {
         return std::unexpected(options.error());
     }
@@ -99,14 +99,14 @@ auto adbc_read(const ExternArgs& args) -> std::expected<ExternValue, std::string
 
 auto adbc_connect(const ExternArgs& args) -> std::expected<ExternValue, std::string> {
     if (args.size() != 2 && args.size() != 3) {
-        return std::unexpected("adbc_connect(driver, uri[, options]) expects 2 or 3 arguments");
+        return std::unexpected("adbc::connect(driver, uri[, options]) expects 2 or 3 arguments");
     }
     const auto* driver = string_arg(args, 0);
     const auto* uri = string_arg(args, 1);
     if (driver == nullptr || uri == nullptr) {
-        return std::unexpected("adbc_connect(driver, uri[, options]) expects string arguments");
+        return std::unexpected("adbc::connect(driver, uri[, options]) expects string arguments");
     }
-    auto options = options_arg(args, 2, "adbc_connect(driver, uri, options)");
+    auto options = options_arg(args, 2, "adbc::connect(driver, uri, options)");
     if (!options) {
         return std::unexpected(options.error());
     }
@@ -117,7 +117,7 @@ auto adbc_connect(const ExternArgs& args) -> std::expected<ExternValue, std::str
     return ExternValue{connection->resource()};
 }
 
-/// The arguments of `adbc_query` and `adbc_execute`: `(db, sql[, params])`.
+/// The arguments of `adbc::query` and `adbc::execute`: `(db, sql[, params])`.
 struct SqlCall {
     Connection db;
     const std::string* sql = nullptr;
@@ -137,7 +137,7 @@ auto sql_call(const ExternArgs& args, std::string_view usage)
 
 auto adbc_query(const ExternArgs& args) -> std::expected<ExternValue, std::string> {
     auto call = sql_call(args,
-                         "adbc_query(db, sql[, params]) expects a string query and a "
+                         "adbc::query(db, sql[, params]) expects a string query and a "
                          "parameter table");
     if (!call) {
         return std::unexpected(call.error());
@@ -147,7 +147,7 @@ auto adbc_query(const ExternArgs& args) -> std::expected<ExternValue, std::strin
 
 auto adbc_execute(const ExternArgs& args) -> std::expected<ExternValue, std::string> {
     auto call = sql_call(args,
-                         "adbc_execute(db, sql[, params]) expects a string statement and "
+                         "adbc::execute(db, sql[, params]) expects a string statement and "
                          "a parameter table");
     if (!call) {
         return std::unexpected(call.error());
@@ -156,7 +156,7 @@ auto adbc_execute(const ExternArgs& args) -> std::expected<ExternValue, std::str
 }
 
 auto adbc_write(const ExternArgs& args) -> std::expected<ExternValue, std::string> {
-    constexpr std::string_view kUsage = "adbc_write(db, df, table, mode)";
+    constexpr std::string_view kUsage = "adbc::write(db, df, table, mode)";
     const auto table = args.size() == 4 ? args.table(1) : nullptr;
     const auto* target = args.size() == 4 ? string_arg(args, 2) : nullptr;
     const auto* mode = args.size() == 4 ? string_arg(args, 3) : nullptr;
@@ -169,7 +169,7 @@ auto adbc_write(const ExternArgs& args) -> std::expected<ExternValue, std::strin
 
 auto adbc_tables(const ExternArgs& args) -> std::expected<ExternValue, std::string> {
     if (args.size() != 1) {
-        return std::unexpected("adbc_tables(db) expects one argument");
+        return std::unexpected("adbc::tables(db) expects one argument");
     }
     return wrap(ibex::adbc::tables(connection_arg(args)));
 }
@@ -183,13 +183,13 @@ auto adbc_table_schema(const ExternArgs& args) -> std::expected<ExternValue, std
     const auto* catalog = string_at(3);
     if (table == nullptr || db_schema == nullptr || catalog == nullptr) {
         return std::unexpected(
-            "adbc_table_schema(db, table, schema, catalog) expects a connection and three "
+            "adbc::table_schema(db, table, schema, catalog) expects a connection and three "
             "strings");
     }
     return wrap(ibex::adbc::table_schema(connection_arg(args), *table, *db_schema, *catalog));
 }
 
-/// `adbc_begin`, `adbc_commit`, `adbc_rollback` and `adbc_close` take the
+/// `adbc::begin`, `adbc::commit`, `adbc::rollback` and `adbc::close` take the
 /// connection and nothing else.
 template <typename Fn>
 auto connection_only(const ExternArgs& args, std::string_view function, Fn&& fn)
@@ -201,35 +201,35 @@ auto connection_only(const ExternArgs& args, std::string_view function, Fn&& fn)
 }
 
 auto adbc_begin(const ExternArgs& args) -> std::expected<ExternValue, std::string> {
-    return connection_only(args, "adbc_begin", ibex::adbc::begin);
+    return connection_only(args, "adbc::begin", ibex::adbc::begin);
 }
 
 auto adbc_commit(const ExternArgs& args) -> std::expected<ExternValue, std::string> {
-    return connection_only(args, "adbc_commit", ibex::adbc::commit);
+    return connection_only(args, "adbc::commit", ibex::adbc::commit);
 }
 
 auto adbc_rollback(const ExternArgs& args) -> std::expected<ExternValue, std::string> {
-    return connection_only(args, "adbc_rollback", ibex::adbc::rollback);
+    return connection_only(args, "adbc::rollback", ibex::adbc::rollback);
 }
 
 auto adbc_close(const ExternArgs& args) -> std::expected<ExternValue, std::string> {
-    return connection_only(args, "adbc_close", ibex::adbc::close);
+    return connection_only(args, "adbc::close", ibex::adbc::close);
 }
 
 }  // namespace
 
 extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* registry) {
-    registry->register_table("adbc_read", adbc_read);
-    registry->register_chunked_table("adbc_read", adbc_read_source);
+    registry->register_table("adbc::read", adbc_read);
+    registry->register_chunked_table("adbc::read", adbc_read_source);
 
-    registry->register_resource("adbc_connect", adbc_connect);
-    registry->register_table("adbc_query", adbc_query);
-    registry->register_scalar("adbc_execute", ibex::runtime::ScalarKind::Int, adbc_execute);
-    registry->register_scalar("adbc_write", ibex::runtime::ScalarKind::Int, adbc_write);
-    registry->register_table("adbc_tables", adbc_tables);
-    registry->register_table("adbc_table_schema", adbc_table_schema);
-    registry->register_scalar("adbc_begin", ibex::runtime::ScalarKind::Int, adbc_begin);
-    registry->register_scalar("adbc_commit", ibex::runtime::ScalarKind::Int, adbc_commit);
-    registry->register_scalar("adbc_rollback", ibex::runtime::ScalarKind::Int, adbc_rollback);
-    registry->register_scalar("adbc_close", ibex::runtime::ScalarKind::Int, adbc_close);
+    registry->register_resource("adbc::connect", adbc_connect);
+    registry->register_table("adbc::query", adbc_query);
+    registry->register_scalar("adbc::execute", ibex::runtime::ScalarKind::Int, adbc_execute);
+    registry->register_scalar("adbc::write", ibex::runtime::ScalarKind::Int, adbc_write);
+    registry->register_table("adbc::tables", adbc_tables);
+    registry->register_table("adbc::table_schema", adbc_table_schema);
+    registry->register_scalar("adbc::begin", ibex::runtime::ScalarKind::Int, adbc_begin);
+    registry->register_scalar("adbc::commit", ibex::runtime::ScalarKind::Int, adbc_commit);
+    registry->register_scalar("adbc::rollback", ibex::runtime::ScalarKind::Int, adbc_rollback);
+    registry->register_scalar("adbc::close", ibex::runtime::ScalarKind::Int, adbc_close);
 }

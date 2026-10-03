@@ -377,7 +377,7 @@ auto build_column_with_validity(R_xlen_t size, PushFn&& push)
 /// Bind an R character vector as a Categorical column.
 ///
 /// Every other Ibex frontend already hands string columns over dictionary
-/// encoded -- `read_csv` and the Parquet reader both produce Categorical -- so
+/// encoded -- `csv::read` and the Parquet reader both produce Categorical -- so
 /// binding R's character vector as a String column made the R path the only
 /// one whose group-by, distinct and sort hashed text per row. On 8M rows and
 /// 252 distinct symbols that was 100ms against 3ms for the same query over the

@@ -136,7 +136,7 @@ bench_three <- function(name, data_table_fn, dplyr_fn, ibex_fn) {
 session <- create_session()
 
 # Hand Ibex its string columns dictionary-encoded, which is the representation
-# every other Ibex frontend already reads them in: `read_csv` and the Parquet
+# every other Ibex frontend already reads them in: `csv::read` and the Parquet
 # reader both produce Categorical, and the website suite's Ibex numbers are
 # measured over exactly that. Leaving them as R `character` made this suite the
 # only place Ibex hashed group keys as text per row -- 100ms against 3ms for

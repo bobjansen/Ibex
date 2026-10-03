@@ -1,9 +1,47 @@
 # Namespaces
 
-Status: **proposed** (2026-10-03, branch `namespaces`). Nothing is built. This
+Status: **implemented** (2026-10-03, branch `namespaces`, phases 1-5). This
 plan says what a namespace is in Ibex, what it replaces, and the order to build
-it in. It is written to be argued with: section "Open questions" lists what the
-design does not settle.
+it in. "As built" below records where the implementation settled the open
+questions or departed from the text.
+
+## As built
+
+- **Open question 1 (`using`):** shipped with the first slice, file- or
+  script-scoped (the interactive REPL and `ReplSession` keep one scope for the
+  session; `:load` and each imported library get their own). Not allowed inside
+  a namespace block.
+- **Open question 4 (C++ mapping):** `a::f` is `ibex::ext::a::f`, a resource
+  type `a::T` is `ibex::ext::a::T` (`codegen::cpp_extern_name`). Not
+  `ibex::a::f`: the headers already use `ibex::csv`, `ibex::adbc`, `ibex::fs`
+  for internals (`ibex::adbc::Connection` is the client class), and a
+  user-declared `namespace ir` / `runtime` would land in the engine's own
+  namespaces. Inside `ibex::ext::parquet` / `ibex::ext::json` a bare
+  `parquet` / `json` names the namespace, so the moved bodies spell Arrow's and
+  nlohmann's as `::parquet` / `::json`.
+- **Qualified declaration names** (not in the plan): `extern fn csv::read(...)`
+  is shorthand for the declaration inside `namespace csv { }`. It is what let
+  the rename pass rewrite the many scripts that declare `extern fn read_csv`
+  explicitly instead of importing.
+- **Resolution** is one AST pass (`parser/names.hpp`) that rewrites a callee to
+  its full name, rather than a lookup at each consumer: the REPL runs it per
+  statement (a `fn` body at its declaration), the whole-script planner and
+  `ibex_compile` over the program. `parse()` already qualifies sibling calls
+  declared in the same source, so the effect pass sees them.
+- **Duplicates:** within one source, a qualified name declared twice is a parse
+  error. Across sources (REPL), redeclaring with the same signature is allowed
+  (importing a library twice); a different signature is an error. Global names
+  keep replace-on-redeclare.
+- **Stub "overloads" folded:** `kafka`, `udp`, `websocket` declared some
+  functions twice (with and without `options`), relying on replace semantics;
+  each is now one declaration with `options: String = ""`. `data_gen.ibex`
+  declared `gen_ids` twice where the second was meant to be `gen_reference`;
+  it now declares `gen::reference`.
+- **C++ helpers kept:** plugin-internal C++ names (`ibex::fs::list_files`,
+  `ibex_udp::udp_recv`, `ibex::data_gen::gen_ticks`, the ADBC plugin's
+  registration handlers) are C++ implementation, not Ibex names, and stay.
+- **`:functions`** already shows qualified names; `:imports` adds the
+  namespaces each source declares into. Completion offers `ns::`.
 
 ## Decisions already made
 

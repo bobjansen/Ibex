@@ -11,21 +11,21 @@
 //
 // Functions:
 //
-//   ws_recv(port, schema[, options])   — WebSocket *server* source: accepts
+//   ws::recv(port, schema[, options])   — WebSocket *server* source: accepts
 //       client connections on `port` and converts each incoming JSON text
 //       message to a one-row DataFrame following `schema`.
-//   ws_connect(url, schema[, options]) — WebSocket *client* source: connects
+//   ws::connect(url, schema[, options]) — WebSocket *client* source: connects
 //       to an external feed at `url` (ws://host[:port][/path]) and converts
 //       each incoming JSON text message the same way.
-//   ws_send(df, port)                  — sink: broadcasts each DataFrame row
+//   ws::send(df, port)                  — sink: broadcasts each DataFrame row
 //       as a JSON text frame to all clients connected on `port`.
-//   ws_listen(port)                    — eagerly binds the listen socket.
+//   ws::listen(port)                    — eagerly binds the listen socket.
 //
 // Options (key=value pairs separated by ';'):
 //   poll_timeout_ms=200       select() window before returning StreamTimeout
 //   on_malformed=skip|error   what to do with messages that fail the schema
 //                             (default: skip)
-//   subscribe=<text>          ws_connect only: text frame sent right after
+//   subscribe=<text>          ws::connect only: text frame sent right after
 //                             the handshake (e.g. an exchange subscribe
 //                             message; must not contain ';')
 //
@@ -37,7 +37,7 @@
 //
 //   // Ingest ticks from an external feed, resample, push to a dashboard.
 //   let ohlc_stream = Stream {
-//       source    = ws_connect("ws://feed.example.com/ticks",
+//       source    = ws::connect("ws://feed.example.com/ticks",
 //                              "ts:timestamp,symbol:str,price:f64,volume:i64"),
 //       transform = [resample 1m, select {
 //           open  = first(price),
@@ -45,10 +45,10 @@
 //           low   = min(price),
 //           close = last(price)
 //       }],
-//       sink = ws_send(8080)
+//       sink = ws::send(8080)
 //   };
 //
-// ws_recv and ws_send share server state for the same port, so a single TCP
+// ws::recv and ws::send share server state for the same port, so a single TCP
 // listen socket serves all connected browser clients.
 
 #pragma once
@@ -352,10 +352,10 @@ inline auto ws_decode_frame(std::string& buf) -> std::optional<WsFrame> {
 struct WsOptions {
     int poll_timeout_ms = 200;
     bool malformed_error = false;  // on_malformed=skip (default) | error
-    std::string subscribe;         // ws_connect only: text frame sent after handshake
+    std::string subscribe;         // ws::connect only: text frame sent after handshake
 };
 
-// Parse the options spec for ws_recv / ws_connect.  Throws on unknown keys.
+// Parse the options spec for ws::recv / ws::connect.  Throws on unknown keys.
 inline auto parse_ws_options(std::string_view spec, bool allow_subscribe) -> WsOptions {
     WsOptions options;
     auto parsed = ibex::plugin::parse_key_value_options(spec);
@@ -488,14 +488,14 @@ inline auto get_server(int port) -> WsServer& {
         throw std::runtime_error(std::string("ws: listen: ") + std::strerror(errno));
     }
 
-    // Non-blocking so accept() in ws_send never stalls.
+    // Non-blocking so accept() in ws::send never stalls.
     ::fcntl(srv->listen_fd, F_SETFL, O_NONBLOCK);
 
     it = g_servers.emplace(port, std::move(srv)).first;
     return *it->second;
 }
 
-// ─── Helpers shared between ws_recv and ws_send ───────────────────────────────
+// ─── Helpers shared between ws::recv and ws::send ───────────────────────────────
 
 // Perform a pending WebSocket upgrade handshake for client `c`.
 // Returns true when the handshake is complete (or already was).
@@ -579,7 +579,7 @@ inline auto service_client_frames(WsClient& c, const std::vector<ibex::plugin::S
     }
 }
 
-// ─── ws_recv ──────────────────────────────────────────────────────────────────
+// ─── ws::recv ──────────────────────────────────────────────────────────────────
 //
 // WebSocket server source.  Listens on `port` for client connections, reads
 // one JSON text message from any connected client, and returns a one-row
@@ -669,7 +669,7 @@ inline auto ws_recv(std::int64_t port, std::string_view schema_spec,
     return StreamTimeout{};
 }
 
-// ─── ws_connect ───────────────────────────────────────────────────────────────
+// ─── ws::connect ───────────────────────────────────────────────────────────────
 //
 // WebSocket client source.  Connects to `url` (ws://host[:port][/path]),
 // performs the client side of the opening handshake, optionally sends a
@@ -687,10 +687,10 @@ struct WsUrl {
 
 inline auto parse_ws_url(std::string_view url) -> WsUrl {
     if (url.starts_with("wss://"))
-        throw std::runtime_error("ws_connect: TLS (wss://) is not supported yet: " +
+        throw std::runtime_error("ws::connect: TLS (wss://) is not supported yet: " +
                                  std::string(url));
     if (!url.starts_with("ws://"))
-        throw std::runtime_error("ws_connect: URL must start with ws://: " + std::string(url));
+        throw std::runtime_error("ws::connect: URL must start with ws://: " + std::string(url));
     url.remove_prefix(std::string_view("ws://").size());
 
     WsUrl parsed;
@@ -707,7 +707,7 @@ inline auto parse_ws_url(std::string_view url) -> WsUrl {
         parsed.port = std::string(authority.substr(colon + 1));
     }
     if (parsed.host.empty())
-        throw std::runtime_error("ws_connect: URL is missing a host: " + std::string(url));
+        throw std::runtime_error("ws::connect: URL is missing a host: " + std::string(url));
     return parsed;
 }
 
@@ -737,7 +737,7 @@ inline void ws_client_connect(WsConnection& conn, const WsUrl& url, const WsOpti
     addrinfo* addrs = nullptr;
     const int rc = ::getaddrinfo(url.host.c_str(), url.port.c_str(), &hints, &addrs);
     if (rc != 0)
-        throw std::runtime_error("ws_connect: resolve " + url.host + ": " + ::gai_strerror(rc));
+        throw std::runtime_error("ws::connect: resolve " + url.host + ": " + ::gai_strerror(rc));
 
     int fd = -1;
     for (const addrinfo* ai = addrs; ai != nullptr; ai = ai->ai_next) {
@@ -755,7 +755,7 @@ inline void ws_client_connect(WsConnection& conn, const WsUrl& url, const WsOpti
     }
     ::freeaddrinfo(addrs);
     if (fd < 0)
-        throw std::runtime_error("ws_connect: cannot connect to " + url.host + ":" + url.port +
+        throw std::runtime_error("ws::connect: cannot connect to " + url.host + ":" + url.port +
                                  ": " + std::strerror(errno));
 
     // ── Opening handshake ─────────────────────────────────────────────────────
@@ -773,7 +773,7 @@ inline void ws_client_connect(WsConnection& conn, const WsUrl& url, const WsOpti
                                 "Sec-WebSocket-Version: 13\r\n\r\n";
     if (::send(fd, request.data(), request.size(), MSG_NOSIGNAL) < 0) {
         ::close(fd);
-        throw std::runtime_error(std::string("ws_connect: handshake send: ") +
+        throw std::runtime_error(std::string("ws::connect: handshake send: ") +
                                  std::strerror(errno));
     }
 
@@ -781,13 +781,13 @@ inline void ws_client_connect(WsConnection& conn, const WsUrl& url, const WsOpti
     while (response.find("\r\n\r\n") == std::string::npos) {
         if (response.size() > 64 * 1024) {
             ::close(fd);
-            throw std::runtime_error("ws_connect: handshake response too large");
+            throw std::runtime_error("ws::connect: handshake response too large");
         }
         char tmp[4096];
         const ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
         if (n <= 0) {
             ::close(fd);
-            throw std::runtime_error("ws_connect: connection closed during handshake");
+            throw std::runtime_error("ws::connect: connection closed during handshake");
         }
         response.append(tmp, static_cast<std::size_t>(n));
     }
@@ -796,13 +796,13 @@ inline void ws_client_connect(WsConnection& conn, const WsUrl& url, const WsOpti
     const std::string_view headers = std::string_view(response).substr(0, header_end + 4);
     if (headers.find(" 101 ") == std::string_view::npos) {
         ::close(fd);
-        throw std::runtime_error("ws_connect: server did not upgrade (no HTTP 101): " +
+        throw std::runtime_error("ws::connect: server did not upgrade (no HTTP 101): " +
                                  std::string(headers.substr(0, headers.find('\r'))));
     }
     const auto accept = extract_http_header(headers, "Sec-WebSocket-Accept");
     if (!accept || *accept != compute_accept_key(key)) {
         ::close(fd);
-        throw std::runtime_error("ws_connect: invalid Sec-WebSocket-Accept in handshake");
+        throw std::runtime_error("ws::connect: invalid Sec-WebSocket-Accept in handshake");
     }
 
     conn.fd = fd;
@@ -812,7 +812,7 @@ inline void ws_client_connect(WsConnection& conn, const WsUrl& url, const WsOpti
     if (!options.subscribe.empty()) {
         const std::string frame = ws_encode_frame(0x1U, options.subscribe, /*masked=*/true);
         if (::send(fd, frame.data(), frame.size(), MSG_NOSIGNAL) < 0)
-            throw std::runtime_error(std::string("ws_connect: subscribe send: ") +
+            throw std::runtime_error(std::string("ws::connect: subscribe send: ") +
                                      std::strerror(errno));
     }
 }
@@ -916,11 +916,11 @@ inline auto ws_connect(std::string_view url, std::string_view schema_spec,
     return StreamTimeout{};
 }
 
-// ─── ws_send ──────────────────────────────────────────────────────────────────
+// ─── ws::send ──────────────────────────────────────────────────────────────────
 //
 // Broadcasts each row of `table` as a JSON WebSocket text frame to all
 // handshaked clients on `port`.  Creates the server if it does not exist yet,
-// so ws_send can be used as a standalone sink without ws_recv.
+// so ws::send can be used as a standalone sink without ws::recv.
 //
 // Non-handshaked clients that have sent their HTTP upgrade request are
 // promoted to the handshaked state on each call so that a client connecting
@@ -964,7 +964,7 @@ inline auto ws_send(const ibex::runtime::Table& table, std::int64_t port) -> std
     for (std::size_t row = 0; row < rows; ++row) {
         auto json = ibex::plugin::table_row_to_json(table, row);
         if (!json)
-            throw std::runtime_error("ws_send: " + json.error());
+            throw std::runtime_error("ws::send: " + json.error());
         const std::string frame = ws_encode_text_frame(*json);
 
         for (auto& c : srv.clients) {
@@ -983,7 +983,7 @@ inline auto ws_send(const ibex::runtime::Table& table, std::int64_t port) -> std
     return sent;
 }
 
-/// ws_listen(port) — eagerly binds the listen socket on `port`.
+/// ws::listen(port) — eagerly binds the listen socket on `port`.
 /// Calling this before the stream loop lets clients connect before the first
 /// bar is emitted.  Returns 0 on success; throws on bind failure.
 inline auto ws_listen(std::int64_t port) -> std::int64_t {
@@ -993,10 +993,27 @@ inline auto ws_listen(std::int64_t port) -> std::int64_t {
 
 }  // namespace ibex_ws
 
-// ─── Global aliases ───────────────────────────────────────────────────────────
-// Expose plugin functions without namespace qualification so that ibex_compile-
-// generated code can call them by their extern fn name directly.
-using ibex_ws::ws_connect;
-using ibex_ws::ws_listen;
-using ibex_ws::ws_recv;
-using ibex_ws::ws_send;
+// ─── Entry points ─────────────────────────────────────────────────────────────
+// What ibex_compile-generated code calls: Ibex's `ws::recv` is
+// `ibex::ext::ws::recv`.
+namespace ibex::ext::ws {
+
+inline auto recv(std::int64_t port, std::string_view schema_spec,
+                 std::string_view options_spec = {}) -> ibex::runtime::ExternValue {
+    return ibex_ws::ws_recv(port, schema_spec, options_spec);
+}
+
+inline auto connect(std::string_view url, std::string_view schema_spec,
+                    std::string_view options_spec = {}) -> ibex::runtime::ExternValue {
+    return ibex_ws::ws_connect(url, schema_spec, options_spec);
+}
+
+inline auto send(const ibex::runtime::Table& table, std::int64_t port) -> std::int64_t {
+    return ibex_ws::ws_send(table, port);
+}
+
+inline auto listen(std::int64_t port) -> std::int64_t {
+    return ibex_ws::ws_listen(port);
+}
+
+}  // namespace ibex::ext::ws

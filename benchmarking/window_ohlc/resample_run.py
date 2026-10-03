@@ -162,11 +162,11 @@ def verify(parquet: Path, tol: float = 1e-9) -> list[str]:
     out = RUN.DATA_DIR / "_verify_resample.parquet"
     script = RUN.DATA_DIR / "_verify_resample.ibex"
     script.write_text(
-        'extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";\n'
-        'extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";\n'
-        f'let t = as_timeframe(read_parquet("{parquet}"), "timestamp");\n'
+        'extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";\n'
+        'extern fn parquet::write(df: DataFrame, path: String) -> Int from "parquet.hpp";\n'
+        f'let t = as_timeframe(parquet::read("{parquet}"), "timestamp");\n'
         f'let r = {IBEX_Q[:-1]};\n'
-        f'write_parquet(r, "{out}");\n')
+        f'parquet::write(r, "{out}");\n')
     proc = subprocess.run([str(RUN.IBEX_BIN), str(script)], capture_output=True, text=True)
     script.unlink(missing_ok=True)
     if proc.returncode != 0:

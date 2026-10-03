@@ -11,7 +11,7 @@
 // with `libibex_adbc.a`.
 //
 // Every function returns the message the plugin has always reported on failure,
-// including its `adbc_execute: ` style prefix.
+// including its `adbc::execute: ` style prefix.
 
 #pragma once
 
@@ -29,7 +29,7 @@
 namespace ibex::adbc {
 
 /// The name the `extern type` declaration in adbc.ibex gives a connection.
-inline constexpr std::string_view kConnectionTypeName = "AdbcConnection";
+inline constexpr std::string_view kConnectionTypeName = "adbc::Connection";
 
 using TablePtr = std::shared_ptr<const runtime::Table>;
 

@@ -190,7 +190,7 @@ using SourceColumnStats = robin_hood::unordered_map<std::string, ColumnStats>;
 /// A table source whose schema is known up front but whose column data is
 /// decoded only when a query asks for it, and cached once decoded.
 ///
-/// This is what turns a `let t = read_parquet(p)` binding into a projection
+/// This is what turns a `let t = parquet::read(p)` binding into a projection
 /// pushdown: binding reads the file's metadata (schema + row count) and nothing
 /// else, then each query decodes just the columns it references. A source that
 /// cannot read columns selectively has no reason to use this — it should keep

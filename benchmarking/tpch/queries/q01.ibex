@@ -12,10 +12,10 @@
 //        benchmarking/tpch/queries/q01.ibex
 // ─────────────────────────────────────────────────────────────────────────────
 
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
-extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
+extern fn csv::write(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
+let lineitem = parquet::read("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
     l_quantity: Int64,
     l_extendedprice: Float64,
     l_discount: Float64,
@@ -40,5 +40,5 @@ let result = lineitem[
     by { l_returnflag, l_linestatus },
     order { l_returnflag, l_linestatus }
 ];
-write_csv(result, "benchmarking/data/tpch/out/q01.csv");
+csv::write(result, "benchmarking/data/tpch/out/q01.csv");
 result;

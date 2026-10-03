@@ -1,5 +1,5 @@
-extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn parquet::write(df: DataFrame, path: String) -> Int from "parquet.hpp";
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
 
 // A `like` over a column the rest of the query never reads is evaluated inside
 // the page decoder (LazyTable::project_where -> string_filter_scan): the text is
@@ -21,9 +21,9 @@ let base = Table(1300000)[update {
 }];
 let rows = base[update { id = rank(one, method = first) }];
 let facts = rows[update { text = `comment ${id} tag${id % 7} end` }];
-write_parquet(facts, "tests/data/parquet_string_filter.parquet");
+parquet::write(facts, "tests/data/parquet_string_filter.parquet");
 
-let fact = read_parquet("tests/data/parquet_string_filter.parquet");
+let fact = parquet::read("tests/data/parquet_string_filter.parquet");
 
 // "tag" occurs once per value, so "%tag3%" matches exactly the rows with
 // id % 7 == 3: ids 3, 10, ..., 1299996, which is 185714 of the 1300000. The

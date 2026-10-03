@@ -9,7 +9,7 @@
 
 import "csv";
 
-let train = read_csv("../kaggle/data/train.csv", "<empty>");
+let train = csv::read("../kaggle/data/train.csv", "<empty>");
 
 // Basic book- and auction-derived features.
 let book = train[update {

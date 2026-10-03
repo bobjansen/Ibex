@@ -1,4 +1,4 @@
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
 
 // Streaming units that span several row groups: see
 // gen_parquet_coalesced_units.py for the file's shape (320 row groups, 64 units
@@ -8,7 +8,7 @@ extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 //
 // One statement per script: in a multi-statement script the scan is decoded
 // whole and never touches a unit.
-let fact = read_parquet("tests/data/parquet_coalesced_units_out.parquet");
+let fact = parquet::read("tests/data/parquet_coalesced_units_out.parquet");
 fact[
     filter like(s, "%needle%") && id >= 12345,
     select { hits = count(), hit_total = sum(id) },

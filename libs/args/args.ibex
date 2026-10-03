@@ -1,3 +1,5 @@
+namespace args {
+
 // Declarative command-line argument parsing.
 //
 // `spec` is a newline- or `;`-separated list of option declarations:
@@ -18,4 +20,6 @@
 // argv comes from the IBEX_ARGS environment variable (one argument per line).
 // Pass a non-empty `argv` (newline- or space-separated) to parse that instead --
 // handy for tests and embedding.
-extern fn parse_args(spec: String, argv: String = "") -> DataFrame from "args.hpp";
+extern fn parse(spec: String, argv: String = "") -> DataFrame from "args.hpp";
+
+}

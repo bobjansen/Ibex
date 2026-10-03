@@ -1,4 +1,4 @@
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
 
-let flights = read_parquet("data/flights-1m.parquet");
+let flights = parquet::read("data/flights-1m.parquet");
 flights[select total = count()];

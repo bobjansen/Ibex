@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
-// Parser for the `options` string of `adbc_read` and `adbc_connect`.
+// Parser for the `options` string of `adbc::read` and `adbc::connect`.
 //
 // Header-only and free of any ADBC dependency so the parsing rules can be
 // tested in builds that do not have a driver manager installed.

@@ -31,10 +31,10 @@
   let currentRows = DEFAULT_ROWS;
 
   const tradesScript = (rows, seed) =>
-    `import data_gen;\nseed_rng(${seed});\nlet trades = gen_ticks(${rows}, "${SYMBOLS}");`;
+    `import data_gen;\nseed_rng(${seed});\nlet trades = gen::ticks(${rows}, "${SYMBOLS}");`;
 
   const seedScript = (rows) =>
-    `${tradesScript(rows, 42)}\nlet reference = gen_reference("${SYMBOLS}");\nlet prices = gen_walk(2000, 100.0, 1.0);`;
+    `${tradesScript(rows, 42)}\nlet reference = gen::reference("${SYMBOLS}");\nlet prices = gen::walk(2000, 100.0, 1.0);`;
 
   const EXAMPLES = [
     ["Aggregate by group", 'trades[select { avg_price = mean(price), total_volume = sum(volume) }, by symbol];'],

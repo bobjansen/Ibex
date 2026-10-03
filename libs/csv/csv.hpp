@@ -15,21 +15,21 @@
 // Ibex CSV library — RFC 4180 compliant CSV reading and writing.
 //
 // Reading:
-//   extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
-//   let df = read_csv("data/myfile.csv");
+//   extern fn csv::read(path: String) -> DataFrame from "csv.hpp";
+//   let df = csv::read("data/myfile.csv");
 // Optional null controls:
-//   extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
-//   let df = read_csv("data/myfile.csv", "<empty>,NA");
+//   extern fn csv::read(path: String, nulls: String) -> DataFrame from "csv.hpp";
+//   let df = csv::read("data/myfile.csv", "<empty>,NA");
 // Optional delimiter and header controls:
-//   extern fn read_csv(path: String, nulls: String, delimiter: String) -> DataFrame from "csv.hpp";
-//   let df = read_csv("data/myfile.csv", "", ";");
-//   extern fn read_csv(path: String, nulls: String, delimiter: String, has_header: Bool)
+//   extern fn csv::read(path: String, nulls: String, delimiter: String) -> DataFrame from
+//   "csv.hpp"; let df = csv::read("data/myfile.csv", "", ";"); extern fn csv::read(path: String,
+//   nulls: String, delimiter: String, has_header: Bool)
 //       -> DataFrame from "csv.hpp";
-//   let df = read_csv("data/myfile.csv", "", ";", false);
+//   let df = csv::read("data/myfile.csv", "", ";", false);
 //
 // Writing:
-//   extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
-//   let rows = write_csv(df, "data/out.csv");
+//   extern fn csv::write(df: DataFrame, path: String) -> Int from "csv.hpp";
+//   let rows = csv::write(df, "data/out.csv");
 //
 // The reader streams the file via mmap (on POSIX) and parses it in a single
 // pass into views over the backing buffer; only fields that contain escaped
@@ -146,7 +146,7 @@ inline auto csv_parse_null_spec(std::string_view spec) -> CsvReadOptions {
 
 inline auto csv_parse_delimiter(std::string_view spec) -> char {
     if (spec.size() != 1) {
-        throw std::runtime_error("read_csv: delimiter must be a single character");
+        throw std::runtime_error("csv::read: delimiter must be a single character");
     }
     return spec.front();
 }
@@ -169,9 +169,9 @@ inline auto csv_parse_column_kind(std::string_view type_str) -> CsvColumnKind {
     }
     if (type_str == "decimal") {
         throw std::runtime_error(
-            "read_csv: decimal needs a precision and scale, e.g. decimal(12,2)");
+            "csv::read: decimal needs a precision and scale, e.g. decimal(12,2)");
     }
-    throw std::runtime_error("read_csv: unknown schema type '" + std::string(type_str) + "'");
+    throw std::runtime_error("csv::read: unknown schema type '" + std::string(type_str) + "'");
 }
 
 /// Parse `decimal(p,s)` (spaces allowed). Returns nullopt for any other type
@@ -181,7 +181,7 @@ inline auto csv_parse_decimal_type(std::string_view type_str) -> std::optional<i
         return std::nullopt;
     }
     const auto fail = [&]() -> std::optional<ibex::DecimalType> {
-        throw std::runtime_error("read_csv: invalid decimal type '" + std::string(type_str) +
+        throw std::runtime_error("csv::read: invalid decimal type '" + std::string(type_str) +
                                  "' (expected decimal(precision, scale) with precision 1..38 "
                                  "and scale 0..precision)");
     };
@@ -289,7 +289,7 @@ class CsvSource {
 #endif
         std::ifstream in(path, std::ios::binary);
         if (!in) {
-            throw std::runtime_error("read_csv: failed to open '" + path + "'");
+            throw std::runtime_error("csv::read: failed to open '" + path + "'");
         }
         in.seekg(0, std::ios::end);
         const auto sz = in.tellg();
@@ -599,9 +599,9 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
                     case CsvColumnKind::Decimal: {
                         auto units = ibex::decimal::parse(sv, col_decimals_[c]);
                         if (!units) {
-                            return std::unexpected("read_csv: column '" + col_names_[c] + "' row " +
-                                                   std::to_string(total_rows_ + rows_read) + ": " +
-                                                   units.error());
+                            return std::unexpected(
+                                "csv::read: column '" + col_names_[c] + "' row " +
+                                std::to_string(total_rows_ + rows_read) + ": " + units.error());
                         }
                         decimal_cols[c].push_back(ibex::Decimal{*units});
                         break;
@@ -609,7 +609,8 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
                     case CsvColumnKind::Int: {
                         std::int64_t iv{};
                         if (!csv_try_int(sv, iv)) {
-                            return std::unexpected("read_csv: column '" + col_names_[c] + "' row " +
+                            return std::unexpected("csv::read: column '" + col_names_[c] +
+                                                   "' row " +
                                                    std::to_string(total_rows_ + rows_read) +
                                                    " failed to parse as i64");
                         }
@@ -619,7 +620,8 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
                     case CsvColumnKind::Double: {
                         double dv{};
                         if (!csv_try_double(sv, dv)) {
-                            return std::unexpected("read_csv: column '" + col_names_[c] + "' row " +
+                            return std::unexpected("csv::read: column '" + col_names_[c] +
+                                                   "' row " +
                                                    std::to_string(total_rows_ + rows_read) +
                                                    " failed to parse as f64");
                         }
@@ -649,7 +651,7 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
                         std::int32_t dv{};
                         if (!csv_try_date(sv, dv)) {
                             return std::unexpected(
-                                "read_csv: column '" + col_names_[c] + "' row " +
+                                "csv::read: column '" + col_names_[c] + "' row " +
                                 std::to_string(total_rows_ + rows_read) +
                                 " failed to parse as date (expected YYYY-MM-DD)");
                         }
@@ -768,19 +770,19 @@ inline auto csv_download_https_to_temp(std::string_view url) -> std::string {
         return curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
     }();
     if (!curl_initialized) {
-        throw std::runtime_error("read_csv: failed to initialize HTTPS client");
+        throw std::runtime_error("csv::read: failed to initialize HTTPS client");
     }
 
     std::error_code ec;
     auto temp_dir = std::filesystem::temp_directory_path(ec);
     if (ec) {
-        throw std::runtime_error("read_csv: failed to locate temp directory: " + ec.message());
+        throw std::runtime_error("csv::read: failed to locate temp directory: " + ec.message());
     }
 
     std::string temp_path;
     std::FILE* fp = csv_open_unique_temp(temp_dir, temp_path);
     if (fp == nullptr) {
-        throw std::runtime_error("read_csv: failed to create temp file in " + temp_dir.string());
+        throw std::runtime_error("csv::read: failed to create temp file in " + temp_dir.string());
     }
 
     bool fp_open = true;
@@ -796,7 +798,7 @@ inline auto csv_download_https_to_temp(std::string_view url) -> std::string {
     CURL* curl = curl_easy_init();
     if (curl == nullptr) {
         cleanup();
-        throw std::runtime_error("read_csv: failed to create HTTPS client");
+        throw std::runtime_error("csv::read: failed to create HTTPS client");
     }
 
     std::string url_string{url};
@@ -836,13 +838,13 @@ inline auto csv_download_https_to_temp(std::string_view url) -> std::string {
         std::filesystem::remove(temp_path, rm_ec);
         const std::string detail =
             error_buffer[0] != '\0' ? error_buffer.data() : curl_easy_strerror(rc);
-        throw std::runtime_error("read_csv: failed to download '" + url_string + "' (" + detail +
+        throw std::runtime_error("csv::read: failed to download '" + url_string + "' (" + detail +
                                  ", HTTP " + std::to_string(response_code) + ")");
     }
     if (close_result != 0) {
         std::error_code rm_ec;
         std::filesystem::remove(temp_path, rm_ec);
-        throw std::runtime_error("read_csv: failed to finish temp download for '" + url_string +
+        throw std::runtime_error("csv::read: failed to finish temp download for '" + url_string +
                                  "'");
     }
     return temp_path;
@@ -888,7 +890,7 @@ inline auto resolve_csv_path(std::string_view path) -> CsvLocalPath {
         return out;
 #else
         throw std::runtime_error(
-            "read_csv: HTTPS URLs are not supported in this build (compiled without libcurl)");
+            "csv::read: HTTPS URLs are not supported in this build (compiled without libcurl)");
 #endif
     }
     out.path.assign(path);
@@ -902,11 +904,11 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
     std::error_code ec;
     const bool exists = std::filesystem::exists(path_string, ec);
     if (ec) {
-        throw std::runtime_error("read_csv: failed to inspect path '" + path_string +
+        throw std::runtime_error("csv::read: failed to inspect path '" + path_string +
                                  "': " + ec.message());
     }
     if (!exists) {
-        throw std::runtime_error("read_csv: file not found: '" + std::string{path} + "'");
+        throw std::runtime_error("csv::read: file not found: '" + std::string{path} + "'");
     }
 
     CsvSource source(path_string);
@@ -1055,7 +1057,7 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                 if (kind == CsvColumnKind::Int) {
                     std::int64_t iv{};
                     if (!csv_try_int(sv, iv)) {
-                        throw std::runtime_error("read_csv: column '" + std::string(name) +
+                        throw std::runtime_error("csv::read: column '" + std::string(name) +
                                                  "' row " + std::to_string(row_index) +
                                                  " failed to parse as i64");
                     }
@@ -1065,7 +1067,7 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                 if (kind == CsvColumnKind::Double) {
                     double dv{};
                     if (!csv_try_double(sv, dv)) {
-                        throw std::runtime_error("read_csv: column '" + std::string(name) +
+                        throw std::runtime_error("csv::read: column '" + std::string(name) +
                                                  "' row " + std::to_string(row_index) +
                                                  " failed to parse as f64");
                     }
@@ -1079,7 +1081,7 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                 if (kind == CsvColumnKind::Date) {
                     std::int32_t dv{};
                     if (!csv_try_date(sv, dv)) {
-                        throw std::runtime_error("read_csv: column '" + std::string(name) +
+                        throw std::runtime_error("csv::read: column '" + std::string(name) +
                                                  "' row " + std::to_string(row_index) +
                                                  " failed to parse as date (expected YYYY-MM-DD)");
                     }
@@ -1089,7 +1091,7 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                 if (kind == CsvColumnKind::Decimal) {
                     auto units = ibex::decimal::parse(sv, decimal_type);
                     if (!units) {
-                        throw std::runtime_error("read_csv: column '" + std::string(name) +
+                        throw std::runtime_error("csv::read: column '" + std::string(name) +
                                                  "' row " + std::to_string(row_index) + ": " +
                                                  units.error());
                     }
@@ -1132,7 +1134,7 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                     case CsvColumnKind::Infer:
                         break;
                 }
-                throw std::runtime_error("read_csv: internal error - unresolved schema hint");
+                throw std::runtime_error("csv::read: internal error - unresolved schema hint");
             }
         };
 
@@ -1230,7 +1232,7 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                     }
                     std::int64_t iv{};
                     if (!csv_try_int(vals[i], iv)) {
-                        throw std::runtime_error("read_csv: column '" + name + "' row " +
+                        throw std::runtime_error("csv::read: column '" + name + "' row " +
                                                  std::to_string(i) + " failed to parse as i64");
                     }
                     col.push_back(iv);
@@ -1252,7 +1254,7 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                     }
                     double dv{};
                     if (!csv_try_double(vals[i], dv)) {
-                        throw std::runtime_error("read_csv: column '" + name + "' row " +
+                        throw std::runtime_error("csv::read: column '" + name + "' row " +
                                                  std::to_string(i) + " failed to parse as f64");
                     }
                     col.push_back(dv);
@@ -1280,7 +1282,7 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                     }
                     auto units = ibex::decimal::parse(vals[i], type);
                     if (!units) {
-                        throw std::runtime_error("read_csv: column '" + name + "' row " +
+                        throw std::runtime_error("csv::read: column '" + name + "' row " +
                                                  std::to_string(i) + ": " + units.error());
                     }
                     col.push_back(ibex::Decimal{*units});
@@ -1302,7 +1304,7 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                     }
                     std::int32_t dv{};
                     if (!csv_try_date(vals[i], dv)) {
-                        throw std::runtime_error("read_csv: column '" + name + "' row " +
+                        throw std::runtime_error("csv::read: column '" + name + "' row " +
                                                  std::to_string(i) +
                                                  " failed to parse as date (expected YYYY-MM-DD)");
                     }
@@ -1533,38 +1535,42 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
 
 }  // namespace ibex::csv::detail
 
-inline auto read_csv(std::string_view path) -> ibex::runtime::Table {
+namespace ibex::ext::csv {
+
+inline auto read(std::string_view path) -> ibex::runtime::Table {
     return ibex::csv::detail::read_csv_with_options(path, ibex::csv::detail::CsvReadOptions{});
 }
 
-inline auto read_csv(std::string_view path, std::string_view null_spec) -> ibex::runtime::Table {
+inline auto read(std::string_view path, std::string_view null_spec) -> ibex::runtime::Table {
     return ibex::csv::detail::read_csv_with_options(
         path, ibex::csv::detail::csv_parse_null_spec(null_spec));
 }
 
-inline auto read_csv(std::string_view path, std::string_view null_spec, std::string_view delimiter)
+inline auto read(std::string_view path, std::string_view null_spec, std::string_view delimiter)
     -> ibex::runtime::Table {
     auto options = ibex::csv::detail::csv_parse_null_spec(null_spec);
     options.delimiter = ibex::csv::detail::csv_parse_delimiter(delimiter);
     return ibex::csv::detail::read_csv_with_options(path, options);
 }
 
-inline auto read_csv(std::string_view path, std::string_view null_spec, std::string_view delimiter,
-                     bool has_header) -> ibex::runtime::Table {
+inline auto read(std::string_view path, std::string_view null_spec, std::string_view delimiter,
+                 bool has_header) -> ibex::runtime::Table {
     auto options = ibex::csv::detail::csv_parse_null_spec(null_spec);
     options.delimiter = ibex::csv::detail::csv_parse_delimiter(delimiter);
     options.has_header = has_header;
     return ibex::csv::detail::read_csv_with_options(path, options);
 }
 
-inline auto read_csv(std::string_view path, std::string_view null_spec, std::string_view delimiter,
-                     bool has_header, std::string_view schema) -> ibex::runtime::Table {
+inline auto read(std::string_view path, std::string_view null_spec, std::string_view delimiter,
+                 bool has_header, std::string_view schema) -> ibex::runtime::Table {
     auto options = ibex::csv::detail::csv_parse_null_spec(null_spec);
     options.delimiter = ibex::csv::detail::csv_parse_delimiter(delimiter);
     options.has_header = has_header;
     options.schema = ibex::csv::detail::csv_parse_schema(schema);
     return ibex::csv::detail::read_csv_with_options(path, options);
 }
+
+}  // namespace ibex::ext::csv
 
 namespace ibex::csv::detail {
 
@@ -1618,7 +1624,7 @@ inline void csv_write_cell(std::ostream& out, const ibex::runtime::ColumnEntry& 
             } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Timestamp>>) {
                 out << col[r].nanos;
             } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Decimal>>) {
-                // Exactly `scale` fractional digits: the text read_csv's
+                // Exactly `scale` fractional digits: the text csv::read's
                 // decimal(p,s) hint parses back to the same units.
                 out << ibex::decimal::to_string(col[r].units,
                                                 ibex::runtime::decimal_type_of(col).scale);
@@ -1629,12 +1635,14 @@ inline void csv_write_cell(std::ostream& out, const ibex::runtime::ColumnEntry& 
 
 }  // namespace ibex::csv::detail
 
+namespace ibex::ext::csv {
+
 /// Write `table` to a CSV file at `path`.
 ///
 /// Returns the number of data rows written (excluding the header line).
 /// Null values are written as empty fields.  String fields containing commas,
 /// double-quotes, or newlines are quoted per RFC 4180.
-inline auto write_csv(const ibex::runtime::Table& table, std::string_view path) -> std::int64_t {
+inline auto write(const ibex::runtime::Table& table, std::string_view path) -> std::int64_t {
     std::string path_str{path};
     if (const std::filesystem::path parent = std::filesystem::path(path_str).parent_path();
         !parent.empty()) {
@@ -1643,7 +1651,7 @@ inline auto write_csv(const ibex::runtime::Table& table, std::string_view path) 
     }
     std::ofstream ofs{path_str};
     if (!ofs) {
-        throw std::runtime_error("write_csv: cannot open for writing: " + path_str);
+        throw std::runtime_error("csv::write: cannot open for writing: " + path_str);
     }
 
     const auto& cols = table.columns;
@@ -1672,8 +1680,10 @@ inline auto write_csv(const ibex::runtime::Table& table, std::string_view path) 
 
     ofs.flush();
     if (!ofs) {
-        throw std::runtime_error("write_csv: I/O error writing: " + path_str);
+        throw std::runtime_error("csv::write: I/O error writing: " + path_str);
     }
 
     return static_cast<std::int64_t>(n_rows);
 }
+
+}  // namespace ibex::ext::csv

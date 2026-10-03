@@ -3,7 +3,7 @@
 # Copyright (C) 2026 Bob Jansen
 
 # compare-plugin-git.sh — A/B two git commits of ibex for a plugin-backed
-# extern function (read_parquet, adbc_read, kafka_recv, ...), on a clean EC2
+# extern function (parquet::read, adbc::read, kafka::recv, ...), on a clean EC2
 # box.
 #
 # The local benchmarking/compare_plugin_git.sh is the tool for this, but a
@@ -14,9 +14,9 @@
 #
 # Why a separate tool from compare-git.sh: ibex_bench (and therefore
 # compare-git.sh) never loads a dynamically-loaded plugin — its "scan mode"
-# hardcodes a direct C++ call to read_csv(), and compare_ibex_git.sh's
+# hardcodes a direct C++ call to csv::read(), and compare_ibex_git.sh's
 # configure_and_build builds with -DIBEX_BUILD_PARQUET=OFF. Neither can
-# exercise read_parquet, adbc_read, or any other plugin-registered extern
+# exercise parquet::read, adbc::read, or any other plugin-registered extern
 # function. This drives the real REPL binary (tools/ibex --plugin-path ...)
 # on the remote box instead, via benchmarking/compare_plugin_git.sh.
 #

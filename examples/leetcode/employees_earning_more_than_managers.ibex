@@ -1,7 +1,7 @@
 import "csv";
 
 let employee =
-    read_csv("examples/leetcode/data/employee_managers.csv",
+    csv::read("examples/leetcode/data/employee_managers.csv",
              nulls = "<empty>",
              schema = "id:int,name:str,salary:int,managerId:int");
 

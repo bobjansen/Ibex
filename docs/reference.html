@@ -43,7 +43,7 @@
     <h2>The shape of an Ibex program</h2>
     <p class="section-sub">Programs bind immutable values, then transform tables with named clauses. Clauses run from left to right inside a table expression.</p>
 <pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
-<span class="kw">let</span> prices = <span class="fn-name">read_csv</span>(<span class="str">"prices.csv"</span>);
+<span class="kw">let</span> prices = <span class="fn-name">csv::read</span>(<span class="str">"prices.csv"</span>);
 
 <span class="kw">let</span> summary = prices[
     <span class="kw">filter</span> volume &gt; <span class="num">0</span>,

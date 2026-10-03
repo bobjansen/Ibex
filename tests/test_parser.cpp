@@ -132,7 +132,7 @@ let label = case { price < 0 => "loss", price == 0 => "flat", else => "gain", };
 
 TEST_CASE("Parse extern declaration with schema types") {
     const char* source =
-        "extern fn read_csv(path: String, schema: DataFrame<{ id: Int64, name: String }>)"
+        "extern fn csv::read(path: String, schema: DataFrame<{ id: Int64, name: String }>)"
         " -> DataFrame<{ id: Int64, name: String }> from \"csv.hpp\";";
 
     auto result = parse(source);
@@ -142,7 +142,7 @@ TEST_CASE("Parse extern declaration with schema types") {
     const auto& stmt = result->statements.front();
     REQUIRE(std::holds_alternative<ExternDecl>(stmt));
     const auto& decl = std::get<ExternDecl>(stmt);
-    REQUIRE(decl.name == "read_csv");
+    REQUIRE(decl.name == "csv::read");
     REQUIRE(decl.params.size() == 2);
     REQUIRE(decl.params[0].name == "path");
     REQUIRE(decl.params[0].type.kind == Type::Kind::Scalar);
@@ -164,9 +164,9 @@ TEST_CASE("Parse extern declaration with schema types") {
 
 TEST_CASE("Parse extern type declaration and resource-typed extern fn") {
     const char* source =
-        "extern type AdbcConnection from \"adbc.hpp\";\n"
-        "extern fn adbc_connect(driver: String) -> AdbcConnection from \"adbc.hpp\";\n"
-        "extern fn adbc_query(mutable db: AdbcConnection, sql: String) -> DataFrame"
+        "extern type adbc::Connection from \"adbc.hpp\";\n"
+        "extern fn adbc::connect(driver: String) -> adbc::Connection from \"adbc.hpp\";\n"
+        "extern fn adbc::query(mutable db: adbc::Connection, sql: String) -> DataFrame"
         " from \"adbc.hpp\";";
 
     auto result = parse(source);
@@ -175,40 +175,40 @@ TEST_CASE("Parse extern type declaration and resource-typed extern fn") {
 
     const auto* type_decl = std::get_if<ExternTypeDecl>(&result->statements[0]);
     REQUIRE(type_decl != nullptr);
-    REQUIRE(type_decl->name == "AdbcConnection");
+    REQUIRE(type_decl->name == "adbc::Connection");
     REQUIRE(type_decl->source_path == "adbc.hpp");
 
     const auto& connect = std::get<ExternDecl>(result->statements[1]);
     REQUIRE(connect.return_type.kind == Type::Kind::Resource);
-    REQUIRE(connect.return_type.resource == "AdbcConnection");
+    REQUIRE(connect.return_type.resource == "adbc::Connection");
 
     const auto& query = std::get<ExternDecl>(result->statements[2]);
     REQUIRE(query.params.size() == 2);
     REQUIRE(query.params[0].type.kind == Type::Kind::Resource);
-    REQUIRE(query.params[0].type.resource == "AdbcConnection");
+    REQUIRE(query.params[0].type.resource == "adbc::Connection");
     REQUIRE(query.params[0].effect == Param::Effect::Mutable);
     REQUIRE(query.return_type.kind == Type::Kind::DataFrame);
 }
 
 TEST_CASE("Resource types are accepted in fn signatures") {
     auto result = parse(
-        "fn f(mutable db: AdbcConnection) -> AdbcConnection { db; }\n"
-        "fn g(db: AdbcConnection, n: Int = 1) -> Int { n; }");
+        "fn f(mutable db: adbc::Connection) -> adbc::Connection { db; }\n"
+        "fn g(db: adbc::Connection, n: Int = 1) -> Int { n; }");
     REQUIRE(result.has_value());
     const auto& f = std::get<FunctionDecl>(result->statements.at(0));
     REQUIRE(f.params.at(0).type.kind == Type::Kind::Resource);
-    REQUIRE(f.params.at(0).type.resource == "AdbcConnection");
+    REQUIRE(f.params.at(0).type.resource == "adbc::Connection");
     REQUIRE(f.params.at(0).effect == Param::Effect::Mutable);
     REQUIRE(f.return_type.kind == Type::Kind::Resource);
-    REQUIRE(f.return_type.resource == "AdbcConnection");
+    REQUIRE(f.return_type.resource == "adbc::Connection");
 }
 
 TEST_CASE("Resource types are rejected outside function signatures") {
-    auto annotated = parse("let db: AdbcConnection = open();");
+    auto annotated = parse("let db: adbc::Connection = open();");
     REQUIRE_FALSE(annotated.has_value());
-    REQUIRE(annotated.error().message.find("unknown type 'AdbcConnection'") != std::string::npos);
+    REQUIRE(annotated.error().message.find("unknown type 'adbc::Connection'") != std::string::npos);
 
-    auto defaulted = parse("fn f(db: AdbcConnection = open()) -> Int { 1; }");
+    auto defaulted = parse("fn f(db: adbc::Connection = open()) -> Int { 1; }");
     REQUIRE_FALSE(defaulted.has_value());
     REQUIRE(defaulted.error().message.find("cannot have a default value") != std::string::npos);
 }
@@ -220,7 +220,7 @@ TEST_CASE("'type' stays an ordinary identifier") {
 }
 
 TEST_CASE("Parse extern declaration with inferred schema") {
-    const char* source = "extern fn read_csv(path: String) -> DataFrame from \"csv.hpp\";";
+    const char* source = "extern fn csv::read(path: String) -> DataFrame from \"csv.hpp\";";
 
     auto result = parse(source);
     REQUIRE(result.has_value());
@@ -229,7 +229,7 @@ TEST_CASE("Parse extern declaration with inferred schema") {
     const auto& stmt = result->statements.front();
     REQUIRE(std::holds_alternative<ExternDecl>(stmt));
     const auto& decl = std::get<ExternDecl>(stmt);
-    REQUIRE(decl.name == "read_csv");
+    REQUIRE(decl.name == "csv::read");
     REQUIRE(decl.return_type.kind == Type::Kind::DataFrame);
     const auto& schema = std::get<SchemaType>(decl.return_type.arg);
     REQUIRE(schema.fields.empty());
@@ -271,7 +271,7 @@ TEST_CASE("Column is not a DSL type alias") {
 
 TEST_CASE("Parse extern and function declarations with effects") {
     const char* source = R"(
-extern fn read_csv(path: String) -> DataFrame effects { io_read("file"), may_fail } from "csv.hpp";
+extern fn csv::read(path: String) -> DataFrame effects { io_read("file"), may_fail } from "csv.hpp";
 fn identity(df: DataFrame) -> DataFrame effects {} {
   df;
 }
@@ -343,7 +343,7 @@ TEST_CASE("Parse allows parameter names that match modifier words") {
 
 TEST_CASE("Parse function and extern defaults") {
     const char* source = R"(
-extern fn read_csv(path: String, nulls: String = "", delimiter: String = ",", has_header: Bool = true)
+extern fn csv::read(path: String, nulls: String = "", delimiter: String = ",", has_header: Bool = true)
     -> DataFrame
     from "csv.hpp";
 fn top_n(df: DataFrame<{ salary: Int64 }>, n: Int = 3) -> DataFrame<{ salary: Int64 }> {
@@ -397,9 +397,9 @@ TEST_CASE("Parse optimization showcase example script") {
 
 TEST_CASE("Effect checking: user fn annotation must include inferred extern effects") {
     const char* source = R"(
-extern fn write_csv(df: DataFrame, path: String) -> Int effects { io_write } from "csv.hpp";
+extern fn csv::write(df: DataFrame, path: String) -> Int effects { io_write } from "csv.hpp";
 fn save(df: DataFrame) -> DataFrame effects {} {
-  write_csv(df, "out.csv");
+  csv::write(df, "out.csv");
   df;
 }
 )";
@@ -410,9 +410,9 @@ fn save(df: DataFrame) -> DataFrame effects {} {
 
 TEST_CASE("Effect checking: annotation passes when inferred effects are declared") {
     const char* source = R"(
-extern fn write_csv(df: DataFrame, path: String) -> Int effects { io_write } from "csv.hpp";
+extern fn csv::write(df: DataFrame, path: String) -> Int effects { io_write } from "csv.hpp";
 fn save(df: DataFrame) -> DataFrame effects { io_write } {
-  write_csv(df, "out.csv");
+  csv::write(df, "out.csv");
   df;
 }
 )";
@@ -451,9 +451,9 @@ fn wrapper() -> Int effects {} {
 
 TEST_CASE("Effect checking: io resource mismatch is reported precisely") {
     const char* source = R"(
-extern fn read_csv(path: String) -> DataFrame effects { io_read("file"), may_fail } from "csv.hpp";
+extern fn csv::read(path: String) -> DataFrame effects { io_read("file"), may_fail } from "csv.hpp";
 fn load(path: String) -> DataFrame effects { io_read("s3"), may_fail } {
-  read_csv(path);
+  csv::read(path);
 }
 )";
     auto result = parse(source);
@@ -463,9 +463,9 @@ fn load(path: String) -> DataFrame effects { io_read("s3"), may_fail } {
 
 TEST_CASE("Effect checking: unscoped io annotation covers scoped inferred resources") {
     const char* source = R"(
-extern fn read_csv(path: String) -> DataFrame effects { io_read("file"), may_fail } from "csv.hpp";
+extern fn csv::read(path: String) -> DataFrame effects { io_read("file"), may_fail } from "csv.hpp";
 fn load(path: String) -> DataFrame effects { io_read, may_fail } {
-  read_csv(path);
+  csv::read(path);
 }
 )";
     auto result = parse(source);
@@ -506,7 +506,7 @@ fn twice(v: Int) -> Int {
   let y = v + v;
   y;
 }
-extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+extern fn csv::read(path: String) -> DataFrame from "csv.hpp";
 )";
 
     auto result = parse(source);
@@ -1832,4 +1832,209 @@ TEST_CASE("Parse leaves map { } placement to lowering") {
 
 TEST_CASE("Parse rejects a bare field in map { }") {
     REQUIRE_FALSE(parse("t[map { x }];").has_value());
+}
+
+// --- Namespaces --------------------------------------------------------------
+
+TEST_CASE("Namespace block qualifies its declarations and is flattened") {
+    auto result = parse(
+        "namespace adbc {\n"
+        "    extern type Connection from \"adbc.hpp\";\n"
+        "    extern fn connect(driver: String) -> Connection from \"adbc.hpp\";\n"
+        "    extern fn query(mutable db: Connection, sql: String) -> DataFrame from \"adbc.hpp\";\n"
+        "    fn one(db: Connection) -> DataFrame { query(db, \"select 1\"); }\n"
+        "}\n"
+        "extern fn global_fn(x: Int) -> Int from \"g.hpp\";\n");
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 5);
+
+    const auto& type_decl = std::get<ExternTypeDecl>(result->statements[0]);
+    REQUIRE(type_decl.name == "adbc::Connection");
+    REQUIRE(type_decl.scope == "adbc");
+
+    const auto& connect = std::get<ExternDecl>(result->statements[1]);
+    REQUIRE(connect.name == "adbc::connect");
+    REQUIRE(connect.scope == "adbc");
+    // `Connection` inside the block is the namespace's own type.
+    REQUIRE(connect.return_type.resource == "adbc::Connection");
+
+    const auto& query = std::get<ExternDecl>(result->statements[2]);
+    REQUIRE(query.params[0].type.resource == "adbc::Connection");
+
+    // A bare call to a sibling in the same source is qualified by parse().
+    const auto& one = std::get<FunctionDecl>(result->statements[3]);
+    REQUIRE(one.name == "adbc::one");
+    REQUIRE(one.scope == "adbc");
+    const auto& body = std::get<ExprStmt>(one.body.at(0));
+    REQUIRE(std::get<CallExpr>(body.expr->node).callee == "adbc::query");
+
+    const auto& global = std::get<ExternDecl>(result->statements[4]);
+    REQUIRE(global.name == "global_fn");
+    REQUIRE(global.scope.empty());
+}
+
+TEST_CASE("Namespace blocks nest, and 'a::b' is shorthand for nesting") {
+    auto nested = parse(
+        "namespace a { namespace b { extern fn f() -> Int from \"x.hpp\"; } "
+        "extern fn g() -> Int from \"x.hpp\"; }");
+    REQUIRE(nested.has_value());
+    REQUIRE(std::get<ExternDecl>(nested->statements[0]).name == "a::b::f");
+    REQUIRE(std::get<ExternDecl>(nested->statements[0]).scope == "a::b");
+    REQUIRE(std::get<ExternDecl>(nested->statements[1]).name == "a::g");
+
+    auto shorthand = parse("namespace a::b { extern fn f() -> Int from \"x.hpp\"; }");
+    REQUIRE(shorthand.has_value());
+    REQUIRE(std::get<ExternDecl>(shorthand->statements[0]).name == "a::b::f");
+}
+
+TEST_CASE("A namespace reopened merges; a qualified name declared twice is an error") {
+    auto merged = parse(
+        "namespace a { extern fn f() -> Int from \"x.hpp\"; }\n"
+        "namespace a { extern fn g() -> Int from \"x.hpp\"; }\n");
+    REQUIRE(merged.has_value());
+    REQUIRE(merged->statements.size() == 2);
+
+    auto duplicate = parse(
+        "namespace a { extern fn f() -> Int from \"x.hpp\"; }\n"
+        "namespace a { fn f() -> Int { 1; } }\n");
+    REQUIRE_FALSE(duplicate.has_value());
+    REQUIRE(duplicate.error().message == "'a::f' is already declared");
+    REQUIRE(duplicate.error().line == 2);
+
+    // Global declarations keep their old behaviour: the later one replaces.
+    REQUIRE(parse("fn f() -> Int { 1; } fn f() -> Int { 2; }").has_value());
+}
+
+TEST_CASE("A namespace block holds declarations only") {
+    auto let = parse("namespace a { let x = 1; }");
+    REQUIRE_FALSE(let.has_value());
+    REQUIRE(let.error().message.find("may appear in a namespace block") != std::string::npos);
+
+    auto using_inside = parse("namespace a { using b; }");
+    REQUIRE_FALSE(using_inside.has_value());
+    REQUIRE(using_inside.error().message.find("'using' is not supported") != std::string::npos);
+
+    auto unclosed = parse("namespace a { extern fn f() -> Int from \"x.hpp\";");
+    REQUIRE_FALSE(unclosed.has_value());
+    REQUIRE(unclosed.error().message == "expected '}' to close namespace 'a'");
+}
+
+TEST_CASE("Qualified calls parse as one callee string") {
+    auto result = parse("let t = adbc::query(db, \"select 1\", params = p);");
+    REQUIRE(result.has_value());
+    const auto& let = std::get<LetStmt>(result->statements[0]);
+    const auto& call = std::get<CallExpr>(let.value->node);
+    REQUIRE(call.callee == "adbc::query");
+    REQUIRE(call.args.size() == 2);
+    REQUIRE(call.named_args.size() == 1);
+
+    auto deep = parse("a::b::c(1);");
+    REQUIRE(deep.has_value());
+    const auto& deep_call = std::get<CallExpr>(std::get<ExprStmt>(deep->statements[0]).expr->node);
+    REQUIRE(deep_call.callee == "a::b::c");
+
+    // A leading `::` names the global function and stays on the callee until
+    // names are resolved.
+    auto global = parse("::f(1);");
+    REQUIRE(global.has_value());
+    REQUIRE(std::get<CallExpr>(std::get<ExprStmt>(global->statements[0]).expr->node).callee ==
+            "::f");
+}
+
+TEST_CASE("Qualified call inside a filter clause") {
+    auto result = parse("t[filter x > geo::distance(lat, lon)];");
+    REQUIRE(result.has_value());
+    const auto& block = std::get<BlockExpr>(std::get<ExprStmt>(result->statements[0]).expr->node);
+    const auto& filter = std::get<FilterClause>(block.clauses.at(0));
+    const auto& cmp = std::get<BinaryExpr>(filter.predicate->node);
+    REQUIRE(std::get<CallExpr>(cmp.right->node).callee == "geo::distance");
+}
+
+TEST_CASE("A qualified name must be called") {
+    auto bare = parse("let x = adbc::query;");
+    REQUIRE_FALSE(bare.has_value());
+    REQUIRE(bare.error().message.find("'adbc::query' is a qualified name and must be called") !=
+            std::string::npos);
+
+    auto caret = parse("t[select { y = ^a::b }];");
+    REQUIRE_FALSE(caret.has_value());
+    REQUIRE(caret.error().message == "'^' cannot be applied to a qualified name");
+}
+
+TEST_CASE("Qualified resource types in signatures") {
+    auto result = parse(
+        "fn f(mutable db: adbc::Connection) -> adbc::Connection { db; }\n"
+        "namespace adbc { extern type Connection from \"adbc.hpp\";\n"
+        "  extern fn g(db: ::Connection) -> Int from \"adbc.hpp\"; }\n");
+    REQUIRE(result.has_value());
+    const auto& f = std::get<FunctionDecl>(result->statements[0]);
+    REQUIRE(f.params[0].type.resource == "adbc::Connection");
+    REQUIRE(f.return_type.resource == "adbc::Connection");
+    // `::Connection` is the global type even inside a namespace declaring one.
+    const auto& g = std::get<ExternDecl>(result->statements[2]);
+    REQUIRE(g.params[0].type.resource == "Connection");
+}
+
+TEST_CASE("Parse using declarations") {
+    auto result = parse("using adbc;\nusing adbc::query;\n");
+    REQUIRE(result.has_value());
+    REQUIRE(std::get<UsingDecl>(result->statements[0]).target == "adbc");
+    REQUIRE(std::get<UsingDecl>(result->statements[1]).target == "adbc::query");
+    REQUIRE(std::get<UsingDecl>(result->statements[1]).start_line == 2);
+}
+
+TEST_CASE("'namespace' and 'using' are contextual: they still work as names") {
+    auto column = parse("t[select { namespace, using }];");
+    REQUIRE(column.has_value());
+    auto binding = parse("let namespace = 1;\nnamespace + 1;\nusing;");
+    REQUIRE(binding.has_value());
+    REQUIRE(binding->statements.size() == 3);
+    auto call = parse("t[filter namespace == using];");
+    REQUIRE(call.has_value());
+}
+
+TEST_CASE("'::' in a model formula is a clear error") {
+    auto result = parse("t[model { y ~ a::b }];");
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().message.find("'::' is not a formula operator") != std::string::npos);
+    // The single-colon interaction still parses.
+    REQUIRE(parse("t[model { y ~ a:b }];").has_value());
+}
+
+TEST_CASE("Stream sink may be qualified") {
+    auto result = parse(
+        "Stream { source = udp::recv(9001), transform = [select { x }], "
+        "sink = udp::send(\"127.0.0.1\", 9002) };");
+    REQUIRE(result.has_value());
+    const auto& stream = std::get<StreamExpr>(std::get<ExprStmt>(result->statements[0]).expr->node);
+    REQUIRE(stream.sink_callee == "udp::send");
+    REQUIRE(std::get<CallExpr>(stream.source->node).callee == "udp::recv");
+}
+
+TEST_CASE("A qualified declaration name is shorthand for a namespace block") {
+    auto result = parse(
+        "extern type adbc::Connection from \"adbc.hpp\";\n"
+        "extern fn adbc::connect(driver: String) -> Connection from \"adbc.hpp\";\n"
+        "fn util::inc(x: Int) -> Int { twice(x); }\n"
+        "fn util::twice(x: Int) -> Int { x * 2; }\n"
+        "extern fn plain(x: Int) -> Int from \"p.hpp\";\n");
+    REQUIRE(result.has_value());
+    const auto& type_decl = std::get<ExternTypeDecl>(result->statements[0]);
+    REQUIRE(type_decl.name == "adbc::Connection");
+    REQUIRE(type_decl.scope == "adbc");
+    const auto& connect = std::get<ExternDecl>(result->statements[1]);
+    REQUIRE(connect.name == "adbc::connect");
+    REQUIRE(connect.scope == "adbc");
+    REQUIRE(connect.return_type.resource == "adbc::Connection");
+    const auto& inc = std::get<FunctionDecl>(result->statements[2]);
+    REQUIRE(inc.scope == "util");
+    REQUIRE(std::get<CallExpr>(std::get<ExprStmt>(inc.body[0]).expr->node).callee == "util::twice");
+    // The enclosing scope is restored after a qualified declaration.
+    REQUIRE(std::get<ExternDecl>(result->statements[4]).scope.empty());
+
+    auto duplicate = parse(
+        "namespace csv { extern fn read(p: String) -> DataFrame from \"csv.hpp\"; }\n"
+        "extern fn csv::read(p: String) -> DataFrame from \"csv.hpp\";\n");
+    REQUIRE_FALSE(duplicate.has_value());
+    REQUIRE(duplicate.error().message == "'csv::read' is already declared");
 }

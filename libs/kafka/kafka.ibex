@@ -5,23 +5,19 @@
 //
 // After importing, the following functions are available:
 //
-//   kafka_recv(brokers: String, topic: String, group: String, schema: String) -> DataFrame
-//   kafka_recv(brokers: String, topic: String, group: String, schema: String,
-//              options: String) -> DataFrame
+//   kafka::recv(brokers: String, topic: String, group: String, schema: String,
+//               options: String = "") -> DataFrame
 //     Polls Kafka for one JSON message, converts it to a one-row DataFrame
 //     using the explicit schema string, and returns StreamTimeout when no
 //     message arrives before the poll timeout.
 //
-//   kafka_recv_avro(brokers: String, topic: String, group: String, schema: String,
-//                   registry_url: String) -> DataFrame
-//   kafka_recv_avro(brokers: String, topic: String, group: String, schema: String,
-//                   registry_url: String, options: String) -> DataFrame
+//   kafka::recv_avro(brokers: String, topic: String, group: String, schema: String,
+//                    registry_url: String, options: String = "") -> DataFrame
 //     Polls Kafka for one Schema-Registry-framed Avro message, fetches the
 //     writer schema from Redpanda Schema Registry, decodes one flat record,
 //     and returns StreamTimeout when no message arrives before the poll timeout.
 //
-//   kafka_send(df: DataFrame, brokers: String, topic: String) -> Int
-//   kafka_send(df: DataFrame, brokers: String, topic: String, options: String) -> Int
+//   kafka::send(df: DataFrame, brokers: String, topic: String, options: String = "") -> Int
 //     Serializes each DataFrame row to one JSON Kafka message.
 //
 // Schema format:
@@ -31,15 +27,14 @@
 //   "poll_timeout_ms=200;consumer.auto.offset.reset=earliest"
 //   "flush_timeout_ms=5000;producer.compression.type=snappy"
 
-extern fn kafka_recv(brokers: String, topic: String, group: String, schema: String)
-    -> DataFrame from "kafka";
-extern fn kafka_recv(brokers: String, topic: String, group: String, schema: String,
-                     options: String) -> DataFrame from "kafka";
-extern fn kafka_recv_avro(brokers: String, topic: String, group: String, schema: String,
-                          registry_url: String) -> DataFrame from "kafka";
-extern fn kafka_recv_avro(brokers: String, topic: String, group: String, schema: String,
-                          registry_url: String, options: String) -> DataFrame from "kafka";
+namespace kafka {
 
-extern fn kafka_send(df: DataFrame, brokers: String, topic: String) -> Int from "kafka";
-extern fn kafka_send(df: DataFrame, brokers: String, topic: String, options: String)
+extern fn recv(brokers: String, topic: String, group: String, schema: String,
+               options: String = "") -> DataFrame from "kafka";
+extern fn recv_avro(brokers: String, topic: String, group: String, schema: String,
+                    registry_url: String, options: String = "") -> DataFrame from "kafka";
+
+extern fn send(df: DataFrame, brokers: String, topic: String, options: String = "")
     -> Int from "kafka";
+
+}

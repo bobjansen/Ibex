@@ -13,7 +13,7 @@ const run = (label, src) => {
 };
 
 run("arithmetic", "2 + 40;");
-run("seed demo tables", 'import data_gen;\nseed_rng(20240115);\nlet trades = gen_ticks(2000, "AAPL,MSFT,GOOG");');
+run("seed demo tables", 'import data_gen;\nseed_rng(20240115);\nlet trades = gen::ticks(2000, "AAPL,MSFT,GOOG");');
 run("aggregate by group", "trades[select { avg_price = mean(price), n = count() }, by symbol];");
 run("filter + head", "trades[filter price > 100, head 3];");
 run("semantic error", "trades[select { nope }];");

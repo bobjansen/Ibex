@@ -1,6 +1,6 @@
 import "csv";
 
-let iris = read_csv("data/iris.csv");
+let iris = csv::read("data/iris.csv");
 
 // Order by a single key (ascending by default). (Output truncated to 10 rows.)
 print("order by Species (ascending):");

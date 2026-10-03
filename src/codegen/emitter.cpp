@@ -111,7 +111,7 @@ void Emitter::emit(std::ostream& out, const Script& script, const Config& config
     model_vars_.clear();
     const std::string result_var = emit_script_steps(script);
     if (result_var.empty()) {
-        // The script ends in an effect (`adbc_close(db);`): there is no table to
+        // The script ends in an effect (`adbc::close(db);`): there is no table to
         // print or return.
         if (config.table_entry_point) {
             out << "    return ibex::runtime::Table{};\n";
@@ -129,7 +129,21 @@ auto Emitter::callee_name(const std::string& callee) const -> std::string {
     if (ir::is_model_table_accessor(callee) || ir::is_model_scalar_accessor(callee)) {
         return "ibex::ops::" + (callee.starts_with("model_") ? callee : "model_" + callee);
     }
-    return user_functions_.contains(callee) ? "_ibex_fn_" + callee : callee;
+    if (user_functions_.contains(callee)) {
+        // A namespaced `fn` (`a::f`) is one flat C++ name: `_ibex_fn_a__f`.
+        std::string mangled = callee;
+        for (auto at = mangled.find("::"); at != std::string::npos; at = mangled.find("::", at)) {
+            mangled.replace(at, 2, "__");
+        }
+        return "_ibex_fn_" + mangled;
+    }
+    return cpp_extern_name(callee);
+}
+
+auto cpp_extern_name(const std::string& name) -> std::string {
+    // A plugin declares the C++ entry point of Ibex's `a::f` as `f` in
+    // `ibex::ext::a`; an unqualified name is a global C++ function.
+    return name.contains("::") ? "ibex::ext::" + name : name;
 }
 
 void Emitter::emit_scalar_store(const std::string& name, const std::string& value) {
@@ -539,7 +553,7 @@ void Emitter::collect_extern_calls(const ir::Node& node) {
     if (node.kind() == ir::NodeKind::ExternCall) {
         const auto& ec = ir::node_cast<ir::ExternCallNode>(node);
         auto var = fresh_var();
-        *out_ << "    auto " << var << " = " << ec.callee() << "(";
+        *out_ << "    auto " << var << " = " << callee_name(ec.callee()) << "(";
         bool first = true;
         for (const auto& arg : ec.args()) {
             if (!first)
@@ -1404,7 +1418,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                   << ") {\n";
             *out_ << "        if (" << sbuf << ".rows() == 0) return;\n";
             *out_ << indent_code(transform_buf.str(), 4);
-            *out_ << "        " << sn.sink_callee() << "(" << transform_var;
+            *out_ << "        " << callee_name(sn.sink_callee()) << "(" << transform_var;
             for (const auto& arg : sn.sink_args()) {
                 *out_ << ", " << emit_raw_expr(arg);
             }
@@ -1412,11 +1426,11 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             *out_ << "    };\n\n";
 
             // ── Emit the source-normalisation lambda ──────────────────────────
-            // Source may return Table (e.g. udp_recv) or ExternValue (e.g. ws_recv).
+            // Source may return Table (e.g. udp::recv) or ExternValue (e.g. ws::recv).
             // We normalise both to ExternValue so the event loop is uniform.
             const std::string call_src = "_call_src_" + var;
             *out_ << "    auto " << call_src << " = [&]() -> ibex::runtime::ExternValue {\n";
-            *out_ << "        auto _r = " << sn.source_callee() << "(";
+            *out_ << "        auto _r = " << callee_name(sn.source_callee()) << "(";
             {
                 bool first = true;
                 for (const auto& arg : sn.source_args()) {
@@ -1550,7 +1564,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             const auto& prog = ir::node_cast<ir::ProgramNode>(node);
             for (const auto& pnode : prog.preamble()) {
                 const auto& ec = ir::node_cast<ir::ExternCallNode>(*pnode);
-                *out_ << "    (void)" << ec.callee() << "(";
+                *out_ << "    (void)" << callee_name(ec.callee()) << "(";
                 bool first = true;
                 for (const auto& arg : ec.args()) {
                     if (!first)

@@ -3,17 +3,24 @@
 
 #include "data_gen.hpp"
 
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/runtime/extern_registry.hpp>
+#include <ibex/runtime/interpreter.hpp>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <map>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <variant>
 #include <vector>
 
 namespace ibex::data_gen {
@@ -44,15 +51,15 @@ struct SymbolInfo {
 // anything else is derived deterministically from the symbol string.
 auto lookup_symbol(const std::string& symbol) -> SymbolInfo {
     static const std::map<std::string, SymbolInfo> known = {
-        {"AAPL", {"Apple Inc.", "Technology"}},
-        {"MSFT", {"Microsoft Corp.", "Technology"}},
-        {"GOOG", {"Alphabet Inc.", "Communication Services"}},
-        {"AMZN", {"Amazon.com Inc.", "Consumer Discretionary"}},
-        {"NVDA", {"NVIDIA Corp.", "Technology"}},
-        {"META", {"Meta Platforms Inc.", "Communication Services"}},
-        {"TSLA", {"Tesla Inc.", "Consumer Discretionary"}},
-        {"JPM", {"JPMorgan Chase & Co.", "Financials"}},
-        {"XOM", {"Exxon Mobil Corp.", "Energy"}},
+        {"AAPL", {.name = "Apple Inc.", .sector = "Technology"}},
+        {"MSFT", {.name = "Microsoft Corp.", .sector = "Technology"}},
+        {"GOOG", {.name = "Alphabet Inc.", .sector = "Communication Services"}},
+        {"AMZN", {.name = "Amazon.com Inc.", .sector = "Consumer Discretionary"}},
+        {"NVDA", {.name = "NVIDIA Corp.", .sector = "Technology"}},
+        {"META", {.name = "Meta Platforms Inc.", .sector = "Communication Services"}},
+        {"TSLA", {.name = "Tesla Inc.", .sector = "Consumer Discretionary"}},
+        {"JPM", {.name = "JPMorgan Chase & Co.", .sector = "Financials"}},
+        {"XOM", {.name = "Exxon Mobil Corp.", .sector = "Energy"}},
     };
     if (const auto it = known.find(symbol); it != known.end()) {
         return it->second;
@@ -60,7 +67,7 @@ auto lookup_symbol(const std::string& symbol) -> SymbolInfo {
     static constexpr std::array<std::string_view, 6> sectors = {
         "Technology", "Financials", "Healthcare", "Energy", "Industrials", "Utilities"};
     const auto hash = std::hash<std::string>{}(symbol);
-    return {symbol + " Corp.", std::string(sectors[hash % sectors.size()])};
+    return {.name = symbol + " Corp.", .sector = std::string(sectors[hash % sectors.size()])};
 }
 
 auto now_ms() -> std::int64_t {
@@ -187,7 +194,7 @@ auto gen_normal(const runtime::RngBridge& rng, std::int64_t n, double mean, doub
     }
     Column<double> value_col;
     value_col.reserve(rows);
-    for (double v : values) {
+    for (const double v : values) {
         value_col.push_back(v);
     }
 
@@ -206,7 +213,7 @@ auto gen_uniform(const runtime::RngBridge& rng, std::int64_t n, double low, doub
     }
     Column<double> value_col;
     value_col.reserve(rows);
-    for (double v : values) {
+    for (const double v : values) {
         value_col.push_back(v);
     }
 
@@ -238,7 +245,7 @@ auto gen_reference(const std::string& symbols) -> runtime::Table {
     }
 
     // Dimension-table string columns are Categorical: `symbol` so its type
-    // matches `gen_ticks`'s join key, and the rest so that gathering them across
+    // matches `gen::ticks`'s join key, and the rest so that gathering them across
     // a join to a large fact table copies dictionary codes rather than strings.
     Column<Categorical> symbol_col;
     Column<Categorical> name_col;
@@ -295,9 +302,9 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
     const ibex::runtime::RngBridge rng = registry->rng();
 
     registry->register_table(
-        "gen_ticks", [rng](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
+        "gen::ticks", [rng](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
             if (args.size() != 6) {
-                return std::unexpected("gen_ticks() expects 6 arguments");
+                return std::unexpected("gen::ticks() expects 6 arguments");
             }
             return ExternValue{ibex::data_gen::gen_ticks(rng, arg_int(args, 0), arg_string(args, 1),
                                                          arg_double(args, 2), arg_double(args, 3),
@@ -305,44 +312,44 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
         });
 
     registry->register_table(
-        "gen_walk", [rng](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
+        "gen::walk", [rng](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
             if (args.size() != 3) {
-                return std::unexpected("gen_walk() expects 3 arguments");
+                return std::unexpected("gen::walk() expects 3 arguments");
             }
             return ExternValue{ibex::data_gen::gen_walk(rng, arg_int(args, 0), arg_double(args, 1),
                                                         arg_double(args, 2))};
         });
 
     registry->register_table(
-        "gen_normal", [rng](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
+        "gen::normal", [rng](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
             if (args.size() != 3) {
-                return std::unexpected("gen_normal() expects 3 arguments");
+                return std::unexpected("gen::normal() expects 3 arguments");
             }
             return ExternValue{ibex::data_gen::gen_normal(
                 rng, arg_int(args, 0), arg_double(args, 1), arg_double(args, 2))};
         });
 
     registry->register_table(
-        "gen_uniform", [rng](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
+        "gen::uniform", [rng](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
             if (args.size() != 3) {
-                return std::unexpected("gen_uniform() expects 3 arguments");
+                return std::unexpected("gen::uniform() expects 3 arguments");
             }
             return ExternValue{ibex::data_gen::gen_uniform(
                 rng, arg_int(args, 0), arg_double(args, 1), arg_double(args, 2))};
         });
 
     registry->register_table(
-        "gen_ids", [](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
+        "gen::ids", [](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
             if (args.size() != 2) {
-                return std::unexpected("gen_ids() expects 2 arguments");
+                return std::unexpected("gen::ids() expects 2 arguments");
             }
             return ExternValue{ibex::data_gen::gen_ids(arg_int(args, 0), arg_string(args, 1))};
         });
 
     registry->register_table(
-        "gen_reference", [](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
+        "gen::reference", [](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
             if (args.size() != 1) {
-                return std::unexpected("gen_reference() expects 1 argument");
+                return std::unexpected("gen::reference() expects 1 argument");
             }
             return ExternValue{ibex::data_gen::gen_reference(arg_string(args, 0))};
         });

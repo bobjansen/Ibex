@@ -13,8 +13,8 @@ that publish random equity trades:
 - `ticks_avro` — the same data as Avro, with the schema in [`tick.avsc`](tick.avsc)
   registered in the Schema Registry
 
-Ibex reads these topics with `kafka_recv` / `kafka_recv_avro`, runs a streaming
-transform, and serves the output on a WebSocket via `ws_send`. Two jobs run per
+Ibex reads these topics with `kafka::recv` / `kafka::recv_avro`, runs a streaming
+transform, and serves the output on a WebSocket via `ws::send`. Two jobs run per
 format:
 
 | Job | Ibex script | Transform | WebSocket |

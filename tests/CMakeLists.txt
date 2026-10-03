@@ -55,6 +55,7 @@ set(IBEX_TEST_SOURCES
     test_kafka_schema_registry_client.cpp
     test_lexer.cpp
     test_parser.cpp
+    test_names.cpp
     test_repl.cpp
     test_repl_resources.cpp
     test_lower.cpp
@@ -102,7 +103,7 @@ if(NOT WIN32)
 endif()
 
 # CURL is optional (see libs/csv/CMakeLists.txt): test_csv.cpp only needs it
-# to exercise read_csv's HTTPS path, which is itself optional.
+# to exercise csv::read's HTTPS path, which is itself optional.
 find_package(CURL)
 
 target_link_libraries(ibex_tests

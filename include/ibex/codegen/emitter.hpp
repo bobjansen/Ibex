@@ -20,6 +20,11 @@
 
 namespace ibex::codegen {
 
+/// The C++ name generated code uses for an extern function or resource type
+/// Ibex calls `name`: `ibex::ext::a::f` for the qualified `a::f`, which a
+/// plugin header declares as `f` in `ibex::ext::a`; an unqualified name as is.
+[[nodiscard]] auto cpp_extern_name(const std::string& name) -> std::string;
+
 /// Emits a C++23 source file from an IR node tree.
 ///
 /// The emitted code uses ibex::ops::* for all table operations and can be
@@ -61,7 +66,7 @@ class Emitter {
         /// Emit a callable Table-returning entry point instead of main().
         bool table_entry_point = false;
         std::string entry_point_name = "ibex_generated_execute";
-        /// The script calls `parse_args`: emit `main(int argc, char** argv)` and
+        /// The script calls `args::parse`: emit `main(int argc, char** argv)` and
         /// forward the process argv to `IBEX_ARGS` before the query runs.
         bool forward_cli_args = false;
     };

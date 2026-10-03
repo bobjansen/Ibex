@@ -2,17 +2,17 @@
 // its own from a string parameter (closed when it returns), and a call to one of
 // them from a clause-free expression. Each runs where the statement is.
 import "adbc";
-let db = adbc_connect("@SQLITE_DRIVER@", "file:/tmp/ibex_parity_adbc_function_table.db");
-adbc_execute(db, "create table t (x integer, g text)");
-adbc_execute(db, "insert into t values (1, 'a'), (2, 'a'), (5, 'b')");
+let db = adbc::connect("@SQLITE_DRIVER@", "file:/tmp/ibex_parity_adbc_function_table.db");
+adbc::execute(db, "create table t (x integer, g text)");
+adbc::execute(db, "insert into t values (1, 'a'), (2, 'a'), (5, 'b')");
 
-fn totals(mutable conn: AdbcConnection) -> DataFrame {
-    adbc_query(conn, "select g, sum(x) as s from t group by g order by g");
+fn totals(mutable conn: adbc::Connection) -> DataFrame {
+    adbc::query(conn, "select g, sum(x) as s from t group by g order by g");
 }
 
 fn count_in(uri: String) -> DataFrame {
-    let scratch = adbc_connect("@SQLITE_DRIVER@", uri);
-    adbc_query(scratch, "select count(*) as n from t");
+    let scratch = adbc::connect("@SQLITE_DRIVER@", uri);
+    adbc::query(scratch, "select count(*) as n from t");
 }
 
 let by_group = totals(db);

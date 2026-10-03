@@ -463,7 +463,7 @@ ASCII whitespace is ignored). `Int64("42")`, `Float64(" 3.5 ")`. A string that
 is not entirely a number — `Int64("4x")`, `Int64("")` — is a runtime error, as
 is a fractional value for a `String → Int` cast (`Int64("3.9")`). Null stays
 null. This is the idiom for reading a typed value out of a text column, such as
-the `value` column of `parse_args` (Section 12.1).
+the `value` column of `args::parse` (Section 12.1).
 
 **Bool → Int casts** map `false` to `0` and `true` to `1`, which is what makes a
 predicate countable: `sum(Int64(price > vwap))` counts the rows above VWAP. (A
@@ -573,7 +573,7 @@ index column in ascending order.
 
 When a `DataFrame` or `TimeFrame` type omits its schema argument (e.g.
 `DataFrame`), the schema is inferred by the implementation (for example, from
-`read_csv`). This form is intended for external I/O and does not change the
+`csv::read`). This form is intended for external I/O and does not change the
 language’s static typing rules.
 
 ### 3.3 Schema Types
@@ -891,11 +891,11 @@ error. The trailing `*` has no additional effect for an ascription because
 extras are always permitted.
 
 ```
-let trades = read_csv("trades.csv") as DataFrame<{ date: Date, px: Float64 }>;
+let trades = csv::read("trades.csv") as DataFrame<{ date: Date, px: Float64 }>;
 ```
 
 The purpose is to recover a statically known schema at a boundary where it would
-otherwise be unknown. Sources such as `read_csv` produce a `DataFrame` with an
+otherwise be unknown. Sources such as `csv::read` produce a `DataFrame` with an
 implementation-inferred (statically unknown) schema; ascribing a schema lets the
 compiler treat the result as a known schema from that point onward, so
 downstream column references can be checked statically. Only the named columns
@@ -943,14 +943,23 @@ statement       = let_stmt
                 | assign_stmt
                 | fn_decl
                 | extern_decl
+                | namespace_decl
+                | using_decl
                 | expr_stmt ;
+
+(* Section 11.7. "namespace" and "using" are contextual: keywords only at the
+   start of a statement and followed by a name. *)
+qualified_name  = IDENT { "::" IDENT } ;
+namespace_decl  = "namespace" qualified_name "{"
+                  { fn_decl | extern_decl | namespace_decl } "}" ;
+using_decl      = "using" qualified_name ";" ;
 
 let_stmt        = "let" [ "mut" ] IDENT [ ":" type ] "=" expr ";" ;
 assign_stmt     = IDENT "=" expr ";" ;
-extern_decl     = "extern" "fn" IDENT "(" [ param_list ] ")"
+extern_decl     = "extern" "fn" qualified_name "(" [ param_list ] ")"
                   "->" type [ effect_decl ] "from" STRING_LIT ";"
-                | "extern" "type" IDENT "from" STRING_LIT ";" ;
-fn_decl         = "fn" IDENT "(" [ param_list ] ")" "->" type
+                | "extern" "type" qualified_name "from" STRING_LIT ";" ;
+fn_decl         = "fn" qualified_name "(" [ param_list ] ")" "->" type
                   [ effect_decl ]
                   "{" { fn_stmt } "}" ;
 expr_stmt       = expr ";" ;
@@ -962,8 +971,8 @@ fn_stmt         = let_stmt
 
 type            = scalar_type
                 | type_ctor [ "<" type_arg ">" ]
-                | IDENT ;  (* resource type (Section 11.5): fn and extern fn
-                              signatures only *)
+                | [ "::" ] qualified_name ;  (* resource type (Section 11.5): fn
+                                                and extern fn signatures only *)
 
 scalar_type     = "Int" | "Int32" | "Int64" | "Float32" | "Float64"
                 | "Bool"  | "String" | "Date" | "Timestamp" ;
@@ -1020,6 +1029,7 @@ multiplicity    = "1" | "n" ;
 join_take       = "take" ( "first" | "last" | "any" ) ;
 
 primary         = IDENT [ "(" [ arg_list ] ")" ]
+                | [ "::" ] qualified_name "(" [ arg_list ] ")"  (* Section 11.7 *)
                 | "Table" "{" [ table_col_def { "," table_col_def } [ "," ] ] "}"
                 | case_expr
                 | "^" IDENT                      (* scope escape *)
@@ -1631,10 +1641,10 @@ import "csv";
 import "fs";
 import "parquet";
 
-list_files("data/csv", "*.csv")[map {
+fs::list("data/csv", "*.csv")[map {
     source = path,
     target = `data/parquet/${stem}.parquet`,
-    rows   = write_parquet(read_csv(path), `data/parquet/${stem}.parquet`)
+    rows   = parquet::write(csv::read(path), `data/parquet/${stem}.parquet`)
 }]
 ```
 
@@ -2281,7 +2291,7 @@ old join new on id nulls equal
   `cross join`, or a join whose `on` is a bare predicate. The message says so
   rather than accepting a clause that would do nothing.
 - `nulls`, `equal` and `never` are matched in this position only and remain
-  usable as ordinary identifiers — `read_csv` has a `nulls` parameter.
+  usable as ordinary identifiers — `csv::read` has a `nulls` parameter.
 
 **Declared cardinality.** A join may state how its rows are expected to line
 up, and the executor checks it:
@@ -2480,7 +2490,7 @@ one row, so an uncorrelated subquery can never multiply the rows it filters.
 correlated one becomes an aggregate grouped by the captured column, left-joined
 back onto the outer rows; an uncorrelated one becomes a cross join against its
 single row. That is also why a source used by both the outer query and the
-subquery should be bound once (`let partsupp = read_parquet(...)`) and named
+subquery should be bound once (`let partsupp = parquet::read(...)`) and named
 twice — one binding is one read.
 
 **Empty inputs.** A subquery over no rows has the value its aggregate has over
@@ -2544,6 +2554,11 @@ are resolved as follows:
    against built-in function names.
 
 4. **Error.** If no match is found in any scope, it is a compile-time error.
+
+A qualified name (`csv::read(...)`) is the exception: it is looked up only
+among declarations, never in column or lexical scope, so no column or binding
+can shadow it. A call to a bare name may resolve through `using` at the lexical
+level. See Section 11.7.
 
 ```
 let threshold = 100.0;
@@ -3309,7 +3324,7 @@ Rules:
 Named arguments resolve against a declared parameter list, so they are
 accepted wherever the callee declares its parameters: user-defined functions,
 `extern` functions, table-valued `extern` functions, and Stream sources (e.g.
-`kafka_recv(brokers = ..., topic = ...)`). A callee with no declaration cannot
+`kafka::recv(brokers = ..., topic = ...)`). A callee with no declaration cannot
 take named arguments; passing them is a compile-time error. The exceptions are
 the few built-ins that document their own named parameters (such as `rank`'s
 sort flags and `rep`'s `times` / `length_out`); these are described with the
@@ -3353,7 +3368,7 @@ Function and extern parameters may be prefixed with one of:
 Example:
 
 ```
-extern fn write_csv(const df: DataFrame, const path: String) -> Int
+extern fn csv::write(const df: DataFrame, const path: String) -> Int
     effects { io_write, may_fail }
     from "csv.hpp";
 ```
@@ -3441,7 +3456,7 @@ extern fn zscore(x: Float64, mu: Float64, sigma: Float64) -> Float64
 Extern declarations may include optional effects:
 
 ```
-extern fn read_csv(path: String) -> DataFrame
+extern fn csv::read(path: String) -> DataFrame
     effects { io_read("file"), may_fail }
     from "csv.hpp";
 ```
@@ -3453,7 +3468,7 @@ Extern declarations follow the same argument rules as user-defined functions,
 including named arguments and trailing default parameters:
 
 ```
-extern fn read_csv(
+extern fn csv::read(
     path: String,
     nulls: String = "",
     delimiter: String = ",",
@@ -3461,7 +3476,7 @@ extern fn read_csv(
 ) -> DataFrame
     from "csv.hpp";
 
-let ticks = read_csv("ticks.csv", has_header = false, delimiter = ";");
+let ticks = csv::read("ticks.csv", has_header = false, delimiter = ";");
 ```
 
 The `from` clause specifies the C++ header that provides the function. The
@@ -3528,17 +3543,17 @@ extern type <Name> from <header_path> ;
 ```
 
 ```
-extern type AdbcConnection from "adbc.hpp";
-extern fn adbc_connect(driver: String, uri: String, options: String = "")
-    -> AdbcConnection from "adbc.hpp";
-extern fn adbc_query(mutable db: AdbcConnection, sql: String) -> DataFrame
+extern type adbc::Connection from "adbc.hpp";
+extern fn adbc::connect(driver: String, uri: String, options: String = "")
+    -> adbc::Connection from "adbc.hpp";
+extern fn adbc::query(mutable db: adbc::Connection, sql: String) -> DataFrame
     from "adbc.hpp";
-extern fn adbc_close(mutable db: AdbcConnection) -> Int from "adbc.hpp";
+extern fn adbc::close(mutable db: adbc::Connection) -> Int from "adbc.hpp";
 
-let db = adbc_connect("sqlite", ":memory:");
-adbc_query(db, "create table t as select 1 as x");
-let t = adbc_query(db, "select x from t");
-adbc_close(db);
+let db = adbc::connect("sqlite", ":memory:");
+adbc::query(db, "create table t as select 1 as x");
+let t = adbc::query(db, "select x from t");
+adbc::close(db);
 ```
 
 `type` is contextual: it is a keyword only directly after `extern`, and stays
@@ -3561,13 +3576,13 @@ takes or returns a resource, or a `fn` whose body or parameter defaults call a
 resource function, directly or through other functions:
 
 ```
-fn load_trades(mutable db: AdbcConnection) -> DataFrame {
-    adbc_query(db, "select * from trades");
+fn load_trades(mutable db: adbc::Connection) -> DataFrame {
+    adbc::query(db, "select * from trades");
 }
 
 fn trade_count(uri: String) -> DataFrame {
-    let db = adbc_connect("postgresql", uri);
-    adbc_query(db, "select count(*) as n from trades");
+    let db = adbc::connect("postgresql", uri);
+    adbc::query(db, "select count(*) as n from trades");
 }
 ```
 
@@ -3577,16 +3592,16 @@ opens one.
 **Where a resource function can be called.** A resource function is called
 only:
 
-- as a statement's value (`let t = adbc_query(db, "...");`, `adbc_close(db);`),
+- as a statement's value (`let t = adbc::query(db, "...");`, `adbc::close(db);`),
 - as a table operand, such as the base of a block or a side of a join
-  (`adbc_query(db, "...")[filter x > 1]`),
+  (`adbc::query(db, "...")[filter x > 1]`),
 - as an argument of another call.
 
 It cannot be called inside a query clause (`filter`, `select`, `update`, ...)
-or inside a larger expression (`adbc_close(db) + 1`). These are rejected
+or inside a larger expression (`adbc::close(db) + 1`). These are rejected
 before any resource function in the statement runs. The same rules apply to
 each statement of a resource function's body. A resource call in an argument
-that is not a resource parameter (`load(db, adbc_close(db))`) is rejected when
+that is not a resource parameter (`load(db, adbc::close(db))`) is rejected when
 the call is evaluated; bind its result with `let` first.
 
 **Order and materialization.** Resource functions run one statement at a time,
@@ -3612,12 +3627,13 @@ its last binding is rebound or erased, or when the session or script ends. The
 resources a function call binds are released when the call ends, normally or
 with an error, in reverse order of binding, unless the call returned them. A
 resource passed straight to a resource parameter
-(`adbc_query(adbc_connect(...), "...")`) is released at the end of that
-statement. A plugin's close function, such as `adbc_close`, closes it earlier
+(`adbc::query(adbc::connect(...), "...")`) is released at the end of that
+statement. A plugin's close function, such as `adbc::close`, closes it earlier
 for every alias.
 
-Programs that call resource functions run in the `ibex` REPL and script
-runner only; `ibex_compile` rejects them.
+`ibex_compile` compiles resource functions too: a connection is a C++ variable
+of type `ibex::ext::adbc::Connection` (Section 11.7), released where the
+interpreter would release it.
 
 ### 11.6 Restrictions
 
@@ -3625,12 +3641,90 @@ runner only; `ibex_compile` rejects them.
 |---------------------------------------|-----------------------------------|
 | No C++ templates in extern signatures | Simplifies type resolution        |
 | No overloads (one name = one function)| Prevents dispatch ambiguity       |
-| No C++ namespaces in names            | Names are Ibex identifiers        |
+| Names are Ibex names (Section 11.7)   | `a::f` is C++ `ibex::ext::a::f`   |
 | No default arguments                  | All arguments must be explicit    |
 | No variadic parameters                | Simplifies IR generation          |
 
 If a C++ function is templated or overloaded, provide a non-templated wrapper
 with a unique name and declare that wrapper as the extern.
+
+### 11.7 Namespaces and `using`
+
+A namespace is a named scope that holds declarations: `fn`, `extern fn` and
+`extern type`. Nothing else lives in a namespace: `let` bindings, columns and
+the language's built-ins (Section 12) are never in one.
+
+```
+namespace adbc {
+    extern type Connection from "adbc.hpp";
+    extern fn connect(driver: String, uri: String, options: String = "")
+        -> Connection from "adbc.hpp";
+    extern fn query(mutable db: Connection, sql: String) -> DataFrame
+        from "adbc.hpp";
+}
+
+let db = adbc::connect("sqlite", ":memory:");
+adbc::query(db, "select 1 as x");
+```
+
+**Declaring.** `namespace name { ... }` holds declarations only. Blocks nest,
+and `namespace a::b { ... }` is shorthand for `namespace a { namespace b { ... }
+}`. A declaration may also be named qualified: `extern fn csv::read(...)` is
+shorthand for the same declaration inside `namespace csv { }`. Files declare
+their own namespaces: the name is written in the file, not derived from the
+file's name or from what `import` asked for, so two files may contribute to one
+namespace and a file may declare a namespace unrelated to its name. Opening a
+namespace again, in the same file or another, merges its declarations.
+Declaring the same qualified name twice is an error (there are no overloads);
+importing the same library twice re-declares nothing new and is allowed. A file
+with no `namespace` declares into the global scope.
+
+Inside a namespace, an `extern type` is named without its prefix
+(`Connection` above is `adbc::Connection`); outside, it is written qualified
+(`mutable db: adbc::Connection`). A resource type's qualified name is its
+identity (Section 11.5).
+
+**Qualified names.** `a::f` names `f` in namespace `a`, and `a::b::f` names `f`
+in `a::b`. Only a call can be qualified: namespaces hold functions, never
+values, so `adbc::query` without `(...)` is an error. A leading `::f` names the
+global `f`. Qualified names resolve differently from every other name (Section
+6.1): `a::f` is looked up only among declarations, never in column or lexical
+scope. A column named `csv` or `let adbc = 1;` cannot shadow `csv::read` or
+`adbc::query`, which is what makes the qualified form safe inside a query
+clause. Naming something that is not declared is an error that names the
+closest declaration in the same namespace.
+
+Inside a function declared in a namespace, a bare name is looked up in that
+namespace first, then in each enclosing one, then by the rules below; a
+function in `adbc` calls its sibling `query` without the prefix. Lookup never
+reaches into another namespace.
+
+**`using`.** `using` brings names into scope for a script that uses one library
+heavily:
+
+```
+using adbc::query;   // one name
+using adbc;          // every name declared directly in adbc (not in adbc::x)
+```
+
+A `using` applies from its statement to the end of its file or script (in the
+REPL, to the end of the session). It makes the name visible at the lexical
+level, ahead of built-ins: `query(db, "...")` then calls `adbc::query`. A name
+that two `using` declarations bring in from different places, or that is also
+declared globally, is an error where it is used, not where the `using` is;
+write the qualified name there. `::f` skips every `using`. A `using` names
+something already declared (import first) and may not appear inside a
+`namespace` block.
+
+`import` and `using` stay separate. `import "adbc";` loads `adbc.ibex` and its
+plugin and brings no unqualified name with it: `adbc::query` needs the import,
+and writing `query` needs the import and `using adbc;`.
+
+**Generated C++.** `ibex_compile` calls the qualified extern `a::f` as the C++
+function `ibex::ext::a::f`, and a resource type `a::T` is the C++ type
+`ibex::ext::a::T`; a plugin header declares its entry points in
+`namespace ibex::ext::<namespace>`. Plugins register the qualified name
+(`registry->register_table("csv::read", ...)`).
 
 ---
 
@@ -3649,14 +3743,14 @@ bundled I/O backends are:
 
 | Plugin | Reader | Writer | Format |
 |--------|--------|--------|--------|
-| `csv`  | `read_csv(path)` | `write_csv(df, path)` | RFC 4180 CSV, optional custom delimiter, optional no-header mode |
-| `json` | `read_json(path)` | `write_json(df, path)` | JSON array-of-objects / JSON-Lines |
-| `parquet` | `read_parquet(path)` | `write_parquet(df, path)` | Apache Parquet; local files, HTTPS URLs, and `s3://` object reads |
-| `args` | `parse_args(spec[, argv])` | — | Command-line argument parsing (see below) |
-| `fs` | `list_files(dir[, pattern[, recursive]])` | — | Directory listing as a DataFrame (see below) |
-| `adbc` | `adbc_read(driver, uri, sql[, options])`, `adbc_query(db, sql[, params])` | `adbc_write(db, df, table[, mode])` | Databases through ADBC drivers (see 12.1.1) |
+| `csv`  | `csv::read(path)` | `csv::write(df, path)` | RFC 4180 CSV, optional custom delimiter, optional no-header mode |
+| `json` | `json::read(path)` | `json::write(df, path)` | JSON array-of-objects / JSON-Lines |
+| `parquet` | `parquet::read(path)` | `parquet::write(df, path)` | Apache Parquet; local files, HTTPS URLs, and `s3://` object reads |
+| `args` | `args::parse(spec[, argv])` | — | Command-line argument parsing (see below) |
+| `fs` | `fs::list(dir[, pattern[, recursive]])` | — | Directory listing as a DataFrame (see below) |
+| `adbc` | `adbc::read(driver, uri, sql[, options])`, `adbc::query(db, sql[, params])` | `adbc::write(db, df, table[, mode])` | Databases through ADBC drivers (see 12.1.1) |
 
-**`parse_args`** turns a spec string and an argument vector into a table with a
+**`args::parse`** turns a spec string and an argument vector into a table with a
 **fixed schema** — one row per argument:
 
 | Column | Meaning |
@@ -3684,7 +3778,7 @@ separator); a non-empty second argument overrides it.
 
 ```
 import "args";
-let args  = parse_args("threads (t) : int = 4 ; input : positional+");
+let args  = args::parse("threads (t) : int = 4 ; input : positional+");
 let n     = Int64(scalar(args[filter name == "threads", select { value }]));
 let files = args[filter kind == "positional", select { path = value }];
 ```
@@ -3693,17 +3787,17 @@ A common example using the bundled CSV plugin:
 
 ```
 import "csv";
-let iris = read_csv("iris.csv");
+let iris = csv::read("iris.csv");
 ```
 
 The equivalent explicit form is:
 
 ```
-extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
-let iris = read_csv("iris.csv");
+extern fn csv::read(path: String) -> DataFrame from "csv.hpp";
+let iris = csv::read("iris.csv");
 ```
 
-`read_csv` infers column types from the input file (Int64, Float64, or String
+`csv::read` infers column types from the input file (Int64, Float64, or String
 per column). The resulting schema is implementation-defined. A bare empty
 field (`a,,c`) reads as null rather than forcing an otherwise-numeric column
 to String; a column with no non-empty values, or one with a non-numeric
@@ -3711,7 +3805,7 @@ value in any row, still infers as String, with empty fields kept as `""`.
 
 The standard CLI, REPL, and Python hosts link the first-party Parquet backend
 directly; an optional thin compatibility plugin delegates to that same backend.
-It accepts local file paths, HTTPS URLs, and S3 object URIs in `read_parquet`.
+It accepts local file paths, HTTPS URLs, and S3 object URIs in `parquet::read`.
 HTTPS URLs require no cloud credentials and are suitable for public objects,
 presigned S3 URLs, and CDN-hosted files. S3 credentials and profiles are
 resolved by the AWS SDK through the usual environment, config-file, and
@@ -3720,11 +3814,11 @@ instance-metadata mechanisms; URI query parameters such as `region` and
 
 ```
 import "parquet";
-let public_prices = read_parquet("https://data.example.com/prices.parquet");
-let prices = read_parquet("s3://market-data/prices.parquet?region=us-east-1");
+let public_prices = parquet::read("https://data.example.com/prices.parquet");
+let prices = parquet::read("s3://market-data/prices.parquet?region=us-east-1");
 ```
 
-In the interactive runtime, binding `read_parquet` reads the file footer first
+In the interactive runtime, binding `parquet::read` reads the file footer first
 and defers column data. Query plans decode only referenced columns. When a
 row-local filter sits directly above a source that is scanned once, predicate
 columns are decoded first and the surviving row indices are passed into the
@@ -3737,11 +3831,11 @@ retained so these optimizations do not change query semantics.
 The bundled CSV plugin also supports:
 
 ```
-extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
-extern fn read_csv(path: String, nulls: String, delimiter: String) -> DataFrame from "csv.hpp";
-extern fn read_csv(path: String, nulls: String, delimiter: String, has_header: Bool)
+extern fn csv::read(path: String, nulls: String) -> DataFrame from "csv.hpp";
+extern fn csv::read(path: String, nulls: String, delimiter: String) -> DataFrame from "csv.hpp";
+extern fn csv::read(path: String, nulls: String, delimiter: String, has_header: Bool)
     -> DataFrame from "csv.hpp";
-extern fn read_csv(path: String, nulls: String, delimiter: String, has_header: Bool,
+extern fn csv::read(path: String, nulls: String, delimiter: String, has_header: Bool,
                    schema: String) -> DataFrame from "csv.hpp";
 ```
 
@@ -3751,17 +3845,17 @@ When `has_header` is `false`, the reader synthesizes numbered column names:
 The JSON plugin supports three input formats:
 
 ```
-extern fn read_json(path: String) -> DataFrame from "json.hpp";
-let df = read_json("data.json");
+extern fn json::read(path: String) -> DataFrame from "json.hpp";
+let df = json::read("data.json");
 ```
 
-`read_json` accepts: (1) a JSON array of objects
+`json::read` accepts: (1) a JSON array of objects
 (`[{"a":1},{"a":2}]`), (2) JSON-Lines (one object per line), or (3) a single
 JSON object (produces a one-row DataFrame). Type inference follows:
 Int64 → Float64 → Bool → String. Mixed integer/float columns widen to Float64.
 JSON `null` values and missing keys produce null bitmaps.
 
-**`list_files`** (plugin `fs`) returns one row per directory entry:
+**`fs::list`** (plugin `fs`) returns one row per directory entry:
 
 | Column | Type | Meaning |
 |--------|------|---------|
@@ -3782,9 +3876,9 @@ directory is transformed — e.g. every CSV to Parquet:
 import "csv";
 import "fs";
 import "parquet";
-list_files("data/csv", "*.csv")[map {
+fs::list("data/csv", "*.csv")[map {
     source = path,
-    rows   = write_parquet(read_csv(path), `data/parquet/${stem}.parquet`)
+    rows   = parquet::write(csv::read(path), `data/parquet/${stem}.parquet`)
 }];
 ```
 
@@ -3792,8 +3886,8 @@ All plugins can also be loaded via `import` (Section 13.4):
 
 ```
 import "json";
-let df = read_json("data.json");
-write_json(df, "output.json");
+let df = json::read("data.json");
+json::write(df, "output.json");
 ```
 
 The transpiler emits the `from` path as a `#include` in the generated C++.
@@ -3809,17 +3903,17 @@ the driver library; `uri` is the driver's database URI or path.
 
 | Function | Result | Meaning |
 |----------|--------|---------|
-| `adbc_read(driver, uri, sql, options = "")` | DataFrame | One-off read: opens a connection, runs `sql`, closes. Streams in Arrow batches. |
-| `adbc_connect(driver, uri, options = "")` | `AdbcConnection` | Opens a connection that later calls share (resource type, 11.5). |
-| `adbc_query(db, sql, params = Table {})` | DataFrame | Runs a query on `db`. |
-| `adbc_execute(db, sql, params = Table {})` | Int | Runs a statement that returns no rows; the affected-row count, or `-1` when the driver reports none. |
-| `adbc_write(db, df, table, mode = "create")` | Int | Bulk-inserts `df` through the driver's ingestion path; the rows written. `mode` is `create`, `append`, `replace` or `create_append`. A failed write writes no rows. |
-| `adbc_tables(db)` | DataFrame | `catalog`, `schema`, `table`, `type` of every table and view `db` sees. |
-| `adbc_table_schema(db, table, schema = "", catalog = "")` | DataFrame | `column`, `arrow_type`, `ibex_type`, `nullable`, `reason`: what a query would give each column, or why it has none. `nullable` is `false` only when the driver reports NOT NULL. |
-| `adbc_begin(db)`, `adbc_commit(db)`, `adbc_rollback(db)` | Int | Group the calls between them into one transaction. A failure inside dooms it: `adbc_commit` then rolls back and reports an error. Closing a connection never commits. No nesting. |
-| `adbc_close(db)` | Int | Closes `db` for every binding: `1` the first time, `0` after. |
+| `adbc::read(driver, uri, sql, options = "")` | DataFrame | One-off read: opens a connection, runs `sql`, closes. Streams in Arrow batches. |
+| `adbc::connect(driver, uri, options = "")` | `adbc::Connection` | Opens a connection that later calls share (resource type, 11.5). |
+| `adbc::query(db, sql, params = Table {})` | DataFrame | Runs a query on `db`. |
+| `adbc::execute(db, sql, params = Table {})` | Int | Runs a statement that returns no rows; the affected-row count, or `-1` when the driver reports none. |
+| `adbc::write(db, df, table, mode = "create")` | Int | Bulk-inserts `df` through the driver's ingestion path; the rows written. `mode` is `create`, `append`, `replace` or `create_append`. A failed write writes no rows. |
+| `adbc::tables(db)` | DataFrame | `catalog`, `schema`, `table`, `type` of every table and view `db` sees. |
+| `adbc::table_schema(db, table, schema = "", catalog = "")` | DataFrame | `column`, `arrow_type`, `ibex_type`, `nullable`, `reason`: what a query would give each column, or why it has none. `nullable` is `false` only when the driver reports NOT NULL. |
+| `adbc::begin(db)`, `adbc::commit(db)`, `adbc::rollback(db)` | Int | Group the calls between them into one transaction. A failure inside dooms it: `adbc::commit` then rolls back and reports an error. Closing a connection never commits. No nesting. |
+| `adbc::close(db)` | Int | Closes `db` for every binding: `1` the first time, `0` after. |
 
-All functions except `adbc_read` take a connection and follow the resource
+All functions except `adbc::read` take a connection and follow the resource
 rules of 11.5. Connection functions run one statement at a time, in order,
 and a connection is single-statement at any moment.
 
@@ -3830,11 +3924,11 @@ the connection is open. The rest of the key reaches the driver unchanged
 (`conn.adbc.connection.autocommit`, not `conn.autocommit`). A backslash escapes
 `;`, `=` and `\` in keys and values. `entrypoint=` overrides the driver's
 initialization symbol. `conn.adbc.connection.autocommit` is refused unless
-`true`: use `adbc_begin`.
+`true`: use `adbc::begin`.
 
 **Parameters.** `params` binds columns by position to the driver's
 placeholders (`?`, `$1`). The prepared statement runs once per row; a
-query's results are concatenated in row order and `adbc_execute`'s counts
+query's results are concatenated in row order and `adbc::execute`'s counts
 add. A table with no rows runs nothing.
 
 **Type mapping on read.**
@@ -3862,7 +3956,7 @@ Timestamp to microseconds). Nulls survive in every column.
 Drivers differ in what they report and accept; Ibex works around the known
 cases (DuckDB takes one parameter row per statement and appends whole rows
 only; MySQL commits when it creates or drops a table, so `create`, `replace`
-and `create_append` are refused inside `adbc_begin`). `docs/io.html` and
+and `create_append` are refused inside `adbc::begin`). `docs/io.html` and
 `docs/connections.html` list the per-driver behaviour.
 
 ### 12.2 Scalar Extraction
@@ -4407,7 +4501,7 @@ The source extern must be declared via `extern fn` (Section 10) or loaded
 with `import` before the `Stream` expression is evaluated.
 
 ```
-source = udp_recv(9001, "ts:ts,symbol:str,price:f64,volume:i64")
+source = udp::recv(9001, "ts:ts,symbol:str,price:f64,volume:i64")
 ```
 
 **`transform = [<clause>, ...]`**
@@ -4435,7 +4529,7 @@ stream runtime prepends the transform output automatically. Any remaining
 arguments after the first are supplied in the `sink` field.
 
 ```
-sink = udp_send("127.0.0.1", 9002)
+sink = udp::send("127.0.0.1", 9002)
 ```
 
 ### 13.3 Stream Kinds
@@ -4464,8 +4558,27 @@ import "json";
 
 This locates `<name>.ibex` on the import search path, parses its `extern fn`
 declarations, and loads the corresponding shared library (e.g. `udp.so`,
-`json.so`) via the plugin mechanism (Section 10.4). The `import` statement is
+`json.so`) via the plugin mechanism (Section 11.4). The `import` statement is
 shorthand for manually writing a series of `extern fn` declarations.
+
+The bundled stubs declare their functions in a namespace (Section 11.7):
+`import "udp";` makes `udp::recv` and `udp::send` callable, and brings no
+unqualified name in with it. A stream names them qualified, or after
+`using udp;` without the prefix:
+
+```
+import "udp";
+using udp;
+let s = Stream {
+    source    = recv(9001, "ts:ts,symbol:str,price:f64,volume:i64"),
+    transform = [resample 1m, select { close = last(price) }],
+    sink      = send("127.0.0.1", 9002)
+};
+```
+
+Which library a stub's declarations load is decided by each declaration's
+`from` path (`from "udp"` loads `udp.so`), not by the namespace, so a file may
+declare a namespace unrelated to its own name and still load the right plugin.
 
 `import` accepts either a quoted string or a bare identifier:
 
@@ -4555,14 +4668,14 @@ The following example reads tick data from UDP port 9001, resamples it into
 import "udp";
 
 let ohlc_stream = Stream {
-    source    = udp_recv(9001, "ts:ts,symbol:str,price:f64,volume:i64"),
+    source    = udp::recv(9001, "ts:ts,symbol:str,price:f64,volume:i64"),
     transform = [resample 1m, select {
         open  = first(price),
         high  = max(price),
         low   = min(price),
         close = last(price)
     }],
-    sink = udp_send("127.0.0.1", 9002)
+    sink = udp::send("127.0.0.1", 9002)
 };
 ```
 
@@ -4571,13 +4684,13 @@ The `resample 1m` in the transform causes the stream kind to be inferred as
 after the first tick in that bar is received (wall-clock trigger), or
 immediately when the first tick belonging to the next minute arrives
 (data-timestamp trigger) — whichever occurs first. The REPL blocks until
-`udp_recv` returns an empty DataFrame (the sender signals end-of-stream).
+`udp::recv` returns an empty DataFrame (the sender signals end-of-stream).
 
-**Note on `udp_recv` timeout:** for prompt end-of-bucket delivery, the
-`udp_recv` implementation should use a short socket receive timeout (e.g.
+**Note on `udp::recv` timeout:** for prompt end-of-bucket delivery, the
+`udp::recv` implementation should use a short socket receive timeout (e.g.
 5–10 ms) and return `StreamTimeout{}` when it fires with no data. This allows
 the wall-clock check to fire close to the bucket boundary while the source
-stays live and misses no messages. A `udp_recv` that blocks indefinitely
+stays live and misses no messages. A `udp::recv` that blocks indefinitely
 delays emission until the next tick arrives.
 
 ---
@@ -4592,13 +4705,13 @@ function usage, and TimeFrame windowing.
 // --------------------------------------------------
 // Extern: CSV loader + scalar helper
 // --------------------------------------------------
-extern fn read_csv(path: String) -> DataFrame<Schema> from "csv.hpp";
+extern fn csv::read(path: String) -> DataFrame<Schema> from "csv.hpp";
 extern fn clamp(x: Float64, lo: Float64, hi: Float64) -> Float64 from "stats.hpp";
 
 // --------------------------------------------------
 // Load iris dataset (schema inferred)
 // --------------------------------------------------
-let iris = read_csv("iris.csv");
+let iris = csv::read("iris.csv");
 
 // --------------------------------------------------
 // Grouped aggregation with extern function call
@@ -4635,7 +4748,7 @@ let annotated = iris[
 // --------------------------------------------------
 // TimeFrame: load tick data, compute rolling returns
 // --------------------------------------------------
-let ticks = read_csv("ticks.csv");
+let ticks = csv::read("ticks.csv");
 
 let tf = as_timeframe(ticks, timestamp);
 
@@ -4650,7 +4763,7 @@ let enriched = tf[
 // --------------------------------------------------
 // Output
 // --------------------------------------------------
-write_csv(summary, "summary.csv");
+csv::write(summary, "summary.csv");
 print(enriched);
 ```
 
@@ -4735,6 +4848,8 @@ where   (the `map ... where` compile-time expansion filter, and the
          `where <predicate> update { ... }` row guard — Section 5.3)
 map  get  in
 type    (only directly after `extern`: `extern type` — Section 11.5)
+namespace  using   (only at the start of a statement, followed by a name —
+                    Section 11.7)
 ```
 
 ---
@@ -4847,8 +4962,8 @@ That makes expensive data loads practical:
 
 ```python
 %%ibex --quiet
-extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
-let train = read_csv("../../kaggle/data/train.csv", "<empty>");
+extern fn csv::read(path: String, nulls: String) -> DataFrame from "csv.hpp";
+let train = csv::read("../../kaggle/data/train.csv", "<empty>");
 
 %%ibex --as pandas --out bucket_summary
 train[select { rows = count() }, by seconds_in_bucket, order seconds_in_bucket];

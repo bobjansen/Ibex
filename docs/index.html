@@ -178,6 +178,12 @@
       C++ binary. Scalar lookups may be null, so optional configuration can be
       recovered explicitly with <code>coalesce</code>.
     </p>
+    <p class="section-sub">
+      Library functions live in namespaces: <code>import "csv"</code> then
+      <code>csv::read(path)</code>, or <code>using csv;</code> and
+      <code>read(path)</code>. Scripts declare their own with
+      <code>namespace name { fn ... }</code>.
+    </p>
   </section>
 
   <!-- Install -->
@@ -206,7 +212,7 @@
 <pre><code><span class="cm"># Unpack the archive for your platform, then:</span>
 ./ibex --plugin-path ./plugins</code></pre>
 <pre><code><span class="kw">import</span> <span class="str">"data_gen"</span>;
-<span class="kw">let</span> ticks = <span class="fn-name">gen_ticks</span>(<span class="num">100</span>);
+<span class="kw">let</span> ticks = <span class="fn-name">gen::ticks</span>(<span class="num">100</span>);
 
 <span class="cm">// Order symbols by total volume</span>
 ticks[

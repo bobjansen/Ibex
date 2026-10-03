@@ -2,11 +2,11 @@
 // closes. The compiled program holds it as a variable and runs each call where
 // the statement is; `rows` is read before the close, as the interpreter does.
 import "adbc";
-let db = adbc_connect("@SQLITE_DRIVER@", "file:/tmp/ibex_parity_adbc_connection.db");
-adbc_execute(db, "create table t (x integer)");
+let db = adbc::connect("@SQLITE_DRIVER@", "file:/tmp/ibex_parity_adbc_connection.db");
+adbc::execute(db, "create table t (x integer)");
 let src = Table { x = [3, 1, 2] };
-adbc_write(db, src, "t", "append");
-let n = adbc_execute(db, "insert into t values (10)");
-let rows = adbc_query(db, "select x from t order by x");
-adbc_close(db);
+adbc::write(db, src, "t", "append");
+let n = adbc::execute(db, "insert into t values (10)");
+let rows = adbc::query(db, "select x from t order by x");
+adbc::close(db);
 rows[select { total = sum(x) }];

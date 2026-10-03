@@ -7,45 +7,52 @@
 // on IBEX_LIBRARY_PATH so the Ibex REPL can load it automatically when a
 // script declares:
 //
-//   extern fn read_json(path: String) -> DataFrame from "json.hpp";
-//   extern fn write_json(df: DataFrame, path: String) -> Int from "json.hpp";
+//   extern fn json::read(path: String) -> DataFrame from "json.hpp";
+//   extern fn json::write(df: DataFrame, path: String) -> Int from "json.hpp";
 
 #include "json.hpp"
 
 #include <ibex/runtime/extern_registry.hpp>
+#include <ibex/runtime/interpreter.hpp>
+
+#include <cstdint>
+#include <exception>
+#include <expected>
+#include <variant>
 
 extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* registry) {
-    registry->register_table("read_json",
-                             [](const ibex::runtime::ExternArgs& args)
-                                 -> std::expected<ibex::runtime::ExternValue, std::string> {
-                                 if (args.size() != 1) {
-                                     return std::unexpected("read_json() expects 1 argument");
-                                 }
-                                 const auto* path = std::get_if<std::string>(&args[0]);
-                                 if (path == nullptr) {
-                                     return std::unexpected("read_json() expects a string path");
-                                 }
-                                 try {
-                                     return ibex::runtime::ExternValue{read_json(*path)};
-                                 } catch (const std::exception& e) {
-                                     return std::unexpected(std::string(e.what()));
-                                 }
-                             });
+    registry->register_table(
+        "json::read",
+        [](const ibex::runtime::ExternArgs& args)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            if (args.size() != 1) {
+                return std::unexpected("json::read() expects 1 argument");
+            }
+            const auto* path = std::get_if<std::string>(args.data());
+            if (path == nullptr) {
+                return std::unexpected("json::read() expects a string path");
+            }
+            try {
+                return ibex::runtime::ExternValue{ibex::ext::json::read(*path)};
+            } catch (const std::exception& e) {
+                return std::unexpected(std::string(e.what()));
+            }
+        });
 
     registry->register_scalar_table_consumer(
-        "write_json", ibex::runtime::ScalarKind::Int,
+        "json::write", ibex::runtime::ScalarKind::Int,
         [](const ibex::runtime::Table& table, const ibex::runtime::ExternArgs& args)
             -> std::expected<ibex::runtime::ExternValue, std::string> {
             if (args.size() != 1) {
                 return std::unexpected(
-                    "write_json(df, path) expects exactly 1 scalar argument (path)");
+                    "json::write(df, path) expects exactly 1 scalar argument (path)");
             }
-            const auto* path = std::get_if<std::string>(&args[0]);
+            const auto* path = std::get_if<std::string>(args.data());
             if (path == nullptr) {
-                return std::unexpected("write_json(df, path) expects a string path");
+                return std::unexpected("json::write(df, path) expects a string path");
             }
             try {
-                std::int64_t rows = write_json(table, *path);
+                std::int64_t rows = ibex::ext::json::write(table, *path);
                 return ibex::runtime::ExternValue{ibex::runtime::ScalarValue{rows}};
             } catch (const std::exception& e) {
                 return std::unexpected(std::string(e.what()));

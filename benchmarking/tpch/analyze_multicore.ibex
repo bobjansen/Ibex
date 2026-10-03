@@ -25,7 +25,7 @@
 // min_ms is the statistic compared: a corrupted wall clock only inflates a
 // sample, so the minimum across re-measures / runs is the honest number.
 
-extern fn read_csv(
+extern fn csv::read(
     path: String,
     nulls: String = "",
     delimiter: String = ",",
@@ -33,9 +33,9 @@ extern fn read_csv(
     schema: String = ""
 ) -> DataFrame from "csv.hpp";
 
-extern fn parse_args(spec: String, argv: String = "") -> DataFrame from "args.hpp";
+extern fn args::parse(spec: String, argv: String = "") -> DataFrame from "args.hpp";
 
-let args = parse_args("path : positional # results TSV (history.tsv shape) ; sf : int # scale factor to analyze ; ibex : string = ibex # ibex (multicore) framework name ; polars : string = pdsh-polars-stream # polars (multicore) framework name ; commit : string? # restrict to one commit (default: best min_ms across all runs)");
+let args = args::parse("path : positional # results TSV (history.tsv shape) ; sf : int # scale factor to analyze ; ibex : string = ibex # ibex (multicore) framework name ; polars : string = pdsh-polars-stream # polars (multicore) framework name ; commit : string? # restrict to one commit (default: best min_ms across all runs)");
 
 let path       = scalar(args[filter name == "path",   select { value }]);
 let sf         = Int64(scalar(args[filter name == "sf", select { value }]));
@@ -44,7 +44,7 @@ let pl_fw      = scalar(args[filter name == "polars", select { value }]);
 let commit_sel = coalesce(scalar(args[filter name == "commit", select { value }]), "");
 
 // history.tsv and the per-run *.tsv files are tab-separated.
-let raw0 = read_csv(path, "", "\t", true, "");
+let raw0 = csv::read(path, "", "\t", true, "");
 let raw = raw0[filter { commit_sel == "" || commit == commit_sel }];
 
 // Collapse every run / re-measure for this scale factor to one number per query.

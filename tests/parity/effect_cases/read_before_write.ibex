@@ -2,9 +2,9 @@
 // it would be inlined into the sink after the write. It must see the old file.
 import "csv";
 let old = Table { x = [1, 2] };
-write_csv(old, "/tmp/ibex_parity_read_before_write.csv");
-let r = read_csv("/tmp/ibex_parity_read_before_write.csv")[select { s = sum(x) }];
+csv::write(old, "/tmp/ibex_parity_read_before_write.csv");
+let r = csv::read("/tmp/ibex_parity_read_before_write.csv")[select { s = sum(x) }];
 let fresh = Table { x = [10, 20] };
-write_csv(fresh, "/tmp/ibex_parity_read_before_write.csv");
-write_csv(r, "/tmp/ibex_parity_read_before_write_out.csv");
-read_csv("/tmp/ibex_parity_read_before_write_out.csv");
+csv::write(fresh, "/tmp/ibex_parity_read_before_write.csv");
+csv::write(r, "/tmp/ibex_parity_read_before_write_out.csv");
+csv::read("/tmp/ibex_parity_read_before_write_out.csv");

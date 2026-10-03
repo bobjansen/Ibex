@@ -38,7 +38,7 @@
   <span class="kw">order</span> { total <span class="kw">desc</span> }
 ];</code></pre>
     <p>Use <code>rename</code>, <code>distinct</code>, <code>head</code>, and <code>tail</code> for common schema and row-shape operations. A conditional <code>where predicate update { ... }</code> replaces values only on matching rows.</p>
-    <p>When an operation is inherently row-wise, <code>map { name = expr, ... }</code> evaluates scalar fields in input order and returns exactly those fields. It may contain effectful extern calls, such as reading and converting each path returned by <code>list_files</code>. Bind the map result before applying another clause.</p>
+    <p>When an operation is inherently row-wise, <code>map { name = expr, ... }</code> evaluates scalar fields in input order and returns exactly those fields. It may contain effectful extern calls, such as reading and converting each path returned by <code>fs::list</code>. Bind the map result before applying another clause.</p>
   </section>
 
   <section class="section" id="joins">

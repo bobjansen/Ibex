@@ -118,16 +118,17 @@ enum class TokenKind : std::uint8_t {
     FatArrow,  // =>
 
     // Delimiters
-    LParen,     // (
-    RParen,     // )
-    LBracket,   // [
-    RBracket,   // ]
-    LBrace,     // {
-    RBrace,     // }
-    Comma,      // ,
-    Semicolon,  // ;
-    Colon,      // :
-    Arrow,      // ->
+    LParen,      // (
+    RParen,      // )
+    LBracket,    // [
+    RBracket,    // ]
+    LBrace,      // {
+    RBrace,      // }
+    Comma,       // ,
+    Semicolon,   // ;
+    Colon,       // :
+    ColonColon,  // :: (namespace qualifier)
+    Arrow,       // ->
 
     // Special
     Eof,

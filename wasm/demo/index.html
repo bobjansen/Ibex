@@ -76,9 +76,9 @@
 
       const SEED = `import data_gen;
 seed_rng(20240115);
-let trades = gen_ticks(50000, "AAPL,MSFT,GOOG,AMZN,NVDA");
-let reference = gen_reference("AAPL,MSFT,GOOG,AMZN,NVDA");
-let prices = gen_walk(2000, 100.0, 1.0);`;
+let trades = gen::ticks(50000, "AAPL,MSFT,GOOG,AMZN,NVDA");
+let reference = gen::reference("AAPL,MSFT,GOOG,AMZN,NVDA");
+let prices = gen::walk(2000, 100.0, 1.0);`;
 
       const EXAMPLES = {
         "Sample data": SEED,

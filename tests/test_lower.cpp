@@ -455,7 +455,7 @@ result;
 
 TEST_CASE("lower_script optimizes a shared binding's plan like the result's", "[parser][lower]") {
     // A binding used twice is planned once, as a shared binding -- which is
-    // what every PDS-H script's `write_csv(result, ...); result;` makes of the
+    // what every PDS-H script's `csv::write(result, ...); result;` makes of the
     // whole query. Its plan must get the optimizer the result gets: skipping it
     // left `[order ...][head n]` an Order feeding a Head (a full sort) where
     // canonicalize R16 fuses a TopK (a heap-select), along with every other
@@ -478,7 +478,7 @@ result;
 }
 
 TEST_CASE("lower_script optimizes a sink's input like the result", "[parser][lower]") {
-    // Every PDS-H script ends `write_csv(result, ...); result;`. The batch
+    // Every PDS-H script ends `csv::write(result, ...); result;`. The batch
     // driver runs the sink's input plan and serves the final `result` from
     // that table, so the plan that actually executes is the sink's -- and it
     // must be optimized as the result's is. It was not: `[order ...][head n]`
@@ -1671,9 +1671,9 @@ enriched[filter x > 10, select { x }];
 TEST_CASE("Lower stream expression with context-provided source and sink externs") {
     auto program = require_parse(R"(
 Stream {
-    source = udp_recv(9001),
+    source = udp::recv(9001),
     transform = [resample 1m, select { open = first(price) }],
-    sink = ws_send(8080)
+    sink = ws::send(8080)
 };
 )");
     REQUIRE(program.statements.size() == 1);
@@ -1681,15 +1681,15 @@ Stream {
     REQUIRE(expr_stmt != nullptr);
 
     parser::LowerContext ctx;
-    ctx.table_externs.insert("udp_recv");
-    ctx.sink_externs.insert("ws_send");
+    ctx.table_externs.insert("udp::recv");
+    ctx.sink_externs.insert("ws::send");
 
     auto result = parser::lower_expr(*expr_stmt->expr, ctx);
     REQUIRE(result.has_value());
     const auto* stream = as_node<ir::StreamNode>(result->get());
     REQUIRE(stream != nullptr);
-    REQUIRE(stream->source_callee() == "udp_recv");
-    REQUIRE(stream->sink_callee() == "ws_send");
+    REQUIRE(stream->source_callee() == "udp::recv");
+    REQUIRE(stream->sink_callee() == "ws::send");
 }
 
 TEST_CASE("Lower stream source binds named arguments to declared positions") {
@@ -1698,11 +1698,11 @@ TEST_CASE("Lower stream source binds named arguments to declared positions") {
     auto program = require_parse(R"(
 extern fn feed(brokers: String, topic: String, group: String, schema: String)
     -> DataFrame from "x";
-extern fn ws_send(df: DataFrame, port: Int) -> Int from "x";
+extern fn ws::send(df: DataFrame, port: Int) -> Int from "x";
 Stream {
     source = feed(group = "g", brokers = "b", topic = "t", schema = "s"),
     transform = [select { x = price }],
-    sink = ws_send(8080)
+    sink = ws::send(8080)
 };
 )");
     auto result = parser::lower(program);
@@ -2264,4 +2264,26 @@ TEST_CASE("Scalar subquery reuse is scoped to one filter", "[lower][scalar_reuse
     std::vector<ir::NodeKind> kinds;
     collect_kinds(**result, kinds);
     REQUIRE(std::ranges::count(kinds, ir::NodeKind::Aggregate) == 2);
+}
+
+TEST_CASE("Lower a qualified call in a filter clause keeps the qualified callee") {
+    // A column named like the namespace is in the frame; the callee must still
+    // be the namespaced function, not the column. Parity cannot see this: both
+    // sides lower through the same code, so assert on the IR.
+    auto program = require_parse(
+        "namespace geo { extern fn near(x: Int) -> Int from \"geo.hpp\"; }\n"
+        "df[filter geo::near(geo) > 1];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+    const auto* filter = as_node<ir::FilterNode>(result->get());
+    REQUIRE(filter != nullptr);
+    const auto* cmp = std::get_if<ibex::ir::CompareExpr>(&filter->predicate().node);
+    REQUIRE(cmp != nullptr);
+    const auto* call = std::get_if<ibex::ir::CallExpr>(&cmp->left->node);
+    REQUIRE(call != nullptr);
+    CHECK(call->callee == "geo::near");
+    REQUIRE(call->args.size() == 1);
+    const auto* arg = std::get_if<ibex::ir::ColumnRef>(&call->args[0]->node);
+    REQUIRE(arg != nullptr);
+    CHECK(arg->name == "geo");
 }

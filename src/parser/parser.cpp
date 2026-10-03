@@ -36,6 +36,10 @@
 // ----------------
 //   Program { vector<Stmt> }
 //   Stmt = ExternDecl | FunctionDecl | LetStmt | TupleLetStmt | ExprStmt | ImportDecl
+//          | ExternTypeDecl | UsingDecl
+//     `namespace a { ... }` is not a statement: its declarations are appended
+//     with qualified names (`a::f`, scope "a") and the block is dropped.
+//     Qualified names (`a::f(...)`) are plain strings in CallExpr::callee.
 //     Every statement ends in ';' (except FunctionDecl, which ends at its
 //     closing '}') and records its start_line/end_line.
 //     FunctionDecl bodies are vector<FnStmt> (let / tuple-let / expression
@@ -63,6 +67,7 @@
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/effects.hpp>
 #include <ibex/parser/lexer.hpp>
+#include <ibex/parser/names.hpp>
 #include <ibex/parser/parser.hpp>
 
 #include <cctype>
@@ -96,6 +101,13 @@ class Parser {
                 return std::unexpected(make_error(
                     peek(), ibex::formatting::format("invalid token {}", format_token(peek()))));
             }
+            if (check_contextual("namespace", TokenKind::Identifier)) {
+                advance();
+                if (!parse_namespace_block(program.statements)) {
+                    return std::unexpected(error_);
+                }
+                continue;
+            }
             auto stmt = parse_statement();
             if (!stmt.has_value()) {
                 return std::unexpected(error_);
@@ -106,7 +118,160 @@ class Parser {
     }
 
    private:
+    /// `word` is a contextual keyword here: an identifier spelled `word` and
+    /// followed by a token of kind `next`. Everywhere else it stays a name.
+    [[nodiscard]] auto check_contextual(std::string_view word, TokenKind next) const -> bool {
+        return check(TokenKind::Identifier) && peek().lexeme == word && peek_next().kind == next;
+    }
+
+    /// `name` inside the namespace being parsed (`a::b::name`), or `name`
+    /// itself at global scope.
+    [[nodiscard]] auto qualify(std::string_view name) const -> std::string {
+        if (current_namespace_.empty()) {
+            return std::string(name);
+        }
+        return current_namespace_ + "::" + std::string(name);
+    }
+
+    /// The `::name` parts after an identifier that was just consumed, appended
+    /// to `name`. `a::b::c` reads as one name.
+    auto parse_qualified_rest(std::string name) -> std::optional<std::string> {
+        while (match(TokenKind::ColonColon)) {
+            auto part = consume_identifier("expected a name after '::'");
+            if (!part.has_value()) {
+                return std::nullopt;
+            }
+            name += "::";
+            name += *part;
+        }
+        return name;
+    }
+
+    /// Sets the namespace being parsed for one declaration, restoring the
+    /// enclosing one when it goes out of scope.
+    class NamespaceGuard {
+       public:
+        NamespaceGuard(std::string& current, std::string scope)
+            : current_(&current), saved_(std::exchange(current, std::move(scope))) {}
+        NamespaceGuard(const NamespaceGuard&) = delete;
+        NamespaceGuard(NamespaceGuard&&) = delete;
+        auto operator=(const NamespaceGuard&) -> NamespaceGuard& = delete;
+        auto operator=(NamespaceGuard&&) -> NamespaceGuard& = delete;
+        ~NamespaceGuard() { *current_ = std::move(saved_); }
+
+       private:
+        std::string* current_;
+        std::string saved_;
+    };
+
+    /// The namespace part of a qualified declaration name (`a::b` for
+    /// `a::b::f`); empty for an unqualified one.
+    static auto scope_of(const std::string& name) -> std::string {
+        const auto cut = name.rfind("::");
+        return cut == std::string::npos ? std::string{} : name.substr(0, cut);
+    }
+
+    /// The full name a declaration named `first` (just consumed) declares. It
+    /// may be qualified, `extern fn csv::read(...)` being shorthand for the
+    /// same declaration in `namespace csv { ... }`.
+    auto parse_declared_name(std::string first) -> std::optional<std::string> {
+        auto name = parse_qualified_rest(std::move(first));
+        if (!name.has_value()) {
+            return std::nullopt;
+        }
+        return qualify(*name);
+    }
+
+    /// `namespace a::b { decl... }`, with `namespace` already consumed. The
+    /// block is flattened: each declaration is appended to `out` with its name
+    /// qualified, and nothing of the block itself remains.
+    auto parse_namespace_block(std::vector<Stmt>& out) -> bool {
+        auto first = consume_identifier("expected a namespace name after 'namespace'");
+        if (!first.has_value()) {
+            return false;
+        }
+        auto name = parse_qualified_rest(std::move(*first));
+        if (!name.has_value()) {
+            return false;
+        }
+        if (!consume(TokenKind::LBrace, "expected '{' after namespace name")) {
+            return false;
+        }
+        const std::string saved = current_namespace_;
+        current_namespace_ = qualify(*name);
+        while (!check(TokenKind::RBrace) && !is_at_end()) {
+            if (check_contextual("namespace", TokenKind::Identifier)) {
+                advance();
+                if (!parse_namespace_block(out)) {
+                    return false;
+                }
+                continue;
+            }
+            std::optional<Stmt> decl;
+            if (match(TokenKind::KeywordExtern)) {
+                decl = parse_extern_decl();
+            } else if (match(TokenKind::KeywordFn)) {
+                decl = parse_fn_decl();
+            } else if (check_contextual("using", TokenKind::Identifier)) {
+                error_ = make_error(peek(), "'using' is not supported inside a namespace block");
+                return false;
+            } else {
+                error_ = make_error(peek(),
+                                    "only 'fn', 'extern fn', 'extern type' and 'namespace' "
+                                    "declarations may appear in a namespace block");
+                return false;
+            }
+            if (!decl.has_value()) {
+                return false;
+            }
+            out.push_back(std::move(*decl));
+        }
+        if (!consume(TokenKind::RBrace, "expected '}' to close namespace '" + *name + "'")) {
+            return false;
+        }
+        current_namespace_ = saved;
+        return true;
+    }
+
+    /// `using a::b;` with `using` already consumed.
+    auto parse_using_decl() -> std::optional<Stmt> {
+        const std::size_t start_line = previous().line;
+        auto first = consume_identifier("expected a name after 'using'");
+        if (!first.has_value()) {
+            return std::nullopt;
+        }
+        auto target = parse_qualified_rest(std::move(*first));
+        if (!target.has_value()) {
+            return std::nullopt;
+        }
+        if (!consume(TokenKind::Semicolon, "expected ';' after using declaration")) {
+            return std::nullopt;
+        }
+        return UsingDecl{
+            .target = std::move(*target),
+            .start_line = start_line,
+            .end_line = previous().line,
+        };
+    }
+
+    /// Record a declaration named `name` (already qualified). A name declared in
+    /// a namespace has exactly one declaration: no overloads, and no silent
+    /// replacement when two blocks of the same namespace both declare it.
+    auto declare(std::string_view name, const Token& at,
+                 robin_hood::unordered_set<std::string>& names) -> bool {
+        const bool fresh = names.insert(std::string(name)).second;
+        if (!fresh && !current_namespace_.empty()) {
+            error_ = make_error(at, "'" + std::string(name) + "' is already declared");
+            return false;
+        }
+        return true;
+    }
+
     auto parse_statement() -> std::optional<Stmt> {
+        if (check_contextual("using", TokenKind::Identifier)) {
+            advance();
+            return parse_using_decl();
+        }
         if (match(TokenKind::KeywordExtern)) {
             return parse_extern_decl();
         }
@@ -169,6 +334,18 @@ class Parser {
         if (!name.has_value()) {
             return std::nullopt;
         }
+        auto full_name = parse_declared_name(std::move(*name));
+        if (!full_name.has_value()) {
+            return std::nullopt;
+        }
+        *name = std::move(*full_name);
+        // The rest of the declaration is parsed in the namespace it declares
+        // into, so `extern fn adbc::connect(...) -> Connection` names
+        // `adbc::Connection`.
+        const NamespaceGuard in_scope(current_namespace_, scope_of(*name));
+        if (!declare(*name, previous(), declared_functions_)) {
+            return std::nullopt;
+        }
         if (!consume(TokenKind::LParen, "expected '(' after extern function name")) {
             return std::nullopt;
         }
@@ -217,12 +394,25 @@ class Parser {
             .source_path = std::move(source_path),
             .start_line = start_line,
             .end_line = previous().line,
+            .scope = current_namespace_,
         };
     }
 
     auto parse_extern_type_decl(std::size_t start_line) -> std::optional<Stmt> {
         auto name = consume_identifier("expected type name after 'extern type'");
         if (!name.has_value()) {
+            return std::nullopt;
+        }
+        auto full_name = parse_declared_name(std::move(*name));
+        if (!full_name.has_value()) {
+            return std::nullopt;
+        }
+        *name = std::move(*full_name);
+        // The rest of the declaration is parsed in the namespace it declares
+        // into, so `extern fn adbc::connect(...) -> Connection` names
+        // `adbc::Connection`.
+        const NamespaceGuard in_scope(current_namespace_, scope_of(*name));
+        if (!declare(*name, previous(), declared_types_)) {
             return std::nullopt;
         }
         if (!consume(TokenKind::KeywordFrom, "expected 'from' after extern type name")) {
@@ -240,6 +430,7 @@ class Parser {
             .source_path = std::move(source_path),
             .start_line = start_line,
             .end_line = previous().line,
+            .scope = current_namespace_,
         };
     }
 
@@ -247,6 +438,18 @@ class Parser {
         const std::size_t start_line = previous().line;
         auto name = consume_identifier("expected function name");
         if (!name.has_value()) {
+            return std::nullopt;
+        }
+        auto full_name = parse_declared_name(std::move(*name));
+        if (!full_name.has_value()) {
+            return std::nullopt;
+        }
+        *name = std::move(*full_name);
+        // The rest of the declaration is parsed in the namespace it declares
+        // into, so `extern fn adbc::connect(...) -> Connection` names
+        // `adbc::Connection`.
+        const NamespaceGuard in_scope(current_namespace_, scope_of(*name));
+        if (!declare(*name, previous(), declared_functions_)) {
             return std::nullopt;
         }
         if (!consume(TokenKind::LParen, "expected '(' after function name")) {
@@ -326,6 +529,7 @@ class Parser {
             .body = std::move(body),
             .start_line = start_line,
             .end_line = previous().line,
+            .scope = current_namespace_,
         };
     }
 
@@ -674,7 +878,7 @@ class Parser {
             // clause that does nothing.
             std::optional<JoinNullMatch> null_match;
             // `nulls` is matched contextually, not reserved: the shipped
-            // `read_csv(path, nulls: String = "", ...)` names a parameter that,
+            // `csv::read(path, nulls: String = "", ...)` names a parameter that,
             // and a join trailer is the one place the word can appear with this
             // meaning. Nothing else may follow a key list, so there is no
             // ambiguity to resolve.
@@ -1233,6 +1437,9 @@ class Parser {
             if (check(TokenKind::LParen)) {
                 return fail_expr(peek(), "'^' cannot be applied to a call");
             }
+            if (check(TokenKind::ColonColon)) {
+                return fail_expr(peek(), "'^' cannot be applied to a qualified name");
+            }
             auto expr = std::make_unique<Expr>();
             expr->node = IdentifierExpr{.name = std::move(name), .lexical = true};
             return expr;
@@ -1325,53 +1532,36 @@ class Parser {
             if (name == "Table" && check(TokenKind::LParen)) {
                 return parse_table_rows_expr();
             }
+            if (check(TokenKind::ColonColon)) {
+                auto qualified = parse_qualified_rest(std::move(name));
+                if (!qualified.has_value()) {
+                    return nullptr;
+                }
+                return parse_qualified_call(std::move(*qualified));
+            }
             if (match(TokenKind::LParen)) {
                 if (name == "rank") {
                     return parse_rank_call();
                 }
-                std::vector<ExprPtr> args;
-                std::vector<NamedArg> named_args;
-                bool seen_named = false;
-                if (!check(TokenKind::RParen)) {
-                    do {
-                        // Named arg: identifier = expr (only when not followed by == or !=)
-                        if (peek().kind == TokenKind::Identifier &&
-                            peek_next().kind == TokenKind::Eq) {
-                            seen_named = true;
-                            std::string arg_name{peek().lexeme};
-                            advance();  // consume identifier
-                            advance();  // consume '='
-                            auto val = parse_expression();
-                            if (!val) {
-                                return nullptr;
-                            }
-                            named_args.push_back(
-                                NamedArg{.name = std::move(arg_name), .value = std::move(val)});
-                        } else {
-                            if (seen_named) {
-                                return fail_expr(
-                                    peek(), "positional arguments must precede named arguments");
-                            }
-                            auto arg = parse_expression();
-                            if (!arg) {
-                                return nullptr;
-                            }
-                            args.push_back(std::move(arg));
-                        }
-                    } while (match(TokenKind::Comma) && !check(TokenKind::RParen));
-                }
-                if (!consume(TokenKind::RParen, "expected ')' after argument list")) {
-                    return nullptr;
-                }
-                auto expr = std::make_unique<Expr>();
-                expr->node = CallExpr{.callee = std::move(name),
-                                      .args = std::move(args),
-                                      .named_args = std::move(named_args)};
-                return expr;
+                return parse_call_args(std::move(name));
             }
             auto expr = std::make_unique<Expr>();
             expr->node = IdentifierExpr{.name = std::move(name)};
             return expr;
+        }
+        // `::name(...)`: the global `name`, never one a `using` brought in.
+        // The leading `::` stays on the callee until names are resolved
+        // (names.hpp), which is what tells the two apart.
+        if (match(TokenKind::ColonColon)) {
+            auto first = consume_identifier("expected a name after '::'");
+            if (!first.has_value()) {
+                return nullptr;
+            }
+            auto qualified = parse_qualified_rest(std::move(*first));
+            if (!qualified.has_value()) {
+                return nullptr;
+            }
+            return parse_qualified_call("::" + *qualified);
         }
         if (match(TokenKind::QuotedIdentifier)) {
             std::string name = unescape_quoted_identifier(previous().lexeme);
@@ -1518,6 +1708,59 @@ class Parser {
         return fail_expr(peek(), "expected expression");
     }
 
+    /// A qualified name names a function in a namespace, so it must be called:
+    /// namespaces hold declarations, never values.
+    auto parse_qualified_call(std::string name) -> ExprPtr {
+        if (!match(TokenKind::LParen)) {
+            return fail_expr(peek(), "'" + name +
+                                         "' is a qualified name and must be called; only "
+                                         "functions live in namespaces");
+        }
+        return parse_call_args(std::move(name));
+    }
+
+    /// The arguments of a call to `callee`, after its '('.
+    auto parse_call_args(std::string callee) -> ExprPtr {
+        std::vector<ExprPtr> args;
+        std::vector<NamedArg> named_args;
+        bool seen_named = false;
+        if (!check(TokenKind::RParen)) {
+            do {
+                // Named arg: identifier = expr (only when not followed by == or !=)
+                if (peek().kind == TokenKind::Identifier && peek_next().kind == TokenKind::Eq) {
+                    seen_named = true;
+                    std::string arg_name{peek().lexeme};
+                    advance();  // consume identifier
+                    advance();  // consume '='
+                    auto val = parse_expression();
+                    if (!val) {
+                        return nullptr;
+                    }
+                    named_args.push_back(
+                        NamedArg{.name = std::move(arg_name), .value = std::move(val)});
+                } else {
+                    if (seen_named) {
+                        return fail_expr(peek(),
+                                         "positional arguments must precede named arguments");
+                    }
+                    auto arg = parse_expression();
+                    if (!arg) {
+                        return nullptr;
+                    }
+                    args.push_back(std::move(arg));
+                }
+            } while (match(TokenKind::Comma) && !check(TokenKind::RParen));
+        }
+        if (!consume(TokenKind::RParen, "expected ')' after argument list")) {
+            return nullptr;
+        }
+        auto expr = std::make_unique<Expr>();
+        expr->node = CallExpr{.callee = std::move(callee),
+                              .args = std::move(args),
+                              .named_args = std::move(named_args)};
+        return expr;
+    }
+
     /// Parse `[expr, expr, ...]` — an array literal (column vector).
     auto parse_array_literal() -> ExprPtr {
         // LBracket has already been consumed by the caller.
@@ -1647,7 +1890,11 @@ class Parser {
                 if (!name.has_value()) {
                     return nullptr;
                 }
-                sink_callee = std::move(*name);
+                auto qualified = parse_qualified_rest(std::move(*name));
+                if (!qualified.has_value()) {
+                    return nullptr;
+                }
+                sink_callee = std::move(*qualified);
                 if (!consume(TokenKind::LParen, "expected '(' after sink function name")) {
                     return nullptr;
                 }
@@ -1925,6 +2172,12 @@ class Parser {
         }
         FormulaTerm term;
         term.columns.push_back(std::move(*name));
+        if (check(TokenKind::ColonColon)) {
+            error_ = make_error(peek(),
+                                "'::' is not a formula operator; write an interaction as "
+                                "'a:b'");
+            return std::nullopt;
+        }
         // Parse interaction terms: a:b:c...
         while (match(TokenKind::Colon)) {
             auto next = consume_column_identifier("expected column name after ':'");
@@ -2457,19 +2710,59 @@ class Parser {
             }
             return Type{.kind = Type::Kind::TimeFrame, .arg = SchemaType{}};
         }
+        if (allow_resource && match(TokenKind::ColonColon)) {
+            // `::Name`: the global type, even inside a namespace that declares
+            // one of the same name.
+            auto first = consume_identifier("expected a type name after '::'");
+            if (!first.has_value()) {
+                return std::nullopt;
+            }
+            auto name = parse_qualified_rest(std::move(*first));
+            if (!name.has_value()) {
+                return std::nullopt;
+            }
+            return Type{.kind = Type::Kind::Resource, .resource = std::move(*name)};
+        }
         if (check(TokenKind::Identifier)) {
             if (allow_resource) {
                 advance();
-                return Type{.kind = Type::Kind::Resource,
-                            .resource = std::string(previous().lexeme)};
+                auto name = parse_qualified_rest(std::string(previous().lexeme));
+                if (!name.has_value()) {
+                    return std::nullopt;
+                }
+                return Type{.kind = Type::Kind::Resource, .resource = resolve_type_name(*name)};
             }
-            error_ = make_error(peek(), "unknown type '" + std::string(peek().lexeme) +
-                                            "' (a resource type declared with 'extern type' "
-                                            "can appear only in function signatures)");
+            const Token& at = peek();
+            advance();
+            auto name = parse_qualified_rest(std::string(previous().lexeme));
+            error_ = make_error(at, "unknown type '" + name.value_or(std::string(at.lexeme)) +
+                                        "' (a resource type declared with 'extern type' "
+                                        "can appear only in function signatures)");
             return std::nullopt;
         }
         error_ = make_error(peek(), "expected type");
         return std::nullopt;
+    }
+
+    /// A resource type named inside a namespace block means the innermost
+    /// `extern type` of that name declared in this source, looking outward
+    /// from the current namespace (`Connection` in `namespace adbc` is
+    /// `adbc::Connection`). Anything else is taken as written.
+    [[nodiscard]] auto resolve_type_name(const std::string& name) const -> std::string {
+        if (name.contains("::")) {
+            return name;
+        }
+        std::string scope = current_namespace_;
+        while (!scope.empty()) {
+            std::string candidate = scope;
+            candidate.append("::").append(name);
+            if (declared_types_.contains(candidate)) {
+                return candidate;
+            }
+            const auto cut = scope.rfind("::");
+            scope = cut == std::string::npos ? std::string{} : scope.substr(0, cut);
+        }
+        return name;
     }
 
     auto parse_schema_type() -> std::optional<SchemaType> {
@@ -3084,6 +3377,12 @@ class Parser {
 
     std::vector<Token> tokens_;
     std::size_t current_ = 0;
+    /// The namespace whose block is being parsed (`a::b`); empty at global scope.
+    std::string current_namespace_;
+    /// Qualified names of the `fn` / `extern fn` and `extern type`
+    /// declarations seen so far in this source.
+    robin_hood::unordered_set<std::string> declared_functions_;
+    robin_hood::unordered_set<std::string> declared_types_;
     ParseError error_{};
     /// Set when `parse_scalar_type` consumed `Decimal` but its `(p, s)` was
     /// malformed, so callers keep that precise error instead of overwriting it
@@ -3102,6 +3401,9 @@ auto parse(std::string_view source) -> ParseResult {
     auto program = parser.parse_program();
     if (!program.has_value()) {
         return std::unexpected(program.error());
+    }
+    if (auto qualified = qualify_sibling_calls(*program); !qualified) {
+        return std::unexpected(qualified.error());
     }
     auto analysis = analyze_effects(*program);
     if (!analysis.has_value()) {

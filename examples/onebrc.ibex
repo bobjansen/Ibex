@@ -1,7 +1,7 @@
 // 1BRC-style aggregation over the raw headerless semicolon-delimited file.
 import "csv";
 
-let measurements = read_csv("examples/measurements.txt", "", ";", false)
+let measurements = csv::read("examples/measurements.txt", "", ";", false)
     [{ station = col1, temp = col2 }];
 
 measurements[select {

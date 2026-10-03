@@ -93,19 +93,19 @@ TEST_CASE("parse_ws_options understands poll timeout, malformed policy, and subs
     CHECK(defaults.poll_timeout_ms == 200);
     CHECK_FALSE(defaults.malformed_error);
 
-    // subscribe is a ws_connect-only option; ws_recv rejects it.
+    // subscribe is a ws::connect-only option; ws::recv rejects it.
     CHECK_THROWS(ibex_ws::parse_ws_options("subscribe=x", /*allow_subscribe=*/false));
     CHECK_THROWS(ibex_ws::parse_ws_options("bogus=1", /*allow_subscribe=*/true));
     CHECK_THROWS(ibex_ws::parse_ws_options("on_malformed=maybe", /*allow_subscribe=*/true));
 }
 
-// --- ws_send end-to-end -------------------------------------------------------
+// --- ws::send end-to-end -------------------------------------------------------
 //
 // Sequence:
-//   1. ws_listen() binds the TCP port.
+//   1. ws::listen() binds the TCP port.
 //   2. Client thread connects and sends the HTTP upgrade request.
 //   3. Main thread sleeps 50 ms (upgrade sits in the kernel recv buffer).
-//   4. ws_send() accepts the connection, promotes the handshake via
+//   4. ws::send() accepts the connection, promotes the handshake via
 //      MSG_DONTWAIT recv, sends HTTP 101, then broadcasts the WS frame.
 //   5. Client reads the HTTP 101 + any bundled WS frame bytes, then parses
 //      the frame, verifying the JSON payload.
@@ -113,7 +113,7 @@ TEST_CASE("parse_ws_options understands poll timeout, malformed policy, and subs
 // This test catches the regression where the first WS frame arrives bundled
 // with the HTTP 101 response in the same TCP segment and is discarded.
 
-TEST_CASE("ws_send: handshake and single-row broadcast") {
+TEST_CASE("ws::send: handshake and single-row broadcast") {
     constexpr int kPort = 17765;
 
     try {
@@ -224,7 +224,7 @@ TEST_CASE("ws_send: handshake and single-row broadcast") {
     });
 
     // Give the client time to connect and send the HTTP upgrade request so it
-    // sits in the kernel recv buffer before ws_send calls MSG_DONTWAIT recv.
+    // sits in the kernel recv buffer before ws::send calls MSG_DONTWAIT recv.
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     ibex::runtime::Table table;
@@ -241,14 +241,14 @@ TEST_CASE("ws_send: handshake and single-row broadcast") {
     CHECK(received_json.find("42") != std::string::npos);
 }
 
-// --- ws_recv end-to-end -------------------------------------------------------
+// --- ws::recv end-to-end -------------------------------------------------------
 //
 // A client connects, upgrades, then sends a malformed message, a valid tick,
-// and finally an {"eof":true} sentinel.  ws_recv must skip the malformed
+// and finally an {"eof":true} sentinel.  ws::recv must skip the malformed
 // message (default on_malformed=skip), materialise the tick according to the
 // schema string, and end the stream on the sentinel.
 
-TEST_CASE("ws_recv: schema-driven receive skips malformed messages and honours eof") {
+TEST_CASE("ws::recv: schema-driven receive skips malformed messages and honours eof") {
     constexpr int kPort = 17766;
     const std::string schema = "ts:timestamp,symbol:str,price:f64,volume:i64";
 
@@ -352,13 +352,13 @@ TEST_CASE("ws_recv: schema-driven receive skips malformed messages and honours e
     CHECK(*row.time_index() == "ts");
 }
 
-// --- ws_connect end-to-end ----------------------------------------------------
+// --- ws::connect end-to-end ----------------------------------------------------
 //
-// Loopback: the plugin's own server (ws_listen + ws_send) plays the external
-// feed, and ws_connect consumes it as a client.  A pump thread broadcasts a
-// row every 20 ms; the main thread polls ws_connect until the row arrives.
+// Loopback: the plugin's own server (ws::listen + ws::send) plays the external
+// feed, and ws::connect consumes it as a client.  A pump thread broadcasts a
+// row every 20 ms; the main thread polls ws::connect until the row arrives.
 
-TEST_CASE("ws_connect: client source receives broadcast rows") {
+TEST_CASE("ws::connect: client source receives broadcast rows") {
     constexpr int kPort = 17767;
 
     try {

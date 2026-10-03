@@ -240,7 +240,7 @@ auto rewrite_aggregate(NodePtr node, const SourceSchemas& sources) -> NodePtr {
 
     // The aggregate emits keys first and aggregates after, so the reduction
     // reorders the output. Restore the original order; without this a caller
-    // reading columns positionally -- `write_csv`, an ascription -- would see a
+    // reading columns positionally -- `csv::write`, an ascription -- would see a
     // different table for the same query.
     std::vector<ColumnRef> ordered;
     ordered.reserve(group_by.size() + agg.aggregations().size());
@@ -564,7 +564,7 @@ auto apply_lift(NodePtr head_node, const Node& root, const LiftPlan& plan, std::
     };
 
     // The output the caller currently sees, which the rewrite must reproduce
-    // exactly -- `write_csv` and ascriptions read columns positionally.
+    // exactly -- `csv::write` and ascriptions read columns positionally.
     std::vector<ColumnRef> final_columns;
     {
         std::vector<Node*> chain;

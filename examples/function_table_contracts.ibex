@@ -1,6 +1,6 @@
 import "csv";
 
-let employee = read_csv(
+let employee = csv::read(
     "examples/leetcode/data/employee_second_highest.csv",
     "",
     ",",

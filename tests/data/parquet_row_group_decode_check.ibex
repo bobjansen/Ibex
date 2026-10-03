@@ -1,12 +1,12 @@
-extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn parquet::write(df: DataFrame, path: String) -> Int from "parquet.hpp";
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
 
 // A fixed-width, null-free column is decoded one ROW GROUP per worker: each
 // range's output row count is known from the footer before anything is decoded,
 // so each range writes its own slice of a buffer allocated up front.
 //
 // This file has two row groups — Parquet's max_row_group_length is 1048576 rows
-// regardless of the chunk size write_parquet asks for, so 1,300,000 rows split
+// regardless of the chunk size parquet::write asks for, so 1,300,000 rows split
 // 1048576 / 251424 — and one column of each type that takes the split path.
 //
 // The aggregates below are order-independent on purpose. What they catch is a
@@ -23,7 +23,7 @@ let base = Table(1300000)[update {
     at = rep([ts"1994-01-01T00:00:00Z", ts"1995-06-15T12:30:00Z"], length_out = 1300000)
 }];
 let facts = base[update { k = rank(one, method = first) }];
-write_parquet(facts, "tests/data/parquet_row_group_decode_out.parquet");
+parquet::write(facts, "tests/data/parquet_row_group_decode_out.parquet");
 
 // Expected: 1300000 / 845000650000 / 1 / 1300000 / 2762500 / 433334 / 433333 /
 // 650000. k is 1..1300000 so sum(k) = n(n+1)/2, and the rest follow from the
@@ -31,7 +31,7 @@ write_parquet(facts, "tests/data/parquet_row_group_decode_out.parquet");
 //
 // Date and Timestamp are counted through an indicator rather than min/max,
 // which the aggregate does not take for those types.
-read_parquet("tests/data/parquet_row_group_decode_out.parquet")[
+parquet::read("tests/data/parquet_row_group_decode_out.parquet")[
     select {
         rows = count(),
         k_total = sum(k),

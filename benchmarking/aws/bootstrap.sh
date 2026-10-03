@@ -623,8 +623,8 @@ EOF
 fi
 
 # ── Compare-plugin mode (compare-plugin-git.sh) ────────────────────────────────
-# A/B two git commits for a plugin-backed extern function (read_parquet,
-# adbc_read, ...) on this clean box. Delegates to compare_plugin_git.sh, which
+# A/B two git commits for a plugin-backed extern function (parquet::read,
+# adbc::read, ...) on this clean box. Delegates to compare_plugin_git.sh, which
 # builds both commits (with the given plugin target, e.g. Arrow/Parquet ON —
 # unlike IBEX_COMPARE_MODE above, which builds with it OFF) and drives the
 # real REPL + --plugin-path, since ibex_bench never loads a plugin. Skips
@@ -921,7 +921,7 @@ if [[ "${IBEX_OHLC_MODE:-0}" == "1" ]]; then
             echo "nproc=$(nproc)"
             echo "cores_swept=${IBEX_OHLC_CORES:-}"
             echo "engines=ibex polars duckdb clickhouse"
-            # The tick spacing IS part of the result: at gen_ticks' own 1000ms
+            # The tick spacing IS part of the result: at gen::ticks' own 1000ms
             # default a 10s bar holds ~1 tick and the bar suites measure
             # group-by cardinality instead of aggregation.
             echo "tick_interval_ms=$(uv run --project /ibex python3 -c \

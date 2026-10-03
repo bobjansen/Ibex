@@ -75,7 +75,7 @@ jobs:
             -DIBEX_BUILD_PARQUET=ON \
             -DIBEX_PARQUET_S3=OFF
 
-      # libcurl powers HTTPS read_csv/read_parquet. Use the static-md triplet so
+      # libcurl powers HTTPS csv::read/parquet::read. Use the static-md triplet so
       # curl links statically into the plugins (no libcurl.dll to bundle) while
       # the CRT stays dynamic (/MD), matching the rest of the build. The default
       # ssl feature resolves to Schannel here, so no OpenSSL build.

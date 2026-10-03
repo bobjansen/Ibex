@@ -7,13 +7,26 @@
 // on IBEX_LIBRARY_PATH so the Ibex REPL can load it automatically when a
 // script declares:
 //
-//   extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
-//   extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+//   extern fn csv::read(path: String) -> DataFrame from "csv.hpp";
+//   extern fn csv::write(df: DataFrame, path: String) -> Int from "csv.hpp";
 
 #include "csv.hpp"
 
+#include <ibex/core/decimal.hpp>
 #include <ibex/runtime/extern_registry.hpp>
+#include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
+
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <expected>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <variant>
+#include <vector>
 
 namespace csv_detail = ibex::csv::detail;
 
@@ -89,120 +102,121 @@ auto try_make_chunked_csv_source(const ibex::runtime::ExternArgs& args)
 
 extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* registry) {
     registry->register_table(
-        "read_csv",
+        "csv::read",
         [](const ibex::runtime::ExternArgs& args)
             -> std::expected<ibex::runtime::ExternValue, std::string> {
             if (args.empty() || args.size() > 5) {
-                return std::unexpected("read_csv() expects 1 to 5 arguments");
+                return std::unexpected("csv::read() expects 1 to 5 arguments");
             }
             const auto* path = std::get_if<std::string>(args.data());
             if (path == nullptr) {
-                return std::unexpected("read_csv() expects a string path");
+                return std::unexpected("csv::read() expects a string path");
             }
             try {
                 if (args.size() == 5) {
                     const auto* null_spec = std::get_if<std::string>(&args[1]);
                     if (null_spec == nullptr) {
                         return std::unexpected(
-                            "read_csv(path, nulls, delimiter, has_header, schema) expects a "
+                            "csv::read(path, nulls, delimiter, has_header, schema) expects a "
                             "string null spec");
                     }
                     const auto* delimiter = std::get_if<std::string>(&args[2]);
                     if (delimiter == nullptr) {
                         return std::unexpected(
-                            "read_csv(path, nulls, delimiter, has_header, schema) expects a "
+                            "csv::read(path, nulls, delimiter, has_header, schema) expects a "
                             "string delimiter");
                     }
                     const auto* has_header = std::get_if<bool>(&args[3]);
                     if (has_header == nullptr) {
                         return std::unexpected(
-                            "read_csv(path, nulls, delimiter, has_header, schema) expects a bool "
+                            "csv::read(path, nulls, delimiter, has_header, schema) expects a bool "
                             "has_header flag");
                     }
                     const auto* schema = std::get_if<std::string>(&args[4]);
                     if (schema == nullptr) {
                         return std::unexpected(
-                            "read_csv(path, nulls, delimiter, has_header, schema) expects a "
+                            "csv::read(path, nulls, delimiter, has_header, schema) expects a "
                             "string schema");
                     }
                     return ibex::runtime::ExternValue{
-                        read_csv(*path, *null_spec, *delimiter, *has_header, *schema)};
+                        ibex::ext::csv::read(*path, *null_spec, *delimiter, *has_header, *schema)};
                 }
                 if (args.size() == 4) {
                     const auto* null_spec = std::get_if<std::string>(&args[1]);
                     if (null_spec == nullptr) {
                         return std::unexpected(
-                            "read_csv(path, nulls, delimiter, has_header) expects a string null "
+                            "csv::read(path, nulls, delimiter, has_header) expects a string null "
                             "spec");
                     }
                     const auto* delimiter = std::get_if<std::string>(&args[2]);
                     if (delimiter == nullptr) {
                         return std::unexpected(
-                            "read_csv(path, nulls, delimiter, has_header) expects a string "
+                            "csv::read(path, nulls, delimiter, has_header) expects a string "
                             "delimiter");
                     }
                     const auto* has_header = std::get_if<bool>(&args[3]);
                     if (has_header == nullptr) {
                         return std::unexpected(
-                            "read_csv(path, nulls, delimiter, has_header) expects a bool "
+                            "csv::read(path, nulls, delimiter, has_header) expects a bool "
                             "has_header flag");
                     }
                     return ibex::runtime::ExternValue{
-                        read_csv(*path, *null_spec, *delimiter, *has_header)};
+                        ibex::ext::csv::read(*path, *null_spec, *delimiter, *has_header)};
                 }
                 if (args.size() == 3) {
                     const auto* null_spec = std::get_if<std::string>(&args[1]);
                     if (null_spec == nullptr) {
                         return std::unexpected(
-                            "read_csv(path, nulls, delimiter) expects a string null spec");
+                            "csv::read(path, nulls, delimiter) expects a string null spec");
                     }
                     const auto* delimiter = std::get_if<std::string>(&args[2]);
                     if (delimiter == nullptr) {
                         return std::unexpected(
-                            "read_csv(path, nulls, delimiter) expects a string delimiter");
+                            "csv::read(path, nulls, delimiter) expects a string delimiter");
                     }
-                    return ibex::runtime::ExternValue{read_csv(*path, *null_spec, *delimiter)};
+                    return ibex::runtime::ExternValue{
+                        ibex::ext::csv::read(*path, *null_spec, *delimiter)};
                 }
                 if (args.size() == 2) {
                     const auto* null_spec = std::get_if<std::string>(&args[1]);
                     if (null_spec == nullptr) {
-                        return std::unexpected("read_csv(path, nulls) expects a string null spec");
+                        return std::unexpected("csv::read(path, nulls) expects a string null spec");
                     }
-                    return ibex::runtime::ExternValue{read_csv(*path, *null_spec)};
+                    return ibex::runtime::ExternValue{ibex::ext::csv::read(*path, *null_spec)};
                 }
-                return ibex::runtime::ExternValue{read_csv(*path)};
+                return ibex::runtime::ExternValue{ibex::ext::csv::read(*path)};
             } catch (const std::exception& e) {
                 return std::unexpected(std::string(e.what()));
             }
         });
 
     registry->register_chunked_table(
-        "read_csv",
+        "csv::read",
         [](const ibex::runtime::ExternArgs& args)
             -> std::expected<ibex::runtime::OperatorPtr, std::string> {
             auto maybe_op = try_make_chunked_csv_source(args);
             if (!maybe_op.has_value()) {
                 return std::unexpected(
-                    "read_csv chunked path requires 5 args with has_header=false, empty "
+                    "csv::read chunked path requires 5 args with has_header=false, empty "
                     "null spec, and fully typed schema");
             }
             return std::move(*maybe_op);
         });
 
     registry->register_scalar_table_consumer(
-        "write_csv", ibex::runtime::ScalarKind::Int,
+        "csv::write", ibex::runtime::ScalarKind::Int,
         [](const ibex::runtime::Table& table, const ibex::runtime::ExternArgs& args)
             -> std::expected<ibex::runtime::ExternValue, std::string> {
             if (args.size() != 1) {
                 return std::unexpected(
-                    "write_csv(df, path) expects exactly 1 scalar argument (path)");
+                    "csv::write(df, path) expects exactly 1 scalar argument (path)");
             }
             const auto* path = std::get_if<std::string>(args.data());
             if (path == nullptr) {
-                return std::unexpected("write_csv(df, path) expects a string path");
+                return std::unexpected("csv::write(df, path) expects a string path");
             }
             try {
-                std::int64_t rows = write_csv(table, *path);
+                std::int64_t rows = ibex::ext::csv::write(table, *path);
                 return ibex::runtime::ExternValue{ibex::runtime::ScalarValue{rows}};
             } catch (const std::exception& e) {
                 return std::unexpected(std::string(e.what()));

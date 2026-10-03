@@ -12,20 +12,20 @@
 // declarations the import stubs carry, but `import` makes the whole-script
 // planner decline, so the imported form silently ran on the statement path
 // while the other 21 queries were batch-planned.
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
-extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
+extern fn csv::write(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let part = read_parquet("benchmarking/data/tpch/parquet/part.parquet") as DataFrame<{
+let part = parquet::read("benchmarking/data/tpch/parquet/part.parquet") as DataFrame<{
     p_partkey: Int64,
     p_brand: String,
     p_type: String,
     p_size: Int64
 }>;
-let partsupp = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet") as DataFrame<{
+let partsupp = parquet::read("benchmarking/data/tpch/parquet/partsupp.parquet") as DataFrame<{
     ps_partkey: Int64,
     ps_suppkey: Int64
 }>;
-let excluded_suppliers = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet") as DataFrame<{
+let excluded_suppliers = parquet::read("benchmarking/data/tpch/parquet/supplier.parquet") as DataFrame<{
     s_suppkey: Int64,
     s_comment: String
 }>[
@@ -50,5 +50,5 @@ let result = unique_part_suppliers[
 ][
     order { supplier_cnt desc, p_brand, p_type, p_size }
 ];
-write_csv(result, "benchmarking/data/tpch/out/q16.csv");
+csv::write(result, "benchmarking/data/tpch/out/q16.csv");
 result;

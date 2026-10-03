@@ -1,4 +1,4 @@
 import "parquet";
 
-let prices = read_parquet("https://data.example.com/prices.parquet");
+let prices = parquet::read("https://data.example.com/prices.parquet");
 prices[total = count()];

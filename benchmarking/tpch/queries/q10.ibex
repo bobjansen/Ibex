@@ -14,10 +14,10 @@
 //        benchmarking/tpch/queries/q10.ibex
 // ─────────────────────────────────────────────────────────────────────────────
 
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
-extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
+extern fn csv::write(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet") as DataFrame<{
+let customer = parquet::read("benchmarking/data/tpch/parquet/customer.parquet") as DataFrame<{
     c_custkey: Int64,
     c_name: String,
     c_address: String,
@@ -26,18 +26,18 @@ let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet") a
     c_acctbal: Float64,
     c_comment: String
 }>;
-let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet") as DataFrame<{
+let orders = parquet::read("benchmarking/data/tpch/parquet/orders.parquet") as DataFrame<{
     o_orderkey: Int64,
     o_custkey: Int64,
     o_orderdate: Date
 }>;
-let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
+let lineitem = parquet::read("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
     l_orderkey: Int64,
     l_extendedprice: Float64,
     l_discount: Float64,
     l_returnflag: String
 }>;
-let nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet") as DataFrame<{
+let nation = parquet::read("benchmarking/data/tpch/parquet/nation.parquet") as DataFrame<{
     n_nationkey: Int64,
     n_name: String
 }>;
@@ -53,5 +53,5 @@ let result = (((customer join orders on { c_custkey = o_custkey })
     order { revenue desc },
     head 20
 ];
-write_csv(result, "benchmarking/data/tpch/out/q10.csv");
+csv::write(result, "benchmarking/data/tpch/out/q10.csv");
 result;

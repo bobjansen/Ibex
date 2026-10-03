@@ -6,15 +6,15 @@
 // - parameter call semantics (`const` / `mutable` / `consume`)
 // - transitive effect annotations on user functions
 
-extern fn read_parquet(const path: String) -> DataFrame
+extern fn parquet::read(const path: String) -> DataFrame
     effects { io_read("file"), may_fail }
     from "parquet.hpp";
 
-extern fn write_parquet(const df: DataFrame, const path: String) -> Int
+extern fn parquet::write(const df: DataFrame, const path: String) -> Int
     effects { io_write("file"), may_fail }
     from "parquet.hpp";
 
-extern fn ws_send(const df: DataFrame, const endpoint: String) -> Int
+extern fn ws::send(const df: DataFrame, const endpoint: String) -> Int
     effects { io_write("ws"), may_fail }
     from "websocket.hpp";
 
@@ -65,13 +65,13 @@ fn archive_only(df: DataFrame, path: String) -> Int effects { io_write, may_fail
 fn dual_sink(df: DataFrame, path: String, endpoint: String) -> Int
     effects { io_write, may_fail } {
     let out = with_inplace_step(df);
-    let a = write_parquet(out, path);
-    let b = ws_send(out, endpoint);
+    let a = parquet::write(out, path);
+    let b = ws::send(out, endpoint);
     a + b;
 }
 
 fn ingest_and_publish(path_in: String, path_out: String, endpoint: String) -> Int
     effects { io_read, io_write, may_fail } {
-    let raw = read_parquet(path_in);
+    let raw = parquet::read(path_in);
     dual_sink(raw, path_out, endpoint);
 }

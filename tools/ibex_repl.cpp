@@ -3,6 +3,11 @@
 
 #include <ibex/repl/repl.hpp>
 #include <ibex/runtime/extern_registry.hpp>
+
+#include <cstdint>
+#include <stdlib.h>  // NOLINT(modernize-deprecated-headers): POSIX setenv
+#include <system_error>
+#include <utility>
 #if defined(IBEX_HAS_UI)
 #include <ibex/ui/server.hpp>
 #endif
@@ -22,7 +27,7 @@
 
 auto main(int argc, char** argv) -> int {
     // Everything after a `--` separator is the running script's own argv: stash
-    // it in IBEX_ARGS (one entry per line) for the `parse_args` library, and
+    // it in IBEX_ARGS (one entry per line) for the `args::parse` library, and
     // hide it from CLI11 so it does not try to parse it as ibex options.
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--") {

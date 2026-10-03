@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <ibex/parser/names.hpp>
 #include <ibex/parser/parser.hpp>
 
 #include <cstdlib>
@@ -107,7 +108,7 @@ inline auto import_search_paths(const std::filesystem::path& entry_file,
 inline auto import_candidates(const std::string& name, const std::filesystem::path& base_dir)
     -> std::vector<std::filesystem::path> {
     std::vector<std::filesystem::path> candidates;
-    std::filesystem::path module{name};
+    const std::filesystem::path module{name};
     std::filesystem::path direct = module;
     if (!direct.has_extension()) {
         direct += ".ibex";
@@ -163,7 +164,8 @@ inline auto stable_path_key(const std::filesystem::path& path) -> std::string {
 
 inline auto expand_imports_impl(parser::Program program, const std::filesystem::path& current_dir,
                                 const std::vector<std::filesystem::path>& search_paths,
-                                robin_hood::unordered_set<std::string>& imported_paths)
+                                robin_hood::unordered_set<std::string>& imported_paths,
+                                robin_hood::unordered_set<std::string>& library_names)
     -> std::expected<parser::Program, std::string> {
     parser::Program out;
     out.statements.reserve(program.statements.size());
@@ -201,13 +203,29 @@ inline auto expand_imports_impl(parser::Program program, const std::filesystem::
         }
 
         auto expanded = expand_imports_impl(std::move(*parsed), resolved->parent_path(),
-                                            search_paths, imported_paths);
+                                            search_paths, imported_paths, library_names);
         if (!expanded.has_value()) {
             return std::unexpected(expanded.error());
         }
 
+        // A library resolves its names on its own: its `using`s apply to it
+        // alone, so they are applied here and not spliced into the importer.
+        // It sees every library expanded so far, since one it imports may
+        // already have been spliced in (and skipped here) by an earlier import.
+        {
+            parser::collect_declared_names(*expanded, library_names);
+            parser::UsingScope usings;
+            if (auto names_resolved = parser::resolve_names(
+                    *expanded, usings, parser::declared_names_of(library_names));
+                !names_resolved) {
+                return std::unexpected("import '" + import.name +
+                                       "': " + names_resolved.error().format());
+            }
+        }
         for (auto& imported_stmt : expanded->statements) {
-            out.statements.push_back(std::move(imported_stmt));
+            if (!std::holds_alternative<parser::UsingDecl>(imported_stmt)) {
+                out.statements.push_back(std::move(imported_stmt));
+            }
         }
     }
 
@@ -220,12 +238,13 @@ inline auto expand_imports(parser::Program program, const std::string& entry_fil
                            const std::vector<std::string>& explicit_paths = {})
     -> std::expected<parser::Program, std::string> {
     namespace fs = std::filesystem;
-    fs::path entry = fs::absolute(fs::path(entry_file));
+    const fs::path entry = fs::absolute(fs::path(entry_file));
     auto paths = detail::import_search_paths(entry, explicit_paths);
 
     robin_hood::unordered_set<std::string> imported_paths;
+    robin_hood::unordered_set<std::string> library_names;
     return detail::expand_imports_impl(std::move(program), entry.parent_path(), paths,
-                                       imported_paths);
+                                       imported_paths, library_names);
 }
 
 }  // namespace ibex::tools

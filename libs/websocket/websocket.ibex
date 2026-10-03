@@ -5,8 +5,7 @@
 //
 // After importing, the following functions are available:
 //
-//   ws_recv(port: Int, schema: String) -> DataFrame
-//   ws_recv(port: Int, schema: String, options: String) -> DataFrame
+//   ws::recv(port: Int, schema: String, options: String = "") -> DataFrame
 //     Starts a WebSocket server on `port` (if not already running) and blocks
 //     up to poll_timeout_ms for an incoming JSON message from any connected
 //     client.  The message shape is described by the schema string, e.g.
@@ -17,34 +16,36 @@
 //     StreamTimeout when no message arrives — the stream runtime calls the
 //     source again after handling any pending time-bucket flushes.
 //
-//   ws_connect(url: String, schema: String) -> DataFrame
-//   ws_connect(url: String, schema: String, options: String) -> DataFrame
+//   ws::connect(url: String, schema: String, options: String = "") -> DataFrame
 //     WebSocket client source: connects to an external feed at `url`
 //     (ws://host[:port][/path]; TLS is not supported yet) and converts each
 //     incoming JSON message using the same schema mini-language and stream
-//     protocol as ws_recv.  The options key subscribe=<text> sends a text
+//     protocol as ws::recv.  The options key subscribe=<text> sends a text
 //     frame right after the handshake (e.g. an exchange subscribe message).
 //
-//   Options for ws_recv / ws_connect ("key=value;key=value"):
+//   Options for ws::recv / ws::connect ("key=value;key=value"):
 //     poll_timeout_ms=200       polling window before StreamTimeout
 //     on_malformed=skip|error   messages that fail the schema (default skip)
-//     subscribe=<text>          ws_connect only
+//     subscribe=<text>          ws::connect only
 //
-//   ws_listen(port: Int) -> Int
+//   ws::listen(port: Int) -> Int
 //     Eagerly opens the WebSocket listen socket on `port` so that browser
 //     clients can connect before the first bar is emitted by a Stream {} sink.
 //     Call this once before the Stream block.  Returns 0 on success; throws
 //     on bind failure (e.g. port already in use).
 //
-//   ws_send(df: DataFrame, port: Int) -> Int
+//   ws::send(df: DataFrame, port: Int) -> Int
 //     Broadcasts each row of `df` as a JSON WebSocket text frame to all
 //     clients currently connected on `port`.  Creates the server listener on
-//     `port` on first call, so ws_send can be used as a standalone sink
-//     (without ws_recv).  Returns the number of rows sent.
+//     `port` on first call, so ws::send can be used as a standalone sink
+//     (without ws::recv).  Returns the number of rows sent.
 
-extern fn ws_listen(port: Int) -> Int from "websocket";
-extern fn ws_recv(port: Int, schema: String) -> DataFrame from "websocket";
-extern fn ws_recv(port: Int, schema: String, options: String) -> DataFrame from "websocket";
-extern fn ws_connect(url: String, schema: String) -> DataFrame from "websocket";
-extern fn ws_connect(url: String, schema: String, options: String) -> DataFrame from "websocket";
-extern fn ws_send(df: DataFrame, port: Int) -> Int from "websocket";
+namespace ws {
+
+extern fn listen(port: Int) -> Int from "websocket";
+extern fn recv(port: Int, schema: String, options: String = "") -> DataFrame from "websocket";
+extern fn connect(url: String, schema: String, options: String = "")
+    -> DataFrame from "websocket";
+extern fn send(df: DataFrame, port: Int) -> Int from "websocket";
+
+}

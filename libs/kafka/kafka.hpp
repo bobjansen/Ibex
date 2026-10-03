@@ -111,31 +111,31 @@ inline auto build_consumer_state(const std::string& brokers, const std::string& 
     if (rd_kafka_conf_set(conf, "bootstrap.servers", brokers.c_str(), errstr, sizeof(errstr)) !=
         RD_KAFKA_CONF_OK) {
         rd_kafka_conf_destroy(conf);
-        return std::unexpected(rd_kafka_error_message("kafka_recv bootstrap.servers", errstr));
+        return std::unexpected(rd_kafka_error_message("kafka::recv bootstrap.servers", errstr));
     }
     if (rd_kafka_conf_set(conf, "group.id", group.c_str(), errstr, sizeof(errstr)) !=
         RD_KAFKA_CONF_OK) {
         rd_kafka_conf_destroy(conf);
-        return std::unexpected(rd_kafka_error_message("kafka_recv group.id", errstr));
+        return std::unexpected(rd_kafka_error_message("kafka::recv group.id", errstr));
     }
     if (rd_kafka_conf_set(conf, "enable.auto.commit", "false", errstr, sizeof(errstr)) !=
         RD_KAFKA_CONF_OK) {
         rd_kafka_conf_destroy(conf);
-        return std::unexpected(rd_kafka_error_message("kafka_recv enable.auto.commit", errstr));
+        return std::unexpected(rd_kafka_error_message("kafka::recv enable.auto.commit", errstr));
     }
     for (const auto& [key, value] : options->config) {
         if (rd_kafka_conf_set(conf, key.c_str(), value.c_str(), errstr, sizeof(errstr)) !=
             RD_KAFKA_CONF_OK) {
             rd_kafka_conf_destroy(conf);
             return std::unexpected(
-                rd_kafka_error_message("kafka_recv option '" + key + "'", errstr));
+                rd_kafka_error_message("kafka::recv option '" + key + "'", errstr));
         }
     }
 
     state->consumer = rd_kafka_new(RD_KAFKA_CONSUMER, conf, errstr, sizeof(errstr));
     if (state->consumer == nullptr) {
         rd_kafka_conf_destroy(conf);
-        return std::unexpected(rd_kafka_error_message("kafka_recv consumer init", errstr));
+        return std::unexpected(rd_kafka_error_message("kafka::recv consumer init", errstr));
     }
     rd_kafka_poll_set_consumer(state->consumer);
 
@@ -144,7 +144,7 @@ inline auto build_consumer_state(const std::string& brokers, const std::string& 
     const rd_kafka_resp_err_t subscribe_err = rd_kafka_subscribe(state->consumer, topics);
     rd_kafka_topic_partition_list_destroy(topics);
     if (subscribe_err != RD_KAFKA_RESP_ERR_NO_ERROR) {
-        return std::unexpected("kafka_recv subscribe failed: " +
+        return std::unexpected("kafka::recv subscribe failed: " +
                                std::string(rd_kafka_err2str(subscribe_err)));
     }
 
@@ -165,21 +165,21 @@ inline auto build_producer_state(const std::string& brokers, const std::string& 
     if (rd_kafka_conf_set(conf, "bootstrap.servers", brokers.c_str(), errstr, sizeof(errstr)) !=
         RD_KAFKA_CONF_OK) {
         rd_kafka_conf_destroy(conf);
-        return std::unexpected(rd_kafka_error_message("kafka_send bootstrap.servers", errstr));
+        return std::unexpected(rd_kafka_error_message("kafka::send bootstrap.servers", errstr));
     }
     for (const auto& [key, value] : options->config) {
         if (rd_kafka_conf_set(conf, key.c_str(), value.c_str(), errstr, sizeof(errstr)) !=
             RD_KAFKA_CONF_OK) {
             rd_kafka_conf_destroy(conf);
             return std::unexpected(
-                rd_kafka_error_message("kafka_send option '" + key + "'", errstr));
+                rd_kafka_error_message("kafka::send option '" + key + "'", errstr));
         }
     }
 
     state->producer = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
     if (state->producer == nullptr) {
         rd_kafka_conf_destroy(conf);
-        return std::unexpected(rd_kafka_error_message("kafka_send producer init", errstr));
+        return std::unexpected(rd_kafka_error_message("kafka::send producer init", errstr));
     }
     return state;
 }
@@ -208,32 +208,33 @@ inline auto build_avro_consumer_state(const std::string& brokers, const std::str
     if (rd_kafka_conf_set(conf, "bootstrap.servers", brokers.c_str(), errstr, sizeof(errstr)) !=
         RD_KAFKA_CONF_OK) {
         rd_kafka_conf_destroy(conf);
-        return std::unexpected(rd_kafka_error_message("kafka_recv_avro bootstrap.servers", errstr));
+        return std::unexpected(
+            rd_kafka_error_message("kafka::recv_avro bootstrap.servers", errstr));
     }
     if (rd_kafka_conf_set(conf, "group.id", group.c_str(), errstr, sizeof(errstr)) !=
         RD_KAFKA_CONF_OK) {
         rd_kafka_conf_destroy(conf);
-        return std::unexpected(rd_kafka_error_message("kafka_recv_avro group.id", errstr));
+        return std::unexpected(rd_kafka_error_message("kafka::recv_avro group.id", errstr));
     }
     if (rd_kafka_conf_set(conf, "enable.auto.commit", "false", errstr, sizeof(errstr)) !=
         RD_KAFKA_CONF_OK) {
         rd_kafka_conf_destroy(conf);
         return std::unexpected(
-            rd_kafka_error_message("kafka_recv_avro enable.auto.commit", errstr));
+            rd_kafka_error_message("kafka::recv_avro enable.auto.commit", errstr));
     }
     for (const auto& [key, value] : options->consumer.config) {
         if (rd_kafka_conf_set(conf, key.c_str(), value.c_str(), errstr, sizeof(errstr)) !=
             RD_KAFKA_CONF_OK) {
             rd_kafka_conf_destroy(conf);
             return std::unexpected(
-                rd_kafka_error_message("kafka_recv_avro option '" + key + "'", errstr));
+                rd_kafka_error_message("kafka::recv_avro option '" + key + "'", errstr));
         }
     }
 
     state->consumer = rd_kafka_new(RD_KAFKA_CONSUMER, conf, errstr, sizeof(errstr));
     if (state->consumer == nullptr) {
         rd_kafka_conf_destroy(conf);
-        return std::unexpected(rd_kafka_error_message("kafka_recv_avro consumer init", errstr));
+        return std::unexpected(rd_kafka_error_message("kafka::recv_avro consumer init", errstr));
     }
     rd_kafka_poll_set_consumer(state->consumer);
 
@@ -242,7 +243,7 @@ inline auto build_avro_consumer_state(const std::string& brokers, const std::str
     const rd_kafka_resp_err_t subscribe_err = rd_kafka_subscribe(state->consumer, topics);
     rd_kafka_topic_partition_list_destroy(topics);
     if (subscribe_err != RD_KAFKA_RESP_ERR_NO_ERROR) {
-        return std::unexpected("kafka_recv_avro subscribe failed: " +
+        return std::unexpected("kafka::recv_avro subscribe failed: " +
                                std::string(rd_kafka_err2str(subscribe_err)));
     }
 
@@ -344,7 +345,7 @@ inline auto kafka_recv(const std::string& brokers, const std::string& topic,
         rd_kafka_message_destroy(state->pending_commit);
         state->pending_commit = nullptr;
         if (commit_err != RD_KAFKA_RESP_ERR_NO_ERROR) {
-            return std::unexpected("kafka_recv commit failed: " +
+            return std::unexpected("kafka::recv commit failed: " +
                                    std::string(rd_kafka_err2str(commit_err)));
         }
     }
@@ -361,7 +362,7 @@ inline auto kafka_recv(const std::string& brokers, const std::string& topic,
             err == RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART) {
             return ibex::runtime::ExternValue{ibex::runtime::StreamTimeout{}};
         }
-        return std::unexpected("kafka_recv poll failed: " + std::string(rd_kafka_err2str(err)));
+        return std::unexpected("kafka::recv poll failed: " + std::string(rd_kafka_err2str(err)));
     }
 
     std::string_view payload(static_cast<const char*>(message->payload), message->len);
@@ -385,7 +386,7 @@ inline auto kafka_send(const ibex::runtime::Table& table, const std::string& bro
 
     rd_kafka_topic_t* rkt = rd_kafka_topic_new(state->producer, topic.c_str(), nullptr);
     if (rkt == nullptr) {
-        return std::unexpected("kafka_send topic init failed: " +
+        return std::unexpected("kafka::send topic init failed: " +
                                std::string(rd_kafka_err2str(rd_kafka_last_error())));
     }
 
@@ -400,7 +401,7 @@ inline auto kafka_send(const ibex::runtime::Table& table, const std::string& bro
                              payload->size(), nullptr, 0, nullptr) == -1) {
             const auto err = rd_kafka_last_error();
             rd_kafka_topic_destroy(rkt);
-            return std::unexpected("kafka_send produce failed: " +
+            return std::unexpected("kafka::send produce failed: " +
                                    std::string(rd_kafka_err2str(err)));
         }
         ++sent;
@@ -408,7 +409,7 @@ inline auto kafka_send(const ibex::runtime::Table& table, const std::string& bro
     rd_kafka_topic_destroy(rkt);
     const rd_kafka_resp_err_t flush_err = rd_kafka_flush(state->producer, state->flush_timeout_ms);
     if (flush_err != RD_KAFKA_RESP_ERR_NO_ERROR) {
-        return std::unexpected("kafka_send flush failed: " +
+        return std::unexpected("kafka::send flush failed: " +
                                std::string(rd_kafka_err2str(flush_err)));
     }
     return sent;
@@ -431,7 +432,7 @@ inline auto kafka_recv_avro(const std::string& brokers, const std::string& topic
         rd_kafka_message_destroy(state->pending_commit);
         state->pending_commit = nullptr;
         if (commit_err != RD_KAFKA_RESP_ERR_NO_ERROR) {
-            return std::unexpected("kafka_recv_avro commit failed: " +
+            return std::unexpected("kafka::recv_avro commit failed: " +
                                    std::string(rd_kafka_err2str(commit_err)));
         }
     }
@@ -451,7 +452,7 @@ inline auto kafka_recv_avro(const std::string& brokers, const std::string& topic
                 err == RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART) {
                 return ibex::runtime::ExternValue{ibex::runtime::StreamTimeout{}};
             }
-            return std::unexpected("kafka_recv_avro poll failed: " +
+            return std::unexpected("kafka::recv_avro poll failed: " +
                                    std::string(rd_kafka_err2str(err)));
         }
     }

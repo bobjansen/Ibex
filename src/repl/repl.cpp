@@ -22,6 +22,7 @@
 #include <ibex/ir/schema.hpp>
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/lower.hpp>
+#include <ibex/parser/names.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/parser/resource_functions.hpp>
 #include <ibex/parser/scalar_bindings.hpp>
@@ -108,7 +109,7 @@ using ColumnRegistry = robin_hood::unordered_map<std::string, runtime::ColumnVal
 /// A binding lives in exactly one of the two registries.
 using LazyTableRegistry = robin_hood::unordered_map<std::string, runtime::LazyTablePtr>;
 using ModelRegistry = robin_hood::unordered_map<std::string, runtime::ModelResult>;
-/// Resource bindings (`let db = adbc_connect(...)`). Only statement-level code
+/// Resource bindings (`let db = adbc::connect(...)`). Only statement-level code
 /// in `execute_statements` sees this registry, never the expression
 /// evaluators, which is what keeps resources out of query expressions and
 /// function bodies. A binding lives in exactly one registry.
@@ -500,6 +501,11 @@ void add_map_keys(std::vector<std::string>& candidates, const Map* map) {
     candidates.reserve(candidates.size() + map->size());
     for (const auto& entry : *map) {
         candidates.push_back(entry.first);
+        // `adbc::query` also offers `adbc::`, so the namespace completes on
+        // its own before a name in it is chosen.
+        if (const auto ns = parser::namespace_of(entry.first); !ns.empty()) {
+            candidates.push_back(std::string(ns) + "::");
+        }
     }
 }
 
@@ -2551,7 +2557,23 @@ void print_imports(const ImportRegistry& imports, const ExternDeclRegistry& exte
     for (const auto& source : sources) {
         auto& names = by_source[source];
         std::ranges::sort(names);
-        ibex::formatting::print("  {}:", source);
+        // The namespaces a source declares into, which need not match its name.
+        std::vector<std::string> namespaces;
+        for (const auto& name : names) {
+            const auto ns = std::string(parser::namespace_of(name));
+            if (!ns.empty() && std::ranges::find(namespaces, ns) == namespaces.end()) {
+                namespaces.push_back(ns);
+            }
+        }
+        std::string label = source;
+        if (!namespaces.empty()) {
+            label += " [namespace";
+            for (const auto& ns : namespaces) {
+                label += " " + ns;
+            }
+            label += "]";
+        }
+        ibex::formatting::print("  {}:", label);
         for (const auto& name : names) {
             ibex::formatting::print(" {}", name);
         }
@@ -3951,7 +3973,7 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         }
     }
 
-    // Every inline source in this expression — `read_parquet(p)` wherever it
+    // Every inline source in this expression — `parquet::read(p)` wherever it
     // appears, not merely as the outermost base — is bound to a temp lazy binding
     // and replaced by that name, so it reaches `interpret` as an ordinary Scan and
     // picks up the same projection pushdown a `let`-bound source gets.
@@ -3959,7 +3981,7 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     // Walking the whole tree is the point. A query written as one expression puts
     // its sources inside join operands:
     //
-    //     (read_parquet(a)[select …] join read_parquet(b)[select …] on k)[filter …]
+    //     (parquet::read(a)[select …] join parquet::read(b)[select …] on k)[filter …]
     //
     // Rewriting only the outermost base would leave those two reads eager, and the
     // single-expression form — the one the optimizer can actually see through —
@@ -4308,7 +4330,7 @@ auto find_library_source(const std::string& name, const std::vector<std::string>
 }
 
 /// Bind `expr` lazily if it is a bare call to an extern table source that can
-/// decode its columns selectively (`read_parquet`). Reads the source's schema
+/// decode its columns selectively (`parquet::read`). Reads the source's schema
 /// and nothing else; the columns are decoded later, per query, by whatever
 /// subset that query references.
 ///
@@ -4354,13 +4376,13 @@ auto try_bind_lazy_source(parser::Expr& expr, runtime::TableRegistry& tables,
     return fn->lazy_table_func(args);
 }
 
-/// Replace every inline lazy source in `expr` — `read_parquet(p)` in any table
+/// Replace every inline lazy source in `expr` — `parquet::read(p)` in any table
 /// position — with a temp lazy binding, so the whole expression lowers to Scans
 /// and projection pushdown reaches all of them.
 ///
 /// Recursion is over the positions where a *table* can appear: a block's base, a
 /// join's operands, a parenthesised group, an ascription, and a call's arguments
-/// (`write_csv(read_parquet(p)[…], out)`). A source nested in a join operand is
+/// (`csv::write(parquet::read(p)[…], out)`). A source nested in a join operand is
 /// the case that matters — see the caller.
 ///
 /// Returns an error message on failure; nullopt on success. Every replacement is
@@ -5291,6 +5313,48 @@ auto run_function(parser::CallExpr& call, const parser::FunctionDecl& fn,
     return std::unexpected("unsupported return type");
 }
 
+/// What a name resolution in the REPL can see: the user functions and extern
+/// declarations registered so far, whatever plugins registered, and `pending`
+/// (declarations of the batch being run that are not registered yet).
+auto repl_declared_names(const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls,
+                         const runtime::ExternRegistry& externs,
+                         const robin_hood::unordered_set<std::string>& pending)
+    -> parser::DeclaredNames {
+    return parser::DeclaredNames{
+        .contains =
+            [&](std::string_view name) {
+                const std::string key(name);
+                return functions.contains(key) || extern_decls.contains(key) ||
+                       pending.contains(key) || externs.contains(key);
+            },
+        .list =
+            [&]() {
+                std::vector<std::string> names;
+                names.reserve(functions.size() + extern_decls.size() + pending.size());
+                for (const auto& [name, _] : functions) {
+                    names.push_back(name);
+                }
+                for (const auto& [name, _] : extern_decls) {
+                    names.push_back(name);
+                }
+                names.insert(names.end(), pending.begin(), pending.end());
+                return names;
+            },
+    };
+}
+
+/// Resolve the names in one expression the REPL evaluates outside a statement
+/// batch (`:explain`, `:peek`), with the session's `using` declarations.
+auto resolve_repl_expression(parser::Expr& expr, const parser::UsingScope& usings,
+                             const FunctionRegistry& functions,
+                             const ExternDeclRegistry& extern_decls,
+                             const runtime::ExternRegistry& externs)
+    -> std::expected<void, std::string> {
+    const robin_hood::unordered_set<std::string> none;
+    return parser::resolve_names(expr, {}, usings,
+                                 repl_declared_names(functions, extern_decls, externs, none));
+}
+
 auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableRegistry& tables,
                         LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
                         ColumnRegistry& columns, ModelRegistry& models, FunctionRegistry& functions,
@@ -5304,8 +5368,26 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                         const std::vector<std::vector<std::string>>* doc_comment_groups = nullptr,
                         FunctionSourceRegistry* function_sources = nullptr,
                         DeclarationDocRegistry* declaration_docs = nullptr,
-                        ImportRegistry* imports = nullptr, std::string_view source_text = {})
-    -> bool {
+                        ImportRegistry* imports = nullptr, std::string_view source_text = {},
+                        parser::UsingScope* usings = nullptr) -> bool {
+    // A `using` applies to the end of its source: the caller passes the
+    // session's scope for an interactive REPL, and each script, `:load`ed file
+    // and imported library starts its own.
+    parser::UsingScope local_usings;
+    parser::UsingScope& using_scope = usings != nullptr ? *usings : local_usings;
+    // Names this batch declares, visible to resolution before the main loop
+    // registers them (a function may call an extern declared after it).
+    robin_hood::unordered_set<std::string> batch_names;
+    for (const auto& stmt : statements) {
+        if (const auto* decl = std::get_if<parser::ExternDecl>(&stmt)) {
+            batch_names.insert(decl->name);
+        }
+    }
+    const auto declared = repl_declared_names(functions, extern_decls, externs, batch_names);
+    // The name of the `fn` declared at each position, which the pre-pass moves
+    // into the registry; its body is resolved when the main loop reaches it.
+    std::vector<std::string> fn_names(statements.size());
+
     // Pre-pass: register every top-level `fn` declaration in this batch so that
     // function bodies can reference functions declared later in the same script
     // or REPL submission. We move the decls into the registry; the main loop
@@ -5314,6 +5396,19 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
         auto& stmt = statements[stmt_index];
         if (std::holds_alternative<parser::FunctionDecl>(stmt)) {
             auto fn = std::get<parser::FunctionDecl>(std::move(stmt));
+            // A qualified name has one declaration (no overloads): declaring it
+            // again is only allowed with the same signature, which is what
+            // importing a library twice does.
+            if (parser::is_qualified(fn.name)) {
+                if (auto it = functions.find(fn.name);
+                    it != functions.end() &&
+                    function_signature(it->second) != function_signature(fn)) {
+                    ibex::formatting::print(
+                        "error: '{}' is already declared with a different signature\n", fn.name);
+                    return false;
+                }
+            }
+            fn_names[stmt_index] = fn.name;
             if (function_sources != nullptr) {
                 auto source = source_for_lines(source_text, fn.start_line, fn.end_line);
                 if (!source.empty()) {
@@ -5341,9 +5436,43 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
         if (print_comment_groups != nullptr && stmt_index < print_comment_groups->size()) {
             print_comment_group((*print_comment_groups)[stmt_index]);
         }
+        if (const auto* using_decl = std::get_if<parser::UsingDecl>(&stmt)) {
+            if (auto applied = parser::apply_using(using_decl->target, using_scope, declared);
+                !applied) {
+                ibex::formatting::print("error: {}\n", applied.error());
+                return false;
+            }
+            continue;
+        }
+        if (std::holds_alternative<parser::FunctionDecl>(stmt)) {
+            // Registered by the pre-pass; its body sees the `using`s in effect here.
+            if (auto it = functions.find(fn_names[stmt_index]); it != functions.end()) {
+                if (auto resolved = parser::resolve_names(it->second, using_scope, declared);
+                    !resolved) {
+                    ibex::formatting::print("error: {}\n", resolved.error());
+                    return false;
+                }
+            }
+            continue;
+        }
+        if (!std::holds_alternative<parser::ImportDecl>(stmt)) {
+            if (auto resolved = parser::resolve_names(stmt, using_scope, declared); !resolved) {
+                ibex::formatting::print("error: {}\n", resolved.error());
+                return false;
+            }
+        }
         if (std::holds_alternative<parser::ExternDecl>(stmt)) {
             auto decl = std::get<parser::ExternDecl>(std::move(stmt));
             auto decl_name = decl.name;
+            if (parser::is_qualified(decl_name)) {
+                if (auto it = extern_decls.find(decl_name);
+                    it != extern_decls.end() &&
+                    extern_signature(it->second) != extern_signature(decl)) {
+                    ibex::formatting::print(
+                        "error: '{}' is already declared with a different signature\n", decl_name);
+                    return false;
+                }
+            }
             if (declaration_docs != nullptr && doc_comment_groups != nullptr &&
                 stmt_index < doc_comment_groups->size()) {
                 auto doc = doc_from_comment_group((*doc_comment_groups)[stmt_index]);
@@ -5426,10 +5555,6 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                                     function_sources, declaration_docs, imports, *source)) {
                 return false;
             }
-            continue;
-        }
-        if (std::holds_alternative<parser::FunctionDecl>(stmt)) {
-            // Already registered by the pre-pass above.
             continue;
         }
 
@@ -6103,7 +6228,7 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
 /// silent and the two paths differ in speed, so `decline_reason` (when non-null)
 /// receives a short explanation: a benchmark that cannot see which path it
 /// measured cannot tell a regression from a gate change.
-auto try_execute_whole_script(const parser::Program& program, runtime::ExternRegistry& externs,
+auto try_execute_whole_script(parser::Program& program, runtime::ExternRegistry& externs,
                               const ReplConfig& config, std::string* decline_reason = nullptr)
     -> std::optional<bool> {
     const auto decline = [&](std::string_view reason) -> std::optional<bool> {
@@ -6180,6 +6305,31 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         }
         imported_units.push_back(std::move(*parsed));
         prelude.push_back(&imported_units.back());
+    }
+    // Resolve names before anything reads a callee. Each library and the script
+    // has its own `using` scope; all of them see every declaration. A failure
+    // is left to the statement path, which reports it at its statement.
+    {
+        robin_hood::unordered_set<std::string> names;
+        for (const auto& unit : imported_units) {
+            parser::collect_declared_names(unit, names);
+        }
+        parser::collect_declared_names(program, names);
+        auto declared = parser::declared_names_of(names);
+        declared.contains = [&names, &externs](std::string_view name) {
+            const std::string key(name);
+            return names.contains(key) || externs.contains(key);
+        };
+        for (auto& unit : imported_units) {
+            parser::UsingScope usings;
+            if (!parser::resolve_names(unit, usings, declared)) {
+                return decline("an import stub's names did not resolve");
+            }
+        }
+        parser::UsingScope usings;
+        if (!parser::resolve_names(program, usings, declared)) {
+            return decline("names did not resolve");
+        }
     }
     // Resource functions run one statement at a time on the statement path,
     // in source order; the whole-script planner would reorder or fuse them.
@@ -6757,6 +6907,8 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
     FunctionSourceRegistry function_sources;
     DeclarationDocRegistry declaration_docs;
     ImportRegistry imports;
+    // The session is one script: a `using` typed at the prompt holds until exit.
+    parser::UsingScope usings;
     robin_hood::unordered_set<std::string> loaded_plugins;
     // Declared after the other bindings so resources close first.
     ResourceRegistry resources;
@@ -6784,7 +6936,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                            functions, compile_time_lists, extern_decls, registry, resources,
                            config.plugin_search_paths, loaded_plugins, config.import_search_paths,
                            nullptr, nullptr, &function_sources, &declaration_docs, &imports,
-                           normalized);
+                           normalized, &usings);
     };
 
     // Accumulates a statement whose delimiters span multiple input lines. Empty
@@ -7020,6 +7172,12 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 continue;
             }
             auto& expr = std::get<parser::ExprStmt>(parsed->statements.front()).expr;
+            if (auto resolved =
+                    resolve_repl_expression(*expr, usings, functions, extern_decls, registry);
+                !resolved) {
+                ibex::formatting::print("error: {}\n", resolved.error());
+                continue;
+            }
             print_physical_explain(*expr, tables, lazy_tables, scalars, columns, models, functions,
                                    compile_time_lists, extern_decls, registry);
             continue;
@@ -7056,6 +7214,12 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 continue;
             }
             auto& expr_stmt = std::get<parser::ExprStmt>(parsed->statements.front());
+            if (auto resolved = resolve_repl_expression(*expr_stmt.expr, usings, functions,
+                                                        extern_decls, registry);
+                !resolved) {
+                ibex::formatting::print("error: {}\n", resolved.error());
+                continue;
+            }
             auto value =
                 eval_expr_value(*expr_stmt.expr, tables, lazy_tables, scalars, columns, models,
                                 functions, compile_time_lists, extern_decls, registry);
@@ -7336,6 +7500,7 @@ class ReplSession::Impl {
     FunctionSourceRegistry function_sources;
     DeclarationDocRegistry declaration_docs;
     ImportRegistry imports;
+    parser::UsingScope usings;
     robin_hood::unordered_set<std::string> loaded_plugins;
     // Declared last so resources close first when the session ends.
     ResourceRegistry resources;
@@ -7369,7 +7534,8 @@ auto ReplSession::execute(std::string_view source) -> ExecutionResult {
         impl_->models, impl_->functions, impl_->compile_time_lists, impl_->extern_decls,
         *impl_->registry, impl_->resources, impl_->config.plugin_search_paths,
         impl_->loaded_plugins, impl_->config.import_search_paths, nullptr, &doc_comment_groups,
-        &impl_->function_sources, &impl_->declaration_docs, &impl_->imports, normalized);
+        &impl_->function_sources, &impl_->declaration_docs, &impl_->imports, normalized,
+        &impl_->usings);
     active_execution_result() = nullptr;
     const std::string output = capture.take();
     result.ok = ok;

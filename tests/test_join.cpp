@@ -3,6 +3,7 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
+#include <ibex/ir/cardinality.hpp>
 #include <ibex/ir/join_pushdown.hpp>
 #include <ibex/ir/join_reorder.hpp>
 #include <ibex/ir/node.hpp>
@@ -18,6 +19,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -197,7 +199,7 @@ TEST_CASE("join: reordering preserves match selection null policy and assertions
         b.add_column("k", Column<std::int64_t>{1, 1, 2, 3, 4, 5, 6}, bv);
         b.add_column("bid", Column<std::int64_t>{11, 12, 20, 30, 40, 50, 60});
         c.add_column("bid", Column<std::int64_t>{clause == "take last" ? 11 : 12});
-        runtime::TableRegistry tables{
+        const runtime::TableRegistry tables{
             {"a", std::move(a)}, {"b", std::move(b)}, {"c", std::move(c)}};
         const std::string src = "((a join b[order { bid asc }] on k " + clause +
                                 ") join c on bid)[select { n = count() }];";
@@ -240,8 +242,10 @@ TEST_CASE("join: take keeps right rows that lose every match on right and outer 
         std::int64_t picked;
         std::int64_t dropped;
     };
-    for (const auto& c : {Case{"right", "first", 10, 20}, Case{"right", "last", 20, 10},
-                          Case{"outer", "first", 10, 20}, Case{"outer", "last", 20, 10}}) {
+    for (const auto& c : {Case{.kind = "right", .take = "first", .picked = 10, .dropped = 20},
+                          Case{.kind = "right", .take = "last", .picked = 20, .dropped = 10},
+                          Case{.kind = "outer", .take = "first", .picked = 10, .dropped = 20},
+                          Case{.kind = "outer", .take = "last", .picked = 20, .dropped = 10}}) {
         CAPTURE(c.kind, c.take);
         auto tables = make_tables();
         const auto out = interpret_expr("(a " + c.kind + " join b[order { y asc }] on k take " +
@@ -282,8 +286,9 @@ TEST_CASE("join: pushdown cannot hide cardinality violations",
     b.add_column("k", Column<std::int64_t>{1, 1});
     b.add_column("v", Column<std::int64_t>{10, 20});
     z.add_column("v", Column<std::int64_t>{10});
-    runtime::TableRegistry tables{{"a", std::move(a)}, {"b", std::move(b)}, {"z", std::move(z)}};
-    ir::SourceSchemas schemas{
+    const runtime::TableRegistry tables{
+        {"a", std::move(a)}, {"b", std::move(b)}, {"z", std::move(z)}};
+    const ir::SourceSchemas schemas{
         {"a", ir::SchemaInfo::known({{.name = "k", .type = ir::ColumnType::Int64}})},
         {"b", ir::SchemaInfo::known({{.name = "k", .type = ir::ColumnType::Int64},
                                      {.name = "v", .type = ir::ColumnType::Int64}})},
@@ -2593,7 +2598,7 @@ TEST_CASE("join: `nulls` takes only equal or never", "[join][nulls]") {
 }
 
 TEST_CASE("join: `nulls` is not a reserved word", "[join][nulls]") {
-    // `read_csv(path, nulls: String = "", ...)` names a parameter `nulls`, so
+    // `csv::read(path, nulls: String = "", ...)` names a parameter `nulls`, so
     // reserving it would have broken the shipped csv reader. It is matched in
     // the join trailer position only.
     runtime::Table t;
@@ -2830,7 +2835,7 @@ TEST_CASE("join: a semi join that keeps no row still reports its columns", "[joi
     // missing schema, not an empty answer: `sum(v)` failed with "column 'v' not
     // found in input" for a column the input plainly has. A plain filter that
     // keeps nothing has always reported its columns; so must these.
-    runtime::TableRegistry tables;
+    const runtime::TableRegistry tables;
 
     SECTION("no key matches") {
         auto out = interpret_expr(R"(

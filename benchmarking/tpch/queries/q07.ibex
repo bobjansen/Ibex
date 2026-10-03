@@ -23,31 +23,31 @@
 //        benchmarking/tpch/queries/q07.ibex
 // ─────────────────────────────────────────────────────────────────────────────
 
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
-extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
+extern fn csv::write(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet") as DataFrame<{
+let customer = parquet::read("benchmarking/data/tpch/parquet/customer.parquet") as DataFrame<{
     c_custkey: Int64,
     c_nationkey: Int64
 }>;
-let nations = read_parquet("benchmarking/data/tpch/parquet/nation.parquet") as DataFrame<{
+let nations = parquet::read("benchmarking/data/tpch/parquet/nation.parquet") as DataFrame<{
     n_nationkey: Int64,
     n_name: String
 }>[
     filter n_name == "FRANCE" || n_name == "GERMANY"
 ];
-let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet") as DataFrame<{
+let orders = parquet::read("benchmarking/data/tpch/parquet/orders.parquet") as DataFrame<{
     o_orderkey: Int64,
     o_custkey: Int64
 }>;
-let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
+let lineitem = parquet::read("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
     l_orderkey: Int64,
     l_suppkey: Int64,
     l_extendedprice: Float64,
     l_discount: Float64,
     l_shipdate: Date
 }>;
-let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet") as DataFrame<{
+let supplier = parquet::read("benchmarking/data/tpch/parquet/supplier.parquet") as DataFrame<{
     s_suppkey: Int64,
     s_nationkey: Int64
 }>;
@@ -74,5 +74,5 @@ let result = joined[
     select { revenue = sum(l_extendedprice * (1.0 - l_discount)) },
     by { supp_nation, cust_nation, l_year }
 ][order { supp_nation, cust_nation, l_year }];
-write_csv(result, "benchmarking/data/tpch/out/q07.csv");
+csv::write(result, "benchmarking/data/tpch/out/q07.csv");
 result;

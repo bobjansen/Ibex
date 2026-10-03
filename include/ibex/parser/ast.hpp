@@ -260,7 +260,7 @@ struct MeltClause {
 
 /// Row-wise `map { name = expr, ... }`: evaluate the field expressions once per
 /// input row, with that row's columns in scope as scalars. Cell expressions may
-/// call effectful externs (`read_csv`, `write_parquet`). Output is one row per
+/// call effectful externs (`csv::read`, `parquet::write`). Output is one row per
 /// input row with exactly the named columns. Must be the last clause of a block.
 struct MapClause {
     std::vector<Field> fields;
@@ -451,7 +451,7 @@ struct JoinExpr {
 /// sink_callee / sink_args — the table-consumer extern that receives each output batch;
 ///             the stream runtime prepends the output Table as the first argument.
 struct StreamExpr {
-    ExprPtr source;                 ///< source call expression (e.g. udp_recv(9001))
+    ExprPtr source;                 ///< source call expression (e.g. udp::recv(9001))
     std::vector<Clause> transform;  ///< anonymous block clauses
     std::string sink_callee;        ///< name of the sink extern fn
     std::vector<ExprPtr>
@@ -500,6 +500,9 @@ struct ExprStmt {
 
 using FnStmt = std::variant<LetStmt, TupleLetStmt, ExprStmt>;
 
+/// Declarations made inside `namespace a::b { ... }` carry the qualified name
+/// (`a::b::f`) in `name` and the enclosing namespace (`a::b`) in `scope`; the
+/// block itself does not survive parsing. `scope` is empty at global scope.
 struct FunctionDecl {
     std::string name;
     std::vector<Param> params;
@@ -508,6 +511,8 @@ struct FunctionDecl {
     std::vector<FnStmt> body;
     std::size_t start_line = 0;
     std::size_t end_line = 0;
+    // NOLINTNEXTLINE(readability-redundant-member-init)
+    std::string scope{};
 };
 
 struct ExternDecl {
@@ -518,6 +523,8 @@ struct ExternDecl {
     std::string source_path;
     std::size_t start_line = 0;
     std::size_t end_line = 0;
+    // NOLINTNEXTLINE(readability-redundant-member-init)
+    std::string scope{};
 };
 
 /// `extern type Name from "plugin.hpp";` — declares an opaque resource type a
@@ -526,6 +533,17 @@ struct ExternDecl {
 struct ExternTypeDecl {
     std::string name;
     std::string source_path;
+    std::size_t start_line = 0;
+    std::size_t end_line = 0;
+    // NOLINTNEXTLINE(readability-redundant-member-init)
+    std::string scope{};
+};
+
+/// `using adbc::query;` (one name) or `using adbc;` (every name declared
+/// directly in `adbc`). Which of the two it is depends on what is declared,
+/// so it is settled when names are resolved (names.hpp), not here.
+struct UsingDecl {
+    std::string target;
     std::size_t start_line = 0;
     std::size_t end_line = 0;
 };
@@ -539,7 +557,7 @@ struct ImportDecl {
 };
 
 using Stmt = std::variant<ExternDecl, FunctionDecl, LetStmt, TupleLetStmt, ExprStmt, ImportDecl,
-                          ExternTypeDecl>;
+                          ExternTypeDecl, UsingDecl>;
 
 struct Program {
     std::vector<Stmt> statements;

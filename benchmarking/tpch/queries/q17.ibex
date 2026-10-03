@@ -21,15 +21,15 @@
 //        benchmarking/tpch/queries/q17.ibex
 // ─────────────────────────────────────────────────────────────────────────────
 
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
-extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
+extern fn csv::write(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let part_raw = read_parquet("benchmarking/data/tpch/parquet/part.parquet") as DataFrame<{
+let part_raw = parquet::read("benchmarking/data/tpch/parquet/part.parquet") as DataFrame<{
     p_partkey: Int64,
     p_brand: String,
     p_container: String
 }>;
-let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
+let lineitem_raw = parquet::read("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
     l_partkey: Int64,
     l_quantity: Int64,
     l_extendedprice: Float64
@@ -53,5 +53,5 @@ let result = (relevant_lineitems join quantity_limits on p_partkey)[
     filter l_quantity < quantity_limit,
     select { avg_yearly = sum(l_extendedprice) / 7.0 }
 ];
-write_csv(result, "benchmarking/data/tpch/out/q17.csv");
+csv::write(result, "benchmarking/data/tpch/out/q17.csv");
 result;

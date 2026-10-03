@@ -5,9 +5,9 @@
 // ibex_compile. A script that declares
 //
 //   import "adbc";
-//   let df = adbc_read("sqlite", "file:data.db", "select 1 as x");
+//   let df = adbc::read("sqlite", "file:data.db", "select 1 as x");
 //
-// transpiles to a call of `adbc_read` below. Link `libibex_adbc.a` with the ADBC
+// transpiles to a call of `adbc::read` below. Link `libibex_adbc.a` with the ADBC
 // driver manager and the Arrow bridge (scripts/ibex-build.sh does); the drivers
 // themselves are found at run time, as in the REPL.
 //
@@ -28,10 +28,6 @@
 
 #include "adbc_client.hpp"
 
-/// The language's `AdbcConnection`: copies alias one connection, and the last
-/// copy to go away closes it.
-using AdbcConnection = ibex::adbc::Connection;
-
 namespace ibex::adbc::detail {
 
 template <typename T>
@@ -48,56 +44,65 @@ inline auto params_of(const ibex::runtime::Table& params) -> TablePtr {
 
 }  // namespace ibex::adbc::detail
 
-inline auto adbc_read(std::string_view driver, std::string_view uri, std::string_view sql,
-                      std::string_view options) -> ibex::runtime::Table {
+// The entry points generated C++ calls: `ibex_compile` names Ibex's
+// `adbc::query` as `ibex::ext::adbc::query`.
+namespace ibex::ext::adbc {
+
+/// The language's `adbc::Connection`: copies alias one connection, and the
+/// last copy to go away closes it.
+using Connection = ibex::adbc::Connection;
+
+inline auto read(std::string_view driver, std::string_view uri, std::string_view sql,
+                 std::string_view options) -> ibex::runtime::Table {
     return ibex::adbc::detail::unwrap(ibex::adbc::read(driver, uri, sql, options));
 }
 
-inline auto adbc_connect(std::string_view driver, std::string_view uri, std::string_view options)
-    -> AdbcConnection {
+inline auto connect(std::string_view driver, std::string_view uri, std::string_view options)
+    -> Connection {
     return ibex::adbc::detail::unwrap(ibex::adbc::connect(driver, uri, options));
 }
 
-inline auto adbc_query(const AdbcConnection& db, std::string_view sql,
-                       const ibex::runtime::Table& params) -> ibex::runtime::Table {
+inline auto query(const Connection& db, std::string_view sql, const ibex::runtime::Table& params)
+    -> ibex::runtime::Table {
     return ibex::adbc::detail::unwrap(
         ibex::adbc::query(db, sql, ibex::adbc::detail::params_of(params)));
 }
 
-inline auto adbc_execute(const AdbcConnection& db, std::string_view sql,
-                         const ibex::runtime::Table& params) -> std::int64_t {
+inline auto execute(const Connection& db, std::string_view sql, const ibex::runtime::Table& params)
+    -> std::int64_t {
     return ibex::adbc::detail::unwrap(
         ibex::adbc::execute(db, sql, ibex::adbc::detail::params_of(params)));
 }
 
-inline auto adbc_write(const AdbcConnection& db, const ibex::runtime::Table& df,
-                       std::string_view table, std::string_view mode) -> std::int64_t {
+inline auto write(const Connection& db, const ibex::runtime::Table& df, std::string_view table,
+                  std::string_view mode) -> std::int64_t {
     return ibex::adbc::detail::unwrap(
         ibex::adbc::write(db, ibex::adbc::detail::params_of(df), table, mode));
 }
 
-inline auto adbc_tables(const AdbcConnection& db) -> ibex::runtime::Table {
+inline auto tables(const Connection& db) -> ibex::runtime::Table {
     return ibex::adbc::detail::unwrap(ibex::adbc::tables(db));
 }
 
-inline auto adbc_table_schema(const AdbcConnection& db, std::string_view table,
-                              std::string_view schema, std::string_view catalog)
-    -> ibex::runtime::Table {
+inline auto table_schema(const Connection& db, std::string_view table, std::string_view schema,
+                         std::string_view catalog) -> ibex::runtime::Table {
     return ibex::adbc::detail::unwrap(ibex::adbc::table_schema(db, table, schema, catalog));
 }
 
-inline auto adbc_begin(const AdbcConnection& db) -> std::int64_t {
+inline auto begin(const Connection& db) -> std::int64_t {
     return ibex::adbc::detail::unwrap(ibex::adbc::begin(db));
 }
 
-inline auto adbc_commit(const AdbcConnection& db) -> std::int64_t {
+inline auto commit(const Connection& db) -> std::int64_t {
     return ibex::adbc::detail::unwrap(ibex::adbc::commit(db));
 }
 
-inline auto adbc_rollback(const AdbcConnection& db) -> std::int64_t {
+inline auto rollback(const Connection& db) -> std::int64_t {
     return ibex::adbc::detail::unwrap(ibex::adbc::rollback(db));
 }
 
-inline auto adbc_close(const AdbcConnection& db) -> std::int64_t {
+inline auto close(const Connection& db) -> std::int64_t {
     return ibex::adbc::detail::unwrap(ibex::adbc::close(db));
 }
+
+}  // namespace ibex::ext::adbc

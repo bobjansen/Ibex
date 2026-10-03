@@ -147,8 +147,8 @@ Session example:
 ```r
 sess <- create_session()
 session_eval(sess, '
-  extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
-  let train = read_csv("data/iris.csv", "");
+  extern fn csv::read(path: String, nulls: String) -> DataFrame from "csv.hpp";
+  let train = csv::read("data/iris.csv", "");
 ')
 
 summary <- session_eval(sess, '
@@ -179,8 +179,8 @@ ibex::register_knitr_engines()
 
 ````
 ```{ibex, session="demo", quiet=TRUE}
-extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
-let iris = read_csv("data/iris.csv", "");
+extern fn csv::read(path: String, nulls: String) -> DataFrame from "csv.hpp";
+let iris = csv::read("data/iris.csv", "");
 ```
 
 ```{ibex, session="demo", assign="summary"}

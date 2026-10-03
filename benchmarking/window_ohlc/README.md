@@ -38,7 +38,7 @@ Two window flavours are benchmarked:
 ## Fairness
 
 - **Identical data.** One Parquet file per `(rows, symbols)` config, generated
-  once by Ibex's `data_gen` plugin (`gen_ticks`, `seed_rng(42)` → reproducible),
+  once by Ibex's `data_gen` plugin (`gen::ticks`, `seed_rng(42)` → reproducible),
   read by every engine.
 - **Compute only.** Input is pre-loaded into memory (Ibex `as_timeframe`, Polars
   eager `DataFrame`, DuckDB in-memory `TABLE`); only compute + full
@@ -215,7 +215,7 @@ three passes over the data rather than five (5.8ms -> 1.4ms per aggregate).
 ## Notes / gotchas
 
 - **Tick density is load-bearing, and the default is wrong for bars.**
-  `gen_ticks`' own `interval_ms` default is 1000.0 — one tick per SECOND across
+  `gen::ticks`' own `interval_ms` default is 1000.0 — one tick per SECOND across
   the whole feed. At that rate a 5M-row/100-symbol file spans 57.8 days, a
   10-second bar holds 1.1 ticks, and `resample` yields 4.76M groups from 5M
   rows: an identity operation wearing the name of an aggregation. It inverted a

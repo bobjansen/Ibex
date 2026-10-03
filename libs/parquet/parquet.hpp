@@ -2,19 +2,19 @@
 // Copyright (C) 2026 Bob Jansen
 
 #pragma once
-// Ibex Parquet library — provides read_parquet() and write_parquet() for use in Ibex scripts.
+// Ibex Parquet library — provides parquet::read() and parquet::write() for use in Ibex scripts.
 //
 // Reading:
-//   extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
-//   let df = read_parquet("data/myfile.parquet");
+//   extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
+//   let df = parquet::read("data/myfile.parquet");
 //   // The local-only R package build accepts local paths only.
 //   // The regular plugin additionally supports HTTPS and S3 paths.
-//   let public = read_parquet("https://data.example.com/myfile.parquet");
-//   let remote = read_parquet("s3://bucket/path/myfile.parquet?region=us-east-1");
+//   let public = parquet::read("https://data.example.com/myfile.parquet");
+//   let remote = parquet::read("s3://bucket/path/myfile.parquet?region=us-east-1");
 //
 // Writing:
-//   extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";
-//   let rows = write_parquet(df, "data/out.parquet");
+//   extern fn parquet::write(df: DataFrame, path: String) -> Int from "parquet.hpp";
+//   let rows = parquet::write(df, "data/out.parquet");
 //
 // Compile with: -I$(IBEX_ROOT)/libraries
 
@@ -109,7 +109,7 @@ inline auto make_temp_parquet_file() -> std::pair<std::FILE*, std::string> {
     std::error_code ec;
     auto temp_dir = std::filesystem::temp_directory_path(ec);
     if (ec) {
-        throw std::runtime_error("read_parquet: failed to locate temp directory: " + ec.message());
+        throw std::runtime_error("parquet::read: failed to locate temp directory: " + ec.message());
     }
 
     std::random_device rd;
@@ -122,7 +122,7 @@ inline auto make_temp_parquet_file() -> std::pair<std::FILE*, std::string> {
             return {file, path};
         }
     }
-    throw std::runtime_error("read_parquet: failed to create temp file: " +
+    throw std::runtime_error("parquet::read: failed to create temp file: " +
                              std::string(std::strerror(errno)));
 }
 
@@ -136,14 +136,14 @@ inline auto download_https_to_temp(std::string_view url) -> std::string {
         return curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
     }();
     if (!curl_initialized) {
-        throw std::runtime_error("read_parquet: failed to initialize HTTPS client");
+        throw std::runtime_error("parquet::read: failed to initialize HTTPS client");
     }
 
     auto [file, temp_path] = make_temp_parquet_file();
     CURL* curl = curl_easy_init();
     if (curl == nullptr) {
         close_and_remove_temp(file, temp_path);
-        throw std::runtime_error("read_parquet: failed to create HTTPS client");
+        throw std::runtime_error("parquet::read: failed to create HTTPS client");
     }
 
     std::string url_string{url};
@@ -176,13 +176,13 @@ inline auto download_https_to_temp(std::string_view url) -> std::string {
     if (rc != CURLE_OK) {
         close_and_remove_temp(file, temp_path);
         std::string detail = error_buffer[0] != '\0' ? error_buffer : curl_easy_strerror(rc);
-        throw std::runtime_error("read_parquet: failed to download '" + url_string + "' (" +
+        throw std::runtime_error("parquet::read: failed to download '" + url_string + "' (" +
                                  detail + ", HTTP " + std::to_string(response_code) + ")");
     }
     if (close_result != 0) {
         close_and_remove_temp(file, temp_path);
-        throw std::runtime_error("read_parquet: failed to finish temp download for '" + url_string +
-                                 "': " + std::strerror(errno));
+        throw std::runtime_error("parquet::read: failed to finish temp download for '" +
+                                 url_string + "': " + std::strerror(errno));
     }
 
     return temp_path;
@@ -194,7 +194,7 @@ inline auto open_parquet_input(std::string_view path)
     std::string path_string{path};
 #if defined(IBEX_PARQUET_LOCAL_ONLY)
     if (path_string.find("://") != std::string::npos) {
-        throw std::runtime_error("read_parquet: this build supports local files only: '" +
+        throw std::runtime_error("parquet::read: this build supports local files only: '" +
                                  path_string + "'");
     }
 #else
@@ -204,7 +204,7 @@ inline auto open_parquet_input(std::string_view path)
         std::error_code remove_ec;
         std::filesystem::remove(temp_path, remove_ec);
         if (!input_result.ok()) {
-            throw std::runtime_error("read_parquet: failed to open downloaded '" + path_string +
+            throw std::runtime_error("parquet::read: failed to open downloaded '" + path_string +
                                      "' (" + input_result.status().ToString() + ")");
         }
         return input_result.ValueOrDie();
@@ -213,13 +213,13 @@ inline auto open_parquet_input(std::string_view path)
         std::string object_path;
         auto fs_result = arrow::fs::FileSystemFromUri(path_string, &object_path);
         if (!fs_result.ok()) {
-            throw std::runtime_error("read_parquet: failed to resolve object storage path '" +
+            throw std::runtime_error("parquet::read: failed to resolve object storage path '" +
                                      path_string + "' (" + fs_result.status().ToString() + ")");
         }
 
         auto input_result = fs_result.ValueOrDie()->OpenInputFile(object_path);
         if (!input_result.ok()) {
-            throw std::runtime_error("read_parquet: failed to open '" + path_string + "' (" +
+            throw std::runtime_error("parquet::read: failed to open '" + path_string + "' (" +
                                      input_result.status().ToString() + ")");
         }
         return input_result.ValueOrDie();
@@ -229,16 +229,16 @@ inline auto open_parquet_input(std::string_view path)
     std::error_code ec;
     const bool exists = std::filesystem::exists(path_string, ec);
     if (ec) {
-        throw std::runtime_error("read_parquet: failed to inspect path '" + path_string +
+        throw std::runtime_error("parquet::read: failed to inspect path '" + path_string +
                                  "': " + ec.message());
     }
     if (!exists) {
-        throw std::runtime_error("read_parquet: file not found: '" + path_string + "'");
+        throw std::runtime_error("parquet::read: file not found: '" + path_string + "'");
     }
 
     auto input_result = arrow::io::ReadableFile::Open(path_string);
     if (!input_result.ok()) {
-        throw std::runtime_error("read_parquet: failed to open '" + path_string + "' (" +
+        throw std::runtime_error("parquet::read: failed to open '" + path_string + "' (" +
                                  input_result.status().ToString() + ")");
     }
     return input_result.ValueOrDie();
@@ -386,7 +386,7 @@ inline void append_int_column(const std::shared_ptr<arrow::ChunkedArray>& chunke
                 append_converted<arrow::UInt8Array>(*chunk, out, widen);
                 break;
             default:
-                throw std::runtime_error("read_parquet: unsupported integer column type");
+                throw std::runtime_error("parquet::read: unsupported integer column type");
         }
     }
 }
@@ -403,7 +403,7 @@ inline void append_double_column(const std::shared_ptr<arrow::ChunkedArray>& chu
                                                     [](float value) { return double{value}; });
                 break;
             default:
-                throw std::runtime_error("read_parquet: unsupported float column type");
+                throw std::runtime_error("parquet::read: unsupported float column type");
         }
     }
 }
@@ -412,7 +412,7 @@ inline void append_bool_column(const std::shared_ptr<arrow::ChunkedArray>& chunk
                                ibex::Column<bool>& out) {
     for (const auto& chunk : chunked->chunks()) {
         if (chunk->type_id() != arrow::Type::BOOL) {
-            throw std::runtime_error("read_parquet: unsupported boolean column type");
+            throw std::runtime_error("parquet::read: unsupported boolean column type");
         }
         const auto& values = static_cast<const arrow::BooleanArray&>(*chunk);
         for (std::int64_t row = 0; row < values.length(); ++row) {
@@ -453,7 +453,7 @@ inline auto build_categorical_column(const std::shared_ptr<arrow::ChunkedArray>&
         const auto& values = *dict_array.dictionary();
         if (values.type_id() != arrow::Type::STRING &&
             values.type_id() != arrow::Type::LARGE_STRING) {
-            throw std::runtime_error("read_parquet: unsupported dictionary value type");
+            throw std::runtime_error("parquet::read: unsupported dictionary value type");
         }
         const auto& strings = static_cast<const arrow::StringArray&>(values);
 
@@ -465,7 +465,7 @@ inline auto build_categorical_column(const std::shared_ptr<arrow::ChunkedArray>&
 
         const auto& indices = *dict_array.indices();
         if (indices.type_id() != arrow::Type::INT32) {
-            throw std::runtime_error("read_parquet: unsupported dictionary index type");
+            throw std::runtime_error("parquet::read: unsupported dictionary index type");
         }
         const auto& int_indices = static_cast<const arrow::Int32Array&>(indices);
         for (int64_t i = 0; i < int_indices.length(); ++i) {
@@ -518,7 +518,7 @@ inline void append_string_column(const std::shared_ptr<arrow::ChunkedArray>& chu
                 out.push_back(arr->IsNull(i) ? std::string_view{} : arr->GetView(i));
             }
         } else {
-            throw std::runtime_error("read_parquet: unsupported string column type");
+            throw std::runtime_error("parquet::read: unsupported string column type");
         }
     }
 }
@@ -528,7 +528,7 @@ inline void append_date32_column(const std::shared_ptr<arrow::ChunkedArray>& chu
     // Arrow DATE32 is int32 days since epoch, exactly ibex::Date's representation.
     for (const auto& chunk : chunked->chunks()) {
         if (chunk->type_id() != arrow::Type::DATE32) {
-            throw std::runtime_error("read_parquet: unsupported date32 column type");
+            throw std::runtime_error("parquet::read: unsupported date32 column type");
         }
         append_same_layout<arrow::Date32Array>(*chunk, out);
     }
@@ -540,7 +540,7 @@ inline void append_date64_column(const std::shared_ptr<arrow::ChunkedArray>& chu
     constexpr std::int64_t kMillisPerDay = 86'400'000;
     for (const auto& chunk : chunked->chunks()) {
         if (chunk->type_id() != arrow::Type::DATE64) {
-            throw std::runtime_error("read_parquet: unsupported date64 column type");
+            throw std::runtime_error("parquet::read: unsupported date64 column type");
         }
         append_converted<arrow::Date64Array>(*chunk, out, [](std::int64_t millis) {
             return ibex::Date{static_cast<std::int32_t>(millis / kMillisPerDay)};
@@ -570,7 +570,7 @@ inline void append_timestamp_column(const std::shared_ptr<arrow::ChunkedArray>& 
     }
     for (const auto& chunk : chunked->chunks()) {
         if (chunk->type_id() != arrow::Type::TIMESTAMP) {
-            throw std::runtime_error("read_parquet: unsupported timestamp column type");
+            throw std::runtime_error("parquet::read: unsupported timestamp column type");
         }
         // A nanosecond column needs no rescaling, so it is already ibex::Timestamp's
         // layout and copies wholesale.
@@ -586,7 +586,7 @@ inline void append_timestamp_column(const std::shared_ptr<arrow::ChunkedArray>& 
 
 /// Populate `sink` (an `ibex::runtime::Table` or `ibex::runtime::Chunk` —
 /// both expose a matching `add_column(name, ColumnValue, optional<ValidityBitmap>)`)
-/// from an already-read Arrow table. Shared by the whole-file `read_parquet()`
+/// from an already-read Arrow table. Shared by the whole-file `parquet::read()`
 /// path and the row-group/batch streaming `ChunkedParquetSourceOperator` so a
 /// single, tested conversion path handles both.
 /// The Decimal(p, s) an Arrow decimal type maps to. Arrow allows what Ibex does
@@ -596,13 +596,14 @@ inline auto decimal_type_from_arrow(const arrow::DataType& type, const std::stri
     -> ibex::DecimalType {
     const auto& dec = static_cast<const arrow::DecimalType&>(type);
     if (type.id() == arrow::Type::DECIMAL256) {
-        throw std::runtime_error(
-            "read_parquet: column '" + name + "' is Decimal256(" + std::to_string(dec.precision()) +
-            ", " + std::to_string(dec.scale()) + "); Ibex decimals hold at most 38 digits");
+        throw std::runtime_error("parquet::read: column '" + name + "' is Decimal256(" +
+                                 std::to_string(dec.precision()) + ", " +
+                                 std::to_string(dec.scale()) +
+                                 "); Ibex decimals hold at most 38 digits");
     }
     if (dec.precision() < 1 || dec.precision() > ibex::decimal::kMaxPrecision || dec.scale() < 0 ||
         dec.scale() > dec.precision()) {
-        throw std::runtime_error("read_parquet: column '" + name + "' has unsupported decimal(" +
+        throw std::runtime_error("parquet::read: column '" + name + "' has unsupported decimal(" +
                                  std::to_string(dec.precision()) + ", " +
                                  std::to_string(dec.scale()) +
                                  "): precision must be 1..38 and scale 0..precision");
@@ -735,7 +736,7 @@ inline void populate_from_arrow_table(const std::shared_ptr<arrow::Table>& table
                 break;
             }
             default:
-                throw std::runtime_error("read_parquet: unsupported column type for " +
+                throw std::runtime_error("parquet::read: unsupported column type for " +
                                          field->name());
         }
     }
@@ -789,7 +790,7 @@ inline auto schema_table_from_arrow(const arrow::Schema& schema) -> ibex::runtim
                                    decimal_type_from_arrow(*field->type(), field->name())));
                 break;
             default:
-                throw std::runtime_error("read_parquet: unsupported column type for " +
+                throw std::runtime_error("parquet::read: unsupported column type for " +
                                          field->name());
         }
     }
@@ -1011,7 +1012,7 @@ inline auto make_parquet_reader(std::shared_ptr<arrow::io::RandomAccessFile> inp
     parquet::arrow::FileReaderBuilder builder;
     auto status = builder.Open(std::move(input));
     if (!status.ok()) {
-        throw std::runtime_error("read_parquet: failed to read: " + path + " (" +
+        throw std::runtime_error("parquet::read: failed to read: " + path + " (" +
                                  status.ToString() + ")");
     }
 
@@ -1029,7 +1030,7 @@ inline auto make_parquet_reader(std::shared_ptr<arrow::io::RandomAccessFile> inp
     std::unique_ptr<parquet::arrow::FileReader> reader;
     status = builder.Build(&reader);
     if (!status.ok()) {
-        throw std::runtime_error("read_parquet: failed to open: " + path + " (" +
+        throw std::runtime_error("parquet::read: failed to open: " + path + " (" +
                                  status.ToString() + ")");
     }
     return reader;
@@ -1046,7 +1047,7 @@ inline auto make_parquet_reader(std::shared_ptr<arrow::io::RandomAccessFile> inp
     parquet::arrow::FileReaderBuilder builder;
     auto status = builder.Open(std::move(input), parquet::default_reader_properties(), metadata);
     if (!status.ok()) {
-        throw std::runtime_error("read_parquet: failed to read: " + path + " (" +
+        throw std::runtime_error("parquet::read: failed to read: " + path + " (" +
                                  status.ToString() + ")");
     }
 
@@ -1060,7 +1061,7 @@ inline auto make_parquet_reader(std::shared_ptr<arrow::io::RandomAccessFile> inp
     std::unique_ptr<parquet::arrow::FileReader> reader;
     status = builder.Build(&reader);
     if (!status.ok()) {
-        throw std::runtime_error("read_parquet: failed to open: " + path + " (" +
+        throw std::runtime_error("parquet::read: failed to open: " + path + " (" +
                                  status.ToString() + ")");
     }
     return reader;
@@ -1176,7 +1177,7 @@ inline auto decode_numeric_into(parquet::arrow::FileReader& reader, int leaf_ind
                 output_data[output_pos++] = value == nullptr ? Out{} : convert(*value);
             });
         if (output_pos != output_rows || emitted != output_rows) {
-            throw std::runtime_error("read_parquet: selected decoder emitted the wrong row count");
+            throw std::runtime_error("parquet::read: selected decoder emitted the wrong row count");
         }
         return emitted;
     }
@@ -1196,7 +1197,7 @@ inline auto decode_numeric_into(parquet::arrow::FileReader& reader, int leaf_ind
         auto row_group = reader.parquet_reader()->RowGroup(group);
         auto column = row_group->Column(leaf_index);
         if (column->type() != DType::type_num) {
-            throw std::runtime_error("read_parquet: physical column type does not match schema");
+            throw std::runtime_error("parquet::read: physical column type does not match schema");
         }
         auto typed = std::static_pointer_cast<parquet::TypedColumnReader<DType>>(column);
         const auto group_rows = static_cast<std::size_t>(metadata.RowGroup(group)->num_rows());
@@ -1216,7 +1217,7 @@ inline auto decode_numeric_into(parquet::arrow::FileReader& reader, int leaf_ind
                                  destination, &values_read);
             if (levels_read <= 0 || levels_read != values_read) {
                 throw std::runtime_error(
-                    "read_parquet: dense column decoder made no progress or found a null "
+                    "parquet::read: dense column decoder made no progress or found a null "
                     "value that contradicts the column statistics");
             }
             const auto count = static_cast<std::size_t>(values_read);
@@ -1230,7 +1231,7 @@ inline auto decode_numeric_into(parquet::arrow::FileReader& reader, int leaf_ind
             row += static_cast<std::size_t>(levels_read);
         }
         if (row != group_rows) {
-            throw std::runtime_error("read_parquet: column ended before its row group");
+            throw std::runtime_error("parquet::read: column ended before its row group");
         }
     }
     return emitted;
@@ -1313,7 +1314,7 @@ inline auto decode_string_column(parquet::arrow::FileReader& reader, int leaf_in
         auto row_group = reader.parquet_reader()->RowGroup(group);
         auto column = row_group->Column(leaf_index);
         if (column->type() != parquet::ByteArrayType::type_num) {
-            throw std::runtime_error("read_parquet: physical column type does not match schema");
+            throw std::runtime_error("parquet::read: physical column type does not match schema");
         }
         auto typed = std::static_pointer_cast<parquet::ByteArrayReader>(column);
         const auto group_rows = static_cast<std::size_t>(metadata.RowGroup(group)->num_rows());
@@ -1328,7 +1329,7 @@ inline auto decode_string_column(parquet::arrow::FileReader& reader, int leaf_in
                 typed->ReadBatch(request, nullptr, nullptr, values.get(), &values_read);
             if (levels_read <= 0 || levels_read != values_read) {
                 throw std::runtime_error(
-                    "read_parquet: dense string decoder made no progress or found a null value "
+                    "parquet::read: dense string decoder made no progress or found a null value "
                     "that contradicts the column statistics");
             }
             const auto count = static_cast<std::size_t>(values_read);
@@ -1351,7 +1352,7 @@ inline auto decode_string_column(parquet::arrow::FileReader& reader, int leaf_in
             row += static_cast<std::size_t>(levels_read);
         }
         if (row != group_rows) {
-            throw std::runtime_error("read_parquet: column ended before its row group");
+            throw std::runtime_error("parquet::read: column ended before its row group");
         }
     }
     out.finish_bulk_append(writer);
@@ -1407,11 +1408,11 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
         auto row_group = reader.parquet_reader()->RowGroup(group);
         auto column = dictionary_column_reader(*row_group, leaf_index);
         if (column == nullptr) {
-            throw std::runtime_error("read_parquet: dictionary column changed encoding");
+            throw std::runtime_error("parquet::read: dictionary column changed encoding");
         }
         const auto* descriptor = column->descr();
         if (descriptor->max_repetition_level() != 0 || descriptor->max_definition_level() > 1) {
-            throw std::runtime_error("read_parquet: nested columns are not supported");
+            throw std::runtime_error("parquet::read: nested columns are not supported");
         }
         const bool optional = descriptor->max_definition_level() != 0;
         // Chunk statistics proving null_count == 0 let this group skip
@@ -1467,7 +1468,7 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
                 std::iota(local_to_global.begin(), local_to_global.end(), 0);
             }
             if (levels_read <= 0) {
-                throw std::runtime_error("read_parquet: dictionary decoder made no progress");
+                throw std::runtime_error("parquet::read: dictionary decoder made no progress");
             }
             if (local_dictionary != nullptr) {
                 local_to_global.clear();
@@ -1479,14 +1480,14 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
                 }
             }
             if (local_to_global.empty() && codes_read != 0) {
-                throw std::runtime_error("read_parquet: dictionary page was not exposed");
+                throw std::runtime_error("parquet::read: dictionary page was not exposed");
             }
 
             if (selection == nullptr && !use_defs) {
                 for (std::int64_t offset = 0; offset < codes_read; ++offset) {
                     const auto local = local_codes[static_cast<std::size_t>(offset)];
                     if (local < 0 || static_cast<std::size_t>(local) >= local_to_global.size()) {
-                        throw std::runtime_error("read_parquet: invalid dictionary index");
+                        throw std::runtime_error("parquet::read: invalid dictionary index");
                     }
                     codes.push_back(local_to_global[static_cast<std::size_t>(local)]);
                 }
@@ -1514,7 +1515,7 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
                         const auto local = local_codes[code_pos];
                         if (local < 0 ||
                             static_cast<std::size_t>(local) >= local_to_global.size()) {
-                            throw std::runtime_error("read_parquet: invalid dictionary index");
+                            throw std::runtime_error("parquet::read: invalid dictionary index");
                         }
                         codes.push_back(local_to_global[static_cast<std::size_t>(local)]);
                     }
@@ -1523,12 +1524,12 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
                 code_pos += static_cast<std::size_t>(valid);
             }
             if (code_pos != static_cast<std::size_t>(codes_read)) {
-                throw std::runtime_error("read_parquet: inconsistent definition levels");
+                throw std::runtime_error("parquet::read: inconsistent definition levels");
             }
             row += static_cast<std::size_t>(levels_read);
         }
         if (row != group_rows) {
-            throw std::runtime_error("read_parquet: column ended before its row group");
+            throw std::runtime_error("parquet::read: column ended before its row group");
         }
         group_start += group_rows;
     }
@@ -1572,11 +1573,11 @@ inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_
         auto row_group = reader.parquet_reader()->RowGroup(group);
         auto column = row_group->Column(leaf_index);
         if (column->type() != DType::type_num) {
-            throw std::runtime_error("read_parquet: physical column type does not match schema");
+            throw std::runtime_error("parquet::read: physical column type does not match schema");
         }
         const auto* descriptor = column->descr();
         if (descriptor->max_repetition_level() != 0 || descriptor->max_definition_level() > 1) {
-            throw std::runtime_error("read_parquet: nested columns are not supported");
+            throw std::runtime_error("parquet::read: nested columns are not supported");
         }
         const bool optional = descriptor->max_definition_level() != 0;
         auto typed = std::static_pointer_cast<parquet::TypedColumnReader<DType>>(column);
@@ -1606,7 +1607,7 @@ inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_
                     const auto skipped = typed->Skip(static_cast<std::int64_t>(gap));
                     if (skipped != static_cast<std::int64_t>(gap)) {
                         throw std::runtime_error(
-                            "read_parquet: column ended while skipping rejected rows");
+                            "parquet::read: column ended while skipping rejected rows");
                     }
                     source_row += gap;
                 }
@@ -1633,7 +1634,7 @@ inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_
                                          values.get(), &values_read);
                     if (levels_read <= 0 || values_read != levels_read) {
                         throw std::runtime_error(
-                            "read_parquet: column ended or held an unexpected null while "
+                            "parquet::read: column ended or held an unexpected null while "
                             "reading selected rows");
                     }
                     for (std::int64_t i = 0; i < levels_read; ++i) {
@@ -1657,7 +1658,7 @@ inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_
             while (selected_pos < selected_end) {
                 if (row >= group_rows || !typed->HasNext()) {
                     throw std::runtime_error(
-                        "read_parquet: column ended while reading selected rows");
+                        "parquet::read: column ended while reading selected rows");
                 }
                 const auto request = static_cast<std::int64_t>(std::min<std::size_t>(
                     static_cast<std::size_t>(kDirectDecodeBatchRows), group_rows - row));
@@ -1666,7 +1667,7 @@ inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_
                     typed->ReadBatch(request, nullptr, nullptr, values.get(), &values_read);
                 if (levels_read <= 0 || values_read != levels_read) {
                     throw std::runtime_error(
-                        "read_parquet: column ended or held an unexpected null while reading "
+                        "parquet::read: column ended or held an unexpected null while reading "
                         "selected rows");
                 }
                 const std::size_t batch_start = group_start + row;
@@ -1691,7 +1692,7 @@ inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_
                 typed->ReadBatch(request, optional ? definitions.get() : nullptr, nullptr,
                                  values.get(), &values_read);
             if (levels_read <= 0) {
-                throw std::runtime_error("read_parquet: column decoder made no progress");
+                throw std::runtime_error("parquet::read: column decoder made no progress");
             }
 
             std::size_t raw_pos = 0;
@@ -1711,12 +1712,12 @@ inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_
                 raw_pos += static_cast<std::size_t>(valid);
             }
             if (raw_pos != static_cast<std::size_t>(values_read)) {
-                throw std::runtime_error("read_parquet: inconsistent definition levels");
+                throw std::runtime_error("parquet::read: inconsistent definition levels");
             }
             row += static_cast<std::size_t>(levels_read);
         }
         if (row != group_rows) {
-            throw std::runtime_error("read_parquet: column ended before its row group");
+            throw std::runtime_error("parquet::read: column ended before its row group");
         }
         group_start += group_rows;
     }
@@ -1793,7 +1794,7 @@ inline auto sharded_numeric(ibex::runtime::ColumnEntry& entry, int leaf_index,
         const auto emitted = decode_numeric_into<DType, Out, SameLayout>(
             reader, leaf_index, selection, range, base + output_start, rows, validity, convert);
         if (emitted != rows || validity.position != rows || validity.has_null) {
-            throw std::runtime_error("read_parquet: sharded decode produced the wrong row count");
+            throw std::runtime_error("parquet::read: sharded decode produced the wrong row count");
         }
         return emitted;
     };
@@ -1833,7 +1834,7 @@ inline void sharded_dictionary(ShardedColumn& planned, int leaf_index,
                                                       (*local_dicts)[shard], local_codes, validity);
         if (emitted != rows || validity.position != rows || validity.has_null) {
             throw std::runtime_error(
-                "read_parquet: sharded dictionary decode produced the wrong row count");
+                "parquet::read: sharded dictionary decode produced the wrong row count");
         }
         std::copy(local_codes.begin(), local_codes.end(), base + output_start);
         (*shard_bounds)[shard] = {output_start, rows};
@@ -1866,7 +1867,7 @@ inline void sharded_dictionary(ShardedColumn& planned, int leaf_index,
             for (std::size_t i = output_start; i < output_start + rows; ++i) {
                 const auto local = codes_base[i];
                 if (local < 0 || static_cast<std::size_t>(local) >= remap.size()) {
-                    throw std::runtime_error("read_parquet: invalid sharded dictionary code");
+                    throw std::runtime_error("parquet::read: invalid sharded dictionary code");
                 }
                 codes_base[i] = remap[static_cast<std::size_t>(local)];
             }
@@ -1975,7 +1976,7 @@ inline auto direct_column(parquet::arrow::FileReader& reader, const arrow::Field
 
     auto verify = [&](std::size_t emitted) {
         if (emitted != output_rows || validity.position != output_rows) {
-            throw std::runtime_error("read_parquet: decoded column has the wrong row count");
+            throw std::runtime_error("parquet::read: decoded column has the wrong row count");
         }
     };
 
@@ -2142,7 +2143,7 @@ inline auto direct_column(parquet::arrow::FileReader& reader, const arrow::Field
                     if (len - i > 16) {
                         const std::uint8_t pad = (value < 0) ? 0xFF : 0x00;
                         if (bytes[i] != pad) {
-                            throw std::runtime_error("read_parquet: decimal in '" + field.name() +
+                            throw std::runtime_error("parquet::read: decimal in '" + field.name() +
                                                      "' exceeds 128 bits");
                         }
                         continue;
@@ -2189,7 +2190,7 @@ inline auto direct_column(parquet::arrow::FileReader& reader, const arrow::Field
                     break;
                 default:
                     throw std::runtime_error(
-                        "read_parquet: unsupported physical type for decimal "
+                        "parquet::read: unsupported physical type for decimal "
                         "column " +
                         field.name());
             }
@@ -2198,7 +2199,7 @@ inline auto direct_column(parquet::arrow::FileReader& reader, const arrow::Field
             break;
         }
         default:
-            throw std::runtime_error("read_parquet: unsupported column type for " + field.name());
+            throw std::runtime_error("parquet::read: unsupported column type for " + field.name());
     }
 
     entry.validity = std::move(validity).finish();
@@ -2239,7 +2240,7 @@ inline auto direct_decode_table(std::span<parquet::arrow::FileReader* const> rea
                                 const ibex::runtime::Selection* selection, std::size_t source_rows,
                                 const DirectDecodeGroups& groups) -> ibex::runtime::Table {
     if (readers.empty()) {
-        throw std::runtime_error("read_parquet: no reader for decode");
+        throw std::runtime_error("parquet::read: no reader for decode");
     }
     auto& reader = *readers.front();
     // The selection must be strictly increasing and inside the source. Where
@@ -2249,7 +2250,7 @@ inline auto direct_decode_table(std::span<parquet::arrow::FileReader* const> rea
     if (groups.begin < 0 || groups.end < groups.begin ||
         groups.end > reader.parquet_reader()->metadata()->num_row_groups() ||
         groups.source_start + groups.rows > source_rows) {
-        throw std::runtime_error("read_parquet: invalid decode row-group range");
+        throw std::runtime_error("parquet::read: invalid decode row-group range");
     }
 
     std::size_t output_rows = groups.rows;
@@ -2271,7 +2272,7 @@ inline auto direct_decode_table(std::span<parquet::arrow::FileReader* const> rea
         if (field_index < 0 || field_index >= schema.num_fields() ||
             field_index >= static_cast<int>(manifest.schema_fields.size()) ||
             !manifest.schema_fields[static_cast<std::size_t>(field_index)].is_leaf()) {
-            throw std::runtime_error("read_parquet: nested columns are not supported");
+            throw std::runtime_error("parquet::read: nested columns are not supported");
         }
         leaves.push_back(
             manifest.schema_fields[static_cast<std::size_t>(field_index)].column_index);
@@ -2323,7 +2324,7 @@ inline auto direct_decode_table(std::span<parquet::arrow::FileReader* const> rea
             output_start += rows;
         }
         if (output_start != output_rows) {
-            throw std::runtime_error("read_parquet: row-group split lost rows");
+            throw std::runtime_error("parquet::read: row-group split lost rows");
         }
     }
 
@@ -2347,7 +2348,7 @@ inline auto direct_decode_table(std::span<parquet::arrow::FileReader* const> rea
                                      [](const auto& column) { return column.has_value(); });
         if (!all_planned) {
             if (!ibex::parquet_selection::whole_valid(sel, source_rows)) {
-                throw std::runtime_error("read_parquet: invalid row selection");
+                throw std::runtime_error("parquet::read: invalid row selection");
             }
         } else {
             std::vector<std::size_t> group_ends;
@@ -2362,7 +2363,7 @@ inline auto direct_decode_table(std::span<parquet::arrow::FileReader* const> rea
                 ibex::parquet_selection::slice_bounds(sel, groups.source_start, group_ends);
             if (!ibex::parquet_selection::outside_valid(sel, slice_bounds, groups.source_start, end,
                                                         source_rows)) {
-                throw std::runtime_error("read_parquet: invalid row selection");
+                throw std::runtime_error("parquet::read: invalid row selection");
             }
         }
     }
@@ -2408,7 +2409,7 @@ inline auto direct_decode_table(std::span<parquet::arrow::FileReader* const> rea
     }
 
     if (invalid_selection.load(std::memory_order_relaxed)) {
-        throw std::runtime_error("read_parquet: invalid row selection");
+        throw std::runtime_error("parquet::read: invalid row selection");
     }
 
     // Every shard for every column has now decoded. Dictionary is the only
@@ -2452,7 +2453,7 @@ inline auto direct_decode_table(std::span<parquet::arrow::FileReader* const> rea
                                 const ibex::runtime::Selection* selection, std::size_t source_rows)
     -> ibex::runtime::Table {
     if (readers.empty()) {
-        throw std::runtime_error("read_parquet: no reader for decode");
+        throw std::runtime_error("parquet::read: no reader for decode");
     }
     return direct_decode_table(readers, schema, field_indices, selection, source_rows,
                                all_decode_groups(*readers.front()->parquet_reader()->metadata()));
@@ -2463,7 +2464,7 @@ inline auto direct_decode_table(std::span<parquet::arrow::FileReader* const> rea
 /// Open `path` for deferred reading: take its schema and row count from the
 /// footer, and hand back a handle that decodes individual columns on demand.
 ///
-/// This is what gives `let t = read_parquet(p)` projection pushdown. Binding
+/// This is what gives `let t = parquet::read(p)` projection pushdown. Binding
 /// touches metadata only; a query that references 4 of 16 columns decodes 4.
 /// Merge one column's footer statistics across every row group into a whole-file
 /// range. Integers only: `span = max - min + 1` is what the planner derives a
@@ -2603,7 +2604,7 @@ inline auto filtered_key_group_scan(parquet::arrow::FileReader& reader, int leaf
 
     auto column = reader.parquet_reader()->RowGroup(group)->Column(leaf_index);
     if (column->type() != DType::type_num) {
-        throw std::runtime_error("read_parquet: physical column type does not match schema");
+        throw std::runtime_error("parquet::read: physical column type does not match schema");
     }
     const auto* descriptor = column->descr();
     if (descriptor->max_repetition_level() != 0 || descriptor->max_definition_level() > 1) {
@@ -2613,7 +2614,7 @@ inline auto filtered_key_group_scan(parquet::arrow::FileReader& reader, int leaf
     auto typed = std::static_pointer_cast<parquet::TypedColumnReader<DType>>(column);
     if (skip > 0 &&
         typed->Skip(static_cast<std::int64_t>(skip)) != static_cast<std::int64_t>(skip)) {
-        throw std::runtime_error("read_parquet: key column shard skip ended before its start");
+        throw std::runtime_error("parquet::read: key column shard skip ended before its start");
     }
 
     std::unique_ptr<Raw[]> decoded(new Raw[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
@@ -2628,7 +2629,7 @@ inline auto filtered_key_group_scan(parquet::arrow::FileReader& reader, int leaf
         const std::int64_t levels_read = typed->ReadBatch(
             request, optional ? definitions.get() : nullptr, nullptr, decoded.get(), &values_read);
         if (levels_read <= 0) {
-            throw std::runtime_error("read_parquet: key column ended before its row group");
+            throw std::runtime_error("parquet::read: key column ended before its row group");
         }
         const std::size_t batch_start = selected.size();
         if (!optional || values_read == levels_read) {
@@ -2665,7 +2666,7 @@ inline auto filtered_key_group_scan(parquet::arrow::FileReader& reader, int leaf
         row += static_cast<std::size_t>(levels_read);
     }
     if (row != shard_rows) {
-        throw std::runtime_error("read_parquet: key column ended before its row group");
+        throw std::runtime_error("parquet::read: key column ended before its row group");
     }
     return true;
 }
@@ -3006,14 +3007,14 @@ inline auto filtered_dictionary_int32_group_scan(parquet::arrow::FileReader& rea
             typed->ReadBatchWithDictionary(request, optional ? definitions.get() : nullptr, nullptr,
                                            codes.get(), &codes_read, &dictionary, &dictionary_size);
         if (levels <= 0)
-            throw std::runtime_error("read_parquet: dictionary date scan made no progress");
+            throw std::runtime_error("parquet::read: dictionary date scan made no progress");
         if (dictionary != nullptr) {
             keep.resize(static_cast<std::size_t>(dictionary_size));
             for (std::int32_t i = 0; i < dictionary_size; ++i)
                 keep[static_cast<std::size_t>(i)] = filter.passes(dictionary[i]);
         }
         if (keep.empty() && codes_read != 0)
-            throw std::runtime_error("read_parquet: dictionary date page was not exposed");
+            throw std::runtime_error("parquet::read: dictionary date page was not exposed");
         std::size_t code = 0;
         for (std::int64_t offset = 0; offset < levels; ++offset) {
             const bool valid = !optional || definitions[static_cast<std::size_t>(offset)] != 0;
@@ -3021,16 +3022,16 @@ inline auto filtered_dictionary_int32_group_scan(parquet::arrow::FileReader& rea
                 continue;
             const auto value = codes[code++];
             if (value < 0 || static_cast<std::size_t>(value) >= keep.size())
-                throw std::runtime_error("read_parquet: invalid dictionary date code");
+                throw std::runtime_error("parquet::read: invalid dictionary date code");
             if (keep[static_cast<std::size_t>(value)])
                 selected.push_back(group.base + row + static_cast<std::size_t>(offset));
         }
         if (code != static_cast<std::size_t>(codes_read))
-            throw std::runtime_error("read_parquet: inconsistent dictionary date levels");
+            throw std::runtime_error("parquet::read: inconsistent dictionary date levels");
         row += static_cast<std::size_t>(levels);
     }
     if (row != group.rows)
-        throw std::runtime_error("read_parquet: dictionary date column ended early");
+        throw std::runtime_error("parquet::read: dictionary date column ended early");
     return true;
 }
 
@@ -3122,7 +3123,7 @@ inline auto filtered_dictionary_string_group_scan(parquet::arrow::FileReader& re
             throw;
         }
         if (levels <= 0) {
-            throw std::runtime_error("read_parquet: dictionary string scan made no progress");
+            throw std::runtime_error("parquet::read: dictionary string scan made no progress");
         }
         if (dictionary != nullptr) {
             views.clear();
@@ -3134,15 +3135,15 @@ inline auto filtered_dictionary_string_group_scan(parquet::arrow::FileReader& re
             keep = keep_fn(views);
             if (keep.size() != views.size()) {
                 throw std::runtime_error(
-                    "read_parquet: dictionary predicate answered the wrong size");
+                    "parquet::read: dictionary predicate answered the wrong size");
             }
         }
         if (keep.empty() && codes_read != 0) {
-            throw std::runtime_error("read_parquet: dictionary string page was not exposed");
+            throw std::runtime_error("parquet::read: dictionary string page was not exposed");
         }
         const auto passes_code = [&](std::int32_t value) {
             if (value < 0 || static_cast<std::size_t>(value) >= keep.size()) {
-                throw std::runtime_error("read_parquet: invalid dictionary string code");
+                throw std::runtime_error("parquet::read: invalid dictionary string code");
             }
             return keep[static_cast<std::size_t>(value)] != 0;
         };
@@ -3152,7 +3153,7 @@ inline auto filtered_dictionary_string_group_scan(parquet::arrow::FileReader& re
             // No nulls: a row's code is at its offset, so only candidates are
             // looked at.
             if (codes_read != levels) {
-                throw std::runtime_error("read_parquet: inconsistent dictionary string levels");
+                throw std::runtime_error("parquet::read: inconsistent dictionary string levels");
             }
             for (; next < candidates_end && (*within)[next] < batch_end; ++next) {
                 const std::size_t offset = (*within)[next] - batch_first;
@@ -3178,7 +3179,7 @@ inline auto filtered_dictionary_string_group_scan(parquet::arrow::FileReader& re
                 }
             }
             if (code != static_cast<std::size_t>(codes_read)) {
-                throw std::runtime_error("read_parquet: inconsistent dictionary string levels");
+                throw std::runtime_error("parquet::read: inconsistent dictionary string levels");
             }
             if (within != nullptr) {
                 for (; next < candidates_end && (*within)[next] < batch_end; ++next) {
@@ -3191,7 +3192,7 @@ inline auto filtered_dictionary_string_group_scan(parquet::arrow::FileReader& re
         row += static_cast<std::size_t>(levels);
     }
     if (row != group.rows) {
-        throw std::runtime_error("read_parquet: dictionary string column ended early");
+        throw std::runtime_error("parquet::read: dictionary string column ended early");
     }
     return true;
 }
@@ -3261,7 +3262,7 @@ inline auto filtered_string_group_scan(parquet::arrow::FileReader& reader, int l
                                        ibex::runtime::Selection& selected) -> bool {
     auto column = reader.parquet_reader()->RowGroup(group)->Column(leaf_index);
     if (column->type() != parquet::ByteArrayType::type_num) {
-        throw std::runtime_error("read_parquet: physical column type does not match schema");
+        throw std::runtime_error("parquet::read: physical column type does not match schema");
     }
     const auto* descriptor = column->descr();
     if (descriptor->max_repetition_level() != 0 || descriptor->max_definition_level() > 1) {
@@ -3271,7 +3272,7 @@ inline auto filtered_string_group_scan(parquet::arrow::FileReader& reader, int l
     auto typed = std::static_pointer_cast<parquet::ByteArrayReader>(column);
     if (skip > 0 &&
         typed->Skip(static_cast<std::int64_t>(skip)) != static_cast<std::int64_t>(skip)) {
-        throw std::runtime_error("read_parquet: string column shard skip ended before its start");
+        throw std::runtime_error("parquet::read: string column shard skip ended before its start");
     }
 
     std::unique_ptr<parquet::ByteArray[]> values(
@@ -3295,7 +3296,7 @@ inline auto filtered_string_group_scan(parquet::arrow::FileReader& reader, int l
         const std::int64_t levels_read = typed->ReadBatch(
             request, optional ? definitions.get() : nullptr, nullptr, values.get(), &values_read);
         if (levels_read <= 0) {
-            throw std::runtime_error("read_parquet: string column ended before its row group");
+            throw std::runtime_error("parquet::read: string column ended before its row group");
         }
         if (!optional || values_read == levels_read) {
             for (std::int64_t i = 0; i < values_read; ++i) {
@@ -3321,7 +3322,7 @@ inline auto filtered_string_group_scan(parquet::arrow::FileReader& reader, int l
         row += static_cast<std::size_t>(levels_read);
     }
     if (row != shard_rows) {
-        throw std::runtime_error("read_parquet: string column ended before its row group");
+        throw std::runtime_error("parquet::read: string column ended before its row group");
     }
     return true;
 }
@@ -3405,14 +3406,14 @@ inline auto filtered_string_page_stripe(const StringPageStripe& task,
         // `RandomAccessFile::GetStream` returns does not implement Peek.
         auto data = input->ReadAt(task.data_offset, task.data_size);
         if (!data.ok())
-            throw std::runtime_error("read_parquet: failed to read string page stripe (" +
+            throw std::runtime_error("parquet::read: failed to read string page stripe (" +
                                      data.status().ToString() + ")");
         stream = std::make_shared<arrow::io::BufferReader>(std::move(*data));
     } else {
         auto dictionary = input->ReadAt(task.dictionary_offset, task.dictionary_size);
         auto data = input->ReadAt(task.data_offset, task.data_size);
         if (!dictionary.ok() || !data.ok())
-            throw std::runtime_error("read_parquet: failed to read string page stripe");
+            throw std::runtime_error("parquet::read: failed to read string page stripe");
         arrow::BufferBuilder joined;
         if (auto status = joined.Append((*dictionary)->data(), (*dictionary)->size()); !status.ok())
             throw std::runtime_error(status.ToString());
@@ -3440,7 +3441,7 @@ inline auto filtered_string_page_stripe(const StringPageStripe& task,
         const auto levels = column->ReadBatch(request, optional ? definitions.get() : nullptr,
                                               nullptr, values.get(), &read);
         if (levels <= 0)
-            throw std::runtime_error("read_parquet: string page stripe made no progress");
+            throw std::runtime_error("parquet::read: string page stripe made no progress");
         std::size_t value = 0;
         for (std::int64_t i = 0; i < levels; ++i) {
             if (!optional || definitions[static_cast<std::size_t>(i)] != 0) {
@@ -3452,7 +3453,7 @@ inline auto filtered_string_page_stripe(const StringPageStripe& task,
         row += static_cast<std::size_t>(levels);
     }
     if (row != task.rows)
-        throw std::runtime_error("read_parquet: string page stripe ended early");
+        throw std::runtime_error("parquet::read: string page stripe ended early");
     return true;
 }
 
@@ -3641,7 +3642,7 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
         for (const auto& name : names) {
             auto it = indices_->find(name);
             if (it == indices_->end()) {
-                return std::unexpected("read_parquet: no column '" + name + "' in " + path_);
+                return std::unexpected("parquet::read: no column '" + name + "' in " + path_);
             }
             column_indices.push_back(it->second);
         }
@@ -3659,7 +3660,7 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
             return direct_decode_table(std::span{readers}, *schema_, column_indices, selection,
                                        rows_, groups);
         } catch (const std::exception& e) {
-            return std::unexpected("read_parquet: failed to read columns from " + path_ + " (" +
+            return std::unexpected("parquet::read: failed to read columns from " + path_ + " (" +
                                    e.what() + ")");
         }
     }
@@ -3671,7 +3672,7 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
         -> std::expected<std::optional<ibex::runtime::Selection>, std::string> override {
         auto it = indices_->find(key);
         if (it == indices_->end()) {
-            return std::unexpected("read_parquet: no column '" + key + "' in " + path_);
+            return std::unexpected("parquet::read: no column '" + key + "' in " + path_);
         }
         // Only types whose ordinary decode is the identity/sign-extension
         // into int64 — the fused filter must see exactly the values the
@@ -3736,8 +3737,8 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
             }
             return std::optional<ibex::runtime::Selection>{};
         } catch (const std::exception& e) {
-            return std::unexpected("read_parquet: fused key filter scan failed on " + path_ + " (" +
-                                   e.what() + ")");
+            return std::unexpected("parquet::read: fused key filter scan failed on " + path_ +
+                                   " (" + e.what() + ")");
         }
     }
 
@@ -3748,7 +3749,7 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
         -> std::expected<std::optional<ibex::runtime::Selection>, std::string> override {
         auto it = indices_->find(column);
         if (it == indices_->end()) {
-            return std::unexpected("read_parquet: no column '" + column + "' in " + path_);
+            return std::unexpected("parquet::read: no column '" + column + "' in " + path_);
         }
         // Plain strings only. A dictionary column arrives as DICTIONARY here
         // and decodes to codes plus one small dictionary, which is cheap to
@@ -3786,7 +3787,7 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
             auto readers = parallel_readers(fallback.size(), exec);
             return filtered_string_selection(std::span{readers}, leaf_index, filter, fallback);
         } catch (const std::exception& e) {
-            return std::unexpected("read_parquet: fused string filter scan failed on " + path_ +
+            return std::unexpected("parquet::read: fused string filter scan failed on " + path_ +
                                    " (" + e.what() + ")");
         }
     }
@@ -3799,7 +3800,7 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
         -> std::expected<std::optional<ibex::runtime::Selection>, std::string> override {
         auto it = indices_->find(column);
         if (it == indices_->end()) {
-            return std::unexpected("read_parquet: no column '" + column + "' in " + path_);
+            return std::unexpected("parquet::read: no column '" + column + "' in " + path_);
         }
         const auto& manifest = reader_->manifest();
         if (it->second >= static_cast<int>(manifest.schema_fields.size()) ||
@@ -3821,7 +3822,7 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
             return filtered_dictionary_string_selection(std::span{readers}, leaf_index, keep,
                                                         within, groups);
         } catch (const std::exception& e) {
-            return std::unexpected("read_parquet: dictionary filter scan failed on " + path_ +
+            return std::unexpected("parquet::read: dictionary filter scan failed on " + path_ +
                                    " (" + e.what() + ")");
         }
     }
@@ -3860,7 +3861,7 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
                                           .rows = unit.rows};
             }
         }
-        throw std::runtime_error("read_parquet: decode unit does not match row groups");
+        throw std::runtime_error("parquet::read: decode unit does not match row groups");
     }
 
     /// The scan groups lying inside `unit`. Both fused scans plan over the
@@ -4014,7 +4015,7 @@ inline auto read_parquet_lazy(std::string_view path) -> ibex::runtime::LazyTable
     std::shared_ptr<arrow::Schema> arrow_schema;
     auto st = metadata_reader->GetSchema(&arrow_schema);
     if (!st.ok()) {
-        throw std::runtime_error("read_parquet: failed to read schema: " + path_string + " (" +
+        throw std::runtime_error("parquet::read: failed to read schema: " + path_string + " (" +
                                  st.ToString() + ")");
     }
 
@@ -4042,7 +4043,7 @@ inline auto read_parquet_lazy(std::string_view path) -> ibex::runtime::LazyTable
             return std::make_unique<ParquetLazySourceReader>(
                 std::move(reader), factory_state, indices, arrow_schema, rows, path_string);
         } catch (const std::exception& e) {
-            return std::unexpected("read_parquet: failed to create reader for " + path_string +
+            return std::unexpected("parquet::read: failed to create reader for " + path_string +
                                    " (" + e.what() + ")");
         }
     };
@@ -4052,7 +4053,9 @@ inline auto read_parquet_lazy(std::string_view path) -> ibex::runtime::LazyTable
         read_column_stats(*parquet_metadata, *arrow_schema));
 }
 
-inline auto read_parquet(std::string_view path) -> ibex::runtime::Table {
+namespace ibex::ext::parquet {
+
+inline auto read(std::string_view path) -> ibex::runtime::Table {
     std::string path_string{path};
     auto input = open_parquet_input(path);
 
@@ -4061,7 +4064,7 @@ inline auto read_parquet(std::string_view path) -> ibex::runtime::Table {
     std::shared_ptr<arrow::Schema> schema;
     auto st = reader->GetSchema(&schema);
     if (!st.ok()) {
-        throw std::runtime_error("read_parquet: failed to read schema: " + path_string + " (" +
+        throw std::runtime_error("parquet::read: failed to read schema: " + path_string + " (" +
                                  st.ToString() + ")");
     }
     std::vector<int> fields(static_cast<std::size_t>(schema->num_fields()));
@@ -4072,14 +4075,16 @@ inline auto read_parquet(std::string_view path) -> ibex::runtime::Table {
     try {
         return direct_decode_table(*reader, *schema, fields, nullptr, rows);
     } catch (const std::exception& e) {
-        throw std::runtime_error("read_parquet: failed to load table: " + path_string + " (" +
+        throw std::runtime_error("parquet::read: failed to load table: " + path_string + " (" +
                                  e.what() + ")");
     }
 }
 
-/// Row-group streaming source for `read_parquet`, registered via
+}  // namespace ibex::ext::parquet
+
+/// Row-group streaming source for `parquet::read`, registered via
 /// `ExternRegistry::register_chunked_table` alongside the whole-file
-/// `read_parquet()` above. Each row group is decoded directly into an Ibex
+/// `parquet::read()` above. Each row group is decoded directly into an Ibex
 /// chunk, without an intermediate Arrow RecordBatch or Table. Categorical
 /// chunks are remapped onto shared dictionaries, preserving the streaming
 /// operator contract across row-group dictionary boundaries.
@@ -4144,7 +4149,7 @@ class ChunkedParquetSourceOperator final : public ibex::runtime::Operator {
             }
             return std::optional<ibex::runtime::Chunk>{std::move(chunk)};
         } catch (const std::exception& e) {
-            return std::unexpected("read_parquet: failed to read row group from " + path_ + " (" +
+            return std::unexpected("parquet::read: failed to read row group from " + path_ + " (" +
                                    e.what() + ")");
         }
     }
@@ -4159,7 +4164,7 @@ class ChunkedParquetSourceOperator final : public ibex::runtime::Operator {
         reader_ = make_parquet_reader(std::move(input), path_);
         auto st = reader_->GetSchema(&schema_);
         if (!st.ok()) {
-            throw std::runtime_error("read_parquet: failed to read schema: " + path_ + " (" +
+            throw std::runtime_error("parquet::read: failed to read schema: " + path_ + " (" +
                                      st.ToString() + ")");
         }
 
@@ -4236,7 +4241,7 @@ inline auto build_string_chunks(std::size_t n, GetFn get, IsNullFn is_null_at, c
         std::shared_ptr<arrow::Array> arr;
         auto st = builder.Finish(&arr);
         if (!st.ok())
-            throw std::runtime_error(std::string("write_parquet: finish ") + what + " failed");
+            throw std::runtime_error(std::string("parquet::write: finish ") + what + " failed");
         chunks.push_back(std::move(arr));
         pending = 0;
     };
@@ -4255,7 +4260,7 @@ inline auto build_string_chunks(std::size_t n, GetFn get, IsNullFn is_null_at, c
             pending += sv.size();
         }
         if (!st.ok())
-            throw std::runtime_error(std::string("write_parquet: append ") + what + " failed");
+            throw std::runtime_error(std::string("parquet::write: append ") + what + " failed");
     }
     // Always flush: an all-null or empty column still needs one chunk so the
     // ChunkedArray has a length and the table's columns stay aligned.
@@ -4279,7 +4284,7 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                 arrow::Int64Builder builder;
                 auto st = builder.Reserve(static_cast<int64_t>(n));
                 if (!st.ok())
-                    throw std::runtime_error("write_parquet: reserve failed");
+                    throw std::runtime_error("parquet::write: reserve failed");
                 for (std::size_t i = 0; i < n; ++i) {
                     if (ibex::runtime::is_null(entry, i)) {
                         st = builder.AppendNull();
@@ -4287,18 +4292,18 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                         st = builder.Append(col[i]);
                     }
                     if (!st.ok())
-                        throw std::runtime_error("write_parquet: append int64 failed");
+                        throw std::runtime_error("parquet::write: append int64 failed");
                 }
                 std::shared_ptr<arrow::Array> arr;
                 st = builder.Finish(&arr);
                 if (!st.ok())
-                    throw std::runtime_error("write_parquet: finish int64 failed");
+                    throw std::runtime_error("parquet::write: finish int64 failed");
                 return single_chunk(std::move(arr));
             } else if constexpr (std::is_same_v<ColT, ibex::Column<double>>) {
                 arrow::DoubleBuilder builder;
                 auto st = builder.Reserve(static_cast<int64_t>(n));
                 if (!st.ok())
-                    throw std::runtime_error("write_parquet: reserve failed");
+                    throw std::runtime_error("parquet::write: reserve failed");
                 for (std::size_t i = 0; i < n; ++i) {
                     if (ibex::runtime::is_null(entry, i)) {
                         st = builder.AppendNull();
@@ -4306,12 +4311,12 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                         st = builder.Append(col[i]);
                     }
                     if (!st.ok())
-                        throw std::runtime_error("write_parquet: append double failed");
+                        throw std::runtime_error("parquet::write: append double failed");
                 }
                 std::shared_ptr<arrow::Array> arr;
                 st = builder.Finish(&arr);
                 if (!st.ok())
-                    throw std::runtime_error("write_parquet: finish double failed");
+                    throw std::runtime_error("parquet::write: finish double failed");
                 return single_chunk(std::move(arr));
             } else if constexpr (std::is_same_v<ColT, ibex::Column<std::string>>) {
                 return build_string_chunks(
@@ -4326,7 +4331,7 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                 arrow::Date32Builder builder;
                 auto st = builder.Reserve(static_cast<int64_t>(n));
                 if (!st.ok())
-                    throw std::runtime_error("write_parquet: reserve failed");
+                    throw std::runtime_error("parquet::write: reserve failed");
                 for (std::size_t i = 0; i < n; ++i) {
                     if (ibex::runtime::is_null(entry, i)) {
                         st = builder.AppendNull();
@@ -4334,19 +4339,19 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                         st = builder.Append(col[i].days);
                     }
                     if (!st.ok())
-                        throw std::runtime_error("write_parquet: append date failed");
+                        throw std::runtime_error("parquet::write: append date failed");
                 }
                 std::shared_ptr<arrow::Array> arr;
                 st = builder.Finish(&arr);
                 if (!st.ok())
-                    throw std::runtime_error("write_parquet: finish date failed");
+                    throw std::runtime_error("parquet::write: finish date failed");
                 return single_chunk(std::move(arr));
             } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Timestamp>>) {
                 arrow::TimestampBuilder builder(arrow::timestamp(arrow::TimeUnit::NANO),
                                                 arrow::default_memory_pool());
                 auto st = builder.Reserve(static_cast<int64_t>(n));
                 if (!st.ok())
-                    throw std::runtime_error("write_parquet: reserve failed");
+                    throw std::runtime_error("parquet::write: reserve failed");
                 for (std::size_t i = 0; i < n; ++i) {
                     if (ibex::runtime::is_null(entry, i)) {
                         st = builder.AppendNull();
@@ -4354,18 +4359,18 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                         st = builder.Append(col[i].nanos);
                     }
                     if (!st.ok())
-                        throw std::runtime_error("write_parquet: append timestamp failed");
+                        throw std::runtime_error("parquet::write: append timestamp failed");
                 }
                 std::shared_ptr<arrow::Array> arr;
                 st = builder.Finish(&arr);
                 if (!st.ok())
-                    throw std::runtime_error("write_parquet: finish timestamp failed");
+                    throw std::runtime_error("parquet::write: finish timestamp failed");
                 return single_chunk(std::move(arr));
             } else if constexpr (std::is_same_v<ColT, ibex::Column<bool>>) {
                 arrow::BooleanBuilder builder;
                 auto st = builder.Reserve(static_cast<int64_t>(n));
                 if (!st.ok())
-                    throw std::runtime_error("write_parquet: reserve failed");
+                    throw std::runtime_error("parquet::write: reserve failed");
                 for (std::size_t i = 0; i < n; ++i) {
                     if (ibex::runtime::is_null(entry, i)) {
                         st = builder.AppendNull();
@@ -4373,12 +4378,12 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                         st = builder.Append(col[i]);
                     }
                     if (!st.ok())
-                        throw std::runtime_error("write_parquet: append bool failed");
+                        throw std::runtime_error("parquet::write: append bool failed");
                 }
                 std::shared_ptr<arrow::Array> arr;
                 st = builder.Finish(&arr);
                 if (!st.ok())
-                    throw std::runtime_error("write_parquet: finish bool failed");
+                    throw std::runtime_error("parquet::write: finish bool failed");
                 return single_chunk(std::move(arr));
             } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Decimal>>) {
                 // decimal128 with the column's own precision and scale; the
@@ -4388,7 +4393,7 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                                                  arrow::default_memory_pool());
                 auto st = builder.Reserve(static_cast<int64_t>(n));
                 if (!st.ok())
-                    throw std::runtime_error("write_parquet: reserve failed");
+                    throw std::runtime_error("parquet::write: reserve failed");
                 for (std::size_t i = 0; i < n; ++i) {
                     if (ibex::runtime::is_null(entry, i)) {
                         st = builder.AppendNull();
@@ -4398,15 +4403,16 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                                                               static_cast<uint64_t>(units)));
                     }
                     if (!st.ok())
-                        throw std::runtime_error("write_parquet: append decimal failed");
+                        throw std::runtime_error("parquet::write: append decimal failed");
                 }
                 std::shared_ptr<arrow::Array> arr;
                 st = builder.Finish(&arr);
                 if (!st.ok())
-                    throw std::runtime_error("write_parquet: finish decimal failed");
+                    throw std::runtime_error("parquet::write: finish decimal failed");
                 return single_chunk(std::move(arr));
             } else {
-                static_assert(std::is_same_v<ColT, void>, "unhandled column type in write_parquet");
+                static_assert(std::is_same_v<ColT, void>,
+                              "unhandled column type in parquet::write");
             }
         },
         *entry.column);
@@ -4441,6 +4447,10 @@ inline auto column_to_arrow_field(const ibex::runtime::ColumnEntry& entry)
 
 }  // namespace
 
+// Inside this namespace a bare `parquet` names it, not Arrow's: Arrow's is
+// `::parquet`.
+namespace ibex::ext::parquet {
+
 /// Write `table` to a Parquet file at `path`.
 ///
 /// Column type mappings:
@@ -4454,8 +4464,7 @@ inline auto column_to_arrow_field(const ibex::runtime::ColumnEntry& entry)
 ///   Decimal     → Parquet DECIMAL (Arrow decimal128, precision and scale kept)
 ///
 /// Returns the number of rows written.
-inline auto write_parquet(const ibex::runtime::Table& table, std::string_view path)
-    -> std::int64_t {
+inline auto write(const ibex::runtime::Table& table, std::string_view path) -> std::int64_t {
     const auto& cols = table.columns;
 
     // Build Arrow schema
@@ -4477,7 +4486,7 @@ inline auto write_parquet(const ibex::runtime::Table& table, std::string_view pa
     auto arrow_table = arrow::Table::Make(schema, arrays, static_cast<int64_t>(table.rows()));
 
     // Open output file, creating the parent directory if it does not exist yet
-    // (so `csv_dir_to_parquet` can write into a fresh output directory).
+    // (so `fs::csv_dir_to_parquet` can write into a fresh output directory).
     if (const std::filesystem::path parent = std::filesystem::path(path).parent_path();
         !parent.empty()) {
         std::error_code mkdir_ec;
@@ -4485,18 +4494,20 @@ inline auto write_parquet(const ibex::runtime::Table& table, std::string_view pa
     }
     auto sink_result = arrow::io::FileOutputStream::Open(std::string(path));
     if (!sink_result.ok()) {
-        throw std::runtime_error("write_parquet: cannot open for writing: " + std::string(path) +
+        throw std::runtime_error("parquet::write: cannot open for writing: " + std::string(path) +
                                  " (" + sink_result.status().ToString() + ")");
     }
 
     // Write Parquet file
-    auto st = parquet::arrow::WriteTable(*arrow_table, arrow::default_memory_pool(),
-                                         sink_result.ValueOrDie(),
-                                         /*chunk_size=*/static_cast<int64_t>(64) * 1024 * 1024);
+    auto st = ::parquet::arrow::WriteTable(*arrow_table, arrow::default_memory_pool(),
+                                           sink_result.ValueOrDie(),
+                                           /*chunk_size=*/static_cast<int64_t>(64) * 1024 * 1024);
     if (!st.ok()) {
-        throw std::runtime_error("write_parquet: failed to write: " + std::string(path) + " (" +
+        throw std::runtime_error("parquet::write: failed to write: " + std::string(path) + " (" +
                                  st.ToString() + ")");
     }
 
     return static_cast<std::int64_t>(table.rows());
 }
+
+}  // namespace ibex::ext::parquet

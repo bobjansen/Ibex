@@ -4,8 +4,7 @@
 //   import "udp";
 //
 // After importing, the following functions are available:
-//   udp_recv(port: Int, schema: String) -> DataFrame
-//   udp_recv(port: Int, schema: String, options: String) -> DataFrame
+//   udp::recv(port: Int, schema: String, options: String = "") -> DataFrame
 //     Blocks until at least one JSON datagram arrives on `port`, drains the
 //     ready batch, and returns a multi-row DataFrame whose columns follow the
 //     schema string, e.g. "ts:timestamp,symbol:str,price:f64,volume:i64"
@@ -17,10 +16,13 @@
 //     Options ("key=value;key=value"):
 //       on_malformed=skip|error   datagrams that fail the schema (default skip)
 //
-//   udp_send(df: DataFrame, host: String, port: Int) -> Int
+//   udp::send(df: DataFrame, host: String, port: Int) -> Int
 //     Serialises each row of `df` as a JSON UDP datagram and sends it to
 //     `host:port`.  Returns the number of rows sent.
 
-extern fn udp_recv(port: Int, schema: String) -> DataFrame from "udp";
-extern fn udp_recv(port: Int, schema: String, options: String) -> DataFrame from "udp";
-extern fn udp_send(df: DataFrame, host: String, port: Int) -> Int from "udp";
+namespace udp {
+
+extern fn recv(port: Int, schema: String, options: String = "") -> DataFrame from "udp";
+extern fn send(df: DataFrame, host: String, port: Int) -> Int from "udp";
+
+}

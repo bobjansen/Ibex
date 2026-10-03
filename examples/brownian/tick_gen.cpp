@@ -6,7 +6,7 @@
 // Sends a continuous stream of synthetic tick datagrams to a UDP port.
 // Each symbol follows an independent GBM price process.
 //
-// Wire format (matches udp_recv plugin):
+// Wire format (matches udp::recv plugin):
 //   {"ts":<ns_since_epoch>,"symbol":"AAPL","price":182.35,"volume":600}
 //
 // Usage:

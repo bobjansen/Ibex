@@ -5,45 +5,45 @@
 //
 // After importing, these are available without any explicit declaration:
 //
-//   adbc_read(driver: String, uri: String, sql: String, options: String = "") -> DataFrame
+//   adbc::read(driver: String, uri: String, sql: String, options: String = "") -> DataFrame
 //     Opens a connection, runs one query, closes the connection.
 //
-//   adbc_connect(driver: String, uri: String, options: String = "") -> AdbcConnection
-//   adbc_query(db: AdbcConnection, sql: String, params: DataFrame = Table {}) -> DataFrame
-//   adbc_execute(db: AdbcConnection, sql: String, params: DataFrame = Table {}) -> Int
-//   adbc_write(db: AdbcConnection, df: DataFrame, table: String,
-//              mode: String = "create") -> Int
-//   adbc_tables(db: AdbcConnection) -> DataFrame
-//   adbc_table_schema(db: AdbcConnection, table: String, schema: String = "",
-//                     catalog: String = "") -> DataFrame
-//   adbc_begin(db: AdbcConnection) -> Int
-//   adbc_commit(db: AdbcConnection) -> Int
-//   adbc_rollback(db: AdbcConnection) -> Int
-//   adbc_close(db: AdbcConnection) -> Int
+//   adbc::connect(driver: String, uri: String, options: String = "") -> adbc::Connection
+//   adbc::query(db: adbc::Connection, sql: String, params: DataFrame = Table {}) -> DataFrame
+//   adbc::execute(db: adbc::Connection, sql: String, params: DataFrame = Table {}) -> Int
+//   adbc::write(db: adbc::Connection, df: DataFrame, table: String,
+//               mode: String = "create") -> Int
+//   adbc::tables(db: adbc::Connection) -> DataFrame
+//   adbc::table_schema(db: adbc::Connection, table: String, schema: String = "",
+//                      catalog: String = "") -> DataFrame
+//   adbc::begin(db: adbc::Connection) -> Int
+//   adbc::commit(db: adbc::Connection) -> Int
+//   adbc::rollback(db: adbc::Connection) -> Int
+//   adbc::close(db: adbc::Connection) -> Int
 //     A reusable connection: one login, and session state (temporary tables,
-//     settings) that lasts across queries. adbc_execute runs a statement that
+//     settings) that lasts across queries. adbc::execute runs a statement that
 //     returns no rows (DDL, insert, update, delete) and returns the affected
-//     row count, or -1 when the driver does not report one. adbc_write
+//     row count, or -1 when the driver does not report one. adbc::write
 //     bulk-inserts a DataFrame into `table`; mode is create (the table must
 //     not exist), append (it must), replace (drop and recreate) or
 //     create_append (create if missing, then append). It returns the rows
 //     written. `params` binds values to the statement's placeholders, in the
 //     driver's syntax (`?` for SQLite, `$1` for PostgreSQL), by column
 //     position: the statement is prepared once and runs once per row, a
-//     query's results following one another in row order and adbc_execute's
-//     counts adding up. No rows: nothing runs. adbc_tables lists the tables
+//     query's results following one another in row order and adbc::execute's
+//     counts adding up. No rows: nothing runs. adbc::tables lists the tables
 //     and views the connection sees (catalog, schema, table, type).
-//     adbc_table_schema describes one table's columns before you query it:
+//     adbc::table_schema describes one table's columns before you query it:
 //     column, arrow_type, ibex_type (the type a query would give it; null
 //     when there is none), nullable (false only when the driver reports NOT
 //     NULL), and reason (why not, and the SQL cast that reads it). An empty
 //     schema or catalog means the driver's default. Both report what the
 //     driver reports: the SQLite driver guesses types from the first rows
-//     and never reports NOT NULL; PostgreSQL's never reports NOT NULL. adbc_begin starts a
-//     transaction (an error when one is open); adbc_commit commits it (an
-//     error when none is open; a failed commit rolls back) and adbc_rollback
+//     and never reports NOT NULL; PostgreSQL's never reports NOT NULL.
+//     adbc::begin starts a transaction (an error when one is open); adbc::commit commits it (an
+//     error when none is open; a failed commit rolls back) and adbc::rollback
 //     discards it, returning 1, or 0 when none was open. Both return the
-//     connection to autocommit. adbc_close returns 1 when it closed the
+//     connection to autocommit. adbc::close returns 1 when it closed the
 //     connection and 0 when it was already closed; a query on a closed
 //     connection is an error. A connection also closes when its last binding
 //     goes away. Closing never commits: an open transaction is rolled back.
@@ -53,40 +53,44 @@
 // The optional `options` string is a `;` or newline separated list of
 // `key=value` entries. Prefix keys with `db.`, `conn.`, or `stmt.` to
 // target database, connection, or statement options; `conn.post.` sets a
-// connection option after the connection is initialized. On adbc_connect,
+// connection option after the connection is initialized. On adbc::connect,
 // `stmt.` options apply to every query on the connection. Use
 // `entrypoint=...` to override the driver entrypoint symbol. A backslash
 // escapes `;`, `=` and `\` inside keys and values.
 //
-// Declarations with defaults: extern declarations are keyed by name, so a
-// second overload would replace the first rather than add to it.
+// Declarations with defaults: a qualified name has one declaration (no
+// overloads), so an optional argument is a parameter with a default.
 
-extern fn adbc_read(driver: String, uri: String, sql: String, options: String = "")
+namespace adbc {
+
+extern fn read(driver: String, uri: String, sql: String, options: String = "")
     -> DataFrame from "adbc.hpp";
 
-extern type AdbcConnection from "adbc.hpp";
+extern type Connection from "adbc.hpp";
 
-extern fn adbc_connect(driver: String, uri: String, options: String = "")
-    -> AdbcConnection from "adbc.hpp";
+extern fn connect(driver: String, uri: String, options: String = "")
+    -> Connection from "adbc.hpp";
 
-extern fn adbc_query(mutable db: AdbcConnection, sql: String, params: DataFrame = Table {})
+extern fn query(mutable db: Connection, sql: String, params: DataFrame = Table {})
     -> DataFrame from "adbc.hpp";
 
-extern fn adbc_execute(mutable db: AdbcConnection, sql: String, params: DataFrame = Table {})
+extern fn execute(mutable db: Connection, sql: String, params: DataFrame = Table {})
     -> Int from "adbc.hpp";
 
-extern fn adbc_write(mutable db: AdbcConnection, df: DataFrame, table: String,
-                     mode: String = "create") -> Int from "adbc.hpp";
+extern fn write(mutable db: Connection, df: DataFrame, table: String, mode: String = "create")
+    -> Int from "adbc.hpp";
 
-extern fn adbc_tables(mutable db: AdbcConnection) -> DataFrame from "adbc.hpp";
+extern fn tables(mutable db: Connection) -> DataFrame from "adbc.hpp";
 
-extern fn adbc_table_schema(mutable db: AdbcConnection, table: String, schema: String = "",
-                            catalog: String = "") -> DataFrame from "adbc.hpp";
+extern fn table_schema(mutable db: Connection, table: String, schema: String = "",
+                       catalog: String = "") -> DataFrame from "adbc.hpp";
 
-extern fn adbc_begin(mutable db: AdbcConnection) -> Int from "adbc.hpp";
+extern fn begin(mutable db: Connection) -> Int from "adbc.hpp";
 
-extern fn adbc_commit(mutable db: AdbcConnection) -> Int from "adbc.hpp";
+extern fn commit(mutable db: Connection) -> Int from "adbc.hpp";
 
-extern fn adbc_rollback(mutable db: AdbcConnection) -> Int from "adbc.hpp";
+extern fn rollback(mutable db: Connection) -> Int from "adbc.hpp";
 
-extern fn adbc_close(mutable db: AdbcConnection) -> Int from "adbc.hpp";
+extern fn close(mutable db: Connection) -> Int from "adbc.hpp";
+
+}

@@ -12,8 +12,21 @@
 
 #include "csv.hpp"
 
+#include <ibex/core/decimal.hpp>
 #include <ibex/runtime/extern_registry.hpp>
+#include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
+
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <expected>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <variant>
+#include <vector>
 
 namespace csv_detail = ibex::csv::detail;
 

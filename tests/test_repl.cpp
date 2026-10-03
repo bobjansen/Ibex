@@ -2,17 +2,20 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/repl/repl.hpp>
 #include <ibex/runtime/env.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/lazy_table.hpp>
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <csv.hpp>
 #include <exception>
 #include <expected>
@@ -46,12 +49,12 @@ TEST_CASE("REPL normalizes implicit semicolons") {
 }
 
 TEST_CASE("REPL loads script with inferred lets") {
-    std::filesystem::path script_path =
+    const std::filesystem::path script_path =
         std::filesystem::path(IBEX_SOURCE_DIR) / "tests" / "data" / "repl_infer.ibex";
     std::ifstream input(script_path);
     REQUIRE(input.good());
     std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    std::string token = "${IBEX_SOURCE_DIR}";
+    const std::string token = "${IBEX_SOURCE_DIR}";
     std::size_t pos = 0;
     while ((pos = source.find(token, pos)) != std::string::npos) {
         source.replace(pos, token.size(), IBEX_SOURCE_DIR);
@@ -526,7 +529,7 @@ TEST_CASE("REPL executes :load via execute_script with file path") {
     // Read and execute manually (same as :load internals)
     std::ifstream in(script_path);
     REQUIRE(in.good());
-    std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     REQUIRE(ibex::repl::execute_script(src, registry));
 }
 
@@ -1974,7 +1977,7 @@ auto capture_planner_line(std::string_view source, ibex::runtime::ExternRegistry
     const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     std::filesystem::remove(path);
     for (const auto& line : std::views::split(text, '\n')) {
-        std::string_view view{line.begin(), line.end()};
+        const std::string_view view{line.begin(), line.end()};
         if (view.starts_with("planner:")) {
             return std::string{view};
         }
@@ -2819,7 +2822,7 @@ auto namespace_session(ibex::runtime::ExternRegistry& registry) -> ibex::repl::R
     config.plugin_search_paths = {dir.string()};
     config.persistent_history = false;
     register_geo(registry);
-    return ibex::repl::ReplSession(config, registry);
+    return {config, registry};
 }
 
 auto scalar_int(const ibex::repl::ExecutionResult& result) -> std::int64_t {
@@ -2836,9 +2839,9 @@ TEST_CASE("Namespaces: import brings in qualified names only", "[repl][namespace
 
     CHECK(scalar_int(session.execute("geo::dist(7);")) == 7);
     CHECK(scalar_int(session.execute("geo::scale(2);")) == 20);
-    const auto far = session.execute("geo::far(geo::points());");
-    REQUIRE(far.ok);
-    CHECK(far.table->rows() == 2);
+    const auto filtered = session.execute("geo::far(geo::points());");
+    REQUIRE(filtered.ok);
+    CHECK(filtered.table->rows() == 2);
 
     // Without `using`, the bare name is not visible.
     const auto bare = session.execute("dist(7);");

@@ -17,6 +17,7 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
@@ -30,6 +31,7 @@
 #include <memory>
 #include <optional>
 #include <random>
+#include <stdlib.h>  // NOLINT(modernize-deprecated-headers): POSIX setenv
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -363,7 +365,7 @@ auto typed_table() -> ibex::runtime::Table {
 }  // namespace
 
 TEST_CASE("adbc::read accepts the documented three-argument form", "[adbc]") {
-    SqliteDb db;
+    const SqliteDb db;
     AdbcSession s;
     seed_trades(s, db);
 
@@ -378,7 +380,7 @@ TEST_CASE("adbc::read accepts the documented three-argument form", "[adbc]") {
 }
 
 TEST_CASE("adbc::read reads every batch and feeds an Ibex aggregation", "[adbc]") {
-    SqliteDb db;
+    const SqliteDb db;
     AdbcSession s;
     seed_trades(s, db);
     const std::string_view two_rows = "stmt.adbc.sqlite.query.batch_rows=2";
@@ -425,7 +427,7 @@ TEST_CASE("adbc::read reads every batch and feeds an Ibex aggregation", "[adbc]"
 }
 
 TEST_CASE("adbc::read carries SQL NULLs as validity", "[adbc]") {
-    SqliteDb db;
+    const SqliteDb db;
     AdbcSession s;
     seed_trades(s, db);
 
@@ -449,7 +451,7 @@ TEST_CASE("adbc::read carries SQL NULLs as validity", "[adbc]") {
 }
 
 TEST_CASE("adbc::read keeps the schema of an empty result", "[adbc]") {
-    SqliteDb db;
+    const SqliteDb db;
     AdbcSession s;
     seed_trades(s, db);
     const std::string_view empty_sql = "select id, symbol from trades where id < 0";
@@ -478,7 +480,7 @@ TEST_CASE("adbc::read keeps the schema of an empty result", "[adbc]") {
 }
 
 TEST_CASE("adbc::read materialized and chunked paths agree", "[adbc]") {
-    SqliteDb db;
+    const SqliteDb db;
     AdbcSession s;
     seed_trades(s, db);
 
@@ -493,7 +495,7 @@ TEST_CASE("adbc::read materialized and chunked paths agree", "[adbc]") {
 }
 
 TEST_CASE("adbc::read applies connection options before and after init", "[adbc]") {
-    SqliteDb db;
+    const SqliteDb db;
     AdbcSession s;
     seed_trades(s, db);
 
@@ -513,7 +515,7 @@ TEST_CASE("adbc::read applies connection options before and after init", "[adbc]
 }
 
 TEST_CASE("adbc::read reports errors instead of failing silently", "[adbc]") {
-    SqliteDb db;
+    const SqliteDb db;
     AdbcSession s;
     seed_trades(s, db);
 
@@ -618,7 +620,7 @@ class ManifestDir {
 }  // namespace
 
 TEST_CASE("adbc::read resolves a bare driver name through a manifest", "[adbc]") {
-    SqliteDb db;
+    const SqliteDb db;
     AdbcSession s;
     seed_trades(s, db);
     const ManifestDir manifests;
@@ -652,7 +654,7 @@ TEST_CASE("adbc::read resolves a bare driver name through a manifest", "[adbc]")
 
 TEST_CASE("adbc::connect keeps one connection across queries", "[adbc][connection]") {
     AdbcSession s;
-    SqliteDb db;
+    const SqliteDb db;
     seed_trades(s, db);
     const auto connect = s.session.execute("let db = adbc::connect(" + ibex_str(sqlite_driver()) +
                                            ", " + ibex_str(db.path()) + ");");
@@ -686,7 +688,7 @@ TEST_CASE("adbc::connect keeps one connection across queries", "[adbc][connectio
 
 TEST_CASE("adbc::close closes every alias once", "[adbc][connection]") {
     AdbcSession s;
-    SqliteDb db;
+    const SqliteDb db;
     seed_trades(s, db);
     REQUIRE(s.session
                 .execute("let db = adbc::connect(" + ibex_str(sqlite_driver()) + ", " +
@@ -708,7 +710,7 @@ TEST_CASE("adbc::close closes every alias once", "[adbc][connection]") {
 
 TEST_CASE("adbc::connect reports failures and misuse", "[adbc][connection]") {
     AdbcSession s;
-    SqliteDb db;
+    const SqliteDb db;
 
     const auto missing =
         s.session.execute("let db = adbc::connect(\"ibex_no_such_driver\", \"\");");
@@ -728,7 +730,7 @@ TEST_CASE("adbc::connect reports failures and misuse", "[adbc][connection]") {
 
 TEST_CASE("Functions take, open and return ADBC connections", "[adbc][connection]") {
     AdbcSession s;
-    SqliteDb db;
+    const SqliteDb db;
     seed_trades(s, db);
     const auto declared = s.session.execute(
         "fn big_ids(mutable c: adbc::Connection) -> DataFrame {\n"
@@ -771,7 +773,7 @@ TEST_CASE("Functions take, open and return ADBC connections", "[adbc][connection
 
 TEST_CASE("adbc::execute runs statements that return no rows", "[adbc][write]") {
     AdbcSession s;
-    SqliteDb db;
+    const SqliteDb db;
     const auto exec = [&](const std::string& source) {
         auto result = s.session.execute(source);
         INFO(source);
@@ -809,8 +811,8 @@ TEST_CASE("adbc::execute runs statements that return no rows", "[adbc][write]") 
 }
 
 TEST_CASE("adbc::write stores every Ibex column type in SQLite", "[adbc][write]") {
-    AdbcSession s;
-    SqliteDb db;
+    const AdbcSession s;
+    const SqliteDb db;
     const auto conn = s.connect(sqlite_driver(), db.path());
 
     const auto written = s.write(conn, typed_table(), "typed", "create");
@@ -852,7 +854,7 @@ TEST_CASE("adbc::write stores every Ibex column type in SQLite", "[adbc][write]"
 
 TEST_CASE("adbc::write modes create, append, replace and create_append", "[adbc][write]") {
     AdbcSession s;
-    SqliteDb db;
+    const SqliteDb db;
     const auto conn = s.connect(sqlite_driver(), db.path());
     const auto ids = [](std::initializer_list<std::int64_t> values) {
         ibex::runtime::Table table;
@@ -901,7 +903,7 @@ TEST_CASE("adbc::write modes create, append, replace and create_append", "[adbc]
 
 TEST_CASE("A failed adbc::write writes nothing and keeps the connection", "[adbc][write]") {
     AdbcSession s;
-    SqliteDb db;
+    const SqliteDb db;
     s.exec(db, {"create table t (id integer primary key)"});
     const auto conn = s.connect(sqlite_driver(), db.path());
     ibex::runtime::Table duplicate;
@@ -920,7 +922,7 @@ TEST_CASE("A failed adbc::write writes nothing and keeps the connection", "[adbc
 
 TEST_CASE("adbc::write takes any table expression, also inside functions", "[adbc][write]") {
     AdbcSession s;
-    SqliteDb db;
+    const SqliteDb db;
     seed_trades(s, db);
     const auto exec = [&](const std::string& source) {
         auto result = s.session.execute(source);
@@ -974,7 +976,7 @@ TEST_CASE("adbc::write takes any table expression, also inside functions", "[adb
 
 TEST_CASE("adbc::query and adbc::execute bind a parameter table", "[adbc][params]") {
     AdbcSession s;
-    SqliteDb db;
+    const SqliteDb db;
     const auto exec = [&](const std::string& source) {
         auto result = s.session.execute(source);
         INFO(source);
@@ -1036,7 +1038,7 @@ TEST_CASE("adbc::query and adbc::execute bind a parameter table", "[adbc][params
 
 TEST_CASE("adbc::begin, adbc::commit and adbc::rollback", "[adbc][transaction]") {
     AdbcSession s;
-    SqliteDb db;
+    const SqliteDb db;
     const auto exec = [&](const std::string& source) {
         auto result = s.session.execute(source);
         INFO(source);
@@ -1175,7 +1177,7 @@ TEST_CASE("adbc::begin, adbc::commit and adbc::rollback", "[adbc][transaction]")
 
 TEST_CASE("adbc::tables and adbc::table_schema describe a SQLite database", "[adbc][discovery]") {
     AdbcSession s;
-    SqliteDb db;
+    const SqliteDb db;
     const auto exec = [&](const std::string& source) {
         auto result = s.session.execute(source);
         INFO(source);
@@ -1947,8 +1949,11 @@ TEST_CASE("Every driver behaves alike", "[adbc][conformance]") {
     };
     const auto question = [](int) { return std::string("?"); };
     const auto dollar = [](int i) { return "$" + std::to_string(i); };
-    SqliteDb sqlite;
-    std::vector<Driver> drivers{{"SQLite", sqlite_driver(), sqlite.path(), question}};
+    const SqliteDb sqlite;
+    std::vector<Driver> drivers{{.name = "SQLite",
+                                 .driver = sqlite_driver(),
+                                 .uri = sqlite.path(),
+                                 .placeholder = question}};
     if (auto uri = get_env("IBEX_TEST_POSTGRES_URI"); uri.has_value() && !uri->empty()) {
         drivers.push_back({"PostgreSQL",
                            get_env("IBEX_TEST_POSTGRES_DRIVER").value_or("postgresql"), *uri,

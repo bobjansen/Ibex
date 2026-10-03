@@ -11,7 +11,9 @@
 #include <ibex/runtime/extern_registry.hpp>
 
 #include <exception>
+#include <expected>
 #include <string>
+#include <variant>
 
 extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* registry) {
     registry->register_table(

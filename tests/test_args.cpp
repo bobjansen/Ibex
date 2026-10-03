@@ -11,8 +11,10 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <args.hpp>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <expected>
 #include <stdexcept>
 #include <string>
 #include <variant>
@@ -40,9 +42,12 @@ auto rows_of(const ibex::runtime::Table& table) -> std::vector<Row> {
     REQUIRE(index != nullptr);
     REQUIRE(value != nullptr);
     std::vector<Row> out;
+    out.reserve(kind->size());
     for (std::size_t i = 0; i < kind->size(); ++i) {
-        out.push_back(Row{std::string((*kind)[i]), std::string((*name)[i]), (*index)[i],
-                          std::string((*value)[i])});
+        out.push_back(Row{.kind = std::string((*kind)[i]),
+                          .name = std::string((*name)[i]),
+                          .index = (*index)[i],
+                          .value = std::string((*value)[i])});
     }
     return out;
 }

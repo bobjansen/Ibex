@@ -271,7 +271,7 @@ TEST_CASE("Write JSON - bool column round-trip") {
 TEST_CASE("Write JSON - null values round-trip") {
     ibex::runtime::Table table;
     ibex::Column<std::int64_t> col({10, 0, 30});
-    std::vector<bool> validity = {true, false, true};
+    const std::vector<bool> validity = {true, false, true};
     table.add_column("val", std::move(col), std::move(validity));
 
     auto out_path = tmp("ibex_test_json_write_null.json");
@@ -298,7 +298,8 @@ TEST_CASE("Write JSON - empty table writes empty array") {
 
     // File should contain an empty JSON array.
     std::ifstream f(out_path);
-    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const std::string content((std::istreambuf_iterator<char>(f)),
+                              std::istreambuf_iterator<char>());
     REQUIRE(content.find("[]") != std::string::npos);
 }
 

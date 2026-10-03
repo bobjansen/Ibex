@@ -12,15 +12,18 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/table_format.hpp>
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <csv.hpp>
 #include <expected>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <string_view>

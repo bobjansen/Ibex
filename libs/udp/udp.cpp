@@ -12,6 +12,12 @@
 #include "udp.hpp"
 
 #include <ibex/runtime/extern_registry.hpp>
+#include <ibex/runtime/interpreter.hpp>
+
+#include <cstdint>
+#include <exception>
+#include <expected>
+#include <variant>
 
 extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* registry) {
     // udp::recv(port: Int, schema: String[, options: String]) -> DataFrame

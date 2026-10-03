@@ -12,17 +12,20 @@
 #include <ibex/runtime/interpreter.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <initializer_list>
 #include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -125,6 +128,8 @@ TEST_CASE("adbc.hpp: a transaction rolls back what it wrote", "[adbc_client]") {
 TEST_CASE("adbc.hpp: copies of a connection alias one connection", "[adbc_client]") {
     const TempDatabase database;
     const auto db = ibex::ext::adbc::connect(kSqliteDriver, database.uri(), "");
+    // A copy on purpose: the test is that a copy shares the connection.
+    // NOLINTNEXTLINE(performance-unnecessary-copy-initialization)
     const ibex::ext::adbc::Connection alias = db;
     (void)ibex::ext::adbc::execute(db, "create table t (x integer)", kNoParams);
 

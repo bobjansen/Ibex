@@ -4,7 +4,7 @@
 // Ibex plugin entry point for fs.hpp.
 //
 //   import "fs";
-//   let files = list_files("data/csv", "*.csv");
+//   let files = fs::list("data/csv", "*.csv");
 
 #include "fs.hpp"
 
@@ -16,22 +16,22 @@
 
 extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* registry) {
     registry->register_table(
-        "list_files",
+        "fs::list",
         [](const ibex::runtime::ExternArgs& args)
             -> std::expected<ibex::runtime::ExternValue, std::string> {
             if (args.empty() || args.size() > 3) {
                 return std::unexpected(
-                    "list_files(dir[, pattern[, recursive]]) expects 1 to 3 arguments");
+                    "fs::list(dir[, pattern[, recursive]]) expects 1 to 3 arguments");
             }
             const auto* dir = std::get_if<std::string>(args.data());
             if (dir == nullptr) {
-                return std::unexpected("list_files: dir must be a string");
+                return std::unexpected("fs::list: dir must be a string");
             }
             std::string pattern = "*";
             if (args.size() >= 2) {
                 const auto* p = std::get_if<std::string>(&args[1]);
                 if (p == nullptr) {
-                    return std::unexpected("list_files: pattern must be a string");
+                    return std::unexpected("fs::list: pattern must be a string");
                 }
                 pattern = *p;
             }
@@ -42,7 +42,7 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
                 } else if (const auto* i = std::get_if<std::int64_t>(&args[2])) {
                     recursive = *i != 0;
                 } else {
-                    return std::unexpected("list_files: recursive must be a bool");
+                    return std::unexpected("fs::list: recursive must be a bool");
                 }
             }
             try {

@@ -2761,3 +2761,211 @@ TEST_CASE("REPL a null element still has to agree with the column's type",
     // Nulls do not excuse mixed element types.
     CHECK_FALSE(ibex::repl::execute_script("Table { v = [1, null, \"a\"] };", registry, config));
 }
+
+// --- Namespaces ---------------------------------------------------------------
+
+namespace {
+
+/// Library stubs for the namespace tests, in a per-process directory.
+auto namespace_stub_dir() -> std::filesystem::path {
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("ibex_namespaces_" + std::to_string(current_process_id()));
+    std::filesystem::create_directories(dir);
+    const auto write = [&](const char* name, const char* text) {
+        std::ofstream stub{dir / name};
+        stub << text;
+    };
+    write("geo.ibex",
+          "namespace geo {\n"
+          "    extern fn points() -> DataFrame from \"geo.hpp\";\n"
+          "    extern fn dist(x: Int) -> Int from \"geo.hpp\";\n"
+          "    fn scale(x: Int) -> Int { x * 10; }\n"
+          "    fn far(df: DataFrame) -> DataFrame { df[filter x > 1]; }\n"
+          "}\n");
+    // A second file contributing to the same namespace; `dist` and `scale`
+    // are siblings declared in geo.ibex.
+    write("geo_extra.ibex", "namespace geo { fn twice(x: Int) -> Int { scale(x) + dist(x); } }\n");
+    write("geo_clash.ibex",
+          "namespace geo { extern fn dist(x: String) -> Int from \"geo.hpp\"; }\n");
+    write("metric.ibex", "namespace metric { extern fn dist(x: Int) -> Int from \"geo.hpp\"; }\n");
+    return dir;
+}
+
+void register_geo(ibex::runtime::ExternRegistry& registry) {
+    registry.register_table("geo::points",
+                            [](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                ibex::runtime::Table table;
+                                table.add_column("x", ibex::Column<std::int64_t>{1, 2, 3});
+                                table.add_column("geo", ibex::Column<std::int64_t>{4, 5, 6});
+                                return ibex::runtime::ExternValue{std::move(table)};
+                            });
+    registry.register_scalar(
+        "geo::dist", ibex::runtime::ScalarKind::Int,
+        [](const ibex::runtime::ExternArgs& args)
+            -> std::expected<ibex::runtime::ExternValue, std::string> { return args.at(0); });
+    registry.register_scalar("metric::dist", ibex::runtime::ScalarKind::Int,
+                             [](const ibex::runtime::ExternArgs& args)
+                                 -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                 return ibex::runtime::ExternValue{ibex::runtime::ScalarValue{
+                                     std::get<std::int64_t>(args.at(0)) * 100}};
+                             });
+}
+
+auto namespace_session(ibex::runtime::ExternRegistry& registry) -> ibex::repl::ReplSession {
+    ibex::repl::ReplConfig config;
+    const auto dir = namespace_stub_dir();
+    config.import_search_paths = {dir.string()};
+    config.plugin_search_paths = {dir.string()};
+    config.persistent_history = false;
+    register_geo(registry);
+    return ibex::repl::ReplSession(config, registry);
+}
+
+auto scalar_int(const ibex::repl::ExecutionResult& result) -> std::int64_t {
+    REQUIRE(result.scalar.has_value());
+    return std::get<std::int64_t>(*result.scalar);
+}
+
+}  // namespace
+
+TEST_CASE("Namespaces: import brings in qualified names only", "[repl][namespaces]") {
+    ibex::runtime::ExternRegistry registry;
+    auto session = namespace_session(registry);
+    REQUIRE(session.execute("import \"geo\";").ok);
+
+    CHECK(scalar_int(session.execute("geo::dist(7);")) == 7);
+    CHECK(scalar_int(session.execute("geo::scale(2);")) == 20);
+    const auto far = session.execute("geo::far(geo::points());");
+    REQUIRE(far.ok);
+    CHECK(far.table->rows() == 2);
+
+    // Without `using`, the bare name is not visible.
+    const auto bare = session.execute("dist(7);");
+    CHECK_FALSE(bare.ok);
+
+    const auto typo = session.execute("geo::dits(7);");
+    CHECK_FALSE(typo.ok);
+    CHECK(typo.error.contains("did you mean 'geo::dist'"));
+}
+
+TEST_CASE("Namespaces: using a namespace or one name", "[repl][namespaces]") {
+    ibex::runtime::ExternRegistry registry;
+    {
+        auto session = namespace_session(registry);
+        REQUIRE(session.execute("import \"geo\";\nusing geo;").ok);
+        // A `using` typed at the prompt holds for the rest of the session.
+        CHECK(scalar_int(session.execute("dist(7);")) == 7);
+        CHECK(scalar_int(session.execute("scale(3);")) == 30);
+    }
+    {
+        auto session = namespace_session(registry);
+        REQUIRE(session.execute("import \"geo\";\nusing geo::scale;").ok);
+        CHECK(scalar_int(session.execute("scale(3);")) == 30);
+        CHECK_FALSE(session.execute("dist(7);").ok);
+    }
+    {
+        auto session = namespace_session(registry);
+        const auto missing = session.execute("using geo;");
+        CHECK_FALSE(missing.ok);
+        CHECK(missing.error.contains("is it imported?"));
+    }
+}
+
+TEST_CASE("Namespaces: two usings that disagree fail where the name is used",
+          "[repl][namespaces]") {
+    ibex::runtime::ExternRegistry registry;
+    auto session = namespace_session(registry);
+    REQUIRE(session.execute("import \"geo\";\nimport \"metric\";\nusing geo;\nusing metric;").ok);
+    CHECK(scalar_int(session.execute("scale(1);")) == 10);
+    const auto ambiguous = session.execute("dist(1);");
+    CHECK_FALSE(ambiguous.ok);
+    CHECK(ambiguous.error.contains("'dist' is ambiguous"));
+    CHECK(scalar_int(session.execute("metric::dist(1);")) == 100);
+}
+
+TEST_CASE("Namespaces: a column or let named like the namespace does not shadow it",
+          "[repl][namespaces]") {
+    ibex::runtime::ExternRegistry registry;
+    auto session = namespace_session(registry);
+    REQUIRE(session.execute("import \"geo\";\nlet geo = 2;").ok);
+    // `geo` is a column of the table and a scalar binding; `geo::scale` is the
+    // function, and its argument `geo` the column.
+    const auto result =
+        session.execute("geo::points()[select { y = geo::scale(geo), z = x + ^geo }];");
+    REQUIRE(result.ok);
+    const auto* y = std::get_if<ibex::Column<std::int64_t>>(result.table->find("y"));
+    REQUIRE(y != nullptr);
+    CHECK((*y)[0] == 40);
+    CHECK((*y)[2] == 60);
+    const auto* z = std::get_if<ibex::Column<std::int64_t>>(result.table->find("z"));
+    REQUIRE(z != nullptr);
+    CHECK((*z)[0] == 3);
+}
+
+TEST_CASE("Namespaces: files merge into one namespace; a clash is an error", "[repl][namespaces]") {
+    ibex::runtime::ExternRegistry registry;
+    auto session = namespace_session(registry);
+    REQUIRE(session.execute("import \"geo\";\nimport \"geo_extra\";").ok);
+    // `twice` reaches its siblings in another file without a prefix.
+    CHECK(scalar_int(session.execute("geo::twice(2);")) == 22);
+    // Importing the same library again redeclares nothing new.
+    REQUIRE(session.execute("import \"geo\";").ok);
+
+    const auto clash = session.execute("import \"geo_clash\";");
+    CHECK_FALSE(clash.ok);
+    CHECK(clash.error.contains("'geo::dist' is already declared with a different signature"));
+}
+
+TEST_CASE("Namespaces: a script declares and uses its own namespace", "[repl][namespaces]") {
+    ibex::runtime::ExternRegistry registry;
+    auto session = namespace_session(registry);
+    const auto result = session.execute(
+        "namespace util {\n"
+        "    fn inc(x: Int) -> Int { x + 1; }\n"
+        "    fn inc2(x: Int) -> Int { inc(inc(x)); }\n"
+        "}\n"
+        "fn inc_global(x: Int) -> Int { x + 100; }\n"
+        "using util::inc2;\n"
+        "inc2(1) + util::inc(0) + ::inc_global(0);\n");
+    INFO(result.error);
+    REQUIRE(result.ok);
+    CHECK(scalar_int(result) == 104);
+}
+
+TEST_CASE("Namespaces: a script with imports and namespaces plans as one block",
+          "[repl][namespaces][planner]") {
+    ibex::runtime::ExternRegistry registry;
+    registry.register_lazy_table(
+        "lz::read",
+        [](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::LazyTablePtr, std::string> {
+            ibex::runtime::Table schema;
+            schema.add_column("a", ibex::Column<std::int64_t>{});
+            return std::make_shared<ibex::runtime::LazyTable>(
+                std::move(schema), 3,
+                [](const std::vector<std::string>& names, const ibex::runtime::Selection*)
+                    -> std::expected<ibex::runtime::Table, std::string> {
+                    ibex::runtime::Table table;
+                    for (const auto& name : names) {
+                        table.add_column(name, ibex::Column<std::int64_t>{1, 2, 3});
+                    }
+                    return table;
+                });
+        });
+    ibex::repl::ReplConfig config;
+    const auto dir = namespace_stub_dir();
+    {
+        std::ofstream stub{dir / "lz.ibex"};
+        stub << "namespace lz {\n"
+             << "    extern fn read() -> DataFrame from \"fake.hpp\";\n"
+             << "    fn big(df: DataFrame) -> DataFrame { df[filter a > 1]; }\n"
+             << "}\n";
+    }
+    config.import_search_paths = {dir.string()};
+    config.plugin_search_paths = {dir.string()};
+    CHECK(capture_planner_line("import \"lz\";\nlz::big(lz::read())[select { n = count() }];\n",
+                               registry, config) == "planner: whole-script");
+    CHECK(capture_planner_line("import \"lz\";\nusing lz;\nbig(read())[select { n = count() }];\n",
+                               registry, config) == "planner: whole-script");
+}

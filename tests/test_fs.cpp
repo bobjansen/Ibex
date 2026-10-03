@@ -120,13 +120,13 @@ namespace {
 auto make_registry() -> ibex::runtime::ExternRegistry {
     ibex::runtime::ExternRegistry registry;
     registry.register_table(
-        "list_files",
+        "fs::list",
         [](const ibex::runtime::ExternArgs& args)
             -> std::expected<ibex::runtime::ExternValue, std::string> {
             const auto* dir = args.empty() ? nullptr : std::get_if<std::string>(&args[0]);
             const auto* pat = args.size() >= 2 ? std::get_if<std::string>(&args[1]) : nullptr;
             if (dir == nullptr) {
-                return std::unexpected("list_files: dir must be a string");
+                return std::unexpected("fs::list: dir must be a string");
             }
             try {
                 return ibex::runtime::ExternValue{
@@ -226,13 +226,13 @@ TEST_CASE("map clause: effectful externs run per row (csv round-trip)", "[fs][ma
     ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
     REQUIRE(session
                 .execute(R"(
-extern fn list_files(dir: String, pattern: String = "*") -> DataFrame from "fs.hpp";
+namespace fs { extern fn list(dir: String, pattern: String = "*") -> DataFrame from "fs.hpp"; }
 extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 )")
                 .ok);
 
-    const std::string script = "list_files(\"" + src.string() + "\", \"*.csv\")[map { " +
+    const std::string script = "fs::list(\"" + src.string() + "\", \"*.csv\")[map { " +
                                "source = path, " + "target = `" + dst.string() +
                                "/${stem}.out.csv`, " + "rows = write_csv(read_csv(path), `" +
                                dst.string() + "/${stem}.out.csv`) }];";

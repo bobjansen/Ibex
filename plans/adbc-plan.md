@@ -263,7 +263,9 @@ like a failed statement.
   result unread (ingest and query), so the BEGIN after it is skipped and the
   transaction's first statement autocommits; DuckDB's ingest drops a failed
   appender flush (e.g. duplicate key) and reports success with nothing
-  written.
+  written. Upstream (2026-10-03): PostgreSQL is apache/arrow-adbc#4695,
+  fixed in ADBC 25 (bump the pin, then drop the quirk); DuckDB is
+  duckdb/duckdb#26425.
 - **Next drivers (decided 2026-09-29): MySQL/MariaDB and DuckDB first.**
   Both are open source (MySQL: ADBC Driver Foundry, Apache-2.0, source in
   `adbc-drivers/mysql`; DuckDB: MIT, the driver is libduckdb itself, with a

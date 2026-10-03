@@ -3654,6 +3654,7 @@ bundled I/O backends are:
 | `parquet` | `read_parquet(path)` | `write_parquet(df, path)` | Apache Parquet; local files, HTTPS URLs, and `s3://` object reads |
 | `args` | `parse_args(spec[, argv])` | — | Command-line argument parsing (see below) |
 | `fs` | `list_files(dir[, pattern[, recursive]])` | — | Directory listing as a DataFrame (see below) |
+| `adbc` | `adbc_read(driver, uri, sql[, options])`, `adbc_query(db, sql[, params])` | `adbc_write(db, df, table[, mode])` | Databases through ADBC drivers (see 12.1.1) |
 
 **`parse_args`** turns a spec string and an argument vector into a table with a
 **fixed schema** — one row per argument:
@@ -3798,6 +3799,71 @@ write_json(df, "output.json");
 The transpiler emits the `from` path as a `#include` in the generated C++.
 The REPL loads `<stem>.so` from the plugin search path at the point the
 `extern fn` declaration is evaluated (Section 10.4).
+
+### 12.1.1 ADBC
+
+The `adbc` plugin reads and writes databases through ADBC drivers
+(SQLite, PostgreSQL, DuckDB, MySQL/MariaDB, and any driver with a manifest).
+`driver` is a bare name resolved through ADBC driver manifests, or a path to
+the driver library; `uri` is the driver's database URI or path.
+
+| Function | Result | Meaning |
+|----------|--------|---------|
+| `adbc_read(driver, uri, sql, options = "")` | DataFrame | One-off read: opens a connection, runs `sql`, closes. Streams in Arrow batches. |
+| `adbc_connect(driver, uri, options = "")` | `AdbcConnection` | Opens a connection that later calls share (resource type, 11.5). |
+| `adbc_query(db, sql, params = Table {})` | DataFrame | Runs a query on `db`. |
+| `adbc_execute(db, sql, params = Table {})` | Int | Runs a statement that returns no rows; the affected-row count, or `-1` when the driver reports none. |
+| `adbc_write(db, df, table, mode = "create")` | Int | Bulk-inserts `df` through the driver's ingestion path; the rows written. `mode` is `create`, `append`, `replace` or `create_append`. A failed write writes no rows. |
+| `adbc_tables(db)` | DataFrame | `catalog`, `schema`, `table`, `type` of every table and view `db` sees. |
+| `adbc_table_schema(db, table, schema = "", catalog = "")` | DataFrame | `column`, `arrow_type`, `ibex_type`, `nullable`, `reason`: what a query would give each column, or why it has none. `nullable` is `false` only when the driver reports NOT NULL. |
+| `adbc_begin(db)`, `adbc_commit(db)`, `adbc_rollback(db)` | Int | Group the calls between them into one transaction. A failure inside dooms it: `adbc_commit` then rolls back and reports an error. Closing a connection never commits. No nesting. |
+| `adbc_close(db)` | Int | Closes `db` for every binding: `1` the first time, `0` after. |
+
+All functions except `adbc_read` take a connection and follow the resource
+rules of 11.5. Connection functions run one statement at a time, in order,
+and a connection is single-statement at any moment.
+
+**Options.** `options` is a string of `key=value` entries separated by `;`
+or newlines. A key prefixed `db.`, `conn.` or `stmt.` sets a database,
+connection or statement option; `conn.post.` sets a connection option after
+the connection is open. The rest of the key reaches the driver unchanged
+(`conn.adbc.connection.autocommit`, not `conn.autocommit`). A backslash escapes
+`;`, `=` and `\` in keys and values. `entrypoint=` overrides the driver's
+initialization symbol. `conn.adbc.connection.autocommit` is refused unless
+`true`: use `adbc_begin`.
+
+**Parameters.** `params` binds columns by position to the driver's
+placeholders (`?`, `$1`). The prepared statement runs once per row; a
+query's results are concatenated in row order and `adbc_execute`'s counts
+add. A table with no rows runs nothing.
+
+**Type mapping on read.**
+
+| Arrow type | Ibex column |
+|------------|-------------|
+| integers, `bool`, `float64`, `date32`, `timestamp` (zone kept as metadata, UTC nanoseconds) | the matching Int64, Bool, Float64, Date, Timestamp |
+| `float32` | Float64 (widened) |
+| `decimal128(p, s)` | `Decimal(p, s)` |
+| `utf8`, `large_utf8`, dictionary strings | String, Categorical |
+| uuid (`arrow.uuid`, or tagged by the PostgreSQL driver) | String, canonical lowercase `8-4-4-4-12` |
+| `time32`, `time64`, `binary`, intervals, lists, opaque driver types | refused |
+
+A refused column is an error that names the column and its type and suggests
+a cast in the query (`CAST(t AS TEXT)`; `AS CHAR` on MySQL). PostgreSQL's
+`numeric` arrives as text; convert it with `Decimal(x, p, s)`. An empty
+result keeps its schema.
+
+**Type mapping on write.** Int64, Float64, Bool, String and Categorical, Date,
+Timestamp and Decimal map to the driver's matching column types; what a driver
+cannot store is the driver's limit (SQLite stores Bool as `0`/`1`, Date and
+Timestamp as ISO 8601 text, and refuses Decimal; PostgreSQL truncates
+Timestamp to microseconds). Nulls survive in every column.
+
+Drivers differ in what they report and accept; Ibex works around the known
+cases (DuckDB takes one parameter row per statement and appends whole rows
+only; MySQL commits when it creates or drops a table, so `create`, `replace`
+and `create_append` are refused inside `adbc_begin`). `docs/io.html` and
+`docs/connections.html` list the per-driver behaviour.
 
 ### 12.2 Scalar Extraction
 

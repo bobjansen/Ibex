@@ -469,3 +469,26 @@ TEST_CASE("Lexer: Eof token is always last", "[lexer]") {
     auto tokens = tokenize("1 + 2");
     REQUIRE(tokens.back().kind == TokenKind::Eof);
 }
+
+// --- Namespace qualifier -----------------------------------------------------
+
+TEST_CASE("Lexer: '::' is one token, ':' stays a colon", "[lexer]") {
+    auto tokens = tokenize("adbc::query x: Int a:b");
+    REQUIRE(tokens.size() == 10);
+    REQUIRE(tokens[0].kind == TokenKind::Identifier);
+    REQUIRE(tokens[1].kind == TokenKind::ColonColon);
+    REQUIRE(tokens[1].lexeme == "::");
+    REQUIRE(tokens[2].kind == TokenKind::Identifier);
+    REQUIRE(tokens[4].kind == TokenKind::Colon);
+    REQUIRE(tokens[7].kind == TokenKind::Colon);
+}
+
+TEST_CASE("Lexer: ': :' is two colons, ':::' is '::' then ':'", "[lexer]") {
+    auto spaced = tokenize("a: :b");
+    REQUIRE(spaced[1].kind == TokenKind::Colon);
+    REQUIRE(spaced[2].kind == TokenKind::Colon);
+
+    auto triple = tokenize("a:::b");
+    REQUIRE(triple[1].kind == TokenKind::ColonColon);
+    REQUIRE(triple[2].kind == TokenKind::Colon);
+}

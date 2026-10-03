@@ -1778,9 +1778,11 @@ class Lowerer {
             functions_.insert_or_assign(fn->name, fn);
             return true;
         }
-        // `extern type` only makes a name usable in `extern fn` signatures;
+        // `extern type` only makes a name usable in `extern fn` signatures,
+        // and a `using` was applied when names were resolved (names.hpp);
         // nothing to lower.
-        return std::holds_alternative<ExternTypeDecl>(stmt);
+        return std::holds_alternative<ExternTypeDecl>(stmt) ||
+               std::holds_alternative<UsingDecl>(stmt);
     }
 
     /// What calling `callee` does, from its `effects` declaration. An extern

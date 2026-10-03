@@ -5,6 +5,7 @@ add_library(ibex_parser STATIC
     effects.cpp
     lexer.cpp
     lower.cpp
+    names.cpp
     parser.cpp
     resource_functions.cpp
 )

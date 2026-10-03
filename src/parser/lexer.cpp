@@ -371,7 +371,12 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
                 add_token(TokenKind::Semicolon, token_start, 1, token_line, token_column);
                 continue;
             case ':':
-                add_token(TokenKind::Colon, token_start, 1, token_line, token_column);
+                // Maximal munch: `a::b` is a qualified name, never `a: :b`.
+                if (match(':')) {
+                    add_token(TokenKind::ColonColon, token_start, 2, token_line, token_column);
+                } else {
+                    add_token(TokenKind::Colon, token_start, 1, token_line, token_column);
+                }
                 continue;
             default:
                 add_token(TokenKind::Error, token_start, 1, token_line, token_column);

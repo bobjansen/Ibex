@@ -4221,10 +4221,20 @@ auto try_load_plugin(const std::string& stem, const std::vector<std::string>& se
 #else
     const std::string filename = stem + ".so";
 #endif
+#ifdef __APPLE__
+    // CMake-built plugins are .dylib on macOS; scripts/ibex-plugin-build.sh still emits .so.
+    const std::string dylib_filename = stem + ".dylib";
+#endif
     std::string last_error;
     std::string last_candidate;
     for (const auto& dir : search_paths) {
         auto full_path = std::filesystem::path(dir) / filename;
+#ifdef __APPLE__
+        if (const auto dylib_path = std::filesystem::path(dir) / dylib_filename;
+            std::filesystem::exists(dylib_path)) {
+            full_path = dylib_path;
+        }
+#endif
 #ifdef _WIN32
         HMODULE handle = LoadLibraryA(full_path.string().c_str());
         if (handle == nullptr) {

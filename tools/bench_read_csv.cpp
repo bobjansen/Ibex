@@ -12,7 +12,7 @@
 #include "../libs/csv/csv.hpp"
 
 int main(int argc, char** argv) {
-    CLI::App app{"Benchmark read_csv() in isolation"};
+    CLI::App app{"Benchmark csv::read() in isolation"};
 
     std::string input = "examples/measurements.txt";
     std::string nulls;
@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
     has_header = !app.get_option("--no-header")->as<bool>();
 
     for (int i = 0; i < warmup; ++i) {
-        (void)read_csv(input, nulls, delimiter, has_header, schema);
+        (void)ibex::ext::csv::read(input, nulls, delimiter, has_header, schema);
     }
 
     double total_ms = 0.0;
@@ -46,7 +46,7 @@ int main(int argc, char** argv) {
 
     for (int i = 0; i < iters; ++i) {
         const auto start = std::chrono::steady_clock::now();
-        auto table = read_csv(input, nulls, delimiter, has_header, schema);
+        auto table = ibex::ext::csv::read(input, nulls, delimiter, has_header, schema);
         const auto end = std::chrono::steady_clock::now();
         const double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
         total_ms += elapsed_ms;
@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "framework\tavg_ms\tmin_ms\tmax_ms\titers\trows\tcols\n";
-    std::cout << "read_csv\t" << std::fixed << std::setprecision(3) << (total_ms / iters) << '\t'
+    std::cout << "csv::read\t" << std::fixed << std::setprecision(3) << (total_ms / iters) << '\t'
               << min_ms << '\t' << max_ms << '\t' << iters << '\t' << rows << '\t' << cols << '\n';
 
     return 0;

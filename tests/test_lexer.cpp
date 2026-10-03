@@ -430,7 +430,7 @@ TEST_CASE("Lexer: block expression with filter and select", "[lexer]") {
 }
 
 TEST_CASE("Lexer: extern declaration", "[lexer]") {
-    auto tokens = tokenize("extern fn read_csv(path: String) -> DataFrame from \"csv.hpp\";");
+    auto tokens = tokenize("extern fn csv::read(path: String) -> DataFrame from \"csv.hpp\";");
     REQUIRE(tokens[0].kind == TokenKind::KeywordExtern);
     REQUIRE(tokens[1].kind == TokenKind::KeywordFn);
     REQUIRE(first_of(tokens, TokenKind::KeywordFrom) != nullptr);

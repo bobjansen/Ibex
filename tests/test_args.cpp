@@ -53,7 +53,7 @@ auto tokens(std::vector<std::string> v) -> std::vector<std::string> {
 
 }  // namespace
 
-TEST_CASE("parse_args: schema is always {kind, name, index, value}", "[args]") {
+TEST_CASE("args::parse: schema is always {kind, name, index, value}", "[args]") {
     auto table = parse_args_from_tokens("v : flag", {});
     REQUIRE(table.columns.size() == 4);
     CHECK(table.columns[0].name == "kind");
@@ -62,7 +62,7 @@ TEST_CASE("parse_args: schema is always {kind, name, index, value}", "[args]") {
     CHECK(table.columns[3].name == "value");
 }
 
-TEST_CASE("parse_args: option, alias, flag, positional", "[args]") {
+TEST_CASE("args::parse: option, alias, flag, positional", "[args]") {
     const std::string spec = R"(
         threads (t)  : int    = 4
         verbose (v)  : flag
@@ -80,14 +80,14 @@ TEST_CASE("parse_args: option, alias, flag, positional", "[args]") {
     CHECK(rows.size() == 4);  // `out` is optional and absent -> no row
 }
 
-TEST_CASE("parse_args: defaults and flag fallback", "[args]") {
+TEST_CASE("args::parse: defaults and flag fallback", "[args]") {
     const auto rows = rows_of(parse_args_from_tokens("threads : int = 4 ; debug : flag", {}));
     CHECK(rows.size() == 2);
     CHECK(rows[0] == Row{"option", "threads", 0, "4"});
     CHECK(rows[1] == Row{"flag", "debug", 0, "false"});
 }
 
-TEST_CASE("parse_args: --name=value, --no-flag, repeated", "[args]") {
+TEST_CASE("args::parse: --name=value, --no-flag, repeated", "[args]") {
     const std::string spec = "out : string ; verbose : flag ; inc (I) : string +";
     const auto rows = rows_of(parse_args_from_tokens(
         spec, tokens({"--out=/tmp/x", "--no-verbose", "-I", "one", "-I", "two"})));
@@ -97,14 +97,14 @@ TEST_CASE("parse_args: --name=value, --no-flag, repeated", "[args]") {
     CHECK(rows[3] == Row{"option", "inc", 1, "two"});
 }
 
-TEST_CASE("parse_args: `--` forces positionals", "[args]") {
+TEST_CASE("args::parse: `--` forces positionals", "[args]") {
     const auto rows =
         rows_of(parse_args_from_tokens("rest : positional*", tokens({"--", "-x", "--y"})));
     CHECK(rows[0] == Row{"positional", "rest", 0, "-x"});
     CHECK(rows[1] == Row{"positional", "rest", 1, "--y"});
 }
 
-TEST_CASE("parse_args: errors", "[args]") {
+TEST_CASE("args::parse: errors", "[args]") {
     CHECK_THROWS_WITH(parse_args_from_tokens("port : int", tokens({"--port", "abc"})),
                       Catch::Matchers::ContainsSubstring("invalid value for --port"));
     CHECK_THROWS_WITH(parse_args_from_tokens("port : int", {}),
@@ -119,31 +119,31 @@ TEST_CASE("parse_args: errors", "[args]") {
                       Catch::Matchers::ContainsSubstring("unknown option type"));
 }
 
-TEST_CASE("parse_args: a single-value option given twice is an error", "[args]") {
+TEST_CASE("args::parse: a single-value option given twice is an error", "[args]") {
     CHECK_THROWS_WITH(parse_args_from_tokens("out : string", tokens({"--out", "a", "--out", "b"})),
                       Catch::Matchers::ContainsSubstring("more than once"));
 }
 
-TEST_CASE("parse_args: bare positional when none declared gets name \"\"", "[args]") {
+TEST_CASE("args::parse: bare positional when none declared gets name \"\"", "[args]") {
     const auto rows = rows_of(parse_args_from_tokens("v : flag", tokens({"one", "two"})));
     CHECK(rows[0] == Row{"positional", "", 0, "one"});
     CHECK(rows[1] == Row{"positional", "", 1, "two"});
 }
 
-TEST_CASE("parse_args: end-to-end through the REPL with scalar() + casts", "[args][e2e]") {
+TEST_CASE("args::parse: end-to-end through the REPL with scalar() + casts", "[args][e2e]") {
     ibex::runtime::ExternRegistry registry;
     registry.register_table(
-        "parse_args",
+        "args::parse",
         [](const ibex::runtime::ExternArgs& args)
             -> std::expected<ibex::runtime::ExternValue, std::string> {
             const auto* spec = args.empty() ? nullptr : std::get_if<std::string>(&args[0]);
             const auto* argv = args.size() >= 2 ? std::get_if<std::string>(&args[1]) : nullptr;
             if (spec == nullptr) {
-                return std::unexpected("parse_args() expects a string spec");
+                return std::unexpected("args::parse() expects a string spec");
             }
             try {
                 return ibex::runtime::ExternValue{
-                    parse_args(*spec, argv != nullptr ? *argv : std::string{})};
+                    ibex::ext::args::parse(*spec, argv != nullptr ? *argv : std::string{})};
             } catch (const std::exception& e) {
                 return std::unexpected(std::string(e.what()));
             }
@@ -151,9 +151,9 @@ TEST_CASE("parse_args: end-to-end through the REPL with scalar() + casts", "[arg
 
     ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
     const auto setup = session.execute(R"(
-extern fn parse_args(spec: String, argv: String = "") -> DataFrame from "args.hpp";
+extern fn args::parse(spec: String, argv: String = "") -> DataFrame from "args.hpp";
 let spec = "threads (t) : int = 4 ; limit : int? ; verbose (v) : flag";
-let args = parse_args(spec, "-t 9 -v");
+let args = args::parse(spec, "-t 9 -v");
 )");
     REQUIRE(setup.ok);
 

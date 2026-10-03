@@ -36,7 +36,7 @@ implementations name a few columns differently (q18). Either case is reported
 as a note and does not fail the check. Numbers match within max(0.01, 1e-9 * |value|),
 because upstream Polars rounds some money columns to 2 decimals and float
 summation order differs between engines. Dates compare as days since the epoch,
-which is what Ibex's `write_csv` emits.
+which is what Ibex's `csv::write` emits.
 
 Usage (from the repo root, inside the project's uv environment):
   uv run --project . benchmarking/tpch/check_against_polars.py --sf 8 [--pdsh-root DIR] [q01 q11 ...]

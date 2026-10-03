@@ -180,10 +180,10 @@ class BenchmarkContract(unittest.TestCase):
                 "filter_simple": "trades[filter price > 500.0]",
             }
             script = ['import "csv";',
-                      f'let prices = read_csv("{root / "prices.csv"}");',
-                      f'let trades = read_csv("{root / "trades.csv"}");']
+                      f'let prices = csv::read("{root / "prices.csv"}");',
+                      f'let trades = csv::read("{root / "trades.csv"}");']
             for name, query in queries.items():
-                script.append(f'write_csv({query}, "{root / (name + ".csv")}");')
+                script.append(f'csv::write({query}, "{root / (name + ".csv")}");')
             (root / "check.ibex").write_text("\n".join(script))
             subprocess.run([str(executable), "--plugin-path", str(executable.parent),
                             str(root / "check.ibex")], check=True, capture_output=True, text=True)

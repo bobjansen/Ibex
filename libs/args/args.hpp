@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 #pragma once
-// Ibex `parse_args` library -- declarative command-line argument parsing.
+// Ibex `args::parse` library -- declarative command-line argument parsing.
 //
 //   import "args";
 //   let spec = "
@@ -11,11 +11,11 @@
 //     out          : string?          # output path; stdout if absent
 //     input        : positional+      # one or more input files
 //   ";
-//   let args   = parse_args(spec);
+//   let args   = args::parse(spec);
 //   let n      = Int64(scalar(args[filter name == \"threads\", select { value }]));
 //   let files  = args[filter kind == \"positional\", select { path = value }];
 //
-// `parse_args(spec)` returns one row per argument, with a fixed schema:
+// `args::parse(spec)` returns one row per argument, with a fixed schema:
 //
 //   kind:  String   -- "option" | "flag" | "positional"
 //   name:  String   -- canonical option name; the positional's declared name
@@ -27,7 +27,7 @@
 // required checks, lexical type validation); it does not shape the schema.
 //
 // argv comes from the `IBEX_ARGS` environment variable (one argument per line).
-// The two-argument form `parse_args(spec, argv)` takes an explicit newline- or
+// The two-argument form `args::parse(spec, argv)` takes an explicit newline- or
 // space-separated argv string instead -- handy for tests and embedding.
 
 #include <ibex/core/column.hpp>
@@ -145,7 +145,7 @@ namespace detail {
     if (word == "timestamp") {
         return ArgType::Timestamp;
     }
-    throw std::runtime_error("parse_args: unknown option type '" + std::string(word) + "'");
+    throw std::runtime_error("args::parse: unknown option type '" + std::string(word) + "'");
 }
 
 // Parse one spec line into an OptionSpec. `line` has the trailing `# help`
@@ -156,7 +156,7 @@ namespace detail {
 [[nodiscard]] inline auto parse_spec_line(std::string_view line, std::string help) -> OptionSpec {
     const auto colon = line.find(':');
     if (colon == std::string_view::npos) {
-        throw std::runtime_error("parse_args: spec line missing ':' -> " + std::string(line));
+        throw std::runtime_error("args::parse: spec line missing ':' -> " + std::string(line));
     }
     std::string head = trim(line.substr(0, colon));
     std::string rest = trim(line.substr(colon + 1));
@@ -169,7 +169,7 @@ namespace detail {
     if (const auto lparen = head.find('('); lparen != std::string::npos) {
         const auto rparen = head.find(')', lparen);
         if (rparen == std::string::npos) {
-            throw std::runtime_error("parse_args: unmatched '(' in spec line -> " +
+            throw std::runtime_error("args::parse: unmatched '(' in spec line -> " +
                                      std::string(line));
         }
         aliases = head.substr(lparen + 1, rparen - lparen - 1);
@@ -177,7 +177,7 @@ namespace detail {
     }
     spec.name = trim(head);
     if (spec.name.empty()) {
-        throw std::runtime_error("parse_args: spec line has no option name -> " +
+        throw std::runtime_error("args::parse: spec line has no option name -> " +
                                  std::string(line));
     }
 
@@ -195,7 +195,7 @@ namespace detail {
 
     const auto tokens = split_ws(rest);
     if (tokens.empty()) {
-        throw std::runtime_error("parse_args: spec line missing a type -> " + std::string(line));
+        throw std::runtime_error("args::parse: spec line missing a type -> " + std::string(line));
     }
     const auto apply_arity = [&](const std::string& a) -> bool {
         if (a == "flag") {
@@ -227,7 +227,7 @@ namespace detail {
         spec.type = parse_arg_type(tokens[0]);
         next = 1;
         if (next < tokens.size() && !apply_arity(tokens[next])) {
-            throw std::runtime_error("parse_args: unknown arity '" + tokens[next] + "' -> " +
+            throw std::runtime_error("args::parse: unknown arity '" + tokens[next] + "' -> " +
                                      std::string(line));
         }
         if (next < tokens.size()) {
@@ -237,7 +237,7 @@ namespace detail {
         next = 1;
     }
     if (next < tokens.size()) {
-        throw std::runtime_error("parse_args: trailing tokens in spec line -> " +
+        throw std::runtime_error("args::parse: trailing tokens in spec line -> " +
                                  std::string(line));
     }
 
@@ -263,7 +263,7 @@ namespace detail {
             spec.spellings.push_back((a.size() == 1 ? "-" : "--") + a);
         }
     } else if (!aliases.empty()) {
-        throw std::runtime_error("parse_args: a positional option takes no aliases -> " +
+        throw std::runtime_error("args::parse: a positional option takes no aliases -> " +
                                  std::string(line));
     }
     return spec;
@@ -300,7 +300,8 @@ namespace detail {
     for (std::size_t i = 0; i < out.size(); ++i) {
         for (std::size_t j = i + 1; j < out.size(); ++j) {
             if (out[i].name == out[j].name) {
-                throw std::runtime_error("parse_args: duplicate option name '" + out[i].name + "'");
+                throw std::runtime_error("args::parse: duplicate option name '" + out[i].name +
+                                         "'");
             }
         }
     }
@@ -309,7 +310,7 @@ namespace detail {
 
 inline void validate_value(const OptionSpec& spec, const std::string& value) {
     const auto fail = [&] {
-        throw std::runtime_error("parse_args: invalid value for --" + spec.name + ": '" + value +
+        throw std::runtime_error("args::parse: invalid value for --" + spec.name + ": '" + value +
                                  "'");
     };
     switch (spec.type) {
@@ -430,7 +431,8 @@ inline void validate_value(const OptionSpec& spec, const std::string& value) {
             return;
         }
         if (pos_idx >= positionals.size()) {
-            throw std::runtime_error("parse_args: unexpected positional argument: '" + value + "'");
+            throw std::runtime_error("args::parse: unexpected positional argument: '" + value +
+                                     "'");
         }
         OptionSpec* spec = positionals[pos_idx];
         const std::int64_t index = occ[spec->name]++;
@@ -473,14 +475,14 @@ inline void validate_value(const OptionSpec& spec, const std::string& value) {
             }
         }
         if (spec == nullptr) {
-            throw std::runtime_error("parse_args: unknown option: " + token);
+            throw std::runtime_error("args::parse: unknown option: " + token);
         }
 
         if (spec->is_flag()) {
             std::string value = negated ? "false" : "true";
             if (inline_value.has_value()) {
                 if (*inline_value != "true" && *inline_value != "false") {
-                    throw std::runtime_error("parse_args: --" + spec->name +
+                    throw std::runtime_error("args::parse: --" + spec->name +
                                              " takes true/false, got '" + *inline_value + "'");
                 }
                 value = *inline_value;
@@ -497,14 +499,14 @@ inline void validate_value(const OptionSpec& spec, const std::string& value) {
             value = *inline_value;
         } else {
             if (i + 1 >= argv.size()) {
-                throw std::runtime_error("parse_args: option " + token + " needs a value");
+                throw std::runtime_error("args::parse: option " + token + " needs a value");
             }
             value = argv[++i];
         }
         validate_value(*spec, value);
         const std::int64_t index = occ[spec->name]++;
         if (index > 0 && spec->arity == ArgArity::Single) {
-            throw std::runtime_error("parse_args: option --" + spec->name +
+            throw std::runtime_error("args::parse: option --" + spec->name +
                                      " given more than once");
         }
         rows.push_back(ArgRow{
@@ -518,7 +520,7 @@ inline void validate_value(const OptionSpec& spec, const std::string& value) {
             if (!seen) {
                 std::string value = spec.default_value.value_or("false");
                 if (value != "true" && value != "false") {
-                    throw std::runtime_error("parse_args: flag --" + spec.name +
+                    throw std::runtime_error("args::parse: flag --" + spec.name +
                                              " default must be true/false");
                 }
                 rows.push_back(ArgRow{
@@ -548,8 +550,8 @@ inline void validate_value(const OptionSpec& spec, const std::string& value) {
         }
         throw std::runtime_error(
             spec.is_positional()
-                ? ("parse_args: missing required positional argument: " + spec.name)
-                : ("parse_args: missing required option: --" + spec.name));
+                ? ("args::parse: missing required positional argument: " + spec.name)
+                : ("args::parse: missing required option: --" + spec.name));
     }
 
     return rows;
@@ -590,19 +592,22 @@ inline void validate_value(const OptionSpec& spec, const std::string& value) {
 
 }  // namespace ibex::args
 
-// Public entry points, at global scope so the transpiler's `parse_args(...)`
-// call in generated C++ resolves (matching csv.hpp's `read_csv`).
+// The entry points generated C++ calls: `ibex_compile` names Ibex's
+// `args::parse` as `ibex::ext::args::parse`.
+namespace ibex::ext::args {
 
 // argv from the IBEX_ARGS environment variable (one argument per line).
-[[nodiscard]] inline auto parse_args(const std::string& spec) -> ibex::runtime::Table {
+[[nodiscard]] inline auto parse(const std::string& spec) -> ibex::runtime::Table {
     return ibex::args::parse_args_from_tokens(spec, ibex::args::detail::argv_from_env());
 }
 
 // Explicit argv string (newline- or space-separated).
-[[nodiscard]] inline auto parse_args(const std::string& spec, const std::string& argv)
+[[nodiscard]] inline auto parse(const std::string& spec, const std::string& argv)
     -> ibex::runtime::Table {
     if (argv.empty()) {
-        return parse_args(spec);
+        return parse(spec);
     }
     return ibex::args::parse_args_from_tokens(spec, ibex::args::detail::split_argv(argv));
 }
+
+}  // namespace ibex::ext::args

@@ -111,7 +111,7 @@ void Emitter::emit(std::ostream& out, const Script& script, const Config& config
     model_vars_.clear();
     const std::string result_var = emit_script_steps(script);
     if (result_var.empty()) {
-        // The script ends in an effect (`adbc_close(db);`): there is no table to
+        // The script ends in an effect (`adbc::close(db);`): there is no table to
         // print or return.
         if (config.table_entry_point) {
             out << "    return ibex::runtime::Table{};\n";
@@ -1426,7 +1426,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             *out_ << "    };\n\n";
 
             // ── Emit the source-normalisation lambda ──────────────────────────
-            // Source may return Table (e.g. udp_recv) or ExternValue (e.g. ws_recv).
+            // Source may return Table (e.g. udp::recv) or ExternValue (e.g. ws::recv).
             // We normalise both to ExternValue so the event loop is uniform.
             const std::string call_src = "_call_src_" + var;
             *out_ << "    auto " << call_src << " = [&]() -> ibex::runtime::ExternValue {\n";

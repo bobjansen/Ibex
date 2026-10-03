@@ -37,7 +37,7 @@ namespace ibex::runtime::physical {
 enum class SourceKind : std::uint8_t {
     TableScan,     ///< Scan of a table in the registry
     LazyScan,      ///< Scan resolved lazily (deferred/reader-backed)
-    ExternSource,  ///< chunked extern call (read_csv, read_parquet, ...)
+    ExternSource,  ///< chunked extern call (csv::read, parquet::read, ...)
     /// The materialized output of a pipeline breaker (a join, an aggregate, an
     /// order — whatever the walk bottomed out in). The subtree keeps the
     /// existing executor and this pipeline consumes what it produces, which is

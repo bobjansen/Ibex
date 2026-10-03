@@ -18,8 +18,8 @@
 
 import "csv";
 
-let emp  = read_csv("examples/data/employees.csv");
-let dept = read_csv("examples/data/departments.csv");
+let emp  = csv::read("examples/data/employees.csv");
+let dept = csv::read("examples/data/departments.csv");
 
 // ── 1. Left join: unmatched employees get null dept_name / budget ─────────────
 //   Result has 6 rows; Dave and Frank have null dept_name, null budget.

@@ -2593,7 +2593,7 @@ TEST_CASE("join: `nulls` takes only equal or never", "[join][nulls]") {
 }
 
 TEST_CASE("join: `nulls` is not a reserved word", "[join][nulls]") {
-    // `read_csv(path, nulls: String = "", ...)` names a parameter `nulls`, so
+    // `csv::read(path, nulls: String = "", ...)` names a parameter `nulls`, so
     // reserving it would have broken the shipped csv reader. It is matched in
     // the join trailer position only.
     runtime::Table t;

@@ -73,7 +73,7 @@ TEST_CASE("wildcard_match: shell globs", "[fs]") {
     CHECK(wildcard_match("report_2026.csv", "report_*.csv"));
 }
 
-TEST_CASE("list_files: schema, splitting, glob, recursion", "[fs]") {
+TEST_CASE("fs::list: schema, splitting, glob, recursion", "[fs]") {
     const auto dir = make_temp_dir("list");
     write_file(dir / "x.csv", "a,b\n1,2\n");
     write_file(dir / "y.csv", "a,b\n3,4\n");
@@ -193,31 +193,31 @@ TEST_CASE("map clause: effectful externs run per row (csv round-trip)", "[fs][ma
     write_file(src / "two.csv", "a,b\n5,6\n");
 
     auto registry = make_registry();
-    registry.register_table("read_csv",
+    registry.register_table("csv::read",
                             [](const ibex::runtime::ExternArgs& args)
                                 -> std::expected<ibex::runtime::ExternValue, std::string> {
                                 const auto* p =
                                     args.empty() ? nullptr : std::get_if<std::string>(&args[0]);
                                 if (p == nullptr) {
-                                    return std::unexpected("read_csv: path must be a string");
+                                    return std::unexpected("csv::read: path must be a string");
                                 }
                                 try {
-                                    return ibex::runtime::ExternValue{::read_csv(*p)};
+                                    return ibex::runtime::ExternValue{ibex::ext::csv::read(*p)};
                                 } catch (const std::exception& e) {
                                     return std::unexpected(std::string(e.what()));
                                 }
                             });
     registry.register_scalar_table_consumer(
-        "write_csv", ibex::runtime::ScalarKind::Int,
+        "csv::write", ibex::runtime::ScalarKind::Int,
         [](const ibex::runtime::Table& table, const ibex::runtime::ExternArgs& args)
             -> std::expected<ibex::runtime::ExternValue, std::string> {
             const auto* path = args.empty() ? nullptr : std::get_if<std::string>(&args[0]);
             if (path == nullptr) {
-                return std::unexpected("write_csv: path must be a string");
+                return std::unexpected("csv::write: path must be a string");
             }
             try {
                 return ibex::runtime::ExternValue{
-                    ibex::runtime::ScalarValue{::write_csv(table, *path)}};
+                    ibex::runtime::ScalarValue{ibex::ext::csv::write(table, *path)}};
             } catch (const std::exception& e) {
                 return std::unexpected(std::string(e.what()));
             }
@@ -227,14 +227,14 @@ TEST_CASE("map clause: effectful externs run per row (csv round-trip)", "[fs][ma
     REQUIRE(session
                 .execute(R"(
 namespace fs { extern fn list(dir: String, pattern: String = "*") -> DataFrame from "fs.hpp"; }
-extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
-extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+extern fn csv::read(path: String) -> DataFrame from "csv.hpp";
+extern fn csv::write(df: DataFrame, path: String) -> Int from "csv.hpp";
 )")
                 .ok);
 
     const std::string script = "fs::list(\"" + src.string() + "\", \"*.csv\")[map { " +
                                "source = path, " + "target = `" + dst.string() +
-                               "/${stem}.out.csv`, " + "rows = write_csv(read_csv(path), `" +
+                               "/${stem}.out.csv`, " + "rows = csv::write(csv::read(path), `" +
                                dst.string() + "/${stem}.out.csv`) }];";
     const auto r = session.execute(script);
     INFO("script: " << script);

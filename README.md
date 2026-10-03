@@ -60,7 +60,7 @@ import "csv";
 
 // Declare the columns this example relies on; the CSV may contain others.
 let prices = as_timeframe(
-    read_csv("prices.csv") as DataFrame<{
+    csv::read("prices.csv") as DataFrame<{
         ts: Timestamp,
         symbol: String,
         price: Float64,
@@ -160,9 +160,9 @@ import "csv";
 import "fs";
 import "parquet";
 
-list_files("incoming", "*.csv")[map {
+fs::list("incoming", "*.csv")[map {
     source = path,
-    rows = write_parquet(read_csv(path), `archive/${stem}.parquet`)
+    rows = parquet::write(csv::read(path), `archive/${stem}.parquet`)
 }];
 ```
 
@@ -244,7 +244,7 @@ let total = scalar(prices[select { total = sum(price) }], total);
 
 // One-argument scalar() returns null for an empty one-column table.
 import "args";
-let args = parse_args("limit (n) : int?");
+let args = args::parse("limit (n) : int?");
 let optional = scalar(args[filter name == "limit", select { value }]);
 let limit = Int64(coalesce(optional, "100"));
 ```
@@ -316,8 +316,8 @@ Use `is null` / `is not null` to test for nulls explicitly:
 ```
 import "csv";
 
-let emp  = read_csv("employees.csv");
-let dept = read_csv("departments.csv");
+let emp  = csv::read("employees.csv");
+let dept = csv::read("departments.csv");
 
 // Left join — unmatched rows get null dept_name
 let enriched = emp left join dept on dept_id;
@@ -342,7 +342,7 @@ row-count based) and use duration literals:
 ```
 import "csv";
 
-let prices = read_csv("prices.csv");
+let prices = csv::read("prices.csv");
 let tf = as_timeframe(prices, timestamp);
 
 // 5-minute rolling mean
@@ -360,7 +360,7 @@ tf[resample 1m, select {
 }]
 
 // As-of join two TimeFrames on time index
-let tf2 = as_timeframe(read_csv("quotes.csv"), timestamp);
+let tf2 = as_timeframe(csv::read("quotes.csv"), timestamp);
 tf asof join tf2 on timestamp
 ```
 
@@ -488,9 +488,9 @@ import "csv";
 import "json";
 import "parquet";
 
-let rows_written = write_csv(result, "output.csv");
-write_json(result, "output.json");
-write_parquet(result, "output.parquet");
+let rows_written = csv::write(result, "output.csv");
+json::write(result, "output.json");
+parquet::write(result, "output.parquet");
 ```
 
 ### Vectorized RNG
@@ -624,7 +624,7 @@ and later cells can reuse it without rerunning the load:
 ```python
 %%ibex --quiet
 import "csv";
-let train = read_csv("../../kaggle/data/train.csv", "<empty>");
+let train = csv::read("../../kaggle/data/train.csv", "<empty>");
 
 %%ibex --as pandas --out bucket_summary
 train[select { rows = count() }, by seconds_in_bucket, order seconds_in_bucket];
@@ -772,7 +772,7 @@ scripts/install_adbc_driver.sh sqlite postgresql
 
 The script downloads Apache's own driver builds (pinned by version and
 SHA-256), needs only `curl`, `unzip` and `sha256sum`, and writes an ADBC driver
-manifest to `~/.config/adbc/drivers` so scripts can say `adbc_read("sqlite", ...)`.
+manifest to `~/.config/adbc/drivers` so scripts can say `adbc::read("sqlite", ...)`.
 On Windows, `scripts\install_adbc_driver.ps1` does the same with only what ships
 with Windows PowerShell, registering each driver under `HKCU\SOFTWARE\ADBC\Drivers`:
 
@@ -909,14 +909,14 @@ that behavior.
 
 ## Plugins
 
-Ibex data-source functions (e.g. `read_csv`, `read_json`, `read_parquet`) are
+Ibex data-source functions (e.g. `csv::read`, `json::read`, `parquet::read`) are
 **I/O backends** — host-linked implementations or shared plugins registered
 with the runtime when a script imports their library declarations.
 
 When the REPL encounters:
 
 ```
-extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+extern fn csv::read(path: String) -> DataFrame from "csv.hpp";
 ```
 
 it looks for `csv.so` in the plugin search path and calls its
@@ -931,13 +931,13 @@ hosts that use dynamic plugins.
 
 | Backend | Functions | Format |
 |--------|-----------|--------|
-| `csv`  | `read_csv`, `write_csv` | RFC 4180 CSV with type inference |
-| `json` | `read_json`, `write_json` | JSON array-of-objects, JSON-Lines, single object |
-| `parquet` | `read_parquet`, `write_parquet` | Apache Parquet, including HTTPS and `s3://` reads |
-| `adbc` | `adbc_read`, `adbc_connect`, `adbc_query`, `adbc_execute`, `adbc_write`, `adbc_tables`, `adbc_table_schema`, `adbc_begin`, `adbc_commit`, `adbc_rollback`, `adbc_close` | Optional ADBC/Arrow driver-manager plugin: read, write and run SQL, in transactions; list tables and columns |
-| `kafka` | `kafka_recv`, `kafka_recv_avro`, `kafka_send` | Optional Kafka streaming plugin for JSON and Schema-Registry-backed Avro |
-| `udp`  | `udp_recv`, `udp_send` | JSON-over-UDP streaming |
-| `websocket` | `ws_recv`, `ws_connect`, `ws_send`, `ws_listen` | JSON-over-WebSocket streaming: server source/sink plus client mode for external feeds |
+| `csv`  | `csv::read`, `csv::write` | RFC 4180 CSV with type inference |
+| `json` | `json::read`, `json::write` | JSON array-of-objects, JSON-Lines, single object |
+| `parquet` | `parquet::read`, `parquet::write` | Apache Parquet, including HTTPS and `s3://` reads |
+| `adbc` | `adbc::read`, `adbc::connect`, `adbc::query`, `adbc::execute`, `adbc::write`, `adbc::tables`, `adbc::table_schema`, `adbc::begin`, `adbc::commit`, `adbc::rollback`, `adbc::close` | Optional ADBC/Arrow driver-manager plugin: read, write and run SQL, in transactions; list tables and columns |
+| `kafka` | `kafka::recv`, `kafka::recv_avro`, `kafka::send` | Optional Kafka streaming plugin for JSON and Schema-Registry-backed Avro |
+| `udp`  | `udp::recv`, `udp::send` | JSON-over-UDP streaming |
+| `websocket` | `ws::recv`, `ws::connect`, `ws::send`, `ws::listen` | JSON-over-WebSocket streaming: server source/sink plus client mode for external feeds |
 
 Parquet reads can target public HTTPS URLs, presigned URLs, and S3-compatible
 object storage. HTTPS URLs require no client cloud setup. S3 credentials come
@@ -946,16 +946,16 @@ as `region` or `endpoint_override`:
 
 ```
 import "parquet";
-let public_prices = read_parquet("https://data.example.com/prices.parquet");
-let prices = read_parquet("s3://market-data/prices.parquet?region=us-east-1");
+let public_prices = parquet::read("https://data.example.com/prices.parquet");
+let prices = parquet::read("s3://market-data/prices.parquet?region=us-east-1");
 ```
 
 Use `import` to load a plugin without explicit `extern fn` declarations:
 
 ```ibex
 import "json";
-let df = read_json("data.json");
-write_json(df, "output.json");
+let df = json::read("data.json");
+json::write(df, "output.json");
 ```
 
 `csv.so` also supports optional null-spec, delimiter, header, and schema
@@ -963,20 +963,20 @@ arguments. Use `import "csv"` for the normal case:
 
 ```ibex
 import "csv";
-let df = read_csv("examples/data/null_metrics.txt", "<empty>,NA");
+let df = csv::read("examples/data/null_metrics.txt", "<empty>,NA");
 ```
 
 The equivalent explicit declaration is:
 
 ```ibex
-extern fn read_csv(
+extern fn csv::read(
     path: String,
     nulls: String = "",
     delimiter: String = ",",
     has_header: Bool = true
 ) -> DataFrame from "csv.hpp";
 
-let df = read_csv("examples/data/null_metrics.txt", nulls = "<empty>,NA");
+let df = csv::read("examples/data/null_metrics.txt", nulls = "<empty>,NA");
 ```
 
 `<empty>` marks empty fields as null; additional comma-separated tokens are
@@ -991,7 +991,7 @@ bitmaps.
 
 ```ibex
 import "adbc";
-let df = adbc_read("sqlite", "", "select 1 as x");
+let df = adbc::read("sqlite", "", "select 1 as x");
 ```
 
 The first argument is a driver name, resolved through an ADBC driver manifest
@@ -1017,7 +1017,7 @@ sources and a JSON sink:
 ```ibex
 import "kafka";
 
-let tick = kafka_recv(
+let tick = kafka::recv(
     "localhost:9092",
     "ticks",
     "ibex-demo",
@@ -1032,7 +1032,7 @@ exposes an Avro receive path:
 ```ibex
 import "kafka";
 
-let tick = kafka_recv_avro(
+let tick = kafka::recv_avro(
     "localhost:19092",
     "ticks_avro",
     "ibex-demo-avro",
@@ -1047,9 +1047,9 @@ The receive schema is explicit and required for both JSON and Avro. Use
 `str`, `cat`, `date`, and `timestamp`. Consumer options use
 `poll_timeout_ms=...` plus any `consumer.<key>=<value>` Kafka config.
 Producer options use `flush_timeout_ms=...` plus `producer.<key>=<value>`.
-`kafka_recv_avro(...)` additionally requires a Schema Registry base URL.
+`kafka::recv_avro(...)` additionally requires a Schema Registry base URL.
 
-For a streaming pipeline, wrap `kafka_recv(...)` inside `Stream { ... }`. Each
+For a streaming pipeline, wrap `kafka::recv(...)` inside `Stream { ... }`. Each
 Kafka JSON message becomes a one-row table. Idle polls return `StreamTimeout`,
 so the stream stays live rather than terminating on temporary inactivity.
 `poll_timeout_ms` is only the consumer wait interval between polls; it is not

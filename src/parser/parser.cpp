@@ -878,7 +878,7 @@ class Parser {
             // clause that does nothing.
             std::optional<JoinNullMatch> null_match;
             // `nulls` is matched contextually, not reserved: the shipped
-            // `read_csv(path, nulls: String = "", ...)` names a parameter that,
+            // `csv::read(path, nulls: String = "", ...)` names a parameter that,
             // and a join trailer is the one place the word can appear with this
             // meaning. Nothing else may follow a key list, so there is no
             // ambiguity to resolve.
@@ -2732,9 +2732,12 @@ class Parser {
                 }
                 return Type{.kind = Type::Kind::Resource, .resource = resolve_type_name(*name)};
             }
-            error_ = make_error(peek(), "unknown type '" + std::string(peek().lexeme) +
-                                            "' (a resource type declared with 'extern type' "
-                                            "can appear only in function signatures)");
+            const Token& at = peek();
+            advance();
+            auto name = parse_qualified_rest(std::string(previous().lexeme));
+            error_ = make_error(at, "unknown type '" + name.value_or(std::string(at.lexeme)) +
+                                        "' (a resource type declared with 'extern type' "
+                                        "can appear only in function signatures)");
             return std::nullopt;
         }
         error_ = make_error(peek(), "expected type");

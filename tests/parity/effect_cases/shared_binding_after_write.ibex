@@ -2,10 +2,10 @@
 // `let` is -- after the write that replaces the file -- not before every sink.
 import "csv";
 let old = Table { x = [1, 2] };
-write_csv(old, "/tmp/ibex_parity_shared_binding_after_write.csv");
+csv::write(old, "/tmp/ibex_parity_shared_binding_after_write.csv");
 let fresh = Table { x = [10, 20] };
-write_csv(fresh, "/tmp/ibex_parity_shared_binding_after_write.csv");
-let r = read_csv("/tmp/ibex_parity_shared_binding_after_write.csv")[select { total = sum(x) }];
+csv::write(fresh, "/tmp/ibex_parity_shared_binding_after_write.csv");
+let r = csv::read("/tmp/ibex_parity_shared_binding_after_write.csv")[select { total = sum(x) }];
 let lo = r[filter total > 0];
 let hi = r[filter total > 1];
 lo join hi on total;

@@ -1,7 +1,11 @@
+namespace parquet {
+
 // Read a Parquet file into a DataFrame.
 // Uses the bundled parquet plugin and preserves supported column types.
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn read(path: String) -> DataFrame from "parquet.hpp";
 
 // Write a DataFrame to a Parquet file.
 // Returns the number of rows written.
-extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";
+extern fn write(df: DataFrame, path: String) -> Int from "parquet.hpp";
+
+}

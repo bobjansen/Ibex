@@ -1,9 +1,11 @@
+namespace csv {
+
 // Read a CSV file into a DataFrame.
 // `nulls` marks matching cells as null; the default keeps empty fields as strings.
 // `delimiter` defaults to ",".
 // `has_header` controls whether the first row contains column names.
 // `schema` optionally supplies explicit column types.
-extern fn read_csv(
+extern fn read(
     path: String,
     nulls: String = "",
     delimiter: String = ",",
@@ -13,4 +15,6 @@ extern fn read_csv(
 
 // Write a DataFrame to a CSV file.
 // Returns the number of rows written.
-extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+extern fn write(df: DataFrame, path: String) -> Int from "csv.hpp";
+
+}

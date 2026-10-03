@@ -3,12 +3,12 @@
 // can drop the table; had the first stayed open until the end of the program the
 // drop would fail with a locked database.
 import "adbc";
-let db = adbc_connect("@SQLITE_DRIVER@", "file:/tmp/ibex_parity_adbc_release.db");
-adbc_execute(db, "create table t (x integer)");
-adbc_begin(db);
-adbc_execute(db, "insert into t values (1)");
+let db = adbc::connect("@SQLITE_DRIVER@", "file:/tmp/ibex_parity_adbc_release.db");
+adbc::execute(db, "create table t (x integer)");
+adbc::begin(db);
+adbc::execute(db, "insert into t values (1)");
 let db = 0;
-let other = adbc_connect("@SQLITE_DRIVER@", "file:/tmp/ibex_parity_adbc_release.db");
-adbc_execute(other, "drop table t");
-let tables = adbc_tables(other);
+let other = adbc::connect("@SQLITE_DRIVER@", "file:/tmp/ibex_parity_adbc_release.db");
+adbc::execute(other, "drop table t");
+let tables = adbc::tables(other);
 tables[select { n = count() }];

@@ -1,4 +1,4 @@
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
 
 // Streamed scan over a Categorical column whose dictionary differs per row
 // group (pipelined-execution plan, Phase 1). The file is the one
@@ -13,9 +13,9 @@ extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 // this asserts.
 //
 // It is a separate file from the writer because only a batch-eligible script
-// reaches the streaming path, and a script with a write_parquet side effect is
+// reaches the streaming path, and a script with a parquet::write side effect is
 // not one. Nothing in PDS-H is dictionary-encoded, so this is the only
 // coverage that remap has.
-let back = read_parquet("tests/data/parquet_categorical_check_out.parquet");
+let back = parquet::read("tests/data/parquet_categorical_check_out.parquet");
 
 back[select { n = count() }, by { cat }, order { cat }];

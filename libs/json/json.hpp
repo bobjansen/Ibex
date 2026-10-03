@@ -5,8 +5,8 @@
 // Ibex JSON library — row-oriented JSON reading and writing via nlohmann/json.
 //
 // Reading:
-//   extern fn read_json(path: String) -> DataFrame from "json.hpp";
-//   let df = read_json("data/myfile.json");
+//   extern fn json::read(path: String) -> DataFrame from "json.hpp";
+//   let df = json::read("data/myfile.json");
 //
 // The input file must contain either:
 //   1. A JSON array of objects (row-oriented):
@@ -16,8 +16,8 @@
 //        {"a":2,"b":"y"}
 //
 // Writing:
-//   extern fn write_json(df: DataFrame, path: String) -> Int from "json.hpp";
-//   let rows = write_json(df, "data/out.json");
+//   extern fn json::write(df: DataFrame, path: String) -> Int from "json.hpp";
+//   let rows = json::write(df, "data/out.json");
 //
 // Output is a JSON array of objects with proper type preservation.
 
@@ -77,16 +77,16 @@ inline auto json_parse_file(std::string_view path) -> std::vector<json> {
     std::error_code ec;
     const bool exists = std::filesystem::exists(path_str, ec);
     if (ec) {
-        throw std::runtime_error("read_json: failed to inspect path '" + path_str +
+        throw std::runtime_error("json::read: failed to inspect path '" + path_str +
                                  "': " + ec.message());
     }
     if (!exists) {
-        throw std::runtime_error("read_json: file not found: '" + path_str + "'");
+        throw std::runtime_error("json::read: file not found: '" + path_str + "'");
     }
 
     std::ifstream ifs{path_str};
     if (!ifs) {
-        throw std::runtime_error("read_json: failed to open '" + path_str + "'");
+        throw std::runtime_error("json::read: failed to open '" + path_str + "'");
     }
 
     // Try to parse as a single JSON value first (array or object).
@@ -121,10 +121,14 @@ inline auto json_parse_file(std::string_view path) -> std::vector<json> {
         // Single object → one-row DataFrame
         return {std::move(parsed)};
     }
-    throw std::runtime_error("read_json: expected array of objects or JSON-Lines");
+    throw std::runtime_error("json::read: expected array of objects or JSON-Lines");
 }
 
 }  // namespace
+
+// Inside this namespace a bare `json` names it, not nlohmann's alias: that is
+// `::json`.
+namespace ibex::ext::json {
 
 /// Read a JSON file into a Table.
 ///
@@ -135,7 +139,7 @@ inline auto json_parse_file(std::string_view path) -> std::vector<json> {
 ///   - All string → String (with categorical compression for low cardinality)
 ///   - Mixed types → String
 ///   - Missing/null values → null bitmap
-inline auto read_json(std::string_view path) -> ibex::runtime::Table {
+inline auto read(std::string_view path) -> ibex::runtime::Table {
     auto rows = json_parse_file(path);
     if (rows.empty()) {
         return ibex::runtime::Table{};
@@ -148,7 +152,7 @@ inline auto read_json(std::string_view path) -> ibex::runtime::Table {
 
     for (const auto& row : rows) {
         if (!row.is_object()) {
-            throw std::runtime_error("read_json: each row must be a JSON object");
+            throw std::runtime_error("json::read: each row must be a JSON object");
         }
         for (auto it = row.begin(); it != row.end(); ++it) {
             auto idx_it = col_index.find(it.key());
@@ -300,6 +304,8 @@ inline auto read_json(std::string_view path) -> ibex::runtime::Table {
     return table;
 }
 
+}  // namespace ibex::ext::json
+
 namespace {
 
 /// Write one cell of a column at row `r` as a JSON value.
@@ -333,26 +339,28 @@ inline auto json_cell_value(const ibex::runtime::ColumnEntry& entry, std::size_t
 
 }  // namespace
 
+namespace ibex::ext::json {
+
 /// Write `table` to a JSON file at `path`.
 ///
 /// Output format is a JSON array of objects. Null values are represented
 /// as JSON null. Returns the number of rows written.
-inline auto write_json(const ibex::runtime::Table& table, std::string_view path) -> std::int64_t {
+inline auto write(const ibex::runtime::Table& table, std::string_view path) -> std::int64_t {
     std::string path_str{path};
     std::ofstream ofs{path_str};
     if (!ofs) {
-        throw std::runtime_error("write_json: cannot open for writing: " + path_str);
+        throw std::runtime_error("json::write: cannot open for writing: " + path_str);
     }
 
     const auto& cols = table.columns;
     const std::size_t n_cols = cols.size();
     const std::size_t n_rows = table.rows();
 
-    json arr = json::array();
-    arr.get_ref<json::array_t&>().reserve(n_rows);
+    ::json arr = ::json::array();
+    arr.get_ref<::json::array_t&>().reserve(n_rows);
 
     for (std::size_t r = 0; r < n_rows; ++r) {
-        json obj = json::object();
+        ::json obj = ::json::object();
         for (std::size_t c = 0; c < n_cols; ++c) {
             obj[cols[c].name] = json_cell_value(cols[c], r);
         }
@@ -362,8 +370,10 @@ inline auto write_json(const ibex::runtime::Table& table, std::string_view path)
     ofs << arr.dump(2) << '\n';
     ofs.flush();
     if (!ofs) {
-        throw std::runtime_error("write_json: I/O error writing: " + path_str);
+        throw std::runtime_error("json::write: I/O error writing: " + path_str);
     }
 
     return static_cast<std::int64_t>(n_rows);
 }
+
+}  // namespace ibex::ext::json

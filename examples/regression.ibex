@@ -16,7 +16,7 @@
 import "csv";
 import "lightgbm";
 
-let prices = read_csv("examples/data/ohlcv.csv");
+let prices = csv::read("examples/data/ohlcv.csv");
 
 // ── 1. Simple OLS: close price as a function of open and volume ─────────────
 print("══════════ 1. OLS  close ~ open + volume ══════════");

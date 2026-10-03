@@ -50,7 +50,7 @@
 <span class="kw">import</span> <span class="str">"csv"</span>;
 
 <span class="cm">// Read data</span>
-<span class="kw">let</span> df = <span class="fn-name">read_csv</span>(<span class="str">"data.csv"</span>);
+<span class="kw">let</span> df = <span class="fn-name">csv::read</span>(<span class="str">"data.csv"</span>);
 
 <span class="cm">// Transform</span>
 <span class="kw">let</span> out = df[
@@ -61,7 +61,7 @@
 ];
 
 <span class="cm">// Save</span>
-<span class="fn-name">write_csv</span>(out, <span class="str">"out.csv"</span>);</code></pre>
+<span class="fn-name">csv::write</span>(out, <span class="str">"out.csv"</span>);</code></pre>
   </section>
 
   <section class="section">
@@ -201,16 +201,16 @@ df[<span class="kw">model</span> { y ~ x, method = wls,
 <span class="kw">import</span> <span class="str">"json"</span>;
 <span class="kw">import</span> <span class="str">"parquet"</span>;
 
-<span class="kw">let</span> df = <span class="fn-name">read_csv</span>(<span class="str">"in.csv"</span>);
-<span class="fn-name">write_parquet</span>(df, <span class="str">"out.parquet"</span>);</code></pre>
+<span class="kw">let</span> df = <span class="fn-name">csv::read</span>(<span class="str">"in.csv"</span>);
+<span class="fn-name">parquet::write</span>(df, <span class="str">"out.parquet"</span>);</code></pre>
       </article>
       <article class="card">
 <pre><code><span class="kw">import</span> <span class="str">"udp"</span>;
 
 <span class="kw">let</span> s = Stream {
-    source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>, <span class="str">"ts:ts,symbol:str,price:f64,volume:i64"</span>),
+    source    = <span class="fn-name">udp::recv</span>(<span class="num">9001</span>, <span class="str">"ts:ts,symbol:str,price:f64,volume:i64"</span>),
     transform = [<span class="kw">filter</span> price &gt; <span class="num">0</span>],
-    sink      = <span class="fn-name">udp_send</span>(<span class="str">"127.0.0.1"</span>, <span class="num">9002</span>)
+    sink      = <span class="fn-name">udp::send</span>(<span class="str">"127.0.0.1"</span>, <span class="num">9002</span>)
 };</code></pre>
       </article>
     </div>

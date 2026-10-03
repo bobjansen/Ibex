@@ -17,29 +17,29 @@
 //        benchmarking/tpch/queries/q20.ibex
 // ─────────────────────────────────────────────────────────────────────────────
 
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
-extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
+extern fn csv::write(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let supplier_raw = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet") as DataFrame<{
+let supplier_raw = parquet::read("benchmarking/data/tpch/parquet/supplier.parquet") as DataFrame<{
     s_suppkey: Int64,
     s_name: String,
     s_address: String,
     s_nationkey: Int64
 }>;
-let nation_raw = read_parquet("benchmarking/data/tpch/parquet/nation.parquet") as DataFrame<{
+let nation_raw = parquet::read("benchmarking/data/tpch/parquet/nation.parquet") as DataFrame<{
     n_nationkey: Int64,
     n_name: String
 }>;
-let partsupp_raw = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet") as DataFrame<{
+let partsupp_raw = parquet::read("benchmarking/data/tpch/parquet/partsupp.parquet") as DataFrame<{
     ps_partkey: Int64,
     ps_suppkey: Int64,
     ps_availqty: Int64
 }>;
-let part_raw = read_parquet("benchmarking/data/tpch/parquet/part.parquet") as DataFrame<{
+let part_raw = parquet::read("benchmarking/data/tpch/parquet/part.parquet") as DataFrame<{
     p_partkey: Int64,
     p_name: String
 }>;
-let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
+let lineitem_raw = parquet::read("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
     l_partkey: Int64,
     l_suppkey: Int64,
     l_quantity: Int64,
@@ -76,5 +76,5 @@ let result = (
     ][select { ps_suppkey }][distinct { ps_suppkey }]
     join q3 on { ps_suppkey = s_suppkey }
 )[select { s_name, s_address }][order { s_name }];
-write_csv(result, "benchmarking/data/tpch/out/q20.csv");
+csv::write(result, "benchmarking/data/tpch/out/q20.csv");
 result;

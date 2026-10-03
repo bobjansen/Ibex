@@ -10,10 +10,10 @@
 //        benchmarking/tpch/queries/q06.ibex
 // ─────────────────────────────────────────────────────────────────────────────
 
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
-extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
+extern fn csv::write(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
+let lineitem = parquet::read("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
     l_quantity: Int64,
     l_extendedprice: Float64,
     l_discount: Float64,
@@ -26,5 +26,5 @@ let result = lineitem[
         && l_quantity < 24,
     select { revenue = sum(l_extendedprice * l_discount) }
 ];
-write_csv(result, "benchmarking/data/tpch/out/q06.csv");
+csv::write(result, "benchmarking/data/tpch/out/q06.csv");
 result;

@@ -848,7 +848,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             const auto& call = node_cast<ExternCallNode>(node);
             // A call-site schema is what this specific reader call returns, and
             // beats the callee's declared one, which is per-function and so
-            // cannot describe a generic reader like read_parquet.
+            // cannot describe a generic reader like parquet::read.
             if (const auto key = extern_call_site_key(call.callee(), call.args())) {
                 if (auto it = sources.find(*key); it != sources.end()) {
                     return it->second;

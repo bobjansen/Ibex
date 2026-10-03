@@ -16,14 +16,14 @@
 //        benchmarking/tpch/queries/q12.ibex
 // ─────────────────────────────────────────────────────────────────────────────
 
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
-extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
+extern fn csv::write(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet") as DataFrame<{
+let orders = parquet::read("benchmarking/data/tpch/parquet/orders.parquet") as DataFrame<{
     o_orderkey: Int64,
     o_orderpriority: String
 }>;
-let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
+let lineitem = parquet::read("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
     l_orderkey: Int64,
     l_shipdate: Date,
     l_commitdate: Date,
@@ -46,5 +46,5 @@ let result = (orders join lineitem on { o_orderkey = l_orderkey })[
     },
     by { l_shipmode }
 ][order { l_shipmode }];
-write_csv(result, "benchmarking/data/tpch/out/q12.csv");
+csv::write(result, "benchmarking/data/tpch/out/q12.csv");
 result;

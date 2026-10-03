@@ -122,7 +122,7 @@ struct ScalarArg {
 /// result so the generated call site can convert it to the parameter's type.
 [[nodiscard]] auto scalar_arg(const ir::Expr& expr) -> ScalarArg;
 
-/// Publish a compiled program's own command-line arguments to `parse_args`,
+/// Publish a compiled program's own command-line arguments to `args::parse`,
 /// which reads them from `IBEX_ARGS` (one entry per line) — the compiled
 /// equivalent of `ibex script.ibex -- <args>`. A no-op when `argc <= 1`, so an
 /// `IBEX_ARGS` already in the environment still applies to an argument-less run.

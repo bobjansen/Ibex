@@ -157,9 +157,9 @@ IBEX_QUANT_STEP_LABELS = [
 
 def ibex_quant_script_text(ohlcv: pathlib.Path, fund: pathlib.Path, steps: list[str], repeats: int) -> str:
     script = [
-        'extern fn read_csv(path: String) -> DataFrame from "csv.hpp";',
-        f'let ohlcv = read_csv("{ohlcv}");',
-        f'let fund = read_csv("{fund}");',
+        'extern fn csv::read(path: String) -> DataFrame from "csv.hpp";',
+        f'let ohlcv = csv::read("{ohlcv}");',
+        f'let fund = csv::read("{fund}");',
     ]
     block = "\n\n".join(steps)
     script.extend(block for _ in range(repeats))

@@ -43,7 +43,7 @@ static auto contains(const std::string& haystack, const std::string& needle) -> 
 
 // Helper: create a leaf ExternCallNode representing a table data source.
 static auto make_source(ir::Builder& b, std::string_view path) -> ir::NodePtr {
-    return b.extern_call("read_csv", {ir::Expr{ir::Literal{std::string(path)}}});
+    return b.extern_call("csv::read", {ir::Expr{ir::Literal{std::string(path)}}});
 }
 
 // --- ExternCall ---------------------------------------------------------------
@@ -55,14 +55,14 @@ TEST_CASE("emitter: extern call node", "[codegen]") {
 
     CHECK(contains(out, "#include <ibex/runtime/ops.hpp>"));
     CHECK(contains(out, "int main()"));
-    CHECK(contains(out, "read_csv(\"trades.csv\")"));
+    CHECK(contains(out, "csv::read(\"trades.csv\")"));
     CHECK(contains(out, "ibex::ops::print("));
     CHECK(contains(out, "return 0;"));
 }
 
 TEST_CASE("lower/codegen: table extern named args are bound before emission", "[codegen]") {
     const char* src = R"(
-extern fn read_csv(
+extern fn csv::read(
     path: String,
     nulls: String = "",
     delimiter: String = ",",
@@ -70,7 +70,7 @@ extern fn read_csv(
     schema: String = ""
 ) -> DataFrame from "csv.hpp";
 
-read_csv("employees.csv", nulls = "<empty>", schema = "id:int,name:str");
+csv::read("employees.csv", nulls = "<empty>", schema = "id:int,name:str");
 )";
 
     auto parsed = parser::parse(src);
@@ -79,7 +79,7 @@ read_csv("employees.csv", nulls = "<empty>", schema = "id:int,name:str");
     REQUIRE(lowered.has_value());
 
     auto out = emit_to_string(**lowered);
-    CHECK(contains(out, R"(read_csv("employees.csv", "<empty>", ",", 1, "id:int,name:str"))"));
+    CHECK(contains(out, R"(csv::read("employees.csv", "<empty>", ",", 1, "id:int,name:str"))"));
 }
 
 TEST_CASE("lower/codegen: a qualified extern is called by its ibex::ext C++ name", "[codegen]") {
@@ -98,7 +98,7 @@ fs::list("data", "*.csv");
     auto out = emit_to_string(**lowered);
     CHECK(contains(out, R"(ibex::ext::fs::list("data", "*.csv"))"));
     CHECK(codegen::cpp_extern_name("adbc::Connection") == "ibex::ext::adbc::Connection");
-    CHECK(codegen::cpp_extern_name("read_csv") == "read_csv");
+    CHECK(codegen::cpp_extern_name("my_extern") == "my_extern");
 }
 
 // --- Filter ------------------------------------------------------------------
@@ -110,7 +110,7 @@ TEST_CASE("emitter: filter node - int64 predicate", "[codegen]") {
     filter->add_child(make_source(b, "data.csv"));
 
     auto out = emit_to_string(*filter);
-    CHECK(contains(out, "read_csv(\"data.csv\")"));
+    CHECK(contains(out, "csv::read(\"data.csv\")"));
     CHECK(contains(out, "ibex::ops::filter("));
     CHECK(contains(out, "ibex::ir::CompareOp::Gt"));
     CHECK(contains(out, "std::int64_t{100}"));
@@ -207,7 +207,7 @@ TEST_CASE("emitter: distinct node", "[codegen]") {
 
     auto out = emit_to_string(*distinct);
     CHECK(contains(out, "ibex::ops::distinct("));
-    CHECK(contains(out, "read_csv(\"trades.csv\")"));
+    CHECK(contains(out, "csv::read(\"trades.csv\")"));
 }
 
 TEST_CASE("emitter: order node", "[codegen]") {
@@ -599,7 +599,7 @@ TEST_CASE("emitter: filter then project pipeline", "[codegen]") {
     proj->add_child(std::move(filter));
 
     auto out = emit_to_string(*proj);
-    auto pos_source = out.find("read_csv(");
+    auto pos_source = out.find("csv::read(");
     auto pos_filter = out.find("ibex::ops::filter(");
     auto pos_proj = out.find("ibex::ops::project(");
     REQUIRE(pos_source != std::string::npos);
@@ -817,7 +817,7 @@ TEST_CASE("emitter: extern headers in config", "[codegen]") {
 
 TEST_CASE("emitter: escape quotes in extern call arg", "[codegen]") {
     ir::Builder b;
-    auto root = b.extern_call("read_csv",
+    auto root = b.extern_call("csv::read",
                               {ir::Expr{ir::Literal{std::string{R"(path/with "quotes".csv)"}}}});
     auto out = emit_to_string(*root);
     CHECK(contains(out, R"(path/with \"quotes\".csv)"));
@@ -859,9 +859,9 @@ TEST_CASE("emitter: rbind emits a brace-init ops::rbind over its children", "[co
 
     auto out = emit_to_string(*node);
     CHECK(contains(out, "ibex::ops::rbind({"));
-    CHECK(contains(out, "read_csv(\"jan.csv\")"));
-    CHECK(contains(out, "read_csv(\"feb.csv\")"));
-    CHECK(contains(out, "read_csv(\"mar.csv\")"));
+    CHECK(contains(out, "csv::read(\"jan.csv\")"));
+    CHECK(contains(out, "csv::read(\"feb.csv\")"));
+    CHECK(contains(out, "csv::read(\"mar.csv\")"));
 }
 
 // --- like ---------------------------------------------------------------------
@@ -949,16 +949,16 @@ TEST_CASE("emitter: a script runs its steps in order and a sink sees its input",
     codegen::Emitter::Script script;
     codegen::Emitter::Script::Step sink;
     sink.kind = codegen::Emitter::Script::Step::Kind::Sink;
-    sink.callee = "write_csv";
+    sink.callee = "csv::write";
     sink.plan = first.get();
     sink.args.push_back(ir::Expr{ir::Literal{std::string("copy.csv")}});
     script.steps.push_back(std::move(sink));
     script.result = result.get();
 
     const auto out = emit_script_to_string(script);
-    const auto read_in = out.find("read_csv(\"in.csv\")");
-    const auto write = out.find("write_csv(t0, \"copy.csv\")");
-    const auto read_out = out.find("read_csv(\"out.csv\")");
+    const auto read_in = out.find("csv::read(\"in.csv\")");
+    const auto write = out.find("csv::write(t0, \"copy.csv\")");
+    const auto read_out = out.find("csv::read(\"out.csv\")");
     REQUIRE(read_in != std::string::npos);
     REQUIRE(write != std::string::npos);
     REQUIRE(read_out != std::string::npos);
@@ -976,7 +976,7 @@ TEST_CASE("emitter: a script's result reuses the table its sink consumed", "[cod
     codegen::Emitter::Script script;
     codegen::Emitter::Script::Step sink;
     sink.kind = codegen::Emitter::Script::Step::Kind::Sink;
-    sink.callee = "write_csv";
+    sink.callee = "csv::write";
     sink.plan = plan.get();
     sink.args.push_back(ir::Expr{ir::Literal{std::string("copy.csv")}});
     sink.input_binding = "result";
@@ -985,9 +985,9 @@ TEST_CASE("emitter: a script's result reuses the table its sink consumed", "[cod
     script.result_binding = "result";
 
     const auto out = emit_script_to_string(script);
-    const auto first = out.find("read_csv(\"in.csv\")");
+    const auto first = out.find("csv::read(\"in.csv\")");
     REQUIRE(first != std::string::npos);
-    CHECK(out.find("read_csv(\"in.csv\")", first + 1) == std::string::npos);
+    CHECK(out.find("csv::read(\"in.csv\")", first + 1) == std::string::npos);
     CHECK(contains(out, "ibex::ops::print(t0)"));
 }
 
@@ -1005,7 +1005,7 @@ TEST_CASE("emitter: a scan of a shared binding resolves to the step that built i
     script.result = result.get();
 
     const auto out = emit_script_to_string(script);
-    CHECK(contains(out, "auto t0 = read_csv(\"in.csv\")"));
+    CHECK(contains(out, "auto t0 = ibex::ext::csv::read(\"in.csv\")"));
     CHECK(contains(out, "ibex::ops::print(t0)"));
 }
 
@@ -1018,7 +1018,7 @@ TEST_CASE("emitter: a bound sink and a bound call store their results as scalars
     codegen::Emitter::Script script;
     codegen::Emitter::Script::Step sink;
     sink.kind = codegen::Emitter::Script::Step::Kind::Sink;
-    sink.callee = "write_csv";
+    sink.callee = "csv::write";
     sink.plan = input.get();
     sink.args.push_back(ir::Expr{ir::Literal{std::string("copy.csv")}});
     sink.bind = "rows";
@@ -1040,7 +1040,7 @@ TEST_CASE("emitter: a bound sink and a bound call store their results as scalars
     // The registry exists, and each call's result lands in it, in step order.
     const auto registry = out.find("ibex::runtime::ScalarRegistry _ibex_scalars;");
     const auto rows = out.find(
-        "_ibex_scalars[\"rows\"] = ibex::runtime::ScalarValue(write_csv(t0, "
+        "_ibex_scalars[\"rows\"] = ibex::runtime::ScalarValue(ibex::ext::csv::write(t0, "
         "\"copy.csv\"))");
     const auto pong = out.find("_ibex_scalars[\"pong\"] = ibex::runtime::ScalarValue(ping(");
     REQUIRE(registry != std::string::npos);
@@ -1067,7 +1067,7 @@ TEST_CASE("emitter: a deferred scalar step runs where it is, not before the othe
     codegen::Emitter::Script script;
     codegen::Emitter::Script::Step sink;
     sink.kind = codegen::Emitter::Script::Step::Kind::Sink;
-    sink.callee = "write_csv";
+    sink.callee = "csv::write";
     sink.plan = first.get();
     sink.args.push_back(ir::Expr{ir::Literal{std::string("rewritten.csv")}});
     script.steps.push_back(std::move(sink));
@@ -1084,8 +1084,8 @@ TEST_CASE("emitter: a deferred scalar step runs where it is, not before the othe
     emitter.emit(oss, script, config);
     const auto out = oss.str();
 
-    const auto write = out.find("write_csv(t0, \"rewritten.csv\")");
-    const auto scalar_read = out.find("read_csv(\"scalar_source.csv\")");
+    const auto write = out.find("csv::write(t0, \"rewritten.csv\")");
+    const auto scalar_read = out.find("csv::read(\"scalar_source.csv\")");
     REQUIRE(write != std::string::npos);
     REQUIRE(scalar_read != std::string::npos);
     CHECK(write < scalar_read);

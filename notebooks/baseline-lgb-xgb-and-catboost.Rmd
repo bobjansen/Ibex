@@ -109,10 +109,10 @@ ensure_optiver_parquet <- function(train_csv, train_parquet, plugin_paths, repo_
   on.exit(unlink(stage_script), add = TRUE)
 
   script_lines <- c(
-    'extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";',
-    'extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";',
-    sprintf('let train = read_csv("%s", "<empty>");', escape_ibex_string(train_csv)),
-    sprintf('write_parquet(train, "%s");', escape_ibex_string(train_parquet)),
+    'extern fn csv::read(path: String, nulls: String) -> DataFrame from "csv.hpp";',
+    'extern fn parquet::write(df: DataFrame, path: String) -> Int from "parquet.hpp";',
+    sprintf('let train = csv::read("%s", "<empty>");', escape_ibex_string(train_csv)),
+    sprintf('parquet::write(train, "%s");', escape_ibex_string(train_parquet)),
     'train[select { rows = count() }];'
   )
   writeLines(script_lines, stage_script)
@@ -145,8 +145,8 @@ sess <- create_session(plugin_paths = plugin_paths)
 ```
 
 ```{ibex load-train, session="optiver", scalars=list(train_parquet=train_parquet), quiet=TRUE}
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
-let train = read_parquet(train_parquet);
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
+let train = parquet::read(train_parquet);
 ```
 
 ```{r define-train-work}
@@ -408,6 +408,6 @@ print(scatter_plot)
 ## Notes
 
 - The original notebook used pretrained models for Kaggle inference. This R version is set up for local training instead.
-- The expensive part remains `read_csv(...)`; using an Ibex session ensures it happens once per knit.
+- The expensive part remains `csv::read(...)`; using an Ibex session ensures it happens once per knit.
 - The feature engineering stays close to the notebook logic and now runs fully through the Ibex feature query before the model handoff to R.
 - If you want a full-size run, increase `params$max_date_id` or set it to `NULL`, and increase `params$sample_rows`.

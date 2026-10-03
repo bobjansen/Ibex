@@ -14,7 +14,7 @@ import data_gen;
 
 // Generate synthetic ticks with a mean 1-second interval.
 seed_rng(42);
-let ticks = gen_ticks(10000000, "TICK", 100.0, 0.0, 1000.0, 1);
+let ticks = gen::ticks(10000000, "TICK", 100.0, 0.0, 1000.0, 1);
 
 // ── 1. Sort by timestamp and promote to a time-indexed DataFrame ──────────────
 //   as_timeframe checks that the key column is sorted (O(n)), reorders if not,

@@ -104,10 +104,10 @@ using SourceSchemas = robin_hood::unordered_map<std::string, SchemaInfo>;
 [[nodiscard]] auto infer_schema(const Node& node, const SourceSchemas& sources = {}) -> SchemaInfo;
 
 /// Key identifying one reader *call site* in a `SourceSchemas`, e.g.
-/// `read_parquet("data/lineitem.parquet")`.
+/// `parquet::read("data/lineitem.parquet")`.
 ///
 /// A declared reader return schema is keyed by the bare callee, which assumes
-/// one schema per function. That is false for a generic reader: `read_parquet`
+/// one schema per function. That is false for a generic reader: `parquet::read`
 /// yields a different schema for every path. So a caller that knows what a
 /// specific call site returns -- the driver, which can read the footer -- keys
 /// it by this instead, and `infer_schema` prefers it over the bare callee.

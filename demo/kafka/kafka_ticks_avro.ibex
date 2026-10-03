@@ -1,10 +1,10 @@
 import "kafka";
 import "websocket";
 
-ws_listen(8775);
+ws::listen(8775);
 
 let ticks = Stream {
-    source = kafka_recv_avro(
+    source = kafka::recv_avro(
         brokers = "localhost:19092",
         topic = "ticks_avro",
         group = "ibex-demo-summary-avro",
@@ -19,7 +19,7 @@ let ticks = Stream {
         total_size = sum(size)
     }],
 
-    sink = ws_send(8775)
+    sink = ws::send(8775)
 };
 
 ticks;

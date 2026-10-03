@@ -15,12 +15,12 @@
 
 extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* registry) {
     registry->register_table(
-        "kafka_recv",
+        "kafka::recv",
         [](const ibex::runtime::ExternArgs& args)
             -> std::expected<ibex::runtime::ExternValue, std::string> {
             if (args.size() != 4 && args.size() != 5) {
                 return std::unexpected(
-                    "kafka_recv(brokers, topic, group, schema[, options]) expects 4 or 5 string "
+                    "kafka::recv(brokers, topic, group, schema[, options]) expects 4 or 5 string "
                     "arguments");
             }
             const auto* brokers = std::get_if<std::string>(&args[0]);
@@ -29,7 +29,7 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
             const auto* schema = std::get_if<std::string>(&args[3]);
             if (brokers == nullptr || topic == nullptr || group == nullptr || schema == nullptr) {
                 return std::unexpected(
-                    "kafka_recv(brokers, topic, group, schema[, options]) expects string "
+                    "kafka::recv(brokers, topic, group, schema[, options]) expects string "
                     "arguments");
             }
             std::string options;
@@ -37,7 +37,7 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
                 const auto* option_text = std::get_if<std::string>(&args[4]);
                 if (option_text == nullptr) {
                     return std::unexpected(
-                        "kafka_recv(..., options) expects the options argument to be a string");
+                        "kafka::recv(..., options) expects the options argument to be a string");
                 }
                 options = *option_text;
             }
@@ -45,12 +45,12 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
         });
 
     registry->register_table(
-        "kafka_recv_avro",
+        "kafka::recv_avro",
         [](const ibex::runtime::ExternArgs& args)
             -> std::expected<ibex::runtime::ExternValue, std::string> {
             if (args.size() != 5 && args.size() != 6) {
                 return std::unexpected(
-                    "kafka_recv_avro(brokers, topic, group, schema, registry_url[, options]) "
+                    "kafka::recv_avro(brokers, topic, group, schema, registry_url[, options]) "
                     "expects 5 or 6 string arguments");
             }
             const auto* brokers = std::get_if<std::string>(&args[0]);
@@ -61,7 +61,7 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
             if (brokers == nullptr || topic == nullptr || group == nullptr || schema == nullptr ||
                 registry_url == nullptr) {
                 return std::unexpected(
-                    "kafka_recv_avro(brokers, topic, group, schema, registry_url[, options]) "
+                    "kafka::recv_avro(brokers, topic, group, schema, registry_url[, options]) "
                     "expects string arguments");
             }
             std::string options;
@@ -69,7 +69,7 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
                 const auto* option_text = std::get_if<std::string>(&args[5]);
                 if (option_text == nullptr) {
                     return std::unexpected(
-                        "kafka_recv_avro(..., options) expects the options argument to be a "
+                        "kafka::recv_avro(..., options) expects the options argument to be a "
                         "string");
                 }
                 options = *option_text;
@@ -79,25 +79,25 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
         });
 
     registry->register_scalar_table_consumer(
-        "kafka_send", ibex::runtime::ScalarKind::Int,
+        "kafka::send", ibex::runtime::ScalarKind::Int,
         [](const ibex::runtime::Table& table, const ibex::runtime::ExternArgs& args)
             -> std::expected<ibex::runtime::ExternValue, std::string> {
             if (args.size() != 2 && args.size() != 3) {
                 return std::unexpected(
-                    "kafka_send(df, brokers, topic[, options]) expects 2 or 3 string arguments");
+                    "kafka::send(df, brokers, topic[, options]) expects 2 or 3 string arguments");
             }
             const auto* brokers = std::get_if<std::string>(&args[0]);
             const auto* topic = std::get_if<std::string>(&args[1]);
             if (brokers == nullptr || topic == nullptr) {
                 return std::unexpected(
-                    "kafka_send(df, brokers, topic[, options]) expects string arguments");
+                    "kafka::send(df, brokers, topic[, options]) expects string arguments");
             }
             std::string options;
             if (args.size() == 3) {
                 const auto* option_text = std::get_if<std::string>(&args[2]);
                 if (option_text == nullptr) {
                     return std::unexpected(
-                        "kafka_send(..., options) expects the options argument to be a string");
+                        "kafka::send(..., options) expects the options argument to be a string");
                 }
                 options = *option_text;
             }

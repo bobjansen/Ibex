@@ -76,4 +76,4 @@ The rising-temperature example shows an ordered lag pattern over dates:
 
 The Ibex versions now also use named CSV arguments where that improves
 readability, for example:
-- `read_csv("...", schema = "...")`
+- `csv::read("...", schema = "...")`

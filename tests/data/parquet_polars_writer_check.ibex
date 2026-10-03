@@ -6,9 +6,9 @@
 //
 // One final statement on purpose: the whole-script planner runs only what the
 // result depends on, so a separate statement per check would be dropped.
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
 
-let t = read_parquet("tests/data/parquet_polars_writer_out.parquet") as DataFrame<{
+let t = parquet::read("tests/data/parquet_polars_writer_out.parquet") as DataFrame<{
     id: Int64,
     seg: String,
     note: String

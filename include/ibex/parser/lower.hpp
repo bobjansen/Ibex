@@ -63,7 +63,7 @@ struct SharedBinding {
 };
 
 /// What a preamble call's result is bound to: a scalar, which later queries read
-/// through the scalar registry, or a resource (`let db = adbc_connect(...)`),
+/// through the scalar registry, or a resource (`let db = adbc::connect(...)`),
 /// which is a variable of the program that only resource parameters take.
 struct CallBind {
     std::string name;
@@ -154,7 +154,7 @@ struct LowerContext {
     /// from its function registry; the whole-program `lower()` collects them
     /// from the program's `fn` statements.
     robin_hood::unordered_map<std::string, const FunctionDecl*> functions;
-    /// Lower a table argument of an extern call (`adbc_write(db, df, ...)`'s `df`)
+    /// Lower a table argument of an extern call (`adbc::write(db, df, ...)`'s `df`)
     /// as a binding of its own that the argument names, the way a script does.
     /// Set by a caller that only wants to know whether an expression is a table
     /// (the scalar-binding classifier); the bindings made are dropped with the

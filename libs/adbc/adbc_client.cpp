@@ -192,7 +192,7 @@ struct DriverQuirks {
     /// to the end, in ADBC 24 and on main as of 2026-10-02). libpq then
     /// reports the connection busy, and the driver skips the BEGIN of the
     /// next transaction, whose first statement then commits on its own and
-    /// survives a rollback. adbc_begin runs a query first, which makes libpq
+    /// survives a rollback. adbc::begin runs a query first, which makes libpq
     /// discard the result.
     bool leaves_result_unread = false;
     /// Drops the error of a failed bulk ingest (DuckDB 1.5.6: the appender
@@ -214,17 +214,17 @@ auto quirks_of_vendor(std::string vendor) -> DriverQuirks {
 }
 
 /// One open ADBC database and connection: the value behind an Ibex
-/// `AdbcConnection`. Shared by every binding of it and by the query running on
+/// `adbc::Connection`. Shared by every binding of it and by the query running on
 /// it (a statement lease), so the handles outlive whichever of them drops
 /// first. Allows one active statement at a time.
 ///
 /// Tables imported from a query may keep zero-copy buffers whose release
 /// callbacks live in the driver library. The pinned driver manager never
 /// unloads a driver (`ManagedLibrary::Release` is a no-op, apache/arrow-adbc#204),
-/// so those buffers stay valid after `adbc_close` and after this object is gone.
+/// so those buffers stay valid after `adbc::close` and after this object is gone.
 class AdbcSession final : public ibex::runtime::Resource {
    public:
-    static constexpr std::string_view kTypeName = "AdbcConnection";
+    static constexpr std::string_view kTypeName = "adbc::Connection";
 
     static auto open(const std::string& driver, const std::string& uri,
                      const ParsedOptions& options)
@@ -327,7 +327,7 @@ class AdbcSession final : public ibex::runtime::Resource {
     auto commit() -> std::expected<void, std::string> {
         return with_lease([&]() -> std::expected<void, std::string> {
             if (!in_transaction_) {
-                return std::unexpected("no transaction is open; start one with adbc_begin");
+                return std::unexpected("no transaction is open; start one with adbc::begin");
             }
             if (statement_failed_) {
                 auto rolled_back = end_with_rollback();
@@ -413,7 +413,7 @@ class AdbcSession final : public ibex::runtime::Resource {
     }
 
     /// Record that a query or statement on this connection failed. Inside a
-    /// transaction, that leaves adbc_commit only able to roll back.
+    /// transaction, that leaves adbc::commit only able to roll back.
     void statement_failed() noexcept {
         if (in_transaction_) {
             statement_failed_ = true;
@@ -555,14 +555,14 @@ class AdbcSession final : public ibex::runtime::Resource {
         }
         for (const auto* list : {&options.connection, &options.connection_post}) {
             for (const auto& [key, value] : *list) {
-                // Turning autocommit off opens a transaction adbc_commit
-                // and adbc_close would not know about.
+                // Turning autocommit off opens a transaction adbc::commit
+                // and adbc::close would not know about.
                 if (key == ADBC_CONNECTION_OPTION_AUTOCOMMIT &&
                     value != ADBC_OPTION_VALUE_ENABLED) {
                     return std::unexpected(
                         "the " ADBC_CONNECTION_OPTION_AUTOCOMMIT
-                        " option only accepts true; start a transaction with adbc_begin and "
-                        "end it with adbc_commit or adbc_rollback");
+                        " option only accepts true; start a transaction with adbc::begin and "
+                        "end it with adbc::commit or adbc::rollback");
                 }
             }
         }
@@ -1391,7 +1391,7 @@ auto connect(std::string_view driver, std::string_view uri, std::string_view opt
     }
     auto session = AdbcSession::open(std::string(driver), std::string(uri), *parsed);
     if (!session) {
-        return std::unexpected("adbc_connect: " + session.error());
+        return std::unexpected("adbc::connect: " + session.error());
     }
     return Connection(runtime::ResourcePtr(std::move(*session)));
 }
@@ -1405,9 +1405,9 @@ auto read_source(std::string_view driver, std::string_view uri, std::string_view
     // A connection of its own, released with the source.
     auto session = AdbcSession::open(std::string(driver), std::string(uri), *parsed);
     if (!session) {
-        return std::unexpected("adbc_read: " + session.error());
+        return std::unexpected("adbc::read: " + session.error());
     }
-    return AdbcSourceOperator::create(std::move(*session), std::string(sql), "adbc_read");
+    return AdbcSourceOperator::create(std::move(*session), std::string(sql), "adbc::read");
 }
 
 auto read(std::string_view driver, std::string_view uri, std::string_view sql,
@@ -1417,23 +1417,23 @@ auto read(std::string_view driver, std::string_view uri, std::string_view sql,
 
 auto query(const Connection& db, std::string_view sql, const TablePtr& params)
     -> std::expected<runtime::Table, std::string> {
-    auto session = session_of(db, "adbc_query");
+    auto session = session_of(db, "adbc::query");
     if (!session) {
         return std::unexpected(session.error());
     }
     return materialize(
-        AdbcSourceOperator::create(std::move(*session), std::string(sql), "adbc_query", params));
+        AdbcSourceOperator::create(std::move(*session), std::string(sql), "adbc::query", params));
 }
 
 auto execute(const Connection& db, std::string_view sql, const TablePtr& params)
     -> std::expected<std::int64_t, std::string> {
-    auto session = session_of(db, "adbc_execute");
+    auto session = session_of(db, "adbc::execute");
     if (!session) {
         return std::unexpected(session.error());
     }
     auto statement = LeasedStatement::open(std::move(*session));
     if (!statement) {
-        return std::unexpected("adbc_execute: " + statement.error());
+        return std::unexpected("adbc::execute: " + statement.error());
     }
     auto& stmt = **statement;
     auto rows =
@@ -1464,23 +1464,23 @@ auto execute(const Connection& db, std::string_view sql, const TablePtr& params)
         });
     if (!rows) {
         stmt.failed();
-        return std::unexpected("adbc_execute: " + rows.error());
+        return std::unexpected("adbc::execute: " + rows.error());
     }
     return *rows;
 }
 
 auto write(const Connection& db, const TablePtr& table, std::string_view target,
            std::string_view mode) -> std::expected<std::int64_t, std::string> {
-    auto session = session_of(db, "adbc_write");
+    auto session = session_of(db, "adbc::write");
     if (!session) {
         return std::unexpected(session.error());
     }
     if (table == nullptr) {
-        return std::unexpected("adbc_write(db, df, table, mode) expects a DataFrame");
+        return std::unexpected("adbc::write(db, df, table, mode) expects a DataFrame");
     }
     const auto adbc_mode = ingest_mode(mode);
     if (!adbc_mode) {
-        return std::unexpected("adbc_write: unknown mode '" + std::string(mode) +
+        return std::unexpected("adbc::write: unknown mode '" + std::string(mode) +
                                "'; expected create, append, replace or create_append");
     }
     const std::string target_name(target);
@@ -1492,14 +1492,14 @@ auto write(const Connection& db, const TablePtr& table, std::string_view target,
     const bool creates = *adbc_mode != std::string_view(ADBC_INGEST_OPTION_MODE_APPEND);
     if (batched && creates && (*session)->in_transaction()) {
         return std::unexpected(
-            "adbc_write: MySQL commits the open transaction when it creates or drops a table, "
-            "so inside adbc_begin only mode \"append\" is supported; create the table "
-            "before adbc_begin");
+            "adbc::write: MySQL commits the open transaction when it creates or drops a table, "
+            "so inside adbc::begin only mode \"append\" is supported; create the table "
+            "before adbc::begin");
     }
 
     auto statement = LeasedStatement::open(std::move(*session));
     if (!statement) {
-        return std::unexpected("adbc_write: " + statement.error());
+        return std::unexpected("adbc::write: " + statement.error());
     }
     auto& stmt = **statement;
     const auto ingest = [&](const char* ingest_mode,
@@ -1530,59 +1530,59 @@ auto write(const Connection& db, const TablePtr& table, std::string_view target,
             });
     if (!rows) {
         stmt.failed();
-        return std::unexpected("adbc_write: " + rows.error());
+        return std::unexpected("adbc::write: " + rows.error());
     }
     // The driver's count, or the table's row count when the driver reports none.
     return *rows >= 0 ? *rows : static_cast<std::int64_t>(table->rows());
 }
 
 auto tables(const Connection& db) -> std::expected<runtime::Table, std::string> {
-    auto session = session_of(db, "adbc_tables");
+    auto session = session_of(db, "adbc::tables");
     if (!session) {
         return std::unexpected(session.error());
     }
-    return run_metadata(**session, "adbc_tables", [&] { return list_tables(**session); });
+    return run_metadata(**session, "adbc::tables", [&] { return list_tables(**session); });
 }
 
 auto table_schema(const Connection& db, std::string_view table, std::string_view schema,
                   std::string_view catalog) -> std::expected<runtime::Table, std::string> {
-    auto session = session_of(db, "adbc_table_schema");
+    auto session = session_of(db, "adbc::table_schema");
     if (!session) {
         return std::unexpected(session.error());
     }
     const std::string table_name(table);
     const std::string schema_name(schema);
     const std::string catalog_name(catalog);
-    return run_metadata(**session, "adbc_table_schema", [&] {
+    return run_metadata(**session, "adbc::table_schema", [&] {
         return describe_table(**session, table_name, schema_name, catalog_name);
     });
 }
 
 auto begin(const Connection& db) -> std::expected<std::int64_t, std::string> {
-    return transaction_call(db, "adbc_begin", [](AdbcSession& session) {
+    return transaction_call(db, "adbc::begin", [](AdbcSession& session) {
         return session.begin().transform([] { return true; });
     });
 }
 
 auto commit(const Connection& db) -> std::expected<std::int64_t, std::string> {
-    return transaction_call(db, "adbc_commit", [](AdbcSession& session) {
+    return transaction_call(db, "adbc::commit", [](AdbcSession& session) {
         return session.commit().transform([] { return true; });
     });
 }
 
 auto rollback(const Connection& db) -> std::expected<std::int64_t, std::string> {
-    return transaction_call(db, "adbc_rollback",
+    return transaction_call(db, "adbc::rollback",
                             [](AdbcSession& session) { return session.rollback(); });
 }
 
 auto close(const Connection& db) -> std::expected<std::int64_t, std::string> {
-    auto session = session_of(db, "adbc_close");
+    auto session = session_of(db, "adbc::close");
     if (!session) {
         return std::unexpected(session.error());
     }
     auto closed = (*session)->close();
     if (!closed) {
-        return std::unexpected("adbc_close: " + closed.error());
+        return std::unexpected("adbc::close: " + closed.error());
     }
     return std::int64_t{*closed ? 1 : 0};
 }

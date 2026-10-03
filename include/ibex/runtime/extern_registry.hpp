@@ -167,18 +167,18 @@ class ExternArgs : public std::vector<ScalarValue> {
 using ExternFn = std::function<std::expected<ExternValue, std::string>(const ExternArgs&)>;
 
 /// Function signature for extern functions whose first argument is a DataFrame.
-/// Used by write operations (e.g. write_csv, write_parquet).
+/// Used by write operations (e.g. csv::write, parquet::write).
 using ExternTableConsumerFn =
     std::function<std::expected<ExternValue, std::string>(const Table&, const ExternArgs&)>;
 
 /// Function signature for extern functions that produce a chunked table
-/// source. Used by streaming readers (e.g. read_csv on the chunked path)
+/// source. Used by streaming readers (e.g. csv::read on the chunked path)
 /// to return an operator that the interpreter can drain chunk by chunk.
 using ExternChunkedTableFn =
     std::function<std::expected<OperatorPtr, std::string>(const ExternArgs&)>;
 
 /// Function signature for extern functions that produce a lazily-decoded table
-/// source (e.g. read_parquet). Returns a handle carrying the schema, from which
+/// source (e.g. parquet::read). Returns a handle carrying the schema, from which
 /// the interpreter materializes only the columns a query references.
 using ExternLazyTableFn =
     std::function<std::expected<LazyTablePtr, std::string>(const ExternArgs&)>;
@@ -325,7 +325,8 @@ class ExternRegistry {
 
     /// Register a scalar-returning extern function whose first argument is a DataFrame.
     /// The registered function receives the DataFrame as a first argument, followed by the
-    /// remaining scalar arguments.  Used for write operations such as write_csv and write_parquet.
+    /// remaining scalar arguments.  Used for write operations such as csv::write and
+    /// parquet::write.
     void register_scalar_table_consumer(std::string name, ScalarKind kind,
                                         ExternTableConsumerFn func) {
         ExternFunction ef;

@@ -260,7 +260,7 @@ struct MeltClause {
 
 /// Row-wise `map { name = expr, ... }`: evaluate the field expressions once per
 /// input row, with that row's columns in scope as scalars. Cell expressions may
-/// call effectful externs (`read_csv`, `write_parquet`). Output is one row per
+/// call effectful externs (`csv::read`, `parquet::write`). Output is one row per
 /// input row with exactly the named columns. Must be the last clause of a block.
 struct MapClause {
     std::vector<Field> fields;
@@ -451,7 +451,7 @@ struct JoinExpr {
 /// sink_callee / sink_args — the table-consumer extern that receives each output batch;
 ///             the stream runtime prepends the output Table as the first argument.
 struct StreamExpr {
-    ExprPtr source;                 ///< source call expression (e.g. udp_recv(9001))
+    ExprPtr source;                 ///< source call expression (e.g. udp::recv(9001))
     std::vector<Clause> transform;  ///< anonymous block clauses
     std::string sink_callee;        ///< name of the sink extern fn
     std::vector<ExprPtr>

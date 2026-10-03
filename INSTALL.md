@@ -41,8 +41,8 @@ IBEX_LIBRARY_PATH=./build/tools ./build/tools/ibex
 ```ibex
 import "csv";
 import "json";
-let df = read_csv("data.csv");
-write_json(df, "data.json");
+let df = csv::read("data.csv");
+json::write(df, "data.json");
 ```
 
 ## Parquet Plugin

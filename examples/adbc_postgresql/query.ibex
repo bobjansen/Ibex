@@ -4,7 +4,7 @@
 import "adbc";
 import "args";
 
-let args = parse_args("
+let args = args::parse("
     driver (d) : string?
     uri        : string?
     sql        : string
@@ -14,4 +14,4 @@ let uri = coalesce(scalar(args[filter name == "uri", select { value }]),
     "postgresql://postgres:ibex@localhost:55432/postgres");
 let sql = scalar(args[filter name == "sql", select { value }]);
 
-adbc_read(driver, uri, sql);
+adbc::read(driver, uri, sql);

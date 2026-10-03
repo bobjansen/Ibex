@@ -64,10 +64,10 @@ def main():
                "as t(id, price) order by id")
 
         def source(query):
-            return ('import "adbc"; import "csv";\nlet t = adbc_read('
+            return ('import "adbc"; import "csv";\nlet t = adbc::read('
                     + ", ".join(json.dumps(s) for s in (args.driver, args.uri, query))
                     + ')[update { price = Decimal(price, 38, 2) }];\n'
-                    + 'write_csv(t, ' + json.dumps(result_csv.as_posix()) + ');\n')
+                    + 'csv::write(t, ' + json.dumps(result_csv.as_posix()) + ');\n')
 
         script.write_text(source(sql), encoding="utf-8")
         run(script)
@@ -77,7 +77,7 @@ def main():
             raise RuntimeError(f"Decimal values or null did not survive: {actual!r}")
 
         # real is float32 on the wire; it must widen to Float64, not be refused.
-        script.write_text('import "adbc"; import "csv";\nwrite_csv(adbc_read('
+        script.write_text('import "adbc"; import "csv";\ncsv::write(adbc::read('
                           + ", ".join(json.dumps(s) for s in (
                               args.driver, args.uri,
                               "select real_n from ibex_types order by id"))

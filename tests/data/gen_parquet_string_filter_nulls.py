@@ -10,7 +10,7 @@ maps them back to rows. Getting that wrong shifts every value after the first
 null onto the wrong row — which still returns a plausible row count, so the
 test sums a key rather than counting.
 
-`write_parquet` cannot produce this shape, hence pyarrow:
+`parquet::write` cannot produce this shape, hence pyarrow:
 
 - use_dictionary=False keeps the column PLAIN, which is the only encoding the
   fused scan claims (a dictionary column is decoded to codes instead);

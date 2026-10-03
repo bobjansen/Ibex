@@ -21,7 +21,7 @@ fn csv_dir_to_parquet(src_dir: String, dst_dir: String) -> DataFrame {
     list(src_dir, "*.csv")[map {
         source = path,
         target = `${dst_dir}/${stem}.parquet`,
-        rows   = write_parquet(read_csv(path), `${dst_dir}/${stem}.parquet`)
+        rows   = parquet::write(csv::read(path), `${dst_dir}/${stem}.parquet`)
     }];
 }
 

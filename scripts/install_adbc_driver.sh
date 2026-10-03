@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Bob Jansen
 #
-# Install an ADBC driver so `adbc_connect("<name>", ...)` finds it by name.
+# Install an ADBC driver so `adbc::connect("<name>", ...)` finds it by name.
 #
 #   scripts/install_adbc_driver.sh [--dest DIR] sqlite|postgresql|duckdb|mysql ...
 #
@@ -183,7 +183,7 @@ write_manifest() {
         echo "${plat} = '${dest}/$1/$6'"
     } >"$dest/$1.toml"
     echo "Installed $dest/$1/$6"
-    echo "  manifest $dest/$1.toml -> adbc_connect(\"$1\", ...)"
+    echo "  manifest $dest/$1.toml -> adbc::connect(\"$1\", ...)"
 }
 
 for name in "${drivers[@]}"; do

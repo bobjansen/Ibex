@@ -508,7 +508,7 @@ TEST_CASE("CSV decimal(p,s) reads and writes exactly", "[decimal][csv]") {
         std::ofstream out(path);
         out << "id,price\n1,12.30\n2,-0.05\n3,1.005\n4,0.1\n";
     }
-    auto table = read_csv(path.string(), "", ",", true, "id:int,price:decimal(12,2)");
+    auto table = ibex::ext::csv::read(path.string(), "", ",", true, "id:int,price:decimal(12,2)");
     runtime::TableRegistry tables;
     tables.emplace("t", table);
     CHECK(texts(table, "price") == std::vector<std::string>{"12.30", "-0.05", "1.01", "0.10"});
@@ -517,22 +517,23 @@ TEST_CASE("CSV decimal(p,s) reads and writes exactly", "[decimal][csv]") {
           std::vector<std::string>{"13.36"});
 
     const auto out_path = std::filesystem::temp_directory_path() / "ibex_decimal_out.csv";
-    write_csv(table, out_path.string());
+    ibex::ext::csv::write(table, out_path.string());
     std::ifstream in(out_path);
     const std::string written((std::istreambuf_iterator<char>(in)),
                               std::istreambuf_iterator<char>());
     CHECK(contains(written, "12.30"));
     CHECK(contains(written, "-0.05"));
-    auto again = read_csv(out_path.string(), "", ",", true, "id:int,price:decimal(12,2)");
+    auto again =
+        ibex::ext::csv::read(out_path.string(), "", ",", true, "id:int,price:decimal(12,2)");
     CHECK(texts(again, "price") == texts(table, "price"));
 
-    CHECK_THROWS(read_csv(path.string(), "", ",", true, "id:int,price:decimal(40,2)"));
-    CHECK_THROWS(read_csv(path.string(), "", ",", true, "id:int,price:decimal"));
+    CHECK_THROWS(ibex::ext::csv::read(path.string(), "", ",", true, "id:int,price:decimal(40,2)"));
+    CHECK_THROWS(ibex::ext::csv::read(path.string(), "", ",", true, "id:int,price:decimal"));
     {
         std::ofstream out(path);
         out << "id,price\n1,12345.67\n";
     }
-    CHECK_THROWS(read_csv(path.string(), "", ",", true, "id:int,price:decimal(5,2)"));
+    CHECK_THROWS(ibex::ext::csv::read(path.string(), "", ",", true, "id:int,price:decimal(5,2)"));
 }
 
 TEST_CASE("Arrow C Data round-trips decimal128 exactly", "[decimal][interop][arrow]") {

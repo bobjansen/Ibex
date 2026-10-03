@@ -66,7 +66,7 @@ class Emitter {
         /// Emit a callable Table-returning entry point instead of main().
         bool table_entry_point = false;
         std::string entry_point_name = "ibex_generated_execute";
-        /// The script calls `parse_args`: emit `main(int argc, char** argv)` and
+        /// The script calls `args::parse`: emit `main(int argc, char** argv)` and
         /// forward the process argv to `IBEX_ARGS` before the query runs.
         bool forward_cli_args = false;
     };

@@ -103,7 +103,7 @@ if(NOT WIN32)
 endif()
 
 # CURL is optional (see libs/csv/CMakeLists.txt): test_csv.cpp only needs it
-# to exercise read_csv's HTTPS path, which is itself optional.
+# to exercise csv::read's HTTPS path, which is itself optional.
 find_package(CURL)
 
 target_link_libraries(ibex_tests

@@ -1,10 +1,10 @@
 import "kafka";
 import "websocket";
 
-ws_listen(8776);
+ws::listen(8776);
 
 let ohlc = Stream {
-    source = kafka_recv_avro(
+    source = kafka::recv_avro(
         brokers = "localhost:19092",
         topic = "ticks_avro",
         group = "ibex-demo-ohlc-avro",
@@ -20,7 +20,7 @@ let ohlc = Stream {
         close = last(price)
     }],
 
-    sink = ws_send(8776)
+    sink = ws::send(8776)
 };
 
 ohlc;

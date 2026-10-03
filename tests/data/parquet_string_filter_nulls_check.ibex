@@ -1,4 +1,4 @@
-extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
 
 // Nulls through the fused string filter. The fixture
 // (gen_parquet_string_filter_nulls.py) is a PLAIN string column with a null
@@ -10,7 +10,7 @@ extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 // `like(null, p)` is null and a filter keeps only true, so the 300 null rows
 // must be absent from BOTH answers — the one place a predicate and its
 // negation agree rather than partitioning the input.
-let fact = read_parquet("tests/data/parquet_string_filter_nulls_out.parquet");
+let fact = parquet::read("tests/data/parquet_string_filter_nulls_out.parquet");
 
 // Every 3rd row carries the needle; every 5th is null. 400 of the 1500 rows
 // are non-null and divisible by 3; 800 are non-null and not; the remaining

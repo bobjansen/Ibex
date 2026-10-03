@@ -121,8 +121,8 @@ https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv</code></pre>
         must be able to find the bundled plugins. After a release build, start
         it with
         <code>./build-release/tools/ibex --plugin-path ./build-release/tools</code>.
-        Without that plugin path, <code>read_parquet</code> and
-        <code>read_csv</code> are not registered.
+        Without that plugin path, <code>parquet::read</code> and
+        <code>csv::read</code> are not registered.
       </div>
       <div class="heads-up">
         <strong>Heads up &mdash; Pandas + CloudFront.</strong> CloudFront
@@ -151,7 +151,7 @@ https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv</code></pre>
       <h3><span class="label-pill pill-ibex">Ibex</span></h3>
 <pre><code>import "parquet";
 
-let trips = read_parquet(
+let trips = parquet::read(
   "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet");
 
 trips[head 5];
@@ -226,7 +226,7 @@ ORDER BY hour;</code></pre>
 Sys.setenv(TZ = "UTC")
 library(arrow); library(dplyr); library(lubridate)
 
-trips &lt;- read_parquet(
+trips &lt;- parquet::read(
   "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet")
 
 trips |&gt;
@@ -585,7 +585,7 @@ trips |&gt;
       <h3><span class="label-pill pill-ibex">Ibex</span></h3>
 <pre><code>import "csv";
 
-let zones  = read_csv(
+let zones  = csv::read(
   "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv");
 
 let joined = trips join zones on PULocationID == LocationID;

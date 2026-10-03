@@ -3,7 +3,7 @@
 // - additional comma-separated tokens are also treated as null
 import "csv";
 
-let metrics = read_csv("examples/data/null_metrics.txt", "<empty>,NA");
+let metrics = csv::read("examples/data/null_metrics.txt", "<empty>,NA");
 
 // Nulls are represented via validity bitmaps and print as null in REPL.
 metrics;

@@ -6,7 +6,7 @@
 tick_sender.py — synthetic market tick generator for the Ibex UDP stream demo.
 
 Sends JSON-encoded tick datagrams to localhost:9001, one per simulated second.
-Each datagram follows the wire protocol expected by the udp_recv plugin:
+Each datagram follows the wire protocol expected by the udp::recv plugin:
 
     {"ts":<ns_since_epoch>,"symbol":"AAPL","price":<float>,"volume":<int>}
 

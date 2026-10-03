@@ -10,7 +10,7 @@ fan out over. That makes a unit a RANGE of row groups, which every per-unit
 path has to honor: the decode, a selection intersected with the unit, and the
 fused string filter's page stripes.
 
-`write_parquet` cannot write row groups this small, hence pyarrow:
+`parquet::write` cannot write row groups this small, hence pyarrow:
 
 - 4,480,000 rows in row groups of 14,000 gives 320 groups; the unit target is
   4,480,000 / 64 = 70,000 rows, so five groups per unit and exactly 64 units;

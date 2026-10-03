@@ -93,6 +93,46 @@ jobs:
           psql "$PGURI" -v ON_ERROR_STOP=1 -f examples/adbc_postgresql/seed.sql
           python3 examples/adbc_postgresql/check.py --uri "$PGURI"
 
+  # The same plugin, tests and demo on macOS (arm64). No database servers
+  # here: the PostgreSQL and MariaDB tests stay in the Linux job, and this one
+  # covers what is platform-specific -- the install script's macOS wheels and
+  # tarballs, loading a driver by name, and the plugin as a dylib.
+  adbc-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build tools
+        run: brew install ninja
+
+      - name: Install the ADBC drivers
+        run: scripts/install_adbc_driver.sh --dest "$RUNNER_TEMP/adbc-drivers" sqlite duckdb
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DIBEX_WARNINGS_AS_ERRORS=ON \
+            -DIBEX_BUILD_TESTS=ON \
+            -DIBEX_BUILD_TOOLS=ON \
+            -DIBEX_BUILD_PARQUET=OFF \
+            -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
+            -DIBEX_BUILD_LIGHTGBM=OFF \
+            -DIBEX_BUILD_KAFKA=OFF \
+            -DIBEX_BUILD_ADBC=ON \
+            -DADBC_DRIVER_SQLITE_LIBRARY="$(ls "$RUNNER_TEMP"/adbc-drivers/sqlite/libadbc_driver_sqlite.*)"
+
+      - name: Build
+        run: cmake --build build --parallel --target ibex_adbc_plugin ibex_adbc_tests ibex_repl_bin ibex_args_plugin ibex_csv_plugin
+
+      - name: Test
+        env:
+          ADBC_DRIVER_PATH: ${{ runner.temp }}/adbc-drivers
+          IBEX_TEST_DUCKDB_DRIVER: duckdb
+        run: ctest --test-dir build --output-on-failure --no-tests=error -R '^adbc:'
+
   # MSVC build of the same targets. The driver comes from
   # scripts/install_adbc_driver.ps1, which also registers it under
   # HKCU\SOFTWARE\ADBC\Drivers so the smoke test can load it by name. The

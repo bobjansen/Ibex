@@ -284,8 +284,8 @@ like a failed statement.
   in the public registry; its docs say GetTableSchema marks NOT NULL. Redshift
   has the same terms. Flight SQL after that; Snowflake and BigQuery need
   accounts and stay documented-but-untested.
-- **macOS in CI**: the install script supports it, but no job runs it.
-- **SPEC.md**: a section for the ADBC functions, the `options` grammar, the type
+- **macOS in CI**: `adbc-macos` job added (2026-10-03; SQLite + DuckDB, no servers); unverified until its first CI run.
+- **SPEC.md**: DONE 2026-10-03 (§12.1.1). Was: a section for the ADBC functions, the `options` grammar, the type
   mapping table, and the connection rules once Phase 4 lands.
 - **`docs/io.html`**: PostgreSQL next to SQLite, writing, parameters,
   connections. Use `import "adbc"` in examples (AGENTS.md).

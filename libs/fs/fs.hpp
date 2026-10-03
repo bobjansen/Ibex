@@ -6,9 +6,9 @@
 // Ibex filesystem library — directory listing as a DataFrame.
 //
 //   import "fs";
-//   let files = list_files("data/csv");                 // everything, one level
-//   let csvs  = list_files("data/csv", "*.csv");        // glob on the file name
-//   let all   = list_files("data", "*.csv", true);      // recurse into subdirs
+//   let files = fs::list("data/csv");                 // everything, one level
+//   let csvs  = fs::list("data/csv", "*.csv");        // glob on the file name
+//   let all   = fs::list("data", "*.csv", true);      // recurse into subdirs
 //
 // Returns one row per entry, sorted by `path`:
 //   path        : String  — dir joined with the entry name
@@ -135,10 +135,10 @@ struct Entry {
     namespace stdfs = std::filesystem;
     std::error_code ec;
     if (!stdfs::exists(dir, ec) || ec) {
-        throw std::runtime_error("list_files: directory not found: '" + dir + "'");
+        throw std::runtime_error("fs::list: directory not found: '" + dir + "'");
     }
     if (!stdfs::is_directory(dir, ec) || ec) {
-        throw std::runtime_error("list_files: not a directory: '" + dir + "'");
+        throw std::runtime_error("fs::list: not a directory: '" + dir + "'");
     }
 
     std::vector<detail::Entry> entries;
@@ -196,9 +196,13 @@ struct Entry {
 
 }  // namespace ibex::fs
 
-// Public entry point at global scope so the transpiler's bare `list_files(...)`
-// call in generated C++ resolves (matching csv.hpp's `read_csv`).
-[[nodiscard]] inline auto list_files(const std::string& dir, const std::string& pattern = "*",
-                                     bool recursive = false) -> ibex::runtime::Table {
+// The entry point generated C++ calls: `ibex_compile` names Ibex's `fs::list`
+// as `ibex::ext::fs::list`.
+namespace ibex::ext::fs {
+
+[[nodiscard]] inline auto list(const std::string& dir, const std::string& pattern = "*",
+                               bool recursive = false) -> ibex::runtime::Table {
     return ibex::fs::list_files(dir, pattern, recursive);
 }
+
+}  // namespace ibex::ext::fs

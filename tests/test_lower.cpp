@@ -2265,3 +2265,25 @@ TEST_CASE("Scalar subquery reuse is scoped to one filter", "[lower][scalar_reuse
     collect_kinds(**result, kinds);
     REQUIRE(std::ranges::count(kinds, ir::NodeKind::Aggregate) == 2);
 }
+
+TEST_CASE("Lower a qualified call in a filter clause keeps the qualified callee") {
+    // A column named like the namespace is in the frame; the callee must still
+    // be the namespaced function, not the column. Parity cannot see this: both
+    // sides lower through the same code, so assert on the IR.
+    auto program = require_parse(
+        "namespace geo { extern fn near(x: Int) -> Int from \"geo.hpp\"; }\n"
+        "df[filter geo::near(geo) > 1];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+    const auto* filter = as_node<ir::FilterNode>(result->get());
+    REQUIRE(filter != nullptr);
+    const auto* cmp = std::get_if<ibex::ir::CompareExpr>(&filter->predicate().node);
+    REQUIRE(cmp != nullptr);
+    const auto* call = std::get_if<ibex::ir::CallExpr>(&cmp->left->node);
+    REQUIRE(call != nullptr);
+    CHECK(call->callee == "geo::near");
+    REQUIRE(call->args.size() == 1);
+    const auto* arg = std::get_if<ibex::ir::ColumnRef>(&call->args[0]->node);
+    REQUIRE(arg != nullptr);
+    CHECK(arg->name == "geo");
+}

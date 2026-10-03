@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <ibex/parser/names.hpp>
 #include <ibex/parser/parser.hpp>
 
 #include <cstdlib>
@@ -206,8 +207,23 @@ inline auto expand_imports_impl(parser::Program program, const std::filesystem::
             return std::unexpected(expanded.error());
         }
 
+        // A library resolves its names on its own: its `using`s apply to it
+        // alone, so they are applied here and not spliced into the importer.
+        {
+            robin_hood::unordered_set<std::string> names;
+            parser::collect_declared_names(*expanded, names);
+            parser::UsingScope usings;
+            if (auto resolved =
+                    parser::resolve_names(*expanded, usings, parser::declared_names_of(names));
+                !resolved) {
+                return std::unexpected("import '" + import.name +
+                                       "': " + resolved.error().format());
+            }
+        }
         for (auto& imported_stmt : expanded->statements) {
-            out.statements.push_back(std::move(imported_stmt));
+            if (!std::holds_alternative<parser::UsingDecl>(imported_stmt)) {
+                out.statements.push_back(std::move(imported_stmt));
+            }
         }
     }
 

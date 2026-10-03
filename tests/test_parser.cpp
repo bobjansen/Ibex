@@ -2010,3 +2010,31 @@ TEST_CASE("Stream sink may be qualified") {
     REQUIRE(stream.sink_callee == "udp::send");
     REQUIRE(std::get<CallExpr>(stream.source->node).callee == "udp::recv");
 }
+
+TEST_CASE("A qualified declaration name is shorthand for a namespace block") {
+    auto result = parse(
+        "extern type adbc::Connection from \"adbc.hpp\";\n"
+        "extern fn adbc::connect(driver: String) -> Connection from \"adbc.hpp\";\n"
+        "fn util::inc(x: Int) -> Int { twice(x); }\n"
+        "fn util::twice(x: Int) -> Int { x * 2; }\n"
+        "extern fn plain(x: Int) -> Int from \"p.hpp\";\n");
+    REQUIRE(result.has_value());
+    const auto& type_decl = std::get<ExternTypeDecl>(result->statements[0]);
+    REQUIRE(type_decl.name == "adbc::Connection");
+    REQUIRE(type_decl.scope == "adbc");
+    const auto& connect = std::get<ExternDecl>(result->statements[1]);
+    REQUIRE(connect.name == "adbc::connect");
+    REQUIRE(connect.scope == "adbc");
+    REQUIRE(connect.return_type.resource == "adbc::Connection");
+    const auto& inc = std::get<FunctionDecl>(result->statements[2]);
+    REQUIRE(inc.scope == "util");
+    REQUIRE(std::get<CallExpr>(std::get<ExprStmt>(inc.body[0]).expr->node).callee == "util::twice");
+    // The enclosing scope is restored after a qualified declaration.
+    REQUIRE(std::get<ExternDecl>(result->statements[4]).scope.empty());
+
+    auto duplicate = parse(
+        "namespace csv { extern fn read(p: String) -> DataFrame from \"csv.hpp\"; }\n"
+        "extern fn csv::read(p: String) -> DataFrame from \"csv.hpp\";\n");
+    REQUIRE_FALSE(duplicate.has_value());
+    REQUIRE(duplicate.error().message == "'csv::read' is already declared");
+}

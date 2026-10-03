@@ -399,9 +399,10 @@ trades[<span class="kw">update</span> { n = ^n }];</code></pre>
       </tbody>
     </table>
     <p>
-      Release never commits anything on its own: there is no transaction API
-      yet, so each <code>adbc::query</code> runs in the driver's default
-      (usually autocommit) mode.
+      Release never commits anything on its own. Outside an
+      <code>adbc::begin</code> each statement runs in the driver's default
+      (usually autocommit) mode; a transaction still open when its connection
+      is released is rolled back.
     </p>
   </section>
 
@@ -412,8 +413,8 @@ trades[<span class="kw">update</span> { n = ^n }];</code></pre>
       <article class="card">
         <h3>Language and tools</h3>
         <ul>
-          <li><code>ibex_compile</code> compiles connections (<code>let db = adbc::connect(...)</code>, aliases, <code>adbc::execute</code> / <code>adbc::query</code> / transactions on it, releasing one by rebinding the name) and functions that take, open or return one. In such a function the last statement must be a table, a connection name, or a call, and a scalar <code>let</code> in its body is not supported yet; a function sees the program's constants but not its tables or connections.</li>
-          <li>Scripts that call resource functions run statement by statement rather than through the whole-script planner.</li>
+          <li>In <code>ibex_compile</code>, a function that takes, opens or returns a connection must end in a table, a connection name, or a call, and cannot have a scalar <code>let</code> in its body; it sees the program's constants but not its tables or connections. Decimal and column parameters are not compiled either.</li>
+          <li>Scripts that call resource functions run statement by statement rather than through the whole-script planner, so their queries are not optimized across statements.</li>
           <li>No resource-typed <code>let</code> annotations, columns, or default parameter values.</li>
           <li><code>mutable</code> on a resource parameter documents intent but is not enforced.</li>
         </ul>
@@ -422,8 +423,9 @@ trades[<span class="kw">update</span> { n = ^n }];</code></pre>
         <h3>ADBC</h3>
         <ul>
           <li>One active query per connection; a second concurrent use reports the connection as busy.</li>
-          <li>No transactions, pooling, or cancellation of a running query.</li>
-          <li>An error while cleaning up a closed connection is not reported.</li>
+          <li>No connection pooling, and no cancellation of a running query: Ctrl+C takes effect after the query returns.</li>
+          <li>No nested transactions or savepoints: <code>adbc::begin</code> on a connection with an open transaction is an error.</li>
+          <li>A connection released because its last binding went away reports no error if the driver fails to close it; call <code>adbc::close</code> to see one.</li>
         </ul>
       </article>
     </div>
@@ -440,25 +442,30 @@ trades[<span class="kw">update</span> { n = ^n }];</code></pre>
 <pre><code><span class="kw">class</span> Session <span class="kw">final</span> : <span class="kw">public</span> ibex::runtime::Resource {
    <span class="kw">public</span>:
     <span class="kw">auto</span> <span class="fn-name">type_name</span>() <span class="kw">const</span> <span class="kw">noexcept</span> -&gt; std::string_view <span class="kw">override</span> {
-        <span class="kw">return</span> <span class="str">"MySession"</span>;   <span class="cm">// matches `extern type MySession`</span>
+        <span class="kw">return</span> <span class="str">"my::Session"</span>;   <span class="cm">// matches `extern type Session` in `namespace my`</span>
     }
     ~<span class="fn-name">Session</span>() <span class="kw">override</span> { <span class="cm">/* close handles; never throw */</span> }
 };
 
-registry.<span class="fn-name">register_resource</span>(<span class="str">"my_open"</span>, [](<span class="kw">const</span> ExternArgs&amp; args) {
+registry.<span class="fn-name">register_resource</span>(<span class="str">"my::open"</span>, [](<span class="kw">const</span> ExternArgs&amp; args) {
     <span class="kw">return</span> ExternValue{std::make_shared&lt;Session&gt;(<span class="cm">/* ... */</span>)};
 });
-registry.<span class="fn-name">register_table</span>(<span class="str">"my_query"</span>, [](<span class="kw">const</span> ExternArgs&amp; args) {
+registry.<span class="fn-name">register_table</span>(<span class="str">"my::query"</span>, [](<span class="kw">const</span> ExternArgs&amp; args) {
     <span class="kw">auto</span> session = args.<span class="fn-name">resource_as</span>&lt;Session&gt;(<span class="num">0</span>);   <span class="cm">// null if not a Session</span>
     <span class="cm">// ...</span>
 });</code></pre>
-<pre><code><span class="kw">extern</span> <span class="kw">type</span> MySession <span class="kw">from</span> <span class="str">"my_plugin.hpp"</span>;
-<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">my_open</span>(uri: String) -&gt; MySession <span class="kw">from</span> <span class="str">"my_plugin.hpp"</span>;
-<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">my_query</span>(<span class="kw">mutable</span> s: MySession, sql: String) -&gt; DataFrame <span class="kw">from</span> <span class="str">"my_plugin.hpp"</span>;</code></pre>
+<pre><code><span class="kw">namespace</span> my {
+<span class="kw">extern</span> <span class="kw">type</span> Session <span class="kw">from</span> <span class="str">"my_plugin.hpp"</span>;
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">open</span>(uri: String) -&gt; Session <span class="kw">from</span> <span class="str">"my_plugin.hpp"</span>;
+<span class="kw">extern</span> <span class="kw">fn</span> <span class="fn-name">query</span>(<span class="kw">mutable</span> s: Session, sql: String) -&gt; DataFrame <span class="kw">from</span> <span class="str">"my_plugin.hpp"</span>;
+}</code></pre>
     <p>
       Scalar arguments keep their positions in <code>args</code>; a resource
       argument occupies its position as a null scalar, so existing plugins
-      that read only scalars are unaffected. The full rules are in
+      that read only scalars are unaffected. Register each function under its
+      qualified name and return the qualified type name from
+      <code>type_name()</code>; for <code>ibex_compile</code>, the header
+      declares the entry points in <code>namespace ibex::ext::my</code>. The full rules are in
       <a href="https://github.com/bobjansen/Ibex/blob/main/SPEC.md" target="_blank" rel="noopener">SPEC.md &sect;11.5</a>.
     </p>
   </section>

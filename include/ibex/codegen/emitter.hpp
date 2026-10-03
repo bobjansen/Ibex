@@ -20,6 +20,11 @@
 
 namespace ibex::codegen {
 
+/// The C++ name generated code uses for an extern function or resource type
+/// Ibex calls `name`: `ibex::ext::a::f` for the qualified `a::f`, which a
+/// plugin header declares as `f` in `ibex::ext::a`; an unqualified name as is.
+[[nodiscard]] auto cpp_extern_name(const std::string& name) -> std::string;
+
 /// Emits a C++23 source file from an IR node tree.
 ///
 /// The emitted code uses ibex::ops::* for all table operations and can be

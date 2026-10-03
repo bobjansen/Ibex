@@ -82,6 +82,25 @@ read_csv("employees.csv", nulls = "<empty>", schema = "id:int,name:str");
     CHECK(contains(out, R"(read_csv("employees.csv", "<empty>", ",", 1, "id:int,name:str"))"));
 }
 
+TEST_CASE("lower/codegen: a qualified extern is called by its ibex::ext C++ name", "[codegen]") {
+    const char* src = R"(
+namespace fs {
+    extern fn list(dir: String, pattern: String = "*") -> DataFrame from "fs.hpp";
+}
+fs::list("data", "*.csv");
+)";
+
+    auto parsed = parser::parse(src);
+    REQUIRE(parsed.has_value());
+    auto lowered = parser::lower(*parsed);
+    REQUIRE(lowered.has_value());
+
+    auto out = emit_to_string(**lowered);
+    CHECK(contains(out, R"(ibex::ext::fs::list("data", "*.csv"))"));
+    CHECK(codegen::cpp_extern_name("adbc::Connection") == "ibex::ext::adbc::Connection");
+    CHECK(codegen::cpp_extern_name("read_csv") == "read_csv");
+}
+
 // --- Filter ------------------------------------------------------------------
 
 TEST_CASE("emitter: filter node - int64 predicate", "[codegen]") {

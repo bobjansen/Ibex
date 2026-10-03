@@ -1,0 +1,17 @@
+// Calls into a namespaced library, qualified and through `using`, from the
+// script and from a function in the script's own namespace. The transpiled
+// program calls `ibex::ext::fs::list`; the interpreter, the plugin's `fs::list`.
+import "csv";
+import "fs";
+
+namespace parity {
+    fn csv_names(dir: String) -> DataFrame {
+        fs::list(dir, "ibex_parity_namespaced_calls_*.csv")[select { name, stem }];
+    }
+}
+
+write_csv(Table { x = [1] }, "/tmp/ibex_parity_namespaced_calls_a.csv");
+write_csv(Table { x = [2, 3] }, "/tmp/ibex_parity_namespaced_calls_b.csv");
+using fs;
+let listed = list("/tmp", "ibex_parity_namespaced_calls_*.csv")[select { name, ext }];
+parity::csv_names("/tmp") join listed on name;

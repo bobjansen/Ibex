@@ -3,6 +3,7 @@
 
 #include <ibex/codegen/emitter.hpp>
 #include <ibex/parser/lower.hpp>
+#include <ibex/parser/names.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/parser/resource_functions.hpp>
 #include <ibex/parser/scalar_bindings.hpp>
@@ -161,7 +162,7 @@ auto cpp_type_of(const ibex::parser::Type& type) -> std::expected<std::string, s
     using ibex::parser::ScalarType;
     switch (type.kind) {
         case Kind::Resource:
-            return type.resource;
+            return ibex::codegen::cpp_extern_name(type.resource);
         case Kind::DataFrame:
         case Kind::TimeFrame:
             return std::string("ibex::runtime::Table");
@@ -275,6 +276,18 @@ int main(int argc, char* argv[]) {
         auto expanded = ibex::tools::expand_imports(std::move(*parsed), input_path, import_paths);
         if (!expanded) {
             return std::unexpected(expanded.error());
+        }
+        // The same resolution the REPL runs, over the script and everything it
+        // imported.
+        robin_hood::unordered_set<std::string> names;
+        ibex::parser::collect_declared_names(*expanded, names);
+        ibex::parser::UsingScope usings;
+        if (auto resolved = ibex::parser::resolve_names(*expanded, usings,
+                                                        ibex::parser::declared_names_of(names));
+            !resolved) {
+            return std::unexpected("error at " + input_path + ":" +
+                                   std::to_string(resolved.error().line) + ": " +
+                                   resolved.error().message);
         }
         return expanded;
     };

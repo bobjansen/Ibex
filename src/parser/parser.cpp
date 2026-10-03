@@ -147,6 +147,41 @@ class Parser {
         return name;
     }
 
+    /// Sets the namespace being parsed for one declaration, restoring the
+    /// enclosing one when it goes out of scope.
+    class NamespaceGuard {
+       public:
+        NamespaceGuard(std::string& current, std::string scope)
+            : current_(&current), saved_(std::exchange(current, std::move(scope))) {}
+        NamespaceGuard(const NamespaceGuard&) = delete;
+        NamespaceGuard(NamespaceGuard&&) = delete;
+        auto operator=(const NamespaceGuard&) -> NamespaceGuard& = delete;
+        auto operator=(NamespaceGuard&&) -> NamespaceGuard& = delete;
+        ~NamespaceGuard() { *current_ = std::move(saved_); }
+
+       private:
+        std::string* current_;
+        std::string saved_;
+    };
+
+    /// The namespace part of a qualified declaration name (`a::b` for
+    /// `a::b::f`); empty for an unqualified one.
+    static auto scope_of(const std::string& name) -> std::string {
+        const auto cut = name.rfind("::");
+        return cut == std::string::npos ? std::string{} : name.substr(0, cut);
+    }
+
+    /// The full name a declaration named `first` (just consumed) declares. It
+    /// may be qualified, `extern fn csv::read(...)` being shorthand for the
+    /// same declaration in `namespace csv { ... }`.
+    auto parse_declared_name(std::string first) -> std::optional<std::string> {
+        auto name = parse_qualified_rest(std::move(first));
+        if (!name.has_value()) {
+            return std::nullopt;
+        }
+        return qualify(*name);
+    }
+
     /// `namespace a::b { decl... }`, with `namespace` already consumed. The
     /// block is flattened: each declaration is appended to `out` with its name
     /// qualified, and nothing of the block itself remains.
@@ -299,7 +334,15 @@ class Parser {
         if (!name.has_value()) {
             return std::nullopt;
         }
-        *name = qualify(*name);
+        auto full_name = parse_declared_name(std::move(*name));
+        if (!full_name.has_value()) {
+            return std::nullopt;
+        }
+        *name = std::move(*full_name);
+        // The rest of the declaration is parsed in the namespace it declares
+        // into, so `extern fn adbc::connect(...) -> Connection` names
+        // `adbc::Connection`.
+        const NamespaceGuard in_scope(current_namespace_, scope_of(*name));
         if (!declare(*name, previous(), declared_functions_)) {
             return std::nullopt;
         }
@@ -360,7 +403,15 @@ class Parser {
         if (!name.has_value()) {
             return std::nullopt;
         }
-        *name = qualify(*name);
+        auto full_name = parse_declared_name(std::move(*name));
+        if (!full_name.has_value()) {
+            return std::nullopt;
+        }
+        *name = std::move(*full_name);
+        // The rest of the declaration is parsed in the namespace it declares
+        // into, so `extern fn adbc::connect(...) -> Connection` names
+        // `adbc::Connection`.
+        const NamespaceGuard in_scope(current_namespace_, scope_of(*name));
         if (!declare(*name, previous(), declared_types_)) {
             return std::nullopt;
         }
@@ -389,7 +440,15 @@ class Parser {
         if (!name.has_value()) {
             return std::nullopt;
         }
-        *name = qualify(*name);
+        auto full_name = parse_declared_name(std::move(*name));
+        if (!full_name.has_value()) {
+            return std::nullopt;
+        }
+        *name = std::move(*full_name);
+        // The rest of the declaration is parsed in the namespace it declares
+        // into, so `extern fn adbc::connect(...) -> Connection` names
+        // `adbc::Connection`.
+        const NamespaceGuard in_scope(current_namespace_, scope_of(*name));
         if (!declare(*name, previous(), declared_functions_)) {
             return std::nullopt;
         }

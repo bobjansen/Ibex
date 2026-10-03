@@ -31,11 +31,17 @@ if [[ -z "$driver" && -f "${CONDA_PREFIX:-/nonexistent}/lib/libadbc_driver_sqlit
 fi
 # Otherwise by name; if no manifest exists the read fails and names it.
 driver="${driver:-sqlite}"
-for f in "$ibex" "$plugins/adbc.so" "$plugins/args.so" "$plugins/csv.so"; do
-    if [[ ! -e "$f" ]]; then
-        echo "missing $f -- build with -DIBEX_BUILD_ADBC=ON first" >&2
-        exit 1
+# CMake builds plugins as .so, or .dylib on macOS.
+for f in "$ibex" "$plugins"/{adbc,args,csv}; do
+    if [[ "$f" == "$ibex" ]]; then
+        [[ -e "$f" ]] && continue
+    elif [[ -e "$f.so" || -e "$f.dylib" ]]; then
+        continue
+    else
+        f="$f.so"
     fi
+    echo "missing $f -- build with -DIBEX_BUILD_ADBC=ON first" >&2
+    exit 1
 done
 
 work="$(mktemp -d)"

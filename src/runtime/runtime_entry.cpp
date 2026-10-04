@@ -191,95 +191,20 @@ auto materialize_row_local(const ir::Node& node, const TableRegistry& registry,
 // could bound. A future attempt needs a cost-aware gate (skip when both sides
 // are large), and belongs wherever that breaker is lifted onto the physical plan.
 
-// The relational inputs of a materialized-call fallback node -- the subtrees
-// `build_materialized_fallback` may build ahead through the physical path. For
-// most kinds these are the direct children. Two shapes carry a child that is
-// *not* an independent relational input and must not be built standalone:
-//   - `Window`'s child is an `update` clause; only `interpret_node`'s Window
-//     case may evaluate it (it needs the window duration). The real input is
-//     the update's own child.
-//   - `Stream`'s child is a per-buffer transform template over `__stream_input__`
-//     and has no meaning outside the stream loop.
-// A kind not listed here (or one whose children are template/expression nodes)
-// gets no pre-build: `interpret_node` evaluates it whole, which is the prior
-// behaviour.
-//
-// This allowlist matters. A first cut that also pre-built `Window`'s direct
-// child and `Stream`'s template failed 51 tests, because each of those was then
-// evaluated on its own. Leaving a kind off costs the other way: `Rbind` was
-// missing, so a join under it ran `interpret_node`'s materializing join and a
-// deferred probe scan beneath it decoded every row.
-auto fallback_relational_inputs(const ir::Node& node) -> std::vector<const ir::Node*> {
-    std::vector<const ir::Node*> inputs;
-    switch (node.kind()) {
-        case ir::NodeKind::Melt:
-        case ir::NodeKind::Dcast:
-        case ir::NodeKind::Columns:
-        case ir::NodeKind::Cov:
-        case ir::NodeKind::Corr:
-        case ir::NodeKind::Transpose:
-        case ir::NodeKind::Matmul:
-        case ir::NodeKind::Resample:
-        case ir::NodeKind::Model:
-        case ir::NodeKind::AsTimeframe:
-        case ir::NodeKind::Update:
-        case ir::NodeKind::Join:
-        case ir::NodeKind::Rbind:
-            inputs.reserve(node.children().size());
-            for (const auto& child : node.children()) {
-                inputs.push_back(child.get());
-            }
-            break;
-        case ir::NodeKind::Window:
-            if (!node.children().empty() && !node.children().front()->children().empty()) {
-                inputs.push_back(node.children().front()->children().front().get());
-            }
-            break;
-        default:
-            break;
-    }
-    return inputs;
-}
-
 // The materialized-call fallback for every node kind `plan_physical` does not
 // migrate (reshape, stats, window, non-row-local update, materializing join,
-// matmul, model, ...). `interpret_node` owns the per-kind semantics; this only
-// makes sure the breaker's *inputs* still go through the physical path: each
-// relational input is built and drained via `build_operator` (fused parallel
-// scan, projection pushdown, streaming join), then `interpret_node` runs over
-// the node with those inputs handed back pre-built through
-// `pre_materialized_children` -- so a `Filter`/`Project` feeding the breaker is
-// not re-evaluated whole-table and serial. `interpret_node` still recurses for
-// anything deeper, and for any kind `fallback_relational_inputs` leaves empty.
-// Sending the whole subtree to `interpret_node` without this pre-build cost
-// `join_filter_rank` 14.7%: the filter between the join and the grouped rank
-// lost its fused parallel scan.
+// matmul, model, ...). `interpret_node` owns the per-kind semantics, and it
+// evaluates every relational input back through `build_operator`
+// (`materialize_input`), so a `Filter`/`Project`/join feeding the breaker keeps
+// its fused parallel scan or streaming join rather than running whole-table
+// and serial beneath it. Recursing instead cost `join_filter_rank` 14.7% (the
+// filter between the join and the grouped rank lost its fused scan) and every
+// deferred probe beneath a node the plan did not migrate.
 auto build_materialized_fallback(const ir::Node& node, const TableRegistry& registry,
                                  const ScalarRegistry* scalars, const ExternRegistry* externs,
                                  const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
-    const std::vector<const ir::Node*> inputs = fallback_relational_inputs(node);
-
-    std::vector<Table> built;
-    built.reserve(inputs.size());
-    for (const ir::Node* input : inputs) {
-        auto table = materialize_row_local(*input, registry, scalars, externs, exec, model_out);
-        if (!table.has_value()) {
-            return std::unexpected(std::move(table.error()));
-        }
-        built.push_back(std::move(table.value()));
-    }
-    // `built` is not resized past this point, so the addresses stay valid for
-    // the `interpret_node` call below.
-    std::vector<std::pair<const ir::Node*, const Table*>> handback;
-    handback.reserve(inputs.size());
-    for (std::size_t i = 0; i < inputs.size(); ++i) {
-        handback.emplace_back(inputs[i], &built[i]);
-    }
-    ExecutionContext local = exec;
-    local.pre_materialized_children = &handback;
-
-    auto table = interpret_node(node, registry, scalars, externs, local, model_out);
+    auto table = interpret_node(node, registry, scalars, externs, exec, model_out);
     if (!table.has_value()) {
         return std::unexpected(std::move(table.error()));
     }

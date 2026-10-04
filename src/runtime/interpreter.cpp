@@ -81,7 +81,7 @@ namespace {
 // dynamic mmap threshold (grows up to 32 MB = 4M float64 rows) is served by a
 // fresh mmap and munmapped on free. The next same-size allocation re-mmaps and
 // re-faults every 4 KB page on first touch — a ~5x throughput cliff once columns
-// cross ~32 MB (see plans/benchmark-perf-priorities.md, P0). Serving large
+// cross ~32 MB (cumsum 0.7 -> 3.3 ns/row from 4M to 8M rows). Serving large
 // allocations from the main arena and never trimming the heap top lets freed
 // buffers recycle already-faulted pages across the warmup/timed iterations.
 // glibc-only; a no-op elsewhere. Opt out via IBEX_NO_MALLOC_TUNING.
@@ -1720,7 +1720,7 @@ auto extract_scalar(const Table& table, const std::string& column, bool zero_row
         return std::unexpected("column not found: " + column);
     }
     // A null cell yields a null scalar (the monostate alternative), not an
-    // error -- see plans/parse-args-and-nullable-scalars-plan.md Part 1.
+    // error -- see SPEC.md §6.7.
     if (entry->validity.has_value() && !(*entry->validity)[0]) {
         return ScalarValue{std::monostate{}};
     }

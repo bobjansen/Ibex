@@ -8,7 +8,8 @@ target,
 says where the gap is, and ranks the workstreams. Mechanism lives in the plans
 it points to: `kernel-pipeline-execution-plan.md`,
 `runtime-multithreading-plan.md`, `owned-agg-per-chunk-barrier-plan.md`,
-`join-perf-plan.md`, `parallelism-overview.md` and `src/runtime/PARALLELISM.md`.
+`parallelism-overview.md` and `src/runtime/PARALLELISM.md` (and the retired
+`join-perf-plan.md`, at `git show 0d069262:plans/join-perf-plan.md`).
 
 The August version (SF-2, target "raise the implied parallel fraction from 44%
 to 60–65%") has been met and is superseded. Its full text, including the W1
@@ -524,7 +525,7 @@ Order, by share of the 16-core gap:
    and `source decode whole` (W3), the sixth-largest idle row.
 2. **The inner-join group: q07 +117, q03 +106, q05 +75, q19 +67 (33%).**
    Scaling 4.6–6.5× against 12–13×. One mechanism, W2's inner-join probe and
-   output assembly (`join-perf-plan.md`, memory `project_join_parallelism`),
+   output assembly (memory `project_join_parallelism`),
    so fix it once and measure all four.
    **Measured 2026-09-24: not one mechanism.** q19's time is in the join itself
    (lineitem ⋈ part, 1.7M rows out). For q03/q05/q07 it is the deferred-probe
@@ -698,8 +699,7 @@ one constant per A/B, and only after W0 has the curve.
 
 - **Inner-join probe and output assembly** (the breaker map's §4.4 slices,
   about 3,100 core-ms at the last full ranking). q19, q10, q03, q05 and q07
-  sit here, all scaling losers. See `join-perf-plan.md` and memory
-  `project_join_parallelism`.
+  sit here, all scaling losers. See memory `project_join_parallelism`.
 - **q21's semi-join occupancy.** It is ranked by ring wait and occupancy, not
   pool work (memory: `project_q21_is_occupancy_bound`). q21 carries the
   suite total, so a regression here hides everywhere else.

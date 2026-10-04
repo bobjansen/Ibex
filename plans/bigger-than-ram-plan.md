@@ -74,9 +74,8 @@ built on it.
   new format to maintain and test independently.
 - A byte-budget tracker (`IBEX_MAX_MEMORY`, following the current compute/pool
   configuration split in `runtime-multithreading-plan.md`): unset/0 means unbounded — the
-  default, so existing benchmarks and RSS baselines in
-  `plans/benchmark-perf-priorities.md` are completely unaffected until a user
-  opts in. When set, operators accumulate in memory and spill only once the
+  default, so existing benchmarks and RSS baselines are completely unaffected
+  until a user opts in. When set, operators accumulate in memory and spill only once the
   running estimate crosses the budget — no cardinality estimation or
   plan-time statistics required, matching how the existing dense-vs-hash
   grouping switch already makes a similar in-memory/alternate-representation

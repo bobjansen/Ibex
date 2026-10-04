@@ -2,6 +2,11 @@
 
 Status of every plan in this directory, grouped by lifecycle.
 
+**2026-10-04:** eight finished or overtaken plans retired (ADBC, opaque
+resources, namespaces, parse-args/nullable scalars, count windows, join perf,
+benchmark coverage, benchmark perf priorities), plus the exists plan; see
+Complete. Their open leftovers are listed there.
+
 **2026-09-23:** the breaker-map arc closed and the *Landed* section was
 emptied. Each of its plans was deleted once its rules had moved into code
 comments, SPEC.md or a parent plan (see Complete below).
@@ -32,16 +37,11 @@ history).
 
 | Plan | Status | What's actually left |
 |---|---|---|
-| [opaque-resource-lifetime-plan.md](opaque-resource-lifetime-plan.md) | Proposed (2026-09-16) | Typed opaque resources, deterministic scope/escape rules, query-expression restrictions, and reusable ADBC connections. |
 | [beat-polars-plan.md](beat-polars-plan.md) | **Ongoing umbrella; W0 closed 2026-09-24** on 16 physical cores (AWS r7i.8xlarge, SMT off): Ibex/Polars 0.61 at 1 core, 1.08 at 8, 1.36 at 16 (geomean 1.45); implied fraction ~88% against Polars' ~98%. The dev box flattered Ibex above ~4 cores. | Serial time is the gap: 1.87 s flat from 8 to 16 cores, 39% of wall at 16; parity needs the fraction at ~93%. §3 order, by share of the 16-core gap (losers +1,117 ms, winners −129): q10 (24%); the inner-join group q07/q03/q05/q19 (33%); q16 and q13; q01; the tail. q21 is a watch item (its lead shrinks with cores). W1 constants after. |
 | [kernel-pipeline-execution-plan.md](kernel-pipeline-execution-plan.md) | **Phase 2 complete** except `KernelContext` (deliberately unbuilt); Phase 3 handoff/island/raw-thread work complete, with accounting and DOP/memory budgets deferred; Phase 4 construction ownership **and fan-out authority** done (backlog 116→6 breakers, plan describes 97% of real-work nodes). Streaming inner joins have typed `HashBuild`/`HashProbe` nodes and positional `JoinColumnMapping`. Streaming aggregates have positional `AggregateColumnMapping`, authoritative partition/finalize policy, and a typed Discovery → Accumulation → FinalOrdering → Emission hash-fallback chain. The serial coordinator invokes all four nodes through a bounded discovery transfer or explicit fused marker, with independent profile rows. Executor-seam mutations prove mappings, policies, and structural edges are consumed or rejected. Known closed schemas bind during planning; lazy/open schemas bind once at execution. Semi/anti retains its separate streaming operator. Architectural successor: typed logical IR, physical pipelines, morsel executor, templated kernel library; not a JIT. | Next: attach aggregate fan-out policy to each structural node, admit it phase by phase, then split `chunked.cpp` by ownership. |
-| [benchmark-perf-priorities.md](benchmark-perf-priorities.md) | Living reference | P0–P2 resolved/landed; rolling min/max optimized. Open: suite trimming (pin sqlite + data.table frollapply cells, duckdb at 3 scales); P4 `tanh` deferred pending accuracy-vs-speed call; P3 ohlc scatter-bound (negative result recorded — don't re-attempt naive fusion); re-check rolling_mean on AWS after the July 2026 regression fix |
-| [benchmark-coverage-plan.md](benchmark-coverage-plan.md) | ~95% done | #9 ClickHouse EWMA (needs arrayFold workaround); #10 DataFusion `fill_forward/backward` + `tf_asof_join` |
-| [count-window-plan.md](count-window-plan.md) | Implemented (interpreter + codegen) | Per-call count/duration windows work (`__window_n`/`__window_ns` in lower.cpp + window.cpp), and the compiled path (`ibex_compile`) is at parity. Open: `window N rows` block syntax and tuple-field `update` inside `window` (interpreter doesn't support that combo either, so codegen correctly still rejects it). The old monotonic-deque follow-up for `rolling_min`/`rolling_max` is done. |
 | [non-row-local-filter-plan.md](non-row-local-filter-plan.md) | Stage 1 shipped | `lag`/`lead`/`is_null` in filter work. Remaining: `rank(...)` in filter/select with `by`, explicit `order {}` context, rolling functions in filter (`price > rolling_mean(price)`) |
 | [bigger-than-ram-plan.md](bigger-than-ram-plan.md) | Phase 4 bullet 1 of 4 done | Out-of-core execution. Done: chunked/streaming `read_parquet` (branch `chunked-parquet-read`; ~6.5× lower peak RSS, ~1.7× faster, verified local + AWS). Next: column projection pushdown, row-group stats pushdown, directory/Hive datasets (rest of Phase 4), then Phase 1 spill infrastructure (prerequisite for Phases 2–3, 6–7: external sort, out-of-core join, adaptive spill selection) |
 | [runtime-multithreading-plan.md](runtime-multithreading-plan.md) | Row-local morsel-parallel pipelines are **ON by default**; Phase 3a is complete; Phase 3b's first source slice landed; Phase 4 items 1–2 landed, item 3 RETIRED (the join gap was Categorical probe keys hashed as *text*, not threading), item 4 part-done. **Nomenclature: `IBEX_THREADS` → `IBEX_CORES`; `IBEX_PARALLEL` removed (serial is `IBEX_CORES=1`).** | The PDS-H multithreading gap is **parallel barriers**, not sources. Next: group-by string/int/generic hash paths + `distinct`; the LazyTable Synchronization Contract (written, unimplemented — Phase 3b's foundation); Phase 2 deterministic RNG (designed, not started). Re-measure at a larger scale before ranking — the threading share of a gap grows with row count. |
-| [join-perf-plan.md](join-perf-plan.md) | Items 1–3 done (2026-07-14; q09 −23%, q13 −30%) | Join/group-by performance findings; see the file's Results section. beat-polars points here for join mechanism |
 | [owned-agg-per-chunk-barrier-plan.md](owned-agg-per-chunk-barrier-plan.md) | High-cardinality partition-owned aggregation vs Polars streaming. q18 (single-Int64 `Sum`) largely closed by the async hot/cold rewrite (**−33%**); the parallel finalize merge landed for all owned paths (**−7%**); q21's ordered-run `Count` finalize + emit fusion landed (**−11.2% SF-4**). | q20/`PairIntKey` (the hot table doesn't help a scattered composite key — a per-partition `CardinalitySketch` is the candidate); q21's remaining wall is the per-chunk accumulate orchestration + a duplicate lineitem decode + a 40ms serial hash-join build. **Do NOT touch `part_count` or serial-`reserve` the maps** — both measured dead ends. |
 | [grouped-chunkview-update-plan.md](grouped-chunkview-update-plan.md) | Mostly complete — `update …, by k` runs off an immutable `GroupedRowPlan` (CSR) instead of gather → per-group `Table` → scatter. Sub-plan of kernel-pipeline Phase 2. | Remaining materialized shapes: `rank`, variable-width ordered state, `window`-clause `lag`/`lead`. |
 | [per-occurrence-scan-selections-plan.md](per-occurrence-scan-selections-plan.md) | **Phases 1–3 LANDED** (`78a09fad`, `bf783ef3`, `f2b298db`). Restored filter pushdown for a source scanned more than once: each occurrence is renamed `source#fN` so `scan_predicates` keeps its predicate, `decode_demanded_lazy_sources` decodes the union of their output columns ONCE and gathers per occurrence, and the instances stay EAGER. Gated structurally on a fusable `like`. `ibex-e2e.sh` is green again. | **Phase 4 — narrow the `!= 1` gate generally.** Its price was +11.3% on q21, since the eager selection ran serial; with that fanned out (`f06e6da3`) widening the gate measures −0.4% geomean, byte-identical on 22, nothing regressed. The blocker is gone, so what is left is a risk judgement about the plan-shape change, not a cost one. |
@@ -60,10 +60,8 @@ history).
 
 | Plan | Notes |
 |---|---|
-| [adbc-plan.md](adbc-plan.md) | **Next up (2026-09-27).** Defines "finished" for ADBC and phases the rest: 0 land the stranded `adbc-reliability` commits (PostgreSQL CI + `check.py`, the opaque-resource plan) and better not-found errors; 1 import type coverage (float32, time, binary, lists…); 2 `adbc_write` ingestion + `adbc_execute`; 3 bound parameters; 4 reusable connections (the opaque-resource design, the one language change); 5 discovery (tables, schemas); 6 DuckDB/Flight SQL drivers, macOS CI, SPEC + docs. Four decisions listed. |
 | [beat-duckdb-plan.md](beat-duckdb-plan.md) | **Parked until ADBC is finished (2026-09-27).** Successor target to beat-polars: on PDS-H SF-10 (AWS, 16 physical cores, `546ce652`) Ibex is ahead of Polars (0.67 / 0.64 total at 8 / 16 cores) and DuckDB is the faster reference. Ibex/DuckDB 0.86 at 1 core, 1.02 at 8, 1.17 at 16; implied fraction 95.0% against DuckDB's 98.1%, parity needs ~96.7%. Workstreams: W1 scaling losers by ms lost (q01, q10, q21, q03, q04, q19, q12…; start with q12), W2 scale-cliff sweep over fixed thresholds, W3 canonical-plan audit, W4 q01 per-core cost, W5 small items. |
 | [radix-partitioned-groupby.md](radix-partitioned-groupby.md) | Noted, not built. High-cardinality group-by is memory-bound; radix partitioning remains a q18/q20 mechanism. Q10 no longer reaches the generic mixed-key ceiling (2026-08-27: FD reduction + discovery-time `First` gathering handle that shape). **But the `First` gathering was itself the measured q10 cost** — late-materialize-fd-payload (retired, see Complete) LANDED (`568c4974`, q10 −32.8%) and lifts that payload above the top-k. |
-| [exists-subquery-plan.md](exists-subquery-plan.md) | Proposal: `exists(table_expr)` as a boolean subquery term — semi/anti/mark joins and the residual-predicate case |
 | [in-subquery-plan.md](in-subquery-plan.md) | Proposal: `x in (table_expr)` / `not in` as semi / null-aware anti join — the subquery family, not a scalar like `like()` |
 | [extern-series-arguments-plan.md](extern-series-arguments-plan.md) | Proposal: `Series<T>` as a first-class extern argument, starting with CSV null tokens |
 | [ibex-compile-conformance-plan.md](ibex-compile-conformance-plan.md) | **Umbrella.** Close the drift between `ibex_compile` (the C++ transpiler) and the interpreter — the surfaces have diverged (map, non-literal extern args, table-returning `fn`, `model {}`, window combos) and the parity harness is an allowlist that hides it. Step 0 upgrades parity to a conformance gate. Key reframe: the emitter emits only `ibex::ops::*` plan-reconstruction, never a native loop — but that's historical, not required. `map` is a `for` loop; **W1a** = `MapNode` + the emitter emitting an actual loop (with `read_csv`/`write_parquet` as literal C++), zero runtime changes. W1b (runtime expression-level extern evaluator, for the interpreter half) is deferred as low-value. Then W2 non-literal extern args, W3 user functions on whole-script/transpile, W4 `model {}`, W5 window combos. `ibex_compile` and the interpreter share all runtime kernels — the gap is plan-construction + expression-eval only. |
@@ -95,6 +93,53 @@ in active plans to `plans/done/...` paths refer to that history.
   `update_row_local_chunk` in `kernel_update.cpp`, next to the
   "do not widen `is_chunk_predicate_native`/`is_range_native_expr`" rule on
   `try_plan_direct_like_int_field`.
+
+- **Retired 2026-10-04.** Read any of them at `git show 0d069262:plans/<name>`.
+  - **adbc-plan.md** — ADBC library work is done: import types, `adbc::write` /
+    `execute`, bound parameters, reusable connections, discovery, DuckDB and
+    macOS CI, SPEC + `docs/io.html`. Left: bump the driver manager and wheels
+    to ADBC 25 when released (apache/arrow-adbc#4695, then try dropping the
+    `SELECT 1` in `adbc_begin`); drop the DuckDB ingest quirk once
+    duckdb/duckdb#26425 ships. Not started by decision: SQL Server (needs
+    filter pushdown into the query SQL first), then Flight SQL; a scalar
+    argument that calls a connection function (bind it with `let`).
+  - **opaque-resource-lifetime-plan.md** — typed opaque resources: top-level,
+    as `fn` parameters/returns, and in `ibex_compile` (W6, 2026-10-02). Its
+    design rules — close is not `consume`; a busy connection errors rather than
+    buffering, waiting or opening a second one; resource operations run in
+    source order and are never eliminated, duplicated, commoned or
+    parallelized — are in the retired file's "Mapping and effects".
+  - **namespaces-plan.md** — implemented 2026-10-03; SPEC.md §11.7. Aliases
+    (`using c = csv;`) and namespaced built-ins were left unproposed.
+  - **parse-args-and-nullable-scalars-plan.md** — null scalars (SPEC.md §6.7)
+    and `parse_args` (`libs/args/`) complete 2026-09-07. Left: codegen does not
+    emit a null scalar binding (noted at both sites in `emitter.{hpp,cpp}`).
+  - **count-window-plan.md** — per-call count/duration windows
+    (`rolling_mean(px, 20)`, `rolling_mean(px, 60s)`) in the interpreter and
+    `ibex_compile`. Left: `window N rows` block syntax, and tuple-field
+    `update` inside `window` (the interpreter rejects it too).
+  - **join-perf-plan.md** — items 1–3 landed (q09 −23%, q13 −30%); item 4 was
+    overtaken by beat-polars. Measured and rejected, do not re-run: a native
+    Parquet encoding decoder, a decode arena, mmap; and do not "just link
+    jemalloc" (`tune_allocator_once` already tunes glibc).
+  - **benchmark-coverage-plan.md** — ~95% done. Left: ClickHouse EWMA (needs an
+    `arrayFold` workaround); DataFusion `fill_forward` / `fill_backward` and
+    `tf_asof_join`.
+  - **benchmark-perf-priorities.md** — P0 (the allocation cliff) resolved, see
+    `tune_allocator_once`; suite trimming built into `run_scale_suite.sh`.
+    Negative result: fusing `ohlc_by_symbol`'s four reducers into one pass
+    does not help — with ~252 groups it is bound by the scatter writes, not
+    bandwidth; the levers are group-id locality or SIMD/threaded scatter. Left:
+    P4 `tanh` (an accuracy-vs-speed call).
+
+- **exists-subquery-plan.md** — retired 2026-10-04. Tier 1 (a whole `exists`
+  conjunct → semi / anti join, `cdff12fa`) and Tier 2 (anywhere else → mark
+  join, `ef1594cd`) are built; the semantics are SPEC.md §5.8 and the lowering
+  rules head `lower_exists` / `mark_exists` in `src/parser/lower.cpp`. Tier 3 —
+  a non-equality capture (q21's `l_suppkey <> outer(l_suppkey)`) as equijoin +
+  residual filter + dedup on a row identity — is unbuilt; its design is at
+  `git show 2d064b83:plans/exists-subquery-plan.md`. No query needs it (q21
+  ships as a hand-written rewrite).
 
 - **Retired 2026-09-23**, all landed or deliberately reverted. Their rules
   moved to where they apply; read the files at `git show 81392162:plans/<name>`.
@@ -143,8 +188,8 @@ in active plans to `plans/done/...` paths refer to that history.
   whole-query `LazyTable` pushdowns; its next work is progress-aware admission
   and general scheduling, not another static scan gate.
 - **runtime-multithreading** is the answer to the remaining polars
-  multi-thread gaps in **benchmark-perf-priorities** (single-thread ibex
-  already wins 37/41 vs polars-st). Its execution-plan seam and first parallel
+  multi-thread gaps (single-thread ibex already won 37/41 vs polars-st in the
+  retired benchmark-perf-priorities survey). Its execution-plan seam and first parallel
   islands are complete. Phase 3a now deliberately precedes parallel I/O:
   promote Parquet to a first-party backend and make Ibex storage adopt
   Arrow-compatible buffers, so Python/R and source morsels share ownership

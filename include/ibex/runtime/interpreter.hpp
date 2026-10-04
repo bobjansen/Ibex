@@ -51,8 +51,8 @@ using ColumnValue =
 // A scalar value, or null. `std::monostate` is the null alternative (a
 // default-constructed ScalarValue is null); it maps to the internal
 // ExprValue::Null across the row-eval boundary. Historically ScalarValue was
-// null-free; see plans/parse-args-and-nullable-scalars-plan.md Part 1 for why
-// that changed. Extern arguments remain null-free -- the type system rejects a
+// null-free; SPEC.md §6.7 has the null-scalar semantics that replaced that.
+// Extern arguments remain null-free -- the type system rejects a
 // null before the call, it never reaches an extern.
 using ScalarValue = std::variant<std::monostate, std::int64_t, double, bool, std::string, Date,
                                  Timestamp, DecimalValue>;

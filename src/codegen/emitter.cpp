@@ -441,9 +441,8 @@ void Emitter::emit_header(std::ostream& out, const Config& config, const Script*
                 [&](const auto& v) {
                     using V = std::decay_t<decltype(v)>;
                     if constexpr (std::is_same_v<V, std::monostate>) {
-                        // Null scalar bindings are not yet emitted by codegen
-                        // (plans/parse-args-and-nullable-scalars-plan.md, later
-                        // slice); collect_scalar_bindings never produces one.
+                        // Null scalar bindings are not yet emitted by codegen;
+                        // collect_scalar_bindings never produces one.
                         out << "ibex::runtime::ScalarValue{std::monostate{}}";
                     } else if constexpr (std::is_same_v<V, std::int64_t>) {
                         out << "std::int64_t{" << v << "}";

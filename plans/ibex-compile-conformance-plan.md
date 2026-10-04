@@ -396,8 +396,8 @@ does not hold yet. Measured on 2026-10-02:
 
 Statement order is not a property of an emit mode. It is a property of the
 plan, and the plan gets it from effect summaries.
-`plans/opaque-resource-lifetime-plan.md` already says so ("Mapping and
-effects"): resource operations run in source order, and cannot be eliminated,
+The opaque-resource design already said so ("Mapping and effects", retired:
+`git show 0d069262:plans/opaque-resource-lifetime-plan.md`): resource operations run in source order, and cannot be eliminated,
 duplicated, commoned, speculated or parallelized; its step 2 is "propagate
 resource summaries through helpers, validate query contexts/map expansions, and
 preserve statement ordering in planning". The REPL and `ibex_compile` must get
@@ -598,7 +598,7 @@ ADBC script with `ibex-build.sh` and run the binary.
 6. **W4 / W5** — lower priority, independent.
 7. **W6** (2026-10-02, user priority: ADBC fully supported in compiled
    programs) — W6-0 (effect-ordered planning; finishes step 2 of
-   `opaque-resource-lifetime-plan.md`), then W6a; W6b is independent and can
+   the opaque-resource plan, now retired), then W6a; W6b is independent and can
    run in parallel; W6c needs all three.
 
 Each workstream is a landable unit and deletes its `.unsupported` markers.
@@ -649,7 +649,7 @@ Build `cmake --build build -j6` (`[[feedback_cap_build_parallelism]]`).
 | W2 | `src/codegen/emitter.cpp` (`emitter.cpp:1422/1469` lift), `src/repl/repl.cpp` (`literal_args`, `:5010`) | shares W1b for the S2 half; `plans/extern-series-arguments-plan.md` |
 | W3 | `src/repl/repl.cpp` (`try_execute_whole_script`), `tools/ibex_compile.cpp`, `src/parser/lower.cpp` (UDF inlining) | parity cases |
 | W4 | `src/codegen/emitter.cpp:860`, `src/runtime/ops.cpp`, `include/ibex/runtime/ops.hpp` | `tests/test_codegen.cpp` |
-| W5 | `src/codegen/emitter.cpp:509/513/518` | `tests/test_codegen.cpp`, `plans/count-window-plan.md` |
+| W5 | `src/codegen/emitter.cpp:509/513/518` | `tests/test_codegen.cpp` |
 | W6 | `src/parser/effects.cpp`, `src/ir/optimizer.cpp`, `src/parser/lower.cpp` (`ScriptPlan`), `src/repl/repl.cpp` (context, drop decline), `tools/ibex_compile.cpp`, `src/codegen/emitter.cpp`, `libs/adbc/` (split), `scripts/ibex-build.sh` | `include/ibex/parser/resource_functions.hpp`, `tests/parity/`, `scripts/ibex-e2e.sh` |
 
 ## Related
@@ -661,4 +661,5 @@ Build `cmake --build build -j6` (`[[feedback_cap_build_parallelism]]`).
 `plans/kernel-pipeline-execution-plan.md` (the architectural successor — this
 plan is explicitly *not* that) ·
 `plans/extern-series-arguments-plan.md` (the `Series<T>` extern-arg ABI, pairs
-with W2) · `plans/count-window-plan.md` (W5 backstory)
+with W2) · the retired count-window plan (W5 backstory,
+`git show 0d069262:plans/count-window-plan.md`)

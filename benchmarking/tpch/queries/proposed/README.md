@@ -19,7 +19,7 @@ general primitives, not on subquery syntax at all:
 | Q22 | **`substring`** (built, SPEC 12.6) + an uncorrelated scalar + a `not exists` as an **anti join**. |
 | Q4 | Nothing — an equality `exists` **is** a semi join. |
 | Q16, Q18 | Nothing — an `in` / `not in` against a fixed set **is** a semi / anti join. |
-| Q21 | Nothing — its inequality-correlated `exists` / `not exists` rewrites to per-order **distinct-supplier counts** (the same distinct+count as Q16). |
+| Q21 | Nothing — its inequality-correlated `exists` / `not exists` rewrites to per-order supplier counts. The shipped file follows Polars' line-count shape rather than the exact distinct-supplier form; its header explains the difference. |
 
 So the whole "subquery syntax" project reduced to two engine features — the
 correlated scalar subquery and `substring` — plus the realisation that `exists`,
@@ -29,14 +29,11 @@ sugar, but they run, and correctly.
 
 ## What is still only a proposal (and needs no query)
 
-Two design docs survive, both for *ergonomics*, since no remaining query needs
-them:
+`exists` / `!exists` have since been built as first-class terms (SPEC 5.8);
+only the inequality-correlated form (q21's shape) is still unbuilt — see the
+exists entry under "Complete" in `plans/README.md`. One design doc survives,
+for *ergonomics*, since no remaining query needs it:
 
-- `plans/exists-subquery-plan.md` — `exists` / `not exists` as first-class terms.
-  Zero new queries: the equality cases are semi/anti joins, and Q21's inequality
-  case has the distinct-count rewrite above. A *generic* inequality-correlated
-  `exists` (Tier 3) would still want a `row_number()` Ibex lacks, but no TPC-H
-  query forces it.
 - `plans/in-subquery-plan.md` — `in` / `not in` as first-class terms. The one
   genuinely new operator it proposes is a **null-aware anti join** (a plain anti
   join is only exact when the subquery column is non-null — which is why Q16 and

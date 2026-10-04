@@ -329,6 +329,10 @@ Blocked upstream, with the workaround in place:
 - DuckDB ingest reports success after a failed flush (duckdb/duckdb#26425,
   open). Drop the DuckDB ingest quirk once a fixed release is pinned.
 
+Done 2026-10-04: Ctrl+C cancels a running query or statement (server-side on
+PostgreSQL through `AdbcStatementCancel`; elsewhere at the next batch), and a
+failed implicit close (last binding gone) is a warning instead of silence.
+
 Not started, by decision:
 
 - SQL Server, on the user's licensed Windows machine; it needs **filter

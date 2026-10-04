@@ -424,7 +424,7 @@ trades[<span class="kw">update</span> { n = ^n }];</code></pre>
         <h3>ADBC</h3>
         <ul>
           <li>One active query per connection; a second concurrent use reports the connection as busy.</li>
-          <li>No connection pooling, and no cancellation of a running query: Ctrl+C takes effect after the query returns.</li>
+          <li>No connection pooling. Ctrl+C in the REPL cancels a running query or statement on the server (PostgreSQL, and any driver that supports ADBC cancellation); with other drivers it stops at the next result batch.</li>
           <li>No nested transactions or savepoints: <code>adbc::begin</code> on a connection with an open transaction is an error.</li>
           <li>A connection released because its last binding went away reports no error if the driver fails to close it; call <code>adbc::close</code> to see one.</li>
         </ul>
@@ -438,7 +438,12 @@ trades[<span class="kw">update</span> { n = ^n }];</code></pre>
     <p class="section-sub">
       A plugin defines a resource by deriving from
       <code>ibex::runtime::Resource</code>. Cleanup belongs in the destructor,
-      which runs when the last owner lets go and must not throw.
+      which runs when the last owner lets go and must not throw. A cleanup
+      failure there has no caller to return it to: report it with
+      <code>ibex::runtime::warn(message)</code> (<code>ibex/runtime/warnings.hpp</code>),
+      which the REPL prints as a warning. A long blocking call in a plugin
+      can poll <code>ibex::runtime::interrupt_requested()</code> to stop on
+      Ctrl+C; both reach the host once the plugin has registered a function.
     </p>
 <pre><code><span class="kw">class</span> Session <span class="kw">final</span> : <span class="kw">public</span> ibex::runtime::Resource {
    <span class="kw">public</span>:

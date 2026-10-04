@@ -14,24 +14,32 @@
 #include <ibex/interop/arrow_c_data.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/interrupt.hpp>
 #include <ibex/runtime/morsel.hpp>
 #include <ibex/runtime/operator.hpp>
+#include <ibex/runtime/warnings.hpp>
 
 #include <algorithm>
 #include <array>
 #include <arrow-adbc/adbc.h>
 #include <arrow-adbc/adbc_driver_manager.h>
+#include <atomic>
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <expected>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -78,6 +86,68 @@ auto call_adbc(std::string_view context, Fn&& fn) -> std::expected<void, std::st
     }
     release_adbc_error(&error);
     return {};
+}
+
+/// While it lives, Ctrl+C cancels `statement`: a watcher thread polls the
+/// interrupt flag and calls `AdbcStatementCancel`, which ADBC allows from any
+/// thread while another call on the statement blocks (a long query on the
+/// server, a result batch in transit). Destroy it before releasing the
+/// statement. Drivers without cancellation report NOT_IMPLEMENTED, ignored:
+/// the statement then stops at the next batch, where Ibex checks the flag.
+class CancelWatch {
+   public:
+    explicit CancelWatch(AdbcStatement* statement)
+        : thread_([this, statement](const std::stop_token& stop) { watch(stop, statement); }) {}
+    CancelWatch(const CancelWatch&) = delete;
+    CancelWatch& operator=(const CancelWatch&) = delete;
+    CancelWatch(CancelWatch&&) = delete;
+    CancelWatch& operator=(CancelWatch&&) = delete;
+    ~CancelWatch() = default;  // the jthread stops and joins
+
+    /// Whether this watch cancelled the statement.
+    [[nodiscard]] auto cancelled() const noexcept -> bool {
+        return cancelled_.load(std::memory_order_acquire);
+    }
+
+   private:
+    void watch(const std::stop_token& stop, AdbcStatement* statement) {
+        constexpr auto kPoll = std::chrono::milliseconds(50);
+        std::unique_lock lock(mutex_);
+        while (!stop.stop_requested()) {
+            if (ibex::runtime::interrupt_requested()) {
+                AdbcError error{};
+                (void)AdbcStatementCancel(statement, &error);
+                release_adbc_error(&error);
+                cancelled_.store(true, std::memory_order_release);
+                return;
+            }
+            // Wakes at once when the watch is destroyed.
+            (void)wake_.wait_for(lock, stop, kPoll, [] { return false; });
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable_any wake_;
+    std::atomic<bool> cancelled_{false};
+    std::jthread thread_;  // last: starts after, and stops before, the rest
+};
+
+/// The message for a failure: `interrupted` when Ctrl+C caused it, so the
+/// REPL reports it like any other interruption.
+auto interrupted_or(const std::optional<CancelWatch>& watch, std::string message) -> std::string {
+    if ((watch.has_value() && watch->cancelled()) || ibex::runtime::interrupt_requested()) {
+        return ibex::runtime::interrupt_message();
+    }
+    return message;
+}
+
+/// `prefix` + `message`, except that an interruption stays the bare
+/// `interrupted` the REPL reports.
+auto prefixed(std::string_view prefix, std::string message) -> std::string {
+    if (message == ibex::runtime::interrupt_message()) {
+        return message;
+    }
+    return std::string(prefix) + message;
 }
 
 /// Drivers `scripts/install_adbc_driver.{sh,ps1}` can install. Keep in step
@@ -239,7 +309,9 @@ class AdbcSession final : public ibex::runtime::Resource {
         session->statement_options_ = options.statement;
         auto init = session->init(driver, uri, options);
         if (!init) {
-            // `session` is destroyed here, releasing whatever init acquired.
+            // Release whatever init acquired; a failure there adds nothing to
+            // the error being reported.
+            (void)session->release_handles();
             return std::unexpected(init.error());
         }
         session->quirks_ = quirks_of_vendor(session->vendor_name());
@@ -251,7 +323,9 @@ class AdbcSession final : public ibex::runtime::Resource {
     AdbcSession(AdbcSession&&) noexcept = delete;
     AdbcSession& operator=(AdbcSession&&) noexcept = delete;
 
-    ~AdbcSession() override { (void)release_handles(); }
+    // The last binding went away (or the session ended) without adbc::close:
+    // nobody is left to return a failure to, so it is a warning.
+    ~AdbcSession() override { warn_if_failed(release_handles()); }
 
     [[nodiscard]] auto type_name() const noexcept -> std::string_view override { return kTypeName; }
 
@@ -272,7 +346,7 @@ class AdbcSession final : public ibex::runtime::Resource {
     void release_lease() noexcept {
         busy_ = false;
         if (closed_) {
-            (void)release_handles();
+            warn_if_failed(release_handles());
         }
     }
 
@@ -434,6 +508,17 @@ class AdbcSession final : public ibex::runtime::Resource {
     }
 
    private:
+    /// Report a failed release that no call can return.
+    static void warn_if_failed(const std::expected<void, std::string>& released) noexcept {
+        if (released) {
+            return;
+        }
+        try {
+            ibex::runtime::warn("adbc: closing a connection failed: " + released.error());
+        } catch (...) {  // NOLINT(bugprone-empty-catch): out of memory; nothing to report with
+        }
+    }
+
     /// Run `SELECT 1` on the connection, without a result stream.
     auto run_trivial_query() -> std::expected<void, std::string> {
         AdbcStatement statement{};
@@ -766,7 +851,7 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
         if (!init) {
             op->session_->statement_failed();
             // `op` is destroyed here, releasing the statement and the lease.
-            return std::unexpected(prefix + init.error());
+            return std::unexpected(prefixed(prefix, interrupted_or(op->cancel_, init.error())));
         }
         return ibex::runtime::OperatorPtr(std::move(op));
     }
@@ -777,8 +862,9 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
     AdbcSourceOperator& operator=(AdbcSourceOperator&&) noexcept = delete;
 
     ~AdbcSourceOperator() override {
-        // Children before parents: stream, statement, then the lease on the
-        // connection.
+        // The watch first (it may cancel the statement), then children before
+        // parents: stream, statement, then the lease on the connection.
+        cancel_.reset();
         ibex::interop::release_arrow_stream(&stream_);
         ibex::interop::release_arrow_schema(&schema_);
         if (statement_acquired_) {
@@ -875,7 +961,7 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
         -> std::expected<std::optional<ibex::runtime::Chunk>, std::string> {
         finished_ = true;
         session_->statement_failed();
-        return std::unexpected(std::move(message));
+        return std::unexpected(interrupted_or(cancel_, std::move(message)));
     }
 
     auto make_chunk(ibex::runtime::Table table)
@@ -896,6 +982,7 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
             return status;
         }
         statement_acquired_ = true;
+        cancel_.emplace(&statement_);
 
         status = apply_adbc_options(
             "AdbcStatementSetOption", &statement_, session_->statement_options(),
@@ -1015,6 +1102,7 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
     // Parameters run row by row (`runs_rows_one_by_one`), and the next row.
     std::shared_ptr<const ibex::runtime::Table> row_params_;
     std::size_t next_row_ = 0;
+    std::optional<CancelWatch> cancel_;
 };
 
 /// One statement on a session, holding the session's statement lease for as
@@ -1036,6 +1124,7 @@ class LeasedStatement {
             return std::unexpected(status.error());
         }
         statement->acquired_ = true;
+        statement->cancel_.emplace(&statement->statement_);
         status = apply_adbc_options(
             "AdbcStatementSetOption", &statement->statement_,
             statement->session_->statement_options(),
@@ -1054,6 +1143,7 @@ class LeasedStatement {
     LeasedStatement& operator=(LeasedStatement&&) noexcept = delete;
 
     ~LeasedStatement() {
+        cancel_.reset();  // before the statement it may cancel
         if (acquired_) {
             AdbcError error{};
             AdbcStatementRelease(&statement_, &error);
@@ -1096,7 +1186,7 @@ class LeasedStatement {
             return AdbcStatementExecuteQuery(&statement_, nullptr, &rows_affected, error);
         });
         if (!status) {
-            return std::unexpected(status.error());
+            return std::unexpected(interrupted_or(cancel_, status.error()));
         }
         return rows_affected;
     }
@@ -1111,6 +1201,7 @@ class LeasedStatement {
     BoundTables bound_;
     AdbcStatement statement_{};
     bool acquired_ = false;
+    std::optional<CancelWatch> cancel_;
 };
 
 /// A string column with nulls, filled row by row.
@@ -1470,7 +1561,7 @@ auto execute(const Connection& db, std::string_view sql, const TablePtr& params)
         });
     if (!rows) {
         stmt.failed();
-        return std::unexpected("adbc::execute: " + rows.error());
+        return std::unexpected(prefixed("adbc::execute: ", rows.error()));
     }
     return *rows;
 }
@@ -1536,7 +1627,7 @@ auto write(const Connection& db, const TablePtr& table, std::string_view target,
             });
     if (!rows) {
         stmt.failed();
-        return std::unexpected("adbc::write: " + rows.error());
+        return std::unexpected(prefixed("adbc::write: ", rows.error()));
     }
     // The driver's count, or the table's row count when the driver reports none.
     return *rows >= 0 ? *rows : static_cast<std::int64_t>(table->rows());

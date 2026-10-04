@@ -15,7 +15,9 @@
 #include <ibex/repl/repl.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/interrupt.hpp>
 #include <ibex/runtime/operator.hpp>
+#include <ibex/runtime/warnings.hpp>
 
 #include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -1254,6 +1256,133 @@ TEST_CASE("adbc::tables and adbc::table_schema describe a SQLite database", "[ad
         REQUIRE_FALSE(closed.ok);
         CHECK(contains(closed.error, "adbc::tables: connection is closed"));
     }
+}
+
+/// Run `source`, requesting an interrupt (as the REPL's Ctrl+C handler does,
+/// in the host) after `delay`. Returns the result and how long it took; the
+/// flag is cleared again afterwards.
+auto execute_interrupted(AdbcSession& s, const std::string& source, std::chrono::milliseconds delay)
+    -> std::pair<ibex::repl::ExecutionResult, std::chrono::milliseconds> {
+    ibex::runtime::clear_interrupt();
+    const auto start = std::chrono::steady_clock::now();
+    std::jthread interrupter([delay] {
+        std::this_thread::sleep_for(delay);
+        ibex::runtime::request_interrupt();
+    });
+    auto result = s.session.execute(source);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    interrupter.join();
+    ibex::runtime::clear_interrupt();
+    return {std::move(result), elapsed};
+}
+
+// The plugin has its own copy of the interrupt flag; registering its
+// functions points it at the host's, which the REPL's handler sets. Reading
+// 20M rows takes seconds; interrupted, the query stops at the next batch.
+TEST_CASE("Ctrl+C stops an ADBC query", "[adbc][interrupt]") {
+    AdbcSession s;
+    const SqliteDb db;
+    REQUIRE(s.session
+                .execute("let db = adbc::connect(" + ibex_str(sqlite_driver()) + ", " +
+                         ibex_str(db.path()) + ");")
+                .ok);
+    const auto [result, elapsed] = execute_interrupted(
+        s,
+        "adbc::query(db, \"with recursive c(x) as (select 1 union all select x + 1 from c "
+        "limit 20000000) select x from c\");",
+        std::chrono::milliseconds(200));
+    INFO(result.error);
+    CHECK_FALSE(result.ok);
+    CHECK(result.error == "interrupted");
+    CHECK(elapsed < std::chrono::milliseconds(2000));
+
+    // The connection is still usable.
+    const auto after = s.session.execute("adbc::query(db, \"select 7 as x\");");
+    INFO(after.error);
+    REQUIRE(after.ok);
+    CHECK(ints(*after.table, "x") == std::vector<std::int64_t>{7});
+}
+
+// On a server, a query can block in the driver with no batch to stop at: the
+// watcher cancels it there (AdbcStatementCancel), for a query and for a
+// statement. Runs only when IBEX_TEST_POSTGRES_URI is set.
+TEST_CASE("Ctrl+C cancels a PostgreSQL query on the server", "[adbc][interrupt][postgresql]") {
+    const auto uri = get_env("IBEX_TEST_POSTGRES_URI");
+    if (!uri.has_value() || uri->empty()) {
+        SKIP("IBEX_TEST_POSTGRES_URI is not set");
+    }
+    const std::string driver = get_env("IBEX_TEST_POSTGRES_DRIVER").value_or("postgresql");
+    AdbcSession s;
+    REQUIRE(
+        s.session
+            .execute("let db = adbc::connect(" + ibex_str(driver) + ", " + ibex_str(*uri) + ");")
+            .ok);
+    for (const std::string call : {"adbc::query", "adbc::execute"}) {
+        INFO(call);
+        const auto [result, elapsed] = execute_interrupted(
+            s, call + "(db, \"select 1 as x from pg_sleep(30)\");", std::chrono::milliseconds(300));
+        INFO(result.error);
+        CHECK_FALSE(result.ok);
+        CHECK(result.error == "interrupted");
+        CHECK(elapsed < std::chrono::milliseconds(5000));
+    }
+    // The connection is usable, and the server is not still sleeping for us.
+    const auto after = s.session.execute(
+        "adbc::query(db, \"select count(*) as n from pg_stat_activity where state = 'active' "
+        "and query like 'select 1 as x from pg_sleep%'\");");
+    INFO(after.error);
+    REQUIRE(after.ok);
+    CHECK(ints(*after.table, "n") == std::vector<std::int64_t>{0});
+}
+
+namespace {
+std::vector<std::string> captured_warnings;
+void capture_warning(std::string_view message) noexcept {
+    captured_warnings.emplace_back(message);
+}
+}  // namespace
+
+// A connection closed by its last binding going away has no call to fail: a
+// failed close is a warning, through the host's sink. MySQL/MariaDB is the
+// driver that reports one: the rollback of an open transaction on a connection
+// the server has killed. (PostgreSQL's driver reports that rollback as done.)
+TEST_CASE("A failed implicit close is a warning", "[adbc][connection][mysql]") {
+    const auto uri = get_env("IBEX_TEST_MYSQL_URI");
+    if (!uri.has_value() || uri->empty()) {
+        SKIP("IBEX_TEST_MYSQL_URI is not set");
+    }
+    const std::string driver = get_env("IBEX_TEST_MYSQL_DRIVER").value_or("mysql");
+    AdbcSession s;
+    const auto exec = [&](const std::string& source) {
+        auto result = s.session.execute(source);
+        INFO(source);
+        INFO(result.error);
+        REQUIRE(result.ok);
+        return result;
+    };
+    const std::string connect = "adbc::connect(" + ibex_str(driver) + ", " + ibex_str(*uri) + ")";
+    exec("let db = " + connect + ";");
+    exec("let admin = " + connect + ";");
+    const auto id =
+        ints(*exec("adbc::query(db, \"select connection_id() as id\");").table, "id").at(0);
+    exec("adbc::begin(db);");
+    exec("adbc::execute(admin, \"kill " + std::to_string(id) + "\");");
+
+    captured_warnings.clear();
+    const auto previous = ibex::runtime::set_warning_sink(&capture_warning);
+    exec("let db = 0;");  // the last binding: closes, rolling back
+    (void)ibex::runtime::set_warning_sink(previous);
+    INFO((captured_warnings.empty() ? std::string{} : captured_warnings[0]));
+    REQUIRE(captured_warnings.size() == 1);
+    CHECK(contains(captured_warnings[0], "adbc: closing a connection failed"));
+
+    // A close that works says nothing.
+    captured_warnings.clear();
+    (void)ibex::runtime::set_warning_sink(&capture_warning);
+    exec("let admin = 0;");
+    (void)ibex::runtime::set_warning_sink(previous);
+    CHECK(captured_warnings.empty());
 }
 
 // Reusable connections against a real PostgreSQL server. Runs only when

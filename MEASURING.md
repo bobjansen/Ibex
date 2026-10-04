@@ -169,7 +169,7 @@ Two things to know when reading it:
 
 * **`build_self_ms`, not `next_self_ms`, is where a materializing fallback
   shows up.** A node whose work happens in `build_operator` (anything routed
-  through `interpret_node`) reports there, and its `occupancy` is meaningless
+  through `run_materialized_node`) reports there, and its `occupancy` is meaningless
   because `span_ns` only covers `next()`.
 * The accounting closes: `pool_work + pool_idle + pool_unqueued ≈
   pool_capacity` (99.6% over PDS-H) and `stage_self + stage_ring_wait +

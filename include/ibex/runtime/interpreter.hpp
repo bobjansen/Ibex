@@ -676,8 +676,8 @@ using DeferredScanRegistry = std::map<std::string, DeferredScan>;
 
 /// Query-scoped execution context. Created once at the `interpret()` boundary
 /// and threaded explicitly through operator construction (`build_operator`) and
-/// the full-table interpreter (`interpret_node`) instead of an execution-scoped
-/// thread-local. Making per-query state an explicit parameter is the
+/// the whole-table kernels it falls back to (`run_materialized_node`) instead of
+/// an execution-scoped thread-local. Making per-query state an explicit parameter is the
 /// prerequisite for moving work onto worker threads (see the runtime
 /// multithreading plan, Phase 0): a worker must be able to see this state
 /// without relying on the thread it happens to run on.

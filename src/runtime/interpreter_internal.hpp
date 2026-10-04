@@ -1312,11 +1312,17 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 
 // ── Cross-TU function declarations ───────────────────────────────────────────
 
-// interpreter.cpp — dispatcher, small table ops, registries.
-[[nodiscard]] auto interpret_node(const ir::Node& node, const TableRegistry& registry,
-                                  const ScalarRegistry* scalars, const ExternRegistry* externs,
-                                  const ExecutionContext& exec, ModelResult* model_out = nullptr)
+// materialized_node.cpp — run one node the physical plan has no streaming
+// operator for: inputs through `materialize_plan`, then its whole-table kernel.
+// Only `build_materialized_fallback` calls it.
+[[nodiscard]] auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
+                                         const ScalarRegistry* scalars,
+                                         const ExternRegistry* externs,
+                                         const ExecutionContext& exec,
+                                         ModelResult* model_out = nullptr)
     -> std::expected<Table, std::string>;
+
+// interpreter.cpp — public entry points, small table ops, registries.
 [[nodiscard]] auto ordering_keys_for_table(const Table& input,
                                            const std::vector<ir::OrderKey>& keys)
     -> std::vector<ir::OrderKey>;
@@ -1334,7 +1340,7 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 /// IMPLEMENTATION, the split `ops.hpp` already uses. There used to be a serial
 /// dedup loop here that boxed a `Key` per row and could not be parallel, while
 /// the operator every real query reaches has single-column and packed-key fast
-/// paths. Nothing routed to the serial one except `interpret_node`'s fallback,
+/// paths. Nothing routed to the serial one except `run_materialized_node`'s fallback,
 /// so the duplicate bought nothing and could only drift.
 ///
 /// Takes `exec` because the implementation is now the chunked operator, which
@@ -1350,7 +1356,7 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 /// assertion, `take` all.
 ///
 /// One definition, two callers — `build_operator` picking the streaming path and
-/// `interpret_node` picking the whole-table adapter. They were written out
+/// `run_materialized_node` picking the whole-table adapter. They were written out
 /// separately at first and were character-identical, which is the I4 failure
 /// mode in miniature: a six-clause predicate duplicated across two files, where
 /// a later clause added to one copy silently routes a join the operator cannot

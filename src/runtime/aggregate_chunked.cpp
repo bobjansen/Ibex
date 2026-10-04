@@ -153,7 +153,7 @@ auto chunked_agg_tracks_validity(ir::AggFunc func) -> bool {
 /// numeric (int/double) inputs. Nullable agg inputs are handled — null
 /// rows skip the update, and an all-null group emits a null result.
 /// Nullable group-by columns are not supported yet; they fall back to
-/// `aggregate_table` via `interpret_node`. Complex aggs (Median, etc.)
+/// `aggregate_table` via `run_materialized_node`. Complex aggs (Median, etc.)
 /// and string aggs also fall back.
 ///
 /// The first chunk's group-by column types are snapshotted (including

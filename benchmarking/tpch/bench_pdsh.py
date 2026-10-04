@@ -37,7 +37,7 @@ def percentile(data: list[float], p: float) -> float:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--engine", choices=("polars", "duckdb"), required=True)
-    parser.add_argument("--polars-engine", choices=("in-memory", "streaming"), default="in-memory",
+    parser.add_argument("--polars-engine", choices=("in-memory", "streaming"), default="streaming",
                         help="which Polars executor to select (Polars only). Upstream pins "
                              "'in-memory' explicitly unless told otherwise, so this is a real "
                              "choice rather than a default; see the note in main().")

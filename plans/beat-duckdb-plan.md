@@ -2,9 +2,14 @@
 
 Status: **proposed, parked until ADBC support is finished** (decided
 2026-09-27). This plan sets the target and ranks the work; nothing in it is
-started. It is the successor target to `beat-polars-plan.md`: on PDS-H SF-10 on
-the AWS benchmark box, Ibex is now ahead of Polars at 8 and 16 cores (total
-0.67 and 0.64), and **DuckDB is the faster of the two reference engines**.
+started. It is the successor target to `beat-polars-plan.md`.
+
+**Correction (2026-10-04):** the Polars column below is Polars' IN-MEMORY
+executor, the harness default at the time. Against its streaming executor (the
+reference since the default flipped) Ibex was *behind* at 8 and 16 cores on
+2026-09-24 (Ibex/Polars-streaming 1.08 / 1.36, SF-8), and Ibex/DuckDB barely
+moved between the two runs, so the "ahead of Polars" reading was the executor
+choice, not Ibex. The DuckDB numbers stand.
 
 **Where Ibex stands (SF-10, 16 physical cores):** ahead of DuckDB on one core
 (0.86 total), level at 8 cores (1.02 total, geomean 1.00), behind at 16 (1.17

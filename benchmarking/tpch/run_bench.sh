@@ -28,19 +28,22 @@
 #
 # A DuckDB reference runs in the same sitting by default -- a comparison against
 # a stale reference number is worthless (a slower box then reads as an ibex
-# regression). `--no-duckdb` is for an intentionally restricted comparison. The
-# in-memory Polars reference also runs unless --no-polars-in-memory is passed.
+# regression). `--no-duckdb` is for an intentionally restricted comparison.
 # Needs a pola-rs/polars-benchmark checkout,
 # auto-found at ~/polars-benchmark or given by --pdsh-root / $PDSH_ROOT. For a
 # quick ibex-only look use bench_ibex.py instead.
 #
-# The in-memory Polars executor materialises whole tables and can OOM a small
-# box at high scale factors; --no-polars-in-memory drops those two passes (pair
-# it with --polars-streaming so a Polars reference still runs).
+# The Polars reference is its STREAMING executor, Polars' fastest. The in-memory
+# executor (upstream's explicit default) is off: a ratio against the slower of
+# two available executors flatters Ibex -- on 2026-09-27 it turned Ibex/Polars
+# 1.36 into 0.64 at 16 cores with Ibex itself barely changed. --polars-in-memory
+# adds it back as an extra column; it materialises whole tables and can OOM a
+# small box at high scale factors. --polars-streaming and --no-polars-in-memory
+# are accepted for old command lines and are the defaults.
 #
 # Usage:
 #   ./run_bench.sh [--sf N] [--warmup N] [--iters N] [--pdsh-root DIR]
-#                  [--polars-streaming] [--no-polars-in-memory] [--no-duckdb]
+#                  [--polars-in-memory] [--no-duckdb]
 #                  [--cores N] [--label TEXT] [--no-archive] [--no-answer-check]
 #
 # Before timing anything, every Ibex answer is diffed against upstream Polars
@@ -60,8 +63,8 @@ RESULTS="$SCRIPT_DIR/results"
 SCALE=1
 WARMUP=1
 ITERS=5
-POLARS_STREAMING=0
-POLARS_IN_MEMORY=1
+POLARS_STREAMING=1
+POLARS_IN_MEMORY=0
 DUCKDB=1
 ARCHIVE=1
 ANSWER_CHECK=1
@@ -78,6 +81,7 @@ while [[ $# -gt 0 ]]; do
         --warmup) WARMUP="$2"; shift 2 ;;
         --iters)  ITERS="$2";  shift 2 ;;
         --pdsh-root) PDSH_ROOT="$2"; shift 2 ;;
+        --polars-in-memory) POLARS_IN_MEMORY=1; shift ;;
         --polars-streaming) POLARS_STREAMING=1; shift ;;
         --no-polars-in-memory) POLARS_IN_MEMORY=0; shift ;;
         --no-duckdb) DUCKDB=0; shift ;;
@@ -262,10 +266,10 @@ rm -f "$RESULTS/ibex_st${SUFFIX}.tsv.tmp"
 # the in-tree Polars implementation removed these are the only reference left,
 # and measuring ibex on 8 cores against a reference free to use 24 is not a
 # comparison. (Nothing is version-pinned here: --pdsh-root is a checkout.)
-# The in-memory executor is the upstream default, but it materialises whole
-# tables; --no-polars-in-memory skips it for a memory-constrained box. Stale
-# TSVs from an earlier run are removed so print_table.py and the archive do not
-# pick up a number this sitting did not measure.
+# The in-memory executor is upstream's explicit default but not the reference
+# here (see the header): it runs only with --polars-in-memory. Stale TSVs from
+# an earlier run are removed so print_table.py and the archive do not pick up a
+# number this sitting did not measure.
 if [[ "$POLARS_IN_MEMORY" -eq 1 ]]; then
     echo "=== upstream PDS-H Polars (multi-threaded, ${CORES:-$(nproc)} cores) ==="
     "${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" --engine polars --pdsh-root "$PDSH_ROOT" \
@@ -277,18 +281,16 @@ if [[ "$POLARS_IN_MEMORY" -eq 1 ]]; then
         --engine polars --pdsh-root "$PDSH_ROOT" --sf "$SCALE" --warmup "$WARMUP" --iters "$ITERS" \
         --framework pdsh-polars-st --out "$RESULTS/pdsh_polars_st${SUFFIX}.tsv"
 else
-    echo "=== upstream PDS-H Polars in-memory: SKIPPED (--no-polars-in-memory) ==="
+    echo "=== upstream PDS-H Polars in-memory: SKIPPED (pass --polars-in-memory to add it) ==="
     rm -f "$RESULTS/pdsh_polars${SUFFIX}.tsv" "$RESULTS/pdsh_polars_st${SUFFIX}.tsv"
 fi
 
-# Polars' streaming executor, run only on request. Upstream selects the
+# Polars' streaming executor: the Polars reference. Upstream selects the
 # in-memory one EXPLICITLY unless told otherwise, so which executor the
 # reference uses is a choice this harness makes rather than a default it
 # inherits -- and reporting a ratio against the slower of two available
-# executors would be the same mistake, in a new place, that removing the
-# in-tree Polars implementation was meant to end. Off by default because every
-# reference re-runs from scratch each sitting and these are two more full
-# passes; on when the comparison is the point.
+# executors is the same mistake, in a new place, that removing the in-tree
+# Polars implementation was meant to end.
 if [[ "$POLARS_STREAMING" -eq 1 ]]; then
     echo "=== upstream PDS-H Polars, streaming engine (${CORES:-$(nproc)} cores) ==="
     "${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" --engine polars \

@@ -234,7 +234,7 @@ The devices:
 
 The only legitimate exceptions: PDS-H q01/q09/q15 differ by ≤1 ulp from parallel
 float reduction order (itself thread-count-independent), enumerated in
-`beat-polars-plan.md` §5. Anything else that differs is a bug. The former
+`plans/beat-both-plan.md` §4. Anything else that differs is a bug. The former
 two-Int64-key owned-aggregate divergence no longer reproduces; the
 "two-key grouped aggregate is deterministic across thread counts" regression
 test now guards the serial and parallel paths.

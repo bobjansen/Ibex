@@ -37,7 +37,7 @@ history).
 
 | Plan | Status | What's actually left |
 |---|---|---|
-| [beat-polars-plan.md](beat-polars-plan.md) | **Ongoing umbrella; W0 closed 2026-09-24** on 16 physical cores (AWS r7i.8xlarge, SMT off): Ibex/Polars 0.61 at 1 core, 1.08 at 8, 1.36 at 16 (geomean 1.45); implied fraction ~88% against Polars' ~98%. The dev box flattered Ibex above ~4 cores. | Serial time is the gap: 1.87 s flat from 8 to 16 cores, 39% of wall at 16; parity needs the fraction at ~93%. §3 order, by share of the 16-core gap (losers +1,117 ms, winners −129): q10 (24%); the inner-join group q07/q03/q05/q19 (33%); q16 and q13; q01; the tail. q21 is a watch item (its lead shrinks with cores). W1 constants after. |
+| [beat-both-plan.md](beat-both-plan.md) | **Ongoing umbrella, created 2026-10-04** by merging beat-polars and beat-duckdb. References: Polars **streaming** and DuckDB (never Polars in-memory). Ibex leads both on 1 core and loses from ~6–8 cores up; the gap is serial time that stays flat with cores (39% of wall at 16). The benchmark write-up waits for milestone 1. | Milestone 1: total and geomean ≤ 1.0 against both at 8 cores on AWS SF-10 (1 core still ahead, 2 cores not a loss). Baseline §1.0 pending (AWS run `20261004T100951_1bfeceb5`), then re-rank §3 by ms lost against the faster reference; provisional order q10 → deferred-probe joins (q03/q05/q07/q09) → q01 → q12/q14/q15/q19/q04 → q16/q13 → scale-cliff sweep → canonical-plan audit. |
 | [kernel-pipeline-execution-plan.md](kernel-pipeline-execution-plan.md) | **Phase 2 complete** except `KernelContext` (deliberately unbuilt); Phase 3 handoff/island/raw-thread work complete, with accounting and DOP/memory budgets deferred; Phase 4 construction ownership **and fan-out authority** done (backlog 116→6 breakers, plan describes 97% of real-work nodes). Streaming inner joins have typed `HashBuild`/`HashProbe` nodes and positional `JoinColumnMapping`. Streaming aggregates have positional `AggregateColumnMapping`, authoritative partition/finalize policy, and a typed Discovery → Accumulation → FinalOrdering → Emission hash-fallback chain. The serial coordinator invokes all four nodes through a bounded discovery transfer or explicit fused marker, with independent profile rows. Executor-seam mutations prove mappings, policies, and structural edges are consumed or rejected. Known closed schemas bind during planning; lazy/open schemas bind once at execution. Semi/anti retains its separate streaming operator. Architectural successor: typed logical IR, physical pipelines, morsel executor, templated kernel library; not a JIT. | Next: attach aggregate fan-out policy to each structural node, admit it phase by phase, then split `chunked.cpp` by ownership. |
 | [non-row-local-filter-plan.md](non-row-local-filter-plan.md) | Stage 1 shipped | `lag`/`lead`/`is_null` in filter work. Remaining: `rank(...)` in filter/select with `by`, explicit `order {}` context, rolling functions in filter (`price > rolling_mean(price)`) |
 | [bigger-than-ram-plan.md](bigger-than-ram-plan.md) | Phase 4 bullet 1 of 4 done | Out-of-core execution. Done: chunked/streaming `read_parquet` (branch `chunked-parquet-read`; ~6.5× lower peak RSS, ~1.7× faster, verified local + AWS). Next: column projection pushdown, row-group stats pushdown, directory/Hive datasets (rest of Phase 4), then Phase 1 spill infrastructure (prerequisite for Phases 2–3, 6–7: external sort, out-of-core join, adaptive spill selection) |
@@ -60,7 +60,6 @@ history).
 
 | Plan | Notes |
 |---|---|
-| [beat-duckdb-plan.md](beat-duckdb-plan.md) | **Parked until ADBC is finished (2026-09-27).** Successor target to beat-polars: on PDS-H SF-10 (AWS, 16 physical cores, `546ce652`) Ibex is ahead of Polars (0.67 / 0.64 total at 8 / 16 cores) and DuckDB is the faster reference. Ibex/DuckDB 0.86 at 1 core, 1.02 at 8, 1.17 at 16; implied fraction 95.0% against DuckDB's 98.1%, parity needs ~96.7%. Workstreams: W1 scaling losers by ms lost (q01, q10, q21, q03, q04, q19, q12…; start with q12), W2 scale-cliff sweep over fixed thresholds, W3 canonical-plan audit, W4 q01 per-core cost, W5 small items. |
 | [radix-partitioned-groupby.md](radix-partitioned-groupby.md) | Noted, not built. High-cardinality group-by is memory-bound; radix partitioning remains a q18/q20 mechanism. Q10 no longer reaches the generic mixed-key ceiling (2026-08-27: FD reduction + discovery-time `First` gathering handle that shape). **But the `First` gathering was itself the measured q10 cost** — late-materialize-fd-payload (retired, see Complete) LANDED (`568c4974`, q10 −32.8%) and lifts that payload above the top-k. |
 | [in-subquery-plan.md](in-subquery-plan.md) | Proposal: `x in (table_expr)` / `not in` as semi / null-aware anti join — the subquery family, not a scalar like `like()` |
 | [extern-series-arguments-plan.md](extern-series-arguments-plan.md) | Proposal: `Series<T>` as a first-class extern argument, starting with CSV null tokens |
@@ -94,6 +93,11 @@ in active plans to `plans/done/...` paths refer to that history.
   "do not widen `is_chunk_predicate_native`/`is_range_native_expr`" rule on
   `try_plan_direct_like_int_field`.
 
+- **beat-polars-plan.md** and **beat-duckdb-plan.md** — merged 2026-10-04 into
+  `beat-both-plan.md` (one target: both references at 8 cores). Full text at
+  `git show 7a32d537:plans/<name>`, including the dev-box sweeps, the W0
+  measurement log and the q14 bandwidth study.
+
 - **Retired 2026-10-04.** Read any of them at `git show 0d069262:plans/<name>`.
   - **adbc-plan.md** — ADBC library work is done: import types, `adbc::write` /
     `execute`, bound parameters, reusable connections, discovery, DuckDB and
@@ -119,7 +123,7 @@ in active plans to `plans/done/...` paths refer to that history.
     `ibex_compile`. Left: `window N rows` block syntax, and tuple-field
     `update` inside `window` (the interpreter rejects it too).
   - **join-perf-plan.md** — items 1–3 landed (q09 −23%, q13 −30%); item 4 was
-    overtaken by beat-polars. Measured and rejected, do not re-run: a native
+    overtaken by beat-polars (now `beat-both-plan.md`). Measured and rejected, do not re-run: a native
     Parquet encoding decoder, a decode arena, mmap; and do not "just link
     jemalloc" (`tune_allocator_once` already tunes glibc).
   - **benchmark-coverage-plan.md** — ~95% done. Left: ClickHouse EWMA (needs an

@@ -285,7 +285,7 @@ architectural limits and were neither:
 - **`__memmove` percentages are not DRAM traffic.** A decode change sized off a
   33%-of-profile `__memmove` measured 20% *slower*, because the buffer being
   copied is a 64Ki-row scratch batch that lives in L2. Ask whether the buffer
-  fits in cache before treating a copy as bandwidth. `beat-polars-plan.md` §8.6.
+  fits in cache before treating a copy as bandwidth. `beat-both-plan.md` §5.
 
 And one measurement that bounds the whole discussion: on the dev box the pure
 page-cache read ceiling is **44.5 GB/s at 8 threads** (14.3 at one). A query
@@ -295,8 +295,8 @@ limit. Cheap to re-measure; worth doing before calling anything bandwidth-bound.
 
 ## When a fan-out moves work rather than adding it
 
-`push_computed_columns_into_joins` (built and reverted, `beat-polars-plan.md`
-§6) is the cautionary case for a whole class: moving an expression to a
+`push_computed_columns_into_joins` (built and reverted, `beat-both-plan.md`
+§5) is the cautionary case for a whole class: moving an expression to a
 different operator changes the **row count it is evaluated over**, and that
 factor is invisible in the plan without cardinality estimates. Pushing
 `Int64(like(p_type, …))` onto q14's `part` side was 2.7× more evaluations and

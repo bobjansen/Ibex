@@ -157,4 +157,4 @@ data-derived partition counts, first-occurrence group ids assigned after the
 parallel phase, lowest-sequence error selection, interrupt over data error.
 The three legitimate ulp exceptions (PDS-H q01/q09/q15, parallel float
 reduction order — itself thread-count-independent) are enumerated in
-`beat-polars-plan.md` §5. Anything else that differs is a bug.
+`plans/beat-both-plan.md` §4. Anything else that differs is a bug.

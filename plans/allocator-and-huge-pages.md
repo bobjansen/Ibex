@@ -29,7 +29,7 @@ Both harnesses time a warm loop in one process and keep the fastest run
 in one Python process). The method is symmetric, but Ibex gains far more from
 it. **q21 is about 0.43 warm against warm and about 0.63 fresh against fresh.**
 Both ratios are from the dev box at 8 cores, where cross-engine ratios flatter
-Ibex (`beat-polars-plan.md` §1b), so confirm them on AWS before quoting them.
+Ibex (`beat-both-plan.md` §4), so confirm them on AWS before quoting them.
 
 ## Why a fresh Ibex process is slow: first-touch page faults
 
@@ -131,11 +131,11 @@ Recommended when reopened: (1) plus a line in the README's performance section.
 ## Consequences that apply now
 
 - **Quote fresh-process timing next to the warm loop** whenever a claim leans on
-  a large Ibex win (`beat-polars-plan.md` §5). The warm loop is not unfair to
+  a large Ibex win (`beat-both-plan.md` §4). The warm loop is not unfair to
   Polars, whose warm gain is small, but it hides Ibex's first-run cost. A
   `--fresh` mode in `bench_ibex.py` would make this routine.
 - **Do not re-try jemalloc for PDS-H or column-only huge pages** without new
-  evidence (listed in `beat-polars-plan.md` §6).
+  evidence (listed in `beat-both-plan.md` §5).
 
 ## Reopen when
 

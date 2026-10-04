@@ -9,6 +9,7 @@ add_library(ibex_ir STATIC
     expr_predicates.cpp
     extern_sources.cpp
     join_pushdown.cpp
+    join_predicate_keys.cpp
     join_semi_reduction.cpp
     join_order.cpp
     join_output.cpp

@@ -2386,8 +2386,21 @@ namespaces, so a collision between them affects the result schema (see **Output
 columns** above) but not how the predicate reads.
 
 Non-equijoin joins use a nested-loop algorithm (O(N×M)) and are therefore
-suited for smaller tables or selective predicates. Equijoin hash-join paths
-are not used when the `on` clause is a predicate expression.
+suited for smaller tables or selective predicates.
+
+**Equality predicates run as equijoins.** A predicate made only of equalities
+between a left and a right column (`on a == b`, `on a == b && c == d`) means
+what the brace form `on { a = b, c = d }` means, and runs as that hash join,
+with the same result: null keys match nothing either way, and a pair with
+different names keeps both columns either way. This holds when both columns'
+types are known when the query is planned and are the same type (String and a
+dictionary-encoded string count as one), other than floating-point (`==` never
+matches NaN) and decimals of differing scale. Such a predicate that does not
+qualify — differing or unknown types, floating-point, or `left(k) == right(k)`
+with one name on both sides, where a key would fold the two columns into one —
+keeps its nested loop and is reported with a warning naming the reason and the
+brace form. A predicate with any other term (`a == b && x < y`) is an ordinary
+theta join.
 
 **Row ordering.** A join makes no promise about the row order of its output.
 Implementations choose an execution strategy freely — which side is built into

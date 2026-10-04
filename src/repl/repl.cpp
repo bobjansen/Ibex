@@ -11,6 +11,7 @@
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/extern_sources.hpp>
 #include <ibex/ir/group_key_reduction.hpp>
+#include <ibex/ir/join_predicate_keys.hpp>
 #include <ibex/ir/join_pushdown.hpp>
 #include <ibex/ir/join_reorder.hpp>
 #include <ibex/ir/join_semi_reduction.hpp>
@@ -34,6 +35,7 @@
 #include <ibex/runtime/rng.hpp>
 #include <ibex/runtime/safe_arith.hpp>
 #include <ibex/runtime/table_format.hpp>
+#include <ibex/runtime/warnings.hpp>
 
 #include <algorithm>
 #include <array>
@@ -97,6 +99,18 @@
 namespace ibex::repl {
 
 namespace {
+
+/// `on a == b` as a hash join where it means the same thing
+/// (`ir::equality_predicates_to_join_keys`), warning about each equality join
+/// it has to leave as a nested loop. First of the schema-aware join rewrites:
+/// the ones after it act only on keyed joins.
+auto equality_joins_as_keys(ir::NodePtr plan, const ir::SourceSchemas& schemas) -> ir::NodePtr {
+    auto rewritten = ir::equality_predicates_to_join_keys(std::move(plan), schemas);
+    for (const auto& warning : rewritten.warnings) {
+        runtime::warn(warning);
+    }
+    return std::move(rewritten.plan);
+}
 
 using FunctionRegistry = robin_hood::unordered_map<std::string, parser::FunctionDecl>;
 using ExternDeclRegistry = robin_hood::unordered_map<std::string, parser::ExternDecl>;
@@ -4126,6 +4140,7 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     // must precede canonicalize; `push_semi_joins_down` reads what
     // `push_filters_into_joins` leaves behind, and both must land before
     // `required_columns` computes column demand below.
+    lowered.value() = equality_joins_as_keys(std::move(lowered.value()), context.source_schemas);
     lowered.value() =
         ir::push_filters_into_joins(std::move(lowered.value()), context.source_schemas);
     lowered.value() = ir::push_semi_joins_down(std::move(lowered.value()), context.source_schemas);
@@ -6088,6 +6103,7 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
     if (auto ok = check_and_fuse_ascriptions(rewritten, schemas); !ok.has_value()) {
         return std::unexpected(ok.error());
     }
+    rewritten = equality_joins_as_keys(std::move(rewritten), schemas);
     rewritten = ir::push_filters_into_joins(std::move(rewritten), schemas);
     rewritten = ir::push_semi_joins_down(std::move(rewritten), schemas);
     rewritten = ir::reduce_inner_joins_to_semi(std::move(rewritten), schemas);
@@ -6800,6 +6816,7 @@ void print_physical_explain(parser::Expr& expr, const runtime::TableRegistry& ta
         ibex::formatting::print("error: {}\n", lowered.error().message);
         return;
     }
+    lowered.value() = equality_joins_as_keys(std::move(lowered.value()), context.source_schemas);
     lowered.value() =
         ir::push_filters_into_joins(std::move(lowered.value()), context.source_schemas);
     lowered.value() = ir::push_semi_joins_down(std::move(lowered.value()), context.source_schemas);

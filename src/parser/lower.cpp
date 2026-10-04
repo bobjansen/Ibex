@@ -61,6 +61,7 @@
 #include <ibex/ir/builder.hpp>
 #include <ibex/ir/column_name_map.hpp>
 #include <ibex/ir/expr_predicates.hpp>
+#include <ibex/ir/join_predicate_keys.hpp>
 #include <ibex/ir/join_pushdown.hpp>
 #include <ibex/ir/join_semi_reduction.hpp>
 #include <ibex/ir/model_accessors.hpp>
@@ -6848,6 +6849,9 @@ auto lower(const Program& program) -> LowerResult {
     // Schema-aware join pushdown runs before canonicalize: canonicalize is a
     // pure structural rewrite that cannot tell which side of a join produces a
     // column, and its rules expect the un-fused Filter(Join(...)) shape.
+    // `on a == b` as a hash join where that means the same thing. Its warnings
+    // (equality joins left as nested loops) are reported where queries run.
+    *lowered = ir::equality_predicates_to_join_keys(std::move(*lowered), source_schemas).plan;
     *lowered = ir::push_filters_into_joins(std::move(*lowered), source_schemas);
     *lowered = ir::push_semi_joins_down(std::move(*lowered), source_schemas);
     *lowered = ir::reduce_inner_joins_to_semi(std::move(*lowered), source_schemas);

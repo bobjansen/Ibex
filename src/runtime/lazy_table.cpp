@@ -1156,7 +1156,8 @@ auto LazyTable::project_where_unit(const std::set<std::string>& names,
                     }
                     if (have_keys && field.name == *dynamic_key) {
                         // A null key fails the filter, so every value is valid.
-                        out.add_column(field.name, Column<std::int64_t>{std::move(key_values)});
+                        out.add_column(field.name,
+                                       Column<std::int64_t>{std::exchange(key_values, {})});
                         continue;
                     }
                     const auto* entry = decoded.find_entry(field.name);

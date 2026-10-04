@@ -11568,6 +11568,46 @@ TEST_CASE("filter by bare boolean column reference keeps true rows", "[filter][t
     REQUIRE(col[1] == 30);
 }
 
+TEST_CASE("filter compares Bool columns and predicates", "[filter][types]") {
+    // Bool vs Bool: columns, a literal, and whole predicates on both sides,
+    // with false < true as in SQL and Polars. `Column<bool>` is bit-packed, so
+    // it needs its own comparison path rather than the pointer kernels.
+    runtime::Table table;
+    table.add_column("val", Column<std::int64_t>{10, 20, 30, 40});
+    table.add_column("a", Column<bool>{true, false, true, false});
+    table.add_column("b", Column<bool>{true, true, false, false});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+    const auto vals = [&](const char* source) {
+        auto ir = require_ir(source);
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto& col = std::get<Column<std::int64_t>>(*result->find("val"));
+        return std::vector<std::int64_t>(col.begin(), col.end());
+    };
+
+    CHECK(vals("t[filter a == b];") == std::vector<std::int64_t>{10, 40});
+    CHECK(vals("t[filter a != b];") == std::vector<std::int64_t>{20, 30});
+    CHECK(vals("t[filter a < b];") == std::vector<std::int64_t>{20});
+    CHECK(vals("t[filter a >= b];") == std::vector<std::int64_t>{10, 30, 40});
+    CHECK(vals("t[filter a == true];") == std::vector<std::int64_t>{10, 30});
+    CHECK(vals("t[filter false != b];") == std::vector<std::int64_t>{10, 20});
+    CHECK(vals("t[filter (val > 15) != (val < 35)];") == std::vector<std::int64_t>{10, 40});
+}
+
+TEST_CASE("filter Bool comparison propagates null", "[filter][types]") {
+    // (k > 1) is null where k is; comparing it keeps no row there, either way.
+    auto ir = require_ir(R"(
+let t = Table { k = [1, null, 3], j = [3, 3, 1] };
+t[filter (k > 1) != (j > 1) || (k > 1) == (j > 1)];
+)");
+    runtime::TableRegistry registry;
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+}
+
 TEST_CASE("filter on non-boolean column still returns not-a-boolean-expression error",
           "[filter][types]") {
     // Exercises compute_mask<FilterColumn>'s fallback branch: a bare non-Bool

@@ -1,0 +1,18 @@
+// Bool compares with Bool — columns, literals, and whole predicates — with
+// false < true, and null in, null out. The interpreter and the emitted C++ must
+// agree. `exists(...)` is a Bool too, so two of them compare like any other.
+let t = Table {
+    k = [1, 2, null, 4],
+    j = [3, 2, 1, 1],
+    f = [true, false, true, false]
+};
+let lines = Table { k = [1, 1, 2], late = [true, false, false] };
+rbind(
+    t[filter (k > 1) != (j > 1)][update { which = "ne" }],
+    t[filter f == (k > 1)][update { which = "eq" }],
+    t[filter f < (j > 1)][update { which = "lt" }],
+    t[filter f == true][update { which = "lit" }],
+    t[filter exists(lines[filter k == outer(k) && late]) != exists(lines[filter k == outer(k)])][
+        update { which = "exists" }
+    ]
+)[order { which, j }];

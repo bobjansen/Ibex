@@ -480,12 +480,56 @@ namespace {
 
 // `off` is the source offset of `col` and `validity` (a borrowed column under a
 // non-whole RowRange); the produced mask is always dense.
+// Bool comparisons, with false < true as in SQL and Polars. `Column<bool>` is
+// bit-packed, so it cannot go through cmp_into's pointer kernels; `lhs(i)` and
+// `rhs(i)` read row i of each side.
+template <typename Lhs, typename Rhs>
+void cmp_bools(ir::CompareOp op, const Lhs& lhs, const Rhs& rhs, uint8_t* mp, std::size_t n) {
+    switch (op) {
+        case ir::CompareOp::Eq:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = lhs(i) == rhs(i);
+            break;
+        case ir::CompareOp::Ne:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = lhs(i) != rhs(i);
+            break;
+        case ir::CompareOp::Lt:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = static_cast<int>(lhs(i)) < static_cast<int>(rhs(i));
+            break;
+        case ir::CompareOp::Le:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = static_cast<int>(lhs(i)) <= static_cast<int>(rhs(i));
+            break;
+        case ir::CompareOp::Gt:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = static_cast<int>(lhs(i)) > static_cast<int>(rhs(i));
+            break;
+        case ir::CompareOp::Ge:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = static_cast<int>(lhs(i)) >= static_cast<int>(rhs(i));
+            break;
+    }
+}
+
 auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, std::size_t off,
                         const LitVal& lit, std::size_t n, const ValidityBitmap* validity = nullptr)
     -> std::expected<Mask, std::string> {
     Mask result;
     result.value.resize(n);
     uint8_t* mp = result.value.data();
+    if (const auto* bool_col = std::get_if<Column<bool>>(&col)) {
+        const auto* value = std::get_if<bool>(&lit);
+        if (value == nullptr) {
+            return std::unexpected("filter: a Bool column compares only with a Bool");
+        }
+        cmp_bools(
+            op, [&](std::size_t i) { return (*bool_col)[off + i]; },
+            [&](std::size_t) { return *value; }, mp, n);
+        result.apply_validity(validity, off, n);
+        return result;
+    }
     // Decimal: exact across scales, against a decimal, an integer, or a float
     // literal read back from its own text (`price > 10.5` means 10.5).
     if (std::holds_alternative<Column<Decimal>>(col) || std::holds_alternative<DecimalValue>(lit)) {
@@ -893,6 +937,14 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, std::size_t lhs_off,
         }
         if (const auto* r = std::get_if<Column<std::string>>(&rhs)) {
             cmp_string_views(*l, *r);
+            return return_with_validity();
+        }
+    }
+    if (const auto* l = std::get_if<Column<bool>>(&lhs)) {
+        if (const auto* r = std::get_if<Column<bool>>(&rhs)) {
+            cmp_bools(
+                op, [&](std::size_t i) { return (*l)[lhs_off + i]; },
+                [&](std::size_t i) { return (*r)[rhs_off + i]; }, mp, n);
             return return_with_validity();
         }
     }

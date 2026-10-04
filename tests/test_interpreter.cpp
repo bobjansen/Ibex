@@ -16533,6 +16533,81 @@ TEST_CASE("Deferred probe filters Date, Timestamp and Bool keys like Int64 ones"
     }
 }
 
+TEST_CASE("Joins under rbind keep their deferred probe", "[runtime][join][deferred_probe]") {
+    // `rbind` is a materializing node; its operands used to be evaluated by
+    // `interpret_node`, whose join materializes both sides before any build
+    // key exists, so a deferred probe scan under it decoded every row.
+    constexpr std::size_t kLazyRows = 70'000;  // above kStreamRightThreshold (65536)
+    runtime::Table left;
+    left.add_column("k", Column<std::int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9});
+    runtime::TableRegistry registry;
+    registry.emplace("build_t", std::move(left));
+    auto ir = require_ir("rbind(build_t join probe_a on k, build_t join probe_b on k);");
+
+    struct Probe {
+        std::shared_ptr<runtime::DynamicScanFilter> slot =
+            std::make_shared<runtime::DynamicScanFilter>();
+        std::shared_ptr<std::size_t> payload_rows = std::make_shared<std::size_t>(0);
+    };
+    Probe a;
+    Probe b;
+    const auto make_scan = [&](const Probe& probe) {
+        runtime::Table schema;
+        schema.add_column("k", Column<std::int64_t>{});
+        schema.add_column("payload", Column<std::int64_t>{});
+        auto rows_seen = probe.payload_rows;
+        auto decode =
+            [rows_seen](
+                const std::vector<std::string>& names,
+                const runtime::Selection* selection) -> std::expected<runtime::Table, std::string> {
+            std::vector<std::size_t> rows;
+            if (selection == nullptr) {
+                rows.resize(kLazyRows);
+                std::iota(rows.begin(), rows.end(), std::size_t{0});
+            } else {
+                rows.assign(selection->begin(), selection->end());
+            }
+            runtime::Table out;
+            for (const auto& name : names) {
+                std::vector<std::int64_t> values;
+                values.reserve(rows.size());
+                for (const std::size_t row : rows) {
+                    values.push_back(name == "k" ? static_cast<std::int64_t>(row % 1000)
+                                                 : static_cast<std::int64_t>(row));
+                }
+                if (name == "payload") {
+                    *rows_seen = rows.size();
+                }
+                out.add_column(name, Column<std::int64_t>{std::move(values)});
+            }
+            out.logical_rows = rows.size();
+            return out;
+        };
+        return runtime::DeferredScan{
+            .lazy = std::make_shared<runtime::LazyTable>(std::move(schema), kLazyRows, decode),
+            .conjuncts = {},
+            .demand = {"k", "payload"},
+            .demand_all = false,
+            .key_column = "k",
+            .filter = probe.slot,
+        };
+    };
+    runtime::DeferredScanRegistry deferred;
+    deferred.emplace("probe_a", make_scan(a));
+    deferred.emplace("probe_b", make_scan(b));
+
+    runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+    exec.parallel_threads = 1;
+    auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+    REQUIRE(out.has_value());
+    // Keys 0..9 of `row % 1000` over 70,000 rows: 700 matches per operand.
+    CHECK(out->rows() == 1400);
+    for (const Probe* probe : {&a, &b}) {
+        CHECK(probe->slot->has_membership());
+        CHECK(*probe->payload_rows == 700);
+    }
+}
+
 TEST_CASE("Inner join probe fans out across workers and matches the serial probe",
           "[runtime][parallel][join]") {
     // Above the parallel probe's 1<<14 row gate so the fan-out actually

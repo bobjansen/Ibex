@@ -993,6 +993,10 @@ class JoinNode final : public Node {
     /// metadata.
     void set_keys(std::vector<JoinKey> keys) { keys_ = std::move(keys); }
 
+    /// Replace the join predicate, or drop it with `std::nullopt`, for a
+    /// rewrite that moves its terms into `keys` (`join_predicate_keys.hpp`).
+    void set_predicate(std::optional<Expr> predicate) { predicate_ = std::move(predicate); }
+
    private:
     JoinKind kind_;
     std::vector<JoinKey> keys_;

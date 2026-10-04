@@ -67,6 +67,7 @@ set(IBEX_TEST_SOURCES
     test_table_properties.cpp
     test_filter_selection.cpp
     test_join.cpp
+    test_join_predicate_keys.cpp
     test_lazy_table.cpp
     test_chunked_sources.cpp
     test_aggregate_prefilter.cpp

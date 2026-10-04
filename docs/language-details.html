@@ -537,7 +537,10 @@ employee[
             Join keys are named with <code>on</code>. When the expression after
             <code>on</code> is a comparison or boolean expression rather than a
             column name, it becomes a <strong>non-equijoin predicate</strong>
-            (theta join) evaluated for every pair of rows.
+            (theta join) evaluated for every pair of rows. A predicate made only
+            of column equalities, such as <code>on a == b</code>, runs as the
+            equivalent hash join <code>on { a = b }</code> when both columns
+            have the same type; when it cannot, Ibex warns.
             Both tables must be <code>TimeFrame</code>s for an asof join.
           </p>
           <p>

@@ -151,8 +151,8 @@ void rewrite(Node& node, const SourceSchemas& sources, std::vector<std::string>&
     for (const CompareExpr* eq : equalities) {
         const auto& a = std::get<ColumnRef>(eq->left->node);
         const auto& b = std::get<ColumnRef>(eq->right->node);
-        Side sa = side_of(a, left, right);
-        Side sb = side_of(b, left, right);
+        const Side sa = side_of(a, left, right);
+        const Side sb = side_of(b, left, right);
         if (sa == Side::Neither || sb == Side::Neither) {
             return;  // the join itself reports an ambiguous or missing name
         }

@@ -1789,6 +1789,9 @@ class DeferredScanSourceOperator final : public Operator {
     /// `Batch` rethrows the first escaped exception at `wait()`, which would
     /// lose the other units' errors and unwind through the pool.
     auto decode_unit(std::size_t slot) -> std::expected<Table, std::string> {
+        if (!plan_.has_value()) {
+            return std::unexpected("streamed scan: unit decoded before the scan was planned");
+        }
         try {
             auto table = materialize_deferred_scan_unit(*scan_, *plan_,
                                                         units_[window_begin_ + slot], *exec_);
@@ -2215,6 +2218,9 @@ class PipelinedScanOperator final : public Operator {
 
     [[nodiscard]] auto run_unit(ScanPipelineWorker& worker, std::size_t sequence,
                                 const ExecutionContext& exec) -> std::expected<Chunk, std::string> {
+        if (!plan_.has_value()) {
+            return std::unexpected("scan pipeline: unit run before the scan was planned");
+        }
         auto decoded = materialize_deferred_scan_unit(*scan_, *plan_, units_[sequence], exec);
         if (!decoded.has_value()) {
             return std::unexpected(std::move(decoded.error()));

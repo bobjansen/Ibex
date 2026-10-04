@@ -10,7 +10,7 @@ ordering, distinct, row-local map) is out of the monolith (`chunked.cpp`
 5152→1635 lines) and the `MaterializedCall` adapter is the accepted end state,
 not a way-station to zero fallbacks. The two remaining Phase 5 items (test-binary
 split; fallback-kind migration) are deferred with reopen conditions. **What's
-left is perf, not migration** — see "Next, in order" and `plans/beat-polars-plan.md`;
+left is perf, not migration** — see "Next, in order" and `plans/beat-both-plan.md`;
 the first target is the q21 serial hash build, now unblocked by Phase 4.
 **Compacted
 2026-08-27** — the ~40-entry Phase 2 per-commit diary is in git history at the
@@ -309,7 +309,7 @@ separate streaming operator.
 splits are done and its remaining items (test binary split; fallback-kind
 migration) are deferred with reopen conditions above. Phase 3's accounting and
 DOP items are deferred/blocked. What remains is **not migration work** — it is
-the measured perf fronts, tracked in the memory index and `plans/beat-polars-plan.md`.
+the measured perf fronts, tracked in the memory index and `plans/beat-both-plan.md`.
 The standout, now unblocked by this plan's Phase 4: **the q21 serial hash build**
 (`build_join_hash_index`, 1.28M rows in ~40ms of a 75–79ms query, 70% of all
 join-build self-time). It could not be morsel-parallel while buried in

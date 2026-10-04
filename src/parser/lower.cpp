@@ -4412,7 +4412,7 @@ class Lowerer {
         std::vector<const Expr*> inner_local;
     };
 
-    auto parse_exists(const CallExpr& call, const ir::Node& outer_input)
+    auto parse_exists(const CallExpr& call, const ir::Node& outer_input) const
         -> std::expected<ExistsSubquery, LowerError> {
         if (call.args.size() != 1 || !call.named_args.empty()) {
             return std::unexpected(
@@ -4582,7 +4582,7 @@ class Lowerer {
             if (!subquery.has_value()) {
                 return std::unexpected(subquery.error());
             }
-            std::string alias = next_scalar_alias(*input, "__ibex_exists_");
+            const std::string alias = next_scalar_alias(*input, "__ibex_exists_");
 
             BlockExpr grouped;
             grouped.base = clone_expr(*subquery->base);

@@ -59,6 +59,17 @@ auto materialize_operator(OperatorPtr op) -> std::expected<Table, std::string> {
     return sink.run();
 }
 
+auto materialize_plan(const ir::Node& node, const TableRegistry& registry,
+                      const ScalarRegistry* scalars, const ExternRegistry* externs,
+                      const ExecutionContext& exec, ModelResult* model_out)
+    -> std::expected<Table, std::string> {
+    auto op = build_operator(node, registry, scalars, externs, exec, model_out);
+    if (!op.has_value()) {
+        return std::unexpected(std::move(op.error()));
+    }
+    return materialize_operator(std::move(op.value()));
+}
+
 auto is_streamable_inner_join(const ir::JoinNode& join) -> bool {
     // `nulls equal` goes to the materialized join, which implements the policy.
     // The streaming operators hash and probe on their own and would each need
@@ -148,38 +159,7 @@ auto join_keys_provably_int64(const ir::JoinNode& join) -> bool {
     return true;
 }
 
-auto inner_join_table(const Table& left, const Table& right, const std::vector<ir::JoinKey>& keys,
-                      const ir::JoinSuffixPolicy& suffix,
-                      const std::vector<ir::OrderKey>& pending_order, const ExecutionContext& exec)
-    -> std::expected<Table, std::string> {
-    // I4 convergence: keep the materialized signature used by interpret_node,
-    // but run the same hash join that build_operator selects for this exact
-    // semantic subset. Table sources copy only their column handles.
-    auto source = make_table_source(left);
-    return materialize_operator(make_chunked_inner_join_operator(
-        std::move(source), right, &keys, exec, suffix, &pending_order,
-        physical_executor_detail::resolved_join_parallelism(exec)));
-}
-
 namespace {
-
-// The single choke point for "build this subtree, then immediately drain it
-// to a whole Table" — every call site in this file that needs a materialized
-// side (a join's build/probe side, an update's input, an aggregate's fused
-// join operand, ...) with no downstream consumer to overlap the build with
-// routes through here, rather than each hand-rolling its own
-// `build_operator` + `materialize_operator` pair. One place to reason about
-// this pattern instead of N independently-drifting copies.
-auto materialize_row_local(const ir::Node& node, const TableRegistry& registry,
-                           const ScalarRegistry* scalars, const ExternRegistry* externs,
-                           const ExecutionContext& exec, ModelResult* model_out)
-    -> std::expected<Table, std::string> {
-    auto op = build_operator(node, registry, scalars, externs, exec, model_out);
-    if (!op.has_value()) {
-        return std::unexpected(std::move(op.error()));
-    }
-    return materialize_operator(std::move(op.value()));
-}
 
 // A materializing binary breaker (non-streamable join, matmul) now resolves in
 // `interpret_node`, which drains both sides whole-table and serially.
@@ -195,7 +175,7 @@ auto materialize_row_local(const ir::Node& node, const TableRegistry& registry,
 // migrate (reshape, stats, window, non-row-local update, materializing join,
 // matmul, model, ...). `interpret_node` owns the per-kind semantics, and it
 // evaluates every relational input back through `build_operator`
-// (`materialize_input`), so a `Filter`/`Project`/join feeding the breaker keeps
+// (`materialize_plan`), so a `Filter`/`Project`/join feeding the breaker keeps
 // its fused parallel scan or streaming join rather than running whole-table
 // and serial beneath it. Recursing instead cost `join_filter_rank` 14.7% (the
 // filter between the join and the grouped rank lost its fused scan) and every
@@ -218,8 +198,7 @@ auto build_unary_materializing_operator(const ir::Node& child_node, const TableR
                                         const ExternRegistry* externs, const ExecutionContext& exec,
                                         ModelResult* model_out, Fn fn)
     -> std::expected<OperatorPtr, std::string> {
-    auto materialized =
-        materialize_row_local(child_node, registry, scalars, externs, exec, model_out);
+    auto materialized = materialize_plan(child_node, registry, scalars, externs, exec, model_out);
     if (!materialized.has_value()) {
         return std::unexpected(std::move(materialized.error()));
     }
@@ -536,7 +515,7 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
                 execution_profile_entry(exec.execution_profile, node));
         }
         auto right =
-            materialize_row_local(*join.children()[1], registry, scalars, externs, exec, model_out);
+            materialize_plan(*join.children()[1], registry, scalars, externs, exec, model_out);
         if (!right.has_value()) {
             return std::unexpected(std::move(right.error()));
         }
@@ -583,7 +562,7 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
                 execution_profile_entry(exec.execution_profile, node));
         }
         auto right =
-            materialize_row_local(*join.children()[1], registry, scalars, externs, exec, model_out);
+            materialize_plan(*join.children()[1], registry, scalars, externs, exec, model_out);
         if (!right.has_value()) {
             return std::unexpected(std::move(right.error()));
         }
@@ -702,12 +681,12 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         const auto& join = ir::node_cast<ir::JoinNode>(*ap.fused_join);
         const std::string& counted_column = ap.counted_column;
         auto left =
-            materialize_row_local(*join.children()[0], registry, scalars, externs, exec, model_out);
+            materialize_plan(*join.children()[0], registry, scalars, externs, exec, model_out);
         if (!left.has_value()) {
             return std::unexpected(std::move(left.error()));
         }
         auto right =
-            materialize_row_local(*join.children()[1], registry, scalars, externs, exec, model_out);
+            materialize_plan(*join.children()[1], registry, scalars, externs, exec, model_out);
         if (!right.has_value()) {
             return std::unexpected(std::move(right.error()));
         }

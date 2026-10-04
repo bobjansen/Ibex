@@ -2334,8 +2334,8 @@ class ChunkedInnerJoinOperator final : public Operator {
             use_materialized_left_ = true;
         }
         slot.ready = true;
-        auto right = interpret_node(*deferred_right_node_, *deferred_registry_, deferred_scalars_,
-                                    deferred_externs_, *deferred_exec_);
+        auto right = materialize_plan(*deferred_right_node_, *deferred_registry_, deferred_scalars_,
+                                      deferred_externs_, *deferred_exec_);
         if (!right.has_value()) {
             return std::move(right.error());
         }
@@ -2387,8 +2387,8 @@ class ChunkedInnerJoinOperator final : public Operator {
                 return std::nullopt;
             }
         }
-        auto right = interpret_node(*deferred_right_node_, *deferred_registry_, deferred_scalars_,
-                                    deferred_externs_, *deferred_exec_);
+        auto right = materialize_plan(*deferred_right_node_, *deferred_registry_, deferred_scalars_,
+                                      deferred_externs_, *deferred_exec_);
         if (!right.has_value()) {
             return std::move(right.error());
         }
@@ -2405,8 +2405,8 @@ class ChunkedInnerJoinOperator final : public Operator {
     auto interpret_wrapped_right(Table scan_table) -> std::optional<std::string> {
         TableRegistry local = *deferred_registry_;
         local.insert_or_assign(deferred_probe_name_, std::move(scan_table));
-        auto right = interpret_node(*deferred_right_node_, local, deferred_scalars_,
-                                    deferred_externs_, *deferred_exec_);
+        auto right = materialize_plan(*deferred_right_node_, local, deferred_scalars_,
+                                      deferred_externs_, *deferred_exec_);
         if (!right.has_value()) {
             return std::move(right.error());
         }

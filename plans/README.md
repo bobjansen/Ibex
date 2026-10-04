@@ -156,7 +156,7 @@ in active plans to `plans/done/...` paths refer to that history.
     (`include/ibex/ir/scan_predicates.hpp`).
   - **physical-fallback-adapter-plan.md** — one `build_materialized_fallback`
     → `interpret_node` seam. Its input allowlist was replaced 2026-10-04 by
-    `materialize_input` (`interpreter.cpp`): every input of a fallback node
+    `materialize_plan` (`runtime_entry.cpp`): every input of a fallback node
     goes back through `build_operator`. Removing `interpret_node` entirely is
     in progress.
   - **cooperative-pipeline-waits-plan.md** — work-conserving ring waits make

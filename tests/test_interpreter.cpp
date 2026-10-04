@@ -16430,6 +16430,109 @@ TEST_CASE("Deferred probe resolving below the stream threshold preserves its dra
     CHECK_FALSE(mismatch.has_value());
 }
 
+// A deferred probe over a Date, Timestamp or Bool key publishes the same
+// membership filter an Int64 key does (`join_key_domain`), so the probe scan
+// decodes its payload only for rows that can match.
+template <typename T, typename MakeKey>
+void check_deferred_probe_filters_key_type(MakeKey make_key, std::size_t build_keys,
+                                           std::size_t expected_matches) {
+    constexpr std::size_t kLazyRows = 70'000;  // above kStreamRightThreshold (65536)
+
+    runtime::Table left;
+    {
+        Column<T> keys;
+        std::vector<std::int64_t> tags;
+        for (std::size_t row = 0; row < build_keys; ++row) {
+            keys.push_back(make_key(row));
+            tags.push_back(static_cast<std::int64_t>(row));
+        }
+        left.add_column("k", std::move(keys));
+        left.add_column("tag", Column<std::int64_t>{std::move(tags)});
+    }
+    runtime::TableRegistry registry;
+    registry.emplace("build_t", std::move(left));
+    auto ir = require_ir("build_t join probe_t on k;");
+
+    auto payload_rows = std::make_shared<std::size_t>(kLazyRows);
+    runtime::Table schema;
+    schema.add_column("k", Column<T>{});
+    schema.add_column("payload", Column<std::int64_t>{});
+    auto decode =
+        [make_key, payload_rows](
+            const std::vector<std::string>& names,
+            const runtime::Selection* selection) -> std::expected<runtime::Table, std::string> {
+        std::vector<std::size_t> rows;
+        if (selection == nullptr) {
+            rows.resize(kLazyRows);
+            std::iota(rows.begin(), rows.end(), std::size_t{0});
+        } else {
+            rows.assign(selection->begin(), selection->end());
+        }
+        runtime::Table out;
+        for (const auto& name : names) {
+            if (name == "k") {
+                Column<T> keys;
+                for (const std::size_t row : rows) {
+                    keys.push_back(make_key(row % 1000));
+                }
+                out.add_column(name, std::move(keys));
+            } else if (name == "payload") {
+                *payload_rows = rows.size();
+                std::vector<std::int64_t> values;
+                values.reserve(rows.size());
+                for (const std::size_t row : rows) {
+                    values.push_back(static_cast<std::int64_t>(row));
+                }
+                out.add_column(name, Column<std::int64_t>{std::move(values)});
+            } else {
+                return std::unexpected("deferred-probe fixture: unknown column " + name);
+            }
+        }
+        out.logical_rows = rows.size();
+        return out;
+    };
+
+    auto slot = std::make_shared<runtime::DynamicScanFilter>();
+    runtime::DeferredScanRegistry deferred;
+    deferred.emplace("probe_t", runtime::DeferredScan{
+                                    .lazy = std::make_shared<runtime::LazyTable>(std::move(schema),
+                                                                                 kLazyRows, decode),
+                                    .conjuncts = {},
+                                    .demand = {"k", "payload"},
+                                    .demand_all = false,
+                                    .key_column = "k",
+                                    .filter = slot,
+                                });
+    runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+    exec.parallel_threads = 1;
+    auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+    REQUIRE(out.has_value());
+    CHECK(out->rows() == expected_matches);
+    CHECK(slot->ready);
+    CHECK(slot->has_membership());
+    // Only the rows that can match were decoded past the key.
+    CHECK(*payload_rows == expected_matches);
+}
+
+TEST_CASE("Deferred probe filters Date, Timestamp and Bool keys like Int64 ones",
+          "[runtime][join][deferred_probe]") {
+    // Probe keys cycle through 1000 values over 70,000 rows; the build side
+    // holds ten of them (Bool: only `true`, one probe row in a hundred).
+    SECTION("Date") {
+        check_deferred_probe_filters_key_type<Date>(
+            [](std::size_t i) { return Date{static_cast<std::int32_t>(i * 3)}; }, 10, 700);
+    }
+    SECTION("Timestamp") {
+        check_deferred_probe_filters_key_type<Timestamp>(
+            [](std::size_t i) { return Timestamp{static_cast<std::int64_t>(i) * 1'000'000'007}; },
+            10, 700);
+    }
+    SECTION("Bool") {
+        check_deferred_probe_filters_key_type<bool>([](std::size_t i) { return i % 100 == 0; }, 1,
+                                                    700);
+    }
+}
+
 TEST_CASE("Inner join probe fans out across workers and matches the serial probe",
           "[runtime][parallel][join]") {
     // Above the parallel probe's 1<<14 row gate so the fan-out actually

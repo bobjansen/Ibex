@@ -3675,13 +3675,22 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
             return std::unexpected("parquet::read: no column '" + key + "' in " + path_);
         }
         // Only types whose ordinary decode is the identity/sign-extension
-        // into int64 — the fused filter must see exactly the values the
-        // materialized column would hold. (Zero-extended unsigned widths
-        // would need their own conversion; join keys are never those.)
-        const auto id = schema_->field(it->second)->type()->id();
+        // into the key's `join_key_domain` — the fused filter must see exactly
+        // the values the materialized column would hold. DATE32 holds days, as
+        // a Date does; a TIMESTAMP holds nanoseconds only in NANO units (the
+        // decode scales every other unit, and INT96 is checked below). Bool
+        // keys have no fused scan and filter after decode. (Zero-extended
+        // unsigned widths would need their own conversion; join keys are
+        // never those.)
+        const auto& type = schema_->field(it->second)->type();
+        const auto id = type->id();
+        const bool nano_timestamp =
+            id == arrow::Type::TIMESTAMP &&
+            static_cast<const arrow::TimestampType&>(*type).unit() == arrow::TimeUnit::NANO;
         const bool fusable = id == arrow::Type::INT8 || id == arrow::Type::INT16 ||
                              id == arrow::Type::INT32 || id == arrow::Type::INT64 ||
-                             id == arrow::Type::UINT64 || id == arrow::Type::DATE32;
+                             id == arrow::Type::UINT64 || id == arrow::Type::DATE32 ||
+                             nano_timestamp;
         const auto& manifest = reader_->manifest();
         if (!fusable || it->second >= static_cast<int>(manifest.schema_fields.size()) ||
             !manifest.schema_fields[static_cast<std::size_t>(it->second)].is_leaf()) {
@@ -3695,6 +3704,11 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
                                       ->schema()
                                       ->Column(leaf_index)
                                       ->physical_type();
+            if (physical != parquet::Type::INT64 && physical != parquet::Type::INT32) {
+                // INT96 timestamps report as nanoseconds but are not stored as
+                // them; nothing else here has a fused answer either.
+                return std::optional<ibex::runtime::Selection>{};
+            }
             const auto& metadata = *reader_->parquet_reader()->metadata();
             // A range that leaves most rows in place is answered by the ordinary
             // path without paying for a scan to find that out. Only for a

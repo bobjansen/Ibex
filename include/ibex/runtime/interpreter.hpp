@@ -564,11 +564,35 @@ class JoinKeyBitmap {
     std::vector<std::uint64_t> words_;
 };
 
+/// The integer a `DynamicScanFilter` tests a join key as: Int64 as itself,
+/// Date as its day count, Timestamp as its nanoseconds, Bool as 0 or 1.
+///
+/// One definition, because three parties must agree on it: the join that
+/// publishes a filter from its build keys, `LazyTable`'s decode-then-filter
+/// path, and a source's fused key scan. A join's keys have the same type on
+/// both sides, so values of different types never meet in one filter. Keys of
+/// any other type (String, Categorical, Decimal, Double) have no filter; a
+/// join over them publishes nothing, which is always sound.
+[[nodiscard]] constexpr auto join_key_domain(std::int64_t key) noexcept -> std::int64_t {
+    return key;
+}
+[[nodiscard]] constexpr auto join_key_domain(Date key) noexcept -> std::int64_t {
+    return key.days;
+}
+[[nodiscard]] constexpr auto join_key_domain(Timestamp key) noexcept -> std::int64_t {
+    return key.nanos;
+}
+[[nodiscard]] constexpr auto join_key_domain(bool key) noexcept -> std::int64_t {
+    return key ? 1 : 0;
+}
+
 /// Key filter a join derives from its build side for a deferred probe scan.
 /// `ready` flips exactly once, before the scan is materialized, when the
 /// owning join has decided (filter present or deliberately absent). A scan
 /// materialized while `ready` is still false simply decodes without dynamic
 /// filtering — absence is always sound, only slower.
+///
+/// Keys are tested as `join_key_domain` integers.
 struct DynamicScanFilter {
     bool ready = false;
     std::optional<std::int64_t> min;

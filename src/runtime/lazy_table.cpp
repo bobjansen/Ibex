@@ -24,6 +24,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -237,33 +238,66 @@ namespace {
 constexpr double kMembershipPassRateCutoff = 0.75;
 constexpr std::size_t kMembershipSampleMax = 65536;
 
+/// A key column read as `join_key_domain` integers, one accessor per column
+/// type so the per-row filter loops carry no type dispatch.
+template <typename T>
+struct ElementKeyAt {
+    const T* data = nullptr;
+    [[nodiscard]] auto operator()(std::size_t row) const -> std::int64_t {
+        return join_key_domain(data[row]);
+    }
+};
+
+/// `Column<bool>` is bit-packed, so it has no element pointer to read through.
+struct BoolKeyAt {
+    const Column<bool>* column = nullptr;
+    [[nodiscard]] auto operator()(std::size_t row) const -> std::int64_t {
+        return join_key_domain((*column)[row]);
+    }
+};
+
+template <typename KeyAt>
 struct KeyColumn {
-    const std::int64_t* data = nullptr;
+    KeyAt at;
     const ValidityBitmap* validity = nullptr;
 };
 
-/// The membership filter only understands int64 keys; anything else means
-/// "no filter", which is always sound.
-auto int64_key_column(const Table& predicates, const std::string& key_name)
-    -> std::optional<KeyColumn> {
+using AnyKeyColumn =
+    std::variant<KeyColumn<ElementKeyAt<std::int64_t>>, KeyColumn<ElementKeyAt<Date>>,
+                 KeyColumn<ElementKeyAt<Timestamp>>, KeyColumn<BoolKeyAt>>;
+
+/// The membership filter tests keys with a `join_key_domain`; any other type
+/// means "no filter", which is always sound.
+auto membership_key_column(const Table& predicates, const std::string& key_name)
+    -> std::optional<AnyKeyColumn> {
     const auto* entry = predicates.find_entry(key_name);
     if (entry == nullptr) {
         return std::nullopt;
     }
-    const auto* keys = std::get_if<Column<std::int64_t>>(&*entry->column);
-    if (keys == nullptr) {
-        return std::nullopt;
-    }
-    return KeyColumn{
-        .data = keys->data(),
-        .validity = entry->validity.has_value() ? &*entry->validity : nullptr,
-    };
+    const ValidityBitmap* validity = entry->validity.has_value() ? &*entry->validity : nullptr;
+    return std::visit(
+        [&](const auto& col) -> std::optional<AnyKeyColumn> {
+            using C = std::remove_cvref_t<decltype(col)>;
+            if constexpr (std::is_same_v<C, Column<bool>>) {
+                return KeyColumn<BoolKeyAt>{.at = {.column = &col}, .validity = validity};
+            } else if constexpr (std::is_same_v<C, Column<std::int64_t>> ||
+                                 std::is_same_v<C, Column<Date>> ||
+                                 std::is_same_v<C, Column<Timestamp>>) {
+                using T = typename C::value_type;
+                return KeyColumn<ElementKeyAt<T>>{.at = {.data = col.data()}, .validity = validity};
+            } else {
+                return std::nullopt;
+            }
+        },
+        *entry->column);
 }
 
 /// Rows with a null key are rejected too: a deferred scan feeds exactly one
 /// inner join (eligibility proof), and null keys never match.
-auto key_passes(const KeyColumn& key, const DynamicScanFilter& filter, std::size_t row) -> bool {
-    return (key.validity == nullptr || (*key.validity)[row]) && filter.passes(key.data[row]);
+template <typename KeyAt>
+auto key_passes(const KeyColumn<KeyAt>& key, const DynamicScanFilter& filter, std::size_t row)
+    -> bool {
+    return (key.validity == nullptr || (*key.validity)[row]) && filter.passes(key.at(row));
 }
 
 /// Estimate the filter's pass rate over the candidate rows `rows(i)`,
@@ -271,9 +305,9 @@ auto key_passes(const KeyColumn& key, const DynamicScanFilter& filter, std::size
 /// key, so a prefix sample would see one narrow key range and lie. Returns
 /// 0.0 for small n — a useless pass over few rows costs nothing, so it never
 /// needs vetoing.
-template <typename RowAt>
-auto membership_pass_rate(const KeyColumn& key, const DynamicScanFilter& filter, std::size_t n,
-                          RowAt rows) -> double {
+template <typename KeyAt, typename RowAt>
+auto membership_pass_rate(const KeyColumn<KeyAt>& key, const DynamicScanFilter& filter,
+                          std::size_t n, RowAt rows) -> double {
     if (n <= kMembershipSampleMax) {
         return 0.0;
     }
@@ -308,8 +342,8 @@ auto membership_ranges(const ExecutionContext& exec, std::size_t n) -> std::size
 /// Fan the row-keep predicate out over `ranges` contiguous ranges of
 /// `[0, n)`, appending each range's surviving `row_at(i)` values, then stitch
 /// the per-range lists back in order.
-template <typename RowAt>
-auto keep_rows_parallel(std::size_t n, std::size_t ranges, const KeyColumn& key,
+template <typename KeyAt, typename RowAt>
+auto keep_rows_parallel(std::size_t n, std::size_t ranges, const KeyColumn<KeyAt>& key,
                         const DynamicScanFilter& filter, const RowAt& row_at)
     -> std::vector<std::size_t> {
     std::vector<std::vector<std::size_t>> parts(ranges);
@@ -344,7 +378,8 @@ auto keep_rows_parallel(std::size_t n, std::size_t ranges, const KeyColumn& key,
 
 /// AND the membership filter into an existing selection, in place. Skipped
 /// (selection untouched) when the sample says it barely rejects.
-void apply_membership_filter(const KeyColumn& key, const DynamicScanFilter& filter,
+template <typename KeyAt>
+void apply_membership_filter(const KeyColumn<KeyAt>& key, const DynamicScanFilter& filter,
                              std::vector<std::size_t>& selected, const ExecutionContext& exec) {
     if (membership_pass_rate(key, filter, selected.size(), [&](std::size_t i) {
             return selected[i];
@@ -365,8 +400,10 @@ void apply_membership_filter(const KeyColumn& key, const DynamicScanFilter& filt
 /// Build a selection straight from the membership filter (no static
 /// conjuncts). nullopt = the filter barely rejects; caller should decode
 /// densely instead.
-auto membership_selection(const KeyColumn& key, const DynamicScanFilter& filter, std::size_t rows,
-                          const ExecutionContext& exec) -> std::optional<std::vector<std::size_t>> {
+template <typename KeyAt>
+auto membership_selection(const KeyColumn<KeyAt>& key, const DynamicScanFilter& filter,
+                          std::size_t rows, const ExecutionContext& exec)
+    -> std::optional<std::vector<std::size_t>> {
     const auto sampled_rate =
         membership_pass_rate(key, filter, rows, [](std::size_t i) { return i; });
     if (sampled_rate > kMembershipPassRateCutoff) {
@@ -791,8 +828,8 @@ auto LazyTable::project_where(const std::set<std::string>& names,
     }
     const Table& predicates = *predicates_res;
 
-    const auto key =
-        membership ? int64_key_column(predicates, *dynamic_key) : std::optional<KeyColumn>{};
+    const auto key = membership ? membership_key_column(predicates, *dynamic_key)
+                                : std::optional<AnyKeyColumn>{};
 
     std::optional<std::vector<std::size_t>> selected;
     if (!applied.empty()) {
@@ -802,13 +839,16 @@ auto LazyTable::project_where(const std::set<std::string>& names,
         }
         selected = std::move(*from_conjuncts);
         if (key.has_value()) {
-            apply_membership_filter(*key, *dynamic, *selected, exec);
+            std::visit(
+                [&](const auto& k) { apply_membership_filter(k, *dynamic, *selected, exec); },
+                *key);
         }
     } else if (membership && key.has_value()) {
         // nullopt here is the escape hatch (the filter barely rejects) or a
-        // key that is missing/non-int64; either way membership contributes
+        // key with no `join_key_domain`; either way membership contributes
         // nothing and `selected` stays empty.
-        selected = membership_selection(*key, *dynamic, rows_, exec);
+        selected = std::visit(
+            [&](const auto& k) { return membership_selection(k, *dynamic, rows_, exec); }, *key);
     }
 
     if (fused_selection.has_value()) {
@@ -1097,8 +1137,8 @@ auto LazyTable::project_where_unit(const std::set<std::string>& names,
     }
     const Table& predicates = *predicates_res;
 
-    const auto key =
-        membership ? int64_key_column(predicates, *dynamic_key) : std::optional<KeyColumn>{};
+    const auto key = membership ? membership_key_column(predicates, *dynamic_key)
+                                : std::optional<AnyKeyColumn>{};
 
     std::optional<Selection> selected;
     if (!applied.empty()) {
@@ -1108,10 +1148,14 @@ auto LazyTable::project_where_unit(const std::set<std::string>& names,
         }
         selected = std::move(*from_conjuncts);
         if (key.has_value()) {
-            apply_membership_filter(*key, *dynamic, *selected, exec);
+            std::visit(
+                [&](const auto& k) { apply_membership_filter(k, *dynamic, *selected, exec); },
+                *key);
         }
     } else if (membership && key.has_value()) {
-        selected = membership_selection(*key, *dynamic, unit.rows, exec);
+        selected = std::visit(
+            [&](const auto& k) { return membership_selection(k, *dynamic, unit.rows, exec); },
+            *key);
     }
 
     if (fused_selection.has_value()) {
@@ -1598,8 +1642,14 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
     }
     const Table& predicates = *predicates_res;
 
-    const auto key = int64_key_column(predicates, key_name);
-    if (!key.has_value()) {
+    // Int64 keys only, as on the fused path above: the two-phase probe this
+    // feeds has not been widened to the other `join_key_domain` types, which
+    // still get their membership filter through `project_where`.
+    const auto any_key = membership_key_column(predicates, key_name);
+    const auto* key = any_key.has_value()
+                          ? std::get_if<KeyColumn<ElementKeyAt<std::int64_t>>>(&*any_key)
+                          : nullptr;
+    if (key == nullptr) {
         return std::optional<JoinKeySelection>{};
     }
 

@@ -814,6 +814,30 @@ TEST_CASE("join: semi join keeps matching left rows only", "[join]") {
     CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{20, 40});
 }
 
+TEST_CASE("join: semi and anti joins whose two keys share one column", "[join]") {
+    // `exists(lines[filter l_k == outer(a) && l_k == outer(b)])` lowers to
+    // exactly this: two key pairs over one right column. The streaming join
+    // used to move that column out for the second key and then read the first
+    // key through the moved-from entry.
+    // Literal tables, so both key pairs are provably Int64 -- the condition
+    // for the streaming operator, which a registry table cannot prove.
+    const runtime::TableRegistry tables;
+    const std::string lhs = "Table { a = [1, 2, 3, 4], b = [1, 7, 3, 4] }";
+    const std::string rhs = "Table { k = [1, 2, 4, 4] }";
+
+    // Row 2 (a=2, b=7) fails b == k; row 3 has no k == 3.
+    auto semi = interpret_expr(lhs + " semi join " + rhs + " on { a = k, b = k };", tables);
+    CHECK(col_i64(semi, "a") == std::vector<std::int64_t>{1, 4});
+    auto anti = interpret_expr(lhs + " anti join " + rhs + " on { a = k, b = k };", tables);
+    CHECK(col_i64(anti, "a") == std::vector<std::int64_t>{2, 3});
+
+    // The mirror shape: one LEFT column in both keys. Only rhs rows with
+    // k1 == k2 can match: (1, 1) and (4, 4).
+    const std::string pairs = "Table { k1 = [1, 2, 4], k2 = [1, 3, 4] }";
+    auto mirror = interpret_expr(lhs + " semi join " + pairs + " on { a = k1, a = k2 };", tables);
+    CHECK(col_i64(mirror, "a") == std::vector<std::int64_t>{1, 4});
+}
+
 TEST_CASE("join: semi join preserves left row order when left side is smaller", "[join]") {
     runtime::Table lhs;
     lhs.add_column("id", Column<std::int64_t>{2, 1, 2, 3});

@@ -30,7 +30,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -45,8 +44,6 @@
 
 #include "interpreter_internal.hpp"
 #include "join_internal.hpp"
-#include "model_internal.hpp"
-#include "reshape_internal.hpp"
 #include "runtime_internal.hpp"
 
 namespace ibex::runtime {

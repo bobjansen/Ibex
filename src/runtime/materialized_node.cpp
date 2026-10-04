@@ -20,19 +20,17 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/interrupt.hpp>
-#include <ibex/runtime/lazy_table.hpp>
-#include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/table_properties.hpp>
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <memory>
 #include <optional>
 #include <robin_hood.h>
 #include <string>
-#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <variant>

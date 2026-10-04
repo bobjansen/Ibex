@@ -92,7 +92,12 @@ compute across a **pipeline breaker** (join build, aggregate, sort).
 - **`PipelinedScanOperator`** — the streaming scan. The source publishes units
   (Parquet row groups); N workers each run a private copy of the row-local
   chain over one unit into a **bounded ring indexed by unit sequence**; the
-  consumer releases them in order.
+  consumer releases them in order. A source longer than three rounds of the
+  pool leaves one pool thread spare for downstream batches (the deadlock rule
+  in `scan_pipeline_worker_count`), and the consumer decodes units in its place
+  whenever it would otherwise park (`run_consumer_unit`, under a serial
+  context); the ring carries one extra round so the workers do not park behind
+  it. Before this, q06 at 8 cores kept 7 of 8 cores busy.
 - **`PipelinedStageOperator`** — a two-slot double buffer running its child on a
   raw thread, so a breaker's probe input is produced concurrently with the
   breaker consuming it. Admitted only when the child can publish more than one

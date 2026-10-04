@@ -117,6 +117,11 @@ struct DeferredProbeScan {
 [[nodiscard]] auto deferred_probe_scan_of(const ir::Node& right, const ExecutionContext& exec)
     -> DeferredProbeScan;
 
+/// The streamed scan under a join's `left` input that carries a
+/// `stream_filter` slot (`ir::streamed_join_left_scans`), or null.
+[[nodiscard]] auto streamed_left_scan_of(const ir::Node& left, const ExecutionContext& exec)
+    -> const DeferredScan*;
+
 /// Pipeline-owned adapter supplied by chunked.cpp. It may morselize an already
 /// materialized probe side before attaching worker-private probes.
 [[nodiscard]] auto make_join_probe_operator(OperatorPtr source,
@@ -148,8 +153,8 @@ struct DeferredProbeScan {
     const ExecutionContext& exec, ir::JoinSuffixPolicy suffix = {},
     const std::vector<ir::OrderKey>* pending_order = nullptr,
     physical::JoinParallelism parallelism = {},
-    std::optional<ir::JoinColumnMapping> columns = std::nullopt)
-    -> std::expected<OperatorPtr, std::string>;
+    std::optional<ir::JoinColumnMapping> columns = std::nullopt,
+    const DeferredScan* left_stream = nullptr) -> std::expected<OperatorPtr, std::string>;
 
 [[nodiscard]] auto make_scheduled_deferred_inner_join_operator(
     OperatorPtr left, const ir::Node* right_node, const TableRegistry* registry,

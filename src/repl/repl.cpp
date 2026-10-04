@@ -6248,6 +6248,7 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
     // filter for it, so the eager decode below reads the whole demanded
     // union once into the registry.
     const auto scan_counts = ir::scan_source_counts(*rewritten);
+    const auto streamed_left = ir::streamed_join_left_scans(*rewritten, deferrable_names);
     const auto repeated_scan = [&](const std::string& name) {
         const auto it = scan_counts.find(name);
         return it != scan_counts.end() && it->second > 1;
@@ -6262,16 +6263,25 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
                 eager_only.contains(name)) {
                 continue;
             }
-            deferred_scans.emplace(name, runtime::DeferredScan{
-                                             .lazy = resolve_lazy_ptr(name),
-                                             .conjuncts = absorbed.applied.contains(name)
-                                                              ? absorbed.predicates.at(name)
-                                                              : std::vector<ir::Expr>{},
-                                             .demand = needed.names,
-                                             .demand_all = needed.all,
-                                             .key_column = {},
-                                             .filter = nullptr,
-                                         });
+            // The left input of an inner join gets a slot for the join's built
+            // right-side keys -- only without an absorbed filter of its own, so
+            // the join knows the scan's row count exactly and its choice of
+            // build side (hence its output order) cannot change.
+            const bool absorbed_filter = absorbed.applied.contains(name);
+            const auto left_of_join = streamed_left.find(name);
+            const bool slot = left_of_join != streamed_left.end() && !absorbed_filter;
+            deferred_scans.emplace(
+                name, runtime::DeferredScan{
+                          .lazy = resolve_lazy_ptr(name),
+                          .conjuncts = absorbed_filter ? absorbed.predicates.at(name)
+                                                       : std::vector<ir::Expr>{},
+                          .demand = needed.names,
+                          .demand_all = needed.all,
+                          .key_column = slot ? left_of_join->second : std::string{},
+                          .filter = nullptr,
+                          .stream_filter =
+                              slot ? std::make_shared<runtime::DynamicScanFilter>() : nullptr,
+                      });
         }
     }
     // Everything not deferred or streamed is decoded eagerly into the

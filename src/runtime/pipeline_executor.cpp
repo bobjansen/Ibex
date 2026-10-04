@@ -1686,11 +1686,7 @@ class DeferredScanSourceOperator final : public Operator {
    public:
     DeferredScanSourceOperator(const DeferredScan& scan, std::vector<SourceUnit> units,
                                const ExecutionContext& exec)
-        : scan_(&scan),
-          plan_(plan_deferred_scan(scan)),
-          units_(std::move(units)),
-          exec_(&exec),
-          window_(unit_window(exec)) {}
+        : scan_(&scan), units_(std::move(units)), exec_(&exec), window_(unit_window(exec)) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         while (true) {
@@ -1766,6 +1762,9 @@ class DeferredScanSourceOperator final : public Operator {
     /// possible — and which is also why everything the body touches is a
     /// member rather than a local.
     void dispatch() {
+        if (!plan_.has_value()) {
+            plan_ = plan_deferred_scan(*scan_);
+        }
         window_begin_ = dispatched_;
         window_count_ = std::min(window_, units_.size() - dispatched_);
         dispatched_ += window_count_;
@@ -1791,8 +1790,8 @@ class DeferredScanSourceOperator final : public Operator {
     /// lose the other units' errors and unwind through the pool.
     auto decode_unit(std::size_t slot) -> std::expected<Table, std::string> {
         try {
-            auto table =
-                materialize_deferred_scan_unit(*scan_, plan_, units_[window_begin_ + slot], *exec_);
+            auto table = materialize_deferred_scan_unit(*scan_, *plan_,
+                                                        units_[window_begin_ + slot], *exec_);
             if (table.has_value()) {
                 normalize_time_index(*table);
             }
@@ -1924,7 +1923,10 @@ class DeferredScanSourceOperator final : public Operator {
     }
 
     const DeferredScan* scan_;
-    DeferredScanPlan plan_;
+    // Planned on first use, not at construction: a scan built as a join's
+    // left input is built before the join's right side, and the join fills
+    // the scan's `stream_filter` only once it has that side.
+    std::optional<DeferredScanPlan> plan_;
     std::vector<SourceUnit> units_;
     const ExecutionContext* exec_;
     std::vector<std::optional<Column<Categorical>>> cat_states_;
@@ -2014,7 +2016,6 @@ class PipelinedScanOperator final : public Operator {
                           std::unique_ptr<ExecutionContext> consumer_exec = nullptr,
                           std::optional<ScanPipelineWorker> consumer_worker = std::nullopt)
         : scan_(&scan),
-          plan_(plan_deferred_scan(scan)),
           units_(std::move(units)),
           workers_(std::move(workers)),
           exec_(&exec),
@@ -2106,6 +2107,7 @@ class PipelinedScanOperator final : public Operator {
             return;
         }
         started_ = true;
+        plan_ = plan_deferred_scan(*scan_);
         batch_ = pool_->submit(workers_.size(), [this](std::size_t id) { run_worker(id); });
     }
 
@@ -2213,7 +2215,7 @@ class PipelinedScanOperator final : public Operator {
 
     [[nodiscard]] auto run_unit(ScanPipelineWorker& worker, std::size_t sequence,
                                 const ExecutionContext& exec) -> std::expected<Chunk, std::string> {
-        auto decoded = materialize_deferred_scan_unit(*scan_, plan_, units_[sequence], exec);
+        auto decoded = materialize_deferred_scan_unit(*scan_, *plan_, units_[sequence], exec);
         if (!decoded.has_value()) {
             return std::unexpected(std::move(decoded.error()));
         }
@@ -2334,7 +2336,10 @@ class PipelinedScanOperator final : public Operator {
     }
 
     const DeferredScan* scan_;
-    DeferredScanPlan plan_;
+    // Planned on first use, not at construction: a scan built as a join's
+    // left input is built before the join's right side, and the join fills
+    // the scan's `stream_filter` only once it has that side.
+    std::optional<DeferredScanPlan> plan_;
     std::vector<SourceUnit> units_;
     std::vector<ScanPipelineWorker> workers_;
     const ExecutionContext* exec_;

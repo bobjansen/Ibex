@@ -161,6 +161,20 @@ struct DeferrableProbeScan {
     const std::map<std::string, double>& absorbed_scan_selectivity = {})
     -> std::map<std::string, DeferrableProbeScan>;
 
+/// Streamed scans that are the LEFT input of an inner single-key join, through
+/// Project / Rename / row-local Update only, and occur once in `root`: source
+/// name -> the join key in the scan's own column names.
+///
+/// The join builds on its right side when that side is small, then streams the
+/// left through it; the scan named here gets a filter slot
+/// (`runtime::DeferredScan::stream_filter`) the join fills with the built
+/// side's keys before pulling a left row. Eligibility here is structural only;
+/// the join decides at run time, from both sides' row counts, whether to fill
+/// it. The mirror of `deferrable_probe_scans`, which serves a join that builds
+/// on its left.
+[[nodiscard]] auto streamed_join_left_scans(const Node& root, const std::set<std::string>& sources)
+    -> std::map<std::string, std::string>;
+
 /// Remove row-local filters which have already been applied by a lazy source.
 /// `applied_sources` must contain only sources for which the caller actually
 /// materialized the selection. The implementation repeats the scan-predicate

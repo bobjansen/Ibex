@@ -1110,34 +1110,59 @@ auto LazyTable::project_where_unit(const std::set<std::string>& names,
     // for this unit's row groups only.
     if (membership && conjuncts.empty() && (key_filter_scan_ != nullptr || reader_factory_) &&
         !cache_.contains(*dynamic_key)) {
-        auto scan = scan_key_filter(*dynamic_key, *dynamic, &unit, exec);
+        // When the key is itself an output, take its passing values from the
+        // scan, which decoded them to test them: decoding the key again for
+        // the selected rows would decompress its pages a second time (a
+        // streamed join input's key is always an output -- the join reads it).
+        // Sources fill `values` only for an Int64 key.
+        const auto* key_schema = schema_.find(*dynamic_key);
+        const bool reuse_key = names.contains(*dynamic_key) && key_schema != nullptr &&
+                               std::holds_alternative<Column<std::int64_t>>(*key_schema);
+        std::vector<std::int64_t> key_values;
+        auto scan =
+            scan_key_filter(*dynamic_key, *dynamic, &unit, exec, reuse_key ? &key_values : nullptr);
         if (!scan) {
             return std::unexpected(scan.error());
         }
         if (scan->has_value()) {
             const Selection selected = std::move(**scan);  // source-global
             const bool all_rows = selected.size() == unit.rows;
+            const bool have_keys =
+                reuse_key && !selected.empty() && key_values.size() == selected.size();
             std::vector<std::string> wanted;
             for (const auto& field : schema_.columns) {
-                if (names.contains(field.name)) {
+                if (names.contains(field.name) && !(have_keys && field.name == *dynamic_key)) {
                     wanted.push_back(field.name);
                 }
             }
-            if (!wanted.empty()) {
-                auto decoded = decode_columns(wanted, all_rows ? nullptr : &selected, &unit, exec);
-                if (!decoded) {
-                    return std::unexpected(decoded.error());
-                }
-                if (decoded->rows() != selected.size()) {
-                    return std::unexpected(
-                        "lazy source produced selected columns with the wrong row count");
+            if (!wanted.empty() || have_keys) {
+                Table decoded;
+                if (!wanted.empty()) {
+                    auto columns =
+                        decode_columns(wanted, all_rows ? nullptr : &selected, &unit, exec);
+                    if (!columns) {
+                        return std::unexpected(columns.error());
+                    }
+                    if (columns->rows() != selected.size()) {
+                        return std::unexpected(
+                            "lazy source produced selected columns with the wrong row count");
+                    }
+                    decoded = std::move(*columns);
                 }
                 Table out;
-                for (const auto& name : wanted) {
-                    const auto* entry = decoded->find_entry(name);
+                for (const auto& field : schema_.columns) {
+                    if (!names.contains(field.name)) {
+                        continue;
+                    }
+                    if (have_keys && field.name == *dynamic_key) {
+                        // A null key fails the filter, so every value is valid.
+                        out.add_column(field.name, Column<std::int64_t>{std::move(key_values)});
+                        continue;
+                    }
+                    const auto* entry = decoded.find_entry(field.name);
                     if (entry == nullptr) {
                         return std::unexpected("lazy source did not produce requested column '" +
-                                               name + "'");
+                                               field.name + "'");
                     }
                     out.add_column_from(entry->name, *entry);
                 }

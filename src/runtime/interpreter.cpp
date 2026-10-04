@@ -179,21 +179,21 @@ namespace {
 /// gather-decode path, slower than the dense decode it replaces; no stats
 /// means no proof, so no bounds. The publisher records raw bounds always —
 /// this is the consumer-side policy.
-auto bounds_worth_applying(const DeferredScan& scan) -> bool {
+auto bounds_worth_applying(const DeferredScan& scan, const DynamicScanFilter& filter) -> bool {
     const auto& stats = scan.lazy->column_stats();
     const auto stat = stats.find(scan.key_column);
-    if (stat == stats.end() || scan.filter == nullptr) {
+    if (stat == stats.end()) {
         return false;
     }
     const auto& col_stat = stat->second;
-    if (!col_stat.min.has_value() || !col_stat.max.has_value() || !scan.filter->min.has_value() ||
-        !scan.filter->max.has_value()) {
+    if (!col_stat.min.has_value() || !col_stat.max.has_value() || !filter.min.has_value() ||
+        !filter.max.has_value()) {
         return false;
     }
     const auto source_min = static_cast<double>(*col_stat.min);
     const auto source_max = static_cast<double>(*col_stat.max);
-    const double kept_min = std::max(static_cast<double>(*scan.filter->min), source_min);
-    const double kept_max = std::min(static_cast<double>(*scan.filter->max), source_max);
+    const double kept_min = std::max(static_cast<double>(*filter.min), source_min);
+    const double kept_max = std::min(static_cast<double>(*filter.max), source_max);
     const double source_span = source_max - source_min + 1.0;
     const double kept_span = std::max(0.0, kept_max - kept_min + 1.0);
     return kept_span / source_span <= 0.8;
@@ -204,15 +204,19 @@ auto bounds_worth_applying(const DeferredScan& scan) -> bool {
 auto plan_deferred_scan(const DeferredScan& scan) -> DeferredScanPlan {
     DeferredScanPlan plan;
     plan.conjuncts = scan.conjuncts;
-    if (scan.filter != nullptr && scan.filter->ready) {
-        if (scan.filter->has_membership()) {
-            plan.dynamic = scan.filter.get();
+    // A deferred probe's slot, or a streamed left input's: the join fills
+    // whichever one this scan has before the scan decodes anything.
+    const DynamicScanFilter* slot =
+        scan.filter != nullptr ? scan.filter.get() : scan.stream_filter.get();
+    if (slot != nullptr && slot->ready) {
+        if (slot->has_membership()) {
+            plan.dynamic = slot;
         }
         // Bound conjuncts only when there is no membership filter (the Bloom
         // was built from exactly these keys, so bounds add nothing to it) and
         // they provably prune.
-        if (plan.dynamic == nullptr && scan.filter->min.has_value() &&
-            scan.filter->max.has_value() && bounds_worth_applying(scan)) {
+        if (plan.dynamic == nullptr && slot->min.has_value() && slot->max.has_value() &&
+            bounds_worth_applying(scan, *slot)) {
             const auto bound = [&](ir::CompareOp op, std::int64_t value) {
                 plan.conjuncts.push_back(ir::Expr{ir::CompareExpr{
                     .op = op,
@@ -220,8 +224,8 @@ auto plan_deferred_scan(const DeferredScan& scan) -> DeferredScanPlan {
                     .right = ir::make_expr_ptr(ir::Expr{ir::Literal{.value = value}}),
                 }});
             };
-            bound(ir::CompareOp::Ge, *scan.filter->min);
-            bound(ir::CompareOp::Le, *scan.filter->max);
+            bound(ir::CompareOp::Ge, *slot->min);
+            bound(ir::CompareOp::Le, *slot->max);
         }
     }
     plan.names = scan.demand;

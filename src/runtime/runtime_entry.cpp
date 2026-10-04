@@ -519,9 +519,12 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
         if (!right.has_value()) {
             return std::unexpected(std::move(right.error()));
         }
+        // A streamed left scan with a slot receives the right side's keys
+        // before the join pulls a left row (`streamed_left_scan_of`).
         auto built = make_scheduled_chunked_inner_join_operator(
             std::move(left_op.value()), std::move(right.value()), &join.keys(), exec, join.suffix(),
-            &join.pending_order(), resolved_join_parallelism(nodes, exec), nodes.columns);
+            &join.pending_order(), resolved_join_parallelism(nodes, exec), nodes.columns,
+            streamed_left_scan_of(*join.children()[0], exec));
         if (!built.has_value()) {
             return std::unexpected(std::move(built.error()));
         }

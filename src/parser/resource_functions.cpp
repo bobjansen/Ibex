@@ -86,19 +86,14 @@ auto ResourceFunctions::first_misplaced(const Expr& expr) const -> std::optional
     return misplaced_below(expr);
 }
 
-// A resource call's own arguments: a nested resource call is allowed (it can
-// open the resource a parameter takes); anything else that hides one is not.
+// A resource call's own arguments are slots like any other call's: a nested
+// resource call may be an argument (it can open the resource a parameter
+// takes) or a table operand inside one (`adbc::write(db, adbc::query(db,
+// sql)[filter ...], t)`); inside a query clause it may not.
 auto ResourceFunctions::misplaced_in_call(const CallExpr& call) const
     -> std::optional<std::string> {
     const auto check = [&](const ExprPtr& arg) -> std::optional<std::string> {
-        if (!arg) {
-            return std::nullopt;
-        }
-        const auto* nested = std::get_if<CallExpr>(&arg->node);
-        if (nested != nullptr && contains(nested->callee)) {
-            return misplaced_in_call(*nested);
-        }
-        return first_call(*arg);
+        return arg ? first_misplaced(*arg) : std::nullopt;
     };
     for (const auto& arg : call.args) {
         if (auto found = check(arg)) {

@@ -1,0 +1,12 @@
+// A query in another call's table argument runs first, as a `let` would: on its
+// own, and as the base of a block whose filter runs in Ibex. Both writes see the
+// rows the earlier statements put there.
+import "adbc";
+let db = adbc::connect("@SQLITE_DRIVER@", "file:/tmp/ibex_parity_adbc_query_in_write.db");
+adbc::execute(db, "create table t (x integer)");
+adbc::execute(db, "insert into t values (1), (2), (3), (4)");
+adbc::write(db, adbc::query(db, "select x from t"), "copy");
+adbc::write(db, adbc::query(db, "select x from copy")[filter x > 2], "big");
+let rows = adbc::query(db, "select x from big order by x");
+adbc::close(db);
+rows;

@@ -2808,18 +2808,23 @@ class Lowerer {
                     args.push_back(ir::Expr{.node = ir::ColumnRef{.name = std::move(name)}});
                     continue;
                 }
-                if (auto nested = resource_functions_->first_call(arg)) {
-                    return std::unexpected(LowerError{
-                        .message = call.callee + ": the argument calls " + *nested +
-                                   ", which compiled programs cannot yet run inside another "
-                                   "call unless it returns a resource; bind its result with "
-                                   "`let` first"});
-                }
             }
             const bool is_table_param = script_mode_ && decl != nullptr &&
                                         i < decl->params->size() &&
                                         ((*decl->params)[i].type.kind == Type::Kind::DataFrame ||
                                          (*decl->params)[i].type.kind == Type::Kind::TimeFrame);
+            // A table argument is a binding of this statement (below), which runs
+            // a resource call in it first, as a `let` would. A scalar argument has
+            // no such slot.
+            if (script_mode_ && resource_functions_.has_value() && !is_table_param) {
+                if (auto nested = resource_functions_->first_call(arg)) {
+                    return std::unexpected(LowerError{
+                        .message = call.callee + ": the argument calls " + *nested +
+                                   ", which compiled programs cannot yet run inside another "
+                                   "call unless it returns a resource or a table; bind its "
+                                   "result with `let` first"});
+                }
+            }
             if (is_table_param) {
                 auto plan = lower_expr(arg);
                 if (!plan.has_value()) {

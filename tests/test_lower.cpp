@@ -772,6 +772,43 @@ t;
     CHECK(lowered->resource_steps[0].name == connection->name);
 }
 
+TEST_CASE("lower_script runs a resource call in a table argument first, as a binding",
+          "[parser][lower][resource]") {
+    // `df` is a binding of the statement's own, so the query under the filter
+    // runs before `put`, at the same statement, as a `let` would.
+    auto lowered = lower_resource_script(R"IBEX(
+let db = open("file:x");
+put(db, load(db, "select 1")[filter x > 0], "t");
+t;
+)IBEX");
+    REQUIRE(lowered.has_value());
+    const parser::SharedBinding* df = nullptr;
+    for (const auto& shared : lowered->shared_bindings) {
+        if (shared.name.starts_with("__ibex_arg_")) {
+            df = &shared;
+        }
+    }
+    REQUIRE(df != nullptr);
+    CHECK(df->position == 6);  // after the five declarations and `let db`
+    const auto calls_load = [](const auto& self, const ir::Node& node) -> bool {
+        if (const auto* call = as_node<ir::ExternCallNode>(&node);
+            call != nullptr && call->callee() == "load") {
+            return true;
+        }
+        return std::ranges::any_of(node.children(), [&](const auto& child) {
+            return child != nullptr && self(self, *child);
+        });
+    };
+    REQUIRE(df->plan != nullptr);
+    CHECK(calls_load(calls_load, *df->plan));
+    const auto* put_call = as_node<ir::ExternCallNode>(lowered->preamble.back().get());
+    REQUIRE(put_call != nullptr);
+    CHECK(put_call->callee() == "put");
+    const auto* df_arg = std::get_if<ir::ColumnRef>(&put_call->args()[1].node);
+    REQUIRE(df_arg != nullptr);
+    CHECK(df_arg->name == df->name);
+}
+
 TEST_CASE("lower_script refuses a nested resource call that does not return a resource",
           "[parser][lower][resource]") {
     // A scalar from a call on a connection, passed as an argument, has nowhere to

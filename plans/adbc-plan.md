@@ -1,8 +1,8 @@
 # Finishing ADBC support
 
-Status: **in progress** (2026-09-28: Phases 0 to 3 done, Phase 4 slices 1-2
-done; 2026-09-27: performance work is parked behind it,
-see `beat-duckdb-plan.md`). This plan says what "finished" means for the ADBC
+Status: **library work done** (2026-10-04: Phases 0 to 5 done; Phase 6 done
+except Flight SQL and SQL Server; see "What is left" at the end. 2026-09-27:
+performance work is parked behind it, see `beat-duckdb-plan.md`). This plan says what "finished" means for the ADBC
 plugin, what exists today, and the order to build the rest in. The design of
 reusable connections already exists as a separate plan
 (`opaque-resource-lifetime-plan.md`) and is referenced, not repeated. The work
@@ -62,8 +62,8 @@ unchanged.
 ### Phase 0 — land what exists
 
 - ~~Cherry-pick `01189d96` and `06d2875e`~~ done on `adbc` (`2acc5a22`,
-  `b8ab0f5f`). Still to do: push `adbc` and confirm the PostgreSQL CI job
-  passes on GitHub (it has never run).
+  `b8ab0f5f`), merged to main. The Linux CI job runs PostgreSQL, MariaDB and
+  DuckDB on every push (green on main, run 37185075146, 2026-10-04).
 - ~~Clearer "driver not found" errors~~ done (see the commit after
   `197bb707`). Offered in September and never done:
   name the driver, the manifest search path it tried, and the install command.
@@ -123,10 +123,10 @@ As built:
 - Resource functions can now take DataFrame/TimeFrame arguments:
   `ExternArgs::push_table` / `table(i)`, filled by `ResourceCalls::call` with
   `eval_table_expr`. Registry ABI change: rebuild plugins. A connection call
-  nested under a query clause inside another connection call's argument
-  (`adbc_write(db, adbc_query(db, ...)[filter ...], ...)`) is still refused by
-  the placement check; bind it with `let` first. Allowing it means hoisting
-  inside resource-call arguments.
+  in a table argument, as its value or as a table operand
+  (`adbc::write(db, adbc::query(db, ...)[filter ...], ...)`), runs before the
+  outer call, in the REPL and in `ibex_compile` (2026-10-04; it was refused
+  until then). A scalar argument still cannot call one.
 
 Measured per type (tests `[adbc][write]`, PostgreSQL gated on
 `IBEX_TEST_POSTGRES_URI`):
@@ -286,13 +286,13 @@ like a failed statement.
   in the public registry; its docs say GetTableSchema marks NOT NULL. Redshift
   has the same terms. Flight SQL after that; Snowflake and BigQuery need
   accounts and stay documented-but-untested.
-- **macOS in CI**: `adbc-macos` job added (2026-10-03; SQLite + DuckDB, no servers); unverified until its first CI run.
+- **macOS in CI**: `adbc-macos` job (2026-10-03; SQLite + DuckDB, no servers); green since run 37142210684.
 - **SPEC.md**: DONE 2026-10-03 (§12.1.1). Was: a section for the ADBC functions, the `options` grammar, the type
   mapping table, and the connection rules once Phase 4 lands.
-- **`docs/io.html`**: PostgreSQL next to SQLite, writing, parameters,
-  connections. Use `import "adbc"` in examples (AGENTS.md).
-- **`ibex_compile`**: generated C++ either supports the ADBC functions or
-  rejects them with a clear message. Check what it does with `adbc_read` today.
+- **`docs/io.html`**: DONE (PostgreSQL, writing, parameters, discovery,
+  transactions; `docs/connections.html` has the connection rules).
+- **`ibex_compile`**: DONE (W6 in `ibex-compile-conformance-plan.md`): every
+  ADBC function transpiles, checked by `tests/parity/effect_cases/adbc_*`.
 
 Done when: the four drivers install by name on the three platforms, and SPEC,
 docs and the walkthroughs cover every function.
@@ -309,15 +309,37 @@ closes the arc; its driver and CI items can go in as early as useful.
 
 1. ~~**`time` columns**~~ decided 2026-09-28: refuse, with an error naming the
    cast. uuid: canonical string.
-2. **Phase 4 in "finished"?** Everything else is library work; Phase 4 is a
-   language feature. Without it ADBC is complete for scripting (one connection
-   per call) but not for session-style use.
+2. ~~**Phase 4 in "finished"?**~~ built (opaque resources, slices 1-2, and
+   transactions).
 3. ~~**Parameter form**~~ table only for now (2026-09-28); a scalar list can be
    sugar later.
 4. ~~**Function naming**~~ decided 2026-09-28: every function is `adbc_*`
    (`adbc_read`, `adbc_write`, `adbc_execute`, `adbc_connect`, `adbc_query`,
    ...); `read_adbc` was renamed with no alias. Namespaces are the next
    question, to be considered separately.
+
+## What is left (2026-10-04)
+
+Blocked upstream, with the workaround in place:
+
+- PostgreSQL COPY result left unread (apache/arrow-adbc#4695): fixed in ADBC
+  25, which is at rc0 only. When 25 is released, bump the driver manager
+  tarball and the wheel pins, then try dropping the `SELECT 1` in
+  `adbc_begin`.
+- DuckDB ingest reports success after a failed flush (duckdb/duckdb#26425,
+  open). Drop the DuckDB ingest quirk once a fixed release is pinned.
+
+Not started, by decision:
+
+- SQL Server, on the user's licensed Windows machine; it needs **filter
+  pushdown** into the query SQL first (a design of its own, out of scope
+  above).
+- Flight SQL (an Apache PyPI wheel, so `install_adbc_driver` can take it the
+  way it takes sqlite/postgresql), after SQL Server. Snowflake/BigQuery:
+  documented, untested.
+- A scalar argument that calls a connection function
+  (`adbc::execute(db, adbc::query(...)...)` where a String or Int is
+  expected); bind it with `let`.
 
 ## Testing
 

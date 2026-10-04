@@ -356,6 +356,7 @@
         <tr><td><code>let t = adbc::query(db, "...");</code></td><td>As a statement's value.</td></tr>
         <tr><td><code>adbc::query(db, "...")[filter x &gt; 1]</code></td><td>As a table operand: the base of a block or a side of a join.</td></tr>
         <tr><td><code>adbc::query(adbc::connect(...), "...")</code></td><td>As an argument of another call. A connection opened this way is closed at the end of the statement.</td></tr>
+        <tr><td><code>adbc::write(db, adbc::query(db, "...")[filter x &gt; 1], "t")</code></td><td>In a table argument, as its value or a table operand. The query runs first, as if bound with <code>let</code> just before the statement. A scalar argument cannot call a resource function; bind the result with <code>let</code>.</td></tr>
       </tbody>
     </table>
     <p>

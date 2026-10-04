@@ -1,6 +1,6 @@
 ---
 name: exists_subquery
-description: "Proposal: exists(table_expr) as a boolean subquery term — semi/anti join, mark join, and the residual-predicate case that q21 needs"
+description: "Proposal: exists(table_expr) as a boolean subquery term — semi/anti join, mark join, and the residual-predicate case (q21's shape)"
 metadata:
   node_type: memory
   type: project
@@ -11,6 +11,10 @@ metadata:
 Status: **proposed**, not built. Follows the shipped correlated scalar subquery
 (`plans/done/correlated-subquery-q02-plan.md`, SPEC 5.7), whose capture machinery
 this reuses wholesale.
+
+Revised 2026-10-04: every TPC-H query this plan used to call "blocked" (q11,
+q18, q20, q21) now ships as a hand-written relational form, and uncorrelated
+`scalar` has landed. The motivation and priority sections below reflect that.
 
 ## Start here: `exists` buys no new queries by itself
 
@@ -37,12 +41,15 @@ So this proposal must be honest about what it is for. `exists` is:
 - **Ergonomics** for the common case — writing the correlation where SQL writes
   it, instead of hand-decorrelating into a semi join and hoisting the inner-only
   predicates out by eye. Real value, but no new capability.
-- **Capability** for exactly one shape: a correlation that a semi join *cannot*
-  express, which is q21's. That is Tier 3 below, and it is the only part of this
-  proposal that unblocks a query.
+- **Expressiveness** for one shape: a correlation that a semi join *cannot*
+  express, which is q21's. That is Tier 3 below. It no longer unblocks a query:
+  q21 ships as a set-based rewrite (per-order supplier counts; see the header of
+  `benchmarking/tpch/queries/q21.ibex`). What Tier 3 buys is writing such a
+  query without finding that rewrite by hand — and without getting it subtly
+  wrong, as the shipped q21's Polars-matching line-count proxy shows.
 
-If the goal is corpus coverage rather than expressiveness, **this is not the next
-thing to build** — see "Priority" at the end.
+So this is a language-quality feature, not a coverage one — see "Priority" at
+the end.
 
 ## Syntax
 
@@ -143,7 +150,7 @@ is a good parity test.
 
 ### Tier 3 — a residual correlated predicate → equijoin + residual filter + dedup
 
-This is the only tier that unblocks anything, and q21 is the whole reason:
+This is the one tier a semi join cannot replace, and q21 is the motivating shape:
 
 ```sql
 and exists (select * from lineitem l2
@@ -176,11 +183,17 @@ nested loop, and must be rejected with a diagnostic rather than silently
 executed.** That rule is the same one the scalar subquery already enforces, and
 it is the line this whole design refuses to cross.
 
-**Dependency:** step 1 needs a row-identity column, and Ibex has no
-`row_number()` today (`rank()` is not it — ties share a rank). That is a
-prerequisite, not a detail.
+**Row identity:** step 1 needs a column that is unique per outer row. The
+runtime already computes one: `rank(x, method = first)` assigns distinct
+ordinals (`RankMethod::First` in `src/runtime/rank_window.cpp`). But `rank` needs
+an ordering column, and the outer may have no unique one, so the lowering wants
+an internal row-index builtin (positional, no sort) rather than the user-facing
+`rank`. That is small, but it is still a step to schedule, and it must stay
+correct under morsel-parallel evaluation (indices assigned per chunk need a
+global offset).
 
-**Buys: q21.** (q21 also needs its `not exists` sibling, same machinery.)
+**Buys: q21 written like its SQL** (with its `not exists` sibling, same
+machinery). The shipped q21 is a hand-written approximation of exactly this.
 
 ## Rejections
 
@@ -194,8 +207,9 @@ update { flag = exists(...) };      // boolean subqueries live in filters, for n
 ```
 
 An *uncorrelated* `exists` is well-defined (true iff the subquery has any row)
-but it is a constant, and constant-folding a table scan into a boolean is a
-different feature. Reject it in V1 and point at the uncorrelated-`scalar` work.
+but it is a constant. Reject it in V1. If it is wanted later, it lowers the
+way uncorrelated `scalar` already does (SPEC 5.7): a one-row aggregate
+(`count() > 0`) cross-joined onto the outer.
 
 ## Test plan
 
@@ -215,17 +229,29 @@ Mirroring what the scalar subquery shipped with:
 
 ## Priority — read this before building it
 
-Ranked by queries unblocked per unit of work, `exists` is **not** next:
+Every TPC-H subquery shape is now covered without subquery syntax:
 
-| Work | Unblocks | Notes |
+| SQL shape | Query | How it ships today |
 |---|---|---|
-| Uncorrelated `scalar` | q11, half of q22 | Smallest. No join at all — evaluate once, broadcast. Already rejected with a specific diagnostic, so the shape is known. |
-| `in` / `not in` | q18, q20 | Semi/anti join, but the null semantics are a trap: `x not in (S)` is never true when S holds a null. q20's correlated half (composite captures) already works. |
-| `exists` Tier 1+2 | *nothing* | Ergonomics only. q04 proves the capability is already there. |
-| `exists` Tier 3 | q21 | Needs `row_number()` first. |
+| uncorrelated `scalar` | q11, q22 | `cross join` against a one-row aggregate (syntax built, SPEC 5.7) |
+| correlated `scalar` | q02, q17 | group-by + join (syntax built, SPEC 5.7) |
+| `exists`, equality | q04 | `semi join` |
+| `not exists`, equality | q22 | anti join (left join + `is_null`) |
+| `in` / `not in` | q16, q18, q20 | `semi join` / anti join |
+| `exists` with `<>` | q21 | set-based rewrite (Polars line-count shape) |
 
-The honest summary: **`exists` is a readability feature with one capability
-attached (Tier 3 / q21) that is also the most expensive part of it.** If the
-next milestone is corpus coverage, do uncorrelated `scalar` and `in` first; if it
-is language quality, Tier 1 is a small, self-contained win that makes q04 and q22
-read like the SQL they came from.
+(The queries follow Polars' explicit relational shapes for benchmark
+comparability — "Match query shapes", 482eb583 — so even the built `scalar`
+syntax is not what they use.) Nothing on the subquery track unblocks a query;
+it is all language quality. Ranked on that basis:
+
+| Work | Value | Notes |
+|---|---|---|
+| `exists` Tier 1 | q04, q22 read like their SQL | Small and self-contained: capture split exists, emits a Semi/Anti join, no schema widening. |
+| `in` / `not in` (`plans/in-subquery-plan.md`) | q16, q18, q20 read like their SQL | Shares Tier 1's semi/anti lowering — the one real argument for building them together. The `not in` null rule is the trap. |
+| `exists` Tier 2 | generality | Mark join; mostly the scalar-subquery lowering reused. Needed for parity testing of Tier 1. |
+| `exists` Tier 3 | q21 exact, without a hand rewrite | Needs the internal row-index builtin (see Tier 3). Most expensive part. |
+
+The honest summary: **`exists` is a readability feature, and so is everything
+left on the subquery track.** If it is built, start with Tier 1 (ideally
+alongside `in`), add Tier 2 for parity, and treat Tier 3 as optional.

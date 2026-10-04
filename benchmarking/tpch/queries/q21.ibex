@@ -6,10 +6,8 @@
 //  that order was also late. Standard TPC-H qualification: NATION='SAUDI ARABIA'.
 //
 //  The SQL correlates two subqueries on an INEQUALITY (l_suppkey <> l1.l_suppkey),
-//  which a semi join cannot express directly. But q21 has the standard set-based
-//  rewrite that turns both into per-order distinct-supplier counts — the same
-//  distinct+count pattern q16 uses — so it needs no `exists` syntax and no
-//  row-identity primitive:
+//  which a semi join cannot express directly. The exact set-based rewrite turns
+//  both into per-order DISTINCT-supplier counts:
 //
 //    - `exists (l2 … l_suppkey <> l1.l_suppkey)` — "another supplier is on this
 //      order" — holds iff the order has MORE THAN ONE distinct supplier.
@@ -17,10 +15,16 @@
 //      also late" — holds iff the order has EXACTLY ONE distinct late supplier,
 //      which must be l1's own (l1 is late by the outer filter).
 //
-//  l1 stays at line granularity (one row per late line), so count(*) counts
-//  waiting lines, matching the SQL. Candidate l1 rows are restricted to Saudi
-//  suppliers first; their order keys then restrict the two distinct-supplier
-//  aggregates without removing any line from a candidate order.
+//  This file does NOT use that rewrite. It matches the Polars PDS-H q21 shape
+//  (so the engine comparison is like for like), which counts LINES instead of
+//  distinct suppliers: `n_supp_by_order` is lines per order and `n_supp_count`
+//  is late lines per order. That equals the SQL only when no order has two
+//  lines from the same supplier, which TPC-H does not guarantee (a line's
+//  supplier is one of its part's four, so two parts can share one). For the
+//  exact form, add `distinct { l_orderkey, l_suppkey }` before both counts.
+//
+//  l1 stays at line granularity (one row per late line), so count() counts
+//  waiting lines, matching the SQL.
 //
 //  Run:
 //    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
@@ -50,8 +54,8 @@ let lineitem_raw = parquet::read("benchmarking/data/tpch/parquet/lineitem.parque
     l_receiptdate: Date
 }>;
 
-// Lines belonging to status-F orders.
-// Match Polars' q1: orders with more than one supplier, joined to late lines.
+// Match Polars' q1: orders with more than one line (Polars' proxy for "more
+// than one supplier"), joined to their late lines.
 let q1 = (
     lineitem_raw[
         select { n_supp_by_order = count() },

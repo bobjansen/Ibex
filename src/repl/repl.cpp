@@ -4677,6 +4677,9 @@ class ResourceCalls {
         if (!bound_args) {
             return std::unexpected(bound_args.error());
         }
+        // Resource calls inside a table argument run first, in argument order,
+        // and the argument reads their results; the AST is restored on return.
+        HoistedResourceCalls nested(tables_, scalars_, columns_);
         runtime::ExternArgs args;
         args.reserve(bound_args->size());
         for (const auto& arg : *bound_args) {
@@ -4688,15 +4691,28 @@ class ResourceCalls {
                 args.push_resource(std::move(*resource));
                 continue;
             }
-            if (auto callee = first_resource_call(*arg.expr)) {
-                return std::unexpected(call.callee + ": argument '" + arg.param->name + "' calls " +
-                                       *callee + "; bind its result with `let` first");
+            const bool is_table_param = arg.param->type.kind == parser::Type::Kind::DataFrame ||
+                                        arg.param->type.kind == parser::Type::Kind::TimeFrame;
+            parser::Expr* expr = arg.expr;
+            if (auto callee = first_resource_call(*expr)) {
+                // A table argument runs its resource calls first, as a `let`
+                // would (and as a compiled program does); a scalar one does not.
+                if (!is_table_param || arg.is_default) {
+                    return std::unexpected(call.callee + ": argument '" + arg.param->name +
+                                           "' calls " + *callee + "; bind its result with `let` " +
+                                           "first");
+                }
+                // Hoisting may replace the slot itself, so read it again.
+                auto& slot = argument_slot(call, *expr);
+                if (auto err = hoist_slot(slot, nested)) {
+                    return std::unexpected(std::move(*err));
+                }
+                expr = slot.get();
             }
-            if (arg.param->type.kind == parser::Type::Kind::DataFrame ||
-                arg.param->type.kind == parser::Type::Kind::TimeFrame) {
-                auto table = eval_table_expr(*arg.expr, *tables_, *lazy_tables_, *scalars_,
-                                             *columns_, *models_, *functions_, *compile_time_lists_,
-                                             *extern_decls_, *externs_);
+            if (is_table_param) {
+                auto table =
+                    eval_table_expr(*expr, *tables_, *lazy_tables_, *scalars_, *columns_, *models_,
+                                    *functions_, *compile_time_lists_, *extern_decls_, *externs_);
                 if (!table) {
                     return std::unexpected(std::move(table.error()));
                 }
@@ -4704,7 +4720,7 @@ class ResourceCalls {
                 continue;
             }
             auto value =
-                eval_scalar_expr(*arg.expr, *tables_, *lazy_tables_, *scalars_, *columns_, *models_,
+                eval_scalar_expr(*expr, *tables_, *lazy_tables_, *scalars_, *columns_, *models_,
                                  *functions_, *compile_time_lists_, *extern_decls_, *externs_);
             if (!value) {
                 return std::unexpected(std::move(value.error()));
@@ -4747,38 +4763,7 @@ class ResourceCalls {
     /// position of `expr`, in source order, and replaces it with a temporary
     /// binding of its result. `expr` itself is the caller's to handle.
     auto hoist(parser::Expr& expr, HoistedResourceCalls& rewrites) -> std::optional<std::string> {
-        auto visit_slot = [&](parser::ExprPtr& slot) -> std::optional<std::string> {
-            if (!slot) {
-                return std::nullopt;
-            }
-            auto* resource_call = as_resource_call(*slot);
-            if (resource_call == nullptr) {
-                return hoist(*slot, rewrites);
-            }
-            auto value = call(*resource_call);
-            if (!value) {
-                return value.error();
-            }
-            auto* evaluated = std::get_if<EvalValue>(&*value);
-            if (evaluated == nullptr) {
-                return resource_call->callee +
-                       " returns a resource, which can only be bound with `let` or passed "
-                       "to a resource parameter";
-            }
-            auto temp_name = make_temp_table_name();
-            if (auto* table = std::get_if<runtime::Table>(evaluated)) {
-                tables_->insert_or_assign(temp_name, std::move(*table));
-            } else if (auto* scalar = std::get_if<runtime::ScalarValue>(evaluated)) {
-                scalars_->insert_or_assign(temp_name, std::move(*scalar));
-            } else if (auto* column = std::get_if<runtime::ColumnValue>(evaluated)) {
-                columns_->insert_or_assign(temp_name, std::move(*column));
-            }
-            rewrites.temp_names.push_back(temp_name);
-            rewrites.replaced.emplace_back(&slot, std::move(slot));
-            slot = std::make_unique<parser::Expr>(
-                parser::Expr{parser::IdentifierExpr{.name = std::move(temp_name)}});
-            return std::nullopt;
-        };
+        auto visit_slot = [&](parser::ExprPtr& slot) { return hoist_slot(slot, rewrites); };
         if (auto* block = std::get_if<parser::BlockExpr>(&expr.node)) {
             return visit_slot(block->base);
         }
@@ -4807,6 +4792,64 @@ class ResourceCalls {
             }
         }
         return std::nullopt;
+    }
+
+    /// `hoist` for one slot: a resource call there runs and the slot names a
+    /// temporary holding its result; anything else is hoisted below.
+    auto hoist_slot(parser::ExprPtr& slot, HoistedResourceCalls& rewrites)
+        -> std::optional<std::string> {
+        if (!slot) {
+            return std::nullopt;
+        }
+        auto* resource_call = as_resource_call(*slot);
+        if (resource_call == nullptr) {
+            return hoist(*slot, rewrites);
+        }
+        const auto returns_resource_error = [&] {
+            return resource_call->callee +
+                   " returns a resource, which can only be bound with `let` or passed "
+                   "to a resource parameter";
+        };
+        // Known from the declaration: refuse before the call opens anything.
+        if (returns_resource(resource_call->callee)) {
+            return returns_resource_error();
+        }
+        auto value = call(*resource_call);
+        if (!value) {
+            return value.error();
+        }
+        auto* evaluated = std::get_if<EvalValue>(&*value);
+        if (evaluated == nullptr) {
+            return returns_resource_error();
+        }
+        auto temp_name = make_temp_table_name();
+        if (auto* table = std::get_if<runtime::Table>(evaluated)) {
+            tables_->insert_or_assign(temp_name, std::move(*table));
+        } else if (auto* scalar = std::get_if<runtime::ScalarValue>(evaluated)) {
+            scalars_->insert_or_assign(temp_name, std::move(*scalar));
+        } else if (auto* column = std::get_if<runtime::ColumnValue>(evaluated)) {
+            columns_->insert_or_assign(temp_name, std::move(*column));
+        }
+        rewrites.temp_names.push_back(temp_name);
+        rewrites.replaced.emplace_back(&slot, std::move(slot));
+        slot = std::make_unique<parser::Expr>(
+            parser::Expr{parser::IdentifierExpr{.name = std::move(temp_name)}});
+        return std::nullopt;
+    }
+
+    /// The owning slot of `call`'s positional or named argument `arg`.
+    static auto argument_slot(parser::CallExpr& call, const parser::Expr& arg) -> parser::ExprPtr& {
+        for (auto& slot : call.args) {
+            if (slot.get() == &arg) {
+                return slot;
+            }
+        }
+        for (auto& named : call.named_args) {
+            if (named.value.get() == &arg) {
+                return named.value;
+            }
+        }
+        std::unreachable();
     }
 
     /// The resource `expr` passes to resource parameter `param`: a binding

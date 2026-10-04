@@ -3600,9 +3600,15 @@ only:
 It cannot be called inside a query clause (`filter`, `select`, `update`, ...)
 or inside a larger expression (`adbc::close(db) + 1`). These are rejected
 before any resource function in the statement runs. The same rules apply to
-each statement of a resource function's body. A resource call in an argument
-that is not a resource parameter (`load(db, adbc::close(db))`) is rejected when
-the call is evaluated; bind its result with `let` first.
+each statement of a resource function's body. In an argument of a resource
+function:
+
+- a resource parameter takes a connection binding or a call that returns one;
+- a table parameter may hold a resource call as its value or as a table
+  operand (`adbc::write(db, adbc::query(db, "...")[filter x > 1], "t")`); it
+  runs before the outer call, as if bound with `let` just before the statement;
+- any other argument (`load(db, adbc::close(db))`) is rejected when the call is
+  evaluated; bind its result with `let` first.
 
 **Order and materialization.** Resource functions run one statement at a time,
 in source order, before the rest of the statement. A resource call in a table

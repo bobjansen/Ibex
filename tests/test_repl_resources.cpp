@@ -71,6 +71,7 @@ extern type OtherConn from "fake_resource.hpp";
 extern fn fake_open(name: String) -> FakeConn from "fake_resource.hpp";
 extern fn fake_query(mutable c: FakeConn, n: Int) -> DataFrame from "fake_resource.hpp";
 extern fn fake_close(mutable c: FakeConn) -> Int from "fake_resource.hpp";
+extern fn fake_put(mutable c: FakeConn, df: DataFrame) -> Int from "fake_resource.hpp";
 extern fn other_open() -> OtherConn from "fake_resource.hpp";
 )";
 
@@ -113,6 +114,18 @@ void register_fake(ibex::runtime::ExternRegistry& registry, FakeState& state) {
             conn->closed = true;
             state.log.push_back("close " + conn->name());
             return ExternValue{ibex::runtime::ScalarValue{std::int64_t{1}}};
+        });
+    registry.register_scalar(
+        "fake_put", ibex::runtime::ScalarKind::Int,
+        [&state](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
+            auto conn = args.resource_as<FakeConn>(0);
+            const auto table = args.table(1);
+            if (conn == nullptr || table == nullptr) {
+                return std::unexpected("fake_put: expects a FakeConn and a table");
+            }
+            const auto rows = static_cast<std::int64_t>(table->rows());
+            state.log.push_back("put " + conn->name() + " " + std::to_string(rows));
+            return ExternValue{ibex::runtime::ScalarValue{rows}};
         });
     registry.register_resource("other_open",
                                [](const ExternArgs&) -> std::expected<ExternValue, std::string> {
@@ -189,6 +202,43 @@ TEST_CASE("Rebinding a resource name releases it; the session releases the rest"
         // Two connections are independent.
         REQUIRE(session.execute("fake_query(b, 1);").ok);
         REQUIRE(state.log.back() == "query b");
+    }
+    REQUIRE(state.live == 0);
+}
+
+TEST_CASE("A resource call in a table argument runs first", "[repl][resource]") {
+    FakeState state;
+    ibex::runtime::ExternRegistry registry;
+    register_fake(registry, state);
+    {
+        ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+        REQUIRE(session.execute(std::string(kDecls) + "let db = fake_open(\"a\");").ok);
+        state.log.clear();
+
+        // As the argument itself, and as the base of a block whose filter runs
+        // in Ibex: the query runs, then the call that takes its result.
+        const auto direct = session.execute("let n = fake_put(db, fake_query(db, 3));");
+        REQUIRE(direct.ok);
+        const auto filtered =
+            session.execute("let m = fake_put(db, fake_query(db, 5)[filter v > 1]);");
+        REQUIRE(filtered.ok);
+        REQUIRE(state.log == std::vector<std::string>{"query a", "put a 3", "query a", "put a 3"});
+
+        // The temporaries are gone and the statement is unchanged: it runs again.
+        REQUIRE(session.execute("fake_put(db, fake_query(db, 5)[filter v > 1]);").ok);
+        REQUIRE(state.log.back() == "put a 3");
+        state.log.clear();
+
+        // Inside a clause of that argument it is still refused, before any call.
+        const auto in_clause =
+            session.execute("fake_put(db, fake_query(db, 3)[filter v < fake_close(db)]);");
+        REQUIRE_FALSE(in_clause.ok);
+        REQUIRE(in_clause.error.contains("fake_close can be called only as"));
+        // A resource has no table to give.
+        const auto resource = session.execute("fake_put(db, fake_open(\"b\"));");
+        REQUIRE_FALSE(resource.ok);
+        REQUIRE(resource.error.contains("returns a resource"));
+        REQUIRE(state.log.empty());
     }
     REQUIRE(state.live == 0);
 }

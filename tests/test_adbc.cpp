@@ -939,13 +939,17 @@ TEST_CASE("adbc::write takes any table expression, also inside functions", "[adb
         "[filter qty > 6, select { total = sum(qty) }, by symbol];");
     const auto written = exec("adbc::write(db, totals, \"totals\");");
     CHECK(std::get<std::int64_t>(*written.scalar) == 2);
-    // Inline, the query clause would run on a resource call's result inside
-    // another resource call's argument: refused before anything runs.
-    const auto inline_query = s.session.execute(
+    // Inline: the query runs first, as a `let` would, and the filter runs on
+    // its result.
+    const auto inline_query = exec(
         "adbc::write(db, adbc::query(db, \"select qty from trades\")[filter qty > 6], "
         "\"inline_t\");");
-    REQUIRE_FALSE(inline_query.ok);
-    CHECK(contains(inline_query.error, "adbc::query can be called only as"));
+    const auto expected =
+        exec("adbc::query(db, \"select qty from trades where qty > 6 order by qty\");");
+    const auto inlined = exec("adbc::query(db, \"select qty from inline_t order by qty\");");
+    CHECK(ints(*inlined.table, "qty") == ints(*expected.table, "qty"));
+    CHECK(std::get<std::int64_t>(*inline_query.scalar) ==
+          static_cast<std::int64_t>(expected.table->rows()));
     const auto totals = exec("adbc::query(db, \"select total from totals order by total\");");
     CHECK(ints(*totals.table, "total") == std::vector<std::int64_t>{7, 30});
 

@@ -282,9 +282,12 @@ workflow's postgres service, checks backends (`pg_backend_pid`,
 `pg_stat_activity`) for per-connection state, isolation, a failed query
 leaving the connection usable, function-owned connections gone on return,
 returned connections kept, and close through an alias. Not yet: busy-guard test through the
-language (unreachable while statements are sequential), cleanup-failure
-reporting through a diagnostic sink (cleanup errors in destructors are dropped),
-cancellation.
+language (unreachable while statements are sequential). Done 2026-10-04:
+cleanup failures in destructors go to `runtime::warn` (`warnings.hpp`; the
+ADBC session warns when an implicit close fails), and Ctrl+C cancels a running
+ADBC statement (`CancelWatch`, `AdbcStatementCancel`). Both needed plugins to
+reach host state: `ExternRegistry::register_*` binds a plugin's interrupt flag
+and warning sink to the host's.
 
 ## Slice 2 as built (2026-09-28)
 
@@ -306,8 +309,9 @@ Commit `81ab2142` (code and tests), then SPEC/docs (`docs/connections.html`).
   returned resource is shared. Body statements use the same
   `ResourceCalls::run_statement` as top-level statements.
 - **Not enforced:** `mutable` on resource parameters. A resource parameter
-  cannot have a default. A resource call inside a non-resource argument is
-  refused at call time, not by the placement check (as for externs).
+  cannot have a default. A resource call inside a scalar argument is
+  refused at call time, not by the placement check (as for externs); in a
+  table argument it runs first (2026-10-04).
 
 Acceptance additions: local cleanup on return and on error, reverse release
 order, bounded live count over repeated calls, resource returns (own and

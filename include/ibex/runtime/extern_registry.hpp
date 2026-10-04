@@ -18,10 +18,13 @@
 #endif
 
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/interrupt.hpp>
 #include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/rng.hpp>
+#include <ibex/runtime/warnings.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -252,6 +255,7 @@ class ExternRegistry {
 
     /// Register a scalar-returning extern function.
     void register_scalar(std::string name, ScalarKind kind, ExternFn func) {
+        use_host_runtime_state();
         registry_.insert_or_assign(std::move(name), ExternFunction{
                                                         .func = std::move(func),
                                                         .table_consumer_func = {},
@@ -264,6 +268,7 @@ class ExternRegistry {
 
     /// Register a table-returning extern function.
     void register_table(std::string name, ExternFn func) {
+        use_host_runtime_state();
         registry_.insert_or_assign(std::move(name), ExternFunction{.func = std::move(func),
                                                                    .table_consumer_func = {},
                                                                    .chunked_table_func = {},
@@ -276,6 +281,7 @@ class ExternRegistry {
     /// connection). Functions that only take a resource register as usual
     /// with `register_scalar` or `register_table`.
     void register_resource(std::string name, ExternFn func) {
+        use_host_runtime_state();
         registry_.insert_or_assign(std::move(name),
                                    ExternFunction{.func = std::move(func),
                                                   .table_consumer_func = {},
@@ -293,6 +299,7 @@ class ExternRegistry {
     /// If a regular `register_table` entry already exists for this name,
     /// both are stored; the interpreter prefers the chunked path.
     void register_chunked_table(std::string name, ExternChunkedTableFn func) {
+        use_host_runtime_state();
         auto it = registry_.find(name);
         if (it != registry_.end()) {
             it->second.chunked_table_func = std::move(func);
@@ -311,6 +318,7 @@ class ExternRegistry {
     /// same name, which remains the fallback for callers that want the whole
     /// table at once.
     void register_lazy_table(std::string name, ExternLazyTableFn func) {
+        use_host_runtime_state();
         auto it = registry_.find(name);
         if (it != registry_.end()) {
             it->second.lazy_table_func = std::move(func);
@@ -329,6 +337,7 @@ class ExternRegistry {
     /// parquet::write.
     void register_scalar_table_consumer(std::string name, ScalarKind kind,
                                         ExternTableConsumerFn func) {
+        use_host_runtime_state();
         ExternFunction ef;
         ef.table_consumer_func = std::move(func);
         ef.kind = ExternReturnKind::Scalar;
@@ -365,6 +374,7 @@ class ExternRegistry {
 
     /// Register a model method (the `method =` value, e.g. "lightgbm").
     void register_model(std::string name, ModelOps ops) {
+        use_host_runtime_state();
         models_.insert_or_assign(std::move(name), std::move(ops));
     }
 
@@ -377,10 +387,22 @@ class ExternRegistry {
     }
 
    private:
+    /// Every `register_*` runs in the module that registers: in a plugin, it
+    /// points the plugin's interrupt checks at the host's Ctrl+C flag and its
+    /// warnings at the host's sink, which the plugin's own copies never see
+    /// (see interrupt.hpp and warnings.hpp).
+    void use_host_runtime_state() const noexcept {
+        bind_interrupt_flag(host_interrupt_flag_);
+        bind_warning_sink(host_warning_sink_);
+    }
+
     robin_hood::unordered_map<std::string, ExternFunction> registry_;
     robin_hood::unordered_map<std::string, ModelOps> models_;
     robin_hood::unordered_set<std::string> libraries_;
     RngBridge rng_;
+    /// Captured where the registry is constructed, which is the host.
+    std::atomic<bool>* host_interrupt_flag_ = interrupt_flag_address();
+    std::atomic<WarningSink>* host_warning_sink_ = warning_sink_address();
 };
 
 }  // namespace ibex::runtime

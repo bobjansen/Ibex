@@ -65,6 +65,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -2639,7 +2640,8 @@ class ChunkedInnerJoinOperator final : public Operator {
     /// to slow q18's unrelated aggregate by 16% at 8 cores through code layout
     /// alone, while this identical-behavior version did not. That is layout
     /// luck, not a property of either version.)
-    IBEX_NOINLINE static auto build_key_bitmap(const std::int64_t* data, std::size_t n,
+    template <typename KeyAt>
+    IBEX_NOINLINE static auto build_key_bitmap(const KeyAt& key_at, std::size_t n,
                                                const ValidityBitmap* validity, std::int64_t mn,
                                                std::int64_t mx)
         -> std::shared_ptr<const JoinKeyBitmap> {
@@ -2648,24 +2650,47 @@ class ChunkedInnerJoinOperator final : public Operator {
             if (validity != nullptr && !(*validity)[r]) {
                 continue;
             }
-            bitmap->insert(data[r]);
+            bitmap->insert(key_at(r));
         }
         return bitmap;
     }
 
+    /// Publish a filter over `key_name`'s valid values, read as
+    /// `join_key_domain` integers. A key type with no integer domain
+    /// publishes nothing.
     static void publish_build_filter_column(const Table& build, const std::string& key_name,
                                             DynamicScanFilter& slot) {
         const auto* entry = build.find_entry(key_name);
         if (entry == nullptr) {
             return;
         }
-        const auto* col = std::get_if<Column<std::int64_t>>(&*entry->column);
-        if (col == nullptr || col->empty()) {
+        const ValidityBitmap* validity = entry->validity.has_value() ? &*entry->validity : nullptr;
+        std::visit(
+            [&](const auto& col) {
+                using C = std::remove_cvref_t<decltype(col)>;
+                if constexpr (std::is_same_v<C, Column<bool>>) {
+                    // Bit-packed: no element pointer to read through.
+                    publish_build_filter_keys(
+                        [&col](std::size_t r) { return join_key_domain(col[r]); }, col.size(),
+                        validity, slot);
+                } else if constexpr (std::is_same_v<C, Column<std::int64_t>> ||
+                                     std::is_same_v<C, Column<Date>> ||
+                                     std::is_same_v<C, Column<Timestamp>>) {
+                    const auto* data = col.data();
+                    publish_build_filter_keys(
+                        [data](std::size_t r) { return join_key_domain(data[r]); }, col.size(),
+                        validity, slot);
+                }
+            },
+            *entry->column);
+    }
+
+    template <typename KeyAt>
+    static void publish_build_filter_keys(const KeyAt& key_at, std::size_t n,
+                                          const ValidityBitmap* validity, DynamicScanFilter& slot) {
+        if (n == 0) {
             return;
         }
-        const ValidityBitmap* validity = entry->validity.has_value() ? &*entry->validity : nullptr;
-        const auto* data = col->data();
-        const std::size_t n = col->size();
         std::int64_t mn = std::numeric_limits<std::int64_t>::max();
         std::int64_t mx = std::numeric_limits<std::int64_t>::min();
         std::size_t valid_rows = 0;
@@ -2673,8 +2698,9 @@ class ChunkedInnerJoinOperator final : public Operator {
             if (validity != nullptr && !(*validity)[r]) {
                 continue;
             }
-            mn = std::min(mn, data[r]);
-            mx = std::max(mx, data[r]);
+            const std::int64_t key = key_at(r);
+            mn = std::min(mn, key);
+            mx = std::max(mx, key);
             ++valid_rows;
         }
         if (valid_rows == 0) {
@@ -2687,7 +2713,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         // insert (an index and a bit set) is cheaper than a Bloom insert (a
         // hash and a random miss), so the dense case builds faster too.
         if (JoinKeyBitmap::worth_building(mn, mx, JoinBloomFilter::bits_for(valid_rows))) {
-            slot.bitmap = build_key_bitmap(data, n, validity, mn, mx);
+            slot.bitmap = build_key_bitmap(key_at, n, validity, mn, mx);
             slot.min = mn;
             slot.max = mx;
             return;  // exact already: no Bloom, no in-list
@@ -2704,7 +2730,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             if (validity != nullptr && !(*validity)[r]) {
                 continue;
             }
-            bloom.insert(data[r]);
+            bloom.insert(key_at(r));
         }
         slot.bloom = std::move(bloom);
         if (valid_rows <= kInListBuildMax) {
@@ -2714,7 +2740,7 @@ class ChunkedInnerJoinOperator final : public Operator {
                 if (validity != nullptr && !(*validity)[r]) {
                     continue;
                 }
-                keys.push_back(data[r]);
+                keys.push_back(key_at(r));
             }
             std::ranges::sort(keys);
             keys.erase(std::ranges::unique(keys).begin(), keys.end());

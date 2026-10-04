@@ -412,6 +412,52 @@ if [[ "$SKIP_REPL" == false ]]; then
         fi
         rm -f "$null_out"
 
+        echo "▸ whole-script (parquet plugin, join-key filters over Date, Timestamp and Bool keys)"
+        # A filtered build side publishes its keys into the probe scan as
+        # `join_key_domain` integers: Date as days, Timestamp as nanoseconds,
+        # Bool as 0/1. The reader fuses the test into its decoder only where the
+        # stored value already is that integer (DATE32, TIMESTAMP(NANO)); a
+        # TIMESTAMP(MICRO) key must decline and filter after decoding. A wrong
+        # domain drops join rows (letting MICRO fuse returned 98 of 989), so the
+        # answers are the check. One join per script: a deferred probe is a
+        # whole-script plan decision, and joins inside `rbind` arguments never
+        # get one. 1 and 8 cores must print the same bytes.
+        uv run --project "$IBEX_ROOT" python \
+            "$IBEX_ROOT/tests/data/gen_parquet_join_key_types.py" "$IBEX_ROOT/tests/data" >/dev/null
+        # Expected, from the generator: 989 rows, payload 48996275, build keys
+        # 22275 for each keyed join; the Bool build row matches every 100th row.
+        for case in "date|build|bd = d|989 48996275 22275" \
+            "timestamp_ns|build|btsn = tsn|989 48996275 22275" \
+            "timestamp_us|build|btsu = tsu|989 48996275 22275" \
+            "bool|build[filter bb]|bb = b|1000 49950000 0"; do
+            IFS='|' read -r kind build_expr keys expected <<<"$case"
+            key_script="$(mktemp --suffix=.ibex)"
+            cat >"$key_script" <<IBEX
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
+let build = parquet::read("$IBEX_ROOT/tests/data/parquet_join_key_build_out.parquet")[filter pick];
+let probe = parquet::read("$IBEX_ROOT/tests/data/parquet_join_key_probe_out.parquet");
+($build_expr join probe on { $keys })[select { n = count(), total = sum(payload), keys = sum(bk) }];
+IBEX
+            key_st="$(mktemp)"
+            key_mt="$(mktemp)"
+            IBEX_CORES=1 "$BUILD_DIR/tools/ibex_eval" --plugin-path "$BUILD_DIR/tools" \
+                "$key_script" >"$key_st" 2>&1
+            IBEX_CORES=8 "$BUILD_DIR/tools/ibex_eval" --plugin-path "$BUILD_DIR/tools" \
+                "$key_script" >"$key_mt" 2>&1
+            read -r n total key_sum <<<"$expected"
+            if rg -n "error:" "$key_st" >/dev/null \
+                || ! rg -n "\| $n +\| $total +\| $key_sum +\|" "$key_st" >/dev/null \
+                || ! diff -q "$key_st" "$key_mt" >/dev/null; then
+                echo "--- $kind (expected $expected) ---" >&2
+                cat "$key_st" "$key_mt" >&2
+                rm -f "$key_script" "$key_st" "$key_mt" \
+                    "$IBEX_ROOT"/tests/data/parquet_join_key_*_out.parquet
+                exit 1
+            fi
+            rm -f "$key_script" "$key_st" "$key_mt"
+        done
+        rm -f "$IBEX_ROOT"/tests/data/parquet_join_key_*_out.parquet
+
         echo "▸ whole-script (parquet plugin, a file written by Polars)"
         # The PDS-H benchmark data is written by Polars, whose files differ
         # from Arrow's: no per-page encoding stats (a dictionary column is

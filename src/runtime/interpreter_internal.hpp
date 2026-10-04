@@ -1378,17 +1378,6 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 /// two-key case. Calls `infer_schema` on both children.
 [[nodiscard]] auto join_keys_provably_int64(const ir::JoinNode& join) -> bool;
 
-/// Whole-table single-key inner join, implemented over
-/// `ChunkedInnerJoinOperator`. Callers must check `is_streamable_inner_join`
-/// first; richer join semantics remain in `join_table_impl`, which is the
-/// implementation of those semantics rather than a fallback.
-[[nodiscard]] auto inner_join_table(const Table& left, const Table& right,
-                                    const std::vector<ir::JoinKey>& keys,
-                                    const ir::JoinSuffixPolicy& suffix,
-                                    const std::vector<ir::OrderKey>& pending_order,
-                                    const ExecutionContext& exec)
-    -> std::expected<Table, std::string>;
-
 // filter.cpp — vectorized predicate evaluation and filtering.
 [[nodiscard]] auto compute_mask(const ir::Expr& expr, const PredicateInput& input,
                                 const ScalarRegistry* scalars, RowRange rows)
@@ -1930,6 +1919,14 @@ enum class FloatCleanMode : std::uint8_t {
     const ScalarRegistry* scalars, const ExternRegistry* externs, const ExecutionContext& exec,
     ModelResult* model_out) -> std::expected<OperatorPtr, std::string>;
 [[nodiscard]] auto materialize_operator(OperatorPtr op) -> std::expected<Table, std::string>;
+/// Build `node` through the physical path (`build_operator`) and drain it to a
+/// table. The one way a materializing step evaluates a relational input: a
+/// fallback node's inputs, a deferred probe's right side, a stream's
+/// per-buffer transform. Nothing evaluates a subtree any other way.
+[[nodiscard]] auto materialize_plan(const ir::Node& node, const TableRegistry& registry,
+                                    const ScalarRegistry* scalars, const ExternRegistry* externs,
+                                    const ExecutionContext& exec, ModelResult* model_out = nullptr)
+    -> std::expected<Table, std::string>;
 [[nodiscard]] auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
                                         const std::vector<ir::ColumnRef>& group_by,
                                         const ExecutionContext& exec)

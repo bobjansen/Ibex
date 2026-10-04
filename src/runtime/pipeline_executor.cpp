@@ -113,17 +113,6 @@ struct ChunkIdentity {
     return chunk;
 }
 
-auto materialize_row_local(const ir::Node& node, const TableRegistry& registry,
-                           const ScalarRegistry* scalars, const ExternRegistry* externs,
-                           const ExecutionContext& exec, ModelResult* model_out)
-    -> std::expected<Table, std::string> {
-    auto op = build_operator(node, registry, scalars, externs, exec, model_out);
-    if (!op.has_value()) {
-        return std::unexpected(std::move(op.error()));
-    }
-    return materialize_operator(std::move(op.value()));
-}
-
 }  // namespace ibex::runtime::pipeline_executor_detail
 
 namespace ibex::runtime {
@@ -1320,8 +1309,7 @@ auto try_take_join_probe(const ir::Node& node, const TableRegistry& registry,
     if (!left_op.has_value()) {
         return std::unexpected(std::move(left_op.error()));
     }
-    auto right =
-        materialize_row_local(*join.children()[1], registry, scalars, externs, exec, model_out);
+    auto right = materialize_plan(*join.children()[1], registry, scalars, externs, exec, model_out);
     if (!right.has_value()) {
         return std::unexpected(std::move(right.error()));
     }

@@ -1047,6 +1047,11 @@ primary         = IDENT [ "(" [ arg_list ] ")" ]
 
 scalar_subquery = "scalar" "(" expr ")" ;
 
+(* Existence subquery — Section 5.8. An ordinary call by name; only valid as a
+   whole `filter` conjunct, optionally negated with the existing `!`. *)
+
+exists_subquery = "exists" "(" expr ")" ;
+
 outer_capture   = "outer" "(" IDENT ")" ;
 
 (* Side-qualified column reference — Section 5.6. Valid only inside a join
@@ -2534,6 +2539,53 @@ from a one-row table (Section 12). Arity tells the two apart.
 A subquery whose aggregate is null (no rows, or only null values, for anything
 but a count) yields a **null scalar** (Section 6.7); in `filter … == scalar(…)`
 the comparison is then null and the row is dropped (Section 3), matching SQL.
+
+### 5.8 Exists Subqueries
+
+A `filter` conjunct may test whether *any* inner row relates to the outer row:
+
+```ibex
+orders[filter exists(lineitem[filter l_orderkey == outer(o_orderkey) && l_commitdate < l_receiptdate])]
+customer[filter !exists(orders[filter o_custkey == outer(c_custkey)])]
+```
+
+Read the first as: keep an order when at least one of its line items arrived
+late. `!exists(...)` keeps exactly the rows `exists(...)` drops. `outer(...)`
+captures work as in Section 5.7.
+
+**Shape.** The subquery is a block with exactly one `filter` clause and no
+`select` — it asks only whether a matching row exists, so there is nothing to
+select. The filter must hold at least one capture equality
+(`inner_column == outer(outer_column)`, in either order) and may hold any
+number of local predicates over the subquery's own columns. Captures may share
+an outer or an inner column, as in Section 5.7.
+
+**Evaluation.** `exists` is a **semi join** on the captured columns, and
+`!exists` an **anti join**; the local predicates filter the inner side first.
+It is the same plan as writing the join by hand:
+
+```ibex
+orders semi join lineitem[filter l_commitdate < l_receiptdate] on { o_orderkey = l_orderkey }
+```
+
+An outer row is kept at most once however many inner rows match it. Nothing is
+added to the result's schema, so unlike `scalar(...)` the enclosing query's
+schema need not be statically known.
+
+**Nulls.** `exists` is never null: it is true or false. An outer row whose
+captured key is null matches no inner row (`k == null` is never true), so
+`exists` is false for it and `!exists` true. This differs deliberately from
+`scalar(...)`, which is null when nothing matches.
+
+Not yet supported, each rejected with a diagnostic:
+
+```ibex
+exists(t[filter k == outer(j), select { k }]);  // no select clause
+exists(t[filter x > 0]);                        // no capture: uncorrelated
+exists(t[filter k == outer(j) && x != outer(y)]); // every capture must be an equality
+t[filter a || exists(...)];                     // must be a whole filter conjunct
+update { flag = exists(...) };                  // only in filters, for now
+```
 
 ---
 

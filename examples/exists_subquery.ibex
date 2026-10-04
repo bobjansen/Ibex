@@ -1,0 +1,42 @@
+// Existence subqueries: `exists(...)` / `!exists(...)` + `outer(column)` (SPEC 5.8).
+//
+// A `filter` conjunct may ask whether ANY inner row relates to the outer row.
+// This is TPC-H Q4's shape, in miniature: which orders had a late line item?
+
+let orders = Table {
+    o_orderkey = [1, 2, 3, 4],
+    o_priority = ["1-URGENT", "2-HIGH", "1-URGENT", "3-MEDIUM"]
+};
+
+let lineitem = Table {
+    l_orderkey   = [1, 1, 1, 2, 4],
+    l_commitdate = [date"2026-01-10", date"2026-01-10", date"2026-01-10", date"2026-02-01", date"2026-03-01"],
+    l_receiptdate = [date"2026-01-12", date"2026-01-15", date"2026-01-09", date"2026-01-30", date"2026-03-05"]
+};
+
+// `l_orderkey` is the subquery's own column; `outer(o_orderkey)` is the order
+// being tested. The other term mentions only lineitem, so it filters the
+// line items before they are matched.
+//
+// Order 1 has two late lines but comes back ONCE: exists is a semi join, not
+// an inner join, so it never multiplies the outer rows.
+print("orders with a late line item:");
+print(orders[
+    filter exists(lineitem[filter l_orderkey == outer(o_orderkey) && l_commitdate < l_receiptdate]),
+    order { o_orderkey }
+]);
+
+// `!exists` is the anti join: exactly the rows `exists` drops. Order 3 has no
+// line items at all, so nothing can be late — it is kept.
+print("orders with no late line item:");
+print(orders[
+    filter !exists(lineitem[filter l_orderkey == outer(o_orderkey) && l_commitdate < l_receiptdate]),
+    order { o_orderkey }
+]);
+
+// It composes with ordinary terms, and adds no column to the result.
+print("urgent orders with any line item at all:");
+print(orders[
+    filter o_priority == "1-URGENT" && exists(lineitem[filter l_orderkey == outer(o_orderkey)]),
+    order { o_orderkey }
+]);

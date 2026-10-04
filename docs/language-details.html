@@ -715,6 +715,41 @@ supply[
         </div>
       </div>
 
+      <!-- 6a'. Exists subqueries -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Subqueries</span>
+          <h3>Keep rows that have &mdash; or lack &mdash; a related row</h3>
+          <p>
+            <code>exists(...)</code> as a <code>filter</code> conjunct keeps an
+            outer row when at least one inner row matches its
+            <code>outer(...)</code> captures; <code>!exists(...)</code> keeps
+            the rest. The subquery has a <code>filter</code> and no
+            <code>select</code>: it asks only whether a row exists.
+          </p>
+          <p>
+            It lowers to a <strong>semi join</strong> (or an
+            <strong>anti join</strong>) on the captured columns, so a row with
+            many matches is kept once and nothing is added to the schema.
+            <code>exists</code> is never null: a null key matches nothing.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Orders with at least one late line item — TPC-H Q4's shape.</span>
+orders[
+    <span class="kw">filter</span> <span class="fn-name">exists</span>(lineitem[
+        <span class="kw">filter</span> l_orderkey == <span class="kw">outer</span>(o_orderkey)
+            &amp;&amp; l_commitdate &lt; l_receiptdate
+    ])
+];
+
+<span class="cm">// Customers who never placed an order — Q22's anti join.</span>
+customer[
+    <span class="kw">filter</span> !<span class="fn-name">exists</span>(orders[<span class="kw">filter</span> o_custkey == <span class="kw">outer</span>(c_custkey)])
+];</code></pre>
+        </div>
+      </div>
+
       <!-- 6b. Null handling -->
       <div class="tour-item">
         <div class="tour-text">

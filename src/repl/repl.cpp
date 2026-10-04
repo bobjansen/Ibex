@@ -338,6 +338,7 @@ constexpr auto kCompletionBuiltins = std::to_array<std::string_view>({
     "cumprod",
     "cumsum",
     "ewma",
+    "exists",
     "exp",
     "fill_backward",
     "fill_forward",
@@ -2416,6 +2417,11 @@ constexpr auto kBuiltinDocs = std::to_array<BuiltinDoc>({
      .signature = "scalar(table, column) -> scalar",
      .summary = "Extract a scalar value from a one-row table.",
      .example = "scalar(summary, \"avg\")"},
+    {.name = "exists",
+     .signature = "exists(table[filter k == outer(j)]) -> Bool",
+     .summary = "In a filter: keep rows with at least one matching inner row (semi join); "
+                "!exists keeps the rest.",
+     .example = "orders[filter exists(items[filter i_order == outer(o_key)])]"},
     {.name = "seq",
      .signature = "seq(from, by) -> Series<Int64|Float64>",
      .summary = "Arithmetic ramp the length of the frame; positional args default to 0 and 1, "

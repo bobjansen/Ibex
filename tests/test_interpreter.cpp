@@ -14749,6 +14749,57 @@ TEST_CASE("Interpret correlated subquery does not widen the filter's schema") {
     REQUIRE(names == std::vector<std::string>{"p_partkey", "p_name", "ps_suppkey", "ps_cost"});
 }
 
+TEST_CASE("Interpret exists keeps an outer row once however many inner rows match") {
+    // Part 1 has two EU suppliers; a naive inner join would return it twice.
+    auto result = interpret_source(std::string(kSupplySources) + R"(
+parts[filter exists(supply[filter ps_partkey == outer(p_partkey) && ps_region == "EU"]),
+      order { p_partkey }];
+)");
+    REQUIRE(int_column(result, "p_partkey") == std::vector<std::int64_t>{1, 2, 3});
+    // Nothing is added to the schema.
+    REQUIRE(result.columns.size() == 2);
+}
+
+TEST_CASE("Interpret not exists keeps exactly the rows exists drops") {
+    auto result = interpret_source(std::string(kSupplySources) + R"(
+parts[filter !exists(supply[filter ps_partkey == outer(p_partkey) && ps_region == "EU"])];
+)");
+    REQUIRE(int_column(result, "p_partkey") == std::vector<std::int64_t>{4});
+}
+
+TEST_CASE("Interpret exists is false, and not exists true, for a null outer key") {
+    auto present = interpret_source(R"(
+let a = Table { k = [1, null, 3] };
+let b = Table { k = [1, 2, null] };
+a[filter exists(b[filter k == outer(k)])];
+)");
+    REQUIRE(int_column(present, "k") == std::vector<std::int64_t>{1});
+
+    auto absent = interpret_source(R"(
+let a = Table { k = [1, null, 3] };
+let b = Table { k = [1, 2, null] };
+a[filter !exists(b[filter k == outer(k)])];
+)");
+    REQUIRE(absent.rows() == 2);
+    const auto* entry = absent.find_entry("k");
+    REQUIRE(entry != nullptr);
+    // The null key survives, alongside 3.
+    REQUIRE(runtime::is_null(*entry, 0) != runtime::is_null(*entry, 1));
+}
+
+TEST_CASE("Interpret exists alongside a correlated scalar subquery") {
+    auto result = interpret_source(std::string(kSupplySources) + R"(
+(parts join supply[select { p_partkey = ps_partkey, ps_suppkey, ps_cost }] on p_partkey)[
+    filter exists(supply[filter ps_partkey == outer(p_partkey) && ps_region == "US"])
+        && ps_cost == scalar(supply[filter ps_partkey == outer(p_partkey), select { m = min(ps_cost) }])
+];
+)");
+    // Only part 4 has a US supplier, and its one row is its own minimum. The
+    // scalar's generated column is still projected back off.
+    REQUIRE(int_column(result, "p_partkey") == std::vector<std::int64_t>{4});
+    REQUIRE(result.columns.size() == 4);
+}
+
 TEST_CASE("Interpret correlated subquery resolves bare inner names in the inner scope") {
     // Both sides call the key `p_partkey`. The bare name inside the subquery is
     // the subquery's own column; only outer(...) reaches the enclosing query.

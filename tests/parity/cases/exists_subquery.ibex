@@ -1,0 +1,28 @@
+// `exists(...)` / `!exists(...)` filter conjuncts lower to semi / anti joins,
+// so the interpreter and the emitted C++ must agree on them. Order 1 has three
+// matching lines and must come back once, not three times. Order 6's key is
+// null: it matches nothing, so `exists` drops it and `!exists` keeps it.
+let orders = Table {
+    o_orderkey = [1, 2, 3, 4, 5, null],
+    o_altkey   = [1, 7, 3, 4, 9, 6],
+    o_priority = ["1-URGENT", "2-HIGH", "1-URGENT", "3-MEDIUM", "2-HIGH", "1-URGENT"]
+};
+let lines = Table {
+    l_orderkey = [1, 1, 1, 2, 4, 4, 9],
+    l_partkey  = [1, 5, 1, 2, 4, 8, 9],
+    l_late     = [true, true, false, false, true, false, true]
+};
+let late = orders[filter exists(lines[filter l_orderkey == outer(o_orderkey) && l_late])];
+let on_time = orders[filter !exists(lines[filter l_orderkey == outer(o_orderkey) && l_late])];
+// Two captures sharing one outer column, and one inner column captured twice.
+let same_part = orders[filter
+    exists(lines[filter l_orderkey == outer(o_orderkey) && l_partkey == outer(o_orderkey)])];
+let both_keys = orders[filter
+    o_priority != "3-MEDIUM"
+    && exists(lines[filter l_orderkey == outer(o_orderkey) && l_orderkey == outer(o_altkey)])];
+rbind(
+    late[update { which = "late" }],
+    on_time[update { which = "on_time" }],
+    same_part[update { which = "same_part" }],
+    both_keys[update { which = "both_keys" }]
+)[order { which, o_altkey }];

@@ -35,7 +35,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -97,12 +96,19 @@ auto call_adbc(std::string_view context, Fn&& fn) -> std::expected<void, std::st
 class CancelWatch {
    public:
     explicit CancelWatch(AdbcStatement* statement)
-        : thread_([this, statement](const std::stop_token& stop) { watch(stop, statement); }) {}
+        : thread_([this, statement] { watch(statement); }) {}
     CancelWatch(const CancelWatch&) = delete;
     CancelWatch& operator=(const CancelWatch&) = delete;
     CancelWatch(CancelWatch&&) = delete;
     CancelWatch& operator=(CancelWatch&&) = delete;
-    ~CancelWatch() = default;  // the jthread stops and joins
+    ~CancelWatch() {
+        {
+            const std::scoped_lock lock(mutex_);
+            stop_ = true;
+        }
+        wake_.notify_one();
+        thread_.join();
+    }
 
     /// Whether this watch cancelled the statement.
     [[nodiscard]] auto cancelled() const noexcept -> bool {
@@ -110,10 +116,10 @@ class CancelWatch {
     }
 
    private:
-    void watch(const std::stop_token& stop, AdbcStatement* statement) {
+    void watch(AdbcStatement* statement) {
         constexpr auto kPoll = std::chrono::milliseconds(50);
         std::unique_lock lock(mutex_);
-        while (!stop.stop_requested()) {
+        while (!stop_) {
             if (ibex::runtime::interrupt_requested()) {
                 AdbcError error{};
                 (void)AdbcStatementCancel(statement, &error);
@@ -122,14 +128,17 @@ class CancelWatch {
                 return;
             }
             // Wakes at once when the watch is destroyed.
-            (void)wake_.wait_for(lock, stop, kPoll, [] { return false; });
+            (void)wake_.wait_for(lock, kPoll, [this] { return stop_; });
         }
     }
 
+    // A plain std::thread with a stop flag, not std::jthread: Apple's libc++
+    // (macOS CI leg) ships neither jthread nor stop_token.
     std::mutex mutex_;
-    std::condition_variable_any wake_;
+    std::condition_variable wake_;
+    bool stop_ = false;  // guarded by mutex_
     std::atomic<bool> cancelled_{false};
-    std::jthread thread_;  // last: starts after, and stops before, the rest
+    std::thread thread_;  // last: starts after, and stops before, the rest
 };
 
 /// The message for a failure: `interrupted` when Ctrl+C caused it, so the

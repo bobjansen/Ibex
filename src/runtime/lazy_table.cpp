@@ -257,6 +257,24 @@ struct BoolKeyAt {
     }
 };
 
+/// A String key, tested against the filter's string set.
+struct StringKeyAt {
+    const Column<std::string>* column = nullptr;
+    [[nodiscard]] auto operator()(std::size_t row) const -> std::string_view {
+        return (*column)[row];
+    }
+};
+
+/// A Categorical key: each dictionary entry is tested once, then a row is one
+/// lookup by its code -- the same trick an `in` list uses (`apply_set_spec`).
+struct CategoricalKeyAt {
+    const Column<Categorical>::code_type* codes = nullptr;
+    std::vector<std::uint8_t> keep_code;
+    [[nodiscard]] auto keep(std::size_t row) const -> bool {
+        return keep_code[static_cast<std::size_t>(codes[row])] != 0U;
+    }
+};
+
 template <typename KeyAt>
 struct KeyColumn {
     KeyAt at;
@@ -265,12 +283,14 @@ struct KeyColumn {
 
 using AnyKeyColumn =
     std::variant<KeyColumn<ElementKeyAt<std::int64_t>>, KeyColumn<ElementKeyAt<Date>>,
-                 KeyColumn<ElementKeyAt<Timestamp>>, KeyColumn<BoolKeyAt>>;
+                 KeyColumn<ElementKeyAt<Timestamp>>, KeyColumn<BoolKeyAt>, KeyColumn<StringKeyAt>,
+                 KeyColumn<CategoricalKeyAt>>;
 
-/// The membership filter tests keys with a `join_key_domain`; any other type
-/// means "no filter", which is always sound.
-auto membership_key_column(const Table& predicates, const std::string& key_name)
-    -> std::optional<AnyKeyColumn> {
+/// The membership filter tests keys with a `join_key_domain`, or as strings;
+/// any other type means "no filter", which is always sound. `filter` is read
+/// only to test a Categorical key's dictionary up front.
+auto membership_key_column(const Table& predicates, const std::string& key_name,
+                           const DynamicScanFilter& filter) -> std::optional<AnyKeyColumn> {
     const auto* entry = predicates.find_entry(key_name);
     if (entry == nullptr) {
         return std::nullopt;
@@ -281,6 +301,17 @@ auto membership_key_column(const Table& predicates, const std::string& key_name)
             using C = std::remove_cvref_t<decltype(col)>;
             if constexpr (std::is_same_v<C, Column<bool>>) {
                 return KeyColumn<BoolKeyAt>{.at = {.column = &col}, .validity = validity};
+            } else if constexpr (std::is_same_v<C, Column<std::string>>) {
+                return KeyColumn<StringKeyAt>{.at = {.column = &col}, .validity = validity};
+            } else if constexpr (std::is_same_v<C, Column<Categorical>>) {
+                const auto& dictionary = col.dictionary();
+                std::vector<std::uint8_t> keep(dictionary.size(), 0U);
+                for (std::size_t code = 0; code < dictionary.size(); ++code) {
+                    keep[code] = static_cast<std::uint8_t>(filter.passes(dictionary[code]));
+                }
+                return KeyColumn<CategoricalKeyAt>{
+                    .at = {.codes = col.codes_data(), .keep_code = std::move(keep)},
+                    .validity = validity};
             } else if constexpr (std::is_same_v<C, Column<std::int64_t>> ||
                                  std::is_same_v<C, Column<Date>> ||
                                  std::is_same_v<C, Column<Timestamp>>) {
@@ -298,7 +329,14 @@ auto membership_key_column(const Table& predicates, const std::string& key_name)
 template <typename KeyAt>
 auto key_passes(const KeyColumn<KeyAt>& key, const DynamicScanFilter& filter, std::size_t row)
     -> bool {
-    return (key.validity == nullptr || (*key.validity)[row]) && filter.passes(key.at(row));
+    if (key.validity != nullptr && !(*key.validity)[row]) {
+        return false;
+    }
+    if constexpr (requires { key.at.keep(row); }) {
+        return key.at.keep(row);  // decided per dictionary entry up front
+    } else {
+        return filter.passes(key.at(row));
+    }
 }
 
 /// Estimate the filter's pass rate over the candidate rows `rows(i)`,
@@ -829,7 +867,7 @@ auto LazyTable::project_where(const std::set<std::string>& names,
     }
     const Table& predicates = *predicates_res;
 
-    const auto key = membership ? membership_key_column(predicates, *dynamic_key)
+    const auto key = membership ? membership_key_column(predicates, *dynamic_key, *dynamic)
                                 : std::optional<AnyKeyColumn>{};
 
     std::optional<std::vector<std::size_t>> selected;
@@ -1138,7 +1176,7 @@ auto LazyTable::project_where_unit(const std::set<std::string>& names,
     }
     const Table& predicates = *predicates_res;
 
-    const auto key = membership ? membership_key_column(predicates, *dynamic_key)
+    const auto key = membership ? membership_key_column(predicates, *dynamic_key, *dynamic)
                                 : std::optional<AnyKeyColumn>{};
 
     std::optional<Selection> selected;
@@ -1646,7 +1684,7 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
     // Int64 keys only, as on the fused path above: the two-phase probe this
     // feeds has not been widened to the other `join_key_domain` types, which
     // still get their membership filter through `project_where`.
-    const auto any_key = membership_key_column(predicates, key_name);
+    const auto any_key = membership_key_column(predicates, key_name, dynamic);
     const auto* key = any_key.has_value()
                           ? std::get_if<KeyColumn<ElementKeyAt<std::int64_t>>>(&*any_key)
                           : nullptr;

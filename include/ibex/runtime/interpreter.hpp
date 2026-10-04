@@ -570,9 +570,10 @@ class JoinKeyBitmap {
 /// One definition, because three parties must agree on it: the join that
 /// publishes a filter from its build keys, `LazyTable`'s decode-then-filter
 /// path, and a source's fused key scan. A join's keys have the same type on
-/// both sides, so values of different types never meet in one filter. Keys of
-/// any other type (String, Categorical, Decimal, Double) have no filter; a
-/// join over them publishes nothing, which is always sound.
+/// both sides, so values of different types never meet in one filter. String
+/// and Categorical keys are tested as strings instead (`StringKeySet`). Decimal
+/// and Double keys have no filter; a join over them publishes nothing, which is
+/// always sound.
 [[nodiscard]] constexpr auto join_key_domain(std::int64_t key) noexcept -> std::int64_t {
     return key;
 }
@@ -586,13 +587,38 @@ class JoinKeyBitmap {
     return key ? 1 : 0;
 }
 
+/// Exact membership over strings, for a join on a String or Categorical key:
+/// the build side's distinct non-null values. The views index the owned
+/// strings, which never move after construction.
+class StringKeySet {
+   public:
+    explicit StringKeySet(std::vector<std::string> distinct) : owned_(std::move(distinct)) {
+        index_.reserve(owned_.size());
+        for (const auto& key : owned_) {
+            index_.insert(std::string_view{key});
+        }
+    }
+    StringKeySet(const StringKeySet&) = delete;
+    StringKeySet(StringKeySet&&) = delete;
+    auto operator=(const StringKeySet&) -> StringKeySet& = delete;
+    auto operator=(StringKeySet&&) -> StringKeySet& = delete;
+    ~StringKeySet() = default;
+
+    [[nodiscard]] auto contains(std::string_view key) const -> bool { return index_.contains(key); }
+    [[nodiscard]] auto size() const noexcept -> std::size_t { return owned_.size(); }
+
+   private:
+    std::vector<std::string> owned_;
+    robin_hood::unordered_flat_set<std::string_view> index_;
+};
+
 /// Key filter a join derives from its build side for a deferred probe scan.
 /// `ready` flips exactly once, before the scan is materialized, when the
 /// owning join has decided (filter present or deliberately absent). A scan
 /// materialized while `ready` is still false simply decodes without dynamic
 /// filtering — absence is always sound, only slower.
 ///
-/// Keys are tested as `join_key_domain` integers.
+/// Keys are tested as `join_key_domain` integers, or as strings (`strings`).
 struct DynamicScanFilter {
     bool ready = false;
     std::optional<std::int64_t> min;
@@ -615,9 +641,18 @@ struct DynamicScanFilter {
     /// inside [min, max] hold more than this fraction of the rows. Lower when
     /// the caller will decode the key again for the rows that pass.
     double footer_pass_rate_limit = 0.75;
+    /// Exact membership for a String or Categorical key, published INSTEAD of
+    /// the integer structures above (which then stay empty). A separate member
+    /// with its own `passes`, so the integer test below does not grow.
+    std::shared_ptr<const StringKeySet> strings;
 
     [[nodiscard]] auto has_membership() const noexcept -> bool {
-        return bloom.has_value() || bitmap != nullptr;
+        return bloom.has_value() || bitmap != nullptr || strings != nullptr;
+    }
+
+    /// Only meaningful when `strings` is set; false means "cannot match".
+    [[nodiscard]] auto passes(std::string_view key) const -> bool {
+        return strings == nullptr || strings->contains(key);
     }
 
     /// Only meaningful when `has_membership()`; false means "cannot match".

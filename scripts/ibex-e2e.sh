@@ -412,10 +412,12 @@ if [[ "$SKIP_REPL" == false ]]; then
         fi
         rm -f "$null_out"
 
-        echo "▸ whole-script (parquet plugin, join-key filters over Date, Timestamp and Bool keys)"
+        echo "▸ whole-script (parquet plugin, join-key filters over Date, Timestamp, Bool and String keys)"
         # A filtered build side publishes its keys into the probe scan as
         # `join_key_domain` integers: Date as days, Timestamp as nanoseconds,
-        # Bool as 0/1. The reader fuses the test into its decoder only where the
+        # Bool as 0/1, a String key as an exact string set (a dictionary-encoded
+        # column reads back as Categorical, a PLAIN one as String; both filter
+        # after decoding the key). The reader fuses the test into its decoder only where the
         # stored value already is that integer (DATE32, TIMESTAMP(NANO)); a
         # TIMESTAMP(MICRO) key must decline and filter after decoding. A wrong
         # domain drops join rows (letting MICRO fuse returned 98 of 989), so the
@@ -429,7 +431,9 @@ if [[ "$SKIP_REPL" == false ]]; then
         for case in "date|build|bd = d|989 48996275 22275" \
             "timestamp_ns|build|btsn = tsn|989 48996275 22275" \
             "timestamp_us|build|btsu = tsu|989 48996275 22275" \
-            "bool|build[filter bb]|bb = b|1000 49950000 0"; do
+            "bool|build[filter bb]|bb = b|1000 49950000 0" \
+            "string_dictionary|build|bs = s|989 48996275 22275" \
+            "string_plain|build|bs = sp|989 48996275 22275"; do
             IFS='|' read -r kind build_expr keys expected <<<"$case"
             key_script="$(mktemp --suffix=.ibex)"
             cat >"$key_script" <<IBEX

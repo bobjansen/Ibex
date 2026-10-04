@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Bob Jansen
 
-"""Build the fixtures for join-key filters over Date, Timestamp and Bool keys.
+"""Build the fixtures for join-key filters over Date, Timestamp, Bool and String keys.
 
 A join publishes its build keys into the probe scan as `join_key_domain`
 integers (Date as days, Timestamp as nanoseconds, Bool as 0/1), and the Parquet
@@ -42,9 +42,13 @@ probe = pa.table({
                     pa.timestamp("ns")),
     "tsu": pa.array([key_or_null(i, k * 1000) for i, k in enumerate(ks)], pa.timestamp("us")),
     "b": pa.array([i % 100 == 0 for i in range(n)], pa.bool_()),
+    "s": pa.array([key_or_null(i, f"key-{k}") for i, k in enumerate(ks)], pa.string()),
+    "sp": pa.array([key_or_null(i, f"key-{k}") for i, k in enumerate(ks)], pa.string()),
     "payload": pa.array(range(n), pa.int64()),
 })
-pq.write_table(probe, out_dir / "parquet_join_key_probe_out.parquet", row_group_size=20_000)
+# `s` dictionary-encoded (read back as Categorical), `sp` PLAIN (a String column).
+pq.write_table(probe, out_dir / "parquet_join_key_probe_out.parquet", row_group_size=20_000,
+               use_dictionary=[c for c in probe.column_names if c != "sp"])
 
 build_ks = list(range(0, 50, 5))
 # A build table of every key, filtered to `pick` in the query: a build side that
@@ -57,6 +61,7 @@ build = pa.table({
     "btsn": pa.array([k * 1_000_000_007 for k in all_ks], pa.timestamp("ns")),
     "btsu": pa.array([k * 1000 for k in all_ks], pa.timestamp("us")),
     "bb": pa.array([k == 0 for k in all_ks], pa.bool_()),
+    "bs": pa.array([f"key-{k}" for k in all_ks], pa.string()),
     "pick": pa.array([k in build_ks for k in all_ks], pa.bool_()),
 })
 pq.write_table(build, out_dir / "parquet_join_key_build_out.parquet")

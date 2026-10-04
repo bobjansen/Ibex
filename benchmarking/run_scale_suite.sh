@@ -26,8 +26,7 @@
 #                        [--keep-data]
 #                        [--to-readme] [--to-readme-rows N] [--to-readme-out path]
 #
-# Trimmed-by-default frameworks (see plans/benchmark-perf-priorities.md): the
-# suite skips work that never changes the competitive picture but dominates
+# Trimmed-by-default frameworks: the suite skips work that never changes the competitive picture but dominates
 # wall-clock, so reruns stay cheap. The web page reuses pinned numbers for these.
 #   - sqlite: never within 2x of the best engine and the slowest by far — skipped
 #     by default. Pass --with-sqlite to regenerate its (stable) baseline numbers.

@@ -10,7 +10,8 @@ metadata:
 
 Status: **proposed**, not built. Reuses the capture/decorrelation machinery of
 the shipped scalar subquery (`plans/done/correlated-subquery-q02-plan.md`, SPEC 5.7)
-and is a close sibling of the `exists` proposal (`plans/exists-subquery-plan.md`).
+and is a close sibling of the built `exists` terms (SPEC 5.8), whose semi / anti
+lowering (`lower_exists` in `src/parser/lower.cpp`) it can share.
 
 ## `in` is not a scalar, and there are two of them
 

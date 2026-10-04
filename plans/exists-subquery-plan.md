@@ -8,7 +8,7 @@ metadata:
 
 # Proposal: `exists` subquery terms
 
-Status: **Tier 1 built** (cdff12fa, SPEC 5.8); Tiers 2 and 3 proposed. Follows the shipped correlated scalar subquery
+Status: **Tiers 1 and 2 built** (SPEC 5.8; Tier 1 cdff12fa); Tier 3 proposed. Follows the shipped correlated scalar subquery
 (`plans/done/correlated-subquery-q02-plan.md`, SPEC 5.7), whose capture machinery
 this reuses wholesale.
 

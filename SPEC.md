@@ -1047,8 +1047,8 @@ primary         = IDENT [ "(" [ arg_list ] ")" ]
 
 scalar_subquery = "scalar" "(" expr ")" ;
 
-(* Existence subquery — Section 5.8. An ordinary call by name; only valid as a
-   whole `filter` conjunct, optionally negated with the existing `!`. *)
+(* Existence subquery — Section 5.8. An ordinary call by name, yielding Bool;
+   valid anywhere inside a `filter` predicate. *)
 
 exists_subquery = "exists" "(" expr ")" ;
 
@@ -2542,7 +2542,7 @@ the comparison is then null and the row is dropped (Section 3), matching SQL.
 
 ### 5.8 Exists Subqueries
 
-A `filter` conjunct may test whether *any* inner row relates to the outer row:
+A `filter` predicate may test whether *any* inner row relates to the outer row:
 
 ```ibex
 orders[filter exists(lineitem[filter l_orderkey == outer(o_orderkey) && l_commitdate < l_receiptdate])]
@@ -2560,17 +2560,34 @@ select. The filter must hold at least one capture equality
 number of local predicates over the subquery's own columns. Captures may share
 an outer or an inner column, as in Section 5.7.
 
-**Evaluation.** `exists` is a **semi join** on the captured columns, and
-`!exists` an **anti join**; the local predicates filter the inner side first.
-It is the same plan as writing the join by hand:
+`exists(...)` is a Bool, so it composes like one — under `||`, negated
+inside a larger expression, or as a whole `&&` conjunct:
 
 ```ibex
-orders semi join lineitem[filter l_commitdate < l_receiptdate] on { o_orderkey = l_orderkey }
+orders[filter o_orderpriority == "1-URGENT" || exists(lineitem[filter l_orderkey == outer(o_orderkey)])]
 ```
 
-An outer row is kept at most once however many inner rows match it. Nothing is
-added to the result's schema, so unlike `scalar(...)` the enclosing query's
-schema need not be statically known.
+**Evaluation.** The subquery is decorrelated, never run per outer row; the
+local predicates filter the inner side first. How it is joined depends on
+where it stands:
+
+- As a **whole `&&` conjunct**, `exists` is a **semi join** on the captured
+  columns and `!exists` an **anti join** — the same plan as writing the join by
+  hand:
+
+  ```ibex
+  orders semi join lineitem[filter l_commitdate < l_receiptdate] on { o_orderkey = l_orderkey }
+  ```
+
+- **Anywhere else** in the predicate it is a **mark join**: the inner rows are
+  counted per captured key, that count is left-joined onto the outer rows, and
+  `exists` reads as "the count is not null".
+
+Either way an outer row is kept at most once however many inner rows match
+it, and nothing is added to the result's schema. A semi join adds no column at
+all, so a whole-conjunct `exists` works over any enclosing query. A mark join
+adds one that is projected back off, which — as for `scalar(...)` (Section
+5.7) — requires the enclosing query's schema to be statically known.
 
 **Nulls.** `exists` is never null: it is true or false. An outer row whose
 captured key is null matches no inner row (`k == null` is never true), so
@@ -2580,11 +2597,11 @@ captured key is null matches no inner row (`k == null` is never true), so
 Not yet supported, each rejected with a diagnostic:
 
 ```ibex
-exists(t[filter k == outer(j), select { k }]);  // no select clause
-exists(t[filter x > 0]);                        // no capture: uncorrelated
+exists(t[filter k == outer(j), select { k }]);    // no select clause
+exists(t[filter x > 0]);                          // no capture: uncorrelated
 exists(t[filter k == outer(j) && x != outer(y)]); // every capture must be an equality
-t[filter a || exists(...)];                     // must be a whole filter conjunct
-update { flag = exists(...) };                  // only in filters, for now
+t[filter a > scalar(...) || exists(...)];         // split scalar and a non-conjunct exists with &&
+update { flag = exists(...) };                    // only in filters, for now
 ```
 
 ---

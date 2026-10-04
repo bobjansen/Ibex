@@ -4270,11 +4270,22 @@ class Lowerer {
 
         std::vector<const Expr*> local;
         std::vector<const Expr*> correlated;
-        std::vector<const Expr*> existence;
+        std::vector<const Expr*> semi;    // a whole `exists(...)` / `!exists(...)` conjunct
+        std::vector<const Expr*> marked;  // `exists(...)` inside a larger expression
         local.reserve(conjuncts.size());
         for (const auto* conjunct : conjuncts) {
             if (contains_call(*conjunct, "exists")) {
-                existence.push_back(conjunct);
+                if (as_whole_exists(*conjunct).call != nullptr) {
+                    semi.push_back(conjunct);
+                    continue;
+                }
+                if (contains_call(*conjunct, "scalar")) {
+                    return std::unexpected(LowerError{
+                        .message = "exists(): an exists(...) inside a larger expression cannot "
+                                   "share a filter term with a scalar(...) subquery; split them "
+                                   "with `&&`"});
+                }
+                marked.push_back(conjunct);
             } else if (contains_call(*conjunct, "scalar")) {
                 correlated.push_back(conjunct);
             } else {
@@ -4282,32 +4293,7 @@ class Lowerer {
             }
         }
 
-        if (!existence.empty()) {
-            // Existence tests filter rows without adding a column, so they can
-            // run first and leave the scalar path below an unchanged schema.
-            if (!local.empty()) {
-                auto lowered = lower_conjunction(local);
-                if (!lowered.has_value()) {
-                    return std::unexpected(lowered.error());
-                }
-                auto filter = builder_.filter(std::move(lowered.value()));
-                filter->add_child(std::move(input));
-                input = std::move(filter);
-                local.clear();
-            }
-            for (const auto* conjunct : existence) {
-                auto joined = lower_exists(*conjunct, std::move(input));
-                if (!joined.has_value()) {
-                    return joined;
-                }
-                input = std::move(joined.value());
-            }
-            if (correlated.empty()) {
-                return input;
-            }
-        }
-
-        if (correlated.empty()) {
+        if (semi.empty() && marked.empty() && correlated.empty()) {
             auto lowered = lower_expr_to_ir(predicate);
             if (!lowered.has_value()) {
                 return std::unexpected(lowered.error());
@@ -4318,19 +4304,28 @@ class Lowerer {
         }
 
         // A filter yields the rows it kept, not a wider table, so the generated
-        // scalar columns the joins below add have to be projected back off —
-        // which means naming every column that stays. Without a closed schema
-        // there is no such list, and rather than let a filter silently widen its
-        // input in exactly the cases where the schema is unclear, refuse.
+        // columns that scalar subqueries and exists marks join on have to be
+        // projected back off — which means naming every column that stays.
+        // Without a closed schema there is no such list, and rather than let a
+        // filter silently widen its input in exactly the cases where the schema
+        // is unclear, refuse. A whole `exists` conjunct is a semi join, which
+        // adds no column, so it alone needs no schema.
+        const bool widens = !marked.empty() || !correlated.empty();
         const ir::SchemaInfo outer_schema = ir::infer_schema(*input, source_schemas());
-        if (!outer_schema.is_known() || outer_schema.is_open()) {
+        if (widens && (!outer_schema.is_known() || outer_schema.is_open())) {
+            if (!correlated.empty()) {
+                return std::unexpected(LowerError{
+                    .message = "scalar(): the enclosing query's columns are not statically known, "
+                               "so a correlated subquery cannot be used here; ascribe a schema to "
+                               "the source (`src as DataFrame<{...}>`)"});
+            }
             return std::unexpected(LowerError{
-                .message = "scalar(): the enclosing query's columns are not statically known, so a "
-                           "correlated subquery cannot be used here; ascribe a schema to the "
-                           "source (`src as DataFrame<{...}>`)"});
+                .message = "exists(): the enclosing query's columns are not statically known, so "
+                           "exists(...) can only be a whole filter conjunct here; ascribe a schema "
+                           "to the source (`src as DataFrame<{...}>`)"});
         }
 
-        // The uncorrelated conjuncts go below the join, directly on the outer
+        // The uncorrelated conjuncts go below the joins, directly on the outer
         // input: they shrink it before it is probed, and sitting on the outer
         // subtree is what lets `push_filters_into_joins` push them further down
         // into the outer query's own joins and scans.
@@ -4344,9 +4339,32 @@ class Lowerer {
             input = std::move(filter);
         }
 
+        // Semi and anti joins only remove rows, so they go next.
+        for (const auto* conjunct : semi) {
+            auto joined = lower_exists(*conjunct, std::move(input));
+            if (!joined.has_value()) {
+                return joined;
+            }
+            input = std::move(joined.value());
+        }
+        if (!widens) {
+            return input;
+        }
+
         std::vector<ir::Expr> residual;
         std::vector<ReusableScalarSubquery> reusable;
-        residual.reserve(correlated.size());
+        residual.reserve(marked.size() + correlated.size());
+        for (const auto* conjunct : marked) {
+            // Each `exists` in the term joins its mark onto `input` as the term
+            // is lowered (see `mark_exists`).
+            ir::NodePtr* const enclosing = std::exchange(exists_marks_, &input);
+            auto rewritten = lower_expr_to_ir(*conjunct);
+            exists_marks_ = enclosing;
+            if (!rewritten.has_value()) {
+                return std::unexpected(rewritten.error());
+            }
+            residual.push_back(std::move(rewritten.value()));
+        }
         for (const auto* conjunct : correlated) {
             auto rewritten = decorrelate(*conjunct, input, reusable);
             if (!rewritten.has_value()) {
@@ -4369,23 +4387,13 @@ class Lowerer {
         return project;
     }
 
-    /// Lower one `exists(...)` / `!exists(...)` filter conjunct over `input`.
-    ///
-    ///     filter exists(inner[filter inner_local && k == outer(j)])
-    ///
-    ///     Join(Semi, on j = k)
-    ///       outer
-    ///       Filter(inner_local)(inner)
-    ///
-    /// `!exists` is the same with an Anti join. Unlike `scalar(...)` there is
-    /// no generated column and no aggregate: a semi join keeps each outer row
-    /// at most once however many inner rows match, and adds nothing to its
-    /// schema, so the outer schema need not be known either.
-    ///
-    /// `exists` is never null. An outer row whose key is null matches nothing
-    /// (`k == null` is never true), so `exists` is false for it and `!exists`
-    /// true — SQL's `exists`, and exactly what the joins do with null keys.
-    auto lower_exists(const Expr& conjunct, ir::NodePtr input) -> LowerResult {
+    /// A conjunct that is exactly `exists(...)` or `!exists(...)`.
+    struct WholeExists {
+        const CallExpr* call = nullptr;
+        bool negated = false;
+    };
+
+    static auto as_whole_exists(const Expr& conjunct) -> WholeExists {
         const Expr* term = &unwrap_group(conjunct);
         bool negated = false;
         if (const auto* unary = std::get_if<UnaryExpr>(&term->node);
@@ -4393,17 +4401,24 @@ class Lowerer {
             negated = true;
             term = &unwrap_group(*unary->expr);
         }
-        const CallExpr* call = as_call(*term, "exists");
-        if (call == nullptr) {
-            return std::unexpected(LowerError{
-                .message = "exists(): a subquery test must be a whole filter conjunct, optionally "
-                           "negated with `!`; it cannot be part of a larger expression"});
-        }
-        if (call->args.size() != 1 || !call->named_args.empty()) {
+        return WholeExists{.call = as_call(*term, "exists"), .negated = negated};
+    }
+
+    /// An `exists(...)` subquery, validated and split: the inner table, the
+    /// `inner == outer(...)` captures, and the terms over inner columns only.
+    struct ExistsSubquery {
+        const Expr* base = nullptr;
+        std::vector<CapturedKey> captures;
+        std::vector<const Expr*> inner_local;
+    };
+
+    auto parse_exists(const CallExpr& call, const ir::Node& outer_input)
+        -> std::expected<ExistsSubquery, LowerError> {
+        if (call.args.size() != 1 || !call.named_args.empty()) {
             return std::unexpected(
                 LowerError{.message = "exists(): expected exactly one table expression"});
         }
-        const Expr& argument = unwrap_group(*call->args.front());
+        const Expr& argument = unwrap_group(*call.args.front());
         if (contains_call(argument, "exists") || contains_call(argument, "scalar")) {
             return std::unexpected(
                 LowerError{.message = "exists(): nested subqueries are not supported"});
@@ -4439,19 +4454,18 @@ class Lowerer {
                 .message = "outer(): a capture may appear only in the subquery's filter clause"});
         }
 
+        ExistsSubquery subquery{.base = block->base.get(), .captures = {}, .inner_local = {}};
         std::vector<const Expr*> conjuncts;
         split_conjuncts(*filter->predicate, conjuncts);
-        std::vector<CapturedKey> captures;
-        std::vector<const Expr*> inner_local;
-        inner_local.reserve(conjuncts.size());
+        subquery.inner_local.reserve(conjuncts.size());
         for (const auto* inner : conjuncts) {
             if (!contains_call(*inner, "outer")) {
-                inner_local.push_back(inner);
+                subquery.inner_local.push_back(inner);
                 continue;
             }
             // Only an equality can become a hash-join key. Anything else
             // (`k != outer(j)`, `k > outer(j)`) has to be evaluated against
-            // each pair of rows, which a semi join cannot do.
+            // each pair of rows, which neither lowering can do.
             const auto* binary = std::get_if<BinaryExpr>(&unwrap_group(*inner).node);
             if (binary == nullptr || binary->op != BinaryOp::Eq) {
                 return std::unexpected(LowerError{
@@ -4463,21 +4477,22 @@ class Lowerer {
             if (!capture.has_value()) {
                 return std::unexpected(capture.error());
             }
-            const bool repeat = std::ranges::any_of(captures, [&](const CapturedKey& seen) {
-                return seen.inner == capture->inner && seen.outer == capture->outer;
-            });
+            const bool repeat =
+                std::ranges::any_of(subquery.captures, [&](const CapturedKey& seen) {
+                    return seen.inner == capture->inner && seen.outer == capture->outer;
+                });
             if (!repeat) {
-                captures.push_back(std::move(capture.value()));
+                subquery.captures.push_back(std::move(capture.value()));
             }
         }
-        if (captures.empty()) {
+        if (subquery.captures.empty()) {
             return std::unexpected(
                 LowerError{.message = "exists(): the subquery captures nothing with outer(...); an "
                                       "uncorrelated exists is not supported"});
         }
-        const ir::SchemaInfo outer_schema = ir::infer_schema(*input, source_schemas());
+        const ir::SchemaInfo outer_schema = ir::infer_schema(outer_input, source_schemas());
         if (outer_schema.is_known() && !outer_schema.is_open()) {
-            for (const auto& capture : captures) {
+            for (const auto& capture : subquery.captures) {
                 if (outer_schema.find(capture.outer) == nullptr) {
                     return std::unexpected(
                         LowerError{.message = "outer(" + capture.outer +
@@ -4485,17 +4500,43 @@ class Lowerer {
                 }
             }
         }
+        return subquery;
+    }
+
+    /// Lower one whole `exists(...)` / `!exists(...)` filter conjunct over
+    /// `input`.
+    ///
+    ///     filter exists(inner[filter inner_local && k == outer(j)])
+    ///
+    ///     Join(Semi, on j = k)
+    ///       outer
+    ///       Filter(inner_local)(inner)
+    ///
+    /// `!exists` is the same with an Anti join. Unlike `scalar(...)` there is
+    /// no generated column and no aggregate: a semi join keeps each outer row
+    /// at most once however many inner rows match, and adds nothing to its
+    /// schema, so the outer schema need not be known either.
+    ///
+    /// `exists` is never null. An outer row whose key is null matches nothing
+    /// (`k == null` is never true), so `exists` is false for it and `!exists`
+    /// true — SQL's `exists`, and exactly what the joins do with null keys.
+    auto lower_exists(const Expr& conjunct, ir::NodePtr input) -> LowerResult {
+        const WholeExists whole = as_whole_exists(conjunct);
+        auto subquery = parse_exists(*whole.call, *input);
+        if (!subquery.has_value()) {
+            return std::unexpected(subquery.error());
+        }
 
         // The inner side is the subquery with its captures stripped: its own
         // terms filter it before the join ever probes it.
         LowerResult inner_plan;
-        if (inner_local.empty()) {
-            inner_plan = lower_expr(*block->base);
+        if (subquery->inner_local.empty()) {
+            inner_plan = lower_expr(*subquery->base);
         } else {
             BlockExpr stripped;
-            stripped.base = clone_expr(*block->base);
+            stripped.base = clone_expr(*subquery->base);
             stripped.clauses.emplace_back(
-                FilterClause{.predicate = clone_conjunction(inner_local)});
+                FilterClause{.predicate = clone_conjunction(subquery->inner_local)});
             Expr stripped_expr;
             stripped_expr.node = std::move(stripped);
             inner_plan = lower_expr(stripped_expr);
@@ -4505,15 +4546,96 @@ class Lowerer {
         }
 
         std::vector<ir::JoinKey> keys;
-        keys.reserve(captures.size());
-        for (const auto& capture : captures) {
+        keys.reserve(subquery->captures.size());
+        for (const auto& capture : subquery->captures) {
             keys.emplace_back(capture.outer, capture.inner);
         }
         auto join =
-            builder_.join(negated ? ir::JoinKind::Anti : ir::JoinKind::Semi, std::move(keys));
+            builder_.join(whole.negated ? ir::JoinKind::Anti : ir::JoinKind::Semi, std::move(keys));
         join->add_child(std::move(input));
         join->add_child(std::move(inner_plan.value()));
         return join;
+    }
+
+    /// Join a mark for `exists(...)` onto `input` and return the Bool that
+    /// stands for it: an `exists` inside a larger expression (`a || exists(...)`)
+    /// needs a value per outer row, which a semi join, being a row filter,
+    /// cannot give.
+    ///
+    ///     filter a || exists(inner[filter inner_local && k == outer(j)])
+    ///
+    ///     Filter(a || __ibex_exists_0 is not null)
+    ///       Join(Left, on j = k)
+    ///         outer
+    ///         Aggregate(by k: count() as __ibex_exists_0)(Filter(inner_local)(inner))
+    ///
+    /// The aggregate has one row per inner key, so the left join never
+    /// multiplies the outer rows, and an outer row with no match gets a null
+    /// mark. `is not null` turns that into false, so `exists` is never null
+    /// here either. `lower_filter` projects the mark back off.
+    auto mark_exists(const CallExpr& call, ir::NodePtr& input)
+        -> std::expected<ir::Expr, LowerError> {
+        // Nothing inside the subquery may mark onto the enclosing query.
+        ir::NodePtr* const enclosing = std::exchange(exists_marks_, nullptr);
+        auto marked = [&]() -> std::expected<ir::Expr, LowerError> {
+            auto subquery = parse_exists(call, *input);
+            if (!subquery.has_value()) {
+                return std::unexpected(subquery.error());
+            }
+            std::string alias = next_scalar_alias(*input, "__ibex_exists_");
+
+            BlockExpr grouped;
+            grouped.base = clone_expr(*subquery->base);
+            if (!subquery->inner_local.empty()) {
+                grouped.clauses.emplace_back(
+                    FilterClause{.predicate = clone_conjunction(subquery->inner_local)});
+            }
+            ByClause by;
+            by.is_braced = true;
+            by.keys.reserve(subquery->captures.size());
+            for (const auto& capture : subquery->captures) {
+                // `a == outer(x) && a == outer(y)` is one group key compared
+                // against two outer ones, as for `scalar(...)`.
+                const bool grouped_already = std::ranges::any_of(
+                    by.keys, [&](const Field& key) { return key.name == capture.inner; });
+                if (!grouped_already) {
+                    by.keys.push_back(Field{.name = capture.inner, .expr = nullptr});
+                }
+            }
+            grouped.clauses.emplace_back(std::move(by));
+            CallExpr count{.callee = "count", .args = {}, .named_args = {}};
+            Expr count_expr;
+            count_expr.node = std::move(count);
+            SelectClause projection;
+            projection.fields.push_back(
+                Field{.name = alias, .expr = std::make_unique<Expr>(std::move(count_expr))});
+            grouped.clauses.emplace_back(std::move(projection));
+
+            Expr grouped_expr;
+            grouped_expr.node = std::move(grouped);
+            auto plan = lower_expr(grouped_expr);
+            if (!plan.has_value()) {
+                return std::unexpected(plan.error());
+            }
+
+            // Folded keys, as for `scalar(...)`: sound for a Left join (see
+            // `lower_scalar_subquery`), and the only kind built here.
+            std::vector<ir::JoinKey> keys;
+            keys.reserve(subquery->captures.size());
+            for (const auto& capture : subquery->captures) {
+                keys.emplace_back(capture.outer, capture.inner, /*fold=*/true);
+            }
+            auto join = builder_.join(ir::JoinKind::Left, std::move(keys));
+            join->add_child(std::move(input));
+            join->add_child(std::move(plan.value()));
+            input = std::move(join);
+
+            return ir::Expr{.node = ir::IsNullExpr{.operand = ir::make_expr_ptr(ir::Expr{
+                                                       .node = ir::ColumnRef{.name = alias}}),
+                                                   .negated = true}};
+        }();
+        exists_marks_ = enclosing;
+        return marked;
     }
 
     /// Join the subquery in `conjunct` onto `input` and return the comparison
@@ -4819,10 +4941,11 @@ class Lowerer {
 
     /// A generated column name for a subquery result that no input column can
     /// collide with.
-    auto next_scalar_alias(const ir::Node& input) -> std::string {
+    auto next_scalar_alias(const ir::Node& input, std::string_view prefix = "__ibex_scalar_")
+        -> std::string {
         const ir::SchemaInfo schema = ir::infer_schema(input, source_schemas());
         while (true) {
-            std::string alias = "__ibex_scalar_" + std::to_string(scalar_subquery_count_++);
+            std::string alias = std::string(prefix) + std::to_string(scalar_subquery_count_++);
             if (!schema.is_known() || schema.find(alias) == nullptr) {
                 return alias;
             }
@@ -4923,9 +5046,12 @@ class Lowerer {
                                "exists(...) correlated subquery"});
             }
             if (call->callee == "exists") {
-                return std::unexpected(LowerError{
-                    .message = "exists(): a subquery test is only supported as a whole filter "
-                               "conjunct, optionally negated with `!`"});
+                if (exists_marks_ == nullptr) {
+                    return std::unexpected(LowerError{
+                        .message = "exists(): a subquery test is only supported in a filter "
+                                   "clause"});
+                }
+                return mark_exists(*call, *exists_marks_);
             }
             // `left(col)` / `right(col)`: which input of the enclosing join the
             // column comes from. Only a join predicate has two inputs to choose
@@ -6688,6 +6814,9 @@ class Lowerer {
     robin_hood::unordered_set<std::string> inlining_active_;
     // Serial number for the generated column a `scalar(...)` subquery lands in.
     std::size_t scalar_subquery_count_ = 0;
+    /// The outer input that an `exists(...)` inside a filter term joins its
+    /// mark onto, while `lower_filter` lowers that term; null elsewhere.
+    ir::NodePtr* exists_marks_ = nullptr;
 };
 
 }  // namespace

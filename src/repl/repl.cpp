@@ -2419,8 +2419,8 @@ constexpr auto kBuiltinDocs = std::to_array<BuiltinDoc>({
      .example = "scalar(summary, \"avg\")"},
     {.name = "exists",
      .signature = "exists(table[filter k == outer(j)]) -> Bool",
-     .summary = "In a filter: keep rows with at least one matching inner row (semi join); "
-                "!exists keeps the rest.",
+     .summary = "In a filter: true when an inner row matches the outer(...) captures; "
+                "composes with ||, &&, and !.",
      .example = "orders[filter exists(items[filter i_order == outer(o_key)])]"},
     {.name = "seq",
      .signature = "seq(from, by) -> Series<Int64|Float64>",

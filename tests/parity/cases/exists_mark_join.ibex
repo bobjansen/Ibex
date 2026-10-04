@@ -1,0 +1,36 @@
+// `exists(...)` inside a larger expression needs a Bool per outer row, so it
+// lowers to a mark join (a per-key count, left-joined on, tested with
+// `is not null`) instead of a semi join. The interpreter and the emitted C++
+// must agree, and `exists(...) || false` must give exactly what the semi join
+// gives. Order 6's key is null: its mark is null, so `exists` is false and
+// `!exists` true.
+let orders = Table {
+    o_orderkey = [1, 2, 3, 4, 5, null],
+    o_altkey   = [1, 7, 3, 4, 9, 6],
+    o_priority = ["1-URGENT", "2-HIGH", "1-URGENT", "3-MEDIUM", "2-HIGH", "1-URGENT"]
+};
+let lines = Table {
+    l_orderkey = [1, 1, 1, 2, 4, 4, 9, null],
+    l_partkey  = [1, 5, 1, 2, 4, 8, 9, 6],
+    l_late     = [true, true, false, false, true, false, true, true]
+};
+let by_semi = orders[filter exists(lines[filter l_orderkey == outer(o_orderkey) && l_late])];
+let by_mark = orders[filter exists(lines[filter l_orderkey == outer(o_orderkey) && l_late]) || false];
+let either = orders[filter
+    o_priority == "1-URGENT" || exists(lines[filter l_orderkey == outer(o_orderkey) && l_late])];
+let neither = orders[filter
+    !(o_priority == "2-HIGH" || exists(lines[filter l_orderkey == outer(o_orderkey)]))];
+// A semi join, a mark join on two captures sharing an inner column, and an
+// ordinary term, all in one filter.
+let mixed = orders[filter
+    exists(lines[filter l_orderkey == outer(o_orderkey)])
+    && (o_priority == "3-MEDIUM"
+        || !exists(lines[filter l_orderkey == outer(o_orderkey) && l_orderkey == outer(o_altkey) && l_late]))
+    && o_altkey < 9];
+rbind(
+    by_semi[update { which = "semi" }],
+    by_mark[update { which = "mark" }],
+    either[update { which = "either" }],
+    neither[update { which = "neither" }],
+    mixed[update { which = "mixed" }]
+)[order { which, o_altkey }];

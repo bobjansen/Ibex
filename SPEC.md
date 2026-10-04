@@ -4145,7 +4145,9 @@ use `round(x, ceil|floor|trunc)` for a `Float -> Int64` conversion.
 connectives (`&&`, `||`, `!`), and the null tests `is_null` / `is_not_null` are
 not restricted to `filter` predicates — they produce a `Series<Bool>` and may be
 assigned in `select`/`update` (e.g. `update { above = price > vwap, missing =
-is_null(sector) }`). `is_null`/`is_not_null`/`coalesce` are null-aware: they read
+is_null(sector) }`). A `Bool` compares with a `Bool` under every comparison
+operator, with `false < true` — `(a > 1) != (b > 1)` or `flag == true`.
+`is_null`/`is_not_null`/`coalesce` are null-aware: they read
 the value's null bit rather than its (ignored) payload, so `coalesce(x, 0.0)`
 replaces nulls and `is_null(x)` is never itself null.
 

@@ -567,6 +567,13 @@ class OrderedChunkRing {
         ready_.notify_all();
     }
 
+    /// Whether `take(sequence)` would return without parking.
+    [[nodiscard]] auto can_take(std::uint64_t sequence) const -> bool {
+        const std::scoped_lock lock(mutex_);
+        return ring_[static_cast<std::size_t>(sequence % window_)].has_value() || cancelled_ ||
+               active_producers_ == 0 || (has_error_ && error_sequence_ <= sequence);
+    }
+
     /// Take the chunk at `sequence`, or nullopt when the run stopped before
     /// producing it — cancelled, failed, or out of producers. The caller asks
     /// `failure()` for why.
@@ -2015,7 +2022,9 @@ class PipelinedScanOperator final : public Operator {
    public:
     PipelinedScanOperator(const DeferredScan& scan, std::vector<SourceUnit> units,
                           std::vector<ScanPipelineWorker> workers, const ExecutionContext& exec,
-                          WorkerPool& pool, std::shared_ptr<ScanWorkerSink> sink = nullptr)
+                          WorkerPool& pool, std::shared_ptr<ScanWorkerSink> sink = nullptr,
+                          std::unique_ptr<ExecutionContext> consumer_exec = nullptr,
+                          std::optional<ScanPipelineWorker> consumer_worker = std::nullopt)
         : scan_(&scan),
           plan_(plan_deferred_scan(scan)),
           units_(std::move(units)),
@@ -2023,7 +2032,12 @@ class PipelinedScanOperator final : public Operator {
           exec_(&exec),
           pool_(&pool),
           sink_(std::move(sink)),
-          window_(std::max<std::size_t>(workers_.size() * 2, 2)),
+          consumer_exec_(std::move(consumer_exec)),
+          consumer_worker_(std::move(consumer_worker)),
+          // A helping consumer gets one more round of slack (see
+          // `run_consumer_unit`); without it the workers park behind it.
+          window_(std::max<std::size_t>(workers_.size() * 2, 2) +
+                  (consumer_worker_.has_value() ? workers_.size() : 0)),
           ring_(window_, workers_.size()) {}
 
     ~PipelinedScanOperator() override { cancel_and_join(); }
@@ -2040,6 +2054,9 @@ class PipelinedScanOperator final : public Operator {
         start();
 
         while (next_sequence_ < units_.size()) {
+            while (consumer_worker_.has_value() && !ring_.can_take(next_sequence_) &&
+                   run_consumer_unit()) {
+            }
             std::optional<Chunk> produced = ring_.take(next_sequence_);
             if (!produced.has_value()) {
                 // Stopped before this unit: cancelled, failed, or out of
@@ -2131,7 +2148,7 @@ class PipelinedScanOperator final : public Operator {
                     return;
                 }
 
-                auto result = run_unit(worker, sequence);
+                auto result = run_unit(worker, sequence, *exec_);
                 if (!result.has_value()) {
                     ring_.record_error(sequence, std::move(result.error()));
                     return;
@@ -2158,9 +2175,57 @@ class PipelinedScanOperator final : public Operator {
         }
     }
 
-    [[nodiscard]] auto run_unit(ScanPipelineWorker& worker, std::size_t sequence)
-        -> std::expected<Chunk, std::string> {
-        auto decoded = materialize_deferred_scan_unit(*scan_, plan_, units_[sequence], *exec_);
+    /// The consumer, about to park on the next unit, runs one unclaimed unit
+    /// itself instead. False when there is none it may take, or the run stopped.
+    ///
+    /// A long source leaves one pool thread spare (`scan_pipeline_worker_count`),
+    /// so without this the consumer and that spare both idle while the workers
+    /// decode: q06 at 8 cores kept 7 of 8 cores busy. The spare stays spare --
+    /// it is what a downstream batch needs -- and the consumer, which is not a
+    /// pool thread, does the eighth core's share.
+    ///
+    /// While it runs a unit it releases nothing, so it claims one only when a
+    /// further round of worker claims still fits in the ring behind it: on q01,
+    /// whose units are heavy, a consumer that claimed anywhere in the window
+    /// parked the workers for as long as it helped and gained nothing. The
+    /// window carries that extra round. A claimed sequence is inside the window
+    /// the consumer holds open itself, so its `acquire` cannot park.
+    [[nodiscard]] auto run_consumer_unit() -> bool {
+        std::size_t sequence = cursor_.load(std::memory_order_relaxed);
+        do {
+            if (sequence >= units_.size() ||
+                sequence + workers_.size() >= next_sequence_ + window_) {
+                return false;
+            }
+        } while (!cursor_.compare_exchange_weak(sequence, sequence + 1, std::memory_order_relaxed));
+        if (ring_.acquire(sequence) == OrderedChunkRing::Acquire::Abandon) {
+            return false;
+        }
+        if (interrupt_requested()) {
+            ring_.cancel();
+            return false;
+        }
+        try {
+            auto result = run_unit(*consumer_worker_, sequence, *consumer_exec_);
+            if (!result.has_value()) {
+                ring_.record_error(sequence, std::move(result.error()));
+                return false;
+            }
+            if (sink_ != nullptr && result->rows() != 0) {
+                sink_->on_worker_chunk(sequence, *result);
+            }
+            ring_.publish(sequence, std::move(*result));
+        } catch (const std::exception& error) {
+            ring_.record_error(sequence,
+                               "scan pipeline: worker exception: " + std::string(error.what()));
+            return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] auto run_unit(ScanPipelineWorker& worker, std::size_t sequence,
+                                const ExecutionContext& exec) -> std::expected<Chunk, std::string> {
+        auto decoded = materialize_deferred_scan_unit(*scan_, plan_, units_[sequence], exec);
         if (!decoded.has_value()) {
             return std::unexpected(std::move(decoded.error()));
         }
@@ -2248,7 +2313,7 @@ class PipelinedScanOperator final : public Operator {
             return;
         }
         validated_ = true;
-        for (auto& worker : workers_) {
+        const auto validate = [](ScanPipelineWorker& worker) {
             auto trailing = worker.chain->next();
             if (!trailing.has_value()) {
                 throw std::runtime_error(trailing.error());
@@ -2256,6 +2321,12 @@ class PipelinedScanOperator final : public Operator {
             if (trailing->has_value()) {
                 throw std::runtime_error("scan pipeline: unexpected trailing output");
             }
+        };
+        for (auto& worker : workers_) {
+            validate(worker);
+        }
+        if (consumer_worker_.has_value()) {
+            validate(*consumer_worker_);
         }
     }
 
@@ -2281,6 +2352,12 @@ class PipelinedScanOperator final : public Operator {
     const ExecutionContext* exec_;
     WorkerPool* pool_;
     std::shared_ptr<ScanWorkerSink> sink_;
+    // The consumer's own chain and its serial context, present when a pool
+    // thread was left spare (`run_consumer_unit`). Serial because the consumer
+    // is not a pool thread, so `on_worker_pool_thread()` would not stop its
+    // decode fanning out over a pool the workers already fill.
+    std::unique_ptr<ExecutionContext> consumer_exec_;
+    std::optional<ScanPipelineWorker> consumer_worker_;
     std::size_t window_ = 2;
     // The same ordered handoff the morsel executor uses: one implementation of
     // the bounded, sequence-ordered producer/consumer shape.
@@ -2496,6 +2573,16 @@ class PipelinedStageOperator final : public Operator {
     return eligible ? make_pipelined_stage(std::move(child), exec, entry) : std::move(child);
 }
 
+/// Whether a scan of `unit_count` units over `workers` pool threads must leave
+/// one spare. A spare thread is only necessary when every pool thread could
+/// remain parked behind ring backpressure. The ring holds 2W results and workers
+/// have already claimed at most another W units, so a source of at most 3W
+/// units necessarily lets one worker exit after the first chunk is released.
+[[nodiscard]] auto scan_pipeline_needs_spare(std::size_t workers, std::size_t pool_size,
+                                             std::size_t unit_count) -> bool {
+    return workers == pool_size && unit_count > workers * 3;
+}
+
 [[nodiscard]] auto scan_pipeline_worker_count(std::size_t unit_count) -> std::size_t {
     auto& pool = process_worker_pool();
     if (pool.size() < 2) {
@@ -2510,13 +2597,10 @@ class PipelinedStageOperator final : public Operator {
     // configure_parallel_from_env uses that field for compute only.
     const std::size_t budget = pool.size();
     std::size_t workers = std::min({budget, pool.size(), unit_count});
-    // A spare thread is only necessary when every pool thread could remain
-    // parked behind ring backpressure. The ring holds 2W results and workers
-    // have already claimed at most another W units, so a source of at most 3W
-    // units necessarily lets one worker exit after the first chunk is released.
-    // Smaller sources (the common Parquet shape) keep the full decode budget;
-    // longer sources reserve one thread for downstream batches.
-    if (workers == pool.size() && unit_count > workers * 3) {
+    // Smaller sources keep the full decode budget; longer sources reserve one
+    // thread for downstream batches, and the consumer works in its place
+    // (`PipelinedScanOperator::run_consumer_unit`).
+    if (scan_pipeline_needs_spare(workers, pool.size(), unit_count)) {
         --workers;
     }
     return workers;
@@ -2546,6 +2630,17 @@ auto make_deferred_scan_source(const DeferredScan& scan, std::vector<SourceUnit>
         }
         workers.push_back(std::move(*worker));
     }
+    std::unique_ptr<ExecutionContext> consumer_exec;
+    std::optional<ScanPipelineWorker> consumer_worker;
+    if (scan_pipeline_needs_spare(worker_count + 1, process_worker_pool().size(), units.size())) {
+        consumer_exec = std::make_unique<ExecutionContext>(exec);
+        consumer_exec->parallel_threads = 1;
+        auto worker = build_scan_pipeline_worker(operators, scalars, externs, *consumer_exec);
+        if (!worker.has_value()) {
+            return std::unexpected(std::move(worker.error()));
+        }
+        consumer_worker = std::move(*worker);
+    }
     if (exec.parallel_stats != nullptr) {
         if (count_as_pipeline) {
             exec.parallel_stats->parallel_pipelines.fetch_add(1, std::memory_order_relaxed);
@@ -2553,9 +2648,9 @@ auto make_deferred_scan_source(const DeferredScan& scan, std::vector<SourceUnit>
         exec.parallel_stats->morsels.fetch_add(units.size(), std::memory_order_relaxed);
         exec.parallel_stats->pipelined_scans.fetch_add(1, std::memory_order_relaxed);
     }
-    return std::make_unique<PipelinedScanOperator>(scan, std::move(units), std::move(workers), exec,
-                                                   process_worker_pool(),
-                                                   take_offered_scan_worker_sink());
+    return std::make_unique<PipelinedScanOperator>(
+        scan, std::move(units), std::move(workers), exec, process_worker_pool(),
+        take_offered_scan_worker_sink(), std::move(consumer_exec), std::move(consumer_worker));
 }
 
 /// A breaker only earns a scheduler thread when its probe input can actually

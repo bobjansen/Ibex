@@ -15485,6 +15485,140 @@ auto make_pipeline_deferred(const std::shared_ptr<PipelineReaderState>& state)
     return deferred;
 }
 
+// A source with more units than three rounds of the pool: the pipelined scan
+// leaves one pool thread spare for downstream batches, and the consumer decodes
+// in its place while it would otherwise park (`run_consumer_unit`).
+struct ManyUnitState {
+    std::size_t units = 0;
+    std::size_t fail_unit = static_cast<std::size_t>(-1);
+    std::thread::id caller;
+    std::atomic<int> on_caller{0};
+    std::atomic<int> caller_could_fan_out{0};
+};
+
+class ManyUnitReader final : public runtime::LazySourceReader {
+   public:
+    static constexpr std::size_t kRows = 100;
+
+    explicit ManyUnitReader(std::shared_ptr<ManyUnitState> state) : state_(std::move(state)) {}
+
+    auto decode_units() -> std::vector<runtime::SourceUnit> override {
+        std::vector<runtime::SourceUnit> units;
+        units.reserve(state_->units);
+        for (std::size_t u = 0; u < state_->units; ++u) {
+            units.push_back({.start = u * kRows, .rows = kRows});
+        }
+        return units;
+    }
+
+    auto decode(const std::vector<std::string>& /*names*/, const runtime::Selection* /*selection*/,
+                const runtime::SourceUnit* unit, const runtime::ExecutionContext& exec)
+        -> std::expected<runtime::Table, std::string> override {
+        if (unit == nullptr) {
+            return std::unexpected("many-unit reader expected a source unit");
+        }
+        if (unit->start / kRows == state_->fail_unit) {
+            return std::unexpected("unit " + std::to_string(state_->fail_unit) + " failed");
+        }
+        if (std::this_thread::get_id() == state_->caller) {
+            state_->on_caller.fetch_add(1);
+            if (exec.can_fan_out()) {
+                state_->caller_could_fan_out.fetch_add(1);
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::vector<std::int64_t> values(unit->rows);
+        for (std::size_t i = 0; i < unit->rows; ++i) {
+            values[i] = static_cast<std::int64_t>(unit->start + i);
+        }
+        runtime::Table out;
+        out.add_column("x", Column<std::int64_t>{std::move(values)});
+        out.logical_rows = unit->rows;
+        return out;
+    }
+
+   private:
+    std::shared_ptr<ManyUnitState> state_;
+};
+
+auto make_many_unit_deferred(const std::shared_ptr<ManyUnitState>& state)
+    -> runtime::DeferredScanRegistry {
+    runtime::Table schema;
+    schema.add_column("x", Column<std::int64_t>{});
+    auto lazy = std::make_shared<runtime::LazyTable>(
+        std::move(schema), state->units * ManyUnitReader::kRows,
+        [state]() -> std::expected<runtime::LazySourceReaderPtr, std::string> {
+            return runtime::LazySourceReaderPtr{std::make_unique<ManyUnitReader>(state)};
+        });
+    runtime::DeferredScanRegistry deferred;
+    deferred.emplace("df", runtime::DeferredScan{.lazy = std::move(lazy),
+                                                 .conjuncts = {},
+                                                 .demand = {"x"},
+                                                 .demand_all = false,
+                                                 .key_column = {},
+                                                 .filter = nullptr});
+    return deferred;
+}
+
+auto many_unit_exec(const runtime::DeferredScanRegistry& deferred,
+                    runtime::ParallelPipelineStats& stats) -> runtime::ExecutionContext {
+    runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+    exec.parallel_threads = 4;
+    exec.parallel_min_rows = 0;
+    exec.parallel_min_cells = 0;
+    exec.parallel_stats = &stats;
+    return exec;
+}
+
+TEST_CASE("Scan pipeline consumer decodes units in place of the spare thread",
+          "[runtime][parallel][pipeline]") {
+    auto state = std::make_shared<ManyUnitState>();
+    state->units = (runtime::process_worker_pool().size() * 3) + 8;
+    state->caller = std::this_thread::get_id();
+    auto deferred = make_many_unit_deferred(state);
+    const runtime::TableRegistry empty;
+    auto ir = require_ir("df[filter x >= 0];");
+
+    runtime::ParallelPipelineStats stats;
+    auto exec = many_unit_exec(deferred, stats);
+    auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
+    REQUIRE(out.has_value());
+    CHECK(stats.pipelined_scans.load() == 1);
+
+    // Every row, in source order, whichever thread decoded its unit.
+    const auto* x = std::get_if<Column<std::int64_t>>(out->find("x"));
+    REQUIRE(x != nullptr);
+    REQUIRE(x->size() == state->units * ManyUnitReader::kRows);
+    bool ordered = true;
+    for (std::size_t i = 0; i < x->size(); ++i) {
+        ordered = ordered && (*x)[i] == static_cast<std::int64_t>(i);
+    }
+    CHECK(ordered);
+
+    // The consumer took units itself, and decoded them serially: it is not a
+    // pool thread, so nothing else would stop its decode fanning out.
+    CHECK(state->on_caller.load() > 0);
+    CHECK(state->caller_could_fan_out.load() == 0);
+}
+
+TEST_CASE("Scan pipeline reports a failing unit whichever thread decodes it",
+          "[runtime][parallel][pipeline]") {
+    auto state = std::make_shared<ManyUnitState>();
+    state->units = (runtime::process_worker_pool().size() * 3) + 8;
+    state->fail_unit = state->units / 2;
+    state->caller = std::this_thread::get_id();
+    auto deferred = make_many_unit_deferred(state);
+    const runtime::TableRegistry empty;
+    auto ir = require_ir("df[filter x >= 0];");
+
+    runtime::ParallelPipelineStats stats;
+    auto exec = many_unit_exec(deferred, stats);
+    auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
+    REQUIRE_FALSE(out.has_value());
+    CHECK(out.error().find("unit " + std::to_string(state->fail_unit) + " failed") !=
+          std::string::npos);
+}
+
 // Streams four large units whose Categorical keys each carry their OWN
 // dictionary, in a different order per unit, the way Parquet row groups do; the
 // last unit adds a key value the others never saw. Values are exact in binary

@@ -293,7 +293,14 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 if (entry2 == nullptr) {
                     return "join key not found in right table: " + *key2_name;
                 }
-                right_key2_chunks_.push_back(std::move(*entry2));
+                // Both keys may name ONE right column (`l_k == outer(a) &&
+                // l_k == outer(b)`); moving it here would leave the first key
+                // reading a moved-from entry below. A copy shares the buffer.
+                if (entry2 == entry) {
+                    right_key2_chunks_.push_back(*entry2);
+                } else {
+                    right_key2_chunks_.push_back(std::move(*entry2));
+                }
             }
             right_rows_ += column_size(*entry->column);
             right_key_chunks_.push_back(std::move(*entry));

@@ -16596,9 +16596,9 @@ auto ten_key_build_registry() -> runtime::TableRegistry {
 }
 
 TEST_CASE("Joins under rbind keep their deferred probe", "[runtime][join][deferred_probe]") {
-    // `rbind` is a materializing node; its operands used to be evaluated by
-    // `interpret_node`, whose join materializes both sides before any build
-    // key exists, so a deferred probe scan under it decoded every row.
+    // `rbind` is a materializing node; its operands used to be evaluated by the
+    // fallback recursively, with a join that materializes both sides before any
+    // build key exists, so a deferred probe scan under it decoded every row.
     const auto registry = ten_key_build_registry();
     auto ir = require_ir("rbind(build_t join probe_a on k, build_t join probe_b on k);");
     const CountingProbe a;
@@ -16621,9 +16621,9 @@ TEST_CASE("Joins under rbind keep their deferred probe", "[runtime][join][deferr
 TEST_CASE("A join under a node the plan does not migrate keeps its deferred probe",
           "[runtime][join][deferred_probe]") {
     // `median` declines the streaming aggregate, so the aggregate runs in
-    // `interpret_node`. Its input used to be evaluated there too, recursively,
-    // with the materializing join -- every probe row decoded. Inputs now go
-    // back through `build_operator`.
+    // `run_materialized_node`. Its input used to be evaluated there too,
+    // recursively, with the materializing join -- every probe row decoded.
+    // Inputs now go back through `build_operator`.
     const auto registry = ten_key_build_registry();
     auto ir = require_ir("(build_t join probe_t on k)[select { m = median(payload) }];");
     const CountingProbe probe;
@@ -17390,7 +17390,7 @@ TEST_CASE("aligned grouped window refuses to split a cross-bucket field",
 }
 
 // A `distinct` beneath an aggregate the plan declines (`median`). The aggregate
-// runs in `interpret_node`, which evaluates its input back through
+// runs in `run_materialized_node`, which evaluates its input back through
 // `build_operator`, so the distinct runs as its streaming operator. One
 // statement on purpose: a `let` between the clauses would materialize the
 // distinct first and never put it beneath the declined node.
@@ -17443,7 +17443,7 @@ TEST_CASE("distinct beneath a declined aggregate answers through the physical pa
 }
 
 // Like distinct above, this needs one statement: `median` declines the
-// chunked aggregate, so the join is an input of a node `interpret_node` runs.
+// chunked aggregate, so the join is an input of a node `run_materialized_node` runs.
 // A `let joined = ...` would materialize the join first.
 TEST_CASE("inner join beneath a declined aggregate answers through the physical path",
           "[interpreter][join][chunked]") {

@@ -85,7 +85,7 @@ auto is_streamable_inner_join(const ir::JoinNode& join) -> bool {
 /// motivating case). Same structural gate as `is_streamable_inner_join`
 /// plus a static schema check -- both keys, on both sides, must be provably
 /// `Int64` -- so an ineligible pair (a string key, an unascribed/Unknown
-/// schema) falls through to the materialized-call fallback (`interpret_node`'s
+/// schema) falls through to the materialized-call fallback (`run_materialized_node`'s
 /// `Join` branch) exactly as it does today, never into a code path that could
 /// fail at runtime.
 /// `ChunkedInnerJoinOperator::initialize_pair` re-checks the actual runtime
@@ -162,7 +162,7 @@ auto join_keys_provably_int64(const ir::JoinNode& join) -> bool {
 namespace {
 
 // A materializing binary breaker (non-streamable join, matmul) now resolves in
-// `interpret_node`, which drains both sides whole-table and serially.
+// `run_materialized_node`, which drains both sides whole-table and serially.
 // Overlapping the two materializations on a raw std::thread was tried twice
 // (once unbudgeted, once under a since-removed helper-thread budget) and
 // regressed the PDS-H suite both times (q09 +57% / +47.5%): the cost is
@@ -173,7 +173,7 @@ namespace {
 
 // The materialized-call fallback for every node kind `plan_physical` does not
 // migrate (reshape, stats, window, non-row-local update, materializing join,
-// matmul, model, ...). `interpret_node` owns the per-kind semantics, and it
+// matmul, model, ...). `run_materialized_node` owns the per-kind semantics, and it
 // evaluates every relational input back through `build_operator`
 // (`materialize_plan`), so a `Filter`/`Project`/join feeding the breaker keeps
 // its fused parallel scan or streaming join rather than running whole-table
@@ -184,7 +184,7 @@ auto build_materialized_fallback(const ir::Node& node, const TableRegistry& regi
                                  const ScalarRegistry* scalars, const ExternRegistry* externs,
                                  const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
-    auto table = interpret_node(node, registry, scalars, externs, exec, model_out);
+    auto table = run_materialized_node(node, registry, scalars, externs, exec, model_out);
     if (!table.has_value()) {
         return std::unexpected(std::move(table.error()));
     }
@@ -234,7 +234,7 @@ auto make_join_probe_operator(OperatorPtr source, std::optional<Table> materiali
 /// Planner seam: returns a pull-based operator that, when drained,
 /// produces the logical result of `node`. Chunked operators exist
 /// today for node kinds that are safe and useful to stream; any other
-/// node kind falls back to the full-table `interpret_node` path and
+/// node kind falls back to the full-table `run_materialized_node` path and
 /// is wrapped in a `TableSourceOperator` so downstream chunked
 /// operators see a uniform pull-based interface.
 // Order-delay past Filter/Project/Rename, and Head/Tail pushdown past
@@ -987,7 +987,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     // and calls `tail_table`; the plan just records that they are breakers.
 
     // Every other node kind is a materialized-call fallback: not migrated by
-    // `plan_physical`, counted just above, and executed by `interpret_node`
+    // `plan_physical`, counted just above, and executed by `run_materialized_node`
     // rather than a per-kind branch. `build_materialized_fallback` still builds
     // the breaker's direct children through the physical path (fused parallel
     // scan, streaming join), so the switch's 15 hand-synced branches collapse

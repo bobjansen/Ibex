@@ -155,10 +155,11 @@ in active plans to `plans/done/...` paths refer to that history.
     rename still can't go is on `isolate_deferrable_probe_scans`
     (`include/ibex/ir/scan_predicates.hpp`).
   - **physical-fallback-adapter-plan.md** — one `build_materialized_fallback`
-    → `interpret_node` seam. Its input allowlist was replaced 2026-10-04 by
-    `materialize_plan` (`runtime_entry.cpp`): every input of a fallback node
-    goes back through `build_operator`. Removing `interpret_node` entirely is
-    in progress.
+    → `interpret_node` seam. On 2026-10-04 `interpret_node` stopped being a
+    second executor: it became `run_materialized_node`
+    (`materialized_node.cpp`), whose every input goes back through
+    `build_operator` (`materialize_plan`), with its input allowlist and the
+    cases for always-migrated kinds deleted.
   - **cooperative-pipeline-waits-plan.md** — work-conserving ring waits make
     nested fan-out safe. Both gates are explained where they live
     (`g_submit_gen` in `worker_pool.cpp`, `cooperative_ring_wait` in

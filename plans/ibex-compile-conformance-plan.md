@@ -103,7 +103,7 @@ Landed:
   `cardinality.cpp` (row-count-preserving), `required_columns.cpp` (demand =
   field-expr columns), plus `infer_output_column_names` / `clone_node` in
   `lower.cpp`.
-- `interpret_node` `case Map`: serial row-major evaluation, then construction
+- `run_materialized_node` `case Map`: serial row-major evaluation, then construction
   of exactly the named result columns.
 - `ibex::ops::map` (`ops.hpp` / `ops.cpp`); emitter `case Map`.
 - Tests: `tests/test_lower.cpp` (S1/S2 build a MapNode, map+other

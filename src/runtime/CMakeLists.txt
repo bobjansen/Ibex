@@ -18,6 +18,7 @@ add_library(ibex_runtime STATIC
     extern_registry.cpp
     filter.cpp
     interpreter.cpp
+    materialized_node.cpp
     rank_window.cpp
     runtime_entry.cpp
     join.cpp

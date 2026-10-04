@@ -256,7 +256,7 @@ separate streaming operator.
    **The fallback adapter is the end state — decided 2026-08-31.** An audit found
    no fallback kind has a streaming operator waiting to be plan-wired: every
    remaining kind (`Window`, `Resample`, `Melt`, `Dcast`, `Cov`, `Corr`,
-   `Matmul`, grouped `Update`, ...) is a whole-table `interpret_node`
+   `Matmul`, grouped `Update`, ...) is a whole-table `run_materialized_node`
    implementation with no operator, and PDS-H's *only* non-`Scan` fallback is the
    materializing `Join` (×4, non-equi / nulls-equal / expect). So there is no
    cheap wiring pass — migrating any kind means writing a new breaker, which is
@@ -269,7 +269,7 @@ separate streaming operator.
    `4923c02e`; see Phase 5 item 3 below for what remains): the 15-branch
    materializing per-kind switch in `build_operator_impl` is gone. Every
    non-migrated kind resolves through one `build_materialized_fallback` →
-   `interpret_node`, which evaluates every relational input back through
+   `run_materialized_node`, which evaluates every relational input back through
    `build_operator` (`materialize_plan`, 2026-10-04; it replaced an input
    allowlist that had left `rbind` and declined aggregates recursing) so a
    filtered/projected input keeps its fused parallel scan. `explain physical` names the retained subtree.
@@ -603,15 +603,16 @@ at all (a one-valued strategy enum would be ceremony).
 2. Move logical fusion/selection out of `ir::NodeKind` — **DONE** for
    `FilterProject` / `FilterUpdateProject`: both legacy types and their
    compatibility lowering are deleted.
-3. Remove obsolete `build_operator` recursion; migrate `interpret_node` to an
-   explicit physical fallback adapter. **DONE 2026-08-29** (`a5183b9a`,
+3. Remove obsolete `build_operator` recursion; migrate `interpret_node` (now
+   `run_materialized_node`) to an explicit physical fallback adapter. **DONE 2026-08-29** (`a5183b9a`,
    `d7f2d59f`, `4923c02e`, `cb2888cd`; the sub-plan was retired 2026-09-23 and
    its rules now live on `build_materialized_fallback` in `runtime_entry.cpp`
    and `materialize_plan`). The
    materializing per-kind switch is one `build_materialized_fallback` seam;
    `build_operator` no longer recurses through a fallback subtree (only through
-   the pre-built relational inputs). `interpret_node` keeps its own recursion as
-   the fallback interpreter. Two small cleanups remain, neither affecting
+   the pre-built relational inputs). Since 2026-10-04 the fallback does not
+   recurse either: `interpret_node` became `run_materialized_node`
+   (`materialized_node.cpp`), whose every input goes through `materialize_plan`. Two small cleanups remain, neither affecting
    performance:
    - *Bare streaming sources inflate the backlog counter.* A deferred `Scan`
      (`stream_scans`) and a chunked `ExternCall` are real streaming operators,

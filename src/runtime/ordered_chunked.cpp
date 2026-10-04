@@ -7,7 +7,7 @@
 // chunked.cpp; the operators are fully private to this translation unit.
 // `build_physical_tail` stays in chunked.cpp (it materializes and calls
 // `tail_table` rather than driving an ordering operator); `as_timeframe` is a
-// whole-table `interpret_node` implementation with no streaming operator.
+// whole-table `run_materialized_node` implementation with no streaming operator.
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>

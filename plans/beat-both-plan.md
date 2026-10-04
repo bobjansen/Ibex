@@ -188,10 +188,82 @@ effect too. Milestone 1 needs ~260 ms, comfortably ~600 ms.
      materialize lineitem instead of streaming it (q19 ~230 → 320–410 ms).
      Patches in `/home/brj/ibex-parked/`; resume at where the join decides to
      materialize its probe side when the build side is `Filter(Scan)`.
-2. **q12 scaling** (+75 ms): wins on one core (0.75), scales 4.2× against
-   7.5×, the worst in the suite. A pure scaling bug; check `occ`/`ring_wait`
-   (item 7) first. q16 (3.6× against 5.8×) is the same symptom at a smaller size.
-3. **q10** (+74 ms). −23% at 8 cores (`96d974dc`: dictionary-decided string
+   **Landed `49da7a27`:** the consumer decodes units in place of the spare
+   pool thread (q06 kept 7 of 8 cores busy; q01/q04/q06/q12/q14/q15/q19
+   −4 to −7% at 8 cores, local). Per core this family is ~2/3 zstd for both
+   Ibex and Polars, so the 1-core numbers are close to a floor.
+2. **Filter the streamed LEFT scan by a built right side** (q12 first; q10,
+   q14 next). *Found 2026-10-04, design below, not built.*
+
+   *Symptom.* q12 (`orders join lineitem`, lineitem filtered to 311k rows)
+   is 58% occupied warm. The join correctly builds on the small right side,
+   then streams all 15M `orders` rows (key and priority decoded in full)
+   through it; 2.1% match. An 80 ms tail runs on ~1.75 threads plus 103 ms
+   of join self time on the main thread. The only scan filter the inner join
+   publishes is the build-LEFT/filter-RIGHT deferred probe
+   (`deferred_probe_scan_of`); the mirror does not exist. A scratch copy with
+   the operands swapped (which takes that path; sizing only, never landed --
+   the engine owns join order) answers the same and runs **260 → 176 ms
+   (−32%)**; join pool work 131 → 29 ms. On AWS, roughly q12 310 → ~200 ms
+   against Polars 235.
+
+   *Where else* (`IBEX_TRACE_JOIN` probe, SF-10, BuildRight joins streaming a
+   base scan): q12 orders 15M → 2.1%; q10 customer 1.5M → 38% (wide string
+   columns skipped for 62% of rows); q14 part 2M → 37.5%; q07 customer by
+   a 2-row nation build → 8% (cheap columns, small gain). q09/q15/q21 stream
+   at 100%, so the gate below must keep them out. q05's 1.8M → 4% probe goes
+   through another join path (fused probe); check separately. q04 is a semi
+   join, a different operator.
+
+   *Order (2026-10-04, at review):* widen the filter to every reasonable key
+   type first, so this lands as a general mechanism rather than an
+   Int64-only benchmark path. **Stage A** (Date, Timestamp, Bool keys through
+   `join_key_domain`, one definition shared by publisher, `LazyTable` and the
+   Parquet fused scan; TIMESTAMP(NANO) fuses, other units filter after decode)
+   is built. **Stage B** String/Categorical keys (string membership: hash Bloom
+   plus exact set; Parquet dictionary pages tested per entry). **Stage C** this
+   item, gated on "the publisher produced a filter", not on key type. Not
+   covered by design: Decimal (int128), Double. Found on the way: joins inside
+   `rbind(...)` arguments never get a deferred probe, whatever the key type.
+
+   *Design.*
+   - **Slot.** A new `DeferredScan::stream_filter` (`shared_ptr<DynamicScanFilter>`),
+     not `filter`: three sites read `filter == nullptr` as "streaming, not a
+     probe scan". `key_column` is shared. `plan_deferred_scan` uses whichever
+     slot is ready; the per-unit decode already honours `plan.dynamic` plus
+     the key column (`materialize_deferred_scan_unit`), so a streamed unit is
+     key-scanned and decodes the rest selected. Public header: rebuild plugins.
+   - **Lowering.** `ir::streamed_join_scans` (beside `deferrable_probe_scans`,
+     same `match_probe_chain` through Project/Rename) names the LEFT base scan
+     of an inner single-key join when it occurs once and carries **no static
+     conjuncts**. The REPL's streaming-registration loop sets
+     `key_column` and `stream_filter` for it.
+   - **Plan timing.** `PipelinedScanOperator` and `DeferredScanSourceOperator`
+     snapshot `plan_deferred_scan` in their constructors, before the right
+     side exists. Move it to first `next()`. `runtime_entry.cpp` builds the
+     left operator, then materializes the right, then the join, and nothing
+     starts the left before the join pulls it -- verify no stage thread does.
+   - **Publish.** `runtime_entry` passes the left scan's slot to the join. In
+     `ChunkedInnerJoinOperator::initialize`, before draining the left: if
+     `n_right * 2 <= left rows` (exact, since the scan has no conjuncts),
+     `publish_build_filter_column(*right_, right key, slot)`; if that produced
+     a filter, go straight to BuildRight, otherwise drain as today, so a key
+     type with no filter keeps its side choice. With no conjuncts and that row
+     ratio the drain would choose BuildRight anyway, so output order is
+     unchanged. The filter's runtime abandon rule covers a gate that guessed
+     wrong.
+   - **Semantics.** Inner join only; a left row whose key is not in the build
+     can never match, and a null key matches nothing. Membership is exact
+     for a dense key range, a Bloom otherwise; the probe still checks every
+     surviving row.
+   - **Tests.** Lowered-IR test that the left scan is registered (parity
+     cannot see lowering, memory `project_parity_cannot_see_lowering_bugs`); a
+     runtime test that the left scan decoded only matching rows (fail-first);
+     a self-join and a filtered left that must stay unregistered; q12 answer
+     byte-identity, and paired A/B on q12/q10/q14/q07 plus the full suite.
+3. **q12 scaling** (+75 ms) is mostly item 2. q16 (3.6× against 5.8×) is
+   the same symptom at a smaller size; check `occ`/`ring_wait` (item 8) first.
+4. **q10** (+74 ms). −23% at 8 cores (`96d974dc`: dictionary-decided string
    conjuncts with the key scan's rows as candidates), −29% at SF-10 (`546ce652`: no row
    cap on the uniqueness proof when the key is read in full), plus
    `3005a3cf`/`0231282c` (columnar, partitioned generic group keys). Still a
@@ -199,7 +271,7 @@ effect too. Milestone 1 needs ~260 ms, comfortably ~600 ms.
    re-time first), `source decode whole`, and `Aggregate.Emission` appending
    text keys row by row (~10–15 ms at SF-10; bulk-append from
    `GroupKeyStore`).
-4. **The deferred-probe joins: q03, q05, q07, q09** (+224 ms together, all
+5. **The deferred-probe joins: q03, q05, q07, q09** (+224 ms together, all
    winning or tied on one core). Their time is the
    lineitem scan feeding the join (`dynamic key scan`, then `decode
    selected`). Done: selection validation moved into the tasks (`08caeea4`,
@@ -207,35 +279,35 @@ effect too. Milestone 1 needs ~260 ms, comfortably ~600 ms.
    8c / −18% at 1c; teaching note `src/runtime/JOIN_FILTERS.md`). Left: the
    key-scan merge (needs `Selection` not to zero-fill, or consuming the parts
    directly).
-5. **q16 and q13.** q16 −11% at 8c (`4a96588c`: distinct partition sets
+6. **q16 and q13.** q16 −11% at 8c (`4a96588c`: distinct partition sets
    pre-sized from a HyperLogLog); range-compressed packed keys measured a
    further −2 to −5% in a prototype (needs footer bounds through column
    origins and a fixed 16-bit categorical id). q13: 182 ms serial, the
    aggregate row, and the fused non-anchored LIKE scan (66% more CPU than
    dense decode plus a filter; `query-shape-conformance-plan.md` item 1).
-6. **Scale-cliff sweep.** SF 1, 2, 4, 8, 10, 16, 30 at 1 and 16 cores; flag any
+7. **Scale-cliff sweep.** SF 1, 2, 4, 8, 10, 16, 30 at 1 and 16 cores; flag any
    query whose time grows faster than its data between adjacent scales, then
    diff its plan and profile across that step. Fixed thresholds to suspect:
    `kMaxProofRows` (1M), `kDenseCellLimit` (4M cells), the 32 MiB dense
    partial budget in `dense_morsel_count`, `kDefaultPartitionMinRows` /
    `kPackedPartitionMinRows`, the deferred-probe gates.
-7. **Decode width and scan starvation** (q04, q10, q12, q06, q20 show
-   `occ ≈ 0.5, ring_wait ≈ self`; ties into items 1 and 2). Split a single-column decode's row-group
+8. **Decode width and scan starvation** (q04, q10, q12, q06, q20 show
+   `occ ≈ 0.5, ring_wait ≈ self`; ties into items 1 and 3). Split a single-column decode's row-group
    task when there are fewer tasks than workers
    (`query-shape-conformance-plan.md` item 2); row-group size at write time is
    the other lever.
-8. **Canonical-plan audit.** Diff every query's plan with and without its
+9. **Canonical-plan audit.** Diff every query's plan with and without its
    `write_csv(result…)` line and A/B the two, for any pass still tuned to the
    pre-`5c64cfcb` shapes.
-9. **Constants calibrated at 8 cores on the dev box:**
+10. **Constants calibrated at 8 cores on the dev box:**
    `IBEX_DECODE_SATURATION`, `kNestedDecodeFanout` and the
    `num_row_groups() < pool.size()` gate, `parallel_min_rows`,
    `kParallelDecodeMinRows`, per-operator partial-state budgets. Measure first,
-   one constant per A/B, and only once items 1–3 have landed.
-10. **Chunked `let` bindings** (structural, unbuilt): a binding is one
+   one constant per A/B, and only once items 1–4 have landed.
+11. **Chunked `let` bindings** (structural, unbuilt): a binding is one
     contiguous `Table`, so streaming a large intermediate into it pays a serial
     concat. Needs its own design note; overlaps the binding GC work.
-11. **q21: milestone 2.** A win at 8 cores (0.95) and the top loser at 16
+12. **q21: milestone 2.** A win at 8 cores (0.95) and the top loser at 16
     (+149 ms against DuckDB); largest serial term (708 ms on 2026-09-24).
     Rank by `ring_wait`/occupancy, not `pool_work`.
 

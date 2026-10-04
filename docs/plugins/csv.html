@@ -1,1 +1,31 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Ibex | CSV plugin</title><link rel="stylesheet" href="../styles.css"></head><body><main class="page"><nav class="nav"><a class="nav-logo" href="../index.html">Ibex</a><div class="nav-links"><a class="nav-link" href="../docs.html">Docs</a><a class="nav-link" href="../io.html">I/O guide</a></div></nav><section class="hero"><p class="eyebrow">Plugin reference</p><h1>CSV</h1><p class="lead">Read delimited text into typed tables and write DataFrames back to CSV.</p></section><section class="section"><h2>Functions</h2><p><code>csv::read(path, nulls = "", delimiter = ",", has_header = true, schema = "") -&gt; DataFrame</code></p><p>Reads a headered CSV by default and infers integer, float, and string/categorical columns. Use <code>nulls</code> for comma-separated null tokens (<code>&lt;empty&gt;</code> includes empty fields), <code>delimiter</code> for another separator, and <code>has_header = false</code> for generated <code>col1</code>, <code>col2</code> names. A schema hint avoids inference when types are known.</p><p><code>csv::write(df, path) -&gt; Int</code> writes a header and rows, returning the row count.</p><pre><code>import "csv"; let trades = csv::read("trades.csv"); let written = csv::write(trades, "copy.csv");</code></pre><p><a href="../io.html">See options and examples in the complete I/O guide.</a></p></section></main></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ibex | CSV plugin</title>
+  <meta name="description" content="Read and write CSV files with the Ibex CSV plugin." />
+  <link rel="stylesheet" href="../styles.css" />
+  <script src="../code-copy.js" defer></script>
+</head>
+<body><main class="page">
+  <nav class="nav"><a class="nav-logo" href="../index.html">Ibex</a><div class="nav-links"><a class="nav-link" href="../docs.html">Docs</a><a class="nav-link" href="../io.html">I/O guide</a></div></nav>
+  <section class="hero"><p class="eyebrow">Standard plugin · <code>import "csv"</code></p><h1>CSV</h1><p class="lead">Read delimited text into typed tables, control how values are interpreted, and write table results back to disk.</p><div class="cta-row"><a class="button primary" href="../io.html">I/O guide</a></div></section>
+  <section class="section"><p class="section-label">Read</p><h2><code>csv::read</code></h2><p><code>csv::read(path: String, nulls: String = "", delimiter: String = ",", has_header: Bool = true, schema: String = "") -&gt; DataFrame</code></p><p>With default arguments, the first row supplies column names and Ibex infers integer, floating-point, and string/categorical columns. The optional arguments let a script describe common variations without preprocessing the file.</p>
+    <div class="table-wrap"><table class="repl-table"><thead><tr><th>Argument</th><th>Default</th><th>Purpose</th></tr></thead><tbody>
+      <tr><td><code>path</code></td><td>required</td><td>Local path to the CSV file.</td></tr>
+      <tr><td><code>nulls</code></td><td><code>""</code></td><td>Comma-separated tokens to interpret as null. Use <code>&lt;empty&gt;</code> to treat empty fields as null too.</td></tr>
+      <tr><td><code>delimiter</code></td><td><code>","</code></td><td>Single field delimiter, for example <code>";"</code> for semicolon-separated files. Quoted fields are parsed with CSV quoting rules.</td></tr>
+      <tr><td><code>has_header</code></td><td><code>true</code></td><td>When false, generate column names <code>col1</code>, <code>col2</code>, and so on.</td></tr>
+      <tr><td><code>schema</code></td><td><code>""</code></td><td>Optional comma-separated type hints, in file column order. Use this when the schema is known and inference is unnecessary.</td></tr>
+    </tbody></table></div>
+  </section>
+  <section class="section"><p class="section-label">Examples</p><h2>Common read configurations</h2><div class="grid-2"><article class="card"><h3>Null tokens</h3><p>Preserve empty cells by default; explicitly opt into empty-as-null if the source uses blank fields for missing data.</p><pre><code><span class="kw">let</span> data = <span class="fn-name">csv::read</span>(<span class="str">"train.csv"</span>, <span class="str">"&lt;empty&gt;,NA"</span>);</code></pre></article><article class="card"><h3>Headerless, known schema</h3><p>Skip type inference when the input layout is fixed. Headerless columns are named from <code>col1</code>.</p><pre><code><span class="kw">let</span> data = <span class="fn-name">csv::read</span>(<span class="str">"measurements.txt"</span>, <span class="str">""</span>, <span class="str">";"</span>, <span class="kw">false</span>, <span class="str">"cat,f64"</span>);</code></pre></article></div>
+<pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
+
+<span class="kw">let</span> trades = <span class="fn-name">csv::read</span>(<span class="str">"data/trades.csv"</span>);
+trades[<span class="kw">filter</span> qty &gt; <span class="num">0</span>, <span class="kw">select</span> { symbol, qty, price }];</code></pre>
+  </section>
+  <section class="section"><p class="section-label">Write</p><h2><code>csv::write</code></h2><p><code>csv::write(df: DataFrame, path: String) -&gt; Int</code> writes a header followed by the rows of <code>df</code>. It returns the number of rows written.</p><pre><code><span class="kw">let</span> summary = trades[<span class="kw">select</span> { total = <span class="fn-name">sum</span>(qty) }, <span class="kw">by</span> symbol];
+<span class="kw">let</span> rows_written = <span class="fn-name">csv::write</span>(summary, <span class="str">"out/summary.csv"</span>);</code></pre><p>For a complete CSV-to-Parquet batch job and further options, see the <a href="../io.html">I/O guide</a>.</p></section>
+</main></body></html>

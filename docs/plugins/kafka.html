@@ -1,1 +1,25 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Ibex | Kafka plugin</title><link rel="stylesheet" href="../styles.css"></head><body><main class="page"><nav class="nav"><a class="nav-logo" href="../index.html">Ibex</a><div class="nav-links"><a class="nav-link" href="../docs.html">Docs</a><a class="nav-link" href="../io.html">I/O guide</a></div></nav><section class="hero"><p class="eyebrow">Plugin reference</p><h1>Kafka</h1><p class="lead">Consume JSON or Schema Registry framed Avro messages and publish DataFrame rows.</p></section><section class="section"><h2>Functions</h2><p><code>kafka::recv(brokers, topic, group, schema, options = "") -&gt; DataFrame</code> polls for one JSON message and converts it to a typed one-row table.</p><p><code>kafka::recv_avro(brokers, topic, group, schema, registry_url, options = "") -&gt; DataFrame</code> consumes one flat Avro record using its Schema Registry writer schema.</p><p><code>kafka::send(df, brokers, topic, options = "") -&gt; Int</code> publishes each DataFrame row as a JSON message. The schema format is comma-separated <code>name:type</code>, such as <code>ts:timestamp,symbol:str,price:f64</code>. Options are semicolon-separated key/value settings; receive poll timeout and producer flush timeout can be set there.</p><pre><code>import "kafka"; let tick = kafka::recv("localhost:19092", "ticks", "demo", "symbol:str,price:f64");</code></pre><p><a href="../io.html">See runnable broker and dashboard examples in the complete I/O guide.</a></p></section></main></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ibex | Kafka plugin</title>
+  <meta name="description" content="Consume JSON and Avro records and publish table rows with the Ibex Kafka plugin." />
+  <link rel="stylesheet" href="../styles.css" />
+  <script src="../code-copy.js" defer></script>
+</head>
+<body><main class="page">
+  <nav class="nav"><a class="nav-logo" href="../index.html">Ibex</a><div class="nav-links"><a class="nav-link" href="../docs.html">Docs</a><a class="nav-link" href="../io.html">I/O guide</a><a class="nav-link" href="../advanced.html">Streams</a></div></nav>
+  <section class="hero"><p class="eyebrow">Standard plugin · <code>import "kafka"</code></p><h1>Kafka and compatible brokers</h1><p class="lead">Receive JSON or Schema Registry framed Avro records as typed one-row tables, and send DataFrame rows as JSON messages.</p><div class="cta-row"><a class="button primary" href="../io.html">Runnable demos</a><a class="button" href="../advanced.html">Streams guide</a></div></section>
+  <section class="section"><p class="section-label">Receive</p><h2>JSON and Avro records</h2><article class="card"><h3><code>kafka::recv</code></h3><p><code>kafka::recv(brokers, topic, group, schema, options = "") -&gt; DataFrame</code></p><p>Polls for one JSON message and decodes its fields using the schema you provide. The schema is a comma-separated list of <code>name:type</code> pairs, for example <code>ts:timestamp,symbol:str,price:f64,volume:i64</code>.</p></article><article class="card"><h3><code>kafka::recv_avro</code></h3><p><code>kafka::recv_avro(brokers, topic, group, schema, registry_url, options = "") -&gt; DataFrame</code></p><p>Reads one Schema Registry framed Avro message, looks up its writer schema from the registry, and decodes a flat record into the fields and types declared in <code>schema</code>.</p></article><p>Both receive functions return one record as a one-row DataFrame. If no message arrives before the poll timeout, the call reports <code>StreamTimeout</code>; use it from an Ibex stream workflow that handles timeouts.</p></section>
+  <section class="section"><p class="section-label">Send</p><h2><code>kafka::send</code></h2><p><code>kafka::send(df: DataFrame, brokers: String, topic: String, options: String = "") -&gt; Int</code></p><p>Serializes each row of <code>df</code> as one JSON message and publishes it to the topic. The return value is the number of rows sent.</p></section>
+  <section class="section"><p class="section-label">Configuration</p><h2>Options and a basic consumer</h2><p>The optional <code>options</code> string contains semicolon-separated <code>key=value</code> pairs. For example, <code>poll_timeout_ms=200;consumer.auto.offset.reset=earliest</code> sets the receive timeout and a consumer property. Producers can set <code>flush_timeout_ms</code> and producer properties such as compression.</p>
+<pre><code><span class="kw">import</span> <span class="str">"kafka"</span>;
+
+<span class="kw">let</span> tick = <span class="fn-name">kafka::recv</span>(
+    <span class="str">"localhost:19092"</span>, <span class="str">"ticks"</span>, <span class="str">"ibex-demo"</span>,
+    <span class="str">"symbol:str,price:f64,size:i64"</span>,
+    <span class="str">"poll_timeout_ms=1000;consumer.auto.offset.reset=earliest"</span>
+);</code></pre>
+    <p>For broker setup, Schema Registry, full JSON and Avro examples, and the WebSocket dashboard demo, see the <a href="../io.html">Kafka section of the I/O guide</a>.</p></section>
+</main></body></html>

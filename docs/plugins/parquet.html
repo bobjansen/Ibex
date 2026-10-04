@@ -1,1 +1,25 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Ibex | Parquet plugin</title><link rel="stylesheet" href="../styles.css"></head><body><main class="page"><nav class="nav"><a class="nav-logo" href="../index.html">Ibex</a><div class="nav-links"><a class="nav-link" href="../docs.html">Docs</a><a class="nav-link" href="../io.html">I/O guide</a></div></nav><section class="hero"><p class="eyebrow">Plugin reference</p><h1>Parquet</h1><p class="lead">Store typed tables in compact columnar files for efficient reloads and scans.</p></section><section class="section"><h2>Functions</h2><p><code>parquet::read(path: String) -&gt; DataFrame</code> reads supported Parquet types. The bundled backend also accepts HTTP(S) URLs and S3 URIs.</p><p><code>parquet::write(df: DataFrame, path: String) -&gt; Int</code> writes a Parquet file and returns the number of rows written.</p><pre><code>import "parquet"; let prices = parquet::read("prices.parquet"); parquet::write(prices, "prices-copy.parquet");</code></pre><p><a href="../io.html">See remote reads and more examples in the complete I/O guide.</a></p></section></main></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ibex | Parquet plugin</title>
+  <meta name="description" content="Read and write typed Parquet files with Ibex." />
+  <link rel="stylesheet" href="../styles.css" />
+  <script src="../code-copy.js" defer></script>
+</head>
+<body><main class="page">
+  <nav class="nav"><a class="nav-logo" href="../index.html">Ibex</a><div class="nav-links"><a class="nav-link" href="../docs.html">Docs</a><a class="nav-link" href="../io.html">I/O guide</a></div></nav>
+  <section class="hero"><p class="eyebrow">Standard backend · <code>import "parquet"</code></p><h1>Parquet</h1><p class="lead">Read and write typed columnar files for compact storage and efficient reloads. The standard hosts link the bundled backend directly.</p><div class="cta-row"><a class="button primary" href="../io.html">I/O guide</a></div></section>
+  <section class="section"><p class="section-label">Functions</p><h2>Read and write Parquet</h2><article class="card"><h3><code>parquet::read</code></h3><p><code>parquet::read(path: String) -&gt; DataFrame</code></p><p>Reads a Parquet file into a DataFrame, preserving supported column types. In addition to local files, the bundled backend supports HTTP(S) locations and S3 URIs.</p></article><article class="card"><h3><code>parquet::write</code></h3><p><code>parquet::write(df: DataFrame, path: String) -&gt; Int</code></p><p>Writes the DataFrame to a Parquet file and returns the number of rows written. Use this return value to record the result of a batch conversion.</p></article></section>
+  <section class="section"><p class="section-label">Examples</p><h2>Local and remote reads</h2>
+<pre><code><span class="kw">import</span> <span class="str">"parquet"</span>;
+
+<span class="kw">let</span> local_prices = <span class="fn-name">parquet::read</span>(<span class="str">"data/prices.parquet"</span>);
+<span class="kw">let</span> public_prices = <span class="fn-name">parquet::read</span>(<span class="str">"https://data.example.com/prices.parquet"</span>);
+<span class="kw">let</span> cloud_prices = <span class="fn-name">parquet::read</span>(<span class="str">"s3://market-data/prices.parquet?region=us-east-1"</span>);</code></pre>
+    <h3>Write a query result</h3><p>Parquet works well as an output for computed tables that will be read again later.</p>
+<pre><code><span class="kw">let</span> daily = local_prices[<span class="kw">select</span> { average = <span class="fn-name">mean</span>(price) }, <span class="kw">by</span> symbol];
+<span class="kw">let</span> rows_written = <span class="fn-name">parquet::write</span>(daily, <span class="str">"out/daily.parquet"</span>);</code></pre>
+    <p>For a directory conversion using <code>fs::list</code>, see the <a href="./fs.html">filesystem reference</a> and the <a href="../io.html">I/O guide</a>.</p></section>
+</main></body></html>

@@ -1,1 +1,84 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Ibex | Filesystem plugin</title><link rel="stylesheet" href="../styles.css"></head><body><main class="page"><nav class="nav"><a class="nav-logo" href="../index.html">Ibex</a><div class="nav-links"><a class="nav-link" href="../docs.html">Docs</a><a class="nav-link" href="../io.html">I/O guide</a></div></nav><section class="hero"><p class="eyebrow">Plugin reference</p><h1>Filesystem</h1><p class="lead">Enumerate files as a DataFrame, then use ordinary Ibex clauses and row-wise <code>map</code> to build file jobs.</p></section><section class="section"><h2><code>fs::list</code></h2><p><code>fs::list(dir: String, pattern: String = "*", recursive: Bool = false) -&gt; DataFrame</code></p><p>Returns one row per matching directory entry, sorted by path. The fixed columns are <code>path</code>, <code>name</code>, <code>stem</code>, <code>ext</code>, <code>size_bytes</code>, and <code>is_dir</code>. <code>stem</code> is the filename without its final extension; <code>ext</code> is that extension. The pattern is a shell glob (<code>*</code>, <code>?</code>, <code>[set]</code>) matched against the entry name. Set <code>recursive</code> to true to include descendants.</p><pre><code>import "fs"; let files = fs::list("data/csv", "*.csv"); files[select { path, stem, ext, size_bytes, is_dir }];</code></pre><h2>Use entries as a batch job</h2><p>Inside <code>map</code>, each input row exposes entry columns as scalar values. Here <code>stem</code> keeps each output name aligned with its source.</p><pre><code>import "csv"; import "fs"; import "parquet"; fs::list("data/csv", "*.csv")[map { source = path, target = `data/parquet/${stem}.parquet`, rows = parquet::write(csv::read(path), `data/parquet/${stem}.parquet`) }];</code></pre><p><a href="../io.html">See the complete I/O guide.</a></p></section></main></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ibex | Filesystem plugin</title>
+  <meta name="description" content="Reference for fs::list: directory enumeration, glob patterns, result columns, and row-wise file jobs." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&amp;family=JetBrains+Mono:wght@400;600&amp;display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="../styles.css" />
+  <script src="../code-copy.js" defer></script>
+</head>
+<body>
+<main class="page">
+  <nav class="nav">
+    <a class="nav-logo" href="../index.html">Ibex</a>
+    <div class="nav-links">
+      <a class="nav-link" href="../docs.html">Docs</a>
+      <a class="nav-link" href="../io.html">I/O guide</a>
+      <a class="nav-link" href="../reference.html">Reference</a>
+    </div>
+  </nav>
+
+  <section class="hero">
+    <p class="eyebrow">Standard plugin · <code>import "fs"</code></p>
+    <h1>Filesystem</h1>
+    <p class="lead">List directory entries as an ordinary table, then use Ibex filters and row-wise <code>map</code> to build repeatable file jobs.</p>
+    <div class="cta-row"><a class="button primary" href="../io.html">I/O guide</a><a class="button" href="../examples.html">Examples</a></div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Function</p>
+    <h2><code>fs::list</code></h2>
+    <p><code>fs::list(dir: String, pattern: String = "*", recursive: Bool = false) -&gt; DataFrame</code></p>
+    <p>Returns one row for each matching entry under <code>dir</code>, ordered by its path. The directory must exist. A path that is missing or is not a directory raises a runtime error.</p>
+    <div class="table-wrap"><table class="repl-table"><thead><tr><th>Column</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+      <tr><td><code>path</code></td><td>String</td><td>Path to the entry, with forward slashes in the returned representation.</td></tr>
+      <tr><td><code>name</code></td><td>String</td><td>Entry filename, including its final extension.</td></tr>
+      <tr><td><code>stem</code></td><td>String</td><td>Filename without its final extension. For <code>prices.daily.csv</code>, the stem is <code>prices.daily</code>.</td></tr>
+      <tr><td><code>ext</code></td><td>String</td><td>Final extension without the dot; empty when the filename has no extension.</td></tr>
+      <tr><td><code>size_bytes</code></td><td>Int64</td><td>File size in bytes. Directories report zero.</td></tr>
+      <tr><td><code>is_dir</code></td><td>Bool</td><td>Whether the entry is a directory.</td></tr>
+    </tbody></table></div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Arguments</p>
+    <h2>Choose which entries to return</h2>
+    <div class="grid-2">
+      <article class="card"><h3><code>dir</code></h3><p>Required directory to enumerate. The listing is non-recursive unless the third argument is true.</p></article>
+      <article class="card"><h3><code>pattern</code></h3><p>Optional shell-style glob matched against each entry’s filename only. Defaults to <code>*</code>, which matches all names at that level.</p></article>
+      <article class="card"><h3><code>recursive</code></h3><p>Optional Boolean. When true, include entries in descendant directories. Matching still applies to each entry’s name.</p></article>
+      <article class="card"><h3>Supported glob syntax</h3><p><code>*</code> matches any run of characters, <code>?</code> matches one character, and bracket classes such as <code>[abc]</code> or <code>[a-z]</code> match one character in a set or range.</p></article>
+    </div>
+<pre><code><span class="kw">import</span> <span class="str">"fs"</span>;
+
+<span class="kw">let</span> files = <span class="fn-name">fs::list</span>(<span class="str">"data"</span>, <span class="str">"*.csv"</span>, <span class="kw">true</span>);
+files[<span class="kw">filter</span> !is_dir, <span class="kw">select</span> { path, stem, ext, size_bytes }];</code></pre>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Batch processing</p>
+    <h2>Use the listing as a file job table</h2>
+    <p>Each row of <code>fs::list</code> can feed a row-wise <code>map</code>. Within the block, <code>path</code>, <code>stem</code>, and the other fields are scalar values for that entry. The fields returned by the block form a result row, so the output table can record both the source and the work performed.</p>
+<pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
+<span class="kw">import</span> <span class="str">"fs"</span>;
+<span class="kw">import</span> <span class="str">"parquet"</span>;
+
+<span class="fn-name">fs::list</span>(<span class="str">"data/csv"</span>, <span class="str">"*.csv"</span>)[<span class="kw">map</span> {
+    source = path,
+    target = <span class="str">`data/parquet/${stem}.parquet`</span>,
+    rows = <span class="fn-name">parquet::write</span>(
+        <span class="fn-name">csv::read</span>(path),
+        <span class="str">`data/parquet/${stem}.parquet`</span>
+    )
+}];</code></pre>
+    <p>For an input named <code>sales.csv</code>, <code>stem</code> is <code>sales</code>, so the target becomes <code>data/parquet/sales.parquet</code>. <code>parquet::write</code> returns the row count, which becomes the <code>rows</code> value in that job’s result.</p>
+  </section>
+
+  <section class="section"><p class="section-label">Related docs</p><h2>Continue</h2><p>See <a href="../io.html">the I/O guide</a> for the full CSV-to-Parquet example, and <a href="../language.html">the language guide</a> for table clauses and <code>map</code>.</p></section>
+</main>
+</body>
+</html>

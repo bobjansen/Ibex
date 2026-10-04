@@ -2655,9 +2655,9 @@ class ChunkedInnerJoinOperator final : public Operator {
         return bitmap;
     }
 
-    /// Publish a filter over `key_name`'s valid values, read as
-    /// `join_key_domain` integers. A key type with no integer domain
-    /// publishes nothing.
+    /// Publish a filter over `key_name`'s valid values: `join_key_domain`
+    /// integers, or an exact string set for a String or Categorical key. Any
+    /// other key type publishes nothing.
     static void publish_build_filter_column(const Table& build, const std::string& key_name,
                                             DynamicScanFilter& slot) {
         const auto* entry = build.find_entry(key_name);
@@ -2680,9 +2680,58 @@ class ChunkedInnerJoinOperator final : public Operator {
                     publish_build_filter_keys(
                         [data](std::size_t r) { return join_key_domain(data[r]); }, col.size(),
                         validity, slot);
+                } else if constexpr (std::is_same_v<C, Column<std::string>>) {
+                    publish_build_filter_strings(col, validity, slot);
+                } else if constexpr (std::is_same_v<C, Column<Categorical>>) {
+                    publish_build_filter_categories(col, validity, slot);
                 }
             },
             *entry->column);
+    }
+
+    /// The distinct valid strings of a String build key, as an exact set.
+    static void publish_build_filter_strings(const Column<std::string>& col,
+                                             const ValidityBitmap* validity,
+                                             DynamicScanFilter& slot) {
+        robin_hood::unordered_flat_set<std::string_view> seen;
+        std::vector<std::string> distinct;
+        for (std::size_t r = 0; r < col.size(); ++r) {
+            if (validity != nullptr && !(*validity)[r]) {
+                continue;
+            }
+            const std::string_view key = col[r];
+            if (seen.insert(key).second) {
+                distinct.emplace_back(key);
+            }
+        }
+        if (!distinct.empty()) {
+            slot.strings = std::make_shared<const StringKeySet>(std::move(distinct));
+        }
+    }
+
+    /// The dictionary entries a Categorical build key actually uses, as an
+    /// exact set: one pass over the codes, then one string per used entry.
+    static void publish_build_filter_categories(const Column<Categorical>& col,
+                                                const ValidityBitmap* validity,
+                                                DynamicScanFilter& slot) {
+        const auto& dictionary = col.dictionary();
+        std::vector<std::uint8_t> used(dictionary.size(), 0U);
+        const auto* codes = col.codes_data();
+        for (std::size_t r = 0; r < col.size(); ++r) {
+            if (validity != nullptr && !(*validity)[r]) {
+                continue;
+            }
+            used[static_cast<std::size_t>(codes[r])] = 1U;
+        }
+        std::vector<std::string> distinct;
+        for (std::size_t code = 0; code < dictionary.size(); ++code) {
+            if (used[code] != 0U) {
+                distinct.push_back(dictionary[code]);
+            }
+        }
+        if (!distinct.empty()) {
+            slot.strings = std::make_shared<const StringKeySet>(std::move(distinct));
+        }
     }
 
     template <typename KeyAt>

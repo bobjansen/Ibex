@@ -16430,9 +16430,10 @@ TEST_CASE("Deferred probe resolving below the stream threshold preserves its dra
     CHECK_FALSE(mismatch.has_value());
 }
 
-// A deferred probe over a Date, Timestamp or Bool key publishes the same
-// membership filter an Int64 key does (`join_key_domain`), so the probe scan
-// decodes its payload only for rows that can match.
+// A deferred probe over a Date, Timestamp, Bool, String or Categorical key
+// publishes a membership filter as an Int64 key does (`join_key_domain`, or a
+// `StringKeySet`), so the probe scan decodes its payload only for rows that can
+// match.
 template <typename T, typename MakeKey>
 void check_deferred_probe_filters_key_type(MakeKey make_key, std::size_t build_keys,
                                            std::size_t expected_matches) {
@@ -16514,7 +16515,7 @@ void check_deferred_probe_filters_key_type(MakeKey make_key, std::size_t build_k
     CHECK(*payload_rows == expected_matches);
 }
 
-TEST_CASE("Deferred probe filters Date, Timestamp and Bool keys like Int64 ones",
+TEST_CASE("Deferred probe filters Date, Timestamp, Bool, String and Categorical keys",
           "[runtime][join][deferred_probe]") {
     // Probe keys cycle through 1000 values over 70,000 rows; the build side
     // holds ten of them (Bool: only `true`, one probe row in a hundred).
@@ -16530,6 +16531,14 @@ TEST_CASE("Deferred probe filters Date, Timestamp and Bool keys like Int64 ones"
     SECTION("Bool") {
         check_deferred_probe_filters_key_type<bool>([](std::size_t i) { return i % 100 == 0; }, 1,
                                                     700);
+    }
+    SECTION("String") {
+        check_deferred_probe_filters_key_type<std::string>(
+            [](std::size_t i) { return "key-" + std::to_string(i); }, 10, 700);
+    }
+    SECTION("Categorical") {
+        check_deferred_probe_filters_key_type<Categorical>(
+            [](std::size_t i) { return "key-" + std::to_string(i); }, 10, 700);
     }
 }
 

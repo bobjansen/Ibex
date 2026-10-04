@@ -1797,10 +1797,12 @@ class ChunkedInnerJoinOperator final : public Operator {
                              const ExecutionContext& exec, ir::JoinSuffixPolicy suffix = {},
                              const std::vector<ir::OrderKey>* pending_order = nullptr,
                              physical::JoinParallelism par = {},
-                             std::optional<ir::JoinColumnMapping> columns = std::nullopt)
+                             std::optional<ir::JoinColumnMapping> columns = std::nullopt,
+                             const DeferredScan* left_stream = nullptr)
         : left_(std::move(left)),
           right_(std::make_shared<Table>(std::move(right))),
           keys_(keys),
+          left_stream_(left_stream),
           par_(par),
           pending_order_(pending_order) {
         bind_probe(keys, std::move(suffix), exec, std::move(columns));
@@ -1983,6 +1985,18 @@ class ChunkedInnerJoinOperator final : public Operator {
 
         const std::size_t n_right = right_->rows();
 
+        // A streamed left scan with a slot: hand it this side's keys before a
+        // single left row is pulled, so it decodes only rows that can match.
+        // Published, the filter settles the orientation as well -- build here
+        // -- with no drain of the left, which the scan's exact row count (it
+        // has no static filter: `ir::streamed_join_left_scans`) shows would
+        // have chosen the same.
+        if (left_stream_ != nullptr && publish_left_stream_filter(right_key_name, n_right)) {
+            return adopt_build(build_join_side(*right_, right_key_name, key_kind,
+                                               JoinOrientation::BuildRight,
+                                               build_partitions(n_right)));
+        }
+
         // Small right: index it without ever measuring the left, which is the
         // one orientation this join can choose without draining a child.
         if (n_right <= kStreamRightThreshold) {
@@ -2077,6 +2091,20 @@ class ChunkedInnerJoinOperator final : public Operator {
                                                    right_key_name, key_kind, order_pays,
                                                    build_partitions(std::min(n_left, n_right)));
         return adopt_build(std::move(outcome), std::move(left_table));
+    }
+
+    /// Fill the streamed left scan's slot from the built right side's keys, when
+    /// the right is at most half the left: the bigger the right, the less a
+    /// filter rejects, and the runtime abandon rule catches the rest. Marks the
+    /// slot ready either way; true when a membership filter was published.
+    auto publish_left_stream_filter(const std::string& right_key_name, std::size_t n_right)
+        -> bool {
+        DynamicScanFilter& slot = *left_stream_->stream_filter;
+        if (n_right * 2 <= left_stream_->lazy->rows()) {
+            publish_build_filter_column(*right_, right_key_name, slot);
+        }
+        slot.ready = true;
+        return slot.has_membership();
     }
 
     /// How many partitions this join's hash build may fill concurrently, or 1
@@ -2876,6 +2904,9 @@ class ChunkedInnerJoinOperator final : public Operator {
     const ScalarRegistry* deferred_scalars_ = nullptr;
     const ExternRegistry* deferred_externs_ = nullptr;
     const ExecutionContext* deferred_exec_ = nullptr;
+    /// The streamed scan under `left_` carrying a `stream_filter` slot this
+    /// join fills from its built right side; null when there is none.
+    const DeferredScan* left_stream_ = nullptr;
     bool initialized_ = false;
     Mode mode_ = Mode::Stream;
 
@@ -2976,6 +3007,16 @@ auto deferred_probe_scan_of(const ir::Node& right, const ExecutionContext& exec)
     return deferred_probe_scan_impl(right, exec);
 }
 
+auto streamed_left_scan_of(const ir::Node& left, const ExecutionContext& exec)
+    -> const DeferredScan* {
+    const auto* scan_node = base_scan_of(left);
+    if (scan_node == nullptr) {
+        return nullptr;
+    }
+    const auto* scan = exec.deferred_scan(scan_node->source_name());
+    return scan != nullptr && scan->stream_filter != nullptr ? scan : nullptr;
+}
+
 auto make_chunked_inner_join_operator(OperatorPtr left, Table right,
                                       const std::vector<ir::JoinKey>* keys,
                                       const ExecutionContext& exec, ir::JoinSuffixPolicy suffix,
@@ -3011,10 +3052,11 @@ auto make_scheduled_chunked_inner_join_operator(
     OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys,
     const ExecutionContext& exec, ir::JoinSuffixPolicy suffix,
     const std::vector<ir::OrderKey>* pending_order, physical::JoinParallelism parallelism,
-    std::optional<ir::JoinColumnMapping> columns) -> std::expected<OperatorPtr, std::string> {
+    std::optional<ir::JoinColumnMapping> columns, const DeferredScan* left_stream)
+    -> std::expected<OperatorPtr, std::string> {
     return finish_scheduled_join(std::make_unique<ChunkedInnerJoinOperator>(
         std::move(left), std::move(right), keys, exec, std::move(suffix), pending_order,
-        parallelism, std::move(columns)));
+        parallelism, std::move(columns), left_stream));
 }
 
 auto make_scheduled_deferred_inner_join_operator(

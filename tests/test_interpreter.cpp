@@ -16653,6 +16653,140 @@ TEST_CASE("A join under a node the plan does not migrate keeps its deferred prob
     CHECK(m[0] == Catch::Approx(34504.5));
 }
 
+/// A streamed source of 8 units x 1000 rows, key `row % 500`, with a fused key
+/// scan that hands back the passing keys. Records how many payload rows it
+/// decoded and whether a decode ever asked for the key again.
+struct StreamLeftState {
+    std::atomic<std::size_t> payload_rows{0};
+    std::atomic<int> key_decodes{0};
+};
+
+class StreamLeftReader final : public runtime::LazySourceReader {
+   public:
+    static constexpr std::size_t kUnits = 8;
+    static constexpr std::size_t kUnitRows = 1000;
+
+    explicit StreamLeftReader(std::shared_ptr<StreamLeftState> state) : state_(std::move(state)) {}
+
+    auto decode_units() -> std::vector<runtime::SourceUnit> override {
+        std::vector<runtime::SourceUnit> units;
+        for (std::size_t u = 0; u < kUnits; ++u) {
+            units.push_back({.start = u * kUnitRows, .rows = kUnitRows});
+        }
+        return units;
+    }
+
+    auto decode(const std::vector<std::string>& names, const runtime::Selection* selection,
+                const runtime::SourceUnit* unit, const runtime::ExecutionContext&)
+        -> std::expected<runtime::Table, std::string> override {
+        const runtime::SourceUnit whole{.start = 0, .rows = kUnits * kUnitRows};
+        const runtime::SourceUnit& range = unit == nullptr ? whole : *unit;
+        std::vector<std::size_t> rows;
+        for (std::size_t row = range.start; row < range.start + range.rows; ++row) {
+            if (selection == nullptr || std::ranges::binary_search(*selection, row)) {
+                rows.push_back(row);
+            }
+        }
+        runtime::Table out;
+        for (const auto& name : names) {
+            std::vector<std::int64_t> values;
+            values.reserve(rows.size());
+            for (const std::size_t row : rows) {
+                values.push_back(name == "k" ? static_cast<std::int64_t>(row % 500)
+                                             : static_cast<std::int64_t>(row));
+            }
+            if (name == "k") {
+                state_->key_decodes.fetch_add(1);
+            } else {
+                state_->payload_rows.fetch_add(rows.size());
+            }
+            out.add_column(name, Column<std::int64_t>{std::move(values)});
+        }
+        out.logical_rows = rows.size();
+        return out;
+    }
+
+    auto key_filter_scan(const std::string& /*key*/, const runtime::DynamicScanFilter& filter,
+                         const runtime::SourceUnit* unit, const runtime::ExecutionContext&,
+                         std::vector<std::int64_t>* values)
+        -> std::expected<std::optional<runtime::Selection>, std::string> override {
+        const runtime::SourceUnit whole{.start = 0, .rows = kUnits * kUnitRows};
+        const runtime::SourceUnit& range = unit == nullptr ? whole : *unit;
+        runtime::Selection selected;
+        for (std::size_t row = range.start; row < range.start + range.rows; ++row) {
+            const auto key = static_cast<std::int64_t>(row % 500);
+            if (filter.passes(key)) {
+                selected.push_back(row);
+                if (values != nullptr) {
+                    values->push_back(key);
+                }
+            }
+        }
+        return std::optional{std::move(selected)};
+    }
+
+   private:
+    std::shared_ptr<StreamLeftState> state_;
+};
+
+TEST_CASE("A streamed left input is filtered by the join's built right side",
+          "[runtime][join][stream_filter]") {
+    // The join builds on its small right side (keys 0..9) and fills the left
+    // scan's slot before pulling a left row, so the left decodes only rows
+    // that can match: 8000 rows, key row % 500, so 160 of them.
+    runtime::Table right;
+    right.add_column("k", Column<std::int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9});
+    right.add_column("tag", Column<std::int64_t>{0, 10, 20, 30, 40, 50, 60, 70, 80, 90});
+    runtime::TableRegistry registry;
+    registry.emplace("right_t", std::move(right));
+    auto ir = require_ir("left_t join right_t on k;");
+
+    const auto run = [&](bool with_slot, std::size_t threads) {
+        auto state = std::make_shared<StreamLeftState>();
+        runtime::Table schema;
+        schema.add_column("k", Column<std::int64_t>{});
+        schema.add_column("payload", Column<std::int64_t>{});
+        auto lazy = std::make_shared<runtime::LazyTable>(
+            std::move(schema), StreamLeftReader::kUnits * StreamLeftReader::kUnitRows,
+            [state]() -> std::expected<runtime::LazySourceReaderPtr, std::string> {
+                return runtime::LazySourceReaderPtr{std::make_unique<StreamLeftReader>(state)};
+            });
+        auto slot = with_slot ? std::make_shared<runtime::DynamicScanFilter>() : nullptr;
+        runtime::DeferredScanRegistry deferred;
+        deferred.emplace("left_t", runtime::DeferredScan{
+                                       .lazy = std::move(lazy),
+                                       .conjuncts = {},
+                                       .demand = {"k", "payload"},
+                                       .demand_all = false,
+                                       .key_column = with_slot ? "k" : "",
+                                       .filter = nullptr,
+                                       .stream_filter = slot,
+                                   });
+        runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+        exec.parallel_threads = threads;
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        return std::tuple{std::move(*out), state, slot};
+    };
+
+    for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+        CAPTURE(threads);
+        auto [filtered, state, slot] = run(true, threads);
+        auto [unfiltered, plain_state, no_slot] = run(false, threads);
+        REQUIRE(slot != nullptr);
+        CHECK(slot->ready);
+        CHECK(slot->has_membership());
+        CHECK(state->payload_rows.load() == 160);
+        // The key came from the scan, never decoded a second time.
+        CHECK(state->key_decodes.load() == 0);
+        CHECK(plain_state->payload_rows.load() == 8000);
+        // Same rows in the same order: the join built on the right either way.
+        REQUIRE(filtered.rows() == 160);
+        const auto mismatch = runtime::compare_tables(unfiltered, filtered);
+        CHECK_FALSE(mismatch.has_value());
+    }
+}
+
 TEST_CASE("Inner join probe fans out across workers and matches the serial probe",
           "[runtime][parallel][join]") {
     // Above the parallel probe's 1<<14 row gate so the fan-out actually

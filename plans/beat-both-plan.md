@@ -193,7 +193,13 @@ effect too. Milestone 1 needs ~260 ms, comfortably ~600 ms.
    −4 to −7% at 8 cores, local). Per core this family is ~2/3 zstd for both
    Ibex and Polars, so the 1-core numbers are close to a floor.
 2. **Filter the streamed LEFT scan by a built right side** (q12 first; q10,
-   q14 next). *Found 2026-10-04, design below, not built.*
+   q14 next). **Built 2026-10-04** after the widening (Stages A/B below):
+   q12 −35% at 8 cores SF-10 (11/11 pairs, local), all 22 answers
+   byte-identical; it also fires on q10 (customer 1.5M → 427k rows) and q14
+   (part 2M → 625k), whose costs are elsewhere, so those move ~1%. Taking the
+   passing key values from the key scan instead of decoding the key again was
+   worth −8.4% on q12 by itself. Rest of the suite: noise (q22 +2.8%, no
+   change in its plan: layout).
 
    *Symptom.* q12 (`orders join lineitem`, lineitem filtered to 311k rows)
    is 58% occupied warm. The join correctly builds on the small right side,

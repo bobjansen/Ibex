@@ -690,6 +690,15 @@ struct DeferredScan {
     bool demand_all = false;
     std::string key_column;  ///< join key in the scan's own column names
     std::shared_ptr<DynamicScanFilter> filter;
+    /// A streamed scan that is the LEFT input of an inner join carries a slot
+    /// here (and `key_column`), into which the join publishes its built right
+    /// side's keys before pulling a single left row. Separate from `filter`,
+    /// whose absence is what marks a scan as streamed rather than a deferred
+    /// probe whose decode the join owns. The explicit {} keeps the many
+    /// registrations that predate it silent under
+    /// -Wmissing-designated-field-initializers.
+    // NOLINTNEXTLINE(readability-redundant-member-init)
+    std::shared_ptr<DynamicScanFilter> stream_filter{};
 };
 
 /// A range of source rows a reader can decode without touching the rest.

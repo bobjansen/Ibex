@@ -457,6 +457,48 @@ TEST_CASE("deferrable_probe_scans: joins the streaming path declines are not def
     }
 }
 
+TEST_CASE("streamed_join_left_scans: the left scan of a single-key inner join",
+          "[ir][scan_predicates][deferred_scan]") {
+    auto plan =
+        inner_join(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"), make_scan("small"), "id");
+    auto left = ir::streamed_join_left_scans(*plan, {"t", "small"});
+    REQUIRE(left.contains("t"));
+    CHECK(left.at("t") == "id");
+    CHECK_FALSE(left.contains("small"));  // the right side is the deferred probe's business
+
+    // A scan read twice cannot take one join's filter.
+    auto twice = inner_join(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"),
+                            std::make_unique<ir::ScanNode>(ir::NodeId{3}, "t"), "id");
+    CHECK(ir::streamed_join_left_scans(*twice, {"t"}).empty());
+
+    // Two keys, or an outer kind: the runtime fills the slot only from its
+    // single-key inner join.
+    auto two_keys = std::make_unique<ir::JoinNode>(
+        ir::NodeId{20}, ir::JoinKind::Inner,
+        std::vector<ir::JoinKey>{ir::JoinKey{"id"}, ir::JoinKey{"id2"}});
+    two_keys->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
+    two_keys->add_child(make_scan("small"));
+    CHECK(ir::streamed_join_left_scans(*two_keys, {"t"}).empty());
+    auto left_join = std::make_unique<ir::JoinNode>(ir::NodeId{20}, ir::JoinKind::Left,
+                                                    std::vector<ir::JoinKey>{ir::JoinKey{"id"}});
+    left_join->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
+    left_join->add_child(make_scan("small"));
+    CHECK(ir::streamed_join_left_scans(*left_join, {"t"}).empty());
+
+    // A Filter between the scan and the join: dropping rows at the scan would
+    // not commute with it, exactly as for a probe.
+    ir::Expr predicate{
+        .node = ir::CompareExpr{
+            .op = ir::CompareOp::Gt,
+            .left = col("id"),
+            .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{0}}})}};
+    auto filtered =
+        inner_join(with_child(std::make_unique<ir::FilterNode>(ir::NodeId{4}, std::move(predicate)),
+                              std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t")),
+                   make_scan("small"), "id");
+    CHECK(ir::streamed_join_left_scans(*filtered, {"t"}).empty());
+}
+
 TEST_CASE("deferrable_probe_scans: an unfiltered build side is declined",
           "[ir][scan_predicates][deferred_scan]") {
     // The row-count gate alone says yes -- 1.5M build rows against 12M probe

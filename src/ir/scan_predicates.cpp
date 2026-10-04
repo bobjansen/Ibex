@@ -718,6 +718,39 @@ auto deferrable_probe_scans(const Node& root, const std::set<std::string>& sourc
     return out;
 }
 
+auto streamed_join_left_scans(const Node& root, const std::set<std::string>& sources)
+    -> std::map<std::string, std::string> {
+    std::map<std::string, std::string> out;
+    if (sources.empty()) {
+        return out;
+    }
+    std::map<std::string, std::size_t> counts;
+    count_scan_occurrences(root, counts);
+    const auto walk = [&](const Node& node, const auto& self) -> void {
+        if (node.kind() == NodeKind::Join) {
+            const auto& join = node_cast<JoinNode>(node);
+            // The same shape a deferred probe needs, with one key: the runtime
+            // fills the slot only from its streaming single-key inner join.
+            if (is_probe_shaped_join(join) && join.keys().size() == 1) {
+                if (auto match = match_probe_chain(*join.children()[0], join.keys().front().left);
+                    match.has_value() && sources.contains(match->first)) {
+                    if (const auto count = counts.find(match->first);
+                        count != counts.end() && count->second == 1) {
+                        out.emplace(match->first, std::move(match->second));
+                    }
+                }
+            }
+        }
+        for (const auto& child : node.children()) {
+            if (child != nullptr) {
+                self(*child, self);
+            }
+        }
+    };
+    walk(root, walk);
+    return out;
+}
+
 auto remove_applied_scan_filters(NodePtr root, const std::set<std::string>& applied_sources)
     -> NodePtr {
     if (root == nullptr || applied_sources.empty()) {

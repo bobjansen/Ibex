@@ -29,8 +29,10 @@
 #   --profile            no timing suite: run breaker_map.py and profile_suite.py
 #                        per --cores count (Ibex only), to rank serial and idle
 #                        time on physical cores. The output is in results/profile/.
-#   --no-polars-in-memory  drop the whole-table Polars passes (they OOM at high
-#                        SF) and run the streaming reference instead
+#   --polars-in-memory   also run Polars' in-memory executor (whole tables; it
+#                        OOMs at high SF). The reference is Polars streaming,
+#                        always; see run_bench.sh. --no-polars-in-memory is
+#                        accepted for old command lines and is the default
 #   --warmup N / --iters N / --key KEY / --region R / --on-demand
 #
 # Usage:
@@ -38,7 +40,7 @@
 #   ./benchmarking/aws/run-tpch.sh --on-demand --type r7i.8xlarge \
 #       --sf 1,8,30,100 --threads-per-core 1 --volume-size 400
 #   ./benchmarking/aws/run-tpch.sh --on-demand --type r7i.8xlarge --sf 8 \
-#       --threads-per-core 1 --cores 2,4,8,12,16 --no-polars-in-memory
+#       --threads-per-core 1 --cores 2,4,8,12,16
 
 set -euo pipefail
 
@@ -62,7 +64,7 @@ ON_DEMAND=0
 CORES=""
 THREADS_PER_CORE=""
 VOLUME_SIZE=250
-POLARS_IN_MEMORY=1
+POLARS_IN_MEMORY=0
 PROFILE=0
 
 while [[ $# -gt 0 ]]; do
@@ -74,6 +76,7 @@ while [[ $# -gt 0 ]]; do
         --cores) CORES="$2"; shift 2 ;;
         --threads-per-core) THREADS_PER_CORE="$2"; shift 2 ;;
         --volume-size) VOLUME_SIZE="$2"; shift 2 ;;
+        --polars-in-memory) POLARS_IN_MEMORY=1; shift ;;
         --no-polars-in-memory) POLARS_IN_MEMORY=0; shift ;;
         --profile) PROFILE=1; shift ;;
         --key) KEY_NAME="$2"; shift 2 ;;

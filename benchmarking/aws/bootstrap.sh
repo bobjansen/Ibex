@@ -827,10 +827,11 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
         # unpinned".
         TPCH_ARGS=(--sf "$scale" --warmup "${IBEX_WARMUP:-1}" --iters "${IBEX_ITERS:-5}"
                    --pdsh-root "$PDSH_ROOT")
-        # The in-memory Polars executor materialises whole tables and OOMs the
-        # box at high scale factors; the streaming pass still gives a reference.
-        if [[ "${IBEX_TPCH_POLARS_IN_MEMORY:-1}" == "0" ]]; then
-            TPCH_ARGS+=(--no-polars-in-memory --polars-streaming)
+        # Polars streaming is the reference (run_bench.sh's default). The
+        # in-memory executor is an opt-in extra column: it materialises whole
+        # tables and OOMs the box at high scale factors.
+        if [[ "${IBEX_TPCH_POLARS_IN_MEMORY:-0}" == "1" ]]; then
+            TPCH_ARGS+=(--polars-in-memory)
         fi
         # IBEX_TPCH_CORES may be a list (2,4,8,16): one full run per count on
         # this box -- a scaling curve whose points share the hardware, each with

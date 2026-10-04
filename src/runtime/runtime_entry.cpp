@@ -206,7 +206,9 @@ auto materialize_row_local(const ir::Node& node, const TableRegistry& registry,
 //
 // This allowlist matters. A first cut that also pre-built `Window`'s direct
 // child and `Stream`'s template failed 51 tests, because each of those was then
-// evaluated on its own.
+// evaluated on its own. Leaving a kind off costs the other way: `Rbind` was
+// missing, so a join under it ran `interpret_node`'s materializing join and a
+// deferred probe scan beneath it decoded every row.
 auto fallback_relational_inputs(const ir::Node& node) -> std::vector<const ir::Node*> {
     std::vector<const ir::Node*> inputs;
     switch (node.kind()) {
@@ -222,6 +224,7 @@ auto fallback_relational_inputs(const ir::Node& node) -> std::vector<const ir::N
         case ir::NodeKind::AsTimeframe:
         case ir::NodeKind::Update:
         case ir::NodeKind::Join:
+        case ir::NodeKind::Rbind:
             inputs.reserve(node.children().size());
             for (const auto& child : node.children()) {
                 inputs.push_back(child.get());

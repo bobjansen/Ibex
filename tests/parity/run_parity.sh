@@ -91,6 +91,10 @@ IBEX_LIBS=(
 
 TMPDIR_WORK="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR_WORK"' EXIT
+# Each case's binary is deleted as soon as it has run. A debug binary statically
+# links the runtime (and Arrow, for the ADBC cases), so keeping all ~70 until
+# exit outgrew a tmpfs /tmp (7.8G) and failed the suite at link time with
+# "No space left on device".
 
 # Conformance gate (see cases/README.md): every `<name>.ibex` the interpreter
 # runs must also transpile+match on ibex_compile, OR carry a sibling
@@ -145,6 +149,7 @@ for case_file in "$CASES_DIR"/*.ibex; do
     else
         echo "parity ok: $name"
     fi
+    rm -f "$bin_file"
 done
 
 # Effect cases: scripts whose statements have effects (a table sink between two
@@ -200,10 +205,10 @@ if [[ -d "$EFFECT_CASES_DIR" ]]; then
             echo "parity mismatch: effect case $name — the transpiled program failed:" >&2
             sed 's/^/    /' "$TMPDIR_WORK/effect_$name.compiled.out" >&2
             fail=1
-            rm -f /tmp/ibex_parity_"$name"*
+            rm -f /tmp/ibex_parity_"$name"* "$bin_file"
             continue
         fi
-        rm -f /tmp/ibex_parity_"$name"*
+        rm -f /tmp/ibex_parity_"$name"* "$bin_file"
         if ! "$IBEX_EVAL" "$case_file" --plugin-path "$BUILD_DIR/tools" \
             >"$TMPDIR_WORK/effect_$name.interp.out" 2>&1; then
             echo "parity: effect case $name — the interpreter failed:" >&2

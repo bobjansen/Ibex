@@ -81,7 +81,7 @@
             <tr><td><code>as_timeframe(df, "time_col")</code></td><td>Convert a table to a time-indexed table using <code>time_col</code>.</td></tr>
             <tr><td><code>scalar(df, col)</code></td><td>Extract one value from a one-row table. A null cell yields a null scalar.</td></tr>
             <tr><td><code>scalar(one_col_df)</code></td><td>Extract from a one-column table; an empty table yields a null scalar, which can be handled with <code>coalesce</code>.</td></tr>
-            <tr><td><code>exists(df[filter k == outer(j)])</code></td><td>In a <code>filter</code>: keep rows with at least one matching inner row (a semi join); <code>!exists(...)</code> keeps the rest. Never null.</td></tr>
+            <tr><td><code>exists(df[filter k == outer(j)])</code></td><td>In a <code>filter</code>: true when at least one inner row matches the <code>outer(...)</code> captures. A whole <code>&amp;&amp;</code> term is a semi join (<code>!exists</code> an anti join); under <code>||</code> it is a mark join. Never null.</td></tr>
             <tr><td><code>order(df, key1, ...)</code></td><td>Return a table ordered by keys. Usually written as <code>df[order key1, ...]</code>.</td></tr>
             <tr><td><code>print(value)</code></td><td>Print a human-readable value in scripts and REPL sessions.</td></tr>
           </tbody>

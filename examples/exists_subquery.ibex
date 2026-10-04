@@ -40,3 +40,14 @@ print(orders[
     filter o_priority == "1-URGENT" && exists(lineitem[filter l_orderkey == outer(o_orderkey)]),
     order { o_orderkey }
 ]);
+
+// `exists` is a Bool, so it also works under `||` or inside a larger
+// expression. A semi join cannot express that — it would drop order 3, which
+// is urgent but has no line items — so here it becomes a mark join: line items
+// counted per order, left-joined on, and tested for presence.
+print("urgent orders, or orders with a late line item:");
+print(orders[
+    filter o_priority == "1-URGENT"
+        || exists(lineitem[filter l_orderkey == outer(o_orderkey) && l_commitdate < l_receiptdate]),
+    order { o_orderkey }
+]);

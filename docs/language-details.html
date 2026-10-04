@@ -728,10 +728,14 @@ supply[
             <code>select</code>: it asks only whether a row exists.
           </p>
           <p>
-            It lowers to a <strong>semi join</strong> (or an
-            <strong>anti join</strong>) on the captured columns, so a row with
-            many matches is kept once and nothing is added to the schema.
-            <code>exists</code> is never null: a null key matches nothing.
+            As a whole <code>&amp;&amp;</code> term it lowers to a
+            <strong>semi join</strong> (or an <strong>anti join</strong>) on the
+            captured columns. Anywhere else &mdash; under <code>||</code>, or
+            negated inside a larger expression &mdash; it becomes a
+            <strong>mark join</strong>: a per-key count left-joined onto the
+            outer rows. Either way a row with many matches is kept once and
+            nothing is added to the schema. <code>exists</code> is never null:
+            a null key matches nothing.
           </p>
         </div>
         <div class="tour-code">
@@ -746,6 +750,12 @@ orders[
 <span class="cm">// Customers who never placed an order — Q22's anti join.</span>
 customer[
     <span class="kw">filter</span> !<span class="fn-name">exists</span>(orders[<span class="kw">filter</span> o_custkey == <span class="kw">outer</span>(c_custkey)])
+];
+
+<span class="cm">// It is a Bool, so it composes: urgent, OR has a late line.</span>
+orders[
+    <span class="kw">filter</span> o_priority == <span class="str">"1-URGENT"</span>
+        || <span class="fn-name">exists</span>(lineitem[<span class="kw">filter</span> l_orderkey == <span class="kw">outer</span>(o_orderkey)])
 ];</code></pre>
         </div>
       </div>

@@ -14787,6 +14787,48 @@ a[filter !exists(b[filter k == outer(k)])];
     REQUIRE(runtime::is_null(*entry, 0) != runtime::is_null(*entry, 1));
 }
 
+TEST_CASE("Interpret exists inside a larger expression agrees with the semi join") {
+    // `|| false` forces the mark join; the answer must not change.
+    const std::string semi = std::string(kSupplySources) + R"(
+parts[filter exists(supply[filter ps_partkey == outer(p_partkey) && ps_region == "EU"]),
+      order { p_partkey }];
+)";
+    const std::string mark = std::string(kSupplySources) + R"(
+parts[filter exists(supply[filter ps_partkey == outer(p_partkey) && ps_region == "EU"]) || false,
+      order { p_partkey }];
+)";
+    const auto semi_result = interpret_source(semi);
+    const auto mark_result = interpret_source(mark);
+    // Part 1 has two EU suppliers and still comes back once.
+    REQUIRE(int_column(mark_result, "p_partkey") == std::vector<std::int64_t>{1, 2, 3});
+    REQUIRE(int_column(mark_result, "p_partkey") == int_column(semi_result, "p_partkey"));
+    REQUIRE(mark_result.columns.size() == 2);
+}
+
+TEST_CASE("Interpret exists under || keeps rows either side admits") {
+    auto result = interpret_source(std::string(kSupplySources) + R"(
+parts[filter p_name == "washer" || exists(supply[filter ps_partkey == outer(p_partkey) && ps_cost > 6.0]),
+      order { p_partkey }];
+)");
+    // Parts 2 (9.0) and 3 (7.0) have a supply above 6; part 4 is a washer with
+    // none, which a semi join would have dropped.
+    REQUIRE(int_column(result, "p_partkey") == std::vector<std::int64_t>{2, 3, 4});
+}
+
+TEST_CASE("Interpret a negated exists inside an expression is true for a null key") {
+    auto result = interpret_source(R"(
+let a = Table { k = [1, null, 3], tag = [0, 0, 1] };
+let b = Table { k = [1, 2, null] };
+a[filter tag == 1 || !exists(b[filter k == outer(k)])];
+)");
+    // k = null matches nothing, so !exists is true (not null) and the row stays;
+    // k = 3 stays through its tag.
+    REQUIRE(result.rows() == 2);
+    const auto* entry = result.find_entry("k");
+    REQUIRE(entry != nullptr);
+    REQUIRE(runtime::is_null(*entry, 0) != runtime::is_null(*entry, 1));
+}
+
 TEST_CASE("Interpret exists alongside a correlated scalar subquery") {
     auto result = interpret_source(std::string(kSupplySources) + R"(
 (parts join supply[select { p_partkey = ps_partkey, ps_suppkey, ps_cost }] on p_partkey)[

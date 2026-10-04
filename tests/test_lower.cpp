@@ -2145,6 +2145,101 @@ TEST_CASE("Lower rejects unsupported correlated-subquery shapes") {
     }
 }
 
+TEST_CASE("Lower turns an exists conjunct into a semi join with no aggregate") {
+    auto result = lower_source(std::string(kCorrelatedSources) + R"(
+parts[filter p_name != "x" && exists(supply[filter ps_partkey == outer(p_partkey) && ps_cost > 4.0])];
+)");
+    REQUIRE(result.has_value());
+
+    // A semi join keeps each outer row at most once: no aggregate, no
+    // generated column, and so no projection back off.
+    std::vector<ir::NodeKind> kinds;
+    collect_kinds(*result.value(), kinds);
+    REQUIRE(std::ranges::find(kinds, ir::NodeKind::Aggregate) == kinds.end());
+    REQUIRE(as_node<ir::ProjectNode>(result->get()) == nullptr);
+
+    const auto* join = find_join(*result.value());
+    REQUIRE(join != nullptr);
+    REQUIRE(join->kind() == ir::JoinKind::Semi);
+    REQUIRE(join->keys() == std::vector<ir::JoinKey>{{"p_partkey", "ps_partkey"}});
+    REQUIRE(join->predicate() == std::nullopt);
+    // The outer-only term filters the outer side, the inner-only term the inner.
+    REQUIRE(as_node<ir::FilterNode>(join->children()[0].get()) != nullptr);
+    REQUIRE(as_node<ir::FilterNode>(join->children()[1].get()) != nullptr);
+}
+
+TEST_CASE("Lower turns a negated exists into an anti join") {
+    auto result = lower_source(std::string(kCorrelatedSources) + R"(
+parts[filter !exists(supply[filter ps_partkey == outer(p_partkey)])];
+)");
+    REQUIRE(result.has_value());
+    const auto* join = find_join(*result.value());
+    REQUIRE(join != nullptr);
+    REQUIRE(join->kind() == ir::JoinKind::Anti);
+    // No inner terms, so the inner side is the bare source.
+    REQUIRE(as_node<ir::FilterNode>(join->children()[1].get()) == nullptr);
+}
+
+TEST_CASE("Lower accepts exists over an enclosing query of unknown schema") {
+    // Unlike scalar(...), exists adds no column to project back off, so the
+    // outer columns need not be nameable.
+    auto result = lower_source(std::string(kCorrelatedSources) +
+                               "unknown[filter exists(supply[filter ps_partkey == outer(k)])];");
+    REQUIRE(result.has_value());
+    const auto* join = find_join(*result.value());
+    REQUIRE(join != nullptr);
+    REQUIRE(join->kind() == ir::JoinKind::Semi);
+}
+
+TEST_CASE("Lower rejects exists forms it cannot express as a semi join") {
+    const auto lower_filter = [](const std::string& predicate) {
+        return lower_source(std::string(kCorrelatedSources) + "parts[filter " + predicate + "];");
+    };
+    const auto rejects = [&](const std::string& predicate, const char* message) {
+        auto result = lower_filter(predicate);
+        REQUIRE_FALSE(result.has_value());
+        INFO(result.error().message);
+        CHECK(result.error().message.find(message) != std::string::npos);
+    };
+
+    SECTION("a select clause") {
+        rejects("exists(supply[filter ps_partkey == outer(p_partkey), select { ps_cost }])",
+                "no select clause");
+    }
+    SECTION("no capture") {
+        rejects("exists(supply[filter ps_cost > 1.0])", "captures nothing");
+    }
+    SECTION("no filter at all") {
+        rejects("exists(supply)", "expected a filtered table");
+    }
+    SECTION("a capture that is not an equality") {
+        rejects("exists(supply[filter ps_partkey > outer(p_partkey)])", "must be an equality");
+        rejects(
+            "exists(supply[filter ps_partkey == outer(p_partkey) && ps_cost != outer(p_partkey)])",
+            "must be an equality");
+    }
+    SECTION("a captured column the enclosing query lacks") {
+        rejects("exists(supply[filter ps_partkey == outer(nope)])", "outer(nope)");
+    }
+    SECTION("inside a larger expression") {
+        rejects("p_partkey > 1 || exists(supply[filter ps_partkey == outer(p_partkey)])",
+                "whole filter conjunct");
+    }
+    SECTION("outside a filter") {
+        auto result = lower_source(std::string(kCorrelatedSources) +
+                                   "parts[update { f = exists(supply[filter ps_partkey == "
+                                   "outer(p_partkey)]) }];");
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().message.find("whole filter conjunct") != std::string::npos);
+    }
+    SECTION("nested subqueries") {
+        rejects(
+            "exists(supply[filter ps_partkey == outer(p_partkey) && exists(parts[filter "
+            "p_partkey == outer(ps_partkey)])])",
+            "nested subqueries");
+    }
+}
+
 TEST_CASE("Lower broadcasts an uncorrelated subquery with a cross join") {
     auto result = lower_source(std::string(kCorrelatedSources) +
                                R"(

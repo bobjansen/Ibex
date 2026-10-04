@@ -1265,7 +1265,7 @@ auto execute_interrupted(AdbcSession& s, const std::string& source, std::chrono:
     -> std::pair<ibex::repl::ExecutionResult, std::chrono::milliseconds> {
     ibex::runtime::clear_interrupt();
     const auto start = std::chrono::steady_clock::now();
-    std::jthread interrupter([delay] {
+    std::thread interrupter([delay] {
         std::this_thread::sleep_for(delay);
         ibex::runtime::request_interrupt();
     });

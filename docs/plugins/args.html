@@ -1,1 +1,42 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Ibex | Arguments plugin</title><link rel="stylesheet" href="../styles.css"></head><body><main class="page"><nav class="nav"><a class="nav-logo" href="../index.html">Ibex</a><div class="nav-links"><a class="nav-link" href="../docs.html">Docs</a><a class="nav-link" href="../io.html">I/O guide</a></div></nav><section class="hero"><p class="eyebrow">Plugin reference</p><h1>Command-line arguments</h1><p class="lead">Declare a command-line interface and receive parsed values as a table.</p></section><section class="section"><h2><code>args::parse</code></h2><p><code>args::parse(spec: String, argv: String = "") -&gt; DataFrame</code></p><p>The specification uses one declaration per line or semicolon: <code>name (aliases) : type [arity] [= default] # help</code>. Supported types are <code>int</code>, <code>int64</code>, <code>float</code>, <code>float64</code>, <code>bool</code>, <code>string</code>, <code>date</code>, and <code>timestamp</code>. Arity can be a single value (the default), <code>flag</code>, <code>+</code>, <code>*</code>, <code>positional</code>, <code>positional+</code>, or <code>positional*</code>. A trailing <code>?</code> makes an argument optional.</p><p>The result has <code>kind</code>, <code>name</code>, <code>index</code>, and <code>value</code> columns. Values are strings (flags use <code>true</code>/<code>false</code>); cast them to the desired type. Missing optional arguments produce no row. Without explicit <code>argv</code>, input comes from <code>IBEX_ARGS</code> (one argument per line).</p><pre><code>import "args"; let parsed = args::parse("threads (t) : int = 4; input : positional+");</code></pre><p><a href="../io.html">See the complete I/O guide.</a></p></section></main></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ibex | Arguments plugin</title>
+  <meta name="description" content="Declare and parse command-line arguments with args::parse." />
+  <link rel="stylesheet" href="../styles.css" />
+  <script src="../code-copy.js" defer></script>
+</head>
+<body><main class="page">
+  <nav class="nav"><a class="nav-logo" href="../index.html">Ibex</a><div class="nav-links"><a class="nav-link" href="../docs.html">Docs</a><a class="nav-link" href="../io.html">I/O guide</a></div></nav>
+  <section class="hero"><p class="eyebrow">Standard plugin · <code>import "args"</code></p><h1>Command-line arguments</h1><p class="lead">Describe a script’s options once, validate the supplied arguments, and receive the parsed values as a table.</p><div class="cta-row"><a class="button primary" href="../io.html">I/O guide</a></div></section>
+  <section class="section"><p class="section-label">Function</p><h2><code>args::parse</code></h2><p><code>args::parse(spec: String, argv: String = "") -&gt; DataFrame</code></p><p><code>spec</code> declares the accepted options and positionals. Declarations are separated by newlines or semicolons. Each declaration has a name, type, optional arity, optional default, and optional help comment.</p>
+<pre><code><span class="kw">import</span> <span class="str">"args"</span>;
+
+<span class="kw">let</span> parsed = <span class="fn-name">args::parse</span>(<span class="str">"
+    threads (t) : int = 4 # worker count
+    quiet (q)   : flag
+    input       : positional+
+"</span>);</code></pre>
+  </section>
+  <section class="section"><p class="section-label">Specification</p><h2>Types, aliases, and arity</h2><p>Use <code>name (alias)</code> for a short option alias. Supported value types are <code>int</code>, <code>int64</code>, <code>float</code>, <code>float64</code>, <code>bool</code>, <code>string</code>, <code>date</code>, and <code>timestamp</code>. Values are validated against their declared type, but returned as strings for the script to cast when it uses them.</p>
+    <div class="table-wrap"><table class="repl-table"><thead><tr><th>Declaration form</th><th>Behavior</th></tr></thead><tbody>
+      <tr><td><code>limit (n) : int</code></td><td>One required option value, supplied as <code>--limit VALUE</code> or <code>-n VALUE</code>.</td></tr>
+      <tr><td><code>quiet (q) : bool flag</code></td><td>Boolean flag; when present its value is <code>true</code>.</td></tr>
+      <tr><td><code>tag : string+</code></td><td>One or more occurrences of the option.</td></tr>
+      <tr><td><code>config : string*</code></td><td>Zero or more occurrences.</td></tr>
+      <tr><td><code>input : string positional</code></td><td>One positional argument; <code>positional+</code> and <code>positional*</code> allow one-or-more and zero-or-more.</td></tr>
+      <tr><td><code>limit : int? = 10</code></td><td>Optional option. If absent, its default is used; without a default it emits no result row.</td></tr>
+    </tbody></table></div>
+    <p>Append <code>#</code> and a description to document an option in the specification. Unknown options, invalid values, duplicate declarations, missing required inputs, and unexpected positionals are errors.</p>
+  </section>
+  <section class="section"><p class="section-label">Result</p><h2>Read the parsed table</h2><p>The result schema is fixed: <code>kind</code>, <code>name</code>, <code>index</code>, and <code>value</code>. <code>kind</code> is <code>option</code>, <code>flag</code>, or <code>positional</code>. <code>index</code> is zero-based within a repeated option or positional name. A flag value is the string <code>true</code> or <code>false</code>.</p><p>Filter on <code>name</code> to select a value, then cast it to the type your program needs. Optional values that are absent emit no row, so <code>scalar</code> can produce null when the filtered result is empty.</p>
+<pre><code><span class="kw">let</span> raw_threads = <span class="fn-name">scalar</span>(parsed[<span class="kw">filter</span> name == <span class="str">"threads"</span>, <span class="kw">select</span> { value }]);
+<span class="kw">let</span> threads = <span class="fn-name">Int64</span>(raw_threads);</code></pre>
+    <h3>Where arguments come from</h3><p>When <code>argv</code> is omitted or empty, the plugin reads <code>IBEX_ARGS</code>, with one argument per line. Supplying a non-empty <code>argv</code> string is useful for tests and embedding; separate values with spaces or newlines.</p>
+<pre><code><span class="cm">// Run: ibex job.ibex -- --threads 8 input.csv</span>
+<span class="kw">let</span> test_args = <span class="fn-name">args::parse</span>(<span class="str">"threads : int; input : string positional"</span>, <span class="str">"--threads 8 input.csv"</span>);</code></pre>
+  </section>
+  <section class="section"><h2>Related docs</h2><p>See <a href="../io.html">the I/O guide</a> for the complete script-argument example and <a href="../reference.html">the reference</a> for scalar extraction.</p></section>
+</main></body></html>

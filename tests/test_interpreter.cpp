@@ -16533,79 +16533,115 @@ TEST_CASE("Deferred probe filters Date, Timestamp and Bool keys like Int64 ones"
     }
 }
 
-TEST_CASE("Joins under rbind keep their deferred probe", "[runtime][join][deferred_probe]") {
-    // `rbind` is a materializing node; its operands used to be evaluated by
-    // `interpret_node`, whose join materializes both sides before any build
-    // key exists, so a deferred probe scan under it decoded every row.
-    constexpr std::size_t kLazyRows = 70'000;  // above kStreamRightThreshold (65536)
-    runtime::Table left;
-    left.add_column("k", Column<std::int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9});
-    runtime::TableRegistry registry;
-    registry.emplace("build_t", std::move(left));
-    auto ir = require_ir("rbind(build_t join probe_a on k, build_t join probe_b on k);");
+/// A lazy probe source of 70,000 rows -- above kStreamRightThreshold (65536),
+/// so a join over it defers the scan -- with key `row % 1000` and a payload
+/// whose decoded row count it records. Registered under `name` in `deferred`.
+struct CountingProbe {
+    static constexpr std::size_t kRows = 70'000;
+    std::shared_ptr<runtime::DynamicScanFilter> slot =
+        std::make_shared<runtime::DynamicScanFilter>();
+    std::shared_ptr<std::size_t> payload_rows = std::make_shared<std::size_t>(0);
 
-    struct Probe {
-        std::shared_ptr<runtime::DynamicScanFilter> slot =
-            std::make_shared<runtime::DynamicScanFilter>();
-        std::shared_ptr<std::size_t> payload_rows = std::make_shared<std::size_t>(0);
-    };
-    Probe a;
-    Probe b;
-    const auto make_scan = [&](const Probe& probe) {
+    void register_as(const std::string& name, runtime::DeferredScanRegistry& deferred) const {
         runtime::Table schema;
         schema.add_column("k", Column<std::int64_t>{});
         schema.add_column("payload", Column<std::int64_t>{});
-        auto rows_seen = probe.payload_rows;
+        auto rows_seen = payload_rows;
         auto decode =
             [rows_seen](
                 const std::vector<std::string>& names,
                 const runtime::Selection* selection) -> std::expected<runtime::Table, std::string> {
             std::vector<std::size_t> rows;
             if (selection == nullptr) {
-                rows.resize(kLazyRows);
+                rows.resize(kRows);
                 std::iota(rows.begin(), rows.end(), std::size_t{0});
             } else {
                 rows.assign(selection->begin(), selection->end());
             }
             runtime::Table out;
-            for (const auto& name : names) {
+            for (const auto& column : names) {
                 std::vector<std::int64_t> values;
                 values.reserve(rows.size());
                 for (const std::size_t row : rows) {
-                    values.push_back(name == "k" ? static_cast<std::int64_t>(row % 1000)
-                                                 : static_cast<std::int64_t>(row));
+                    values.push_back(column == "k" ? static_cast<std::int64_t>(row % 1000)
+                                                   : static_cast<std::int64_t>(row));
                 }
-                if (name == "payload") {
+                if (column == "payload") {
                     *rows_seen = rows.size();
                 }
-                out.add_column(name, Column<std::int64_t>{std::move(values)});
+                out.add_column(column, Column<std::int64_t>{std::move(values)});
             }
             out.logical_rows = rows.size();
             return out;
         };
-        return runtime::DeferredScan{
-            .lazy = std::make_shared<runtime::LazyTable>(std::move(schema), kLazyRows, decode),
-            .conjuncts = {},
-            .demand = {"k", "payload"},
-            .demand_all = false,
-            .key_column = "k",
-            .filter = probe.slot,
-        };
-    };
+        deferred.emplace(name, runtime::DeferredScan{
+                                   .lazy = std::make_shared<runtime::LazyTable>(std::move(schema),
+                                                                                kRows, decode),
+                                   .conjuncts = {},
+                                   .demand = {"k", "payload"},
+                                   .demand_all = false,
+                                   .key_column = "k",
+                                   .filter = slot,
+                               });
+    }
+};
+
+/// A ten-row build side, keys 0..9: 700 probe rows match.
+auto ten_key_build_registry() -> runtime::TableRegistry {
+    runtime::Table left;
+    left.add_column("k", Column<std::int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9});
+    runtime::TableRegistry registry;
+    registry.emplace("build_t", std::move(left));
+    return registry;
+}
+
+TEST_CASE("Joins under rbind keep their deferred probe", "[runtime][join][deferred_probe]") {
+    // `rbind` is a materializing node; its operands used to be evaluated by
+    // `interpret_node`, whose join materializes both sides before any build
+    // key exists, so a deferred probe scan under it decoded every row.
+    const auto registry = ten_key_build_registry();
+    auto ir = require_ir("rbind(build_t join probe_a on k, build_t join probe_b on k);");
+    const CountingProbe a;
+    const CountingProbe b;
     runtime::DeferredScanRegistry deferred;
-    deferred.emplace("probe_a", make_scan(a));
-    deferred.emplace("probe_b", make_scan(b));
+    a.register_as("probe_a", deferred);
+    b.register_as("probe_b", deferred);
 
     runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
     exec.parallel_threads = 1;
     auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
     REQUIRE(out.has_value());
-    // Keys 0..9 of `row % 1000` over 70,000 rows: 700 matches per operand.
     CHECK(out->rows() == 1400);
-    for (const Probe* probe : {&a, &b}) {
+    for (const CountingProbe* probe : {&a, &b}) {
         CHECK(probe->slot->has_membership());
         CHECK(*probe->payload_rows == 700);
     }
+}
+
+TEST_CASE("A join under a node the plan does not migrate keeps its deferred probe",
+          "[runtime][join][deferred_probe]") {
+    // `median` declines the streaming aggregate, so the aggregate runs in
+    // `interpret_node`. Its input used to be evaluated there too, recursively,
+    // with the materializing join -- every probe row decoded. Inputs now go
+    // back through `build_operator`.
+    const auto registry = ten_key_build_registry();
+    auto ir = require_ir("(build_t join probe_t on k)[select { m = median(payload) }];");
+    const CountingProbe probe;
+    runtime::DeferredScanRegistry deferred;
+    probe.register_as("probe_t", deferred);
+
+    runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+    exec.parallel_threads = 1;
+    auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+    REQUIRE(out.has_value());
+    REQUIRE(out->rows() == 1);
+    CHECK(probe.slot->has_membership());
+    CHECK(*probe.payload_rows == 700);
+    // Rows with row % 1000 < 10: payloads 0..9, 1000..1009, ..., 69000..69009.
+    // The median of those 700 values is the mean of the 350th and 351st,
+    // 34009 and 35000.
+    const auto& m = std::get<Column<double>>(*out->find("m"));
+    CHECK(m[0] == Catch::Approx(34504.5));
 }
 
 TEST_CASE("Inner join probe fans out across workers and matches the serial probe",
@@ -17353,13 +17389,12 @@ TEST_CASE("aligned grouped window refuses to split a cross-bucket field",
     }
 }
 
-// `distinct_table` is the whole-table signature over the chunked operator (I4).
-// It runs ONLY through `interpret_node`, which the chunked builder reaches only
-// for a subtree beneath a node it declined — and only within a single statement,
-// because a `let` materializes and breaks the chain. Every assertion here is on
-// that shape for that reason: written with a `let` between the two clauses, the
-// test passes without executing a line of the code it claims to cover.
-TEST_CASE("distinct beneath a declined aggregate runs the collapsed whole-table path",
+// A `distinct` beneath an aggregate the plan declines (`median`). The aggregate
+// runs in `interpret_node`, which evaluates its input back through
+// `build_operator`, so the distinct runs as its streaming operator. One
+// statement on purpose: a `let` between the clauses would materialize the
+// distinct first and never put it beneath the declined node.
+TEST_CASE("distinct beneath a declined aggregate answers through the physical path",
           "[interpreter][distinct][chunked]") {
     runtime::TableRegistry registry;
 
@@ -17408,10 +17443,9 @@ TEST_CASE("distinct beneath a declined aggregate runs the collapsed whole-table 
 }
 
 // Like distinct above, this needs one statement: `median` declines the
-// chunked aggregate and therefore makes its join child reach interpret_node.
-// A `let joined = ...` would materialize the join first and never exercise the
-// whole-table adapter this test is meant to pin.
-TEST_CASE("inner join beneath a declined aggregate runs the collapsed whole-table path",
+// chunked aggregate, so the join is an input of a node `interpret_node` runs.
+// A `let joined = ...` would materialize the join first.
+TEST_CASE("inner join beneath a declined aggregate answers through the physical path",
           "[interpreter][join][chunked]") {
     runtime::TableRegistry registry;
     runtime::Table left;
@@ -17431,8 +17465,8 @@ TEST_CASE("inner join beneath a declined aggregate runs the collapsed whole-tabl
     // The join has four rows: v is {20, 20, 30, 30}.
     CHECK(col[0] == Catch::Approx(25.0));
 
-    // No matches likewise reach the adapter in the fallback shape. The
-    // chunked join must retain its schema despite having no non-empty morsel.
+    // No matches, in the same shape. The chunked join must retain its schema
+    // despite having no non-empty morsel.
     runtime::Table no_match;
     no_match.add_column("k", Column<std::int64_t>{99});
     no_match.add_column("other", Column<std::int64_t>{7});

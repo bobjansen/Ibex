@@ -269,10 +269,10 @@ separate streaming operator.
    `4923c02e`; see Phase 5 item 3 below for what remains): the 15-branch
    materializing per-kind switch in `build_operator_impl` is gone. Every
    non-migrated kind resolves through one `build_materialized_fallback` →
-   `interpret_node`; `build_materialized_fallback` still builds the breaker's
-   relational inputs through `build_operator` (handed back via
-   `ExecutionContext::pre_materialized_children`) so a filtered/projected input
-   keeps its fused parallel scan. `explain physical` names the retained subtree.
+   `interpret_node`, which evaluates every relational input back through
+   `build_operator` (`materialize_input`, 2026-10-04; it replaced an input
+   allowlist that had left `rbind` and declined aggregates recursing) so a
+   filtered/projected input keeps its fused parallel scan. `explain physical` names the retained subtree.
    `chunked.cpp` −290 lines net. The residual-family extraction that followed is
    done (item 5 above); the fallback adapter is now the accepted end state, not a
    way-station — see item 5.
@@ -606,8 +606,8 @@ at all (a one-valued strategy enum would be ceremony).
 3. Remove obsolete `build_operator` recursion; migrate `interpret_node` to an
    explicit physical fallback adapter. **DONE 2026-08-29** (`a5183b9a`,
    `d7f2d59f`, `4923c02e`, `cb2888cd`; the sub-plan was retired 2026-09-23 and
-   its rules now live on `fallback_relational_inputs` /
-   `build_materialized_fallback` in `runtime_entry.cpp`). The
+   its rules now live on `build_materialized_fallback` in `runtime_entry.cpp`
+   and `materialize_input` in `interpreter.cpp`). The
    materializing per-kind switch is one `build_materialized_fallback` seam;
    `build_operator` no longer recurses through a fallback subtree (only through
    the pre-built relational inputs). `interpret_node` keeps its own recursion as

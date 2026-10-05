@@ -48,10 +48,16 @@ The rolling helpers are `rolling_sum`, `rolling_mean`, `rolling_min`,
 `rolling_last`; `window_start()` and `window_end()` expose the nominal bounds.
 
 Current shape:
+- Evaluation runs on the same engine as the `ibex` REPL, so the whole language
+  works from R: `import`, `fn`, scalar and table `let` bindings, `print()`
+  (its output goes to the R console), and resources.
 - `eval_ibex()` evaluates an inline Ibex query.
 - `eval_file()` evaluates a `.ibex` file.
-- `create_session()`, `session_eval()`, and `session_eval_file()` keep table-valued `let`
-  bindings alive across calls.
+- `create_session()`, `session_eval()`, and `session_eval_file()` keep every
+  binding (tables, scalars, functions, imports) alive across calls. Tables and
+  scalars passed with `tables =` / `scalars =` last for that one call.
+- `plugin_paths` is where both plugins (`csv.so`) and `import` stubs
+  (`csv.ibex`) are found.
 - `register_knitr_engines()` adds a `{ibex}` knitr engine for R Markdown.
 - `knitr_session(name)` returns the named engine-backed session for mixed R / Ibex notebooks.
 - `tables = list(name = data.frame(...))` binds R tables into Ibex by copy.

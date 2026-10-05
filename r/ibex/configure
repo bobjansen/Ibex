@@ -37,7 +37,8 @@ command -v cmake >/dev/null 2>&1 || {
   exit 1
 }
 
-if [ ! -f "${IBEX_BUILD_DIR}/src/runtime/libibex_runtime.a" ]; then
+if [ ! -f "${IBEX_BUILD_DIR}/src/runtime/libibex_runtime.a" ] \
+  || [ ! -f "${IBEX_BUILD_DIR}/src/repl/libibex_repl.a" ]; then
   echo "configure: building the minimal Ibex runtime" >&2
   cmake -S "${IBEX_ROOT}" -B "${IBEX_BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
@@ -50,7 +51,7 @@ if [ ! -f "${IBEX_BUILD_DIR}/src/runtime/libibex_runtime.a" ]; then
     -DIBEX_BUILD_LIGHTGBM=OFF \
     -DIBEX_USE_CCACHE=OFF
   cmake --build "${IBEX_BUILD_DIR}" --target \
-    ibex_core ibex_ir ibex_parser ibex_runtime ibex_interop --parallel
+    ibex_core ibex_ir ibex_parser ibex_runtime ibex_interop ibex_repl --parallel
 fi
 
 # The bridge is deliberately linked to the small static runtime closure. Build

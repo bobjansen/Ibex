@@ -86,7 +86,7 @@ Owner: `operator.hpp`.
   engine move without a correctness argument.
 * Per-chunk interruption boundaries: long *pipelines* check
   `interrupt_requested()` between chunks; intra-operator fan-outs
-  historically do not (documented gap, `parallelism-overview.md` I13).
+  historically do not (documented gap, I13 in `PARALLELISM.md`).
 * An operator normally degrades to serial under `on_worker_pool_thread()` —
   "outermost wins" — to avoid needless nested fan-out. A necessary nested
   `WorkerPool::submit` is safe: workers cooperatively execute queued tasks

@@ -3,8 +3,8 @@
 # Copyright (C) 2026 Bob Jansen
 """Sum the operator profile across the PDS-H suite, one row per query.
 
-This is the tool the accounting tables in `plans/parallelism-overview.md` came
-from. `IBEX_PROFILE_OPERATORS=1` prints one `operator profile:` line per
+This is the tool the occupancy and closure findings in
+`src/runtime/PARALLELISM.md` came from. `IBEX_PROFILE_OPERATORS=1` prints one `operator profile:` line per
 STATEMENT, so a query's numbers are the sum over its lines; doing that by eye
 across 22 queries is how arithmetic errors get into a plan.
 

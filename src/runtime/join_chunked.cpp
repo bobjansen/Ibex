@@ -2271,8 +2271,7 @@ class ChunkedInnerJoinOperator final : public Operator {
 
    private:
     /// Two-fixed-width-int-key path: narrow first cut of the streaming
-    /// two-key join (plans/parallelism-overview.md's "stream multi-key
-    /// joins" item). Non-deferred case: `right_` is already a whole `Table`
+    /// two-key join. Non-deferred case: `right_` is already a whole `Table`
     /// by construction (the call site materializes it, same as the
     /// single-key path), so the only real decision left is which side to
     /// index: this materializes `left_` too and builds on whichever side is
@@ -2319,8 +2318,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         return adopt_build(std::move(outcome), std::move(left_table));
     }
 
-    /// Deferred-probe POC for the two-key path (plans/parallelism-overview.md
-    /// "deferred scan filtering for two-key joins", TPC-H q09's `lineitem`
+    /// Deferred-probe POC for the two-key path (TPC-H q09's `lineitem`
     /// join). Reuses the existing single-key deferred-scan machinery
     /// unchanged: builds the (small) left side first, publishes a
     /// `DynamicScanFilter` over `keys_->at(0)` ONLY -- one component, not
@@ -2456,6 +2454,12 @@ class ChunkedInnerJoinOperator final : public Operator {
     /// selection is reused to materialize `right_` (RightMaterialized)
     /// rather than thrown away: recomputing it from scratch was measured at
     /// +12% on q03.
+    ///
+    /// The Precomputed outcome computes the matched row pairs from a hash
+    /// probe BEFORE any wrapper chain above the probe scan runs. That is sound
+    /// only while that chain is 1:1. Admitting a row-dropping operator (a
+    /// Filter) above the probe scan makes the pairs wrong; an experiment that
+    /// did so (2026-08) won 2.6-3.2x on q03 and was removed for this reason.
     auto try_two_phase_probe(const DynamicScanFilter& slot, TwoPhase& outcome)
         -> std::optional<std::string> {
         outcome = TwoPhase::NotApplicable;

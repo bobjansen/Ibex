@@ -601,8 +601,7 @@ void collect_deferrable(const Node& node, const std::set<std::string>& sources,
         // both keys exactly once decoded). Deliberately not both components
         // yet: `DynamicScanFilter`/`DeferredScan` are single-column, and this
         // is the POC for whether scan-altitude pruning is the lever at all
-        // before extending them (plans/parallelism-overview.md's "stream
-        // multi-key joins" follow-up, TPC-H q09's lineitem join).
+        // before extending them (TPC-H q09's lineitem join).
         if (is_probe_shaped_join(join)) {
             if (auto match = match_probe_chain(*join.children()[1], join.keys().front().right);
                 match.has_value() && sources.contains(match->first)) {

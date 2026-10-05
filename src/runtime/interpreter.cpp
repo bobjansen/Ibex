@@ -80,6 +80,22 @@ namespace {
 // allocations from the main arena and never trimming the heap top lets freed
 // buffers recycle already-faulted pages across the warmup/timed iterations.
 // glibc-only; a no-op elsewhere. Opt out via IBEX_NO_MALLOC_TUNING.
+//
+// What it does not fix is the FIRST run's faults: a fresh q21 touches ~2.7 GB
+// (~760k faults, against ~75k warm), which is why Ibex gains ~38% from a warm
+// process on q21 and Polars ~8%. Measured 2026-09-24 (PDS-H SF-8, paired):
+//   - jemalloc instead of glibc: +3.7% fresh at 1 core (q21 +14%), a wash at
+//     8. No. It could only reach Ibex's own executables anyway, not the Python
+//     or R modules running inside someone else's process.
+//   - whole-heap huge pages (`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`): -8.0%
+//     fresh at 1 core, -4.9% at 8, neutral warm. The lever, if single runs
+//     matter: have `ibex`/`ibex_eval` re-exec themselves with the tunable.
+//   - huge pages for column buffers only (`madvise` in NoInitAllocator):
+//     -0.6% / -1.8%, q04 +5%; reverted. The gain comes from every allocation
+//     (hash tables, selection vectors, Arrow buffers), not one class of them.
+// Reopen when one-shot command-line runs become a target, or a warm process
+// shows page faults. The full write-up: the retired
+// plans/allocator-and-huge-pages.md (`git show 47918401:plans/allocator-and-huge-pages.md`).
 void tune_allocator_once() {
 #ifdef __GLIBC__
     static std::once_flag flag;

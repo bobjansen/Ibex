@@ -28,7 +28,7 @@ logical planning / physical pipelines / morsel execution while **rejecting query
 JIT** — Ibex's backend stays compiled C++ with a broad library of
 template-instantiated vector kernels.
 
-Read `MEASURING.md` and `parallelism-overview.md` first. `chunked-execution-plan.md`
+Read `MEASURING.md` and `src/runtime/PARALLELISM.md` first. `chunked-execution-plan.md`
 and `chunked-execution` were removed from the tree 2026-08-22 (git history);
 this plan owns the architecture that replaces their ad-hoc seams. The R1–R21
 canonicalize table is in `include/ibex/ir/canonicalize.hpp`.
@@ -287,7 +287,7 @@ separate streaming operator.
    matter: `IBEX_PROFILE_OPERATORS` gives per-operator `pool_work_ms` /
    `ring_wait_ms` / `barrier_wait_ms` / `pool_idle_ms` / `occupancy` / morsels
    plus a plan summary (`serial_fraction`, `amdahl_ceiling`, closure check —
-   `parallelism-overview.md`: "closure is 99.6% on the pool"), and each join /
+   the retired `parallelism-overview.md`: "closure is 99.6% on the pool"), and each join /
    aggregate phase node already has its own profile row. A per-pipeline rollup
    would only *group* those rows into source→breaker segments — no first-class
    pipeline object exists to key it on. Every decision it would inform is dead
@@ -499,7 +499,7 @@ breaker operators (Phase 4).
    only remaining non-pool thread is
    `PipelinedStageOperator`'s (item 1's subject).
 5. **Per-pipeline scheduling accounting — DEFERRED (not blocked), 2026-08-31.**
-   Plan+operator accounting is closed (`parallelism-overview.md`: 99.6% on the
+   Plan+operator accounting is closed (the retired `parallelism-overview.md`, `git show 47918401:plans/parallelism-overview.md`: 99.6% on the
    pool); a per-pipeline rollup would only re-group existing per-operator rows
    and unblocks no live decision (scheduler dropped, DOP budget blocked, branch
    concurrency wants a cost gate). See "Next, in order" item 7 for the full

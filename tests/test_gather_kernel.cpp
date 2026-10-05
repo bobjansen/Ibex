@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
-// The shared gather kernel's concurrency rules (parallelism-overview.md, I1).
+// The shared gather kernel's concurrency rules (inconsistency I1, resolved by
+// collapsing the parallel gathers onto this one kernel).
 //
 // `make_gather_column` + `gather_range_into` is the one kernel every path that
 // rewrites a column through an index array uses. Before it was shared, three

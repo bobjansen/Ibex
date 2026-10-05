@@ -3,9 +3,11 @@
 Status of every plan in this directory, grouped by lifecycle.
 
 **2026-10-05:** retired the radix group-by note, the owned aggregate,
-runtime multithreading, the Phase 3 DOP-budget analysis and the join contract
-(`joins.md`, its rules moved to SPEC.md and the code); the rows below
-re-checked against the tree. `plans/` holds plans; documentation lives in
+runtime multithreading, the Phase 3 DOP-budget analysis, and the three
+reference documents (`joins.md`, `parallelism-overview.md`,
+`allocator-and-huge-pages.md`), whose rules moved to SPEC.md, `MEASURING.md`,
+`src/runtime/PARALLELISM.md` and the code; the rows below re-checked against
+the tree. `plans/` holds plans; documentation lives in
 SPEC.md, `docs/`, `src/**/*.md` and code comments.
 
 **2026-10-04:** eight finished or overtaken plans retired (ADBC, opaque
@@ -50,13 +52,6 @@ history).
 | [grouped-chunkview-update-plan.md](grouped-chunkview-update-plan.md) | Mostly complete — `update …, by k` runs off an immutable `GroupedRowPlan` (CSR) instead of gather → per-group `Table` → scatter. Sub-plan of kernel-pipeline Phase 2. | Remaining materialized shapes: `rank`, variable-width ordered state, `window`-clause `lag`/`lead`. |
 | [per-occurrence-scan-selections-plan.md](per-occurrence-scan-selections-plan.md) | **Phases 1–3 LANDED** (`78a09fad`, `bf783ef3`, `f2b298db`). Restored filter pushdown for a source scanned more than once: each occurrence is renamed `source#fN` so `scan_predicates` keeps its predicate, `decode_demanded_lazy_sources` decodes the union of their output columns ONCE and gathers per occurrence, and the instances stay EAGER. Gated structurally on a fusable `like`. `ibex-e2e.sh` is green again. | **Phase 4 — narrow the `!= 1` gate generally.** Its price was +11.3% on q21, since the eager selection ran serial; with that fanned out (`f06e6da3`) widening the gate measures −0.4% geomean, byte-identical on 22, nothing regressed. The blocker is gone, so what is left is a risk judgement about the plan-shape change, not a cost one. |
 | [query-shape-conformance-plan.md](query-shape-conformance-plan.md) | **Compacted 2026-09-23.** The investigation is closed: excluding q21 the suite is at parity (0.995×), the scan-fusion cost gate is closed, and q21 is a known single-query gap (a self-join rewrite, not pushdown). The file now holds only the leftovers and the do-not-repeat list. | q13's fused non-anchored LIKE scan (66% more CPU than dense decode + filter); row-group task granularity in `direct_decode_table` (q15); a row-count-ratio deferred-probe gate (low priority, re-survey first). |
-
-## Reference — descriptive, not a work item
-
-| Document | What it is |
-|---|---|
-| [parallelism-overview.md](parallelism-overview.md) | **Start here before adding a new fan-out.** The design itself (the `WorkerPool` substrate, the three parallelism layers, the determinism contract, the config surface) moved to `src/runtime/PARALLELISM.md` on 2026-08-27. This file is the inconsistency list (I1–I15, several RESOLVED) + the standing findings: the task scheduler is DROPPED on measurement (pool is ~70% idle with nothing queued), the "70% idle, not serial" accounting, and "Rejected: weakening first-occurrence group ordering". |
-| [allocator-and-huge-pages.md](allocator-and-huge-pages.md) | Analysis only, parked (2026-09-24). Ibex gains ~38% from a warm process on q21 against Polars' ~8% (first-touch page faults), so q21 is ~0.43 warm but ~0.63 fresh. jemalloc: no (+3.7% at 1 core). Whole-heap huge pages via `GLIBC_TUNABLES=glibc.malloc.hugetlb=1`: −8.0% / −4.9% fresh at 1 / 8 cores, neutral warm. Column-buffer-only `madvise` tried and reverted (−0.6% / −1.8%). Reopen if single command-line runs matter. |
 
 ## Proposed — no implementation yet
 
@@ -108,6 +103,31 @@ in active plans to `plans/done/...` paths refer to that history.
     count. Its "LazyTable Synchronization Contract" was never written down as
     code, but workers have decoded `LazyTable` units concurrently since
     2026-08-16, each with its own reader; read that section as history.
+
+- **parallelism-overview.md** — retired 2026-10-05; read it at
+  `git show 47918401:plans/parallelism-overview.md`. The catalogue of where the
+  multi-core model diverges from itself (I1–I15) and the findings that closed
+  or refused each track. Where it lives now: the open inconsistencies, the
+  "not inconsistencies" list, the dropped scheduler and the reverted
+  multi-producer overlap (with its recovery commits) in
+  `src/runtime/PARALLELISM.md` ("Where the model is still muddy"); the
+  rejected weakening of first-occurrence group order under its determinism
+  contract; the two-phase probe's `Precomputed` trap on `try_two_phase_probe`;
+  the attribution mistakes (serial operator vs expression off a fast path,
+  `__memmove` in L2, the I/O floor) and the placement-changes-row-count rule in
+  `MEASURING.md` §10. Left, none scheduled: eliding the first-occurrence merge
+  when the consumer ignores order (a required-ordering property propagated
+  down the plan), and a shared "is this type parallel-capable in role X"
+  predicate (I2).
+- **allocator-and-huge-pages.md** — retired 2026-10-05; read it at
+  `git show 47918401:plans/allocator-and-huge-pages.md`. A parked analysis of why a
+  fresh process is slow (first-touch page faults; q21 ~0.43 against Polars
+  warm, ~0.63 fresh). jemalloc no; whole-heap huge pages −8.0% / −4.9% fresh
+  at 1 / 8 cores and neutral warm; column-buffer-only huge pages reverted. The
+  findings and the reopen condition (one-shot command-line runs become a
+  target, or a warm process shows page faults) are on `tune_allocator_once`
+  in `src/runtime/interpreter.cpp`; the warm/fresh quoting rule is in
+  `MEASURING.md`.
 
 - **joins.md** — retired 2026-10-05; read it at `git show fa7aad97:plans/joins.md`.
   The join contract, built 2026-08: asymmetric keys, the canonical output

@@ -303,9 +303,13 @@ separate streaming operator.
    CMake churn and the CI reshaping. Reopen if the test link becomes a drag on
    the inner loop.
 9. **Phase 3 item 2 — DOP/memory budgets** — analysed and **blocked / deferred**
-   (`phase3-dop-budget-analysis.md`): the pool is 65% idle with nothing queued,
-   so a budget rations a non-scarce resource. Reopen when a multi-producer
-   change needs it or `profile_suite.py` shows queues.
+   (the retired `phase3-dop-budget-analysis.md`, at
+   `git show 82ab01d1:plans/phase3-dop-budget-analysis.md`): the pool was 65%
+   idle with nothing queued at SF-1, so a budget would ration a non-scarce
+   resource. Its 2a (`ExecutionContext::compute_budget()`) is built. Reopen
+   when a multi-producer change needs it, when a third ad-hoc branch budget
+   appears (consumer-helps' serial context and `scan_pipeline_needs_spare` are
+   two), or when `profile_suite.py` at SF-10 shows queues.
 
 **The architectural migration is drained.** Phases 1–4 are done; Phase 5's
 splits are done and its remaining items (test binary split; fallback-kind
@@ -483,7 +487,7 @@ breaker operators (Phase 4).
    `PipelinedStageOperator` keeps its raw thread + plain `std::deque` FIFO (cap
    2, single producer) — deliberately not merged (no sequence ordering to
    maintain).
-2. **DOP/memory budgets** — analysed and blocked, see above (item 8).
+2. **DOP/memory budgets** — analysed and blocked, see above (item 9).
 3. **Migrate islands + pipelined scan/stage to the executor** — DONE, islands
    are a pipeline mode.
 4. **Eliminate raw-thread construction from join/builder branches — CLOSED, by

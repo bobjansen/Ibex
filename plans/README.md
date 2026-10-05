@@ -2,8 +2,9 @@
 
 Status of every plan in this directory, grouped by lifecycle.
 
-**2026-10-05:** three more retired (radix group-by note, owned aggregate,
-runtime multithreading), and the rows below re-checked against the tree.
+**2026-10-05:** four more retired (radix group-by note, owned aggregate,
+runtime multithreading, the Phase 3 DOP-budget analysis), and the rows below
+re-checked against the tree.
 
 **2026-10-04:** eight finished or overtaken plans retired (ADBC, opaque
 resources, namespaces, parse-args/nullable scalars, count windows, join perf,
@@ -54,7 +55,6 @@ history).
 |---|---|
 | [joins.md](joins.md) | The join contract: Ibex's join model and the gaps found building the dplyr backend; mapped vs shared-name keys |
 | [parallelism-overview.md](parallelism-overview.md) | **Start here before adding a new fan-out.** The design itself (the `WorkerPool` substrate, the three parallelism layers, the determinism contract, the config surface) moved to `src/runtime/PARALLELISM.md` on 2026-08-27. This file is the inconsistency list (I1–I15, several RESOLVED) + the standing findings: the task scheduler is DROPPED on measurement (pool is ~70% idle with nothing queued), the "70% idle, not serial" accounting, and "Rejected: weakening first-occurrence group ordering". |
-| [phase3-dop-budget-analysis.md](phase3-dop-budget-analysis.md) | Analysis only, nothing built (2026-08-24). Argues the DOP half of kernel-pipeline Phase 3 item 2 is a precondition for unjustified work and the memory half has no consumer — reopen only when a multi-producer change needs it. |
 | [allocator-and-huge-pages.md](allocator-and-huge-pages.md) | Analysis only, parked (2026-09-24). Ibex gains ~38% from a warm process on q21 against Polars' ~8% (first-touch page faults), so q21 is ~0.43 warm but ~0.63 fresh. jemalloc: no (+3.7% at 1 core). Whole-heap huge pages via `GLIBC_TUNABLES=glibc.malloc.hugetlb=1`: −8.0% / −4.9% fresh at 1 / 8 cores, neutral warm. Column-buffer-only `madvise` tried and reverted (−0.6% / −1.8%). Reopen if single command-line runs matter. |
 
 ## Proposed — no implementation yet
@@ -107,6 +107,20 @@ in active plans to `plans/done/...` paths refer to that history.
     count. Its "LazyTable Synchronization Contract" was never written down as
     code, but workers have decoded `LazyTable` units concurrently since
     2026-08-16, each with its own reader; read that section as history.
+
+- **phase3-dop-budget-analysis.md** — retired 2026-10-05; read it at
+  `git show 82ab01d1:plans/phase3-dop-budget-analysis.md`. An analysis of
+  kernel-pipeline Phase 3 item 2 (DOP and memory budgets). Done: 2a, the named
+  compute budget (`ExecutionContext::compute_budget()`), and the removal of
+  `IBEX_PARALLEL` (serial is `IBEX_CORES=1`; every core count gives the same
+  bits). Parked: 2b, child DOP budgets — reopen with a multi-producer breaker,
+  or when a third ad-hoc branch budget appears (consumer-helps' serial context
+  and `scan_pipeline_needs_spare` are two today). Rejected as scoped: 2c, a
+  memory budget, until something consumes it (binding GC is the likely first).
+  Its main premise is obsolete: nested `submit` from a pool thread used to be
+  an invariant violation and is now legal and bounded (cooperative waits run
+  strictly nested work; capped at the pool size). Its occupancy numbers are
+  SF-1, August; re-run `profile_suite.py` at SF-10 before reopening 2b.
 
 - **parallel-chunkview-output-plan.md** — removed 2026-09-02, all five delivery
   items landed (it had been mislabelled "proposed" while its whole protocol was

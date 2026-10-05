@@ -270,8 +270,12 @@ effect too. Milestone 1 needs ~260 ms, comfortably ~600 ms.
    pre-sized from a HyperLogLog); range-compressed packed keys measured a
    further −2 to −5% in a prototype (needs footer bounds through column
    origins and a fixed 16-bit categorical id). q13: 182 ms serial, the
-   aggregate row, and the fused non-anchored LIKE scan (66% more CPU than
-   dense decode plus a filter; `query-shape-conformance-plan.md` item 1).
+   aggregate row, and the fused non-anchored LIKE scan: `string_filter_scan`
+   over all of `o_comment` for `not like '%special%requests%'` uses 66% more
+   CPU than a dense decode plus an in-memory filter (SF-8/8c: fused 398 ms
+   wall / 2614 ms pool work, unfused 294 / 1577; better occupancy, 0.82 vs
+   0.67, hides part of it). Make the fused string scan competitive, or decline
+   fusion for a non-anchored LIKE over a large String column.
 7. **Scale-cliff sweep.** SF 1, 2, 4, 8, 10, 16, 30 at 1 and 16 cores; flag any
    query whose time grows faster than its data between adjacent scales, then
    diff its plan and profile across that step. Fixed thresholds to suspect:
@@ -280,9 +284,9 @@ effect too. Milestone 1 needs ~260 ms, comfortably ~600 ms.
    `kPackedPartitionMinRows`, the deferred-probe gates.
 8. **Decode width and scan starvation** (q04, q10, q12, q06, q20 show
    `occ ≈ 0.5, ring_wait ≈ self`; ties into items 1 and 3). Split a single-column decode's row-group
-   task when there are fewer tasks than workers
-   (`query-shape-conformance-plan.md` item 2); row-group size at write time is
-   the other lever.
+   task when there are fewer tasks than workers (`direct_decode_table`; q15's
+   `l_shipdate` at SF-2 left cores idle); row-group size at write time is the
+   other lever.
 9. **Canonical-plan audit.** Diff every query's plan with and without its
    `write_csv(result…)` line and A/B the two, for any pass still tuned to the
    pre-`5c64cfcb` shapes.
@@ -367,6 +371,25 @@ cursor at 2 cores.
   q18 +44%, q20 +30%. Small tweaks to the radix owned accumulate (a key/gid
   cache, run collapsing, a single fused scan with 8× redundant hashing):
   neutral or worse; it is latency-bound at ~30 ns/row.
+- **From the query-shape conformance work** (`482eb583` rewrote the 22
+  queries into their canonical form, −13–16%; the suite is back at parity
+  without q21): `elide_checked_ascriptions` (net +25%, it unblocked deferred
+  probes for q09/q12; `fuse_checked_ascriptions` replaced it); a structural
+  "was this side filtered" deferred-probe gate (`contains_row_reducing_node`,
+  net −10.3% where it should have won: cannot tell q08's small-by-construction
+  `part` from q12's large unfiltered `orders`); classifying `Ascribe` as
+  pipelineable, four attempts at +13–30% (every newly eligible scan paid
+  pipelining overhead for a consumer that drained it synchronously); a
+  numeric selective-decode path above the Arrow API, twice (the cost is in
+  Arrow's page copy).
+- **q21 is a shape gap, not a regression to undo.** Canonical q21 self-joins
+  lineitem at line granularity and then aggregates, so its join output grows
+  with the square of lines per order; the old query counted per order first.
+  Pushing `o_orderstatus == 'F'` through does nothing (it keeps ~50%).
+  Closing it needs a rewrite of "a self-join whose only consumer compares a
+  cardinality (`== 1`, `> 1`, `exists`)" into distinct-and-count, and q21 is
+  the only query with that shape. Swapping the old query text back in is
+  ruled out: join order and shape are the engine's job.
 - **A fix that does not move the wall** was usually off the critical path (the
   q10 build-side string concat: serial, fixed, 0%).
 

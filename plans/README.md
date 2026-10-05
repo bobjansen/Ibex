@@ -4,8 +4,8 @@ Status of every plan in this directory, grouped by lifecycle.
 
 **2026-10-05:** retired the radix group-by note, the owned aggregate,
 runtime multithreading, the Phase 3 DOP-budget analysis, the kernel-pipeline
-migration (finished), the compile-conformance umbrella (finished), and the
-three
+migration (finished), the compile-conformance umbrella (finished), the
+query-shape conformance leftovers (moved into beat-both), and the three
 reference documents (`joins.md`, `parallelism-overview.md`,
 `allocator-and-huge-pages.md`), whose rules moved to SPEC.md, `MEASURING.md`,
 `src/runtime/PARALLELISM.md` and the code; the rows below re-checked against
@@ -52,7 +52,6 @@ history).
 | [bigger-than-ram-plan.md](bigger-than-ram-plan.md) | Phase 4 bullet 1 of 4 done | Out-of-core execution. Done: chunked/streaming `read_parquet` (branch `chunked-parquet-read`; ~6.5× lower peak RSS, ~1.7× faster, verified local + AWS). Next: column projection pushdown, row-group stats pushdown, directory/Hive datasets (rest of Phase 4), then Phase 1 spill infrastructure (prerequisite for Phases 2–3, 6–7: external sort, out-of-core join, adaptive spill selection) |
 | [grouped-chunkview-update-plan.md](grouped-chunkview-update-plan.md) | Mostly complete — `update …, by k` runs off an immutable `GroupedRowPlan` (CSR) instead of gather → per-group `Table` → scatter. Began as a sub-plan of the (retired) kernel-pipeline plan's Phase 2. | Remaining materialized shapes: `rank`, variable-width ordered state, `window`-clause `lag`/`lead`. |
 | [per-occurrence-scan-selections-plan.md](per-occurrence-scan-selections-plan.md) | **Phases 1–3 LANDED** (`78a09fad`, `bf783ef3`, `f2b298db`). Restored filter pushdown for a source scanned more than once: each occurrence is renamed `source#fN` so `scan_predicates` keeps its predicate, `decode_demanded_lazy_sources` decodes the union of their output columns ONCE and gathers per occurrence, and the instances stay EAGER. Gated structurally on a fusable `like`. `ibex-e2e.sh` is green again. | **Phase 4 — narrow the `!= 1` gate generally.** Its price was +11.3% on q21, since the eager selection ran serial; with that fanned out (`f06e6da3`) widening the gate measures −0.4% geomean, byte-identical on 22, nothing regressed. The blocker is gone, so what is left is a risk judgement about the plan-shape change, not a cost one. |
-| [query-shape-conformance-plan.md](query-shape-conformance-plan.md) | **Compacted 2026-09-23.** The investigation is closed: excluding q21 the suite is at parity (0.995×), the scan-fusion cost gate is closed, and q21 is a known single-query gap (a self-join rewrite, not pushdown). The file now holds only the leftovers and the do-not-repeat list. | q13's fused non-anchored LIKE scan (66% more CPU than dense decode + filter); row-group task granularity in `direct_decode_table` (q15); a row-count-ratio deferred-probe gate (low priority, re-survey first). |
 
 ## Proposed — no implementation yet
 
@@ -128,6 +127,20 @@ in active plans to `plans/done/...` paths refer to that history.
   target, or a warm process shows page faults) are on `tune_allocator_once`
   in `src/runtime/interpreter.cpp`; the warm/fresh quoting rule is in
   `MEASURING.md`.
+
+- **query-shape-conformance-plan.md** — retired 2026-10-05; read it at
+  `git show 051dd48f:plans/query-shape-conformance-plan.md` (the full diary is at
+  `git show 81392162:plans/query-shape-conformance-plan.md`). Why the
+  canonical query rewrite (`482eb583`) cost 13–16% and how the suite got back
+  to parity without q21. Its open items moved to `beat-both-plan.md` §3 (q13's
+  fused non-anchored LIKE in item 6, the row-group task split in item 8), its
+  do-not-repeat list and the q21 shape argument to §5. Its third item, a
+  row-count-ratio deferred-probe gate, is built (`build_side_worth_deferring`:
+  the build estimate under half the probe's rows, then key-domain coverage).
+  Left: its note that the old "filter-into-join pushdown cannot see schemas at
+  lowering" mechanism looks resolved (the REPL re-runs
+  `push_filters_into_joins` with footer schemas); check that before reopening
+  it.
 
 - **ibex-compile-conformance-plan.md** — retired 2026-10-05; read it at
   `git show 707662b7:plans/ibex-compile-conformance-plan.md`. Closed the drift

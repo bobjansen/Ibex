@@ -97,6 +97,29 @@ TEST_CASE("Lower rejects map { } combined with another clause") {
     REQUIRE_FALSE(result.has_value());
 }
 
+TEST_CASE("Lower rejects a grouped select field that is not an aggregate", "[parser][lower]") {
+    // `select` + `by` emits one row per group. A field that is neither a group
+    // key nor an aggregate has no single value per group; it used to project
+    // every row and drop the `by`, so `lag` read across group boundaries.
+    for (const char* src :
+         {"t[select { d, l = lag(s, 1) }, by d];", "t[select { d, r = rank(s) }, by d];",
+          "t[select { d, s }, by d];", "t[select { s2 = s * 2 }, by { d }];"}) {
+        CAPTURE(src);
+        auto result = parser::lower(require_parse(src));
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().message.find("update") != std::string::npos);
+    }
+    // Only group keys: one row per group is `distinct`.
+    auto keys_only = parser::lower(require_parse("t[select { d }, by d];"));
+    REQUIRE_FALSE(keys_only.has_value());
+    CHECK(keys_only.error().message.find("distinct") != std::string::npos);
+
+    // Still fine: aggregates, and a `by` that groups a head/tail limit.
+    CHECK(parser::lower(require_parse("t[select { d, n = count() }, by d];")).has_value());
+    CHECK(parser::lower(require_parse("t[select { d, s }, head 1, by d];")).has_value());
+    CHECK(parser::lower(require_parse("t[update { l = lag(s, 1) }, by d];")).has_value());
+}
+
 TEST_CASE("Lower inlines a table-returning user function at its call site") {
     auto program = require_parse(
         "fn wide(src: DataFrame, lo: Int) -> DataFrame effects {} {\n"

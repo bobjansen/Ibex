@@ -6,9 +6,11 @@ measurement history this file leaves out, is at
 `git show 7a32d537:plans/beat-polars-plan.md` and
 `git show 7a32d537:plans/beat-duckdb-plan.md` (the August Polars plan is at
 `git show e82f679d:plans/beat-polars-plan.md`). Mechanism lives in
-`kernel-pipeline-execution-plan.md`, `runtime-multithreading-plan.md`,
-`owned-agg-per-chunk-barrier-plan.md`, `parallelism-overview.md` and
-`src/runtime/PARALLELISM.md`.
+`kernel-pipeline-execution-plan.md`, `parallelism-overview.md` and
+`src/runtime/PARALLELISM.md`; the retired owned-aggregate and
+runtime-multithreading plans are at
+`git show 587bc2e4:plans/owned-agg-per-chunk-barrier-plan.md` and
+`git show 587bc2e4:plans/runtime-multithreading-plan.md`.
 
 **The benchmark write-up waits for this plan's first milestone.** Ibex is the
 fastest of the three engines on 1–4 cores, ties at 8 and loses at 16 (§1.0); a
@@ -221,52 +223,31 @@ effect too. Milestone 1 needs ~260 ms, comfortably ~600 ms.
    through another join path (fused probe); check separately. q04 is a semi
    join, a different operator.
 
-   *Order (2026-10-04, at review):* widen the filter to every reasonable key
-   type first, so this lands as a general mechanism rather than an
-   Int64-only benchmark path. **Stage A** (Date, Timestamp, Bool keys through
-   `join_key_domain`, one definition shared by publisher, `LazyTable` and the
-   Parquet fused scan; TIMESTAMP(NANO) fuses, other units filter after decode)
-   is built. **Stage B** String/Categorical keys (string membership: hash Bloom
-   plus exact set; Parquet dictionary pages tested per entry). **Stage C** this
-   item, gated on "the publisher produced a filter", not on key type. Not
-   covered by design: Decimal (int128), Double. Found on the way: joins inside
-   `rbind(...)` arguments never get a deferred probe, whatever the key type.
+   *Order (2026-10-04, at review):* the filter was widened to every
+   reasonable key type first, so this landed as a general mechanism rather
+   than an Int64-only benchmark path. **Stage A** (`a1d8fd8d`): Date,
+   Timestamp and Bool keys through `join_key_domain`, one definition shared by
+   publisher, `LazyTable` and the Parquet fused scan; TIMESTAMP(NANO) fuses,
+   other units filter after decode. **Stage B** (`b9cb2f9e`): String and
+   Categorical keys (an exact string set; Categorical tested once per
+   dictionary entry). **Stage C** (`c4084d23`): this item, gated on "the
+   publisher produced a filter", not on key type. Found on the way and fixed:
+   joins inside `rbind(...)` never got a deferred probe (`5b5ac0a0`).
 
-   *Design.*
-   - **Slot.** A new `DeferredScan::stream_filter` (`shared_ptr<DynamicScanFilter>`),
-     not `filter`: three sites read `filter == nullptr` as "streaming, not a
-     probe scan". `key_column` is shared. `plan_deferred_scan` uses whichever
-     slot is ready; the per-unit decode already honours `plan.dynamic` plus
-     the key column (`materialize_deferred_scan_unit`), so a streamed unit is
-     key-scanned and decodes the rest selected. Public header: rebuild plugins.
-   - **Lowering.** `ir::streamed_join_scans` (beside `deferrable_probe_scans`,
-     same `match_probe_chain` through Project/Rename) names the LEFT base scan
-     of an inner single-key join when it occurs once and carries **no static
-     conjuncts**. The REPL's streaming-registration loop sets
-     `key_column` and `stream_filter` for it.
-   - **Plan timing.** `PipelinedScanOperator` and `DeferredScanSourceOperator`
-     snapshot `plan_deferred_scan` in their constructors, before the right
-     side exists. Move it to first `next()`. `runtime_entry.cpp` builds the
-     left operator, then materializes the right, then the join, and nothing
-     starts the left before the join pulls it -- verify no stage thread does.
-   - **Publish.** `runtime_entry` passes the left scan's slot to the join. In
-     `ChunkedInnerJoinOperator::initialize`, before draining the left: if
-     `n_right * 2 <= left rows` (exact, since the scan has no conjuncts),
-     `publish_build_filter_column(*right_, right key, slot)`; if that produced
-     a filter, go straight to BuildRight, otherwise drain as today, so a key
-     type with no filter keeps its side choice. With no conjuncts and that row
-     ratio the drain would choose BuildRight anyway, so output order is
-     unchanged. The filter's runtime abandon rule covers a gate that guessed
-     wrong.
-   - **Semantics.** Inner join only; a left row whose key is not in the build
-     can never match, and a null key matches nothing. Membership is exact
-     for a dense key range, a Bloom otherwise; the probe still checks every
-     surviving row.
-   - **Tests.** Lowered-IR test that the left scan is registered (parity
-     cannot see lowering, memory `project_parity_cannot_see_lowering_bugs`); a
-     runtime test that the left scan decoded only matching rows (fail-first);
-     a self-join and a filtered left that must stay unregistered; q12 answer
-     byte-identity, and paired A/B on q12/q10/q14/q07 plus the full suite.
+   *As built* (`c4084d23`). `DeferredScan::stream_filter` is a second slot
+   beside `filter` (three sites read `filter == nullptr` as "streaming, not a
+   probe scan"). `ir::streamed_join_left_scans` names the left base scan of a
+   single-key inner join, reached through Project/Rename and read once; the
+   REPL registers it only when the scan has no filter of its own, so its row
+   count is exact. The scan operators plan on first `next()`, after the right
+   side exists. `ChunkedInnerJoinOperator::publish_left_stream_filter` runs
+   before the left is drained: when `n_right * 2 <=` left rows it publishes the
+   right keys, and a published filter goes straight to BuildRight (the side the
+   drain would have chosen anyway, so output order is unchanged); no filter
+   means the old drain. Inner join only. Tests: the lowered-IR matcher
+   (`test_ir_required_columns.cpp`) and the StreamLeftReader runtime test
+   (`test_interpreter.cpp`), which fails with the filter switched off.
+   Not covered: two-key joins, semi/anti left inputs, Decimal and Double keys.
 3. **q12 scaling** (+75 ms) is mostly item 2. q16 (3.6× against 5.8×) is
    the same symptom at a smaller size; check `occ`/`ring_wait` (item 8) first.
 4. **q10** (+74 ms). −23% at 8 cores (`96d974dc`: dictionary-decided string
@@ -381,6 +362,11 @@ cursor at 2 cores.
   hit L1.
 - **jemalloc:** +3.7% fresh at 1 core. **Huge pages for column buffers
   only:** −0.6% / −1.8%; whole-heap huge pages are the lever (parked).
+- **Owned aggregate:** more partitions than workers (`part_count`): q18 +13
+  to +48%. A serial `reserve` of the partition maps on the calling thread:
+  q18 +44%, q20 +30%. Small tweaks to the radix owned accumulate (a key/gid
+  cache, run collapsing, a single fused scan with 8× redundant hashing):
+  neutral or worse; it is latency-bound at ~30 ns/row.
 - **A fix that does not move the wall** was usually off the critical path (the
   q10 build-side string concat: serial, fixed, 0%).
 

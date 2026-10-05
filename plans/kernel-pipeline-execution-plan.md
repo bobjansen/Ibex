@@ -10,8 +10,11 @@ ordering, distinct, row-local map) is out of the monolith (`chunked.cpp`
 5152→1635 lines) and the `MaterializedCall` adapter is the accepted end state,
 not a way-station to zero fallbacks. The two remaining Phase 5 items (test-binary
 split; fallback-kind migration) are deferred with reopen conditions. **What's
-left is perf, not migration** — see "Next, in order" and `plans/beat-both-plan.md`;
-the first target is the q21 serial hash build, now unblocked by Phase 4.
+left is perf, not migration**, ranked in `plans/beat-both-plan.md` §3. (This
+header once named the q21 serial hash build as the first target; the 40 ms it
+rested on came from wall-span self times and is unconfirmed — re-measure with
+`perf` and per-node `pool_tasks` before spending on it.) On 2026-10-04
+`interpret_node` stopped being a second executor (Phase 5 item 3 below).
 **Compacted
 2026-08-27** — the ~40-entry Phase 2 per-commit diary is in git history at the
 pre-compaction commit's parent; the "Where Phase 2 stands" table below is the
@@ -32,14 +35,13 @@ canonicalize table is in `include/ibex/ir/canonicalize.hpp`.
 
 ## Why
 
-`src/runtime/chunked.cpp` remains the residual streaming operator
-implementations and a large set of operator-specific construction rules.
-Planning lives in `physical_plan.cpp`, migrated-plan validation and dispatch in
-`runtime_entry.cpp`, and generic map/morsel execution in
-`pipeline_executor.cpp`. Aggregate and streaming inner join have moved to
-family-owned translation units, but the remaining responsibilities are still
-grown together because
-`build_operator(const ir::Node&)` lowers logical nodes directly into mutable
+*Written before the migration; kept for the reasoning.* `src/runtime/chunked.cpp`
+held the streaming operator implementations and a large set of
+operator-specific construction rules (it has since been split by family and
+renamed `runtime_entry.cpp`, 2026-08-31). Planning lives in
+`physical_plan.cpp` and generic map/morsel execution in
+`pipeline_executor.cpp`. The responsibilities had grown together because
+`build_operator(const ir::Node&)` lowered logical nodes directly into mutable
 `Operator::next()` objects. Three costs: (1) a physical choice has no
 representation ("stream this join", "materialize this aggregate" are builder
 branches, not inspectable decisions); (2) parallelism is operator-local — a

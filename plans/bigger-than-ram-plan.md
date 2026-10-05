@@ -53,7 +53,7 @@ suggested sequence follows expected workload payoff.
 | 4 | Chunked, pushdown-aware Parquet: row-group streaming (**done**), column pruning, stats pushdown, directory/Hive datasets | 1 (for the case where a single row group still doesn't fit; independent otherwise) |
 | 5 | ADBC + Parquet chunked sinks (write path) | none of the above strictly, but pointless without 4 for the Parquet half |
 | 6 | Planner-driven adaptive operator selection (spill only when the budget is actually crossed) | 1–3 |
-| 7 (stretch) | Parallel spill I/O | 1 + `runtime-multithreading-plan.md` |
+| 7 (stretch) | Parallel spill I/O | 1 + the multi-core runtime (landed; `src/runtime/PARALLELISM.md`) |
 
 ### Phase 1 — Spill infrastructure
 
@@ -73,7 +73,7 @@ built on it.
   code: bespoke binary would be marginally faster to (de)serialize but is a
   new format to maintain and test independently.
 - A byte-budget tracker (`IBEX_MAX_MEMORY`, following the current compute/pool
-  configuration split in `runtime-multithreading-plan.md`): unset/0 means unbounded — the
+  configuration split in `src/runtime/PARALLELISM.md`): unset/0 means unbounded — the
   default, so existing benchmarks and RSS baselines are completely unaffected
   until a user opts in. When set, operators accumulate in memory and spill only once the
   running estimate crosses the budget — no cardinality estimation or
@@ -246,7 +246,7 @@ genuinely doesn't fit.
 
 ### Phase 7 (stretch) — Parallel spill I/O
 
-Only after both Phase 1 and `runtime-multithreading-plan.md` have landed:
+Only after Phase 1 has landed (the multi-core runtime it also needs has):
 parallelize spill-partition writes (join) and k-way merge reads (sort) using
 the worker pool that plan introduces. Sequence deliberately after — do not
 couple spill correctness work to multithreading work; get single-threaded
@@ -307,7 +307,7 @@ spill correct and tested first.
   Snowflake, DuckDB, SQLite"). Phase 5 here is also the first real exercise
   of that memory's "sinks are first-class" requirement for the eventual SQL
   backend.
-- **`plans/runtime-multithreading-plan.md`** intersects only at Phase 7
+- **The retired runtime-multithreading plan** (`git show 587bc2e4:plans/runtime-multithreading-plan.md`; current design in `src/runtime/PARALLELISM.md`) intersects only at Phase 7
   (stretch). Everything else in this plan is orthogonal to thread count —
   do not block spill correctness work on multithreading landing first.
 - **`plans/done/function-kind-registry-plan.md`** is unrelated in mechanism but

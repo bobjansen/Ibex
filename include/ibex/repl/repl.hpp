@@ -3,10 +3,12 @@
 
 #pragma once
 
+#include <ibex/ir/schema.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
 #include <cstddef>
+#include <expected>
 #include <memory>
 #include <optional>
 #include <string>
@@ -53,6 +55,10 @@ struct ExecutionResult {
     /// remains the last table for compatibility with existing callers.
     std::vector<runtime::Table> tables;
     std::optional<runtime::ScalarValue> scalar;
+    /// Everything the execution wrote to stdout: `print(...)` output, warnings,
+    /// and (when rendering) the formatted results -- but not the error, which
+    /// is in `error`.
+    std::string output;
     std::string error;
     std::optional<std::size_t> error_line;
     std::optional<std::size_t> error_column;
@@ -77,9 +83,35 @@ class ReplSession {
     ReplSession(const ReplSession&) = delete;
     auto operator=(const ReplSession&) -> ReplSession& = delete;
 
+    /// How one `execute` call runs.
+    struct ExecuteOptions {
+        /// Tables and scalars visible to this call only: bound under their
+        /// names for its duration, shadowing any session binding of the same
+        /// name, and removed again afterwards -- unless the call itself rebinds
+        /// the name, in which case its binding stays.
+        runtime::TableRegistry tables;
+        runtime::ScalarRegistry scalars;
+        /// Format each value to text as the terminal REPL does. A caller that
+        /// reads `ExecutionResult::table` / `scalar` itself can skip it.
+        bool render = true;
+    };
+
     [[nodiscard]] auto execute(std::string_view source) -> ExecutionResult;
+    [[nodiscard]] auto execute(std::string_view source, ExecuteOptions options) -> ExecutionResult;
     [[nodiscard]] auto environment() const -> std::vector<EnvironmentTable>;
     [[nodiscard]] auto erase(std::string_view name) -> bool;
+
+    /// The table bound to `name`, decoding a lazy binding in full.
+    [[nodiscard]] auto table_binding(std::string_view name)
+        -> std::expected<runtime::Table, std::string>;
+
+    /// The schema of one expression, inferred by lowering it against the
+    /// session's bindings without running it. Nullopt when it does not lower
+    /// or the schema is not fully known. `extra_names` are names the caller
+    /// will bind for the call that runs it (they are not columns).
+    [[nodiscard]] auto infer_schema(std::string_view expression,
+                                    const std::vector<std::string>& extra_names) const
+        -> std::optional<ir::SchemaInfo>;
 
    private:
     class Impl;

@@ -304,6 +304,13 @@ auto active_execution_result() -> ExecutionResult*& {
     return result;
 }
 
+// Whether values are formatted to text. Off for a programmatic caller that
+// reads ExecutionResult itself (ReplSession::ExecuteOptions::render).
+auto render_results() -> bool& {
+    static thread_local bool render = true;
+    return render;
+}
+
 struct BoundCallArg {
     const parser::Param* param = nullptr;
     parser::Expr* expr = nullptr;
@@ -622,8 +629,10 @@ void print_table(const runtime::Table& table, std::size_t max_rows) {
 
 // Render any evaluated value (table, scalar, or column) to stdout using the
 // same formatting the REPL applies to a bare expression statement. Shared by
-// the top-level statement printer and the `print(...)` builtin.
-void render_eval_value(const EvalValue& value) {
+// the top-level statement printer and the `print(...)` builtin; `requested` is
+// the builtin, whose output is the point and is formatted even when the
+// session does not render results.
+void render_eval_value(const EvalValue& value, bool requested = false) {
     if (active_execution_result() != nullptr) {
         if (const auto* scalar = std::get_if<runtime::ScalarValue>(&value)) {
             active_execution_result()->scalar = *scalar;
@@ -637,6 +646,9 @@ void render_eval_value(const EvalValue& value) {
             active_execution_result()->table = table;
             active_execution_result()->tables.push_back(table);
         }
+    }
+    if (!render_results() && !requested) {
+        return;
     }
     if (const auto* scalar = std::get_if<runtime::ScalarValue>(&value)) {
         ibex::formatting::print("{}\n", format_scalar(*scalar));
@@ -1083,6 +1095,21 @@ auto table_schema_info(const runtime::Table& table) -> ir::SchemaInfo {
     for (const auto& entry : table.columns) {
         fields.push_back(
             ir::SchemaField{.name = entry.name, .type = column_ir_type(*entry.column)});
+    }
+    return ir::SchemaInfo::known(std::move(fields), /*open=*/false);
+}
+
+/// `table_schema_info` for a materialized table, with the one nullability proof
+/// it carries: a column with no validity bitmap holds no nulls. Not for a lazy
+/// source's schema, whose columns hold no rows and so no bitmap either.
+auto materialized_schema_info(const runtime::Table& table) -> ir::SchemaInfo {
+    std::vector<ir::SchemaField> fields;
+    fields.reserve(table.columns.size());
+    for (const auto& entry : table.columns) {
+        fields.push_back(ir::SchemaField{
+            .name = entry.name,
+            .type = column_ir_type(*entry.column),
+            .nulls = entry.validity.has_value() ? ir::Nullability::Maybe : ir::Nullability::Never});
     }
     return ir::SchemaInfo::known(std::move(fields), /*open=*/false);
 }
@@ -2750,7 +2777,7 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
             }
             // Display as a side effect and pass the value through unchanged, so
             // `print(x)` composes (e.g. `let y = print(x);` shows and binds).
-            render_eval_value(inner.value());
+            render_eval_value(inner.value(), /*requested=*/true);
             return inner;
         }
         if (call->callee == "seed_rng") {
@@ -3310,6 +3337,68 @@ auto eval_series_call(parser::CallExpr& call, runtime::TableRegistry& tables,
     return EvalValue{std::move(col.value())};
 }
 
+/// What the lowerer needs to know about a session's bindings to lower one
+/// expression the way the REPL does: table externs and sinks, every in-scope
+/// name (so a bare name in a clause is not taken for a missing column), the
+/// schema of each table binding, and the user functions it inlines.
+auto build_lower_context(const runtime::TableRegistry& tables, const LazyTableRegistry& lazy_tables,
+                         const runtime::ScalarRegistry& scalars, const ColumnRegistry& columns,
+                         const ModelRegistry& models, const FunctionRegistry& functions,
+                         const CompileTimeListRegistry& compile_time_lists,
+                         const ExternDeclRegistry& extern_decls) -> parser::LowerContext {
+    parser::LowerContext context;
+    context.compile_time_lists = compile_time_lists;
+    for (const auto& [name, decl] : extern_decls) {
+        if (decl.return_type.kind == parser::Type::Kind::DataFrame ||
+            decl.return_type.kind == parser::Type::Kind::TimeFrame) {
+            context.table_externs.insert(name);
+            context.table_extern_decls.insert_or_assign(name, &decl);
+        }
+        if (!decl.params.empty() && decl.params[0].type.kind == parser::Type::Kind::DataFrame) {
+            context.sink_externs.insert(name);
+        }
+    }
+    // Supply every in-scope binding name so the lowerer can statically validate
+    // column references in filter/computed expressions without false positives.
+    // A superset is safe; under-inclusion is not, so include all registries.
+    for (const auto& entry : scalars) {
+        context.lexical_names.insert(entry.first);
+    }
+    for (const auto& entry : columns) {
+        context.lexical_names.insert(entry.first);
+    }
+    for (const auto& entry : models) {
+        context.lexical_names.insert(entry.first);
+    }
+    for (const auto& entry : functions) {
+        context.lexical_names.insert(entry.first);
+    }
+    for (const auto& entry : compile_time_lists) {
+        context.lexical_names.insert(entry.first);
+    }
+    for (const auto& entry : tables) {
+        context.lexical_names.insert(entry.first);
+    }
+    for (const auto& entry : lazy_tables) {
+        context.lexical_names.insert(entry.first);
+    }
+    // Carry the exact schema of each in-scope table binding into the lowerer so
+    // references to a let-bound table are checked statically in this expression.
+    // A lazy binding knows its schema without having decoded anything, so it is
+    // checked just as strictly as a materialized one.
+    for (const auto& [name, table] : tables) {
+        context.source_schemas.insert_or_assign(name, materialized_schema_info(table));
+    }
+    for (const auto& [name, lazy] : lazy_tables) {
+        context.source_schemas.insert_or_assign(name, table_schema_info(lazy->schema()));
+    }
+    // Scalar user functions are inlined when called inside clause expressions.
+    for (const auto& [name, decl] : functions) {
+        context.functions.insert_or_assign(name, &decl);
+    }
+    return context;
+}
+
 auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                      LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
                      ColumnRegistry& columns, ModelRegistry& models,
@@ -3520,56 +3609,8 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         return std::unexpected("unknown table: " + ident->name +
                                " (available: " + format_table_names(tables, lazy_tables) + ")");
     }
-    parser::LowerContext context;
-    context.compile_time_lists = compile_time_lists;
-    for (const auto& [name, decl] : extern_decls) {
-        if (decl.return_type.kind == parser::Type::Kind::DataFrame ||
-            decl.return_type.kind == parser::Type::Kind::TimeFrame) {
-            context.table_externs.insert(name);
-            context.table_extern_decls.insert_or_assign(name, &decl);
-        }
-        if (!decl.params.empty() && decl.params[0].type.kind == parser::Type::Kind::DataFrame) {
-            context.sink_externs.insert(name);
-        }
-    }
-    // Supply every in-scope binding name so the lowerer can statically validate
-    // column references in filter/computed expressions without false positives.
-    // A superset is safe; under-inclusion is not, so include all registries.
-    for (const auto& entry : scalars) {
-        context.lexical_names.insert(entry.first);
-    }
-    for (const auto& entry : columns) {
-        context.lexical_names.insert(entry.first);
-    }
-    for (const auto& entry : models) {
-        context.lexical_names.insert(entry.first);
-    }
-    for (const auto& entry : functions) {
-        context.lexical_names.insert(entry.first);
-    }
-    for (const auto& entry : compile_time_lists) {
-        context.lexical_names.insert(entry.first);
-    }
-    for (const auto& entry : tables) {
-        context.lexical_names.insert(entry.first);
-    }
-    for (const auto& entry : lazy_tables) {
-        context.lexical_names.insert(entry.first);
-    }
-    // Carry the exact schema of each in-scope table binding into the lowerer so
-    // references to a let-bound table are checked statically in this expression.
-    // A lazy binding knows its schema without having decoded anything, so it is
-    // checked just as strictly as a materialized one.
-    for (const auto& [name, table] : tables) {
-        context.source_schemas.insert_or_assign(name, table_schema_info(table));
-    }
-    for (const auto& [name, lazy] : lazy_tables) {
-        context.source_schemas.insert_or_assign(name, table_schema_info(lazy->schema()));
-    }
-    // Scalar user functions are inlined when called inside clause expressions.
-    for (const auto& [name, decl] : functions) {
-        context.functions.insert_or_assign(name, &decl);
-    }
+    parser::LowerContext context = build_lower_context(
+        tables, lazy_tables, scalars, columns, models, functions, compile_time_lists, extern_decls);
     auto lowered = parser::lower_expr(expr, context);
     if (!lowered) {
         return std::unexpected(lowered.error().message);
@@ -6278,43 +6319,8 @@ void print_physical_explain(parser::Expr& expr, const runtime::TableRegistry& ta
                             const CompileTimeListRegistry& compile_time_lists,
                             const ExternDeclRegistry& extern_decls,
                             const runtime::ExternRegistry& externs) {
-    parser::LowerContext context;
-    context.compile_time_lists = compile_time_lists;
-    for (const auto& [name, decl] : extern_decls) {
-        if (decl.return_type.kind == parser::Type::Kind::DataFrame ||
-            decl.return_type.kind == parser::Type::Kind::TimeFrame) {
-            context.table_externs.insert(name);
-            context.table_extern_decls.insert_or_assign(name, &decl);
-        }
-        if (!decl.params.empty() && decl.params[0].type.kind == parser::Type::Kind::DataFrame) {
-            context.sink_externs.insert(name);
-        }
-    }
-    for (const auto& entry : scalars) {
-        context.lexical_names.insert(entry.first);
-    }
-    for (const auto& entry : columns) {
-        context.lexical_names.insert(entry.first);
-    }
-    for (const auto& entry : models) {
-        context.lexical_names.insert(entry.first);
-    }
-    for (const auto& entry : functions) {
-        context.lexical_names.insert(entry.first);
-        context.functions.insert_or_assign(entry.first, &entry.second);
-    }
-    for (const auto& entry : compile_time_lists) {
-        context.lexical_names.insert(entry.first);
-    }
-    for (const auto& entry : tables) {
-        context.lexical_names.insert(entry.first);
-        context.source_schemas.insert_or_assign(entry.first, table_schema_info(entry.second));
-    }
-    for (const auto& entry : lazy_tables) {
-        context.lexical_names.insert(entry.first);
-        context.source_schemas.insert_or_assign(entry.first,
-                                                table_schema_info(entry.second->schema()));
-    }
+    parser::LowerContext context = build_lower_context(
+        tables, lazy_tables, scalars, columns, models, functions, compile_time_lists, extern_decls);
 
     auto lowered = parser::lower_expr(expr, context);
     if (!lowered.has_value()) {
@@ -7089,6 +7095,146 @@ ReplSession::ReplSession(ReplSession&&) noexcept = default;
 auto ReplSession::operator=(ReplSession&&) noexcept -> ReplSession& = default;
 
 auto ReplSession::execute(std::string_view source) -> ExecutionResult {
+    return execute(source, ExecuteOptions{});
+}
+
+namespace {
+
+/// Binds a ReplSession call's own tables and scalars for its duration (see
+/// ReplSession::ExecuteOptions) and puts the session back afterwards. A name
+/// lives in one registry, so a call binding shadows whatever the session holds
+/// under that name, in any registry, and the session's binding returns after.
+class CallBindings {
+   public:
+    CallBindings(runtime::TableRegistry& tables, LazyTableRegistry& lazy_tables,
+                 runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
+                 runtime::TableRegistry call_tables, runtime::ScalarRegistry call_scalars)
+        : tables_(&tables), lazy_tables_(&lazy_tables), scalars_(&scalars), columns_(&columns) {
+        for (auto& [name, table] : call_tables) {
+            shadow(name);
+            bound_tables_.emplace_back(name, identity(table));
+            tables_->insert_or_assign(name, std::move(table));
+        }
+        for (auto& [name, value] : call_scalars) {
+            shadow(name);
+            bound_scalars_.emplace_back(name, value);
+            scalars_->insert_or_assign(name, std::move(value));
+        }
+    }
+    CallBindings(const CallBindings&) = delete;
+    auto operator=(const CallBindings&) -> CallBindings& = delete;
+    CallBindings(CallBindings&&) = delete;
+    auto operator=(CallBindings&&) -> CallBindings& = delete;
+
+    ~CallBindings() {
+        try {
+            put_back();
+        } catch (...) {
+            // Only an allocation can fail here; the call's bindings then stay.
+            static_cast<void>(std::fputs(
+                "ibex: could not restore the session's bindings after a call\n", stderr));
+        }
+    }
+
+   private:
+    /// A binding the call left alone is removed; one it replaced stays.
+    void put_back() {
+        for (const auto& [name, column] : bound_tables_) {
+            if (auto it = tables_->find(name);
+                it != tables_->end() && identity(it->second) == column) {
+                tables_->erase(it);
+                restore(name);
+            }
+        }
+        for (const auto& [name, value] : bound_scalars_) {
+            if (auto it = scalars_->find(name); it != scalars_->end() && it->second == value) {
+                scalars_->erase(it);
+                restore(name);
+            }
+        }
+    }
+
+    struct Shadowed {
+        std::optional<runtime::Table> table;
+        std::optional<runtime::LazyTablePtr> lazy;
+        std::optional<runtime::ScalarValue> scalar;
+        std::optional<runtime::ColumnValue> column;
+    };
+
+    /// The storage of a table's first column: shared, so a binding the call
+    /// did not touch still holds it, and a rebinding almost never does.
+    static auto identity(const runtime::Table& table) -> const void* {
+        return table.columns.empty() ? static_cast<const void*>(&table)
+                                     : static_cast<const void*>(table.columns.front().column.get());
+    }
+
+    void shadow(const std::string& name) {
+        Shadowed saved;
+        if (auto it = tables_->find(name); it != tables_->end()) {
+            saved.table = std::move(it->second);
+            tables_->erase(it);
+        }
+        if (auto it = lazy_tables_->find(name); it != lazy_tables_->end()) {
+            saved.lazy = std::move(it->second);
+            lazy_tables_->erase(it);
+        }
+        if (auto it = scalars_->find(name); it != scalars_->end()) {
+            saved.scalar = std::move(it->second);
+            scalars_->erase(it);
+        }
+        if (auto it = columns_->find(name); it != columns_->end()) {
+            saved.column = std::move(it->second);
+            columns_->erase(it);
+        }
+        shadowed_.insert_or_assign(name, std::move(saved));
+    }
+
+    void restore(const std::string& name) {
+        auto it = shadowed_.find(name);
+        if (it == shadowed_.end()) {
+            return;
+        }
+        auto& saved = it->second;
+        if (saved.table.has_value()) {
+            tables_->insert_or_assign(name, std::move(*saved.table));
+        }
+        if (saved.lazy.has_value()) {
+            lazy_tables_->insert_or_assign(name, std::move(*saved.lazy));
+        }
+        if (saved.scalar.has_value()) {
+            scalars_->insert_or_assign(name, std::move(*saved.scalar));
+        }
+        if (saved.column.has_value()) {
+            columns_->insert_or_assign(name, std::move(*saved.column));
+        }
+    }
+
+    runtime::TableRegistry* tables_;
+    LazyTableRegistry* lazy_tables_;
+    runtime::ScalarRegistry* scalars_;
+    ColumnRegistry* columns_;
+    std::vector<std::pair<std::string, const void*>> bound_tables_;
+    std::vector<std::pair<std::string, runtime::ScalarValue>> bound_scalars_;
+    robin_hood::unordered_map<std::string, Shadowed> shadowed_;
+};
+
+/// Sets the thread's render flag for one execution.
+class RenderScope {
+   public:
+    explicit RenderScope(bool render) : previous_(render_results()) { render_results() = render; }
+    RenderScope(const RenderScope&) = delete;
+    auto operator=(const RenderScope&) -> RenderScope& = delete;
+    RenderScope(RenderScope&&) = delete;
+    auto operator=(RenderScope&&) -> RenderScope& = delete;
+    ~RenderScope() { render_results() = previous_; }
+
+   private:
+    bool previous_;
+};
+
+}  // namespace
+
+auto ReplSession::execute(std::string_view source, ExecuteOptions options) -> ExecutionResult {
     ExecutionResult result;
     const std::string normalized = normalize_input(source);
     auto parsed = parser::parse(normalized);
@@ -7102,6 +7248,10 @@ auto ReplSession::execute(std::string_view source) -> ExecutionResult {
     const auto comments = collect_script_comment_lines(normalized);
     const auto doc_comment_groups = build_statement_comment_groups(parsed->statements, comments);
     const std::scoped_lock lock(execution_capture_mutex());
+    const CallBindings call_bindings(impl_->tables, impl_->lazy_tables, impl_->scalars,
+                                     impl_->columns, std::move(options.tables),
+                                     std::move(options.scalars));
+    const RenderScope render(options.render);
     StdoutCapture capture;
     active_execution_result() = &result;
     const bool ok = execute_statements(
@@ -7112,14 +7262,20 @@ auto ReplSession::execute(std::string_view source) -> ExecutionResult {
         &impl_->function_sources, &impl_->declaration_docs, &impl_->imports, normalized,
         &impl_->usings);
     active_execution_result() = nullptr;
-    const std::string output = capture.take();
+    std::string output = capture.take();
     result.ok = ok;
     if (!ok) {
         result.error = error_from_output(output);
         if (result.error.empty()) {
             result.error = "query execution failed";
         }
+        // The error is reported in `error`, not again in the output.
+        if (const auto start = output.rfind("error: "); start != std::string::npos) {
+            const auto end = output.find('\n', start);
+            output.erase(start, end == std::string::npos ? std::string::npos : end - start + 1);
+        }
     }
+    result.output = std::move(output);
     return result;
 }
 
@@ -7153,6 +7309,44 @@ auto ReplSession::erase(std::string_view name) -> bool {
            impl_->models.erase(key) != 0 || impl_->functions.erase(key) != 0 ||
            impl_->compile_time_lists.erase(key) != 0 || impl_->extern_decls.erase(key) != 0 ||
            impl_->resources.erase(key) != 0;
+}
+
+auto ReplSession::table_binding(std::string_view name)
+    -> std::expected<runtime::Table, std::string> {
+    const std::string key(name);
+    if (auto it = impl_->tables.find(key); it != impl_->tables.end()) {
+        return it->second;
+    }
+    if (auto it = impl_->lazy_tables.find(key); it != impl_->lazy_tables.end()) {
+        return it->second->materialize(command_exec());
+    }
+    return std::unexpected("session has no table binding named '" + key + "'");
+}
+
+auto ReplSession::infer_schema(std::string_view expression,
+                               const std::vector<std::string>& extra_names) const
+    -> std::optional<ir::SchemaInfo> {
+    auto parsed = parser::parse(normalize_input(expression));
+    if (!parsed.has_value() || parsed->statements.size() != 1) {
+        return std::nullopt;
+    }
+    const auto* statement = std::get_if<parser::ExprStmt>(&parsed->statements.front());
+    if (statement == nullptr || statement->expr == nullptr) {
+        return std::nullopt;
+    }
+    parser::LowerContext context = build_lower_context(
+        impl_->tables, impl_->lazy_tables, impl_->scalars, impl_->columns, impl_->models,
+        impl_->functions, impl_->compile_time_lists, impl_->extern_decls);
+    context.lexical_names.insert(extra_names.begin(), extra_names.end());
+    auto lowered = parser::lower_expr(*statement->expr, context);
+    if (!lowered.has_value() || lowered.value() == nullptr) {
+        return std::nullopt;
+    }
+    auto schema = ir::infer_schema(*lowered.value(), context.source_schemas);
+    if (!schema.is_known()) {
+        return std::nullopt;
+    }
+    return schema;
 }
 
 auto line_editing::verbose() -> bool {

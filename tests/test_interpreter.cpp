@@ -16326,7 +16326,7 @@ TEST_CASE("Pipeline scheduler stages a streamable join before its consumer",
 
 TEST_CASE("Deferred probe resolving below the stream threshold preserves its drained probe side",
           "[runtime][parallel][join][deferred_probe]") {
-    // Regression for the q18 crash described in kernel-pipeline Phase 4. The
+    // Regression for a q18 crash found during the breaker migration. The
     // lazy right starts above kStreamRightThreshold, so the join drains the
     // left and publishes a membership filter. That filter leaves one right
     // row, putting initialize() back below the threshold. The BuildRight path

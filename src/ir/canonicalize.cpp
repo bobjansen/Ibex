@@ -790,9 +790,8 @@ auto try_filter_past_aggregate(NodePtr node) -> TryResult {
 // resolving the same fused kernel. Keeping them here would have meant two
 // places deciding the same thing, with the IR carrying the answer.
 //
-// The fused node kinds themselves remain, constructible and handled
-// everywhere they were, because tools and serialized trees still name them —
-// see plans/kernel-pipeline-execution-plan.md Phase 5.
+// The fused node kinds (`FilterProject`, `FilterUpdateProject`) were deleted
+// afterwards, with their compatibility lowering.
 
 // R7/R8: Head(Filter(x)) → FilterHead(x), Tail(Filter(x)) → FilterTail(x)
 // when the limit has no group_by.
@@ -916,6 +915,8 @@ using RuleFn = TryResult (*)(NodePtr);
 // Ordered list of rules. The driver tries each in turn; on any fire, it
 // restarts from the top, so earlier rules are re-tried against shapes exposed
 // by later ones. Rule names mirror the Rx labels in canonicalize.hpp.
+// Shrink the size when removing a rule: a missing initializer is a null RuleFn,
+// and the driver calls it (942 tests segfaulted the one time that happened).
 constexpr std::array<std::pair<std::string_view, RuleFn>, 17> kRules{{
     {"R19:filter-merge", try_filter_merge},
     {"R17:simplify-predicate", try_simplify_predicate},

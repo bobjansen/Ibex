@@ -31,7 +31,7 @@
 // pruning narrows the right side before it is materialized. The make_* entry
 // points used by runtime_entry.cpp are at the bottom of the file and are
 // declared in join_chunked_internal.hpp.
-// Background: plans/kernel-pipeline-execution-plan.md.
+// Background: src/runtime/CONTRACTS.md section 0.
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/compiler.hpp>
@@ -146,8 +146,8 @@ inline constexpr std::size_t kJoinNil = std::numeric_limits<std::size_t>::max();
 /// no merge afterwards. That is what makes a hash build morsel-parallel, and
 /// it is the reason this type exists: `build_join_hash_index` is one serial
 /// loop, and on TPC-H q21 it spends 40 ms hashing 1.29M rows inside a 75 ms
-/// query (measured 2026-08-25, see plans/kernel-pipeline-execution-plan.md,
-/// "Where join time actually goes").
+/// query (measured 2026-08-25 from operator self times, which are wall spans;
+/// the partitioned fill measured q21 -8.5%).
 ///
 /// `partition_count == 1` is exactly the single-map behaviour this replaced,
 /// bit for bit: one partition, mask 0, every key landing in `parts[0]`.
@@ -519,9 +519,8 @@ auto build_join_pair_index(const Column<std::int64_t>& col0, const Column<std::i
 /// what makes it a VALUE rather than a shape encoded across three operator
 /// members (`mode_`, `probe_op_`, `left_table_`). A build phase
 /// can decide it without knowing who will probe, which is what a separately
-/// scheduled `HashBuild` needs; see plans/kernel-pipeline-execution-plan.md,
-/// "The build-side choice does not block the split" -- the physical plan does
-/// not have to name the side statically, because the pipeline that scans the
+/// scheduled `HashBuild` needs. The physical plan does not have to name the
+/// side statically, because the pipeline that scans the
 /// other side is constructed after this phase has already run.
 enum class JoinOrientation : std::uint8_t {
     BuildRight,  ///< index the right side, stream left chunks through it
@@ -1999,6 +1998,11 @@ class ChunkedInnerJoinOperator final : public Operator {
 
         // Small right: index it without ever measuring the left, which is the
         // one orientation this join can choose without draining a child.
+        //
+        // This is the build-side choice. It is not the deferred-probe decision
+        // (`ir::build_side_worth_deferring`: should the build side be
+        // materialized early so its keys can prune a probe scan's decode?);
+        // the two are routinely both called "the join cost model".
         if (n_right <= kStreamRightThreshold) {
             return adopt_build(build_join_side(*right_, right_key_name, key_kind,
                                                JoinOrientation::BuildRight,

@@ -786,8 +786,7 @@ auto map_kernel_factory(MapKernelCapability capability) noexcept -> MapKernelFac
 
 namespace physical_executor_detail {
 
-/// Compose one step of a migrated physical map pipeline (Phase 1 of
-/// plans/kernel-pipeline-execution-plan.md). Walks the plan top-down so the
+/// Compose one step of a migrated physical map pipeline. Walks the plan top-down so the
 /// per-step profile scopes nest exactly the way the per-kind switch's
 /// recursion did, wraps each constructed operator with
 /// `profile_operator`, and builds the source through the *public*

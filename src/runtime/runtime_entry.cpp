@@ -357,8 +357,7 @@ void configure_parallel_from_env(ExecutionContext& exec) {
 namespace physical_executor_detail {
 /// Build a join the plan migrated: `HashBuild` on one side, `HashProbe` on the
 /// other. The family-owned join executor implements both phases and exposes a
-/// narrow construction boundary here. The kernel-pipeline plan's Phase 4 item
-/// 1.
+/// narrow construction boundary here.
 ///
 /// The three branches are the ones that used to sit in `build_operator_impl`'s
 /// per-kind switch. Construction lives with the plan, the decisions are the
@@ -493,7 +492,7 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
         // build and the right materialize were overlapped on a raw
         // std::thread here for a time (q10 ~-3% in-suite), but every
         // widening of the idea measured worse and was reverted, and the
-        // site was removed ahead of the kernel-pipeline restructure —
+        // site was removed on 2026-08-21 —
         // branch concurrency needs a cost-aware gate, not a thread-count
         // one. Left builds first, then the right materializes.
         auto left_op =
@@ -848,7 +847,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                          const ScalarRegistry* scalars, const ExternRegistry* externs,
                          const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
-    // Physical-plan seam (plans/kernel-pipeline-execution-plan.md). One plan
+    // Physical-plan seam (src/runtime/CONTRACTS.md section 0). One plan
     // per node, and it describes the whole map chain or migrated breaker. The
     // executor below is also callable with an already-built plan, which makes
     // plan-edge mutation tests exercise the same consumer production uses.

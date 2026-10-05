@@ -80,8 +80,7 @@ auto is_streamable_inner_join(const ir::JoinNode& join) -> bool {
            !join.expect().asserts_anything() && join.take() == ir::MatchSelection::All;
 }
 
-/// Two-fixed-width-int-key inner join (plans/parallelism-overview.md's
-/// "stream multi-key joins" item; TPC-H q09's `lineitem` join is the
+/// Two-fixed-width-int-key inner join (TPC-H q09's `lineitem` join is the
 /// motivating case). Same structural gate as `is_streamable_inner_join`
 /// plus a static schema check -- both keys, on both sides, must be provably
 /// `Int64` -- so an ineligible pair (a string key, an unascribed/Unknown
@@ -447,8 +446,8 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
         // budget to bound, so the budget was never going to help. The
         // cost is inherent to overlapping this specific pair of sides,
         // not to how many raw threads accumulate. Reverted a second
-        // time; see plans/parallelism-overview.md's "generalize
-        // multiple producers" section before trying again here.
+        // time; see "Measured and dropped" in src/runtime/PARALLELISM.md
+        // before trying again here.
         auto left_op =
             build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
         if (!left_op.has_value()) {
@@ -490,7 +489,7 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
         // interprets the right subtree itself (resolve_deferred_probe).
         const auto probe = deferred_probe_scan_of(*join.children()[1], exec);
 
-        // Multiple producers (plans/parallelism-overview.md): the left
+        // Multiple producers (src/runtime/PARALLELISM.md): the left
         // build and the right materialize were overlapped on a raw
         // std::thread here for a time (q10 ~-3% in-suite), but every
         // widening of the idea measured worse and was reverted, and the
@@ -532,8 +531,7 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
             std::move(*built), stage_probe, exec,
             execution_profile_entry(exec.execution_profile, node));
     }
-    // Streaming two-Int64-key inner join (plans/parallelism-overview.md's
-    // "stream multi-key joins" item): same shape as the single-key
+    // Streaming two-Int64-key inner join: same shape as the single-key
     // streamable path just above, minus the multiple-producers-overlap
     // machinery -- this builds the hash index on the smaller of the two
     // sides and streams/scans the other through

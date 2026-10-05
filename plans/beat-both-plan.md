@@ -6,9 +6,8 @@ measurement history this file leaves out, is at
 `git show 7a32d537:plans/beat-polars-plan.md` and
 `git show 7a32d537:plans/beat-duckdb-plan.md` (the August Polars plan is at
 `git show e82f679d:plans/beat-polars-plan.md`). Mechanism lives in
-`kernel-pipeline-execution-plan.md`, `parallelism-overview.md` and
-`src/runtime/PARALLELISM.md`; the retired owned-aggregate and
-runtime-multithreading plans are at
+`kernel-pipeline-execution-plan.md` and `src/runtime/PARALLELISM.md`; the
+retired owned-aggregate and runtime-multithreading plans are at
 `git show 587bc2e4:plans/owned-agg-per-chunk-barrier-plan.md` and
 `git show 587bc2e4:plans/runtime-multithreading-plan.md`.
 
@@ -320,8 +319,8 @@ fixing it; when a fix does not move the wall, find what ate the gain.
   difference is a bug.
 - **Warm and fresh.** `run_bench.sh` times a warm in-process loop for every
   engine. Ibex gains far more from warmth than Polars (q21 ~38% against ~8%,
-  first-touch page faults), so quote a large win fresh-process too
-  (`allocator-and-huge-pages.md`).
+  first-touch page faults), so quote a large win fresh-process too (see
+  `tune_allocator_once` in `src/runtime/interpreter.cpp`).
 - **Ibex-only A/B: local**, `benchmarking/ab_queries.py`, interleaved, 8 cores,
   byte-identity on; re-run anything flagged at `--repeats 16`. For changes
   that add threads or spinning use `perf stat` elapsed plus standalone

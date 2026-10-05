@@ -211,6 +211,12 @@ uv run --project . python benchmarking/tpch/check_answers.py    # NO arguments
 ./benchmarking/run_scale_suite.sh --threads 8
 ```
 
+The PDS-H harnesses time a warm loop in one process for every engine, and Ibex
+gains far more from warmth than Polars does (q21 ~38% against ~8%: first-touch
+page faults; see `tune_allocator_once`). When a claim leans on a large Ibex
+win, quote a fresh-process time next to it (`ibex_eval` on the `.ibex` file,
+one run).
+
 Run `check_answers.py` with **no arguments**. Naming queries filters to ones it
 has a reference answer for, and anything else prints `SKIP (not implemented)`
 and exits 0 — `check_answers.py q01 q06` is two SKIPs and a green exit code,
@@ -250,8 +256,10 @@ for them unless the task is explicitly "publish new numbers".
 ### Profiling the whole suite
 
 `benchmarking/profile_suite.py` sums the per-statement profile across all 22
-queries and prints the closure columns. Every accounting table in
-`plans/parallelism-overview.md` came from it.
+queries and prints the closure columns (occupancy, `pool_unqueued_ms`,
+`pool_idle_ms`, `stage_park_ms`). The "the pool is ~70% empty with nothing
+queued" finding behind `src/runtime/PARALLELISM.md`'s dropped scheduler came
+from it.
 
 ```bash
 python3 benchmarking/profile_suite.py 8
@@ -403,7 +411,9 @@ A real example: `median(v) by {a,b}` cost 517ms at 9800 groups and 20ms at 5000.
 Sweeping group count alone looked like a cliff at 6000. Sweeping key count alone
 looked fine (one key handled 100k groups in 67ms). The actual trigger needed
 **both** multiple keys and a particular hash-table size, and neither sweep could
-see it. See `plans/parallelism-overview.md`.
+see it. (The cause: `hash_combine` over an identity `std::hash<int64_t>` never
+finalized, so two small int keys hashed to roughly `b + (a << 6)`, one probe
+cluster. One `fmix64` fixed it — in four places, which is §9's point.)
 
 When something looks like a threshold, ask what else changed at that threshold.
 
@@ -556,3 +566,27 @@ Then extract the shared thing rather than updating each copy.
 This profiler has had five attribution bugs, all of which made "serial" look
 bigger than it was. A figure that surprises you is a claim to check, not a
 finding to report. Corroborate with wall-clock A/B before building a plan on it.
+
+Three attribution mistakes worth knowing by name, each of which read as an
+architectural limit and was not one:
+
+- **"This operator is serial."** Read `pool_tasks` per node before naming the
+  operator. In one q14 experiment the "serial join build" was the `Update`
+  between the scan and the join: one field shape fell off
+  `plan_direct_field`, and that route is all-or-nothing per update node, so a
+  single unrecognised field serialised the whole node (`serial_fraction`
+  0.133 → 0.288). "This operator is serial" and "this operator's
+  *expression* fell off a fast path" look identical from outside.
+- **`__memmove` percentages are not DRAM traffic.** A decode change sized off a
+  33%-of-profile `__memmove` measured 20% slower: the buffer was a 64Ki-row
+  scratch batch living in L2. Ask whether the buffer fits in cache first.
+- **"Bandwidth-bound."** Measure the floor before claiming it. On the dev box
+  the page-cache read ceiling is 44.5 GB/s at 8 threads (14.3 at one), so a
+  query reading 903 MB has a ~20 ms floor; q14 at ~104 ms was 4.5× off it.
+
+And one for placement changes: moving an expression to another operator
+changes the **row count it is evaluated over**, which the plan does not show
+without cardinality estimates. Pushing a computed column onto q14's `part` side
+was 2.7× more evaluations and paid; the same pass on q12's `orders` side was
+9× more and cost 40%. Any fan-out or placement change that alters which
+operator evaluates an expression needs both row counts before it is enabled.

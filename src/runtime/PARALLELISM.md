@@ -3,10 +3,10 @@
 Companion to [CONTRACTS.md](CONTRACTS.md). That file states the data-and-flow
 contracts (`Chunk`, `next()`, materialization, `TableProperties`, determinism);
 this one states the **parallelism model** — the mental picture, the three layers,
-and which part of the engine owns which decision. Kept current with the code;
-[plans/parallelism-overview.md](../../plans/parallelism-overview.md) is the
-companion *plan* — the catalogue of where this model is still inconsistent and
-the order to fix it.
+and which part of the engine owns which decision. Kept current with the code.
+Where the model is still inconsistent is catalogued below ("Where the model is
+still muddy"); the plan that tracked it, with its measurement history, was
+retired 2026-10-05 (`git show 47918401:plans/parallelism-overview.md`).
 
 ## The model in one paragraph
 
@@ -244,6 +244,17 @@ two-Int64-key owned-aggregate divergence no longer reproduces; the
 "two-key grouped aggregate is deterministic across thread counts" regression
 test now guards the serial and parallel paths.
 
+**Rejected: weakening first-occurrence group order** (2026-08-17; someone will
+propose it again). Declaring group-by output order unspecified would drop the
+serial first-occurrence merge in `try_discover_partitioned` and let grouped
+aggregation stream its output. The prize was ~26 ms of ~172 ms on q18 at 3M
+groups, the worst case. Against it: it spends this contract, it blunts the
+`diff` verification above, and it breaks scripts (Ibex follows `data.table`,
+where `by=` keeps first appearance). Do instead: elide the merge at *plan*
+level when the consumer provably ignores order (it feeds an `order`, a scalar
+aggregate or a join) — a required-ordering property propagated down the plan.
+Not built.
+
 ## Configuration surface
 
 | Variable | Reads | Meaning |
@@ -275,12 +286,58 @@ operator-private decisions belong to breaker families that have not completed
 that migration; do not generalize their local thresholds into a second policy
 system.
 
-**The symptoms** (`plans/parallelism-overview.md` Part 2 is the live
-catalogue): type-exclusion rules with no shared "is this type parallel-capable
-in role X" predicate (I2/I3); nine private row thresholds beside the two
-`ExecutionContext` knobs, none sweepable without recompiling (I6);
-`parallel_min_cells` consulted by 2 of ~30 sites (I7); worker-count caps that
-differ arbitrarily (I9); cancellation reaching Layers A/B but not Layer C (I13).
+**The symptoms**, catalogued 2026-08 (the I-numbers are cited in code; the
+resolved ones are in the retired plan). Undocumented divergence rather than
+bugs: each new operator copies whichever neighbour it was written next to.
+
+- **I2** — String/Categorical are excluded from several fan-out decisions,
+  each for its own reason (`stageable_conjunct_columns` width;
+  `evaluate_field_maybe_parallel` Int/Double only; parallel partial aggregates
+  Int/Double only), with no shared "is this type parallel-capable in role X"
+  predicate.
+- **I3** — multi-key Categorical group discovery has no partitioned path
+  (`multi_cat_find_or_insert` is serial).
+- **I6** — private row thresholds (`parallel_min_rows`, `kMinProbeRows`,
+  `kMinParallelPredicateRows`, `kDefaultPartitionMinRows`, …) beside the two
+  `ExecutionContext` knobs. Break-evens genuinely differ per operator; the
+  problem is that none can be swept without recompiling. Convergence:
+  `ExecutionContext`-scaled multiples.
+- **I7** — `parallel_min_cells` (width) is consulted by 2 of ~30 sites, though
+  "131k rows won at 6 columns, lost at 2" applies equally to filter gather,
+  join concat and aggregate emission.
+- **I9** — worker-count caps differ arbitrarily (`min(…, 64)`, `min(…, 16)`,
+  uncapped), undocumented.
+- **I10** — aggregate emission gates a group count against a *row* threshold.
+- **I12** — two thread species: the long-lived stage thread of
+  `PipelinedStageOperator` (parks on consumer backpressure; hosting it on the
+  pool would deadlock) is named and counted (`on_stage_thread()`,
+  `stage_threads_peak`) but not explicit in the primitive.
+- **I13** — cancellation reaches Layers A/B but not intra-operator fan-outs
+  (Layer C). Consistent with the per-node/chunk/statement contract; the gap
+  grows as operators get bigger parallel sections.
+- **I14** — two grain philosophies: island grain from thread count, aggregate
+  morsel count from row count (for float determinism). Nothing warns that
+  reusing `island_grain` inside a reduction breaks determinism.
+
+**Not inconsistencies** (recorded so they are not "fixed"):
+- prefix sums in `TwoPhaseFilterOperator` / `try_discover_partitioned` are
+  serial on purpose: O(morsels), not O(rows);
+- a refused island runs as one whole-table chunk, not a serial morsel sweep
+  (fix for a measured 3× regression);
+- `parallel_threads` deliberately does not cap the scan pipeline.
+
+**Measured and dropped:**
+- **A task scheduler / work stealing** (2026-08-21): `pool_idle_ms` and
+  `stage_park_ms` were ~0 on all 22 queries while ~67% of the pool sat with
+  nothing queued, so stealing had nothing to steal. Revisit only if occupancy
+  rises far enough for queues to build.
+- **Multiple producers per staged breaker.** Decoding two sibling scans
+  concurrently was worth ~15% synthetically and ~8% on q10 alone (~3%
+  in-suite), but every widening measured worse: semi/anti overlap q04 +19%,
+  `build_binary_materializing_operator` q09 +57% (both sides materialize, so
+  overlapping them contends for bandwidth instead of filling idle cores).
+  Removed 2026-08-21; recover from `38d6b307` / `190235b2` / `a3b39c6d` only
+  with a cost-aware gate (skip when both sides are large).
 
 ---
 

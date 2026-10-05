@@ -2327,7 +2327,7 @@ class HashAggregateState final {
     /// `by { l_partkey, l_suppkey }` is the motivating shape; validated
     /// there at -16.5%, 8/8 paired wins, 8 cores, vs. a q18/Int64 prototype
     /// that measured only -7.6%, was never promoted, and has since been
-    /// removed -- see plans/parallelism-overview.md). Deliberately narrow:
+    /// removed). Deliberately narrow:
     ///
     /// - Exactly one aggregate, Sum(Double) or Count. q18 and q20 both only
     ///   ever exercise one, so nothing measures whether row-wise fusion beats
@@ -6889,8 +6889,8 @@ class HashAggregateState final {
     std::vector<std::size_t> scatter_rows_;
     std::uint64_t rows_seen_ = 0;
 
-    // --- Partition-owned aggregation (plans/parallelism-overview.md "stream
-    // multi-key joins" successor, step 2): the PairIntKey path only, admitted
+    // --- Partition-owned aggregation (step 2 of the partition-owned
+    // aggregate API): the PairIntKey path only, admitted
     // by `try_owned_pair`'s gates. `IBEX_DISABLE_OWNED_PAIR_AGG=1` is its kill
     // switch.
 

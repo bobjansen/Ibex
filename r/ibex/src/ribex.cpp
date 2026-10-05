@@ -3,39 +3,37 @@
 
 #define R_NO_REMAP
 
+// The R bindings. Every evaluation runs on `repl::ReplSession` -- the same
+// evaluator as the `ibex` REPL and `ibex_eval` -- so a script that runs there
+// runs here: imports, functions, scalar bindings, resources. This file only
+// converts between R values and Ibex tables/scalars and exports results as
+// Arrow C data.
+
 #include <ibex/interop/arrow_c_data.hpp>
-#include <ibex/ir/join_pushdown.hpp>
-#include <ibex/ir/optimizer.hpp>
-#include <ibex/parser/ast.hpp>
-#include <ibex/parser/lower.hpp>
-#include <ibex/parser/parser.hpp>
+#include <ibex/ir/schema.hpp>
+#include <ibex/repl/repl.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <dlfcn.h>
-#endif
 #include <expected>
-#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <R_ext/Arith.h>
 #include <R_ext/Error.h>
+#include <R_ext/Print.h>
 #include <Rinternals.h>
 #include <robin_hood.h>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -45,134 +43,56 @@ auto make_error(std::string_view stage, const std::string& message) -> std::stri
     return "ibex " + std::string(stage) + ": " + message;
 }
 
-auto plugin_stem(const std::string& source_path) -> std::string {
-    return std::filesystem::path(source_path).stem().string();
-}
-
-enum class PluginLoadStatus : std::uint8_t { Loaded, NotFound, LoadError };
-
-struct PluginLoadResult {
-    PluginLoadStatus status;
-    std::string message;
-};
-
-struct SessionState {
-    ibex::runtime::TableRegistry tables;
-    robin_hood::unordered_map<std::string, std::vector<std::string>> compile_time_lists;
-    robin_hood::unordered_set<std::string> table_externs;
-    robin_hood::unordered_set<std::string> sink_externs;
-    ibex::runtime::ExternRegistry externs;
-    std::unordered_set<std::string> loaded_plugins;
+/// One R `ibex_session`. The extern registry outlives the session that holds a
+/// reference to it, hence the declaration order. `generation` changes on every
+/// reset, so the dplyr backend can tell a reset session from the one it bound
+/// its tables in.
+struct RSession {
+    ibex::runtime::ExternRegistry registry;
     std::vector<std::string> plugin_paths;
+    std::unique_ptr<ibex::repl::ReplSession> repl;
     std::uint64_t generation = 0;
 };
 
 std::atomic<std::uint64_t> next_session_generation{1};
 
-/// Defined below, next to the schema-inference helpers that share it.
-auto session_source_schemas(const SessionState& session) -> ibex::ir::SourceSchemas;
-
-auto try_load_plugin(const std::string& stem, const std::vector<std::string>& search_paths,
-                     std::unordered_set<std::string>& loaded_plugins,
-                     ibex::runtime::ExternRegistry& externs) -> PluginLoadResult {
-    if (loaded_plugins.contains(stem)) {
-        return {.status = PluginLoadStatus::Loaded, .message = ""};
-    }
-
-#ifdef _WIN32
-    const std::string filename = stem + ".dll";
-#else
-    const std::string filename = stem + ".so";
-#endif
-    std::string last_error;
-    std::string last_candidate;
-    for (const auto& dir : search_paths) {
-        auto full_path = std::filesystem::path(dir) / filename;
-        void* handle = nullptr;
-#ifdef _WIN32
-        handle = static_cast<void*>(LoadLibraryA(full_path.string().c_str()));
-#else
-        handle = dlopen(full_path.c_str(), RTLD_NOW | RTLD_LOCAL);
-#endif
-        if (handle == nullptr) {
-            if (std::filesystem::exists(full_path)) {
-#ifdef _WIN32
-                last_error = "Windows error " + std::to_string(GetLastError());
-#else
-                if (const char* err = dlerror()) {
-                    last_error = err;
-                }
-#endif
-                last_candidate = full_path.string();
-            }
-            continue;
-        }
-
-        using RegisterFn = void (*)(ibex::runtime::ExternRegistry*);
-#ifdef _WIN32
-        auto* fn = reinterpret_cast<RegisterFn>(
-            GetProcAddress(static_cast<HMODULE>(handle), "ibex_register"));
-#else
-        auto* fn = reinterpret_cast<RegisterFn>(dlsym(handle, "ibex_register"));
-#endif
-        if (fn == nullptr) {
-#ifdef _WIN32
-            FreeLibrary(static_cast<HMODULE>(handle));
-#else
-            dlclose(handle);
-#endif
-            last_candidate = full_path.string();
-            last_error = "missing ibex_register symbol";
-            continue;
-        }
-
-        fn(&externs);
-        loaded_plugins.insert(stem);
-        return {PluginLoadStatus::Loaded, ""};
-    }
-
-    if (!last_candidate.empty()) {
-        return {PluginLoadStatus::LoadError,
-                "failed to load '" + last_candidate +
-                    "': " + (last_error.empty() ? "unknown error" : last_error)};
-    }
-
-    return {PluginLoadStatus::NotFound, ""};
+auto make_repl_config(const std::vector<std::string>& plugin_paths) -> ibex::repl::ReplConfig {
+    ibex::repl::ReplConfig config;
+    config.plugin_search_paths = plugin_paths;  // also where `import` finds its stubs
+    config.persistent_history = false;
+    return config;
 }
 
-auto load_source_plugins(const ibex::parser::Program& program,
-                         const std::vector<std::string>& plugin_search_paths,
-                         ibex::runtime::ExternRegistry& externs)
-    -> std::expected<void, std::string> {
-    std::unordered_set<std::string> loaded_plugins;
-    for (const auto& stmt : program.statements) {
-        if (const auto* decl = std::get_if<ibex::parser::ExternDecl>(&stmt)) {
-            if (decl->source_path.empty()) {
-                continue;
-            }
-            auto stem = plugin_stem(decl->source_path);
-            auto result = try_load_plugin(stem, plugin_search_paths, loaded_plugins, externs);
-            if (result.status == PluginLoadStatus::NotFound) {
-#ifdef _WIN32
-                return std::unexpected("could not find plugin '" + stem + ".dll' in search path");
-#else
-                return std::unexpected("could not find plugin '" + stem + ".so' in search path");
-#endif
-            }
-            if (result.status == PluginLoadStatus::LoadError) {
-                return std::unexpected(result.message);
-            }
-            continue;
-        }
+auto make_session(std::vector<std::string> plugin_paths) -> std::unique_ptr<RSession> {
+    auto session = std::make_unique<RSession>();
+    session->plugin_paths = std::move(plugin_paths);
+    session->repl = std::make_unique<ibex::repl::ReplSession>(
+        make_repl_config(session->plugin_paths), session->registry);
+    session->generation = next_session_generation.fetch_add(1, std::memory_order_relaxed);
+    return session;
+}
 
-        if (std::holds_alternative<ibex::parser::ImportDecl>(stmt)) {
-            return std::unexpected(
-                "ibex does not yet support import declarations; use explicit extern fn "
-                "declarations with plugin_paths");
-        }
+/// Runs `source` in `session` with this call's own tables and scalars. What
+/// the script prints reaches the R console; the result is the last table it
+/// produced, or null when it produced none.
+auto run_in_session(RSession& session, const std::string& source,
+                    ibex::runtime::TableRegistry tables, ibex::runtime::ScalarRegistry scalars)
+    -> std::expected<std::shared_ptr<const ibex::runtime::Table>, std::string> {
+    ibex::repl::ReplSession::ExecuteOptions options;
+    options.tables = std::move(tables);
+    options.scalars = std::move(scalars);
+    options.render = false;
+    auto result = session.repl->execute(source, std::move(options));
+    if (!result.output.empty()) {
+        Rprintf("%s", result.output.c_str());
     }
-
-    return {};
+    if (!result.ok) {
+        return std::unexpected(make_error("error", result.error));
+    }
+    if (!result.table.has_value()) {
+        return std::shared_ptr<const ibex::runtime::Table>{};
+    }
+    return std::make_shared<const ibex::runtime::Table>(std::move(*result.table));
 }
 
 auto read_text_file(const std::string& path) -> std::expected<std::string, std::string> {
@@ -446,33 +366,6 @@ auto build_categorical_from_strings(SEXP column_sexp, R_xlen_t size)
     return std::pair{ibex::runtime::ColumnValue{std::move(column)},
                      has_nulls ? std::optional<ibex::runtime::ValidityBitmap>(std::move(validity))
                                : std::nullopt};
-}
-
-/// Run the plan optimizer over a lowered session expression.
-///
-/// `parser::lower()` (whole program) and `lower_script()` both optimize before
-/// handing a plan to the runtime. `lower_expr()`, which is what a session
-/// statement uses, does not -- so a session never saw canonicalize, and the
-/// fused shapes the runtime keeps fast paths for were never formed. The one
-/// that hurt: `[order { price desc }][head 100]` stayed an Order feeding a
-/// Head and ran a full sort of 8M rows, where canonicalize R16 fuses it into a
-/// TopK that the chunked operator answers with an O(n log k) heap-select --
-/// 182ms against 15ms on the same data.
-///
-/// The context is default-constructed deliberately. Its `unknown_callee`
-/// summary claims every effect, so the effect-sensitive passes stay
-/// conservative about externs the session may have registered.
-auto optimize_session_plan(ibex::ir::NodePtr node, const ibex::ir::SourceSchemas& sources)
-    -> ibex::ir::NodePtr {
-    // The schema-aware join rewrites run first and in this order: both expect
-    // the un-fused `Filter(Join(...))` shape that canonicalize consumes, and
-    // `push_semi_joins_down` reads what `push_filters_into_joins` leaves. A
-    // semi/anti join that stays above an inner join filters after paying for
-    // it instead of before.
-    node = ibex::ir::push_filters_into_joins(std::move(node), sources);
-    node = ibex::ir::push_semi_joins_down(std::move(node), sources);
-    const ibex::ir::OptimizationContext context;
-    return ibex::ir::optimize_plan(std::move(node), context);
 }
 
 auto build_column_from_r_vector(const std::string& name, SEXP column_sexp, bool encode_strings)
@@ -758,241 +651,6 @@ auto build_table_registry_from_r(SEXP tables_sexp)
     return registry;
 }
 
-auto extract_compile_time_string_list(const ibex::parser::Expr& expr)
-    -> std::optional<std::vector<std::string>> {
-    const auto* array = std::get_if<ibex::parser::ArrayLiteralExpr>(&expr.node);
-    if (array == nullptr) {
-        return std::nullopt;
-    }
-
-    std::vector<std::string> values;
-    values.reserve(array->elements.size());
-    for (const auto& elem : array->elements) {
-        const auto* lit = std::get_if<ibex::parser::LiteralExpr>(&elem->node);
-        if (lit == nullptr) {
-            return std::nullopt;
-        }
-        const auto* text = std::get_if<std::string>(&lit->value);
-        if (text == nullptr) {
-            return std::nullopt;
-        }
-        values.push_back(*text);
-    }
-    return values;
-}
-
-auto extract_compile_time_string_list(const ibex::runtime::Table& table)
-    -> std::optional<std::vector<std::string>> {
-    if (table.columns.size() != 1 || table.columns.front().name != "name") {
-        return std::nullopt;
-    }
-
-    const auto& entry = table.columns.front();
-    const auto* names = std::get_if<ibex::Column<std::string>>(entry.column.get());
-    if (names == nullptr) {
-        return std::nullopt;
-    }
-    if (entry.validity.has_value()) {
-        for (std::size_t row = 0; row < names->size(); ++row) {
-            if (!(*entry.validity)[row]) {
-                return std::nullopt;
-            }
-        }
-    }
-
-    std::vector<std::string> values;
-    values.reserve(names->size());
-    for (const auto& value : *names) {
-        values.push_back(std::string(value));
-    }
-    return values;
-}
-
-auto merge_registries(const ibex::runtime::TableRegistry& base,
-                      const ibex::runtime::TableRegistry& extra) -> ibex::runtime::TableRegistry {
-    ibex::runtime::TableRegistry merged = base;
-    for (const auto& [name, table] : extra) {
-        merged.insert_or_assign(name, table);
-    }
-    return merged;
-}
-
-auto merge_scalars(const ibex::runtime::ScalarRegistry& base,
-                   const ibex::runtime::ScalarRegistry& extra) -> ibex::runtime::ScalarRegistry {
-    ibex::runtime::ScalarRegistry merged = base;
-    for (const auto& [name, value] : extra) {
-        merged.insert_or_assign(name, value);
-    }
-    return merged;
-}
-
-auto eval_table_impl(const std::string& source, const ibex::runtime::TableRegistry& registry,
-                     const ibex::runtime::ScalarRegistry& scalars,
-                     const std::vector<std::string>& plugin_search_paths)
-    -> std::expected<std::shared_ptr<const ibex::runtime::Table>, std::string> {
-    auto parsed = ibex::parser::parse(source);
-    if (!parsed.has_value()) {
-        return std::unexpected(make_error("parse error", parsed.error().format()));
-    }
-
-    ibex::runtime::ExternRegistry externs;
-    if (!plugin_search_paths.empty()) {
-        auto loaded = load_source_plugins(*parsed, plugin_search_paths, externs);
-        if (!loaded.has_value()) {
-            return std::unexpected(make_error("plugin load error", loaded.error()));
-        }
-    }
-
-    auto lowered = ibex::parser::lower(*parsed);
-    if (!lowered.has_value()) {
-        return std::unexpected(make_error("lowering error", lowered.error().message));
-    }
-
-    auto evaluated = ibex::runtime::interpret(*lowered.value(), registry, &scalars,
-                                              plugin_search_paths.empty() ? nullptr : &externs);
-    if (!evaluated.has_value()) {
-        return std::unexpected(make_error("runtime error", evaluated.error()));
-    }
-
-    return std::make_shared<ibex::runtime::Table>(std::move(*evaluated));
-}
-
-auto register_extern_decl(const ibex::parser::ExternDecl& decl, SessionState& session)
-    -> std::expected<void, std::string> {
-    if (decl.return_type.kind == ibex::parser::Type::Kind::DataFrame ||
-        decl.return_type.kind == ibex::parser::Type::Kind::TimeFrame) {
-        session.table_externs.insert(decl.name);
-    }
-    if (!decl.params.empty() && decl.params[0].type.kind == ibex::parser::Type::Kind::DataFrame) {
-        session.sink_externs.insert(decl.name);
-    }
-    if (decl.source_path.empty()) {
-        return {};
-    }
-
-    auto stem = plugin_stem(decl.source_path);
-    auto result =
-        try_load_plugin(stem, session.plugin_paths, session.loaded_plugins, session.externs);
-    if (result.status == PluginLoadStatus::NotFound) {
-        return std::unexpected("could not find plugin '" + stem + ".so' in search path");
-    }
-    if (result.status == PluginLoadStatus::LoadError) {
-        return std::unexpected(result.message);
-    }
-    return {};
-}
-
-auto eval_table_in_session(SessionState& session, const std::string& source,
-                           const ibex::runtime::TableRegistry& extra_tables,
-                           const ibex::runtime::ScalarRegistry& extra_scalars)
-    -> std::expected<std::shared_ptr<const ibex::runtime::Table>, std::string> {
-    auto parsed = ibex::parser::parse(source);
-    if (!parsed.has_value()) {
-        return std::unexpected(make_error("parse error", parsed.error().format()));
-    }
-
-    std::shared_ptr<const ibex::runtime::Table> last_table;
-    for (const auto& stmt : parsed->statements) {
-        if (const auto* decl = std::get_if<ibex::parser::ExternDecl>(&stmt)) {
-            auto registered = register_extern_decl(*decl, session);
-            if (!registered.has_value()) {
-                return std::unexpected(make_error("plugin load error", registered.error()));
-            }
-            continue;
-        }
-        if (std::holds_alternative<ibex::parser::ImportDecl>(stmt)) {
-            return std::unexpected(
-                make_error("session error",
-                           "import declarations are not supported in ibex sessions; use "
-                           "explicit extern fn declarations"));
-        }
-        if (std::holds_alternative<ibex::parser::FunctionDecl>(stmt)) {
-            return std::unexpected(make_error(
-                "session error", "function declarations are not supported in ibex sessions"));
-        }
-        if (std::holds_alternative<ibex::parser::TupleLetStmt>(stmt)) {
-            return std::unexpected(make_error(
-                "session error", "tuple let bindings are not supported in ibex sessions"));
-        }
-
-        ibex::parser::LowerContext context;
-        context.compile_time_lists = session.compile_time_lists;
-        context.table_externs = session.table_externs;
-        context.sink_externs = session.sink_externs;
-        auto runtime_registry = merge_registries(session.tables, extra_tables);
-        auto runtime_scalars = merge_scalars({}, extra_scalars);
-
-        // Carry every in-scope name into the lowerer, exactly as the REPL does.
-        // The static column-ref check treats a bare name in a filter or update
-        // expression as a column unless it is listed here, so without this a
-        // bound scalar is rejected as a missing column the moment the input
-        // schema is statically known -- which is precisely what happens when
-        // clauses are chained instead of split across intermediate `let`s.
-        for (const auto& entry : runtime_registry) {
-            context.lexical_names.insert(entry.first);
-        }
-        for (const auto& entry : runtime_scalars) {
-            context.lexical_names.insert(entry.first);
-        }
-        for (const auto& entry : session.compile_time_lists) {
-            context.lexical_names.insert(entry.first);
-        }
-        context.lexical_names.insert(session.table_externs.begin(), session.table_externs.end());
-        context.lexical_names.insert(session.sink_externs.begin(), session.sink_externs.end());
-
-        if (const auto* let_stmt = std::get_if<ibex::parser::LetStmt>(&stmt)) {
-            if (auto string_list = extract_compile_time_string_list(*let_stmt->value);
-                string_list.has_value()) {
-                session.compile_time_lists.insert_or_assign(let_stmt->name,
-                                                            std::move(*string_list));
-                continue;
-            }
-            auto lowered = ibex::parser::lower_expr(*let_stmt->value, context);
-            if (!lowered.has_value()) {
-                return std::unexpected(
-                    make_error("lowering error",
-                               "ibex sessions currently support only table-valued let bindings: " +
-                                   lowered.error().message));
-            }
-            auto plan =
-                optimize_session_plan(std::move(lowered.value()), session_source_schemas(session));
-            auto evaluated = ibex::runtime::interpret(*plan, runtime_registry, &runtime_scalars,
-                                                      &session.externs);
-            if (!evaluated.has_value()) {
-                return std::unexpected(make_error("runtime error", evaluated.error()));
-            }
-            if (auto compile_time_list = extract_compile_time_string_list(*evaluated);
-                compile_time_list.has_value()) {
-                session.compile_time_lists.insert_or_assign(let_stmt->name,
-                                                            std::move(*compile_time_list));
-            } else {
-                session.compile_time_lists.erase(let_stmt->name);
-            }
-            session.tables.insert_or_assign(let_stmt->name, std::move(*evaluated));
-            continue;
-        }
-
-        const auto& expr_stmt = std::get<ibex::parser::ExprStmt>(stmt);
-        auto lowered = ibex::parser::lower_expr(*expr_stmt.expr, context);
-        if (!lowered.has_value()) {
-            return std::unexpected(
-                make_error("lowering error",
-                           "ibex sessions currently support only table-valued expressions: " +
-                               lowered.error().message));
-        }
-        auto plan =
-            optimize_session_plan(std::move(lowered.value()), session_source_schemas(session));
-        auto evaluated =
-            ibex::runtime::interpret(*plan, runtime_registry, &runtime_scalars, &session.externs);
-        if (!evaluated.has_value()) {
-            return std::unexpected(make_error("runtime error", evaluated.error()));
-        }
-        last_table = std::make_shared<ibex::runtime::Table>(std::move(*evaluated));
-    }
-
-    return last_table;
-}
-
 // The finalizers below are where R hands ownership back. Between the export and
 // this call the object is owned by R's collector, through a raw `void*` in the
 // external pointer -- a smart pointer cannot live in that slot, which is the
@@ -1020,7 +678,7 @@ void array_finalizer(SEXP ext) {
 }
 
 void session_finalizer(SEXP ext) {
-    const std::unique_ptr<SessionState> session(static_cast<SessionState*>(R_ExternalPtrAddr(ext)));
+    const std::unique_ptr<RSession> session(static_cast<RSession*>(R_ExternalPtrAddr(ext)));
     if (!session) {
         return;
     }
@@ -1075,11 +733,11 @@ auto scalar_string(SEXP value, const char* what) -> std::expected<std::string, s
     return std::string(CHAR(STRING_ELT(value, 0)));
 }
 
-auto session_from_sexp(SEXP session_sexp) -> std::expected<SessionState*, std::string> {
+auto session_from_sexp(SEXP session_sexp) -> std::expected<RSession*, std::string> {
     if (TYPEOF(session_sexp) != EXTPTRSXP) {
         return std::unexpected("'session' must be a ibex session");
     }
-    auto* session = static_cast<SessionState*>(R_ExternalPtrAddr(session_sexp));
+    auto* session = static_cast<RSession*>(R_ExternalPtrAddr(session_sexp));
     if (session == nullptr) {
         return std::unexpected("invalid ibex session");
     }
@@ -1109,113 +767,13 @@ auto column_type_name(const ibex::runtime::ColumnValue& value) -> const char* {
         value);
 }
 
-auto ir_column_type(const ibex::runtime::ColumnValue& value)
-    -> std::optional<ibex::ir::ColumnType> {
-    return std::visit(
-        [](const auto& column) -> std::optional<ibex::ir::ColumnType> {
-            using Column = std::decay_t<decltype(column)>;
-            if constexpr (std::is_same_v<Column, ibex::Column<std::int64_t>>) {
-                return ibex::ir::ColumnType::Int64;
-            } else if constexpr (std::is_same_v<Column, ibex::Column<double>>) {
-                return ibex::ir::ColumnType::Float64;
-            } else if constexpr (std::is_same_v<Column, ibex::Column<bool>>) {
-                return ibex::ir::ColumnType::Bool;
-            } else if constexpr (std::is_same_v<Column, ibex::Column<ibex::Date>>) {
-                return ibex::ir::ColumnType::Date;
-            } else if constexpr (std::is_same_v<Column, ibex::Column<ibex::Timestamp>>) {
-                return ibex::ir::ColumnType::Timestamp;
-            } else if constexpr (std::is_same_v<Column, ibex::Column<ibex::Categorical>>) {
-                // The IR has no Categorical: it is a String with a dictionary,
-                // and every rule that reads the type treats it as one.
-                return ibex::ir::ColumnType::String;
-            } else {
-                return ibex::ir::ColumnType::String;
-            }
-        },
-        value);
-}
-
-/// Describe every table bound in the session so `infer_schema` can resolve the
-/// scans a rendered dplyr plan makes.
-///
-/// The nullability here is the strongest evidence there is, and it is evidence
-/// rather than a declaration: these are materialized columns, and a column with
-/// no validity bitmap holds no nulls. That is what seeds the core's propagation
-/// -- every proof downstream of a `filter` or a join is ultimately grounded in
-/// one of these.
-auto session_source_schemas(const SessionState& session) -> ibex::ir::SourceSchemas {
-    ibex::ir::SourceSchemas sources;
-    for (const auto& [name, table] : session.tables) {
-        std::vector<ibex::ir::SchemaField> fields;
-        fields.reserve(table.columns.size());
-        for (const auto& entry : table.columns) {
-            fields.push_back(ibex::ir::SchemaField{.name = entry.name,
-                                                   .type = ir_column_type(*entry.column),
-                                                   .nulls = entry.validity.has_value()
-                                                                ? ibex::ir::Nullability::Maybe
-                                                                : ibex::ir::Nullability::Never});
-        }
-        sources.emplace(name, ibex::ir::SchemaInfo::known(std::move(fields)));
-    }
-    return sources;
-}
-
-/// Infer the schema of a rendered lazy-plan query without executing it.
-///
-/// Deliberately total: every way this can fail to reach a Known schema returns
-/// `nullopt` rather than an error, because the caller's fallback -- assume
-/// every column nullable -- is sound for all of them. A plan shape this cannot
-/// lower is a plan the adapter should still be able to describe conservatively.
-auto infer_plan_schema(const SessionState& session, const std::string& source,
-                       const std::vector<std::string>& extra_lexical_names)
-    -> std::optional<ibex::ir::SchemaInfo> {
-    auto parsed = ibex::parser::parse(source);
-    if (!parsed.has_value() || parsed->statements.size() != 1) {
-        return std::nullopt;
-    }
-    const auto* expr_stmt = std::get_if<ibex::parser::ExprStmt>(&parsed->statements.front());
-    if (expr_stmt == nullptr) {
-        return std::nullopt;
-    }
-
-    ibex::parser::LowerContext context;
-    context.compile_time_lists = session.compile_time_lists;
-    context.table_externs = session.table_externs;
-    context.sink_externs = session.sink_externs;
-    // Same reason as `eval_table_in_session`: without the in-scope names, a
-    // captured scalar in a filter reads as a missing column and lowering fails.
-    for (const auto& entry : session.tables) {
-        context.lexical_names.insert(entry.first);
-    }
-    for (const auto& entry : session.compile_time_lists) {
-        context.lexical_names.insert(entry.first);
-    }
-    context.lexical_names.insert(session.table_externs.begin(), session.table_externs.end());
-    context.lexical_names.insert(session.sink_externs.begin(), session.sink_externs.end());
-    // Scalars captured from the R environment (`.env$cutoff`) are supplied at
-    // eval time, not bound in the session, so the caller has to name them. A
-    // plan carrying one is ordinary, and without this every such plan would
-    // fail to lower and fall back to "everything nullable".
-    context.lexical_names.insert(extra_lexical_names.begin(), extra_lexical_names.end());
-
-    auto lowered = ibex::parser::lower_expr(*expr_stmt->expr, context);
-    if (!lowered.has_value() || lowered.value() == nullptr) {
-        return std::nullopt;
-    }
-    auto schema = ibex::ir::infer_schema(*lowered.value(), session_source_schemas(session));
-    if (!schema.is_known()) {
-        return std::nullopt;
-    }
-    return schema;
-}
-
-auto export_table_info(const SessionState& session, const std::string& name)
+auto export_table_info(RSession& session, const std::string& name)
     -> std::expected<SEXP, std::string> {
-    const auto it = session.tables.find(name);
-    if (it == session.tables.end()) {
-        return std::unexpected("session has no table binding named '" + name + "'");
+    auto bound = session.repl->table_binding(name);
+    if (!bound.has_value()) {
+        return std::unexpected(bound.error());
     }
-    const auto& table = it->second;
+    const auto& table = *bound;
     const auto column_count = static_cast<R_xlen_t>(table.columns.size());
 
     SEXP out = PROTECT(Rf_allocVector(VECSXP, 11));
@@ -1304,13 +862,11 @@ void collect_buffer_addresses(const ArrowArray& array, const std::string& path,
         collect_buffer_addresses(*array.dictionary, path + ".dictionary", out);
     }
 }
-
 }  // namespace
 
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
 // NOLINTBEGIN(cppcoreguidelines-pro-type-vararg)
-// These have SEXP's as arguments and use Rf_error, this is idiomatic R interfacing code but
-// triggers the lints.
+
 extern "C" SEXP ibex_c_arrow_buffer_addresses(SEXP array_sexp) {
     if (TYPEOF(array_sexp) != EXTPTRSXP || !Rf_inherits(array_sexp, "nanoarrow_array")) {
         Rf_error("'array' must be a nanoarrow_array");
@@ -1334,79 +890,95 @@ extern "C" SEXP ibex_c_arrow_buffer_addresses(SEXP array_sexp) {
     return result;
 }
 
-extern "C" SEXP ibex_c_eval_ibex(SEXP query_sexp, SEXP plugin_paths_sexp, SEXP tables_sexp,
-                                 SEXP scalars_sexp) {
-    auto query = scalar_string(query_sexp, "'query'");
-    if (!query.has_value()) {
-        Rf_error("%s", query.error().c_str());
-    }
+namespace {
 
-    auto plugin_paths = parse_plugin_paths(plugin_paths_sexp);
-    if (!plugin_paths.has_value()) {
-        Rf_error("%s", plugin_paths.error().c_str());
-    }
+/// The tables, scalars and plugin paths every evaluation entry point takes from
+/// R, converted; raises an R error on a bad argument.
+struct CallInputs {
+    ibex::runtime::TableRegistry tables;
+    ibex::runtime::ScalarRegistry scalars;
+};
 
+auto call_inputs(SEXP tables_sexp, SEXP scalars_sexp) -> CallInputs {
     auto tables = build_table_registry_from_r(tables_sexp);
     if (!tables.has_value()) {
         Rf_error("%s", make_error("table import error", tables.error()).c_str());
     }
-
     auto scalars = build_scalar_registry_from_r(scalars_sexp);
     if (!scalars.has_value()) {
         Rf_error("%s", make_error("scalar import error", scalars.error()).c_str());
     }
+    return CallInputs{.tables = std::move(*tables), .scalars = std::move(*scalars)};
+}
 
-    auto evaluated = eval_table_impl(*query, *tables, *scalars, *plugin_paths);
+auto source_text(SEXP text_sexp, bool is_path) -> std::string {
+    auto text = scalar_string(text_sexp, is_path ? "'path'" : "'query'");
+    if (!text.has_value()) {
+        Rf_error("%s", text.error().c_str());
+    }
+    if (!is_path) {
+        return std::move(*text);
+    }
+    auto source = read_text_file(*text);
+    if (!source.has_value()) {
+        Rf_error("%s", source.error().c_str());
+    }
+    return std::move(*source);
+}
+
+/// The result of one evaluation as R gets it: an Arrow payload, or NULL.
+auto result_payload(
+    const std::expected<std::shared_ptr<const ibex::runtime::Table>, std::string>& evaluated)
+    -> SEXP {
     if (!evaluated.has_value()) {
         Rf_error("%s", evaluated.error().c_str());
     }
-
+    if (!*evaluated) {
+        return R_NilValue;
+    }
     auto payload = export_table_payload(*evaluated);
     if (!payload.has_value()) {
         Rf_error("%s", payload.error().c_str());
     }
-
     return *payload;
+}
+
+/// A one-off evaluation (`eval_ibex`, `eval_file`): a fresh session for the call.
+auto eval_once(SEXP text_sexp, bool is_path, SEXP plugin_paths_sexp, SEXP tables_sexp,
+               SEXP scalars_sexp) -> SEXP {
+    auto source = source_text(text_sexp, is_path);
+    auto plugin_paths = parse_plugin_paths(plugin_paths_sexp);
+    if (!plugin_paths.has_value()) {
+        Rf_error("%s", plugin_paths.error().c_str());
+    }
+    auto inputs = call_inputs(tables_sexp, scalars_sexp);
+    auto session = make_session(std::move(*plugin_paths));
+    return result_payload(
+        run_in_session(*session, source, std::move(inputs.tables), std::move(inputs.scalars)));
+}
+
+auto eval_in_session(SEXP session_sexp, SEXP text_sexp, bool is_path, SEXP tables_sexp,
+                     SEXP scalars_sexp) -> SEXP {
+    auto session = session_from_sexp(session_sexp);
+    if (!session.has_value()) {
+        Rf_error("%s", session.error().c_str());
+    }
+    auto source = source_text(text_sexp, is_path);
+    auto inputs = call_inputs(tables_sexp, scalars_sexp);
+    return result_payload(
+        run_in_session(**session, source, std::move(inputs.tables), std::move(inputs.scalars)));
+}
+
+}  // namespace
+
+extern "C" SEXP ibex_c_eval_ibex(SEXP query_sexp, SEXP plugin_paths_sexp, SEXP tables_sexp,
+                                 SEXP scalars_sexp) {
+    return eval_once(query_sexp, false, plugin_paths_sexp, tables_sexp, scalars_sexp);
 }
 
 extern "C" SEXP ibex_c_eval_file(SEXP path_sexp, SEXP plugin_paths_sexp, SEXP tables_sexp,
                                  SEXP scalars_sexp) {
-    auto path = scalar_string(path_sexp, "'path'");
-    if (!path.has_value()) {
-        Rf_error("%s", path.error().c_str());
-    }
-
-    auto source = read_text_file(*path);
-    if (!source.has_value()) {
-        Rf_error("%s", source.error().c_str());
-    }
-
-    auto plugin_paths = parse_plugin_paths(plugin_paths_sexp);
-    if (!plugin_paths.has_value()) {
-        Rf_error("%s", plugin_paths.error().c_str());
-    }
-
-    auto tables = build_table_registry_from_r(tables_sexp);
-    if (!tables.has_value()) {
-        Rf_error("%s", make_error("table import error", tables.error()).c_str());
-    }
-
-    auto scalars = build_scalar_registry_from_r(scalars_sexp);
-    if (!scalars.has_value()) {
-        Rf_error("%s", make_error("scalar import error", scalars.error()).c_str());
-    }
-
-    auto evaluated = eval_table_impl(*source, *tables, *scalars, *plugin_paths);
-    if (!evaluated.has_value()) {
-        Rf_error("%s", evaluated.error().c_str());
-    }
-
-    auto payload = export_table_payload(*evaluated);
-    if (!payload.has_value()) {
-        Rf_error("%s", payload.error().c_str());
-    }
-
-    return *payload;
+    return eval_once(path_sexp, true, plugin_paths_sexp, tables_sexp, scalars_sexp);
 }
 
 extern "C" SEXP ibex_c_create_session(SEXP plugin_paths_sexp) {
@@ -1415,10 +987,7 @@ extern "C" SEXP ibex_c_create_session(SEXP plugin_paths_sexp) {
         Rf_error("%s", plugin_paths.error().c_str());
     }
 
-    auto* session = new SessionState();
-    session->plugin_paths = std::move(*plugin_paths);
-    session->generation = next_session_generation.fetch_add(1, std::memory_order_relaxed);
-
+    auto* session = make_session(std::move(*plugin_paths)).release();
     SEXP ext = PROTECT(R_MakeExternalPtr(session, Rf_install("ibex_session"), R_NilValue));
     R_RegisterCFinalizerEx(ext, session_finalizer, TRUE);
     SEXP cls = PROTECT(Rf_mkString("ibex_session"));
@@ -1445,12 +1014,9 @@ extern "C" SEXP ibex_c_reset_session(SEXP session_sexp) {
         Rf_error("%s", session.error().c_str());
     }
 
-    auto plugin_paths = (*session)->plugin_paths;
-    delete *session;
-    auto* fresh = new SessionState();
-    fresh->plugin_paths = std::move(plugin_paths);
-    fresh->generation = next_session_generation.fetch_add(1, std::memory_order_relaxed);
-    R_SetExternalPtrAddr(session_sexp, fresh);
+    auto fresh = make_session((*session)->plugin_paths);
+    const std::unique_ptr<RSession> old(*session);
+    R_SetExternalPtrAddr(session_sexp, fresh.release());
     return session_sexp;
 }
 
@@ -1470,6 +1036,11 @@ extern "C" SEXP ibex_c_session_table_info(SEXP session_sexp, SEXP name_sexp) {
     return *info;
 }
 
+/// Infer the schema of a rendered lazy-plan query without executing it.
+///
+/// Deliberately total: every way this can fail to reach a Known schema returns
+/// NULL rather than an error, because the caller's fallback -- assume every
+/// column nullable -- is sound for all of them.
 extern "C" SEXP ibex_c_session_infer_schema(SEXP session_sexp, SEXP query_sexp,
                                             SEXP lexical_names_sexp) {
     auto session = session_from_sexp(session_sexp);
@@ -1481,6 +1052,9 @@ extern "C" SEXP ibex_c_session_infer_schema(SEXP session_sexp, SEXP query_sexp,
         Rf_error("%s", query.error().c_str());
     }
 
+    // Scalars captured from the R environment (`.env$cutoff`) are supplied at
+    // eval time, not bound in the session, so the caller names them: they are
+    // not columns.
     std::vector<std::string> lexical_names;
     if (TYPEOF(lexical_names_sexp) == STRSXP) {
         const R_xlen_t count = Rf_xlength(lexical_names_sexp);
@@ -1493,7 +1067,7 @@ extern "C" SEXP ibex_c_session_infer_schema(SEXP session_sexp, SEXP query_sexp,
         }
     }
 
-    const auto schema = infer_plan_schema(**session, *query, lexical_names);
+    const auto schema = (*session)->repl->infer_schema(*query, lexical_names);
     if (!schema.has_value()) {
         return R_NilValue;
     }
@@ -1520,81 +1094,12 @@ extern "C" SEXP ibex_c_session_infer_schema(SEXP session_sexp, SEXP query_sexp,
 
 extern "C" SEXP ibex_c_session_eval_ibex(SEXP session_sexp, SEXP query_sexp, SEXP tables_sexp,
                                          SEXP scalars_sexp) {
-    auto session = session_from_sexp(session_sexp);
-    if (!session.has_value()) {
-        Rf_error("%s", session.error().c_str());
-    }
-
-    auto query = scalar_string(query_sexp, "'query'");
-    if (!query.has_value()) {
-        Rf_error("%s", query.error().c_str());
-    }
-
-    auto tables = build_table_registry_from_r(tables_sexp);
-    if (!tables.has_value()) {
-        Rf_error("%s", make_error("table import error", tables.error()).c_str());
-    }
-
-    auto scalars = build_scalar_registry_from_r(scalars_sexp);
-    if (!scalars.has_value()) {
-        Rf_error("%s", make_error("scalar import error", scalars.error()).c_str());
-    }
-
-    auto evaluated = eval_table_in_session(**session, *query, *tables, *scalars);
-    if (!evaluated.has_value()) {
-        Rf_error("%s", evaluated.error().c_str());
-    }
-    if (!*evaluated) {
-        return R_NilValue;
-    }
-
-    auto payload = export_table_payload(*evaluated);
-    if (!payload.has_value()) {
-        Rf_error("%s", payload.error().c_str());
-    }
-    return *payload;
+    return eval_in_session(session_sexp, query_sexp, false, tables_sexp, scalars_sexp);
 }
 
 extern "C" SEXP ibex_c_session_eval_file(SEXP session_sexp, SEXP path_sexp, SEXP tables_sexp,
                                          SEXP scalars_sexp) {
-    auto session = session_from_sexp(session_sexp);
-    if (!session.has_value()) {
-        Rf_error("%s", session.error().c_str());
-    }
-
-    auto path = scalar_string(path_sexp, "'path'");
-    if (!path.has_value()) {
-        Rf_error("%s", path.error().c_str());
-    }
-
-    auto source = read_text_file(*path);
-    if (!source.has_value()) {
-        Rf_error("%s", source.error().c_str());
-    }
-
-    auto tables = build_table_registry_from_r(tables_sexp);
-    if (!tables.has_value()) {
-        Rf_error("%s", make_error("table import error", tables.error()).c_str());
-    }
-
-    auto scalars = build_scalar_registry_from_r(scalars_sexp);
-    if (!scalars.has_value()) {
-        Rf_error("%s", make_error("scalar import error", scalars.error()).c_str());
-    }
-
-    auto evaluated = eval_table_in_session(**session, *source, *tables, *scalars);
-    if (!evaluated.has_value()) {
-        Rf_error("%s", evaluated.error().c_str());
-    }
-    if (!*evaluated) {
-        return R_NilValue;
-    }
-
-    auto payload = export_table_payload(*evaluated);
-    if (!payload.has_value()) {
-        Rf_error("%s", payload.error().c_str());
-    }
-    return *payload;
+    return eval_in_session(session_sexp, path_sexp, true, tables_sexp, scalars_sexp);
 }
 // NOLINTEND(cppcoreguidelines-pro-type-vararg)
 // NOLINTEND(bugprone-easily-swappable-parameters)

@@ -250,6 +250,9 @@ elseif(IBEX_BUILD_TOOLS)
         add_subdirectory(src/ui)
     endif()
     add_subdirectory(tools)
+elseif(IBEX_MINIMAL_RUNTIME)
+    # The language bindings (r/ibex) evaluate on the REPL session facade.
+    add_subdirectory(src/repl)
 endif()
 
 # Tests must be enabled before optional subdirectories that register tests.

@@ -37,10 +37,11 @@ def percentile(data: list[float], p: float) -> float:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--engine", choices=("polars", "duckdb"), required=True)
-    parser.add_argument("--polars-engine", choices=("in-memory", "streaming"), default="streaming",
-                        help="which Polars executor to select (Polars only). Upstream pins "
-                             "'in-memory' explicitly unless told otherwise, so this is a real "
-                             "choice rather than a default; see the note in main().")
+    parser.add_argument("--polars-engine", choices=("in-memory", "streaming"), default=None,
+                        help="which Polars executor to select (Polars only; default "
+                             "'streaming'). Upstream pins 'in-memory' explicitly unless told "
+                             "otherwise, so this is a real choice rather than a default; see "
+                             "the note in main().")
     parser.add_argument("--threads", type=int, default=None,
                         help="connection thread count (DuckDB only)")
     parser.add_argument("--pdsh-root", type=pathlib.Path, required=True,
@@ -53,8 +54,13 @@ def main() -> int:
     args = parser.parse_args()
     if args.threads is not None and (args.engine != "duckdb" or args.threads < 1):
         parser.error("--threads requires --engine duckdb and a positive value")
-    if args.polars_engine != "in-memory" and args.engine != "polars":
+    if args.polars_engine is not None and args.engine != "polars":
         parser.error("--polars-engine applies to --engine polars")
+    # Defaulted here rather than in add_argument, so the check above can tell an
+    # explicit flag from the default, and only for Polars: a DuckDB run has no
+    # executor choice (and no "-stream" in its framework name).
+    if args.polars_engine is None and args.engine == "polars":
+        args.polars_engine = "streaming"
 
     if not (args.pdsh_root / "queries" / args.engine).is_dir():
         parser.error(f"{args.pdsh_root} is not a Polars PDS-H checkout")

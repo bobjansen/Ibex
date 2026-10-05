@@ -29,6 +29,12 @@ namespace ibex::codegen {
 ///
 /// The emitted code uses ibex::ops::* for all table operations and can be
 /// compiled against the ibex runtime library.
+///
+/// The ops re-enter the same runtime kernels the interpreter runs, so a
+/// compiled program and the REPL can only diverge in plan construction and
+/// expression evaluation, never in a kernel. `tests/parity/` enforces it: every
+/// case must transpile and match the interpreter, or carry an `.unsupported`
+/// marker naming why (none do today).
 class Emitter {
    public:
     struct Config {

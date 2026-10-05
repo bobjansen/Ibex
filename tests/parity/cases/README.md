@@ -29,7 +29,7 @@ For a marked case the harness instead checks:
 
 So closing a transpiler gap = deleting its markers. Add a marked case for a
 construct the interpreter supports but `ibex_compile` does not, pointing at the
-workstream that will fix it (`plans/ibex-compile-conformance-plan.md`).
+plan or issue that will fix it.
 
 Current markers:
 

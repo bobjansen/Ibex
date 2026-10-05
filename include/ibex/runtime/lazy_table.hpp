@@ -281,8 +281,9 @@ class LazyTable {
     /// that the projection also wants is decoded normally rather than answered
     /// inside the page decoder, because it has to be materialized anyway.
     ///
-    /// Phase 2 seam of plans/per-occurrence-scan-selections-plan.md. Nothing
-    /// calls it yet.
+    /// The shared-decode seam: `decode_demanded_lazy_sources` (repl.cpp) decodes
+    /// a repeated source's output columns once and gathers each occurrence's
+    /// selection from them (see `isolate_filtered_scan_instances`).
     [[nodiscard]] auto selection_for(const std::set<std::string>& output_names,
                                      const std::vector<ir::Expr>& conjuncts,
                                      const ExecutionContext& exec,

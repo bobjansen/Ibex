@@ -445,8 +445,8 @@ TEST_CASE("LazyTable: project_where decodes predicates before selected payload c
 
 TEST_CASE("LazyTable: selection_for returns the rows project_where keeps",
           "[runtime][lazy_table]") {
-    // The equivalence Phase 2 of plans/per-occurrence-scan-selections-plan.md
-    // rests on: the selection alone must pick out exactly the rows
+    // The equivalence the shared decode of a repeated source rests on: the
+    // selection alone must pick out exactly the rows
     // project_where would have produced, so several occurrences of one source
     // can share a decode and gather from it instead of each re-reading.
     FakeSource selection_source;

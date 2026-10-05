@@ -2,11 +2,58 @@
 
 The one-place statement of the contracts every operator, source, kernel, and
 sink in this directory is bound by. Written 2026-08-22 as Phase 2's opening
-deliverable of [plans/kernel-pipeline-execution-plan.md](../../plans/kernel-pipeline-execution-plan.md)
+deliverable of the kernel-pipeline migration (plan retired 2026-10-05:
+`git show 2b96e6d6:plans/kernel-pipeline-execution-plan.md`)
 — extracting the kernel APIs (`ChunkView`, selection, validity, output
 writer) is stating these contracts in code, so they get stated in prose
 first. Each section names the header that owns the normative doc comment;
 this file is the map and the cross-file invariants, not a second authority.
+
+## 0. The execution architecture these contracts serve
+
+```
+parser AST → logical IR → physical plan → pipelines → morsel executor → Table / sink
+```
+
+- **Lowering is one-way.** After semantic analysis no runtime component
+  inspects `parser::ast`.
+- **The logical IR is purely logical**: relational meaning, expression and null
+  semantics, the schema / ordering / uniqueness / nullability / origin proofs,
+  and the optimizer's rewrites. It does not encode execution accidents (a fused
+  node kind, "is this join streamable", a key representation, whether a source
+  is worker-safe).
+- **The physical plan (`runtime::physical`, `physical_plan.hpp`) owns algorithm
+  selection and execution capability.** Its nodes are data, and each declares
+  rather than implies: schema and `TableProperties` transfer, streaming or
+  blocking, partitioning and output-order rule, state ownership, fan-out
+  policy, and a decline reason. `explain physical` prints it. A plan that
+  cannot say why it materialized is not acceptable.
+- **A pipeline** runs from a partitionable source or a breaker's output to the
+  next breaker. A breaker owns its build state and starts the next pipeline
+  when its build completes. The executor runs numbered morsels on the one
+  process pool; no query DAG scheduler, no work stealing, no futures (measured
+  unnecessary: `PARALLELISM.md`, "Measured and dropped").
+- **Kernels** are a library of statically compiled specializations behind a few
+  interfaces (`kernel_types.hpp`: `ColumnView`, `ChunkView`, `Selection`,
+  output writers), dispatched once at pipeline construction, never per row,
+  and shared across operators (the same gather / validity / scatter / hash
+  kernels serve filter output, join assembly, sort and aggregate emission).
+- **Breakers follow state ownership, not universal streaming.** Hash join: one
+  build, immutable once built (`JoinHashIndex`), probed by source-order
+  morsels. Hash aggregate: partitions own key maps and slots, with a
+  data-derived partition count. Order and distinct are explicit barriers.
+- **`MaterializedCall` is the accepted end state for the rest**, not a
+  way-station: honest, profiled, named in `explain physical`, its inputs built
+  through `materialize_plan` (`build_materialized_fallback`,
+  `run_materialized_node`). A fallback kind becomes a physical breaker only
+  when a profile shows it costing wall time.
+- **No query JIT.** This is Umbra's staged design (AST → relational algebra →
+  pipeline-oriented morsel execution) with a precompiled templated-kernel
+  backend in place of generated code — a deliberate trade for low
+  implementation and query-startup cost (Kersten, Leis, Neumann, *Tidy Tuples
+  and Flying Start*, VLDB Journal 2021). One freedom follows from it: Umbra
+  must fix a join's build side at compile time; Ibex resolves orientation at
+  run time, after the build barrier, with both row counts in hand.
 
 ## 1. `Chunk` — the unit of flow
 

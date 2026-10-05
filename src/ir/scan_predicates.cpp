@@ -388,6 +388,10 @@ auto build_side_key_domain_ratio(const JoinNode& join, const SourceRowCounts& ro
     return static_cast<double>(build_rows) / static_cast<double>(domain->second);
 }
 
+// This decides decode pruning only. Which side a join indexes is decided at
+// run time, with both row counts, in `ChunkedInnerJoinOperator::initialize`
+// (`join_chunked.cpp`); the two are routinely both called "the join cost
+// model".
 auto build_side_worth_deferring(const JoinNode& join, const std::string& probe_source,
                                 const SourceRowCounts& row_counts, const SourceSchemas& schemas,
                                 const std::map<std::string, double>& absorbed) -> bool {

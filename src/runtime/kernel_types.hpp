@@ -21,9 +21,8 @@
 
 namespace ibex::runtime::kernel {
 
-/// Phase 2, item 1 of plans/kernel-pipeline-execution-plan.md: the non-owning
-/// vocabulary kernels exchange data through, per the ownership model that plan
-/// prescribes and CONTRACTS.md states. Views carry length, validity, and
+/// The non-owning vocabulary kernels exchange data through, per the ownership
+/// model CONTRACTS.md states (section 0 for the architecture). Views carry length, validity, and
 /// position explicitly and own nothing; the referenced storage must outlive
 /// the view (the one-query lease and the operator's chunk lifetime provide
 /// that, as they already do for `TableRangeMorsel`).

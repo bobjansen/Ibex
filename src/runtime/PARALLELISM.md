@@ -343,9 +343,9 @@ bugs: each new operator copies whichever neighbour it was written next to.
 
 # Target: parallelism as a plan decision
 
-Status: **spec, not built** (2026-08-27). This is the end state the breaker
-decomposition (`kernel-pipeline-execution-plan.md` Phase 4) builds toward. It is
-written before the code so it can be checked once rather than argued during
+Status: **built for Distinct, Order, streaming Join and streaming Aggregate**
+(2026-08-29); written 2026-08-27 as the spec the breaker migration built
+toward, before the code, so it could be checked once rather than argued during
 every slice. Nothing here changes a determinism device or a kernel — it moves
 *who decides* and *where the tunable lives*, not *how the work is done*.
 
@@ -498,9 +498,8 @@ Every slice:
   once.
 - **Not removing the runtime checks.** `on_worker_pool_thread()` and the
   first-chunk floor check are the operator's, permanently.
-- **Not ownership of the remaining `chunked.cpp` split.** This contract enabled
-  Phase 5; Aggregate and streaming inner join have now moved, while
-  planner/executor extraction is tracked by the kernel-pipeline plan.
+- **Not ownership of the `chunked.cpp` split.** This contract enabled it; the
+  split finished 2026-08-31 (`runtime_entry.cpp` plus one file per family).
 - **Not a row-count estimator project.** The estimate is opportunistic (footer
   stats, exact child counts). `partition_count = 0 / derive` is the honest
   default and preserves today's behavior exactly.

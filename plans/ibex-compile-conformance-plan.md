@@ -17,7 +17,7 @@ they can express, and nothing makes that drift visible. This is the **umbrella**
 `map` (W1) is the first concrete workstream and carries the most design detail.
 
 **Non-goal:** this is *not* the "typed logical IR → physical pipelines →
-templated kernels" successor described in `kernel-pipeline-execution-plan.md`.
+templated kernels" architecture (`src/runtime/CONTRACTS.md` §0).
 It keeps the current architecture (the transpiler emits `ibex::ops::*` calls
 that re-enter the runtime kernels) and makes it cover the language that already
 exists.
@@ -658,8 +658,8 @@ Build `cmake --build build -j6` (`[[feedback_cap_build_parallelism]]`).
 `[[project_physical_fallback_adapter]]` · `[[project_interpreter_tu_split]]` ·
 `[[project_repl_two_path_consolidation]]` · `[[project_e2e_lazy_query_harness]]` ·
 `[[project_object_equivalence_script]]` ·
-`plans/kernel-pipeline-execution-plan.md` (the architectural successor — this
-plan is explicitly *not* that) ·
+`src/runtime/CONTRACTS.md` §0 (the runtime architecture — this plan is
+explicitly *not* about it) ·
 `plans/extern-series-arguments-plan.md` (the `Series<T>` extern-arg ABI, pairs
 with W2) · the retired count-window plan (W5 backstory,
 `git show 0d069262:plans/count-window-plan.md`)

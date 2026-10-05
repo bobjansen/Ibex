@@ -178,9 +178,9 @@ struct JoinPlan {
     /// plan that names a build side is a plan a scheduler would believe.
     /// Naming the inputs and leaving the orientation to the build is what
     /// lets both children be scheduled as pipelines without the plan
-    /// pretending to a decision it cannot make -- see
-    /// plans/kernel-pipeline-execution-plan.md, "The build-side choice does
-    /// not block the split".
+    /// pretending to a decision it cannot make: the pipeline that scans the
+    /// other side is constructed after the build barrier has chosen
+    /// (CONTRACTS.md section 0, last bullet).
     const ir::Node* left_input = nullptr;
     const ir::Node* right_input = nullptr;
     std::size_t key_count = 0;
@@ -576,6 +576,13 @@ struct Plan {
 /// to execute. A map step is admitted only when the residual construction path
 /// agrees (`is_map_step` mirrors that routing exactly), so the plan cannot
 /// claim a shape the executor would construct differently.
+///
+/// Porting a decision here: name the builder's own predicates and
+/// de-duplicate them, have the planner RELAY them, have the builder consume
+/// the plan, then move construction. A planner that restates a builder's
+/// gates in its own words drifts: one did within the hour (two-key Int64 joins,
+/// `6de3956d`), and an equivalence probe written from the same reading agreed
+/// with the mistake.
 [[nodiscard]] auto plan_physical(const ir::Node& root, const TableRegistry& registry,
                                  const ExternRegistry* externs,
                                  const ir::SourceSchemas& source_schemas = {}) -> Plan;

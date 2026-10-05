@@ -3,7 +3,8 @@
 Status of every plan in this directory, grouped by lifecycle.
 
 **2026-10-05:** retired the radix group-by note, the owned aggregate,
-runtime multithreading, the Phase 3 DOP-budget analysis, and the three
+runtime multithreading, the Phase 3 DOP-budget analysis, the kernel-pipeline
+migration (finished), and the three
 reference documents (`joins.md`, `parallelism-overview.md`,
 `allocator-and-huge-pages.md`), whose rules moved to SPEC.md, `MEASURING.md`,
 `src/runtime/PARALLELISM.md` and the code; the rows below re-checked against
@@ -46,7 +47,6 @@ history).
 | Plan | Status | What's actually left |
 |---|---|---|
 | [beat-both-plan.md](beat-both-plan.md) | **Ongoing umbrella, created 2026-10-04** by merging beat-polars and beat-duckdb. References: Polars **streaming** and DuckDB (never Polars in-memory). Baseline §1.0 (AWS `20261004T100951_1bfeceb5`, 8 cores): Ibex/Polars 0.94 total, geomean 1.00 against both; Ibex leads on 1–4 cores and loses at 16. The benchmark write-up waits for milestone 1. | Milestone 1: total and geomean ≤ 1.0 against both at 8 cores on AWS SF-10 (1 core still ahead, 2 cores not a loss). Landed since the baseline: consumer helps the scan (`49da7a27`, lineitem scan family −4 to −7% at 8 cores) and the left-scan join filter (`c4084d23`, q12 −35%); an AWS run to re-check the milestone is pending. Next per §3: q10, the deferred-probe joins (q03/q05/q07/q09), q01's worker-side work. |
-| [kernel-pipeline-execution-plan.md](kernel-pipeline-execution-plan.md) | **Phase 2 complete** except `KernelContext` (deliberately unbuilt); Phase 3 handoff/island/raw-thread work complete, with accounting and DOP/memory budgets deferred; Phase 4 construction ownership **and fan-out authority** done (backlog 116→6 breakers, plan describes 97% of real-work nodes). Streaming inner joins have typed `HashBuild`/`HashProbe` nodes and positional `JoinColumnMapping`. Streaming aggregates have positional `AggregateColumnMapping`, authoritative partition/finalize policy, and a typed Discovery → Accumulation → FinalOrdering → Emission hash-fallback chain. The serial coordinator invokes all four nodes through a bounded discovery transfer or explicit fused marker, with independent profile rows. Executor-seam mutations prove mappings, policies, and structural edges are consumed or rejected. Known closed schemas bind during planning; lazy/open schemas bind once at execution. Semi/anti retains its separate streaming operator. Architectural successor: typed logical IR, physical pipelines, morsel executor, templated kernel library; not a JIT. | Migration drained; what is left is perf, ranked in beat-both. Open in-plan: attach aggregate fan-out policy to each structural node and admit it phase by phase. Done since this row was written: the `chunked.cpp` split (2026-08-31) and the end of `interpret_node` as a second executor (2026-10-04). |
 | [non-row-local-filter-plan.md](non-row-local-filter-plan.md) | Stage 1 shipped | `lag`/`lead`/`is_null` in filter work. Remaining: `rank(...)` in filter/select with `by`, explicit `order {}` context, rolling functions in filter (`price > rolling_mean(price)`) |
 | [bigger-than-ram-plan.md](bigger-than-ram-plan.md) | Phase 4 bullet 1 of 4 done | Out-of-core execution. Done: chunked/streaming `read_parquet` (branch `chunked-parquet-read`; ~6.5× lower peak RSS, ~1.7× faster, verified local + AWS). Next: column projection pushdown, row-group stats pushdown, directory/Hive datasets (rest of Phase 4), then Phase 1 spill infrastructure (prerequisite for Phases 2–3, 6–7: external sort, out-of-core join, adaptive spill selection) |
 | [grouped-chunkview-update-plan.md](grouped-chunkview-update-plan.md) | Mostly complete — `update …, by k` runs off an immutable `GroupedRowPlan` (CSR) instead of gather → per-group `Table` → scatter. Sub-plan of kernel-pipeline Phase 2. | Remaining materialized shapes: `rank`, variable-width ordered state, `window`-clause `lag`/`lead`. |
@@ -128,6 +128,34 @@ in active plans to `plans/done/...` paths refer to that history.
   target, or a warm process shows page faults) are on `tune_allocator_once`
   in `src/runtime/interpreter.cpp`; the warm/fresh quoting rule is in
   `MEASURING.md`.
+
+- **kernel-pipeline-execution-plan.md** — retired 2026-10-05; read it at
+  `git show 2b96e6d6:plans/kernel-pipeline-execution-plan.md`. The migration from
+  `build_operator` branches to logical IR → physical plan → pipelines →
+  morsel executor, drained 2026-08-31: an inspectable physical plan
+  (`explain physical`), row-local kernels (`kernel_types.hpp`), one ordered
+  handoff (`OrderedChunkRing`), islands as a pipeline mode, breakers built from
+  the plan with plan-owned fan-out (`HashBuild`/`HashProbe`; the four
+  aggregate phases), `chunked.cpp` split into `runtime_entry.cpp` plus one
+  file per family, and the `MaterializedCall` fallback as the accepted end
+  state. Where its rules live now: the architecture in
+  `src/runtime/CONTRACTS.md` §0; the planner-relays-the-builder method note on
+  `plan_physical`; the two "join cost model" decisions beside each other
+  (`build_side_worth_deferring`, `ChunkedInnerJoinOperator::initialize`).
+  Its "q21 serial hash build" target was met by the partitioned build
+  (q21 −8.5%); the 40 ms it was sized from was a wall-span self time. Left:
+  - two small cleanups: the `Filter`/`Project`/`Rename` branches in
+    `build_operator_impl` (`runtime_entry.cpp`) are probably reachable only on
+    `MalformedMapNode` (confirm, then delete or make them
+    `invariant_violation`); bare streaming sources (a deferred `Scan`, a
+    chunked `ExternCall`) inflate the `note_materialized_call` backlog;
+  - `IBEX_PROBE_MORSELS=1` (opt-in probe morsels) still stalls SF-4 q09: fix
+    it or delete the opt-in;
+  - deferred, with their reopen conditions: `KernelContext` (when kernels
+    share scratch or a cancellation owner), per-pipeline scheduling accounting
+    (a multi-producer change, or queues forming), splitting the test binary by
+    layer (when the link hurts the inner loop), migrating a fallback kind
+    (when one profiles hot), DOP/memory budgets (see the DOP-analysis entry).
 
 - **joins.md** — retired 2026-10-05; read it at `git show fa7aad97:plans/joins.md`.
   The join contract, built 2026-08: asymmetric keys, the canonical output
@@ -272,8 +300,8 @@ in active plans to `plans/done/...` paths refer to that history.
 - The extern chunked-source contract (formerly chunked-execution §2,
   removed from the tree 2026-08-22) is the gateway to the
   ADBC/pushdown stages in the execution roadmap (memory:
-  project_execution_roadmap); it is now tracked in kernel-pipeline Phase 0/2
-  and bigger-than-ram Phase 4.
+  project_execution_roadmap); `src/runtime/CONTRACTS.md` §6 states it, and
+  bigger-than-ram Phase 4 is where it is extended.
 - **pipelined-execution** now supplies the first source-to-breaker and
   join-output overlap on top of the chunked substrate. It deliberately retains
   whole-query `LazyTable` pushdowns; its next work is progress-aware admission
@@ -286,7 +314,8 @@ in active plans to `plans/done/...` paths refer to that history.
 - **bigger-than-ram** built directly on the removed **chunked-execution**:
   every "materializing" row in that plan's coverage table (unsorted `Order`/
   `AsTimeframe`, non-streaming `Tail`, general `Join`) is a target phase
-  here — that breaker list is now kernel-pipeline Phase 4/5's — and the
+  here — the streaming breakers that exist now are listed in
+  `src/runtime/PARALLELISM.md` — and the
   extern-source contract hardening and this plan's Phase 4 (chunked Parquet)
   are the same work from two angles. Its Phase 7 (parallel spill I/O) was sequenced after
   **runtime-multithreading**, which has since landed.

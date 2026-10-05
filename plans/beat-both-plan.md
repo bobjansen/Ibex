@@ -6,8 +6,8 @@ measurement history this file leaves out, is at
 `git show 7a32d537:plans/beat-polars-plan.md` and
 `git show 7a32d537:plans/beat-duckdb-plan.md` (the August Polars plan is at
 `git show e82f679d:plans/beat-polars-plan.md`). Mechanism lives in
-`kernel-pipeline-execution-plan.md` and `src/runtime/PARALLELISM.md`; the
-retired owned-aggregate and runtime-multithreading plans are at
+`src/runtime/CONTRACTS.md` and `src/runtime/PARALLELISM.md`; the retired
+owned-aggregate and runtime-multithreading plans are at
 `git show 587bc2e4:plans/owned-agg-per-chunk-barrier-plan.md` and
 `git show 587bc2e4:plans/runtime-multithreading-plan.md`.
 

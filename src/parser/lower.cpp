@@ -4103,6 +4103,21 @@ class Lowerer {
         return result;
     }
 
+    /// Whether `expr` is a bare name (or `^name`) for a scalar of an enclosing
+    /// inlined call: one of its scalar parameters or `let`s.
+    [[nodiscard]] auto names_inline_scalar(const Expr& expr) const -> bool {
+        const Expr* cur = &expr;
+        while (const auto* group = std::get_if<GroupExpr>(&cur->node)) {
+            cur = group->expr.get();
+        }
+        const auto* ident = std::get_if<IdentifierExpr>(&cur->node);
+        if (ident == nullptr) {
+            return false;
+        }
+        return std::ranges::any_of(inline_scopes_,
+                                   [&](const auto& scope) { return scope.contains(ident->name); });
+    }
+
     /// Inline a call to a table-returning user function in table position: lower
     /// each argument in the caller's scope, then install table-typed params as
     /// IR bindings (as if `let`-bound) and scalar params into a fresh inline
@@ -4200,6 +4215,17 @@ class Lowerer {
             }
         }
         for (const auto* let : body_shape->lets) {
+            // A bare name is a scalar when it names one of this call's scalar
+            // parameters or lets; `lower_expr` would take any name for a table.
+            if (names_inline_scalar(*let->value)) {
+                auto scalar = lower_expr_to_ir(*let->value);
+                if (!scalar.has_value()) {
+                    cleanup();
+                    return std::unexpected(scalar.error());
+                }
+                inline_scopes_.back().insert_or_assign(let->name, std::move(scalar.value()));
+                continue;
+            }
             if (auto tbl = lower_expr(*let->value); tbl.has_value()) {
                 shadow(let->name, std::move(tbl.value()));
             } else {

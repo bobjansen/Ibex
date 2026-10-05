@@ -272,14 +272,14 @@ rm -f "$RESULTS/ibex_st${SUFFIX}.tsv.tmp"
 # number this sitting did not measure.
 if [[ "$POLARS_IN_MEMORY" -eq 1 ]]; then
     echo "=== upstream PDS-H Polars (multi-threaded, ${CORES:-$(nproc)} cores) ==="
-    "${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" --engine polars --pdsh-root "$PDSH_ROOT" \
-        --sf "$SCALE" --warmup "$WARMUP" --iters "$ITERS" --framework pdsh-polars \
+    "${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" --engine polars --polars-engine in-memory \
+        --pdsh-root "$PDSH_ROOT" --sf "$SCALE" --warmup "$WARMUP" --iters "$ITERS" --framework pdsh-polars \
         --out "$RESULTS/pdsh_polars${SUFFIX}.tsv"
 
     echo "=== upstream PDS-H Polars (single-threaded) ==="
     POLARS_MAX_THREADS=1 "${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" \
-        --engine polars --pdsh-root "$PDSH_ROOT" --sf "$SCALE" --warmup "$WARMUP" --iters "$ITERS" \
-        --framework pdsh-polars-st --out "$RESULTS/pdsh_polars_st${SUFFIX}.tsv"
+        --engine polars --polars-engine in-memory --pdsh-root "$PDSH_ROOT" --sf "$SCALE" \
+        --warmup "$WARMUP" --iters "$ITERS" --framework pdsh-polars-st --out "$RESULTS/pdsh_polars_st${SUFFIX}.tsv"
 else
     echo "=== upstream PDS-H Polars in-memory: SKIPPED (pass --polars-in-memory to add it) ==="
     rm -f "$RESULTS/pdsh_polars${SUFFIX}.tsv" "$RESULTS/pdsh_polars_st${SUFFIX}.tsv"

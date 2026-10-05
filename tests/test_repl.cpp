@@ -2973,6 +2973,37 @@ TEST_CASE("Namespaces: a script with imports and namespaces plans as one block",
                                registry, config) == "planner: whole-script");
 }
 
+TEST_CASE("REPL: a table function's scalar lets survive a call nested in another call",
+          "[repl][function]") {
+    // A call nested in `rbind(...)` is inlined into the plan, unlike a call that
+    // is a whole statement. A body `let` naming a scalar parameter (`let n =
+    // x`) used to be taken there for a table named `x`, and the update then
+    // failed at run time with "column not found".
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    const auto setup = session.execute(R"(
+let base = Table { a = [0], b = [0] };
+fn renamed(x: Int) -> DataFrame {
+    let n = x;
+    Table { a = [1] }[update { b = n }];
+}
+)");
+    CAPTURE(setup.error);
+    REQUIRE(setup.ok);
+    const auto b_of = [&](const char* src) {
+        CAPTURE(src);
+        const auto r = session.execute(src);
+        REQUIRE(r.ok);
+        REQUIRE(r.table.has_value());
+        const auto* b = std::get_if<ibex::Column<std::int64_t>>(r.table->find("b"));
+        REQUIRE(b != nullptr);
+        return std::vector<std::int64_t>(b->begin(), b->end());
+    };
+    CHECK(b_of("rbind(base, renamed(7));") == std::vector<std::int64_t>{0, 7});
+    // The same call as a whole statement, which never went through the plan.
+    CHECK(b_of("renamed(7);") == std::vector<std::int64_t>{7});
+}
+
 TEST_CASE("REPL session accepts input that ends with a function definition", "[repl][function]") {
     // The REPL supplies a missing final `;`. After a declaration's closing `}`
     // that `;` used to become an empty statement and a parse error.

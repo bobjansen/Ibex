@@ -120,6 +120,26 @@ TEST_CASE("Lower rejects a grouped select field that is not an aggregate", "[par
     CHECK(parser::lower(require_parse("t[update { l = lag(s, 1) }, by d];")).has_value());
 }
 
+TEST_CASE("Lower keeps a table function's scalar lets scalar when it inlines the call",
+          "[parser][lower]") {
+    // `let n = x` names a scalar parameter; inlined, it used to become a table
+    // named `x` and the update a column reference that failed at run time.
+    auto plan = parser::lower(require_parse(R"(
+fn renamed(x: Int) -> DataFrame {
+    let n = x;
+    Table { a = [1] }[update { b = n }];
+}
+rbind(Table { a = [0], b = [0] }, renamed(7));
+)"));
+    REQUIRE(plan.has_value());
+    const ibex::runtime::TableRegistry none;
+    auto out = ibex::runtime::interpret(*plan.value(), none, nullptr, nullptr);
+    REQUIRE(out.has_value());
+    const auto* b = std::get_if<ibex::Column<std::int64_t>>(out->find("b"));
+    REQUIRE(b != nullptr);
+    CHECK(std::vector<std::int64_t>(b->begin(), b->end()) == std::vector<std::int64_t>{0, 7});
+}
+
 TEST_CASE("Lower inlines a table-returning user function at its call site") {
     auto program = require_parse(
         "fn wide(src: DataFrame, lo: Int) -> DataFrame effects {} {\n"

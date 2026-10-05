@@ -1,106 +1,110 @@
-// PDS-H AWS report: every number on the report, computed in Ibex.
+// PDS-H report: every number on the report, computed in Ibex.
 //
-// report.R unpacks the run archives, loads each pass with `load_pass`, binds
-// them all as `timings`, then reads the tables below back into R and plots
-// them with ggplot2. A pass is one `run_bench.sh` invocation at one pinned
-// core count: Ibex, Polars streaming and DuckDB, each also single-threaded.
+// report.R finds each pass of each run it is given, loads every timing TSV of
+// the pass with `load_timings`, binds them all as `timings`, then reads the
+// tables below back into R to write and plot. A pass is one `run_bench.sh`
+// invocation at one pinned core count; its TSVs hold one engine each, timed
+// multi-threaded or (framework name ending in `-st`) single-threaded.
+//
+// Nothing here names an engine but Ibex: every other engine in the data is a
+// reference, and "the faster reference" is the fastest of them per query.
 
 import "csv";
 import "json";
 
-// One engine's per-query timings (mean of the timed iterations) from one pass.
-fn read_engine(path: String, eng: String, threads: String) -> DataFrame {
-    csv::read(path, "", "\t")[select { query, ms = avg_ms }][update { engine = eng, mode = threads }];
-}
-
-// The six TSVs of one pass, tagged with its run, its pass id and the core
-// count it was pinned to (from the pass's manifest).
-fn load_pass(dir: String, run_label: String, pass_id: String) -> DataFrame {
+// One timing TSV of one pass, tagged with its run, its pass id, and the core
+// count and scale factor from the pass's manifest.
+fn load_timings(dir: String, file: String, run_label: String, pass_id: String) -> DataFrame {
     let n_cores = Int64(scalar(json::read(`${dir}/manifest.json`), cores));
-    rbind(
-        read_engine(`${dir}/ibex_sf10.tsv`, "Ibex", "multi"),
-        read_engine(`${dir}/pdsh_polars_stream_sf10.tsv`, "Polars", "multi"),
-        read_engine(`${dir}/pdsh_duckdb_sf10.tsv`, "DuckDB", "multi"),
-        read_engine(`${dir}/ibex_st_sf10.tsv`, "Ibex", "single"),
-        read_engine(`${dir}/pdsh_polars_stream_st_sf10.tsv`, "Polars", "single"),
-        read_engine(`${dir}/pdsh_duckdb_st_sf10.tsv`, "DuckDB", "single")
-    )[update { run = run_label, pass = pass_id, cores = n_cores }];
-}
-
-// One row per (run, pass, cores, query): the three engines' milliseconds side
-// by side, for one thread mode.
-fn engines_wide(t: DataFrame, threads: String) -> DataFrame {
-    let ib = t[filter engine == "Ibex" && mode == threads,
-               select { run, pass, cores, query, ibex = ms }];
-    let pl = t[filter engine == "Polars" && mode == threads,
-               select { run, pass, cores, query, polars = ms }];
-    let dk = t[filter engine == "DuckDB" && mode == threads,
-               select { run, pass, cores, query, duckdb = ms }];
-    (ib join pl on { run, pass, cores, query }) join dk on { run, pass, cores, query };
-}
-
-// Per query: Ibex against each engine and against the faster of the two.
-fn per_query(t: DataFrame) -> DataFrame {
-    engines_wide(t, "multi")[update {
-        faster_ms = pmin(polars, duckdb),
-        faster = case { polars <= duckdb => "Polars", else => "DuckDB" },
-        vs_faster = ibex / pmin(polars, duckdb),
-        ms_behind = ibex - pmin(polars, duckdb)
+    let sf = Int64(scalar(json::read(`${dir}/manifest.json`), scale_factor));
+    csv::read(`${dir}/${file}`, "", "\t")[select { framework, query, ms = avg_ms }][update {
+        engine = case {
+            like(framework, "ibex%") => "Ibex",
+            like(framework, "%duckdb%") => "DuckDB",
+            like(framework, "%polars-stream%") => "Polars streaming",
+            like(framework, "%polars%") => "Polars in-memory",
+            else => framework
+        },
+        mode = case { like(framework, "%-st") => "single", else => "multi" },
+        run = run_label,
+        pass = pass_id,
+        cores = n_cores,
+        scale_factor = sf
     }];
 }
 
-// Suite totals and the ratios the report quotes, per pass. `exclude` drops one
-// query from every figure (pass "" to keep all 22).
+// One row per (pass, reference engine, query): Ibex's milliseconds beside the
+// reference's, for one thread mode.
+fn against_references(t: DataFrame, threads: String) -> DataFrame {
+    let ibex = t[filter engine == "Ibex" && mode == threads,
+                 select { run, pass, cores, scale_factor, query, ibex = ms }];
+    let refs = t[filter engine != "Ibex" && mode == threads,
+                 select { run, pass, cores, query, reference = engine, reference_ms = ms }];
+    (ibex join refs on { run, pass, cores, query })[update { ratio = ibex / reference_ms }];
+}
+
+// Per query: Ibex against the fastest reference engine.
+fn per_query(t: DataFrame) -> DataFrame {
+    let pairs = against_references(t, "multi");
+    let fastest = pairs[select { faster_ms = min(reference_ms) }, by { run, pass, query }];
+    let named = (pairs join fastest on { run, pass, query })[filter reference_ms == faster_ms,
+                                                             select { run, pass, query, faster = reference }]
+                [distinct { run, pass, query, faster }];
+    ((pairs[select { ibex = first(ibex) }, by { run, pass, cores, scale_factor, query }]
+         join fastest on { run, pass, query })
+         join named on { run, pass, query })[update {
+        vs_faster = ibex / faster_ms,
+        ms_behind = ibex - faster_ms
+    }][order { run, cores, pass, query }];
+}
+
+// Suite totals and geomeans of Ibex against each reference, per pass.
+// `exclude` drops one query from every figure (pass "" to keep them all).
 fn suite(t: DataFrame, threads: String, exclude: String) -> DataFrame {
-    engines_wide(t, threads)[filter query != exclude, select {
+    against_references(t, threads)[filter query != exclude, select {
+        queries = count(),
         ibex_s = sum(ibex) / 1000.0,
-        polars_s = sum(polars) / 1000.0,
-        duckdb_s = sum(duckdb) / 1000.0,
-        geomean_vs_polars = exp(mean(log(ibex / polars))),
-        geomean_vs_duckdb = exp(mean(log(ibex / duckdb))),
-        geomean_vs_faster = exp(mean(log(ibex / pmin(polars, duckdb))))
-    }, by { run, pass, cores }][update {
-        vs_polars = ibex_s / polars_s,
-        vs_duckdb = ibex_s / duckdb_s
+        reference_s = sum(reference_ms) / 1000.0,
+        geomean = exp(mean(log(ratio)))
+    }, by { run, pass, cores, scale_factor, reference }][update {
+        total_ratio = ibex_s / reference_s
+    }][order { run, cores, pass, reference }];
+}
+
+// Against the fastest reference per query: the totals and geomean the
+// headline quotes, per pass.
+fn suite_vs_faster(t: DataFrame, exclude: String) -> DataFrame {
+    per_query(t)[filter query != exclude, select {
+        queries = count(),
+        ibex_s = sum(ibex) / 1000.0,
+        faster_s = sum(faster_ms) / 1000.0,
+        geomean = exp(mean(log(vs_faster)))
+    }, by { run, pass, cores, scale_factor }][update {
+        total_ratio = ibex_s / faster_s
     }][order { run, cores, pass }];
 }
 
-// Single-core totals per run. Every pass repeats the single-threaded rows on
-// the same box, so a run's single-core time is the mean over its passes and
-// its ratio is taken over all of them.
+// Every engine's suite total per pass, both thread modes.
+fn totals(t: DataFrame) -> DataFrame {
+    t[select { queries = count(), seconds = sum(ms) / 1000.0 },
+      by { run, pass, cores, scale_factor, engine, mode }][order { run, cores, pass, engine, mode }];
+}
+
+// Single-core totals per run and engine. Every pass repeats the
+// single-threaded rows on the same box, so a run's single-core time is the
+// mean over its passes.
 fn one_core(t: DataFrame) -> DataFrame {
-    engines_wide(t, "single")[select {
-        passes = count_distinct(pass),
-        ibex_ms = sum(ibex),
-        polars_ms = sum(polars),
-        duckdb_ms = sum(duckdb)
-    }, by { run }][update {
-        ibex_s = ibex_ms / 1000.0 / Float64(passes),
-        polars_s = polars_ms / 1000.0 / Float64(passes),
-        duckdb_s = duckdb_ms / 1000.0 / Float64(passes),
-        vs_polars = ibex_ms / polars_ms,
-        vs_duckdb = ibex_ms / duckdb_ms
-    }][select { run, passes, ibex_s, polars_s, duckdb_s, vs_polars, vs_duckdb }];
+    totals(t)[filter mode == "single", select {
+        passes = count(),
+        seconds = mean(seconds)
+    }, by { run, scale_factor, engine }][order { run, engine }];
 }
 
-// Each engine's speedup over its own single-core time on the same box.
+// Each engine's speedup over its own single-core time in the same run.
 fn scaling(t: DataFrame) -> DataFrame {
-    let multi = suite(t, "multi", "");
-    let single = one_core(t)[select { run, ibex1 = ibex_s, polars1 = polars_s, duckdb1 = duckdb_s }];
-    (multi join single on { run })[update {
-        speedup_ibex = ibex1 / ibex_s,
-        speedup_polars = polars1 / polars_s,
-        speedup_duckdb = duckdb1 / duckdb_s
-    }][select { run, pass, cores, speedup_ibex, speedup_polars, speedup_duckdb }];
-}
-
-// The 8-core passes side by side, with and without q21: how well a ratio
-// repeats across passes and boxes.
-fn repeatability(t: DataFrame, n_cores: Int) -> DataFrame {
-    let all = suite(t, "multi", "")[filter cores == n_cores,
-                                    select { run, pass, ibex_s, polars_s, duckdb_s, vs_polars, vs_duckdb }];
-    let no_q21 = suite(t, "multi", "q21")[filter cores == n_cores,
-                                          select { run, pass, no_q21_vs_polars = vs_polars,
-                                                   no_q21_vs_duckdb = vs_duckdb }];
-    (all join no_q21 on { run, pass })[order { run, pass }];
+    let multi = totals(t)[filter mode == "multi", select { run, pass, cores, engine, seconds }];
+    let single = one_core(t)[select { run, engine, one_core_s = seconds }];
+    (multi join single on { run, engine })[update {
+        speedup = one_core_s / seconds
+    }][select { run, pass, cores, engine, seconds, speedup }][order { run, cores, pass, engine }];
 }

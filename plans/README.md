@@ -4,7 +4,8 @@ Status of every plan in this directory, grouped by lifecycle.
 
 **2026-10-05:** retired the radix group-by note, the owned aggregate,
 runtime multithreading, the Phase 3 DOP-budget analysis, the kernel-pipeline
-migration (finished), and the three
+migration (finished), the compile-conformance umbrella (finished), and the
+three
 reference documents (`joins.md`, `parallelism-overview.md`,
 `allocator-and-huge-pages.md`), whose rules moved to SPEC.md, `MEASURING.md`,
 `src/runtime/PARALLELISM.md` and the code; the rows below re-checked against
@@ -49,7 +50,7 @@ history).
 | [beat-both-plan.md](beat-both-plan.md) | **Ongoing umbrella, created 2026-10-04** by merging beat-polars and beat-duckdb. References: Polars **streaming** and DuckDB (never Polars in-memory). Baseline §1.0 (AWS `20261004T100951_1bfeceb5`, 8 cores): Ibex/Polars 0.94 total, geomean 1.00 against both; Ibex leads on 1–4 cores and loses at 16. The benchmark write-up waits for milestone 1. | Milestone 1: total and geomean ≤ 1.0 against both at 8 cores on AWS SF-10 (1 core still ahead, 2 cores not a loss). Landed since the baseline: consumer helps the scan (`49da7a27`, lineitem scan family −4 to −7% at 8 cores) and the left-scan join filter (`c4084d23`, q12 −35%); an AWS run to re-check the milestone is pending. Next per §3: q10, the deferred-probe joins (q03/q05/q07/q09), q01's worker-side work. |
 | [non-row-local-filter-plan.md](non-row-local-filter-plan.md) | Stage 1 shipped | `lag`/`lead`/`is_null` in filter work. Remaining: `rank(...)` in filter/select with `by`, explicit `order {}` context, rolling functions in filter (`price > rolling_mean(price)`) |
 | [bigger-than-ram-plan.md](bigger-than-ram-plan.md) | Phase 4 bullet 1 of 4 done | Out-of-core execution. Done: chunked/streaming `read_parquet` (branch `chunked-parquet-read`; ~6.5× lower peak RSS, ~1.7× faster, verified local + AWS). Next: column projection pushdown, row-group stats pushdown, directory/Hive datasets (rest of Phase 4), then Phase 1 spill infrastructure (prerequisite for Phases 2–3, 6–7: external sort, out-of-core join, adaptive spill selection) |
-| [grouped-chunkview-update-plan.md](grouped-chunkview-update-plan.md) | Mostly complete — `update …, by k` runs off an immutable `GroupedRowPlan` (CSR) instead of gather → per-group `Table` → scatter. Sub-plan of kernel-pipeline Phase 2. | Remaining materialized shapes: `rank`, variable-width ordered state, `window`-clause `lag`/`lead`. |
+| [grouped-chunkview-update-plan.md](grouped-chunkview-update-plan.md) | Mostly complete — `update …, by k` runs off an immutable `GroupedRowPlan` (CSR) instead of gather → per-group `Table` → scatter. Began as a sub-plan of the (retired) kernel-pipeline plan's Phase 2. | Remaining materialized shapes: `rank`, variable-width ordered state, `window`-clause `lag`/`lead`. |
 | [per-occurrence-scan-selections-plan.md](per-occurrence-scan-selections-plan.md) | **Phases 1–3 LANDED** (`78a09fad`, `bf783ef3`, `f2b298db`). Restored filter pushdown for a source scanned more than once: each occurrence is renamed `source#fN` so `scan_predicates` keeps its predicate, `decode_demanded_lazy_sources` decodes the union of their output columns ONCE and gathers per occurrence, and the instances stay EAGER. Gated structurally on a fusable `like`. `ibex-e2e.sh` is green again. | **Phase 4 — narrow the `!= 1` gate generally.** Its price was +11.3% on q21, since the eager selection ran serial; with that fanned out (`f06e6da3`) widening the gate measures −0.4% geomean, byte-identical on 22, nothing regressed. The blocker is gone, so what is left is a risk judgement about the plan-shape change, not a cost one. |
 | [query-shape-conformance-plan.md](query-shape-conformance-plan.md) | **Compacted 2026-09-23.** The investigation is closed: excluding q21 the suite is at parity (0.995×), the scan-fusion cost gate is closed, and q21 is a known single-query gap (a self-join rewrite, not pushdown). The file now holds only the leftovers and the do-not-repeat list. | q13's fused non-anchored LIKE scan (66% more CPU than dense decode + filter); row-group task granularity in `direct_decode_table` (q15); a row-count-ratio deferred-probe gate (low priority, re-survey first). |
 
@@ -59,7 +60,6 @@ history).
 |---|---|
 | [in-subquery-plan.md](in-subquery-plan.md) | Proposal: `x in (table_expr)` / `!(x in …)` as semi / null-aware anti join — a sibling of `exists`; readability, not new queries |
 | [extern-series-arguments-plan.md](extern-series-arguments-plan.md) | Proposal: `Series<T>` as a first-class extern argument, starting with CSV null tokens |
-| [ibex-compile-conformance-plan.md](ibex-compile-conformance-plan.md) | **Umbrella.** Close the drift between `ibex_compile` (the C++ transpiler) and the interpreter — the surfaces have diverged (map, non-literal extern args, table-returning `fn`, `model {}`, window combos) and the parity harness is an allowlist that hides it. Step 0 upgrades parity to a conformance gate. Key reframe: the emitter emits only `ibex::ops::*` plan-reconstruction, never a native loop — but that's historical, not required. `map` is a `for` loop; **W1a** = `MapNode` + the emitter emitting an actual loop (with `read_csv`/`write_parquet` as literal C++), zero runtime changes. W1b (runtime expression-level extern evaluator, for the interpreter half) is deferred as low-value. Then W2 non-literal extern args, W3 user functions on whole-script/transpile, W4 `model {}`, W5 window combos. `ibex_compile` and the interpreter share all runtime kernels — the gap is plan-construction + expression-eval only. |
 | [project_http_plugin_plan.md](project_http_plugin_plan.md) | HTTP plugin MVP: simple registration API, blocking server, no decorators yet |
 
 ## Moved to `../roadmap/`
@@ -128,6 +128,32 @@ in active plans to `plans/done/...` paths refer to that history.
   target, or a warm process shows page faults) are on `tune_allocator_once`
   in `src/runtime/interpreter.cpp`; the warm/fresh quoting rule is in
   `MEASURING.md`.
+
+- **ibex-compile-conformance-plan.md** — retired 2026-10-05; read it at
+  `git show 707662b7:plans/ibex-compile-conformance-plan.md`. Closed the drift
+  between `ibex_compile` and the interpreter: the parity suite became a
+  conformance gate (every case transpiles and matches, or carries an
+  `.unsupported` marker; none do), then `map { }` on every surface (W1),
+  non-literal extern arguments and `parse_args` (W2), user functions (W3),
+  `model { }` with the built-in methods (W4), window combinations (W5, which
+  also fixed `where … update` compiling without its guard), and effects and
+  ADBC resources in compiled programs, functions included (W6, 2026-10-02).
+  Its two rules are on `Emitter` (`include/ibex/codegen/emitter.hpp`: one
+  set of kernels, so divergence can only be in plan construction) and
+  `ScriptPlan` (`include/ibex/parser/lower.hpp`: statement order comes from
+  the plan's effect summaries). Left, each refused with a message today:
+  - in compiled programs: plugin model methods (`lightgbm`, `kmeans`, `pca`,
+    hence `predict`), a model fitted inside a function;
+  - in compiled functions: a scalar `let` in the body, Decimal or column
+    parameters, reading the program's tables or connections, a nested call
+    returning a scalar or table argument;
+  - on the whole-script path: a deferred scalar sourced by the same lazy-reader
+    graph still declines (W2-S2);
+  - deferred: `effects { }` declarations on the ADBC externs (only together
+    with the file readers and writers), and a resource acquire/use/close
+    summary for finer reordering (needs alias analysis first);
+  - unverified: stream constructs in compiled mode were flagged for an audit
+    that the plan never closed.
 
 - **kernel-pipeline-execution-plan.md** — retired 2026-10-05; read it at
   `git show 2b96e6d6:plans/kernel-pipeline-execution-plan.md`. The migration from

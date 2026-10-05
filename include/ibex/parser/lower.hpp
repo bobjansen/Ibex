@@ -89,6 +89,11 @@ struct ResourceStep {
 
 struct FunctionPlan;
 
+/// Statement order is a property of the plan, from effect summaries: sinks,
+/// shared bindings, preamble calls and resource steps carry a `position`, and
+/// `ir::is_reorderable` decides what may move. The REPL's batch executor and
+/// `ibex_compile`'s emitter both consume this one plan, so neither has its own
+/// "run statements in source order" rule to drift from the other's.
 struct ScriptPlan {
     std::vector<ir::NodePtr> preamble;
     /// Statement index of each `preamble` call, parallel to it. A consumer that

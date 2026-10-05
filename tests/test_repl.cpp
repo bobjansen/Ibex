@@ -3025,3 +3025,84 @@ TEST_CASE("REPL session accepts input that ends with a function definition", "[r
     REQUIRE(r.scalar.has_value());
     CHECK(std::get<std::int64_t>(*r.scalar) == 42);
 }
+
+TEST_CASE("ReplSession: a call's own tables and scalars last for that call", "[repl][session]") {
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    REQUIRE(session.execute("let kept = Table { v = [1, 2, 3] };").ok);
+
+    const auto int_column = [](const ibex::runtime::Table& table, const char* name) {
+        const auto* column = std::get_if<ibex::Column<std::int64_t>>(table.find(name));
+        REQUIRE(column != nullptr);
+        return std::vector<std::int64_t>(column->begin(), column->end());
+    };
+    ibex::runtime::Table input;
+    input.add_column("v", ibex::Column<std::int64_t>{10, 20});
+    ibex::repl::ReplSession::ExecuteOptions options;
+    options.tables.insert_or_assign("kept", input);  // shadows the session's `kept`
+    options.scalars.insert_or_assign("cutoff", std::int64_t{15});
+    options.render = false;
+    const auto r = session.execute("let out = kept[filter v > cutoff]; out;", std::move(options));
+    CAPTURE(r.error);
+    REQUIRE(r.ok);
+    REQUIRE(r.table.has_value());
+    CHECK(int_column(*r.table, "v") == std::vector<std::int64_t>{20});
+    CHECK(r.output.empty());  // nothing formatted
+
+    // After the call: the session's `kept` is back, `cutoff` is gone, and the
+    // call's own `let out` stays.
+    auto kept = session.table_binding("kept");
+    REQUIRE(kept.has_value());
+    CHECK(int_column(*kept, "v") == std::vector<std::int64_t>{1, 2, 3});
+    CHECK_FALSE(session.execute("kept[filter v > cutoff];").ok);
+    auto out = session.table_binding("out");
+    REQUIRE(out.has_value());
+    CHECK(int_column(*out, "v") == std::vector<std::int64_t>{20});
+
+    // A call that rebinds its own table's name keeps the new binding.
+    ibex::repl::ReplSession::ExecuteOptions rebinding;
+    rebinding.tables.insert_or_assign("scratch", input);
+    REQUIRE(session.execute("let scratch = scratch[filter v > 10];", std::move(rebinding)).ok);
+    auto scratch = session.table_binding("scratch");
+    REQUIRE(scratch.has_value());
+    CHECK(int_column(*scratch, "v") == std::vector<std::int64_t>{20});
+    CHECK_FALSE(session.table_binding("nothing").has_value());
+}
+
+TEST_CASE("ReplSession: print output comes back without rendering results", "[repl][session]") {
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    ibex::repl::ReplSession::ExecuteOptions quiet;
+    quiet.render = false;
+    const auto r = session.execute("print(\"hello\"); Table { a = [1] };", std::move(quiet));
+    REQUIRE(r.ok);
+    CHECK(r.output.find("hello") != std::string::npos);
+    CHECK(r.output.find("rows:") == std::string::npos);
+    REQUIRE(r.table.has_value());
+
+    const auto rendered = session.execute("Table { a = [1] };");
+    REQUIRE(rendered.ok);
+    CHECK(rendered.output.find("rows: 1") != std::string::npos);
+
+    // A failure's message is the error, not part of the output as well.
+    const auto failed = session.execute("print(\"before\"); missing_table[select { a }];");
+    REQUIRE_FALSE(failed.ok);
+    CHECK(failed.error.find("missing_table") != std::string::npos);
+    CHECK(failed.output.find("before") != std::string::npos);
+    CHECK(failed.output.find("missing_table") == std::string::npos);
+}
+
+TEST_CASE("ReplSession: infer_schema lowers against the session's bindings", "[repl][session]") {
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    REQUIRE(session.execute("let t = Table { k = [1, 2], v = [1.5, 2.5] };").ok);
+    // `limit` is bound by the call that will run it, so it is no column.
+    const auto schema =
+        session.infer_schema("t[filter k > limit, select { k, w = v * 2.0 }]", {"limit"});
+    REQUIRE(schema.has_value());
+    REQUIRE(schema->fields().size() == 2);
+    CHECK(schema->fields()[0].name == "k");
+    CHECK(schema->fields()[1].name == "w");
+    CHECK(schema->fields()[1].type == ibex::ir::ColumnType::Float64);
+    CHECK_FALSE(session.infer_schema("t[filter missing > 1]", {}).has_value());
+}

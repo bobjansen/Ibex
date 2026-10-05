@@ -4410,6 +4410,42 @@ TEST_CASE("resample with by - one bucket per (bucket, symbol)") {
     REQUIRE(result->find("symbol") != nullptr);
 }
 
+TEST_CASE("resample select may list a by key, which it emits once") {
+    // `select { symbol, ... }, by symbol` is how an ordinary grouped select
+    // names its key, and what the dplyr backend writes; resample refused the
+    // bare field as an unaggregated column.
+    constexpr std::int64_t min_ns = 60LL * 1'000'000'000LL;
+    runtime::Table table;
+    table.add_column("ts",
+                     Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(30'000'000'000LL),
+                                       ts_from_nanos(1 * min_ns), ts_from_nanos(90'000'000'000LL)});
+    table.add_column("price", Column<double>{10.0, 20.0, 30.0, 40.0});
+    table.add_column("symbol", Column<std::string>{"A", "A", "B", "B"});
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
+    runtime::TableRegistry registry;
+    registry.emplace("tf", table);
+
+    auto ir = require_ir(
+        R"(tf[resample 1m, select { symbol, close = last(price), n = count() }, by symbol];)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    std::vector<std::string> names;
+    for (const auto& column : result->columns) {
+        names.push_back(column.name);
+    }
+    CHECK(names == std::vector<std::string>{"ts", "symbol", "close", "n"});
+    const auto* close = std::get_if<Column<double>>(result->find("close"));
+    REQUIRE(close != nullptr);
+    CHECK(std::vector<double>(close->begin(), close->end()) == std::vector<double>{20.0, 40.0});
+
+    // A bare field that is not a key is still refused.
+    auto program = parser::parse(R"(tf[resample 1m, select { price }, by symbol];)");
+    REQUIRE(program.has_value());
+    auto refused = parser::lower(*program);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().message.find("bare column") != std::string::npos);
+}
+
 TEST_CASE("resample + order sorts the bars by a non-time key, keeps TimeFrame") {
     constexpr std::int64_t min_ns = 60LL * 1'000'000'000LL;
     runtime::Table table;

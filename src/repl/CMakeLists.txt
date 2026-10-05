@@ -79,8 +79,9 @@ if(Readline_FOUND)
     if(TARGET Ibex::Sanitizers)
         target_link_libraries(ibex_repl_cli PRIVATE Ibex::Sanitizers)
     endif()
+    add_library(Ibex::repl_cli ALIAS ibex_repl_cli)
 else()
-    # No readline: the interactive binary gets the plain reader too.
-    add_library(ibex_repl_cli ALIAS ibex_repl)
+    # No readline: the interactive binary gets the plain reader too. (An
+    # ALIAS cannot name another ALIAS, so this one names ibex_repl itself.)
+    add_library(Ibex::repl_cli ALIAS ibex_repl)
 endif()
-add_library(Ibex::repl_cli ALIAS ibex_repl_cli)

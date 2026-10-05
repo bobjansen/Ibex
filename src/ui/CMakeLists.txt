@@ -12,9 +12,11 @@ target_include_directories(ibex_ui
         $<INSTALL_INTERFACE:include>
 )
 
+# Only the interactive `ibex` binary links the UI, so it takes that binary's
+# readline-backed REPL library.
 target_link_libraries(ibex_ui
     PUBLIC
-        Ibex::repl
+        Ibex::repl_cli
     PRIVATE
         Ibex::CompilerOptions
         nlohmann_json::nlohmann_json

@@ -13,7 +13,7 @@ set_target_properties(ibex_repl_bin PROPERTIES
 
 target_link_libraries(ibex_repl_bin
     PRIVATE
-        Ibex::repl
+        Ibex::repl_cli
         Ibex::CompilerOptions
         CLI11::CLI11
 )

@@ -3334,6 +3334,17 @@ class Lowerer {
             node = std::move(aggregate.value());
         } else if (!window_select && !state.resample && !state.melt && !state.dcast &&
                    state.select) {
+            // `select` + `by` emits one row per group (SPEC 5.3), so a field
+            // must be an aggregate or a group key. Without an aggregate this
+            // branch only projects, which would drop the `by` and return every
+            // row -- `lag` reading across groups, `rank` over the whole table.
+            // A `by` here belongs to the select unless a head/tail limit
+            // claims it.
+            if (state.by != nullptr && !state.head && !state.tail) {
+                if (auto err = check_grouped_select_fields(*state.by, expanded_select_fields)) {
+                    return std::unexpected(std::move(*err));
+                }
+            }
             auto project = lower_select_projection(expanded_select_fields,
                                                    state.select->tuple_fields, std::move(node));
             if (!project.has_value()) {
@@ -5971,6 +5982,42 @@ class Lowerer {
             return expr_contains_builtin_aggregate(*group->expr);
         }
         return false;
+    }
+
+    /// Why a `select` + `by` with no aggregate field is an error: each field
+    /// is a group key (one row per group is then `distinct`) or a per-row
+    /// expression (which is what `update ..., by` computes). Only called once
+    /// `select_has_aggregate` has said no field aggregates.
+    [[nodiscard]] static auto check_grouped_select_fields(const ByClause& by,
+                                                          const std::vector<Field>& fields)
+        -> std::optional<LowerError> {
+        const auto is_group_key = [&](const Field& field) {
+            std::string_view column = field.name;
+            if (field.expr != nullptr) {
+                const auto* ident = std::get_if<IdentifierExpr>(&field.expr->node);
+                if (ident == nullptr || ident->lexical) {
+                    return false;
+                }
+                column = ident->name;
+            }
+            return std::ranges::any_of(by.keys,
+                                       [&](const Field& key) { return key.name == column; });
+        };
+        for (const auto& field : fields) {
+            if (!is_group_key(field)) {
+                return LowerError{
+                    .message =
+                        "select with by returns one row per group, so each field must be "
+                        "an aggregate or a group key, and '" +
+                        field.name +
+                        "' is neither. To compute it for every row within its group, "
+                        "use update instead: `update { " +
+                        field.name + " = ... }, by ...`"};
+            }
+        }
+        return LowerError{.message =
+                              "select with by but no aggregate: for one row per group "
+                              "of the keys, use distinct { ... } without by"};
     }
 
     [[nodiscard]] auto select_has_aggregate(const std::vector<Field>& fields) const -> bool {

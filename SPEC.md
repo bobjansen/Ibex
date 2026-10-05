@@ -1711,7 +1711,12 @@ allows multiple keys and computed grouping keys (which must be named).
 
 Interaction with `select` and `update`:
 
-- `select` + `by` → **aggregation**. One output row per group.
+- `select` + `by` → **aggregation**. One output row per group, so every field
+  must be a group key or contain an aggregate. Any other field is an error —
+  `t[select { d, l = lag(s, 1) }, by d]` has no single `l` per group; compute it
+  per row with `update { l = lag(s, 1) }, by d`. A `select` + `by` holding only
+  group keys is an error too: that is `distinct`. (A `by` that groups a `head`
+  or `tail` limit is not affected.)
 - `update` + `by` → **grouped update**. The update expression is evaluated per
   group, and the result is broadcast back to every row in that group (similar
   to SQL window functions without explicit framing).

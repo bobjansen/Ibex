@@ -2972,3 +2972,17 @@ TEST_CASE("Namespaces: a script with imports and namespaces plans as one block",
     CHECK(capture_planner_line("import \"lz\";\nusing lz;\nbig(read())[select { n = count() }];\n",
                                registry, config) == "planner: whole-script");
 }
+
+TEST_CASE("REPL session accepts input that ends with a function definition", "[repl][function]") {
+    // The REPL supplies a missing final `;`. After a declaration's closing `}`
+    // that `;` used to become an empty statement and a parse error.
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    const auto declared = session.execute("fn twice(x: Int) -> Int { let y = x * 2; y; }");
+    CAPTURE(declared.error);
+    REQUIRE(declared.ok);
+    const auto r = session.execute("twice(21)");
+    REQUIRE(r.ok);
+    REQUIRE(r.scalar.has_value());
+    CHECK(std::get<std::int64_t>(*r.scalar) == 42);
+}

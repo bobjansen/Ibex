@@ -6845,7 +6845,11 @@ void print_physical_explain(parser::Expr& expr, const runtime::TableRegistry& ta
 
 auto normalize_input(std::string_view input) -> std::string {
     auto normalized = std::string(ibex::trim(input));
-    if (!normalized.empty() && normalized.back() != ';') {
+    // A missing final `;` is supplied for an expression typed without one,
+    // but only when the input does not already parse: a declaration that ends
+    // in `}` (`fn f() -> Int { 1; }`) is complete, and a `;` after it would be
+    // an empty statement, which is a parse error.
+    if (!normalized.empty() && normalized.back() != ';' && !parser::parse(normalized)) {
         normalized.push_back(';');
     }
     return normalized;

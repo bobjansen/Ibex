@@ -145,8 +145,10 @@ q10/q20)** — the standing structural lever in place of the scheduler. Sub-stat
   memory: `project_reverted_perf_dead_ends`).
   A real win needs a **partition-owned aggregate API** (owns a partition from key
   discovery through mergeable state). First piece LANDED `4fedf2a4` (PairIntKey,
-  q20 −15-18%); Int64 single-key slice + the ordered-run finalize are the live
-  work — see `owned-agg-per-chunk-barrier-plan.md` and
+  q20 −15-18%); the Int64 single-key slice (async hot/cold, q18 −33%), the
+  parallel finalize merge and the ordered-run `Count` finalize have landed
+  since, and the PairIntKey collector took q20 to −51.7%. The retired plan is
+  `git show 587bc2e4:plans/owned-agg-per-chunk-barrier-plan.md`; see also
   memory: `project_q21_is_occupancy_bound`.
 
 **Items 10–11** (type exclusions; elide the first-occurrence merge when the
@@ -197,8 +199,13 @@ Stage 3 (admitting a row-local Filter above the probe scan): q03 won 2.6–3.2×
 rejects nothing. **Trap worth keeping:** `try_two_phase_probe`'s `Precomputed`
 branch computes `li`/`ri` from a hash probe *before* the wrapper chain runs —
 sound while that chain is 1:1, wrong the moment a Filter can drop rows there.
-Reopening needs the selectivity cost model — see
-memory: `project_deferred_probe_selectivity_scoping`.
+Reopening needed the selectivity cost model (memory:
+`project_deferred_probe_selectivity_scoping`). The q12 case it names is now
+handled without one: `deferrable_probe_scans` declines a probe when the build
+side is not estimated smaller than the scan (an unfiltered build side spans
+the whole key domain; `include/ibex/ir/scan_predicates.hpp`), and since
+2026-10-04 q12's streamed `orders` is filtered by the built right side instead
+(`beat-both-plan.md` §3 item 2). The `Precomputed` trap above still stands.
 
 ---
 

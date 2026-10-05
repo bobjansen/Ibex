@@ -16,7 +16,7 @@ the general ABI needed for plugins to accept Ibex series values.
 ```ibex
 import "csv";
 
-let cars = read_csv(
+let cars = csv::read(
     "cars.csv",
     nulls = ["<empty>", "NA", "null"]
 );
@@ -58,7 +58,7 @@ any future `extern fn f(values: Series<T>, ...)` declaration.
 The CSV import declaration becomes:
 
 ```ibex
-extern fn read_csv(
+extern fn csv::read(
     path: String,
     nulls: Series<String> = [],
     delimiter: String = ",",
@@ -96,7 +96,7 @@ type (`ibex::Column<std::string>` / the project's canonical string-column
 alias), passed by `const&`. The CSV header exposes matching overloads:
 
 ```cpp
-read_csv(std::string_view path, const ibex::Column<std::string>& nulls, ...)
+csv::read(std::string_view path, const ibex::Column<std::string>& nulls, ...)
 ```
 
 This preserves a typed path for generated programs and avoids inventing a
@@ -163,7 +163,7 @@ not add `Series<Enum>` merely for this work; scalar enum arguments cover
    restriction temporarily where series values cannot have a meaningful whole
    value, but make error messages say so.
 3. Add focused baseline tests for scalar extern calls, named/default argument
-   binding, CSV's existing string specification, and generated `read_csv` calls.
+   binding, CSV's existing string specification, and generated `csv::read` calls.
    These establish what Phase 1 must not regress.
 
 ### Phase 1 — Generalize the interpreted extern ABI
@@ -248,7 +248,7 @@ not add `Series<Enum>` merely for this work; scalar enum arguments cover
    - null elements return a readable error;
    - duplicates are harmless;
    - commas inside a token are preserved as literal token content.
-3. Update all `read_csv` C++ overloads and generated-call signatures to take the
+3. Update all `csv::read` C++ overloads and generated-call signatures to take the
    column argument. Keep the no-argument reader overload for defaults.
 4. Remove the comma-splitting parser and all string-null-spec overloads. This is
    a clean break, including internal C++ test helpers where appropriate.
@@ -288,7 +288,7 @@ not add `Series<Enum>` merely for this work; scalar enum arguments cover
 
 ## Acceptance criteria
 
-1. `read_csv("cars.csv", nulls = ["<empty>", "NA", "null"])` works in the
+1. `csv::read("cars.csv", nulls = ["<empty>", "NA", "null"])` works in the
    REPL, interpreter, and transpiled executable with identical typed nulls.
 2. `nulls = "<empty>,NA"` is rejected because the parameter is no longer a
    string.

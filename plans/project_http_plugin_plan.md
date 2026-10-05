@@ -9,6 +9,10 @@ metadata:
 
 # HTTP Plugin Implementation Plan
 
+Status: proposed, not built. Examples updated 2026-10-05 to current syntax
+(`filter` without parentheses, `&&`, namespaced plugin functions, top-level
+statements rather than `fn main`); the design below is unchanged from 2026-08-08.
+
 ## Overview
 
 Simple, registration-based HTTP plugin for Ibex that allows users to expose query functions as HTTP endpoints. No decorators (those come later as orthogonal language feature). Registration is explicit and non-blocking; server startup is blocking and user-controlled.
@@ -22,27 +26,27 @@ Simple, registration-based HTTP plugin for Ibex that allows users to expose quer
 ```ibex
 // Define query functions
 fn get_price(symbol: String, days: Int = 30) -> DataFrame {
-    prices[filter(ticker == symbol and date >= today() - days)]
+    prices[filter ticker == symbol && date >= today() - days]
 }
 
 fn fetch_data(id: Int) -> DataFrame {
-    data[filter(id == id)]
+    data[filter id == ^id]  // ^id: the parameter, not the column (SPEC 6.2)
 }
 
 // Register endpoints (non-blocking, just adds to registry)
-http_register_endpoint("/prices/{symbol}", "get_price", method="get", format="json")
-http_register_endpoint("/data/{id}", "fetch_data", method="get", format="json")
+http::register_endpoint("/prices/{symbol}", "get_price", method = "get", format = "json");
+http::register_endpoint("/data/{id}", "fetch_data", method = "get", format = "json");
 
 // Start server (blocking)
-http_listen(8080)
+http::listen(8080);
 // Server now running, handling requests at localhost:8080/prices/... and /data/...
 // User can curl or browse
 // User presses Ctrl+C to stop
 
 // Back in REPL, can adjust and re-register
 fn get_price_v2(symbol: String) -> DataFrame { ... }
-http_register_endpoint("/prices/{symbol}", "get_price_v2")
-http_listen(8080)  // Start again with updated endpoint
+http::register_endpoint("/prices/{symbol}", "get_price_v2");
+http::listen(8080);  // Start again with updated endpoint
 ```
 
 ### Codegen Workflow (`.ibex` file)
@@ -51,14 +55,12 @@ http_listen(8080)  // Start again with updated endpoint
 import "http"
 
 fn get_price(symbol: String) -> DataFrame {
-    prices[filter(ticker == symbol)]
+    prices[filter ticker == symbol]
 }
 
-fn main() {
-    http_register_endpoint("/prices/{symbol}", "get_price", format="json")
-    http_listen(8080)  // Blocks; script runs as a server
-    // When killed externally, process exits
-}
+http::register_endpoint("/prices/{symbol}", "get_price", format = "json");
+http::listen(8080);  // Blocks; script runs as a server
+// When killed externally, process exits
 ```
 
 ---
@@ -67,7 +69,7 @@ fn main() {
 
 ### 1. Registration Model (MVP): Quoted String Function Names
 
-**Decision: Use `http_register_endpoint(path, "function_name", ...)`**
+**Decision: Use `http::register_endpoint(path, "function_name", ...)`**
 
 - Function names passed as quoted strings
 - Registration performs lookup in interpreter's symbol table
@@ -84,8 +86,8 @@ fn main() {
 
 **Decision: Non-blocking registration, blocking server startup**
 
-- `http_register_endpoint()` adds to registry and returns immediately
-- `http_listen(port)` starts server and blocks until shutdown
+- `http::register_endpoint()` adds to registry and returns immediately
+- `http::listen(port)` starts server and blocks until shutdown
 - User controls flow: Ctrl+C to stop, then adjust and re-start
 
 **Why this approach**:
@@ -154,7 +156,7 @@ Alternate formats (Arrow IPC, CSV, Parquet) in V1.0.
 
 ```ibex
 // Register endpoint with function name (quoted string)
-extern fn http_register_endpoint(
+extern fn http::register_endpoint(
     path: String,              // "/prices/{symbol}"
     function_name: String,     // "get_price"
     method: String = "get",    // "get", "post", "put", "delete"
@@ -162,7 +164,7 @@ extern fn http_register_endpoint(
 ) -> Int from "http.hpp";
 
 // Start server (blocking)
-extern fn http_listen(port: Int) -> Int from "http.hpp";
+extern fn http::listen(port: Int) -> Int from "http.hpp";
 
 // Debug endpoint list (optional)
 extern fn http_endpoints(port: Int = 0) -> DataFrame from "http.hpp";
@@ -210,7 +212,7 @@ extern fn http_endpoints(port: Int = 0) -> DataFrame from "http.hpp";
 **Key challenge**: Runtime lookup of function by name
 
 **Solution**:
-- `http_register_endpoint()` calls `interpreter()->lookup_function(name)`
+- `http::register_endpoint()` calls `interpreter()->lookup_function(name)`
 - Validates: function exists, returns DataFrame
 - Stores function reference for later invocation
 - At request time: bind params → call function → serialize result
@@ -259,8 +261,8 @@ extern fn http_endpoints(port: Int = 0) -> DataFrame from "http.hpp";
 ## Success Criteria (MVP)
 
 - [ ] HTTP server listens on specified port
-- [ ] Register endpoints with `http_register_endpoint(path, function_name)`
-- [ ] Start server with `http_listen(port)` (blocking)
+- [ ] Register endpoints with `http::register_endpoint(path, function_name)`
+- [ ] Start server with `http::listen(port)` (blocking)
 - [ ] Parameter binding: path params, query string, POST body
 - [ ] Type validation: convert strings → Int/Double/Date/etc., 400 errors on failure
 - [ ] JSON response format (primary)
@@ -292,7 +294,7 @@ extern fn http_endpoints(port: Int = 0) -> DataFrame from "http.hpp";
 
 2. **Codegen Handler Calls**: How do generated HTTP handlers invoke compiled query functions? (calling convention, linking)
 
-3. **Port Management**: `http_listen()` accepts port parameter?
+3. **Port Management**: `http::listen()` accepts port parameter?
 
 4. **Thread Pool**: Size = `std::thread::hardware_concurrency()`?
 

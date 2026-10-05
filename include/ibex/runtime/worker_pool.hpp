@@ -23,7 +23,8 @@ namespace ibex::runtime {
 inline constexpr auto kCoopPollInterval = std::chrono::microseconds(250);
 
 /// Process-owned worker pool for the runtime's morsel pipelines
-/// (`plans/runtime-multithreading-plan.md`, Phase 1).
+/// (the retired runtime-multithreading plan, Phase 1:
+/// `git show 587bc2e4:plans/runtime-multithreading-plan.md`).
 ///
 /// Deliberately small and boring, as the plan requires: pre-spawned threads, a
 /// single mutex+condvar task queue, and a completion latch. There is no work

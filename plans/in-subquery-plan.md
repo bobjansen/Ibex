@@ -75,9 +75,12 @@ A `filter` keeps TRUE and drops FALSE and UNKNOWN alike, so:
 ### The null-aware anti join is a run-time flag, not a planning choice
 
 The earlier draft kept the plain anti join "for the q16 case, where `s_suppkey`
-is provably non-null". The planner cannot prove that: the IR schema carries no
-column nullability. The exemption would have to be decided at run time anyway,
-and there it costs almost nothing:
+is provably non-null". The planner cannot prove that. The IR does track
+nullability (`SchemaField::nulls`, rules in `ir/nullability.hpp`), but as a
+proof by construction, never a source's promise: a file column is always
+`Maybe`, so a primary key read from Parquet is too. A plan-time `Never` on S's
+column would let the planner drop the flag, but the run-time check is cheap
+enough that a second path is not worth it:
 
 - the build side visits every right key already (the streaming operator in
   `src/runtime/semi_anti_join.cpp` skips null right keys at exactly that point),

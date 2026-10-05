@@ -425,6 +425,16 @@ struct DeferredWrap {
             continue;
         }
 
+        // A call to a table function is a table let whose lowering failed, not
+        // a scalar: report why it could not be lowered.
+        if (const auto* call = std::get_if<CallExpr>(&let_stmt->value->node);
+            call != nullptr && lower_ctx.functions.contains(call->callee)) {
+            const auto kind = lower_ctx.functions.at(call->callee)->return_type.kind;
+            if (kind == Type::Kind::DataFrame || kind == Type::Kind::TimeFrame) {
+                return std::unexpected("let '" + let_stmt->name +
+                                       "': " + table_result.error().message);
+            }
+        }
         return std::unexpected("unsupported scalar let '" + let_stmt->name +
                                "': " + scalar_result.error());
     }

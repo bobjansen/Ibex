@@ -2976,16 +2976,22 @@ TEST_CASE("Namespaces: a script with imports and namespaces plans as one block",
 TEST_CASE("REPL: a table function's scalar lets survive a call nested in another call",
           "[repl][function]") {
     // A call nested in `rbind(...)` is inlined into the plan, unlike a call that
-    // is a whole statement. A body `let` naming a scalar parameter (`let n =
-    // x`) used to be taken there for a table named `x`, and the update then
-    // failed at run time with "column not found".
+    // is a whole statement. Two of its body's scalar `let`s used to go wrong
+    // there: `let n = x` (a parameter) was taken for a table named `x`, and
+    // `let m = scalar(...)` became a column reference -- both failed at run
+    // time with "column not found".
     ibex::runtime::ExternRegistry registry;
     ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
     const auto setup = session.execute(R"(
 let base = Table { a = [0], b = [0] };
+let src = Table { id = [1, 2], v = [10, 20] };
 fn renamed(x: Int) -> DataFrame {
     let n = x;
     Table { a = [1] }[update { b = n }];
+}
+fn looked_up(k: Int) -> DataFrame {
+    let m = scalar(src[filter id == k], v);
+    Table { a = [1] }[update { b = m }];
 }
 )");
     CAPTURE(setup.error);
@@ -3000,8 +3006,10 @@ fn renamed(x: Int) -> DataFrame {
         return std::vector<std::int64_t>(b->begin(), b->end());
     };
     CHECK(b_of("rbind(base, renamed(7));") == std::vector<std::int64_t>{0, 7});
-    // The same call as a whole statement, which never went through the plan.
-    CHECK(b_of("renamed(7);") == std::vector<std::int64_t>{7});
+    CHECK(b_of("rbind(base, looked_up(2));") == std::vector<std::int64_t>{0, 20});
+    CHECK(b_of("rbind(base, looked_up(1), renamed(3));") == std::vector<std::int64_t>{0, 10, 3});
+    // The same calls as whole statements, which never went through the plan.
+    CHECK(b_of("looked_up(2);") == std::vector<std::int64_t>{20});
 }
 
 TEST_CASE("REPL session accepts input that ends with a function definition", "[repl][function]") {

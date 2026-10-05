@@ -907,6 +907,43 @@ auto clause_contains_call_if(const Clause& clause, const CallPredicate& matches)
 
 namespace {
 
+auto table_function_needs_statements(const FunctionDecl& fn, const FunctionLookup& lookup,
+                                     robin_hood::unordered_set<std::string>& visiting) -> bool {
+    if (!visiting.insert(fn.name).second) {
+        return false;  // a recursive call finds nothing its first visit does not
+    }
+    const auto calls_one = [&](const Expr& expr) {
+        return contains_call_if(expr, [&](std::string_view callee) {
+            const FunctionDecl* inner = lookup(callee);
+            return inner != nullptr && table_function_needs_statements(*inner, lookup, visiting);
+        });
+    };
+    for (const auto& stmt : fn.body) {
+        if (const auto* let = std::get_if<LetStmt>(&stmt); let != nullptr && let->value) {
+            if (is_deferred_scalar_let_shape(*let->value) || calls_one(*let->value)) {
+                return true;
+            }
+        } else if (const auto* expr = std::get_if<ExprStmt>(&stmt);
+                   expr != nullptr && expr->expr && calls_one(*expr->expr)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+auto table_function_needs_statements(const FunctionDecl& fn, const FunctionLookup& lookup) -> bool {
+    if (fn.return_type.kind != Type::Kind::DataFrame &&
+        fn.return_type.kind != Type::Kind::TimeFrame) {
+        return false;
+    }
+    robin_hood::unordered_set<std::string> visiting;
+    return table_function_needs_statements(fn, lookup, visiting);
+}
+
+namespace {
+
 /// True when any node anywhere in `expr` calls `callee`.
 auto contains_call(const Expr& expr, std::string_view callee) -> bool {
     return contains_call_if(expr, [callee](std::string_view name) { return name == callee; });
@@ -4215,6 +4252,16 @@ class Lowerer {
             }
         }
         for (const auto* let : body_shape->lets) {
+            // `let n = scalar(<table>, col)` is evaluated by running the table
+            // when the binding is made; a plan has no step for that, so the
+            // call cannot be inlined. The REPL runs such a call statement by
+            // statement instead (`table_function_needs_statements`).
+            if (is_deferred_scalar_let_shape(*let->value)) {
+                cleanup();
+                return std::unexpected(LowerError{
+                    .message = "table function '" + fn.name + "' cannot be inlined: `let " +
+                               let->name + "` reads a value out of a table with scalar(...)"});
+            }
             // A bare name is a scalar when it names one of this call's scalar
             // parameters or lets; `lower_expr` would take any name for a table.
             if (names_inline_scalar(*let->value)) {

@@ -108,6 +108,42 @@ What the table says:
   against DuckDB), then q01 +111, q10 +104, q19 +97, q14 +78, q12 +76, q03
   +76. Lost 1,175 ms on 18 queries. Milestone 2 needs q21 back.
 
+### 1.0b After consumer-helps and the left-scan filter (2026-10-05)
+
+Same command and box type on `4d628abe` (code as of `c4084d23` plus the tidy
+fix `b43fea81`; the bench harness fix `4d628abe` restored the DuckDB column).
+All 22 answers match. Artifact
+`benchmarking/results/tpch_aws_20261005T071555.tar.gz`.
+
+| cores | Ibex total | Polars-st | DuckDB | Ibex/Polars | Ibex/DuckDB | geomean I/P | geomean I/D |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 (8c pass) | 56.0 s | 78.0 s | 62.6 s | 0.72 | 0.89 | 0.75 | 0.86 |
+| 2 | 25.3 s | 34.5 s | 30.8 s | 0.73 | 0.82 | 0.78 | 0.81 |
+| 4 | 14.1 s | 17.8 s | 15.7 s | 0.79 | 0.90 | 0.84 | 0.88 |
+| 8 | 8.95 s | 9.88 s | 9.05 s | **0.91** | **0.99** | **0.95** | **0.96** |
+| 8, no q21 | 7.84 s | 8.00 s | 7.87 s | **0.98** | **1.00** (0.996) | **0.98** | **0.96** |
+| 16 | 5.53 s | 5.10 s | 4.57 s | 1.08 | 1.21 | 1.11 | 1.14 |
+
+**Milestone 1: met on this run, confirmation pending.** Every criterion holds
+at 8 cores, with and without q21; 1 core is still ahead (0.72 / 0.89), 2
+cores is no loss. But the DuckDB margins are 0.99 and 0.996 from one sitting,
+and the 8-core pass ran on a slow stretch: its own 1-core rows were ~10%
+slower than the other passes' for all three engines (Ibex 56.0 s against
+50.8–52.7 s), and every 8-core absolute time is above 10-04's. A second
+sitting at 8 cores only (two passes, `--cores 8,8`) was launched 2026-10-05.
+
+Moved at 8 cores (Ibex/Polars): q12 1.32 → **0.85** (310 → 224 ms, §3 item
+2); the scan family from consumer-helps (§3 item 1), q06 1.37 → 1.22, q14
+1.38 → 1.26, q15 1.32 → 1.23, q19 1.37 → 1.30, q01 1.02 → 0.96, q04 0.82 →
+0.75. The rest within a few percent. Lost 756 ms on 13 queries against the
+faster reference (was 936 on 14), won 364 back (was 293). Top losers now:
+q19 +105, q01 +99, q03 +73, q10 +72, q14 +69, q04 +61, q07 +56, q15 +54.
+
+At 16 cores (milestone 2) the totals barely moved (1.08 / 1.21, was 1.09 /
+1.20): q12 and the scan family improved, q03, q16, q18 and q20 drifted the
+other way. Lost 1,188 ms on 19 queries; q21 +192, q10 +113, q01 +102, q03
++98, q09 +91, q07 +83.
+
 ### 1.1 Earlier numbers, and what each is still good for
 
 | run | data | Polars column | still valid for |

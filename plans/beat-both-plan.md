@@ -124,13 +124,26 @@ All 22 answers match. Artifact
 | 8, no q21 | 7.84 s | 8.00 s | 7.87 s | **0.98** | **1.00** (0.996) | **0.98** | **0.96** |
 | 16 | 5.53 s | 5.10 s | 4.57 s | 1.08 | 1.21 | 1.11 | 1.14 |
 
-**Milestone 1: met on this run, confirmation pending.** Every criterion holds
-at 8 cores, with and without q21; 1 core is still ahead (0.72 / 0.89), 2
-cores is no loss. But the DuckDB margins are 0.99 and 0.996 from one sitting,
-and the 8-core pass ran on a slow stretch: its own 1-core rows were ~10%
-slower than the other passes' for all three engines (Ibex 56.0 s against
-50.8–52.7 s), and every 8-core absolute time is above 10-04's. A second
-sitting at 8 cores only (two passes, `--cores 8,8`) was launched 2026-10-05.
+**Milestone 1: met, confirmed — but against DuckDB without q21 it is a tie,
+not a margin.** Every criterion holds at 8 cores, with and without q21; 1 core
+is still ahead (0.72 / 0.89), 2 cores is no loss. The 8-core pass above ran on
+a slow stretch (its own 1-core rows ~10% slower for all three engines), so a
+second sitting ran two more 8-core passes (`--cores 8,8`, same commit, new box;
+`benchmarking/results/tpch_aws_20261005T091728.tar.gz`):
+
+| 8 cores | Ibex | Polars-st | DuckDB | I/P | I/D | gm I/P | gm I/D | no q21 I/P | no q21 I/D |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| run 1 pass (above) | 8.95 s | 9.88 s | 9.05 s | 0.91 | 0.99 | 0.95 | 0.96 | 0.98 | 0.996 |
+| confirmation pass 1 | 7.85 s | 8.63 s | 7.91 s | 0.91 | 0.99 | 0.95 | 0.95 | 0.98 | 0.996 |
+| confirmation pass 2 | 7.86 s | 8.61 s | 7.92 s | 0.91 | 0.99 | 0.96 | 0.95 | 0.99 | 0.997 |
+
+Three passes on two boxes agree to the second decimal, so the ratios are
+stable even though absolute times moved 12% between boxes. Against Polars the
+milestone holds with room (0.91 total, 0.98 without q21). Against DuckDB the
+total is 0.99 and the no-q21 total 0.996–0.997: under 1.0 on every pass, but
+by about 25 ms of 6.9 s. §1.0 puts a claim that survives sitting drift (§4) at
+~0.95: that is ~300 ms more off the 8-core no-q21 total, and §3's top losers
+(q19, q01, q03, q10, q14) are where it is.
 
 Moved at 8 cores (Ibex/Polars): q12 1.32 → **0.85** (310 → 224 ms, §3 item
 2); the scan family from consumer-helps (§3 item 1), q06 1.37 → 1.22, q14

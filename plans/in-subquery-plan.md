@@ -1,154 +1,172 @@
 ---
 name: in_subquery
-description: "Proposal: x in (table_expr) / not in as a semi / null-aware anti join — the subquery family, NOT a scalar like like(). Unblocks q18, q20."
+description: "Proposal: x in (table_expr) / !(x in ...) as a semi / null-aware anti join, a sibling of the built exists terms. Readability for q18/q20/q16, not new queries."
 metadata:
   node_type: memory
   type: project
 ---
 
-# Proposal: `in` / `not in` subquery terms
+# Proposal: `in` subquery terms
 
-Status: **proposed**, not built. Reuses the capture/decorrelation machinery of
-the shipped scalar subquery (`plans/done/correlated-subquery-q02-plan.md`, SPEC 5.7)
-and is a close sibling of the built `exists` terms (SPEC 5.8), whose semi / anti
-lowering (`lower_exists` in `src/parser/lower.cpp`) it can share.
+Status: **proposed**, not built. Revised 2026-10-05 against the tree after
+`exists` Tiers 1 and 2 shipped (SPEC 5.8, `ef1594cd`). It reuses the
+capture/decorrelation machinery of the scalar subquery (SPEC 5.7,
+`plans/done/correlated-subquery-q02-plan.md`) and the whole-conjunct semi / anti
+lowering of `exists` (`lower_filter` → `lower_exists` in `src/parser/lower.cpp`).
+
+## What it buys
+
+All 22 PDS-H queries already run, so `in` unblocks no query. It buys
+readability and a closer match to the SQL in three of them:
+
+- **q18** writes its uncorrelated `o_orderkey in (…)` by hand: compute the set
+  into a `let`, then `orders semi join big_orders on { o_orderkey = l_orderkey }`.
+- **q16** writes its `s_suppkey not in (…)` as `left join … filter
+  is_null(excluded_suppkey)` (its header comment still says "anti join"; it is
+  not).
+- **q20** is written as Polars' explicit join shape, deliberately, to keep the
+  engine comparison about execution. `in` would let a *readable* q20 exist
+  beside it, not replace it.
+
+So this is ergonomics plus one correctness primitive (the null-aware anti join)
+that no current query needs. Rank it accordingly: below any measured perf work.
 
 ## `in` is not a scalar, and there are two of them
 
-It is tempting to model `in` the way `like()` is modelled — a row-wise scalar
-builtin in `scalar_builtins()`. That is right for exactly one form and wrong for
-the one that matters.
+- **`x in (v1, v2, …)` — a literal value list.** A row-wise `like()` sibling
+  that belongs in `scalar_builtins()`. q16 and q19 would drop their `||` chains
+  of equality. Out of scope here; a separate, small builtin.
+- **`x in (table_expr)` — membership against a one-column subquery.** Not a
+  scalar: the RHS is a whole table probed set-at-a-time. Through the row-wise
+  path it would re-scan the subquery per outer row, the nested-loop trap the
+  subquery design refuses. It belongs in the subquery/join family, and the rest
+  of this plan is only about it.
 
-- **`x in (v1, v2, …)` — a literal value list.** This *is* a `like()` sibling:
-  row-wise, RHS known at eval time, one Bool per row. But **no PDS-H query needs
-  it** — q19 already hand-expands its `IN`-lists to `||`-chains of equality. Nice
-  to have, not a query-unblocker. If built, it belongs in `scalar_builtins()`.
+## Semantics: `in` is a semi join, `!(x in …)` a null-aware anti join
 
-- **`x in (table_expr)` — membership against a one-column subquery.** This is
-  what q18 and q20 use, and it is not a scalar at all. A scalar builtin has its
-  arguments evaluated to *values* per row; here the RHS is a whole *table* probed
-  set-at-a-time. Forcing it through the row-wise path means re-scanning the
-  subquery per outer row — the nested-loop trap the whole subquery design
-  refuses. It belongs in the **subquery/join family**.
-
-The rest of this plan is only about the second form.
-
-## Semantics: `in` is a semi join, `not in` is a null-aware anti join
-
-`x in (S)` ≡ `exists(S[filter s_col == outer(x)])`. So it is Tier 1 of the
-`exists` proposal with one equality synthesized between the outer value and the
-subquery's single column:
+`x in (S)` keeps a row when some row of S equals `x`. With `s` the single
+column of S, it is `exists(S[filter s == outer(x)])` with that one equality
+synthesized:
 
 ```
 filter <local> && x in (S)
 
-    SemiJoin(on x)
+    Join(Semi, on { x = s })
       Filter(<local>)(outer)
-      Rename(s_col -> x)
-        <lowered S>
+      <lowered S>
 ```
-
-`not in` is an `AntiJoin` — but not a plain one. This is the whole reason the
-proposed README says it "must not be silently implemented as a plain anti join."
 
 ### The three-valued truth, and where it hides
 
 | predicate | result |
 |---|---|
-| `x IN (S)`     | TRUE on a match; FALSE on no match if S has no null; **UNKNOWN** on no match if S contains a null |
-| `x NOT IN (S)` | FALSE on a match; **UNKNOWN** on no match if S contains a null; TRUE on no match if S has no null |
+| `x in (S)`    | TRUE on a match; FALSE on no match if S has no null; **UNKNOWN** on no match if S has a null, or if `x` is null |
+| `!(x in (S))` | FALSE on a match; **UNKNOWN** in the same two cases; TRUE otherwise |
 
-A `filter` keeps TRUE and drops both FALSE and UNKNOWN. Reading the table through
-that lens:
+A `filter` keeps TRUE and drops FALSE and UNKNOWN alike, so:
 
-- **`in` (positive) needs no null handling at all.** "Keep on a match" is exactly
-  what a plain semi join does — equality never matches a null, so the
-  UNKNOWN-vs-FALSE distinction is invisible in a filter. **A plain semi join is
-  already correct.**
+- **Positive `in` as a whole conjunct needs no null handling.** "Keep on a
+  match" is a plain semi join; equality never matches a null.
+- **Negated `in` as a whole conjunct differs from a plain anti join twice:**
+  1. if S contains any null, it keeps **no** rows;
+  2. a row whose `x` is null **drops**. A plain anti join (`NullMatch::Never`)
+     treats a null probe key as unmatched and keeps it.
 
-- **`not in` diverges from a plain anti join in two ways:**
-  1. **If S contains any null, `not in` keeps *no* rows** — every row is either a
-     match (FALSE) or a non-match-against-a-null (UNKNOWN). A plain anti join
-     would return the non-matches.
-  2. **A null on the probe side (`x` is null) drops**, because `null = anything`
-     is UNKNOWN. A plain anti join treats a null `x` as unmatched and *keeps* it.
-     (Verified: our anti join keeps unmatched rows, and the null-key work makes a
-     null key its own non-matching group — so it survives an anti join today.)
+### The null-aware anti join is a run-time flag, not a planning choice
 
-### When a plain anti join is exact — and q16 proves it
+The earlier draft kept the plain anti join "for the q16 case, where `s_suppkey`
+is provably non-null". The planner cannot prove that: the IR schema carries no
+column nullability. The exemption would have to be decided at run time anyway,
+and there it costs almost nothing:
 
-If **both** the subquery column and the outer key are non-nullable, neither
-divergence can fire, and `not in` *is* a plain anti join. That is not
-hypothetical: **q16 already ships `s_suppkey not in (…)` as a plain `anti join`**
-and passes the official answer check, because `s_suppkey` is a primary key. The
-null-aware version is only needed when the subquery column can actually be null.
+- the build side visits every right key already (the streaming operator in
+  `src/runtime/semi_anti_join.cpp` skips null right keys at exactly that point),
+  so "the build saw a null → emit nothing" is one flag set at build time;
+- "drop a null probe key" is one validity test on a key the probe reads anyway.
 
-So the deliverable is a **null-aware anti join**: an anti join that (1) yields
-empty when its build column contains a null, and (2) drops null probe keys. Give
-it a distinct spelling in the IR (a flag on the existing anti-join lowering, or a
-dedicated node) so the existing `anti join` operator's cheaper, null-oblivious
-semantics stay available for the q16 case, where they are provably fine.
+So: one new `JoinNode` setting for the anti join — a third `NullMatch` value
+(e.g. `NullAware`) or a separate flag; pick whichever keeps the existing
+`NullMatch` switches exhaustive with less churn — set by every negated `in`,
+honoured by the streaming semi/anti operator and the materialized fallback, and
+printed by `explain`. When S has no null, the result equals a plain anti join
+except for null probe keys, so q16 rewritten as `!(s_suppkey in (…))` gives the
+same answer.
+
+`is_streamable_semi_anti_join` (`semi_anti_join.cpp`) admits only
+`NullMatch::Never`, so a new `NullMatch` value would send every negated `in` to
+the materialized fallback. Teaching the streaming operator the flag is part of
+the work, not a follow-up.
+
+## Spelling: `!(x in (S))`
+
+Ibex has no `not`; negation is `!` (q13's `!like(...)`, SPEC 5.8's
+`!exists(...)`). `!(x in (S))` adds no syntax, and as a whole conjunct it fits
+the `!exists(...)` handling `lower_filter` already has. `x not in (S)` reads
+like SQL but adds a word that exists nowhere else in the language; `x !in (S)`
+adds an operator. Neither is worth it for V1. Revisit only if the parenthesised
+form proves error-prone.
+
+`in` is already a hard keyword (`TokenKind::KeywordIn`, used by `map … in`), so
+no identifier can collide. Parse `value in ( table_expr )` at comparison
+precedence. Note the parse ambiguity to settle in the parser, not in the plan:
+`x in (a)` with `a` a bare name is a one-element table expression here, never a
+literal list, until the literal-list builtin exists and the two are told apart
+by the RHS's kind.
+
+## Correlation
+
+Uncorrelated is the main case, unlike `exists`: SPEC 5.8 rejects an `exists`
+with no capture, but for `in` the synthesized `s == outer(x)` *is* the capture.
+q18 and q20 use only uncorrelated `in`s.
+
+A correlated `in` (S itself uses `outer(...)`) adds its captures beside the
+synthesized one, and the semi/anti join keys on all of them — the same
+multi-capture shape `exists` lowers today.
 
 ## V1 restrictions (each rejected with a diagnostic)
 
-Mirroring the scalar subquery's boundary:
-
-- **Filter-position only, as a top-level conjunct.** All three PDS-H `in`s sit at
-  the top level of a filter. `in` under an `||`, or negated inside a larger
-  boolean, needs the mark-join / null-aware-boolean-column form — defer it, same
-  as `exists` Tier 2.
-- **Bare-column LHS.** `x` must be a column, so the semi/anti join is a plain
-  equijoin. A computed LHS (`a + b in (S)`) must be materialised first.
-- **One-column subquery.** The RHS must produce exactly one column.
+- **Whole `&&` conjunct only, positive or negated.** `in` under `||` or inside a
+  larger boolean would need a mark join, and unlike `exists` (never null) the
+  mark is three-valued: an unmatched row is UNKNOWN, not FALSE, when S holds a
+  null or `x` is null, and that matters under `!` (`!(x in S) || p`). The
+  built mark join reads "count is not null"; `in` would also need "S has a
+  null" and "`x` is null". Defer until a query wants it.
+- **Bare-column LHS**, so the join is a plain equijoin. `(a + b) in (S)` must be
+  materialised first.
+- **One-column subquery.**
+- **Filter position only.**
 
 ```ibex
-select { flag = x in (S) };   // boolean subqueries live in filters, for now
-(a + b) in (S);               // LHS must be a bare column
-x in (t[select { a, b }]);    // subquery must have one column
+t[filter p || x in (S)];        // in only as a whole && conjunct, for now
+update { flag = x in (S) };     // only in filters
+(a + b) in (S);                 // LHS must be a bare column
+x in (t[select { a, b }]);      // subquery must have one column
 ```
 
-## Correlated vs uncorrelated, and a freebie
+## Performance: the readable q18 must plan like the hand-written one
 
-`in` correlates the same way `scalar`/`exists` do: if S captures with `outer(...)`
-it is per-key; if not it is a fixed set. **Both q18 and q20 use only uncorrelated
-`in`s** — the RHS is a computed set that does not reference the outer row.
-
-An uncorrelated positive `in` is therefore a plain semi join against a fixed
-subquery, which — exactly like q04's `exists` — **is expressible today without the
-feature**: compute the set into a `let`, rename its column to the key, and
-`semi join` on it. So q18 is a q04-shaped freebie whenever we want it, and q20's
-real blocker is not a missing primitive but the intricacy of assembling three
-nested subqueries (two `in`s and the already-working correlated `scalar`) by
-hand. `in` syntax buys readability here, and the null-aware anti join buys
-correctness for the general `not in` — neither q18 nor q20 needs that second part.
-
-## Parser / AST
-
-`in` is infix (`value in ( table_expr )`), unlike the call-shaped `scalar(...)`
-and `exists(...)`. `in` is already a soft keyword (`map … in`). Parse it at
-comparison precedence with a value-expression LHS and a parenthesised
-table-expression RHS, and lower it through the same filter-conjunct splitter that
-handles `scalar`/`exists`, synthesising the `x == s_col` equality. `not in` is
-the negation; reuse `!`-style handling rather than adding `not` as a prefix
-operator (Ibex has none — negation is `!`, cf. q13's `!like(...)`).
+- **Semi-join pushdown** (`src/ir/join_pushdown.cpp`) only sees a
+  `Join(Semi(Join(Inner …)))` when both share one IR tree (q18's comment). The
+  lowering must put the semi join in the enclosing expression's tree, not behind
+  a binding.
+- **The Stage C left-scan filter** covers inner joins only; semi/anti joins on a
+  streamed left input are listed as not yet covered
+  (`plans/beat-both-plan.md` §3 item 2). Not a blocker; worth knowing when
+  comparing q18 forms.
 
 ## Test plan
 
-- parser: `x in (S)`, `x not in (S)`, and the three rejections above;
-- lower: `in` → Semi join, no aggregate added; `not in` → the null-aware anti
-  join variant, distinct from the plain one;
-- a positive `in` keeps each outer row at most once (no duplication);
-- `not in` against a subquery **with** a null in its column keeps no rows;
-- `not in` against a **null-free** subquery equals a plain anti join (the q16
-  case) — and a null probe key still drops;
-- interpreter/codegen parity;
-- no duplicated source read for a binding used by both sides.
-
-## Priority
-
-This is the highest-value subquery increment left: two queries (q18, q20), and
-it makes q16's hand-rolled anti join expressible as the `not in` it came from.
-Ranked against its neighbours: **`in`/`not in` (q18, q20) > `exists` (0 new
-queries, ergonomics only) > `exists` Tier 3 (q21, needs `row_number()`)**. The
-positive-`in` half is small (it reuses the semi join outright); the null-aware
-anti join is the one genuinely new operator, and no current query needs it.
+- parser: `x in (S)`, `!(x in (S))`, and each rejection above;
+- lower: positive `in` → `Join(Semi)` with no aggregate; negated → the
+  null-aware anti join, distinct in the IR from a plain anti join;
+- **the readable q18 and the hand-written q18 lower to the same plan** (covers
+  pushdown and duplicated source reads; see
+  [[project_parity_cannot_see_lowering_bugs]] — assert on the IR);
+- a positive `in` keeps each outer row at most once;
+- negated `in` against an S holding a null keeps no rows;
+- negated `in` against a null-free S equals a plain anti join except that a null
+  probe key drops — hand-computed expected rows, not a second Ibex query
+  ([[project_rewrite_test_reference_trap]]);
+- the streaming path honours the null-aware flag (single- and multi-threaded),
+  and fails when the flag is ignored;
+- interpreter/codegen parity.

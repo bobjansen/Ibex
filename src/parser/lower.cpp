@@ -3476,7 +3476,7 @@ class Lowerer {
                     return std::unexpected(keys.error());
                 extra_group_by = std::move(keys.value());
             }
-            auto lowered_resample = lower_resample_aggs(*state.select);
+            auto lowered_resample = lower_resample_aggs(*state.select, extra_group_by);
             if (!lowered_resample.has_value())
                 return std::unexpected(lowered_resample.error());
             auto lowered = std::move(lowered_resample.value());
@@ -6127,7 +6127,10 @@ class Lowerer {
         }
     }
 
-    auto lower_resample_aggs(const SelectClause& select)
+    /// `group_keys`: the `by` keys. Resample emits them (after the time index)
+    /// whatever `select` lists, so a bare field naming one is already there.
+    auto lower_resample_aggs(const SelectClause& select,
+                             const std::vector<ir::ColumnRef>& group_keys)
         -> std::expected<LoweredAggList, LowerError> {
         LoweredAggList lowered;
         std::size_t temp_counter = 0;
@@ -6223,9 +6226,14 @@ class Lowerer {
 
         for (const auto& field : select.fields) {
             if (field.expr == nullptr) {
+                if (std::ranges::any_of(group_keys, [&](const ir::ColumnRef& key) {
+                        return key.name == field.name;
+                    })) {
+                    continue;
+                }
                 return std::unexpected(
                     LowerError{.message = "resample select: bare column reference not supported — "
-                                          "use an aggregate function"});
+                                          "use an aggregate function or a `by` key"});
             }
             lowered.final_columns.push_back(field.name);
             const auto* call = std::get_if<CallExpr>(&field.expr->node);

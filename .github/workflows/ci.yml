@@ -222,8 +222,10 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-20 clang-tidy-20 cmake ninja-build libcurl4-openssl-dev || \
-          sudo apt-get install -y clang-18 clang-tidy-18 cmake ninja-build libcurl4-openssl-dev
+          # libreadline-dev: src/repl/line_editing_readline.cpp is configured
+          # (and so analysed with real flags) only when readline is found.
+          sudo apt-get install -y clang-20 clang-tidy-20 cmake ninja-build libcurl4-openssl-dev libreadline-dev || \
+          sudo apt-get install -y clang-18 clang-tidy-18 cmake ninja-build libcurl4-openssl-dev libreadline-dev
 
       - name: Configure (also emits compile_commands.json)
         # Ninja + CMAKE_EXPORT_COMPILE_COMMANDS (set in CMakeLists) writes

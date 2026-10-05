@@ -30,6 +30,7 @@ bench_results/**
 benchmarking/data/**
 benchmarking/results/compiled/**
 benchmarking/results/*_artifacts.tar.gz
+libraries/**
 *.csv
 *.tar.gz
 *.tsv

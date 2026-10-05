@@ -29,7 +29,7 @@ namespace ibex::ir {
 /// still reads `o_custkey` from orders; the optimizer uses `c_custkey` as the
 /// folded key's logical output name.
 ///
-/// It also removes a cost the passes never had anything to do with: SPEC 12.3
+/// It also removes a cost the passes never had anything to do with: SPEC 5.6
 /// keeps BOTH key columns in a mapped join's output, so the join materialises a
 /// column the same-named form folds away. On q13 — where no pass declines at
 /// all — that alone is 4%.
@@ -51,7 +51,16 @@ namespace ibex::ir {
 ///     child (else the fold changes which columns the suffix policy renames).
 ///     Both schemas must be Known.
 ///
-/// Anything unproven is left mapped, which is exactly today's behaviour.
+/// Anything unproven is left mapped, which is exactly today's behaviour, and
+/// each pass that needs one name declines on it (each gate says so). Two cases
+/// cannot be folded at all: Right/Outer joins, and a Left join whose right key
+/// is read above it. An Inner join whose right key is read above could be:
+/// rename below, then an order-restoring `Project` above. The general
+/// alternative to folding is an equivalence-class key model in
+/// `join_reorder`/`join_order` -- union-find over `(relation, column)` instead
+/// of `Edge::keys` and distinct estimates keyed by bare column name -- at the
+/// cost of rebuilding each `(left, right)` pair the reorder emits. Worth it
+/// only when a real query needs one of those shapes.
 ///
 /// Pure on IR: takes ownership and returns the rewritten tree.
 [[nodiscard]] auto normalize_mapped_join_keys(NodePtr root, const SourceSchemas& sources)

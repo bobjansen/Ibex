@@ -166,6 +166,10 @@ using SourceSchemas = robin_hood::unordered_map<std::string, SchemaInfo>;
 ///
 ///   - a missing key is only provable against a closed Known schema, since an
 ///     open one may carry the column anonymously;
+///   - Ibex stays strict and never picks a common type (SPEC 5.6). A frontend
+///     with its own coercion rules (vctrs for R, NumPy-style promotion for
+///     Python) lowers the cases it supports to explicit casts and rejects the
+///     rest before submitting;
 ///   - types are compared at the *runtime's* granularity, not the IR's: the
 ///     runtime carries one integer and one float width, so a declared Int32
 ///     joins a declared Int64 and only a genuinely different kind is rejected.

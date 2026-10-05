@@ -759,6 +759,18 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     // cache on nearly every probe. Beyond the ratio the sort is the cheaper of
     // the two costs and the default wins.
     //
+    // Measured with a String key (the expensive sort), as query minus a control
+    // without the trailing `order`:
+    //
+    //     right/left   extra join cost   sort saved   net
+    //        1.33         -105 ms          674 ms     -779 ms
+    //        4             +51 ms          160 ms     -109 ms
+    //        8             +65 ms           67 ms       -2 ms
+    //       16             +80 ms           33 ms      +47 ms
+    //
+    // Break-even is near 8; the guard sits at 4 because an integer key reaches
+    // the pre-sorted data check, saves far less, and moves break-even down.
+    //
     // Semi and anti joins are excluded because they emit in left-row order
     // whichever side is indexed (see `build_indices_from_right_scan`), so there
     // is no trade to make -- forcing the side would pay the cost for nothing.

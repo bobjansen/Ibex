@@ -1500,6 +1500,21 @@ ibex_join_operator <- function(kind) {
       cross = " cross join ")[[kind]]
 }
 
+# How dplyr's joins map onto Ibex's (SPEC.md 5.6). Ibex's contract is its own;
+# where dplyr differs, the adapter either reconstructs dplyr's behaviour or
+# falls back, never returns a differently-shaped answer.
+#
+# - Taken from dplyr, natively: named key mappings (`on { a = b }`), with the
+#   right key dropped afterwards as dplyr does; filtering joins as their own
+#   kinds; `.x`/`.y` passed through as an explicit `suffix`.
+# - Declined by Ibex, mapped explicitly here: `na_matches = "na"` is not Ibex's
+#   default (three-valued logic), so it is spelled `nulls equal`; automatic
+#   suffixing is not Ibex's either, so the suffix is always passed.
+# - Not reconstructed yet: dplyr's left row order (Ibex promises none; an
+#   explicit `order` on the plan would supply it), the grouping across a
+#   mutating join (dropped below), and vctrs common-type coercion of keys
+#   (Ibex rejects keys of different kinds rather than picking a common type).
+#
 # `semi join` and `anti join` return the left columns only. That one fact is
 # what makes them the simplest kinds to translate -- no right columns means no
 # collision, so no suffix; the output schema is the input's; and the grouping

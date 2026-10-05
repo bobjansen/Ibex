@@ -539,8 +539,8 @@ enum class ColumnType : std::uint8_t {
 /// A *proof*, like `SchemaInfo::unique_keys`: `Never` means an operator's
 /// definition rules nulls out, never that a source promised it. `Maybe` is the
 /// ⊥ every rule falls back to, so no rule may reach `Never` without an argument
-/// for it. The rules live in `ir/nullability.hpp`; `plans/joins.md` records why
-/// each holds.
+/// for it. The rules, each with the argument for it, live in
+/// `ir/nullability.hpp` / `src/ir/nullability.cpp`.
 enum class Nullability : std::uint8_t {
     /// No proof; the column may hold nulls. Sound for any column whatever.
     Maybe,

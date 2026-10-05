@@ -471,6 +471,10 @@ interleave. This applies to any edit inside an operator, not just "optimizations
 Use `benchmarking/ab_queries.py` (§1a) rather than rolling your own — the design
 details below are the ones that bit while writing it.
 
+Time with a real clock. `/usr/bin/time` has 10 ms granularity: on q21 it read a
+change as −0.9% where `time.perf_counter()` over 12 interleaved pairs read
++10.2% with 1/12 paired wins.
+
 Serial runs drift on this box, so sides must be **interleaved and paired**: run
 `i` of each side under the same machine conditions, then reason about the paired
 differences. An unpaired comparison of two sets of timings throws away the only

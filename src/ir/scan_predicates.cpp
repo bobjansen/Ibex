@@ -225,14 +225,23 @@ auto scan_predicates_by_occurrence(const Node& root) -> std::vector<ScanOccurren
 }
 
 auto scan_predicates(const Node& root) -> ScanPredicateMap {
-    // Derived from the per-occurrence answer, and deliberately no more
-    // permissive than before: a source is pushed only when it has exactly ONE
-    // occurrence, because the table registry is keyed by source name and cannot
-    // give two occurrences different rows. Widening this is Phase 3 of
-    // plans/per-occurrence-scan-selections-plan.md, and needs the registry
-    // change first -- lifting it alone is UNSOUND, not merely risky: on a
+    // A source is pushed only when it has exactly ONE occurrence: the table
+    // registry is keyed by source name and cannot give two occurrences
+    // different rows. Lifting this alone is UNSOUND, not merely risky: on a
     // `like` / `!like` pair both conjuncts land in one decode, intersect to
     // nothing, and the query returns zero rows.
+    //
+    // Repeated sources get per-occurrence predicates another way:
+    // `isolate_filtered_scan_instances` names the occurrences apart and the
+    // REPL decodes their union once, gathering each occurrence's selection. It
+    // does that only for a fusable `like` over a column the query reads nowhere
+    // else (`collect_filtered_sources`), where the string column is then never
+    // built; every other predicate keeps the pooled decode and runs above it.
+    // Widening that to any predicate measured neutral (2026-09-04: -0.4%
+    // geomean, byte-identical on 22) and is not done: split instances must stay
+    // eager, so widening would move every repeatedly-scanned filtered source
+    // off the streaming and deferred-probe paths. Reopen with a query where a
+    // per-occurrence non-`like` predicate is a measured win.
     auto occurrences = scan_predicates_by_occurrence(root);
     std::map<std::string, std::size_t> counts;
     for (const auto& occurrence : occurrences) {

@@ -276,8 +276,7 @@ TEST_CASE("scan_predicates_by_occurrence: keeps two occurrences of one source ap
           "[ir][scan_predicates]") {
     // The same shape the name-keyed map has to reject wholesale: one source,
     // two scans, each wanting different rows. Per occurrence the two predicates
-    // are separable -- which is what the later phases of
-    // plans/per-occurrence-scan-selections-plan.md need.
+    // are separable -- which is what isolate_filtered_scan_instances relies on.
     auto join = std::make_unique<ir::JoinNode>(ir::NodeId{5}, ir::JoinKind::Inner,
                                                std::vector<ir::JoinKey>{"id"});
     join->add_child(

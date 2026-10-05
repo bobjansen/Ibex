@@ -5,7 +5,8 @@ Status of every plan in this directory, grouped by lifecycle.
 **2026-10-05:** retired the radix group-by note, the owned aggregate,
 runtime multithreading, the Phase 3 DOP-budget analysis, the kernel-pipeline
 migration (finished), the compile-conformance umbrella (finished), the
-query-shape conformance leftovers (moved into beat-both), and the three
+query-shape conformance leftovers (moved into beat-both), the per-occurrence
+scan selections (built; widening deferred), and the three
 reference documents (`joins.md`, `parallelism-overview.md`,
 `allocator-and-huge-pages.md`), whose rules moved to SPEC.md, `MEASURING.md`,
 `src/runtime/PARALLELISM.md` and the code; the rows below re-checked against
@@ -47,11 +48,10 @@ history).
 
 | Plan | Status | What's actually left |
 |---|---|---|
-| [beat-both-plan.md](beat-both-plan.md) | **Ongoing umbrella, created 2026-10-04** by merging beat-polars and beat-duckdb. References: Polars **streaming** and DuckDB (never Polars in-memory). Baseline §1.0 (AWS `20261004T100951_1bfeceb5`, 8 cores): Ibex/Polars 0.94 total, geomean 1.00 against both; Ibex leads on 1–4 cores and loses at 16. The benchmark write-up waits for milestone 1. | Milestone 1: total and geomean ≤ 1.0 against both at 8 cores on AWS SF-10 (1 core still ahead, 2 cores not a loss). Landed since the baseline: consumer helps the scan (`49da7a27`, lineitem scan family −4 to −7% at 8 cores) and the left-scan join filter (`c4084d23`, q12 −35%); an AWS run to re-check the milestone is pending. Next per §3: q10, the deferred-probe joins (q03/q05/q07/q09), q01's worker-side work. |
+| [beat-both-plan.md](beat-both-plan.md) | **Ongoing umbrella, created 2026-10-04** by merging beat-polars and beat-duckdb. References: Polars **streaming** and DuckDB (never Polars in-memory). Baseline §1.0 (AWS `20261004T100951_1bfeceb5`, 8 cores): Ibex/Polars 0.94 total, geomean 1.00 against both; Ibex leads on 1–4 cores and loses at 16. The benchmark write-up waits for milestone 1. | Milestone 1: total and geomean ≤ 1.0 against both at 8 cores on AWS SF-10 (1 core still ahead, 2 cores not a loss). Landed since the baseline: consumer helps the scan (`49da7a27`, lineitem scan family −4 to −7% at 8 cores) and the left-scan join filter (`c4084d23`, q12 −35%); AWS 2026-10-05 (§1.0b) meets milestone 1 at 8 cores (0.91 / 0.99 total, 0.95 / 0.96 geomean; without q21 0.98 / 1.00) on one sitting, confirmation run pending. Top 8-core losers now q19, q01, q03, q10, q14; milestone 2 (16 cores) unchanged at 1.08 / 1.21. |
 | [non-row-local-filter-plan.md](non-row-local-filter-plan.md) | Stage 1 shipped | `lag`/`lead`/`is_null` in filter work. Remaining: `rank(...)` in filter/select with `by`, explicit `order {}` context, rolling functions in filter (`price > rolling_mean(price)`) |
 | [bigger-than-ram-plan.md](bigger-than-ram-plan.md) | Phase 4 bullet 1 of 4 done | Out-of-core execution. Done: chunked/streaming `read_parquet` (branch `chunked-parquet-read`; ~6.5× lower peak RSS, ~1.7× faster, verified local + AWS). Next: column projection pushdown, row-group stats pushdown, directory/Hive datasets (rest of Phase 4), then Phase 1 spill infrastructure (prerequisite for Phases 2–3, 6–7: external sort, out-of-core join, adaptive spill selection) |
 | [grouped-chunkview-update-plan.md](grouped-chunkview-update-plan.md) | Mostly complete — `update …, by k` runs off an immutable `GroupedRowPlan` (CSR) instead of gather → per-group `Table` → scatter. Began as a sub-plan of the (retired) kernel-pipeline plan's Phase 2. | Remaining materialized shapes: `rank`, variable-width ordered state, `window`-clause `lag`/`lead`. |
-| [per-occurrence-scan-selections-plan.md](per-occurrence-scan-selections-plan.md) | **Phases 1–3 LANDED** (`78a09fad`, `bf783ef3`, `f2b298db`). Restored filter pushdown for a source scanned more than once: each occurrence is renamed `source#fN` so `scan_predicates` keeps its predicate, `decode_demanded_lazy_sources` decodes the union of their output columns ONCE and gathers per occurrence, and the instances stay EAGER. Gated structurally on a fusable `like`. `ibex-e2e.sh` is green again. | **Phase 4 — narrow the `!= 1` gate generally.** Its price was +11.3% on q21, since the eager selection ran serial; with that fanned out (`f06e6da3`) widening the gate measures −0.4% geomean, byte-identical on 22, nothing regressed. The blocker is gone, so what is left is a risk judgement about the plan-shape change, not a cost one. |
 
 ## Proposed — no implementation yet
 
@@ -127,6 +127,25 @@ in active plans to `plans/done/...` paths refer to that history.
   target, or a warm process shows page faults) are on `tune_allocator_once`
   in `src/runtime/interpreter.cpp`; the warm/fresh quoting rule is in
   `MEASURING.md`.
+
+- **per-occurrence-scan-selections-plan.md** — retired 2026-10-05; read it at
+  `git show c5e9e2b1:plans/per-occurrence-scan-selections-plan.md`. A source scanned
+  more than once had lost all filter pushdown (`afe55f25` made occurrences
+  share a name). Phases 1–3 (`78a09fad`, `bf783ef3`, `f2b298db`): occurrence
+  identity (`scan_predicates_by_occurrence`), the `selection_for` seam, and
+  `isolate_filtered_scan_instances` with one shared decode per source,
+  gated on a fusable `like` over a filter-only column; the e2e check that
+  caught it is green. On the way, the eager selection was morselized (q04
+  −5.5%). The gate's rule and why it stays narrow are on the gate
+  (`scan_predicates.cpp`); the timer lesson is in `MEASURING.md` §6. Left:
+  - Phase 4, widening the gate to any predicate: measured −0.4% geomean,
+    byte-identical on 22 (2026-09-04). **Decided 2026-10-05: not now** —
+    split instances must stay eager, so widening would take every
+    repeatedly-scanned filtered source off the streaming and deferred-probe
+    paths that beat-both relies on. Reopen with a query where a
+    per-occurrence non-`like` predicate is a measured win;
+  - a strictly safe interim, unbuilt: push the conjuncts common to every
+    occurrence (each occurrence's own filter still runs above).
 
 - **query-shape-conformance-plan.md** — retired 2026-10-05; read it at
   `git show 051dd48f:plans/query-shape-conformance-plan.md` (the full diary is at

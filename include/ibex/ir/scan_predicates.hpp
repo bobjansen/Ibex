@@ -29,17 +29,15 @@ using ScanPredicateMap = std::map<std::string, std::vector<Expr>>;
 
 /// One `Scan` node's own pushable conjuncts.
 ///
-/// Phase 1 of `plans/per-occurrence-scan-selections-plan.md`. `ScanPredicateMap`
-/// above is keyed by SOURCE NAME, which cannot tell two occurrences of one
+/// `ScanPredicateMap` above is keyed by SOURCE NAME, which cannot tell two occurrences of one
 /// source apart, so it must drop every predicate of a repeated source: pushing
 /// one occurrence's filter would wrongly filter the other. This keys on the
 /// scan node instead, the same identity `ColumnOrigin::scan` uses to tell a
 /// self-join's two sides apart for FD reduction.
 ///
-/// Nothing consumes the extra resolution yet -- `scan_predicates` is still
-/// derived from this and still declines a repeated source, byte for byte. It
-/// exists so the later phases have somewhere to put "same decode, different
-/// rows".
+/// `scan_predicates` is derived from this and still declines a repeated
+/// source; `isolate_filtered_scan_instances` is what uses the per-occurrence
+/// resolution, to give a repeated source "same decode, different rows".
 struct ScanOccurrence {
     NodeId scan;                  ///< identity of the `ScanNode` itself
     std::string source;           ///< the source it reads

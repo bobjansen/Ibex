@@ -4824,6 +4824,9 @@ class ResourceCalls {
         }
         auto* resource_call = as_resource_call(*slot);
         if (resource_call == nullptr) {
+            if (auto* statement_call = as_statement_table_call(*slot)) {
+                return hoist_statement_table_call(*statement_call, slot, rewrites);
+            }
             return hoist(*slot, rewrites);
         }
         const auto returns_resource_error = [&] {
@@ -4851,6 +4854,50 @@ class ResourceCalls {
         } else if (auto* column = std::get_if<runtime::ColumnValue>(evaluated)) {
             columns_->insert_or_assign(temp_name, std::move(*column));
         }
+        rewrites.temp_names.push_back(temp_name);
+        rewrites.replaced.emplace_back(&slot, std::move(slot));
+        slot = std::make_unique<parser::Expr>(
+            parser::Expr{parser::IdentifierExpr{.name = std::move(temp_name)}});
+        return std::nullopt;
+    }
+
+    /// The call `expr` is, when it calls a table function that must run
+    /// statement by statement (`parser::table_function_needs_statements`):
+    /// one whose body reads a `let` out of a table with `scalar(...)`.
+    [[nodiscard]] auto as_statement_table_call(parser::Expr& expr) const -> parser::CallExpr* {
+        auto* call = std::get_if<parser::CallExpr>(&expr.node);
+        if (call == nullptr) {
+            return nullptr;
+        }
+        const auto fn = functions_->find(call->callee);
+        if (fn == functions_->end()) {
+            return nullptr;
+        }
+        const auto lookup = [&](std::string_view name) -> const parser::FunctionDecl* {
+            const auto it = functions_->find(std::string(name));
+            return it == functions_->end() ? nullptr : &it->second;
+        };
+        return parser::table_function_needs_statements(fn->second, lookup) ? call : nullptr;
+    }
+
+    /// Runs such a call where it stands, as a statement would, and makes the
+    /// slot name a temporary holding its table. Inlined into the plan instead,
+    /// its `scalar(...)` binding would have no value.
+    auto hoist_statement_table_call(parser::CallExpr& call, parser::ExprPtr& slot,
+                                    HoistedResourceCalls& rewrites) -> std::optional<std::string> {
+        auto result = run_function(call, functions_->find(call.callee)->second, *tables_,
+                                   *lazy_tables_, *scalars_, *columns_, *models_, *functions_,
+                                   *compile_time_lists_, *extern_decls_, *externs_, nullptr);
+        if (!result) {
+            return result.error();
+        }
+        auto* evaluated = std::get_if<EvalValue>(&*result);
+        auto* table = evaluated != nullptr ? std::get_if<runtime::Table>(evaluated) : nullptr;
+        if (table == nullptr) {
+            return "function '" + call.callee + "' did not return a table";
+        }
+        auto temp_name = make_temp_table_name();
+        tables_->insert_or_assign(temp_name, std::move(*table));
         rewrites.temp_names.push_back(temp_name);
         rewrites.replaced.emplace_back(&slot, std::move(slot));
         slot = std::make_unique<parser::Expr>(

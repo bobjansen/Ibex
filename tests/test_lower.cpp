@@ -138,6 +138,19 @@ rbind(Table { a = [0], b = [0] }, renamed(7));
     const auto* b = std::get_if<ibex::Column<std::int64_t>>(out->find("b"));
     REQUIRE(b != nullptr);
     CHECK(std::vector<std::int64_t>(b->begin(), b->end()) == std::vector<std::int64_t>{0, 7});
+
+    // `scalar(...)` reads a table when the binding is made, which a plan has
+    // no step for: the inliner refuses with the reason rather than lowering a
+    // column reference.
+    auto refused = parser::lower(require_parse(R"(
+fn looked_up(k: Int) -> DataFrame {
+    let m = scalar(Table { v = [1] }, v);
+    Table { a = [1] }[update { b = m }];
+}
+rbind(Table { a = [0], b = [0] }, looked_up(2));
+)"));
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().message.find("cannot be inlined") != std::string::npos);
 }
 
 TEST_CASE("Lower inlines a table-returning user function at its call site") {

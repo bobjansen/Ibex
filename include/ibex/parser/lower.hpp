@@ -177,6 +177,17 @@ using CallPredicate = std::function<bool(std::string_view)>;
 [[nodiscard]] auto clause_contains_call_if(const Clause& clause, const CallPredicate& matches)
     -> bool;
 
+using FunctionLookup = std::function<const FunctionDecl*(std::string_view)>;
+
+/// True when a call to table function `fn` has to run statement by statement
+/// instead of being inlined into the plan around it: its body binds a `let`
+/// from `scalar(<table>, ...)` (a value read out of a table when the binding
+/// is made, which a plan has no step for), directly or through a function it
+/// calls. The REPL runs a nested call to such a function first and passes its
+/// result; the inliner refuses it. `lookup` finds user functions by name.
+[[nodiscard]] auto table_function_needs_statements(const FunctionDecl& fn,
+                                                   const FunctionLookup& lookup) -> bool;
+
 [[nodiscard]] auto lower(const Program& program) -> LowerResult;
 
 /// Lower a complete script while preserving table-consuming extern calls as

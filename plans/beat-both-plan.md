@@ -263,7 +263,8 @@ effect too. Milestone 1 needs ~260 ms, comfortably ~600 ms.
    lineitem scan feeding the join (`dynamic key scan`, then `decode
    selected`). Done: selection validation moved into the tasks (`08caeea4`,
    −2 to −4%); exact join-key bitmap for dense keys (`a925b814`, q03 −7.5% at
-   8c / −18% at 1c; teaching note `src/runtime/JOIN_FILTERS.md`). Left: the
+   8c / −18% at 1c; the design is on `DynamicScanFilter` in
+   `include/ibex/runtime/interpreter.hpp`). Left: the
    key-scan merge (needs `Selection` not to zero-fill, or consuming the parts
    directly).
 6. **q16 and q13.** q16 −11% at 8c (`4a96588c`: distinct partition sets

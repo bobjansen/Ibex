@@ -2427,6 +2427,11 @@ is established by that conversion, not by the join.
 The `on` list must contain one or more unqualified key entries. An unmapped
 entry must be present under that name in both inputs; a mapped entry's left name
 must be present in the left input and its right name in the right input.
+The two columns of a key must be of the same kind: integer widths count as one
+kind, and so do floating-point widths. Ibex never picks a common type for keys
+of different kinds — cast one side. The check runs as soon as both input
+schemas are known, before any data is read, and the error names the side, the
+key and both types.
 `asof join` requires both operands to be `TimeFrame`s and the `on` list must
 pair their respective time-index columns. Additional pairs are equality keys.
 

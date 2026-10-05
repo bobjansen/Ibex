@@ -21,8 +21,8 @@ class SchemaInfo;
 ///
 /// Every rule here answers `Nullability::Maybe` for anything it cannot argue,
 /// so an unmodelled expression or operator costs precision and never soundness.
-/// Adding a rule means adding an argument; see `plans/joins.md` for the ones
-/// already made.
+/// Adding a rule means adding an argument, written beside the rule it
+/// justifies, as the existing ones are.
 
 /// Whether a computed field can hold a null, given the schema it reads.
 [[nodiscard]] auto expr_nullability(const Expr& expr, const SchemaInfo& input) -> Nullability;

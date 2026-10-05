@@ -2,9 +2,11 @@
 
 Status of every plan in this directory, grouped by lifecycle.
 
-**2026-10-05:** four more retired (radix group-by note, owned aggregate,
-runtime multithreading, the Phase 3 DOP-budget analysis), and the rows below
-re-checked against the tree.
+**2026-10-05:** retired the radix group-by note, the owned aggregate,
+runtime multithreading, the Phase 3 DOP-budget analysis and the join contract
+(`joins.md`, its rules moved to SPEC.md and the code); the rows below
+re-checked against the tree. `plans/` holds plans; documentation lives in
+SPEC.md, `docs/`, `src/**/*.md` and code comments.
 
 **2026-10-04:** eight finished or overtaken plans retired (ADBC, opaque
 resources, namespaces, parse-args/nullable scalars, count windows, join perf,
@@ -53,7 +55,6 @@ history).
 
 | Document | What it is |
 |---|---|
-| [joins.md](joins.md) | The join contract: Ibex's join model and the gaps found building the dplyr backend; mapped vs shared-name keys |
 | [parallelism-overview.md](parallelism-overview.md) | **Start here before adding a new fan-out.** The design itself (the `WorkerPool` substrate, the three parallelism layers, the determinism contract, the config surface) moved to `src/runtime/PARALLELISM.md` on 2026-08-27. This file is the inconsistency list (I1–I15, several RESOLVED) + the standing findings: the task scheduler is DROPPED on measurement (pool is ~70% idle with nothing queued), the "70% idle, not serial" accounting, and "Rejected: weakening first-occurrence group ordering". |
 | [allocator-and-huge-pages.md](allocator-and-huge-pages.md) | Analysis only, parked (2026-09-24). Ibex gains ~38% from a warm process on q21 against Polars' ~8% (first-touch page faults), so q21 is ~0.43 warm but ~0.63 fresh. jemalloc: no (+3.7% at 1 core). Whole-heap huge pages via `GLIBC_TUNABLES=glibc.malloc.hugetlb=1`: −8.0% / −4.9% fresh at 1 / 8 cores, neutral warm. Column-buffer-only `madvise` tried and reverted (−0.6% / −1.8%). Reopen if single command-line runs matter. |
 
@@ -107,6 +108,29 @@ in active plans to `plans/done/...` paths refer to that history.
     count. Its "LazyTable Synchronization Contract" was never written down as
     code, but workers have decoded `LazyTable` units concurrently since
     2026-08-16, each with its own reader; read that section as history.
+
+- **joins.md** — retired 2026-10-05; read it at `git show fa7aad97:plans/joins.md`.
+  The join contract, built 2026-08: asymmetric keys, the canonical output
+  planner, row order outside the contract, `left()`/`right()`, collisions and
+  `suffix`, early key checks, order-aware build-side choice, `nulls equal`,
+  `expect`/`take`, schema nullability, mapped-key normalization. Where its
+  rules live now: the semantics in SPEC.md §5.6 (key-type strictness added
+  there on retirement); the rules beside the code — `mapped_join_keys.hpp`
+  (what cannot be folded, and the equivalence-class alternative),
+  `ir/nullability.{hpp,cpp}`, `check_joins` in `ir/schema.hpp`, the
+  build-side ratio and its measurements in `src/runtime/join.cpp`, the
+  `nulls equal` decline in `physical_plan.cpp`; the dplyr mapping at the top
+  of the join helpers in `r/ibex/R/dplyr-backend.R`; its benchmarking method
+  in `MEASURING.md`. Left, none scheduled:
+  - time-domain joins beyond `asof join` with a tolerance: direction, tie
+    behaviour, interval/overlap joins (as compound inequalities over the
+    theta path), all keeping the time-index ordering;
+  - the equivalence-class key model (only when a query needs a mapped key
+    under a Right/Outer join, or a right key read above a Left join);
+  - letting `expect n:1` bias the build side (needs a threshold and a paired
+    benchmark, like the pending-order guard);
+  - the R adapter: dplyr's left row order, grouping across a mutating join,
+    vctrs key coercion.
 
 - **phase3-dop-budget-analysis.md** — retired 2026-10-05; read it at
   `git show 82ab01d1:plans/phase3-dop-budget-analysis.md`. An analysis of

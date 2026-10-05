@@ -1250,6 +1250,9 @@ auto plan_join(const ir::JoinNode& join) -> JoinPlan {
         // `PairIntInner`, semi/anti through the semi/anti operator's pair set.
         out.decline = JoinDeclineReason::KeyTypesUnsupported;
     } else if (join.null_match() != ir::NullMatch::Never) {
+        // `nulls equal` runs on the materialized join only: one definition of
+        // null-tagged key equality, and no streaming operator pays for an
+        // option most joins never ask for.
         out.decline = JoinDeclineReason::NullsEqual;
     } else if (join.expect().asserts_anything()) {
         out.decline = JoinDeclineReason::AssertsCardinality;

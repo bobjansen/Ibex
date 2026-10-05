@@ -227,6 +227,13 @@ once per side and later runs are incremental ninja builds with ccache hits on
 unchanged files. Delete the cache dir — or pass `--no-cache` — when a
 from-scratch build is required.
 
+Check the query list in the report before reading the numbers.
+`bench_ibex.sh` defaults each optional table (`--csv-trades`, `--csv-events`,
+…) to a path under the worktree's own `benchmarking/data/`, where no data
+exists, so a table the comparison fails to forward silently drops every query
+that needs it — from both sides at once, which keeps the report
+self-consistent and gives you nothing to notice.
+
 The competitor harnesses need the project's **uv** environment, not system
 python or conda (those lack polars/pandas and fail in a way that looks like
 "deps not installed"):
@@ -419,7 +426,7 @@ The single most common way to "verify" nothing. Two checks:
   (return an error, delete a term, `if (false)`) and confirm the test fails.
   If it still passes, the test is decorative. Restore immediately afterwards.
 * **Check reachability.** The whole-table functions (`distinct_table`,
-  `inner_join_table`, `aggregate_table`) run only for a subtree beneath a node
+  `join_table_impl`, `aggregate_table`) run only for a subtree beneath a node
   the chunked builder declined, **within one statement**. A `let` materializes
   and breaks the chain, so
 

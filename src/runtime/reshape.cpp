@@ -5,9 +5,11 @@
 #include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -77,47 +79,194 @@ auto extract_numeric(const Table& input)
     return {std::move(names), std::move(data)};
 }
 
-struct DcastKey {
-    static constexpr std::size_t kMaxCols = 8;
-    std::array<std::int64_t, kMaxCols> v{};
-    std::uint8_t n{0};
-    /// Bit k set when key column k is null in this row. A null cannot be
-    /// encoded as a reserved value in `v`: every 64-bit pattern is a legal
-    /// key for some column type, so any sentinel is a value that collides.
-    std::uint8_t null_mask{0};
+/// A row whose pivot is null (or a code outside the dictionary): it adds no
+/// cell and no output row.
+constexpr std::uint32_t kDcastNoPivot = std::numeric_limits<std::uint32_t>::max();
 
-    auto operator==(const DcastKey& o) const noexcept -> bool {
-        if (null_mask != o.null_mask) {
-            return false;
-        }
-        // Element-wise rather than std::memcmp: this runs once per input row
-        // (incl. the prev-key shortcut), and a libc memcmp call for ~16 bytes
-        // is dominated by call overhead. n is small (typically 1–3), so an
-        // inlined loop of int64 compares is far cheaper.
-        if (n != o.n) {
-            return false;
-        }
-        for (std::uint8_t k = 0; k < n; ++k) {
-            if (v[k] != o.v[k]) {
+/// The row key of a dcast, read straight from the key columns.
+///
+/// Equality compares the VALUES, so it is exact for every column type by
+/// construction: there is no per-column code to keep injective. Two nulls in
+/// the same column are equal (a null row key is a group of its own), a null
+/// and a value are not. A Float64 compares by bit pattern with -0.0 folded
+/// onto 0.0, so the two group together and every NaN with the same bits forms
+/// one group, as with any other key.
+struct DcastRowKey {
+    std::vector<const ColumnEntry*> columns;
+
+    [[nodiscard]] static auto double_bits(double value) noexcept -> std::uint64_t {
+        return std::bit_cast<std::uint64_t>(value == 0.0 ? 0.0 : value);
+    }
+
+    [[nodiscard]] auto equal(std::size_t a, std::size_t b) const -> bool {
+        for (const auto* entry : columns) {
+            const bool a_null = is_null(*entry, a);
+            const bool b_null = is_null(*entry, b);
+            if (a_null || b_null) {
+                if (a_null != b_null) {
+                    return false;
+                }
+                continue;
+            }
+            const bool same = std::visit(
+                [a, b](const auto& c) -> bool {
+                    using T = std::decay_t<decltype(c)>;
+                    if constexpr (std::is_same_v<T, Column<Categorical>>) {
+                        return c.code_at(a) == c.code_at(b);
+                    } else if constexpr (std::is_same_v<T, Column<double>>) {
+                        return double_bits(c[a]) == double_bits(c[b]);
+                    } else {
+                        return c[a] == c[b];
+                    }
+                },
+                *entry->column);
+            if (!same) {
                 return false;
             }
         }
         return true;
     }
-};
 
-struct DcastKeyHash {
-    auto operator()(const DcastKey& k) const noexcept -> std::size_t {
-        std::uint64_t h = k.null_mask;
-        for (const auto elem : std::span(k.v.data(), k.n)) {
-            h ^= static_cast<std::uint64_t>(elem);
+    /// Set `continues[r]` for each row of [begin, end) whose key equals the
+    /// key of the row before it, both rows having a pivot. The first row of
+    /// the range starts a run. One typed pass per key column, rather than a
+    /// type dispatch per row.
+    void mark_runs(std::size_t begin, std::size_t end, const std::uint32_t* pvi,
+                   const std::uint64_t* hashes, std::uint8_t* continues) const {
+        if (begin == end) {
+            return;
+        }
+        continues[begin] = false;
+        for (std::size_t r = begin + 1; r < end; ++r) {
+            continues[r] = pvi[r] != kDcastNoPivot && pvi[r - 1] != kDcastNoPivot &&
+                           hashes[r] == hashes[r - 1];
+        }
+        for (const auto* entry : columns) {
+            const bool nullable = entry->validity.has_value();
+            std::visit(
+                [&](const auto& c) {
+                    using T = std::decay_t<decltype(c)>;
+                    for (std::size_t r = begin + 1; r < end; ++r) {
+                        if (!continues[r]) {
+                            continue;
+                        }
+                        if (nullable) {
+                            const bool now_null = is_null(*entry, r);
+                            const bool prev_null = is_null(*entry, r - 1);
+                            if (now_null || prev_null) {
+                                continues[r] = now_null == prev_null;
+                                continue;
+                            }
+                        }
+                        if constexpr (std::is_same_v<T, Column<Categorical>>) {
+                            continues[r] = c.code_at(r) == c.code_at(r - 1);
+                        } else if constexpr (std::is_same_v<T, Column<double>>) {
+                            continues[r] = double_bits(c[r]) == double_bits(c[r - 1]);
+                        } else {
+                            continues[r] = c[r] == c[r - 1];
+                        }
+                    }
+                },
+                *entry->column);
+        }
+    }
+
+    /// Fold key column `k` of rows [begin, end) into `hashes`. The first
+    /// column seeds the hash; every column mixes its value in the same way.
+    void hash_rows(std::size_t k, std::size_t begin, std::size_t end, const std::uint32_t* pvi,
+                   std::uint64_t* hashes) const {
+        constexpr std::uint64_t kNullValue = 0x9e3779b97f4a7c15ULL;
+        const ColumnEntry& entry = *columns[k];
+        const auto mix = [](std::uint64_t h, std::uint64_t v) -> std::uint64_t {
+            h ^= v;
             h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ULL;
             h = (h ^ (h >> 27)) * 0x94d049bb133111ebULL;
-            h ^= h >> 31;
-        }
-        return static_cast<std::size_t>(h);
+            return h ^ (h >> 31);
+        };
+        std::visit(
+            [&](const auto& c) {
+                using T = std::decay_t<decltype(c)>;
+                const auto value_hash = [&c](std::size_t r) -> std::uint64_t {
+                    if constexpr (std::is_same_v<T, Column<Categorical>>) {
+                        return static_cast<std::uint64_t>(c.code_at(r));
+                    } else if constexpr (std::is_same_v<T, Column<std::string>>) {
+                        const std::string_view sv = c[r];
+                        return robin_hood::hash_bytes(sv.data(), sv.size());
+                    } else if constexpr (std::is_same_v<T, Column<double>>) {
+                        return double_bits(c[r]);
+                    } else if constexpr (std::is_same_v<T, Column<bool>>) {
+                        return c[r] ? 1U : 0U;
+                    } else if constexpr (std::is_same_v<T, Column<Date>>) {
+                        return static_cast<std::uint64_t>(c[r].days);
+                    } else if constexpr (std::is_same_v<T, Column<Timestamp>>) {
+                        return static_cast<std::uint64_t>(c[r].nanos);
+                    } else if constexpr (std::is_same_v<T, Column<Decimal>>) {
+                        const Decimal value = c[r];
+                        return robin_hood::hash_bytes(&value.units, sizeof(value.units));
+                    } else {
+                        return static_cast<std::uint64_t>(c[r]);
+                    }
+                };
+                const bool nullable = entry.validity.has_value();
+                for (std::size_t r = begin; r < end; ++r) {
+                    if (pvi[r] == kDcastNoPivot) {
+                        continue;
+                    }
+                    const std::uint64_t v =
+                        nullable && is_null(entry, r) ? kNullValue : value_hash(r);
+                    hashes[r] = mix(k == 0 ? 0 : hashes[r], v);
+                }
+            },
+            *entry.column);
     }
 };
+
+/// Run `body(i)` for every `i` in `[0, count)` on up to `workers` threads,
+/// or inline, in order, when `workers` is 1.
+template <typename Body>
+void for_dcast_tasks(std::size_t workers, std::size_t count, const Body& body) {
+    if (workers < 2 || count < 2) {
+        for (std::size_t i = 0; i < count; ++i) {
+            body(i);
+        }
+        return;
+    }
+    std::atomic<std::size_t> cursor{0};
+    auto batch = process_worker_pool().submit(std::min(workers, count), [&](std::size_t) {
+        for (std::size_t i = cursor.fetch_add(1, std::memory_order_relaxed); i < count;
+             i = cursor.fetch_add(1, std::memory_order_relaxed)) {
+            body(i);
+        }
+    });
+    batch.wait();
+}
+
+/// Run `body(range, begin, end)` over `ranges` equal slices of `[0, n)`,
+/// aligned to 64 rows. A caller that keeps one result per slice and reads them
+/// in slice order sees the rows in input order.
+template <typename Body>
+void for_dcast_ranges(std::size_t workers, std::size_t n, std::size_t ranges, const Body& body) {
+    constexpr std::size_t kAlign = 64;
+    const std::size_t grain =
+        std::max<std::size_t>(kAlign, (((n + ranges - 1) / ranges) + kAlign - 1) / kAlign * kAlign);
+    for_dcast_tasks(workers, ranges, [&](std::size_t range) {
+        const std::size_t begin = std::min(n, range * grain);
+        body(range, begin, std::min(n, begin + grain));
+    });
+}
+
+/// True when `validity` marks at least one row null.
+[[nodiscard]] auto validity_has_null(ValidityBitmap& validity) -> bool {
+    const std::size_t bits = validity.size();
+    const auto* words = validity.words_data();
+    for (std::size_t w = 0; w < bits / 64; ++w) {
+        if (words[w] != ~std::uint64_t{0}) {
+            return true;
+        }
+    }
+    const std::size_t tail = bits % 64;
+    return tail != 0 && (words[bits / 64] | (~std::uint64_t{0} << tail)) != ~std::uint64_t{0};
+}
 
 }  // namespace
 
@@ -1165,9 +1314,8 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
 }
 
 auto dcast_table(const Table& input, const std::string& pivot_column,
-                 const std::string& value_column, const std::vector<std::string>& row_keys)
-    -> std::expected<Table, std::string> {
-    constexpr std::size_t kMissingPivot = std::numeric_limits<std::size_t>::max();
+                 const std::string& value_column, const std::vector<std::string>& row_keys,
+                 const ExecutionContext* exec) -> std::expected<Table, std::string> {
     constexpr std::size_t kMissingCell = std::numeric_limits<std::size_t>::max();
 
     auto pivot_it = input.index.find(pivot_column);
@@ -1180,75 +1328,141 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
         return std::unexpected("dcast: value column not found: " + value_column +
                                " (available: " + format_columns(input) + ")");
     }
-    std::vector<std::size_t> key_indices;
-    key_indices.reserve(row_keys.size());
+    DcastRowKey key;
+    key.columns.reserve(row_keys.size());
     for (const auto& name : row_keys) {
         auto it = input.index.find(name);
         if (it == input.index.end()) {
             return std::unexpected("dcast: row key column not found: " + name +
                                    " (available: " + format_columns(input) + ")");
         }
-        key_indices.push_back(it->second);
+        key.columns.push_back(&input.columns[it->second]);
     }
 
-    std::size_t pivot_idx = pivot_it->second;
-    const std::size_t value_idx = value_it->second;
+    const ColumnEntry& pivot_entry = input.columns[pivot_it->second];
+    const ColumnEntry& value_entry = input.columns[value_it->second];
+    const auto& pivot_col = *pivot_entry.column;
     const std::size_t rows = input.rows();
 
+    // Every pass below is a row-range or partition fan-out whose results are
+    // read back in input order, so the answer does not depend on `workers`.
+    std::size_t workers = 1;
+    if (exec != nullptr && exec->can_fan_out() && rows >= exec->parallel_min_rows &&
+        !on_worker_pool_thread()) {
+        workers = std::min(exec->compute_budget(), process_worker_pool().size());
+    }
+    const std::size_t ranges = workers < 2 ? 1 : workers * 4;
+
+    // ── Pivot values, in order of first appearance, and each row's pivot ──────
+    // Each range lists the values it sees first, in order; reading the lists in
+    // range order and keeping each value's first sighting gives the global
+    // first-appearance order.
     std::vector<std::string> pivot_values;
-    const auto& pivot_col = *input.columns[pivot_idx].column;
-
-    std::vector<std::size_t> cat_code_to_pvi;
-    robin_hood::unordered_flat_map<std::int64_t, std::size_t> int_pvi_map;
-    robin_hood::unordered_flat_map<std::string, std::size_t, StringViewHash, StringViewEq>
-        str_pvi_map;
-
+    std::vector<std::uint32_t> pvi(rows, kDcastNoPivot);
     if (const auto* cat_col = std::get_if<Column<Categorical>>(&pivot_col)) {
         const auto& dict = cat_col->dictionary();
-        cat_code_to_pvi.assign(dict.size(), kMissingPivot);
-        for (std::size_t r = 0; r < rows; ++r) {
-            if (is_null(input.columns[pivot_idx], r)) {
-                continue;
+        const auto code_of = [&](std::size_t r) -> std::size_t {
+            if (is_null(pivot_entry, r)) {
+                return dict.size();
             }
             const auto code = cat_col->code_at(r);
-            if (code < 0) {
-                continue;
-            }
-            const auto ci = static_cast<std::size_t>(code);
-            if (ci >= dict.size()) {
-                continue;
-            }
-            if (cat_code_to_pvi[ci] == kMissingPivot) {
-                cat_code_to_pvi[ci] = pivot_values.size();
-                pivot_values.push_back(dict[ci]);
+            return code < 0 ? dict.size() : std::min(static_cast<std::size_t>(code), dict.size());
+        };
+        std::vector<std::vector<std::size_t>> seen(ranges);
+        for_dcast_ranges(workers, rows, ranges,
+                         [&](std::size_t range, std::size_t begin, std::size_t end) {
+                             std::vector<bool> local(dict.size(), false);
+                             for (std::size_t r = begin; r < end; ++r) {
+                                 const std::size_t ci = code_of(r);
+                                 if (ci < dict.size() && !local[ci]) {
+                                     local[ci] = true;
+                                     seen[range].push_back(ci);
+                                 }
+                             }
+                         });
+        std::vector<std::uint32_t> code_to_pvi(dict.size() + 1, kDcastNoPivot);
+        for (const auto& list : seen) {
+            for (const std::size_t ci : list) {
+                if (code_to_pvi[ci] == kDcastNoPivot) {
+                    code_to_pvi[ci] = static_cast<std::uint32_t>(pivot_values.size());
+                    pivot_values.push_back(dict[ci]);
+                }
             }
         }
+        for_dcast_ranges(workers, rows, ranges,
+                         [&](std::size_t, std::size_t begin, std::size_t end) {
+                             for (std::size_t r = begin; r < end; ++r) {
+                                 pvi[r] = code_to_pvi[code_of(r)];
+                             }
+                         });
     } else if (const auto* int_col = std::get_if<Column<std::int64_t>>(&pivot_col)) {
-        int_pvi_map.reserve(16);
-        for (std::size_t r = 0; r < rows; ++r) {
-            if (is_null(input.columns[pivot_idx], r)) {
-                continue;
-            }
-            const std::int64_t pv = (*int_col)[r];
-            auto [it, inserted] = int_pvi_map.try_emplace(pv, pivot_values.size());
-            if (inserted) {
-                pivot_values.push_back(std::to_string(pv));
+        std::vector<std::vector<std::int64_t>> seen(ranges);
+        for_dcast_ranges(
+            workers, rows, ranges, [&](std::size_t range, std::size_t begin, std::size_t end) {
+                robin_hood::unordered_flat_set<std::int64_t> local;
+                for (std::size_t r = begin; r < end; ++r) {
+                    if (!is_null(pivot_entry, r) && local.insert((*int_col)[r]).second) {
+                        seen[range].push_back((*int_col)[r]);
+                    }
+                }
+            });
+        robin_hood::unordered_flat_map<std::int64_t, std::uint32_t> to_pvi;
+        for (const auto& list : seen) {
+            for (const std::int64_t pv : list) {
+                if (to_pvi.try_emplace(pv, static_cast<std::uint32_t>(pivot_values.size()))
+                        .second) {
+                    pivot_values.push_back(std::to_string(pv));
+                }
             }
         }
+        for_dcast_ranges(workers, rows, ranges,
+                         [&](std::size_t, std::size_t begin, std::size_t end) {
+                             for (std::size_t r = begin; r < end; ++r) {
+                                 if (!is_null(pivot_entry, r)) {
+                                     pvi[r] = to_pvi.find((*int_col)[r])->second;
+                                 }
+                             }
+                         });
+    } else if (const auto* str_col = std::get_if<Column<std::string>>(&pivot_col)) {
+        std::vector<std::vector<std::string_view>> seen(ranges);
+        for_dcast_ranges(
+            workers, rows, ranges, [&](std::size_t range, std::size_t begin, std::size_t end) {
+                robin_hood::unordered_flat_set<std::string_view> local;
+                for (std::size_t r = begin; r < end; ++r) {
+                    if (!is_null(pivot_entry, r) && local.insert((*str_col)[r]).second) {
+                        seen[range].push_back((*str_col)[r]);
+                    }
+                }
+            });
+        robin_hood::unordered_flat_map<std::string_view, std::uint32_t> to_pvi;
+        for (const auto& list : seen) {
+            for (const std::string_view pv : list) {
+                if (to_pvi.try_emplace(pv, static_cast<std::uint32_t>(pivot_values.size()))
+                        .second) {
+                    pivot_values.emplace_back(pv);
+                }
+            }
+        }
+        for_dcast_ranges(workers, rows, ranges,
+                         [&](std::size_t, std::size_t begin, std::size_t end) {
+                             for (std::size_t r = begin; r < end; ++r) {
+                                 if (!is_null(pivot_entry, r)) {
+                                     pvi[r] = to_pvi.find((*str_col)[r])->second;
+                                 }
+                             }
+                         });
     } else {
-        str_pvi_map.reserve(16);
+        // Any other pivot type is keyed by its printed label, serially: no
+        // workload pivots on these at scale.
+        robin_hood::unordered_flat_map<std::string, std::uint32_t> to_pvi;
         for (std::size_t r = 0; r < rows; ++r) {
-            if (is_null(input.columns[pivot_idx], r)) {
+            if (is_null(pivot_entry, r)) {
                 continue;
             }
-            std::string pv = std::visit(
+            std::string label = std::visit(
                 [r](const auto& col) -> std::string {
                     using ColType = std::decay_t<decltype(col)>;
-                    if constexpr (std::is_same_v<ColType, Column<std::string>> ||
-                                  std::is_same_v<ColType, Column<Categorical>>) {
-                        return std::string(col[r]);
-                    } else if constexpr (std::is_same_v<ColType, Column<std::int64_t>> ||
-                                         std::is_same_v<ColType, Column<double>>) {
+                    if constexpr (std::is_same_v<ColType, Column<double>>) {
                         return std::to_string(col[r]);
                     } else if constexpr (std::is_same_v<ColType, Column<bool>>) {
                         return col[r] ? "true" : "false";
@@ -1257,305 +1471,266 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
                     }
                 },
                 pivot_col);
-            auto [it, inserted] = str_pvi_map.try_emplace(std::move(pv), pivot_values.size());
+            auto [it, inserted] = to_pvi.try_emplace(
+                std::move(label), static_cast<std::uint32_t>(pivot_values.size()));
             if (inserted) {
                 pivot_values.push_back(it->first);
             }
+            pvi[r] = it->second;
         }
     }
 
     if (pivot_values.empty()) {
         Table output;
-        for (const std::size_t ki : key_indices) {
-            const auto& entry = input.columns[ki];
-            output.add_column(entry.name, *entry.column);
-            if (entry.validity.has_value()) {
-                output.columns.back().validity = entry.validity;
+        for (const auto* entry : key.columns) {
+            output.add_column(entry->name, *entry->column);
+            if (entry->validity.has_value()) {
+                output.columns.back().validity = entry->validity;
             }
         }
         return output;
     }
-
     const std::size_t n_pivots = pivot_values.size();
 
-    const std::size_t n_keys = key_indices.size();
-    std::vector<std::vector<std::int32_t>> str_intern(n_keys);
+    // ── Row-key hashes and runs ────────────────────────────────────────────────
+    // Long input usually repeats a row key for each of its pivots in a row (melt
+    // writes it that way), so a row with the same key as the row before it
+    // continues that row's run. Runs are found here, in one sequential pass,
+    // and every later step handles a run as one unit.
+    detail::NoInitVector<std::uint64_t> hashes;
+    hashes.resize(rows);
+    detail::NoInitVector<std::uint8_t> continues;
+    continues.resize(rows);
+    for_dcast_ranges(workers, rows, ranges, [&](std::size_t, std::size_t begin, std::size_t end) {
+        if (key.columns.empty()) {
+            std::fill(hashes.data() + begin, hashes.data() + end, std::uint64_t{0});
+        }
+        for (std::size_t k = 0; k < key.columns.size(); ++k) {
+            key.hash_rows(k, begin, end, pvi.data(), hashes.data());
+        }
+        key.mark_runs(begin, end, pvi.data(), hashes.data(), continues.data());
+    });
+    const auto is_run_start = [&](std::size_t r) {
+        return pvi[r] != kDcastNoPivot && !continues[r];
+    };
 
-    for (std::size_t k = 0; k < n_keys; ++k) {
-        const std::size_t ki = key_indices[k];
-        const auto* str_col = std::get_if<Column<std::string>>(input.columns[ki].column.get());
-        if (str_col == nullptr) {
-            continue;
-        }
-        auto& codes = str_intern[k];
-        codes.reserve(rows);
-        robin_hood::unordered_flat_map<std::string_view, std::int32_t, StringViewHash, StringViewEq>
-            sv_to_code;
-        sv_to_code.reserve((rows / n_pivots) + 1);
-        // Run-length shortcut: id columns are typically clustered (melt emits
-        // long runs of the same id), so reuse the previous row's code when the
-        // value repeats instead of hashing/probing the map every row.
-        std::string_view prev_sv;
-        std::int32_t prev_code = -1;
-        bool have_prev = false;
-        for (std::size_t r = 0; r < rows; ++r) {
-            if (is_null(input.columns[ki], r)) {
-                codes.push_back(-1);
-                have_prev = false;
-                continue;
+    // ── Partition the runs by hash ─────────────────────────────────────────────
+    // A row key lives in exactly one partition, and each partition holds its
+    // runs in input order, so a partition sees every key's first row first and
+    // its last row last: the same first-appearance and last-wins answer as one
+    // pass over the whole input. Small inputs keep one partition and skip the
+    // scatter.
+    const bool partitioned = workers > 1 && rows <= std::numeric_limits<std::uint32_t>::max();
+    const std::size_t part_bits =
+        partitioned
+            ? std::min<std::size_t>(8, static_cast<std::size_t>(std::bit_width((workers * 8) - 1)))
+            : 0;
+    const std::size_t parts = std::size_t{1} << part_bits;
+    detail::NoInitVector<std::uint32_t> order;
+    std::vector<std::size_t> part_begin(parts + 1, 0);
+    if (partitioned) {
+        const auto part_of = [&](std::size_t r) -> std::size_t {
+            return static_cast<std::size_t>(hashes[r] >> (64 - part_bits));
+        };
+        std::vector<std::size_t> offsets(ranges * parts, 0);
+        for_dcast_ranges(workers, rows, ranges,
+                         [&](std::size_t range, std::size_t begin, std::size_t end) {
+                             std::size_t* counts = offsets.data() + (range * parts);
+                             for (std::size_t r = begin; r < end; ++r) {
+                                 if (is_run_start(r)) {
+                                     ++counts[part_of(r)];
+                                 }
+                             }
+                         });
+        std::size_t running = 0;
+        for (std::size_t p = 0; p < parts; ++p) {
+            part_begin[p] = running;
+            for (std::size_t range = 0; range < ranges; ++range) {
+                const std::size_t count = offsets[(range * parts) + p];
+                offsets[(range * parts) + p] = running;
+                running += count;
             }
-            const std::string_view sv = (*str_col)[r];
-            if (have_prev && sv == prev_sv) {
-                codes.push_back(prev_code);
-                continue;
-            }
-            auto [it, inserted] =
-                sv_to_code.try_emplace(sv, static_cast<std::int32_t>(sv_to_code.size()));
-            (void)inserted;
-            prev_sv = sv;
-            prev_code = it->second;
-            have_prev = true;
-            codes.push_back(it->second);
         }
+        part_begin[parts] = running;
+        order.resize(running);
+        for_dcast_ranges(workers, rows, ranges,
+                         [&](std::size_t range, std::size_t begin, std::size_t end) {
+                             std::size_t* next = offsets.data() + (range * parts);
+                             for (std::size_t r = begin; r < end; ++r) {
+                                 if (is_run_start(r)) {
+                                     order[next[part_of(r)]++] = static_cast<std::uint32_t>(r);
+                                 }
+                             }
+                         });
     }
 
-    const std::size_t est_out_rows = (rows / n_pivots) + 1;
-
-    std::vector<std::size_t> first_input_row;
-    first_input_row.reserve(est_out_rows);
-    std::vector<std::size_t> cell_rows(est_out_rows * n_pivots, kMissingCell);
-
-    const auto key_is_null = [&](std::size_t k, std::size_t r) -> bool {
-        return is_null(input.columns[key_indices[k]], r);
+    // ── Group each partition ───────────────────────────────────────────────────
+    struct Part {
+        std::vector<std::size_t> first_rows;  ///< per group, its first input row
+        std::vector<std::size_t> cells;       ///< group x pivot -> last input row
+        std::vector<bool> missing;            ///< per pivot: some group lacks it
     };
-
-    // The row key's identity, as one 64-bit code per key column. Every encoding
-    // here must be INJECTIVE: two distinct key values that encode alike merge
-    // two output rows into one and silently drop a row's values. Null-ness
-    // travels separately, in the key's null mask.
-    const auto encode_key = [&](std::size_t k, std::size_t r) -> std::int64_t {
-        const std::size_t ki = key_indices[k];
-        if (key_is_null(k, r)) {
-            return 0;  // the value is not read; the mask carries the null
-        }
-        if (!str_intern[k].empty()) {
-            return str_intern[k][r];
-        }
-        return std::visit(
-            [r](const auto& c) -> std::int64_t {
-                using T = std::decay_t<decltype(c)>;
-                if constexpr (std::is_same_v<T, Column<Categorical>>) {
-                    return static_cast<std::int64_t>(c.code_at(r));
-                } else if constexpr (std::is_same_v<T, Column<std::int64_t>>) {
-                    return c[r];
-                } else if constexpr (std::is_same_v<T, Column<double>>) {
-                    // Truncating to an integer is not injective: 1.5 and 1.9
-                    // both became 1, merging two row keys and keeping only the
-                    // later row's cells. The bit pattern is exact. -0.0 is
-                    // folded onto 0.0 so the two group together, matching the
-                    // value equality every other key path uses.
-                    const double value = c[r] == 0.0 ? 0.0 : c[r];
-                    return std::bit_cast<std::int64_t>(value);
-                } else if constexpr (std::is_same_v<T, Column<bool>>) {
-                    return static_cast<std::int64_t>(c[r] ? 1 : 0);
-                } else if constexpr (std::is_same_v<T, Column<Date>>) {
-                    return static_cast<std::int64_t>(c[r].days);
-                } else if constexpr (std::is_same_v<T, Column<Timestamp>>) {
-                    return c[r].nanos;
-                } else {
-                    return 0;
-                }
-            },
-            *input.columns[ki].column);
+    struct RowHash {
+        const std::uint64_t* hashes;
+        auto operator()(std::size_t r) const noexcept -> std::size_t { return hashes[r]; }
     };
-
-    const auto resolve_pvi = [&](std::size_t r) -> std::size_t {
-        if (is_null(input.columns[pivot_idx], r)) {
-            return kMissingPivot;
-        }
-        if (!cat_code_to_pvi.empty()) {
-            const auto* cat_col = std::get_if<Column<Categorical>>(&pivot_col);
-            const auto code = cat_col->code_at(r);
-            if (code >= 0) {
-                const auto ci = static_cast<std::size_t>(code);
-                if (ci < cat_code_to_pvi.size()) {
-                    return cat_code_to_pvi[ci];
-                }
-            }
-            return kMissingPivot;
-        }
-        if (!int_pvi_map.empty()) {
-            const auto* int_col = std::get_if<Column<std::int64_t>>(&pivot_col);
-            auto it = int_pvi_map.find((*int_col)[r]);
-            return it != int_pvi_map.end() ? it->second : kMissingPivot;
-        }
-        if (const auto* str_col_ptr = std::get_if<Column<std::string>>(&pivot_col)) {
-            auto it = str_pvi_map.find((*str_col_ptr)[r]);
-            return it != str_pvi_map.end() ? it->second : kMissingPivot;
-        }
-        const std::string pv = std::visit(
-            [r](const auto& col) -> std::string {
-                using ColType = std::decay_t<decltype(col)>;
-                if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
-                    return std::string(col[r]);
-                } else if constexpr (std::is_same_v<ColType, Column<double>>) {
-                    return std::to_string(col[r]);
-                } else if constexpr (std::is_same_v<ColType, Column<bool>>) {
-                    return col[r] ? "true" : "false";
-                } else {
-                    return std::to_string(r);
-                }
-            },
-            pivot_col);
-        auto it = str_pvi_map.find(pv);
-        return it != str_pvi_map.end() ? it->second : kMissingPivot;
+    struct RowEq {
+        const DcastRowKey* key;
+        auto operator()(std::size_t a, std::size_t b) const -> bool { return key->equal(a, b); }
     };
-
-    if (n_keys <= DcastKey::kMaxCols) {
-        robin_hood::unordered_flat_map<DcastKey, std::size_t, DcastKeyHash> key_to_row;
-        key_to_row.reserve(est_out_rows);
-        DcastKey prev_key{};
-        prev_key.n = static_cast<std::uint8_t>(n_keys);
-        std::size_t prev_out_row = std::numeric_limits<std::size_t>::max();
-
-        for (std::size_t r = 0; r < rows; ++r) {
-            const std::size_t pvi = resolve_pvi(r);
-            if (pvi == kMissingPivot) {
-                continue;
+    std::vector<Part> part_out(parts);
+    for_dcast_tasks(workers, parts, [&](std::size_t p) {
+        Part& part = part_out[p];
+        // A partition's runs bound its groups; unpartitioned, a key per
+        // pivot's worth of rows is the usual shape of long input.
+        const std::size_t expected =
+            partitioned ? part_begin[p + 1] - part_begin[p] : (rows / n_pivots) + 1;
+        robin_hood::unordered_flat_map<std::size_t, std::size_t, RowHash, RowEq> groups(
+            0, RowHash{hashes.data()}, RowEq{&key});
+        groups.reserve(expected);
+        part.first_rows.reserve(expected);
+        part.cells.reserve(expected * n_pivots);
+        const auto add_run = [&](std::size_t start) {
+            auto [it, inserted] = groups.try_emplace(start, part.first_rows.size());
+            if (inserted) {
+                part.first_rows.push_back(start);
+                part.cells.resize(part.cells.size() + n_pivots, kMissingCell);
             }
-
-            DcastKey key{};
-            key.n = static_cast<std::uint8_t>(n_keys);
-            for (std::size_t k = 0; k < n_keys; ++k) {
-                key.v[k] = encode_key(k, r);
-                if (key_is_null(k, r)) {
-                    key.null_mask |= static_cast<std::uint8_t>(1U << k);
-                }
+            std::size_t* cells = part.cells.data() + (it->second * n_pivots);
+            std::size_t r = start;
+            do {
+                cells[pvi[r]] = r;
+                ++r;
+            } while (r < rows && continues[r]);
+        };
+        if (partitioned) {
+            for (std::size_t i = part_begin[p]; i < part_begin[p + 1]; ++i) {
+                add_run(order[i]);
             }
-
-            std::size_t out_row{};
-            if (key == prev_key && prev_out_row != std::numeric_limits<std::size_t>::max()) {
-                out_row = prev_out_row;
-            } else {
-                auto [it, inserted] = key_to_row.try_emplace(key, first_input_row.size());
-                if (inserted) {
-                    first_input_row.push_back(r);
-                    const std::size_t needed = first_input_row.size() * n_pivots;
-                    if (needed > cell_rows.size()) {
-                        cell_rows.resize(std::max(needed, cell_rows.size() * 2), kMissingCell);
-                    }
-                }
-                out_row = it->second;
-                prev_key = key;
-                prev_out_row = out_row;
-            }
-            cell_rows[(out_row * n_pivots) + pvi] = r;
-        }
-    } else {
-        // More key columns than DcastKey holds, so the key is a byte buffer.
-        // It carries the same two halves: one code per column, then one byte
-        // per column saying whether that column was null.
-        robin_hood::unordered_map<std::string, std::size_t> key_to_row_str;
-        key_to_row_str.reserve(est_out_rows);
-        const std::size_t key_bytes = n_keys * (sizeof(std::int64_t) + 1);
-        std::string prev_key_str(key_bytes, '\0');
-        std::size_t prev_out_row = std::numeric_limits<std::size_t>::max();
-
-        for (std::size_t r = 0; r < rows; ++r) {
-            const std::size_t pvi = resolve_pvi(r);
-            if (pvi == kMissingPivot) {
-                continue;
-            }
-
-            std::string key(key_bytes, '\0');
-            for (std::size_t k = 0; k < n_keys; ++k) {
-                std::int64_t v = encode_key(k, r);
-                std::memcpy(key.data() + (k * sizeof(std::int64_t)), &v, sizeof(v));
-                key[(n_keys * sizeof(std::int64_t)) + k] = key_is_null(k, r) ? '\1' : '\0';
-            }
-
-            std::size_t out_row{};
-            if (key == prev_key_str && prev_out_row != std::numeric_limits<std::size_t>::max()) {
-                out_row = prev_out_row;
-            } else {
-                auto [it, inserted] = key_to_row_str.try_emplace(key, first_input_row.size());
-                if (inserted) {
-                    first_input_row.push_back(r);
-                    const std::size_t needed = first_input_row.size() * n_pivots;
-                    if (needed > cell_rows.size()) {
-                        cell_rows.resize(std::max(needed, cell_rows.size() * 2), kMissingCell);
-                    }
-                }
-                out_row = it->second;
-                prev_key_str = std::move(key);
-                prev_out_row = out_row;
-            }
-            cell_rows[(out_row * n_pivots) + pvi] = r;
-        }
-    }
-
-    std::size_t out_rows = first_input_row.size();
-
-    Table output;
-
-    for (std::size_t k = 0; k < row_keys.size(); ++k) {
-        const std::size_t ki = key_indices[k];
-        const auto& entry = input.columns[ki];
-        auto col = make_empty_like(*entry.column);
-        std::visit([out_rows](auto& c) { c.reserve(out_rows); }, col);
-        // encode_key already gives a null row key its own group (kNullKey), so the
-        // rows come out right; the validity has to be carried across too, or the
-        // null row key would print as the type's zero value.
-        ValidityBitmap validity;
-        bool has_nulls = false;
-        if (entry.validity.has_value()) {
-            validity.assign(out_rows, true);
-        }
-        for (std::size_t or_idx = 0; or_idx < out_rows; ++or_idx) {
-            const std::size_t source_row = first_input_row[or_idx];
-            append_value(col, *entry.column, source_row);
-            if (entry.validity.has_value() && is_null(entry, source_row)) {
-                validity.set(or_idx, false);
-                has_nulls = true;
-            }
-        }
-        if (has_nulls) {
-            output.add_column(entry.name, std::move(col), std::move(validity));
         } else {
-            output.add_column(entry.name, std::move(col));
+            for (std::size_t r = 0; r < rows; ++r) {
+                if (is_run_start(r)) {
+                    add_run(r);
+                }
+            }
         }
-    }
+        part.missing.assign(n_pivots, false);
+        for (std::size_t c = 0; c < part.cells.size(); ++c) {
+            if (part.cells[c] == kMissingCell) {
+                part.missing[c % n_pivots] = true;
+            }
+        }
+    });
+    order = {};
 
-    const auto& value_entry = input.columns[value_idx];
+    // ── Number the groups in order of first appearance ─────────────────────────
+    // Each group's first row is tagged with the group's id; a scan over the
+    // rows in input order then meets the groups in output order, and writes
+    // the output's index arrays front to back.
+    constexpr std::uint32_t kNotFirst = std::numeric_limits<std::uint32_t>::max();
+    std::vector<std::size_t> part_base(parts + 1, 0);
+    for (std::size_t p = 0; p < parts; ++p) {
+        part_base[p + 1] = part_base[p] + part_out[p].first_rows.size();
+    }
+    const std::size_t out_rows = part_base[parts];
+    if (out_rows >= kNotFirst) {
+        return std::unexpected("dcast: more than 2^32 - 1 output rows");
+    }
+    detail::NoInitVector<std::uint32_t> group_at;
+    group_at.resize(rows);
+    for_dcast_ranges(workers, rows, ranges, [&](std::size_t, std::size_t begin, std::size_t end) {
+        std::fill(group_at.data() + begin, group_at.data() + end, kNotFirst);
+    });
+    for_dcast_tasks(workers, parts, [&](std::size_t p) {
+        const auto& first_rows = part_out[p].first_rows;
+        for (std::size_t g = 0; g < first_rows.size(); ++g) {
+            group_at[first_rows[g]] = static_cast<std::uint32_t>(part_base[p] + g);
+        }
+    });
+    std::vector<std::size_t> range_base(ranges + 1, 0);
+    for_dcast_ranges(workers, rows, ranges,
+                     [&](std::size_t range, std::size_t begin, std::size_t end) {
+                         range_base[range + 1] = static_cast<std::size_t>(
+                             std::ranges::count_if(group_at.data() + begin, group_at.data() + end,
+                                                   [](std::uint32_t g) { return g != kNotFirst; }));
+                     });
+    for (std::size_t range = 0; range < ranges; ++range) {
+        range_base[range + 1] += range_base[range];
+    }
+    // Every slot is written below, so none is zeroed first.
+    detail::NoInitVector<std::size_t> first_input_row;
+    first_input_row.resize(out_rows);
+    std::vector<detail::NoInitVector<std::size_t>> cell_idx(n_pivots);
     for (std::size_t pi = 0; pi < n_pivots; ++pi) {
-        auto col = make_empty_like(*value_entry.column);
-        std::visit([out_rows](auto& c) { c.reserve(out_rows); }, col);
-        ValidityBitmap validity(out_rows, false);
-        bool has_nulls = false;
-
-        for (std::size_t or_idx = 0; or_idx < out_rows; ++or_idx) {
-            const std::size_t cell_key = (or_idx * n_pivots) + pi;
-            const std::size_t input_row = cell_rows[cell_key];
-            if (input_row != kMissingCell) {
-                append_value(col, *value_entry.column, input_row);
-                const bool val_null = is_null(value_entry, input_row);
-                validity.set(or_idx, !val_null);
-                if (val_null) {
-                    has_nulls = true;
-                }
-            } else {
-                std::visit([](auto& c) { c.push_back({}); }, col);
-                has_nulls = true;
+        cell_idx[pi].resize(out_rows);
+    }
+    for_dcast_ranges(workers, rows, ranges,
+                     [&](std::size_t range, std::size_t begin, std::size_t end) {
+                         std::size_t out = range_base[range];
+                         for (std::size_t r = begin; r < end; ++r) {
+                             const std::uint32_t g = group_at[r];
+                             if (g == kNotFirst) {
+                                 continue;
+                             }
+                             const std::size_t p = static_cast<std::size_t>(
+                                 std::ranges::upper_bound(part_base, g) - part_base.begin() - 1);
+                             const std::size_t* cells =
+                                 part_out[p].cells.data() + ((g - part_base[p]) * n_pivots);
+                             first_input_row[out] = r;
+                             for (std::size_t pi = 0; pi < n_pivots; ++pi) {
+                                 cell_idx[pi][out] = cells[pi];
+                             }
+                             ++out;
+                         }
+                     });
+    std::vector<bool> missing(n_pivots, false);
+    for (const auto& part : part_out) {
+        for (std::size_t pi = 0; pi < n_pivots; ++pi) {
+            if (part.missing[pi]) {
+                missing[pi] = true;
             }
         }
+    }
+    part_out.clear();
+    group_at = {};
 
-        if (has_nulls) {
-            output.add_column(pivot_values[pi], std::move(col), std::move(validity));
+    // ── Gather the output ──────────────────────────────────────────────────────
+    std::vector<ColumnGatherJob> jobs;
+    std::vector<const ColumnEntry*> sources;
+    jobs.reserve(key.columns.size() + n_pivots);
+    sources.reserve(key.columns.size() + n_pivots);
+    const auto add_job = [&](const ColumnEntry& entry, const std::size_t* idx, bool sentinel) {
+        jobs.push_back({
+            .column = entry.column.get(),
+            .validity = entry.validity.has_value() ? &*entry.validity : nullptr,
+            .idx = idx,
+            .indivisible = sentinel,
+        });
+        sources.push_back(&entry);
+    };
+    for (const auto* entry : key.columns) {
+        add_job(*entry, first_input_row.data(), false);
+    }
+    for (std::size_t pi = 0; pi < n_pivots; ++pi) {
+        add_job(value_entry, cell_idx[pi].data(), missing[pi]);
+    }
+    auto gathered =
+        gather_columns_batched(jobs, out_rows, exec, [&](std::size_t j) -> GatheredColumn {
+            return gather_entry_with_nulls(*sources[j], jobs[j].idx, out_rows, kMissingCell);
+        });
+
+    // A column keeps a validity bitmap only when it has a null to carry.
+    Table output;
+    for (std::size_t j = 0; j < gathered.size(); ++j) {
+        const std::string& name =
+            j < key.columns.size() ? key.columns[j]->name : pivot_values[j - key.columns.size()];
+        auto& [column, validity] = gathered[j];
+        if (validity.has_value() && validity_has_null(*validity)) {
+            output.add_column(name, std::move(column), std::move(*validity));
         } else {
-            output.add_column(pivot_values[pi], std::move(col));
+            output.add_column(name, std::move(column));
         }
     }
-
     return output;
 }
 

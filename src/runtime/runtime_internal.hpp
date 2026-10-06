@@ -473,6 +473,26 @@ void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src,
 /// A gathered column and the validity bitmap that came with it.
 using GatheredColumn = std::pair<ColumnValue, std::optional<ValidityBitmap>>;
 
+/// Gather a whole column entry through `idx`, serially. A `kNull` index and a
+/// null source row both come out null, so the result carries the sentinel
+/// nulls and the source's own together.
+[[nodiscard]] inline auto gather_entry_with_nulls(const ColumnEntry& entry, const std::size_t* idx,
+                                                  std::size_t total, std::size_t kNull)
+    -> GatheredColumn {
+    auto [column, validity] = gather_column_with_nulls(*entry.column, idx, total, kNull, nullptr);
+    if (!entry.validity.has_value()) {
+        return {std::move(column), std::move(validity)};
+    }
+    ValidityBitmap bitmap =
+        validity.has_value() ? std::move(*validity) : ValidityBitmap(total, true);
+    for (std::size_t i = 0; i < total; ++i) {
+        if (idx[i] != kNull && !(*entry.validity)[idx[i]]) {
+            bitmap.set(i, false);
+        }
+    }
+    return {std::move(column), std::move(bitmap)};
+}
+
 /// One column in a multi-column gather.
 struct ColumnGatherJob {
     const ColumnValue* column = nullptr;

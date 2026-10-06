@@ -567,7 +567,8 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
             if (!child) {
                 return std::unexpected(child.error());
             }
-            return dcast_table(child.value(), dn.pivot_column(), dn.value_column(), dn.row_keys());
+            return dcast_table(child.value(), dn.pivot_column(), dn.value_column(), dn.row_keys(),
+                               &exec);
         }
         case ir::NodeKind::Cov: {
             if (node.children().empty()) {

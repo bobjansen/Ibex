@@ -11190,6 +11190,159 @@ TEST_CASE("dcast: value column not found returns error", "[dcast]") {
     REQUIRE(result.error().find("value column not found") != std::string::npos);
 }
 
+namespace {
+
+/// A context that fans dcast out over four workers however small the input.
+auto dcast_parallel_exec() -> runtime::ExecutionContext {
+    runtime::ExecutionContext exec;
+    exec.parallel_threads = 4;
+    exec.parallel_min_rows = 0;
+    return exec;
+}
+
+}  // namespace
+
+TEST_CASE("dcast: a parallel run keeps first-appearance order and the last value",
+          "[dcast][parallel]") {
+    // Row keys first appear in the order 2, 1, 3, null; pivots in the order
+    // x, y. Key 2 sets x twice and key 1 sets y twice (the second time to
+    // null): the later row wins both times. Key 3 has no y. Key 4's only row
+    // has a null pivot, so it adds no output row.
+    runtime::TableRegistry registry;
+    runtime::Table lng;
+    runtime::ValidityBitmap k_valid(11, true);
+    k_valid.set(6, false);
+    k_valid.set(9, false);
+    runtime::ValidityBitmap p_valid(11, true);
+    p_valid.set(7, false);
+    p_valid.set(8, false);
+    runtime::ValidityBitmap v_valid(11, true);
+    v_valid.set(10, false);
+    lng.add_column("k", Column<std::int64_t>{2, 1, 2, 3, 1, 2, 0, 3, 4, 0, 1}, std::move(k_valid));
+    lng.add_column("p", Column<std::string>{"x", "y", "y", "x", "x", "x", "y", "", "", "x", "y"},
+                   std::move(p_valid));
+    lng.add_column("v", Column<std::int64_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11},
+                   std::move(v_valid));
+    registry["lng"] = std::move(lng);
+
+    auto ir = require_ir("lng[dcast p, select v, by { k }];");
+    auto result =
+        runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, dcast_parallel_exec());
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 4);
+    REQUIRE(result->columns.size() == 3);
+    CHECK(result->columns[1].name == "x");
+    CHECK(result->columns[2].name == "y");
+
+    const auto* k = result->find_entry("k");
+    const auto* x = result->find_entry("x");
+    const auto* y = result->find_entry("y");
+    REQUIRE(k != nullptr);
+    REQUIRE(x != nullptr);
+    REQUIRE(y != nullptr);
+    const auto& k_col = std::get<Column<std::int64_t>>(*k->column);
+    CHECK(k_col[0] == 2);
+    CHECK(k_col[1] == 1);
+    CHECK(k_col[2] == 3);
+    CHECK(runtime::is_null(*k, 3));
+    CHECK_FALSE(runtime::is_null(*k, 0));
+
+    const auto& x_col = std::get<Column<std::int64_t>>(*x->column);
+    CHECK(x_col[0] == 6);
+    CHECK(x_col[1] == 5);
+    CHECK(x_col[2] == 4);
+    CHECK(x_col[3] == 10);
+    CHECK_FALSE(x->validity.has_value());
+
+    const auto& y_col = std::get<Column<std::int64_t>>(*y->column);
+    CHECK(y_col[0] == 3);
+    CHECK(runtime::is_null(*y, 1));
+    CHECK(runtime::is_null(*y, 2));
+    CHECK(y_col[3] == 7);
+    CHECK_FALSE(runtime::is_null(*y, 3));
+}
+
+TEST_CASE("dcast: a parallel run gives the serial answer on broken runs and odd keys",
+          "[dcast][parallel]") {
+    // Long input whose row keys come in runs that are broken up and resumed
+    // later, with null row keys, -0.0 beside 0.0, duplicate cells, missing
+    // cells, null pivots and null values. One worker and four must agree on
+    // every row, cell and null.
+    constexpr std::size_t kKeys = 1500;
+    const std::array<std::string_view, 3> pivots{"a", "b", "c"};
+    std::vector<std::size_t> key_of;
+    std::vector<std::size_t> pivot_of;
+    for (std::size_t key = 0; key < kKeys; ++key) {
+        for (std::size_t pi = 0; pi < pivots.size(); ++pi) {
+            if (key % 11 == 0 && pi == 2) {
+                continue;  // missing cell
+            }
+            key_of.push_back(key);
+            pivot_of.push_back(pi);
+            if (key % 13 == 0) {
+                key_of.push_back(key);  // duplicate cell, a later row
+                pivot_of.push_back(pi);
+            }
+        }
+    }
+    // Reverse every other block of seven rows: runs break and resume.
+    for (std::size_t begin = 0; begin + 7 <= key_of.size(); begin += 14) {
+        std::reverse(key_of.begin() + static_cast<std::ptrdiff_t>(begin),
+                     key_of.begin() + static_cast<std::ptrdiff_t>(begin + 7));
+        std::reverse(pivot_of.begin() + static_cast<std::ptrdiff_t>(begin),
+                     pivot_of.begin() + static_cast<std::ptrdiff_t>(begin + 7));
+    }
+
+    const std::size_t rows = key_of.size();
+    Column<std::string> sym;
+    Column<double> day;
+    Column<std::string> pivot;
+    Column<std::int64_t> value;
+    runtime::ValidityBitmap sym_valid(rows, true);
+    runtime::ValidityBitmap pivot_valid(rows, true);
+    runtime::ValidityBitmap value_valid(rows, true);
+    for (std::size_t r = 0; r < rows; ++r) {
+        const std::size_t key = key_of[r];
+        sym.push_back("S" + std::to_string(key % 300));
+        if (key % 97 == 0) {
+            sym_valid.set(r, false);
+        }
+        // Keys below 300 differ only in sign of zero on alternate rows.
+        const double d = static_cast<double>(key / 300);
+        day.push_back(d == 0.0 && r % 2 == 0 ? -0.0 : d);
+        pivot.push_back(std::string(pivots[pivot_of[r]]));
+        if (r % 101 == 0) {
+            pivot_valid.set(r, false);
+        }
+        value.push_back(static_cast<std::int64_t>(r));
+        if (r % 37 == 0) {
+            value_valid.set(r, false);
+        }
+    }
+    runtime::TableRegistry registry;
+    runtime::Table lng;
+    lng.add_column("sym", std::move(sym), std::move(sym_valid));
+    lng.add_column("day", std::move(day));
+    lng.add_column("pivot", std::move(pivot), std::move(pivot_valid));
+    lng.add_column("value", std::move(value), std::move(value_valid));
+    registry["lng"] = std::move(lng);
+
+    auto ir = require_ir("lng[dcast pivot, select value, by { sym, day }];");
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    auto one = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+    REQUIRE(one.has_value());
+    auto four = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, dcast_parallel_exec());
+    REQUIRE(four.has_value());
+    // The table has kKeys distinct (sym, day) keys plus the null-sym groups;
+    // anything far below that means keys were merged.
+    CHECK(one->rows() > kKeys / 2);
+    auto mismatch = runtime::compare_tables(*one, *four);
+    if (mismatch.has_value()) {
+        FAIL(mismatch->message());
+    }
+}
+
 // --- ExternCall node ---------------------------------------------------------
 
 // Helper: extern fn declaration so the lowerer recognises the function.

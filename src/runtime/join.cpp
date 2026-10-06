@@ -292,18 +292,7 @@ auto find_candidate_time_column(const Table& side) -> std::optional<std::string>
 /// per-column fan-out this batching exists to remove.
 auto gather_entry(const ColumnEntry& entry, const std::size_t* idx, std::size_t total)
     -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
-    auto [column, validity] = gather_column_with_nulls(*entry.column, idx, total, kNull, nullptr);
-    if (!entry.validity.has_value()) {
-        return {std::move(column), std::move(validity)};
-    }
-    ValidityBitmap bitmap =
-        validity.has_value() ? std::move(*validity) : ValidityBitmap(total, true);
-    for (std::size_t i = 0; i < total; ++i) {
-        if (idx[i] != kNull && !(*entry.validity)[idx[i]]) {
-            bitmap.set(i, false);
-        }
-    }
-    return {std::move(column), std::move(bitmap)};
+    return gather_entry_with_nulls(entry, idx, total, kNull);
 }
 
 /// True when `idx` holds at least one `kNull`, i.e. an output row with no

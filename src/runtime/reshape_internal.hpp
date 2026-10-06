@@ -34,7 +34,7 @@ namespace ibex::runtime {
     -> std::expected<Table, std::string>;
 [[nodiscard]] auto dcast_table(const Table& input, const std::string& pivot_column,
                                const std::string& value_column,
-                               const std::vector<std::string>& row_keys)
-    -> std::expected<Table, std::string>;
+                               const std::vector<std::string>& row_keys,
+                               const ExecutionContext* exec) -> std::expected<Table, std::string>;
 
 }  // namespace ibex::runtime

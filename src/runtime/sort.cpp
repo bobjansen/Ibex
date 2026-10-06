@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -59,8 +60,8 @@ namespace {
 
 template <typename Idx>
 
-void radix_sort_by_key(std::vector<std::uint64_t> src_keys, std::vector<Idx>& idx,
-                       std::size_t rows) {
+void radix_sort_by_key_serial(std::vector<std::uint64_t> src_keys, std::vector<Idx>& idx,
+                              std::size_t rows) {
     // Build all 8 byte-histograms in one sequential scan.
     std::array<std::array<std::size_t, 256>, 8> hists{};
     for (std::size_t i = 0; i < rows; ++i) {
@@ -120,16 +121,282 @@ void radix_sort_by_key(std::vector<std::uint64_t> src_keys, std::vector<Idx>& id
         idx = std::move(*src_i);
 }
 
+/// Below this many rows the MSD split's 65536-bucket histogram costs more
+/// than the LSD passes it saves.
+constexpr std::size_t kParallelRadixMinRows = std::size_t{1} << 16;
+
+/// Run `body(t, begin, end)` over `workers` fixed, contiguous chunks of
+/// `[0, rows)`, chunk `t` on worker `t`; inline when `workers` is 1. A radix
+/// pass needs the same chunks when it counts as when it scatters, which a
+/// dynamically handed-out range cannot promise.
+template <typename Body>
+void for_sort_chunks(std::size_t workers, std::size_t rows, const Body& body) {
+    if (workers < 2) {
+        body(std::size_t{0}, std::size_t{0}, rows);
+        return;
+    }
+    auto batch = process_worker_pool().submit(
+        workers, [&](std::size_t t) { body(t, rows * t / workers, rows * (t + 1) / workers); });
+    batch.wait();
+}
+
+/// `idx[i] = i` for every row, across `workers`.
+template <typename Idx>
+void fill_identity(std::vector<Idx>& idx, std::size_t workers) {
+    for_sort_chunks(workers, idx.size(), [&](std::size_t, std::size_t begin, std::size_t end) {
+        // NOLINTNEXTLINE(modernize-use-ranges): Apple libc++ does not provide ranges::iota.
+        std::iota(idx.begin() + static_cast<std::ptrdiff_t>(begin),
+                  idx.begin() + static_cast<std::ptrdiff_t>(end), static_cast<Idx>(begin));
+    });
+}
+
+/// Stably sort one bucket of an MSD split, already in place in `keys`/`idx`,
+/// by its low `bits` key bits (the bits above are equal across the bucket).
+///
+/// A short bucket is insertion-sorted and a cache-sized one takes LSD byte
+/// passes, skipping the bytes it does not vary in. A larger one is split
+/// again on its top bits and each part sorted the same way, so no bucket is
+/// ever scattered whole more than once per level: a skewed key (a Float64's
+/// exponent puts most rows in a few top-level buckets) costs a level, not a
+/// pass over a large bucket per byte. The split is stable, so the sort is.
+template <typename Idx>
+void sort_msd_bucket(std::uint64_t* keys, Idx* idx, std::size_t n, unsigned bits,
+                     std::vector<std::uint64_t>& scratch_keys, std::vector<Idx>& scratch_idx) {
+    if (n < 2 || bits == 0) {
+        return;
+    }
+    constexpr std::size_t kInsertionMax = 32;
+    if (n <= kInsertionMax) {
+        for (std::size_t i = 1; i < n; ++i) {
+            const std::uint64_t k = keys[i];
+            const Idx v = idx[i];
+            std::size_t j = i;
+            while (j > 0 && keys[j - 1] > k) {
+                keys[j] = keys[j - 1];
+                idx[j] = idx[j - 1];
+                --j;
+            }
+            keys[j] = k;
+            idx[j] = v;
+        }
+        return;
+    }
+    scratch_keys.resize(std::max(scratch_keys.size(), n));
+    scratch_idx.resize(std::max(scratch_idx.size(), n));
+
+    constexpr std::size_t kLsdMax = std::size_t{1} << 12;
+    if (n > kLsdMax && bits > 8) {
+        constexpr unsigned kSplitBits = 8;
+        const unsigned rest = bits - kSplitBits;
+        std::array<std::size_t, 257> start{};
+        for (std::size_t i = 0; i < n; ++i) {
+            ++start[((keys[i] >> rest) & 0xFFU) + 1];
+        }
+        for (std::size_t d = 1; d <= 256; ++d) {
+            start[d] += start[d - 1];
+        }
+        std::array<std::size_t, 256> next;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+        std::copy_n(start.begin(), 256, next.begin());
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::size_t at = next[(keys[i] >> rest) & 0xFFU]++;
+            scratch_keys[at] = keys[i];
+            scratch_idx[at] = idx[i];
+        }
+        std::copy_n(scratch_keys.data(), n, keys);
+        std::copy_n(scratch_idx.data(), n, idx);
+        for (std::size_t d = 0; d < 256; ++d) {
+            sort_msd_bucket(keys + start[d], idx + start[d], start[d + 1] - start[d], rest,
+                            scratch_keys, scratch_idx);
+        }
+        return;
+    }
+
+    const unsigned passes = (bits + 7U) / 8U;
+    std::array<std::array<std::size_t, 256>, 8> hists{};
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto k = keys[i];
+        for (unsigned p = 0; p < passes; ++p) {
+            ++hists[p][(k >> (p * 8U)) & 0xFFU];
+        }
+    }
+    std::uint64_t* src_k = keys;
+    std::uint64_t* dst_k = scratch_keys.data();
+    Idx* src_i = idx;
+    Idx* dst_i = scratch_idx.data();
+    std::array<std::size_t, 256> cnt;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    for (unsigned pass = 0; pass < passes; ++pass) {
+        const auto& h = hists[pass];
+        std::size_t non_zero = 0;
+        for (const auto c : h) {
+            non_zero += c != 0 ? 1U : 0U;
+        }
+        if (non_zero <= 1) {
+            continue;
+        }
+        const auto shift = pass * 8U;
+        std::size_t total = 0;
+        for (std::size_t b = 0; b < 256; ++b) {
+            cnt[b] = total;
+            total += h[b];
+        }
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::size_t bucket = (src_k[i] >> shift) & 0xFFU;
+            dst_k[cnt[bucket]] = src_k[i];
+            dst_i[cnt[bucket]] = src_i[i];
+            ++cnt[bucket];
+        }
+        std::swap(src_k, dst_k);
+        std::swap(src_i, dst_i);
+    }
+    if (src_i != idx) {
+        std::copy_n(src_i, n, idx);
+        std::copy_n(src_k, n, keys);
+    }
+}
+
+/// Stable radix sort of `idx` by `src_keys` that touches main memory about
+/// twice instead of once per varying key byte.
+///
+/// The LSD sort scatters the whole array once per byte, and on a random
+/// Float64 key all eight bytes vary: eight passes over memory, which is
+/// bandwidth, not cores, and so did not get faster with more workers. Here
+/// one scatter on the top 16 bits that vary splits the rows into up to 65536
+/// buckets, each small enough to sort in cache, and the buckets are then
+/// sorted independently.
+///
+/// The scatter is split into `workers` fixed, contiguous chunks: each chunk
+/// takes the slots of bucket `b` after every earlier chunk's, so equal digits
+/// keep their input order, and each bucket's sort is stable. A heavily skewed
+/// key (most rows in one bucket) still sorts correctly, with that bucket on a
+/// single worker.
+template <typename Idx>
+void radix_sort_by_key_msd(std::vector<std::uint64_t> src_keys, std::vector<Idx>& idx,
+                           std::size_t rows, std::size_t workers) {
+    constexpr unsigned kDigitBits = 16;
+    const auto run_chunks = [&](const auto& body) { for_sort_chunks(workers, rows, body); };
+
+    // The bits that vary: every bit above the highest one is shared by all rows.
+    std::vector<std::uint64_t> chunk_diff(workers, 0);
+    const std::uint64_t first = src_keys[0];
+    run_chunks([&](std::size_t t, std::size_t begin, std::size_t end) {
+        std::uint64_t diff = 0;
+        for (std::size_t i = begin; i < end; ++i) {
+            diff |= src_keys[i] ^ first;
+        }
+        chunk_diff[t] = diff;
+    });
+    std::uint64_t diff = 0;
+    for (const auto d : chunk_diff) {
+        diff |= d;
+    }
+    if (diff == 0) {
+        return;  // every key equal: the input order is the stable order
+    }
+    const auto varying = static_cast<unsigned>(std::bit_width(diff));
+    const unsigned digit_bits = std::min(kDigitBits, varying);
+    const unsigned low_bits = varying - digit_bits;
+    const std::uint64_t digit_mask = (std::uint64_t{1} << digit_bits) - 1;
+    const auto digit = [&](std::uint64_t k) {
+        return static_cast<std::size_t>((k >> low_bits) & digit_mask);
+    };
+    const std::size_t buckets = std::size_t{1} << digit_bits;
+
+    // Counts per chunk, then bucket-major, chunk-minor offsets.
+    std::vector<std::size_t> pos(workers * buckets, 0);
+    run_chunks([&](std::size_t t, std::size_t begin, std::size_t end) {
+        std::size_t* counts = pos.data() + (t * buckets);
+        for (std::size_t i = begin; i < end; ++i) {
+            ++counts[digit(src_keys[i])];
+        }
+    });
+    std::vector<std::size_t> bucket_begin(buckets + 1, 0);
+    std::size_t total = 0;
+    for (std::size_t b = 0; b < buckets; ++b) {
+        bucket_begin[b] = total;
+        for (std::size_t t = 0; t < workers; ++t) {
+            const std::size_t c = pos[(t * buckets) + b];
+            pos[(t * buckets) + b] = total;
+            total += c;
+        }
+    }
+    bucket_begin[buckets] = total;
+
+    ::ibex::detail::NoInitVector<std::uint64_t> keys;
+    keys.resize(rows);
+    ::ibex::detail::NoInitVector<Idx> out;
+    out.resize(rows);
+    run_chunks([&](std::size_t t, std::size_t begin, std::size_t end) {
+        std::size_t* next = pos.data() + (t * buckets);
+        for (std::size_t i = begin; i < end; ++i) {
+            const std::size_t at = next[digit(src_keys[i])]++;
+            keys[at] = src_keys[i];
+            out[at] = idx[i];
+        }
+    });
+    src_keys = {};
+
+    // Sort the buckets, in tasks of adjacent buckets holding about the same
+    // number of rows: a skewed key packs most rows into a few neighbouring
+    // buckets, and tasks of a fixed bucket count left one worker with them.
+    // Each worker keeps its scratch across its tasks.
+    const std::size_t task_rows = std::max<std::size_t>(1, rows / (workers * 16));
+    std::vector<std::size_t> task_begin{0};
+    for (std::size_t b = 0; b < buckets; ++b) {
+        if (bucket_begin[b + 1] - bucket_begin[task_begin.back()] >= task_rows) {
+            task_begin.push_back(b + 1);
+        }
+    }
+    if (task_begin.back() != buckets) {
+        task_begin.push_back(buckets);
+    }
+    const std::size_t tasks = task_begin.size() - 1;
+    std::atomic<std::size_t> cursor{0};
+    const auto sort_tasks = [&](std::size_t) {
+        std::vector<std::uint64_t> scratch_keys;
+        std::vector<Idx> scratch_idx;
+        for (std::size_t task = cursor.fetch_add(1, std::memory_order_relaxed); task < tasks;
+             task = cursor.fetch_add(1, std::memory_order_relaxed)) {
+            for (std::size_t b = task_begin[task]; b < task_begin[task + 1]; ++b) {
+                const std::size_t lo = bucket_begin[b];
+                sort_msd_bucket(keys.data() + lo, out.data() + lo, bucket_begin[b + 1] - lo,
+                                low_bits, scratch_keys, scratch_idx);
+            }
+        }
+    };
+    if (workers < 2) {
+        sort_tasks(0);
+    } else {
+        auto batch = process_worker_pool().submit(workers, sort_tasks);
+        batch.wait();
+    }
+    run_chunks([&](std::size_t, std::size_t begin, std::size_t end) {
+        std::copy(out.data() + begin, out.data() + end, idx.data() + begin);
+    });
+}
+
+/// Stable radix sort of `idx` by `src_keys`. A small input takes the plain
+/// LSD sort; a large one the cache-friendly MSD split, across `workers`.
+template <typename Idx>
+void radix_sort_by_key(std::vector<std::uint64_t> src_keys, std::vector<Idx>& idx, std::size_t rows,
+                       std::size_t workers) {
+    if (rows < kParallelRadixMinRows) {
+        radix_sort_by_key_serial(std::move(src_keys), idx, rows);
+        return;
+    }
+    radix_sort_by_key_msd(std::move(src_keys), idx, rows, std::max<std::size_t>(1, workers));
+}
+
 }  // namespace
 
 namespace {
 
 template <typename Idx>
 
-auto radix_sort_impl(std::vector<std::uint64_t> src_keys, std::size_t rows) -> std::vector<Idx> {
+auto radix_sort_impl(std::vector<std::uint64_t> src_keys, std::size_t rows, std::size_t workers)
+    -> std::vector<Idx> {
     std::vector<Idx> idx(rows);
-    std::iota(idx.begin(), idx.end(), Idx{0});
-    radix_sort_by_key(std::move(src_keys), idx, rows);
+    fill_identity(idx, workers);
+    radix_sort_by_key(std::move(src_keys), idx, rows, workers);
     return idx;
 }
 
@@ -227,10 +494,11 @@ void sort_key_index_slice(std::uint64_t* keys, std::size_t* idx, std::size_t n,
 
 // Dispatch to 32-bit indices for tables that fit, 64-bit otherwise.
 using SortIdx = std::variant<std::vector<std::uint32_t>, std::vector<std::uint64_t>>;
-auto radix_sort_u64_asc(std::vector<std::uint64_t> keys, std::size_t rows) -> SortIdx {
+auto radix_sort_u64_asc(std::vector<std::uint64_t> keys, std::size_t rows, std::size_t workers)
+    -> SortIdx {
     if (rows <= std::numeric_limits<std::uint32_t>::max())
-        return radix_sort_impl<std::uint32_t>(std::move(keys), rows);
-    return radix_sort_impl<std::uint64_t>(std::move(keys), rows);
+        return radix_sort_impl<std::uint32_t>(std::move(keys), rows, workers);
+    return radix_sort_impl<std::uint64_t>(std::move(keys), rows, workers);
 }
 
 // Stable multi-key sort by LSD radix: `codes[k]` holds one order-preserving u64
@@ -243,16 +511,18 @@ namespace {
 
 template <typename Idx>
 
-auto lsd_multi_radix(const std::vector<std::vector<std::uint64_t>>& codes, std::size_t rows)
-    -> std::vector<Idx> {
+auto lsd_multi_radix(const std::vector<std::vector<std::uint64_t>>& codes, std::size_t rows,
+                     const ExecutionContext& exec, std::size_t workers) -> std::vector<Idx> {
     std::vector<Idx> idx(rows);
-    std::iota(idx.begin(), idx.end(), Idx{0});
+    fill_identity(idx, workers);
     for (std::size_t k = codes.size(); k-- > 0;) {
         const auto& code = codes[k];
         std::vector<std::uint64_t> gathered(rows);
-        for (std::size_t i = 0; i < rows; ++i)
-            gathered[i] = code[static_cast<std::size_t>(idx[i])];  // Index is below rows.
-        radix_sort_by_key(std::move(gathered), idx, rows);
+        for_row_ranges(&exec, rows, [&](std::size_t begin, std::size_t end) {
+            for (std::size_t i = begin; i < end; ++i)
+                gathered[i] = code[static_cast<std::size_t>(idx[i])];  // Index is below rows.
+        });
+        radix_sort_by_key(std::move(gathered), idx, rows, workers);
     }
     return idx;
 }
@@ -473,6 +743,10 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
     // comparison is equivalent to signed comparison — this lets radix_sort_u64_asc
     // consume the vector directly without an extra copy.
     constexpr std::uint64_t kSignFlip = std::uint64_t{1} << 63;
+    // Workers for the radix passes; 1 means serial. Sized on rows, so the
+    // permutation, which is stable, cannot depend on it.
+    const std::size_t sort_workers =
+        std::max<std::size_t>(1, group_barrier_worker_count(exec, rows));
     enum class FlatKind : std::uint8_t { I64, F64, Str };
     struct FlatKey {
         FlatKind kind = FlatKind::I64;
@@ -697,7 +971,7 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
     // Fast path: single ascending I64 key — radix sort (pre-sorted case already handled above).
     if (!has_null_keys && flat_keys.size() == 1 && flat_keys[0].kind == FlatKind::I64 &&
         flat_keys[0].ascending) {
-        auto sort_result = radix_sort_u64_asc(std::move(flat_keys[0].u64), rows);
+        auto sort_result = radix_sort_u64_asc(std::move(flat_keys[0].u64), rows, sort_workers);
         return std::visit(
             [&]<typename Idx>(const std::vector<Idx>& idx) -> std::expected<Table, std::string> {
                 return gather_rows_parallel(input, idx, &resolved_keys, exec);
@@ -710,9 +984,11 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
     if (flat_keys.size() == 1 && flat_keys[0].kind == FlatKind::F64 && flat_keys[0].ascending) {
         std::vector<std::uint64_t> radix_keys(rows);
         const auto& f = flat_keys[0].f64;
-        for (std::size_t i = 0; i < rows; ++i)
-            radix_keys[i] = double_to_sortable_u64(f[i]);
-        auto sort_result = radix_sort_u64_asc(std::move(radix_keys), rows);
+        for_row_ranges(&exec, rows, [&](std::size_t begin, std::size_t end) {
+            for (std::size_t i = begin; i < end; ++i)
+                radix_keys[i] = double_to_sortable_u64(f[i]);
+        });
+        auto sort_result = radix_sort_u64_asc(std::move(radix_keys), rows, sort_workers);
         return std::visit(
             [&]<typename Idx>(const std::vector<Idx>& idx) -> std::expected<Table, std::string> {
                 return gather_rows_parallel(input, idx, &resolved_keys, exec);
@@ -750,10 +1026,10 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
     auto radix_gather =
         [&](std::vector<std::vector<std::uint64_t>>& codes) -> std::expected<Table, std::string> {
         if (rows <= std::numeric_limits<std::uint32_t>::max()) {
-            auto idx = lsd_multi_radix<std::uint32_t>(codes, rows);
+            auto idx = lsd_multi_radix<std::uint32_t>(codes, rows, exec, sort_workers);
             return gather_rows_parallel(input, idx, &resolved_keys, exec);
         }
-        auto idx = lsd_multi_radix<std::uint64_t>(codes, rows);
+        auto idx = lsd_multi_radix<std::uint64_t>(codes, rows, exec, sort_workers);
         return gather_rows_parallel(input, idx, &resolved_keys, exec);
     };
 
@@ -784,8 +1060,10 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
                     break;
                 case FlatKind::F64:
                     code.resize(rows);
-                    for (std::size_t i = 0; i < rows; ++i)
-                        code[i] = double_to_sortable_u64(fk.f64[i]);
+                    for_row_ranges(&exec, rows, [&](std::size_t begin, std::size_t end) {
+                        for (std::size_t i = begin; i < end; ++i)
+                            code[i] = double_to_sortable_u64(fk.f64[i]);
+                    });
                     break;
                 case FlatKind::Str: {
                     // Uncapped: the encode only bails when the distinct count

@@ -982,6 +982,91 @@ TEST_CASE("Interpret update with bool scalar reference") {
     REQUIRE((*keep_bools)[2] == true);
 }
 
+TEST_CASE("Interpret order matches a stable sort on large inputs, serial and parallel",
+          "[interpreter][order][parallel]") {
+    // Large enough for the MSD radix (64K rows and up). The expected order is
+    // std::stable_sort over row ids, so ties must keep input order. Keys:
+    //   x  Float64 spread over ten binades, rounded so many rows tie;
+    //   s  Float64 skewed: almost every row in one narrow range, a few far
+    //      away, so one top-level bucket holds nearly everything;
+    //   k  Int64 with negatives;
+    //   g  Int64 with four values, as a leading key;
+    //   w  Int64, 10000 values spaced far apart, so each lands in a small
+    //      bucket of its own holding ~20 tied rows.
+    constexpr std::size_t kRows = 200000;
+    Column<std::int64_t> id;
+    Column<double> x;
+    Column<double> s;
+    Column<std::int64_t> k;
+    Column<std::int64_t> g;
+    Column<std::int64_t> w;
+    std::uint64_t state = 42;
+    const auto next = [&state]() {
+        state = (state * 6364136223846793005ULL) + 1442695040888963407ULL;
+        return state >> 33;
+    };
+    for (std::size_t i = 0; i < kRows; ++i) {
+        id.push_back(static_cast<std::int64_t>(i));
+        x.push_back(std::round(std::ldexp(1.0 + (static_cast<double>(next() % 1000) / 1000.0),
+                                          static_cast<int>(next() % 10)) *
+                               100.0) /
+                    100.0);
+        s.push_back(i % 1000 == 0 ? 1.0e9 + static_cast<double>(next() % 7)
+                                  : 5.0 + (static_cast<double>(next() % 4096) * 1.0e-9));
+        k.push_back(static_cast<std::int64_t>(next() % 2001) - 1000);
+        g.push_back(static_cast<std::int64_t>(next() % 4));
+        w.push_back(static_cast<std::int64_t>(next() % 10000) << 20);
+    }
+    runtime::TableRegistry registry;
+    {
+        runtime::Table t;
+        t.add_column("id", id);
+        t.add_column("x", x);
+        t.add_column("s", s);
+        t.add_column("k", k);
+        t.add_column("g", g);
+        t.add_column("w", w);
+        registry.emplace("t", std::move(t));
+    }
+
+    const auto expected_ids = [&](const auto& less) {
+        std::vector<std::size_t> rows(kRows);
+        std::iota(rows.begin(), rows.end(), std::size_t{0});
+        std::ranges::stable_sort(rows, less);
+        return rows;
+    };
+    const auto check = [&](const char* query, const std::vector<std::size_t>& expected) {
+        INFO(query);
+        auto ir = require_ir(query);
+        runtime::ExecutionContext serial;
+        serial.parallel_threads = 1;
+        runtime::ExecutionContext parallel;
+        parallel.parallel_threads = 4;
+        parallel.parallel_min_rows = 0;
+        for (const auto* exec : {&serial, &parallel}) {
+            auto result = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, *exec);
+            REQUIRE(result.has_value());
+            const auto& got = std::get<Column<std::int64_t>>(*result->find("id"));
+            REQUIRE(got.size() == kRows);
+            std::size_t mismatches = 0;
+            for (std::size_t i = 0; i < kRows; ++i) {
+                mismatches += static_cast<std::size_t>(got[i]) != expected[i] ? 1U : 0U;
+            }
+            CHECK(mismatches == 0);
+        }
+    };
+
+    check("t[order x];", expected_ids([&](std::size_t a, std::size_t b) { return x[a] < x[b]; }));
+    check("t[order { x desc }];",
+          expected_ids([&](std::size_t a, std::size_t b) { return x[a] > x[b]; }));
+    check("t[order s];", expected_ids([&](std::size_t a, std::size_t b) { return s[a] < s[b]; }));
+    check("t[order k];", expected_ids([&](std::size_t a, std::size_t b) { return k[a] < k[b]; }));
+    check("t[order w];", expected_ids([&](std::size_t a, std::size_t b) { return w[a] < w[b]; }));
+    check("t[order { g asc, x desc }];", expected_ids([&](std::size_t a, std::size_t b) {
+              return g[a] != g[b] ? g[a] < g[b] : x[a] > x[b];
+          }));
+}
+
 TEST_CASE("Interpret order descending") {
     runtime::Table table;
     table.add_column("price", Column<std::int64_t>{10, 30, 20});

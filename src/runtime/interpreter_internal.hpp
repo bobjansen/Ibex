@@ -1580,7 +1580,9 @@ void gather_selection_into(Table& output, const Table& input,
 // uint64_t otherwise. Keys are taken by move — the caller's u64 buffer is
 // consumed, no copy.
 using SortIdx = std::variant<std::vector<std::uint32_t>, std::vector<std::uint64_t>>;
-[[nodiscard]] auto radix_sort_u64_asc(std::vector<std::uint64_t> keys, std::size_t rows) -> SortIdx;
+/// `workers` above 1 runs the passes in parallel; the permutation is the same.
+[[nodiscard]] auto radix_sort_u64_asc(std::vector<std::uint64_t> keys, std::size_t rows,
+                                      std::size_t workers = 1) -> SortIdx;
 
 [[nodiscard]] auto group_barrier_worker_count(const ExecutionContext& exec, std::size_t rows)
     -> std::size_t;

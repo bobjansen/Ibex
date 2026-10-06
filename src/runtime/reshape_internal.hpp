@@ -30,8 +30,8 @@ namespace ibex::runtime {
                                const std::optional<std::string>& merge_key = std::nullopt)
     -> std::expected<Table, std::string>;
 [[nodiscard]] auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
-                              const std::vector<std::string>& measure_columns)
-    -> std::expected<Table, std::string>;
+                              const std::vector<std::string>& measure_columns,
+                              const ExecutionContext* exec) -> std::expected<Table, std::string>;
 [[nodiscard]] auto dcast_table(const Table& input, const std::string& pivot_column,
                                const std::string& value_column,
                                const std::vector<std::string>& row_keys,

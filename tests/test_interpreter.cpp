@@ -11287,6 +11287,91 @@ auto dcast_parallel_exec() -> runtime::ExecutionContext {
 
 }  // namespace
 
+TEST_CASE("melt: a parallel run puts every cell where the row and measure say",
+          "[melt][parallel]") {
+    // Output row r * m + j holds input row r's ids and measure j. 300 rows
+    // span several 64-row ranges, so every range boundary and the bit-packed
+    // columns (Bool, validity) are crossed by more than one worker.
+    constexpr std::size_t kRows = 300;
+    Column<std::string> name;
+    Column<bool> flag;
+    Column<double> a;
+    Column<double> b;
+    Column<std::string> sa;
+    Column<std::string> sb;
+    runtime::ValidityBitmap name_valid(kRows, true);
+    runtime::ValidityBitmap a_valid(kRows, true);
+    for (std::size_t r = 0; r < kRows; ++r) {
+        name.push_back("n" + std::to_string(r * 7));
+        flag.push_back(r % 3 == 0);
+        a.push_back(static_cast<double>(r) + 0.5);
+        b.push_back(-static_cast<double>(r));
+        sa.push_back(std::string(r % 5, 'x'));
+        sb.push_back("y" + std::to_string(r));
+        if (r % 11 == 0) {
+            name_valid.set(r, false);
+        }
+        if (r % 13 == 0) {
+            a_valid.set(r, false);
+        }
+    }
+    runtime::TableRegistry registry;
+    {
+        runtime::Table wide;
+        wide.add_column("name", name, name_valid);
+        wide.add_column("flag", flag);
+        wide.add_column("a", a, a_valid);
+        wide.add_column("b", b);
+        wide.add_column("sa", sa);
+        wide.add_column("sb", sb);
+        registry.emplace("wide", std::move(wide));
+    }
+    runtime::ExecutionContext exec;
+    exec.parallel_threads = 4;
+    exec.parallel_min_rows = 0;
+
+    auto numeric_ir = require_ir("wide[melt { name, flag }, select { a, b }];");
+    auto numeric = runtime::interpret(*numeric_ir, registry, nullptr, nullptr, nullptr, exec);
+    REQUIRE(numeric.has_value());
+    REQUIRE(numeric->rows() == kRows * 2);
+    const auto* name_out = numeric->find_entry("name");
+    const auto* value_out = numeric->find_entry("value");
+    REQUIRE(name_out != nullptr);
+    REQUIRE(value_out != nullptr);
+    const auto& names = std::get<Column<std::string>>(*name_out->column);
+    const auto& flags = std::get<Column<bool>>(*numeric->find("flag"));
+    const auto& variable = std::get<Column<Categorical>>(*numeric->find("variable"));
+    const auto& values = std::get<Column<double>>(*value_out->column);
+    std::size_t wrong = 0;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        for (std::size_t j = 0; j < 2; ++j) {
+            const std::size_t o = (r * 2) + j;
+            wrong += runtime::is_null(*name_out, o) != (r % 11 == 0) ? 1U : 0U;
+            wrong += names[o] != name[r] ? 1U : 0U;
+            wrong += flags[o] != flag[r] ? 1U : 0U;
+            wrong += variable[o] != (j == 0 ? "a" : "b") ? 1U : 0U;
+            const bool null_value = j == 0 && r % 13 == 0;
+            wrong += runtime::is_null(*value_out, o) != null_value ? 1U : 0U;
+            if (!null_value) {
+                wrong += values[o] != (j == 0 ? a[r] : b[r]) ? 1U : 0U;
+            }
+        }
+    }
+    CHECK(wrong == 0);
+
+    auto string_ir = require_ir("wide[melt { flag }, select { sa, sb }];");
+    auto strings = runtime::interpret(*string_ir, registry, nullptr, nullptr, nullptr, exec);
+    REQUIRE(strings.has_value());
+    REQUIRE(strings->rows() == kRows * 2);
+    const auto& svalues = std::get<Column<std::string>>(*strings->find("value"));
+    wrong = 0;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        wrong += svalues[r * 2] != sa[r] ? 1U : 0U;
+        wrong += svalues[(r * 2) + 1] != sb[r] ? 1U : 0U;
+    }
+    CHECK(wrong == 0);
+}
+
 TEST_CASE("dcast: a parallel run keeps first-appearance order and the last value",
           "[dcast][parallel]") {
     // Row keys first appear in the order 2, 1, 3, null; pivots in the order

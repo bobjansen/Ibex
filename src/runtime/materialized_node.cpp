@@ -556,7 +556,7 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
             if (!child) {
                 return std::unexpected(child.error());
             }
-            return melt_table(child.value(), mn.id_columns(), mn.measure_columns());
+            return melt_table(child.value(), mn.id_columns(), mn.measure_columns(), &exec);
         }
         case ir::NodeKind::Dcast: {
             const auto& dn = ir::node_cast<ir::DcastNode>(node);

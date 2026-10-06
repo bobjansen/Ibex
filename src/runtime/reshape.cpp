@@ -224,7 +224,7 @@ struct DcastRowKey {
 /// Run `body(i)` for every `i` in `[0, count)` on up to `workers` threads,
 /// or inline, in order, when `workers` is 1.
 template <typename Body>
-void for_dcast_tasks(std::size_t workers, std::size_t count, const Body& body) {
+void for_reshape_tasks(std::size_t workers, std::size_t count, const Body& body) {
     if (workers < 2 || count < 2) {
         for (std::size_t i = 0; i < count; ++i) {
             body(i);
@@ -245,14 +245,24 @@ void for_dcast_tasks(std::size_t workers, std::size_t count, const Body& body) {
 /// aligned to 64 rows. A caller that keeps one result per slice and reads them
 /// in slice order sees the rows in input order.
 template <typename Body>
-void for_dcast_ranges(std::size_t workers, std::size_t n, std::size_t ranges, const Body& body) {
+void for_reshape_ranges(std::size_t workers, std::size_t n, std::size_t ranges, const Body& body) {
     constexpr std::size_t kAlign = 64;
     const std::size_t grain =
         std::max<std::size_t>(kAlign, (((n + ranges - 1) / ranges) + kAlign - 1) / kAlign * kAlign);
-    for_dcast_tasks(workers, ranges, [&](std::size_t range) {
+    for_reshape_tasks(workers, ranges, [&](std::size_t range) {
         const std::size_t begin = std::min(n, range * grain);
         body(range, begin, std::min(n, begin + grain));
     });
+}
+
+/// Workers for a reshape over `rows` rows: the context's compute budget, or 1
+/// when the input is small, fan-out is off, or this already runs on a worker.
+[[nodiscard]] auto reshape_workers(const ExecutionContext* exec, std::size_t rows) -> std::size_t {
+    if (exec == nullptr || !exec->can_fan_out() || rows < exec->parallel_min_rows ||
+        on_worker_pool_thread()) {
+        return 1;
+    }
+    return std::max<std::size_t>(1, std::min(exec->compute_budget(), process_worker_pool().size()));
 }
 
 /// True when `validity` marks at least one row null.
@@ -813,7 +823,7 @@ auto rbind_table(const std::vector<const Table*>& tables,
 }
 
 auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
-                const std::vector<std::string>& measure_columns)
+                const std::vector<std::string>& measure_columns, const ExecutionContext* exec)
     -> std::expected<Table, std::string> {
     std::vector<std::size_t> id_indices;
     id_indices.reserve(id_columns.size());
@@ -861,18 +871,55 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
         }
     }
 
-    std::size_t rows = input.rows();
-    std::size_t n_measures = measure_indices.size();
-    std::size_t out_rows = rows * n_measures;
+    const std::size_t rows = input.rows();
+    const std::size_t n_measures = measure_indices.size();
+    const std::size_t out_rows = rows * n_measures;
+
+    // Input rows [begin, end) become output rows [begin * m, end * m), m the
+    // measure count, so every range writes its own slice of each output. Range
+    // starts are multiples of 64 input rows, which makes the output starts
+    // multiples of 64 too: no two ranges share a word of a `Column<bool>` or a
+    // validity bitmap.
+    const std::size_t workers = reshape_workers(exec, out_rows);
+    const std::size_t ranges = workers < 2 ? 1 : workers * 4;
+    const auto for_rows = [&](const auto& body) {
+        for_reshape_ranges(
+            workers, rows, ranges,
+            [&](std::size_t, std::size_t begin, std::size_t end) { body(begin, end); });
+    };
+    // The measure count as a template argument when it is small, so the inner
+    // loops unroll; 0 means "use n_measures".
+    const auto with_measure_count = [&](const auto& f) {
+        switch (n_measures) {
+            case 1:
+                f.template operator()<1>();
+                break;
+            case 2:
+                f.template operator()<2>();
+                break;
+            case 3:
+                f.template operator()<3>();
+                break;
+            case 4:
+                f.template operator()<4>();
+                break;
+            default:
+                f.template operator()<0>();
+                break;
+        }
+    };
 
     Table output;
 
+    // ── Id columns: each input row repeated once per measure ────────────────
     for (const std::size_t id_idx : id_indices) {
         const auto& entry = input.columns[id_idx];
-        auto col = std::visit(
+        ColumnValue col = std::visit(
             [&](const auto& src_col) -> ColumnValue {
                 using SrcCol = std::decay_t<decltype(src_col)>;
                 if constexpr (std::is_same_v<SrcCol, Column<std::string>>) {
+                    // Row r's copies start at m * offs[r]: every earlier row
+                    // was written m times.
                     Column<std::string> out_col;
                     const auto* src_offs = src_col.offsets_data();
                     const char* src_chars = src_col.chars_data();
@@ -882,429 +929,235 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                     auto* dst_offs = out_col.offsets_data();
                     char* dst_chars = out_col.chars_data();
                     dst_offs[0] = 0;
-                    std::size_t out_i = 0;
-                    std::size_t out_char = 0;
-                    auto emit_repeat_n = [&]<std::size_t N>() {
-                        for (std::size_t r = 0; r < rows; ++r) {
-                            const auto start = static_cast<std::size_t>(src_offs[r]);
-                            const auto end = static_cast<std::size_t>(src_offs[r + 1]);
-                            const std::size_t len = end - start;
-                            const char* p = src_chars + start;
-                            const std::size_t row_char_base = out_char;
-                            if (len > 0) {
-                                if constexpr (N >= 1) {
-                                    std::memcpy(dst_chars + row_char_base, p, len);
-                                }
-                                if constexpr (N >= 2) {
-                                    std::memcpy(dst_chars + row_char_base + len, p, len);
-                                }
-                                if constexpr (N >= 3) {
-                                    std::memcpy(dst_chars + row_char_base + (2 * len), p, len);
-                                }
-                                if constexpr (N >= 4) {
-                                    std::memcpy(dst_chars + row_char_base + (3 * len), p, len);
-                                }
-                            }
-                            if constexpr (N >= 1) {
-                                dst_offs[++out_i] = static_cast<std::uint32_t>(row_char_base + len);
-                            }
-                            if constexpr (N >= 2) {
-                                dst_offs[++out_i] =
-                                    static_cast<std::uint32_t>(row_char_base + (2 * len));
-                            }
-                            if constexpr (N >= 3) {
-                                dst_offs[++out_i] =
-                                    static_cast<std::uint32_t>(row_char_base + (3 * len));
-                            }
-                            if constexpr (N >= 4) {
-                                dst_offs[++out_i] =
-                                    static_cast<std::uint32_t>(row_char_base + (4 * len));
-                            }
-                            out_char += len * N;
-                        }
-                    };
-                    switch (n_measures) {
-                        case 1:
-                            emit_repeat_n.template operator()<1>();
-                            break;
-                        case 2:
-                            emit_repeat_n.template operator()<2>();
-                            break;
-                        case 3:
-                            emit_repeat_n.template operator()<3>();
-                            break;
-                        case 4:
-                            emit_repeat_n.template operator()<4>();
-                            break;
-                        default:
-                            for (std::size_t r = 0; r < rows; ++r) {
+                    with_measure_count([&]<std::size_t M>() {
+                        const std::size_t m = M == 0 ? n_measures : M;
+                        for_rows([&](std::size_t begin, std::size_t end) {
+                            for (std::size_t r = begin; r < end; ++r) {
                                 const auto start = static_cast<std::size_t>(src_offs[r]);
-                                const auto end = static_cast<std::size_t>(src_offs[r + 1]);
-                                const std::size_t len = end - start;
-                                const char* p = src_chars + start;
-                                const std::size_t row_char_base = out_char;
-                                const std::size_t repeated_chars = len * n_measures;
-                                if (len > 0 && n_measures > 0) {
-                                    std::memcpy(dst_chars + row_char_base, p, len);
-                                    std::size_t copied = len;
-                                    while (copied < repeated_chars) {
-                                        const std::size_t chunk =
-                                            std::min(copied, repeated_chars - copied);
-                                        std::memcpy(dst_chars + row_char_base + copied,
-                                                    dst_chars + row_char_base, chunk);
-                                        copied += chunk;
+                                const std::size_t len =
+                                    static_cast<std::size_t>(src_offs[r + 1]) - start;
+                                const std::size_t base = start * m;
+                                for (std::size_t j = 0; j < m; ++j) {
+                                    if (len > 0) {
+                                        std::memcpy(dst_chars + base + (j * len), src_chars + start,
+                                                    len);
                                     }
+                                    dst_offs[(r * m) + j + 1] =
+                                        static_cast<std::uint32_t>(base + ((j + 1) * len));
                                 }
-                                for (std::size_t m = 0; m < n_measures; ++m) {
-                                    dst_offs[++out_i] =
-                                        static_cast<std::uint32_t>(row_char_base + ((m + 1) * len));
-                                }
-                                out_char += repeated_chars;
                             }
-                            break;
-                    }
+                        });
+                    });
                     return out_col;
                 } else if constexpr (std::is_same_v<SrcCol, Column<Categorical>>) {
                     Column<Categorical> out_col{src_col.dictionary_ptr(), src_col.index_ptr(), {}};
                     out_col.resize(out_rows);
                     auto* dst_codes = out_col.codes_data();
-                    std::size_t out_i = 0;
-                    for (std::size_t r = 0; r < rows; ++r) {
-                        auto code = src_col.code_at(r);
-                        for (std::size_t m = 0; m < n_measures; ++m) {
-                            dst_codes[out_i++] = code;
-                        }
-                    }
+                    with_measure_count([&]<std::size_t M>() {
+                        const std::size_t m = M == 0 ? n_measures : M;
+                        for_rows([&](std::size_t begin, std::size_t end) {
+                            for (std::size_t r = begin; r < end; ++r) {
+                                const auto code = src_col.code_at(r);
+                                for (std::size_t j = 0; j < m; ++j) {
+                                    dst_codes[(r * m) + j] = code;
+                                }
+                            }
+                        });
+                    });
+                    return out_col;
+                } else if constexpr (std::is_same_v<SrcCol, Column<bool>>) {
+                    SrcCol out_col;
+                    out_col.resize(out_rows);
+                    with_measure_count([&]<std::size_t M>() {
+                        const std::size_t m = M == 0 ? n_measures : M;
+                        for_rows([&](std::size_t begin, std::size_t end) {
+                            for (std::size_t r = begin; r < end; ++r) {
+                                const bool v = src_col[r];
+                                for (std::size_t j = 0; j < m; ++j) {
+                                    out_col.set((r * m) + j, v);
+                                }
+                            }
+                        });
+                    });
                     return out_col;
                 } else {
+                    // Every slot is written below, so none is zeroed first.
                     SrcCol out_col;
-                    out_col.reserve(out_rows);
-                    out_col.resize(out_rows);
-                    if constexpr (std::is_same_v<SrcCol, Column<bool>>) {
-                        switch (n_measures) {
-                            case 1:
-                                for (std::size_t r = 0; r < rows; ++r) {
-                                    out_col.set(r, src_col[r]);
-                                }
-                                break;
-                            case 2:
-                                for (std::size_t r = 0; r < rows; ++r) {
-                                    const bool v = src_col[r];
-                                    const std::size_t base = r * 2;
-                                    out_col.set(base, v);
-                                    out_col.set(base + 1, v);
-                                }
-                                break;
-                            case 3:
-                                for (std::size_t r = 0; r < rows; ++r) {
-                                    const bool v = src_col[r];
-                                    const std::size_t base = r * 3;
-                                    out_col.set(base, v);
-                                    out_col.set(base + 1, v);
-                                    out_col.set(base + 2, v);
-                                }
-                                break;
-                            case 4:
-                                for (std::size_t r = 0; r < rows; ++r) {
-                                    const bool v = src_col[r];
-                                    const std::size_t base = r * 4;
-                                    out_col.set(base, v);
-                                    out_col.set(base + 1, v);
-                                    out_col.set(base + 2, v);
-                                    out_col.set(base + 3, v);
-                                }
-                                break;
-                            default: {
-                                std::size_t out_i = 0;
-                                for (std::size_t r = 0; r < rows; ++r) {
-                                    const bool v = src_col[r];
-                                    for (std::size_t m = 0; m < n_measures; ++m) {
-                                        out_col.set(out_i++, v);
-                                    }
-                                }
-                                break;
-                            }
-                        }
+                    if constexpr (requires { out_col.resize_for_overwrite(out_rows); }) {
+                        out_col.resize_for_overwrite(out_rows);
                     } else {
-                        auto* dst = out_col.data();
-                        switch (n_measures) {
-                            case 1:
-                                for (std::size_t r = 0; r < rows; ++r) {
-                                    dst[r] = src_col[r];
-                                }
-                                break;
-                            case 2:
-                                for (std::size_t r = 0; r < rows; ++r) {
-                                    auto v = src_col[r];
-                                    const std::size_t base = r * 2;
-                                    dst[base] = v;
-                                    dst[base + 1] = v;
-                                }
-                                break;
-                            case 3:
-                                for (std::size_t r = 0; r < rows; ++r) {
-                                    auto v = src_col[r];
-                                    const std::size_t base = r * 3;
-                                    dst[base] = v;
-                                    dst[base + 1] = v;
-                                    dst[base + 2] = v;
-                                }
-                                break;
-                            case 4:
-                                for (std::size_t r = 0; r < rows; ++r) {
-                                    auto v = src_col[r];
-                                    const std::size_t base = r * 4;
-                                    dst[base] = v;
-                                    dst[base + 1] = v;
-                                    dst[base + 2] = v;
-                                    dst[base + 3] = v;
-                                }
-                                break;
-                            default: {
-                                std::size_t out_i = 0;
-                                for (std::size_t r = 0; r < rows; ++r) {
-                                    auto v = src_col[r];
-                                    for (std::size_t m = 0; m < n_measures; ++m) {
-                                        dst[out_i++] = v;
-                                    }
-                                }
-                                break;
-                            }
-                        }
+                        out_col.resize(out_rows);
                     }
+                    auto* dst = out_col.data();
+                    const auto* src = src_col.data();
+                    with_measure_count([&]<std::size_t M>() {
+                        const std::size_t m = M == 0 ? n_measures : M;
+                        for_rows([&](std::size_t begin, std::size_t end) {
+                            for (std::size_t r = begin; r < end; ++r) {
+                                const auto v = src[r];
+                                for (std::size_t j = 0; j < m; ++j) {
+                                    dst[(r * m) + j] = v;
+                                }
+                            }
+                        });
+                    });
                     return out_col;
                 }
             },
             *entry.column);
+        col = with_meta_of(std::move(col), *entry.column);
 
         if (entry.validity.has_value()) {
-            ValidityBitmap validity;
-            validity.reserve(out_rows);
-            for (std::size_t r = 0; r < rows; ++r) {
-                const bool valid = (*entry.validity)[r];
-                for (std::size_t m = 0; m < n_measures; ++m) {
-                    validity.push_back(valid);
+            ValidityBitmap validity(out_rows, true);
+            for_rows([&](std::size_t begin, std::size_t end) {
+                for (std::size_t r = begin; r < end; ++r) {
+                    if (!(*entry.validity)[r]) {
+                        for (std::size_t j = 0; j < n_measures; ++j) {
+                            validity.set((r * n_measures) + j, false);
+                        }
+                    }
                 }
-            }
+            });
             output.add_column(entry.name, std::move(col), std::move(validity));
         } else {
             output.add_column(entry.name, std::move(col));
         }
     }
 
+    // ── variable: the measure names, cycling ────────────────────────────────
     {
         Column<Categorical> var_col{std::vector<std::string>(measure_names)};
         var_col.resize(out_rows);
         auto* codes = var_col.codes_data();
-        for (std::size_t mi = 0; mi < n_measures; ++mi) {
-            codes[mi] = static_cast<Column<Categorical>::code_type>(mi);
-        }
-        std::size_t copied = n_measures;
-        while (copied < out_rows) {
-            const std::size_t chunk = std::min(copied, out_rows - copied);
-            std::memcpy(codes + copied, codes, chunk * sizeof(*codes));
-            copied += chunk;
-        }
+        for_rows([&](std::size_t begin, std::size_t end) {
+            for (std::size_t r = begin; r < end; ++r) {
+                for (std::size_t j = 0; j < n_measures; ++j) {
+                    codes[(r * n_measures) + j] = static_cast<Column<Categorical>::code_type>(j);
+                }
+            }
+        });
         output.add_column("variable", std::move(var_col));
     }
 
-    bool any_measure_validity = false;
-    for (std::size_t mi = 0; mi < n_measures; ++mi) {
-        if (input.columns[measure_indices[mi]].validity.has_value()) {
-            any_measure_validity = true;
-            break;
-        }
-    }
-
-    auto value_col = std::visit(
+    // ── value: the measures, interleaved row by row ─────────────────────────
+    const auto measure_entry = [&](std::size_t j) -> const ColumnEntry& {
+        return input.columns[measure_indices[j]];
+    };
+    ColumnValue value_col = std::visit(
         [&](const auto& first_col) -> ColumnValue {
             using SrcCol = std::decay_t<decltype(first_col)>;
+            std::vector<const SrcCol*> measures;
+            measures.reserve(n_measures);
+            for (std::size_t j = 0; j < n_measures; ++j) {
+                const auto* src = std::get_if<SrcCol>(measure_entry(j).column.get());
+                if (src == nullptr) {
+                    reshape_invariant_violation(
+                        "melt_table: measure column type mismatch after upfront validation");
+                }
+                measures.push_back(src);
+            }
             if constexpr (std::is_same_v<SrcCol, Column<std::string>>) {
+                // Row r's values start at the sum of every measure's offset at
+                // r: each earlier row wrote one value per measure.
                 Column<std::string> out_col;
-                std::vector<const Column<std::string>*> measures;
-                measures.reserve(n_measures);
                 std::size_t total_chars = 0;
-                for (std::size_t mi = 0; mi < n_measures; ++mi) {
-                    const auto& entry = input.columns[measure_indices[mi]];
-                    const auto* src = std::get_if<Column<std::string>>(entry.column.get());
-                    if (src == nullptr) {
-                        reshape_invariant_violation(
-                            "melt_table: measure column type mismatch after upfront validation");
-                    }
-                    measures.push_back(src);
-                    const auto* offs = src->offsets_data();
-                    total_chars += rows > 0 ? static_cast<std::size_t>(offs[rows]) : 0;
+                for (const auto* src : measures) {
+                    total_chars +=
+                        rows > 0 ? static_cast<std::size_t>(src->offsets_data()[rows]) : 0;
                 }
                 out_col.resize_for_gather(out_rows, total_chars);
                 auto* dst_offs = out_col.offsets_data();
                 char* dst_chars = out_col.chars_data();
                 dst_offs[0] = 0;
-                std::size_t out_i = 0;
-                std::size_t out_char = 0;
-                for (std::size_t r = 0; r < rows; ++r) {
-                    for (std::size_t mi = 0; mi < n_measures; ++mi) {
-                        const auto* src_offs = measures[mi]->offsets_data();
-                        const char* src_chars = measures[mi]->chars_data();
-                        const auto start = static_cast<std::size_t>(src_offs[r]);
-                        const auto end = static_cast<std::size_t>(src_offs[r + 1]);
-                        const std::size_t len = end - start;
-                        if (len > 0) {
-                            std::memcpy(dst_chars + out_char, src_chars + start, len);
-                        }
-                        out_char += len;
-                        dst_offs[++out_i] = static_cast<std::uint32_t>(out_char);
+                for_rows([&](std::size_t begin, std::size_t end) {
+                    std::size_t out_char = 0;
+                    for (const auto* src : measures) {
+                        out_char += static_cast<std::size_t>(src->offsets_data()[begin]);
                     }
-                }
+                    for (std::size_t r = begin; r < end; ++r) {
+                        for (std::size_t j = 0; j < n_measures; ++j) {
+                            const auto* src_offs = measures[j]->offsets_data();
+                            const auto start = static_cast<std::size_t>(src_offs[r]);
+                            const std::size_t len =
+                                static_cast<std::size_t>(src_offs[r + 1]) - start;
+                            if (len > 0) {
+                                std::memcpy(dst_chars + out_char, measures[j]->chars_data() + start,
+                                            len);
+                            }
+                            out_char += len;
+                            dst_offs[(r * n_measures) + j + 1] =
+                                static_cast<std::uint32_t>(out_char);
+                        }
+                    }
+                });
                 return out_col;
             } else if constexpr (std::is_same_v<SrcCol, Column<Categorical>>) {
                 Column<Categorical> out_col{first_col.dictionary_ptr(), first_col.index_ptr(), {}};
-                std::vector<const Column<Categorical>*> measures;
-                measures.reserve(n_measures);
-                for (std::size_t mi = 0; mi < n_measures; ++mi) {
-                    const auto& entry = input.columns[measure_indices[mi]];
-                    const auto* src = std::get_if<Column<Categorical>>(entry.column.get());
-                    if (src == nullptr) {
-                        reshape_invariant_violation(
-                            "melt_table: measure column type mismatch after upfront validation");
-                    }
-                    measures.push_back(src);
-                }
                 out_col.resize(out_rows);
                 auto* dst_codes = out_col.codes_data();
-                std::size_t out_i = 0;
-                for (std::size_t r = 0; r < rows; ++r) {
-                    for (std::size_t mi = 0; mi < n_measures; ++mi) {
-                        dst_codes[out_i++] = measures[mi]->code_at(r);
+                for_rows([&](std::size_t begin, std::size_t end) {
+                    for (std::size_t r = begin; r < end; ++r) {
+                        for (std::size_t j = 0; j < n_measures; ++j) {
+                            dst_codes[(r * n_measures) + j] = measures[j]->code_at(r);
+                        }
                     }
-                }
+                });
+                return out_col;
+            } else if constexpr (std::is_same_v<SrcCol, Column<bool>>) {
+                SrcCol out_col;
+                out_col.resize(out_rows);
+                for_rows([&](std::size_t begin, std::size_t end) {
+                    for (std::size_t r = begin; r < end; ++r) {
+                        for (std::size_t j = 0; j < n_measures; ++j) {
+                            out_col.set((r * n_measures) + j, (*measures[j])[r]);
+                        }
+                    }
+                });
                 return out_col;
             } else {
                 SrcCol out_col;
-                std::vector<const SrcCol*> measures;
-                measures.reserve(n_measures);
-                for (std::size_t mi = 0; mi < n_measures; ++mi) {
-                    const auto& entry = input.columns[measure_indices[mi]];
-                    const auto* src = std::get_if<SrcCol>(entry.column.get());
-                    if (src == nullptr) {
-                        reshape_invariant_violation(
-                            "melt_table: measure column type mismatch after upfront validation");
-                    }
-                    measures.push_back(src);
-                }
-                out_col.resize(out_rows);
-                if constexpr (std::is_same_v<SrcCol, Column<bool>>) {
-                    switch (n_measures) {
-                        case 1:
-                            for (std::size_t r = 0; r < rows; ++r) {
-                                out_col.set(r, (*measures[0])[r]);
-                            }
-                            break;
-                        case 2:
-                            for (std::size_t r = 0; r < rows; ++r) {
-                                const std::size_t base = r * 2;
-                                out_col.set(base, (*measures[0])[r]);
-                                out_col.set(base + 1, (*measures[1])[r]);
-                            }
-                            break;
-                        case 3:
-                            for (std::size_t r = 0; r < rows; ++r) {
-                                const std::size_t base = r * 3;
-                                out_col.set(base, (*measures[0])[r]);
-                                out_col.set(base + 1, (*measures[1])[r]);
-                                out_col.set(base + 2, (*measures[2])[r]);
-                            }
-                            break;
-                        case 4:
-                            for (std::size_t r = 0; r < rows; ++r) {
-                                const std::size_t base = r * 4;
-                                out_col.set(base, (*measures[0])[r]);
-                                out_col.set(base + 1, (*measures[1])[r]);
-                                out_col.set(base + 2, (*measures[2])[r]);
-                                out_col.set(base + 3, (*measures[3])[r]);
-                            }
-                            break;
-                        default: {
-                            std::size_t out_i = 0;
-                            for (std::size_t r = 0; r < rows; ++r) {
-                                for (std::size_t mi = 0; mi < n_measures; ++mi) {
-                                    out_col.set(out_i++, (*measures[mi])[r]);
-                                }
-                            }
-                            break;
-                        }
-                    }
+                if constexpr (requires { out_col.resize_for_overwrite(out_rows); }) {
+                    out_col.resize_for_overwrite(out_rows);
                 } else {
-                    auto* dst = out_col.data();
-                    switch (n_measures) {
-                        case 1: {
-                            const auto* m0 = measures[0]->data();
-                            for (std::size_t r = 0; r < rows; ++r) {
-                                dst[r] = m0[r];
-                            }
-                            break;
-                        }
-                        case 2: {
-                            const auto* m0 = measures[0]->data();
-                            const auto* m1 = measures[1]->data();
-                            for (std::size_t r = 0; r < rows; ++r) {
-                                const std::size_t base = r * 2;
-                                dst[base] = m0[r];
-                                dst[base + 1] = m1[r];
-                            }
-                            break;
-                        }
-                        case 3: {
-                            const auto* m0 = measures[0]->data();
-                            const auto* m1 = measures[1]->data();
-                            const auto* m2 = measures[2]->data();
-                            for (std::size_t r = 0; r < rows; ++r) {
-                                const std::size_t base = r * 3;
-                                dst[base] = m0[r];
-                                dst[base + 1] = m1[r];
-                                dst[base + 2] = m2[r];
-                            }
-                            break;
-                        }
-                        case 4: {
-                            const auto* m0 = measures[0]->data();
-                            const auto* m1 = measures[1]->data();
-                            const auto* m2 = measures[2]->data();
-                            const auto* m3 = measures[3]->data();
-                            for (std::size_t r = 0; r < rows; ++r) {
-                                const std::size_t base = r * 4;
-                                dst[base] = m0[r];
-                                dst[base + 1] = m1[r];
-                                dst[base + 2] = m2[r];
-                                dst[base + 3] = m3[r];
-                            }
-                            break;
-                        }
-                        default: {
-                            std::size_t out_i = 0;
-                            for (std::size_t r = 0; r < rows; ++r) {
-                                for (std::size_t mi = 0; mi < n_measures; ++mi) {
-                                    dst[out_i++] = (*measures[mi])[r];
-                                }
-                            }
-                            break;
-                        }
-                    }
+                    out_col.resize(out_rows);
                 }
+                auto* dst = out_col.data();
+                std::vector<const typename SrcCol::value_type*> srcs;
+                srcs.reserve(n_measures);
+                for (const auto* src : measures) {
+                    srcs.push_back(src->data());
+                }
+                with_measure_count([&]<std::size_t M>() {
+                    const std::size_t m = M == 0 ? n_measures : M;
+                    for_rows([&](std::size_t begin, std::size_t end) {
+                        for (std::size_t r = begin; r < end; ++r) {
+                            for (std::size_t j = 0; j < m; ++j) {
+                                dst[(r * m) + j] = srcs[j][r];
+                            }
+                        }
+                    });
+                });
                 return out_col;
             }
         },
-        *input.columns[measure_indices[0]].column);
+        *measure_entry(0).column);
+    value_col = with_meta_of(std::move(value_col), *measure_entry(0).column);
 
+    bool any_measure_validity = false;
+    for (std::size_t j = 0; j < n_measures; ++j) {
+        any_measure_validity = any_measure_validity || measure_entry(j).validity.has_value();
+    }
     if (any_measure_validity) {
         ValidityBitmap value_validity(out_rows, true);
-        std::size_t out_i = 0;
-        for (std::size_t r = 0; r < rows; ++r) {
-            for (std::size_t mi = 0; mi < n_measures; ++mi, ++out_i) {
-                if (is_null(input.columns[measure_indices[mi]], r)) {
-                    value_validity.set(out_i, false);
+        for_rows([&](std::size_t begin, std::size_t end) {
+            for (std::size_t r = begin; r < end; ++r) {
+                for (std::size_t j = 0; j < n_measures; ++j) {
+                    if (is_null(measure_entry(j), r)) {
+                        value_validity.set((r * n_measures) + j, false);
+                    }
                 }
             }
-        }
+        });
         output.add_column("value", std::move(value_col), std::move(value_validity));
     } else {
         output.add_column("value", std::move(value_col));
@@ -1346,11 +1199,7 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
 
     // Every pass below is a row-range or partition fan-out whose results are
     // read back in input order, so the answer does not depend on `workers`.
-    std::size_t workers = 1;
-    if (exec != nullptr && exec->can_fan_out() && rows >= exec->parallel_min_rows &&
-        !on_worker_pool_thread()) {
-        workers = std::min(exec->compute_budget(), process_worker_pool().size());
-    }
+    const std::size_t workers = reshape_workers(exec, rows);
     const std::size_t ranges = workers < 2 ? 1 : workers * 4;
 
     // ── Pivot values, in order of first appearance, and each row's pivot ──────
@@ -1369,17 +1218,17 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
             return code < 0 ? dict.size() : std::min(static_cast<std::size_t>(code), dict.size());
         };
         std::vector<std::vector<std::size_t>> seen(ranges);
-        for_dcast_ranges(workers, rows, ranges,
-                         [&](std::size_t range, std::size_t begin, std::size_t end) {
-                             std::vector<bool> local(dict.size(), false);
-                             for (std::size_t r = begin; r < end; ++r) {
-                                 const std::size_t ci = code_of(r);
-                                 if (ci < dict.size() && !local[ci]) {
-                                     local[ci] = true;
-                                     seen[range].push_back(ci);
-                                 }
-                             }
-                         });
+        for_reshape_ranges(workers, rows, ranges,
+                           [&](std::size_t range, std::size_t begin, std::size_t end) {
+                               std::vector<bool> local(dict.size(), false);
+                               for (std::size_t r = begin; r < end; ++r) {
+                                   const std::size_t ci = code_of(r);
+                                   if (ci < dict.size() && !local[ci]) {
+                                       local[ci] = true;
+                                       seen[range].push_back(ci);
+                                   }
+                               }
+                           });
         std::vector<std::uint32_t> code_to_pvi(dict.size() + 1, kDcastNoPivot);
         for (const auto& list : seen) {
             for (const std::size_t ci : list) {
@@ -1389,15 +1238,15 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
                 }
             }
         }
-        for_dcast_ranges(workers, rows, ranges,
-                         [&](std::size_t, std::size_t begin, std::size_t end) {
-                             for (std::size_t r = begin; r < end; ++r) {
-                                 pvi[r] = code_to_pvi[code_of(r)];
-                             }
-                         });
+        for_reshape_ranges(workers, rows, ranges,
+                           [&](std::size_t, std::size_t begin, std::size_t end) {
+                               for (std::size_t r = begin; r < end; ++r) {
+                                   pvi[r] = code_to_pvi[code_of(r)];
+                               }
+                           });
     } else if (const auto* int_col = std::get_if<Column<std::int64_t>>(&pivot_col)) {
         std::vector<std::vector<std::int64_t>> seen(ranges);
-        for_dcast_ranges(
+        for_reshape_ranges(
             workers, rows, ranges, [&](std::size_t range, std::size_t begin, std::size_t end) {
                 robin_hood::unordered_flat_set<std::int64_t> local;
                 for (std::size_t r = begin; r < end; ++r) {
@@ -1415,17 +1264,17 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
                 }
             }
         }
-        for_dcast_ranges(workers, rows, ranges,
-                         [&](std::size_t, std::size_t begin, std::size_t end) {
-                             for (std::size_t r = begin; r < end; ++r) {
-                                 if (!is_null(pivot_entry, r)) {
-                                     pvi[r] = to_pvi.find((*int_col)[r])->second;
-                                 }
-                             }
-                         });
+        for_reshape_ranges(workers, rows, ranges,
+                           [&](std::size_t, std::size_t begin, std::size_t end) {
+                               for (std::size_t r = begin; r < end; ++r) {
+                                   if (!is_null(pivot_entry, r)) {
+                                       pvi[r] = to_pvi.find((*int_col)[r])->second;
+                                   }
+                               }
+                           });
     } else if (const auto* str_col = std::get_if<Column<std::string>>(&pivot_col)) {
         std::vector<std::vector<std::string_view>> seen(ranges);
-        for_dcast_ranges(
+        for_reshape_ranges(
             workers, rows, ranges, [&](std::size_t range, std::size_t begin, std::size_t end) {
                 robin_hood::unordered_flat_set<std::string_view> local;
                 for (std::size_t r = begin; r < end; ++r) {
@@ -1443,14 +1292,14 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
                 }
             }
         }
-        for_dcast_ranges(workers, rows, ranges,
-                         [&](std::size_t, std::size_t begin, std::size_t end) {
-                             for (std::size_t r = begin; r < end; ++r) {
-                                 if (!is_null(pivot_entry, r)) {
-                                     pvi[r] = to_pvi.find((*str_col)[r])->second;
-                                 }
-                             }
-                         });
+        for_reshape_ranges(workers, rows, ranges,
+                           [&](std::size_t, std::size_t begin, std::size_t end) {
+                               for (std::size_t r = begin; r < end; ++r) {
+                                   if (!is_null(pivot_entry, r)) {
+                                       pvi[r] = to_pvi.find((*str_col)[r])->second;
+                                   }
+                               }
+                           });
     } else {
         // Any other pivot type is keyed by its printed label, serially: no
         // workload pivots on these at scale.
@@ -1501,7 +1350,7 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
     hashes.resize(rows);
     detail::NoInitVector<std::uint8_t> continues;
     continues.resize(rows);
-    for_dcast_ranges(workers, rows, ranges, [&](std::size_t, std::size_t begin, std::size_t end) {
+    for_reshape_ranges(workers, rows, ranges, [&](std::size_t, std::size_t begin, std::size_t end) {
         if (key.columns.empty()) {
             std::fill(hashes.data() + begin, hashes.data() + end, std::uint64_t{0});
         }
@@ -1533,15 +1382,15 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
             return static_cast<std::size_t>(hashes[r] >> (64 - part_bits));
         };
         std::vector<std::size_t> offsets(ranges * parts, 0);
-        for_dcast_ranges(workers, rows, ranges,
-                         [&](std::size_t range, std::size_t begin, std::size_t end) {
-                             std::size_t* counts = offsets.data() + (range * parts);
-                             for (std::size_t r = begin; r < end; ++r) {
-                                 if (is_run_start(r)) {
-                                     ++counts[part_of(r)];
-                                 }
-                             }
-                         });
+        for_reshape_ranges(workers, rows, ranges,
+                           [&](std::size_t range, std::size_t begin, std::size_t end) {
+                               std::size_t* counts = offsets.data() + (range * parts);
+                               for (std::size_t r = begin; r < end; ++r) {
+                                   if (is_run_start(r)) {
+                                       ++counts[part_of(r)];
+                                   }
+                               }
+                           });
         std::size_t running = 0;
         for (std::size_t p = 0; p < parts; ++p) {
             part_begin[p] = running;
@@ -1553,15 +1402,15 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
         }
         part_begin[parts] = running;
         order.resize(running);
-        for_dcast_ranges(workers, rows, ranges,
-                         [&](std::size_t range, std::size_t begin, std::size_t end) {
-                             std::size_t* next = offsets.data() + (range * parts);
-                             for (std::size_t r = begin; r < end; ++r) {
-                                 if (is_run_start(r)) {
-                                     order[next[part_of(r)]++] = static_cast<std::uint32_t>(r);
-                                 }
-                             }
-                         });
+        for_reshape_ranges(workers, rows, ranges,
+                           [&](std::size_t range, std::size_t begin, std::size_t end) {
+                               std::size_t* next = offsets.data() + (range * parts);
+                               for (std::size_t r = begin; r < end; ++r) {
+                                   if (is_run_start(r)) {
+                                       order[next[part_of(r)]++] = static_cast<std::uint32_t>(r);
+                                   }
+                               }
+                           });
     }
 
     // ── Group each partition ───────────────────────────────────────────────────
@@ -1579,7 +1428,7 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
         auto operator()(std::size_t a, std::size_t b) const -> bool { return key->equal(a, b); }
     };
     std::vector<Part> part_out(parts);
-    for_dcast_tasks(workers, parts, [&](std::size_t p) {
+    for_reshape_tasks(workers, parts, [&](std::size_t p) {
         Part& part = part_out[p];
         // A partition's runs bound its groups; unpartitioned, a key per
         // pivot's worth of rows is the usual shape of long input.
@@ -1638,22 +1487,22 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
     }
     detail::NoInitVector<std::uint32_t> group_at;
     group_at.resize(rows);
-    for_dcast_ranges(workers, rows, ranges, [&](std::size_t, std::size_t begin, std::size_t end) {
+    for_reshape_ranges(workers, rows, ranges, [&](std::size_t, std::size_t begin, std::size_t end) {
         std::fill(group_at.data() + begin, group_at.data() + end, kNotFirst);
     });
-    for_dcast_tasks(workers, parts, [&](std::size_t p) {
+    for_reshape_tasks(workers, parts, [&](std::size_t p) {
         const auto& first_rows = part_out[p].first_rows;
         for (std::size_t g = 0; g < first_rows.size(); ++g) {
             group_at[first_rows[g]] = static_cast<std::uint32_t>(part_base[p] + g);
         }
     });
     std::vector<std::size_t> range_base(ranges + 1, 0);
-    for_dcast_ranges(workers, rows, ranges,
-                     [&](std::size_t range, std::size_t begin, std::size_t end) {
-                         range_base[range + 1] = static_cast<std::size_t>(
-                             std::ranges::count_if(group_at.data() + begin, group_at.data() + end,
-                                                   [](std::uint32_t g) { return g != kNotFirst; }));
-                     });
+    for_reshape_ranges(
+        workers, rows, ranges, [&](std::size_t range, std::size_t begin, std::size_t end) {
+            range_base[range + 1] = static_cast<std::size_t>(
+                std::ranges::count_if(group_at.data() + begin, group_at.data() + end,
+                                      [](std::uint32_t g) { return g != kNotFirst; }));
+        });
     for (std::size_t range = 0; range < ranges; ++range) {
         range_base[range + 1] += range_base[range];
     }
@@ -1664,25 +1513,25 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
     for (std::size_t pi = 0; pi < n_pivots; ++pi) {
         cell_idx[pi].resize(out_rows);
     }
-    for_dcast_ranges(workers, rows, ranges,
-                     [&](std::size_t range, std::size_t begin, std::size_t end) {
-                         std::size_t out = range_base[range];
-                         for (std::size_t r = begin; r < end; ++r) {
-                             const std::uint32_t g = group_at[r];
-                             if (g == kNotFirst) {
-                                 continue;
-                             }
-                             const std::size_t p = static_cast<std::size_t>(
-                                 std::ranges::upper_bound(part_base, g) - part_base.begin() - 1);
-                             const std::size_t* cells =
-                                 part_out[p].cells.data() + ((g - part_base[p]) * n_pivots);
-                             first_input_row[out] = r;
-                             for (std::size_t pi = 0; pi < n_pivots; ++pi) {
-                                 cell_idx[pi][out] = cells[pi];
-                             }
-                             ++out;
-                         }
-                     });
+    for_reshape_ranges(workers, rows, ranges,
+                       [&](std::size_t range, std::size_t begin, std::size_t end) {
+                           std::size_t out = range_base[range];
+                           for (std::size_t r = begin; r < end; ++r) {
+                               const std::uint32_t g = group_at[r];
+                               if (g == kNotFirst) {
+                                   continue;
+                               }
+                               const std::size_t p = static_cast<std::size_t>(
+                                   std::ranges::upper_bound(part_base, g) - part_base.begin() - 1);
+                               const std::size_t* cells =
+                                   part_out[p].cells.data() + ((g - part_base[p]) * n_pivots);
+                               first_input_row[out] = r;
+                               for (std::size_t pi = 0; pi < n_pivots; ++pi) {
+                                   cell_idx[pi][out] = cells[pi];
+                               }
+                               ++out;
+                           }
+                       });
     std::vector<bool> missing(n_pivots, false);
     for (const auto& part : part_out) {
         for (std::size_t pi = 0; pi < n_pivots; ++pi) {

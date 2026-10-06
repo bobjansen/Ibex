@@ -12136,6 +12136,83 @@ TEST_CASE("cov: drops non-numeric columns silently", "[cov][matrix]") {
     REQUIRE(result->rows() == 1);
 }
 
+TEST_CASE("cov and corr agree across worker counts and with a long-double reference",
+          "[cov][corr][matrix][parallel]") {
+    // 50000 rows: many 4096-row blocks and a ragged last one. An Int64 column
+    // is widened like a Float64 one. One worker and four must give the same
+    // bits; both must match a two-pass sum in long double.
+    constexpr std::size_t kRows = 50000;
+    Column<double> x;
+    Column<std::int64_t> y;
+    Column<double> z;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        const double t = static_cast<double>(i);
+        x.push_back(1000.0 + std::sin(t * 0.01) * 50.0);
+        y.push_back(static_cast<std::int64_t>((i * 7919) % 1000));
+        z.push_back((t * 0.001) + std::cos(t * 0.37));
+    }
+    const std::array<std::vector<long double>, 3> data = [&] {
+        std::array<std::vector<long double>, 3> d;
+        for (std::size_t i = 0; i < kRows; ++i) {
+            d[0].push_back(x[i]);
+            d[1].push_back(static_cast<long double>(y[i]));
+            d[2].push_back(z[i]);
+        }
+        return d;
+    }();
+    std::array<long double, 3> mean{};
+    for (std::size_t j = 0; j < 3; ++j) {
+        for (const long double v : data[j]) {
+            mean[j] += v;
+        }
+        mean[j] /= static_cast<long double>(kRows);
+    }
+    const auto ref_cov = [&](std::size_t a, std::size_t b) {
+        long double s = 0;
+        for (std::size_t i = 0; i < kRows; ++i) {
+            s += (data[a][i] - mean[a]) * (data[b][i] - mean[b]);
+        }
+        return static_cast<double>(s / static_cast<long double>(kRows - 1));
+    };
+
+    runtime::TableRegistry registry;
+    {
+        runtime::Table t;
+        t.add_column("x", x);
+        t.add_column("y", y);
+        t.add_column("z", z);
+        registry.emplace("t", std::move(t));
+    }
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+    const std::array<std::string, 3> names{"x", "y", "z"};
+    for (const char* query : {"t[cov];", "t[corr];"}) {
+        INFO(query);
+        const bool is_cov = std::string_view(query) == "t[cov];";
+        auto ir = require_ir(query);
+        auto one = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+        auto four = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+        REQUIRE(one.has_value());
+        REQUIRE(four.has_value());
+        auto mismatch = runtime::compare_tables(*one, *four);
+        if (mismatch.has_value()) {
+            FAIL(mismatch->message());
+        }
+        for (std::size_t b = 0; b < 3; ++b) {
+            const auto& col = std::get<Column<double>>(*one->find(names[b]));
+            for (std::size_t a = 0; a < 3; ++a) {
+                const double expected =
+                    is_cov ? ref_cov(a, b)
+                           : ref_cov(a, b) / std::sqrt(ref_cov(a, a) * ref_cov(b, b));
+                CHECK(col[a] == Catch::Approx(expected).epsilon(1e-12));
+            }
+        }
+    }
+}
+
 TEST_CASE("cov: integer columns are widened to double", "[cov][matrix]") {
     runtime::Table t;
     t.add_column("a", Column<std::int64_t>{1, 2, 3, 4, 5});

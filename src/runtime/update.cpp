@@ -4613,6 +4613,28 @@ auto write_guarded_update(Table& output, const std::string& alias, GuardedWriteT
                                        RowTransform::Preserve));
 }
 
+/// True when evaluating `expr` on rows the guard does not select has no effect
+/// anyone can observe, so a guarded field may be computed for every row and
+/// then selected, like `when/then/otherwise`: Float64 column references,
+/// numeric literals and arithmetic. Float64 arithmetic cannot fail, warn or
+/// draw randomness, and `/` and `%` on integer literals are total. Anything
+/// else (a call, a lexical scalar, an Int64 or Decimal column, which can
+/// overflow) keeps the matched-rows-only evaluation SPEC.md promises.
+auto is_speculation_safe(const ir::Expr& expr, const Table& table) -> bool {
+    if (const auto* ref = std::get_if<ir::ColumnRef>(&expr.node)) {
+        const auto* column = ref->lexical ? nullptr : table.find(ref->name);
+        return column != nullptr && std::holds_alternative<Column<double>>(*column);
+    }
+    if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
+        return std::holds_alternative<double>(lit->value) ||
+               std::holds_alternative<std::int64_t>(lit->value);
+    }
+    if (const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node)) {
+        return is_speculation_safe(*bin->left, table) && is_speculation_safe(*bin->right, table);
+    }
+    return false;
+}
+
 }  // namespace
 
 /// Execute a guarded update `where <predicate> update { ... }`: rows matching
@@ -4634,24 +4656,63 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
     }
     const std::size_t n = input.rows();
 
-    // Mask: a row matches iff the predicate is true AND not null.
-    auto mask = compute_mask(*update.guard(), input, scalars, RowRange::whole(n));
-    if (!mask) {
-        return std::unexpected(mask.error());
-    }
-    // Fold the 3VL validity into the mask bytes. Every consumer below asks the
-    // same question — "true and not null?" — so answering it once turns each of
+    // Whether this update fans out. When it does not, every step below takes
+    // the serial path it always took: evaluating a field on every row and
+    // selecting pays only when the rows are split across workers.
+    // The budget is checked before the pool, so a serial query never creates
+    // the pool just to ask its size.
+    const bool parallel = exec.can_fan_out() && !on_worker_pool_thread() &&
+                          n >= exec.parallel_min_rows && exec.compute_budget() >= 2 &&
+                          process_worker_pool().size() >= 2;
+
+    // Mask: a row matches iff the predicate is true AND not null. The 3VL
+    // validity is folded into the bytes: every consumer below asks the same
+    // question — "true and not null?" — so answering it once turns each of
     // them into a single dense byte read instead of a byte read plus a
-    // conditional bit probe, and lets the literal path below vectorize.
-    if (mask->valid.has_value()) {
-        const std::uint8_t* mask_valid = mask->valid->data();
-        std::uint8_t* bytes = mask->value.data();
-        for (std::size_t i = 0; i < n; ++i) {
-            bytes[i] = static_cast<std::uint8_t>(bytes[i] != 0 && mask_valid[i] != 0);
+    // conditional bit probe, and lets the select loops vectorize. A guard the
+    // evaluators can run by range is computed in parallel ranges.
+    Mask whole_mask;
+    ::ibex::detail::NoInitVector<std::uint8_t> range_mask;
+    const std::uint8_t* matched_bytes = nullptr;
+    if (parallel && is_range_native_expr(*update.guard())) {
+        range_mask.resize(n);
+        std::mutex error_mutex;
+        std::optional<std::string> error;
+        for_row_ranges(&exec, n, [&](std::size_t begin, std::size_t end) {
+            auto mask = compute_mask(*update.guard(), input, scalars,
+                                     RowRange{.begin = begin, .count = end - begin});
+            if (!mask) {
+                const std::scoped_lock lock(error_mutex);
+                error = std::move(mask.error());
+                return;
+            }
+            const std::uint8_t* values = mask->value.data();
+            const std::uint8_t* valid = mask->valid.has_value() ? mask->valid->data() : nullptr;
+            for (std::size_t i = 0; i < end - begin; ++i) {
+                range_mask[begin + i] = static_cast<std::uint8_t>(
+                    values[i] != 0 && (valid == nullptr || valid[i] != 0));
+            }
+        });
+        if (error.has_value()) {
+            return std::unexpected(std::move(*error));
         }
-        mask->valid.reset();
+        matched_bytes = range_mask.data();
+    } else {
+        auto mask = compute_mask(*update.guard(), input, scalars, RowRange::whole(n));
+        if (!mask) {
+            return std::unexpected(mask.error());
+        }
+        if (mask->valid.has_value()) {
+            const std::uint8_t* mask_valid = mask->valid->data();
+            std::uint8_t* bytes = mask->value.data();
+            for (std::size_t i = 0; i < n; ++i) {
+                bytes[i] = static_cast<std::uint8_t>(bytes[i] != 0 && mask_valid[i] != 0);
+            }
+            mask->valid.reset();
+        }
+        whole_mask = std::move(*mask);
+        matched_bytes = whole_mask.value.data();
     }
-    const std::uint8_t* matched_bytes = mask->value.data();
 
     // Common CASE-WHEN shape: replacing values in an existing, non-null,
     // fixed-width column with a literal. The general guarded-update path below
@@ -4716,8 +4777,22 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                             }
                             typename Col::value_type* dst = out.data();
                             const typename Col::value_type* src = old_col.data();
-                            for (std::size_t i = 0; i < n; ++i) {
-                                dst[i] = matched_bytes[i] != 0 ? value : src[i];
+                            if (parallel) {
+                                for_row_ranges(&exec, n,
+                                               [dst, src, matched_bytes, value](std::size_t begin,
+                                                                                std::size_t end) {
+                                                   for (std::size_t i = begin; i < end; ++i) {
+                                                       dst[i] =
+                                                           matched_bytes[i] != 0 ? value : src[i];
+                                                   }
+                                               });
+                            } else {
+                                // Measured: the same loop run through the
+                                // range helper's lambda is ~25% slower on one
+                                // core than written out here.
+                                for (std::size_t i = 0; i < n; ++i) {
+                                    dst[i] = matched_bytes[i] != 0 ? value : src[i];
+                                }
                             }
                         } else {
                             // `Column<bool>` reaches here and is bit-packed, so
@@ -4746,25 +4821,34 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                         out_valid.resize(n);
                         bool any_invalid = false;
                         if (!old_validity->is_external()) {
+                            // Ranges are 64-row aligned, so each owns whole words.
                             constexpr std::size_t kBits = 64;
                             const std::uint64_t* src = old_validity->words_data();
                             std::uint64_t* dst = out_valid.words_data();
-                            const std::size_t words = (n + kBits - 1) / kBits;
-                            for (std::size_t w = 0; w < words; ++w) {
-                                const std::size_t base = w * kBits;
-                                const std::size_t len = std::min(kBits, n - base);
-                                std::uint64_t bits = 0;
-                                for (std::size_t b = 0; b < len; ++b) {
-                                    bits |= static_cast<std::uint64_t>(matched_bytes[base + b] != 0)
+                            std::atomic<bool> saw_invalid{false};
+                            for_row_ranges(&exec, n, [&](std::size_t begin, std::size_t end) {
+                                bool local_invalid = false;
+                                for (std::size_t w = begin / kBits; w * kBits < end; ++w) {
+                                    const std::size_t base = w * kBits;
+                                    const std::size_t len = std::min(kBits, n - base);
+                                    std::uint64_t bits = 0;
+                                    for (std::size_t b = 0; b < len; ++b) {
+                                        bits |=
+                                            static_cast<std::uint64_t>(matched_bytes[base + b] != 0)
                                             << b;
+                                    }
+                                    const std::uint64_t all = len == kBits
+                                                                  ? ~std::uint64_t{0}
+                                                                  : ((std::uint64_t{1} << len) - 1);
+                                    const std::uint64_t merged = (src[w] | bits) & all;
+                                    dst[w] = merged;
+                                    local_invalid = local_invalid || merged != all;
                                 }
-                                const std::uint64_t all = len == kBits
-                                                              ? ~std::uint64_t{0}
-                                                              : ((std::uint64_t{1} << len) - 1);
-                                const std::uint64_t merged = (src[w] | bits) & all;
-                                dst[w] = merged;
-                                any_invalid = any_invalid || merged != all;
-                            }
+                                if (local_invalid) {
+                                    saw_invalid.store(true, std::memory_order_relaxed);
+                                }
+                            });
+                            any_invalid = saw_invalid.load(std::memory_order_relaxed);
                         } else {
                             // An adopted Arrow bitmap may sit at a bit offset
                             // and need not be word-aligned; read it bit by bit.
@@ -4792,16 +4876,29 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
         }
     }
 
+    // The matched rows as indices, built the first time a field needs them:
+    // the parallel blend below reads the mask bytes instead.
     std::vector<std::size_t> matched_idx;
-    matched_idx.reserve(n / 8);
-    for (std::size_t i = 0; i < n; ++i) {
-        if (matched_bytes[i] != 0) {
-            matched_idx.push_back(i);
+    bool have_matched_idx = false;
+    const auto need_matched_idx = [&]() -> const std::vector<std::size_t>& {
+        if (!have_matched_idx) {
+            matched_idx.reserve(n / 8);
+            for (std::size_t i = 0; i < n; ++i) {
+                if (matched_bytes[i] != 0) {
+                    matched_idx.push_back(i);
+                }
+            }
+            have_matched_idx = true;
         }
-    }
+        return matched_idx;
+    };
 
     Table output = std::move(input);
-    std::optional<Table> sub;  // matching rows of the original columns (built lazily)
+    // The table as it stood when the first subset-evaluable field was reached:
+    // every such field reads it, whether it runs on the matching rows (`sub`,
+    // gathered from it) or speculatively on all of them.
+    std::optional<Table> snapshot;
+    std::optional<Table> sub;  // matching rows of `snapshot` (built lazily)
     robin_hood::unordered_set<std::string> subset_refs;
     for (const auto& field : update.fields()) {
         if (ir::is_subset_evaluable_expr(field.expr)) {
@@ -4820,29 +4917,41 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                                               : nullptr;
 
         // Evaluate the field. Subset-evaluable fields run on the matching rows
-        // only; the rest run over the full table.
-        const bool subset = ir::is_subset_evaluable_expr(field.expr);
+        // only, unless they are speculation-safe, in which case they run on
+        // every row of the same snapshot and are selected below; the rest run
+        // over the full table.
+        const bool subset_evaluable = ir::is_subset_evaluable_expr(field.expr);
+        if (subset_evaluable && !snapshot.has_value()) {
+            // A subset expression only needs the columns it references.
+            // Avoid gathering unrelated payload columns (often the bulk
+            // of a wide table) merely to evaluate one guarded assignment.
+            Table subset_source;
+            for (const auto& entry : output.columns) {
+                if (subset_refs.contains(entry.name)) {
+                    subset_source.add_column_from(entry.name, entry);
+                }
+            }
+            if (subset_source.columns.empty()) {
+                subset_source.logical_rows = n;
+            }
+            snapshot = std::move(subset_source);
+        }
+        const bool speculative =
+            parallel && subset_evaluable && is_speculation_safe(field.expr, *snapshot);
+        const bool subset = subset_evaluable && !speculative;
         std::shared_ptr<ColumnValue> new_vals;
         std::optional<ValidityBitmap> new_valid;
         {
             if (subset && !sub.has_value()) {
-                // A subset expression only needs the columns it references.
-                // Avoid gathering unrelated payload columns (often the bulk
-                // of a wide table) merely to evaluate one guarded assignment.
-                Table subset_source;
-                for (const auto& entry : output.columns) {
-                    if (subset_refs.contains(entry.name)) {
-                        subset_source.add_column_from(entry.name, entry);
-                    }
-                }
-                if (subset_source.columns.empty()) {
-                    subset_source.logical_rows = matched_idx.size();
-                    sub = std::move(subset_source);
+                if (snapshot->columns.empty()) {
+                    Table empty;
+                    empty.logical_rows = need_matched_idx().size();
+                    sub = std::move(empty);
                 } else {
-                    sub = gather_rows(subset_source, matched_idx);
+                    sub = gather_rows(*snapshot, need_matched_idx());
                 }
             }
-            Table src_in = subset ? Table{*sub} : Table{output};
+            Table src_in = subset ? Table{*sub} : speculative ? Table{*snapshot} : Table{output};
             auto upd = update_table(std::move(src_in), {field}, scalars, externs, exec);
             if (!upd) {
                 return std::unexpected(upd.error());
@@ -4868,6 +4977,96 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                 using Col = std::decay_t<decltype(src)>;
                 const Col* oldc = old_col != nullptr ? &std::get<Col>(*old_col) : nullptr;
 
+                // Values computed for every row (a full-table or speculative
+                // field) into a dense column: one select per row, in parallel
+                // 64-aligned ranges, which also makes the validity writes
+                // word-disjoint.
+                if constexpr (is_dense_column_v<Col>) {
+                    if (!subset && parallel) {
+                        using Value = Col::value_type;
+                        Col out;
+                        if constexpr (std::is_trivially_default_constructible_v<Value>) {
+                            out.resize_for_overwrite(n);
+                        } else {
+                            out.resize(n);
+                        }
+                        Value* dst = out.data();
+                        const Value* new_data = src.data();
+                        const Value* old_data = oldc != nullptr ? oldc->data() : nullptr;
+                        // A row is valid when it takes a valid value from its
+                        // side: the new value where matched, the old one (if
+                        // any) elsewhere. Worked a word at a time from the
+                        // mask bytes and the two bitmaps.
+                        const bool track_validity =
+                            oldc == nullptr || old_valid != nullptr || new_valid.has_value();
+                        const bool words_ok = (old_valid == nullptr || !old_valid->is_external()) &&
+                                              (!new_valid.has_value() || !new_valid->is_external());
+                        constexpr std::size_t kBits = 64;
+                        const std::uint64_t* new_words =
+                            new_valid.has_value() && words_ok ? new_valid->words_data() : nullptr;
+                        const std::uint64_t* old_words =
+                            old_valid != nullptr && words_ok ? old_valid->words_data() : nullptr;
+                        ValidityBitmap valid(track_validity ? n : 0, true);
+                        std::uint64_t* valid_words = track_validity ? valid.words_data() : nullptr;
+                        std::atomic<bool> saw_invalid{false};
+                        for_row_ranges(&exec, n, [&](std::size_t begin, std::size_t end) {
+                            for (std::size_t i = begin; i < end; ++i) {
+                                // The payload under a null is never read by
+                                // Ibex, but goes to Arrow on export, so a new
+                                // column's unmatched rows are zero, not garbage.
+                                dst[i] = matched_bytes[i] != 0 ? new_data[i]
+                                         : old_data != nullptr ? old_data[i]
+                                                               : Value{};
+                            }
+                            if (!track_validity) {
+                                return;
+                            }
+                            bool local_invalid = false;
+                            for (std::size_t w = begin / kBits; w * kBits < end; ++w) {
+                                const std::size_t base = w * kBits;
+                                const std::size_t len = std::min(kBits, n - base);
+                                const std::uint64_t all = len == kBits
+                                                              ? ~std::uint64_t{0}
+                                                              : ((std::uint64_t{1} << len) - 1);
+                                std::uint64_t m = 0;
+                                for (std::size_t b = 0; b < len; ++b) {
+                                    m |= static_cast<std::uint64_t>(matched_bytes[base + b] != 0)
+                                         << b;
+                                }
+                                std::uint64_t new_bits = all;
+                                std::uint64_t old_bits = oldc != nullptr ? all : 0;
+                                if (words_ok) {
+                                    new_bits = new_words != nullptr ? new_words[w] : all;
+                                    if (old_words != nullptr) {
+                                        old_bits = old_words[w];
+                                    }
+                                } else {
+                                    for (std::size_t b = 0; b < len; ++b) {
+                                        const std::uint64_t bit = std::uint64_t{1} << b;
+                                        if (new_valid.has_value() && !(*new_valid)[base + b]) {
+                                            new_bits &= ~bit;
+                                        }
+                                        if (old_valid != nullptr && !(*old_valid)[base + b]) {
+                                            old_bits &= ~bit;
+                                        }
+                                    }
+                                }
+                                const std::uint64_t merged =
+                                    ((m & new_bits) | (~m & old_bits)) & all;
+                                valid_words[w] = merged;
+                                local_invalid = local_invalid || merged != all;
+                            }
+                            if (local_invalid) {
+                                saw_invalid.store(true, std::memory_order_relaxed);
+                            }
+                        });
+                        return {ColumnValue{std::move(out)},
+                                saw_invalid.load(std::memory_order_relaxed)
+                                    ? std::optional<ValidityBitmap>{std::move(valid)}
+                                    : std::nullopt};
+                    }
+                }
+
                 // The overwhelmingly common case has valid values on both
                 // arms. Start with the required copy of the old output column,
                 // then scatter only matching rows into it. This avoids a
@@ -4890,12 +5089,13 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                                 out[dst] = src[s];
                             }
                         };
+                        const auto& rows_matched = need_matched_idx();
                         if (subset) {
-                            for (std::size_t k = 0; k < matched_idx.size(); ++k) {
-                                scatter(matched_idx[k], k);
+                            for (std::size_t k = 0; k < rows_matched.size(); ++k) {
+                                scatter(rows_matched[k], k);
                             }
                         } else {
-                            for (const std::size_t i : matched_idx) {
+                            for (const std::size_t i : rows_matched) {
                                 scatter(i, i);
                             }
                         }
@@ -4914,14 +5114,15 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                         // null is never read by Ibex, but it is still handed
                         // to Arrow on export, so it must not be garbage.
                         out.resize(n);
+                        const auto& rows_matched = need_matched_idx();
                         ValidityBitmap valid(n, false);
-                        bool any_invalid = matched_idx.size() < n;
+                        bool any_invalid = rows_matched.size() < n;
                         typename Col::value_type* out_values = nullptr;
                         if constexpr (is_dense_column_v<Col>) {
                             out_values = out.data();
                         }
-                        for (std::size_t k = 0; k < matched_idx.size(); ++k) {
-                            const std::size_t i = matched_idx[k];
+                        for (std::size_t k = 0; k < rows_matched.size(); ++k) {
+                            const std::size_t i = rows_matched[k];
                             const std::size_t si = subset ? k : i;
                             if (new_valid.has_value() && !(*new_valid)[si]) {
                                 any_invalid = true;

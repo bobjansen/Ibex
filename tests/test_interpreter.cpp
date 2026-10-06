@@ -7407,6 +7407,83 @@ TEST_CASE("null-aware functions and booleans in value position", "[null_aware]")
     CHECK(big[2]);
 }
 
+TEST_CASE("guarded update: a parallel run gives the serial answer", "[guarded_update][parallel]") {
+    // Four workers take the parallel mask, the all-rows evaluation of plain
+    // Float64 arithmetic and the parallel select; one worker takes the
+    // matched-rows-only path. They must agree on every shape, nulls included.
+    // 1000 rows cross several 64-row ranges.
+    constexpr std::size_t kRows = 1000;
+    Column<double> price;
+    Column<double> nullable;
+    Column<std::int64_t> qty;
+    runtime::ValidityBitmap nullable_valid(kRows, true);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        price.push_back(static_cast<double>((i * 37) % 1000) + 0.25);
+        nullable.push_back(static_cast<double>(i));
+        qty.push_back(static_cast<std::int64_t>(i % 17));
+        if (i % 7 == 0) {
+            nullable_valid.set(i, false);
+        }
+    }
+    runtime::TableRegistry registry;
+    {
+        runtime::Table t;
+        t.add_column("price", price);
+        t.add_column("nullable", nullable, nullable_valid);
+        t.add_column("qty", qty);
+        registry.emplace("t", std::move(t));
+    }
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+    for (const char* query : {
+             "t[where price > 900.0 update { price = 900.0 }];",
+             "t[where price > 900.0 update { price = price * 0.9 }];",
+             "t[where price > 900.0 update { price = price * 0.9, excess = price - 900.0 }];",
+             "t[where price > 900.0 update { prev = lag(price, 1) }];",
+             "t[where is_null(nullable) update { nullable = 0.0 }];",
+             "t[where nullable > 500.0 update { nullable = nullable / 2.0 }];",
+             "t[where price < 100.0 update { qty = price * 2.0 }];",
+             "t[where qty == 3 update { doubled = price + price }];",
+             "t[where nullable > 10.0 update { price = nullable - 1.0 }];",
+         }) {
+        INFO(query);
+        auto ir = require_ir(query);
+        auto one = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+        auto four = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+        REQUIRE(one.has_value());
+        REQUIRE(four.has_value());
+        auto mismatch = runtime::compare_tables(*one, *four);
+        if (mismatch.has_value()) {
+            FAIL(mismatch->message());
+        }
+    }
+
+    // Every field of a guarded update reads the input as it was: `excess`
+    // sees the old price, not the one `price` was just given.
+    auto ir = require_ir(
+        "t[where price > 900.0 update { price = price * 0.5, excess = price - 900.0 }];");
+    auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+    REQUIRE(out.has_value());
+    const auto& new_price = std::get<Column<double>>(*out->find("price"));
+    const auto* excess = out->find_entry("excess");
+    REQUIRE(excess != nullptr);
+    const auto& excess_values = std::get<Column<double>>(*excess->column);
+    std::size_t wrong = 0;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        if (price[i] > 900.0) {
+            wrong += new_price[i] != price[i] * 0.5 ? 1U : 0U;
+            wrong += runtime::is_null(*excess, i) || excess_values[i] != price[i] - 900.0 ? 1U : 0U;
+        } else {
+            wrong += new_price[i] != price[i] ? 1U : 0U;
+            wrong += runtime::is_null(*excess, i) ? 0U : 1U;
+        }
+    }
+    CHECK(wrong == 0);
+}
+
 TEST_CASE("guarded update: where C update keeps non-matching rows", "[guarded_update]") {
     auto make = [] {
         runtime::Table t;

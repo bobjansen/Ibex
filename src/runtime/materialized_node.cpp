@@ -579,7 +579,7 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
             if (!child) {
                 return std::unexpected(child.error());
             }
-            return cov_table(child.value());
+            return cov_table(child.value(), &exec);
         }
         case ir::NodeKind::Corr: {
             if (node.children().empty()) {
@@ -590,7 +590,7 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
             if (!child) {
                 return std::unexpected(child.error());
             }
-            return corr_table(child.value());
+            return corr_table(child.value(), &exec);
         }
         case ir::NodeKind::Transpose: {
             if (node.children().empty()) {

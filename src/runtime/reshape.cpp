@@ -278,85 +278,187 @@ void for_reshape_ranges(std::size_t workers, std::size_t n, std::size_t ranges, 
     return tail != 0 && (words[bits / 64] | (~std::uint64_t{0} << tail)) != ~std::uint64_t{0};
 }
 
-}  // namespace
+/// The numeric (Float64 and Int64) columns of `input`, in column order, read
+/// in place.
+struct NumericColumns {
+    std::vector<std::string> names;
+    std::vector<const Column<double>*> doubles;     ///< per column, or null
+    std::vector<const Column<std::int64_t>*> ints;  ///< per column, or null
 
-auto cov_table(const Table& input) -> std::expected<Table, std::string> {
-    auto [names, data] = extract_numeric(input);
-    const std::size_t n = names.size();
-    const std::size_t rows = data.empty() ? 0 : data[0].size();
+    [[nodiscard]] auto size() const -> std::size_t { return names.size(); }
 
+    /// Copy rows [begin, end) of column `j` into `out`, as doubles.
+    void load(std::size_t j, std::size_t begin, std::size_t end, double* out) const {
+        if (doubles[j] != nullptr) {
+            std::copy(doubles[j]->data() + begin, doubles[j]->data() + end, out);
+        } else {
+            const std::int64_t* src = ints[j]->data();
+            for (std::size_t i = begin; i < end; ++i) {
+                out[i - begin] = static_cast<double>(src[i]);
+            }
+        }
+    }
+};
+
+auto numeric_columns(const Table& input) -> NumericColumns {
+    NumericColumns out;
+    for (const auto& entry : input.columns) {
+        const auto* d = std::get_if<Column<double>>(entry.column.get());
+        const auto* i = std::get_if<Column<std::int64_t>>(entry.column.get());
+        if (d != nullptr || i != nullptr) {
+            out.names.push_back(entry.name);
+            out.doubles.push_back(d);
+            out.ints.push_back(i);
+        }
+    }
+    return out;
+}
+
+/// The sample covariance matrix of `input`'s numeric columns, or an error
+/// naming `op`.
+///
+/// Two passes, as before (means, then co-moments about them), now over fixed
+/// blocks of rows: each block is summed in four lanes, so the loop vectorizes,
+/// and every column pair is accumulated in the same pass over a block, rather
+/// than one pass per pair. Blocks run across workers, but the block size is
+/// fixed and partial sums are combined in block order, so the result does not
+/// depend on the number of workers.
+auto covariance_matrix(const Table& input, const ExecutionContext* exec, std::string_view op)
+    -> std::expected<std::pair<std::vector<std::string>, std::vector<std::vector<double>>>,
+                     std::string> {
+    const NumericColumns cols = numeric_columns(input);
+    const std::size_t n = cols.size();
+    const std::size_t rows = input.rows();
     if (n == 0) {
-        return std::unexpected("cov: no numeric columns found");
+        return std::unexpected(std::string(op) + ": no numeric columns found");
     }
     if (rows < 2) {
-        return std::unexpected("cov: need at least 2 rows to compute covariance");
+        return std::unexpected(std::string(op) + ": need at least 2 rows to compute " +
+                               (op == "cov" ? "covariance" : "correlation"));
     }
 
-    std::vector<double> mean(n, 0.0);
-    for (std::size_t j = 0; j < n; ++j) {
-        for (std::size_t i = 0; i < rows; ++i) {
-            mean[j] += data[j][i];
+    constexpr std::size_t kBlock = 4096;
+    constexpr std::size_t kLanes = 4;
+    const std::size_t blocks = (rows + kBlock - 1) / kBlock;
+    const std::size_t workers = reshape_workers(exec, rows);
+    const auto lane_sum = [](const double* x, std::size_t len) {
+        std::array<double, kLanes> acc{};
+        std::size_t i = 0;
+        for (; i + kLanes <= len; i += kLanes) {
+            for (std::size_t l = 0; l < kLanes; ++l) {
+                acc[l] += x[i + l];
+            }
         }
-        mean[j] /= static_cast<double>(rows);
+        for (; i < len; ++i) {
+            acc[0] += x[i];
+        }
+        return (acc[0] + acc[1]) + (acc[2] + acc[3]);
+    };
+
+    // Pass 1: the means.
+    std::vector<double> block_sums(blocks * n);
+    for_reshape_tasks(workers, blocks, [&](std::size_t blk) {
+        const std::size_t begin = blk * kBlock;
+        const std::size_t end = std::min(rows, begin + kBlock);
+        std::array<double, kBlock> buf;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+        for (std::size_t j = 0; j < n; ++j) {
+            cols.load(j, begin, end, buf.data());
+            block_sums[(blk * n) + j] = lane_sum(buf.data(), end - begin);
+        }
+    });
+    std::vector<double> mean(n, 0.0);
+    for (std::size_t blk = 0; blk < blocks; ++blk) {
+        for (std::size_t j = 0; j < n; ++j) {
+            mean[j] += block_sums[(blk * n) + j];
+        }
+    }
+    for (auto& m : mean) {
+        m /= static_cast<double>(rows);
     }
 
+    // Pass 2: every pair's co-moment about the means. Pair (a, b), a <= b, is
+    // slot a * n + b.
+    std::vector<double> block_moments(blocks * n * n, 0.0);
+    for_reshape_tasks(workers, blocks, [&](std::size_t blk) {
+        const std::size_t begin = blk * kBlock;
+        const std::size_t len = std::min(rows, begin + kBlock) - begin;
+        std::vector<double> centred(n * kBlock);
+        for (std::size_t j = 0; j < n; ++j) {
+            double* x = centred.data() + (j * kBlock);
+            cols.load(j, begin, begin + len, x);
+            for (std::size_t i = 0; i < len; ++i) {
+                x[i] -= mean[j];
+            }
+        }
+        double* moments = block_moments.data() + (blk * n * n);
+        for (std::size_t a = 0; a < n; ++a) {
+            const double* xa = centred.data() + (a * kBlock);
+            for (std::size_t b = a; b < n; ++b) {
+                const double* xb = centred.data() + (b * kBlock);
+                std::array<double, kLanes> acc{};
+                std::size_t i = 0;
+                for (; i + kLanes <= len; i += kLanes) {
+                    for (std::size_t l = 0; l < kLanes; ++l) {
+                        acc[l] += xa[i + l] * xb[i + l];
+                    }
+                }
+                for (; i < len; ++i) {
+                    acc[0] += xa[i] * xb[i];
+                }
+                moments[(a * n) + b] = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+            }
+        }
+    });
     const auto denom = static_cast<double>(rows - 1);
     std::vector<std::vector<double>> cov(n, std::vector<double>(n, 0.0));
     for (std::size_t a = 0; a < n; ++a) {
         for (std::size_t b = a; b < n; ++b) {
             double s = 0.0;
-            for (std::size_t i = 0; i < rows; ++i) {
-                s += (data[a][i] - mean[a]) * (data[b][i] - mean[b]);
+            for (std::size_t blk = 0; blk < blocks; ++blk) {
+                s += block_moments[(blk * n * n) + (a * n) + b];
             }
             cov[a][b] = cov[b][a] = s / denom;
         }
     }
+    return std::pair{cols.names, std::move(cov)};
+}
 
+/// A square matrix as a table: a `column` label column, then one Float64
+/// column per name.
+auto matrix_table(const std::vector<std::string>& names,
+                  const std::vector<std::vector<double>>& matrix) -> Table {
     Table out;
     Column<std::string> label_col;
     for (const auto& nm : names) {
         label_col.push_back(nm);
     }
     out.add_column("column", std::move(label_col));
-    for (std::size_t b = 0; b < n; ++b) {
-        Column<double> col_data(std::vector<double>(cov[b].begin(), cov[b].end()));
-        out.add_column(names[b], std::move(col_data));
+    for (std::size_t b = 0; b < names.size(); ++b) {
+        out.add_column(names[b],
+                       Column<double>(std::vector<double>(matrix[b].begin(), matrix[b].end())));
     }
     return out;
 }
 
-auto corr_table(const Table& input) -> std::expected<Table, std::string> {
-    auto [names, data] = extract_numeric(input);
+}  // namespace
+
+auto cov_table(const Table& input, const ExecutionContext* exec)
+    -> std::expected<Table, std::string> {
+    auto cov = covariance_matrix(input, exec, "cov");
+    if (!cov) {
+        return std::unexpected(std::move(cov.error()));
+    }
+    return matrix_table(cov->first, cov->second);
+}
+
+auto corr_table(const Table& input, const ExecutionContext* exec)
+    -> std::expected<Table, std::string> {
+    auto cov_result = covariance_matrix(input, exec, "corr");
+    if (!cov_result) {
+        return std::unexpected(std::move(cov_result.error()));
+    }
+    const auto& [names, cov] = *cov_result;
     const std::size_t n = names.size();
-    const std::size_t rows = data.empty() ? 0 : data[0].size();
-
-    if (n == 0) {
-        return std::unexpected("corr: no numeric columns found");
-    }
-    if (rows < 2) {
-        return std::unexpected("corr: need at least 2 rows to compute correlation");
-    }
-
-    std::vector<double> mean(n, 0.0);
-    for (std::size_t j = 0; j < n; ++j) {
-        for (std::size_t i = 0; i < rows; ++i) {
-            mean[j] += data[j][i];
-        }
-        mean[j] /= static_cast<double>(rows);
-    }
-
-    const auto denom = static_cast<double>(rows - 1);
-    std::vector<std::vector<double>> cov(n, std::vector<double>(n, 0.0));
-    for (std::size_t a = 0; a < n; ++a) {
-        for (std::size_t b = a; b < n; ++b) {
-            double s = 0.0;
-            for (std::size_t i = 0; i < rows; ++i) {
-                s += (data[a][i] - mean[a]) * (data[b][i] - mean[b]);
-            }
-            cov[a][b] = cov[b][a] = s / denom;
-        }
-    }
-
     std::vector<std::vector<double>> corr_mat(n, std::vector<double>(n, 0.0));
     for (std::size_t a = 0; a < n; ++a) {
         for (std::size_t b = 0; b < n; ++b) {
@@ -369,18 +471,7 @@ auto corr_table(const Table& input) -> std::expected<Table, std::string> {
             }
         }
     }
-
-    Table out;
-    Column<std::string> label_col;
-    for (const auto& nm : names) {
-        label_col.push_back(nm);
-    }
-    out.add_column("column", std::move(label_col));
-    for (std::size_t b = 0; b < n; ++b) {
-        Column<double> col_data(std::vector<double>(corr_mat[b].begin(), corr_mat[b].end()));
-        out.add_column(names[b], std::move(col_data));
-    }
-    return out;
+    return matrix_table(names, corr_mat);
 }
 
 auto transpose_table(const Table& input) -> std::expected<Table, std::string> {

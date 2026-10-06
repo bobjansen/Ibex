@@ -12,8 +12,10 @@
 
 namespace ibex::runtime {
 
-[[nodiscard]] auto cov_table(const Table& input) -> std::expected<Table, std::string>;
-[[nodiscard]] auto corr_table(const Table& input) -> std::expected<Table, std::string>;
+[[nodiscard]] auto cov_table(const Table& input, const ExecutionContext* exec)
+    -> std::expected<Table, std::string>;
+[[nodiscard]] auto corr_table(const Table& input, const ExecutionContext* exec)
+    -> std::expected<Table, std::string>;
 [[nodiscard]] auto transpose_table(const Table& input) -> std::expected<Table, std::string>;
 [[nodiscard]] auto matmul_table(const Table& left, const Table& right)
     -> std::expected<Table, std::string>;

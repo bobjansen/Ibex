@@ -12,13 +12,17 @@
 #include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "interpreter_internal.hpp"
 #include "kernel_filter.hpp"
 #include "kernel_gather.hpp"
 #include "kernel_types.hpp"
@@ -1289,14 +1293,15 @@ TEST_CASE("A declined split still avoids the table bridge", "[kernel][update][pa
 // A compiled arithmetic tree keeps the table bridge, on purpose. `aea4d347` gave
 // the tree a range-writing arm so `sqrt` over a column would split inside the
 // chunk kernel instead of crossing to the table evaluator, and this test pinned
-// that. The arm is withheld again: `eval_numeric_tree_double` interprets the
-// node array per row, where the table evaluator's own writer runs a compiled
-// loop, and q01 at SF-2 measured +34-79% at 2/4/8 cores on the arm. Declining
-// the split is how such a field keeps its parallelism rather than how it loses
-// it -- the table evaluator splits it too, just faster.
+// that. The arm was withheld again: the tree was then interpreted per row, where
+// the table evaluator's own writer runs a compiled loop, and q01 at SF-2
+// measured +34-79% at 2/4/8 cores on the arm. Declining the split is how such a
+// field keeps its parallelism rather than how it loses it -- the table
+// evaluator splits it too. The tree is now evaluated in blocks, but the arm
+// has not been re-measured on q01.
 //
 // The values are still asserted at the window boundaries, so if the arm is
-// re-offered once the tree is compiled, only the three stats lines move.
+// re-offered, only the three stats lines move.
 TEST_CASE("A compiled numeric tree keeps the table bridge", "[kernel][update][parallel]") {
     constexpr std::size_t kRows = 40'000;
     Column<double> price;
@@ -1336,6 +1341,76 @@ TEST_CASE("A compiled numeric tree keeps the table bridge", "[kernel][update][pa
     CHECK(stats.chunk_direct_updates.load() == 0);
     CHECK(stats.parallel_fields.load() == 1);
     CHECK(stats.parallel_direct_numeric_fields.load() == 1);
+}
+
+// The tree writer evaluates 1024-row blocks, and libmvec's answer is not
+// scalar libm's: a ragged range whose last block ends mid-vector must still
+// give each row the same bits as one whole-column call, or a result would
+// depend on where a range boundary fell -- and so on the worker count.
+TEST_CASE("A numeric tree gives the same bits over any split of its rows",
+          "[kernel][update][math]") {
+    constexpr std::size_t kRows = (2 * 1024) + 45;
+    Column<double> price;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        price.push_back((static_cast<double>((r * 7919) % 4001) - 2000.0) / 3.0);
+    }
+    runtime::Table table;
+    table.add_column("price", std::move(price));
+    auto col = [] { return ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}); };
+    auto call = [](const char* fn, ir::ExprPtr arg) {
+        std::vector<ir::ExprPtr> args;
+        args.push_back(std::move(arg));
+        return ir::make_expr_ptr(ir::Expr{
+            .node = ir::CallExpr{.callee = fn, .args = std::move(args), .named_args = {}}});
+    };
+    // sin(floor(price) / 7.0) * 2.0: a transcendental over a computed argument
+    // fed by an exact kernel. Doubling is exact, so a last-bit difference in
+    // sin survives into the result rather than being rounded away by a sum.
+    auto num = [](double v) {
+        return ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = v}});
+    };
+    auto binary = [](ir::ArithmeticOp op, ir::ExprPtr l, ir::ExprPtr r) {
+        return ir::make_expr_ptr(ir::Expr{
+            .node = ir::BinaryExpr{.op = op, .left = std::move(l), .right = std::move(r)}});
+    };
+    const auto root = binary(
+        ir::ArithmeticOp::Mul,
+        call("sin", binary(ir::ArithmeticOp::Div, call("floor", col()), num(7.0))), num(2.0));
+    const ir::Expr& expr = *root;
+    const runtime::PredicateInput input(table);
+    const auto plan = runtime::kernel::try_plan_direct_numeric_tree(expr, input, nullptr);
+    REQUIRE(plan.has_value());
+    REQUIRE(plan->type == runtime::ExprType::Double);
+
+    std::vector<double> whole(kRows);
+    REQUIRE(runtime::kernel::write_direct_numeric_tree_range(*plan, runtime::RowRange::whole(kRows),
+                                                             {.doubles = whole.data()}));
+    std::vector<double> split(kRows, 0.0);
+    std::size_t begin = 0;
+    // Odd widths put many rows in a range's last, partial vector.
+    for (const std::size_t width : {1U, 3U, 5U, 7U, 1021U, 6U, 9U, 11U, 1001U, 2U, 13U}) {
+        REQUIRE(runtime::kernel::write_direct_numeric_tree_range(
+            *plan, {.begin = begin, .count = width}, {.doubles = split.data() + begin}));
+        begin += width;
+    }
+    REQUIRE(runtime::kernel::write_direct_numeric_tree_range(
+        *plan, {.begin = begin, .count = kRows - begin}, {.doubles = split.data() + begin}));
+
+    std::size_t differ = 0;
+    std::size_t wrong = 0;
+    const auto& source = std::get<Column<double>>(*table.find("price"));
+    for (std::size_t r = 0; r < kRows; ++r) {
+        differ += std::bit_cast<std::uint64_t>(whole[r]) == std::bit_cast<std::uint64_t>(split[r])
+                      ? 0U
+                      : 1U;
+        const double expected = std::sin(std::floor(source[r]) / 7.0) * 2.0;
+        wrong += std::fabs(whole[r] - expected) <= 8 * std::numeric_limits<double>::epsilon() *
+                                                       std::max(1.0, std::fabs(expected))
+                     ? 0U
+                     : 1U;
+    }
+    CHECK(differ == 0);
+    CHECK(wrong == 0);
 }
 
 // A multi-field clause folds one field at a time in parallel mode too, each

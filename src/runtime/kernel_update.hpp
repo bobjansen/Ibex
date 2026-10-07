@@ -24,6 +24,7 @@
 
 #include "interpreter_internal.hpp"
 #include "kernel_gather.hpp"
+#include "numeric_math.hpp"
 #include "runtime_internal.hpp"
 
 namespace ibex::runtime {
@@ -165,7 +166,7 @@ struct NumericTreeNode {
     const double* doubles = nullptr;
     std::int64_t int_scalar = 0;
     double double_scalar = 0.0;
-    double (*unary)(double) = nullptr;
+    UnaryMath unary = UnaryMath::Abs;
 };
 
 /// A compiled arithmetic tree over columns and scalars: the general numeric

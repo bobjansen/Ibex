@@ -7407,6 +7407,96 @@ TEST_CASE("null-aware functions and booleans in value position", "[null_aware]")
     CHECK(big[2]);
 }
 
+TEST_CASE("update: element-wise math gives the row formula on every row, serial and parallel",
+          "[update][math][parallel]") {
+    // Numeric trees are evaluated 1024 rows at a time; three blocks and a
+    // ragged tail cross every block edge. Serial runs the chunk kernel's tree,
+    // four workers the table evaluator: both must give the row formula, and
+    // each other's bits (they share one set of math kernels).
+    constexpr std::size_t kRows = (3 * 1024) + 37;
+    Column<double> x;
+    Column<std::int64_t> k;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        // Negatives, exact halves and fractions: where floor/ceil/trunc differ.
+        x.push_back((static_cast<double>((i * 7919) % 2001) - 1000.0) / 4.0);
+        k.push_back(static_cast<std::int64_t>((i * 31) % 23) - 11);
+    }
+    runtime::TableRegistry registry;
+    {
+        runtime::Table t;
+        t.add_column("x", x);
+        t.add_column("k", k);
+        registry.emplace("t", std::move(t));
+    }
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+
+    struct Case {
+        const char* query;
+        double (*row)(double, std::int64_t);
+        double ulps;  // 0: exact; else libmvec's documented error bound
+    };
+    const std::array<Case, 13> cases = {{
+        {"t[update { v = abs(x) }];", [](double v, std::int64_t) { return std::fabs(v); }, 0},
+        {"t[update { v = floor(x) }];", [](double v, std::int64_t) { return std::floor(v); }, 0},
+        {"t[update { v = ceil(x) }];", [](double v, std::int64_t) { return std::ceil(v); }, 0},
+        {"t[update { v = trunc(x) }];", [](double v, std::int64_t) { return std::trunc(v); }, 0},
+        {"t[update { v = sqrt(abs(x)) }];",
+         [](double v, std::int64_t) { return std::sqrt(std::fabs(v)); }, 0},
+        {"t[update { v = pmin(x, 3.5) + k % 3 }];",
+         [](double v, std::int64_t n) { return std::min(v, 3.5) + std::fmod(n, 3.0); }, 0},
+        {"t[update { v = x + abs(-2.5) }];", [](double v, std::int64_t) { return v + 2.5; }, 0},
+        {"t[update { v = exp(x / 1000.0) }];",
+         [](double v, std::int64_t) { return std::exp(v / 1000.0); }, 4},
+        {"t[update { v = log(abs(x) + 1.0) }];",
+         [](double v, std::int64_t) { return std::log(std::fabs(v) + 1.0); }, 4},
+        {"t[update { v = sin(x) }];", [](double v, std::int64_t) { return std::sin(v); }, 4},
+        {"t[update { v = cos(x) }];", [](double v, std::int64_t) { return std::cos(v); }, 4},
+        {"t[update { v = tanh(x / 7.0) }];",
+         [](double v, std::int64_t) { return std::tanh(v / 7.0); }, 4},
+        {"t[update { v = atan(x) * 2.0 }];",
+         [](double v, std::int64_t) { return std::atan(v) * 2.0; }, 4},
+    }};
+    for (const auto& c : cases) {
+        INFO(c.query);
+        auto ir = require_ir(c.query);
+        auto one = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+        auto four = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+        REQUIRE(one.has_value());
+        REQUIRE(four.has_value());
+        if (auto mismatch = runtime::compare_tables(*one, *four); mismatch.has_value()) {
+            FAIL(mismatch->message());
+        }
+        const auto& v = std::get<Column<double>>(*one->find("v"));
+        REQUIRE(v.size() == kRows);
+        std::size_t wrong = 0;
+        for (std::size_t i = 0; i < kRows; ++i) {
+            const double expected = c.row(x[i], k[i]);
+            const double tolerance = c.ulps * std::numeric_limits<double>::epsilon() *
+                                     std::max(1.0, std::fabs(expected));
+            wrong += std::fabs(v[i] - expected) <= tolerance ? 0U : 1U;
+        }
+        CHECK(wrong == 0);
+    }
+
+    // An Int tree stays Int end to end.
+    auto ir = require_ir("t[update { v = k * 3 - pmax(k, 2) % 5 }];");
+    auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+    REQUIRE(out.has_value());
+    const auto& v = std::get<Column<std::int64_t>>(*out->find("v"));
+    std::size_t wrong = 0;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        wrong += v[i] == (k[i] * 3) -
+                             runtime::safe_imod(std::max<std::int64_t>(k[i], 2), std::int64_t{5})
+                     ? 0U
+                     : 1U;
+    }
+    CHECK(wrong == 0);
+}
+
 TEST_CASE("guarded update: a parallel run gives the serial answer", "[guarded_update][parallel]") {
     // Four workers take the parallel mask, the all-rows evaluation of plain
     // Float64 arithmetic and the parallel select; one worker takes the

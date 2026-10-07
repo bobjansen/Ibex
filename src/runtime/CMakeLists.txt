@@ -24,6 +24,7 @@ add_library(ibex_runtime STATIC
     join.cpp
     kernel_filter.cpp
     kernel_update.cpp
+    numeric_math.cpp
     lazy_table.cpp
     static_range_filter.cpp
     model.cpp

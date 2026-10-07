@@ -42,14 +42,9 @@
 #include <variant>
 #include <vector>
 
-#include "kernel_update.hpp"
-#include "zorro.hpp"
-
-#if defined(__AVX2__) || defined(__BMI2__)
-#include <immintrin.h>
-#endif
-
 #include "interpreter_internal.hpp"
+#include "kernel_update.hpp"
+#include "numeric_math.hpp"
 #include "runtime_internal.hpp"
 
 namespace ibex::runtime {
@@ -516,47 +511,6 @@ auto try_write_fast_update_binary(const ir::Expr& expr, const Table& input, RowR
     return true;
 }
 
-}  // namespace
-
-// Pure double→double row-wise math builtins (sqrt/log/exp/trig + the
-// type-preserving abs/floor/ceil/trunc when applied to a Double). Looked up by
-// name so they can be compiled into the no-variant numeric fast path instead of
-// the per-row scalar registry. Returns nullptr for names not in this set.
-using UnaryDoubleFn = double (*)(double);
-namespace {
-
-auto lookup_unary_double_fn(std::string_view name) -> UnaryDoubleFn {
-    static const robin_hood::unordered_map<std::string_view, UnaryDoubleFn> table = {
-        {"sqrt", [](double x) { return std::sqrt(x); }},
-        {"log", [](double x) { return std::log(x); }},
-        {"exp", [](double x) { return std::exp(x); }},
-        {"log2", [](double x) { return std::log2(x); }},
-        {"log10", [](double x) { return std::log10(x); }},
-        {"sin", [](double x) { return std::sin(x); }},
-        {"cos", [](double x) { return std::cos(x); }},
-        {"tan", [](double x) { return std::tan(x); }},
-        {"asin", [](double x) { return std::asin(x); }},
-        {"acos", [](double x) { return std::acos(x); }},
-        {"atan", [](double x) { return std::atan(x); }},
-        {"sinh", [](double x) { return std::sinh(x); }},
-        {"cosh", [](double x) { return std::cosh(x); }},
-        {"tanh", [](double x) { return std::tanh(x); }},
-        {"abs", [](double x) { return std::fabs(x); }},
-        {"floor", [](double x) { return std::floor(x); }},
-        {"ceil", [](double x) { return std::ceil(x); }},
-        {"trunc", [](double x) { return std::trunc(x); }},
-    };
-    auto it = table.find(name);
-    return it == table.end() ? nullptr : it->second;
-}
-
-// abs/floor/ceil/trunc preserve the argument type (Int stays Int); only these
-// may take an Int argument on the fast path. The transcendentals always widen
-// to Double, so an Int argument is cast.
-auto unary_fn_is_type_preserving(std::string_view name) -> bool {
-    return name == "abs" || name == "floor" || name == "ceil" || name == "trunc";
-}
-
 struct NumericUpdateNode {
     enum class Kind : std::uint8_t {
         IntColumn,
@@ -579,7 +533,7 @@ struct NumericUpdateNode {
     const double* dbl = nullptr;
     std::int64_t int_lit = 0;
     double dbl_lit = 0.0;
-    UnaryDoubleFn dbl_fn = nullptr;
+    UnaryMath dbl_fn = UnaryMath::Abs;
     std::int64_t (*int_fn)(double) = nullptr;
 };
 
@@ -845,7 +799,7 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
         // Unary double→double math (sqrt/log/exp/…, and abs/floor/ceil/trunc on
         // a Double argument): compile the child, wrap in a UnaryDouble node.
         if (call->args.size() == 1 && call->named_args.empty()) {
-            if (auto fn = lookup_unary_double_fn(call->callee)) {
+            if (const auto fn = lookup_unary_math(call->callee); fn.has_value()) {
                 auto child = try_compile_numeric_update_expr(*call->args[0], input, scalars, nodes,
                                                              temps, range);
                 if (!child.has_value()) {
@@ -853,15 +807,14 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
                 }
                 // abs/floor/ceil/trunc keep an Int argument Int — leave those to
                 // the generic path (this fast node always yields Double).
-                if (unary_fn_is_type_preserving(call->callee) &&
-                    nodes[*child].type != ExprType::Double) {
+                if (unary_math_is_type_preserving(*fn) && nodes[*child].type != ExprType::Double) {
                     return std::nullopt;
                 }
                 NumericUpdateNode node;
                 node.kind = NumericUpdateNode::Kind::UnaryDouble;
                 node.type = ExprType::Double;
                 node.left = *child;
-                node.dbl_fn = fn;
+                node.dbl_fn = *fn;
                 nodes.push_back(node);
                 return static_cast<std::uint32_t>(nodes.size() - 1);
             }
@@ -1055,11 +1008,10 @@ auto eval_numeric_double_node_block(const NumericUpdateNode& node, std::uint32_t
         case NumericUpdateNode::Kind::UnaryDouble: {
             const auto src = values[node.left];
             if (src.data == nullptr) {
-                value = NumericBlockValue<double>{.scalar = node.dbl_fn(src.scalar)};
+                value =
+                    NumericBlockValue<double>{.scalar = apply_unary_math(node.dbl_fn, src.scalar)};
             } else {
-                for (std::size_t i = 0; i < count; ++i) {
-                    dst[i] = node.dbl_fn(src.data[i]);
-                }
+                apply_unary_math(node.dbl_fn, src.data, dst, count);
                 value = NumericBlockValue<double>{.data = dst};
             }
             return;
@@ -1335,137 +1287,6 @@ auto try_fast_update_pminmax(const ir::Expr& expr, const Table& input, RowRange 
 
 }  // namespace
 
-// Vectorised transcendentals via libmvec — the same mechanism zorro uses for the
-// RNG normal/exponential paths. Fills dst[i] = fn(src[i]) in 4-wide AVX2 chunks +
-// a scalar tail, ~5–10× the scalar libm tree-walk. Returns false (caller falls
-// back to the scalar tree-walk) when the build lacks AVX2/libmvec or `name` has
-// no kernel here, so non-x86/glibc targets stay correct.
-#if defined(__AVX2__) && defined(ZORRO_USE_LIBMVEC)
-// glibc AVX2 packed-double symbols (one arg). Every name below is also a
-// registered scalar builtin, so the SIMD body and the scalar tail/fallback agree.
-// NOLINTBEGIN(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp) — these
-// are glibc's fixed vector-ABI symbol names; the spelling is not ours to choose.
-extern "C" {
-
-__m256d _ZGVdN4v_log2(__m256d) noexcept;
-__m256d _ZGVdN4v_log10(__m256d) noexcept;
-__m256d _ZGVdN4v_exp(__m256d) noexcept;
-__m256d _ZGVdN4v_sin(__m256d) noexcept;
-__m256d _ZGVdN4v_cos(__m256d) noexcept;
-__m256d _ZGVdN4v_tan(__m256d) noexcept;
-__m256d _ZGVdN4v_asin(__m256d) noexcept;
-__m256d _ZGVdN4v_acos(__m256d) noexcept;
-__m256d _ZGVdN4v_atan(__m256d) noexcept;
-__m256d _ZGVdN4v_sinh(__m256d) noexcept;
-__m256d _ZGVdN4v_cosh(__m256d) noexcept;
-__m256d _ZGVdN4v_tanh(__m256d) noexcept;
-}
-// NOLINTEND(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp)
-namespace {
-
-struct SimdKernel {
-    std::string_view name;
-    __m256d (*vec)(__m256d) noexcept;  // 4-wide AVX2 body
-    double (*scalar)(double);          // matching libm scalar for the tail
-};
-
-}  // namespace
-// Non-capturing lambdas decay to function pointers; std::log etc. are overloaded,
-// so wrap each to pin the double overload without an explicit cast per row.
-const std::array<SimdKernel, 13> kSimdKernels = {
-    {
-        {.name = "log", .vec = _ZGVdN4v_log, .scalar = [](double x) { return std::log(x); }},
-        {.name = "log2", .vec = _ZGVdN4v_log2, .scalar = [](double x) { return std::log2(x); }},
-        {.name = "log10", .vec = _ZGVdN4v_log10, .scalar = [](double x) { return std::log10(x); }},
-        {.name = "exp", .vec = _ZGVdN4v_exp, .scalar = [](double x) { return std::exp(x); }},
-        {.name = "sin", .vec = _ZGVdN4v_sin, .scalar = [](double x) { return std::sin(x); }},
-        {.name = "cos", .vec = _ZGVdN4v_cos, .scalar = [](double x) { return std::cos(x); }},
-        {.name = "tan", .vec = _ZGVdN4v_tan, .scalar = [](double x) { return std::tan(x); }},
-        {.name = "asin", .vec = _ZGVdN4v_asin, .scalar = [](double x) { return std::asin(x); }},
-        {.name = "acos", .vec = _ZGVdN4v_acos, .scalar = [](double x) { return std::acos(x); }},
-        {.name = "atan", .vec = _ZGVdN4v_atan, .scalar = [](double x) { return std::atan(x); }},
-        {.name = "sinh", .vec = _ZGVdN4v_sinh, .scalar = [](double x) { return std::sinh(x); }},
-        {.name = "cosh", .vec = _ZGVdN4v_cosh, .scalar = [](double x) { return std::cosh(x); }},
-        {.name = "tanh", .vec = _ZGVdN4v_tanh, .scalar = [](double x) { return std::tanh(x); }},
-    },
-};
-namespace {
-
-auto find_simd_kernel(std::string_view name) -> const SimdKernel* {
-    for (const auto& k : kSimdKernels) {
-        if (k.name == name) {
-            return &k;
-        }
-    }
-    return nullptr;
-}
-auto simd_transcendental(std::string_view name, const double* src, double* dst, std::size_t n)
-    -> bool {
-    const SimdKernel* k = find_simd_kernel(name);
-    if (k == nullptr) {
-        return false;
-    }
-    std::size_t i = 0;
-    for (; i + 4 <= n; i += 4) {
-        _mm256_storeu_pd(dst + i, k->vec(_mm256_loadu_pd(src + i)));
-    }
-    for (; i < n; ++i) {
-        dst[i] = k->scalar(src[i]);
-    }
-    return true;
-}
-// True iff simd_transcendental has a kernel for `name` on this build — lets the
-// unary fast path gate on it before materialising the argument.
-auto simd_transcendental_supported(std::string_view name) -> bool {
-    return find_simd_kernel(name) != nullptr;
-}
-
-}  // namespace
-#else
-namespace {
-
-auto simd_transcendental(std::string_view, const double*, double*, std::size_t) -> bool {
-    return false;
-}
-auto simd_transcendental_supported(std::string_view) -> bool {
-    return false;
-}
-}  // namespace
-#endif
-
-// Packed IEEE sqrt over a column: vsqrtpd on AVX2 chunks + a scalar tail.
-// std::sqrt sets errno on a negative argument, so without -fno-math-errno the
-// auto-vectorizer keeps the f(column) loop on scalar vsqrtsd (+ an errno-domain
-// branch) — ~2× slower than the packed form. Calling _mm256_sqrt_pd directly
-// sidesteps that for the whole-column shape without flipping errno semantics
-// TU-wide (which would pessimize the round→int64 loops). Bit-identical to
-// std::sqrt for finite inputs; sqrt(<0) is NaN either way, only errno differs,
-// which ibex never reads after a math builtin.
-#ifdef __AVX2__
-namespace {
-
-void simd_sqrt(const double* src, double* dst, std::size_t n) noexcept {
-    std::size_t i = 0;
-    for (; i + 4 <= n; i += 4) {
-        _mm256_storeu_pd(dst + i, _mm256_sqrt_pd(_mm256_loadu_pd(src + i)));
-    }
-    for (; i < n; ++i) {
-        dst[i] = std::sqrt(src[i]);
-    }
-}
-
-}  // namespace
-#else
-namespace {
-
-void simd_sqrt(const double* src, double* dst, std::size_t n) noexcept {
-    for (std::size_t i = 0; i < n; ++i) {
-        dst[i] = std::sqrt(src[i]);
-    }
-}
-}  // namespace
-#endif
-
 // Forward declaration: try_fast_update_unary materialises a computed log/exp
 // argument through the full numeric fast path, which is defined just below it.
 
@@ -1533,19 +1354,22 @@ auto try_fast_update_unary(const ir::Expr& expr, const Table& input, RowRange ra
         return ColumnValue{std::move(out)};
     }
 
-    // Transcendentals via libmvec: accept a bare Double column or any
-    // fast-computable numeric argument (materialised to a temp column first).
-    // simd_transcendental returns false for names it has no kernel for and for
-    // builds lacking AVX2/libmvec, so the caller falls back to the scalar
-    // tree-walk. (sqrt is handled by the dedicated vsqrtpd path below.)
-    if (call->args.size() == 1 && output_kind == ExprType::Double &&
-        simd_transcendental_supported(call->callee)) {
+    // double -> double math over a Double column: one column kernel
+    // (`apply_unary_math`: vroundpd/vandpd/vsqrtpd, libmvec for the
+    // transcendentals). A widening function also takes any fast-computable
+    // argument, materialised to a temp column first; abs/floor/ceil/trunc over
+    // anything but a Double column fall through to the blocked tree.
+    const auto fn = call->args.size() == 1 ? lookup_unary_math(call->callee) : std::nullopt;
+    if (fn.has_value() && output_kind == ExprType::Double) {
         auto arg = resolve_fast_operand(*call->args[0], input, scalars);
         ColumnValue owned;  // backing store if the argument is computed
         const double* src = nullptr;
         if (arg && arg->is_column && arg->kind == ExprType::Double) {
             src = std::get<Column<double>>(*arg->column).data() + begin;
         } else {
+            if (unary_math_is_type_preserving(*fn)) {
+                return std::nullopt;
+            }
             // Ranged: the temp comes back dense for the range, so the
             // `owned` pointer below is read at offset 0, not `begin`.
             auto materialised = try_fast_update_numeric_expr(*call->args[0], input, range,
@@ -1558,39 +1382,7 @@ auto try_fast_update_unary(const ir::Expr& expr, const Table& input, RowRange ra
         }
         Column<double> out;
         out.resize_for_overwrite(rows);
-        if (!simd_transcendental(call->callee, src, out.data(), rows)) {
-            return std::nullopt;  // no SIMD kernel on this target: tree-walk
-        }
-        return ColumnValue{std::move(out)};
-    }
-
-    if (call->args.size() == 1 && output_kind == ExprType::Double) {
-        auto arg = resolve_fast_operand(*call->args[0], input, scalars);
-        if (!arg || !arg->is_column || arg->kind != ExprType::Double) {
-            return std::nullopt;
-        }
-        const double* src = std::get<Column<double>>(*arg->column).data() + begin;
-        Column<double> out;
-        out.resize_for_overwrite(rows);
-        double* dst = out.data();
-        auto run = [&](auto k) {
-            for (std::size_t i = 0; i < rows; ++i)
-                dst[i] = k(src[i]);
-        };
-        const auto& f = call->callee;
-        if (f == "sqrt") {
-            simd_sqrt(src, dst, rows);
-        } else if (f == "abs") {
-            run([](double x) { return std::fabs(x); });
-        } else if (f == "floor") {
-            run([](double x) { return std::floor(x); });
-        } else if (f == "ceil") {
-            run([](double x) { return std::ceil(x); });
-        } else if (f == "trunc") {
-            run([](double x) { return std::trunc(x); });
-        } else {
-            return std::nullopt;  // transcendentals: tree-walk (libm-bound anyway)
-        }
+        apply_unary_math(*fn, src, out.data(), rows);
         return ColumnValue{std::move(out)};
     }
     return std::nullopt;

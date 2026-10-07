@@ -40,6 +40,7 @@
 #include "kernel_filter.hpp"
 #include "kernel_gather.hpp"
 #include "kernel_types.hpp"
+#include "numeric_math.hpp"
 #include "runtime_internal.hpp"
 
 namespace ibex::runtime::kernel {
@@ -92,48 +93,6 @@ struct NumericOperand {
     ScalarValue scalar;
     ExprType kind = ExprType::Int;
 };
-
-using UnaryDoubleFn = double (*)(double);
-
-auto lookup_unary_double(std::string_view name) -> UnaryDoubleFn {
-    if (name == "sqrt")
-        return [](double value) { return std::sqrt(value); };
-    if (name == "log")
-        return [](double value) { return std::log(value); };
-    if (name == "exp")
-        return [](double value) { return std::exp(value); };
-    if (name == "log2")
-        return [](double value) { return std::log2(value); };
-    if (name == "log10")
-        return [](double value) { return std::log10(value); };
-    if (name == "sin")
-        return [](double value) { return std::sin(value); };
-    if (name == "cos")
-        return [](double value) { return std::cos(value); };
-    if (name == "tan")
-        return [](double value) { return std::tan(value); };
-    if (name == "asin")
-        return [](double value) { return std::asin(value); };
-    if (name == "acos")
-        return [](double value) { return std::acos(value); };
-    if (name == "atan")
-        return [](double value) { return std::atan(value); };
-    if (name == "sinh")
-        return [](double value) { return std::sinh(value); };
-    if (name == "cosh")
-        return [](double value) { return std::cosh(value); };
-    if (name == "tanh")
-        return [](double value) { return std::tanh(value); };
-    if (name == "abs")
-        return [](double value) { return std::fabs(value); };
-    if (name == "floor")
-        return [](double value) { return std::floor(value); };
-    if (name == "ceil")
-        return [](double value) { return std::ceil(value); };
-    if (name == "trunc")
-        return [](double value) { return std::trunc(value); };
-    return nullptr;
-}
 
 auto resolve_numeric_operand(const ir::Expr& expr, const PredicateInput& input,
                              const ScalarRegistry* scalars) -> std::optional<NumericOperand> {
@@ -246,18 +205,16 @@ auto compile_numeric_tree(const ir::Expr& expr, const PredicateInput& input,
             return accumulated;
         }
         if (call->args.size() == 1 && call->named_args.empty()) {
-            const UnaryDoubleFn unary = lookup_unary_double(call->callee);
-            if (unary != nullptr) {
+            if (const auto unary = lookup_unary_math(call->callee); unary.has_value()) {
                 const auto child = compile_numeric_tree(*call->args.front(), input, scalars, nodes);
-                if (!child.has_value() || ((call->callee == "abs" || call->callee == "floor" ||
-                                            call->callee == "ceil" || call->callee == "trunc") &&
+                if (!child.has_value() || (unary_math_is_type_preserving(*unary) &&
                                            nodes[*child].type != ExprType::Double)) {
                     return std::nullopt;
                 }
                 nodes.push_back({.kind = NumericTreeNode::Kind::Unary,
                                  .type = ExprType::Double,
                                  .left = *child,
-                                 .unary = unary});
+                                 .unary = *unary});
                 return static_cast<std::uint32_t>(nodes.size() - 1);
             }
         }
@@ -286,76 +243,143 @@ auto compile_numeric_tree(const ir::Expr& expr, const PredicateInput& input,
     return static_cast<std::uint32_t>(nodes.size() - 1);
 }
 
-auto eval_numeric_tree_double(const NumericTreeNode* nodes, std::uint32_t index, std::size_t row)
-    -> double {
-    const auto& node = nodes[index];
+// Numeric trees are evaluated a block of rows at a time: each node fills one
+// block from its children's blocks with a loop chosen outside it, so the
+// arithmetic vectorizes and the math builtins run their column kernels, where a
+// per-row walk of the tree paid a switch and an indirect call per node per row.
+// A Double tree evaluates every node as double, Int subtrees included (an Int
+// `%` under a Double parent is fmod), exactly as the row walk did.
+constexpr std::size_t kNumericTreeBlockRows = 1024;
+
+/// One node's value over the current block: `data` points at `count` values
+/// (a column slice or the node's scratch), or is null and `scalar` holds a
+/// value every row shares.
+template <typename T>
+struct NumericTreeBlock {
+    const T* data = nullptr;
+    T scalar{};
+};
+
+template <typename T, typename Op>
+auto combine_tree_blocks(const NumericTreeBlock<T>& left, const NumericTreeBlock<T>& right, T* dst,
+                         std::size_t count, Op op) -> NumericTreeBlock<T> {
+    if (left.data == nullptr && right.data == nullptr) {
+        return {.data = nullptr, .scalar = op(left.scalar, right.scalar)};
+    }
+    if (left.data != nullptr && right.data != nullptr) {
+        for (std::size_t i = 0; i < count; ++i) {
+            dst[i] = op(left.data[i], right.data[i]);
+        }
+    } else if (left.data != nullptr) {
+        const T value = right.scalar;
+        for (std::size_t i = 0; i < count; ++i) {
+            dst[i] = op(left.data[i], value);
+        }
+    } else {
+        const T value = left.scalar;
+        for (std::size_t i = 0; i < count; ++i) {
+            dst[i] = op(value, right.data[i]);
+        }
+    }
+    return {.data = dst, .scalar = T{}};
+}
+
+auto eval_double_tree_node(const NumericTreeNode& node,
+                           const std::vector<NumericTreeBlock<double>>& values, std::size_t row,
+                           std::size_t count, double* dst) -> NumericTreeBlock<double> {
+    using Block = NumericTreeBlock<double>;
     switch (node.kind) {
         case NumericTreeNode::Kind::IntColumn:
-            return static_cast<double>(node.ints[row]);
+            for (std::size_t i = 0; i < count; ++i) {
+                dst[i] = static_cast<double>(node.ints[row + i]);
+            }
+            return {.data = dst, .scalar = 0.0};
         case NumericTreeNode::Kind::DoubleColumn:
-            return node.doubles[row];
+            return {.data = node.doubles + row, .scalar = 0.0};
         case NumericTreeNode::Kind::IntScalar:
-            return static_cast<double>(node.int_scalar);
+            return {.data = nullptr, .scalar = static_cast<double>(node.int_scalar)};
         case NumericTreeNode::Kind::DoubleScalar:
-            return node.double_scalar;
+            return {.data = nullptr, .scalar = node.double_scalar};
         case NumericTreeNode::Kind::Min:
-            return std::min(eval_numeric_tree_double(nodes, node.left, row),
-                            eval_numeric_tree_double(nodes, node.right, row));
+            return combine_tree_blocks(values[node.left], values[node.right], dst, count,
+                                       [](double a, double b) { return std::min(a, b); });
         case NumericTreeNode::Kind::Max:
-            return std::max(eval_numeric_tree_double(nodes, node.left, row),
-                            eval_numeric_tree_double(nodes, node.right, row));
-        case NumericTreeNode::Kind::Unary:
-            return node.unary(eval_numeric_tree_double(nodes, node.left, row));
+            return combine_tree_blocks(values[node.left], values[node.right], dst, count,
+                                       [](double a, double b) { return std::max(a, b); });
+        case NumericTreeNode::Kind::Unary: {
+            const Block& child = values[node.left];
+            if (child.data == nullptr) {
+                return {.data = nullptr, .scalar = apply_unary_math(node.unary, child.scalar)};
+            }
+            apply_unary_math(node.unary, child.data, dst, count);
+            return {.data = dst, .scalar = 0.0};
+        }
         case NumericTreeNode::Kind::Binary: {
-            const double left = eval_numeric_tree_double(nodes, node.left, row);
-            const double right = eval_numeric_tree_double(nodes, node.right, row);
+            const Block& left = values[node.left];
+            const Block& right = values[node.right];
             switch (node.op) {
                 case ir::ArithmeticOp::Add:
-                    return left + right;
+                    return combine_tree_blocks(left, right, dst, count,
+                                               [](double a, double b) { return a + b; });
                 case ir::ArithmeticOp::Sub:
-                    return left - right;
+                    return combine_tree_blocks(left, right, dst, count,
+                                               [](double a, double b) { return a - b; });
                 case ir::ArithmeticOp::Mul:
-                    return left * right;
+                    return combine_tree_blocks(left, right, dst, count,
+                                               [](double a, double b) { return a * b; });
                 case ir::ArithmeticOp::Div:
-                    return left / right;
+                    return combine_tree_blocks(left, right, dst, count,
+                                               [](double a, double b) { return a / b; });
                 case ir::ArithmeticOp::Mod:
-                    return std::fmod(left, right);
+                    return combine_tree_blocks(left, right, dst, count,
+                                               [](double a, double b) { return std::fmod(a, b); });
             }
         }
     }
     invariant_violation("numeric tree: unhandled double node");
 }
 
-auto eval_numeric_tree_int(const NumericTreeNode* nodes, std::uint32_t index, std::size_t row)
-    -> std::int64_t {
-    const auto& node = nodes[index];
+auto eval_int_tree_node(const NumericTreeNode& node,
+                        const std::vector<NumericTreeBlock<std::int64_t>>& values, std::size_t row,
+                        std::size_t count, std::int64_t* dst) -> NumericTreeBlock<std::int64_t> {
+    using Block = NumericTreeBlock<std::int64_t>;
     switch (node.kind) {
         case NumericTreeNode::Kind::IntColumn:
-            return node.ints[row];
+            return {.data = node.ints + row, .scalar = 0};
         case NumericTreeNode::Kind::IntScalar:
-            return node.int_scalar;
+            return {.data = nullptr, .scalar = node.int_scalar};
         case NumericTreeNode::Kind::Min:
-            return std::min(eval_numeric_tree_int(nodes, node.left, row),
-                            eval_numeric_tree_int(nodes, node.right, row));
+            return combine_tree_blocks(
+                values[node.left], values[node.right], dst, count,
+                [](std::int64_t a, std::int64_t b) { return std::min(a, b); });
         case NumericTreeNode::Kind::Max:
-            return std::max(eval_numeric_tree_int(nodes, node.left, row),
-                            eval_numeric_tree_int(nodes, node.right, row));
+            return combine_tree_blocks(
+                values[node.left], values[node.right], dst, count,
+                [](std::int64_t a, std::int64_t b) { return std::max(a, b); });
         case NumericTreeNode::Kind::Binary: {
-            const std::int64_t left = eval_numeric_tree_int(nodes, node.left, row);
-            const std::int64_t right = eval_numeric_tree_int(nodes, node.right, row);
+            const Block& left = values[node.left];
+            const Block& right = values[node.right];
             switch (node.op) {
                 case ir::ArithmeticOp::Add:
-                    return left + right;
+                    return combine_tree_blocks(
+                        left, right, dst, count,
+                        [](std::int64_t a, std::int64_t b) { return a + b; });
                 case ir::ArithmeticOp::Sub:
-                    return left - right;
+                    return combine_tree_blocks(
+                        left, right, dst, count,
+                        [](std::int64_t a, std::int64_t b) { return a - b; });
                 case ir::ArithmeticOp::Mul:
-                    return left * right;
+                    return combine_tree_blocks(
+                        left, right, dst, count,
+                        [](std::int64_t a, std::int64_t b) { return a * b; });
                 case ir::ArithmeticOp::Div:
                     invariant_violation("numeric tree: Int division widens to Double");
                 case ir::ArithmeticOp::Mod:
-                    return safe_imod(left, right);
+                    return combine_tree_blocks(
+                        left, right, dst, count,
+                        [](std::int64_t a, std::int64_t b) { return safe_imod(a, b); });
             }
-            return 0;  // exhaustive switch; keeps strict compilers aware.
+            invariant_violation("numeric tree: unhandled Int operator");
         }
         case NumericTreeNode::Kind::DoubleColumn:
         case NumericTreeNode::Kind::DoubleScalar:
@@ -363,6 +387,32 @@ auto eval_numeric_tree_int(const NumericTreeNode* nodes, std::uint32_t index, st
             invariant_violation("numeric tree: Double node in Int expression");
     }
     invariant_violation("numeric tree: unhandled Int node");
+}
+
+/// Evaluate `plan` (nodes in post-order, the root last) over `count` rows from
+/// absolute row `begin` into `out`. The root writes straight into `out`.
+template <typename T, typename EvalNode>
+void eval_numeric_tree_blocks(const DirectNumericTreePlan& plan, std::size_t begin,
+                              std::size_t count, T* out, EvalNode eval_node) {
+    const std::size_t width = static_cast<std::size_t>(plan.root) + 1;
+    // One block of scratch per node; a range shorter than a block needs less.
+    const std::size_t stride = std::min(count, kNumericTreeBlockRows);
+    std::vector<T> scratch(width * stride);
+    std::vector<NumericTreeBlock<T>> values(width);
+    for (std::size_t offset = 0; offset < count; offset += kNumericTreeBlockRows) {
+        const std::size_t rows = std::min(kNumericTreeBlockRows, count - offset);
+        for (std::uint32_t idx = 0; idx <= plan.root; ++idx) {
+            T* dst = idx == plan.root ? out + offset
+                                      : scratch.data() + (static_cast<std::size_t>(idx) * stride);
+            values[idx] = eval_node(plan.nodes[idx], values, begin + offset, rows, dst);
+        }
+        const NumericTreeBlock<T>& root = values[plan.root];
+        if (root.data == nullptr) {
+            std::fill_n(out + offset, rows, root.scalar);
+        } else if (root.data != out + offset) {
+            std::copy_n(root.data, rows, out + offset);
+        }
+    }
 }
 
 auto try_numeric_tree_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields,
@@ -2523,19 +2573,13 @@ auto write_direct_numeric_tree_range(const DirectNumericTreePlan& plan,
         if (output.ints == nullptr) {
             return false;
         }
-        for (std::size_t offset = 0; offset < range.count; ++offset) {
-            output.ints[offset] =
-                eval_numeric_tree_int(plan.nodes.data(), plan.root, range.begin + offset);
-        }
+        eval_numeric_tree_blocks(plan, range.begin, range.count, output.ints, eval_int_tree_node);
         return true;
     }
     if (output.doubles == nullptr) {
         return false;
     }
-    for (std::size_t offset = 0; offset < range.count; ++offset) {
-        output.doubles[offset] =
-            eval_numeric_tree_double(plan.nodes.data(), plan.root, range.begin + offset);
-    }
+    eval_numeric_tree_blocks(plan, range.begin, range.count, output.doubles, eval_double_tree_node);
     return true;
 }
 
@@ -2566,17 +2610,16 @@ auto plan_direct_field(const ir::Expr& expr, const PredicateInput& input,
     // a parallel chunk update over general arithmetic would stop declining the
     // split and crossing to `update_table`, and measured only that the metadata
     // bridge went away -- "No performance claim: this removes a per-chunk metadata
-    // bridge, not a row loop." The row loop is the problem:
-    // `eval_numeric_tree_double` walks the node array recursively FOR EVERY ROW,
-    // switching on kind per node and calling through a function pointer for unary
-    // ops, where `try_write_compiled_numeric_update_expr` on the other side of the
-    // bridge runs a compiled loop. Bisected on q01 at SF-2 (min-of-5): this arm
-    // costs 389/211/168ms at 2/4/8 cores against 220/137/130ms without it, +34-79%.
+    // bridge, not a row loop." The row loop was the problem: the tree was then
+    // walked recursively for every row, where `try_write_compiled_numeric_update_expr`
+    // on the other side of the bridge runs a compiled loop. Bisected on q01 at SF-2
+    // (min-of-5): this arm cost 389/211/168ms at 2/4/8 cores against 220/137/130ms
+    // without it, +34-79%.
     //
-    // Declining the split and paying the bridge is therefore the faster route, and
-    // is what shipped before `aea4d347`. Re-offer the arm once the tree is compiled
-    // rather than interpreted per row; the plan, the range writer and their tests
-    // are kept for that, and `try_numeric_tree_update` still uses them serially.
+    // The tree is now evaluated a block at a time (`eval_numeric_tree_blocks`), so
+    // that reason is gone, but the arm has not been re-measured on q01; offer it
+    // again only with that measurement. The plan, the range writer and their tests
+    // are kept for it, and `try_numeric_tree_update` uses them serially.
     return route;
 }
 

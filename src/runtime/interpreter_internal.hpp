@@ -1734,9 +1734,12 @@ using WindowSpec = std::variant<ir::Duration, CountWindow>;
 /// `[t-dur, t]`. Returns the time index's type (Timestamp or Date).
 [[nodiscard]] auto window_bound_column(const Table& table, ir::Duration duration, bool aligned,
                                        bool want_end) -> std::expected<ComputedColumn, std::string>;
+/// `exec`, when given, lets the ungrouped fast path split its rows and
+/// buckets across workers.
 [[nodiscard]] auto resample_table(const Table& input, ir::Duration bucket_dur,
                                   const std::vector<ir::ColumnRef>& extra_group_by,
-                                  const std::vector<ir::AggSpec>& aggregations)
+                                  const std::vector<ir::AggSpec>& aggregations,
+                                  const ExecutionContext* exec = nullptr)
     -> std::expected<Table, std::string>;
 
 // update.cpp — update/select field application (incl. fast numeric paths).

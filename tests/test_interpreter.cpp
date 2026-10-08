@@ -8856,6 +8856,120 @@ TEST_CASE("grouped update mixes a general aggregate into a row-local expression"
     CHECK(out->columns.size() == 3);
 }
 
+// An ungrouped resample finds its bucket edges in row ranges (each starting
+// from the bucket of the row before it, skipping the division while a row stays
+// in the current bucket) and reduces blocks of buckets across workers. Edges,
+// gaps and negative timestamps must come out as the serial floor grid does.
+TEST_CASE("resample: a parallel run gives the serial bars", "[resample][parallel]") {
+    // 48k rows: four workers' ranges start at multiples of 12k rows, which are
+    // minute edges (every 120th row), so a range that misreads its start shows.
+    constexpr std::size_t kRows = 48'000;
+    constexpr std::int64_t kMinute = 60'000'000'000;
+    constexpr std::int64_t kBase = -5 * 60 * kMinute;  // five hours before the epoch
+    Column<Timestamp> ts;
+    Column<double> x;
+    Column<std::int64_t> n;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        // 500 ms apart, so rows land exactly on minute edges; a three-hour gap
+        // leaves empty minutes that must not appear.
+        const std::int64_t gap = i >= 20'000 ? 180 * kMinute : 0;
+        ts.push_back(Timestamp{kBase + (static_cast<std::int64_t>(i) * 500'000'000) + gap});
+        x.push_back((static_cast<double>((i * 7919) % 1009) / 7.0) - 60.0);
+        n.push_back(static_cast<std::int64_t>((i * 31) % 97) - 40);
+    }
+    runtime::TableRegistry registry;
+    {
+        runtime::Table t;
+        t.add_column("ts", ts);
+        t.add_column("x", x);
+        t.add_column("n", n);
+        registry.emplace("t", std::move(t));
+    }
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+    const char* fields =
+        "select { o = first(x), h = max(x), l = min(x), c = last(x), s = sum(n), "
+        "m = mean(x), k = count(), mn = min(n) }";
+    const std::string utc = std::string("as_timeframe(t, \"ts\")[resample 1m, ") + fields + "];";
+    const std::string zoned =
+        std::string(
+            "as_timeframe(t[update { ts = in_timezone(ts, \"America/New_York\") }], "
+            "\"ts\")[resample 1h, ") +
+        fields + "];";
+    for (const auto& query : {utc, zoned}) {
+        INFO(query);
+        auto ir = require_ir(query.c_str());
+        auto one = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+        auto four = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+        REQUIRE(one.has_value());
+        REQUIRE(four.has_value());
+        if (auto mismatch = runtime::compare_tables(*one, *four); mismatch.has_value()) {
+            FAIL(mismatch->message());
+        }
+    }
+
+    // The UTC bars by hand: floor each time to its minute, reduce in row order.
+    auto ir = require_ir(utc.c_str());
+    auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+    REQUIRE(out.has_value());
+    const auto floor_minute = [&](std::int64_t t) {
+        std::int64_t q = t / kMinute;
+        if (t < 0 && t % kMinute != 0) {
+            --q;
+        }
+        return q * kMinute;
+    };
+    std::vector<std::int64_t> bucket;
+    std::vector<double> open;
+    std::vector<double> high;
+    std::vector<double> low;
+    std::vector<double> close;
+    std::vector<double> total;
+    std::vector<std::int64_t> count;
+    std::vector<std::int64_t> sum;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        const std::int64_t b = floor_minute(ts[i].nanos);
+        if (bucket.empty() || bucket.back() != b) {
+            bucket.push_back(b);
+            open.push_back(x[i]);
+            high.push_back(x[i]);
+            low.push_back(x[i]);
+            total.push_back(0.0);
+            count.push_back(0);
+            sum.push_back(0);
+        }
+        high.back() = std::max(high.back(), x[i]);
+        low.back() = std::min(low.back(), x[i]);
+        close.resize(bucket.size());
+        close.back() = x[i];
+        total.back() += x[i];
+        count.back() += 1;
+        sum.back() += n[i];
+    }
+    REQUIRE(out->rows() == bucket.size());
+    const auto& bars = std::get<Column<Timestamp>>(*out->find("ts"));
+    const auto& o = std::get<Column<double>>(*out->find("o"));
+    const auto& h = std::get<Column<double>>(*out->find("h"));
+    const auto& l = std::get<Column<double>>(*out->find("l"));
+    const auto& c = std::get<Column<double>>(*out->find("c"));
+    const auto& m = std::get<Column<double>>(*out->find("m"));
+    const auto& k = std::get<Column<std::int64_t>>(*out->find("k"));
+    const auto& sm = std::get<Column<std::int64_t>>(*out->find("s"));
+    std::size_t wrong = 0;
+    for (std::size_t g = 0; g < bucket.size(); ++g) {
+        wrong += bars[g].nanos == bucket[g] && o[g] == open[g] && h[g] == high[g] &&
+                         l[g] == low[g] && c[g] == close[g] &&
+                         m[g] == total[g] / static_cast<double>(count[g]) && k[g] == count[g] &&
+                         sm[g] == sum[g]
+                     ? 0U
+                     : 1U;
+    }
+    CHECK(wrong == 0);
+}
+
 // An ungrouped top-k splits its rows into ranges with a heap each, then merges
 // the heaps. Ranks are (key, row) -- ties go by row order -- so the result must
 // be the first `k` rows of a STABLE sort, serial or parallel, head or tail.

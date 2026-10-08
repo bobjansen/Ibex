@@ -9021,6 +9021,88 @@ TEST_CASE("grouped update mixes a general aggregate into a row-local expression"
     CHECK(out->columns.size() == 3);
 }
 
+// fill_forward / fill_backward fill dense columns in parallel ranges, each
+// starting from the nearest earlier (later) range's carry. A null run across
+// several whole ranges, leading and trailing nulls, an all-null and a no-null
+// column must all give the serial LOCF / NOCB, nulls included.
+TEST_CASE("fill_forward and fill_backward give the serial fill in parallel", "[fill][parallel]") {
+    constexpr std::size_t kRows = 12'000;
+    Column<double> x;
+    Column<std::int64_t> k;
+    Column<double> none;
+    Column<double> full;
+    runtime::ValidityBitmap valid(kRows, true);
+    runtime::ValidityBitmap none_valid(kRows, false);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        x.push_back(static_cast<double>(i) * 0.25);
+        k.push_back(static_cast<std::int64_t>(i) - 6000);
+        none.push_back(1.0);
+        full.push_back(static_cast<double>(i));
+        // Leading nulls, a run from 2,000 to 9,500 (several whole ranges on
+        // four workers), scattered nulls, trailing nulls.
+        const bool null_row = i < 37 || (i >= 2000 && i < 9500) || i % 11 == 0 || i >= kRows - 23;
+        valid.set(i, !null_row);
+    }
+    runtime::TableRegistry registry;
+    {
+        runtime::Table t;
+        t.add_column("x", x, valid);
+        t.add_column("k", k, valid);
+        t.add_column("none", none, none_valid);
+        t.add_column("full", full);
+        registry.emplace("t", std::move(t));
+    }
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+    // Expected source row per output row (or none), by a plain scan.
+    const auto source = [&](const runtime::ValidityBitmap* v, bool forward) {
+        std::vector<std::optional<std::size_t>> src(kRows);
+        std::optional<std::size_t> carry;
+        for (std::size_t step = 0; step < kRows; ++step) {
+            const std::size_t i = forward ? step : kRows - 1 - step;
+            if (v == nullptr || (*v)[i]) {
+                carry = i;
+            }
+            src[i] = carry;
+        }
+        return src;
+    };
+    for (const bool forward : {true, false}) {
+        const char* fn = forward ? "fill_forward" : "fill_backward";
+        const std::string query = std::string("t[update { fx = ") + fn + "(x), fk = " + fn +
+                                  "(k), fz = " + fn + "(none), ff = " + fn + "(full) }];";
+        INFO(query);
+        const auto want = source(&valid, forward);
+        auto ir = require_ir(query.c_str());
+        for (const auto* exec : {&serial, &parallel}) {
+            auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, *exec);
+            REQUIRE(out.has_value());
+            const auto* fx = out->find_entry("fx");
+            const auto* fk = out->find_entry("fk");
+            const auto* fnone = out->find_entry("fz");
+            const auto* ff = out->find_entry("ff");
+            const auto& vx = std::get<Column<double>>(*fx->column);
+            const auto& vk = std::get<Column<std::int64_t>>(*fk->column);
+            const auto& vf = std::get<Column<double>>(*ff->column);
+            std::size_t wrong = 0;
+            for (std::size_t i = 0; i < kRows; ++i) {
+                if (want[i].has_value()) {
+                    wrong += !runtime::is_null(*fx, i) && vx[i] == x[*want[i]] ? 0U : 1U;
+                    wrong += !runtime::is_null(*fk, i) && vk[i] == k[*want[i]] ? 0U : 1U;
+                } else {
+                    wrong += runtime::is_null(*fx, i) && runtime::is_null(*fk, i) ? 0U : 1U;
+                }
+                wrong += runtime::is_null(*fnone, i) ? 0U : 1U;  // nothing to carry
+                wrong += !runtime::is_null(*ff, i) && vf[i] == full[i] ? 0U : 1U;
+            }
+            CHECK(wrong == 0);
+        }
+    }
+}
+
 // An ungrouped resample finds its bucket edges in row ranges (each starting
 // from the bucket of the row before it, skipping the division while a row stays
 // in the current bucket) and reduces blocks of buckets across workers. Edges,

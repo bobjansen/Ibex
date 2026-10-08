@@ -19,6 +19,7 @@
 #include <ibex/runtime/rng.hpp>
 #include <ibex/runtime/safe_arith.hpp>
 #include <ibex/runtime/table_format.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
 #include <array>
@@ -1683,11 +1684,11 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                       },
                       .exec = TransformExec{.column_eval = [](const ir::CallExpr& call,
                                                               const Table& input, std::size_t,
-                                                              const ColumnEvalCtx&)
+                                                              const ColumnEvalCtx& ctx)
                                                 -> std::expected<ComputedColumn, std::string> {
                           auto res = call.callee == "fill_forward"
-                                         ? eval_fill_forward(call, input)
-                                         : eval_fill_backward(call, input);
+                                         ? eval_fill_forward(call, input, ctx.exec)
+                                         : eval_fill_backward(call, input, ctx.exec);
                           if (!res) {
                               return std::unexpected(res.error());
                           }
@@ -3174,6 +3175,91 @@ auto eval_cumsum_cumprod_column(const ir::CallExpr& call, const Table& input, bo
 // fill_forward/fill_backward leave unfillable leading/trailing nulls as null.
 // fill_null produces a column with no validity bitmap (all rows are valid).
 
+/// LOCF (`forward`) or NOCB over a dense column in parallel row ranges: each
+/// range finds its last (first) valid row, a scan over the ranges gives each
+/// one the carry from the nearest earlier (later) range that has a value, and
+/// every range then fills on its own. Rows with nothing to carry -- before the
+/// first valid row (after the last) -- get T{}; their nulls are the caller's,
+/// from the returned edge: the first valid row for LOCF, one past the last for
+/// NOCB (`rows` / 0 when there is none).
+template <typename T, typename Valid>
+auto fill_carry_ranges(const T* in, T* dst, std::size_t rows, const Valid& is_valid,
+                       std::size_t ranges, bool forward) -> std::size_t {
+    constexpr std::size_t kNone = std::numeric_limits<std::size_t>::max();
+    const std::size_t grain = (rows + ranges - 1) / ranges;
+    std::vector<std::size_t> edge(ranges, kNone);   // last (LOCF) / first (NOCB) valid
+    std::vector<std::size_t> first(ranges, kNone);  // first valid (LOCF edge)
+    std::vector<std::size_t> last(ranges, kNone);   // last valid (NOCB edge)
+    const auto run = [&](const auto& body) {
+        auto batch = process_worker_pool().submit(ranges, [&](std::size_t r) {
+            const std::size_t b = std::min(rows, r * grain);
+            body(r, b, std::min(rows, b + grain));
+        });
+        batch.wait();
+    };
+    run([&](std::size_t r, std::size_t b, std::size_t e) {
+        for (std::size_t i = b; i < e; ++i) {
+            if (is_valid(i)) {
+                first[r] = i;
+                break;
+            }
+        }
+        for (std::size_t i = e; i-- > b;) {
+            if (is_valid(i)) {
+                last[r] = i;
+                break;
+            }
+        }
+        edge[r] = forward ? last[r] : first[r];
+    });
+    // carry[r]: the row whose value range r starts from, or kNone.
+    std::vector<std::size_t> carry(ranges, kNone);
+    if (forward) {
+        for (std::size_t r = 1; r < ranges; ++r) {
+            carry[r] = edge[r - 1] != kNone ? edge[r - 1] : carry[r - 1];
+        }
+    } else {
+        for (std::size_t r = ranges - 1; r-- > 0;) {
+            carry[r] = edge[r + 1] != kNone ? edge[r + 1] : carry[r + 1];
+        }
+    }
+    run([&](std::size_t r, std::size_t b, std::size_t e) {
+        bool have = carry[r] != kNone;
+        T value = have ? in[carry[r]] : T{};
+        if (forward) {
+            for (std::size_t i = b; i < e; ++i) {
+                if (is_valid(i)) {
+                    value = in[i];
+                    have = true;
+                }
+                dst[i] = have ? value : T{};
+            }
+        } else {
+            for (std::size_t i = e; i-- > b;) {
+                if (is_valid(i)) {
+                    value = in[i];
+                    have = true;
+                }
+                dst[i] = have ? value : T{};
+            }
+        }
+    });
+    if (forward) {
+        for (std::size_t r = 0; r < ranges; ++r) {
+            if (first[r] != kNone) {
+                return first[r];
+            }
+        }
+        return rows;
+    }
+    for (std::size_t r = ranges; r-- > 0;) {
+        if (last[r] != kNone) {
+            return last[r] + 1;
+        }
+    }
+    return 0;
+}
+
 // fill_null(col, value): replace every null cell with the scalar `value`.
 // Accepts any column type; `value` must be a literal matching the column type.
 // Returns a column with no validity bitmap.
@@ -3268,7 +3354,7 @@ auto eval_fill_null(const ir::CallExpr& call, const Table& input)
 
 // fill_forward(col): LOCF — carry the last valid (non-null) value forward.
 // Unfillable leading nulls (no prior valid value) remain null.
-auto eval_fill_forward(const ir::CallExpr& call, const Table& input)
+auto eval_fill_forward(const ir::CallExpr& call, const Table& input, const ExecutionContext* exec)
     -> std::expected<FillResult, std::string> {
     if (call.args.size() != 1) {
         return std::unexpected("fill_forward: expected 1 argument (col)");
@@ -3314,6 +3400,19 @@ auto eval_fill_forward(const ir::CallExpr& call, const Table& input)
                     return ((bits[bit >> 3] >> (bit & 7U)) & 1U) != 0U;
                 };
 
+                const std::size_t workers =
+                    exec != nullptr ? group_barrier_worker_count(*exec, rows) : 0;
+                if (workers >= 2) {
+                    const std::size_t lead = fill_carry_ranges(in, dst, rows, is_valid, workers,
+                                                               /*forward=*/true);
+                    if (lead > 0) {
+                        out_validity.emplace(rows, true);
+                        for (std::size_t row = 0; row < lead; ++row) {
+                            out_validity->set(row, false);
+                        }
+                    }
+                    return FillResult{std::move(result), std::move(out_validity)};
+                }
                 // Leading nulls have no value to carry; they stay null.
                 std::size_t i = 0;
                 while (i < rows && !is_valid(i)) {
@@ -3362,7 +3461,7 @@ auto eval_fill_forward(const ir::CallExpr& call, const Table& input)
 
 // fill_backward(col): NOCB — carry the next valid (non-null) value backward.
 // Unfillable trailing nulls (no subsequent valid value) remain null.
-auto eval_fill_backward(const ir::CallExpr& call, const Table& input)
+auto eval_fill_backward(const ir::CallExpr& call, const Table& input, const ExecutionContext* exec)
     -> std::expected<FillResult, std::string> {
     if (call.args.size() != 1) {
         return std::unexpected("fill_backward: expected 1 argument (col)");
@@ -3405,6 +3504,19 @@ auto eval_fill_backward(const ir::CallExpr& call, const Table& input)
                     return ((bits[bit >> 3] >> (bit & 7U)) & 1U) != 0U;
                 };
 
+                const std::size_t workers =
+                    exec != nullptr ? group_barrier_worker_count(*exec, rows) : 0;
+                if (workers >= 2) {
+                    const std::size_t trail = fill_carry_ranges(in, dst, rows, is_valid, workers,
+                                                                /*forward=*/false);
+                    if (trail < rows) {
+                        out_validity.emplace(rows, true);
+                        for (std::size_t row = trail; row < rows; ++row) {
+                            out_validity->set(row, false);
+                        }
+                    }
+                    return FillResult{std::move(result), std::move(out_validity)};
+                }
                 // Trailing nulls have no following value; they stay null.
                 std::size_t end = rows;
                 while (end > 0 && !is_valid(end - 1)) {

@@ -523,6 +523,78 @@ auto resolve_predicate_sides(const ir::Expr& predicate, const Table& left, const
     return rewritten;
 }
 
+/// How many fixed row ranges an as-of pass over `n` rows splits into: one
+/// unless the context may fan out and `n` clears the row floor, then up to the
+/// worker budget. The ranges are fixed and numbered in row order, which is what
+/// lets per-range state be combined in row order afterwards.
+auto asof_range_count(const ExecutionContext* exec, std::size_t n) -> std::size_t {
+    if (exec == nullptr || !exec->can_fan_out() || on_worker_pool_thread() ||
+        n < std::max<std::size_t>(exec->parallel_min_rows, 1)) {
+        return 1;
+    }
+    return std::max<std::size_t>(
+        1, std::min({exec->compute_budget(), process_worker_pool().size(), n}));
+}
+
+/// Run `body(range, begin, end)` over `ranges` equal contiguous ranges of
+/// [0, n), across workers when there is more than one.
+template <typename Body>
+void for_fixed_ranges(std::size_t ranges, std::size_t n, const Body& body) {
+    const std::size_t grain = (n + ranges - 1) / std::max<std::size_t>(ranges, 1);
+    if (ranges < 2) {
+        body(std::size_t{0}, std::size_t{0}, n);
+        return;
+    }
+    auto batch = process_worker_pool().submit(ranges, [&](std::size_t r) {
+        const std::size_t begin = std::min(n, r * grain);
+        body(r, begin, std::min(n, begin + grain));
+    });
+    batch.wait();
+}
+
+/// Rows grouped by code, stably: `rows[begin[g], begin[g + 1])` are the rows
+/// whose code is `g`, ascending. A `kNoGroup` row is left out. Counted per
+/// (range, code) and scattered in row order, so the result is the serial one.
+struct CodeBuckets {
+    std::vector<std::size_t> begin;
+    ::ibex::detail::NoInitVector<std::size_t> rows;
+};
+
+auto bucket_rows_by_code(const std::uint32_t* codes, std::size_t n, std::size_t groups,
+                         std::size_t ranges) -> CodeBuckets {
+    std::vector<std::size_t> counts(ranges * groups, 0);
+    for_fixed_ranges(ranges, n, [&](std::size_t r, std::size_t b, std::size_t e) {
+        std::size_t* local = counts.data() + (r * groups);
+        for (std::size_t i = b; i < e; ++i) {
+            if (codes[i] != kNoGroup) {
+                ++local[codes[i]];
+            }
+        }
+    });
+    CodeBuckets out;
+    out.begin.assign(groups + 1, 0);
+    std::size_t total = 0;
+    for (std::size_t g = 0; g < groups; ++g) {
+        out.begin[g] = total;
+        for (std::size_t r = 0; r < ranges; ++r) {
+            const std::size_t c = counts[(r * groups) + g];
+            counts[(r * groups) + g] = total;  // this range's first slot for g
+            total += c;
+        }
+    }
+    out.begin[groups] = total;
+    out.rows.resize(total);
+    for_fixed_ranges(ranges, n, [&](std::size_t r, std::size_t b, std::size_t e) {
+        std::size_t* next = counts.data() + (r * groups);
+        for (std::size_t i = b; i < e; ++i) {
+            if (codes[i] != kNoGroup) {
+                out.rows[next[codes[i]]++] = i;
+            }
+        }
+    });
+    return out;
+}
+
 }  // namespace
 
 // NOLINTNEXTLINE(readability-function-size)
@@ -1751,8 +1823,21 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                         return value;
                     }
                 };
-                const bool left_sorted = std::is_sorted(left_times, left_times + n_left);
-                const bool right_sorted = std::is_sorted(right_times, right_times + n_right);
+                // Checked by range, each range also against its predecessor's
+                // last row, so the answer is std::is_sorted's.
+                const auto sorted = [&](const auto* times, std::size_t n) {
+                    std::atomic<bool> ok{true};
+                    for_fixed_ranges(asof_range_count(exec, n), n,
+                                     [&](std::size_t, std::size_t b, std::size_t e) {
+                                         const std::size_t from = b == 0 ? 0 : b - 1;
+                                         if (e > from && !std::is_sorted(times + from, times + e)) {
+                                             ok.store(false, std::memory_order_relaxed);
+                                         }
+                                     });
+                    return ok.load();
+                };
+                const bool left_sorted = sorted(left_times, n_left);
+                const bool right_sorted = sorted(right_times, n_right);
                 if (!left_sorted || !right_sorted) {
                     const char* which = (!left_sorted && !right_sorted)
                                             ? "both sides are"
@@ -1821,7 +1906,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 // side is the identity permutation — only the matched right row per left
                 // row varies. We therefore build just right_idx and materialise the left
                 // columns wholesale (no identity gather, no n_left index array).
-                std::vector<std::size_t> right_idx(n_left);
+                ::ibex::detail::NoInitVector<std::size_t> right_idx(n_left);
                 bool grouped_done = false;
 
                 if (left_eq_keys.empty()) {
@@ -1831,14 +1916,30 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                     // each left time in O(n_left + n_right). Skips the per-row Key
                     // construction + hashing that otherwise builds one giant group over
                     // the entire right table and dominates the cost for large rights.
-                    std::size_t pos = 0;  // # right rows with time <= current left time
-                    for (std::size_t l = 0; l < n_left; ++l) {
-                        while (pos < n_right && time_value_to_int(right_times[pos]) <=
-                                                    time_value_to_int(left_times[l])) {
-                            ++pos;
-                        }
-                        right_idx[l] = (pos == 0) ? kNull : pos - 1;
-                    }
+                    // Left ranges merge independently: each finds where its first
+                    // row's merge stands with one binary search, then walks.
+                    for_fixed_ranges(
+                        asof_range_count(exec, n_left), n_left,
+                        [&](std::size_t, std::size_t b, std::size_t e) {
+                            if (b == e) {
+                                return;
+                            }
+                            // # right rows with time <= current left time
+                            auto pos = static_cast<std::size_t>(
+                                std::upper_bound(right_times, right_times + n_right,
+                                                 time_value_to_int(left_times[b]),
+                                                 [&](std::int64_t t, const auto& rt) {
+                                                     return t < time_value_to_int(rt);
+                                                 }) -
+                                right_times);
+                            for (std::size_t l = b; l < e; ++l) {
+                                while (pos < n_right && time_value_to_int(right_times[pos]) <=
+                                                            time_value_to_int(left_times[l])) {
+                                    ++pos;
+                                }
+                                right_idx[l] = (pos == 0) ? kNull : pos - 1;
+                            }
+                        });
                     grouped_done = true;
                 } else if (left_eq_keys.size() == 1 && !has_null_eq_keys) {
                     // Single equality key (the common asof-by case, e.g. by symbol):
@@ -1863,32 +1964,146 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                                     return;  // left/right key types differ -> generic path
                                 }
                                 const auto& lc = *lcp;
-                                robin_hood::unordered_map<KeyV, std::size_t> dict;
-                                std::vector<std::vector<std::size_t>> buckets;
-                                for (std::size_t r = 0; r < n_right; ++r) {
-                                    auto [it, inserted] = dict.try_emplace(rc[r], buckets.size());
-                                    if (inserted) {
-                                        buckets.emplace_back();
+                                // One worker: a single pass that buckets each right
+                                // row as it hashes it. The parallel form below makes
+                                // more passes over the rows, which only pays when
+                                // they are split across workers.
+                                if (asof_range_count(exec, n_right) < 2) {
+                                    robin_hood::unordered_map<KeyV, std::size_t> dict;
+                                    std::vector<std::vector<std::size_t>> buckets;
+                                    for (std::size_t r = 0; r < n_right; ++r) {
+                                        auto [it, inserted] =
+                                            dict.try_emplace(rc[r], buckets.size());
+                                        if (inserted) {
+                                            buckets.emplace_back();
+                                        }
+                                        buckets[it->second].push_back(r);
                                     }
-                                    buckets[it->second].push_back(r);
+                                    // per-key merge cursors advance through `pos`.
+                                    // NOLINTNEXTLINE(misc-const-correctness)
+                                    std::vector<std::size_t> cursor(buckets.size(), 0);
+                                    for (std::size_t l = 0; l < n_left; ++l) {
+                                        auto it = dict.find(lc[l]);
+                                        if (it == dict.end()) {
+                                            right_idx[l] = kNull;
+                                            continue;
+                                        }
+                                        const auto& rows = buckets[it->second];
+                                        std::size_t& pos = cursor[it->second];
+                                        while (pos < rows.size() &&
+                                               time_value_to_int(right_times[rows[pos]]) <=
+                                                   time_value_to_int(left_times[l])) {
+                                            ++pos;
+                                        }
+                                        right_idx[l] = (pos == 0) ? kNull : rows[pos - 1];
+                                    }
+                                    grouped_done = true;
+                                    return;
                                 }
-                                // per-key merge cursors advance through `pos`.
-                                // NOLINTNEXTLINE(misc-const-correctness)
-                                std::vector<std::size_t> cursor(buckets.size(), 0);
-                                for (std::size_t l = 0; l < n_left; ++l) {
-                                    auto it = dict.find(lc[l]);
-                                    if (it == dict.end()) {
-                                        right_idx[l] = kNull;
-                                        continue;
+                                // 1. Codes for the right keys: each fixed range
+                                //    numbers its keys in a local dictionary;
+                                //    those merge in range order into one.
+                                const std::size_t ranges = asof_range_count(exec, n_right);
+                                std::vector<robin_hood::unordered_map<KeyV, std::uint32_t>> local(
+                                    ranges);
+                                std::vector<std::vector<KeyV>> local_keys(ranges);
+                                ::ibex::detail::NoInitVector<std::uint32_t> rcode(n_right);
+                                for_fixed_ranges(ranges, n_right,
+                                                 [&](std::size_t r, std::size_t b, std::size_t e) {
+                                                     auto& map = local[r];
+                                                     for (std::size_t i = b; i < e; ++i) {
+                                                         auto [it, inserted] = map.try_emplace(
+                                                             rc[i], static_cast<std::uint32_t>(
+                                                                        local_keys[r].size()));
+                                                         if (inserted) {
+                                                             local_keys[r].push_back(rc[i]);
+                                                         }
+                                                         rcode[i] = it->second;
+                                                     }
+                                                 });
+                                robin_hood::unordered_map<KeyV, std::uint32_t> dict;
+                                std::vector<std::vector<std::uint32_t>> remap(ranges);
+                                for (std::size_t r = 0; r < ranges; ++r) {
+                                    remap[r].reserve(local_keys[r].size());
+                                    for (const auto& key : local_keys[r]) {
+                                        auto [it, inserted] = dict.try_emplace(
+                                            key, static_cast<std::uint32_t>(dict.size()));
+                                        remap[r].push_back(it->second);
                                     }
-                                    const auto& rows = buckets[it->second];
-                                    std::size_t& pos = cursor[it->second];
-                                    while (pos < rows.size() &&
-                                           time_value_to_int(right_times[rows[pos]]) <=
-                                               time_value_to_int(left_times[l])) {
-                                        ++pos;
+                                }
+                                const std::size_t groups = dict.size();
+                                if (ranges > 1) {
+                                    for_fixed_ranges(
+                                        ranges, n_right,
+                                        [&](std::size_t r, std::size_t b, std::size_t e) {
+                                            for (std::size_t i = b; i < e; ++i) {
+                                                rcode[i] = remap[r][rcode[i]];
+                                            }
+                                        });
+                                }
+                                // 2. Left codes: a read-only lookup per row. A key
+                                //    the right lacks matches nothing.
+                                ::ibex::detail::NoInitVector<std::uint32_t> lcode(n_left);
+                                for_fixed_ranges(
+                                    asof_range_count(exec, n_left), n_left,
+                                    [&](std::size_t, std::size_t b, std::size_t e) {
+                                        for (std::size_t l = b; l < e; ++l) {
+                                            auto it = dict.find(lc[l]);
+                                            lcode[l] = it == dict.end() ? kNoGroup : it->second;
+                                            if (lcode[l] == kNoGroup) {
+                                                right_idx[l] = kNull;  // no such key on the right
+                                            }
+                                        }
+                                    });
+                                // 3. Both sides' rows by key, row order kept. The
+                                //    per-(range, key) counts are bounded: a high
+                                //    cardinality key gets fewer ranges.
+                                constexpr std::size_t kMaxCountCells = std::size_t{1} << 22;
+                                const auto bucket_ranges = [&](std::size_t n) {
+                                    const std::size_t r = asof_range_count(exec, n);
+                                    return std::max<std::size_t>(
+                                        1, std::min(r, kMaxCountCells /
+                                                           std::max<std::size_t>(groups, 1)));
+                                };
+                                const CodeBuckets right_rows = bucket_rows_by_code(
+                                    rcode.data(), n_right, groups, bucket_ranges(n_right));
+                                const CodeBuckets left_rows = bucket_rows_by_code(
+                                    lcode.data(), n_left, groups, bucket_ranges(n_left));
+                                // 4. One two-pointer merge per key, keys claimed by
+                                //    workers.
+                                std::atomic<std::size_t> next_group{0};
+                                const auto merge_groups = [&] {
+                                    while (true) {
+                                        const std::size_t g =
+                                            next_group.fetch_add(1, std::memory_order_relaxed);
+                                        if (g >= groups) {
+                                            return;
+                                        }
+                                        const std::size_t rb = right_rows.begin[g];
+                                        const std::size_t re = right_rows.begin[g + 1];
+                                        std::size_t pos = rb;
+                                        for (std::size_t k = left_rows.begin[g];
+                                             k < left_rows.begin[g + 1]; ++k) {
+                                            const std::size_t l = left_rows.rows[k];
+                                            while (pos < re &&
+                                                   time_value_to_int(
+                                                       right_times[right_rows.rows[pos]]) <=
+                                                       time_value_to_int(left_times[l])) {
+                                                ++pos;
+                                            }
+                                            right_idx[l] =
+                                                pos == rb ? kNull : right_rows.rows[pos - 1];
+                                        }
                                     }
-                                    right_idx[l] = (pos == 0) ? kNull : rows[pos - 1];
+                                };
+                                const std::size_t merge_workers =
+                                    std::min(asof_range_count(exec, n_left), groups);
+                                if (merge_workers < 2) {
+                                    merge_groups();
+                                } else {
+                                    auto batch = process_worker_pool().submit(
+                                        merge_workers, [&](std::size_t) { merge_groups(); });
+                                    batch.wait();
                                 }
                                 grouped_done = true;
                             }

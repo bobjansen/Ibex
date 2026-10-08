@@ -1290,19 +1290,12 @@ TEST_CASE("A declined split still avoids the table bridge", "[kernel][update][pa
     CHECK(stats.parallel_fields.load() == 0);
 }
 
-// A compiled arithmetic tree keeps the table bridge, on purpose. `aea4d347` gave
-// the tree a range-writing arm so `sqrt` over a column would split inside the
-// chunk kernel instead of crossing to the table evaluator, and this test pinned
-// that. The arm was withheld again: the tree was then interpreted per row, where
-// the table evaluator's own writer runs a compiled loop, and q01 at SF-2
-// measured +34-79% at 2/4/8 cores on the arm. Declining the split is how such a
-// field keeps its parallelism rather than how it loses it -- the table
-// evaluator splits it too. The tree is now evaluated in blocks, but the arm
-// has not been re-measured on q01.
-//
-// The values are still asserted at the window boundaries, so if the arm is
-// re-offered, only the three stats lines move.
-TEST_CASE("A compiled numeric tree keeps the table bridge", "[kernel][update][parallel]") {
+// A compiled arithmetic tree is a route arm of its own, so an expression the
+// single-operation families cannot name -- `sqrt` over a column here -- still
+// splits inside the chunk kernel rather than crossing to the table evaluator.
+// (8ec84a5f withheld the arm while the tree was interpreted per row; it is
+// evaluated in blocks now.)
+TEST_CASE("A compiled numeric tree splits inside the chunk kernel", "[kernel][update][parallel]") {
     constexpr std::size_t kRows = 40'000;
     Column<double> price;
     for (std::size_t r = 0; r < kRows; ++r) {
@@ -1335,10 +1328,8 @@ TEST_CASE("A compiled numeric tree keeps the table bridge", "[kernel][update][pa
     // would first show.
     CHECK(root[4'096] == Catch::Approx(std::sqrt(4'096.0)));
     CHECK(root[kRows - 1] == Catch::Approx(std::sqrt(static_cast<double>(kRows - 1))));
-    // Bridged, not unparallelized: `chunk_direct_updates` is what the kernel would
-    // have claimed, and the other two are the table evaluator splitting the field
-    // through its own compiled writer on the far side of the bridge.
-    CHECK(stats.chunk_direct_updates.load() == 0);
+    // Claimed by the kernel and split by it: no crossing to the table evaluator.
+    CHECK(stats.chunk_direct_updates.load() == 1);
     CHECK(stats.parallel_fields.load() == 1);
     CHECK(stats.parallel_direct_numeric_fields.load() == 1);
 }

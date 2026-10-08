@@ -2606,20 +2606,12 @@ auto plan_direct_field(const ir::Expr& expr, const PredicateInput& input,
     if (route.fixed_width.has_value()) {
         return route;
     }
-    // The numeric-tree arm is deliberately NOT offered here. `aea4d347` added it so
-    // a parallel chunk update over general arithmetic would stop declining the
-    // split and crossing to `update_table`, and measured only that the metadata
-    // bridge went away -- "No performance claim: this removes a per-chunk metadata
-    // bridge, not a row loop." The row loop was the problem: the tree was then
-    // walked recursively for every row, where `try_write_compiled_numeric_update_expr`
-    // on the other side of the bridge runs a compiled loop. Bisected on q01 at SF-2
-    // (min-of-5): this arm cost 389/211/168ms at 2/4/8 cores against 220/137/130ms
-    // without it, +34-79%.
-    //
-    // The tree is now evaluated a block at a time (`eval_numeric_tree_blocks`), so
-    // that reason is gone, but the arm has not been re-measured on q01; offer it
-    // again only with that measurement. The plan, the range writer and their tests
-    // are kept for it, and `try_numeric_tree_update` uses them serially.
+    // General arithmetic and math builtins: the compiled numeric tree, written a
+    // range at a time inside the chunk kernel. It was withheld (8ec84a5f) while
+    // the tree was interpreted per row, which cost q01 +34-79% at 2/4/8 cores
+    // against declining the split and crossing to `update_table`; the tree is
+    // now evaluated in blocks (`eval_numeric_tree_blocks`).
+    route.numeric_tree = try_plan_direct_numeric_tree(expr, input, scalars);
     return route;
 }
 

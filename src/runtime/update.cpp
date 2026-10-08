@@ -2102,6 +2102,10 @@ enum class NativeGroupedReduction : std::uint8_t {
     MaxDouble,
     CountRows,
     CountNonNull,
+    /// Sample standard deviation (n - 1), by Welford's update in row order --
+    /// the generic aggregate's arithmetic, so the two agree bit for bit. Null
+    /// for a group with fewer than two values, as there.
+    Stddev,
 };
 
 struct NativeGroupedReductionField {
@@ -2137,6 +2141,9 @@ auto native_reduction_for(std::string_view callee, const ColumnEntry& source)
     if (callee == "max") {
         return is_int ? NativeGroupedReduction::MaxInt : NativeGroupedReduction::MaxDouble;
     }
+    if (callee == "std") {
+        return NativeGroupedReduction::Stddev;
+    }
     return std::nullopt;
 }
 
@@ -2149,7 +2156,7 @@ auto classify_native_grouped_reduction(const ir::CallExpr& call, const Table& in
         return std::nullopt;
     }
     if (call.callee != "sum" && call.callee != "mean" && call.callee != "min" &&
-        call.callee != "max" && call.callee != "count") {
+        call.callee != "max" && call.callee != "count" && call.callee != "std") {
         return std::nullopt;
     }
     NativeGroupedReductionField item;
@@ -2227,6 +2234,52 @@ auto compute_grouped_reduction_broadcast(const NativeGroupedReductionField& item
     }
 
     std::vector<std::uint8_t> all_null(group_rows.group_count(), 0U);
+    if (item.reduction == NativeGroupedReduction::Stddev) {
+        const auto* validity = item.source->validity ? &*item.source->validity : nullptr;
+        Column<double> result;
+        result.resize_for_overwrite(rows);
+        const auto welford = [&](const auto& source) {
+            for_each_group([&](std::size_t group) noexcept {
+                std::size_t count = 0;
+                double mean = 0.0;
+                double m2 = 0.0;
+                for (const auto row : group_rows[group]) {
+                    if (validity != nullptr && !(*validity)[row]) {
+                        continue;
+                    }
+                    const auto x = static_cast<double>(source[row]);
+                    count += 1;
+                    const double delta = x - mean;
+                    mean += delta / static_cast<double>(count);
+                    m2 += delta * (x - mean);
+                }
+                const double value =
+                    count < 2 ? 0.0 : std::sqrt(m2 / static_cast<double>(count - 1));
+                all_null[group] = count < 2 ? 1U : 0U;
+                for (const auto row : group_rows[group]) {
+                    result[row] = value;
+                }
+            });
+        };
+        if (const auto* ints = std::get_if<Column<std::int64_t>>(&*item.source->column)) {
+            welford(*ints);
+        } else {
+            welford(std::get<Column<double>>(*item.source->column));
+        }
+        std::optional<ValidityBitmap> output_validity;
+        for (std::size_t group = 0; group < group_rows.group_count(); ++group) {
+            if (all_null[group] == 0U) {
+                continue;
+            }
+            if (!output_validity.has_value()) {
+                output_validity = ValidityBitmap(rows, true);
+            }
+            for (const auto row : group_rows[group]) {
+                output_validity->set(row, false);
+            }
+        }
+        return {ColumnValue{std::move(result)}, std::move(output_validity)};
+    }
     const auto reduce =
         [&]<typename Source, typename Result>(const Column<Source>& source) -> ColumnValue {
         const auto* validity = item.source->validity ? &*item.source->validity : nullptr;

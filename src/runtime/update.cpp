@@ -4501,7 +4501,10 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
             }
             mask->valid.reset();
         }
-        whole_mask = std::move(*mask);
+        // Only the folded bytes are kept. Moving the whole Mask out of the
+        // expected also moved its (just reset) validity optional, which GCC
+        // 13/14 at -O3 reports as maybe-uninitialized under -Werror.
+        whole_mask.value = std::move(mask->value);
         matched_bytes = whole_mask.value.data();
     }
 

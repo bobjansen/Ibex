@@ -781,16 +781,18 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     // Nothing is checked when the clause is absent, so a join that does not
     // declare a shape pays nothing.
     std::string expect_error;
-    auto check_expect = [&](const std::vector<std::size_t>* left_idx,
-                            const std::vector<std::size_t>* right_idx, std::size_t total) {
-        const auto first_repeat = [&](const std::vector<std::size_t>* idx,
+    // Index arrays of `total` entries; null means the identity (each row of
+    // that side once, in order).
+    auto check_expect = [&](const std::size_t* left_idx, const std::size_t* right_idx,
+                            std::size_t total) {
+        const auto first_repeat = [&](const std::size_t* idx,
                                       std::size_t side_rows) -> std::optional<std::size_t> {
             if (idx == nullptr) {
                 return std::nullopt;  // identity: each row of that side appears once
             }
             std::vector<std::uint8_t> seen(side_rows, 0U);
-            for (std::size_t i = 0; i < total && i < idx->size(); ++i) {
-                const std::size_t row = (*idx)[i];
+            for (std::size_t i = 0; i < total; ++i) {
+                const std::size_t row = idx[i];
                 if (row == kNull) {
                     continue;  // an unmatched row matched nothing, so it repeats nothing
                 }
@@ -966,9 +968,13 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
     };
 
-    auto materialize_left_identity = [&](const std::vector<std::size_t>& right_idx) {
+    // `right_idx` is a contiguous array of one entry per left row.
+    auto materialize_left_identity = [&](const auto& right_idx) {
+        // The output's left half is the left input unchanged, so it shares the
+        // input's columns rather than copying them.
         for (std::size_t c = 0; c < left.columns.size(); ++c) {
-            output.replace_column(c, *left.columns[c].column, left.columns[c].validity);
+            output.columns[c].column = left.columns[c].column;
+            output.columns[c].validity = left.columns[c].validity;
         }
 
         const bool right_sentinel = index_has_sentinel(right_idx.data(), right_idx.size());
@@ -986,7 +992,21 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         // Every left row, once, in its own order: the strongest form of the
         // claim, and it needs no index array to prove it.
         claim_carried_ordering();
-        check_expect(nullptr, &right_idx, right_idx.size());
+        check_expect(nullptr, right_idx.data(), right_idx.size());
+    };
+
+    // A left join whose right keys are unique keeps every left row once, in
+    // order, so only each row's right match varies. Rows are independent: probe
+    // them in ranges, into an array every range writes in full.
+    // `match_of(l)` is the matching right row, or kNull.
+    auto probe_left_identity = [&](const auto& match_of) {
+        ::ibex::detail::NoInitVector<std::size_t> ri(n_left);
+        for_row_ranges(exec, n_left, [&](std::size_t begin, std::size_t end) {
+            for (std::size_t l = begin; l < end; ++l) {
+                ri[l] = match_of(l);
+            }
+        });
+        materialize_left_identity(ri);
     };
 
     // ── Materialize output columns from index arrays ─────────────────────
@@ -1001,7 +1021,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         // against the pairs BEFORE `take` drops any of them -- otherwise
         // `take first` would satisfy every `expect n:1` by construction and the
         // declaration would assert nothing.
-        check_expect(&in_left_idx, &in_right_idx, in_left_idx.size());
+        check_expect(in_left_idx.data(), in_right_idx.data(), in_left_idx.size());
 
         std::vector<std::size_t> taken_left;
         std::vector<std::size_t> taken_right;
@@ -1575,14 +1595,10 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             }
             const auto* codes = lc->codes_data();
             if (preserve_left_only && grouped.unique()) {
-                std::vector<std::size_t> ri(n_left, kNull);
-                for (std::size_t l = 0; l < n_left; ++l) {
+                probe_left_identity([&](std::size_t l) {
                     const std::uint32_t gid = code_gid[static_cast<std::size_t>(codes[l])];
-                    if (gid != kNoGroup) {
-                        ri[l] = grouped.rows[grouped.offsets[gid]];
-                    }
-                }
-                materialize_left_identity(ri);
+                    return gid == kNoGroup ? kNull : grouped.rows[grouped.offsets[gid]];
+                });
                 return join_failure(output);
             }
             auto lookup = [&](std::size_t l) -> std::span<const std::size_t> {
@@ -1594,14 +1610,10 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         } else {
             const auto& ls = std::get<Column<std::string>>(*left_keys[0]);
             if (preserve_left_only && grouped.unique()) {
-                std::vector<std::size_t> ri(n_left, kNull);
-                for (std::size_t l = 0; l < n_left; ++l) {
+                probe_left_identity([&](std::size_t l) {
                     auto it = key_gid.find(ls[l]);
-                    if (it != key_gid.end()) {
-                        ri[l] = grouped.rows[grouped.offsets[it->second]];
-                    }
-                }
-                materialize_left_identity(ri);
+                    return it == key_gid.end() ? kNull : grouped.rows[grouped.offsets[it->second]];
+                });
                 return join_failure(output);
             }
             auto lookup = [&](std::size_t l) -> std::span<const std::size_t> {
@@ -1650,14 +1662,10 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
         const auto* probe_data = left_ints.data();
         if (preserve_left_only && grouped.unique()) {
-            std::vector<std::size_t> ri(n_left, kNull);
-            for (std::size_t l = 0; l < n_left; ++l) {
+            probe_left_identity([&](std::size_t l) {
                 auto it = key_gid.find(probe_data[l]);
-                if (it != key_gid.end()) {
-                    ri[l] = grouped.rows[grouped.offsets[it->second]];
-                }
-            }
-            materialize_left_identity(ri);
+                return it == key_gid.end() ? kNull : grouped.rows[grouped.offsets[it->second]];
+            });
             return join_failure(output);
         }
 

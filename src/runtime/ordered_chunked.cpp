@@ -594,6 +594,75 @@ class ChunkedOrderedLimitOperator final : public Operator {
                 return key_column[r];
             }
         };
+        // Grouped by one Categorical key with no nulls, across workers: each
+        // fixed row range keeps a heap per dictionary code, then per code the
+        // range heaps merge into that group's heap. The output is sorted by
+        // (key, sequence) at the end, so which group a winner sits in first
+        // does not matter, and a group's winners -- its top k under that strict
+        // order -- do not depend on the merge order.
+        constexpr std::size_t kMaxRangeCodeHeaps = std::size_t{1} << 16;
+        const std::size_t group_workers = group_by_->size() == 1 && !cat_gid_memo_.empty() &&
+                                                  group_key_cols.front().validity == nullptr
+                                              ? group_barrier_worker_count(exec_, rows)
+                                              : 0;
+        if (group_workers >= 2 && group_workers * cat_gid_memo_.size() <= kMaxRangeCodeHeaps) {
+            const auto& cat = *group_key_cols.front().cat;
+            const std::size_t dict = cat_gid_memo_.size();
+            constexpr std::size_t kNoRow = std::numeric_limits<std::size_t>::max();
+            const std::size_t base = next_sequence_;
+            const std::size_t grain = (rows + group_workers - 1) / group_workers;
+            std::vector<std::vector<std::vector<Entry>>> local(group_workers);
+            std::vector<std::vector<std::size_t>> sample(group_workers);
+            auto batch = process_worker_pool().submit(group_workers, [&](std::size_t r) {
+                auto& heaps = local[r];
+                auto& first_row = sample[r];
+                heaps.resize(dict);
+                first_row.assign(dict, kNoRow);
+                const std::size_t begin = std::min(rows, r * grain);
+                const std::size_t end = std::min(rows, begin + grain);
+                for (std::size_t row = begin; row < end; ++row) {
+                    const auto code = static_cast<std::size_t>(cat.code_at(row));
+                    std::vector<Entry>& heap = heaps[code];
+                    if (first_row[code] == kNoRow) {
+                        first_row[code] = row;
+                    }
+                    const std::size_t sequence = base + row;
+                    const T key = key_at(row);
+                    if (heap.size() == count_ &&
+                        !single_key_better(key, sequence, heap.front(), ascending)) {
+                        continue;
+                    }
+                    Entry entry;
+                    entry.key.values.reserve(1);
+                    entry.key.values.emplace_back(key);
+                    entry.sequence = sequence;
+                    entry.row = snapshot_row(chunk, row);
+                    push_entry(heap, std::move(entry));
+                }
+            });
+            batch.wait();
+            next_sequence_ += rows;
+            for (std::size_t code = 0; code < dict; ++code) {
+                std::size_t any_row = kNoRow;
+                for (std::size_t r = 0; r < group_workers && any_row == kNoRow; ++r) {
+                    any_row = sample[r][code];
+                }
+                if (any_row == kNoRow) {
+                    continue;
+                }
+                std::vector<Entry>* heap = resolve_group_heap(chunk, group_key_cols, any_row);
+                for (std::size_t r = 0; r < group_workers; ++r) {
+                    for (auto& entry : local[r][code]) {
+                        if (heap->size() == count_ && !entry_preferred(entry, heap->front())) {
+                            continue;
+                        }
+                        push_entry(*heap, std::move(entry));
+                    }
+                }
+            }
+            return std::nullopt;
+        }
+
         // Ungrouped, across workers: each fixed row range keeps its own heap,
         // then the range heaps merge into this one. A row's rank is (key,
         // sequence), a strict total order, so the winners do not depend on

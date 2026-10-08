@@ -9298,6 +9298,89 @@ TEST_CASE("top-k: a parallel run takes the stable sort's rows, ties included", "
     }
 }
 
+// A top-k grouped by one categorical key keeps a heap per dictionary code in
+// each row range and merges them per group. Its rows must be each group's first
+// (last) k of a stable sort, output in (key, row) order -- serial or parallel.
+TEST_CASE("top-k by a categorical key: a parallel run takes each group's stable-sort rows",
+          "[topk][parallel]") {
+    constexpr std::size_t kRows = 24'000;
+    const std::vector<std::string> dict{"d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7"};
+    std::vector<Column<Categorical>::code_type> codes;
+    Column<double> price;
+    Column<std::int64_t> id;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        codes.push_back(static_cast<Column<Categorical>::code_type>(7 - ((i * 5) % 8)));
+        price.push_back(static_cast<double>((i * 7919) % 53));  // heavy ties
+        id.push_back(static_cast<std::int64_t>(i));
+    }
+    const auto code_of = [&](std::size_t i) { return codes[i]; };
+    runtime::TableRegistry registry;
+    {
+        runtime::Table t;
+        t.add_column("g", Column<Categorical>(dict, codes));
+        t.add_column("price", price);
+        t.add_column("id", id);
+        registry.emplace("t", std::move(t));
+    }
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+    struct Case {
+        const char* query;
+        bool ascending;
+        bool head;
+        std::size_t k;
+    };
+    for (const auto& c : std::array<Case, 4>{{
+             {"t[order price desc, head 3, by g];", false, true, 3},
+             {"t[order price desc, tail 3, by g];", false, false, 3},
+             {"t[order price asc, head 50, by g];", true, true, 50},
+             {"t[order price asc, tail 50, by g];", true, false, 50},
+         }}) {
+        INFO(c.query);
+        auto ir = require_ir(c.query);
+        auto one = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+        auto four = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+        REQUIRE(one.has_value());
+        REQUIRE(four.has_value());
+        if (auto mismatch = runtime::compare_tables(*one, *four); mismatch.has_value()) {
+            FAIL(mismatch->message());
+        }
+        // Reference: per group, the stable sort's first (last) k rows; all of
+        // them then ordered by (price, row) as the operator emits.
+        const auto before = [&](std::int64_t a, std::int64_t b) {
+            const double pa = price[static_cast<std::size_t>(a)];
+            const double pb = price[static_cast<std::size_t>(b)];
+            if (pa != pb) {
+                return c.ascending ? pa < pb : pa > pb;
+            }
+            return a < b;
+        };
+        std::vector<std::int64_t> want;
+        for (std::size_t g = 0; g < dict.size(); ++g) {
+            std::vector<std::int64_t> rows;
+            for (std::size_t i = 0; i < kRows; ++i) {
+                if (static_cast<std::size_t>(code_of(i)) == g) {
+                    rows.push_back(static_cast<std::int64_t>(i));
+                }
+            }
+            std::ranges::sort(rows, before);
+            const std::size_t take = std::min(c.k, rows.size());
+            if (c.head) {
+                want.insert(want.end(), rows.begin(),
+                            rows.begin() + static_cast<std::ptrdiff_t>(take));
+            } else {
+                want.insert(want.end(), rows.end() - static_cast<std::ptrdiff_t>(take), rows.end());
+            }
+        }
+        std::ranges::sort(want, before);
+        const auto& got = std::get<Column<std::int64_t>>(*four->find("id"));
+        CHECK(std::vector<std::int64_t>(got.begin(), got.end()) == want);
+    }
+}
+
 // `median(x) by <categorical>` numbers its groups and collects each group's
 // values across workers. Groups must still come out in first-appearance order
 // (not dictionary order) and each group's values in row order -- skew and

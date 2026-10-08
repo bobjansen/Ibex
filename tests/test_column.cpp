@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -415,6 +416,31 @@ TEST_CASE("Column<int> resize_for_overwrite exposes writable slots", "[core][col
     REQUIRE(col[0] == 10);
     REQUIRE(col[1] == 20);
     REQUIRE(col[2] == 30);
+}
+
+// Date, Timestamp and Decimal default their one member to zero, which makes
+// them non-trivially default constructible. They are opted in to the
+// overwrite fast paths explicitly, so a presized Date column skips its zero
+// fill like an Int64 one; this pins that opt-in (and resize_for_overwrite on
+// them would not compile without it).
+TEST_CASE("Zero-default value types may be presized for overwrite", "[core][column]") {
+    static_assert(ibex::detail::overwrite_safe_v<std::int64_t>);
+    static_assert(ibex::detail::overwrite_safe_v<ibex::Date>);
+    static_assert(ibex::detail::overwrite_safe_v<ibex::Timestamp>);
+    static_assert(!ibex::detail::overwrite_safe_v<std::string>);
+
+    ibex::Column<ibex::Date> dates;
+    dates.resize_for_overwrite(2);
+    dates.data()[0] = ibex::Date{19'000};
+    dates.data()[1] = ibex::Date{-3};
+    REQUIRE(dates.size() == 2);
+    REQUIRE(dates[0] == ibex::Date{19'000});
+    REQUIRE(dates[1] == ibex::Date{-3});
+
+    ibex::Column<ibex::Timestamp> stamps;
+    stamps.resize_for_overwrite(1);
+    stamps.data()[0] = ibex::Timestamp{42};
+    REQUIRE(stamps[0] == ibex::Timestamp{42});
 }
 
 TEST_CASE("Column<int> clear and pop_back", "[core][column]") {

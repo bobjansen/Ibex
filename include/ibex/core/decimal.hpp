@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <ibex/core/overwrite_safe.hpp>
+
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -82,6 +84,9 @@ struct DecimalValue {
         return a.units == b.units && a.type == b.type;
     }
 };
+
+template <>
+struct detail::zero_default_value<Decimal> : std::true_type {};
 
 namespace decimal {
 

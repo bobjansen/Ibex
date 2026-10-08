@@ -140,8 +140,7 @@ void presize_filter_chunk_output(Chunk& output, const ChunkView& input,
                                      // NOLINTNEXTLINE(bugprone-branch-clone)
                                      std::is_same_v<ColT, Column<Categorical>>) {
                     dst.resize(rows_total);
-                } else if constexpr (std::is_trivially_default_constructible_v<
-                                         typename ColT::value_type>) {
+                } else if constexpr (::ibex::detail::overwrite_safe_v<typename ColT::value_type>) {
                     dst.resize_for_overwrite(rows_total);
                 } else {
                     dst.resize(rows_total);

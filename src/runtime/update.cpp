@@ -3736,8 +3736,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
                     ColT out;
                     out.resize(rows);
                     return ColumnValue{std::move(out)};
-                } else if constexpr (std::is_trivially_default_constructible_v<
-                                         typename ColT::value_type>) {
+                } else if constexpr (::ibex::detail::overwrite_safe_v<typename ColT::value_type>) {
                     // The groups partition every row, so each output element is
                     // written by exactly one scatter. Value-initialising first
                     // would be a second full pass over the column for nothing —
@@ -4559,12 +4558,11 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                             // whether the column holds adopted (Arrow) buffers,
                             // which cost more than the store it guarded.
                             using Value = Col::value_type;
-                            if constexpr (std::is_trivially_default_constructible_v<Value>) {
+                            if constexpr (::ibex::detail::overwrite_safe_v<Value>) {
                                 out.resize_for_overwrite(n);
                             } else {
-                                // `Timestamp`/`Date` default their member, so
-                                // they cannot skip the fill; the select below
-                                // still writes every slot exactly once.
+                                // The select below still writes every slot
+                                // exactly once.
                                 out.resize(n);
                             }
                             typename Col::value_type* dst = out.data();
@@ -4777,7 +4775,7 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                     if (!subset && parallel) {
                         using Value = Col::value_type;
                         Col out;
-                        if constexpr (std::is_trivially_default_constructible_v<Value>) {
+                        if constexpr (::ibex::detail::overwrite_safe_v<Value>) {
                             out.resize_for_overwrite(n);
                         } else {
                             out.resize(n);

@@ -5,6 +5,7 @@
 
 #include <ibex/core/compiler.hpp>
 #include <ibex/core/decimal.hpp>
+#include <ibex/core/overwrite_safe.hpp>
 #include <ibex/core/time_zone.hpp>
 
 #include <algorithm>
@@ -52,7 +53,7 @@ class NoInitAllocator {
 
     template <typename U>
     void construct(U* p) noexcept(std::is_nothrow_default_constructible_v<U>) {
-        if constexpr (!std::is_trivially_default_constructible_v<U>) {
+        if constexpr (!overwrite_safe_v<U>) {
             ::new (static_cast<void*>(p)) U();
         }
     }
@@ -426,7 +427,7 @@ class Column {
 
     /// Resize without value-initializing new slots. Callers must overwrite every element.
     void resize_for_overwrite(size_type count)
-        requires std::is_trivially_default_constructible_v<T>
+        requires detail::overwrite_safe_v<T>
     {
         // Existing values must survive `resize` when count is smaller or when
         // the caller grows relative to an adopted slice.
@@ -1752,7 +1753,7 @@ class ColumnAppender {
 
     ColumnAppender(ColT& column, std::size_t rows) : column_(&column) {
         if constexpr (is_dense_column_v<ColT>) {
-            if constexpr (std::is_trivially_default_constructible_v<value_type>) {
+            if constexpr (detail::overwrite_safe_v<value_type>) {
                 column_->resize_for_overwrite(rows);
             } else {
                 column_->resize(rows);

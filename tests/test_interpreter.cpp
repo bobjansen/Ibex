@@ -8856,6 +8856,83 @@ TEST_CASE("grouped update mixes a general aggregate into a row-local expression"
     CHECK(out->columns.size() == 3);
 }
 
+// `median(x) by <categorical>` numbers its groups and collects each group's
+// values across workers. Groups must still come out in first-appearance order
+// (not dictionary order) and each group's values in row order -- skew and
+// kurtosis sum in that order -- so the parallel answer is the serial one, bits
+// included.
+TEST_CASE("collect aggregates by a categorical key give the serial answer in parallel",
+          "[aggregate][median][parallel]") {
+    constexpr std::size_t kRows = 30'000;
+    // Dictionary order c0..c9; first appearances run c7, c3, c9, ... and c5
+    // never appears.
+    const std::vector<std::string> dict{"c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9"};
+    const std::array<Column<Categorical>::code_type, 9> appearance{7, 3, 9, 0, 8, 1, 6, 2, 4};
+    std::vector<Column<Categorical>::code_type> codes;
+    Column<double> x;
+    Column<std::int64_t> n;
+    runtime::ValidityBitmap x_valid(kRows, true);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        // The last group first appears near the end, past several range starts.
+        const std::size_t slot = i < 9 ? i : (i >= kRows - 50 ? 8 : (i * 7) % 8);
+        codes.push_back(appearance[slot]);
+        x.push_back((static_cast<double>((i * 7919) % 2003) / 3.0) - 300.0);
+        n.push_back(static_cast<std::int64_t>((i * 31) % 211) - 100);
+        if (i % 13 == 0) {
+            x_valid.set(i, false);
+        }
+    }
+    runtime::TableRegistry registry;
+    {
+        runtime::Table t;
+        t.add_column("g", Column<Categorical>(dict, std::move(codes)));
+        t.add_column("x", x, x_valid);
+        t.add_column("n", n);
+        registry.emplace("t", std::move(t));
+    }
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+    for (const char* query : {
+             "t[select { m = median(x) }, by g];",
+             "t[select { q = quantile(x, 0.9), qn = quantile(n, 0.25) }, by g];",
+             "t[select { s = skew(x), k = kurtosis(n), m = median(n) }, by g];",
+         }) {
+        INFO(query);
+        auto ir = require_ir(query);
+        auto one = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+        auto four = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+        REQUIRE(one.has_value());
+        REQUIRE(four.has_value());
+        if (auto mismatch = runtime::compare_tables(*one, *four); mismatch.has_value()) {
+            FAIL(mismatch->message());
+        }
+        // First-appearance order, not dictionary order.
+        REQUIRE(four->rows() == appearance.size());
+        const auto& keys = std::get<Column<Categorical>>(*four->find("g"));
+        for (std::size_t g = 0; g < appearance.size(); ++g) {
+            CHECK(keys[g] == dict[static_cast<std::size_t>(appearance[g])]);
+        }
+    }
+    // One median by hand: group c7 (rows with appearance slot 0), nulls skipped.
+    std::vector<double> c7;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        const std::size_t slot = i < 9 ? i : (i >= kRows - 50 ? 8 : (i * 7) % 8);
+        if (slot == 0 && x_valid[i]) {
+            c7.push_back(x[i]);
+        }
+    }
+    std::ranges::sort(c7);
+    const double want = c7.size() % 2 == 1 ? c7[c7.size() / 2]
+                                           : (c7[(c7.size() / 2) - 1] + c7[c7.size() / 2]) / 2.0;
+    auto ir = require_ir("t[select { m = median(x) }, by g];");
+    auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+    REQUIRE(out.has_value());
+    CHECK(std::get<Column<double>>(*out->find("m"))[0] == want);
+}
+
 // A left join gathers its right columns by output-row range, unmatched rows
 // (the `kNull` sentinel) included, and string columns by range as well. The
 // answer must be the serial one, byte for byte, whatever the column type --

@@ -397,7 +397,7 @@ void eval_numeric_tree_blocks(const DirectNumericTreePlan& plan, std::size_t beg
     const std::size_t width = static_cast<std::size_t>(plan.root) + 1;
     // One block of scratch per node; a range shorter than a block needs less.
     const std::size_t stride = std::min(count, kNumericTreeBlockRows);
-    std::vector<T> scratch(width * stride);
+    ::ibex::detail::NoInitVector<T> scratch(width * stride);
     std::vector<NumericTreeBlock<T>> values(width);
     for (std::size_t offset = 0; offset < count; offset += kNumericTreeBlockRows) {
         const std::size_t rows = std::min(kNumericTreeBlockRows, count - offset);

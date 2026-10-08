@@ -3013,9 +3013,18 @@ auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_
                     }
                 }
             } else {
-                // POD column: zero-fill then bulk-copy the shifted region.
+                // POD column: bulk-copy the shifted region and default only
+                // the `n` boundary rows (null below), rather than zero-filling
+                // the whole column first.
                 using T = ColT::value_type;
-                out.resize(rows);  // zero-initialises
+                if constexpr (!std::is_same_v<ColT, Column<bool>> &&
+                              ::ibex::detail::overwrite_safe_v<T>) {
+                    out.resize_for_overwrite(rows);
+                    const std::size_t edge = std::min(n, rows);
+                    std::fill_n(is_lag ? out.data() : out.data() + (rows - edge), edge, T{});
+                } else {
+                    out.resize(rows);  // zero-initialises
+                }
                 if constexpr (std::is_same_v<ColT, Column<bool>>) {
                     if (is_lag) {
                         for (std::size_t i = n; i < rows; ++i) {

@@ -1864,6 +1864,19 @@ class HashAggregateState final {
             return std::nullopt;
         }
 
+        // Build the deferred index from the groups numbered so far: the serial
+        // loop is about to probe it.
+        const auto materialize_int_index = [&] {
+            int_index_.reserve(n_groups_);
+            for (std::size_t g = 0; g < n_groups_; ++g) {
+                int_index_.emplace(int_order_[g], static_cast<std::uint32_t>(g));
+            }
+            int_index_deferred_ = false;
+        };
+        if (int_index_deferred_ && n_groups_ != int_serial_groups_) {
+            materialize_int_index();
+        }
+
         // Run-length shortcut, as in the string path: sorted/chunked input often
         // repeats the key, so skip the map lookup when it matches the last row.
         std::int64_t prev_key = 0;
@@ -1874,13 +1887,31 @@ class HashAggregateState final {
             std::uint32_t gid{};
             if (have_prev && key == prev_key) {
                 gid = prev_gid;
+            } else if (int_index_deferred_ && (n_groups_ == 0 || key > int_max_key_)) {
+                // Above every key seen, so new; see `int_index_deferred_`.
+                gid = static_cast<std::uint32_t>(n_groups_);
+                int_order_.push_back(key);
+                int_max_key_ = key;
+                ++n_groups_;
+                ++int_serial_groups_;
+                size_group_arrays();
+                if (has_discovery_first) {
+                    first_rows.push_back(row);
+                }
+                prev_key = key;
+                prev_gid = gid;
+                have_prev = true;
             } else {
+                if (int_index_deferred_) {
+                    materialize_int_index();
+                }
                 auto it = int_index_.find(key);
                 if (it == int_index_.end()) {
                     gid = static_cast<std::uint32_t>(n_groups_);
                     int_index_.emplace(key, gid);
                     int_order_.push_back(key);
                     ++n_groups_;
+                    ++int_serial_groups_;
                     size_group_arrays();
                     if (has_discovery_first) {
                         first_rows.push_back(row);
@@ -6848,6 +6879,17 @@ class HashAggregateState final {
     bool int_fast_path_ = false;
     IntKeyKind int_key_kind_ = IntKeyKind::Int64;
     robin_hood::unordered_flat_map<std::int64_t, std::uint32_t> int_index_;
+    /// While the serial loop has only ever met keys in strictly increasing
+    /// order of first appearance, `int_index_` is left empty: a key equal to
+    /// the previous row's is that row's group, and a key above every key seen
+    /// is necessarily new, so no lookup is needed. Sorted input (TPC-H's
+    /// l_orderkey) then never builds the map at all. The first key that goes
+    /// backwards builds `int_index_` once from `int_order_` and clears this.
+    bool int_index_deferred_ = true;
+    std::int64_t int_max_key_ = 0;
+    /// Groups the serial loop has numbered; any other group means another
+    /// path ran, and the deferral is given up before probing.
+    std::size_t int_serial_groups_ = 0;
     /// Group keys, as raw integers, in first-seen order. Default-init
     /// allocator: `resize()`'s new elements are always fully overwritten by
     /// the caller before being read (see the class docstring above).

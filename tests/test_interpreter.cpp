@@ -8825,10 +8825,10 @@ TEST_CASE("grouped update broadcasts general aggregates as select computes them"
             }
         }
     }
-    // `count(col)` is lowered to a sum over a derived 0/1 column, which is a
-    // bare fixed-width reduction and never reaches the lifter; the other six
-    // are one grouped aggregation between them.
-    CHECK(stats.grouped_lifted_group_state.load() == 6);
+    // `count(col)` is lowered to a sum over a derived 0/1 column and `std(x)`
+    // is a native reduction, so both are bare fixed-width reductions that never
+    // reach the lifter; the other five are one grouped aggregation between them.
+    CHECK(stats.grouped_lifted_group_state.load() == 5);
 }
 
 // A general aggregate mixed into an expression must reach the row-local
@@ -8854,6 +8854,101 @@ TEST_CASE("grouped update mixes a general aggregate into a row-local expression"
     REQUIRE(z->validity.has_value());
     CHECK_FALSE((*z->validity)[3]);
     CHECK(out->columns.size() == 3);
+}
+
+// `std` is a native grouped reduction: Welford in row order per group, the
+// generic aggregate's arithmetic, so its bits must be the hand-computed ones.
+// Nulls are skipped, a group with fewer than two values is null, and the result
+// may not depend on how many workers claimed groups.
+TEST_CASE("grouped update std is the row-order Welford answer, serial and parallel",
+          "[update][groupby][reduction][parallel]") {
+    constexpr std::size_t kRows = 5000;
+    Column<std::int64_t> g;
+    Column<double> x;
+    Column<std::int64_t> n;
+    runtime::ValidityBitmap x_valid(kRows, true);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        // Groups 0..39 over many rows; group 40 has one row, group 41 one row
+        // whose x is null.
+        const auto group = static_cast<std::int64_t>(i < kRows - 2 ? (i * 7) % 40 : 40 + (i % 2));
+        g.push_back(group);
+        x.push_back((static_cast<double>((i * 7919) % 1009) / 7.0) - 50.0);
+        n.push_back(static_cast<std::int64_t>((i * 31) % 97) - 40);
+        if (i % 11 == 0 || i == kRows - 1) {
+            x_valid.set(i, false);
+        }
+    }
+    runtime::TableRegistry registry;
+    {
+        runtime::Table t;
+        t.add_column("g", g);
+        t.add_column("x", x, x_valid);
+        t.add_column("n", n);
+        registry.emplace("t", std::move(t));
+    }
+    // Hand Welford per group, in row order, skipping nulls.
+    const auto expected = [&](bool use_x, std::int64_t group) -> std::optional<double> {
+        std::size_t count = 0;
+        double mean = 0.0;
+        double m2 = 0.0;
+        for (std::size_t i = 0; i < kRows; ++i) {
+            if (g[i] != group || (use_x && !x_valid[i])) {
+                continue;
+            }
+            const double v = use_x ? x[i] : static_cast<double>(n[i]);
+            count += 1;
+            const double delta = v - mean;
+            mean += delta / static_cast<double>(count);
+            m2 += delta * (v - mean);
+        }
+        if (count < 2) {
+            return std::nullopt;
+        }
+        return std::sqrt(m2 / static_cast<double>(count - 1));
+    };
+
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+    for (const auto* exec : {&serial, &parallel}) {
+        auto ir = require_ir("t[update { sx = std(x), sn = std(n) }, by g];");
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, *exec);
+        REQUIRE(out.has_value());
+        const auto* sx = out->find_entry("sx");
+        const auto* sn = out->find_entry("sn");
+        REQUIRE(sx != nullptr);
+        REQUIRE(sn != nullptr);
+        std::size_t wrong = 0;
+        for (std::size_t i = 0; i < kRows; ++i) {
+            for (const auto& [entry, use_x] : {std::pair{sx, true}, std::pair{sn, false}}) {
+                const auto want = expected(use_x, g[i]);
+                if (!want.has_value()) {
+                    wrong += runtime::is_null(*entry, i) ? 0U : 1U;
+                } else {
+                    wrong += !runtime::is_null(*entry, i) &&
+                                     std::get<Column<double>>(*entry->column)[i] == *want
+                                 ? 0U
+                                 : 1U;
+                }
+            }
+        }
+        CHECK(wrong == 0);
+    }
+
+    // The normalize shape: std lifted into a row-local expression.
+    auto ir = require_ir("t[update { z = (x - mean(x)) / std(x) }, by g];");
+    auto one = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+    auto four = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+    REQUIRE(one.has_value());
+    REQUIRE(four.has_value());
+    if (auto mismatch = runtime::compare_tables(*one, *four); mismatch.has_value()) {
+        FAIL(mismatch->message());
+    }
+    const auto* z = one->find_entry("z");
+    REQUIRE(z != nullptr);
+    CHECK(runtime::is_null(*z, kRows - 2));  // group 40: one value, std null
 }
 
 TEST_CASE("grouped update mixes native reductions and materialized fields in declaration order",

@@ -2377,8 +2377,7 @@ void presize_filter_output(Table& output, const Table& input,
                     dst.resize(rows_total);
                 } else if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
                     dst.resize(rows_total);
-                } else if constexpr (std::is_trivially_default_constructible_v<
-                                         typename ColT::value_type>) {
+                } else if constexpr (::ibex::detail::overwrite_safe_v<typename ColT::value_type>) {
                     // Every output row is written by exactly one gather, so
                     // value-initializing here would be a wasted pass over the
                     // whole column.

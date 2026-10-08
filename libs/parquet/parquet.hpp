@@ -1246,7 +1246,7 @@ inline auto decode_numeric_column(parquet::arrow::FileReader& reader, int leaf_i
                                   DirectValidity& validity, Convert&& convert) -> std::size_t {
     const std::size_t output_start = out.size();
     const std::size_t output_rows = decode_output_rows(selection, groups);
-    if constexpr (std::is_trivially_default_constructible_v<Out>) {
+    if constexpr (::ibex::detail::overwrite_safe_v<Out>) {
         out.resize_for_overwrite(output_start + output_rows);
     } else {
         out.resize(output_start + output_rows);
@@ -1781,7 +1781,7 @@ inline auto sharded_numeric(ibex::runtime::ColumnEntry& entry, int leaf_index,
                             Convert convert) -> ShardDecodeFn {
     entry.column = std::make_shared<ibex::runtime::ColumnValue>(ibex::Column<Out>{});
     auto& out = std::get<ibex::Column<Out>>(*entry.column);
-    if constexpr (std::is_trivially_default_constructible_v<Out>) {
+    if constexpr (::ibex::detail::overwrite_safe_v<Out>) {
         out.resize_for_overwrite(output_rows);
     } else {
         out.resize(output_rows);

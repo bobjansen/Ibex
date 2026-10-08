@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <ibex/core/overwrite_safe.hpp>
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -34,6 +36,11 @@ struct Timestamp {
     return Date{static_cast<std::int32_t>(
         std::chrono::floor<std::chrono::days>(point).time_since_epoch().count())};
 }
+
+template <>
+struct detail::zero_default_value<Date> : std::true_type {};
+template <>
+struct detail::zero_default_value<Timestamp> : std::true_type {};
 
 }  // namespace ibex
 

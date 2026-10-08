@@ -46,6 +46,7 @@
 #include "kernel_update.hpp"
 #include "numeric_math.hpp"
 #include "runtime_internal.hpp"
+#include "welford.hpp"
 
 namespace ibex::runtime {
 
@@ -2247,11 +2248,8 @@ auto compute_grouped_reduction_broadcast(const NativeGroupedReductionField& item
                     if (validity != nullptr && !(*validity)[row]) {
                         continue;
                     }
-                    const auto x = static_cast<double>(source[row]);
                     count += 1;
-                    const double delta = x - mean;
-                    mean += delta / static_cast<double>(count);
-                    m2 += delta * (x - mean);
+                    welford_add(static_cast<double>(source[row]), count, mean, m2);
                 }
                 const double value =
                     count < 2 ? 0.0 : std::sqrt(m2 / static_cast<double>(count - 1));

@@ -8856,6 +8856,136 @@ TEST_CASE("grouped update mixes a general aggregate into a row-local expression"
     CHECK(out->columns.size() == 3);
 }
 
+// A left join gathers its right columns by output-row range, unmatched rows
+// (the `kNull` sentinel) included, and string columns by range as well. The
+// answer must be the serial one, byte for byte, whatever the column type --
+// and with unique right keys the left columns are shared, not copied.
+TEST_CASE("left join: a parallel gather of every column type gives the serial answer",
+          "[join][parallel]") {
+    constexpr std::size_t kLeft = 20'000;
+    constexpr std::size_t kRight = 300;
+    Column<std::int64_t> lk;
+    Column<double> lv;
+    for (std::size_t i = 0; i < kLeft; ++i) {
+        lk.push_back(static_cast<std::int64_t>((i * 37) % 450));  // keys >= 300 never match
+        lv.push_back(static_cast<double>(i) * 0.5);
+    }
+    Column<std::int64_t> rk;
+    Column<std::string> rs;
+    std::vector<Column<Categorical>::code_type> rc;
+    Column<std::int64_t> rn;
+    Column<double> rd;
+    Column<bool> rb;
+    runtime::ValidityBitmap rs_valid(kRight, true);
+    runtime::ValidityBitmap rn_valid(kRight, true);
+    for (std::size_t r = 0; r < kRight; ++r) {
+        rk.push_back(static_cast<std::int64_t>(r));
+        // Empty strings and long ones, so ranges meet uneven byte counts.
+        rs.push_back(r % 7 == 0 ? std::string{}
+                                : std::string(1 + (r % 23), static_cast<char>('a' + (r % 26))));
+        rc.push_back(static_cast<Column<Categorical>::code_type>(r % 5));
+        rn.push_back(static_cast<std::int64_t>(r) * 3 - 100);
+        rd.push_back(static_cast<double>(r) / 7.0);
+        rb.push_back(r % 3 == 0);
+        if (r % 11 == 0) {
+            rs_valid.set(r, false);
+        }
+        if (r % 13 == 0) {
+            rn_valid.set(r, false);
+        }
+    }
+    const std::vector<std::string> dict{"c0", "c1", "c2", "c3", "c4"};
+    // `copies` stacks the right rows that many times: 2 repeats every key, the
+    // general (non-identity) left-join path.
+    const auto make_right = [&](std::size_t copies) {
+        Column<std::int64_t> k;
+        Column<std::string> str;
+        std::vector<Column<Categorical>::code_type> codes;
+        Column<std::int64_t> num;
+        Column<double> dbl;
+        Column<bool> flag;
+        runtime::ValidityBitmap str_valid(kRight * copies, true);
+        runtime::ValidityBitmap num_valid(kRight * copies, true);
+        for (std::size_t c = 0; c < copies; ++c) {
+            for (std::size_t r = 0; r < kRight; ++r) {
+                const std::size_t at = (c * kRight) + r;
+                k.push_back(rk[r]);
+                str.push_back(rs[r]);
+                codes.push_back(rc[r]);
+                num.push_back(rn[r]);
+                dbl.push_back(rd[r]);
+                flag.push_back(rb[r]);
+                str_valid.set(at, rs_valid[r]);
+                num_valid.set(at, rn_valid[r]);
+            }
+        }
+        runtime::Table right;
+        right.add_column("k", std::move(k));
+        right.add_column("s", std::move(str), std::move(str_valid));
+        right.add_column("c", Column<Categorical>(dict, std::move(codes)));
+        right.add_column("n", std::move(num), std::move(num_valid));
+        right.add_column("d", std::move(dbl));
+        right.add_column("b", std::move(flag));
+        return right;
+    };
+    runtime::TableRegistry registry;
+    {
+        runtime::Table left;
+        left.add_column("k", lk);
+        left.add_column("lv", lv);
+        registry.emplace("l", std::move(left));
+        registry.emplace("r", make_right(1));
+        registry.emplace("r2", make_right(2));
+    }
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+    parallel.parallel_min_cells = 0;
+    for (const char* query : {
+             "l left join r on k;",
+             "l left join r[update { dec = Decimal(n, 12, 2), day = Date(n) }] on k;",
+             "l left join r2 on k;",
+         }) {
+        INFO(query);
+        auto ir = require_ir(query);
+        auto one = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+        auto four = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+        REQUIRE(one.has_value());
+        REQUIRE(four.has_value());
+        if (auto mismatch = runtime::compare_tables(*one, *four); mismatch.has_value()) {
+            FAIL(mismatch->message());
+        }
+    }
+
+    // Hand-checked cells of the unique-key join: a matched row carries its
+    // right values (and their nulls), an unmatched one is null throughout.
+    auto ir = require_ir("l left join r on k;");
+    auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+    REQUIRE(out.has_value());
+    REQUIRE(out->rows() == kLeft);
+    const auto* s_entry = out->find_entry("s");
+    const auto* n_entry = out->find_entry("n");
+    REQUIRE(s_entry != nullptr);
+    REQUIRE(n_entry != nullptr);
+    const auto& s_col = std::get<Column<std::string>>(*s_entry->column);
+    std::size_t wrong = 0;
+    for (std::size_t i = 0; i < kLeft; ++i) {
+        const auto key = static_cast<std::size_t>(lk[i]);
+        if (key >= kRight) {
+            wrong += runtime::is_null(*s_entry, i) && runtime::is_null(*n_entry, i) ? 0U : 1U;
+            continue;
+        }
+        wrong += runtime::is_null(*s_entry, i) == !rs_valid[key] ? 0U : 1U;
+        if (rs_valid[key]) {
+            wrong += s_col[i] == rs[key] ? 0U : 1U;
+        }
+        wrong += runtime::is_null(*n_entry, i) == !rn_valid[key] ? 0U : 1U;
+    }
+    CHECK(wrong == 0);
+}
+
 // `std` is a native grouped reduction: Welford in row order per group, the
 // generic aggregate's arithmetic, so its bits must be the hand-computed ones.
 // Nulls are skipped, a group with fewer than two values is null, and the result

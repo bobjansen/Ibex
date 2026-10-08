@@ -498,11 +498,13 @@ struct ColumnGatherJob {
     const ColumnValue* column = nullptr;
     const ValidityBitmap* validity = nullptr;  ///< null when the source has none
     const std::size_t* idx = nullptr;          ///< output row -> source row
-    /// Set when the CALLER knows this column cannot be written by range — a
-    /// join index carrying `kNull` sentinels is the case that needs it, because
-    /// the sentinel branch writes a validity bit beside each value and so is a
-    /// different kernel. A string column is detected here and needs no flag.
+    /// Set when the CALLER knows this column cannot be written by range.
     bool indivisible = false;
+    /// Set when `idx` holds this sentinel for an output row with no source row
+    /// (a join's unmatched side). Such a row comes out as the type's default
+    /// and null, and the result always carries a validity bitmap -- the
+    /// `gather_column_with_nulls` contract, written by range.
+    std::optional<std::size_t> null_index = std::nullopt;
 };
 
 /// Gather several columns in ONE worker batch, as (column x range) tasks.
@@ -519,9 +521,15 @@ struct ColumnGatherJob {
 ///   * a (column, range) task, whose ranges are 64-ALIGNED so a bit-packed
 ///     destination (`Column<bool>`, a validity bitmap) never has two ranges in
 ///     one word;
-///   * a whole-column task, for a string (cumulative offsets have no partial
-///     form) or for a job the caller marked `indivisible`. Those still run
-///     CONCURRENTLY WITH the other columns, which is the point of batching.
+///   * a whole-column task, for a job the caller marked `indivisible` or a
+///     bit-packed column with sentinels. Those still run CONCURRENTLY WITH the
+///     other columns, which is the point of batching.
+///
+/// String columns are written by range too: a first batch counts each range's
+/// bytes, which fixes every range's first byte, and the main batch then writes
+/// offsets and bytes per range. A whole-column string task left one worker
+/// gathering every string while the rest waited (a left join's one string
+/// column: 21 ms of a 21 ms statement was that wait).
 ///
 /// `gather_whole(j)` produces job `j`'s column in full. It is used for the
 /// indivisible tasks and for the serial fallback, so a caller with extra
@@ -547,7 +555,7 @@ template <typename GatherWhole>
     const std::size_t threads = std::min(budget, pool_size);
     const bool worth_it =
         exec != nullptr && exec->can_fan_out() && !on_worker_pool_thread() && threads >= 2 &&
-        !jobs.empty() && total >= exec->parallel_min_rows &&
+        !jobs.empty() && total > 0 && total >= exec->parallel_min_rows &&
         (exec->parallel_min_cells == 0 || total * jobs.size() >= exec->parallel_min_cells);
 
     if (!worth_it) {
@@ -564,6 +572,7 @@ template <typename GatherWhole>
         std::size_t lo = 0;
         std::size_t hi = 0;
         bool indivisible = false;
+        std::uint64_t char_base = 0;  ///< a string range's first output byte
     };
 
     // Enough tasks that one slow column cannot strand the rest, rounded up to
@@ -573,18 +582,26 @@ template <typename GatherWhole>
     span = ((span + kAlign - 1) / kAlign) * kAlign;
     span = std::max(span, kAlign);
 
+    const auto is_string = [&](const ColumnGatherJob& job) {
+        return std::holds_alternative<Column<std::string>>(*job.column);
+    };
     std::vector<Task> tasks;
     tasks.reserve(jobs.size() * ((total / span) + 1));
     for (std::size_t j = 0; j < jobs.size(); ++j) {
         const auto& job = jobs[j];
-        if (job.indivisible || std::holds_alternative<Column<std::string>>(*job.column)) {
+        const bool bool_with_nulls =
+            job.null_index.has_value() && std::holds_alternative<Column<bool>>(*job.column);
+        if (job.indivisible || bool_with_nulls) {
             tasks.push_back({.job = j, .lo = 0, .hi = total, .indivisible = true});
             continue;
         }
         // Allocate before the fan-out: the destinations must not be reshaped
-        // once workers hold references into `out`.
-        out[j].first = make_gather_column(*job.column, total);
-        if (job.validity != nullptr) {
+        // once workers hold references into `out`. A string column is sized
+        // once its byte count is known, below.
+        if (!is_string(job)) {
+            out[j].first = make_gather_column(*job.column, total);
+        }
+        if (job.validity != nullptr || job.null_index.has_value()) {
             out[j].second = ValidityBitmap(total, false);
         }
         for (std::size_t lo = 0; lo < total; lo += span) {
@@ -597,26 +614,131 @@ template <typename GatherWhole>
     }
 
     std::atomic<std::size_t> cursor{0};
-    auto batch = process_worker_pool().submit(std::min(threads, tasks.size()), [&](std::size_t) {
-        while (true) {
-            const std::size_t t = cursor.fetch_add(1, std::memory_order_relaxed);
-            if (t >= tasks.size()) {
-                return;
-            }
+    const auto run_tasks = [&](const auto& body) {
+        cursor.store(0, std::memory_order_relaxed);
+        auto batch =
+            process_worker_pool().submit(std::min(threads, tasks.size()), [&](std::size_t) {
+                while (true) {
+                    const std::size_t t = cursor.fetch_add(1, std::memory_order_relaxed);
+                    if (t >= tasks.size()) {
+                        return;
+                    }
+                    body(t);
+                }
+            });
+        batch.wait();
+    };
+
+    // Strings: count each range's bytes, then give every range its first byte
+    // (ranges in row order) and size each column once.
+    if (std::ranges::any_of(
+            tasks, [&](const Task& t) { return !t.indivisible && is_string(jobs[t.job]); })) {
+        std::vector<std::uint64_t> range_chars(tasks.size(), 0);
+        run_tasks([&](std::size_t t) {
             const auto& task = tasks[t];
             const auto& job = jobs[task.job];
-            if (task.indivisible) {
-                out[task.job] = gather_whole(task.job);
-                continue;
+            if (task.indivisible || !is_string(job)) {
+                return;
             }
-            const std::span<const std::size_t> idx{job.idx, total};
+            const auto* offsets = std::get<Column<std::string>>(*job.column).offsets_data();
+            std::uint64_t chars = 0;
+            for (std::size_t pos = task.lo; pos < task.hi; ++pos) {
+                const std::size_t row = job.idx[pos];
+                if (job.null_index.has_value() && row == *job.null_index) {
+                    continue;
+                }
+                chars += offsets[row + 1] - offsets[row];
+            }
+            range_chars[t] = chars;
+        });
+        std::vector<std::uint64_t> job_chars(jobs.size(), 0);
+        for (std::size_t t = 0; t < tasks.size(); ++t) {
+            if (!tasks[t].indivisible && is_string(jobs[tasks[t].job])) {
+                tasks[t].char_base = job_chars[tasks[t].job];
+                job_chars[tasks[t].job] += range_chars[t];
+            }
+        }
+        for (std::size_t j = 0; j < jobs.size(); ++j) {
+            if (is_string(jobs[j]) && std::ranges::any_of(tasks, [&](const Task& t) {
+                    return t.job == j && !t.indivisible;
+                })) {
+                Column<std::string> strings;
+                strings.resize_for_gather(total, job_chars[j]);
+                strings.offsets_data()[0] = 0;
+                out[j].first = std::move(strings);
+            }
+        }
+    }
+
+    run_tasks([&](std::size_t t) {
+        const auto& task = tasks[t];
+        const auto& job = jobs[task.job];
+        if (task.indivisible) {
+            out[task.job] = gather_whole(task.job);
+            return;
+        }
+        const std::span<const std::size_t> idx{job.idx, total};
+        if (!job.null_index.has_value() && !is_string(job)) {
             gather_range_into(out[task.job].first, *job.column, idx, task.lo, task.hi);
             if (job.validity != nullptr) {
                 gather_validity_range(*out[task.job].second, *job.validity, idx, task.lo, task.hi);
             }
+            return;
         }
+        // A sentinel row is the default value and null; any other row is the
+        // source value, null where the source is.
+        const std::size_t null_row = job.null_index.value_or(static_cast<std::size_t>(-1));
+        ValidityBitmap* valid = out[task.job].second ? &*out[task.job].second : nullptr;
+        const auto mark = [&](std::size_t pos, std::size_t row) {
+            if (valid != nullptr) {
+                valid->set(pos,
+                           row != null_row && (job.validity == nullptr || (*job.validity)[row]));
+            }
+        };
+        std::visit(
+            [&](auto& dst) {
+                using ColT = std::decay_t<decltype(dst)>;
+                const auto& src = std::get<ColT>(*job.column);
+                if constexpr (std::is_same_v<ColT, Column<std::string>>) {
+                    const auto* src_off = src.offsets_data();
+                    const char* src_char = src.chars_data();
+                    auto* dst_off = dst.offsets_data();
+                    char* dst_char = dst.chars_data();
+                    auto cur = static_cast<std::uint32_t>(task.char_base);
+                    for (std::size_t pos = task.lo; pos < task.hi; ++pos) {
+                        const std::size_t row = idx[pos];
+                        if (row != null_row) {
+                            const std::uint32_t len = src_off[row + 1] - src_off[row];
+                            if (len != 0) {
+                                std::memcpy(dst_char + cur, src_char + src_off[row], len);
+                            }
+                            cur += len;
+                        }
+                        dst_off[pos + 1] = cur;
+                        mark(pos, row);
+                    }
+                } else if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                    auto* dp = dst.codes_data();
+                    const auto* sp = src.codes_data();
+                    for (std::size_t pos = task.lo; pos < task.hi; ++pos) {
+                        const std::size_t row = idx[pos];
+                        dp[pos] = row != null_row ? sp[row] : 0;
+                        mark(pos, row);
+                    }
+                } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
+                    invariant_violation("gather_columns_batched: bool with nulls is whole-column");
+                } else {
+                    auto* dp = dst.data();
+                    const auto* sp = src.data();
+                    for (std::size_t pos = task.lo; pos < task.hi; ++pos) {
+                        const std::size_t row = idx[pos];
+                        dp[pos] = row != null_row ? sp[row] : typename ColT::value_type{};
+                        mark(pos, row);
+                    }
+                }
+            },
+            out[task.job].first);
     });
-    batch.wait();
     return out;
 }
 

@@ -304,15 +304,16 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
     # momentum → Sharpe-like ratio per symbol. ts has a stable order key (unlike
     # update_group_filter above), so lagInFrame works. ClickHouse RANGE offsets
     # must fit in 32 bits, so the window orders by microseconds (intDiv(ts,1000))
-    # with a 300000000 µs = 5-minute frame (inclusive both ends — matches ibex);
+    # with a 299999999 µs frame: SQL frames are closed on both ends, so this is
+    # ibex's (t - 5m, t];
     # the 100 ms row spacing keeps µs values tie-free. stddevSamp = ddof=1.
     if pts_path is not None:
         run(
             "log_return_momentum",
-            "SELECT symbol, avg(mom) AS mean_mom, stddevSamp(mom) AS std_mom, "
+            "SELECT symbol, avg(mom) AS mean_mom, "
             "avg(mom) / stddevSamp(mom) AS sharpe FROM ("
             "SELECT symbol, avg(lr) OVER (PARTITION BY symbol ORDER BY tus "
-            "RANGE BETWEEN 300000000 PRECEDING AND CURRENT ROW) AS mom FROM ("
+            "RANGE BETWEEN 299999999 PRECEDING AND CURRENT ROW) AS mom FROM ("
             "SELECT symbol, intDiv(ts, 1000) AS tus, "
             "log(price / lagInFrame(price, 1) OVER ("
             "PARTITION BY symbol ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)) AS lr "

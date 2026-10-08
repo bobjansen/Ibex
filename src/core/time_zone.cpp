@@ -160,13 +160,22 @@ auto same_civil_time(const std::tm& lhs, const std::tm& rhs) -> bool {
            lhs.tm_hour == rhs.tm_hour && lhs.tm_min == rhs.tm_min && lhs.tm_sec == rhs.tm_sec;
 }
 
+/// TZ and tzset are process-global, so every with_zone call shares this one
+/// lock. It must not be a static local of the template below: each
+/// instantiation would get its own mutex, and two callers with different
+/// lambdas (local_bucket_start and local_time_to_sys) could then restore TZ
+/// under each other mid-conversion.
+auto timezone_mutex() -> std::mutex& {
+    static std::mutex mutex;
+    return mutex;
+}
+
 template <typename F>
 auto with_zone(std::string_view zone, F&& fn) -> decltype(fn()) {
-    // TZ and tzset are process-global. The fallback is used only on platforms
-    // whose standard library lacks chrono tzdb; serialising here preserves
-    // correctness for concurrent resamples and casts.
-    static std::mutex timezone_mutex;
-    const std::scoped_lock lock(timezone_mutex);
+    // The fallback is used only on platforms whose standard library lacks
+    // chrono tzdb; serialising here preserves correctness for concurrent
+    // resamples and casts.
+    const std::scoped_lock lock(timezone_mutex());
     const char* previous = std::getenv("TZ");
     const std::optional<std::string> saved =
         previous != nullptr ? std::optional<std::string>(previous) : std::nullopt;

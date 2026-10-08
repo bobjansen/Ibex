@@ -346,7 +346,8 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     # Tier 3 funnel on the timestamped table: log returns → 5-minute time-windowed
     # momentum → Sharpe-like ratio per symbol. Matches ibex: sort by ts; the first
     # return per symbol is null (skipped — pandas rolling.mean and .mean()/.std()
-    # are NaN-aware); window closed on both ends; sample std (ddof=1).
+    # are NaN-aware); window (t - 5m, t] like ibex's; sample std (ddof=1). std_mom
+    # is only a step toward sharpe: ibex does not output it.
     pts_path = derive_prices_ts(csv_path)
     if pts_path is not None:
         pt = pd.read_csv(pts_path)
@@ -358,7 +359,7 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
             g["lr"] = np.log(g["price"] / g.groupby("symbol")["price"].shift(1))
             g["mom"] = g.groupby("symbol", group_keys=False).apply(
                 lambda s: pd.Series(
-                    s.set_index("dt")["lr"].rolling("5min", closed="both").mean().to_numpy(),
+                    s.set_index("dt")["lr"].rolling("5min", closed="right").mean().to_numpy(),
                     index=s.index,
                 )
             )
@@ -366,7 +367,7 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
                 mean_mom=("mom", "mean"), std_mom=("mom", lambda s: s.std(ddof=1))
             )
             res["sharpe"] = res["mean_mom"] / res["std_mom"]
-            return res.reset_index()
+            return res.drop(columns="std_mom").reset_index()
 
         run("log_return_momentum", _log_return_momentum)
 
@@ -678,7 +679,7 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
             )
             .with_columns(
                 pl.col("lr")
-                .rolling_mean_by("dt", window_size="5m", closed="both")
+                .rolling_mean_by("dt", window_size="5m", closed="right")
                 .over("symbol")
                 .alias("mom")
             )
@@ -687,7 +688,8 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
                 pl.col("mom").mean().alias("mean_mom"),
                 pl.col("mom").std().alias("std_mom"),
             )
-            .with_columns((pl.col("mean_mom") / pl.col("std_mom")).alias("sharpe")),
+            .with_columns((pl.col("mean_mom") / pl.col("std_mom")).alias("sharpe"))
+            .drop("std_mom"),
         )
 
     # Transforms / single-pass language features.
@@ -1047,7 +1049,7 @@ def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
             )
             .with_columns(
                 pl.col("lr")
-                .rolling_mean_by("dt", window_size="5m", closed="both")
+                .rolling_mean_by("dt", window_size="5m", closed="right")
                 .over("symbol")
                 .alias("mom")
             )
@@ -1057,6 +1059,7 @@ def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
                 pl.col("mom").std().alias("std_mom"),
             )
             .with_columns((pl.col("mean_mom") / pl.col("std_mom")).alias("sharpe"))
+            .drop("std_mom")
             .collect(),
         )
     # Transforms / single-pass language features.

@@ -180,14 +180,13 @@ def bench_polars(parquet: Path, window: str, iters: int,
         # (symbol, timestamp), which FANS OUT on tied timestamps -- 200,018 rows
         # out of a 200,000-row input, i.e. Polars was not doing the same work as
         # the others. Ties are rare but real at tick density.
-        # closed="both" -- polars defaults to "right", i.e. (t-10s, t], while
-        # Ibex and DuckDB use [t-10s, t]. On sparse data no tick ever lands
-        # exactly on a boundary and the difference is invisible; at tick density
-        # it is not.
+        # closed="right", i.e. (t-10s, t], is Ibex's window (SPEC.md §9.3). On
+        # sparse data no tick ever lands exactly on a boundary and the
+        # difference is invisible; at tick density it is not.
         base = df.sort(["symbol", "timestamp"])
         def q():
             agg = (base.rolling(index_column="timestamp", period=WINDOW, group_by="symbol",
-                               closed="both")
+                               closed="right")
                        .agg(open=pl.col("price").first(), high=pl.col("price").max(),
                             low=pl.col("price").min(), close=pl.col("price").last(),
                             volume_sum=pl.col("volume").sum()))
@@ -220,7 +219,8 @@ def _duckdb_sql(window: str) -> str:
                sum(volume) OVER w AS volume_sum
         FROM t
         WINDOW w AS (PARTITION BY symbol ORDER BY timestamp
-                     RANGE BETWEEN INTERVAL '{WINDOW}' PRECEDING AND CURRENT ROW)
+                     RANGE BETWEEN INTERVAL '{WINDOW}' - INTERVAL 1 MICROSECOND PRECEDING
+                     AND CURRENT ROW)
         ORDER BY symbol"""
 
 
@@ -244,7 +244,8 @@ def _clickhouse_sql(window: str) -> str:
     # type"). Ordering by MICROSECONDS puts the offset inside int32 while
     # keeping the frame far finer than the ~1ms tick spacing. It is the closest
     # faithful expression available; `--verify` is what decides whether the
-    # rounding changes any answer.
+    # rounding changes any answer. SQL frames are closed on both ends, so the
+    # offset stops one microsecond short of Ibex's open left edge.
     return f"""
         SELECT timestamp, symbol, price,
                first_value(price) OVER w AS open, max(price) OVER w AS high,
@@ -252,7 +253,7 @@ def _clickhouse_sql(window: str) -> str:
                sum(volume) OVER w AS volume_sum
         FROM t
         WINDOW w AS (PARTITION BY symbol ORDER BY toUnixTimestamp64Micro(timestamp)
-                     RANGE BETWEEN {WINDOW_SECS * 1_000_000} PRECEDING AND CURRENT ROW)
+                     RANGE BETWEEN {WINDOW_SECS * 1_000_000 - 1} PRECEDING AND CURRENT ROW)
         ORDER BY symbol"""
 
 
@@ -305,12 +306,13 @@ OHLCV = ["open", "high", "low", "close", "volume_sum"]
 
 
 # Engines whose trailing frame provably differs from Ibex's on some rows.
-# Ibex's window is [t - dur, t] and POSITION-bounded: it ends at the current
+# Ibex's window is (t - dur, t] and POSITION-bounded: it ends at the current
 # row. A SQL `RANGE` frame is peer-inclusive at BOTH ends -- every row sharing
 # the current ORDER BY value is in it, including later ones. On top of that,
 # DuckDB's INTERVAL arithmetic is microsecond-resolution, and ClickHouse rejects
 # a RANGE offset wider than 32 bits so the query orders by microseconds, which
-# makes any two ticks inside one microsecond peers.
+# makes any two ticks inside one microsecond peers. Both SQL frames are closed,
+# so each stops one microsecond short of the window to approximate the open edge.
 _FRAME_ENGINES = ("polars", "duckdb", "clickhouse")
 
 
@@ -363,16 +365,16 @@ def _frame_differs(frame, engine: str):
     for lo, hi in zip(np.r_[0, bounds], np.r_[bounds, ts.size]):
         t = ts[lo:hi]
         pos = np.arange(t.size)
-        left_ibex = np.searchsorted(t, t - WINDOW_NS, side="left")
+        left_ibex = np.searchsorted(t, t - WINDOW_NS, side="right")
         key = t
         if engine == "clickhouse":
             key = tu = t // 1000        # ClickHouse's ORDER BY key IS microseconds
-            left = np.searchsorted(tu, tu - (WINDOW_NS // 1000), side="left")
+            left = np.searchsorted(tu, tu - (WINDOW_NS // 1000), side="right")
             right = np.searchsorted(tu, tu, side="right") - 1
         elif engine == "duckdb":
-            left = np.searchsorted(t, (t - WINDOW_NS) // 1000 * 1000, side="left")
+            left = np.searchsorted(t, (t - WINDOW_NS) // 1000 * 1000 + 1000, side="left")
             right = np.searchsorted(t, t, side="right") - 1
-        else:                                   # polars, closed="both", ns-exact
+        else:                                   # polars, closed="right", ns-exact
             left = left_ibex
             right = np.searchsorted(t, t, side="right") - 1
         # `first(price)` is ambiguous when the frame's FIRST row is one of a
@@ -427,7 +429,7 @@ def verify_engines(parquet: Path, window: str, tol: float = 1e-9) -> list[str]:
     else:
         base = df.sort(["symbol", "timestamp"])
         agg = (base.rolling(index_column="timestamp", period=WINDOW, group_by="symbol",
-                               closed="both")
+                               closed="right")
                    .agg(open=pl.col("price").first(), high=pl.col("price").max(),
                         low=pl.col("price").min(), close=pl.col("price").last(),
                         volume_sum=pl.col("volume").sum()))

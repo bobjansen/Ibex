@@ -229,7 +229,9 @@ if (!skip_dplyr) {
 
 # Timestamped prices for the time-windowed pipeline (log_return_momentum):
 # prices_ts.csv (symbol, ts:int64-ns, price) beside the prices CSV. The 5-minute
-# window is slider's .before = 3e11 ns (inclusive both ends — matches ibex).
+# window is ibex's (t - 5m, t]. slider's .before is closed, so it stops half a
+# row spacing (50 ms) short of 5m: exact whether ts arrives as integer64 or as
+# a double, whose ulp at epoch nanoseconds is 256 ns.
 prices_ts_path <- sub("prices\\.csv$", "prices_ts.csv", csv_path)
 has_prices_ts  <- grepl("prices\\.csv$", csv_path) && file.exists(prices_ts_path)
 dt_ts <- NULL
@@ -370,9 +372,9 @@ if (!skip_data_table) {
             d <- copy(dt_ts); setorder(d, ts)
             d[, lr := log(price / shift(price, 1L)), by = symbol]
             d[, mom := slide_index_dbl(lr, ts, ~mean(.x, na.rm = TRUE),
-                                       .before = 300000000000), by = symbol]
-            d[, .(mean_mom = mean(mom, na.rm = TRUE), std_mom = sd(mom, na.rm = TRUE)),
-              by = symbol][, sharpe := mean_mom / std_mom][]
+                                       .before = 299950000000), by = symbol]
+            d[, .(mean_mom = mean(mom, na.rm = TRUE),
+                  sharpe = mean(mom, na.rm = TRUE) / sd(mom, na.rm = TRUE)), by = symbol]
         })
     }
 
@@ -536,10 +538,10 @@ if (!skip_dplyr) {
             function() tb_ts |> arrange(ts) |> group_by(symbol) |>
                 mutate(lr  = log(price / lag(price, 1L)),
                        mom = slide_index_dbl(lr, ts, ~mean(.x, na.rm = TRUE),
-                                             .before = 300000000000)) |>
+                                             .before = 299950000000)) |>
                 summarise(mean_mom = mean(mom, na.rm = TRUE),
-                          std_mom = sd(mom, na.rm = TRUE), .groups = "drop") |>
-                mutate(sharpe = mean_mom / std_mom))
+                          sharpe = mean(mom, na.rm = TRUE) / sd(mom, na.rm = TRUE),
+                          .groups = "drop"))
     }
 
     # Transforms / single-pass language features.

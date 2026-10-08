@@ -47,7 +47,6 @@ const char* malloc_conf = "dirty_decay_ms:-1,muzzy_decay_ms:-1";
 #include <limits>
 #include <memory>
 #include <numeric>
-#include <random>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -3702,12 +3701,10 @@ int main(int argc, char** argv) {
             quotes_table.add_column("ts", std::move(q_ts));
             quotes_table.add_column("bid", std::move(q_bid));
 
-            // Trade indices: deterministic 10% reservoir-style sample.
+            // Trades: every 10th quote index, jittered by a closed form rather
+            // than an RNG so every harness generates the same rows.
             std::vector<std::size_t> trade_idx;
             trade_idx.reserve(timeframe_rows / 10);
-            // Fine here
-            // NOLINTNEXTLINE(bugprone-random-generator-seed, cert-msc51-cpp, cert-msc32-c)
-            std::mt19937_64 rng{42};
             for (std::size_t i = 0; i < timeframe_rows; ++i) {
                 if ((i % 10ULL) == 0ULL) {
                     trade_idx.push_back(i);
@@ -3720,10 +3717,10 @@ int main(int argc, char** argv) {
             t_ts.reserve(trade_idx.size());
             t_qty.reserve(trade_idx.size());
             for (auto i : trade_idx) {
-                const auto jitter_ms = static_cast<std::int64_t>(rng() % 1000ULL);
+                const auto jitter_ms = static_cast<std::int64_t>((i * 37ULL) % 999ULL);
                 t_ts.push_back(ibex::Timestamp{(static_cast<std::int64_t>(i) * 1'000'000'000LL) +
                                                (jitter_ms * 1'000'000LL)});
-                t_qty.push_back(static_cast<std::int64_t>(rng() % 99ULL) + 1);
+                t_qty.push_back(static_cast<std::int64_t>((i * 13ULL) % 99ULL) + 1);
             }
             ibex::runtime::Table trades_table;
             trades_table.add_column("ts", std::move(t_ts));
@@ -3773,9 +3770,6 @@ int main(int argc, char** argv) {
             // index they derive from so every trade has same-symbol candidates.
             std::vector<std::size_t> trade_idx;
             trade_idx.reserve(timeframe_rows / 10);
-            // Fine here
-            // NOLINTNEXTLINE(bugprone-random-generator-seed, cert-msc51-cpp, cert-msc32-c)
-            std::mt19937_64 rng{42};
             for (std::size_t i = 0; i < timeframe_rows; ++i) {
                 if ((i % 10ULL) == 0ULL) {
                     trade_idx.push_back(i);
@@ -3789,7 +3783,7 @@ int main(int argc, char** argv) {
             t_ts.reserve(trade_idx.size());
             t_qty.reserve(trade_idx.size());
             for (auto i : trade_idx) {
-                const auto jitter_ms = static_cast<std::int64_t>(rng() % 1000ULL);
+                const auto jitter_ms = static_cast<std::int64_t>((i * 37ULL) % 999ULL);
                 t_ts.push_back(ibex::Timestamp{(static_cast<std::int64_t>(i) * 1'000'000'000LL) +
                                                (jitter_ms * 1'000'000LL)});
                 t_sym.push_back(sym_names[i % kAsofSymbols]);

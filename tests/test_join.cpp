@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -2918,5 +2919,136 @@ let b = Table { k = [2] };
         REQUIRE(out.rows() == 1);
         CHECK(col_i64(out, "n") == std::vector<std::int64_t>{1});
         CHECK(col_i64(out, "s") == std::vector<std::int64_t>{20});
+    }
+}
+
+// The as-of join runs its sortedness checks, its time-only merge and its
+// single-key factorise/bucket/merge across workers. Whatever the split, each
+// left row must get the LAST right row (in row order) with the same key and a
+// time at or before its own, or null -- the serial answer.
+TEST_CASE("join: a parallel asof join gives the serial, row-order answer",
+          "[join][asof][parallel]") {
+    constexpr std::size_t kLeft = 12'000;
+    constexpr std::size_t kRight = 40'000;
+    Column<Timestamp> rts;
+    Column<std::string> rsym;
+    Column<std::int64_t> rkey;
+    Column<std::int64_t> rrow;
+    for (std::size_t i = 0; i < kRight; ++i) {
+        rts.push_back(Timestamp{static_cast<std::int64_t>((i * 3) / 2) * 10});  // ties
+        rsym.push_back("S" + std::to_string(i % 7));
+        rkey.push_back(static_cast<std::int64_t>(i % 7));
+        rrow.push_back(static_cast<std::int64_t>(i));
+    }
+    Column<Timestamp> lts;
+    Column<std::string> lsym;
+    Column<std::int64_t> lkey;
+    for (std::size_t l = 0; l < kLeft; ++l) {
+        // Starts before every right time; keys 7 and 8 never occur on the right.
+        lts.push_back(Timestamp{(static_cast<std::int64_t>(l) * 50) - 300});
+        lsym.push_back("S" + std::to_string(l % 9));
+        lkey.push_back(static_cast<std::int64_t>(l % 9));
+    }
+    runtime::TableRegistry tables;
+    {
+        runtime::Table lhs;
+        lhs.add_column("ts", lts);
+        lhs.add_column("symbol", lsym);
+        lhs.add_column("key", lkey);
+        lhs.set_properties(runtime::TableProperties::time_frame("ts"));
+        tables.emplace("lhs", std::move(lhs));
+        // One right table per key shape, so no non-key column name is shared.
+        const auto right = [&](const char* key_name, const auto* key_col) {
+            runtime::Table rhs;
+            rhs.add_column("ts", rts);
+            if (key_col != nullptr) {
+                rhs.add_column(key_name, *key_col);
+            }
+            rhs.add_column("rrow", rrow);
+            rhs.set_properties(runtime::TableProperties::time_frame("ts"));
+            return rhs;
+        };
+        tables.emplace("rhs_t", right("", static_cast<const Column<std::int64_t>*>(nullptr)));
+        tables.emplace("rhs_s", right("symbol", &rsym));
+        tables.emplace("rhs_k", right("key", &rkey));
+    }
+    // Reference: the last right row at or before each left time, per key
+    // (key -1: time only).
+    const auto expected = [&](std::size_t l, bool by_key) -> std::optional<std::int64_t> {
+        std::optional<std::int64_t> best;
+        for (std::size_t r = 0; r < kRight && rts[r].nanos <= lts[l].nanos; ++r) {
+            if (!by_key || rkey[r] == lkey[l]) {
+                best = static_cast<std::int64_t>(r);
+            }
+        }
+        return best;
+    };
+    std::vector<std::optional<std::int64_t>> want_time(kLeft);
+    std::vector<std::optional<std::int64_t>> want_key(kLeft);
+    for (std::size_t l = 0; l < kLeft; ++l) {
+        want_time[l] = expected(l, false);
+        want_key[l] = expected(l, true);
+    }
+
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+    parallel.parallel_min_cells = 0;
+    const auto run = [&](const char* src, const runtime::ExecutionContext& exec) {
+        auto parsed = parser::parse(src);
+        REQUIRE(parsed.has_value());
+        auto lowered = parser::lower(*parsed);
+        REQUIRE(lowered.has_value());
+        return runtime::interpret(*lowered.value(), tables, nullptr, nullptr, nullptr, exec);
+    };
+    for (const auto& [src, by_key] : {std::pair{"lhs asof join rhs_t on ts;", false},
+                                      std::pair{"lhs asof join rhs_s on {ts, symbol};", true},
+                                      std::pair{"lhs asof join rhs_k on {ts, key};", true}}) {
+        INFO(src);
+        for (const auto* exec : {&serial, &parallel}) {
+            auto out = run(src, *exec);
+            REQUIRE(out.has_value());
+            REQUIRE(out->rows() == kLeft);
+            const auto* matched = out->find_entry("rrow");
+            REQUIRE(matched != nullptr);
+            const auto& values = std::get<Column<std::int64_t>>(*matched->column);
+            const auto& want = by_key ? want_key : want_time;
+            std::size_t wrong = 0;
+            for (std::size_t l = 0; l < kLeft; ++l) {
+                if (!want[l].has_value()) {
+                    wrong += runtime::is_null(*matched, l) ? 0U : 1U;
+                } else {
+                    wrong += !runtime::is_null(*matched, l) && values[l] == *want[l] ? 0U : 1U;
+                }
+            }
+            CHECK(wrong == 0);
+        }
+    }
+
+    // One inversion, at a range boundary or not, is still unsorted: the join
+    // refuses it, and as_timeframe sorts it. The join splits into equal ranges
+    // (boundaries at multiples of kRight / 4 on four workers); as_timeframe's
+    // check uses 64-aligned ones (multiples of 10048).
+    for (const std::size_t at : {kRight / 4, kRight / 2, (3 * kRight) / 4, kRight - 1,
+                                 std::size_t{10'048}, std::size_t{20'096}, std::size_t{30'144}}) {
+        INFO(at);
+        Column<Timestamp> bad = rts;
+        bad[at] = Timestamp{bad[at - 1].nanos - 1};
+        runtime::Table rhs;
+        rhs.add_column("ts", bad);
+        rhs.add_column("rrow", rrow);
+        auto unsorted = rhs;
+        unsorted.set_properties(runtime::TableProperties::time_frame("ts"));
+        tables.insert_or_assign("bad", std::move(unsorted));
+        tables.insert_or_assign("raw", std::move(rhs));
+        auto refused = run("lhs asof join bad on ts;", parallel);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().find("not sorted") != std::string::npos);
+        auto promoted = run("as_timeframe(raw, \"ts\");", parallel);
+        REQUIRE(promoted.has_value());
+        const auto& ts = std::get<Column<Timestamp>>(*promoted->find("ts"));
+        CHECK(std::ranges::is_sorted(ts, {}, &Timestamp::nanos));
     }
 }

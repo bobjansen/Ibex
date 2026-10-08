@@ -320,9 +320,9 @@ struct GatherJob {
 /// The join used to call `gather_entry` in a loop and let each call fan its own
 /// rows out, which submitted and waited a batch per column. See that helper for
 /// the measurement that motivated batching. The join-specific part is only
-/// which columns are indivisible (a side whose index carries `kNull`) and what
-/// a whole-column gather means here (`gather_entry`, which merges the sentinel
-/// nulls with the source's own).
+/// which side's index carries the `kNull` sentinel (gathered by range as default
+/// and null) and what a whole-column gather means here (`gather_entry`, which
+/// merges the sentinel nulls with the source's own).
 auto gather_entries(std::span<const GatherJob> jobs, std::size_t total,
                     const ExecutionContext* exec) -> std::vector<GatheredColumn> {
     std::vector<ColumnGatherJob> column_jobs;
@@ -332,7 +332,7 @@ auto gather_entries(std::span<const GatherJob> jobs, std::size_t total,
             .column = job.entry->column.get(),
             .validity = job.entry->validity.has_value() ? &*job.entry->validity : nullptr,
             .idx = job.idx,
-            .indivisible = job.has_sentinel,
+            .null_index = job.has_sentinel ? std::optional<std::size_t>{kNull} : std::nullopt,
         });
     }
     return gather_columns_batched(column_jobs, total, exec, [&](std::size_t j) -> GatheredColumn {

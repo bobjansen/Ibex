@@ -8856,6 +8856,87 @@ TEST_CASE("grouped update mixes a general aggregate into a row-local expression"
     CHECK(out->columns.size() == 3);
 }
 
+// An ungrouped top-k splits its rows into ranges with a heap each, then merges
+// the heaps. Ranks are (key, row) -- ties go by row order -- so the result must
+// be the first `k` rows of a STABLE sort, serial or parallel, head or tail.
+TEST_CASE("top-k: a parallel run takes the stable sort's rows, ties included", "[topk][parallel]") {
+    constexpr std::size_t kRows = 20'000;
+    Column<double> x;
+    Column<std::int64_t> n;
+    Column<Date> d;
+    Column<std::int64_t> id;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        x.push_back(static_cast<double>((i * 7919) % 37));  // heavy ties
+        n.push_back(static_cast<std::int64_t>((i * 31) % 101) - 50);
+        d.push_back(Date{static_cast<std::int32_t>((i * 13) % 17)});
+        id.push_back(static_cast<std::int64_t>(i));
+    }
+    runtime::TableRegistry registry;
+    {
+        runtime::Table t;
+        t.add_column("x", x);
+        t.add_column("n", n);
+        t.add_column("d", d);
+        t.add_column("id", id);
+        registry.emplace("t", std::move(t));
+    }
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+    // Reference: a stable sort of row ids by the key, then the first or last k.
+    const auto reference = [&](const auto& key, bool ascending, bool head, std::size_t k) {
+        std::vector<std::int64_t> rows(kRows);
+        std::iota(rows.begin(), rows.end(), 0);
+        std::ranges::stable_sort(rows, [&](std::int64_t a, std::int64_t b) {
+            return ascending ? key(a) < key(b) : key(b) < key(a);
+        });
+        return head ? std::vector<std::int64_t>(rows.begin(),
+                                                rows.begin() + static_cast<std::ptrdiff_t>(k))
+                    : std::vector<std::int64_t>(rows.end() - static_cast<std::ptrdiff_t>(k),
+                                                rows.end());
+    };
+    struct Case {
+        const char* query;
+        int column;  // 0 x, 1 n, 2 d
+        bool ascending;
+        bool head;
+        std::size_t k;
+    };
+    for (const auto& c : std::array<Case, 6>{{
+             {"t[order x desc, head 100];", 0, false, true, 100},
+             {"t[order x desc, tail 100];", 0, false, false, 100},
+             {"t[order x asc, head 7000];", 0, true, true, 7000},  // > a range's rows
+             {"t[order n asc, head 50];", 1, true, true, 50},
+             {"t[order n desc, tail 75];", 1, false, false, 75},
+             {"t[order d desc, head 300];", 2, false, true, 300},
+         }}) {
+        INFO(c.query);
+        auto ir = require_ir(c.query);
+        auto one = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+        auto four = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+        REQUIRE(one.has_value());
+        REQUIRE(four.has_value());
+        if (auto mismatch = runtime::compare_tables(*one, *four); mismatch.has_value()) {
+            FAIL(mismatch->message());
+        }
+        const auto& got = std::get<Column<std::int64_t>>(*four->find("id"));
+        std::vector<std::int64_t> want;
+        if (c.column == 0) {
+            want = reference([&](std::int64_t r) { return x[static_cast<std::size_t>(r)]; },
+                             c.ascending, c.head, c.k);
+        } else if (c.column == 1) {
+            want = reference([&](std::int64_t r) { return n[static_cast<std::size_t>(r)]; },
+                             c.ascending, c.head, c.k);
+        } else {
+            want = reference([&](std::int64_t r) { return d[static_cast<std::size_t>(r)].days; },
+                             c.ascending, c.head, c.k);
+        }
+        CHECK(std::vector<std::int64_t>(got.begin(), got.end()) == want);
+    }
+}
+
 // `median(x) by <categorical>` numbers its groups and collects each group's
 // values across workers. Groups must still come out in first-appearance order
 // (not dictionary order) and each group's values in row order -- skew and

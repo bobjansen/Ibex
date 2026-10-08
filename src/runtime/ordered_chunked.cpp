@@ -14,6 +14,7 @@
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -412,12 +413,13 @@ class ChunkedOrderedLimitOperator final : public Operator {
 
     ChunkedOrderedLimitOperator(OperatorPtr child, const std::vector<ir::OrderKey>* keys,
                                 std::size_t count, const std::vector<ir::ColumnRef>* group_by,
-                                KeepMode keep_mode)
+                                KeepMode keep_mode, ExecutionContext exec)
         : child_(std::move(child)),
           keys_(keys),
           count_(count),
           group_by_(group_by),
-          keep_mode_(keep_mode) {}
+          keep_mode_(keep_mode),
+          exec_(std::move(exec)) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (emitted_) {
@@ -592,6 +594,47 @@ class ChunkedOrderedLimitOperator final : public Operator {
                 return key_column[r];
             }
         };
+        // Ungrouped, across workers: each fixed row range keeps its own heap,
+        // then the range heaps merge into this one. A row's rank is (key,
+        // sequence), a strict total order, so the winners do not depend on
+        // which rows a heap saw first; sequences are the serial ones.
+        const std::size_t workers =
+            group_by_->empty() ? group_barrier_worker_count(exec_, rows) : 0;
+        if (workers >= 2) {
+            const std::size_t base = next_sequence_;
+            const std::size_t grain = (rows + workers - 1) / workers;
+            std::vector<std::vector<Entry>> local(workers);
+            auto batch = process_worker_pool().submit(workers, [&](std::size_t r) {
+                std::vector<Entry>& heap = local[r];
+                const std::size_t begin = std::min(rows, r * grain);
+                const std::size_t end = std::min(rows, begin + grain);
+                for (std::size_t row = begin; row < end; ++row) {
+                    const std::size_t sequence = base + row;
+                    const T key = key_at(row);
+                    if (heap.size() == count_ &&
+                        !single_key_better(key, sequence, heap.front(), ascending)) {
+                        continue;
+                    }
+                    Entry entry;
+                    entry.key.values.reserve(1);
+                    entry.key.values.emplace_back(key);
+                    entry.sequence = sequence;
+                    entry.row = snapshot_row(chunk, row);
+                    push_entry(heap, std::move(entry));
+                }
+            });
+            batch.wait();
+            next_sequence_ += rows;
+            for (auto& heap : local) {
+                for (auto& entry : heap) {
+                    if (heap_.size() == count_ && !entry_preferred(entry, heap_.front())) {
+                        continue;
+                    }
+                    push_entry(heap_, std::move(entry));
+                }
+            }
+            return std::nullopt;
+        }
         for (std::size_t row = 0; row < rows; ++row) {
             const std::size_t sequence = next_sequence_++;
             const T key = key_at(row);
@@ -751,6 +794,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
     bool emitted_ = false;
     std::size_t next_sequence_ = 0;
     std::vector<Entry> heap_;
+    ExecutionContext exec_;
     std::vector<Key> group_keys_;
     std::vector<GroupState> group_states_;
     KeyRowIndex group_index_;
@@ -810,8 +854,8 @@ auto build_physical_topk(const ir::Node& node, const TableRegistry& registry,
     const auto keep = (topk.keep_mode() == ir::TopKNode::KeepMode::First)
                           ? ChunkedOrderedLimitOperator::KeepMode::First
                           : ChunkedOrderedLimitOperator::KeepMode::Last;
-    return std::make_unique<ChunkedOrderedLimitOperator>(std::move(child_op.value()), &topk.keys(),
-                                                         topk.count(), &topk.group_by(), keep);
+    return std::make_unique<ChunkedOrderedLimitOperator>(
+        std::move(child_op.value()), &topk.keys(), topk.count(), &topk.group_by(), keep, exec);
 }
 
 }  // namespace physical_executor_detail

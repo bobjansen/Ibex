@@ -9672,6 +9672,102 @@ TEST_CASE("left join: a parallel gather of every column type gives the serial an
 // generic aggregate's arithmetic, so its bits must be the hand-computed ones.
 // Nulls are skipped, a group with fewer than two values is null, and the result
 // may not depend on how many workers claimed groups.
+TEST_CASE("update fuses lag and lead into arithmetic, serial and parallel",
+          "[update][lag][parallel]") {
+    constexpr std::size_t kRows = 5000;
+    Column<double> x;
+    Column<double> y;
+    Column<std::int64_t> n;
+    runtime::ValidityBitmap x_valid(kRows, true);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        x.push_back((static_cast<double>((i * 7919) % 1009) / 7.0) - 50.0);
+        y.push_back(static_cast<double>((i * 37) % 101) * 0.25);
+        n.push_back(static_cast<std::int64_t>((i * 31) % 97) - 40);
+        if (i % 13 == 0) {
+            x_valid.set(i, false);
+        }
+    }
+    runtime::TableRegistry registry;
+    {
+        runtime::Table t;
+        t.add_column("x", x, x_valid);
+        t.add_column("y", y);
+        t.add_column("n", n);
+        registry.emplace("t", std::move(t));
+    }
+    // Source row of r, or nullopt when it falls off the table.
+    const auto at = [&](std::size_t r, std::int64_t shift) -> std::optional<std::size_t> {
+        const auto s = static_cast<std::int64_t>(r) + shift;
+        if (s < 0 || s >= static_cast<std::int64_t>(kRows)) {
+            return std::nullopt;
+        }
+        return static_cast<std::size_t>(s);
+    };
+    using Expected = std::function<std::optional<double>(std::size_t)>;
+    const std::vector<std::pair<const char*, Expected>> cases = {
+        {"t[update { d = y - lag(y, 1) }];",
+         [&](std::size_t r) -> std::optional<double> {
+             const auto s = at(r, -1);
+             return s ? std::optional(y[r] - y[*s]) : std::nullopt;
+         }},
+        {"t[update { d = x - lag(x, 3) }];",
+         [&](std::size_t r) -> std::optional<double> {
+             const auto s = at(r, -3);
+             if (!s || !x_valid[r] || !x_valid[*s]) {
+                 return std::nullopt;
+             }
+             return x[r] - x[*s];
+         }},
+        {"t[update { d = lead(n, 2) * 2 + n }];",
+         [&](std::size_t r) -> std::optional<double> {
+             const auto s = at(r, 2);
+             return s ? std::optional(static_cast<double>((n[*s] * 2) + n[r])) : std::nullopt;
+         }},
+        {"t[update { d = lag(n, 1) / 2 }];",
+         [&](std::size_t r) -> std::optional<double> {
+             const auto s = at(r, -1);
+             return s ? std::optional(static_cast<double>(n[*s]) / 2.0) : std::nullopt;
+         }},
+        {"t[update { d = lag(y, 0) + 1.5 }];",
+         [&](std::size_t r) -> std::optional<double> { return y[r] + 1.5; }},
+        {"t[update { d = y - lag(y, 6000) }];",
+         [](std::size_t) -> std::optional<double> { return std::nullopt; }},
+    };
+
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+    parallel.parallel_grain = 700;  // range starts fall inside every shift
+    for (const auto& [query, expected] : cases) {
+        for (const auto* exec : {&serial, &parallel}) {
+            INFO(query << (exec == &serial ? " serial" : " parallel"));
+            auto ir = require_ir(query);
+            auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, *exec);
+            REQUIRE(out.has_value());
+            const auto* d = out->find_entry("d");
+            REQUIRE(d != nullptr);
+            std::size_t wrong = 0;
+            for (std::size_t r = 0; r < kRows; ++r) {
+                const auto want = expected(r);
+                if (!want.has_value()) {
+                    wrong += runtime::is_null(*d, r) ? 0U : 1U;
+                    continue;
+                }
+                if (runtime::is_null(*d, r)) {
+                    ++wrong;
+                } else if (const auto* ints = std::get_if<Column<std::int64_t>>(&*d->column)) {
+                    wrong += static_cast<double>((*ints)[r]) == *want ? 0U : 1U;
+                } else {
+                    wrong += std::get<Column<double>>(*d->column)[r] == *want ? 0U : 1U;
+                }
+            }
+            CHECK(wrong == 0);
+        }
+    }
+}
+
 TEST_CASE("grouped update std is the row-order Welford answer, serial and parallel",
           "[update][groupby][reduction][parallel]") {
     constexpr std::size_t kRows = 5000;

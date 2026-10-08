@@ -154,7 +154,12 @@ struct NumericTreeNode {
         Binary,
         Min,
         Max,
-        Unary
+        Unary,
+        /// `lag`/`lead` of a column: row r reads source[r + shift], and a row
+        /// whose source falls outside [0, source_rows) reads 0 (it is null --
+        /// collect_expr_validity marks it).
+        IntShift,
+        DoubleShift
     };
 
     Kind kind = Kind::IntScalar;
@@ -167,7 +172,15 @@ struct NumericTreeNode {
     std::int64_t int_scalar = 0;
     double double_scalar = 0.0;
     UnaryMath unary = UnaryMath::Abs;
+    std::int64_t shift = 0;
+    std::size_t source_rows = 0;
 };
+
+/// Whether a numeric tree may read rows other than the one it writes
+/// (`lag`/`lead`). Only a caller holding the whole table may allow it: a chunk
+/// or a filtered subset has different neighbours than the table the query
+/// means, so every other planner keeps the default.
+enum class ShiftedReads : std::uint8_t { Refuse, Allow };
 
 /// A compiled arithmetic tree over columns and scalars: the general numeric
 /// shape the single-operation `DirectFieldPlan` family cannot name. The root's
@@ -275,7 +288,8 @@ struct DirectStringPlan {
                                                     NumericOutputSpan output) -> bool;
 
 [[nodiscard]] auto try_plan_direct_numeric_tree(const ir::Expr& expr, const PredicateInput& input,
-                                                const ScalarRegistry* scalars)
+                                                const ScalarRegistry* scalars,
+                                                ShiftedReads shifted = ShiftedReads::Refuse)
     -> std::optional<DirectNumericTreePlan>;
 [[nodiscard]] auto write_direct_numeric_tree_range(const DirectNumericTreePlan& plan,
                                                    ::ibex::runtime::RowRange range,
@@ -317,7 +331,9 @@ struct DirectFieldRoute {
 };
 
 [[nodiscard]] auto plan_direct_field(const ir::Expr& expr, const PredicateInput& input,
-                                     const ScalarRegistry* scalars) -> DirectFieldRoute;
+                                     const ScalarRegistry* scalars,
+                                     ShiftedReads shifted = ShiftedReads::Refuse)
+    -> DirectFieldRoute;
 
 /// A caller's own writer for one range of an expression the direct vocabulary
 /// does not cover. It fills the numeric window and returns that range's

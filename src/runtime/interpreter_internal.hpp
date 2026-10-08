@@ -1814,9 +1814,12 @@ enum class FloatCleanMode : std::uint8_t {
     -> std::expected<ComputedColumn, std::string>;
 [[nodiscard]] auto eval_fill_null(const ir::CallExpr& call, const Table& input)
     -> std::expected<FillResult, std::string>;
-[[nodiscard]] auto eval_fill_forward(const ir::CallExpr& call, const Table& input)
+/// `exec`, when given, lets a dense column fill in parallel row ranges.
+[[nodiscard]] auto eval_fill_forward(const ir::CallExpr& call, const Table& input,
+                                     const ExecutionContext* exec = nullptr)
     -> std::expected<FillResult, std::string>;
-[[nodiscard]] auto eval_fill_backward(const ir::CallExpr& call, const Table& input)
+[[nodiscard]] auto eval_fill_backward(const ir::CallExpr& call, const Table& input,
+                                      const ExecutionContext* exec = nullptr)
     -> std::expected<FillResult, std::string>;
 [[nodiscard]] auto eval_float_clean(const ir::CallExpr& call, const Table& input,
                                     FloatCleanMode mode) -> std::expected<FillResult, std::string>;

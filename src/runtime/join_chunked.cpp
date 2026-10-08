@@ -84,6 +84,11 @@
 
 namespace ibex::runtime {
 
+/// Per-row match indices. Every slot is written before it is read, so a resize
+/// need not zero-fill: at millions of matches that fill was serial main-thread
+/// time on every probe.
+using IndexVec = ::ibex::detail::NoInitVector<std::size_t>;
+
 namespace {
 
 /// The base Scan under `node`, peeled through a chain of Project/Rename/Update
@@ -647,8 +652,8 @@ struct JoinProbe {
     /// One worker's slice of a parallel probe. Members so the vectors keep
     /// their capacity across chunks instead of reallocating per probe.
     struct ProbePart {
-        std::vector<std::size_t> li;
-        std::vector<std::size_t> ri;
+        IndexVec li;
+        IndexVec ri;
     };
     /// One matching probe row in swapped mode: the right row and the head of
     /// the left chain it hit. Phase 2 replays these instead of re-probing.
@@ -794,8 +799,8 @@ struct JoinProbe {
     }
 
     template <typename Body>
-    auto probe_ranges_parallel(std::size_t n, std::vector<std::size_t>& li,
-                               std::vector<std::size_t>& ri, const Body& body) -> bool {
+    auto probe_ranges_parallel(std::size_t n, IndexVec& li, IndexVec& ri, const Body& body)
+        -> bool {
         const std::size_t workers = probe_parallel_workers(n);
         if (workers == 0) {
             return false;
@@ -860,6 +865,66 @@ struct JoinProbe {
         return true;
     }
 
+    /// A unique build side across workers: each fixed range resolves its rows'
+    /// heads once and counts its matches, then writes its (left, right) pairs
+    /// straight into its own slice of `li`/`ri` -- no per-range vectors and no
+    /// concatenation. The pairs and their order are the serial probe's.
+    // Out of line: inlined, it grew the serial probe around it enough to cost
+    // the one-core path ~10% on inner_join_symbol.
+    template <typename HeadOf>
+    [[gnu::noinline]] auto probe_unique_ranges(std::size_t n, const HeadOf& head_of, IndexVec& li,
+                                               IndexVec& ri) -> bool {
+        const std::size_t workers = probe_parallel_workers(n);
+        if (workers == 0) {
+            return false;
+        }
+        auto& pool = process_worker_pool();
+        const std::size_t grain = (n + workers - 1) / workers;
+        IndexVec heads(n);
+        std::vector<std::size_t> counts(workers, 0);
+        {
+            auto batch = pool.submit(workers, [&](std::size_t w) {
+                const std::size_t begin = std::min(n, w * grain);
+                const std::size_t end = std::min(n, begin + grain);
+                std::size_t count = 0;
+                for (std::size_t l = begin; l < end; ++l) {
+                    const std::size_t head = probe_is_null(l) ? kNil : head_of(l);
+                    heads[l] = head;
+                    count += head != kNil ? 1U : 0U;
+                }
+                counts[w] = count;
+            });
+            batch.wait();
+        }
+        std::size_t total = 0;
+        for (std::size_t& c : counts) {
+            const std::size_t here = c;
+            c = total;
+            total += here;
+        }
+        li.resize(total);
+        ri.resize(total);
+        {
+            auto batch = pool.submit(workers, [&](std::size_t w) {
+                const std::size_t begin = std::min(n, w * grain);
+                const std::size_t end = std::min(n, begin + grain);
+                std::size_t out = counts[w];
+                for (std::size_t l = begin; l < end; ++l) {
+                    if (heads[l] != kNil) {
+                        li[out] = l;
+                        ri[out] = heads[l];
+                        ++out;
+                    }
+                }
+            });
+            batch.wait();
+        }
+        if (exec_->parallel_stats != nullptr) {
+            exec_->parallel_stats->parallel_probes.fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
+    }
+
     /// Swapped-mode probe: phase 1 walks right rows `head_of` resolves against
     /// the left index, phase 2 expands the recorded chains into (li, ri).
     /// The parallel path fans phase 1 out over contiguous right-row ranges and
@@ -868,8 +933,7 @@ struct JoinProbe {
     /// disjoint slices and the result is byte-identical to the serial replay
     /// (parts are visited in range order, ranges in row order).
     template <typename HeadOf>
-    void probe_swapped(std::size_t n_right, const HeadOf& head_of, std::vector<std::size_t>& li,
-                       std::vector<std::size_t>& ri) {
+    void probe_swapped(std::size_t n_right, const HeadOf& head_of, IndexVec& li, IndexVec& ri) {
         const auto scan = [&](std::size_t begin, std::size_t end, std::vector<SwappedHit>& hits,
                               std::size_t& total) {
             for (std::size_t r = begin; r < end; ++r) {
@@ -946,12 +1010,12 @@ struct JoinProbe {
     // Only possible when the build side was unique; otherwise falls back
     // to the chained walk.
     template <typename Map, typename GetKey>
-    auto probe_scalar(const Map& heads, std::size_t n, GetKey get, std::vector<std::size_t>& li,
-                      std::vector<std::size_t>& ri) -> bool {
+    auto probe_scalar(const Map& heads, std::size_t n, GetKey get, IndexVec& li, IndexVec& ri)
+        -> bool {
         // One body for both paths, so the parallel and serial results cannot
         // drift: the parallel one runs it per range, the serial one once.
-        const auto scan = [&](std::size_t begin, std::size_t end, std::vector<std::size_t>& out_l,
-                              std::vector<std::size_t>& out_r) {
+        const auto scan = [&](std::size_t begin, std::size_t end, IndexVec& out_l,
+                              IndexVec& out_r) {
             for (std::size_t l = begin; l < end; ++l) {
                 if (probe_is_null(l)) {
                     continue;
@@ -966,6 +1030,11 @@ struct JoinProbe {
                 }
             }
         };
+        if (index().unique &&
+            probe_unique_ranges(
+                n, [&](std::size_t l) { return heads.find_head(get(l)); }, li, ri)) {
+            return li.size() == n;
+        }
         if (probe_ranges_parallel(n, li, ri, scan)) {
             // `li_identity` means li == 0..n-1, which for a unique build side
             // is exactly "every row matched" — the same test the serial path
@@ -1016,10 +1085,9 @@ struct JoinProbe {
     // shapes as `probe_scalar`, but the caller supplies the head instead of a
     // key to hash — see `resolve_categorical_heads`.
     template <typename GetHead>
-    auto probe_resolved(std::size_t n, GetHead head_of, std::vector<std::size_t>& li,
-                        std::vector<std::size_t>& ri) -> bool {
-        const auto scan = [&](std::size_t begin, std::size_t end, std::vector<std::size_t>& out_l,
-                              std::vector<std::size_t>& out_r) {
+    auto probe_resolved(std::size_t n, GetHead head_of, IndexVec& li, IndexVec& ri) -> bool {
+        const auto scan = [&](std::size_t begin, std::size_t end, IndexVec& out_l,
+                              IndexVec& out_r) {
             for (std::size_t l = begin; l < end; ++l) {
                 if (probe_is_null(l)) {
                     continue;
@@ -1030,6 +1098,9 @@ struct JoinProbe {
                 }
             }
         };
+        if (index().unique && probe_unique_ranges(n, head_of, li, ri)) {
+            return li.size() == n;
+        }
         if (probe_ranges_parallel(n, li, ri, scan)) {
             return index().unique && li.size() == n;
         }
@@ -1103,8 +1174,8 @@ struct JoinProbe {
         const ColumnValue* key = probe_entry.column.get();
         probe_validity_ = probe_entry.validity.has_value() ? &*probe_entry.validity : nullptr;
 
-        std::vector<std::size_t> li;
-        std::vector<std::size_t> ri;
+        IndexVec li;
+        IndexVec ri;
         const std::size_t n = left_chunk.rows();
         li.reserve(n);
         ri.reserve(n);
@@ -1220,8 +1291,8 @@ struct JoinProbe {
         const ValidityBitmap* v0 = e0.validity.has_value() ? &*e0.validity : nullptr;
         const ValidityBitmap* v1 = e1.validity.has_value() ? &*e1.validity : nullptr;
 
-        std::vector<std::size_t> li;
-        std::vector<std::size_t> ri;
+        IndexVec li;
+        IndexVec ri;
         const std::size_t n = left_chunk.rows();
         li.reserve(n);
         ri.reserve(n);
@@ -1247,10 +1318,10 @@ struct JoinProbe {
     // single-bitmap `probe_is_null` member, since a probe row here is null
     // when EITHER key is.
     template <typename IsNull, typename GetKey>
-    auto probe_pair(std::size_t n, IsNull is_null, GetKey get_key, std::vector<std::size_t>& li,
-                    std::vector<std::size_t>& ri) -> bool {
-        const auto scan = [&](std::size_t begin, std::size_t end, std::vector<std::size_t>& out_l,
-                              std::vector<std::size_t>& out_r) {
+    auto probe_pair(std::size_t n, IsNull is_null, GetKey get_key, IndexVec& li, IndexVec& ri)
+        -> bool {
+        const auto scan = [&](std::size_t begin, std::size_t end, IndexVec& out_l,
+                              IndexVec& out_r) {
             for (std::size_t l = begin; l < end; ++l) {
                 if (is_null(l)) {
                     continue;
@@ -1337,8 +1408,8 @@ struct JoinProbe {
         // probe side. Its null-keyed rows match nothing (see build_join_hash_index).
         probe_validity_ = right_entry.validity.has_value() ? &*right_entry.validity : nullptr;
 
-        std::vector<std::size_t> li;
-        std::vector<std::size_t> ri;
+        IndexVec li;
+        IndexVec ri;
 
         // Every key kind reduces to "resolve right row r to a left chain head
         // or kNil"; the map branches wrap the hash lookup, the categorical
@@ -1470,8 +1541,8 @@ struct JoinProbe {
             return index().pair_heads.find_head(key);
         };
 
-        std::vector<std::size_t> li;
-        std::vector<std::size_t> ri;
+        IndexVec li;
+        IndexVec ri;
         probe_swapped(n_right, head_of, li, ri);
 
         Table left_copy;

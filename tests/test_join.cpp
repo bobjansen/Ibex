@@ -11,6 +11,7 @@
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/table_compare.hpp>
 #include <ibex/runtime/table_properties.hpp>
 
 #include <catch2/catch_message.hpp>
@@ -3051,4 +3052,117 @@ TEST_CASE("join: a parallel asof join gives the serial, row-order answer",
         const auto& ts = std::get<Column<Timestamp>>(*promoted->find("ts"));
         CHECK(std::ranges::is_sorted(ts, {}, &Timestamp::nanos));
     }
+}
+
+// A unique build side probes in parallel by counting each range's matches and
+// writing the pairs straight into place. The output -- rows and their order --
+// must be the serial probe's, for hashed (Int64, String) and dictionary-resolved
+// (Categorical against String) keys, with null and unmatched probe keys.
+TEST_CASE("join: a parallel unique-key inner join gives the serial rows in order",
+          "[join][parallel]") {
+    constexpr std::size_t kLeft = 30'000;
+    constexpr std::size_t kRight = 400;
+    Column<std::int64_t> lk;
+    Column<std::string> ls;
+    std::vector<Column<Categorical>::code_type> lc;
+    Column<std::int64_t> lrow;
+    runtime::ValidityBitmap lk_valid(kLeft, true);
+    std::vector<std::string> dict;
+    for (std::size_t d = 0; d < 600; ++d) {
+        dict.push_back("s" + std::to_string(d));  // s400..s599 never match
+    }
+    for (std::size_t i = 0; i < kLeft; ++i) {
+        const auto key = static_cast<std::int64_t>((i * 37) % 600);
+        lk.push_back(key);
+        ls.push_back("s" + std::to_string(key));
+        lc.push_back(static_cast<Column<Categorical>::code_type>(key));
+        lrow.push_back(static_cast<std::int64_t>(i));
+        if (i % 29 == 0) {
+            lk_valid.set(i, false);
+        }
+    }
+    Column<std::int64_t> rk;
+    Column<std::string> rs;
+    Column<double> rv;
+    for (std::size_t r = 0; r < kRight; ++r) {
+        rk.push_back(static_cast<std::int64_t>(r));
+        rs.push_back("s" + std::to_string(r));
+        rv.push_back(static_cast<double>(r) * 1.5);
+    }
+    runtime::TableRegistry tables;
+    {
+        runtime::Table l_int;
+        l_int.add_column("k", lk, lk_valid);
+        l_int.add_column("lrow", lrow);
+        tables.emplace("l_int", std::move(l_int));
+        runtime::Table l_cat;
+        l_cat.add_column("s", Column<Categorical>(dict, std::move(lc)));
+        l_cat.add_column("lrow", lrow);
+        tables.emplace("l_cat", std::move(l_cat));
+        runtime::Table l_str;
+        l_str.add_column("s", ls);
+        l_str.add_column("lrow", lrow);
+        tables.emplace("l_str", std::move(l_str));
+        runtime::Table r_int;
+        r_int.add_column("k", rk);
+        r_int.add_column("rv", rv);
+        tables.emplace("r_int", std::move(r_int));
+        runtime::Table r_str;
+        r_str.add_column("s", rs);
+        r_str.add_column("rv", rv);
+        tables.emplace("r_str", std::move(r_str));
+        Column<std::int64_t> rk2 = rk;
+        Column<double> rv2 = rv;
+        for (std::size_t r = 0; r < kRight; ++r) {
+            rk2.push_back(rk[r]);
+            rv2.push_back(rv[r] + 1000.0);
+        }
+        runtime::Table r_dup;
+        r_dup.add_column("k", std::move(rk2));
+        r_dup.add_column("rv", std::move(rv2));
+        tables.emplace("r_dup", std::move(r_dup));
+    }
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+    parallel.parallel_min_cells = 0;
+    const auto run = [&](const char* src, const runtime::ExecutionContext& exec) {
+        auto parsed = parser::parse(src);
+        REQUIRE(parsed.has_value());
+        auto lowered = parser::lower(*parsed);
+        REQUIRE(lowered.has_value());
+        return runtime::interpret(*lowered.value(), tables, nullptr, nullptr, nullptr, exec);
+    };
+    for (const char* src : {"l_int join r_int on k;", "l_cat join r_str on s;",
+                            "l_str join r_str on s;", "l_int join r_dup on k;"}) {
+        INFO(src);
+        auto one = run(src, serial);
+        auto four = run(src, parallel);
+        REQUIRE(one.has_value());
+        REQUIRE(four.has_value());
+        if (auto mismatch = runtime::compare_tables(*one, *four); mismatch.has_value()) {
+            FAIL(mismatch->message());
+        }
+    }
+    // By hand for the unique Int64 join: left rows in order, keys < 400 and
+    // non-null, each with its key's right value.
+    auto out = run("l_int join r_int on k;", parallel);
+    REQUIRE(out.has_value());
+    std::vector<std::int64_t> want_rows;
+    for (std::size_t i = 0; i < kLeft; ++i) {
+        if (lk_valid[i] && lk[i] < static_cast<std::int64_t>(kRight)) {
+            want_rows.push_back(static_cast<std::int64_t>(i));
+        }
+    }
+    CHECK(col_i64(*out, "lrow") == want_rows);
+    const auto& got_v = std::get<Column<double>>(*out->find("rv"));
+    std::size_t wrong = 0;
+    for (std::size_t j = 0; j < want_rows.size(); ++j) {
+        wrong += got_v[j] == static_cast<double>(lk[static_cast<std::size_t>(want_rows[j])]) * 1.5
+                     ? 0U
+                     : 1U;
+    }
+    CHECK(wrong == 0);
 }

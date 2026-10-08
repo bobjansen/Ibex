@@ -6,6 +6,12 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
+#include <cstdint>
+#include <limits>
+#include <map>
+#include <utility>
+#include <vector>
+
 #include "../src/runtime/aggregate_chunked_internal.hpp"
 #include "../src/runtime/interpreter_internal.hpp"
 
@@ -230,4 +236,72 @@ TEST_CASE("Boolean first last skip nulls and preserve all-null groups",
         REQUIRE(runtime::is_null(*out->find_entry("f"), 1));
         REQUIRE(runtime::is_null(*out->find_entry("l"), 1));
     }
+}
+
+// The serial Int64 path numbers groups without a hash map while their keys
+// arrive in strictly increasing order, and builds the map only when a key goes
+// backwards. Whatever the shape, the result must be the hash answer: groups in
+// first-appearance order, every row counted once in its own group.
+TEST_CASE("serial int64 aggregate defers its index until a key goes backwards",
+          "[aggregate][audit]") {
+    using Keys = std::vector<std::vector<std::int64_t>>;  // one inner vector per chunk
+    const auto runs = [](std::int64_t from, std::int64_t to, std::int64_t length) {
+        std::vector<std::int64_t> keys;
+        for (std::int64_t k = from; k < to; ++k) {
+            for (std::int64_t r = 0; r < 1 + (k % length); ++r) {
+                keys.push_back(k);
+            }
+        }
+        return keys;
+    };
+    std::vector<std::int64_t> backwards = runs(0, 3000, 4);
+    for (const std::int64_t k : {17, 2999, 4000, 4000, 3, 5000, 0}) {
+        backwards.push_back(k);
+    }
+    std::vector<std::int64_t> later = runs(100, 200, 3);  // all below chunk 1's max
+    later.push_back(9000);
+    const Keys shape =
+        GENERATE_COPY(Keys{runs(0, 5000, 4)},                       // sorted, never backwards
+                      Keys{backwards},                              // backwards mid-chunk
+                      Keys{runs(0, 3000, 4), later},                // backwards in a later chunk
+                      Keys{runs(0, 2000, 3), runs(2000, 4000, 5)},  // sorted across chunks
+                      Keys{{std::numeric_limits<std::int64_t>::min(), -1, -1, 7, -1}});
+    std::vector<runtime::Chunk> chunks;
+    std::vector<std::int64_t> order;
+    std::map<std::int64_t, std::pair<std::int64_t, std::int64_t>> expected;  // count, sum
+    std::int64_t value = 0;
+    for (const auto& chunk_keys : shape) {
+        Column<std::int64_t> keys;
+        Column<std::int64_t> values;
+        for (const std::int64_t k : chunk_keys) {
+            keys.push_back(k);
+            values.push_back(++value);
+            if (!expected.contains(k)) {
+                order.push_back(k);
+            }
+            expected[k].first += 1;
+            expected[k].second += value;
+        }
+        runtime::Chunk c;
+        c.add_column("k", std::move(keys));
+        c.add_column("v", std::move(values));
+        chunks.push_back(std::move(c));
+    }
+    auto out =
+        aggregate_chunks(std::move(chunks), {{.name = "k"}},
+                         {{.func = ir::AggFunc::Count, .column = {}, .alias = "n"},
+                          {.func = ir::AggFunc::Sum, .column = {.name = "v"}, .alias = "s"}});
+    REQUIRE(out.has_value());
+    REQUIRE(out->rows() == order.size());
+    const auto& k = ints(*out, "k");
+    const auto& n = ints(*out, "n");
+    const auto& s = ints(*out, "s");
+    std::size_t wrong = 0;
+    for (std::size_t g = 0; g < order.size(); ++g) {
+        wrong += k[g] == order[g] && n[g] == expected[order[g]].first &&
+                         s[g] == expected[order[g]].second
+                     ? 0U
+                     : 1U;
+    }
+    CHECK(wrong == 0);
 }

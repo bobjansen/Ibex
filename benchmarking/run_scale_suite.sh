@@ -23,6 +23,7 @@
 #                        [--skip-sqlite] [--with-sqlite]
 #                        [--with-frollapply]
 #                        [--skip-pandas] [--skip-dplyr] [--skip-polars-st]
+#                        [--skip-polars-in-memory]
 #                        [--keep-data]
 #                        [--to-readme] [--to-readme-rows N] [--to-readme-out path]
 #
@@ -93,6 +94,7 @@ SKIP_R=0
 SKIP_PANDAS=0
 SKIP_DPLYR=0
 SKIP_POLARS_ST=0
+SKIP_POLARS_IN_MEMORY=0
 SKIP_DUCKDB=0
 SKIP_DUCKDB_ST=0
 SKIP_DATAFUSION=0
@@ -174,6 +176,7 @@ while [[ $# -gt 0 ]]; do
         --skip-pandas) SKIP_PANDAS=1; shift ;;
         --skip-dplyr)  SKIP_DPLYR=1; shift ;;
         --skip-polars-st) SKIP_POLARS_ST=1; shift ;;
+        --skip-polars-in-memory) SKIP_POLARS_IN_MEMORY=1; shift ;;
         --skip-duckdb) SKIP_DUCKDB=1; shift ;;
         --skip-duckdb-st) SKIP_DUCKDB_ST=1; shift ;;
         --skip-datafusion) SKIP_DATAFUSION=1; shift ;;
@@ -333,7 +336,7 @@ if not matching:
     selected_rows = max(r["dataset_rows"] for r in rows)
     matching = [r for r in rows if r["dataset_rows"] == selected_rows]
 
-preferred_frameworks = ["ibex", "ibex-compiled", "polars", "polars-st", "duckdb", "duckdb-st", "datafusion", "datafusion-st", "clickhouse", "clickhouse-st", "sqlite", "pandas", "data.table", "dplyr"]
+preferred_frameworks = ["ibex", "ibex-compiled", "polars", "polars-in-memory", "polars-st", "duckdb", "duckdb-st", "datafusion", "datafusion-st", "clickhouse", "clickhouse-st", "sqlite", "pandas", "data.table", "dplyr"]
 present_frameworks = {r["framework"] for r in matching}
 frameworks = [fw for fw in preferred_frameworks if fw in present_frameworks]
 for fw in sorted(present_frameworks):
@@ -556,6 +559,29 @@ for rows in "${SIZES[@]}"; do
             awk 'BEGIN { FS=OFS="\t" } NR==1 { print; next } { if ($1 == "polars") $1="polars-st"; print }' \
                 "$polars_st_raw" > "$polars_st_tsv"
             append_tagged_results "$rows" "$polars_st_tsv"
+        fi
+
+        # Polars 2 runs a bare `.collect()` on its streaming engine, so the
+        # `polars` rows above are streaming. Its in-memory engine is still
+        # faster on some queries, and the comparison is against Polars at its
+        # best: time it too, under the same thread budget, as its own
+        # framework. Reports take the fastest engine per query.
+        if [[ $SKIP_POLARS_IN_MEMORY -eq 0 ]]; then
+            echo "  → polars (in-memory engine)"
+            polars_mem_raw="$size_result_dir/polars_in_memory_raw.tsv"
+            polars_mem_tsv="$size_result_dir/polars_in_memory.tsv"
+            POLARS_ENGINE_AFFINITY=in-memory IBEX_FW_SUFFIX=-in-memory \
+                uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_python.py" \
+                --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
+                --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
+                --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
+                --fill-rows "$rows" \
+                --warmup "$WARMUP" --iters "$EFF_ITERS" \
+                --skip-pandas \
+                --out "$polars_mem_raw" || { engine_failed "polars-in-memory"; : > "$polars_mem_raw"; }
+            awk 'BEGIN { FS=OFS="\t" } NR==1 { print; next } { if ($1 == "polars") $1="polars-in-memory"; print }' \
+                "$polars_mem_raw" > "$polars_mem_tsv"
+            append_tagged_results "$rows" "$polars_mem_tsv"
         fi
     fi
 

@@ -15,13 +15,19 @@
 //      also late" — holds iff the order has EXACTLY ONE distinct late supplier,
 //      which must be l1's own (l1 is late by the outer filter).
 //
-//  This file does NOT use that rewrite. It matches the Polars PDS-H q21 shape
-//  (so the engine comparison is like for like), which counts LINES instead of
-//  distinct suppliers: `n_supp_by_order` is lines per order and `n_supp_count`
-//  is late lines per order. That equals the SQL only when no order has two
-//  lines from the same supplier, which TPC-H does not guarantee (a line's
-//  supplier is one of its part's four, so two parts can share one). For the
-//  exact form, add `distinct { l_orderkey, l_suppkey }` before both counts.
+//  This file does NOT use that rewrite. It keeps the shape Polars PDS-H q21
+//  used until polars-benchmark 401908a, which counts LINES instead of distinct
+//  suppliers: `n_supp_by_order` is lines per order and `n_supp_count` is late
+//  lines per order. That equals the SQL only when no order has two lines from
+//  the same supplier, which TPC-H does not guarantee (a line's supplier is one
+//  of its part's four, so two parts can share one). For the exact form, add
+//  `distinct { l_orderkey, l_suppkey }` before both counts.
+//
+//  Upstream's Polars q21 now applies the Saudi Arabia / status-F filters first
+//  and counts distinct suppliers only for the orders they leave. Each engine
+//  runs the shape that is fastest for it: on Ibex that is this one (SF-8,
+//  8 cores, 2026-10-08: ~565 ms here vs ~835 ms for a port of upstream's,
+//  whose dimension joins run in textual order), and the answers match.
 //
 //  l1 stays at line granularity (one row per late line), so count() counts
 //  waiting lines, matching the SQL.

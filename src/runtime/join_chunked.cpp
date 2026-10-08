@@ -872,8 +872,8 @@ struct JoinProbe {
     // Out of line: inlined, it grew the serial probe around it enough to cost
     // the one-core path ~10% on inner_join_symbol.
     template <typename HeadOf>
-    [[gnu::noinline]] auto probe_unique_ranges(std::size_t n, const HeadOf& head_of, IndexVec& li,
-                                               IndexVec& ri) -> bool {
+    IBEX_NOINLINE auto probe_unique_ranges(std::size_t n, const HeadOf& head_of, IndexVec& li,
+                                           IndexVec& ri) -> bool {
         const std::size_t workers = probe_parallel_workers(n);
         if (workers == 0) {
             return false;

@@ -1103,10 +1103,25 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 count_distinct_aggs.push_back(i);
             }
         }
-        std::vector<std::uint32_t> row_gid;
+        // Every path below writes each row's group id before anything reads it.
+        ::ibex::detail::NoInitVector<std::uint32_t> row_gid;
         if (!collect_aggs.empty() || !count_distinct_aggs.empty()) {
             row_gid.resize(rows);
         }
+        // Fixed contiguous row ranges, one per worker, numbered in row order.
+        const std::size_t range_workers =
+            exec != nullptr ? group_barrier_worker_count(*exec, rows) : 0;
+        const auto for_row_range = [&](std::size_t ranges, const auto& body) {
+            const std::size_t grain = (rows + ranges - 1) / ranges;
+            auto batch = process_worker_pool().submit(ranges, [&](std::size_t r) {
+                const std::size_t begin = std::min(rows, r * grain);
+                body(r, begin, std::min(rows, begin + grain));
+            });
+            batch.wait();
+        };
+        // Per-(range, bucket) count tables are only worth their size when the
+        // bucket count is small.
+        constexpr std::size_t kMaxRangeCells = std::size_t{1} << 22;
 
         auto new_group = [&](std::size_t row) {
             Key key;
@@ -1131,7 +1146,55 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             cat_gid_memo.assign(key_cols.front().cat->dictionary().size(), kNoCatGid);
         }
 
-        for (std::size_t row = 0; row < rows; ++row) {
+        // `median(x) by <categorical>` (only collect aggregates, so the row loop
+        // below would do nothing per row but find the group): with several
+        // workers, number the groups and fill row_gid in parallel instead. A
+        // group's id is its order of first appearance, so each range records
+        // the first row of every code; the earliest wins, and the groups are
+        // created in that row order through the same index calls the loop makes.
+        const bool collect_only =
+            !collect_aggs.empty() && collect_aggs.size() == aggregations.size();
+        const bool parallel_cat_groups = collect_only && range_workers >= 2 &&
+                                         !cat_gid_memo.empty() &&
+                                         group_validity.front() == nullptr &&
+                                         range_workers * cat_gid_memo.size() <= kMaxRangeCells;
+        if (parallel_cat_groups) {
+            const auto& codes = *key_cols.front().cat;
+            const std::size_t dict = cat_gid_memo.size();
+            constexpr std::size_t kUnseen = std::numeric_limits<std::size_t>::max();
+            std::vector<std::size_t> first(range_workers * dict, kUnseen);
+            for_row_range(range_workers, [&](std::size_t r, std::size_t b, std::size_t e) {
+                std::size_t* local = first.data() + (r * dict);
+                for (std::size_t row = b; row < e; ++row) {
+                    const auto code = static_cast<std::size_t>(codes.code_at(row));
+                    if (local[code] == kUnseen) {
+                        local[code] = row;
+                    }
+                }
+            });
+            std::vector<std::pair<std::size_t, std::size_t>> seen;  // (first row, code)
+            for (std::size_t code = 0; code < dict; ++code) {
+                std::size_t row = kUnseen;
+                for (std::size_t r = 0; r < range_workers; ++r) {
+                    row = std::min(row, first[(r * dict) + code]);
+                }
+                if (row != kUnseen) {
+                    seen.emplace_back(row, code);
+                }
+            }
+            std::ranges::sort(seen);
+            for (const auto& [row, code] : seen) {
+                cat_gid_memo[code] = index.find_or_insert(group_order, key_cols, row,
+                                                          [&] { return new_group(row); });
+            }
+            for_row_range(range_workers, [&](std::size_t, std::size_t b, std::size_t e) {
+                for (std::size_t row = b; row < e; ++row) {
+                    row_gid[row] = cat_gid_memo[static_cast<std::size_t>(codes.code_at(row))];
+                }
+            });
+        }
+
+        for (std::size_t row = 0; !parallel_cat_groups && row < rows; ++row) {
             std::uint32_t gid = 0;
             if (!cat_gid_memo.empty() && !key_cols.front().is_null(row)) {
                 const auto code = static_cast<std::size_t>(key_cols.front().cat->code_at(row));
@@ -1225,19 +1288,59 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             for (const std::size_t ai : collect_aggs) {
                 const ColumnValue& col = *agg_columns[ai];
                 const ValidityBitmap* vb = agg_validity[ai];
+                // With several workers: counted per (range, group) and scattered
+                // range by range into group-major slots, so every group's values
+                // keep row order (skew and kurtosis sum in that order).
+                const bool parallel_collect =
+                    range_workers >= 2 && range_workers * n_groups <= kMaxRangeCells;
+                std::vector<std::size_t> range_cursor;
                 std::ranges::fill(offsets, std::size_t{0});
-                for (std::size_t row = 0; row < rows; ++row) {
-                    if (vb == nullptr || (*vb)[row]) {
-                        ++offsets[row_gid[row] + 1];
+                if (parallel_collect) {
+                    range_cursor.assign(range_workers * n_groups, 0);
+                    for_row_range(range_workers, [&](std::size_t r, std::size_t b, std::size_t e) {
+                        std::size_t* local = range_cursor.data() + (r * n_groups);
+                        for (std::size_t row = b; row < e; ++row) {
+                            if (vb == nullptr || (*vb)[row]) {
+                                ++local[row_gid[row]];
+                            }
+                        }
+                    });
+                    std::size_t total = 0;
+                    for (std::size_t g = 0; g < n_groups; ++g) {
+                        offsets[g] = total;
+                        for (std::size_t r = 0; r < range_workers; ++r) {
+                            const std::size_t c = range_cursor[(r * n_groups) + g];
+                            range_cursor[(r * n_groups) + g] = total;
+                            total += c;
+                        }
                     }
-                }
-                for (std::size_t g = 0; g < n_groups; ++g) {
-                    offsets[g + 1] += offsets[g];
+                    offsets[n_groups] = total;
+                } else {
+                    for (std::size_t row = 0; row < rows; ++row) {
+                        if (vb == nullptr || (*vb)[row]) {
+                            ++offsets[row_gid[row] + 1];
+                        }
+                    }
+                    for (std::size_t g = 0; g < n_groups; ++g) {
+                        offsets[g + 1] += offsets[g];
+                    }
                 }
                 buf.resize(offsets[n_groups]);
                 std::copy(offsets.begin(), offsets.end() - 1, cursor.begin());
                 auto scatter = [&](const auto& typed) {
                     const auto* data = typed.data();
+                    if (parallel_collect) {
+                        for_row_range(
+                            range_workers, [&](std::size_t r, std::size_t b, std::size_t e) {
+                                std::size_t* next = range_cursor.data() + (r * n_groups);
+                                for (std::size_t row = b; row < e; ++row) {
+                                    if (vb == nullptr || (*vb)[row]) {
+                                        buf[next[row_gid[row]]++] = static_cast<double>(data[row]);
+                                    }
+                                }
+                            });
+                        return;
+                    }
                     for (std::size_t row = 0; row < rows; ++row) {
                         if (vb == nullptr || (*vb)[row]) {
                             buf[cursor[row_gid[row]]++] = static_cast<double>(data[row]);

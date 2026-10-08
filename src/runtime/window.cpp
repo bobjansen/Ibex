@@ -10,6 +10,7 @@
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
 #include <bit>
@@ -1727,7 +1728,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
 
 auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
                          const std::vector<ir::ColumnRef>& extra_group_by,
-                         const std::vector<ir::AggSpec>& aggregations)
+                         const std::vector<ir::AggSpec>& aggregations, const ExecutionContext* exec)
     -> std::expected<Table, std::string> {
     if (!input.time_index().has_value())
         return std::unexpected("resample requires a TimeFrame — use as_timeframe() first");
@@ -1819,20 +1820,67 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
             }
         }
 
+        // Fixed contiguous ranges, one per worker, run in parallel when there
+        // are several; `body(range, begin, end)`.
+        const std::size_t workers =
+            exec != nullptr ? std::max<std::size_t>(1, group_barrier_worker_count(*exec, rows)) : 1;
+        const auto for_blocks = [&](std::size_t n, const auto& body) {
+            const std::size_t blocks = std::min(workers, std::max<std::size_t>(n, 1));
+            const std::size_t grain = (n + blocks - 1) / blocks;
+            if (blocks < 2) {
+                body(std::size_t{0}, std::size_t{0}, n);
+                return;
+            }
+            auto batch = process_worker_pool().submit(blocks, [&](std::size_t r) {
+                const std::size_t begin = std::min(n, r * grain);
+                body(r, begin, std::min(n, begin + grain));
+            });
+            batch.wait();
+        };
+
         // Bucket boundaries: starts[g] is the first row of bucket g; the trailing
-        // sentinel `rows` closes the last bucket.
+        // sentinel `rows` closes the last bucket. Each range starts from the
+        // bucket of the row before it, and on the plain UTC grid a row still
+        // inside the current bucket needs no division to say so.
+        const bool zoned =
+#ifdef IBEX_HAS_STD_CHRONO_TIME_ZONES
+            zone != nullptr;
+#else
+            zone.has_value();
+#endif
+        std::vector<std::vector<std::size_t>> range_starts(workers);
+        std::vector<std::vector<std::int64_t>> range_bvals(workers);
+        for_blocks(rows, [&](std::size_t r, std::size_t begin, std::size_t end) {
+            if (begin >= end) {
+                return;
+            }
+            auto& st = range_starts[r];
+            auto& bv = range_bvals[r];
+            std::int64_t cur = bucket_of(begin == 0 ? 0 : begin - 1);
+            if (begin == 0) {
+                st.push_back(0);
+                bv.push_back(cur);
+            }
+            for (std::size_t i = begin; i < end; ++i) {
+                if (!zoned) {
+                    const std::int64_t nanos = (*ts_col)[i].nanos;
+                    if (nanos >= cur && nanos - cur < dur_ns) {
+                        continue;
+                    }
+                }
+                const std::int64_t b = bucket_of(i);
+                if (b != cur) {
+                    st.push_back(i);
+                    bv.push_back(b);
+                    cur = b;
+                }
+            }
+        });
         std::vector<std::size_t> starts;
         std::vector<std::int64_t> bvals;
-        starts.reserve(1024);
-        bvals.reserve(1024);
-        std::int64_t prev = 0;
-        for (std::size_t i = 0; i < rows; ++i) {
-            const std::int64_t b = bucket_of(i);
-            if (i == 0 || b != prev) {
-                starts.push_back(i);
-                bvals.push_back(b);
-                prev = b;
-            }
+        for (std::size_t r = 0; r < workers; ++r) {
+            starts.insert(starts.end(), range_starts[r].begin(), range_starts[r].end());
+            bvals.insert(bvals.end(), range_bvals[r].begin(), range_bvals[r].end());
         }
         const std::size_t ng = bvals.size();
         starts.push_back(rows);
@@ -1846,12 +1894,17 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
         ts_out.set_meta(ts_col->meta());
         out.add_column(ts_name, std::move(ts_out));
 
+        // Every output is one value per bucket, so blocks of buckets reduce
+        // independently into a presized column.
         for (const auto& agg : aggregations) {
             if (agg.func == ir::AggFunc::Count) {
                 Column<std::int64_t> c;
-                c.reserve(ng);
-                for (std::size_t g = 0; g < ng; ++g)
-                    c.push_back(static_cast<std::int64_t>(starts[g + 1] - starts[g]));
+                c.resize_for_overwrite(ng);
+                std::int64_t* dst = c.data();
+                for_blocks(ng, [&](std::size_t, std::size_t g0, std::size_t g1) {
+                    for (std::size_t g = g0; g < g1; ++g)
+                        dst[g] = static_cast<std::int64_t>(starts[g + 1] - starts[g]);
+                });
                 out.add_column(agg.alias, std::move(c));
                 continue;
             }
@@ -1863,49 +1916,55 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
                         const bool to_double = (agg.func == ir::AggFunc::Mean);
                         if (to_double) {
                             Column<double> c;
-                            c.reserve(ng);
-                            for (std::size_t g = 0; g < ng; ++g) {
-                                const std::size_t lo = starts[g];
-                                const std::size_t hi = starts[g + 1];
-                                double acc = 0.0;
-                                for (std::size_t j = lo; j < hi; ++j)
-                                    acc += static_cast<double>(src[j]);
-                                c.push_back(acc / static_cast<double>(hi - lo));
-                            }
+                            c.resize_for_overwrite(ng);
+                            double* dst = c.data();
+                            for_blocks(ng, [&](std::size_t, std::size_t g0, std::size_t g1) {
+                                for (std::size_t g = g0; g < g1; ++g) {
+                                    const std::size_t lo = starts[g];
+                                    const std::size_t hi = starts[g + 1];
+                                    double acc = 0.0;
+                                    for (std::size_t j = lo; j < hi; ++j)
+                                        acc += static_cast<double>(src[j]);
+                                    dst[g] = acc / static_cast<double>(hi - lo);
+                                }
+                            });
                             out.add_column(agg.alias, std::move(c));
                         } else {
                             Column<T> c;
-                            c.reserve(ng);
-                            for (std::size_t g = 0; g < ng; ++g) {
-                                const std::size_t lo = starts[g];
-                                const std::size_t hi = starts[g + 1];
-                                T v = src[lo];
-                                switch (agg.func) {
-                                    case ir::AggFunc::First:
-                                        break;
-                                    case ir::AggFunc::Last:
-                                        v = src[hi - 1];
-                                        break;
-                                    case ir::AggFunc::Min:
-                                        for (std::size_t j = lo + 1; j < hi; ++j)
-                                            v = std::min(v, src[j]);
-                                        break;
-                                    case ir::AggFunc::Max:
-                                        for (std::size_t j = lo + 1; j < hi; ++j)
-                                            v = std::max(v, src[j]);
-                                        break;
-                                    case ir::AggFunc::Sum: {
-                                        T s = T{};
-                                        for (std::size_t j = lo; j < hi; ++j)
-                                            s += src[j];
-                                        v = s;
-                                        break;
+                            c.resize_for_overwrite(ng);
+                            T* dst = c.data();
+                            for_blocks(ng, [&](std::size_t, std::size_t g0, std::size_t g1) {
+                                for (std::size_t g = g0; g < g1; ++g) {
+                                    const std::size_t lo = starts[g];
+                                    const std::size_t hi = starts[g + 1];
+                                    T v = src[lo];
+                                    switch (agg.func) {
+                                        case ir::AggFunc::First:
+                                            break;
+                                        case ir::AggFunc::Last:
+                                            v = src[hi - 1];
+                                            break;
+                                        case ir::AggFunc::Min:
+                                            for (std::size_t j = lo + 1; j < hi; ++j)
+                                                v = std::min(v, src[j]);
+                                            break;
+                                        case ir::AggFunc::Max:
+                                            for (std::size_t j = lo + 1; j < hi; ++j)
+                                                v = std::max(v, src[j]);
+                                            break;
+                                        case ir::AggFunc::Sum: {
+                                            T sum = T{};
+                                            for (std::size_t j = lo; j < hi; ++j)
+                                                sum += src[j];
+                                            v = sum;
+                                            break;
+                                        }
+                                        default:
+                                            break;
                                     }
-                                    default:
-                                        break;
+                                    dst[g] = v;
                                 }
-                                c.push_back(v);
-                            }
+                            });
                             out.add_column(agg.alias, std::move(c));
                         }
                     }
@@ -2260,9 +2319,9 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
 /// missed the grouped fast path.
 auto resample_table(const Table& input, ir::Duration bucket_dur,
                     const std::vector<ir::ColumnRef>& extra_group_by,
-                    const std::vector<ir::AggSpec>& aggregations)
+                    const std::vector<ir::AggSpec>& aggregations, const ExecutionContext* exec)
     -> std::expected<Table, std::string> {
-    auto result = resample_table_impl(input, bucket_dur, extra_group_by, aggregations);
+    auto result = resample_table_impl(input, bucket_dur, extra_group_by, aggregations, exec);
     if (!result.has_value() || extra_group_by.empty()) {
         return result;
     }

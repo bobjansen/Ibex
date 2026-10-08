@@ -323,7 +323,8 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
                 materialize_plan(*node.children().front(), registry, scalars, externs, exec);
             if (!child.has_value())
                 return child;
-            return resample_table(child.value(), rs.duration(), rs.group_by(), rs.aggregations());
+            return resample_table(child.value(), rs.duration(), rs.group_by(), rs.aggregations(),
+                                  &exec);
         }
         case ir::NodeKind::Window: {
             const auto& win = ir::node_cast<ir::WindowNode>(node);

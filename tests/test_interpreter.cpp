@@ -7497,6 +7497,171 @@ TEST_CASE("update: element-wise math gives the row formula on every row, serial 
     CHECK(wrong == 0);
 }
 
+// The guarded update's fused paths -- a literal guard with a literal value
+// (no mask at all) and plain Float64 arithmetic written block by block --
+// against answers computed by hand, serially and on four workers, so a fault
+// both runs share cannot hide.
+TEST_CASE("guarded update: fused literal and arithmetic paths give the row formula",
+          "[guarded_update][parallel]") {
+    constexpr std::size_t kRows = 9000;
+    Column<double> price;
+    Column<double> other;
+    Column<std::int64_t> qty;
+    Column<double> nullable;
+    runtime::ValidityBitmap nullable_valid(kRows, true);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        const double p = static_cast<double>((i * 37) % 1000) + 0.5;
+        price.push_back(i % 97 == 0 ? std::numeric_limits<double>::quiet_NaN() : p);
+        other.push_back(static_cast<double>(i % 13) - 6.0);
+        qty.push_back(static_cast<std::int64_t>(i % 17));
+        nullable.push_back(p);
+        if (i % 7 == 0) {
+            nullable_valid.set(i, false);
+        }
+    }
+    runtime::TableRegistry registry;
+    {
+        runtime::Table t;
+        t.add_column("price", price);
+        t.add_column("other", other);
+        t.add_column("qty", qty);
+        t.add_column("nullable", nullable, nullable_valid);
+        registry.emplace("t", std::move(t));
+    }
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+    const auto both = [&](const std::string& query, const auto& check) {
+        INFO(query);
+        auto ir = require_ir(query.c_str());
+        for (const auto* exec : {&serial, &parallel}) {
+            auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, *exec);
+            REQUIRE(out.has_value());
+            check(*out);
+        }
+    };
+    // Bit-equal, NaN included.
+    const auto same = [](double a, double b) {
+        return std::bit_cast<std::uint64_t>(a) == std::bit_cast<std::uint64_t>(b);
+    };
+
+    // Literal guard, literal value: every operator, both operand orders.
+    struct Literal {
+        const char* guard;
+        bool (*holds)(double);
+    };
+    for (const auto& c : std::array<Literal, 8>{{
+             {"price > 900.0", [](double p) { return p > 900.0; }},
+             {"price >= 900.5", [](double p) { return p >= 900.5; }},
+             {"price < 100.0", [](double p) { return p < 100.0; }},
+             {"price <= 100.5", [](double p) { return p <= 100.5; }},
+             {"price == 500.5", [](double p) { return p == 500.5; }},
+             {"price != 500.5", [](double p) { return p != 500.5; }},
+             {"900.0 < price", [](double p) { return p > 900.0; }},
+             {"100.0 >= price", [](double p) { return p <= 100.0; }},
+         }}) {
+        both(std::string("t[where ") + c.guard + " update { price = 1.25 }];",
+             [&](const runtime::Table& out) {
+                 const auto& got = std::get<Column<double>>(*out.find("price"));
+                 std::size_t wrong = 0;
+                 for (std::size_t i = 0; i < kRows; ++i) {
+                     wrong += same(got[i], c.holds(price[i]) ? 1.25 : price[i]) ? 0U : 1U;
+                 }
+                 CHECK(wrong == 0);
+             });
+    }
+    both("t[where qty >= 9 update { qty = 100 }];", [&](const runtime::Table& out) {
+        const auto& got = std::get<Column<std::int64_t>>(*out.find("qty"));
+        std::size_t wrong = 0;
+        for (std::size_t i = 0; i < kRows; ++i) {
+            wrong += got[i] == (qty[i] >= 9 ? 100 : qty[i]) ? 0U : 1U;
+        }
+        CHECK(wrong == 0);
+    });
+    // A nullable guard column is not fused; a null row does not match.
+    both("t[where nullable > 900.0 update { nullable = 0.0 }];", [&](const runtime::Table& out) {
+        const auto* entry = out.find_entry("nullable");
+        const auto& got = std::get<Column<double>>(*entry->column);
+        std::size_t wrong = 0;
+        for (std::size_t i = 0; i < kRows; ++i) {
+            if (!nullable_valid[i]) {
+                wrong += runtime::is_null(*entry, i) ? 0U : 1U;
+            } else {
+                wrong += got[i] == (nullable[i] > 900.0 ? 0.0 : nullable[i]) ? 0U : 1U;
+            }
+        }
+        CHECK(wrong == 0);
+    });
+
+    // `where is_null(y) update { y = v }` is a fill: nulls become v, nothing
+    // stays null. The negated guard takes the mask path.
+    both("t[where is_null(nullable) update { nullable = 7.5 }];", [&](const runtime::Table& out) {
+        const auto* entry = out.find_entry("nullable");
+        const auto& got = std::get<Column<double>>(*entry->column);
+        std::size_t wrong = 0;
+        for (std::size_t i = 0; i < kRows; ++i) {
+            wrong +=
+                !runtime::is_null(*entry, i) && got[i] == (nullable_valid[i] ? nullable[i] : 7.5)
+                    ? 0U
+                    : 1U;
+        }
+        CHECK(wrong == 0);
+    });
+    both("t[where !is_null(nullable) update { nullable = 7.5 }];", [&](const runtime::Table& out) {
+        const auto* entry = out.find_entry("nullable");
+        const auto& got = std::get<Column<double>>(*entry->column);
+        std::size_t wrong = 0;
+        for (std::size_t i = 0; i < kRows; ++i) {
+            if (nullable_valid[i]) {
+                wrong += !runtime::is_null(*entry, i) && got[i] == 7.5 ? 0U : 1U;
+            } else {
+                wrong += runtime::is_null(*entry, i) ? 0U : 1U;
+            }
+        }
+        CHECK(wrong == 0);
+    });
+
+    // Fused arithmetic into an existing column and into a new one; both read
+    // the table as it was (`excess` sees the old price).
+    both("t[where price > 900.0 update { price = price * 0.9 + other, excess = price - 900.0 }];",
+         [&](const runtime::Table& out) {
+             const auto& p = std::get<Column<double>>(*out.find("price"));
+             const auto* e_entry = out.find_entry("excess");
+             REQUIRE(e_entry != nullptr);
+             const auto& e = std::get<Column<double>>(*e_entry->column);
+             std::size_t wrong = 0;
+             for (std::size_t i = 0; i < kRows; ++i) {
+                 if (price[i] > 900.0) {
+                     wrong += same(p[i], (price[i] * 0.9) + other[i]) ? 0U : 1U;
+                     wrong += !runtime::is_null(*e_entry, i) && e[i] == price[i] - 900.0 ? 0U : 1U;
+                 } else {
+                     wrong += same(p[i], price[i]) ? 0U : 1U;
+                     // Null, and a zero payload rather than garbage.
+                     wrong += runtime::is_null(*e_entry, i) && e[i] == 0.0 ? 0U : 1U;
+                 }
+             }
+             CHECK(wrong == 0);
+         });
+
+    // A full-table field (lag) merged by the dense select.
+    both("t[where price > 900.0 update { prev = lag(price, 1) }];", [&](const runtime::Table& out) {
+        const auto* entry = out.find_entry("prev");
+        REQUIRE(entry != nullptr);
+        const auto& got = std::get<Column<double>>(*entry->column);
+        std::size_t wrong = 0;
+        for (std::size_t i = 0; i < kRows; ++i) {
+            if (price[i] > 900.0 && i > 0) {
+                wrong += !runtime::is_null(*entry, i) && same(got[i], price[i - 1]) ? 0U : 1U;
+            } else {
+                wrong += runtime::is_null(*entry, i) ? 0U : 1U;
+            }
+        }
+        CHECK(wrong == 0);
+    });
+}
+
 TEST_CASE("guarded update: a parallel run gives the serial answer", "[guarded_update][parallel]") {
     // Four workers take the parallel mask, the all-rows evaluation of plain
     // Float64 arithmetic and the parallel select; one worker takes the

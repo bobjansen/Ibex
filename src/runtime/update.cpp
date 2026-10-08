@@ -4481,6 +4481,183 @@ auto is_speculation_safe(const ir::Expr& expr, const Table& table) -> bool {
 
 }  // namespace
 
+namespace {
+
+/// The fused path of `apply_guarded_update` for `where x <op> c update { y =
+/// v }` with x, y null-free columns of one type (Float64, or Int64 with Int64
+/// literals); nullopt when the update has any other shape.
+auto try_fused_literal_guard(const Table& input, const ir::UpdateNode& update,
+                             const ExecutionContext& exec, bool parallel) -> std::optional<Table> {
+    // With one worker the mask path (a vectorised compare into bytes, then a
+    // byte select) measured faster than this fused loop: 4.2 vs 4.9 ms at 4M
+    // rows. Split across workers the fused loop wins (2.7 -> 1.2 ms at 8).
+    if (!parallel || update.fields().size() != 1) {
+        return std::nullopt;
+    }
+    const auto& field = update.fields().front();
+    const auto* value = std::get_if<ir::Literal>(&field.expr.node);
+    if (value == nullptr) {
+        return std::nullopt;
+    }
+    // `where is_null(y) update { y = v }` is fill_null: every null of y
+    // becomes v and y has no nulls left. Read a validity word at a time.
+    if (const auto* null_test = std::get_if<ir::IsNullExpr>(&update.guard()->node);
+        null_test != nullptr && !null_test->negated) {
+        const auto* ref = ir::as_column_ref(*null_test->operand);
+        const auto* entry = ref != nullptr && !ref->lexical && ref->name == field.alias
+                                ? input.find_entry(ref->name)
+                                : nullptr;
+        if (entry == nullptr || !entry->validity.has_value() || entry->validity->is_external() ||
+            (input.time_index().has_value() && field.alias == *input.time_index())) {
+            return std::nullopt;
+        }
+        const auto fill = [&]<typename T>(T v) -> std::optional<Table> {
+            const T* old = std::get<Column<T>>(*entry->column).data();
+            const std::uint64_t* words = entry->validity->words_data();
+            const std::size_t n = input.rows();
+            Column<T> out;
+            out.resize_for_overwrite(n);
+            T* dst = out.data();
+            for_row_ranges(&exec, n, [&](std::size_t b, std::size_t e) {
+                for (std::size_t i = b; i < e; ++i) {
+                    const bool valid = ((words[i / 64] >> (i % 64)) & 1U) != 0U;
+                    dst[i] = valid ? old[i] : v;
+                }
+            });
+            Table output = input;
+            ColumnValue values{std::move(out)};
+            auto landing = prepare_guarded_write(output, field.alias, values);
+            if (!landing.has_value()) {
+                return std::nullopt;
+            }
+            write_guarded_update(output, field.alias, *landing, std::move(values), std::nullopt);
+            return output;
+        };
+        if (std::holds_alternative<Column<double>>(*entry->column)) {
+            if (const auto* d = std::get_if<double>(&value->value)) {
+                return fill(*d);
+            }
+            if (const auto* i = std::get_if<std::int64_t>(&value->value)) {
+                return fill(static_cast<double>(*i));
+            }
+        } else if (std::holds_alternative<Column<std::int64_t>>(*entry->column)) {
+            if (const auto* i = std::get_if<std::int64_t>(&value->value)) {
+                return fill(*i);
+            }
+        }
+        return std::nullopt;
+    }
+    const auto* cmp = std::get_if<ir::CompareExpr>(&update.guard()->node);
+    if (cmp == nullptr) {
+        return std::nullopt;
+    }
+    // Normalise to `column <op> literal`.
+    const auto* ref = ir::as_column_ref(*cmp->left);
+    const auto* bound = std::get_if<ir::Literal>(&cmp->right->node);
+    ir::CompareOp op = cmp->op;
+    if (ref == nullptr || bound == nullptr) {
+        ref = ir::as_column_ref(*cmp->right);
+        bound = std::get_if<ir::Literal>(&cmp->left->node);
+        switch (op) {
+            case ir::CompareOp::Lt:
+                op = ir::CompareOp::Gt;
+                break;
+            case ir::CompareOp::Le:
+                op = ir::CompareOp::Ge;
+                break;
+            case ir::CompareOp::Gt:
+                op = ir::CompareOp::Lt;
+                break;
+            case ir::CompareOp::Ge:
+                op = ir::CompareOp::Le;
+                break;
+            default:
+                break;
+        }
+    }
+    if (ref == nullptr || bound == nullptr || ref->lexical) {
+        return std::nullopt;
+    }
+    const auto* guard = input.find_entry(ref->name);
+    const auto* target = input.find_entry(field.alias);
+    if (guard == nullptr || target == nullptr || guard->validity.has_value() ||
+        target->validity.has_value() || guard->column->index() != target->column->index() ||
+        (input.time_index().has_value() && field.alias == *input.time_index())) {
+        return std::nullopt;
+    }
+    const auto run = [&]<typename T>(T c, T v) -> std::optional<Table> {
+        const T* x = std::get<Column<T>>(*guard->column).data();
+        const T* old = std::get<Column<T>>(*target->column).data();
+        const std::size_t n = input.rows();
+        Column<T> out;
+        out.resize_for_overwrite(n);
+        T* dst = out.data();
+        const auto select = [&](auto pick) {
+            for_row_ranges(&exec, n, [&](std::size_t b, std::size_t e) {
+                for (std::size_t i = b; i < e; ++i) {
+                    dst[i] = pick(x[i]) ? v : old[i];
+                }
+            });
+        };
+        switch (op) {
+            case ir::CompareOp::Eq:
+                select([c](T a) { return a == c; });
+                break;
+            case ir::CompareOp::Ne:
+                select([c](T a) { return a != c; });
+                break;
+            case ir::CompareOp::Lt:
+                select([c](T a) { return a < c; });
+                break;
+            case ir::CompareOp::Le:
+                select([c](T a) { return a <= c; });
+                break;
+            case ir::CompareOp::Gt:
+                select([c](T a) { return a > c; });
+                break;
+            case ir::CompareOp::Ge:
+                select([c](T a) { return a >= c; });
+                break;
+        }
+        Table output = input;
+        ColumnValue values{std::move(out)};
+        auto landing = prepare_guarded_write(output, field.alias, values);
+        if (!landing.has_value()) {
+            return std::nullopt;  // the general path reports it
+        }
+        write_guarded_update(output, field.alias, *landing, std::move(values), std::nullopt);
+        return output;
+    };
+    const auto as_double = [](const ir::Literal& lit) -> std::optional<double> {
+        if (const auto* d = std::get_if<double>(&lit.value)) {
+            return *d;
+        }
+        if (const auto* i = std::get_if<std::int64_t>(&lit.value)) {
+            return static_cast<double>(*i);
+        }
+        return std::nullopt;
+    };
+    if (std::holds_alternative<Column<double>>(*guard->column)) {
+        const auto c = as_double(*bound);
+        const auto v = as_double(*value);
+        if (!c.has_value() || !v.has_value()) {
+            return std::nullopt;
+        }
+        return run(*c, *v);
+    }
+    if (std::holds_alternative<Column<std::int64_t>>(*guard->column)) {
+        const auto* c = std::get_if<std::int64_t>(&bound->value);
+        const auto* v = std::get_if<std::int64_t>(&value->value);
+        if (c == nullptr || v == nullptr) {
+            return std::nullopt;
+        }
+        return run(*c, *v);
+    }
+    return std::nullopt;
+}
+
+}  // namespace
+
 /// Execute a guarded update `where <predicate> update { ... }`: rows matching
 /// the predicate get the field assignments; non-matching rows keep their values
 /// (a new column is null off-mask). Each field is evaluated where it is needed —
@@ -4508,6 +4685,15 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
     const bool parallel = exec.can_fan_out() && !on_worker_pool_thread() &&
                           n >= exec.parallel_min_rows && exec.compute_budget() >= 2 &&
                           process_worker_pool().size() >= 2;
+
+    // `where x <op> c update { y = v }` -- a column compared with a literal,
+    // a literal assigned -- over null-free columns of one numeric type: no
+    // mask at all, one select per row (`y = x <op> c ? v : y`). The mask path
+    // computes, copies and reads a mask, then merges validity, in four passes.
+    // NaN compares false, as in the mask, so it keeps the old value.
+    if (auto fused = try_fused_literal_guard(input, update, exec, parallel); fused.has_value()) {
+        return std::move(*fused);
+    }
 
     // Mask: a row matches iff the predicate is true AND not null. The 3VL
     // validity is folded into the bytes: every consumer below asks the same
@@ -4785,6 +4971,82 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
         const bool speculative =
             parallel && subset_evaluable && is_speculation_safe(field.expr, *snapshot);
         const bool subset = subset_evaluable && !speculative;
+
+        // Fused: plain Float64 arithmetic (speculation-safe, so it cannot fail
+        // or warn on a row the guard rejects) over null-free columns, into a
+        // Float64 target. The compiled numeric tree writes each block of rows
+        // straight into the output, and the rows the guard rejects are put back
+        // to the old value (or 0 and null for a new column) while the block is
+        // in cache: one pass, where the subset path builds a row index, gathers,
+        // evaluates, copies the old column and scatters.
+        if (subset_evaluable && is_speculation_safe(field.expr, *snapshot) &&
+            std::ranges::none_of(snapshot->columns,
+                                 [](const ColumnEntry& e) { return e.validity.has_value(); }) &&
+            (old_col == nullptr ||
+             (std::holds_alternative<Column<double>>(*old_col) && old_valid == nullptr))) {
+            const PredicateInput source(*snapshot);
+            const auto plan = kernel::try_plan_direct_numeric_tree(field.expr, source, scalars);
+            if (plan.has_value() && plan->type == ExprType::Double) {
+                Column<double> out;
+                out.resize_for_overwrite(n);
+                double* dst = out.data();
+                const double* old_data =
+                    old_col != nullptr ? std::get<Column<double>>(*old_col).data() : nullptr;
+                ValidityBitmap valid(old_data == nullptr ? n : 0, true);
+                std::uint64_t* valid_words = old_data == nullptr ? valid.words_data() : nullptr;
+                std::atomic<bool> saw_invalid{false};
+                constexpr std::size_t kBlock = 1024;
+                constexpr std::size_t kBits = 64;
+                for_row_ranges(
+                    parallel ? &exec : nullptr, n, [&](std::size_t begin, std::size_t end) {
+                        for (std::size_t b = begin; b < end; b += kBlock) {
+                            const std::size_t len = std::min(kBlock, end - b);
+                            (void)kernel::write_direct_numeric_tree_range(
+                                *plan, RowRange{.begin = b, .count = len}, {.doubles = dst + b});
+                            // An unconditional select, so it vectorizes into blends.
+                            if (old_data != nullptr) {
+                                for (std::size_t i = b; i < b + len; ++i) {
+                                    dst[i] = matched_bytes[i] != 0 ? dst[i] : old_data[i];
+                                }
+                            } else {
+                                for (std::size_t i = b; i < b + len; ++i) {
+                                    dst[i] = matched_bytes[i] != 0 ? dst[i] : 0.0;
+                                }
+                            }
+                        }
+                        if (valid_words == nullptr) {
+                            return;
+                        }
+                        bool local_invalid = false;
+                        for (std::size_t w = begin / kBits; w * kBits < end; ++w) {
+                            const std::size_t base = w * kBits;
+                            const std::size_t len = std::min(kBits, n - base);
+                            std::uint64_t m = 0;
+                            for (std::size_t k = 0; k < len; ++k) {
+                                m |= static_cast<std::uint64_t>(matched_bytes[base + k] != 0) << k;
+                            }
+                            const std::uint64_t all =
+                                len == kBits ? ~std::uint64_t{0} : ((std::uint64_t{1} << len) - 1);
+                            valid_words[w] = m;
+                            local_invalid = local_invalid || m != all;
+                        }
+                        if (local_invalid) {
+                            saw_invalid.store(true, std::memory_order_relaxed);
+                        }
+                    });
+                ColumnValue fused{std::move(out)};
+                auto target = prepare_guarded_write(output, field.alias, fused);
+                if (!target.has_value()) {
+                    return std::unexpected(std::move(target.error()));
+                }
+                write_guarded_update(output, field.alias, *target, std::move(fused),
+                                     saw_invalid.load(std::memory_order_relaxed)
+                                         ? std::optional<ValidityBitmap>{std::move(valid)}
+                                         : std::nullopt);
+                continue;
+            }
+        }
+
         std::shared_ptr<ColumnValue> new_vals;
         std::optional<ValidityBitmap> new_valid;
         {
@@ -4824,11 +5086,12 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                 const Col* oldc = old_col != nullptr ? &std::get<Col>(*old_col) : nullptr;
 
                 // Values computed for every row (a full-table or speculative
-                // field) into a dense column: one select per row, in parallel
-                // 64-aligned ranges, which also makes the validity writes
-                // word-disjoint.
+                // field) into a dense column: one select per row, in 64-aligned
+                // ranges (parallel when the update is), which also makes the
+                // validity writes word-disjoint. With one worker it still beats
+                // indexing the matched rows: the values are already there.
                 if constexpr (is_dense_column_v<Col>) {
-                    if (!subset && parallel) {
+                    if (!subset) {
                         using Value = Col::value_type;
                         Col out;
                         if constexpr (::ibex::detail::overwrite_safe_v<Value>) {

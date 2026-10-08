@@ -40,6 +40,7 @@ const char* malloc_conf = "dirty_decay_ms:-1,muzzy_decay_ms:-1";
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <csv.hpp>
 #include <fstream>
@@ -1734,6 +1735,59 @@ auto run_scalar_kernel_benchmark(std::string_view bench_name, std::size_t rows,
 // timer includes csv::read() — apples-to-apples with `pl.scan_csv(...).collect()`.
 using ScanPaths = std::vector<std::pair<std::string, std::string>>;
 
+/// IBEX_DIGEST_OUT=path: one answer digest per in-memory query -- the row
+/// count and the sum of every Int64 and Double cell, nulls and NaN skipped --
+/// in the format bench_python.py writes, for check_scale_answers.py. Neither
+/// row order nor column names enter it, so engines can be compared directly.
+struct AnswerDigest {
+    std::string query;
+    std::size_t rows = 0;
+    long double numeric_sum = 0.0L;
+};
+
+auto answer_digests() -> std::vector<AnswerDigest>& {
+    static std::vector<AnswerDigest> digests;
+    return digests;
+}
+
+auto record_answer_digest(const std::string& query, const ibex::runtime::Table& table) -> void {
+    if (std::getenv("IBEX_DIGEST_OUT") == nullptr) {
+        return;
+    }
+    long double sum = 0.0L;
+    for (const auto& entry : table.columns) {
+        const auto* validity = entry.validity.has_value() ? &*entry.validity : nullptr;
+        const auto valid = [&](std::size_t i) { return validity == nullptr || (*validity)[i]; };
+        if (const auto* ints = std::get_if<ibex::Column<std::int64_t>>(entry.column.get())) {
+            for (std::size_t i = 0; i < ints->size(); ++i) {
+                if (valid(i)) {
+                    sum += static_cast<long double>((*ints)[i]);
+                }
+            }
+        } else if (const auto* dbls = std::get_if<ibex::Column<double>>(entry.column.get())) {
+            for (std::size_t i = 0; i < dbls->size(); ++i) {
+                if (valid(i) && !std::isnan((*dbls)[i])) {
+                    sum += static_cast<long double>((*dbls)[i]);
+                }
+            }
+        }
+    }
+    answer_digests().push_back({.query = query, .rows = table.rows(), .numeric_sum = sum});
+}
+
+auto write_answer_digests() -> void {
+    const char* path = std::getenv("IBEX_DIGEST_OUT");
+    if (path == nullptr) {
+        return;
+    }
+    std::ofstream out(path);
+    out << "query\trows\tnumeric_sum\n";
+    out.precision(17);
+    for (const auto& d : answer_digests()) {
+        out << d.query << '\t' << d.rows << '\t' << static_cast<double>(d.numeric_sum) << '\n';
+    }
+}
+
 auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& tables,
                    std::size_t warmup_iters, std::size_t iters, bool include_parse,
                    const ScanPaths& scan_paths = {}) -> int {
@@ -1902,6 +1956,7 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
     const double peak_mb = peak_rss_mb();
     auto s = compute_stats(std::move(times));
     print_bench_line(query.name, iters, s, last_rows, peak_mb);
+    record_answer_digest(query.name, last_result);
 
     return 0;
 }
@@ -2080,6 +2135,12 @@ int main(int argc, char** argv) {
 
         // Single-column group-by: exercises the string fast path (robin_hood).
         std::vector<BenchQuery> queries = {
+            // The floor: one column of a resident table, parse and plan
+            // included. Read the small queries' times against it.
+            {
+                .name = "select_one_column",
+                .source = "prices[select { price }]",
+            },
             {
                 .name = "mean_by_symbol",
                 .source = "prices[select {avg_price = mean(price)}, by symbol]",
@@ -4000,5 +4061,6 @@ int main(int argc, char** argv) {
         }
     }
 
+    write_answer_digests();
     return status;
 }

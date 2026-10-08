@@ -17,7 +17,7 @@ Usage:
   uv run bench_python.py --csv data/prices.csv --skip-pandas
   uv run bench_python.py --csv data/prices.csv --polars-lazy --skip-pandas
 """
-import argparse, csv, pathlib, sys, time
+import argparse, csv, os, pathlib, sys, time
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -32,6 +32,60 @@ from bench_mem import reset_peak_rss, peak_rss_mb, CELL_CUTOFF_MS, should_skip, 
 # resets the kernel peak counter after warmup and reads it after the measured
 # iterations; run() helpers read this when appending the peak_rss_mb column.
 LAST_PEAK_RSS_MB = 0.0
+
+
+# IBEX_POLARS_CATEGORICAL=1: give Polars its string columns as Categorical, the
+# encoding Ibex's CSV reader picks for low-cardinality strings by itself.
+# Without it every `by symbol` / `join on symbol` compares Ibex hashing codes
+# with Polars hashing strings. The cast is done once at load, never timed.
+POLARS_CATEGORICAL = os.environ.get("IBEX_POLARS_CATEGORICAL") == "1"
+
+
+def pl_keys(frame):
+    """An eager Polars frame with its String columns as Categorical when
+    IBEX_POLARS_CATEGORICAL is set; unchanged otherwise."""
+    if not POLARS_CATEGORICAL:
+        return frame
+    return frame.with_columns(pl.col(pl.String).cast(pl.Categorical))
+
+
+# IBEX_DIGEST_OUT=path: write one answer digest per Polars query -- the row
+# count and the sum of every numeric column, NaN and nulls skipped -- so
+# check_scale_answers.py can compare engines without caring about row order
+# or column names. Pandas queries are not recorded.
+DIGESTS = []
+
+
+def record_digest(fw, name, result):
+    if not fw.startswith("polars") or os.environ.get("IBEX_DIGEST_OUT") is None:
+        return
+    if isinstance(result, pl.LazyFrame):
+        result = result.collect()
+    if isinstance(result, pl.Series):
+        result = result.to_frame()
+    if not isinstance(result, pl.DataFrame):
+        return
+    total = 0.0
+    for col, dtype in result.schema.items():
+        if not dtype.is_numeric():
+            continue
+        series = result.get_column(col)
+        if dtype.is_float():
+            series = series.fill_nan(None)
+        value = series.sum()
+        if value is not None:
+            total += float(value)
+    DIGESTS.append((name, result.height, total))
+
+
+def write_digests():
+    path = os.environ.get("IBEX_DIGEST_OUT")
+    if path is None:
+        return
+    with open(path, "w", newline="") as f:
+        f.write("query\trows\tnumeric_sum\n")
+        for name, n, total in DIGESTS:
+            f.write(f"{name}\t{n}\t{total!r}\n")
 
 
 def _windowed_ewma(values, alpha=0.1):
@@ -112,6 +166,7 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
             fn, warmup, iters
         )
         n = len(result)
+        record_digest(_fw, name, result)
         print(
             f"  pandas/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -426,7 +481,7 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
 def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     _fw = "polars"
     print("polars: loading...", file=sys.stderr, flush=True)
-    resident = pl.read_csv(csv_path)
+    resident = pl_keys(pl.read_csv(csv_path))
     n_rows = resident.height
     df = resident.lazy()
     rows = []
@@ -440,6 +495,7 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
             fn, warmup, iters
         )
         n = len(result)
+        record_digest(_fw, name, result)
         print(
             f"  polars/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -459,6 +515,11 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
                 f"{LAST_PEAK_RSS_MB:.1f}",
             )
         )
+
+    # The floor: one column of a resident frame. Whatever this costs is the
+    # fixed price of a query through this harness (Python call, plan, collect),
+    # not work -- read the small queries' times against it.
+    run("select_one_column", lambda: df.select("price"))
 
     run(
         "mean_by_symbol",
@@ -605,7 +666,7 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     # log returns → 5-minute time-windowed momentum → Sharpe-like ratio per symbol.
     pts_path = derive_prices_ts(csv_path)
     if pts_path is not None:
-        pt = pl.read_csv(pts_path).sort("ts").with_columns(
+        pt = pl_keys(pl.read_csv(pts_path)).sort("ts").with_columns(
             pl.from_epoch("ts", time_unit="ns").alias("dt")
         ).lazy()
         run(
@@ -710,7 +771,7 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
 
     if csv_multi_path:
         print("polars: loading multi...", file=sys.stderr, flush=True)
-        dfm = pl.read_csv(csv_multi_path).lazy()
+        dfm = pl_keys(pl.read_csv(csv_multi_path)).lazy()
 
         run(
             "count_by_symbol_day",
@@ -751,7 +812,7 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
 
     if csv_trades_path:
         print("polars: loading trades...", file=sys.stderr, flush=True)
-        dft = pl.read_csv(csv_trades_path).lazy()
+        dft = pl_keys(pl.read_csv(csv_trades_path)).lazy()
 
         run("filter_simple", lambda: dft.filter(pl.col("price") > 500.0))
 
@@ -801,6 +862,7 @@ def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
             fn, warmup, iters
         )
         n = len(result)
+        record_digest(_fw, name, result)
         print(
             f"  polars_lazy/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -1181,6 +1243,7 @@ def bench_pandas_null(csv_path, csv_lookup_path, warmup, iters):
             fn, warmup, iters
         )
         n = len(result)
+        record_digest(_fw, name, result)
         print(
             f"  pandas/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -1220,8 +1283,8 @@ def bench_polars_null(csv_path, csv_lookup_path, warmup, iters):
     _fw = "polars"
     """Left join producing ~50% null right-column values."""
     print("polars: loading for null bench...", file=sys.stderr, flush=True)
-    df = pl.read_csv(csv_path)
-    lookup = pl.read_csv(csv_lookup_path)
+    df = pl_keys(pl.read_csv(csv_path))
+    lookup = pl_keys(pl.read_csv(csv_lookup_path))
     lookup_symbols = lookup.select("symbol").unique()
     prices_small = df.head(2000)
     lookup_small = lookup.head(64)
@@ -1239,6 +1302,7 @@ def bench_polars_null(csv_path, csv_lookup_path, warmup, iters):
             fn, warmup, iters
         )
         n = len(result)
+        record_digest(_fw, name, result)
         print(
             f"  polars/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -1291,6 +1355,7 @@ def bench_pandas_reshape(csv_multi_path, warmup, iters, reshape_rows):
             fn, warmup, iters
         )
         n = len(result)
+        record_digest(_fw, name, result)
         print(
             f"  pandas/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -1389,6 +1454,7 @@ def bench_polars_reshape(csv_multi_path, warmup, iters, reshape_rows):
             fn, warmup, iters
         )
         n = len(result)
+        record_digest(_fw, name, result)
         print(
             f"  polars/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -1480,6 +1546,7 @@ def bench_pandas_fill(n_rows, warmup, iters):
             fn, warmup, iters
         )
         n = len(result)
+        record_digest(_fw, name, result)
         print(
             f"  pandas/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -1530,6 +1597,7 @@ def bench_polars_fill(n_rows, warmup, iters):
             fn, warmup, iters
         )
         n = len(result)
+        record_digest(_fw, name, result)
         print(
             f"  polars/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -1585,6 +1653,7 @@ def bench_pandas_events(csv_events_path, warmup, iters, csv_users_path=None):
             fn, warmup, iters
         )
         n = len(result)
+        record_digest(_fw, name, result)
         print(
             f"  pandas/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -1645,8 +1714,8 @@ def bench_pandas_events(csv_events_path, warmup, iters, csv_users_path=None):
 def bench_polars_events(csv_events_path, warmup, iters, csv_users_path=None):
     _fw = "polars"
     print("polars: loading events...", file=sys.stderr, flush=True)
-    df = pl.read_csv(csv_events_path).lazy()
-    users = pl.read_csv(csv_users_path).lazy() if csv_users_path else None
+    df = pl_keys(pl.read_csv(csv_events_path)).lazy()
+    users = pl_keys(pl.read_csv(csv_users_path)).lazy() if csv_users_path else None
     rows = []
 
     def run(name, fn):
@@ -1658,6 +1727,7 @@ def bench_polars_events(csv_events_path, warmup, iters, csv_users_path=None):
             fn, warmup, iters
         )
         n = len(result)
+        record_digest(_fw, name, result)
         print(
             f"  polars/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -1731,6 +1801,7 @@ def bench_pandas_tf(n_rows, warmup, iters):
             fn, warmup, iters
         )
         n = len(result)
+        record_digest(_fw, name, result)
         print(
             f"  pandas/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -1777,6 +1848,7 @@ def bench_polars_tf(n_rows, warmup, iters):
             fn, warmup, iters
         )
         n = len(result)
+        record_digest(_fw, name, result)
         print(
             f"  polars/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -1852,6 +1924,7 @@ def bench_pandas_asof(n_rows, warmup, iters):
             fn, warmup, iters
         )
         n = len(result)
+        record_digest(_fw, name, result)
         print(
             f"  pandas/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -1878,13 +1951,13 @@ def bench_polars_asof(n_rows, warmup, iters):
         "ts": pd.to_datetime(np.arange(n_rows), unit="s"),
         "symbol": np.arange(n_rows) % n_sym,
         "bid": 99.0 + (np.arange(n_rows) % 100) * 0.01,
-    }).with_columns(pl.col("symbol").cast(pl.Utf8)).sort("ts").lazy()
+    }).with_columns(pl.col("symbol").cast(pl.Utf8)).sort("ts").pipe(pl_keys).lazy()
     sample = np.arange(0, n_rows, 10, dtype=np.int64)
     trades = pl.DataFrame({
         "ts": pd.to_datetime(sample, unit="s") + pd.to_timedelta((sample * 37) % 999, unit="ms"),
         "symbol": sample % n_sym,
         "qty": (sample * 13) % 99 + 1,
-    }).with_columns(pl.col("symbol").cast(pl.Utf8)).sort("ts").lazy()
+    }).with_columns(pl.col("symbol").cast(pl.Utf8)).sort("ts").pipe(pl_keys).lazy()
     rows = []
 
     def run(name, fn):
@@ -1896,6 +1969,7 @@ def bench_polars_asof(n_rows, warmup, iters):
             fn, warmup, iters
         )
         n = len(result)
+        record_digest(_fw, name, result)
         print(
             f"  polars/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -2027,6 +2101,7 @@ def main():
         )
         w.writerows(all_rows)
     print(f"results written to {out}", file=sys.stderr)
+    write_digests()
 
 
 if __name__ == "__main__":

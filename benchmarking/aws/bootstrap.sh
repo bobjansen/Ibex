@@ -757,8 +757,10 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
     # PDS-H is intentionally kept separate from the scale suite: it uses TPC-H
     # data and reports a per-query TSV rather than synthetic scale-query rows.
     # The upstream checkout is pinned so an artifact can always be reproduced.
+    # 401908a (2026-10-01) is the first that runs on Polars 2 (`engine=`
+    # instead of the removed `streaming=`); its data generator is unchanged.
     PDSH_REPO=https://github.com/pola-rs/polars-benchmark.git
-    PDSH_COMMIT=e0b0746a70355516d061c89584a517299565e0ef
+    PDSH_COMMIT=401908a307f133a2dffbe3f5e0e0fb2b50ea310b
     PDSH_ROOT=/opt/polars-benchmark
     ARTIFACT=/ibex/benchmarking/results/tpch.tar.gz
 

@@ -41,6 +41,7 @@
 
 #include "interpreter_internal.hpp"
 #include "runtime_internal.hpp"
+#include "welford.hpp"
 
 namespace ibex::runtime {
 
@@ -388,10 +389,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     x = std::get<double>(scalar_from_column(column, row));
                 }
                 slot.count += 1;
-                const double delta = x - slot.double_value;
-                slot.double_value += delta / static_cast<double>(slot.count);
-                const double delta2 = x - slot.double_value;
-                slot.m2 += delta * delta2;
+                welford_add(x, static_cast<std::size_t>(slot.count), slot.double_value, slot.m2);
                 continue;
             }
             if (agg.func == ir::AggFunc::Ewma) {

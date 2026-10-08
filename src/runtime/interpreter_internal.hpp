@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "runtime_internal.hpp"
+#include "welford.hpp"
 
 namespace ibex::runtime {
 
@@ -768,14 +769,12 @@ static_assert(sizeof(AggSlotCore) == 16);
 // Online central-moment accumulators (Welford / Pébay), shared by the chunked
 // aggregate operators. `double_value` holds the running mean; m2/m3/m4 hold
 // Σ(x-mean)^k. These match the two-pass central moments the materializing
-// aggregate computes to within floating-point rounding — and for stddev the
-// M2 update is bit-identical (Pébay's term1 reduces to the simple Welford
-// step), so `stddev` results agree exactly across paths.
+// aggregate computes to within floating-point rounding. `stddev` takes the
+// shared welford_add step, so it agrees bit for bit with every other std()
+// path; the moments recurrence is separate and only feeds skew and kurtosis.
 inline void agg_update_stddev(AggSlotCore& slot, double& m2, double x) {
     slot.count += 1;
-    const double delta = x - slot.double_value;
-    slot.double_value += delta / static_cast<double>(slot.count);
-    m2 += delta * (x - slot.double_value);
+    welford_add(x, static_cast<std::size_t>(slot.count), slot.double_value, m2);
 }
 
 // Full m2/m3/m4 update for skewness/kurtosis (Pébay single-value recurrence).

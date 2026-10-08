@@ -49,6 +49,7 @@
 #include "interpreter_internal.hpp"
 #include "physical_plan.hpp"
 #include "runtime_internal.hpp"
+#include "welford.hpp"
 
 namespace {
 
@@ -9706,11 +9707,8 @@ TEST_CASE("grouped update std is the row-order Welford answer, serial and parall
             if (g[i] != group || (use_x && !x_valid[i])) {
                 continue;
             }
-            const double v = use_x ? x[i] : static_cast<double>(n[i]);
             count += 1;
-            const double delta = v - mean;
-            mean += delta / static_cast<double>(count);
-            m2 += delta * (v - mean);
+            runtime::welford_add(use_x ? x[i] : static_cast<double>(n[i]), count, mean, m2);
         }
         if (count < 2) {
             return std::nullopt;

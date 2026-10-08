@@ -9298,6 +9298,85 @@ TEST_CASE("top-k: a parallel run takes the stable sort's rows, ties included", "
     }
 }
 
+// `rank(x) by <categorical>` numbers its groups and builds each group's run
+// across workers. Two codes spelling the same string are one group, groups are
+// numbered by first appearance, and each run keeps row order, so ranks must be
+// the serial ones -- checked against ranks computed by hand.
+TEST_CASE("rank by a categorical key gives the serial ranks in parallel", "[rank][parallel]") {
+    constexpr std::size_t kRows = 20'000;
+    // "a" appears under codes 1 and 4: one group.
+    const std::vector<std::string> dict{"z", "a", "m", "q", "a", "k"};
+    std::vector<Column<Categorical>::code_type> codes;
+    Column<double> x;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        codes.push_back(static_cast<Column<Categorical>::code_type>((i * 7) % 6));
+        x.push_back(static_cast<double>((i * 7919) % 41));  // ties
+    }
+    runtime::TableRegistry registry;
+    {
+        runtime::Table t;
+        t.add_column("g", Column<Categorical>(dict, codes));
+        t.add_column("x", x);
+        registry.emplace("t", std::move(t));
+    }
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+    struct Case {
+        const char* query;
+        int method;  // 0 dense, 1 min, 2 first
+        bool ascending;
+    };
+    for (const auto& c : std::array<Case, 4>{{
+             {"t[update { r = rank(x, method = dense, ascending = false) }, by g];", 0, false},
+             {"t[update { r = rank(x, method = dense) }, by g];", 0, true},
+             {"t[update { r = rank(x, method = min, ascending = false) }, by g];", 1, false},
+             {"t[update { r = rank(x, method = first) }, by g];", 2, true},
+         }}) {
+        INFO(c.query);
+        auto ir = require_ir(c.query);
+        auto one = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+        auto four = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+        REQUIRE(one.has_value());
+        REQUIRE(four.has_value());
+        if (auto mismatch = runtime::compare_tables(*one, *four); mismatch.has_value()) {
+            FAIL(mismatch->message());
+        }
+        const auto& got = std::get<Column<std::int64_t>>(*four->find("r"));
+        // Reference per group: its rows sorted stably by x in rank order; then
+        // first = position, min = position of the first equal value, dense =
+        // count of distinct values before it, plus one.
+        std::map<std::string, std::vector<std::size_t>> groups;
+        for (std::size_t i = 0; i < kRows; ++i) {
+            groups[dict[static_cast<std::size_t>(codes[i])]].push_back(i);
+        }
+        std::vector<std::int64_t> want(kRows, 0);
+        for (auto& [name, rows] : groups) {
+            std::ranges::stable_sort(rows, [&](std::size_t a, std::size_t b) {
+                return c.ascending ? x[a] < x[b] : x[a] > x[b];
+            });
+            std::int64_t dense = 0;
+            std::size_t tie_start = 0;
+            for (std::size_t p = 0; p < rows.size(); ++p) {
+                if (p == 0 || x[rows[p]] != x[rows[p - 1]]) {
+                    ++dense;
+                    tie_start = p;
+                }
+                want[rows[p]] = c.method == 0   ? dense
+                                : c.method == 1 ? static_cast<std::int64_t>(tie_start) + 1
+                                                : static_cast<std::int64_t>(p) + 1;
+            }
+        }
+        std::size_t wrong = 0;
+        for (std::size_t i = 0; i < kRows; ++i) {
+            wrong += got[i] == want[i] ? 0U : 1U;
+        }
+        CHECK(wrong == 0);
+    }
+}
+
 // A top-k grouped by one categorical key keeps a heap per dictionary code in
 // each row range and merges them per group. Its rows must be each group's first
 // (last) k of a stable sort, output in (key, row) order -- serial or parallel.

@@ -267,20 +267,31 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
                              });
     if (radix_order) {
         const FlatCol& ok = order_flat[0];
-        std::vector<std::uint64_t> codes;
-        if (ok.kind == FlatKind::F64) {
-            codes.resize(rows);
-            for (std::size_t i = 0; i < rows; ++i)
-                codes[i] = double_to_sortable_u64(ok.f64[i]);
-        } else {
-            codes = ok.u64;  // already sign-flipped to order-preserving u64
-        }
-        // Invert the order-preserving codes for a descending key so an ascending
+        // Fixed contiguous row ranges, one per worker, when there are several.
+        const std::size_t range_workers =
+            std::max<std::size_t>(1, group_barrier_worker_count(exec, rows));
+        const auto for_ranges = [&](const auto& body) {
+            const std::size_t grain = (rows + range_workers - 1) / range_workers;
+            if (range_workers < 2) {
+                body(std::size_t{0}, std::size_t{0}, rows);
+                return;
+            }
+            auto batch = process_worker_pool().submit(range_workers, [&](std::size_t r) {
+                const std::size_t begin = std::min(rows, r * grain);
+                body(r, begin, std::min(rows, begin + grain));
+            });
+            batch.wait();
+        };
+        // Order-preserving codes, inverted for a descending key so an ascending
         // radix sort yields descending order.
-        if (!ok.ascending) {
-            for (auto& c : codes)
-                c = ~c;
-        }
+        std::vector<std::uint64_t> codes(rows);
+        for_ranges([&](std::size_t, std::size_t b, std::size_t e) {
+            for (std::size_t i = b; i < e; ++i) {
+                const std::uint64_t c =
+                    ok.kind == FlatKind::F64 ? double_to_sortable_u64(ok.f64[i]) : ok.u64[i];
+                codes[i] = ok.ascending ? c : ~c;
+            }
+        });
         if (group_entries.empty()) {
             // Ungrouped: one run, so there is nothing to bucket and the whole
             // table is the slice.
@@ -296,7 +307,7 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
             // Assign group IDs using the already-flattened group_flat arrays (string_view,
             // no per-row allocation) instead of calling scalar_from_column (which
             // heap-allocates std::string for string columns on every row).
-            std::vector<std::uint32_t> group_id(rows);
+            ::ibex::detail::NoInitVector<std::uint32_t> group_id(rows);
             std::uint32_t ngroups = 0;
             const Column<Categorical>* cat_group =
                 group_entries.size() == 1
@@ -318,7 +329,52 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
                 const auto& dict = cat_group->dictionary();
                 std::vector<std::uint32_t> code_gid(dict.size(), kUnset);
                 robin_hood::unordered_flat_map<std::string_view, std::uint32_t> by_text;
-                for (std::size_t r = 0; r < rows; ++r) {
+                // Across workers: each range records each code's first row; the
+                // codes are then numbered in order of their earliest row --
+                // first appearance, as the loop below assigns -- and the rows
+                // filled in parallel.
+                constexpr std::size_t kMaxRangeCodes = std::size_t{1} << 22;
+                const bool parallel_ids =
+                    range_workers >= 2 && range_workers * dict.size() <= kMaxRangeCodes;
+                if (parallel_ids) {
+                    constexpr std::size_t kNoRow = std::numeric_limits<std::size_t>::max();
+                    std::vector<std::size_t> first(range_workers * dict.size(), kNoRow);
+                    for_ranges([&](std::size_t r, std::size_t b, std::size_t e) {
+                        std::size_t* local = first.data() + (r * dict.size());
+                        for (std::size_t row = b; row < e; ++row) {
+                            const auto code = static_cast<std::size_t>(cat_group->code_at(row));
+                            if (local[code] == kNoRow) {
+                                local[code] = row;
+                            }
+                        }
+                    });
+                    std::vector<std::pair<std::size_t, std::size_t>> seen;  // (first row, code)
+                    for (std::size_t code = 0; code < dict.size(); ++code) {
+                        std::size_t row = kNoRow;
+                        for (std::size_t r = 0; r < range_workers; ++r) {
+                            row = std::min(row, first[(r * dict.size()) + code]);
+                        }
+                        if (row != kNoRow) {
+                            seen.emplace_back(row, code);
+                        }
+                    }
+                    std::ranges::sort(seen);
+                    for (const auto& [row, code] : seen) {
+                        auto [it, inserted] =
+                            by_text.emplace(std::string_view{dict[code]}, ngroups);
+                        if (inserted) {
+                            ++ngroups;
+                        }
+                        code_gid[code] = it->second;
+                    }
+                    for_ranges([&](std::size_t, std::size_t b, std::size_t e) {
+                        for (std::size_t row = b; row < e; ++row) {
+                            group_id[row] =
+                                code_gid[static_cast<std::size_t>(cat_group->code_at(row))];
+                        }
+                    });
+                }
+                for (std::size_t r = 0; !parallel_ids && r < rows; ++r) {
                     const auto code = static_cast<std::size_t>(cat_group->code_at(r));
                     std::uint32_t gid = code_gid[code];
                     if (gid == kUnset) {
@@ -381,24 +437,58 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
             // contiguously; rows enter a run in ascending row order and the
             // slice sort is stable, so ties break by row exactly as the global
             // stable sort broke them.
-            std::vector<std::size_t> cnt(static_cast<std::size_t>(ngroups) + 1, 0);
-            for (std::size_t r = 0; r < rows; ++r)
-                ++cnt[static_cast<std::size_t>(group_id[r]) + 1];
-            for (std::size_t g = 0; g < ngroups; ++g)
-                cnt[g + 1] += cnt[g];
+            // Counted per (range, group) and scattered range by range, so
+            // every run keeps its rows in ascending row order; one range when
+            // serial, or when the count table would be too large.
+            const std::size_t scatter_ranges =
+                range_workers * static_cast<std::size_t>(ngroups) <= (std::size_t{1} << 22)
+                    ? range_workers
+                    : 1;
+            const std::size_t ng = ngroups;
+            std::vector<std::size_t> range_cursor(scatter_ranges * ng, 0);
+            const std::size_t grain = (rows + scatter_ranges - 1) / scatter_ranges;
+            const auto for_scatter = [&](const auto& body) {
+                if (scatter_ranges < 2) {
+                    body(std::size_t{0}, std::size_t{0}, rows);
+                    return;
+                }
+                auto batch = process_worker_pool().submit(scatter_ranges, [&](std::size_t r) {
+                    const std::size_t begin = std::min(rows, r * grain);
+                    body(r, begin, std::min(rows, begin + grain));
+                });
+                batch.wait();
+            };
+            for_scatter([&](std::size_t r, std::size_t b, std::size_t e) {
+                std::size_t* local = range_cursor.data() + (r * ng);
+                for (std::size_t row = b; row < e; ++row)
+                    ++local[group_id[row]];
+            });
+            std::vector<std::size_t> cnt(ng + 1, 0);
+            {
+                std::size_t total = 0;
+                for (std::size_t g = 0; g < ng; ++g) {
+                    cnt[g] = total;
+                    for (std::size_t r = 0; r < scatter_ranges; ++r) {
+                        const std::size_t c = range_cursor[(r * ng) + g];
+                        range_cursor[(r * ng) + g] = total;
+                        total += c;
+                    }
+                }
+                cnt[ng] = total;
+            }
             radix_group_starts =
                 cnt;  // group g spans [radix_group_starts[g], radix_group_starts[g+1])
 
             idx.resize(rows);
-            std::vector<std::uint64_t> run_keys(rows);
-            {
-                std::vector<std::size_t> cursor(cnt.begin(), cnt.end() - 1);
-                for (std::size_t r = 0; r < rows; ++r) {
-                    const std::size_t at = cursor[group_id[r]]++;
-                    idx[at] = r;
-                    run_keys[at] = codes[r];
+            ::ibex::detail::NoInitVector<std::uint64_t> run_keys(rows);
+            for_scatter([&](std::size_t r, std::size_t b, std::size_t e) {
+                std::size_t* next = range_cursor.data() + (r * ng);
+                for (std::size_t row = b; row < e; ++row) {
+                    const std::size_t at = next[group_id[row]]++;
+                    idx[at] = row;
+                    run_keys[at] = codes[row];
                 }
-            }
+            });
 
             const std::size_t sort_workers =
                 ngroups >= 2 ? group_barrier_worker_count(exec, rows) : 0;
@@ -501,7 +591,13 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
         return equal_rank_keys(lhs, rhs);
     };
 
-    std::vector<double> rank_values(rows, 0.0);
+    // On the radix path every row is ranked (it admits no null key), so the
+    // fill would only be overwritten; elsewhere a null kept as null is never
+    // written and must hold 0, not garbage.
+    ::ibex::detail::NoInitVector<double> rank_values(rows);
+    if (!radix_order) {
+        std::ranges::fill(rank_values, 0.0);
+    }
     // Only `na_option = keep` ever writes this, and only a null key makes it
     // write. Allocating it regardless cost a bitmap per call for every rank
     // that has no nulls to keep.
@@ -625,9 +721,11 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
         Column<std::int64_t> out;
         out.resize_for_overwrite(rows);
         std::int64_t* dst = out.data();
-        for (std::size_t r = 0; r < rows; ++r) {
-            dst[r] = static_cast<std::int64_t>(rank_values[r]);
-        }
+        for_row_ranges(&exec, rows, [&](std::size_t b, std::size_t e) {
+            for (std::size_t r = b; r < e; ++r) {
+                dst[r] = static_cast<std::int64_t>(rank_values[r]);
+            }
+        });
         ComputedColumn result{.column = std::move(out), .validity = std::nullopt};
         if (rank.na_option == ir::RankNaOption::Keep) {
             result.validity = std::move(validity);

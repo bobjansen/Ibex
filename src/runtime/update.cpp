@@ -4172,12 +4172,58 @@ namespace {
 ///   - the result cannot be written into a fixed-width window or the supported
 ///     string interpolation slab. Categorical results still need their
 ///     per-piece dictionaries merged, and a wrong merge is silent.
+/// Whether `expr` calls `lag` or `lead` anywhere inside arithmetic.
+auto has_shift_call(const ir::Expr& expr) -> bool {
+    if (const auto* binary = std::get_if<ir::BinaryExpr>(&expr.node)) {
+        return has_shift_call(*binary->left) || has_shift_call(*binary->right);
+    }
+    if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
+        return call->callee == "lag" || call->callee == "lead" ||
+               std::ranges::any_of(call->args,
+                                   [](const auto& arg) { return has_shift_call(*arg); });
+    }
+    return false;
+}
+
 auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
                                    const ColumnEvalCtx& ctx, const ExecutionContext& exec)
     -> std::expected<ComputedColumn, std::string> {
     const std::size_t rows = table.rows();
-    const auto whole = [&] { return evaluate_field(expr, table, RowRange::whole(rows), ctx); };
     const PredicateInput direct_input(table);
+    // `table` is the whole input, so a numeric tree may read a row's
+    // neighbours here: `x - lag(x, 1)` reads x[r - 1] in place instead of first
+    // materializing the lagged column. Serially too, so one core gains it --
+    // except a bare `lag(x, k)`, which is a plain copy: the lag kernel's single
+    // memcpy beat the tree's block copies 7.2 vs 11.2 ms at 16M rows.
+    const auto* bare = std::get_if<ir::CallExpr>(&expr.node);
+    const bool bare_shift = bare != nullptr && (bare->callee == "lag" || bare->callee == "lead");
+    const auto whole = [&]() -> std::expected<ComputedColumn, std::string> {
+        if (!bare_shift && has_shift_call(expr)) {
+            if (const auto plan = kernel::try_plan_direct_numeric_tree(
+                    expr, direct_input, ctx.scalars, kernel::ShiftedReads::Allow);
+                plan.has_value()) {
+                ColumnValue values;
+                kernel::NumericOutputSpan window;
+                if (plan->type == ExprType::Int) {
+                    Column<std::int64_t> out;
+                    out.resize_for_overwrite(rows);
+                    values = std::move(out);
+                    window.ints = std::get<Column<std::int64_t>>(values).data();
+                } else {
+                    Column<double> out;
+                    out.resize_for_overwrite(rows);
+                    values = std::move(out);
+                    window.doubles = std::get<Column<double>>(values).data();
+                }
+                if (kernel::write_direct_numeric_tree_range(*plan, RowRange::whole(rows), window)) {
+                    return ComputedColumn{.column = std::move(values),
+                                          .validity = collect_expr_validity(expr, direct_input,
+                                                                            RowRange::whole(rows))};
+                }
+            }
+        }
+        return evaluate_field(expr, table, RowRange::whole(rows), ctx);
+    };
     // The categorical arm is planned before the size gates because the
     // whole-range route below needs the same output dictionary the split route
     // would build, and building that twice is the one part of planning that is
@@ -4218,7 +4264,8 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
         return whole();
     }
     if (!route.categorical.has_value()) {
-        route = kernel::plan_direct_field(expr, direct_input, ctx.scalars);
+        route =
+            kernel::plan_direct_field(expr, direct_input, ctx.scalars, kernel::ShiftedReads::Allow);
     }
     // The fallback below evaluates one range at a time, so an expression that
     // is not range-native would re-read the whole table per range; and a result

@@ -192,6 +192,52 @@ auto collect_expr_validity(const ir::Expr& expr, const PredicateInput& input, Ro
             return;
         result = merge_validity(result ? &*result : nullptr, 0, v, rows.begin, rows.count);
     };
+    // `lag(col, k)` / `lead(col, k)` with a literal offset, as the numeric tree
+    // plans it: row r is valid when its source row r -/+ k is in the table and
+    // valid there. Any other shape is left to the generic walk.
+    auto merge_shifted = [&](const ir::CallExpr& call) -> bool {
+        if ((call.callee != "lag" && call.callee != "lead") || call.args.size() != 2) {
+            return false;
+        }
+        const auto* ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+        const auto* literal = std::get_if<ir::Literal>(&call.args[1]->node);
+        const auto* offset =
+            literal != nullptr ? std::get_if<std::int64_t>(&literal->value) : nullptr;
+        if (ref == nullptr || ref->lexical || offset == nullptr || *offset < 0) {
+            return false;
+        }
+        const auto* entry = input.find(ref->name);
+        if (entry == nullptr) {
+            return false;
+        }
+        const auto table_rows = static_cast<std::int64_t>(input.rows());
+        const std::int64_t shift = call.callee == "lag" ? -*offset : *offset;
+        const std::int64_t first = static_cast<std::int64_t>(rows.begin) + shift;
+        const auto count = static_cast<std::int64_t>(rows.count);
+        const ValidityBitmap* source = entry->validity ? &*entry->validity : nullptr;
+        if (source == nullptr && first >= 0 && first + count <= table_rows) {
+            return true;  // every source row exists and none is null
+        }
+        // Range rows whose source row exists: [lo, hi).
+        const std::int64_t lo = std::clamp<std::int64_t>(-first, 0, count);
+        const std::int64_t hi = std::clamp<std::int64_t>(table_rows - first, lo, count);
+        ValidityBitmap shifted(rows.count, true);
+        for (std::int64_t i = 0; i < lo; ++i) {
+            shifted.set(static_cast<std::size_t>(i), false);
+        }
+        for (std::int64_t i = hi; i < count; ++i) {
+            shifted.set(static_cast<std::size_t>(i), false);
+        }
+        if (source != nullptr) {
+            for (std::int64_t i = lo; i < hi; ++i) {
+                if (!(*source)[static_cast<std::size_t>(first + i)]) {
+                    shifted.set(static_cast<std::size_t>(i), false);
+                }
+            }
+        }
+        result = merge_validity(result ? &*result : nullptr, 0, &shifted, 0, rows.count);
+        return true;
+    };
     std::function<void(const ir::Expr&)> walk = [&](const ir::Expr& e) {
         std::visit(
             [&](const auto& node) {
@@ -208,6 +254,9 @@ auto collect_expr_validity(const ir::Expr& expr, const PredicateInput& input, Ro
                     walk(*node.left);
                     walk(*node.right);
                 } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
+                    if (merge_shifted(node)) {
+                        return;
+                    }
                     for (const auto& arg : node.args)
                         walk(*arg);
                 }

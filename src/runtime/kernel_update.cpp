@@ -158,12 +158,43 @@ auto numeric_double_value(const NumericOperand& operand) -> double {
                : std::get<double>(operand.scalar);
 }
 
+/// `lag(col, k)` / `lead(col, k)` over an Int or Double column with a
+/// non-negative literal offset, as a shift node; nullopt for any other shape,
+/// which then evaluates through the general `lag` kernel.
+auto compile_shift_node(const ir::CallExpr& call, const PredicateInput& input,
+                        const ScalarRegistry* scalars) -> std::optional<NumericTreeNode> {
+    if ((call.callee != "lag" && call.callee != "lead") || call.args.size() != 2 ||
+        !call.named_args.empty()) {
+        return std::nullopt;
+    }
+    const auto* literal = std::get_if<ir::Literal>(&call.args[1]->node);
+    const auto* offset = literal != nullptr ? std::get_if<std::int64_t>(&literal->value) : nullptr;
+    if (offset == nullptr || *offset < 0) {
+        return std::nullopt;
+    }
+    const auto operand = resolve_numeric_operand(*call.args[0], input, scalars);
+    if (!operand.has_value() || !operand->is_column) {
+        return std::nullopt;
+    }
+    NumericTreeNode node{.type = operand->kind};
+    node.shift = call.callee == "lag" ? -*offset : *offset;
+    node.source_rows = input.rows();
+    if (operand->kind == ExprType::Int) {
+        node.kind = NumericTreeNode::Kind::IntShift;
+        node.ints = std::get<Column<std::int64_t>>(*operand->column).data();
+    } else {
+        node.kind = NumericTreeNode::Kind::DoubleShift;
+        node.doubles = std::get<Column<double>>(*operand->column).data();
+    }
+    return node;
+}
+
 auto compile_numeric_tree(const ir::Expr& expr, const PredicateInput& input,
-                          const ScalarRegistry* scalars, std::vector<NumericTreeNode>& nodes)
-    -> std::optional<std::uint32_t> {
+                          const ScalarRegistry* scalars, std::vector<NumericTreeNode>& nodes,
+                          ShiftedReads shifted) -> std::optional<std::uint32_t> {
     if (const auto* binary = std::get_if<ir::BinaryExpr>(&expr.node)) {
-        const auto left = compile_numeric_tree(*binary->left, input, scalars, nodes);
-        const auto right = compile_numeric_tree(*binary->right, input, scalars, nodes);
+        const auto left = compile_numeric_tree(*binary->left, input, scalars, nodes, shifted);
+        const auto right = compile_numeric_tree(*binary->right, input, scalars, nodes, shifted);
         if (!left.has_value() || !right.has_value()) {
             return std::nullopt;
         }
@@ -180,14 +211,22 @@ auto compile_numeric_tree(const ir::Expr& expr, const PredicateInput& input,
         return static_cast<std::uint32_t>(nodes.size() - 1);
     }
     if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
+        if (shifted == ShiftedReads::Allow) {
+            if (auto node = compile_shift_node(*call, input, scalars); node.has_value()) {
+                nodes.push_back(*node);
+                return static_cast<std::uint32_t>(nodes.size() - 1);
+            }
+        }
         if ((call->callee == "pmin" || call->callee == "pmax") && call->args.size() >= 2 &&
             call->named_args.empty()) {
-            auto accumulated = compile_numeric_tree(*call->args.front(), input, scalars, nodes);
+            auto accumulated =
+                compile_numeric_tree(*call->args.front(), input, scalars, nodes, shifted);
             if (!accumulated.has_value()) {
                 return std::nullopt;
             }
             for (std::size_t arg = 1; arg < call->args.size(); ++arg) {
-                const auto next = compile_numeric_tree(*call->args[arg], input, scalars, nodes);
+                const auto next =
+                    compile_numeric_tree(*call->args[arg], input, scalars, nodes, shifted);
                 if (!next.has_value()) {
                     return std::nullopt;
                 }
@@ -206,7 +245,8 @@ auto compile_numeric_tree(const ir::Expr& expr, const PredicateInput& input,
         }
         if (call->args.size() == 1 && call->named_args.empty()) {
             if (const auto unary = lookup_unary_math(call->callee); unary.has_value()) {
-                const auto child = compile_numeric_tree(*call->args.front(), input, scalars, nodes);
+                const auto child =
+                    compile_numeric_tree(*call->args.front(), input, scalars, nodes, shifted);
                 if (!child.has_value() || (unary_math_is_type_preserving(*unary) &&
                                            nodes[*child].type != ExprType::Double)) {
                     return std::nullopt;
@@ -284,6 +324,26 @@ auto combine_tree_blocks(const NumericTreeBlock<T>& left, const NumericTreeBlock
     return {.data = dst, .scalar = T{}};
 }
 
+/// A shift node's values for block rows [row, row + count): the source slice
+/// itself when every row's source is in bounds, else a copy with 0 at the rows
+/// that fall off either end (they are null).
+template <typename T, typename Source>
+auto shift_tree_block(const NumericTreeNode& node, const Source* source, std::size_t row,
+                      std::size_t count, T* dst) -> NumericTreeBlock<T> {
+    const std::int64_t first = static_cast<std::int64_t>(row) + node.shift;
+    const auto rows = static_cast<std::int64_t>(node.source_rows);
+    if constexpr (std::is_same_v<T, Source>) {
+        if (first >= 0 && first + static_cast<std::int64_t>(count) <= rows) {
+            return {.data = source + first, .scalar = T{}};
+        }
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::int64_t at = first + static_cast<std::int64_t>(i);
+        dst[i] = at >= 0 && at < rows ? static_cast<T>(source[at]) : T{};
+    }
+    return {.data = dst, .scalar = T{}};
+}
+
 auto eval_double_tree_node(const NumericTreeNode& node,
                            const std::vector<NumericTreeBlock<double>>& values, std::size_t row,
                            std::size_t count, double* dst) -> NumericTreeBlock<double> {
@@ -296,6 +356,10 @@ auto eval_double_tree_node(const NumericTreeNode& node,
             return {.data = dst, .scalar = 0.0};
         case NumericTreeNode::Kind::DoubleColumn:
             return {.data = node.doubles + row, .scalar = 0.0};
+        case NumericTreeNode::Kind::IntShift:
+            return shift_tree_block(node, node.ints, row, count, dst);
+        case NumericTreeNode::Kind::DoubleShift:
+            return shift_tree_block(node, node.doubles, row, count, dst);
         case NumericTreeNode::Kind::IntScalar:
             return {.data = nullptr, .scalar = static_cast<double>(node.int_scalar)};
         case NumericTreeNode::Kind::DoubleScalar:
@@ -346,6 +410,8 @@ auto eval_int_tree_node(const NumericTreeNode& node,
     switch (node.kind) {
         case NumericTreeNode::Kind::IntColumn:
             return {.data = node.ints + row, .scalar = 0};
+        case NumericTreeNode::Kind::IntShift:
+            return shift_tree_block(node, node.ints, row, count, dst);
         case NumericTreeNode::Kind::IntScalar:
             return {.data = nullptr, .scalar = node.int_scalar};
         case NumericTreeNode::Kind::Min:
@@ -382,6 +448,7 @@ auto eval_int_tree_node(const NumericTreeNode& node,
             invariant_violation("numeric tree: unhandled Int operator");
         }
         case NumericTreeNode::Kind::DoubleColumn:
+        case NumericTreeNode::Kind::DoubleShift:
         case NumericTreeNode::Kind::DoubleScalar:
         case NumericTreeNode::Kind::Unary:
             invariant_violation("numeric tree: Double node in Int expression");
@@ -2551,11 +2618,11 @@ auto write_fixed_width_numeric_binary(const ir::Expr& expr, const PredicateInput
 }
 
 auto try_plan_direct_numeric_tree(const ir::Expr& expr, const PredicateInput& input,
-                                  const ScalarRegistry* scalars)
+                                  const ScalarRegistry* scalars, ShiftedReads shifted)
     -> std::optional<DirectNumericTreePlan> {
     DirectNumericTreePlan plan;
     plan.nodes.reserve(8);
-    const auto root = compile_numeric_tree(expr, input, scalars, plan.nodes);
+    const auto root = compile_numeric_tree(expr, input, scalars, plan.nodes, shifted);
     if (!root.has_value()) {
         return std::nullopt;
     }
@@ -2584,7 +2651,7 @@ auto write_direct_numeric_tree_range(const DirectNumericTreePlan& plan,
 }
 
 auto plan_direct_field(const ir::Expr& expr, const PredicateInput& input,
-                       const ScalarRegistry* scalars) -> DirectFieldRoute {
+                       const ScalarRegistry* scalars, ShiftedReads shifted) -> DirectFieldRoute {
     DirectFieldRoute route;
     route.string = make_direct_string_plan(expr, input, scalars);
     if (route.string.has_value()) {
@@ -2611,7 +2678,7 @@ auto plan_direct_field(const ir::Expr& expr, const PredicateInput& input,
     // the tree was interpreted per row, which cost q01 +34-79% at 2/4/8 cores
     // against declining the split and crossing to `update_table`; the tree is
     // now evaluated in blocks (`eval_numeric_tree_blocks`).
-    route.numeric_tree = try_plan_direct_numeric_tree(expr, input, scalars);
+    route.numeric_tree = try_plan_direct_numeric_tree(expr, input, scalars, shifted);
     return route;
 }
 

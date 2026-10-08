@@ -23,7 +23,7 @@
 #                        [--skip-sqlite] [--with-sqlite]
 #                        [--with-frollapply]
 #                        [--skip-pandas] [--skip-dplyr] [--skip-polars-st]
-#                        [--skip-polars-in-memory]
+#                        [--skip-polars-in-memory] [--skip-polars-categorical]
 #                        [--keep-data]
 #                        [--to-readme] [--to-readme-rows N] [--to-readme-out path]
 #
@@ -95,6 +95,7 @@ SKIP_PANDAS=0
 SKIP_DPLYR=0
 SKIP_POLARS_ST=0
 SKIP_POLARS_IN_MEMORY=0
+SKIP_POLARS_CATEGORICAL=0
 SKIP_DUCKDB=0
 SKIP_DUCKDB_ST=0
 SKIP_DATAFUSION=0
@@ -177,6 +178,7 @@ while [[ $# -gt 0 ]]; do
         --skip-dplyr)  SKIP_DPLYR=1; shift ;;
         --skip-polars-st) SKIP_POLARS_ST=1; shift ;;
         --skip-polars-in-memory) SKIP_POLARS_IN_MEMORY=1; shift ;;
+        --skip-polars-categorical) SKIP_POLARS_CATEGORICAL=1; shift ;;
         --skip-duckdb) SKIP_DUCKDB=1; shift ;;
         --skip-duckdb-st) SKIP_DUCKDB_ST=1; shift ;;
         --skip-datafusion) SKIP_DATAFUSION=1; shift ;;
@@ -336,7 +338,7 @@ if not matching:
     selected_rows = max(r["dataset_rows"] for r in rows)
     matching = [r for r in rows if r["dataset_rows"] == selected_rows]
 
-preferred_frameworks = ["ibex", "ibex-compiled", "polars", "polars-in-memory", "polars-st", "duckdb", "duckdb-st", "datafusion", "datafusion-st", "clickhouse", "clickhouse-st", "sqlite", "pandas", "data.table", "dplyr"]
+preferred_frameworks = ["ibex", "ibex-compiled", "polars", "polars-in-memory", "polars-categorical", "polars-in-memory-categorical", "polars-st", "duckdb", "duckdb-st", "datafusion", "datafusion-st", "clickhouse", "clickhouse-st", "sqlite", "pandas", "data.table", "dplyr"]
 present_frameworks = {r["framework"] for r in matching}
 frameworks = [fw for fw in preferred_frameworks if fw in present_frameworks]
 for fw in sorted(present_frameworks):
@@ -484,6 +486,7 @@ for rows in "${SIZES[@]}"; do
     if [[ $SKIP_IBEX -eq 0 ]]; then
         echo "  → ibex"
         IBEX_ROOT="$IBEX_ROOT" BUILD_DIR="$BUILD_DIR" \
+            IBEX_DIGEST_OUT="$size_result_dir/ibex_digest.tsv" \
             bash "$SCRIPT_DIR/bench_ibex.sh" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
@@ -534,6 +537,7 @@ for rows in "${SIZES[@]}"; do
         if [[ $SKIP_PANDAS -eq 1 ]]; then
             py_args+=(--skip-pandas)
         fi
+        IBEX_DIGEST_OUT="$size_result_dir/polars_digest.tsv" \
         uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_python.py" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
@@ -566,11 +570,23 @@ for rows in "${SIZES[@]}"; do
         # faster on some queries, and the comparison is against Polars at its
         # best: time it too, under the same thread budget, as its own
         # framework. Reports take the fastest engine per query.
-        if [[ $SKIP_POLARS_IN_MEMORY -eq 0 ]]; then
-            echo "  → polars (in-memory engine)"
-            polars_mem_raw="$size_result_dir/polars_in_memory_raw.tsv"
-            polars_mem_tsv="$size_result_dir/polars_in_memory.tsv"
-            POLARS_ENGINE_AFFINITY=in-memory IBEX_FW_SUFFIX=-in-memory \
+        #
+        # Polars at its best also means its string keys as Categorical: Ibex's
+        # CSV reader dictionary-encodes low-cardinality strings by itself, so
+        # without this a `by symbol` compares Ibex hashing codes with Polars
+        # hashing strings. Both engines run that way too (cast at load, never
+        # timed). Each variant writes an answer digest for the check below.
+        # $1 framework name, $2 file stem, $3 engine affinity ("" = default),
+        # $4 IBEX_POLARS_CATEGORICAL value.
+        run_polars_variant() {
+            local fw="$1" stem="$2" affinity="$3" categorical="$4"
+            echo "  → ${fw}"
+            local raw="$size_result_dir/${stem}_raw.tsv"
+            local tsv="$size_result_dir/${stem}.tsv"
+            local env_args=(IBEX_FW_SUFFIX="-${fw#polars-}" IBEX_POLARS_CATEGORICAL="$categorical"
+                            IBEX_DIGEST_OUT="$size_result_dir/${stem}_digest.tsv")
+            [[ -n "$affinity" ]] && env_args+=(POLARS_ENGINE_AFFINITY="$affinity")
+            env "${env_args[@]}" \
                 uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_python.py" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
@@ -578,11 +594,29 @@ for rows in "${SIZES[@]}"; do
                 --fill-rows "$rows" \
                 --warmup "$WARMUP" --iters "$EFF_ITERS" \
                 --skip-pandas \
-                --out "$polars_mem_raw" || { engine_failed "polars-in-memory"; : > "$polars_mem_raw"; }
-            awk 'BEGIN { FS=OFS="\t" } NR==1 { print; next } { if ($1 == "polars") $1="polars-in-memory"; print }' \
-                "$polars_mem_raw" > "$polars_mem_tsv"
-            append_tagged_results "$rows" "$polars_mem_tsv"
+                --out "$raw" || { engine_failed "$fw"; : > "$raw"; }
+            awk -v fw="$fw" 'BEGIN { FS=OFS="\t" } NR==1 { print; next } { if ($1 == "polars") $1=fw; print }' \
+                "$raw" > "$tsv"
+            append_tagged_results "$rows" "$tsv"
+        }
+        if [[ $SKIP_POLARS_IN_MEMORY -eq 0 ]]; then
+            run_polars_variant polars-in-memory polars_in_memory in-memory 0
         fi
+        if [[ $SKIP_POLARS_CATEGORICAL -eq 0 ]]; then
+            run_polars_variant polars-categorical polars_categorical "" 1
+            if [[ $SKIP_POLARS_IN_MEMORY -eq 0 ]]; then
+                run_polars_variant polars-in-memory-categorical polars_in_memory_categorical \
+                    in-memory 1
+            fi
+        fi
+    fi
+
+    # Same answers, or the timings compare nothing: Ibex's digests against
+    # every Polars variant's. A report to read, not a gate -- see the script.
+    if [[ -s "$size_result_dir/ibex_digest.tsv" ]] &&
+        compgen -G "$size_result_dir/polars*_digest.tsv" > /dev/null; then
+        python3 "$SCRIPT_DIR/check_scale_answers.py" "$size_result_dir/ibex_digest.tsv" \
+            "$size_result_dir"/polars*_digest.tsv | tee "$size_result_dir/answers.txt"
     fi
 
     if [[ $SKIP_R -eq 0 ]]; then

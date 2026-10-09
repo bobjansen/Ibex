@@ -321,7 +321,7 @@ auto build_categorical_from_strings(SEXP column_sexp, R_xlen_t size)
     using code_type = ibex::Column<ibex::Categorical>::code_type;
 
     std::vector<std::string> dictionary;
-    std::vector<code_type> codes;
+    ibex::Column<ibex::Categorical>::codes_storage codes;
     codes.reserve(static_cast<std::size_t>(size));
     // Keyed by the pointer's integer value, not by `const void*`: the pointer
     // specialization hashes by identity, and CHARSXPs are aligned, so every

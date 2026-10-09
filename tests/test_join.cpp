@@ -3197,3 +3197,106 @@ TEST_CASE("semi and anti join match categorical keys whose dictionaries differ",
     CHECK(rows_of("l semi join r on k;") == std::vector<std::int64_t>{0, 1, 3, 5});
     CHECK(rows_of("l anti join r on k;") == std::vector<std::int64_t>{2, 4});
 }
+
+TEST_CASE("semi and anti join: a parallel probe keeps exactly the matching rows",
+          "[join][semi][anti][parallel]") {
+    // Past the operator's parallel floor (1 << 18 rows), so the morsel path
+    // runs, and not a multiple of 64, so the last keep word is ragged.
+    constexpr std::size_t kRows = 300'001;
+    constexpr std::size_t kKeys = 50;
+    Column<std::int64_t> ikey;
+    Column<std::string> skey;
+    Column<std::string> name;
+    Column<bool> flag;
+    Column<double> value;
+    runtime::ValidityBitmap value_valid(kRows, true);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        const std::size_t k = (i * 7919) % kKeys;
+        ikey.push_back(static_cast<std::int64_t>(k));
+        skey.push_back("k" + std::to_string(k));
+        name.push_back(std::string(1 + (i % 5), static_cast<char>('a' + (i % 26))));
+        flag.push_back(i % 3 == 0);
+        value.push_back(static_cast<double>(i) * 0.5);
+        if (i % 13 == 0) {
+            value_valid.set(i, false);
+        }
+    }
+    // Every third key is on the right; its strings come in a different order,
+    // so a categorical key gets its own dictionary there.
+    Column<std::int64_t> right_ikey;
+    Column<std::string> right_skey;
+    for (std::size_t k = kKeys; k-- > 0;) {
+        if (k % 3 == 0) {
+            right_ikey.push_back(static_cast<std::int64_t>(k));
+            right_skey.push_back("k" + std::to_string(k));
+        }
+    }
+    const auto categorical = [](const Column<std::string>& strings) {
+        Column<Categorical> out;
+        for (std::size_t i = 0; i < strings.size(); ++i) {
+            out.push_back(strings[i]);
+        }
+        return out;
+    };
+    runtime::TableRegistry registry;
+    {
+        runtime::Table left;
+        left.add_column("ik", ikey);
+        left.add_column("sk", skey);
+        left.add_column("ck", categorical(skey));
+        left.add_column("name", name);
+        left.add_column("flag", flag);
+        left.add_column("value", value, value_valid);
+        registry.emplace("l", std::move(left));
+        runtime::Table right;
+        right.add_column("ik", right_ikey);
+        right.add_column("sk", right_skey);
+        right.add_column("ck", categorical(right_skey));
+        registry.emplace("r", std::move(right));
+    }
+
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    for (const char* key : {"ik", "sk", "ck"}) {
+        for (const char* kind : {"semi", "anti"}) {
+            const bool keep_matches = std::string_view(kind) == "semi";
+            std::vector<std::size_t> expected;
+            for (std::size_t i = 0; i < kRows; ++i) {
+                if ((((i * 7919) % kKeys) % 3 == 0) == keep_matches) {
+                    expected.push_back(i);
+                }
+            }
+            const std::string query = std::string("l ") + kind + " join r on " + key + ";";
+            for (const auto* exec : {&serial, &parallel}) {
+                INFO(query << (exec == &serial ? " serial" : " parallel"));
+                auto parsed = parser::parse(query);
+                REQUIRE(parsed.has_value());
+                auto lowered = parser::lower(*parsed);
+                REQUIRE(lowered.has_value());
+                auto out = runtime::interpret(*lowered.value(), registry, nullptr, nullptr, nullptr,
+                                              *exec);
+                REQUIRE(out.has_value());
+                REQUIRE(out->rows() == expected.size());
+                const auto& got_ik = std::get<Column<std::int64_t>>(*out->find("ik"));
+                const auto& got_name = std::get<Column<std::string>>(*out->find("name"));
+                const auto& got_flag = std::get<Column<bool>>(*out->find("flag"));
+                const auto* got_value = out->find_entry("value");
+                REQUIRE(got_value != nullptr);
+                const auto& values = std::get<Column<double>>(*got_value->column);
+                std::size_t wrong = 0;
+                for (std::size_t j = 0; j < expected.size(); ++j) {
+                    const std::size_t i = expected[j];
+                    const bool null = runtime::is_null(*got_value, j);
+                    wrong += got_ik[j] != ikey[i] || got_name[j] != name[i] ||
+                                     got_flag[j] != flag[i] || null != !value_valid[i] ||
+                                     (!null && values[j] != value[i])
+                                 ? 1U
+                                 : 0U;
+                }
+                CHECK(wrong == 0);
+            }
+        }
+    }
+}

@@ -20,6 +20,7 @@
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -214,10 +215,10 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     ///
     /// The scan is one hash lookup per right row against a map that stopped
     /// changing before it started, so it splits with no coordination — the same
-    /// shape as `select_rows` below, and gated on the same row floor for the
+    /// shape as `filter_rows` below, and gated on the same row floor for the
     /// same reason: below it the fan-out costs more than the lookups it spreads.
     ///
-    /// Capped additionally by a BYTE budget, which `select_rows` needs no
+    /// Capped additionally by a BYTE budget, which `filter_rows` needs no
     /// equivalent of: each worker owns a private byte per left key, so the cost
     /// scales with the left's cardinality as well as the right's row count. A
     /// 57k-key left (q04) is 57KB per worker and free; a multi-million-key left
@@ -741,146 +742,113 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     // -- so it is set where a mistake is cheap rather than where it is tight.
     static constexpr std::size_t kMinParallelPredicateRows = 1U << 18U;
 
-    /// The surviving row indices, ascending, evaluated across the worker pool.
+    /// The rows of `t` that `pred` keeps, through the filter operator's own
+    /// machinery. Each morsel packs its keep bits a 64-row word at a time,
+    /// with no branch on the predicate, and counts its string bytes; the
+    /// output is sized once, without zero-filling; then each morsel gathers
+    /// its rows into its own window of it, in parallel.
     ///
-    /// Every predicate this operator builds probes ONE key cell against a set
-    /// that stopped changing before the first left chunk arrived: it reads the
-    /// key column, the set, and a validity bitmap, and writes nothing. So the
-    /// rows split with no coordination at all, and each range can build its own
-    /// index list -- one memcpy per range to concatenate, rather than a second
-    /// full pass over a keep-flag array.
+    /// It used to build an index list: 8 bytes per kept row, pushed behind a
+    /// branch that mispredicts at mid selectivity, concatenated serially, then
+    /// gathered through. At half of 16M rows kept that was 37 ms at eight
+    /// cores, 18% of it serial.
     ///
-    /// Ranges are contiguous and appended in order, so the result stays
-    /// ascending, which both `gather_rows` and every consumer of the chunk
-    /// require.
-    template <typename Pred>
-    auto select_rows(std::size_t rows, Pred pred) -> std::vector<std::size_t> {
-        auto serial_select = [&] {
-            std::vector<std::size_t> idx;
-            idx.reserve(rows);
-            for (std::size_t row = 0; row < rows; ++row) {
-                if (pred(row)) {
-                    idx.push_back(row);
-                }
-            }
-            return idx;
-        };
-        // The context checks come before the pool binding for the same reason
-        // as everywhere else: constructing the pool spawns its threads
-        // eagerly, and a serial query must not pay for them.
-        if (exec_ == nullptr || !exec_->can_fan_out() || on_worker_pool_thread() ||
-            rows < kMinParallelPredicateRows) {
-            return serial_select();
-        }
-        auto& pool = process_worker_pool();
-        const std::size_t budget = exec_->compute_budget();
-        const std::size_t workers = std::min(budget, pool.size());
-        // `submit` CLAMPS its worker count to the pool size, so a range count
-        // above it would leave those ranges unvisited and silently drop rows.
-        const std::size_t ranges = std::max<std::size_t>(1, std::min(workers, rows));
-        if (ranges < 2) {
-            return serial_select();
-        }
-
-        const std::size_t grain = (rows + ranges - 1) / ranges;
-        std::vector<std::vector<std::size_t>> parts(ranges);
-        {
-            auto batch = pool.submit(ranges, [&](std::size_t r) {
-                const std::size_t begin = r * grain;
-                const std::size_t end = std::min(rows, begin + grain);
-                if (begin >= end) {
-                    return;
-                }
-                auto& out = parts[r];
-                out.reserve(end - begin);
-                for (std::size_t row = begin; row < end; ++row) {
-                    if (pred(row)) {
-                        out.push_back(row);
-                    }
-                }
-            });
-            batch.wait();
-        }
-
-        std::size_t total = 0;
-        for (const auto& part : parts) {
-            total += part.size();
-        }
-        std::vector<std::size_t> idx;
-        idx.reserve(total);
-        for (const auto& part : parts) {
-            idx.insert(idx.end(), part.begin(), part.end());
-        }
-        return idx;
-    }
-
+    /// Every predicate this operator builds probes one key cell against a set
+    /// that stopped changing before the first left chunk arrived, and writes
+    /// nothing, so morsels need no coordination.
     template <typename Pred>
     auto filter_rows(Table t, Pred pred) -> std::optional<Table> {
         const std::size_t rows = t.rows();
-        const std::vector<std::size_t> idx = select_rows(rows, pred);
-        if (idx.empty()) {
+        if (rows == 0) {
             return std::nullopt;
         }
-        if (idx.size() == rows) {
+        auto layout = build_filter_output_layout(t, nullptr);
+        if (!layout.has_value()) {
+            invariant_violation("semi/anti join: output layout of an unprojected table failed");
+        }
+        // The context checks come before the pool binding: constructing the
+        // pool spawns its threads eagerly, and a serial query must not pay.
+        std::size_t morsels = 1;
+        if (exec_ != nullptr && exec_->can_fan_out() && !on_worker_pool_thread() &&
+            rows >= kMinParallelPredicateRows &&
+            filter_gather_is_thread_safe(t, layout->src_of_dst)) {
+            // `submit` clamps its worker count to the pool size, so more
+            // morsels than that would leave some unvisited.
+            morsels = std::min(exec_->compute_budget(), process_worker_pool().size());
+        }
+        // Morsels start on a 64-row boundary, so each owns whole keep words.
+        const std::size_t grain = ((((rows + morsels - 1) / morsels) + 63) / 64) * 64;
+        morsels = (rows + grain - 1) / grain;
+        const auto range_of = [&](std::size_t m) {
+            const std::size_t begin = m * grain;
+            return RowRange{.begin = begin, .count = std::min(rows, begin + grain) - begin};
+        };
+        const auto for_morsels = [&](const auto& body) {
+            if (morsels < 2) {
+                body(std::size_t{0});
+                return;
+            }
+            auto batch = process_worker_pool().submit(morsels, [&](std::size_t m) { body(m); });
+            batch.wait();
+        };
+
+        const std::size_t n_cols = layout->output.columns.size();
+        const bool has_strings = std::ranges::any_of(layout->src_of_dst, [&](std::size_t src) {
+            return std::holds_alternative<Column<std::string>>(*t.columns[src].column);
+        });
+        std::vector<FilterSelection> selections(morsels);
+        std::vector<std::vector<std::size_t>> chars_at(has_strings ? morsels : 0,
+                                                       std::vector<std::size_t>(n_cols, 0));
+        for_morsels([&](std::size_t m) {
+            const RowRange range = range_of(m);
+            auto& sel = selections[m];
+            sel.keep_words.assign((range.count + 63) / 64, 0);
+            for (std::size_t w = 0; w < sel.keep_words.size(); ++w) {
+                const std::size_t base = range.begin + (w * 64);
+                const std::size_t lim = std::min<std::size_t>(64, range.begin + range.count - base);
+                std::uint64_t bits = 0;
+                for (std::size_t k = 0; k < lim; ++k) {
+                    bits |= static_cast<std::uint64_t>(pred(base + k)) << k;
+                }
+                sel.keep_words[w] = bits;
+                sel.kept += static_cast<std::size_t>(std::popcount(bits));
+            }
+            if (has_strings) {
+                count_selected_chars(t, layout->src_of_dst, sel, range, chars_at[m]);
+            }
+        });
+
+        // Exclusive prefix sums: each morsel's counts become its offsets.
+        std::vector<std::size_t> row_at(morsels, 0);
+        std::size_t kept = 0;
+        for (std::size_t m = 0; m < morsels; ++m) {
+            row_at[m] = kept;
+            kept += selections[m].kept;
+        }
+        if (kept == 0) {
+            return std::nullopt;
+        }
+        if (kept == rows) {
             return t;
         }
-        // For a small output the serial per-column gather is cheapest. For a
-        // large one -- q21's semi join is one ~15M-row chunk, previously ~88%
-        // serial -- fan the columns out over the pool in one batch. The floor
-        // is the same `kMinParallelPredicateRows` (and the same reasoning) as
-        // `select_rows`: `filter_chunk` runs once per left chunk, so a lower
-        // floor forks a batch per ~150k-row chunk and the barriers cost more
-        // than they buy.
-        if (idx.size() >= kMinParallelPredicateRows) {
-            return gather_rows_batched(t, idx);
-        }
-        return gather_rows(t, idx);
-    }
-
-    /// `gather_rows`, but the columns are gathered concurrently in ONE worker
-    /// batch (`gather_columns_batched`) instead of a serial per-column loop.
-    /// `idx` is an ascending subset with no `kNull` sentinel, so a subset keeps
-    /// every group boundary and imposes no order and the source properties ride
-    /// along unchanged -- the same rule `gather_rows` documents.
-    auto gather_rows_batched(const Table& input, const std::vector<std::size_t>& idx) -> Table {
-        const std::size_t total = idx.size();
-        const std::span<const std::size_t> idx_span{idx.data(), total};
-
-        std::vector<ColumnGatherJob> jobs;
-        jobs.reserve(input.columns.size());
-        for (const auto& entry : input.columns) {
-            jobs.push_back({
-                .column = entry.column.get(),
-                .validity = entry.validity.has_value() ? &*entry.validity : nullptr,
-                .idx = idx.data(),
-                .indivisible = false,
-            });
-        }
-
-        auto gathered =
-            gather_columns_batched(jobs, total, exec_, [&](std::size_t j) -> GatheredColumn {
-                const auto& entry = input.columns[j];
-                ColumnValue col = make_gather_column(*entry.column, total);
-                gather_range_into(col, *entry.column, idx_span, 0, total);
-                std::optional<ValidityBitmap> val;
-                if (entry.validity.has_value()) {
-                    ValidityBitmap dst(total, false);
-                    gather_validity_range(dst, *entry.validity, idx_span, 0, total);
-                    val = std::move(dst);
-                }
-                return {std::move(col), std::move(val)};
-            });
-
-        Table output;
-        output.columns.reserve(input.columns.size());
-        for (std::size_t j = 0; j < input.columns.size(); ++j) {
-            output.add_column(input.columns[j].name, std::move(gathered[j].first));
-            if (gathered[j].second.has_value()) {
-                output.columns.back().validity = std::move(gathered[j].second);
+        std::vector<std::size_t> chars_total(n_cols, 0);
+        for (std::size_t d = 0; d < n_cols && has_strings; ++d) {
+            for (auto& per_morsel : chars_at) {
+                const std::size_t count = per_morsel[d];
+                per_morsel[d] = chars_total[d];
+                chars_total[d] += count;
             }
         }
-        output.set_properties(input.properties());
-        return output;
+        presize_filter_output(layout->output, t, layout->src_of_dst, kept, chars_total);
+        for_morsels([&](std::size_t m) {
+            gather_selection_into(
+                layout->output, t, layout->src_of_dst, selections[m], range_of(m),
+                GatherDest{.row = row_at[m], .char_base = has_strings ? &chars_at[m] : nullptr});
+        });
+        // A subset keeps every group boundary and imposes no order, so the
+        // source properties ride along unchanged.
+        layout->output.set_properties(t.properties());
+        return std::move(*layout).output;
     }
 
     auto filter_chunk(Table t) -> std::optional<Table> {
@@ -930,8 +898,8 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 // operator's members and the column's accessors, every row
                 // reloads the bitmap's base, span and minimum, and tests the
                 // column and the validity bitmap for adopted Arrow storage:
-                // `select_rows` stores each surviving index, which may alias
-                // those members, so none of it hoists. Resolve them once.
+                // the probe runs inside `filter_rows`'s packing loop, where
+                // none of it hoists on its own. Resolve them once.
                 const std::int64_t* const keys = col->data();
                 const auto dense_min = static_cast<std::uint64_t>(dense_i64_min_);
                 const std::uint64_t dense_slots = dense_i64_nbits_;

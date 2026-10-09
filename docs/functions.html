@@ -216,7 +216,7 @@
             <tr><td><code>hour(t)</code></td><td>Hour component from Timestamp.</td></tr>
             <tr><td><code>minute(t)</code></td><td>Minute component from Timestamp.</td></tr>
             <tr><td><code>second(t)</code></td><td>Second component from Timestamp.</td></tr>
-            <tr><td><code>round(x, mode)</code></td><td>Round Float to Int with mode: <code>nearest</code>, <code>bankers</code>, <code>floor</code>, <code>ceil</code>, or <code>trunc</code>. An Int is returned unchanged; a <code>Decimal(p, s)</code> rounds exactly to a scale-zero Decimal.</td></tr>
+            <tr><td><code>round(x, mode)</code></td><td>Round Float to Int with a <code>RoundMode</code>: <code>Nearest</code>, <code>Bankers</code>, <code>Floor</code>, <code>Ceil</code>, or <code>Trunc</code> (or qualified, <code>RoundMode::Nearest</code>). An Int is returned unchanged; a <code>Decimal(p, s)</code> rounds exactly to a scale-zero Decimal.</td></tr>
             <tr><td><code>like(s, pattern)</code></td><td><code>Bool</code>: SQL-LIKE match over the whole string. See below.</td></tr>
             <tr><td><code>length(s)</code></td><td><code>Int64</code>: Unicode code-point count.</td></tr>
             <tr><td><code>byte_length(s)</code></td><td><code>Int64</code>: UTF-8 byte count; use for wire/SQL compatibility.</td></tr>

@@ -1792,35 +1792,35 @@ i;
 
 TEST_CASE("round: nearest mode rounds half away from zero") {
     ibex::runtime::ExternRegistry registry;
-    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(2.5, nearest);", registry));
+    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(2.5, Nearest);", registry));
 }
 
 TEST_CASE("round: floor mode rounds down") {
     ibex::runtime::ExternRegistry registry;
-    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(2.9, floor);", registry));
+    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(2.9, Floor);", registry));
 }
 
 TEST_CASE("round: ceil mode rounds up") {
     ibex::runtime::ExternRegistry registry;
-    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(2.1, ceil);", registry));
+    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(2.1, Ceil);", registry));
 }
 
 TEST_CASE("round: trunc mode rounds toward zero") {
     ibex::runtime::ExternRegistry registry;
-    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(2.9, trunc);", registry));
+    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(2.9, Trunc);", registry));
 }
 
 TEST_CASE("round: negative value with floor") {
     ibex::runtime::ExternRegistry registry;
-    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(-2.1, floor);", registry));
+    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(-2.1, Floor);", registry));
 }
 
 TEST_CASE("round: bankers mode rounds half-to-even") {
     ibex::runtime::ExternRegistry registry;
     // 2.5 rounds to 2 (nearest even), 3.5 rounds to 4 (nearest even)
-    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(2.5, bankers);", registry));
-    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(3.5, bankers);", registry));
-    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(2.1, bankers);", registry));
+    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(2.5, Bankers);", registry));
+    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(3.5, Bankers);", registry));
+    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(2.1, Bankers);", registry));
 }
 
 TEST_CASE("round: unknown mode is an error") {
@@ -1828,9 +1828,19 @@ TEST_CASE("round: unknown mode is an error") {
     REQUIRE_FALSE(ibex::repl::execute_script("let x: Int64 = round(2.5, halfway);", registry));
 }
 
+TEST_CASE("round: the mode may be qualified with its enum type") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(2.5, RoundMode::Bankers);", registry));
+}
+
+TEST_CASE("round: the old lowercase mode spelling is an error") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE_FALSE(ibex::repl::execute_script("let x: Int64 = round(2.5, nearest);", registry));
+}
+
 TEST_CASE("round: Int argument is an error") {
     ibex::runtime::ExternRegistry registry;
-    REQUIRE_FALSE(ibex::repl::execute_script("let x: Int64 = round(3, nearest);", registry));
+    REQUIRE_FALSE(ibex::repl::execute_script("let x: Int64 = round(3, Nearest);", registry));
 }
 
 TEST_CASE("round: applied to Float column with nearest mode") {
@@ -1847,7 +1857,7 @@ TEST_CASE("round: applied to Float column with nearest mode") {
 extern fn get_data() -> DataFrame from "fake.hpp";
 let df = get_data();
 let (v) = df;
-let r: Series<Int64> = round(v, nearest);
+let r: Series<Int64> = round(v, Nearest);
 r;
 )";
     REQUIRE(ibex::repl::execute_script(src, registry));
@@ -1867,7 +1877,7 @@ TEST_CASE("round: applied to Int column is an error") {
 extern fn get_data() -> DataFrame from "fake.hpp";
 let df = get_data();
 let (n) = df;
-let r: Series<Int64> = round(n, nearest);
+let r: Series<Int64> = round(n, Nearest);
 r;
 )";
     REQUIRE_FALSE(ibex::repl::execute_script(src, registry));

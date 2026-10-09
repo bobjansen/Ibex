@@ -182,7 +182,9 @@
       Library functions live in namespaces: <code>import "csv"</code> then
       <code>csv::read(path)</code>, or <code>using csv;</code> and
       <code>read(path)</code>. Scripts declare their own with
-      <code>namespace name { fn ... }</code>.
+      <code>namespace name { fn ... }</code>. Fixed choices are built-in
+      enums: <code>round(x, Bankers)</code>, or qualified,
+      <code>round(x, RoundMode::Bankers)</code>.
     </p>
   </section>
 

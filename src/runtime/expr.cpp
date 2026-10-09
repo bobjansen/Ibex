@@ -9,6 +9,7 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/decimal.hpp>
+#include <ibex/core/enums.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/core/time_zone.hpp>
 #include <ibex/ir/expr_predicates.hpp>
@@ -1953,42 +1954,39 @@ auto find_builtin(std::string_view name) -> const BuiltinFn* {
 
 namespace {
 
-// round(x, mode): mode is a bare identifier (lowered to a ColumnRef), so round
-// is dispatched separately from the value-based scalar registry above.
-auto valid_round_mode(std::string_view m) -> bool {
-    return m == "nearest" || m == "bankers" || m == "floor" || m == "ceil" || m == "trunc";
-}
-
-auto extract_ir_round_mode(const ir::Expr& arg) -> std::expected<std::string_view, std::string> {
-    if (const auto* ref = std::get_if<ir::ColumnRef>(&arg.node)) {
-        if (valid_round_mode(ref->name)) {
-            return std::string_view{ref->name};
+// round(x, mode): lowering resolves the mode to its canonical `RoundMode::Member`
+// string literal (SPEC.md Section 3.7), so round is dispatched separately from
+// the value-based scalar registry above.
+auto extract_ir_round_mode(const ir::Expr& arg) -> std::expected<RoundMode, std::string> {
+    if (const auto* literal = std::get_if<ir::Literal>(&arg.node)) {
+        if (const auto* text = std::get_if<std::string>(&literal->value)) {
+            auto mode = resolve_round_mode(*text);
+            if (!mode.has_value()) {
+                return std::unexpected("round(): " + mode.error());
+            }
+            return *mode;
         }
-        return std::unexpected("round(): unknown mode '" + ref->name +
-                               "' (expected: nearest, bankers, floor, ceil, trunc)");
     }
-    return std::unexpected(
-        "round(): second argument must be a bare mode identifier "
-        "(nearest, bankers, floor, ceil, trunc)");
+    return std::unexpected("round(): second argument must be a RoundMode such as Nearest");
 }
 
-auto apply_round(double v, std::string_view mode) -> std::int64_t {
-    if (mode == "nearest") {
-        return static_cast<std::int64_t>(std::llround(v));
+auto apply_round(double v, RoundMode mode) -> std::int64_t {
+    switch (mode) {
+        case RoundMode::Nearest:
+            return static_cast<std::int64_t>(std::llround(v));
+        case RoundMode::Bankers:
+            return static_cast<std::int64_t>(std::llrint(v));  // FE_TONEAREST: ties to even
+        case RoundMode::Floor:
+            return static_cast<std::int64_t>(std::floor(v));
+        case RoundMode::Ceil:
+            return static_cast<std::int64_t>(std::ceil(v));
+        case RoundMode::Trunc:
+            break;
     }
-    if (mode == "bankers") {
-        return static_cast<std::int64_t>(std::llrint(v));  // FE_TONEAREST: ties to even
-    }
-    if (mode == "floor") {
-        return static_cast<std::int64_t>(std::floor(v));
-    }
-    if (mode == "ceil") {
-        return static_cast<std::int64_t>(std::ceil(v));
-    }
-    return static_cast<std::int64_t>(std::trunc(v));  // trunc
+    return static_cast<std::int64_t>(std::trunc(v));
 }
 
-auto apply_decimal_round(const DecimalValue& value, std::string_view mode)
+auto apply_decimal_round(const DecimalValue& value, RoundMode mode)
     -> std::expected<DecimalValue, std::string> {
     const int scale = value.type.scale;
     const Int128 divisor = decimal::pow10(scale);
@@ -1996,15 +1994,15 @@ auto apply_decimal_round(const DecimalValue& value, std::string_view mode)
     const Int128 remainder = value.units % divisor;
     const bool has_remainder = remainder != 0;
     bool increment = false;
-    if (mode == "floor") {
+    if (mode == RoundMode::Floor) {
         increment = value.units < 0 && has_remainder;
-    } else if (mode == "ceil") {
+    } else if (mode == RoundMode::Ceil) {
         increment = value.units > 0 && has_remainder;
-    } else if (mode == "nearest" || mode == "bankers") {
+    } else if (mode == RoundMode::Nearest || mode == RoundMode::Bankers) {
         const Int128 magnitude = remainder < 0 ? -remainder : remainder;
         const Int128 half = divisor / 2;
-        increment =
-            magnitude > half || (magnitude == half && (mode == "nearest" || (quotient % 2) != 0));
+        increment = magnitude > half ||
+                    (magnitude == half && (mode == RoundMode::Nearest || (quotient % 2) != 0));
     }
     if (increment) {
         quotient += value.units < 0 ? -1 : 1;
@@ -2220,7 +2218,7 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
             }
             return fn.infer(call->callee, arg_types);
         }
-        // round(x, mode): mode is a bare identifier, so it is dispatched apart
+        // round(x, mode): mode is a RoundMode literal, so it is dispatched apart
         // from the value-based registry. Always yields Int64.
         if (call->callee == "round") {
             if (call->args.size() != 2) {
@@ -2590,7 +2588,7 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
             }
             return scalar_exec->eval(call->callee, arg_values);
         }
-        // round(x, mode): mode is a bare identifier; dispatched apart from the
+        // round(x, mode): mode is a RoundMode literal; dispatched apart from the
         // value-based registry. Always yields Int64.
         if (call->callee == "round") {
             if (call->args.size() != 2) {

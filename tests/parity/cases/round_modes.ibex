@@ -1,0 +1,2 @@
+let t = Table { x = [2.5, 3.5, -2.5, 1.2, -0.5] };
+t[update { n = round(x, Nearest), b = round(x, RoundMode::Bankers), f = round(x, Floor), c = round(x, Ceil), z = round(x, Trunc) }];

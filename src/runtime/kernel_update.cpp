@@ -2839,7 +2839,6 @@ auto evaluate_field_windows(const ir::Expr& expr, const DirectFieldRoute& route,
     }
 
     if (route.categorical.has_value()) {
-        using Code = Column<Categorical>::code_type;
         Column<Categorical>::codes_storage codes(rows, 0);
         std::vector<std::expected<std::optional<ValidityBitmap>, std::string>> pieces(morsels);
         std::atomic<std::size_t> cursor{0};

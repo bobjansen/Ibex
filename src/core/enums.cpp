@@ -48,7 +48,9 @@ auto round_mode_enum() -> const BuiltinEnum& {
 }
 
 auto find_builtin_enum(std::string_view name) -> const BuiltinEnum* {
-    const auto* const it = std::ranges::find_if(
+    // std::array iterators are pointers in libstdc++, but class types in MSVC.
+    // NOLINTNEXTLINE(readability-qualified-auto)
+    const auto it = std::ranges::find_if(
         kBuiltinEnums, [&](const BuiltinEnum* type) { return type->name == name; });
     return it == kBuiltinEnums.end() ? nullptr : *it;
 }

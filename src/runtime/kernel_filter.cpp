@@ -136,16 +136,15 @@ void presize_filter_chunk_output(Chunk& output, const ChunkView& input,
                 if constexpr (std::is_same_v<ColT, Column<std::string>>) {
                     dst.resize_for_gather(rows_total, chars_total[d]);
                     dst.offsets_data()[0] = 0;
-                } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
-                    // Zero-filled on purpose: the bit appender ORs into its
-                    // destination word rather than assigning it.
-                    dst.resize(rows_total);
-                } else if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
-                    // Every code is written by the gather, as for fixed width.
-                    dst.resize_for_overwrite(rows_total);
-                } else if constexpr (::ibex::detail::overwrite_safe_v<typename ColT::value_type>) {
+                } else if constexpr (std::is_same_v<ColT, Column<Categorical>> ||
+                                     (!std::is_same_v<ColT, Column<bool>> &&
+                                      ::ibex::detail::overwrite_safe_v<
+                                          typename ColT::value_type>)) {
+                    // Every code or fixed-width value is written by the gather.
                     dst.resize_for_overwrite(rows_total);
                 } else {
+                    // Bool must be zero-filled: the bit appender ORs into its
+                    // destination word rather than assigning it.
                     dst.resize(rows_total);
                 }
             },

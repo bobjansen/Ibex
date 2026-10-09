@@ -68,4 +68,5 @@ add_custom_target(ibex_ui_assets DEPENDS "${IBEX_UI_INDEX}")
 install(
     DIRECTORY "${IBEX_UI_OUTPUT_DIR}/"
     DESTINATION "${CMAKE_INSTALL_BINDIR}/ui"
+    COMPONENT runtime
 )

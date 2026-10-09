@@ -118,6 +118,12 @@ set(ARROW_HDFS OFF CACHE BOOL "" FORCE)
 set(ARROW_ORC OFF CACHE BOOL "" FORCE)
 set(ARROW_GANDIVA OFF CACHE BOOL "" FORCE)
 set(ARROW_SUBSTRAIT OFF CACHE BOOL "" FORCE)
+# Installed Arrow libraries find each other relative to themselves: RUNPATH
+# $ORIGIN (Linux) / @loader_path (macOS), and on macOS an @rpath install name.
+# Without the latter the dylibs were named /usr/local/lib/libarrow.*.dylib and a
+# release `ibex` failed to start anywhere they were not installed there.
+set(ARROW_RPATH_ORIGIN ON CACHE BOOL "" FORCE)
+set(ARROW_INSTALL_NAME_RPATH ON CACHE BOOL "" FORCE)
 # S3 filesystem support drags in the entire bundled AWS SDK (aws-lc, aws-c-*).
 # The normal plugin keeps it configurable; local-only embedding hosts exclude
 # it unconditionally.

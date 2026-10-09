@@ -11,6 +11,30 @@ set_target_properties(ibex_repl_bin PROPERTIES
     OUTPUT_NAME ibex
 )
 
+# `ibex --version`. The release workflow passes the tag (-DIBEX_VERSION=v0.4.0);
+# otherwise it is `git describe` as of the last configure, so a dev build that
+# has not re-run CMake since reports an older commit.
+set(IBEX_VERSION "" CACHE STRING
+    "Version reported by `ibex --version`; empty = git describe at configure time")
+set(_ibex_version "${IBEX_VERSION}")
+if(_ibex_version STREQUAL "")
+    find_package(Git QUIET)
+    if(GIT_FOUND)
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" describe --tags --always --dirty
+            WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+            OUTPUT_VARIABLE _ibex_version
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+    endif()
+    if(_ibex_version STREQUAL "")
+        set(_ibex_version "${PROJECT_VERSION}-dev")
+    endif()
+endif()
+target_compile_definitions(ibex_repl_bin PRIVATE IBEX_VERSION_STRING="${_ibex_version}")
+unset(_ibex_version)
+
 target_link_libraries(ibex_repl_bin
     PRIVATE
         Ibex::repl_cli
@@ -50,9 +74,8 @@ if(TARGET Ibex::Sanitizers)
     target_link_libraries(ibex_repl_bin PRIVATE Ibex::Sanitizers)
 endif()
 
-install(TARGETS ibex_repl_bin
-    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
-)
+# Installed (component `runtime`) by the release-bundle block in the top-level
+# CMakeLists.txt, which also sets its relative INSTALL_RPATH.
 
 add_executable(ibex_bench ibex_bench.cpp)
 

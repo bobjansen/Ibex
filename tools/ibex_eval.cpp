@@ -51,7 +51,8 @@ auto main(int argc, char** argv) -> int {
     app.add_option("--plugin-path", plugin_path,
                    "Directory to search for plugin shared libraries (*.so). "
                    "Defaults to IBEX_LIBRARY_PATH environment variable, then to "
-                   "the directory containing this executable.");
+                   "../lib/ibex beside this executable (release layout), else "
+                   "the directory containing it.");
     app.add_option("--import-path", import_path,
                    "Directory to search for library stub files (*.ibex) used by "
                    "`import` declarations.  Defaults to the plugin search path.");
@@ -65,11 +66,7 @@ auto main(int argc, char** argv) -> int {
         }
     }
     if (plugin_path.empty()) {
-        std::error_code ec;
-        auto exe_dir = ibex::tools::executable_directory();
-        if (!exe_dir.empty() && std::filesystem::exists(exe_dir, ec)) {
-            plugin_path = exe_dir.string();
-        }
+        plugin_path = ibex::tools::default_plugin_directory().string();
     }
 
     ibex::repl::ReplConfig config;

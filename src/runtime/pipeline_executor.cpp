@@ -1916,7 +1916,7 @@ class DeferredScanSourceOperator final : public Operator {
             state->clear();
 
             const auto& local_codes = local->codes();
-            std::vector<code_type> codes(local_codes.size());
+            Column<Categorical>::codes_storage codes(local_codes.size());
             for (std::size_t row = 0; row < local_codes.size(); ++row) {
                 codes[row] = remap[static_cast<std::size_t>(local_codes[row])];
             }
@@ -2695,7 +2695,7 @@ auto translate_deferred_categorical(const Column<Categorical>& local,
     const std::size_t rows = local.size();
     const code_type* local_codes = local.codes_data();
     const code_type* remap = deferred.remap.data();
-    std::vector<code_type> codes(rows);
+    Column<Categorical>::codes_storage codes(rows);
     for (std::size_t row = 0; row < rows; ++row) {
         codes[row] = remap[static_cast<std::size_t>(local_codes[row])];
     }

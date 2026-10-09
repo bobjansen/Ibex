@@ -3064,7 +3064,7 @@ TEST_CASE("join: a parallel unique-key inner join gives the serial rows in order
     constexpr std::size_t kRight = 400;
     Column<std::int64_t> lk;
     Column<std::string> ls;
-    std::vector<Column<Categorical>::code_type> lc;
+    Column<Categorical>::codes_storage lc;
     Column<std::int64_t> lrow;
     runtime::ValidityBitmap lk_valid(kLeft, true);
     std::vector<std::string> dict;

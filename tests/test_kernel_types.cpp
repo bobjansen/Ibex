@@ -235,7 +235,7 @@ TEST_CASE("Row-local interpolation reads categorical dictionary codes", "[kernel
     runtime::Chunk chunk;
     chunk.add_column("symbol",
                      Column<Categorical>{std::vector<std::string>{"AAPL", "GOOG"},
-                                         std::vector<Column<Categorical>::code_type>{1, 0, 1}},
+                                         Column<Categorical>::codes_storage{1, 0, 1}},
                      runtime::ValidityBitmap{true, false, true});
     ir::CallExpr interpolation{.callee = "__interp", .args = {}, .named_args = {}};
     interpolation.args.push_back(
@@ -610,12 +610,10 @@ TEST_CASE("Row-local temporal parts preserve source validity", "[kernel][update]
 TEST_CASE("Row-local CASE retains selected categorical labels", "[kernel][update]") {
     runtime::Chunk chunk;
     chunk.add_column("pick_left", Column<bool>{true, false, true});
-    chunk.add_column("left",
-                     Column<Categorical>{std::vector<std::string>{"A", "B"},
-                                         std::vector<Column<Categorical>::code_type>{0, 1, 0}});
-    chunk.add_column("right",
-                     Column<Categorical>{std::vector<std::string>{"B", "C"},
-                                         std::vector<Column<Categorical>::code_type>{1, 0, 1}});
+    chunk.add_column("left", Column<Categorical>{std::vector<std::string>{"A", "B"},
+                                                 Column<Categorical>::codes_storage{0, 1, 0}});
+    chunk.add_column("right", Column<Categorical>{std::vector<std::string>{"B", "C"},
+                                                  Column<Categorical>::codes_storage{1, 0, 1}});
     ir::CallExpr call{
         .callee = "__case",
         .args = {ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "pick_left"}}),

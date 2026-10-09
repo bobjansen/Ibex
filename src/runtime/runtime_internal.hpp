@@ -186,7 +186,7 @@ inline auto make_gather_column(const ColumnValue& src, std::size_t rows) -> Colu
                 if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
                     // Shares the source dictionary; only the codes are gathered.
                     return Column<Categorical>(col.dictionary_ptr(), col.index_ptr(),
-                                               std::vector<Column<Categorical>::code_type>(rows));
+                                               Column<Categorical>::codes_storage(rows));
                 } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
                     return ColT{};
                 } else if constexpr (!std::is_same_v<ColT, Column<bool>> &&
@@ -399,7 +399,7 @@ void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src,
             }
             ValidityBitmap bm(n, true);
             if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
-                std::vector<Column<Categorical>::code_type> codes(n);
+                Column<Categorical>::codes_storage codes(n);
                 const auto* sp = col.codes_data();
                 for (std::size_t i = 0; i < n; ++i) {
                     if (indices[i] != kNull) {

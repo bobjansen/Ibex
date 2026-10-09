@@ -315,8 +315,9 @@ TEST_CASE("PartitionedTableSource round-trips a multi-type table at every grain"
     input.add_column("i", Column<std::int64_t>{1, 2, 3, 4, 5, 6, 7});
     input.add_column("d", Column<double>{1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5});
     input.add_column("s", Column<std::string>{"a", "bb", "ccc", "d", "ee", "f", "ggg"});
-    input.add_column("c", Column<Categorical>{std::vector<std::string>{"x", "y"},
-                                              std::vector<std::int32_t>{0, 1, 0, 1, 1, 0, 1}});
+    input.add_column("c",
+                     Column<Categorical>{std::vector<std::string>{"x", "y"},
+                                         Column<Categorical>::codes_storage{0, 1, 0, 1, 1, 0, 1}});
 
     // Grains that divide evenly, don't divide evenly, equal the size, and exceed it.
     for (const std::size_t grain :

@@ -1182,9 +1182,8 @@ namespace {
 /// pair that `by { symbol, day }` produces when the table came from R, where a
 /// factor arrives as Categorical and an IDate as Date.
 auto make_cat_date_chunk(const std::shared_ptr<std::vector<std::string>>& dictionary,
-                         std::vector<Column<Categorical>::code_type> codes,
-                         std::vector<std::int32_t> days, std::vector<std::int64_t> values)
-    -> runtime::Chunk {
+                         Column<Categorical>::codes_storage codes, std::vector<std::int32_t> days,
+                         std::vector<std::int64_t> values) -> runtime::Chunk {
     runtime::Chunk chunk;
 
     runtime::ColumnEntry sym;
@@ -1223,7 +1222,7 @@ auto make_cat_date_chunk(const std::shared_ptr<std::vector<std::string>>& dictio
 /// thing across chunks.
 auto make_cat_chunk(const std::string& name,
                     const std::shared_ptr<std::vector<std::string>>& dictionary,
-                    std::vector<Column<Categorical>::code_type> codes) -> runtime::Chunk {
+                    Column<Categorical>::codes_storage codes) -> runtime::Chunk {
     runtime::Chunk chunk;
     runtime::ColumnEntry entry;
     entry.name = name;
@@ -1240,7 +1239,7 @@ auto make_cat_chunk(const std::string& name,
 /// Append a second Categorical column `name` (own dictionary) onto `chunk`.
 void add_cat_column(runtime::Chunk& chunk, const std::string& name,
                     const std::shared_ptr<std::vector<std::string>>& dictionary,
-                    std::vector<Column<Categorical>::code_type> codes) {
+                    Column<Categorical>::codes_storage codes) {
     runtime::ColumnEntry entry;
     entry.name = name;
     entry.column = std::make_shared<runtime::ColumnValue>(
@@ -3047,7 +3046,7 @@ TEST_CASE("update + by scatters packed strings and categorical codes", "[update]
                      runtime::ValidityBitmap{true, true, false, true});
     table.add_column("category",
                      Column<Categorical>{std::vector<std::string>{"red", "blue"},
-                                         std::vector<Column<Categorical>::code_type>{0, 1, 0, 1}},
+                                         Column<Categorical>::codes_storage{0, 1, 0, 1}},
                      runtime::ValidityBitmap{true, true, false, true});
     runtime::TableRegistry registry;
     registry.emplace("t", table);
@@ -3407,7 +3406,7 @@ TEST_CASE("grouped window scatters packed strings and categorical codes",
                      runtime::ValidityBitmap{true, true, false, true});
     table.add_column("category",
                      Column<Categorical>{std::vector<std::string>{"red", "blue"},
-                                         std::vector<Column<Categorical>::code_type>{0, 1, 0, 1}},
+                                         Column<Categorical>::codes_storage{0, 1, 0, 1}},
                      runtime::ValidityBitmap{true, true, false, true});
     runtime::TableRegistry registry;
     registry.emplace("t", table);
@@ -7932,11 +7931,11 @@ TEST_CASE("guarded update: where C update keeps non-matching rows", "[guarded_up
         runtime::Table t;
         t.add_column("label",
                      Column<Categorical>{std::vector<std::string>{"old", "keep", "gone"},
-                                         std::vector<Column<Categorical>::code_type>{0, 0, 1, 2}},
+                                         Column<Categorical>::codes_storage{0, 0, 1, 2}},
                      runtime::ValidityBitmap{true, true, true, false});
         t.add_column("replacement",
                      Column<Categorical>{std::vector<std::string>{"new", "ignored"},
-                                         std::vector<Column<Categorical>::code_type>{0, 1, 0, 1}},
+                                         Column<Categorical>::codes_storage{0, 1, 0, 1}},
                      runtime::ValidityBitmap{true, true, false, true});
         t.add_column("g", Column<std::string>{"x", "y", "x", "y"});
         runtime::TableRegistry registry;
@@ -7962,9 +7961,8 @@ TEST_CASE("guarded update: where C update keeps non-matching rows", "[guarded_up
 
 TEST_CASE("guarded update: CASE strings retain a categorical target", "[guarded_update][case]") {
     runtime::Table t;
-    t.add_column("category",
-                 Column<Categorical>{std::vector<std::string>{"old", "keep"},
-                                     std::vector<Column<Categorical>::code_type>{0, 1, 0, 1}});
+    t.add_column("category", Column<Categorical>{std::vector<std::string>{"old", "keep"},
+                                                 Column<Categorical>::codes_storage{0, 1, 0, 1}});
     t.add_column("take", Column<bool>{true, false, true, false});
     runtime::TableRegistry registry;
     registry.emplace("t", std::move(t));
@@ -9371,7 +9369,7 @@ TEST_CASE("rank by a categorical key gives the serial ranks in parallel", "[rank
     constexpr std::size_t kRows = 20'000;
     // "a" appears under codes 1 and 4: one group.
     const std::vector<std::string> dict{"z", "a", "m", "q", "a", "k"};
-    std::vector<Column<Categorical>::code_type> codes;
+    Column<Categorical>::codes_storage codes;
     Column<double> x;
     for (std::size_t i = 0; i < kRows; ++i) {
         codes.push_back(static_cast<Column<Categorical>::code_type>((i * 7) % 6));
@@ -9449,7 +9447,7 @@ TEST_CASE("top-k by a categorical key: a parallel run takes each group's stable-
           "[topk][parallel]") {
     constexpr std::size_t kRows = 24'000;
     const std::vector<std::string> dict{"d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7"};
-    std::vector<Column<Categorical>::code_type> codes;
+    Column<Categorical>::codes_storage codes;
     Column<double> price;
     Column<std::int64_t> id;
     for (std::size_t i = 0; i < kRows; ++i) {
@@ -9537,7 +9535,7 @@ TEST_CASE("collect aggregates by a categorical key give the serial answer in par
     // never appears.
     const std::vector<std::string> dict{"c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9"};
     const std::array<Column<Categorical>::code_type, 9> appearance{7, 3, 9, 0, 8, 1, 6, 2, 4};
-    std::vector<Column<Categorical>::code_type> codes;
+    Column<Categorical>::codes_storage codes;
     Column<double> x;
     Column<std::int64_t> n;
     runtime::ValidityBitmap x_valid(kRows, true);
@@ -9618,7 +9616,7 @@ TEST_CASE("left join: a parallel gather of every column type gives the serial an
     }
     Column<std::int64_t> rk;
     Column<std::string> rs;
-    std::vector<Column<Categorical>::code_type> rc;
+    Column<Categorical>::codes_storage rc;
     Column<std::int64_t> rn;
     Column<double> rd;
     Column<bool> rb;
@@ -9646,7 +9644,7 @@ TEST_CASE("left join: a parallel gather of every column type gives the serial an
     const auto make_right = [&](std::size_t copies) {
         Column<std::int64_t> k;
         Column<std::string> str;
-        std::vector<Column<Categorical>::code_type> codes;
+        Column<Categorical>::codes_storage codes;
         Column<std::int64_t> num;
         Column<double> dbl;
         Column<bool> flag;
@@ -17338,7 +17336,7 @@ class CatPipelineReader final : public runtime::LazySourceReader {
                 if (name == "f" && unit == nullptr) {
                     dict.push_back("X");
                 }
-                std::vector<std::int32_t> codes;
+                Column<Categorical>::codes_storage codes;
                 codes.reserve(rows.size());
                 for (const std::size_t row : rows) {
                     const std::string value =
@@ -17433,7 +17431,7 @@ class WideDictCatReader final : public runtime::LazySourceReader {
                 // per unit for `s`, as a Parquet row group writes it.
                 std::vector<std::string> dict;
                 robin_hood::unordered_map<std::string, std::int32_t> code_of;
-                std::vector<std::int32_t> codes;
+                Column<Categorical>::codes_storage codes;
                 codes.reserve(rows.size());
                 for (const std::size_t row : rows) {
                     std::string value =
@@ -18718,7 +18716,7 @@ TEST_CASE("Interpret order by a categorical column sorts by dictionary value",
         // Codes are deliberately assigned in the opposite order to the values,
         // so anything that sorted by raw code would be visibly wrong.
         Column<Categorical> symbol{std::vector<std::string>{"C", "B", "A"},
-                                   std::vector<std::int32_t>{0, 1, 2, 1}};
+                                   Column<Categorical>::codes_storage{0, 1, 2, 1}};
         runtime::Table table;
         table.add_column("symbol", std::move(symbol));
         table.add_column("seq", Column<std::int64_t>{10, 20, 30, 40});
@@ -18745,7 +18743,7 @@ TEST_CASE("Interpret order by a categorical column sorts by dictionary value",
 
     SECTION("descending order reverses the values") {
         Column<Categorical> symbol{std::vector<std::string>{"C", "B", "A"},
-                                   std::vector<std::int32_t>{0, 1, 2}};
+                                   Column<Categorical>::codes_storage{0, 1, 2}};
         runtime::Table table;
         table.add_column("symbol", std::move(symbol));
 
@@ -18774,7 +18772,7 @@ TEST_CASE("Interpret order by a categorical column sorts by dictionary value",
         // first so the key is not already ordered — otherwise the sort
         // short-circuits on a pre-sorted key and neither implementation runs.
         Column<Categorical> symbol{std::vector<std::string>{"B", "A", "A", "A"},
-                                   std::vector<std::int32_t>{0, 3, 1, 2}};
+                                   Column<Categorical>::codes_storage{0, 3, 1, 2}};
         runtime::Table table;
         table.add_column("symbol", std::move(symbol));
         table.add_column("seq", Column<std::int64_t>{10, 20, 30, 40});
@@ -18803,7 +18801,7 @@ TEST_CASE("Interpret order by a categorical column sorts by dictionary value",
 
     SECTION("nulls sort last and take the comparator path") {
         Column<Categorical> symbol{std::vector<std::string>{"B", "A"},
-                                   std::vector<std::int32_t>{0, 1, 0}};
+                                   Column<Categorical>::codes_storage{0, 1, 0}};
         runtime::Table table;
         table.add_column("symbol", std::move(symbol));
         table.columns[0].validity = runtime::ValidityBitmap{true, false, true};
@@ -18917,7 +18915,7 @@ TEST_CASE("Interpret order gathers every column kind identically in parallel",
     Column<bool> flag;
     Column<std::string> name;
     Column<Categorical> tag{std::vector<std::string>{"alpha", "beta", "gamma"},
-                            std::vector<std::int32_t>{}};
+                            Column<Categorical>::codes_storage{}};
     runtime::ValidityBitmap value_valid;
     for (std::size_t i = 0; i < kRows; ++i) {
         // Descending key, so every row actually moves.

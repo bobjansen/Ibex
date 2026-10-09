@@ -622,6 +622,10 @@ class Column<Categorical> {
     using value_type = std::string_view;
     using size_type = std::size_t;
     using code_type = std::int32_t;
+    /// Row-sized code buffer whose `resize` leaves new codes uninitialized, as
+    /// fixed-width columns' storage does: a categorical output sized up front
+    /// and then gathered into is not zero-filled first.
+    using codes_storage = detail::NoInitVector<code_type>;
     using index_map =
         robin_hood::unordered_map<std::string, code_type, detail::StringHash, std::equal_to<>>;
 
@@ -635,7 +639,7 @@ class Column<Categorical> {
         rebuild_index();
     }
 
-    Column(std::vector<std::string> dict, std::vector<code_type> codes)
+    Column(std::vector<std::string> dict, codes_storage codes)
         : dict_(std::make_shared<std::vector<std::string>>(std::move(dict))),
           index_(std::make_shared<index_map>()),
           codes_(std::move(codes)) {
@@ -643,13 +647,13 @@ class Column<Categorical> {
     }
 
     Column(std::shared_ptr<std::vector<std::string>> dict, std::shared_ptr<index_map> index,
-           std::vector<code_type> codes = {})
+           codes_storage codes = {})
         : dict_(std::move(dict)), index_(std::move(index)), codes_(std::move(codes)) {}
 
     Column(const Column& other)
         : dict_(other.dict_),
           index_(other.index_),
-          codes_(other.codes_are_external() ? std::vector<code_type>{} : other.codes_),
+          codes_(other.codes_are_external() ? codes_storage{} : other.codes_),
           external_codes_owner_(other.external_codes_owner_),
           codes_data_(other.codes_are_external() ? other.codes_data_ : nullptr),
           codes_offset_(other.codes_are_external() ? other.codes_offset_ : 0),
@@ -836,6 +840,12 @@ class Column<Categorical> {
         codes_.resize(count, 0);
     }
 
+    /// Resize without initializing new codes. Callers must write every one.
+    void resize_for_overwrite(size_type count) {
+        detach_codes();
+        codes_.resize(count);
+    }
+
     [[nodiscard]] auto dictionary() const -> const std::vector<std::string>& {
         materialize_dictionary();
         return *dict_;
@@ -851,7 +861,7 @@ class Column<Categorical> {
         return index_;
     }
 
-    [[nodiscard]] auto codes() const -> const std::vector<code_type>& {
+    [[nodiscard]] auto codes() const -> const codes_storage& {
         materialize_codes_cache();
         return codes_;
     }
@@ -963,7 +973,7 @@ class Column<Categorical> {
 
     mutable std::shared_ptr<std::vector<std::string>> dict_;
     mutable std::shared_ptr<index_map> index_;
-    mutable std::vector<code_type> codes_;
+    mutable codes_storage codes_;
     std::shared_ptr<const void> external_codes_owner_;
     const code_type* codes_data_ = nullptr;
     size_type codes_offset_ = 0;

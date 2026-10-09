@@ -2270,7 +2270,7 @@ TEST_CASE("E2E: a row-local update is parallelized inside the operator", "[e2e][
 
 TEST_CASE("E2E: categorical interpolation writes parallel string windows", "[e2e][parallel]") {
     constexpr std::size_t kRows = 1000;
-    std::vector<Column<Categorical>::code_type> codes;
+    Column<Categorical>::codes_storage codes;
     codes.reserve(kRows);
     runtime::ValidityBitmap validity;
     validity.reserve(kRows);

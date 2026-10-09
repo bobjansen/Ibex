@@ -434,7 +434,7 @@ inline auto build_categorical_column(const std::shared_ptr<arrow::ChunkedArray>&
     -> ibex::Column<ibex::Categorical> {
     std::vector<std::string> dict;
     std::map<std::string, std::int32_t, std::less<>> index;
-    std::vector<std::int32_t> codes;
+    ibex::Column<ibex::Categorical>::codes_storage codes;
     codes.reserve(static_cast<std::size_t>(chunked->length()));
 
     auto intern = [&](std::string value) -> std::int32_t {
@@ -1363,8 +1363,8 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
                                      const ibex::runtime::Selection* selection,
                                      const DirectDecodeGroups& groups,
                                      std::vector<std::string>& dictionary,
-                                     std::vector<std::int32_t>& codes, DirectValidity& validity)
-    -> std::size_t {
+                                     ibex::Column<ibex::Categorical>::codes_storage& codes,
+                                     DirectValidity& validity) -> std::size_t {
     std::map<std::string, std::int32_t, std::less<>> index;
     auto intern = [&](std::string value) {
         auto [it, inserted] = index.try_emplace(value, 0);
@@ -1813,7 +1813,7 @@ inline void sharded_dictionary(ShardedColumn& planned, int leaf_index,
                                const ibex::runtime::Selection* selection,
                                const DirectDecodeGroups& groups, std::size_t output_rows) {
     const auto num_shards = static_cast<std::size_t>(groups.end - groups.begin);
-    auto codes = std::make_shared<std::vector<std::int32_t>>(output_rows, 0);
+    auto codes = std::make_shared<ibex::Column<ibex::Categorical>::codes_storage>(output_rows, 0);
     auto local_dicts = std::make_shared<std::vector<std::vector<std::string>>>(num_shards);
     // {output_start, rows} per shard, in row-group order. A shard the
     // selection rejects entirely is never decoded and keeps {0, 0}, which
@@ -1828,7 +1828,7 @@ inline void sharded_dictionary(ShardedColumn& planned, int leaf_index,
                                std::size_t output_start, std::size_t rows) -> std::size_t {
         const auto shard = static_cast<std::size_t>(range.begin - groups_begin);
         DirectValidity validity(rows);
-        std::vector<std::int32_t> local_codes;
+        ibex::Column<ibex::Categorical>::codes_storage local_codes;
         local_codes.reserve(rows);
         const auto emitted = decode_dictionary_column(reader, leaf_index, selection, range,
                                                       (*local_dicts)[shard], local_codes, validity);
@@ -2060,7 +2060,7 @@ inline auto direct_column(parquet::arrow::FileReader& reader, const arrow::Field
         }
         case arrow::Type::DICTIONARY: {
             std::vector<std::string> dictionary;
-            std::vector<std::int32_t> codes;
+            ibex::Column<ibex::Categorical>::codes_storage codes;
             codes.reserve(output_rows);
             auto emitted = decode_dictionary_column(reader, leaf_index, selection, groups,
                                                     dictionary, codes, validity);

@@ -268,7 +268,7 @@ inline auto read(std::string_view path) -> ibex::runtime::Table {
             // Try categorical compression, on the same terms as every other
             // importer (see categorical_promotion_limit).
             const std::size_t max_uniques = ibex::categorical_promotion_limit(n_rows);
-            std::vector<ibex::Column<ibex::Categorical>::code_type> codes;
+            ibex::Column<ibex::Categorical>::codes_storage codes;
             codes.reserve(n_rows);
             std::vector<std::string> dict;
             dict.reserve(std::min(n_rows, max_uniques));

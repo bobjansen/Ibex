@@ -8111,7 +8111,20 @@ TEST_CASE("round in an update is range-native under a split", "[update][parallel
             return std::vector<std::int64_t>(col->begin(), col->end());
         };
 
-        CHECK(run(true) == run(false));
+        // The libm definition of each mode, so a shared kernel cannot agree
+        // with itself and be wrong.
+        const std::string m(mode);
+        std::vector<std::int64_t> expected;
+        expected.reserve(kRows);
+        for (const double x : std::get<Column<double>>(*registry.at("t").find("v"))) {
+            expected.push_back(m == "Nearest"   ? std::llround(x)
+                               : m == "Bankers" ? std::llrint(x)
+                               : m == "Floor"   ? static_cast<std::int64_t>(std::floor(x))
+                               : m == "Ceil"    ? static_cast<std::int64_t>(std::ceil(x))
+                                                : static_cast<std::int64_t>(std::trunc(x)));
+        }
+        CHECK(run(true) == expected);
+        CHECK(run(false) == expected);
     }
 }
 

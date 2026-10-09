@@ -523,7 +523,7 @@ struct NumericUpdateNode {
         Min,          ///< pmin(left, right) — element-wise minimum
         Max,          ///< pmax(left, right) — element-wise maximum
         UnaryDouble,  ///< dbl_fn(child) — row-wise double→double math (child = left)
-        UnaryToInt,   ///< int_fn(child as double) — round(x, mode): Double → Int (child = left)
+        UnaryToInt,   ///< round(child as double, round_mode): Double → Int (child = left)
     };
 
     Kind kind = Kind::IntLiteral;
@@ -536,7 +536,7 @@ struct NumericUpdateNode {
     std::int64_t int_lit = 0;
     double dbl_lit = 0.0;
     UnaryMath dbl_fn = UnaryMath::Abs;
-    std::int64_t (*int_fn)(double) = nullptr;
+    RoundMode round_mode = RoundMode::Nearest;
 };
 
 // round(x, mode)'s mode: the `RoundMode::Member` literal lowering writes, or
@@ -551,22 +551,54 @@ auto round_mode_arg(const ir::Expr& arg) -> std::optional<RoundMode> {
     return mode.has_value() ? std::optional(*mode) : std::nullopt;
 }
 
-// round(x, mode) → Int64: the mode's kernel, fixed at compile time. Mirrors
-// apply_round() exactly.
-auto lookup_round_int_fn(RoundMode mode) -> std::int64_t (*)(double) {
+/// round(x, mode) over `n` values into `dst` (Int64, or Double for a round
+/// nested in Double arithmetic). The mode is switched on once, outside the
+/// loop, so each loop is one inlined kernel that vectorises; a per-value call
+/// through a function pointer to libm's llround was what made the range-split
+/// path slower at two cores than one. Matches apply_round() exactly.
+template <typename Out>
+void round_into(const double* src, Out* dst, std::size_t n, RoundMode mode) {
+    const auto run = [&](auto kernel) {
+        for (std::size_t i = 0; i < n; ++i) {
+            dst[i] = static_cast<Out>(kernel(src[i]));
+        }
+    };
     switch (mode) {
         case RoundMode::Nearest:
-            return [](double v) { return static_cast<std::int64_t>(std::llround(v)); };
+            // Round half away from zero, branchless so the loop vectorises
+            // (trunc/fabs/copysign → vroundpd/vandpd/vorpd) instead of calling
+            // libm llround per element. Exact: frac = v - trunc(v) is computed
+            // without error for |v| < 2^52, and |frac| >= 0.5 is the exact
+            // away-from-zero test (avoids the floor(v+0.5) double-rounding bug at
+            // v = nextafter(0.5, 0)). For |v| >= 2^52 v is already integral,
+            // frac is 0, and the result is v — matching llround.
+            run([](double v) {
+                const double t = std::trunc(v);
+                const double frac = v - t;
+                return static_cast<std::int64_t>(std::fabs(frac) >= 0.5 ? t + std::copysign(1.0, v)
+                                                                        : t);
+            });
+            return;
         case RoundMode::Bankers:
-            return [](double v) { return static_cast<std::int64_t>(std::llrint(v)); };
+            run([](double v) { return static_cast<std::int64_t>(std::llrint(v)); });
+            return;
         case RoundMode::Floor:
-            return [](double v) { return static_cast<std::int64_t>(std::floor(v)); };
+            run([](double v) { return static_cast<std::int64_t>(std::floor(v)); });
+            return;
         case RoundMode::Ceil:
-            return [](double v) { return static_cast<std::int64_t>(std::ceil(v)); };
+            run([](double v) { return static_cast<std::int64_t>(std::ceil(v)); });
+            return;
         case RoundMode::Trunc:
-            break;
+            run([](double v) { return static_cast<std::int64_t>(std::trunc(v)); });
+            return;
     }
-    return [](double v) { return static_cast<std::int64_t>(std::trunc(v)); };
+}
+
+/// round(v, mode) for one value, through the same kernels as `round_into`.
+auto round_one(double v, RoundMode mode) -> std::int64_t {
+    std::int64_t out = 0;
+    round_into(&v, &out, 1, mode);
+    return out;
 }
 
 // Materialize `src` as a Column<int64_t> (want == Int) or Column<double>
@@ -761,7 +793,7 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
             if (!mode.has_value()) {
                 return std::nullopt;
             }
-            auto* kern = lookup_round_int_fn(*mode);
+
             auto child = try_compile_numeric_update_expr(*call->args[0], input, scalars, nodes,
                                                          temps, range);
             if (!child.has_value()) {
@@ -771,7 +803,7 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
             node.kind = NumericUpdateNode::Kind::UnaryToInt;
             node.type = ExprType::Int;
             node.left = *child;
-            node.int_fn = kern;
+            node.round_mode = *mode;
             nodes.push_back(node);
             return static_cast<std::uint32_t>(nodes.size() - 1);
         }
@@ -1030,12 +1062,10 @@ auto eval_numeric_double_node_block(const NumericUpdateNode& node, std::uint32_t
         case NumericUpdateNode::Kind::UnaryToInt: {
             const auto src = values[node.left];
             if (src.data == nullptr) {
-                value = NumericBlockValue<double>{.scalar =
-                                                      static_cast<double>(node.int_fn(src.scalar))};
+                value = NumericBlockValue<double>{
+                    .scalar = static_cast<double>(round_one(src.scalar, node.round_mode))};
             } else {
-                for (std::size_t i = 0; i < count; ++i) {
-                    dst[i] = static_cast<double>(node.int_fn(src.data[i]));
-                }
+                round_into(src.data, dst, count, node.round_mode);
                 value = NumericBlockValue<double>{.data = dst};
             }
             return;
@@ -1100,11 +1130,10 @@ auto eval_numeric_int_node_block(const NumericUpdateNode& node, std::uint32_t id
         case NumericUpdateNode::Kind::UnaryToInt: {
             const auto src = double_values[node.left];
             if (src.data == nullptr) {
-                value = NumericBlockValue<std::int64_t>{.scalar = node.int_fn(src.scalar)};
+                value = NumericBlockValue<std::int64_t>{.scalar =
+                                                            round_one(src.scalar, node.round_mode)};
             } else {
-                for (std::size_t i = 0; i < count; ++i) {
-                    dst[i] = node.int_fn(src.data[i]);
-                }
+                round_into(src.data, dst, count, node.round_mode);
                 value = NumericBlockValue<std::int64_t>{.data = dst};
             }
             return;
@@ -1331,34 +1360,7 @@ auto try_fast_update_unary(const ir::Expr& expr, const Table& input, RowRange ra
         const double* src = std::get<Column<double>>(*arg->column).data() + begin;
         Column<std::int64_t> out;
         out.resize_for_overwrite(rows);
-        std::int64_t* dst = out.data();
-        auto run = [&](auto k) {
-            for (std::size_t i = 0; i < rows; ++i)
-                dst[i] = k(src[i]);
-        };
-        if (*mode == RoundMode::Nearest) {
-            // Round half away from zero, branchless so the loop vectorises
-            // (trunc/fabs/copysign → vroundpd/vandpd/vorpd) instead of calling
-            // libm llround per element. Exact: frac = v - trunc(v) is computed
-            // without error for |v| < 2^52, and |frac| >= 0.5 is the exact
-            // away-from-zero test (avoids the floor(v+0.5) double-rounding bug at
-            // v = nextafter(0.5, 0)). For |v| >= 2^52 v is already integral, frac
-            // is 0, and the result is v — matching llround.
-            run([](double v) {
-                const double t = std::trunc(v);
-                const double frac = v - t;
-                return static_cast<std::int64_t>(std::fabs(frac) >= 0.5 ? t + std::copysign(1.0, v)
-                                                                        : t);
-            });
-        } else if (*mode == RoundMode::Bankers) {
-            run([](double v) { return static_cast<std::int64_t>(std::llrint(v)); });
-        } else if (*mode == RoundMode::Floor) {
-            run([](double v) { return static_cast<std::int64_t>(std::floor(v)); });
-        } else if (*mode == RoundMode::Ceil) {
-            run([](double v) { return static_cast<std::int64_t>(std::ceil(v)); });
-        } else {
-            run([](double v) { return static_cast<std::int64_t>(std::trunc(v)); });
-        }
+        round_into(src, out.data(), rows, *mode);
         return ColumnValue{std::move(out)};
     }
 

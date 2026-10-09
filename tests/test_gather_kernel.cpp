@@ -27,6 +27,8 @@
 #include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -276,5 +278,86 @@ TEST_CASE("kernel validity gather handles an externally offset source and adjoin
     for (std::size_t i = 0; i < 100; ++i) {
         CAPTURE(i);
         CHECK(dst[3 + i] == (i % 3 != 1));
+    }
+}
+
+TEST_CASE("word-block gather keeps every survivor at every density and stays in its window",
+          "[runtime][gather]") {
+    namespace kernel = ibex::runtime::kernel;
+    // Words cycle through the densities that pick each path (empty, sparse,
+    // either side of the vector threshold, dense, full). Every rotation of the
+    // cycle is tried, so each density ends each window: that is where a vector
+    // store overhanging its window would show, with no later word to cover it.
+    const std::uint64_t patterns[] = {0,
+                                      1,
+                                      0x8000000000000000ULL,
+                                      0x5555,
+                                      0xFFFF,
+                                      0x1FFFF,
+                                      0xFF00FF00,
+                                      0xAAAAAAAAAAAAAAAAULL,
+                                      0x0123456789ABCDEFULL,
+                                      0x7FFFFFFFFFFFFFFFULL,
+                                      ~std::uint64_t{0}};
+    constexpr std::size_t kWords = 48;
+    constexpr std::size_t kSplit = kWords / 2;
+
+    const auto check = [&]<typename T>(T marker, std::size_t rows, std::size_t rotation) {
+        CAPTURE(sizeof(T), rows, rotation);
+        std::vector<std::uint64_t> words(kWords);
+        for (std::size_t w = 0; w < kWords; ++w) {
+            words[w] = patterns[(w + rotation) % std::size(patterns)];
+        }
+        if (rows % 64 != 0) {
+            words.back() &= (std::uint64_t{1} << (rows % 64)) - 1;  // ragged last word
+        }
+        std::vector<T> src(rows);
+        for (std::size_t r = 0; r < rows; ++r) {
+            src[r] = static_cast<T>((static_cast<std::int64_t>(r) * 3) + 1);
+        }
+        std::vector<T> expected;
+        for (std::size_t r = 0; r < rows; ++r) {
+            if (((words[r / 64] >> (r % 64)) & 1U) != 0) {
+                expected.push_back(src[r]);
+            }
+        }
+        const std::size_t kept = expected.size();
+        const kernel::ColumnView<T> view(src.data(), src.size(), nullptr);
+
+        // One exact-size window: nothing may land past `kept`.
+        std::vector<T> out(kept + 16, marker);
+        kernel::gather_selected(
+            view, kernel::RowWordBlocks{.words = words.data(), .word_count = kWords, .row_base = 0},
+            kernel::OutputSpan<T>{.data = out.data(), .begin = 0, .count = kept});
+        CHECK(std::vector<T>(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(kept)) ==
+              expected);
+        CHECK(std::ranges::all_of(out.begin() + static_cast<std::ptrdiff_t>(kept), out.end(),
+                                  [&](T v) { return v == marker; }));
+
+        // Two adjoining windows, the right one written first: an overhanging
+        // store from the left window would clobber what the right one wrote.
+        std::size_t left_kept = 0;
+        for (std::size_t w = 0; w < kSplit; ++w) {
+            left_kept += static_cast<std::size_t>(std::popcount(words[w]));
+        }
+        std::vector<T> joined(kept, marker);
+        kernel::gather_selected(
+            view,
+            kernel::RowWordBlocks{.words = words.data() + kSplit,
+                                  .word_count = kWords - kSplit,
+                                  .row_base = kSplit * 64},
+            kernel::OutputSpan<T>{
+                .data = joined.data(), .begin = left_kept, .count = kept - left_kept});
+        kernel::gather_selected(
+            view, kernel::RowWordBlocks{.words = words.data(), .word_count = kSplit, .row_base = 0},
+            kernel::OutputSpan<T>{.data = joined.data(), .begin = 0, .count = left_kept});
+        CHECK(joined == expected);
+    };
+    for (const std::size_t rows : {kWords * 64, ((kWords - 1) * 64) + 37}) {
+        for (std::size_t rotation = 0; rotation < std::size(patterns); ++rotation) {
+            check(double{-1.0}, rows, rotation);
+            check(std::int64_t{-1}, rows, rotation);
+            check(std::int32_t{-1}, rows, rotation);
+        }
     }
 }

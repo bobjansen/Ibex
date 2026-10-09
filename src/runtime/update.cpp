@@ -4714,9 +4714,9 @@ auto try_fused_literal_guard(const Table& input, const ir::UpdateNode& update,
 
 namespace {
 
-/// The fused path of `apply_guarded_update` for one Float64 field the block
-/// tree computes: `where g update { y = f }` evaluated a block of rows at a
-/// time, the guard for the block, then the value tree into the output, then
+/// The fused path of `apply_guarded_update` for Float64 fields the block tree
+/// computes: `where g update { y = f, ... }` evaluated a block of rows at a
+/// time, the guard for the block, then each value tree into its output, then
 /// the rows the guard rejects put back to the old value (or 0 and null for a
 /// new column), all while the block is in cache. No table-sized mask is built:
 /// the mask path wrote one for every row, and its parallel form copied it
@@ -4730,62 +4730,89 @@ namespace {
 auto try_fused_guarded_tree(const Table& input, const ir::UpdateNode& update,
                             const ScalarRegistry* scalars, const ExecutionContext& exec,
                             bool parallel) -> std::optional<std::expected<Table, std::string>> {
-    if (update.fields().size() != 1 || !is_range_native_expr(*update.guard())) {
+    const auto& fields = update.fields();
+    if (fields.empty() || !is_range_native_expr(*update.guard())) {
         return std::nullopt;
     }
-    const auto& field = update.fields().front();
-    // A literal has its own path, which copies the old column once.
-    if (std::holds_alternative<ir::Literal>(field.expr.node)) {
-        return std::nullopt;
-    }
-    if (ir::is_subset_evaluable_expr(field.expr) && !is_speculation_safe(field.expr, input)) {
-        return std::nullopt;
-    }
-    robin_hood::unordered_set<std::string> refs;
-    ir::collect_expr_column_refs(field.expr, refs);
-    for (const auto& name : refs) {
-        const auto* entry = input.find_entry(name);
-        if (entry == nullptr || entry->validity.has_value()) {
-            return std::nullopt;
-        }
-    }
-    const ColumnEntry* old_entry = input.find_entry(field.alias);
-    if (old_entry != nullptr && (!std::holds_alternative<Column<double>>(*old_entry->column) ||
-                                 old_entry->validity.has_value())) {
-        return std::nullopt;
-    }
-    const PredicateInput source(input);
-    const auto plan = kernel::try_plan_direct_numeric_tree(field.expr, source, scalars,
-                                                           kernel::ShiftedReads::Allow);
-    if (!plan.has_value() || plan->type != ExprType::Double) {
+    // A lone literal has its own path, which copies the old column once.
+    if (fields.size() == 1 && std::holds_alternative<ir::Literal>(fields.front().expr.node)) {
         return std::nullopt;
     }
 
+    // Every field's tree reads the input as it was. That is what the general
+    // path does for a field it restricts to the matched rows (they read one
+    // snapshot, taken at the first such field), but a field it cannot restrict
+    // reads the table as the fields before it left it. So a field may read a
+    // column an earlier field writes only while every field so far is one the
+    // general path restricts: then that snapshot is the input itself.
+    struct FieldPlan {
+        const ir::FieldSpec* field = nullptr;
+        kernel::DirectNumericTreePlan plan;
+        const double* old_data = nullptr;
+        bool may_be_null = false;
+        Column<double> out;
+        ValidityBitmap valid;
+        std::atomic<bool> saw_invalid{false};
+    };
     const std::size_t n = input.rows();
-    Column<double> out;
-    out.resize_for_overwrite(n);
-    double* dst = out.data();
-    const double* old_data =
-        old_entry != nullptr ? std::get<Column<double>>(*old_entry->column).data() : nullptr;
-    // Nulls can only come from a new column's unmatched rows or the value's
-    // own null rows (a shift's edge); otherwise no bitmap is built.
-    const bool may_be_null = old_data == nullptr || has_shift_call(field.expr);
-    ValidityBitmap valid(may_be_null ? n : 0, true);
-    std::uint64_t* valid_words = valid.words_data();
-    std::atomic<bool> saw_invalid{false};
+    const PredicateInput source(input);
+    std::vector<std::unique_ptr<FieldPlan>> plans;
+    plans.reserve(fields.size());
+    robin_hood::unordered_set<std::string> written;
+    bool all_restricted = true;
+    for (const auto& field : fields) {
+        const bool restricted = ir::is_subset_evaluable_expr(field.expr);
+        all_restricted = all_restricted && restricted;
+        if (restricted && !is_speculation_safe(field.expr, input)) {
+            return std::nullopt;
+        }
+        robin_hood::unordered_set<std::string> refs;
+        ir::collect_expr_column_refs(field.expr, refs);
+        for (const auto& name : refs) {
+            const auto* entry = input.find_entry(name);
+            if (entry == nullptr || entry->validity.has_value() ||
+                (!all_restricted && written.contains(name))) {
+                return std::nullopt;
+            }
+        }
+        if (!written.insert(field.alias).second) {
+            return std::nullopt;  // one alias written twice
+        }
+        const ColumnEntry* old_entry = input.find_entry(field.alias);
+        if (old_entry != nullptr && (!std::holds_alternative<Column<double>>(*old_entry->column) ||
+                                     old_entry->validity.has_value())) {
+            return std::nullopt;
+        }
+        auto plan = kernel::try_plan_direct_numeric_tree(field.expr, source, scalars,
+                                                         kernel::ShiftedReads::Allow);
+        if (!plan.has_value() || plan->type != ExprType::Double) {
+            return std::nullopt;
+        }
+        auto fp = std::make_unique<FieldPlan>();
+        fp->field = &field;
+        fp->plan = std::move(*plan);
+        fp->old_data =
+            old_entry != nullptr ? std::get<Column<double>>(*old_entry->column).data() : nullptr;
+        // Nulls can only come from a new column's unmatched rows or the value's
+        // own null rows (a shift's edge); otherwise no bitmap is built.
+        fp->may_be_null = fp->old_data == nullptr || has_shift_call(field.expr);
+        fp->out.resize_for_overwrite(n);
+        fp->valid = ValidityBitmap(fp->may_be_null ? n : 0, true);
+        plans.push_back(std::move(fp));
+    }
+
     std::mutex error_mutex;
     std::optional<std::string> error;
     // The guard is computed a span at a time, so its mask stays in cache
     // instead of being written for the whole table and read back; within a
-    // span the value tree and the select run a block at a time, so the block
-    // they write is still in L1 when the select reads it back. Both sizes are
-    // multiples of 64, and ranges start on a 64-row boundary, so every block
-    // owns whole validity words.
+    // span each field's value tree and select run a block at a time, so the
+    // block they write is still in L1 when the select reads it back. Both
+    // sizes are multiples of 64, and ranges start on a 64-row boundary, so
+    // every block owns whole validity words.
     constexpr std::size_t kSpan = 16384;
     constexpr std::size_t kBlock = 1024;
     constexpr std::size_t kBits = 64;
     const auto run_span = [&](std::size_t begin, std::size_t end) -> bool {
-        bool local_invalid = false;
         auto mask = compute_mask(*update.guard(), input, scalars,
                                  RowRange{.begin = begin, .count = end - begin});
         if (!mask) {
@@ -4802,51 +4829,59 @@ auto try_fused_guarded_tree(const Table& input, const ir::UpdateNode& update,
                 hits[i] = static_cast<std::uint8_t>(hits[i] != 0 && hit_valid[i] != 0);
             }
         }
-        for (std::size_t b = begin; b < end; b += kBlock) {
-            const std::size_t len = std::min(kBlock, end - b);
-            const RowRange block{.begin = b, .count = len};
-            (void)kernel::write_direct_numeric_tree_range(*plan, block, {.doubles = dst + b});
-            const std::uint8_t* hit = hits + (b - begin);
-            double* row = dst + b;
-            if (old_data != nullptr) {
-                const double* old_row = old_data + b;
-                // Both sides loaded unconditionally, so the select is a vector
-                // blend; written as `hit ? row[i] : old_row[i]` it compiled to
-                // a per-row pointer pick and scalar load (36 vs 25 ms).
-                for (std::size_t i = 0; i < len; ++i) {
-                    const double fresh = row[i];
-                    const double old = old_row[i];
-                    row[i] = hit[i] != 0 ? fresh : old;
+        for (const auto& fp : plans) {
+            bool local_invalid = false;
+            double* dst = fp->out.data();
+            const double* old_data = fp->old_data;
+            std::uint64_t* valid_words = fp->valid.words_data();
+            for (std::size_t b = begin; b < end; b += kBlock) {
+                const std::size_t len = std::min(kBlock, end - b);
+                const RowRange block{.begin = b, .count = len};
+                (void)kernel::write_direct_numeric_tree_range(fp->plan, block,
+                                                              {.doubles = dst + b});
+                const std::uint8_t* hit = hits + (b - begin);
+                double* row = dst + b;
+                if (old_data != nullptr) {
+                    const double* old_row = old_data + b;
+                    // Both sides loaded unconditionally, so the select is a
+                    // vector blend; written as `hit ? row[i] : old_row[i]` it
+                    // compiled to a per-row pointer pick and scalar load (36 vs
+                    // 25 ms at one core).
+                    for (std::size_t i = 0; i < len; ++i) {
+                        const double fresh = row[i];
+                        const double old = old_row[i];
+                        row[i] = hit[i] != 0 ? fresh : old;
+                    }
+                } else {
+                    for (std::size_t i = 0; i < len; ++i) {
+                        row[i] = hit[i] != 0 ? row[i] : 0.0;
+                    }
                 }
-            } else {
-                for (std::size_t i = 0; i < len; ++i) {
-                    row[i] = hit[i] != 0 ? row[i] : 0.0;
+                if (!fp->may_be_null) {
+                    continue;
+                }
+                // Null rows of the value itself: a shift's edge.
+                const auto value_valid = collect_expr_validity(fp->field->expr, source, block);
+                for (std::size_t w = 0; w * kBits < len; ++w) {
+                    const std::size_t base = w * kBits;
+                    const std::size_t count = std::min(kBits, len - base);
+                    const std::uint64_t all =
+                        count == kBits ? ~std::uint64_t{0} : ((std::uint64_t{1} << count) - 1);
+                    std::uint64_t m = 0;
+                    for (std::size_t k = 0; k < count; ++k) {
+                        m |= static_cast<std::uint64_t>(hit[base + k] != 0) << k;
+                    }
+                    const std::uint64_t value_bits =
+                        value_valid.has_value() ? value_valid->words_data()[w] & all : all;
+                    const std::uint64_t old_bits = old_data != nullptr ? all : 0;
+                    const std::uint64_t merged = ((m & value_bits) | (~m & old_bits)) & all;
+                    valid_words[(b + base) / kBits] = merged;
+                    local_invalid = local_invalid || merged != all;
                 }
             }
-            if (!may_be_null) {
-                continue;
+            if (local_invalid) {
+                fp->saw_invalid.store(true, std::memory_order_relaxed);
             }
-            // Null rows of the value itself: a shift's edge.
-            const auto value_valid = collect_expr_validity(field.expr, source, block);
-            for (std::size_t w = 0; w * kBits < len; ++w) {
-                const std::size_t base = w * kBits;
-                const std::size_t count = std::min(kBits, len - base);
-                const std::uint64_t all =
-                    count == kBits ? ~std::uint64_t{0} : ((std::uint64_t{1} << count) - 1);
-                std::uint64_t m = 0;
-                for (std::size_t k = 0; k < count; ++k) {
-                    m |= static_cast<std::uint64_t>(hit[base + k] != 0) << k;
-                }
-                const std::uint64_t value_bits =
-                    value_valid.has_value() ? value_valid->words_data()[w] & all : all;
-                const std::uint64_t old_bits = old_data != nullptr ? all : 0;
-                const std::uint64_t merged = ((m & value_bits) | (~m & old_bits)) & all;
-                valid_words[(b + base) / kBits] = merged;
-                local_invalid = local_invalid || merged != all;
-            }
-        }
-        if (local_invalid) {
-            saw_invalid.store(true, std::memory_order_relaxed);
         }
         return true;
     };
@@ -4861,15 +4896,17 @@ auto try_fused_guarded_tree(const Table& input, const ir::UpdateNode& update,
         return std::unexpected(std::move(*error));
     }
     Table output = input;
-    ColumnValue values{std::move(out)};
-    auto target = prepare_guarded_write(output, field.alias, values);
-    if (!target.has_value()) {
-        return std::unexpected(std::move(target.error()));
+    for (const auto& fp : plans) {
+        ColumnValue values{std::move(fp->out)};
+        auto target = prepare_guarded_write(output, fp->field->alias, values);
+        if (!target.has_value()) {
+            return std::unexpected(std::move(target.error()));
+        }
+        write_guarded_update(output, fp->field->alias, *target, std::move(values),
+                             fp->saw_invalid.load(std::memory_order_relaxed)
+                                 ? std::optional<ValidityBitmap>{std::move(fp->valid)}
+                                 : std::nullopt);
     }
-    write_guarded_update(output, field.alias, *target, std::move(values),
-                         saw_invalid.load(std::memory_order_relaxed)
-                             ? std::optional<ValidityBitmap>{std::move(valid)}
-                             : std::nullopt);
     return output;
 }
 

@@ -9821,6 +9821,68 @@ TEST_CASE("guarded update computes its guard per block, lag and lead included",
     }
 }
 
+TEST_CASE("guarded update with several fields keeps each field's view of the table",
+          "[update][guarded][parallel]") {
+    constexpr std::size_t kRows = 5000;
+    Column<double> price;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        price.push_back(i == 0 ? 999.0 : static_cast<double>((i * 7919) % 1000));
+    }
+    runtime::TableRegistry registry;
+    {
+        runtime::Table t;
+        t.add_column("price", price);
+        registry.emplace("t", std::move(t));
+    }
+    const auto hot = [&](std::size_t r) { return price[r] > 600.0; };
+    const auto updated = [&](std::size_t r) { return hot(r) ? price[r] * 0.9 : price[r]; };
+
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+    parallel.parallel_grain = 640;
+    const auto run = [&](const char* query, const runtime::ExecutionContext& exec) {
+        auto ir = require_ir(query);
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        return std::move(*out);
+    };
+    // Count rows where `column` differs from `expected` (nullopt = null).
+    const auto wrong_in = [&](const runtime::Table& out, const char* column,
+                              const std::function<std::optional<double>(std::size_t)>& expected) {
+        const auto* entry = out.find_entry(column);
+        REQUIRE(entry != nullptr);
+        const auto& values = std::get<Column<double>>(*entry->column);
+        std::size_t wrong = 0;
+        for (std::size_t r = 0; r < kRows; ++r) {
+            const auto want = expected(r);
+            const bool null = runtime::is_null(*entry, r);
+            wrong += want.has_value() ? (null || values[r] != *want ? 1U : 0U) : (null ? 0U : 1U);
+        }
+        return wrong;
+    };
+    for (const auto* exec : {&serial, &parallel}) {
+        INFO((exec == &serial ? "serial" : "parallel"));
+        // Both fields read the price the update started from.
+        const auto both =
+            run("t[where price > 600.0 update { price = price * 0.9, excess = price - 600.0 }];",
+                *exec);
+        CHECK(wrong_in(both, "price", [&](std::size_t r) { return updated(r); }) == 0);
+        CHECK(wrong_in(both, "excess", [&](std::size_t r) -> std::optional<double> {
+                  return hot(r) ? std::optional(price[r] - 600.0) : std::nullopt;
+              }) == 0);
+        // A field the update cannot restrict to its matched rows reads the
+        // table as the fields before it left it: lag sees the new price.
+        const auto mixed = run(
+            "t[where price > 600.0 update { price = price * 0.9, prev = lag(price, 1) }];", *exec);
+        CHECK(wrong_in(mixed, "prev", [&](std::size_t r) -> std::optional<double> {
+                  return hot(r) && r > 0 ? std::optional(updated(r - 1)) : std::nullopt;
+              }) == 0);
+    }
+}
+
 TEST_CASE("update fuses lag and lead into arithmetic, serial and parallel",
           "[update][lag][parallel]") {
     constexpr std::size_t kRows = 5000;

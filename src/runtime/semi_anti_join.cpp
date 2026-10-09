@@ -708,6 +708,18 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                     }
                 }
             }
+            if (one_dictionary) {
+                // A probe whose categorical key has another dictionary (two
+                // tables built apart) matches by text through `right_strings_`,
+                // so it needs the strings too. Without them it matched nothing:
+                // a semi join kept no row and an anti join every row. One entry
+                // per distinct code, so never more than the dictionary.
+                const auto& dict = first_cat->dictionary();
+                for (const auto code : right_cat_codes_) {
+                    owned_strings_.emplace_back(dict[static_cast<std::size_t>(code)]);
+                    right_strings_.insert(std::string_view{owned_strings_.back()});
+                }
+            }
             return std::nullopt;
         }
         if (std::holds_alternative<Column<std::string>>(key)) {

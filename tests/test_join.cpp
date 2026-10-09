@@ -3166,3 +3166,34 @@ TEST_CASE("join: a parallel unique-key inner join gives the serial rows in order
     }
     CHECK(wrong == 0);
 }
+
+TEST_CASE("semi and anti join match categorical keys whose dictionaries differ",
+          "[join][semi][anti]") {
+    // Built apart, the two key columns get their own dictionaries; the right
+    // one also lists its values in another order.
+    Column<Categorical> left_key;
+    for (const char* v : {"a", "b", "c", "a", "d", "b"}) {
+        left_key.push_back(v);
+    }
+    Column<Categorical> right_key;
+    for (const char* v : {"b", "a", "b"}) {
+        right_key.push_back(v);
+    }
+    runtime::TableRegistry registry;
+    {
+        runtime::Table left;
+        left.add_column("k", left_key);
+        left.add_column("i", Column<std::int64_t>{0, 1, 2, 3, 4, 5});
+        registry.emplace("l", std::move(left));
+        runtime::Table right;
+        right.add_column("k", right_key);
+        registry.emplace("r", std::move(right));
+    }
+    const auto rows_of = [&](const char* query) {
+        const auto out = interpret_expr(query, registry);
+        const auto& ids = std::get<Column<std::int64_t>>(*out.find("i"));
+        return std::vector<std::int64_t>(ids.begin(), ids.end());
+    };
+    CHECK(rows_of("l semi join r on k;") == std::vector<std::int64_t>{0, 1, 3, 5});
+    CHECK(rows_of("l anti join r on k;") == std::vector<std::int64_t>{2, 4});
+}

@@ -9734,6 +9734,93 @@ TEST_CASE("left join: a parallel gather of every column type gives the serial an
 // generic aggregate's arithmetic, so its bits must be the hand-computed ones.
 // Nulls are skipped, a group with fewer than two values is null, and the result
 // may not depend on how many workers claimed groups.
+TEST_CASE("guarded update computes its guard per block, lag and lead included",
+          "[update][guarded][parallel]") {
+    constexpr std::size_t kRows = 5000;
+    Column<double> price;
+    Column<double> g;
+    Column<double> y;
+    runtime::ValidityBitmap g_valid(kRows, true);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        // Row 0 and the last row pass `price > 600`, so lag's and lead's
+        // boundary nulls land on matched rows.
+        price.push_back(i == 0 || i == kRows - 1 ? 999.0 : static_cast<double>((i * 7919) % 1000));
+        g.push_back(static_cast<double>((i * 31) % 97) - 40.0);
+        y.push_back(static_cast<double>(i) * 0.5);
+        if (i % 11 == 0) {
+            g_valid.set(i, false);
+        }
+    }
+    runtime::TableRegistry registry;
+    {
+        runtime::Table t;
+        t.add_column("price", price);
+        t.add_column("g", g, g_valid);
+        t.add_column("y", y);
+        registry.emplace("t", std::move(t));
+    }
+    const auto at = [&](std::size_t r, std::int64_t shift) -> std::optional<std::size_t> {
+        const auto s = static_cast<std::int64_t>(r) + shift;
+        if (s < 0 || s >= static_cast<std::int64_t>(kRows)) {
+            return std::nullopt;
+        }
+        return static_cast<std::size_t>(s);
+    };
+    const auto hot = [&](std::size_t r) { return price[r] > 600.0; };
+    // The expected value of the written column at row r, nullopt for null.
+    using Expected = std::function<std::optional<double>(std::size_t)>;
+    const std::vector<std::tuple<const char*, const char*, Expected>> cases = {
+        {"t[where price > 600.0 update { price = price * 0.9 }];", "price",
+         [&](std::size_t r) -> std::optional<double> {
+             return hot(r) ? price[r] * 0.9 : price[r];
+         }},
+        {"t[where price > 600.0 update { prev = lag(price, 1) }];", "prev",
+         [&](std::size_t r) -> std::optional<double> {
+             const auto s = at(r, -1);
+             return hot(r) && s ? std::optional(price[*s]) : std::nullopt;
+         }},
+        {"t[where g > 0.0 update { y = price - lag(price, 2) }];", "y",
+         [&](std::size_t r) -> std::optional<double> {
+             if (!g_valid[r] || !(g[r] > 0.0)) {
+                 return y[r];  // unmatched keeps the old value
+             }
+             const auto s = at(r, -2);
+             return s ? std::optional(price[r] - price[*s]) : std::nullopt;
+         }},
+        {"t[where price > 600.0 update { z = lead(price, 1) + 1.0 }];", "z",
+         [&](std::size_t r) -> std::optional<double> {
+             const auto s = at(r, 1);
+             return hot(r) && s ? std::optional(price[*s] + 1.0) : std::nullopt;
+         }},
+    };
+
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+    parallel.parallel_grain = 640;
+    for (const auto& [query, column, expected] : cases) {
+        for (const auto* exec : {&serial, &parallel}) {
+            INFO(query << (exec == &serial ? " serial" : " parallel"));
+            auto ir = require_ir(query);
+            auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, *exec);
+            REQUIRE(out.has_value());
+            const auto* entry = out->find_entry(column);
+            REQUIRE(entry != nullptr);
+            const auto& values = std::get<Column<double>>(*entry->column);
+            std::size_t wrong = 0;
+            for (std::size_t r = 0; r < kRows; ++r) {
+                const auto want = expected(r);
+                const bool null = runtime::is_null(*entry, r);
+                wrong +=
+                    want.has_value() ? (null || values[r] != *want ? 1U : 0U) : (null ? 0U : 1U);
+            }
+            CHECK(wrong == 0);
+        }
+    }
+}
+
 TEST_CASE("update fuses lag and lead into arithmetic, serial and parallel",
           "[update][lag][parallel]") {
     constexpr std::size_t kRows = 5000;

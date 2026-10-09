@@ -4712,6 +4712,169 @@ auto try_fused_literal_guard(const Table& input, const ir::UpdateNode& update,
 
 }  // namespace
 
+namespace {
+
+/// The fused path of `apply_guarded_update` for one Float64 field the block
+/// tree computes: `where g update { y = f }` evaluated a block of rows at a
+/// time, the guard for the block, then the value tree into the output, then
+/// the rows the guard rejects put back to the old value (or 0 and null for a
+/// new column), all while the block is in cache. No table-sized mask is built:
+/// the mask path wrote one for every row, and its parallel form copied it
+/// again, before the blend read it back.
+///
+/// `f` may read neighbouring rows (`lag(price, 1)`). That is only correct
+/// because the tree runs over every row of the whole table, which is how the
+/// general path evaluates a field it cannot restrict to the matching rows. A
+/// field it can restrict must also be speculation-safe, so computing it on a
+/// rejected row has no effect anyone can see.
+auto try_fused_guarded_tree(const Table& input, const ir::UpdateNode& update,
+                            const ScalarRegistry* scalars, const ExecutionContext& exec,
+                            bool parallel) -> std::optional<std::expected<Table, std::string>> {
+    if (update.fields().size() != 1 || !is_range_native_expr(*update.guard())) {
+        return std::nullopt;
+    }
+    const auto& field = update.fields().front();
+    // A literal has its own path, which copies the old column once.
+    if (std::holds_alternative<ir::Literal>(field.expr.node)) {
+        return std::nullopt;
+    }
+    if (ir::is_subset_evaluable_expr(field.expr) && !is_speculation_safe(field.expr, input)) {
+        return std::nullopt;
+    }
+    robin_hood::unordered_set<std::string> refs;
+    ir::collect_expr_column_refs(field.expr, refs);
+    for (const auto& name : refs) {
+        const auto* entry = input.find_entry(name);
+        if (entry == nullptr || entry->validity.has_value()) {
+            return std::nullopt;
+        }
+    }
+    const ColumnEntry* old_entry = input.find_entry(field.alias);
+    if (old_entry != nullptr && (!std::holds_alternative<Column<double>>(*old_entry->column) ||
+                                 old_entry->validity.has_value())) {
+        return std::nullopt;
+    }
+    const PredicateInput source(input);
+    const auto plan = kernel::try_plan_direct_numeric_tree(field.expr, source, scalars,
+                                                           kernel::ShiftedReads::Allow);
+    if (!plan.has_value() || plan->type != ExprType::Double) {
+        return std::nullopt;
+    }
+
+    const std::size_t n = input.rows();
+    Column<double> out;
+    out.resize_for_overwrite(n);
+    double* dst = out.data();
+    const double* old_data =
+        old_entry != nullptr ? std::get<Column<double>>(*old_entry->column).data() : nullptr;
+    // Nulls can only come from a new column's unmatched rows or the value's
+    // own null rows (a shift's edge); otherwise no bitmap is built.
+    const bool may_be_null = old_data == nullptr || has_shift_call(field.expr);
+    ValidityBitmap valid(may_be_null ? n : 0, true);
+    std::uint64_t* valid_words = valid.words_data();
+    std::atomic<bool> saw_invalid{false};
+    std::mutex error_mutex;
+    std::optional<std::string> error;
+    // The guard is computed a span at a time, so its mask stays in cache
+    // instead of being written for the whole table and read back; within a
+    // span the value tree and the select run a block at a time, so the block
+    // they write is still in L1 when the select reads it back. Both sizes are
+    // multiples of 64, and ranges start on a 64-row boundary, so every block
+    // owns whole validity words.
+    constexpr std::size_t kSpan = 16384;
+    constexpr std::size_t kBlock = 1024;
+    constexpr std::size_t kBits = 64;
+    const auto run_span = [&](std::size_t begin, std::size_t end) -> bool {
+        bool local_invalid = false;
+        auto mask = compute_mask(*update.guard(), input, scalars,
+                                 RowRange{.begin = begin, .count = end - begin});
+        if (!mask) {
+            const std::scoped_lock lock(error_mutex);
+            error = std::move(mask.error());
+            return false;
+        }
+        // "Matched" is true and not null; fold the guard's nulls in only when
+        // it has any, so the select below reads one byte per row.
+        std::uint8_t* hits = mask->value.data();
+        if (mask->valid.has_value()) {
+            const std::uint8_t* hit_valid = mask->valid->data();
+            for (std::size_t i = 0; i < end - begin; ++i) {
+                hits[i] = static_cast<std::uint8_t>(hits[i] != 0 && hit_valid[i] != 0);
+            }
+        }
+        for (std::size_t b = begin; b < end; b += kBlock) {
+            const std::size_t len = std::min(kBlock, end - b);
+            const RowRange block{.begin = b, .count = len};
+            (void)kernel::write_direct_numeric_tree_range(*plan, block, {.doubles = dst + b});
+            const std::uint8_t* hit = hits + (b - begin);
+            double* row = dst + b;
+            if (old_data != nullptr) {
+                const double* old_row = old_data + b;
+                // Both sides loaded unconditionally, so the select is a vector
+                // blend; written as `hit ? row[i] : old_row[i]` it compiled to
+                // a per-row pointer pick and scalar load (36 vs 25 ms).
+                for (std::size_t i = 0; i < len; ++i) {
+                    const double fresh = row[i];
+                    const double old = old_row[i];
+                    row[i] = hit[i] != 0 ? fresh : old;
+                }
+            } else {
+                for (std::size_t i = 0; i < len; ++i) {
+                    row[i] = hit[i] != 0 ? row[i] : 0.0;
+                }
+            }
+            if (!may_be_null) {
+                continue;
+            }
+            // Null rows of the value itself: a shift's edge.
+            const auto value_valid = collect_expr_validity(field.expr, source, block);
+            for (std::size_t w = 0; w * kBits < len; ++w) {
+                const std::size_t base = w * kBits;
+                const std::size_t count = std::min(kBits, len - base);
+                const std::uint64_t all =
+                    count == kBits ? ~std::uint64_t{0} : ((std::uint64_t{1} << count) - 1);
+                std::uint64_t m = 0;
+                for (std::size_t k = 0; k < count; ++k) {
+                    m |= static_cast<std::uint64_t>(hit[base + k] != 0) << k;
+                }
+                const std::uint64_t value_bits =
+                    value_valid.has_value() ? value_valid->words_data()[w] & all : all;
+                const std::uint64_t old_bits = old_data != nullptr ? all : 0;
+                const std::uint64_t merged = ((m & value_bits) | (~m & old_bits)) & all;
+                valid_words[(b + base) / kBits] = merged;
+                local_invalid = local_invalid || merged != all;
+            }
+        }
+        if (local_invalid) {
+            saw_invalid.store(true, std::memory_order_relaxed);
+        }
+        return true;
+    };
+    for_row_ranges(parallel ? &exec : nullptr, n, [&](std::size_t begin, std::size_t end) {
+        for (std::size_t span = begin; span < end; span += kSpan) {
+            if (!run_span(span, std::min(end, span + kSpan))) {
+                return;
+            }
+        }
+    });
+    if (error.has_value()) {
+        return std::unexpected(std::move(*error));
+    }
+    Table output = input;
+    ColumnValue values{std::move(out)};
+    auto target = prepare_guarded_write(output, field.alias, values);
+    if (!target.has_value()) {
+        return std::unexpected(std::move(target.error()));
+    }
+    write_guarded_update(output, field.alias, *target, std::move(values),
+                         saw_invalid.load(std::memory_order_relaxed)
+                             ? std::optional<ValidityBitmap>{std::move(valid)}
+                             : std::nullopt);
+    return output;
+}
+
+}  // namespace
+
 /// Execute a guarded update `where <predicate> update { ... }`: rows matching
 /// the predicate get the field assignments; non-matching rows keep their values
 /// (a new column is null off-mask). Each field is evaluated where it is needed —
@@ -4746,6 +4909,10 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
     // computes, copies and reads a mask, then merges validity, in four passes.
     // NaN compares false, as in the mask, so it keeps the old value.
     if (auto fused = try_fused_literal_guard(input, update, exec, parallel); fused.has_value()) {
+        return std::move(*fused);
+    }
+    if (auto fused = try_fused_guarded_tree(input, update, scalars, exec, parallel);
+        fused.has_value()) {
         return std::move(*fused);
     }
 

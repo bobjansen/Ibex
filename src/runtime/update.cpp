@@ -2488,14 +2488,169 @@ auto ordered_source_supported(const ColumnEntry& source) -> bool {
            std::holds_alternative<Column<double>>(*source.column);
 }
 
+/// `lag`/`lead` by group in row order, or nullopt when it does not apply.
+///
+/// The CSR walk below visits one group's rows at a time, and with many groups
+/// interleaved those rows sit far apart: every read and every write lands on
+/// a different cache line. Here the rows are read in order instead, and each
+/// group's last `offset` values sit in a small ring (a few hundred groups fit
+/// in L1), so a row's lag is one ring read and its own value one ring write.
+///
+/// In parallel each range starts with empty rings. A row whose group has
+/// fewer than `offset` earlier values in its own range cannot be answered yet:
+/// it is written as null and noted (at most `offset` per group per range).
+/// Walking the ranges in order afterwards, a running ring holds the most
+/// recent values before each range; it answers those rows, then takes in the
+/// range's own final ring. That costs ranges x groups x offset, and no second
+/// pass over the rows. `lead` is the same walk taken backwards.
+///
+/// The values are only copied, never combined, so every thread count gives
+/// the serial answer bit for bit.
+auto grouped_shift_by_rows(const NativeGroupedOrderedCall& ordered, const ColumnEntry& source,
+                           std::span<const std::uint32_t> row_gid, std::size_t group_count,
+                           std::size_t rows, std::size_t workers)
+    -> std::optional<std::pair<ColumnValue, std::optional<ValidityBitmap>>> {
+    constexpr std::size_t kMaxOffset = 64;
+    // Rings per range; past this the CSR walk's locality is no worse.
+    constexpr std::size_t kMaxRingBytes = std::size_t{1} << 20;
+    const bool lag = ordered.kind == NativeGroupedOrderedKind::Lag;
+    const std::size_t k = ordered.offset;
+    if ((!lag && ordered.kind != NativeGroupedOrderedKind::Lead) || k == 0 || k > kMaxOffset ||
+        source.validity.has_value() || group_count * k * sizeof(double) > kMaxRingBytes ||
+        row_gid.size() != rows) {
+        return std::nullopt;
+    }
+    const auto run =
+        [&]<typename T>(
+            const Column<T>& values) -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
+        Column<T> result;
+        result.resize_for_overwrite(rows);
+        const T* const in = values.data();
+        T* const out = result.data();
+        const std::uint32_t* const gid = row_gid.data();
+        ValidityBitmap valid(rows, true);
+        std::uint64_t* const valid_words = valid.words_data();
+
+        // Ranges start on a 64-row boundary, so each owns whole validity words.
+        const std::size_t ranges = std::max<std::size_t>(1, std::min(workers, rows / 64));
+        const std::size_t grain = ((((rows + ranges - 1) / ranges) + 63) / 64) * 64;
+        const std::size_t range_count = (rows + grain - 1) / grain;
+        // One group's ring: `k` slots, `next` the slot the next value goes to
+        // (the oldest once full), `seen` capped at `k`.
+        struct Rings {
+            std::vector<T> slots;
+            std::vector<std::uint32_t> next;
+            std::vector<std::uint32_t> seen;
+        };
+        struct Pending {
+            std::size_t row;
+            std::uint32_t group;
+            std::uint32_t before;  // values of its group earlier in its range
+        };
+        std::vector<Rings> tails(range_count);
+        std::vector<std::vector<Pending>> pending(range_count);
+        const auto walk = [&](std::size_t r) {
+            const std::size_t begin = r * grain;
+            const std::size_t end = std::min(rows, begin + grain);
+            Rings& ring = tails[r];
+            ring.slots.resize(group_count * k);
+            ring.next.assign(group_count, 0);
+            ring.seen.assign(group_count, 0);
+            auto& waiting = pending[r];
+            const std::size_t count = end - begin;
+            for (std::size_t step = 0; step < count; ++step) {
+                const std::size_t row = lag ? begin + step : end - 1 - step;
+                const std::uint32_t g = gid[row];
+                T* const slots = ring.slots.data() + (static_cast<std::size_t>(g) * k);
+                const std::uint32_t at = ring.next[g];
+                if (ring.seen[g] == k) {
+                    out[row] = slots[at];
+                } else {
+                    out[row] = T{};
+                    waiting.push_back(Pending{.row = row, .group = g, .before = ring.seen[g]});
+                    ++ring.seen[g];
+                }
+                slots[at] = in[row];
+                ring.next[g] = at + 1 == k ? 0 : at + 1;
+            }
+            for (const auto& wait : waiting) {
+                valid_words[wait.row / 64] &= ~(std::uint64_t{1} << (wait.row % 64));
+            }
+        };
+        if (range_count < 2) {
+            walk(0);
+        } else {
+            auto batch = process_worker_pool().submit(range_count, [&](std::size_t r) { walk(r); });
+            batch.wait();
+        }
+
+        // The running ring: the most recent values before the range at hand,
+        // in walk order. Ranges are visited in walk order too (backwards for
+        // lead), so "before" is always the side the shift reads from.
+        Rings prefix;
+        prefix.slots.resize(group_count * k);
+        prefix.next.assign(group_count, 0);
+        prefix.seen.assign(group_count, 0);
+        bool any_invalid = false;
+        for (std::size_t visit = 0; visit < range_count; ++visit) {
+            const std::size_t r = lag ? visit : range_count - 1 - visit;
+            for (const auto& wait : pending[r]) {
+                // It needs the value `k - before` places back from the range's
+                // start; the running ring has `seen` of those, newest last.
+                const std::uint32_t back = static_cast<std::uint32_t>(k) - wait.before;
+                const std::uint32_t have = prefix.seen[wait.group];
+                if (back > have) {
+                    any_invalid = true;
+                    continue;
+                }
+                const T* const slots =
+                    prefix.slots.data() + (static_cast<std::size_t>(wait.group) * k);
+                const std::uint32_t newest = prefix.next[wait.group];  // one past the newest
+                const std::size_t slot = (newest + k - back) % k;
+                out[wait.row] = slots[slot];
+                valid_words[wait.row / 64] |= std::uint64_t{1} << (wait.row % 64);
+            }
+            // Take in this range's own last values, oldest first.
+            const Rings& tail = tails[r];
+            for (std::size_t g = 0; g < group_count; ++g) {
+                const std::uint32_t n = tail.seen[g];
+                const T* const from = tail.slots.data() + (g * k);
+                T* const to = prefix.slots.data() + (g * k);
+                const std::uint32_t oldest = n == k ? tail.next[g] : 0;
+                for (std::uint32_t j = 0; j < n; ++j) {
+                    to[prefix.next[g]] = from[(oldest + j) % k];
+                    prefix.next[g] = prefix.next[g] + 1 == k ? 0 : prefix.next[g] + 1;
+                }
+                prefix.seen[g] =
+                    std::min<std::uint32_t>(static_cast<std::uint32_t>(k), prefix.seen[g] + n);
+            }
+        }
+        return {ColumnValue{std::move(result)},
+                any_invalid ? std::optional<ValidityBitmap>{std::move(valid)} : std::nullopt};
+    };
+    if (const auto* ints = std::get_if<Column<std::int64_t>>(&*source.column)) {
+        return run(*ints);
+    }
+    if (const auto* doubles = std::get_if<Column<double>>(&*source.column)) {
+        return run(*doubles);
+    }
+    return std::nullopt;
+}
+
 /// Walk each CSR group in original row order and scatter to absolute output
 /// rows. A worker owns its group's complete state chain, so nothing crosses a
 /// group boundary; the byte validity staging avoids concurrent writes to packed
 /// bitmap words and is merged only after the worker barrier.
 auto compute_grouped_ordered_column(const NativeGroupedOrderedCall& ordered,
                                     const ColumnEntry& source, const GroupedRows& group_rows,
-                                    std::size_t rows, std::size_t workers)
+                                    std::span<const std::uint32_t> row_gid, std::size_t rows,
+                                    std::size_t workers)
     -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
+    if (auto by_rows = grouped_shift_by_rows(ordered, source, row_gid, group_rows.group_count(),
+                                             rows, workers);
+        by_rows.has_value()) {
+        return std::move(*by_rows);
+    }
     const auto kind = ordered.kind;
     const auto offset = ordered.offset;
     std::vector<std::uint8_t> invalid(rows, 0U);
@@ -2962,8 +3117,8 @@ auto try_native_grouped_aggregate_expr(const Table& input, const ir::FieldSpec& 
             if (source == nullptr || !ordered_source_supported(*source)) {
                 return std::optional<Table>{};
             }
-            auto [column, validity] =
-                compute_grouped_ordered_column(*item.ordered, *source, group_rows, rows, workers);
+            auto [column, validity] = compute_grouped_ordered_column(
+                *item.ordered, *source, group_rows, grouped.row_gid(rows), rows, workers);
             staged_names.push_back(item.column);
             if (validity.has_value()) {
                 staged.add_column(item.column, std::move(column), std::move(*validity));
@@ -3046,7 +3201,9 @@ auto try_native_grouped_aggregate_expr(const Table& input, const ir::FieldSpec& 
 
 /// Fixed-width, bare ordered kernels over one CSR group.
 auto try_native_grouped_ordered_field(const Table& input, const std::vector<ir::FieldSpec>& fields,
-                                      const GroupedRows& group_rows, const ExecutionContext& exec)
+                                      const GroupedRows& group_rows,
+                                      std::span<const std::uint32_t> row_gid,
+                                      const ExecutionContext& exec)
     -> std::expected<std::optional<Table>, std::string> {
     if (fields.size() != 1) {
         return std::optional<Table>{};
@@ -3073,7 +3230,7 @@ auto try_native_grouped_ordered_field(const Table& input, const std::vector<ir::
     const std::size_t workers =
         grouped_reduction_worker_count(exec, group_rows.group_count(), rows);
     auto [column, validity] =
-        compute_grouped_ordered_column(*ordered, *entry, group_rows, rows, workers);
+        compute_grouped_ordered_column(*ordered, *entry, group_rows, row_gid, rows, workers);
     Table output = input;
     if (validity.has_value()) {
         output.add_column(field.alias, std::move(column), std::move(*validity));
@@ -5705,7 +5862,7 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
     const GroupedRows& group_rows = grouped.rows;
     const auto row_gid = grouped.row_gid(rows);
 
-    if (auto ordered = try_native_grouped_ordered_field(input, fields, group_rows, exec);
+    if (auto ordered = try_native_grouped_ordered_field(input, fields, group_rows, row_gid, exec);
         !ordered) {
         return std::unexpected(ordered.error());
         // NOLINTNEXTLINE(readability-else-after-return) // ordered is defined in the if

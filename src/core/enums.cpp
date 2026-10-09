@@ -6,6 +6,11 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstddef>
+#include <expected>
+#include <string>
+#include <string_view>
+#include <utility>
 
 namespace ibex {
 

@@ -29,7 +29,6 @@
 #include <memory>
 #include <optional>
 #include <robin_hood.h>
-#include <span>
 #include <string>
 #include <string_view>
 #include <utility>

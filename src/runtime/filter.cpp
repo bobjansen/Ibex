@@ -2419,22 +2419,17 @@ void presize_filter_output(Table& output, const Table& input,
                     // is what makes the offsets array well-formed no matter how
                     // the rows are divided up.
                     dst.offsets_data()[0] = 0;
-                    // NOLINTNEXTLINE(bugprone-branch-clone)
-                } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
-                    // Zero-filled on purpose: the bit appender ORs into its
-                    // destination word rather than assigning it.
-                    dst.resize(rows_total);
-                } else if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
-                    // Every code is written by one gather, as for fixed width.
-                    // Zero-filling here was the filter's serial phase: 8 of
-                    // 21 ms at eight cores for 8M kept rows.
-                    dst.resize_for_overwrite(rows_total);
-                } else if constexpr (::ibex::detail::overwrite_safe_v<typename ColT::value_type>) {
+                } else if constexpr (std::is_same_v<ColT, Column<Categorical>> ||
+                                     (!std::is_same_v<ColT, Column<bool>> &&
+                                      ::ibex::detail::overwrite_safe_v<
+                                          typename ColT::value_type>)) {
                     // Every output row is written by exactly one gather, so
                     // value-initializing here would be a wasted pass over the
                     // whole column.
                     dst.resize_for_overwrite(rows_total);
                 } else {
+                    // Bool must be zero-filled: the bit appender ORs into its
+                    // destination word rather than assigning it.
                     dst.resize(rows_total);
                 }
             },

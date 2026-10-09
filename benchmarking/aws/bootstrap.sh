@@ -342,6 +342,102 @@ build_ibex() {
     fi
 }
 
+# ── Host memory facts + perf counters ─────────────────────────────────────────
+# Same-type boxes do not time Ibex the same: on 2026-10-09 every PDS-H query ran
+# 12-19% slower than on the 10-08 box while Polars and DuckDB were flat, and a
+# same-box A/B showed no code change. The suspect is how the host backs guest
+# memory (huge pages, fault cost), which glibc-malloc Ibex feels more than
+# jemalloc Polars. These record what is needed to confirm or drop that across
+# runs. None of it may abort a run: every probe is best-effort.
+
+# THP policy, hugepage counters and fragmentation, plus the clock at this
+# moment. Taken before and after a suite, since fragmentation grows with it.
+write_host_memory_facts() {
+    local out="$1"
+    mkdir -p "$(dirname "$out")"
+    {
+        echo "# $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        local f
+        for f in enabled defrag shmem_enabled khugepaged/defrag; do
+            echo "thp_${f//\//_}=$(cat "/sys/kernel/mm/transparent_hugepage/$f" 2>/dev/null || echo unknown)"
+        done
+        echo "kernel=$(uname -r)"
+        echo "## /proc/meminfo (huge pages)"
+        grep -E '^(MemTotal|MemFree|MemAvailable|AnonHugePages|ShmemHugePages|HugePages_|Hugepagesize)' /proc/meminfo
+        echo "## /proc/vmstat (thp)"
+        grep -E '^thp_' /proc/vmstat
+        echo "## /proc/buddyinfo (free blocks per order; high orders = room for huge pages)"
+        cat /proc/buddyinfo
+        echo "## cpu MHz (snapshot, per vCPU)"
+        awk -F: '/^cpu MHz/ {gsub(/ /,"",$2); printf "%s ", $2} END {print ""}' /proc/cpuinfo
+    } > "$out" 2>&1 || true
+}
+
+# perf comes from the kernel-matched linux-tools package, which a baked AMI may
+# predate. Hardware counters (cycles, dTLB) may read <not supported> on a
+# partial-socket instance; the software ones (page faults, task-clock) do not.
+ensure_perf() {
+    perf --version >/dev/null 2>&1 && return 0
+    apt_get_retry install -y --no-install-recommends linux-tools-common "linux-tools-$(uname -r)" \
+        >/dev/null 2>&1 \
+        || apt_get_retry install -y --no-install-recommends linux-tools-aws >/dev/null 2>&1 \
+        || true
+    perf --version >/dev/null 2>&1
+}
+
+# perf stat around the PDS-H Ibex timing itself (bench_ibex.py's warm REPL, the
+# same warmup/iters) for a few queries, so the counters describe what was timed.
+# q01 scan + aggregate, q09 join-heavy, q21 the one query unmoved on 10-09.
+PERF_STAT_QUERIES=(q01 q09 q21)
+PERF_STAT_EVENTS=task-clock,page-faults,minor-faults,major-faults,context-switches,cpu-migrations,cycles,instructions,dTLB-load-misses,dTLB-store-misses
+perf_stat_pdsh_ibex() {
+    local cores="$1" out_dir="$2"
+    command -v perf >/dev/null 2>&1 || return 0
+    mkdir -p "$out_dir"
+    local pin=() ibex_cores=auto q
+    if [[ -n "$cores" && "$cores" != "0" ]]; then
+        pin=(taskset -c "0-$((cores - 1))")
+        ibex_cores="$cores"
+    fi
+    for q in "${PERF_STAT_QUERIES[@]}"; do
+        IBEX_CORES="$ibex_cores" perf stat -e "$PERF_STAT_EVENTS" \
+            -o "$out_dir/perf_stat_${q}_${cores}c.txt" -- \
+            "${pin[@]}" python3 /ibex/benchmarking/tpch/bench_ibex.py \
+                --warmup "${IBEX_WARMUP:-1}" --iters "${IBEX_ITERS:-5}" \
+                --out "$out_dir/perf_stat_${q}_${cores}c.tsv" "$q" \
+            >/dev/null 2>&1 \
+            || echo "perf stat ${q} ${cores}c exited $?" >> "$out_dir/failures.txt"
+    done
+}
+
+# The in-memory counterpart: perf stat around bench_ibex.sh for a few suites on
+# the sweep's own 16M-row CSVs, pinned like the sweep (taskset 0..T-1,
+# IBEX_CORES=T). ibex_bench loads every CSV per run, so the counts include the
+# load; they compare box to box, not to the timed ms.
+PERF_STAT_SCALING_SUITES=(groupagg filter join)
+perf_stat_scaling_ibex() {
+    local threads="$1" rows="$2" out_dir="$3"
+    command -v perf >/dev/null 2>&1 || return 0
+    # run_scale_suite.sh names the data directory by row count (16M -> 16000000).
+    if [[ "$rows" =~ ^([0-9]+)[mM]$ ]]; then rows="${BASH_REMATCH[1]}000000"
+    elif [[ "$rows" =~ ^([0-9]+)[kK]$ ]]; then rows="${BASH_REMATCH[1]}000"; fi
+    local data="/ibex/benchmarking/data/scales/$rows" suite
+    [[ -f "$data/prices.csv" ]] || return 0
+    mkdir -p "$out_dir"
+    for suite in "${PERF_STAT_SCALING_SUITES[@]}"; do
+        IBEX_CORES="$threads" IBEX_ROOT=/ibex BUILD_DIR=/ibex/build-release \
+            perf stat -e "$PERF_STAT_EVENTS" -o "$out_dir/perf_stat_${suite}_${threads}t.txt" -- \
+            taskset -c "0-$((threads - 1))" bash /ibex/benchmarking/bench_ibex.sh \
+                --csv "$data/prices.csv" --csv-multi "$data/prices_multi.csv" \
+                --csv-trades "$data/trades.csv" --csv-events "$data/events.csv" \
+                --csv-lookup "$data/lookup.csv" --csv-users "$data/users.csv" \
+                --suite "$suite" --warmup "${IBEX_WARMUP:-1}" --iters "${IBEX_ITERS:-5}" \
+                --out "$out_dir/perf_stat_${suite}_${threads}t.tsv" \
+            >/dev/null 2>&1 \
+            || echo "perf stat ${suite} ${threads}t exited $?" >> "$out_dir/failures.txt"
+    done
+}
+
 build_ibex_with_compiler() {
     local build_dir="$1" cc="$2" cxx="$3"
     cmake -B "$build_dir" -G Ninja \
@@ -799,6 +895,7 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
     }
 
     build_ibex
+    ensure_perf || echo "perf unavailable; PDS-H runs without perf stat counters" >&2
     if [[ ! -d "$PDSH_ROOT/.git" ]]; then
         git clone "$PDSH_REPO" "$PDSH_ROOT"
     fi
@@ -866,12 +963,17 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
             done
             continue
         fi
+        HOST_OUT=/ibex/benchmarking/tpch/results/host
         for cores in "${TPCH_CORE_LIST[@]}"; do
             CORE_ARGS=()
             if [[ -n "$cores" && "$cores" != "0" ]]; then
                 CORE_ARGS=(--cores "$cores" --label "aws sf${scale} ${cores}c")
             fi
+            write_host_memory_facts "$HOST_OUT/memory_sf${scale}_${cores}c_before.txt"
             bash /ibex/benchmarking/tpch/run_bench.sh "${TPCH_ARGS[@]}" "${CORE_ARGS[@]}"
+            write_host_memory_facts "$HOST_OUT/memory_sf${scale}_${cores}c_after.txt"
+            # After run_bench.sh, which points the parquet symlink at this scale.
+            perf_stat_pdsh_ibex "$cores" "$HOST_OUT/sf${scale}"
             push_partial_tpch
         done
     done
@@ -1192,6 +1294,7 @@ if [[ "${IBEX_SCALING_MODE:-0}" == "1" ]]; then
     PARTIAL_KEY="${IBEX_RESULT_KEY%.csv}.partial.csv"
     BOX_KEY="${IBEX_RESULT_KEY%.csv}.box.txt"
     BOX_FACTS=/ibex/benchmarking/results/thread_scaling.box.txt
+    PERF_OUT=/ibex/benchmarking/results/thread_scaling_perf
 
     write_box_facts() {
         mkdir -p "$(dirname "$BOX_FACTS")"
@@ -1219,6 +1322,19 @@ if [[ "${IBEX_SCALING_MODE:-0}" == "1" ]]; then
             echo "warmup=${IBEX_WARMUP:-1} iters=${IBEX_ITERS:-5}"
             echo "clang=$(clang++-${CLANG_VERSION} --version 2>/dev/null | head -1)"
         } > "$BOX_FACTS" 2>/dev/null || true
+        # THP and hugepage state before and after the sweep, in the box facts
+        # (the only host file this mode uploads).
+        write_host_memory_facts "${BOX_FACTS%.txt}.memory_after.txt"
+        local when f
+        for when in before after; do
+            { echo "## host memory, ${when} the sweep"
+              cat "${BOX_FACTS%.txt}.memory_${when}.txt"; } >> "$BOX_FACTS" 2>/dev/null || true
+        done
+        # perf stat output too: box.txt is this mode's only uploaded host file.
+        for f in "$PERF_OUT"/perf_stat_*.txt "$PERF_OUT"/failures.txt; do
+            [[ -f "$f" ]] || continue
+            { echo "## $(basename "$f")"; cat "$f"; } >> "$BOX_FACTS" 2>/dev/null || true
+        done
     }
 
     finish_scaling() {
@@ -1246,6 +1362,8 @@ if [[ "${IBEX_SCALING_MODE:-0}" == "1" ]]; then
       done ) &
     SCALING_UPLOADER_PID=$!
 
+    write_host_memory_facts "${BOX_FACTS%.txt}.memory_before.txt"
+
     # The sweep exits non-zero when any pass is incomplete. That must not skip
     # the upload — a curve with one hole is still the run's whole output — so
     # the EXIT trap above owns the upload and the failure is only reported.
@@ -1258,6 +1376,17 @@ if [[ "${IBEX_SCALING_MODE:-0}" == "1" ]]; then
             --iters "${IBEX_ITERS:-5}" \
             --out "$SCALING_CSV" \
         || echo "WARNING: thread sweep reported failures; uploading what completed" >&2
+
+    # After the sweep, so the counters cannot perturb its timings.
+    if ensure_perf; then
+        IFS=',' read -r -a PERF_THREADS <<< "${IBEX_SCALING_THREADS:-1,2,4,8}"
+        for t in "${PERF_THREADS[@]}"; do
+            (( t <= $(nproc) )) || continue
+            perf_stat_scaling_ibex "$t" "${IBEX_SCALING_ROWS:-16M}" "$PERF_OUT"
+        done
+    else
+        echo "perf unavailable; thread sweep runs without perf stat counters" >&2
+    fi
 
     exit 0
 fi

@@ -452,9 +452,9 @@ TEST_CASE("chunked source groups two categorical keys identically to one chunk",
     for (std::int32_t i = 0; i < kDict; ++i) {
         names.push_back("value-" + std::to_string(i));
     }
-    Column<Categorical> a{names, std::vector<std::int32_t>{}};
-    Column<Categorical> b{names, std::vector<std::int32_t>{}};
-    Column<Categorical> c{names, std::vector<std::int32_t>{}};
+    Column<Categorical> a{names, Column<Categorical>::codes_storage{}};
+    Column<Categorical> b{names, Column<Categorical>::codes_storage{}};
+    Column<Categorical> c{names, Column<Categorical>::codes_storage{}};
     Column<std::int64_t> amount;
     for (std::size_t i = 0; i < kRows; ++i) {
         a.push_code(static_cast<std::int32_t>(i % 5));

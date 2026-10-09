@@ -1311,7 +1311,7 @@ auto try_planned_categorical_update(const Chunk& input, const std::vector<ir::Fi
     if (!plan.has_value()) {
         return std::nullopt;
     }
-    std::vector<Column<Categorical>::code_type> codes(view.rows(), 0);
+    Column<Categorical>::codes_storage codes(view.rows(), 0);
     auto validity = write_direct_categorical_field_range(
         *plan, source, ::ibex::runtime::RowRange::whole(view.rows()), scalars,
         {.codes = codes.data(), .begin = 0, .count = view.rows()});
@@ -2840,7 +2840,7 @@ auto evaluate_field_windows(const ir::Expr& expr, const DirectFieldRoute& route,
 
     if (route.categorical.has_value()) {
         using Code = Column<Categorical>::code_type;
-        std::vector<Code> codes(rows, 0);
+        Column<Categorical>::codes_storage codes(rows, 0);
         std::vector<std::expected<std::optional<ValidityBitmap>, std::string>> pieces(morsels);
         std::atomic<std::size_t> cursor{0};
         auto batch = pool.submit(threads, [&](std::size_t) {

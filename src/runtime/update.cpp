@@ -4244,7 +4244,7 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
         if (!route.categorical.has_value()) {
             return whole();
         }
-        std::vector<Column<Categorical>::code_type> codes(rows, 0);
+        Column<Categorical>::codes_storage codes(rows, 0);
         auto validity = kernel::write_direct_categorical_field_range(
             *route.categorical, direct_input, RowRange::whole(rows), ctx.scalars,
             {.codes = codes.data(), .begin = 0, .count = rows});

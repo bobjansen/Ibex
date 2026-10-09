@@ -550,7 +550,7 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
         std::vector<ibex::Column<std::int64_t>> int_cols(n_cols);
         std::vector<ibex::Column<double>> double_cols(n_cols);
         std::vector<ibex::Column<std::string>> string_cols(n_cols);
-        std::vector<std::vector<ibex::Column<ibex::Categorical>::code_type>> cat_codes(n_cols);
+        std::vector<ibex::Column<ibex::Categorical>::codes_storage> cat_codes(n_cols);
         std::vector<ibex::Column<ibex::Date>> date_cols(n_cols);
         std::vector<ibex::Column<ibex::Decimal>> decimal_cols(n_cols);
 
@@ -1022,7 +1022,7 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
             using code_type = ibex::Column<ibex::Categorical>::code_type;
             std::vector<std::string> dict;
             ibex::Column<ibex::Categorical>::index_map cat_index;
-            std::vector<code_type> cat_codes;
+            ibex::Column<ibex::Categorical>::codes_storage cat_codes;
 
             explicit CsvSchemaColumnBuilder(CsvColumnKind kind_in) : kind(kind_in) {}
 
@@ -1318,7 +1318,7 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                 continue;
             }
             if (hint == CsvColumnKind::Categorical) {
-                std::vector<ibex::Column<ibex::Categorical>::code_type> codes;
+                ibex::Column<ibex::Categorical>::codes_storage codes;
                 codes.reserve(n);
                 std::vector<std::string> dict;
                 // Keys are owned `std::string`. Storing `std::string_view`
@@ -1488,7 +1488,7 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
         // Pure-string column: try categorical promotion.
         if (n > 0) {
             const std::size_t max_uniques = ibex::categorical_promotion_limit(n);
-            std::vector<ibex::Column<ibex::Categorical>::code_type> codes;
+            ibex::Column<ibex::Categorical>::codes_storage codes;
             codes.reserve(n);
             std::vector<std::string> dict;
             // Keys are owned `std::string`. Storing `std::string_view` here

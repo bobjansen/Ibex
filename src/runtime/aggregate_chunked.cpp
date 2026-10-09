@@ -4718,7 +4718,7 @@ class HashAggregateState final {
                 if (multi_cat_slots_.empty()) {
                     multi_cat_rehash_groups();
                 }
-                std::vector<Column<Categorical>::code_type> row_codes(n_keys);
+                Column<Categorical>::codes_storage row_codes(n_keys);
                 for (std::size_t row = 0; row < rows; ++row) {
                     for (std::size_t c = 0; c < n_keys; ++c) {
                         row_codes[c] = raws[c][row];
@@ -6698,7 +6698,7 @@ class HashAggregateState final {
     };
 
     struct CatKey {
-        std::vector<Column<Categorical>::code_type> codes;
+        Column<Categorical>::codes_storage codes;
         auto operator==(const CatKey& o) const noexcept -> bool { return codes == o.codes; }
     };
 

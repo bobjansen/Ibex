@@ -79,7 +79,7 @@ auto make_table(std::size_t rows) -> runtime::Table {
     Column<std::int64_t> nullable;
     runtime::ValidityBitmap valid(rows, true);
     std::vector<std::string> dict{"alpha", "beta", "gamma"};
-    std::vector<std::int32_t> codes;
+    Column<Categorical>::codes_storage codes;
     codes.reserve(rows);
 
     for (std::size_t i = 0; i < rows; ++i) {

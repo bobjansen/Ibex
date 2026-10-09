@@ -1073,7 +1073,7 @@ auto slice_table(const ibex::runtime::Table& table, std::size_t rows) -> ibex::r
                     }
                     return ibex::Column<ibex::Timestamp>(std::move(data));
                 } else if constexpr (std::is_same_v<ColType, ibex::Column<ibex::Categorical>>) {
-                    std::vector<ibex::Column<ibex::Categorical>::code_type> codes;
+                    ibex::Column<ibex::Categorical>::codes_storage codes;
                     codes.reserve(n);
                     const auto* src = col.codes_data();
                     for (std::size_t i = 0; i < n; ++i) {
@@ -3474,7 +3474,7 @@ int main(int argc, char** argv) {
                 for (std::size_t i = 0; i < dict->size(); ++i) {
                     index->emplace(dict->at(i), static_cast<CatCol::code_type>(i));
                 }
-                std::vector<CatCol::code_type> codes;
+                CatCol::codes_storage codes;
                 codes.reserve(long_rows);
                 for (std::size_t i = 0; i < long_rows; ++i) {
                     codes.push_back(static_cast<CatCol::code_type>(i % 4));

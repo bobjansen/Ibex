@@ -2425,7 +2425,10 @@ void presize_filter_output(Table& output, const Table& input,
                     // destination word rather than assigning it.
                     dst.resize(rows_total);
                 } else if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
-                    dst.resize(rows_total);
+                    // Every code is written by one gather, as for fixed width.
+                    // Zero-filling here was the filter's serial phase: 8 of
+                    // 21 ms at eight cores for 8M kept rows.
+                    dst.resize_for_overwrite(rows_total);
                 } else if constexpr (::ibex::detail::overwrite_safe_v<typename ColT::value_type>) {
                     // Every output row is written by exactly one gather, so
                     // value-initializing here would be a wasted pass over the

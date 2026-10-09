@@ -1425,7 +1425,7 @@ class DictReader final : public runtime::LazySourceReader {
         runtime::Table out;
         for (const auto& name : names) {
             if (name == "flag") {
-                std::vector<Column<Categorical>::code_type> codes;
+                Column<Categorical>::codes_storage codes;
                 runtime::ValidityBitmap validity(rows.size(), true);
                 for (std::size_t i = 0; i < rows.size(); ++i) {
                     const char* v = kFlags[rows[i]];

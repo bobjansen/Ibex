@@ -9821,6 +9821,96 @@ TEST_CASE("guarded update computes its guard per block, lag and lead included",
     }
 }
 
+TEST_CASE("grouped lag and lead walk rows in order, serial and parallel",
+          "[update][groupby][lag][parallel]") {
+    constexpr std::size_t kRows = 20'003;
+    Column<std::int64_t> g;
+    Column<double> x;
+    Column<std::int64_t> n;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        // 37 interleaved groups; group 37 only in the last 100 rows (the last
+        // range of a parallel run), group 38 only twice (fewer rows than lag 3).
+        std::int64_t group = static_cast<std::int64_t>((i * 7919) % 37);
+        if (i >= kRows - 100 && i % 3 == 0) {
+            group = 37;
+        }
+        if (i == 5000 || i == 15000) {
+            group = 38;
+        }
+        g.push_back(group);
+        x.push_back((static_cast<double>(i) * 0.5) + 1.0);
+        n.push_back(static_cast<std::int64_t>(i) * 3);
+    }
+    std::vector<std::vector<std::size_t>> rows_of(39);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        rows_of[static_cast<std::size_t>(g[i])].push_back(i);
+    }
+    runtime::TableRegistry registry;
+    {
+        runtime::Table t;
+        t.add_column("g", g);
+        t.add_column("x", x);
+        t.add_column("n", n);
+        registry.emplace("t", std::move(t));
+    }
+    // The source row `shift` places along row r's group, or nullopt.
+    const auto shifted = [&](std::size_t r, std::int64_t shift) -> std::optional<std::size_t> {
+        const auto& members = rows_of[static_cast<std::size_t>(g[r])];
+        const auto pos =
+            static_cast<std::int64_t>(std::ranges::lower_bound(members, r) - members.begin());
+        const std::int64_t at = pos + shift;
+        if (at < 0 || at >= static_cast<std::int64_t>(members.size())) {
+            return std::nullopt;
+        }
+        return members[static_cast<std::size_t>(at)];
+    };
+    struct Case {
+        std::string query;
+        std::int64_t shift;
+        bool ints;
+    };
+    std::vector<Case> cases;
+    for (const int k : {1, 2, 3, 65}) {
+        cases.push_back({"t[update { p = lag(x, " + std::to_string(k) + ") }, by g];", -k, false});
+    }
+    for (const int k : {1, 3}) {
+        cases.push_back({"t[update { p = lead(x, " + std::to_string(k) + ") }, by g];", k, false});
+    }
+    cases.push_back({"t[update { p = lag(n, 2) }, by g];", -2, true});
+
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+    for (const auto& c : cases) {
+        for (const auto* exec : {&serial, &parallel}) {
+            INFO(c.query << (exec == &serial ? " serial" : " parallel"));
+            auto ir = require_ir(c.query.c_str());
+            auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, *exec);
+            REQUIRE(out.has_value());
+            const auto* entry = out->find_entry("p");
+            REQUIRE(entry != nullptr);
+            std::size_t wrong = 0;
+            for (std::size_t r = 0; r < kRows; ++r) {
+                const auto source = shifted(r, c.shift);
+                const bool null = runtime::is_null(*entry, r);
+                if (!source.has_value()) {
+                    wrong += null ? 0U : 1U;
+                } else if (null) {
+                    ++wrong;
+                } else if (c.ints) {
+                    wrong +=
+                        std::get<Column<std::int64_t>>(*entry->column)[r] == n[*source] ? 0U : 1U;
+                } else {
+                    wrong += std::get<Column<double>>(*entry->column)[r] == x[*source] ? 0U : 1U;
+                }
+            }
+            CHECK(wrong == 0);
+        }
+    }
+}
+
 TEST_CASE("guarded update with several fields keeps each field's view of the table",
           "[update][guarded][parallel]") {
     constexpr std::size_t kRows = 5000;

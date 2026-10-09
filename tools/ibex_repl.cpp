@@ -49,6 +49,7 @@ auto main(int argc, char** argv) -> int {
     }
 
     CLI::App app{"Ibex — interactive columnar DSL"};
+    app.set_version_flag("--version", "ibex " IBEX_VERSION_STRING);
 
     bool verbose = false;
     bool no_history = false;
@@ -69,7 +70,8 @@ auto main(int argc, char** argv) -> int {
     app.add_option("--plugin-path", plugin_path,
                    "Directory to search for plugin shared libraries (*.so). "
                    "Defaults to IBEX_LIBRARY_PATH environment variable, then to "
-                   "the directory containing this executable.");
+                   "../lib/ibex beside this executable (release layout), else "
+                   "the directory containing it.");
     app.add_option("--import-path", import_path,
                    "Directory to search for library stub files (*.ibex) used by "
                    "`import` declarations.  Defaults to the plugin search path.");
@@ -97,8 +99,8 @@ auto main(int argc, char** argv) -> int {
     CLI11_PARSE(app, argc, argv);
 
     // Resolve plugin search path: --plugin-path flag takes precedence, then
-    // IBEX_LIBRARY_PATH, then the directory holding this executable (where
-    // plugins are built/packaged by default).
+    // IBEX_LIBRARY_PATH, then the release layout's lib/ibex or the directory
+    // holding this executable (default_plugin_directory).
     if (plugin_path.empty()) {
         const char* env = std::getenv("IBEX_LIBRARY_PATH");
         if (env != nullptr) {
@@ -106,11 +108,7 @@ auto main(int argc, char** argv) -> int {
         }
     }
     if (plugin_path.empty()) {
-        std::error_code ec;
-        auto exe_dir = ibex::tools::executable_directory();
-        if (!exe_dir.empty() && std::filesystem::exists(exe_dir, ec)) {
-            plugin_path = exe_dir.string();
-        }
+        plugin_path = ibex::tools::default_plugin_directory().string();
     }
 
     ibex::runtime::ExternRegistry registry;

@@ -60,7 +60,9 @@ jobs:
             -DIBEX_ENABLE_MARCH_NATIVE=OFF \
             -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
             -DIBEX_BUILD_PARQUET=ON \
-            -DIBEX_PARQUET_S3=OFF
+            -DIBEX_PARQUET_S3=OFF \
+            -DIBEX_VERSION="${RELEASE_TAG}" \
+            -DCMAKE_INSTALL_LIBDIR=lib
 
       - name: Configure (macOS)
         if: runner.os == 'macOS'
@@ -73,7 +75,9 @@ jobs:
             -DIBEX_ENABLE_MARCH_NATIVE=OFF \
             -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
             -DIBEX_BUILD_PARQUET=ON \
-            -DIBEX_PARQUET_S3=OFF
+            -DIBEX_PARQUET_S3=OFF \
+            -DIBEX_VERSION="${RELEASE_TAG}" \
+            -DCMAKE_INSTALL_LIBDIR=lib
 
       # libcurl powers HTTPS csv::read/parquet::read. Use the static-md triplet so
       # curl links statically into the plugins (no libcurl.dll to bundle) while
@@ -95,7 +99,9 @@ jobs:
             -DIBEX_ENABLE_MARCH_NATIVE=OFF \
             -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
             -DIBEX_BUILD_PARQUET=ON \
-            -DIBEX_PARQUET_S3=OFF
+            -DIBEX_PARQUET_S3=OFF \
+            -DIBEX_VERSION="${RELEASE_TAG}" \
+            -DCMAKE_INSTALL_LIBDIR=lib
 
       - name: Build
         shell: bash
@@ -106,54 +112,58 @@ jobs:
             cmake --build build-release --parallel
           fi
 
+      # `--component runtime` installs exactly the user-facing tree (see the
+      # release-bundle block in the top-level CMakeLists.txt): bin/ibex,
+      # bin/ui and lib/ibex (plugins + Arrow/Parquet) on Linux/macOS, all of it
+      # in bin/ on Windows. No headers, static libraries or benchmark tools.
       - name: Assemble release bundle
         shell: bash
         run: |
+          name="ibex-${RELEASE_TAG}-${{ matrix.asset_suffix }}"
           rm -rf stage
-          mkdir -p stage/bin stage/plugins
-
           if [ "$RUNNER_OS" = "Windows" ]; then
-            cmake --install build-release --config Release --prefix "$PWD/stage"
-            find build-release/tools -maxdepth 1 \( -name '*.dll' -o -name '*.ibex' \) -exec cp {} stage/plugins/ \;
+            cmake --install build-release --config Release --component runtime --prefix "$PWD/stage/$name"
+            test -f "stage/$name/bin/ibex.exe"
+            test -f "stage/$name/bin/csv.dll"
           else
-            cmake --install build-release --prefix "$PWD/stage"
-            # Arrow/Parquet's shared libs carry SONAME-versioned names
-            # (libarrow.so.2200), not a bare .so suffix, so -name '*.so' alone
-            # misses them.
-            find build-release/tools -maxdepth 1 \( -name '*.so' -o -name '*.so.*' -o -name '*.dylib' -o -name '*.ibex' \) -exec cp {} stage/plugins/ \;
+            cmake --install build-release --component runtime --prefix "$PWD/stage/$name" --strip
+            test -f "stage/$name/bin/ibex"
+            ls "stage/$name/lib/ibex/"csv.*
           fi
+          test -f "stage/$name/bin/ui/index.html"
+          cp LICENSE LICENSING.md "stage/$name/"
 
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            test -f stage/bin/ibex.exe
-          else
-            test -f stage/bin/ibex
-          fi
-          test -f stage/bin/ui/index.html
-
-          cat > stage/README.txt <<EOF
+          cat > "stage/$name/README.txt" <<EOF
           Ibex ${RELEASE_TAG}
 
-          Layout:
-          - bin/: executables
-          - plugins/: bundled plugin libraries and import stubs
+          Run bin/ibex (bin\ibex.exe on Windows) from anywhere; it finds its
+          plugins and the browser UI relative to itself.
 
-          Quick start:
-          - The browser workbench is bundled beside the executable at ./bin/ui.
-          - Linux/macOS REPL: IBEX_LIBRARY_PATH="\$(pwd)/plugins" ./bin/ibex
-          - Linux/macOS UI: IBEX_LIBRARY_PATH="\$(pwd)/plugins" ./bin/ibex ui --data-dir . --demo
-          - Windows PowerShell REPL: \$env:IBEX_LIBRARY_PATH = "$PWD/plugins"; .\bin\ibex.exe
-          - Windows PowerShell UI: \$env:IBEX_LIBRARY_PATH = "$PWD/plugins"; .\bin\ibex.exe ui --data-dir . --demo
-          - Open the printed http://127.0.0.1:8765 address in a browser.
+            ibex                       interactive REPL
+            ibex script.ibex           run a script
+            ibex ui --demo             browser UI with sample data
+                                       (open the printed http://127.0.0.1:8765)
+
+          To put ibex on your PATH, use the installer instead of this archive:
+            curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sh
+            powershell -ExecutionPolicy Bypass -c "irm https://github.com/${{ github.repository }}/releases/latest/download/install.ps1 | iex"
 
           Notes:
-          - These release bundles intentionally disable -march=native for portability.
-          - The Parquet plugin is built without S3 filesystem support (IBEX_PARQUET_S3=OFF);
-            local and HTTPS parquet reads work, s3:// paths do not.
+          - Built without -march=native, for portability.
+          - Parquet is built without S3 support: local and HTTPS reads work,
+            s3:// paths do not.
+          - Linux: needs glibc 2.39+ (Ubuntu 24.04 or newer) and the system
+            readline and curl libraries (apt install libreadline8t64 libcurl4t64).
           EOF
 
-          asset_name="ibex-${RELEASE_TAG}-${{ matrix.asset_suffix }}.zip"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            asset_name="${name}.zip"
+            (cd stage && cmake -E tar cf "../${asset_name}" --format=zip "$name")
+          else
+            asset_name="${name}.tar.gz"
+            tar -C stage -czf "${asset_name}" "$name"
+          fi
           echo "ASSET_NAME=${asset_name}" >> "$GITHUB_ENV"
-          cmake -E tar cf "${asset_name}" --format=zip stage
 
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v7
@@ -162,11 +172,99 @@ jobs:
           path: ${{ env.ASSET_NAME }}
           if-no-files-found: error
 
-  publish:
-    runs-on: ubuntu-latest
+  # Install each archive with the shipped installer on a FRESH runner and run a
+  # script that loads plugins and Arrow. The build runner cannot catch a
+  # bundle that only works next to its build tree: v0.3.0's Linux and macOS
+  # binaries pointed at the CI build directory and /usr/local/lib, and never
+  # started anywhere else.
+  smoke:
     needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            asset_suffix: linux-x86_64
+            ext: tar.gz
+          - os: macos-15
+            asset_suffix: macos-arm64
+            ext: tar.gz
+          - os: windows-latest
+            asset_suffix: windows-x86_64
+            ext: zip
+
+    runs-on: ${{ matrix.os }}
 
     steps:
+      - name: Checkout installer scripts
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          sparse-checkout: scripts
+
+      - name: Download archive
+        uses: actions/download-artifact@v8
+        with:
+          name: ibex-${{ env.RELEASE_TAG }}-${{ matrix.asset_suffix }}.${{ matrix.ext }}
+          path: dist
+
+      - name: Write smoke script
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/smoke"
+          cat > "$RUNNER_TEMP/smoke/smoke.ibex" <<'EOF'
+          import "data_gen";
+          import "csv";
+          import "parquet";
+          let t = gen::ticks(100);
+          csv::write(t, "t.csv");
+          parquet::write(t, "t.parquet");
+          let a = csv::read("t.csv");
+          let b = parquet::read("t.parquet");
+          b[select { n = count() }];
+          EOF
+
+      - name: Install and run (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          IBEX_ARCHIVE="$PWD/dist/ibex-${RELEASE_TAG}-${{ matrix.asset_suffix }}.tar.gz" \
+            IBEX_HOME="$RUNNER_TEMP/ibex-home" IBEX_BIN_DIR="$RUNNER_TEMP/bin" \
+            sh scripts/install.sh
+          cd "$RUNNER_TEMP/smoke"
+          # No IBEX_LIBRARY_PATH, no --plugin-path: the bundle must find its
+          # own plugins and libraries.
+          env -u IBEX_LIBRARY_PATH "$RUNNER_TEMP/bin/ibex" --version | grep -F "$RELEASE_TAG"
+          env -u IBEX_LIBRARY_PATH "$RUNNER_TEMP/bin/ibex" smoke.ibex | tee out.txt
+          grep -q '| 100 |' out.txt
+
+      - name: Install and run (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:IBEX_ARCHIVE = "$PWD\dist\ibex-$env:RELEASE_TAG-${{ matrix.asset_suffix }}.zip"
+          $env:IBEX_HOME = "$env:RUNNER_TEMP\ibex-home"
+          ./scripts/install.ps1
+          Remove-Item Env:IBEX_LIBRARY_PATH -ErrorAction SilentlyContinue
+          Set-Location "$env:RUNNER_TEMP\smoke"
+          $ibex = "$env:RUNNER_TEMP\ibex-home\bin\ibex.exe"
+          $v = & $ibex --version
+          if ($LASTEXITCODE -ne 0 -or $v -notmatch [regex]::Escape($env:RELEASE_TAG)) { throw "bad --version: $v" }
+          $out = & $ibex smoke.ibex | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0 -or $out -notmatch '\| 100 \|') { throw 'smoke script failed' }
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: smoke
+
+    steps:
+      - name: Checkout installer scripts
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          sparse-checkout: scripts
+
       - name: Download packaged artifacts
         uses: actions/download-artifact@v8
         with:
@@ -177,10 +275,30 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          mkdir -p upload
+          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} upload/ \;
+          cp scripts/install.sh scripts/install.ps1 upload/
+          (cd upload && sha256sum ibex-* > SHA256SUMS && cat SHA256SUMS)
+
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" \
-              --title "$RELEASE_TAG" \
-              --notes "Automated release for $RELEASE_TAG."
+            cat > notes.md <<EOF
+          ## Install
+
+          Linux (x86_64, glibc 2.39+) and macOS (Apple silicon):
+
+          \`\`\`sh
+          curl -fsSL https://github.com/${GH_REPO}/releases/latest/download/install.sh | sh
+          \`\`\`
+
+          Windows (PowerShell):
+
+          \`\`\`powershell
+          powershell -ExecutionPolicy Bypass -c "irm https://github.com/${GH_REPO}/releases/latest/download/install.ps1 | iex"
+          \`\`\`
+
+          Or download the archive for your platform below, unpack it anywhere and run \`bin/ibex\`.
+          EOF
+            gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --notes-file notes.md
           fi
 
-          find dist -type f -name '*.zip' -print0 | xargs -0 -n1 gh release upload "$RELEASE_TAG" --clobber
+          gh release upload "$RELEASE_TAG" --clobber upload/*

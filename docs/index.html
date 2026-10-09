@@ -199,20 +199,24 @@
     <div class="steps">
 
       <div>
-        <p class="step-label">Option A &mdash; download a release</p>
+        <p class="step-label">Option A &mdash; install a release</p>
         <p style="margin: 0 0 0.7rem; color: var(--muted); font-size: 0.93rem;">
-          Grab the prebuilt <code>ibex</code> REPL and bundled plugins, unpack,
-          and run &mdash; no toolchain required.
+          The prebuilt <code>ibex</code> REPL, bundled plugins and browser UI
+          &mdash; no toolchain required.
         </p>
+<pre><code><span class="cm"># Linux (x86_64) and macOS (Apple silicon)</span>
+curl -fsSL https://github.com/bobjansen/Ibex/releases/latest/download/install.sh | sh
+
+<span class="cm"># Windows (PowerShell)</span>
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/bobjansen/Ibex/releases/latest/download/install.ps1 | iex"</code></pre>
         <p style="margin: 0 0 0.9rem;">
-          <a class="button primary" href="https://github.com/bobjansen/Ibex/releases" target="_blank" rel="noopener">github.com/bobjansen/Ibex/releases &#8599;</a>
+          <a class="button" href="https://github.com/bobjansen/Ibex/releases" target="_blank" rel="noopener">Or download an archive &#8599;</a>
         </p>
       </div>
 
       <div>
         <p class="step-label">Run your first pipeline</p>
-<pre><code><span class="cm"># Unpack the archive for your platform, then:</span>
-./ibex --plugin-path ./plugins</code></pre>
+<pre><code>ibex</code></pre>
 <pre><code><span class="kw">import</span> <span class="str">"data_gen"</span>;
 <span class="kw">let</span> ticks = <span class="fn-name">gen::ticks</span>(<span class="num">100</span>);
 

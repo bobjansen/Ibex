@@ -280,3 +280,95 @@ install(
     DIRECTORY include/ibex
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
 )
+
+# ── Release bundle: the `runtime` install component ──────────────────────────
+# `cmake --install <build> --component runtime --prefix <dir>` installs exactly
+# what a user runs, and nothing a developer builds against:
+#
+#   bin/ibex[.exe]       the REPL / script runner / `ibex ui` server
+#   bin/ui/              the bundled browser UI (src/ui)
+#   lib/ibex/            plugins, their *.ibex stubs, Arrow/Parquet libraries
+#
+# Binaries find their libraries relative to themselves ($ORIGIN /
+# @executable_path), and `ibex` searches ../lib/ibex for plugins by default
+# (tools/exe_path.hpp), so the tree runs from wherever it is unpacked with no
+# environment variable. Windows has no RPATH: the loader searches the exe's own
+# directory, so there everything goes in bin/ beside ibex.exe, which is also
+# the plugin directory `ibex` falls back to.
+#
+# Headers, static libraries, ibex_compile/ibex_eval and the benchmark tools stay
+# in the default (Unspecified) component: a plain `cmake --install` is
+# unchanged.
+if(WIN32)
+    set(IBEX_INSTALL_PLUGINDIR "${CMAKE_INSTALL_BINDIR}")
+else()
+    set(IBEX_INSTALL_PLUGINDIR "${CMAKE_INSTALL_LIBDIR}/ibex")
+endif()
+if(APPLE)
+    set(_ibex_exe_rpath "@executable_path/../${CMAKE_INSTALL_LIBDIR}/ibex")
+    set(_ibex_plugin_rpath "@loader_path")
+else()
+    set(_ibex_exe_rpath "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}/ibex")
+    set(_ibex_plugin_rpath "$ORIGIN")
+endif()
+
+if(TARGET ibex_repl_bin)
+    set_target_properties(ibex_repl_bin PROPERTIES INSTALL_RPATH "${_ibex_exe_rpath}")
+    install(TARGETS ibex_repl_bin
+        RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT runtime
+    )
+endif()
+
+foreach(_ibex_plugin args csv fs json data_gen udp websocket lightgbm kmeans pca
+        parquet adbc kafka)
+    set(_ibex_plugin_target "ibex_${_ibex_plugin}_plugin")
+    if(NOT TARGET ${_ibex_plugin_target})
+        continue()
+    endif()
+    set_target_properties(${_ibex_plugin_target} PROPERTIES
+        INSTALL_RPATH "${_ibex_plugin_rpath}")
+    install(TARGETS ${_ibex_plugin_target}
+        LIBRARY DESTINATION "${IBEX_INSTALL_PLUGINDIR}" COMPONENT runtime
+        RUNTIME DESTINATION "${IBEX_INSTALL_PLUGINDIR}" COMPONENT runtime
+        # A DLL's import library is for linking against it, which nothing does.
+        ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT devel
+    )
+    # Every plugin's build copies its stub to <output dir>/<name>.ibex.
+    install(FILES "${IBEX_PLUGIN_OUTPUT_DIR}/${_ibex_plugin}.ibex"
+        DESTINATION "${IBEX_INSTALL_PLUGINDIR}" COMPONENT runtime
+    )
+endforeach()
+
+# Arrow/Parquet (libs/parquet, via FetchContent) are linked by `ibex` itself
+# and by the parquet plugin. Arrow's own install rules put them, with headers,
+# in the default component; this installs only the shared libraries, by SONAME,
+# beside the plugins. libs/parquet sets ARROW_RPATH_ORIGIN and
+# ARROW_INSTALL_NAME_RPATH so they resolve one another from there.
+foreach(_ibex_arrow_target arrow_shared parquet_shared arrow_ipc_shared)
+    if(NOT TARGET ${_ibex_arrow_target})
+        continue()
+    endif()
+    get_target_property(_ibex_arrow_type ${_ibex_arrow_target} TYPE)
+    if(NOT _ibex_arrow_type STREQUAL "SHARED_LIBRARY")
+        continue()
+    endif()
+    install(TARGETS ${_ibex_arrow_target}
+        LIBRARY DESTINATION "${IBEX_INSTALL_PLUGINDIR}" COMPONENT runtime NAMELINK_SKIP
+        RUNTIME DESTINATION "${IBEX_INSTALL_PLUGINDIR}" COMPONENT runtime
+        ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT devel
+    )
+endforeach()
+# The MSVC runtime (vcruntime/msvcp DLLs) beside ibex.exe, so the Windows bundle
+# starts on a machine without the Visual C++ Redistributable.
+if(MSVC)
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION "${CMAKE_INSTALL_BINDIR}")
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_COMPONENT runtime)
+    include(InstallRequiredSystemLibraries)
+endif()
+
+unset(_ibex_plugin)
+unset(_ibex_plugin_target)
+unset(_ibex_arrow_target)
+unset(_ibex_arrow_type)
+unset(_ibex_exe_rpath)
+unset(_ibex_plugin_rpath)

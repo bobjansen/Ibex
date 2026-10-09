@@ -64,22 +64,25 @@
     <p class="section-label">Install</p>
     <h2>Get a REPL and the bundled I/O plugins</h2>
     <p>
-      The quickest start is a release archive with the <code>ibex</code>
-      executable and plugin shared libraries. Building from source gives you the
-      latest work tree.
+      The quickest start is the installer, which puts a prebuilt
+      <code>ibex</code> with its bundled plugins and browser UI on your
+      <code>PATH</code>. Building from source gives you the latest work tree.
     </p>
     <div class="grid-2 wide-examples" style="margin-top:1.2rem;">
       <article class="card">
-        <h3>Download a release</h3>
+        <h3>Install a release</h3>
+        <p>Linux (x86_64, glibc 2.39+) and macOS (Apple silicon):</p>
+<pre><code>curl -fsSL https://github.com/bobjansen/Ibex/releases/latest/download/install.sh | sh</code></pre>
+        <p>Windows (PowerShell):</p>
+<pre><code>powershell -ExecutionPolicy Bypass -c "irm https://github.com/bobjansen/Ibex/releases/latest/download/install.ps1 | iex"</code></pre>
+<pre><code>ibex --version
+ibex              <span class="cm"># REPL</span>
+ibex ui --demo    <span class="cm"># browser UI with sample data</span></code></pre>
         <p>
-          Unpack the archive, keep the plugin directory next to the executable,
-          and start the REPL with an explicit plugin path.
-        </p>
-<pre><code><span class="cm"># from the unpacked release directory</span>
-./ibex --plugin-path ./plugins</code></pre>
-        <p>
-          Releases are published at
-          <a href="https://github.com/bobjansen/Ibex/releases" target="_blank" rel="noopener">github.com/bobjansen/Ibex/releases</a>.
+          Prefer no installer? Download the archive for your platform from
+          <a href="https://github.com/bobjansen/Ibex/releases" target="_blank" rel="noopener">github.com/bobjansen/Ibex/releases</a>,
+          unpack it anywhere and run <code>bin/ibex</code>; it finds its
+          plugins on its own.
         </p>
       </article>
       <article class="card">

@@ -11,25 +11,37 @@ including the separate MIT attribution for Poorman-derived Ibex test material.
 Small pull requests are welcome under the contribution terms in
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## Start the browser UI from a release
+## Install
 
-The release archive is self-contained: keep the `bin/`, `bin/ui/`, and
-`plugins/` directories together after extracting it. The commands below work
-for a new user without Node.js or a source checkout.
-
-On Linux or macOS:
+Linux (x86_64, glibc 2.39+, e.g. Ubuntu 24.04) and macOS (Apple silicon):
 
 ```bash
-cd ibex-<version>
-IBEX_LIBRARY_PATH="$PWD/plugins" ./bin/ibex ui --data-dir .
+curl -fsSL https://github.com/bobjansen/Ibex/releases/latest/download/install.sh | sh
 ```
 
-On Windows PowerShell:
+Windows (PowerShell):
 
 ```powershell
-cd ibex-<version>
-$env:IBEX_LIBRARY_PATH = "$PWD/plugins"
-.\bin\ibex.exe ui --data-dir .
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/bobjansen/Ibex/releases/latest/download/install.ps1 | iex"
+```
+
+The installer downloads the release archive for your platform, verifies its
+checksum, unpacks it into `~/.ibex` (`%LOCALAPPDATA%\Programs\Ibex` on Windows)
+and puts `ibex` on your `PATH`. `IBEX_VERSION=v0.4.0` pins a release and
+`IBEX_HOME` picks the directory. On Linux, `ibex` needs the system readline
+and curl libraries (`sudo apt install libreadline8t64 libcurl4t64`); the
+installer names them if they are missing.
+
+Without the installer: download `ibex-<version>-<platform>.tar.gz` (`.zip` on
+Windows) from the [releases page](https://github.com/bobjansen/Ibex/releases),
+unpack it anywhere and run `bin/ibex`. The archive is self-contained: `ibex`
+finds its plugins (`lib/ibex/`, or beside `ibex.exe` on Windows) and the
+browser UI (`bin/ui/`) relative to itself, so no environment variable is needed.
+
+## Start the browser UI
+
+```bash
+ibex ui --data-dir .
 ```
 
 To try queries without supplying data, load synthetic `trades`, `reference`

@@ -45,4 +45,21 @@ inline auto executable_directory() -> std::filesystem::path {
 #endif
 }
 
+/// Default plugin directory: `<prefix>/lib/ibex` when the executable sits in
+/// the release layout (`<prefix>/bin/ibex`, see the `runtime` install
+/// component in the top-level CMakeLists.txt), otherwise the executable's own
+/// directory, which is where a build tree and the Windows bundle keep them.
+inline auto default_plugin_directory() -> std::filesystem::path {
+    auto exe_dir = executable_directory();
+    if (exe_dir.empty()) {
+        return {};
+    }
+    std::error_code ec;
+    auto bundled = exe_dir.parent_path() / "lib" / "ibex";
+    if (std::filesystem::is_directory(bundled, ec)) {
+        return bundled;
+    }
+    return std::filesystem::exists(exe_dir, ec) ? exe_dir : std::filesystem::path{};
+}
+
 }  // namespace ibex::tools

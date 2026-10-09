@@ -57,6 +57,7 @@
 // clone_clause).
 
 #include <ibex/core/decimal.hpp>
+#include <ibex/core/enums.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/builder.hpp>
 #include <ibex/ir/column_name_map.hpp>
@@ -790,6 +791,36 @@ auto same_subquery_expr(const Expr* lhs, const Expr* rhs) -> bool {
 }
 
 /// The call `expr` is, if it calls `callee`; null otherwise.
+/// The built-in enum a built-in function's positional parameter takes
+/// (SPEC.md Section 3.7), or null for an ordinary value parameter.
+auto builtin_enum_parameter(std::string_view callee, std::size_t index) -> const BuiltinEnum* {
+    if (callee == "round" && index == 1) {
+        return &round_mode_enum();
+    }
+    return nullptr;
+}
+
+/// Lower an argument passed to a parameter of enum `type`: `Member` or
+/// `Type::Member`, written into the IR as its canonical `Type::Member` string.
+/// Enum values have no other source -- no column or binding holds one -- so a
+/// bare name here is a member or an error, never a column or `let`.
+auto lower_enum_argument(const BuiltinEnum& type, std::string_view callee, const Expr& arg)
+    -> std::expected<ir::Expr, LowerError> {
+    const auto* ident = std::get_if<IdentifierExpr>(&unwrap_group(arg).node);
+    if (ident == nullptr || ident->lexical) {
+        return std::unexpected(LowerError{
+            .message = std::string(callee) + "(): expected a " + std::string(type.name) +
+                       " such as " + std::string(type.members.front()) + " or " +
+                       std::string(type.name) + "::" + std::string(type.members.front())});
+    }
+    auto member = resolve_enum_member(type, ident->name);
+    if (!member.has_value()) {
+        return std::unexpected(
+            LowerError{.message = std::string(callee) + "(): " + member.error()});
+    }
+    return ir::Expr{.node = ir::Literal{.value = qualified_enum_member(type, *member)}};
+}
+
 auto as_call(const Expr& expr, std::string_view callee) -> const CallExpr* {
     const auto* call = std::get_if<CallExpr>(&unwrap_group(expr).node);
     return call != nullptr && call->callee == callee ? call : nullptr;
@@ -5061,6 +5092,14 @@ class Lowerer {
                     return it->second;
                 }
             }
+            // The parser admits a qualified identifier only for an enum member,
+            // and an enum-typed parameter consumes it before this point.
+            if (const auto cut = ident->name.rfind("::"); cut != std::string::npos) {
+                return std::unexpected(LowerError{
+                    .message = "'" + ident->name + "' is a " + ident->name.substr(0, cut) +
+                               " value; it can only be passed to a " + ident->name.substr(0, cut) +
+                               " parameter"});
+            }
             return ir::Expr{.node = ir::ColumnRef{.name = ident->name, .lexical = ident->lexical}};
         }
         if (const auto* literal = std::get_if<LiteralExpr>(&expr.node)) {
@@ -5293,7 +5332,16 @@ class Lowerer {
             ir::CallExpr lowered_call;
             lowered_call.callee = call->callee;
             lowered_call.args.reserve(call->args.size());
-            for (const auto& arg : call->args) {
+            for (std::size_t index = 0; index < call->args.size(); ++index) {
+                const auto& arg = call->args[index];
+                if (const auto* type = builtin_enum_parameter(call->callee, index)) {
+                    auto member = lower_enum_argument(*type, call->callee, *arg);
+                    if (!member.has_value()) {
+                        return std::unexpected(member.error());
+                    }
+                    lowered_call.args.push_back(ir::make_expr_ptr(std::move(*member)));
+                    continue;
+                }
                 auto lowered_arg = lower_expr_to_ir(*arg);
                 if (!lowered_arg.has_value()) {
                     return std::unexpected(lowered_arg.error());

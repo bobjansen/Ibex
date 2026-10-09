@@ -63,6 +63,7 @@
 // `as DataFrame<{ .. }>`, and negated numeric literals are folded.
 
 #include <ibex/core/decimal.hpp>
+#include <ibex/core/enums.hpp>
 #include <ibex/format.hpp>
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/effects.hpp>
@@ -1712,9 +1713,22 @@ class Parser {
     /// namespaces hold declarations, never values.
     auto parse_qualified_call(std::string name) -> ExprPtr {
         if (!match(TokenKind::LParen)) {
+            // `RoundMode::Nearest`: a member of a built-in enum (SPEC.md Section
+            // 3.7) is the one qualified name that is not a call. It stays an
+            // identifier; lowering checks it against the parameter it is passed to.
+            if (const auto cut = name.rfind("::"); cut != std::string::npos) {
+                if (const auto* type = find_builtin_enum(std::string_view(name).substr(0, cut))) {
+                    if (auto member = resolve_enum_member(*type, name); !member.has_value()) {
+                        return fail_expr(previous(), member.error());
+                    }
+                    auto expr = std::make_unique<Expr>();
+                    expr->node = IdentifierExpr{.name = std::move(name)};
+                    return expr;
+                }
+            }
             return fail_expr(peek(), "'" + name +
                                          "' is a qualified name and must be called; only "
-                                         "functions live in namespaces");
+                                         "functions and enum members live in namespaces");
         }
         return parse_call_args(std::move(name));
     }

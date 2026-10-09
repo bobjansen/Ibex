@@ -1,0 +1,14 @@
+// round's mode is a RoundMode, one of Ibex's built-in enums (SPEC.md 3.7).
+// Where a RoundMode is expected, write the member bare or qualified.
+
+let fills = Table {
+    qty = [2.5, 3.5, -2.5, 1.2],
+};
+
+fills[update {
+    nearest = round(qty, Nearest),           // ties away from zero
+    bankers = round(qty, Bankers),           // ties to even
+    down    = round(qty, RoundMode::Floor),  // the qualified form
+    up      = round(qty, Ceil),
+    toward0 = round(qty, Trunc),
+}];

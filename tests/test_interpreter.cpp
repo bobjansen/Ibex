@@ -22,6 +22,7 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <algorithm>
 #include <array>
@@ -2224,7 +2225,7 @@ TEST_CASE("Interpret blocked nested numeric update across block boundaries") {
         "t[update { revenue = price * (1.0 - discount) * (1.0 + tax), "
         "mixed = (quantity + 2) * price, "
         "int_expr = ((quantity % divisor) + 3) * (quantity - 1), "
-        "rounded = round((price * 2.0) + discount, nearest), "
+        "rounded = round((price * 2.0) + discount, Nearest), "
         "clipped = pmin(pmax(price + tax, -3.0), 35.0) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
@@ -7029,7 +7030,7 @@ TEST_CASE("scalar registry: casts/ceil/floor/trunc/round in update", "[scalar_re
 
     auto ir = require_ir(
         "t[update { fi = Float64(i), iw = Int64(w), c = ceil(f), fl = floor(f), tr = trunc(f), "
-        "rn = round(f, nearest), rb = round(f, bankers) }];");
+        "rn = round(f, Nearest), rb = round(f, Bankers) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
 
@@ -7071,7 +7072,7 @@ TEST_CASE("scalar registry: shared by filter predicates", "[scalar_registry]") {
     registry.emplace("t", table);
 
     // Casts and round work in predicate position (same registry as update/select).
-    auto ir = require_ir("t[filter Int64(w) > 3 && round(f, nearest) > 2];");
+    auto ir = require_ir("t[filter Int64(w) > 3 && round(f, Nearest) > 2];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
     const auto& f = std::get<Column<double>>(*result->find("f"));
@@ -8091,7 +8092,7 @@ TEST_CASE("round in an update is range-native under a split", "[update][parallel
     runtime::TableRegistry registry;
     registry.emplace("t", t);
 
-    for (const char* mode : {"nearest", "bankers", "floor", "ceil", "trunc"}) {
+    for (const char* mode : {"Nearest", "Bankers", "Floor", "Ceil", "Trunc"}) {
         CAPTURE(mode);
         const std::string source = "t[update { r = round(v, " + std::string(mode) + ") }];";
         auto ir = require_ir(source.c_str());
@@ -8112,6 +8113,56 @@ TEST_CASE("round in an update is range-native under a split", "[update][parallel
 
         CHECK(run(true) == run(false));
     }
+}
+
+TEST_CASE("round's mode is a RoundMode, bare or qualified, and never a column", "[round][enum]") {
+    runtime::Table t;
+    t.add_column("x", Column<double>{2.5, -2.5, 3.5, 1.2});
+    // A Float64 column named like a member. It cannot hold a RoundMode, so in
+    // the mode slot `Nearest` is the member; in the value slot it is this column.
+    t.add_column("Nearest", Column<double>{0.5, 1.5, 2.5, -0.5});
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir(
+        "t[update { a = round(x, Nearest), b = round(x, RoundMode::Nearest), "
+        "c = round(Nearest, Bankers), d = round(x, RoundMode::Floor) }];");
+    auto out = runtime::interpret(*ir, registry);
+    REQUIRE(out.has_value());
+    const auto ints = [&](const char* name) {
+        const auto& col = std::get<Column<std::int64_t>>(*out->find(name));
+        return std::vector<std::int64_t>(col.begin(), col.end());
+    };
+    CHECK(ints("a") == std::vector<std::int64_t>{3, -3, 4, 1});
+    CHECK(ints("b") == ints("a"));
+    CHECK(ints("c") == std::vector<std::int64_t>{0, 2, 2, 0});
+    CHECK(ints("d") == std::vector<std::int64_t>{2, -3, 3, 1});
+
+    const auto lower_error = [](const char* source) -> std::string {
+        auto program = parser::parse(source);
+        REQUIRE(program.has_value());
+        auto lowered = parser::lower(*program);
+        REQUIRE_FALSE(lowered.has_value());
+        return lowered.error().message;
+    };
+    CHECK_THAT(lower_error("t[update { a = round(x, nearest) }];"),
+               Catch::Matchers::ContainsSubstring("did you mean 'Nearest'"));
+    CHECK_THAT(lower_error("t[update { a = round(x, ^Nearest) }];"),
+               Catch::Matchers::ContainsSubstring("expected a RoundMode"));
+    CHECK_THAT(lower_error("t[update { a = round(x, 1) }];"),
+               Catch::Matchers::ContainsSubstring("expected a RoundMode"));
+    CHECK_THAT(lower_error("t[update { a = RoundMode::Nearest }];"),
+               Catch::Matchers::ContainsSubstring("can only be passed to a RoundMode parameter"));
+
+    const auto parse_error = [](const char* source) -> std::string {
+        auto program = parser::parse(source);
+        REQUIRE_FALSE(program.has_value());
+        return program.error().message;
+    };
+    CHECK_THAT(parse_error("t[update { a = round(x, RoundMode::Bogus) }];"),
+               Catch::Matchers::ContainsSubstring("unknown RoundMode member 'Bogus'"));
+    CHECK_THAT(parse_error("t[update { a = round(x, Mode::Nearest) }];"),
+               Catch::Matchers::ContainsSubstring("must be called"));
 }
 
 TEST_CASE("temporal parts write parallel fixed-width windows", "[update][parallel]") {
@@ -12769,7 +12820,7 @@ TEST_CASE("update scalar math builtins vectorise (sqrt/abs/floor/ceil/round)", "
 
     auto ir = require_ir(
         "t[update { sq = sqrt(abs(x)), fl = floor(x), ce = ceil(x), ab = abs(x), "
-        "rn = round(x, nearest), rb = round(x, bankers), comp = sqrt(x * x) }];");
+        "rn = round(x, Nearest), rb = round(x, Bankers), comp = sqrt(x * x) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
 
@@ -12791,12 +12842,12 @@ TEST_CASE("update scalar math builtins vectorise (sqrt/abs/floor/ceil/round)", "
     // round(x, mode) yields Int64; nearest rounds half away, bankers ties-to-even.
     const auto* rn = std::get_if<Column<std::int64_t>>(result->find("rn"));
     REQUIRE(rn != nullptr);
-    REQUIRE((*rn)[1] == -3);  // round(-2.5, nearest)
-    REQUIRE((*rn)[2] == 4);   // round(3.5, nearest)
+    REQUIRE((*rn)[1] == -3);  // round(-2.5, Nearest)
+    REQUIRE((*rn)[2] == 4);   // round(3.5, Nearest)
     const auto* rb = std::get_if<Column<std::int64_t>>(result->find("rb"));
     REQUIRE(rb != nullptr);
-    REQUIRE((*rb)[1] == -2);  // round(-2.5, bankers) -> ties to even
-    REQUIRE((*rb)[2] == 4);   // round(3.5, bankers)  -> ties to even
+    REQUIRE((*rb)[1] == -2);  // round(-2.5, Bankers) -> ties to even
+    REQUIRE((*rb)[2] == 4);   // round(3.5, Bankers)  -> ties to even
 
     // Computed argument exercises the tree-walk UnaryDouble path.
     const auto* comp = std::get_if<Column<double>>(result->find("comp"));
@@ -12816,7 +12867,7 @@ TEST_CASE("round nearest matches llround at the double-rounding boundary", "[upd
     t.add_column("x", Column<double>{just_below_half, -just_below_half, 0.5, -0.5, 2.5});
     registry["t"] = std::move(t);
 
-    auto ir = require_ir("t[update { r = round(x, nearest) }];");
+    auto ir = require_ir("t[update { r = round(x, Nearest) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
     const auto* r = std::get_if<Column<std::int64_t>>(result->find("r"));

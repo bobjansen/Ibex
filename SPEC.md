@@ -498,7 +498,7 @@ let bad = Int64(3.9);           // runtime error: 3.9 is not a whole number
 prices[update { vol_int = Int64(volume_f) }];
 
 // Round first, then cast
-prices[update { vol_int = Int64(round(volume_f, nearest)) }];
+prices[update { vol_int = Int64(round(volume_f, Nearest)) }];
 
 // Instant -> UTC calendar day, e.g. to group by day
 flights[select { n = count() }, by { day = Date(time_hour) }];
@@ -924,6 +924,42 @@ The runtime check is enforced on both execution paths: the interpreter/REPL and
 generated C++ (the `ibex_compile` path emits a validating `ibex::ops::ascribe`
 call).
 
+### 3.7 Built-in Enums
+
+Some function parameters take one of a fixed set of named choices rather than a
+value. Ibex defines these as **built-in enums**; scripts cannot declare their
+own. Each has a PascalCase type name and PascalCase members:
+
+| Enum        | Members                                   | Used by                    |
+|-------------|-------------------------------------------|----------------------------|
+| `RoundMode` | `Nearest`, `Bankers`, `Floor`, `Ceil`, `Trunc` | `round(x, mode)` (Section 12.6) |
+
+A member is written **qualified**, `RoundMode::Nearest`, or **bare**,
+`Nearest`, wherever a parameter of that enum type is expected:
+
+```
+round(price, RoundMode::Bankers)
+round(price, Bankers)            // same: the parameter's type says which enum
+```
+
+**Resolution of a bare member.** In an argument whose parameter has enum type
+`E`, a bare identifier is looked up among `E`'s members, and among columns and
+`let` bindings *of type `E`*. A name found in exactly one place resolves there;
+a name found in both is an ambiguity error that asks for the qualified form.
+Columns and bindings of other types are not candidates: a `Float64` column
+named `Nearest` cannot be passed where a `RoundMode` is expected, so in that
+position `Nearest` is the member. No column or binding can hold an enum value
+today, so a bare member never actually competes with one.
+
+An enum-typed parameter accepts only a member, bare or qualified: a string, a
+number, a `^name`, or any other expression is a compile-time error, as is an
+unknown member (`round(x, nearest)` suggests `Nearest`). A qualified member is
+an error anywhere other than an argument of its enum type, and
+`RoundMode::Bogus` is a parse error.
+
+Enum values are not first-class: they cannot be stored in a column, bound with
+`let`, or returned from a function.
+
 ---
 
 ## 4. Formal Grammar
@@ -1030,6 +1066,7 @@ join_take       = "take" ( "first" | "last" | "any" ) ;
 
 primary         = IDENT [ "(" [ arg_list ] ")" ]
                 | [ "::" ] qualified_name "(" [ arg_list ] ")"  (* Section 11.7 *)
+                | IDENT "::" IDENT                 (* enum member, Section 3.7 *)
                 | "Table" "{" [ table_col_def { "," table_col_def } [ "," ] ] "}"
                 | case_expr
                 | "^" IDENT                      (* scope escape *)
@@ -4162,7 +4199,7 @@ These scalar functions, the cast constructors of Section 3.1.1
 (`Int64`/`Float64`/…), and `round` are row-wise: they may be used uniformly in
 `select`, `update` (plain and windowed), and `filter` predicates. `ceil`/
 `floor`/`trunc` keep the numeric type (an integral `Float64` stays `Float64`);
-use `round(x, ceil|floor|trunc)` for a `Float -> Int64` conversion.
+use `round(x, Ceil|Floor|Trunc)` for a `Float -> Int64` conversion.
 
 **Boolean-valued expressions in value position.** Comparisons (`a > b`), logical
 connectives (`&&`, `||`, `!`), and the null tests `is_null` / `is_not_null` are
@@ -4184,17 +4221,18 @@ and the fill/clean functions of Section 3.5 (`fill_null`, `null_if_nan`,
 value is returned unchanged. For Decimal input it returns an exact scale-zero
 Decimal; the result precision is `min(38, max(1, p - s + 1))`. Decimal rounding
 applies to the scaled integer units without converting through Float64. The
-mode is a bare identifier (not a string):
+mode is a `RoundMode` (Section 3.7), written bare (`Nearest`) or qualified
+(`RoundMode::Nearest`):
 
 | Mode      | Behaviour                                  | C++ equivalent         |
 |-----------|--------------------------------------------|------------------------|
-| `nearest` | Round to nearest, ties away from zero      | `std::llround`         |
-| `bankers` | Round to nearest, ties to even (banker's)  | `std::llrint`          |
-| `floor`   | Round toward −∞                            | `std::floor` + cast    |
-| `ceil`    | Round toward +∞                            | `std::ceil`  + cast    |
-| `trunc`   | Round toward zero (truncate)               | `std::trunc` + cast    |
+| `Nearest` | Round to nearest, ties away from zero      | `std::llround`         |
+| `Bankers` | Round to nearest, ties to even (banker's)  | `std::llrint`          |
+| `Floor`   | Round toward −∞                            | `std::floor` + cast    |
+| `Ceil`    | Round toward +∞                            | `std::ceil`  + cast    |
+| `Trunc`   | Round toward zero (truncate)               | `std::trunc` + cast    |
 
-`bankers` uses IEEE 754 default rounding (`FE_TONEAREST`): 0.5 rounds to the
+`Bankers` uses IEEE 754 default rounding (`FE_TONEAREST`): 0.5 rounds to the
 nearest even integer, so 2.5 → 2 and 3.5 → 4. This is the statistically
 unbiased choice for repeated rounding.
 
@@ -4204,23 +4242,23 @@ for contexts such as `select { hi = max(price) }, by symbol`. Row-wise
 `pmin` / `pmax` require comparable arguments of one type; `Int64` and
 `Float64` may be mixed and widen to `Float64`.
 
-Passing a non-numeric value is a type error. An unknown mode identifier is a
-runtime error.
+Passing a non-numeric value is a type error. An unknown mode is a compile-time
+error.
 
 ```
-round(3.7, nearest)   // → 4
-round(3.7, bankers)   // → 4
-round(2.5, nearest)   // → 3  (ties away from zero)
-round(2.5, bankers)   // → 2  (ties to even)
-round(3.5, bankers)   // → 4  (ties to even)
-round(3.7, floor)     // → 3
-round(3.7, ceil)      // → 4
-round(3.7, trunc)     // → 3
-round(-3.7, nearest)  // → -4
-round(-3.7, trunc)    // → -3
+round(3.7, Nearest)   // → 4
+round(3.7, Bankers)   // → 4
+round(2.5, Nearest)   // → 3  (ties away from zero)
+round(2.5, Bankers)   // → 2  (ties to even)
+round(3.5, Bankers)   // → 4  (ties to even)
+round(3.7, Floor)     // → 3
+round(3.7, Ceil)      // → 4
+round(3.7, Trunc)     // → 3
+round(-3.7, Nearest)  // → -4
+round(-3.7, RoundMode::Trunc)  // → -3  (the qualified form)
 
 // Typical use: round a Float column to Int before an explicit cast
-prices[update { vol_int = round(volume_f, bankers) }];
+prices[update { vol_int = round(volume_f, Bankers) }];
 ```
 
 #### String Pattern Matching — `like`

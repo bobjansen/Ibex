@@ -3,6 +3,7 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/decimal.hpp>
+#include <ibex/core/enums.hpp>
 #include <ibex/core/text.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/format.hpp>
@@ -1785,58 +1786,46 @@ auto apply_column_cast(const runtime::ColumnValue& col, std::string_view callee)
     return std::unexpected(std::string(callee) + "(): cannot cast column to Float");
 }
 
-/// Validates that an expression is a bare mode identifier and returns its name.
-auto extract_round_mode(const parser::Expr& arg) -> std::expected<std::string_view, std::string> {
+/// round's mode: `Nearest` or `RoundMode::Nearest` (SPEC.md Section 3.7).
+auto extract_round_mode(const parser::Expr& arg) -> std::expected<RoundMode, std::string> {
     const auto* ident = std::get_if<parser::IdentifierExpr>(&arg.node);
-    if (!ident) {
+    if (ident == nullptr || ident->lexical) {
         return std::unexpected(
-            "round(): second argument must be a bare mode identifier (nearest, bankers, floor, "
-            "ceil, trunc)");
+            "round(): expected a RoundMode such as Nearest or RoundMode::Nearest");
     }
-    if (ident->name != "nearest" && ident->name != "bankers" && ident->name != "floor" &&
-        ident->name != "ceil" && ident->name != "trunc") {
-        return std::unexpected("round(): unknown mode '" + ident->name +
-                               "' (expected: nearest, bankers, floor, ceil, trunc)");
+    auto mode = resolve_round_mode(ident->name);
+    if (!mode.has_value()) {
+        return std::unexpected("round(): " + mode.error());
     }
-    return std::string_view{ident->name};
+    return *mode;
 }
 
-auto apply_scalar_round(double v, std::string_view mode)
+auto round_value(double v, RoundMode mode) -> std::int64_t {
+    switch (mode) {
+        case RoundMode::Nearest:
+            return static_cast<std::int64_t>(std::llround(v));
+        case RoundMode::Bankers:
+            return static_cast<std::int64_t>(std::llrint(v));  // FE_TONEAREST: ties to even
+        case RoundMode::Floor:
+            return static_cast<std::int64_t>(std::floor(v));
+        case RoundMode::Ceil:
+            return static_cast<std::int64_t>(std::ceil(v));
+        case RoundMode::Trunc:
+            break;
+    }
+    return static_cast<std::int64_t>(std::trunc(v));
+}
+
+auto apply_scalar_round(double v, RoundMode mode)
     -> std::expected<runtime::ScalarValue, std::string> {
-    std::int64_t result{};
-    if (mode == "nearest") {
-        result = static_cast<std::int64_t>(std::llround(v));
-    } else if (mode == "bankers") {
-        result =
-            static_cast<std::int64_t>(std::llrint(v));  // uses FE_TONEAREST (round-half-to-even)
-    } else if (mode == "floor") {
-        result = static_cast<std::int64_t>(std::floor(v));
-    } else if (mode == "ceil") {
-        result = static_cast<std::int64_t>(std::ceil(v));
-    } else {  // trunc
-        result = static_cast<std::int64_t>(std::trunc(v));
-    }
-    return runtime::ScalarValue{result};
+    return runtime::ScalarValue{round_value(v, mode)};
 }
 
-auto apply_column_round(const Column<double>& src, std::string_view mode) -> Column<std::int64_t> {
+auto apply_column_round(const Column<double>& src, RoundMode mode) -> Column<std::int64_t> {
     Column<std::int64_t> dst;
     dst.reserve(src.size());
     for (const double v : src) {
-        std::int64_t r{};
-        if (mode == "nearest") {
-            r = static_cast<std::int64_t>(std::llround(v));
-        } else if (mode == "bankers") {
-            r = static_cast<std::int64_t>(
-                std::llrint(v));  // uses FE_TONEAREST (round-half-to-even)
-        } else if (mode == "floor") {
-            r = static_cast<std::int64_t>(std::floor(v));
-        } else if (mode == "ceil") {
-            r = static_cast<std::int64_t>(std::ceil(v));
-        } else {  // trunc
-            r = static_cast<std::int64_t>(std::trunc(v));
-        }
-        dst.push_back(r);
+        dst.push_back(round_value(v, mode));
     }
     return dst;
 }
@@ -1939,7 +1928,7 @@ constexpr auto kBuiltinDocs = std::to_array<BuiltinDoc>({
     {.name = "round",
      .signature = "round(value, mode) -> Int64",
      .summary = "Round Float64 using nearest/bankers/floor/ceil/trunc.",
-     .example = "round(2.5, bankers)"},
+     .example = "round(2.5, Bankers)"},
     {.name = "like",
      .signature = "like(value, pattern) -> Bool",
      .summary = "SQL-LIKE match over the whole string: % is any run of characters, _ is one, "

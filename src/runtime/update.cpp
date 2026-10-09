@@ -8,6 +8,7 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/decimal.hpp>
+#include <ibex/core/enums.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
@@ -538,25 +539,34 @@ struct NumericUpdateNode {
     std::int64_t (*int_fn)(double) = nullptr;
 };
 
-// round(x, mode) → Int64. mode is a bare identifier; resolve it to a kernel at
-// compile time. Mirrors apply_round() exactly. Returns nullptr for bad modes.
-auto lookup_round_int_fn(std::string_view mode) -> std::int64_t (*)(double) {
-    if (mode == "nearest") {
-        return [](double v) { return static_cast<std::int64_t>(std::llround(v)); };
+// round(x, mode)'s mode: the `RoundMode::Member` literal lowering writes, or
+// nullopt for any other argument.
+auto round_mode_arg(const ir::Expr& arg) -> std::optional<RoundMode> {
+    const auto* literal = std::get_if<ir::Literal>(&arg.node);
+    const auto* text = literal != nullptr ? std::get_if<std::string>(&literal->value) : nullptr;
+    if (text == nullptr) {
+        return std::nullopt;
     }
-    if (mode == "bankers") {
-        return [](double v) { return static_cast<std::int64_t>(std::llrint(v)); };
+    auto mode = resolve_round_mode(*text);
+    return mode.has_value() ? std::optional(*mode) : std::nullopt;
+}
+
+// round(x, mode) → Int64: the mode's kernel, fixed at compile time. Mirrors
+// apply_round() exactly.
+auto lookup_round_int_fn(RoundMode mode) -> std::int64_t (*)(double) {
+    switch (mode) {
+        case RoundMode::Nearest:
+            return [](double v) { return static_cast<std::int64_t>(std::llround(v)); };
+        case RoundMode::Bankers:
+            return [](double v) { return static_cast<std::int64_t>(std::llrint(v)); };
+        case RoundMode::Floor:
+            return [](double v) { return static_cast<std::int64_t>(std::floor(v)); };
+        case RoundMode::Ceil:
+            return [](double v) { return static_cast<std::int64_t>(std::ceil(v)); };
+        case RoundMode::Trunc:
+            break;
     }
-    if (mode == "floor") {
-        return [](double v) { return static_cast<std::int64_t>(std::floor(v)); };
-    }
-    if (mode == "ceil") {
-        return [](double v) { return static_cast<std::int64_t>(std::ceil(v)); };
-    }
-    if (mode == "trunc") {
-        return [](double v) { return static_cast<std::int64_t>(std::trunc(v)); };
-    }
-    return nullptr;
+    return [](double v) { return static_cast<std::int64_t>(std::trunc(v)); };
 }
 
 // Materialize `src` as a Column<int64_t> (want == Int) or Column<double>
@@ -744,14 +754,14 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
     }
 
     // round(x, mode) → Int: compile the value child and wrap in a UnaryToInt
-    // node whose kernel is fixed by the (compile-time) mode identifier.
+    // node whose kernel is fixed by the (compile-time) mode.
     if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
         if (call->callee == "round" && call->args.size() == 2 && call->named_args.empty()) {
-            const auto* moderef = std::get_if<ir::ColumnRef>(&call->args[1]->node);
-            auto kern = moderef != nullptr ? lookup_round_int_fn(moderef->name) : nullptr;
-            if (kern == nullptr) {
+            const auto mode = round_mode_arg(*call->args[1]);
+            if (!mode.has_value()) {
                 return std::nullopt;
             }
+            auto* kern = lookup_round_int_fn(*mode);
             auto child = try_compile_numeric_update_expr(*call->args[0], input, scalars, nodes,
                                                          temps, range);
             if (!child.has_value()) {
@@ -1313,9 +1323,9 @@ auto try_fast_update_unary(const ir::Expr& expr, const Table& input, RowRange ra
     }
 
     if (call->callee == "round" && call->args.size() == 2 && output_kind == ExprType::Int) {
-        const auto* moderef = std::get_if<ir::ColumnRef>(&call->args[1]->node);
+        const auto mode = round_mode_arg(*call->args[1]);
         auto arg = resolve_fast_operand(*call->args[0], input, scalars);
-        if (moderef == nullptr || !arg || !arg->is_column || arg->kind != ExprType::Double) {
+        if (!mode.has_value() || !arg || !arg->is_column || arg->kind != ExprType::Double) {
             return std::nullopt;
         }
         const double* src = std::get<Column<double>>(*arg->column).data() + begin;
@@ -1326,8 +1336,7 @@ auto try_fast_update_unary(const ir::Expr& expr, const Table& input, RowRange ra
             for (std::size_t i = 0; i < rows; ++i)
                 dst[i] = k(src[i]);
         };
-        const auto& m = moderef->name;
-        if (m == "nearest") {
+        if (*mode == RoundMode::Nearest) {
             // Round half away from zero, branchless so the loop vectorises
             // (trunc/fabs/copysign → vroundpd/vandpd/vorpd) instead of calling
             // libm llround per element. Exact: frac = v - trunc(v) is computed
@@ -1341,16 +1350,14 @@ auto try_fast_update_unary(const ir::Expr& expr, const Table& input, RowRange ra
                 return static_cast<std::int64_t>(std::fabs(frac) >= 0.5 ? t + std::copysign(1.0, v)
                                                                         : t);
             });
-        } else if (m == "bankers") {
+        } else if (*mode == RoundMode::Bankers) {
             run([](double v) { return static_cast<std::int64_t>(std::llrint(v)); });
-        } else if (m == "floor") {
+        } else if (*mode == RoundMode::Floor) {
             run([](double v) { return static_cast<std::int64_t>(std::floor(v)); });
-        } else if (m == "ceil") {
+        } else if (*mode == RoundMode::Ceil) {
             run([](double v) { return static_cast<std::int64_t>(std::ceil(v)); });
-        } else if (m == "trunc") {
-            run([](double v) { return static_cast<std::int64_t>(std::trunc(v)); });
         } else {
-            return std::nullopt;
+            run([](double v) { return static_cast<std::int64_t>(std::trunc(v)); });
         }
         return ColumnValue{std::move(out)};
     }

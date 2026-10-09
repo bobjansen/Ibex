@@ -2457,7 +2457,7 @@ int main(int argc, char** argv) {
                 {.name = "sqrt_price", .source = "prices[update { v = sqrt(price) }]"},
                 {.name = "log_price", .source = "prices[update { v = log(price) }]"},
                 {.name = "exp_price", .source = "prices[update { v = exp(price / 1000.0) }]"},
-                {.name = "round_price", .source = "prices[update { v = round(price, nearest) }]"},
+                {.name = "round_price", .source = "prices[update { v = round(price, Nearest) }]"},
                 {.name = "floor_price", .source = "prices[update { v = floor(price) }]"},
                 {.name = "ceil_price", .source = "prices[update { v = ceil(price) }]"},
                 {.name = "sin_price", .source = "prices[update { v = sin(price) }]"},

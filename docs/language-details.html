@@ -953,10 +953,13 @@ sales[<span class="kw">filter</span> <span class="fn-name">like</span>(label, <s
           <p>
             <strong>Float &rarr; Int casts</strong> require the value to be a
             whole number. Use <code>round(x,&nbsp;mode)</code> first when the
-            value may have a fractional part. Five modes are available:
-            <code>nearest</code> (ties away from zero), <code>bankers</code>
-            (ties to even — statistically unbiased), <code>floor</code>,
-            <code>ceil</code>, <code>trunc</code>.
+            value may have a fractional part. The mode is a
+            <code>RoundMode</code>, one of Ibex's built-in enums:
+            <code>Nearest</code> (ties away from zero), <code>Bankers</code>
+            (ties to even — statistically unbiased), <code>Floor</code>,
+            <code>Ceil</code>, <code>Trunc</code>. Write it bare where a
+            <code>RoundMode</code> is expected, or qualified as
+            <code>RoundMode::Nearest</code>.
           </p>
           <p>
             Type annotations on <code>let</code> bindings and function
@@ -972,19 +975,20 @@ sales[<span class="kw">filter</span> <span class="fn-name">like</span>(label, <s
 <span class="cm">// Int64(3.9)  ← runtime error: fractional part</span>
 
 <span class="cm">// Round a Float column to Int</span>
-prices[<span class="kw">update</span> { vol_int = <span class="fn-name">round</span>(volume_f, nearest) }];
+prices[<span class="kw">update</span> { vol_int = <span class="fn-name">round</span>(volume_f, Nearest) }];
 
 <span class="cm">// All five rounding modes</span>
-<span class="fn-name">round</span>(<span class="num">3.7</span>, nearest)   <span class="cm">// → 4  (ties away from zero)</span>
-<span class="fn-name">round</span>(<span class="num">2.5</span>, nearest)   <span class="cm">// → 3  (tie → away from zero)</span>
-<span class="fn-name">round</span>(<span class="num">2.5</span>, bankers)   <span class="cm">// → 2  (tie → nearest even)</span>
-<span class="fn-name">round</span>(<span class="num">3.5</span>, bankers)   <span class="cm">// → 4  (tie → nearest even)</span>
-<span class="fn-name">round</span>(<span class="num">3.7</span>, floor)     <span class="cm">// → 3  (toward −∞)</span>
-<span class="fn-name">round</span>(<span class="num">3.7</span>, ceil)      <span class="cm">// → 4  (toward +∞)</span>
-<span class="fn-name">round</span>(<span class="num">3.7</span>, trunc)     <span class="cm">// → 3  (toward zero)</span>
+<span class="fn-name">round</span>(<span class="num">3.7</span>, Nearest)   <span class="cm">// → 4  (ties away from zero)</span>
+<span class="fn-name">round</span>(<span class="num">2.5</span>, Nearest)   <span class="cm">// → 3  (tie → away from zero)</span>
+<span class="fn-name">round</span>(<span class="num">2.5</span>, Bankers)   <span class="cm">// → 2  (tie → nearest even)</span>
+<span class="fn-name">round</span>(<span class="num">3.5</span>, Bankers)   <span class="cm">// → 4  (tie → nearest even)</span>
+<span class="fn-name">round</span>(<span class="num">3.7</span>, Floor)     <span class="cm">// → 3  (toward −∞)</span>
+<span class="fn-name">round</span>(<span class="num">3.7</span>, Ceil)      <span class="cm">// → 4  (toward +∞)</span>
+<span class="fn-name">round</span>(<span class="num">3.7</span>, Trunc)     <span class="cm">// → 3  (toward zero)</span>
+<span class="fn-name">round</span>(<span class="num">3.7</span>, RoundMode::Trunc)  <span class="cm">// → 3  (qualified form)</span>
 
 <span class="cm">// Column-level cast after rounding</span>
-prices[<span class="kw">update</span> { vol_int = <span class="fn-name">Int64</span>(<span class="fn-name">round</span>(volume_f, nearest)) }];
+prices[<span class="kw">update</span> { vol_int = <span class="fn-name">Int64</span>(<span class="fn-name">round</span>(volume_f, Nearest)) }];
 
 <span class="cm">// Annotation validation</span>
 <span class="kw">let</span> y: Float64 = <span class="fn-name">Float64</span>(<span class="num">42</span>);   <span class="cm">// explicit cast satisfies annotation</span></code></pre>

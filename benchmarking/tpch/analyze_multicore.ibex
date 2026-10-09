@@ -56,7 +56,7 @@ let polars = raw[filter framework == pl_fw && scale_factor == sf]
 let cmp = (ibex join polars on {query})
             [update {
                 speedup = polars_ms / ibex_ms,
-                ibex_faster_pct = round((polars_ms / ibex_ms - 1.0) * 100.0, nearest)
+                ibex_faster_pct = round((polars_ms / ibex_ms - 1.0) * 100.0, Nearest)
             }];
 
 // --- Every query, slowest (for Ibex) first. -------------------------------

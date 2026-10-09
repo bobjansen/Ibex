@@ -2640,8 +2640,8 @@ auto is_range_native_expr(const ir::Expr& expr) -> bool {
                 const auto* fn = find_builtin(node.callee);
                 if (fn == nullptr) {
                     // `round(x, mode)` is dispatched apart from the value-based
-                    // registry because its mode is a bare identifier rather than
-                    // a value (see extract_ir_round_mode), so `find_builtin`
+                    // registry because its mode is a RoundMode rather than a
+                    // value (see extract_ir_round_mode), so `find_builtin`
                     // cannot see it. It is row-local either way: the fused
                     // numeric tree compiles it to a range-aware UnaryToInt node
                     // whose kernel the mode fixes at compile time, and the

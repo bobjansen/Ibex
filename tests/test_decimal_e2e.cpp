@@ -214,9 +214,9 @@ TEST_CASE("Decimal abs and round preserve exact scale semantics", "[decimal][e2e
     runtime::TableRegistry tables;
     tables.emplace("t", std::move(t));
     auto out = run_ok(
-        "t[update { magnitude = abs(x), nearest = round(x, nearest), "
-        "bankers = round(x, bankers), low = round(x, floor), high = round(x, ceil), "
-        "toward_zero = round(x, trunc) }];",
+        "t[update { magnitude = abs(x), nearest = round(x, Nearest), "
+        "bankers = round(x, Bankers), low = round(x, Floor), high = round(x, Ceil), "
+        "toward_zero = round(x, Trunc) }];",
         tables);
     CHECK(texts(out, "magnitude") ==
           std::vector<std::string>{"1.50", "1.50", "1.25", "1.25", "0.50"});

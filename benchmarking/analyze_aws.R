@@ -194,15 +194,26 @@ if (kind == "pdsh") {
         perf <- do.call(rbind, lapply(perf_files, function(f) {
             lines <- readLines(f, warn = FALSE)
             m <- regmatches(basename(f), regexec("perf_stat_(q[0-9]+)_([0-9]+)c", basename(f)))[[1]]
+            # Older perf prints task-clock as "<x> msec task-clock", newer
+            # perf (the AWS box's) as bare nanoseconds.
+            task_line <- grep("task-clock", lines, value = TRUE)
+            task_clock <- counter(lines, "task-clock")
+            if (length(task_line) == 0 || !grepl("msec", task_line[[1]])) {
+                task_clock <- task_clock / 1e6
+            }
             data.frame(query = m[[2]], cores = as.integer(m[[3]]),
-                       task_clock_ms = counter(lines, "task-clock"),
+                       task_clock_ms = task_clock,
                        page_faults = counter(lines, "page-faults"),
                        major_faults = counter(lines, "major-faults"),
                        dtlb_load_misses = counter(lines, "dTLB-load-misses"),
-                       cycles = counter(lines, "cycles"))
+                       cycles = counter(lines, "cycles"),
+                       instructions = counter(lines, "instructions"))
         }))
         show("perf stat, Ibex (warm REPL, same warmup/iters as the timed run)", ibex('
-            perf[update { faults_per_cpu_ms = Float64(page_faults) / task_clock_ms }]
+            perf[update { faults_per_cpu_ms = Float64(page_faults) / task_clock_ms,
+                          ipc = Float64(instructions) / Float64(cycles) }]
+                [select { query, cores, task_clock_ms, page_faults, faults_per_cpu_ms,
+                          dtlb_load_misses, ipc }]
                 [order { query asc, cores asc }];', tables = list(perf = perf)))
     }
     mem_files <- list.files(host, pattern = "^memory_.*\\.txt$", full.names = TRUE)

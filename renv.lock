@@ -124,36 +124,6 @@
       "Maintainer": "Hadley Wickham <hadley@posit.co>",
       "Repository": "CRAN"
     },
-    "TTR": {
-      "Package": "TTR",
-      "Version": "0.24.4",
-      "Source": "Repository",
-      "Type": "Package",
-      "Title": "Technical Trading Rules",
-      "Authors@R": "c( person(given=\"Joshua\", family=\"Ulrich\", role=c(\"cre\",\"aut\"), email=\"josh.m.ulrich@gmail.com\"), person(given=c(\"Ethan\",\"B.\"), family=\"Smith\", role=\"ctb\") )",
-      "Imports": [
-        "xts (>= 0.10-0)",
-        "zoo",
-        "curl"
-      ],
-      "LinkingTo": [
-        "xts"
-      ],
-      "Enhances": [
-        "quantmod"
-      ],
-      "Suggests": [
-        "RUnit"
-      ],
-      "Description": "A collection of over 50 technical indicators for creating technical trading rules. The package also provides fast implementations of common rolling-window functions, and several volatility calculations.",
-      "License": "GPL (>= 2)",
-      "URL": "https://github.com/joshuaulrich/TTR",
-      "BugReports": "https://github.com/joshuaulrich/TTR/issues",
-      "NeedsCompilation": "yes",
-      "Author": "Joshua Ulrich [cre, aut], Ethan B. Smith [ctb]",
-      "Maintainer": "Joshua Ulrich <josh.m.ulrich@gmail.com>",
-      "Repository": "CRAN"
-    },
     "base64enc": {
       "Package": "base64enc",
       "Version": "0.1-6",
@@ -173,6 +143,75 @@
       "URL": "https://www.rforge.net/base64enc",
       "BugReports": "https://github.com/s-u/base64enc/issues",
       "NeedsCompilation": "yes",
+      "Repository": "CRAN"
+    },
+    "bit": {
+      "Package": "bit",
+      "Version": "4.6.0",
+      "Source": "Repository",
+      "Title": "Classes and Methods for Fast Memory-Efficient Boolean Selections",
+      "Authors@R": "c( person(\"Michael\", \"Chirico\", email = \"MichaelChirico4@gmail.com\", role = c(\"aut\", \"cre\")), person(\"Jens\", \"Oehlschlägel\", role = \"aut\"), person(\"Brian\", \"Ripley\", role = \"ctb\") )",
+      "Depends": [
+        "R (>= 3.4.0)"
+      ],
+      "Suggests": [
+        "testthat (>= 3.0.0)",
+        "roxygen2",
+        "knitr",
+        "markdown",
+        "rmarkdown",
+        "microbenchmark",
+        "bit64 (>= 4.0.0)",
+        "ff (>= 4.0.0)"
+      ],
+      "Description": "Provided are classes for boolean and skewed boolean vectors, fast boolean methods, fast unique and non-unique integer sorting, fast set operations on sorted and unsorted sets of integers, and foundations for ff (range index, compression, chunked processing).",
+      "License": "GPL-2 | GPL-3",
+      "LazyLoad": "yes",
+      "ByteCompile": "yes",
+      "Encoding": "UTF-8",
+      "URL": "https://github.com/r-lib/bit",
+      "VignetteBuilder": "knitr, rmarkdown",
+      "RoxygenNote": "7.3.2",
+      "Config/testthat/edition": "3",
+      "NeedsCompilation": "yes",
+      "Author": "Michael Chirico [aut, cre], Jens Oehlschlägel [aut], Brian Ripley [ctb]",
+      "Maintainer": "Michael Chirico <MichaelChirico4@gmail.com>",
+      "Repository": "CRAN"
+    },
+    "bit64": {
+      "Package": "bit64",
+      "Version": "4.8.2",
+      "Source": "Repository",
+      "Title": "A S3 Class for Vectors of 64bit Integers",
+      "Authors@R": "c( person(\"Michael\", \"Chirico\", email=\"michaelchirico4@gmail.com\", role=c(\"aut\", \"cre\")), person(\"Jens\", \"Oehlschlägel\", role=\"aut\"), person(\"Leonardo\", \"Silvestri\", role=\"ctb\"), person(\"Ofek\", \"Shilon\", role=\"ctb\"), person(\"Christian\", \"Ullerich\", role=\"ctb\") )",
+      "Depends": [
+        "R (>= 3.5.0)"
+      ],
+      "Description": "Package 'bit64' provides serializable S3 atomic 64bit (signed) integers. These are useful for handling database keys and exact counting in +-2^63. WARNING: do not use them as replacement for 32bit integers, integer64 are not supported for subscripting by R-core and they have different semantics when combined with double, e.g. integer64 + double => integer64. Class integer64 can be used in vectors, matrices, arrays and data.frames. Methods are available for coercion from and to logicals, integers, doubles, characters and factors as well as many elementwise and summary functions. Many fast algorithmic operations such as 'match' and 'order' support inter- active data exploration and manipulation and optionally leverage caching.",
+      "License": "GPL-2 | GPL-3",
+      "LazyLoad": "yes",
+      "ByteCompile": "yes",
+      "URL": "https://github.com/r-lib/bit64, https://bit64.r-lib.org",
+      "Encoding": "UTF-8",
+      "Imports": [
+        "bit (>= 4.0.0)",
+        "graphics",
+        "methods",
+        "stats",
+        "utils"
+      ],
+      "Suggests": [
+        "patrick (>= 0.3.0)",
+        "testthat (>= 3.3.0)",
+        "withr"
+      ],
+      "Config/testthat/edition": "3",
+      "Config/Needs/development": "patrick, testthat",
+      "Config/Needs/website": "tidyverse/tidytemplate",
+      "RoxygenNote": "7.3.3",
+      "NeedsCompilation": "yes",
+      "Author": "Michael Chirico [aut, cre], Jens Oehlschlägel [aut], Leonardo Silvestri [ctb], Ofek Shilon [ctb], Christian Ullerich [ctb]",
+      "Maintainer": "Michael Chirico <michaelchirico4@gmail.com>",
       "Repository": "CRAN"
     },
     "brio": {
@@ -475,40 +514,6 @@
       "NeedsCompilation": "no",
       "Author": "Gábor Csárdi [aut, cre], Brodie Gaslam [ctb], Posit Software, PBC [cph, fnd]",
       "Maintainer": "Gábor Csárdi <csardi.gabor@gmail.com>",
-      "Repository": "CRAN"
-    },
-    "curl": {
-      "Package": "curl",
-      "Version": "7.1.0",
-      "Source": "Repository",
-      "Type": "Package",
-      "Title": "A Modern and Flexible Web Client for R",
-      "Authors@R": "c( person(\"Jeroen\", \"Ooms\", role = c(\"aut\", \"cre\"), email = \"jeroenooms@gmail.com\", comment = c(ORCID = \"0000-0002-4035-0289\")), person(\"Hadley\", \"Wickham\", role = \"ctb\"), person(\"Posit Software, PBC\", role = \"cph\"))",
-      "Description": "Bindings to 'libcurl' <https://curl.se/libcurl/> for performing fully configurable HTTP/FTP requests where responses can be processed in memory, on disk, or streaming via the callback or connection interfaces. Some knowledge of 'libcurl' is recommended; for a more-user-friendly web client see the  'httr2' package which builds on this package with http specific tools and logic.",
-      "License": "MIT + file LICENSE",
-      "SystemRequirements": "libcurl (>= 7.73): libcurl-devel (rpm) or libcurl4-openssl-dev (deb)",
-      "URL": "https://jeroen.r-universe.dev/curl",
-      "BugReports": "https://github.com/jeroen/curl/issues",
-      "Suggests": [
-        "spelling",
-        "testthat (>= 1.0.0)",
-        "knitr",
-        "jsonlite",
-        "later",
-        "rmarkdown",
-        "httpuv (>= 1.4.4)",
-        "webutils"
-      ],
-      "VignetteBuilder": "knitr",
-      "Depends": [
-        "R (>= 3.0.0)"
-      ],
-      "RoxygenNote": "7.3.2",
-      "Encoding": "UTF-8",
-      "Language": "en-US",
-      "NeedsCompilation": "yes",
-      "Author": "Jeroen Ooms [aut, cre] (ORCID: <https://orcid.org/0000-0002-4035-0289>), Hadley Wickham [ctb], Posit Software, PBC [cph]",
-      "Maintainer": "Jeroen Ooms <jeroenooms@gmail.com>",
       "Repository": "CRAN"
     },
     "data.table": {
@@ -966,6 +971,59 @@
       "Maintainer": "Thomas Lin Pedersen <thomas.pedersen@posit.co>",
       "Repository": "CRAN"
     },
+    "ggrepel": {
+      "Package": "ggrepel",
+      "Version": "0.9.8",
+      "Source": "Repository",
+      "Authors@R": "c( person(\"Kamil\", \"Slowikowski\", email = \"kslowikowski@gmail.com\", role = c(\"aut\", \"cre\"), comment = c(ORCID = \"0000-0002-2843-6370\")), person(\"Teun\", \"van den Brand\", role = \"ctb\", comment = c(ORCID = \"0000-0002-9335-7468\")), person(\"Alicia\", \"Schep\", role = \"ctb\", comment = c(ORCID = \"0000-0002-3915-0618\")), person(\"Sean\", \"Hughes\", role = \"ctb\", comment = c(ORCID = \"0000-0002-9409-9405\")), person(\"Trung Kien\", \"Dang\", role = \"ctb\", comment = c(ORCID = \"0000-0001-7562-6495\")), person(\"Saulius\", \"Lukauskas\", role = \"ctb\"), person(\"Jean-Olivier\", \"Irisson\", role = \"ctb\", comment = c(ORCID = \"0000-0003-4920-3880\")), person(\"Zhian N\", \"Kamvar\", role = \"ctb\", comment = c(ORCID = \"0000-0003-1458-7108\")), person(\"Thompson\", \"Ryan\", role = \"ctb\", comment = c(ORCID = \"0000-0002-0450-8181\")), person(\"Dervieux\", \"Christophe\", role = \"ctb\", comment = c(ORCID = \"0000-0003-4474-2498\")), person(\"Yutani\", \"Hiroaki\", role = \"ctb\"), person(\"Pierre\", \"Gramme\", role = \"ctb\"), person(\"Amir Masoud\", \"Abdol\", role = \"ctb\"), person(\"Malcolm\", \"Barrett\", role = \"ctb\", comment = c(ORCID = \"0000-0003-0299-5825\")), person(\"Robrecht\", \"Cannoodt\", role = \"ctb\", comment = c(ORCID = \"0000-0003-3641-729X\")), person(\"Michał\", \"Krassowski\", role = \"ctb\", comment = c(ORCID = \"0000-0002-9638-7785\")), person(\"Michael\", \"Chirico\", role = \"ctb\", comment = c(ORCID = \"0000-0003-0787-087X\")), person(\"Pedro\", \"Aphalo\", role = \"ctb\", comment = c(ORCID = \"0000-0003-3385-972X\")), person(\"Francis\", \"Barton\", role = \"ctb\") )",
+      "Title": "Automatically Position Non-Overlapping Text Labels with 'ggplot2'",
+      "Description": "Provides text and label geoms for 'ggplot2' that help to avoid overlapping text labels. Labels repel away from each other and away from the data points.",
+      "Depends": [
+        "R (>= 4.1.0)",
+        "ggplot2 (>= 3.5.2)"
+      ],
+      "Imports": [
+        "grid",
+        "Rcpp",
+        "rlang (>= 1.1.6)",
+        "S7",
+        "scales (>= 1.4.0)",
+        "withr (>= 3.0.2)"
+      ],
+      "Suggests": [
+        "knitr",
+        "rmarkdown",
+        "testthat",
+        "svglite",
+        "vdiffr",
+        "gridExtra",
+        "ggpp",
+        "patchwork",
+        "devtools",
+        "prettydoc",
+        "ggbeeswarm",
+        "dplyr",
+        "magrittr",
+        "readr",
+        "stringr",
+        "marquee",
+        "rsvg",
+        "sf"
+      ],
+      "VignetteBuilder": "knitr",
+      "License": "GPL-3 | file LICENSE",
+      "URL": "https://ggrepel.slowkow.com/, https://github.com/slowkow/ggrepel",
+      "BugReports": "https://github.com/slowkow/ggrepel/issues",
+      "RoxygenNote": "7.3.3",
+      "LinkingTo": [
+        "Rcpp"
+      ],
+      "Encoding": "UTF-8",
+      "NeedsCompilation": "yes",
+      "Author": "Kamil Slowikowski [aut, cre] (ORCID: <https://orcid.org/0000-0002-2843-6370>), Teun van den Brand [ctb] (ORCID: <https://orcid.org/0000-0002-9335-7468>), Alicia Schep [ctb] (ORCID: <https://orcid.org/0000-0002-3915-0618>), Sean Hughes [ctb] (ORCID: <https://orcid.org/0000-0002-9409-9405>), Trung Kien Dang [ctb] (ORCID: <https://orcid.org/0000-0001-7562-6495>), Saulius Lukauskas [ctb], Jean-Olivier Irisson [ctb] (ORCID: <https://orcid.org/0000-0003-4920-3880>), Zhian N Kamvar [ctb] (ORCID: <https://orcid.org/0000-0003-1458-7108>), Thompson Ryan [ctb] (ORCID: <https://orcid.org/0000-0002-0450-8181>), Dervieux Christophe [ctb] (ORCID: <https://orcid.org/0000-0003-4474-2498>), Yutani Hiroaki [ctb], Pierre Gramme [ctb], Amir Masoud Abdol [ctb], Malcolm Barrett [ctb] (ORCID: <https://orcid.org/0000-0003-0299-5825>), Robrecht Cannoodt [ctb] (ORCID: <https://orcid.org/0000-0003-3641-729X>), Michał Krassowski [ctb] (ORCID: <https://orcid.org/0000-0002-9638-7785>), Michael Chirico [ctb] (ORCID: <https://orcid.org/0000-0003-0787-087X>), Pedro Aphalo [ctb] (ORCID: <https://orcid.org/0000-0003-3385-972X>), Francis Barton [ctb]",
+      "Maintainer": "Kamil Slowikowski <kslowikowski@gmail.com>",
+      "Repository": "CRAN"
+    },
     "glue": {
       "Package": "glue",
       "Version": "1.8.0",
@@ -1163,6 +1221,39 @@
       "Author": "Joe Cheng [aut], Winston Chang [aut, cre], Posit, PBC [cph, fnd] (ROR: <https://ror.org/03wc8by49>), Hector Corrada Bravo [ctb], Jeroen Ooms [ctb], Andrzej Krzemienski [cph] (optional.hpp), libuv project contributors [cph] (libuv library, see src/libuv/AUTHORS file), Joyent, Inc. and other Node contributors [cph] (libuv library, see src/libuv/AUTHORS file; and http-parser library, see src/http-parser/AUTHORS file), Niels Provos [cph] (libuv subcomponent: tree.h), Internet Systems Consortium, Inc. [cph] (libuv subcomponent: inet_pton and inet_ntop, contained in src/libuv/src/inet.c), Alexander Chemeris [cph] (libuv subcomponent: stdint-msvc2008.h (from msinttypes)), Google, Inc. [cph] (libuv subcomponent: pthread-fixes.c), Sony Mobile Communcations AB [cph] (libuv subcomponent: pthread-fixes.c), Berkeley Software Design Inc. [cph] (libuv subcomponent: android-ifaddrs.h, android-ifaddrs.c), Kenneth MacKay [cph] (libuv subcomponent: android-ifaddrs.h, android-ifaddrs.c), Emergya (Cloud4all, FP7/2007-2013, grant agreement no 289016) [cph] (libuv subcomponent: android-ifaddrs.h, android-ifaddrs.c), Steve Reid [aut] (SHA-1 implementation), James Brown [aut] (SHA-1 implementation), Bob Trower [aut] (base64 implementation), Alexander Peslyak [aut] (MD5 implementation), Trantor Standard Systems [cph] (base64 implementation), Igor Sysoev [cph] (http-parser)",
       "Maintainer": "Winston Chang <winston@posit.co>",
       "Repository": "CRAN"
+    },
+    "ibex": {
+      "Package": "ibex",
+      "Version": "0.0.1",
+      "Source": "unknown",
+      "Type": "Package",
+      "Title": "R Interface for Ibex",
+      "Authors@R": "c(person(\"Bob\", \"Jansen\", email = \"bobjansen@hey.com\", role = c(\"aut\", \"cre\")))",
+      "Author": "Bob Jansen [aut, cre]",
+      "Maintainer": "Ibex Developers <ibex@example.invalid>",
+      "Description": "Pure-R bindings for the Ibex dataframe DSL. Queries are parsed and executed by the Ibex C++ runtime and results are imported into R through the Arrow C Data Interface using nanoarrow. Results can be returned as a nanoarrow array or converted directly to a data.frame for immediate use with ggplot2.",
+      "Depends": [
+        "R (>= 4.4)"
+      ],
+      "Imports": [
+        "dplyr (>= 1.1.0)",
+        "nanoarrow",
+        "rlang (>= 1.1.0)",
+        "tibble (>= 3.2.0)",
+        "tidyselect (>= 1.2.0)"
+      ],
+      "Suggests": [
+        "bit64",
+        "knitr",
+        "testthat (>= 3.0.0)"
+      ],
+      "Config/testthat/edition": "3",
+      "Config/ibex/dplyr-version": ">= 1.1.0, < 1.2.0",
+      "SystemRequirements": "CMake (>= 3.26), C++23 compiler and standard library with <format>, curl, tar",
+      "License": "AGPL-3 + file LICENSE",
+      "Encoding": "UTF-8",
+      "RoxygenNote": "7.3.2",
+      "NeedsCompilation": "yes"
     },
     "isoband": {
       "Package": "isoband",
@@ -1380,45 +1471,6 @@
       "NeedsCompilation": "yes",
       "Author": "Winston Chang [aut] (ORCID: <https://orcid.org/0000-0002-1576-2126>), Joe Cheng [aut], Charlie Gao [aut, cre] (ORCID: <https://orcid.org/0000-0002-0750-061X>), Posit Software, PBC [cph, fnd] (ROR: <https://ror.org/03wc8by49>), Marcus Geelnard [ctb, cph] (TinyCThread library, https://tinycthread.github.io/), Evan Nemerson [ctb, cph] (TinyCThread library, https://tinycthread.github.io/)",
       "Maintainer": "Charlie Gao <charlie.gao@posit.co>",
-      "Repository": "CRAN"
-    },
-    "lattice": {
-      "Package": "lattice",
-      "Version": "0.22-6",
-      "Source": "Repository",
-      "Date": "2024-03-20",
-      "Priority": "recommended",
-      "Title": "Trellis Graphics for R",
-      "Authors@R": "c(person(\"Deepayan\", \"Sarkar\", role = c(\"aut\", \"cre\"), email = \"deepayan.sarkar@r-project.org\", comment = c(ORCID = \"0000-0003-4107-1553\")), person(\"Felix\", \"Andrews\", role = \"ctb\"), person(\"Kevin\", \"Wright\", role = \"ctb\", comment = \"documentation\"), person(\"Neil\", \"Klepeis\", role = \"ctb\"), person(\"Johan\", \"Larsson\", role = \"ctb\", comment = \"miscellaneous improvements\"), person(\"Zhijian (Jason)\", \"Wen\", role = \"cph\", comment = \"filled contour code\"), person(\"Paul\", \"Murrell\", role = \"ctb\", email = \"paul@stat.auckland.ac.nz\"), person(\"Stefan\", \"Eng\", role = \"ctb\", comment = \"violin plot improvements\"), person(\"Achim\", \"Zeileis\", role = \"ctb\", comment = \"modern colors\"), person(\"Alexandre\", \"Courtiol\", role = \"ctb\", comment = \"generics for larrows, lpolygon, lrect and lsegments\") )",
-      "Description": "A powerful and elegant high-level data visualization system inspired by Trellis graphics, with an emphasis on multivariate data. Lattice is sufficient for typical graphics needs, and is also flexible enough to handle most nonstandard requirements. See ?Lattice for an introduction.",
-      "Depends": [
-        "R (>= 4.0.0)"
-      ],
-      "Suggests": [
-        "KernSmooth",
-        "MASS",
-        "latticeExtra",
-        "colorspace"
-      ],
-      "Imports": [
-        "grid",
-        "grDevices",
-        "graphics",
-        "stats",
-        "utils"
-      ],
-      "Enhances": [
-        "chron",
-        "zoo"
-      ],
-      "LazyLoad": "yes",
-      "LazyData": "yes",
-      "License": "GPL (>= 2)",
-      "URL": "https://lattice.r-forge.r-project.org/",
-      "BugReports": "https://github.com/deepayan/lattice/issues",
-      "NeedsCompilation": "yes",
-      "Author": "Deepayan Sarkar [aut, cre] (<https://orcid.org/0000-0003-4107-1553>), Felix Andrews [ctb], Kevin Wright [ctb] (documentation), Neil Klepeis [ctb], Johan Larsson [ctb] (miscellaneous improvements), Zhijian (Jason) Wen [cph] (filled contour code), Paul Murrell [ctb], Stefan Eng [ctb] (violin plot improvements), Achim Zeileis [ctb] (modern colors), Alexandre Courtiol [ctb] (generics for larrows, lpolygon, lrect and lsegments)",
-      "Maintainer": "Deepayan Sarkar <deepayan.sarkar@r-project.org>",
       "Repository": "CRAN"
     },
     "lifecycle": {
@@ -3137,41 +3189,6 @@
       "NeedsCompilation": "no",
       "Author": "David B. Dahl [aut], David Scott [aut, cre], Charles Roosen [aut], Arni Magnusson [aut], Jonathan Swinton [aut], Ajay Shah [ctb], Arne Henningsen [ctb], Benno Puetz [ctb], Bernhard Pfaff [ctb], Claudio Agostinelli [ctb], Claudius Loehnert [ctb], David Mitchell [ctb], David Whiting [ctb], Fernando da Rosa [ctb], Guido Gay [ctb], Guido Schulz [ctb], Ian Fellows [ctb], Jeff Laake [ctb], John Walker [ctb], Jun Yan [ctb], Liviu Andronic [ctb], Markus Loecher [ctb], Martin Gubri [ctb], Matthieu Stigler [ctb], Robert Castelo [ctb], Seth Falcon [ctb], Stefan Edwards [ctb], Sven Garbade [ctb], Uwe Ligges [ctb]"
     },
-    "xts": {
-      "Package": "xts",
-      "Version": "0.14.2",
-      "Source": "Repository",
-      "Type": "Package",
-      "Title": "eXtensible Time Series",
-      "Authors@R": "c( person(given=c(\"Jeffrey\",\"A.\"), family=\"Ryan\", role=c(\"aut\",\"cph\")), person(given=c(\"Joshua\",\"M.\"), family=\"Ulrich\", role=c(\"cre\",\"aut\"), email=\"josh.m.ulrich@gmail.com\"), person(given=\"Ross\", family=\"Bennett\", role=\"ctb\"), person(given=\"Corwin\", family=\"Joy\", role=\"ctb\") )",
-      "Depends": [
-        "R (>= 3.6.0)",
-        "zoo (>= 1.7-12)"
-      ],
-      "Imports": [
-        "methods"
-      ],
-      "LinkingTo": [
-        "zoo"
-      ],
-      "Suggests": [
-        "timeSeries",
-        "timeDate",
-        "tseries",
-        "chron",
-        "tinytest"
-      ],
-      "LazyLoad": "yes",
-      "Description": "Provide for uniform handling of R's different time-based data classes by extending zoo, maximizing native format information preservation and allowing for user level customization and extension, while simplifying cross-class interoperability.",
-      "License": "GPL (>= 2)",
-      "URL": "https://joshuaulrich.github.io/xts/, https://github.com/joshuaulrich/xts",
-      "BugReports": "https://github.com/joshuaulrich/xts/issues",
-      "Encoding": "UTF-8",
-      "NeedsCompilation": "yes",
-      "Author": "Jeffrey A. Ryan [aut, cph], Joshua M. Ulrich [cre, aut], Ross Bennett [ctb], Corwin Joy [ctb]",
-      "Maintainer": "Joshua M. Ulrich <josh.m.ulrich@gmail.com>",
-      "Repository": "CRAN"
-    },
     "yaml": {
       "Package": "yaml",
       "Version": "2.3.12",
@@ -3196,50 +3213,6 @@
       "NeedsCompilation": "yes",
       "Author": "Hadley Wickham [cre] (ORCID: <https://orcid.org/0000-0003-4757-117X>), Shawn Garbett [ctb] (ORCID: <https://orcid.org/0000-0003-4079-5621>), Jeremy Stephens [aut, ctb], Kirill Simonov [aut], Yihui Xie [ctb] (ORCID: <https://orcid.org/0000-0003-0645-5666>), Zhuoer Dong [ctb], Jeffrey Horner [ctb], reikoch [ctb], Will Beasley [ctb] (ORCID: <https://orcid.org/0000-0002-5613-5006>), Brendan O'Connor [ctb], Michael Quinn [ctb], Charlie Gao [ctb], Gregory R. Warnes [ctb], Zhian N. Kamvar [ctb]",
       "Maintainer": "Hadley Wickham <hadley@posit.co>",
-      "Repository": "CRAN"
-    },
-    "zoo": {
-      "Package": "zoo",
-      "Version": "1.9-0",
-      "Source": "Repository",
-      "Date": "2026-07-30",
-      "Title": "S3 Infrastructure for Regular and Irregular Time Series (Z's Ordered Observations)",
-      "Authors@R": "c(person(given = \"Achim\", family = \"Zeileis\", role = c(\"aut\", \"cre\"), email = \"Achim.Zeileis@R-project.org\", comment = c(ORCID = \"0000-0003-0918-3766\")), person(given = \"Gabor\", family = \"Grothendieck\", role = \"aut\", email = \"ggrothendieck@gmail.com\"), person(given = c(\"Jeffrey\", \"A.\"), family = \"Ryan\", role = \"aut\", email = \"jeff.a.ryan@gmail.com\"), person(given = c(\"Joshua\", \"M.\"), family = \"Ulrich\", role = \"ctb\", email = \"josh.m.ulrich@gmail.com\"), person(given = \"Felix\", family = \"Andrews\", role = \"ctb\", email = \"felix@nfrac.org\"))",
-      "Description": "An S3 class with methods for working with regular and irregular time series. The class stores data as numeric vectors/matrices (or factors) along with a time index of arbitrary class (including numeric, Date, POSIXct, chron, yearmon, yearqtr, etc.). Functions and methods are consistent with the ts class and base R and also extend standard generics. Tools include: Data import/export, coercion, visualization (with base R, 'ggplot2', 'lattice', 'tinyplot'), alignment and merging, aggregation, lags and subsets, rolling analytics, and time-based interpolation/filling. The design is introduced in Zeileis and Grothendieck (2005) <doi:10.18637/jss.v014.i06>.",
-      "Depends": [
-        "R (>= 3.1.0)",
-        "stats"
-      ],
-      "Suggests": [
-        "AER",
-        "coda",
-        "chron",
-        "ggplot2 (>= 3.5.0)",
-        "knitr",
-        "mondate",
-        "scales",
-        "stinepack",
-        "strucchange",
-        "timeDate",
-        "timeSeries (>= 4021.104)",
-        "tinyplot",
-        "tis",
-        "tseries",
-        "xts"
-      ],
-      "Imports": [
-        "utils",
-        "graphics",
-        "grDevices",
-        "lattice (>= 0.20-27)"
-      ],
-      "License": "GPL-2 | GPL-3",
-      "VignetteBuilder": "knitr",
-      "URL": "https://zeileis.codeberg.page/zoo/",
-      "BugReports": "https://codeberg.org/zeileis/zoo/issues",
-      "NeedsCompilation": "yes",
-      "Author": "Achim Zeileis [aut, cre] (ORCID: <https://orcid.org/0000-0003-0918-3766>), Gabor Grothendieck [aut], Jeffrey A. Ryan [aut], Joshua M. Ulrich [ctb], Felix Andrews [ctb]",
-      "Maintainer": "Achim Zeileis <Achim.Zeileis@R-project.org>",
       "Repository": "CRAN"
     }
   }

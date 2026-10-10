@@ -5,7 +5,7 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/compiler.hpp>
-#include <ibex/core/null_scalar.hpp>
+#include <ibex/core/scalar_value.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/core/time_zone.hpp>
 #include <ibex/ir/node.hpp>
@@ -43,15 +43,11 @@ using ScalarKind = ibex::ScalarKind;
 using ColumnValue =
     std::variant<Column<std::int64_t>, Column<double>, Column<std::string>, Column<Categorical>,
                  Column<Date>, Column<Timestamp>, Column<bool>, Column<Decimal>>;
-// A scalar value, or null. `NullScalar` is the null alternative: it records
-// the kind of value it stands in for (SPEC.md §6.7), and a default-constructed
-// ScalarValue is an untyped null. It maps to the internal ExprValue::Null
-// across the row-eval boundary. Historically ScalarValue was
-// null-free; SPEC.md §6.7 has the null-scalar semantics that replaced that.
-// Extern arguments remain null-free -- the type system rejects a
-// null before the call, it never reaches an extern.
-using ScalarValue = std::variant<ibex::NullScalar, std::int64_t, double, bool, std::string, Date,
-                                 Timestamp, DecimalValue>;
+// A scalar value, or a null of a recorded type (core/scalar_value.hpp). It maps
+// to the internal ExprValue::Null across the row-eval boundary. Extern
+// arguments remain null-free -- the type system rejects a null before the
+// call, it never reaches an extern.
+using ScalarValue = ibex::ScalarValue;
 
 /// The precision and scale of a Decimal column. Absent metadata on a Decimal
 /// column is a producer bug; reading it as scale 0 is the least surprising

@@ -2268,22 +2268,7 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
                 return arg_type;
             }
         }
-        switch (fn->scalar_kind.value()) {
-            case ScalarKind::Int:
-                return ExprType::Int;
-            case ScalarKind::Double:
-                return ExprType::Double;
-            case ScalarKind::Bool:
-                return ExprType::Bool;
-            case ScalarKind::String:
-                return ExprType::String;
-            case ScalarKind::Date:
-                return ExprType::Date;
-            case ScalarKind::Timestamp:
-                return ExprType::Timestamp;
-            case ScalarKind::Decimal:
-                return ExprType::Decimal;
-        }
+        return expr_type_of_kind(fn->scalar_kind).value();
     }
     return std::unexpected("unsupported expression");
 }

@@ -4,11 +4,14 @@
 #pragma once
 
 #include <ibex/core/decimal.hpp>
+#include <ibex/core/time.hpp>
 
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <string>
+#include <variant>
 
 namespace ibex {
 
@@ -37,6 +40,12 @@ struct NullScalar {
 
     [[nodiscard]] auto operator==(const NullScalar&) const -> bool = default;
 };
+
+/// A scalar value, or a null of a recorded type. The one definition every layer
+/// uses: the parser (compile-time scalar bindings), the runtime and codegen
+/// alias it.
+using ScalarValue = std::variant<NullScalar, std::int64_t, double, bool, std::string, Date,
+                                 Timestamp, DecimalValue>;
 
 }  // namespace ibex
 

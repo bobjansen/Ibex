@@ -3102,6 +3102,23 @@ TEST_CASE("ReplSession: print output comes back without rendering results", "[re
     CHECK(failed.output.find("missing_table") == std::string::npos);
 }
 
+TEST_CASE("ReplSession: table and scalar hold the last value only", "[repl][session]") {
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+
+    const auto scalar_last = session.execute("Table { a = [1] }; 1 + 1;");
+    REQUIRE(scalar_last.ok);
+    CHECK_FALSE(scalar_last.table.has_value());
+    REQUIRE(scalar_last.scalar.has_value());
+    CHECK(std::get<std::int64_t>(*scalar_last.scalar) == 2);
+    CHECK(scalar_last.tables.size() == 1);  // every rendered table is still kept
+
+    const auto table_last = session.execute("1 + 1; Table { a = [1] };");
+    REQUIRE(table_last.ok);
+    CHECK(table_last.table.has_value());
+    CHECK_FALSE(table_last.scalar.has_value());
+}
+
 TEST_CASE("ReplSession: infer_schema lowers against the session's bindings", "[repl][session]") {
     ibex::runtime::ExternRegistry registry;
     ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);

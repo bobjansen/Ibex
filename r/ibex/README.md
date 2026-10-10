@@ -66,7 +66,10 @@ Current shape:
   normalized through `nanoarrow` when possible.
 - `scalars = list(x = 1L, flag = TRUE, day = as.Date(...), ts = as.POSIXct(...))`
   binds R scalars into Ibex by copy.
-- results return as a `data.frame` by default for immediate `ggplot2` use
+- results return as a `data.frame` by default for immediate `ggplot2` use;
+  when the last statement is a scalar, it returns as a length-1 vector of that
+  type (`session_eval(s, "1 + 1;")` is `2`, a null scalar is `NA`), and a call
+  whose last statement produces no value returns invisible `NULL`
 - `format = "nanoarrow"` returns the lower-level Arrow-backed nanoarrow array
 - `session_table_schema()` inspects a resident table without evaluating a query
 

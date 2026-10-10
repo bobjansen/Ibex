@@ -77,9 +77,16 @@ default_plugin_paths <- function() {
     candidates[dir.exists(candidates)]
 }
 
+# A query's last value comes back as a data.frame (a table), a length-1 vector
+# (a scalar), or invisible NULL (no value). A scalar travels as a one-row table
+# flagged `scalar = TRUE`, so it gets exactly the conversion a table column
+# would; a null scalar arrives as NA, since it has no type to convert.
 as_ibex_result <- function(payload, format) {
     if (is.null(payload)) {
         return(invisible(NULL))
+    }
+    if (is.atomic(payload)) {
+        return(payload)
     }
 
     stopifnot(is.list(payload), all(c("array", "schema") %in% names(payload)))
@@ -93,7 +100,13 @@ as_ibex_result <- function(payload, format) {
         return(array)
     }
 
-    warn_int64_precision(convert_ibex_array(array, schema), schema)
+    result <- warn_int64_precision(convert_ibex_array(array, schema), schema)
+    if (isTRUE(payload$scalar)) {
+        # `[1L]`, not `[[1L]]`: single brackets keep Date, POSIXct (and its
+        # zone), factor and integer64 classes.
+        return(result[[1L]][1L])
+    }
+    result
 }
 
 # An Ibex Categorical is exported as an Arrow dictionary array, which is

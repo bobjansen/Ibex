@@ -141,8 +141,12 @@ for t in "${THREADS[@]}"; do
     echo ""
 done
 
-# --keep-data held the generated CSVs across passes; drop them now.
-rm -rf "$SCRIPT_DIR/data/scales"
+# --keep-data held the generated CSVs across passes; drop them now, unless the
+# caller still needs them (bootstrap.sh's perf stat pass runs on them after the
+# sweep and removes them itself).
+if [[ "${IBEX_SCALING_KEEP_DATA:-0}" != "1" ]]; then
+    rm -rf "$SCRIPT_DIR/data/scales"
+fi
 
 echo "thread-scaling results written to:"
 echo "  $OUT"

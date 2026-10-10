@@ -1,0 +1,21 @@
+// Explicit casts: Ibex never converts between types implicitly.
+
+let runs = Table {
+    cores = [1, 2, 8],
+    ms = [50281.0, 26714.0, 8414.0],
+    day = [date"2026-10-09", date"2026-10-09", date"2026-10-10"],
+};
+
+runs[update {
+    // Number -> text, exactly as it prints (the same as `${cores}`).
+    label = String(cores),
+    tagged = `${cores}c`,
+    when = String(day),
+    // Float -> Int needs a whole number: round first.
+    seconds = Int64(round(ms / 1000.0, Nearest)),
+    // Bool -> Int counts a predicate.
+    slow = Int64(ms > 10000.0),
+}];
+
+// A text label makes a number usable as a dcast pivot column.
+runs[update { at = String(cores) }][dcast at, select ms, by day];

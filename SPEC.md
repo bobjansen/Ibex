@@ -448,6 +448,7 @@ Int64(x)    Float64(x)
 Int32(x)    Float32(x)
 Int(x)      -- alias for Int64(x)
 Date(x)
+String(x)
 ```
 
 **Float → Int casts** succeed only when the value is already a whole number
@@ -476,6 +477,15 @@ zone-less `Timestamp` — it cuts on **UTC**. The truncation floors, so an insta
 before the epoch lands on its own day rather than rounding toward the epoch.
 Other input types are a compile-time error; there is no `Date("2024-01-15")`
 parse (use the `date"..."` literal).
+
+**String casts** accept any type and yield its text exactly as the value
+prints, so `String(x)` is the same as the template `` `${x}` ``:
+`String(8)` is `"8"`, `String(2.0)` is `"2"`, `String(date"2024-01-15")` is
+`"2024-01-15"`. A null stays null. It is the way to turn a number into a label,
+for example a `dcast` pivot column: `by { at = String(cores) }`.
+
+No other type name is a cast: `Bool(x)` and `Timestamp(x)` are compile errors
+that list the casts above.
 
 **Decimal casts** name the target type in the call:
 `Decimal(x, precision, scale)`, with integer-literal precision and scale. They

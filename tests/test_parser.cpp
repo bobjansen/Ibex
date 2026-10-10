@@ -2038,3 +2038,14 @@ TEST_CASE("A qualified declaration name is shorthand for a namespace block") {
     REQUIRE_FALSE(duplicate.has_value());
     REQUIRE(duplicate.error().message == "'csv::read' is already declared");
 }
+
+TEST_CASE("A type name that is not a cast says which casts exist") {
+    for (const char* src : {"t[update { b = Bool(x) }];", "t[update { b = Timestamp(x) }];"}) {
+        auto result = ibex::parser::parse(src);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().message.find("is a type, not a cast") != std::string::npos);
+        CHECK(result.error().message.find("String(x)") != std::string::npos);
+    }
+    CHECK(ibex::parser::parse("t[update { s = String(x) }];").has_value());
+    CHECK_FALSE(ibex::parser::parse("t[update { s = String x }];").has_value());
+}

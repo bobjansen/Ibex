@@ -67,7 +67,8 @@ std::unique_ptr<T[]> make_owned_array(std::size_t n) {
 struct FastOperand {
     bool is_column = false;
     const ColumnValue* column = nullptr;
-    ScalarValue literal;
+    /// Set exactly when !is_column.
+    std::optional<ScalarValue> literal;
     ExprType kind = ExprType::Int;
 };
 
@@ -89,7 +90,7 @@ auto resolve_fast_operand(const ir::Expr& expr, const Table& input, const Scalar
             return FastOperand{
                 .is_column = true,
                 .column = source,
-                .literal = ScalarValue{},
+                .literal = std::nullopt,
                 .kind = expr_type_for_column(*source),
             };
         }
@@ -157,16 +158,16 @@ auto apply_double_op(ir::ArithmeticOp op, double lhs, double rhs) -> double {
 
 auto get_int_value(const FastOperand& op, std::size_t row) -> std::int64_t {
     if (!op.is_column) {
-        if (const auto* int_value = std::get_if<std::int64_t>(&op.literal)) {
+        if (const auto* int_value = std::get_if<std::int64_t>(&*op.literal)) {
             return *int_value;
         }
-        if (const auto* date_value = std::get_if<Date>(&op.literal)) {
+        if (const auto* date_value = std::get_if<Date>(&*op.literal)) {
             return date_value->days;
         }
-        if (const auto* ts_value = std::get_if<Timestamp>(&op.literal)) {
+        if (const auto* ts_value = std::get_if<Timestamp>(&*op.literal)) {
             return ts_value->nanos;
         }
-        return static_cast<std::int64_t>(std::get<double>(op.literal));
+        return static_cast<std::int64_t>(std::get<double>(*op.literal));
     }
     if (const auto* int_col = std::get_if<Column<std::int64_t>>(op.column)) {
         return (*int_col)[row];
@@ -185,16 +186,16 @@ auto get_int_value(const FastOperand& op, std::size_t row) -> std::int64_t {
 
 auto get_double_value(const FastOperand& op, std::size_t row) -> double {
     if (!op.is_column) {
-        if (const auto* int_value = std::get_if<std::int64_t>(&op.literal)) {
+        if (const auto* int_value = std::get_if<std::int64_t>(&*op.literal)) {
             return static_cast<double>(*int_value);
         }
-        if (const auto* date_value = std::get_if<Date>(&op.literal)) {
+        if (const auto* date_value = std::get_if<Date>(&*op.literal)) {
             return static_cast<double>(date_value->days);
         }
-        if (const auto* ts_value = std::get_if<Timestamp>(&op.literal)) {
+        if (const auto* ts_value = std::get_if<Timestamp>(&*op.literal)) {
             return static_cast<double>(ts_value->nanos);
         }
-        return std::get<double>(op.literal);
+        return std::get<double>(*op.literal);
     }
     if (const auto* int_col = std::get_if<Column<std::int64_t>>(op.column)) {
         return static_cast<double>((*int_col)[row]);
@@ -1569,13 +1570,10 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
             }
             if (scalars != nullptr) {
                 if (auto it = scalars->find(col_ref->name); it != scalars->end()) {
-                    if (is_null_scalar(it->second)) {
-                        // A null binding has no type of its own: an all-null
-                        // Int64 column, as the value path broadcasts it.
-                        Column<std::int64_t> nulls;
-                        nulls.resize(rows, 0);
-                        output.add_column(field.alias, std::move(nulls),
-                                          ValidityBitmap(rows, false));
+                    if (const auto* null = std::get_if<NullScalar>(&it->second)) {
+                        // An all-null column of the binding's type.
+                        auto [column, validity] = null_column(*null, rows);
+                        output.add_column(field.alias, std::move(column), std::move(validity));
                         continue;
                     }
                     output.add_column(field.alias, broadcast_scalar_column(it->second, rows));
@@ -4547,13 +4545,10 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
             }
             if (scalars != nullptr) {
                 if (auto it = scalars->find(col_ref->name); it != scalars->end()) {
-                    if (is_null_scalar(it->second)) {
-                        // A null binding has no type of its own: an all-null
-                        // Int64 column, as the value path broadcasts it.
-                        Column<std::int64_t> nulls;
-                        nulls.resize(rows, 0);
-                        output.add_column(field.alias, std::move(nulls),
-                                          ValidityBitmap(rows, false));
+                    if (const auto* null = std::get_if<NullScalar>(&it->second)) {
+                        // An all-null column of the binding's type.
+                        auto [column, validity] = null_column(*null, rows);
+                        output.add_column(field.alias, std::move(column), std::move(validity));
                         continue;
                     }
                     output.add_column(field.alias, broadcast_scalar_column(it->second, rows));

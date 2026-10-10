@@ -712,7 +712,7 @@ TEST_CASE("Interpret select with function call") {
             if (args.size() != 1) {
                 return std::unexpected("square() expects 1 argument");
             }
-            const auto* value = std::get_if<std::int64_t>(args.data());
+            const auto* value = std::get_if<std::int64_t>(&args.front());
             if (value == nullptr) {
                 return std::unexpected("square() expects int argument");
             }
@@ -19836,7 +19836,8 @@ TEST_CASE("ExternArgs carries resources by position", "[runtime][resource]") {
         REQUIRE(args.resource(2) == nullptr);
         REQUIRE(args.resource(1) != nullptr);
         REQUIRE(args.resource(1)->type_name() == "FakeResource");
-        REQUIRE(std::holds_alternative<ibex::NullScalar>(args[1]));
+        // A resource holds its position but no scalar: reading one throws.
+        REQUIRE_THROWS_AS(args[1], std::logic_error);
         REQUIRE(args.resource_as<FakeResource>(1) != nullptr);
         REQUIRE(args.resource_as<OtherResource>(1) == nullptr);
 
@@ -19847,21 +19848,21 @@ TEST_CASE("ExternArgs carries resources by position", "[runtime][resource]") {
 }
 
 TEST_CASE("NullScalar: a null scalar records the kind it stands in for", "[nulls][scalar]") {
-    // Default-constructed, a ScalarValue is an untyped null.
-    const runtime::ScalarValue untyped{};
-    REQUIRE(runtime::is_null_scalar(untyped));
-    CHECK_FALSE(std::get<ibex::NullScalar>(untyped).kind.has_value());
+    // There is no untyped null: neither a NullScalar nor a ScalarValue can be
+    // default-constructed.
+    static_assert(!std::is_default_constructible_v<ibex::NullScalar>);
+    static_assert(!std::is_default_constructible_v<runtime::ScalarValue>);
 
-    const ibex::NullScalar int_null{.kind = ibex::ScalarKind::Int, .decimal = {}};
-    const ibex::NullScalar money_null{.kind = ibex::ScalarKind::Decimal,
-                                      .decimal = {.precision = 10, .scale = 2}};
+    const ibex::NullScalar int_null{ibex::ScalarKind::Int};
+    const ibex::NullScalar money_null{ibex::ScalarKind::Decimal,
+                                      DecimalType{.precision = 10, .scale = 2}};
     CHECK(runtime::is_null_scalar(runtime::ScalarValue{int_null}));
+    CHECK(runtime::scalar_kind(runtime::ScalarValue{money_null}) == ibex::ScalarKind::Decimal);
     // Nulls of one kind are equal and hash alike; of different kinds, not.
-    CHECK(int_null == ibex::NullScalar{.kind = ibex::ScalarKind::Int, .decimal = {}});
-    CHECK_FALSE(int_null == ibex::NullScalar{});
-    CHECK_FALSE(money_null == ibex::NullScalar{.kind = ibex::ScalarKind::Decimal,
-                                               .decimal = {.precision = 10, .scale = 3}});
+    CHECK(int_null == ibex::NullScalar{ibex::ScalarKind::Int});
+    CHECK_FALSE(int_null == ibex::NullScalar{ibex::ScalarKind::Double});
+    CHECK_FALSE(money_null == ibex::NullScalar{ibex::ScalarKind::Decimal,
+                                               DecimalType{.precision = 10, .scale = 3}});
     CHECK(std::hash<ibex::NullScalar>{}(int_null) ==
-          std::hash<ibex::NullScalar>{}(
-              ibex::NullScalar{.kind = ibex::ScalarKind::Int, .decimal = {}}));
+          std::hash<ibex::NullScalar>{}(ibex::NullScalar{ibex::ScalarKind::Int}));
 }

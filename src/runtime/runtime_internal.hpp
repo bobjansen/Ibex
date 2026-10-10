@@ -102,8 +102,8 @@ auto apply_table_properties(Table& table, const TableProperties& props) -> void;
 /// A null of an expression type (a Categorical is a String as a scalar);
 /// `decimal` is used only for Decimal.
 [[nodiscard]] auto null_of_expr_type(ExprType type, DecimalType decimal = {}) -> NullScalar;
-/// The expression type a scalar kind is; nullopt for an untyped NULL.
-[[nodiscard]] auto expr_type_of_kind(std::optional<ScalarKind> kind) -> std::optional<ExprType>;
+/// The expression type a scalar kind is.
+[[nodiscard]] auto expr_type_of_kind(ScalarKind kind) -> ExprType;
 
 inline auto append_value(ColumnValue& out, const ColumnValue& src, std::size_t index) -> void {
     std::visit(

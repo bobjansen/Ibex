@@ -875,8 +875,7 @@ auto scalar_kind_name(runtime::ScalarKind kind) -> std::string_view {
 }
 
 auto scalar_value_type_name(const runtime::ScalarValue& val) -> std::string_view {
-    const auto kind = runtime::scalar_kind(val);
-    return kind ? scalar_kind_name(*kind) : "an untyped NULL";
+    return scalar_kind_name(runtime::scalar_kind(val));
 }
 
 auto type_to_string(const parser::Type& type) -> std::string {
@@ -1014,26 +1013,16 @@ auto extern_signature(const parser::ExternDecl& decl) -> std::string {
 
 /// The null a declared scalar type stands for: what an untyped NULL becomes
 /// when an annotation (`let x: Int64 = NULL;`) or a declaration names the type.
+/// The null a declared scalar type stands for: what a bare NULL is where a
+/// declaration (`let x: Int64 = NULL;`, a parameter, a return type) types it.
 auto null_of_scalar_type(parser::ScalarType type, std::optional<DecimalType> decimal)
     -> NullScalar {
-    return NullScalar{.kind = parser::scalar_kind_of(type),
-                      .decimal = decimal.value_or(DecimalType{})};
+    return NullScalar{parser::scalar_kind_of(type), decimal.value_or(DecimalType{})};
 }
 
 auto scalar_type_matches(const runtime::ScalarValue& val, parser::ScalarType expected) -> bool {
-    // A typed null matches its own type like a value does; an untyped one
-    // matches nothing (an annotation gives it a type before this is asked).
+    // A null matches its own type, as a value does.
     return runtime::scalar_kind(val) == parser::scalar_kind_of(expected);
-}
-
-/// An untyped null typed by a declaration (`-> Int64`); anything else as is.
-auto with_declared_null(runtime::ScalarValue value, const parser::Type& declared)
-    -> runtime::ScalarValue {
-    const auto* st = std::get_if<parser::ScalarType>(&declared.arg);
-    if (declared.kind != parser::Type::Kind::Scalar || st == nullptr) {
-        return value;
-    }
-    return runtime::with_null_kind(std::move(value), null_of_scalar_type(*st, declared.decimal));
 }
 
 /// Widen an integer scalar to Float when a let binding (or function argument)
@@ -1517,6 +1506,10 @@ constexpr std::string_view kNullSeriesBindingError =
     "null is only allowed in a Table { } column literal, not a standalone series";
 
 /// True if `expr` is the `null` keyword, which the parser lowers to `__null()`.
+constexpr std::string_view kUntypedNullError =
+    "NULL has no type here: give it one with a cast, `Int64(NULL)`, or a declaration, "
+    "`let x: Int64 = NULL;`";
+
 auto is_null_literal_expr(const parser::Expr& expr) -> bool {
     const auto* call = std::get_if<parser::CallExpr>(&expr.node);
     return call != nullptr && call->callee == "__null" && call->args.empty() &&
@@ -1675,7 +1668,7 @@ auto apply_scalar_cast(const runtime::ScalarValue& val, std::string_view callee)
                           : (callee == "Int64" || callee == "Int32" || callee == "Int")
                               ? runtime::ScalarKind::Int
                               : runtime::ScalarKind::Double;
-        return runtime::ScalarValue{NullScalar{.kind = kind, .decimal = {}}};
+        return runtime::ScalarValue{NullScalar{kind}};
     }
     if (callee == "Date") {
         if (const auto* ts = std::get_if<Timestamp>(&val)) {
@@ -2547,6 +2540,44 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                       const runtime::ExternRegistry& externs)
     -> std::expected<runtime::ScalarValue, std::string>;
 
+/// A bare NULL has no type of its own; where a declaration names one -- an
+/// annotated `let`, a parameter, a return type -- it is a null of that type.
+/// Anything else is evaluated as usual.
+auto eval_scalar_for(parser::Expr& expr, const parser::Type& declared,
+                     runtime::TableRegistry& tables, LazyTableRegistry& lazy_tables,
+                     runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
+                     ModelRegistry& models, const FunctionRegistry& functions,
+                     CompileTimeListRegistry& compile_time_lists,
+                     const ExternDeclRegistry& extern_decls, const runtime::ExternRegistry& externs)
+    -> std::expected<runtime::ScalarValue, std::string> {
+    const auto* st = std::get_if<parser::ScalarType>(&declared.arg);
+    if (declared.kind == parser::Type::Kind::Scalar && st != nullptr &&
+        is_null_literal_expr(expr)) {
+        return runtime::ScalarValue{null_of_scalar_type(*st, declared.decimal)};
+    }
+    return eval_scalar_expr(expr, tables, lazy_tables, scalars, columns, models, functions,
+                            compile_time_lists, extern_decls, externs);
+}
+
+/// One argument of an extern call. Externs take null-free arguments (SPEC.md
+/// Section 6.7): a null -- a NULL typed by the parameter included -- is
+/// rejected here, in front of the call, as the runtime's extern path does.
+auto eval_extern_arg(const BoundCallArg& arg, std::string_view callee,
+                     runtime::TableRegistry& tables, LazyTableRegistry& lazy_tables,
+                     runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
+                     ModelRegistry& models, const FunctionRegistry& functions,
+                     CompileTimeListRegistry& compile_time_lists,
+                     const ExternDeclRegistry& extern_decls, const runtime::ExternRegistry& externs)
+    -> std::expected<runtime::ScalarValue, std::string> {
+    auto value = eval_scalar_for(*arg.expr, arg.param->type, tables, lazy_tables, scalars, columns,
+                                 models, functions, compile_time_lists, extern_decls, externs);
+    if (value && runtime::is_null_scalar(*value)) {
+        return std::unexpected(std::string(callee) + ": null argument '" + arg.param->name +
+                               "' in extern function call");
+    }
+    return value;
+}
+
 // Evaluate a call to a "series function": an aggregate (max/sum/mean/… reducing a
 // series to a scalar) or a row-wise scalar builtin (abs/sqrt/pmax/… applied
 // element-wise when any argument is a series, else to scalars). Returns a
@@ -2968,6 +2999,21 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         return eval_scalar_operator(op, operands, externs);
     }
     if (auto* case_expr = std::get_if<parser::CaseExpr>(&expr.node)) {
+        // A NULL arm has no type of its own; the case's type is its other
+        // arms' (`case { c => 1, else => NULL }` is an Int64 null, and so is
+        // `Int64(NULL)`, which the parser spells that way).
+        auto case_null = [&]() -> std::expected<runtime::ScalarValue, std::string> {
+            parser::LowerContext context;
+            auto lowered = parser::lower_value_expr(expr, context);
+            if (!lowered) {
+                return std::unexpected(lowered.error().message);
+            }
+            auto null = runtime::infer_scalar_null(*lowered, &scalars, &externs);
+            if (!null) {
+                return std::unexpected("case: its NULL arm has no type: " + null.error());
+            }
+            return runtime::ScalarValue{*null};
+        };
         auto chosen = [&]() -> std::expected<runtime::ScalarValue, std::string> {
             // Arms are tried in order and only the chosen value is evaluated, as in
             // a cell; a null condition does not match.
@@ -3009,30 +3055,25 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                     return std::unexpected("case: an arm condition must be Bool");
                 }
                 if (*matched) {
+                    if (is_null_literal_expr(*arm.value)) {
+                        return case_null();
+                    }
                     return eval_scalar_expr(*arm.value, tables, lazy_tables, scalars, columns,
                                             models, functions, compile_time_lists, extern_decls,
                                             externs);
                 }
             }
+            if (is_null_literal_expr(*case_expr->else_value)) {
+                return case_null();
+            }
             return eval_scalar_expr(*case_expr->else_value, tables, lazy_tables, scalars, columns,
                                     models, functions, compile_time_lists, extern_decls, externs);
         }();
-        // A NULL arm has no type of its own; the case's type is its other
-        // arms' (`case { c => 1, else => NULL }` is an Int64 null, and so is
-        // `Int64(NULL)`, which the parser spells that way).
-        if (chosen && runtime::is_null_scalar(*chosen) &&
-            !runtime::scalar_kind(*chosen).has_value()) {
-            parser::LowerContext context;
-            if (auto lowered = parser::lower_value_expr(expr, context)) {
-                return runtime::ScalarValue{
-                    runtime::infer_scalar_null(*lowered, &scalars, &externs)};
-            }
-        }
         return chosen;
     }
     if (auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
         if (call->callee == "__null" && call->args.empty()) {
-            return runtime::ScalarValue{ibex::NullScalar{}};
+            return std::unexpected(std::string(kUntypedNullError));
         }
         if (call->callee == "__interp") {
             // String interpolation: stringify each argument (literal segments and
@@ -3055,8 +3096,7 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                 out += format_scalar(*value);
             }
             if (null_value) {
-                return runtime::ScalarValue{
-                    NullScalar{.kind = runtime::ScalarKind::String, .decimal = {}}};
+                return runtime::ScalarValue{NullScalar{runtime::ScalarKind::String}};
             }
             return runtime::ScalarValue{std::move(out)};
         }
@@ -3137,9 +3177,9 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                 runtime::ExternArgs scalar_args;
                 scalar_args.reserve(bound_args->size() - 1);
                 for (std::size_t i = 1; i < bound_args->size(); ++i) {
-                    auto value = eval_scalar_expr(*(*bound_args)[i].expr, tables, lazy_tables,
-                                                  scalars, columns, models, functions,
-                                                  compile_time_lists, extern_decls, externs);
+                    auto value = eval_extern_arg((*bound_args)[i], call->callee, tables,
+                                                 lazy_tables, scalars, columns, models, functions,
+                                                 compile_time_lists, extern_decls, externs);
                     if (!value) {
                         return std::unexpected(value.error());
                     }
@@ -3150,7 +3190,7 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                     return std::unexpected(result.error());
                 }
                 if (auto* scalar = std::get_if<runtime::ScalarValue>(&result.value())) {
-                    return with_declared_null(std::move(*scalar), decl.return_type);
+                    return *scalar;
                 }
                 return std::unexpected("extern function returned table: " + call->callee);
             }
@@ -3158,8 +3198,8 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             args.reserve(bound_args->size());
             for (const auto& arg : *bound_args) {
                 auto value =
-                    eval_scalar_expr(*arg.expr, tables, lazy_tables, scalars, columns, models,
-                                     functions, compile_time_lists, extern_decls, externs);
+                    eval_extern_arg(arg, call->callee, tables, lazy_tables, scalars, columns,
+                                    models, functions, compile_time_lists, extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -3170,8 +3210,7 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                 return std::unexpected(result.error());
             }
             if (auto* scalar = std::get_if<runtime::ScalarValue>(&result.value())) {
-                // A plugin's null is of the declared return type.
-                return with_declared_null(std::move(*scalar), decl.return_type);
+                return *scalar;
             }
             return std::unexpected("extern function returned table: " + call->callee);
         }
@@ -3556,8 +3595,9 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         runtime::ExternArgs args;
         args.reserve(bound_args->size());
         for (const auto& arg : *bound_args) {
-            auto value = eval_scalar_expr(*arg.expr, tables, lazy_tables, scalars, columns, models,
-                                          functions, compile_time_lists, extern_decls, externs);
+            auto value =
+                eval_extern_arg(arg, call.callee, tables, lazy_tables, scalars, columns, models,
+                                functions, compile_time_lists, extern_decls, externs);
             if (!value) {
                 return std::unexpected(value.error());
             }
@@ -3941,8 +3981,8 @@ auto try_bind_lazy_source(parser::Expr& expr, runtime::TableRegistry& tables,
     runtime::ExternArgs args;
     args.reserve(bound_args->size());
     for (const auto& arg : *bound_args) {
-        auto value = eval_scalar_expr(*arg.expr, tables, lazy_tables, scalars, columns, models,
-                                      functions, compile_time_lists, extern_decls, externs);
+        auto value = eval_extern_arg(arg, call->callee, tables, lazy_tables, scalars, columns,
+                                     models, functions, compile_time_lists, extern_decls, externs);
         if (!value) {
             return std::unexpected(value.error());
         }
@@ -4648,16 +4688,15 @@ auto run_function(parser::CallExpr& call, const parser::FunctionDecl& fn,
         }
         switch (param.type.kind) {
             case parser::Type::Kind::Scalar: {
-                auto value = eval_scalar_expr(arg, tables, lazy_tables, scalars, columns, models,
-                                              functions, compile_time_lists, extern_decls, externs);
+                // A NULL argument takes the declared parameter type.
+                auto value =
+                    eval_scalar_for(arg, param.type, tables, lazy_tables, scalars, columns, models,
+                                    functions, compile_time_lists, extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
                 const auto* st = std::get_if<parser::ScalarType>(&param.type.arg);
                 if (st != nullptr) {
-                    // A NULL argument takes the declared parameter type.
-                    value.value() = runtime::with_null_kind(
-                        std::move(value.value()), null_of_scalar_type(*st, param.type.decimal));
                     try_widen_int_to_float(value.value(), *st);
                 }
                 if (st != nullptr && !scalar_type_matches(value.value(), *st)) {
@@ -4756,17 +4795,16 @@ auto run_function(parser::CallExpr& call, const parser::FunctionDecl& fn,
                                        (let_stmt.type->kind == parser::Type::Kind::DataFrame ||
                                         let_stmt.type->kind == parser::Type::Kind::TimeFrame);
             if (type_is_scalar) {
-                auto value = eval_scalar_expr(*let_stmt.value, local_tables, local_lazy_tables,
-                                              local_scalars, local_columns, local_models, functions,
-                                              local_compile_time_lists, extern_decls, externs);
+                // `let x: Int64 = NULL;`: the annotation types the NULL.
+                auto value =
+                    eval_scalar_for(*let_stmt.value, *let_stmt.type, local_tables,
+                                    local_lazy_tables, local_scalars, local_columns, local_models,
+                                    functions, local_compile_time_lists, extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
                 const auto* st = std::get_if<parser::ScalarType>(&let_stmt.type->arg);
                 if (st != nullptr) {
-                    // `let x: Int64 = NULL;`: the annotation types the NULL.
-                    value.value() = runtime::with_null_kind(
-                        std::move(value.value()), null_of_scalar_type(*st, let_stmt.type->decimal));
                     try_widen_int_to_float(value.value(), *st);
                 }
                 if (st != nullptr && !scalar_type_matches(value.value(), *st)) {
@@ -4911,6 +4949,14 @@ auto run_function(parser::CallExpr& call, const parser::FunctionDecl& fn,
             continue;
         }
         const auto& expr_stmt = std::get<parser::ExprStmt>(stmt);
+        // A returned bare NULL is of the declared return type.
+        if (const auto* st = std::get_if<parser::ScalarType>(&fn.return_type.arg);
+            fn.return_type.kind == parser::Type::Kind::Scalar && st != nullptr &&
+            is_null_literal_expr(*expr_stmt.expr)) {
+            last_value = ResourceCallValue{
+                EvalValue{runtime::ScalarValue{null_of_scalar_type(*st, fn.return_type.decimal)}}};
+            continue;
+        }
         auto value = eval_expr_value(*expr_stmt.expr, local_tables, local_lazy_tables,
                                      local_scalars, local_columns, local_models, functions,
                                      local_compile_time_lists, extern_decls, externs);
@@ -4948,9 +4994,7 @@ auto run_function(parser::CallExpr& call, const parser::FunctionDecl& fn,
         if (!std::holds_alternative<runtime::ScalarValue>(result)) {
             return std::unexpected(call.callee + ": return type mismatch (expected scalar)");
         }
-        // A returned NULL is of the declared return type.
-        return EvalValue{
-            with_declared_null(std::get<runtime::ScalarValue>(std::move(result)), fn.return_type)};
+        return EvalValue{std::get<runtime::ScalarValue>(std::move(result))};
     }
     if (fn.return_type.kind == parser::Type::Kind::DataFrame ||
         fn.return_type.kind == parser::Type::Kind::TimeFrame) {
@@ -5293,19 +5337,16 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                                           let_stmt.type->kind == parser::Type::Kind::TimeFrame;
                 const bool expect_column = let_stmt.type->kind == parser::Type::Kind::Series;
                 if (expect_scalar) {
-                    auto value = eval_scalar_expr(*let_stmt.value, tables, lazy_tables, scalars,
-                                                  columns, models, functions, compile_time_lists,
-                                                  extern_decls, externs);
+                    // `let x: Int64 = NULL;`: the annotation types the NULL.
+                    auto value = eval_scalar_for(*let_stmt.value, *let_stmt.type, tables,
+                                                 lazy_tables, scalars, columns, models, functions,
+                                                 compile_time_lists, extern_decls, externs);
                     if (!value) {
                         ibex::formatting::print("error: {}\n", value.error());
                         return false;
                     }
                     const auto* st = std::get_if<parser::ScalarType>(&let_stmt.type->arg);
                     if (st != nullptr) {
-                        // `let x: Int64 = NULL;`: the annotation types the NULL.
-                        value.value() = runtime::with_null_kind(
-                            std::move(value.value()),
-                            null_of_scalar_type(*st, let_stmt.type->decimal));
                         try_widen_int_to_float(value.value(), *st);
                     }
                     if (st != nullptr && !scalar_type_matches(value.value(), *st)) {

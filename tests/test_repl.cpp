@@ -68,7 +68,7 @@ TEST_CASE("REPL loads script with inferred lets") {
                                 if (args.size() != 1) {
                                     return std::unexpected("csv::read() expects 1 argument");
                                 }
-                                const auto* path = std::get_if<std::string>(args.data());
+                                const auto* path = std::get_if<std::string>(&args.front());
                                 if (path == nullptr) {
                                     return std::unexpected("csv::read() expects a string path");
                                 }
@@ -1151,7 +1151,7 @@ TEST_CASE("REPL supports named arguments and defaults for extern functions") {
             if (args.size() != 4) {
                 return std::unexpected("read_fake() expects 4 arguments");
             }
-            const auto* path = std::get_if<std::string>(args.data());
+            const auto* path = std::get_if<std::string>(&args.front());
             const auto* nulls = std::get_if<std::string>(&args[1]);
             const auto* delimiter = std::get_if<std::string>(&args[2]);
             const auto* has_header = std::get_if<bool>(&args[3]);
@@ -3161,8 +3161,11 @@ TEST_CASE("ReplSession: a scalar statement means what the same expression means 
     CHECK_FALSE(std::get<bool>(value("n is not null;")));
     CHECK(std::get<bool>(value("n == 1 || true;")));
     CHECK(is_null(value("n == 1 && true;")));
-    CHECK(is_null(value("NULL;")));
     CHECK(is_null(value("Int64(NULL);")));
+    // A NULL nothing types is an error, not an untyped null.
+    auto untyped = session.execute("NULL;");
+    REQUIRE_FALSE(untyped.ok);
+    CHECK(untyped.error.find("NULL has no type here") != std::string::npos);
 }
 
 TEST_CASE("ReplSession: a null scalar records the type it was made with",
@@ -3177,7 +3180,7 @@ TEST_CASE("ReplSession: a null scalar records the type it was made with",
         return r;
     };
     // The kind a statement's null result stands in for; nullopt if untyped.
-    auto null_kind = [&](const std::string& src) -> std::optional<ScalarKind> {
+    auto null_kind = [&](const std::string& src) -> ScalarKind {
         auto r = run(src);
         REQUIRE(r.scalar.has_value());
         const auto* null = std::get_if<ibex::NullScalar>(&*r.scalar);
@@ -3206,8 +3209,14 @@ TEST_CASE("ReplSession: a null scalar records the type it was made with",
     CHECK(null_kind("f;") == ScalarKind::Double);
     run("fn g() -> Float64 { NULL; }");
     CHECK(null_kind("g();") == ScalarKind::Double);
-    // A bare NULL has no type.
-    CHECK_FALSE(null_kind("NULL;").has_value());
+    // A bare NULL nothing types is an error: as a statement and as an
+    // unannotated let.
+    for (const char* src : {"NULL;", "let u = NULL;"}) {
+        auto r = session.execute(src);
+        INFO(src);
+        REQUIRE_FALSE(r.ok);
+        CHECK(r.error.find("NULL has no type here") != std::string::npos);
+    }
 
     // The recorded type is checked like a value's.
     auto mismatch = session.execute("let z: String = Int64(NULL);");

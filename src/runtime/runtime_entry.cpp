@@ -952,11 +952,11 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                     break;
                 }
                 auto scalar = scalar_from_expr(val.value());
-                if (is_null_scalar(scalar)) {
+                if (!scalar) {
                     args_ok = false;
                     break;
                 }
-                args.push_back(std::move(scalar));
+                args.push_back(std::move(*scalar));
             }
             if (args_ok) {
                 auto op = fn->chunked_table_func(args);

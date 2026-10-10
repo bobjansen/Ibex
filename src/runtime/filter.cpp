@@ -1594,11 +1594,10 @@ auto eval_value_vec(const ir::Expr& expr, const PredicateInput& input,
                         // A null scalar broadcasts as an all-invalid column; a
                         // comparison against it is null for every row, so the
                         // predicate drops them all (SPEC section 3).
-                        if (is_null_scalar(it->second)) {
-                            Column<std::int64_t> col;
-                            col.resize(n, 0);
-                            ColResult r{ColumnValue{std::move(col)}};
-                            r.owned_validity = ValidityBitmap(n, false);
+                        if (const auto* null = std::get_if<NullScalar>(&it->second)) {
+                            auto [column, validity] = null_column(*null, n);
+                            ColResult r{std::move(column)};
+                            r.owned_validity = std::move(validity);
                             return r;
                         }
                         // Broadcast scalar into a full column (a decimal keeps
@@ -2279,22 +2278,6 @@ auto compute_mask(const ir::Expr& expr, const PredicateInput& input, const Scala
                     return std::unexpected(val.error());
                 const auto* bcol = std::get_if<Column<bool>>(&deref_col(*val));
                 if (bcol == nullptr) {
-                    // A null scalar has no type of its own, so it cannot arrive
-                    // as a Bool column; as a predicate it is simply unknown,
-                    // which three-valued logic handles (`null || true`).
-                    if (const auto* ref = std::get_if<ir::ColumnRef>(&expr.node);
-                        ref != nullptr && scalars != nullptr &&
-                        (ref->lexical || input.find(ref->name) == nullptr)) {
-                        if (auto it = scalars->find(ref->name);
-                            it != scalars->end() &&
-                            std::holds_alternative<ibex::NullScalar>(it->second)) {
-                            Mask m;
-                            m.value.resize(n);
-                            std::fill_n(m.value.data(), n, uint8_t{0});
-                            m.valid.emplace(n, uint8_t{0});
-                            return m;
-                        }
-                    }
                     return std::unexpected("filter: not a boolean expression");
                 }
                 Mask m;

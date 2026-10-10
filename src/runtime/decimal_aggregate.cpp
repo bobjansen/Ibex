@@ -137,7 +137,7 @@ auto group_rows(const Table& input, const std::vector<ir::ColumnRef>& group_by)
             key.values.reserve(cols.size());
             for (std::size_t i = 0; i < cols.size(); ++i) {
                 if (cols[i].is_null(row)) {
-                    key.values.emplace_back();
+                    key.values.emplace_back(null_of_column(*entries[i]->column));
                     key.set_null(i);
                 } else {
                     key.values.push_back(box_key_value(*entries[i]->column, row));

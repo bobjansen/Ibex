@@ -99,7 +99,8 @@ enum class DirectValidityKind : std::uint8_t { FillNull, Coalesce, Case };
 /// destination and the final merged validity bitmap.
 struct DirectValidityValue {
     const ColumnEntry* column = nullptr;
-    ScalarValue literal{};
+    /// Set exactly when is_literal.
+    std::optional<ScalarValue> literal;
     bool is_literal = false;
     bool is_null = false;
 };

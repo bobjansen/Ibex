@@ -203,29 +203,26 @@ auto column_kind(const ColumnValue& column) -> ExprType {
 auto null_of_expr_type(ExprType type, DecimalType decimal) -> NullScalar {
     switch (type) {
         case ExprType::Int:
-            return NullScalar{.kind = ScalarKind::Int, .decimal = {}};
+            return NullScalar{ScalarKind::Int};
         case ExprType::Double:
-            return NullScalar{.kind = ScalarKind::Double, .decimal = {}};
+            return NullScalar{ScalarKind::Double};
         case ExprType::Bool:
-            return NullScalar{.kind = ScalarKind::Bool, .decimal = {}};
+            return NullScalar{ScalarKind::Bool};
         case ExprType::String:
         case ExprType::Categorical:
-            return NullScalar{.kind = ScalarKind::String, .decimal = {}};
+            return NullScalar{ScalarKind::String};
         case ExprType::Date:
-            return NullScalar{.kind = ScalarKind::Date, .decimal = {}};
+            return NullScalar{ScalarKind::Date};
         case ExprType::Timestamp:
-            return NullScalar{.kind = ScalarKind::Timestamp, .decimal = {}};
+            return NullScalar{ScalarKind::Timestamp};
         case ExprType::Decimal:
-            return NullScalar{.kind = ScalarKind::Decimal, .decimal = decimal};
+            return NullScalar{ScalarKind::Decimal, decimal};
     }
-    return NullScalar{};
+    return NullScalar{ScalarKind::Int};
 }
 
-auto expr_type_of_kind(std::optional<ScalarKind> kind) -> std::optional<ExprType> {
-    if (!kind) {
-        return std::nullopt;
-    }
-    switch (*kind) {
+auto expr_type_of_kind(ScalarKind kind) -> ExprType {
+    switch (kind) {
         case ScalarKind::Int:
             return ExprType::Int;
         case ScalarKind::Double:
@@ -241,7 +238,7 @@ auto expr_type_of_kind(std::optional<ScalarKind> kind) -> std::optional<ExprType
         case ScalarKind::Decimal:
             return ExprType::Decimal;
     }
-    return std::nullopt;
+    return ExprType::Int;
 }
 
 }  // namespace ibex::runtime

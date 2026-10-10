@@ -28,9 +28,11 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <robin_hood.h>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -117,17 +119,48 @@ using ResourcePtr = std::shared_ptr<Resource>;
 /// Functions are registered by name and can be looked up at runtime.
 using ExternValue = std::variant<Table, ScalarValue, StreamTimeout, ResourcePtr>;
 
-/// Arguments to an extern function, by position. Scalar arguments are the
-/// vector's elements. A resource argument occupies a null scalar slot and is
-/// read with `resource(i)` or `resource_as<T>(i)`; so does a table argument of
-/// a resource function (one that also takes a resource), read with `table(i)`.
-class ExternArgs : public std::vector<ScalarValue> {
+/// Arguments to an extern function, by position. A scalar argument is read with
+/// `args[i]` / `args.at(i)`; a resource argument with `resource(i)` /
+/// `resource_as<T>(i)`; a table argument of a resource function (one that also
+/// takes a resource) with `table(i)`. A resource or table occupies its position
+/// but holds no scalar: reading it as one throws, rather than handing the
+/// plugin a placeholder value.
+class ExternArgs {
    public:
-    using std::vector<ScalarValue>::vector;
+    ExternArgs() = default;
+    ExternArgs(std::initializer_list<ScalarValue> values) {
+        slots_.reserve(values.size());
+        for (const auto& value : values) {
+            slots_.emplace_back(value);
+        }
+    }
+
+    [[nodiscard]] auto size() const noexcept -> std::size_t { return slots_.size(); }
+    [[nodiscard]] auto empty() const noexcept -> bool { return slots_.empty(); }
+    void reserve(std::size_t n) { slots_.reserve(n); }
+
+    void push_back(ScalarValue value) { slots_.emplace_back(std::move(value)); }
+
+    /// The scalar at position `index`. A resource or table position throws.
+    [[nodiscard]] auto operator[](std::size_t index) const -> const ScalarValue& {
+        return scalar_at(index);
+    }
+    [[nodiscard]] auto operator[](std::size_t index) -> ScalarValue& {
+        return const_cast<ScalarValue&>(std::as_const(*this).scalar_at(index));
+    }
+    /// As `operator[]`, and an out-of-range `index` throws too.
+    [[nodiscard]] auto at(std::size_t index) const -> const ScalarValue& {
+        if (index >= slots_.size()) {
+            throw std::out_of_range("extern argument " + std::to_string(index) + " out of range");
+        }
+        return scalar_at(index);
+    }
+    [[nodiscard]] auto front() const -> const ScalarValue& { return at(0); }
+    [[nodiscard]] auto back() const -> const ScalarValue& { return at(slots_.size() - 1); }
 
     void push_resource(ResourcePtr value) {
         resources_.emplace_back(size(), std::move(value));
-        push_back(ScalarValue{});
+        slots_.emplace_back(std::nullopt);
     }
 
     /// The resource at position `index`, or null when that argument is a scalar.
@@ -150,7 +183,7 @@ class ExternArgs : public std::vector<ScalarValue> {
 
     void push_table(std::shared_ptr<const Table> value) {
         tables_.emplace_back(size(), std::move(value));
-        push_back(ScalarValue{});
+        slots_.emplace_back(std::nullopt);
     }
 
     /// The table at position `index`, or null when that argument is not a table.
@@ -164,6 +197,17 @@ class ExternArgs : public std::vector<ScalarValue> {
     }
 
    private:
+    [[nodiscard]] auto scalar_at(std::size_t index) const -> const ScalarValue& {
+        const auto& slot = slots_[index];
+        if (!slot.has_value()) {
+            throw std::logic_error("extern argument " + std::to_string(index) +
+                                   " is a resource or table, not a scalar");
+        }
+        return *slot;
+    }
+
+    /// One per position; empty where a resource or table sits.
+    std::vector<std::optional<ScalarValue>> slots_;
     std::vector<std::pair<std::size_t, ResourcePtr>> resources_;
     std::vector<std::pair<std::size_t, std::shared_ptr<const Table>>> tables_;
 };

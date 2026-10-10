@@ -108,7 +108,7 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
             if (args.empty() || args.size() > 5) {
                 return std::unexpected("csv::read() expects 1 to 5 arguments");
             }
-            const auto* path = std::get_if<std::string>(args.data());
+            const auto* path = std::get_if<std::string>(&args.front());
             if (path == nullptr) {
                 return std::unexpected("csv::read() expects a string path");
             }
@@ -211,7 +211,7 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
                 return std::unexpected(
                     "csv::write(df, path) expects exactly 1 scalar argument (path)");
             }
-            const auto* path = std::get_if<std::string>(args.data());
+            const auto* path = std::get_if<std::string>(&args.front());
             if (path == nullptr) {
                 return std::unexpected("csv::write(df, path) expects a string path");
             }

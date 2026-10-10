@@ -392,7 +392,7 @@ struct DeferredWrap {
 
         auto scalar_result = eval_scalar_expr(*let_stmt->value, env);
         if (scalar_result) {
-            env[let_stmt->name] = scalar_result.value();
+            env.insert_or_assign(let_stmt->name, scalar_result.value());
             out.compile_time.emplace_back(let_stmt->name, scalar_result.value());
             // Later table lets may filter/compute against this scalar; a bare
             // name there must resolve as a binding, not a missing column.

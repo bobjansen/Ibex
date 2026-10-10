@@ -150,7 +150,8 @@ void Emitter::emit_scalar_store(const std::string& name, const std::string& valu
     if (in_function_) {
         *out_ << "    _ibex_scope.set(\"" << escape_string(name) << "\", " << value << ");\n";
     } else {
-        *out_ << "    _ibex_scalars[\"" << escape_string(name) << "\"] = " << value << ";\n";
+        *out_ << "    _ibex_scalars.insert_or_assign(\"" << escape_string(name) << "\", " << value
+              << ");\n";
     }
 }
 
@@ -436,14 +437,16 @@ void Emitter::emit_header(std::ostream& out, const Config& config, const Script*
     if (has_scalars) {
         out << "    ibex::runtime::ScalarRegistry _ibex_scalars;\n";
         for (const auto& [name, value] : config.scalar_bindings) {
-            out << "    _ibex_scalars[\"" << escape_string(name) << "\"] = ";
+            out << "    _ibex_scalars.insert_or_assign(\"" << escape_string(name) << "\", ";
             std::visit(
                 [&](const auto& v) {
                     using V = std::decay_t<decltype(v)>;
                     if constexpr (std::is_same_v<V, ibex::NullScalar>) {
-                        // Null scalar bindings are not yet emitted by codegen;
-                        // collect_scalar_bindings never produces one.
-                        out << "ibex::runtime::ScalarValue{ibex::NullScalar{}}";
+                        // A null binding keeps its type.
+                        out << "ibex::runtime::ScalarValue{ibex::NullScalar{ibex::ScalarKind{"
+                            << static_cast<int>(v.kind) << "}, ibex::DecimalType{"
+                            << static_cast<int>(v.decimal.precision) << ", "
+                            << static_cast<int>(v.decimal.scale) << "}}}";
                     } else if constexpr (std::is_same_v<V, std::int64_t>) {
                         out << "std::int64_t{" << v << "}";
                     } else if constexpr (std::is_same_v<V, double>) {
@@ -462,7 +465,7 @@ void Emitter::emit_header(std::ostream& out, const Config& config, const Script*
                     }
                 },
                 value);
-            out << ";\n";
+            out << ");\n";
         }
         out << "    ibex::ops::set_scalars(&_ibex_scalars);\n\n";
 

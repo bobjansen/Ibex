@@ -391,9 +391,9 @@ auto evaluate_row_count_expr(const ir::Expr& expr, const ScalarRegistry* scalars
     return evaluate_row_count_expr_impl(expr, scalars, externs);
 }
 
-auto scalar_kind(const ScalarValue& v) -> std::optional<ScalarKind> {
+auto scalar_kind(const ScalarValue& v) -> ScalarKind {
     return std::visit(
-        [](const auto& x) -> std::optional<ScalarKind> {
+        [](const auto& x) -> ScalarKind {
             using T = std::decay_t<decltype(x)>;
             if constexpr (std::is_same_v<T, NullScalar>) {
                 return x.kind;
@@ -424,17 +424,21 @@ auto null_of_column(const ColumnValue& column) -> NullScalar {
 }
 
 auto infer_scalar_null(const ir::Expr& expr, const ScalarRegistry* scalars,
-                       const ExternRegistry* externs) -> NullScalar {
-    const Table none;
-    auto type = infer_expr_type(expr, none, scalars, externs);
+                       const ExternRegistry* externs) -> std::expected<NullScalar, std::string> {
+    return infer_null_of(expr, Table{}, scalars, externs);
+}
+
+auto infer_null_of(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars,
+                   const ExternRegistry* externs) -> std::expected<NullScalar, std::string> {
+    auto type = infer_expr_type(expr, input, scalars, externs);
     if (!type) {
-        return NullScalar{};
+        return std::unexpected(type.error());
     }
     DecimalType decimal{};
     if (*type == ExprType::Decimal) {
-        auto inferred = infer_decimal_type(expr, none, scalars);
+        auto inferred = infer_decimal_type(expr, input, scalars);
         if (!inferred) {
-            return NullScalar{};
+            return std::unexpected(inferred.error());
         }
         decimal = *inferred;
     }
@@ -468,9 +472,13 @@ auto evaluate_scalar_expr(const ir::Expr& expr, const ScalarRegistry* scalars,
     }
     // The per-row evaluator's null carries no type; inference supplies it.
     if (std::holds_alternative<Null>(*value)) {
-        return ScalarValue{infer_scalar_null(expr, scalars, externs)};
+        auto null = infer_scalar_null(expr, scalars, externs);
+        if (!null) {
+            return std::unexpected(null.error());
+        }
+        return ScalarValue{*null};
     }
-    return scalar_from_expr(*value);
+    return *scalar_from_expr(*value);
 }
 
 auto merge_validity_bitmaps(const ValidityBitmap* a, const ValidityBitmap* b, std::size_t n)
@@ -654,9 +662,10 @@ auto extract_scalar(const Table& table, const std::string& column, bool zero_row
     const auto* entry = table.find_entry(column);
     if (table.rows() == 0 && zero_rows_is_null) {
         // No row, but the column still has a type: the null is of it.
-        return ScalarValue{entry != nullptr && entry->column != nullptr
-                               ? null_of_column(*entry->column)
-                               : NullScalar{}};
+        if (entry == nullptr || entry->column == nullptr) {
+            return std::unexpected("column not found: " + column);
+        }
+        return ScalarValue{null_of_column(*entry->column)};
     }
     if (table.rows() != 1) {
         return std::unexpected("scalar() requires exactly one row");
@@ -695,13 +704,13 @@ auto materialize_deferred_scalar_bindings(std::span<const ir::DeferredScalarBind
             if (!value) {
                 return std::unexpected("deferred scalar '" + binding.name + "': " + value.error());
             }
-            scalars[source.tmp_name] = std::move(*value);
+            scalars.insert_or_assign(source.tmp_name, std::move(*value));
         }
         auto result = evaluate_scalar_expr(binding.value, &scalars, externs);
         if (!result) {
             return std::unexpected("deferred scalar '" + binding.name + "': " + result.error());
         }
-        scalars[binding.name] = std::move(*result);
+        scalars.insert_or_assign(binding.name, std::move(*result));
     }
     return {};
 }
@@ -735,25 +744,24 @@ auto eval_scalar_builtin(std::string_view name, const std::vector<ScalarValue>& 
     if (!result) {
         return std::unexpected(result.error());
     }
-    if (std::holds_alternative<Null>(*result) && found->infer) {
-        // A null result is of the builtin's return type, when the argument
-        // types (a typed null's included) determine it.
+    if (std::holds_alternative<Null>(*result)) {
+        // A null result is of the builtin's return type, which its argument
+        // types (a typed null's included) determine.
         std::vector<ExprType> types;
         types.reserve(args.size());
         for (const auto& a : args) {
-            const auto type = expr_type_of_kind(scalar_kind(a));
-            if (!type) {
-                return ScalarValue{NullScalar{}};
-            }
-            types.push_back(*type);
+            types.push_back(expr_type_of_kind(scalar_kind(a)));
+        }
+        if (!found->infer) {
+            return std::unexpected(std::string(name) + ": cannot type a null result");
         }
         auto returned = found->infer(name, types);
-        return ScalarValue{returned ? null_of_expr_type(*returned) : NullScalar{}};
+        if (!returned) {
+            return std::unexpected(returned.error());
+        }
+        return ScalarValue{null_of_expr_type(*returned)};
     }
-    // A null result is now a valid scalar (the NullScalar alternative); null
-    // propagation and the null-handling builtins (coalesce, is null) rely on
-    // it reaching the caller rather than erroring here.
-    return scalar_from_expr(*result);
+    return *scalar_from_expr(*result);
 }
 
 auto aggregate_series(std::string_view name, const ColumnValue& column, double param)

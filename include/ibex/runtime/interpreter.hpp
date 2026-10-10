@@ -110,22 +110,12 @@ using ScalarValue = ibex::ScalarValue;
 }
 
 /// The kind of a scalar: the alternative it holds, or for a null the kind it
-/// stands in for (nullopt for an untyped NULL).
-[[nodiscard]] auto scalar_kind(const ScalarValue& v) -> std::optional<ScalarKind>;
+/// stands in for.
+[[nodiscard]] auto scalar_kind(const ScalarValue& v) -> ScalarKind;
 
 /// A null of `column`'s type: what a null cell of it is as a scalar. A
 /// Categorical column's cells are Strings.
 [[nodiscard]] auto null_of_column(const ColumnValue& column) -> NullScalar;
-
-/// The type an untyped NULL value takes on from an annotation or a context
-/// that names one; a typed null or a value is returned unchanged.
-[[nodiscard]] inline auto with_null_kind(ScalarValue value, NullScalar kind) -> ScalarValue {
-    if (const auto* null = std::get_if<NullScalar>(&value);
-        null != nullptr && !null->kind.has_value()) {
-        return ScalarValue{kind};
-    }
-    return value;
-}
 
 /// Copy the value-metadata of `src` onto a column derived from it.
 ///
@@ -1168,11 +1158,11 @@ class ExternArgs;
 /// Evaluate a scalar-valued expression against `scalars` (no column input).
 /// A null result is a NullScalar of the expression's type.
 /// The type `expr` would have as a scalar, as a null of that type: what
-/// `case { c => 1, else => NULL }` is when it takes the NULL arm. When
-/// the expression cannot be typed (it names an unknown binding, say), the
-/// result is an untyped null.
+/// `case { c => 1, else => NULL }` is when it takes the NULL arm. An error
+/// when the expression has no type (a NULL nothing types).
 [[nodiscard]] auto infer_scalar_null(const ir::Expr& expr, const ScalarRegistry* scalars = nullptr,
-                                     const ExternRegistry* externs = nullptr) -> NullScalar;
+                                     const ExternRegistry* externs = nullptr)
+    -> std::expected<NullScalar, std::string>;
 
 [[nodiscard]] auto evaluate_scalar_expr(const ir::Expr& expr,
                                         const ScalarRegistry* scalars = nullptr,

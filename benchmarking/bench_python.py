@@ -34,16 +34,18 @@ from bench_mem import reset_peak_rss, peak_rss_mb, CELL_CUTOFF_MS, should_skip, 
 LAST_PEAK_RSS_MB = 0.0
 
 
-# IBEX_POLARS_CATEGORICAL=1: give Polars its string columns as Categorical, the
-# encoding Ibex's CSV reader picks for low-cardinality strings by itself.
-# Without it every `by symbol` / `join on symbol` compares Ibex hashing codes
-# with Polars hashing strings. The cast is done once at load, never timed.
-POLARS_CATEGORICAL = os.environ.get("IBEX_POLARS_CATEGORICAL") == "1"
+# Polars gets its string columns as Categorical, the encoding Ibex's CSV reader
+# picks for low-cardinality strings by itself: without it every `by symbol` /
+# `join on symbol` compares Ibex hashing codes with Polars hashing strings. The
+# cast is done once at load, never timed. This is the reference configuration
+# (Polars 2 streaming, Categorical keys); IBEX_POLARS_CATEGORICAL=0 gives the
+# raw String keys, for an experiment only.
+POLARS_CATEGORICAL = os.environ.get("IBEX_POLARS_CATEGORICAL") != "0"
 
 
 def pl_keys(frame):
-    """An eager Polars frame with its String columns as Categorical when
-    IBEX_POLARS_CATEGORICAL is set; unchanged otherwise."""
+    """An eager Polars frame with its String columns as Categorical, unless
+    IBEX_POLARS_CATEGORICAL=0."""
     if not POLARS_CATEGORICAL:
         return frame
     return frame.with_columns(pl.col(pl.String).cast(pl.Categorical))

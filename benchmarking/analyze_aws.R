@@ -15,10 +15,14 @@
 # Ratios are ibex_ms / reference_ms, so below 1.0 means Ibex is faster. The
 # reference per query is the FASTEST of its engine's variants:
 #
-#   inmem  Polars 2 = best of polars, polars-in-memory and their -categorical
-#          variants; DuckDB = duckdb
-#   pdsh   Polars 2 = best of streaming and in-memory; also streaming alone,
-#          since it is the PDS-H reference engine; DuckDB = pdsh-duckdb
+#   inmem  Polars 2 = polars: its streaming engine with string keys as
+#          Categorical (cast at load, untimed) -- `polars-categorical` in runs
+#          from before 2026-10-10, which also timed other variants;
+#          DuckDB = duckdb
+#   pdsh   Polars 2 = pdsh-polars-stream; DuckDB = pdsh-duckdb
+#
+# Polars' in-memory engine is an opt-in experiment (run_scale_suite.sh,
+# run-tpch.sh) and is not a reference here.
 #
 # Quote the geomean, not the total: the in-memory totals are dominated by three
 # dcast queries. inmem leaves out rand_* (RNG, not query work), corr and
@@ -84,8 +88,13 @@ if (kind == "inmem") {
         ";"
     ))
     exclude <- '!(like(query, "rand_%") || like(query, "%corr%") || like(query, "%floor%"))'
+    # Runs before 2026-10-10 timed `polars` with String keys and the reference
+    # configuration as `polars-categorical`; later runs time only the reference,
+    # as `polars`.
+    frameworks <- ibex("raw[select { n = count() }, by framework];")$framework
+    polars_ref <- if ("polars-categorical" %in% frameworks) "polars-categorical" else "polars"
     references <- list(
-        "Polars 2 (best of 4 variants)" = 'like(framework, "polars%")',
+        "Polars 2 (streaming, Categorical keys)" = sprintf('framework == "%s"', polars_ref),
         "DuckDB" = 'framework == "duckdb"'
     )
 } else {
@@ -117,9 +126,7 @@ if (kind == "inmem") {
     ibex("let raw = input;", tables = list(input = raw))
     exclude <- "true"
     references <- list(
-        "Polars 2 (best of streaming, in-memory)" =
-            'framework == "pdsh-polars-stream" || framework == "pdsh-polars"',
-        "Polars 2 streaming" = 'framework == "pdsh-polars-stream"',
+        "Polars 2 (streaming)" = 'framework == "pdsh-polars-stream"',
         "DuckDB" = 'framework == "pdsh-duckdb"'
     )
 }

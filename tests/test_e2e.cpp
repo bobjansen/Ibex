@@ -483,6 +483,69 @@ TEST_CASE("E2E: String() of null is null", "[e2e][cast][string][nulls]") {
     CHECK((*missing)[1]);
 }
 
+TEST_CASE("E2E: is null takes any expression and sees a null scalar", "[e2e][nulls]") {
+    runtime::ScalarRegistry scalars;
+    scalars.insert_or_assign("n", runtime::ScalarValue{std::monostate{}});
+    scalars.insert_or_assign("k", runtime::ScalarValue{std::int64_t{5}});
+    const char* frame = "Table { a = [1, 2] }[update { v = case { a > 1 => 10, else => NULL } }]";
+
+    auto out = run(std::string(frame) +
+                       "[select { e = (v + 1) is null, s = String(v) is null, nn = n is null,"
+                       "          kn = k is null }];",
+                   {}, &scalars);
+    auto bools = [&](const char* name) {
+        const auto* col = std::get_if<Column<bool>>(out.find(name));
+        REQUIRE(col != nullptr);
+        return std::vector<bool>{(*col)[0], (*col)[1]};
+    };
+    CHECK(bools("e") == std::vector<bool>{true, false});
+    CHECK(bools("s") == std::vector<bool>{true, false});
+    // A null scalar binding is null on every row; it used to read as valid.
+    CHECK(bools("nn") == std::vector<bool>{true, true});
+    CHECK(bools("kn") == std::vector<bool>{false, false});
+
+    CHECK(run(std::string(frame) + "[filter n is null];", {}, &scalars).rows() == 2);
+    CHECK(run(std::string(frame) + "[filter (v * 2) is not null];", {}, &scalars).rows() == 1);
+}
+
+TEST_CASE("E2E: a cast of NULL is a typed null", "[e2e][nulls][cast]") {
+    auto out =
+        run("Table { a = [1, 2] }[update { i = Int64(NULL), f = Float64(NULL),"
+            " d = Date(NULL), s = String(NULL), m = Decimal(NULL, 10, 2),"
+            " pick = case { a > 1 => a, else => Int64(NULL) } }];",
+            {});
+    REQUIRE(out.rows() == 2);
+    CHECK(std::get_if<Column<std::int64_t>>(out.find("i")) != nullptr);
+    CHECK(std::get_if<Column<double>>(out.find("f")) != nullptr);
+    CHECK(std::get_if<Column<Date>>(out.find("d")) != nullptr);
+    CHECK(std::get_if<Column<std::string>>(out.find("s")) != nullptr);
+    CHECK(std::get_if<Column<Decimal>>(out.find("m")) != nullptr);
+    for (const char* name : {"i", "f", "d", "s", "m"}) {
+        const auto* entry = out.find_entry(name);
+        REQUIRE(entry != nullptr);
+        REQUIRE(entry->validity.has_value());
+        CHECK_FALSE((*entry->validity)[0]);
+        CHECK_FALSE((*entry->validity)[1]);
+    }
+    const auto* pick = out.find_entry("pick");
+    REQUIRE(pick != nullptr);
+    REQUIRE(pick->validity.has_value());
+    CHECK_FALSE((*pick->validity)[0]);
+    CHECK((*pick->validity)[1]);
+}
+
+TEST_CASE("E2E: a null scalar broadcast into a column is an all-null column", "[e2e][nulls]") {
+    runtime::ScalarRegistry scalars;
+    scalars.insert_or_assign("n", runtime::ScalarValue{std::monostate{}});
+    // Used to trip an internal invariant and abort.
+    auto out = run("Table { a = [1, 2] }[update { y = n }];", {}, &scalars);
+    const auto* entry = out.find_entry("y");
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->validity.has_value());
+    CHECK_FALSE((*entry->validity)[0]);
+    CHECK_FALSE((*entry->validity)[1]);
+}
+
 TEST_CASE("E2E: hour() inside computed group key", "[e2e][time][groupby]") {
     auto out =
         run("Table { ts = [ts\"2024-01-01T09:15:00\", ts\"2024-01-01T09:45:00\","

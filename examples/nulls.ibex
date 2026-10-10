@@ -62,3 +62,8 @@ with_bonus[filter { bonus > 200000 }];
 //   Bob (salary 72000, non-null dept) is kept — true OR false = true.
 print("6. dept_name is not null OR salary > 80000 — 3VL OR keeps known-true rows:");
 enriched[filter { dept_name is not null || salary > 80000 }];
+
+// A typed null is a cast of NULL; `is null` takes any expression.
+let scored = Table { id = [1, 2, 3], score = [0.9, 0.4, 0.7] }
+    [update { pass = case { score > 0.5 => Int64(round(score * 100.0, Nearest)), else => Int64(NULL) } }];
+scored[select { id, pass, missing = (pass + 1) is null }];

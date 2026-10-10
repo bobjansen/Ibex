@@ -2670,9 +2670,12 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
         }
         return EvalValue{std::move(scalar.value())};
     }
+    const auto* null_call = std::get_if<parser::CallExpr>(&expr.node);
     if (std::holds_alternative<parser::LiteralExpr>(expr.node) ||
         std::holds_alternative<parser::BinaryExpr>(expr.node) ||
-        std::holds_alternative<parser::UnaryExpr>(expr.node)) {
+        std::holds_alternative<parser::UnaryExpr>(expr.node) ||
+        std::holds_alternative<parser::CaseExpr>(expr.node) ||
+        (null_call != nullptr && null_call->callee == "__null" && null_call->args.empty())) {
         auto scalar = eval_scalar_expr(expr, tables, lazy_tables, scalars, columns, models,
                                        functions, compile_time_lists, extern_decls, externs);
         if (!scalar) {
@@ -2841,6 +2844,30 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
     return EvalValue{std::move(table.value())};
 }
 
+// A name standing for an already-evaluated operand of a scalar operator.
+auto operand_ref(std::string name) -> parser::ExprPtr {
+    auto ref = std::make_unique<parser::Expr>();
+    ref->node = parser::IdentifierExpr{.name = std::move(name), .lexical = false};
+    return ref;
+}
+
+// Operators on scalars run on the runtime's expression engine, the one that
+// evaluates columns and filters, so a scalar statement means what the same
+// expression means in a cell: comparisons, logic, `is null`, null
+// propagation, `/` as Float64, every type. `node` is one operator over the
+// names bound in `operands`; the REPL evaluates the operands itself, since
+// they may be things only it knows (subqueries, models, user functions).
+auto eval_scalar_operator(const parser::Expr& node, const runtime::ScalarRegistry& operands,
+                          const runtime::ExternRegistry& externs)
+    -> std::expected<runtime::ScalarValue, std::string> {
+    parser::LowerContext context;
+    auto lowered = parser::lower_value_expr(node, context);
+    if (!lowered) {
+        return std::unexpected(lowered.error().message);
+    }
+    return runtime::evaluate_scalar_expr(*lowered, &operands, &externs);
+}
+
 auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                       LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
                       ColumnRegistry& columns, ModelRegistry& models,
@@ -2895,23 +2922,11 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         if (!value) {
             return std::unexpected(value.error());
         }
-        if (unary->op != parser::UnaryOp::Negate) {
-            return std::unexpected("unsupported unary operator in scalar expression");
-        }
-        if (std::holds_alternative<Date>(value.value()) ||
-            std::holds_alternative<Timestamp>(value.value())) {
-            return std::unexpected("date/time arithmetic not supported");
-        }
-        if (std::holds_alternative<bool>(value.value())) {
-            return std::unexpected("boolean arithmetic not supported");
-        }
-        if (const auto* int_value = std::get_if<std::int64_t>(&value.value())) {
-            return runtime::ScalarValue{-(*int_value)};
-        }
-        if (const auto* double_value = std::get_if<double>(&value.value())) {
-            return runtime::ScalarValue{-(*double_value)};
-        }
-        return std::unexpected("unsupported unary operand type");
+        parser::Expr op;
+        op.node = parser::UnaryExpr{.op = unary->op, .expr = operand_ref("__operand")};
+        runtime::ScalarRegistry operands;
+        operands.insert_or_assign("__operand", std::move(*value));
+        return eval_scalar_operator(op, operands, externs);
     }
     if (const auto* binary = std::get_if<parser::BinaryExpr>(&expr.node)) {
         auto left = eval_scalar_expr(*binary->left, tables, lazy_tables, scalars, columns, models,
@@ -2924,58 +2939,66 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         if (!right) {
             return std::unexpected(right.error());
         }
-        if (std::holds_alternative<Date>(left.value()) ||
-            std::holds_alternative<Date>(right.value()) ||
-            std::holds_alternative<Timestamp>(left.value()) ||
-            std::holds_alternative<Timestamp>(right.value())) {
-            return std::unexpected("date/time arithmetic not supported");
+        parser::Expr op;
+        op.node = parser::BinaryExpr{
+            .op = binary->op, .left = operand_ref("__lhs"), .right = operand_ref("__rhs")};
+        runtime::ScalarRegistry operands;
+        operands.insert_or_assign("__lhs", std::move(*left));
+        operands.insert_or_assign("__rhs", std::move(*right));
+        return eval_scalar_operator(op, operands, externs);
+    }
+    if (auto* case_expr = std::get_if<parser::CaseExpr>(&expr.node)) {
+        // Arms are tried in order and only the chosen value is evaluated, as in
+        // a cell; a null condition does not match.
+        std::optional<runtime::ScalarValue> selector;
+        if (case_expr->selector) {
+            auto value =
+                eval_scalar_expr(*case_expr->selector, tables, lazy_tables, scalars, columns,
+                                 models, functions, compile_time_lists, extern_decls, externs);
+            if (!value) {
+                return std::unexpected(value.error());
+            }
+            selector = std::move(*value);
         }
-        if (std::holds_alternative<bool>(left.value()) ||
-            std::holds_alternative<bool>(right.value())) {
-            return std::unexpected("boolean arithmetic not supported");
-        }
-        const bool left_double = std::holds_alternative<double>(left.value());
-        const bool right_double = std::holds_alternative<double>(right.value());
-        if (left_double || right_double) {
-            const double lhs = left_double
-                                   ? std::get<double>(left.value())
-                                   : static_cast<double>(std::get<std::int64_t>(left.value()));
-            const double rhs = right_double
-                                   ? std::get<double>(right.value())
-                                   : static_cast<double>(std::get<std::int64_t>(right.value()));
-            switch (binary->op) {
-                case parser::BinaryOp::Add:
-                    return runtime::ScalarValue{lhs + rhs};
-                case parser::BinaryOp::Sub:
-                    return runtime::ScalarValue{lhs - rhs};
-                case parser::BinaryOp::Mul:
-                    return runtime::ScalarValue{lhs * rhs};
-                case parser::BinaryOp::Div:
-                    return runtime::ScalarValue{lhs / rhs};
-                case parser::BinaryOp::Mod:
-                    return std::unexpected("mod not supported for float scalars");
-                default:
-                    return std::unexpected("unsupported operator in scalar expression");
+        for (auto& arm : case_expr->arms) {
+            auto condition =
+                eval_scalar_expr(*arm.condition, tables, lazy_tables, scalars, columns, models,
+                                 functions, compile_time_lists, extern_decls, externs);
+            if (!condition) {
+                return std::unexpected(condition.error());
+            }
+            if (selector.has_value()) {
+                parser::Expr eq;
+                eq.node = parser::BinaryExpr{.op = parser::BinaryOp::Eq,
+                                             .left = operand_ref("__lhs"),
+                                             .right = operand_ref("__rhs")};
+                runtime::ScalarRegistry operands;
+                operands.insert_or_assign("__lhs", *selector);
+                operands.insert_or_assign("__rhs", std::move(*condition));
+                condition = eval_scalar_operator(eq, operands, externs);
+                if (!condition) {
+                    return std::unexpected(condition.error());
+                }
+            }
+            if (std::holds_alternative<std::monostate>(*condition)) {
+                continue;
+            }
+            const auto* matched = std::get_if<bool>(&*condition);
+            if (matched == nullptr) {
+                return std::unexpected("case: an arm condition must be Bool");
+            }
+            if (*matched) {
+                return eval_scalar_expr(*arm.value, tables, lazy_tables, scalars, columns, models,
+                                        functions, compile_time_lists, extern_decls, externs);
             }
         }
-        auto lhs = std::get<std::int64_t>(left.value());
-        auto rhs = std::get<std::int64_t>(right.value());
-        switch (binary->op) {
-            case parser::BinaryOp::Add:
-                return runtime::ScalarValue{lhs + rhs};
-            case parser::BinaryOp::Sub:
-                return runtime::ScalarValue{lhs - rhs};
-            case parser::BinaryOp::Mul:
-                return runtime::ScalarValue{lhs * rhs};
-            case parser::BinaryOp::Div:
-                return runtime::ScalarValue{runtime::safe_idiv(lhs, rhs)};
-            case parser::BinaryOp::Mod:
-                return runtime::ScalarValue{runtime::safe_imod(lhs, rhs)};
-            default:
-                return std::unexpected("unsupported operator in scalar expression");
-        }
+        return eval_scalar_expr(*case_expr->else_value, tables, lazy_tables, scalars, columns,
+                                models, functions, compile_time_lists, extern_decls, externs);
     }
     if (auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
+        if (call->callee == "__null" && call->args.empty()) {
+            return runtime::ScalarValue{std::monostate{}};
+        }
         if (call->callee == "__interp") {
             // String interpolation: stringify each argument (literal segments and
             // embedded value expressions alike) and concatenate. format_scalar

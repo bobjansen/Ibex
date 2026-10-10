@@ -3119,6 +3119,52 @@ TEST_CASE("ReplSession: table and scalar hold the last value only", "[repl][sess
     CHECK_FALSE(table_last.scalar.has_value());
 }
 
+TEST_CASE("ReplSession: a scalar statement means what the same expression means in a cell",
+          "[repl][session][scalar]") {
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    auto value = [&](const char* src) -> ibex::runtime::ScalarValue {
+        auto r = session.execute(src);
+        INFO(src << " -> " << r.error);
+        REQUIRE(r.ok);
+        REQUIRE(r.scalar.has_value());
+        return *r.scalar;
+    };
+    auto is_null = [](const ibex::runtime::ScalarValue& v) {
+        return std::holds_alternative<std::monostate>(v);
+    };
+
+    // Comparisons and logic used to be "unsupported operator"; string
+    // equality and arithmetic on a null scalar used to abort the process.
+    CHECK(std::get<bool>(value("3 > 2;")));
+    CHECK_FALSE(std::get<bool>(value("\"a\" == \"b\";")));
+    CHECK(std::get<bool>(value("\"a\" < \"b\";")));
+    CHECK_FALSE(std::get<bool>(value("true && false;")));
+    CHECK_FALSE(std::get<bool>(value("!true;")));
+    CHECK(std::get<bool>(value("date\"2024-01-02\" > date\"2024-01-01\";")));
+    // `/` is Float64 on every path (SPEC 3.2): the REPL used to truncate.
+    CHECK(std::get<double>(value("7 / 2;")) == 3.5);
+    CHECK(std::get<std::int64_t>(value("7 % 2;")) == 1);
+    CHECK(std::get<std::string>(value("case { 2 > 3 => \"a\", else => \"b\" };")) == "b");
+    CHECK(std::get<std::string>(value("case 5 { 5 => \"five\", else => \"other\" };")) == "five");
+
+    // Nulls: a null scalar propagates, `is null` sees it, and three-valued
+    // logic decides `null || true`.
+    REQUIRE(
+        session
+            .execute("let t = Table { a = [1] }[update { v = case { a > 5 => 1, else => NULL } }];")
+            .ok);
+    REQUIRE(session.execute("let n = scalar(t[select { m = max(v) }], m);").ok);
+    CHECK(is_null(value("n;")));
+    CHECK(is_null(value("n + 1;")));
+    CHECK(std::get<bool>(value("n is null;")));
+    CHECK_FALSE(std::get<bool>(value("n is not null;")));
+    CHECK(std::get<bool>(value("n == 1 || true;")));
+    CHECK(is_null(value("n == 1 && true;")));
+    CHECK(is_null(value("NULL;")));
+    CHECK(is_null(value("Int64(NULL);")));
+}
+
 TEST_CASE("ReplSession: infer_schema lowers against the session's bindings", "[repl][session]") {
     ibex::runtime::ExternRegistry registry;
     ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);

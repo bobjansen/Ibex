@@ -393,6 +393,23 @@ auto evaluate_row_count_expr(const ir::Expr& expr, const ScalarRegistry* scalars
 auto evaluate_scalar_expr(const ir::Expr& expr, const ScalarRegistry* scalars,
                           const ExternRegistry* externs)
     -> std::expected<ScalarValue, std::string> {
+    if (field_uses_vectorized_eval(expr)) {
+        // Comparisons, logic and `is null` exist only on the validity-aware
+        // column path, so evaluate the expression as a field of a one-row,
+        // column-less frame and read its single cell back -- the same code a
+        // `select` field runs, nulls included.
+        Table one_row;
+        one_row.logical_rows = 1;
+        auto cell = evaluate_field(expr, one_row, RowRange{.begin = 0, .count = 1},
+                                   ColumnEvalCtx{.scalars = scalars, .externs = externs});
+        if (!cell) {
+            return std::unexpected(cell.error());
+        }
+        if (cell->validity.has_value() && !(*cell->validity)[0]) {
+            return ScalarValue{std::monostate{}};
+        }
+        return scalar_from_column(cell->column, 0);
+    }
     auto value = eval_expr(expr, Table{}, 0, scalars, externs);
     if (!value) {
         return std::unexpected(value.error());

@@ -391,6 +391,10 @@ value and may be used for a value arm when another arm establishes the result
 type. All non-`NULL` value arms must have the same type, apart from the usual
 `Int`/`Float` widening.
 
+Anywhere else, give `NULL` its type with a cast: `Int64(NULL)`, `Float64(NULL)`,
+`Date(NULL)`, `String(NULL)`, `Decimal(NULL, p, s)` are typed nulls, usable as a
+column value (`update { y = Int64(NULL) }`) or an argument.
+
 ---
 
 ## 3. Type System
@@ -2817,7 +2821,8 @@ A null scalar **propagates** through arithmetic, comparison, scalar functions,
 and `${}` interpolation under the ordinary null rules of Section 3
 (`null + x = null`, `null > x = null`, `abs(null) = null`,
 `` `px=${null}` `` evaluates to null). `is null` / `is not null`, `coalesce`, and
-`fill_null` consume it. A cast of null is null of the target type.
+`fill_null` consume it. A cast of null is null of the target type, which is
+how a typed null is written: `Int64(NULL)`.
 
 A null scalar is a **runtime error** only where a value must be present:
 

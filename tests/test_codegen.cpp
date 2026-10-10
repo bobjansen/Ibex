@@ -1042,9 +1042,11 @@ TEST_CASE("emitter: a bound sink and a bound call store their results as scalars
     // The registry exists, and each call's result lands in it, in step order.
     const auto registry = out.find("ibex::runtime::ScalarRegistry _ibex_scalars;");
     const auto rows = out.find(
-        "_ibex_scalars[\"rows\"] = ibex::runtime::ScalarValue(ibex::ext::csv::write(t0, "
+        "_ibex_scalars.insert_or_assign(\"rows\", "
+        "ibex::runtime::ScalarValue(ibex::ext::csv::write(t0, "
         "\"copy.csv\"))");
-    const auto pong = out.find("_ibex_scalars[\"pong\"] = ibex::runtime::ScalarValue(ping(");
+    const auto pong =
+        out.find("_ibex_scalars.insert_or_assign(\"pong\", ibex::runtime::ScalarValue(ping(");
     REQUIRE(registry != std::string::npos);
     REQUIRE(rows != std::string::npos);
     REQUIRE(pong != std::string::npos);
@@ -1091,7 +1093,7 @@ TEST_CASE("emitter: a deferred scalar step runs where it is, not before the othe
     REQUIRE(write != std::string::npos);
     REQUIRE(scalar_read != std::string::npos);
     CHECK(write < scalar_read);
-    CHECK(contains(out, "_ibex_scalars[\"k\"] = ibex::ops::eval_scalar("));
+    CHECK(contains(out, "_ibex_scalars.insert_or_assign(\"k\", ibex::ops::eval_scalar("));
 }
 
 TEST_CASE("emitter: a resource is a variable, aliased, passed to calls and released", "[codegen]") {

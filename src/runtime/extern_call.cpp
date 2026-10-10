@@ -48,10 +48,10 @@ auto eval_extern_args(const std::vector<ir::Expr>& exprs, const ScalarRegistry* 
         // in front of the call, rather than reaching extern code. Static typing
         // catches most; this is the runtime backstop.
         auto scalar = scalar_from_expr(val.value());
-        if (is_null_scalar(scalar)) {
+        if (!scalar) {
             return std::unexpected("null argument in extern function call");
         }
-        args.push_back(std::move(scalar));
+        args.push_back(std::move(*scalar));
     }
     return args;
 }
@@ -67,10 +67,10 @@ auto eval_extern_args(const std::vector<ir::ExprPtr>& exprs, std::size_t begin, 
             return std::unexpected(std::move(value.error()));
         }
         auto scalar = scalar_from_expr(*value);
-        if (is_null_scalar(scalar)) {
+        if (!scalar) {
             return std::unexpected(std::string(callee) + ": null argument in extern function call");
         }
-        args.push_back(std::move(scalar));
+        args.push_back(std::move(*scalar));
     }
     return args;
 }

@@ -612,7 +612,10 @@ auto numeric_cast_kernel(const ir::CallExpr& call, const Table& input, std::size
                     if (!value) {
                         return std::unexpected(value.error());
                     }
-                    return broadcast_cast_result(scalar_from_expr(*value), to_int, rows);
+                    return broadcast_cast_result(
+                        scalar_from_expr(*value).value_or(
+                            ScalarValue{NullScalar{to_int ? ScalarKind::Int : ScalarKind::Double}}),
+                        to_int, rows);
                 }
             }
             return std::unexpected(call.callee + "(): unknown column '" + ref->name + "'");
@@ -625,7 +628,9 @@ auto numeric_cast_kernel(const ir::CallExpr& call, const Table& input, std::size
         if (!value) {
             return std::unexpected(value.error());
         }
-        return broadcast_cast_result(scalar_from_expr(*value), to_int, rows);
+        return broadcast_cast_result(scalar_from_expr(*value).value_or(ScalarValue{NullScalar{
+                                         to_int ? ScalarKind::Int : ScalarKind::Double}}),
+                                     to_int, rows);
     }
 
     const ValidityBitmap* validity = entry->validity.has_value() ? &*entry->validity : nullptr;
@@ -2033,11 +2038,7 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
             if (scalars != nullptr) {
                 if (auto it = scalars->find(col->name); it != scalars->end()) {
                     // A binding's type, null or not (a null records its kind).
-                    if (auto type = expr_type_of_kind(scalar_kind(it->second))) {
-                        return *type;
-                    }
-                    // An untyped NULL binding has no type to give.
-                    return ExprType::String;
+                    return expr_type_of_kind(scalar_kind(it->second));
                 }
             }
             if (col->lexical) {
@@ -2268,7 +2269,7 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
                 return arg_type;
             }
         }
-        return expr_type_of_kind(fn->scalar_kind).value();
+        return expr_type_of_kind(fn->scalar_kind.value());
     }
     return std::unexpected("unsupported expression");
 }

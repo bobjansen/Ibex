@@ -28,7 +28,7 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
             if (args.size() != 1) {
                 return std::unexpected("json::read() expects 1 argument");
             }
-            const auto* path = std::get_if<std::string>(args.data());
+            const auto* path = std::get_if<std::string>(&args.front());
             if (path == nullptr) {
                 return std::unexpected("json::read() expects a string path");
             }
@@ -47,7 +47,7 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
                 return std::unexpected(
                     "json::write(df, path) expects exactly 1 scalar argument (path)");
             }
-            const auto* path = std::get_if<std::string>(args.data());
+            const auto* path = std::get_if<std::string>(&args.front());
             if (path == nullptr) {
                 return std::unexpected("json::write(df, path) expects a string path");
             }

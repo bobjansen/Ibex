@@ -641,19 +641,26 @@ inline auto expr_from_scalar(const ScalarValue& v) -> ExprValue {
         v);
 }
 
-/// ExprValue -> ScalarValue: total. ExprValue::Null maps to an untyped
-/// NullScalar.
-inline auto scalar_from_expr(const ExprValue& v) -> ScalarValue {
+/// ExprValue -> ScalarValue, or nullopt for ExprValue::Null: the row
+/// evaluator's null carries no type, and a ScalarValue null must, so the caller
+/// says what a null is there -- rejects it, or types it (infer_null_of).
+inline auto scalar_from_expr(const ExprValue& v) -> std::optional<ScalarValue> {
     return std::visit(
-        [](const auto& x) -> ScalarValue {
+        [](const auto& x) -> std::optional<ScalarValue> {
             if constexpr (std::is_same_v<std::decay_t<decltype(x)>, Null>) {
-                return ScalarValue{ibex::NullScalar{}};
+                return std::nullopt;
             } else {
                 return ScalarValue{x};
             }
         },
         v);
 }
+
+/// The null of `expr`'s type over `input` (with `scalars`): what a null value
+/// of it is as a scalar. An error when the expression has no type.
+[[nodiscard]] auto infer_null_of(const ir::Expr& expr, const Table& input,
+                                 const ScalarRegistry* scalars, const ExternRegistry* externs)
+    -> std::expected<NullScalar, std::string>;
 
 /// The numeric half of an aggregate's per-group state, and deliberately a POD.
 ///
@@ -744,9 +751,10 @@ struct AggSlot {
         double double_value;
     };
     /// The boxed value First/Last needs for a non-numeric column (String, but
-    /// also Bool/Date/Timestamp). The chunked operator keeps these in a side
-    /// array that stays EMPTY — and therefore free — for an all-numeric query.
-    ScalarValue text_value;
+    /// also Bool/Date/Timestamp); empty until the group has one. The chunked
+    /// operator keeps these in a side array that stays EMPTY — and therefore
+    /// free — for an all-numeric query.
+    std::optional<ScalarValue> text_value;
     /// Welford M2, inline here because the materializing aggregate keeps one
     /// slot per group in ordinary containers and has no scratch region to put
     /// it in. The chunked operator, which allocates slots by the million, keeps
@@ -1186,6 +1194,18 @@ inline void append_text_cell(ColumnValue& column, const ScalarValue& value) {
     append_scalar(column, value);
 }
 
+/// An all-null column of a null scalar's type, `rows` long, with its validity:
+/// what broadcasting a null binding into a frame is. The payload is the type's
+/// zero and is never read.
+inline auto null_column(const NullScalar& null, std::size_t rows)
+    -> std::pair<ColumnValue, ValidityBitmap>;
+
+/// An aggregate slot's boxed value, or an empty string when the group had
+/// none -- what a text cell of an empty group has always been.
+inline auto text_or_empty(const std::optional<ScalarValue>& value) -> ScalarValue {
+    return value.has_value() ? *value : ScalarValue{std::string{}};
+}
+
 inline auto broadcast_scalar_column(const ScalarValue& value, std::size_t rows) -> ColumnValue {
     return std::visit(
         [rows](const auto& v) -> ColumnValue {
@@ -1207,6 +1227,30 @@ inline auto broadcast_scalar_column(const ScalarValue& value, std::size_t rows) 
             }
         },
         value);
+}
+
+inline auto null_column(const NullScalar& null, std::size_t rows)
+    -> std::pair<ColumnValue, ValidityBitmap> {
+    const ScalarValue zero = [&]() -> ScalarValue {
+        switch (null.kind) {
+            case ScalarKind::Int:
+                return std::int64_t{0};
+            case ScalarKind::Double:
+                return 0.0;
+            case ScalarKind::Bool:
+                return false;
+            case ScalarKind::String:
+                return std::string{};
+            case ScalarKind::Date:
+                return Date{0};
+            case ScalarKind::Timestamp:
+                return Timestamp{0};
+            case ScalarKind::Decimal:
+                return DecimalValue{.units = 0, .type = null.decimal};
+        }
+        return std::int64_t{0};
+    }();
+    return {broadcast_scalar_column(zero, rows), ValidityBitmap(rows, false)};
 }
 
 inline auto scalar_kind_from_value(const ScalarValue& value) -> ExprType {

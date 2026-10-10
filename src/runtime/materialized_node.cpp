@@ -258,7 +258,18 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
                         return std::unexpected("map field '" + map_node.fields()[field].alias +
                                                "': " + value.error());
                     }
-                    values[field].push_back(scalar_from_expr(*value));
+                    auto scalar = scalar_from_expr(*value);
+                    if (!scalar) {
+                        // A null cell is of the field's type.
+                        auto null =
+                            infer_null_of(map_node.fields()[field].expr, *child, scalars, externs);
+                        if (!null) {
+                            return std::unexpected("map field '" + map_node.fields()[field].alias +
+                                                   "': " + null.error());
+                        }
+                        scalar = ScalarValue{*null};
+                    }
+                    values[field].push_back(std::move(*scalar));
                 }
             }
             Table out;
@@ -698,9 +709,9 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
                     if (!val)
                         return std::unexpected(val.error());
                     auto scalar = scalar_from_expr(val.value());
-                    if (is_null_scalar(scalar))
+                    if (!scalar)
                         return std::unexpected("null argument in stream extern call");
-                    out.push_back(std::move(scalar));
+                    out.push_back(std::move(*scalar));
                 }
                 return out;
             };

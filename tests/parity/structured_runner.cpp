@@ -39,7 +39,7 @@ auto main(int argc, char* const* argv) -> int {
     }
     ibex::runtime::ScalarRegistry scalars;
     for (auto& [name, value] : scalar_bindings->compile_time) {
-        scalars[name] = std::move(value);
+        scalars.insert_or_assign(name, std::move(value));
     }
     if (auto ok = ibex::runtime::materialize_deferred_scalar_bindings(scalar_bindings->deferred, {},
                                                                       scalars, nullptr);

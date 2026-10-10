@@ -90,7 +90,8 @@ auto write_direct_update(const Chunk& input, std::string alias, std::shared_ptr<
 struct NumericOperand {
     bool is_column = false;
     const ColumnValue* column = nullptr;
-    ScalarValue scalar;
+    /// Set exactly when !is_column.
+    std::optional<ScalarValue> scalar;
     ExprType kind = ExprType::Int;
 };
 
@@ -103,7 +104,7 @@ auto resolve_numeric_operand(const ir::Expr& expr, const PredicateInput& input,
                 if (kind == ExprType::Int || kind == ExprType::Double) {
                     return NumericOperand{.is_column = true,
                                           .column = entry->column.get(),
-                                          .scalar = ScalarValue{},
+                                          .scalar = std::nullopt,
                                           .kind = kind};
                 }
                 return std::nullopt;
@@ -148,14 +149,14 @@ auto numeric_binary_operands(const ir::Expr& expr, const PredicateInput& input,
 
 auto numeric_int_value(const NumericOperand& operand) -> std::int64_t {
     return operand.kind == ExprType::Int
-               ? std::get<std::int64_t>(operand.scalar)
-               : static_cast<std::int64_t>(std::get<double>(operand.scalar));
+               ? std::get<std::int64_t>(*operand.scalar)
+               : static_cast<std::int64_t>(std::get<double>(*operand.scalar));
 }
 
 auto numeric_double_value(const NumericOperand& operand) -> double {
     return operand.kind == ExprType::Int
-               ? static_cast<double>(std::get<std::int64_t>(operand.scalar))
-               : std::get<double>(operand.scalar);
+               ? static_cast<double>(std::get<std::int64_t>(*operand.scalar))
+               : std::get<double>(*operand.scalar);
 }
 
 /// `lag(col, k)` / `lead(col, k)` over an Int or Double column with a
@@ -2019,7 +2020,7 @@ auto try_plan_direct_validity_field(const ir::Expr& expr, const PredicateInput& 
             }
             kind = source_kind;
             plan.values.push_back(
-                {.column = entry, .literal = {}, .is_literal = false, .is_null = false});
+                {.column = entry, .literal = std::nullopt, .is_literal = false, .is_null = false});
             return true;
         }
         if (const auto* literal = std::get_if<ir::Literal>(&value.node)) {
@@ -2042,7 +2043,7 @@ auto try_plan_direct_validity_field(const ir::Expr& expr, const PredicateInput& 
             null_call != nullptr && null_call->callee == "__null" && null_call->args.empty() &&
             null_call->named_args.empty()) {
             plan.values.push_back(
-                {.column = nullptr, .literal = {}, .is_literal = false, .is_null = true});
+                {.column = nullptr, .literal = std::nullopt, .is_literal = false, .is_null = true});
             return true;
         }
         return false;
@@ -2120,7 +2121,7 @@ auto resolve_validity_operands(const DirectValidityPlan& plan, std::size_t range
         if (value.is_null) {
             // Never available; nothing to resolve.
         } else if (value.is_literal) {
-            const auto* literal = std::get_if<T>(&value.literal);
+            const auto* literal = std::get_if<T>(&*value.literal);
             if (literal == nullptr) {
                 return std::nullopt;
             }
@@ -2289,13 +2290,13 @@ auto write_direct_validity_field_range(const DirectValidityPlan& plan, const Pre
         if (plan.numeric_kind == FixedWidthNumericKind::Int) {
             output.numeric.ints[offset] =
                 is_valid ? selected->is_literal
-                               ? std::get<std::int64_t>(selected->literal)
+                               ? std::get<std::int64_t>(*selected->literal)
                                : std::get<Column<std::int64_t>>(*selected->column->column)[row]
                          : 0;
         } else {
             output.numeric.doubles[offset] =
                 is_valid ? selected->is_literal
-                               ? std::get<double>(selected->literal)
+                               ? std::get<double>(*selected->literal)
                                : std::get<Column<double>>(*selected->column->column)[row]
                          : 0.0;
         }
@@ -2338,7 +2339,7 @@ auto try_plan_direct_categorical_field(const ir::Expr& expr, const PredicateInpu
             }
             has_categorical_source = true;
             plan.values.push_back(
-                {.column = entry, .literal = {}, .is_literal = false, .is_null = false});
+                {.column = entry, .literal = std::nullopt, .is_literal = false, .is_null = false});
             return true;
         }
         if (const auto* literal = std::get_if<ir::Literal>(&value.node)) {
@@ -2356,7 +2357,7 @@ auto try_plan_direct_categorical_field(const ir::Expr& expr, const PredicateInpu
             null_call != nullptr && null_call->callee == "__null" && null_call->args.empty() &&
             null_call->named_args.empty()) {
             plan.values.push_back(
-                {.column = nullptr, .literal = {}, .is_literal = false, .is_null = true});
+                {.column = nullptr, .literal = std::nullopt, .is_literal = false, .is_null = true});
             return true;
         }
         return false;
@@ -2404,7 +2405,7 @@ auto try_plan_direct_categorical_field(const ir::Expr& expr, const PredicateInpu
                 remap.push_back(intern(label));
             }
         } else if (value.is_literal) {
-            plan.literal_codes[index] = intern(std::get<std::string>(value.literal));
+            plan.literal_codes[index] = intern(std::get<std::string>(*value.literal));
         }
     }
     return plan;

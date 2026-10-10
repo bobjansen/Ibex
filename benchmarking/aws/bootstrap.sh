@@ -422,8 +422,12 @@ perf_stat_scaling_ibex() {
     if [[ "$rows" =~ ^([0-9]+)[mM]$ ]]; then rows="${BASH_REMATCH[1]}000000"
     elif [[ "$rows" =~ ^([0-9]+)[kK]$ ]]; then rows="${BASH_REMATCH[1]}000"; fi
     local data="/ibex/benchmarking/data/scales/$rows" suite
-    [[ -f "$data/prices.csv" ]] || return 0
     mkdir -p "$out_dir"
+    if [[ ! -f "$data/prices.csv" ]]; then
+        # Say so: a silent return here once cost a whole run its counters.
+        echo "perf stat ${threads}t skipped: no data in $data" >> "$out_dir/failures.txt"
+        return 0
+    fi
     for suite in "${PERF_STAT_SCALING_SUITES[@]}"; do
         IBEX_CORES="$threads" IBEX_ROOT=/ibex BUILD_DIR=/ibex/build-release \
             perf stat -e "$PERF_STAT_EVENTS" -o "$out_dir/perf_stat_${suite}_${threads}t.txt" -- \
@@ -1367,7 +1371,7 @@ if [[ "${IBEX_SCALING_MODE:-0}" == "1" ]]; then
     # The sweep exits non-zero when any pass is incomplete. That must not skip
     # the upload — a curve with one hole is still the run's whole output — so
     # the EXIT trap above owns the upload and the failure is only reported.
-    IBEX_ROOT=/ibex BUILD_DIR=/ibex/build-release \
+    IBEX_ROOT=/ibex BUILD_DIR=/ibex/build-release IBEX_SCALING_KEEP_DATA=1 \
         bash /ibex/benchmarking/run_thread_scaling.sh \
             --threads "${IBEX_SCALING_THREADS:-1,2,4,8}" \
             --rows "${IBEX_SCALING_ROWS:-16M}" \
@@ -1386,7 +1390,10 @@ if [[ "${IBEX_SCALING_MODE:-0}" == "1" ]]; then
         done
     else
         echo "perf unavailable; thread sweep runs without perf stat counters" >&2
+        mkdir -p "$PERF_OUT"
+        echo "perf unavailable on this box" >> "$PERF_OUT/failures.txt"
     fi
+    rm -rf /ibex/benchmarking/data/scales
 
     exit 0
 fi

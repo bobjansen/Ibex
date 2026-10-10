@@ -35,15 +35,9 @@ namespace ibex::runtime {
 class ExecutionProfileState;
 class ExternRegistry;
 
-enum class ScalarKind : std::uint8_t {
-    Int,
-    Double,
-    Bool,
-    String,
-    Date,
-    Timestamp,
-    Decimal,
-};
+/// The kind of a scalar value; lives in core so the null alternative of every
+/// ScalarValue alias can record it.
+using ScalarKind = ibex::ScalarKind;
 
 // Column<Decimal> is last so no alternative index that predates it moves.
 using ColumnValue =
@@ -117,6 +111,24 @@ using ScalarValue = std::variant<ibex::NullScalar, std::int64_t, double, bool, s
 /// True when a ScalarValue holds the null alternative.
 [[nodiscard]] inline auto is_null_scalar(const ScalarValue& v) -> bool {
     return std::holds_alternative<ibex::NullScalar>(v);
+}
+
+/// The kind of a scalar: the alternative it holds, or for a null the kind it
+/// stands in for (nullopt for an untyped NULL).
+[[nodiscard]] auto scalar_kind(const ScalarValue& v) -> std::optional<ScalarKind>;
+
+/// A null of `column`'s type: what a null cell of it is as a scalar. A
+/// Categorical column's cells are Strings.
+[[nodiscard]] auto null_of_column(const ColumnValue& column) -> NullScalar;
+
+/// The type an untyped NULL value takes on from an annotation or a context
+/// that names one; a typed null or a value is returned unchanged.
+[[nodiscard]] inline auto with_null_kind(ScalarValue value, NullScalar kind) -> ScalarValue {
+    if (const auto* null = std::get_if<NullScalar>(&value);
+        null != nullptr && !null->kind.has_value()) {
+        return ScalarValue{kind};
+    }
+    return value;
 }
 
 /// Copy the value-metadata of `src` onto a column derived from it.
@@ -1158,7 +1170,14 @@ class ExternArgs;
     -> std::expected<std::size_t, std::string>;
 
 /// Evaluate a scalar-valued expression against `scalars` (no column input).
-/// Returns a null scalar (NullScalar) when the expression evaluates to null.
+/// A null result is a NullScalar of the expression's type.
+/// The type `expr` would have as a scalar, as a null of that type: what
+/// `case { c => 1, else => NULL }` is when it takes the NULL arm. When
+/// the expression cannot be typed (it names an unknown binding, say), the
+/// result is an untyped null.
+[[nodiscard]] auto infer_scalar_null(const ir::Expr& expr, const ScalarRegistry* scalars = nullptr,
+                                     const ExternRegistry* externs = nullptr) -> NullScalar;
+
 [[nodiscard]] auto evaluate_scalar_expr(const ir::Expr& expr,
                                         const ScalarRegistry* scalars = nullptr,
                                         const ExternRegistry* externs = nullptr)

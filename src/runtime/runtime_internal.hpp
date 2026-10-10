@@ -99,6 +99,11 @@ auto apply_table_properties(Table& table, const TableProperties& props) -> void;
 [[nodiscard]] auto int64_to_date_checked(std::int64_t value) -> Date;
 [[nodiscard]] auto scalar_from_column(const ColumnValue& column, std::size_t row) -> ScalarValue;
 [[nodiscard]] auto column_kind(const ColumnValue& column) -> ExprType;
+/// A null of an expression type (a Categorical is a String as a scalar);
+/// `decimal` is used only for Decimal.
+[[nodiscard]] auto null_of_expr_type(ExprType type, DecimalType decimal = {}) -> NullScalar;
+/// The expression type a scalar kind is; nullopt for an untyped NULL.
+[[nodiscard]] auto expr_type_of_kind(std::optional<ScalarKind> kind) -> std::optional<ExprType>;
 
 inline auto append_value(ColumnValue& out, const ColumnValue& src, std::size_t index) -> void {
     std::visit(

@@ -854,7 +854,30 @@ auto scalar_type_name(parser::ScalarType st) -> std::string_view {
     return "Unknown";
 }
 
+auto scalar_kind_name(runtime::ScalarKind kind) -> std::string_view {
+    switch (kind) {
+        case runtime::ScalarKind::Int:
+            return "Int64";
+        case runtime::ScalarKind::Double:
+            return "Float64";
+        case runtime::ScalarKind::Bool:
+            return "Bool";
+        case runtime::ScalarKind::String:
+            return "String";
+        case runtime::ScalarKind::Date:
+            return "Date";
+        case runtime::ScalarKind::Timestamp:
+            return "Timestamp";
+        case runtime::ScalarKind::Decimal:
+            return "Decimal";
+    }
+    return "Unknown";
+}
+
 auto scalar_value_type_name(const runtime::ScalarValue& val) -> std::string_view {
+    if (const auto* null = std::get_if<NullScalar>(&val)) {
+        return null->kind ? scalar_kind_name(*null->kind) : "an untyped NULL";
+    }
     if (std::holds_alternative<std::int64_t>(val))
         return "Int64";
     if (std::holds_alternative<double>(val))
@@ -867,6 +890,8 @@ auto scalar_value_type_name(const runtime::ScalarValue& val) -> std::string_view
         return "Date";
     if (std::holds_alternative<Timestamp>(val))
         return "Timestamp";
+    if (std::holds_alternative<DecimalValue>(val))
+        return "Decimal";
     return "Unknown";
 }
 
@@ -1003,7 +1028,41 @@ auto extern_signature(const parser::ExternDecl& decl) -> std::string {
     return out;
 }
 
+/// The null a declared scalar type stands for: what an untyped NULL becomes
+/// when an annotation (`let x: Int64 = NULL;`) or a declaration names the type.
+auto null_of_scalar_type(parser::ScalarType type, std::optional<DecimalType> decimal)
+    -> NullScalar {
+    const auto kind = [&] {
+        switch (type) {
+            case parser::ScalarType::Int32:
+            case parser::ScalarType::Int64:
+                return runtime::ScalarKind::Int;
+            case parser::ScalarType::Float32:
+            case parser::ScalarType::Float64:
+                return runtime::ScalarKind::Double;
+            case parser::ScalarType::Bool:
+                return runtime::ScalarKind::Bool;
+            case parser::ScalarType::String:
+                return runtime::ScalarKind::String;
+            case parser::ScalarType::Date:
+                return runtime::ScalarKind::Date;
+            case parser::ScalarType::Timestamp:
+                return runtime::ScalarKind::Timestamp;
+            case parser::ScalarType::Decimal:
+                return runtime::ScalarKind::Decimal;
+        }
+        return runtime::ScalarKind::Int;
+    }();
+    return NullScalar{.kind = kind, .decimal = decimal.value_or(DecimalType{})};
+}
+
 auto scalar_type_matches(const runtime::ScalarValue& val, parser::ScalarType expected) -> bool {
+    if (const auto* null = std::get_if<NullScalar>(&val)) {
+        // A typed null matches its own type; an untyped one matches nothing
+        // (an annotation gives it a type before this is asked).
+        return null->kind.has_value() &&
+               *null->kind == *null_of_scalar_type(expected, std::nullopt).kind;
+    }
     switch (expected) {
         case parser::ScalarType::Int32:
         case parser::ScalarType::Int64:
@@ -1025,6 +1084,16 @@ auto scalar_type_matches(const runtime::ScalarValue& val, parser::ScalarType exp
     return false;
 }
 
+/// An untyped null typed by a declaration (`-> Int64`); anything else as is.
+auto with_declared_null(runtime::ScalarValue value, const parser::Type& declared)
+    -> runtime::ScalarValue {
+    const auto* st = std::get_if<parser::ScalarType>(&declared.arg);
+    if (declared.kind != parser::Type::Kind::Scalar || st == nullptr) {
+        return value;
+    }
+    return runtime::with_null_kind(std::move(value), null_of_scalar_type(*st, declared.decimal));
+}
+
 /// Widen an integer scalar to Float when a let binding (or function argument)
 /// declares a Float type. Avoids the `let x: Float64 = Float64(42)` ceremony
 /// that nothing in the language gains from. This is the only implicit
@@ -1032,6 +1101,11 @@ auto scalar_type_matches(const runtime::ScalarValue& val, parser::ScalarType exp
 auto try_widen_int_to_float(runtime::ScalarValue& val, parser::ScalarType expected) -> bool {
     if (expected != parser::ScalarType::Float32 && expected != parser::ScalarType::Float64) {
         return false;
+    }
+    if (auto* null = std::get_if<NullScalar>(&val);
+        null != nullptr && null->kind == runtime::ScalarKind::Int) {
+        null->kind = runtime::ScalarKind::Double;
+        return true;
     }
     const auto* iv = std::get_if<std::int64_t>(&val);
     if (iv == nullptr) {
@@ -1655,7 +1729,11 @@ auto apply_scalar_cast(const runtime::ScalarValue& val, std::string_view callee)
     -> std::expected<runtime::ScalarValue, std::string> {
     // Casting null yields null of the target type, as with every scalar function.
     if (runtime::is_null_scalar(val)) {
-        return val;
+        const auto kind = callee == "Date" ? runtime::ScalarKind::Date
+                          : (callee == "Int64" || callee == "Int32" || callee == "Int")
+                              ? runtime::ScalarKind::Int
+                              : runtime::ScalarKind::Double;
+        return runtime::ScalarValue{NullScalar{.kind = kind, .decimal = {}}};
     }
     if (callee == "Date") {
         if (const auto* ts = std::get_if<Timestamp>(&val)) {
@@ -2948,52 +3026,67 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         return eval_scalar_operator(op, operands, externs);
     }
     if (auto* case_expr = std::get_if<parser::CaseExpr>(&expr.node)) {
-        // Arms are tried in order and only the chosen value is evaluated, as in
-        // a cell; a null condition does not match.
-        std::optional<runtime::ScalarValue> selector;
-        if (case_expr->selector) {
-            auto value =
-                eval_scalar_expr(*case_expr->selector, tables, lazy_tables, scalars, columns,
-                                 models, functions, compile_time_lists, extern_decls, externs);
-            if (!value) {
-                return std::unexpected(value.error());
+        auto chosen = [&]() -> std::expected<runtime::ScalarValue, std::string> {
+            // Arms are tried in order and only the chosen value is evaluated, as in
+            // a cell; a null condition does not match.
+            std::optional<runtime::ScalarValue> selector;
+            if (case_expr->selector) {
+                auto value =
+                    eval_scalar_expr(*case_expr->selector, tables, lazy_tables, scalars, columns,
+                                     models, functions, compile_time_lists, extern_decls, externs);
+                if (!value) {
+                    return std::unexpected(value.error());
+                }
+                selector = std::move(*value);
             }
-            selector = std::move(*value);
-        }
-        for (auto& arm : case_expr->arms) {
-            auto condition =
-                eval_scalar_expr(*arm.condition, tables, lazy_tables, scalars, columns, models,
-                                 functions, compile_time_lists, extern_decls, externs);
-            if (!condition) {
-                return std::unexpected(condition.error());
-            }
-            if (selector.has_value()) {
-                parser::Expr eq;
-                eq.node = parser::BinaryExpr{.op = parser::BinaryOp::Eq,
-                                             .left = operand_ref("__lhs"),
-                                             .right = operand_ref("__rhs")};
-                runtime::ScalarRegistry operands;
-                operands.insert_or_assign("__lhs", *selector);
-                operands.insert_or_assign("__rhs", std::move(*condition));
-                condition = eval_scalar_operator(eq, operands, externs);
+            for (auto& arm : case_expr->arms) {
+                auto condition =
+                    eval_scalar_expr(*arm.condition, tables, lazy_tables, scalars, columns, models,
+                                     functions, compile_time_lists, extern_decls, externs);
                 if (!condition) {
                     return std::unexpected(condition.error());
                 }
+                if (selector.has_value()) {
+                    parser::Expr eq;
+                    eq.node = parser::BinaryExpr{.op = parser::BinaryOp::Eq,
+                                                 .left = operand_ref("__lhs"),
+                                                 .right = operand_ref("__rhs")};
+                    runtime::ScalarRegistry operands;
+                    operands.insert_or_assign("__lhs", *selector);
+                    operands.insert_or_assign("__rhs", std::move(*condition));
+                    condition = eval_scalar_operator(eq, operands, externs);
+                    if (!condition) {
+                        return std::unexpected(condition.error());
+                    }
+                }
+                if (std::holds_alternative<ibex::NullScalar>(*condition)) {
+                    continue;
+                }
+                const auto* matched = std::get_if<bool>(&*condition);
+                if (matched == nullptr) {
+                    return std::unexpected("case: an arm condition must be Bool");
+                }
+                if (*matched) {
+                    return eval_scalar_expr(*arm.value, tables, lazy_tables, scalars, columns,
+                                            models, functions, compile_time_lists, extern_decls,
+                                            externs);
+                }
             }
-            if (std::holds_alternative<ibex::NullScalar>(*condition)) {
-                continue;
-            }
-            const auto* matched = std::get_if<bool>(&*condition);
-            if (matched == nullptr) {
-                return std::unexpected("case: an arm condition must be Bool");
-            }
-            if (*matched) {
-                return eval_scalar_expr(*arm.value, tables, lazy_tables, scalars, columns, models,
-                                        functions, compile_time_lists, extern_decls, externs);
+            return eval_scalar_expr(*case_expr->else_value, tables, lazy_tables, scalars, columns,
+                                    models, functions, compile_time_lists, extern_decls, externs);
+        }();
+        // A NULL arm has no type of its own; the case's type is its other
+        // arms' (`case { c => 1, else => NULL }` is an Int64 null, and so is
+        // `Int64(NULL)`, which the parser spells that way).
+        if (chosen && runtime::is_null_scalar(*chosen) &&
+            !runtime::scalar_kind(*chosen).has_value()) {
+            parser::LowerContext context;
+            if (auto lowered = parser::lower_value_expr(expr, context)) {
+                return runtime::ScalarValue{
+                    runtime::infer_scalar_null(*lowered, &scalars, &externs)};
             }
         }
-        return eval_scalar_expr(*case_expr->else_value, tables, lazy_tables, scalars, columns,
-                                models, functions, compile_time_lists, extern_decls, externs);
+        return chosen;
     }
     if (auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
         if (call->callee == "__null" && call->args.empty()) {
@@ -3002,15 +3095,26 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         if (call->callee == "__interp") {
             // String interpolation: stringify each argument (literal segments and
             // embedded value expressions alike) and concatenate. format_scalar
-            // renders strings unquoted, so the literals read verbatim.
+            // renders strings unquoted, so the literals read verbatim. A null
+            // embedded value makes the whole template null, as in a cell
+            // (SPEC.md Section 3: `px=${null}` is null), never the text "null".
             std::string out;
+            bool null_value = false;
             for (auto& arg : call->args) {
                 auto value = eval_scalar_expr(*arg, tables, lazy_tables, scalars, columns, models,
                                               functions, compile_time_lists, extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
+                if (runtime::is_null_scalar(*value)) {
+                    null_value = true;
+                    continue;
+                }
                 out += format_scalar(*value);
+            }
+            if (null_value) {
+                return runtime::ScalarValue{
+                    NullScalar{.kind = runtime::ScalarKind::String, .decimal = {}}};
             }
             return runtime::ScalarValue{std::move(out)};
         }
@@ -3104,7 +3208,7 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                     return std::unexpected(result.error());
                 }
                 if (auto* scalar = std::get_if<runtime::ScalarValue>(&result.value())) {
-                    return *scalar;
+                    return with_declared_null(std::move(*scalar), decl.return_type);
                 }
                 return std::unexpected("extern function returned table: " + call->callee);
             }
@@ -3124,7 +3228,8 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                 return std::unexpected(result.error());
             }
             if (auto* scalar = std::get_if<runtime::ScalarValue>(&result.value())) {
-                return *scalar;
+                // A plugin's null is of the declared return type.
+                return with_declared_null(std::move(*scalar), decl.return_type);
             }
             return std::unexpected("extern function returned table: " + call->callee);
         }
@@ -4608,6 +4713,9 @@ auto run_function(parser::CallExpr& call, const parser::FunctionDecl& fn,
                 }
                 const auto* st = std::get_if<parser::ScalarType>(&param.type.arg);
                 if (st != nullptr) {
+                    // A NULL argument takes the declared parameter type.
+                    value.value() = runtime::with_null_kind(
+                        std::move(value.value()), null_of_scalar_type(*st, param.type.decimal));
                     try_widen_int_to_float(value.value(), *st);
                 }
                 if (st != nullptr && !scalar_type_matches(value.value(), *st)) {
@@ -4714,6 +4822,9 @@ auto run_function(parser::CallExpr& call, const parser::FunctionDecl& fn,
                 }
                 const auto* st = std::get_if<parser::ScalarType>(&let_stmt.type->arg);
                 if (st != nullptr) {
+                    // `let x: Int64 = NULL;`: the annotation types the NULL.
+                    value.value() = runtime::with_null_kind(
+                        std::move(value.value()), null_of_scalar_type(*st, let_stmt.type->decimal));
                     try_widen_int_to_float(value.value(), *st);
                 }
                 if (st != nullptr && !scalar_type_matches(value.value(), *st)) {
@@ -4895,7 +5006,9 @@ auto run_function(parser::CallExpr& call, const parser::FunctionDecl& fn,
         if (!std::holds_alternative<runtime::ScalarValue>(result)) {
             return std::unexpected(call.callee + ": return type mismatch (expected scalar)");
         }
-        return EvalValue{std::get<runtime::ScalarValue>(std::move(result))};
+        // A returned NULL is of the declared return type.
+        return EvalValue{
+            with_declared_null(std::get<runtime::ScalarValue>(std::move(result)), fn.return_type)};
     }
     if (fn.return_type.kind == parser::Type::Kind::DataFrame ||
         fn.return_type.kind == parser::Type::Kind::TimeFrame) {
@@ -5247,6 +5360,10 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                     }
                     const auto* st = std::get_if<parser::ScalarType>(&let_stmt.type->arg);
                     if (st != nullptr) {
+                        // `let x: Int64 = NULL;`: the annotation types the NULL.
+                        value.value() = runtime::with_null_kind(
+                            std::move(value.value()),
+                            null_of_scalar_type(*st, let_stmt.type->decimal));
                         try_widen_int_to_float(value.value(), *st);
                     }
                     if (st != nullptr && !scalar_type_matches(value.value(), *st)) {

@@ -42,6 +42,7 @@
 #include <malloc.h>  // mallopt
 #endif
 
+#include "decimal_ops.hpp"
 #include "interpreter_internal.hpp"
 #include "join_internal.hpp"
 #include "runtime_internal.hpp"
@@ -390,6 +391,56 @@ auto evaluate_row_count_expr(const ir::Expr& expr, const ScalarRegistry* scalars
     return evaluate_row_count_expr_impl(expr, scalars, externs);
 }
 
+auto scalar_kind(const ScalarValue& v) -> std::optional<ScalarKind> {
+    return std::visit(
+        [](const auto& x) -> std::optional<ScalarKind> {
+            using T = std::decay_t<decltype(x)>;
+            if constexpr (std::is_same_v<T, NullScalar>) {
+                return x.kind;
+            } else if constexpr (std::is_same_v<T, std::int64_t>) {
+                return ScalarKind::Int;
+            } else if constexpr (std::is_same_v<T, double>) {
+                return ScalarKind::Double;
+            } else if constexpr (std::is_same_v<T, bool>) {
+                return ScalarKind::Bool;
+            } else if constexpr (std::is_same_v<T, std::string>) {
+                return ScalarKind::String;
+            } else if constexpr (std::is_same_v<T, Date>) {
+                return ScalarKind::Date;
+            } else if constexpr (std::is_same_v<T, Timestamp>) {
+                return ScalarKind::Timestamp;
+            } else {
+                static_assert(std::is_same_v<T, DecimalValue>);
+                return ScalarKind::Decimal;
+            }
+        },
+        v);
+}
+
+auto null_of_column(const ColumnValue& column) -> NullScalar {
+    const auto* decimal = std::get_if<Column<Decimal>>(&column);
+    return null_of_expr_type(column_kind(column),
+                             decimal != nullptr ? decimal_type_of(*decimal) : DecimalType{});
+}
+
+auto infer_scalar_null(const ir::Expr& expr, const ScalarRegistry* scalars,
+                       const ExternRegistry* externs) -> NullScalar {
+    const Table none;
+    auto type = infer_expr_type(expr, none, scalars, externs);
+    if (!type) {
+        return NullScalar{};
+    }
+    DecimalType decimal{};
+    if (*type == ExprType::Decimal) {
+        auto inferred = infer_decimal_type(expr, none, scalars);
+        if (!inferred) {
+            return NullScalar{};
+        }
+        decimal = *inferred;
+    }
+    return null_of_expr_type(*type, decimal);
+}
+
 auto evaluate_scalar_expr(const ir::Expr& expr, const ScalarRegistry* scalars,
                           const ExternRegistry* externs)
     -> std::expected<ScalarValue, std::string> {
@@ -407,13 +458,17 @@ auto evaluate_scalar_expr(const ir::Expr& expr, const ScalarRegistry* scalars,
             return std::unexpected(cell.error());
         }
         if (cell->validity.has_value() && !(*cell->validity)[0]) {
-            return ScalarValue{ibex::NullScalar{}};
+            return ScalarValue{null_of_column(cell->column)};
         }
         return scalar_from_column(cell->column, 0);
     }
     auto value = eval_expr(expr, Table{}, 0, scalars, externs);
     if (!value) {
         return std::unexpected(value.error());
+    }
+    // The per-row evaluator's null carries no type; inference supplies it.
+    if (std::holds_alternative<Null>(*value)) {
+        return ScalarValue{infer_scalar_null(expr, scalars, externs)};
     }
     return scalar_from_expr(*value);
 }
@@ -596,20 +651,23 @@ auto join_tables(const Table& left, const Table& right, ir::JoinKind kind,
 
 auto extract_scalar(const Table& table, const std::string& column, bool zero_rows_is_null)
     -> std::expected<ScalarValue, std::string> {
+    const auto* entry = table.find_entry(column);
     if (table.rows() == 0 && zero_rows_is_null) {
-        return ScalarValue{ibex::NullScalar{}};
+        // No row, but the column still has a type: the null is of it.
+        return ScalarValue{entry != nullptr && entry->column != nullptr
+                               ? null_of_column(*entry->column)
+                               : NullScalar{}};
     }
     if (table.rows() != 1) {
         return std::unexpected("scalar() requires exactly one row");
     }
-    const auto* entry = table.find_entry(column);
     if (entry == nullptr || entry->column == nullptr) {
         return std::unexpected("column not found: " + column);
     }
-    // A null cell yields a null scalar (the NullScalar alternative), not an
-    // error -- see SPEC.md §6.7.
+    // A null cell yields a null scalar of the column's type, not an error --
+    // see SPEC.md §6.7.
     if (entry->validity.has_value() && !(*entry->validity)[0]) {
-        return ScalarValue{ibex::NullScalar{}};
+        return ScalarValue{null_of_column(*entry->column)};
     }
     return scalar_from_column(*entry->column, 0);
 }
@@ -639,11 +697,11 @@ auto materialize_deferred_scalar_bindings(std::span<const ir::DeferredScalarBind
             }
             scalars[source.tmp_name] = std::move(*value);
         }
-        auto result = eval_expr(binding.value, Table{}, 0, &scalars, externs);
+        auto result = evaluate_scalar_expr(binding.value, &scalars, externs);
         if (!result) {
             return std::unexpected("deferred scalar '" + binding.name + "': " + result.error());
         }
-        scalars[binding.name] = scalar_from_expr(*result);
+        scalars[binding.name] = std::move(*result);
     }
     return {};
 }
@@ -677,6 +735,21 @@ auto eval_scalar_builtin(std::string_view name, const std::vector<ScalarValue>& 
     if (!result) {
         return std::unexpected(result.error());
     }
+    if (std::holds_alternative<Null>(*result) && found->infer) {
+        // A null result is of the builtin's return type, when the argument
+        // types (a typed null's included) determine it.
+        std::vector<ExprType> types;
+        types.reserve(args.size());
+        for (const auto& a : args) {
+            const auto type = expr_type_of_kind(scalar_kind(a));
+            if (!type) {
+                return ScalarValue{NullScalar{}};
+            }
+            types.push_back(*type);
+        }
+        auto returned = found->infer(name, types);
+        return ScalarValue{returned ? null_of_expr_type(*returned) : NullScalar{}};
+    }
     // A null result is now a valid scalar (the NullScalar alternative); null
     // propagation and the null-handling builtins (coalesce, is null) rely on
     // it reaching the caller rather than erroring here.
@@ -706,10 +779,10 @@ auto aggregate_series(std::string_view name, const ColumnValue& column, double p
     if (entry == nullptr || entry->column == nullptr) {
         return std::unexpected(std::string(name) + "(): produced no result");
     }
-    // An aggregate with no valid observations reduces to a null scalar (the
-    // NullScalar alternative), consistent with the column path.
+    // An aggregate with no valid observations reduces to a null scalar of its
+    // result type, consistent with the column path.
     if (entry->validity.has_value() && !(*entry->validity)[0]) {
-        return ScalarValue{ibex::NullScalar{}};
+        return ScalarValue{null_of_column(*entry->column)};
     }
     return scalar_from_column(*entry->column, 0);
 }

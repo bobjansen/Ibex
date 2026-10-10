@@ -875,24 +875,8 @@ auto scalar_kind_name(runtime::ScalarKind kind) -> std::string_view {
 }
 
 auto scalar_value_type_name(const runtime::ScalarValue& val) -> std::string_view {
-    if (const auto* null = std::get_if<NullScalar>(&val)) {
-        return null->kind ? scalar_kind_name(*null->kind) : "an untyped NULL";
-    }
-    if (std::holds_alternative<std::int64_t>(val))
-        return "Int64";
-    if (std::holds_alternative<double>(val))
-        return "Float64";
-    if (std::holds_alternative<bool>(val))
-        return "Bool";
-    if (std::holds_alternative<std::string>(val))
-        return "String";
-    if (std::holds_alternative<Date>(val))
-        return "Date";
-    if (std::holds_alternative<Timestamp>(val))
-        return "Timestamp";
-    if (std::holds_alternative<DecimalValue>(val))
-        return "Decimal";
-    return "Unknown";
+    const auto kind = runtime::scalar_kind(val);
+    return kind ? scalar_kind_name(*kind) : "an untyped NULL";
 }
 
 auto type_to_string(const parser::Type& type) -> std::string {
@@ -1032,56 +1016,14 @@ auto extern_signature(const parser::ExternDecl& decl) -> std::string {
 /// when an annotation (`let x: Int64 = NULL;`) or a declaration names the type.
 auto null_of_scalar_type(parser::ScalarType type, std::optional<DecimalType> decimal)
     -> NullScalar {
-    const auto kind = [&] {
-        switch (type) {
-            case parser::ScalarType::Int32:
-            case parser::ScalarType::Int64:
-                return runtime::ScalarKind::Int;
-            case parser::ScalarType::Float32:
-            case parser::ScalarType::Float64:
-                return runtime::ScalarKind::Double;
-            case parser::ScalarType::Bool:
-                return runtime::ScalarKind::Bool;
-            case parser::ScalarType::String:
-                return runtime::ScalarKind::String;
-            case parser::ScalarType::Date:
-                return runtime::ScalarKind::Date;
-            case parser::ScalarType::Timestamp:
-                return runtime::ScalarKind::Timestamp;
-            case parser::ScalarType::Decimal:
-                return runtime::ScalarKind::Decimal;
-        }
-        return runtime::ScalarKind::Int;
-    }();
-    return NullScalar{.kind = kind, .decimal = decimal.value_or(DecimalType{})};
+    return NullScalar{.kind = parser::scalar_kind_of(type),
+                      .decimal = decimal.value_or(DecimalType{})};
 }
 
 auto scalar_type_matches(const runtime::ScalarValue& val, parser::ScalarType expected) -> bool {
-    if (const auto* null = std::get_if<NullScalar>(&val)) {
-        // A typed null matches its own type; an untyped one matches nothing
-        // (an annotation gives it a type before this is asked).
-        return null->kind.has_value() &&
-               *null->kind == *null_of_scalar_type(expected, std::nullopt).kind;
-    }
-    switch (expected) {
-        case parser::ScalarType::Int32:
-        case parser::ScalarType::Int64:
-            return std::holds_alternative<std::int64_t>(val);
-        case parser::ScalarType::Float32:
-        case parser::ScalarType::Float64:
-            return std::holds_alternative<double>(val);
-        case parser::ScalarType::Bool:
-            return std::holds_alternative<bool>(val);
-        case parser::ScalarType::String:
-            return std::holds_alternative<std::string>(val);
-        case parser::ScalarType::Date:
-            return std::holds_alternative<Date>(val);
-        case parser::ScalarType::Timestamp:
-            return std::holds_alternative<Timestamp>(val);
-        case parser::ScalarType::Decimal:
-            return std::holds_alternative<DecimalValue>(val);
-    }
-    return false;
+    // A typed null matches its own type like a value does; an untyped one
+    // matches nothing (an annotation gives it a type before this is asked).
+    return runtime::scalar_kind(val) == parser::scalar_kind_of(expected);
 }
 
 /// An untyped null typed by a declaration (`-> Int64`); anything else as is.

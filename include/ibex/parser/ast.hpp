@@ -4,6 +4,7 @@
 #pragma once
 
 #include <ibex/core/decimal.hpp>
+#include <ibex/core/scalar_value.hpp>
 #include <ibex/core/time.hpp>
 
 #include <cstddef>
@@ -29,6 +30,30 @@ enum class ScalarType : std::uint8_t {
     /// (`SchemaField::decimal`, `Type::decimal`).
     Decimal,
 };
+
+/// The kind of value a declared scalar type holds: a scalar is always 64-bit,
+/// so Int32/Float32 declare an Int/Double value.
+[[nodiscard]] constexpr auto scalar_kind_of(ScalarType type) -> ScalarKind {
+    switch (type) {
+        case ScalarType::Int32:
+        case ScalarType::Int64:
+            return ScalarKind::Int;
+        case ScalarType::Float32:
+        case ScalarType::Float64:
+            return ScalarKind::Double;
+        case ScalarType::Bool:
+            return ScalarKind::Bool;
+        case ScalarType::String:
+            return ScalarKind::String;
+        case ScalarType::Date:
+            return ScalarKind::Date;
+        case ScalarType::Timestamp:
+            return ScalarKind::Timestamp;
+        case ScalarType::Decimal:
+            return ScalarKind::Decimal;
+    }
+    return ScalarKind::Int;
+}
 
 struct SchemaField {
     std::string name;

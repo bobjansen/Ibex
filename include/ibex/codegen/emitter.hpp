@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include <ibex/core/null_scalar.hpp>
+#include <ibex/core/scalar_value.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 
@@ -39,12 +39,7 @@ namespace ibex::codegen {
 class Emitter {
    public:
     struct Config {
-        // Must stay identical to ibex::runtime::ScalarValue and
-        // ibex::parser::ScalarValue. Leading ibex::NullScalar is the null
-        // alternative (SPEC.md §6.7); codegen does not emit null scalar
-        // bindings yet.
-        using ScalarValue = std::variant<ibex::NullScalar, std::int64_t, double, bool, std::string,
-                                         Date, Timestamp, DecimalValue>;
+        using ScalarValue = ibex::ScalarValue;
 
         /// Header files to #include (from extern fn declarations).
         std::vector<std::string> extern_headers;

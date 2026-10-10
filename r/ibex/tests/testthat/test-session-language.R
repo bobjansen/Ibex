@@ -57,3 +57,27 @@ test_that("a session imports a library", {
     result <- session_eval(sess, sprintf('import "csv"; csv::read("%s")[filter v > 1];', csv))
     expect_equal(result$k, "b")
 })
+
+test_that("a scalar result comes back as a length-1 vector of its type", {
+    sess <- create_session()
+    expect_identical(session_eval(sess, "1 + 1;"), 2)
+    expect_identical(session_eval(sess, "1.5 * 2.0;"), 3)
+    expect_identical(session_eval(sess, "String(8);"), "8")
+    session_eval(sess, "let b = scalar(Table { a = [3] }[select { b = a > 2 }], b);")
+    expect_identical(session_eval(sess, "b;"), TRUE)
+    expect_equal(session_eval(sess, 'date"2024-01-15";'), as.Date("2024-01-15"))
+    expect_identical(eval_ibex("40 + 2;"), 42)
+
+    # A scalar binding read back, and the last value wins over an earlier table.
+    session_eval(sess, "let n = scalar(Table { a = [7, 9] }[select { m = max(a) }], m);")
+    expect_identical(session_eval(sess, "Table { a = [1] }; n;"), 9)
+    expect_s3_class(session_eval(sess, "n; Table { a = [1] };"), "data.frame")
+})
+
+test_that("a null scalar comes back as NA and a statement with no value as NULL", {
+    sess <- create_session()
+    session_eval(sess, "let t = Table { a = [1] }[update { v = case { a > 5 => 1, else => NULL } }];")
+    session_eval(sess, "let m = scalar(t[select { m = max(v) }], m);")
+    expect_identical(session_eval(sess, "m;"), NA)
+    expect_null(session_eval(sess, "let x = 1;"))
+})

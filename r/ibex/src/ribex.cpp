@@ -72,12 +72,19 @@ auto make_session(std::vector<std::string> plugin_paths) -> std::unique_ptr<RSes
     return session;
 }
 
+/// What one evaluation hands back to R: the last value it produced, which is a
+/// table, a scalar, or nothing.
+struct Evaluated {
+    std::shared_ptr<const ibex::runtime::Table> table;
+    std::optional<ibex::runtime::ScalarValue> scalar;
+};
+
 /// Runs `source` in `session` with this call's own tables and scalars. What
-/// the script prints reaches the R console; the result is the last table it
-/// produced, or null when it produced none.
+/// the script prints reaches the R console; the result is the last value it
+/// produced.
 auto run_in_session(RSession& session, const std::string& source,
                     ibex::runtime::TableRegistry tables, ibex::runtime::ScalarRegistry scalars)
-    -> std::expected<std::shared_ptr<const ibex::runtime::Table>, std::string> {
+    -> std::expected<Evaluated, std::string> {
     ibex::repl::ReplSession::ExecuteOptions options;
     options.tables = std::move(tables);
     options.scalars = std::move(scalars);
@@ -89,10 +96,13 @@ auto run_in_session(RSession& session, const std::string& source,
     if (!result.ok) {
         return std::unexpected(make_error("error", result.error));
     }
-    if (!result.table.has_value()) {
-        return std::shared_ptr<const ibex::runtime::Table>{};
+    Evaluated evaluated;
+    if (result.table.has_value()) {
+        evaluated.table = std::make_shared<const ibex::runtime::Table>(std::move(*result.table));
+    } else if (result.scalar.has_value()) {
+        evaluated.scalar = std::move(result.scalar);
     }
-    return std::make_shared<const ibex::runtime::Table>(std::move(*result.table));
+    return evaluated;
 }
 
 auto read_text_file(const std::string& path) -> std::expected<std::string, std::string> {
@@ -926,21 +936,69 @@ auto source_text(SEXP text_sexp, bool is_path) -> std::string {
     return std::move(*source);
 }
 
-/// The result of one evaluation as R gets it: an Arrow payload, or NULL.
-auto result_payload(
-    const std::expected<std::shared_ptr<const ibex::runtime::Table>, std::string>& evaluated)
-    -> SEXP {
+/// A scalar as a one-row table with one column, `value`, so it reaches R by the
+/// same Arrow conversion as a table column: Date, Timestamp, Decimal and Int64
+/// come back exactly as they would in a table. A null scalar has no type and no
+/// column image; the caller hands R an `NA` for it instead.
+auto scalar_as_table(const ibex::runtime::ScalarValue& value)
+    -> std::shared_ptr<const ibex::runtime::Table> {
+    auto table = std::make_shared<ibex::runtime::Table>();
+    std::visit(
+        [&](const auto& v) {
+            using V = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<V, std::monostate>) {
+                return;
+            } else if constexpr (std::is_same_v<V, ibex::DecimalValue>) {
+                auto column = ibex::runtime::make_decimal_column(v.type);
+                column.push_back(ibex::Decimal{v.units});
+                table->add_column("value", std::move(column));
+            } else {
+                ibex::Column<V> column;
+                column.push_back(v);
+                table->add_column("value", std::move(column));
+            }
+        },
+        value);
+    return table;
+}
+
+/// The result of one evaluation as R gets it: NULL when it produced nothing,
+/// NA for a null scalar, otherwise an Arrow payload -- `list(array, schema)`,
+/// plus `scalar = TRUE` when it carries a one-row scalar for R to unwrap.
+auto result_payload(const std::expected<Evaluated, std::string>& evaluated) -> SEXP {
     if (!evaluated.has_value()) {
         Rf_error("%s", evaluated.error().c_str());
     }
-    if (!*evaluated) {
+    std::shared_ptr<const ibex::runtime::Table> table = evaluated->table;
+    const bool is_scalar = evaluated->scalar.has_value();
+    if (is_scalar) {
+        if (std::holds_alternative<std::monostate>(*evaluated->scalar)) {
+            return Rf_ScalarLogical(NA_LOGICAL);
+        }
+        table = scalar_as_table(*evaluated->scalar);
+    }
+    if (!table) {
         return R_NilValue;
     }
-    auto payload = export_table_payload(*evaluated);
+    auto payload = export_table_payload(table);
     if (!payload.has_value()) {
         Rf_error("%s", payload.error().c_str());
     }
-    return *payload;
+    if (!is_scalar) {
+        return *payload;
+    }
+    SEXP base = PROTECT(*payload);
+    SEXP out = PROTECT(Rf_allocVector(VECSXP, 3));
+    SEXP names = PROTECT(Rf_allocVector(STRSXP, 3));
+    SET_VECTOR_ELT(out, 0, VECTOR_ELT(base, 0));
+    SET_VECTOR_ELT(out, 1, VECTOR_ELT(base, 1));
+    SET_VECTOR_ELT(out, 2, Rf_ScalarLogical(TRUE));
+    SET_STRING_ELT(names, 0, Rf_mkChar("array"));
+    SET_STRING_ELT(names, 1, Rf_mkChar("schema"));
+    SET_STRING_ELT(names, 2, Rf_mkChar("scalar"));
+    Rf_setAttrib(out, R_NamesSymbol, names);
+    UNPROTECT(3);
+    return out;
 }
 
 /// A one-off evaluation (`eval_ibex`, `eval_file`): a fresh session for the call.

@@ -634,18 +634,24 @@ void print_table(const runtime::Table& table, std::size_t max_rows) {
 // the builtin, whose output is the point and is formatted even when the
 // session does not render results.
 void render_eval_value(const EvalValue& value, bool requested = false) {
-    if (active_execution_result() != nullptr) {
+    // `table` and `scalar` describe the LAST value only, so recording one
+    // clears the other: after `t; 1 + 1;` a caller reading them sees the
+    // scalar, not a table from an earlier statement. `tables` keeps them all.
+    if (auto* result = active_execution_result(); result != nullptr) {
         if (const auto* scalar = std::get_if<runtime::ScalarValue>(&value)) {
-            active_execution_result()->scalar = *scalar;
+            result->scalar = *scalar;
+            result->table.reset();
         } else if (const auto* col = std::get_if<runtime::ColumnValue>(&value)) {
             runtime::Table temp;
             temp.add_column("column", *col);
-            active_execution_result()->table = temp;
-            active_execution_result()->tables.push_back(std::move(temp));
+            result->table = temp;
+            result->scalar.reset();
+            result->tables.push_back(std::move(temp));
         } else {
             const auto& table = std::get<runtime::Table>(value);
-            active_execution_result()->table = table;
-            active_execution_result()->tables.push_back(table);
+            result->table = table;
+            result->scalar.reset();
+            result->tables.push_back(table);
         }
     }
     if (!render_results() && !requested) {

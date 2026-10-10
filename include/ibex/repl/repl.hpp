@@ -50,9 +50,11 @@ struct ReplConfig {
 /// callers (such as the local UI server) can render tables themselves.
 struct ExecutionResult {
     bool ok = false;
+    /// The last value the execution produced is in exactly one of `table` and
+    /// `scalar` (neither when it produced none): a later scalar clears an
+    /// earlier table, and vice versa.
     std::optional<runtime::Table> table;
-    /// Every table rendered by this execution, in statement order. `table`
-    /// remains the last table for compatibility with existing callers.
+    /// Every table rendered by this execution, in statement order.
     std::vector<runtime::Table> tables;
     std::optional<runtime::ScalarValue> scalar;
     /// Everything the execution wrote to stdout: `print(...)` output, warnings,

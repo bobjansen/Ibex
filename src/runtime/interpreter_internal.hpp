@@ -627,12 +627,12 @@ struct Null {
 using ExprValue =
     std::variant<Null, std::int64_t, double, bool, std::string, Date, Timestamp, DecimalValue>;
 
-/// ScalarValue -> ExprValue: total. The monostate (null) alternative maps to
-/// ExprValue::Null.
+/// ScalarValue -> ExprValue: total. A NullScalar maps to ExprValue::Null, which
+/// carries no kind: the per-row evaluator takes types from inference.
 inline auto expr_from_scalar(const ScalarValue& v) -> ExprValue {
     return std::visit(
         [](const auto& x) -> ExprValue {
-            if constexpr (std::is_same_v<std::decay_t<decltype(x)>, std::monostate>) {
+            if constexpr (std::is_same_v<std::decay_t<decltype(x)>, ibex::NullScalar>) {
                 return Null{};
             } else {
                 return x;
@@ -641,13 +641,13 @@ inline auto expr_from_scalar(const ScalarValue& v) -> ExprValue {
         v);
 }
 
-/// ExprValue -> ScalarValue: total. ExprValue::Null maps to the monostate
-/// (null) alternative of ScalarValue.
+/// ExprValue -> ScalarValue: total. ExprValue::Null maps to an untyped
+/// NullScalar.
 inline auto scalar_from_expr(const ExprValue& v) -> ScalarValue {
     return std::visit(
         [](const auto& x) -> ScalarValue {
             if constexpr (std::is_same_v<std::decay_t<decltype(x)>, Null>) {
-                return ScalarValue{std::monostate{}};
+                return ScalarValue{ibex::NullScalar{}};
             } else {
                 return ScalarValue{x};
             }
@@ -1179,7 +1179,7 @@ inline auto append_scalar(ColumnValue& column, const ScalarValue& value) -> void
 /// text (a null scalar); its cell is masked by the null bit but still has to
 /// exist, so it is written as an empty string.
 inline void append_text_cell(ColumnValue& column, const ScalarValue& value) {
-    if (std::holds_alternative<std::monostate>(value)) {
+    if (std::holds_alternative<ibex::NullScalar>(value)) {
         append_scalar(column, ScalarValue{std::string{}});
         return;
     }
@@ -1190,7 +1190,7 @@ inline auto broadcast_scalar_column(const ScalarValue& value, std::size_t rows) 
     return std::visit(
         [rows](const auto& v) -> ColumnValue {
             using V = std::decay_t<decltype(v)>;
-            if constexpr (std::is_same_v<V, std::monostate>) {
+            if constexpr (std::is_same_v<V, ibex::NullScalar>) {
                 // A null scalar has no column type. Callers that can reach a
                 // null must broadcast it themselves (typed null column); this
                 // path is a contract violation.

@@ -19836,7 +19836,7 @@ TEST_CASE("ExternArgs carries resources by position", "[runtime][resource]") {
         REQUIRE(args.resource(2) == nullptr);
         REQUIRE(args.resource(1) != nullptr);
         REQUIRE(args.resource(1)->type_name() == "FakeResource");
-        REQUIRE(std::holds_alternative<std::monostate>(args[1]));
+        REQUIRE(std::holds_alternative<ibex::NullScalar>(args[1]));
         REQUIRE(args.resource_as<FakeResource>(1) != nullptr);
         REQUIRE(args.resource_as<OtherResource>(1) == nullptr);
 
@@ -19844,4 +19844,24 @@ TEST_CASE("ExternArgs carries resources by position", "[runtime][resource]") {
         REQUIRE(copy.resource(1) == args.resource(1));
     }
     REQUIRE(live == 0);
+}
+
+TEST_CASE("NullScalar: a null scalar records the kind it stands in for", "[nulls][scalar]") {
+    // Default-constructed, a ScalarValue is an untyped null.
+    const runtime::ScalarValue untyped{};
+    REQUIRE(runtime::is_null_scalar(untyped));
+    CHECK(std::get<ibex::NullScalar>(untyped).kind == ibex::ScalarKind::Unknown);
+
+    const ibex::NullScalar int_null{.kind = ibex::ScalarKind::Int64, .decimal = {}};
+    const ibex::NullScalar money_null{.kind = ibex::ScalarKind::Decimal,
+                                      .decimal = {.precision = 10, .scale = 2}};
+    CHECK(runtime::is_null_scalar(runtime::ScalarValue{int_null}));
+    // Nulls of one kind are equal and hash alike; of different kinds, not.
+    CHECK(int_null == ibex::NullScalar{.kind = ibex::ScalarKind::Int64, .decimal = {}});
+    CHECK_FALSE(int_null == ibex::NullScalar{});
+    CHECK_FALSE(money_null == ibex::NullScalar{.kind = ibex::ScalarKind::Decimal,
+                                               .decimal = {.precision = 10, .scale = 3}});
+    CHECK(std::hash<ibex::NullScalar>{}(int_null) ==
+          std::hash<ibex::NullScalar>{}(
+              ibex::NullScalar{.kind = ibex::ScalarKind::Int64, .decimal = {}}));
 }

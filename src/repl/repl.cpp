@@ -575,7 +575,7 @@ auto format_scalar(const runtime::ScalarValue& value) -> std::string {
     return std::visit(
         [](const auto& v) -> std::string {
             using T = std::decay_t<decltype(v)>;
-            if constexpr (std::is_same_v<T, std::monostate>) {
+            if constexpr (std::is_same_v<T, ibex::NullScalar>) {
                 return "null";
             } else if constexpr (std::is_same_v<T, Date>) {
                 return runtime::format_date(v);
@@ -2980,7 +2980,7 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                     return std::unexpected(condition.error());
                 }
             }
-            if (std::holds_alternative<std::monostate>(*condition)) {
+            if (std::holds_alternative<ibex::NullScalar>(*condition)) {
                 continue;
             }
             const auto* matched = std::get_if<bool>(&*condition);
@@ -2997,7 +2997,7 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     }
     if (auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
         if (call->callee == "__null" && call->args.empty()) {
-            return runtime::ScalarValue{std::monostate{}};
+            return runtime::ScalarValue{ibex::NullScalar{}};
         }
         if (call->callee == "__interp") {
             // String interpolation: stringify each argument (literal segments and
@@ -3210,7 +3210,7 @@ auto column_from_scalars(const std::vector<runtime::ScalarValue>& vals)
     return std::visit(
         [&](const auto& first) -> std::expected<runtime::ColumnValue, std::string> {
             using T = std::decay_t<decltype(first)>;
-            if constexpr (std::is_same_v<T, std::monostate>) {
+            if constexpr (std::is_same_v<T, ibex::NullScalar>) {
                 return std::unexpected("element-wise result is null");
             } else if constexpr (std::is_same_v<T, DecimalValue>) {
                 DecimalType unified = first.type;

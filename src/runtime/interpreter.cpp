@@ -400,13 +400,14 @@ auto evaluate_scalar_expr(const ir::Expr& expr, const ScalarRegistry* scalars,
         // `select` field runs, nulls included.
         Table one_row;
         one_row.logical_rows = 1;
-        auto cell = evaluate_field(expr, one_row, RowRange{.begin = 0, .count = 1},
-                                   ColumnEvalCtx{.scalars = scalars, .externs = externs});
+        auto cell = evaluate_field(
+            expr, one_row, RowRange{.begin = 0, .count = 1},
+            ColumnEvalCtx{.scalars = scalars, .externs = externs, .window = std::nullopt});
         if (!cell) {
             return std::unexpected(cell.error());
         }
         if (cell->validity.has_value() && !(*cell->validity)[0]) {
-            return ScalarValue{std::monostate{}};
+            return ScalarValue{ibex::NullScalar{}};
         }
         return scalar_from_column(cell->column, 0);
     }
@@ -596,7 +597,7 @@ auto join_tables(const Table& left, const Table& right, ir::JoinKind kind,
 auto extract_scalar(const Table& table, const std::string& column, bool zero_rows_is_null)
     -> std::expected<ScalarValue, std::string> {
     if (table.rows() == 0 && zero_rows_is_null) {
-        return ScalarValue{std::monostate{}};
+        return ScalarValue{ibex::NullScalar{}};
     }
     if (table.rows() != 1) {
         return std::unexpected("scalar() requires exactly one row");
@@ -605,10 +606,10 @@ auto extract_scalar(const Table& table, const std::string& column, bool zero_row
     if (entry == nullptr || entry->column == nullptr) {
         return std::unexpected("column not found: " + column);
     }
-    // A null cell yields a null scalar (the monostate alternative), not an
+    // A null cell yields a null scalar (the NullScalar alternative), not an
     // error -- see SPEC.md §6.7.
     if (entry->validity.has_value() && !(*entry->validity)[0]) {
-        return ScalarValue{std::monostate{}};
+        return ScalarValue{ibex::NullScalar{}};
     }
     return scalar_from_column(*entry->column, 0);
 }
@@ -666,7 +667,7 @@ auto eval_scalar_builtin(std::string_view name, const std::vector<ScalarValue>& 
         return std::unexpected(std::string(name) + ": wrong number of arguments");
     }
     // The registry evaluates ExprValue; conversion to and from ScalarValue is
-    // lossless, including ScalarValue's std::monostate null alternative.
+    // lossless, including ScalarValue's ibex::NullScalar null alternative.
     std::vector<ExprValue> expr_args;
     expr_args.reserve(args.size());
     for (const auto& a : args) {
@@ -676,7 +677,7 @@ auto eval_scalar_builtin(std::string_view name, const std::vector<ScalarValue>& 
     if (!result) {
         return std::unexpected(result.error());
     }
-    // A null result is now a valid scalar (the monostate alternative); null
+    // A null result is now a valid scalar (the NullScalar alternative); null
     // propagation and the null-handling builtins (coalesce, is null) rely on
     // it reaching the caller rather than erroring here.
     return scalar_from_expr(*result);
@@ -706,9 +707,9 @@ auto aggregate_series(std::string_view name, const ColumnValue& column, double p
         return std::unexpected(std::string(name) + "(): produced no result");
     }
     // An aggregate with no valid observations reduces to a null scalar (the
-    // monostate alternative), consistent with the column path.
+    // NullScalar alternative), consistent with the column path.
     if (entry->validity.has_value() && !(*entry->validity)[0]) {
-        return ScalarValue{std::monostate{}};
+        return ScalarValue{ibex::NullScalar{}};
     }
     return scalar_from_column(*entry->column, 0);
 }

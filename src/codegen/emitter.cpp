@@ -440,10 +440,10 @@ void Emitter::emit_header(std::ostream& out, const Config& config, const Script*
             std::visit(
                 [&](const auto& v) {
                     using V = std::decay_t<decltype(v)>;
-                    if constexpr (std::is_same_v<V, std::monostate>) {
+                    if constexpr (std::is_same_v<V, ibex::NullScalar>) {
                         // Null scalar bindings are not yet emitted by codegen;
                         // collect_scalar_bindings never produces one.
-                        out << "ibex::runtime::ScalarValue{std::monostate{}}";
+                        out << "ibex::runtime::ScalarValue{ibex::NullScalar{}}";
                     } else if constexpr (std::is_same_v<V, std::int64_t>) {
                         out << "std::int64_t{" << v << "}";
                     } else if constexpr (std::is_same_v<V, double>) {
@@ -1892,7 +1892,7 @@ auto Emitter::emit_raw_expr(const ir::Expr& expr) -> std::string {
                 return std::visit(
                     [&](const auto& v) -> std::string {
                         using V = std::decay_t<decltype(v)>;
-                        if constexpr (std::is_same_v<V, std::monostate>) {
+                        if constexpr (std::is_same_v<V, ibex::NullScalar>) {
                             throw std::runtime_error(
                                 "ibex_compile: null scalar in extern call argument");
                         } else if constexpr (std::is_same_v<V, std::int64_t>) {

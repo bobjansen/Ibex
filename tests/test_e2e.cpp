@@ -485,7 +485,7 @@ TEST_CASE("E2E: String() of null is null", "[e2e][cast][string][nulls]") {
 
 TEST_CASE("E2E: is null takes any expression and sees a null scalar", "[e2e][nulls]") {
     runtime::ScalarRegistry scalars;
-    scalars.insert_or_assign("n", runtime::ScalarValue{std::monostate{}});
+    scalars.insert_or_assign("n", runtime::ScalarValue{ibex::NullScalar{}});
     scalars.insert_or_assign("k", runtime::ScalarValue{std::int64_t{5}});
     const char* frame = "Table { a = [1, 2] }[update { v = case { a > 1 => 10, else => NULL } }]";
 
@@ -536,7 +536,7 @@ TEST_CASE("E2E: a cast of NULL is a typed null", "[e2e][nulls][cast]") {
 
 TEST_CASE("E2E: a null scalar broadcast into a column is an all-null column", "[e2e][nulls]") {
     runtime::ScalarRegistry scalars;
-    scalars.insert_or_assign("n", runtime::ScalarValue{std::monostate{}});
+    scalars.insert_or_assign("n", runtime::ScalarValue{ibex::NullScalar{}});
     // Used to trip an internal invariant and abort.
     auto out = run("Table { a = [1, 2] }[update { y = n }];", {}, &scalars);
     const auto* entry = out.find_entry("y");

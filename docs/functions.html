@@ -226,7 +226,7 @@
       </article>
       <article class="card">
         <h3>Cast constructors</h3>
-        <p>These are regular call syntax in Ibex, used in expressions and updates.</p>
+        <p>These are regular call syntax in Ibex, used in expressions and updates. A cast of <code>NULL</code> is a typed null: <code>Int64(NULL)</code>.</p>
         <table class="repl-table">
           <tbody>
             <tr><td><code>Int64(x)</code></td><td>Explicit cast to 64-bit integer. A <code>Bool</code> casts to 0/1, so <code>sum(Int64(price &gt; vwap))</code> counts a predicate.</td></tr>

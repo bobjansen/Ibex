@@ -2525,6 +2525,9 @@ class Lowerer {
     }
 
     auto lower_expression(const Expr& expr) -> LowerResult { return lower_expr(expr); }
+    auto lower_value_expression(const Expr& expr) -> std::expected<ir::Expr, LowerError> {
+        return lower_expr_to_ir(expr);
+    }
 
     void set_script_mode(bool on) { script_mode_ = on; }
 
@@ -7129,6 +7132,14 @@ auto lower_script(const Program& program, const ir::SourceSchemas& reader_schema
     lowered->result =
         ir::optimize_plan(std::move(lowered->result), optimization_context, &optimization_stats);
     return lowered;
+}
+
+auto lower_value_expr(const Expr& expr, LowerContext& context)
+    -> std::expected<ir::Expr, LowerError> {
+    Lowerer lowerer(&context.bindings, context.compile_time_lists, context.table_externs,
+                    context.sink_externs, context.table_extern_decls, context.source_schemas,
+                    context.functions);
+    return lowerer.lower_value_expression(expr);
 }
 
 auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult {

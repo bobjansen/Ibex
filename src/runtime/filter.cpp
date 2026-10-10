@@ -2212,13 +2212,14 @@ auto compute_mask(const ir::Expr& expr, const PredicateInput& input, const Scala
                 // IS NULL / IS NOT NULL: test the operand column's validity.
                 // Always produces a valid Bool (never null itself).
                 const bool want_null = !node.negated;
-                if (const auto* col_node = std::get_if<ir::ColumnRef>(&node.operand->node)) {
-                    const ValidityBitmap* bm = nullptr;
-                    if (const auto* entry =
-                            col_node->lexical ? nullptr : input.find(col_node->name);
-                        entry != nullptr && entry->validity.has_value()) {
-                        bm = &*entry->validity;
-                    }
+                const auto* col_node = std::get_if<ir::ColumnRef>(&node.operand->node);
+                const auto* col_entry = (col_node == nullptr || col_node->lexical)
+                                            ? nullptr
+                                            : input.find(col_node->name);
+                if (col_entry != nullptr) {
+                    // A column of the input: read its bitmap directly.
+                    const ValidityBitmap* bm =
+                        col_entry->validity.has_value() ? &*col_entry->validity : nullptr;
                     Mask m;
                     m.value.resize(n);
                     // No validity bitmap → every row is valid, one constant fill.
@@ -2251,7 +2252,21 @@ auto compute_mask(const ir::Expr& expr, const PredicateInput& input, const Scala
                     }
                     return m;
                 }
-                return std::unexpected("filter: 'is null' operand must be a column reference");
+                // Any other operand -- a scalar binding, arithmetic, a call --
+                // is evaluated as a value, with its validity, and tested on
+                // that: `(a + 1) is null`, `n is null` for a null scalar `n`.
+                auto val = eval_value_vec(*node.operand, input, scalars, rows);
+                if (!val) {
+                    return std::unexpected(val.error());
+                }
+                Mask m;
+                m.value.resize(n);
+                const ValidityBitmap* bm = val->get_validity();
+                for (std::size_t i = 0; i < n; ++i) {
+                    const bool v = bm == nullptr || (*bm)[val->offset + i];
+                    m.value[i] = static_cast<uint8_t>(want_null ? !v : v);
+                }
+                return m;
             } else {
                 // ColumnRef, Literal, BinaryExpr, CallExpr, RankExpr are not
                 // structurally boolean (compare/logical/is-null), but may still
@@ -2263,8 +2278,25 @@ auto compute_mask(const ir::Expr& expr, const PredicateInput& input, const Scala
                 if (!val)
                     return std::unexpected(val.error());
                 const auto* bcol = std::get_if<Column<bool>>(&deref_col(*val));
-                if (bcol == nullptr)
+                if (bcol == nullptr) {
+                    // A null scalar has no type of its own, so it cannot arrive
+                    // as a Bool column; as a predicate it is simply unknown,
+                    // which three-valued logic handles (`null || true`).
+                    if (const auto* ref = std::get_if<ir::ColumnRef>(&expr.node);
+                        ref != nullptr && scalars != nullptr &&
+                        (ref->lexical || input.find(ref->name) == nullptr)) {
+                        if (auto it = scalars->find(ref->name);
+                            it != scalars->end() &&
+                            std::holds_alternative<std::monostate>(it->second)) {
+                            Mask m;
+                            m.value.resize(n);
+                            std::fill_n(m.value.data(), n, uint8_t{0});
+                            m.valid.emplace(n, uint8_t{0});
+                            return m;
+                        }
+                    }
                     return std::unexpected("filter: not a boolean expression");
+                }
                 Mask m;
                 m.value.resize(n);
                 for (std::size_t i = 0; i < n; ++i)

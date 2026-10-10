@@ -1569,6 +1569,15 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
             }
             if (scalars != nullptr) {
                 if (auto it = scalars->find(col_ref->name); it != scalars->end()) {
+                    if (is_null_scalar(it->second)) {
+                        // A null binding has no type of its own: an all-null
+                        // Int64 column, as the value path broadcasts it.
+                        Column<std::int64_t> nulls;
+                        nulls.resize(rows, 0);
+                        output.add_column(field.alias, std::move(nulls),
+                                          ValidityBitmap(rows, false));
+                        continue;
+                    }
                     output.add_column(field.alias, broadcast_scalar_column(it->second, rows));
                     continue;
                 }
@@ -4538,6 +4547,15 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
             }
             if (scalars != nullptr) {
                 if (auto it = scalars->find(col_ref->name); it != scalars->end()) {
+                    if (is_null_scalar(it->second)) {
+                        // A null binding has no type of its own: an all-null
+                        // Int64 column, as the value path broadcasts it.
+                        Column<std::int64_t> nulls;
+                        nulls.resize(rows, 0);
+                        output.add_column(field.alias, std::move(nulls),
+                                          ValidityBitmap(rows, false));
+                        continue;
+                    }
                     output.add_column(field.alias, broadcast_scalar_column(it->second, rows));
                     continue;
                 }

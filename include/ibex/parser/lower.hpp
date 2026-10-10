@@ -216,4 +216,11 @@ using FunctionLookup = std::function<const FunctionDecl*(std::string_view)>;
 /// Lower a single expression with an external context.
 [[nodiscard]] auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult;
 
+/// Lower a value (row or scalar) expression -- an operand of `filter` or a
+/// field of `select` -- to an `ir::Expr`. A bare name becomes a `ColumnRef`,
+/// which the runtime resolves against the input's columns and then its scalar
+/// bindings, so with an empty input this is a scalar expression.
+[[nodiscard]] auto lower_value_expr(const Expr& expr, LowerContext& context)
+    -> std::expected<ir::Expr, LowerError>;
+
 }  // namespace ibex::parser

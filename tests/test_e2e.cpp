@@ -448,6 +448,41 @@ TEST_CASE("E2E: Date() is identity on a Date and rejects other types", "[e2e][ti
         std::string::npos);
 }
 
+TEST_CASE("E2E: String() formats any value as it prints", "[e2e][cast][string]") {
+    auto out =
+        run("Table { n = [8, 16], x = [1.5, 2.0], d = [date\"2024-01-15\", date\"2024-02-01\"] }"
+            "[select { cores = String(n), label = `${n}c`, xs = String(x), ds = String(d),"
+            "          same = String(String(n)) }];",
+            {});
+    REQUIRE(out.rows() == 2);
+    CHECK(col_str(out, "cores") == std::vector<std::string>{"8", "16"});
+    CHECK(col_str(out, "label") == std::vector<std::string>{"8c", "16c"});
+    CHECK(col_str(out, "xs") == std::vector<std::string>{"1.5", "2"});
+    CHECK(col_str(out, "ds") == std::vector<std::string>{"2024-01-15", "2024-02-01"});
+    CHECK(col_str(out, "same") == std::vector<std::string>{"8", "16"});
+
+    // As a group key: the pivot label the AWS analysis needed.
+    auto keyed =
+        run("Table { n = [1, 8, 8] }[select { k = count() }, by { at = String(n) },"
+            " order { at asc }];",
+            {});
+    CHECK(col_str(keyed, "at") == std::vector<std::string>{"1", "8"});
+    CHECK(col_i64(keyed, "k") == std::vector<std::int64_t>{1, 2});
+}
+
+TEST_CASE("E2E: String() of null is null", "[e2e][cast][string][nulls]") {
+    auto out =
+        run("Table { s = [\"a\", \"b\"] }"
+            "[update { v = case { s == \"a\" => 1, else => NULL } }]"
+            "[select { t = String(v) }][select { missing = t is null }];",
+            {});
+    REQUIRE(out.rows() == 2);
+    const auto* missing = std::get_if<Column<bool>>(out.find("missing"));
+    REQUIRE(missing != nullptr);
+    CHECK_FALSE((*missing)[0]);
+    CHECK((*missing)[1]);
+}
+
 TEST_CASE("E2E: hour() inside computed group key", "[e2e][time][groupby]") {
     auto out =
         run("Table { ts = [ts\"2024-01-01T09:15:00\", ts\"2024-01-01T09:45:00\","

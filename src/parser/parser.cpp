@@ -1652,6 +1652,43 @@ class Parser {
             }
             return fail_expr(previous(), "expected '(' after type name in cast expression");
         }
+        // String(expr): the value's text, formatted as it prints. That is exactly
+        // a one-field template, so it desugars to `__interp("", expr, "")` and
+        // takes interpolation's null propagation and every evaluation path.
+        if (match(TokenKind::KeywordString)) {
+            if (!match(TokenKind::LParen)) {
+                return fail_expr(previous(), "expected '(' after type name in cast expression");
+            }
+            auto arg = parse_expression();
+            if (!arg) {
+                return nullptr;
+            }
+            if (!consume(TokenKind::RParen, "expected ')' after cast argument")) {
+                return nullptr;
+            }
+            auto empty_segment = [] {
+                auto lit = std::make_unique<Expr>();
+                lit->node = LiteralExpr{.value = std::string{}};
+                return lit;
+            };
+            std::vector<ExprPtr> interp_args;
+            interp_args.push_back(empty_segment());
+            interp_args.push_back(std::move(arg));
+            interp_args.push_back(empty_segment());
+            auto cast_expr = std::make_unique<Expr>();
+            cast_expr->node =
+                CallExpr{.callee = "__interp", .args = std::move(interp_args), .named_args = {}};
+            return cast_expr;
+        }
+        // Any other type name where a value belongs: say which casts exist rather
+        // than the bare "expected expression".
+        if (check(TokenKind::KeywordBool) || check(TokenKind::KeywordTimestamp) ||
+            check(TokenKind::KeywordDataFrame) || check(TokenKind::KeywordTimeFrame)) {
+            return fail_expr(peek(), "'" + std::string(peek().lexeme) +
+                                         "' is a type, not a cast; the casts are Int64(x), "
+                                         "Int32(x), Int(x), Float64(x), Float32(x), Date(x), "
+                                         "Decimal(x, p, s) and String(x)");
+        }
         if (match(TokenKind::IntLiteral)) {
             auto value = parse_int(previous().lexeme);
             if (!value.has_value()) {

@@ -948,7 +948,8 @@ sales[<span class="kw">filter</span> <span class="fn-name">like</span>(label, <s
             Ibex never coerces <code>Int</code>&thinsp;&harr;&thinsp;<code>Float</code>
             implicitly. Use type-name constructors — <code>Int64(x)</code>,
             <code>Float64(x)</code>, etc. — for explicit numeric casts. They
-            work on scalars and on entire columns.
+            work on scalars and on entire columns. <code>String(x)</code> turns
+            any value into its printed text, for labels.
           </p>
           <p>
             <strong>Float &rarr; Int casts</strong> require the value to be a
@@ -973,6 +974,7 @@ sales[<span class="kw">filter</span> <span class="fn-name">like</span>(label, <s
 <span class="kw">let</span> n: Int64   = <span class="fn-name">Int64</span>(<span class="num">3.0</span>);   <span class="cm">// ok — 3.0 is a whole number</span>
 <span class="kw">let</span> f: Float64 = <span class="fn-name">Float64</span>(<span class="num">42</span>);   <span class="cm">// ok — Int → Float always succeeds</span>
 <span class="cm">// Int64(3.9)  ← runtime error: fractional part</span>
+<span class="kw">let</span> s: String  = <span class="fn-name">String</span>(<span class="num">8</span>);    <span class="cm">// "8" — any value, as it prints</span>
 
 <span class="cm">// Round a Float column to Int</span>
 prices[<span class="kw">update</span> { vol_int = <span class="fn-name">round</span>(volume_f, Nearest) }];

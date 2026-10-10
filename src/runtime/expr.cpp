@@ -566,7 +566,7 @@ auto like_kernel(const ir::CallExpr& call, const Table& input, std::size_t rows,
 // Semantics mirror the per-row eval exactly: Bool -> 0/1 for Int, non-integer
 // Float -> Int errors, null cells propagate untouched (their payload is never
 // read, so a garbage NaN in a null slot cannot fail the integrality check).
-// Broadcast a scalar cast result into a full column. A null (monostate) scalar
+// Broadcast a scalar cast result into a full column. A null (NullScalar) scalar
 // becomes an all-null column of the cast's target type -- `Int64(null)` is null,
 // not an error.
 auto broadcast_cast_result(const ScalarValue& value, bool to_int, std::size_t rows)

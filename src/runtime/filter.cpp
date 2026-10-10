@@ -2287,7 +2287,7 @@ auto compute_mask(const ir::Expr& expr, const PredicateInput& input, const Scala
                         (ref->lexical || input.find(ref->name) == nullptr)) {
                         if (auto it = scalars->find(ref->name);
                             it != scalars->end() &&
-                            std::holds_alternative<std::monostate>(it->second)) {
+                            std::holds_alternative<ibex::NullScalar>(it->second)) {
                             Mask m;
                             m.value.resize(n);
                             std::fill_n(m.value.data(), n, uint8_t{0});

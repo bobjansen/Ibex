@@ -5,6 +5,7 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/compiler.hpp>
+#include <ibex/core/null_scalar.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/core/time_zone.hpp>
 #include <ibex/ir/node.hpp>
@@ -48,13 +49,14 @@ enum class ScalarKind : std::uint8_t {
 using ColumnValue =
     std::variant<Column<std::int64_t>, Column<double>, Column<std::string>, Column<Categorical>,
                  Column<Date>, Column<Timestamp>, Column<bool>, Column<Decimal>>;
-// A scalar value, or null. `std::monostate` is the null alternative (a
-// default-constructed ScalarValue is null); it maps to the internal
-// ExprValue::Null across the row-eval boundary. Historically ScalarValue was
+// A scalar value, or null. `NullScalar` is the null alternative: it records
+// the kind of value it stands in for (SPEC.md §6.7), and a default-constructed
+// ScalarValue is an untyped null. It maps to the internal ExprValue::Null
+// across the row-eval boundary. Historically ScalarValue was
 // null-free; SPEC.md §6.7 has the null-scalar semantics that replaced that.
 // Extern arguments remain null-free -- the type system rejects a
 // null before the call, it never reaches an extern.
-using ScalarValue = std::variant<std::monostate, std::int64_t, double, bool, std::string, Date,
+using ScalarValue = std::variant<ibex::NullScalar, std::int64_t, double, bool, std::string, Date,
                                  Timestamp, DecimalValue>;
 
 /// The precision and scale of a Decimal column. Absent metadata on a Decimal
@@ -114,7 +116,7 @@ using ScalarValue = std::variant<std::monostate, std::int64_t, double, bool, std
 
 /// True when a ScalarValue holds the null alternative.
 [[nodiscard]] inline auto is_null_scalar(const ScalarValue& v) -> bool {
-    return std::holds_alternative<std::monostate>(v);
+    return std::holds_alternative<ibex::NullScalar>(v);
 }
 
 /// Copy the value-metadata of `src` onto a column derived from it.
@@ -1126,7 +1128,7 @@ class ExternArgs;
     -> std::expected<Table, std::string>;
 
 /// Extract the single cell of `column` from a one-row table. A null cell yields
-/// a null scalar (monostate). With `zero_rows_is_null`, an empty table also
+/// a null scalar (NullScalar). With `zero_rows_is_null`, an empty table also
 /// yields null (the one-argument `scalar(<table>)` form, SPEC 5.7); otherwise a
 /// row count other than 1 is an error.
 [[nodiscard]] auto extract_scalar(const Table& table, const std::string& column,
@@ -1156,7 +1158,7 @@ class ExternArgs;
     -> std::expected<std::size_t, std::string>;
 
 /// Evaluate a scalar-valued expression against `scalars` (no column input).
-/// Returns a null scalar (monostate) when the expression evaluates to null.
+/// Returns a null scalar (NullScalar) when the expression evaluates to null.
 [[nodiscard]] auto evaluate_scalar_expr(const ir::Expr& expr,
                                         const ScalarRegistry* scalars = nullptr,
                                         const ExternRegistry* externs = nullptr)

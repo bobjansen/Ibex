@@ -3131,7 +3131,7 @@ TEST_CASE("ReplSession: a scalar statement means what the same expression means 
         return *r.scalar;
     };
     auto is_null = [](const ibex::runtime::ScalarValue& v) {
-        return std::holds_alternative<std::monostate>(v);
+        return std::holds_alternative<ibex::NullScalar>(v);
     };
 
     // Comparisons and logic used to be "unsupported operator"; string

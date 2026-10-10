@@ -56,6 +56,8 @@ auto compare_scalar_for_order(const ScalarValue& lhs, const ScalarValue& rhs) ->
             if constexpr (std::is_same_v<L, R> && std::is_same_v<L, DecimalValue>) {
                 const auto ord = decimal::compare(l, r);
                 return ord < 0 ? -1 : (ord > 0 ? 1 : 0);
+            } else if constexpr (std::is_same_v<L, R> && std::is_same_v<L, NullScalar>) {
+                return 0;  // two nulls tie
             } else if constexpr (std::is_same_v<L, R>) {
                 if (l < r) {
                     return -1;

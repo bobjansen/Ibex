@@ -8,16 +8,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 
 namespace ibex {
 
-/// Which value a scalar is, or stands in for when null. Mirrors the value
-/// alternatives of `ScalarValue` one for one. `Unknown` is a null nothing has
-/// typed yet: a bare `NULL` expression.
+/// Which value a scalar is: one per value alternative of `ScalarValue`. Also
+/// how an extern declares a scalar return (`ExternRegistry::register_scalar`).
 enum class ScalarKind : std::uint8_t {
-    Unknown,
-    Int64,
-    Float64,
+    Int,
+    Double,
     Bool,
     String,
     Date,
@@ -28,10 +27,11 @@ enum class ScalarKind : std::uint8_t {
 /// The null alternative of `ScalarValue`. A scalar binding carries its type
 /// even when it is null, exactly as a column cell does (SPEC.md Section 6.7),
 /// so the null records the kind it stands in for -- and, for a Decimal, the
-/// precision and scale. A default-constructed `NullScalar` (and so a
-/// default-constructed `ScalarValue`) is an untyped null.
+/// precision and scale. No kind is an untyped null: a bare `NULL` nothing has
+/// given a type yet. A default-constructed `NullScalar` (and so a
+/// default-constructed `ScalarValue`) is one.
 struct NullScalar {
-    ScalarKind kind = ScalarKind::Unknown;
+    std::optional<ScalarKind> kind;
     /// Meaningful only when `kind` is Decimal.
     DecimalType decimal{};
 
@@ -44,7 +44,8 @@ struct NullScalar {
 template <>
 struct std::hash<ibex::NullScalar> {
     auto operator()(const ibex::NullScalar& n) const noexcept -> std::size_t {
-        return std::hash<std::uint32_t>{}((static_cast<std::uint32_t>(n.kind) << 16U) |
+        const std::uint32_t kind = n.kind ? static_cast<std::uint32_t>(*n.kind) + 1U : 0U;
+        return std::hash<std::uint32_t>{}((kind << 16U) |
                                           (static_cast<std::uint32_t>(n.decimal.precision) << 8U) |
                                           n.decimal.scale);
     }

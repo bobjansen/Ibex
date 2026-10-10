@@ -3165,6 +3165,62 @@ TEST_CASE("ReplSession: a scalar statement means what the same expression means 
     CHECK(is_null(value("Int64(NULL);")));
 }
 
+TEST_CASE("ReplSession: a null scalar records the type it was made with",
+          "[repl][session][scalar][nulls]") {
+    using ibex::runtime::ScalarKind;
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    auto run = [&](const std::string& src) {
+        auto r = session.execute(src);
+        INFO(src << " -> " << r.error);
+        REQUIRE(r.ok);
+        return r;
+    };
+    // The kind a statement's null result stands in for; nullopt if untyped.
+    auto null_kind = [&](const std::string& src) -> std::optional<ScalarKind> {
+        auto r = run(src);
+        REQUIRE(r.scalar.has_value());
+        const auto* null = std::get_if<ibex::NullScalar>(&*r.scalar);
+        REQUIRE(null != nullptr);
+        return null->kind;
+    };
+
+    run("let t = Table { a = [1, 2], s = [\"x\", \"y\"] }"
+        "[update { v = case { a > 5 => 1, else => NULL } }];");
+    // From a column: a null cell, an empty one-argument subquery, an aggregate.
+    run("let n = scalar(t[filter a == 1, select { v }], v);");
+    CHECK(null_kind("n;") == ScalarKind::Int);
+    CHECK(null_kind("scalar(t[filter a > 9, select { s }]);") == ScalarKind::String);
+    CHECK(null_kind("scalar(t[select { m = max(v) }], m);") == ScalarKind::Int);
+    // Through an operator, a cast, a case, a template.
+    CHECK(null_kind("n + 1;") == ScalarKind::Int);
+    CHECK(null_kind("n / 2;") == ScalarKind::Double);
+    CHECK(null_kind("Int64(NULL);") == ScalarKind::Int);
+    CHECK(null_kind("Float64(n);") == ScalarKind::Double);
+    CHECK(null_kind("case { 1 > 2 => \"a\", else => NULL };") == ScalarKind::String);
+    CHECK(null_kind("`x${n}`;") == ScalarKind::String);
+    // From a declaration: an annotated let, a widening, a function's return.
+    run("let x: Int64 = NULL;");
+    CHECK(null_kind("x;") == ScalarKind::Int);
+    run("let f: Float64 = Int64(NULL);");
+    CHECK(null_kind("f;") == ScalarKind::Double);
+    run("fn g() -> Float64 { NULL; }");
+    CHECK(null_kind("g();") == ScalarKind::Double);
+    // A bare NULL has no type.
+    CHECK_FALSE(null_kind("NULL;").has_value());
+
+    // The recorded type is checked like a value's.
+    auto mismatch = session.execute("let z: String = Int64(NULL);");
+    REQUIRE_FALSE(mismatch.ok);
+    CHECK(mismatch.error.find("Int64") != std::string::npos);
+
+    // And a null binding is usable in a column expression as its type.
+    auto cols = run("t[update { y1 = n + 1, y2 = Int64(n), y3 = Float64(n), y4 = x }];");
+    REQUIRE(cols.table.has_value());
+    CHECK(std::get_if<ibex::Column<std::int64_t>>(cols.table->find("y1")) != nullptr);
+    CHECK(std::get_if<ibex::Column<double>>(cols.table->find("y3")) != nullptr);
+}
+
 TEST_CASE("ReplSession: infer_schema lowers against the session's bindings", "[repl][session]") {
     ibex::runtime::ExternRegistry registry;
     ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);

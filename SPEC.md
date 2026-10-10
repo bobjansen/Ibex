@@ -2824,6 +2824,14 @@ and `${}` interpolation under the ordinary null rules of Section 3
 `fill_null` consume it. A cast of null is null of the target type, which is
 how a typed null is written: `Int64(NULL)`.
 
+A null scalar's type is the type of what produced it: the column `scalar()`
+read, the aggregate, the cast, the other arms of a `case`, the declared return
+type of a function or extern. A bare `NULL` has none, so a declaration gives it
+one: `let x: Int64 = NULL;` binds a null Int64, as does passing `NULL` to an
+`Int64` parameter. The type is checked like a value's (`let s: String =
+Int64(NULL);` is an error), and a null binding behaves as its type in an
+expression (`t[update { y = n + 1 }]` is an Int64 column of nulls).
+
 A null scalar is a **runtime error** only where a value must be present:
 
 - a row-count expression — `take`, `head`, `tail`, `rep`'s length, a `Table(n)` /

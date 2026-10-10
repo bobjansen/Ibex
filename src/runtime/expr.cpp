@@ -602,6 +602,11 @@ auto numeric_cast_kernel(const ir::CallExpr& call, const Table& input, std::size
             // semantic reference), then broadcast.
             if (ctx.scalars != nullptr) {
                 if (auto it = ctx.scalars->find(ref->name); it != ctx.scalars->end()) {
+                    // The raw eval skips the registry's null propagation, so a
+                    // null binding is handled here: a cast of null is null.
+                    if (is_null_scalar(it->second)) {
+                        return broadcast_cast_result(it->second, to_int, rows);
+                    }
                     const auto& eval = std::get<ScalarExec>(find_builtin(call.callee)->exec).eval;
                     auto value = eval(call.callee, {expr_from_scalar(it->second)});
                     if (!value) {
@@ -2027,21 +2032,11 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
         if (source == nullptr) {
             if (scalars != nullptr) {
                 if (auto it = scalars->find(col->name); it != scalars->end()) {
-                    if (std::holds_alternative<std::int64_t>(it->second)) {
-                        return ExprType::Int;
+                    // A binding's type, null or not (a null records its kind).
+                    if (auto type = expr_type_of_kind(scalar_kind(it->second))) {
+                        return *type;
                     }
-                    if (std::holds_alternative<double>(it->second)) {
-                        return ExprType::Double;
-                    }
-                    if (std::holds_alternative<bool>(it->second)) {
-                        return ExprType::Bool;
-                    }
-                    if (std::holds_alternative<Date>(it->second)) {
-                        return ExprType::Date;
-                    }
-                    if (std::holds_alternative<Timestamp>(it->second)) {
-                        return ExprType::Timestamp;
-                    }
+                    // An untyped NULL binding has no type to give.
                     return ExprType::String;
                 }
             }
@@ -2309,6 +2304,10 @@ auto infer_decimal_type(const ir::Expr& expr, const Table& input, const ScalarRe
             if (auto it = scalars->find(col->name); it != scalars->end()) {
                 if (const auto* d = std::get_if<DecimalValue>(&it->second)) {
                     return d->type;
+                }
+                if (const auto* null = std::get_if<NullScalar>(&it->second);
+                    null != nullptr && null->kind == ScalarKind::Decimal) {
+                    return null->decimal;
                 }
                 if (std::holds_alternative<std::int64_t>(it->second)) {
                     return decimal::kInt64Type;

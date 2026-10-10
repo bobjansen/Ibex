@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstddef>
 #include <ostream>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -167,7 +168,9 @@ auto format_cell(const ColumnEntry& entry, std::size_t row) -> std::string {
         column);
 }
 
-void format_table(const Table& table, std::ostream& out, std::size_t max_rows) {
+namespace {
+
+void render_table(const Table& table, std::ostream& out, std::size_t max_rows) {
     if (table.columns.empty()) {
         // A column-less frame may still carry a logical row count (e.g. from
         // `Table(n)`); report it rather than the bare "<empty>".
@@ -223,6 +226,18 @@ void format_table(const Table& table, std::ostream& out, std::size_t max_rows) {
     if (table.rows() > shown_rows) {
         ibex::formatting::print(out, "... ({} more rows)\n", table.rows() - shown_rows);
     }
+}
+
+}  // namespace
+
+// The table is rendered into memory and handed to `out` in one write. Rendering
+// straight into std::cout cost one write per cell, border and newline (~100 for
+// a 4-column, 10-row table); a terminal on Linux buffers those, but the Windows
+// console takes each as a separate, slow write (milliseconds per table).
+void format_table(const Table& table, std::ostream& out, std::size_t max_rows) {
+    std::ostringstream buffer;
+    render_table(table, buffer, max_rows);
+    out << buffer.view();
 }
 
 }  // namespace ibex::runtime

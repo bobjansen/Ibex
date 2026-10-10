@@ -23,7 +23,7 @@
 #                        [--skip-sqlite] [--with-sqlite]
 #                        [--with-frollapply]
 #                        [--skip-pandas] [--skip-dplyr] [--skip-polars-st]
-#                        [--skip-polars-in-memory] [--skip-polars-categorical]
+#                        [--with-polars-in-memory]
 #                        [--keep-data]
 #                        [--to-readme] [--to-readme-rows N] [--to-readme-out path]
 #
@@ -94,8 +94,12 @@ SKIP_R=0
 SKIP_PANDAS=0
 SKIP_DPLYR=0
 SKIP_POLARS_ST=0
-SKIP_POLARS_IN_MEMORY=0
-SKIP_POLARS_CATEGORICAL=0
+# The Polars reference is Polars 2's streaming engine (a bare `.collect()`)
+# with its string keys as Categorical (bench_python.py casts them at load,
+# untimed), matching the dictionary encoding Ibex's reader picks by itself.
+# The in-memory engine is an opt-in experiment, not a reference: timing it
+# beside streaming, with and without Categorical keys, ran Polars four times.
+SKIP_POLARS_IN_MEMORY=1
 SKIP_DUCKDB=0
 SKIP_DUCKDB_ST=0
 SKIP_DATAFUSION=0
@@ -177,8 +181,11 @@ while [[ $# -gt 0 ]]; do
         --skip-pandas) SKIP_PANDAS=1; shift ;;
         --skip-dplyr)  SKIP_DPLYR=1; shift ;;
         --skip-polars-st) SKIP_POLARS_ST=1; shift ;;
+        --with-polars-in-memory) SKIP_POLARS_IN_MEMORY=0; shift ;;
+        # Old flags, accepted so old command lines run: in-memory is skipped
+        # by default, and Categorical keys are now the base `polars` rows.
         --skip-polars-in-memory) SKIP_POLARS_IN_MEMORY=1; shift ;;
-        --skip-polars-categorical) SKIP_POLARS_CATEGORICAL=1; shift ;;
+        --skip-polars-categorical) shift ;;
         --skip-duckdb) SKIP_DUCKDB=1; shift ;;
         --skip-duckdb-st) SKIP_DUCKDB_ST=1; shift ;;
         --skip-datafusion) SKIP_DATAFUSION=1; shift ;;
@@ -566,24 +573,17 @@ for rows in "${SIZES[@]}"; do
         fi
 
         # Polars 2 runs a bare `.collect()` on its streaming engine, so the
-        # `polars` rows above are streaming. Its in-memory engine is still
-        # faster on some queries, and the comparison is against Polars at its
-        # best: time it too, under the same thread budget, as its own
-        # framework. Reports take the fastest engine per query.
-        #
-        # Polars at its best also means its string keys as Categorical: Ibex's
-        # CSV reader dictionary-encodes low-cardinality strings by itself, so
-        # without this a `by symbol` compares Ibex hashing codes with Polars
-        # hashing strings. Both engines run that way too (cast at load, never
-        # timed). Each variant writes an answer digest for the check below.
-        # $1 framework name, $2 file stem, $3 engine affinity ("" = default),
-        # $4 IBEX_POLARS_CATEGORICAL value.
+        # `polars` rows above are streaming with Categorical keys -- the
+        # reference (see SKIP_POLARS_IN_MEMORY). --with-polars-in-memory adds
+        # its in-memory engine as an extra framework, an experiment only. It
+        # writes an answer digest for the check below.
+        # $1 framework name, $2 file stem, $3 engine affinity ("" = default).
         run_polars_variant() {
-            local fw="$1" stem="$2" affinity="$3" categorical="$4"
+            local fw="$1" stem="$2" affinity="$3"
             echo "  → ${fw}"
             local raw="$size_result_dir/${stem}_raw.tsv"
             local tsv="$size_result_dir/${stem}.tsv"
-            local env_args=(IBEX_FW_SUFFIX="-${fw#polars-}" IBEX_POLARS_CATEGORICAL="$categorical"
+            local env_args=(IBEX_FW_SUFFIX="-${fw#polars-}"
                             IBEX_DIGEST_OUT="$size_result_dir/${stem}_digest.tsv")
             [[ -n "$affinity" ]] && env_args+=(POLARS_ENGINE_AFFINITY="$affinity")
             env "${env_args[@]}" \
@@ -600,14 +600,7 @@ for rows in "${SIZES[@]}"; do
             append_tagged_results "$rows" "$tsv"
         }
         if [[ $SKIP_POLARS_IN_MEMORY -eq 0 ]]; then
-            run_polars_variant polars-in-memory polars_in_memory in-memory 0
-        fi
-        if [[ $SKIP_POLARS_CATEGORICAL -eq 0 ]]; then
-            run_polars_variant polars-categorical polars_categorical "" 1
-            if [[ $SKIP_POLARS_IN_MEMORY -eq 0 ]]; then
-                run_polars_variant polars-in-memory-categorical polars_in_memory_categorical \
-                    in-memory 1
-            fi
+            run_polars_variant polars-in-memory polars_in_memory in-memory
         fi
     fi
 

@@ -76,6 +76,7 @@ Environment:
   IBEX_PERFCMP_CACHE   Persistent cache root (default ~/.cache/ibex/perfcmp).
                        Delete it to force a full reconfigure/rebuild.
   IBEX_PERFCMP_TMPDIR  Per-run results/logs location (default /tmp).
+  IBEX_PERFCMP_JOBS    Build parallelism for each side (default 4).
 EOF
 }
 
@@ -388,7 +389,10 @@ ensure_build() {
     fi
     # Skipping `cmake -S -B` on cache hits is deliberate: ninja re-runs cmake
     # itself when a CMakeLists.txt changed, which is the only real dependency.
-    if ! cmake --build "$build_dir" --parallel --target ibex_bench >>"$log_file" 2>&1; then
+    # Capped: ninja's default (cores + 2) runs out of memory on a 15 GB box
+    # building the big runtime translation units.
+    if ! cmake --build "$build_dir" --parallel "${IBEX_PERFCMP_JOBS:-4}" --target ibex_bench \
+        >>"$log_file" 2>&1; then
         cat "$log_file" >&2
         return 1
     fi

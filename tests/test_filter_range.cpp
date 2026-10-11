@@ -400,6 +400,11 @@ TEST_CASE("evaluate_field over a partial range matches evaluating a gathered ran
                               arith(ir::ArithmeticOp::Mul, col_ref("id"), ilit(2)), ilit(-1)}))});
     fields.push_back({.label = "row-local kernel builtin over a range",
                       .expr = std::move(*call("length", {col_ref("name")}))});
+    fields.push_back({.label = "unary math over a computed nullable argument",
+                      .expr = std::move(*call(
+                          "sqrt", {arith(ir::ArithmeticOp::Add, col_ref("nullable"), ilit(1))}))});
+    fields.push_back(
+        {.label = "abs of an Int column", .expr = std::move(*call("abs", {col_ref("id")}))});
 
     for (const auto& f : fields) {
         for (const std::size_t grain : {1U, 7U, 63U, 64U, 65U, 200U}) {

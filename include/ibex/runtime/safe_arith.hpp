@@ -46,4 +46,17 @@ constexpr auto safe_imod(T a, T b) noexcept -> T {
     return a % b;
 }
 
+/// |a|, total: the minimum of a signed type, which has no positive
+/// counterpart, wraps to itself rather than being undefined (`std::abs`).
+template <typename T>
+constexpr auto safe_iabs(T a) noexcept -> T {
+    static_assert(std::is_integral_v<T>, "safe_iabs is for integer types only");
+    if constexpr (std::is_signed_v<T>) {
+        using U = std::make_unsigned_t<T>;
+        return a < 0 ? static_cast<T>(U{0} - static_cast<U>(a)) : a;
+    } else {
+        return a;
+    }
+}
+
 }  // namespace ibex::runtime

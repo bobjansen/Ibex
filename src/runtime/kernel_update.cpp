@@ -251,9 +251,18 @@ auto compile_numeric_tree(const ir::Expr& expr, const PredicateInput& input,
             if (const auto unary = lookup_unary_math(call->callee); unary.has_value()) {
                 const auto child =
                     compile_numeric_tree(*call->args.front(), input, scalars, nodes, shifted);
-                if (!child.has_value() || (unary_math_is_type_preserving(*unary) &&
-                                           nodes[*child].type != ExprType::Double)) {
+                if (!child.has_value()) {
                     return std::nullopt;
+                }
+                if (unary_math_is_type_preserving(*unary) && nodes[*child].type == ExprType::Int) {
+                    // floor/ceil/trunc of an Int is the Int itself: no node.
+                    if (*unary != UnaryMath::Abs) {
+                        return child;
+                    }
+                    nodes.push_back({.kind = NumericTreeNode::Kind::IntAbs,
+                                     .type = ExprType::Int,
+                                     .left = *child});
+                    return static_cast<std::uint32_t>(nodes.size() - 1);
                 }
                 nodes.push_back({.kind = NumericTreeNode::Kind::Unary,
                                  .type = ExprType::Double,
@@ -382,6 +391,16 @@ auto eval_double_tree_node(const NumericTreeNode& node,
             apply_unary_math(node.unary, child.data, dst, count);
             return {.data = dst, .scalar = 0.0};
         }
+        case NumericTreeNode::Kind::IntAbs: {
+            // An Int `abs` read as a double: the child's values are already
+            // widened, so the double `abs` gives the same result.
+            const Block& child = values[node.left];
+            if (child.data == nullptr) {
+                return {.data = nullptr, .scalar = std::fabs(child.scalar)};
+            }
+            apply_unary_math(UnaryMath::Abs, child.data, dst, count);
+            return {.data = dst, .scalar = 0.0};
+        }
         case NumericTreeNode::Kind::Binary: {
             const Block& left = values[node.left];
             const Block& right = values[node.right];
@@ -418,6 +437,16 @@ auto eval_int_tree_node(const NumericTreeNode& node,
             return shift_tree_block(node, node.ints, row, count, dst);
         case NumericTreeNode::Kind::IntScalar:
             return {.data = nullptr, .scalar = node.int_scalar};
+        case NumericTreeNode::Kind::IntAbs: {
+            const Block& child = values[node.left];
+            if (child.data == nullptr) {
+                return {.data = nullptr, .scalar = safe_iabs(child.scalar)};
+            }
+            for (std::size_t i = 0; i < count; ++i) {
+                dst[i] = safe_iabs(child.data[i]);
+            }
+            return {.data = dst, .scalar = 0};
+        }
         case NumericTreeNode::Kind::Min:
             return combine_tree_blocks(
                 values[node.left], values[node.right], dst, count,

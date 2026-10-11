@@ -156,6 +156,10 @@ struct NumericTreeNode {
         Min,
         Max,
         Unary,
+        /// `abs` of an Int child, staying Int (the other type-preserving
+        /// functions, floor/ceil/trunc, are the identity on an Int and emit no
+        /// node).
+        IntAbs,
         /// `lag`/`lead` of a column: row r reads source[r + shift], and a row
         /// whose source falls outside [0, source_rows) reads 0 (it is null --
         /// collect_expr_validity marks it).

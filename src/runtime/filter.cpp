@@ -1511,23 +1511,13 @@ auto dispatch_numeric_cmp_pair_kernel(const NumericCmpSpec& lhs_spec,
 
 namespace {
 
-// Evaluate a scalar call (abs, sqrt, casts, …) whose arguments nest a
-// non-row-local sub-expression (a Transform/Generator): materialize those arguments
-// into columns, then apply the scalar function over them. Defined after
-// eval_value_vec (it recurses into it).
-auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
-                              const ScalarRegistry* scalars, RowRange rows)
-    -> std::expected<ColResult, std::string>;
-
 // Result of a sub-expression that could only be evaluated over the whole table.
 //
-// Three evaluator branches cannot honour a partial range: a whole-column
-// builtin (rolling/cum/lag — not row-local, so evaluating it over a slice would
-// change its answer), `eval_scalar_over_columns`, and the per-row field
-// evaluator. All three are `CallExpr` branches, and `is_range_native_expr`
-// rejects every `CallExpr`, so **under a partial range none of them is
-// reachable** — reaching one means the gate and the evaluators have drifted
-// apart.
+// One evaluator branch cannot honour a partial range: a whole-column builtin
+// (rolling/cum/lag — not row-local, so evaluating it over a slice would change
+// its answer). `is_range_native_expr` rejects it, so **under a partial range it
+// is not reachable** — reaching it means the gate and the evaluator have
+// drifted apart.
 //
 // That drift is what this abort exists to catch. It is not a wrong answer: the
 // natural alternative, evaluating whole-table and slicing, is perfectly
@@ -1575,8 +1565,8 @@ inline auto mask_to_bool_result(Mask m, std::size_t n) -> ColResult {
 // or an owned ColumnValue for computed intermediates.
 auto eval_value_vec(const ir::Expr& expr, const PredicateInput& input,
                     const ScalarRegistry* scalars, RowRange rows,
-                    std::optional<ir::Duration> window, bool window_aligned)
-    -> std::expected<ColResult, std::string> {
+                    std::optional<ir::Duration> window, bool window_aligned,
+                    const ExternRegistry* externs) -> std::expected<ColResult, std::string> {
     const std::size_t n = rows.count;
     return std::visit(
         [&](const auto& node) -> std::expected<ColResult, std::string> {
@@ -1625,11 +1615,12 @@ auto eval_value_vec(const ir::Expr& expr, const PredicateInput& input,
                 }
                 return ColResult{broadcast_scalar_column(scalar_from_literal(node), n)};
             } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
-                auto lhs = eval_value_vec(*node.left, input, scalars, rows, window, window_aligned);
+                auto lhs = eval_value_vec(*node.left, input, scalars, rows, window, window_aligned,
+                                          externs);
                 if (!lhs)
                     return std::unexpected(lhs.error());
-                auto rhs =
-                    eval_value_vec(*node.right, input, scalars, rows, window, window_aligned);
+                auto rhs = eval_value_vec(*node.right, input, scalars, rows, window, window_aligned,
+                                          externs);
                 if (!rhs)
                     return std::unexpected(rhs.error());
                 const bool left_dec = std::holds_alternative<Column<Decimal>>(deref_col(*lhs));
@@ -1675,8 +1666,11 @@ auto eval_value_vec(const ir::Expr& expr, const PredicateInput& input,
                                                     rhs->get_validity(), rhs->offset, n);
                 return res;
             } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
+                // A row-local builtin's kernel only for the whole table; over a
+                // partial range it is applied element by element (below).
                 if (const auto* fn = find_builtin(node.callee);
-                    fn != nullptr && use_column_kernel(*fn, node)) {
+                    fn != nullptr && use_column_kernel(*fn, node) &&
+                    (rows.is_whole(input.rows()) || is_column_only(*fn))) {
                     // Whole-column builtin (Transform/Generator, or a hybrid
                     // null-handling scalar in kernel shape) as a column leaf —
                     // lets rolling/cum/lag/fill and rand_*/rep nest inside
@@ -1686,7 +1680,7 @@ auto eval_value_vec(const ir::Expr& expr, const PredicateInput& input,
                     // (same as scalar calls below), but an enclosing `window`
                     // clause must reach nested rolling calls too.
                     const ColumnEvalCtx ctx{.scalars = scalars,
-                                            .externs = nullptr,
+                                            .externs = externs,
                                             .window = window,
                                             .window_aligned = window_aligned};
                     // Not row-local: evaluated over the whole table and sliced,
@@ -1707,9 +1701,9 @@ auto eval_value_vec(const ir::Expr& expr, const PredicateInput& input,
                         // row-local argument such as `price * volume` so windowed
                         // aggregate expressions can compose without a separate
                         // user-visible update step.
-                        auto arg =
-                            eval_value_vec(*node.args.front(), input, scalars,
-                                           RowRange::whole(kernel_rows), window, window_aligned);
+                        auto arg = eval_value_vec(*node.args.front(), input, scalars,
+                                                  RowRange::whole(kernel_rows), window,
+                                                  window_aligned, externs);
                         if (!arg) {
                             return std::unexpected(arg.error());
                         }
@@ -1750,34 +1744,18 @@ auto eval_value_vec(const ir::Expr& expr, const PredicateInput& input,
                     return slice_computed(std::move(*col), rows, kernel_rows);
                 }
                 // A scalar call (abs, sqrt, casts, round, pmin/pmax, date
-                // parts, …). If any argument nests a non-row-local
-                // sub-expression (a Transform/Generator call or a boolean
-                // node), the per-row evaluator can't produce it — materialize
-                // those arguments into columns first, then apply the scalar
-                // function over them (e.g. `abs(rand_normal(0, 1))`).
-                const bool args_need_vec = std::ranges::any_of(
-                    node.args, [](const auto& a) { return field_uses_vectorized_eval(*a); });
-                if (args_need_vec) {
-                    const Table* table = input.table();
-                    if (table == nullptr) {
-                        return std::unexpected(node.callee +
-                                               ": requires whole-table predicate evaluation");
-                    }
-                    return eval_scalar_over_columns(node, *table, scalars, rows);
-                }
-                // Otherwise delegate to the shared field evaluator, which
-                // dispatches through the registry (per-row, incl. the
-                // null-handling scalars) and carries validity. Extern scalar
-                // functions are not available in predicate position (externs
-                // are not threaded into this vectorized evaluator).
+                // parts, case, a template, an extern): the field evaluator
+                // applies it over its argument columns, range-aware.
                 const Table* table = input.table();
                 if (table == nullptr) {
                     return std::unexpected(node.callee +
                                            ": requires whole-table predicate evaluation");
                 }
-                auto col = evaluate_field(
-                    expr, *table, rows,
-                    ColumnEvalCtx{.scalars = scalars, .externs = nullptr, .window = std::nullopt});
+                auto col = evaluate_field(expr, *table, rows,
+                                          ColumnEvalCtx{.scalars = scalars,
+                                                        .externs = externs,
+                                                        .window = window,
+                                                        .window_aligned = window_aligned});
                 if (!col) {
                     return std::unexpected(col.error());
                 }
@@ -1926,60 +1904,7 @@ auto eval_coalesce_column(const ir::CallExpr& call, const Table& input,
 // Row-local arguments (columns, literals, arithmetic, round's mode identifier)
 // are kept verbatim. The result is null wherever any materialized argument was
 // null — standard scalar null propagation.
-namespace {
-auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
-                              const ScalarRegistry* scalars, RowRange rows)
-    -> std::expected<ColResult, std::string> {
-    // Materializes its vectorized arguments as extra columns of a copy of the
-    // whole table, so the synthesized columns have to be table-length: a
-    // range's worth would leave `tmp` with columns of two different lengths.
-    // Evaluate whole-table (see slice_computed).
-    const std::size_t n = table.rows();
-    Table tmp = table;
-    ir::CallExpr rewritten;
-    rewritten.callee = call.callee;
-    rewritten.args.reserve(call.args.size());
-    int synth = 0;
-    for (const auto& arg : call.args) {
-        if (!field_uses_vectorized_eval(*arg)) {
-            rewritten.args.push_back(arg);  // row-local: keep verbatim (deep-copied)
-            continue;
-        }
-        auto c = eval_value_vec(*arg, table, scalars, RowRange::whole(n));
-        if (!c) {
-            return std::unexpected(c.error());
-        }
-        ColumnValue owned;
-        if (auto* v = std::get_if<ColumnValue>(&c->data)) {
-            owned = std::move(*v);
-        } else {
-            owned = *std::get<const ColumnValue*>(c->data);
-        }
-        const std::string name = "__ibex_nl_" + std::to_string(synth++) + "__";
-        if (const auto* v = c->get_validity()) {
-            tmp.add_column(name, std::move(owned), *v);
-        } else {
-            tmp.add_column(name, std::move(owned));
-        }
-        ir::Expr ref;
-        ref.node = ir::ColumnRef{.name = name};
-        rewritten.args.push_back(ir::make_expr_ptr(std::move(ref)));
-    }
-    // The materialized columns carry their validity, and the shared field
-    // evaluator produces the exact result validity from it (propagation or a
-    // Handles eval) — no post-hoc AND of argument masks, which would wrongly
-    // re-null rows a null-handling function just filled.
-    ir::Expr rewritten_expr;
-    rewritten_expr.node = std::move(rewritten);
-    auto col = evaluate_field(
-        rewritten_expr, tmp, RowRange::whole(n),
-        ColumnEvalCtx{.scalars = scalars, .externs = nullptr, .window = std::nullopt});
-    if (!col) {
-        return std::unexpected(col.error());
-    }
-    return slice_computed(std::move(*col), rows, n);
-}
-}  // namespace
+namespace {}  // namespace
 
 namespace {
 
@@ -2658,35 +2583,20 @@ auto is_range_native_expr(const ir::Expr& expr) -> bool {
             } else if constexpr (std::is_same_v<T, ir::IsNullExpr>) {
                 return is_range_native_expr(*node.operand);
             } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
-                // Mirrors eval_value_vec's CallExpr branch, which is what picks
-                // the sub-path — these are its three non-range-native outcomes,
-                // in its order:
+                // Mirrors eval_value_vec's CallExpr branch. A whole-column
+                // builtin is the one non-range-native outcome; every other call
+                // goes to `evaluate_field`, which applies it over its argument
+                // columns range by range -- `case` and `round` included, though
+                // neither is in the value-based registry.
                 const auto* fn = find_builtin(node.callee);
-                if (fn == nullptr) {
-                    // `round(x, mode)` is dispatched apart from the value-based
-                    // registry because its mode is a RoundMode rather than a
-                    // value (see extract_ir_round_mode), so `find_builtin`
-                    // cannot see it. It is row-local either way: the fused
-                    // numeric tree compiles it to a range-aware UnaryToInt node
-                    // whose kernel the mode fixes at compile time, and the
-                    // per-row fallback walks the range too. Anything else
-                    // unknown here is an extern, which this evaluator does not
-                    // run at all.
-                    return node.callee == "round" &&
-                           std::ranges::all_of(
-                               node.args, [](const auto& a) { return is_range_native_expr(*a); });
+                if (fn == nullptr && node.callee != "round" && node.callee != "__case") {
+                    return false;  // an extern, which this evaluator does not run
                 }
-                if (use_column_kernel(*fn, node)) {
+                if (fn != nullptr && is_column_only(*fn)) {
                     return false;  // whole-column builtin — a range changes its answer
                 }
-                if (std::ranges::any_of(
-                        node.args, [](const auto& a) { return field_uses_vectorized_eval(*a); })) {
-                    return false;  // routes to eval_scalar_over_columns, still whole-table
-                }
-                // Otherwise it delegates to `evaluate_field`, whose fused
-                // numeric tree and per-row loop are both range-native. Named
-                // args are literals or bare identifiers (window spans, round
-                // modes), never evaluated per row.
+                // Named args are literals or bare identifiers (window spans,
+                // round modes), never evaluated per row.
                 return std::ranges::all_of(node.args,
                                            [](const auto& a) { return is_range_native_expr(*a); });
             } else {

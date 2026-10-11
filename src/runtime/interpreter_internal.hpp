@@ -1437,10 +1437,13 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 [[nodiscard]] auto eval_coalesce_column(const ir::CallExpr& call, const Table& input,
                                         const ScalarRegistry* scalars, RowRange rows)
     -> std::expected<ComputedColumn, std::string>;
+/// `externs` is null in predicate position, where extern calls are not
+/// available; a field passes its own.
 [[nodiscard]] auto eval_value_vec(const ir::Expr& expr, const PredicateInput& input,
                                   const ScalarRegistry* scalars, RowRange rows,
                                   std::optional<ir::Duration> window = std::nullopt,
-                                  bool window_aligned = false)
+                                  bool window_aligned = false,
+                                  const ExternRegistry* externs = nullptr)
     -> std::expected<ColResult, std::string>;
 /// Element-wise arithmetic. `lhs_off`/`rhs_off` are the operands' `ColResult::offset`
 /// — the output is always dense, so only the inputs carry one.

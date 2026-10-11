@@ -14,9 +14,11 @@
 #include <ibex/core/time_zone.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/ir/schema.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/like.hpp>
+#include <ibex/runtime/morsel.hpp>
 #include <ibex/runtime/rng.hpp>
 #include <ibex/runtime/safe_arith.hpp>
 #include <ibex/runtime/table_format.hpp>
@@ -2715,6 +2717,477 @@ auto field_uses_vectorized_eval(const ir::Expr& expr) -> bool {
 //   4. the per-row eval_expr loop.
 // update_table and windowed_update_table (and through them the grouped,
 // guarded, and chunked variants) and evaluate_field_column all dispatch here.
+// ── Column evaluation of calls ────────────────────────────────────────────────
+//
+// Every field is typed before any row runs (`infer_expr_type`), and a call is
+// evaluated over columns: its arguments as columns over the field's rows, then
+// the function applied element by element into a column of the call's type.
+// Nulls are validity bits throughout.
+
+namespace {
+
+// An empty column of the field's static type.
+auto typed_column_for(ExprType type, const ir::Expr& expr, const Table& input,
+                      const ScalarRegistry* scalars) -> std::expected<ColumnValue, std::string> {
+    switch (type) {
+        case ExprType::Int:
+            return Column<std::int64_t>{};
+        case ExprType::Double:
+            return Column<double>{};
+        case ExprType::Bool:
+            return Column<bool>{};
+        case ExprType::String:
+            return Column<std::string>{};
+        case ExprType::Categorical:
+            return Column<Categorical>{};
+        case ExprType::Date:
+            return Column<Date>{};
+        case ExprType::Timestamp:
+            return Column<Timestamp>{};
+        case ExprType::Decimal: {
+            auto decimal = infer_decimal_type(expr, input, scalars);
+            if (!decimal) {
+                return std::unexpected(decimal.error());
+            }
+            return make_decimal_column(*decimal);
+        }
+    }
+    return std::unexpected("evaluate_field: unknown expression type");
+}
+
+// Append a null row: a placeholder payload the validity bit masks.
+void append_null(ColumnValue& column) {
+    std::visit(
+        [](auto& col) {
+            using ColType = std::decay_t<decltype(col)>;
+            if constexpr (std::is_same_v<typename ColType::value_type, std::string_view>) {
+                col.push_back(std::string_view{});
+            } else {
+                col.push_back(typename ColType::value_type{});
+            }
+        },
+        column);
+}
+
+// Append a present value to a column of the field's type (Int widens to
+// Float, a Decimal is fitted to the column's precision and scale).
+auto append_value(ColumnValue& column, const ExprValue& value) -> std::expected<void, std::string> {
+    // Fitting a value to the column's Decimal(p, s) can overflow, which is a
+    // query error -- so it is handled here, where one can be returned.
+    if (auto* dec_col = std::get_if<Column<Decimal>>(&column)) {
+        auto units = fit_decimal(value, decimal_type_of(*dec_col));
+        if (!units) {
+            return std::unexpected(units.error());
+        }
+        dec_col->push_back(Decimal{*units});
+        return {};
+    }
+    std::visit(
+        [&](auto& col) {
+            using ColType = std::decay_t<decltype(col)>;
+            using ValueType = ColType::value_type;
+            if constexpr (std::is_same_v<ValueType, std::int64_t>) {
+                if (const auto* int_value = std::get_if<std::int64_t>(&value)) {
+                    col.push_back(*int_value);
+                } else if (const auto* double_value = std::get_if<double>(&value)) {
+                    col.push_back(static_cast<std::int64_t>(*double_value));
+                } else {
+                    invariant_violation(
+                        "evaluate_field: expected Int64-compatible expression value");
+                }
+            } else if constexpr (std::is_same_v<ValueType, double>) {
+                if (const auto* int_value = std::get_if<std::int64_t>(&value)) {
+                    col.push_back(static_cast<double>(*int_value));
+                } else if (const auto* double_value = std::get_if<double>(&value)) {
+                    col.push_back(*double_value);
+                } else {
+                    invariant_violation(
+                        "evaluate_field: expected Float64-compatible expression value");
+                }
+            } else if constexpr (std::is_same_v<ValueType, bool>) {
+                if (const auto* bool_value = std::get_if<bool>(&value)) {
+                    col.push_back(*bool_value);
+                } else if (const auto* int_value = std::get_if<std::int64_t>(&value)) {
+                    col.push_back(*int_value != 0);
+                } else {
+                    invariant_violation(
+                        "evaluate_field: expected Bool-compatible expression value");
+                }
+            } else if constexpr (std::is_same_v<ValueType, std::string_view>) {
+                // Column<std::string>::value_type is std::string_view; the
+                // ExprValue holds an owned std::string, which push_back copies
+                // into the column's arena.
+                if (const auto* v = std::get_if<std::string>(&value)) {
+                    col.push_back(*v);
+                } else {
+                    invariant_violation("evaluate_field: expected String expression value");
+                }
+            } else if constexpr (std::is_same_v<ValueType, Date>) {
+                if (const auto* date_value = std::get_if<Date>(&value)) {
+                    col.push_back(*date_value);
+                } else if (const auto* int_value = std::get_if<std::int64_t>(&value)) {
+                    col.push_back(int64_to_date_checked(*int_value));
+                } else {
+                    invariant_violation(
+                        "evaluate_field: expected Date-compatible expression value");
+                }
+            } else if constexpr (std::is_same_v<ValueType, Timestamp>) {
+                if (const auto* timestamp_value = std::get_if<Timestamp>(&value)) {
+                    col.push_back(*timestamp_value);
+                } else if (const auto* int_value = std::get_if<std::int64_t>(&value)) {
+                    col.push_back(Timestamp{*int_value});
+                } else {
+                    invariant_violation(
+                        "evaluate_field: expected Timestamp-compatible expression value");
+                }
+            }
+        },
+        column);
+    return {};
+}
+
+// Row `i` of an argument column, or Null where its validity bit is clear.
+auto cell_value(const ColResult& arg, std::size_t i) -> ExprValue {
+    const std::size_t at = arg.offset + i;
+    if (const auto* validity = arg.get_validity(); validity != nullptr && !(*validity)[at]) {
+        return Null{};
+    }
+    return std::visit(
+        [&](const auto& column) -> ExprValue {
+            using ColType = std::decay_t<decltype(column)>;
+            if constexpr (std::is_same_v<ColType, Column<Categorical>> ||
+                          std::is_same_v<ColType, Column<std::string>>) {
+                return std::string(column[at]);
+            } else if constexpr (std::is_same_v<ColType, Column<Decimal>>) {
+                return DecimalValue{.units = column[at].units, .type = decimal_type_of(column)};
+            } else {
+                return column[at];
+            }
+        },
+        deref_col(arg));
+}
+
+auto is_null_call(const ir::Expr& expr) -> bool {
+    const auto* call = std::get_if<ir::CallExpr>(&expr.node);
+    return call != nullptr && call->callee == "__null" && call->args.empty();
+}
+
+// True when `expr` reads only its own row: no whole-column builtin (rolling,
+// cumulative, lag/lead, generators) and no rank anywhere in it.
+auto is_row_local(const ir::Expr& expr) -> bool {
+    return std::visit(
+        [](const auto& node) -> bool {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, ir::ColumnRef> || std::is_same_v<T, ir::Literal>) {
+                return true;
+            } else if constexpr (std::is_same_v<T, ir::BinaryExpr> ||
+                                 std::is_same_v<T, ir::CompareExpr>) {
+                return is_row_local(*node.left) && is_row_local(*node.right);
+            } else if constexpr (std::is_same_v<T, ir::LogicalExpr>) {
+                return is_row_local(*node.left) &&
+                       (node.right == nullptr || is_row_local(*node.right));
+            } else if constexpr (std::is_same_v<T, ir::IsNullExpr>) {
+                return is_row_local(*node.operand);
+            } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
+                if (const auto* fn = find_builtin(node.callee);
+                    fn != nullptr && is_column_only(*fn)) {
+                    return false;
+                }
+                return std::ranges::all_of(node.args,
+                                           [](const auto& arg) { return is_row_local(*arg); });
+            } else {
+                return false;
+            }
+        },
+        expr.node);
+}
+
+// An argument column over some rows, read back by position. `by_row` when it
+// was evaluated over every row of the field (indexed by row), otherwise over
+// the selected rows only (indexed by position among them).
+struct RowsValue {
+    ColResult column;
+    bool by_row;
+};
+
+// `expr` over the `rows` (relative to `range`) of the field. All of them: the
+// field's own range. Some: a gather of just those rows of the columns `expr`
+// reads, so an arm is evaluated only where it is taken -- unless it is not
+// row-local, which evaluates over every row and is read back by row.
+auto eval_over_rows(const ir::Expr& expr, const Table& input, RowRange range,
+                    const std::vector<std::size_t>& rows, const ColumnEvalCtx& ctx)
+    -> std::expected<RowsValue, std::string> {
+    if (rows.size() == range.count || !is_row_local(expr)) {
+        auto all = eval_value_vec(expr, input, ctx.scalars, range, ctx.window, ctx.window_aligned,
+                                  ctx.externs);
+        if (!all) {
+            return std::unexpected(all.error());
+        }
+        return RowsValue{.column = std::move(*all), .by_row = true};
+    }
+    std::vector<ir::ColumnRef> refs;
+    ir::collect_expr_columns(expr, refs);
+    Table narrow;
+    for (const auto& ref : refs) {
+        if (ref.lexical || narrow.find(ref.name) != nullptr) {
+            continue;
+        }
+        if (const auto* entry = input.find_entry(ref.name)) {
+            narrow.add_column_from(ref.name, *entry);
+        }
+    }
+    std::vector<std::uint64_t> absolute;
+    absolute.reserve(rows.size());
+    for (const std::size_t row : rows) {
+        absolute.push_back(range.begin + row);
+    }
+    Table subset = gather_rows(narrow, absolute);
+    subset.logical_rows = rows.size();
+    auto some = eval_value_vec(expr, subset, ctx.scalars, RowRange::whole(rows.size()), ctx.window,
+                               ctx.window_aligned, ctx.externs);
+    if (!some) {
+        return std::unexpected(some.error());
+    }
+    // A bare column comes back borrowed from `subset`, which ends here: own it.
+    if (const auto* const* borrowed = std::get_if<const ColumnValue*>(&some->data)) {
+        std::optional<ValidityBitmap> validity;
+        if (const auto* v = some->get_validity()) {
+            validity = *v;
+        }
+        ColResult owned{ColumnValue{**borrowed}, std::move(validity)};
+        return RowsValue{.column = std::move(owned), .by_row = false};
+    }
+    return RowsValue{.column = std::move(*some), .by_row = false};
+}
+
+// `case` over columns. Arms are tried in order, and a row's later conditions
+// and untaken values are never evaluated -- each condition runs over the rows
+// no earlier arm took, each value over the rows that take it -- so an arm a
+// row does not take cannot fail it or call an extern for it.
+auto eval_case_columns(const ir::CallExpr& call, const ir::Expr& expr, const Table& input,
+                       RowRange range, const ColumnEvalCtx& ctx, ExprType type)
+    -> std::expected<ComputedColumn, std::string> {
+    if (call.args.empty() || call.args.size() % 2 == 0) {
+        return std::unexpected("case: expected condition/value arm pairs followed by else");
+    }
+    const std::size_t n = range.count;
+    const std::size_t arms = call.args.size() / 2;  // the else arm is index `arms`
+    std::vector<std::size_t> arm_of(n, arms);
+    std::vector<std::size_t> open(n);
+    std::iota(open.begin(), open.end(), std::size_t{0});
+    for (std::size_t arm = 0; arm < arms && !open.empty(); ++arm) {
+        auto condition = eval_over_rows(*call.args[2 * arm], input, range, open, ctx);
+        if (!condition) {
+            return std::unexpected(condition.error());
+        }
+        std::vector<std::size_t> still_open;
+        for (std::size_t p = 0; p < open.size(); ++p) {
+            const auto value = cell_value(condition->column, condition->by_row ? open[p] : p);
+            // A null condition does not match (three-valued logic).
+            if (const auto* matched = std::get_if<bool>(&value); matched != nullptr && *matched) {
+                arm_of[open[p]] = arm;
+            } else if (std::holds_alternative<bool>(value) || std::holds_alternative<Null>(value)) {
+                still_open.push_back(open[p]);
+            } else {
+                return std::unexpected("case: each condition must evaluate to Bool");
+            }
+        }
+        open = std::move(still_open);
+    }
+
+    // Each arm's rows, and each row's position among them.
+    std::vector<std::vector<std::size_t>> rows_of(arms + 1);
+    std::vector<std::size_t> position(n);
+    for (std::size_t row = 0; row < n; ++row) {
+        position[row] = rows_of[arm_of[row]].size();
+        rows_of[arm_of[row]].push_back(row);
+    }
+    std::vector<std::optional<RowsValue>> values(arms + 1);
+    for (std::size_t arm = 0; arm <= arms; ++arm) {
+        const ir::Expr& value = arm < arms ? *call.args[2 * arm + 1] : *call.args.back();
+        if (rows_of[arm].empty() || is_null_call(value)) {
+            continue;  // untaken, or a NULL arm: null of the case's type
+        }
+        auto evaluated = eval_over_rows(value, input, range, rows_of[arm], ctx);
+        if (!evaluated) {
+            return std::unexpected(evaluated.error());
+        }
+        values[arm] = std::move(*evaluated);
+    }
+
+    auto column = typed_column_for(type, expr, input, ctx.scalars);
+    if (!column) {
+        return std::unexpected(column.error());
+    }
+    std::visit([&](auto& col) { col.reserve(n); }, *column);
+    ValidityBitmap validity(n, true);
+    bool any_null = false;
+    for (std::size_t row = 0; row < n; ++row) {
+        const auto& taken = values[arm_of[row]];
+        const ExprValue value = taken.has_value()
+                                    ? cell_value(taken->column, taken->by_row ? row : position[row])
+                                    : ExprValue{Null{}};
+        if (std::holds_alternative<Null>(value)) {
+            append_null(*column);
+            validity.set(row, false);
+            any_null = true;
+        } else if (auto appended = append_value(*column, value); !appended) {
+            return std::unexpected(appended.error());
+        }
+    }
+    return ComputedColumn{
+        .column = std::move(*column),
+        .validity = any_null ? std::optional<ValidityBitmap>{std::move(validity)} : std::nullopt};
+}
+
+// Any other call over columns: a scalar builtin, `round`, or an extern.
+auto eval_call_columns(const ir::CallExpr& call, const ir::Expr& expr, const Table& input,
+                       RowRange range, const ColumnEvalCtx& ctx, ExprType type)
+    -> std::expected<ComputedColumn, std::string> {
+    if (call.callee == "__case") {
+        return eval_case_columns(call, expr, input, range, ctx, type);
+    }
+    if (call.callee == "__null") {
+        return std::unexpected(std::string(kUntypedNullError));
+    }
+    const auto* entry = find_builtin(call.callee);
+    const auto* scalar_exec = entry != nullptr ? std::get_if<ScalarExec>(&entry->exec) : nullptr;
+    if (scalar_exec != nullptr && scalar_exec->eval == nullptr) {
+        scalar_exec = nullptr;
+    }
+    std::optional<RoundMode> mode;
+    const ExternFunction* extern_fn = nullptr;
+    if (scalar_exec != nullptr) {
+        const auto argc = static_cast<int>(call.args.size());
+        if (argc < entry->min_args || (entry->max_args >= 0 && argc > entry->max_args)) {
+            return std::unexpected(call.callee + ": wrong number of arguments");
+        }
+    } else if (call.callee == "round") {
+        // round(x, mode): the mode is a RoundMode member, fixed for the call.
+        if (call.args.size() != 2) {
+            return std::unexpected("round: expected 2 arguments (value, mode)");
+        }
+        auto parsed = extract_ir_round_mode(*call.args[1]);
+        if (!parsed) {
+            return std::unexpected(parsed.error());
+        }
+        mode = *parsed;
+    } else {
+        extern_fn = ctx.externs != nullptr ? ctx.externs->find(call.callee) : nullptr;
+        if (extern_fn == nullptr) {
+            return std::unexpected("unknown function in expression: " + call.callee);
+        }
+        if (extern_fn->kind != ExternReturnKind::Scalar) {
+            return std::unexpected("function not usable in expression: " + call.callee);
+        }
+    }
+
+    const std::size_t n = range.count;
+    // The arguments, as columns over the field's rows. A bare NULL argument is
+    // null in every row; round's mode is not a value.
+    std::vector<std::optional<ColResult>> args;
+    args.reserve(call.args.size());
+    const bool table_first = extern_fn != nullptr && extern_fn->first_arg_is_table;
+    for (std::size_t a = 0; a < call.args.size(); ++a) {
+        if ((mode.has_value() && a == 1) || is_null_call(*call.args[a]) || table_first) {
+            args.emplace_back();
+            continue;
+        }
+        auto column = eval_value_vec(*call.args[a], input, ctx.scalars, range, ctx.window,
+                                     ctx.window_aligned, ctx.externs);
+        if (!column) {
+            return std::unexpected(column.error());
+        }
+        args.emplace_back(std::move(*column));
+    }
+    const auto arg_at = [&](std::size_t a, std::size_t row) -> ExprValue {
+        return args[a].has_value() ? cell_value(*args[a], row) : ExprValue{Null{}};
+    };
+
+    auto column = typed_column_for(type, expr, input, ctx.scalars);
+    if (!column) {
+        return std::unexpected(column.error());
+    }
+    std::visit([&](auto& col) { col.reserve(n); }, *column);
+    ValidityBitmap validity(n, true);
+    bool any_null = false;
+    std::vector<ExprValue> row_args(call.args.size());
+    for (std::size_t row = 0; row < n; ++row) {
+        std::expected<ExprValue, std::string> value = ExprValue{Null{}};
+        if (scalar_exec != nullptr) {
+            // NullPolicy::Propagate, applied centrally: a null argument nulls
+            // the call, so `eval` never sees one. Handles entries (coalesce,
+            // fill_null, null_if_*) receive the null and decide.
+            bool null_argument = false;
+            for (std::size_t a = 0; a < call.args.size(); ++a) {
+                row_args[a] = arg_at(a, row);
+                null_argument = null_argument || std::holds_alternative<Null>(row_args[a]);
+            }
+            if (!null_argument || entry->null_policy != NullPolicy::Propagate) {
+                value = scalar_exec->eval(call.callee, row_args);
+            }
+        } else if (mode.has_value()) {
+            const auto x = arg_at(0, row);
+            if (const auto* decimal_value = std::get_if<DecimalValue>(&x)) {
+                auto rounded = apply_decimal_round(*decimal_value, *mode);
+                if (!rounded) {
+                    return std::unexpected(rounded.error());
+                }
+                value = ExprValue{*rounded};
+            } else if (const auto* integer = std::get_if<std::int64_t>(&x)) {
+                value = ExprValue{*integer};
+            } else if (!std::holds_alternative<Null>(x)) {
+                auto d = expr_value_to_double(x);
+                if (!d) {
+                    return std::unexpected("round: first argument must be numeric");
+                }
+                value = ExprValue{apply_round(*d, *mode)};
+            }
+        } else if (table_first) {
+            // An extern whose first argument is a table runs per row with its
+            // own argument handling.
+            value = eval_extern_expr(call, input, range.begin + row, ctx.scalars, ctx.externs);
+        } else {
+            // Externs take null-free arguments: a null is rejected in front of
+            // the call, rather than reaching extern code.
+            ExternArgs extern_args;
+            extern_args.reserve(call.args.size());
+            for (std::size_t a = 0; a < call.args.size(); ++a) {
+                auto argument = scalar_from_expr(arg_at(a, row));
+                if (!argument.has_value()) {
+                    return std::unexpected(call.callee + ": null argument in extern function call");
+                }
+                extern_args.push_back(std::move(*argument));
+            }
+            auto result = extern_fn->func(extern_args);
+            if (!result) {
+                return std::unexpected(result.error());
+            }
+            const auto* scalar = std::get_if<ScalarValue>(&*result);
+            if (scalar == nullptr) {
+                return std::unexpected("extern function returned a non-scalar in expression: " +
+                                       call.callee);
+            }
+            value = expr_from_scalar(*scalar);
+        }
+        if (!value) {
+            return std::unexpected(value.error());
+        }
+        if (std::holds_alternative<Null>(*value)) {
+            append_null(*column);
+            validity.set(row, false);
+            any_null = true;
+        } else if (auto appended = append_value(*column, *value); !appended) {
+            return std::unexpected(appended.error());
+        }
+    }
+    return ComputedColumn{
+        .column = std::move(*column),
+        .validity = any_null ? std::optional<ValidityBitmap>{std::move(validity)} : std::nullopt};
+}
+
+}  // namespace
+
 auto evaluate_field(const ir::Expr& expr, const Table& input, RowRange range,
                     const ColumnEvalCtx& ctx) -> std::expected<ComputedColumn, std::string> {
     const std::size_t table_rows = input.rows();
@@ -2723,8 +3196,11 @@ auto evaluate_field(const ir::Expr& expr, const Table& input, RowRange range,
     // exactly this many rows; the ones that do not are guarded below.
     const std::size_t rows = range.count;
     if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
+        // A row-local builtin with a column kernel (a cast, `like`, ...) uses
+        // it over the whole table; over a partial range it is applied element
+        // by element below, like any scalar call.
         if (const auto* fn = find_builtin(call->callee);
-            fn != nullptr && use_column_kernel(*fn, *call)) {
+            fn != nullptr && use_column_kernel(*fn, *call) && (whole || is_column_only(*fn))) {
             // A whole-column builtin (rolling/cum/lag, generators) reads
             // neighbouring rows or the whole frame, so a range would change its
             // answer rather than just its cost. These are permanently
@@ -2754,202 +3230,39 @@ auto evaluate_field(const ir::Expr& expr, const Table& input, RowRange range,
     if (!inferred) {
         return std::unexpected(inferred.error());
     }
-    // Validity-/boolean-aware fields (comparisons, logical, is_null) and
-    // nested whole-column calls cannot be built per row. Evaluate them
-    // through the vectorized, validity-aware path.
-    // Decimal arithmetic has a vectorized, validity-aware kernel
-    // (`decimal_arith_columns`) but no fused numeric tree, so without this it
-    // fell to the per-row loop below -- ~150x an Int64 multiply, boxing every
-    // value in a variant. Only BinaryExpr roots: they always yield an owned
-    // dense column, never the borrowed leaf the branch below rejects.
-    const auto decimal_arith_root = [&] {
-        const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node);
-        if (bin == nullptr) {
-            return false;
-        }
-        if (inferred.value() == ExprType::Decimal) {
-            return true;
-        }
-        const auto is_decimal = [&](const ir::Expr& side) {
-            auto t = infer_expr_type(side, input, ctx.scalars, ctx.externs);
-            return t.has_value() && *t == ExprType::Decimal;
-        };
-        return bin->op == ir::ArithmeticOp::Div &&
-               (is_decimal(*bin->left) || is_decimal(*bin->right));
-    };
-    if (field_uses_vectorized_eval(expr) || decimal_arith_root()) {
-        auto res = eval_value_vec(expr, input, ctx.scalars, range, ctx.window, ctx.window_aligned);
-        if (!res) {
-            return std::unexpected(res.error());
-        }
-        // `field_uses_vectorized_eval` is true only for a boolean node or a
-        // nested whole-column call, and both produce an owned dense column —
-        // never the borrowed-with-offset leaf. A borrowed result here would
-        // need densifying, which this branch does not do, so check rather than
-        // copy the wrong rows.
-        if (res->offset != 0) {
-            invariant_violation(
-                "evaluate_field: vectorized path returned a borrowed column with a row "
-                "offset; it can only produce dense results");
-        }
-        ColumnValue col;
-        if (auto* owned = std::get_if<ColumnValue>(&res->data)) {
-            col = std::move(*owned);
-        } else {
-            col = *std::get<const ColumnValue*>(res->data);
-        }
-        std::optional<ValidityBitmap> validity;
-        if (const auto* v = res->get_validity()) {
-            validity = *v;
-        }
-        return ComputedColumn{.column = std::move(col), .validity = std::move(validity)};
-    }
     // The fused numeric tree is range-aware: its leaves advance their base
-    // pointers by `range.begin`, and a leaf that would still need whole-table
-    // evaluation declines so this falls through to the per-row loop below
-    // rather than re-reading the whole column per call.
+    // pointers by `range.begin`. It declines anything it cannot compile.
     if (auto fast = try_fast_update_numeric_expr(expr, input, range, inferred.value(), ctx.scalars);
         fast.has_value()) {
         return ComputedColumn{.column = std::move(fast.value()),
                               .validity = collect_expr_validity(expr, input, range)};
     }
-    ColumnValue new_column;
-    switch (inferred.value()) {
-        case ExprType::Int:
-            new_column = Column<std::int64_t>{};
-            break;
-        case ExprType::Double:
-            new_column = Column<double>{};
-            break;
-        case ExprType::Bool:
-            new_column = Column<bool>{};
-            break;
-        case ExprType::String:
-            new_column = Column<std::string>{};
-            break;
-        case ExprType::Categorical:
-            new_column = Column<Categorical>{};
-            break;
-        case ExprType::Date:
-            new_column = Column<Date>{};
-            break;
-        case ExprType::Timestamp:
-            new_column = Column<Timestamp>{};
-            break;
-        case ExprType::Decimal: {
-            auto type = infer_decimal_type(expr, input, ctx.scalars);
-            if (!type) {
-                return std::unexpected(type.error());
-            }
-            new_column = make_decimal_column(*type);
-            break;
-        }
+    if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
+        return eval_call_columns(*call, expr, input, range, ctx, inferred.value());
     }
-    std::visit([&](auto& col) { col.reserve(rows); }, new_column);
-    // Validity is produced inline: eval_expr returns Null for a null cell and
-    // propagation carries it to the row's result, so the bitmap is exact —
-    // no post-hoc collect_expr_validity mask, no computing on undefined
-    // payloads (plans/exprvalue-null-arm-plan.md, stage 2).
-    ValidityBitmap validity(rows, true);
-    bool any_null = false;
-    // `eval_expr` indexes the input directly, so the loop walks source rows
-    // while the output is appended densely; validity is indexed by output row.
-    for (std::size_t row = range.begin; row < range.end(); ++row) {
-        const std::size_t out_row = row - range.begin;
-        auto value = eval_expr(expr, input, row, ctx.scalars, ctx.externs);
-        if (!value) {
-            return std::unexpected(value.error());
-        }
-        if (std::holds_alternative<Null>(value.value())) {
-            validity.set(out_row, false);
-            any_null = true;
-            std::visit(
-                [](auto& col) {
-                    using ColType = std::decay_t<decltype(col)>;
-                    if constexpr (std::is_same_v<typename ColType::value_type, std::string_view>) {
-                        col.push_back(std::string_view{});
-                    } else {
-                        col.push_back(typename ColType::value_type{});
-                    }
-                },
-                new_column);
-            continue;
-        }
-        // Fitting a value to the column's Decimal(p, s) can overflow, which is
-        // a query error -- so it is handled here, where one can be returned.
-        if (auto* dec_col = std::get_if<Column<Decimal>>(&new_column)) {
-            auto units = fit_decimal(value.value(), decimal_type_of(*dec_col));
-            if (!units) {
-                return std::unexpected(units.error());
-            }
-            dec_col->push_back(Decimal{*units});
-            continue;
-        }
-        std::visit(
-            [&](auto& col) {
-                using ColType = std::decay_t<decltype(col)>;
-                using ValueType = ColType::value_type;
-                if constexpr (std::is_same_v<ValueType, std::int64_t>) {
-                    if (const auto* int_value = std::get_if<std::int64_t>(&value.value())) {
-                        col.push_back(*int_value);
-                    } else if (const auto* double_value = std::get_if<double>(&value.value())) {
-                        col.push_back(static_cast<std::int64_t>(*double_value));
-                    } else {
-                        invariant_violation(
-                            "eval_expr_column: expected Int64-compatible expression value");
-                    }
-                } else if constexpr (std::is_same_v<ValueType, double>) {
-                    if (const auto* int_value = std::get_if<std::int64_t>(&value.value())) {
-                        col.push_back(static_cast<double>(*int_value));
-                    } else if (const auto* double_value = std::get_if<double>(&value.value())) {
-                        col.push_back(*double_value);
-                    } else {
-                        invariant_violation(
-                            "eval_expr_column: expected Float64-compatible expression value");
-                    }
-                } else if constexpr (std::is_same_v<ValueType, bool>) {
-                    if (const auto* bool_value = std::get_if<bool>(&value.value())) {
-                        col.push_back(*bool_value);
-                    } else if (const auto* int_value = std::get_if<std::int64_t>(&value.value())) {
-                        col.push_back(*int_value != 0);
-                    } else {
-                        invariant_violation(
-                            "eval_expr_column: expected Bool-compatible expression value");
-                    }
-                } else if constexpr (std::is_same_v<ValueType, std::string_view>) {
-                    // Column<std::string>::value_type is std::string_view; the
-                    // ExprValue holds an owned std::string, which push_back copies
-                    // into the column's arena.
-                    if (const auto* v = std::get_if<std::string>(&value.value())) {
-                        col.push_back(*v);
-                    } else {
-                        invariant_violation("eval_expr_column: expected String expression value");
-                    }
-                } else if constexpr (std::is_same_v<ValueType, Date>) {
-                    if (const auto* date_value = std::get_if<Date>(&value.value())) {
-                        col.push_back(*date_value);
-                    } else if (const auto* int_value = std::get_if<std::int64_t>(&value.value())) {
-                        col.push_back(int64_to_date_checked(*int_value));
-                    } else {
-                        invariant_violation(
-                            "eval_expr_column: expected Date-compatible expression value");
-                    }
-                } else if constexpr (std::is_same_v<ValueType, Timestamp>) {
-                    if (const auto* timestamp_value = std::get_if<Timestamp>(&value.value())) {
-                        col.push_back(*timestamp_value);
-                    } else if (const auto* int_value = std::get_if<std::int64_t>(&value.value())) {
-                        col.push_back(Timestamp{*int_value});
-                    } else {
-                        invariant_violation(
-                            "eval_expr_column: expected Timestamp-compatible expression value");
-                    }
-                }
-            },
-            new_column);
+    // Everything else -- a column, a literal, arithmetic, a comparison, logic,
+    // `is null` -- is the vectorized, validity-aware evaluator's.
+    auto res = eval_value_vec(expr, input, ctx.scalars, range, ctx.window, ctx.window_aligned,
+                              ctx.externs);
+    if (!res) {
+        return std::unexpected(res.error());
     }
-    return ComputedColumn{
-        .column = std::move(new_column),
-        .validity = any_null ? std::optional<ValidityBitmap>{std::move(validity)} : std::nullopt};
+    // A bare column comes back borrowed, at the range's offset: copy its rows.
+    if (const auto* const* borrowed = std::get_if<const ColumnValue*>(&res->data)) {
+        std::optional<ValidityBitmap> validity;
+        if (const auto* v = res->get_validity()) {
+            validity =
+                gather_validity(std::optional<ValidityBitmap>{*v}, res->offset, res->offset + rows);
+        }
+        return ComputedColumn{.column = gather_range(**borrowed, res->offset, res->offset + rows),
+                              .validity = std::move(validity)};
+    }
+    std::optional<ValidityBitmap> validity;
+    if (const auto* v = res->get_validity()) {
+        validity = *v;
+    }
+    return ComputedColumn{.column = std::move(std::get<ColumnValue>(res->data)),
+                          .validity = std::move(validity)};
 }
 
 // Produce a shifted copy of a column: lag(col, n)[i] = col[i-n], lead(col, n)[i] = col[i+n].

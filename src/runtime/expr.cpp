@@ -2414,246 +2414,14 @@ auto infer_decimal_type(const ir::Expr& expr, const Table& input, const ScalarRe
     return std::unexpected("cannot determine the Decimal precision and scale of this expression");
 }
 
-auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
-               const ScalarRegistry* scalars, const ExternRegistry* externs)
-    -> std::expected<ExprValue, std::string> {
-    if (const auto* col = std::get_if<ir::ColumnRef>(&expr.node)) {
-        const auto* entry = col->lexical ? nullptr : input.find_entry(col->name);
-        if (entry == nullptr) {
-            if (scalars != nullptr) {
-                if (auto it = scalars->find(col->name); it != scalars->end()) {
-                    return expr_from_scalar(it->second);
-                }
-            }
-            if (col->lexical) {
-                return std::unexpected("'^" + col->name +
-                                       "' does not resolve to a lexical binding");
-            }
-            return std::unexpected("unknown column in expression: " + col->name +
-                                   " (available: " + format_columns(input) + ")");
-        }
-        // A null cell is Null, read from the validity bitmap — its payload is
-        // undefined and never touched (plans/exprvalue-null-arm-plan.md).
-        if (entry->validity.has_value() && !(*entry->validity)[row]) {
-            return ExprValue{Null{}};
-        }
-        return std::visit(
-            [&](const auto& column) -> ExprValue {
-                using ColType = std::decay_t<decltype(column)>;
-                if constexpr (std::is_same_v<ColType, Column<Categorical>> ||
-                              std::is_same_v<ColType, Column<std::string>>) {
-                    return std::string(column[row]);
-                } else if constexpr (std::is_same_v<ColType, Column<Decimal>>) {
-                    return DecimalValue{.units = column[row].units,
-                                        .type = decimal_type_of(column)};
-                } else {
-                    return column[row];
-                }
-            },
-            *entry->column);
-    }
-    if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
-        return std::visit(
-            [](const auto& v) -> ExprValue {
-                // A typed NULL is the row evaluator's null; inference has its type.
-                if constexpr (std::is_same_v<std::decay_t<decltype(v)>, NullScalar>) {
-                    return Null{};
-                } else {
-                    return v;
-                }
-            },
-            lit->value);
-    }
-    if (const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node)) {
-        auto left = eval_expr(*bin->left, input, row, scalars, externs);
-        if (!left) {
-            return left;
-        }
-        auto right = eval_expr(*bin->right, input, row, scalars, externs);
-        if (!right) {
-            return right;
-        }
-        // Null propagates through every operator: null in -> null out.
-        if (std::holds_alternative<Null>(left.value()) ||
-            std::holds_alternative<Null>(right.value())) {
-            return ExprValue{Null{}};
-        }
-        if (std::holds_alternative<DecimalValue>(left.value()) ||
-            std::holds_alternative<DecimalValue>(right.value())) {
-            return decimal_arith(bin->op, left.value(), right.value());
-        }
-        if (std::holds_alternative<std::string>(left.value()) ||
-            std::holds_alternative<std::string>(right.value())) {
-            return std::unexpected("string arithmetic not supported");
-        }
-        if (std::holds_alternative<Date>(left.value()) ||
-            std::holds_alternative<Date>(right.value()) ||
-            std::holds_alternative<Timestamp>(left.value()) ||
-            std::holds_alternative<Timestamp>(right.value())) {
-            return std::unexpected("date/time arithmetic not supported");
-        }
-        if (std::holds_alternative<bool>(left.value()) ||
-            std::holds_alternative<bool>(right.value())) {
-            return std::unexpected("boolean arithmetic not supported");
-        }
-        auto to_double = [](const ExprValue& v) -> double {
-            if (const auto* i = std::get_if<std::int64_t>(&v)) {
-                return static_cast<double>(*i);
-            }
-            return std::get<double>(v);
-        };
-        const bool want_double = bin->op == ir::ArithmeticOp::Div ||
-                                 std::holds_alternative<double>(left.value()) ||
-                                 std::holds_alternative<double>(right.value());
-        if (want_double) {
-            const double lhs = to_double(left.value());
-            const double rhs = to_double(right.value());
-            switch (bin->op) {
-                case ir::ArithmeticOp::Add:
-                    return lhs + rhs;
-                case ir::ArithmeticOp::Sub:
-                    return lhs - rhs;
-                case ir::ArithmeticOp::Mul:
-                    return lhs * rhs;
-                case ir::ArithmeticOp::Div:
-                    return lhs / rhs;
-                case ir::ArithmeticOp::Mod:
-                    return std::fmod(lhs, rhs);
-            }
-        } else {
-            const std::int64_t lhs = std::get<std::int64_t>(left.value());
-            const std::int64_t rhs = std::get<std::int64_t>(right.value());
-            switch (bin->op) {
-                case ir::ArithmeticOp::Add:
-                    return lhs + rhs;
-                case ir::ArithmeticOp::Sub:
-                    return lhs - rhs;
-                case ir::ArithmeticOp::Mul:
-                    return lhs * rhs;
-                case ir::ArithmeticOp::Div:
-                    return safe_idiv(lhs, rhs);
-                case ir::ArithmeticOp::Mod:
-                    return safe_imod(lhs, rhs);
-            }
-        }
-    }
-    if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
-        if (call->callee == "__null") {
-            if (!call->args.empty()) {
-                return std::unexpected("NULL takes no arguments");
-            }
-            return ExprValue{Null{}};
-        }
-        if (call->callee == "__case") {
-            if (call->args.empty() || call->args.size() % 2 == 0) {
-                return std::unexpected("case: expected condition/value arm pairs followed by else");
-            }
-            for (std::size_t i = 0; i + 1 < call->args.size(); i += 2) {
-                auto condition = eval_expr(*call->args[i], input, row, scalars, externs);
-                if (!condition) {
-                    return condition;
-                }
-                // CASE follows SQL's three-valued rule: a null condition does
-                // not match and the next arm is considered.
-                if (const auto* matched = std::get_if<bool>(&condition.value())) {
-                    if (*matched) {
-                        return eval_expr(*call->args[i + 1], input, row, scalars, externs);
-                    }
-                } else if (!std::holds_alternative<Null>(condition.value())) {
-                    return std::unexpected("case: each condition must evaluate to Bool");
-                }
-            }
-            return eval_expr(*call->args.back(), input, row, scalars, externs);
-        }
-        // Pure row-wise scalar builtins: single source of truth (see
-        // builtins()). Both this pass and infer_expr_type dispatch here.
-        // Non-Scalar builtins hold no ScalarExec — they fall through to the
-        // same "unknown function" error as before they joined the registry
-        // (routing sends them to the vectorized path instead).
-        const auto* entry = find_builtin(call->callee);
-        const auto* scalar_exec =
-            entry != nullptr ? std::get_if<ScalarExec>(&entry->exec) : nullptr;
-        if (scalar_exec != nullptr && scalar_exec->eval != nullptr) {
-            const auto argc = static_cast<int>(call->args.size());
-            if (argc < entry->min_args || (entry->max_args >= 0 && argc > entry->max_args)) {
-                return std::unexpected(std::string(call->callee) + ": wrong number of arguments");
-            }
-            std::vector<ExprValue> arg_values;
-            arg_values.reserve(call->args.size());
-            for (const auto& arg : call->args) {
-                auto v = eval_expr(*arg, input, row, scalars, externs);
-                if (!v) {
-                    return v;
-                }
-                // NullPolicy::Propagate, applied centrally: a Null argument
-                // short-circuits the call to Null, so `eval` never sees one.
-                // Handles entries (coalesce/fill_null/null_if_*) receive the
-                // Null and decide.
-                if (entry->null_policy == NullPolicy::Propagate &&
-                    std::holds_alternative<Null>(*v)) {
-                    return ExprValue{Null{}};
-                }
-                arg_values.push_back(std::move(*v));
-            }
-            return scalar_exec->eval(call->callee, arg_values);
-        }
-        // round(x, mode): mode is a RoundMode literal; dispatched apart from the
-        // value-based registry. Always yields Int64.
-        if (call->callee == "round") {
-            if (call->args.size() != 2) {
-                return std::unexpected("round: expected 2 arguments (value, mode)");
-            }
-            auto mode = extract_ir_round_mode(*call->args[1]);
-            if (!mode) {
-                return std::unexpected(mode.error());
-            }
-            auto arg = eval_expr(*call->args[0], input, row, scalars, externs);
-            if (!arg) {
-                return arg;
-            }
-            if (std::holds_alternative<Null>(arg.value())) {
-                return ExprValue{Null{}};
-            }
-            if (const auto* decimal_value = std::get_if<DecimalValue>(&arg.value())) {
-                auto rounded = apply_decimal_round(*decimal_value, *mode);
-                if (!rounded) {
-                    return std::unexpected(rounded.error());
-                }
-                return ExprValue{*rounded};
-            }
-            if (const auto* integer = std::get_if<std::int64_t>(&arg.value())) {
-                return ExprValue{*integer};
-            }
-            auto d = expr_value_to_double(arg.value());
-            if (!d) {
-                return std::unexpected("round: first argument must be numeric");
-            }
-            return ExprValue{apply_round(*d, *mode)};
-        }
-        if (externs == nullptr) {
-            return std::unexpected("unknown function in expression: " + call->callee);
-        }
-        const auto* fn = externs->find(call->callee);
-        if (fn == nullptr) {
-            return std::unexpected("unknown function in expression: " + call->callee);
-        }
-        if (fn->kind != ExternReturnKind::Scalar) {
-            return std::unexpected("function not usable in expression: " + call->callee);
-        }
-        return eval_extern_expr(*call, input, row, scalars, externs);
-    }
-    return std::unexpected("unsupported expression");
-}
-
 auto evaluate_row_count_expr_impl(const ir::Expr& expr, const ScalarRegistry* scalars,
                                   const ExternRegistry* externs)
     -> std::expected<std::size_t, std::string> {
-    const Table empty;
-    auto value = eval_expr(expr, empty, 0, scalars, externs);
+    auto value = evaluate_scalar_expr(expr, scalars, externs);
     if (!value) {
         return std::unexpected("row count expression: " + value.error());
     }
-    if (std::holds_alternative<Null>(value.value())) {
+    if (is_null_scalar(value.value())) {
         return std::unexpected("row count expression is null; a count must be a present value");
     }
     if (const auto* i = std::get_if<std::int64_t>(&value.value())) {
@@ -2665,39 +2433,54 @@ auto evaluate_row_count_expr_impl(const ir::Expr& expr, const ScalarRegistry* sc
     return std::unexpected("row count expression must evaluate to Int64");
 }
 
-// True if a field expression must be evaluated through the vectorized, validity-
-// aware path (eval_value_vec) instead of the per-row eval_expr, because somewhere
-// in the tree it has a node the per-row evaluator can't produce:
-//   - a boolean node (comparison / logical / is_null), or
-//   - a whole-column builtin: any registry entry with a `column_eval`
-//     (Transforms — rolling/cum/lag/lead/fill/null_if_*/coalesce — and
-//     Generators — `rand_*` / `rep`).
-// Detecting these anywhere (not just at the top or under arithmetic) is what
-// lets a non-row-local call nest inside arithmetic OR inside a scalar call —
-// e.g. `(close - lag(close,1)) / lag(close,1)` and `abs(rand_normal(0,1))`.
-// A plain scalar field (`abs(x)`, `x + 1`) contains none of these and stays on
-// the fast per-row path.
-auto field_uses_vectorized_eval(const ir::Expr& expr) -> bool {
+// ── Column evaluation of calls ────────────────────────────────────────────────
+//
+// Every field is typed before any row runs (`infer_expr_type`), and a call is
+// evaluated over columns: its arguments as columns over the field's rows, then
+// the function applied element by element into a column of the call's type.
+// Nulls are validity bits throughout.
+
+auto cell_value(const ColResult& arg, std::size_t i) -> ExprValue {
+    const std::size_t at = arg.offset + i;
+    if (const auto* validity = arg.get_validity(); validity != nullptr && !(*validity)[at]) {
+        return Null{};
+    }
+    return std::visit(
+        [&](const auto& column) -> ExprValue {
+            using ColType = std::decay_t<decltype(column)>;
+            if constexpr (std::is_same_v<ColType, Column<Categorical>> ||
+                          std::is_same_v<ColType, Column<std::string>>) {
+                return std::string(column[at]);
+            } else if constexpr (std::is_same_v<ColType, Column<Decimal>>) {
+                return DecimalValue{.units = column[at].units, .type = decimal_type_of(column)};
+            } else {
+                return column[at];
+            }
+        },
+        deref_col(arg));
+}
+
+auto is_row_local(const ir::Expr& expr) -> bool {
     return std::visit(
         [](const auto& node) -> bool {
             using T = std::decay_t<decltype(node)>;
-            if constexpr (std::is_same_v<T, ir::CompareExpr> ||
-                          std::is_same_v<T, ir::LogicalExpr> || std::is_same_v<T, ir::IsNullExpr>) {
+            if constexpr (std::is_same_v<T, ir::ColumnRef> || std::is_same_v<T, ir::Literal>) {
                 return true;
-            } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
-                return field_uses_vectorized_eval(*node.left) ||
-                       field_uses_vectorized_eval(*node.right);
+            } else if constexpr (std::is_same_v<T, ir::BinaryExpr> ||
+                                 std::is_same_v<T, ir::CompareExpr>) {
+                return is_row_local(*node.left) && is_row_local(*node.right);
+            } else if constexpr (std::is_same_v<T, ir::LogicalExpr>) {
+                return is_row_local(*node.left) &&
+                       (node.right == nullptr || is_row_local(*node.right));
+            } else if constexpr (std::is_same_v<T, ir::IsNullExpr>) {
+                return is_row_local(*node.operand);
             } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
-                // Column-ONLY builtins (Transform/Generator) cannot be built
-                // per row. Hybrid null-handling scalars (fill_null/null_if_*/
-                // coalesce) evaluate per-row via their NullPolicy::Handles
-                // eval, so they don't force this path.
                 if (const auto* fn = find_builtin(node.callee);
                     fn != nullptr && is_column_only(*fn)) {
-                    return true;
+                    return false;
                 }
-                return std::ranges::any_of(
-                    node.args, [](const auto& a) { return field_uses_vectorized_eval(*a); });
+                return std::ranges::all_of(node.args,
+                                           [](const auto& arg) { return is_row_local(*arg); });
             } else {
                 return false;
             }
@@ -2705,24 +2488,33 @@ auto field_uses_vectorized_eval(const ir::Expr& expr) -> bool {
         expr.node);
 }
 
-// The single field-expression evaluator (stage 6 of
-// plans/function-kind-registry-plan.md): every field/value dispatch runs
-// through here exactly once —
-//   1. a top-level whole-column builtin (Transform/Generator) via the
-//      registry's `column_eval`, with a row-count guard so a short generator
-//      (rep's length_out) errors instead of reading out of bounds;
-//   2. the vectorized, validity-aware path for anything containing a boolean
-//      node or a nested whole-column call (eval_expr is pure and has no null);
-//   3. the fused numeric fast path;
-//   4. the per-row eval_expr loop.
-// update_table and windowed_update_table (and through them the grouped,
-// guarded, and chunked variants) and evaluate_field_column all dispatch here.
-// ── Column evaluation of calls ────────────────────────────────────────────────
-//
-// Every field is typed before any row runs (`infer_expr_type`), and a call is
-// evaluated over columns: its arguments as columns over the field's rows, then
-// the function applied element by element into a column of the call's type.
-// Nulls are validity bits throughout.
+auto expr_calls_extern(const ir::Expr& expr, const ExternRegistry* externs) -> bool {
+    if (externs == nullptr) {
+        return false;
+    }
+    return std::visit(
+        [&](const auto& node) -> bool {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, ir::BinaryExpr> || std::is_same_v<T, ir::CompareExpr>) {
+                return expr_calls_extern(*node.left, externs) ||
+                       expr_calls_extern(*node.right, externs);
+            } else if constexpr (std::is_same_v<T, ir::LogicalExpr>) {
+                return expr_calls_extern(*node.left, externs) ||
+                       (node.right != nullptr && expr_calls_extern(*node.right, externs));
+            } else if constexpr (std::is_same_v<T, ir::IsNullExpr>) {
+                return expr_calls_extern(*node.operand, externs);
+            } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
+                if (find_builtin(node.callee) == nullptr && externs->find(node.callee) != nullptr) {
+                    return true;
+                }
+                return std::ranges::any_of(
+                    node.args, [&](const auto& arg) { return expr_calls_extern(*arg, externs); });
+            } else {
+                return false;
+            }
+        },
+        expr.node);
+}
 
 namespace {
 
@@ -2846,60 +2638,9 @@ auto append_value(ColumnValue& column, const ExprValue& value) -> std::expected<
     return {};
 }
 
-// Row `i` of an argument column, or Null where its validity bit is clear.
-auto cell_value(const ColResult& arg, std::size_t i) -> ExprValue {
-    const std::size_t at = arg.offset + i;
-    if (const auto* validity = arg.get_validity(); validity != nullptr && !(*validity)[at]) {
-        return Null{};
-    }
-    return std::visit(
-        [&](const auto& column) -> ExprValue {
-            using ColType = std::decay_t<decltype(column)>;
-            if constexpr (std::is_same_v<ColType, Column<Categorical>> ||
-                          std::is_same_v<ColType, Column<std::string>>) {
-                return std::string(column[at]);
-            } else if constexpr (std::is_same_v<ColType, Column<Decimal>>) {
-                return DecimalValue{.units = column[at].units, .type = decimal_type_of(column)};
-            } else {
-                return column[at];
-            }
-        },
-        deref_col(arg));
-}
-
 auto is_null_call(const ir::Expr& expr) -> bool {
     const auto* call = std::get_if<ir::CallExpr>(&expr.node);
     return call != nullptr && call->callee == "__null" && call->args.empty();
-}
-
-// True when `expr` reads only its own row: no whole-column builtin (rolling,
-// cumulative, lag/lead, generators) and no rank anywhere in it.
-auto is_row_local(const ir::Expr& expr) -> bool {
-    return std::visit(
-        [](const auto& node) -> bool {
-            using T = std::decay_t<decltype(node)>;
-            if constexpr (std::is_same_v<T, ir::ColumnRef> || std::is_same_v<T, ir::Literal>) {
-                return true;
-            } else if constexpr (std::is_same_v<T, ir::BinaryExpr> ||
-                                 std::is_same_v<T, ir::CompareExpr>) {
-                return is_row_local(*node.left) && is_row_local(*node.right);
-            } else if constexpr (std::is_same_v<T, ir::LogicalExpr>) {
-                return is_row_local(*node.left) &&
-                       (node.right == nullptr || is_row_local(*node.right));
-            } else if constexpr (std::is_same_v<T, ir::IsNullExpr>) {
-                return is_row_local(*node.operand);
-            } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
-                if (const auto* fn = find_builtin(node.callee);
-                    fn != nullptr && is_column_only(*fn)) {
-                    return false;
-                }
-                return std::ranges::all_of(node.args,
-                                           [](const auto& arg) { return is_row_local(*arg); });
-            } else {
-                return false;
-            }
-        },
-        expr.node);
 }
 
 // An argument column over some rows, read back by position. `by_row` when it
@@ -3056,7 +2797,8 @@ auto eval_call_columns(const ir::CallExpr& call, const ir::Expr& expr, const Tab
         scalar_exec = nullptr;
     }
     std::optional<RoundMode> mode;
-    const ExternFunction* extern_fn = nullptr;
+    // An extern is called per row, in order, over its argument columns.
+    std::optional<std::vector<ExprValue>> extern_values;
     if (scalar_exec != nullptr) {
         const auto argc = static_cast<int>(call.args.size());
         if (argc < entry->min_args || (entry->max_args >= 0 && argc > entry->max_args)) {
@@ -3073,13 +2815,14 @@ auto eval_call_columns(const ir::CallExpr& call, const ir::Expr& expr, const Tab
         }
         mode = *parsed;
     } else {
-        extern_fn = ctx.externs != nullptr ? ctx.externs->find(call.callee) : nullptr;
-        if (extern_fn == nullptr) {
+        if (ctx.externs == nullptr || ctx.externs->find(call.callee) == nullptr) {
             return std::unexpected("unknown function in expression: " + call.callee);
         }
-        if (extern_fn->kind != ExternReturnKind::Scalar) {
-            return std::unexpected("function not usable in expression: " + call.callee);
+        auto values = eval_extern_values(call, input, range, ctx);
+        if (!values) {
+            return std::unexpected(values.error());
         }
+        extern_values = std::move(*values);
     }
 
     const std::size_t n = range.count;
@@ -3087,9 +2830,9 @@ auto eval_call_columns(const ir::CallExpr& call, const ir::Expr& expr, const Tab
     // null in every row; round's mode is not a value.
     std::vector<std::optional<ColResult>> args;
     args.reserve(call.args.size());
-    const bool table_first = extern_fn != nullptr && extern_fn->first_arg_is_table;
     for (std::size_t a = 0; a < call.args.size(); ++a) {
-        if ((mode.has_value() && a == 1) || is_null_call(*call.args[a]) || table_first) {
+        if ((mode.has_value() && a == 1) || is_null_call(*call.args[a]) ||
+            extern_values.has_value()) {
             args.emplace_back();
             continue;
         }
@@ -3143,32 +2886,8 @@ auto eval_call_columns(const ir::CallExpr& call, const ir::Expr& expr, const Tab
                 }
                 value = ExprValue{apply_round(*d, *mode)};
             }
-        } else if (table_first) {
-            // An extern whose first argument is a table runs per row with its
-            // own argument handling.
-            value = eval_extern_expr(call, input, range.begin + row, ctx.scalars, ctx.externs);
         } else {
-            // Externs take null-free arguments: a null is rejected in front of
-            // the call, rather than reaching extern code.
-            ExternArgs extern_args;
-            extern_args.reserve(call.args.size());
-            for (std::size_t a = 0; a < call.args.size(); ++a) {
-                auto argument = scalar_from_expr(arg_at(a, row));
-                if (!argument.has_value()) {
-                    return std::unexpected(call.callee + ": null argument in extern function call");
-                }
-                extern_args.push_back(std::move(*argument));
-            }
-            auto result = extern_fn->func(extern_args);
-            if (!result) {
-                return std::unexpected(result.error());
-            }
-            const auto* scalar = std::get_if<ScalarValue>(&*result);
-            if (scalar == nullptr) {
-                return std::unexpected("extern function returned a non-scalar in expression: " +
-                                       call.callee);
-            }
-            value = expr_from_scalar(*scalar);
+            value = std::move((*extern_values)[row]);
         }
         if (!value) {
             return std::unexpected(value.error());
@@ -3188,6 +2907,17 @@ auto eval_call_columns(const ir::CallExpr& call, const ir::Expr& expr, const Tab
 
 }  // namespace
 
+// The single field-expression evaluator: every field/value dispatch runs
+// through here exactly once, typed before any row --
+//   1. a top-level whole-column builtin (Transform/Generator) via the
+//      registry's `column_eval`, with a row-count guard so a short generator
+//      (rep's length_out) errors instead of reading out of bounds;
+//   2. the fused numeric tree;
+//   3. a call over its argument columns (eval_call_columns);
+//   4. the vectorized, validity-aware evaluator for everything else.
+// update_table and windowed_update_table (and through them the grouped,
+// guarded, and chunked variants), scalars, `map`, and evaluate_field_column all
+// dispatch here.
 auto evaluate_field(const ir::Expr& expr, const Table& input, RowRange range,
                     const ColumnEvalCtx& ctx) -> std::expected<ComputedColumn, std::string> {
     const std::size_t table_rows = input.rows();
@@ -3279,8 +3009,7 @@ auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_
     if (!col_ref) {
         return std::unexpected(fname + ": first argument must be a column name");
     }
-    const Table empty;
-    auto offset_value = eval_expr(*call.args[1], empty, 0, scalars, externs);
+    auto offset_value = evaluate_scalar_expr(*call.args[1], scalars, externs);
     if (!offset_value) {
         return std::unexpected(fname + ": " + offset_value.error());
     }

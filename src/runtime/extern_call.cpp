@@ -35,75 +35,72 @@ namespace ibex::runtime {
 
 namespace {
 
+// An extern's arguments where there is no row to read: each is a scalar
+// expression. Externs take null-free arguments: a null is rejected here, in
+// front of the call, rather than reaching extern code.
 auto eval_extern_args(const std::vector<ir::Expr>& exprs, const ScalarRegistry* scalars,
                       const ExternRegistry* externs) -> std::expected<ExternArgs, std::string> {
     ExternArgs args;
     args.reserve(exprs.size());
     for (const auto& arg : exprs) {
-        auto val = eval_expr(arg, Table{}, 0, scalars, externs);
-        if (!val.has_value()) {
-            return std::unexpected(std::move(val.error()));
-        }
-        // Externs take null-free ScalarValue arguments: a null is rejected here,
-        // in front of the call, rather than reaching extern code. Static typing
-        // catches most; this is the runtime backstop.
-        auto scalar = scalar_from_expr(val.value());
-        if (!scalar) {
-            return std::unexpected("null argument in extern function call");
-        }
-        args.push_back(std::move(*scalar));
-    }
-    return args;
-}
-
-auto eval_extern_args(const std::vector<ir::ExprPtr>& exprs, std::size_t begin, const Table& input,
-                      std::size_t row, const ScalarRegistry* scalars, const ExternRegistry* externs,
-                      std::string_view callee) -> std::expected<ExternArgs, std::string> {
-    ExternArgs args;
-    args.reserve(exprs.size() - begin);
-    for (std::size_t i = begin; i < exprs.size(); ++i) {
-        auto value = eval_expr(*exprs[i], input, row, scalars, externs);
-        if (!value) {
+        auto value = evaluate_scalar_expr(arg, scalars, externs);
+        if (!value.has_value()) {
             return std::unexpected(std::move(value.error()));
         }
-        auto scalar = scalar_from_expr(*value);
-        if (!scalar) {
-            return std::unexpected(std::string(callee) + ": null argument in extern function call");
+        if (is_null_scalar(*value)) {
+            return std::unexpected("null argument in extern function call");
         }
-        args.push_back(std::move(*scalar));
+        args.push_back(std::move(*value));
     }
     return args;
 }
 
-auto eval_extern_table_expr(const ir::Expr& expr, const Table& input, std::size_t row,
-                            const ScalarRegistry* scalars, const ExternRegistry* externs)
+// The argument columns of an extern call over a field's rows, from `begin`.
+auto eval_arg_columns(const std::vector<ir::ExprPtr>& exprs, std::size_t begin, const Table& input,
+                      RowRange range, const ColumnEvalCtx& ctx)
+    -> std::expected<std::vector<ColResult>, std::string> {
+    std::vector<ColResult> columns;
+    columns.reserve(exprs.size() - std::min(begin, exprs.size()));
+    for (std::size_t i = begin; i < exprs.size(); ++i) {
+        auto column = eval_value_vec(*exprs[i], input, ctx.scalars, range, ctx.window,
+                                     ctx.window_aligned, ctx.externs);
+        if (!column) {
+            return std::unexpected(std::move(column.error()));
+        }
+        columns.push_back(std::move(*column));
+    }
+    return columns;
+}
+
+// Row `row`'s arguments, read from their columns.
+auto row_args(const std::vector<ColResult>& columns, std::size_t row, std::string_view callee)
+    -> std::expected<ExternArgs, std::string> {
+    ExternArgs args;
+    args.reserve(columns.size());
+    for (const auto& column : columns) {
+        auto value = scalar_from_expr(cell_value(column, row));
+        if (!value.has_value()) {
+            return std::unexpected(std::string(callee) + ": null argument in extern function call");
+        }
+        args.push_back(std::move(*value));
+    }
+    return args;
+}
+
+// A table-producing extern call, as a consumer's table argument.
+auto call_table_extern(const ExternFunction& fn, const std::string& callee, const ExternArgs& args)
     -> std::expected<Table, std::string> {
-    const auto* call = std::get_if<ir::CallExpr>(&expr.node);
-    if (call == nullptr) {
-        return std::unexpected("table argument to an extern consumer must be an extern call");
-    }
-    const auto* fn = externs->find(call->callee);
-    if (fn == nullptr) {
-        return std::unexpected("unknown extern function: " + call->callee);
-    }
-    if (fn->kind != ExternReturnKind::Table || fn->first_arg_is_table) {
-        return std::unexpected("function does not produce a table: " + call->callee);
-    }
-    auto args = eval_extern_args(call->args, 0, input, row, scalars, externs, call->callee);
-    if (!args) {
-        return std::unexpected(std::move(args.error()));
-    }
-    if (fn->chunked_table_func) {
-        auto source = fn->chunked_table_func(*args);
+    if (fn.chunked_table_func) {
+        auto source = fn.chunked_table_func(args);
         if (source) {
             return materialize_operator(std::move(*source));
         }
     }
-    if (!fn->func) {
+    if (!fn.func) {
         return std::unexpected("extern table function has no materializing implementation: " +
-                               call->callee);
+                               callee);
     }
-    auto result = fn->func(*args);
+    auto result = fn.func(args);
     if (!result) {
         return std::unexpected(std::move(result.error()));
     }
@@ -111,60 +108,92 @@ auto eval_extern_table_expr(const ir::Expr& expr, const Table& input, std::size_
         return std::move(*table);
     }
     return std::unexpected(
-        "extern function returned a non-table value where a table was required: " + call->callee);
+        "extern function returned a non-table value where a table was required: " + callee);
 }
 
 }  // namespace
 
-auto eval_extern_expr(const ir::CallExpr& call, const Table& input, std::size_t row,
-                      const ScalarRegistry* scalars, const ExternRegistry* externs)
-    -> std::expected<ExprValue, std::string> {
-    if (externs == nullptr) {
+auto eval_extern_values(const ir::CallExpr& call, const Table& input, RowRange range,
+                        const ColumnEvalCtx& ctx)
+    -> std::expected<std::vector<ExprValue>, std::string> {
+    if (ctx.externs == nullptr) {
         return std::unexpected("extern call with no registry: " + call.callee);
     }
-    const auto* fn = externs->find(call.callee);
+    const auto* fn = ctx.externs->find(call.callee);
     if (fn == nullptr) {
         return std::unexpected("unknown extern function: " + call.callee);
     }
     if (fn->kind != ExternReturnKind::Scalar) {
         return std::unexpected("function not usable in expression: " + call.callee);
     }
-
-    std::expected<ExternValue, std::string> result =
-        std::unexpected("extern function has no implementation: " + call.callee);
+    // A table first argument is itself an extern call producing a table, whose
+    // own arguments are read per row like the consumer's.
+    const ExternFunction* table_fn = nullptr;
+    const ir::CallExpr* table_call = nullptr;
+    std::vector<ColResult> table_args;
     if (fn->first_arg_is_table) {
         if (call.args.empty() || !fn->table_consumer_func) {
             return std::unexpected(call.callee + " requires a table first argument");
         }
-        auto table = eval_extern_table_expr(*call.args.front(), input, row, scalars, externs);
-        if (!table) {
-            return std::unexpected(std::move(table.error()));
+        table_call = std::get_if<ir::CallExpr>(&call.args.front()->node);
+        if (table_call == nullptr) {
+            return std::unexpected("table argument to an extern consumer must be an extern call");
         }
-        auto args = eval_extern_args(call.args, 1, input, row, scalars, externs, call.callee);
+        table_fn = ctx.externs->find(table_call->callee);
+        if (table_fn == nullptr) {
+            return std::unexpected("unknown extern function: " + table_call->callee);
+        }
+        if (table_fn->kind != ExternReturnKind::Table || table_fn->first_arg_is_table) {
+            return std::unexpected("function does not produce a table: " + table_call->callee);
+        }
+        auto columns = eval_arg_columns(table_call->args, 0, input, range, ctx);
+        if (!columns) {
+            return std::unexpected(std::move(columns.error()));
+        }
+        table_args = std::move(*columns);
+    } else if (!fn->func) {
+        return std::unexpected("extern scalar function has no implementation: " + call.callee);
+    }
+    auto columns = eval_arg_columns(call.args, fn->first_arg_is_table ? 1 : 0, input, range, ctx);
+    if (!columns) {
+        return std::unexpected(std::move(columns.error()));
+    }
+
+    std::vector<ExprValue> values;
+    values.reserve(range.count);
+    for (std::size_t row = 0; row < range.count; ++row) {
+        auto args = row_args(*columns, row, call.callee);
         if (!args) {
             return std::unexpected(std::move(args.error()));
         }
-        result = fn->table_consumer_func(*table, *args);
-    } else {
-        if (!fn->func) {
-            return std::unexpected("extern scalar function has no implementation: " + call.callee);
+        std::expected<ExternValue, std::string> result =
+            std::unexpected("extern function has no implementation: " + call.callee);
+        if (table_fn != nullptr) {
+            auto table_arguments = row_args(table_args, row, table_call->callee);
+            if (!table_arguments) {
+                return std::unexpected(std::move(table_arguments.error()));
+            }
+            auto table = call_table_extern(*table_fn, table_call->callee, *table_arguments);
+            if (!table) {
+                return std::unexpected(std::move(table.error()));
+            }
+            result = fn->table_consumer_func(*table, *args);
+        } else {
+            result = fn->func(*args);
         }
-        auto args = eval_extern_args(call.args, 0, input, row, scalars, externs, call.callee);
-        if (!args) {
-            return std::unexpected(std::move(args.error()));
+        if (!result) {
+            return std::unexpected(std::move(result.error()));
         }
-        result = fn->func(*args);
+        if (auto* scalar = std::get_if<ScalarValue>(&*result)) {
+            values.push_back(expr_from_scalar(*scalar));
+        } else if (std::holds_alternative<ResourcePtr>(*result)) {
+            return std::unexpected("a resource cannot be used in a query expression: " +
+                                   call.callee);
+        } else {
+            return std::unexpected("extern function returned table in expression: " + call.callee);
+        }
     }
-    if (!result) {
-        return std::unexpected(std::move(result.error()));
-    }
-    if (auto* scalar = std::get_if<ScalarValue>(&*result)) {
-        return expr_from_scalar(*scalar);
-    }
-    if (std::holds_alternative<ResourcePtr>(*result)) {
-        return std::unexpected("a resource cannot be used in a query expression: " + call.callee);
-    }
-    return std::unexpected("extern function returned table in expression: " + call.callee);
+    return values;
 }
 
 auto invoke_extern_call(const ir::ExternCallNode& ec, const ScalarRegistry* scalars,

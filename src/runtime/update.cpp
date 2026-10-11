@@ -1278,6 +1278,9 @@ auto try_fast_update_pminmax(const ir::Expr& expr, const Table& input, RowRange 
     if (!left || !right || left->kind != output_kind || right->kind != output_kind) {
         return std::nullopt;  // mixed int/double or non-numeric: generic path
     }
+    if (!left->is_column && !right->is_column) {
+        return std::nullopt;  // two scalars: nothing to vectorize, and no column to read
+    }
 
     auto run = [&](auto* dst, auto lp, auto ls, auto rp, auto rs) {
         using V = std::decay_t<decltype(ls)>;

@@ -3223,6 +3223,45 @@ TEST_CASE("a compiled program's scalar lets have the REPL's values",
     CHECK(std::get<NullScalar>(typed_scalars.at("y")).kind == runtime::ScalarKind::Double);
 }
 
+TEST_CASE("map fields are typed, row-local, and call externs in row order", "[interpreter][map]") {
+    runtime::TableRegistry registry;
+    runtime::Table table;
+    table.add_column("qty", Column<std::int64_t>{2, 3});
+    table.add_column("b", Column<bool>{true, false});
+    registry.emplace("t", table);
+
+    // The column type is the field's static type, not the arm a row took:
+    // an Int arm and a Float arm make a Float64 column.
+    auto typed =
+        runtime::interpret(*require_ir("t[map { y = case { b => qty, else => 1.5 } }];"), registry);
+    REQUIRE(typed.has_value());
+    const auto* y = std::get_if<Column<double>>(typed->find("y"));
+    REQUIRE(y != nullptr);
+    CHECK((*y)[0] == 2.0);
+    CHECK((*y)[1] == 1.5);
+
+    // A map field is evaluated per row; one that reads other rows is an error.
+    auto rolling = runtime::interpret(*require_ir("t[map { y = lag(qty, 1) }];"), registry);
+    REQUIRE_FALSE(rolling.has_value());
+    CHECK(rolling.error().find("per row") != std::string::npos);
+
+    // With an extern, rows run in order and, within a row, fields in order.
+    runtime::ExternRegistry externs;
+    std::vector<std::int64_t> seen;
+    externs.register_scalar("note", runtime::ScalarKind::Int,
+                            [&seen](const runtime::ExternArgs& args)
+                                -> std::expected<runtime::ExternValue, std::string> {
+                                const auto v = std::get<std::int64_t>(args[0]);
+                                seen.push_back(v);
+                                return runtime::ExternValue{runtime::ScalarValue{v}};
+                            });
+    auto ordered = runtime::interpret(*require_ir("extern fn note(x: Int) -> Int from \"n.hpp\";"
+                                                  " t[map { a = note(qty), z = note(qty * 10) }];"),
+                                      registry, nullptr, &externs);
+    REQUIRE(ordered.has_value());
+    CHECK(seen == std::vector<std::int64_t>{2, 20, 3, 30});
+}
+
 TEST_CASE("A case evaluates an arm only for the rows that take it", "[interpreter][case]") {
     // SPEC.md 2.6: arms are tried in order and evaluation stops at the first
     // true condition. Evaluated over columns, an arm runs over the rows that

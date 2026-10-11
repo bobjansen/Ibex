@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Bob Jansen
 
 // expr.cpp — expression evaluation: the row-wise scalar-builtin registry
-// (single source of truth for infer + eval), type inference, per-row eval,
-// per-field column evaluation, lag/lead/cum/fill/float-clean transforms,
+// (single source of truth for infer + eval), type inference, per-field column
+// evaluation (calls over columns), lag/lead/cum/fill/float-clean transforms,
 // and the RNG/rep column generators.
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
 
@@ -70,8 +70,9 @@ constexpr auto rng_func_returns_int(std::string_view name) -> bool;
 // A pure row-wise scalar function is a function of its already-evaluated
 // arguments — one value in each row maps to one value out. Both the
 // type-inference pass (`infer_expr_type`, which picks the output column type)
-// and the per-row evaluation pass (`eval_expr`, which computes each cell)
-// dispatch these functions through this single table. Previously each pass had
+// and the column evaluator (`eval_call_columns`, which applies the function to
+// each row of its argument columns) dispatch these functions through this
+// single table. Previously each pass had
 // its own hand-maintained switch, so functions could drift out of sync — casts,
 // ceil/floor/trunc, and round were usable at the REPL top level but missing
 // from `update`/`select`. Registering once here keeps both passes in lockstep.
@@ -124,7 +125,7 @@ auto parse_string_as_double(std::string_view s) -> std::optional<double> {
     return value;
 }
 
-auto expr_value_to_double(const ExprValue& v) -> std::optional<double> {
+auto expr_value_to_double(const ScalarValue& v) -> std::optional<double> {
     if (const auto* i = std::get_if<std::int64_t>(&v)) {
         return static_cast<double>(*i);
     }
@@ -144,7 +145,7 @@ auto expr_value_to_double(const ExprValue& v) -> std::optional<double> {
 // the table/REPL display formatting (floats via format_float_mixed, dates/
 // timestamps via their formatters) so an interpolated value reads the same as a
 // printed one.
-auto expr_value_to_string(const ExprValue& v) -> std::string {
+auto expr_value_to_string(const ScalarValue& v) -> std::string {
     if (const auto* s = std::get_if<std::string>(&v)) {
         return *s;
     }
@@ -172,8 +173,8 @@ auto expr_value_to_string(const ExprValue& v) -> std::string {
 namespace {
 
 // Extract a calendar/clock field from a Date or Timestamp value.
-auto eval_date_part(std::string_view name, const ExprValue& v)
-    -> std::expected<ExprValue, std::string> {
+auto eval_date_part(std::string_view name, const ScalarValue& v)
+    -> std::expected<ScalarValue, std::string> {
     using namespace std::chrono;
     const bool date_ok = (name == "year" || name == "month" || name == "day");
     if (const auto* dv = std::get_if<Date>(&v)) {
@@ -182,12 +183,12 @@ auto eval_date_part(std::string_view name, const ExprValue& v)
         }
         const year_month_day ymd{sys_days{days{dv->days}}};
         if (name == "year") {
-            return ExprValue{static_cast<std::int64_t>(static_cast<int>(ymd.year()))};
+            return ScalarValue{static_cast<std::int64_t>(static_cast<int>(ymd.year()))};
         }
         if (name == "month") {
-            return ExprValue{static_cast<std::int64_t>(static_cast<unsigned>(ymd.month()))};
+            return ScalarValue{static_cast<std::int64_t>(static_cast<unsigned>(ymd.month()))};
         }
-        return ExprValue{static_cast<std::int64_t>(static_cast<unsigned>(ymd.day()))};
+        return ScalarValue{static_cast<std::int64_t>(static_cast<unsigned>(ymd.day()))};
     }
     if (const auto* tv = std::get_if<Timestamp>(&v)) {
         const sys_time<nanoseconds> tp{nanoseconds{tv->nanos}};
@@ -195,21 +196,21 @@ auto eval_date_part(std::string_view name, const ExprValue& v)
         const year_month_day ymd{day_pt};
         const hh_mm_ss<nanoseconds> hms{tp - day_pt};
         if (name == "year") {
-            return ExprValue{static_cast<std::int64_t>(static_cast<int>(ymd.year()))};
+            return ScalarValue{static_cast<std::int64_t>(static_cast<int>(ymd.year()))};
         }
         if (name == "month") {
-            return ExprValue{static_cast<std::int64_t>(static_cast<unsigned>(ymd.month()))};
+            return ScalarValue{static_cast<std::int64_t>(static_cast<unsigned>(ymd.month()))};
         }
         if (name == "day") {
-            return ExprValue{static_cast<std::int64_t>(static_cast<unsigned>(ymd.day()))};
+            return ScalarValue{static_cast<std::int64_t>(static_cast<unsigned>(ymd.day()))};
         }
         if (name == "hour") {
-            return ExprValue{static_cast<std::int64_t>(hms.hours().count())};
+            return ScalarValue{static_cast<std::int64_t>(hms.hours().count())};
         }
         if (name == "minute") {
-            return ExprValue{static_cast<std::int64_t>(hms.minutes().count())};
+            return ScalarValue{static_cast<std::int64_t>(hms.minutes().count())};
         }
-        return ExprValue{static_cast<std::int64_t>(hms.seconds().count())};
+        return ScalarValue{static_cast<std::int64_t>(hms.seconds().count())};
     }
     return std::unexpected(std::string(name) + ": argument must be Date or Timestamp");
 }
@@ -479,7 +480,7 @@ auto resolve_like_arg(const ir::Expr& expr, const Table& input, const ScalarRegi
 
 // like(value, pattern) over whole columns: compile the pattern once, then scan.
 // The per-row registry eval is the semantic reference; this only avoids
-// re-compiling the pattern and copying every value into an ExprValue.
+// re-compiling the pattern and copying every value into an ScalarValue.
 auto like_kernel(const ir::CallExpr& call, const Table& input, std::size_t rows,
                  const ColumnEvalCtx& ctx) -> std::expected<ComputedColumn, std::string> {
     if (call.args.size() != 2) {
@@ -561,7 +562,7 @@ auto like_kernel(const ir::CallExpr& call, const Table& input, std::size_t rows,
 }
 
 // Int64/Int32/Int and Float64/Float32 over a bare column, literal, or lexical
-// scalar. The per-row eval boxes every cell into an ExprValue and re-runs the
+// scalar. The per-row eval boxes every cell into an ScalarValue and re-runs the
 // registry dispatch per row; the cast is an identity or widening loop. This is
 // the path `count(col)` takes — it lowers to `sum(Int64(col is not null))`,
 // whose bool column lands here after the boolean arm is materialized.
@@ -610,13 +611,15 @@ auto numeric_cast_kernel(const ir::CallExpr& call, const Table& input, std::size
                         return broadcast_cast_result(it->second, to_int, rows);
                     }
                     const auto& eval = std::get<ScalarExec>(find_builtin(call.callee)->exec).eval;
-                    auto value = eval(call.callee, {expr_from_scalar(it->second)});
+                    auto value = eval(call.callee, {it->second});
                     if (!value) {
                         return std::unexpected(value.error());
                     }
+                    // A null result is a null of the cast's type.
                     return broadcast_cast_result(
-                        scalar_from_expr(*value).value_or(
-                            ScalarValue{NullScalar{to_int ? ScalarKind::Int : ScalarKind::Double}}),
+                        is_null_scalar(*value)
+                            ? ScalarValue{NullScalar{to_int ? ScalarKind::Int : ScalarKind::Double}}
+                            : *value,
                         to_int, rows);
                 }
             }
@@ -626,13 +629,15 @@ auto numeric_cast_kernel(const ir::CallExpr& call, const Table& input, std::size
         // Literal argument: convert once, broadcast.
         const auto& lit = std::get<ir::Literal>(arg.node);
         const auto& eval = std::get<ScalarExec>(find_builtin(call.callee)->exec).eval;
-        auto value = eval(call.callee, {expr_from_scalar(scalar_from_literal(lit))});
+        auto value = eval(call.callee, {scalar_from_literal(lit)});
         if (!value) {
             return std::unexpected(value.error());
         }
-        return broadcast_cast_result(scalar_from_expr(*value).value_or(ScalarValue{NullScalar{
-                                         to_int ? ScalarKind::Int : ScalarKind::Double}}),
-                                     to_int, rows);
+        return broadcast_cast_result(
+            is_null_scalar(*value)
+                ? ScalarValue{NullScalar{to_int ? ScalarKind::Int : ScalarKind::Double}}
+                : *value,
+            to_int, rows);
     }
 
     const ValidityBitmap* validity = entry->validity.has_value() ? &*entry->validity : nullptr;
@@ -949,7 +954,7 @@ auto string_length_kernel(const ir::CallExpr& call, const Table& input, std::siz
 
 const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
     using IT = std::expected<ExprType, std::string>;
-    using IV = std::expected<ExprValue, std::string>;
+    using IV = std::expected<ScalarValue, std::string>;
     static const robin_hood::unordered_map<std::string_view, BuiltinFn> table = [] {
         robin_hood::unordered_map<std::string_view, BuiltinFn> m;
 
@@ -966,15 +971,15 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                           return std::unexpected("abs: argument must be numeric");
                       },
                       .exec = ScalarExec{.eval = [](std::string_view,
-                                                    const std::vector<ExprValue>& a) -> IV {
+                                                    const std::vector<ScalarValue>& a) -> IV {
                           if (const auto* i = std::get_if<std::int64_t>(a.data())) {
-                              return ExprValue{std::int64_t{std::abs(*i)}};
+                              return ScalarValue{std::int64_t{std::abs(*i)}};
                           }
                           if (const auto* d = std::get_if<double>(a.data())) {
-                              return ExprValue{std::abs(*d)};
+                              return ScalarValue{std::abs(*d)};
                           }
                           if (const auto* d = std::get_if<DecimalValue>(a.data())) {
-                              return ExprValue{DecimalValue{
+                              return ScalarValue{DecimalValue{
                                   .units = d->units < 0 ? -d->units : d->units, .type = d->type}};
                           }
                           return std::unexpected("abs: argument must be numeric");
@@ -994,12 +999,12 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                           return ExprType::String;
                       },
                       .exec = ScalarExec{.eval = [](std::string_view,
-                                                    const std::vector<ExprValue>& a) -> IV {
+                                                    const std::vector<ScalarValue>& a) -> IV {
                           std::string out;
                           for (const auto& v : a) {
                               out += expr_value_to_string(v);
                           }
-                          return ExprValue{std::move(out)};
+                          return ScalarValue{std::move(out)};
                       }},
                   });
 
@@ -1014,39 +1019,39 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                 return std::unexpected(std::string(name) + ": argument must be numeric");
             },
             .exec = ScalarExec{.eval = [](std::string_view name,
-                                          const std::vector<ExprValue>& a) -> IV {
+                                          const std::vector<ScalarValue>& a) -> IV {
                 auto x = expr_value_to_double(a[0]);
                 if (!x) {
                     return std::unexpected(std::string(name) + ": argument must be numeric");
                 }
                 const double v = *x;
                 if (name == "sqrt")
-                    return ExprValue{std::sqrt(v)};
+                    return ScalarValue{std::sqrt(v)};
                 if (name == "log")
-                    return ExprValue{std::log(v)};
+                    return ScalarValue{std::log(v)};
                 if (name == "log2")
-                    return ExprValue{std::log2(v)};
+                    return ScalarValue{std::log2(v)};
                 if (name == "log10")
-                    return ExprValue{std::log10(v)};
+                    return ScalarValue{std::log10(v)};
                 if (name == "exp")
-                    return ExprValue{std::exp(v)};
+                    return ScalarValue{std::exp(v)};
                 if (name == "sin")
-                    return ExprValue{std::sin(v)};
+                    return ScalarValue{std::sin(v)};
                 if (name == "cos")
-                    return ExprValue{std::cos(v)};
+                    return ScalarValue{std::cos(v)};
                 if (name == "tan")
-                    return ExprValue{std::tan(v)};
+                    return ScalarValue{std::tan(v)};
                 if (name == "asin")
-                    return ExprValue{std::asin(v)};
+                    return ScalarValue{std::asin(v)};
                 if (name == "acos")
-                    return ExprValue{std::acos(v)};
+                    return ScalarValue{std::acos(v)};
                 if (name == "atan")
-                    return ExprValue{std::atan(v)};
+                    return ScalarValue{std::atan(v)};
                 if (name == "sinh")
-                    return ExprValue{std::sinh(v)};
+                    return ScalarValue{std::sinh(v)};
                 if (name == "cosh")
-                    return ExprValue{std::cosh(v)};
-                return ExprValue{std::tanh(v)};  // tanh
+                    return ScalarValue{std::cosh(v)};
+                return ScalarValue{std::tanh(v)};  // tanh
             }},
         };
         for (const auto* fn : {
@@ -1081,18 +1086,18 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                 return std::unexpected(std::string(name) + ": argument must be numeric");
             },
             .exec = ScalarExec{.eval = [](std::string_view name,
-                                          const std::vector<ExprValue>& a) -> IV {
+                                          const std::vector<ScalarValue>& a) -> IV {
                 if (std::holds_alternative<std::int64_t>(a[0])) {
                     return a[0];
                 }
                 if (const auto* d = std::get_if<double>(a.data())) {
                     if (name == "ceil") {
-                        return ExprValue{std::ceil(*d)};
+                        return ScalarValue{std::ceil(*d)};
                     }
                     if (name == "floor") {
-                        return ExprValue{std::floor(*d)};
+                        return ScalarValue{std::floor(*d)};
                     }
-                    return ExprValue{std::trunc(*d)};
+                    return ScalarValue{std::trunc(*d)};
                 }
                 return std::unexpected(std::string(name) + ": argument must be numeric");
             }},
@@ -1115,21 +1120,22 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                 }
                 return std::unexpected(std::string(name) + "(): cannot cast non-numeric to Float");
             },
-            .exec = ScalarExec{.eval = [](std::string_view, const std::vector<ExprValue>& a) -> IV {
-                if (const auto* dv = std::get_if<DecimalValue>(a.data())) {
-                    return ExprValue{decimal::to_double(dv->units, dv->type.scale)};
-                }
-                if (const auto* s = std::get_if<std::string>(a.data())) {
-                    if (auto d = parse_string_as_double(*s)) {
-                        return ExprValue{*d};
+            .exec =
+                ScalarExec{.eval = [](std::string_view, const std::vector<ScalarValue>& a) -> IV {
+                    if (const auto* dv = std::get_if<DecimalValue>(a.data())) {
+                        return ScalarValue{decimal::to_double(dv->units, dv->type.scale)};
                     }
-                    return std::unexpected("Float64(): cannot parse '" + *s + "' as a number");
-                }
-                if (auto d = expr_value_to_double(a[0])) {
-                    return ExprValue{*d};
-                }
-                return std::unexpected("cast: cannot cast non-numeric to Float");
-            }},
+                    if (const auto* s = std::get_if<std::string>(a.data())) {
+                        if (auto d = parse_string_as_double(*s)) {
+                            return ScalarValue{*d};
+                        }
+                        return std::unexpected("Float64(): cannot parse '" + *s + "' as a number");
+                    }
+                    if (auto d = expr_value_to_double(a[0])) {
+                        return ScalarValue{*d};
+                    }
+                    return std::unexpected("cast: cannot cast non-numeric to Float");
+                }},
         };
         m.emplace("Float64", to_float);
         m.emplace("Float32", to_float);
@@ -1152,9 +1158,9 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                 return std::unexpected(std::string(name) + "(): cannot cast non-numeric to Int");
             },
             .exec = ScalarExec{.eval = [](std::string_view name,
-                                          const std::vector<ExprValue>& a) -> IV {
+                                          const std::vector<ScalarValue>& a) -> IV {
                 if (const auto* i = std::get_if<std::int64_t>(a.data())) {
-                    return ExprValue{*i};
+                    return ScalarValue{*i};
                 }
                 if (const auto* dv = std::get_if<DecimalValue>(a.data())) {
                     auto whole = decimal::to_int64(dv->units, dv->type.scale);
@@ -1162,10 +1168,10 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                         return std::unexpected(std::string(name) + "(): " + whole.error() +
                                                " (use Decimal(x, p, 0) to round first)");
                     }
-                    return ExprValue{*whole};
+                    return ScalarValue{*whole};
                 }
                 if (const auto* b = std::get_if<bool>(a.data())) {
-                    return ExprValue{static_cast<std::int64_t>(*b ? 1 : 0)};
+                    return ScalarValue{static_cast<std::int64_t>(*b ? 1 : 0)};
                 }
                 if (const auto* d = std::get_if<double>(a.data())) {
                     if (*d != std::trunc(*d)) {
@@ -1173,11 +1179,11 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                                                "(): cannot cast non-integer Float to Int (use "
                                                "floor(), ceil(), or round())");
                     }
-                    return ExprValue{static_cast<std::int64_t>(*d)};
+                    return ScalarValue{static_cast<std::int64_t>(*d)};
                 }
                 if (const auto* s = std::get_if<std::string>(a.data())) {
                     if (auto parsed = parse_string_as_int(*s)) {
-                        return ExprValue{*parsed};
+                        return ScalarValue{*parsed};
                     }
                     return std::unexpected(std::string(name) + "(): cannot parse '" + *s +
                                            "' as an integer");
@@ -1211,34 +1217,34 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                         "Decimal(): cannot cast to Decimal (expected Int, Float, String, or "
                         "Decimal)");
                 },
-                .exec =
-                    ScalarExec{.eval = [](std::string_view, const std::vector<ExprValue>& a) -> IV {
-                        const auto* p = std::get_if<std::int64_t>(&a[1]);
-                        const auto* s = std::get_if<std::int64_t>(&a[2]);
-                        if (p == nullptr || s == nullptr || *p < 1 || *p > decimal::kMaxPrecision ||
-                            *s < 0 || *s > *p) {
-                            return std::unexpected("Decimal(x, precision, scale): invalid type");
-                        }
-                        const DecimalType t{.precision = static_cast<std::uint8_t>(*p),
-                                            .scale = static_cast<std::uint8_t>(*s)};
-                        std::expected<Int128, std::string> units =
-                            std::unexpected("Decimal(): cannot cast to Decimal");
-                        if (const auto* str = std::get_if<std::string>(a.data())) {
-                            units = decimal::parse(*str, t);
-                            if (!units) {
-                                return std::unexpected("Decimal(): cannot parse '" + *str +
-                                                       "': " + units.error());
-                            }
-                        } else if (const auto* f = std::get_if<double>(a.data())) {
-                            units = decimal::from_double(*f, t);
-                        } else {
-                            units = fit_decimal(a[0], t);
-                        }
+                .exec = ScalarExec{.eval = [](std::string_view,
+                                              const std::vector<ScalarValue>& a) -> IV {
+                    const auto* p = std::get_if<std::int64_t>(&a[1]);
+                    const auto* s = std::get_if<std::int64_t>(&a[2]);
+                    if (p == nullptr || s == nullptr || *p < 1 || *p > decimal::kMaxPrecision ||
+                        *s < 0 || *s > *p) {
+                        return std::unexpected("Decimal(x, precision, scale): invalid type");
+                    }
+                    const DecimalType t{.precision = static_cast<std::uint8_t>(*p),
+                                        .scale = static_cast<std::uint8_t>(*s)};
+                    std::expected<Int128, std::string> units =
+                        std::unexpected("Decimal(): cannot cast to Decimal");
+                    if (const auto* str = std::get_if<std::string>(a.data())) {
+                        units = decimal::parse(*str, t);
                         if (!units) {
-                            return std::unexpected("Decimal(): " + units.error());
+                            return std::unexpected("Decimal(): cannot parse '" + *str +
+                                                   "': " + units.error());
                         }
-                        return ExprValue{DecimalValue{.units = *units, .type = t}};
-                    }},
+                    } else if (const auto* f = std::get_if<double>(a.data())) {
+                        units = decimal::from_double(*f, t);
+                    } else {
+                        units = fit_decimal(a[0], t);
+                    }
+                    if (!units) {
+                        return std::unexpected("Decimal(): " + units.error());
+                    }
+                    return ScalarValue{DecimalValue{.units = *units, .type = t}};
+                }},
             });
 
         // year / month / day / hour / minute / second: Date|Timestamp -> Int.
@@ -1254,7 +1260,7 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                                        (date_ok ? ": argument must be Date or Timestamp"
                                                 : ": argument must be Timestamp"));
             },
-            .exec = ScalarExec{.eval = [](std::string_view name, const std::vector<ExprValue>& a)
+            .exec = ScalarExec{.eval = [](std::string_view name, const std::vector<ScalarValue>& a)
                                    -> IV { return eval_date_part(name, a[0]); }},
         };
         m.emplace("year", date_part);
@@ -1283,19 +1289,19 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                                            "Int days since the epoch)");
                 },
                 .exec = ScalarExec{.eval = [](std::string_view name,
-                                              const std::vector<ExprValue>& a) -> IV {
+                                              const std::vector<ScalarValue>& a) -> IV {
                     if (const auto* ts = std::get_if<Timestamp>(a.data())) {
-                        return ExprValue{timestamp_to_date(*ts)};
+                        return ScalarValue{timestamp_to_date(*ts)};
                     }
                     if (const auto* d = std::get_if<Date>(a.data())) {
-                        return ExprValue{*d};
+                        return ScalarValue{*d};
                     }
                     if (const auto* i = std::get_if<std::int64_t>(a.data())) {
                         if (*i < std::numeric_limits<std::int32_t>::min() ||
                             *i > std::numeric_limits<std::int32_t>::max()) {
                             return std::unexpected(std::string(name) + "(): date out of range");
                         }
-                        return ExprValue{Date{static_cast<std::int32_t>(*i)}};
+                        return ScalarValue{Date{static_cast<std::int32_t>(*i)}};
                     }
                     return std::unexpected(std::string(name) + "(): cannot cast to Date");
                 }},
@@ -1313,9 +1319,9 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                           return std::unexpected("is_nan: argument must be Float64");
                       },
                       .exec = ScalarExec{.eval = [](std::string_view,
-                                                    const std::vector<ExprValue>& a) -> IV {
+                                                    const std::vector<ScalarValue>& a) -> IV {
                           if (const auto* d = std::get_if<double>(a.data())) {
-                              return ExprValue{std::isnan(*d)};
+                              return ScalarValue{std::isnan(*d)};
                           }
                           return std::unexpected("is_nan: argument must be Float64");
                       }},
@@ -1325,30 +1331,31 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
         // column kernel (compile the pattern once, scan) is the fast path for
         // the bare column-and-literal form; this eval is the semantic reference
         // and handles computed arguments.
-        m.emplace("like", BuiltinFn{
-                              .min_args = 2,
-                              .max_args = 2,
-                              .scalar_kernel = ScalarKernel::Like,
-                              .infer = [](std::string_view, const std::vector<ExprType>& a) -> IT {
-                                  if (a[0] != ExprType::String || a[1] != ExprType::String) {
-                                      return std::unexpected("like: both arguments must be String");
-                                  }
-                                  return ExprType::Bool;
-                              },
-                              .exec = ScalarExec{.eval = [](std::string_view,
-                                                            const std::vector<ExprValue>& a) -> IV {
-                                  const auto* value = std::get_if<std::string>(a.data());
-                                  const auto* pattern = std::get_if<std::string>(&a[1]);
-                                  if (value == nullptr || pattern == nullptr) {
-                                      return std::unexpected("like: both arguments must be String");
-                                  }
-                                  auto compiled = compile_like_pattern(*pattern);
-                                  if (!compiled) {
-                                      return std::unexpected(compiled.error());
-                                  }
-                                  return ExprValue{like_match(*compiled, *value)};
-                              }},
-                          });
+        m.emplace("like",
+                  BuiltinFn{
+                      .min_args = 2,
+                      .max_args = 2,
+                      .scalar_kernel = ScalarKernel::Like,
+                      .infer = [](std::string_view, const std::vector<ExprType>& a) -> IT {
+                          if (a[0] != ExprType::String || a[1] != ExprType::String) {
+                              return std::unexpected("like: both arguments must be String");
+                          }
+                          return ExprType::Bool;
+                      },
+                      .exec = ScalarExec{.eval = [](std::string_view,
+                                                    const std::vector<ScalarValue>& a) -> IV {
+                          const auto* value = std::get_if<std::string>(a.data());
+                          const auto* pattern = std::get_if<std::string>(&a[1]);
+                          if (value == nullptr || pattern == nullptr) {
+                              return std::unexpected("like: both arguments must be String");
+                          }
+                          auto compiled = compile_like_pattern(*pattern);
+                          if (!compiled) {
+                              return std::unexpected(compiled.error());
+                          }
+                          return ScalarValue{like_match(*compiled, *value)};
+                      }},
+                  });
 
         // substring(s, start[, length]): a Unicode-codepoint slice with Polars
         // `str.slice` semantics — start is 0-based and may be negative (from the
@@ -1370,7 +1377,7 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                           return ExprType::String;
                       },
                       .exec = ScalarExec{.eval = [](std::string_view,
-                                                    const std::vector<ExprValue>& a) -> IV {
+                                                    const std::vector<ScalarValue>& a) -> IV {
                           const auto* value = std::get_if<std::string>(a.data());
                           const auto* start = std::get_if<std::int64_t>(&a[1]);
                           if (value == nullptr || start == nullptr) {
@@ -1384,7 +1391,7 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                               }
                               length = *len;
                           }
-                          return ExprValue{utf8_substring(*value, *start, length)};
+                          return ScalarValue{utf8_substring(*value, *start, length)};
                       }},
                   });
 
@@ -1403,16 +1410,16 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                               return ExprType::Int;
                           },
                           .exec = ScalarExec{.eval = [](std::string_view function_name,
-                                                        const std::vector<ExprValue>& a) -> IV {
+                                                        const std::vector<ScalarValue>& a) -> IV {
                               const auto* value = std::get_if<std::string>(a.data());
                               if (value == nullptr) {
                                   return std::unexpected(std::string(function_name) +
                                                          ": argument must be String");
                               }
                               if (function_name == "byte_length") {
-                                  return ExprValue{static_cast<std::int64_t>(value->size())};
+                                  return ScalarValue{static_cast<std::int64_t>(value->size())};
                               }
-                              return ExprValue{utf8_codepoint_count(*value)};
+                              return ScalarValue{utf8_codepoint_count(*value)};
                           }},
                       });
         }
@@ -1446,11 +1453,11 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                 return *result;
             },
             .exec = ScalarExec{.eval = [](std::string_view name,
-                                          const std::vector<ExprValue>& a) -> IV {
+                                          const std::vector<ScalarValue>& a) -> IV {
                 const bool want_min = (name == "pmin");
-                auto better = [&](const ExprValue& cand,
-                                  const ExprValue& best) -> std::expected<bool, std::string> {
-                    auto num = [](const ExprValue& v) -> std::optional<double> {
+                auto better = [&](const ScalarValue& cand,
+                                  const ScalarValue& best) -> std::expected<bool, std::string> {
+                    auto num = [](const ScalarValue& v) -> std::optional<double> {
                         return expr_value_to_double(v);
                     };
                     if (auto c = num(cand)) {
@@ -1478,7 +1485,7 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                     return std::unexpected(std::string(name) +
                                            ": arguments must all be comparable and of one type");
                 };
-                ExprValue best = a[0];
+                ScalarValue best = a[0];
                 if (std::holds_alternative<bool>(best)) {
                     return std::unexpected(std::string(name) +
                                            ": Bool arguments are not supported");
@@ -1711,39 +1718,39 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                   });
         m.emplace("fill_backward", m.at("fill_forward"));
 
-        // ── Null-handling scalars (plans/exprvalue-null-arm-plan.md, stage
-        // 3): row-local functions whose *purpose* is null, so their per-row
-        // eval opts into receiving Null (NullPolicy::Handles) instead of the
+        // ── Null-handling scalars: row-local functions whose *purpose* is
+        // null, so their per-row eval opts into receiving a null
+        // (NullPolicy::Handles) instead of the
         // central propagation. Each keeps its column kernel as a whole-column
         // fast path for the top-level bare form; the per-row eval is the
         // general form and the semantic reference — the two must agree.
-        m.emplace(
-            "fill_null",
-            BuiltinFn{
-                .min_args = 0,
-                .max_args = -1,
-                .null_policy = NullPolicy::Handles,
-                .scalar_kernel = ScalarKernel::FillNull,
-                .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
-                    if (a.size() != 2) {
-                        return std::unexpected(std::string(name) +
-                                               ": expected 2 arguments (col, value)");
-                    }
-                    const bool numeric_widen = a[0] == ExprType::Double && a[1] == ExprType::Int;
-                    if (a[1] != a[0] && !numeric_widen) {
-                        return std::unexpected(std::string(name) +
-                                               ": fill value must match the column type");
-                    }
-                    return a[0];
-                },
-                .exec =
-                    ScalarExec{.eval = [](std::string_view, const std::vector<ExprValue>& a) -> IV {
-                        if (std::holds_alternative<Null>(a[0])) {
-                            return a[1];
-                        }
-                        return a[0];
-                    }},
-            });
+        m.emplace("fill_null",
+                  BuiltinFn{
+                      .min_args = 0,
+                      .max_args = -1,
+                      .null_policy = NullPolicy::Handles,
+                      .scalar_kernel = ScalarKernel::FillNull,
+                      .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+                          if (a.size() != 2) {
+                              return std::unexpected(std::string(name) +
+                                                     ": expected 2 arguments (col, value)");
+                          }
+                          const bool numeric_widen =
+                              a[0] == ExprType::Double && a[1] == ExprType::Int;
+                          if (a[1] != a[0] && !numeric_widen) {
+                              return std::unexpected(std::string(name) +
+                                                     ": fill value must match the column type");
+                          }
+                          return a[0];
+                      },
+                      .exec = ScalarExec{.eval = [](std::string_view,
+                                                    const std::vector<ScalarValue>& a) -> IV {
+                          if (std::holds_alternative<NullScalar>(a[0])) {
+                              return a[1];
+                          }
+                          return a[0];
+                      }},
+                  });
 
         m.emplace(
             "null_if_nan",
@@ -1762,9 +1769,9 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                     return ExprType::Double;
                 },
                 .exec = ScalarExec{.eval = [](std::string_view name,
-                                              const std::vector<ExprValue>& a) -> IV {
-                    if (std::holds_alternative<Null>(a[0])) {
-                        return ExprValue{Null{}};  // already null: stays null
+                                              const std::vector<ScalarValue>& a) -> IV {
+                    if (std::holds_alternative<NullScalar>(a[0])) {
+                        return a[0];  // already null: stays null
                     }
                     const auto* d = std::get_if<double>(a.data());
                     if (d == nullptr) {
@@ -1772,7 +1779,7 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                     }
                     const bool to_null =
                         name == "null_if_nan" ? std::isnan(*d) : !std::isfinite(*d);
-                    return to_null ? ExprValue{Null{}} : a[0];
+                    return to_null ? ScalarValue{NullScalar{ScalarKind::Double}} : a[0];
                 }},
             });
         m.emplace("null_if_not_finite", m.at("null_if_nan"));
@@ -1801,13 +1808,13 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                           return categorical ? ExprType::Categorical : a[0];
                       },
                       .exec = ScalarExec{.eval = [](std::string_view,
-                                                    const std::vector<ExprValue>& a) -> IV {
+                                                    const std::vector<ScalarValue>& a) -> IV {
                           for (const auto& v : a) {
-                              if (!std::holds_alternative<Null>(v)) {
+                              if (!std::holds_alternative<NullScalar>(v)) {
                                   return v;
                               }
                           }
-                          return ExprValue{Null{}};  // every argument null
+                          return a.back();  // every argument null
                       }},
                   });
 
@@ -2059,8 +2066,8 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
     if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
         // Visited rather than tested alternative by alternative: a literal
         // arm that falls through to String allocates a String column for a
-        // `date"..."`/`ts"..."` value that `eval_expr` then hands back as a
-        // Date/Timestamp, which trips eval_expr_column's invariant. An
+        // `date"..."`/`ts"..."` value that evaluation then hands back as a
+        // Date/Timestamp, which the column append rejects. An
         // exhaustive visit makes a new Literal alternative a compile error
         // instead.
         return std::visit(
@@ -2202,7 +2209,7 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
             return categorical_result ? ExprType::Categorical : *result;
         }
         // Pure row-wise scalar builtins: single source of truth (see
-        // builtins()). Both this pass and eval_expr dispatch here.
+        // builtins()). Both this pass and eval_call_columns dispatch here.
         if (auto it = builtins().find(call->callee); it != builtins().end()) {
             const auto& fn = it->second;
             const auto argc = static_cast<int>(call->args.size());
@@ -2440,13 +2447,13 @@ auto evaluate_row_count_expr_impl(const ir::Expr& expr, const ScalarRegistry* sc
 // the function applied element by element into a column of the call's type.
 // Nulls are validity bits throughout.
 
-auto cell_value(const ColResult& arg, std::size_t i) -> ExprValue {
+auto cell_value(const ColResult& arg, std::size_t i) -> ScalarValue {
     const std::size_t at = arg.offset + i;
     if (const auto* validity = arg.get_validity(); validity != nullptr && !(*validity)[at]) {
-        return Null{};
+        return ScalarValue{null_of_column(deref_col(arg))};
     }
     return std::visit(
-        [&](const auto& column) -> ExprValue {
+        [&](const auto& column) -> ScalarValue {
             using ColType = std::decay_t<decltype(column)>;
             if constexpr (std::is_same_v<ColType, Column<Categorical>> ||
                           std::is_same_v<ColType, Column<std::string>>) {
@@ -2563,7 +2570,8 @@ void append_null(ColumnValue& column) {
 
 // Append a present value to a column of the field's type (Int widens to
 // Float, a Decimal is fitted to the column's precision and scale).
-auto append_value(ColumnValue& column, const ExprValue& value) -> std::expected<void, std::string> {
+auto append_value(ColumnValue& column, const ScalarValue& value)
+    -> std::expected<void, std::string> {
     // Fitting a value to the column's Decimal(p, s) can overflow, which is a
     // query error -- so it is handled here, where one can be returned.
     if (auto* dec_col = std::get_if<Column<Decimal>>(&column)) {
@@ -2607,7 +2615,7 @@ auto append_value(ColumnValue& column, const ExprValue& value) -> std::expected<
                 }
             } else if constexpr (std::is_same_v<ValueType, std::string_view>) {
                 // Column<std::string>::value_type is std::string_view; the
-                // ExprValue holds an owned std::string, which push_back copies
+                // ScalarValue holds an owned std::string, which push_back copies
                 // into the column's arena.
                 if (const auto* v = std::get_if<std::string>(&value)) {
                     col.push_back(*v);
@@ -2727,7 +2735,8 @@ auto eval_case_columns(const ir::CallExpr& call, const ir::Expr& expr, const Tab
             // A null condition does not match (three-valued logic).
             if (const auto* matched = std::get_if<bool>(&value); matched != nullptr && *matched) {
                 arm_of[open[p]] = arm;
-            } else if (std::holds_alternative<bool>(value) || std::holds_alternative<Null>(value)) {
+            } else if (std::holds_alternative<bool>(value) ||
+                       std::holds_alternative<NullScalar>(value)) {
                 still_open.push_back(open[p]);
             } else {
                 return std::unexpected("case: each condition must evaluate to Bool");
@@ -2763,12 +2772,14 @@ auto eval_case_columns(const ir::CallExpr& call, const ir::Expr& expr, const Tab
     std::visit([&](auto& col) { col.reserve(n); }, *column);
     ValidityBitmap validity(n, true);
     bool any_null = false;
+    // A NULL arm, or an arm no row took: a null of the case's type.
+    const ScalarValue case_null{null_of_column(*column)};
     for (std::size_t row = 0; row < n; ++row) {
         const auto& taken = values[arm_of[row]];
-        const ExprValue value = taken.has_value()
-                                    ? cell_value(taken->column, taken->by_row ? row : position[row])
-                                    : ExprValue{Null{}};
-        if (std::holds_alternative<Null>(value)) {
+        const ScalarValue value =
+            taken.has_value() ? cell_value(taken->column, taken->by_row ? row : position[row])
+                              : case_null;
+        if (std::holds_alternative<NullScalar>(value)) {
             append_null(*column);
             validity.set(row, false);
             any_null = true;
@@ -2798,7 +2809,7 @@ auto eval_call_columns(const ir::CallExpr& call, const ir::Expr& expr, const Tab
     }
     std::optional<RoundMode> mode;
     // An extern is called per row, in order, over its argument columns.
-    std::optional<std::vector<ExprValue>> extern_values;
+    std::optional<std::vector<ScalarValue>> extern_values;
     if (scalar_exec != nullptr) {
         const auto argc = static_cast<int>(call.args.size());
         if (argc < entry->min_args || (entry->max_args >= 0 && argc > entry->max_args)) {
@@ -2843,28 +2854,32 @@ auto eval_call_columns(const ir::CallExpr& call, const ir::Expr& expr, const Tab
         }
         args.emplace_back(std::move(*column));
     }
-    const auto arg_at = [&](std::size_t a, std::size_t row) -> ExprValue {
-        return args[a].has_value() ? cell_value(*args[a], row) : ExprValue{Null{}};
-    };
-
     auto column = typed_column_for(type, expr, input, ctx.scalars);
     if (!column) {
         return std::unexpected(column.error());
     }
     std::visit([&](auto& col) { col.reserve(n); }, *column);
+    // A null of the call's type: what a bare NULL argument is, and the result
+    // until the function says otherwise.
+    const ScalarValue call_null{null_of_column(*column)};
+    const auto arg_at = [&](std::size_t a, std::size_t row) -> ScalarValue {
+        return args[a].has_value() ? cell_value(*args[a], row) : call_null;
+    };
     ValidityBitmap validity(n, true);
     bool any_null = false;
-    std::vector<ExprValue> row_args(call.args.size());
+    std::vector<ScalarValue> row_args;
+    row_args.reserve(call.args.size());
     for (std::size_t row = 0; row < n; ++row) {
-        std::expected<ExprValue, std::string> value = ExprValue{Null{}};
+        std::expected<ScalarValue, std::string> value = call_null;
         if (scalar_exec != nullptr) {
             // NullPolicy::Propagate, applied centrally: a null argument nulls
             // the call, so `eval` never sees one. Handles entries (coalesce,
             // fill_null, null_if_*) receive the null and decide.
             bool null_argument = false;
+            row_args.clear();
             for (std::size_t a = 0; a < call.args.size(); ++a) {
-                row_args[a] = arg_at(a, row);
-                null_argument = null_argument || std::holds_alternative<Null>(row_args[a]);
+                row_args.push_back(arg_at(a, row));
+                null_argument = null_argument || is_null_scalar(row_args.back());
             }
             if (!null_argument || entry->null_policy != NullPolicy::Propagate) {
                 value = scalar_exec->eval(call.callee, row_args);
@@ -2876,15 +2891,15 @@ auto eval_call_columns(const ir::CallExpr& call, const ir::Expr& expr, const Tab
                 if (!rounded) {
                     return std::unexpected(rounded.error());
                 }
-                value = ExprValue{*rounded};
+                value = ScalarValue{*rounded};
             } else if (const auto* integer = std::get_if<std::int64_t>(&x)) {
-                value = ExprValue{*integer};
-            } else if (!std::holds_alternative<Null>(x)) {
+                value = ScalarValue{*integer};
+            } else if (!std::holds_alternative<NullScalar>(x)) {
                 auto d = expr_value_to_double(x);
                 if (!d) {
                     return std::unexpected("round: first argument must be numeric");
                 }
-                value = ExprValue{apply_round(*d, *mode)};
+                value = ScalarValue{apply_round(*d, *mode)};
             }
         } else {
             value = std::move((*extern_values)[row]);
@@ -2892,7 +2907,7 @@ auto eval_call_columns(const ir::CallExpr& call, const ir::Expr& expr, const Tab
         if (!value) {
             return std::unexpected(value.error());
         }
-        if (std::holds_alternative<Null>(*value)) {
+        if (std::holds_alternative<NullScalar>(*value)) {
             append_null(*column);
             validity.set(row, false);
             any_null = true;
@@ -3368,8 +3383,7 @@ auto eval_fill_null(const ir::CallExpr& call, const Table& input)
                 // Decimal(p, s): the fill must not change the column's type.
                 if (std::holds_alternative<DecimalValue>(fill_lit->value) ||
                     std::holds_alternative<std::int64_t>(fill_lit->value)) {
-                    auto units = fit_decimal(expr_from_scalar(scalar_from_literal(*fill_lit)),
-                                             decimal_type_of(col));
+                    auto units = fit_decimal(scalar_from_literal(*fill_lit), decimal_type_of(col));
                     if (!units) {
                         return std::unexpected("fill_null: " + units.error());
                     }

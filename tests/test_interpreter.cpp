@@ -3081,13 +3081,12 @@ TEST_CASE("update + by scatters packed strings and categorical codes", "[update]
     CHECK_FALSE((*copied_entry->validity)[2]);
 }
 
-TEST_CASE("per-row evaluation propagates null without reading payloads",
-          "[interpreter][update][null]") {
-    // The per-row evaluator represents a null cell as an ExprValue Null read
+TEST_CASE("evaluation propagates null without reading payloads", "[interpreter][update][null]") {
+    // Evaluation represents a null cell as a null of its column's type, read
     // from the validity bitmap (never touching the undefined payload) and
     // propagates it: null in -> null out, through operators and scalar
-    // builtins alike. String interpolation is per-row-only, so it pins the
-    // path; abs() pins the registry-call propagation.
+    // builtins alike. String interpolation pins the call-over-columns path;
+    // abs() pins the registry-call propagation.
     runtime::Table table;
     table.add_column("x", Column<double>{1.5, 0.0, 3.5}, std::vector<bool>{true, false, true});
 
@@ -13751,7 +13750,7 @@ TEST_CASE("update: bare bool literal does not crash", "[update][bool]") {
     // column-copy fast path) and isn't Compare/Logical/IsNull (so it misses the
     // vectorized path), so it falls into the generic per-row loop in
     // update_table_window. That loop's Bool branch only checked for an
-    // int64_t-holding ExprValue, but eval_expr returns a bool-holding ExprValue
+    // int64_t-holding value, but evaluation returns a bool-holding value
     // for a Bool literal — the mismatch previously tripped an
     // invariant_violation abort instead of a graceful error.
     runtime::Table table;

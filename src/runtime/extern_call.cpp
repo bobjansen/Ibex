@@ -78,11 +78,11 @@ auto row_args(const std::vector<ColResult>& columns, std::size_t row, std::strin
     ExternArgs args;
     args.reserve(columns.size());
     for (const auto& column : columns) {
-        auto value = scalar_from_expr(cell_value(column, row));
-        if (!value.has_value()) {
+        auto value = cell_value(column, row);
+        if (is_null_scalar(value)) {
             return std::unexpected(std::string(callee) + ": null argument in extern function call");
         }
-        args.push_back(std::move(*value));
+        args.push_back(std::move(value));
     }
     return args;
 }
@@ -115,7 +115,7 @@ auto call_table_extern(const ExternFunction& fn, const std::string& callee, cons
 
 auto eval_extern_values(const ir::CallExpr& call, const Table& input, RowRange range,
                         const ColumnEvalCtx& ctx)
-    -> std::expected<std::vector<ExprValue>, std::string> {
+    -> std::expected<std::vector<ScalarValue>, std::string> {
     if (ctx.externs == nullptr) {
         return std::unexpected("extern call with no registry: " + call.callee);
     }
@@ -159,7 +159,7 @@ auto eval_extern_values(const ir::CallExpr& call, const Table& input, RowRange r
         return std::unexpected(std::move(columns.error()));
     }
 
-    std::vector<ExprValue> values;
+    std::vector<ScalarValue> values;
     values.reserve(range.count);
     for (std::size_t row = 0; row < range.count; ++row) {
         auto args = row_args(*columns, row, call.callee);
@@ -185,7 +185,7 @@ auto eval_extern_values(const ir::CallExpr& call, const Table& input, RowRange r
             return std::unexpected(std::move(result.error()));
         }
         if (auto* scalar = std::get_if<ScalarValue>(&*result)) {
-            values.push_back(expr_from_scalar(*scalar));
+            values.push_back(*scalar);
         } else if (std::holds_alternative<ResourcePtr>(*result)) {
             return std::unexpected("a resource cannot be used in a query expression: " +
                                    call.callee);

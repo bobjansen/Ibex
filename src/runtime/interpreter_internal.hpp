@@ -614,48 +614,6 @@ inline auto collect_key_validity(const Table& table, const std::vector<ir::Colum
 
 }  // namespace
 
-/// The per-row null: a cell whose value is missing (validity bit clear).
-/// plans/exprvalue-null-arm-plan.md — the alternative exists so the per-row
-/// evaluator can represent missing cells directly instead of computing on
-/// undefined payloads and masking afterwards. ScalarValue (REPL scalars,
-/// extern args) deliberately stays null-free; convert at the boundary with
-/// the helpers below.
-struct Null {
-    auto operator==(const Null&) const -> bool = default;
-};
-
-using ExprValue =
-    std::variant<Null, std::int64_t, double, bool, std::string, Date, Timestamp, DecimalValue>;
-
-/// ScalarValue -> ExprValue: total. A NullScalar maps to ExprValue::Null, which
-/// carries no kind: the per-row evaluator takes types from inference.
-inline auto expr_from_scalar(const ScalarValue& v) -> ExprValue {
-    return std::visit(
-        [](const auto& x) -> ExprValue {
-            if constexpr (std::is_same_v<std::decay_t<decltype(x)>, ibex::NullScalar>) {
-                return Null{};
-            } else {
-                return x;
-            }
-        },
-        v);
-}
-
-/// ExprValue -> ScalarValue, or nullopt for ExprValue::Null: the row
-/// evaluator's null carries no type, and a ScalarValue null must, so the caller
-/// says what a null is there -- rejects it, or types it (infer_null_of).
-inline auto scalar_from_expr(const ExprValue& v) -> std::optional<ScalarValue> {
-    return std::visit(
-        [](const auto& x) -> std::optional<ScalarValue> {
-            if constexpr (std::is_same_v<std::decay_t<decltype(x)>, Null>) {
-                return std::nullopt;
-            } else {
-                return ScalarValue{x};
-            }
-        },
-        v);
-}
-
 /// The null of `expr`'s type over `input` (with `scalars`): what a null value
 /// of it is as a scalar. An error when the expression has no type.
 [[nodiscard]] auto infer_null_of(const ir::Expr& expr, const Table& input,
@@ -1001,19 +959,18 @@ struct ColumnEvalCtx {
     const ExecutionContext* exec = nullptr;
 };
 
-// How a Scalar builtin's per-row `eval` meets a Null argument
-// (plans/exprvalue-null-arm-plan.md, stage 3).
+// How a Scalar builtin's per-row `eval` meets a null argument.
 enum class NullPolicy : std::uint8_t {
-    Propagate,  // default: any Null argument -> Null result; eval never sees Null
-    Handles,    // eval receives Null arguments and decides (coalesce, fill_null, ...)
+    Propagate,  // default: any null argument -> null result; eval never sees a null
+    Handles,    // eval receives null arguments and decides (coalesce, fill_null, ...)
 };
 
 // Signatures shared by the registry payloads below.
 using InferFn = std::expected<ExprType, std::string> (*)(std::string_view,
                                                          const std::vector<ExprType>&);
 // Row-local evaluation: args at row i -> value at row i.
-using RowEvalFn = std::expected<ExprValue, std::string> (*)(std::string_view,
-                                                            const std::vector<ExprValue>&);
+using RowEvalFn = std::expected<ScalarValue, std::string> (*)(std::string_view,
+                                                              const std::vector<ScalarValue>&);
 // Whole-column evaluation: the raw call (for arg literals / named args), the
 // input table, the output row count, and the evaluation context.
 using ColumnEvalFn = std::expected<ComputedColumn, std::string> (*)(const ir::CallExpr&,
@@ -1716,15 +1673,15 @@ inline auto double_to_sortable_u64(double value) -> std::uint64_t {
 [[nodiscard]] auto aggregate_call_to_spec(const ir::CallExpr& call, std::string alias)
     -> std::expected<std::optional<ir::AggSpec>, std::string>;
 [[nodiscard]] auto expr_contains_aggregate_call(const ir::Expr& expr) -> bool;
-// The scalar-collapse pair returns ExprValue so a null aggregate result (an
+// The scalar-collapse pair returns ScalarValue so a null aggregate result (an
 // all-null group has no mean/first/...) is carried as Null instead of a
 // garbage payload; callers broadcast Null as an all-invalid column.
 [[nodiscard]] auto eval_aggregate_call_scalar(const ir::CallExpr& node, const Table& input,
                                               const ScalarRegistry* scalars)
-    -> std::expected<ExprValue, std::string>;
+    -> std::expected<ScalarValue, std::string>;
 [[nodiscard]] auto eval_aggregate_scalar(const ir::Expr& expr, const Table& input,
                                          const ScalarRegistry* scalars)
-    -> std::expected<ExprValue, std::string>;
+    -> std::expected<ScalarValue, std::string>;
 [[nodiscard]] auto expr_has_bare_column(const ir::Expr& expr) -> bool;
 [[nodiscard]] auto fold_aggregates_to_columns(ir::Expr& expr, const Table& group_input,
                                               Table& working, const ScalarRegistry* scalars,
@@ -1923,14 +1880,14 @@ enum class FloatCleanMode : std::uint8_t {
 /// True when `expr` calls an extern function anywhere in it.
 [[nodiscard]] auto expr_calls_extern(const ir::Expr& expr, const ExternRegistry* externs) -> bool;
 /// Row `i` of an evaluated column, or Null where its validity bit is clear.
-[[nodiscard]] auto cell_value(const ColResult& column, std::size_t i) -> ExprValue;
+[[nodiscard]] auto cell_value(const ColResult& column, std::size_t i) -> ScalarValue;
 /// An extern scalar call over the rows of a field: its arguments evaluated as
 /// columns, then the extern called once per row, in row order, with that row's
 /// arguments (a null one is rejected in front of the call). A table first
 /// argument is a table-producing extern call, made per row the same way.
 [[nodiscard]] auto eval_extern_values(const ir::CallExpr& call, const Table& input, RowRange range,
                                       const ColumnEvalCtx& ctx)
-    -> std::expected<std::vector<ExprValue>, std::string>;
+    -> std::expected<std::vector<ScalarValue>, std::string>;
 [[nodiscard]] auto evaluate_row_count_expr_impl(const ir::Expr& expr, const ScalarRegistry* scalars,
                                                 const ExternRegistry* externs)
     -> std::expected<std::size_t, std::string>;
@@ -1958,8 +1915,8 @@ enum class FloatCleanMode : std::uint8_t {
     -> std::expected<ColumnValue, std::string>;
 [[nodiscard]] auto apply_seq_func(const ir::CallExpr& call, std::size_t rows)
     -> std::expected<ColumnValue, std::string>;
-[[nodiscard]] auto expr_value_to_double(const ExprValue& v) -> std::optional<double>;
-[[nodiscard]] auto expr_value_to_string(const ExprValue& v) -> std::string;
+[[nodiscard]] auto expr_value_to_double(const ScalarValue& v) -> std::optional<double>;
+[[nodiscard]] auto expr_value_to_string(const ScalarValue& v) -> std::string;
 
 // runtime_entry.cpp — operator-build dispatch and physical-plan construction.
 // Rank/window evaluation is in rank_window.cpp; extern-call execution in

@@ -45,7 +45,7 @@ namespace ibex::runtime {
 /// The decimal a numeric operand denotes when it meets a decimal. Int64 is
 /// exact as Decimal(19, 0); a double is taken as the literal it was written as
 /// (the type checker rejects a double that is not a literal).
-[[nodiscard]] inline auto decimal_operand(const ExprValue& v)
+[[nodiscard]] inline auto decimal_operand(const ScalarValue& v)
     -> std::expected<DecimalValue, std::string> {
     if (const auto* d = std::get_if<DecimalValue>(&v)) {
         return *d;
@@ -107,9 +107,9 @@ namespace ibex::runtime {
 }
 
 /// Row-level `a op b` where at least one side is a decimal.
-[[nodiscard]] inline auto decimal_arith(ir::ArithmeticOp op, const ExprValue& left,
-                                        const ExprValue& right)
-    -> std::expected<ExprValue, std::string> {
+[[nodiscard]] inline auto decimal_arith(ir::ArithmeticOp op, const ScalarValue& left,
+                                        const ScalarValue& right)
+    -> std::expected<ScalarValue, std::string> {
     auto a = decimal_operand(left);
     if (!a) {
         return std::unexpected(a.error());
@@ -120,8 +120,8 @@ namespace ibex::runtime {
     }
     if (op == ir::ArithmeticOp::Div) {
         // `/` has one result type (SPEC 3.1). IEEE rules for a zero divisor.
-        return ExprValue{decimal::to_double(a->units, a->type.scale) /
-                         decimal::to_double(b->units, b->type.scale)};
+        return ScalarValue{decimal::to_double(a->units, a->type.scale) /
+                           decimal::to_double(b->units, b->type.scale)};
     }
     auto rt = decimal_arith_type(op, a->type, b->type);
     if (!rt) {
@@ -131,12 +131,12 @@ namespace ibex::runtime {
     if (!decimal_arith_units(op, a->units, a->type.scale, b->units, b->type.scale, *rt, out)) {
         return std::unexpected(decimal_overflow(*rt));
     }
-    return ExprValue{DecimalValue{.units = out, .type = *rt}};
+    return ScalarValue{DecimalValue{.units = out, .type = *rt}};
 }
 
 /// The units a computed value holds in a `Decimal(target)` column: decimals
 /// rescaled (half away from zero), Int64 exactly. Too large is an error.
-[[nodiscard]] inline auto fit_decimal(const ExprValue& v, DecimalType target)
+[[nodiscard]] inline auto fit_decimal(const ScalarValue& v, DecimalType target)
     -> std::expected<Int128, std::string> {
     auto d = decimal_operand(v);
     if (!d) {

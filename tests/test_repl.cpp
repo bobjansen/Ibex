@@ -275,8 +275,51 @@ TEST_CASE("REPL scalar builtins apply element-wise to series", "[repl][series]")
     REQUIRE(ibex::repl::execute_script("print(abs([-1, 2, -3]));", registry));
     // Mismatched series lengths error.
     REQUIRE_FALSE(ibex::repl::execute_script("print(pmax([1,2,3], [1,2]));", registry));
-    // A series result where a scalar is required (arithmetic) errors.
-    REQUIRE_FALSE(ibex::repl::execute_script("print(pmax([1,2],[3,4]) + 1);", registry));
+}
+
+TEST_CASE("REPL series expressions run on the runtime as a column", "[repl][series]") {
+    // Operators, casts, round and builtins over a series evaluate as the same
+    // expression does over a column; a scalar broadcasts.
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    auto column = [&](const char* src) -> ibex::runtime::ColumnValue {
+        auto r = session.execute(src);
+        INFO(src << " -> " << r.error);
+        REQUIRE(r.ok);
+        // A series result comes back as a one-column table.
+        REQUIRE(r.table.has_value());
+        REQUIRE(r.table->columns.size() == 1);
+        return *r.table->columns.front().column;
+    };
+    auto ints = [&](const char* src) {
+        const auto values = std::get<ibex::Column<std::int64_t>>(column(src));
+        return std::vector<std::int64_t>(values.begin(), values.end());
+    };
+    auto floats = [&](const char* src) {
+        const auto values = std::get<ibex::Column<double>>(column(src));
+        return std::vector<double>(values.begin(), values.end());
+    };
+    using I64 = std::vector<std::int64_t>;
+    using F64 = std::vector<double>;
+    REQUIRE(session.execute("let s = [1, 5, 3];").ok);
+    REQUIRE(session.execute("let f = [1.5, 2.5, -2.5];").ok);
+    CHECK(ints("pmax([1,2],[3,4]) + 1;") == I64{4, 5});
+    CHECK(ints("s * 2 - 1;") == I64{1, 9, 5});
+    CHECK(floats("s / 2;") == F64{0.5, 2.5, 1.5});
+    CHECK(ints("round(f, Nearest);") == I64{2, 3, -3});
+    CHECK(ints("round(f, Bankers);") == I64{2, 2, -2});
+    // SPEC.md Section 12.6: an Int64 is returned unchanged.
+    CHECK(ints("round(s, Floor);") == I64{1, 5, 3});
+    CHECK(floats("Float64(s);") == F64{1.0, 5.0, 3.0});
+    CHECK(ints("case { s > 2 => s, else => 0 };") == I64{0, 5, 3});
+    // A whole Float casts; a fraction is an error, as in a column.
+    CHECK(ints("Int64([2.0, 4.0]);") == I64{2, 4});
+    CHECK_FALSE(session.execute("Int64(f);").ok);
+    // Aggregates reduce what an expression produced.
+    auto total = session.execute("sum(s * 2);");
+    REQUIRE(total.ok);
+    REQUIRE(total.scalar.has_value());
+    CHECK(std::get<std::int64_t>(*total.scalar) == 18);
 }
 
 TEST_CASE("REPL string interpolation in scalar position", "[repl][interp]") {
@@ -1869,7 +1912,8 @@ r;
     REQUIRE(ibex::repl::execute_script(src, registry));
 }
 
-TEST_CASE("round: applied to Int column is an error") {
+TEST_CASE("round: an Int column is returned unchanged") {
+    // SPEC.md Section 12.6, and what a column expression does.
     ibex::runtime::ExternRegistry registry;
     registry.register_table("get_data",
                             [](const ibex::runtime::ExternArgs&)
@@ -1886,7 +1930,7 @@ let (n) = df;
 let r: Series<Int64> = round(n, Nearest);
 r;
 )";
-    REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
+    REQUIRE(ibex::repl::execute_script(src, registry));
 }
 
 TEST_CASE("REPL correlated subquery reads a shared source once", "[repl][subquery]") {

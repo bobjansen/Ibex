@@ -574,6 +574,19 @@ Duration literals (`1m`, `30s`) are not valid series elements.
 standalone Series binding is a bare column with no validity bitmap, so it has
 nowhere to record the null. See Section 8.2.
 
+An expression over Series bindings means what it means over a table's columns:
+operators, `case`, casts, `round` and the scalar built-ins apply element-wise,
+a scalar operand broadcasts, and the Series must have equal lengths. An
+aggregate reduces the result (`sum(px * 2)`). A result with a null element is
+an error, for the reason above.
+
+```
+let qty = [1, 5, 3];
+qty * 2 - 1;                // [1, 9, 5]
+round(px, Bankers);         // Series<Int64>
+case { qty > 2 => qty, else => 0 };   // [0, 5, 3]
+```
+
 `TimeFrame<S>` is a `DataFrame<S>` with the additional invariant that exactly
 one column of type `Timestamp` is designated as the time index, and rows are
 sorted by that index in ascending order.

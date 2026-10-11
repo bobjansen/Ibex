@@ -716,26 +716,6 @@ auto resolve_table(const std::string& name, const runtime::TableRegistry& tables
     return std::unexpected("unknown table '" + name + "'");
 }
 
-void print_scalars(const runtime::ScalarRegistry& scalars) {
-    if (scalars.empty()) {
-        ibex::formatting::print("scalars: <none>\n");
-        return;
-    }
-    std::vector<std::string> names;
-    names.reserve(scalars.size());
-    for (const auto& entry : scalars) {
-        names.push_back(entry.first);
-    }
-    std::ranges::sort(names);
-    ibex::formatting::print("scalars:\n");
-    for (const auto& name : names) {
-        ibex::formatting::print("  {} = ", name);
-        const auto& value = scalars.at(name);
-        ibex::formatting::print("{}", format_scalar(value));
-        ibex::formatting::print("\n");
-    }
-}
-
 std::string format_scalar_names(const runtime::ScalarRegistry& scalars) {
     if (scalars.empty()) {
         return "<none>";
@@ -876,6 +856,26 @@ auto scalar_kind_name(runtime::ScalarKind kind) -> std::string_view {
 
 auto scalar_value_type_name(const runtime::ScalarValue& val) -> std::string_view {
     return scalar_kind_name(runtime::scalar_kind(val));
+}
+
+void print_scalars(const runtime::ScalarRegistry& scalars) {
+    if (scalars.empty()) {
+        ibex::formatting::print("scalars: <none>\n");
+        return;
+    }
+    std::vector<std::string> names;
+    names.reserve(scalars.size());
+    for (const auto& entry : scalars) {
+        names.push_back(entry.first);
+    }
+    std::ranges::sort(names);
+    ibex::formatting::print("scalars:\n");
+    for (const auto& name : names) {
+        // The type too: a null binding still has one.
+        const auto& value = scalars.at(name);
+        ibex::formatting::print("  {}: {} = {}\n", name, scalar_value_type_name(value),
+                                format_scalar(value));
+    }
 }
 
 auto type_to_string(const parser::Type& type) -> std::string {

@@ -74,10 +74,15 @@ test_that("a scalar result comes back as a length-1 vector of its type", {
     expect_s3_class(session_eval(sess, "n; Table { a = [1] };"), "data.frame")
 })
 
-test_that("a null scalar comes back as NA and a statement with no value as NULL", {
+test_that("a null scalar comes back as the NA of its type", {
     sess <- create_session()
-    session_eval(sess, "let t = Table { a = [1] }[update { v = case { a > 5 => 1, else => NULL } }];")
+    session_eval(sess, "let t = Table { a = [1] }[update { v = case { a > 5 => 1.5, else => NULL } }];")
     session_eval(sess, "let m = scalar(t[select { m = max(v) }], m);")
-    expect_identical(session_eval(sess, "m;"), NA)
+    expect_identical(session_eval(sess, "m;"), NA_real_)
+    expect_identical(session_eval(sess, "String(NULL);"), NA_character_)
+    expect_identical(session_eval(sess, "let b: Bool = NULL; b;"), NA)
+    expect_identical(session_eval(sess, "let d: Date = NULL; d;"), as.Date(NA))
+    expect_identical(session_eval(sess, "Float64(NULL);"), NA_real_)
+    expect_true(is.na(session_eval(sess, "Int64(NULL);")))
     expect_null(session_eval(sess, "let x = 1;"))
 })

@@ -80,13 +80,10 @@ default_plugin_paths <- function() {
 # A query's last value comes back as a data.frame (a table), a length-1 vector
 # (a scalar), or invisible NULL (no value). A scalar travels as a one-row table
 # flagged `scalar = TRUE`, so it gets exactly the conversion a table column
-# would; a null scalar arrives as NA, since it has no type to convert.
+# would -- a null scalar included, which comes back as the NA of its type.
 as_ibex_result <- function(payload, format) {
     if (is.null(payload)) {
         return(invisible(NULL))
-    }
-    if (is.atomic(payload)) {
-        return(payload)
     }
 
     stopifnot(is.list(payload), all(c("array", "schema") %in% names(payload)))

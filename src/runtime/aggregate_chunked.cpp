@@ -442,7 +442,7 @@ class DenseAggregateScanSink final : public ScanWorkerSink {
         if (partial == nullptr) {
             return;
         }
-        const std::lock_guard lock(pending_mutex_);
+        const std::scoped_lock lock(pending_mutex_);
         try {
             pending_[unit] = std::move(partial);
         } catch (...) {  // NOLINT(bugprone-empty-catch) -- as above
@@ -454,13 +454,13 @@ class DenseAggregateScanSink final : public ScanWorkerSink {
     /// aggregate merging it reads those columns' codes at a handful of rows,
     /// and translates the column itself on any other path. Empty stops it.
     void defer_translation(std::vector<std::size_t> columns) {
-        const std::lock_guard lock(pending_mutex_);
+        const std::scoped_lock lock(pending_mutex_);
         deferred_columns_ = std::move(columns);
     }
 
     [[nodiscard]] auto untranslated_columns(std::size_t unit, const Chunk& chunk) noexcept
         -> std::vector<std::size_t> override {
-        const std::lock_guard lock(pending_mutex_);
+        const std::scoped_lock lock(pending_mutex_);
         if (deferred_columns_.empty()) {
             return {};
         }
@@ -478,7 +478,7 @@ class DenseAggregateScanSink final : public ScanWorkerSink {
     [[nodiscard]] auto on_emit(std::size_t unit, const Chunk& chunk,
                                std::vector<DeferredCategoricalRemap> deferred) noexcept
         -> bool override {
-        const std::lock_guard lock(pending_mutex_);
+        const std::scoped_lock lock(pending_mutex_);
         current_ = {};
         const auto it = pending_.find(unit);
         if (it == pending_.end()) {
@@ -498,7 +498,7 @@ class DenseAggregateScanSink final : public ScanWorkerSink {
     /// one, with the remaps of the columns it emitted untranslated. Consuming
     /// thread only, between that emission and the next.
     [[nodiscard]] auto take_current() -> EmittedWorkerPartial {
-        const std::lock_guard lock(pending_mutex_);
+        const std::scoped_lock lock(pending_mutex_);
         return std::exchange(current_, {});
     }
 

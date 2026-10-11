@@ -808,6 +808,9 @@ std::string column_type_name(const runtime::ColumnValue& column) {
     if (std::holds_alternative<Column<Decimal>>(column)) {
         return "Decimal";
     }
+    if (std::holds_alternative<Column<bool>>(column)) {
+        return "Bool";
+    }
     return "Unknown";
 }
 

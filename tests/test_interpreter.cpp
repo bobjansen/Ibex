@@ -3223,6 +3223,30 @@ TEST_CASE("a compiled program's scalar lets have the REPL's values",
     CHECK(std::get<NullScalar>(typed_scalars.at("y")).kind == runtime::ScalarKind::Double);
 }
 
+TEST_CASE("Every case arm is type-checked, the else arm included", "[interpreter][case][types]") {
+    // A case is well typed or rejected before any row runs, whichever arm the
+    // data would take: the else arm used to escape the check.
+    runtime::TableRegistry registry;
+    runtime::Table table;
+    table.add_column("qty", Column<std::int64_t>{2, 3});
+    table.add_column("b", Column<bool>{true, true});
+    registry.emplace("t", table);
+    for (const char* src : {"t[update { y = case { qty > 1 => \"foo\", else => 1 } }];",
+                            "t[update { y = case { b => \"foo\", else => 1 } }];",
+                            "t[update { y = case { qty > 1 => \"foo\", qty <= 1 => 1, "
+                            "else => 0 } }];"}) {
+        INFO(src);
+        auto result = runtime::interpret(*require_ir(src), registry);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("same type") != std::string::npos);
+    }
+    // Int and Float arms widen to Float64.
+    auto widened = runtime::interpret(
+        *require_ir("t[update { y = case { b => qty, else => 1.5 } }];"), registry);
+    REQUIRE(widened.has_value());
+    CHECK(std::holds_alternative<Column<double>>(*widened->find("y")));
+}
+
 TEST_CASE("A typed NULL literal is a null of its type in every position", "[interpreter][null]") {
     runtime::TableRegistry registry;
     runtime::Table table;

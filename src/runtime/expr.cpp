@@ -2165,7 +2165,14 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
             }
             std::optional<ExprType> result;
             bool categorical_result = false;
-            for (std::size_t i = 1; i < call->args.size(); i += 2) {
+            // The value arms are the odd arguments, then `else` last: every one
+            // is checked, whichever a row would take.
+            std::vector<std::size_t> values;
+            for (std::size_t i = 1; i + 1 < call->args.size(); i += 2) {
+                values.push_back(i);
+            }
+            values.push_back(call->args.size() - 1);
+            for (const std::size_t i : values) {
                 const auto* null_arm = std::get_if<ir::CallExpr>(&call->args[i]->node);
                 if (null_arm != nullptr && null_arm->callee == "__null") {
                     continue;

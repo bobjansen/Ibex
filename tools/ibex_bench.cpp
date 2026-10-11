@@ -2463,6 +2463,12 @@ int main(int argc, char** argv) {
                 {.name = "sin_price", .source = "prices[update { v = sin(price) }]"},
                 {.name = "cos_price", .source = "prices[update { v = cos(price) }]"},
                 {.name = "tanh_price", .source = "prices[update { v = tanh(price / 1000.0) }]"},
+                // abs of an Int, and math over an argument the fused numeric
+                // tree cannot compile (coalesce): both used to run per row.
+                {.name = "abs_int_price",
+                 .source = "prices[update { v = abs(round(price, Floor) - 300) }]"},
+                {.name = "sqrt_coalesce_price",
+                 .source = "prices[update { v = sqrt(coalesce(price, 0.0)) }]"},
             };
             for (const auto& query : scalar_queries) {
                 ScanPaths sp;

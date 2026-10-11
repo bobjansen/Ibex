@@ -55,6 +55,7 @@
 
 #include "decimal_ops.hpp"
 #include "interpreter_internal.hpp"
+#include "numeric_math.hpp"
 #include "runtime_internal.hpp"
 
 namespace ibex::runtime {
@@ -973,7 +974,7 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                       .exec = ScalarExec{.eval = [](std::string_view,
                                                     const std::vector<ScalarValue>& a) -> IV {
                           if (const auto* i = std::get_if<std::int64_t>(a.data())) {
-                              return ScalarValue{std::int64_t{std::abs(*i)}};
+                              return ScalarValue{safe_iabs(*i)};
                           }
                           if (const auto* d = std::get_if<double>(a.data())) {
                               return ScalarValue{std::abs(*d)};
@@ -2792,6 +2793,55 @@ auto eval_case_columns(const ir::CallExpr& call, const ir::Expr& expr, const Tab
         .validity = any_null ? std::optional<ValidityBitmap>{std::move(validity)} : std::nullopt};
 }
 
+// Unary math (sqrt, log, abs, floor, ...) over an evaluated argument column:
+// one vectorized kernel rather than a call per row, whatever produced the
+// argument. floor/ceil/trunc of an Int are the Int itself. nullopt for a
+// shape it does not cover (Decimal `abs`), which the per-row path handles.
+auto unary_math_over_column(UnaryMath fn, const ColResult& arg, std::size_t n, ExprType type)
+    -> std::optional<ComputedColumn> {
+    const auto& source = deref_col(arg);
+    std::optional<ValidityBitmap> validity;
+    if (const auto* v = arg.get_validity()) {
+        validity = gather_validity(std::optional<ValidityBitmap>{*v}, arg.offset, arg.offset + n);
+    }
+    if (const auto* ints = std::get_if<Column<std::int64_t>>(&source)) {
+        const std::int64_t* src = ints->data() + arg.offset;
+        if (unary_math_is_type_preserving(fn)) {
+            if (type != ExprType::Int) {
+                return std::nullopt;
+            }
+            Column<std::int64_t> out;
+            out.resize_for_overwrite(n);
+            if (fn == UnaryMath::Abs) {
+                for (std::size_t i = 0; i < n; ++i) {
+                    out.data()[i] = safe_iabs(src[i]);
+                }
+            } else {
+                std::copy_n(src, n, out.data());
+            }
+            return ComputedColumn{.column = std::move(out), .validity = std::move(validity)};
+        }
+        if (type != ExprType::Double) {
+            return std::nullopt;
+        }
+        Column<double> out;
+        out.resize_for_overwrite(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            out.data()[i] = static_cast<double>(src[i]);
+        }
+        apply_unary_math(fn, out.data(), out.data(), n);
+        return ComputedColumn{.column = std::move(out), .validity = std::move(validity)};
+    }
+    if (const auto* doubles = std::get_if<Column<double>>(&source);
+        doubles != nullptr && type == ExprType::Double) {
+        Column<double> out;
+        out.resize_for_overwrite(n);
+        apply_unary_math(fn, doubles->data() + arg.offset, out.data(), n);
+        return ComputedColumn{.column = std::move(out), .validity = std::move(validity)};
+    }
+    return std::nullopt;
+}
+
 // Any other call over columns: a scalar builtin, `round`, or an extern.
 auto eval_call_columns(const ir::CallExpr& call, const ir::Expr& expr, const Table& input,
                        RowRange range, const ColumnEvalCtx& ctx, ExprType type)
@@ -2854,6 +2904,13 @@ auto eval_call_columns(const ir::CallExpr& call, const ir::Expr& expr, const Tab
         }
         args.emplace_back(std::move(*column));
     }
+    if (const auto unary = call.args.size() == 1 ? lookup_unary_math(call.callee) : std::nullopt;
+        unary.has_value() && args.front().has_value()) {
+        if (auto applied = unary_math_over_column(*unary, *args.front(), n, type)) {
+            return std::move(*applied);
+        }
+    }
+
     auto column = typed_column_for(type, expr, input, ctx.scalars);
     if (!column) {
         return std::unexpected(column.error());

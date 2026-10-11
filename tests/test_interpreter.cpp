@@ -3222,6 +3222,59 @@ TEST_CASE("a compiled program's scalar lets have the REPL's values",
     CHECK(std::get<NullScalar>(typed_scalars.at("y")).kind == runtime::ScalarKind::Double);
 }
 
+TEST_CASE("Unary math runs over columns for Int and computed arguments", "[interpreter][math]") {
+    // floor/ceil/trunc of an Int are the Int; abs of an Int stays Int and wraps
+    // at the minimum like the other guarded integer operations. Math over a
+    // computed argument (coalesce, case, a cast) is one kernel over its column.
+    runtime::TableRegistry registry;
+    runtime::Table table;
+    const auto lowest = std::numeric_limits<std::int64_t>::min();
+    table.add_column("i", Column<std::int64_t>{-3, 0, 4, lowest},
+                     std::vector<bool>{true, false, true, true});
+    table.add_column("x", Column<double>{4.0, 0.0, 9.0, 16.0},
+                     std::vector<bool>{true, false, true, true});
+    registry.emplace("t", table);
+    auto result = runtime::interpret(
+        *require_ir("t[update { f = floor(i), c = ceil(i), r = trunc(i), a = abs(i),"
+                    " s = sqrt(coalesce(x, 25.0)), k = floor(case { x > 5.0 => x, else => 1.5 }),"
+                    " w = sqrt(Float64(i * i)), n = abs(i) + 1 }];"),
+        registry);
+    REQUIRE(result.has_value());
+    const auto ints = [&](const char* name) {
+        const auto& column = std::get<Column<std::int64_t>>(*result->find(name));
+        return std::vector<std::int64_t>(column.begin(), column.end());
+    };
+    const auto doubles = [&](const char* name) {
+        const auto& column = std::get<Column<double>>(*result->find(name));
+        return std::vector<double>(column.begin(), column.end());
+    };
+    const auto valid = [&](const char* name, std::size_t row) {
+        const auto* entry = result->find_entry(name);
+        return !entry->validity.has_value() || (*entry->validity)[row];
+    };
+    for (const char* name : {"f", "c", "r"}) {
+        INFO(name);
+        const auto values = ints(name);
+        CHECK(values[0] == -3);
+        CHECK(values[2] == 4);
+        CHECK(values[3] == lowest);
+        CHECK_FALSE(valid(name, 1));
+    }
+    const auto a = ints("a");
+    CHECK(a[0] == 3);
+    CHECK(a[2] == 4);
+    CHECK(a[3] == lowest);
+    CHECK_FALSE(valid("a", 1));
+    CHECK(ints("n")[0] == 4);
+    CHECK(doubles("s") == std::vector<double>{2.0, 5.0, 3.0, 4.0});
+    CHECK(valid("s", 1));
+    const auto k = doubles("k");
+    CHECK(k[0] == 1.0);
+    CHECK(k[2] == 9.0);
+    CHECK(k[3] == 16.0);
+    CHECK(doubles("w")[0] == 3.0);
+}
+
 TEST_CASE("map fields are typed, row-local, and call externs in row order", "[interpreter][map]") {
     runtime::TableRegistry registry;
     runtime::Table table;

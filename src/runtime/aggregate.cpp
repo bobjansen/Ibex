@@ -419,7 +419,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 const std::string_view value = text_cell(column, row);
                 if (!slot.has_value ||
                     text_extreme_replaces(agg.func, value,
-                                          std::get<std::string>(*slot.text_value))) {
+                                          std::get<std::string>(slot.text_value))) {
                     slot.text_value = std::string(value);
                 }
                 slot.has_value = true;
@@ -715,7 +715,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     if (slot.kind == ExprType::Double) {
                         append_scalar(*column, slot.double_value);
                     } else if (slot.kind == ExprType::String) {
-                        append_text_cell(*column, text_or_empty(slot.text_value));
+                        append_text_cell(*column, slot.text_value);
                     } else {
                         append_scalar(*column, slot.int_value);
                     }
@@ -728,9 +728,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         append_scalar(*column, slot.double_value);
                     } else if (slot.kind == ExprType::Bool) {
                         append_scalar(*column,
-                                      slot.has_value ? *slot.text_value : ScalarValue{false});
+                                      slot.has_value ? slot.text_value : ScalarValue{false});
                     } else {
-                        append_text_cell(*column, text_or_empty(slot.text_value));
+                        append_text_cell(*column, slot.text_value);
                     }
                     break;
                 // Median/Quantile/Skew/Kurtosis are reduced in the contiguous

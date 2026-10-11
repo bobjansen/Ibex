@@ -3506,9 +3506,9 @@ class HashAggregateState final {
 
     /// Slot-indexed boxed value, grown on first use. `slot_index` is the same
     /// `gid * n_aggs_ + agg_i` that indexes `flat_slots_`.
-    auto text_at(std::size_t slot_index) -> std::optional<ScalarValue>& {
+    auto text_at(std::size_t slot_index) -> ScalarValue& {
         if (text_store_.size() < flat_slots_.size()) {
-            text_store_.resize(flat_slots_.size());
+            text_store_.resize(flat_slots_.size(), ScalarValue{std::string{}});
         }
         return text_store_[slot_index];
     }
@@ -4984,7 +4984,7 @@ class HashAggregateState final {
             has_text = has_text || (seeded[a] != 0U && plan_[a].kind == ExprType::String);
         }
         if (has_text && text_store_.size() < flat_slots_.size()) {
-            text_store_.resize(flat_slots_.size());
+            text_store_.resize(flat_slots_.size(), ScalarValue{std::string{}});
         }
         const auto seed_one = [&](std::size_t gid, std::size_t row, std::size_t a) {
             const auto& entry = *agg_entries[a];
@@ -5663,7 +5663,7 @@ class HashAggregateState final {
                             text_at((static_cast<std::size_t>(gids[row]) * n_aggs_) + agg_i);
                         const std::string_view value = text_cell(*entry.column, row);
                         if (!slot.present() ||
-                            text_extreme_replaces(text_func, value, std::get<std::string>(*held))) {
+                            text_extreme_replaces(text_func, value, std::get<std::string>(held))) {
                             held = std::string(value);
                             slot.mark_present();
                         }
@@ -6066,7 +6066,7 @@ class HashAggregateState final {
                         auto& held = text_at(agg_i);
                         const std::string_view value = text_cell(*entry.column, r);
                         if (!slot.present() ||
-                            text_extreme_replaces(func, value, std::get<std::string>(*held))) {
+                            text_extreme_replaces(func, value, std::get<std::string>(held))) {
                             held = std::string(value);
                             slot.mark_present();
                         }
@@ -6574,7 +6574,12 @@ class HashAggregateState final {
                             std::get<Column<Timestamp>>(column).push_back(
                                 Timestamp{slot.int_value});
                         } else {
-                            append_text_cell(column, text_or_empty(text_store_[(g * n_aggs_) + i]));
+                            // No valid row may have initialized the text side array.
+                            if (slot.present()) {
+                                append_text_cell(column, text_store_[(g * n_aggs_) + i]);
+                            } else {
+                                append_text_cell(column, ScalarValue{std::string{}});
+                            }
                         }
                         break;
                     default:
@@ -6830,8 +6835,10 @@ class HashAggregateState final {
     /// Boxed First/Last values for non-numeric columns, parallel to
     /// `flat_slots_` and indexed identically. Stays EMPTY — no allocation, no
     /// ScalarValue construction — for an all-numeric query, which is why the
-    /// slot itself can be a POD.
-    std::vector<std::optional<ScalarValue>> text_store_;
+    /// slot itself can be a POD. The slot's `present()` says whether a group
+    /// has a value; an entry without one holds an empty string, a placeholder
+    /// that costs no optional discriminator and is never read as a null.
+    std::vector<ScalarValue> text_store_;
 
     // Flat accumulator storage: n_groups_ × n_aggs_ contiguous AggSlotCores.
     SlotArray<AggSlotCore> flat_slots_;

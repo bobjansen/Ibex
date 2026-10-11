@@ -3192,6 +3192,44 @@ TEST_CASE("Int division is float division on every evaluation path",
     }
 }
 
+TEST_CASE("text aggregates preserve missing payloads and long strings",
+          "[interpreter][aggregate][string][null]") {
+    runtime::Table table;
+    const std::string text(256, 'z');
+    table.add_column("s", Column<std::string>{"", text, "", text},
+                     std::vector<bool>{false, true, false, true});
+    table.add_column("g", Column<std::int64_t>{1, 2, 1, 2});
+    table.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0});
+    SECTION("mixed valid and missing text payloads") {}
+    SECTION("no group has a valid text payload") {
+        table.columns[0].validity = runtime::ValidityBitmap(4, false);
+    }
+    const bool all_null = !(*table.find_entry("s")->validity)[1];
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+    for (const bool materialized : {false, true}) {
+        const std::string fields = "f = first(s), l = last(s), lo = min(s), hi = max(s)" +
+                                   std::string(materialized ? ", m = median(x)" : "");
+        const std::string source = "t[select { " + fields + " }, by g];";
+        auto ir = require_ir(source.c_str());
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        REQUIRE(result->rows() == 2);
+        const auto& groups = std::get<Column<std::int64_t>>(*result->find("g"));
+        for (const auto* name : {"f", "l", "lo", "hi"}) {
+            const auto* entry = result->find_entry(name);
+            REQUIRE(entry != nullptr);
+            REQUIRE(entry->validity.has_value());
+            const auto& values = std::get<Column<std::string>>(*entry->column);
+            for (std::size_t row = 0; row < result->rows(); ++row) {
+                const bool valid = !all_null && groups[row] == 2;
+                CHECK((*entry->validity)[row] == valid);
+                CHECK(values[row] == (valid ? text : std::string{}));
+            }
+        }
+    }
+}
+
 TEST_CASE("aggregates over an all-null column reduce to null, not garbage",
           "[interpreter][aggregate][null]") {
     // An aggregate with no valid observations has no value: first/last (which

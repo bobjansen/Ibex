@@ -13,6 +13,7 @@
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/morsel.hpp>
 #include <ibex/runtime/safe_arith.hpp>
 #include <ibex/runtime/table_properties.hpp>
 #include <ibex/runtime/worker_pool.hpp>
@@ -1792,106 +1793,148 @@ auto eval_coalesce_column(const ir::CallExpr& call, const Table& input,
     if (call.args.size() < 2) {
         return std::unexpected("coalesce: expected at least 2 arguments");
     }
+    // Eager type check, mirroring registry inference (which the update ladders
+    // bypass): without it a mismatched later argument would only error when a
+    // null row actually reaches it. Inferred, so no argument is evaluated for it.
+    std::optional<ExprType> t0;
+    for (const auto& arg : call.args) {
+        auto type = infer_expr_type(*arg, input, scalars, nullptr);
+        if (!type) {
+            return std::unexpected(type.error());
+        }
+        if (t0.has_value() && *type != *t0) {
+            return std::unexpected("coalesce: arguments must share one type");
+        }
+        t0 = *type;
+    }
+
+    // The first argument, then each later one only while some row is still
+    // null: `chosen[i]` is the argument row i takes, `kNone` while it has none.
+    constexpr std::uint32_t kNone = std::numeric_limits<std::uint32_t>::max();
     std::vector<ColResult> cols;
     cols.reserve(call.args.size());
-    for (const auto& a : call.args) {
-        auto c = eval_value_vec(*a, input, scalars, rows);
+    std::vector<std::uint32_t> chosen(n, kNone);
+    std::vector<std::size_t> open;
+    for (std::size_t k = 0; k < call.args.size(); ++k) {
+        if (k > 0 && open.empty()) {
+            break;
+        }
+        auto c = eval_value_vec(*call.args[k], input, scalars, rows);
         if (!c) {
             return std::unexpected(c.error());
         }
+        const auto* validity = c->get_validity();
+        if (k == 0) {
+            for (std::size_t i = 0; i < n; ++i) {
+                if (validity == nullptr || (*validity)[c->offset + i]) {
+                    chosen[i] = 0;
+                } else {
+                    open.push_back(i);
+                }
+            }
+        } else {
+            std::vector<std::size_t> still_open;
+            for (const std::size_t i : open) {
+                if (validity == nullptr || (*validity)[c->offset + i]) {
+                    chosen[i] = static_cast<std::uint32_t>(k);
+                } else {
+                    still_open.push_back(i);
+                }
+            }
+            open = std::move(still_open);
+        }
         cols.push_back(std::move(*c));
     }
-    // Eager type check, mirroring registry inference (which the update ladders
-    // bypass): without it a mismatched later argument would only error when a
-    // null row actually reaches it.
-    const auto t0 = expr_type_for_column(deref_col(cols[0]));
-    for (std::size_t k = 1; k < cols.size(); ++k) {
-        if (expr_type_for_column(deref_col(cols[k])) != t0) {
-            return std::unexpected("coalesce: arguments must share one type");
+
+    // No null in the first argument: the answer is the first argument. A
+    // Decimal keeps this shortcut only when its type is already the result's.
+    const bool decimal = std::holds_alternative<Column<Decimal>>(deref_col(cols[0]));
+    if (cols.size() == 1 && open.empty() && !decimal) {
+        if (auto* owned = std::get_if<ColumnValue>(&cols[0].data); owned != nullptr) {
+            return ComputedColumn{.column = std::move(*owned), .validity = std::nullopt};
         }
+        return ComputedColumn{
+            .column = gather_range(deref_col(cols[0]), cols[0].offset, cols[0].offset + n),
+            .validity = std::nullopt};
     }
-    if (std::holds_alternative<Column<Decimal>>(deref_col(cols[0]))) {
+
+    std::optional<ValidityBitmap> validity;
+    if (!open.empty()) {
+        ValidityBitmap valid(n, true);
+        for (const std::size_t i : open) {
+            valid.set(i, false);
+        }
+        validity = std::move(valid);
+    }
+    if (decimal) {
         // Arguments may differ in scale (`coalesce(price, decimal"0")`): the
         // result takes the narrowest type holding them all, and each chosen
         // value is rescaled into it -- raw units are only comparable at one
-        // scale.
+        // scale. The type spans every argument, evaluated or not.
         DecimalType unified = decimal_type_of(std::get<Column<Decimal>>(deref_col(cols[0])));
-        for (std::size_t k = 1; k < cols.size(); ++k) {
-            unified = decimal::union_type(
-                unified, decimal_type_of(std::get<Column<Decimal>>(deref_col(cols[k]))));
+        for (std::size_t k = 1; k < call.args.size(); ++k) {
+            auto type = infer_decimal_type(*call.args[k], input, scalars);
+            if (!type) {
+                return std::unexpected(type.error());
+            }
+            unified = decimal::union_type(unified, *type);
+        }
+        std::vector<const Column<Decimal>*> sources;
+        sources.reserve(cols.size());
+        for (const auto& cr : cols) {
+            sources.push_back(&std::get<Column<Decimal>>(deref_col(cr)));
         }
         Column<Decimal> out = make_decimal_column(unified);
         out.reserve(n);
-        ValidityBitmap valid(n, true);
-        bool any_invalid = false;
         for (std::size_t i = 0; i < n; ++i) {
-            bool filled = false;
-            for (const auto& cr : cols) {
-                const auto* vk = cr.get_validity();
-                if (vk == nullptr || (*vk)[cr.offset + i]) {
-                    const auto& src = std::get<Column<Decimal>>(deref_col(cr));
-                    Int128 units = 0;
-                    if (!decimal::rescale(src[cr.offset + i].units, decimal_type_of(src).scale,
-                                          unified.scale, units) ||
-                        !decimal::fits(units, unified.precision)) {
-                        return std::unexpected("coalesce: " + decimal_overflow(unified));
-                    }
-                    out.push_back(Decimal{units});
-                    filled = true;
-                    break;
-                }
-            }
-            if (!filled) {
+            if (chosen[i] == kNone) {
                 out.push_back(Decimal{});
-                valid.set(i, false);
-                any_invalid = true;
+                continue;
             }
+            const auto& src = *sources[chosen[i]];
+            Int128 units = 0;
+            if (!decimal::rescale(src[cols[chosen[i]].offset + i].units, decimal_type_of(src).scale,
+                                  unified.scale, units) ||
+                !decimal::fits(units, unified.precision)) {
+                return std::unexpected("coalesce: " + decimal_overflow(unified));
+            }
+            out.push_back(Decimal{units});
         }
-        ComputedColumn r{.column = ColumnValue{std::move(out)}, .validity = std::nullopt};
-        if (any_invalid) {
-            r.validity = std::move(valid);
-        }
-        return r;
+        return ComputedColumn{.column = ColumnValue{std::move(out)},
+                              .validity = std::move(validity)};
     }
     return std::visit(
         [&](const auto& c0) -> std::expected<ComputedColumn, std::string> {
             using Col = std::decay_t<decltype(c0)>;
+            // Each argument's column, resolved once rather than per row.
+            std::vector<const Col*> sources;
+            sources.reserve(cols.size());
+            for (const auto& cr : cols) {
+                const auto* typed = std::get_if<Col>(&deref_col(cr));
+                if (typed == nullptr) {
+                    return std::unexpected("coalesce: arguments must share one type");
+                }
+                sources.push_back(typed);
+            }
             Col out;
             // A coalesced column means what its first argument means (a
             // Timestamp keeps its zone).
             out.set_meta(c0.meta());
             out.reserve(n);
-            ValidityBitmap valid(n, true);
-            bool any_invalid = false;
             for (std::size_t i = 0; i < n; ++i) {
-                bool filled = false;
-                for (const auto& cr : cols) {
-                    const auto* vk = cr.get_validity();
-                    if (vk == nullptr || (*vk)[cr.offset + i]) {
-                        const auto* tc = std::get_if<Col>(&deref_col(cr));
-                        if (tc == nullptr) {
-                            return std::unexpected("coalesce: arguments must share one type");
-                        }
-                        out.push_back((*tc)[cr.offset + i]);
-                        filled = true;
-                        break;
-                    }
-                }
-                if (!filled) {
+                const std::uint32_t k = chosen[i];
+                if (k == kNone) {
                     if constexpr (std::is_same_v<Col, Column<Categorical>>) {
                         out.push_back(std::string_view{});
                     } else {
                         out.push_back(typename Col::value_type{});
                     }
-                    valid.set(i, false);
-                    any_invalid = true;
+                } else {
+                    out.push_back((*sources[k])[cols[k].offset + i]);
                 }
             }
-            ComputedColumn r{.column = ColumnValue{std::move(out)}, .validity = std::nullopt};
-            if (any_invalid) {
-                r.validity = std::move(valid);
-            }
-            return r;
+            return ComputedColumn{.column = ColumnValue{std::move(out)},
+                                  .validity = std::move(validity)};
         },
         deref_col(cols[0]));
 }

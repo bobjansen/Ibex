@@ -2998,11 +2998,33 @@ auto evaluate_field(const ir::Expr& expr, const Table& input, RowRange range,
     // exactly this many rows; the ones that do not are guarded below.
     const std::size_t rows = range.count;
     if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
-        // A row-local builtin with a column kernel (a cast, `like`, ...) uses
-        // it over the whole table; over a partial range it is applied element
-        // by element below, like any scalar call.
+        // A row-local builtin with a column kernel (a cast, `like`, coalesce,
+        // ...) over a partial range: its arguments are columns and literals, so
+        // the kernel runs over just the columns it reads, sliced to the range.
         if (const auto* fn = find_builtin(call->callee);
-            fn != nullptr && use_column_kernel(*fn, *call) && (whole || is_column_only(*fn))) {
+            fn != nullptr && !whole && use_column_kernel(*fn, *call) && !is_column_only(*fn)) {
+            std::vector<ir::ColumnRef> refs;
+            ir::collect_expr_columns(expr, refs);
+            Table slice;
+            for (const auto& ref : refs) {
+                if (ref.lexical || slice.find(ref.name) != nullptr) {
+                    continue;
+                }
+                if (const auto* entry = input.find_entry(ref.name)) {
+                    auto column = gather_range(*entry->column, range.begin, range.end());
+                    if (auto validity =
+                            gather_validity(entry->validity, range.begin, range.end())) {
+                        slice.add_column(ref.name, std::move(column), std::move(*validity));
+                    } else {
+                        slice.add_column(ref.name, std::move(column));
+                    }
+                }
+            }
+            slice.logical_rows = rows;
+            return column_eval_of(*fn)(*call, slice, rows, ctx);
+        }
+        if (const auto* fn = find_builtin(call->callee);
+            fn != nullptr && use_column_kernel(*fn, *call)) {
             // A whole-column builtin (rolling/cum/lag, generators) reads
             // neighbouring rows or the whole frame, so a range would change its
             // answer rather than just its cost. These are permanently

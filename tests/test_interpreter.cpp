@@ -3222,6 +3222,57 @@ TEST_CASE("a compiled program's scalar lets have the REPL's values",
     CHECK(std::get<NullScalar>(typed_scalars.at("y")).kind == runtime::ScalarKind::Double);
 }
 
+TEST_CASE("coalesce takes later arguments only where earlier ones are null",
+          "[interpreter][coalesce]") {
+    runtime::TableRegistry registry;
+    runtime::Table table;
+    table.add_column("a", Column<std::int64_t>{1, 0, 0, 4},
+                     std::vector<bool>{true, false, false, true});
+    table.add_column("b", Column<std::int64_t>{10, 20, 0, 40},
+                     std::vector<bool>{true, true, false, true});
+    table.add_column("full", Column<std::int64_t>{7, 8, 9, 10});
+    table.add_column("d", runtime::make_decimal_column(DecimalType{.precision = 10, .scale = 1}));
+    {
+        auto& d = std::get<Column<Decimal>>(*table.find("d"));
+        for (const std::int64_t units : {15, 0, 25, 35}) {
+            d.push_back(Decimal{units});
+        }
+        table.columns.back().validity = runtime::ValidityBitmap({true, false, true, true});
+    }
+    registry.emplace("t", table);
+    auto result =
+        runtime::interpret(*require_ir("t[select { x = coalesce(full, 0), y = coalesce(a, b, -1),"
+                                       " z = coalesce(a, b), m = coalesce(d, decimal\"0.25\") }];"),
+                           registry);
+    REQUIRE(result.has_value());
+    const auto ints = [&](const char* name) {
+        const auto& column = std::get<Column<std::int64_t>>(*result->find(name));
+        return std::vector<std::int64_t>(column.begin(), column.end());
+    };
+    // No null in the first argument: it is the answer.
+    CHECK(ints("x") == std::vector<std::int64_t>{7, 8, 9, 10});
+    CHECK_FALSE(result->find_entry("x")->validity.has_value());
+    // The third argument fills only the row the second leaves null.
+    CHECK(ints("y") == std::vector<std::int64_t>{1, 20, -1, 4});
+    CHECK_FALSE(result->find_entry("y")->validity.has_value());
+    const auto* z = result->find_entry("z");
+    REQUIRE(z->validity.has_value());
+    CHECK((*z->validity)[1]);
+    CHECK_FALSE((*z->validity)[2]);
+    CHECK(ints("z")[1] == 20);
+    // Decimal arguments of different scales unify; row 1 takes the literal.
+    const auto& m = std::get<Column<Decimal>>(*result->find("m"));
+    CHECK(runtime::decimal_type_of(m).scale == 2);
+    CHECK(m[0].units == 150);
+    CHECK(m[1].units == 25);
+
+    // A mismatched later argument is an error even where no null reaches it.
+    auto mismatch =
+        runtime::interpret(*require_ir("t[select { x = coalesce(full, \"none\") }];"), registry);
+    REQUIRE_FALSE(mismatch.has_value());
+    CHECK(mismatch.error().find("share one type") != std::string::npos);
+}
+
 TEST_CASE("Unary math runs over columns for Int and computed arguments", "[interpreter][math]") {
     // floor/ceil/trunc of an Int are the Int; abs of an Int stays Int and wraps
     // at the minimum like the other guarded integer operations. Math over a

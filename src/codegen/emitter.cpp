@@ -52,6 +52,14 @@ auto decimal_value_cpp(const DecimalValue& v) -> std::string {
            std::to_string(v.type.precision) + ", " + std::to_string(v.type.scale) + ")";
 }
 
+/// C++ for a typed NULL: the kind (and a Decimal's precision and scale) it
+/// stands for.
+auto null_scalar_cpp(const NullScalar& v) -> std::string {
+    return "ibex::NullScalar{ibex::ScalarKind{" + std::to_string(static_cast<int>(v.kind)) +
+           "}, ibex::DecimalType{" + std::to_string(v.decimal.precision) + ", " +
+           std::to_string(v.decimal.scale) + "}}";
+}
+
 auto format_double(double v) -> std::string {
     if (std::isnan(v))
         return "std::numeric_limits<double>::quiet_NaN()";
@@ -443,10 +451,7 @@ void Emitter::emit_header(std::ostream& out, const Config& config, const Script*
                     using V = std::decay_t<decltype(v)>;
                     if constexpr (std::is_same_v<V, ibex::NullScalar>) {
                         // A null binding keeps its type.
-                        out << "ibex::runtime::ScalarValue{ibex::NullScalar{ibex::ScalarKind{"
-                            << static_cast<int>(v.kind) << "}, ibex::DecimalType{"
-                            << static_cast<int>(v.decimal.precision) << ", "
-                            << static_cast<int>(v.decimal.scale) << "}}}";
+                        out << "ibex::runtime::ScalarValue{" << null_scalar_cpp(v) << "}";
                     } else if constexpr (std::is_same_v<V, std::int64_t>) {
                         out << "std::int64_t{" << v << "}";
                     } else if constexpr (std::is_same_v<V, double>) {
@@ -1322,6 +1327,10 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                             type_str = "ibex::Date";
                         } else if constexpr (std::is_same_v<T, DecimalValue>) {
                             type_str = "ibex::Decimal";
+                        } else if constexpr (std::is_same_v<T, NullScalar>) {
+                            // Unreachable: lowering fills a NULL hole with a placeholder.
+                            throw std::runtime_error(
+                                "ibex_compile: NULL element in a column literal");
                         } else {
                             static_assert(std::is_same_v<T, Timestamp>);
                             type_str = "ibex::Timestamp";
@@ -1381,6 +1390,11 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                                     } else if constexpr (std::is_same_v<V, DecimalValue>) {
                                         // Unreachable: Decimal columns returned above.
                                         *out_ << decimal_value_cpp(v);
+                                    } else if constexpr (std::is_same_v<V, NullScalar>) {
+                                        // Unreachable: lowering fills a NULL hole with a
+                                        // placeholder and clears its validity bit.
+                                        throw std::runtime_error(
+                                            "ibex_compile: NULL element in a column literal");
                                     } else {
                                         static_assert(std::is_same_v<V, Timestamp>);
                                         *out_ << "ibex::Timestamp{std::int64_t{"
@@ -1647,6 +1661,8 @@ auto Emitter::emit_filter_expr(const ir::Expr& expr) -> std::string {
                                    std::to_string(v.days) + "}})";
                         } else if constexpr (std::is_same_v<V, DecimalValue>) {
                             return "ibex::ops::filter_decimal(" + decimal_value_cpp(v) + ")";
+                        } else if constexpr (std::is_same_v<V, NullScalar>) {
+                            return "ibex::ops::null_lit(" + null_scalar_cpp(v) + ")";
                         } else {
                             static_assert(std::is_same_v<V, Timestamp>);
                             return "ibex::ops::filter_timestamp(ibex::Timestamp{std::int64_t{" +
@@ -1720,6 +1736,8 @@ auto Emitter::emit_expr(const ir::Expr& expr) -> std::string {
                                    std::to_string(v.days) + "}})";
                         } else if constexpr (std::is_same_v<V, DecimalValue>) {
                             return "ibex::ops::decimal_lit(" + decimal_value_cpp(v) + ")";
+                        } else if constexpr (std::is_same_v<V, NullScalar>) {
+                            return "ibex::ops::null_lit(" + null_scalar_cpp(v) + ")";
                         } else {
                             static_assert(std::is_same_v<V, Timestamp>);
                             return "ibex::ops::timestamp_lit(ibex::Timestamp{std::int64_t{" +
@@ -1933,6 +1951,9 @@ auto Emitter::emit_raw_expr(const ir::Expr& expr) -> std::string {
                             return "ibex::Date{std::int32_t{" + std::to_string(v.days) + "}}";
                         } else if constexpr (std::is_same_v<V, DecimalValue>) {
                             return decimal_value_cpp(v);
+                        } else if constexpr (std::is_same_v<V, NullScalar>) {
+                            // As in the REPL: an extern is never handed a NULL.
+                            throw std::runtime_error("ibex_compile: null argument in extern call");
                         } else {
                             static_assert(std::is_same_v<V, Timestamp>);
                             return "ibex::Timestamp{std::int64_t{" + std::to_string(v.nanos) + "}}";

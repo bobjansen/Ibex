@@ -974,6 +974,10 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
                                     Decimal{decimal_units_for(scalar_from_literal(lit), unified)});
                             }
                             return col_data;
+                        } else if constexpr (std::is_same_v<T, NullScalar>) {
+                            // Lowering fills NULL holes with placeholders; a typed
+                            // NULL here is a column of that type, all null.
+                            return null_column(first_val, col.elements.size()).first;
                         } else {
                             Column<T> col_data;
                             col_data.reserve(col.elements.size());

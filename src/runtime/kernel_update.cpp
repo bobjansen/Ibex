@@ -122,6 +122,9 @@ auto resolve_numeric_operand(const ir::Expr& expr, const PredicateInput& input,
         return std::nullopt;
     }
     if (const auto* literal = std::get_if<ir::Literal>(&expr.node)) {
+        if (std::holds_alternative<NullScalar>(literal->value)) {
+            return std::nullopt;  // a typed NULL takes the general, validity-aware path
+        }
         const ScalarValue scalar = scalar_from_literal(*literal);
         const ExprType kind = scalar_kind_from_value(scalar);
         if (kind == ExprType::Int || kind == ExprType::Double) {
@@ -542,7 +545,8 @@ auto try_literal_update(const Chunk& input, const std::vector<ir::FieldSpec>& fi
         return std::nullopt;
     }
     const auto* literal = std::get_if<ir::Literal>(&fields.front().expr.node);
-    if (literal == nullptr) {
+    // A typed NULL needs a validity bitmap: the general path writes one.
+    if (literal == nullptr || std::holds_alternative<NullScalar>(literal->value)) {
         return std::nullopt;
     }
 
@@ -810,6 +814,9 @@ auto make_direct_case_plan(const ChunkView& view, const ir::CallExpr& call,
             return true;
         }
         if (const auto* literal = std::get_if<ir::Literal>(&expr.node)) {
+            if (std::holds_alternative<NullScalar>(literal->value)) {
+                return false;  // a typed NULL arm takes the general path
+            }
             if (plan.type_column == nullptr && !plan.literal_type.has_value()) {
                 plan.literal_type = broadcast_scalar_column(scalar_from_literal(*literal), 1);
             }

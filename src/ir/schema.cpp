@@ -88,6 +88,24 @@ auto literal_type(const Literal& lit) -> ColumnType {
                 return ColumnType::Date;
             } else if constexpr (std::is_same_v<T, DecimalValue>) {
                 return ColumnType::Decimal;
+            } else if constexpr (std::is_same_v<T, NullScalar>) {
+                switch (value.kind) {
+                    case ScalarKind::Int:
+                        return ColumnType::Int64;
+                    case ScalarKind::Double:
+                        return ColumnType::Float64;
+                    case ScalarKind::Bool:
+                        return ColumnType::Bool;
+                    case ScalarKind::String:
+                        return ColumnType::String;
+                    case ScalarKind::Date:
+                        return ColumnType::Date;
+                    case ScalarKind::Timestamp:
+                        return ColumnType::Timestamp;
+                    case ScalarKind::Decimal:
+                        return ColumnType::Decimal;
+                }
+                return ColumnType::Int64;
             } else {
                 static_assert(std::is_same_v<T, Timestamp>);
                 return ColumnType::Timestamp;
@@ -807,6 +825,10 @@ auto extern_call_site_key(const std::string& callee, const std::vector<Expr>& ar
                     key += "d" + std::to_string(value.days);
                 } else if constexpr (std::is_same_v<T, DecimalValue>) {
                     key += "m" + decimal::to_string(value);
+                } else if constexpr (std::is_same_v<T, NullScalar>) {
+                    key += "n" + std::to_string(static_cast<int>(value.kind)) + "_" +
+                           std::to_string(value.decimal.precision) + "_" +
+                           std::to_string(value.decimal.scale);
                 } else {
                     key += "t" + std::to_string(value.nanos);
                 }

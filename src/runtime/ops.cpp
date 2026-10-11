@@ -612,6 +612,10 @@ auto decimal_lit(DecimalValue v) -> ir::Expr {
     return ir::Expr{ir::Literal{v}};
 }
 
+auto null_lit(NullScalar v) -> ir::Expr {
+    return ir::Expr{ir::Literal{v}};
+}
+
 auto binop(ir::ArithmeticOp op, ir::Expr lhs, ir::Expr rhs) -> ir::Expr {
     return ir::Expr{ir::BinaryExpr{
         .op = op,
@@ -652,9 +656,7 @@ namespace {
 auto mk_expr(ir::Expr e) -> ir::ExprPtr {
     return ir::make_expr_ptr(std::move(e));
 }
-auto lit_expr(
-    std::variant<std::int64_t, double, bool, std::string, Date, Timestamp, DecimalValue> v)
-    -> ir::Expr {
+auto lit_expr(decltype(ir::Literal::value) v) -> ir::Expr {
     return ir::Expr{.node = ir::Literal{.value = std::move(v)}};
 }
 }  // namespace

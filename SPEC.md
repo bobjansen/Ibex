@@ -393,7 +393,9 @@ type. All non-`NULL` value arms must have the same type, apart from the usual
 
 Anywhere else, give `NULL` its type with a cast: `Int64(NULL)`, `Float64(NULL)`,
 `Date(NULL)`, `String(NULL)`, `Decimal(NULL, p, s)` are typed nulls, usable as a
-column value (`update { y = Int64(NULL) }`) or an argument.
+column value (`update { y = Int64(NULL) }`), an argument, or an element of a
+`Table { }` column literal, where an all-null column takes the typed null's
+type (`[Float64(NULL), Float64(NULL)]` is a Float64 column of nulls).
 
 ---
 

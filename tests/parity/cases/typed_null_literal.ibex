@@ -1,0 +1,18 @@
+// A typed NULL is a literal: `Int64(NULL)`, `Decimal(NULL, p, s)`, and a NULL
+// typed by its declaration (`let x: Int64 = NULL;`). The interpreter and the
+// emitted C++ (ibex::ops::null_lit) must agree on its type and its nulls, in
+// value, predicate and column-literal positions.
+let x: Int64 = NULL;
+let y: Float64 = NULL;
+
+let t = Table {
+    a = [1, Int64(NULL), 3],
+    all_typed = [Float64(NULL), Float64(NULL), Float64(NULL)]
+};
+
+t;
+t[update { b = x, c = y, d = case { a > 1 => a, else => Int64(NULL) } }];
+t[update { e = coalesce(a, x), g = Decimal(NULL, 10, 2), s = String(NULL) }];
+t[filter a == Int64(NULL)];
+t[filter a == Int64(NULL) || a > 2];
+t[select { total = sum(a), n = Int64(NULL), seen = count(all_typed) }];

@@ -137,8 +137,10 @@ struct IdentifierExpr {
 };
 
 struct LiteralExpr {
+    /// `NullScalar` is a NULL whose type is written where it stands:
+    /// `Int64(NULL)`, `Decimal(NULL, 10, 2)`, `let x: Int64 = NULL;`.
     std::variant<std::int64_t, double, bool, std::string, DurationLiteral, Date, Timestamp,
-                 DecimalValue>
+                 DecimalValue, NullScalar>
         value;
 };
 

@@ -2049,3 +2049,25 @@ TEST_CASE("A type name that is not a cast says which casts exist") {
     CHECK(ibex::parser::parse("t[update { s = String(x) }];").has_value());
     CHECK_FALSE(ibex::parser::parse("t[update { s = String x }];").has_value());
 }
+
+TEST_CASE("A cast of NULL is a typed NULL literal") {
+    // `T(NULL)` is a literal of T's type, not a cast of an untyped NULL.
+    const auto literal_of = [](const char* src) {
+        auto result = parse(src);
+        REQUIRE(result.has_value());
+        const auto& let = std::get<LetStmt>(result->statements.front());
+        const auto* lit = std::get_if<LiteralExpr>(&let.value->node);
+        REQUIRE(lit != nullptr);
+        const auto* null = std::get_if<ibex::NullScalar>(&lit->value);
+        REQUIRE(null != nullptr);
+        return *null;
+    };
+    CHECK(literal_of("let a = Int64(NULL);").kind == ibex::ScalarKind::Int);
+    CHECK(literal_of("let a = Int(NULL);").kind == ibex::ScalarKind::Int);
+    CHECK(literal_of("let a = Float32(NULL);").kind == ibex::ScalarKind::Double);
+    CHECK(literal_of("let a = Date(NULL);").kind == ibex::ScalarKind::Date);
+    CHECK(literal_of("let a = String(NULL);").kind == ibex::ScalarKind::String);
+    const auto dec = literal_of("let a = Decimal(NULL, 10, 2);");
+    CHECK(dec.kind == ibex::ScalarKind::Decimal);
+    CHECK(dec.decimal == ibex::DecimalType{.precision = 10, .scale = 2});
+}

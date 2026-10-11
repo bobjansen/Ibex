@@ -2516,7 +2516,15 @@ auto eval_aggregate_scalar(const ir::Expr& expr, const Table& input, const Scala
         [&](const auto& node) -> std::expected<ExprValue, std::string> {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, ir::Literal>) {
-                return std::visit([](const auto& v) -> ExprValue { return v; }, node.value);
+                return std::visit(
+                    [](const auto& v) -> ExprValue {
+                        if constexpr (std::is_same_v<std::decay_t<decltype(v)>, NullScalar>) {
+                            return Null{};
+                        } else {
+                            return v;
+                        }
+                    },
+                    node.value);
             } else if constexpr (std::is_same_v<T, ir::ColumnRef>) {
                 if (scalars != nullptr) {
                     auto it = scalars->find(node.name);

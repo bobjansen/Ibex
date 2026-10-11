@@ -311,7 +311,22 @@ struct DeferredWrap {
         // A plain scalar expression: a binding with no subplan, evaluated in
         // order with the others. Later table lets may filter/compute against
         // it; a bare name there must resolve as a binding, not a missing column.
-        auto value = lower_value_expr(*let_stmt->value, lower_ctx);
+        // `let x: Int64 = NULL;`: the declaration types the NULL, as a literal.
+        auto value = [&]() -> std::expected<ir::Expr, LowerError> {
+            const auto* null_call = std::get_if<CallExpr>(&let_stmt->value->node);
+            const auto* declared =
+                let_stmt->type.has_value() && let_stmt->type->kind == Type::Kind::Scalar
+                    ? std::get_if<ScalarType>(&let_stmt->type->arg)
+                    : nullptr;
+            if (declared != nullptr && null_call != nullptr && null_call->callee == "__null" &&
+                null_call->args.empty()) {
+                return ir::Expr{
+                    .node = ir::Literal{
+                        .value = NullScalar{scalar_kind_of(*declared),
+                                            let_stmt->type->decimal.value_or(DecimalType{})}}};
+            }
+            return lower_value_expr(*let_stmt->value, lower_ctx);
+        }();
         if (!value) {
             return std::unexpected("unsupported scalar let '" + let_stmt->name +
                                    "': " + value.error().message);

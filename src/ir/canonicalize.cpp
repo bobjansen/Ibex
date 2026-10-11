@@ -208,7 +208,10 @@ auto fold_cmp(CompareOp op, const Literal& l, const Literal& r) -> std::optional
         [&](const auto& lv) -> std::optional<bool> {
             using T = std::decay_t<decltype(lv)>;
             const auto& rv = std::get<T>(r.value);
-            if constexpr (std::is_same_v<T, DecimalValue>) {
+            if constexpr (std::is_same_v<T, NullScalar>) {
+                // A comparison with NULL is null, not a constant true/false.
+                return std::nullopt;
+            } else if constexpr (std::is_same_v<T, DecimalValue>) {
                 // Numeric, across scales: decimal"1.0" == decimal"1.00".
                 const auto ord = decimal::compare(lv, rv);
                 switch (op) {

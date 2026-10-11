@@ -2076,6 +2076,8 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
                     return ExprType::Timestamp;
                 } else if constexpr (std::is_same_v<T, DecimalValue>) {
                     return ExprType::Decimal;
+                } else if constexpr (std::is_same_v<T, NullScalar>) {
+                    return expr_type_of_kind(value.kind);
                 } else {
                     static_assert(std::is_same_v<T, std::string>);
                     return ExprType::String;
@@ -2316,6 +2318,10 @@ auto infer_decimal_type(const ir::Expr& expr, const Table& input, const ScalarRe
             }
             return v->type;
         }
+        if (const auto* null = std::get_if<NullScalar>(&lit->value);
+            null != nullptr && null->kind == ScalarKind::Decimal) {
+            return null->decimal;
+        }
         return std::unexpected("literal is not Decimal");
     }
     if (const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node)) {
@@ -2438,7 +2444,16 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
             *entry->column);
     }
     if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
-        return std::visit([](const auto& v) -> ExprValue { return v; }, lit->value);
+        return std::visit(
+            [](const auto& v) -> ExprValue {
+                // A typed NULL is the row evaluator's null; inference has its type.
+                if constexpr (std::is_same_v<std::decay_t<decltype(v)>, NullScalar>) {
+                    return Null{};
+                } else {
+                    return v;
+                }
+            },
+            lit->value);
     }
     if (const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node)) {
         auto left = eval_expr(*bin->left, input, row, scalars, externs);
@@ -3932,6 +3947,9 @@ auto apply_rep_func(const ir::CallExpr& call, const Table& input, std::size_t ro
     // ── scalar literal x ────────────────────────────────────────────────────
     if (array_len_sentinel == 0) {
         if (const auto* lit = std::get_if<ir::Literal>(&call.args[0]->node)) {
+            if (std::holds_alternative<NullScalar>(lit->value)) {
+                return std::unexpected("rep: a NULL has no value to repeat");
+            }
             return std::visit(
                 [&](const auto& v) -> ColumnValue {
                     using T = std::decay_t<decltype(v)>;
@@ -3969,6 +3987,8 @@ auto apply_rep_func(const ir::CallExpr& call, const Table& input, std::size_t ro
                         Column<Decimal> col = make_decimal_column(v.type);
                         col.resize(out_len, Decimal{v.units});
                         return col;
+                    } else if constexpr (std::is_same_v<T, NullScalar>) {
+                        return Column<std::int64_t>{};  // rejected above
                     } else {
                         static_assert(std::is_same_v<T, Timestamp>);
                         Column<Timestamp> col;

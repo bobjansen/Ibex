@@ -7,6 +7,7 @@
 #include <ibex/core/text.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/format.hpp>
+#include <ibex/ir/builder.hpp>
 #include <ibex/ir/cardinality.hpp>
 #include <ibex/ir/distinct_key_reduction.hpp>
 #include <ibex/ir/expr_predicates.hpp>
@@ -1655,101 +1656,6 @@ auto is_cast_callee(std::string_view callee) -> bool {
            callee == "Float32" || callee == "Date";
 }
 
-/// Applies an element-wise column type cast.
-auto apply_column_cast(const runtime::ColumnValue& col, std::string_view callee)
-    -> std::expected<runtime::ColumnValue, std::string> {
-    if (callee == "Date") {
-        if (const auto* src = std::get_if<Column<Timestamp>>(&col)) {
-            Column<Date> dst;
-            dst.reserve(src->size());
-            for (const Timestamp ts : *src) {
-                dst.push_back(timestamp_to_date(ts));
-            }
-            return runtime::ColumnValue{std::move(dst)};
-        }
-        if (std::holds_alternative<Column<Date>>(col)) {
-            return col;
-        }
-        return std::unexpected("Date(): cannot cast column to Date");
-    }
-    const bool to_int = (callee == "Int64" || callee == "Int32" || callee == "Int");
-    if (to_int) {
-        if (std::holds_alternative<Column<std::int64_t>>(col)) {
-            return col;
-        }
-        if (std::holds_alternative<Column<double>>(col)) {
-            const auto& src = std::get<Column<double>>(col);
-            for (const double v : src) {
-                if (v != std::trunc(v)) {
-                    return std::unexpected(std::string(callee) +
-                                           "(): cannot cast non-integer Float column to Int (use "
-                                           "floor(), ceil(), or round())");
-                }
-            }
-            Column<std::int64_t> dst;
-            dst.reserve(src.size());
-            for (double v : src) {
-                dst.push_back(static_cast<std::int64_t>(v));
-            }
-            return runtime::ColumnValue{std::move(dst)};
-        }
-        return std::unexpected(std::string(callee) + "(): cannot cast column to Int");
-    }
-    // Float64 / Float32
-    if (std::holds_alternative<Column<double>>(col)) {
-        return col;
-    }
-    if (std::holds_alternative<Column<std::int64_t>>(col)) {
-        const auto& src = std::get<Column<std::int64_t>>(col);
-        Column<double> dst;
-        dst.reserve(src.size());
-        for (std::int64_t v : src) {
-            dst.push_back(static_cast<double>(v));
-        }
-        return runtime::ColumnValue{std::move(dst)};
-    }
-    return std::unexpected(std::string(callee) + "(): cannot cast column to Float");
-}
-
-/// round's mode: `Nearest` or `RoundMode::Nearest` (SPEC.md Section 3.7).
-auto extract_round_mode(const parser::Expr& arg) -> std::expected<RoundMode, std::string> {
-    const auto* ident = std::get_if<parser::IdentifierExpr>(&arg.node);
-    if (ident == nullptr || ident->lexical) {
-        return std::unexpected(
-            "round(): expected a RoundMode such as Nearest or RoundMode::Nearest");
-    }
-    auto mode = resolve_round_mode(ident->name);
-    if (!mode.has_value()) {
-        return std::unexpected("round(): " + mode.error());
-    }
-    return *mode;
-}
-
-auto round_value(double v, RoundMode mode) -> std::int64_t {
-    switch (mode) {
-        case RoundMode::Nearest:
-            return static_cast<std::int64_t>(std::llround(v));
-        case RoundMode::Bankers:
-            return static_cast<std::int64_t>(std::llrint(v));  // FE_TONEAREST: ties to even
-        case RoundMode::Floor:
-            return static_cast<std::int64_t>(std::floor(v));
-        case RoundMode::Ceil:
-            return static_cast<std::int64_t>(std::ceil(v));
-        case RoundMode::Trunc:
-            break;
-    }
-    return static_cast<std::int64_t>(std::trunc(v));
-}
-
-auto apply_column_round(const Column<double>& src, RoundMode mode) -> Column<std::int64_t> {
-    Column<std::int64_t> dst;
-    dst.reserve(src.size());
-    for (const double v : src) {
-        dst.push_back(round_value(v, mode));
-    }
-    return dst;
-}
-
 void print_schema(const runtime::Table& table) {
     ibex::formatting::print("columns:\n");
     for (const auto& entry : table.columns) {
@@ -2441,10 +2347,6 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                       const runtime::ExternRegistry& externs)
     -> std::expected<runtime::ScalarValue, std::string>;
 
-auto apply_scalar_call(const parser::CallExpr& call, runtime::ScalarValue value,
-                       const runtime::ExternRegistry& externs)
-    -> std::expected<runtime::ScalarValue, std::string>;
-
 /// A bare NULL has no type of its own; where a declaration names one -- an
 /// annotated `let`, a parameter, a return type -- it is a null of that type.
 /// Anything else is evaluated as usual.
@@ -2594,6 +2496,61 @@ auto eval_model_predict(parser::CallExpr& call, runtime::TableRegistry& tables,
     return runtime::predict_model(it->second, newdata.value(), externs);
 }
 
+/// A call only the REPL can evaluate: it reads a table (`scalar`), calls a
+/// user `fn` or an extern, reads a model, or aggregates a series. Unknown
+/// names stay here too, for the REPL's list of what is available. Everything
+/// else in a scalar expression -- operators, `case`, casts, `round`, string
+/// interpolation, NULL, the row-local builtins -- is the runtime's.
+auto is_repl_call(const parser::CallExpr& call, const FunctionRegistry& functions,
+                  const ExternDeclRegistry& extern_decls) -> bool {
+    if (call.callee == "scalar" || functions.contains(call.callee) ||
+        extern_decls.contains(call.callee) || is_model_scalar_accessor(call.callee) ||
+        ir::is_aggregate_func(call.callee)) {
+        return true;
+    }
+    return !(call.callee == "__null" || call.callee == "__interp" || call.callee == "round" ||
+             is_cast_callee(call.callee) || runtime::is_scalar_builtin(call.callee));
+}
+
+/// True when `expr` holds a call only the REPL can evaluate.
+auto contains_repl_call(const parser::Expr& expr, const FunctionRegistry& functions,
+                        const ExternDeclRegistry& extern_decls) -> bool {
+    const auto holds = [&](const parser::ExprPtr& e) {
+        return e != nullptr && contains_repl_call(*e, functions, extern_decls);
+    };
+    return std::visit(
+        [&](const auto& node) -> bool {
+            using N = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<N, parser::CallExpr>) {
+                return is_repl_call(node, functions, extern_decls) ||
+                       std::ranges::any_of(node.args, holds) ||
+                       std::ranges::any_of(node.named_args, [&](const parser::NamedArg& arg) {
+                           return holds(arg.value);
+                       });
+            } else if constexpr (std::is_same_v<N, parser::CaseExpr>) {
+                return holds(node.selector) || holds(node.else_value) ||
+                       std::ranges::any_of(node.arms, [&](const parser::CaseArm& arm) {
+                           return holds(arm.condition) || holds(arm.value);
+                       });
+            } else if constexpr (std::is_same_v<N, parser::UnaryExpr> ||
+                                 std::is_same_v<N, parser::GroupExpr>) {
+                return holds(node.expr);
+            } else if constexpr (std::is_same_v<N, parser::BinaryExpr>) {
+                return holds(node.left) || holds(node.right);
+            } else {
+                return false;
+            }
+        },
+        expr.node);
+}
+
+auto eval_on_runtime(parser::Expr& expr, bool allow_series, runtime::TableRegistry& tables,
+                     LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
+                     ColumnRegistry& columns, ModelRegistry& models,
+                     const FunctionRegistry& functions, CompileTimeListRegistry& compile_time_lists,
+                     const ExternDeclRegistry& extern_decls, const runtime::ExternRegistry& externs)
+    -> std::expected<EvalValue, std::string>;
+
 auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
                      LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
                      ColumnRegistry& columns, ModelRegistry& models,
@@ -2615,29 +2572,17 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
         }
         return EvalValue{std::move(series->column)};
     }
-    // String interpolation (`...${expr}...`) lowers to a __interp call; it always
-    // produces a scalar string.
+    // Operators, literals, `case`, casts, round, templates, NULL and the
+    // row-local builtins run on the runtime's engine: over a series, as a
+    // column. The calls only the REPL can evaluate are handled below.
     if (const auto* call = std::get_if<parser::CallExpr>(&expr.node);
-        call != nullptr && call->callee == "__interp") {
-        auto scalar = eval_scalar_expr(expr, tables, lazy_tables, scalars, columns, models,
-                                       functions, compile_time_lists, extern_decls, externs);
-        if (!scalar) {
-            return std::unexpected(scalar.error());
-        }
-        return EvalValue{std::move(scalar.value())};
-    }
-    const auto* null_call = std::get_if<parser::CallExpr>(&expr.node);
-    if (std::holds_alternative<parser::LiteralExpr>(expr.node) ||
+        std::holds_alternative<parser::LiteralExpr>(expr.node) ||
         std::holds_alternative<parser::BinaryExpr>(expr.node) ||
         std::holds_alternative<parser::UnaryExpr>(expr.node) ||
         std::holds_alternative<parser::CaseExpr>(expr.node) ||
-        (null_call != nullptr && null_call->callee == "__null" && null_call->args.empty())) {
-        auto scalar = eval_scalar_expr(expr, tables, lazy_tables, scalars, columns, models,
-                                       functions, compile_time_lists, extern_decls, externs);
-        if (!scalar) {
-            return std::unexpected(scalar.error());
-        }
-        return EvalValue{std::move(scalar.value())};
+        (call != nullptr && !is_repl_call(*call, functions, extern_decls))) {
+        return eval_on_runtime(expr, /*allow_series=*/true, tables, lazy_tables, scalars, columns,
+                               models, functions, compile_time_lists, extern_decls, externs);
     }
     if (const auto* ident = std::get_if<parser::IdentifierExpr>(&expr.node)) {
         if (auto it = scalars.find(ident->name); it != scalars.end()) {
@@ -2669,56 +2614,6 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
                 return std::unexpected(scalar.error());
             }
             return EvalValue{std::move(scalar.value())};
-        }
-        if (is_cast_callee(call->callee) && call->args.size() == 1) {
-            auto inner =
-                eval_expr_value(*call->args[0], tables, lazy_tables, scalars, columns, models,
-                                functions, compile_time_lists, extern_decls, externs);
-            if (!inner) {
-                return std::unexpected(inner.error());
-            }
-            if (auto* col = std::get_if<runtime::ColumnValue>(&inner.value())) {
-                auto result = apply_column_cast(*col, call->callee);
-                if (!result) {
-                    return std::unexpected(result.error());
-                }
-                return EvalValue{std::move(result.value())};
-            }
-            if (auto* scalar = std::get_if<runtime::ScalarValue>(&inner.value())) {
-                auto result = apply_scalar_call(*call, std::move(*scalar), externs);
-                if (!result) {
-                    return std::unexpected(result.error());
-                }
-                return EvalValue{std::move(result.value())};
-            }
-            return std::unexpected(std::string(call->callee) + "(): cannot cast a table");
-        }
-        if (call->callee == "round" && call->args.size() == 2) {
-            auto mode = extract_round_mode(*call->args[1]);
-            if (!mode) {
-                return std::unexpected(mode.error());
-            }
-            auto inner =
-                eval_expr_value(*call->args[0], tables, lazy_tables, scalars, columns, models,
-                                functions, compile_time_lists, extern_decls, externs);
-            if (!inner) {
-                return std::unexpected(inner.error());
-            }
-            if (auto* col = std::get_if<runtime::ColumnValue>(&inner.value())) {
-                if (!std::holds_alternative<Column<double>>(*col)) {
-                    return std::unexpected("round(): column must be Float");
-                }
-                return EvalValue{runtime::ColumnValue{
-                    apply_column_round(std::get<Column<double>>(*col), *mode)}};
-            }
-            if (auto* scalar = std::get_if<runtime::ScalarValue>(&inner.value())) {
-                auto result = apply_scalar_call(*call, std::move(*scalar), externs);
-                if (!result) {
-                    return std::unexpected(result.error());
-                }
-                return EvalValue{std::move(result.value())};
-            }
-            return std::unexpected("round(): cannot round a table");
         }
         if (call->callee == "print") {
             if (call->args.size() != 1 || !call->named_args.empty()) {
@@ -2784,11 +2679,9 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
             }
             return EvalValue{std::move(table.value())};
         }
-        // Series functions: aggregates over a series (max/sum/mean/… -> scalar)
-        // and row-wise scalar builtins (sqrt/abs/pmax/… -> scalar, or a series
-        // when applied element-wise to series arguments). Routed here rather than
-        // treated as a table function.
-        if (ir::is_aggregate_func(call->callee) || runtime::is_scalar_builtin(call->callee)) {
+        // Aggregates over a series (max/sum/mean/… -> scalar), routed here
+        // rather than treated as a table function.
+        if (ir::is_aggregate_func(call->callee)) {
             return eval_series_call(*call, tables, lazy_tables, scalars, columns, models, functions,
                                     compile_time_lists, extern_decls, externs);
         }
@@ -2825,93 +2718,36 @@ auto eval_scalar_operator(const parser::Expr& node, const runtime::ScalarRegistr
     return runtime::evaluate_scalar_expr(*lowered, &operands, &externs);
 }
 
-/// `call` (a cast, or `round(_, mode)`) applied to one evaluated scalar, on the
-/// runtime's engine like every scalar operator. The value stands in for the
-/// call's first argument; the rest -- `round`'s mode -- are enum members.
-auto apply_scalar_call(const parser::CallExpr& call, runtime::ScalarValue value,
-                       const runtime::ExternRegistry& externs)
-    -> std::expected<runtime::ScalarValue, std::string> {
-    parser::CallExpr applied;
-    applied.callee = call.callee;
-    applied.args.push_back(operand_ref("__operand"));
-    for (std::size_t i = 1; i < call.args.size(); ++i) {
-        const auto* member = std::get_if<parser::IdentifierExpr>(&call.args[i]->node);
-        if (member == nullptr) {
-            return std::unexpected(call.callee + "(): expected a single value argument");
-        }
-        auto arg = std::make_unique<parser::Expr>();
-        arg->node = *member;
-        applied.args.push_back(std::move(arg));
-    }
-    parser::Expr node;
-    node.node = std::move(applied);
-    runtime::ScalarRegistry operands;
-    operands.insert_or_assign("__operand", std::move(value));
-    return eval_scalar_operator(node, operands, externs);
-}
-
-/// A call only the REPL can evaluate: it reads a table (`scalar`), calls a
-/// user `fn` or an extern, reads a model, or aggregates a series. Unknown
-/// names stay here too, for the REPL's list of what is available. Everything
-/// else in a scalar expression -- operators, `case`, casts, `round`, string
-/// interpolation, NULL, the row-local builtins -- is the runtime's.
-auto is_repl_call(const parser::CallExpr& call, const FunctionRegistry& functions,
-                  const ExternDeclRegistry& extern_decls) -> bool {
-    if (call.callee == "scalar" || functions.contains(call.callee) ||
-        extern_decls.contains(call.callee) || is_model_scalar_accessor(call.callee) ||
-        ir::is_aggregate_func(call.callee)) {
-        return true;
-    }
-    return !(call.callee == "__null" || call.callee == "__interp" || call.callee == "round" ||
-             is_cast_callee(call.callee) || runtime::is_scalar_builtin(call.callee));
-}
-
-/// True when `expr` holds a call only the REPL can evaluate.
-auto contains_repl_call(const parser::Expr& expr, const FunctionRegistry& functions,
-                        const ExternDeclRegistry& extern_decls) -> bool {
-    const auto holds = [&](const parser::ExprPtr& e) {
-        return e != nullptr && contains_repl_call(*e, functions, extern_decls);
-    };
-    return std::visit(
-        [&](const auto& node) -> bool {
-            using N = std::decay_t<decltype(node)>;
-            if constexpr (std::is_same_v<N, parser::CallExpr>) {
-                return is_repl_call(node, functions, extern_decls) ||
-                       std::ranges::any_of(node.args, holds) ||
-                       std::ranges::any_of(node.named_args, [&](const parser::NamedArg& arg) {
-                           return holds(arg.value);
-                       });
-            } else if constexpr (std::is_same_v<N, parser::CaseExpr>) {
-                return holds(node.selector) || holds(node.else_value) ||
-                       std::ranges::any_of(node.arms, [&](const parser::CaseArm& arm) {
-                           return holds(arm.condition) || holds(arm.value);
-                       });
-            } else if constexpr (std::is_same_v<N, parser::UnaryExpr> ||
-                                 std::is_same_v<N, parser::GroupExpr>) {
-                return holds(node.expr);
-            } else if constexpr (std::is_same_v<N, parser::BinaryExpr>) {
-                return holds(node.left) || holds(node.right);
-            } else {
-                return false;
-            }
-        },
-        expr.node);
-}
-
-/// A scalar expression on the runtime's engine, the one that evaluates cells,
-/// so a scalar statement means what the same expression means in a column.
+/// An expression on the runtime's engine, the one that evaluates cells and
+/// columns, so a statement means what the same expression means in a table.
 /// The parts only the REPL can evaluate (`is_repl_call`, or a `case` holding
-/// one) are evaluated first and stand in as operands; a bound name is passed
-/// as itself.
-auto eval_scalar_on_runtime(parser::Expr& expr, runtime::TableRegistry& tables,
-                            LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
-                            ColumnRegistry& columns, ModelRegistry& models,
-                            const FunctionRegistry& functions,
-                            CompileTimeListRegistry& compile_time_lists,
-                            const ExternDeclRegistry& extern_decls,
-                            const runtime::ExternRegistry& externs)
-    -> std::expected<runtime::ScalarValue, std::string> {
+/// one) are evaluated first and stand in as operands; a bound scalar is passed
+/// as itself. With `allow_series`, a series binding (or a REPL part that yields
+/// a series) becomes a column of a one-off frame, and the expression is
+/// evaluated over it as a column; otherwise a series is an error.
+auto eval_on_runtime(parser::Expr& expr, bool allow_series, runtime::TableRegistry& tables,
+                     LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
+                     ColumnRegistry& columns, ModelRegistry& models,
+                     const FunctionRegistry& functions, CompileTimeListRegistry& compile_time_lists,
+                     const ExternDeclRegistry& extern_decls, const runtime::ExternRegistry& externs)
+    -> std::expected<EvalValue, std::string> {
     runtime::ScalarRegistry operands;
+    runtime::Table frame;
+    std::string error;
+    const auto add_series = [&](const std::string& name, const runtime::ColumnValue& column) {
+        if (!allow_series) {
+            error = "expected scalar expression";
+            return false;
+        }
+        if (!frame.columns.empty() && runtime::column_size(column) != frame.rows()) {
+            error = "series arguments have different lengths";
+            return false;
+        }
+        if (frame.find(name) == nullptr) {
+            frame.add_column(name, column);
+        }
+        return true;
+    };
     // The subtrees the REPL evaluated, swapped for their operand's name while
     // the runtime reads the expression, and swapped back on the way out.
     std::vector<std::pair<parser::Expr*, decltype(parser::Expr::node)>> swapped;
@@ -2920,7 +2756,6 @@ auto eval_scalar_on_runtime(parser::Expr& expr, runtime::TableRegistry& tables,
             at->node = std::move(node);
         }
     };
-    std::string error;
     std::function<bool(parser::Expr&)> bind;
     const auto bind_ptr = [&bind](const parser::ExprPtr& e) { return e == nullptr || bind(*e); };
     bind = [&](parser::Expr& e) -> bool {
@@ -2929,22 +2764,46 @@ auto eval_scalar_on_runtime(parser::Expr& expr, runtime::TableRegistry& tables,
                 operands.insert_or_assign(ident->name, it->second);
                 return true;
             }
-            error = columns.contains(ident->name) ? std::string("expected scalar expression")
-                                                  : "unknown scalar: " + ident->name;
+            if (const auto it = columns.find(ident->name); it != columns.end()) {
+                return add_series(ident->name, it->second);
+            }
+            error = "unknown scalar: " + ident->name;
             return false;
         }
+        // A series literal (`[1, 2, 3]`) is the REPL's to build, like a call
+        // only it can evaluate.
         const auto* call = std::get_if<parser::CallExpr>(&e.node);
-        if ((call != nullptr && is_repl_call(*call, functions, extern_decls)) ||
+        const bool series_literal = std::holds_alternative<parser::ArrayLiteralExpr>(e.node);
+        if (series_literal || (call != nullptr && is_repl_call(*call, functions, extern_decls)) ||
             (std::holds_alternative<parser::CaseExpr>(e.node) &&
              contains_repl_call(e, functions, extern_decls))) {
-            auto value = eval_scalar_expr(e, tables, lazy_tables, scalars, columns, models,
-                                          functions, compile_time_lists, extern_decls, externs);
-            if (!value) {
-                error = value.error();
-                return false;
-            }
             std::string name = "__repl_operand_" + std::to_string(swapped.size());
-            operands.insert_or_assign(name, std::move(*value));
+            if (allow_series && (call != nullptr || series_literal)) {
+                auto value = eval_expr_value(e, tables, lazy_tables, scalars, columns, models,
+                                             functions, compile_time_lists, extern_decls, externs);
+                if (!value) {
+                    error = value.error();
+                    return false;
+                }
+                if (auto* column = std::get_if<runtime::ColumnValue>(&*value)) {
+                    if (!add_series(name, *column)) {
+                        return false;
+                    }
+                } else if (auto* scalar = std::get_if<runtime::ScalarValue>(&*value)) {
+                    operands.insert_or_assign(name, std::move(*scalar));
+                } else {
+                    error = "a table where a value was expected";
+                    return false;
+                }
+            } else {
+                auto value = eval_scalar_expr(e, tables, lazy_tables, scalars, columns, models,
+                                              functions, compile_time_lists, extern_decls, externs);
+                if (!value) {
+                    error = value.error();
+                    return false;
+                }
+                operands.insert_or_assign(name, std::move(*value));
+            }
             auto saved = std::move(e.node);
             e.node = parser::IdentifierExpr{.name = std::move(name), .lexical = false};
             swapped.emplace_back(&e, std::move(saved));
@@ -2986,18 +2845,73 @@ auto eval_scalar_on_runtime(parser::Expr& expr, runtime::TableRegistry& tables,
             },
             e.node);
     };
-    const bool bound = bind(expr);
-    std::expected<runtime::ScalarValue, std::string> result = std::unexpected(error);
-    if (bound) {
-        parser::LowerContext context;
-        if (auto lowered = parser::lower_value_expr(expr, context); lowered.has_value()) {
-            result = runtime::evaluate_scalar_expr(*lowered, &operands, &externs);
-        } else {
-            result = std::unexpected(lowered.error().message);
+    const auto evaluate = [&]() -> std::expected<EvalValue, std::string> {
+        if (!bind(expr)) {
+            return std::unexpected(error);
         }
-    }
+        parser::LowerContext context;
+        auto lowered = parser::lower_value_expr(expr, context);
+        if (!lowered) {
+            return std::unexpected(lowered.error().message);
+        }
+        if (frame.columns.empty()) {
+            auto scalar = runtime::evaluate_scalar_expr(*lowered, &operands, &externs);
+            if (!scalar) {
+                return std::unexpected(scalar.error());
+            }
+            return EvalValue{std::move(*scalar)};
+        }
+        // Over a series: the expression is a field of an update on the frame,
+        // the same plan a `select { v = ... }` runs.
+        constexpr std::string_view kFrame = "__series";
+        constexpr std::string_view kValue = "__value";
+        ir::Builder builder;
+        auto update = builder.update(
+            {ir::FieldSpec{.alias = std::string(kValue), .expr = std::move(*lowered)}});
+        update->add_child(builder.scan(std::string(kFrame)));
+        auto project = builder.project({ir::ColumnRef{.name = std::string(kValue)}});
+        project->add_child(std::move(update));
+        runtime::TableRegistry registry;
+        registry.emplace(std::string(kFrame), std::move(frame));
+        auto result = runtime::interpret(*project, registry, &operands, &externs);
+        if (!result) {
+            return std::unexpected(result.error());
+        }
+        const auto* entry = result->find_entry(std::string(kValue));
+        if (entry == nullptr) {
+            return std::unexpected("internal: series expression produced no column");
+        }
+        if (entry->validity.has_value()) {
+            const auto& validity = *entry->validity;
+            for (std::size_t row = 0; row < validity.size(); ++row) {
+                if (!validity[row]) {
+                    return std::unexpected(std::string{kNullSeriesBindingError});
+                }
+            }
+        }
+        return EvalValue{*entry->column};
+    };
+    auto result = evaluate();
     restore();
     return result;
+}
+
+/// A scalar expression on the runtime's engine; a series in it is an error.
+auto eval_scalar_on_runtime(parser::Expr& expr, runtime::TableRegistry& tables,
+                            LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
+                            ColumnRegistry& columns, ModelRegistry& models,
+                            const FunctionRegistry& functions,
+                            CompileTimeListRegistry& compile_time_lists,
+                            const ExternDeclRegistry& extern_decls,
+                            const runtime::ExternRegistry& externs)
+    -> std::expected<runtime::ScalarValue, std::string> {
+    auto value =
+        eval_on_runtime(expr, /*allow_series=*/false, tables, lazy_tables, scalars, columns, models,
+                        functions, compile_time_lists, extern_decls, externs);
+    if (!value) {
+        return std::unexpected(value.error());
+    }
+    return std::get<runtime::ScalarValue>(std::move(*value));
 }
 
 auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
@@ -3222,67 +3136,6 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                                   compile_time_lists, extern_decls, externs);
 }
 
-// Extract element `i` of a column as a scalar (Categorical/String -> std::string).
-auto column_element(const runtime::ColumnValue& col, std::size_t i) -> runtime::ScalarValue {
-    return std::visit(
-        [i](const auto& c) -> runtime::ScalarValue {
-            auto value = c[i];
-            using V = std::decay_t<decltype(value)>;
-            if constexpr (std::is_same_v<V, std::string_view>) {
-                return runtime::ScalarValue{std::string(value)};
-            } else if constexpr (std::is_same_v<V, Decimal>) {
-                return runtime::ScalarValue{
-                    DecimalValue{.units = value.units, .type = runtime::decimal_type_of(c)}};
-            } else {
-                return runtime::ScalarValue{value};
-            }
-        },
-        col);
-}
-
-// Build a homogeneous column from a sequence of scalar values (all the same
-// variant alternative). Used to materialize an element-wise builtin result.
-auto column_from_scalars(const std::vector<runtime::ScalarValue>& vals)
-    -> std::expected<runtime::ColumnValue, std::string> {
-    if (vals.empty()) {
-        return std::unexpected("internal: empty element-wise result");
-    }
-    return std::visit(
-        [&](const auto& first) -> std::expected<runtime::ColumnValue, std::string> {
-            using T = std::decay_t<decltype(first)>;
-            if constexpr (std::is_same_v<T, ibex::NullScalar>) {
-                return std::unexpected("element-wise result is null");
-            } else if constexpr (std::is_same_v<T, DecimalValue>) {
-                DecimalType unified = first.type;
-                for (const auto& v : vals) {
-                    const auto* p = std::get_if<DecimalValue>(&v);
-                    if (p == nullptr) {
-                        return std::unexpected("element-wise result has inconsistent types");
-                    }
-                    unified = decimal::union_type(unified, p->type);
-                }
-                auto col = runtime::make_decimal_column(unified);
-                col.reserve(vals.size());
-                for (const auto& v : vals) {
-                    col.push_back(Decimal{runtime::decimal_units_for(v, unified)});
-                }
-                return runtime::ColumnValue{std::move(col)};
-            } else {
-                Column<T> col;
-                col.reserve(vals.size());
-                for (const auto& v : vals) {
-                    const auto* p = std::get_if<T>(&v);
-                    if (p == nullptr) {
-                        return std::unexpected("element-wise result has inconsistent types");
-                    }
-                    col.push_back(*p);
-                }
-                return runtime::ColumnValue{std::move(col)};
-            }
-        },
-        vals.front());
-}
-
 auto eval_series_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                       LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
                       ColumnRegistry& columns, ModelRegistry& models,
@@ -3339,60 +3192,7 @@ auto eval_series_call(parser::CallExpr& call, runtime::TableRegistry& tables,
         return EvalValue{std::move(result.value())};
     }
 
-    // Scalar builtin (abs/sqrt/sin/pmax/...): element-wise when any argument is a
-    // series (broadcasting scalars), otherwise a plain scalar result.
-    std::size_t n = 0;
-    bool any_series = false;
-    for (const auto& v : arg_values) {
-        if (const auto* c = std::get_if<runtime::ColumnValue>(&v)) {
-            any_series = true;
-            const std::size_t len = runtime::column_size(*c);
-            if (!any_series || n == 0) {
-                n = len;
-            }
-            if (len != n) {
-                return std::unexpected(call.callee + "(): series arguments have different lengths");
-            }
-        }
-    }
-    if (!any_series) {
-        std::vector<runtime::ScalarValue> scalar_args;
-        scalar_args.reserve(arg_values.size());
-        for (auto& v : arg_values) {
-            scalar_args.push_back(std::get<runtime::ScalarValue>(v));
-        }
-        auto result = runtime::eval_scalar_builtin(call.callee, scalar_args);
-        if (!result) {
-            return std::unexpected(result.error());
-        }
-        return EvalValue{std::move(result.value())};
-    }
-    if (n == 0) {
-        return std::unexpected(call.callee + "(): cannot apply to an empty series");
-    }
-    std::vector<runtime::ScalarValue> results;
-    results.reserve(n);
-    for (std::size_t i = 0; i < n; ++i) {
-        std::vector<runtime::ScalarValue> row_args;
-        row_args.reserve(arg_values.size());
-        for (const auto& v : arg_values) {
-            if (const auto* c = std::get_if<runtime::ColumnValue>(&v)) {
-                row_args.push_back(column_element(*c, i));
-            } else {
-                row_args.push_back(std::get<runtime::ScalarValue>(v));
-            }
-        }
-        auto r = runtime::eval_scalar_builtin(call.callee, row_args);
-        if (!r) {
-            return std::unexpected(r.error());
-        }
-        results.push_back(std::move(r.value()));
-    }
-    auto col = column_from_scalars(results);
-    if (!col) {
-        return std::unexpected(col.error());
-    }
-    return EvalValue{std::move(col.value())};
+    return std::unexpected(call.callee + "(): not an aggregate");
 }
 
 /// What the lowerer needs to know about a session's bindings to lower one

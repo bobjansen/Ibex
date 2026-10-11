@@ -524,7 +524,7 @@ auto cmp_col_scalar_into_double(ir::CompareOp op, const double* __restrict cp, d
 }  // namespace
 
 // Dispatch column-vs-scalar comparison over all type combinations.
-using LitVal = std::variant<std::int64_t, double, bool, std::string, Date, Timestamp, DecimalValue>;
+using LitVal = decltype(ir::Literal::value);
 namespace {
 
 // `off` is the source offset of `col` and `validity` (a borrowed column under a
@@ -568,6 +568,12 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, std::size_t of
     Mask result;
     result.value.resize(n);
     uint8_t* mp = result.value.data();
+    if (std::holds_alternative<NullScalar>(lit)) {
+        // Comparing with a typed NULL is null on every row (three-valued).
+        std::fill_n(mp, n, uint8_t{0});
+        result.valid = std::vector<uint8_t>(n, 0);
+        return result;
+    }
     if (const auto* bool_col = std::get_if<Column<bool>>(&col)) {
         const auto* value = std::get_if<bool>(&lit);
         if (value == nullptr) {
@@ -1612,6 +1618,11 @@ auto eval_value_vec(const ir::Expr& expr, const PredicateInput& input,
                 return std::unexpected("filter: unknown column '" + node.name + "'");
             } else if constexpr (std::is_same_v<T, ir::Literal>) {
                 // Broadcast literal into a full column (fallback; common path avoids this).
+                if (const auto* null = std::get_if<NullScalar>(&node.value)) {
+                    // A typed NULL: a column of its type, every row null.
+                    auto [column, validity] = null_column(*null, n);
+                    return ColResult{std::move(column), std::move(validity)};
+                }
                 return ColResult{broadcast_scalar_column(scalar_from_literal(node), n)};
             } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
                 auto lhs = eval_value_vec(*node.left, input, scalars, rows, window, window_aligned);

@@ -1619,15 +1619,20 @@ class Parser {
                                                  "): precision must be 1..38 and scale "
                                                  "0..precision");
             }
-            const bool null_arg = is_null_literal(*arg);
+            if (is_null_literal(*arg)) {
+                return make_typed_null(
+                    ScalarKind::Decimal,
+                    DecimalType{.precision = static_cast<std::uint8_t>(*precision),
+                                .scale = static_cast<std::uint8_t>(*scale)});
+            }
             std::vector<ExprPtr> cast_args;
-            cast_args.push_back(null_arg ? make_literal(std::int64_t{0}) : std::move(arg));
+            cast_args.push_back(std::move(arg));
             cast_args.push_back(make_literal(*precision));
             cast_args.push_back(make_literal(*scale));
             auto cast_expr = std::make_unique<Expr>();
             cast_expr->node =
                 CallExpr{.callee = "Decimal", .args = std::move(cast_args), .named_args = {}};
-            return null_arg ? make_typed_null(std::move(cast_expr)) : std::move(cast_expr);
+            return cast_expr;
         }
         // Type-name cast: Int64(expr), Float64(expr), Int32(expr), Float32(expr),
         // Int(expr), Date(expr)
@@ -1644,13 +1649,17 @@ class Parser {
                 if (!consume(TokenKind::RParen, "expected ')' after cast argument")) {
                     return nullptr;
                 }
-                const bool null_arg = is_null_literal(*arg);
+                if (is_null_literal(*arg)) {
+                    return make_typed_null(type_name == "Date"              ? ScalarKind::Date
+                                           : type_name.starts_with("Float") ? ScalarKind::Double
+                                                                            : ScalarKind::Int);
+                }
                 std::vector<ExprPtr> cast_args;
-                cast_args.push_back(null_arg ? make_literal(std::int64_t{0}) : std::move(arg));
+                cast_args.push_back(std::move(arg));
                 auto cast_expr = std::make_unique<Expr>();
                 cast_expr->node = CallExpr{
                     .callee = std::move(type_name), .args = std::move(cast_args), .named_args = {}};
-                return null_arg ? make_typed_null(std::move(cast_expr)) : std::move(cast_expr);
+                return cast_expr;
             }
             return fail_expr(previous(), "expected '(' after type name in cast expression");
         }
@@ -1669,7 +1678,7 @@ class Parser {
                 return nullptr;
             }
             if (is_null_literal(*arg)) {
-                return make_typed_null(make_literal(std::string{}));
+                return make_typed_null(ScalarKind::String);
             }
             auto empty_segment = [] {
                 auto lit = std::make_unique<Expr>();
@@ -3376,14 +3385,10 @@ class Parser {
     /// spelled as the typed-null form the language already has -- a `case`
     /// whose never-taken arm fixes the type: `case { false => T(0), else =>
     /// NULL }`. Every evaluation path already runs it.
-    static auto make_typed_null(ExprPtr typed_zero) -> ExprPtr {
-        auto null_value = std::make_unique<Expr>();
-        null_value->node = CallExpr{.callee = "__null", .args = {}, .named_args = {}};
-        std::vector<CaseArm> arms;
-        arms.push_back(CaseArm{.condition = make_literal(false), .value = std::move(typed_zero)});
+    /// `T(NULL)`: a NULL of the cast's type, as a literal.
+    static auto make_typed_null(ScalarKind kind, DecimalType decimal = {}) -> ExprPtr {
         auto expr = std::make_unique<Expr>();
-        expr->node = CaseExpr{
-            .selector = nullptr, .arms = std::move(arms), .else_value = std::move(null_value)};
+        expr->node = LiteralExpr{.value = NullScalar{kind, decimal}};
         return expr;
     }
 

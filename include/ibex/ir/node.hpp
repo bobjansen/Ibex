@@ -4,6 +4,7 @@
 #pragma once
 
 #include <ibex/core/decimal.hpp>
+#include <ibex/core/scalar_value.hpp>
 #include <ibex/core/time.hpp>
 
 #include <algorithm>
@@ -106,7 +107,9 @@ class ExprPtr {
 };
 
 struct Literal {
-    std::variant<std::int64_t, double, bool, std::string, Date, Timestamp, DecimalValue> value;
+    /// `NullScalar`: a NULL of the type written where it stands (`Int64(NULL)`).
+    std::variant<std::int64_t, double, bool, std::string, Date, Timestamp, DecimalValue, NullScalar>
+        value;
 };
 
 enum class ArithmeticOp : std::uint8_t {

@@ -1533,9 +1533,19 @@ auto eval_series_literal(const parser::ArrayLiteralExpr& array,
     std::vector<bool> valid;
     bool any_null = false;
     std::optional<std::size_t> type_index;
+    // A typed NULL element (`Int64(NULL)`) is a hole like `null`, and gives an
+    // all-null literal its type.
+    std::optional<NullScalar> null_type;
 
     for (const auto& element : array.elements) {
-        if (is_null_literal_expr(*element)) {
+        const auto* typed_null = [&]() -> const NullScalar* {
+            const auto* lit = std::get_if<parser::LiteralExpr>(&element->node);
+            return lit != nullptr ? std::get_if<NullScalar>(&lit->value) : nullptr;
+        }();
+        if (typed_null != nullptr && !null_type.has_value()) {
+            null_type = *typed_null;
+        }
+        if (typed_null != nullptr || is_null_literal_expr(*element)) {
             any_null = true;
             valid.resize(values.size(), true);
             valid.push_back(false);
@@ -1565,6 +1575,27 @@ auto eval_series_literal(const parser::ArrayLiteralExpr& array,
         // Give every hole a value of the column's type, so the builders below
         // can read `values` without a per-element null check.
         LiteralValue placeholder{std::int64_t{0}};
+        if (!type_index.has_value() && null_type.has_value()) {
+            placeholder = [&]() -> LiteralValue {
+                switch (null_type->kind) {
+                    case runtime::ScalarKind::Int:
+                        return std::int64_t{0};
+                    case runtime::ScalarKind::Double:
+                        return 0.0;
+                    case runtime::ScalarKind::Bool:
+                        return false;
+                    case runtime::ScalarKind::String:
+                        return std::string{};
+                    case runtime::ScalarKind::Date:
+                        return Date{};
+                    case runtime::ScalarKind::Timestamp:
+                        return Timestamp{};
+                    case runtime::ScalarKind::Decimal:
+                        return DecimalValue{.units = 0, .type = null_type->decimal};
+                }
+                return std::int64_t{0};
+            }();
+        }
         if (type_index.has_value()) {
             std::size_t first_valid = 0;
             while (!valid[first_valid]) {
@@ -1575,6 +1606,8 @@ auto eval_series_literal(const parser::ArrayLiteralExpr& array,
                     using T = std::decay_t<decltype(v)>;
                     if constexpr (std::is_same_v<T, DecimalValue>) {
                         return DecimalValue{.units = 0, .type = v.type};
+                    } else if constexpr (std::is_same_v<T, NullScalar>) {
+                        return std::int64_t{0};  // a typed NULL is a hole, never a value
                     } else {
                         return T{};
                     }
@@ -1593,8 +1626,9 @@ auto eval_series_literal(const parser::ArrayLiteralExpr& array,
     runtime::ColumnValue out = std::visit(
         [&](const auto& first_val) -> runtime::ColumnValue {
             using T = std::decay_t<decltype(first_val)>;
-            if constexpr (std::is_same_v<T, parser::DurationLiteral>) {
-                return Column<std::int64_t>{};  // excluded above
+            if constexpr (std::is_same_v<T, parser::DurationLiteral> ||
+                          std::is_same_v<T, NullScalar>) {
+                return Column<std::int64_t>{};  // excluded above; NULLs are holes
             } else if constexpr (std::is_same_v<T, DecimalValue>) {
                 // Decimal: one column type for the list, the narrowest holding
                 // every element exactly.

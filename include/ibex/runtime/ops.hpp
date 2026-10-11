@@ -381,6 +381,8 @@ void stream_append_row(runtime::Table& dst, const runtime::Table& src, std::size
 [[nodiscard]] auto date_lit(Date v) -> ir::Expr;
 [[nodiscard]] auto timestamp_lit(Timestamp v) -> ir::Expr;
 [[nodiscard]] auto decimal_lit(DecimalValue v) -> ir::Expr;
+/// A typed NULL (`Int64(NULL)`), in value and predicate positions alike.
+[[nodiscard]] auto null_lit(NullScalar v) -> ir::Expr;
 [[nodiscard]] auto binop(ir::ArithmeticOp op, ir::Expr lhs, ir::Expr rhs) -> ir::Expr;
 [[nodiscard]] auto fn_call(std::string callee, std::vector<ir::Expr> args,
                            std::vector<NamedArgExpr> named_args = {}) -> ir::Expr;

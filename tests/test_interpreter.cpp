@@ -3210,6 +3210,65 @@ TEST_CASE("a compiled program's scalar lets have the REPL's values",
     CHECK(std::get<double>(scalars.at("m")) == 7.0);
     CHECK(std::get<bool>(scalars.at("c")));
     CHECK(std::get<std::int64_t>(scalars.at("r")) == 1);
+
+    // `let x: Int64 = NULL;`: the declaration types the NULL.
+    const auto typed = require_program("let x: Int64 = NULL; let y: Float64 = NULL;");
+    auto typed_set = parser::collect_scalar_binding_set(typed);
+    REQUIRE(typed_set.has_value());
+    runtime::ScalarRegistry typed_scalars;
+    REQUIRE(runtime::materialize_deferred_scalar_bindings(typed_set->deferred, {}, typed_scalars,
+                                                          nullptr)
+                .has_value());
+    CHECK(std::get<NullScalar>(typed_scalars.at("x")).kind == runtime::ScalarKind::Int);
+    CHECK(std::get<NullScalar>(typed_scalars.at("y")).kind == runtime::ScalarKind::Double);
+}
+
+TEST_CASE("A typed NULL literal is a null of its type in every position", "[interpreter][null]") {
+    runtime::TableRegistry registry;
+    runtime::Table table;
+    table.add_column("a", Column<std::int64_t>{1, 2, 3});
+    registry.emplace("t", table);
+    // As a column value, a case arm, and a column-literal element. An all-null
+    // column literal takes the typed NULL's type rather than the Int64 default.
+    auto ir = require_ir(
+        "t[update { f = Float64(NULL), d = Decimal(NULL, 10, 2), s = String(NULL),"
+        " c = case { a > 1 => a, else => Int64(NULL) } }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto all_null = [&](const char* name) {
+        const auto* entry = result->find_entry(name);
+        REQUIRE(entry != nullptr);
+        REQUIRE(entry->validity.has_value());
+        for (std::size_t row = 0; row < result->rows(); ++row) {
+            CHECK_FALSE((*entry->validity)[row]);
+        }
+        return entry->column.get();
+    };
+    CHECK(std::holds_alternative<Column<double>>(*all_null("f")));
+    CHECK(std::holds_alternative<Column<Decimal>>(*all_null("d")));
+    CHECK(std::holds_alternative<Column<std::string>>(*all_null("s")));
+    const auto* c = result->find_entry("c");
+    REQUIRE(c != nullptr);
+    CHECK(std::holds_alternative<Column<std::int64_t>>(*c->column));
+
+    auto literal =
+        require_ir("Table { x = [Float64(NULL), Float64(NULL)], y = [1, Int64(NULL)] };");
+    auto built = runtime::interpret(*literal, registry);
+    REQUIRE(built.has_value());
+    CHECK(std::holds_alternative<Column<double>>(*built->find("x")));
+    const auto* y = built->find_entry("y");
+    REQUIRE(y != nullptr);
+    REQUIRE(y->validity.has_value());
+    CHECK((*y->validity)[0]);
+    CHECK_FALSE((*y->validity)[1]);
+
+    // A comparison with a typed NULL is null: no row passes, and `|| true` does.
+    auto none = runtime::interpret(*require_ir("t[filter a == Int64(NULL)];"), registry);
+    REQUIRE(none.has_value());
+    CHECK(none->rows() == 0);
+    auto some = runtime::interpret(*require_ir("t[filter a == Int64(NULL) || a > 2];"), registry);
+    REQUIRE(some.has_value());
+    CHECK(some->rows() == 1);
 }
 
 TEST_CASE("text aggregates preserve missing payloads and long strings",

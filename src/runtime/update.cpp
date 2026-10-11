@@ -111,7 +111,7 @@ auto resolve_fast_operand(const ir::Expr& expr, const Table& input, const Scalar
     }
     if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
         const ScalarValue value = scalar_from_literal(*lit);
-        if (is_decimal(value)) {
+        if (is_decimal(value) || is_null_scalar(value)) {
             return std::nullopt;
         }
         return FastOperand{
@@ -5188,7 +5188,8 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
         const auto& field = update.fields().front();
         const auto* literal = std::get_if<ir::Literal>(&field.expr.node);
         const ColumnEntry* old_entry = input.find_entry(field.alias);
-        if (literal != nullptr && old_entry != nullptr) {
+        if (literal != nullptr && old_entry != nullptr &&
+            !std::holds_alternative<NullScalar>(literal->value)) {
             ColumnValue replacement =
                 broadcast_scalar_column(scalar_from_literal(*literal), std::size_t{1});
             auto replacement_values = preserve_categorical_target(

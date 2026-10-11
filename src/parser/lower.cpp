@@ -1088,6 +1088,27 @@ auto is_null_literal(const Expr& expr) -> bool {
            call->named_args.empty();
 }
 
+/// A zero of a typed NULL's type: the stand-in a column stores under it.
+auto zero_literal_of(const NullScalar& null) -> ir::Literal {
+    switch (null.kind) {
+        case ScalarKind::Int:
+            return ir::Literal{.value = std::int64_t{0}};
+        case ScalarKind::Double:
+            return ir::Literal{.value = 0.0};
+        case ScalarKind::Bool:
+            return ir::Literal{.value = false};
+        case ScalarKind::String:
+            return ir::Literal{.value = std::string{}};
+        case ScalarKind::Date:
+            return ir::Literal{.value = Date{}};
+        case ScalarKind::Timestamp:
+            return ir::Literal{.value = Timestamp{}};
+        case ScalarKind::Decimal:
+            return ir::Literal{.value = DecimalValue{.units = 0, .type = null.decimal}};
+    }
+    return ir::Literal{.value = std::int64_t{0}};
+}
+
 /// A zero-valued literal of the same type as `like` — the stand-in stored for a
 /// `null` series element, which the validity bitmap masks out. A Decimal keeps
 /// `like`'s precision and scale so the column's unified type is unaffected.
@@ -1097,6 +1118,8 @@ auto placeholder_for(const ir::Literal& like) -> ir::Literal {
             using T = std::decay_t<decltype(v)>;
             if constexpr (std::is_same_v<T, DecimalValue>) {
                 return ir::Literal{.value = DecimalValue{.units = 0, .type = v.type}};
+            } else if constexpr (std::is_same_v<T, NullScalar>) {
+                return zero_literal_of(v);
             } else {
                 return ir::Literal{.value = T{}};
             }
@@ -2644,11 +2667,21 @@ class Lowerer {
             std::vector<bool> valid;
             elements.reserve(arr->elements.size());
             bool any_null = false;
+            // A typed NULL element (`Int64(NULL)`) is a hole like `null`, and
+            // gives an all-null column its type.
+            std::optional<NullScalar> null_type;
 
             // Determine the type from the first element and validate uniformity.
             int type_tag = -1;  // 0=int, 1=double, 2=bool, 3=string, 4=Date, 5=Timestamp
             for (const auto& elem_ptr : arr->elements) {
-                if (is_null_literal(*elem_ptr)) {
+                const auto* typed_null = [&]() -> const NullScalar* {
+                    const auto* lit = std::get_if<LiteralExpr>(&elem_ptr->node);
+                    return lit != nullptr ? std::get_if<NullScalar>(&lit->value) : nullptr;
+                }();
+                if (typed_null != nullptr && !null_type.has_value()) {
+                    null_type = *typed_null;
+                }
+                if (typed_null != nullptr || is_null_literal(*elem_ptr)) {
                     any_null = true;
                     valid.resize(elements.size(), true);
                     valid.push_back(false);
@@ -2702,15 +2735,16 @@ class Lowerer {
             if (any_null) {
                 // Give every hole a value of the column's type, so downstream
                 // consumers can read `elements` without a per-element null
-                // check. An all-null column has no type to take; it defaults to
-                // Int64, matching the `col = []` rule.
+                // check. An all-null column takes a typed NULL's type, else it
+                // defaults to Int64, matching the `col = []` rule.
                 const auto placeholder = [&] {
                     for (std::size_t i = 0; i < elements.size(); ++i) {
                         if (valid[i]) {
                             return placeholder_for(elements[i]);
                         }
                     }
-                    return ir::Literal{.value = std::int64_t{0}};
+                    return null_type.has_value() ? zero_literal_of(*null_type)
+                                                 : ir::Literal{.value = std::int64_t{0}};
                 }();
                 for (std::size_t i = 0; i < elements.size(); ++i) {
                     if (!valid[i]) {
@@ -5127,6 +5161,9 @@ class Lowerer {
             if (const auto* dec_value = std::get_if<DecimalValue>(&literal->value)) {
                 return ir::Expr{.node = ir::Literal{.value = *dec_value}};
             }
+            if (const auto* null_value = std::get_if<NullScalar>(&literal->value)) {
+                return ir::Expr{.node = ir::Literal{.value = *null_value}};
+            }
             return std::unexpected(LowerError{.message = "unsupported literal in expression"});
         }
         if (const auto* case_expr = std::get_if<CaseExpr>(&expr.node)) {
@@ -5638,6 +5675,9 @@ class Lowerer {
                 }
                 if (const auto* dec_value = std::get_if<DecimalValue>(&literal->value)) {
                     return ir::Expr{.node = ir::Literal{.value = *dec_value}};
+                }
+                if (const auto* null_value = std::get_if<NullScalar>(&literal->value)) {
+                    return ir::Expr{.node = ir::Literal{.value = *null_value}};
                 }
                 return std::unexpected(LowerError{.message = "unsupported literal in expression"});
             }

@@ -43,10 +43,9 @@ using ScalarKind = ibex::ScalarKind;
 using ColumnValue =
     std::variant<Column<std::int64_t>, Column<double>, Column<std::string>, Column<Categorical>,
                  Column<Date>, Column<Timestamp>, Column<bool>, Column<Decimal>>;
-// A scalar value, or a null of a recorded type (core/scalar_value.hpp). It maps
-// to the internal ExprValue::Null across the row-eval boundary. Extern
-// arguments remain null-free -- the type system rejects a null before the
-// call, it never reaches an extern.
+// A scalar value, or a null of a recorded type (core/scalar_value.hpp): the one
+// value type of every evaluator. Extern arguments remain null-free -- a null
+// is rejected before the call, it never reaches an extern.
 using ScalarValue = ibex::ScalarValue;
 
 /// The precision and scale of a Decimal column. Absent metadata on a Decimal

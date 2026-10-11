@@ -45,64 +45,6 @@
 
 namespace ibex::runtime {
 
-namespace {
-
-// An all-default-payload column of the given type; pair it with an all-false
-// ValidityBitmap to broadcast a null scalar (the payloads are never read).
-auto default_column_for(ExprType type, std::size_t rows) -> ColumnValue {
-    switch (type) {
-        case ExprType::Int: {
-            Column<std::int64_t> c;
-            c.resize(rows);
-            return ColumnValue{std::move(c)};
-        }
-        case ExprType::Double: {
-            Column<double> c;
-            c.resize(rows);
-            return ColumnValue{std::move(c)};
-        }
-        case ExprType::Bool: {
-            Column<bool> c;
-            c.resize(rows);
-            return ColumnValue{std::move(c)};
-        }
-        case ExprType::String: {
-            Column<std::string> c;
-            for (std::size_t i = 0; i < rows; ++i) {
-                c.push_back(std::string_view{});
-            }
-            return ColumnValue{std::move(c)};
-        }
-        case ExprType::Categorical: {
-            Column<Categorical> c;
-            c.resize(rows);
-            return ColumnValue{std::move(c)};
-        }
-        case ExprType::Date: {
-            Column<Date> c;
-            c.resize(rows);
-            return ColumnValue{std::move(c)};
-        }
-        case ExprType::Timestamp: {
-            Column<Timestamp> c;
-            c.resize(rows);
-            return ColumnValue{std::move(c)};
-        }
-        case ExprType::Decimal: {
-            // Payloads of a null broadcast are never read; the type is only a
-            // placeholder until a caller that knows it replaces the column.
-            Column<Decimal> c = make_decimal_column(DecimalType{});
-            c.resize(rows);
-            return ColumnValue{std::move(c)};
-        }
-    }
-    Column<std::int64_t> c;  // unreachable; keeps MSVC C4715 quiet
-    c.resize(rows);
-    return ColumnValue{std::move(c)};
-}
-
-}  // namespace
-
 auto global_aggregate_of_empty(const std::vector<ColumnEntry>& empty_columns,
                                const std::vector<ir::AggSpec>& aggregations)
     -> std::vector<ColumnEntry> {
@@ -2379,7 +2321,7 @@ auto expr_contains_aggregate_call(const ir::Expr& expr) -> bool {
 /// the undefined payload.
 auto eval_aggregate_call_scalar(const ir::CallExpr& node, const Table& input,
                                 const ScalarRegistry* scalars)
-    -> std::expected<ExprValue, std::string> {
+    -> std::expected<ScalarValue, std::string> {
     auto func = parse_aggregate_func(node.callee);
     if (!func.has_value()) {
         return std::unexpected("update + by: non-aggregate function '" + node.callee +
@@ -2402,7 +2344,7 @@ auto eval_aggregate_call_scalar(const ir::CallExpr& node, const Table& input,
                 return std::unexpected(agg.error());
             }
             const auto* entry = agg->find_entry("__agg_broadcast");
-            return expr_from_scalar(scalar_from_column(*entry->column, 0));
+            return scalar_from_column(*entry->column, 0);
         }
         // count(col) is the non-null count — the same rewrite lower.cpp applies
         // (sum of a 0/1 column), repeated here because `update + by` parses its
@@ -2499,9 +2441,10 @@ auto eval_aggregate_call_scalar(const ir::CallExpr& node, const Table& input,
         return std::unexpected("update + by: internal error computing aggregate broadcast");
     }
     if (entry->validity.has_value() && !(*entry->validity)[0]) {
-        return ExprValue{Null{}};  // no valid observations in the group
+        // No valid observations in the group: a null of the aggregate's type.
+        return ScalarValue{null_of_column(*entry->column)};
     }
-    return expr_from_scalar(scalar_from_column(*entry->column, 0));
+    return scalar_from_column(*entry->column, 0);
 }
 
 /// Evaluate a compound aggregate expression to a single scalar. Each
@@ -2511,25 +2454,17 @@ auto eval_aggregate_call_scalar(const ir::CallExpr& node, const Table& input,
 /// ColumnRefs resolve only against `scalars` — a column reference outside
 /// an aggregate would not collapse to a per-group scalar.
 auto eval_aggregate_scalar(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars)
-    -> std::expected<ExprValue, std::string> {
+    -> std::expected<ScalarValue, std::string> {
     return std::visit(
-        [&](const auto& node) -> std::expected<ExprValue, std::string> {
+        [&](const auto& node) -> std::expected<ScalarValue, std::string> {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, ir::Literal>) {
-                return std::visit(
-                    [](const auto& v) -> ExprValue {
-                        if constexpr (std::is_same_v<std::decay_t<decltype(v)>, NullScalar>) {
-                            return Null{};
-                        } else {
-                            return v;
-                        }
-                    },
-                    node.value);
+                return std::visit([](const auto& v) -> ScalarValue { return v; }, node.value);
             } else if constexpr (std::is_same_v<T, ir::ColumnRef>) {
                 if (scalars != nullptr) {
                     auto it = scalars->find(node.name);
                     if (it != scalars->end()) {
-                        return expr_from_scalar(it->second);
+                        return it->second;
                     }
                 }
                 if (node.lexical) {
@@ -2547,18 +2482,23 @@ auto eval_aggregate_scalar(const ir::Expr& expr, const Table& input, const Scala
                 if (!rhs) {
                     return std::unexpected(rhs.error());
                 }
-                // Null propagates through the scalar arithmetic, same as the
-                // per-row evaluator: a null aggregate nulls the compound.
-                if (std::holds_alternative<Null>(*lhs) || std::holds_alternative<Null>(*rhs)) {
-                    return ExprValue{Null{}};
-                }
-                const ColumnValue lhs_col = broadcast_scalar_column(*scalar_from_expr(*lhs), 1);
-                const ColumnValue rhs_col = broadcast_scalar_column(*scalar_from_expr(*rhs), 1);
-                auto result = arith_vec(node.op, lhs_col, 0, rhs_col, 0, 1);
+                // A null aggregate nulls the compound. Its type is what the
+                // same column arithmetic yields, so a null operand stands in
+                // as a one-row null column of its own type.
+                const auto one_row = [](const ScalarValue& v) -> ColumnValue {
+                    if (const auto* null = std::get_if<NullScalar>(&v)) {
+                        return null_column(*null, 1).first;
+                    }
+                    return broadcast_scalar_column(v, 1);
+                };
+                auto result = arith_vec(node.op, one_row(*lhs), 0, one_row(*rhs), 0, 1);
                 if (!result) {
                     return std::unexpected(result.error());
                 }
-                return expr_from_scalar(scalar_from_column(*result, 0));
+                if (is_null_scalar(*lhs) || is_null_scalar(*rhs)) {
+                    return ScalarValue{null_of_column(*result)};
+                }
+                return scalar_from_column(*result, 0);
             } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
                 return eval_aggregate_call_scalar(node, input, scalars);
             } else {
@@ -2624,18 +2564,13 @@ auto fold_aggregates_to_columns(ir::Expr& expr, const Table& group_input, Table&
                     while (working.find(name) != nullptr) {
                         name += '_';
                     }
-                    if (std::holds_alternative<Null>(*scalar)) {
+                    if (const auto* null = std::get_if<NullScalar>(&*scalar)) {
                         // A null aggregate (all-null group) broadcasts as an
-                        // all-invalid column of the call's inferred type.
-                        auto ty = infer_expr_type(expr, group_input, scalars, nullptr);
-                        if (!ty) {
-                            return std::unexpected(ty.error());
-                        }
-                        working.add_column(name, default_column_for(*ty, working.rows()),
-                                           ValidityBitmap(working.rows(), false));
+                        // all-invalid column of its type.
+                        auto [column, validity] = null_column(*null, working.rows());
+                        working.add_column(name, std::move(column), std::move(validity));
                     } else {
-                        working.add_column(name, broadcast_scalar_column(*scalar_from_expr(*scalar),
-                                                                         working.rows()));
+                        working.add_column(name, broadcast_scalar_column(*scalar, working.rows()));
                     }
                     expr.node = ir::ColumnRef{.name = std::move(name)};
                     return {};
@@ -2756,21 +2691,17 @@ auto broadcast_aggregate_column(const Table& input, const ir::FieldSpec& field,
     if (!scalar) {
         return std::unexpected(scalar.error());
     }
-    if (std::holds_alternative<Null>(*scalar)) {
-        // A null compound aggregate broadcasts as an all-invalid column of
-        // the expression's inferred type.
-        auto ty = infer_expr_type(field.expr, input, scalars, nullptr);
-        if (!ty) {
-            return std::unexpected(ty.error());
-        }
+    if (const auto* null = std::get_if<NullScalar>(&*scalar)) {
+        // A null compound aggregate broadcasts as an all-invalid column of its type.
+        auto [column, validity] = null_column(*null, input.rows());
         BroadcastAggregateColumn result{
-            .column = default_column_for(*ty, input.rows()),
-            .validity = ValidityBitmap(input.rows(), false),
+            .column = std::move(column),
+            .validity = std::move(validity),
         };
         return std::optional<BroadcastAggregateColumn>{std::move(result)};
     }
     BroadcastAggregateColumn result{
-        .column = broadcast_scalar_column(*scalar_from_expr(*scalar), input.rows()),
+        .column = broadcast_scalar_column(*scalar, input.rows()),
         .validity = std::nullopt,
     };
     return std::optional<BroadcastAggregateColumn>{std::move(result)};

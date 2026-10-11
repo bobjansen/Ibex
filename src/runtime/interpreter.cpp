@@ -716,18 +716,18 @@ auto eval_scalar_builtin(std::string_view name, const std::vector<ScalarValue>& 
     if (argc < found->min_args || (found->max_args >= 0 && argc > found->max_args)) {
         return std::unexpected(std::string(name) + ": wrong number of arguments");
     }
-    // The registry evaluates ExprValue; conversion to and from ScalarValue is
+    // The registry evaluates ScalarValue; conversion to and from ScalarValue is
     // lossless, including ScalarValue's ibex::NullScalar null alternative.
-    std::vector<ExprValue> expr_args;
+    std::vector<ScalarValue> expr_args;
     expr_args.reserve(args.size());
     for (const auto& a : args) {
-        expr_args.push_back(expr_from_scalar(a));
+        expr_args.push_back(a);
     }
     auto result = scalar_exec->eval(name, expr_args);
     if (!result) {
         return std::unexpected(result.error());
     }
-    if (std::holds_alternative<Null>(*result)) {
+    if (std::holds_alternative<NullScalar>(*result)) {
         // A null result is of the builtin's return type, which its argument
         // types (a typed null's included) determine.
         std::vector<ExprType> types;
@@ -744,7 +744,7 @@ auto eval_scalar_builtin(std::string_view name, const std::vector<ScalarValue>& 
         }
         return ScalarValue{null_of_expr_type(*returned)};
     }
-    return *scalar_from_expr(*result);
+    return *result;
 }
 
 auto aggregate_series(std::string_view name, const ColumnValue& column, double param)

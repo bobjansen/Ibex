@@ -15,8 +15,8 @@ namespace ibex::runtime {
 // wrap), and `INT_MIN % -1 == 0`.
 //
 // Single source of truth for guarded integer division: the vectorized
-// (`arith_into`), per-row (`eval_expr`), scalar-broadcast (`apply_int_op`), and
-// REPL scalar evaluators all route through here so they cannot disagree. Float
+// (`arith_into`), scalar-broadcast (`apply_int_op`), and fused numeric
+// evaluators all route through here so they cannot disagree. Float
 // division is total (IEEE inf/nan, no trap) and is never routed through these.
 template <typename T>
 constexpr auto safe_idiv(T a, T b) noexcept -> T {

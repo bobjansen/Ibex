@@ -220,6 +220,11 @@ using FunctionLookup = std::function<const FunctionDecl*(std::string_view)>;
 /// field of `select` -- to an `ir::Expr`. A bare name becomes a `ColumnRef`,
 /// which the runtime resolves against the input's columns and then its scalar
 /// bindings, so with an empty input this is a scalar expression.
+/// True when positional parameter `index` of the built-in `callee` takes a
+/// built-in enum member (`round(x, Nearest)`), which is a name lowering
+/// resolves, not a value.
+[[nodiscard]] auto is_builtin_enum_parameter(std::string_view callee, std::size_t index) -> bool;
+
 [[nodiscard]] auto lower_value_expr(const Expr& expr, LowerContext& context)
     -> std::expected<ir::Expr, LowerError>;
 

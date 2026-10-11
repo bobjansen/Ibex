@@ -2146,7 +2146,7 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
             if (!call->args.empty()) {
                 return std::unexpected("NULL takes no arguments");
             }
-            return std::unexpected("NULL needs a typed case arm");
+            return std::unexpected(std::string(kUntypedNullError));
         }
         if (call->callee == "__case") {
             if (call->args.empty() || call->args.size() % 2 == 0) {

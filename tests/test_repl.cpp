@@ -1838,9 +1838,15 @@ TEST_CASE("round: the old lowercase mode spelling is an error") {
     REQUIRE_FALSE(ibex::repl::execute_script("let x: Int64 = round(2.5, nearest);", registry));
 }
 
-TEST_CASE("round: Int argument is an error") {
+TEST_CASE("round: an Int argument is returned unchanged") {
+    // SPEC.md Section 12.6, and what a cell does.
     ibex::runtime::ExternRegistry registry;
-    REQUIRE_FALSE(ibex::repl::execute_script("let x: Int64 = round(3, Nearest);", registry));
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    REQUIRE(session.execute("let x: Int64 = round(3, Nearest);").ok);
+    auto r = session.execute("x;");
+    REQUIRE(r.ok);
+    REQUIRE(r.scalar.has_value());
+    CHECK(std::get<std::int64_t>(*r.scalar) == 3);
 }
 
 TEST_CASE("round: applied to Float column with nearest mode") {
@@ -3166,6 +3172,47 @@ TEST_CASE("ReplSession: a scalar statement means what the same expression means 
     auto untyped = session.execute("NULL;");
     REQUIRE_FALSE(untyped.ok);
     CHECK(untyped.error.find("NULL has no type here") != std::string::npos);
+}
+
+TEST_CASE("ReplSession: REPL-only parts of a scalar compose with the runtime's operators",
+          "[repl][session][scalar]") {
+    // A subquery, a user fn, an extern or an aggregate is evaluated by the REPL
+    // and handed to the runtime as an operand; the operators, casts, round and
+    // templates around it are the runtime's, the same as in a cell.
+    ibex::runtime::ExternRegistry registry;
+    int ticks = 0;
+    registry.register_scalar(
+        "tick", ibex::runtime::ScalarKind::Int,
+        [&ticks](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            ++ticks;
+            return ibex::runtime::ExternValue{ibex::runtime::ScalarValue{std::int64_t{1}}};
+        });
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    auto value = [&](const char* src) -> ibex::runtime::ScalarValue {
+        auto r = session.execute(src);
+        INFO(src << " -> " << r.error);
+        REQUIRE(r.ok);
+        REQUIRE(r.scalar.has_value());
+        return *r.scalar;
+    };
+    REQUIRE(session.execute("extern fn tick() -> Int from \"fake.hpp\";").ok);
+    REQUIRE(session.execute("let t = Table { a = [1, 2, 3] };").ok);
+    REQUIRE(session.execute("fn twice(x: Int) -> Int { x * 2; }").ok);
+    REQUIRE(session.execute("let s = [1, 5, 3];").ok);
+
+    CHECK(std::get<std::int64_t>(value("scalar(t[select { m = max(a) }], m) + 1;")) == 4);
+    CHECK(std::get<double>(value("twice(4) / 2;")) == 4.0);
+    CHECK(std::get<std::int64_t>(value("max(s) * 10;")) == 50);
+    CHECK(std::get<std::string>(value("`t=${twice(2)}`;")) == "t=4");
+    CHECK(std::get<std::int64_t>(value("round(Float64(twice(3)) / 4.0, Nearest);")) == 2);
+    CHECK(std::get<std::int64_t>(value("round(3, Floor);")) == 3);
+
+    // A case holding a REPL-only call evaluates only the arm it takes.
+    CHECK(std::get<std::int64_t>(value("case { 1 > 2 => tick(), else => 7 };")) == 7);
+    CHECK(ticks == 0);
+    CHECK(std::get<std::int64_t>(value("case { 1 < 2 => tick() + 1, else => 7 };")) == 2);
+    CHECK(ticks == 1);
 }
 
 TEST_CASE("ReplSession: a null scalar records the type it was made with",

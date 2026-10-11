@@ -936,10 +936,34 @@ auto source_text(SEXP text_sexp, bool is_path) -> std::string {
     return std::move(*source);
 }
 
+/// One placeholder cell of the type a null scalar stands for.
+auto null_cell(const ibex::NullScalar& null) -> ibex::runtime::ColumnValue {
+    switch (null.kind) {
+        case ibex::ScalarKind::Int:
+            return ibex::Column<std::int64_t>{0};
+        case ibex::ScalarKind::Double:
+            return ibex::Column<double>{0.0};
+        case ibex::ScalarKind::Bool:
+            return ibex::Column<bool>{false};
+        case ibex::ScalarKind::String:
+            return ibex::Column<std::string>{std::string{}};
+        case ibex::ScalarKind::Date:
+            return ibex::Column<ibex::Date>{ibex::Date{}};
+        case ibex::ScalarKind::Timestamp:
+            return ibex::Column<ibex::Timestamp>{ibex::Timestamp{}};
+        case ibex::ScalarKind::Decimal: {
+            auto column = ibex::runtime::make_decimal_column(null.decimal);
+            column.push_back(ibex::Decimal{});
+            return column;
+        }
+    }
+    return ibex::Column<std::int64_t>{0};
+}
+
 /// A scalar as a one-row table with one column, `value`, so it reaches R by the
 /// same Arrow conversion as a table column: Date, Timestamp, Decimal and Int64
-/// come back exactly as they would in a table. A null scalar has no type and no
-/// column image; the caller hands R an `NA` for it instead.
+/// come back exactly as they would in a table. A null scalar is a null cell of
+/// its own type, so R gets the matching `NA` (NA_character_, a Date NA, ...).
 auto scalar_as_table(const ibex::runtime::ScalarValue& value)
     -> std::shared_ptr<const ibex::runtime::Table> {
     auto table = std::make_shared<ibex::runtime::Table>();
@@ -947,7 +971,7 @@ auto scalar_as_table(const ibex::runtime::ScalarValue& value)
         [&](const auto& v) {
             using V = std::decay_t<decltype(v)>;
             if constexpr (std::is_same_v<V, ibex::NullScalar>) {
-                return;
+                table->add_column("value", null_cell(v), ibex::runtime::ValidityBitmap(1, false));
             } else if constexpr (std::is_same_v<V, ibex::DecimalValue>) {
                 auto column = ibex::runtime::make_decimal_column(v.type);
                 column.push_back(ibex::Decimal{v.units});
@@ -963,7 +987,7 @@ auto scalar_as_table(const ibex::runtime::ScalarValue& value)
 }
 
 /// The result of one evaluation as R gets it: NULL when it produced nothing,
-/// NA for a null scalar, otherwise an Arrow payload -- `list(array, schema)`,
+/// otherwise an Arrow payload -- `list(array, schema)`,
 /// plus `scalar = TRUE` when it carries a one-row scalar for R to unwrap.
 auto result_payload(const std::expected<Evaluated, std::string>& evaluated) -> SEXP {
     if (!evaluated.has_value()) {
@@ -972,9 +996,6 @@ auto result_payload(const std::expected<Evaluated, std::string>& evaluated) -> S
     std::shared_ptr<const ibex::runtime::Table> table = evaluated->table;
     const bool is_scalar = evaluated->scalar.has_value();
     if (is_scalar) {
-        if (std::holds_alternative<ibex::NullScalar>(*evaluated->scalar)) {
-            return Rf_ScalarLogical(NA_LOGICAL);
-        }
         table = scalar_as_table(*evaluated->scalar);
     }
     if (!table) {

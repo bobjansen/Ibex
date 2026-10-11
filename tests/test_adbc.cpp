@@ -184,7 +184,7 @@ auto string_args(std::initializer_list<std::string_view> values) -> ibex::runtim
     ibex::runtime::ExternArgs args;
     args.reserve(values.size());
     for (const auto value : values) {
-        args.emplace_back(std::string(value));
+        args.push_back(std::string(value));
     }
     return args;
 }
@@ -257,8 +257,8 @@ struct AdbcSession {
         ibex::runtime::ExternArgs args;
         args.push_resource(conn);
         args.push_table(std::make_shared<const ibex::runtime::Table>(std::move(table)));
-        args.emplace_back(std::string(target));
-        args.emplace_back(std::string(mode));
+        args.push_back(std::string(target));
+        args.push_back(std::string(mode));
         auto written = plugin("adbc::write").func(args);
         if (!written) {
             return std::unexpected(written.error());
@@ -271,7 +271,7 @@ struct AdbcSession {
         -> ibex::runtime::Table {
         ibex::runtime::ExternArgs args;
         args.push_resource(conn);
-        args.emplace_back(std::string(sql));
+        args.push_back(std::string(sql));
         auto result = plugin("adbc::query").func(args);
         INFO(sql);
         INFO((result.has_value() ? std::string{} : result.error()));
@@ -1910,7 +1910,7 @@ TEST_CASE("adbc::write and adbc::execute against PostgreSQL", "[adbc][write][pos
     const auto execute = [&](std::string_view sql) {
         ibex::runtime::ExternArgs args;
         args.push_resource(conn);
-        args.emplace_back(std::string(sql));
+        args.push_back(std::string(sql));
         auto result = s.plugin("adbc::execute").func(args);
         INFO(sql);
         INFO((result.has_value() ? std::string{} : result.error()));
@@ -1996,7 +1996,7 @@ TEST_CASE("adbc::write and adbc::execute against PostgreSQL", "[adbc][write][pos
     {
         ibex::runtime::ExternArgs args;
         args.push_resource(conn);
-        args.emplace_back(
+        args.push_back(
             std::string("insert into ibex_params values ($1, $2, $3, $4, $5, $6, $7, $8)"));
         args.push_table(std::make_shared<const ibex::runtime::Table>(std::move(params)));
         auto inserted = s.plugin("adbc::execute").func(args);
@@ -2024,7 +2024,7 @@ TEST_CASE("adbc::write and adbc::execute against PostgreSQL", "[adbc][write][pos
         lookup.add_column("i", ibex::Column<std::int64_t>{-3, 1});
         ibex::runtime::ExternArgs args;
         args.push_resource(conn);
-        args.emplace_back(std::string("select i, s from ibex_params where i = $1"));
+        args.push_back(std::string("select i, s from ibex_params where i = $1"));
         args.push_table(std::make_shared<const ibex::runtime::Table>(std::move(lookup)));
         auto found = s.plugin("adbc::query").func(args);
         REQUIRE(found.has_value());
@@ -2039,7 +2039,7 @@ TEST_CASE("adbc::write and adbc::execute against PostgreSQL", "[adbc][write][pos
         no_rows.add_column("i", ibex::Column<std::int64_t>{});
         ibex::runtime::ExternArgs args;
         args.push_resource(conn);
-        args.emplace_back(std::string("select i, s from ibex_params where i = $1"));
+        args.push_back(std::string("select i, s from ibex_params where i = $1"));
         args.push_table(std::make_shared<const ibex::runtime::Table>(std::move(no_rows)));
         auto found = s.plugin("adbc::query").func(args);
         REQUIRE(found.has_value());
@@ -2059,7 +2059,7 @@ TEST_CASE("adbc::write and adbc::execute against PostgreSQL", "[adbc][write][pos
     CHECK(nulls(uuids, "u") == std::vector<bool>{false, true});
     ibex::runtime::ExternArgs time_args;
     time_args.push_resource(conn);
-    time_args.emplace_back(std::string("select '12:30'::time as t"));
+    time_args.push_back(std::string("select '12:30'::time as t"));
     const auto times = s.plugin("adbc::query").func(time_args);
     REQUIRE_FALSE(times.has_value());
     CHECK(contains(times.error(),

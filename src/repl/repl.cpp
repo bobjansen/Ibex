@@ -6171,9 +6171,6 @@ auto try_execute_whole_script(parser::Program& program, runtime::ExternRegistry&
 
     runtime::TableRegistry base_tables = build_builtin_tables();
     runtime::ScalarRegistry scalars;
-    for (auto& [name, value] : scalar_bindings->compile_time) {
-        scalars.insert_or_assign(name, std::move(value));
-    }
     if (auto materialized = runtime::materialize_deferred_scalar_bindings(
             scalar_bindings->deferred, base_tables, scalars, &externs);
         !materialized.has_value()) {

@@ -8,6 +8,7 @@
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
+#include <ibex/parser/scalar_bindings.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/lazy_table.hpp>
@@ -3190,6 +3191,25 @@ TEST_CASE("Int division is float division on every evaluation path",
                   Catch::Approx(static_cast<double>((*x)[r]) / static_cast<double>((*g)[r])));
         }
     }
+}
+
+TEST_CASE("a compiled program's scalar lets have the REPL's values",
+          "[interpreter][codegen][scalar]") {
+    // ibex_compile and the parity runner collect scalar lets here. They used to
+    // be folded by a parser-side evaluator of their own, which divided Int by
+    // Int as integers (`7 / 2` was 3, not the language's 3.5) and knew no
+    // comparison; the runtime evaluates them now, as it does every scalar.
+    const auto program =
+        require_program("let k = 7 / 2; let m = k * 2.0; let c = 3 > 2; let r = 7 % 2;");
+    auto set = parser::collect_scalar_binding_set(program);
+    REQUIRE(set.has_value());
+    runtime::ScalarRegistry scalars;
+    REQUIRE(runtime::materialize_deferred_scalar_bindings(set->deferred, {}, scalars, nullptr)
+                .has_value());
+    CHECK(std::get<double>(scalars.at("k")) == 3.5);
+    CHECK(std::get<double>(scalars.at("m")) == 7.0);
+    CHECK(std::get<bool>(scalars.at("c")));
+    CHECK(std::get<std::int64_t>(scalars.at("r")) == 1);
 }
 
 TEST_CASE("text aggregates preserve missing payloads and long strings",

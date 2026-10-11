@@ -4,15 +4,12 @@
 #pragma once
 
 // Scalar `let` bindings (`let k = (base * 2) + 5;`) are not lowered into IR as
-// columns — they are evaluated at compile time and supplied to execution as a
-// ScalarRegistry. Both the transpiler (ibex_compile) and the parity runner need
-// to reconstruct that registry from a parsed Program, so the logic lives here in
-// one place. Values use the same std::variant as ibex::runtime::ScalarValue and
-// ibex::codegen::Emitter::Config::ScalarValue (identical aliases, so the results
-// are interchangeable with both without conversion).
+// columns: each is lowered to a value expression and evaluated at run time, in
+// order, by the runtime's scalar evaluator (the one every other scalar goes
+// through), and supplied to execution as a ScalarRegistry. Both the transpiler
+// (ibex_compile) and the parity runner need to reconstruct those bindings from
+// a parsed Program, so the logic lives here in one place.
 
-#include <ibex/core/scalar_value.hpp>
-#include <ibex/core/time.hpp>
 #include <ibex/ir/model_accessors.hpp>
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/lower.hpp>
@@ -34,123 +31,12 @@
 
 namespace ibex::parser {
 
-using ScalarValue = ibex::ScalarValue;
-
-[[nodiscard]] inline auto eval_scalar_expr(
-    const Expr& expr, const robin_hood::unordered_map<std::string, ScalarValue>& env)
-    -> std::expected<ScalarValue, std::string> {
-    if (const auto* ident = std::get_if<IdentifierExpr>(&expr.node)) {
-        if (auto it = env.find(ident->name); it != env.end()) {
-            return it->second;
-        }
-        return std::unexpected("unknown scalar binding: " + ident->name);
-    }
-
-    if (const auto* lit = std::get_if<LiteralExpr>(&expr.node)) {
-        if (const auto* v = std::get_if<std::int64_t>(&lit->value))
-            return ScalarValue{*v};
-        if (const auto* v = std::get_if<double>(&lit->value))
-            return ScalarValue{*v};
-        if (const auto* v = std::get_if<std::string>(&lit->value))
-            return ScalarValue{*v};
-        if (const auto* v = std::get_if<ibex::Date>(&lit->value))
-            return ScalarValue{*v};
-        if (const auto* v = std::get_if<ibex::Timestamp>(&lit->value))
-            return ScalarValue{*v};
-        if (const auto* v = std::get_if<ibex::DecimalValue>(&lit->value))
-            return ScalarValue{*v};
-        return std::unexpected("unsupported scalar literal");
-    }
-
-    if (const auto* group = std::get_if<GroupExpr>(&expr.node)) {
-        return eval_scalar_expr(*group->expr, env);
-    }
-
-    if (const auto* unary = std::get_if<UnaryExpr>(&expr.node)) {
-        if (unary->op != UnaryOp::Negate) {
-            return std::unexpected("unsupported unary scalar operator");
-        }
-        auto value = eval_scalar_expr(*unary->expr, env);
-        if (!value) {
-            return std::unexpected(value.error());
-        }
-        if (const auto* v = std::get_if<std::int64_t>(&*value))
-            return ScalarValue{-(*v)};
-        if (const auto* v = std::get_if<double>(&*value))
-            return ScalarValue{-(*v)};
-        return std::unexpected("unary negate requires numeric scalar");
-    }
-
-    if (const auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
-        auto left = eval_scalar_expr(*binary->left, env);
-        if (!left) {
-            return std::unexpected(left.error());
-        }
-        auto right = eval_scalar_expr(*binary->right, env);
-        if (!right) {
-            return std::unexpected(right.error());
-        }
-
-        const bool left_double = std::holds_alternative<double>(*left);
-        const bool right_double = std::holds_alternative<double>(*right);
-        if (left_double || right_double) {
-            const double lhs = left_double ? std::get<double>(*left)
-                                           : static_cast<double>(std::get<std::int64_t>(*left));
-            const double rhs = right_double ? std::get<double>(*right)
-                                            : static_cast<double>(std::get<std::int64_t>(*right));
-            switch (binary->op) {
-                case BinaryOp::Add:
-                    return ScalarValue{lhs + rhs};
-                case BinaryOp::Sub:
-                    return ScalarValue{lhs - rhs};
-                case BinaryOp::Mul:
-                    return ScalarValue{lhs * rhs};
-                case BinaryOp::Div:
-                    return ScalarValue{lhs / rhs};
-                case BinaryOp::Mod:
-                    return std::unexpected("mod not supported for float scalars");
-                default:
-                    return std::unexpected("unsupported scalar operator");
-            }
-        }
-
-        if (!std::holds_alternative<std::int64_t>(*left) ||
-            !std::holds_alternative<std::int64_t>(*right)) {
-            return std::unexpected("binary scalar op requires numeric operands");
-        }
-        const auto lhs = std::get<std::int64_t>(*left);
-        const auto rhs = std::get<std::int64_t>(*right);
-        switch (binary->op) {
-            case BinaryOp::Add:
-                return ScalarValue{lhs + rhs};
-            case BinaryOp::Sub:
-                return ScalarValue{lhs - rhs};
-            case BinaryOp::Mul:
-                return ScalarValue{lhs * rhs};
-            case BinaryOp::Div:
-                if (rhs == 0) {
-                    return std::unexpected("division by zero in scalar let");
-                }
-                return ScalarValue{lhs / rhs};
-            case BinaryOp::Mod:
-                if (rhs == 0) {
-                    return std::unexpected("modulo by zero in scalar let");
-                }
-                return ScalarValue{lhs % rhs};
-            default:
-                return std::unexpected("unsupported scalar operator");
-        }
-    }
-
-    return std::unexpected("unsupported scalar expression");
-}
-
-// Scalar `let` bindings split by how they are evaluated: `compile_time` folds
-// to a constant during lowering; `deferred` contains a `scalar(<table>)`
-// subquery and is evaluated at run time (both by the interpreter reference and
-// by the emitted C++) via runtime::materialize_deferred_scalar_bindings.
+// A program's scalar `let` bindings. Every one in `deferred` is evaluated at run
+// time (by the interpreter reference and by the emitted C++) via
+// runtime::materialize_deferred_scalar_bindings: a `scalar(<table>)` subquery
+// runs its subplans first, a plain expression (`let k = 7 / 2;`) has none.
+// Nothing is folded here, so a scalar has the same value on every path.
 struct ScalarBindingSet {
-    std::vector<std::pair<std::string, ScalarValue>> compile_time;
     std::vector<ir::DeferredScalarBinding> deferred;
     /// Statement index of each `deferred` binding, parallel to it. A consumer
     /// that runs the script in order runs the binding there; one that evaluates
@@ -288,7 +174,6 @@ struct DeferredWrap {
                                                      std::span<const Program* const> prelude = {})
     -> std::expected<ScalarBindingSet, std::string> {
     ScalarBindingSet out;
-    robin_hood::unordered_map<std::string, ScalarValue> env;
     int deferred_counter = 0;
 
     LowerContext lower_ctx;
@@ -390,16 +275,6 @@ struct DeferredWrap {
             continue;
         }
 
-        auto scalar_result = eval_scalar_expr(*let_stmt->value, env);
-        if (scalar_result) {
-            env.insert_or_assign(let_stmt->name, scalar_result.value());
-            out.compile_time.emplace_back(let_stmt->name, scalar_result.value());
-            // Later table lets may filter/compute against this scalar; a bare
-            // name there must resolve as a binding, not a missing column.
-            lower_ctx.lexical_names.insert(let_stmt->name);
-            continue;
-        }
-
         if (auto deferred = try_build_deferred_scalar_binding(let_stmt->name, *let_stmt->value,
                                                               lower_ctx, deferred_counter);
             deferred.has_value()) {
@@ -432,22 +307,24 @@ struct DeferredWrap {
                                        "': " + table_result.error().message);
             }
         }
-        return std::unexpected("unsupported scalar let '" + let_stmt->name +
-                               "': " + scalar_result.error());
+
+        // A plain scalar expression: a binding with no subplan, evaluated in
+        // order with the others. Later table lets may filter/compute against
+        // it; a bare name there must resolve as a binding, not a missing column.
+        auto value = lower_value_expr(*let_stmt->value, lower_ctx);
+        if (!value) {
+            return std::unexpected("unsupported scalar let '" + let_stmt->name +
+                                   "': " + value.error().message);
+        }
+        ir::DeferredScalarBinding binding;
+        binding.name = let_stmt->name;
+        binding.value = std::move(*value);
+        out.deferred.push_back(std::move(binding));
+        out.deferred_positions.push_back(position);
+        lower_ctx.lexical_names.insert(let_stmt->name);
     }
 
     return out;
-}
-
-// Backwards-compatible: the compile-time bindings only. Prefer
-// collect_scalar_binding_set for paths that must also honour deferred bindings.
-[[nodiscard]] inline auto collect_scalar_bindings(const Program& program)
-    -> std::expected<std::vector<std::pair<std::string, ScalarValue>>, std::string> {
-    auto set = collect_scalar_binding_set(program);
-    if (!set) {
-        return std::unexpected(set.error());
-    }
-    return std::move(set->compile_time);
 }
 
 }  // namespace ibex::parser

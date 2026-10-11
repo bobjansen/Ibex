@@ -7134,6 +7134,10 @@ auto lower_script(const Program& program, const ir::SourceSchemas& reader_schema
     return lowered;
 }
 
+auto is_builtin_enum_parameter(std::string_view callee, std::size_t index) -> bool {
+    return builtin_enum_parameter(callee, index) != nullptr;
+}
+
 auto lower_value_expr(const Expr& expr, LowerContext& context)
     -> std::expected<ir::Expr, LowerError> {
     Lowerer lowerer(&context.bindings, context.compile_time_lists, context.table_externs,

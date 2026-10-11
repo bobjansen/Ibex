@@ -1155,8 +1155,11 @@ class ExternArgs;
                                            const ExternRegistry* externs = nullptr)
     -> std::expected<std::size_t, std::string>;
 
-/// Evaluate a scalar-valued expression against `scalars` (no column input).
-/// A null result is a NullScalar of the expression's type.
+/// The error for a NULL that nothing gives a type (SPEC.md Section 6.7).
+inline constexpr std::string_view kUntypedNullError =
+    "NULL has no type here: give it one with a cast, `Int64(NULL)`, or a declaration, "
+    "`let x: Int64 = NULL;`";
+
 /// The type `expr` would have as a scalar, as a null of that type: what
 /// `case { c => 1, else => NULL }` is when it takes the NULL arm. An error
 /// when the expression has no type (a NULL nothing types).
@@ -1164,6 +1167,8 @@ class ExternArgs;
                                      const ExternRegistry* externs = nullptr)
     -> std::expected<NullScalar, std::string>;
 
+/// Evaluate a scalar-valued expression against `scalars` (no column input).
+/// A null result is a NullScalar of the expression's type.
 [[nodiscard]] auto evaluate_scalar_expr(const ir::Expr& expr,
                                         const ScalarRegistry* scalars = nullptr,
                                         const ExternRegistry* externs = nullptr)

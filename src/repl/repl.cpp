@@ -1506,10 +1506,6 @@ constexpr std::string_view kNullSeriesBindingError =
     "null is only allowed in a Table { } column literal, not a standalone series";
 
 /// True if `expr` is the `null` keyword, which the parser lowers to `__null()`.
-constexpr std::string_view kUntypedNullError =
-    "NULL has no type here: give it one with a cast, `Int64(NULL)`, or a declaration, "
-    "`let x: Int64 = NULL;`";
-
 auto is_null_literal_expr(const parser::Expr& expr) -> bool {
     const auto* call = std::get_if<parser::CallExpr>(&expr.node);
     return call != nullptr && call->callee == "__null" && call->args.empty() &&
@@ -1659,96 +1655,6 @@ auto is_cast_callee(std::string_view callee) -> bool {
            callee == "Float32" || callee == "Date";
 }
 
-/// Applies a scalar type cast. `callee` must be a cast name (checked by is_cast_callee).
-auto apply_scalar_cast(const runtime::ScalarValue& val, std::string_view callee)
-    -> std::expected<runtime::ScalarValue, std::string> {
-    // Casting null yields null of the target type, as with every scalar function.
-    if (runtime::is_null_scalar(val)) {
-        const auto kind = callee == "Date" ? runtime::ScalarKind::Date
-                          : (callee == "Int64" || callee == "Int32" || callee == "Int")
-                              ? runtime::ScalarKind::Int
-                              : runtime::ScalarKind::Double;
-        return runtime::ScalarValue{NullScalar{kind}};
-    }
-    if (callee == "Date") {
-        if (const auto* ts = std::get_if<Timestamp>(&val)) {
-            return runtime::ScalarValue{timestamp_to_date(*ts)};
-        }
-        if (std::holds_alternative<Date>(val)) {
-            return val;
-        }
-        if (const auto* days = std::get_if<std::int64_t>(&val)) {
-            if (*days < std::numeric_limits<std::int32_t>::min() ||
-                *days > std::numeric_limits<std::int32_t>::max()) {
-                return std::unexpected("Date(): date out of range");
-            }
-            return runtime::ScalarValue{Date{static_cast<std::int32_t>(*days)}};
-        }
-        return std::unexpected(std::string("Date(): cannot cast ") +
-                               std::string(scalar_value_type_name(val)) + " to Date");
-    }
-    const bool to_int = (callee == "Int64" || callee == "Int32" || callee == "Int");
-    if (to_int) {
-        if (std::holds_alternative<std::int64_t>(val)) {
-            return val;
-        }
-        if (std::holds_alternative<bool>(val)) {
-            return runtime::ScalarValue{static_cast<std::int64_t>(std::get<bool>(val) ? 1 : 0)};
-        }
-        if (std::holds_alternative<double>(val)) {
-            double v = std::get<double>(val);
-            if (v != std::trunc(v)) {
-                return std::unexpected(std::string(callee) + "(): cannot cast non-integer Float " +
-                                       std::to_string(v) +
-                                       " to Int (use floor(), ceil(), or round())");
-            }
-            return runtime::ScalarValue{static_cast<std::int64_t>(v)};
-        }
-        if (const auto* s = std::get_if<std::string>(&val)) {
-            std::string trimmed = *s;
-            const auto not_space = [](unsigned char c) { return std::isspace(c) == 0; };
-            trimmed.erase(trimmed.begin(), std::ranges::find_if(trimmed, not_space));
-            trimmed.erase(std::ranges::find_if(std::views::reverse(trimmed), not_space).base(),
-                          trimmed.end());
-            std::int64_t out{};
-            const char* begin = trimmed.c_str();
-            if (!trimmed.empty() && trimmed.front() == '+') {
-                ++begin;
-            }
-            const auto [ptr, ec] = std::from_chars(begin, trimmed.c_str() + trimmed.size(), out);
-            if (ec != std::errc{} || ptr != trimmed.c_str() + trimmed.size() || trimmed.empty()) {
-                return std::unexpected(std::string(callee) + "(): cannot parse '" + *s +
-                                       "' as an integer");
-            }
-            return runtime::ScalarValue{out};
-        }
-        return std::unexpected(std::string(callee) + "(): cannot cast " +
-                               std::string(scalar_value_type_name(val)) + " to Int");
-    }
-    // Float64 / Float32
-    if (std::holds_alternative<double>(val)) {
-        return val;
-    }
-    if (std::holds_alternative<std::int64_t>(val)) {
-        return runtime::ScalarValue{static_cast<double>(std::get<std::int64_t>(val))};
-    }
-    if (const auto* s = std::get_if<std::string>(&val)) {
-        errno = 0;
-        char* end = nullptr;
-        const double v = std::strtod(s->c_str(), &end);
-        while (*end != '\0' && std::isspace(static_cast<unsigned char>(*end)) != 0) {
-            ++end;
-        }
-        if (end == s->c_str() || *end != '\0' || errno == ERANGE) {
-            return std::unexpected(std::string(callee) + "(): cannot parse '" + *s +
-                                   "' as a number");
-        }
-        return runtime::ScalarValue{v};
-    }
-    return std::unexpected(std::string(callee) + "(): cannot cast " +
-                           std::string(scalar_value_type_name(val)) + " to Float");
-}
-
 /// Applies an element-wise column type cast.
 auto apply_column_cast(const runtime::ColumnValue& col, std::string_view callee)
     -> std::expected<runtime::ColumnValue, std::string> {
@@ -1833,11 +1739,6 @@ auto round_value(double v, RoundMode mode) -> std::int64_t {
             break;
     }
     return static_cast<std::int64_t>(std::trunc(v));
-}
-
-auto apply_scalar_round(double v, RoundMode mode)
-    -> std::expected<runtime::ScalarValue, std::string> {
-    return runtime::ScalarValue{round_value(v, mode)};
 }
 
 auto apply_column_round(const Column<double>& src, RoundMode mode) -> Column<std::int64_t> {
@@ -2540,6 +2441,10 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                       const runtime::ExternRegistry& externs)
     -> std::expected<runtime::ScalarValue, std::string>;
 
+auto apply_scalar_call(const parser::CallExpr& call, runtime::ScalarValue value,
+                       const runtime::ExternRegistry& externs)
+    -> std::expected<runtime::ScalarValue, std::string>;
+
 /// A bare NULL has no type of its own; where a declaration names one -- an
 /// annotated `let`, a parameter, a return type -- it is a null of that type.
 /// Anything else is evaluated as usual.
@@ -2780,7 +2685,7 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
                 return EvalValue{std::move(result.value())};
             }
             if (auto* scalar = std::get_if<runtime::ScalarValue>(&inner.value())) {
-                auto result = apply_scalar_cast(*scalar, call->callee);
+                auto result = apply_scalar_call(*call, std::move(*scalar), externs);
                 if (!result) {
                     return std::unexpected(result.error());
                 }
@@ -2807,10 +2712,11 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
                     apply_column_round(std::get<Column<double>>(*col), *mode)}};
             }
             if (auto* scalar = std::get_if<runtime::ScalarValue>(&inner.value())) {
-                if (!std::holds_alternative<double>(*scalar)) {
-                    return std::unexpected("round(): first argument must be Float");
+                auto result = apply_scalar_call(*call, std::move(*scalar), externs);
+                if (!result) {
+                    return std::unexpected(result.error());
                 }
-                return EvalValue{apply_scalar_round(std::get<double>(*scalar), *mode).value()};
+                return EvalValue{std::move(result.value())};
             }
             return std::unexpected("round(): cannot round a table");
         }
@@ -2919,6 +2825,181 @@ auto eval_scalar_operator(const parser::Expr& node, const runtime::ScalarRegistr
     return runtime::evaluate_scalar_expr(*lowered, &operands, &externs);
 }
 
+/// `call` (a cast, or `round(_, mode)`) applied to one evaluated scalar, on the
+/// runtime's engine like every scalar operator. The value stands in for the
+/// call's first argument; the rest -- `round`'s mode -- are enum members.
+auto apply_scalar_call(const parser::CallExpr& call, runtime::ScalarValue value,
+                       const runtime::ExternRegistry& externs)
+    -> std::expected<runtime::ScalarValue, std::string> {
+    parser::CallExpr applied;
+    applied.callee = call.callee;
+    applied.args.push_back(operand_ref("__operand"));
+    for (std::size_t i = 1; i < call.args.size(); ++i) {
+        const auto* member = std::get_if<parser::IdentifierExpr>(&call.args[i]->node);
+        if (member == nullptr) {
+            return std::unexpected(call.callee + "(): expected a single value argument");
+        }
+        auto arg = std::make_unique<parser::Expr>();
+        arg->node = *member;
+        applied.args.push_back(std::move(arg));
+    }
+    parser::Expr node;
+    node.node = std::move(applied);
+    runtime::ScalarRegistry operands;
+    operands.insert_or_assign("__operand", std::move(value));
+    return eval_scalar_operator(node, operands, externs);
+}
+
+/// A call only the REPL can evaluate: it reads a table (`scalar`), calls a
+/// user `fn` or an extern, reads a model, or aggregates a series. Unknown
+/// names stay here too, for the REPL's list of what is available. Everything
+/// else in a scalar expression -- operators, `case`, casts, `round`, string
+/// interpolation, NULL, the row-local builtins -- is the runtime's.
+auto is_repl_call(const parser::CallExpr& call, const FunctionRegistry& functions,
+                  const ExternDeclRegistry& extern_decls) -> bool {
+    if (call.callee == "scalar" || functions.contains(call.callee) ||
+        extern_decls.contains(call.callee) || is_model_scalar_accessor(call.callee) ||
+        ir::is_aggregate_func(call.callee)) {
+        return true;
+    }
+    return !(call.callee == "__null" || call.callee == "__interp" || call.callee == "round" ||
+             is_cast_callee(call.callee) || runtime::is_scalar_builtin(call.callee));
+}
+
+/// True when `expr` holds a call only the REPL can evaluate.
+auto contains_repl_call(const parser::Expr& expr, const FunctionRegistry& functions,
+                        const ExternDeclRegistry& extern_decls) -> bool {
+    const auto holds = [&](const parser::ExprPtr& e) {
+        return e != nullptr && contains_repl_call(*e, functions, extern_decls);
+    };
+    return std::visit(
+        [&](const auto& node) -> bool {
+            using N = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<N, parser::CallExpr>) {
+                return is_repl_call(node, functions, extern_decls) ||
+                       std::ranges::any_of(node.args, holds) ||
+                       std::ranges::any_of(node.named_args, [&](const parser::NamedArg& arg) {
+                           return holds(arg.value);
+                       });
+            } else if constexpr (std::is_same_v<N, parser::CaseExpr>) {
+                return holds(node.selector) || holds(node.else_value) ||
+                       std::ranges::any_of(node.arms, [&](const parser::CaseArm& arm) {
+                           return holds(arm.condition) || holds(arm.value);
+                       });
+            } else if constexpr (std::is_same_v<N, parser::UnaryExpr> ||
+                                 std::is_same_v<N, parser::GroupExpr>) {
+                return holds(node.expr);
+            } else if constexpr (std::is_same_v<N, parser::BinaryExpr>) {
+                return holds(node.left) || holds(node.right);
+            } else {
+                return false;
+            }
+        },
+        expr.node);
+}
+
+/// A scalar expression on the runtime's engine, the one that evaluates cells,
+/// so a scalar statement means what the same expression means in a column.
+/// The parts only the REPL can evaluate (`is_repl_call`, or a `case` holding
+/// one) are evaluated first and stand in as operands; a bound name is passed
+/// as itself.
+auto eval_scalar_on_runtime(parser::Expr& expr, runtime::TableRegistry& tables,
+                            LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
+                            ColumnRegistry& columns, ModelRegistry& models,
+                            const FunctionRegistry& functions,
+                            CompileTimeListRegistry& compile_time_lists,
+                            const ExternDeclRegistry& extern_decls,
+                            const runtime::ExternRegistry& externs)
+    -> std::expected<runtime::ScalarValue, std::string> {
+    runtime::ScalarRegistry operands;
+    // The subtrees the REPL evaluated, swapped for their operand's name while
+    // the runtime reads the expression, and swapped back on the way out.
+    std::vector<std::pair<parser::Expr*, decltype(parser::Expr::node)>> swapped;
+    const auto restore = [&swapped] {
+        for (auto& [at, node] : swapped | std::views::reverse) {
+            at->node = std::move(node);
+        }
+    };
+    std::string error;
+    std::function<bool(parser::Expr&)> bind;
+    const auto bind_ptr = [&bind](const parser::ExprPtr& e) { return e == nullptr || bind(*e); };
+    bind = [&](parser::Expr& e) -> bool {
+        if (const auto* ident = std::get_if<parser::IdentifierExpr>(&e.node)) {
+            if (const auto it = scalars.find(ident->name); it != scalars.end()) {
+                operands.insert_or_assign(ident->name, it->second);
+                return true;
+            }
+            error = columns.contains(ident->name) ? std::string("expected scalar expression")
+                                                  : "unknown scalar: " + ident->name;
+            return false;
+        }
+        const auto* call = std::get_if<parser::CallExpr>(&e.node);
+        if ((call != nullptr && is_repl_call(*call, functions, extern_decls)) ||
+            (std::holds_alternative<parser::CaseExpr>(e.node) &&
+             contains_repl_call(e, functions, extern_decls))) {
+            auto value = eval_scalar_expr(e, tables, lazy_tables, scalars, columns, models,
+                                          functions, compile_time_lists, extern_decls, externs);
+            if (!value) {
+                error = value.error();
+                return false;
+            }
+            std::string name = "__repl_operand_" + std::to_string(swapped.size());
+            operands.insert_or_assign(name, std::move(*value));
+            auto saved = std::move(e.node);
+            e.node = parser::IdentifierExpr{.name = std::move(name), .lexical = false};
+            swapped.emplace_back(&e, std::move(saved));
+            return true;
+        }
+        return std::visit(
+            [&](auto& node) -> bool {
+                using N = std::decay_t<decltype(node)>;
+                if constexpr (std::is_same_v<N, parser::LiteralExpr>) {
+                    return true;
+                } else if constexpr (std::is_same_v<N, parser::UnaryExpr> ||
+                                     std::is_same_v<N, parser::GroupExpr>) {
+                    return bind_ptr(node.expr);
+                } else if constexpr (std::is_same_v<N, parser::BinaryExpr>) {
+                    return bind_ptr(node.left) && bind_ptr(node.right);
+                } else if constexpr (std::is_same_v<N, parser::CaseExpr>) {
+                    return bind_ptr(node.selector) &&
+                           std::ranges::all_of(node.arms,
+                                               [&](const parser::CaseArm& arm) {
+                                                   return bind_ptr(arm.condition) &&
+                                                          bind_ptr(arm.value);
+                                               }) &&
+                           bind_ptr(node.else_value);
+                } else if constexpr (std::is_same_v<N, parser::CallExpr>) {
+                    for (std::size_t i = 0; i < node.args.size(); ++i) {
+                        // `round(x, Nearest)`: an enum member, which lowering resolves.
+                        if (!parser::is_builtin_enum_parameter(node.callee, i) &&
+                            !bind_ptr(node.args[i])) {
+                            return false;
+                        }
+                    }
+                    return std::ranges::all_of(node.named_args, [&](const parser::NamedArg& arg) {
+                        return bind_ptr(arg.value);
+                    });
+                } else {
+                    error = "expected scalar expression";
+                    return false;
+                }
+            },
+            e.node);
+    };
+    const bool bound = bind(expr);
+    std::expected<runtime::ScalarValue, std::string> result = std::unexpected(error);
+    if (bound) {
+        parser::LowerContext context;
+        if (auto lowered = parser::lower_value_expr(expr, context); lowered.has_value()) {
+            result = runtime::evaluate_scalar_expr(*lowered, &operands, &externs);
+        } else {
+            result = std::unexpected(lowered.error().message);
+        }
+    }
+    restore();
+    return result;
+}
+
 auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                       LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
                       ColumnRegistry& columns, ModelRegistry& models,
@@ -2927,78 +3008,11 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                       const ExternDeclRegistry& extern_decls,
                       const runtime::ExternRegistry& externs)
     -> std::expected<runtime::ScalarValue, std::string> {
-    if (const auto* literal = std::get_if<parser::LiteralExpr>(&expr.node)) {
-        if (const auto* int_value = std::get_if<std::int64_t>(&literal->value)) {
-            return runtime::ScalarValue{*int_value};
-        }
-        if (const auto* double_value = std::get_if<double>(&literal->value)) {
-            return runtime::ScalarValue{*double_value};
-        }
-        if (const auto* bool_value = std::get_if<bool>(&literal->value)) {
-            return runtime::ScalarValue{*bool_value};
-        }
-        if (const auto* str_value = std::get_if<std::string>(&literal->value)) {
-            return runtime::ScalarValue{*str_value};
-        }
-        if (const auto* decimal_value = std::get_if<DecimalValue>(&literal->value)) {
-            return runtime::ScalarValue{*decimal_value};
-        }
-        // `date"..."` / `ts"..."`. With these, the only LiteralExpr
-        // alternative ScalarValue cannot hold is DurationLiteral, which is a
-        // window/resample spec rather than a value, so it stays unsupported.
-        if (const auto* date_value = std::get_if<Date>(&literal->value)) {
-            return runtime::ScalarValue{*date_value};
-        }
-        if (const auto* timestamp_value = std::get_if<Timestamp>(&literal->value)) {
-            return runtime::ScalarValue{*timestamp_value};
-        }
-        return std::unexpected("unsupported scalar literal");
-    }
-    if (const auto* ident = std::get_if<parser::IdentifierExpr>(&expr.node)) {
-        if (auto it = scalars.find(ident->name); it != scalars.end()) {
-            return it->second;
-        }
-        if (columns.contains(ident->name)) {
-            return std::unexpected("expected scalar expression");
-        }
-        return std::unexpected("unknown scalar: " + ident->name);
-    }
-    if (const auto* group = std::get_if<parser::GroupExpr>(&expr.node)) {
-        return eval_scalar_expr(*group->expr, tables, lazy_tables, scalars, columns, models,
-                                functions, compile_time_lists, extern_decls, externs);
-    }
-    if (const auto* unary = std::get_if<parser::UnaryExpr>(&expr.node)) {
-        auto value = eval_scalar_expr(*unary->expr, tables, lazy_tables, scalars, columns, models,
-                                      functions, compile_time_lists, extern_decls, externs);
-        if (!value) {
-            return std::unexpected(value.error());
-        }
-        parser::Expr op;
-        op.node = parser::UnaryExpr{.op = unary->op, .expr = operand_ref("__operand")};
-        runtime::ScalarRegistry operands;
-        operands.insert_or_assign("__operand", std::move(*value));
-        return eval_scalar_operator(op, operands, externs);
-    }
-    if (const auto* binary = std::get_if<parser::BinaryExpr>(&expr.node)) {
-        auto left = eval_scalar_expr(*binary->left, tables, lazy_tables, scalars, columns, models,
-                                     functions, compile_time_lists, extern_decls, externs);
-        if (!left) {
-            return std::unexpected(left.error());
-        }
-        auto right = eval_scalar_expr(*binary->right, tables, lazy_tables, scalars, columns, models,
-                                      functions, compile_time_lists, extern_decls, externs);
-        if (!right) {
-            return std::unexpected(right.error());
-        }
-        parser::Expr op;
-        op.node = parser::BinaryExpr{
-            .op = binary->op, .left = operand_ref("__lhs"), .right = operand_ref("__rhs")};
-        runtime::ScalarRegistry operands;
-        operands.insert_or_assign("__lhs", std::move(*left));
-        operands.insert_or_assign("__rhs", std::move(*right));
-        return eval_scalar_operator(op, operands, externs);
-    }
-    if (auto* case_expr = std::get_if<parser::CaseExpr>(&expr.node)) {
+    // Only a call that needs the REPL, or a `case` holding one (its arms stay
+    // lazy, so an extern in an arm not taken never runs), is evaluated here;
+    // anything else goes to the runtime whole.
+    if (auto* case_expr = std::get_if<parser::CaseExpr>(&expr.node);
+        case_expr != nullptr && contains_repl_call(expr, functions, extern_decls)) {
         // A NULL arm has no type of its own; the case's type is its other
         // arms' (`case { c => 1, else => NULL }` is an Int64 null, and so is
         // `Int64(NULL)`, which the parser spells that way).
@@ -3071,35 +3085,8 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         }();
         return chosen;
     }
-    if (auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
-        if (call->callee == "__null" && call->args.empty()) {
-            return std::unexpected(std::string(kUntypedNullError));
-        }
-        if (call->callee == "__interp") {
-            // String interpolation: stringify each argument (literal segments and
-            // embedded value expressions alike) and concatenate. format_scalar
-            // renders strings unquoted, so the literals read verbatim. A null
-            // embedded value makes the whole template null, as in a cell
-            // (SPEC.md Section 3: `px=${null}` is null), never the text "null".
-            std::string out;
-            bool null_value = false;
-            for (auto& arg : call->args) {
-                auto value = eval_scalar_expr(*arg, tables, lazy_tables, scalars, columns, models,
-                                              functions, compile_time_lists, extern_decls, externs);
-                if (!value) {
-                    return std::unexpected(value.error());
-                }
-                if (runtime::is_null_scalar(*value)) {
-                    null_value = true;
-                    continue;
-                }
-                out += format_scalar(*value);
-            }
-            if (null_value) {
-                return runtime::ScalarValue{NullScalar{runtime::ScalarKind::String}};
-            }
-            return runtime::ScalarValue{std::move(out)};
-        }
+    if (auto* call = std::get_if<parser::CallExpr>(&expr.node);
+        call != nullptr && is_repl_call(*call, functions, extern_decls)) {
         if (is_model_scalar_accessor(call->callee)) {
             return eval_model_scalar_accessor(*call, models);
         }
@@ -3214,43 +3201,9 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             }
             return std::unexpected("extern function returned table: " + call->callee);
         }
-        if (is_cast_callee(call->callee)) {
-            if (call->args.size() != 1) {
-                return std::unexpected(call->callee + "(): expects exactly one argument");
-            }
-            auto value =
-                eval_scalar_expr(*call->args[0], tables, lazy_tables, scalars, columns, models,
-                                 functions, compile_time_lists, extern_decls, externs);
-            if (!value) {
-                return std::unexpected(value.error());
-            }
-            return apply_scalar_cast(value.value(), call->callee);
-        }
-        if (call->callee == "round") {
-            if (call->args.size() != 2) {
-                return std::unexpected(
-                    "round(): expects (value, mode) — mode: nearest, bankers, floor, ceil, trunc");
-            }
-            auto mode = extract_round_mode(*call->args[1]);
-            if (!mode) {
-                return std::unexpected(mode.error());
-            }
-            auto value =
-                eval_scalar_expr(*call->args[0], tables, lazy_tables, scalars, columns, models,
-                                 functions, compile_time_lists, extern_decls, externs);
-            if (!value) {
-                return std::unexpected(value.error());
-            }
-            if (!std::holds_alternative<double>(*value)) {
-                return std::unexpected("round(): first argument must be Float");
-            }
-            return apply_scalar_round(std::get<double>(*value), *mode);
-        }
-        // Aggregates over a series (max/sum/mean/…) and row-wise scalar builtins
-        // (sqrt/sin/abs/pmax/…) both flow through eval_series_call. In scalar
-        // position the result must be a scalar — an element-wise series result
-        // (e.g. pmax(s1, s2)) is an error here, but works via eval_expr_value.
-        if (ir::is_aggregate_func(call->callee) || runtime::is_scalar_builtin(call->callee)) {
+        // Aggregates over a series (max/sum/mean/…) flow through
+        // eval_series_call. In scalar position the result must be a scalar.
+        if (ir::is_aggregate_func(call->callee)) {
             auto value = eval_series_call(*call, tables, lazy_tables, scalars, columns, models,
                                           functions, compile_time_lists, extern_decls, externs);
             if (!value) {
@@ -3265,7 +3218,8 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         return std::unexpected("unknown function: " + call->callee + " (available: " +
                                format_function_names(functions, extern_decls) + ")");
     }
-    return std::unexpected("expected scalar expression");
+    return eval_scalar_on_runtime(expr, tables, lazy_tables, scalars, columns, models, functions,
+                                  compile_time_lists, extern_decls, externs);
 }
 
 // Extract element `i` of a column as a scalar (Categorical/String -> std::string).

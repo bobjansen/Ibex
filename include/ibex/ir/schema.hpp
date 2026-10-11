@@ -205,4 +205,9 @@ using SourceSchemas = robin_hood::unordered_map<std::string, SchemaInfo>;
     const robin_hood::unordered_set<std::string>& lexical_names = {},
     bool check_expressions = false) -> std::optional<std::string>;
 
+/// Append every column reference in `expr` (value or predicate) to `out`,
+/// lexical `^name` references included; the caller filters against its schema
+/// and bindings.
+void collect_expr_columns(const Expr& expr, std::vector<ColumnRef>& out);
+
 }  // namespace ibex::ir

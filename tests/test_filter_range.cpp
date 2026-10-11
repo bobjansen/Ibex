@@ -390,6 +390,16 @@ TEST_CASE("evaluate_field over a partial range matches evaluating a gathered ran
                                                               .right = ilit(1)}}});
     fields.push_back({.label = "boolean over a nullable column",
                       .expr = cmp(ir::CompareOp::Gt, col_ref("nullable"), ilit(40))});
+    // A case evaluates each arm over the rows that take it; under a range those
+    // are the range's rows, at the range's offset.
+    fields.push_back(
+        {.label = "case over a nullable column",
+         .expr = std::move(
+             *call("__case", {ir::make_expr_ptr(cmp(ir::CompareOp::Gt, col_ref("id"), ilit(50))),
+                              col_ref("nullable"), col_ref("flag"),
+                              arith(ir::ArithmeticOp::Mul, col_ref("id"), ilit(2)), ilit(-1)}))});
+    fields.push_back({.label = "row-local kernel builtin over a range",
+                      .expr = std::move(*call("length", {col_ref("name")}))});
 
     for (const auto& f : fields) {
         for (const std::size_t grain : {1U, 7U, 63U, 64U, 65U, 200U}) {

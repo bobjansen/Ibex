@@ -1361,15 +1361,6 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
     return SchemaInfo::unknown();
 }
 
-namespace {
-
-auto missing_column(std::string_view clause, const std::string& name) -> std::string {
-    return std::string(clause) + ": column '" + name + "' not found in input";
-}
-
-// Collect the column names referenced by an expression (value or predicate).
-// Function callees and bound scalars are filtered out by the caller against the
-// schema / lexical bindings; here we just gather every ColumnRef name.
 void collect_expr_columns(const Expr& expr, std::vector<ColumnRef>& out) {
     std::visit(
         [&](const auto& node) {
@@ -1402,6 +1393,12 @@ void collect_expr_columns(const Expr& expr, std::vector<ColumnRef>& out) {
             }
         },
         expr.node);
+}
+
+namespace {
+
+auto missing_column(std::string_view clause, const std::string& name) -> std::string {
+    return std::string(clause) + ": column '" + name + "' not found in input";
 }
 
 }  // namespace

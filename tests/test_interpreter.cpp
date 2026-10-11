@@ -3223,6 +3223,41 @@ TEST_CASE("a compiled program's scalar lets have the REPL's values",
     CHECK(std::get<NullScalar>(typed_scalars.at("y")).kind == runtime::ScalarKind::Double);
 }
 
+TEST_CASE("A case evaluates an arm only for the rows that take it", "[interpreter][case]") {
+    // SPEC.md 2.6: arms are tried in order and evaluation stops at the first
+    // true condition. Evaluated over columns, an arm runs over the rows that
+    // take it -- an arm a row does not take neither fails it nor calls an
+    // extern for it.
+    runtime::TableRegistry registry;
+    runtime::Table table;
+    table.add_column("s", Column<std::string>{"1", "x", "3"});
+    table.add_column("ok", Column<bool>{true, false, true});
+    registry.emplace("t", table);
+
+    auto cast = runtime::interpret(
+        *require_ir("t[update { n = case { ok => Int64(s), else => 0 } }];"), registry);
+    REQUIRE(cast.has_value());
+    const auto& n = std::get<Column<std::int64_t>>(*cast->find("n"));
+    CHECK(std::vector<std::int64_t>(n.begin(), n.end()) == std::vector<std::int64_t>{1, 0, 3});
+
+    runtime::ExternRegistry externs;
+    int calls = 0;
+    externs.register_scalar(
+        "tick", runtime::ScalarKind::Int,
+        [&calls](const runtime::ExternArgs&) -> std::expected<runtime::ExternValue, std::string> {
+            ++calls;
+            return runtime::ExternValue{runtime::ScalarValue{std::int64_t{7}}};
+        });
+    auto ir = require_ir(
+        "extern fn tick() -> Int from \"t.hpp\"; t[update { v = case { ok => 0, else => tick() } "
+        "}];");
+    auto ticked = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(ticked.has_value());
+    CHECK(calls == 1);
+    const auto& v = std::get<Column<std::int64_t>>(*ticked->find("v"));
+    CHECK(std::vector<std::int64_t>(v.begin(), v.end()) == std::vector<std::int64_t>{0, 7, 0});
+}
+
 TEST_CASE("Every case arm is type-checked, the else arm included", "[interpreter][case][types]") {
     // A case is well typed or rejected before any row runs, whichever arm the
     // data would take: the else arm used to escape the check.

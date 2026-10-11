@@ -751,16 +751,21 @@ struct AggSlot {
         double double_value;
     };
     /// The boxed value First/Last needs for a non-numeric column (String, but
-    /// also Bool/Date/Timestamp); empty until the group has one. The chunked
+    /// also Bool/Date/Timestamp). Presence is tracked by has_value; the empty
+    /// string is a payload placeholder, not a null. The chunked
     /// operator keeps these in a side array that stays EMPTY — and therefore
     /// free — for an all-numeric query.
-    std::optional<ScalarValue> text_value;
+    ScalarValue text_value = std::string{};
     /// Welford M2, inline here because the materializing aggregate keeps one
     /// slot per group in ordinary containers and has no scratch region to put
     /// it in. The chunked operator, which allocates slots by the million, keeps
     /// it in scratch instead — that asymmetry is the whole point of the split.
     double m2 = 0.0;
 };
+
+// Keep absence in has_value rather than adding an optional discriminator to
+// every materializing slot (including numeric-only queries).
+static_assert(sizeof(AggSlot) <= 96);
 
 // The whole point of the split — lock it in so a future field cannot quietly
 // put a constructor back on the per-group hot path.
@@ -1199,12 +1204,6 @@ inline void append_text_cell(ColumnValue& column, const ScalarValue& value) {
 /// zero and is never read.
 inline auto null_column(const NullScalar& null, std::size_t rows)
     -> std::pair<ColumnValue, ValidityBitmap>;
-
-/// An aggregate slot's boxed value, or an empty string when the group had
-/// none -- what a text cell of an empty group has always been.
-inline auto text_or_empty(const std::optional<ScalarValue>& value) -> ScalarValue {
-    return value.has_value() ? *value : ScalarValue{std::string{}};
-}
 
 inline auto broadcast_scalar_column(const ScalarValue& value, std::size_t rows) -> ColumnValue {
     return std::visit(

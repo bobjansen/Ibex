@@ -352,7 +352,6 @@ auto run(int argc, char** argv) -> int {
     config.bench_mode = bench;
     config.bench_warmup = bench_warmup;
     config.bench_iters = bench_iters;
-    config.scalar_bindings = std::move(scalar_bindings->compile_time);
     if (script_plan.has_value()) {
         // The script orders its deferred scalars itself, among its other steps.
         for (const auto& binding : scalar_bindings->deferred) {

@@ -1917,26 +1917,34 @@ enum class FloatCleanMode : std::uint8_t {
 [[nodiscard]] auto infer_expr_type(const ir::Expr& expr, const Table& input,
                                    const ScalarRegistry* scalars, const ExternRegistry* externs)
     -> std::expected<ExprType, std::string>;
-[[nodiscard]] auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
-                             const ScalarRegistry* scalars, const ExternRegistry* externs)
-    -> std::expected<ExprValue, std::string>;
-[[nodiscard]] auto eval_extern_expr(const ir::CallExpr& call, const Table& input, std::size_t row,
-                                    const ScalarRegistry* scalars, const ExternRegistry* externs)
-    -> std::expected<ExprValue, std::string>;
+/// True when `expr` reads only its own row: no whole-column builtin (rolling,
+/// cumulative, lag/lead, generators) and no rank anywhere in it.
+[[nodiscard]] auto is_row_local(const ir::Expr& expr) -> bool;
+/// True when `expr` calls an extern function anywhere in it.
+[[nodiscard]] auto expr_calls_extern(const ir::Expr& expr, const ExternRegistry* externs) -> bool;
+/// Row `i` of an evaluated column, or Null where its validity bit is clear.
+[[nodiscard]] auto cell_value(const ColResult& column, std::size_t i) -> ExprValue;
+/// An extern scalar call over the rows of a field: its arguments evaluated as
+/// columns, then the extern called once per row, in row order, with that row's
+/// arguments (a null one is rejected in front of the call). A table first
+/// argument is a table-producing extern call, made per row the same way.
+[[nodiscard]] auto eval_extern_values(const ir::CallExpr& call, const Table& input, RowRange range,
+                                      const ColumnEvalCtx& ctx)
+    -> std::expected<std::vector<ExprValue>, std::string>;
 [[nodiscard]] auto evaluate_row_count_expr_impl(const ir::Expr& expr, const ScalarRegistry* scalars,
                                                 const ExternRegistry* externs)
     -> std::expected<std::size_t, std::string>;
-[[nodiscard]] auto field_uses_vectorized_eval(const ir::Expr& expr) -> bool;
-// The single field-expression evaluator: top-level whole-column builtin via
-// the registry, then vectorized / fast / per-row. All update paths and
-// the vectorized evaluator's scalar-call delegation dispatch through it
-// (stage 6 of the plan).
+// The single field-expression evaluator. The field is typed before any row runs,
+// then evaluated over columns: a whole-column builtin, the fused numeric tree,
+// a call applied over its argument columns, or the vectorized evaluator. Every
+// update path, every scalar (as a one-row frame), `map`, and the vectorized
+// evaluator's calls dispatch through it.
 //
 // `rows` selects which rows of `input` to evaluate; the result is always dense
-// (row 0 of the output is row `rows.begin` of the input). Not every sub-path
-// honours a partial range yet — see `is_range_native_expr`, which is the
-// authority on which expressions may be given one, and `evaluate_field`'s own
-// asserts for what happens if that gate and this function disagree.
+// (row 0 of the output is row `rows.begin` of the input). A whole-column
+// builtin cannot honour a partial range — see `is_range_native_expr`, which is
+// the authority on which expressions may be given one, and `evaluate_field`'s
+// own asserts for what happens if that gate and this function disagree.
 [[nodiscard]] auto evaluate_field(const ir::Expr& expr, const Table& input, RowRange range,
                                   const ColumnEvalCtx& ctx)
     -> std::expected<ComputedColumn, std::string>;

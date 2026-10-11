@@ -234,45 +234,72 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
             if (!child) {
                 return std::unexpected(child.error());
             }
-            // Map is deliberately row-major and serial: field expressions may
-            // perform observable I/O, so both row and declaration order are
-            // language semantics rather than a parallelization opportunity.
+            // Every field is typed and evaluated over columns by the field
+            // evaluator. Map is row-major where that can be observed: a field
+            // that calls an extern may perform I/O, so a map with one runs row
+            // by row, fields in declaration order. Without one there is no
+            // order to observe, and each field is evaluated over all rows.
+            const ColumnEvalCtx ctx{.scalars = scalars, .externs = externs, .window = std::nullopt};
+            const auto field_error = [&](std::size_t field, const std::string& message) {
+                if (const auto* ref =
+                        std::get_if<ir::ColumnRef>(&map_node.fields()[field].expr.node);
+                    ref != nullptr && registry.contains(ref->name)) {
+                    return "map field '" + map_node.fields()[field].alias +
+                           "' must evaluate to a scalar, not a table";
+                }
+                return "map field '" + map_node.fields()[field].alias + "': " + message;
+            };
+            bool calls_extern = false;
+            for (std::size_t field = 0; field < map_node.fields().size(); ++field) {
+                const auto& expr = map_node.fields()[field].expr;
+                if (!is_row_local(expr)) {
+                    return std::unexpected(
+                        field_error(field,
+                                    "a map field is evaluated per row and cannot read "
+                                    "other rows (rolling, cumulative, lag, ...)"));
+                }
+                calls_extern = calls_extern || expr_calls_extern(expr, externs);
+            }
+            const std::size_t rows = child->rows();
+            Table out;
+            if (!calls_extern) {
+                for (std::size_t field = 0; field < map_node.fields().size(); ++field) {
+                    auto column = evaluate_field(map_node.fields()[field].expr, *child,
+                                                 RowRange::whole(rows), ctx);
+                    if (!column) {
+                        return std::unexpected(field_error(field, column.error()));
+                    }
+                    if (column->validity) {
+                        out.add_column(map_node.fields()[field].alias, std::move(column->column),
+                                       std::move(*column->validity));
+                    } else {
+                        out.add_column(map_node.fields()[field].alias, std::move(column->column));
+                    }
+                }
+                if (out.columns.empty()) {
+                    out.logical_rows = rows;
+                }
+                return out;
+            }
             std::vector<std::vector<ScalarValue>> values(map_node.fields().size());
             for (auto& field_values : values) {
-                field_values.reserve(child->rows());
+                field_values.reserve(rows);
             }
-            for (std::size_t row = 0; row < child->rows(); ++row) {
+            for (std::size_t row = 0; row < rows; ++row) {
                 if (interrupt_requested()) {
                     return std::unexpected(interrupt_message());
                 }
                 for (std::size_t field = 0; field < map_node.fields().size(); ++field) {
-                    auto value =
-                        eval_expr(map_node.fields()[field].expr, *child, row, scalars, externs);
-                    if (!value) {
-                        if (const auto* ref =
-                                std::get_if<ir::ColumnRef>(&map_node.fields()[field].expr.node);
-                            ref != nullptr && registry.contains(ref->name)) {
-                            return std::unexpected("map field '" + map_node.fields()[field].alias +
-                                                   "' must evaluate to a scalar, not a table");
-                        }
-                        return std::unexpected("map field '" + map_node.fields()[field].alias +
-                                               "': " + value.error());
+                    auto cell = evaluate_field(map_node.fields()[field].expr, *child,
+                                               RowRange{.begin = row, .count = 1}, ctx);
+                    if (!cell) {
+                        return std::unexpected(field_error(field, cell.error()));
                     }
-                    auto scalar = scalar_from_expr(*value);
-                    if (!scalar) {
-                        // A null cell is of the field's type.
-                        auto null =
-                            infer_null_of(map_node.fields()[field].expr, *child, scalars, externs);
-                        if (!null) {
-                            return std::unexpected("map field '" + map_node.fields()[field].alias +
-                                                   "': " + null.error());
-                        }
-                        scalar = ScalarValue{*null};
-                    }
-                    values[field].push_back(std::move(*scalar));
+                    values[field].push_back(cell->validity.has_value() && !(*cell->validity)[0]
+                                                ? ScalarValue{null_of_column(cell->column)}
+                                                : scalar_from_column(cell->column, 0));
                 }
             }
-            Table out;
             for (std::size_t field = 0; field < map_node.fields().size(); ++field) {
                 auto column = map_column_from_scalars(values[field]);
                 if (!column) {
@@ -705,13 +732,12 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
                 ExternArgs out;
                 out.reserve(exprs.size());
                 for (const auto& arg : exprs) {
-                    auto val = eval_expr(arg, Table{}, 0, scalars, externs);
+                    auto val = evaluate_scalar_expr(arg, scalars, externs);
                     if (!val)
                         return std::unexpected(val.error());
-                    auto scalar = scalar_from_expr(val.value());
-                    if (!scalar)
+                    if (is_null_scalar(*val))
                         return std::unexpected("null argument in stream extern call");
-                    out.push_back(std::move(*scalar));
+                    out.push_back(std::move(*val));
                 }
                 return out;
             };

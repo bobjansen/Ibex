@@ -69,6 +69,11 @@ Polars 2.0.0 and visitor version `(15, 2)`. Other versions fail explicitly. This
 pin is an integration risk to resolve before distributing a general backend;
 it is not a claim of full Polars compatibility.
 
+Categorical result columns retain their Arrow dictionaries when passed to
+Polars. This avoids decoding them into strings and recreating categories.
+Polars may still validate/remap codes, and named category mappings receive
+the required dtype correction. Columns declared as String retain String output.
+
 ## Validation and measurements
 
 ```bash

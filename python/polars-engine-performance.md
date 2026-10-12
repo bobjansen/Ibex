@@ -98,3 +98,40 @@ joins/windows selected from benchmark evidence, reusable sources across
 different query objects, first-use allocations and a maintainable visitor
 version policy. The current private visitor pin remains the principal
 integration risk; full API compatibility and standalone packaging remain open.
+
+## Categorical output follow-up
+
+After commit `d6c79ef3`, the output boundary was changed to preserve native
+Arrow dictionaries for columns declared Categorical. Previously the lowerer's
+logical string schema caused those columns to be decoded into strings before
+Polars encoded them again. String output still receives the declared String
+type, and named category mappings retain their dtype correction.
+
+| Warm full output boundary | Before, 1 core | After, 1 core | Before, 8 cores | After, 8 cores |
+|---|---:|---:|---:|---:|
+| Grouped mean: 1,008 rows, two keys + mean | 0.142 ms | 0.071 ms | 0.419 ms | 0.185 ms |
+| Projection: 1M rows, two categorical keys + price | 32.71 ms | 16.37 ms | 20.90 ms | 9.25 ms |
+
+These measurements isolate the complete Python output boundary; native query
+execution, Arrow export and input preparation are excluded. They reuse the
+same immutable native outputs across thirty matched pairs, alternating order.
+Every categorical pair improves in both configurations (signed-rank p=0.00000173
+using the repository's normal approximation for thirty pairs). Numeric/String
+control cases show no statistically distinguishable changes in this sample.
+Numeric payloads remain shared, but categorical import can still validate/remap
+codes; dictionary preservation does not imply a zero-copy categorical result.
+
+Checks cover nulls, sliced/chunked arrays, different dictionary orders, empty
+outputs, named category mappings and native projection/grouping. Both new
+regression tests fail when the previous string round trip is restored. The
+Engine suite now has fifteen tests; all four Python CTest suites pass.
+
+```bash
+cmake --build build-release -j 6
+PYTHONPATH=build-release/python:python IBEX_CORES=8 taskset -c 0-7 \
+  .venv/bin/python python/bench_polars_result.py --iters 30 \
+  --out /tmp/categorical-output.json
+```
+
+[Matched samples and source hashes](../benchmarking/results/python_categorical_output_20261012.json)
+retain the old conversion function as a baseline against the revised boundary.

@@ -1,0 +1,908 @@
+{
+  "date": "2026-10-12",
+  "build": "Release",
+  "cpu": "13th Gen Intel(R) Core(TM) i7-13700",
+  "platform": "Linux-6.18.40.1-microsoft-standard-WSL2-x86_64-with-glibc2.41",
+  "ibex_head": "34f117b0e667f95dad71f31790f0438318e8ea24",
+  "worktree_dirty": true,
+  "source_sha256": {
+    "python/ibex/__init__.py": "54b113e96b2a8906162652eb052c993a037ac649ae9c3df806975c5b45132ede",
+    "python/ibex/_lower.py": "f52c2bc31913d93d3f07454ff1a43b7ff5bdcb5d128829246368183eb6e8f8ff",
+    "python/ibex/_expr.py": "7d93e378cd7086d55c87b6c78a95fa68fe28b0c60d02a72d4d4b5ca6c7e44bdd",
+    "python/ibex/_frame.py": "6bbeadfec57d55ef9ce023b675486f87d4cb1d87dc229e2916030375773ec617",
+    "python/ibex_pyarrow_module.cpp": "d697977212dd7cc351e6fb7fc174a6b559e14ad96fe20decd0001e2442b49b34"
+  },
+  "pdsh_head": "401908a307f133a2dffbe3f5e0e0fb2b50ea310b",
+  "input": {
+    "kind": "synthetic Arrow and actual PDS-H SF-1 columns loaded into memory outside timings",
+    "seed": 20261012,
+    "query": "unchanged upstream q1"
+  },
+  "timing": "12 interleaved pairs after two warmups; preparation and first collection separately recorded",
+  "caveats": [
+    "Local workstation, not published PDS-H baseline.",
+    "No runtime kernel changes; old raw route and prepared route use the same binary.",
+    "Native results are not cached. Input representation is prepared once.",
+    "First-use times are single samples, not a statistical speed claim.",
+    "Actual PDS-H memory measurements load only the seven q01 columns, identically for both frontends.",
+    "Source hashes recorded after documentation-only updates; functional code matches measured runs."
+  ],
+  "runs": [
+    {
+      "rows": 1000000,
+      "groups": 6,
+      "polars_version": "2.0.0",
+      "ibex_cores": "1",
+      "polars_threads": 1,
+      "input_mode": "bound",
+      "polars_engine": "streaming",
+      "input_prepare_ms": {
+        "ibex": 26.208534,
+        "polars": 19.703374
+      },
+      "first_collect_ms": {
+        "ibex": 39.711631,
+        "polars": 20.362635,
+        "ibex_raw": 42.164343
+      },
+      "samples_ms": {
+        "ibex": [
+          14.105474,
+          15.065042,
+          14.072348,
+          14.189464,
+          20.460718,
+          14.55458,
+          13.841787,
+          14.070366,
+          14.084597,
+          14.232576,
+          13.740444,
+          24.635349
+        ],
+        "polars": [
+          17.261402,
+          16.825421,
+          16.69282,
+          18.581898,
+          16.880376,
+          19.431945,
+          16.971674,
+          17.59605,
+          16.67187,
+          16.603271,
+          16.924387,
+          16.783626
+        ],
+        "ibex_raw": [
+          39.843444,
+          39.043783,
+          43.583601,
+          39.819153,
+          42.918623,
+          37.547967,
+          38.645679,
+          38.045735,
+          42.261745,
+          38.454018,
+          36.836597,
+          44.763311
+        ]
+      },
+      "median_ms": {
+        "ibex": 14.147469,
+        "polars": 16.902381499999997,
+        "ibex_raw": 39.431467999999995
+      },
+      "lowering_samples_ms": [
+        0.112093,
+        0.184794,
+        0.297286,
+        0.217074,
+        0.203773,
+        0.197229,
+        0.201536,
+        0.206177,
+        0.20653,
+        0.206597,
+        0.198585,
+        0.208539
+      ],
+      "native_endpoint_samples_ms": [
+        13.441354,
+        13.39179,
+        13.615784,
+        13.768265,
+        13.324182,
+        13.676998,
+        13.204423,
+        13.394004,
+        16.177183,
+        13.447356,
+        13.602588,
+        13.530427
+      ],
+      "note": "Native endpoint includes planning, execution and Arrow export; raw mode also repeats Arrow import. No results cached.",
+      "result_sha256": "07b271902368febedf8c1adec3e80d2f76ca87e5e1238fb01771f3adbe57044c",
+      "paired_ibex_vs_polars": {
+        "median_ratio": 0.8300932586370073,
+        "wilcoxon_p": 0.17626953125,
+        "wins": 10
+      },
+      "paired_bound_vs_raw": {
+        "median_ratio": 0.36997351428465275,
+        "wilcoxon_p": 0.00048828125
+      }
+    },
+    {
+      "rows": 1000000,
+      "groups": 6,
+      "polars_version": "2.0.0",
+      "ibex_cores": "8",
+      "polars_threads": 8,
+      "input_mode": "bound",
+      "polars_engine": "streaming",
+      "input_prepare_ms": {
+        "ibex": 28.227116,
+        "polars": 12.303573
+      },
+      "first_collect_ms": {
+        "ibex": 11.940392,
+        "polars": 14.142396
+      },
+      "samples_ms": {
+        "ibex": [
+          5.269396,
+          9.717547,
+          4.91928,
+          5.487558,
+          6.108131,
+          5.862304,
+          4.850513,
+          6.934883,
+          5.074924,
+          5.249908,
+          4.644975,
+          7.505317
+        ],
+        "polars": [
+          10.871065,
+          6.363964,
+          8.012274,
+          6.881651,
+          7.559204,
+          6.555677,
+          8.894922,
+          7.061558,
+          6.584915,
+          9.421546,
+          7.294641,
+          6.579897
+        ]
+      },
+      "median_ms": {
+        "ibex": 5.378477,
+        "polars": 7.1780995
+      },
+      "lowering_samples_ms": [
+        0.068394,
+        0.180016,
+        0.189867,
+        0.24421,
+        0.178883,
+        0.179062,
+        0.177905,
+        0.183148,
+        0.178452,
+        0.177268,
+        0.188065,
+        0.176429
+      ],
+      "native_endpoint_samples_ms": [
+        4.701001,
+        4.500452,
+        6.782559,
+        5.272691,
+        4.713129,
+        7.753988,
+        4.364212,
+        4.304689,
+        6.805439,
+        5.261917,
+        4.457342,
+        7.792445
+      ],
+      "note": "Native endpoint includes planning, execution and Arrow export; raw mode also repeats Arrow import. No results cached.",
+      "result_sha256": "07b271902368febedf8c1adec3e80d2f76ca87e5e1238fb01771f3adbe57044c",
+      "paired_ibex_vs_polars": {
+        "median_ratio": 0.7840540940842802,
+        "wilcoxon_p": 0.0341796875,
+        "wins": 10
+      }
+    },
+    {
+      "rows": 100000,
+      "groups": 6,
+      "polars_version": "2.0.0",
+      "ibex_cores": "1",
+      "polars_threads": 1,
+      "input_mode": "bound",
+      "polars_engine": "streaming",
+      "input_prepare_ms": {
+        "ibex": 2.785689,
+        "polars": 2.255197
+      },
+      "first_collect_ms": {
+        "ibex": 3.381424,
+        "polars": 4.43565
+      },
+      "samples_ms": {
+        "ibex": [
+          1.69228,
+          1.764902,
+          1.384075,
+          1.927433,
+          1.654763,
+          1.810128,
+          1.451304,
+          1.905106,
+          1.592161,
+          1.7655,
+          1.437521,
+          1.921681
+        ],
+        "polars": [
+          2.349157,
+          2.166987,
+          2.150849,
+          2.191149,
+          2.396181,
+          2.198407,
+          2.22515,
+          2.284941,
+          2.464574,
+          2.312987,
+          2.131269,
+          1.875398
+        ]
+      },
+      "median_ms": {
+        "ibex": 1.728591,
+        "polars": 2.2117785000000003
+      },
+      "lowering_samples_ms": [
+        0.103165,
+        0.100796,
+        0.104793,
+        0.093951,
+        0.151858,
+        0.100748,
+        0.092684,
+        0.090437,
+        0.088513,
+        0.096161,
+        0.11133,
+        0.092601
+      ],
+      "native_endpoint_samples_ms": [
+        1.220578,
+        1.122539,
+        1.048367,
+        1.013125,
+        1.076603,
+        1.027206,
+        1.053796,
+        0.986212,
+        1.05498,
+        1.017176,
+        0.983319,
+        1.057671
+      ],
+      "note": "Native endpoint includes planning, execution and Arrow export; raw mode also repeats Arrow import. No results cached.",
+      "paired_ibex_vs_polars": {
+        "median_ratio": 0.7418381390525924,
+        "wilcoxon_p": 0.0009765625,
+        "wins": 11
+      }
+    },
+    {
+      "rows": 100000,
+      "groups": 1000,
+      "polars_version": "2.0.0",
+      "ibex_cores": "1",
+      "polars_threads": 1,
+      "input_mode": "bound",
+      "polars_engine": "streaming",
+      "input_prepare_ms": {
+        "ibex": 3.460058,
+        "polars": 2.150477
+      },
+      "first_collect_ms": {
+        "ibex": 3.417107,
+        "polars": 5.988048
+      },
+      "samples_ms": {
+        "ibex": [
+          2.115247,
+          2.177223,
+          1.681651,
+          2.161841,
+          1.748373,
+          2.141275,
+          1.782108,
+          2.237288,
+          1.705761,
+          1.814788,
+          1.527752,
+          1.941853
+        ],
+        "polars": [
+          2.864259,
+          2.969382,
+          2.992736,
+          2.520307,
+          2.625721,
+          2.528351,
+          2.82425,
+          2.693315,
+          2.673249,
+          2.424201,
+          2.465353,
+          2.262639
+        ]
+      },
+      "median_ms": {
+        "ibex": 1.8783205,
+        "polars": 2.6494850000000003
+      },
+      "lowering_samples_ms": [
+        0.06273,
+        0.119141,
+        0.112138,
+        0.100426,
+        0.173899,
+        0.104459,
+        0.096994,
+        0.124611,
+        0.101566,
+        0.122192,
+        0.138041,
+        0.106732
+      ],
+      "native_endpoint_samples_ms": [
+        1.432725,
+        1.376085,
+        1.311849,
+        1.377767,
+        1.396541,
+        1.313756,
+        1.311966,
+        1.31225,
+        1.339072,
+        1.568535,
+        1.404337,
+        1.387607
+      ],
+      "note": "Native endpoint includes planning, execution and Arrow export; raw mode also repeats Arrow import. No results cached.",
+      "paired_ibex_vs_polars": {
+        "median_ratio": 0.735860699620728,
+        "wilcoxon_p": 0.00048828125,
+        "wins": 12
+      }
+    },
+    {
+      "rows": 1000000,
+      "groups": 1000,
+      "polars_version": "2.0.0",
+      "ibex_cores": "1",
+      "polars_threads": 1,
+      "input_mode": "bound",
+      "polars_engine": "streaming",
+      "input_prepare_ms": {
+        "ibex": 33.357748,
+        "polars": 21.914313
+      },
+      "first_collect_ms": {
+        "ibex": 38.795921,
+        "polars": 21.733311
+      },
+      "samples_ms": {
+        "ibex": [
+          16.620708,
+          16.112921,
+          15.981887,
+          17.28537,
+          16.096557,
+          16.289067,
+          16.04389,
+          16.340863,
+          19.137392,
+          16.173883,
+          16.118729,
+          16.213931
+        ],
+        "polars": [
+          17.658719,
+          16.455928,
+          17.884457,
+          17.501041,
+          17.134889,
+          16.338358,
+          16.89932,
+          16.687728,
+          17.808924,
+          16.306055,
+          17.134947,
+          16.191211
+        ]
+      },
+      "median_ms": {
+        "ibex": 16.193907,
+        "polars": 17.017104500000002
+      },
+      "lowering_samples_ms": [
+        0.064547,
+        0.235178,
+        0.248298,
+        0.184147,
+        0.246326,
+        0.183432,
+        0.185049,
+        0.183669,
+        0.237921,
+        0.214206,
+        0.188116,
+        0.206834
+      ],
+      "native_endpoint_samples_ms": [
+        15.795719,
+        15.853399,
+        15.541781,
+        15.475404,
+        16.122861,
+        15.374483,
+        15.514999,
+        15.808314,
+        15.922167,
+        18.377995,
+        15.999302,
+        15.392828
+      ],
+      "note": "Native endpoint includes planning, execution and Arrow export; raw mode also repeats Arrow import. No results cached.",
+      "paired_ibex_vs_polars": {
+        "median_ratio": 0.9791851942312496,
+        "wilcoxon_p": 0.0341796875,
+        "wins": 10
+      }
+    },
+    {
+      "rows": 1000000,
+      "groups": 1000,
+      "polars_version": "2.0.0",
+      "ibex_cores": "8",
+      "polars_threads": 8,
+      "input_mode": "bound",
+      "polars_engine": "streaming",
+      "input_prepare_ms": {
+        "ibex": 35.755983,
+        "polars": 10.90952
+      },
+      "first_collect_ms": {
+        "ibex": 9.460788,
+        "polars": 14.789297
+      },
+      "samples_ms": {
+        "ibex": [
+          6.691706,
+          5.403133,
+          5.507297,
+          6.849883,
+          5.045049,
+          7.532261,
+          5.032027,
+          9.921693,
+          5.120874,
+          6.65,
+          4.978148,
+          5.875886
+        ],
+        "polars": [
+          8.944147,
+          10.210912,
+          9.421162,
+          10.686201,
+          11.488043,
+          8.397507,
+          9.234646,
+          8.117971,
+          13.749155,
+          11.947987,
+          9.401521,
+          9.321876
+        ]
+      },
+      "median_ms": {
+        "ibex": 5.6915915,
+        "polars": 9.4113415
+      },
+      "lowering_samples_ms": [
+        0.067384,
+        0.191278,
+        0.227222,
+        0.181874,
+        0.246856,
+        0.179813,
+        0.177516,
+        0.179089,
+        0.187352,
+        0.183287,
+        0.192665,
+        0.182017
+      ],
+      "native_endpoint_samples_ms": [
+        4.8908,
+        5.20381,
+        6.368676,
+        5.179732,
+        7.097505,
+        5.562888,
+        4.701132,
+        8.45898,
+        4.984497,
+        6.783379,
+        6.243784,
+        4.700633
+      ],
+      "note": "Native endpoint includes planning, execution and Arrow export; raw mode also repeats Arrow import. No results cached.",
+      "paired_ibex_vs_polars": {
+        "median_ratio": 0.5705728754154017,
+        "wilcoxon_p": 0.00146484375,
+        "wins": 11
+      }
+    },
+    {
+      "rows": 1000000,
+      "groups": 6,
+      "polars_version": "2.0.0",
+      "ibex_cores": "1",
+      "polars_threads": 1,
+      "input_mode": "bound",
+      "polars_engine": "in-memory",
+      "input_prepare_ms": {
+        "ibex": 29.564511,
+        "polars": 18.332521
+      },
+      "first_collect_ms": {
+        "ibex": 27.464917,
+        "polars": 47.625126
+      },
+      "samples_ms": {
+        "ibex": [
+          13.811569,
+          14.039782,
+          14.186837,
+          14.917798,
+          13.611821,
+          14.149838,
+          14.07366,
+          15.52788,
+          15.807097,
+          14.179113,
+          13.600435,
+          14.058234
+        ],
+        "polars": [
+          20.193678,
+          20.430374,
+          21.483639,
+          21.794969,
+          20.38656,
+          19.820806,
+          19.981141,
+          19.570405,
+          22.109255,
+          19.634175,
+          21.020462,
+          19.852219
+        ]
+      },
+      "median_ms": {
+        "ibex": 14.111749,
+        "polars": 20.290118999999997
+      },
+      "lowering_samples_ms": [
+        0.061496,
+        0.236418,
+        0.233261,
+        0.224678,
+        0.291675,
+        0.176887,
+        0.20014,
+        0.180985,
+        0.187605,
+        0.195326,
+        0.205716,
+        0.176434
+      ],
+      "native_endpoint_samples_ms": [
+        13.510377,
+        14.297712,
+        17.877644,
+        14.337277,
+        13.511063,
+        13.410057,
+        14.174706,
+        13.79146,
+        13.259218,
+        13.622131,
+        14.210857,
+        14.00939
+      ],
+      "note": "Native endpoint includes planning, execution and Arrow export; raw mode also repeats Arrow import. No results cached.",
+      "paired_ibex_vs_polars": {
+        "median_ratio": 0.6957742914935476,
+        "wilcoxon_p": 0.00048828125,
+        "wins": 12
+      }
+    },
+    {
+      "rows": 1000000,
+      "groups": 6,
+      "polars_version": "2.0.0",
+      "ibex_cores": "8",
+      "polars_threads": 8,
+      "input_mode": "bound",
+      "polars_engine": "streaming",
+      "input_prepare_ms": {
+        "ibex": 31.492398,
+        "polars": 11.085092
+      },
+      "first_collect_ms": {
+        "ibex": 14.65939,
+        "polars": 11.181725
+      },
+      "samples_ms": {
+        "ibex": [
+          5.897041,
+          5.28714,
+          5.388069,
+          6.508021,
+          5.078984,
+          6.989041,
+          5.335448,
+          5.328055,
+          8.114674,
+          5.263142,
+          4.895405,
+          10.310477
+        ],
+        "polars": [
+          9.172858,
+          7.645207,
+          7.489386,
+          8.054208,
+          9.587494,
+          6.711549,
+          9.3065,
+          6.766556,
+          7.061766,
+          8.599663,
+          8.441295,
+          6.452926
+        ]
+      },
+      "median_ms": {
+        "ibex": 5.3617585000000005,
+        "polars": 7.849707499999999
+      },
+      "lowering_samples_ms": [
+        0.065562,
+        0.178814,
+        0.195461,
+        0.179958,
+        0.260689,
+        0.193437,
+        0.180143,
+        0.185306,
+        0.195751,
+        0.181249,
+        0.180104,
+        0.182688
+      ],
+      "native_endpoint_samples_ms": [
+        4.907321,
+        6.064875,
+        7.022822,
+        4.325833,
+        9.663923,
+        4.797597,
+        5.443251,
+        5.113168,
+        5.03986,
+        4.462404,
+        7.368182,
+        4.743281
+      ],
+      "note": "Native endpoint includes planning, execution and Arrow export; raw mode also repeats Arrow import. No results cached.",
+      "paired_ibex_vs_polars": {
+        "median_ratio": 0.705495017109611,
+        "wilcoxon_p": 0.04248046875,
+        "wins": 9
+      }
+    },
+    {
+      "rows": 6001215,
+      "groups": 4,
+      "polars_version": "2.0.0",
+      "input": "scale-1.0/lineitem.parquet",
+      "ibex_cores": "1",
+      "polars_threads": 1,
+      "input_mode": "bound",
+      "polars_engine": "streaming",
+      "input_prepare_ms": {
+        "ibex": 153.851635,
+        "polars": 125.475773
+      },
+      "first_collect_ms": {
+        "ibex": 220.366411,
+        "polars": 99.95908
+      },
+      "samples_ms": {
+        "ibex": [
+          94.613547,
+          99.185437,
+          98.427865,
+          97.74779,
+          98.020031,
+          92.323284,
+          95.591385,
+          108.773271,
+          104.297365,
+          96.796619,
+          95.724399,
+          92.677206
+        ],
+        "polars": [
+          99.550639,
+          92.393196,
+          94.015334,
+          99.341804,
+          96.050968,
+          91.207289,
+          98.50783,
+          101.357749,
+          94.402527,
+          96.096642,
+          97.163457,
+          92.470431
+        ]
+      },
+      "median_ms": {
+        "ibex": 97.2722045,
+        "polars": 96.073805
+      },
+      "lowering_samples_ms": [
+        0.137572,
+        0.201398,
+        0.194616,
+        0.194015,
+        0.175958,
+        0.197409,
+        0.179047,
+        0.191987,
+        0.183771,
+        0.185428,
+        0.265884,
+        0.204878
+      ],
+      "native_endpoint_samples_ms": [
+        93.746265,
+        93.843726,
+        90.569518,
+        89.738805,
+        89.735017,
+        91.683416,
+        93.077457,
+        89.95084,
+        94.510703,
+        91.796383,
+        89.567973,
+        96.6069
+      ],
+      "note": "Native endpoint includes planning, execution and Arrow export; raw mode also repeats Arrow import. No results cached.",
+      "result_sha256": "eb0c6d1554e46283e51af212723de7d62e850a314c9a6101bb5e14f758ffbd26",
+      "paired_ibex_vs_polars": {
+        "median_ratio": 1.0097599518158908,
+        "wilcoxon_p": 0.30126953125,
+        "wins": 4
+      }
+    },
+    {
+      "rows": 6001215,
+      "groups": 4,
+      "polars_version": "2.0.0",
+      "input": "scale-1.0/lineitem.parquet",
+      "ibex_cores": "8",
+      "polars_threads": 8,
+      "input_mode": "bound",
+      "polars_engine": "streaming",
+      "input_prepare_ms": {
+        "ibex": 147.828018,
+        "polars": 63.008391
+      },
+      "first_collect_ms": {
+        "ibex": 52.663389,
+        "polars": 32.340512
+      },
+      "samples_ms": {
+        "ibex": [
+          28.558982,
+          28.594247,
+          26.425075,
+          25.680094,
+          29.746523,
+          27.015946,
+          27.335831,
+          26.610512,
+          26.102132,
+          26.354299,
+          28.03095,
+          26.17439
+        ],
+        "polars": [
+          27.348888,
+          27.993924,
+          26.112789,
+          25.163746,
+          26.034924,
+          26.259288,
+          25.411521,
+          25.152863,
+          26.24331,
+          24.524883,
+          26.572243,
+          27.990251
+        ]
+      },
+      "median_ms": {
+        "ibex": 26.813229,
+        "polars": 26.1780495
+      },
+      "lowering_samples_ms": [
+        0.134701,
+        0.182309,
+        0.173883,
+        0.185954,
+        0.203203,
+        0.181953,
+        0.200951,
+        0.176737,
+        0.18928,
+        0.180303,
+        0.188337,
+        0.182183
+      ],
+      "native_endpoint_samples_ms": [
+        25.297119,
+        26.6587,
+        24.551656,
+        27.211702,
+        24.60196,
+        26.086805,
+        25.397303,
+        24.414805,
+        26.844841,
+        24.898147,
+        24.56377,
+        27.882977
+      ],
+      "note": "Native endpoint includes planning, execution and Arrow export; raw mode also repeats Arrow import. No results cached.",
+      "result_sha256": "eb0c6d1554e46283e51af212723de7d62e850a314c9a6101bb5e14f758ffbd26",
+      "paired_ibex_vs_polars": {
+        "median_ratio": 1.036530711661774,
+        "wilcoxon_p": 0.02099609375,
+        "wins": 2
+      }
+    }
+  ]
+}

@@ -33,12 +33,15 @@ target_link_libraries(ibex_pyarrow
     PRIVATE
         Ibex::parser
         Ibex::runtime
+        Ibex::repl
         Ibex::interop
         Ibex::CompilerOptions
         Python3::Module
 )
 
+set(IBEX_PYTHON_HAS_PARQUET 0)
 if(TARGET Ibex::parquet)
+    set(IBEX_PYTHON_HAS_PARQUET 1)
     target_link_libraries(ibex_pyarrow PRIVATE Ibex::parquet)
     target_compile_definitions(ibex_pyarrow PRIVATE IBEX_HAS_PARQUET_BACKEND=1)
 
@@ -89,6 +92,13 @@ execute_process(
 )
 
 if(IBEX_BUILD_TESTS AND IBEX_PYARROW_IMPORT_RESULT EQUAL 0)
+    add_test(
+        NAME ibex_python_lazy
+        COMMAND "${CMAKE_COMMAND}" -E env
+            "PYTHONPATH=${PROJECT_BINARY_DIR}/python:${PROJECT_SOURCE_DIR}/python"
+            "IBEX_TEST_PARQUET=${IBEX_PYTHON_HAS_PARQUET}"
+            "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/python/test_ibex_lazy.py"
+    )
     add_test(
         NAME ibex_pyarrow_smoke
         COMMAND "${CMAKE_COMMAND}" -E env

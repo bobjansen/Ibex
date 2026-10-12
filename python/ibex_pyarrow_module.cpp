@@ -8,6 +8,7 @@
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
+#include <ibex/repl/repl.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
@@ -16,6 +17,7 @@
 #include <datetime.h>
 
 #include <dlfcn.h>
+#include <exception>
 #include <expected>
 #include <filesystem>
 #include <fstream>
@@ -1076,6 +1078,11 @@ auto try_build_runtime_table_from_arrow(PyObject* table_like)
 
 auto build_runtime_table_from_python(PyObject* table_like)
     -> std::expected<ibex::runtime::Table, std::string> {
+    if (PyCapsule_IsValid(table_like, "ibex_pyarrow.bound_table")) {
+        const auto* table = static_cast<const ibex::runtime::Table*>(
+            PyCapsule_GetPointer(table_like, "ibex_pyarrow.bound_table"));
+        return *table;  // Shared column handles; no payload import/copy.
+    }
     auto arrow_table = try_build_runtime_table_from_arrow(table_like);
     if (!arrow_table) {
         return std::unexpected(arrow_table.error());
@@ -1374,7 +1381,109 @@ PyObject* py_session_eval_file(PyObject* /*self*/, PyObject* args, PyObject* kwa
     return export_result_table_or_none(*evaluated);
 }
 
+// Complete pipelines use the same planning and lazy-reader path as the CLI
+// and R host. The older eval_table/session APIs retain their current behavior.
+void bound_table_destructor(PyObject* capsule) {
+    auto* table = static_cast<ibex::runtime::Table*>(
+        PyCapsule_GetPointer(capsule, "ibex_pyarrow.bound_table"));
+    if (table != nullptr) {
+        delete table;
+    } else {
+        PyErr_Clear();
+    }
+}
+
+PyObject* py_bind_table(PyObject* /*self*/, PyObject* object) {
+    try {
+        auto imported = build_runtime_table_from_python(object);
+        if (!imported.has_value()) {
+            return set_python_error_from_message(PyExc_RuntimeError, imported.error());
+        }
+        auto table = std::make_unique<ibex::runtime::Table>(std::move(*imported));
+        // Apply Ibex's existing low-cardinality heuristic once at the input
+        // boundary. Repeated queries reuse dictionary codes instead of copying
+        // Arrow strings and hashing/gathering them again for every collection.
+        const auto limit = ibex::categorical_promotion_limit(table->rows());
+        for (std::size_t pos = 0; pos < table->columns.size(); ++pos) {
+            const auto& entry = table->columns[pos];
+            const auto* strings = std::get_if<ibex::Column<std::string>>(entry.column.get());
+            if (strings == nullptr || strings->empty()) {
+                continue;
+            }
+            ibex::Column<ibex::Categorical> categorical;
+            categorical.reserve(strings->size());
+            bool fits = true;
+            for (std::size_t row = 0; row < strings->size(); ++row) {
+                categorical.push_back(ibex::runtime::is_null(entry, row) ? std::string_view{}
+                                                                         : (*strings)[row]);
+                if (categorical.dictionary().size() > limit) {
+                    fits = false;
+                    break;
+                }
+            }
+            if (fits) {
+                categorical.set_meta(strings->meta());
+                table->replace_column(pos, std::move(categorical));
+            }
+        }
+        PyObject* capsule =
+            PyCapsule_New(table.get(), "ibex_pyarrow.bound_table", bound_table_destructor);
+        if (capsule != nullptr) {
+            table.release();
+        }
+        return capsule;
+    } catch (const std::exception& error) {
+        return set_python_error_from_message(PyExc_RuntimeError, error.what());
+    }
+}
+
+PyObject* py_execute_pipeline(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
+    static const char* kwlist[] = {"source", "tables", "scalars", nullptr};
+    const char* source = nullptr;
+    PyObject* tables_obj = Py_None;
+    PyObject* scalars_obj = Py_None;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s|OO", const_cast<char**>(kwlist), &source,
+                                     &tables_obj, &scalars_obj)) {
+        return nullptr;
+    }
+    auto tables = build_table_registry_from_python(tables_obj);
+    if (!tables.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, tables.error());
+    }
+    auto scalars = build_scalar_registry_from_python(scalars_obj);
+    if (!scalars.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, scalars.error());
+    }
+    try {
+        ibex::runtime::ExternRegistry externs;
+        register_first_party_backends(externs);
+        ibex::repl::ReplConfig config;
+        config.persistent_history = false;
+        ibex::repl::ReplSession session(config, externs);
+        ibex::repl::ReplSession::ExecuteOptions options;
+        options.tables = std::move(*tables);
+        options.scalars = std::move(*scalars);
+        options.render = false;
+        auto result = session.execute(source, std::move(options));
+        if (!result.ok) {
+            return set_python_error_from_message(PyExc_RuntimeError, result.error);
+        }
+        if (!result.table.has_value()) {
+            return set_python_error_from_message(PyExc_RuntimeError,
+                                                 "pipeline did not produce a table");
+        }
+        return export_result_table_or_none(
+            std::make_shared<const ibex::runtime::Table>(std::move(*result.table)));
+    } catch (const std::exception& error) {
+        return set_python_error_from_message(PyExc_RuntimeError, error.what());
+    }
+}
+
 PyMethodDef kModuleMethods[] = {
+    {"bind_table", py_bind_table, METH_O,
+     PyDoc_STR("Prepare and retain an immutable native input once for repeated pipelines.")},
+    {"execute_pipeline", _PyCFunction_CAST(py_execute_pipeline), METH_VARARGS | METH_KEYWORDS,
+     PyDoc_STR("Execute a complete pipeline through the shared Ibex planner, returning Arrow.")},
     {"create_session", _PyCFunction_CAST(py_create_session), METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR("Create a persistent Ibex session for repeated evaluation.")},
     {"reset_session", _PyCFunction_CAST(py_reset_session), METH_VARARGS | METH_KEYWORDS,

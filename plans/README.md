@@ -52,6 +52,7 @@ history).
 | [non-row-local-filter-plan.md](non-row-local-filter-plan.md) | Stage 1 shipped | `lag`/`lead`/`is_null` in filter work. Remaining: `rank(...)` in filter/select with `by`, explicit `order {}` context, rolling functions in filter (`price > rolling_mean(price)`) |
 | [bigger-than-ram-plan.md](bigger-than-ram-plan.md) | Phase 4 bullet 1 of 4 done | Out-of-core execution. Done: chunked/streaming `read_parquet` (branch `chunked-parquet-read`; ~6.5× lower peak RSS, ~1.7× faster, verified local + AWS). Next: column projection pushdown, row-group stats pushdown, directory/Hive datasets (rest of Phase 4), then Phase 1 spill infrastructure (prerequisite for Phases 2–3, 6–7: external sort, out-of-core join, adaptive spill selection) |
 | [grouped-chunkview-update-plan.md](grouped-chunkview-update-plan.md) | Mostly complete — `update …, by k` runs off an immutable `GroupedRowPlan` (CSR) instead of gather → per-group `Table` → scatter. Began as a sub-plan of the (retired) kernel-pipeline plan's Phase 2. | Remaining materialized shapes: `rank`, variable-width ordered state, `window`-clause `lag`/`lead`. |
+| [python-polars-backend-plan.md](python-polars-backend-plan.md) | Independent Python q06/q01 slices implemented, 2026-10-12; prepared in-memory inputs, grouped aggregates and sorting. Correctness and local warm/first-use measurements recorded. | First-use/preparation overhead and demanded-column binding; then Engine prototype/comparison, remaining PDS-H/API coverage and packaging. |
 
 ## Proposed — no implementation yet
 

@@ -199,7 +199,9 @@ class DataFrame:
         for name in self.columns:
             _identifier(name)
         supported = (pa.int64(), pa.float64(), pa.bool_(), pa.string(), pa.large_string(), pa.date32())
-        if any(dtype not in supported for dtype in self._table.schema.types):
+        if any(dtype not in supported and not (
+            pa.types.is_dictionary(dtype) and dtype.value_type in (pa.string(), pa.large_string())
+        ) for dtype in self._table.schema.types):
             raise NotImplementedError("lazy in-memory inputs currently support Int64, Float64, Bool, String and Date")
         if self._bound_source is None:
             import ibex_pyarrow
@@ -210,6 +212,20 @@ class DataFrame:
             for index, field in enumerate(table.schema):
                 if field.type == pa.large_string():
                     table = table.set_column(index, field.name, table.column(index).cast(pa.string()))
+                elif pa.types.is_dictionary(field.type):
+                    arrays = []
+                    for chunk in table.column(index).chunks:
+                        if len(chunk.dictionary) >= 2**31:
+                            raise NotImplementedError("categorical dictionary exceeds native Int32 code range")
+                        indices = chunk.indices
+                        if indices.type == pa.uint32():
+                            indices = indices.view(pa.int32())
+                        elif indices.type != pa.int32():
+                            indices = indices.cast(pa.int32())
+                        arrays.append(pa.DictionaryArray.from_arrays(
+                            indices, chunk.dictionary.cast(pa.string())))
+                    table = table.set_column(index, field.name, pa.chunked_array(
+                        arrays, type=pa.dictionary(pa.int32(), pa.string())))
             native_input = table if table.num_rows else pa.RecordBatch.from_arrays(
                 [column.combine_chunks() for column in table.columns], schema=table.schema
             )

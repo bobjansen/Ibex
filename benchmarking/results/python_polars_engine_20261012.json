@@ -1,0 +1,611 @@
+{
+  "runs": [
+    {
+      "query": "mean_by_symbol_day",
+      "rows": 1000000,
+      "groups": 1008,
+      "input": "resident Polars categorical keys; prices_multi seed 43, 252 symbols, four days",
+      "resident_chunks": {
+        "symbol": 1,
+        "day": 1,
+        "price": 1
+      },
+      "input_prepare_ms": {
+        "engine": 23.430561,
+        "independent": 10.709468
+      },
+      "first_collect_ms": {
+        "engine": 3.930052,
+        "independent": 1.935075,
+        "polars": 11.225085
+      },
+      "samples_ms": {
+        "engine": [
+          2.241033,
+          2.480549,
+          2.203019,
+          2.473823,
+          2.393685,
+          2.408297,
+          2.129992,
+          2.447555,
+          2.278278,
+          2.386164,
+          2.395467,
+          2.189506
+        ],
+        "independent": [
+          1.806376,
+          2.134075,
+          1.843755,
+          1.94886,
+          1.971004,
+          2.382066,
+          1.801776,
+          2.139706,
+          1.965185,
+          2.1656,
+          1.924879,
+          2.043987
+        ],
+        "polars": [
+          5.901801,
+          5.666116,
+          5.580779,
+          5.749945,
+          5.698224,
+          5.956343,
+          5.795784,
+          5.923056,
+          6.001889,
+          5.682475,
+          5.676344,
+          5.784124
+        ]
+      },
+      "median_ms": {
+        "engine": 2.3899245000000002,
+        "independent": 1.9680944999999999,
+        "polars": 5.7670345
+      },
+      "result_sha256": "f08ef47b91ab7db39cefe1d78f3918d96f362f76a5e0bac49f85e26a994cfa33",
+      "ibex_cores": "1",
+      "polars_threads": 1,
+      "cpu_affinity": [
+        0
+      ],
+      "polars_version": "2.0.0",
+      "platform": "Linux-6.18.40.1-microsoft-standard-WSL2-x86_64-with-glibc2.41",
+      "build": "Release",
+      "ibex_head": "97de43bde61971474e94fb0121def6d12a0673f7",
+      "worktree_dirty": true,
+      "source_sha256": {
+        "python/ibex/__init__.py": "54b113e96b2a8906162652eb052c993a037ac649ae9c3df806975c5b45132ede",
+        "python/ibex/_lower.py": "f02ef6f1de12969f2b4822a8c716ccaf4c6519b748efc550a98b8bae46215d32",
+        "python/ibex/_expr.py": "7d93e378cd7086d55c87b6c78a95fa68fe28b0c60d02a72d4d4b5ca6c7e44bdd",
+        "python/ibex/_frame.py": "7915dad90c7cfb29fdd188541c697b049c0a82731408063d649220c94d4357a2",
+        "python/ibex_polars/_engine.py": "8a660a013ca985a3236a086436d647a4c4ed4fbe42ac9c66a62dd1dfe6c930af",
+        "python/ibex_polars/__init__.py": "ff367504c12ccb725feb342c4eba07580e6ecf8a8fb079b16d8f52299bbc85f3",
+        "python/ibex_polars/_adapter.py": "801de9c92d104863484a8ab60abe832ecec4fab35e3f8cc320a1299e79ef1835",
+        "python/bench_polars_engine.py": "451fa2a777b72f8e785fa244525c7f5d21e0bf8fcb439f544e4bfa074a7d7663",
+        "src/runtime/aggregate_chunked.cpp": "c18191463148dd79bc1758b16c75cb77a4c157007f8668bbbc5a730717e5d027",
+        "python/ibex_pyarrow_module.cpp": "d697977212dd7cc351e6fb7fc174a6b559e14ad96fe20decd0001e2442b49b34"
+      },
+      "native_source": "_ibex_input[select { `symbol`, `day`, `avg_price` = mean(`price`) }, by { `symbol`, `day` }];",
+      "notes": [
+        "Same resident categorical input for all routes; initial data generation/encoding excluded.",
+        "Preparation translates/binds inputs without executing aggregation; no results cached.",
+        "First collection order is Engine, independent, Polars. Native runtime initialization is charged to Engine; independent first collection shares the initialized runtime.",
+        "Warm timings include output conversion; independent output is Arrow-backed, Engine output is Polars.",
+        "All six execution orders balanced; each index forms a matched pair."
+      ],
+      "paired_comparisons": {
+        "polars": {
+          "engine_faster_pairs": 12,
+          "pairs": 12,
+          "two_sided_wilcoxon_p": 0.00048828125,
+          "median_reference_over_engine": 2.4466241237429065
+        },
+        "independent": {
+          "engine_faster_pairs": 0,
+          "pairs": 12,
+          "two_sided_wilcoxon_p": 0.00048828125,
+          "median_reference_over_engine": 0.853115532345333
+        }
+      }
+    },
+    {
+      "query": "mean_by_symbol_day",
+      "rows": 1000000,
+      "groups": 1008,
+      "input": "resident Polars categorical keys; prices_multi seed 43, 252 symbols, four days",
+      "resident_chunks": {
+        "symbol": 1,
+        "day": 1,
+        "price": 1
+      },
+      "input_prepare_ms": {
+        "engine": 19.457535,
+        "independent": 10.684001
+      },
+      "first_collect_ms": {
+        "engine": 2.301058,
+        "independent": 0.922757,
+        "polars": 6.021746
+      },
+      "samples_ms": {
+        "engine": [
+          2.224299,
+          1.657676,
+          1.40849,
+          1.769201,
+          1.679084,
+          1.508562,
+          1.254912,
+          1.501023,
+          1.397222,
+          1.720653,
+          1.752887,
+          1.572883
+        ],
+        "independent": [
+          1.191432,
+          1.169193,
+          0.922401,
+          1.194229,
+          0.902757,
+          1.205429,
+          0.81375,
+          1.228839,
+          0.918293,
+          1.143729,
+          0.959321,
+          1.859538
+        ],
+        "polars": [
+          3.211896,
+          2.454386,
+          4.427192,
+          2.642449,
+          3.076614,
+          4.125115,
+          2.752432,
+          4.454882,
+          2.963072,
+          2.522167,
+          4.531203,
+          2.935426
+        ]
+      },
+      "median_ms": {
+        "engine": 1.6152795,
+        "independent": 1.156461,
+        "polars": 3.019843
+      },
+      "result_sha256": "f08ef47b91ab7db39cefe1d78f3918d96f362f76a5e0bac49f85e26a994cfa33",
+      "ibex_cores": "8",
+      "polars_threads": 8,
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "polars_version": "2.0.0",
+      "platform": "Linux-6.18.40.1-microsoft-standard-WSL2-x86_64-with-glibc2.41",
+      "build": "Release",
+      "ibex_head": "97de43bde61971474e94fb0121def6d12a0673f7",
+      "worktree_dirty": true,
+      "source_sha256": {
+        "python/ibex/__init__.py": "54b113e96b2a8906162652eb052c993a037ac649ae9c3df806975c5b45132ede",
+        "python/ibex/_lower.py": "f02ef6f1de12969f2b4822a8c716ccaf4c6519b748efc550a98b8bae46215d32",
+        "python/ibex/_expr.py": "7d93e378cd7086d55c87b6c78a95fa68fe28b0c60d02a72d4d4b5ca6c7e44bdd",
+        "python/ibex/_frame.py": "7915dad90c7cfb29fdd188541c697b049c0a82731408063d649220c94d4357a2",
+        "python/ibex_polars/_engine.py": "8a660a013ca985a3236a086436d647a4c4ed4fbe42ac9c66a62dd1dfe6c930af",
+        "python/ibex_polars/__init__.py": "ff367504c12ccb725feb342c4eba07580e6ecf8a8fb079b16d8f52299bbc85f3",
+        "python/ibex_polars/_adapter.py": "801de9c92d104863484a8ab60abe832ecec4fab35e3f8cc320a1299e79ef1835",
+        "python/bench_polars_engine.py": "451fa2a777b72f8e785fa244525c7f5d21e0bf8fcb439f544e4bfa074a7d7663",
+        "src/runtime/aggregate_chunked.cpp": "c18191463148dd79bc1758b16c75cb77a4c157007f8668bbbc5a730717e5d027",
+        "python/ibex_pyarrow_module.cpp": "d697977212dd7cc351e6fb7fc174a6b559e14ad96fe20decd0001e2442b49b34"
+      },
+      "native_source": "_ibex_input[select { `symbol`, `day`, `avg_price` = mean(`price`) }, by { `symbol`, `day` }];",
+      "notes": [
+        "Same resident categorical input for all routes; initial data generation/encoding excluded.",
+        "Preparation translates/binds inputs without executing aggregation; no results cached.",
+        "First collection order is Engine, independent, Polars. Native runtime initialization is charged to Engine; independent first collection shares the initialized runtime.",
+        "Warm timings include output conversion; independent output is Arrow-backed, Engine output is Polars.",
+        "All six execution orders balanced; each index forms a matched pair."
+      ],
+      "paired_comparisons": {
+        "polars": {
+          "engine_faster_pairs": 12,
+          "pairs": 12,
+          "two_sided_wilcoxon_p": 0.00048828125,
+          "median_reference_over_engine": 1.9934795479789105
+        },
+        "independent": {
+          "engine_faster_pairs": 1,
+          "pairs": 12,
+          "two_sided_wilcoxon_p": 0.00146484375,
+          "median_reference_over_engine": 0.6609670316743674
+        }
+      }
+    },
+    {
+      "query": "mean_by_symbol_day",
+      "rows": 16000000,
+      "groups": 1008,
+      "input": "resident Polars categorical keys; prices_multi seed 43, 252 symbols, four days",
+      "resident_chunks": {
+        "symbol": 1,
+        "day": 1,
+        "price": 1
+      },
+      "input_prepare_ms": {
+        "engine": 148.283393,
+        "independent": 144.179424
+      },
+      "first_collect_ms": {
+        "engine": 44.469111,
+        "independent": 25.61936,
+        "polars": 84.738643
+      },
+      "samples_ms": {
+        "engine": [
+          26.811498,
+          27.2032,
+          27.82186,
+          30.616839,
+          26.224968,
+          26.294435,
+          26.02475,
+          26.143325,
+          26.39082,
+          27.569353,
+          26.121026,
+          26.383598
+        ],
+        "independent": [
+          25.784678,
+          25.589647,
+          25.635531,
+          31.685755,
+          25.655863,
+          25.34581,
+          26.609395,
+          25.395879,
+          26.056008,
+          25.726355,
+          26.706156,
+          26.918192
+        ],
+        "polars": [
+          99.349257,
+          88.819025,
+          86.040257,
+          92.103885,
+          86.831167,
+          83.919375,
+          84.502646,
+          86.417339,
+          83.482941,
+          84.348757,
+          82.289806,
+          85.769706
+        ]
+      },
+      "median_ms": {
+        "engine": 26.387209,
+        "independent": 25.7555165,
+        "polars": 85.90498149999999
+      },
+      "result_sha256": "c0c3b03da712ecb2670f05164c21af5aa0f9c2e725dab2f6e56c2ad8ba27743b",
+      "ibex_cores": "1",
+      "polars_threads": 1,
+      "cpu_affinity": [
+        0
+      ],
+      "polars_version": "2.0.0",
+      "platform": "Linux-6.18.40.1-microsoft-standard-WSL2-x86_64-with-glibc2.41",
+      "build": "Release",
+      "ibex_head": "97de43bde61971474e94fb0121def6d12a0673f7",
+      "worktree_dirty": true,
+      "source_sha256": {
+        "python/ibex/__init__.py": "54b113e96b2a8906162652eb052c993a037ac649ae9c3df806975c5b45132ede",
+        "python/ibex/_lower.py": "f02ef6f1de12969f2b4822a8c716ccaf4c6519b748efc550a98b8bae46215d32",
+        "python/ibex/_expr.py": "7d93e378cd7086d55c87b6c78a95fa68fe28b0c60d02a72d4d4b5ca6c7e44bdd",
+        "python/ibex/_frame.py": "7915dad90c7cfb29fdd188541c697b049c0a82731408063d649220c94d4357a2",
+        "python/ibex_polars/_engine.py": "8a660a013ca985a3236a086436d647a4c4ed4fbe42ac9c66a62dd1dfe6c930af",
+        "python/ibex_polars/__init__.py": "ff367504c12ccb725feb342c4eba07580e6ecf8a8fb079b16d8f52299bbc85f3",
+        "python/ibex_polars/_adapter.py": "801de9c92d104863484a8ab60abe832ecec4fab35e3f8cc320a1299e79ef1835",
+        "python/bench_polars_engine.py": "451fa2a777b72f8e785fa244525c7f5d21e0bf8fcb439f544e4bfa074a7d7663",
+        "src/runtime/aggregate_chunked.cpp": "c18191463148dd79bc1758b16c75cb77a4c157007f8668bbbc5a730717e5d027",
+        "python/ibex_pyarrow_module.cpp": "d697977212dd7cc351e6fb7fc174a6b559e14ad96fe20decd0001e2442b49b34"
+      },
+      "native_source": "_ibex_input[select { `symbol`, `day`, `avg_price` = mean(`price`) }, by { `symbol`, `day` }];",
+      "notes": [
+        "Same resident categorical input for all routes; initial data generation/encoding excluded.",
+        "Preparation translates/binds inputs without executing aggregation; no results cached.",
+        "First collection order is Engine, independent, Polars. Native runtime initialization is charged to Engine; independent first collection shares the initialized runtime.",
+        "Warm timings include output conversion; independent output is Arrow-backed, Engine output is Polars.",
+        "All six execution orders balanced; each index forms a matched pair."
+      ],
+      "paired_comparisons": {
+        "polars": {
+          "engine_faster_pairs": 12,
+          "pairs": 12,
+          "two_sided_wilcoxon_p": 0.00048828125,
+          "median_reference_over_engine": 3.2192684711619624
+        },
+        "independent": {
+          "engine_faster_pairs": 4,
+          "pairs": 12,
+          "two_sided_wilcoxon_p": 0.1513671875,
+          "median_reference_over_engine": 0.9748543983083311
+        }
+      }
+    },
+    {
+      "query": "mean_by_symbol_day",
+      "rows": 16000000,
+      "groups": 1008,
+      "input": "resident Polars categorical keys; prices_multi seed 43, 252 symbols, four days",
+      "resident_chunks": {
+        "symbol": 1,
+        "day": 1,
+        "price": 1
+      },
+      "input_prepare_ms": {
+        "engine": 152.451592,
+        "independent": 143.944366
+      },
+      "first_collect_ms": {
+        "engine": 26.726937,
+        "independent": 9.880957,
+        "polars": 20.016376
+      },
+      "samples_ms": {
+        "engine": [
+          9.033872,
+          9.401676,
+          9.524965,
+          9.118665,
+          9.792094,
+          9.460911,
+          9.097181,
+          9.267712,
+          9.980755,
+          9.251269,
+          9.810849,
+          9.627109
+        ],
+        "independent": [
+          9.053002,
+          8.899949,
+          8.884366,
+          9.308448,
+          8.285446,
+          10.481618,
+          8.678833,
+          9.105017,
+          8.754234,
+          8.530659,
+          8.433144,
+          9.709022
+        ],
+        "polars": [
+          14.664509,
+          15.293613,
+          14.300189,
+          14.273436,
+          16.053555,
+          13.754639,
+          14.279648,
+          16.169066,
+          14.575886,
+          14.215892,
+          14.469709,
+          15.271279
+        ]
+      },
+      "median_ms": {
+        "engine": 9.431293499999999,
+        "independent": 8.8921575,
+        "polars": 14.5227975
+      },
+      "result_sha256": "c0c3b03da712ecb2670f05164c21af5aa0f9c2e725dab2f6e56c2ad8ba27743b",
+      "ibex_cores": "8",
+      "polars_threads": 8,
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "polars_version": "2.0.0",
+      "platform": "Linux-6.18.40.1-microsoft-standard-WSL2-x86_64-with-glibc2.41",
+      "build": "Release",
+      "ibex_head": "97de43bde61971474e94fb0121def6d12a0673f7",
+      "worktree_dirty": true,
+      "source_sha256": {
+        "python/ibex/__init__.py": "54b113e96b2a8906162652eb052c993a037ac649ae9c3df806975c5b45132ede",
+        "python/ibex/_lower.py": "f02ef6f1de12969f2b4822a8c716ccaf4c6519b748efc550a98b8bae46215d32",
+        "python/ibex/_expr.py": "7d93e378cd7086d55c87b6c78a95fa68fe28b0c60d02a72d4d4b5ca6c7e44bdd",
+        "python/ibex/_frame.py": "7915dad90c7cfb29fdd188541c697b049c0a82731408063d649220c94d4357a2",
+        "python/ibex_polars/_engine.py": "8a660a013ca985a3236a086436d647a4c4ed4fbe42ac9c66a62dd1dfe6c930af",
+        "python/ibex_polars/__init__.py": "ff367504c12ccb725feb342c4eba07580e6ecf8a8fb079b16d8f52299bbc85f3",
+        "python/ibex_polars/_adapter.py": "801de9c92d104863484a8ab60abe832ecec4fab35e3f8cc320a1299e79ef1835",
+        "python/bench_polars_engine.py": "451fa2a777b72f8e785fa244525c7f5d21e0bf8fcb439f544e4bfa074a7d7663",
+        "src/runtime/aggregate_chunked.cpp": "c18191463148dd79bc1758b16c75cb77a4c157007f8668bbbc5a730717e5d027",
+        "python/ibex_pyarrow_module.cpp": "d697977212dd7cc351e6fb7fc174a6b559e14ad96fe20decd0001e2442b49b34"
+      },
+      "native_source": "_ibex_input[select { `symbol`, `day`, `avg_price` = mean(`price`) }, by { `symbol`, `day` }];",
+      "notes": [
+        "Same resident categorical input for all routes; initial data generation/encoding excluded.",
+        "Preparation translates/binds inputs without executing aggregation; no results cached.",
+        "First collection order is Engine, independent, Polars. Native runtime initialization is charged to Engine; independent first collection shares the initialized runtime.",
+        "Warm timings include output conversion; independent output is Arrow-backed, Engine output is Polars.",
+        "All six execution orders balanced; each index forms a matched pair."
+      ],
+      "paired_comparisons": {
+        "polars": {
+          "engine_faster_pairs": 12,
+          "pairs": 12,
+          "two_sided_wilcoxon_p": 0.00048828125,
+          "median_reference_over_engine": 1.5674886054880628
+        },
+        "independent": {
+          "engine_faster_pairs": 4,
+          "pairs": 12,
+          "two_sided_wilcoxon_p": 0.0771484375,
+          "median_reference_over_engine": 0.9503238744037397
+        }
+      }
+    }
+  ],
+  "native_fix_ab": {
+    "base": "97de43bd",
+    "target": "WORKTREE",
+    "cores": 1,
+    "suite": "multi",
+    "rows": 1000000,
+    "iters_per_repeat": 2,
+    "paired_repeats": 12,
+    "queries": {
+      "count_by_symbol_day": {
+        "base_ms": [
+          1.319,
+          1.46,
+          2.019,
+          1.432,
+          1.493,
+          1.335,
+          1.312,
+          1.358,
+          1.543,
+          1.248,
+          1.203,
+          1.341
+        ],
+        "target_ms": [
+          1.312,
+          1.461,
+          1.401,
+          1.496,
+          1.437,
+          1.427,
+          1.449,
+          1.449,
+          1.251,
+          1.414,
+          1.336,
+          1.31
+        ],
+        "two_sided_wilcoxon_p": 0.6220703125
+      },
+      "mean_by_symbol_day": {
+        "base_ms": [
+          1.773,
+          1.751,
+          1.759,
+          1.958,
+          2.101,
+          1.777,
+          1.763,
+          1.862,
+          2.122,
+          1.549,
+          1.572,
+          1.591
+        ],
+        "target_ms": [
+          1.99,
+          1.874,
+          1.948,
+          2.013,
+          1.908,
+          1.953,
+          1.861,
+          1.881,
+          1.622,
+          1.791,
+          1.763,
+          1.92
+        ],
+        "two_sided_wilcoxon_p": 0.1513671875
+      },
+      "ohlc_by_symbol_day": {
+        "base_ms": [
+          4.188,
+          4.269,
+          4.398,
+          4.831,
+          4.855,
+          4.3,
+          4.143,
+          4.386,
+          4.748,
+          3.958,
+          3.886,
+          3.909
+        ],
+        "target_ms": [
+          4.334,
+          4.364,
+          4.666,
+          4.67,
+          4.675,
+          4.443,
+          4.27,
+          4.416,
+          4.175,
+          4.39,
+          3.996,
+          4.047
+        ],
+        "two_sided_wilcoxon_p": 0.4697265625
+      },
+      "symbol_day_to_symbol": {
+        "base_ms": [
+          3.296,
+          3.524,
+          3.68,
+          3.754,
+          3.928,
+          3.533,
+          3.521,
+          3.807,
+          3.443,
+          3.047,
+          3.127,
+          3.012
+        ],
+        "target_ms": [
+          3.536,
+          3.646,
+          3.722,
+          3.922,
+          3.966,
+          3.671,
+          3.733,
+          3.45,
+          3.352,
+          3.205,
+          3.197,
+          3.174
+        ],
+        "two_sided_wilcoxon_p": 0.0771484375
+      }
+    },
+    "assessment": "unclear: no statistically significant changes in this focused owned-input sample; this is not proof of no regression",
+    "input": "benchmarking/data/prices_multi.csv"
+  }
+}

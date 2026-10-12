@@ -59,6 +59,44 @@ auto ints(const runtime::Table& t, const char* name) -> const Column<std::int64_
 }
 }  // namespace
 
+TEST_CASE("categorical aggregate reads borrowed numeric columns without detaching",
+          "[aggregate][arrow][adopt]") {
+    auto doubles = std::make_shared<std::vector<double>>(std::initializer_list<double>{1, 2, 3, 4});
+    auto integers = std::make_shared<std::vector<std::int64_t>>(
+        std::initializer_list<std::int64_t>{1, 2, 3, 4});
+    runtime::Chunk chunk;
+    Column<Categorical> first;
+    Column<Categorical> second;
+    for (const auto* key : {"a", "b", "a", "b"}) {
+        first.push_back(key);
+        second.push_back("day");
+    }
+    chunk.add_column("k", std::move(first));
+    chunk.add_column("day", std::move(second));
+    chunk.add_column("d", Column<double>::from_external(doubles, doubles->data(), doubles->size()));
+    chunk.add_column(
+        "i", Column<std::int64_t>::from_external(integers, integers->data(), integers->size()));
+    const auto double_column = chunk.columns[2].column;
+    const auto integer_column = chunk.columns[3].column;
+    auto result =
+        aggregate_chunks({chunk}, {{.name = "k"}, {.name = "day"}},
+                         {{.func = ir::AggFunc::Mean, .column = {.name = "d"}, .alias = "average"},
+                          {.func = ir::AggFunc::Sum, .column = {.name = "i"}, .alias = "total"}});
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+    const auto& borrowed_double = std::get<Column<double>>(std::as_const(*double_column));
+    const auto& borrowed_int = std::get<Column<std::int64_t>>(std::as_const(*integer_column));
+    REQUIRE(borrowed_double.is_external());
+    REQUIRE(borrowed_int.is_external());
+    REQUIRE(borrowed_double.data() == doubles->data());
+    REQUIRE(borrowed_int.data() == integers->data());
+    const auto& averages = std::get<Column<double>>(*result->find("average"));
+    REQUIRE(averages[0] == 2.0);
+    REQUIRE(averages[1] == 3.0);
+    REQUIRE(ints(*result, "total")[0] == 4);
+    REQUIRE(ints(*result, "total")[1] == 6);
+}
+
 TEST_CASE("duplicate ordering keys do not imply grouping contiguity", "[aggregate][audit]") {
     runtime::Chunk c;
     c.add_column("k", Column<std::int64_t>{1, 1, 1});

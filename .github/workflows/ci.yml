@@ -82,7 +82,7 @@ jobs:
         if: runner.os == 'Linux' && matrix.build_type == 'Release'
         run: |
           python3 -m venv .venv
-          .venv/bin/python -m pip install pyarrow numpy pandas ipython
+          .venv/bin/python -m pip install pyarrow numpy pandas ipython polars==2.0.0
 
       - name: Configure (Linux)
         if: runner.os == 'Linux'

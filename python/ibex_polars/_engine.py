@@ -7,12 +7,35 @@ import threading
 import weakref
 
 import polars as pl
+import pyarrow as pa
 
 from ._adapter import Adapter, check_version, flag_key
 
 check_version()
 
 from polars.lazyframe.query_result import SingleNodeQueryResult
+
+
+def _to_polars(result, expected, output):
+    """Export the declared result schema without decoding categorical keys."""
+    result = result.select(list(expected))
+    metadata = dict(result.schema.metadata or {})
+    metadata.pop(b"ibex.ordering", None)
+    result = result.replace_schema_metadata(metadata or None)
+    for index, name in enumerate(result.column_names):
+        dtype = result.column(index).type
+        # The shared lowerer's logical string type describes dictionary-backed
+        # strings too. For categorical output, let Polars import the dictionary
+        # directly instead of decoding every row and encoding it again.
+        if expected[name].base_type() == pl.Categorical and pa.types.is_dictionary(dtype):
+            continue
+        if dtype != output[name]:
+            result = result.set_column(index, name, result.column(index).cast(output[name]))
+    frame = pl.from_arrow(result)
+    assert isinstance(frame, pl.DataFrame)
+    # Named category mappings still require conversion to the requested dtype.
+    return frame if frame.schema == expected else frame.cast(expected, strict=True)
+
 
 class IbexEngine(pl.Engine):
     def __init__(self, *, cache_size=32):
@@ -73,18 +96,9 @@ class IbexEngine(pl.Engine):
         with self._lock:
             source, bindings, scalars, expected, output = self._prepare(lf, optimizations)
             result = ibex_pyarrow.execute_pipeline(source, tables=bindings, scalars=scalars)
-        result = result.select(list(expected))
-        metadata = dict(result.schema.metadata or {})
-        metadata.pop(b"ibex.ordering", None)
-        result = result.replace_schema_metadata(metadata or None)
-        for index, name in enumerate(result.column_names):
-            if result.column(index).type != output[name]:
-                result = result.set_column(index, name, result.column(index).cast(output[name]))
         # Conversion/casting constructs the public Polars result; the query's
         # filters, arithmetic and reductions have already executed in Ibex.
-        frame = pl.from_arrow(result)
-        assert isinstance(frame, pl.DataFrame)  # a pa.Table always converts to a DataFrame
-        return frame if frame.schema == expected else frame.cast(expected, strict=True)
+        return _to_polars(result, expected, output)
 
     def execute(self, lf, *, optimizations):
         return SingleNodeQueryResult(self.collect(lf, optimizations=optimizations))

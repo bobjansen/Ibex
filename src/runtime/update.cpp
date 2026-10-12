@@ -9,6 +9,7 @@
 #include <ibex/core/column.hpp>
 #include <ibex/core/decimal.hpp>
 #include <ibex/core/enums.hpp>
+#include <ibex/core/scalar_value.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
@@ -157,7 +158,7 @@ auto apply_double_op(ir::ArithmeticOp op, double lhs, double rhs) -> double {
 }
 
 auto get_int_value(const FastOperand& op, std::size_t row) -> std::int64_t {
-    if (!op.is_column) {
+    if (op.literal.has_value()) {
         if (const auto* int_value = std::get_if<std::int64_t>(&*op.literal)) {
             return *int_value;
         }
@@ -185,7 +186,7 @@ auto get_int_value(const FastOperand& op, std::size_t row) -> std::int64_t {
 }
 
 auto get_double_value(const FastOperand& op, std::size_t row) -> double {
-    if (!op.is_column) {
+    if (op.literal.has_value()) {
         if (const auto* int_value = std::get_if<std::int64_t>(&*op.literal)) {
             return static_cast<double>(*int_value);
         }

@@ -9,6 +9,7 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/decimal.hpp>
+#include <ibex/core/scalar_value.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>

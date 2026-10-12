@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/core/decimal.hpp>
+#include <ibex/core/scalar_value.hpp>
 #include <ibex/ir/canonicalize.hpp>
 #include <ibex/ir/column_name_map.hpp>
 #include <ibex/ir/expr_predicates.hpp>

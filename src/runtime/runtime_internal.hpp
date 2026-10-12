@@ -668,7 +668,7 @@ template <typename GatherWhole>
                     return t.job == j && !t.indivisible;
                 })) {
                 Column<std::string> strings;
-                strings.resize_for_gather(total, job_chars[j]);
+                strings.resize_for_gather(total, static_cast<std::size_t>(job_chars[j]));
                 strings.offsets_data()[0] = 0;
                 out[j].first = std::move(strings);
             }

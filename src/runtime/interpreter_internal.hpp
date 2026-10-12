@@ -722,8 +722,11 @@ struct AggSlot {
 };
 
 // Keep absence in has_value rather than adding an optional discriminator to
-// every materializing slot (including numeric-only queries).
-static_assert(sizeof(AggSlot) <= 96);
+// every materializing slot (including numeric-only queries). The bound is
+// relative to ScalarValue, whose size is the standard library's: 48 bytes
+// with libstdc++/libc++ (so 96 here), more on MSVC, whose debug std::string
+// carries an iterator-debugging proxy. Everything beyond it is ours.
+static_assert(sizeof(AggSlot) <= sizeof(ScalarValue) + 48);
 
 // The whole point of the split — lock it in so a future field cannot quietly
 // put a constructor back on the per-group hot path.
@@ -1880,7 +1883,7 @@ enum class FloatCleanMode : std::uint8_t {
 /// True when `expr` calls an extern function anywhere in it.
 [[nodiscard]] auto expr_calls_extern(const ir::Expr& expr, const ExternRegistry* externs) -> bool;
 /// Row `i` of an evaluated column, or Null where its validity bit is clear.
-[[nodiscard]] auto cell_value(const ColResult& column, std::size_t i) -> ScalarValue;
+[[nodiscard]] auto cell_value(const ColResult& arg, std::size_t i) -> ScalarValue;
 /// An extern scalar call over the rows of a field: its arguments evaluated as
 /// columns, then the extern called once per row, in row order, with that row's
 /// arguments (a null one is rejected in front of the call). A table first

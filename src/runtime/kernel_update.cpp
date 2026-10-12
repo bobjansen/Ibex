@@ -4,6 +4,7 @@
 #include "kernel_update.hpp"
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/scalar_value.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>
@@ -151,12 +152,18 @@ auto numeric_binary_operands(const ir::Expr& expr, const PredicateInput& input,
 }
 
 auto numeric_int_value(const NumericOperand& operand) -> std::int64_t {
+    if (!operand.scalar.has_value()) {
+        invariant_violation("numeric_int_value: column operand");
+    }
     return operand.kind == ExprType::Int
                ? std::get<std::int64_t>(*operand.scalar)
                : static_cast<std::int64_t>(std::get<double>(*operand.scalar));
 }
 
 auto numeric_double_value(const NumericOperand& operand) -> double {
+    if (!operand.scalar.has_value()) {
+        invariant_violation("numeric_double_value: column operand");
+    }
     return operand.kind == ExprType::Int
                ? static_cast<double>(std::get<std::int64_t>(*operand.scalar))
                : std::get<double>(*operand.scalar);
@@ -2156,7 +2163,7 @@ auto resolve_validity_operands(const DirectValidityPlan& plan, std::size_t range
         operand.is_null = value.is_null;
         if (value.is_null) {
             // Never available; nothing to resolve.
-        } else if (value.is_literal) {
+        } else if (value.literal.has_value()) {
             const auto* literal = std::get_if<T>(&*value.literal);
             if (literal == nullptr) {
                 return std::nullopt;
@@ -2325,13 +2332,13 @@ auto write_direct_validity_field_range(const DirectValidityPlan& plan, const Pre
         }
         if (plan.numeric_kind == FixedWidthNumericKind::Int) {
             output.numeric.ints[offset] =
-                is_valid ? selected->is_literal
+                is_valid ? selected->literal.has_value()
                                ? std::get<std::int64_t>(*selected->literal)
                                : std::get<Column<std::int64_t>>(*selected->column->column)[row]
                          : 0;
         } else {
             output.numeric.doubles[offset] =
-                is_valid ? selected->is_literal
+                is_valid ? selected->literal.has_value()
                                ? std::get<double>(*selected->literal)
                                : std::get<Column<double>>(*selected->column->column)[row]
                          : 0.0;

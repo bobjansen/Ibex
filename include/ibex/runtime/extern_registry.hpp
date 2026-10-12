@@ -35,6 +35,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -143,17 +144,17 @@ class ExternArgs {
 
     /// The scalar at position `index`. A resource or table position throws.
     [[nodiscard]] auto operator[](std::size_t index) const -> const ScalarValue& {
-        return scalar_at(index);
+        return scalar_at(*this, index);
     }
     [[nodiscard]] auto operator[](std::size_t index) -> ScalarValue& {
-        return const_cast<ScalarValue&>(std::as_const(*this).scalar_at(index));
+        return scalar_at(*this, index);
     }
     /// As `operator[]`, and an out-of-range `index` throws too.
     [[nodiscard]] auto at(std::size_t index) const -> const ScalarValue& {
         if (index >= slots_.size()) {
             throw std::out_of_range("extern argument " + std::to_string(index) + " out of range");
         }
-        return scalar_at(index);
+        return scalar_at(*this, index);
     }
     [[nodiscard]] auto front() const -> const ScalarValue& { return at(0); }
     [[nodiscard]] auto back() const -> const ScalarValue& { return at(slots_.size() - 1); }
@@ -197,8 +198,11 @@ class ExternArgs {
     }
 
    private:
-    [[nodiscard]] auto scalar_at(std::size_t index) const -> const ScalarValue& {
-        const auto& slot = slots_[index];
+    /// The scalar at `index`, const exactly when `self` is.
+    template <typename Self>
+    [[nodiscard]] static auto scalar_at(Self& self, std::size_t index)
+        -> std::conditional_t<std::is_const_v<Self>, const ScalarValue&, ScalarValue&> {
+        auto& slot = self.slots_[index];
         if (!slot.has_value()) {
             throw std::logic_error("extern argument " + std::to_string(index) +
                                    " is a resource or table, not a scalar");

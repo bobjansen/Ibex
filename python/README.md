@@ -1,5 +1,9 @@
 # Independent lazy Python frontend (experimental)
 
+For unchanged real Polars lazy queries using `.collect(engine=IbexEngine())`,
+see the [Polars Engine prototype](ibex_polars/README.md) and
+[Engine comparison](polars-engine-performance.md).
+
 The `ibex` module under this directory is an independent frontend with an
 initial subset of the Polars 2.0 API. Polars is not a runtime dependency.
 Query construction creates immutable expressions and pipeline steps;

@@ -2533,7 +2533,7 @@ class HashAggregateState final {
                 continue;
             }
             const ColumnEntry& entry = *agg_entries[a];
-            sum_cols[a] = std::get<Column<double>>(*entry.column).data();
+            sum_cols[a] = std::get<Column<double>>(std::as_const(*entry.column)).data();
             sum_validity[a] = entry.validity.has_value() ? &*entry.validity : nullptr;
         }
 
@@ -5290,7 +5290,8 @@ class HashAggregateState final {
             const auto bits_at = [&](std::size_t row) -> std::uint64_t {
                 switch (kind) {
                     case ExprType::Double: {
-                        const double value = std::get<Column<double>>(*entry.column).data()[row];
+                        const double value =
+                            std::get<Column<double>>(std::as_const(*entry.column)).data()[row];
                         return std::bit_cast<std::uint64_t>(value == 0.0 ? 0.0 : value);
                     }
                     case ExprType::Date:
@@ -5303,7 +5304,8 @@ class HashAggregateState final {
                         return std::get<Column<bool>>(*entry.column)[row] ? 1U : 0U;
                     default:  // Int
                         return static_cast<std::uint64_t>(
-                            std::get<Column<std::int64_t>>(*entry.column).data()[row]);
+                            std::get<Column<std::int64_t>>(std::as_const(*entry.column))
+                                .data()[row]);
                 }
             };
             const auto insert_range = [&](std::size_t lo, std::size_t hi) {
@@ -5417,7 +5419,10 @@ class HashAggregateState final {
                     keep_temporal(slot_for(gids[row]), func, temporal_raw(*entry.column, row));
                 }
             } else if (plan_[agg_i].kind == ExprType::Double) {
-                const double* data = std::get<Column<double>>(*entry.column).data();
+                // The shared_ptr remains mutable through a const ColumnEntry.
+                // Read through a const variant so parallel workers cannot
+                // detach (and race on) borrowed Arrow storage.
+                const double* data = std::get<Column<double>>(std::as_const(*entry.column)).data();
                 switch (plan_[agg_i].func) {
                     case ir::AggFunc::Sum:
                         for (std::size_t row = begin; row < rows; ++row) {
@@ -5499,7 +5504,8 @@ class HashAggregateState final {
                         break;
                 }
             } else if (plan_[agg_i].kind == ExprType::Int) {
-                const std::int64_t* data = std::get<Column<std::int64_t>>(*entry.column).data();
+                const std::int64_t* data =
+                    std::get<Column<std::int64_t>>(std::as_const(*entry.column)).data();
                 switch (plan_[agg_i].func) {
                     case ir::AggFunc::Sum:
                         for (std::size_t row = begin; row < rows; ++row) {
@@ -5872,7 +5878,7 @@ class HashAggregateState final {
                     keep_temporal(slot, func, temporal_raw(*entry.column, row));
                 });
             } else if (plan_[agg_i].kind == ExprType::Double) {
-                const double* data = std::get<Column<double>>(*entry.column).data();
+                const double* data = std::get<Column<double>>(std::as_const(*entry.column)).data();
                 switch (func) {
                     case ir::AggFunc::Sum:
                         // has_value must track "saw a non-null value", not
@@ -5933,7 +5939,8 @@ class HashAggregateState final {
                         break;
                 }
             } else if (plan_[agg_i].kind == ExprType::Int) {
-                const std::int64_t* data = std::get<Column<std::int64_t>>(*entry.column).data();
+                const std::int64_t* data =
+                    std::get<Column<std::int64_t>>(std::as_const(*entry.column)).data();
                 switch (func) {
                     case ir::AggFunc::Sum:
                         each([&](std::size_t r) {
@@ -7653,11 +7660,12 @@ class ChunkedSortedAggregateOperator final : public Operator {
             const auto& entry = *agg_entries[i];
             const bool has_nulls = entry.validity.has_value();
             if (plan_[i].kind == ExprType::Double) {
-                const double* data = std::get<Column<double>>(*entry.column).data();
+                const double* data = std::get<Column<double>>(std::as_const(*entry.column)).data();
                 accumulate_typed(slot, &cur_scratch_[i * kMomentScratch], plan_[i].func, data,
                                  entry, has_nulls, start, end);
             } else {
-                const std::int64_t* data = std::get<Column<std::int64_t>>(*entry.column).data();
+                const std::int64_t* data =
+                    std::get<Column<std::int64_t>>(std::as_const(*entry.column)).data();
                 accumulate_typed(slot, &cur_scratch_[i * kMomentScratch], plan_[i].func, data,
                                  entry, has_nulls, start, end);
             }

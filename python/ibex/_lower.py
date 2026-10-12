@@ -38,6 +38,27 @@ def lower(frame, *, validate=False, result_schema=None):
             return f"mean({render(args[0])})"
         if op == "len":
             return "count()"
+        if op == "cast":
+            names = {pa.float64(): "Float64", pa.int64(): "Int64"}
+            return f"{names[args[1]]}({render(args[0])})"
+        if op == "is_null":
+            return f"is_null({render(args[0])})"
+        if op.startswith("polars_"):
+            comparison = op.removeprefix("polars_")
+            left, right = render(args[0]), render(args[1])
+            if not any(current_types.get(id(arg)) == pa.float64() for arg in args):
+                return f"({left} {comparison} {right})"
+            nan = [f"is_nan({value})" if current_types.get(id(arg)) == pa.float64() else "false"
+                   for arg, value in zip(args, (left, right))]
+            if comparison in ("==", "!="):
+                value = f"(({left} == {right}) || ({nan[0]} && {nan[1]}))"
+                if comparison == "!=":
+                    value = f"!({value})"
+            else:
+                a, b = nan if comparison in (">", ">=") else nan[::-1]
+                extra = a if comparison in (">=", "<=") else f"({a} && !({b}))"
+                value = f"(({left} {comparison} {right}) || {extra})"
+            return f"case {{ is_null({left}) || is_null({right}) => NULL, else => {value} }}"
         if op == "!":
             return f"!({render(args[0])})"
         if op not in ("+", "-", "*", "/", "==", "!=", "<", "<=", ">", ">=", "&&", "||"):
@@ -87,10 +108,37 @@ def lower(frame, *, validate=False, result_schema=None):
                     occupied.add(temporary)
                     updates.append(f"{_identifier(temporary)} = is_null({_identifier(name)})")
                     order.append(f"{_identifier(temporary)} desc")
+                if operation == "sort" and validate and schemas[index].get(name) == pa.float64():
+                    # Polars orders NaN above infinity; Ibex's native numeric
+                    # comparison uses IEEE unordered semantics. Stage a flag.
+                    temporary = f"_ibex_sort_nan_{index}_{key_index}"
+                    while temporary in occupied:
+                        temporary += "_"
+                    occupied.add(temporary)
+                    updates.append(f"{_identifier(temporary)} = is_nan({_identifier(name)})")
+                    order.append(f"{_identifier(temporary)} {'desc' if reverse else 'asc'}")
                 order.append(f"{_identifier(name)} {'desc' if reverse else 'asc'}")
             if updates:
                 source += f"[update {{ {', '.join(updates)} }}]"
             source += f"[order {{ {', '.join(order)} }}]"
+        elif operation == "hstack":
+            if len(expressions) == 1:
+                expr = expressions[0]
+                source += f"[update {{ {_identifier(expr._name)} = {render(expr)} }}]"
+                continue
+            # A Polars HStack reads all fields from the input schema. Stage
+            # values under fresh names before assigning any output aliases.
+            occupied = set(schemas[index]) if validate else {expr._name for expr in expressions}
+            temporary_names = []
+            for field_index, expr in enumerate(expressions):
+                name = f"_ibex_hstack_{index}_{field_index}"
+                while name in occupied:
+                    name += "_"
+                occupied.add(name)
+                temporary_names.append(name)
+            fields = ", ".join(f"{_identifier(name)} = {render(expr)}" for name, expr in zip(temporary_names, expressions))
+            assignments = ", ".join(f"{_identifier(expr._name)} = {_identifier(name)}" for name, expr in zip(temporary_names, expressions))
+            source += f"[update {{ {fields} }}][update {{ {assignments} }}]"
         else:
             fields = ", ".join(f"{_identifier(expr._name)} = {render(expr)}" for expr in expressions)
             source += f"[{operation} {{ {fields} }}]"
@@ -109,7 +157,7 @@ def _validate_types(frame):
         schema = value.schema
     # The compatible frontend exposes strings as Arrow large_utf8, matching
     # the reference frame's Arrow boundary even for utf8 source buffers.
-    columns = {name: pa.large_string() if dtype == pa.string() else dtype
+    columns = {name: pa.large_string() if dtype == pa.string() or pa.types.is_dictionary(dtype) else dtype
                for name, dtype in zip(schema.names, schema.types)}
     numeric = (pa.int64(), pa.float64())
     supported = numeric + (pa.uint32(), pa.bool_(), pa.string(), pa.large_string(), pa.date32())
@@ -143,6 +191,15 @@ def _validate_types(frame):
             return pa.float64() if op == "mean" else result
         if op == "len":
             return pa.uint32()
+        if op == "cast":
+            original = dtype(args[0])
+            target = args[1]
+            if target != pa.float64() or original not in numeric:
+                raise NotImplementedError("only numeric casts to Float64 are supported by this adapter")
+            return target
+        if op == "is_null":
+            dtype(args[0])
+            return pa.bool_()
         if op == "!":
             if dtype(args[0]) != pa.bool_():
                 raise TypeError("logical negation requires a Boolean expression")
@@ -152,7 +209,7 @@ def _validate_types(frame):
             if left != pa.bool_() or right != pa.bool_():
                 raise TypeError("logical operators require Boolean expressions")
             return pa.bool_()
-        if op in ("==", "!=", "<", "<=", ">", ">="):
+        if op.removeprefix("polars_") in ("==", "!=", "<", "<=", ">", ">="):
             if left != right and not (left in numeric and right in numeric):
                 raise NotImplementedError("comparison between these types is not supported yet")
             return pa.bool_()
@@ -162,6 +219,7 @@ def _validate_types(frame):
 
     for operation, expressions in frame._steps:
         type_map = {}
+        keys, key_types = (), []
         if operation == "aggregate":
             keys, expressions = expressions
             key_types = [dtype(Expr("col", (name,))) for name in keys]

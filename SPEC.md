@@ -5118,6 +5118,17 @@ Polars is not required by the package. Joins and full API
 compatibility are follow-up work; unsupported behavior has no Polars fallback.
 See `python/README.md` for the implemented scope and conformance runner.
 
+The experimental `ibex_polars.IbexEngine` provides an alternative frontend:
+real Polars lazy plans are optimized by Polars, translated through its private
+visitor, and executed using the same native pipeline endpoint. Collection
+returns real Polars DataFrames. The initial slice covers upstream q01/q06,
+resident inputs, simultaneous row-local updates, null predicates and Polars
+floating-point comparison/sort ordering. It pins Polars 2.0.0 and visitor
+version `(15, 2)`; unsupported plans fail without automatic fallback.
+A bounded, weakly owned plan cache retains prepared resident inputs and respects
+optimization flags; each collection executes again. See
+`python/ibex_polars/README.md` for scope, ownership and preparation costs.
+
 The optional `tables` binding map adopts supported single-batch PyArrow buffers
 through Arrow C Data and retains their producer ownership; fragmented inputs
 are combined first, and unsupported Python table shapes use the copying path.

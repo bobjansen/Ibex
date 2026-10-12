@@ -3288,7 +3288,7 @@ TEST_CASE("Unary math runs over columns for Int and computed arguments", "[inter
     auto result = runtime::interpret(
         *require_ir("t[update { f = floor(i), c = ceil(i), r = trunc(i), a = abs(i),"
                     " s = sqrt(coalesce(x, 25.0)), k = floor(case { x > 5.0 => x, else => 1.5 }),"
-                    " w = sqrt(Float64(i * i)), n = abs(i) + 1 }];"),
+                    " w = sqrt(Float64(i + 12)), n = abs(i) + 1 }];"),
         registry);
     REQUIRE(result.has_value());
     const auto ints = [&](const char* name) {

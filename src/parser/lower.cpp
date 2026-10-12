@@ -58,6 +58,7 @@
 
 #include <ibex/core/decimal.hpp>
 #include <ibex/core/enums.hpp>
+#include <ibex/core/scalar_value.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/builder.hpp>
 #include <ibex/ir/column_name_map.hpp>

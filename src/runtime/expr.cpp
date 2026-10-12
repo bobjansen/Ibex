@@ -38,6 +38,7 @@
 #include <ctime>
 #include <expected>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <random>
 #include <robin_hood.h>
@@ -2724,6 +2725,7 @@ auto eval_case_columns(const ir::CallExpr& call, const ir::Expr& expr, const Tab
     const std::size_t arms = call.args.size() / 2;  // the else arm is index `arms`
     std::vector<std::size_t> arm_of(n, arms);
     std::vector<std::size_t> open(n);
+    // NOLINTNEXTLINE(modernize-use-ranges): Apple libc++ does not provide ranges::iota.
     std::iota(open.begin(), open.end(), std::size_t{0});
     for (std::size_t arm = 0; arm < arms && !open.empty(); ++arm) {
         auto condition = eval_over_rows(*call.args[2 * arm], input, range, open, ctx);
@@ -2755,7 +2757,7 @@ auto eval_case_columns(const ir::CallExpr& call, const ir::Expr& expr, const Tab
     }
     std::vector<std::optional<RowsValue>> values(arms + 1);
     for (std::size_t arm = 0; arm <= arms; ++arm) {
-        const ir::Expr& value = arm < arms ? *call.args[2 * arm + 1] : *call.args.back();
+        const ir::Expr& value = arm < arms ? *call.args[(2 * arm) + 1] : *call.args.back();
         if (rows_of[arm].empty() || is_null_call(value)) {
             continue;  // untaken, or a NULL arm: null of the case's type
         }
@@ -2904,10 +2906,11 @@ auto eval_call_columns(const ir::CallExpr& call, const ir::Expr& expr, const Tab
         }
         args.emplace_back(std::move(*column));
     }
-    if (const auto unary = call.args.size() == 1 ? lookup_unary_math(call.callee) : std::nullopt;
-        unary.has_value() && args.front().has_value()) {
-        if (auto applied = unary_math_over_column(*unary, *args.front(), n, type)) {
-            return std::move(*applied);
+    if (const auto unary = call.args.size() == 1 ? lookup_unary_math(call.callee) : std::nullopt) {
+        if (const auto& first = args.front(); first.has_value()) {
+            if (auto applied = unary_math_over_column(*unary, *first, n, type)) {
+                return std::move(*applied);
+            }
         }
     }
 
@@ -2958,7 +2961,7 @@ auto eval_call_columns(const ir::CallExpr& call, const ir::Expr& expr, const Tab
                 }
                 value = ScalarValue{apply_round(*d, *mode)};
             }
-        } else {
+        } else if (extern_values.has_value()) {
             value = std::move((*extern_values)[row]);
         }
         if (!value) {

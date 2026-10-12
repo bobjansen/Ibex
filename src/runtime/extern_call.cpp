@@ -11,6 +11,7 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>

@@ -3,6 +3,7 @@
 
 #include <ibex/codegen/emitter.hpp>
 #include <ibex/core/decimal.hpp>
+#include <ibex/core/scalar_value.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/model_accessors.hpp>
 #include <ibex/ir/node.hpp>
@@ -1314,27 +1315,28 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 std::visit(
                     [&](const auto& first_val) {
                         using T = std::decay_t<decltype(first_val)>;
-                        std::string type_str;
-                        if constexpr (std::is_same_v<T, std::int64_t>) {
-                            type_str = "std::int64_t";
-                        } else if constexpr (std::is_same_v<T, double>) {
-                            type_str = "double";
-                        } else if constexpr (std::is_same_v<T, bool>) {
-                            type_str = "bool";
-                        } else if constexpr (std::is_same_v<T, std::string>) {
-                            type_str = "std::string";
-                        } else if constexpr (std::is_same_v<T, Date>) {
-                            type_str = "ibex::Date";
-                        } else if constexpr (std::is_same_v<T, DecimalValue>) {
-                            type_str = "ibex::Decimal";
-                        } else if constexpr (std::is_same_v<T, NullScalar>) {
-                            // Unreachable: lowering fills a NULL hole with a placeholder.
-                            throw std::runtime_error(
-                                "ibex_compile: NULL element in a column literal");
-                        } else {
-                            static_assert(std::is_same_v<T, Timestamp>);
-                            type_str = "ibex::Timestamp";
-                        }
+                        const std::string type_str = []() -> std::string {
+                            if constexpr (std::is_same_v<T, std::int64_t>) {
+                                return "std::int64_t";
+                            } else if constexpr (std::is_same_v<T, double>) {
+                                return "double";
+                            } else if constexpr (std::is_same_v<T, bool>) {
+                                return "bool";
+                            } else if constexpr (std::is_same_v<T, std::string>) {
+                                return "std::string";
+                            } else if constexpr (std::is_same_v<T, Date>) {
+                                return "ibex::Date";
+                            } else if constexpr (std::is_same_v<T, DecimalValue>) {
+                                return "ibex::Decimal";
+                            } else if constexpr (std::is_same_v<T, NullScalar>) {
+                                // Unreachable: lowering fills a NULL hole with a placeholder.
+                                throw std::runtime_error(
+                                    "ibex_compile: NULL element in a column literal");
+                            } else {
+                                static_assert(std::is_same_v<T, Timestamp>);
+                                return "ibex::Timestamp";
+                            }
+                        }();
                         if constexpr (std::is_same_v<T, DecimalValue>) {
                             // A Decimal column carries its type as metadata, so it
                             // is built by a helper rather than a brace list.

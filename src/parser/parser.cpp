@@ -64,6 +64,7 @@
 
 #include <ibex/core/decimal.hpp>
 #include <ibex/core/enums.hpp>
+#include <ibex/core/scalar_value.hpp>
 #include <ibex/format.hpp>
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/effects.hpp>

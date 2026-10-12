@@ -3,7 +3,7 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/decimal.hpp>
-#include <ibex/core/enums.hpp>
+#include <ibex/core/scalar_value.hpp>
 #include <ibex/core/text.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/format.hpp>
@@ -35,7 +35,6 @@
 #include <ibex/runtime/interrupt.hpp>
 #include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/rng.hpp>
-#include <ibex/runtime/safe_arith.hpp>
 #include <ibex/runtime/table_format.hpp>
 #include <ibex/runtime/warnings.hpp>
 

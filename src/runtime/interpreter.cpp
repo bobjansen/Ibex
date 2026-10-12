@@ -3,6 +3,7 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/decimal.hpp>
+#include <ibex/core/scalar_value.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/column_name_map.hpp>
 #include <ibex/ir/node.hpp>
@@ -30,6 +31,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>

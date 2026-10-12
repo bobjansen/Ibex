@@ -15,6 +15,7 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/decimal.hpp>
+#include <ibex/core/scalar_value.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>

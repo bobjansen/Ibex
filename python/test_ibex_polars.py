@@ -19,6 +19,7 @@ import pyarrow.parquet as pq
 import ibex_pyarrow
 from ibex_polars import IbexEngine
 from ibex_polars._adapter import Adapter
+from ibex_polars._engine import _to_polars
 
 
 class EngineTests(unittest.TestCase):
@@ -95,6 +96,46 @@ class EngineTests(unittest.TestCase):
         for descending in (False, True):
             for last in (False, True):
                 self.equal(frame.sort("x", descending=descending, nulls_last=last, maintain_order=True))
+
+    def test_categorical_output_preserves_arrow_dictionary(self):
+        # Exercise sliced/chunked codes, nulls and a dictionary whose order
+        # differs from Polars' global category mapping. No native query is
+        # needed to isolate the output boundary's representation contract.
+        chunks = [pa.DictionaryArray.from_arrays(pa.array([0, 2, None, 1], type=pa.int32()),
+                                                pa.array(["z", "a", "b"])).slice(1),
+                  pa.DictionaryArray.from_arrays(pa.array([1, None, 0], type=pa.int32()),
+                                                pa.array(["b", "z", "a"]))]
+        table = pa.table({"g": pa.chunked_array(chunks), "x": [1., 2., 3., 4., 5., 6.]})
+        output = {"g": pa.large_string(), "x": pa.float64()}
+        for dtype in (pl.Categorical(), pl.Categorical(pl.Categories("ibex_output_test"))):
+            expected = pl.Schema({"g": dtype, "x": pl.Float64})
+            with patch.object(pl, "from_arrow", wraps=pl.from_arrow) as convert:
+                result = _to_polars(table, expected, output)
+                passed = convert.call_args.args[0]
+                self.assertTrue(pa.types.is_dictionary(passed["g"].type))
+                for before, after in zip(table["g"].chunks, passed["g"].chunks):
+                    self.assertEqual(before.buffers()[1].address, after.buffers()[1].address)
+            self.assertEqual(result.schema, expected)
+            self.assertEqual(result["g"].to_list(), ["b", None, "a", "z", None, "b"])
+            self.assertEqual(result["x"].to_list(), table["x"].to_pylist())
+        empty = table.slice(0, 0)
+        result = _to_polars(empty, expected, output)
+        self.assertEqual(result.schema, expected)
+        self.assertEqual(result.height, 0)
+        string_schema = pl.Schema({"g": pl.String, "x": pl.Float64})
+        self.assertEqual(_to_polars(table, string_schema, output).schema, string_schema)
+
+    def test_categorical_output_from_native_projection_and_grouping(self):
+        for dtype in (pl.Categorical, pl.Categorical(pl.Categories("ibex_pipeline_test"))):
+            frame = pl.DataFrame({"g": ["z", None, "a", "z"], "x": [1., 2., 3., 4.]}).with_columns(
+                pl.col("g").cast(dtype))
+            query = frame.lazy()
+            reference = query.collect(engine="streaming")
+            with patch.object(pl, "from_arrow", wraps=pl.from_arrow) as convert:
+                result = query.collect(engine=self.engine)
+                self.assertTrue(pa.types.is_dictionary(convert.call_args.args[0]["g"].type))
+            assert_frame_equal(result, reference)
+            self.equal(frame.lazy().group_by("g").agg(mean=pl.mean("x")).sort("g"))
 
     def test_prepare_projects_demanded_columns_without_query_collection(self):
         query = pl.DataFrame({"x": [1, 2], "unused": [[1], [2]]}).lazy().select(pl.sum("x"))

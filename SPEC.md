@@ -5100,6 +5100,24 @@ points are provided:
 - `eval_table(source, tables=None, scalars=None)` evaluates an in-memory Ibex source string
 - `eval_file(path, tables=None, scalars=None)` evaluates a `.ibex` file from disk
 
+An additional `execute_pipeline(source, tables=None, scalars=None)` endpoint
+executes a complete generated pipeline through `repl::ReplSession`, sharing
+the CLI/R host's planner and lazy readers. Existing evaluation entry points
+retain their behavior. The independent experimental `ibex` Python package
+uses this endpoint after rendering immutable expression/pipeline nodes with
+typed scalar bindings. Its first Polars 2.0 API subset supports single-file
+Parquet scans, filtering, projection, one-expression updates, numeric
+sums/means, row counts, column-key grouping and sorting, covering upstream
+PDS-H q06 and q01 query bodies. In-memory frames retain prepared native inputs,
+applying the existing categorical promotion heuristic once at binding. Each
+collection executes the pipeline again; query results are not cached.
+Collection returns an
+Ibex DataFrame backed by Arrow; schema/dtype descriptors are currently Arrow
+types, with UInt32 row counts and large-UTF8 strings at the public Arrow boundary.
+Polars is not required by the package. Joins and full API
+compatibility are follow-up work; unsupported behavior has no Polars fallback.
+See `python/README.md` for the implemented scope and conformance runner.
+
 The optional `tables` binding map adopts supported single-batch PyArrow buffers
 through Arrow C Data and retains their producer ownership; fragmented inputs
 are combined first, and unsupported Python table shapes use the copying path.

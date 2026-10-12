@@ -103,6 +103,20 @@
       memory &mdash; and the best cell is outlined. Hover any cell for the exact
       time and peak memory.
     </p>
+    <p class="bench-note">
+      <strong>What this measures.</strong> Each engine loads the data once into
+      its own in-memory format, untimed, and every query is timed from there
+      until its full result is materialised. DuckDB hands its result over as an
+      Arrow table: measured against writing it into a DuckDB table, that is the
+      faster of the two overall. Ibex's CSV reader dictionary-encodes string
+      columns automatically, so a group-by on <code>symbol</code> runs on
+      integer codes. Polars is given the same encoding (its string columns are
+      cast to <code>Categorical</code>); DuckDB, DataFusion, ClickHouse and
+      data.table group on plain strings, as they do by default. Tables are read
+      once and queried many times, so that is a real advantage, and part of the
+      distance to the SQL engines; Polars is the closest like-for-like
+      comparison on this page.
+    </p>
 
     <div class="bench-controls">
       <div class="grp"><span class="lbl">Rows</span><span id="scales"></span></div>

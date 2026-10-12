@@ -77,7 +77,7 @@ namespace {
 /// the full grown range (via `try_discover_partitioned`'s resize_keys/
 /// store_key pair, or `finalize_owned_ordered_runs`'s sequential group scan)
 /// before any read reaches it. Standard idiom; avoids the same redundant
-/// value-init tax `SlotArray::grow_uninitialized` (above) exists to avoid.
+/// value-init tax `SlotArray::grow_uninitialized` (below) exists to avoid.
 template <typename T, typename A = std::allocator<T>>
 class default_init_allocator : public A {
     using AT = std::allocator_traits<A>;
@@ -143,42 +143,16 @@ auto chunked_agg_tracks_validity(ir::AggFunc func) -> bool {
     }
 }
 
-/// Streaming hash aggregate. Maintains a `robin_hood` group index and
-/// per-group `AggState` across chunks: each incoming chunk updates the
-/// state per row, the chunk is released, and the final result is
-/// emitted as a single output chunk on EOF.
+/// Per-group slot array that grows through `realloc` and not by copying.
 ///
-/// Eligibility is gated at `build_operator` time to the common subset
-/// that streams cleanly: `Count`, `Sum`, `Min`, `Max`, `Mean` on
-/// numeric (int/double) inputs. Nullable agg inputs are handled — null
-/// rows skip the update, and an all-null group emits a null result.
-/// Nullable group-by columns are not supported yet; they fall back to
-/// `aggregate_table` via `run_materialized_node`. Complex aggs (Median, etc.)
-/// and string aggs also fall back.
+/// A group-by grows its slots once per chunk. `std::vector` copies the whole
+/// array on every reallocation, while `realloc` on an mmap-sized block extends
+/// it in place with `mremap` and moves no bytes. On q18 (3M groups, 6 chunks)
+/// those copies were 49ms of `size_group_arrays`' 79ms.
 ///
-/// The first chunk's group-by column types are snapshotted (including
-/// the Categorical dictionary pointer when applicable) and reused when
-/// building output; the chunked csv source shares dictionaries across
-/// chunks, matching MaterializeOperator's existing assumption.
-/// A growable array of trivially-copyable slots that grows through `realloc`.
-///
-/// `std::vector` cannot use `realloc`: it must allocate, copy, and free, and on
-/// this array that copy IS the cost. A group-by discovers its groups a chunk at
-/// a time, so the slot array is resized once per chunk and never shrinks; by
-/// the last chunk the copies dominate. Measured on q18 (3M groups over 6
-/// chunks): `size_group_arrays` cost 79ms, and pre-reserving the final size --
-/// which a real query cannot do, since the group count is what it is about to
-/// find out -- removed 49ms of it. That removed cost is all copying.
-///
-/// At these sizes the block is served by `mmap`, and `realloc` extends it with
-/// `mremap`: page-table work, no bytes moved. The elements it must still touch
-/// are only the NEW ones, which is the irreducible part.
-///
-/// Deliberately minimal: no shrink, no insert, no iterators. It is a slot array
-/// indexed by group id, and every use it has is `resize` / `data` / `[]`.
-///
-/// The `realloc`/`free` calls are the whole reason this class exists (in-place
-/// `mremap` growth, no copy) -- it is itself the RAII wrapper the check wants.
+/// Indexed by group id; the whole interface is `grow_uninitialized`,
+/// `fill_default`, `data` and `[]`.
+// realloc/free are the point of this class, which is its own RAII wrapper.
 // NOLINTBEGIN(cppcoreguidelines-no-malloc)
 template <typename T>
 class SlotArray {
@@ -215,24 +189,11 @@ class SlotArray {
     auto operator[](std::size_t i) noexcept -> T& { return data_[i]; }
     auto operator[](std::size_t i) const noexcept -> const T& { return data_[i]; }
 
-    /// Grow to `n` WITHOUT initializing the new tail, which is returned for the
-    /// caller to fill. Never shrinks the allocation: a group-by only ever adds
-    /// groups.
+    /// Set the size to `n` and return the new tail UNINITIALIZED for the caller
+    /// to fill. Shrinking only moves the size; the allocation is kept.
     ///
-    /// Split out of `resize` because on a large array the fill is the expensive
-    /// half and it is not serial by nature. `mremap` hands back pages the kernel
-    /// has yet to materialize, so writing them is 72MB of first-touch page
-    /// faults on q18's 3M slots — 44ms in a cold process, several times what the
-    /// bytes alone cost, and page faults are what scales with threads. A caller
-    /// holding a worker pool fans this out; one without it calls `resize` and
-    /// pays the serial fill.
-    ///
-    /// How much this is worth depends on whether the pages are fresh, so read
-    /// the two numbers separately. Cold (`ibex query.ibex`, the path a script
-    /// takes) the fan-out takes q18's fill 44ms -> 34ms and the whole query
-    /// -4.3%. Warm — the PDS-H harness, which reuses one process, so the
-    /// allocator hands back pages already faulted — the fill is plain bandwidth
-    /// and the suite geomean does not move.
+    /// The fill is left to the caller because on fresh `mremap` pages its cost
+    /// is first-touch page faults, which parallelize (`fill_slots_parallel`).
     [[nodiscard]] auto grow_uninitialized(std::size_t n) -> std::span<T> {
         if (n <= size_) {
             size_ = n;
@@ -254,31 +215,23 @@ class SlotArray {
         return {data_ + old, n - old};
     }
 
-    /// Value-initialize `tail`, a range `grow_uninitialized` just handed back.
+    /// Value-initialize `tail`: one `memset` when `T{}` is all zero bytes (as
+    /// `AggSlotCore` is), else a copy of `T{}` per element. The compiler will
+    /// not turn that copy loop into a memset on its own.
     ///
-    /// One `memset` when `T`'s value-initialized form is all-zero bytes, which
-    /// every slot type here is (`AggSlotCore`'s two enums both start at 0). The
-    /// per-element copy this replaces cost q18's fill 12ms of its 55: three
-    /// million 24-byte `memcpy`s the compiler will not fuse, because it cannot
-    /// see that the prototype is zeros.
-    ///
-    /// Padding is why the test is a run-time `memcmp` rather than a
-    /// `static_assert`: value-initialization zeroes `T`'s padding too, so the
-    /// comparison is well defined here, but no constant expression can state
-    /// that for a type with padding. The loop keeps the class honest for a
-    /// future slot type whose default is not all zeros.
+    /// The zero test is a run-time `memcmp` because it is not expressible as a
+    /// constant expression in general. It is well defined because
+    /// value-initialization also zeroes padding.
     static void fill_default(std::span<T> tail) noexcept {
         if (tail.empty()) {
             return;
         }
         const T prototype{};
         alignas(T) std::array<unsigned char, sizeof(T)> zero{};
-        // prototype{} zeroes padding too (see the class comment), so this is well defined.
         // NOLINTNEXTLINE(cert-exp42-c,cert-flp37-c,bugprone-suspicious-memory-comparison)
         if (std::memcmp(&prototype, zero.data(), sizeof(T)) == 0) {
-            // Through `void*`: `T` has default member initializers, so it is not
-            // trivially default-constructible and -Wclass-memaccess objects to
-            // memset-ing it directly. The memcmp above is what licenses this.
+            // Through `void*`: default member initializers make -Wclass-memaccess
+            // object; the memcmp above is what licenses the memset.
             std::memset(static_cast<void*>(tail.data()), 0, tail.size() * sizeof(T));
             return;
         }
@@ -286,9 +239,6 @@ class SlotArray {
             std::memcpy(&slot, &prototype, sizeof(T));
         }
     }
-
-    /// Grow to `n`, value-initializing the new tail on the calling thread.
-    void resize(std::size_t n) { fill_default(grow_uninitialized(n)); }
 
    private:
     T* data_ = nullptr;
@@ -3519,10 +3469,6 @@ class HashAggregateState final {
         return scratch_.data() + (gid * scratch_stride_) + scratch_offset_[agg_i];
     }
 
-    /// Size every per-group array to `n_groups_`. THE ONLY PLACE THAT RESIZES
-    /// THEM — the grouping fast paths used to call `flat_slots_.resize()`
-    /// directly, and adding a second per-group array (scratch) to just one of
-    /// those call sites left the others reading a null pointer.
     /// One hash partition's share of the group index. Partitions are disjoint by
     /// construction — a key's partition is a function of its hash — so a worker
     /// owning a partition owns every row and every group in it, and needs no
@@ -3913,6 +3859,7 @@ class HashAggregateState final {
         slot.mark_present();
     }
 
+    /// Grow every per-group array (slots and scratch) to `n_groups_`.
     void size_group_arrays() {
         auto tail = flat_slots_.grow_uninitialized(n_groups_ * n_aggs_);
         if (!fill_slots_parallel(tail)) {
@@ -3928,15 +3875,9 @@ class HashAggregateState final {
     /// `alloc_group`, where the tail is one slot — and the caller fills it
     /// serially.
     ///
-    /// Worth threading at all only because the cost is page faults rather than
-    /// bytes: the kernel materializes a page per fault, and eight threads
-    /// faulting disjoint pages fault in parallel. Eight threads buy about 1.3x,
-    /// not 8x — the fault path serializes on the kernel's own locks — so this is
-    /// a small win, not a lever. Sizing it against the rest of q18's aggregate
-    /// (3M groups): 80ms parallel discovery probe, 44ms this fill, 26ms serial
-    /// first-occurrence merge, 12ms key-array growth, 10ms accumulate. It is the
-    /// largest SERIAL block, which is why it is threaded first, and it is still
-    /// only a sixth of the operator.
+    /// Worth threading only because on fresh pages the cost is first-touch page
+    /// faults, not bytes. The kernel's fault path serializes, so eight threads
+    /// buy about 1.3x: a small win, not a lever.
     auto fill_slots_parallel(std::span<AggSlotCore> tail) -> bool {
         // Sized so the batch (a submit plus a join) stays small against the
         // work. Below a few megabytes the serial memset is already

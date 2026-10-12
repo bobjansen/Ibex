@@ -22,8 +22,8 @@ class Expr:
     def __sub__(self, other): return self._binary("-", other)
     def __mul__(self, other): return self._binary("*", other)
     def __truediv__(self, other): return self._binary("/", other)
-    def __eq__(self, other): return self._binary("==", other)
-    def __ne__(self, other): return self._binary("!=", other)
+    def __eq__(self, other): return self._binary("==", other)  # type: ignore[override]
+    def __ne__(self, other): return self._binary("!=", other)  # type: ignore[override]
     def __lt__(self, other): return self._binary("<", other)
     def __le__(self, other): return self._binary("<=", other)
     def __gt__(self, other): return self._binary(">", other)

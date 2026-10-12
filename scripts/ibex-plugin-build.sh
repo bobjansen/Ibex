@@ -73,9 +73,8 @@ fi
 # ── Include paths ─────────────────────────────────────────────────────────────
 IBEX_INCS=(
     "-I$IBEX_ROOT/include"
-    "-I$BUILD_DIR/_deps/fmt-src/include"
-    "-I$BUILD_DIR/_deps/robin_hood-src/src/include"
-    "-I$BUILD_DIR/_deps/fast_float-src/include"
+    -isystem "$BUILD_DIR/_deps/robin_hood-src/src/include"
+    -isystem "$BUILD_DIR/_deps/fast_float-src/include"
 )
 # Add each plugin source directory so plugins can include sibling headers
 for _lib_dir in "$IBEX_ROOT/libs"/*/; do
@@ -83,14 +82,10 @@ for _lib_dir in "$IBEX_ROOT/libs"/*/; do
 done
 
 # ── Runtime libraries ─────────────────────────────────────────────────────────
-_fmt_lib="$BUILD_DIR/_deps/fmt-build/libfmt.a"
-[[ -f "$_fmt_lib" ]] || _fmt_lib="$BUILD_DIR/_deps/fmt-build/libfmtd.a"
-
 IBEX_LIBS=(
     "$BUILD_DIR/src/runtime/libibex_runtime.a"
     "$BUILD_DIR/src/ir/libibex_ir.a"
     "$BUILD_DIR/src/core/libibex_core.a"
-    "$_fmt_lib"
 )
 
 

@@ -580,6 +580,27 @@ See [`examples/ibex_dplyr.R`](examples/ibex_dplyr.R) for a complete runnable
 example with scalar capture, lazy translation, grouped aggregation, and
 collection back into R.
 
+## Polars Engine (experimental)
+
+The `ibex_polars` prototype executes supported real Polars lazy queries in Ibex
+and returns Polars DataFrames. Original PDS-H q01/q06 imports and query bodies
+remain unchanged:
+
+```python
+import polars as pl
+from ibex_polars import IbexEngine
+
+engine = IbexEngine()
+query = trades.lazy().group_by("symbol", "day").agg(avg_price=pl.mean("price"))
+result = query.collect(engine=engine)
+```
+
+Reuse the Engine and query to retain prepared resident inputs; every collection
+executes again. Unsupported plans fail explicitly. This source-tree experiment
+pins Polars 2.0.0 and its private plan visitor. See
+[scope and setup](python/ibex_polars/README.md) and
+[resident-table measurements](python/polars-engine-performance.md).
+
 ## Independent lazy Python API (experimental)
 
 An independent `ibex` Python frontend now implements the first subset of the

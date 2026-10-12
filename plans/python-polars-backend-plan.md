@@ -1,14 +1,14 @@
 # Python package: Polars 2.0 API compatibility and execution options
 
-Status: independent q06/q01 slices implemented, 2026-10-12. The initial
-Engine-only proposal has been broadened to weigh two architectures; the
-Engine prototype remains open.
+Status: independent and real-Polars Engine q06/q01 slices implemented,
+2026-10-12. Continue with the Engine experiment first, retaining the independent
+frontend as a comparison on the shared native endpoint.
 
 2026-10-12: independent q06 slice implemented under `python/ibex/`, with
 immutable expressions/pipelines and Arrow-backed result containers. The new
 native `execute_pipeline` endpoint uses the shared REPL evaluator; this slice
 renders source with typed scalar bindings rather than exposing typed IR.
-Grouping/q01 has since landed; the Engine prototype remains open. Standalone packaging,
+Grouping/q01 and the Engine prototype have since landed. Standalone packaging,
 Polars dtype descriptors and broader API compatibility remain follow-up work.
 Validation: unchanged upstream q06 passes against the reference at SF-1 and
 SF-10 with matching names, shape, Float64 output and revenue within the
@@ -31,6 +31,30 @@ prepare only demanded input columns; keep preparation costs visible.
 
 ## Assessment after the first slices
 
+Engine follow-up: `python/ibex_polars/` translates the optimized real Polars plan
+through a pinned private visitor. Original upstream q01/q06 query bodies and
+imports pass on SF-1 resident and SF-10 Parquet inputs, returning real Polars
+DataFrames. Unsupported plans fail before native binding/execution. A bounded,
+weakly owned cache prepares only demanded resident columns and retains input
+ownership; repeated collection always executes. The adapter preserves
+simultaneous update semantics, count/category output types, null sorting and
+Polars' NaN comparison/order behavior. See `python/ibex_polars/README.md` and
+`python/polars-engine-performance.md`.
+
+The resident categorical experiment also exposed a native aggregate reader
+calling a mutable `.data()` through a shared pointer, detaching borrowed Arrow
+columns concurrently. Numeric reads now use const access. A native regression
+asserts borrowed buffers remain attached; reverting the fix makes it fail.
+
+Next decision: prioritize the Engine route while the measured supported subset
+remains competitive. Broaden plan coverage around concrete native strengths,
+then investigate fragmented-input/first-use costs and stabilize the private
+visitor boundary. Do not promise additional speedups or full compatibility
+from frontend integration alone. The existing independent prototype remains
+useful for separating native execution from adapter overhead.
+
+### Earlier assessment of the independent frontend
+
 Continue exploring an independent frontend, with a bounded scope. It already
 preserves a native strength: grouped mean over prepared in-memory tables is
 about 3.1x faster at one core and 1.6x at eight than the categorical-key
@@ -44,7 +68,7 @@ cost is substantially worse despite its warm-query win, so the intended
 workload must remain repeated analytics on resident inputs until that improves.
 Retain native ownership and semantic conformance as gates alongside speed.
 
-Then compare the planned small Engine frontend on the same native endpoint.
+The small Engine comparison on the same native endpoint is now implemented above.
 Choose between owning API compatibility and reusing Polars' frontend based on
 maintenance effort, integration stability and complete-pipeline performance.
 Broader joins/windows and standalone packaging follow evidence from that

@@ -10,6 +10,7 @@
 #   ibex_repl_cli  - GNU readline / libedit: history, completion, Ctrl+C at the
 #                    prompt. Only the interactive `ibex` binary links it.
 add_library(ibex_repl_core OBJECT
+    eager_projection.cpp
     repl.cpp
 )
 

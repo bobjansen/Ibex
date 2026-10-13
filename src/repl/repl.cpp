@@ -92,6 +92,7 @@
 #include <system_error>
 #include <variant>
 
+#include "eager_projection.hpp"
 #include "line_editing.hpp"
 
 namespace ibex::repl {
@@ -3555,6 +3556,14 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
 
     const runtime::TableRegistry* eval_tables = &tables;
     runtime::TableRegistry projected;
+    auto narrowed = detail::narrow_demanded_tables(ir::required_columns(*lowered.value()), tables);
+    if (!narrowed.empty()) {
+        projected = tables;
+        for (auto& [name, table] : narrowed) {
+            projected.insert_or_assign(name, std::move(table));
+        }
+        eval_tables = &projected;
+    }
     if (!lazy_tables.empty()) {
         const auto resolve_lazy = [&](const std::string& name) -> runtime::LazyTable* {
             const auto it = lazy_tables.find(name);
@@ -3572,7 +3581,9 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         const auto absorbed = absorb_lazy_scan_filters(
             lowered.value(),
             [&](const std::string& name) { return resolve_lazy(name) != nullptr; });
-        projected = tables;
+        if (eval_tables != &projected) {
+            projected = tables;
+        }
         if (auto ok = decode_demanded_lazy_sources(ir::required_columns(*lowered.value()), absorbed,
                                                    resolve_lazy, exec, &scalars, projected);
             !ok.has_value()) {

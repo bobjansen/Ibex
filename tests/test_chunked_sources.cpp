@@ -1687,3 +1687,104 @@ TEST_CASE("median by integer and Categorical keys: parallel cell grouping matche
         }
     }
 }
+
+TEST_CASE("grouped top-k: partitioned flat heaps take each group's stable-sort rows",
+          "[runtime][chunked][topk]") {
+    // h2o q8: `order { v desc }, head 2, by g` over many groups. The groups
+    // are hash partitioned across workers and keep flat (key, sequence) heaps;
+    // only rows still in a heap are copied out, into pieces that are compacted
+    // once mostly displaced. Expected rows come from a stable sort per group,
+    // computed here: ties go to the earlier row for head and to the later row
+    // for tail, and the output is every winner in (key, arrival) order.
+    struct Case {
+        std::string query;
+        bool desc;
+        bool tail;
+        std::size_t k;
+        bool rising;  // every row beats the last: the store must compact
+        std::string grain;
+        std::int64_t groups = 50'021;  // past rows / 2, a chunk is kept whole
+    };
+    for (const Case& test :
+         {Case{"t[order { v desc }, head 2, by g]", true, false, 2, false, ""},
+          Case{"t[order { v desc }, head 2, by g]", true, false, 2, false, "70001"},
+          Case{"t[order { v }, head 3, by g]", false, false, 3, false, "70001"},
+          Case{"t[order { v }, tail 2, by g]", false, true, 2, false, "70001"},
+          Case{"t[order { v desc }, head 1, by g]", true, false, 1, true, "300000"},
+          Case{"t[order { v desc }, head 2, by g]", true, false, 2, false, "70001", 300'007}}) {
+        INFO(test.query << " grain '" << test.grain << "' rising " << test.rising);
+        const std::size_t rows = test.rising ? 1'500'000 : 400'000;
+        Column<std::int64_t> g;
+        Column<double> v;
+        Column<std::int64_t> id;
+        runtime::ValidityBitmap g_valid;
+        g_valid.assign(rows, true);
+        for (std::size_t row = 0; row < rows; ++row) {
+            const auto key = static_cast<std::int64_t>(row * 7919) % test.groups;
+            g.push_back(key);
+            if (!test.rising && row % 997 == 0) {
+                g_valid.set(row, false);  // one null group
+            }
+            // Few distinct values, so ties decide most winners.
+            // Rising, until a last chunk that displaces nothing: the winners
+            // are then read through the refs compaction rewrote.
+            const double rising = row < 1'200'000 ? static_cast<double>(row) : -1.0;
+            v.push_back(test.rising ? rising : static_cast<double>((row * 104'729) % 13) - 6.0);
+            id.push_back(static_cast<std::int64_t>(row));
+        }
+        // Reference: rows per group, stably sorted, then the head or tail.
+        std::map<std::int64_t, std::vector<std::size_t>> groups;  // null -> min
+        constexpr std::int64_t kNullGroup = std::numeric_limits<std::int64_t>::min();
+        for (std::size_t row = 0; row < rows; ++row) {
+            groups[g_valid[row] ? g[row] : kNullGroup].push_back(row);
+        }
+        const auto before = [&](std::size_t a, std::size_t b) {
+            return test.desc ? v[a] > v[b] : v[a] < v[b];
+        };
+        std::vector<std::size_t> want;
+        for (auto& [key, members] : groups) {
+            std::ranges::stable_sort(members, before);
+            const std::size_t take = std::min(test.k, members.size());
+            if (test.tail) {
+                want.insert(want.end(), members.end() - static_cast<std::ptrdiff_t>(take),
+                            members.end());
+            } else {
+                want.insert(want.end(), members.begin(),
+                            members.begin() + static_cast<std::ptrdiff_t>(take));
+            }
+        }
+        std::ranges::sort(want, [&](std::size_t a, std::size_t b) {
+            if (v[a] != v[b]) {
+                return before(a, b);
+            }
+            return a < b;
+        });
+
+        runtime::Table t;
+        t.add_column("g", std::move(g), std::move(g_valid));
+        t.add_column("v", std::move(v));
+        t.add_column("id", std::move(id));
+        runtime::TableRegistry registry;
+        registry.emplace("t", std::move(t));
+        std::optional<ChunkGrainGuard> guard;
+        if (!test.grain.empty()) {
+            guard.emplace(test.grain);
+        }
+        auto program = parser::parse(test.query + ";");
+        REQUIRE(program.has_value());
+        auto ir = parser::lower(program.value());
+        REQUIRE(ir.has_value());
+        runtime::ExecutionContext parallel;
+        parallel.parallel_threads = 8;
+        parallel.parallel_min_rows = 0;
+        const auto p =
+            runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+        REQUIRE(p.has_value());
+        REQUIRE(p->rows() == want.size());
+        const auto& pid = std::get<Column<std::int64_t>>(*p->find("id"));
+        for (std::size_t i = 0; i < want.size(); ++i) {
+            INFO("output row " << i);
+            REQUIRE(static_cast<std::size_t>(pid[i]) == want[i]);
+        }
+    }
+}

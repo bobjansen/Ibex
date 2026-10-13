@@ -1087,55 +1087,190 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             cat_gid_memo.assign(key_cols.front().cat->dictionary().size(), kNoCatGid);
         }
 
-        // `median(x) by <categorical>` (only collect aggregates, so the row loop
-        // below would do nothing per row but find the group): with several
-        // workers, number the groups and fill row_gid in parallel instead. A
-        // group's id is its order of first appearance, so each range records
-        // the first row of every code; the earliest wins, and the groups are
-        // created in that row order through the same index calls the loop makes.
+        // With several workers and keys that are all integers or codes with a
+        // small Cartesian span (`median(x) by <categorical>`, h2o q6's `by {
+        // id4, id5 }` over 100 x 100 ids), number the groups and fill row_gid
+        // in parallel instead of probing the boxed index once per row. A
+        // row's cell is its keys' offsets from their minimums; each range
+        // records the first row of every cell, the earliest wins, and the
+        // groups are created in that row order through the same index calls
+        // the loop makes. The row loop then only updates the per-row states,
+        // and is skipped when every aggregate is collected below.
         const bool collect_only =
             !collect_aggs.empty() && collect_aggs.size() == aggregations.size();
-        const bool parallel_cat_groups = collect_only && range_workers >= 2 &&
-                                         !cat_gid_memo.empty() &&
-                                         group_validity.front() == nullptr &&
-                                         range_workers * cat_gid_memo.size() <= kMaxRangeCells;
-        if (parallel_cat_groups) {
-            const auto& codes = *key_cols.front().cat;
-            const std::size_t dict = cat_gid_memo.size();
-            constexpr std::size_t kUnseen = std::numeric_limits<std::size_t>::max();
-            std::vector<std::size_t> first(range_workers * dict, kUnseen);
-            for_row_range(range_workers, [&](std::size_t r, std::size_t b, std::size_t e) {
-                std::size_t* local = first.data() + (r * dict);
-                for (std::size_t row = b; row < e; ++row) {
-                    const auto code = static_cast<std::size_t>(codes.code_at(row));
-                    if (local[code] == kUnseen) {
-                        local[code] = row;
+        std::vector<std::int64_t> cell_lo(key_cols.size(), 0);
+        std::vector<std::uint64_t> cell_stride(key_cols.size(), 0);
+        std::size_t n_cells = 0;
+        const auto cell_key = [&](const KeyCol& col, std::size_t row) -> std::int64_t {
+            switch (col.kind) {
+                case KeyCol::Kind::Cat:
+                    return static_cast<std::int64_t>(col.cat->code_at(row));
+                case KeyCol::Kind::Date:
+                    return col.date[row].days;
+                case KeyCol::Kind::Ts:
+                    return col.ts[row].nanos;
+                default:
+                    return col.i64[row];
+            }
+        };
+        const bool cell_keys =
+            range_workers >= 2 && rows > 0 && !key_cols.empty() &&
+            std::ranges::all_of(key_cols, [](const KeyCol& col) {
+                return col.validity == nullptr &&
+                       (col.kind == KeyCol::Kind::Int64 || col.kind == KeyCol::Kind::Cat ||
+                        col.kind == KeyCol::Kind::Date || col.kind == KeyCol::Kind::Ts);
+            });
+        if (cell_keys) {
+            // Bounds per key: a Categorical's are its dictionary's; the rest
+            // are measured, range by range.
+            std::vector<std::pair<std::int64_t, std::int64_t>> bounds(
+                range_workers * key_cols.size(), {std::numeric_limits<std::int64_t>::max(),
+                                                  std::numeric_limits<std::int64_t>::min()});
+            const bool measured = std::ranges::any_of(
+                key_cols, [](const KeyCol& col) { return col.kind != KeyCol::Kind::Cat; });
+            if (measured) {
+                for_row_range(range_workers, [&](std::size_t r, std::size_t b, std::size_t e) {
+                    for (std::size_t c = 0; c < key_cols.size(); ++c) {
+                        if (key_cols[c].kind == KeyCol::Kind::Cat) {
+                            continue;
+                        }
+                        auto& [lo, hi] = bounds[(r * key_cols.size()) + c];
+                        for (std::size_t row = b; row < e; ++row) {
+                            const std::int64_t v = cell_key(key_cols[c], row);
+                            lo = std::min(lo, v);
+                            hi = std::max(hi, v);
+                        }
+                    }
+                });
+            }
+            std::uint64_t cells = 1;
+            for (std::size_t c = key_cols.size(); c-- > 0 && cells != 0;) {
+                std::int64_t lo = 0;
+                std::int64_t hi = 0;
+                if (key_cols[c].kind == KeyCol::Kind::Cat) {
+                    hi = static_cast<std::int64_t>(key_cols[c].cat->dictionary().size()) - 1;
+                } else {
+                    lo = std::numeric_limits<std::int64_t>::max();
+                    hi = std::numeric_limits<std::int64_t>::min();
+                    for (std::size_t r = 0; r < range_workers; ++r) {
+                        lo = std::min(lo, bounds[(r * key_cols.size()) + c].first);
+                        hi = std::max(hi, bounds[(r * key_cols.size()) + c].second);
                     }
                 }
-            });
-            std::vector<std::pair<std::size_t, std::size_t>> seen;  // (first row, code)
-            for (std::size_t code = 0; code < dict; ++code) {
-                std::size_t row = kUnseen;
-                for (std::size_t r = 0; r < range_workers; ++r) {
-                    row = std::min(row, first[(r * dict) + code]);
-                }
-                if (row != kUnseen) {
-                    seen.emplace_back(row, code);
-                }
+                // Unsigned, so a span straddling zero cannot overflow; a span
+                // of the whole int64 range wraps to 0 and declines.
+                const std::uint64_t span =
+                    hi < lo ? 0
+                            : static_cast<std::uint64_t>(hi) - static_cast<std::uint64_t>(lo) + 1;
+                cell_lo[c] = lo;
+                cell_stride[c] = cells;
+                cells = (span == 0 || span > kMaxRangeCells / cells) ? 0 : cells * span;
             }
-            std::ranges::sort(seen);
-            for (const auto& [row, code] : seen) {
-                cat_gid_memo[code] = index.find_or_insert(group_order, key_cols, row,
+            if (cells != 0 && range_workers * cells <= kMaxRangeCells) {
+                n_cells = static_cast<std::size_t>(cells);
+            }
+        }
+        const bool parallel_cell_groups = n_cells != 0;
+        if (parallel_cell_groups) {
+            if (row_gid.empty()) {
+                row_gid.resize(rows);
+            }
+            constexpr std::size_t kUnseen = std::numeric_limits<std::size_t>::max();
+            // Number the groups from `cell_at(row)`, then fill row_gid.
+            const auto group_cells = [&](const auto& cell_at) {
+                std::vector<std::size_t> first(range_workers * n_cells, kUnseen);
+                for_row_range(range_workers, [&](std::size_t r, std::size_t b, std::size_t e) {
+                    std::size_t* local = first.data() + (r * n_cells);
+                    for (std::size_t row = b; row < e; ++row) {
+                        const std::size_t cell = cell_at(row);
+                        if (local[cell] == kUnseen) {
+                            local[cell] = row;
+                        }
+                    }
+                });
+                std::vector<std::pair<std::size_t, std::size_t>> seen;  // (first row, cell)
+                for (std::size_t cell = 0; cell < n_cells; ++cell) {
+                    std::size_t row = kUnseen;
+                    for (std::size_t r = 0; r < range_workers; ++r) {
+                        row = std::min(row, first[(r * n_cells) + cell]);
+                    }
+                    if (row != kUnseen) {
+                        seen.emplace_back(row, cell);
+                    }
+                }
+                std::ranges::sort(seen);
+                std::vector<std::uint32_t> cell_gid(n_cells, 0);
+                for (const auto& [row, cell] : seen) {
+                    cell_gid[cell] = index.find_or_insert(group_order, key_cols, row,
                                                           [&] { return new_group(row); });
-            }
-            for_row_range(range_workers, [&](std::size_t, std::size_t b, std::size_t e) {
-                for (std::size_t row = b; row < e; ++row) {
-                    row_gid[row] = cat_gid_memo[static_cast<std::size_t>(codes.code_at(row))];
                 }
-            });
+                for_row_range(range_workers, [&](std::size_t, std::size_t b, std::size_t e) {
+                    for (std::size_t row = b; row < e; ++row) {
+                        row_gid[row] = cell_gid[cell_at(row)];
+                    }
+                });
+            };
+            // A key's part of the cell, typed so the dispatch stays out of
+            // the row loops.
+            const auto with_part = [&](std::size_t c, const auto& body) {
+                const KeyCol& col = key_cols[c];
+                const std::int64_t lo = cell_lo[c];
+                const auto stride = static_cast<std::uint32_t>(cell_stride[c]);
+                const auto part = [lo, stride](std::int64_t v) {
+                    return static_cast<std::uint32_t>(v - lo) * stride;
+                };
+                switch (col.kind) {
+                    case KeyCol::Kind::Cat: {
+                        const auto* codes = col.cat->codes_data();
+                        body([=](std::size_t row) {
+                            return part(static_cast<std::int64_t>(codes[row]));
+                        });
+                        break;
+                    }
+                    case KeyCol::Kind::Date: {
+                        const Date* dates = col.date;
+                        body([=](std::size_t row) { return part(dates[row].days); });
+                        break;
+                    }
+                    case KeyCol::Kind::Ts: {
+                        const Timestamp* stamps = col.ts;
+                        body([=](std::size_t row) { return part(stamps[row].nanos); });
+                        break;
+                    }
+                    default: {
+                        const std::int64_t* ints = col.i64;
+                        body([=](std::size_t row) { return part(ints[row]); });
+                        break;
+                    }
+                }
+            };
+            if (key_cols.size() == 1) {
+                with_part(0, group_cells);
+            } else {
+                // Several keys: sum the parts into one buffer, a column at a
+                // time.
+                ::ibex::detail::NoInitVector<std::uint32_t> row_cell;
+                row_cell.resize(rows);
+                std::uint32_t* out = row_cell.data();
+                for_row_range(range_workers, [&](std::size_t, std::size_t b, std::size_t e) {
+                    for (std::size_t c = 0; c < key_cols.size(); ++c) {
+                        with_part(c, [&](const auto& part_at) {
+                            for (std::size_t row = b; row < e; ++row) {
+                                out[row] = c == 0 ? part_at(row) : out[row] + part_at(row);
+                            }
+                        });
+                    }
+                });
+                group_cells([out](std::size_t row) { return out[row]; });
+            }
+            for (std::size_t row = 0; !collect_only && row < rows; ++row) {
+                if (auto err = update_state(states[row_gid[row]].slots.data(), row)) {
+                    return std::unexpected(*err);
+                }
+            }
         }
 
-        for (std::size_t row = 0; !parallel_cat_groups && row < rows; ++row) {
+        for (std::size_t row = 0; !parallel_cell_groups && row < rows; ++row) {
             std::uint32_t gid = 0;
             if (!cat_gid_memo.empty() && !key_cols.front().is_null(row)) {
                 const auto code = static_cast<std::size_t>(key_cols.front().cat->code_at(row));

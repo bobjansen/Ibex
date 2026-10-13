@@ -158,6 +158,20 @@ class WorkerPool {
 /// code and would otherwise each get their own pool (the RTLD_LOCAL trap).
 [[nodiscard]] auto process_worker_pool() -> WorkerPool&;
 
+/// How a module reaches the process pool. A plugin is loaded RTLD_LOCAL with
+/// its own statically linked copy of this runtime, so its
+/// `process_worker_pool()` would otherwise build a SECOND pool beside the
+/// host's. `ExternRegistry` points the plugin at the host's accessor when the
+/// plugin registers its functions, as it does the interrupt flag.
+using WorkerPoolAccessor = WorkerPool& (*)();
+
+/// Make this module's `process_worker_pool()` return the pool behind `host`.
+/// A no-op in the host, where `host` is its own accessor.
+void bind_worker_pool(WorkerPoolAccessor host) noexcept;
+
+/// The accessor this module uses, for passing to `bind_worker_pool`.
+[[nodiscard]] auto worker_pool_accessor() noexcept -> WorkerPoolAccessor;
+
 /// The process-wide pool's thread count if it has already been created, or 0
 /// otherwise -- never constructs it. `process_worker_pool().size()` reads the
 /// same number but creates the pool as a side effect of asking; a caller that

@@ -23,6 +23,7 @@
 #include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/rng.hpp>
 #include <ibex/runtime/warnings.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <atomic>
 #include <cstdint>
@@ -436,12 +437,14 @@ class ExternRegistry {
 
    private:
     /// Every `register_*` runs in the module that registers: in a plugin, it
-    /// points the plugin's interrupt checks at the host's Ctrl+C flag and its
-    /// warnings at the host's sink, which the plugin's own copies never see
-    /// (see interrupt.hpp and warnings.hpp).
+    /// points the plugin's interrupt checks at the host's Ctrl+C flag, its
+    /// warnings at the host's sink, and its worker pool at the host's pool,
+    /// which the plugin's own copies never see (see interrupt.hpp,
+    /// warnings.hpp and worker_pool.hpp).
     void use_host_runtime_state() const noexcept {
         bind_interrupt_flag(host_interrupt_flag_);
         bind_warning_sink(host_warning_sink_);
+        bind_worker_pool(host_worker_pool_);
     }
 
     robin_hood::unordered_map<std::string, ExternFunction> registry_;
@@ -451,6 +454,7 @@ class ExternRegistry {
     /// Captured where the registry is constructed, which is the host.
     std::atomic<bool>* host_interrupt_flag_ = interrupt_flag_address();
     std::atomic<WarningSink>* host_warning_sink_ = warning_sink_address();
+    WorkerPoolAccessor host_worker_pool_ = worker_pool_accessor();
 };
 
 }  // namespace ibex::runtime

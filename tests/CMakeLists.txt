@@ -15,6 +15,7 @@ set(IBEX_TEST_SOURCES
     test_column.cpp
     test_csv.cpp
     test_csv_parallel.cpp
+    test_csv_lazy.cpp
     test_decimal.cpp
     test_decimal_e2e.cpp
     test_fs.cpp

@@ -253,6 +253,31 @@
 <span class="kw">let</span> ledger = <span class="fn-name">csv::read</span>(<span class="str">"ledger.csv"</span>, <span class="str">""</span>, <span class="str">","</span>, <span class="kw">true</span>,
                            <span class="str">"account:str,amount:decimal(12,2)"</span>);</code></pre>
     </article>
+
+    <article class="card" style="margin-top:1rem;">
+      <h3>Declare every column: queries parse only what they use</h3>
+      <p>
+        When the schema gives a type to <em>every</em> column, binding the file
+        reads only its header and counts its rows. Each query then parses just
+        the columns it references and keeps them, so a repeated query does not
+        read the file again, and memory holds only the columns you use. This is
+        the same projection pushdown <code>parquet::read</code> gets from its
+        footer.
+      </p>
+<pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
+
+<span class="kw">let</span> x = <span class="fn-name">csv::read</span>(<span class="str">"big.csv"</span>,
+                  schema = <span class="str">"id1:cat,id2:cat,v1:int,v3:double"</span>);
+x[<span class="kw">select</span> { s = <span class="fn-name">sum</span>(v1) }, <span class="kw">by</span> id1];   <span class="cm">// parses id1 and v1 only</span>
+x[<span class="kw">select</span> { m = <span class="fn-name">mean</span>(v3) }, <span class="kw">by</span> id2];  <span class="cm">// parses id2 and v3</span></code></pre>
+      <p>
+        Two things change compared with an eager read. A value its declared type
+        rejects is reported when a query first reads that column (with the same
+        message), and a column no query reads is never checked. And the file
+        must not change while it is bound. A schema that leaves any column to
+        inference reads eagerly, because an inferred type depends on every row.
+      </p>
+    </article>
   </section>
 
   <section class="section">

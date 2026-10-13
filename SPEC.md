@@ -4017,6 +4017,69 @@ extern fn csv::read(path: String, nulls: String, delimiter: String, has_header: 
 When `has_header` is `false`, the reader synthesizes numbered column names:
 `col1`, `col2`, `col3`, ...
 
+**Schema strings.** `schema` is a comma-separated list of column types. An
+entry written `name:type` applies to the column of that name; an entry written
+as a bare `type` applies to the column at the same position in the list. Empty
+entries are skipped and hold no position (`"int,,str"` is `"int,str"`). A
+column no entry covers is inferred as usual. Types:
+
+| Type | Aliases | Column | A value that does not parse |
+|------|---------|--------|-----------------------------|
+| `int` | `i64` | `Int64` | error |
+| `double` | `f64`, `float` | `Float64` | error |
+| `str` | `string` | `String` | (never) |
+| `cat` | `categorical` | `String`, dictionary-encoded | (never) |
+| `date` | | `Date` (`YYYY-MM-DD`) | error |
+| `decimal(p,s)` | | `Decimal(p, s)`, parsed exactly | error |
+
+A declared column skips inference entirely; a null token (`nulls`) still reads
+as null in any of them, but an empty field in an `int`, `double`, `date` or
+`decimal` column is an error unless `nulls` includes `<empty>`.
+
+```
+let trades = csv::read("trades.csv",
+                       schema = "symbol:cat,ts:date,price:double,qty:int");
+```
+
+**A schema that declares every column binds lazily.** When `schema` gives a type
+to every column of a local file, `let t = csv::read(...)` reads only the header
+and counts the rows; no column is parsed. Each query then parses just the
+columns it references, and keeps them: a later query over the same columns
+does not touch the file again. This is the projection pushdown `parquet::read`
+has (above), and it holds only the columns queries use in memory.
+
+```
+import "csv";
+let x = csv::read("big.csv",
+                  schema = "id1:cat,id2:cat,id4:int,v1:int,v2:int,v3:double");
+x[select { s = sum(v1) }, by id1];   // parses id1 and v1 only
+x[select { s = sum(v1) }, by id1];   // cached: the file is not read
+x[select { m = mean(v3) }, by id2];  // parses id2 and v3
+```
+
+A lazily bound file differs from an eagerly read one in two ways only:
+
+- A value its declared type rejects is reported when a query first reads that
+  column -- with the same message (column and row) the eager read gives -- not
+  at the `let`. A column no query reads is never checked.
+- The file must not change while it is bound: each query that needs a column
+  not yet parsed reads it again, and one whose header or row count no longer
+  matches the binding is an error ("changed after it was bound"), never a
+  silently different answer.
+
+Results are otherwise identical, including types, nulls and the order of a
+categorical column's dictionary. Every other `csv::read` is read eagerly, as
+before: with no schema or one that leaves any column to inference (the type of
+an inferred column depends on every row, so it cannot be known without reading
+the whole file), an HTTPS URL, or a file with no data row.
+
+**Reading in parallel.** On more than one core an eager read splits a large file
+(8 MB or more) into byte ranges and parses them concurrently; a lazy one does
+the same for the columns a query asks for. A split may fall inside a quoted
+field that spans lines; the reader detects that and reads the file in one
+piece. Parallel and serial reads give identical results, so this changes only
+how long a read takes.
+
 The JSON plugin supports three input formats:
 
 ```

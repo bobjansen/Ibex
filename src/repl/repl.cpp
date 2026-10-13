@@ -3778,7 +3778,11 @@ auto try_bind_lazy_source(parser::Expr& expr, runtime::TableRegistry& tables,
         }
         args.push_back(std::move(value.value()));
     }
-    return fn->lazy_table_func(args);
+    auto lazy = fn->lazy_table_func(args);
+    if (lazy.has_value() && lazy.value() == nullptr) {
+        return std::nullopt;  // declined: the eager path evaluates the call
+    }
+    return lazy;
 }
 
 /// Replace every inline lazy source in `expr` — `parquet::read(p)` in any table
@@ -5417,6 +5421,26 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
         if (!lazy.has_value()) {
             return std::unexpected(lazy.error());
         }
+        if (lazy.value() == nullptr) {
+            // Declined for these arguments: read it eagerly and scan the
+            // materialized table under the source's name, like any binding.
+            if (!function->func) {
+                return std::unexpected("lazy source declined and has no eager reader: " +
+                                       source.callee);
+            }
+            auto eager = function->func(*args);
+            if (!eager.has_value()) {
+                return std::unexpected(eager.error());
+            }
+            auto* table = std::get_if<runtime::Table>(&eager.value());
+            if (table == nullptr) {
+                return std::unexpected(source.callee + " did not return a table");
+            }
+            schemas.insert_or_assign(source.source_name, table_schema_info(*table));
+            row_counts.insert_or_assign(source.source_name, table->rows());
+            tables.insert_or_assign(source.source_name, std::move(*table));
+            continue;
+        }
         // Uniqueness is the one thing the planner cannot infer about a base
         // table from its own construction, and without it the `|PK ⋈ FK| <=
         // |FK|` bound in `estimate_cardinality` never applies to a scan —
@@ -6008,7 +6032,7 @@ auto try_execute_whole_script(parser::Program& program, runtime::ExternRegistry&
                     continue;
                 }
                 auto lazy = function->lazy_table_func(*args);
-                if (!lazy.has_value()) {
+                if (!lazy.has_value() || lazy.value() == nullptr) {
                     // A reader that cannot even be opened is the executor's
                     // error to report, with its own message. Leave the schema
                     // unknown and let lowering proceed as it did before.

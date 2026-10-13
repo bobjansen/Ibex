@@ -232,6 +232,12 @@ using ExternChunkedTableFn =
 /// Function signature for extern functions that produce a lazily-decoded table
 /// source (e.g. parquet::read). Returns a handle carrying the schema, from which
 /// the interpreter materializes only the columns a query references.
+///
+/// A source that is lazy only for SOME arguments declines the rest by returning
+/// a null handle (success, not an error): the interpreter then evaluates the
+/// call through the function's eager `register_table` entry, exactly as if no
+/// lazy entry existed. `csv::read` is lazy only with a fully declared schema.
+/// An error, by contrast, is the call's error.
 using ExternLazyTableFn =
     std::function<std::expected<LazyTablePtr, std::string>(const ExternArgs&)>;
 

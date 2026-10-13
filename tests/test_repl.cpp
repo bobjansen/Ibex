@@ -39,6 +39,8 @@
 #include <utility>
 #include <vector>
 
+#include "../src/repl/eager_projection.hpp"
+
 using ibex::repl::normalize_input;
 
 TEST_CASE("REPL normalizes implicit semicolons") {
@@ -2206,6 +2208,104 @@ let rows = read_fake();
 rows[filter a > 1, select { n = count() }];
 )";
     CHECK(capture_planner_line(source, registry) == "planner: whole-script");
+}
+
+TEST_CASE("REPL narrows an in-memory table to the columns a plan reads, on both paths",
+          "[repl][planner][eager_projection]") {
+    // `make_x` is a reader that declines lazily and reads eagerly, as
+    // `csv::read` does without a declared schema: whole-script planning scans
+    // the eager table it returns. `make_x_eager` has no lazy hook at all, so
+    // its script runs statement by statement over an ordinary bound table. Each answer is
+    // hand-computed; a narrowing that dropped a column the plan reads errors or answers wrongly
+    // here.
+    ibex::runtime::ExternRegistry registry;
+    const auto make_x = [](const ibex::runtime::ExternArgs&)
+        -> std::expected<ibex::runtime::ExternValue, std::string> {
+        ibex::runtime::Table t;
+        t.add_column("g", ibex::Column<std::int64_t>{1, 1, 1, 2, 2, 3});
+        t.add_column("pad1", ibex::Column<std::int64_t>{0, 1, 0, 1, 0, 1});
+        t.add_column("v", ibex::Column<double>{5.0, 9.0, 7.0, 1.0, 3.0, 4.0});
+        t.add_column("pad2", ibex::Column<std::int64_t>{7, 7, 7, 7, 7, 7});
+        return ibex::runtime::ExternValue{std::move(t)};
+    };
+    // Eager only: a script with no lazy source runs statement by statement.
+    registry.register_table("make_x_eager", make_x);
+    registry.register_table("make_x", make_x);
+    registry.register_lazy_table(
+        "make_x",
+        [](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::LazyTablePtr, std::string> { return nullptr; });
+    ibex::runtime::Table captured;
+    registry.register_scalar_table_consumer(
+        "capture", ibex::runtime::ScalarKind::Int,
+        [&captured](const ibex::runtime::Table& table, const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            captured = table;
+            return ibex::runtime::ExternValue{std::int64_t{0}};
+        });
+    const auto names = [&] {
+        std::vector<std::string> out;
+        for (const auto& entry : captured.columns) {
+            out.push_back(entry.name);
+        }
+        return out;
+    };
+    const auto ints = [&](const std::string& name) {
+        const auto* column = std::get_if<ibex::Column<std::int64_t>>(captured.find(name));
+        REQUIRE(column != nullptr);
+        return std::vector<std::int64_t>(column->begin(), column->end());
+    };
+    const auto doubles = [&](const std::string& name) {
+        const auto* column = std::get_if<ibex::Column<double>>(captured.find(name));
+        REQUIRE(column != nullptr);
+        return std::vector<double>(column->begin(), column->end());
+    };
+
+    std::size_t dropped = 0;
+    for (const bool whole_script : {true, false}) {
+        CAPTURE(whole_script);
+        const auto run = [&](const std::string& query) {
+            const std::string reader = whole_script ? "make_x" : "make_x_eager";
+            const std::string source =
+                "extern fn " + reader +
+                "() -> DataFrame from \"fake.hpp\";\n"
+                "extern fn capture(df: DataFrame) -> Int from \"fake.hpp\";\n"
+                "let x = " +
+                reader + "();\nlet result = " + query + ";\ncapture(result);\nresult;\n";
+            captured = ibex::runtime::Table{};
+            const auto before = ibex::repl::detail::eager_projection_dropped_columns();
+            const auto planner = capture_planner_line(source, registry);
+            dropped = ibex::repl::detail::eager_projection_dropped_columns() - before;
+            if (whole_script) {
+                REQUIRE(planner == "planner: whole-script");
+            } else {
+                INFO(planner);
+                REQUIRE(planner.starts_with("planner: statements"));
+            }
+        };
+
+        run("x[order { v desc }, head 2, by g][select { g, top = v }]");
+        CHECK(names() == std::vector<std::string>{"g", "top"});
+        CHECK(ints("g") == std::vector<std::int64_t>{1, 1, 3, 2, 2});
+        CHECK(doubles("top") == std::vector<double>{9.0, 7.0, 4.0, 3.0, 1.0});
+        CHECK(dropped == 2);  // pad1, pad2
+
+        // No select above: every column is read, so none may be dropped.
+        run("x[order { v desc }, head 1, by g]");
+        CHECK(names() == std::vector<std::string>{"g", "pad1", "v", "pad2"});
+        CHECK(captured.rows() == 3);
+        CHECK(dropped == 0);
+
+        // Reads no column, still counts every row.
+        run("x[select { n = count() }]");
+        CHECK(ints("n") == std::vector<std::int64_t>{6});
+        CHECK(dropped == 0);
+
+        // The filter's column is read though the output drops it.
+        run("x[filter pad1 == 1, select { s = sum(v) }]");
+        CHECK(doubles("s") == std::vector<double>{14.0});
+        CHECK(dropped == 2);  // g, pad2
+    }
 }
 
 TEST_CASE("REPL whole-script planner resolves scalar reader arguments",

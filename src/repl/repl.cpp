@@ -5771,6 +5771,11 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
         !ok.has_value()) {
         return std::unexpected(ok.error());
     }
+    // The in-memory tables -- materialized shared bindings and sources read
+    // eagerly -- narrowed the same way the statement path narrows them.
+    for (auto& [name, table] : detail::narrow_demanded_tables(demand, tables)) {
+        tables.insert_or_assign(name, std::move(table));
+    }
     return runtime::interpret(*rewritten, tables, &scalars, &externs, nullptr, exec);
 }
 

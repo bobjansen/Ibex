@@ -6,6 +6,7 @@
 #include <ibex/ir/required_columns.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
+#include <cstddef>
 #include <map>
 #include <string>
 #include <utility>
@@ -26,5 +27,9 @@ namespace ibex::repl::detail {
 [[nodiscard]] auto narrow_demanded_tables(const std::map<std::string, ir::ColumnDemand>& demand,
                                           const runtime::TableRegistry& tables)
     -> std::vector<std::pair<std::string, runtime::Table>>;
+
+/// Columns `narrow_demanded_tables` has dropped in this process. Lets a test
+/// see that a REPL path narrowed a table, which its answers cannot show.
+[[nodiscard]] auto eager_projection_dropped_columns() -> std::size_t;
 
 }  // namespace ibex::repl::detail

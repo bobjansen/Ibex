@@ -3,11 +3,20 @@
 
 #include "eager_projection.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdlib>
 #include <set>
 
 namespace ibex::repl::detail {
+
+namespace {
+std::atomic<std::size_t> dropped_columns{0};
+}  // namespace
+
+auto eager_projection_dropped_columns() -> std::size_t {
+    return dropped_columns.load(std::memory_order_relaxed);
+}
 
 auto narrow_demanded_tables(const std::map<std::string, ir::ColumnDemand>& demand,
                             const runtime::TableRegistry& tables)
@@ -55,6 +64,7 @@ auto narrow_demanded_tables(const std::map<std::string, ir::ColumnDemand>& deman
             }
         }
         narrowed.set_properties(props);
+        dropped_columns.fetch_add(table.columns.size() - kept, std::memory_order_relaxed);
         out.emplace_back(name, std::move(narrowed));
     }
     return out;

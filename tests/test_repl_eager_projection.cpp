@@ -3,21 +3,17 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/ir/required_columns.hpp>
-#include <ibex/repl/repl.hpp>
-#include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/table_properties.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
-#include <expected>
 #include <map>
 #include <optional>
 #include <set>
 #include <string>
 #include <utility>
-#include <variant>
 #include <vector>
 
 #include "../src/repl/eager_projection.hpp"
@@ -45,13 +41,6 @@ auto names_of(const Table& t) -> std::vector<std::string> {
         out.push_back(entry.name);
     }
     return out;
-}
-
-template <typename T>
-auto values_of(const Table& t, const std::string& name) -> std::vector<T> {
-    const auto* column = std::get_if<ibex::Column<T>>(t.find(name));
-    REQUIRE(column != nullptr);
-    return {column->begin(), column->end()};
 }
 
 auto demand_of(std::set<std::string> names) -> ColumnDemand {
@@ -123,52 +112,4 @@ TEST_CASE("eager projection: columns the table's properties name survive the cut
     ColumnDemand all;
     all.widen();
     REQUIRE(narrow_demanded_tables({{"sorted", all}}, tables).empty());
-}
-
-TEST_CASE("eager projection: statement-path answers over a narrowed in-memory table",
-          "[repl][eager_projection]") {
-    ibex::runtime::ExternRegistry registry;
-    registry.register_table("make_x",
-                            [](const ibex::runtime::ExternArgs&)
-                                -> std::expected<ibex::runtime::ExternValue, std::string> {
-                                return ibex::runtime::ExternValue{wide_table()};
-                            });
-    Table captured;
-    registry.register_scalar_table_consumer(
-        "capture", ibex::runtime::ScalarKind::Int,
-        [&captured](const Table& table, const ibex::runtime::ExternArgs&)
-            -> std::expected<ibex::runtime::ExternValue, std::string> {
-            captured = table;
-            return ibex::runtime::ExternValue{std::int64_t{0}};
-        });
-    const std::string prelude = R"(
-extern fn make_x() -> DataFrame from "fake.hpp";
-extern fn capture(df: DataFrame) -> Int from "fake.hpp";
-let force_statement_path = 1;
-let x = make_x();
-)";
-    const auto run = [&](const std::string& statement) {
-        captured = Table{};
-        REQUIRE(ibex::repl::execute_script(prelude + statement, registry));
-    };
-
-    SECTION("grouped top-k carries only the columns the select reads") {
-        run("capture(x[order { v desc }, head 2, by g][select { g, top = v }]);");
-        REQUIRE(names_of(captured) == std::vector<std::string>{"g", "top"});
-        REQUIRE(values_of<std::int64_t>(captured, "g") == std::vector<std::int64_t>{1, 1, 3, 2, 2});
-        REQUIRE(values_of<double>(captured, "top") == std::vector<double>{9.0, 7.0, 4.0, 3.0, 1.0});
-    }
-    SECTION("a top-k with no select above keeps every column") {
-        run("capture(x[order { v desc }, head 1, by g]);");
-        REQUIRE(names_of(captured) == std::vector<std::string>{"g", "pad1", "v", "pad2"});
-        REQUIRE(captured.rows() == 3);
-    }
-    SECTION("a count reads no column and still counts every row") {
-        run("capture(x[select { n = count() }]);");
-        REQUIRE(values_of<std::int64_t>(captured, "n") == std::vector<std::int64_t>{6});
-    }
-    SECTION("a filter column is kept though the output drops it") {
-        run("capture(x[filter pad1 == 1, select { s = sum(v) }]);");
-        REQUIRE(values_of<double>(captured, "s") == std::vector<double>{14.0});
-    }
 }

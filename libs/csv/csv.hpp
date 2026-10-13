@@ -31,15 +31,20 @@
 //   extern fn csv::write(df: DataFrame, path: String) -> Int from "csv.hpp";
 //   let rows = csv::write(df, "data/out.csv");
 //
-// The reader streams the file via mmap (on POSIX) and parses it in a single
-// pass into views over the backing buffer; only fields that contain escaped
-// `""` sequences allocate a heap string.  Typed column construction then
-// performs at most one numeric-probe scan per column and fuses the final
-// parse into the build loop, so each value is parsed at most twice.
+// The reader maps the file (mmap on POSIX) and parses it into views over the
+// mapped bytes; only fields that contain escaped `""` sequences allocate a
+// heap string. On more than one core a large file is parsed in parallel byte
+// ranges ("Parallel eager read" below), with results identical to the serial
+// reader, which remains the fallback and the reference.
+//
+// With a schema that types every column, `csv::read` is also a lazy source
+// ("Lazy read with a declared schema" below): binding counts rows, and each
+// query parses only the columns it references.
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
@@ -277,7 +282,16 @@ class CsvSource {
                     data_ = "";
                     return;
                 }
-                void* addr = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
+                // MAP_POPULATE maps every page in one kernel call instead of
+                // one fault per 4 KB page as the parse first touches it. The
+                // parallel parse is neutral either way; the lazy source's row
+                // count -- a bare byte scan -- halved (139 -> 60 ms on 500 MB).
+#ifdef MAP_POPULATE
+                constexpr int kMapFlags = MAP_PRIVATE | MAP_POPULATE;
+#else
+                constexpr int kMapFlags = MAP_PRIVATE;
+#endif
+                void* addr = ::mmap(nullptr, size_, PROT_READ, kMapFlags, fd, 0);
                 if (addr != MAP_FAILED) {
                     ::madvise(addr, size_, MADV_SEQUENTIAL);
                     fd_ = fd;
@@ -897,6 +911,106 @@ inline auto resolve_csv_path(std::string_view path) -> CsvLocalPath {
     }
     out.path.assign(path);
     return out;
+}
+
+// ── Layout ───────────────────────────────────────────────────────────────────
+
+/// The schema hint for column `idx` named `name`: an entry written
+/// `name:type` matches by name, an unnamed entry by position.
+inline auto csv_resolve_hint(const CsvReadOptions& options, std::size_t idx,
+                             const std::string& name) -> CsvColumnKind {
+    if (options.schema.empty()) {
+        return CsvColumnKind::Infer;
+    }
+    for (const auto& entry : options.schema.entries) {
+        if (entry.name && *entry.name == name) {
+            return entry.kind;
+        }
+    }
+    if (idx < options.schema.entries.size() && !options.schema.entries[idx].name) {
+        return options.schema.entries[idx].kind;
+    }
+    return CsvColumnKind::Infer;
+}
+
+/// The Decimal(p, s) of a column whose hint is Decimal, resolved the same way
+/// as `csv_resolve_hint`.
+inline auto csv_resolve_decimal(const CsvReadOptions& options, std::size_t idx,
+                                const std::string& name) -> ibex::DecimalType {
+    for (const auto& entry : options.schema.entries) {
+        if (entry.name && *entry.name == name) {
+            return entry.decimal;
+        }
+    }
+    if (idx < options.schema.entries.size() && !options.schema.entries[idx].name) {
+        return options.schema.entries[idx].decimal;
+    }
+    return ibex::DecimalType{};
+}
+
+/// What every read of a CSV file starts from: the column names (from the
+/// header, or `col1`, `col2`, ...), each column's declared type, and the first
+/// data row, which fixes the column count when there is no header. Shared by
+/// the eager reader and the lazy source so both resolve a file identically.
+struct CsvLayout {
+    /// `has_header` was set but the file holds no row at all.
+    bool no_header_row = false;
+    std::vector<std::string> names;
+    std::vector<CsvColumnKind> hints;
+    std::vector<ibex::DecimalType> decimals;
+    bool has_first_row = false;
+    /// Views into the source buffer, or into `escapes`.
+    std::vector<std::string_view> first_row;
+    std::size_t first_row_bytes = 0;
+    /// Just past the first data row (past the header when there is none).
+    const char* body = nullptr;
+    /// Unescaped `""` fields of the header and first row. A deque, so the
+    /// views into it stay valid as later parses append.
+    std::deque<std::string> escapes;
+};
+
+inline void csv_read_layout(const char* data, const char* end, const CsvReadOptions& options,
+                            CsvLayout& out) {
+    const char* pos = data;
+    std::vector<std::string_view> row_buf;
+    row_buf.reserve(16);
+    if (options.has_header) {
+        if (!csv_parse_row(pos, end, options.delimiter, row_buf, out.escapes)) {
+            out.no_header_row = true;
+            out.body = pos;
+            return;
+        }
+        out.names.reserve(row_buf.size());
+        for (auto sv : row_buf) {
+            out.names.emplace_back(sv);
+        }
+    }
+    const char* first_row_start = pos;
+    out.has_first_row = csv_parse_row(pos, end, options.delimiter, row_buf, out.escapes);
+    out.first_row_bytes = static_cast<std::size_t>(pos - first_row_start);
+    out.body = pos;
+    if (out.has_first_row) {
+        out.first_row = row_buf;
+        if (!options.has_header) {
+            out.names.reserve(out.first_row.size());
+            for (std::size_t i = 0; i < out.first_row.size(); ++i) {
+                out.names.push_back("col" + std::to_string(i + 1));
+            }
+        }
+    } else if (!options.has_header) {
+        // With no row to discover columns from, the supplied schema is the
+        // layout.
+        for (std::size_t i = 0; i < options.schema.entries.size(); ++i) {
+            out.names.push_back(
+                options.schema.entries[i].name.value_or("col" + std::to_string(i + 1)));
+        }
+    }
+    out.hints.reserve(out.names.size());
+    out.decimals.reserve(out.names.size());
+    for (std::size_t c = 0; c < out.names.size(); ++c) {
+        out.hints.push_back(csv_resolve_hint(options, c, out.names[c]));
+        out.decimals.push_back(csv_resolve_decimal(options, c, out.names[c]));
+    }
 }
 
 // ── Parallel eager read ──────────────────────────────────────────────────────
@@ -1672,33 +1786,54 @@ auto csv_concat_sinks(const std::vector<CsvRangeRows>& ranges, std::size_t c,
     return out;
 }
 
-/// The parallel read of the body [body, end), after the header and the first
-/// data row (`first_row`) have been parsed. Returns nullopt whenever the serial
-/// reader must run instead: too small, one core, a cut inside a quoted field,
-/// or a value a declared type rejects.
-inline auto csv_read_parallel(
-    const char* body, const char* end, const std::vector<std::string_view>& first_row,
-    std::size_t first_row_bytes, const std::vector<std::string>& col_names,
-    const std::vector<CsvColumnKind>& hints, const std::vector<ibex::DecimalType>& decimals,
-    const CsvReadOptions& options) -> std::optional<ibex::runtime::Table> {
+/// The parallel read of `layout.body .. end`, after `csv_read_layout` has
+/// parsed the header and the first data row.
+///
+/// The eager reader calls this with no `take` and no `forced_workers`: it then
+/// declines (nullopt) whenever the serial reader should run instead -- too
+/// small, one core, a cut inside a quoted field, or a value a declared type
+/// rejects.
+///
+/// The lazy source calls it with `take` (only those columns are stored and
+/// returned; the rest are tokenized past) and `forced_workers` (its query's
+/// budget, possibly 1). It never wants the serial reader, which builds every
+/// column: a failed boundary check retries as one range instead, so the only
+/// nullopt it can see is a rejected value.
+inline auto csv_read_parallel(const char* end, const CsvLayout& layout,
+                              const CsvReadOptions& options,
+                              const std::vector<std::uint8_t>* take = nullptr,
+                              std::size_t forced_workers = 0, bool single_range = false)
+    -> std::optional<ibex::runtime::Table> {
+    const char* body = layout.body;
+    const auto& first_row = layout.first_row;
+    const auto first_row_bytes = layout.first_row_bytes;
+    const auto& col_names = layout.names;
+    const auto& hints = layout.hints;
+    const auto& decimals = layout.decimals;
     const auto bytes = static_cast<std::size_t>(end - body);
-    if (bytes < csv_env_size("IBEX_CSV_PARALLEL_MIN_BYTES", kCsvParallelMinBytes) ||
-        std::getenv("IBEX_CSV_SERIAL") != nullptr) {
-        return std::nullopt;
-    }
-    const std::size_t workers = std::min(ibex::runtime::compute_thread_count(),
-                                         ibex::runtime::process_worker_pool().size());
-    if (workers < 2) {
-        return std::nullopt;
+    std::size_t workers = forced_workers;
+    if (forced_workers == 0) {
+        if (bytes < csv_env_size("IBEX_CSV_PARALLEL_MIN_BYTES", kCsvParallelMinBytes) ||
+            std::getenv("IBEX_CSV_SERIAL") != nullptr) {
+            return std::nullopt;
+        }
+        workers = std::min(ibex::runtime::compute_thread_count(),
+                           ibex::runtime::process_worker_pool().size());
+        if (workers < 2) {
+            return std::nullopt;
+        }
     }
     const std::size_t n_cols = col_names.size();
+    const std::vector<std::uint8_t> take_mask =
+        take != nullptr ? *take : std::vector<std::uint8_t>(n_cols, 1);
     const CsvNullSet null_set(options);
     const auto modes = csv_choose_sinks(body, end, options.delimiter, first_row, hints, null_set);
 
     // A few ranges per worker, so one dense range cannot strand the rest.
     const std::size_t range_bytes = std::max<std::size_t>(
         csv_env_size("IBEX_CSV_PARALLEL_RANGE_BYTES", kCsvParallelMinRangeBytes), 1);
-    const std::size_t parts = std::clamp<std::size_t>(bytes / range_bytes, 1, workers * 4);
+    const std::size_t parts =
+        single_range ? 1 : std::clamp<std::size_t>(bytes / range_bytes, 1, workers * 4);
     const auto cuts = csv_split_ranges(body, end, parts);
     std::vector<CsvRangeRows> ranges(cuts.size());
     for (auto& range : ranges) {
@@ -1708,11 +1843,12 @@ inline auto csv_read_parallel(
             range.sinks[c].decimal_type = decimals[c];
         }
     }
-    const std::vector<std::uint8_t> take_all(n_cols, 1);
     // The first data row was parsed to learn the column count; it leads range 0.
     for (std::size_t c = 0; c < n_cols; ++c) {
-        ranges[0].sinks[c].push(c < first_row.size() ? first_row[c] : std::string_view{}, 0,
-                                null_set);
+        if (take_mask[c] != 0) {
+            ranges[0].sinks[c].push(c < first_row.size() ? first_row[c] : std::string_view{}, 0,
+                                    null_set);
+        }
     }
     ranges[0].rows = 1;
     const std::size_t row_bytes = std::max<std::size_t>(first_row_bytes, 1);
@@ -1722,13 +1858,16 @@ inline auto csv_read_parallel(
     };
     csv_run_parallel(cuts.size(), workers, [&](std::size_t r) {
         csv_parse_range(cuts[r].first, cuts[r].second, end, options.delimiter, reserve_for(r),
-                        null_set, take_all, ranges[r]);
+                        null_set, take_mask, ranges[r]);
     });
 
     std::vector<std::size_t> offsets(ranges.size());
     std::size_t rows = 0;
     for (std::size_t r = 0; r < ranges.size(); ++r) {
         if (!ranges[r].consistent) {
+            if (forced_workers != 0 && !single_range) {
+                return csv_read_parallel(end, layout, options, take, forced_workers, true);
+            }
             return std::nullopt;
         }
         offsets[r] = rows;
@@ -1740,7 +1879,7 @@ inline auto csv_read_parallel(
     // value at all, is re-read as views and built like any text column.
     std::vector<std::uint8_t> reread(n_cols, 0);
     for (std::size_t c = 0; c < n_cols; ++c) {
-        if (modes[c] == CsvSinkMode::Views) {
+        if (take_mask[c] == 0 || modes[c] == CsvSinkMode::Views) {
             continue;
         }
         bool any_valid = false;
@@ -1795,6 +1934,9 @@ inline auto csv_read_parallel(
 
     ibex::runtime::Table table;
     for (std::size_t c = 0; c < n_cols; ++c) {
+        if (take_mask[c] == 0) {
+            continue;
+        }
         const auto mode = ranges[0].sinks[c].mode;
         const auto& name = col_names[c];
         if (mode == CsvSinkMode::Views) {
@@ -1907,82 +2049,30 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
     }
 
     CsvSource source(path_string);
-    const char* pos = source.data();
     const char* end = source.data() + source.size();
-
-    std::deque<std::string> escape_storage;
+    CsvLayout layout;
+    csv_read_layout(source.data(), end, options, layout);
+    if (layout.no_header_row) {
+        return ibex::runtime::Table{};
+    }
+    const char* pos = layout.body;
+    std::deque<std::string>& escape_storage = layout.escapes;
     std::vector<std::string_view> row_buf;
     row_buf.reserve(16);
-
-    std::vector<std::string> col_names;
-    if (options.has_header) {
-        if (!csv_parse_row(pos, end, options.delimiter, row_buf, escape_storage)) {
-            return ibex::runtime::Table{};
-        }
-        col_names.reserve(row_buf.size());
-        for (auto sv : row_buf) {
-            col_names.emplace_back(sv);
-        }
-    }
-
-    // Resolve a schema hint for column `c`/`name`: match by name if any
-    // entries were written as `name:type`, otherwise by position.
-    auto resolve_hint = [&](std::size_t idx, const std::string& name) -> CsvColumnKind {
-        if (options.schema.empty()) {
-            return CsvColumnKind::Infer;
-        }
-        for (const auto& entry : options.schema.entries) {
-            if (entry.name && *entry.name == name) {
-                return entry.kind;
-            }
-        }
-        if (idx < options.schema.entries.size() && !options.schema.entries[idx].name) {
-            return options.schema.entries[idx].kind;
-        }
-        return CsvColumnKind::Infer;
+    const std::vector<std::string>& col_names = layout.names;
+    const std::vector<std::string_view>& first_row = layout.first_row;
+    const bool has_first_row = layout.has_first_row;
+    const auto resolve_decimal = [&](std::size_t idx, const std::string& name) {
+        return csv_resolve_decimal(options, idx, name);
     };
-    // The Decimal(p, s) of a column whose hint is Decimal, resolved the same
-    // way as `resolve_hint`.
-    auto resolve_decimal = [&](std::size_t idx, const std::string& name) -> ibex::DecimalType {
-        for (const auto& entry : options.schema.entries) {
-            if (entry.name && *entry.name == name) {
-                return entry.decimal;
-            }
-        }
-        if (idx < options.schema.entries.size() && !options.schema.entries[idx].name) {
-            return options.schema.entries[idx].decimal;
-        }
-        return ibex::DecimalType{};
+    const auto resolve_hint = [&](std::size_t idx, const std::string& name) {
+        return csv_resolve_hint(options, idx, name);
     };
-
-    std::vector<std::string_view> first_row;
-    const char* first_row_start = pos;
-    bool has_first_row = csv_parse_row(pos, end, options.delimiter, row_buf, escape_storage);
-    const auto first_row_bytes = static_cast<std::size_t>(pos - first_row_start);
-    if (has_first_row) {
-        first_row = row_buf;
-        if (!options.has_header) {
-            col_names.reserve(first_row.size());
-            for (std::size_t i = 0; i < first_row.size(); ++i) {
-                col_names.push_back("col" + std::to_string(i + 1));
-            }
-        }
-    } else if (!options.has_header) {
-        // With no row to discover columns from, the supplied schema is the
-        // layout. Feed it through the ordinary typed column builders below.
-        for (std::size_t i = 0; i < options.schema.entries.size(); ++i) {
-            col_names.push_back(
-                options.schema.entries[i].name.value_or("col" + std::to_string(i + 1)));
-        }
-    }
 
     std::size_t n_cols = col_names.size();
-    std::vector<CsvColumnKind> resolved_hints;
-    resolved_hints.reserve(n_cols);
+    const std::vector<CsvColumnKind>& resolved_hints = layout.hints;
     bool all_hints_known = has_first_row;
-    for (std::size_t c = 0; c < n_cols; ++c) {
-        const auto hint = resolve_hint(c, col_names[c]);
-        resolved_hints.push_back(hint);
+    for (const auto hint : resolved_hints) {
         if (hint == CsvColumnKind::Infer) {
             all_hints_known = false;
         }
@@ -1991,13 +2081,7 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
     const bool need_null_check = options.null_if_empty || !options.null_tokens.empty();
 
     if (has_first_row) {
-        std::vector<ibex::DecimalType> decimals;
-        decimals.reserve(n_cols);
-        for (std::size_t c = 0; c < n_cols; ++c) {
-            decimals.push_back(resolve_decimal(c, col_names[c]));
-        }
-        if (auto table = csv_read_parallel(pos, end, first_row, first_row_bytes, col_names,
-                                           resolved_hints, decimals, options)) {
+        if (auto table = csv_read_parallel(end, layout, options)) {
             return std::move(*table);
         }
     }
@@ -2541,6 +2625,285 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
     }
 
     return table;
+}
+
+// ── Lazy read with a declared schema ─────────────────────────────────────────
+//
+// `let t = csv::read(path, ..., schema = "...")` with a type for EVERY column
+// binds like `parquet::read`: binding learns the schema and the row count and
+// decodes nothing, and each query parses only the columns it references. Those
+// columns are cached in the `LazyTable`, so a later query that needs them again
+// does not touch the file.
+//
+// Why only a declared schema. A lazy source must know every column's type when
+// it is bound. Parquet reads that from its footer; a CSV file has none, and the
+// eager reader infers a type from the WHOLE column (one "1.5" anywhere makes it
+// Double; Categorical vs String depends on the distinct count over all rows).
+// Learning that is a full pass -- about as costly as the eager read itself --
+// and the first query would then tokenize the file again. With every type
+// declared there is nothing to learn: binding is a parallel row count.
+//
+// What the user sees differs from the eager read in exactly two ways, both
+// documented in SPEC.md (Section 12.1):
+//   * A value its declared type rejects is reported when a query first reads
+//     that column, not at the `let`, and a column no query reads is never
+//     checked. The message is the eager reader's own.
+//   * Each query that needs a column not yet cached re-reads the file; the
+//     file must not change while it is bound (a changed row count or header
+//     is an error, not a silently different answer).
+//
+// Every other case declines (`csv_lazy_read` returns null) and the eager
+// reader runs as before: no schema or a partial one, an HTTPS path, an empty
+// file, or a file that cannot be opened -- whose error the eager reader then
+// reports in its usual words.
+
+/// Rows in `[body, end)` exactly as `csv_parse_row` counts them.
+///
+/// Without a quote anywhere in the body a row is a maximal run of bytes that
+/// are neither '\r' nor '\n', which a byte scan counts in parallel with no
+/// tokenizing. A quote may hide a newline inside a field, so then the rows are
+/// tokenized with the same cuts and boundary check as the parallel read (a
+/// failed check recounts as one range).
+inline auto csv_count_rows(const char* body, const char* end, char delim, std::size_t workers)
+    -> std::size_t {
+    const auto bytes = static_cast<std::size_t>(end - body);
+    if (bytes == 0) {
+        return 0;
+    }
+    workers = std::max<std::size_t>(workers, 1);
+    const std::size_t range_bytes = std::max<std::size_t>(
+        csv_env_size("IBEX_CSV_PARALLEL_RANGE_BYTES", kCsvParallelMinRangeBytes), 1);
+    const std::size_t parts = std::clamp<std::size_t>(bytes / range_bytes, 1, workers * 4);
+    const auto bound = [&](std::size_t k) { return k == parts ? end : body + (bytes / parts) * k; };
+    std::vector<std::size_t> counts(parts, 0);
+    std::atomic<bool> quoted{false};
+    csv_run_parallel(parts, workers, [&](std::size_t k) {
+        const char* p = bound(k);
+        const char* q = bound(k + 1);
+        if (std::memchr(p, '"', static_cast<std::size_t>(q - p)) != nullptr) {
+            quoted.store(true, std::memory_order_relaxed);
+            return;
+        }
+        bool after_break = p == body || p[-1] == '\n' || p[-1] == '\r';
+        std::size_t n = 0;
+        for (; p < q; ++p) {
+            const bool is_break = *p == '\n' || *p == '\r';
+            n += (!is_break && after_break) ? 1 : 0;
+            after_break = is_break;
+        }
+        counts[k] = n;
+    });
+    if (!quoted.load()) {
+        std::size_t total = 0;
+        for (const auto n : counts) {
+            total += n;
+        }
+        return total;
+    }
+    const auto tokenized = [&](std::size_t pieces) -> std::optional<std::size_t> {
+        const auto cuts = csv_split_ranges(body, end, pieces);
+        std::vector<CsvRangeRows> ranges(cuts.size());
+        const CsvReadOptions none;
+        const CsvNullSet no_nulls(none);
+        const std::vector<std::uint8_t> nothing;
+        csv_run_parallel(cuts.size(), workers, [&](std::size_t r) {
+            csv_parse_range(cuts[r].first, cuts[r].second, end, delim, 0, no_nulls, nothing,
+                            ranges[r]);
+        });
+        std::size_t total = 0;
+        for (const auto& range : ranges) {
+            if (!range.consistent) {
+                return std::nullopt;
+            }
+            total += range.rows;
+        }
+        return total;
+    };
+    if (auto total = tokenized(parts)) {
+        return *total;
+    }
+    return *tokenized(1);
+}
+
+/// `table`'s rows at the ascending positions `selection`, for a decode asked
+/// to materialize only some rows. Codes keep their dictionary.
+inline auto csv_gather_rows(const ibex::runtime::Table& table,
+                            const ibex::runtime::Selection& selection) -> ibex::runtime::Table {
+    ibex::runtime::Table out;
+    const std::size_t n = selection.size();
+    for (const auto& entry : table.columns) {
+        auto gathered = std::visit(
+            [&](const auto& column) -> ibex::runtime::ColumnValue {
+                using C = std::decay_t<decltype(column)>;
+                if constexpr (std::is_same_v<C, ibex::Column<ibex::Categorical>>) {
+                    ibex::Column<ibex::Categorical>::codes_storage codes;
+                    codes.reserve(n);
+                    for (const auto row : selection) {
+                        codes.push_back(column.code_at(row));
+                    }
+                    return ibex::Column<ibex::Categorical>(column.dictionary_ptr(),
+                                                           column.index_ptr(), std::move(codes));
+                } else {
+                    C result;
+                    result.reserve(n);
+                    for (const auto row : selection) {
+                        result.push_back(column[row]);
+                    }
+                    result.set_meta(column.meta());
+                    return result;
+                }
+            },
+            *entry.column);
+        if (entry.validity.has_value()) {
+            ibex::runtime::ValidityBitmap validity;
+            validity.assign(n, true);
+            for (std::size_t i = 0; i < n; ++i) {
+                if (!(*entry.validity)[selection[i]]) {
+                    validity.set(i, false);
+                }
+            }
+            out.add_column(entry.name, std::move(gathered), std::move(validity));
+        } else {
+            out.add_column(entry.name, std::move(gathered));
+        }
+    }
+    return out;
+}
+
+/// What a bound lazy CSV source remembers; shared by every reader it makes.
+struct CsvLazyState {
+    std::string path;
+    CsvReadOptions options;
+    std::vector<std::string> names;
+    std::size_t rows = 0;
+};
+
+/// Decodes the requested columns of a bound CSV file. One per concurrent
+/// decode (`LazyTable` pools them); it holds no cursor, so it reopens the file
+/// for each decode.
+class CsvLazyReader final : public ibex::runtime::LazySourceReader {
+   public:
+    explicit CsvLazyReader(std::shared_ptr<const CsvLazyState> state) : state_(std::move(state)) {}
+
+    auto decode(const std::vector<std::string>& names, const ibex::runtime::Selection* selection,
+                const ibex::runtime::SourceUnit* /*unit: the source has no units*/,
+                const ibex::runtime::ExecutionContext& exec)
+        -> std::expected<ibex::runtime::Table, std::string> override {
+        const auto changed = [&] {
+            return std::unexpected("csv::read: '" + state_->path +
+                                   "' changed after it was bound; bind it again");
+        };
+        try {
+            CsvSource source(state_->path);
+            const char* end = source.data() + source.size();
+            CsvLayout layout;
+            csv_read_layout(source.data(), end, state_->options, layout);
+            if (!layout.has_first_row || layout.names != state_->names) {
+                return changed();
+            }
+            std::vector<std::uint8_t> take(layout.names.size(), 0);
+            for (const auto& name : names) {
+                for (std::size_t c = 0; c < layout.names.size(); ++c) {
+                    if (layout.names[c] == name) {
+                        take[c] = 1;
+                    }
+                }
+            }
+            const std::size_t workers = std::max<std::size_t>(
+                1, std::min(exec.compute_budget(), ibex::runtime::process_worker_pool().size()));
+            auto table = csv_read_parallel(end, layout, state_->options, &take, workers);
+            if (!table.has_value()) {
+                // A declared type rejected a value. The eager reader raises
+                // the error in its own words (column and row).
+                (void)read_csv_with_options(state_->path, state_->options);
+                return std::unexpected("csv::read: '" + state_->path +
+                                       "': a value does not match its declared type");
+            }
+            if (table->rows() != state_->rows) {
+                return changed();
+            }
+            if (selection != nullptr) {
+                return csv_gather_rows(*table, *selection);
+            }
+            return std::move(*table);
+        } catch (const std::exception& e) {
+            return std::unexpected(std::string(e.what()));
+        }
+    }
+
+   private:
+    std::shared_ptr<const CsvLazyState> state_;
+};
+
+/// `csv::read` as a lazy source, or null to decline (see the section comment):
+/// the caller then reads eagerly.
+inline auto csv_lazy_read(std::string_view path, const CsvReadOptions& options)
+    -> std::expected<ibex::runtime::LazyTablePtr, std::string> {
+    if (options.schema.empty() || is_https_uri(path)) {
+        return ibex::runtime::LazyTablePtr{};
+    }
+    const std::string path_string{path};
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path_string, ec)) {
+        return ibex::runtime::LazyTablePtr{};
+    }
+    try {
+        CsvSource source(path_string);
+        const char* end = source.data() + source.size();
+        CsvLayout layout;
+        csv_read_layout(source.data(), end, options, layout);
+        if (!layout.has_first_row || std::ranges::any_of(layout.hints, [](CsvColumnKind k) {
+                return k == CsvColumnKind::Infer;
+            })) {
+            return ibex::runtime::LazyTablePtr{};
+        }
+        const std::size_t workers = std::min(ibex::runtime::compute_thread_count(),
+                                             ibex::runtime::process_worker_pool().size());
+        const std::size_t rows = 1 + csv_count_rows(layout.body, end, options.delimiter, workers);
+
+        ibex::runtime::Table schema;
+        for (std::size_t c = 0; c < layout.names.size(); ++c) {
+            switch (layout.hints[c]) {
+                case CsvColumnKind::Int:
+                    schema.add_column(layout.names[c], ibex::Column<std::int64_t>{});
+                    break;
+                case CsvColumnKind::Double:
+                    schema.add_column(layout.names[c], ibex::Column<double>{});
+                    break;
+                case CsvColumnKind::String:
+                    schema.add_column(layout.names[c], ibex::Column<std::string>{});
+                    break;
+                case CsvColumnKind::Categorical:
+                    schema.add_column(layout.names[c],
+                                      ibex::Column<ibex::Categorical>(std::vector<std::string>{}));
+                    break;
+                case CsvColumnKind::Date:
+                    schema.add_column(layout.names[c], ibex::Column<ibex::Date>{});
+                    break;
+                case CsvColumnKind::Decimal: {
+                    ibex::Column<ibex::Decimal> column;
+                    ibex::ColumnMeta meta;
+                    meta.decimal = layout.decimals[c];
+                    column.set_meta(meta);
+                    schema.add_column(layout.names[c], std::move(column));
+                    break;
+                }
+                case CsvColumnKind::Infer:
+                    return ibex::runtime::LazyTablePtr{};
+            }
+        }
+        auto state = std::make_shared<const CsvLazyState>(CsvLazyState{
+            .path = path_string, .options = options, .names = layout.names, .rows = rows});
+        ibex::runtime::LazySourceReaderFactory factory =
+            [state]() -> std::expected<ibex::runtime::LazySourceReaderPtr, std::string> {
+            return std::make_unique<CsvLazyReader>(state);
+        };
+        return std::make_shared<ibex::runtime::LazyTable>(std::move(schema), rows,
+                                                          std::move(factory));
+    } catch (const std::exception&) {
+        // Unreadable: the eager reader reports it in its own words.
+        return ibex::runtime::LazyTablePtr{};
+    }
 }
 
 }  // namespace ibex::csv::detail

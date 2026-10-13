@@ -15,6 +15,7 @@
 #include <ibex/core/decimal.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/operator.hpp>
 
 #include <cstddef>
@@ -185,6 +186,36 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
                     return ibex::runtime::ExternValue{ibex::ext::csv::read(*path, *null_spec)};
                 }
                 return ibex::runtime::ExternValue{ibex::ext::csv::read(*path)};
+            } catch (const std::exception& e) {
+                return std::unexpected(std::string(e.what()));
+            }
+        });
+
+    // Lazy only with a schema that declares every column; any other call
+    // declines (a null handle) and the eager `csv::read` above runs. See
+    // "Lazy read with a declared schema" in csv.hpp.
+    registry->register_lazy_table(
+        "csv::read",
+        [](const ibex::runtime::ExternArgs& args)
+            -> std::expected<ibex::runtime::LazyTablePtr, std::string> {
+            if (args.size() != 5) {
+                return ibex::runtime::LazyTablePtr{};
+            }
+            const auto* path = std::get_if<std::string>(&args[0]);
+            const auto* null_spec = std::get_if<std::string>(&args[1]);
+            const auto* delimiter = std::get_if<std::string>(&args[2]);
+            const auto* has_header = std::get_if<bool>(&args[3]);
+            const auto* schema = std::get_if<std::string>(&args[4]);
+            if (path == nullptr || null_spec == nullptr || delimiter == nullptr ||
+                has_header == nullptr || schema == nullptr || schema->empty()) {
+                return ibex::runtime::LazyTablePtr{};
+            }
+            try {
+                auto options = csv_detail::csv_parse_null_spec(*null_spec);
+                options.delimiter = csv_detail::csv_parse_delimiter(*delimiter);
+                options.has_header = *has_header;
+                options.schema = csv_detail::csv_parse_schema(*schema);
+                return csv_detail::csv_lazy_read(*path, options);
             } catch (const std::exception& e) {
                 return std::unexpected(std::string(e.what()));
             }

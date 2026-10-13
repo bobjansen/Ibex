@@ -4,7 +4,10 @@ namespace csv {
 // `nulls` marks matching cells as null; the default keeps empty fields as strings.
 // `delimiter` defaults to ",".
 // `has_header` controls whether the first row contains column names.
-// `schema` optionally supplies explicit column types.
+// `schema` optionally supplies explicit column types ("name:type" or a bare
+// type by position; int, double, str, cat, date, decimal(p,s)). When it types
+// EVERY column, `let t = csv::read(...)` binds lazily: queries parse only the
+// columns they use (see SPEC.md, Section 12.1).
 extern fn read(
     path: String,
     nulls: String = "",

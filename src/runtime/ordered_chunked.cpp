@@ -17,13 +17,16 @@
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -407,6 +410,24 @@ class ChunkedOrderOperator final : public Operator {
     bool still_sorted_ = true;
 };
 
+/// Yields prebuilt chunks in order, for concatenating them through
+/// `materialize_operator`.
+class ChunkListSource final : public Operator {
+   public:
+    explicit ChunkListSource(std::vector<Chunk> chunks) : chunks_(std::move(chunks)) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (pos_ >= chunks_.size()) {
+            return std::optional<Chunk>{};
+        }
+        return std::optional<Chunk>{std::move(chunks_[pos_++])};
+    }
+
+   private:
+    std::vector<Chunk> chunks_;
+    std::size_t pos_ = 0;
+};
+
 class ChunkedOrderedLimitOperator final : public Operator {
    public:
     enum class KeepMode : std::uint8_t { First, Last };
@@ -594,6 +615,23 @@ class ChunkedOrderedLimitOperator final : public Operator {
                 return key_column[r];
             }
         };
+        if constexpr (!std::is_same_v<T, bool>) {
+            if (!group_by_->empty() && count_ <= kPodMaxCount) {
+                using K = std::conditional_t<std::is_same_v<T, double>, double, std::int64_t>;
+                return process_grouped_pod<K>(
+                    chunk,
+                    [&](std::size_t r) -> K {
+                        if constexpr (std::is_same_v<T, Date>) {
+                            return key_at(r).days;
+                        } else if constexpr (std::is_same_v<T, Timestamp>) {
+                            return key_at(r).nanos;
+                        } else {
+                            return key_at(r);
+                        }
+                    },
+                    ascending, group_key_cols, rows);
+            }
+        }
         // Grouped by one Categorical key with no nulls, across workers: each
         // fixed row range keeps a heap per dictionary code, then per code the
         // range heaps merge into that group's heap. The output is sorted by
@@ -728,6 +766,420 @@ class ChunkedOrderedLimitOperator final : public Operator {
         return std::nullopt;
     }
 
+    // ── Grouped top-k over one order key, in flat POD heaps ─────────────────
+    //
+    // `order { v }, head k, by g` (h2o q8: two largest v3 per id6) used to
+    // resolve every row's group through one serial boxed index and to box a
+    // full-row snapshot for every heap candidate, so it ran on one core and
+    // at 5M groups held gigabytes of `ScalarValue`s. Here the rows are hash
+    // partitioned by group key and each partition, on its own worker, keeps
+    // its groups' heaps as `k` flat (order key, sequence, ref) slots. A
+    // group lives in exactly one partition and its rows are visited in row
+    // order, so every heap sees what the serial loop would. Only rows still
+    // in a heap when the chunk ends are copied, into a stored piece; the
+    // winners are gathered from those pieces once, at the end, in the same
+    // (key, sequence) order `build_output` sorts by.
+
+    static constexpr std::size_t kPodMaxCount = 16;
+    /// A ref of a row in the chunk being processed, not yet in a piece.
+    static constexpr std::uint64_t kPodCurrentChunk = std::uint64_t{1} << 63;
+
+    template <typename K>
+    struct PodEntry {
+        K key{};
+        std::uint64_t sequence = 0;
+        std::uint64_t ref = 0;  ///< (piece << 32) | row, or kPodCurrentChunk | row
+    };
+
+    template <typename K>
+    struct PodPartition {
+        KeyRowIndex index;
+        std::vector<Key> keys;
+        /// The index instead, when the group key is one integer column.
+        robin_hood::unordered_flat_map<std::int64_t, std::uint32_t> int_index;
+        std::uint32_t null_gid = std::numeric_limits<std::uint32_t>::max();
+        std::vector<PodEntry<K>> heaps;  ///< gid * count_ .. + sizes[gid]
+        std::vector<std::uint32_t> sizes;
+        std::vector<std::uint32_t> stamp;    ///< chunk number + 1 that last changed gid
+        std::vector<std::uint32_t> touched;  ///< gids changed by the current chunk
+    };
+
+    template <typename K>
+    auto pod_partitions() -> std::vector<PodPartition<K>>& {
+        if constexpr (std::is_same_v<K, double>) {
+            return pod_double_;
+        } else {
+            return pod_int_;
+        }
+    }
+
+    template <typename K>
+    [[nodiscard]] auto pod_better(const PodEntry<K>& lhs, const PodEntry<K>& rhs,
+                                  bool ascending) const -> bool {
+        // `single_key_better`, on the flat entry.
+        if (lhs.key == rhs.key) {
+            return keep_mode_ == KeepMode::First ? (lhs.sequence < rhs.sequence)
+                                                 : (rhs.sequence < lhs.sequence);
+        }
+        const bool lhs_first = ascending ? (lhs.key < rhs.key) : (lhs.key > rhs.key);
+        return keep_mode_ == KeepMode::First ? lhs_first : !lhs_first;
+    }
+
+    template <typename K, typename KeyAt>
+    auto process_grouped_pod(const Table& chunk, const KeyAt& key_at, bool ascending,
+                             const std::vector<KeyCol>& group_key_cols, std::size_t rows)
+        -> std::optional<std::string> {
+        if (!pod_active_) {
+            // One integer key, read as its raw value; fixed for the stream,
+            // since a group must be found by the same index in every chunk.
+            pod_int_key_ =
+                group_key_cols.size() == 1 && (group_key_cols.front().kind == KeyCol::Kind::Int64 ||
+                                               group_key_cols.front().kind == KeyCol::Kind::Date ||
+                                               group_key_cols.front().kind == KeyCol::Kind::Ts);
+        }
+        pod_active_ = true;
+        pod_ascending_ = ascending;
+        const std::size_t workers = group_barrier_worker_count(exec_, rows);
+        auto& parts = pod_partitions<K>();
+        if (parts.empty()) {
+            // Fixed by the first chunk: a group's partition is a function of
+            // its hash and this count, for the life of the operator.
+            std::size_t count = 1;
+            while (count * 2 <= workers) {
+                count *= 2;
+            }
+            parts.resize(count);
+        }
+        const std::size_t n_parts = parts.size();
+        const std::uint64_t base = next_sequence_;
+        next_sequence_ += rows;
+        ++pod_chunks_;
+        const auto chunk_stamp = static_cast<std::uint32_t>(pod_chunks_);
+
+        // Every row's key hash, once. A lone non-null Categorical hashes per
+        // dictionary entry, exactly as `hash_key_row` hashes its text.
+        std::vector<std::uint64_t> hashes(rows);
+        const auto run_ranges = [&](const auto& body) {
+            if (workers < 2) {
+                body(std::size_t{0}, rows);
+                return;
+            }
+            const std::size_t grain = (rows + workers - 1) / workers;
+            auto batch = process_worker_pool().submit(workers, [&](std::size_t r) {
+                const std::size_t begin = std::min(rows, r * grain);
+                body(begin, std::min(rows, begin + grain));
+            });
+            batch.wait();
+        };
+        const KeyCol& key0 = group_key_cols.front();
+        const auto int_key = [&key0](std::size_t row) -> std::int64_t {
+            switch (key0.kind) {
+                case KeyCol::Kind::Date:
+                    return key0.date[row].days;
+                case KeyCol::Kind::Ts:
+                    return key0.ts[row].nanos;
+                default:
+                    return key0.i64[row];
+            }
+        };
+        // Any fixed value: a null's partition only has to be the same in
+        // every chunk.
+        constexpr std::uint64_t kNullHash = 0x9e3779b97f4a7c15ULL;
+        if (pod_int_key_) {
+            run_ranges([&](std::size_t begin, std::size_t end) {
+                for (std::size_t row = begin; row < end; ++row) {
+                    hashes[row] = key0.is_null(row)
+                                      ? kNullHash
+                                      : robin_hood::hash<std::int64_t>{}(int_key(row));
+                }
+            });
+        } else if (group_key_cols.size() == 1 && group_key_cols.front().kind == KeyCol::Kind::Cat &&
+                   group_key_cols.front().validity == nullptr) {
+            const auto& cat = *group_key_cols.front().cat;
+            const auto& dict = cat.dictionary();
+            std::vector<std::uint64_t> code_hash(dict.size());
+            for (std::size_t code = 0; code < dict.size(); ++code) {
+                std::uint64_t seed = 0;
+                key_hash_mix(seed, std::hash<std::string_view>{}(dict[code]));
+                code_hash[code] = key_hash_finalize(seed);
+            }
+            const auto* codes = cat.codes_data();
+            run_ranges([&](std::size_t begin, std::size_t end) {
+                for (std::size_t row = begin; row < end; ++row) {
+                    hashes[row] = code_hash[static_cast<std::size_t>(codes[row])];
+                }
+            });
+        } else {
+            run_ranges([&](std::size_t begin, std::size_t end) {
+                for (std::size_t row = begin; row < end; ++row) {
+                    hashes[row] = hash_key_row(group_key_cols, row);
+                }
+            });
+        }
+
+        std::vector<const ColumnEntry*> group_entries;
+        group_entries.reserve(group_by_->size());
+        for (const auto& ref : *group_by_) {
+            group_entries.push_back(chunk.find_entry(ref.name));
+        }
+        const std::size_t k = count_;
+        const auto worse_first = [&](const PodEntry<K>& a, const PodEntry<K>& b) {
+            return pod_better(a, b, ascending);
+        };
+        // High hash bits pick the partition; the index probes with the low.
+        const auto part_of = [n_parts](std::uint64_t hash) {
+            return static_cast<std::size_t>(hash >> 40U) & (n_parts - 1);
+        };
+        const auto run_partition = [&](std::size_t p) {
+            PodPartition<K>& part = parts[p];
+            for (std::size_t row = 0; row < rows; ++row) {
+                const std::uint64_t hash = hashes[row];
+                if (part_of(hash) != p) {
+                    continue;
+                }
+                const auto new_group = [&] {
+                    const auto gid = static_cast<std::uint32_t>(part.sizes.size());
+                    part.sizes.push_back(0);
+                    part.stamp.push_back(0);
+                    part.heaps.resize(part.sizes.size() * k);
+                    return gid;
+                };
+                std::uint32_t gid = 0;
+                if (pod_int_key_) {
+                    if (key0.is_null(row)) {
+                        if (part.null_gid == std::numeric_limits<std::uint32_t>::max()) {
+                            part.null_gid = new_group();
+                        }
+                        gid = part.null_gid;
+                    } else {
+                        auto [it, fresh] = part.int_index.try_emplace(int_key(row), 0U);
+                        if (fresh) {
+                            it->second = new_group();
+                        }
+                        gid = it->second;
+                    }
+                } else {
+                    gid = part.index.find_or_insert_hashed(
+                        hash,
+                        [&](std::uint32_t g) {
+                            return key_equals_row(part.keys[g], group_key_cols, row);
+                        },
+                        [&] {
+                            Key key;
+                            key.values.reserve(group_entries.size());
+                            for (const ColumnEntry* entry : group_entries) {
+                                push_key_value(key, *entry, row);
+                            }
+                            part.keys.push_back(std::move(key));
+                            return new_group();
+                        });
+                }
+                const PodEntry<K> entry{key_at(row), base + row, kPodCurrentChunk | row};
+                PodEntry<K>* heap = part.heaps.data() + (static_cast<std::size_t>(gid) * k);
+                std::uint32_t& size = part.sizes[gid];
+                if (size == k) {
+                    if (!pod_better(entry, heap[0], ascending)) {
+                        continue;
+                    }
+                    std::pop_heap(heap, heap + k, worse_first);
+                    heap[k - 1] = entry;
+                    std::push_heap(heap, heap + k, worse_first);
+                } else {
+                    heap[size] = entry;
+                    ++size;
+                    std::push_heap(heap, heap + size, worse_first);
+                }
+                if (part.stamp[gid] != chunk_stamp) {
+                    part.stamp[gid] = chunk_stamp;
+                    part.touched.push_back(gid);
+                }
+            }
+        };
+        if (workers >= 2 && n_parts >= 2) {
+            std::atomic<std::size_t> cursor{0};
+            auto batch = process_worker_pool().submit(std::min(workers, n_parts), [&](std::size_t) {
+                for (std::size_t p = cursor.fetch_add(1); p < n_parts; p = cursor.fetch_add(1)) {
+                    run_partition(p);
+                }
+            });
+            batch.wait();
+        } else {
+            for (std::size_t p = 0; p < n_parts; ++p) {
+                run_partition(p);
+            }
+        }
+
+        // Copy the rows this chunk left in a heap into a piece, and point
+        // their entries at it.
+        // A row's place in the piece is its rank among the kept rows: mark,
+        // then number in row order (no sort; at 5M groups nearly every row
+        // is kept).
+        std::vector<std::uint32_t> rank(rows, 0);
+        for (auto& part : parts) {
+            for (const std::uint32_t gid : part.touched) {
+                const PodEntry<K>* heap = part.heaps.data() + (static_cast<std::size_t>(gid) * k);
+                for (std::uint32_t i = 0; i < part.sizes[gid]; ++i) {
+                    if ((heap[i].ref & kPodCurrentChunk) != 0) {
+                        rank[static_cast<std::uint32_t>(heap[i].ref)] = 1;
+                    }
+                }
+            }
+        }
+        std::vector<std::uint32_t> kept;
+        for (std::size_t row = 0; row < rows; ++row) {
+            if (rank[row] != 0) {
+                rank[row] = static_cast<std::uint32_t>(kept.size());
+                kept.push_back(static_cast<std::uint32_t>(row));
+            }
+        }
+        // Mostly kept (many groups, few rows each): keep the chunk itself,
+        // whose columns are shared, rather than copying nearly all of it.
+        const bool whole_chunk = kept.size() * 2 >= rows;
+        if (kept.empty()) {
+            for (auto& part : parts) {
+                part.touched.clear();
+            }
+            return std::nullopt;
+        }
+        const auto piece = static_cast<std::uint64_t>(pod_pieces_.size());
+        for (auto& part : parts) {
+            for (const std::uint32_t gid : part.touched) {
+                PodEntry<K>* heap = part.heaps.data() + (static_cast<std::size_t>(gid) * k);
+                for (std::uint32_t i = 0; i < part.sizes[gid]; ++i) {
+                    if ((heap[i].ref & kPodCurrentChunk) != 0) {
+                        const auto row = static_cast<std::uint32_t>(heap[i].ref);
+                        heap[i].ref = (piece << 32U) | (whole_chunk ? row : rank[row]);
+                    }
+                }
+            }
+            part.touched.clear();
+        }
+        pod_piece_rows_ += whole_chunk ? rows : kept.size();
+        pod_pieces_.push_back(whole_chunk ? chunk : gather_rows(chunk, kept));
+        pod_compact_if_sparse<K>();
+        return std::nullopt;
+    }
+
+    /// The live entries of every heap, in output order.
+    template <typename K>
+    auto pod_winners() -> std::vector<PodEntry<K>> {
+        std::vector<PodEntry<K>> winners;
+        for (const auto& part : pod_partitions<K>()) {
+            for (std::size_t gid = 0; gid < part.sizes.size(); ++gid) {
+                const PodEntry<K>* heap = part.heaps.data() + (gid * count_);
+                winners.insert(winners.end(), heap, heap + part.sizes[gid]);
+            }
+        }
+        // `row_comes_first`: the order key, then arrival. Two stable radix
+        // passes, arrival first: equal keys then keep arrival order.
+        const std::size_t n = winners.size();
+        const std::size_t workers = group_barrier_worker_count(exec_, n);
+        const auto permute = [&](const SortIdx& order) {
+            std::vector<PodEntry<K>> sorted(n);
+            std::visit(
+                [&](const auto& idx) {
+                    for (std::size_t i = 0; i < n; ++i) {
+                        sorted[i] = winners[idx[i]];
+                    }
+                },
+                order);
+            winners = std::move(sorted);
+        };
+        std::vector<std::uint64_t> radix(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            radix[i] = winners[i].sequence;
+        }
+        permute(radix_sort_u64_asc(std::move(radix), n, workers));
+        radix.assign(n, 0);
+        for (std::size_t i = 0; i < n; ++i) {
+            std::uint64_t bits = 0;
+            if constexpr (std::is_same_v<K, double>) {
+                // -0.0 and 0.0 compare equal, so they must tie here too.
+                const double key = winners[i].key == 0.0 ? 0.0 : winners[i].key;
+                bits = double_to_sortable_u64(key);
+            } else {
+                bits = static_cast<std::uint64_t>(winners[i].key) ^ (std::uint64_t{1} << 63U);
+            }
+            radix[i] = pod_ascending_ ? bits : ~bits;
+        }
+        permute(radix_sort_u64_asc(std::move(radix), n, workers));
+        return winners;
+    }
+
+    /// The stored pieces as one table, and each piece's first row in it.
+    auto pod_concat_pieces() -> std::pair<Table, std::vector<std::size_t>> {
+        std::vector<std::size_t> offsets;
+        offsets.reserve(pod_pieces_.size());
+        std::size_t total = 0;
+        for (const auto& piece : pod_pieces_) {
+            offsets.push_back(total);
+            total += piece.rows();
+        }
+        if (pod_pieces_.size() == 1) {
+            return {std::move(pod_pieces_.front()), std::move(offsets)};
+        }
+        std::vector<Chunk> chunks;
+        chunks.reserve(pod_pieces_.size());
+        for (auto& piece : pod_pieces_) {
+            chunks.push_back(table_to_chunk(std::move(piece)));
+        }
+        auto table = materialize_operator(std::make_unique<ChunkListSource>(std::move(chunks)));
+        if (!table.has_value()) {
+            invariant_violation("grouped top-k: concatenating stored rows failed: " +
+                                table.error());
+        }
+        return {std::move(*table), std::move(offsets)};
+    }
+
+    /// Once most stored rows have been displaced from every heap, keep only
+    /// the live ones: worst case (each row better than the last) every row
+    /// is stored once.
+    template <typename K>
+    void pod_compact_if_sparse() {
+        std::size_t live = 0;
+        for (const auto& part : pod_partitions<K>()) {
+            for (const auto size : part.sizes) {
+                live += size;
+            }
+        }
+        constexpr std::size_t kMinGarbageRows = std::size_t{1} << 16;
+        if (pod_pieces_.size() < 2 || pod_piece_rows_ < (2 * live) + kMinGarbageRows) {
+            return;
+        }
+        auto [table, offsets] = pod_concat_pieces();
+        std::vector<std::uint64_t> rows;
+        rows.reserve(live);
+        for (auto& part : pod_partitions<K>()) {
+            for (std::size_t gid = 0; gid < part.sizes.size(); ++gid) {
+                PodEntry<K>* heap = part.heaps.data() + (gid * count_);
+                for (std::uint32_t i = 0; i < part.sizes[gid]; ++i) {
+                    rows.push_back(offsets[heap[i].ref >> 32U] + (heap[i].ref & 0xffffffffU));
+                    heap[i].ref = rows.size() - 1;
+                }
+            }
+        }
+        pod_pieces_.clear();
+        pod_pieces_.push_back(gather_rows(table, rows));
+        pod_piece_rows_ = rows.size();
+    }
+
+    template <typename K>
+    auto build_pod_output() -> Table {
+        const auto winners = pod_winners<K>();
+        if (winners.empty()) {
+            return empty_template_.value_or(Table{});
+        }
+        auto [table, offsets] = pod_concat_pieces();
+        std::vector<std::uint64_t> rows;
+        rows.reserve(winners.size());
+        for (const auto& entry : winners) {
+            rows.push_back(offsets[entry.ref >> 32U] + (entry.ref & 0xffffffffU));
+        }
+        Table out = gather_rows(table, rows);
+        out.set_properties(out.properties().with_ordering(*keys_));
+        return out;
+    }
+
     auto process_chunk(const Table& chunk) -> std::optional<std::string> {
         if (count_ == 0 || chunk.rows() == 0) {
             return std::nullopt;
@@ -814,6 +1266,10 @@ class ChunkedOrderedLimitOperator final : public Operator {
     }
 
     auto build_output() -> Table {
+        if (pod_active_) {
+            return pod_double_.empty() ? build_pod_output<std::int64_t>()
+                                       : build_pod_output<double>();
+        }
         std::vector<Entry> winners;
         if (group_by_->empty()) {
             winners = heap_;
@@ -874,6 +1330,16 @@ class ChunkedOrderedLimitOperator final : public Operator {
     /// make a retained code->gid mapping silently wrong.
     std::vector<std::uint32_t> cat_gid_memo_;
     static constexpr std::uint32_t kNoCatGid = std::numeric_limits<std::uint32_t>::max();
+    /// `process_grouped_pod`'s state; one of the two partition sets is used,
+    /// by the order key's storage.
+    bool pod_active_ = false;
+    bool pod_ascending_ = true;
+    bool pod_int_key_ = false;
+    std::size_t pod_chunks_ = 0;
+    std::vector<PodPartition<std::int64_t>> pod_int_;
+    std::vector<PodPartition<double>> pod_double_;
+    std::vector<Table> pod_pieces_;
+    std::size_t pod_piece_rows_ = 0;
 };
 
 }  // namespace

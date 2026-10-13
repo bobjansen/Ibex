@@ -2305,6 +2305,15 @@ TEST_CASE("REPL narrows an in-memory table to the columns a plan reads, on both 
         run("x[filter pad1 == 1, select { s = sum(v) }]");
         CHECK(doubles("s") == std::vector<double>{14.0});
         CHECK(dropped == 2);  // g, pad2
+
+        // A suffixed output is read through the collision that names it, so
+        // `v` stays on both sides though only `v_l` and `v_r` are selected.
+        run("(x left join Table { g = [1, 2], v = [10.0, 20.0] } on g suffix { \"_l\", \"_r\" })"
+            "[select { g, v_l, v_r }]");
+        CHECK(names() == std::vector<std::string>{"g", "v_l", "v_r"});
+        CHECK(ints("g") == std::vector<std::int64_t>{1, 1, 1, 2, 2, 3});
+        CHECK(doubles("v_l") == std::vector<double>{5.0, 9.0, 7.0, 1.0, 3.0, 4.0});
+        CHECK(dropped == 2);  // pad1, pad2
     }
 }
 

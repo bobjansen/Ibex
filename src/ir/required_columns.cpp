@@ -357,9 +357,30 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
                 }
                 const ColumnNameMap left_names(left_folded_names);
                 const ColumnNameMap right_names(right_folded_names);
-                for (const auto& name : need.names) {
+                // A suffix policy renames the columns BOTH inputs hold, and
+                // only those: `X` on both sides becomes `X` + left suffix and
+                // `X` + right suffix. So a read of a suffixed name needs `X`
+                // from both inputs -- the collision is what gives the name
+                // its suffix, and dropping `X` from either side would leave
+                // the other one unrenamed. A name merely ending in a suffix
+                // pulls in a stripped name nothing reads, which costs a column,
+                // never a wrong answer.
+                const auto& suffix = join.suffix();
+                const auto add_both = [&](const std::string& name) {
                     left_below.add(left_names.input_name(name));
                     right_below.add(right_names.input_name(name));
+                };
+                for (const auto& name : need.names) {
+                    add_both(name);
+                    if (!suffix.present) {
+                        continue;
+                    }
+                    for (const auto* applied : {&suffix.left, &suffix.right}) {
+                        if (!applied->empty() && name.size() > applied->size() &&
+                            name.ends_with(*applied)) {
+                            add_both(name.substr(0, name.size() - applied->size()));
+                        }
+                    }
                 }
             }
             for (const auto& key : join.keys()) {

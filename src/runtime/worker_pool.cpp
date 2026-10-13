@@ -849,15 +849,37 @@ auto process_worker_pool_state() -> ProcessWorkerPool& {
     return *state;
 }
 
-}  // namespace
-
-auto process_worker_pool() -> WorkerPool& {
+auto own_process_worker_pool() -> WorkerPool& {
     auto& state = process_worker_pool_state();
     const std::lock_guard lock(state.mutex);
     if (state.pool == nullptr) {
         state.pool = std::make_unique<WorkerPool>(decode_thread_count());
     }
     return *state.pool;
+}
+
+/// Set in a plugin to the host's accessor; null in the host.
+std::atomic<WorkerPoolAccessor> g_bound_pool_accessor{nullptr};
+
+}  // namespace
+
+auto process_worker_pool() -> WorkerPool& {
+    if (const auto bound = g_bound_pool_accessor.load(std::memory_order_acquire);
+        bound != nullptr) {
+        return bound();
+    }
+    return own_process_worker_pool();
+}
+
+void bind_worker_pool(WorkerPoolAccessor host) noexcept {
+    if (host != nullptr && host != &own_process_worker_pool) {
+        g_bound_pool_accessor.store(host, std::memory_order_release);
+    }
+}
+
+auto worker_pool_accessor() noexcept -> WorkerPoolAccessor {
+    const auto bound = g_bound_pool_accessor.load(std::memory_order_acquire);
+    return bound != nullptr ? bound : &own_process_worker_pool;
 }
 
 auto existing_worker_pool_size() -> std::size_t {

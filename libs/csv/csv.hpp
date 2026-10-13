@@ -41,9 +41,11 @@
 #include <ibex/core/time.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -897,6 +899,999 @@ inline auto resolve_csv_path(std::string_view path) -> CsvLocalPath {
     return out;
 }
 
+// ── Parallel eager read ──────────────────────────────────────────────────────
+//
+// The serial reader below parses every row on one thread, so `csv::read` took
+// the same ~2 s on a 500 MB file at 1 core and at 8 while Polars and DuckDB
+// scale to 0.25-0.5 s. This splits the body into byte ranges at newlines and
+// parses each range on its own worker, then builds every column from the
+// per-range field views, a range per task.
+//
+// A cut at a newline is only a row boundary if that newline is not inside a
+// quoted field. Rather than track quote state up front, the cuts are taken on
+// trust and checked afterwards: range 0 starts at a true row boundary, so its
+// worker's rows are true rows, and if its last row ends at or before the cut,
+// the cut is a true boundary too -- and so on by induction. Any range whose
+// last row runs past its cut fails the check, and the whole read falls back to
+// the serial path. So does any value a declared type cannot parse, which lets
+// the serial path raise its exact error. The parallel path declines; it never
+// guesses.
+//
+// The result is identical to the serial reader's: same types, same nulls, and
+// Categorical dictionaries in first-appearance order (each range's dictionary
+// is merged in range order).
+
+/// Below this many body bytes the serial reader is fast enough that fanning
+/// out costs more than it saves.
+inline constexpr std::size_t kCsvParallelMinBytes = std::size_t{8} << 20;
+/// The smallest byte range one worker is given.
+inline constexpr std::size_t kCsvParallelMinRangeBytes = std::size_t{2} << 20;
+
+/// Reads that took the parallel path, for tests that must prove they did.
+inline std::atomic<std::size_t> csv_parallel_reads{0};
+
+/// A size from the environment, or `fallback`. The thresholds are overridable
+/// so tests can drive the parallel path with small files and tiny ranges.
+inline auto csv_env_size(const char* name, std::size_t fallback) -> std::size_t {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || *raw == '\0') {
+        return fallback;
+    }
+    std::size_t value = 0;
+    const char* raw_end = raw + std::strlen(raw);
+    const auto result = std::from_chars(raw, raw_end, value);
+    return result.ec == std::errc{} && result.ptr == raw_end ? value : fallback;
+}
+
+inline auto csv_skip_blank_lines(const char* pos, const char* end) -> const char* {
+    while (pos < end && (*pos == '\n' || *pos == '\r')) {
+        ++pos;
+    }
+    return pos;
+}
+
+/// Run `body(i)` for i in [0, tasks) on up to `workers` pool threads.
+template <typename Body>
+void csv_run_parallel(std::size_t tasks, std::size_t workers, const Body& body) {
+    if (workers <= 1 || tasks <= 1) {
+        for (std::size_t i = 0; i < tasks; ++i) {
+            body(i);
+        }
+        return;
+    }
+    std::atomic<std::size_t> next{0};
+    ibex::runtime::process_worker_pool()
+        .submit(std::min(workers, tasks),
+                [&](std::size_t) {
+                    for (std::size_t i = next.fetch_add(1, std::memory_order_relaxed); i < tasks;
+                         i = next.fetch_add(1, std::memory_order_relaxed)) {
+                        body(i);
+                    }
+                })
+        .wait();
+}
+
+/// Cut [begin, end) into at most `parts` ranges, each but the first starting
+/// right after a '\n'. The cuts are candidates only; see above.
+inline auto csv_split_ranges(const char* begin, const char* end, std::size_t parts)
+    -> std::vector<std::pair<const char*, const char*>> {
+    std::vector<const char*> cuts{begin};
+    const auto bytes = static_cast<std::size_t>(end - begin);
+    for (std::size_t k = 1; k < parts; ++k) {
+        const char* target = begin + (bytes / parts) * k;
+        if (target <= cuts.back()) {
+            continue;
+        }
+        const auto* nl = static_cast<const char*>(
+            std::memchr(target, '\n', static_cast<std::size_t>(end - target)));
+        if (nl == nullptr || nl + 1 >= end) {
+            break;
+        }
+        cuts.push_back(nl + 1);
+    }
+    std::vector<std::pair<const char*, const char*>> ranges;
+    ranges.reserve(cuts.size());
+    for (std::size_t k = 0; k < cuts.size(); ++k) {
+        ranges.emplace_back(cuts[k], k + 1 < cuts.size() ? cuts[k + 1] : end);
+    }
+    return ranges;
+}
+
+/// The null spec, resolved once for a read: `csv_parse_null_spec` keeps owned
+/// strings, which a per-field lookup would have to build a `std::string` to
+/// probe -- one allocation per field per row.
+struct CsvNullSet {
+    bool if_empty = false;
+    robin_hood::unordered_flat_set<std::string_view> tokens;
+
+    explicit CsvNullSet(const CsvReadOptions& options) : if_empty(options.null_if_empty) {
+        for (const auto& token : options.null_tokens) {
+            tokens.insert(std::string_view{token});
+        }
+    }
+    [[nodiscard]] auto active() const noexcept -> bool { return if_empty || !tokens.empty(); }
+    [[nodiscard]] auto is_null(std::string_view sv) const -> bool {
+        return (if_empty && sv.empty()) || (!tokens.empty() && tokens.contains(sv));
+    }
+};
+
+/// Where one column's fields go while a range is parsed. Numeric columns --
+/// declared, or inferred from a sample -- parse straight into a typed buffer;
+/// everything else keeps its field views and is built afterwards exactly as
+/// the serial reader builds it.
+enum class CsvSinkMode : std::uint8_t {
+    Views,
+    InferInt,     ///< inferred: Int64 so far; may widen to InferDouble
+    InferDouble,  ///< inferred: Double
+    Int,          ///< declared i64
+    Double,       ///< declared f64
+    Date,         ///< declared date
+    Decimal,      ///< declared decimal(p,s)
+};
+
+struct CsvColumnSink {
+    CsvSinkMode mode = CsvSinkMode::Views;
+    std::vector<std::string_view> views;
+    ibex::Column<std::int64_t> ints;
+    ibex::Column<double> doubles;
+    ibex::Column<ibex::Date> dates;
+    ibex::Column<ibex::Decimal> decimals;
+    ibex::DecimalType decimal_type{};
+    /// Range-local rows that are null (or, for an inferred column, empty).
+    std::vector<std::uint32_t> invalid;
+    bool any_valid = false;
+    /// An inferred numeric column met a value that is no number at all; the
+    /// column is re-read as views in a second pass.
+    bool needs_text = false;
+    /// A declared type rejected a value; the whole read falls back to the
+    /// serial reader, which raises the error.
+    bool rejected = false;
+
+    void reserve(std::size_t rows) {
+        switch (mode) {
+            case CsvSinkMode::Views:
+                views.reserve(rows);
+                break;
+            case CsvSinkMode::InferInt:
+            case CsvSinkMode::Int:
+                ints.reserve(rows);
+                break;
+            case CsvSinkMode::InferDouble:
+            case CsvSinkMode::Double:
+                doubles.reserve(rows);
+                break;
+            case CsvSinkMode::Date:
+                dates.reserve(rows);
+                break;
+            case CsvSinkMode::Decimal:
+                decimals.reserve(rows);
+                break;
+        }
+    }
+
+    void push_invalid(std::uint32_t row) {
+        invalid.push_back(row);
+        switch (mode) {
+            case CsvSinkMode::InferInt:
+            case CsvSinkMode::Int:
+                ints.push_back(0);
+                break;
+            case CsvSinkMode::InferDouble:
+            case CsvSinkMode::Double:
+                doubles.push_back(0.0);
+                break;
+            case CsvSinkMode::Date:
+                dates.push_back(ibex::Date{});
+                break;
+            case CsvSinkMode::Decimal:
+                decimals.push_back(ibex::Decimal{});
+                break;
+            case CsvSinkMode::Views:
+                break;
+        }
+    }
+
+    /// Int64 -> Double in place. Exact with respect to the serial reader,
+    /// which would parse the same text as a double: both round the integer to
+    /// the nearest double.
+    void widen_to_double() {
+        doubles.reserve(ints.capacity());
+        for (std::size_t i = 0; i < ints.size(); ++i) {
+            doubles.push_back(static_cast<double>(ints[i]));
+        }
+        ints = {};
+        mode = CsvSinkMode::InferDouble;
+    }
+
+    void push(std::string_view sv, std::uint32_t row, const CsvNullSet& nulls) {
+        if (mode == CsvSinkMode::Views) {
+            views.push_back(sv);
+            return;
+        }
+        if (needs_text || rejected) {
+            return;
+        }
+        if (nulls.active() && nulls.is_null(sv)) {
+            push_invalid(row);
+            return;
+        }
+        switch (mode) {
+            case CsvSinkMode::InferInt: {
+                if (sv.empty()) {
+                    push_invalid(row);
+                    return;
+                }
+                std::int64_t iv{};
+                if (csv_try_int(sv, iv)) {
+                    ints.push_back(iv);
+                    any_valid = true;
+                    return;
+                }
+                double dv{};
+                if (csv_try_double(sv, dv)) {
+                    widen_to_double();
+                    doubles.push_back(dv);
+                    any_valid = true;
+                    return;
+                }
+                needs_text = true;
+                return;
+            }
+            case CsvSinkMode::InferDouble: {
+                if (sv.empty()) {
+                    push_invalid(row);
+                    return;
+                }
+                double dv{};
+                if (csv_try_double(sv, dv)) {
+                    doubles.push_back(dv);
+                    any_valid = true;
+                    return;
+                }
+                needs_text = true;
+                return;
+            }
+            case CsvSinkMode::Int: {
+                std::int64_t iv{};
+                rejected = !csv_try_int(sv, iv);
+                ints.push_back(iv);
+                return;
+            }
+            case CsvSinkMode::Double: {
+                double dv{};
+                rejected = !csv_try_double(sv, dv);
+                doubles.push_back(dv);
+                return;
+            }
+            case CsvSinkMode::Date: {
+                std::int32_t days{};
+                rejected = !csv_try_date(sv, days);
+                dates.push_back(ibex::Date{days});
+                return;
+            }
+            case CsvSinkMode::Decimal: {
+                auto units = ibex::decimal::parse(sv, decimal_type);
+                rejected = !units.has_value();
+                decimals.push_back(ibex::Decimal{units.value_or(ibex::Int128{})});
+                return;
+            }
+            case CsvSinkMode::Views:
+                return;
+        }
+    }
+};
+
+/// One range's rows, one sink per column. Views point into the source buffer,
+/// or into `escapes` for fields that held a `""`.
+struct CsvRangeRows {
+    std::vector<CsvColumnSink> sinks;
+    std::deque<std::string> escapes;
+    std::deque<std::string> reread_escapes;
+    std::size_t rows = 0;
+    bool consistent = true;
+};
+
+/// Parse the rows that START in [begin, range_end) into `out.sinks`. A row
+/// may run past `range_end` -- that is what `consistent` reports. Only the
+/// columns with `take[c]` set are stored.
+inline void csv_parse_range(const char* begin, const char* range_end, const char* file_end,
+                            char delim, std::size_t reserve_rows, const CsvNullSet& nulls,
+                            const std::vector<std::uint8_t>& take, CsvRangeRows& out) {
+    const std::size_t n_cols = out.sinks.size();
+    for (std::size_t c = 0; c < n_cols; ++c) {
+        if (take[c] != 0) {
+            out.sinks[c].reserve(reserve_rows);
+        }
+    }
+    std::vector<std::string_view> fields;
+    fields.reserve(n_cols);
+    const char* pos = begin;
+    const char* last_end = begin;
+    auto row = static_cast<std::uint32_t>(out.rows);
+    while (true) {
+        pos = csv_skip_blank_lines(pos, file_end);
+        if (pos >= range_end || !csv_parse_row(pos, file_end, delim, fields, out.escapes)) {
+            break;
+        }
+        last_end = pos;
+        const std::size_t row_cols = fields.size();
+        for (std::size_t c = 0; c < n_cols; ++c) {
+            if (take[c] != 0) {
+                out.sinks[c].push(c < row_cols ? fields[c] : std::string_view{}, row, nulls);
+            }
+        }
+        ++row;
+    }
+    out.rows = row;
+    out.consistent = last_end <= range_end;
+}
+
+/// Pick each column's sink from its declared type, or, for an inferred
+/// column, from the first rows: Int64 if every non-null, non-empty sampled
+/// value is an integer, Double if every one is a number, Views otherwise.
+/// A wrong guess costs time, never correctness: a numeric sink that meets
+/// text sends its column back through the views path.
+inline auto csv_choose_sinks(const char* body, const char* end, char delim,
+                             const std::vector<std::string_view>& first_row,
+                             const std::vector<CsvColumnKind>& hints, const CsvNullSet& nulls)
+    -> std::vector<CsvSinkMode> {
+    constexpr std::size_t kSampleRows = 1000;
+    const std::size_t n_cols = hints.size();
+    std::vector<std::uint8_t> all_int(n_cols, 1);
+    std::vector<std::uint8_t> all_double(n_cols, 1);
+    std::vector<std::uint8_t> any_valid(n_cols, 0);
+    const auto look = [&](const std::vector<std::string_view>& fields) {
+        for (std::size_t c = 0; c < n_cols; ++c) {
+            const auto sv = c < fields.size() ? fields[c] : std::string_view{};
+            if (sv.empty() || (nulls.active() && nulls.is_null(sv))) {
+                continue;
+            }
+            any_valid[c] = 1;
+            std::int64_t iv{};
+            double dv{};
+            if (all_int[c] != 0 && !csv_try_int(sv, iv)) {
+                all_int[c] = 0;
+            }
+            if (all_double[c] != 0 && !csv_try_double(sv, dv)) {
+                all_double[c] = 0;
+            }
+        }
+    };
+    look(first_row);
+    std::deque<std::string> escapes;
+    std::vector<std::string_view> fields;
+    const char* pos = body;
+    for (std::size_t r = 0; r < kSampleRows && csv_parse_row(pos, end, delim, fields, escapes);
+         ++r) {
+        look(fields);
+    }
+    std::vector<CsvSinkMode> modes(n_cols, CsvSinkMode::Views);
+    for (std::size_t c = 0; c < n_cols; ++c) {
+        switch (hints[c]) {
+            case CsvColumnKind::Int:
+                modes[c] = CsvSinkMode::Int;
+                break;
+            case CsvColumnKind::Double:
+                modes[c] = CsvSinkMode::Double;
+                break;
+            case CsvColumnKind::Date:
+                modes[c] = CsvSinkMode::Date;
+                break;
+            case CsvColumnKind::Decimal:
+                modes[c] = CsvSinkMode::Decimal;
+                break;
+            case CsvColumnKind::String:
+            case CsvColumnKind::Categorical:
+                break;
+            case CsvColumnKind::Infer:
+                if (any_valid[c] != 0 && all_int[c] != 0) {
+                    modes[c] = CsvSinkMode::InferInt;
+                } else if (any_valid[c] != 0 && all_double[c] != 0) {
+                    modes[c] = CsvSinkMode::InferDouble;
+                }
+                break;
+        }
+    }
+    return modes;
+}
+
+template <typename T>
+void csv_size_for_overwrite(ibex::Column<T>& column, std::size_t n) {
+    if constexpr (ibex::detail::overwrite_safe_v<T>) {
+        column.resize_for_overwrite(n);
+    } else {
+        column.resize(n);
+    }
+}
+
+/// Everything a parallel column build reads: per-range views and where each
+/// range starts in the column.
+struct CsvSegments {
+    std::vector<const std::vector<std::string_view>*> views;
+    std::vector<std::size_t> offsets;
+    std::size_t rows = 0;
+    std::size_t workers = 1;
+};
+
+/// A Categorical column built range by range: each range interns its own
+/// values in first-appearance order, then the dictionaries are merged in
+/// range order, which reproduces the serial first-appearance order exactly.
+/// `limit` caps the distinct count (0 = none); exceeding it returns nullopt.
+/// Rows flagged in `null_flags` take code 0 and add nothing, as in the serial
+/// reader.
+inline auto csv_build_categorical(const CsvSegments& seg, const std::uint8_t* null_flags,
+                                  std::size_t limit)
+    -> std::optional<ibex::Column<ibex::Categorical>> {
+    using code_type = ibex::Column<ibex::Categorical>::code_type;
+    // One dictionary per WORKER, over a contiguous run of ranges, not one per
+    // range: the merge below is serial and costs one insert per local entry,
+    // and a high-cardinality column repeats most of its values in every range.
+    // h2o's id3 (100k values) merged ~3M entries from 32 ranges; from 8
+    // groups it merges ~0.8M.
+    const std::size_t k = seg.views.size();
+    const std::size_t groups = std::min(k, std::max<std::size_t>(seg.workers, 1));
+    const auto group_begin = [&](std::size_t g) { return (k * g) / groups; };
+    ibex::Column<ibex::Categorical>::codes_storage codes;
+    codes.resize(seg.rows);
+    std::vector<std::vector<std::string_view>> local_dicts(groups);
+    std::atomic<bool> over{false};
+    csv_run_parallel(groups, seg.workers, [&](std::size_t g) {
+        robin_hood::unordered_flat_map<std::string_view, code_type> index;
+        auto& dict = local_dicts[g];
+        for (std::size_t r = group_begin(g); r < group_begin(g + 1); ++r) {
+            const auto& vals = *seg.views[r];
+            const std::size_t off = seg.offsets[r];
+            for (std::size_t i = 0; i < vals.size(); ++i) {
+                if (null_flags != nullptr && null_flags[off + i] != 0) {
+                    codes[off + i] = -1;
+                    continue;
+                }
+                const auto [it, inserted] =
+                    index.try_emplace(vals[i], static_cast<code_type>(dict.size()));
+                if (inserted) {
+                    dict.push_back(vals[i]);
+                    if (limit != 0 && dict.size() > limit) {
+                        over.store(true, std::memory_order_relaxed);
+                        return;
+                    }
+                }
+                codes[off + i] = it->second;
+            }
+        }
+    });
+    if (over.load()) {
+        return std::nullopt;
+    }
+    std::vector<std::string> dict;
+    robin_hood::unordered_flat_map<std::string_view, code_type> global;
+    global.reserve(local_dicts[0].size());
+    std::vector<std::vector<code_type>> remap(groups);
+    for (std::size_t g = 0; g < groups; ++g) {
+        remap[g].reserve(local_dicts[g].size());
+        for (const auto value : local_dicts[g]) {
+            const auto [it, inserted] =
+                global.try_emplace(value, static_cast<code_type>(dict.size()));
+            if (inserted) {
+                dict.emplace_back(value);
+                if (limit != 0 && dict.size() > limit) {
+                    return std::nullopt;
+                }
+            }
+            remap[g].push_back(it->second);
+        }
+    }
+    csv_run_parallel(k, seg.workers, [&](std::size_t r) {
+        std::size_t g = 0;
+        while (group_begin(g + 1) <= r) {
+            ++g;
+        }
+        const std::size_t off = seg.offsets[r];
+        const std::size_t n = seg.views[r]->size();
+        const auto& map = remap[g];
+        for (std::size_t i = 0; i < n; ++i) {
+            const code_type local = codes[off + i];
+            codes[off + i] = local < 0 ? 0 : map[static_cast<std::size_t>(local)];
+        }
+    });
+    return ibex::Column<ibex::Categorical>(std::move(dict), std::move(codes));
+}
+
+/// A String column built range by range and concatenated in order. Rows
+/// flagged in `null_flags` read as "".
+inline auto csv_build_strings(const CsvSegments& seg, const std::uint8_t* null_flags)
+    -> ibex::Column<std::string> {
+    const std::size_t k = seg.views.size();
+    std::vector<ibex::Column<std::string>> parts(k);
+    csv_run_parallel(k, seg.workers, [&](std::size_t r) {
+        const auto& vals = *seg.views[r];
+        const std::size_t off = seg.offsets[r];
+        auto& part = parts[r];
+        part.reserve(vals.size());
+        for (std::size_t i = 0; i < vals.size(); ++i) {
+            part.push_back(null_flags != nullptr && null_flags[off + i] != 0 ? std::string_view{}
+                                                                             : vals[i]);
+        }
+    });
+    ibex::Column<std::string> out = std::move(parts[0]);
+    for (std::size_t r = 1; r < k; ++r) {
+        out.append(parts[r]);
+    }
+    return out;
+}
+
+/// Parse every non-null row of a column straight into a pre-sized buffer.
+/// `parse(view, slot) -> bool`; a null row gets `null_value`. Returns false if
+/// any value fails, leaving the error to the serial reader.
+template <typename T, typename Parse>
+auto csv_build_fixed(const CsvSegments& seg, const std::uint8_t* null_flags, T null_value,
+                     ibex::Column<T>& out, const Parse& parse) -> bool {
+    csv_size_for_overwrite(out, seg.rows);
+    T* data = out.data();
+    std::atomic<bool> bad{false};
+    csv_run_parallel(seg.views.size(), seg.workers, [&](std::size_t r) {
+        const auto& vals = *seg.views[r];
+        const std::size_t off = seg.offsets[r];
+        for (std::size_t i = 0; i < vals.size(); ++i) {
+            if (null_flags != nullptr && null_flags[off + i] != 0) {
+                data[off + i] = null_value;
+                continue;
+            }
+            if (!parse(vals[i], data[off + i])) {
+                bad.store(true, std::memory_order_relaxed);
+                return;
+            }
+        }
+    });
+    return !bad.load();
+}
+
+/// The inference probe for one numeric type: every non-null value parses, or
+/// is empty (an empty field reads as null in an otherwise-numeric column).
+/// Mirrors the serial probe; `empties` gets the global rows that were empty.
+template <typename T, typename Parse>
+auto csv_probe_numeric(const CsvSegments& seg, const std::uint8_t* null_flags, ibex::Column<T>& out,
+                       std::vector<std::size_t>& empties, bool& any_valid, const Parse& parse)
+    -> bool {
+    const std::size_t k = seg.views.size();
+    csv_size_for_overwrite(out, seg.rows);
+    T* data = out.data();
+    std::atomic<bool> bad{false};
+    std::vector<std::uint8_t> valid_in(k, 0);
+    std::vector<std::vector<std::size_t>> empty_in(k);
+    csv_run_parallel(k, seg.workers, [&](std::size_t r) {
+        const auto& vals = *seg.views[r];
+        const std::size_t off = seg.offsets[r];
+        for (std::size_t i = 0; i < vals.size(); ++i) {
+            if (bad.load(std::memory_order_relaxed)) {
+                return;
+            }
+            if (null_flags != nullptr && null_flags[off + i] != 0) {
+                data[off + i] = T{};
+                continue;
+            }
+            if (vals[i].empty()) {
+                empty_in[r].push_back(off + i);
+                data[off + i] = T{};
+                continue;
+            }
+            if (!parse(vals[i], data[off + i])) {
+                bad.store(true, std::memory_order_relaxed);
+                return;
+            }
+            valid_in[r] = 1;
+        }
+    });
+    if (bad.load()) {
+        return false;
+    }
+    any_valid = std::ranges::any_of(valid_in, [](std::uint8_t v) { return v != 0; });
+    for (auto& e : empty_in) {
+        empties.insert(empties.end(), e.begin(), e.end());
+    }
+    return true;
+}
+
+/// Build one column from its per-range field views, with the serial
+/// reader's semantics, and add it to `table`. Returns false when a declared
+/// type rejects a value.
+inline auto csv_build_column_from_views(ibex::runtime::Table& table, const CsvSegments& seg,
+                                        const std::string& name, CsvColumnKind hint,
+                                        ibex::DecimalType decimal, const CsvNullSet& null_set)
+    -> bool {
+    const std::size_t n = seg.rows;
+    std::vector<std::uint8_t> null_flags;
+    ibex::runtime::ValidityBitmap validity;
+    bool has_nulls = false;
+    if (null_set.active()) {
+        null_flags.assign(n, 0);
+        std::atomic<bool> any{false};
+        csv_run_parallel(seg.views.size(), seg.workers, [&](std::size_t r) {
+            const auto& vals = *seg.views[r];
+            const std::size_t off = seg.offsets[r];
+            bool seen = false;
+            for (std::size_t i = 0; i < vals.size(); ++i) {
+                if (null_set.is_null(vals[i])) {
+                    null_flags[off + i] = 1;
+                    seen = true;
+                }
+            }
+            if (seen) {
+                any.store(true, std::memory_order_relaxed);
+            }
+        });
+        has_nulls = any.load();
+        if (has_nulls) {
+            validity.assign(n, true);
+            for (std::size_t i = 0; i < n; ++i) {
+                if (null_flags[i] != 0) {
+                    validity.set(i, false);
+                }
+            }
+        }
+    }
+    const std::uint8_t* nulls = has_nulls ? null_flags.data() : nullptr;
+    auto add = [&](auto&& column) {
+        if (has_nulls) {
+            table.add_column(name, std::forward<decltype(column)>(column), validity);
+        } else {
+            table.add_column(name, std::forward<decltype(column)>(column));
+        }
+    };
+
+    if (hint != CsvColumnKind::Infer) {
+        switch (hint) {
+            case CsvColumnKind::Int: {
+                ibex::Column<std::int64_t> col;
+                if (!csv_build_fixed<std::int64_t>(seg, nulls, 0, col, csv_try_int)) {
+                    return false;
+                }
+                add(std::move(col));
+                return true;
+            }
+            case CsvColumnKind::Double: {
+                ibex::Column<double> col;
+                if (!csv_build_fixed<double>(seg, nulls, 0.0, col, csv_try_double)) {
+                    return false;
+                }
+                add(std::move(col));
+                return true;
+            }
+            case CsvColumnKind::Decimal: {
+                ibex::Column<ibex::Decimal> col;
+                ibex::ColumnMeta meta;
+                meta.decimal = decimal;
+                col.set_meta(meta);
+                const bool ok = csv_build_fixed<ibex::Decimal>(
+                    seg, nulls, ibex::Decimal{}, col,
+                    [&](std::string_view sv, ibex::Decimal& slot) {
+                        auto units = ibex::decimal::parse(sv, decimal);
+                        if (!units) {
+                            return false;
+                        }
+                        slot = ibex::Decimal{*units};
+                        return true;
+                    });
+                if (!ok) {
+                    return false;
+                }
+                add(std::move(col));
+                return true;
+            }
+            case CsvColumnKind::Date: {
+                ibex::Column<ibex::Date> col;
+                const bool ok = csv_build_fixed<ibex::Date>(
+                    seg, nulls, ibex::Date{}, col, [](std::string_view sv, ibex::Date& slot) {
+                        std::int32_t days{};
+                        if (!csv_try_date(sv, days)) {
+                            return false;
+                        }
+                        slot = ibex::Date{days};
+                        return true;
+                    });
+                if (!ok) {
+                    return false;
+                }
+                add(std::move(col));
+                return true;
+            }
+            case CsvColumnKind::Categorical:
+                add(*csv_build_categorical(seg, nulls, 0));
+                return true;
+            case CsvColumnKind::String:
+            case CsvColumnKind::Infer:
+                add(csv_build_strings(seg, nulls));
+                return true;
+        }
+    }
+
+    // Inference, in the serial reader's order: Int64, then Double, then
+    // String -- Categorical when the column has no nulls and few enough
+    // distinct values.
+    const auto numeric = [&](auto& column, const auto& parse) -> bool {
+        std::vector<std::size_t> empties;
+        bool any_valid = false;
+        using T = typename std::decay_t<decltype(column)>::value_type;
+        if (!csv_probe_numeric<T>(seg, nulls, column, empties, any_valid, parse) || !any_valid) {
+            return false;
+        }
+        if (!empties.empty()) {
+            ibex::runtime::ValidityBitmap probe =
+                has_nulls ? validity : ibex::runtime::ValidityBitmap{};
+            if (!has_nulls) {
+                probe.assign(n, true);
+            }
+            for (const std::size_t row : empties) {
+                probe.set(row, false);
+            }
+            table.add_column(name, std::move(column), std::move(probe));
+        } else if (has_nulls) {
+            table.add_column(name, std::move(column), validity);
+        } else {
+            table.add_column(name, std::move(column));
+        }
+        return true;
+    };
+    if (n > 0) {
+        ibex::Column<std::int64_t> ints;
+        if (numeric(ints, csv_try_int)) {
+            return true;
+        }
+        ibex::Column<double> doubles;
+        if (numeric(doubles, csv_try_double)) {
+            return true;
+        }
+    }
+    if (has_nulls) {
+        add(csv_build_strings(seg, nulls));
+        return true;
+    }
+    if (n > 0) {
+        if (auto cat = csv_build_categorical(seg, nullptr, ibex::categorical_promotion_limit(n))) {
+            table.add_column(name, std::move(*cat));
+            return true;
+        }
+    }
+    table.add_column(name, csv_build_strings(seg, nullptr));
+    return true;
+}
+
+/// Concatenate one typed column out of the ranges' sinks into its final
+/// buffer, a range per task. `get(sink)` names the range's buffer.
+template <typename T, typename Get>
+auto csv_concat_sinks(const std::vector<CsvRangeRows>& ranges, std::size_t c,
+                      const std::vector<std::size_t>& offsets, std::size_t rows,
+                      std::size_t workers, const Get& get) -> ibex::Column<T> {
+    ibex::Column<T> out;
+    csv_size_for_overwrite(out, rows);
+    T* data = out.data();
+    csv_run_parallel(ranges.size(), workers, [&](std::size_t r) {
+        const CsvColumnSink& sink = ranges[r].sinks[c];
+        const auto& src = get(sink);
+        std::copy_n(src.data(), src.size(), data + offsets[r]);
+    });
+    return out;
+}
+
+/// The parallel read of the body [body, end), after the header and the first
+/// data row (`first_row`) have been parsed. Returns nullopt whenever the serial
+/// reader must run instead: too small, one core, a cut inside a quoted field,
+/// or a value a declared type rejects.
+inline auto csv_read_parallel(
+    const char* body, const char* end, const std::vector<std::string_view>& first_row,
+    std::size_t first_row_bytes, const std::vector<std::string>& col_names,
+    const std::vector<CsvColumnKind>& hints, const std::vector<ibex::DecimalType>& decimals,
+    const CsvReadOptions& options) -> std::optional<ibex::runtime::Table> {
+    const auto bytes = static_cast<std::size_t>(end - body);
+    if (bytes < csv_env_size("IBEX_CSV_PARALLEL_MIN_BYTES", kCsvParallelMinBytes) ||
+        std::getenv("IBEX_CSV_SERIAL") != nullptr) {
+        return std::nullopt;
+    }
+    const std::size_t workers = std::min(ibex::runtime::compute_thread_count(),
+                                         ibex::runtime::process_worker_pool().size());
+    if (workers < 2) {
+        return std::nullopt;
+    }
+    const std::size_t n_cols = col_names.size();
+    const CsvNullSet null_set(options);
+    const auto modes = csv_choose_sinks(body, end, options.delimiter, first_row, hints, null_set);
+
+    // A few ranges per worker, so one dense range cannot strand the rest.
+    const std::size_t range_bytes = std::max<std::size_t>(
+        csv_env_size("IBEX_CSV_PARALLEL_RANGE_BYTES", kCsvParallelMinRangeBytes), 1);
+    const std::size_t parts = std::clamp<std::size_t>(bytes / range_bytes, 1, workers * 4);
+    const auto cuts = csv_split_ranges(body, end, parts);
+    std::vector<CsvRangeRows> ranges(cuts.size());
+    for (auto& range : ranges) {
+        range.sinks.resize(n_cols);
+        for (std::size_t c = 0; c < n_cols; ++c) {
+            range.sinks[c].mode = modes[c];
+            range.sinks[c].decimal_type = decimals[c];
+        }
+    }
+    const std::vector<std::uint8_t> take_all(n_cols, 1);
+    // The first data row was parsed to learn the column count; it leads range 0.
+    for (std::size_t c = 0; c < n_cols; ++c) {
+        ranges[0].sinks[c].push(c < first_row.size() ? first_row[c] : std::string_view{}, 0,
+                                null_set);
+    }
+    ranges[0].rows = 1;
+    const std::size_t row_bytes = std::max<std::size_t>(first_row_bytes, 1);
+    const auto reserve_for = [&](std::size_t r) {
+        const auto span = static_cast<std::size_t>(cuts[r].second - cuts[r].first) / row_bytes;
+        return span + span / 8 + 16;
+    };
+    csv_run_parallel(cuts.size(), workers, [&](std::size_t r) {
+        csv_parse_range(cuts[r].first, cuts[r].second, end, options.delimiter, reserve_for(r),
+                        null_set, take_all, ranges[r]);
+    });
+
+    std::vector<std::size_t> offsets(ranges.size());
+    std::size_t rows = 0;
+    for (std::size_t r = 0; r < ranges.size(); ++r) {
+        if (!ranges[r].consistent) {
+            return std::nullopt;
+        }
+        offsets[r] = rows;
+        rows += ranges[r].rows;
+    }
+
+    // Per column: a declared type that rejected a value sends the whole read
+    // to the serial path; an inferred numeric that met text, or that saw no
+    // value at all, is re-read as views and built like any text column.
+    std::vector<std::uint8_t> reread(n_cols, 0);
+    for (std::size_t c = 0; c < n_cols; ++c) {
+        if (modes[c] == CsvSinkMode::Views) {
+            continue;
+        }
+        bool any_valid = false;
+        for (const auto& range : ranges) {
+            const auto& sink = range.sinks[c];
+            if (sink.rejected) {
+                return std::nullopt;
+            }
+            reread[c] |= sink.needs_text ? 1U : 0U;
+            any_valid = any_valid || sink.any_valid;
+        }
+        const bool inferred =
+            modes[c] == CsvSinkMode::InferInt || modes[c] == CsvSinkMode::InferDouble;
+        if (inferred && !any_valid) {
+            reread[c] = 1;
+        }
+    }
+    if (std::ranges::any_of(reread, [](std::uint8_t v) { return v != 0; })) {
+        for (auto& range : ranges) {
+            for (std::size_t c = 0; c < n_cols; ++c) {
+                if (reread[c] != 0) {
+                    range.sinks[c] = CsvColumnSink{};  // Views
+                }
+            }
+        }
+        csv_run_parallel(cuts.size(), workers, [&](std::size_t r) {
+            auto& range = ranges[r];
+            CsvRangeRows views;
+            views.sinks.resize(n_cols);
+            if (r == 0) {
+                for (std::size_t c = 0; c < n_cols; ++c) {
+                    if (reread[c] != 0) {
+                        views.sinks[c].views.push_back(c < first_row.size() ? first_row[c]
+                                                                            : std::string_view{});
+                    }
+                }
+                views.rows = 1;
+            }
+            csv_parse_range(cuts[r].first, cuts[r].second, end, options.delimiter, reserve_for(r),
+                            null_set, reread, views);
+            for (std::size_t c = 0; c < n_cols; ++c) {
+                if (reread[c] != 0) {
+                    range.sinks[c].views = std::move(views.sinks[c].views);
+                }
+            }
+            // Escaped fields of the re-read point into its own storage. Moving
+            // the deque keeps every element where it is; moving the strings out
+            // one by one would not (a short string's bytes live inside it).
+            range.reread_escapes = std::move(views.escapes);
+        });
+    }
+
+    ibex::runtime::Table table;
+    for (std::size_t c = 0; c < n_cols; ++c) {
+        const auto mode = ranges[0].sinks[c].mode;
+        const auto& name = col_names[c];
+        if (mode == CsvSinkMode::Views) {
+            CsvSegments seg;
+            seg.workers = workers;
+            for (std::size_t r = 0; r < ranges.size(); ++r) {
+                seg.views.push_back(&ranges[r].sinks[c].views);
+                seg.offsets.push_back(offsets[r]);
+            }
+            seg.rows = rows;
+            if (!csv_build_column_from_views(table, seg, name, hints[c], decimals[c], null_set)) {
+                return std::nullopt;
+            }
+            continue;
+        }
+        // Typed sinks: the invalid rows (nulls, and an inferred column's
+        // empties) are the validity, exactly as the serial reader assembles it.
+        ibex::runtime::ValidityBitmap validity;
+        bool any_invalid = false;
+        for (std::size_t r = 0; r < ranges.size(); ++r) {
+            const auto& invalid = ranges[r].sinks[c].invalid;
+            if (invalid.empty()) {
+                continue;
+            }
+            if (!any_invalid) {
+                validity.assign(rows, true);
+                any_invalid = true;
+            }
+            for (const auto local : invalid) {
+                validity.set(offsets[r] + local, false);
+            }
+        }
+        auto add = [&](auto&& column) {
+            if (any_invalid) {
+                table.add_column(name, std::forward<decltype(column)>(column), std::move(validity));
+            } else {
+                table.add_column(name, std::forward<decltype(column)>(column));
+            }
+        };
+        const bool widened = std::ranges::any_of(ranges, [&](const CsvRangeRows& r) {
+            return r.sinks[c].mode == CsvSinkMode::InferDouble;
+        });
+        switch (mode) {
+            case CsvSinkMode::InferInt:
+            case CsvSinkMode::InferDouble:
+                if (widened) {
+                    for (auto& range : ranges) {
+                        if (range.sinks[c].mode == CsvSinkMode::InferInt) {
+                            range.sinks[c].widen_to_double();
+                        }
+                    }
+                    add(csv_concat_sinks<double>(
+                        ranges, c, offsets, rows, workers,
+                        [](const CsvColumnSink& s) -> const auto& { return s.doubles; }));
+                } else {
+                    add(csv_concat_sinks<std::int64_t>(
+                        ranges, c, offsets, rows, workers,
+                        [](const CsvColumnSink& s) -> const auto& { return s.ints; }));
+                }
+                break;
+            case CsvSinkMode::Int:
+                add(csv_concat_sinks<std::int64_t>(
+                    ranges, c, offsets, rows, workers,
+                    [](const CsvColumnSink& s) -> const auto& { return s.ints; }));
+                break;
+            case CsvSinkMode::Double:
+                add(csv_concat_sinks<double>(
+                    ranges, c, offsets, rows, workers,
+                    [](const CsvColumnSink& s) -> const auto& { return s.doubles; }));
+                break;
+            case CsvSinkMode::Date:
+                add(csv_concat_sinks<ibex::Date>(
+                    ranges, c, offsets, rows, workers,
+                    [](const CsvColumnSink& s) -> const auto& { return s.dates; }));
+                break;
+            case CsvSinkMode::Decimal: {
+                auto col = csv_concat_sinks<ibex::Decimal>(
+                    ranges, c, offsets, rows, workers,
+                    [](const CsvColumnSink& s) -> const auto& { return s.decimals; });
+                ibex::ColumnMeta meta;
+                meta.decimal = decimals[c];
+                col.set_meta(meta);
+                add(std::move(col));
+                break;
+            }
+            case CsvSinkMode::Views:
+                break;
+        }
+        // Free this column's range buffers before building the next one.
+        for (auto& range : ranges) {
+            range.sinks[c] = CsvColumnSink{};
+        }
+    }
+    csv_parallel_reads.fetch_add(1, std::memory_order_relaxed);
+    return table;
+}
+
 inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& options)
     -> ibex::runtime::Table {
     auto local = resolve_csv_path(path);
@@ -927,23 +1922,6 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
         col_names.reserve(row_buf.size());
         for (auto sv : row_buf) {
             col_names.emplace_back(sv);
-        }
-    }
-
-    // Cheap newline count for row reservation.  Quoted newlines are rare
-    // enough that this is a fine upper bound.
-    std::size_t row_estimate = 0;
-    {
-        const char* scan = pos;
-        while (scan < end) {
-            const char* nl = static_cast<const char*>(
-                std::memchr(scan, '\n', static_cast<std::size_t>(end - scan)));
-            if (nl == nullptr) {
-                ++row_estimate;
-                break;
-            }
-            ++row_estimate;
-            scan = nl + 1;
         }
     }
 
@@ -978,7 +1956,9 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
     };
 
     std::vector<std::string_view> first_row;
+    const char* first_row_start = pos;
     bool has_first_row = csv_parse_row(pos, end, options.delimiter, row_buf, escape_storage);
+    const auto first_row_bytes = static_cast<std::size_t>(pos - first_row_start);
     if (has_first_row) {
         first_row = row_buf;
         if (!options.has_header) {
@@ -1009,6 +1989,36 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
     }
 
     const bool need_null_check = options.null_if_empty || !options.null_tokens.empty();
+
+    if (has_first_row) {
+        std::vector<ibex::DecimalType> decimals;
+        decimals.reserve(n_cols);
+        for (std::size_t c = 0; c < n_cols; ++c) {
+            decimals.push_back(resolve_decimal(c, col_names[c]));
+        }
+        if (auto table = csv_read_parallel(pos, end, first_row, first_row_bytes, col_names,
+                                           resolved_hints, decimals, options)) {
+            return std::move(*table);
+        }
+    }
+
+    // Cheap newline count for row reservation.  Quoted newlines are rare
+    // enough that this is a fine upper bound. Counted only here, after the
+    // parallel path declined: it is a serial pass over the whole file.
+    std::size_t row_estimate = 0;
+    {
+        const char* scan = pos;
+        while (scan < end) {
+            const char* nl = static_cast<const char*>(
+                std::memchr(scan, '\n', static_cast<std::size_t>(end - scan)));
+            if (nl == nullptr) {
+                ++row_estimate;
+                break;
+            }
+            ++row_estimate;
+            scan = nl + 1;
+        }
+    }
 
     if (has_first_row && all_hints_known && !need_null_check) {
         struct CsvSchemaColumnBuilder {

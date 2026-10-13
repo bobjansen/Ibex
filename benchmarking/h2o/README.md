@@ -114,3 +114,28 @@ cross-engine check.
   | G1_1e7_1e1_0_0 | q10 | 1992 | 210 | 245 |
   | G1_1e7_2e0_0_0 | q8 | 22070 | 3143 | 191 |
   | G1_1e7_2e0_0_0 | q10 | 1182 | 212 | 246 |
+
+## Results: 2026-10-13, dev box, 1 core, 1e7 rows
+
+Same build and engine versions. Raw data is in
+`results/h2o_20261013T080556_1t.tsv`. All 60 cells completed and verified.
+Part of the run overlapped a short profiling session on cores 12–23. That
+session was off the benchmark's core, but memory bandwidth is shared.
+
+| data | ibex/polars geomean | ibex/duckdb geomean | ibex/polars total |
+|---|---:|---:|---:|
+| J1_1e7_NA_0_0 (join) | 1.33 | 0.26 | 1.18 |
+| G1_1e7_1e2_0_0 | 1.23 | 1.30 | 3.27 |
+| G1_1e7_1e1_0_0 | 1.19 | 1.35 | 4.29 |
+| G1_1e7_2e0_0_0 | 1.50 | 1.65 | 4.11 |
+| G1_1e7_1e2_5_0 (NAs) | 0.98 | 1.16 | 2.39 |
+| G1_1e7_1e2_0_1 (sorted) | 1.26 | 1.36 | 3.06 |
+
+- The losing questions are the same as at 8 cores: q4, q5, q8, q9 and q10, plus
+  q3/q7 at 5e6 groups. Per-core, the gaps are smaller than at 8 cores
+  (G1_1e7_1e2_0_0 geomean 1.23 vs 1.48), so part of the 8-core deficit is
+  parallel scaling.
+- q8 takes the same time at 1 and 8 cores (2.0 s / 2.1 s at K=1e2, 8.8 s /
+  8.6 s at K=1e1). It runs serially when the key is not Categorical.
+- The join gap to Polars narrows to 1.33 per-core. Ibex wins q4, the string
+  key join, and stays well ahead of DuckDB (0.26).

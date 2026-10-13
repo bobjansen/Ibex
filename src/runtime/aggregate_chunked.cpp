@@ -1917,6 +1917,13 @@ class HashAggregateState final {
             return 0;
         };
 
+        // A key whose values span few cells next to the rows (`by id4` over
+        // 100 ids) is indexed like a Categorical code, `key - min`: no hash,
+        // and the morsel partials fan out even when the input is one chunk.
+        if (try_process_rows_int_dense(key_at, agg_entries, rows)) {
+            return std::nullopt;
+        }
+
         // The q18 shape (one Int64 key and one Int64 or Double sum) is a streaming sink,
         // not a sequence of per-chunk fork/join pipelines. Each chunk becomes
         // one independent hot-table task; the caller immediately pulls the
@@ -3636,6 +3643,144 @@ class HashAggregateState final {
             gids[row] = gid;
         }
 
+        publish_discovered(agg_entries, rows);
+        return true;
+    }
+
+    /// Group a single integer key through a flat `key - min` -> gid array.
+    /// Returns false when the key's span is too wide, leaving the caller on
+    /// its hash paths.
+    ///
+    /// It starts only on the first chunk, and only when the span is at most a
+    /// quarter of the rows: the array is then denser than the data, and the
+    /// hash paths it displaces (async hot sum, owned and partitioned
+    /// discovery) all assume they start from no groups. Later chunks widen
+    /// the bounds the way the pair path does -- rebuild from `int_order_`,
+    /// gids unchanged -- up to `kDenseCellLimit`. Past that it retires for
+    /// good: partitioned discovery seeds from `int_order_` and the serial loop
+    /// rebuilds `int_index_` from it (`int_serial_groups_` no longer matches),
+    /// and neither may be followed by this path again, since it would not see
+    /// the groups they add.
+    /// Min and max of an integer key over `rows`, in pieces on the pool when
+    /// the dense fan-out may run: over one 10M-row chunk the serial scan was
+    /// a third of the whole aggregate.
+    template <typename KeyAt>
+    auto int_key_bounds(const KeyAt& key_at, std::size_t rows)
+        -> std::pair<std::int64_t, std::int64_t> {
+        const auto scan = [&](std::size_t begin, std::size_t end) {
+            std::int64_t lo = key_at(begin);
+            std::int64_t hi = lo;
+            for (std::size_t row = begin + 1; row < end; ++row) {
+                const std::int64_t v = key_at(row);
+                lo = std::min(lo, v);
+                hi = std::max(hi, v);
+            }
+            return std::pair{lo, hi};
+        };
+        const std::size_t pieces = morsel_cut_from_rows(rows);
+        const std::size_t threads =
+            exec_ != nullptr && par_.accumulation.decline == physical::FanOutDecline::None
+                ? std::min(pieces, par_.accumulation.worker_cap)
+                : std::size_t{1};
+        if (threads < 2 || on_worker_pool_thread()) {
+            return scan(0, rows);
+        }
+        const std::size_t grain = (rows + pieces - 1) / pieces;
+        std::vector<std::pair<std::int64_t, std::int64_t>> parts(pieces, scan(0, 1));
+        std::atomic<std::size_t> cursor{0};
+        auto batch = process_worker_pool().submit(threads, [&](std::size_t) {
+            for (std::size_t m = cursor.fetch_add(1, std::memory_order_relaxed); m < pieces;
+                 m = cursor.fetch_add(1, std::memory_order_relaxed)) {
+                const std::size_t begin = m * grain;
+                const std::size_t end = std::min(rows, begin + grain);
+                if (begin < end) {
+                    parts[m] = scan(begin, end);
+                }
+            }
+        });
+        batch.wait();
+        auto bounds = parts[0];
+        for (const auto& [lo, hi] : parts) {
+            bounds.first = std::min(bounds.first, lo);
+            bounds.second = std::max(bounds.second, hi);
+        }
+        return bounds;
+    }
+
+    template <typename KeyAt>
+    auto try_process_rows_int_dense(const KeyAt& key_at,
+                                    const std::vector<const ColumnEntry*>& agg_entries,
+                                    std::size_t rows) -> bool {
+        if (int_dense_retired_ || rows == 0) {
+            return false;
+        }
+        if (!int_dense_active_ && (n_groups_ > 0 || partitioned_active_ || owned_mode_ ||
+                                   std::getenv("IBEX_DISABLE_INT_DENSE_KEY") != nullptr)) {
+            int_dense_retired_ = true;
+            return false;
+        }
+        auto [lo, hi] = int_key_bounds(key_at, rows);
+        if (int_dense_active_) {
+            lo = std::min(lo, int_dense_min_);
+            hi = std::max(hi, int_dense_max_);
+        }
+        // Unsigned, so a span straddling zero cannot overflow; a span of the
+        // whole int64 range wraps to 0 and is rejected with the rest.
+        const std::uint64_t span =
+            static_cast<std::uint64_t>(hi) - static_cast<std::uint64_t>(lo) + 1;
+        const bool fits = span != 0 && span <= kDenseCellLimit &&
+                          (int_dense_active_ || span * kIntDenseRowsPerCell <= rows);
+        if (!fits) {
+            int_dense_retired_ = true;
+            return false;
+        }
+        const auto n_cells = static_cast<std::size_t>(span);
+        if (!int_dense_active_ || lo != int_dense_min_) {
+            int_dense_gid_.assign(n_cells, kNoGid);
+            for (std::size_t g = 0; g < int_order_.size(); ++g) {
+                int_dense_gid_[static_cast<std::size_t>(int_order_[g] - lo)] =
+                    static_cast<std::uint32_t>(g);
+            }
+            int_dense_active_ = true;
+        } else if (int_dense_gid_.size() < n_cells) {
+            int_dense_gid_.resize(n_cells, kNoGid);
+        }
+        int_dense_min_ = lo;
+        int_dense_max_ = hi;
+
+        const auto new_group = [&](std::size_t cell) {
+            const std::uint32_t gid = alloc_group();
+            int_order_.push_back(lo + static_cast<std::int64_t>(cell));
+            return gid;
+        };
+        const std::size_t morsels = dense_morsel_count(n_cells, rows);
+        if (morsels != 0 && aggs_are_slot_combinable()) {
+            int_dense_cells_.resize(rows);
+            auto* cells = int_dense_cells_.data();
+            run_dense_fused(
+                cells, n_cells, agg_entries, rows, int_dense_gid_, morsels,
+                [&](std::size_t begin, std::size_t end) {
+                    // On the morsel's own worker, into its own slice.
+                    for (std::size_t row = begin; row < end; ++row) {
+                        cells[row] = static_cast<std::uint32_t>(key_at(row) - lo);
+                    }
+                },
+                new_group);
+            publish_fused_accumulation();
+            return true;
+        }
+
+        gids_buf_.resize(rows);
+        auto* gids = gids_buf_.data();
+        for (std::size_t row = 0; row < rows; ++row) {
+            const auto cell = static_cast<std::size_t>(key_at(row) - lo);
+            std::uint32_t gid = int_dense_gid_[cell];
+            if (gid == kNoGid) {
+                gid = new_group(cell);
+                int_dense_gid_[cell] = gid;
+            }
+            gids[row] = gid;
+        }
         publish_discovered(agg_entries, rows);
         return true;
     }
@@ -7060,6 +7205,16 @@ class HashAggregateState final {
     // Cartesian cell-space size below which multi-key grouping uses a dense
     // array (one load per row) instead of hashing. 4M cells = 16 MB of u32.
     static constexpr std::uint64_t kDenseCellLimit = 4'000'000ULL;
+
+    // Single-integer dense path (`try_process_rows_int_dense`): `key - min`
+    // indexes `int_dense_gid_`; `int_order_` stays the key of each group.
+    static constexpr std::uint64_t kIntDenseRowsPerCell = 4;
+    bool int_dense_active_ = false;
+    bool int_dense_retired_ = false;
+    std::int64_t int_dense_min_ = 0;
+    std::int64_t int_dense_max_ = 0;
+    std::vector<std::uint32_t> int_dense_gid_;
+    std::vector<std::uint32_t> int_dense_cells_;
 
     // Single-Categorical fast path: code → gid via direct array (codes are a
     // dense [0, dict_size) index, so no hashing is needed).

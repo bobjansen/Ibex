@@ -1733,7 +1733,9 @@ TEST_CASE("Aggregate Accumulation consumes its structural-node worker ceiling",
     groups.reserve(kRows);
     values.reserve(kRows);
     for (std::int64_t row = 0; row < kRows; ++row) {
-        groups.push_back(row % 8);
+        // Eight keys spread wider than the dense array takes, so the groups
+        // come from hash discovery and Accumulation is a separate node.
+        groups.push_back((row % 8) * 1'000'003);
         values.push_back(static_cast<double>(row % 97));
     }
     input.add_column("g", std::move(groups));

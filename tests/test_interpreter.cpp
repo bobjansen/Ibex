@@ -1693,6 +1693,105 @@ TEST_CASE("Interpret packed-key aggregate groups mixed Categorical and Int64 key
     CHECK((*n)[3] == 1);
 }
 
+TEST_CASE("Interpret packed-key aggregate emits Categorical keys by code with null keys") {
+    // Two Categorical keys sharing ONE dictionary across chunks, plus an Int64
+    // so the packed path (not the all-Categorical one) takes it: the stored
+    // codes are valid against the output column's dictionary, so emission
+    // writes codes instead of re-interning text. The later chunk's null on
+    // `a` migrates the aggregate to the generic path; the codes must survive
+    // that and the null group must still come out null.
+    auto dict = std::make_shared<std::vector<std::string>>(std::vector<std::string>{"p", "q", "r"});
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("cat_codes_packed", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        auto first = make_cat_chunk("a", dict, {2, 0, 2});
+        add_cat_column(first, "b", dict, {1, 1, 1});
+        add_int_column(first, "c", {0, 2, 0});
+        chunks.push_back(std::move(first));
+        auto later = make_cat_chunk("a", dict, {0, 2});
+        add_cat_column(later, "b", dict, {1, 1});
+        add_int_column(later, "c", {2, 0});
+        later.columns[0].validity = runtime::ValidityBitmap{true, false};
+        chunks.push_back(std::move(later));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn cat_codes_packed() -> DataFrame from \"x.hpp\"; "
+        "cat_codes_packed()[select { n = count() }, by { a, b, c }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    if (!result.has_value()) {
+        FAIL(result.error());
+    }
+
+    const auto* a = std::get_if<Column<Categorical>>(result->find("a"));
+    const auto* b = std::get_if<Column<Categorical>>(result->find("b"));
+    const auto* c = std::get_if<Column<std::int64_t>>(result->find("c"));
+    const auto* n = std::get_if<Column<std::int64_t>>(result->find("n"));
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    REQUIRE(c != nullptr);
+    REQUIRE(n != nullptr);
+    REQUIRE(a->size() == 3);
+    CHECK((*a)[0] == "r");
+    CHECK((*b)[0] == "q");
+    CHECK((*c)[0] == 0);
+    CHECK((*n)[0] == 2);
+    CHECK((*a)[1] == "p");
+    CHECK((*c)[1] == 2);
+    CHECK((*n)[1] == 2);
+    CHECK_FALSE(runtime::is_null(*result->find_entry("a"), 0));
+    CHECK(runtime::is_null(*result->find_entry("a"), 2));
+    CHECK((*b)[2] == "q");
+    CHECK((*c)[2] == 0);
+    CHECK((*n)[2] == 1);
+}
+
+TEST_CASE("Interpret three-Categorical-key aggregate migrates a null key from a later chunk") {
+    // Three Categorical keys select the all-Categorical path, but the 3+ key
+    // packed probe used to fire as well. A later chunk's null migrated the
+    // Categorical path and then fell into the packed one, which cannot hold a
+    // null key: the query failed with "gained nulls across chunks".
+    auto dict = std::make_shared<std::vector<std::string>>(std::vector<std::string>{"p", "q", "r"});
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("late_null_three_cats", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        auto first = make_cat_chunk("a", dict, {2, 0});
+        add_cat_column(first, "b", dict, {1, 1});
+        add_cat_column(first, "c", dict, {0, 2});
+        chunks.push_back(std::move(first));
+        auto later = make_cat_chunk("a", dict, {0, 2});
+        add_cat_column(later, "b", dict, {1, 1});
+        add_cat_column(later, "c", dict, {2, 0});
+        later.columns[0].validity = runtime::ValidityBitmap{true, false};
+        chunks.push_back(std::move(later));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn late_null_three_cats() -> DataFrame from \"x.hpp\"; "
+        "late_null_three_cats()[select { n = count() }, by { a, b, c }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    if (!result.has_value()) {
+        FAIL(result.error());
+    }
+    const auto* a = std::get_if<Column<Categorical>>(result->find("a"));
+    const auto* n = std::get_if<Column<std::int64_t>>(result->find("n"));
+    REQUIRE(a != nullptr);
+    REQUIRE(n != nullptr);
+    REQUIRE(a->size() == 3);
+    CHECK((*a)[0] == "r");
+    CHECK((*n)[0] == 1);
+    CHECK((*a)[1] == "p");
+    CHECK((*n)[1] == 2);
+    CHECK(runtime::is_null(*result->find_entry("a"), 2));
+    CHECK((*n)[2] == 1);
+}
+
 // Dates far enough apart that the cell product blows the dense budget must fall
 // back to the hash path and still group correctly.
 TEST_CASE("Interpret group-by on Categorical and Date falls back when the key domain is huge") {

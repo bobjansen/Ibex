@@ -521,8 +521,10 @@ class GroupKeyStore {
                         col.put_double(gid, column[row], size());
                     } else if constexpr (std::is_same_v<C, Column<bool>>) {
                         col.put_int(Kind::Bool, gid, column[row] ? 1 : 0, size());
-                    } else if constexpr (std::is_same_v<C, Column<std::string>> ||
-                                         std::is_same_v<C, Column<Categorical>>) {
+                    } else if constexpr (std::is_same_v<C, Column<Categorical>>) {
+                        col.put_cat(gid, std::string_view{column[row]}, column.code_at(row),
+                                    column.dictionary_ptr().get(), size());
+                    } else if constexpr (std::is_same_v<C, Column<std::string>>) {
                         col.put_text(gid, std::string_view{column[row]}, size());
                     } else if constexpr (std::is_same_v<C, Column<Date>>) {
                         col.put_int(Kind::Date, gid, column[row].days, size());
@@ -577,6 +579,34 @@ class GroupKeyStore {
 
     [[nodiscard]] auto null_mask(std::size_t gid) const noexcept -> std::uint64_t {
         return null_masks_[gid];
+    }
+
+    /// How emission may read key column `c` without boxing each group.
+    enum class IntCells : std::uint8_t { None, Int64, Date, Ts };
+    [[nodiscard]] auto int_cells(std::size_t c) const -> std::pair<IntCells, const std::int64_t*> {
+        const Col& col = cols_[c];
+        switch (col.kind) {
+            case Kind::Int64:
+                return {IntCells::Int64, col.ints.data()};
+            case Kind::Date:
+                return {IntCells::Date, col.ints.data()};
+            case Kind::Ts:
+                return {IntCells::Ts, col.ints.data()};
+            default:
+                return {IntCells::None, nullptr};
+        }
+    }
+
+    /// Every group's code for Categorical key column `c`, or nullptr unless
+    /// all of them were recorded against `dict`.
+    [[nodiscard]] auto cat_codes_against(std::size_t c, const void* dict) const
+        -> const Column<Categorical>::code_type* {
+        const Col& col = cols_[c];
+        if (col.kind != Kind::Text || !col.codes_usable || col.code_dict == nullptr ||
+            col.code_dict != dict || col.cat_codes.size() < size()) {
+            return nullptr;
+        }
+        return col.cat_codes.data();
     }
 
     /// `hash_key_value` of the group's key, without building it.
@@ -873,8 +903,16 @@ class GroupKeyStore {
                     }
                     col.claim(Kind::Text, groups);
                     col.chars.reserve(col.chars.size() + bytes);
-                    for (std::size_t n = 0; n < rows.size(); ++n) {
-                        col.put_text(first + n, std::string_view{column[rows[n]]}, groups);
+                    if constexpr (std::is_same_v<C, Column<Categorical>>) {
+                        const void* dict = column.dictionary_ptr().get();
+                        for (std::size_t n = 0; n < rows.size(); ++n) {
+                            col.put_cat(first + n, std::string_view{column[rows[n]]},
+                                        column.code_at(rows[n]), dict, groups);
+                        }
+                    } else {
+                        for (std::size_t n = 0; n < rows.size(); ++n) {
+                            col.put_text(first + n, std::string_view{column[rows[n]]}, groups);
+                        }
                     }
                 } else if constexpr (std::is_same_v<C, Column<Date>>) {
                     col.claim(Kind::Date, groups);
@@ -928,6 +966,16 @@ class GroupKeyStore {
         std::vector<char> chars;
         std::vector<Int128> units;
         std::vector<DecimalType> decimal_types;
+        /// A Categorical key's code next to its text, against `code_dict`, so
+        /// emission can write codes into the output column (which shares the
+        /// input's dictionary) instead of re-interning every group's text --
+        /// a string hash per group per key column, serial per column, that
+        /// was most of h2o q10's emission at 10M groups. `codes_usable` drops
+        /// for good the first time a group's text arrives without a code
+        /// against that same dictionary.
+        std::vector<Column<Categorical>::code_type> cat_codes;
+        const void* code_dict = nullptr;
+        bool codes_usable = true;
 
         [[nodiscard]] auto text(std::size_t gid) const -> std::string_view {
             return {chars.data() + text_offsets[gid], text_lengths[gid]};
@@ -947,6 +995,9 @@ class GroupKeyStore {
                 case Kind::Text:
                     text_offsets.resize(n);
                     text_lengths.resize(n);
+                    if (codes_usable) {
+                        cat_codes.resize(n);
+                    }
                     break;
                 case Kind::Dec:
                     units.resize(n);
@@ -979,10 +1030,33 @@ class GroupKeyStore {
             doubles[gid] = value;
         }
         void put_text(std::size_t gid, std::string_view value, std::size_t groups) {
+            write_text(gid, value, groups);
+            drop_codes();
+        }
+        void put_cat(std::size_t gid, std::string_view value, Column<Categorical>::code_type code,
+                     const void* dict, std::size_t groups) {
+            write_text(gid, value, groups);
+            if (!codes_usable) {
+                return;
+            }
+            if (code_dict == nullptr) {
+                code_dict = dict;
+            }
+            if (code_dict != dict) {
+                drop_codes();
+                return;
+            }
+            cat_codes[gid] = code;
+        }
+        void write_text(std::size_t gid, std::string_view value, std::size_t groups) {
             claim(Kind::Text, groups);
             text_offsets[gid] = chars.size();
             text_lengths[gid] = static_cast<std::uint32_t>(value.size());
             chars.insert(chars.end(), value.begin(), value.end());
+        }
+        void drop_codes() {
+            codes_usable = false;
+            cat_codes = {};
         }
         void put_decimal(std::size_t gid, Int128 value, DecimalType type, std::size_t groups) {
             claim(Kind::Dec, groups);
@@ -1002,7 +1076,11 @@ class GroupKeyStore {
                     put_double(to, src.doubles[from], groups);
                     break;
                 case Kind::Text:
-                    put_text(to, src.text(from), groups);
+                    if (src.codes_usable && src.code_dict != nullptr) {
+                        put_cat(to, src.text(from), src.cat_codes[from], src.code_dict, groups);
+                    } else {
+                        put_text(to, src.text(from), groups);
+                    }
                     break;
                 case Kind::Dec:
                     put_decimal(to, src.units[from], src.decimal_types[from], groups);
@@ -1592,9 +1670,17 @@ class HashAggregateState final {
                 // migrates to the generic path below.
                 encoder_.size_cells_from_data =
                     std::getenv("IBEX_DISABLE_RANGED_PACKED_KEY") == nullptr;
-                packed_fast_path_ = encoder_.size_cells_from_data
-                                        ? PackedKeyEncoder::packable_shape(group_entries)
-                                        : encoder_.build_packed_key(group_entries).has_value();
+                //
+                // Not when `cat_fast_path_` already owns the shape (three or
+                // more Categoricals). It dispatches first, so the packed flag
+                // only mattered once a later chunk's null migrated the
+                // Categorical path -- and then, still set, it sent that chunk
+                // to the packed path, which cannot hold a null key and failed
+                // the query with "gained nulls across chunks".
+                packed_fast_path_ =
+                    !cat_fast_path_ && (encoder_.size_cells_from_data
+                                            ? PackedKeyEncoder::packable_shape(group_entries)
+                                            : encoder_.build_packed_key(group_entries).has_value());
             }
             initialized_ = true;
         } else {
@@ -6331,32 +6417,34 @@ class HashAggregateState final {
     /// Size a range-writable column and return its buffer. Called on the
     /// building thread only: `data()` and `codes_data()` detach a shared
     /// buffer, so resolving the address once here is what makes the indexed
-    /// writes below safe from workers.
+    /// writes below safe from workers. Left uninitialized: the task grid
+    /// writes every group of every range-writable column, and zeroing here
+    /// was a serial memset (~0.5 GB at h2o q10's 10M groups) ahead of it.
     static auto size_and_address(ColumnValue& col, EmitSlot kind, std::size_t n) -> void* {
         switch (kind) {
             case EmitSlot::I64: {
                 auto& c = std::get<Column<std::int64_t>>(col);
-                c.resize(n);
+                c.resize_for_overwrite(n);
                 return c.data();
             }
             case EmitSlot::F64: {
                 auto& c = std::get<Column<double>>(col);
-                c.resize(n);
+                c.resize_for_overwrite(n);
                 return c.data();
             }
             case EmitSlot::DateKey: {
                 auto& c = std::get<Column<Date>>(col);
-                c.resize(n);
+                c.resize_for_overwrite(n);
                 return c.data();
             }
             case EmitSlot::TsKey: {
                 auto& c = std::get<Column<Timestamp>>(col);
-                c.resize(n);
+                c.resize_for_overwrite(n);
                 return c.data();
             }
             case EmitSlot::Cat: {
                 auto& c = std::get<Column<Categorical>>(col);
-                c.resize(n);
+                c.resize_for_overwrite(n);
                 return c.codes_data();
             }
             case EmitSlot::Whole:
@@ -6469,6 +6557,13 @@ class HashAggregateState final {
         // `gather_columns_batched`.
         std::vector<EmitSlot> slot_kind(out.columns.size(), EmitSlot::Whole);
         std::vector<void*> slot_data(out.columns.size(), nullptr);
+        // The generic and packed paths keep keys in `group_keys_`. Integer
+        // keys and Categorical codes there can be range-written as well; the
+        // rest (text with no usable code, doubles, bools, decimals) appends.
+        const bool keys_in_store =
+            !cat_fast_path_ && !str_fast_path_ && !int_fast_path_ && !pair_int_fast_path_;
+        std::vector<const std::int64_t*> store_ints(group_by_->size(), nullptr);
+        std::vector<const Column<Categorical>::code_type*> store_codes(group_by_->size(), nullptr);
         for (std::size_t ci = 0; ci < group_by_->size(); ++ci) {
             if (cat_fast_path_) {
                 slot_kind[ci] = EmitSlot::Cat;
@@ -6476,6 +6571,25 @@ class HashAggregateState final {
                 slot_kind[ci] = emit_slot_for_int_key(int_key_kind_);
             } else if (pair_int_fast_path_) {
                 slot_kind[ci] = emit_slot_for_int_key(ci == 0 ? int_key_kind_ : int_key_kind_b_);
+            } else if (keys_in_store && ci < group_keys_.columns() &&
+                       group_keys_.size() >= n_groups_) {
+                const ColumnValue& col = *out.columns[ci].column;
+                const auto [cells, ints] = group_keys_.int_cells(ci);
+                using IC = GroupKeyStore::IntCells;
+                if ((cells == IC::Int64 && std::holds_alternative<Column<std::int64_t>>(col)) ||
+                    (cells == IC::Date && std::holds_alternative<Column<Date>>(col)) ||
+                    (cells == IC::Ts && std::holds_alternative<Column<Timestamp>>(col))) {
+                    slot_kind[ci] = cells == IC::Int64  ? EmitSlot::I64
+                                    : cells == IC::Date ? EmitSlot::DateKey
+                                                        : EmitSlot::TsKey;
+                    store_ints[ci] = ints;
+                } else if (const auto* cat = std::get_if<Column<Categorical>>(&col)) {
+                    if (const auto* codes =
+                            group_keys_.cat_codes_against(ci, cat->dictionary_ptr().get())) {
+                        slot_kind[ci] = EmitSlot::Cat;
+                        store_codes[ci] = codes;
+                    }
+                }
             }
         }
         for (std::size_t i = 0; i < aggregations_->size(); ++i) {
@@ -6563,8 +6677,19 @@ class HashAggregateState final {
                 if (ci >= group_keys_.columns()) {
                     return;
                 }
+                const auto* ints = store_ints[ci];
+                const auto* src_codes = store_codes[ci];
+                auto* dst_codes = src_codes != nullptr
+                                      ? static_cast<Column<Categorical>::code_type*>(slot_data[ci])
+                                      : nullptr;
                 for (std::size_t g = lo; g < hi; ++g) {
-                    group_keys_.append_to(col, ci, g);
+                    if (ints != nullptr) {
+                        put_int_key(ci, g, ints[g]);
+                    } else if (dst_codes != nullptr) {
+                        dst_codes[g] = src_codes[g];
+                    } else {
+                        group_keys_.append_to(col, ci, g);
+                    }
                     if (any_null_keys != 0 && ci < kMaxKeyColumns &&
                         (group_keys_.null_mask(g) & (std::uint64_t{1} << ci)) != 0) {
                         key_validity[ci].set(g, false);

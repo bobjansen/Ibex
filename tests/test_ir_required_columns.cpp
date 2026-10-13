@@ -180,6 +180,36 @@ TEST_CASE("required_columns: mapped join demands each side's own key", "[ir][req
     CHECK(demand.at("right").names == std::set<std::string>{"a", "right_id"});
 }
 
+TEST_CASE("required_columns: a suffixed join output demands the colliding name from both sides",
+          "[ir][required_columns]") {
+    // `val` on both inputs leaves the join as `val_l` and `val_r`. Reading
+    // either needs `val` from BOTH sides: drop it from one and the collision
+    // that suffixes the other disappears with it.
+    const auto demand_for = [](ir::JoinSuffixPolicy suffix, std::vector<std::string> read) {
+        auto join = std::make_unique<ir::JoinNode>(ir::NodeId{2}, ir::JoinKind::Left,
+                                                   std::vector<ir::JoinKey>{"id"}, std::nullopt,
+                                                   std::move(suffix));
+        join->add_child(make_scan("left"));
+        join->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{9}, "right"));
+        auto plan = with_child(std::make_unique<ir::ProjectNode>(ir::NodeId{3}, refs(read)),
+                               std::move(join));
+        return ir::required_columns(*plan);
+    };
+
+    const auto both = demand_for({.present = true, .left = "_l", .right = "_r"}, {"val_l"});
+    CHECK(both.at("left").names == std::set<std::string>{"id", "val", "val_l"});
+    CHECK(both.at("right").names == std::set<std::string>{"id", "val", "val_l"});
+
+    // An empty left suffix keeps the left name; the right one still needs it.
+    const auto right_only = demand_for({.present = true, .left = "", .right = "_r"}, {"val_r"});
+    CHECK(right_only.at("left").names == std::set<std::string>{"id", "val", "val_r"});
+    CHECK(right_only.at("right").names == std::set<std::string>{"id", "val", "val_r"});
+
+    // Without a policy a collision is an error, so nothing is stripped.
+    const auto none = demand_for({}, {"val_l"});
+    CHECK(none.at("left").names == std::set<std::string>{"id", "val_l"});
+}
+
 TEST_CASE("required_columns: a folded logical key maps to both native inputs",
           "[ir][required_columns]") {
     auto join = std::make_unique<ir::JoinNode>(

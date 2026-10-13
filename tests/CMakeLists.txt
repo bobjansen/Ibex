@@ -74,6 +74,7 @@ set(IBEX_TEST_SOURCES
     test_operator.cpp
     test_table_compare.cpp
     test_worker_pool.cpp
+    test_packed_key_encoder.cpp
 )
 if(NOT WIN32)
     list(APPEND IBEX_TEST_SOURCES test_websocket.cpp test_udp.cpp)

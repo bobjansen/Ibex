@@ -1458,3 +1458,97 @@ TEST_CASE("generic group-by keys: partitioned discovery equals a hand-computed g
         check(*pr);
     }
 }
+
+TEST_CASE("chunked aggregate: a narrow-span Int64 key groups through a dense array",
+          "[runtime][chunked][aggregate]") {
+    // h2o q4's shape: one Int64 key over ~100 distinct values. Its span is a
+    // small fraction of the rows, so `key - min` indexes a gid array and the
+    // morsels fan out even over one chunk. The chunked runs move the bounds:
+    // a later chunk reaches below the first chunk's minimum (rebuild, gids
+    // unchanged), and in the `wide` run one chunk spans past the dense limit,
+    // so the path retires and the hash paths must carry on with the groups it
+    // made. Expected values are computed here, in first-seen order.
+    constexpr std::int64_t kRows = 600'000;
+    const auto key_of = [](std::int64_t row, bool wide) -> std::int64_t {
+        if (wide && row >= 450'000 && row < 460'000) {
+            return (row % 7) * 1'000'000'000;  // retires the dense path
+        }
+        const std::int64_t base = (row * 7919) % 97;
+        return row < 300'000 ? base : base - 40;  // later rows reach below
+    };
+    for (const auto& [grain, wide] :
+         {std::pair<const char*, bool>{"", false}, std::pair<const char*, bool>{"70001", false},
+          std::pair<const char*, bool>{"70001", true}}) {
+        INFO("grain '" << grain << "' wide " << wide);
+        runtime::TableRegistry registry;
+        std::vector<std::int64_t> want_keys;
+        struct Want {
+            std::int64_t n = 0;
+            std::int64_t sum = 0;
+            std::int64_t lo = 0;
+            std::int64_t hi = 0;
+            std::int64_t first = 0;
+        };
+        std::map<std::int64_t, Want> want;
+        {
+            Column<std::int64_t> g;
+            Column<std::int64_t> v;
+            for (std::int64_t row = 0; row < kRows; ++row) {
+                const std::int64_t key = key_of(row, wide);
+                const std::int64_t value = ((row * 104729) % 1'000'003) - 500'000;
+                g.push_back(key);
+                v.push_back(value);
+                auto [it, fresh] = want.try_emplace(key);
+                Want& w = it->second;
+                if (fresh) {
+                    want_keys.push_back(key);
+                    w.lo = value;
+                    w.hi = value;
+                    w.first = value;
+                }
+                ++w.n;
+                w.sum += value;
+                w.lo = std::min(w.lo, value);
+                w.hi = std::max(w.hi, value);
+            }
+            runtime::Table t;
+            t.add_column("g", std::move(g));
+            t.add_column("v", std::move(v));
+            registry.emplace("t", std::move(t));
+        }
+        std::optional<ChunkGrainGuard> guard;
+        if (*grain != '\0') {
+            guard.emplace(grain);
+        }
+        auto program = parser::parse(
+            "t[select { n = count(), s = sum(v), lo = min(v), hi = max(v), f = first(v) }, "
+            "by { g }];");
+        REQUIRE(program.has_value());
+        auto ir = parser::lower(program.value());
+        REQUIRE(ir.has_value());
+        runtime::ExecutionContext parallel;
+        parallel.parallel_threads = 8;
+        parallel.parallel_min_rows = 0;
+        const auto p =
+            runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+        REQUIRE(p.has_value());
+
+        REQUIRE(p->rows() == want_keys.size());
+        const auto& pg = std::get<Column<std::int64_t>>(*p->find("g"));
+        const auto& pn = std::get<Column<std::int64_t>>(*p->find("n"));
+        const auto& ps = std::get<Column<std::int64_t>>(*p->find("s"));
+        const auto& plo = std::get<Column<std::int64_t>>(*p->find("lo"));
+        const auto& phi = std::get<Column<std::int64_t>>(*p->find("hi"));
+        const auto& pf = std::get<Column<std::int64_t>>(*p->find("f"));
+        for (std::size_t i = 0; i < want_keys.size(); ++i) {
+            INFO("group " << i);
+            const Want& w = want.at(want_keys[i]);
+            REQUIRE(pg[i] == want_keys[i]);
+            REQUIRE(pn[i] == w.n);
+            REQUIRE(ps[i] == w.sum);
+            REQUIRE(plo[i] == w.lo);
+            REQUIRE(phi[i] == w.hi);
+            REQUIRE(pf[i] == w.first);
+        }
+    }
+}

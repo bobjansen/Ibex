@@ -1587,6 +1587,112 @@ TEST_CASE("Interpret packed-key aggregate migrates a null key introduced by a la
     CHECK((*n)[2] == 1);
 }
 
+TEST_CASE("Interpret packed-key aggregate migrates when a later chunk outgrows the layout") {
+    // The first chunk sizes each packed cell from its own values (a fits a few
+    // bits). The later chunk's extremes cannot be packed under that layout, so
+    // the aggregate must move to the generic path -- and still merge the
+    // repeated (1, 10, 100) into the group the packed path already found.
+    constexpr auto lo = std::numeric_limits<std::int64_t>::min();
+    constexpr auto hi = std::numeric_limits<std::int64_t>::max();
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("outgrown_packed", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        auto first = make_int_chunk("a", {1, 2});
+        add_int_column(first, "b", {10, 20});
+        add_int_column(first, "c", {100, 200});
+        chunks.push_back(std::move(first));
+        auto later = make_int_chunk("a", {1, lo, hi, 2});
+        add_int_column(later, "b", {10, 10, 20, 20});
+        add_int_column(later, "c", {100, 100, 200, 200});
+        chunks.push_back(std::move(later));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn outgrown_packed() -> DataFrame from \"x.hpp\"; "
+        "outgrown_packed()[select { n = count() }, by { a, b, c }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+
+    const auto* a = std::get_if<Column<std::int64_t>>(result->find("a"));
+    const auto* b = std::get_if<Column<std::int64_t>>(result->find("b"));
+    const auto* n = std::get_if<Column<std::int64_t>>(result->find("n"));
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    REQUIRE(n != nullptr);
+    REQUIRE(a->size() == 4);
+    CHECK((*a)[0] == 1);
+    CHECK((*n)[0] == 2);
+    CHECK((*a)[1] == 2);
+    CHECK((*n)[1] == 2);
+    CHECK((*a)[2] == lo);
+    CHECK((*b)[2] == 10);
+    CHECK((*n)[2] == 1);
+    CHECK((*a)[3] == hi);
+    CHECK((*b)[3] == 20);
+    CHECK((*n)[3] == 1);
+}
+
+TEST_CASE("Interpret packed-key aggregate groups mixed Categorical and Int64 keys") {
+    // Two Categoricals (one dictionary per chunk, so ids are interned) and two
+    // Int64s with negative values: the shape that only packs once cells are
+    // sized from the data. Chunk two repeats two chunk-one groups through a
+    // dictionary with a different code order.
+    auto dict1 = std::make_shared<std::vector<std::string>>(std::vector<std::string>{"x", "y"});
+    auto dict2 =
+        std::make_shared<std::vector<std::string>>(std::vector<std::string>{"y", "x", "z"});
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("mixed_packed", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        auto first = make_cat_chunk("s", dict1, {0, 1, 0});
+        add_cat_column(first, "t", dict1, {1, 1, 0});
+        add_int_column(first, "a", {-5, 7, -5});
+        add_int_column(first, "b", {1'000'000, -1, 1'000'000});
+        chunks.push_back(std::move(first));
+        auto later = make_cat_chunk("s", dict2, {1, 0, 2});  // x, y, z
+        add_cat_column(later, "t", dict2, {0, 0, 2});        // y, y, z
+        add_int_column(later, "a", {-5, 7, 0});
+        add_int_column(later, "b", {1'000'000, -1, 0});
+        chunks.push_back(std::move(later));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn mixed_packed() -> DataFrame from \"x.hpp\"; "
+        "mixed_packed()[select { n = count() }, by { s, t, a, b }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+
+    const auto* s = std::get_if<Column<Categorical>>(result->find("s"));
+    const auto* t = std::get_if<Column<Categorical>>(result->find("t"));
+    const auto* a = std::get_if<Column<std::int64_t>>(result->find("a"));
+    const auto* n = std::get_if<Column<std::int64_t>>(result->find("n"));
+    REQUIRE(s != nullptr);
+    REQUIRE(t != nullptr);
+    REQUIRE(a != nullptr);
+    REQUIRE(n != nullptr);
+    REQUIRE(s->size() == 4);
+    CHECK((*s)[0] == "x");
+    CHECK((*t)[0] == "y");
+    CHECK((*a)[0] == -5);
+    CHECK((*n)[0] == 2);
+    CHECK((*s)[1] == "y");
+    CHECK((*t)[1] == "y");
+    CHECK((*a)[1] == 7);
+    CHECK((*n)[1] == 2);
+    CHECK((*s)[2] == "x");
+    CHECK((*t)[2] == "x");
+    CHECK((*n)[2] == 1);
+    CHECK((*s)[3] == "z");
+    CHECK((*t)[3] == "z");
+    CHECK((*a)[3] == 0);
+    CHECK((*n)[3] == 1);
+}
+
 // Dates far enough apart that the cell product blows the dense budget must fall
 // back to the hash path and still group correctly.
 TEST_CASE("Interpret group-by on Categorical and Date falls back when the key domain is huge") {

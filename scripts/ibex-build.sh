@@ -14,6 +14,7 @@
 #   IBEX_ROOT   — repo root          (default: directory above this script)
 #   BUILD_DIR   — cmake build dir    (default: $IBEX_ROOT/build)
 #   CXX         — C++ compiler       (default: clang++)
+#   CXXFLAGS    — compiler flags     (default: -O2)
 
 set -euo pipefail
 
@@ -21,6 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IBEX_ROOT="${IBEX_ROOT:-$(dirname "$SCRIPT_DIR")}"
 BUILD_DIR="${BUILD_DIR:-$IBEX_ROOT/build}"
 CXX="${CXX:-clang++}"
+CXXFLAGS="${CXXFLAGS:--O2}"
 
 detect_cxx_std_flag() {
     local candidate
@@ -135,6 +137,6 @@ if grep -q '#include "adbc.hpp"' "$CPP_FILE"; then
 fi
 
 echo "▸ compiling   → $OUTPUT"
-"$CXX" -std="$CXX_STD_FLAG" "${IBEX_INCS[@]}" "$CPP_FILE" "${IBEX_LIBS[@]}" -o "$OUTPUT"
+"$CXX" -std="$CXX_STD_FLAG" $CXXFLAGS "${IBEX_INCS[@]}" "$CPP_FILE" "${IBEX_LIBS[@]}" -o "$OUTPUT"
 
 echo "✓ built $OUTPUT"

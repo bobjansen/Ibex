@@ -12,6 +12,7 @@
 #   IBEX_ROOT   — repo root          (default: directory above this script)
 #   BUILD_DIR   — cmake build dir    (default: $IBEX_ROOT/build-release when available, else $IBEX_ROOT/build)
 #   CXX         — C++ compiler       (default: clang++)
+#   CXXFLAGS    — compiler flags     (default: -O2)
 
 set -euo pipefail
 
@@ -25,6 +26,7 @@ if [[ -z "${BUILD_DIR:-}" ]]; then
     fi
 fi
 CXX="${CXX:-clang++}"
+CXXFLAGS="${CXXFLAGS:--O2}"
 
 detect_cxx_std_flag() {
     local candidate
@@ -114,7 +116,7 @@ echo "▸ transpiling $IBEX_FILE"
 "$IBEX_COMPILE" "$IBEX_FILE" -o "$CPP_FILE"
 
 echo "▸ compiling   $CPP_FILE"
-"$CXX" -std="$CXX_STD_FLAG" "${IBEX_INCS[@]}" "$CPP_FILE" "${IBEX_LIBS[@]}" -o "$BIN_FILE"
+"$CXX" -std="$CXX_STD_FLAG" $CXXFLAGS "${IBEX_INCS[@]}" "$CPP_FILE" "${IBEX_LIBS[@]}" -o "$BIN_FILE"
 
 echo "▸ running"
 echo ""

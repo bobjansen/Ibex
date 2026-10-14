@@ -68,7 +68,6 @@ fi
 IBEX_INCS=(
     "-I$IBEX_ROOT/include"
     "-I$IBEX_ROOT/libraries"
-    "-I$BUILD_DIR/_deps/fmt-src/include"
     "-I$BUILD_DIR/_deps/fast_float-src/include"
     "-I$BUILD_DIR/_deps/robin_hood-src/src/include"
 )
@@ -79,10 +78,6 @@ if [[ -d "$IBEX_ROOT/libs" ]]; then
         IBEX_INCS+=("-I$lib_dir")
     done < <(find "$IBEX_ROOT/libs" -mindepth 1 -maxdepth 1 -type d -print0)
 fi
-
-# Support both debug (libfmtd.a) and release (libfmt.a) build trees.
-_fmt_lib="$BUILD_DIR/_deps/fmt-build/libfmt.a"
-[[ -f "$_fmt_lib" ]] || _fmt_lib="$BUILD_DIR/_deps/fmt-build/libfmtd.a"
 
 # jemalloc: pools large freed allocations instead of returning them to the OS,
 # eliminating page-fault overhead on repeated large-table operations.
@@ -104,7 +99,6 @@ IBEX_LIBS=(
     "$BUILD_DIR/src/runtime/libibex_runtime.a"
     "$BUILD_DIR/src/ir/libibex_ir.a"
     "$BUILD_DIR/src/core/libibex_core.a"
-    "$_fmt_lib"
 )
 [[ -n "$_jemalloc" ]] && IBEX_LIBS+=("$_jemalloc")
 

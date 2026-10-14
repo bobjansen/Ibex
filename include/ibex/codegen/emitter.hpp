@@ -6,10 +6,12 @@
 #include <ibex/core/scalar_value.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/ir/required_columns.hpp>
 
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <robin_hood.h>
@@ -179,6 +181,11 @@ class Emitter {
     robin_hood::unordered_map<std::string, std::string> resource_vars_;
     /// Tables produced by a Script's shared-binding steps, by binding name.
     robin_hood::unordered_map<std::string, std::string> named_tables_;
+    /// What each source node (`Scan`, `ExternCall`, `Construct`) of an emitted tree is read
+    /// for, from `ir::source_output_demand` of that tree's root. A bounded
+    /// demand narrows the source's table before its consumer sees it, as the
+    /// REPL narrows its in-memory tables.
+    std::map<const ir::Node*, ir::ColumnDemand> source_demand_;
 
     /// Everything before the query: includes, `main`/entry-point opening, and
     /// the scalar registry. `emit_footer` closes what this opens.
@@ -210,6 +217,12 @@ class Emitter {
     /// Emit code for a node and all its children; returns the variable name
     /// that holds the result.
     auto emit_node(const ir::Node& node) -> std::string;
+    /// `emit_node` for the root of a tree the program evaluates on its own:
+    /// records the tree's source demand first, so its sources are narrowed.
+    auto emit_root(const ir::Node& root) -> std::string;
+    /// `var`, the table `source` produced, narrowed to the columns its
+    /// consumers read when that demand is bounded; `var` itself otherwise.
+    auto narrow_source(const ir::Node& source, std::string var) -> std::string;
 
     /// Emit a boolean predicate expression as nested ibex::ops::filter_* builder
     /// calls (inline).

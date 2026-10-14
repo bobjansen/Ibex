@@ -160,6 +160,14 @@ void forward_cli_args(int argc, char** argv);
 [[nodiscard]] auto project(const runtime::Table& t, const std::vector<std::string>& col_names)
     -> runtime::Table;
 
+/// `t` cut down to the columns the compiled plan reads from it, sharing their
+/// storage. Unlike `project` it is not a query step: names `t` lacks are
+/// ignored, and columns its ordering, time index or grouping name are kept.
+/// The emitter places it above each table source whose demand is bounded --
+/// the same narrowing the REPL applies to its in-memory tables.
+[[nodiscard]] auto narrow(const runtime::Table& t, const std::vector<std::string>& col_names)
+    -> runtime::Table;
+
 [[nodiscard]] auto distinct(const runtime::Table& t) -> runtime::Table;
 
 [[nodiscard]] auto order(const runtime::Table& t, const std::vector<ir::OrderKey>& keys)

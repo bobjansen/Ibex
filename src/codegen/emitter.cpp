@@ -217,7 +217,7 @@ auto Emitter::emit_script_steps(const Script& script) -> std::string {
                     throw std::runtime_error("ibex_compile: shared binding has no plan");
                 }
                 last_model_.clear();
-                named_tables_[step.name] = emit_node(*step.plan);
+                named_tables_[step.name] = emit_root(*step.plan);
                 // A binding that fits a model is also that model, by the same name.
                 if (step.plan->kind() == ir::NodeKind::Model) {
                     model_vars_[step.name] = last_model_;
@@ -238,7 +238,7 @@ auto Emitter::emit_script_steps(const Script& script) -> std::string {
                     if (step.plan == nullptr) {
                         throw std::runtime_error("ibex_compile: sink has no input plan");
                     }
-                    input = emit_node(*step.plan);
+                    input = emit_root(*step.plan);
                     if (step.input_binding.has_value()) {
                         sink_inputs[*step.input_binding] = input;
                     }
@@ -303,7 +303,7 @@ auto Emitter::emit_script_steps(const Script& script) -> std::string {
         }
     }
     if (result_var.empty() && script.result != nullptr) {
-        result_var = emit_node(*script.result);
+        result_var = emit_root(*script.result);
     }
     return result_var;
 }
@@ -491,7 +491,7 @@ void Emitter::emit_deferred_scalar(const ir::DeferredScalarBinding& binding) {
     auto& out = *out_;
     for (const auto& source : binding.sources) {
         out << "    {\n";
-        auto src_var = emit_node(*source.plan);
+        auto src_var = emit_root(*source.plan);
         emit_scalar_store(source.tmp_name, "ibex::ops::scalar_of_table(" + src_var + ", \"" +
                                                escape_string(source.column.value_or("")) + "\", " +
                                                (source.column.has_value() ? "false" : "true") +
@@ -510,7 +510,7 @@ void Emitter::emit_query(std::ostream& out, const ir::Node& root, const Config& 
         std::ostringstream query_buf;
         auto* saved_out = out_;
         out_ = &query_buf;
-        auto result_var = emit_node(root);
+        auto result_var = emit_root(root);
         out_ = saved_out;
 
         // Re-indent query code by 4 extra spaces so it sits inside the loop body.
@@ -538,7 +538,7 @@ void Emitter::emit_query(std::ostream& out, const ir::Node& root, const Config& 
             << config.bench_iters << ";\n";
         out << "    std::fprintf(stderr, \"avg_ms=%.3f\\n\", _avg_ms);\n";
     } else {
-        auto result_var = emit_node(root);
+        auto result_var = emit_root(root);
         if (config.table_entry_point) {
             out << "    return " << result_var << ";\n";
         } else if (config.print_result) {
@@ -587,6 +587,29 @@ auto Emitter::fresh_var() -> std::string {
     return "t" + std::to_string(tmp_counter_++);
 }
 
+auto Emitter::emit_root(const ir::Node& root) -> std::string {
+    for (const auto& [node, demand] : ir::source_output_demand(root)) {
+        source_demand_[node].merge(demand);
+    }
+    return emit_node(root);
+}
+
+auto Emitter::narrow_source(const ir::Node& source, std::string var) -> std::string {
+    const auto it = source_demand_.find(&source);
+    if (it == source_demand_.end() || it->second.all || it->second.names.empty()) {
+        return var;
+    }
+    auto narrowed = fresh_var();
+    *out_ << "    auto " << narrowed << " = ibex::ops::narrow(" << var << ", {";
+    bool first = true;
+    for (const auto& name : it->second.names) {
+        *out_ << (first ? "" : ", ") << "\"" << escape_string(name) << "\"";
+        first = false;
+    }
+    *out_ << "});\n";
+    return narrowed;
+}
+
 // NOLINTNEXTLINE(readability-function-size): one exhaustive dispatcher keeps IR emission local.
 auto Emitter::emit_node(const ir::Node& node) -> std::string {
     const auto require_single_child = [](const ir::Node& parent,
@@ -606,7 +629,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             }
             if (const auto named = named_tables_.find(scan.source_name());
                 named != named_tables_.end()) {
-                return named->second;
+                return narrow_source(node, named->second);
             }
             throw std::runtime_error(
                 "ibex_compile: ScanNode cannot be emitted — use 'extern fn' to declare data "
@@ -1003,7 +1026,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
         case ir::NodeKind::ExternCall: {
             // In bench mode ExternCall nodes were pre-emitted; reuse the var.
             if (auto it = cached_vars_.find(&node); it != cached_vars_.end())
-                return it->second;
+                return narrow_source(node, it->second);
             const auto& ec = ir::node_cast<ir::ExternCallNode>(node);
             auto var = fresh_var();
             *out_ << "    auto " << var << " = " << callee_name(ec.callee()) << "(";
@@ -1015,7 +1038,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 *out_ << emit_raw_expr(arg);
             }
             *out_ << ");\n";
-            return var;
+            return narrow_source(node, std::move(var));
         }
 
         case ir::NodeKind::Join: {
@@ -1411,7 +1434,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                     },
                     col.elements[0].value);
             }
-            return var;
+            return narrow_source(node, std::move(var));
         }
 
         case ir::NodeKind::Stream: {

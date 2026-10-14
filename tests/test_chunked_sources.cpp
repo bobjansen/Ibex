@@ -2164,3 +2164,72 @@ TEST_CASE("chunked aggregate: parallel dense gid numbering keeps first-seen orde
         }
     }
 }
+
+TEST_CASE("chunked aggregate: many string groups come out in first-seen order, bytes intact",
+          "[runtime][chunked][aggregate]") {
+    // h2o q3 at K=2e0: ~5M string groups. Partitioned discovery now numbers
+    // groups by scanning rows rather than merging partitions, writes keys
+    // back in parallel, and Emission lays the key column out from per-block
+    // lengths so spans copy bytes in parallel. Keys vary in length (one is
+    // empty) so a wrong offset shows up as a wrong key. Expected values are
+    // computed here, in first-seen order, over one chunk and several.
+    constexpr std::size_t kRows = 700'001;
+    constexpr std::size_t kGroups = 300'007;
+    const auto key_of = [](std::size_t row) -> std::string {
+        const std::size_t id = (row * 2'654'435'761ULL) % kGroups;
+        if (id == 17) {
+            return "";
+        }
+        return "k" + std::to_string(id) + std::string(id % 23, 'x');
+    };
+    runtime::TableRegistry registry;
+    std::vector<std::string> order;
+    std::map<std::string, std::pair<std::int64_t, std::int64_t>> want;  // key -> (n, sum)
+    {
+        std::vector<std::string> keys(kRows);
+        Column<std::int64_t> v;
+        for (std::size_t row = 0; row < kRows; ++row) {
+            keys[row] = key_of(row);
+            const auto value = static_cast<std::int64_t>(row % 1'009);
+            v.push_back(value);
+            auto [it, fresh] = want.try_emplace(keys[row]);
+            if (fresh) {
+                order.push_back(keys[row]);
+            }
+            ++it->second.first;
+            it->second.second += value;
+        }
+        runtime::Table t;
+        t.add_column("k", Column<std::string>{keys});
+        t.add_column("v", std::move(v));
+        registry.emplace("t", std::move(t));
+    }
+    for (const char* grain : {"", "100003"}) {
+        INFO("grain '" << grain << "'");
+        std::optional<ChunkGrainGuard> guard;
+        if (*grain != '\0') {
+            guard.emplace(grain);
+        }
+        auto program = parser::parse("t[select { n = count(), s = sum(v) }, by k];");
+        REQUIRE(program.has_value());
+        auto ir = parser::lower(program.value());
+        REQUIRE(ir.has_value());
+        runtime::ExecutionContext parallel;
+        parallel.parallel_threads = 8;
+        parallel.parallel_min_rows = 0;
+        const auto p =
+            runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+        REQUIRE(p.has_value());
+        REQUIRE(p->rows() == order.size());
+        const auto& pk = std::get<Column<std::string>>(*p->find("k"));
+        const auto& pn = std::get<Column<std::int64_t>>(*p->find("n"));
+        const auto& ps = std::get<Column<std::int64_t>>(*p->find("s"));
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            INFO("group " << i);
+            REQUIRE(pk[i] == order[i]);
+            const auto& [n, sum] = want.at(order[i]);
+            REQUIRE(pn[i] == n);
+            REQUIRE(ps[i] == sum);
+        }
+    }
+}

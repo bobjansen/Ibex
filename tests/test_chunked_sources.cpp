@@ -1789,6 +1789,99 @@ TEST_CASE("grouped top-k: partitioned flat heaps take each group's stable-sort r
     }
 }
 
+TEST_CASE("chunked aggregate: a nullable narrow-span Int64 key keeps the dense array",
+          "[runtime][chunked][aggregate][validity]") {
+    // h2o q4 with NAs: `by id4` where id4 has nulls. The null key is one more
+    // dense cell, so the path no longer migrates to the generic one. Row 0 is
+    // null (the null group is gid 0); the payload under a null is far outside
+    // the span, so a null read as a value would index past the array. The
+    // chunked runs widen the bounds below the first chunk (rebuild, the null
+    // cell moves; a later chunk reaches above, so the old null cell becomes a
+    // value cell), and in the `wide` run the path retires with a null group
+    // already made, so the generic path must adopt it. Expected values are
+    // computed here, in first-seen order; the null group is key nullopt.
+    constexpr std::int64_t kRows = 600'000;
+    const auto is_null_row = [](std::int64_t row) { return row % 13 == 0; };
+    const auto key_of = [](std::int64_t row, bool wide) -> std::int64_t {
+        if (wide && row >= 450'000 && row < 460'000) {
+            return (row % 7) * 1'000'000'000;
+        }
+        const std::int64_t base = (row * 7919) % 97;
+        if (row < 300'000) {
+            return base;
+        }
+        return row < 400'000 ? base - 40 : base + 50;
+    };
+    for (const auto& [grain, wide] :
+         {std::pair<const char*, bool>{"", false}, std::pair<const char*, bool>{"70001", false},
+          std::pair<const char*, bool>{"70001", true}}) {
+        INFO("grain '" << grain << "' wide " << wide);
+        runtime::TableRegistry registry;
+        struct Want {
+            std::int64_t n = 0;
+            std::int64_t sum = 0;
+        };
+        std::vector<std::optional<std::int64_t>> want_keys;
+        std::map<std::optional<std::int64_t>, Want> want;
+        {
+            Column<std::int64_t> g;
+            Column<std::int64_t> v;
+            runtime::ValidityBitmap valid;
+            for (std::int64_t row = 0; row < kRows; ++row) {
+                const bool null = is_null_row(row);
+                const std::int64_t value = ((row * 104729) % 1'000'003) - 500'000;
+                g.push_back(null ? 5'000'000'000'000 + row : key_of(row, wide));
+                valid.push_back(!null);
+                v.push_back(value);
+                const std::optional<std::int64_t> key =
+                    null ? std::nullopt : std::optional{key_of(row, wide)};
+                auto [it, fresh] = want.try_emplace(key);
+                if (fresh) {
+                    want_keys.push_back(key);
+                }
+                ++it->second.n;
+                it->second.sum += value;
+            }
+            runtime::Table t;
+            t.add_column("g", std::move(g), std::move(valid));
+            t.add_column("v", std::move(v));
+            registry.emplace("t", std::move(t));
+        }
+        std::optional<ChunkGrainGuard> guard;
+        if (*grain != '\0') {
+            guard.emplace(grain);
+        }
+        auto program = parser::parse("t[select { n = count(), s = sum(v) }, by g];");
+        REQUIRE(program.has_value());
+        auto ir = parser::lower(program.value());
+        REQUIRE(ir.has_value());
+        runtime::ExecutionContext parallel;
+        parallel.parallel_threads = 8;
+        parallel.parallel_min_rows = 0;
+        const auto p =
+            runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+        REQUIRE(p.has_value());
+
+        REQUIRE(p->rows() == want_keys.size());
+        const auto* g_entry = p->find_entry("g");
+        REQUIRE(g_entry != nullptr);
+        const auto& pg = std::get<Column<std::int64_t>>(*g_entry->column);
+        const auto& pn = std::get<Column<std::int64_t>>(*p->find("n"));
+        const auto& ps = std::get<Column<std::int64_t>>(*p->find("s"));
+        for (std::size_t i = 0; i < want_keys.size(); ++i) {
+            INFO("group " << i);
+            const bool null = runtime::is_null(*g_entry, i);
+            REQUIRE(null == !want_keys[i].has_value());
+            if (!null) {
+                REQUIRE(pg[i] == *want_keys[i]);
+            }
+            const Want& w = want.at(want_keys[i]);
+            REQUIRE(pn[i] == w.n);
+            REQUIRE(ps[i] == w.sum);
+        }
+    }
+}
+
 TEST_CASE("median by nullable integer and Categorical keys: parallel cell grouping keeps nulls",
           "[runtime][aggregate][median][validity]") {
     // h2o q6 with NAs: the keys of `median(v) by { id4, id5 }` have nulls. A

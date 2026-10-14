@@ -796,6 +796,14 @@ class GroupKeyStore {
     /// Append key column `ci` of group `gid` to `out`, as `append_scalar` of
     /// the boxed value would -- text straight from the buffer, with no string
     /// built on the way.
+    /// Whether key column `c` holds text, which `text` then reads.
+    [[nodiscard]] auto is_text(std::size_t c) const -> bool {
+        return c < cols_.size() && cols_[c].kind == Kind::Text;
+    }
+    [[nodiscard]] auto text(std::size_t c, std::size_t gid) const -> std::string_view {
+        return cols_[c].text(gid);
+    }
+
     void append_to(ColumnValue& out, std::size_t ci, std::size_t gid) const {
         const Col& col = cols_[ci];
         switch (col.kind) {
@@ -839,50 +847,126 @@ class GroupKeyStore {
     }
 
     /// Where a group's key is to be copied from: group `index` of `store`.
+    /// No default member values, so it is trivially default constructible and
+    /// a row-sized buffer of them (`NoInitVector`) is not zero-filled first;
+    /// every one is built with both fields.
     struct Source {
-        const GroupKeyStore* store = nullptr;
-        std::uint32_t index = 0;
+        const GroupKeyStore* store;
+        std::uint32_t index;
     };
 
-    /// Groups `first .. first + sources.size()` take the keys of `sources`, in
-    /// order -- the partitioned discovery's new groups, whose keys already sit
-    /// in their partitions' stores. Split so the copy can run a column per
-    /// worker: `prepare_fill` (serial) sizes and types every column, then
-    /// `fill_column(c, ...)` for each column may run concurrently, since each
-    /// touches only its own column.
-    void prepare_fill(std::size_t first, std::span<const Source> sources) {
-        if (size() < first + sources.size()) {
-            resize(first + sources.size());
+    /// Groups `first .. first + count` take the keys of `Source`s -- the
+    /// partitioned discovery's new groups, whose keys already sit in their
+    /// partitions' stores. `stores` is every store the sources point into (a
+    /// partition's each), so nothing
+    /// here walks the sources serially: this sizes the store, then per column
+    /// `prepare_column_from` types it and sizes its text, and
+    /// `fill_column_range` / `fill_null_masks_range` may run on disjoint
+    /// source ranges concurrently.
+    void prepare_fill_from(std::size_t first, std::size_t count,
+                           std::span<const GroupKeyStore* const> stores) {
+        if (size() < first + count) {
+            resize(first + count);
         }
-        for (const Source& src : sources) {
-            ensure_columns(src.store->cols_.size());
-        }
-        for (std::size_t c = 0; c < cols_.size(); ++c) {
-            for (const Source& src : sources) {
-                if (c < src.store->cols_.size() && src.store->cols_[c].kind != Kind::Unset) {
-                    cols_[c].claim(src.store->cols_[c].kind, size());
-                    break;
-                }
-            }
-        }
-        for (std::size_t n = 0; n < sources.size(); ++n) {
-            null_masks_[first + n] = sources[n].store->null_masks_[sources[n].index];
+        for (const GroupKeyStore* store : stores) {
+            ensure_columns(store->cols_.size());
         }
     }
 
-    void fill_column(std::size_t c, std::size_t first, std::span<const Source> sources) {
+    /// Type column `c` from the first store that has it, keep Categorical
+    /// codes only while every store's are usable against one dictionary (as
+    /// `copy_from` would decide group by group), and grow `chars` by
+    /// `text_bytes`. Returns where the new text starts.
+    auto prepare_column_from(std::size_t c, std::span<const GroupKeyStore* const> stores,
+                             std::size_t text_bytes) -> std::size_t {
         Col& col = cols_[c];
-        if (col.kind == Kind::Text) {
-            // Size the buffer once: growing it per value re-copied everything
-            // written so far, serially, which was most of this copy's cost.
-            std::size_t bytes = 0;
-            for (const Source& src : sources) {
-                bytes += src.store->cols_[c].text_lengths[src.index];
+        for (const GroupKeyStore* store : stores) {
+            if (c < store->cols_.size() && store->cols_[c].kind != Kind::Unset) {
+                col.claim(store->cols_[c].kind, size());
+                break;
             }
-            col.chars.reserve(col.chars.size() + bytes);
         }
-        for (std::size_t n = 0; n < sources.size(); ++n) {
-            col.copy_from(sources[n].store->cols_[c], sources[n].index, first + n, size());
+        if (col.kind != Kind::Text) {
+            return 0;
+        }
+        for (const GroupKeyStore* store : stores) {
+            if (!col.codes_usable) {
+                break;
+            }
+            if (c >= store->cols_.size() || store->cols_[c].kind == Kind::Unset) {
+                continue;
+            }
+            const Col& src = store->cols_[c];
+            if (!src.codes_usable || src.code_dict == nullptr) {
+                col.drop_codes();
+            } else if (col.code_dict == nullptr) {
+                col.code_dict = src.code_dict;
+            } else if (col.code_dict != src.code_dict) {
+                col.drop_codes();
+            }
+        }
+        const std::size_t base = col.chars.size();
+        col.chars.resize(base + text_bytes);
+        return base;
+    }
+
+    /// The text bytes sources `[lo, hi)` hold in column `c`; 0 unless text.
+    [[nodiscard]] auto text_bytes_of_sources(std::size_t c, std::span<const Source> sources,
+                                             std::size_t lo, std::size_t hi) const -> std::size_t {
+        if (cols_[c].kind != Kind::Text) {
+            return 0;
+        }
+        std::size_t bytes = 0;
+        for (std::size_t n = lo; n < hi; ++n) {
+            bytes += sources[n].store->cols_[c].text_lengths[sources[n].index];
+        }
+        return bytes;
+    }
+
+    void fill_column_range(std::size_t c, std::size_t first, std::span<const Source> sources,
+                           std::size_t lo, std::size_t hi, std::size_t text_at) {
+        Col& col = cols_[c];
+        for (std::size_t n = lo; n < hi; ++n) {
+            const Col& src = sources[n].store->cols_[c];
+            const std::size_t from = sources[n].index;
+            const std::size_t to = first + n;
+            switch (col.kind) {
+                case Kind::Int64:
+                case Kind::Bool:
+                case Kind::Date:
+                case Kind::Ts:
+                    col.ints[to] = src.ints[from];
+                    break;
+                case Kind::Double:
+                    col.doubles[to] = src.doubles[from];
+                    break;
+                case Kind::Text: {
+                    const std::string_view value = src.text(from);
+                    col.text_offsets[to] = text_at;
+                    col.text_lengths[to] = static_cast<std::uint32_t>(value.size());
+                    if (!value.empty()) {
+                        std::memcpy(col.chars.data() + text_at, value.data(), value.size());
+                    }
+                    text_at += value.size();
+                    if (col.codes_usable) {
+                        col.cat_codes[to] = src.cat_codes[from];
+                    }
+                    break;
+                }
+                case Kind::Dec:
+                    col.units[to] = src.units[from];
+                    col.decimal_types[to] = src.decimal_types[from];
+                    break;
+                case Kind::Unset:
+                    break;
+            }
+        }
+    }
+
+    void fill_null_masks_range(std::size_t first, std::span<const Source> sources, std::size_t lo,
+                               std::size_t hi) {
+        for (std::size_t n = lo; n < hi; ++n) {
+            null_masks_[first + n] = sources[n].store->null_masks_[sources[n].index];
         }
     }
 
@@ -890,7 +974,7 @@ class GroupKeyStore {
     /// `entries` -- the packed discovery's new groups, which it numbers
     /// serially and so must not copy keys for while it does. Split like
     /// `prepare_fill`: this (serial) sizes the store and sets the null masks,
-    /// then `fill_column_rows(c, ...)` may run once per column concurrently.
+    /// then `prepare_column_rows` and `fill_column_rows_range` write them.
     void prepare_fill_rows(std::size_t first, const std::vector<const ColumnEntry*>& entries,
                            std::span<const std::size_t> rows) {
         if (size() < first + rows.size()) {
@@ -912,70 +996,134 @@ class GroupKeyStore {
         }
     }
 
-    /// Write key column `c` for the groups `prepare_fill_rows` sized, as
-    /// `set_row` would write them one group at a time.
-    void fill_column_rows(std::size_t c, std::size_t first,
-                          const std::vector<const ColumnEntry*>& entries,
-                          std::span<const std::size_t> rows) {
+    /// Make column `c` ready for `fill_column_rows_range` over groups
+    /// `prepare_fill_rows` sized: take its type from `column` and, for text,
+    /// grow `chars` by `text_bytes` (the rows' total) once. Returns where the
+    /// new text starts. Serial; the ranges then run concurrently.
+    auto prepare_column_rows(std::size_t c, const ColumnValue& column, std::size_t text_bytes)
+        -> std::size_t {
         Col& col = cols_[c];
         const std::size_t groups = size();
         std::visit(
-            [&](const auto& column) {
-                using C = std::decay_t<decltype(column)>;
+            [&](const auto& typed) {
+                using C = std::decay_t<decltype(typed)>;
                 if constexpr (std::is_same_v<C, Column<std::int64_t>>) {
                     col.claim(Kind::Int64, groups);
-                    for (std::size_t n = 0; n < rows.size(); ++n) {
-                        col.ints[first + n] = column[rows[n]];
-                    }
                 } else if constexpr (std::is_same_v<C, Column<double>>) {
                     col.claim(Kind::Double, groups);
-                    for (std::size_t n = 0; n < rows.size(); ++n) {
-                        col.doubles[first + n] = column[rows[n]];
-                    }
                 } else if constexpr (std::is_same_v<C, Column<bool>>) {
                     col.claim(Kind::Bool, groups);
-                    for (std::size_t n = 0; n < rows.size(); ++n) {
-                        col.ints[first + n] = column[rows[n]] ? 1 : 0;
-                    }
-                } else if constexpr (std::is_same_v<C, Column<std::string>> ||
-                                     std::is_same_v<C, Column<Categorical>>) {
-                    std::size_t bytes = 0;
-                    for (const std::size_t row : rows) {
-                        bytes += std::string_view{column[row]}.size();
-                    }
+                } else if constexpr (std::is_same_v<C, Column<std::string>>) {
                     col.claim(Kind::Text, groups);
-                    col.chars.reserve(col.chars.size() + bytes);
-                    if constexpr (std::is_same_v<C, Column<Categorical>>) {
-                        const void* dict = column.dictionary_ptr().get();
-                        for (std::size_t n = 0; n < rows.size(); ++n) {
-                            col.put_cat(first + n, std::string_view{column[rows[n]]},
-                                        column.code_at(rows[n]), dict, groups);
-                        }
-                    } else {
-                        for (std::size_t n = 0; n < rows.size(); ++n) {
-                            col.put_text(first + n, std::string_view{column[rows[n]]}, groups);
-                        }
+                    col.drop_codes();
+                } else if constexpr (std::is_same_v<C, Column<Categorical>>) {
+                    col.claim(Kind::Text, groups);
+                    // As `put_cat`: codes stay usable while every group's
+                    // code is against one dictionary.
+                    const void* dict = typed.dictionary_ptr().get();
+                    if (col.codes_usable && col.code_dict == nullptr) {
+                        col.code_dict = dict;
+                    } else if (col.codes_usable && col.code_dict != dict) {
+                        col.drop_codes();
                     }
                 } else if constexpr (std::is_same_v<C, Column<Date>>) {
                     col.claim(Kind::Date, groups);
-                    for (std::size_t n = 0; n < rows.size(); ++n) {
-                        col.ints[first + n] = column[rows[n]].days;
-                    }
                 } else if constexpr (std::is_same_v<C, Column<Timestamp>>) {
                     col.claim(Kind::Ts, groups);
-                    for (std::size_t n = 0; n < rows.size(); ++n) {
-                        col.ints[first + n] = column[rows[n]].nanos;
+                } else if constexpr (std::is_same_v<C, Column<Decimal>>) {
+                    col.claim(Kind::Dec, groups);
+                } else {
+                    invariant_violation("group key store: unsupported key column type");
+                }
+            },
+            column);
+        if (col.kind != Kind::Text) {
+            return 0;
+        }
+        const std::size_t base = col.chars.size();
+        col.chars.resize(base + text_bytes);
+        return base;
+    }
+
+    /// Write column `c` for groups `first + lo .. first + hi` from `rows[lo
+    /// .. hi)` of `column`, as `set_row` would one group at a time; text goes
+    /// at `text_at` onward. Disjoint ranges may run concurrently once
+    /// `prepare_column_rows` has run.
+    void fill_column_rows_range(std::size_t c, std::size_t first, const ColumnValue& column,
+                                std::span<const std::size_t> rows, std::size_t lo, std::size_t hi,
+                                std::size_t text_at) {
+        Col& col = cols_[c];
+        const auto put_text = [&](std::size_t gid, std::string_view value) {
+            col.text_offsets[gid] = text_at;
+            col.text_lengths[gid] = static_cast<std::uint32_t>(value.size());
+            if (!value.empty()) {
+                std::memcpy(col.chars.data() + text_at, value.data(), value.size());
+            }
+            text_at += value.size();
+        };
+        std::visit(
+            [&](const auto& typed) {
+                using C = std::decay_t<decltype(typed)>;
+                if constexpr (std::is_same_v<C, Column<std::int64_t>>) {
+                    for (std::size_t n = lo; n < hi; ++n) {
+                        col.ints[first + n] = typed[rows[n]];
+                    }
+                } else if constexpr (std::is_same_v<C, Column<double>>) {
+                    for (std::size_t n = lo; n < hi; ++n) {
+                        col.doubles[first + n] = typed[rows[n]];
+                    }
+                } else if constexpr (std::is_same_v<C, Column<bool>>) {
+                    for (std::size_t n = lo; n < hi; ++n) {
+                        col.ints[first + n] = typed[rows[n]] ? 1 : 0;
+                    }
+                } else if constexpr (std::is_same_v<C, Column<std::string>>) {
+                    for (std::size_t n = lo; n < hi; ++n) {
+                        put_text(first + n, typed[rows[n]]);
+                    }
+                } else if constexpr (std::is_same_v<C, Column<Categorical>>) {
+                    const bool codes = col.codes_usable;
+                    for (std::size_t n = lo; n < hi; ++n) {
+                        put_text(first + n, typed[rows[n]]);
+                        if (codes) {
+                            col.cat_codes[first + n] = typed.code_at(rows[n]);
+                        }
+                    }
+                } else if constexpr (std::is_same_v<C, Column<Date>>) {
+                    for (std::size_t n = lo; n < hi; ++n) {
+                        col.ints[first + n] = typed[rows[n]].days;
+                    }
+                } else if constexpr (std::is_same_v<C, Column<Timestamp>>) {
+                    for (std::size_t n = lo; n < hi; ++n) {
+                        col.ints[first + n] = typed[rows[n]].nanos;
                     }
                 } else if constexpr (std::is_same_v<C, Column<Decimal>>) {
-                    for (std::size_t n = 0; n < rows.size(); ++n) {
-                        col.put_decimal(first + n, column[rows[n]].units, decimal_type_of(column),
-                                        groups);
+                    const DecimalType type = decimal_type_of(typed);
+                    for (std::size_t n = lo; n < hi; ++n) {
+                        col.units[first + n] = typed[rows[n]].units;
+                        col.decimal_types[first + n] = type;
                     }
                 } else {
                     invariant_violation("group key store: unsupported key column type");
                 }
             },
-            *entries[c]->column);
+            column);
+    }
+
+    /// The bytes `rows[lo .. hi)` of a text key column take; 0 otherwise.
+    [[nodiscard]] static auto text_bytes_of_rows(const ColumnValue& column,
+                                                 std::span<const std::size_t> rows, std::size_t lo,
+                                                 std::size_t hi) -> std::size_t {
+        std::size_t bytes = 0;
+        if (const auto* str = std::get_if<Column<std::string>>(&column)) {
+            for (std::size_t n = lo; n < hi; ++n) {
+                bytes += (*str)[rows[n]].size();
+            }
+        } else if (const auto* cat = std::get_if<Column<Categorical>>(&column)) {
+            for (std::size_t n = lo; n < hi; ++n) {
+                bytes += std::string_view{(*cat)[rows[n]]}.size();
+            }
+        }
+        return bytes;
     }
 
     /// Keep only the groups in `keep`, in that order (the filter-over-aggregate
@@ -1005,7 +1153,7 @@ class GroupKeyStore {
         std::vector<double> doubles;
         std::vector<std::uint64_t> text_offsets;
         std::vector<std::uint32_t> text_lengths;
-        std::vector<char> chars;
+        ::ibex::detail::NoInitVector<char> chars;
         std::vector<Int128> units;
         std::vector<DecimalType> decimal_types;
         /// A Categorical key's code next to its text, against `code_dict`, so
@@ -4233,11 +4381,16 @@ class HashAggregateState final {
         // order, it costs a sequential pass, where the probe below would
         // otherwise miss on the offsets before it could even prefetch the
         // bytes.
-        constexpr bool kScatterViews =
-            std::is_same_v<decltype(key_at(std::size_t{0})), std::string_view>;
+        using Probe = std::decay_t<decltype(key_at(std::size_t{0}))>;
+        constexpr bool kScatterViews = std::is_same_v<Probe, std::string_view>;
+        // Any small plain probe key travels the same way: a packed key built
+        // from six columns at a sparse row was six cache misses per probe
+        // (h2o q10). The generic path's probe is a fat handle; it does not.
+        constexpr bool kScatterKeys = std::is_trivially_copyable_v<Probe> && sizeof(Probe) <= 32;
+        ::ibex::detail::NoInitVector<Probe> scattered_keys;
         scatter_rows_.resize(rows);
-        if constexpr (kScatterViews) {
-            scatter_views_.resize(rows);
+        if constexpr (kScatterKeys) {
+            scattered_keys.resize(rows);
         }
         {
             auto batch = pool.submit(ranges, [&](std::size_t r) {
@@ -4247,8 +4400,8 @@ class HashAggregateState final {
                 for (std::size_t row = begin; row < end; ++row) {
                     const std::size_t at = cursor[part_of_row_[row]]++;
                     scatter_rows_[at] = row;
-                    if constexpr (kScatterViews) {
-                        scatter_views_[at] = key_at(row);
+                    if constexpr (kScatterKeys) {
+                        scattered_keys[at] = key_at(row);
                     }
                 }
             });
@@ -4270,14 +4423,50 @@ class HashAggregateState final {
                      p = cursor.fetch_add(1, std::memory_order_relaxed)) {
                     auto& partition = partitions[p];
                     const std::size_t part_end = part_begin[p + 1];
+                    // Once a sample of this partition's rows shows most of
+                    // them start groups (h2o q10: nearly all ~1e7 rows do),
+                    // size its tables for the rest at that rate, so they do
+                    // not regrow and rehash on the way there. A
+                    // low-cardinality partition never trips it, so nothing is
+                    // reserved per row there.
+                    constexpr std::size_t kReserveSample = 1024;
+                    const std::size_t sample_end = part_begin[p] + kReserveSample;
+                    const std::size_t held_at_start = partition.gids.size();
                     for (std::size_t i = part_begin[p]; i < part_end; ++i) {
+                        if (i == sample_end && part_end - i > 4 * kReserveSample) {
+                            const std::size_t fresh = partition.gids.size() - held_at_start;
+                            if (fresh * 2 > kReserveSample) {
+                                const std::size_t more = (part_end - i) * fresh / kReserveSample;
+                                const std::size_t total = partition.gids.size() + more;
+                                partition.index.reserve(total);
+                                partition.gids.reserve(total);
+                                partition.first_rows.reserve(total);
+                                partition.keys.reserve(total);
+                            }
+                        }
+                        // The generic key reads every key column at its row
+                        // (and the row's hash) to probe and again to store a
+                        // new group: several misses per row. Fetch the columns
+                        // 32 rows ahead, and 16 ahead the text their offsets
+                        // point at, by then in cache.
+                        if constexpr (std::is_same_v<Probe, GenericRowProbe>) {
+                            if (i + 32 < part_end) {
+                                const std::size_t ahead = scatter_rows_[i + 32];
+                                __builtin_prefetch(row_hashes_.data() + ahead);
+                                prefetch_key_row(*key_at(ahead).cols, ahead, false);
+                            }
+                            if (i + 16 < part_end) {
+                                const std::size_t ahead = scatter_rows_[i + 16];
+                                prefetch_key_row(*key_at(ahead).cols, ahead, true);
+                            }
+                        }
                         // A partition's rows are ascending but sparse, so a
                         // string key's bytes are a cache miss per row: fetch
                         // the key a few rows ahead while probing this one.
                         if constexpr (kScatterViews) {
                             constexpr std::size_t kAhead = 16;
                             if (i + kAhead < part_end) {
-                                __builtin_prefetch(scatter_views_[i + kAhead].data());
+                                __builtin_prefetch(scattered_keys[i + kAhead].data());
                             }
                         }
                         const std::size_t row = scatter_rows_[i];
@@ -4286,8 +4475,8 @@ class HashAggregateState final {
                         // key per ROW rather than per GROUP is the whole cost
                         // this path exists to avoid.
                         const auto key = [&] {
-                            if constexpr (kScatterViews) {
-                                return scatter_views_[i];
+                            if constexpr (kScatterKeys) {
+                                return scattered_keys[i];
                             } else {
                                 return key_at(row);
                             }
@@ -5321,7 +5510,9 @@ class HashAggregateState final {
         // The loop records each new group's row; the keys are copied after,
         // a column per worker, as `fill_new_generic_keys` does.
         const std::size_t groups_before = n_groups_;
-        std::vector<std::size_t> new_group_rows;
+        // Every entry is written by `store_key`, so it is not zero-filled
+        // first (80 MB at 1e7 groups, on one thread).
+        ::ibex::detail::NoInitVector<std::size_t> new_group_rows;
         if (try_discover_partitioned<Packed, Hash>(
                 key_at, rows, gids, state.partitions,
                 [&](std::size_t n) {
@@ -5492,8 +5683,32 @@ class HashAggregateState final {
         if (n_groups_ <= first) {
             return;
         }
-        std::vector<GroupKeyStore::Source> sources(n_groups_ - first);
-        for (std::size_t p = 0; p < generic_partitions_.size(); ++p) {
+        // Every phase runs across workers: at h2o q10's ~1e7 groups a serial
+        // source list plus a column per worker (text appended serially) was
+        // several hundred ms.
+        const std::size_t count = n_groups_ - first;
+        const std::size_t workers =
+            on_worker_pool_thread() ? std::size_t{1} : par_.discovery.worker_cap;
+        const auto fan = [&](std::size_t tasks, const auto& body) {
+            if (workers < 2 || tasks < 2) {
+                for (std::size_t t = 0; t < tasks; ++t) {
+                    body(t);
+                }
+                return;
+            }
+            std::atomic<std::size_t> next{0};
+            auto batch = process_worker_pool().submit(std::min(workers, tasks), [&](std::size_t) {
+                for (std::size_t t = next.fetch_add(1, std::memory_order_relaxed); t < tasks;
+                     t = next.fetch_add(1, std::memory_order_relaxed)) {
+                    body(t);
+                }
+            });
+            batch.wait();
+        };
+
+        // Each new group's id is unique, so partitions write their own slots.
+        ::ibex::detail::NoInitVector<GroupKeyStore::Source> sources(count);
+        fan(generic_partitions_.size(), [&](std::size_t p) {
             const auto& partition = generic_partitions_[p];
             const std::size_t from = p < held_before.size() ? held_before[p] : 0;
             for (std::size_t i = from; i < partition.keys.size(); ++i) {
@@ -5507,29 +5722,63 @@ class HashAggregateState final {
                 sources[partition.gids[i] - first] =
                     GroupKeyStore::Source{.store = slot.store, .index = slot.index};
             }
+        });
+        const std::span<const GroupKeyStore::Source> view{sources.data(), count};
+        std::vector<const GroupKeyStore*> stores;
+        stores.reserve(generic_partition_keys_.size());
+        for (const auto& store : generic_partition_keys_) {
+            stores.push_back(&store);
         }
-        const std::span<const GroupKeyStore::Source> view{sources};
-        group_keys_.prepare_fill(first, view);
+        group_keys_.prepare_fill_from(first, count, stores);
+
         const std::size_t columns = group_keys_.columns();
-        const std::size_t workers = std::min(columns, par_.discovery.worker_cap);
-        if (workers >= 2) {
-            std::atomic<std::size_t> next{0};
-            auto batch = process_worker_pool().submit(workers, [&](std::size_t) {
-                for (std::size_t c = next.fetch_add(1, std::memory_order_relaxed); c < columns;
-                     c = next.fetch_add(1, std::memory_order_relaxed)) {
-                    group_keys_.fill_column(c, first, view);
-                }
-            });
-            batch.wait();
-            return;
-        }
-        for (std::size_t c = 0; c < columns; ++c) {
-            group_keys_.fill_column(c, first, view);
-        }
+        constexpr std::size_t kMinRangeRows = std::size_t{1} << 16;
+        const std::size_t ranges = std::clamp<std::size_t>(count / kMinRangeRows, 1,
+                                                           std::max<std::size_t>(1, workers * 4));
+        const std::size_t grain = (count + ranges - 1) / ranges;
+        const auto range_of = [&](std::size_t r) {
+            const std::size_t lo = std::min(count, r * grain);
+            return std::pair{lo, std::min(count, lo + grain)};
+        };
+        // Columns are typed first (a column per task: claiming sizes its
+        // arrays), then text sized per range, then everything written.
+        std::vector<std::size_t> text_at(columns * (ranges + 1), 0);
+        fan(columns, [&](std::size_t c) { (void)group_keys_.prepare_column_from(c, stores, 0); });
+        fan(columns * ranges, [&](std::size_t t) {
+            const std::size_t c = t / ranges;
+            const std::size_t r = t % ranges;
+            const auto [lo, hi] = range_of(r);
+            text_at[(c * (ranges + 1)) + r + 1] =
+                group_keys_.text_bytes_of_sources(c, view, lo, hi);
+        });
+        fan(columns, [&](std::size_t c) {
+            std::size_t* at = text_at.data() + (c * (ranges + 1));
+            for (std::size_t r = 0; r < ranges; ++r) {
+                at[r + 1] += at[r];
+            }
+            const std::size_t base = group_keys_.prepare_column_from(c, stores, at[ranges]);
+            for (std::size_t r = 0; r <= ranges; ++r) {
+                at[r] += base;
+            }
+        });
+        fan((columns + 1) * ranges, [&](std::size_t t) {
+            const std::size_t c = t / ranges;
+            const auto [lo, hi] = range_of(t % ranges);
+            if (c == columns) {
+                group_keys_.fill_null_masks_range(first, view, lo, hi);
+            } else {
+                group_keys_.fill_column_range(c, first, view, lo, hi,
+                                              text_at[(c * (ranges + 1)) + (t % ranges)]);
+            }
+        });
     }
 
     /// Write the keys of groups `first ..` from the chunk rows that created
-    /// them, a column per worker (see `GroupKeyStore::prepare_fill_rows`).
+    /// them (see `GroupKeyStore::prepare_fill_rows`). Each column is cut into
+    /// row ranges, so a 6-column key is not a 6-worker copy: at h2o q10's
+    /// ~1e7 groups a column per worker was ~200 ms, three of them writing
+    /// Categorical text through a serial append. A text column's ranges are
+    /// sized first, so each knows where its bytes go.
     void fill_new_keys_from_rows(std::size_t first,
                                  const std::vector<const ColumnEntry*>& group_entries,
                                  std::span<const std::size_t> rows) {
@@ -5538,21 +5787,72 @@ class HashAggregateState final {
         }
         group_keys_.prepare_fill_rows(first, group_entries, rows);
         const std::size_t columns = group_entries.size();
-        const std::size_t workers = std::min(columns, par_.discovery.worker_cap);
-        if (workers >= 2) {
+        const std::size_t workers =
+            on_worker_pool_thread() ? std::size_t{1} : par_.discovery.worker_cap;
+        constexpr std::size_t kMinRangeRows = std::size_t{1} << 16;
+        const std::size_t ranges = std::clamp<std::size_t>(rows.size() / kMinRangeRows, 1,
+                                                           std::max<std::size_t>(1, workers * 4));
+        const std::size_t grain = (rows.size() + ranges - 1) / ranges;
+        const auto fan = [&](const auto& body) {
+            const std::size_t tasks = columns * ranges;
+            if (workers < 2 || tasks < 2) {
+                for (std::size_t t = 0; t < tasks; ++t) {
+                    body(t / ranges, t % ranges);
+                }
+                return;
+            }
             std::atomic<std::size_t> next{0};
-            auto batch = process_worker_pool().submit(workers, [&](std::size_t) {
-                for (std::size_t c = next.fetch_add(1, std::memory_order_relaxed); c < columns;
-                     c = next.fetch_add(1, std::memory_order_relaxed)) {
-                    group_keys_.fill_column_rows(c, first, group_entries, rows);
+            auto batch = process_worker_pool().submit(std::min(workers, tasks), [&](std::size_t) {
+                for (std::size_t t = next.fetch_add(1, std::memory_order_relaxed); t < tasks;
+                     t = next.fetch_add(1, std::memory_order_relaxed)) {
+                    body(t / ranges, t % ranges);
                 }
             });
             batch.wait();
-            return;
+        };
+        const auto range_of = [&](std::size_t r) {
+            const std::size_t lo = std::min(rows.size(), r * grain);
+            return std::pair{lo, std::min(rows.size(), lo + grain)};
+        };
+        // Text bytes per (column, range), then each range's starting byte.
+        std::vector<std::size_t> text_at(columns * (ranges + 1), 0);
+        fan([&](std::size_t c, std::size_t r) {
+            const auto [lo, hi] = range_of(r);
+            text_at[(c * (ranges + 1)) + r + 1] =
+                GroupKeyStore::text_bytes_of_rows(*group_entries[c]->column, rows, lo, hi);
+        });
+        // A column per task: claiming a column sizes (and zero-fills) its
+        // arrays, ~80-160 MB each at 1e7 groups, and each touches only its own.
+        const auto prepare = [&](std::size_t c) {
+            std::size_t* at = text_at.data() + (c * (ranges + 1));
+            for (std::size_t r = 0; r < ranges; ++r) {
+                at[r + 1] += at[r];
+            }
+            const std::size_t base =
+                group_keys_.prepare_column_rows(c, *group_entries[c]->column, at[ranges]);
+            for (std::size_t r = 0; r <= ranges; ++r) {
+                at[r] += base;
+            }
+        };
+        if (workers >= 2 && columns >= 2) {
+            std::atomic<std::size_t> next{0};
+            auto batch = process_worker_pool().submit(std::min(workers, columns), [&](std::size_t) {
+                for (std::size_t c = next.fetch_add(1, std::memory_order_relaxed); c < columns;
+                     c = next.fetch_add(1, std::memory_order_relaxed)) {
+                    prepare(c);
+                }
+            });
+            batch.wait();
+        } else {
+            for (std::size_t c = 0; c < columns; ++c) {
+                prepare(c);
+            }
         }
-        for (std::size_t c = 0; c < columns; ++c) {
-            group_keys_.fill_column_rows(c, first, group_entries, rows);
-        }
+        fan([&](std::size_t c, std::size_t r) {
+            const auto [lo, hi] = range_of(r);
+            group_keys_.fill_column_rows_range(c, first, *group_entries[c]->column, rows, lo, hi,
+                                               text_at[(c * (ranges + 1)) + r]);
+        });
     }
 
     /// Store non-null First aggregates at the row that creates each new group.
@@ -6912,8 +7212,9 @@ class HashAggregateState final {
     /// path, `CountDistinct`. Everything else is a fixed-width buffer that can
     /// be pre-sized once and then written by group index, which is what lets a
     /// narrow output still use the whole pool.
-    /// `Str` is the single-string key, laid out up front (offsets from
-    /// per-block lengths) so its spans copy bytes in parallel.
+    /// `Str` is a String key column -- the single-string path's, or a text
+    /// column of `group_keys_` -- laid out up front (offsets from per-block
+    /// lengths) so its spans copy bytes in parallel.
     enum class EmitSlot : std::uint8_t { Whole, I64, F64, DateKey, TsKey, Cat, Str };
 
     /// One emission task: a column, and the half-open group range of it to
@@ -7152,27 +7453,38 @@ class HashAggregateState final {
                         slot_kind[ci] = EmitSlot::Cat;
                         store_codes[ci] = codes;
                     }
+                } else if (std::holds_alternative<Column<std::string>>(col) &&
+                           group_keys_.is_text(ci)) {
+                    slot_kind[ci] = EmitSlot::Str;
                 }
             }
         }
         for (std::size_t i = 0; i < aggregations_->size(); ++i) {
             slot_kind[group_by_->size() + i] = emit_slot_for_agg(plan_[i].func, plan_[i].kind);
         }
-        // The string key's bytes before each `kEmitAlign` block of groups, so
-        // a span knows where its bytes go. At 5M groups the one serial
-        // push_back task was most of Emission, with the other workers idle.
-        std::vector<std::size_t> str_block_base;
-        if (str_fast_path_ && slot_kind[0] == EmitSlot::Str) {
+        // A String key column's bytes before each `kEmitAlign` block of
+        // groups, so a span knows where its bytes go. At 5M groups the one
+        // serial push_back task per such column was most of Emission, with
+        // the other workers idle.
+        const auto key_text = [&](std::size_t ci, std::size_t g) -> std::string_view {
+            return str_fast_path_ ? str_order_[g] : group_keys_.text(ci, g);
+        };
+        std::vector<std::vector<std::size_t>> str_block_base(group_by_->size());
+        for (std::size_t ci = 0; ci < group_by_->size(); ++ci) {
+            if (slot_kind[ci] != EmitSlot::Str) {
+                continue;
+            }
+            auto& base = str_block_base[ci];
             const std::size_t blocks = (n_groups_ + kEmitAlign - 1) / kEmitAlign;
-            str_block_base.assign(blocks + 1, 0);
+            base.assign(blocks + 1, 0);
             const auto sum_blocks = [&](std::size_t b_lo, std::size_t b_hi) {
                 for (std::size_t b = b_lo; b < b_hi; ++b) {
                     std::size_t bytes = 0;
                     const std::size_t end = std::min(n_groups_, (b + 1) * kEmitAlign);
                     for (std::size_t g = b * kEmitAlign; g < end; ++g) {
-                        bytes += str_order_[g].size();
+                        bytes += key_text(ci, g).size();
                     }
-                    str_block_base[b + 1] = bytes;
+                    base[b + 1] = bytes;
                 }
             };
             const std::size_t workers =
@@ -7190,16 +7502,16 @@ class HashAggregateState final {
                 sum_blocks(0, blocks);
             }
             for (std::size_t b = 0; b < blocks; ++b) {
-                str_block_base[b + 1] += str_block_base[b];
+                base[b + 1] += base[b];
             }
-            if (str_block_base[blocks] <= std::numeric_limits<std::uint32_t>::max()) {
-                auto& str_col = std::get<Column<std::string>>(out.mutable_column(0));
-                str_col.resize_for_gather(n_groups_, str_block_base[blocks]);
+            if (base[blocks] <= std::numeric_limits<std::uint32_t>::max()) {
+                auto& str_col = std::get<Column<std::string>>(out.mutable_column(ci));
+                str_col.resize_for_gather(n_groups_, base[blocks]);
                 str_col.offsets_data()[0] = 0;
             } else {
                 // Past the 32-bit offsets: append, and let the column refuse.
-                slot_kind[0] = EmitSlot::Whole;
-                str_block_base.clear();
+                slot_kind[ci] = EmitSlot::Whole;
+                base.clear();
             }
         }
         for (std::size_t c = 0; c < out.columns.size(); ++c) {
@@ -7264,6 +7576,29 @@ class HashAggregateState final {
         // which worker got which column.
         const auto emit_key_range = [&](std::size_t ci, std::size_t lo, std::size_t hi) {
             ColumnValue& col = out.mutable_column(ci);
+            if (slot_kind[ci] == EmitSlot::Str) {
+                // Spans start on a `kEmitAlign` boundary (or at 0), so no two
+                // share a validity word.
+                auto& str_col = std::get<Column<std::string>>(col);
+                std::uint32_t* offsets = str_col.offsets_data();
+                char* chars = str_col.chars_data();
+                std::size_t at = str_block_base[ci][lo / kEmitAlign];
+                const std::uint64_t null_bit =
+                    ci < kMaxKeyColumns ? std::uint64_t{1} << ci : std::uint64_t{0};
+                const bool nulls = !str_fast_path_ && any_null_keys != 0 && null_bit != 0;
+                for (std::size_t g = lo; g < hi; ++g) {
+                    const std::string_view key = key_text(ci, g);
+                    if (!key.empty()) {
+                        std::memcpy(chars + at, key.data(), key.size());
+                    }
+                    at += key.size();
+                    offsets[g + 1] = static_cast<std::uint32_t>(at);
+                    if (nulls && (group_keys_.null_mask(g) & null_bit) != 0) {
+                        key_validity[ci].set(g, false);
+                    }
+                }
+                return;
+            }
             if (cat_fast_path_) {
                 auto* codes = static_cast<Column<Categorical>::code_type*>(slot_data[ci]);
                 const std::size_t n_keys = group_by_->size();
@@ -7275,18 +7610,6 @@ class HashAggregateState final {
                     for (std::size_t g = lo; g < hi; ++g) {
                         codes[g] = multi_cat_codes_flat_[(g * n_keys) + ci];
                     }
-                }
-            } else if (str_fast_path_ && !str_block_base.empty()) {
-                // Spans start on a `kEmitAlign` boundary (or at 0).
-                auto& str_col = std::get<Column<std::string>>(col);
-                std::uint32_t* offsets = str_col.offsets_data();
-                char* chars = str_col.chars_data();
-                std::size_t at = str_block_base[lo / kEmitAlign];
-                for (std::size_t g = lo; g < hi; ++g) {
-                    const std::string_view key = str_order_[g];
-                    std::memcpy(chars + at, key.data(), key.size());
-                    at += key.size();
-                    offsets[g + 1] = static_cast<std::uint32_t>(at);
                 }
             } else if (str_fast_path_) {
                 auto& str_col = std::get<Column<std::string>>(col);
@@ -7578,6 +7901,44 @@ class HashAggregateState final {
     /// worker that owns its partition -- writes its key into that partition's
     /// store. `part_mask` must be the mask `try_discover_partitioned` uses
     /// (`discovery_partition_count() - 1`).
+    /// Prefetch key columns' cells at `row` -- or, with `text`, the bytes of
+    /// its String keys, whose offsets an earlier call fetched.
+    static void prefetch_key_row(const std::vector<KeyCol>& cols, std::size_t row, bool text) {
+        for (const KeyCol& col : cols) {
+            if (text) {
+                if (col.kind == KeyCol::Kind::Str) {
+                    __builtin_prefetch(col.str->chars_data() + col.str->offsets_data()[row]);
+                }
+                continue;
+            }
+            switch (col.kind) {
+                case KeyCol::Kind::Int64:
+                    __builtin_prefetch(col.i64 + row);
+                    break;
+                case KeyCol::Kind::Double:
+                    __builtin_prefetch(col.f64 + row);
+                    break;
+                case KeyCol::Kind::Cat:
+                    __builtin_prefetch(col.cat->codes_data() + row);
+                    break;
+                case KeyCol::Kind::Str:
+                    __builtin_prefetch(col.str->offsets_data() + row);
+                    break;
+                case KeyCol::Kind::Date:
+                    __builtin_prefetch(col.date + row);
+                    break;
+                case KeyCol::Kind::Ts:
+                    __builtin_prefetch(col.ts + row);
+                    break;
+                case KeyCol::Kind::Dec:
+                    __builtin_prefetch(col.dec + row);
+                    break;
+                case KeyCol::Kind::Bool:
+                    break;
+            }
+        }
+    }
+
     struct GenericRowProbe {
         std::uint64_t hash = 0;
         const std::vector<KeyCol>* cols = nullptr;
@@ -7773,8 +8134,6 @@ class HashAggregateState final {
     std::vector<std::uint64_t> row_hashes_;
     std::vector<std::uint8_t> part_of_row_;
     std::vector<std::size_t> scatter_rows_;
-    /// String keys' views in `scatter_rows_` order; see `try_discover_partitioned`.
-    std::vector<std::string_view> scatter_views_;
     std::vector<std::uint8_t> starts_group_;
     std::uint64_t rows_seen_ = 0;
 

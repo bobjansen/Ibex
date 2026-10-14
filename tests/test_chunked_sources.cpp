@@ -2241,3 +2241,134 @@ TEST_CASE("chunked aggregate: many string groups come out in first-seen order, b
         }
     }
 }
+
+TEST_CASE("chunked aggregate: six-column keys at ~1 group per row match a reference",
+          "[runtime][chunked][aggregate]") {
+    // h2o q10: `by { id1, ..., id6 }` with nearly every row its own group.
+    // The packed key (Categoricals and Int64s) now travels with its row
+    // through the scatter; the generic key (a String among them, and a
+    // nullable Int64) prefetches its columns; both fill their new groups'
+    // keys by row range, Categorical text and codes included. Expected values
+    // are computed here, in first-seen order, over one chunk and several.
+    constexpr std::size_t kRows = 300'007;
+    const std::vector<std::string> labels{"a", "bb", "ccc", "dddd", "eeeee"};
+    Column<Categorical>::codes_storage c1;
+    Column<Categorical>::codes_storage c2;
+    std::vector<std::string> s3(kRows);
+    runtime::ValidityBitmap s3_valid;
+    Column<std::int64_t> i4;
+    Column<std::int64_t> i5;
+    runtime::ValidityBitmap i5_valid;
+    Column<std::int64_t> i6;
+    Column<std::int64_t> v;
+    std::vector<std::array<std::int64_t, 6>> raw(kRows);
+    const auto s3_null = [&](std::size_t row) { return raw[row][2] % 13 == 0; };
+    for (std::size_t row = 0; row < kRows; ++row) {
+        const std::uint64_t h = (row * 2'654'435'761ULL) % 250'013;
+        raw[row] = {static_cast<std::int64_t>(h % 5),
+                    static_cast<std::int64_t>((h / 5) % 5),
+                    static_cast<std::int64_t>((h / 25) % 97),
+                    static_cast<std::int64_t>((h / 2425) % 11) - 5,
+                    static_cast<std::int64_t>(h % 7),
+                    static_cast<std::int64_t>(h % 3)};
+        c1.push_back(static_cast<Column<Categorical>::code_type>(raw[row][0]));
+        c2.push_back(static_cast<Column<Categorical>::code_type>(raw[row][1]));
+        s3[row] = "s" + std::to_string(raw[row][2]) +
+                  std::string(static_cast<std::size_t>(raw[row][2] % 9), 'z');
+        s3_valid.push_back(!s3_null(row));
+        i4.push_back(raw[row][3]);
+        i5.push_back(raw[row][4]);
+        i5_valid.push_back(raw[row][4] != 6);  // ~1/7 null
+        i6.push_back(raw[row][5]);
+        v.push_back(static_cast<std::int64_t>(row % 1'013));
+    }
+    runtime::Table t;
+    t.add_column("c1", Column<Categorical>(labels, std::move(c1)));
+    t.add_column("c2", Column<Categorical>(labels, std::move(c2)));
+    t.add_column("s3", Column<std::string>{s3}, std::move(s3_valid));
+    t.add_column("i4", std::move(i4));
+    t.add_column("i5", std::move(i5), std::move(i5_valid));
+    t.add_column("i6", std::move(i6));
+    t.add_column("v", std::move(v));
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    // packed: c1, c2, i4, i6 (+ i5 when null-free is not required: the
+    // generic case covers the nullable one); generic: all six.
+    struct Shape {
+        std::string by;
+        std::vector<int> cols;  // indices into raw
+    };
+    for (const Shape& shape : {Shape{"c1, c2, i4, i6", {0, 1, 3, 5}},
+                               Shape{"c1, c2, s3, i4, i5, i6", {0, 1, 2, 3, 4, 5}}}) {
+        std::vector<std::string> order;
+        std::map<std::string, std::pair<std::int64_t, std::int64_t>> want;
+        for (std::size_t row = 0; row < kRows; ++row) {
+            std::string key;
+            for (const int c : shape.cols) {
+                if (c == 4 && raw[row][4] == 6) {
+                    key += "null|";
+                } else if (c == 0 || c == 1) {
+                    key += labels[static_cast<std::size_t>(raw[row][static_cast<std::size_t>(c)])] +
+                           "|";
+                } else if (c == 2) {
+                    key += s3_null(row) ? std::string("null|") : s3[row] + "|";
+                } else {
+                    key += std::to_string(raw[row][static_cast<std::size_t>(c)]) + "|";
+                }
+            }
+            auto [it, fresh] = want.try_emplace(key);
+            if (fresh) {
+                order.push_back(key);
+            }
+            ++it->second.first;
+            it->second.second += static_cast<std::int64_t>(row % 1'013);
+        }
+        for (const char* grain : {"", "70001"}) {
+            INFO("by " << shape.by << " grain '" << grain << "'");
+            std::optional<ChunkGrainGuard> guard;
+            if (*grain != '\0') {
+                guard.emplace(grain);
+            }
+            auto program =
+                parser::parse("t[select { n = count(), s = sum(v) }, by { " + shape.by + " }];");
+            REQUIRE(program.has_value());
+            auto ir = parser::lower(program.value());
+            REQUIRE(ir.has_value());
+            runtime::ExecutionContext parallel;
+            parallel.parallel_threads = 8;
+            parallel.parallel_min_rows = 0;
+            const auto p =
+                runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+            REQUIRE(p.has_value());
+            REQUIRE(p->rows() == order.size());
+            const auto& pn = std::get<Column<std::int64_t>>(*p->find("n"));
+            const auto& ps = std::get<Column<std::int64_t>>(*p->find("s"));
+            const std::vector<std::string> names{"c1", "c2", "s3", "i4", "i5", "i6"};
+            for (std::size_t g = 0; g < order.size(); ++g) {
+                INFO("group " << g);
+                std::string got;
+                for (const int c : shape.cols) {
+                    const auto* entry = p->find_entry(names[static_cast<std::size_t>(c)]);
+                    REQUIRE(entry != nullptr);
+                    if (runtime::is_null(*entry, g)) {
+                        got += "null|";
+                    } else if (const auto* cat =
+                                   std::get_if<Column<Categorical>>(&*entry->column)) {
+                        got += std::string((*cat)[g]) + "|";
+                    } else if (const auto* str =
+                                   std::get_if<Column<std::string>>(&*entry->column)) {
+                        got += std::string((*str)[g]) + "|";
+                    } else {
+                        got +=
+                            std::to_string(std::get<Column<std::int64_t>>(*entry->column)[g]) + "|";
+                    }
+                }
+                REQUIRE(got == order[g]);
+                const auto& [n, sum] = want.at(order[g]);
+                REQUIRE(pn[g] == n);
+                REQUIRE(ps[g] == sum);
+            }
+        }
+    }
+}

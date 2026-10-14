@@ -21,9 +21,8 @@ Data is loaded once per process and not timed; each question is timed
 checked: row count and the upstream "chk" sums must agree across engines, or
 the row is flagged MISMATCH and the script exits non-zero.
 
-Ibex has no grouped `corr` aggregate, so groupby q9 (r^2 of v1, v2) is written
-as the closed form over six grouped sums. That is more work than a native
-kernel, so it can only flatter the other engines.
+Groupby q9 (r^2 of v1, v2) uses Ibex's grouped `corr(x, y)`, which, like the
+other engines' corr, skips any row where either side is null.
 
 Usage:
   uv run --project <ibex-root> benchmarking/h2o/run.py G1_1e7_1e2_0_0 J1_1e7_NA_0_0 \\
@@ -63,15 +62,11 @@ ABS_TOL = 1e-6
 # Each question: (id, upstream description, chk columns, ibex, polars, duckdb).
 # The chk columns are summed over the answer, exactly as upstream does; the
 # answer's row count is always checked too. `nas` is True for data generated
-# with NAs, where upstream's q8 drops null v3 explicitly and Ibex has to say
-# what the others do implicitly (corr over pairwise-complete rows).
+# with NAs, where upstream's q8 drops null v3 explicitly.
 
 def groupby_questions(nas: bool):
     import polars as pl
     nn = lambda *cols: ("filter " + " && ".join(f"is_not_null({c})" for c in cols) + ", ") if nas else ""
-    r2_sums = ("select { n = Float64(count()), sx = Float64(sum(v1)), sy = Float64(sum(v2)), "
-               "sxy = Float64(sum(v1 * v2)), sxx = Float64(sum(v1 * v1)), syy = Float64(sum(v2 * v2)) }")
-    r2 = "r2 = (n * sxy - sx * sy) * (n * sxy - sx * sy) / ((n * sxx - sx * sx) * (n * syy - sy * sy))"
     return [
         ("q1", "sum v1 by id1", ["v1"],
          "x[select { v1 = sum(v1) }, by id1]",
@@ -109,7 +104,7 @@ def groupby_questions(nas: bool):
                      .agg(pl.col("v3").top_k(2).alias("largest2_v3")).explode("largest2_v3")),
          "SELECT id6, unnest(max(v3, 2)) AS largest2_v3 FROM x WHERE v3 IS NOT NULL GROUP BY id6"),
         ("q9", "regression v1 v2 by id2 id4", ["r2"],
-         f"x[{nn('v1', 'v2')}{r2_sums}, by {{ id2, id4 }}][select {{ id2, id4, {r2} }}]",
+         "x[select { r2 = corr(v1, v2) }, by { id2, id4 }][update { r2 = r2 * r2 }]",
          lambda x: x.group_by(["id2", "id4"]).agg((pl.corr("v1", "v2") ** 2).alias("r2")),
          "SELECT id2, id4, pow(corr(v1, v2), 2) AS r2 FROM x GROUP BY id2, id4"),
         ("q10", "sum v3 count by id1:id6", ["v3", "count"],

@@ -22,11 +22,12 @@ where Ibex is known to be weak.
 | q6 | median v3 sd v3 by id4 id5 | `x[select { median_v3 = median(v3), sd_v3 = std(v3) }, by { id4, id5 }]` |
 | q7 | max v1 - min v2 by id3 | `x[select { range_v1_v2 = max(v1) - min(v2) }, by id3]` |
 | q8 | largest two v3 by id6 | `x[order { v3 desc }, head 2, by id6][select { id6, largest2_v3 = v3 }]` |
-| q9 | regression v1 v2 by id2 id4 | r² from six grouped sums (no grouped `corr` aggregate yet) |
+| q9 | regression v1 v2 by id2 id4 | `x[select { r2 = corr(v1, v2) }, by { id2, id4 }][update { r2 = r2 * r2 }]` |
 | q10 | sum v3 count by id1:id6 | `x[select { v3 = sum(v3), count = count() }, by { id1, …, id6 }]` |
 
-With NAs, q8 and q9 add `filter is_not_null(…)` to match what the other
-engines do implicitly. The full query text is in `run.py`.
+With NAs, q8 adds `filter is_not_null(v3)`, as upstream's solutions do. q9's
+`corr` skips any row where either side is null, as the other engines' does.
+The full query text is in `run.py`.
 
 **Join** (`J1_<N>_NA_<NA%>_<sorted>` plus its small/medium/big right tables),
 5 questions: small inner on int, medium inner on int, medium left on int,

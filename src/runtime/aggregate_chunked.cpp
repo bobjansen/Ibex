@@ -461,6 +461,48 @@ class DenseAggregateScanSink final : public ScanWorkerSink {
     EmittedWorkerPartial current_;
 };
 
+/// Append-only bytes for string group keys, handed out as views that stay
+/// valid for the arena's life -- moves included, since its blocks are on the
+/// heap and never reallocate. One writer per arena.
+///
+/// The single-string key used to be a `std::string` three times over: in a
+/// partition's index, in its key list, and in `str_order_`, and the index
+/// moved them as it grew. At h2o's 5M groups that was most of the probe.
+/// Now a group's bytes are copied once, here, and everything else holds a
+/// 16-byte view.
+class StringArena {
+   public:
+    StringArena() = default;
+    StringArena(const StringArena&) = delete;
+    auto operator=(const StringArena&) -> StringArena& = delete;
+    StringArena(StringArena&&) noexcept = default;
+    auto operator=(StringArena&&) noexcept -> StringArena& = default;
+    ~StringArena() = default;
+
+    [[nodiscard]] auto intern(std::string_view value) -> std::string_view {
+        if (value.empty()) {
+            return {};
+        }
+        if (value.size() > left_) {
+            const std::size_t size = std::max(kBlockBytes, value.size());
+            blocks_.push_back(std::make_unique_for_overwrite<char[]>(size));
+            next_ = blocks_.back().get();
+            left_ = size;
+        }
+        char* at = next_;
+        std::memcpy(at, value.data(), value.size());
+        next_ += value.size();
+        left_ -= value.size();
+        return {at, value.size()};
+    }
+
+   private:
+    static constexpr std::size_t kBlockBytes = std::size_t{1} << 20;
+    std::vector<std::unique_ptr<char[]>> blocks_;
+    char* next_ = nullptr;
+    std::size_t left_ = 0;
+};
+
 /// The generic group-by's keys, stored column by column.
 ///
 /// The generic path used to keep one boxed `Key` per group -- a vector of
@@ -1838,9 +1880,11 @@ class HashAggregateState final {
         const auto key_at = [&](std::size_t row) -> std::string_view {
             return std::string_view{src_chars + src_off[row], src_off[row + 1] - src_off[row]};
         };
-        if (try_discover_partitioned<std::string, StrViewHash, StrViewEq>(
+        if (try_discover_partitioned<std::string_view, StrViewHash, StrViewEq>(
                 key_at, rows, gids, str_partitions_, [&](std::size_t n) { str_order_.resize(n); },
-                [&](const std::string& key, std::uint32_t gid, std::size_t) {
+                [&](std::string_view key, std::uint32_t gid, std::size_t) {
+                    // A view of the partition's arena, which lives as long as
+                    // this operator.
                     str_order_[gid] = key;
                 },
                 kDefaultPartitionMinRows,
@@ -1859,15 +1903,14 @@ class HashAggregateState final {
             if (key == prev_key) {
                 gid = prev_gid;
             } else {
-                // Transparent lookup on string_view avoids constructing a
-                // std::string per probe. Insertions pay one std::string
-                // construction per novel key — with libstdc++'s 15-char SSO,
-                // 11-char user_id strings stay inline (no heap alloc).
+                // Probed with a view of the row; a novel key's bytes are
+                // copied once, into `str_arena_`.
                 auto it = str_index_.find(key);
                 if (it == str_index_.end()) {
                     gid = static_cast<std::uint32_t>(n_groups_);
-                    str_index_.emplace(std::string(key), gid);
-                    str_order_.emplace_back(key);
+                    const std::string_view owned = str_arena_.intern(key);
+                    str_index_.emplace(owned, gid);
+                    str_order_.push_back(owned);
                     ++n_groups_;
                     size_group_arrays();
                 } else {
@@ -3959,13 +4002,15 @@ class HashAggregateState final {
     /// construction — a key's partition is a function of its hash — so a worker
     /// owning a partition owns every row and every group in it, and needs no
     /// lock and no merge against the others.
-    /// `Eq` is spelled out so a transparent hash/equal pair can be used: the
-    /// string path stores owning `std::string` keys but probes with
-    /// `std::string_view`, and only pays the copy on a genuinely new group —
-    /// exactly what the serial `str_index_` does.
+    /// `Eq` is spelled out so a transparent hash/equal pair can be used. The
+    /// string path's `Key` is a `std::string_view`: a new group's bytes are
+    /// copied once into `arena`, and the index, `keys` and the caller all
+    /// hold views of that copy.
     template <typename Key, typename Hash, typename Eq = std::equal_to<Key>>
     struct KeyPartition {
         robin_hood::unordered_flat_map<Key, std::uint32_t, Hash, Eq> index;
+        /// Owns a string key's bytes; unused by every other key type.
+        StringArena arena;
         /// This partition's groups, in the order they were first seen — which,
         /// because rows are scattered in row order, is ascending by first row.
         /// That is what makes the final ordering a merge of already-sorted
@@ -4184,19 +4229,35 @@ class HashAggregateState final {
         }
 
         // Pass 2: scatter row indices into their partition's slice.
+        // A string key's view goes along with its row: read here in row
+        // order, it costs a sequential pass, where the probe below would
+        // otherwise miss on the offsets before it could even prefetch the
+        // bytes.
+        constexpr bool kScatterViews =
+            std::is_same_v<decltype(key_at(std::size_t{0})), std::string_view>;
         scatter_rows_.resize(rows);
+        if constexpr (kScatterViews) {
+            scatter_views_.resize(rows);
+        }
         {
             auto batch = pool.submit(ranges, [&](std::size_t r) {
                 const std::size_t begin = r * grain;
                 const std::size_t end = std::min(rows, begin + grain);
                 std::size_t* cursor = offsets.data() + (r * part_count);
                 for (std::size_t row = begin; row < end; ++row) {
-                    scatter_rows_[cursor[part_of_row_[row]]++] = row;
+                    const std::size_t at = cursor[part_of_row_[row]]++;
+                    scatter_rows_[at] = row;
+                    if constexpr (kScatterViews) {
+                        scatter_views_[at] = key_at(row);
+                    }
                 }
             });
             batch.wait();
         }
 
+        // Which rows start a group, marked by the probe; one byte each, so
+        // workers on different partitions never share a write.
+        starts_group_.assign(rows, 0);
         // Pass 3: each worker owns whole partitions. Ids assigned here are
         // partition-LOCAL — a plain counter, no atomic — because a global id
         // cannot be handed out in first-occurrence order until every partition
@@ -4212,13 +4273,11 @@ class HashAggregateState final {
                     for (std::size_t i = part_begin[p]; i < part_end; ++i) {
                         // A partition's rows are ascending but sparse, so a
                         // string key's bytes are a cache miss per row: fetch
-                        // the key a few rows ahead while probing this one
-                        // (h2o q3 at 5M groups: probe 257 -> 190 ms).
-                        if constexpr (std::is_same_v<decltype(key_at(std::size_t{0})),
-                                                     std::string_view>) {
+                        // the key a few rows ahead while probing this one.
+                        if constexpr (kScatterViews) {
                             constexpr std::size_t kAhead = 16;
                             if (i + kAhead < part_end) {
-                                __builtin_prefetch(key_at(scatter_rows_[i + kAhead]).data());
+                                __builtin_prefetch(scatter_views_[i + kAhead].data());
                             }
                         }
                         const std::size_t row = scatter_rows_[i];
@@ -4226,7 +4285,13 @@ class HashAggregateState final {
                         // the key column (strings), and materializing an owning
                         // key per ROW rather than per GROUP is the whole cost
                         // this path exists to avoid.
-                        const auto key = key_at(row);
+                        const auto key = [&] {
+                            if constexpr (kScatterViews) {
+                                return scatter_views_[i];
+                            } else {
+                                return key_at(row);
+                            }
+                        }();
                         auto it = partition.index.find(key);
                         std::uint32_t local{};
                         if (it == partition.index.end()) {
@@ -4236,9 +4301,18 @@ class HashAggregateState final {
                             // second time: for a key that owns a heap
                             // allocation (the generic path's), that is one
                             // build per group instead of two.
-                            const auto inserted = partition.index.emplace(Key(key), local).first;
+                            Key owned = [&] {
+                                if constexpr (std::is_same_v<Key, std::string_view>) {
+                                    return partition.arena.intern(key);
+                                } else {
+                                    return Key(key);
+                                }
+                            }();
+                            const auto inserted =
+                                partition.index.emplace(std::move(owned), local).first;
                             partition.gids.push_back(0);  // filled below, in order
                             partition.first_rows.push_back(row_base + row);
+                            starts_group_[row] = 1;
                             partition.keys.emplace_back(inserted->first);
                         } else {
                             local = it->second;
@@ -4259,8 +4333,8 @@ class HashAggregateState final {
         // cost more than the parallel discovery saved (+25% median). Paying one
         // ordered pass here instead keeps every later pass sequential.
         //
-        // The order is read off the rows: a row starts a group when it is its
-        // partition entry's first row. Each range counts its starters, a prefix
+        // The order is read off the rows: the probe marked every row that
+        // started a group (`starts_group_`). Each range counts its starters, a prefix
         // over ranges gives each range its first id, and a second scan hands
         // the ids out in row order -- every new group is numbered by the one
         // range holding its first row, so nothing is shared. This replaced a
@@ -4271,11 +4345,8 @@ class HashAggregateState final {
         // first row, so appending after them preserves the global order.
         const std::size_t base = n_groups_;
         {
-            const auto starts_group = [&](std::size_t row) {
-                const auto& partition = partitions[part_of_row_[row]];
-                const std::uint32_t local = gids[row];
-                return local >= partition.stored && partition.first_rows[local] == row_base + row;
-            };
+            const std::uint8_t* starts = starts_group_.data();
+            const auto starts_group = [&](std::size_t row) { return starts[row] != 0; };
             std::vector<std::size_t> starters(ranges + 1, 0);
             auto count = pool.submit(ranges, [&](std::size_t r) {
                 const std::size_t begin = r * grain;
@@ -4506,7 +4577,7 @@ class HashAggregateState final {
     void migrate_str_fast_path_to_generic() {
         seed_generic_index_from_keys(n_groups_, [&](std::size_t i) {
             Key key;
-            key.values.emplace_back(str_order_[i]);
+            key.values.emplace_back(std::string(str_order_[i]));
             return key;
         });
         str_fast_path_ = false;
@@ -7212,7 +7283,7 @@ class HashAggregateState final {
                 char* chars = str_col.chars_data();
                 std::size_t at = str_block_base[lo / kEmitAlign];
                 for (std::size_t g = lo; g < hi; ++g) {
-                    const std::string& key = str_order_[g];
+                    const std::string_view key = str_order_[g];
                     std::memcpy(chars + at, key.data(), key.size());
                     at += key.size();
                     offsets[g + 1] = static_cast<std::uint32_t>(at);
@@ -7471,24 +7542,13 @@ class HashAggregateState final {
     // Transparent hash/eq: lets `str_index_.find(string_view)` skip the
     // allocation of a temporary std::string on every probe.
     struct StrViewHash {
-        using is_transparent = void;
         auto operator()(std::string_view s) const noexcept -> std::size_t {
-            return robin_hood::hash_bytes(s.data(), s.size());
-        }
-        auto operator()(const std::string& s) const noexcept -> std::size_t {
             return robin_hood::hash_bytes(s.data(), s.size());
         }
     };
     struct StrViewEq {
-        using is_transparent = void;
-        auto operator()(const std::string& a, const std::string& b) const noexcept -> bool {
+        auto operator()(std::string_view a, std::string_view b) const noexcept -> bool {
             return a == b;
-        }
-        auto operator()(const std::string& a, std::string_view b) const noexcept -> bool {
-            return std::string_view(a) == b;
-        }
-        auto operator()(std::string_view a, const std::string& b) const noexcept -> bool {
-            return a == std::string_view(b);
         }
     };
     struct CatKeyHash {
@@ -7648,8 +7708,12 @@ class HashAggregateState final {
     std::vector<std::uint64_t> multi_cat_strides_;  // last-seen strides for rebuild detection
 
     // Single-string-key fast path.
-    robin_hood::unordered_flat_map<std::string, std::size_t, StrViewHash, StrViewEq> str_index_;
-    std::vector<std::string> str_order_;
+    /// Views of `str_arena_` (serial path) or of `str_partitions_`' arenas
+    /// (partitioned path); see `StringArena`.
+    robin_hood::unordered_flat_map<std::string_view, std::size_t, StrViewHash, StrViewEq>
+        str_index_;
+    std::vector<std::string_view> str_order_;
+    StringArena str_arena_;
 
     // Single fixed-width-integer-key fast path (int64 / Date / Timestamp, no
     // nulls): a direct value -> gid map, no owned Key per group. `group by <int
@@ -7700,7 +7764,7 @@ class HashAggregateState final {
     /// first-occurrence numbering is merged on.
     std::vector<KeyPartition<PairIntKey, PairIntKeyHash>> pair_partitions_;
     std::vector<KeyPartition<std::int64_t, robin_hood::hash<std::int64_t>>> int_partitions_;
-    std::vector<KeyPartition<std::string, StrViewHash, StrViewEq>> str_partitions_;
+    std::vector<KeyPartition<std::string_view, StrViewHash, StrViewEq>> str_partitions_;
     std::vector<KeyPartition<GenericGroupSlot, GenericKeyHash, GenericKeyEq>> generic_partitions_;
     std::vector<GroupKeyStore> generic_partition_keys_;
     /// `partitioned_active_` is one flag for every key shape; this says the
@@ -7709,6 +7773,9 @@ class HashAggregateState final {
     std::vector<std::uint64_t> row_hashes_;
     std::vector<std::uint8_t> part_of_row_;
     std::vector<std::size_t> scatter_rows_;
+    /// String keys' views in `scatter_rows_` order; see `try_discover_partitioned`.
+    std::vector<std::string_view> scatter_views_;
+    std::vector<std::uint8_t> starts_group_;
     std::uint64_t rows_seen_ = 0;
 
     // --- Partition-owned aggregation (step 2 of the partition-owned

@@ -756,11 +756,12 @@ auto make_field(std::string alias, ir::Expr expr) -> ir::FieldSpec {
 }
 
 auto make_agg(ir::AggFunc func, std::string col_name, std::string alias, double param,
-              bool is_count) -> ir::AggSpec {
+              bool is_count, std::string paired) -> ir::AggSpec {
     return ir::AggSpec{.func = func,
                        .column = ir::ColumnRef{.name = std::move(col_name)},
                        .alias = std::move(alias),
                        .param = param,
+                       .paired = ir::ColumnRef{.name = std::move(paired)},
                        .is_count = is_count};
 }
 

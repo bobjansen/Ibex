@@ -135,8 +135,11 @@ auto agg_nullability(const AggSpec& agg, const SchemaInfo& input, bool grouped) 
         case AggFunc::Quantile:
         case AggFunc::Skew:
         case AggFunc::Kurtosis:
+        case AggFunc::Cov:
+        case AggFunc::Corr:
             // Under-claimed on purpose: each is undefined for a group below
-            // some size and this pass has no bound on group size.
+            // some size and this pass has no bound on group size (and corr
+            // for a constant column).
             return Nullability::Maybe;
         case AggFunc::Count:
         case AggFunc::CountDistinct:

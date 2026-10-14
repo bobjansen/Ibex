@@ -303,7 +303,16 @@ enum class AggFunc : std::uint8_t {
                ///< double).
     Skew,      ///< Sample skewness (Fisher–Pearson, n≥3; ignores nulls; always returns double).
     Kurtosis,  ///< Sample excess kurtosis (n≥4; ignores nulls; always returns double).
+    Cov,       ///< cov(x, y): sample covariance, n-1 denominator, over the rows where both are
+               ///< non-null (n≥2; always returns double).
+    Corr,      ///< corr(x, y): Pearson correlation over the rows where both are non-null (n≥2,
+               ///< neither constant; always returns double).
 };
+
+/// Whether `func` reads two columns (`AggSpec::column` and `AggSpec::paired`).
+[[nodiscard]] constexpr auto agg_is_paired(AggFunc func) noexcept -> bool {
+    return func == AggFunc::Cov || func == AggFunc::Corr;
+}
 
 /// Join type.
 enum class JoinKind : std::uint8_t {
@@ -502,6 +511,11 @@ struct AggSpec {
     ColumnRef column;
     std::string alias;
     double param = 0.0;  ///< Function-specific parameter (e.g. alpha for Ewma).
+    /// The second column of a two-column aggregate (`cov`, `corr`: the `y` of
+    /// `f(x, y)`, with `column` the `x`); empty for every other function. A
+    /// pass that reads, renames or demands an aggregate's input column must
+    /// treat this one the same way.
+    ColumnRef paired{};
     /// `count(col)`, lowered as a Sum over a 0/1 not-null flag. Only the value
     /// over no rows differs from a plain Sum: a count of nothing is 0, not null.
     bool is_count = false;

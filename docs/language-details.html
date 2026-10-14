@@ -798,7 +798,10 @@ orders[
             <code>last</code>, &hellip;) returns null for an all-null group,
             plus <code>std</code> on fewer than 2 non-null values,
             <code>skew</code> on fewer than 3, <code>kurtosis</code> on
-            fewer than 4. Only <code>count</code> never returns null.
+            fewer than 4, and <code>cov</code>/<code>corr</code> on fewer
+            than 2 rows where both inputs are present (<code>corr</code> also
+            when either side is constant). Only <code>count</code> never
+            returns null.
           </p>
           <p>
             A <code>TimeFrame</code>&rsquo;s time index may not contain nulls

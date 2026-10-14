@@ -298,6 +298,25 @@ TEST_CASE("emitter: aggregate node with parameterized function", "[codegen]") {
     CHECK(contains(out, ", 0.5)"));
 }
 
+TEST_CASE("emitter: a paired aggregate carries its second column", "[codegen]") {
+    ir::Builder b;
+    auto agg = b.aggregate({}, {ir::AggSpec{.func = ir::AggFunc::Corr,
+                                            .column = ir::ColumnRef{.name = "x"},
+                                            .alias = "r",
+                                            .paired = ir::ColumnRef{.name = "y"}},
+                                ir::AggSpec{.func = ir::AggFunc::Cov,
+                                            .column = ir::ColumnRef{.name = "x"},
+                                            .alias = "c",
+                                            .paired = ir::ColumnRef{.name = "y"}}});
+    agg->add_child(make_source(b, "trades.csv"));
+
+    auto out = emit_to_string(*agg);
+    CHECK(contains(
+        out, "ibex::ops::make_agg(ibex::ir::AggFunc::Corr, \"x\", \"r\", 0.0, false, \"y\")"));
+    CHECK(contains(out,
+                   "ibex::ops::make_agg(ibex::ir::AggFunc::Cov, \"x\", \"c\", 0.0, false, \"y\")"));
+}
+
 // --- Resample ----------------------------------------------------------------
 
 TEST_CASE("emitter: resample node - OHLC with group-by", "[codegen]") {

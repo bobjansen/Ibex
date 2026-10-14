@@ -512,6 +512,7 @@ void prune_lifted_inputs(AggregateNode& agg, const LiftPlan& plan) {
     }
     for (const auto& spec : agg.aggregations()) {
         droppable.erase(spec.column.name);
+        droppable.erase(spec.paired.name);
     }
     NodePtr* slot = agg.children().empty() ? nullptr : &agg.mutable_children().front();
     while (slot != nullptr && *slot != nullptr && !droppable.empty()) {

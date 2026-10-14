@@ -9,6 +9,7 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/lazy_table.hpp>
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
@@ -2314,6 +2315,20 @@ TEST_CASE("REPL narrows an in-memory table to the columns a plan reads, on both 
         CHECK(ints("g") == std::vector<std::int64_t>{1, 1, 1, 2, 2, 3});
         CHECK(doubles("v_l") == std::vector<double>{5.0, 9.0, 7.0, 1.0, 3.0, 4.0});
         CHECK(dropped == 2);  // pad1, pad2
+
+        // cov(x, y) reads its second column too: Σ(v - 29/6)(pad1 - 1/2) = -1/2,
+        // over n - 1 = 5.
+        run("x[select { c = cov(v, pad1) }]");
+        REQUIRE(doubles("c").size() == 1);
+        CHECK(doubles("c")[0] == Catch::Approx(-0.1));
+        CHECK(dropped == 2);  // g, pad2
+        // With a count() beside it the aggregate keeps no projection of its
+        // inputs below it, so the demand comes from the aggregate itself.
+        run("x[select { c = cov(v, pad1), n = count() }]");
+        REQUIRE(doubles("c").size() == 1);
+        CHECK(doubles("c")[0] == Catch::Approx(-0.1));
+        CHECK(ints("n") == std::vector<std::int64_t>{6});
+        CHECK(dropped == 2);  // g, pad2
     }
 }
 

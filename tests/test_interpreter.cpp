@@ -6493,6 +6493,142 @@ TEST_CASE("Interpret sample stddev grouped") {
     CHECK((*sv)[1] == Catch::Approx(1.41421356).epsilon(1e-5));
 }
 
+TEST_CASE("Interpret grouped corr and cov against a two-pass reference",
+          "[interpreter][aggregate][corr]") {
+    // Pairs count only where both sides are present. Group 5 has a constant
+    // y (corr undefined, cov 0), group 6 a single pair (both undefined). The
+    // reference is the textbook two-pass computation.
+    constexpr std::size_t kRows = 2'003;
+    Column<double> x;
+    Column<std::int64_t> y;
+    Column<std::int64_t> g;
+    runtime::ValidityBitmap xv;
+    runtime::ValidityBitmap yv;
+    for (std::size_t row = 0; row < kRows; ++row) {
+        const auto group = static_cast<std::int64_t>(row == kRows - 1 ? 6 : row % 6);
+        g.push_back(group);
+        x.push_back(static_cast<double>((row * 7919) % 1'000) / 10.0 + 1e6);
+        y.push_back(group == 5 ? 42 : static_cast<std::int64_t>((row * 104'729) % 997) - 300);
+        xv.push_back(row % 7 != 3);
+        yv.push_back(row % 11 != 4 || group == 6);
+    }
+    runtime::Table table;
+    table.add_column("x", x, xv);
+    table.add_column("y", y, yv);
+    table.add_column("g", g);
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    struct Want {
+        std::optional<double> cov;
+        std::optional<double> corr;
+    };
+    std::map<std::int64_t, Want> want;
+    {
+        std::map<std::int64_t, std::vector<std::pair<double, double>>> pairs;
+        for (std::size_t row = 0; row < kRows; ++row) {
+            pairs[g[row]];
+            if (xv[row] && yv[row]) {
+                pairs[g[row]].emplace_back(x[row], static_cast<double>(y[row]));
+            }
+        }
+        for (const auto& [key, ps] : pairs) {
+            Want w;
+            const auto n = static_cast<double>(ps.size());
+            if (ps.size() >= 2) {
+                double mx = 0.0;
+                double my = 0.0;
+                for (const auto& [a, b] : ps) {
+                    mx += a;
+                    my += b;
+                }
+                mx /= n;
+                my /= n;
+                double sxy = 0.0;
+                double sxx = 0.0;
+                double syy = 0.0;
+                for (const auto& [a, b] : ps) {
+                    sxy += (a - mx) * (b - my);
+                    sxx += (a - mx) * (a - mx);
+                    syy += (b - my) * (b - my);
+                }
+                w.cov = sxy / (n - 1.0);
+                if (sxx > 0.0 && syy > 0.0) {
+                    w.corr = sxy / std::sqrt(sxx * syy);
+                }
+            }
+            want[key] = w;
+        }
+    }
+
+    auto ir = require_ir("t[select { c = cov(x, y), r = corr(x, y) }, by g][order { g asc }];");
+    // Serially, and across workers: there each row range folds into its own
+    // co-moments, merged per group.
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 8;
+    parallel.parallel_min_rows = 0;
+    for (const bool fan_out : {false, true}) {
+        INFO("fan_out " << fan_out);
+        auto result = fan_out
+                          ? runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel)
+                          : runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        REQUIRE(result->rows() == want.size());
+        const auto* c_entry = result->find_entry("c");
+        const auto* r_entry = result->find_entry("r");
+        REQUIRE(c_entry != nullptr);
+        REQUIRE(r_entry != nullptr);
+        const auto& cs = std::get<Column<double>>(*c_entry->column);
+        const auto& rs = std::get<Column<double>>(*r_entry->column);
+        const auto& gs = std::get<Column<std::int64_t>>(*result->find("g"));
+        for (std::size_t i = 0; i < result->rows(); ++i) {
+            INFO("group " << gs[i]);
+            const Want& w = want.at(gs[i]);
+            REQUIRE(runtime::is_null(*c_entry, i) == !w.cov.has_value());
+            REQUIRE(runtime::is_null(*r_entry, i) == !w.corr.has_value());
+            if (w.cov.has_value()) {
+                CHECK(cs[i] == Catch::Approx(*w.cov).epsilon(1e-9).margin(1e-9));
+            }
+            if (w.corr.has_value()) {
+                CHECK(rs[i] == Catch::Approx(*w.corr).epsilon(1e-9));
+            }
+        }
+    }
+    CHECK(want.at(5).cov.has_value());         // the constant y: cov 0 ...
+    CHECK_FALSE(want.at(5).corr.has_value());  // ... corr undefined
+    CHECK_FALSE(want.at(6).cov.has_value());   // one pair
+
+    // The same values through update + by (per row), a computed argument and
+    // the ungrouped form.
+    auto upd = runtime::interpret(*require_ir("t[update { r = corr(x, y) }, by g];"), registry);
+    REQUIRE(upd.has_value());
+    const auto* upd_r = upd->find_entry("r");
+    const auto& upd_g = std::get<Column<std::int64_t>>(*upd->find("g"));
+    for (std::size_t row = 0; row < upd->rows(); ++row) {
+        const Want& w = want.at(upd_g[row]);
+        REQUIRE(runtime::is_null(*upd_r, row) == !w.corr.has_value());
+        if (w.corr.has_value()) {
+            CHECK(std::get<Column<double>>(*upd_r->column)[row] ==
+                  Catch::Approx(*w.corr).epsilon(1e-9));
+        }
+    }
+    auto scaled = runtime::interpret(
+        *require_ir("t[select { r = corr(x * -2.0, y) }, by g][order { g asc }];"), registry);
+    REQUIRE(scaled.has_value());
+    const auto& scaled_r = std::get<Column<double>>(*scaled->find("r"));
+    CHECK(scaled_r[0] == Catch::Approx(-*want.at(0).corr).epsilon(1e-9));
+
+    // Errors: a string column, and the arity.
+    runtime::Table text;
+    text.add_column("s", Column<std::string>{"a", "b"});
+    text.add_column("v", Column<double>{1.0, 2.0});
+    runtime::TableRegistry text_registry;
+    text_registry.emplace("u", text);
+    auto bad = runtime::interpret(*require_ir("u[select { r = corr(s, v) }];"), text_registry);
+    REQUIRE_FALSE(bad.has_value());
+    CHECK(bad.error().find("Int64 or Float64") != std::string::npos);
+}
+
 TEST_CASE("Interpret stddev single element is null") {
     runtime::Table table;
     table.add_column("v", Column<double>{5.0});

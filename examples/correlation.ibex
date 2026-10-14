@@ -1,0 +1,39 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Ibex Correlation Demo  ·  grouped corr(x, y) / cov(x, y)
+//
+//  `corr(x, y)` and `cov(x, y)` are aggregates: one value per group, over the
+//  rows where both x and y are present. The bare `[corr]` / `[cov]` clauses
+//  are something else -- the correlation / covariance MATRIX of every numeric
+//  column of a table.
+//
+//  Run:  ./build-release/tools/ibex examples/correlation.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+let trades = Table {
+    desk   = ["fx", "fx", "fx", "fx", "rates", "rates", "rates", "rates"],
+    qty    = [10.0, 20.0, 30.0, 40.0, 5.0, 15.0, 25.0, 35.0],
+    pnl    = [1.0, 2.5, 2.9, 4.2, -1.0, 0.5, NULL, -2.0],
+    spread = [0.2, 0.2, 0.2, 0.2, 0.4, 0.3, 0.2, 0.1],
+};
+
+// ── 1. One value per desk ───────────────────────────────────────────────────
+// `rates` has a null pnl: that row drops out of both pnl aggregates. `fx` has
+// a constant spread, so corr(qty, spread) is null there (cov is 0).
+print("══════════ 1. corr / cov by desk ══════════");
+print(trades[select {
+    r_pnl    = corr(qty, pnl),
+    cov_pnl  = cov(qty, pnl),
+    r_spread = corr(qty, spread),
+}, by desk]);
+
+// ── 2. Arguments may be expressions; r² is just corr squared ────────────────
+print("══════════ 2. r² of notional vs pnl ══════════");
+print(trades[select { r2 = corr(qty * 100.0, pnl) * corr(qty * 100.0, pnl) }, by desk]);
+
+// ── 3. Broadcast back onto every row with update + by ───────────────────────
+print("══════════ 3. update + by ══════════");
+print(trades[update { desk_r = corr(qty, pnl) }, by desk]);
+
+// ── 4. Contrast: the matrix clause over all numeric columns ─────────────────
+print("══════════ 4. [corr] matrix ══════════");
+print(trades[filter desk == "fx", select { qty, spread, pnl }][corr]);

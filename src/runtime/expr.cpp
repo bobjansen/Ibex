@@ -838,8 +838,8 @@ auto validate_builtin(std::string_view name, const BuiltinFn& fn) -> void {
         builtin_invariant(name, "GeneratorExec is missing its column evaluator");
     }
     if (const auto* aggregate = std::get_if<AggregateExec>(&fn.exec);
-        aggregate != nullptr && static_cast<std::uint8_t>(aggregate->func) >
-                                    static_cast<std::uint8_t>(ir::AggFunc::Kurtosis)) {
+        aggregate != nullptr &&
+        static_cast<std::uint8_t>(aggregate->func) > static_cast<std::uint8_t>(ir::AggFunc::Corr)) {
         builtin_invariant(name, "AggregateExec has an invalid aggregate function id");
     }
 }
@@ -1905,9 +1905,9 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                 }
                 return a[0];
             }
-            return ExprType::Double;  // mean/median/std/ewma/quantile/skew/kurtosis
+            return ExprType::Double;  // mean/median/std/ewma/quantile/skew/kurtosis/cov/corr
         };
-        constexpr std::array<std::pair<std::string_view, ir::AggFunc>, 14> agg_funcs{{
+        constexpr std::array<std::pair<std::string_view, ir::AggFunc>, 16> agg_funcs{{
             {"sum", ir::AggFunc::Sum},
             {"mean", ir::AggFunc::Mean},
             {"min", ir::AggFunc::Min},
@@ -1922,6 +1922,8 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
             {"quantile", ir::AggFunc::Quantile},
             {"skew", ir::AggFunc::Skew},
             {"kurtosis", ir::AggFunc::Kurtosis},
+            {"cov", ir::AggFunc::Cov},
+            {"corr", ir::AggFunc::Corr},
         }};
         for (const auto& [name, func] : agg_funcs) {
             m.emplace(name, BuiltinFn{

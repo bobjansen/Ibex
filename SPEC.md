@@ -168,6 +168,11 @@ Bool   String Date    Timestamp
 Int    Series DataFrame TimeFrame
 ```
 
+`cov` and `corr` are the one exception to "may not be used as function
+names": followed by `(` in an expression they are the paired aggregates
+`cov(x, y)` and `corr(x, y)` (Section 7.1), while the bare words remain the
+matrix clauses (`df[cov]`, `df[corr]`). No user function can take either name.
+
 Built-in function names are **soft-reserved**: they cannot be shadowed by user
 bindings but are not syntactic keywords. Built-ins are intentionally minimal;
 prefer `extern fn` hooks for functionality implemented in C++.
@@ -762,6 +767,8 @@ first(col)  // first non-null value; null for an all-null group
 last(col)   // last non-null value; null for an all-null group
 std(col)    // ignores null rows; returns null if fewer than 2 non-null values
 ewma(col, alpha)  // ignores null rows; returns null for an empty group
+cov(x, y)   // only rows where both x and y are non-null; null if fewer than 2 such rows
+corr(x, y)  // as cov, and null when either column is constant over those rows
 ```
 
 Over a `Decimal(p, s)` column, `sum` is `Decimal(38, s)` (exact, and an error
@@ -769,7 +776,7 @@ past 38 digits); `min`, `max`, `first` and `last` keep the column's type;
 `mean` divides the exact sum in decimal (without capping the quotient's scale at 38) and only then
 converts to `Float64`, so `mean` of `0.10, 0.20, 0.30` is exactly `0.2`; `count` and
 `count_distinct` are `Int64`. The statistical aggregates (`median`, `std`,
-`quantile`, `ewma`, `skew`, `kurtosis`) are not defined for `Decimal` — convert
+`quantile`, `ewma`, `skew`, `kurtosis`, `cov`, `corr`) are not defined for `Decimal` — convert
 explicitly with `Float64(x)`, which states the rounding rather than hiding it.
 
 A null aggregate result behaves like any other null downstream: it broadcasts
@@ -2884,6 +2891,8 @@ The following built-in functions are **aggregate functions**. They consume a
 | `median(col)`         | `Series<Numeric>`  | `Float64`  | Middle value; null rows are ignored. Even-length groups return the average of the two middle values. |
 | `std(col)`            | `Series<Numeric>`  | `Float64`  | Sample standard deviation (denominator n − 1). Returns null for groups with fewer than 2 non-null values. |
 | `ewma(col, alpha)`    | `Series<Numeric>`  | `Float64`  | Exponentially weighted moving average. `alpha` ∈ (0, 1] is a numeric literal; rows are processed in storage order within each group. Returns null if the group is empty. |
+| `cov(x, y)`           | `Series<Numeric>` × 2 | `Float64` | Sample covariance (denominator n − 1) over the rows where **both** `x` and `y` are non-null. Returns null for groups with fewer than 2 such rows. Either argument may be an expression. |
+| `corr(x, y)`          | `Series<Numeric>` × 2 | `Float64` | Pearson correlation over the same rows as `cov`. Returns null for groups with fewer than 2 such rows, or where `x` or `y` is constant (SQL's `CORR` rule). |
 
 `Numeric` denotes `Int32 | Int64 | Float32 | Float64`.
 

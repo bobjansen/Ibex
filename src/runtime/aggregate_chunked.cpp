@@ -4016,14 +4016,25 @@ class HashAggregateState final {
     struct NoGroupKeys {};
 
     /// How many partitions `try_discover_partitioned` splits rows into: a
-    /// power of two, so a partition is `hash & (count - 1)`, capped by the
-    /// Discovery node's workers.
+    /// power of two, so a partition is `hash & (count - 1)`, and a fixed
+    /// function of the Discovery node's workers, so every chunk of a stream
+    /// agrees on it.
+    ///
+    /// Several per worker, not one: at h2o's 5M string groups one partition
+    /// per worker held ~625k keys, ~40 MB of table, and every probe missed
+    /// cache. Sixteen per worker keeps a partition's table near L2 at that
+    /// size and lets the workers balance over them. It was capped at the
+    /// worker count while numbering was a P-way merge; numbering is now a
+    /// row scan, which does not care how many partitions there are.
+    /// `part_of_row_` is one byte, hence the 256.
     [[nodiscard]] auto discovery_partition_count() const -> std::size_t {
-        std::size_t part_count = 1;
-        while (part_count * 2 <= par_.discovery.worker_cap) {
-            part_count *= 2;
+        constexpr std::size_t kPerWorker = 16;
+        constexpr std::size_t kMax = 256;
+        std::size_t workers = 1;
+        while (workers * 2 <= par_.discovery.worker_cap) {
+            workers *= 2;
         }
-        return part_count;
+        return std::min(kMax, workers * kPerWorker);
     }
 
     /// Whether `try_discover_partitioned` would run for a chunk of `rows`, so a
@@ -4197,7 +4208,19 @@ class HashAggregateState final {
                 for (std::size_t p = cursor.fetch_add(1, std::memory_order_relaxed); p < part_count;
                      p = cursor.fetch_add(1, std::memory_order_relaxed)) {
                     auto& partition = partitions[p];
-                    for (std::size_t i = part_begin[p]; i < part_begin[p + 1]; ++i) {
+                    const std::size_t part_end = part_begin[p + 1];
+                    for (std::size_t i = part_begin[p]; i < part_end; ++i) {
+                        // A partition's rows are ascending but sparse, so a
+                        // string key's bytes are a cache miss per row: fetch
+                        // the key a few rows ahead while probing this one
+                        // (h2o q3 at 5M groups: probe 257 -> 190 ms).
+                        if constexpr (std::is_same_v<decltype(key_at(std::size_t{0})),
+                                                     std::string_view>) {
+                            constexpr std::size_t kAhead = 16;
+                            if (i + kAhead < part_end) {
+                                __builtin_prefetch(key_at(scatter_rows_[i + kAhead]).data());
+                            }
+                        }
                         const std::size_t row = scatter_rows_[i];
                         // `auto`, not `Key`: the probe type may be a view onto
                         // the key column (strings), and materializing an owning
@@ -4236,62 +4259,77 @@ class HashAggregateState final {
         // cost more than the parallel discovery saved (+25% median). Paying one
         // ordered pass here instead keeps every later pass sequential.
         //
-        // Each partition's new entries are already ascending by first row, so
-        // this is a P-way merge. Groups carried over from earlier chunks keep
-        // their ids: a group first seen in a later chunk necessarily has a later
+        // The order is read off the rows: a row starts a group when it is its
+        // partition entry's first row. Each range counts its starters, a prefix
+        // over ranges gives each range its first id, and a second scan hands
+        // the ids out in row order -- every new group is numbered by the one
+        // range holding its first row, so nothing is shared. This replaced a
+        // P-way merge over the partitions' first rows, which cost O(groups x
+        // partitions) on one thread and was why the partitions were capped at
+        // the worker count. Groups carried over from earlier chunks keep their
+        // ids: a group first seen in a later chunk necessarily has a later
         // first row, so appending after them preserves the global order.
-        //
-        // Rescanning every partition per group is O(groups x partitions), and
-        // replacing it with the textbook heap (replace-top, one sift per group,
-        // O(groups log partitions)) is a MEASURED DEAD END: q18's merge went
-        // 25.6ms -> 27.1ms and q20's 7.9ms -> 13.1ms, suite +0.15% over 12
-        // interleaved rounds. P is `part_count`, a power of two capped by the
-        // worker count -- 8 here. Eight predictable compares over an array that
-        // never leaves L1 beat three sift levels of data-dependent branching and
-        // struct moves. A heap would need dozens of runs before it paid.
         const std::size_t base = n_groups_;
         {
-            std::vector<std::size_t> cursors(part_count);
-            for (std::size_t p = 0; p < part_count; ++p) {
-                cursors[p] = partitions[p].stored;
+            const auto starts_group = [&](std::size_t row) {
+                const auto& partition = partitions[part_of_row_[row]];
+                const std::uint32_t local = gids[row];
+                return local >= partition.stored && partition.first_rows[local] == row_base + row;
+            };
+            std::vector<std::size_t> starters(ranges + 1, 0);
+            auto count = pool.submit(ranges, [&](std::size_t r) {
+                const std::size_t begin = r * grain;
+                const std::size_t end = std::min(rows, begin + grain);
+                std::size_t n = 0;
+                for (std::size_t row = begin; row < end; ++row) {
+                    n += starts_group(row) ? 1 : 0;
+                }
+                starters[r + 1] = n;
+            });
+            count.wait();
+            for (std::size_t r = 0; r < ranges; ++r) {
+                starters[r + 1] += starters[r];
             }
-            auto next = static_cast<std::uint32_t>(base);
-            while (true) {
-                std::size_t best = part_count;
-                std::uint64_t best_row = std::numeric_limits<std::uint64_t>::max();
-                for (std::size_t p = 0; p < part_count; ++p) {
-                    if (cursors[p] >= partitions[p].first_rows.size()) {
-                        continue;
-                    }
-                    if (partitions[p].first_rows[cursors[p]] < best_row) {
-                        best_row = partitions[p].first_rows[cursors[p]];
-                        best = p;
+            auto number = pool.submit(ranges, [&](std::size_t r) {
+                const std::size_t begin = r * grain;
+                const std::size_t end = std::min(rows, begin + grain);
+                auto next = static_cast<std::uint32_t>(base + starters[r]);
+                for (std::size_t row = begin; row < end; ++row) {
+                    if (starts_group(row)) {
+                        partitions[part_of_row_[row]].gids[gids[row]] = next++;
                     }
                 }
-                if (best == part_count) {
-                    break;
-                }
-                partitions[best].gids[cursors[best]] = next++;
-                ++cursors[best];
-            }
-            n_groups_ = next;
+            });
+            number.wait();
+            n_groups_ = base + starters[ranges];
         }
         size_group_arrays();
         // The caller's gid-indexed key vector has to cover the ids just handed
-        // out before any of them is written back.
+        // out before any of them is written back. Every `store_key` writes
+        // only its own gid's entries, so partitions are written back in
+        // parallel: at 5M string groups this copy alone was ~50 ms serial.
         resize_keys(n_groups_);
-        for (auto& partition : partitions) {
-            for (std::size_t i = partition.stored; i < partition.gids.size(); ++i) {
-                // The third argument is the group's first row WITHIN THIS
-                // CHUNK. Only entries from `stored` on are visited, and those
-                // are exactly the groups this call discovered, so their first
-                // row is always local and `row_base` recovers it. A packed key
-                // is not invertible on its own — the packed path uses this row
-                // to read the original column values back for the output.
-                store_key(partition.keys[i], partition.gids[i],
-                          static_cast<std::size_t>(partition.first_rows[i] - row_base));
-            }
-            partition.stored = partition.gids.size();
+        {
+            std::atomic<std::size_t> cursor{0};
+            auto batch = pool.submit(std::min(workers, part_count), [&](std::size_t) {
+                for (std::size_t p = cursor.fetch_add(1, std::memory_order_relaxed); p < part_count;
+                     p = cursor.fetch_add(1, std::memory_order_relaxed)) {
+                    auto& partition = partitions[p];
+                    for (std::size_t i = partition.stored; i < partition.gids.size(); ++i) {
+                        // The third argument is the group's first row WITHIN
+                        // THIS CHUNK. Only entries from `stored` on are
+                        // visited, and those are exactly the groups this call
+                        // discovered, so their first row is always local and
+                        // `row_base` recovers it. A packed key is not
+                        // invertible on its own -- the packed path uses this
+                        // row to read the original column values back.
+                        store_key(partition.keys[i], partition.gids[i],
+                                  static_cast<std::size_t>(partition.first_rows[i] - row_base));
+                    }
+                    partition.stored = partition.gids.size();
+                }
+            });
+            batch.wait();
         }
 
         // Pass 4: local id -> global gid. The partition a row belongs to is
@@ -6803,7 +6841,9 @@ class HashAggregateState final {
     /// path, `CountDistinct`. Everything else is a fixed-width buffer that can
     /// be pre-sized once and then written by group index, which is what lets a
     /// narrow output still use the whole pool.
-    enum class EmitSlot : std::uint8_t { Whole, I64, F64, DateKey, TsKey, Cat };
+    /// `Str` is the single-string key, laid out up front (offsets from
+    /// per-block lengths) so its spans copy bytes in parallel.
+    enum class EmitSlot : std::uint8_t { Whole, I64, F64, DateKey, TsKey, Cat, Str };
 
     /// One emission task: a column, and the half-open group range of it to
     /// write. `Whole` columns get exactly one task covering every group.
@@ -6895,6 +6935,7 @@ class HashAggregateState final {
                 c.resize_for_overwrite(n);
                 return c.codes_data();
             }
+            case EmitSlot::Str:
             case EmitSlot::Whole:
                 break;
         }
@@ -6920,6 +6961,7 @@ class HashAggregateState final {
                     static_cast<Column<Categorical>::code_type>(raw);
                 return;
             case EmitSlot::F64:
+            case EmitSlot::Str:
             case EmitSlot::Whole:
                 // No key kind produces either: `emit_slot_for_int_key` never
                 // returns them, and only it feeds this.
@@ -7015,6 +7057,8 @@ class HashAggregateState final {
         for (std::size_t ci = 0; ci < group_by_->size(); ++ci) {
             if (cat_fast_path_) {
                 slot_kind[ci] = EmitSlot::Cat;
+            } else if (str_fast_path_) {
+                slot_kind[ci] = EmitSlot::Str;
             } else if (int_fast_path_) {
                 slot_kind[ci] = emit_slot_for_int_key(int_key_kind_);
             } else if (pair_int_fast_path_) {
@@ -7043,8 +7087,55 @@ class HashAggregateState final {
         for (std::size_t i = 0; i < aggregations_->size(); ++i) {
             slot_kind[group_by_->size() + i] = emit_slot_for_agg(plan_[i].func, plan_[i].kind);
         }
+        // The string key's bytes before each `kEmitAlign` block of groups, so
+        // a span knows where its bytes go. At 5M groups the one serial
+        // push_back task was most of Emission, with the other workers idle.
+        std::vector<std::size_t> str_block_base;
+        if (str_fast_path_ && slot_kind[0] == EmitSlot::Str) {
+            const std::size_t blocks = (n_groups_ + kEmitAlign - 1) / kEmitAlign;
+            str_block_base.assign(blocks + 1, 0);
+            const auto sum_blocks = [&](std::size_t b_lo, std::size_t b_hi) {
+                for (std::size_t b = b_lo; b < b_hi; ++b) {
+                    std::size_t bytes = 0;
+                    const std::size_t end = std::min(n_groups_, (b + 1) * kEmitAlign);
+                    for (std::size_t g = b * kEmitAlign; g < end; ++g) {
+                        bytes += str_order_[g].size();
+                    }
+                    str_block_base[b + 1] = bytes;
+                }
+            };
+            const std::size_t workers =
+                exec_ != nullptr && par_.emission.decline == physical::FanOutDecline::None &&
+                        !on_worker_pool_thread() && n_groups_ >= par_.emission.row_floor
+                    ? std::min(par_.emission.worker_cap, blocks)
+                    : std::size_t{1};
+            if (workers > 1) {
+                const std::size_t grain = (blocks + workers - 1) / workers;
+                auto batch = process_worker_pool().submit(workers, [&](std::size_t w) {
+                    sum_blocks(std::min(blocks, w * grain), std::min(blocks, (w + 1) * grain));
+                });
+                batch.wait();
+            } else {
+                sum_blocks(0, blocks);
+            }
+            for (std::size_t b = 0; b < blocks; ++b) {
+                str_block_base[b + 1] += str_block_base[b];
+            }
+            if (str_block_base[blocks] <= std::numeric_limits<std::uint32_t>::max()) {
+                auto& str_col = std::get<Column<std::string>>(out.mutable_column(0));
+                str_col.resize_for_gather(n_groups_, str_block_base[blocks]);
+                str_col.offsets_data()[0] = 0;
+            } else {
+                // Past the 32-bit offsets: append, and let the column refuse.
+                slot_kind[0] = EmitSlot::Whole;
+                str_block_base.clear();
+            }
+        }
         for (std::size_t c = 0; c < out.columns.size(); ++c) {
             ColumnValue& col = out.mutable_column(c);
+            if (slot_kind[c] == EmitSlot::Str) {
+                continue;
+            }
             if (slot_kind[c] == EmitSlot::Whole) {
                 std::visit([&](auto& x) { x.reserve(n_groups_); }, col);
                 continue;
@@ -7113,6 +7204,18 @@ class HashAggregateState final {
                     for (std::size_t g = lo; g < hi; ++g) {
                         codes[g] = multi_cat_codes_flat_[(g * n_keys) + ci];
                     }
+                }
+            } else if (str_fast_path_ && !str_block_base.empty()) {
+                // Spans start on a `kEmitAlign` boundary (or at 0).
+                auto& str_col = std::get<Column<std::string>>(col);
+                std::uint32_t* offsets = str_col.offsets_data();
+                char* chars = str_col.chars_data();
+                std::size_t at = str_block_base[lo / kEmitAlign];
+                for (std::size_t g = lo; g < hi; ++g) {
+                    const std::string& key = str_order_[g];
+                    std::memcpy(chars + at, key.data(), key.size());
+                    at += key.size();
+                    offsets[g + 1] = static_cast<std::uint32_t>(at);
                 }
             } else if (str_fast_path_) {
                 auto& str_col = std::get<Column<std::string>>(col);

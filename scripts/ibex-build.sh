@@ -86,28 +86,11 @@ fi
 [[ -d "$BUILD_DIR/_deps/fast_float-src/include" ]] &&
     IBEX_INCS+=("-isystem" "$BUILD_DIR/_deps/fast_float-src/include")
 
-# jemalloc: pools large freed allocations instead of returning them to the OS,
-# eliminating page-fault overhead on repeated large-table operations.
-# The versioned .so.2 name is used because most distros don't ship an unversioned symlink.
-_jemalloc=""
-for _candidate in \
-        "$(ldconfig -p 2>/dev/null | awk '/libjemalloc\.so\.2/{print $NF; exit}')" \
-        /usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
-        /usr/lib/aarch64-linux-gnu/libjemalloc.so.2 \
-        /usr/lib/libjemalloc.so.2 \
-        /usr/local/lib/libjemalloc.so.2; do
-    if [[ -n "$_candidate" && -f "$_candidate" ]]; then
-        _jemalloc="$_candidate"
-        break
-    fi
-done
-
 IBEX_LIBS=(
     "$BUILD_DIR/src/runtime/libibex_runtime.a"
     "$BUILD_DIR/src/ir/libibex_ir.a"
     "$BUILD_DIR/src/core/libibex_core.a"
 )
-[[ -n "$_jemalloc" ]] && IBEX_LIBS+=("$_jemalloc")
 
 # ── Transpile then compile ────────────────────────────────────────────────────
 TMPDIR_WORK="$(mktemp -d)"

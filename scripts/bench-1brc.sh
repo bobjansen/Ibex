@@ -174,25 +174,11 @@ if [[ "$SKIP_COMPILED" -eq 0 ]]; then
         done < <(find "$IBEX_ROOT/libs" -mindepth 1 -maxdepth 1 -type d -print0)
     fi
 
-    JEMALLOC_LIB=""
-    for candidate in \
-        "$(ldconfig -p 2>/dev/null | awk '/libjemalloc\.so\.2/{print $NF; exit}')" \
-        /usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
-        /usr/lib/aarch64-linux-gnu/libjemalloc.so.2 \
-        /usr/lib/libjemalloc.so.2 \
-        /usr/local/lib/libjemalloc.so.2; do
-        if [[ -n "$candidate" && -f "$candidate" ]]; then
-            JEMALLOC_LIB="$candidate"
-            break
-        fi
-    done
-
     "$IBEX_COMPILE" --no-print "$BENCH_QUERY" -o "$CPP_FILE" >&2
     "$CXX" $CXXFLAGS "${IBEX_INCS[@]}" "$CPP_FILE" \
         "$BUILD_DIR/src/runtime/libibex_runtime.a" \
         "$BUILD_DIR/src/ir/libibex_ir.a" \
         "$BUILD_DIR/src/core/libibex_core.a" \
-        ${JEMALLOC_LIB:+$JEMALLOC_LIB} \
         -o "$COMPILED_BIN"
 fi
 

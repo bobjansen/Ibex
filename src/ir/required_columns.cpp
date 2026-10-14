@@ -210,6 +210,9 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
                 if (!spec.column.name.empty()) {
                     below.add(spec.column.name);
                 }
+                if (!spec.paired.name.empty()) {
+                    below.add(spec.paired.name);
+                }
             }
             visit_children(node, below, out);
             return;

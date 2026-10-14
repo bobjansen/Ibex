@@ -29,6 +29,7 @@
 #include <memory>
 #include <optional>
 #include <robin_hood.h>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -161,6 +162,20 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         agg_columns.push_back(entry->column.get());
     }
 
+    // The `y` of cov(x, y) / corr(x, y); nullptr for every other aggregate.
+    std::vector<const ColumnEntry*> paired_entries(aggregations.size(), nullptr);
+    for (std::size_t i = 0; i < aggregations.size(); ++i) {
+        if (!ir::agg_is_paired(aggregations[i].func)) {
+            continue;
+        }
+        const auto* entry = input.find_entry(aggregations[i].paired.name);
+        if (entry == nullptr) {
+            return std::unexpected("aggregate column not found: " + aggregations[i].paired.name +
+                                   " (available: " + format_columns(input) + ")");
+        }
+        paired_entries[i] = entry;
+    }
+
     std::vector<const ValidityBitmap*> agg_validity;
     agg_validity.reserve(aggregations.size());
     bool has_nullable_agg_inputs = false;
@@ -220,10 +235,24 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             return std::unexpected("string aggregation not supported");
         }
 
+        if (ir::agg_is_paired(agg.func)) {
+            const auto numeric = [](const ColumnValue& column) {
+                return std::holds_alternative<Column<std::int64_t>>(column) ||
+                       std::holds_alternative<Column<double>>(column);
+            };
+            if (!numeric(*agg_columns[i]) || !numeric(*paired_entries[i]->column)) {
+                return std::unexpected(
+                    std::string(agg.func == ir::AggFunc::Cov ? "cov" : "corr") + "(" +
+                    agg.column.name + ", " + agg.paired.name +
+                    "): both columns must be Int64 or Float64 (convert with Float64(x) first)");
+            }
+            item.kind = ExprType::Double;
+        }
+
         if (agg.func == ir::AggFunc::Median || agg.func == ir::AggFunc::Stddev ||
             agg.func == ir::AggFunc::Ewma || agg.func == ir::AggFunc::Quantile ||
             agg.func == ir::AggFunc::Skew || agg.func == ir::AggFunc::Kurtosis ||
-            agg.func == ir::AggFunc::CountDistinct) {
+            agg.func == ir::AggFunc::CountDistinct || ir::agg_is_paired(agg.func)) {
             // CountDistinct keeps a per-group set of seen values -- like the
             // moment aggregates it cannot be folded into a scalar accumulator,
             // so it takes the row-wise grouping path below.
@@ -269,6 +298,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             if (agg.func == ir::AggFunc::Count) {
                 slot.count += 1;
                 continue;
+            }
+            if (ir::agg_is_paired(agg.func)) {
+                continue;  // the co-moment pass below, after grouping
             }
             // Every aggregate that reads a value skips null rows: first/last
             // are the first/last NON-null value (SPEC 3.5), not the first row.
@@ -405,6 +437,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::Quantile:
                     case ir::AggFunc::Skew:
                     case ir::AggFunc::Kurtosis:
+                    case ir::AggFunc::Cov:
+                    case ir::AggFunc::Corr:
                         break;
                 }
                 slot.has_value = true;
@@ -444,6 +478,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::Quantile:
                     case ir::AggFunc::Skew:
                     case ir::AggFunc::Kurtosis:
+                    case ir::AggFunc::Cov:
+                    case ir::AggFunc::Corr:
                         break;
                 }
                 slot.has_value = true;
@@ -517,6 +553,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::Quantile:
                     case ir::AggFunc::Skew:
                     case ir::AggFunc::Kurtosis:
+                    case ir::AggFunc::Cov:
+                    case ir::AggFunc::Corr:
                         break;
                 }
                 slot.has_value = true;
@@ -555,6 +593,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::Quantile:
                     case ir::AggFunc::Skew:
                     case ir::AggFunc::Kurtosis:
+                    case ir::AggFunc::Cov:
+                    case ir::AggFunc::Corr:
                         break;
                 }
                 slot.has_value = true;
@@ -592,6 +632,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 case ir::AggFunc::Quantile:
                 case ir::AggFunc::Skew:
                 case ir::AggFunc::Kurtosis:
+                case ir::AggFunc::Cov:
+                case ir::AggFunc::Corr:
                     column = Column<double>{};
                     break;
                 case ir::AggFunc::Sum:
@@ -694,6 +736,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 case ir::AggFunc::Quantile:
                 case ir::AggFunc::Skew:
                 case ir::AggFunc::Kurtosis:
+                case ir::AggFunc::Cov:
+                case ir::AggFunc::Corr:
                     append_scalar(*column, slot.double_value);
                     break;
             }
@@ -725,6 +769,11 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 return slot.count >= 3;
             case ir::AggFunc::Kurtosis:
                 return slot.count >= 4;
+            // The co-moment pass sets has_value exactly when the result is
+            // defined (two pairs, and for corr neither side constant).
+            case ir::AggFunc::Cov:
+            case ir::AggFunc::Corr:
+                return slot.has_value;
             case ir::AggFunc::Count:
             case ir::AggFunc::CountDistinct:
                 return true;
@@ -1036,17 +1085,20 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         // directly. Only allocate row_gid when a collect-aggregate is present.
         std::vector<std::size_t> collect_aggs;
         std::vector<std::size_t> count_distinct_aggs;
+        std::vector<std::size_t> paired_aggs;
         for (std::size_t i = 0; i < plan.size(); ++i) {
             if (plan[i].func == ir::AggFunc::Median || plan[i].func == ir::AggFunc::Quantile ||
                 plan[i].func == ir::AggFunc::Skew || plan[i].func == ir::AggFunc::Kurtosis) {
                 collect_aggs.push_back(i);
             } else if (plan[i].func == ir::AggFunc::CountDistinct) {
                 count_distinct_aggs.push_back(i);
+            } else if (ir::agg_is_paired(plan[i].func)) {
+                paired_aggs.push_back(i);
             }
         }
         // Every path below writes each row's group id before anything reads it.
         ::ibex::detail::NoInitVector<std::uint32_t> row_gid;
-        if (!collect_aggs.empty() || !count_distinct_aggs.empty()) {
+        if (!collect_aggs.empty() || !count_distinct_aggs.empty() || !paired_aggs.empty()) {
             row_gid.resize(rows);
         }
         // Fixed contiguous row ranges, one per worker, numbered in row order.
@@ -1098,8 +1150,11 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         // and is skipped when every aggregate is collected below. A nullable
         // key has one more offset past its span for null; the index the
         // groups are created through already tells null from the payload.
+        // cov/corr are folded after grouping too, so they count here.
         const bool collect_only =
-            !collect_aggs.empty() && collect_aggs.size() == aggregations.size();
+            !collect_aggs.empty() || !paired_aggs.empty()
+                ? collect_aggs.size() + paired_aggs.size() == aggregations.size()
+                : false;
         std::vector<std::int64_t> cell_lo(key_cols.size(), 0);
         std::vector<std::uint64_t> cell_stride(key_cols.size(), 0);
         std::vector<std::uint64_t> cell_null(key_cols.size(), 0);
@@ -1377,6 +1432,62 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             }
         }
 
+        // cov(x, y) / corr(x, y): fold each row where both sides are present
+        // into its group's co-moment, then finish into the slot -- the value
+        // in double_value, and has_value exactly when it is defined. With
+        // several workers and few enough groups, each row range folds into
+        // its own co-moments, merged per group in range order.
+        if (!paired_aggs.empty()) {
+            const std::size_t n_groups = states.size();
+            for (const std::size_t ai : paired_aggs) {
+                const ColumnValue& xs = *agg_columns[ai];
+                const ColumnValue& ys = *paired_entries[ai]->column;
+                const ValidityBitmap* xv = agg_validity[ai];
+                const ValidityBitmap* yv = paired_entries[ai]->validity.has_value()
+                                               ? &*paired_entries[ai]->validity
+                                               : nullptr;
+                const auto value_at = [](const ColumnValue& column, std::size_t row) {
+                    if (const auto* d = std::get_if<Column<double>>(&column)) {
+                        return (*d)[row];
+                    }
+                    return static_cast<double>(std::get<Column<std::int64_t>>(column)[row]);
+                };
+                const auto fold = [&](std::span<CoMoment> acc, std::size_t begin, std::size_t end) {
+                    for (std::size_t row = begin; row < end; ++row) {
+                        if ((xv != nullptr && !(*xv)[row]) || (yv != nullptr && !(*yv)[row])) {
+                            continue;
+                        }
+                        co_moment_add(acc[row_gid[row]], value_at(xs, row), value_at(ys, row));
+                    }
+                };
+                std::vector<CoMoment> acc(n_groups);
+                constexpr std::size_t kMaxPartialGroups = std::size_t{1} << 20;
+                const std::size_t workers =
+                    exec != nullptr ? group_barrier_worker_count(*exec, rows) : 0;
+                if (workers >= 2 && rows > 0 && n_groups * workers <= kMaxPartialGroups) {
+                    std::vector<CoMoment> partial(workers * n_groups);
+                    for_row_range(workers, [&](std::size_t r, std::size_t b, std::size_t e) {
+                        fold(std::span<CoMoment>(partial).subspan(r * n_groups, n_groups), b, e);
+                    });
+                    for (std::size_t r = 0; r < workers; ++r) {
+                        for (std::size_t g = 0; g < n_groups; ++g) {
+                            co_moment_merge(acc[g], partial[(r * n_groups) + g]);
+                        }
+                    }
+                } else {
+                    fold(acc, 0, rows);
+                }
+                const bool corr = plan[ai].func == ir::AggFunc::Corr;
+                for (std::size_t g = 0; g < n_groups; ++g) {
+                    AggSlot& slot = states[g].slots[ai];
+                    const auto result = corr ? co_moment_corr(acc[g]) : co_moment_cov(acc[g]);
+                    slot.count = static_cast<std::int64_t>(acc[g].n);
+                    slot.has_value = result.has_value();
+                    slot.double_value = result.value_or(0.0);
+                }
+            }
+        }
+
         // Contiguous collect pass: per aggregate, histogram group sizes into a
         // prefix-sum offset table, scatter the value column into ONE flat buffer
         // by group id (buf[cursor[g]++] = v — no per-group vector, no pointer
@@ -1575,7 +1686,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 func == ir::AggFunc::Last || func == ir::AggFunc::Median ||
                 func == ir::AggFunc::Stddev || func == ir::AggFunc::Ewma ||
                 func == ir::AggFunc::Quantile || func == ir::AggFunc::Skew ||
-                func == ir::AggFunc::Kurtosis) {
+                func == ir::AggFunc::Kurtosis || ir::agg_is_paired(func)) {
                 track_agg_validity[i] = 1U;
                 agg_validity_out[i].reserve(group_order.size());
             }
@@ -2425,6 +2536,22 @@ auto aggregate_call_to_spec(const ir::CallExpr& call, std::string alias)
     if (call.args.empty()) {
         return std::unexpected(call.callee + "(): expected column argument");
     }
+    if (ir::agg_is_paired(*func)) {
+        if (call.args.size() != 2) {
+            return std::unexpected(call.callee + "() takes two arguments: " + call.callee +
+                                   "(x, y)");
+        }
+        const auto* x = ir::as_column_ref(*call.args[0]);
+        const auto* y = ir::as_column_ref(*call.args[1]);
+        if (x == nullptr || y == nullptr) {
+            // A computed argument: the fold path materialises it.
+            return std::optional<ir::AggSpec>{};
+        }
+        return std::optional<ir::AggSpec>{ir::AggSpec{.func = *func,
+                                                      .column = ir::ColumnRef{.name = x->name},
+                                                      .alias = std::move(alias),
+                                                      .paired = ir::ColumnRef{.name = y->name}}};
+    }
     if (call.callee == "ewma" || call.callee == "quantile") {
         if (call.args.size() != 2) {
             return std::unexpected(call.callee + "(): expected two arguments");
@@ -2564,27 +2691,33 @@ auto eval_aggregate_call_scalar(const ir::CallExpr& node, const Table& input,
         } else {
             return std::unexpected(node.callee + "(): second argument must be a numeric literal");
         }
+    } else if (ir::agg_is_paired(*func)) {
+        if (node.args.size() != 2) {
+            return std::unexpected(node.callee + "() takes two arguments: " + node.callee +
+                                   "(x, y)");
+        }
     } else if (node.args.size() != 1) {
         return std::unexpected("aggregate functions take one argument");
     }
-    // If the aggregate's first arg is a bare column we aggregate it
-    // directly; otherwise materialise the computed arg as a temp
-    // column appended to a shallow copy of the input (columns are
-    // shared_ptr-backed, so the copy is cheap).
-    const auto* col_ref = ir::as_column_ref(*node.args[0]);
+    // A bare column argument is aggregated directly; a computed one is
+    // materialised as a temp column appended to a shallow copy of the input
+    // (columns are shared_ptr-backed, so the copy is cheap).
     Table working;
-    const Table* effective_input = &input;
-    std::string agg_col_name;
-    if (col_ref != nullptr) {
-        agg_col_name = col_ref->name;
-    } else {
-        auto col_result =
-            eval_value_vec(*node.args[0], input, scalars, RowRange::whole(input.rows()));
+    bool copied = false;
+    const auto argument_column =
+        [&](const ir::Expr& arg) -> std::expected<std::string, std::string> {
+        if (const auto* col_ref = ir::as_column_ref(arg)) {
+            return col_ref->name;
+        }
+        auto col_result = eval_value_vec(arg, input, scalars, RowRange::whole(input.rows()));
         if (!col_result) {
             return std::unexpected(col_result.error());
         }
-        working = input;
-        agg_col_name = "__agg_broadcast_arg";
+        if (!copied) {
+            working = input;
+            copied = true;
+        }
+        std::string agg_col_name = "__agg_broadcast_arg";
         while (working.find(agg_col_name) != nullptr) {
             agg_col_name += '_';
         }
@@ -2605,13 +2738,27 @@ auto eval_aggregate_call_scalar(const ir::CallExpr& node, const Table& input,
         } else {
             working.add_column(agg_col_name, std::move(materialised));
         }
-        effective_input = &working;
+        return agg_col_name;
+    };
+    auto agg_col_name = argument_column(*node.args[0]);
+    if (!agg_col_name) {
+        return std::unexpected(agg_col_name.error());
     }
+    std::string paired_name;
+    if (ir::agg_is_paired(*func)) {
+        auto paired = argument_column(*node.args[1]);
+        if (!paired) {
+            return std::unexpected(paired.error());
+        }
+        paired_name = std::move(*paired);
+    }
+    const Table* effective_input = copied ? &working : &input;
     ir::AggSpec spec{
         .func = *func,
-        .column = ir::ColumnRef{.name = agg_col_name},
+        .column = ir::ColumnRef{.name = std::move(*agg_col_name)},
         .alias = "__agg_broadcast",
         .param = param,
+        .paired = ir::ColumnRef{.name = std::move(paired_name)},
     };
     auto agg = aggregate_table(*effective_input, {}, std::vector<ir::AggSpec>{std::move(spec)});
     if (!agg) {

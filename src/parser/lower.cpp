@@ -5836,6 +5836,15 @@ class Lowerer {
                     temp_columns[alias] = true;
                     return ir::Expr{.node = ir::ColumnRef{.name = alias}};
                 }
+                if (ir::agg_is_paired(func.value())) {
+                    auto spec = lower_paired_agg(*call, func.value(), alias, lower_agg_arg);
+                    if (!spec.has_value()) {
+                        return std::unexpected(spec.error());
+                    }
+                    aggs.push_back(std::move(*spec));
+                    temp_columns[alias] = true;
+                    return ir::Expr{.node = ir::ColumnRef{.name = alias}};
+                }
                 if (call->args.size() != 1) {
                     return std::unexpected(
                         LowerError{.message = "aggregate functions take one argument"});
@@ -5993,6 +6002,16 @@ class Lowerer {
                             .alias = field.name,
                             .param = p,
                         });
+                        final_columns.push_back(field.name);
+                        continue;
+                    }
+                    if (ir::agg_is_paired(func.value())) {
+                        auto spec =
+                            lower_paired_agg(*call, func.value(), field.name, lower_agg_arg);
+                        if (!spec.has_value()) {
+                            return std::unexpected(spec.error());
+                        }
+                        aggs.push_back(std::move(*spec));
                         final_columns.push_back(field.name);
                         continue;
                     }
@@ -6302,6 +6321,11 @@ class Lowerer {
             if (call->callee == "count" && call->args.empty()) {
                 lowered.aggs.push_back(
                     ir::AggSpec{.func = func, .column = {.name = ""}, .alias = alias});
+            } else if (ir::agg_is_paired(func)) {
+                auto spec = lower_paired_agg(*call, func, alias, lower_agg_arg);
+                if (!spec)
+                    return std::unexpected(spec.error());
+                lowered.aggs.push_back(std::move(*spec));
             } else {
                 if (call->args.size() != 1) {
                     return std::unexpected(
@@ -6423,6 +6447,13 @@ class Lowerer {
                                 .column = {.name = std::move(column_name.value())},
                                 .alias = field.name,
                                 .param = p});
+                continue;
+            }
+            if (ir::agg_is_paired(func.value())) {
+                auto spec = lower_paired_agg(*call, func.value(), field.name, lower_agg_arg);
+                if (!spec.has_value())
+                    return std::unexpected(spec.error());
+                lowered.aggs.push_back(std::move(*spec));
                 continue;
             }
             if (call->args.size() != 1)
@@ -6604,6 +6635,31 @@ class Lowerer {
         }
     }
 
+    /// `cov(x, y)` / `corr(x, y)`: two aggregate inputs, each lowered by the
+    /// caller's `lower_agg_arg` (a column, or an expression materialized into
+    /// a temp column, as for any aggregate).
+    template <typename LowerArg>
+    static auto lower_paired_agg(const CallExpr& call, ir::AggFunc func, std::string alias,
+                                 const LowerArg& lower_agg_arg)
+        -> std::expected<ir::AggSpec, LowerError> {
+        if (call.args.size() != 2 || !call.named_args.empty()) {
+            return std::unexpected(LowerError{
+                .message = call.callee + "() takes two arguments: " + call.callee + "(x, y)"});
+        }
+        auto x = lower_agg_arg(*call.args[0]);
+        if (!x.has_value()) {
+            return std::unexpected(x.error());
+        }
+        auto y = lower_agg_arg(*call.args[1]);
+        if (!y.has_value()) {
+            return std::unexpected(y.error());
+        }
+        return ir::AggSpec{.func = func,
+                           .column = ir::ColumnRef{.name = std::move(*x)},
+                           .alias = std::move(alias),
+                           .paired = ir::ColumnRef{.name = std::move(*y)}};
+    }
+
     static auto parse_agg_func(std::string_view name) -> std::optional<ir::AggFunc> {
         if (name == "sum") {
             return ir::AggFunc::Sum;
@@ -6646,6 +6702,12 @@ class Lowerer {
         }
         if (name == "kurtosis") {
             return ir::AggFunc::Kurtosis;
+        }
+        if (name == "cov") {
+            return ir::AggFunc::Cov;
+        }
+        if (name == "corr") {
+            return ir::AggFunc::Corr;
         }
         return std::nullopt;
     }

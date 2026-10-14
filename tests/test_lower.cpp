@@ -42,6 +42,43 @@ const T* as_node(const ir::Node* node) {
 
 }  // namespace
 
+TEST_CASE("Lower corr(x, y) and cov(x, y) to paired aggregates", "[parser][lower]") {
+    // `corr` and `cov` are reserved for the matrix clauses; in an expression
+    // the call form is the paired aggregate, and its arguments lower like any
+    // aggregate's (a computed one through a temp column).
+    auto program = require_parse("t[select { r = corr(x, y), c = cov(x * 2.0, y) }, by g];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+    const ir::AggregateNode* agg = nullptr;
+    for (const ir::Node* node = result->get(); node != nullptr && agg == nullptr;
+         node = node->children().empty() ? nullptr : node->children()[0].get()) {
+        agg = as_node<ir::AggregateNode>(node);
+    }
+    REQUIRE(agg != nullptr);
+    REQUIRE(agg->aggregations().size() == 2);
+    const auto& r = agg->aggregations()[0];
+    CHECK(r.func == ir::AggFunc::Corr);
+    CHECK(r.column.name == "x");
+    CHECK(r.paired.name == "y");
+    const auto& c = agg->aggregations()[1];
+    CHECK(c.func == ir::AggFunc::Cov);
+    CHECK(c.column.name != "x");  // the computed x * 2.0
+    CHECK(c.paired.name == "y");
+
+    for (const char* bad :
+         {"t[select { r = corr(x) }, by g];", "t[select { r = cov(x, y, z) }];"}) {
+        INFO(bad);
+        auto lowered = parser::lower(require_parse(bad));
+        REQUIRE_FALSE(lowered.has_value());
+        CHECK(lowered.error().message.find("takes two arguments") != std::string::npos);
+    }
+
+    // The bare clause is still the correlation matrix.
+    auto matrix = parser::lower(require_parse("t[select { x, y }][corr];"));
+    REQUIRE(matrix.has_value());
+    CHECK(as_node<ir::CorrNode>(matrix->get()) != nullptr);
+}
+
 TEST_CASE("Lower filter and select to IR") {
     auto program = require_parse("df[filter price > 10, select { price }];");
     auto result = parser::lower(program);

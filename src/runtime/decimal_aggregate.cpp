@@ -71,6 +71,10 @@ auto agg_name(ir::AggFunc func) -> std::string_view {
             return "skew";
         case ir::AggFunc::Kurtosis:
             return "kurtosis";
+        case ir::AggFunc::Cov:
+            return "cov";
+        case ir::AggFunc::Corr:
+            return "corr";
     }
     return "aggregate";
 }

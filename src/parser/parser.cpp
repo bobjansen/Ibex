@@ -1477,6 +1477,17 @@ class Parser {
                 CallExpr{.callee = std::string(word), .args = std::move(args), .named_args = {}};
             return expr;
         }
+        // `corr(x, y)` / `cov(x, y)` — the paired aggregates (SPEC.md Section
+        // 7). The words are reserved for the matrix clauses (`df[corr]`),
+        // which never stand in expression position, so here only the call form
+        // is an expression and no user function can take the name.
+        if ((check(TokenKind::KeywordCorr) || check(TokenKind::KeywordCov)) &&
+            peek_next().kind == TokenKind::LParen) {
+            std::string name = check(TokenKind::KeywordCorr) ? "corr" : "cov";
+            advance();  // 'corr' / 'cov'
+            advance();  // '('
+            return parse_call_args(std::move(name));
+        }
         // `outer(column)` — a correlated-subquery capture. `outer` is a reserved
         // word (the `outer join` operator), so it never reaches the Identifier
         // branch below; only the call form is an expression, and because the

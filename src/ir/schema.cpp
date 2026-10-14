@@ -277,6 +277,8 @@ auto agg_result_type(const AggSpec& agg, const SchemaInfo& input) -> std::option
         case AggFunc::Quantile:
         case AggFunc::Skew:
         case AggFunc::Kurtosis:
+        case AggFunc::Cov:
+        case AggFunc::Corr:
             // Always produce a Float64 result.
             return ColumnType::Float64;
         case AggFunc::Sum:

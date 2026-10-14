@@ -772,7 +772,14 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 *out_ << "ibex::ops::make_agg("
                       << "ibex::ir::AggFunc::" << emit_agg_func(a.func) << ", \""
                       << escape_string(a.column.name) << "\", \"" << escape_string(a.alias)
-                      << "\", " << format_double(a.param) << (a.is_count ? ", true" : "") << ")";
+                      << "\", " << format_double(a.param);
+                if (!a.paired.name.empty()) {
+                    *out_ << (a.is_count ? ", true" : ", false") << ", \""
+                          << escape_string(a.paired.name) << "\"";
+                } else if (a.is_count) {
+                    *out_ << ", true";
+                }
+                *out_ << ")";
             }
             *out_ << "});\n";
             return var;
@@ -950,7 +957,14 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 *out_ << "ibex::ops::make_agg("
                       << "ibex::ir::AggFunc::" << emit_agg_func(a.func) << ", \""
                       << escape_string(a.column.name) << "\", \"" << escape_string(a.alias)
-                      << "\", " << format_double(a.param) << (a.is_count ? ", true" : "") << ")";
+                      << "\", " << format_double(a.param);
+                if (!a.paired.name.empty()) {
+                    *out_ << (a.is_count ? ", true" : ", false") << ", \""
+                          << escape_string(a.paired.name) << "\"";
+                } else if (a.is_count) {
+                    *out_ << ", true";
+                }
+                *out_ << ")";
             }
             *out_ << "});\n";
             return var;
@@ -2024,6 +2038,10 @@ auto Emitter::emit_agg_func(ir::AggFunc func) -> std::string {
             return "Skew";
         case ir::AggFunc::Kurtosis:
             return "Kurtosis";
+        case ir::AggFunc::Cov:
+            return "Cov";
+        case ir::AggFunc::Corr:
+            return "Corr";
     }
     return "Sum";
 }

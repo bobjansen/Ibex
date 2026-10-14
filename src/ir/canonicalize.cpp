@@ -713,6 +713,9 @@ auto try_project_prune_above_aggregate(NodePtr node) -> TryResult {
         if (seen.insert(a.column.name).second) {
             needed.push_back(a.column);
         }
+        if (!a.paired.name.empty() && seen.insert(a.paired.name).second) {
+            needed.push_back(a.paired);
+        }
     }
     if (needed.empty()) {
         return {.changed = false, .node = std::move(node)};

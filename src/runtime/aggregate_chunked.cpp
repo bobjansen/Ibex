@@ -3828,6 +3828,19 @@ class HashAggregateState final {
 
         gids_buf_.resize(rows);
         auto* gids = gids_buf_.data();
+        const auto record = [&](std::size_t cell, std::uint32_t gid) {
+            if (cell == null_cell) {
+                int_null_gid_ = gid;
+                int_order_.push_back(0);
+            } else {
+                int_order_.push_back(lo + static_cast<std::int64_t>(cell));
+            }
+        };
+        if (try_assign_dense_gids_parallel(rows, n_cells + 1, int_dense_gid_.data(), cell_of,
+                                           record, gids)) {
+            publish_discovered(agg_entries, rows);
+            return true;
+        }
         for (std::size_t row = 0; row < rows; ++row) {
             const std::size_t cell = cell_of(row);
             std::uint32_t gid = int_dense_gid_[cell];
@@ -3838,6 +3851,92 @@ class HashAggregateState final {
             gids[row] = gid;
         }
         publish_discovered(agg_entries, rows);
+        return true;
+    }
+
+    /// Number a chunk's rows through a dense cell -> gid array across workers,
+    /// for when there are too many cells for the fused per-morsel partials
+    /// (h2o q5's ~1e6 int ids, q3's ~1e6 Categorical codes): serially that
+    /// probe was the whole of Discovery, on one core. `cell_at(row)` is the
+    /// row's cell in [0, n_cells); a new cell becomes the next gid, and
+    /// `record(cell, gid)` stores its key.
+    ///
+    /// Groups are still created in first-row order, so the gids are the
+    /// serial loop's. Workers first record each new cell's first row (an
+    /// atomic minimum; the cells are parked in `gids`), then each row range
+    /// lists, in row order, the cells whose first row it holds. Walking the
+    /// ranges in order numbers the groups, whose slots are grown once; then
+    /// the workers fill `gids`.
+    template <typename CellAt, typename Record>
+    auto try_assign_dense_gids_parallel(std::size_t rows, std::size_t n_cells, std::uint32_t* dense,
+                                        const CellAt& cell_at, const Record& record,
+                                        std::uint32_t* gids) -> bool {
+        constexpr std::size_t kMinRows = std::size_t{1} << 20;
+        constexpr std::uint32_t kUnseen = std::numeric_limits<std::uint32_t>::max();
+        if (rows < kMinRows || rows >= kUnseen || exec_ == nullptr ||
+            par_.accumulation.decline != physical::FanOutDecline::None ||
+            par_.accumulation.worker_cap < 2 || on_worker_pool_thread() ||
+            std::getenv("IBEX_DISABLE_PARALLEL_DENSE_GIDS") != nullptr) {
+            return false;
+        }
+        const std::size_t threads = par_.accumulation.worker_cap;
+        const std::size_t n_ranges = threads * 4;
+        const std::size_t grain = (rows + n_ranges - 1) / n_ranges;
+        auto& pool = process_worker_pool();
+        const auto fan = [&](const auto& body) {
+            std::atomic<std::size_t> cursor{0};
+            auto batch = pool.submit(threads, [&](std::size_t) {
+                for (std::size_t r = cursor.fetch_add(1, std::memory_order_relaxed); r < n_ranges;
+                     r = cursor.fetch_add(1, std::memory_order_relaxed)) {
+                    const std::size_t begin = std::min(rows, r * grain);
+                    body(r, begin, std::min(rows, begin + grain));
+                }
+            });
+            batch.wait();
+        };
+
+        std::vector<std::uint32_t> first(n_cells, kUnseen);
+        fan([&](std::size_t, std::size_t begin, std::size_t end) {
+            for (std::size_t row = begin; row < end; ++row) {
+                const auto cell = static_cast<std::uint32_t>(cell_at(row));
+                gids[row] = cell;
+                if (dense[cell] != kNoGid) {
+                    continue;
+                }
+                std::atomic_ref<std::uint32_t> slot(first[cell]);
+                auto held = slot.load(std::memory_order_relaxed);
+                const auto here = static_cast<std::uint32_t>(row);
+                while (here < held &&
+                       !slot.compare_exchange_weak(held, here, std::memory_order_relaxed)) {
+                }
+            }
+        });
+        std::vector<std::vector<std::uint32_t>> fresh(n_ranges);
+        fan([&](std::size_t r, std::size_t begin, std::size_t end) {
+            for (std::size_t row = begin; row < end; ++row) {
+                const std::uint32_t cell = gids[row];
+                if (dense[cell] == kNoGid && first[cell] == row) {
+                    fresh[r].push_back(cell);
+                }
+            }
+        });
+        auto gid = static_cast<std::uint32_t>(n_groups_);
+        for (const auto& cells : fresh) {
+            for (const std::uint32_t cell : cells) {
+                dense[cell] = gid;
+                record(cell, gid);
+                ++gid;
+            }
+        }
+        if (gid != n_groups_) {
+            n_groups_ = gid;
+            size_group_arrays();
+        }
+        fan([&](std::size_t, std::size_t begin, std::size_t end) {
+            for (std::size_t row = begin; row < end; ++row) {
+                gids[row] = dense[gids[row]];
+            }
+        });
         return true;
     }
 
@@ -4967,7 +5066,14 @@ class HashAggregateState final {
                 cat_dense_gid_.resize(dict_size, kNoGid);
             }
             std::uint32_t* dense = cat_dense_gid_.data();
-            for (std::size_t row = 0; row < rows; ++row) {
+            const bool parallel = try_assign_dense_gids_parallel(
+                rows, dict_size, dense,
+                [codes](std::size_t row) { return static_cast<std::size_t>(codes[row]); },
+                [&](std::size_t code, std::uint32_t) {
+                    cat_order_.push_back(static_cast<Column<Categorical>::code_type>(code));
+                },
+                gids);
+            for (std::size_t row = 0; !parallel && row < rows; ++row) {
                 const auto code = codes[row];
                 std::uint32_t gid = dense[code];
                 if (gid == kNoGid) {

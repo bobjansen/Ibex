@@ -1095,11 +1095,14 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         // records the first row of every cell, the earliest wins, and the
         // groups are created in that row order through the same index calls
         // the loop makes. The row loop then only updates the per-row states,
-        // and is skipped when every aggregate is collected below.
+        // and is skipped when every aggregate is collected below. A nullable
+        // key has one more offset past its span for null; the index the
+        // groups are created through already tells null from the payload.
         const bool collect_only =
             !collect_aggs.empty() && collect_aggs.size() == aggregations.size();
         std::vector<std::int64_t> cell_lo(key_cols.size(), 0);
         std::vector<std::uint64_t> cell_stride(key_cols.size(), 0);
+        std::vector<std::uint64_t> cell_null(key_cols.size(), 0);
         std::size_t n_cells = 0;
         const auto cell_key = [&](const KeyCol& col, std::size_t row) -> std::int64_t {
             switch (col.kind) {
@@ -1116,9 +1119,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         const bool cell_keys =
             range_workers >= 2 && rows > 0 && !key_cols.empty() &&
             std::ranges::all_of(key_cols, [](const KeyCol& col) {
-                return col.validity == nullptr &&
-                       (col.kind == KeyCol::Kind::Int64 || col.kind == KeyCol::Kind::Cat ||
-                        col.kind == KeyCol::Kind::Date || col.kind == KeyCol::Kind::Ts);
+                return col.kind == KeyCol::Kind::Int64 || col.kind == KeyCol::Kind::Cat ||
+                       col.kind == KeyCol::Kind::Date || col.kind == KeyCol::Kind::Ts;
             });
         if (cell_keys) {
             // Bounds per key: a Categorical's are its dictionary's; the rest
@@ -1135,8 +1137,12 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             continue;
                         }
                         auto& [lo, hi] = bounds[(r * key_cols.size()) + c];
+                        const KeyCol& col = key_cols[c];
                         for (std::size_t row = b; row < e; ++row) {
-                            const std::int64_t v = cell_key(key_cols[c], row);
+                            if (col.is_null(row)) {
+                                continue;
+                            }
+                            const std::int64_t v = cell_key(col, row);
                             lo = std::min(lo, v);
                             hi = std::max(hi, v);
                         }
@@ -1159,9 +1165,16 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 }
                 // Unsigned, so a span straddling zero cannot overflow; a span
                 // of the whole int64 range wraps to 0 and declines.
-                const std::uint64_t span =
+                std::uint64_t span =
                     hi < lo ? 0
                             : static_cast<std::uint64_t>(hi) - static_cast<std::uint64_t>(lo) + 1;
+                // A nullable key's null offset is one past its span. With every
+                // row null the span is empty and the null offset is the only
+                // one; a wrapped (full-range) span stays 0 and declines.
+                if (key_cols[c].validity != nullptr && (span != 0 || hi < lo)) {
+                    cell_null[c] = span;
+                    ++span;
+                }
                 cell_lo[c] = lo;
                 cell_stride[c] = cells;
                 cells = (span == 0 || span > kMaxRangeCells / cells) ? 0 : cells * span;
@@ -1219,27 +1232,41 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 const auto part = [lo, stride](std::int64_t v) {
                     return static_cast<std::uint32_t>(v - lo) * stride;
                 };
+                // Nullable: a null row takes the last offset, whatever its
+                // payload holds.
+                const auto with_values = [&](const auto& value_at) {
+                    if (col.validity == nullptr) {
+                        body([=](std::size_t row) { return part(value_at(row)); });
+                        return;
+                    }
+                    const ValidityBitmap* valid = col.validity;
+                    const std::uint32_t null_part =
+                        static_cast<std::uint32_t>(cell_null[c]) * stride;
+                    body([=](std::size_t row) {
+                        return (*valid)[row] ? part(value_at(row)) : null_part;
+                    });
+                };
                 switch (col.kind) {
                     case KeyCol::Kind::Cat: {
                         const auto* codes = col.cat->codes_data();
-                        body([=](std::size_t row) {
-                            return part(static_cast<std::int64_t>(codes[row]));
-                        });
+                        with_values(
+                            [=](std::size_t row) { return static_cast<std::int64_t>(codes[row]); });
                         break;
                     }
                     case KeyCol::Kind::Date: {
                         const Date* dates = col.date;
-                        body([=](std::size_t row) { return part(dates[row].days); });
+                        with_values(
+                            [=](std::size_t row) -> std::int64_t { return dates[row].days; });
                         break;
                     }
                     case KeyCol::Kind::Ts: {
                         const Timestamp* stamps = col.ts;
-                        body([=](std::size_t row) { return part(stamps[row].nanos); });
+                        with_values([=](std::size_t row) { return stamps[row].nanos; });
                         break;
                     }
                     default: {
                         const std::int64_t* ints = col.i64;
-                        body([=](std::size_t row) { return part(ints[row]); });
+                        with_values([=](std::size_t row) { return ints[row]; });
                         break;
                     }
                 }
@@ -1595,6 +1622,24 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 return std::unexpected("missing aggregate column in output");
             }
             output->columns[out_it->second].validity = std::move(agg_validity_out[i]);
+        }
+
+        // A null key was appended as its payload; mark it null.
+        for (std::size_t ci = 0; ci < group_by.size(); ++ci) {
+            if (std::ranges::none_of(group_order,
+                                     [&](const Key& key) { return key.is_null(ci); })) {
+                continue;
+            }
+            ValidityBitmap valid;
+            valid.reserve(group_order.size());
+            for (const Key& key : group_order) {
+                valid.push_back(!key.is_null(ci));
+            }
+            auto out_it = output->index.find(group_by[ci].name);
+            if (out_it == output->index.end()) {
+                return std::unexpected("missing group-by column in output");
+            }
+            output->columns[out_it->second].validity = std::move(valid);
         }
 
         return output;

@@ -1788,3 +1788,120 @@ TEST_CASE("grouped top-k: partitioned flat heaps take each group's stable-sort r
         }
     }
 }
+
+TEST_CASE("median by nullable integer and Categorical keys: parallel cell grouping keeps nulls",
+          "[runtime][aggregate][median][validity]") {
+    // h2o q6 with NAs: the keys of `median(v) by { id4, id5 }` have nulls. A
+    // nullable key's null takes one offset past its span, so the parallel cell
+    // grouping still runs. The payload under an Int64 null is far outside the
+    // span, so a null read as a value would index past the cells; `z` is null
+    // on every row. Expected values are computed here, in first-seen order.
+    constexpr std::size_t kRows = 200'000;
+    const std::vector<std::string> labels{"x", "y", "z"};
+    Column<std::int64_t> a;
+    runtime::ValidityBitmap a_valid;
+    Column<Date> d;
+    Column<std::int64_t> z;
+    runtime::ValidityBitmap z_valid;
+    Column<Categorical>::codes_storage c_codes;
+    runtime::ValidityBitmap c_valid;
+    Column<double> v;
+    const auto a_null = [](std::size_t row) { return row % 11 == 0; };
+    const auto c_null = [](std::size_t row) { return row % 7 == 3; };
+    for (std::size_t row = 0; row < kRows; ++row) {
+        a.push_back(a_null(row) ? 9'000'000'000'000 + static_cast<std::int64_t>(row)
+                                : static_cast<std::int64_t>((row * 7919) % 23) - 11);
+        a_valid.push_back(!a_null(row));
+        d.push_back(Date{static_cast<std::int32_t>(19'000 + ((row * 104'729) % 17))});
+        z.push_back(static_cast<std::int64_t>(row));
+        z_valid.push_back(false);
+        c_codes.push_back(static_cast<Column<Categorical>::code_type>((row * 13) % labels.size()));
+        c_valid.push_back(!c_null(row));
+        v.push_back(static_cast<double>((row * 2'654'435'761ULL) % 100'003) / 7.0);
+    }
+    runtime::Table t;
+    t.add_column("a", a, a_valid);
+    t.add_column("d", d);
+    t.add_column("z", z, z_valid);
+    t.add_column("c", Column<Categorical>(labels, std::move(c_codes)), c_valid);
+    t.add_column("v", v);
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    const auto key_text = [&](std::string_view by, std::size_t row) {
+        std::string out;
+        for (const char k : by) {
+            switch (k) {
+                case 'a':
+                    out += a_null(row) ? "null|" : std::to_string(a[row]) + "|";
+                    break;
+                case 'd':
+                    out += std::to_string(d[row].days) + "|";
+                    break;
+                case 'z':
+                    out += "null|";
+                    break;
+                default:
+                    out += c_null(row) ? "null|" : labels[(row * 13) % labels.size()] + "|";
+                    break;
+            }
+        }
+        return out;
+    };
+    for (const std::string by : {"a", "ad", "ca", "za"}) {
+        INFO("by " << by);
+        std::vector<std::string> order;
+        std::map<std::string, std::vector<double>> groups;
+        for (std::size_t row = 0; row < kRows; ++row) {
+            auto key = key_text(by, row);
+            auto [it, fresh] = groups.try_emplace(key);
+            if (fresh) {
+                order.push_back(key);
+            }
+            it->second.push_back(v[row]);
+        }
+        std::string by_list;
+        for (const char k : by) {
+            by_list += std::string(by_list.empty() ? "" : ", ") + k;
+        }
+        auto program =
+            parser::parse("t[select { m = median(v), n = count() }, by { " + by_list + " }];");
+        REQUIRE(program.has_value());
+        auto ir = parser::lower(program.value());
+        REQUIRE(ir.has_value());
+        runtime::ExecutionContext parallel;
+        parallel.parallel_threads = 8;
+        parallel.parallel_min_rows = 0;
+        const auto p =
+            runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+        REQUIRE(p.has_value());
+        REQUIRE(p->rows() == order.size());
+        const auto& pm = std::get<Column<double>>(*p->find("m"));
+        const auto& pn = std::get<Column<std::int64_t>>(*p->find("n"));
+        for (std::size_t g = 0; g < order.size(); ++g) {
+            INFO("group " << g << " key " << order[g]);
+            std::string got;
+            for (const char k : by) {
+                const auto* entry = p->find_entry(std::string(1, k));
+                REQUIRE(entry != nullptr);
+                if (runtime::is_null(*entry, g)) {
+                    got += "null|";
+                } else if (const auto* ints = std::get_if<Column<std::int64_t>>(&*entry->column)) {
+                    got += std::to_string((*ints)[g]) + "|";
+                } else if (const auto* dates = std::get_if<Column<Date>>(&*entry->column)) {
+                    got += std::to_string((*dates)[g].days) + "|";
+                } else {
+                    got += std::string(std::get<Column<Categorical>>(*entry->column)[g]) + "|";
+                }
+            }
+            REQUIRE(got == order[g]);
+            auto values = groups.at(order[g]);
+            std::ranges::sort(values);
+            const std::size_t n = values.size();
+            REQUIRE(static_cast<std::size_t>(pn[g]) == n);
+            const double median =
+                n % 2 == 1 ? values[n / 2] : (values[(n / 2) - 1] + values[n / 2]) / 2.0;
+            REQUIRE(pm[g] == median);
+        }
+    }
+}

@@ -2204,32 +2204,40 @@ TEST_CASE("chunked aggregate: many string groups come out in first-seen order, b
         t.add_column("v", std::move(v));
         registry.emplace("t", std::move(t));
     }
-    for (const char* grain : {"", "100003"}) {
-        INFO("grain '" << grain << "'");
-        std::optional<ChunkGrainGuard> guard;
-        if (*grain != '\0') {
-            guard.emplace(grain);
-        }
-        auto program = parser::parse("t[select { n = count(), s = sum(v) }, by k];");
-        REQUIRE(program.has_value());
-        auto ir = parser::lower(program.value());
-        REQUIRE(ir.has_value());
-        runtime::ExecutionContext parallel;
-        parallel.parallel_threads = 8;
-        parallel.parallel_min_rows = 0;
-        const auto p =
-            runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
-        REQUIRE(p.has_value());
-        REQUIRE(p->rows() == order.size());
-        const auto& pk = std::get<Column<std::string>>(*p->find("k"));
-        const auto& pn = std::get<Column<std::int64_t>>(*p->find("n"));
-        const auto& ps = std::get<Column<std::int64_t>>(*p->find("s"));
-        for (std::size_t i = 0; i < order.size(); ++i) {
-            INFO("group " << i);
-            REQUIRE(pk[i] == order[i]);
-            const auto& [n, sum] = want.at(order[i]);
-            REQUIRE(pn[i] == n);
-            REQUIRE(ps[i] == sum);
+    // `k2` is built per chunk, so each chunk's key bytes are freed once the
+    // aggregate has read them: a group key that kept a view of its row
+    // instead of its own copy reads another chunk's bytes.
+    const std::vector<std::pair<std::string, std::string>> queries{
+        {"t[select { n = count(), s = sum(v) }, by k];", "k"},
+        {"t[update { k2 = `${k}` }][select { n = count(), s = sum(v) }, by k2];", "k2"}};
+    for (const auto& [query, key_name] : queries) {
+        for (const char* grain : {"", "100003"}) {
+            INFO("grain '" << grain << "' query " << query);
+            std::optional<ChunkGrainGuard> guard;
+            if (*grain != '\0') {
+                guard.emplace(grain);
+            }
+            auto program = parser::parse(query);
+            REQUIRE(program.has_value());
+            auto ir = parser::lower(program.value());
+            REQUIRE(ir.has_value());
+            runtime::ExecutionContext parallel;
+            parallel.parallel_threads = 8;
+            parallel.parallel_min_rows = 0;
+            const auto p =
+                runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+            REQUIRE(p.has_value());
+            REQUIRE(p->rows() == order.size());
+            const auto& pk = std::get<Column<std::string>>(*p->find(key_name));
+            const auto& pn = std::get<Column<std::int64_t>>(*p->find("n"));
+            const auto& ps = std::get<Column<std::int64_t>>(*p->find("s"));
+            for (std::size_t i = 0; i < order.size(); ++i) {
+                INFO("group " << i);
+                REQUIRE(pk[i] == order[i]);
+                const auto& [n, sum] = want.at(order[i]);
+                REQUIRE(pn[i] == n);
+                REQUIRE(ps[i] == sum);
+            }
         }
     }
 }

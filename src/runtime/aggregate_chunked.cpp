@@ -5607,12 +5607,150 @@ class HashAggregateState final {
         return true;
     }
 
+    /// Accumulate many groups across workers by giving each worker whole
+    /// ranges of group ids, for when per-morsel partials do not fit
+    /// (`dense_morsel_count` declines: h2o q3/q5 at ~1e6 groups, where every
+    /// partial would be 48 MB). Serially those rows were 30M random updates
+    /// over the whole slot array, one core, cache-missing on each.
+    ///
+    /// Each window of rows is cut into morsels small enough to stay in cache.
+    /// A morsel buckets its rows by gid range and gathers each bucket's gids
+    /// and aggregate values into a block, reading every value once. Then each
+    /// range's owner runs `accumulate_columns_into` over its blocks in morsel
+    /// order. A group's rows therefore still meet its slot in row order, on one
+    /// thread, so the result is the serial one bit for bit (First/Last and
+    /// floating-point sums included), whatever the schedule, and nothing is
+    /// merged. Slots and scratch are only touched through gids, which the
+    /// ranges keep disjoint; the text aggregates' shared boxed store is not, so
+    /// they decline.
+    auto try_accumulate_owned_ranges(const std::uint32_t* gids,
+                                     const std::vector<const ColumnEntry*>& agg_entries,
+                                     std::size_t rows,
+                                     const std::vector<std::uint8_t>* skip = nullptr) -> bool {
+        constexpr std::size_t kMinRows = std::size_t{1} << 20;
+        constexpr std::size_t kMinGroups = std::size_t{1} << 16;
+        constexpr std::size_t kMorselRows = std::size_t{1} << 16;
+        constexpr std::size_t kWindowRows = std::size_t{1} << 22;
+        // Slots one owner holds, sized to sit in a core's L2.
+        constexpr std::size_t kRangeBytes = std::size_t{1} << 20;
+        if (rows < kMinRows || n_groups_ < kMinGroups || exec_ == nullptr ||
+            par_.accumulation.decline != physical::FanOutDecline::None ||
+            par_.accumulation.worker_cap < 2 || on_worker_pool_thread() ||
+            std::getenv("IBEX_DISABLE_OWNED_RANGE_ACCUMULATION") != nullptr) {
+            return false;
+        }
+        for (std::size_t a = 0; a < n_aggs_; ++a) {
+            if ((skip != nullptr && (*skip)[a] != 0U) || plan_[a].func == ir::AggFunc::Count ||
+                plan_[a].func == ir::AggFunc::CountDistinct) {
+                continue;
+            }
+            if (plan_[a].kind != ExprType::Int && plan_[a].kind != ExprType::Double) {
+                return false;
+            }
+        }
+        const std::size_t group_bytes =
+            (n_aggs_ * sizeof(AggSlotCore)) + (scratch_stride_ * sizeof(double));
+        // A power-of-two range, so a row's owner is a shift.
+        const unsigned shift = static_cast<unsigned>(
+            std::countr_zero(std::bit_floor(std::max<std::size_t>(1, kRangeBytes / group_bytes))));
+        const std::size_t n_ranges = ((n_groups_ - 1) >> shift) + 1;
+        if (n_ranges < 2) {
+            return false;
+        }
+        const std::size_t threads = std::min(par_.accumulation.worker_cap, n_ranges);
+        auto& pool = process_worker_pool();
+        const auto fan = [&](std::size_t tasks, const auto& body) {
+            std::atomic<std::size_t> cursor{0};
+            auto batch = pool.submit(std::min(threads, tasks), [&](std::size_t) {
+                for (std::size_t t = cursor.fetch_add(1, std::memory_order_relaxed); t < tasks;
+                     t = cursor.fetch_add(1, std::memory_order_relaxed)) {
+                    body(t);
+                }
+            });
+            batch.wait();
+        };
+        const auto gathers = [&](std::size_t a) {
+            return (skip == nullptr || (*skip)[a] == 0U) && plan_[a].func != ir::AggFunc::Count &&
+                   plan_[a].func != ir::AggFunc::CountDistinct;
+        };
+
+        struct Block {
+            std::vector<std::uint32_t> gids;
+            std::vector<ColumnEntry> values;  // per aggregate; unset when not gathered
+        };
+        for (std::size_t w0 = 0; w0 < rows; w0 += kWindowRows) {
+            const std::size_t w1 = std::min(rows, w0 + kWindowRows);
+            const std::size_t n_morsels = (w1 - w0 + kMorselRows - 1) / kMorselRows;
+            std::vector<Block> blocks(n_morsels * n_ranges);
+            fan(n_morsels, [&](std::size_t m) {
+                const std::size_t begin = w0 + (m * kMorselRows);
+                const std::size_t end = std::min(w1, begin + kMorselRows);
+                std::vector<std::size_t> start(n_ranges + 1, 0);
+                for (std::size_t row = begin; row < end; ++row) {
+                    ++start[(gids[row] >> shift) + 1];
+                }
+                for (std::size_t r = 0; r < n_ranges; ++r) {
+                    start[r + 1] += start[r];
+                }
+                std::vector<std::size_t> idx(end - begin);
+                std::vector<std::size_t> fill(start.begin(), start.end() - 1);
+                for (std::size_t row = begin; row < end; ++row) {
+                    idx[fill[gids[row] >> shift]++] = row;
+                }
+                for (std::size_t r = 0; r < n_ranges; ++r) {
+                    const std::size_t n = start[r + 1] - start[r];
+                    if (n == 0) {
+                        continue;
+                    }
+                    const std::size_t* at = idx.data() + start[r];
+                    Block& block = blocks[(m * n_ranges) + r];
+                    block.gids.resize(n);
+                    for (std::size_t i = 0; i < n; ++i) {
+                        block.gids[i] = gids[at[i]];
+                    }
+                    block.values.resize(n_aggs_);
+                    for (std::size_t a = 0; a < n_aggs_; ++a) {
+                        if (!gathers(a)) {
+                            continue;
+                        }
+                        auto [column, validity] = gather_entry_with_nulls(
+                            *agg_entries[a], at, n, std::numeric_limits<std::size_t>::max());
+                        block.values[a].column = std::make_shared<ColumnValue>(std::move(column));
+                        block.values[a].validity = std::move(validity);
+                    }
+                }
+            });
+            fan(n_ranges, [&](std::size_t r) {
+                std::vector<const ColumnEntry*> entries(agg_entries);
+                for (std::size_t m = 0; m < n_morsels; ++m) {
+                    Block& block = blocks[(m * n_ranges) + r];
+                    if (block.gids.empty()) {
+                        continue;
+                    }
+                    for (std::size_t a = 0; a < n_aggs_; ++a) {
+                        if (gathers(a)) {
+                            entries[a] = &block.values[a];
+                        }
+                    }
+                    accumulate_columns_into(block.gids.data(), entries, 0, block.gids.size(),
+                                            flat_slots_.data(), scratch_.data(), skip);
+                    block = {};
+                }
+            });
+        }
+        if (exec_->parallel_stats != nullptr) {
+            exec_->parallel_stats->parallel_fields.fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
+    }
+
     /// Accumulate `gids` either across workers or, when that is not worth it,
     /// serially — the one call every gid-assigning fast path ends with.
     void accumulate_gids(const std::uint32_t* gids,
                          const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows,
                          const std::vector<std::uint8_t>* skip = nullptr) {
-        if (!try_accumulate_parallel(gids, agg_entries, rows, skip)) {
+        if (!try_accumulate_parallel(gids, agg_entries, rows, skip) &&
+            !try_accumulate_owned_ranges(gids, agg_entries, rows, skip)) {
             accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data(), scratch_.data(),
                                     skip);
         }

@@ -1998,3 +1998,75 @@ TEST_CASE("median by nullable integer and Categorical keys: parallel cell groupi
         }
     }
 }
+
+TEST_CASE("chunked aggregate: owned gid ranges accumulate many groups exactly as serially",
+          "[runtime][chunked][aggregate]") {
+    // h2o q5 at K=1e1: ~1e6 groups, so no per-morsel partial fits and the
+    // rows were accumulated serially. Owned gid ranges run them across
+    // workers, each group's rows still in row order on one thread, so the
+    // answer must equal the serial one bit for bit -- the Double sums, First
+    // and Last included. A null-bearing value column rides along. The serial
+    // answer is the same query with the path switched off; a hand-computed
+    // reference pins the Int64 sums and counts too.
+    constexpr std::int64_t kRows = (std::int64_t{1} << 20) + 12'345;
+    constexpr std::int64_t kGroups = 200'003;
+    runtime::TableRegistry registry;
+    std::map<std::int64_t, std::pair<std::int64_t, std::int64_t>> want;  // key -> (n, sum)
+    {
+        Column<std::int64_t> g;
+        Column<std::int64_t> iv;
+        Column<double> dv;
+        runtime::ValidityBitmap dv_valid;
+        for (std::int64_t row = 0; row < kRows; ++row) {
+            const std::int64_t key = (row * 7919) % kGroups;
+            const std::int64_t value = ((row * 104'729) % 1'000'003) - 500'000;
+            g.push_back(key);
+            iv.push_back(value);
+            dv.push_back(static_cast<double>(value) / 7.0);
+            dv_valid.push_back(row % 5 != 0);
+            auto& [n, sum] = want[key];
+            ++n;
+            sum += value;
+        }
+        runtime::Table t;
+        t.add_column("g", std::move(g));
+        t.add_column("iv", std::move(iv));
+        t.add_column("dv", std::move(dv), std::move(dv_valid));
+        registry.emplace("t", std::move(t));
+    }
+    auto program = parser::parse(
+        "t[select { n = count(), s = sum(iv), ds = sum(dv), m = mean(dv), lo = min(dv), "
+        "hi = max(iv), f = first(dv), l = last(iv), sd = std(dv) }, by g];");
+    REQUIRE(program.has_value());
+    auto ir = parser::lower(program.value());
+    REQUIRE(ir.has_value());
+    const auto run = [&](bool owned) {
+        if (!owned) {
+            runtime::set_env("IBEX_DISABLE_OWNED_RANGE_ACCUMULATION", "1");
+        }
+        runtime::ExecutionContext parallel;
+        parallel.parallel_threads = 8;
+        parallel.parallel_min_rows = 0;
+        auto out = runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+        runtime::unset_env("IBEX_DISABLE_OWNED_RANGE_ACCUMULATION");
+        return out;
+    };
+    const auto serial = run(false);
+    const auto owned = run(true);
+    REQUIRE(serial.has_value());
+    REQUIRE(owned.has_value());
+    const auto mismatch = runtime::compare_tables(*serial, *owned);
+    INFO((mismatch.has_value() ? mismatch->message() : std::string{}));
+    REQUIRE_FALSE(mismatch.has_value());
+
+    REQUIRE(owned->rows() == want.size());
+    const auto& pg = std::get<Column<std::int64_t>>(*owned->find("g"));
+    const auto& pn = std::get<Column<std::int64_t>>(*owned->find("n"));
+    const auto& ps = std::get<Column<std::int64_t>>(*owned->find("s"));
+    for (std::size_t i = 0; i < owned->rows(); ++i) {
+        const auto& [n, sum] = want.at(pg[i]);
+        INFO("group " << i << " key " << pg[i]);
+        REQUIRE(pn[i] == n);
+        REQUIRE(ps[i] == sum);
+    }
+}

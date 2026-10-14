@@ -1391,6 +1391,11 @@ class HashAggregateState final {
         } else if (int_fast_path_) {
             compact_by_index(int_order_.data(), keep);
             int_order_.resize(keep.size());
+            if (int_null_gid_ != kNoGid) {
+                const auto it = std::ranges::find(keep, int_null_gid_);
+                int_null_gid_ =
+                    it == keep.end() ? kNoGid : static_cast<std::uint32_t>(it - keep.begin());
+            }
         } else if (pair_int_fast_path_) {
             compact_by_index(pair_order_.data(), keep);
             pair_order_.resize(keep.size());
@@ -1622,7 +1627,9 @@ class HashAggregateState final {
                 }
                 return std::nullopt;
             };
-            if (group_entries.size() == 1 && !group_entries[0]->validity.has_value()) {
+            // A nullable key keeps the path too: its dense array has a null
+            // cell, and `process_rows_int` migrates whatever else it meets.
+            if (group_entries.size() == 1) {
                 if (auto kind = int_kind_of(*group_entries[0]->column)) {
                     int_fast_path_ = true;
                     int_key_kind_ = *kind;
@@ -1754,15 +1761,14 @@ class HashAggregateState final {
         // key->gid lookup; the accumulated `flat_slots_`/`scratch_` those gids
         // already own are untouched, and this chunk then runs the generic path
         // below like any other.
-        if ((cat_fast_path_ || str_fast_path_ || int_fast_path_ || pair_int_fast_path_ ||
-             packed_fast_path_) &&
+        // The single-int path is the exception: its dense array holds a null
+        // group, so `process_rows_int` decides per chunk.
+        if ((cat_fast_path_ || str_fast_path_ || pair_int_fast_path_ || packed_fast_path_) &&
             std::ranges::any_of(group_entries, [](const ColumnEntry* entry) {
                 return entry->validity.has_value();
             })) {
             if (cat_fast_path_) {
                 migrate_cat_fast_path_to_generic(group_entries.size());
-            } else if (int_fast_path_) {
-                migrate_int_fast_path_to_generic();
             } else if (str_fast_path_) {
                 migrate_str_fast_path_to_generic();
             } else if (pair_int_fast_path_) {
@@ -1920,8 +1926,16 @@ class HashAggregateState final {
         // A key whose values span few cells next to the rows (`by id4` over
         // 100 ids) is indexed like a Categorical code, `key - min`: no hash,
         // and the morsel partials fan out even when the input is one chunk.
-        if (try_process_rows_int_dense(key_at, agg_entries, rows)) {
+        const ValidityBitmap* key_valid =
+            group_entries[0]->validity.has_value() ? &*group_entries[0]->validity : nullptr;
+        if (try_process_rows_int_dense(key_at, key_valid, agg_entries, rows)) {
             return std::nullopt;
+        }
+        // Every path below reads raw values, so a null row -- or a null group
+        // the dense path already made -- moves the groups to the generic path.
+        if (key_valid != nullptr || int_null_gid_ != kNoGid) {
+            migrate_int_fast_path_to_generic();
+            return process_rows_generic(group_entries, agg_entries, rows);
         }
 
         // The q18 shape (one Int64 key and one Int64 or Double sum) is a streaming sink,
@@ -3664,16 +3678,27 @@ class HashAggregateState final {
     /// Min and max of an integer key over `rows`, in pieces on the pool when
     /// the dense fan-out may run: over one 10M-row chunk the serial scan was
     /// a third of the whole aggregate.
+    /// Null rows are skipped; with none valid, `lo > hi`.
     template <typename KeyAt>
-    auto int_key_bounds(const KeyAt& key_at, std::size_t rows)
+    auto int_key_bounds(const KeyAt& key_at, const ValidityBitmap* valid, std::size_t rows)
         -> std::pair<std::int64_t, std::int64_t> {
         const auto scan = [&](std::size_t begin, std::size_t end) {
-            std::int64_t lo = key_at(begin);
-            std::int64_t hi = lo;
-            for (std::size_t row = begin + 1; row < end; ++row) {
-                const std::int64_t v = key_at(row);
-                lo = std::min(lo, v);
-                hi = std::max(hi, v);
+            std::int64_t lo = std::numeric_limits<std::int64_t>::max();
+            std::int64_t hi = std::numeric_limits<std::int64_t>::min();
+            if (valid == nullptr) {
+                for (std::size_t row = begin; row < end; ++row) {
+                    const std::int64_t v = key_at(row);
+                    lo = std::min(lo, v);
+                    hi = std::max(hi, v);
+                }
+            } else {
+                for (std::size_t row = begin; row < end; ++row) {
+                    if ((*valid)[row]) {
+                        const std::int64_t v = key_at(row);
+                        lo = std::min(lo, v);
+                        hi = std::max(hi, v);
+                    }
+                }
             }
             return std::pair{lo, hi};
         };
@@ -3686,7 +3711,7 @@ class HashAggregateState final {
             return scan(0, rows);
         }
         const std::size_t grain = (rows + pieces - 1) / pieces;
-        std::vector<std::pair<std::int64_t, std::int64_t>> parts(pieces, scan(0, 1));
+        std::vector<std::pair<std::int64_t, std::int64_t>> parts(pieces, scan(0, 0));
         std::atomic<std::size_t> cursor{0};
         auto batch = process_worker_pool().submit(threads, [&](std::size_t) {
             for (std::size_t m = cursor.fetch_add(1, std::memory_order_relaxed); m < pieces;
@@ -3707,8 +3732,12 @@ class HashAggregateState final {
         return bounds;
     }
 
+    ///
+    /// A null key is one more cell past the span (`int_dense_gid_.back()`),
+    /// remembered as `int_null_gid_` so a rebuild can put it back; its
+    /// `int_order_` entry is a placeholder 0.
     template <typename KeyAt>
-    auto try_process_rows_int_dense(const KeyAt& key_at,
+    auto try_process_rows_int_dense(const KeyAt& key_at, const ValidityBitmap* valid,
                                     const std::vector<const ColumnEntry*>& agg_entries,
                                     std::size_t rows) -> bool {
         if (int_dense_retired_ || rows == 0) {
@@ -3719,10 +3748,14 @@ class HashAggregateState final {
             int_dense_retired_ = true;
             return false;
         }
-        auto [lo, hi] = int_key_bounds(key_at, rows);
+        auto [lo, hi] = int_key_bounds(key_at, valid, rows);
         if (int_dense_active_) {
             lo = std::min(lo, int_dense_min_);
             hi = std::max(hi, int_dense_max_);
+        } else if (lo > hi) {
+            // Every row null: one null cell, nothing else yet.
+            lo = 0;
+            hi = 0;
         }
         // Unsigned, so a span straddling zero cannot overflow; a span of the
         // whole int64 range wraps to 0 and is rejected with the rest.
@@ -3735,34 +3768,57 @@ class HashAggregateState final {
             return false;
         }
         const auto n_cells = static_cast<std::size_t>(span);
+        const std::size_t null_cell = n_cells;
         if (!int_dense_active_ || lo != int_dense_min_) {
-            int_dense_gid_.assign(n_cells, kNoGid);
+            int_dense_gid_.assign(n_cells + 1, kNoGid);
             for (std::size_t g = 0; g < int_order_.size(); ++g) {
-                int_dense_gid_[static_cast<std::size_t>(int_order_[g] - lo)] =
-                    static_cast<std::uint32_t>(g);
+                if (g != int_null_gid_) {
+                    int_dense_gid_[static_cast<std::size_t>(int_order_[g] - lo)] =
+                        static_cast<std::uint32_t>(g);
+                }
             }
             int_dense_active_ = true;
-        } else if (int_dense_gid_.size() < n_cells) {
-            int_dense_gid_.resize(n_cells, kNoGid);
+        } else if (int_dense_gid_.size() < n_cells + 1) {
+            // The old null cell becomes a value cell.
+            int_dense_gid_.back() = kNoGid;
+            int_dense_gid_.resize(n_cells + 1, kNoGid);
         }
+        int_dense_gid_[null_cell] = int_null_gid_;
         int_dense_min_ = lo;
         int_dense_max_ = hi;
 
         const auto new_group = [&](std::size_t cell) {
             const std::uint32_t gid = alloc_group();
-            int_order_.push_back(lo + static_cast<std::int64_t>(cell));
+            if (cell == null_cell) {
+                int_null_gid_ = gid;
+                int_order_.push_back(0);
+            } else {
+                int_order_.push_back(lo + static_cast<std::int64_t>(cell));
+            }
             return gid;
         };
-        const std::size_t morsels = dense_morsel_count(n_cells, rows);
+        const auto cell_of = [&](std::size_t row) -> std::size_t {
+            if (valid != nullptr && !(*valid)[row]) {
+                return null_cell;
+            }
+            return static_cast<std::size_t>(key_at(row) - lo);
+        };
+        const std::size_t morsels = dense_morsel_count(n_cells + 1, rows);
         if (morsels != 0 && aggs_are_slot_combinable()) {
             int_dense_cells_.resize(rows);
             auto* cells = int_dense_cells_.data();
             run_dense_fused(
-                cells, n_cells, agg_entries, rows, int_dense_gid_, morsels,
+                cells, n_cells + 1, agg_entries, rows, int_dense_gid_, morsels,
                 [&](std::size_t begin, std::size_t end) {
                     // On the morsel's own worker, into its own slice.
-                    for (std::size_t row = begin; row < end; ++row) {
-                        cells[row] = static_cast<std::uint32_t>(key_at(row) - lo);
+                    if (valid == nullptr) {
+                        for (std::size_t row = begin; row < end; ++row) {
+                            cells[row] = static_cast<std::uint32_t>(key_at(row) - lo);
+                        }
+                    } else {
+                        for (std::size_t row = begin; row < end; ++row) {
+                            cells[row] = static_cast<std::uint32_t>(cell_of(row));
+                        }
                     }
                 },
                 new_group);
@@ -3773,7 +3829,7 @@ class HashAggregateState final {
         gids_buf_.resize(rows);
         auto* gids = gids_buf_.data();
         for (std::size_t row = 0; row < rows; ++row) {
-            const auto cell = static_cast<std::size_t>(key_at(row) - lo);
+            const std::size_t cell = cell_of(row);
             std::uint32_t gid = int_dense_gid_[cell];
             if (gid == kNoGid) {
                 gid = new_group(cell);
@@ -4300,6 +4356,9 @@ class HashAggregateState final {
         seed_generic_index_from_keys(n_groups_, [&](std::size_t i) {
             Key key;
             key.values.push_back(scalar_of_int_key(int_key_kind_, int_order_[i]));
+            if (i == int_null_gid_) {
+                key.set_null(0);
+            }
             return key;
         });
         int_fast_path_ = false;
@@ -6777,6 +6836,12 @@ class HashAggregateState final {
             }
         }
 
+        if (int_fast_path_ && int_null_gid_ != kNoGid) {
+            any_null_keys = 1;
+            key_validity[0].assign(n_groups_, true);
+            key_validity[0].set(int_null_gid_, false);
+        }
+
         // One definition of "store this raw integer key at group g". The
         // destination was pre-sized above, so this is an indexed write; the
         // Cat case stores a code, which resolves against the shared dictionary
@@ -7215,6 +7280,8 @@ class HashAggregateState final {
     std::int64_t int_dense_max_ = 0;
     std::vector<std::uint32_t> int_dense_gid_;
     std::vector<std::uint32_t> int_dense_cells_;
+    /// The null key's group, made only by the dense path; kNoGid if none.
+    std::uint32_t int_null_gid_ = kNoGid;
 
     // Single-Categorical fast path: code → gid via direct array (codes are a
     // dense [0, dict_size) index, so no hashing is needed).

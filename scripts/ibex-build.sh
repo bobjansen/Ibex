@@ -70,7 +70,6 @@ fi
 IBEX_INCS=(
     "-I$IBEX_ROOT/include"
     "-I$IBEX_ROOT/libraries"
-    "-I$BUILD_DIR/_deps/fmt-src/include"
     "-I$BUILD_DIR/_deps/robin_hood-src/src/include"
 )
 
@@ -84,9 +83,6 @@ fi
 # csv.hpp parses floats with fast_float, which the build fetches rather than installs.
 [[ -d "$BUILD_DIR/_deps/fast_float-src/include" ]] &&
     IBEX_INCS+=("-isystem" "$BUILD_DIR/_deps/fast_float-src/include")
-
-_fmt_lib="$BUILD_DIR/_deps/fmt-build/libfmt.a"
-[[ -f "$_fmt_lib" ]] || _fmt_lib="$BUILD_DIR/_deps/fmt-build/libfmtd.a"
 
 # jemalloc: pools large freed allocations instead of returning them to the OS,
 # eliminating page-fault overhead on repeated large-table operations.
@@ -108,7 +104,6 @@ IBEX_LIBS=(
     "$BUILD_DIR/src/runtime/libibex_runtime.a"
     "$BUILD_DIR/src/ir/libibex_ir.a"
     "$BUILD_DIR/src/core/libibex_core.a"
-    "$_fmt_lib"
 )
 [[ -n "$_jemalloc" ]] && IBEX_LIBS+=("$_jemalloc")
 

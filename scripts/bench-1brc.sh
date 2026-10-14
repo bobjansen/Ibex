@@ -165,7 +165,6 @@ if [[ "$SKIP_COMPILED" -eq 0 ]]; then
 
     IBEX_INCS=(
         "-I$IBEX_ROOT/include"
-        "-I$BUILD_DIR/_deps/fmt-src/include"
         "-I$BUILD_DIR/_deps/fast_float-src/include"
         "-I$BUILD_DIR/_deps/robin_hood-src/src/include"
     )
@@ -175,8 +174,6 @@ if [[ "$SKIP_COMPILED" -eq 0 ]]; then
         done < <(find "$IBEX_ROOT/libs" -mindepth 1 -maxdepth 1 -type d -print0)
     fi
 
-    FMT_LIB="$BUILD_DIR/_deps/fmt-build/libfmt.a"
-    [[ -f "$FMT_LIB" ]] || FMT_LIB="$BUILD_DIR/_deps/fmt-build/libfmtd.a"
     JEMALLOC_LIB=""
     for candidate in \
         "$(ldconfig -p 2>/dev/null | awk '/libjemalloc\.so\.2/{print $NF; exit}')" \
@@ -195,7 +192,6 @@ if [[ "$SKIP_COMPILED" -eq 0 ]]; then
         "$BUILD_DIR/src/runtime/libibex_runtime.a" \
         "$BUILD_DIR/src/ir/libibex_ir.a" \
         "$BUILD_DIR/src/core/libibex_core.a" \
-        "$FMT_LIB" \
         ${JEMALLOC_LIB:+$JEMALLOC_LIB} \
         -o "$COMPILED_BIN"
 fi

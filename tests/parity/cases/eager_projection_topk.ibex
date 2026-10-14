@@ -1,0 +1,9 @@
+// The compiled program narrows `x` to the columns the plan reads (g, pad2, v)
+// before the grouped top-k; the interpreter runs it unnarrowed.
+let x = Table {
+    g = [1, 1, 1, 2, 2, 3],
+    pad1 = [0, 1, 0, 1, 0, 1],
+    v = [5.0, 9.0, 7.0, 1.0, 3.0, 4.0],
+    pad2 = [7, 7, 7, 7, 8, 7]
+};
+x[filter pad2 == 7, order { v desc }, head 2, by g][select { g, top = v }];

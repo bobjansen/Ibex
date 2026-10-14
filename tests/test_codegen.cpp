@@ -84,6 +84,47 @@ csv::read("employees.csv", nulls = "<empty>", schema = "id:int,name:str");
     CHECK(contains(out, R"(csv::read("employees.csv", "<empty>", ",", 1, "id:int,name:str"))"));
 }
 
+TEST_CASE("lower/codegen: a source is narrowed to the columns its plan reads", "[codegen]") {
+    // The REPL narrows its in-memory tables to the columns a plan reads; the
+    // compiled program does the same through `ops::narrow`, from the same
+    // demand walk.
+    const auto emitted = [](const std::string& query) {
+        const std::string src = R"(
+extern fn csv::read(path: String) -> DataFrame from "csv.hpp";
+let x = csv::read("x.csv");
+let lit = Table { g = [1, 2], pad = [0, 0], v = [1.0, 2.0] };
+)" + query;
+        auto parsed = parser::parse(src);
+        REQUIRE(parsed.has_value());
+        auto lowered = parser::lower(*parsed);
+        REQUIRE(lowered.has_value());
+        return emit_to_string(**lowered);
+    };
+
+    SECTION("a call source, read through a grouped top-k") {
+        const auto out =
+            emitted("x[filter pad == 7, order { v desc }, head 2, by g][select { g, top = v }];");
+        INFO(out);
+        CHECK(contains(out, R"(auto t1 = ibex::ops::narrow(t0, {"g", "pad", "v"});)"));
+        CHECK(contains(out, "ibex::ops::filter(t1,"));
+    }
+    SECTION("a table literal") {
+        const auto out = emitted("lit[select { s = sum(v) }, by g];");
+        INFO(out);
+        CHECK(contains(out, R"(ibex::ops::narrow(t0, {"g", "v"}))"));
+    }
+    SECTION("a plan that returns every column narrows nothing") {
+        const auto out = emitted("x[order { v desc }, head 1, by g];");
+        INFO(out);
+        CHECK_FALSE(contains(out, "ibex::ops::narrow"));
+    }
+    SECTION("a count reads no column and narrows nothing") {
+        const auto out = emitted("x[select { n = count() }];");
+        INFO(out);
+        CHECK_FALSE(contains(out, "ibex::ops::narrow"));
+    }
+}
+
 TEST_CASE("lower/codegen: a qualified extern is called by its ibex::ext C++ name", "[codegen]") {
     const char* src = R"(
 namespace fs {

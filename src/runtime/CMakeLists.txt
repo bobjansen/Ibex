@@ -29,6 +29,7 @@ add_library(ibex_runtime STATIC
     static_range_filter.cpp
     model.cpp
     ops.cpp
+    table_narrow.cpp
     physical_plan.cpp
     pipeline.cpp
     pipeline_executor.cpp

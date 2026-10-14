@@ -6,7 +6,6 @@
 #include <ibex/ir/required_columns.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
-#include <cstddef>
 #include <map>
 #include <string>
 #include <utility>
@@ -15,21 +14,11 @@
 namespace ibex::repl::detail {
 
 /// The in-memory tables in `demand` that the plan reads only part of, each cut
-/// down to its demanded columns. The cut shares column storage, so it copies
-/// nothing; what it saves is every operator above the scan carrying, and
-/// gathering, columns nobody reads: `x[order {v3 desc}, head 2, by id6]` over
-/// a nine-column table moved nine payload columns through the top-k heaps.
-/// The lazy sources get the same narrowing from `decode_demanded_lazy_sources`.
-///
-/// A column the table's own properties name (its ordering, time index or
-/// grouping) is kept even when undemanded, so the properties stay true of the
-/// narrowed table. `IBEX_DISABLE_EAGER_PROJECTION` turns this off.
+/// down to its demanded columns by `runtime::narrow_to_columns`. The lazy
+/// sources get the same narrowing from `decode_demanded_lazy_sources`; both
+/// REPL drivers call this for their in-memory tables.
 [[nodiscard]] auto narrow_demanded_tables(const std::map<std::string, ir::ColumnDemand>& demand,
                                           const runtime::TableRegistry& tables)
     -> std::vector<std::pair<std::string, runtime::Table>>;
-
-/// Columns `narrow_demanded_tables` has dropped in this process. Lets a test
-/// see that a REPL path narrowed a table, which its answers cannot show.
-[[nodiscard]] auto eager_projection_dropped_columns() -> std::size_t;
 
 }  // namespace ibex::repl::detail

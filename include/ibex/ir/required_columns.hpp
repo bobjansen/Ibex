@@ -75,4 +75,13 @@ struct ColumnDemand {
 /// Pointers have the same lifetime rule as `join_output_demand`.
 [[nodiscard]] auto filter_output_demand(const Node& root) -> std::map<const Node*, ColumnDemand>;
 
+/// What the plan reads from each source node's own output -- every `Scan`,
+/// `ExternCall` and `Construct` -- keyed by node address in `root`. Same walk, same
+/// demand model and asymmetry as `required_columns`, but per node rather than
+/// per source name, for a consumer (`ibex_compile`'s emitter) whose sources
+/// are call and literal nodes in the tree rather than named scans. A node absent from the
+/// map must be read as "nothing is proven". Pointers have the same lifetime
+/// rule as `join_output_demand`.
+[[nodiscard]] auto source_output_demand(const Node& root) -> std::map<const Node*, ColumnDemand>;
+
 }  // namespace ibex::ir

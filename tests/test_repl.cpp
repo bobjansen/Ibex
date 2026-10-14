@@ -39,7 +39,7 @@
 #include <utility>
 #include <vector>
 
-#include "../src/repl/eager_projection.hpp"
+#include "../src/runtime/table_narrow.hpp"
 
 using ibex::repl::normalize_input;
 
@@ -2273,9 +2273,9 @@ TEST_CASE("REPL narrows an in-memory table to the columns a plan reads, on both 
                 "let x = " +
                 reader + "();\nlet result = " + query + ";\ncapture(result);\nresult;\n";
             captured = ibex::runtime::Table{};
-            const auto before = ibex::repl::detail::eager_projection_dropped_columns();
+            const auto before = ibex::runtime::narrowed_column_count();
             const auto planner = capture_planner_line(source, registry);
-            dropped = ibex::repl::detail::eager_projection_dropped_columns() - before;
+            dropped = ibex::runtime::narrowed_column_count() - before;
             if (whole_script) {
                 REQUIRE(planner == "planner: whole-script");
             } else {

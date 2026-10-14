@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <optional>
 #include <ostream>
+#include <set>
 #include <stdexcept>
 #include <stdlib.h>  // NOLINT(modernize-deprecated-headers): declares POSIX setenv.
 #include <string>
@@ -23,6 +24,8 @@
 #include <utility>
 #include <variant>
 #include <vector>
+
+#include "table_narrow.hpp"
 
 namespace ibex::ops {
 
@@ -166,6 +169,12 @@ auto project(const runtime::Table& t, const std::vector<std::string>& col_names)
     auto proj_node = b.project(to_col_refs(col_names));
     proj_node->add_child(std::move(scan_node));
     return delegate(std::move(proj_node), t);
+}
+
+auto narrow(const runtime::Table& t, const std::vector<std::string>& col_names) -> runtime::Table {
+    auto narrowed =
+        runtime::narrow_to_columns(t, std::set<std::string>(col_names.begin(), col_names.end()));
+    return narrowed.has_value() ? std::move(*narrowed) : t;
 }
 
 auto distinct(const runtime::Table& t) -> runtime::Table {

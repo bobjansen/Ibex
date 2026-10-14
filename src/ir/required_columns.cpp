@@ -122,6 +122,7 @@ struct DemandSink {
     DemandMap sources;
     std::map<const Node*, ColumnDemand> joins;
     std::map<const Node*, ColumnDemand> filters;
+    std::map<const Node*, ColumnDemand> source_nodes;
 };
 
 void visit(const Node& node, const ColumnDemand& need, DemandSink& out);
@@ -148,6 +149,17 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
     switch (node.kind()) {
         case NodeKind::Scan: {
             out.sources[node_cast<ScanNode>(node).source_name()].merge(need);
+            out.source_nodes[&node].merge(need);
+            return;
+        }
+
+        // A table-valued call, or a `Table { ... }` literal, is a source too:
+        // what is read of its result is `need`. What it is built from is
+        // consumed whole.
+        case NodeKind::ExternCall:
+        case NodeKind::Construct: {
+            out.source_nodes[&node].merge(need);
+            visit_children_widened(node, out);
             return;
         }
 
@@ -426,8 +438,8 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
         // input would change which rows survive — not just which columns.
         case NodeKind::Distinct:
         // Everything else — Window, Resample, AsTimeframe, Columns,
-        // Melt, Dcast, Cov, Corr, Transpose, Matmul, Rbind, Model, Stream,
-        // ExternCall, Construct — either reads columns this pass cannot name or
+        // Melt, Dcast, Cov, Corr, Transpose, Matmul, Rbind, Model, Stream —
+        // either reads columns this pass cannot name or
         // consumes its input whole.
         default:
             visit_children_widened(node, out);
@@ -451,6 +463,14 @@ auto join_output_demand(const Node& root) -> std::map<const Node*, ColumnDemand>
     all.widen();
     visit(root, all, out);
     return std::move(out.joins);
+}
+
+auto source_output_demand(const Node& root) -> std::map<const Node*, ColumnDemand> {
+    DemandSink out;
+    ColumnDemand all;
+    all.widen();
+    visit(root, all, out);
+    return std::move(out.source_nodes);
 }
 
 auto filter_output_demand(const Node& root) -> std::map<const Node*, ColumnDemand> {

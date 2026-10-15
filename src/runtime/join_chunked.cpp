@@ -84,6 +84,11 @@
 
 namespace ibex::runtime {
 
+auto dense_int_join_probes() -> std::atomic<std::uint64_t>& {
+    static std::atomic<std::uint64_t> count{0};
+    return count;
+}
+
 /// Per-row match indices. Every slot is written before it is read, so a resize
 /// need not zero-fill: at millions of matches that fill was serial main-thread
 /// time on every probe.
@@ -227,6 +232,11 @@ struct JoinHashIndex {
     std::vector<std::size_t> chain_next;
     /// Head row per key, one map per key representation.
     PartitionedHeads<std::int64_t> i64_heads;
+    /// Int keys only: the head row for `key` at `key - i64_dense_lo`, or
+    /// `kJoinNil`, when the build keys cover a small, dense range (see
+    /// `densify_int_heads`). Empty otherwise.
+    std::vector<std::size_t> i64_dense;
+    std::int64_t i64_dense_lo = 0;
     PartitionedHeads<double> f64_heads;
     PartitionedHeads<bool> bool_heads;
     PartitionedHeads<Date> date_heads;
@@ -407,6 +417,48 @@ void fill_partitioned_heads(Heads& heads, std::size_t n, const KeyAt& key_at, co
     }
 }
 
+/// Give a small, dense Int build side a direct-address head table.
+///
+/// A probe row then costs a bounds check and one load instead of a hash, a
+/// partition pick and a map probe. h2o's integer joins build on 10 and 1e4
+/// keys (`id1`, `id2` = 1..n) and spent ~2 ns per row per hash, twice -- most
+/// of a 21 ms probe for 10M rows. Derived from the finished map, so the build
+/// and its chains are untouched. Only when the range is at most eight times
+/// the key count (plus slack for tiny sides) and at most 2^20 slots, so the
+/// table stays small whatever the keys.
+void densify_int_heads(JoinHashIndex& index) {
+    constexpr std::uint64_t kMaxSlots = std::uint64_t{1} << 20;
+    std::size_t keys = 0;
+    for (const auto& part : index.i64_heads.parts) {
+        keys += part.size();
+    }
+    // More keys than slots cannot fit, and finding the range walks every
+    // key: PDS-H q22's 1.2M-key anti-join build paid that walk for nothing.
+    if (keys == 0 || keys > kMaxSlots) {
+        return;
+    }
+    std::int64_t lo = std::numeric_limits<std::int64_t>::max();
+    std::int64_t hi = std::numeric_limits<std::int64_t>::min();
+    for (const auto& part : index.i64_heads.parts) {
+        for (const auto& [key, head] : part) {
+            lo = std::min(lo, key);
+            hi = std::max(hi, key);
+        }
+    }
+    const std::uint64_t span = static_cast<std::uint64_t>(hi) - static_cast<std::uint64_t>(lo);
+    if (span >= kMaxSlots || span >= (std::uint64_t{8} * keys) + 1024) {
+        return;
+    }
+    index.i64_dense.assign(static_cast<std::size_t>(span) + 1, kJoinNil);
+    index.i64_dense_lo = lo;
+    for (const auto& part : index.i64_heads.parts) {
+        for (const auto& [key, head] : part) {
+            index.i64_dense[static_cast<std::size_t>(static_cast<std::uint64_t>(key) -
+                                                     static_cast<std::uint64_t>(lo))] = head;
+        }
+    }
+}
+
 auto build_join_hash_index(const Table& build_side, const std::string& key_name, ExprType key_kind,
                            std::size_t partitions) -> std::expected<JoinHashIndex, std::string> {
     const ColumnValue* key = build_side.find(key_name);
@@ -438,6 +490,7 @@ auto build_join_hash_index(const Table& build_side, const std::string& key_name,
         if (col == nullptr)
             return std::unexpected("inner join: build-side key type mismatch");
         build_scalar(*col, index.i64_heads);
+        densify_int_heads(index);
     } else if (key_kind == ExprType::Double) {
         const auto* col = std::get_if<Column<double>>(key);
         if (col == nullptr)
@@ -1187,8 +1240,22 @@ struct JoinProbe {
                 return std::unexpected("inner join: left key type mismatch");
             }
             const auto* data = col->data();
-            li_identity =
-                probe_scalar(index().i64_heads, n, [&](std::size_t i) { return data[i]; }, li, ri);
+            if (const auto& dense = index().i64_dense; !dense.empty()) {
+                const auto lo = static_cast<std::uint64_t>(index().i64_dense_lo);
+                const std::size_t slots = dense.size();
+                const std::size_t* heads = dense.data();
+                dense_int_join_probes().fetch_add(1, std::memory_order_relaxed);
+                li_identity = probe_resolved(
+                    n,
+                    [&](std::size_t i) {
+                        const std::uint64_t at = static_cast<std::uint64_t>(data[i]) - lo;
+                        return at < slots ? heads[at] : kNil;
+                    },
+                    li, ri);
+            } else {
+                li_identity = probe_scalar(
+                    index().i64_heads, n, [&](std::size_t i) { return data[i]; }, li, ri);
+            }
         } else if (index().key_kind == ExprType::Double) {
             const auto* col = std::get_if<Column<double>>(key);
             if (col == nullptr) {

@@ -174,7 +174,10 @@ auto project(const runtime::Table& t, const std::vector<std::string>& col_names)
 auto narrow(const runtime::Table& t, const std::vector<std::string>& col_names) -> runtime::Table {
     auto narrowed =
         runtime::narrow_to_columns(t, std::set<std::string>(col_names.begin(), col_names.end()));
-    return narrowed.has_value() ? std::move(*narrowed) : t;
+    if (narrowed.has_value()) {
+        return std::move(*narrowed);
+    }
+    return t;
 }
 
 auto distinct(const runtime::Table& t) -> runtime::Table {

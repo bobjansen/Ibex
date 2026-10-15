@@ -25,6 +25,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <robin_hood.h>
 #include <string>
 #include <string_view>
 #include <type_traits>

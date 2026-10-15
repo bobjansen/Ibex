@@ -1635,6 +1635,59 @@ TEST_CASE("Interpret packed-key aggregate migrates when a later chunk outgrows t
     CHECK((*n)[3] == 1);
 }
 
+TEST_CASE("Interpret packed-key aggregate migrates when a String key outgrows its ids") {
+    // 41 + 21 bits of Int64 span leave the String one spare bit over the two
+    // ids its first chunk needs: ids 0..3. The later chunk brings five more
+    // strings, so the aggregate must move to the generic path -- and still
+    // merge the repeated ("p", 0, 0) into the group the packed path found.
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("outgrown_str_packed", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        auto first = make_str_int_chunk("s", {"p", "q"}, "a", {0, std::int64_t{1} << 40});
+        add_int_column(first, "b", {0, std::int64_t{1} << 20});
+        chunks.push_back(std::move(first));
+        auto later = make_str_int_chunk("s", {"p", "r", "s", "t", "u", "v", "q"}, "a",
+                                        {0, 0, 0, 0, 0, 0, 0});
+        add_int_column(later, "b", {0, 0, 0, 0, 0, 0, 0});
+        chunks.push_back(std::move(later));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn outgrown_str_packed() -> DataFrame from \"x.hpp\"; "
+        "outgrown_str_packed()[select { n = count() }, by { s, a, b }];");
+    // Serial, so the String interns into one partition and its ids are dense.
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs, nullptr, serial);
+    if (!result.has_value()) {
+        FAIL(result.error());
+    }
+
+    const auto* s = std::get_if<Column<std::string>>(result->find("s"));
+    const auto* a = std::get_if<Column<std::int64_t>>(result->find("a"));
+    const auto* n = std::get_if<Column<std::int64_t>>(result->find("n"));
+    REQUIRE(s != nullptr);
+    REQUIRE(a != nullptr);
+    REQUIRE(n != nullptr);
+    REQUIRE(s->size() == 8);
+    CHECK((*s)[0] == "p");
+    CHECK((*n)[0] == 2);
+    CHECK((*s)[1] == "q");
+    CHECK((*a)[1] == std::int64_t{1} << 40);
+    CHECK((*n)[1] == 1);
+    const std::vector<std::string> fresh{"r", "s", "t", "u", "v"};
+    for (std::size_t i = 0; i < fresh.size(); ++i) {
+        CHECK((*s)[2 + i] == fresh[i]);
+        CHECK((*n)[2 + i] == 1);
+    }
+    CHECK((*s)[7] == "q");
+    CHECK((*a)[7] == 0);
+    CHECK((*n)[7] == 1);
+}
+
 TEST_CASE("Interpret packed-key aggregate groups mixed Categorical and Int64 keys") {
     // Two Categoricals (one dictionary per chunk, so ids are interned) and two
     // Int64s with negative values: the shape that only packs once cells are

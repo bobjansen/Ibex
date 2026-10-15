@@ -1459,6 +1459,104 @@ TEST_CASE("generic group-by keys: partitioned discovery equals a hand-computed g
     }
 }
 
+TEST_CASE("packed group-by keys: a String key column interns into the packed key",
+          "[runtime][chunked][aggregate][parallel]") {
+    // A String among three or more keys used to send the whole key to the
+    // generic path (h2o q10 at K=2e0: id3 a 5M-level String). It now interns
+    // into ids per row and packs like a Categorical. Checked against a
+    // grouping computed here, in first-occurrence order, serially and with
+    // the interning partitioned across workers, whole and in 20000-row
+    // chunks -- the first chunk then interns serially and the rest must find
+    // its strings again. Values past the small-string buffer and the empty
+    // string are the shapes an interning arena gets wrong.
+    constexpr std::size_t kRows = 300'000;
+    Column<std::string> s;
+    Column<std::int64_t> a;
+    Column<std::int64_t> b;
+    Column<std::int64_t> q;
+    struct Group {
+        std::string s;
+        std::int64_t a = 0;
+        std::int64_t b = 0;
+        std::int64_t count = 0;
+        std::int64_t total = 0;
+    };
+    std::vector<Group> groups;
+    std::map<std::tuple<std::string, std::int64_t, std::int64_t>, std::size_t> index;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        const std::size_t k = (i * 7919) % 2'003;
+        const std::string sv = k == 0  ? std::string{}
+                               : k % 2 ? "c" + std::to_string(k)
+                                       : "customer-" + std::to_string(k) + "-padding-past-the-sso";
+        const auto av = static_cast<std::int64_t>(i % 3) - 1;
+        const auto bv = static_cast<std::int64_t>((i * 31) % 5) * 1'000'000;
+        const auto qv = static_cast<std::int64_t>(i % 97);
+        s.push_back(sv);
+        a.push_back(av);
+        b.push_back(bv);
+        q.push_back(qv);
+        auto [it, inserted] = index.emplace(std::make_tuple(sv, av, bv), groups.size());
+        if (inserted) {
+            groups.push_back(Group{.s = sv, .a = av, .b = bv, .count = 0, .total = 0});
+        }
+        ++groups[it->second].count;
+        groups[it->second].total += qv;
+    }
+    runtime::Table t;
+    t.add_column("s", std::move(s));
+    t.add_column("a", std::move(a));
+    t.add_column("b", std::move(b));
+    t.add_column("q", std::move(q));
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto program = parser::parse("t[select { total = sum(q), c = count() }, by { a, s, b }];");
+    REQUIRE(program.has_value());
+    auto ir = parser::lower(program.value());
+    REQUIRE(ir.has_value());
+
+    const auto check = [&](const runtime::Table& out) {
+        REQUIRE(out.rows() == groups.size());
+        const auto& os = std::get<Column<std::string>>(*out.find("s"));
+        const auto& oa = std::get<Column<std::int64_t>>(*out.find("a"));
+        const auto& ob = std::get<Column<std::int64_t>>(*out.find("b"));
+        const auto& ot = std::get<Column<std::int64_t>>(*out.find("total"));
+        const auto& oc = std::get<Column<std::int64_t>>(*out.find("c"));
+        for (std::size_t g = 0; g < groups.size(); ++g) {
+            INFO("group " << g);
+            const Group& want = groups[g];
+            REQUIRE(std::string(os[g]) == want.s);
+            REQUIRE(oa[g] == want.a);
+            REQUIRE(ob[g] == want.b);
+            REQUIRE(oc[g] == want.count);
+            REQUIRE(ot[g] == want.total);
+        }
+    };
+
+    for (const bool chunked : {false, true}) {
+        INFO("chunked: " << chunked);
+        std::optional<ChunkGrainGuard> guard;
+        if (chunked) {
+            guard.emplace("20000");
+        }
+        runtime::ExecutionContext serial;
+        serial.parallel_threads = 1;
+        runtime::ExecutionContext parallel;
+        parallel.parallel_threads = 8;
+        parallel.parallel_min_rows = 0;
+        const auto sr =
+            runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, serial);
+        const auto pr =
+            runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+        INFO((sr.has_value() ? std::string{} : sr.error()));
+        REQUIRE(sr.has_value());
+        INFO((pr.has_value() ? std::string{} : pr.error()));
+        REQUIRE(pr.has_value());
+        check(*sr);
+        check(*pr);
+    }
+}
+
 TEST_CASE("chunked aggregate: a narrow-span Int64 key groups through a dense array",
           "[runtime][chunked][aggregate]") {
     // h2o q4's shape: one Int64 key over ~100 distinct values. Its span is a

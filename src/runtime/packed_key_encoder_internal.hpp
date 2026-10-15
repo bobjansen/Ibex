@@ -7,17 +7,21 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <robin_hood.h>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <vector>
+
+#include "string_arena_internal.hpp"
 
 namespace ibex::runtime {
 
@@ -85,13 +89,14 @@ struct PackedKeyEncoder {
     /// One fixed-width integral key column, resolved to its raw storage and the
     /// bit offset it occupies in the packed key.
     struct PackCol {
-        enum class Kind : std::uint8_t { Int64, Date, Ts, Bool, Cat } kind{Kind::Int64};
+        enum class Kind : std::uint8_t { Int64, Date, Ts, Bool, Cat, Str } kind{Kind::Int64};
         const std::int64_t* i64 = nullptr;
         const Date* date = nullptr;
         const Timestamp* ts = nullptr;
         const Column<bool>* boolean = nullptr;
         const Column<Categorical>* cat = nullptr;
         const std::uint32_t* remap = nullptr;  ///< local code -> operator-global id
+        const std::uint32_t* codes = nullptr;  ///< Str: each row's interned id
         unsigned shift = 0;  ///< bit offset of this column's cell in the packed key
         /// Subtracted (wrapping) from an Int64/Ts/Date value to form its cell.
         /// Zero unless cells are sized from the data, in which case it is the
@@ -111,22 +116,69 @@ struct PackedKeyEncoder {
     /// operator-global id fixes that, and costs one lookup per DICTIONARY ENTRY
     /// per chunk rather than one per row: the row loop then reads `remap[code]`,
     /// a single array index with no hashing and no allocation at all.
+    ///
+    /// Every chunk of an in-memory table shares ONE dictionary, though, and
+    /// then the codes already are operator-global ids. Interning h2o's 5M-level
+    /// id3 anyway was ~650 ms of serial map inserts per query. So the first
+    /// dictionary is adopted as the id space (`base`, remap the identity), and
+    /// the map is only built once a chunk arrives with a different one.
     struct CatIntern {
         /// Views point into `arena`, whose deque never invalidates references.
         robin_hood::unordered_flat_map<std::string_view, std::uint32_t> ids;
         std::deque<std::string> arena;
         std::vector<std::uint32_t> remap;  ///< rebuilt per chunk, indexed by local code
+        /// The adopted dictionary, while every chunk so far has used it; null
+        /// once `ids` holds the id space instead.
+        std::shared_ptr<std::vector<std::string>> base;
+        /// Ids assigned so far; every id is below it.
+        std::size_t count = 0;
+    };
+
+    /// Per-key-column interning state for String columns.
+    ///
+    /// A String has no fixed-width cell, so it is interned PER ROW into an id
+    /// first -- one hash probe per row, which is what kept strings out of this
+    /// path. Against the generic path it still wins by far: at h2o q10's
+    /// shape (a 5M-level String among six keys) the generic key cost ~750 ns
+    /// per row, where interning is one probe that threads like the
+    /// single-string discovery: rows are hash-partitioned, and each partition
+    /// owns a map that persists across chunks. A partition hands out its own
+    /// ids, so a row's id is `local * parts + partition` -- unique without
+    /// any cross-partition numbering, and dense enough that 5M strings take
+    /// 23 bits.
+    struct StrIntern {
+        struct Part {
+            /// Views into `arena`.
+            robin_hood::unordered_flat_map<std::string_view, std::uint32_t> ids;
+            StringArena arena;
+        };
+        std::vector<Part> parts;  ///< a power of two, fixed by the first chunk
+        unsigned part_bits = 0;
+        /// The chunk column `codes` was built from, so the layout can refuse a
+        /// column nobody interned.
+        const Column<std::string>* column = nullptr;
+        ::ibex::detail::NoInitVector<std::uint32_t> codes;  ///< per row of `column`
+
+        /// Every id handed out so far is below this.
+        [[nodiscard]] auto id_bound() const -> std::size_t {
+            std::size_t most = 0;
+            for (const auto& part : parts) {
+                most = std::max(most, part.ids.size());
+            }
+            return most << part_bits;
+        }
     };
 
     /// A key is packable iff every column reduces to a fixed-width INTEGRAL cell
     /// whose byte equality equals value equality, with no nulls, and the columns
     /// together fit in 32 bytes.
     ///
-    /// Doubles are excluded (-0.0/NaN break byte equality). Strings are excluded
-    /// because interning one per row would cost the hash lookup this path exists
-    /// to avoid. Categoricals ARE included: their dictionary is interned once per
-    /// chunk into operator-global ids (see `CatIntern`), which is what makes a
-    /// code comparable across chunks.
+    /// Doubles are excluded (-0.0/NaN break byte equality). Categoricals ARE
+    /// included: their dictionary is interned once per chunk into
+    /// operator-global ids (see `CatIntern`), which is what makes a code
+    /// comparable across chunks. Strings are included only when cells are
+    /// sized from the data, and only after the caller has run
+    /// `intern_strings` on the chunk (see `StrIntern`).
     auto build_packed_key(const std::vector<const ColumnEntry*>& entries)
         -> std::optional<PackedPlan> {
         layout_miss_ = false;
@@ -142,7 +194,8 @@ struct PackedKeyEncoder {
     }
 
     /// The shape half of `build_packed_key`: every column is a packable kind
-    /// and none carries nulls. Touches no state, so it can probe a chunk
+    /// and none carries nulls. Admits String, so it is for a caller that sizes
+    /// cells from the data and runs `intern_strings`. Touches no state, so it can probe a chunk
     /// without fixing a data-sized layout from it.
     [[nodiscard]] static auto packable_shape(const std::vector<const ColumnEntry*>& entries)
         -> bool {
@@ -153,7 +206,8 @@ struct PackedKeyEncoder {
                     std::holds_alternative<Column<Date>>(column) ||
                     std::holds_alternative<Column<Timestamp>>(column) ||
                     std::holds_alternative<Column<bool>>(column) ||
-                    std::holds_alternative<Column<Categorical>>(column));
+                    std::holds_alternative<Column<Categorical>>(column) ||
+                    std::holds_alternative<Column<std::string>>(column));
         });
     }
 
@@ -266,6 +320,11 @@ struct PackedKeyEncoder {
         std::int64_t max = 0;  ///< for Cat: highest global id assigned so far
     };
 
+    /// Cat and Str cells hold an id counted up from 0, not a value.
+    [[nodiscard]] static constexpr auto is_id(PackCol::Kind kind) -> bool {
+        return kind == PackCol::Kind::Cat || kind == PackCol::Kind::Str;
+    }
+
     [[nodiscard]] static constexpr auto cell_cap(PackCol::Kind kind) -> unsigned {
         switch (kind) {
             case PackCol::Kind::Int64:
@@ -273,6 +332,7 @@ struct PackedKeyEncoder {
                 return 64U;
             case PackCol::Kind::Date:
             case PackCol::Kind::Cat:
+            case PackCol::Kind::Str:
                 return 32U;
             case PackCol::Kind::Bool:
                 return 1U;
@@ -300,8 +360,8 @@ struct PackedKeyEncoder {
     /// fit check can compare signed values directly.
     [[nodiscard]] static auto place_window(PackCol::Kind kind, unsigned bits, const Observed& seen)
         -> std::int64_t {
-        if (kind == PackCol::Kind::Cat || kind == PackCol::Kind::Bool || bits >= 64U) {
-            return kind == PackCol::Kind::Cat || kind == PackCol::Kind::Bool ? 0 : seen.min;
+        if (is_id(kind) || kind == PackCol::Kind::Bool || bits >= 64U) {
+            return is_id(kind) || kind == PackCol::Kind::Bool ? 0 : seen.min;
         }
         const bool is_date = kind == PackCol::Kind::Date;
         const auto floor = is_date ? std::int64_t{std::numeric_limits<std::int32_t>::min()}
@@ -327,7 +387,7 @@ struct PackedKeyEncoder {
             return true;
         }
         const std::uint64_t mask = (std::uint64_t{1} << cell.bits) - 1;
-        if (kind == PackCol::Kind::Cat) {
+        if (is_id(kind)) {
             return static_cast<std::uint64_t>(seen.max) <= mask;
         }
         // `place_window` keeps lo + mask inside the kind's range, so this
@@ -343,10 +403,9 @@ struct PackedKeyEncoder {
         unsigned total = 0;
         for (std::size_t k = 0; k < cols.size(); ++k) {
             const auto kind = cols[k].kind;
-            const std::uint64_t span = kind == PackCol::Kind::Cat
-                                           ? static_cast<std::uint64_t>(seen[k].max)
-                                           : static_cast<std::uint64_t>(seen[k].max) -
-                                                 static_cast<std::uint64_t>(seen[k].min);
+            const std::uint64_t span = is_id(kind) ? static_cast<std::uint64_t>(seen[k].max)
+                                                   : static_cast<std::uint64_t>(seen[k].max) -
+                                                         static_cast<std::uint64_t>(seen[k].min);
             layout[k].bits =
                 kind == PackCol::Kind::Bool ? 1U : static_cast<unsigned>(std::bit_width(span));
             total += layout[k].bits;
@@ -420,7 +479,20 @@ struct PackedKeyEncoder {
                 }
                 // Ids are assigned densely from 0, so the count so far bounds
                 // every id this chunk can produce -- no row scan needed.
-                seen[k].max = static_cast<std::int64_t>(cat_interns_[k].ids.size()) - 1;
+                seen[k].max = static_cast<std::int64_t>(cat_interns_[k].count) - 1;
+            } else if (const auto* c_str = std::get_if<Column<std::string>>(&column)) {
+                // Its ids come from `intern_strings`, which the caller ran on
+                // this very column; anything else is a caller that cannot
+                // intern, and the generic path is the safe answer.
+                // An id past 32 bits was truncated in `codes`.
+                if (k >= str_interns_.size() || str_interns_[k].column != c_str ||
+                    str_interns_[k].id_bound() > (std::size_t{1} << 32U)) {
+                    layout_miss_ = true;
+                    return std::nullopt;
+                }
+                col.kind = PackCol::Kind::Str;
+                col.codes = str_interns_[k].codes.data();
+                seen[k].max = static_cast<std::int64_t>(str_interns_[k].id_bound()) - 1;
             } else {
                 return std::nullopt;
             }
@@ -460,6 +532,36 @@ struct PackedKeyEncoder {
         if (dict_size == 0) {
             return nullptr;
         }
+        const auto& dict_ptr = cat.dictionary_ptr();
+        if (state.count == 0 && state.base == nullptr) {
+            state.base = dict_ptr;
+        }
+        if (state.base != nullptr) {
+            if (dict_ptr == state.base) {
+                // A dictionary only ever grows at its end, so the codes it
+                // held before keep their meaning.
+                const std::size_t had = state.remap.size();
+                if (dict_size > had) {
+                    state.remap.resize(dict_size);
+                    for (std::size_t code = had; code < dict_size; ++code) {
+                        state.remap[code] = static_cast<std::uint32_t>(code);
+                    }
+                }
+                state.count = std::max(state.count, dict_size);
+                return state.remap.data();
+            }
+            // A second dictionary: from here on ids come from the map, so seed
+            // it with the adopted one's ids, which are its codes. Copied into
+            // the arena, since a growing dictionary moves its strings.
+            const auto& base = *state.base;
+            state.ids.reserve(state.count);
+            for (std::size_t code = 0; code < state.count; ++code) {
+                state.arena.emplace_back(base[code]);
+                state.ids.emplace(std::string_view{state.arena.back()},
+                                  static_cast<std::uint32_t>(code));
+            }
+            state.base.reset();
+        }
         state.remap.resize(dict_size);
         for (std::size_t code = 0; code < dict_size; ++code) {
             const std::string_view value = dict[code];
@@ -474,8 +576,149 @@ struct PackedKeyEncoder {
             state.ids.emplace(std::string_view{state.arena.back()}, id);
             state.remap[code] = id;
         }
+        state.count = state.ids.size();
         return state.remap.data();
     }
+
+    /// Intern every String key column of this chunk into `str_interns_`, for
+    /// `build_packed_key` to pack. `run(n, body)` calls `body(i)` for each
+    /// `i < n`, across workers if it can; `tasks` is how many it can use at
+    /// once, and `parts` the partition count to fix on a first call (a power
+    /// of two, at most 256; 1 for a caller that will not fan out).
+    template <typename Run>
+    void intern_strings(const std::vector<const ColumnEntry*>& entries, std::size_t parts,
+                        std::size_t tasks, const Run& run) {
+        if (str_interns_.size() < entries.size()) {
+            str_interns_.resize(entries.size());
+        }
+        for (std::size_t k = 0; k < entries.size(); ++k) {
+            const auto* column = std::get_if<Column<std::string>>(&*entries[k]->column);
+            if (column == nullptr || entries[k]->validity.has_value()) {
+                continue;
+            }
+            auto& state = str_interns_[k];
+            if (state.parts.empty()) {
+                state.part_bits =
+                    static_cast<unsigned>(std::bit_width(std::max<std::size_t>(parts, 1)) - 1);
+                state.parts.resize(std::size_t{1} << state.part_bits);
+            }
+            intern_column(state, *column, tasks, run);
+            state.column = column;
+        }
+    }
+
+    template <typename Run>
+    static void intern_column(StrIntern& state, const Column<std::string>& column,
+                              std::size_t tasks, const Run& run) {
+        const std::size_t rows = column.size();
+        const char* chars = column.chars_data();
+        const std::uint32_t* offsets = column.offsets_data();
+        const auto view_at = [&](std::size_t row) {
+            return std::string_view{chars + offsets[row], offsets[row + 1] - offsets[row]};
+        };
+        state.codes.resize(rows);
+        std::uint32_t* codes = state.codes.data();
+        const unsigned bits = state.part_bits;
+        const std::size_t part_count = state.parts.size();
+        // High bits pick the partition: the map indexes by the low ones.
+        const auto part_of = [bits](std::size_t hash) -> std::size_t {
+            return bits == 0 ? 0 : static_cast<std::size_t>(std::uint64_t{hash} >> (64U - bits));
+        };
+        // A partition's probe of `view`, as the row's code.
+        const auto probe = [&](std::size_t p, std::string_view view) -> std::uint32_t {
+            auto& part = state.parts[p];
+            auto it = part.ids.find(view);
+            std::uint32_t local = 0;
+            if (it == part.ids.end()) {
+                local = static_cast<std::uint32_t>(part.ids.size());
+                part.ids.emplace(part.arena.intern(view), local);
+            } else {
+                local = it->second;
+            }
+            return static_cast<std::uint32_t>((std::size_t{local} << bits) | p);
+        };
+        const robin_hood::hash<std::string_view> hasher;
+        if (tasks < 2 || part_count < 2 || rows < kParallelInternRows) {
+            for (std::size_t row = 0; row < rows; ++row) {
+                const auto view = view_at(row);
+                codes[row] = probe(part_of(hasher(view)), view);
+            }
+            return;
+        }
+
+        // Pass 1: each row's partition, and a histogram per row range. Ranges
+        // are contiguous, so a partition's rows stay in row order below.
+        const std::size_t ranges = tasks;
+        const std::size_t grain = (rows + ranges - 1) / ranges;
+        ::ibex::detail::NoInitVector<std::uint8_t> part_of_row(rows);
+        std::vector<std::size_t> counts(ranges * part_count, 0);
+        run(ranges, [&](std::size_t r) {
+            const std::size_t end = std::min(rows, (r + 1) * grain);
+            std::size_t* range_counts = counts.data() + (r * part_count);
+            for (std::size_t row = r * grain; row < end; ++row) {
+                const auto p = static_cast<std::uint8_t>(part_of(hasher(view_at(row))));
+                part_of_row[row] = p;
+                ++range_counts[p];
+            }
+        });
+        std::vector<std::size_t> part_begin(part_count + 1, 0);
+        {
+            std::size_t running = 0;
+            for (std::size_t p = 0; p < part_count; ++p) {
+                part_begin[p] = running;
+                for (std::size_t r = 0; r < ranges; ++r) {
+                    const std::size_t n = counts[(r * part_count) + p];
+                    counts[(r * part_count) + p] = running;
+                    running += n;
+                }
+            }
+            part_begin[part_count] = running;
+        }
+        // Pass 2: scatter each row, with its view, into its partition's slice.
+        // The view travels with the row so the probe below reads it
+        // sequentially instead of missing on the offsets first.
+        ::ibex::detail::NoInitVector<std::uint32_t> scattered_rows(rows);
+        ::ibex::detail::NoInitVector<std::string_view> scattered_views(rows);
+        run(ranges, [&](std::size_t r) {
+            const std::size_t end = std::min(rows, (r + 1) * grain);
+            std::size_t* cursor = counts.data() + (r * part_count);
+            for (std::size_t row = r * grain; row < end; ++row) {
+                const std::size_t at = cursor[part_of_row[row]]++;
+                scattered_rows[at] = static_cast<std::uint32_t>(row);
+                scattered_views[at] = view_at(row);
+            }
+        });
+        // Pass 3: each task takes whole partitions, so a map has one writer.
+        std::atomic<std::size_t> next{0};
+        run(std::min(tasks, part_count), [&](std::size_t) {
+            for (std::size_t p = next.fetch_add(1, std::memory_order_relaxed); p < part_count;
+                 p = next.fetch_add(1, std::memory_order_relaxed)) {
+                const std::size_t begin = part_begin[p];
+                const std::size_t end = part_begin[p + 1];
+                // Size the map once a sample shows most rows are new keys, so
+                // it does not rehash its way up (see `try_discover_partitioned`).
+                constexpr std::size_t kSample = 1024;
+                const std::size_t held = state.parts[p].ids.size();
+                for (std::size_t i = begin; i < end; ++i) {
+                    if (i == begin + kSample && end - i > 4 * kSample) {
+                        const std::size_t fresh = state.parts[p].ids.size() - held;
+                        if (fresh * 2 > kSample) {
+                            state.parts[p].ids.reserve(state.parts[p].ids.size() +
+                                                       ((end - i) * fresh / kSample));
+                        }
+                    }
+                    constexpr std::size_t kAhead = 16;
+                    if (i + kAhead < end) {
+                        __builtin_prefetch(scattered_views[i + kAhead].data());
+                    }
+                    codes[scattered_rows[i]] = probe(p, scattered_views[i]);
+                }
+            }
+        });
+    }
+
+    /// Below this many rows a chunk is interned on the calling thread.
+    static constexpr std::size_t kParallelInternRows = std::size_t{1} << 16;
 
     /// Pack one row's key. Cheap enough — a handful of array reads and shifts,
     /// no hashing and no branch on width — that callers which need the key
@@ -505,6 +748,9 @@ struct PackedKeyEncoder {
                 case PackCol::Kind::Cat:
                     cell = col.remap[static_cast<std::size_t>(col.cat->code_at(row))];
                     break;
+                case PackCol::Kind::Str:
+                    cell = col.codes[row];
+                    break;
             }
             if constexpr (std::is_same_v<Packed, std::uint64_t>) {
                 key |= cell << col.shift;
@@ -526,6 +772,8 @@ struct PackedKeyEncoder {
 
     /// Interning state, indexed by key column position (see `CatIntern`).
     std::vector<CatIntern> cat_interns_;
+    /// Likewise for String key columns (see `StrIntern`).
+    std::vector<StrIntern> str_interns_;
     /// The data-sized layout, fixed by the first chunk; empty until then.
     std::vector<CellLayout> layout_;
     unsigned layout_bytes_ = 0;

@@ -708,6 +708,9 @@ class ChunkedDistinctOperator final : public Operator {
                     case PackedKeyEncoder::PackCol::Kind::Cat:
                         cell = col.remap[static_cast<std::size_t>(col.cat->code_at(row))];
                         break;
+                    case PackedKeyEncoder::PackCol::Kind::Str:
+                        cell = col.codes[row];
+                        break;
                 }
                 if constexpr (std::is_same_v<Packed, std::uint64_t>) {
                     key |= cell << col.shift;

@@ -4211,11 +4211,93 @@ class HashAggregateState final {
         return std::min(kMax, workers * kPerWorker);
     }
 
+    /// `WorkerPool::submit`'s shape, run inline when there is no pool.
+    struct DiscoveryRunner {
+        WorkerPool* pool = nullptr;
+        [[nodiscard]] auto submit(std::size_t tasks,
+                                  const std::function<void(std::size_t)>& body) const
+            -> WorkerPool::Batch {
+            if (pool == nullptr) {
+                for (std::size_t t = 0; t < tasks; ++t) {
+                    body(t);
+                }
+                return {};
+            }
+            return pool->submit(tasks, body);
+        }
+    };
+
+    /// Set once the one-core sample (`sample_mostly_distinct`) said no.
+    mutable bool single_core_sample_declined_ = false;
+
+    /// Discovery runs on the calling core alone: the plan declined fan-out
+    /// for want of cores (not for want of rows), or left one worker.
+    [[nodiscard]] auto discovery_single_core() const -> bool {
+        return par_.discovery.decline == physical::FanOutDecline::SingleCore ||
+               (par_.discovery.decline == physical::FanOutDecline::None &&
+                par_.discovery.worker_cap < 2);
+    }
+
+    /// Workers partitioned discovery splits its passes over.
+    [[nodiscard]] auto discovery_workers() const -> std::size_t {
+        return discovery_single_core() ? 1 : par_.discovery.worker_cap;
+    }
+
+    /// Whether a strided sample of the chunk's keys is mostly distinct, by
+    /// their hashes: the high-cardinality signal that makes partitioning pay
+    /// on ONE core.
+    ///
+    /// There it is not parallelism but locality. One table of h2o q10's ~1e7
+    /// groups misses cache on nearly every probe (2.3 s of its 2.6 s at one
+    /// core); split 16 ways, each partition's table is a 16th of that, and
+    /// q10 runs in 0.9 s. Few groups invert it: the one table already sits
+    /// in cache, the partition passes are pure overhead, and 1000 groups ran
+    /// 120 -> 200 ms. Measured crossover: serial won at ~1e4 groups,
+    /// partitioning at ~6e5. Sampled 64k rows at least 80% distinct means
+    /// roughly 1.5e5 groups or more. Strided, so sorted input does not
+    /// sample one run.
+    ///
+    /// Distinct is not enough: the serial loop skips the lookup for a row
+    /// whose key repeats the row before it, so clustered keys are cheap there
+    /// however many groups they make. PDS-H lineitem is stored by
+    /// `l_orderkey`, ~4 rows an order: partitioned, q21 at one core ran
+    /// 2.8 -> 4.7 s. So each sampled row is also compared with its
+    /// predecessor, and more than a quarter repeating keeps the serial loop.
+    template <typename HashAt>
+    [[nodiscard]] static auto sample_mostly_distinct(std::size_t rows, const HashAt& hash_at)
+        -> bool {
+        constexpr std::size_t kSample = std::size_t{1} << 16;
+        const std::size_t n = std::min(rows, kSample);
+        if (n == 0) {
+            return false;
+        }
+        const std::size_t stride = rows / n;  // at least 1
+        robin_hood::unordered_flat_set<std::uint64_t> seen;
+        seen.reserve(n);
+        std::size_t repeats = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            // Jittered within the stride: at a fixed offset, runs as long as
+            // the stride would always be sampled at their first row and never
+            // look like repeats.
+            const std::size_t row =
+                (i * stride) + static_cast<std::size_t>((i * 2'654'435'761ULL) >> 7U) % stride;
+            const auto hash = static_cast<std::uint64_t>(hash_at(row));
+            seen.insert(hash);
+            if (row != 0 && static_cast<std::uint64_t>(hash_at(row - 1)) == hash) {
+                ++repeats;
+            }
+        }
+        return seen.size() * 5 >= n * 4 && repeats * 4 <= n;
+    }
+
     /// Whether `try_discover_partitioned` would run for a chunk of `rows`, so a
     /// caller with per-row preparation of its own (the generic path hashes
-    /// every row first) can skip it when the answer is no.
+    /// every row first) can skip it when the answer is no. `hash_at(row)` is
+    /// the row's key hash, sampled only on one core (`sample_mostly_distinct`).
+    template <typename HashAt>
     [[nodiscard]] auto may_discover_partitioned(std::size_t rows, std::size_t min_rows,
-                                                bool can_seed) const -> bool {
+                                                bool can_seed, const HashAt& hash_at) const
+        -> bool {
         // The Discovery node's worker cap and fan-out permission come from
         // the plan (src/runtime/PARALLELISM.md); the operator keeps only the two
         // checks it alone can make -- is it nested, did this operator's input so
@@ -4226,12 +4308,20 @@ class HashAggregateState final {
         if (exec_ == nullptr || on_worker_pool_thread()) {
             return false;
         }
-        if (par_.discovery.decline != physical::FanOutDecline::None ||
-            par_.discovery.worker_cap < 2) {
+        const bool single_core = discovery_single_core();
+        if (!single_core && (par_.discovery.decline != physical::FanOutDecline::None ||
+                             par_.discovery.worker_cap < 2)) {
             return false;
         }
         if (!partitioned_active_) {
             if (std::max(rows_offered_, rows) < min_rows) {
+                return false;
+            }
+            // Sampled once: a declined stream stays declined, or every chunk
+            // of a clustered parquet scan (PDS-H q18) paid for a fresh sample.
+            if (single_core &&
+                (single_core_sample_declined_ || !sample_mostly_distinct(rows, hash_at))) {
+                single_core_sample_declined_ = true;
                 return false;
             }
             // Starting part-way through means groups already exist, and they
@@ -4281,13 +4371,21 @@ class HashAggregateState final {
         // lowering it is a measured dead end, because the break-even is set by
         // group CARDINALITY and a low-cardinality run of this size loses.
         constexpr bool can_seed = !std::is_same_v<KeyOfGroup, NoGroupKeys>;
-        if (!may_discover_partitioned(rows, min_rows, can_seed)) {
+        if (!may_discover_partitioned(rows, min_rows, can_seed,
+                                      [&](std::size_t row) { return Hash{}(key_at(row)); })) {
             return false;
         }
-        auto& pool = process_worker_pool();
-        const std::size_t workers = par_.discovery.worker_cap;
+        // On one core the passes run here, inline: partitioning is then for
+        // the cache, not a fan-out, and is counted apart from one.
+        const bool single_core = discovery_single_core();
+        const DiscoveryRunner pool{single_core ? nullptr : &process_worker_pool()};
+        const std::size_t workers = discovery_workers();
         const std::size_t part_count = discovery_partition_count();
-        note_partition_fanout();
+        if (single_core) {
+            single_core_partitioned_discoveries().fetch_add(1, std::memory_order_relaxed);
+        } else {
+            note_partition_fanout();
+        }
         const std::uint64_t part_mask = part_count - 1;
         if (partitions.size() < part_count) {
             partitions.resize(part_count);
@@ -5600,14 +5698,17 @@ class HashAggregateState final {
         // As for the packed key: probing this key costs far more per row than
         // an int or a string probe, so partitioning pays off at the lower
         // threshold.
-        if (!may_discover_partitioned(rows, kPackedPartitionMinRows, true)) {
+        if (!may_discover_partitioned(rows, kPackedPartitionMinRows, true,
+                                      [&](std::size_t row) { return hash_key_row(cols, row); })) {
             return false;
         }
         row_hashes_.resize(rows);
         {
-            const std::size_t workers = par_.discovery.worker_cap;
+            const std::size_t workers = discovery_workers();
             const std::size_t grain = (rows + workers - 1) / workers;
-            auto batch = process_worker_pool().submit(workers, [&](std::size_t w) {
+            const DiscoveryRunner runner{discovery_single_core() ? nullptr
+                                                                 : &process_worker_pool()};
+            auto batch = runner.submit(workers, [&](std::size_t w) {
                 const std::size_t end = std::min(rows, (w + 1) * grain);
                 for (std::size_t row = w * grain; row < end; ++row) {
                     row_hashes_[row] = hash_key_row(cols, row);
@@ -9140,6 +9241,11 @@ class ChunkedSortedAggregateOperator final : public Operator {
 };
 
 }  // namespace
+
+auto single_core_partitioned_discoveries() -> std::atomic<std::uint64_t>& {
+    static std::atomic<std::uint64_t> count{0};
+    return count;
+}
 
 auto make_chunked_aggregate_operator(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
                                      const std::vector<ir::AggSpec>* aggregations,

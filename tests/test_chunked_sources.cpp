@@ -46,6 +46,7 @@
 #include <variant>
 #include <vector>
 
+#include "aggregate_chunked_internal.hpp"
 #include "execution_profile_internal.hpp"
 #include "join_chunked_internal.hpp"
 
@@ -1554,6 +1555,104 @@ TEST_CASE("packed group-by keys: a String key column interns into the packed key
         REQUIRE(pr.has_value());
         check(*sr);
         check(*pr);
+    }
+}
+
+TEST_CASE("one-core aggregate: partitions discovery only for a mostly distinct key",
+          "[runtime][chunked][aggregate]") {
+    // On one core, partitioning is a cache-locality trade, not parallelism:
+    // it wins when one table of the groups would miss cache (h2o q10) and
+    // loses when the groups are few. A strided sample decides. Both shapes
+    // are checked against a grouping computed here, in first-occurrence
+    // order, and a counter shows which way each went.
+    constexpr std::size_t kRows = 300'000;
+    const auto run = [&](const auto& key_of, bool expect_partitioned) {
+        Column<std::int64_t> a;
+        Column<std::int64_t> b;
+        Column<std::int64_t> c;
+        Column<std::int64_t> q;
+        std::vector<std::tuple<std::int64_t, std::int64_t, std::int64_t>> order;
+        std::map<std::tuple<std::int64_t, std::int64_t, std::int64_t>,
+                 std::pair<std::int64_t, std::int64_t>>
+            sums;  // count, total
+        for (std::size_t i = 0; i < kRows; ++i) {
+            const auto key = key_of(i);
+            const auto qv = static_cast<std::int64_t>(i % 97);
+            a.push_back(std::get<0>(key));
+            b.push_back(std::get<1>(key));
+            c.push_back(std::get<2>(key));
+            q.push_back(qv);
+            auto [it, inserted] = sums.emplace(key, std::pair<std::int64_t, std::int64_t>{0, 0});
+            if (inserted) {
+                order.push_back(key);
+            }
+            ++it->second.first;
+            it->second.second += qv;
+        }
+        runtime::Table t;
+        t.add_column("a", std::move(a));
+        t.add_column("b", std::move(b));
+        t.add_column("c", std::move(c));
+        t.add_column("q", std::move(q));
+        runtime::TableRegistry registry;
+        registry.emplace("t", std::move(t));
+        auto program = parser::parse("t[select { total = sum(q), n = count() }, by { a, b, c }];");
+        REQUIRE(program.has_value());
+        auto ir = parser::lower(program.value());
+        REQUIRE(ir.has_value());
+        runtime::ParallelPipelineStats stats;
+        runtime::ExecutionContext serial;
+        serial.parallel_threads = 1;
+        serial.parallel_stats = &stats;
+        const auto before = runtime::single_core_partitioned_discoveries().load();
+        const auto out =
+            runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, serial);
+        INFO((out.has_value() ? std::string{} : out.error()));
+        REQUIRE(out.has_value());
+        // Partitioned or not, one core never fans out.
+        CHECK(stats.parallel_aggregate_partitions.load() == 0);
+        CHECK((runtime::single_core_partitioned_discoveries().load() > before) ==
+              expect_partitioned);
+        REQUIRE(out->rows() == order.size());
+        const auto& oa = std::get<Column<std::int64_t>>(*out->find("a"));
+        const auto& ob = std::get<Column<std::int64_t>>(*out->find("b"));
+        const auto& oc = std::get<Column<std::int64_t>>(*out->find("c"));
+        const auto& ot = std::get<Column<std::int64_t>>(*out->find("total"));
+        const auto& on = std::get<Column<std::int64_t>>(*out->find("n"));
+        for (std::size_t g = 0; g < order.size(); ++g) {
+            INFO("group " << g);
+            const auto& key = order[g];
+            REQUIRE(oa[g] == std::get<0>(key));
+            REQUIRE(ob[g] == std::get<1>(key));
+            REQUIRE(oc[g] == std::get<2>(key));
+            REQUIRE(on[g] == sums[key].first);
+            REQUIRE(ot[g] == sums[key].second);
+        }
+    };
+    SECTION("nearly every row a new group: partitioned") {
+        run(
+            [](std::size_t i) {
+                const auto k = static_cast<std::int64_t>((i * 7919) % 250'000);
+                return std::tuple{k % 1000, k / 1000, -k};
+            },
+            true);
+    }
+    SECTION("distinct but clustered, four rows a key: the serial loop's run shortcut") {
+        run(
+            [](std::size_t i) {
+                const auto k = static_cast<std::int64_t>(i / 4);
+                return std::tuple{k % 1000, k / 1000, -k};
+            },
+            false);
+    }
+    SECTION("210 groups: the one serial table") {
+        run(
+            [](std::size_t i) {
+                return std::tuple{static_cast<std::int64_t>(i % 10),
+                                  static_cast<std::int64_t>(i % 7),
+                                  static_cast<std::int64_t>(i % 3)};
+            },
+            false);
     }
 }
 

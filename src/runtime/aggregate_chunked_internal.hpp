@@ -6,6 +6,8 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -20,6 +22,11 @@ struct ColumnRef;
 }  // namespace ibex::ir
 
 namespace ibex::runtime {
+
+/// How many times, process-wide, an aggregate partitioned its group discovery
+/// on ONE core -- for cache locality, run inline, so not a fan-out and not in
+/// `ParallelPipelineStats::parallel_aggregate_partitions`. For tests.
+[[nodiscard]] auto single_core_partitioned_discoveries() -> std::atomic<std::uint64_t>&;
 
 /// Construct the adaptive sorted/hash aggregate implementation. Kept as one
 /// factory boundary so the complete aggregate family can live in its own

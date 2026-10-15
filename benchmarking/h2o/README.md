@@ -84,6 +84,36 @@ fit on the dev box. Run it on AWS instead.
 Results go to `results/h2o_<stamp>_<T>t.tsv`, one row per (data, question,
 engine), with every timed sample kept.
 
+## Results: 2026-10-15, AWS r7i.4xlarge, 1 and 8 physical cores, 1e7 rows
+
+Ibex `5ee22b2b`, Polars 2.0.0 (streaming), DuckDB 1.5.4, on one clean
+r7i.4xlarge (Xeon Platinum 8488C) with SMT off, so 8 physical cores; every
+engine pinned to the same cores. Run with `benchmarking/aws/run-h2o.sh
+--on-demand`; the artifact is `results/h2o_aws_20261015T151409.tar.gz`. All
+132 cells completed and passed the cross-engine check. This is the run the
+website shows.
+
+| data | 8c ibex/polars geomean | 8c ibex/duckdb geomean | 8c ibex/polars total | 1c ibex/polars geomean | 1c ibex/duckdb geomean | 1c ibex/polars total |
+|---|---:|---:|---:|---:|---:|---:|
+| J1_1e7_NA_0_0 (join) | 1.00 | 0.19 | 1.47 | 0.88 | 0.15 | 0.88 |
+| G1_1e7_1e2_0_0 | 0.85 | 0.67 | 1.12 | 0.64 | 0.69 | 0.90 |
+| G1_1e7_1e2_5_0 (NAs) | 0.79 | 0.74 | 1.03 | 0.51 | 0.63 | 0.72 |
+| G1_1e7_1e2_0_1 (sorted) | 0.87 | 0.64 | 1.12 | 0.65 | 0.70 | 0.89 |
+| G1_1e7_1e1_0_0 | 0.94 | 0.98 | 0.66 | 0.63 | 0.70 | 0.98 |
+| G1_1e7_2e0_0_0 | 1.07 | 1.24 | 0.43 | 0.66 | 0.70 | 0.77 |
+
+- **1 core:** Ibex leads both engines on every geomean, groupby and join.
+- **8 cores:** Ibex scales less than Polars from 1 to 8 cores, as on PDS-H,
+  and the dev box (below) flatters Ibex above ~4 cores. Groupby leads Polars
+  on the geomean of every set but K=2e0 (1.07), and DuckDB on all but K=2e0
+  (1.24).
+- **q10** is the largest loss: 2.2–3.2× Polars and 1.3–1.75× DuckDB at 8 cores
+  (417–549 ms against 169–225 ms), 1.1–1.9× Polars at 1 core.
+- **Other 8-core losses:** q5 (`by id6`) up to 2.1× Polars at K=2e0, q6 (median)
+  1.2–1.8×, q7 (`by id3`) ~1.4×, and the big join q5 1.81× (397 against
+  219 ms), which is what puts the join total at 1.47 while q1–q4 are
+  0.77–0.91×.
+
 ## Results: 2026-10-15, dev box, 8 cores, 1e7 rows
 
 Ibex `6f51208e`, Polars 2.0.0 (streaming), DuckDB 1.5.4, all three engines in

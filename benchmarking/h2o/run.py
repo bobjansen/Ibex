@@ -13,8 +13,11 @@ the h2oai db-benchmark (duckdblabs/db-benchmark @ 3b074bc319):
     cast to Categorical) and the streaming engine (`collect(engine="streaming")`);
   * DuckDB uses the upstream solution's schema (ENUM for id1/id2 in groupby,
     ENUM id4/id5 in join, FLOAT v3) and materialises into a TEMP table;
-  * Ibex reads the same CSV with its own reader (types and dictionary encoding
-    are its own choice, as everywhere else in the benchmarks).
+  * Ibex reads the same CSV with its own reader and picks its own types, except
+    that the groupby string keys are declared Categorical (`schema =
+    "id1:cat,id2:cat,id3:cat"`), the Ibex spelling of the upstream Polars cast.
+    Left to itself the reader keeps a key with more distinct values than 10% of
+    rows as String, which at K=2e0 is id3 (5M levels).
 
 Data is loaded once per process and not timed; each question is timed
 `--warmup` + `--iters` times and reported as min and median. Every result is
@@ -184,7 +187,9 @@ def ibex_run(data: str, task: str, nas: bool, wanted: list[str], warmup: int, it
     to CSV with timing off. A process per question keeps a failing or
     runaway question from taking the rest down with it."""
     tables = {"x": DATA_DIR / f"{data}.csv"} if task == "groupby" else join_tables(data)
-    loads = ['import "csv";'] + [f'let {k} = csv::read("{p}");' for k, p in tables.items()]
+    # The groupby string keys are Categorical, as upstream casts them for Polars.
+    schema = ', schema = "id1:cat,id2:cat,id3:cat"' if task == "groupby" else ""
+    loads = ['import "csv";'] + [f'let {k} = csv::read("{p}"{schema});' for k, p in tables.items()]
     results = []
     with tempfile.TemporaryDirectory(prefix="ibex_h2o_") as tmp:
         for qid, desc, chk_cols, ibex_q, _, _ in questions_for(task, nas):

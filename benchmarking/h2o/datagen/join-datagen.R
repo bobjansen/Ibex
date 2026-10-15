@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # Vendored verbatim from https://github.com/duckdblabs/db-benchmark (_data/join-datagen.R),
 # the maintained fork of h2oai/db-benchmark, at commit 3b074bc319. Licensed MPL-2.0; see LICENSE-MPL-2.0.
 # Do not edit: the point is that every engine reads the upstream data.

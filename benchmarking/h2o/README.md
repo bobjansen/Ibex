@@ -115,9 +115,10 @@ Engine changes since 2026-10-14:
 
 - **Groupby:** Ibex leads both engines on the geomean of every groupby set:
   0.64–0.77 against Polars, 0.59–0.98 against DuckDB. Every groupby total
-  is below 1 against both.
+  is below 1 against Polars; against DuckDB, K=2e0's is 1.35, nearly all of
+  it q8.
 - **q10 (~1e7 groups)** is the largest remaining loss: 1.5–2.0× Polars
-  (318–473 ms against 211–255 ms). It leads DuckDB nowhere (1.13–1.53×).
+  (318–473 ms against 211–255 ms), and it trails DuckDB too (1.13–1.53×).
 - **Smaller losses:** q5 (`by id6`) is 1.12–1.29× Polars, q6 (median) up to
   1.13×, and q9 at K=2e0 1.32×, where it runs 16 ms against 12. DuckDB leads
   q8 (per-group top-k) at K=1e1 and 2e0 (2.1× and 3.6×), though Ibex is

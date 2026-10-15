@@ -90,13 +90,15 @@ Ibex `6f51208e`, Polars 2.0.0 (streaming), DuckDB 1.5.4, all three engines in
 the same sitting, with the string keys Categorical for Polars and Ibex (see
 Fairness). The ratio is Ibex/other on min ms, so below 1 means Ibex is faster.
 Raw data is in `results/h2o_20261015T131020_8t.tsv`. All 66 cells completed
-and passed the cross-engine check. The 2026-10-14 column is the previous run
+and passed the cross-engine check. The join row is a later run at `ce43503f`,
+after the join changes below (`results/h2o_20261015T145615_8t.tsv`). The
+2026-10-14 column is the previous run
 (`results/h2o_20261014T184344_8t.tsv`), with Ibex reading `id3` and the join's
 `id6` as String.
 
 | data | ibex/polars geomean | ibex/duckdb geomean | ibex/polars total | ibex/polars 2026-10-14 |
 |---|---:|---:|---:|---:|
-| J1_1e7_NA_0_0 (join) | 1.39 | 0.43 | 1.23 | 1.58 |
+| J1_1e7_NA_0_0 (join) | 0.94 | 0.24 | 1.01 | 1.58 |
 | G1_1e7_1e2_0_0 | 0.77 | 0.65 | 0.95 | 0.94 |
 | G1_1e7_1e2_5_0 (NAs) | 0.64 | 0.60 | 0.89 | 1.24 |
 | G1_1e7_1e2_0_1 (sorted) | 0.69 | 0.59 | 0.93 | 0.77 |
@@ -111,7 +113,10 @@ Engine changes since 2026-10-14:
 - string group keys kept in arenas, as views;
 - grouped `cov(x, y)` and `corr(x, y)` (q9);
 - packed multi-column keys that hold a String, a 5M-level Categorical, or a
-  nullable column (q10, including the NA data).
+  nullable column (q10, including the NA data);
+- join: a direct-address probe for a small, dense integer build side, and an
+  output gather that reads each index range once for every column
+  (`8e774bed`, `ce43503f`).
 
 - **Groupby:** Ibex leads both engines on the geomean of every groupby set:
   0.64–0.77 against Polars, 0.59–0.98 against DuckDB. Every groupby total
@@ -123,19 +128,22 @@ Engine changes since 2026-10-14:
   1.13×, and q9 at K=2e0 1.32×, where it runs 16 ms against 12. DuckDB leads
   q8 (per-group top-k) at K=1e1 and 2e0 (2.1× and 3.6×), though Ibex is
   0.27–0.39× Polars there.
-- **Join:** the int-key inner joins q1 and q2 are about 2× Polars. Ibex leads
-  DuckDB (0.43); DuckDB's join times vary run to run on this box (q1 109 ms
-  here, 198 ms in the morning run).
+- **Join:** level with Polars. q1, q2 and q4 run 32–34 ms against Polars'
+  32–35 ms, q3 (left join) is 0.69×, and q5 (a 1e7-row build side) 1.07×.
+  Polars' own times vary by ~15% between runs on this box (q1 26–33 ms), so
+  the 8-core join geomean has read 0.94–1.04 across clean runs. Ibex leads
+  DuckDB (0.24).
 
 ## Results: 2026-10-15, dev box, 1 core, 1e7 rows
 
 Same build and engine versions, same sitting. Raw data is in
-`results/h2o_20261015T131421_1t.tsv`. All 66 cells completed and passed the
+`results/h2o_20261015T131421_1t.tsv`, and for the join row, run at `ce43503f`,
+`results/h2o_20261015T145720_1t.tsv`. All 66 cells completed and passed the
 cross-engine check. The 2026-10-14 column is `results/h2o_20261014T184755_1t.tsv`.
 
 | data | ibex/polars geomean | ibex/duckdb geomean | ibex/polars total | ibex/polars 2026-10-14 |
 |---|---:|---:|---:|---:|
-| J1_1e7_NA_0_0 (join) | 1.18 | 0.21 | 1.10 | 1.33 |
+| J1_1e7_NA_0_0 (join) | 0.93 | 0.17 | 0.97 | 1.33 |
 | G1_1e7_1e2_0_0 | 0.57 | 0.61 | 0.82 | 0.75 |
 | G1_1e7_1e2_5_0 (NAs) | 0.50 | 0.58 | 0.71 | 0.81 |
 | G1_1e7_1e2_0_1 (sorted) | 0.58 | 0.63 | 0.82 | 0.78 |
@@ -151,4 +159,5 @@ cross-engine check. The 2026-10-14 column is `results/h2o_20261014T184755_1t.tsv
 - **q9** is 0.4–0.6× Polars. Grouped `corr` first ran it at 220–390 ms on one
   core, because `aggregate_table` grouped integer and code keys by cell only
   with two or more workers; with that gate removed it is 45–75 ms.
-- **Join:** q1 and q2 are 1.4–1.8× Polars; Ibex is 0.21× DuckDB.
+- **Join:** Ibex leads Polars on four of five questions (0.86–0.98×; q3 1.05×)
+  and is 0.17× DuckDB.

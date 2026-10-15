@@ -97,6 +97,12 @@ struct PackedKeyEncoder {
         const Column<bool>* boolean = nullptr;
         const Column<Categorical>* cat = nullptr;
         const std::uint32_t* remap = nullptr;  ///< local code -> operator-global id
+        /// Set while the column's dictionary is the adopted id space
+        /// (`CatIntern::base`): `remap` is then the identity, and the code is
+        /// the cell. Reading the remap anyway cost a cache miss per row once
+        /// it outgrew the cache -- h2o q10's 5M-level id3 is a 20 MB remap,
+        /// ~300 ms of a ~950 ms query at one core.
+        bool cat_identity = false;
         const std::uint32_t* codes = nullptr;  ///< Str: each row's interned id
         /// Set when the column may hold nulls; a null row packs as `null_cell`,
         /// a value no non-null row of the column can take.
@@ -312,6 +318,7 @@ struct PackedKeyEncoder {
                 if (col.remap == nullptr) {
                     return std::nullopt;
                 }
+                col.cat_identity = cat_interns_[k].base != nullptr;
                 col.kind = PackCol::Kind::Cat;
                 col.cat = c_cat;
                 bytes += 4;
@@ -553,6 +560,7 @@ struct PackedKeyEncoder {
                     layout_miss_ = true;
                     return std::nullopt;
                 }
+                col.cat_identity = cat_interns_[k].base != nullptr;
                 // Ids are assigned densely from 0, so the count so far bounds
                 // every id this chunk can produce -- no row scan needed.
                 seen[k].max = static_cast<std::int64_t>(cat_interns_[k].count) - 1;
@@ -832,7 +840,7 @@ struct PackedKeyEncoder {
                         cell = (*col.boolean)[row] ? 1U : 0U;
                         break;
                     case PackCol::Kind::Cat:
-                        cell = col.remap[static_cast<std::size_t>(col.cat->code_at(row))];
+                        cell = cat_cell(col, row);
                         break;
                     case PackCol::Kind::Str:
                         cell = col.codes[row];
@@ -846,6 +854,12 @@ struct PackedKeyEncoder {
             }
         }
         return key;
+    }
+
+    /// A Categorical column's cell for `row`: its operator-global id.
+    [[nodiscard]] static auto cat_cell(const PackCol& col, std::size_t row) -> std::uint64_t {
+        const auto code = static_cast<std::size_t>(col.cat->code_at(row));
+        return col.cat_identity ? code : col.remap[code];
     }
 
     /// Materialize this chunk's packed key for every row in `[begin, end)`.

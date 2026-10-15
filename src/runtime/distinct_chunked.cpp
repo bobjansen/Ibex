@@ -706,7 +706,7 @@ class ChunkedDistinctOperator final : public Operator {
                         cell = (*col.boolean)[row] ? 1U : 0U;
                         break;
                     case PackedKeyEncoder::PackCol::Kind::Cat:
-                        cell = col.remap[static_cast<std::size_t>(col.cat->code_at(row))];
+                        cell = PackedKeyEncoder::cat_cell(col, row);
                         break;
                     case PackedKeyEncoder::PackCol::Kind::Str:
                         cell = col.codes[row];

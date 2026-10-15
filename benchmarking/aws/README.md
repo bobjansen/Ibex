@@ -12,6 +12,7 @@ pull the results back as a CSV. Three layers:
 | `run-per-engine.sh`  | local       | **One instance per engine**, in parallel, then combines results. |
 | `run-thread-scaling.sh` | local    | One box, the suite once per thread count — how each engine converts cores into throughput. |
 | `run-tpch.sh`        | local       | One instance runs the TPC-H/PDS-H quartet and downloads a TSV artifact. |
+| `run-h2o.sh`         | local       | One instance runs the h2o db-benchmark (Ibex, Polars, DuckDB) per core count and downloads a TSV artifact. |
 | `run-window-ohlc.sh` | local       | One instance runs the window-OHLC suite (Ibex/Polars/DuckDB) and downloads a TSV artifact. |
 | `run-r-only.sh`      | local       | One 8-core instance runs the R-only suite (data.table/dplyr/ibex-r) across a size sweep. |
 | `compare-git.sh`     | local       | A/B **two git commits** of ibex on one clean box (low-noise perf verdict). |

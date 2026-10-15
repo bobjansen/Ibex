@@ -125,23 +125,25 @@ Engine changes since 2026-10-14:
 
 ## Results: 2026-10-15, dev box, 1 core, 1e7 rows
 
-Same build and engine versions, same sitting. Raw data is in
-`results/h2o_20261015T093311_1t.tsv`. All 66 cells completed and passed the
-cross-engine check. The 2026-10-14 column is `results/h2o_20261014T184755_1t.tsv`.
+Ibex `1591723e` (the 8-core build plus one-core cell grouping in the
+materialising aggregate), same engine versions, run later the same day. Raw
+data is in `results/h2o_20261015T100123_1t.tsv`. All 66 cells completed and
+passed the cross-engine check. The 2026-10-14 column is
+`results/h2o_20261014T184755_1t.tsv`.
 
 | data | ibex/polars geomean | ibex/duckdb geomean | ibex/polars total | ibex/polars 2026-10-14 |
 |---|---:|---:|---:|---:|
-| J1_1e7_NA_0_0 (join) | 1.17 | 0.22 | 1.08 | 1.33 |
-| G1_1e7_1e2_0_0 | 0.83 | 0.89 | 1.73 | 0.75 |
-| G1_1e7_1e2_5_0 (NAs) | 0.71 | 0.82 | 1.59 | 0.81 |
-| G1_1e7_1e2_0_1 (sorted) | 0.87 | 0.89 | 1.73 | 0.78 |
-| G1_1e7_1e1_0_0 | 0.79 | 0.92 | 1.63 | 0.78 |
-| G1_1e7_2e0_0_0 | 0.88 | 0.92 | 1.14 | 1.11 |
+| J1_1e7_NA_0_0 (join) | 1.12 | 0.21 | 0.97 | 1.33 |
+| G1_1e7_1e2_0_0 | 0.62 | 0.66 | 1.52 | 0.75 |
+| G1_1e7_1e2_5_0 (NAs) | 0.57 | 0.66 | 1.49 | 0.81 |
+| G1_1e7_1e2_0_1 (sorted) | 0.63 | 0.68 | 1.42 | 0.78 |
+| G1_1e7_1e1_0_0 | 0.66 | 0.71 | 1.57 | 0.78 |
+| G1_1e7_2e0_0_0 | 0.73 | 0.78 | 1.10 | 1.11 |
 
-- Ibex leads both engines on every groupby geomean at 1 core too. The totals
-  stay above 1 because q10 (3.1–4.7× Polars) dominates them.
-- **q9 regressed at 1 core.** Grouped `corr` made it 2–3× faster at 8 cores
-  (14–28 ms) but slower at 1 core than the six-sum formula it replaced: 390
-  against 198 ms at K=1e2, 220 against 152 ms at K=2e0. That is 2.6–3.8×
-  Polars, and it is most of why the K=1e2 and sorted geomeans read higher
-  than on 2026-10-14. Not yet investigated.
+- Ibex leads both engines on every groupby geomean at 1 core. The totals
+  stay above 1 because q10 (3.0–4.5× Polars, 2.3–3.5 s) dominates them.
+- **q9 and q6:** grouped `corr` first ran q9 at 220–390 ms on one core, slower
+  than the six-sum formula it replaced, because `aggregate_table` grouped
+  integer and code keys by cell only when it had two or more workers. With
+  that gate removed (`1591723e`), q9 is 46–77 ms (0.36–0.60× Polars) and q6
+  (median by `id4, id5`) roughly halved.

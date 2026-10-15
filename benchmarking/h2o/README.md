@@ -43,9 +43,16 @@ columns.
   upstream solutions. For Polars that is Int32 ids and values, string keys cast
   to Categorical, Float32 join values, and the streaming engine. For DuckDB it
   is ENUM keys where upstream uses them and FLOAT `v3`. Ibex reads the CSV with
-  its own reader and picks its own types and dictionary encoding. The narrower
-  upstream types move fewer bytes than Ibex's Int64/Float64, so they favour
-  the other engines.
+  its own reader and picks its own types. The narrower upstream types move
+  fewer bytes than Ibex's Int64/Float64, so they favour the other engines.
+- **Groupby string keys are Categorical in Ibex too.** Upstream casts `id1`,
+  `id2` and `id3` to Categorical for Polars after loading, outside the timed
+  section. Ibex is given the same instruction in its own syntax,
+  `csv::read(path, schema = "id1:cat,id2:cat,id3:cat")`. Left to itself, the
+  reader keeps a column with more distinct values than 10% of its rows as a
+  String. At K=2e0 that is `id3` (5M levels), and until 2026-10-15 Ibex grouped
+  it as a String while Polars grouped a prebuilt dictionary. DuckDB's upstream
+  schema leaves `id3` as VARCHAR.
 - **Loading is not timed.** Data is loaded into memory once per process. Each
   question is timed for 1 warmup and 5 timed iterations, and the result is
   fully materialised: an Ibex `let`, a Polars `DataFrame`, a DuckDB TEMP table.
@@ -76,6 +83,32 @@ fit on the dev box. Run it on AWS instead.
 
 Results go to `results/h2o_<stamp>_<T>t.tsv`, one row per (data, question,
 engine), with every timed sample kept.
+
+## Results: 2026-10-15, dev box, 8 cores, groupby only
+
+Ibex `780ce990` with the groupby string keys declared Categorical (see
+Fairness), against Polars 2.0.0 (streaming) in the same sitting. DuckDB was not
+re-run. Raw data is in `results/h2o_20261015T092216_8t.tsv`,
+`results/h2o_20261015T092232_8t.tsv` and `results/h2o_20261015T092301_8t.tsv`.
+All 30 cells passed the cross-engine check.
+
+| data | ibex/polars geomean | ibex/polars 2026-10-14 |
+|---|---:|---:|
+| G1_1e7_1e2_0_0 | 0.71 | 0.94 |
+| G1_1e7_1e1_0_0 | 0.84 | 1.61 |
+| G1_1e7_2e0_0_0 | 0.77 | 1.68 |
+
+Engine changes since 2026-10-14: owned-range parallel accumulation and
+parallel group numbering at high cardinality; string group keys kept in arenas;
+grouped `cov`/`corr` (q9); packed multi-column keys that hold a String or a
+5M-level Categorical (q10). At K=2e0 the Categorical `id3` takes q3 from 250 to
+87 ms and q7 from 251 to 87 ms. Both are now level with Polars (0.88 and 0.96).
+
+- **q10 (~1e7 groups)** is the largest remaining loss: 1.4–2.0× Polars
+  (313–425 ms against 206–228 ms).
+- **q5** (`by id6`, Int64, up to 5M groups) is 0.93–1.28×. **q9** is 0.59–1.23×;
+  it runs in 12–30 ms, so a few ms of jitter swing the ratio.
+- Everything else is at or below 1.07× Polars at every K, and q8 is 0.24–0.37×.
 
 ## Results: 2026-10-14, dev box, 8 cores, 1e7 rows
 

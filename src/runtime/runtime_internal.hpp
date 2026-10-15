@@ -595,6 +595,11 @@ template <typename GatherWhole>
     // and from cache for the other columns. Column-major, each column re-read
     // its whole index from memory -- for a nine-column join output, most of
     // the bytes the gather moved (h2o join q1: output assembly 28 -> 21 ms).
+    // Ranges are capped so that slice (8 bytes a row) stays in L2 while the
+    // worker goes through the columns: interleaved, h2o join q1 ran ~31 ms
+    // with the cap against ~35 ms without, q2 ~35 against ~38.
+    constexpr std::size_t kCachedRangeRows = std::size_t{1} << 14;
+    span = std::min(span, kCachedRangeRows);
     std::vector<Task> tasks;
     tasks.reserve(jobs.size() * ((total / span) + 1));
     std::vector<std::size_t> ranged_jobs;

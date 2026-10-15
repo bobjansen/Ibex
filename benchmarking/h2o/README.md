@@ -84,88 +84,64 @@ fit on the dev box. Run it on AWS instead.
 Results go to `results/h2o_<stamp>_<T>t.tsv`, one row per (data, question,
 engine), with every timed sample kept.
 
-## Results: 2026-10-15, dev box, 8 cores, groupby only
+## Results: 2026-10-15, dev box, 8 cores, 1e7 rows
 
-Ibex `780ce990` with the groupby string keys declared Categorical (see
-Fairness), against Polars 2.0.0 (streaming) in the same sitting. DuckDB was not
-re-run. Raw data is in `results/h2o_20261015T092216_8t.tsv`,
-`results/h2o_20261015T092232_8t.tsv` and `results/h2o_20261015T092301_8t.tsv`.
-All 30 cells passed the cross-engine check.
+Ibex `37d5b91e`, Polars 2.0.0 (streaming), DuckDB 1.5.4, all three engines in
+the same sitting, with the string keys Categorical for Polars and Ibex (see
+Fairness). The ratio is Ibex/other on min ms, so below 1 means Ibex is faster.
+Raw data is in `results/h2o_20261015T092842_8t.tsv`. All 66 cells completed
+and passed the cross-engine check. The 2026-10-14 column is the previous run
+(`results/h2o_20261014T184344_8t.tsv`), with Ibex reading `id3` and the join's
+`id6` as String.
 
-| data | ibex/polars geomean | ibex/polars 2026-10-14 |
-|---|---:|---:|
-| G1_1e7_1e2_0_0 | 0.71 | 0.94 |
-| G1_1e7_1e1_0_0 | 0.84 | 1.61 |
-| G1_1e7_2e0_0_0 | 0.77 | 1.68 |
+| data | ibex/polars geomean | ibex/duckdb geomean | ibex/polars total | ibex/polars 2026-10-14 |
+|---|---:|---:|---:|---:|
+| J1_1e7_NA_0_0 (join) | 1.35 | 0.26 | 1.21 | 1.58 |
+| G1_1e7_1e2_0_0 | 0.79 | 0.69 | 1.06 | 0.94 |
+| G1_1e7_1e2_5_0 (NAs) | 0.64 | 0.68 | 1.72 | 1.24 |
+| G1_1e7_1e2_0_1 (sorted) | 0.60 | 0.58 | 0.90 | 0.77 |
+| G1_1e7_1e1_0_0 | 0.77 | 0.84 | 0.69 | 1.61 |
+| G1_1e7_2e0_0_0 | 0.79 | 0.98 | 0.45 | 1.68 |
 
-Engine changes since 2026-10-14: owned-range parallel accumulation and
-parallel group numbering at high cardinality; string group keys kept in arenas;
-grouped `cov`/`corr` (q9); packed multi-column keys that hold a String or a
-5M-level Categorical (q10). At K=2e0 the Categorical `id3` takes q3 from 250 to
-87 ms and q7 from 251 to 87 ms. Both are now level with Polars (0.88 and 0.96).
+Engine changes since 2026-10-14:
+- a null cell in the dense integer-key array, and nullable keys in parallel
+  group numbering (q4 and q6 with NAs);
+- owned-range parallel accumulation and parallel group numbering at high
+  cardinality (q3, q5, q7);
+- string group keys kept in arenas, as views;
+- grouped `cov(x, y)` and `corr(x, y)` (q9);
+- packed multi-column keys that hold a String or a 5M-level Categorical (q10).
 
-- **q10 (~1e7 groups)** is the largest remaining loss: 1.4–2.0× Polars
-  (313–425 ms against 206–228 ms).
-- **q5** (`by id6`, Int64, up to 5M groups) is 0.93–1.28×. **q9** is 0.59–1.23×;
-  it runs in 12–30 ms, so a few ms of jitter swing the ratio.
-- Everything else is at or below 1.07× Polars at every K, and q8 is 0.24–0.37×.
+- **Groupby:** Ibex leads both engines on the geomean of every groupby set:
+  0.60–0.79 against Polars, 0.58–0.98 against DuckDB.
+- **q10 (~1e7 groups)** is the largest remaining loss: 1.6–2.2× Polars
+  (379–442 ms against 203–237 ms). With NAs it is 1314 ms (4.9×): a key
+  column with nulls leaves the packed-key path for the generic one.
+- **q6** (median by `id4, id5`) is 1.67× Polars at K=1e2 and **q5** (`by id6`)
+  1.37× at K=2e0. DuckDB still leads q8 (per-group top-k) at K=1e1 and 2e0
+  (1.9× and 3.3×), though Ibex is 0.25–0.48× Polars there.
+- **Join:** the int-key inner joins q1 and q2 are 1.6–2.1× Polars; Ibex stays
+  well ahead of DuckDB (0.26).
 
-## Results: 2026-10-14, dev box, 8 cores, 1e7 rows
-
-Ibex `eeb73465`, Polars 2.0.0 (streaming), DuckDB 1.5.4, all three engines in
-the same sitting. The ratio is Ibex/other on min ms, so below 1 means Ibex is
-faster. Raw data is in `results/h2o_20261014T184344_8t.tsv`. All 66 cells
-completed (none ran out of memory) and passed the cross-engine check. The
-2026-10-13 column is the first run (`results/h2o_20261013T074652_8t.tsv`),
-before the fixes listed below.
-
-| data | ibex/polars geomean | ibex/duckdb geomean | ibex/polars 2026-10-13 |
-|---|---:|---:|---:|
-| J1_1e7_NA_0_0 (join) | 1.58 | 0.38 | 1.67 |
-| G1_1e7_1e2_0_0 | 0.94 | 0.86 | 1.48 |
-| G1_1e7_1e2_5_0 (NAs) | 1.24 | 1.10 | 1.44 |
-| G1_1e7_1e2_0_1 (sorted) | 0.77 | 0.74 | 1.42 |
-| G1_1e7_1e1_0_0 | 1.61 | 1.64 | 1.96 (9 q) |
-| G1_1e7_2e0_0_0 | 1.68 | 2.36 | 2.33 (8 q) |
-
-Fixes since the first run:
-- dense array for a narrow-span integer key (`6b13dcb5`, q4);
-- parallel group numbering for materialized integer keys (`49694f56`, q6);
-- partitioned flat heaps for grouped top-k (`6bbae675`, q8);
-- data-sized packed keys and range emission (`c797512e`, `adc2fea6`, q10);
-- in-memory tables cut to the columns a query reads (`df1a2495` and
-  follow-ups).
-
-- **Wins:** low- and medium-cardinality keys. At K=1e2, q1–q5, q7 and q8 are
-  0.37–1.25× Polars. q8 (per-group top-k) went from 7–8× Polars to 0.27–0.38×
-  at every K, though DuckDB still leads it at K=1e1 and 2e0 (1.8× and 3.7×).
-- **q10 (~1e7 groups)** is the largest remaining loss: 3.2–6.5× Polars. Most of
-  its time is spent assigning groups. At K=2e0 the `id3` key (5M levels) is
-  read as a String, not Categorical.
-- **High cardinality** (q3, q5, q7 at 1e6–5e6 groups) is 2.6–7× Polars.
-- **q9** is 2.4–4.8×, because there is no grouped `corr` aggregate.
-- **Nulls disable the q4 and q6 fast paths.** With 5% NAs, q4 is 70.7 ms
-  against 10.7 ms without, and q6 432 ms against 115 ms.
-- **Join** is unchanged: it loses to Polars on the int-key inner joins (q1, q2:
-  2.3–2.5×) and stays well ahead of DuckDB.
-
-## Results: 2026-10-14, dev box, 1 core, 1e7 rows
+## Results: 2026-10-15, dev box, 1 core, 1e7 rows
 
 Same build and engine versions, same sitting. Raw data is in
-`results/h2o_20261014T184755_1t.tsv`. All 66 cells completed and verified.
-The 2026-10-13 column is `results/h2o_20261013T080556_1t.tsv`.
+`results/h2o_20261015T093311_1t.tsv`. All 66 cells completed and passed the
+cross-engine check. The 2026-10-14 column is `results/h2o_20261014T184755_1t.tsv`.
 
-| data | ibex/polars geomean | ibex/duckdb geomean | ibex/polars total | ibex/polars 2026-10-13 |
+| data | ibex/polars geomean | ibex/duckdb geomean | ibex/polars total | ibex/polars 2026-10-14 |
 |---|---:|---:|---:|---:|
-| J1_1e7_NA_0_0 (join) | 1.33 | 0.26 | 1.17 | 1.33 |
-| G1_1e7_1e2_0_0 | 0.75 | 0.81 | 1.61 | 1.23 |
-| G1_1e7_1e1_0_0 | 0.78 | 0.89 | 1.57 | 1.19 |
-| G1_1e7_2e0_0_0 | 1.11 | 1.25 | 1.36 | 1.50 |
-| G1_1e7_1e2_5_0 (NAs) | 0.81 | 0.96 | 1.70 | 0.98 |
-| G1_1e7_1e2_0_1 (sorted) | 0.78 | 0.82 | 1.64 | 1.26 |
+| J1_1e7_NA_0_0 (join) | 1.17 | 0.22 | 1.08 | 1.33 |
+| G1_1e7_1e2_0_0 | 0.83 | 0.89 | 1.73 | 0.75 |
+| G1_1e7_1e2_5_0 (NAs) | 0.71 | 0.82 | 1.59 | 0.81 |
+| G1_1e7_1e2_0_1 (sorted) | 0.87 | 0.89 | 1.73 | 0.78 |
+| G1_1e7_1e1_0_0 | 0.79 | 0.92 | 1.63 | 0.78 |
+| G1_1e7_2e0_0_0 | 0.88 | 0.92 | 1.14 | 1.11 |
 
-- Per core, Ibex wins every groupby set except K=2e0. The totals stay above 1
-  because q10 (3–4× Polars) dominates them.
-- The 8-core geomeans are worse than the 1-core ones at K=1e1 and 2e0
-  (1.61 vs 0.78, 1.68 vs 1.11). The high-cardinality questions (q3, q5, q7,
-  q10) scale poorly: q5 at K=1e1 runs 226 ms at 1 core and 213 ms at 8.
+- Ibex leads both engines on every groupby geomean at 1 core too. The totals
+  stay above 1 because q10 (3.1–4.7× Polars) dominates them.
+- **q9 regressed at 1 core.** Grouped `corr` made it 2–3× faster at 8 cores
+  (14–28 ms) but slower at 1 core than the six-sum formula it replaced: 390
+  against 198 ms at K=1e2, 220 against 152 ms at K=2e0. That is 2.6–3.8×
+  Polars, and it is most of why the K=1e2 and sorted geomeans read higher
+  than on 2026-10-14. Not yet investigated.

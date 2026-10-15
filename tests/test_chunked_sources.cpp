@@ -255,6 +255,101 @@ TEST_CASE("multi-key categorical aggregate: the fused parallel path matches a re
     }
 }
 
+TEST_CASE("inner join: a small dense Int build side probes by direct address",
+          "[runtime][chunked][join]") {
+    // A build side whose keys cover a small range (h2o's id1/id2 joins) is
+    // probed through a direct-address head table instead of its hash map.
+    // Probe keys below, above and far outside that range must miss -- the
+    // offset from the range's bottom wraps for a key below it -- and nulls
+    // on either side must match nothing, whatever value they hold. Checked
+    // against the pairs computed here, serially and fanned out, for a unique
+    // build side, one with repeated keys, and one too sparse for the table.
+    constexpr std::size_t kLeftRows = 300'000;
+    constexpr auto kMin = std::numeric_limits<std::int64_t>::min();
+    constexpr auto kMax = std::numeric_limits<std::int64_t>::max();
+    const auto run_case = [&](const std::vector<std::int64_t>& right_keys,
+                              const std::vector<bool>& right_valid, bool expect_dense) {
+        Column<std::int64_t> rk;
+        Column<std::int64_t> rv;
+        runtime::ValidityBitmap rk_valid;
+        for (std::size_t r = 0; r < right_keys.size(); ++r) {
+            rk.push_back(right_keys[r]);
+            rv.push_back(static_cast<std::int64_t>(r) * 100);
+            rk_valid.push_back(right_valid[r]);
+        }
+        Column<std::int64_t> lk;
+        Column<std::int64_t> lv;
+        runtime::ValidityBitmap lk_valid;
+        std::vector<std::pair<std::int64_t, std::int64_t>> want;
+        for (std::size_t i = 0; i < kLeftRows; ++i) {
+            std::int64_t key = static_cast<std::int64_t>((i * 7919) % 23) - 8;
+            if (i % 101 == 7) {
+                key = i % 2 == 0 ? kMin : kMax;
+            }
+            const bool valid = i % 37 != 3;
+            lk.push_back(valid ? key : right_keys.front());
+            lv.push_back(static_cast<std::int64_t>(i));
+            lk_valid.push_back(valid);
+            if (!valid) {
+                continue;
+            }
+            for (std::size_t r = 0; r < right_keys.size(); ++r) {
+                if (right_valid[r] && right_keys[r] == key) {
+                    want.emplace_back(static_cast<std::int64_t>(i),
+                                      static_cast<std::int64_t>(r) * 100);
+                }
+            }
+        }
+        std::ranges::sort(want);
+        runtime::Table left;
+        left.add_column("k", std::move(lk));
+        left.columns.back().validity = std::move(lk_valid);
+        left.add_column("lv", std::move(lv));
+        runtime::Table right;
+        right.add_column("k", std::move(rk));
+        right.columns.back().validity = std::move(rk_valid);
+        right.add_column("rv", std::move(rv));
+        runtime::TableRegistry registry;
+        registry.emplace("lhs", std::move(left));
+        registry.emplace("rhs", std::move(right));
+        auto program = parser::parse("lhs join rhs on k;");
+        REQUIRE(program.has_value());
+        auto ir = parser::lower(program.value());
+        REQUIRE(ir.has_value());
+        for (const std::size_t threads : {std::size_t{1}, std::size_t{8}}) {
+            INFO("threads " << threads);
+            runtime::ExecutionContext exec;
+            exec.parallel_threads = threads;
+            exec.parallel_min_rows = 0;
+            const auto before = runtime::dense_int_join_probes().load();
+            const auto out =
+                runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, exec);
+            INFO((out.has_value() ? std::string{} : out.error()));
+            REQUIRE(out.has_value());
+            CHECK((runtime::dense_int_join_probes().load() > before) == expect_dense);
+            const auto& olv = std::get<Column<std::int64_t>>(*out->find("lv"));
+            const auto& orv = std::get<Column<std::int64_t>>(*out->find("rv"));
+            std::vector<std::pair<std::int64_t, std::int64_t>> got;
+            got.reserve(out->rows());
+            for (std::size_t row = 0; row < out->rows(); ++row) {
+                got.emplace_back(olv[row], orv[row]);
+            }
+            std::ranges::sort(got);
+            REQUIRE(got == want);
+        }
+    };
+    SECTION("unique keys, one null with an in-range payload") {
+        run_case({-3, -2, -1, 0, 1, 2, 3, 4, 5, 0},
+                 {true, true, true, true, true, true, true, true, true, false}, true);
+    }
+    SECTION("repeated keys chain") {
+        run_case({2, -3, 2, 7, -3, 2, 0}, {true, true, true, true, true, true, true}, true);
+    }
+    SECTION("keys too sparse for the table") {
+        run_case({0, 1, std::int64_t{1} << 40}, {true, true, true}, false);
+    }
+}
+
 TEST_CASE("inner join: the left is drained only until the orientation is decided",
           "[runtime][chunked][join]") {
     // The join needs one fact about its left side -- whether it has more rows

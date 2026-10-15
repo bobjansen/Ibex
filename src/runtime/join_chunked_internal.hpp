@@ -9,6 +9,7 @@
 #include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/operator.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -20,6 +21,11 @@
 #include "physical_plan.hpp"
 
 namespace ibex::runtime {
+
+/// How many join probes, process-wide, resolved an Int key through the build
+/// side's direct-address head table instead of its hash map. For tests: the
+/// two give the same answer.
+[[nodiscard]] auto dense_int_join_probes() -> std::atomic<std::uint64_t>&;
 
 /// Two fixed-width int keys packed into one struct, injective with no
 /// knowledge of their domains -- same trick as the aggregate's own

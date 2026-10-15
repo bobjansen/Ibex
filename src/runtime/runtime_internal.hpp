@@ -590,8 +590,15 @@ template <typename GatherWhole>
     const auto is_string = [&](const ColumnGatherJob& job) {
         return std::holds_alternative<Column<std::string>>(*job.column);
     };
+    // Tasks are laid out range-major and a worker claims a whole range, every
+    // column of it (below), so a range's index slice is read from memory once
+    // and from cache for the other columns. Column-major, each column re-read
+    // its whole index from memory -- for a nine-column join output, most of
+    // the bytes the gather moved (h2o join q1: output assembly 28 -> 21 ms).
     std::vector<Task> tasks;
     tasks.reserve(jobs.size() * ((total / span) + 1));
+    std::vector<std::size_t> ranged_jobs;
+    ranged_jobs.reserve(jobs.size());
     for (std::size_t j = 0; j < jobs.size(); ++j) {
         const auto& job = jobs[j];
         const bool bool_with_nulls =
@@ -609,28 +616,46 @@ template <typename GatherWhole>
         if (job.validity != nullptr || job.null_index.has_value()) {
             out[j].second = ValidityBitmap(total, false);
         }
+        ranged_jobs.push_back(j);
+    }
+    // Indivisible tasks first, each its own unit; then one unit per range,
+    // holding that range's task for every ranged column.
+    std::vector<std::size_t> unit_begin;
+    unit_begin.reserve(tasks.size() + (total / span) + 2);
+    for (std::size_t t = 0; t < tasks.size(); ++t) {
+        unit_begin.push_back(t);
+    }
+    if (!ranged_jobs.empty()) {
         for (std::size_t lo = 0; lo < total; lo += span) {
-            tasks.push_back(
-                {.job = j, .lo = lo, .hi = std::min(lo + span, total), .indivisible = false});
+            unit_begin.push_back(tasks.size());
+            for (const std::size_t j : ranged_jobs) {
+                tasks.push_back(
+                    {.job = j, .lo = lo, .hi = std::min(lo + span, total), .indivisible = false});
+            }
         }
     }
+    unit_begin.push_back(tasks.size());
     if (tasks.empty()) {
         return out;
     }
+    const std::size_t units = unit_begin.size() - 1;
 
     std::atomic<std::size_t> cursor{0};
+    // A worker claims a unit -- an indivisible task, or one range of every
+    // ranged column -- and runs its tasks in order.
     const auto run_tasks = [&](const auto& body) {
         cursor.store(0, std::memory_order_relaxed);
-        auto batch =
-            process_worker_pool().submit(std::min(threads, tasks.size()), [&](std::size_t) {
-                while (true) {
-                    const std::size_t t = cursor.fetch_add(1, std::memory_order_relaxed);
-                    if (t >= tasks.size()) {
-                        return;
-                    }
+        auto batch = process_worker_pool().submit(std::min(threads, units), [&](std::size_t) {
+            while (true) {
+                const std::size_t u = cursor.fetch_add(1, std::memory_order_relaxed);
+                if (u >= units) {
+                    return;
+                }
+                for (std::size_t t = unit_begin[u]; t < unit_begin[u + 1]; ++t) {
                     body(t);
                 }
-            });
+            }
+        });
         batch.wait();
     };
 

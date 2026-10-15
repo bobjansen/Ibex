@@ -61,6 +61,7 @@
 #include "packed_key_encoder_internal.hpp"
 #include "runtime_internal.hpp"
 #include "scan_worker_sink_internal.hpp"
+#include "string_arena_internal.hpp"
 
 namespace ibex::runtime {
 
@@ -459,48 +460,6 @@ class DenseAggregateScanSink final : public ScanWorkerSink {
     robin_hood::unordered_map<std::size_t, std::unique_ptr<WorkerDensePartial>> pending_;
     std::vector<std::size_t> deferred_columns_;
     EmittedWorkerPartial current_;
-};
-
-/// Append-only bytes for string group keys, handed out as views that stay
-/// valid for the arena's life -- moves included, since its blocks are on the
-/// heap and never reallocate. One writer per arena.
-///
-/// The single-string key used to be a `std::string` three times over: in a
-/// partition's index, in its key list, and in `str_order_`, and the index
-/// moved them as it grew. At h2o's 5M groups that was most of the probe.
-/// Now a group's bytes are copied once, here, and everything else holds a
-/// 16-byte view.
-class StringArena {
-   public:
-    StringArena() = default;
-    StringArena(const StringArena&) = delete;
-    auto operator=(const StringArena&) -> StringArena& = delete;
-    StringArena(StringArena&&) noexcept = default;
-    auto operator=(StringArena&&) noexcept -> StringArena& = default;
-    ~StringArena() = default;
-
-    [[nodiscard]] auto intern(std::string_view value) -> std::string_view {
-        if (value.empty()) {
-            return {};
-        }
-        if (value.size() > left_) {
-            const std::size_t size = std::max(kBlockBytes, value.size());
-            blocks_.push_back(std::make_unique_for_overwrite<char[]>(size));
-            next_ = blocks_.back().get();
-            left_ = size;
-        }
-        char* at = next_;
-        std::memcpy(at, value.data(), value.size());
-        next_ += value.size();
-        left_ -= value.size();
-        return {at, value.size()};
-    }
-
-   private:
-    static constexpr std::size_t kBlockBytes = std::size_t{1} << 20;
-    std::vector<std::unique_ptr<char[]>> blocks_;
-    char* next_ = nullptr;
-    std::size_t left_ = 0;
 };
 
 /// The generic group-by's keys, stored column by column.
@@ -1985,6 +1944,7 @@ class HashAggregateState final {
             return process_rows_int_pair(group_entries, agg_entries, rows);
         }
         if (packed_fast_path_ && rows != 0) {
+            intern_string_keys(group_entries);
             auto plan = encoder_.build_packed_key(group_entries);
             if (!plan.has_value() && encoder_.layout_miss()) {
                 // Values outside the data-sized layout the first chunk fixed
@@ -2009,6 +1969,27 @@ class HashAggregateState final {
             return process_rows_packed(group_entries, agg_entries, plan->cols, rows, packed256_);
         }
         return process_rows_generic(group_entries, agg_entries, rows);
+    }
+
+    /// Give the packed path ids for this chunk's String key columns
+    /// (`PackedKeyEncoder::StrIntern`), across the Discovery node's workers
+    /// when it may fan out.
+    void intern_string_keys(const std::vector<const ColumnEntry*>& group_entries) {
+        const bool fan = exec_ != nullptr && !on_worker_pool_thread() &&
+                         par_.discovery.decline == physical::FanOutDecline::None &&
+                         par_.discovery.worker_cap >= 2;
+        const auto run = [&](std::size_t tasks, const auto& body) {
+            if (!fan || tasks < 2) {
+                for (std::size_t t = 0; t < tasks; ++t) {
+                    body(t);
+                }
+                return;
+            }
+            auto batch = process_worker_pool().submit(tasks, [&](std::size_t t) { body(t); });
+            batch.wait();
+        };
+        encoder_.intern_strings(group_entries, fan ? discovery_partition_count() : 1,
+                                fan ? par_.discovery.worker_cap : 1, run);
     }
 
     auto process_rows_str(const std::vector<const ColumnEntry*>& group_entries,

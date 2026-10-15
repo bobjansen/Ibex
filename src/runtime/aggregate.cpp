@@ -1104,7 +1104,14 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         // Fixed contiguous row ranges, one per worker, numbered in row order.
         const std::size_t range_workers =
             exec != nullptr ? group_barrier_worker_count(*exec, rows) : 0;
+        // The cell grouping below also runs on one range: it is the cheap way
+        // to group integer and code keys even without workers to share it.
+        const std::size_t cell_ranges = std::max<std::size_t>(range_workers, 1);
         const auto for_row_range = [&](std::size_t ranges, const auto& body) {
+            if (ranges <= 1) {
+                body(0, 0, rows);
+                return;
+            }
             const std::size_t grain = (rows + ranges - 1) / ranges;
             auto batch = process_worker_pool().submit(ranges, [&](std::size_t r) {
                 const std::size_t begin = std::min(rows, r * grain);
@@ -1139,10 +1146,12 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             cat_gid_memo.assign(key_cols.front().cat->dictionary().size(), kNoCatGid);
         }
 
-        // With several workers and keys that are all integers or codes with a
-        // small Cartesian span (`median(x) by <categorical>`, h2o q6's `by {
-        // id4, id5 }` over 100 x 100 ids), number the groups and fill row_gid
-        // in parallel instead of probing the boxed index once per row. A
+        // When the keys are all integers or codes with a small Cartesian span
+        // (`median(x) by <categorical>`, h2o q6's `by { id4, id5 }` over
+        // 100 x 100 ids), number the groups and fill row_gid -- across the
+        // workers when there are several -- instead of probing the boxed index
+        // once per row. On one core that probe hashes a Categorical as text;
+        // skipping it took h2o q9 at 1 core from 390 to 54 ms. A
         // row's cell is its keys' offsets from their minimums; each range
         // records the first row of every cell, the earliest wins, and the
         // groups are created in that row order through the same index calls
@@ -1172,8 +1181,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             }
         };
         const bool cell_keys =
-            range_workers >= 2 && rows > 0 && !key_cols.empty() &&
-            std::ranges::all_of(key_cols, [](const KeyCol& col) {
+            rows > 0 && !key_cols.empty() && std::ranges::all_of(key_cols, [](const KeyCol& col) {
                 return col.kind == KeyCol::Kind::Int64 || col.kind == KeyCol::Kind::Cat ||
                        col.kind == KeyCol::Kind::Date || col.kind == KeyCol::Kind::Ts;
             });
@@ -1181,12 +1189,12 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             // Bounds per key: a Categorical's are its dictionary's; the rest
             // are measured, range by range.
             std::vector<std::pair<std::int64_t, std::int64_t>> bounds(
-                range_workers * key_cols.size(), {std::numeric_limits<std::int64_t>::max(),
-                                                  std::numeric_limits<std::int64_t>::min()});
+                cell_ranges * key_cols.size(), {std::numeric_limits<std::int64_t>::max(),
+                                                std::numeric_limits<std::int64_t>::min()});
             const bool measured = std::ranges::any_of(
                 key_cols, [](const KeyCol& col) { return col.kind != KeyCol::Kind::Cat; });
             if (measured) {
-                for_row_range(range_workers, [&](std::size_t r, std::size_t b, std::size_t e) {
+                for_row_range(cell_ranges, [&](std::size_t r, std::size_t b, std::size_t e) {
                     for (std::size_t c = 0; c < key_cols.size(); ++c) {
                         if (key_cols[c].kind == KeyCol::Kind::Cat) {
                             continue;
@@ -1213,7 +1221,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 } else {
                     lo = std::numeric_limits<std::int64_t>::max();
                     hi = std::numeric_limits<std::int64_t>::min();
-                    for (std::size_t r = 0; r < range_workers; ++r) {
+                    for (std::size_t r = 0; r < cell_ranges; ++r) {
                         lo = std::min(lo, bounds[(r * key_cols.size()) + c].first);
                         hi = std::max(hi, bounds[(r * key_cols.size()) + c].second);
                     }
@@ -1234,20 +1242,20 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 cell_stride[c] = cells;
                 cells = (span == 0 || span > kMaxRangeCells / cells) ? 0 : cells * span;
             }
-            if (cells != 0 && range_workers * cells <= kMaxRangeCells) {
+            if (cells != 0 && cell_ranges * cells <= kMaxRangeCells) {
                 n_cells = static_cast<std::size_t>(cells);
             }
         }
-        const bool parallel_cell_groups = n_cells != 0;
-        if (parallel_cell_groups) {
+        const bool cell_groups = n_cells != 0;
+        if (cell_groups) {
             if (row_gid.empty()) {
                 row_gid.resize(rows);
             }
             constexpr std::size_t kUnseen = std::numeric_limits<std::size_t>::max();
             // Number the groups from `cell_at(row)`, then fill row_gid.
             const auto group_cells = [&](const auto& cell_at) {
-                std::vector<std::size_t> first(range_workers * n_cells, kUnseen);
-                for_row_range(range_workers, [&](std::size_t r, std::size_t b, std::size_t e) {
+                std::vector<std::size_t> first(cell_ranges * n_cells, kUnseen);
+                for_row_range(cell_ranges, [&](std::size_t r, std::size_t b, std::size_t e) {
                     std::size_t* local = first.data() + (r * n_cells);
                     for (std::size_t row = b; row < e; ++row) {
                         const std::size_t cell = cell_at(row);
@@ -1259,7 +1267,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 std::vector<std::pair<std::size_t, std::size_t>> seen;  // (first row, cell)
                 for (std::size_t cell = 0; cell < n_cells; ++cell) {
                     std::size_t row = kUnseen;
-                    for (std::size_t r = 0; r < range_workers; ++r) {
+                    for (std::size_t r = 0; r < cell_ranges; ++r) {
                         row = std::min(row, first[(r * n_cells) + cell]);
                     }
                     if (row != kUnseen) {
@@ -1272,7 +1280,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     cell_gid[cell] = index.find_or_insert(group_order, key_cols, row,
                                                           [&] { return new_group(row); });
                 }
-                for_row_range(range_workers, [&](std::size_t, std::size_t b, std::size_t e) {
+                for_row_range(cell_ranges, [&](std::size_t, std::size_t b, std::size_t e) {
                     for (std::size_t row = b; row < e; ++row) {
                         row_gid[row] = cell_gid[cell_at(row)];
                     }
@@ -1334,7 +1342,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 ::ibex::detail::NoInitVector<std::uint32_t> row_cell;
                 row_cell.resize(rows);
                 std::uint32_t* out = row_cell.data();
-                for_row_range(range_workers, [&](std::size_t, std::size_t b, std::size_t e) {
+                for_row_range(cell_ranges, [&](std::size_t, std::size_t b, std::size_t e) {
                     for (std::size_t c = 0; c < key_cols.size(); ++c) {
                         with_part(c, [&](const auto& part_at) {
                             for (std::size_t row = b; row < e; ++row) {
@@ -1352,7 +1360,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             }
         }
 
-        for (std::size_t row = 0; !parallel_cell_groups && row < rows; ++row) {
+        for (std::size_t row = 0; !cell_groups && row < rows; ++row) {
             std::uint32_t gid = 0;
             if (!cat_gid_memo.empty() && !key_cols.front().is_null(row)) {
                 const auto code = static_cast<std::size_t>(key_cols.front().cat->code_at(row));

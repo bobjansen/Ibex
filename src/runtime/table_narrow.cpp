@@ -3,8 +3,13 @@
 
 #include "table_narrow.hpp"
 
+#include <ibex/runtime/interpreter.hpp>
+
 #include <atomic>
 #include <cstdlib>
+#include <optional>
+#include <set>
+#include <string>
 
 namespace ibex::runtime {
 

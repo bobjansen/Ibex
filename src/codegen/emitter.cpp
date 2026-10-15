@@ -7,6 +7,7 @@
 #include <ibex/core/time.hpp>
 #include <ibex/ir/model_accessors.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/ir/required_columns.hpp>
 
 #include <cmath>
 #include <cstddef>

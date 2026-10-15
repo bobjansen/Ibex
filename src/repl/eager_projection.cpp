@@ -3,6 +3,14 @@
 
 #include "eager_projection.hpp"
 
+#include <ibex/ir/required_columns.hpp>
+#include <ibex/runtime/interpreter.hpp>
+
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include "runtime/table_narrow.hpp"
 
 namespace ibex::repl::detail {

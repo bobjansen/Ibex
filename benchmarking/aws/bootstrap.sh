@@ -984,6 +984,81 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
     exit 0
 fi
 
+# ── h2o db-benchmark mode (run-h2o.sh) ────────────────────────────────────────
+# The h2o groupby + join questions on the upstream data (benchmarking/h2o):
+# Ibex, Polars 2 streaming and DuckDB, every engine pinned to the same cores by
+# run.py. One full run per core count in IBEX_H2O_CORES, on this one box, so a
+# 1-core and an 8-core row share the hardware. Each finished count is pushed as
+# a partial artifact; the final one ships from the EXIT trap with the bench log,
+# so a failure still leaves its evidence.
+if [[ "${IBEX_H2O_MODE:-0}" == "1" ]]; then
+    H2O_DIR=/ibex/benchmarking/h2o
+    H2O_OUT="$H2O_DIR/results"
+    ARTIFACT=/ibex/benchmarking/results/h2o.tar.gz
+
+    finish_h2o() {
+        local code=$?
+        set +e
+        mkdir -p /ibex/benchmarking/results "$H2O_OUT"
+        echo "exit_code=$code" > "$H2O_OUT/exit_code.txt"
+        cp /var/log/ibex-bench.log "$H2O_OUT/ibex-bench.log" 2>/dev/null
+        {
+            echo "ibex_commit=$(git -C /ibex rev-parse HEAD)"
+            uv run --project /ibex python3 -c 'import duckdb, polars; print(f"duckdb={duckdb.__version__}"); print(f"polars={polars.__version__}")'
+            lscpu
+        } > "$H2O_OUT/versions.txt" 2>&1 || true
+        tar -C "$H2O_DIR" -czf "$ARTIFACT" results
+        aws s3 cp "$ARTIFACT" "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY}" --region "${IBEX_REGION}" || true
+        shutdown -h now
+        return "$code"
+    }
+    trap finish_h2o EXIT
+
+    # Its own key: the launcher's wait loop exits as soon as the final key
+    # appears, so a partial there would pass for a finished run.
+    push_partial_h2o() {
+        mkdir -p /ibex/benchmarking/results
+        tar -C "$H2O_DIR" -czf "$ARTIFACT" results 2>/dev/null || return 0
+        aws s3 cp "$ARTIFACT" "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY%.tar.gz}.partial.tar.gz" \
+            --region "${IBEX_REGION}" >/dev/null 2>&1 || true
+    }
+
+    build_ibex
+    uv sync --project /ibex
+    mkdir -p "$H2O_OUT"
+    # The generators need R + data.table; a baked AMI may predate either, and
+    # this also exports the benchmark R library for Rscript below.
+    ensure_current_r
+
+    # Upstream's own R generators (vendored, seeded): every engine reads the
+    # same CSV. Each data name is parsed back into the generator's arguments.
+    IFS=',' read -r -a H2O_DATA <<< "${IBEX_H2O_DATA}"
+    for data in "${H2O_DATA[@]}"; do
+        IFS='_' read -r kind n k na sorted <<< "$data"
+        if [[ "$kind" == "G1" ]]; then
+            bash "$H2O_DIR/gen_data.sh" groupby "$n" "$k" "$na" "$sorted"
+        else
+            bash "$H2O_DIR/gen_data.sh" join "$n" "$na" "$sorted"
+        fi
+    done
+
+    # A MISMATCH makes run.py exit non-zero after writing its TSV; record that
+    # and carry on, so one bad cell does not cost the other core counts.
+    IFS=',' read -r -a H2O_CORE_LIST <<< "${IBEX_H2O_CORES:-1}"
+    for cores in "${H2O_CORE_LIST[@]}"; do
+        echo "=== h2o: ${cores} core(s) ==="
+        write_host_memory_facts "$H2O_OUT/host/memory_${cores}c_before.txt"
+        uv run --project /ibex "$H2O_DIR/run.py" "${H2O_DATA[@]}" --threads "$cores" \
+            --warmup "${IBEX_WARMUP:-1}" --iters "${IBEX_ITERS:-5}" \
+            > "$H2O_OUT/summary_${cores}c.txt" \
+            || echo "run.py ${cores}c exited $?" >> "$H2O_OUT/failures.txt"
+        cat "$H2O_OUT/summary_${cores}c.txt"
+        write_host_memory_facts "$H2O_OUT/host/memory_${cores}c_after.txt"
+        push_partial_h2o
+    done
+    exit 0
+fi
+
 # ── Window-OHLC mode (run-window-ohlc.sh) ──────────────────────────────────────
 # Rolling open/close bars per time window per symbol, across Ibex, Polars and
 # DuckDB on identical Ibex-generated Parquet.

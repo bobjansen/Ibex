@@ -856,12 +856,12 @@ class GroupKeyStore {
                 continue;
             }
             const Col& src = store->cols_[c];
-            if (!src.codes_usable || src.code_dict == nullptr) {
+            // Codes stay only while every store's are usable against ONE dictionary.
+            if (!src.codes_usable || src.code_dict == nullptr ||
+                (col.code_dict != nullptr && col.code_dict != src.code_dict)) {
                 col.drop_codes();
             } else if (col.code_dict == nullptr) {
                 col.code_dict = src.code_dict;
-            } else if (col.code_dict != src.code_dict) {
-                col.drop_codes();
             }
         }
         const std::size_t base = col.chars.size();
@@ -2107,8 +2107,8 @@ class HashAggregateState final {
         // A key whose values span few cells next to the rows (`by id4` over
         // 100 ids) is indexed like a Categorical code, `key - min`: no hash,
         // and the morsel partials fan out even when the input is one chunk.
-        const ValidityBitmap* key_valid =
-            group_entries[0]->validity.has_value() ? &*group_entries[0]->validity : nullptr;
+        const std::optional<ValidityBitmap>& key_validity = group_entries[0]->validity;
+        const ValidityBitmap* key_valid = key_validity.has_value() ? &*key_validity : nullptr;
         if (try_process_rows_int_dense(key_at, key_valid, agg_entries, rows)) {
             return std::nullopt;
         }
@@ -4084,7 +4084,7 @@ class HashAggregateState final {
                 if (dense[cell] != kNoGid) {
                     continue;
                 }
-                std::atomic_ref<std::uint32_t> slot(first[cell]);
+                const std::atomic_ref<std::uint32_t> slot(first[cell]);
                 auto held = slot.load(std::memory_order_relaxed);
                 const auto here = static_cast<std::uint32_t>(row);
                 while (here < held &&
@@ -4289,7 +4289,7 @@ class HashAggregateState final {
             // the stride would always be sampled at their first row and never
             // look like repeats.
             const std::size_t row =
-                (i * stride) + static_cast<std::size_t>((i * 2'654'435'761ULL) >> 7U) % stride;
+                (i * stride) + (static_cast<std::size_t>((i * 2'654'435'761ULL) >> 7U) % stride);
             const auto hash = static_cast<std::uint64_t>(hash_at(row));
             seen.insert(hash);
             if (row != 0 && static_cast<std::uint64_t>(hash_at(row - 1)) == hash) {
@@ -4475,6 +4475,7 @@ class HashAggregateState final {
         // from six columns at a sparse row was six cache misses per probe
         // (h2o q10). The generic path's probe is a fat handle; it does not.
         constexpr bool kScatterKeys = std::is_trivially_copyable_v<Probe> && sizeof(Probe) <= 32;
+        // NOLINTNEXTLINE(misc-const-correctness) -- written when kScatterKeys, below
         ::ibex::detail::NoInitVector<Probe> scattered_keys;
         scatter_rows_.resize(rows);
         if constexpr (kScatterKeys) {

@@ -5,8 +5,15 @@
 """Generate a self-contained benchmark website from result CSV(s).
 
 Usage:
-  python3 gen_website.py results/<latest>.csv
+  python3 gen_website.py results/<latest>.csv \\
+      [--pdsh results/tpch_aws_<ts>.tar.gz] [--h2o results/h2o_aws_<ts>.tar.gz]
   # -> writes docs/benchmarks.html (page on the Ibex docs site)
+
+The page has three sections: Ibex's own in-memory suite (the CSV), PDS-H
+(`--pdsh`: a run-tpch.sh artifact, or its results/history.tsv) and the h2o
+db-benchmark (`--h2o`: a run-h2o.sh artifact, or h2o/run.py TSVs; later TSVs
+override earlier ones per data set and core count). A section with no input
+is left off the page.
 
 Each AWS run now produces a complete, self-contained CSV (see
 benchmarking/aws/bootstrap.sh), so the page is generated from that one run — no
@@ -26,6 +33,7 @@ import html
 import json
 import re
 import sys
+import tarfile
 from collections import defaultdict
 from pathlib import Path
 
@@ -192,6 +200,141 @@ def build_payload(cells, mem, paths, commit=None):
     }
 
 
+# ── PDS-H and h2o: independent suites, read from their own artifacts ────────
+
+# PDS-H frameworks shown, in order: Ibex and the upstream Polars-streaming and
+# DuckDB implementations. The -st rows are one-thread runs inside each core
+# count; the core switch already covers that axis, so they are not shown.
+PDSH_ENGINES = [("ibex", "Ibex"), ("pdsh-polars-stream", "Polars"), ("pdsh-duckdb", "DuckDB")]
+
+
+def _tar_member_texts(path: Path, pattern: str) -> list[tuple[str, str]]:
+    """(name, text) of every member of a .tar.gz whose name matches `pattern`."""
+    out = []
+    with tarfile.open(path, "r:gz") as tar:
+        for m in tar.getmembers():
+            if m.isfile() and re.search(pattern, m.name):
+                f = tar.extractfile(m)
+                if f is not None:
+                    out.append((m.name, f.read().decode("utf-8")))
+    return sorted(out)
+
+
+def load_pdsh(path: Path) -> dict:
+    """PDS-H payload from a run-tpch.sh artifact or its results/history.tsv."""
+    if path.name.endswith(".tar.gz"):
+        texts = _tar_member_texts(path, r"results/history\.tsv$")
+        versions = dict(_tar_member_texts(path, r"results/versions\.txt$"))
+        manifests = _tar_member_texts(path, r"results/runs/[^/]+/manifest\.json$")
+        if not texts:
+            raise ValueError(f"{path}: no results/history.tsv")
+        history = texts[0][1]
+    else:
+        history, versions, manifests = path.read_text(encoding="utf-8"), {}, []
+    rows = list(csv.DictReader(history.splitlines(), delimiter="\t"))
+    wanted = dict(PDSH_ENGINES)
+    tables: dict[str, dict] = {}
+    commit, sf = "unknown", None
+    for r in rows:
+        if r.get("framework") not in wanted:
+            continue
+        try:
+            ms = float(r["avg_ms"])
+        except (KeyError, ValueError):
+            continue
+        cores = r["cores"]
+        table = tables.setdefault(cores, {"rows": [], "cells": {}})
+        q = r["query"]
+        if q not in table["cells"]:
+            table["rows"].append({"id": q, "label": q})
+            table["cells"][q] = {}
+        table["cells"][q][r["framework"]] = ms
+        commit, sf = r.get("commit", commit), r.get("scale_factor", sf)
+    for t in tables.values():
+        t["rows"].sort(key=lambda row: row["id"])
+    cpu = ""
+    for _, text in manifests:
+        try:
+            cpu = json.loads(text).get("cpu", "") or cpu
+        except ValueError:
+            pass
+    version_text = next(iter(versions.values()), "")
+    found = dict(line.split("=", 1) for line in version_text.splitlines() if "=" in line)
+    cores = sorted(tables, key=int)
+    return {
+        "engines": [{"id": k, "label": v} for k, v in PDSH_ENGINES],
+        "selectors": [{"key": "cores", "label": "Cores",
+                       "options": [{"value": c, "label": c} for c in cores],
+                       "default": cores[-1] if cores else None}],
+        "tables": tables,
+        "meta": {"commit": commit[:8], "scale_factor": sf, "cpu": cpu,
+                 "polars": found.get("polars", ""), "duckdb": found.get("duckdb", ""),
+                 "source": path.name},
+    }
+
+
+H2O_ENGINES = [("ibex", "Ibex"), ("polars", "Polars"), ("duckdb", "DuckDB")]
+H2O_DATA_LABEL = {
+    "J1_1e7_NA_0_0": "join",
+    "G1_1e7_1e2_0_0": "groupby K=1e2",
+    "G1_1e7_1e2_5_0": "groupby K=1e2, 5% NA",
+    "G1_1e7_1e2_0_1": "groupby K=1e2, sorted",
+    "G1_1e7_1e1_0_0": "groupby K=1e1",
+    "G1_1e7_2e0_0_0": "groupby K=2e0",
+}
+
+
+def load_h2o(paths: list[Path]) -> dict:
+    """h2o payload from run-h2o.sh artifacts or h2o/run.py TSVs, in order."""
+    texts: list[tuple[str, str]] = []
+    cpu = ""
+    for p in paths:
+        if p.name.endswith(".tar.gz"):
+            texts += _tar_member_texts(p, r"results/h2o_[^/]*\.tsv$")
+            for _, v in _tar_member_texts(p, r"results/versions\.txt$"):
+                m = re.search(r"Model name:\s*(.+)", v)
+                cpu = m.group(1).strip() if m else cpu
+        else:
+            texts.append((p.name, p.read_text(encoding="utf-8")))
+    # cells[(data, threads)][question][engine] = min ms; a later file wins per
+    # (data, threads), so a re-run of one set replaces it whole.
+    tables: dict[str, dict] = {}
+    versions: dict[str, set] = defaultdict(set)
+    for _, text in texts:
+        fresh: dict[str, dict] = {}
+        for r in csv.DictReader(text.splitlines(), delimiter="\t"):
+            if r.get("status") != "ok":
+                continue
+            key = f"{r['data']}|{r['threads']}"
+            table = fresh.setdefault(key, {"rows": [], "cells": {}})
+            q = r["question"]
+            if q not in table["cells"]:
+                table["rows"].append({"id": q, "label": f"{q} {r['desc']}"})
+                table["cells"][q] = {}
+            table["cells"][q][r["engine"]] = float(r["min_ms"])
+            versions[r["engine"]].add(r["version"])
+        tables.update(fresh)
+    for t in tables.values():
+        t["rows"].sort(key=lambda row: int(row["id"][1:]))
+    data_sets = sorted({k.split("|")[0] for k in tables},
+                       key=lambda d: list(H2O_DATA_LABEL).index(d) if d in H2O_DATA_LABEL else 99)
+    threads = sorted({k.split("|")[1] for k in tables}, key=int)
+    return {
+        "engines": [{"id": k, "label": v} for k, v in H2O_ENGINES],
+        "selectors": [
+            {"key": "data", "label": "Data",
+             "options": [{"value": d, "label": H2O_DATA_LABEL.get(d, d)} for d in data_sets],
+             "default": data_sets[1] if len(data_sets) > 1 else (data_sets or [None])[0]},
+            {"key": "threads", "label": "Cores",
+             "options": [{"value": t, "label": t} for t in threads],
+             "default": threads[-1] if threads else None},
+        ],
+        "tables": tables,
+        "meta": {"versions": {k: sorted(v) for k, v in versions.items()}, "cpu": cpu,
+                 "sources": [p.name for p in paths]},
+    }
+
+
 HTML_TEMPLATE = """<!doctype html>
 <html lang="en">
 <head>
@@ -255,6 +398,14 @@ HTML_TEMPLATE = """<!doctype html>
     .bench td.best { font-weight: 700; outline: 1.5px solid var(--accent);
       outline-offset: -2px; }
     .bench td.na { color: var(--muted); }
+    .bench tr.sum td { font-weight: 600; background: var(--paper); }
+    .bench tr.sum td.qcol { color: var(--accent); }
+    .headline { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-top: 1.1rem; }
+    .headline a { display: block; padding: 0.7rem 0.95rem; border: 1px solid var(--line);
+      border-radius: 10px; background: var(--paper); color: var(--ink); text-decoration: none;
+      font-size: 0.9rem; line-height: 1.35; }
+    .headline a:hover { border-color: var(--accent); }
+    .headline strong { color: var(--accent); }
   </style>
 </head>
 <body>
@@ -267,17 +418,22 @@ __BENCHMARK_NAV__
     <p class="eyebrow">Benchmarks</p>
     <h1>How fast is Ibex?</h1>
     <p class="lead">
+      __LEAD_SUITES__ Each section names the machine and the commit it was
+      measured on. Lower is better.
+    </p>
+    <div class="headline" id="headline"></div>
+  </section>
+
+  <section class="section" id="inmemory">
+    <p class="section-label">Ibex's own suite</p>
+    <h2>In-memory DataFrame queries</h2>
+    <p class="section-sub">
       Ibex against <strong>Polars</strong>, <strong>DuckDB</strong>,
       <strong>ClickHouse</strong>, <strong>DataFusion</strong> and
       <strong>data.table</strong> on the same columnar queries, from 1M to __MAXM__M
-      rows. Times are the mean of timed iterations; lower is better.
+      rows. Times are the mean of timed iterations.
     </p>
     <div class="stats" id="stats"></div>
-  </section>
-
-  <section class="section">
-    <p class="section-label">Results</p>
-    <h2>Per-query timings</h2>
     <p class="section-sub">
       Pick a row count and a metric. Each row is colour-scaled green&rarr;red
       against the best engine in that row &mdash; fastest for time, lightest for
@@ -353,10 +509,76 @@ __BENCHMARK_NAV__
     <p class="bench-note" id="meta"></p>
   </section>
 
+  <section class="section" id="h2o">
+    <p class="section-label">Independent benchmark</p>
+    <h2>h2o db-benchmark</h2>
+    <p class="section-sub">
+      The h2oai db-benchmark questions, as maintained by DuckDB Labs
+      (<a href="https://github.com/duckdblabs/db-benchmark" target="_blank" rel="noopener">duckdblabs/db-benchmark</a>,
+      pinned at <code>3b074bc319</code>): ten group-by questions on 10M rows at three
+      key cardinalities (K=100, 10 and 2, the last with 5M groups in <code>id3</code>),
+      with 5% nulls and pre-sorted variants, and five joins. None of these queries
+      or data shapes were written alongside Ibex. Pick a data set and a core count.
+    </p>
+    <p class="bench-note">
+      <strong>What this measures.</strong> The data comes from the upstream R
+      generators, unmodified, and every engine reads the same CSV. Polars and
+      DuckDB use the schemas of the upstream solutions: Polars runs its streaming
+      engine with Int32 ids and string keys cast to <code>Categorical</code>;
+      DuckDB uses <code>ENUM</code> keys where upstream does and a FLOAT
+      <code>v3</code>. Ibex declares the same string keys
+      <code>Categorical</code> and otherwise picks its own types (Int64 and
+      Float64, which move more bytes than the upstream Int32/Float32). Loading is
+      not timed; each question runs 1 warmup and 5 timed iterations, fully
+      materialising its result, and the table shows the fastest. Every answer is
+      checked across engines: the row count and upstream's checksum columns
+      must agree.
+    </p>
+    <div class="bench-controls" id="h2o-controls"></div>
+    <div class="tablewrap"><table class="bench" id="h2o-tbl"></table></div>
+    <p class="bench-note" style="margin-top:1rem">
+      The summary rows compare Ibex with each engine over the questions all three
+      completed: the geometric mean of the per-question ratios, and the ratio of
+      the totals. Below 1 means Ibex is faster. The harness is
+      <a href="__GITHUB__/benchmarking/h2o/run.py" target="_blank" rel="noopener">benchmarking/h2o/run.py</a>.
+    </p>
+    <p class="bench-note" id="h2o-meta"></p>
+  </section>
+
+  <section class="section" id="pdsh">
+    <p class="section-label">Independent benchmark</p>
+    <h2>PDS-H (TPC-H)</h2>
+    <p class="section-sub">
+      Polars' TPC-H-derived benchmark
+      (<a href="https://github.com/pola-rs/polars-benchmark" target="_blank" rel="noopener">pola-rs/polars-benchmark</a>):
+      22 decision-support queries over a star schema, read from Parquet. Polars
+      (streaming engine) and DuckDB run upstream's own query code; Ibex runs its
+      translations of the same queries. Pick a core count.
+    </p>
+    <p class="bench-note">
+      <strong>What this measures.</strong> The Parquet files come from upstream's
+      generator, never from Ibex, and each query reads its inputs from them, as
+      upstream PDS-H does. Every Ibex answer is diffed against Polars at the
+      benchmarked scale before anything is timed. Times are the mean of 5 timed
+      iterations after 1 warmup.
+    </p>
+    <div class="bench-controls" id="pdsh-controls"></div>
+    <div class="tablewrap"><table class="bench" id="pdsh-tbl"></table></div>
+    <p class="bench-note" style="margin-top:1rem">
+      The summary rows compare Ibex with each engine: the geometric mean of the
+      per-query ratios, and the ratio of the totals. Below 1 means Ibex is
+      faster. The queries are in
+      <a href="__GITHUB__/benchmarking/tpch/queries" target="_blank" rel="noopener">benchmarking/tpch/queries</a>.
+    </p>
+    <p class="bench-note" id="pdsh-meta"></p>
+  </section>
+
 </main>
 
 <script>
 const PAYLOAD = __PAYLOAD__;
+const H2O = __H2O__;
+const PDSH = __PDSH__;
 const state = { scale: null, metric: "ms", columns: new Set() };
 
 function fmt(ms) {
@@ -477,6 +699,137 @@ function initColumnPicker() {
   });
   setColumns(PAYLOAD.frameworks);
 }
+
+// ── PDS-H and h2o: one heat table per suite, keyed by its selectors ────────
+function geomean(xs) {
+  return Math.exp(xs.reduce((a, x) => a + Math.log(x), 0) / xs.length);
+}
+function suiteTable(suite, sel) {
+  return suite.tables[suite.selectors.map(s => sel[s.key]).join("|")];
+}
+// Ibex over each engine across rows every engine completed:
+// { engine: {geo, total, n} }.
+function suiteSummary(suite, tables) {
+  const out = {};
+  for (const e of suite.engines) {
+    if (e.id === "ibex") continue;
+    const ratios = [];
+    let ti = 0, te = 0;
+    for (const t of tables) {
+      for (const row of t.rows) {
+        const c = t.cells[row.id] || {};
+        if (!suite.engines.every(x => c[x.id] != null)) continue;
+        ratios.push(c.ibex / c[e.id]);
+        ti += c.ibex; te += c[e.id];
+      }
+    }
+    if (ratios.length) out[e.id] = { geo: geomean(ratios), total: ti / te, n: ratios.length };
+  }
+  return out;
+}
+function renderSuite(id, suite, state) {
+  const el = document.getElementById(id + "-tbl");
+  const table = suiteTable(suite, state.sel);
+  const engines = suite.engines;
+  let h = "<thead><tr><th class='qcol'>query</th>" + engines.map(e =>
+    `<th class='${e.id === "ibex" ? "ibex" : ""}'>${e.label}</th>`).join("") + "</tr></thead><tbody>";
+  if (!table) {
+    el.innerHTML = h + "<tr><td class='qcol'>No results for this combination.</td></tr></tbody>";
+    return;
+  }
+  for (const row of table.rows) {
+    const cell = table.cells[row.id] || {};
+    const vals = engines.map(e => cell[e.id]).filter(v => v != null);
+    if (!vals.length) continue;
+    const best = Math.min(...vals);
+    h += `<tr><td class='qcol'>${row.label}</td>`;
+    for (const e of engines) {
+      const v = cell[e.id];
+      const ic = e.id === "ibex" ? " ibex-col" : "";
+      if (v == null) { h += `<td class='na${ic}'>–</td>`; continue; }
+      const ratio = v / best, isBest = v === best;
+      const txt = state.metric === "ratio" ? (isBest ? "1.0×" : ratio.toFixed(1) + "×") : fmt(v);
+      h += `<td class='cell${isBest ? " best" : ""}${ic}' style='background:${heat(ratio)}' `
+         + `title='${e.label}: ${v.toFixed(3)} ms (${ratio.toFixed(2)}× fastest)'>${txt}</td>`;
+    }
+    h += "</tr>";
+  }
+  const sum = suiteSummary(suite, [table]);
+  for (const [key, label] of [["geo", "Ibex ÷ engine, geomean"], ["total", "Ibex ÷ engine, total"]]) {
+    h += `<tr class='sum'><td class='qcol'>${label}</td>`;
+    for (const e of engines) {
+      const s = sum[e.id];
+      h += `<td class='${e.id === "ibex" ? "ibex-col" : ""}'>`
+         + (e.id === "ibex" ? "" : s ? s[key].toFixed(2) : "–") + "</td>";
+    }
+    h += "</tr>";
+  }
+  el.innerHTML = h + "</tbody>";
+}
+function initSuite(id, suite, metaHtml) {
+  const section = document.getElementById(id);
+  if (!suite) { section.remove(); return; }
+  const state = { sel: {}, metric: "ms" };
+  const controls = document.getElementById(id + "-controls");
+  let html = "";
+  for (const s of suite.selectors) {
+    state.sel[s.key] = s.default;
+    html += `<div class='grp'><span class='lbl'>${s.label}</span>` + s.options.map(o =>
+      `<button class='opt' data-k='${s.key}' data-v='${o.value}'>${o.label}</button>`).join("")
+      + "</div>";
+  }
+  html += "<div class='grp'><span class='lbl'>Show</span>"
+    + "<button class='opt' data-m='ms'>Time (ms)</button>"
+    + "<button class='opt' data-m='ratio'>× fastest</button></div>";
+  controls.innerHTML = html;
+  const sync = () => {
+    controls.querySelectorAll("button").forEach(b => b.classList.toggle("on",
+      b.dataset.m ? b.dataset.m === state.metric : state.sel[b.dataset.k] === b.dataset.v));
+    renderSuite(id, suite, state);
+  };
+  controls.addEventListener("click", ev => {
+    const b = ev.target.closest("button");
+    if (!b) return;
+    if (b.dataset.m) state.metric = b.dataset.m; else state.sel[b.dataset.k] = b.dataset.v;
+    sync();
+  });
+  document.getElementById(id + "-meta").innerHTML = metaHtml;
+  sync();
+}
+function chip(href, html) { return `<a href='${href}'>${html}</a>`; }
+function fx(v) { return v.toFixed(2) + "×"; }
+
+(function initIndependent() {
+  const head = [];
+  if (H2O) {
+    const cores = H2O.selectors.find(s => s.key === "threads").default;
+    const pick = kind => Object.entries(H2O.tables)
+      .filter(([k]) => k.endsWith("|" + cores) && k.startsWith(kind)).map(([, t]) => t);
+    for (const [kind, name] of [["G1", "groupby"], ["J1", "join"]]) {
+      const s = suiteSummary(H2O, pick(kind));
+      if (s.polars) head.push(chip("#h2o", `h2o ${name} · ${cores} cores<br>Ibex <strong>${fx(s.polars.geo)}</strong> Polars`
+        + (s.duckdb ? `, <strong>${fx(s.duckdb.geo)}</strong> DuckDB` : "") + " (geomean)"));
+    }
+    const v = H2O.meta.versions;
+    const ver = Object.entries(v).map(([e, xs]) => `${e} <code>${xs.join(", ")}</code>`).join(", ");
+    initSuite("h2o", H2O, (H2O.meta.cpu ? `${H2O.meta.cpu} · ` : "")
+      + `versions: ${ver} · sources: ${H2O.meta.sources.join(", ")}`);
+  } else initSuite("h2o", null, "");
+  if (PDSH) {
+    const cores = PDSH.selectors[0].default;
+    const s = suiteSummary(PDSH, [PDSH.tables[cores]]);
+    if (s["pdsh-polars-stream"]) head.push(chip("#pdsh", `PDS-H SF-${PDSH.meta.scale_factor} · ${cores} cores<br>`
+      + `Ibex total <strong>${fx(s["pdsh-polars-stream"].total)}</strong> Polars`
+      + (s["pdsh-duckdb"] ? `, <strong>${fx(s["pdsh-duckdb"].total)}</strong> DuckDB` : "")));
+    const m = PDSH.meta;
+    initSuite("pdsh", PDSH, `SF-${m.scale_factor}` + (m.cpu ? ` · ${m.cpu}` : "")
+      + ` · Ibex commit <code>${m.commit}</code> · Polars <code>${m.polars}</code>, DuckDB <code>${m.duckdb}</code>`
+      + ` · source: ${m.source}`);
+  } else initSuite("pdsh", null, "");
+  head.unshift(chip("#inmemory", `In-memory suite<br><strong>${PAYLOAD.queries.length}</strong> queries, `
+    + `<strong>${PAYLOAD.frameworks.length}</strong> engines`));
+  document.getElementById("headline").innerHTML = head.join("");
+})();
 
 (function init() {
   const P = PAYLOAD, big = P.scales[P.scales.length - 1];
@@ -751,9 +1104,13 @@ def main(argv=None):
                     help="output HTML (default: docs/benchmarks.html)")
     ap.add_argument("--commit", default=None,
                     help="commit hash of the latest run (local CSV names omit it)")
+    ap.add_argument("--pdsh", type=Path, default=None,
+                    help="PDS-H section: a run-tpch.sh artifact (.tar.gz) or its history.tsv")
+    ap.add_argument("--h2o", type=Path, nargs="+", default=None,
+                    help="h2o section: run-h2o.sh artifact(s) or h2o/run.py TSVs, merged in order")
     args = ap.parse_args(argv)
 
-    for p in args.csv:
+    for p in args.csv + ([args.pdsh] if args.pdsh else []) + (args.h2o or []):
         if not p.exists():
             print(f"error: {p} not found", file=sys.stderr)
             return 1
@@ -765,14 +1122,30 @@ def main(argv=None):
     payload = build_payload(cells, mem, args.csv, commit=args.commit)
 
     max_rows_m = f"{max(payload['scales']) // 1_000_000}" if payload["scales"] else "16"
+    pdsh = load_pdsh(args.pdsh) if args.pdsh else None
+    h2o = load_h2o(args.h2o) if args.h2o else None
+    suites = ["Ibex's own in-memory DataFrame suite"]
+    if h2o:
+        suites.append("the independent h2o db-benchmark")
+    if pdsh:
+        suites.append("PDS-H, Polars' TPC-H-derived benchmark")
+    count = {1: "One benchmark", 2: "Two benchmarks", 3: "Three benchmarks"}[len(suites)]
+    listed = suites[0] if len(suites) == 1 else ", ".join(suites[:-1]) + " and " + suites[-1]
+    lead = f"{count}, with every engine pinned to the same cores: {listed}."
     out_html = (HTML_TEMPLATE
                 .replace("__BENCHMARK_NAV__", BENCHMARK_NAV)
                 .replace("__PAYLOAD__", json.dumps(payload, separators=(",", ":")))
+                .replace("__H2O__", json.dumps(h2o, separators=(",", ":")))
+                .replace("__PDSH__", json.dumps(pdsh, separators=(",", ":")))
+                .replace("__GITHUB__", GITHUB)
+                .replace("__LEAD_SUITES__", html.escape(lead, quote=False))
                 .replace("__MAXM__", max_rows_m))
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(out_html, encoding="utf-8")
     print(f"wrote {args.out}  ({len(payload['queries'])} queries, "
-          f"{len(payload['frameworks'])} engines, scales {payload['scales']})")
+          f"{len(payload['frameworks'])} engines, scales {payload['scales']})"
+          + (f"; PDS-H cores {sorted(pdsh['tables'], key=int)}" if pdsh else "")
+          + (f"; h2o {len(h2o['tables'])} (data, cores) tables" if h2o else ""))
 
     # Companion methodology + per-engine code page (auto-extracted from sources).
     code_payload = build_code_payload(cells)

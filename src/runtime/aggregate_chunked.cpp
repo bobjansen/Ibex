@@ -491,10 +491,10 @@ class GroupKeyStore {
     void reserve(std::size_t n) { null_masks_.reserve(n); }
 
     /// Groups beyond the old size exist but hold nothing until written.
-    void resize(std::size_t n) {
+    void resize(std::size_t n, bool zero = true) {
         null_masks_.resize(n, 0);
         for (auto& col : cols_) {
-            col.resize(n);
+            col.resize(n, zero);
         }
     }
 
@@ -864,6 +864,7 @@ class GroupKeyStore {
                 col.code_dict = src.code_dict;
             }
         }
+        col.materialize_text();
         const std::size_t base = col.chars.size();
         col.chars.resize(base + text_bytes);
         return base;
@@ -877,7 +878,7 @@ class GroupKeyStore {
         }
         std::size_t bytes = 0;
         for (std::size_t n = lo; n < hi; ++n) {
-            bytes += sources[n].store->cols_[c].text_lengths[sources[n].index];
+            bytes += sources[n].store->cols_[c].text(sources[n].index).size();
         }
         return bytes;
     }
@@ -936,8 +937,16 @@ class GroupKeyStore {
     /// then `prepare_column_rows` and `fill_column_rows_range` write them.
     void prepare_fill_rows(std::size_t first, const std::vector<const ColumnEntry*>& entries,
                            std::span<const std::size_t> rows) {
+        // A codes-only column this chunk cannot extend with codes stores its
+        // text from here on; do it while every group it holds is a written one.
+        for (std::size_t c = 0; c < entries.size() && c < cols_.size(); ++c) {
+            if (cols_[c].text_dict != nullptr && fill_stores_text(c, *entries[c]->column)) {
+                cols_[c].materialize_text();
+            }
+        }
         if (size() < first + rows.size()) {
-            resize(first + rows.size());
+            // `fill_column_rows_range` writes every new group of every column.
+            resize(first + rows.size(), /*zero=*/false);
         }
         ensure_columns(entries.size());
         for (std::size_t n = 0; n < rows.size(); ++n) {
@@ -967,16 +976,23 @@ class GroupKeyStore {
             [&](const auto& typed) {
                 using C = std::decay_t<decltype(typed)>;
                 if constexpr (std::is_same_v<C, Column<std::int64_t>>) {
-                    col.claim(Kind::Int64, groups);
+                    col.claim(Kind::Int64, groups, /*zero=*/false);
                 } else if constexpr (std::is_same_v<C, Column<double>>) {
-                    col.claim(Kind::Double, groups);
+                    col.claim(Kind::Double, groups, /*zero=*/false);
                 } else if constexpr (std::is_same_v<C, Column<bool>>) {
-                    col.claim(Kind::Bool, groups);
+                    col.claim(Kind::Bool, groups, /*zero=*/false);
                 } else if constexpr (std::is_same_v<C, Column<std::string>>) {
-                    col.claim(Kind::Text, groups);
+                    col.claim(Kind::Text, groups, /*zero=*/false);
                     col.drop_codes();
                 } else if constexpr (std::is_same_v<C, Column<Categorical>>) {
-                    col.claim(Kind::Text, groups);
+                    // A column first written here holds codes alone (see
+                    // `Col::text_dict`); every one of its groups is.
+                    const bool fresh = col.kind == Kind::Unset && col.codes_usable;
+                    if (fresh) {
+                        col.text_dict = typed.dictionary_ptr();
+                        code_only_key_columns().fetch_add(1, std::memory_order_relaxed);
+                    }
+                    col.claim(Kind::Text, groups, /*zero=*/false);
                     // As `put_cat`: codes stay usable while every group's
                     // code is against one dictionary.
                     const void* dict = typed.dictionary_ptr().get();
@@ -986,17 +1002,17 @@ class GroupKeyStore {
                         col.drop_codes();
                     }
                 } else if constexpr (std::is_same_v<C, Column<Date>>) {
-                    col.claim(Kind::Date, groups);
+                    col.claim(Kind::Date, groups, /*zero=*/false);
                 } else if constexpr (std::is_same_v<C, Column<Timestamp>>) {
-                    col.claim(Kind::Ts, groups);
+                    col.claim(Kind::Ts, groups, /*zero=*/false);
                 } else if constexpr (std::is_same_v<C, Column<Decimal>>) {
-                    col.claim(Kind::Dec, groups);
+                    col.claim(Kind::Dec, groups, /*zero=*/false);
                 } else {
                     invariant_violation("group key store: unsupported key column type");
                 }
             },
             column);
-        if (col.kind != Kind::Text) {
+        if (col.kind != Kind::Text || col.text_dict != nullptr) {
             return 0;
         }
         const std::size_t base = col.chars.size();
@@ -1040,6 +1056,12 @@ class GroupKeyStore {
                         put_text(first + n, typed[rows[n]]);
                     }
                 } else if constexpr (std::is_same_v<C, Column<Categorical>>) {
+                    if (col.text_dict != nullptr) {
+                        for (std::size_t n = lo; n < hi; ++n) {
+                            col.cat_codes[first + n] = typed.code_at(rows[n]);
+                        }
+                        return;
+                    }
                     const bool codes = col.codes_usable;
                     for (std::size_t n = lo; n < hi; ++n) {
                         put_text(first + n, typed[rows[n]]);
@@ -1066,6 +1088,21 @@ class GroupKeyStore {
                 }
             },
             column);
+    }
+
+    /// Whether `fill_column_rows_range` will copy `column`'s text into column
+    /// `c`: not for a Categorical column that holds codes alone, or is about
+    /// to (`prepare_column_rows`), so its bytes need not be counted.
+    [[nodiscard]] auto fill_stores_text(std::size_t c, const ColumnValue& column) const -> bool {
+        const auto* cat = std::get_if<Column<Categorical>>(&column);
+        if (cat == nullptr || c >= cols_.size()) {
+            return true;
+        }
+        const Col& col = cols_[c];
+        if (col.kind == Kind::Unset) {
+            return !col.codes_usable;
+        }
+        return col.text_dict == nullptr || col.text_dict != cat->dictionary_ptr();
     }
 
     /// The bytes `rows[lo .. hi)` of a text key column take; 0 otherwise.
@@ -1108,10 +1145,10 @@ class GroupKeyStore {
     /// (nanos); text is `chars[text_offsets[g] .. + text_lengths[g]]`.
     struct Col {
         Kind kind = Kind::Unset;
-        std::vector<std::int64_t> ints;
-        std::vector<double> doubles;
-        std::vector<std::uint64_t> text_offsets;
-        std::vector<std::uint32_t> text_lengths;
+        ::ibex::detail::NoInitVector<std::int64_t> ints;
+        ::ibex::detail::NoInitVector<double> doubles;
+        ::ibex::detail::NoInitVector<std::uint64_t> text_offsets;
+        ::ibex::detail::NoInitVector<std::uint32_t> text_lengths;
         ::ibex::detail::NoInitVector<char> chars;
         std::vector<Int128> units;
         std::vector<DecimalType> decimal_types;
@@ -1122,30 +1159,83 @@ class GroupKeyStore {
         /// was most of h2o q10's emission at 10M groups. `codes_usable` drops
         /// for good the first time a group's text arrives without a code
         /// against that same dictionary.
-        std::vector<Column<Categorical>::code_type> cat_codes;
+        ::ibex::detail::NoInitVector<Column<Categorical>::code_type> cat_codes;
         const void* code_dict = nullptr;
         bool codes_usable = true;
+        /// Set when a Categorical column's text is not stored at all: every
+        /// group's code is in `cat_codes`, against this dictionary (which is
+        /// `code_dict`), and `text` reads the value there. The packed path's
+        /// bulk fill starts a column this way (`prepare_column_rows`): at h2o
+        /// q10's 1e7 groups, copying three Categorical keys' text next to
+        /// their codes was ~35 ms of first-touch writes nothing read.
+        /// Anything that would store text for a group materializes it all
+        /// first (`materialize_text`), so `codes_usable` holds while it is set.
+        std::shared_ptr<const std::vector<std::string>> text_dict;
 
         [[nodiscard]] auto text(std::size_t gid) const -> std::string_view {
+            if (text_dict != nullptr) {
+                // A null group's code need not index the dictionary.
+                const auto code = static_cast<std::size_t>(cat_codes[gid]);
+                return code < text_dict->size() ? std::string_view{(*text_dict)[code]}
+                                                : std::string_view{};
+            }
             return {chars.data() + text_offsets[gid], text_lengths[gid]};
         }
 
-        void resize(std::size_t n) {
+        /// Store every group's text, as an eagerly filled column would, and
+        /// stop reading it through `text_dict`.
+        void materialize_text() {
+            if (text_dict == nullptr) {
+                return;
+            }
+            const std::size_t groups = cat_codes.size();
+            std::size_t bytes = 0;
+            for (std::size_t g = 0; g < groups; ++g) {
+                bytes += text(g).size();
+            }
+            text_offsets.resize(groups);
+            text_lengths.resize(groups);
+            chars.clear();
+            chars.reserve(bytes);
+            for (std::size_t g = 0; g < groups; ++g) {
+                const std::string_view value = text(g);
+                text_offsets[g] = chars.size();
+                text_lengths[g] = static_cast<std::uint32_t>(value.size());
+                chars.insert(chars.end(), value.begin(), value.end());
+            }
+            text_dict = nullptr;
+        }
+
+        /// Grow (or shrink) to `n` groups. New groups' values are zero unless
+        /// `zero` is false, for a caller that writes every new group itself
+        /// (`prepare_fill_rows`): at 1e7 groups the zero-fill was a serial
+        /// first touch of ~100 MB a column, then written over in parallel.
+        void resize(std::size_t n, bool zero = true) {
+            const auto grow = [&](auto& values) {
+                const std::size_t old = values.size();
+                values.resize(n);
+                if (zero && n > old) {
+                    std::fill(values.begin() + static_cast<std::ptrdiff_t>(old), values.end(),
+                              typename std::decay_t<decltype(values)>::value_type{});
+                }
+            };
             switch (kind) {
                 case Kind::Int64:
                 case Kind::Bool:
                 case Kind::Date:
                 case Kind::Ts:
-                    ints.resize(n);
+                    grow(ints);
                     break;
                 case Kind::Double:
-                    doubles.resize(n);
+                    grow(doubles);
                     break;
                 case Kind::Text:
-                    text_offsets.resize(n);
-                    text_lengths.resize(n);
+                    if (text_dict == nullptr) {
+                        grow(text_offsets);
+                        grow(text_lengths);
+                    }
                     if (codes_usable) {
-                        cat_codes.resize(n);
+                        grow(cat_codes);
                     }
                     break;
                 case Kind::Dec:
@@ -1159,7 +1249,7 @@ class GroupKeyStore {
 
         /// A column takes its type from its first value; every later one must
         /// match, as every chunk of one key column has one type.
-        void claim(Kind wanted, std::size_t groups) {
+        void claim(Kind wanted, std::size_t groups, bool zero = true) {
             if (kind == wanted) {
                 return;
             }
@@ -1167,7 +1257,7 @@ class GroupKeyStore {
                 invariant_violation("group key store: a key column changed type");
             }
             kind = wanted;
-            resize(groups);
+            resize(groups, zero);
         }
 
         void put_int(Kind wanted, std::size_t gid, std::int64_t value, std::size_t groups) {
@@ -1184,6 +1274,10 @@ class GroupKeyStore {
         }
         void put_cat(std::size_t gid, std::string_view value, Column<Categorical>::code_type code,
                      const void* dict, std::size_t groups) {
+            if (text_dict != nullptr && text_dict.get() == dict) {
+                cat_codes[gid] = code;
+                return;
+            }
             write_text(gid, value, groups);
             if (!codes_usable) {
                 return;
@@ -1199,11 +1293,13 @@ class GroupKeyStore {
         }
         void write_text(std::size_t gid, std::string_view value, std::size_t groups) {
             claim(Kind::Text, groups);
+            materialize_text();
             text_offsets[gid] = chars.size();
             text_lengths[gid] = static_cast<std::uint32_t>(value.size());
             chars.insert(chars.end(), value.begin(), value.end());
         }
         void drop_codes() {
+            materialize_text();
             codes_usable = false;
             cat_codes = {};
         }
@@ -1949,7 +2045,9 @@ class HashAggregateState final {
         }
         if (packed_fast_path_ && rows != 0) {
             intern_string_keys(group_entries);
-            auto plan = encoder_.build_packed_key(group_entries);
+            auto plan = encoder_.build_packed_key(
+                group_entries, packed_prep_fans_out() ? par_.discovery.worker_cap : 1,
+                [&](std::size_t tasks, const auto& body) { run_packed_prep(tasks, body); });
             if (!plan.has_value() && encoder_.layout_miss()) {
                 // Values outside the data-sized layout the first chunk fixed
                 // (or, on the first chunk, a key wider than 256 bits even
@@ -1983,22 +2081,33 @@ class HashAggregateState final {
     /// Give the packed path ids for this chunk's String key columns
     /// (`PackedKeyEncoder::StrIntern`), across the Discovery node's workers
     /// when it may fan out.
-    void intern_string_keys(const std::vector<const ColumnEntry*>& group_entries) {
-        const bool fan = exec_ != nullptr && !on_worker_pool_thread() &&
-                         par_.discovery.decline == physical::FanOutDecline::None &&
-                         par_.discovery.worker_cap >= 2;
-        const auto run = [&](std::size_t tasks, const auto& body) {
-            if (!fan || tasks < 2) {
-                for (std::size_t t = 0; t < tasks; ++t) {
-                    body(t);
-                }
-                return;
+    /// Whether the packed key's per-chunk preparation (`intern_string_keys`,
+    /// `build_packed_key`) may spread over the Discovery node's workers.
+    [[nodiscard]] auto packed_prep_fans_out() const -> bool {
+        return exec_ != nullptr && !on_worker_pool_thread() &&
+               par_.discovery.decline == physical::FanOutDecline::None &&
+               par_.discovery.worker_cap >= 2;
+    }
+
+    /// `run(tasks, body)` for the packed key's preparation: `body(t)` for
+    /// each `t < tasks`, on the workers when `packed_prep_fans_out`.
+    void run_packed_prep(std::size_t tasks, const std::function<void(std::size_t)>& body) const {
+        if (!packed_prep_fans_out() || tasks < 2) {
+            for (std::size_t t = 0; t < tasks; ++t) {
+                body(t);
             }
-            auto batch = process_worker_pool().submit(tasks, [&](std::size_t t) { body(t); });
-            batch.wait();
-        };
-        encoder_.intern_strings(group_entries, fan ? discovery_partition_count() : 1,
-                                fan ? par_.discovery.worker_cap : 1, run);
+            return;
+        }
+        auto batch = process_worker_pool().submit(tasks, body);
+        batch.wait();
+    }
+
+    void intern_string_keys(const std::vector<const ColumnEntry*>& group_entries) {
+        const bool fan = packed_prep_fans_out();
+        encoder_.intern_strings(
+            group_entries, fan ? discovery_partition_count() : 1,
+            fan ? par_.discovery.worker_cap : 1,
+            [&](std::size_t tasks, const auto& body) { run_packed_prep(tasks, body); });
     }
 
     auto process_rows_str(const std::vector<const ColumnEntry*>& group_entries,
@@ -4198,6 +4307,17 @@ class HashAggregateState final {
     /// position: its key is built from a ROW and is not invertible.
     struct NoGroupKeys {};
 
+    /// Passed as `store_key` by a caller that wants only each new group's
+    /// first row within the chunk (the packed path, which rebuilds keys from
+    /// rows). Groups are numbered in row order, so the numbering pass writes
+    /// those rows sequentially, `(*rows)[gid - first_gid]`, and the partitions
+    /// keep no keys or first rows at all. `rows` is sized by `resize_keys`,
+    /// which runs before numbering.
+    struct StoreFirstRows {
+        ::ibex::detail::NoInitVector<std::size_t>* rows = nullptr;
+        std::size_t first_gid = 0;
+    };
+
     /// How many partitions `try_discover_partitioned` splits rows into: a
     /// power of two, so a partition is `hash & (count - 1)`, and a fixed
     /// function of the Discovery node's workers, so every chunk of a stream
@@ -4380,6 +4500,9 @@ class HashAggregateState final {
         // lowering it is a measured dead end, because the break-even is set by
         // group CARDINALITY and a low-cardinality run of this size loses.
         constexpr bool can_seed = !std::is_same_v<KeyOfGroup, NoGroupKeys>;
+        constexpr bool kRowsOnly = std::is_same_v<StoreKey, StoreFirstRows>;
+        static_assert(!(kRowsOnly && can_seed),
+                      "seeded groups need their keys kept in the partitions");
         if (!may_discover_partitioned(rows, min_rows, can_seed,
                                       [&](std::size_t row) { return Hash{}(key_at(row)); })) {
             return false;
@@ -4529,8 +4652,10 @@ class HashAggregateState final {
                                 const std::size_t total = partition.gids.size() + more;
                                 partition.index.reserve(total);
                                 partition.gids.reserve(total);
-                                partition.first_rows.reserve(total);
-                                partition.keys.reserve(total);
+                                if constexpr (!kRowsOnly) {
+                                    partition.first_rows.reserve(total);
+                                    partition.keys.reserve(total);
+                                }
                             }
                         }
                         // The generic key reads every key column at its row
@@ -4586,12 +4711,14 @@ class HashAggregateState final {
                                     return Key(key);
                                 }
                             }();
-                            const auto inserted =
+                            [[maybe_unused]] const auto inserted =
                                 partition.index.emplace(std::move(owned), local).first;
                             partition.gids.push_back(0);  // filled below, in order
-                            partition.first_rows.push_back(row_base + row);
                             starts_group_[row] = 1;
-                            partition.keys.emplace_back(inserted->first);
+                            if constexpr (!kRowsOnly) {
+                                partition.first_rows.push_back(row_base + row);
+                                partition.keys.emplace_back(inserted->first);
+                            }
                         } else {
                             local = it->second;
                         }
@@ -4639,26 +4766,34 @@ class HashAggregateState final {
             for (std::size_t r = 0; r < ranges; ++r) {
                 starters[r + 1] += starters[r];
             }
+            n_groups_ = base + starters[ranges];
+            size_group_arrays();
+            // The caller's gid-indexed key vector has to cover the ids about
+            // to be handed out before any of them is written back.
+            resize_keys(n_groups_);
             auto number = pool.submit(ranges, [&](std::size_t r) {
                 const std::size_t begin = r * grain;
                 const std::size_t end = std::min(rows, begin + grain);
                 auto next = static_cast<std::uint32_t>(base + starters[r]);
                 for (std::size_t row = begin; row < end; ++row) {
                     if (starts_group(row)) {
+                        if constexpr (kRowsOnly) {
+                            (*store_key.rows)[next - store_key.first_gid] = row;
+                        }
                         partitions[part_of_row_[row]].gids[gids[row]] = next++;
                     }
                 }
             });
             number.wait();
-            n_groups_ = base + starters[ranges];
         }
-        size_group_arrays();
-        // The caller's gid-indexed key vector has to cover the ids just handed
-        // out before any of them is written back. Every `store_key` writes
-        // only its own gid's entries, so partitions are written back in
-        // parallel: at 5M string groups this copy alone was ~50 ms serial.
-        resize_keys(n_groups_);
-        {
+        if constexpr (kRowsOnly) {
+            for (auto& partition : partitions) {
+                partition.stored = partition.gids.size();
+            }
+        } else {
+            // Every `store_key` writes only its own gid's entries, so
+            // partitions are written back in parallel: at 5M string groups
+            // this copy alone was ~50 ms serial.
             std::atomic<std::size_t> cursor{0};
             auto batch = pool.submit(std::min(workers, part_count), [&](std::size_t) {
                 for (std::size_t p = cursor.fetch_add(1, std::memory_order_relaxed); p < part_count;
@@ -5608,9 +5743,7 @@ class HashAggregateState final {
                     group_keys_.resize(n);
                     new_group_rows.resize(n - groups_before);
                 },
-                [&](const Packed&, std::uint32_t gid, std::size_t row) {
-                    new_group_rows[gid - groups_before] = row;
-                },
+                StoreFirstRows{.rows = &new_group_rows, .first_gid = groups_before},
                 kPackedPartitionMinRows)) {
             fill_new_keys_from_rows(groups_before, group_entries, new_group_rows);
             publish_discovered(agg_entries, rows);
@@ -5908,7 +6041,14 @@ class HashAggregateState final {
         };
         // Text bytes per (column, range), then each range's starting byte.
         std::vector<std::size_t> text_at(columns * (ranges + 1), 0);
+        std::vector<std::uint8_t> counts_text(columns);
+        for (std::size_t c = 0; c < columns; ++c) {
+            counts_text[c] = group_keys_.fill_stores_text(c, *group_entries[c]->column) ? 1 : 0;
+        }
         fan([&](std::size_t c, std::size_t r) {
+            if (counts_text[c] == 0) {
+                return;
+            }
             const auto [lo, hi] = range_of(r);
             text_at[(c * (ranges + 1)) + r + 1] =
                 GroupKeyStore::text_bytes_of_rows(*group_entries[c]->column, rows, lo, hi);
@@ -9258,6 +9398,11 @@ auto packed_nullable_key_chunks() -> std::atomic<std::uint64_t>& {
 }
 
 auto single_core_partitioned_discoveries() -> std::atomic<std::uint64_t>& {
+    static std::atomic<std::uint64_t> count{0};
+    return count;
+}
+
+auto code_only_key_columns() -> std::atomic<std::uint64_t>& {
     static std::atomic<std::uint64_t> count{0};
     return count;
 }

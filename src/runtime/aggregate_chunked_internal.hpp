@@ -33,6 +33,11 @@ namespace ibex::runtime {
 /// path gives the same answer, so only this tells the two apart.
 [[nodiscard]] auto packed_nullable_key_chunks() -> std::atomic<std::uint64_t>&;
 
+/// How many Categorical key columns, process-wide, an aggregate's key store
+/// began holding as codes alone, its text read through the dictionary. For
+/// tests: storing the text too gives the same answer.
+[[nodiscard]] auto code_only_key_columns() -> std::atomic<std::uint64_t>&;
+
 /// Construct the adaptive sorted/hash aggregate implementation. Kept as one
 /// factory boundary so the complete aggregate family can live in its own
 /// translation unit without exposing its state types to the pipeline builder.

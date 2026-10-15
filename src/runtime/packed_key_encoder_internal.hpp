@@ -185,11 +185,25 @@ struct PackedKeyEncoder {
     /// comparable across chunks. Strings are included only when cells are
     /// sized from the data, and only after the caller has run
     /// `intern_strings` on the chunk (see `StrIntern`).
+    ///
+    /// Sizing cells from the data scans every Int64/Date/Timestamp key column
+    /// for its range; `run` and `tasks` are as for `intern_strings`, and split
+    /// that scan (at h2o q10's 1e7 rows, three Int64 keys were ~15 ms on one
+    /// core). The one-argument form scans on the calling thread.
     auto build_packed_key(const std::vector<const ColumnEntry*>& entries)
         -> std::optional<PackedPlan> {
+        return build_packed_key(entries, 1, [](std::size_t tasks, const auto& body) {
+            for (std::size_t t = 0; t < tasks; ++t) {
+                body(t);
+            }
+        });
+    }
+    template <typename Run>
+    auto build_packed_key(const std::vector<const ColumnEntry*>& entries, std::size_t tasks,
+                          const Run& run) -> std::optional<PackedPlan> {
         layout_miss_ = false;
         if (size_cells_from_data) {
-            return build_ranged_layout(entries);
+            return build_ranged_layout(entries, tasks, run);
         }
         for (const auto* entry : entries) {
             if (entry->validity.has_value()) {
@@ -362,26 +376,41 @@ struct PackedKeyEncoder {
     /// The range of the non-null values; {0, 0} when there are none. A null
     /// row's payload is whatever the column holds there, so it must not
     /// widen the window.
-    template <typename T, typename Get>
+    /// Split over up to `tasks` ranges of `run` (see `build_packed_key`).
+    template <typename T, typename Get, typename Run>
     [[nodiscard]] static auto observe_range(const T* data, std::size_t n, Get get,
-                                            const ValidityBitmap* valid) -> Observed {
-        std::int64_t lo = std::numeric_limits<std::int64_t>::max();
-        std::int64_t hi = std::numeric_limits<std::int64_t>::min();
-        if (valid == nullptr) {
-            for (std::size_t i = 0; i < n; ++i) {
-                const std::int64_t v = get(data[i]);
-                lo = std::min(lo, v);
-                hi = std::max(hi, v);
-            }
-        } else {
-            for (std::size_t i = 0; i < n; ++i) {
-                if ((*valid)[i]) {
+                                            const ValidityBitmap* valid, std::size_t tasks,
+                                            const Run& run) -> Observed {
+        constexpr std::size_t kMinRangeRows = std::size_t{1} << 16;
+        const std::size_t ranges = std::clamp<std::size_t>(n / kMinRangeRows, 1, tasks);
+        const std::size_t grain = (n + ranges - 1) / ranges;
+        std::vector<std::int64_t> los(ranges, std::numeric_limits<std::int64_t>::max());
+        std::vector<std::int64_t> his(ranges, std::numeric_limits<std::int64_t>::min());
+        run(ranges, [&](std::size_t r) {
+            const std::size_t begin = std::min(n, r * grain);
+            const std::size_t end = std::min(n, begin + grain);
+            std::int64_t lo = los[r];
+            std::int64_t hi = his[r];
+            if (valid == nullptr) {
+                for (std::size_t i = begin; i < end; ++i) {
                     const std::int64_t v = get(data[i]);
                     lo = std::min(lo, v);
                     hi = std::max(hi, v);
                 }
+            } else {
+                for (std::size_t i = begin; i < end; ++i) {
+                    if ((*valid)[i]) {
+                        const std::int64_t v = get(data[i]);
+                        lo = std::min(lo, v);
+                        hi = std::max(hi, v);
+                    }
+                }
             }
-        }
+            los[r] = lo;
+            his[r] = hi;
+        });
+        const std::int64_t lo = *std::ranges::min_element(los);
+        const std::int64_t hi = *std::ranges::max_element(his);
         return lo > hi ? Observed{} : Observed{.min = lo, .max = hi};
     }
 
@@ -481,8 +510,9 @@ struct PackedKeyEncoder {
         return true;
     }
 
-    auto build_ranged_layout(const std::vector<const ColumnEntry*>& entries)
-        -> std::optional<PackedPlan> {
+    template <typename Run>
+    auto build_ranged_layout(const std::vector<const ColumnEntry*>& entries, std::size_t tasks,
+                             const Run& run) -> std::optional<PackedPlan> {
         // Sized once before any remap pointer is taken; see `build_packed_layout`.
         if (cat_interns_.size() < entries.size()) {
             cat_interns_.resize(entries.size());
@@ -499,18 +529,19 @@ struct PackedKeyEncoder {
             if (const auto* c_int = std::get_if<Column<std::int64_t>>(&column)) {
                 col.kind = PackCol::Kind::Int64;
                 col.i64 = c_int->data();
-                seen[k] =
-                    observe_range(col.i64, c_int->size(), [](std::int64_t v) { return v; }, valid);
+                seen[k] = observe_range(
+                    col.i64, c_int->size(), [](std::int64_t v) { return v; }, valid, tasks, run);
             } else if (const auto* c_date = std::get_if<Column<Date>>(&column)) {
                 col.kind = PackCol::Kind::Date;
                 col.date = c_date->data();
                 seen[k] = observe_range(
-                    col.date, c_date->size(), [](Date v) { return std::int64_t{v.days}; }, valid);
+                    col.date, c_date->size(), [](Date v) { return std::int64_t{v.days}; }, valid,
+                    tasks, run);
             } else if (const auto* c_ts = std::get_if<Column<Timestamp>>(&column)) {
                 col.kind = PackCol::Kind::Ts;
                 col.ts = c_ts->data();
-                seen[k] =
-                    observe_range(col.ts, c_ts->size(), [](Timestamp v) { return v.nanos; }, valid);
+                seen[k] = observe_range(
+                    col.ts, c_ts->size(), [](Timestamp v) { return v.nanos; }, valid, tasks, run);
             } else if (const auto* c_bool = std::get_if<Column<bool>>(&column)) {
                 col.kind = PackCol::Kind::Bool;
                 col.boolean = c_bool;

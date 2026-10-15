@@ -2803,3 +2803,124 @@ TEST_CASE("chunked aggregate: six-column keys at ~1 group per row match a refere
         }
     }
 }
+
+TEST_CASE("chunked aggregate: packed keys keep Categorical columns as codes across chunks",
+          "[runtime][chunked][aggregate]") {
+    // The packed path's key store holds a Categorical key as codes alone,
+    // reading its text through the dictionary. A later chunk over the same
+    // dictionary extends the codes; one over another dictionary (reordered,
+    // with a new label) has the text stored first; one whose key turns
+    // nullable migrates the aggregate to the generic path, which then hashes
+    // and compares the stored keys by text. Expected values are computed
+    // here, in first-seen order.
+    constexpr std::size_t kRows = 40'000;  // over the partitioned path's row gate
+    enum class Later : std::uint8_t { SameDictionary, OtherDictionary, Nulls };
+
+    for (const Later later : {Later::SameDictionary, Later::OtherDictionary, Later::Nulls}) {
+        INFO("later chunk " << static_cast<int>(later));
+        // Fresh per run, each with an index that matches it: a dictionary is
+        // shared append-only, so the output may grow it (here with `t`).
+        const auto dictionary = [](std::vector<std::string> labels) {
+            auto index = std::make_shared<Column<Categorical>::index_map>();
+            for (std::size_t i = 0; i < labels.size(); ++i) {
+                index->emplace(labels[i], static_cast<Column<Categorical>::code_type>(i));
+            }
+            return std::pair{std::make_shared<std::vector<std::string>>(std::move(labels)),
+                             std::move(index)};
+        };
+        const auto [dict_a, index_a] = dictionary({"p", "q", "r", "s"});
+        const auto [dict_a2, index_a2] = dictionary({"s", "t", "q", "p", "r"});
+        const auto [dict_b, index_b] = dictionary({"x", "y", "z"});
+        std::vector<std::string> order;
+        std::map<std::string, std::pair<std::int64_t, std::int64_t>> want;
+        std::vector<runtime::Chunk> chunks;
+        for (std::size_t k = 0; k < 2; ++k) {
+            const bool other = k == 1 && later == Later::OtherDictionary;
+            const auto& a_dict = other ? dict_a2 : dict_a;
+            const bool nulls = k == 1 && later == Later::Nulls;
+            Column<Categorical> a{a_dict, other ? index_a2 : index_a};
+            Column<Categorical> b{dict_b, index_b};
+            Column<std::int64_t> c;
+            Column<std::int64_t> v;
+            runtime::ValidityBitmap a_valid;
+            for (std::size_t i = 0; i < kRows; ++i) {
+                const auto a_code =
+                    static_cast<Column<Categorical>::code_type>(((i * 7) + k) % a_dict->size());
+                const auto b_code = static_cast<Column<Categorical>::code_type>((i / 3) % 3);
+                const auto c_value = static_cast<std::int64_t>((i * 13) % 997) - 400;
+                const auto value = static_cast<std::int64_t>(i % 101);
+                const bool a_ok = !nulls || i % 11 != 4;
+                a.push_code(a_code);
+                b.push_code(b_code);
+                c.push_back(c_value);
+                v.push_back(value);
+                a_valid.push_back(a_ok);
+                const std::string key =
+                    (a_ok ? (*a_dict)[static_cast<std::size_t>(a_code)] : std::string("null")) +
+                    "|" + (*dict_b)[static_cast<std::size_t>(b_code)] + "|" +
+                    std::to_string(c_value);
+                auto [it, fresh] = want.try_emplace(key);
+                if (fresh) {
+                    order.push_back(key);
+                }
+                ++it->second.first;
+                it->second.second += value;
+            }
+            runtime::Chunk chunk;
+            const auto add = [&](const std::string& name, runtime::ColumnValue column) {
+                runtime::ColumnEntry entry;
+                entry.name = name;
+                entry.column = std::make_shared<runtime::ColumnValue>(std::move(column));
+                chunk.columns.push_back(std::move(entry));
+            };
+            add("a", std::move(a));
+            if (nulls) {
+                chunk.columns.back().validity = std::move(a_valid);
+            }
+            add("b", std::move(b));
+            add("c", std::move(c));
+            add("v", std::move(v));
+            chunks.push_back(std::move(chunk));
+        }
+        runtime::ExternRegistry externs;
+        externs.register_chunked_table("cat_code_keys", [&](const runtime::ExternArgs&) {
+            return std::expected<runtime::OperatorPtr, std::string>{
+                std::make_unique<VectorSource>(chunks)};
+        });
+        auto program = parser::parse(
+            "extern fn cat_code_keys() -> DataFrame from \"x.hpp\"; "
+            "cat_code_keys()[select { n = count(), s = sum(v) }, by { a, b, c }];");
+        REQUIRE(program.has_value());
+        auto ir = parser::lower(program.value());
+        REQUIRE(ir.has_value());
+        runtime::ExecutionContext parallel;
+        parallel.parallel_threads = 8;
+        parallel.parallel_min_rows = 0;
+        const runtime::TableRegistry registry;
+        const auto code_only_before = runtime::code_only_key_columns().load();
+        const auto p =
+            runtime::interpret(*ir.value(), registry, nullptr, &externs, nullptr, parallel);
+        INFO((p.has_value() ? std::string{} : p.error()));
+        REQUIRE(p.has_value());
+        // Guards the test: the key store really held codes alone (a and b).
+        CHECK(runtime::code_only_key_columns().load() >= code_only_before + 2);
+        const auto* pa = p->find_entry("a");
+        REQUIRE(pa != nullptr);
+        const auto& a_out = std::get<Column<Categorical>>(*pa->column);
+        const auto& b_out = std::get<Column<Categorical>>(*p->find("b"));
+        const auto& c_out = std::get<Column<std::int64_t>>(*p->find("c"));
+        const auto& pn = std::get<Column<std::int64_t>>(*p->find("n"));
+        REQUIRE(p->rows() == order.size());
+        const auto& ps = std::get<Column<std::int64_t>>(*p->find("s"));
+        for (std::size_t g = 0; g < order.size(); ++g) {
+            INFO("group " << g);
+            const std::string got =
+                (runtime::is_null(*pa, g) ? std::string("null") : std::string(a_out[g])) + "|" +
+                std::string(b_out[g]) + "|" + std::to_string(c_out[g]);
+            REQUIRE(got == order[g]);
+            const auto& [n, sum] = want.at(order[g]);
+            REQUIRE(pn[g] == n);
+            REQUIRE(ps[g] == sum);
+        }
+    }
+}

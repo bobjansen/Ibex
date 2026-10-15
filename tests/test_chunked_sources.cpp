@@ -1656,6 +1656,145 @@ TEST_CASE("one-core aggregate: partitions discovery only for a mostly distinct k
     }
 }
 
+TEST_CASE("packed group-by keys: nullable key columns keep the packed path",
+          "[runtime][chunked][aggregate][parallel]") {
+    // h2o q10 on its 5%-NA data: every key column has a validity bitmap, which
+    // used to send the whole key to the generic path. Each nullable column
+    // now keeps a null cell in the packed key. A Categorical, a String and
+    // two Int64 keys, each null on its own rows with a payload that is a real
+    // value elsewhere -- so a packer that read the payload would merge a null
+    // group into a value's. Checked against a grouping computed here, in
+    // first-occurrence order, serially and fanned out, whole and in chunks.
+    constexpr std::size_t kRows = 300'000;
+    const std::vector<std::string> labels{"p", "q", "r", "s", "t"};
+    Column<Categorical>::codes_storage codes;
+    Column<std::string> s;
+    Column<std::int64_t> a;
+    Column<std::int64_t> b;
+    Column<std::int64_t> q;
+    runtime::ValidityBitmap c_valid;
+    runtime::ValidityBitmap s_valid;
+    runtime::ValidityBitmap a_valid;
+    runtime::ValidityBitmap b_valid;
+    using Cell = std::optional<std::int64_t>;
+    using Key = std::tuple<Cell, std::optional<std::string>, Cell, Cell>;
+    std::vector<Key> order;
+    std::map<Key, std::pair<std::int64_t, std::int64_t>> sums;  // count, total
+    for (std::size_t i = 0; i < kRows; ++i) {
+        const std::size_t k = (i * 7919) % 60'001;
+        const auto cv = static_cast<std::int64_t>(k % 5);
+        const std::string sv = "s" + std::to_string(k % 101);
+        const auto av = static_cast<std::int64_t>(k % 7) - 3;
+        const auto bv = static_cast<std::int64_t>(k / 5) * 1'000;
+        const bool c_ok = i % 19 != 3;
+        const bool s_ok = i % 23 != 5;
+        const bool a_ok = i % 29 != 7;
+        const bool b_ok = i % 31 != 11;
+        const auto qv = static_cast<std::int64_t>(i % 97);
+        codes.push_back(static_cast<Column<Categorical>::code_type>(cv));
+        s.push_back(sv);
+        a.push_back(av);
+        b.push_back(bv);
+        q.push_back(qv);
+        c_valid.push_back(c_ok);
+        s_valid.push_back(s_ok);
+        a_valid.push_back(a_ok);
+        b_valid.push_back(b_ok);
+        const Key key{c_ok ? Cell{cv} : std::nullopt,
+                      s_ok ? std::optional<std::string>{sv} : std::nullopt,
+                      a_ok ? Cell{av} : std::nullopt, b_ok ? Cell{bv} : std::nullopt};
+        auto [it, inserted] = sums.emplace(key, std::pair<std::int64_t, std::int64_t>{0, 0});
+        if (inserted) {
+            order.push_back(key);
+        }
+        ++it->second.first;
+        it->second.second += qv;
+    }
+    runtime::Table t;
+    t.add_column("c", Column<Categorical>(labels, std::move(codes)));
+    t.columns.back().validity = std::move(c_valid);
+    t.add_column("s", std::move(s));
+    t.columns.back().validity = std::move(s_valid);
+    t.add_column("a", std::move(a));
+    t.columns.back().validity = std::move(a_valid);
+    t.add_column("b", std::move(b));
+    t.columns.back().validity = std::move(b_valid);
+    t.add_column("q", std::move(q));
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto program = parser::parse("t[select { total = sum(q), n = count() }, by { c, s, a, b }];");
+    REQUIRE(program.has_value());
+    auto ir = parser::lower(program.value());
+    REQUIRE(ir.has_value());
+
+    const auto check = [&](const runtime::Table& out) {
+        REQUIRE(out.rows() == order.size());
+        const auto* oc = out.find_entry("c");
+        const auto* os = out.find_entry("s");
+        const auto* oa = out.find_entry("a");
+        const auto* ob = out.find_entry("b");
+        REQUIRE(oc != nullptr);
+        REQUIRE(os != nullptr);
+        REQUIRE(oa != nullptr);
+        REQUIRE(ob != nullptr);
+        const auto& cc = std::get<Column<Categorical>>(*oc->column);
+        const auto& sc = std::get<Column<std::string>>(*os->column);
+        const auto& ac = std::get<Column<std::int64_t>>(*oa->column);
+        const auto& bc = std::get<Column<std::int64_t>>(*ob->column);
+        const auto& ot = std::get<Column<std::int64_t>>(*out.find("total"));
+        const auto& on = std::get<Column<std::int64_t>>(*out.find("n"));
+        for (std::size_t g = 0; g < order.size(); ++g) {
+            INFO("group " << g);
+            const auto& [kc, ks, ka, kb] = order[g];
+            REQUIRE(runtime::is_null(*oc, g) == !kc.has_value());
+            if (kc) {
+                REQUIRE(std::string(cc[g]) == labels[static_cast<std::size_t>(*kc)]);
+            }
+            REQUIRE(runtime::is_null(*os, g) == !ks.has_value());
+            if (ks) {
+                REQUIRE(std::string(sc[g]) == *ks);
+            }
+            REQUIRE(runtime::is_null(*oa, g) == !ka.has_value());
+            if (ka) {
+                REQUIRE(ac[g] == *ka);
+            }
+            REQUIRE(runtime::is_null(*ob, g) == !kb.has_value());
+            if (kb) {
+                REQUIRE(bc[g] == *kb);
+            }
+            REQUIRE(on[g] == sums.at(order[g]).first);
+            REQUIRE(ot[g] == sums.at(order[g]).second);
+        }
+    };
+
+    for (const bool chunked : {false, true}) {
+        INFO("chunked: " << chunked);
+        std::optional<ChunkGrainGuard> guard;
+        if (chunked) {
+            guard.emplace("20000");
+        }
+        runtime::ExecutionContext serial;
+        serial.parallel_threads = 1;
+        runtime::ExecutionContext parallel;
+        parallel.parallel_threads = 8;
+        parallel.parallel_min_rows = 0;
+        const auto packed_before = runtime::packed_nullable_key_chunks().load();
+        const auto sr =
+            runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, serial);
+        const auto pr =
+            runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+        INFO((sr.has_value() ? std::string{} : sr.error()));
+        REQUIRE(sr.has_value());
+        INFO((pr.has_value() ? std::string{} : pr.error()));
+        REQUIRE(pr.has_value());
+        // Guards the test: the nullable key really stayed on the packed path.
+        CHECK(runtime::packed_nullable_key_chunks().load() > packed_before);
+        check(*sr);
+        check(*pr);
+    }
+}
+
 TEST_CASE("chunked aggregate: a narrow-span Int64 key groups through a dense array",
           "[runtime][chunked][aggregate]") {
     // h2o q4's shape: one Int64 key over ~100 distinct values. Its span is a

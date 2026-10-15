@@ -1912,7 +1912,11 @@ class HashAggregateState final {
         // below like any other.
         // The single-int path is the exception: its dense array holds a null
         // group, so `process_rows_int` decides per chunk.
-        if ((cat_fast_path_ || str_fast_path_ || pair_int_fast_path_ || packed_fast_path_) &&
+        // A data-sized packed key keeps a null cell per nullable column, so
+        // only `build_packed_key` below can say whether this chunk's nulls fit.
+        const bool packed_takes_nulls = packed_fast_path_ && encoder_.size_cells_from_data;
+        if ((cat_fast_path_ || str_fast_path_ || pair_int_fast_path_ ||
+             (packed_fast_path_ && !packed_takes_nulls)) &&
             std::ranges::any_of(group_entries, [](const ColumnEntry* entry) {
                 return entry->validity.has_value();
             })) {
@@ -1958,6 +1962,11 @@ class HashAggregateState final {
                 // The shape was packable when the first chunk fixed the path,
                 // so this is an unsupported mid-stream key-layout transition.
                 return "HashAggregateState: group-by key column gained nulls across chunks";
+            }
+            if (std::ranges::any_of(plan->cols, [](const PackedKeyEncoder::PackCol& col) {
+                    return col.valid != nullptr;
+                })) {
+                packed_nullable_key_chunks().fetch_add(1, std::memory_order_relaxed);
             }
             if (plan->width <= sizeof(std::uint64_t)) {
                 return process_rows_packed(group_entries, agg_entries, plan->cols, rows, packed64_);
@@ -9241,6 +9250,11 @@ class ChunkedSortedAggregateOperator final : public Operator {
 };
 
 }  // namespace
+
+auto packed_nullable_key_chunks() -> std::atomic<std::uint64_t>& {
+    static std::atomic<std::uint64_t> count{0};
+    return count;
+}
 
 auto single_core_partitioned_discoveries() -> std::atomic<std::uint64_t>& {
     static std::atomic<std::uint64_t> count{0};

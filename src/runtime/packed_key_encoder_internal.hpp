@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <ibex/core/compiler.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
 #include <algorithm>
@@ -758,7 +759,7 @@ struct PackedKeyEncoder {
                     }
                     constexpr std::size_t kAhead = 16;
                     if (i + kAhead < end) {
-                        __builtin_prefetch(scattered_views[i + kAhead].data());
+                        ::ibex::detail::prefetch(scattered_views[i + kAhead].data());
                     }
                     codes[scattered_rows[i]] = probe(p, scattered_views[i]);
                 }

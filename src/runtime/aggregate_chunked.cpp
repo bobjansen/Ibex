@@ -4541,7 +4541,7 @@ class HashAggregateState final {
                         if constexpr (std::is_same_v<Probe, GenericRowProbe>) {
                             if (i + 32 < part_end) {
                                 const std::size_t ahead = scatter_rows_[i + 32];
-                                __builtin_prefetch(row_hashes_.data() + ahead);
+                                ::ibex::detail::prefetch(row_hashes_.data() + ahead);
                                 prefetch_key_row(*key_at(ahead).cols, ahead, false);
                             }
                             if (i + 16 < part_end) {
@@ -4555,7 +4555,7 @@ class HashAggregateState final {
                         if constexpr (kScatterViews) {
                             constexpr std::size_t kAhead = 16;
                             if (i + kAhead < part_end) {
-                                __builtin_prefetch(scattered_keys[i + kAhead].data());
+                                ::ibex::detail::prefetch(scattered_keys[i + kAhead].data());
                             }
                         }
                         const std::size_t row = scatter_rows_[i];
@@ -7999,31 +7999,31 @@ class HashAggregateState final {
         for (const KeyCol& col : cols) {
             if (text) {
                 if (col.kind == KeyCol::Kind::Str) {
-                    __builtin_prefetch(col.str->chars_data() + col.str->offsets_data()[row]);
+                    ::ibex::detail::prefetch(col.str->chars_data() + col.str->offsets_data()[row]);
                 }
                 continue;
             }
             switch (col.kind) {
                 case KeyCol::Kind::Int64:
-                    __builtin_prefetch(col.i64 + row);
+                    ::ibex::detail::prefetch(col.i64 + row);
                     break;
                 case KeyCol::Kind::Double:
-                    __builtin_prefetch(col.f64 + row);
+                    ::ibex::detail::prefetch(col.f64 + row);
                     break;
                 case KeyCol::Kind::Cat:
-                    __builtin_prefetch(col.cat->codes_data() + row);
+                    ::ibex::detail::prefetch(col.cat->codes_data() + row);
                     break;
                 case KeyCol::Kind::Str:
-                    __builtin_prefetch(col.str->offsets_data() + row);
+                    ::ibex::detail::prefetch(col.str->offsets_data() + row);
                     break;
                 case KeyCol::Kind::Date:
-                    __builtin_prefetch(col.date + row);
+                    ::ibex::detail::prefetch(col.date + row);
                     break;
                 case KeyCol::Kind::Ts:
-                    __builtin_prefetch(col.ts + row);
+                    ::ibex::detail::prefetch(col.ts + row);
                     break;
                 case KeyCol::Kind::Dec:
-                    __builtin_prefetch(col.dec + row);
+                    ::ibex::detail::prefetch(col.dec + row);
                     break;
                 case KeyCol::Kind::Bool:
                     break;

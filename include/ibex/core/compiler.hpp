@@ -16,3 +16,26 @@
 #define IBEX_ALWAYS_INLINE
 #define IBEX_NOINLINE
 #endif
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#endif
+
+namespace ibex::detail {
+
+/// A read-prefetch hint for the cache line holding `addr`, into every cache
+/// level: GCC/Clang's `__builtin_prefetch` default, and MSVC's intrinsics for
+/// the same instruction (`prefetcht0` on x86/x64, `prfm pldl1keep` on ARM64).
+inline void prefetch(const void* addr) noexcept {
+#if defined(__clang__) || defined(__GNUC__)
+    __builtin_prefetch(addr);
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_prefetch(static_cast<const char*>(addr), _MM_HINT_T0);
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+    __prefetch(addr);
+#else
+    (void)addr;
+#endif
+}
+
+}  // namespace ibex::detail

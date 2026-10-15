@@ -97,6 +97,10 @@ struct PackedKeyEncoder {
         const Column<Categorical>* cat = nullptr;
         const std::uint32_t* remap = nullptr;  ///< local code -> operator-global id
         const std::uint32_t* codes = nullptr;  ///< Str: each row's interned id
+        /// Set when the column may hold nulls; a null row packs as `null_cell`,
+        /// a value no non-null row of the column can take.
+        const ValidityBitmap* valid = nullptr;
+        std::uint64_t null_cell = 0;
         unsigned shift = 0;  ///< bit offset of this column's cell in the packed key
         /// Subtracted (wrapping) from an Int64/Ts/Date value to form its cell.
         /// Zero unless cells are sized from the data, in which case it is the
@@ -170,8 +174,9 @@ struct PackedKeyEncoder {
     };
 
     /// A key is packable iff every column reduces to a fixed-width INTEGRAL cell
-    /// whose byte equality equals value equality, with no nulls, and the columns
-    /// together fit in 32 bytes.
+    /// whose byte equality equals value equality, and the columns together fit
+    /// in 32 bytes. Nulls only when cells are sized from the data: a nullable
+    /// column then keeps its cell's top value for null (see `CellLayout`).
     ///
     /// Doubles are excluded (-0.0/NaN break byte equality). Categoricals ARE
     /// included: their dictionary is interned once per chunk into
@@ -182,27 +187,26 @@ struct PackedKeyEncoder {
     auto build_packed_key(const std::vector<const ColumnEntry*>& entries)
         -> std::optional<PackedPlan> {
         layout_miss_ = false;
+        if (size_cells_from_data) {
+            return build_ranged_layout(entries);
+        }
         for (const auto* entry : entries) {
             if (entry->validity.has_value()) {
                 return std::nullopt;
             }
         }
-        if (size_cells_from_data) {
-            return build_ranged_layout(entries);
-        }
         return build_packed_layout(entries);
     }
 
-    /// The shape half of `build_packed_key`: every column is a packable kind
-    /// and none carries nulls. Admits String, so it is for a caller that sizes
+    /// The shape half of `build_packed_key`: every column is a packable kind.
+    /// Admits String and nullable columns, so it is for a caller that sizes
     /// cells from the data and runs `intern_strings`. Touches no state, so it can probe a chunk
     /// without fixing a data-sized layout from it.
     [[nodiscard]] static auto packable_shape(const std::vector<const ColumnEntry*>& entries)
         -> bool {
         return std::ranges::all_of(entries, [](const ColumnEntry* entry) {
             const ColumnValue& column = *entry->column;
-            return !entry->validity.has_value() &&
-                   (std::holds_alternative<Column<std::int64_t>>(column) ||
+            return (std::holds_alternative<Column<std::int64_t>>(column) ||
                     std::holds_alternative<Column<Date>>(column) ||
                     std::holds_alternative<Column<Timestamp>>(column) ||
                     std::holds_alternative<Column<bool>>(column) ||
@@ -309,9 +313,16 @@ struct PackedKeyEncoder {
     }
 
     /// One column's fixed cell: its width and the bottom of its value window.
+    ///
+    /// A column the first chunk saw nullable keeps the cell's top value,
+    /// all ones, for null: its values must stay below it, so it costs at most
+    /// one more bit, and it never grows to 64 bits, where no value is spare.
+    /// h2o's 5%-NA q10 has a validity bitmap on every key column; without
+    /// this it ran the generic path at 4.9x Polars.
     struct CellLayout {
         unsigned bits = 0;
         std::int64_t lo = 0;  ///< window bottom; ids for Cat, unused for Bool
+        bool nullable = false;
     };
 
     /// What one chunk holds in a column, in the terms its cell is sized by.
@@ -325,41 +336,59 @@ struct PackedKeyEncoder {
         return kind == PackCol::Kind::Cat || kind == PackCol::Kind::Str;
     }
 
-    [[nodiscard]] static constexpr auto cell_cap(PackCol::Kind kind) -> unsigned {
+    [[nodiscard]] static constexpr auto cell_cap(PackCol::Kind kind, bool nullable) -> unsigned {
         switch (kind) {
             case PackCol::Kind::Int64:
             case PackCol::Kind::Ts:
-                return 64U;
+                return nullable ? 63U : 64U;
             case PackCol::Kind::Date:
             case PackCol::Kind::Cat:
             case PackCol::Kind::Str:
                 return 32U;
             case PackCol::Kind::Bool:
-                return 1U;
+                return nullable ? 2U : 1U;
         }
         return 0U;
     }
 
+    /// The largest cell a value may take: the cell's top value is null's when
+    /// the column is nullable.
+    [[nodiscard]] static auto value_room(unsigned bits, bool nullable) -> std::uint64_t {
+        const std::uint64_t mask = bits >= 64U ? ~std::uint64_t{0} : (std::uint64_t{1} << bits) - 1;
+        return nullable ? mask - 1 : mask;
+    }
+
+    /// The range of the non-null values; {0, 0} when there are none. A null
+    /// row's payload is whatever the column holds there, so it must not
+    /// widen the window.
     template <typename T, typename Get>
-    [[nodiscard]] static auto observe_range(const T* data, std::size_t n, Get get) -> Observed {
-        if (n == 0) {
-            return {};
+    [[nodiscard]] static auto observe_range(const T* data, std::size_t n, Get get,
+                                            const ValidityBitmap* valid) -> Observed {
+        std::int64_t lo = std::numeric_limits<std::int64_t>::max();
+        std::int64_t hi = std::numeric_limits<std::int64_t>::min();
+        if (valid == nullptr) {
+            for (std::size_t i = 0; i < n; ++i) {
+                const std::int64_t v = get(data[i]);
+                lo = std::min(lo, v);
+                hi = std::max(hi, v);
+            }
+        } else {
+            for (std::size_t i = 0; i < n; ++i) {
+                if ((*valid)[i]) {
+                    const std::int64_t v = get(data[i]);
+                    lo = std::min(lo, v);
+                    hi = std::max(hi, v);
+                }
+            }
         }
-        std::int64_t lo = get(data[0]);
-        std::int64_t hi = lo;
-        for (std::size_t i = 1; i < n; ++i) {
-            const std::int64_t v = get(data[i]);
-            lo = std::min(lo, v);
-            hi = std::max(hi, v);
-        }
-        return {.min = lo, .max = hi};
+        return lo > hi ? Observed{} : Observed{.min = lo, .max = hi};
     }
 
     /// Smallest window of `bits` bits that holds `[seen.min, seen.max]`,
     /// centred on it and kept inside the kind's own value range so the
     /// fit check can compare signed values directly.
-    [[nodiscard]] static auto place_window(PackCol::Kind kind, unsigned bits, const Observed& seen)
-        -> std::int64_t {
+    [[nodiscard]] static auto place_window(PackCol::Kind kind, unsigned bits, bool nullable,
+                                           const Observed& seen) -> std::int64_t {
         if (is_id(kind) || kind == PackCol::Kind::Bool || bits >= 64U) {
             return is_id(kind) || kind == PackCol::Kind::Bool ? 0 : seen.min;
         }
@@ -368,7 +397,7 @@ struct PackedKeyEncoder {
                                    : std::numeric_limits<std::int64_t>::min();
         const auto ceil = is_date ? std::int64_t{std::numeric_limits<std::int32_t>::max()}
                                   : std::numeric_limits<std::int64_t>::max();
-        const std::uint64_t mask = (std::uint64_t{1} << bits) - 1;
+        const std::uint64_t mask = value_room(bits, nullable);
         const std::uint64_t span =
             static_cast<std::uint64_t>(seen.max) - static_cast<std::uint64_t>(seen.min);
         const std::uint64_t below_room =
@@ -386,7 +415,7 @@ struct PackedKeyEncoder {
         if (kind == PackCol::Kind::Bool || cell.bits >= 64U) {
             return true;
         }
-        const std::uint64_t mask = (std::uint64_t{1} << cell.bits) - 1;
+        const std::uint64_t mask = value_room(cell.bits, cell.nullable);
         if (is_id(kind)) {
             return static_cast<std::uint64_t>(seen.max) <= mask;
         }
@@ -403,11 +432,21 @@ struct PackedKeyEncoder {
         unsigned total = 0;
         for (std::size_t k = 0; k < cols.size(); ++k) {
             const auto kind = cols[k].kind;
+            const bool nullable = cols[k].valid != nullptr;
             const std::uint64_t span = is_id(kind) ? static_cast<std::uint64_t>(seen[k].max)
                                                    : static_cast<std::uint64_t>(seen[k].max) -
                                                          static_cast<std::uint64_t>(seen[k].min);
+            if (nullable && span == std::numeric_limits<std::uint64_t>::max()) {
+                return false;  // every value taken: none left for null
+            }
+            layout[k].nullable = nullable;
             layout[k].bits =
-                kind == PackCol::Kind::Bool ? 1U : static_cast<unsigned>(std::bit_width(span));
+                kind == PackCol::Kind::Bool
+                    ? cell_cap(kind, nullable)
+                    : static_cast<unsigned>(std::bit_width(nullable ? span + 1 : span));
+            if (layout[k].bits > cell_cap(kind, nullable)) {
+                return false;
+            }
             total += layout[k].bits;
         }
         unsigned word_bits = 0;
@@ -426,7 +465,7 @@ struct PackedKeyEncoder {
         for (bool grew = true; spare != 0 && grew;) {
             grew = false;
             for (std::size_t k = 0; k < cols.size() && spare != 0; ++k) {
-                if (layout[k].bits < cell_cap(cols[k].kind)) {
+                if (layout[k].bits < cell_cap(cols[k].kind, layout[k].nullable)) {
                     ++layout[k].bits;
                     --spare;
                     grew = true;
@@ -434,7 +473,7 @@ struct PackedKeyEncoder {
             }
         }
         for (std::size_t k = 0; k < cols.size(); ++k) {
-            layout[k].lo = place_window(cols[k].kind, layout[k].bits, seen[k]);
+            layout[k].lo = place_window(cols[k].kind, layout[k].bits, layout[k].nullable, seen[k]);
         }
         layout_ = std::move(layout);
         layout_bytes_ = word_bits / 8U;
@@ -453,19 +492,24 @@ struct PackedKeyEncoder {
         for (std::size_t k = 0; k < entries.size(); ++k) {
             PackCol& col = plan.cols[k];
             const ColumnValue& column = *entries[k]->column;
+            const ValidityBitmap* valid =
+                entries[k]->validity.has_value() ? &*entries[k]->validity : nullptr;
+            col.valid = valid;
             if (const auto* c_int = std::get_if<Column<std::int64_t>>(&column)) {
                 col.kind = PackCol::Kind::Int64;
                 col.i64 = c_int->data();
-                seen[k] = observe_range(col.i64, c_int->size(), [](std::int64_t v) { return v; });
+                seen[k] =
+                    observe_range(col.i64, c_int->size(), [](std::int64_t v) { return v; }, valid);
             } else if (const auto* c_date = std::get_if<Column<Date>>(&column)) {
                 col.kind = PackCol::Kind::Date;
                 col.date = c_date->data();
-                seen[k] = observe_range(col.date, c_date->size(),
-                                        [](Date v) { return std::int64_t{v.days}; });
+                seen[k] = observe_range(
+                    col.date, c_date->size(), [](Date v) { return std::int64_t{v.days}; }, valid);
             } else if (const auto* c_ts = std::get_if<Column<Timestamp>>(&column)) {
                 col.kind = PackCol::Kind::Ts;
                 col.ts = c_ts->data();
-                seen[k] = observe_range(col.ts, c_ts->size(), [](Timestamp v) { return v.nanos; });
+                seen[k] =
+                    observe_range(col.ts, c_ts->size(), [](Timestamp v) { return v.nanos; }, valid);
             } else if (const auto* c_bool = std::get_if<Column<bool>>(&column)) {
                 col.kind = PackCol::Kind::Bool;
                 col.boolean = c_bool;
@@ -504,7 +548,9 @@ struct PackedKeyEncoder {
             }
         } else {
             for (std::size_t k = 0; k < plan.cols.size(); ++k) {
-                if (!fits(plan.cols[k].kind, layout_[k], seen[k])) {
+                // A column the first chunk saw without nulls has no null cell.
+                if (!fits(plan.cols[k].kind, layout_[k], seen[k]) ||
+                    (plan.cols[k].valid != nullptr && !layout_[k].nullable)) {
                     layout_miss_ = true;
                     return std::nullopt;
                 }
@@ -514,6 +560,7 @@ struct PackedKeyEncoder {
         for (std::size_t k = 0; k < plan.cols.size(); ++k) {
             plan.cols[k].shift = shift;
             plan.cols[k].offset = static_cast<std::uint64_t>(layout_[k].lo);
+            plan.cols[k].null_cell = value_room(layout_[k].bits, false);
             shift += layout_[k].bits;
         }
         plan.width = layout_bytes_;
@@ -593,7 +640,9 @@ struct PackedKeyEncoder {
         }
         for (std::size_t k = 0; k < entries.size(); ++k) {
             const auto* column = std::get_if<Column<std::string>>(&*entries[k]->column);
-            if (column == nullptr || entries[k]->validity.has_value()) {
+            // A nullable column is interned whole: a null row's payload gets
+            // an id like any string, and the packer never reads it.
+            if (column == nullptr) {
                 continue;
             }
             auto& state = str_interns_[k];
@@ -729,28 +778,34 @@ struct PackedKeyEncoder {
         Packed key{};
         for (const auto& col : cols) {
             std::uint64_t cell = 0;
-            switch (col.kind) {
-                case PackCol::Kind::Int64:
-                    cell = static_cast<std::uint64_t>(col.i64[row]) - col.offset;
-                    break;
-                case PackCol::Kind::Date:
-                    // Wraps in 32 bits, so a zero offset is the plain code.
-                    cell =
-                        static_cast<std::uint32_t>(static_cast<std::uint32_t>(col.date[row].days) -
-                                                   static_cast<std::uint32_t>(col.offset));
-                    break;
-                case PackCol::Kind::Ts:
-                    cell = static_cast<std::uint64_t>(col.ts[row].nanos) - col.offset;
-                    break;
-                case PackCol::Kind::Bool:
-                    cell = (*col.boolean)[row] ? 1U : 0U;
-                    break;
-                case PackCol::Kind::Cat:
-                    cell = col.remap[static_cast<std::size_t>(col.cat->code_at(row))];
-                    break;
-                case PackCol::Kind::Str:
-                    cell = col.codes[row];
-                    break;
+            // Checked first: a null row's payload is not a value to read (a
+            // Categorical null's code need not index the remap).
+            if (col.valid != nullptr && !(*col.valid)[row]) {
+                cell = col.null_cell;
+            } else {
+                switch (col.kind) {
+                    case PackCol::Kind::Int64:
+                        cell = static_cast<std::uint64_t>(col.i64[row]) - col.offset;
+                        break;
+                    case PackCol::Kind::Date:
+                        // Wraps in 32 bits, so a zero offset is the plain code.
+                        cell = static_cast<std::uint32_t>(
+                            static_cast<std::uint32_t>(col.date[row].days) -
+                            static_cast<std::uint32_t>(col.offset));
+                        break;
+                    case PackCol::Kind::Ts:
+                        cell = static_cast<std::uint64_t>(col.ts[row].nanos) - col.offset;
+                        break;
+                    case PackCol::Kind::Bool:
+                        cell = (*col.boolean)[row] ? 1U : 0U;
+                        break;
+                    case PackCol::Kind::Cat:
+                        cell = col.remap[static_cast<std::size_t>(col.cat->code_at(row))];
+                        break;
+                    case PackCol::Kind::Str:
+                        cell = col.codes[row];
+                        break;
+                }
             }
             if constexpr (std::is_same_v<Packed, std::uint64_t>) {
                 key |= cell << col.shift;

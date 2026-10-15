@@ -336,3 +336,127 @@ TEST_CASE("data-sized packed key reads a shared Categorical dictionary's codes a
     CHECK(key_d != key_b);
     CHECK(key_d != key_c);
 }
+
+namespace {
+
+auto with_nulls(runtime::ColumnEntry entry, std::vector<bool> valid) -> runtime::ColumnEntry {
+    runtime::ValidityBitmap bitmap;
+    for (const bool v : valid) {
+        bitmap.push_back(v);
+    }
+    entry.validity = std::move(bitmap);
+    return entry;
+}
+
+}  // namespace
+
+TEST_CASE("data-sized packed key gives a nullable column a null cell of its own", "[packed_key]") {
+    // Every column nullable, of every id and value kind. Row r is null in
+    // column r % 4 only (and row 8 in none), so each null must pack apart
+    // from every value, from the other columns' nulls, and from a value at
+    // the very top of its window. A null row's payload is garbage -- here
+    // the extremes -- and must neither widen the window nor be read.
+    constexpr auto big = std::numeric_limits<std::int64_t>::max();
+    std::vector<runtime::ColumnEntry> cols;
+    cols.push_back(with_nulls(int_entry({big, 1, 2, 3, 0, 1, 2, 3, 3}),
+                              {false, true, true, true, false, true, true, true, true}));
+    cols.push_back(with_nulls(cat_entry({"a", "b", "c", "d"}, {0, 3, 1, 2, 0, 0, 1, 2, 3}),
+                              {true, false, true, true, true, false, true, true, true}));
+    cols.push_back(with_nulls(str_entry({"x", "y", "", "z", "x", "y", "never", "z", "z"}),
+                              {true, true, false, true, true, true, false, true, true}));
+    cols.push_back(with_nulls(date_entry({0, 1, 2, -2'000'000'000, 0, 1, 2, 7, 3}),
+                              {true, true, true, false, true, true, true, false, true}));
+    for (const std::size_t parts : {std::size_t{1}, std::size_t{4}}) {
+        INFO("parts " << parts);
+        auto encoder = ranged_encoder();
+        encoder.intern_strings(ptrs(cols), parts, 1, inline_run);
+        auto plan = encoder.build_packed_key(ptrs(cols));
+        REQUIRE(plan.has_value());
+        // The garbage payloads did not stretch the Int64 or Date windows.
+        CHECK(plan->width == sizeof(std::uint64_t));
+        std::set<std::uint64_t> keys;
+        for (std::size_t row = 0; row < 4; ++row) {
+            keys.insert(PackedKeyEncoder::pack_row<std::uint64_t>(plan->cols, row));
+        }
+        CHECK(keys.size() == 4);
+        // Rows 4..7 repeat rows 0..3's tuples with different payloads under
+        // each null: the same keys.
+        for (std::size_t row = 4; row < 8; ++row) {
+            INFO("row " << row);
+            CHECK(PackedKeyEncoder::pack_row<std::uint64_t>(plan->cols, row) ==
+                  PackedKeyEncoder::pack_row<std::uint64_t>(plan->cols, row - 4));
+        }
+        // Row 8 has no null and its top-of-range values: a fifth key.
+        CHECK_FALSE(keys.contains(PackedKeyEncoder::pack_row<std::uint64_t>(plan->cols, 8)));
+    }
+}
+
+TEST_CASE("data-sized packed key keeps a nullable cell's top value for null", "[packed_key]") {
+    // Values 0..2 need 2 bits, and their top value 3 is null's when the column
+    // is nullable: 3 must not pack like null.
+    std::vector<runtime::ColumnEntry> cols;
+    cols.push_back(with_nulls(int_entry({0, 1, 2, 9}), {true, true, true, false}));
+    cols.push_back(int_entry({0, 0, 0, 0}));
+    cols.push_back(int_entry({0, 0, 0, 0}));
+    auto encoder = ranged_encoder();
+    REQUIRE(encoder.build_packed_key(ptrs(cols)).has_value());
+    std::vector<runtime::ColumnEntry> later;
+    later.push_back(with_nulls(int_entry({3, 0}), {true, false}));
+    later.push_back(int_entry({0, 0}));
+    later.push_back(int_entry({0, 0}));
+    auto plan = encoder.build_packed_key(ptrs(later));
+    if (plan.has_value()) {
+        CHECK(PackedKeyEncoder::pack_row<std::uint64_t>(plan->cols, 0) !=
+              PackedKeyEncoder::pack_row<std::uint64_t>(plan->cols, 1));
+    } else {
+        CHECK(encoder.layout_miss());
+    }
+}
+
+TEST_CASE("data-sized packed key misses on nulls the layout has no cell for", "[packed_key]") {
+    SECTION("a column the first chunk saw without nulls") {
+        auto encoder = ranged_encoder();
+        std::vector<runtime::ColumnEntry> first;
+        first.push_back(int_entry({0, 1}));
+        first.push_back(int_entry({0, 1}));
+        first.push_back(int_entry({0, 1}));
+        REQUIRE(encoder.build_packed_key(ptrs(first)).has_value());
+        std::vector<runtime::ColumnEntry> later;
+        later.push_back(with_nulls(int_entry({0, 1}), {true, false}));
+        later.push_back(int_entry({0, 1}));
+        later.push_back(int_entry({0, 1}));
+        CHECK_FALSE(encoder.build_packed_key(ptrs(later)).has_value());
+        CHECK(encoder.layout_miss());
+    }
+    SECTION("a nullable Int64 whose values take every bit pattern") {
+        auto encoder = ranged_encoder();
+        std::vector<runtime::ColumnEntry> cols;
+        cols.push_back(with_nulls(int_entry({std::numeric_limits<std::int64_t>::min(),
+                                             std::numeric_limits<std::int64_t>::max(), 0}),
+                                  {true, true, false}));
+        cols.push_back(int_entry({0, 0, 0}));
+        cols.push_back(int_entry({0, 0, 0}));
+        CHECK_FALSE(encoder.build_packed_key(ptrs(cols)).has_value());
+        CHECK(encoder.layout_miss());
+    }
+}
+
+TEST_CASE("data-sized packed key sizes a nullable cell one past its values", "[packed_key]") {
+    // 41 + 21 bits of Int64 span fill 62 of a 64-bit word, so no spare bit can
+    // rescue the nullable column: values 0..3 need 2 bits, and their top value
+    // 3 would be null's. Sized one past them, 3 and null pack apart.
+    std::vector<runtime::ColumnEntry> cols;
+    cols.push_back(with_nulls(int_entry({0, 3, 0}), {true, true, false}));
+    cols.push_back(int_entry({0, std::int64_t{1} << 40, std::int64_t{1} << 40}));
+    cols.push_back(int_entry({0, std::int64_t{1} << 20, std::int64_t{1} << 20}));
+    auto encoder = ranged_encoder();
+    auto plan = encoder.build_packed_key(ptrs(cols));
+    REQUIRE(plan.has_value());
+    REQUIRE(plan->width == sizeof(PackedKeyEncoder::Packed128));
+    const auto key = [&](std::size_t row) {
+        const auto packed =
+            PackedKeyEncoder::pack_row<PackedKeyEncoder::Packed128>(plan->cols, row);
+        return std::pair{packed.w[0], packed.w[1]};
+    };
+    CHECK(key(1) != key(2));
+}

@@ -28,6 +28,11 @@ namespace ibex::runtime {
 /// `ParallelPipelineStats::parallel_aggregate_partitions`. For tests.
 [[nodiscard]] auto single_core_partitioned_discoveries() -> std::atomic<std::uint64_t>&;
 
+/// How many chunks, process-wide, an aggregate grouped on its packed key
+/// while some key column carried a validity bitmap. For tests: the generic
+/// path gives the same answer, so only this tells the two apart.
+[[nodiscard]] auto packed_nullable_key_chunks() -> std::atomic<std::uint64_t>&;
+
 /// Construct the adaptive sorted/hash aggregate implementation. Kept as one
 /// factory boundary so the complete aggregate family can live in its own
 /// translation unit without exposing its state types to the pipeline builder.

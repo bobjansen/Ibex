@@ -24,6 +24,89 @@ pull the results back as a CSV. Three layers:
 All scripts read `S3_BUCKET` / `AWS_REGION` / `IBEX_AMI` from `.config` (written
 by `setup.sh` and `build-ami.sh`); override via env or `--region`.
 
+## Published benchmark snapshot
+
+The [benchmark page](../../docs/benchmarks.html) combines three runs, each
+with its own timing boundary and provenance:
+
+| Suite | Measured | Ibex commit | Machine and budget | Timing |
+|---|---|---|---|---|
+| In-memory DataFrame | 2026-10-12 | `ffeb07ad` | r7i.2xlarge, 64 GiB; separate identical instance per engine; 8 vCPUs on 4 physical cores, SMT on; default engine thread budgets, plus single-thread variants | Load once, excluded; full result materialisation; mean of 5 iterations after 1 warmup |
+| H2O, 10M rows | 2026-10-16 | `9c99d03b` | One r7i.4xlarge, Xeon Platinum 8488C, 128 GiB; SMT off; all engines pinned to the same 1 or 8 physical cores | Load once, excluded; full result materialisation; minimum of 5 iterations after 1 warmup |
+| PDS-H, SF10 | 2026-10-16 | `9c99d03b` | One r7i.4xlarge, Xeon Platinum 8488C, 128 GiB; SMT off; all engines pinned to the same 1, 2 or 8 physical cores | Parquet reads included in each query; full result materialisation; mean of 5 iterations after 1 warmup |
+
+H2O and PDS-H use Polars **2.0.0** (streaming) and DuckDB **1.5.4**.
+PDS-H pins upstream `pola-rs/polars-benchmark` at `401908a307f1`;
+H2O pins `duckdblabs/db-benchmark` at `3b074bc319`. H2O checks row counts
+and upstream checksum sums across engines; PDS-H checks all 22 Ibex answers
+against Polars at the measured scale before timing. The PDS-H per-run
+manifests record `dirty: true`; retain those manifests with the result when
+citing the run rather than describing it as a verified clean checkout.
+The in-memory CSV and launch manifest do not retain competitor package versions.
+
+Source artifacts, under `benchmarking/results/`:
+
+- `scales_aws_20261012T184009.csv` and its `.manifest.json`.
+- `h2o_aws_20261016T074103.tar.gz` (samples, checks and `versions.txt`).
+- `tpch_aws_20261016T060314.tar.gz` (samples, per-run manifests and `versions.txt`).
+
+Report geometric means **and** ratios of total query times. The former gives
+equal weight to multiplicative differences per question; the latter gives
+more weight to long-running queries. The total is a sum of measured query
+times, excluding provisioning, builds and untimed setup. Read individual
+queries alongside both: summaries compress wins as well as losses.
+
+For example, at 8 physical cores (times in ms):
+
+| Suite / question | Ibex | Polars | DuckDB |
+|---|---:|---:|---:|
+| H2O K=100, q1 (sum by id1) | 2.505 | 7.916 | 3.266 |
+| H2O K=100, q6 (median and stddev) | 162.82 | 105.69 | 111.15 |
+| H2O K=2, q8 (top two per group) | 870.48 | 4167.26 | 211.11 |
+| H2O join q5 (big inner join) | 333.953 | 197.452 | 446.076 |
+| PDS-H q02 | 58.02 | 62.28 | 109.81 |
+| PDS-H q04 | 282.40 | 158.51 | 226.34 |
+
+Across all PDS-H queries at 8 cores, Ibex/Polars is **1.20 geometric mean,
+1.22 total**; Ibex/DuckDB is **0.94 geometric mean, 0.96 total**. H2O's
+8-core joins are **0.99 geometric mean, 1.40 total** against Polars.
+The [H2O README](../h2o/README.md) lists every dataset's summaries at both
+core counts; the website exposes every query.
+
+### Reproduce the published configurations
+
+Use a separate clone checked out at the indicated Ibex commit. Complete the
+[one-time AWS setup](#1-one-time-setup) first. These commands launch paid EC2
+instances and download new measurements; exact times will vary. Dependencies
+are resolved by each revision's harness and AMI, so compare its recorded
+versions with the snapshot above.
+
+At `ffeb07ad`:
+
+```bash
+./benchmarking/aws/run-per-engine.sh --on-demand --type r7i.2xlarge \
+    --sizes 1M,2M,4M,8M,16M,32M,50M --warmup 1 --iters 5
+```
+
+At `9c99d03b`:
+
+```bash
+./benchmarking/aws/run-h2o.sh --on-demand --type r7i.4xlarge \
+    --threads-per-core 1 --cores 1,8 --warmup 1 --iters 5
+./benchmarking/aws/run-tpch.sh --on-demand --type r7i.4xlarge \
+    --sf 10 --threads-per-core 1 --cores 1,2,8 --warmup 1 --iters 5
+```
+
+To regenerate the published pages from the existing artifacts, from the
+repository root at the current revision:
+
+```bash
+python3 benchmarking/gen_website.py \
+    benchmarking/results/scales_aws_20261012T184009.csv --commit ffeb07ad \
+    --h2o benchmarking/results/h2o_aws_20261016T074103.tar.gz \
+    --pdsh benchmarking/results/tpch_aws_20261016T060314.tar.gz
+```
+
 ## vCPUs are hyperthreads
 
 Read this before quoting a core count. On every current x86 instance family a

@@ -84,14 +84,72 @@ fit on the dev box. Run it on AWS instead.
 Results go to `results/h2o_<stamp>_<T>t.tsv`, one row per (data, question,
 engine), with every timed sample kept.
 
-## Results: 2026-10-15, AWS r7i.4xlarge, 1 and 8 physical cores, 1e7 rows
+## Results: 2026-10-16, AWS r7i.4xlarge, 1 and 8 physical cores, 1e7 rows
+
+Ibex `9c99d03b`, Polars 2.0.0 (streaming), DuckDB 1.5.4, on one clean
+r7i.4xlarge (Xeon Platinum 8488C, 128 GiB), with SMT off and every engine
+pinned to the same 1 or 8 physical cores. All 110 (data, question, core-count)
+comparisons completed and passed the cross-engine row-count/checksum checks
+(330 engine result rows). This is
+the run shown on the website; the artifact is
+`results/h2o_aws_20261016T074103.tar.gz`.
+
+Loading is excluded. Each question fully materialises its result, with 1 warmup
+and 5 timed iterations; these ratios use the minimum times. Below 1 means
+Ibex is faster. Geometric means weight each question equally in ratio space;
+totals compare the sum of question times, so longer questions carry more weight.
+Both wins and losses can appear smaller in either summary than individually.
+
+| data | cores | ibex/polars geomean | ibex/polars total | ibex/duckdb geomean | ibex/duckdb total |
+|---|---:|---:|---:|---:|---:|
+| J1_1e7_NA_0_0 (join) | 1 | 0.86 | 0.84 | 0.15 | 0.22 |
+| G1_1e7_1e2_0_0 | 1 | 0.58 | 0.74 | 0.63 | 0.60 |
+| G1_1e7_1e2_5_0 (NAs) | 1 | 0.51 | 0.66 | 0.59 | 0.58 |
+| G1_1e7_1e2_0_1 (sorted) | 1 | 0.61 | 0.77 | 0.64 | 0.60 |
+| G1_1e7_1e1_0_0 | 1 | 0.56 | 0.73 | 0.66 | 0.65 |
+| G1_1e7_2e0_0_0 | 1 | 0.63 | 0.64 | 0.65 | 0.71 |
+| J1_1e7_NA_0_0 (join) | 8 | 0.99 | 1.40 | 0.19 | 0.37 |
+| G1_1e7_1e2_0_0 | 8 | 0.74 | 0.85 | 0.61 | 0.69 |
+| G1_1e7_1e2_5_0 (NAs) | 8 | 0.73 | 0.89 | 0.67 | 0.76 |
+| G1_1e7_1e2_0_1 (sorted) | 8 | 0.78 | 0.90 | 0.60 | 0.70 |
+| G1_1e7_1e1_0_0 | 8 | 0.88 | 0.53 | 0.92 | 0.79 |
+| G1_1e7_2e0_0_0 | 8 | 0.96 | 0.34 | 1.10 | 1.27 |
+
+- **1 core:** Ibex leads both engines on every dataset by both summaries.
+- **8 cores:** every groupby dataset leads Polars by both summaries. Against
+  DuckDB, every groupby dataset leads except K=2e0. Join q1–q4 beat Polars,
+  while the big join q5 takes 334 ms against 197 ms (1.69×), putting the
+  join total at 1.40 despite a 0.99 geometric mean.
+- **Wins and losses within a dataset:** at K=100, 8 cores, q1 takes
+  2.505 / 7.916 / 3.266 ms (Ibex / Polars / DuckDB), while q6 takes
+  162.82 / 105.69 / 111.15 ms. At K=2, q8 takes
+  870.48 / 4167.26 / 211.11 ms: a substantial win against Polars and a
+  substantial loss against DuckDB.
+- **q10 improved:** the packed categorical-key changes bring its ratio to
+  Polars to 0.83–0.94 at 1 core and 1.36–1.54 at 8 cores, from
+  1.10–1.92 and 2.22–3.16 in the previous AWS run. These are ratios from
+  separate cross-engine runs, rather than an interleaved causal A/B.
+
+To reproduce the configuration, check out `9c99d03b` in a separate clone,
+complete the [AWS setup](../aws/README.md#1-one-time-setup), then run:
+
+```sh
+./benchmarking/aws/run-h2o.sh --on-demand --type r7i.4xlarge \
+    --threads-per-core 1 --cores 1,8 --warmup 1 --iters 5
+```
+
+The runner launches a paid EC2 instance and downloads the result archive.
+See the [publication snapshot and reproduction commands](../aws/README.md#published-benchmark-snapshot)
+for all three suites.
+
+## Previous results: 2026-10-15, AWS r7i.4xlarge, 1 and 8 physical cores, 1e7 rows
 
 Ibex `5ee22b2b`, Polars 2.0.0 (streaming), DuckDB 1.5.4, on one clean
 r7i.4xlarge (Xeon Platinum 8488C) with SMT off, so 8 physical cores; every
 engine pinned to the same cores. Run with `benchmarking/aws/run-h2o.sh
 --on-demand`; the artifact is `results/h2o_aws_20261015T151409.tar.gz`. All
-132 cells completed and passed the cross-engine check. This is the run the
-website shows.
+132 cells completed and passed the cross-engine check. Superseded on the
+website by the 2026-10-16 run above.
 
 | data | 8c ibex/polars geomean | 8c ibex/duckdb geomean | 8c ibex/polars total | 1c ibex/polars geomean | 1c ibex/duckdb geomean | 1c ibex/polars total |
 |---|---:|---:|---:|---:|---:|---:|

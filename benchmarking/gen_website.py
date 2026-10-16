@@ -422,6 +422,14 @@ __BENCHMARK_NAV__
       measured on. Lower is better.
     </p>
     <div class="headline" id="headline"></div>
+    <p class="bench-note">
+      Ratios are Ibex time divided by the other engine's time; below 1 means
+      Ibex is faster. Geometric means weight questions equally in ratio space;
+      totals compare the sum of query times and give longer queries more weight.
+      Both summaries compress individual wins and losses. See the per-query
+      tables and the
+      <a href="__GITHUB__/benchmarking/aws/README.md#published-benchmark-snapshot">run details and reproduction commands</a>.
+    </p>
   </section>
 
   <section class="section" id="inmemory">
@@ -432,6 +440,14 @@ __BENCHMARK_NAV__
       <strong>ClickHouse</strong>, <strong>DataFusion</strong> and
       <strong>data.table</strong> on the same columnar queries, from 1M to __MAXM__M
       rows. Times are the mean of timed iterations.
+    </p>
+    <p class="bench-note">
+      <strong>Published run:</strong> October 12, 2026, Ibex <code>ffeb07ad</code>;
+      separate identical r7i.2xlarge instances per engine, 64 GiB, 8 vCPUs on
+      4 physical cores with SMT on. Engines use their default thread budgets;
+      the <code>-st</code> columns use one thread. One warmup, 5 timed iterations.
+      Competitor package versions were not retained in this run's CSV or launch manifest.
+      <a href="__GITHUB__/benchmarking/aws/README.md#reproduce-the-published-configurations">Reproduce this configuration</a>.
     </p>
     <div class="stats" id="stats"></div>
     <p class="section-sub">
@@ -512,6 +528,7 @@ __BENCHMARK_NAV__
   <section class="section" id="h2o">
     <p class="section-label">Independent benchmark</p>
     <h2>h2o db-benchmark</h2>
+    <p class="bench-note" id="h2o-meta"></p>
     <p class="section-sub">
       The h2oai db-benchmark questions, as maintained by DuckDB Labs
       (<a href="https://github.com/duckdblabs/db-benchmark" target="_blank" rel="noopener">duckdblabs/db-benchmark</a>,
@@ -519,6 +536,11 @@ __BENCHMARK_NAV__
       key cardinalities (K=100, 10 and 2, the last with 5M groups in <code>id3</code>),
       with 5% nulls and pre-sorted variants, and five joins. None of these queries
       or data shapes were written alongside Ibex. Pick a data set and a core count.
+    </p>
+    <p class="bench-note">
+      <strong>Published run:</strong> October 16, 2026, r7i.4xlarge, 128 GiB,
+      SMT off; each engine pinned to the same 1 or 8 physical cores.
+      <a href="__GITHUB__/benchmarking/h2o/README.md#results-2026-10-16-aws-r7i4xlarge-1-and-8-physical-cores-1e7-rows">Dataset summaries and reproduction command</a>.
     </p>
     <p class="bench-note">
       <strong>What this measures.</strong> The data comes from the upstream R
@@ -535,6 +557,7 @@ __BENCHMARK_NAV__
       must agree.
     </p>
     <div class="bench-controls" id="h2o-controls"></div>
+    <p class="bench-note" id="h2o-examples"></p>
     <div class="tablewrap"><table class="bench" id="h2o-tbl"></table></div>
     <p class="bench-note" style="margin-top:1rem">
       The summary rows compare Ibex with each engine over the questions all three
@@ -542,12 +565,12 @@ __BENCHMARK_NAV__
       the totals. Below 1 means Ibex is faster. The harness is
       <a href="__GITHUB__/benchmarking/h2o/run.py" target="_blank" rel="noopener">benchmarking/h2o/run.py</a>.
     </p>
-    <p class="bench-note" id="h2o-meta"></p>
   </section>
 
   <section class="section" id="pdsh">
     <p class="section-label">Independent benchmark</p>
     <h2>PDS-H (TPC-H)</h2>
+    <p class="bench-note" id="pdsh-meta"></p>
     <p class="section-sub">
       Polars' TPC-H-derived benchmark
       (<a href="https://github.com/pola-rs/polars-benchmark" target="_blank" rel="noopener">pola-rs/polars-benchmark</a>):
@@ -562,7 +585,15 @@ __BENCHMARK_NAV__
       benchmarked scale before anything is timed. Times are the mean of 5 timed
       iterations after 1 warmup.
     </p>
+    <p class="bench-note">
+      <strong>Published run:</strong> October 16, 2026, r7i.4xlarge, 128 GiB,
+      SMT off; each engine pinned to the same 1, 2 or 8 physical cores.
+      Upstream revision <code>401908a307f1</code>. Per-run manifests record a
+      dirty working tree; the artifact retains those manifests.
+      <a href="__GITHUB__/benchmarking/aws/README.md#reproduce-the-published-configurations">Reproduce this configuration</a>.
+    </p>
     <div class="bench-controls" id="pdsh-controls"></div>
+    <p class="bench-note" id="pdsh-examples"></p>
     <div class="tablewrap"><table class="bench" id="pdsh-tbl"></table></div>
     <p class="bench-note" style="margin-top:1rem">
       The summary rows compare Ibex with each engine: the geometric mean of the
@@ -570,7 +601,6 @@ __BENCHMARK_NAV__
       faster. The queries are in
       <a href="__GITHUB__/benchmarking/tpch/queries" target="_blank" rel="noopener">benchmarking/tpch/queries</a>.
     </p>
-    <p class="bench-note" id="pdsh-meta"></p>
   </section>
 
 </main>
@@ -731,6 +761,13 @@ function renderSuite(id, suite, state) {
   const el = document.getElementById(id + "-tbl");
   const table = suiteTable(suite, state.sel);
   const engines = suite.engines;
+  const questions = id === "pdsh" ? ["q02", "q04"]
+    : state.sel.data.startsWith("J1") ? ["q1", "q5"] : ["q1", "q6", "q8", "q10"];
+  const examples = questions.filter(q => table && table.cells[q])
+    .map(q => `${q}: ` + engines.filter(e => table.cells[q][e.id] != null)
+      .map(e => `${e.label} ${fmt(table.cells[q][e.id])}`).join(", "));
+  document.getElementById(id + "-examples").innerHTML = examples.length
+    ? "<strong>Selected questions at this setting.</strong> " + examples.join("; ") + "." : "";
   let h = "<thead><tr><th class='qcol'>query</th>" + engines.map(e =>
     `<th class='${e.id === "ibex" ? "ibex" : ""}'>${e.label}</th>`).join("") + "</tr></thead><tbody>";
   if (!table) {
@@ -798,6 +835,12 @@ function initSuite(id, suite, metaHtml) {
 }
 function chip(href, html) { return `<a href='${href}'>${html}</a>`; }
 function fx(v) { return v.toFixed(2) + "×"; }
+function headlineRatios(suite, summary) {
+  return suite.engines.filter(e => summary[e.id]).map(e => {
+    const s = summary[e.id];
+    return `${e.label}: <strong>${fx(s.geo)}</strong> geomean, <strong>${fx(s.total)}</strong> total`;
+  }).join("<br>");
+}
 
 (function initIndependent() {
   const head = [];
@@ -807,8 +850,8 @@ function fx(v) { return v.toFixed(2) + "×"; }
       .filter(([k]) => k.endsWith("|" + cores) && k.startsWith(kind)).map(([, t]) => t);
     for (const [kind, name] of [["G1", "groupby"], ["J1", "join"]]) {
       const s = suiteSummary(H2O, pick(kind));
-      if (s.polars) head.push(chip("#h2o", `h2o ${name} · ${cores} cores<br>Ibex <strong>${fx(s.polars.geo)}</strong> Polars`
-        + (s.duckdb ? `, <strong>${fx(s.duckdb.geo)}</strong> DuckDB` : "") + " (geomean)"));
+      if (s.polars) head.push(chip("#h2o", `h2o ${name} · ${cores} cores · Ibex ÷ engine<br>`
+        + headlineRatios(H2O, s)));
     }
     const v = H2O.meta.versions;
     const ver = Object.entries(v).map(([e, xs]) => `${e} <code>${xs.join(", ")}</code>`).join(", ");
@@ -818,9 +861,8 @@ function fx(v) { return v.toFixed(2) + "×"; }
   if (PDSH) {
     const cores = PDSH.selectors[0].default;
     const s = suiteSummary(PDSH, [PDSH.tables[cores]]);
-    if (s["pdsh-polars-stream"]) head.push(chip("#pdsh", `PDS-H SF-${PDSH.meta.scale_factor} · ${cores} cores<br>`
-      + `Ibex total <strong>${fx(s["pdsh-polars-stream"].total)}</strong> Polars`
-      + (s["pdsh-duckdb"] ? `, <strong>${fx(s["pdsh-duckdb"].total)}</strong> DuckDB` : "")));
+    if (s["pdsh-polars-stream"]) head.push(chip("#pdsh", `PDS-H SF-${PDSH.meta.scale_factor} · ${cores} cores · Ibex ÷ engine<br>`
+      + headlineRatios(PDSH, s)));
     const m = PDSH.meta;
     initSuite("pdsh", PDSH, `SF-${m.scale_factor}` + (m.cpu ? ` · ${m.cpu}` : "")
       + ` · Ibex commit <code>${m.commit}</code> · Polars <code>${m.polars}</code>, DuckDB <code>${m.duckdb}</code>`
@@ -1131,7 +1173,8 @@ def main(argv=None):
         suites.append("PDS-H, Polars' TPC-H-derived benchmark")
     count = {1: "One benchmark", 2: "Two benchmarks", 3: "Three benchmarks"}[len(suites)]
     listed = suites[0] if len(suites) == 1 else ", ".join(suites[:-1]) + " and " + suites[-1]
-    lead = f"{count}, with every engine pinned to the same cores: {listed}."
+    lead = (f"{count}: {listed}. H2O and PDS-H pin every engine to the same cores; "
+            "the in-memory suite uses separate identical instances with default engine thread budgets.")
     out_html = (HTML_TEMPLATE
                 .replace("__BENCHMARK_NAV__", BENCHMARK_NAV)
                 .replace("__PAYLOAD__", json.dumps(payload, separators=(",", ":")))

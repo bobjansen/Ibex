@@ -9,7 +9,7 @@
 import "adbc";
 
 adbc::read(
-    "~/miniforge3/envs/ibex/lib/libadbc_driver_sqlite.so",
+    "~/anaconda3/envs/ibex/lib/libadbc_driver_sqlite.so",
     "/tmp/measurements_1m.sqlite",
     "select station, temp from measurements"
 )[select {

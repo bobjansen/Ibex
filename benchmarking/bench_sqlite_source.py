@@ -17,7 +17,7 @@ the full aggregation down into SQL.
 Usage:
   ./.venv/bin/python benchmarking/bench_sqlite_source.py \
       --sqlite-db /tmp/measurements_1m.sqlite \
-      --driver ~/miniforge3/envs/ibex/lib/libadbc_driver_sqlite.so
+      --driver ~/anaconda3/envs/ibex/lib/libadbc_driver_sqlite.so
 """
 
 from __future__ import annotations
@@ -182,7 +182,7 @@ def parse_args() -> argparse.Namespace:
                         help="Path to libadbc_driver_sqlite.so")
     parser.add_argument("--ibex-bin", default="build-release/tools/ibex")
     parser.add_argument("--plugin-path", default="build-release/tools")
-    parser.add_argument("--ld-library-path", default="~/miniforge3/envs/ibex/lib")
+    parser.add_argument("--ld-library-path", default="~/anaconda3/envs/ibex/lib")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--out", default="benchmarking/results/sqlite_source.tsv")

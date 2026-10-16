@@ -240,7 +240,7 @@ extern fn http_endpoints(port: Int = 0) -> DataFrame from "http.hpp";
 ## File Structure
 
 ```
-~/ibex/
+ibex/
 ├── libs/http/
 │   ├── CMakeLists.txt
 │   ├── http.hpp                    # Core server + routing + params

@@ -4,12 +4,14 @@
 //   python3 scripts/import_measurements_sqlite.py --limit 1000000 --output /tmp/measurements_1m.sqlite
 //
 // Run the REPL with the ADBC plugin available, then paste this script:
-//   LD_LIBRARY_PATH=/path/to/conda/env/lib:$LD_LIBRARY_PATH \
 //   ./build-release/tools/ibex --plugin-path ./build-release/tools
+// "sqlite" resolves through an ADBC driver manifest (see
+// scripts/install_adbc_driver.sh); a path to libadbc_driver_sqlite.so,
+// e.g. from a conda env, works too.
 import "adbc";
 
 adbc::read(
-    "~/anaconda3/envs/ibex/lib/libadbc_driver_sqlite.so",
+    "sqlite",
     "/tmp/measurements_1m.sqlite",
     "select station, temp from measurements"
 )[select {

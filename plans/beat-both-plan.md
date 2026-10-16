@@ -236,7 +236,7 @@ effect too. Milestone 1 needs ~260 ms, comfortably ~600 ms.
      `extract_restriction_or_clauses`) is built and correct and drops the join
      from ~79 to 0.3 ms, but a small filtered build side then makes the join
      materialize lineitem instead of streaming it (q19 ~230 → 320–410 ms).
-     Patches in `~/ibex-parked/`; resume at where the join decides to
+     Patches in `~/ibex-parked/` (local, not in the repo); resume at where the join decides to
      materialize its probe side when the build side is `Filter(Scan)`.
    **Landed `49da7a27`:** the consumer decodes units in place of the spare
    pool thread (q06 kept 7 of 8 cores busy; q01/q04/q06/q12/q14/q15/q19

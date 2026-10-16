@@ -16,8 +16,12 @@ the full aggregation down into SQL.
 
 Usage:
   ./.venv/bin/python benchmarking/bench_sqlite_source.py \
-      --sqlite-db /tmp/measurements_1m.sqlite \
-      --driver ~/anaconda3/envs/ibex/lib/libadbc_driver_sqlite.so
+      --sqlite-db /tmp/measurements_1m.sqlite
+
+The SQLite driver is --driver, else $ADBC_DRIVER_SQLITE, else
+$CONDA_PREFIX/lib/libadbc_driver_sqlite.so when a conda env provides it, else
+the name "sqlite" resolved through a driver manifest (see
+scripts/install_adbc_driver.sh), as in examples/adbc_sqlite/run.sh.
 """
 
 from __future__ import annotations
@@ -101,11 +105,12 @@ def bench_ibex(driver: str, sqlite_db: str, ibex_bin: str, plugin_path: str, ld_
         'by station, order station];\n'
     )
     env = os.environ.copy()
-    env["LD_LIBRARY_PATH"] = (
-        ld_library_path
-        if not env.get("LD_LIBRARY_PATH")
-        else f"{ld_library_path}:{env['LD_LIBRARY_PATH']}"
-    )
+    if ld_library_path:
+        env["LD_LIBRARY_PATH"] = (
+            ld_library_path
+            if not env.get("LD_LIBRARY_PATH")
+            else f"{ld_library_path}:{env['LD_LIBRARY_PATH']}"
+        )
     completed = subprocess.run(
         [ibex_bin, "--plugin-path", plugin_path],
         input=script,
@@ -171,6 +176,20 @@ def bench_sqlite_pushdown(sqlite_db: str):
         conn.close()
 
 
+def conda_lib_dir() -> str | None:
+    prefix = os.environ.get("CONDA_PREFIX")
+    return str(pathlib.Path(prefix) / "lib") if prefix else None
+
+
+def default_sqlite_driver() -> str:
+    if driver := os.environ.get("ADBC_DRIVER_SQLITE"):
+        return driver
+    lib = conda_lib_dir()
+    if lib and (pathlib.Path(lib) / "libadbc_driver_sqlite.so").is_file():
+        return str(pathlib.Path(lib) / "libadbc_driver_sqlite.so")
+    return "sqlite"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sqlite-db", default="/tmp/measurements_1m.sqlite")
@@ -178,11 +197,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=1_000_000)
     parser.add_argument("--ensure-db", action="store_true",
                         help="Create the SQLite DB from measurements.txt when missing.")
-    parser.add_argument("--driver", required=True,
-                        help="Path to libadbc_driver_sqlite.so")
+    parser.add_argument("--driver", default=default_sqlite_driver(),
+                        help="Path to libadbc_driver_sqlite.so, or a driver manifest name")
     parser.add_argument("--ibex-bin", default="build-release/tools/ibex")
     parser.add_argument("--plugin-path", default="build-release/tools")
-    parser.add_argument("--ld-library-path", default="~/anaconda3/envs/ibex/lib")
+    parser.add_argument("--ld-library-path", default=conda_lib_dir() or "",
+                        help="Prepended to LD_LIBRARY_PATH for the Ibex run "
+                             "(default: $CONDA_PREFIX/lib when set)")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--out", default="benchmarking/results/sqlite_source.tsv")

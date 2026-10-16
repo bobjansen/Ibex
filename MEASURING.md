@@ -245,7 +245,7 @@ python or conda (those lack polars/pandas and fail in a way that looks like
 "deps not installed"):
 
 ```bash
-uv run --project ~/ibex python benchmarking/bench_python.py --csv ... --iters 1
+uv run python benchmarking/bench_python.py --csv ... --iters 1
 Rscript benchmarking/bench_r.R --csv ...          # R needs no wrapper
 ```
 

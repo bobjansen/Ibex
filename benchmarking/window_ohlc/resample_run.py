@@ -17,8 +17,8 @@ a sort would measure nothing; `run.py`'s `order symbol` exists because a
 downstream per-symbol stage wants a tall frame grouped, which does not apply.
 
 Usage:
-  uv run --project ~/ibex benchmarking/window_ohlc/resample_run.py --verify
-  uv run --project ~/ibex benchmarking/window_ohlc/resample_run.py \
+  uv run benchmarking/window_ohlc/resample_run.py --verify
+  uv run benchmarking/window_ohlc/resample_run.py \
       --rows 5000000 --symbols 3 100 --out results/resample.tsv
 """
 from __future__ import annotations

@@ -570,7 +570,7 @@ struct PackedKeyEncoder {
                 // intern, and the generic path is the safe answer.
                 // An id past 32 bits was truncated in `codes`.
                 if (k >= str_interns_.size() || str_interns_[k].column != c_str ||
-                    str_interns_[k].id_bound() > (std::size_t{1} << 32U)) {
+                    std::uint64_t{str_interns_[k].id_bound()} > (std::uint64_t{1} << 32U)) {
                     layout_miss_ = true;
                     return std::nullopt;
                 }

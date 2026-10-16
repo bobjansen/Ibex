@@ -67,6 +67,25 @@ namespace ibex::runtime {
 
 namespace {
 
+/// Lower `slot` to `value` if smaller while other workers may do the same.
+inline void atomic_store_min(std::uint32_t& slot, std::uint32_t value) noexcept {
+#ifdef __cpp_lib_atomic_ref
+    const std::atomic_ref<std::uint32_t> ref(slot);
+    auto held = ref.load(std::memory_order_relaxed);
+    while (value < held && !ref.compare_exchange_weak(held, value, std::memory_order_relaxed)) {
+    }
+#else
+    // Apple's and emscripten's libc++ don't ship std::atomic_ref yet. A
+    // 32-bit atomic is lock-free on the supported targets, so this view gives
+    // the same relaxed CAS loop without needing atomic_ref.
+    static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
+    auto* ref = reinterpret_cast<std::atomic<std::uint32_t>*>(&slot);
+    auto held = ref->load(std::memory_order_relaxed);
+    while (value < held && !ref->compare_exchange_weak(held, value, std::memory_order_relaxed)) {
+    }
+#endif
+}
+
 /// Allocator adaptor that skips value-initialization for `resize()`'s new
 /// elements, i.e. `resize()` behaves like `reserve()` + leaving the tail
 /// default-initialized rather than zero-filled. Everything else (push_back,
@@ -4193,12 +4212,7 @@ class HashAggregateState final {
                 if (dense[cell] != kNoGid) {
                     continue;
                 }
-                const std::atomic_ref<std::uint32_t> slot(first[cell]);
-                auto held = slot.load(std::memory_order_relaxed);
-                const auto here = static_cast<std::uint32_t>(row);
-                while (here < held &&
-                       !slot.compare_exchange_weak(held, here, std::memory_order_relaxed)) {
-                }
+                atomic_store_min(first[cell], static_cast<std::uint32_t>(row));
             }
         });
         std::vector<std::vector<std::uint32_t>> fresh(n_ranges);

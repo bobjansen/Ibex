@@ -29,6 +29,22 @@
 #   --profile            no timing suite: run breaker_map.py and profile_suite.py
 #                        per --cores count (Ibex only), to rank serial and idle
 #                        time on physical cores. The output is in results/profile/.
+#   --counters           no timing suite: perf counters per engine x query x
+#                        --cores count (benchmarking/tpch/perf_counters.py), every
+#                        count counted from the timed iterations only. Output in
+#                        results/counters/sf<N>/ with report.txt. Tuned by:
+#     --counter-engines LIST   ibex,polars,duckdb (default all three); `ibex:name`
+#                              is a variant, given env via --counter-args
+#     --counter-queries LIST   default q01,q09,q21
+#     --counter-events SPEC    presets basic,memory,stalls,topdown and/or raw
+#                              events (default all four presets); unsupported
+#                              ones are probed and dropped, see events.tsv.
+#                              Full PMU (stalls/topdown) needs a full-socket or
+#                              metal instance; partial-socket boxes expose the
+#                              architectural events only
+#     --counter-args "..."     passed through verbatim, e.g.
+#                              "--iters 20 --pairs 5 --split-events" or
+#                              "--variant-env ibex:arena1=GLIBC_TUNABLES=glibc.malloc.arena_max=1"
 #   --polars-in-memory   also run Polars' in-memory executor (whole tables; it
 #                        OOMs at high SF). The reference is Polars streaming,
 #                        always; see run_bench.sh. --no-polars-in-memory is
@@ -41,6 +57,8 @@
 #       --sf 1,8,30,100 --threads-per-core 1 --volume-size 400
 #   ./benchmarking/aws/run-tpch.sh --on-demand --type r7i.8xlarge --sf 8 \
 #       --threads-per-core 1 --cores 2,4,8,12,16
+#   ./benchmarking/aws/run-tpch.sh --on-demand --type r7i.8xlarge --sf 10 \
+#       --threads-per-core 1 --cores 1,8 --counters --counter-queries q01,q05,q09
 
 set -euo pipefail
 
@@ -66,6 +84,11 @@ THREADS_PER_CORE=""
 VOLUME_SIZE=250
 POLARS_IN_MEMORY=0
 PROFILE=0
+COUNTERS=0
+COUNTER_ENGINES="ibex,polars,duckdb"
+COUNTER_QUERIES="q01,q09,q21"
+COUNTER_EVENTS="basic,memory,stalls,topdown"
+COUNTER_ARGS=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -79,13 +102,23 @@ while [[ $# -gt 0 ]]; do
         --polars-in-memory) POLARS_IN_MEMORY=1; shift ;;
         --no-polars-in-memory) POLARS_IN_MEMORY=0; shift ;;
         --profile) PROFILE=1; shift ;;
+        --counters) COUNTERS=1; shift ;;
+        --counter-engines) COUNTER_ENGINES="$2"; shift 2 ;;
+        --counter-queries) COUNTER_QUERIES="$2"; shift 2 ;;
+        --counter-events) COUNTER_EVENTS="$2"; shift 2 ;;
+        --counter-args) COUNTER_ARGS="$2"; shift 2 ;;
         --key) KEY_NAME="$2"; shift 2 ;;
         --region) REGION="$2"; shift 2 ;;
         --on-demand) ON_DEMAND=1; shift ;;
-        -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,61p' "$0"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
+
+if [[ "$PROFILE" -eq 1 && "$COUNTERS" -eq 1 ]]; then
+    echo "error: --profile and --counters are separate runs; pick one" >&2
+    exit 1
+fi
 
 S3_BUCKET="${S3_BUCKET:?S3_BUCKET not set — run benchmarking/aws/setup.sh first}"
 REPO_URL=$(bench_repo_url "$IBEX_ROOT")
@@ -154,12 +187,18 @@ else
     echo "Cores  : pinned to ${CORES}${THREADS_PER_CORE:+ (ThreadsPerCore=${THREADS_PER_CORE})}"
 fi
 echo "Disk   : ${VOLUME_SIZE} GB (need ~${need_gb} GB for SF ${SCALES})"
+if [[ "$COUNTERS" -eq 1 ]]; then
+    echo "Mode   : counters only (${COUNTER_ENGINES} x ${COUNTER_QUERIES}; events ${COUNTER_EVENTS}${COUNTER_ARGS:+; $COUNTER_ARGS})"
+fi
 echo "Result : s3://$S3_BUCKET/$RESULT_KEY"
 
 USER_DATA=$(bench_user_data "$REPO_URL" "$COMMIT" \
     "IBEX_TPCH_MODE=1" "IBEX_TPCH_SCALES=${SCALES}" "IBEX_WARMUP=${WARMUP}" "IBEX_ITERS=${ITERS}" \
     "IBEX_TPCH_CORES=${CORES}" "IBEX_TPCH_POLARS_IN_MEMORY=${POLARS_IN_MEMORY}" \
     "IBEX_TPCH_PROFILE=${PROFILE}" \
+    "IBEX_TPCH_COUNTERS=${COUNTERS}" "IBEX_TPCH_COUNTER_ENGINES=${COUNTER_ENGINES}" \
+    "IBEX_TPCH_COUNTER_QUERIES=${COUNTER_QUERIES}" "IBEX_TPCH_COUNTER_EVENTS=${COUNTER_EVENTS}" \
+    "IBEX_TPCH_COUNTER_ARGS=${COUNTER_ARGS}" \
     "IBEX_S3_BUCKET=${S3_BUCKET}" "IBEX_RESULT_KEY=${RESULT_KEY}" "IBEX_REGION=${REGION}")
 INSTANCE_ID=$(aws ec2 run-instances --region "$REGION" --instance-type "$INSTANCE_TYPE" --image-id "$AMI" \
     "${MARKET_ARGS[@]}" "${CPU_ARGS[@]}" --instance-initiated-shutdown-behavior terminate \

@@ -967,6 +967,30 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
             done
             continue
         fi
+        # Counters mode (run-tpch.sh --counters): no timing suite. perf counters
+        # per engine x query x core count from perf_counters.py, which counts the
+        # timed iterations only (long-minus-short runs) and probes which events
+        # this box exposes. One invocation covers the whole core list, so its
+        # report can put each count against the smallest.
+        if [[ "${IBEX_TPCH_COUNTERS:-0}" == "1" ]]; then
+            if ! command -v perf >/dev/null 2>&1; then
+                echo "perf unavailable; --counters has nothing to measure" >&2
+                exit 1
+            fi
+            COUNTERS_OUT="/ibex/benchmarking/tpch/results/counters/sf${scale}"
+            mkdir -p "$COUNTERS_OUT"
+            read -r -a COUNTER_EXTRA <<< "${IBEX_TPCH_COUNTER_ARGS:-}"
+            echo "=== counters: SF-${scale} cores ${IBEX_TPCH_CORES} ==="
+            uv run --project /ibex python3 /ibex/benchmarking/tpch/perf_counters.py \
+                --sf "$scale" --pdsh-root "$PDSH_ROOT" --cores "$IBEX_TPCH_CORES" \
+                --engines "${IBEX_TPCH_COUNTER_ENGINES:-ibex,polars,duckdb}" \
+                --queries "${IBEX_TPCH_COUNTER_QUERIES:-q01,q09,q21}" \
+                --events "${IBEX_TPCH_COUNTER_EVENTS:-basic,memory,stalls,topdown}" \
+                --warmup "${IBEX_WARMUP:-1}" --out "$COUNTERS_OUT" "${COUNTER_EXTRA[@]}" \
+                || echo "perf_counters SF-${scale} exited $?" >> "$COUNTERS_OUT/failures.txt"
+            push_partial_tpch
+            continue
+        fi
         HOST_OUT=/ibex/benchmarking/tpch/results/host
         for cores in "${TPCH_CORE_LIST[@]}"; do
             CORE_ARGS=()

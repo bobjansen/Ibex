@@ -51,6 +51,8 @@ def main() -> int:
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--framework", default=None)
     parser.add_argument("--out", type=pathlib.Path, required=True)
+    parser.add_argument("queries", nargs="*",
+                        help="queries to run, as q01..q22 (default: all 22)")
     args = parser.parse_args()
     if args.threads is not None and (args.engine != "duckdb" or args.threads < 1):
         parser.error("--threads requires --engine duckdb and a positive value")
@@ -61,6 +63,15 @@ def main() -> int:
     # executor choice (and no "-stream" in its framework name).
     if args.polars_engine is None and args.engine == "polars":
         args.polars_engine = "streaming"
+
+    query_numbers = list(range(1, 23))
+    if args.queries:
+        try:
+            query_numbers = [int(q.lstrip("q")) for q in args.queries]
+        except ValueError:
+            parser.error(f"queries are named q01..q22, got {args.queries}")
+        if any(not 1 <= n <= 22 for n in query_numbers):
+            parser.error(f"queries are named q01..q22, got {args.queries}")
 
     if not (args.pdsh_root / "queries" / args.engine).is_dir():
         parser.error(f"{args.pdsh_root} is not a Polars PDS-H checkout")
@@ -84,7 +95,7 @@ def main() -> int:
     rows = []
     with tempfile.TemporaryDirectory(prefix="ibex_pdsh_") as tmp:
         timing_dir = pathlib.Path(tmp)
-        for query_number in range(1, 23):
+        for query_number in query_numbers:
             timing_file = timing_dir / f"{args.engine}_q{query_number}.csv"
             env = os.environ | {
                 "SCALE_FACTOR": args.sf,

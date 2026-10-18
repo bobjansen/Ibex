@@ -16,7 +16,7 @@ set(__BUILD_FOR_R OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     LightGBM
     GIT_REPOSITORY https://github.com/microsoft/LightGBM.git
-    GIT_TAG        v4.5.0
+    GIT_TAG        v4.6.0
     GIT_SHALLOW    TRUE
 )
 # LightGBM emits noisy developer warnings; quiet them like the Arrow plugin does.

@@ -185,6 +185,22 @@ set(RapidJSON_SOURCE "BUNDLED" CACHE STRING "" FORCE)
 set(Boost_SOURCE "BUNDLED" CACHE STRING "" FORCE)
 set(BOOST_SOURCE "BUNDLED" CACHE STRING "" FORCE)
 set(AWSSDK_SOURCE "BUNDLED" CACHE STRING "" FORCE)
+# Arrow 22 bundles aws-lc v1.52.1, whose OPENSSL_memchr returns memchr()'s
+# result as void *. glibc 2.43 makes memchr const-preserving even in C11 mode,
+# so that fails under aws-lc's -Werror. v1.68.0 added the cast; FetchContent
+# keeps the first declaration, so this one overrides Arrow's.
+if(ARROW_S3)
+    # As a subproject Arrow skips its own option definitions, so this is unset
+    # and FindOpenSSLAlt falls back to static libcrypto.a — whose pkg-config
+    # needs libjitterentropy.a on newer distros.
+    set(ARROW_OPENSSL_USE_SHARED ON CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        aws-lc
+        SYSTEM OVERRIDE_FIND_PACKAGE EXCLUDE_FROM_ALL TRUE
+        URL      https://github.com/aws/aws-lc/archive/v1.73.0.tar.gz
+        URL_HASH SHA256=e33ae89e7d09d7b23a900f68b62088d8813c260ac564b016e543ee3540ebcce3
+    )
+endif()
 set(CMAKE_PROJECT_aws-cpp-sdk-all_INCLUDE_BEFORE
     "${IBEX_ROOT}/cmake/AwsSdkCppModulePath.cmake")
 set(UNSAFE_TREAT_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)

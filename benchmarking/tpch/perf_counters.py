@@ -24,7 +24,8 @@ dropped and listed in `events.tsv`, so one preset works on any box (a VM on
 part of a socket exposes fewer counters than a full-socket or metal one).
 Many events on one run multiplex; `pct_running` in `counters.tsv` says how
 much of the run each was counted, and `--split-events` gives every event
-group its own run pair instead.
+group (a preset, the loose raw events, or an `a+b+c` token) its own run pair
+instead.
 
 Engines spin briefly before parking, so "CPUs utilized" means busy or
 spinning, and spin shows up as instructions too.
@@ -82,19 +83,27 @@ ENGINES = ("ibex", "polars", "duckdb")
 
 
 def expand_events(spec: str) -> list[list[str]]:
-    """Comma list of presets / raw events -> groups (one per preset, raw events
-    together), REQUIRED first and no duplicates across groups."""
+    """Comma list of presets / raw events -> groups (one per preset, loose raw
+    events together, `a+b+c` its own group), REQUIRED first and no duplicates
+    across groups."""
     groups: list[list[str]] = []
     raw: list[str] = []
     for token in filter(None, (t.strip() for t in spec.split(","))):
         if token in PRESETS:
             groups.append(list(PRESETS[token]))
+        elif "+" in token:
+            groups.append([e for e in token.split("+") if e])
         else:
             raw.append(token)
     if raw:
         groups.append(raw)
     seen = set(REQUIRED)
     out = [list(REQUIRED)]
+    # The rest of `basic` is software events: no PMU counter, so it rides in
+    # the first group instead of costing a run pair of its own.
+    if any(g == list(PRESETS["basic"]) for g in groups):
+        out[0] += [e for e in PRESETS["basic"] if e not in seen]
+        seen.update(out[0])
     for g in groups:
         g = [e for e in g if e not in seen]
         seen.update(g)
@@ -113,8 +122,11 @@ def parse_perf_csv(path: pathlib.Path) -> dict[str, tuple[float | None, float, s
         if len(f) < 3:
             continue
         value, unit, event = f[0], f[1], f[2]
-        # Unprivileged runs print `cycles:u`; hybrid CPUs `cpu_core/cycles/`.
+        # Unprivileged runs print `cycles:u`; hybrid CPUs `cpu_core/cycles/`,
+        # plus a `cpu_atom/` line for the efficiency cores (none in --cpus).
         event = event.split(":")[0]
+        if event.startswith("cpu_atom/"):
+            continue
         if event.startswith("cpu_core/") and event.endswith("/"):
             event = event[len("cpu_core/"):-1]
         pct = float(f[4]) if len(f) > 4 and f[4] not in ("", "<not counted>") else 0.0
@@ -132,7 +144,10 @@ def parse_perf_csv(path: pathlib.Path) -> dict[str, tuple[float | None, float, s
 
 
 def probe(events: list[str], tmp: pathlib.Path) -> dict[str, str]:
-    """event -> 'ok' | 'unknown' | 'unsupported', one perf run per event."""
+    """event -> 'ok' | 'zero' | 'unknown' | 'unsupported', one perf run per event.
+
+    'zero' is counted anyway (a cross-core event can be 0 on one thread) but
+    warned about: hypervisors accept some events and then read them as 0."""
     status = {}
     out = tmp / "probe.csv"
     for ev in events:
@@ -143,7 +158,9 @@ def probe(events: list[str], tmp: pathlib.Path) -> dict[str, str]:
             status[ev] = "unknown"
             continue
         values = parse_perf_csv(out)
-        status[ev] = "ok" if any(v is not None for v, _, _ in values.values()) else "unsupported"
+        counted = [v for v, _, _ in values.values() if v is not None]
+        status[ev] = ("unsupported" if not counted
+                      else "zero" if all(v == 0 for v in counted) else "ok")
     return status
 
 
@@ -164,7 +181,7 @@ def engine_command(base: str, query: str, cores: int, iters: int, args,
         else:
             cmd += ["--threads", str(cores)]
         cmd.append(query)
-    return ["taskset", "-c", f"0-{cores - 1}"] + cmd, env
+    return ["taskset", "-c", ",".join(map(str, args.cpus[:cores]))] + cmd, env
 
 
 def read_samples(tsv: pathlib.Path) -> list[float]:
@@ -187,6 +204,10 @@ def main() -> int:
                          "ibex:arena1=GLIBC_TUNABLES=glibc.malloc.arena_max=1 (repeatable)")
     ap.add_argument("--queries", default="q01,q09,q21")
     ap.add_argument("--cores", default="1,8", help="comma list; the smallest is the scaling base")
+    ap.add_argument("--cpus", default=None,
+                    help="CPU list N cores are taken from, first N entries (default 0,1,2,...). "
+                         "On SMT or hybrid boxes give one thread per performance core, "
+                         "e.g. 0,2,4,6,8,10,12,14")
     ap.add_argument("--events", default="basic,memory,stalls",
                     help=f"presets ({', '.join(PRESETS)}) and/or raw perf events")
     ap.add_argument("--split-events", action="store_true",
@@ -222,6 +243,10 @@ def main() -> int:
     available = len(os.sched_getaffinity(0))
     if cores_list[0] < 1 or cores_list[-1] > available:
         ap.error(f"--cores must be within 1..{available}")
+    args.cpus = ([int(c) for c in args.cpus.split(",")] if args.cpus
+                 else list(range(cores_list[-1])))
+    if len(args.cpus) < cores_list[-1]:
+        ap.error(f"--cpus lists {len(args.cpus)} CPUs, --cores needs {cores_list[-1]}")
 
     # bench_ibex.py reads the `parquet` symlink; point it at this scale, as
     # run_bench.sh does, so every engine reads the same tables.
@@ -246,9 +271,13 @@ def main() -> int:
         f.write("event\tstatus\n")
         for ev, st in status.items():
             f.write(f"{ev}\t{st}\n")
-    groups = [[e for e in g if status[e] == "ok"] for g in groups]
+    zero = [e for e, s in status.items() if s == "zero"]
+    if zero:
+        print(f"# WARNING: read 0 on the probe (blanked by a hypervisor?): {', '.join(zero)}",
+              file=sys.stderr)
+    groups = [[e for e in g if status[e] in ("ok", "zero")] for g in groups]
     groups = [g for g in groups if g]
-    dropped = [e for e, s in status.items() if s != "ok"]
+    dropped = [e for e, s in status.items() if s not in ("ok", "zero")]
     print(f"# events: {sum(map(len, groups))} counted, {len(dropped)} dropped"
           + (f" ({', '.join(dropped)})" if dropped else ""), file=sys.stderr)
     if not args.split_events:

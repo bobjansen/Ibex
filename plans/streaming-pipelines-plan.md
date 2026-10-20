@@ -126,10 +126,31 @@ then AWS. A slice that does not move the 8-core wall is not landed.
    stream into a table (`resolve_deferred_probe_pair`), and the 1M-row
    batching hands the breakers above DRAM-sized chunks again.
 
-   Next in this slice: a per-unit BuildLeft probe for two-key joins
-   (`emit_swapped_pair` per unit), so q05/q09 chain; then measure 1→8-core
-   CPI on native Linux (`cpu_growth.py`, `perf_counters.py`) against the
-   whole-relation path.
+   **Two-key joins and moderate right sides (2026-10-20, same flag).** A
+   two-key deferred probe whose left drained (q09 `lineitem`) runs per unit:
+   the left is indexed once and each unit decodes with the scan's pushdowns
+   and probes in scan order (`run_streamed_swapped_pair_unit`,
+   `emit_swapped_pair(.., share_left)` so the left is not copied per unit). A
+   join whose left is an unstarted streaming pipeline and whose right is at
+   most 1M rows indexes the right without draining the left and attaches its
+   probe (`stream_left_into_right_build`; q05 `supplier`, single-key joins
+   too). `ParallelPipelineStats::streamed_probes` counts both kinds; q05 now
+   streams 4 probes, q09 3. q09's chain still ends at `orders` (12M rows, over
+   the 1M right-build limit), whose deferred probe drains the stream to filter
+   `orders` by lineitem's keys: the build-in-full question above, unanswered.
+
+   Measured (same setup, a slower sitting; ratios only): 22/22 answers, 1c ==
+   8c under streaming except q09's known exception; q03 −4%, q05 −3%, q11 −3%,
+   q10 −2%, q08/q18 +1%, total −1.0%, geomean −1.2%. On WSL the wall barely
+   moves because zstd, ~2/3 of the CPU, is untouched; the expected gain is in
+   1→8-core CPI and idle, which needs native Linux counters
+   (`cpu_growth.py`, `perf_counters.py --engines ibex,ibex:stream
+   --variant-env ibex:stream=IBEX_STREAM_PROBES=1`) and then AWS.
+
+   Owed before the flag can default on: tests that fail without it (a
+   multi-unit Parquet deferred probe, single- and two-key, asserting
+   `streamed_probes` and 1c == 8c), and the REPL statement / `ibex_compile`
+   paths checked (`feedback`: the three paths are equals).
 2. **Generic per-worker aggregate sink.** Hash, owned and partitioned paths as
    per-unit partials merged in unit order (first-occurrence group order holds).
    The largest slice (`aggregate_chunked.cpp`, 9.5k lines).

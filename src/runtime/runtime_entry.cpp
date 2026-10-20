@@ -287,7 +287,7 @@ auto process_pipeline_stats() -> ParallelPipelineStats* {
                     "pipeline stats: parallel={} serial={} morsels={} "
                     "pipelined_scans={} pipelined_stages={} range_heads={} two_phase={} "
                     "parallel_fields={} parallel_direct_numeric_fields={} parallel_probes={} "
-                    "parallel_hash_builds={} parallel_aggregate_partitions={} "
+                    "parallel_hash_builds={} streamed_probes={} parallel_aggregate_partitions={} "
                     "parallel_aggregate_finalizes={} "
                     "grouped_lifted_group_state={} chunk_direct_updates={} "
                     "untranslated_categorical_columns={}\n",
@@ -296,7 +296,8 @@ auto process_pipeline_stats() -> ParallelPipelineStats* {
                     stats.pipelined_stages.load(), stats.range_heads.load(),
                     stats.two_phase_filters.load(), stats.parallel_fields.load(),
                     stats.parallel_direct_numeric_fields.load(), stats.parallel_probes.load(),
-                    stats.parallel_hash_builds.load(), stats.parallel_aggregate_partitions.load(),
+                    stats.parallel_hash_builds.load(), stats.streamed_probes.load(),
+                    stats.parallel_aggregate_partitions.load(),
                     stats.parallel_aggregate_finalizes.load(),
                     stats.grouped_lifted_group_state.load(), stats.chunk_direct_updates.load(),
                     stats.untranslated_categorical_columns.load());

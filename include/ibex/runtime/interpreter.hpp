@@ -802,6 +802,11 @@ struct ParallelPipelineStats {
     /// a gate that silently stopped matching would lose the parallelism with
     /// every test still green.
     std::atomic<std::uint64_t> parallel_hash_builds{0};
+    /// Join probes that run per unit inside a streaming pipeline
+    /// (`stream_probes`): deferred probes run as a unit pipeline, and probes
+    /// attached to a streaming left's worker chains. Their output matches the
+    /// whole-relation join, so only this says a chain stayed streamed.
+    std::atomic<std::uint64_t> streamed_probes{0};
     /// Hash-aggregate `partition` phases (radix scatter+accumulate or the
     /// partition-owned path) that fanned out across workers, and `finalize`
     /// phases (the co-ranking / ordered-run / first-row-seed merges) that did.

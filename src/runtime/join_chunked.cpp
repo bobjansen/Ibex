@@ -1578,7 +1578,11 @@ struct JoinProbe {
     // `head_of(row)` callback -- with the null check folded into `head_of`
     // itself (returning `kNil`) instead of the single-bitmap `probe_is_null`
     // member, since a row here is null when EITHER key is.
-    auto emit_swapped_pair(const Table& left_table) -> std::expected<Table, std::string> {
+    /// `share_left` passes the left columns to `assemble_output` by reference
+    /// count instead of copying them: a streamed probe calls this once per unit
+    /// against the same left table.
+    auto emit_swapped_pair(const Table& left_table, bool share_left = false)
+        -> std::expected<Table, std::string> {
         if (!columns_.has_value()) {
             return std::unexpected("join column mapping not bound");
         }
@@ -1616,6 +1620,10 @@ struct JoinProbe {
         Table left_copy;
         left_copy.columns.reserve(left_table.columns.size());
         for (const auto& c : left_table.columns) {
+            if (share_left) {
+                left_copy.add_column_from(c.name, c);
+                continue;
+            }
             left_copy.add_column(c.name, *c.column);
             left_copy.columns.back().validity = c.validity;
         }
@@ -1933,7 +1941,44 @@ struct StreamedTwoPhaseShared {
     const ScalarRegistry* scalars = nullptr;
     const ExternRegistry* externs = nullptr;
     std::string scan_name;
+    /// The scan's pushdowns, fixed once its filter slot is ready; set for the
+    /// two-key path, which decodes each unit with them (`run_streamed_swapped_pair_unit`).
+    std::optional<DeferredScanPlan> plan;
 };
+
+/// The probe's right input for one unit: the decoded rows themselves for a
+/// bare scan, or the wrappers above the scan interpreted over them.
+auto wrap_unit_right(const StreamedTwoPhaseShared& shared, Table rows, const ExecutionContext& exec)
+    -> std::expected<Table, std::string> {
+    if (shared.bare_scan) {
+        return rows;
+    }
+    TableRegistry local = *shared.registry;
+    local.insert_or_assign(shared.scan_name, std::move(rows));
+    return materialize_plan(*shared.right_node, local, shared.scalars, shared.externs, exec);
+}
+
+/// One unit of a two-key join that indexed its (smaller, materialized) left
+/// side: decode the unit with the scan's pushdowns, then probe its rows
+/// through the left index in scan order -- `emit_swapped_pair` over the unit.
+/// Concatenated in unit order, the units give the rows and order the
+/// whole-source swapped emit does.
+auto run_streamed_swapped_pair_unit(const StreamedTwoPhaseShared& shared, JoinProbe& probe,
+                                    std::size_t unit_index, const ExecutionContext& exec)
+    -> std::expected<Table, std::string> {
+    auto rows =
+        materialize_deferred_scan_unit(*shared.scan, *shared.plan, shared.units[unit_index], exec);
+    if (!rows.has_value()) {
+        return std::unexpected(std::move(rows.error()));
+    }
+    normalize_time_index(*rows);
+    auto right = wrap_unit_right(shared, std::move(*rows), exec);
+    if (!right.has_value()) {
+        return std::unexpected(std::move(right.error()));
+    }
+    probe.right_ = std::make_shared<const Table>(std::move(*right));
+    return probe.emit_swapped_pair(*shared.build, /*share_left=*/true);
+}
 
 /// One unit of the two-phase deferred probe, on the calling worker: the unit's
 /// key selection, a serial probe of its keys through the built left index,
@@ -2015,20 +2060,11 @@ auto run_streamed_two_phase_unit(const StreamedTwoPhaseShared& shared, JoinProbe
     if (!right_rows.has_value()) {
         return std::unexpected(std::move(right_rows.error()));
     }
-    Table right;
-    if (shared.bare_scan) {
-        right = std::move(*right_rows);
-    } else {
-        TableRegistry local = *shared.registry;
-        local.insert_or_assign(shared.scan_name, std::move(*right_rows));
-        auto wrapped =
-            materialize_plan(*shared.right_node, local, shared.scalars, shared.externs, exec);
-        if (!wrapped.has_value()) {
-            return std::unexpected(std::move(wrapped.error()));
-        }
-        right = std::move(*wrapped);
+    auto right = wrap_unit_right(shared, std::move(*right_rows), exec);
+    if (!right.has_value()) {
+        return std::unexpected(std::move(right.error()));
     }
-    probe.right_ = std::make_shared<const Table>(std::move(right));
+    probe.right_ = std::make_shared<const Table>(std::move(*right));
 
     Table left_side;
     left_side.columns.reserve(shared.build->columns.size());
@@ -2214,6 +2250,10 @@ class ChunkedInnerJoinOperator final : public Operator {
     // materialize left to pick the smaller build side.
     static constexpr std::size_t kStreamRightThreshold = 65536;
 
+    /// The largest right side `stream_left_into_right_build` indexes without
+    /// measuring a streaming left: the decode unit's own row target. Not tuned.
+    static constexpr std::size_t kStreamBuildRightMax = std::size_t{1} << 20;
+
     /// Hand the probe what it needs before anything runs, including joint
     /// ownership of the right side. The `shared_ptr`'s identity is stable from
     /// construction even where the table it points at is filled later (the
@@ -2276,7 +2316,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         // (`ir::build_side_worth_deferring`: should the build side be
         // materialized early so its keys can prune a probe scan's decode?);
         // the two are routinely both called "the join cost model".
-        if (n_right <= kStreamRightThreshold) {
+        if (n_right <= kStreamRightThreshold || stream_left_into_right_build(n_right)) {
             return adopt_build(build_join_side(*right_, right_key_name, key_kind,
                                                JoinOrientation::BuildRight,
                                                build_partitions(n_right)));
@@ -2627,6 +2667,31 @@ class ChunkedInnerJoinOperator final : public Operator {
     /// pruning the scan itself is worth it at all before adding more on top.
     auto resolve_deferred_probe_pair() -> std::optional<std::string> {
         DynamicScanFilter& slot = *deferred_probe_->filter;
+        // A streaming left that can take this probe on its workers: index the
+        // deferred side whole, unfiltered, rather than drain the left to filter
+        // it (`stream_left_into_right_build`).
+        if (stream_left_into_right_build(deferred_probe_->lazy->rows())) {
+            slot.ready = true;
+            auto right = materialize_plan(*deferred_right_node_, *deferred_registry_,
+                                          deferred_scalars_, deferred_externs_, *deferred_exec_);
+            if (!right.has_value()) {
+                return std::move(right.error());
+            }
+            *right_ = std::move(*right);
+            deferred_probe_ = nullptr;
+            const ir::JoinKey& k0 = keys_->at(0);
+            const ir::JoinKey& k1 = keys_->at(1);
+            auto right_keys = pair_key_columns(*right_, k0.right, k1.right, "right");
+            if (!right_keys.has_value()) {
+                return std::move(right_keys.error());
+            }
+            probe_.pair_mode_ = true;
+            return adopt_build(JoinBuildOutcome{
+                .index = std::make_shared<const JoinHashIndex>(
+                    build_join_pair_index(*right_keys->col0, *right_keys->col1, right_keys->v0,
+                                          right_keys->v1, build_partitions(right_->rows()))),
+                .orientation = JoinOrientation::BuildRight});
+        }
         if (deferred_probe_->lazy->rows() > kStreamRightThreshold) {
             auto left_res = MaterializeOperator(std::move(left_)).run();
             if (!left_res.has_value()) {
@@ -2637,6 +2702,17 @@ class ChunkedInnerJoinOperator final : public Operator {
             use_materialized_left_ = true;
         }
         slot.ready = true;
+        if (deferred_exec_->stream_probes && use_materialized_left_) {
+            bool streamed = false;
+            if (auto err = try_stream_pair_deferred(streamed)) {
+                return err;
+            }
+            if (streamed) {
+                deferred_probe_ = nullptr;
+                mode_ = Mode::Streamed;
+                return std::nullopt;
+            }
+        }
         auto right = materialize_plan(*deferred_right_node_, *deferred_registry_, deferred_scalars_,
                                       deferred_externs_, *deferred_exec_);
         if (!right.has_value()) {
@@ -2937,6 +3013,77 @@ class ChunkedInnerJoinOperator final : public Operator {
         return std::nullopt;
     }
 
+    void count_streamed_probe() const {
+        if (deferred_exec_->parallel_stats != nullptr) {
+            deferred_exec_->parallel_stats->streamed_probes.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    /// Whether to index a right side of `right_rows` rows without measuring
+    /// the left: the left is a streaming pipeline that can run this join's
+    /// probe on its workers, and the right is at most `kStreamBuildRightMax`.
+    /// Draining that left to compare sizes would end the stream at this join.
+    [[nodiscard]] auto stream_left_into_right_build(std::size_t right_rows) const -> bool {
+        return probe_.exec_ != nullptr && probe_.exec_->stream_probes &&
+               right_rows <= kStreamBuildRightMax && left_ != nullptr &&
+               pipeline_executor_detail::is_attachable_worker_pipeline(*left_);
+    }
+
+    /// The two-key deferred probe as a streaming pipeline, for the shape
+    /// `choose_and_build_pair` resolves to BuildLeft: the drained left is
+    /// indexed once, and each unit of the probe scan decodes with its pushdowns
+    /// and probes on one worker (`run_streamed_swapped_pair_unit`).
+    auto try_stream_pair_deferred(bool& streamed) -> std::optional<std::string> {
+        const DeferredScan& scan = *deferred_probe_;
+        auto units = deferred_scan_units(scan);
+        if (units.size() < 2 || !left_materialized_.has_value()) {
+            return std::nullopt;
+        }
+        const Table& left = *left_materialized_;
+        const ir::JoinKey& k0 = keys_->at(0);
+        const ir::JoinKey& k1 = keys_->at(1);
+        auto left_keys = pair_key_columns(left, k0.left, k1.left, "left");
+        if (!left_keys.has_value()) {
+            return std::nullopt;  // the whole-source path reports it
+        }
+        probe_.pair_mode_ = true;
+        if (auto published = publish_build(JoinBuildOutcome{
+                .index = std::make_shared<const JoinHashIndex>(
+                    build_join_pair_index(*left_keys->col0, *left_keys->col1, left_keys->v0,
+                                          left_keys->v1, build_partitions(left.rows()))),
+                .orientation = JoinOrientation::BuildLeft});
+            !published.has_value()) {
+            return std::move(published.error());
+        }
+        auto shared = std::make_shared<StreamedTwoPhaseShared>();
+        shared->scan = &scan;
+        shared->units = units;
+        shared->plan = plan_deferred_scan(scan);
+        shared->build = std::make_shared<const Table>(std::move(*left_materialized_));
+        left_materialized_.reset();
+        use_materialized_left_ = false;
+        shared->right_node = deferred_right_node_;
+        shared->bare_scan = deferred_right_node_->kind() == ir::NodeKind::Scan;
+        shared->registry = deferred_registry_;
+        shared->scalars = deferred_scalars_;
+        shared->externs = deferred_externs_;
+        shared->scan_name = deferred_probe_name_;
+        auto prototype = std::make_shared<const JoinProbe>(probe_);
+        streamed_pipeline_ = pipeline_executor_detail::build_unit_pipeline(
+            std::move(units),
+            [shared, prototype]() -> pipeline_executor_detail::UnitProducer {
+                auto probe = std::make_shared<JoinProbe>(*prototype);
+                return [shared, probe](std::size_t unit, const ExecutionContext& exec) {
+                    probe->exec_ = &exec;
+                    return run_streamed_swapped_pair_unit(*shared, *probe, unit, exec);
+                };
+            },
+            *deferred_exec_);
+        count_streamed_probe();
+        streamed = true;
+        return std::nullopt;
+    }
+
     /// The two-phase probe as a streaming pipeline: build the left index here,
     /// then let each unit of the probe scan run its key selection, probe,
     /// selected decode and assembly on one worker (`run_streamed_two_phase_unit`).
@@ -2979,6 +3126,7 @@ class ChunkedInnerJoinOperator final : public Operator {
                 };
             },
             *deferred_exec_);
+        count_streamed_probe();
         outcome = TwoPhase::Streamed;
         return std::nullopt;
     }
@@ -3348,6 +3496,10 @@ auto build_hash_probe_operator(HashProbeInput input) -> std::expected<OperatorPt
                                                                /*preserve_empty_morsels=*/true);
                 });
             if (attached) {
+                if (stream->probe.exec_->parallel_stats != nullptr) {
+                    stream->probe.exec_->parallel_stats->streamed_probes.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
                 return std::move(stream->source);
             }
         }

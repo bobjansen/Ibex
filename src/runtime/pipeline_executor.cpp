@@ -2145,8 +2145,12 @@ class PipelinedScanOperator final : public Operator {
     /// the first `next()`, and never under a worker sink, which was offered for
     /// the chain as built. `attach` receives the context that chain runs under:
     /// a step that may fan out must use it, because the consumer's is serial.
+    [[nodiscard]] auto can_attach_worker_step() const noexcept -> bool {
+        return !started_ && sink_ == nullptr;
+    }
+
     [[nodiscard]] auto attach_worker_step(const WorkerStepAttach& attach) -> bool {
-        if (started_ || sink_ != nullptr) {
+        if (!can_attach_worker_step()) {
             return false;
         }
         for (auto& worker : workers_) {
@@ -2784,6 +2788,11 @@ auto build_unit_pipeline(std::vector<SourceUnit> units, const UnitProducerFactor
     constexpr std::size_t kEmitBatchRows = std::size_t{1} << 20;
     pipeline->set_emit_batch_rows(kEmitBatchRows);
     return pipeline;
+}
+
+auto is_attachable_worker_pipeline(const Operator& op) -> bool {
+    const auto* pipeline = dynamic_cast<const PipelinedScanOperator*>(&op);
+    return pipeline != nullptr && pipeline->can_attach_worker_step();
 }
 
 auto try_attach_worker_step(Operator& op, const WorkerStepAttach& attach) -> bool {

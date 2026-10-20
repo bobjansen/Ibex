@@ -79,6 +79,11 @@ using WorkerStepAttach =
 /// `op` untouched and the caller runs the step above it as before.
 [[nodiscard]] auto try_attach_worker_step(Operator& op, const WorkerStepAttach& attach) -> bool;
 
+/// Whether `try_attach_worker_step` would accept a step on `op` now. A join
+/// asks before it decides its build side: a left that can take the probe is
+/// worth building the right for, without draining the left to measure it.
+[[nodiscard]] auto is_attachable_worker_pipeline(const Operator& op) -> bool;
+
 [[nodiscard]] auto has_multi_unit_deferred_scan(const ir::Node& node, const TableRegistry& registry,
                                                 const ExecutionContext& exec) -> bool;
 

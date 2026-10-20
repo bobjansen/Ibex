@@ -58,10 +58,12 @@ TEST_CASE("join key bitmap: agrees with the key set on random dense inputs", "[j
         JoinKeyBitmap bitmap(*present.begin(), *present.rbegin());
         for (const auto key : present) {
             bitmap.insert(key);
+            bitmap.insert(key);  // a repeated build key counts once
         }
         for (std::int64_t key = base - 70; key < base + span + 70; ++key) {
             REQUIRE(bitmap.contains(key) == present.contains(key));
         }
+        REQUIRE(bitmap.count() == present.size());
     }
 }
 

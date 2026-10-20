@@ -3104,6 +3104,20 @@ class ChunkedInnerJoinOperator final : public Operator {
         if (units.size() < 2) {
             return std::nullopt;
         }
+        // The whole-source path builds on the RIGHT instead when the left has
+        // more rows than the probe has survivors (`try_two_phase_probe`): then
+        // the smaller side is indexed and the wide left streams in order rather
+        // than being gathered at random per survivor (q09's orders join: 3.3M
+        // lineitem-side rows against 2.9M orders, node time doubled streamed).
+        // Survivors are only known after the units run, but a probe key that is
+        // unique on its side (a primary key) yields at most one survivor per
+        // distinct build key. A left with more rows than that would be flipped
+        // there, so it is not streamed here. Declining only hands the decision
+        // back to the whole-source path; an unknown count streams.
+        if (scan.filter != nullptr && scan.filter->distinct_keys != 0 &&
+            build.rows() > scan.filter->distinct_keys) {
+            return std::nullopt;
+        }
         if (auto published = publish_build(
                 build_join_side(build, keys_->front().left, ExprType::Int,
                                 JoinOrientation::BuildLeft, build_partitions(build.rows())));
@@ -3289,6 +3303,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         // hash and a random miss), so the dense case builds faster too.
         if (JoinKeyBitmap::worth_building(mn, mx, JoinBloomFilter::bits_for(valid_rows))) {
             slot.bitmap = build_key_bitmap(key_at, n, validity, mn, mx);
+            slot.distinct_keys = slot.bitmap->count();
             slot.min = mn;
             slot.max = mx;
             return;  // exact already: no Bloom, no in-list

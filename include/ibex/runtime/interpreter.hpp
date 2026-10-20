@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -557,6 +558,16 @@ class JoinKeyBitmap {
                ((words_[static_cast<std::size_t>(offset >> 6U)] >> (offset & 63U)) & 1U) != 0;
     }
 
+    /// The number of distinct keys inserted: the exact build-side key
+    /// cardinality, for one pass over the words.
+    [[nodiscard]] auto count() const noexcept -> std::size_t {
+        std::size_t n = 0;
+        for (const std::uint64_t word : words_) {
+            n += static_cast<std::size_t>(std::popcount(word));
+        }
+        return n;
+    }
+
    private:
     std::int64_t base_;
     std::uint64_t bits_;
@@ -634,6 +645,10 @@ struct DynamicScanFilter {
     /// when it pays (`JoinKeyBitmap::worth_building`): it is exact, so a Bloom
     /// beside it would only cost a second pass over the build keys.
     std::shared_ptr<const JoinKeyBitmap> bitmap;
+    /// The build side's distinct key count when it is known exactly (with
+    /// `bitmap`, its population count); 0 = unknown. Lets a join estimate how
+    /// many probe rows can survive before the probe scan has run.
+    std::size_t distinct_keys = 0;
     /// A range-only filter (no `bloom`) is not worth a fused scan when the
     /// interval leaves most rows in place, and the source can tell from its
     /// footer before reading a page: it declines when row groups lying wholly

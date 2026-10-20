@@ -37,6 +37,7 @@ Usage:
   uv run benchmarking/tpch/bench_ibex.py [--statements] [--warmup N] [--iters N] [--out path]
 """
 import argparse
+import os
 import pathlib
 import re
 import statistics
@@ -46,7 +47,10 @@ import tempfile
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 IBEX_ROOT = SCRIPT_DIR.parent.parent
-IBEX_BIN = IBEX_ROOT / "build-release/tools/ibex"
+# IBEX_BIN overrides the binary (plugins still come from build-release/tools),
+# e.g. a saved base build as a perf_counters.py variant:
+#   --variant-env ibex:base=IBEX_BIN=/path/to/saved/ibex
+IBEX_BIN = pathlib.Path(os.environ.get("IBEX_BIN", IBEX_ROOT / "build-release/tools/ibex"))
 PLUGIN_DIR = IBEX_ROOT / "build-release/tools"
 QUERIES_DIR = SCRIPT_DIR / "queries"
 

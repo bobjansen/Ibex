@@ -1966,6 +1966,9 @@ auto wrap_unit_right(const StreamedTwoPhaseShared& shared, Table rows, const Exe
 auto run_streamed_swapped_pair_unit(const StreamedTwoPhaseShared& shared, JoinProbe& probe,
                                     std::size_t unit_index, const ExecutionContext& exec)
     -> std::expected<Table, std::string> {
+    if (!shared.plan.has_value()) {
+        return std::unexpected("streamed join probe: the probe scan was not planned");
+    }
     auto rows =
         materialize_deferred_scan_unit(*shared.scan, *shared.plan, shared.units[unit_index], exec);
     if (!rows.has_value()) {
@@ -3059,6 +3062,9 @@ class ChunkedInnerJoinOperator final : public Operator {
         shared->scan = &scan;
         shared->units = units;
         shared->plan = plan_deferred_scan(scan);
+        if (!left_materialized_.has_value()) {
+            return "streamed join probe: the drained left side went missing";
+        }
         shared->build = std::make_shared<const Table>(std::move(*left_materialized_));
         left_materialized_.reset();
         use_materialized_left_ = false;
@@ -3107,6 +3113,9 @@ class ChunkedInnerJoinOperator final : public Operator {
         auto shared = std::make_shared<StreamedTwoPhaseShared>();
         shared->scan = &scan;
         shared->units = units;
+        if (!left_materialized_.has_value()) {
+            return "streamed join probe: the drained left side went missing";
+        }
         shared->build = std::make_shared<const Table>(std::move(*left_materialized_));
         left_materialized_.reset();
         shared->right_node = deferred_right_node_;

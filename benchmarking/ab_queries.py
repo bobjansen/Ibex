@@ -58,15 +58,18 @@ How the verdict is decided, and why it is not a fixed percentage band:
   real optimizations deliver.
 * `geomean` over per-query ratios is the headline, not the sum of times — a sum
   is dominated by whichever query happens to be longest.
-* Byte-identity is checked by default and is not a performance question: the
-  engine's contract is that output does not depend on how it was computed.
+* Output is checked by default and is not a performance question: the
+  engine's contract is that rows, their order and every non-float value do not
+  depend on how they were computed. Floats may differ in their last bits (the
+  order of a parallel sum is not part of the contract), so they are compared
+  with `outputs_match`'s tolerance rather than byte for byte.
 """
 
 import argparse
 import itertools
-
 import math
 import pathlib
+import re
 import statistics
 import subprocess
 import sys
@@ -141,6 +144,40 @@ def wilcoxon_p(diffs: list[float]) -> float:
     return min(1.0, math.erfc(abs(w - mean) / sd / math.sqrt(2.0)))
 
 
+# A printed float: a decimal point or an exponent. Integers are compared exactly.
+FLOAT_TOKEN = re.compile(r"[-+]?(?:\d+\.\d*|\.\d+|\d+(?:\.\d*)?[eE][-+]?\d+)")
+# Relative tolerance for floats: last-bit differences of a double are ~1e-16.
+FLOAT_REL_TOL = 1e-9
+
+
+def floats_match(a: str, b: str) -> bool:
+    """Equal within FLOAT_REL_TOL, or within one unit of the last printed
+    decimal: a last-bit difference can flip the rounding of a printed digit."""
+    x, y = float(a), float(b)
+    if abs(x - y) <= FLOAT_REL_TOL * max(abs(x), abs(y)):
+        return True
+    decimals = [len(t.split(".")[1]) for t in (a, b) if "." in t and "e" not in t.lower()]
+    return bool(decimals) and abs(x - y) <= 1.5 * 10.0 ** -min(decimals)
+
+
+def outputs_match(a: str, b: str) -> bool:
+    """Same lines and tokens in the same order; float tokens within tolerance."""
+    lines_a, lines_b = a.splitlines(), b.splitlines()
+    if len(lines_a) != len(lines_b):
+        return False
+    for la, lb in zip(lines_a, lines_b):
+        if la == lb:
+            continue
+        ta, tb = re.split(r"(\s+|\|)", la), re.split(r"(\s+|\|)", lb)
+        if len(ta) != len(tb):
+            return False
+        for x, y in zip(ta, tb):
+            if x != y and not (FLOAT_TOKEN.fullmatch(x) and FLOAT_TOKEN.fullmatch(y)
+                               and floats_match(x, y)):
+                return False
+    return True
+
+
 def run_once(binary: pathlib.Path, query: pathlib.Path, args: argparse.Namespace
              ) -> tuple[float, str]:
     """One timed run. Returns (milliseconds, stdout)."""
@@ -213,7 +250,7 @@ def compare(query: pathlib.Path, args: argparse.Namespace) -> dict | None:
     losses = sum(1 for b, t in zip(base_ms, target_ms) if t > b)
     pvalue = wilcoxon_p([t - b for b, t in zip(base_ms, target_ms)])
 
-    identical = base_out == target_out
+    identical = outputs_match(base_out, target_out)
     if not identical:
         verdict = "DIFFERS"
     elif abs(delta) < args.min_effect:
@@ -266,7 +303,7 @@ def main() -> int:
                     help="sign-test significance level (default 0.05)")
     ap.add_argument("--timeout", type=int, default=900)
     ap.add_argument("--no-verify", action="store_true",
-                    help="skip the byte-identity check (do not use for an "
+                    help="skip the output check (do not use for an "
                          "operator change)")
     args = ap.parse_args()
     if args.repeats % 2 == 1:
@@ -343,7 +380,7 @@ def main() -> int:
           f"({100 * (geo - 1):+.1f}%)  <- the headline")
 
     if args.no_verify:
-        print("# byte-identity NOT checked (--no-verify)")
+        print("# output NOT checked (--no-verify)")
     elif differing:
         print(f"# OUTPUT CHANGED on {len(differing)} quer"
               f"{'y' if len(differing) == 1 else 'ies'}: {' '.join(differing)}")
@@ -351,7 +388,7 @@ def main() -> int:
               "it before reading any timing above.")
         return 2
     else:
-        print(f"# byte-identical on all {len(rows)} queries")
+        print(f"# same rows and order on all {len(rows)} queries (floats within tolerance)")
 
     # Holm-Bonferroni across the queries. Testing 22 queries at alpha=0.05 means
     # roughly one spurious verdict per run BY CONSTRUCTION, and a suite A/B is

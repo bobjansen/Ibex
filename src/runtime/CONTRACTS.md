@@ -198,10 +198,13 @@ Owner: `table_properties.hpp`.
 
 ## 7. Determinism bar (the contract behind every contract)
 
-Byte-identical output between serial and parallel execution at any core
-count, any grain, any threshold. Devices: positional order reconstruction,
-data-derived partition counts, first-occurrence group ids assigned after the
-parallel phase, lowest-sequence error selection, interrupt over data error.
-The three legitimate ulp exceptions (PDS-H q01/q09/q15, parallel float
-reduction order — itself thread-count-independent) are enumerated in
-`plans/beat-both-plan.md` §4. Anything else that differs is a bug.
+The same rows, in the same order, with the same non-float values, between
+serial and parallel execution at any core count, any grain, any threshold.
+Devices: positional order reconstruction, data-derived partition counts,
+first-occurrence group ids assigned after the parallel phase, lowest-sequence
+error selection, interrupt over data error. Floats may differ in their last
+bits: the order of floating-point operations (a parallel sum, a per-unit
+partial) is not part of the contract, and no device exists to fix it.
+Answer checks compare floats with a tolerance (`benchmarking/ab_queries.py`,
+`outputs_match`). A different row, row order, key, count, integer, string or
+decimal is a bug.

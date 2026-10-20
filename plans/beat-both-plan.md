@@ -368,8 +368,8 @@ fixing it; when a fix does not move the wall, find what ate the gain.
 - **Answers:** `run_bench.sh` diffs every Ibex answer against upstream Polars
   at the benchmarked SF before timing (`check_against_polars.py`); never pass
   `--no-answer-check` for a published number. Serial vs parallel Ibex answers
-  are byte-identical except q01, q09, q15 (last-ulp float reductions); a fourth
-  difference is a bug.
+  have the same rows, order and non-float values; floats may differ in their
+  last bits (`src/runtime/CONTRACTS.md` §7).
 - **Warm and fresh.** `run_bench.sh` times a warm in-process loop for every
   engine. Ibex gains far more from warmth than Polars (q21 ~38% against ~8%,
   first-touch page faults), so quote a large win fresh-process too (see

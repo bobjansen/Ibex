@@ -61,7 +61,7 @@ hash build, aggregate merge, order, distinct, window, materialized fallbacks.
 - Immutable `JoinHashIndex` after `run_build`; build-before-probe is an explicit
   call.
 - Ordered rings and unit `sequence` numbers: merging per-unit results in unit
-  order is what keeps output byte-identical.
+  order is what keeps row order identical.
 
 ## The `IBEX_PROBE_MORSELS` deadlock (diagnosed 2026-10-20, not fixed)
 
@@ -80,9 +80,9 @@ and it morselizes a materialized table (a §5 dead end of `beat-both-plan.md`).
 
 ## Slices
 
-Each slice: byte-identical answers 22/22 at 1 and 8 cores
-(`diff <(IBEX_CORES=1 …) <(IBEX_CORES=8 …)`), `ab_queries.py` locally, the
-1-to-8-core CPI and idle split on the native Linux box (`perf_counters.py`),
+Each slice: the same answers 22/22 at 1 and 8 cores, rows and order exact,
+floats within tolerance (`src/runtime/CONTRACTS.md` §7), `ab_queries.py`
+locally, the 1-to-8-core CPI and idle split on the native Linux box (`perf_counters.py`),
 then AWS. A slice that does not move the 8-core wall is not landed.
 
 1. **Probe steps in the scan-pipeline worker chain.** A streaming inner probe

@@ -12,18 +12,26 @@ compares two BINARIES over .ibex query files, which is what you want when the
 thing you care about is a PDS-H query rather than a micro benchmark, and when
 you already have both builds.
 
-Build the base side without disturbing your tree:
+Build the base side in a worktree of its own, so your tree (committed or not)
+is never touched. Never `git stash` for this: a stash that fails to pop, or a
+rebuild forgotten after it, measures the base against itself.
 
+    cmake --build build-release -j 6                  # the change, full tree
     cp build-release/tools/ibex_eval /tmp/eval_target
-    git stash -q
-    CMAKE_BUILD_PARALLEL_LEVEL=6 cmake --build build-release --target ibex_eval
-    cp build-release/tools/ibex_eval /tmp/eval_base
-    git stash pop -q
-    CMAKE_BUILD_PARALLEL_LEVEL=6 cmake --build build-release --target ibex_eval
+    # Once: a base worktree with its own build tree (first configure fetches
+    # the bundled dependencies, ~1h; later builds are incremental).
+    git worktree add --detach ../ibex-base <base-ref>
+    cmake -S ../ibex-base -B ../ibex-base/build-release -G Ninja \
+        -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=Release
+    # Each time: move it to the base and build the full tree there.
+    git -C ../ibex-base checkout --detach <base-ref>
+    cmake --build ../ibex-base/build-release -j 6
+    cp ../ibex-base/build-release/tools/ibex_eval /tmp/eval_base
 
-That last rebuild is not optional: after `git stash pop` the binary sitting in
-`build-release/` is still the BASE build, and forgetting it means measuring the
-base against itself while believing otherwise.
+Build full trees, not `--target ibex_eval`: Parquet is linked into the binary,
+and a target-restricted build can leave a stale part in place that measures
+plausibly and wrongly. Configure the base with the same options as your
+`build-release` (see its CMakeCache.txt).
 
     python3 benchmarking/ab_queries.py --base /tmp/eval_base --target /tmp/eval_target
 

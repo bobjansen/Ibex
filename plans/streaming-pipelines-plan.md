@@ -170,8 +170,18 @@ then AWS. A slice that does not move the 8-core wall is not landed.
 - A ring costs when its consumer drains synchronously (Ascribe as pipelineable,
   +13–30%). The only ring left is at the pipeline's sink.
 - Keep scan/aggregate overlap: removing it cost q01 +44%, q15 +61%.
-- A 1M-row unit is larger than cache: process it in row-group slices
-  (122,880 rows on the polars-benchmark files) through the whole chain.
+- Row-group slices do not pay for the streamed joins (2026-10-20, native
+  i7-13700, SF-10, 3.2 GHz locked, 8-core medians): running the two-phase and
+  two-key unit pipelines over row groups instead of 1M-row units (q09: 555
+  pieces instead of 95, output still batched to 1M rows) was slower on every
+  query (q03 405 → 422 ms, q05 448 → 465, q09 723 → 780, q10 517 → 528;
+  1 core +4–8%) and raised q09's L3 misses (16.1M → 20.1M). Per-piece setup
+  (key scan, scan plan, reader, probe) costs more than the cache gains. The
+  misses come from the probed structures, not the decode grain: q09's
+  two-key build side is 43.6 MB (left 13.9 MB, `chain_next` 3.5 MB,
+  `pair_heads` 26.2 MB), and `pair_heads` is ~2.4× oversized (8 partitions of
+  131,072 slots for ~54k keys each, power-of-two rounding after the 80% load
+  cap).
 - Overlapping a join's two sides regressed twice (`32889afd`, `27cb4a27`):
   builds run before their probe pipeline, not beside it.
 

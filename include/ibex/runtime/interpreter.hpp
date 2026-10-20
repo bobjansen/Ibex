@@ -957,6 +957,14 @@ struct ExecutionContext {
     /// chunked join, and the lazy-table keep-rows scan) and must agree.
     bool parallel_join_probe = true;
 
+    /// Whether streaming pipelines run join probes on the worker that produced
+    /// the unit (`plans/streaming-pipelines-plan.md`, slice 1): a deferred probe
+    /// scan runs its key scan, probe and selected decode per unit, and a join
+    /// that builds on its right side attaches its probe to the worker chains of
+    /// a streaming left input. `IBEX_STREAM_PROBES=1` turns it on; off by
+    /// default until it is measured.
+    bool stream_probes = false;
+
     /// Look up a deferred scan by its plan (instance) name, or null if there is
     /// no registry or no matching entry.
     [[nodiscard]] auto deferred_scan(const std::string& name) const -> const DeferredScan* {
@@ -979,7 +987,7 @@ struct ExecutionContext {
 ///   "parallel off" could not drift into meaning different things.
 /// - `IBEX_STREAM_SCAN` → `stream_scans`, `IBEX_JOIN_PROBE` →
 ///   `parallel_join_probe` (both default on; three seams each consult the
-///   field and must agree).
+///   field and must agree). `IBEX_STREAM_PROBES` → `stream_probes` (off).
 /// - `IBEX_MORSEL_ROWS` → `parallel_grain`, and when set explicitly also drops
 ///   `parallel_min_rows` to that grain so a deliberately small grain is honored.
 ///

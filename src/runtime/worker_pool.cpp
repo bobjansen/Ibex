@@ -930,6 +930,10 @@ auto parallel_join_probe_from_env() -> std::optional<bool> {
     return env_flag("IBEX_JOIN_PROBE");
 }
 
+auto stream_probes_from_env() -> std::optional<bool> {
+    return env_flag("IBEX_STREAM_PROBES");
+}
+
 auto source_chunk_rows_from_env() -> std::size_t {
     const auto raw = env_value("IBEX_CHUNK_ROWS");
     if (raw.empty()) {

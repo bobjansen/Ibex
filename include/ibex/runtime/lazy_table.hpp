@@ -323,8 +323,12 @@ class LazyTable {
     /// late materialization for a caller (the deferred-probe join) that
     /// already knows exactly which rows survive. Bypasses `cache_` like
     /// `project_where` does, and for the same reason.
+    ///
+    /// `unit`, when given, holds every row of `selected` (still source-global)
+    /// and restricts the decode to it: a streaming caller works one unit at a
+    /// time and must not touch the rest of the source.
     [[nodiscard]] auto project_rows(const std::set<std::string>& names, const Selection& selected,
-                                    const ExecutionContext& exec)
+                                    const ExecutionContext& exec, const SourceUnit* unit = nullptr)
         -> std::expected<Table, std::string>;
 
     /// Phase A of a two-phase deferred probe: compute the scan's selection
@@ -333,6 +337,13 @@ class LazyTable {
     /// The outer optional is nullopt when there is no selective answer
     /// (no membership, non-int64 key, or the escape hatch fired) and the
     /// caller must fall back to the ordinary full materialization.
+    ///
+    /// With `unit`, phase A covers that unit alone and always answers: when the
+    /// fused scan has no answer for the unit, its key and conjunct columns are
+    /// decoded and the conjuncts applied, without the membership filter. The
+    /// selection is then a superset of the matching rows, which is all the probe
+    /// that consumes it needs; the probe itself is exact. `unit_selection_ready`
+    /// says up front whether a key column qualifies at all.
     struct JoinKeySelection {
         Selection selected;  ///< ascending source-row indices
         ColumnEntry keys;    ///< key values for exactly those rows
@@ -341,8 +352,13 @@ class LazyTable {
                                           const ExecutionContext& exec,
                                           const ScalarRegistry* scalars,
                                           const DynamicScanFilter& dynamic,
-                                          const std::string& key_name)
+                                          const std::string& key_name,
+                                          const SourceUnit* unit = nullptr)
         -> std::expected<std::optional<JoinKeySelection>, std::string>;
+    /// Whether `join_key_selection` can run per unit for `key_name`: the source
+    /// has units, the key is an Int64 column of the schema, and it is not cached
+    /// whole (a cached column already answers the whole-source phase A).
+    [[nodiscard]] auto unit_selection_ready(const std::string& key_name) const -> bool;
 
     /// Materialize every column — the fallback for anything that consumes the
     /// table whole rather than through a query plan.
@@ -406,8 +422,16 @@ class LazyTable {
     /// through it. nullopt = the conjuncts name no column to stage.
     [[nodiscard]] auto narrow_selection(const Selection& selected,
                                         const std::vector<ir::Expr>& conjuncts,
-                                        const ExecutionContext& exec, const ScalarRegistry* scalars)
+                                        const ExecutionContext& exec, const ScalarRegistry* scalars,
+                                        const SourceUnit* unit = nullptr)
         -> std::expected<std::optional<Selection>, std::string>;
+    /// Phase A for one unit when the fused scan has no answer for it.
+    [[nodiscard]] auto unit_key_selection_fallback(const std::vector<ir::Expr>& conjuncts,
+                                                   const ExecutionContext& exec,
+                                                   const ScalarRegistry* scalars,
+                                                   const std::string& key_name,
+                                                   const SourceUnit& unit)
+        -> std::expected<std::optional<JoinKeySelection>, std::string>;
     /// The predicate columns for one unit, never cached and never read from
     /// the cache except to slice a column that is already there whole.
     [[nodiscard]] auto decode_unit_predicate_columns(
@@ -438,7 +462,8 @@ class LazyTable {
     [[nodiscard]] auto scan_dictionary_filters(const std::vector<ir::Expr>& conjuncts,
                                                const Selection* within,
                                                const ScalarRegistry* scalars,
-                                               const ExecutionContext& exec)
+                                               const ExecutionContext& exec,
+                                               const SourceUnit* unit = nullptr)
         -> std::expected<std::optional<Selection>, std::string>;
     [[nodiscard]] auto acquire_reader() -> std::expected<LazySourceReaderPtr, std::string>;
     void release_reader(LazySourceReaderPtr reader);
@@ -460,7 +485,8 @@ using LazyTablePtr = std::shared_ptr<LazyTable>;
 /// exactly those rows. nullopt = no selective answer; fall back to
 /// `materialize_deferred_scan`.
 [[nodiscard]] auto deferred_scan_key_selection(const DeferredScan& scan,
-                                               const ExecutionContext& exec)
+                                               const ExecutionContext& exec,
+                                               const SourceUnit* unit = nullptr)
     -> std::expected<std::optional<LazyTable::JoinKeySelection>, std::string>;
 
 /// Phase B: materialize the scan's demanded columns through the survivor
@@ -469,7 +495,8 @@ using LazyTablePtr = std::shared_ptr<LazyTable>;
 /// ordinary path.
 [[nodiscard]] auto materialize_deferred_scan_rows(const DeferredScan& scan, const Selection& rows,
                                                   const ExecutionContext& exec,
-                                                  const ColumnEntry& key_column)
+                                                  const ColumnEntry& key_column,
+                                                  const SourceUnit* unit = nullptr)
     -> std::expected<Table, std::string>;
 
 }  // namespace ibex::runtime

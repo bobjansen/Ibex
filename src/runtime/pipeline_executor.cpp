@@ -1959,6 +1959,24 @@ class DeferredScanSourceOperator final : public Operator {
     std::size_t window_ = 1;
 };
 
+/// Replays a list of chunks once; the input of `MaterializeOperator` when the
+/// unit pipeline batches several units' output into one chunk.
+class ChunkListSource final : public Operator {
+   public:
+    explicit ChunkListSource(std::vector<Chunk> chunks) : chunks_(std::move(chunks)) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (position_ == chunks_.size()) {
+            return std::optional<Chunk>{};
+        }
+        return std::optional<Chunk>{std::move(chunks_[position_++])};
+    }
+
+   private:
+    std::vector<Chunk> chunks_;
+    std::size_t position_ = 0;
+};
+
 // A one-chunk source owned by one scan-pipeline worker. The worker replaces
 // the pending chunk for every source unit it claims, then pulls the private
 // row-local chain exactly once. Keeping the chain private is what makes its
@@ -1983,6 +2001,9 @@ class ScanPipelineSource final : public Operator {
 struct ScanPipelineWorker {
     ScanPipelineSource* source = nullptr;
     OperatorPtr chain;
+    /// Produces a unit's rows in place of the scan decode (`build_unit_pipeline`);
+    /// empty for a scan pipeline. Private to this worker, like `chain`.
+    UnitProducer produce;
 };
 
 [[nodiscard]] auto build_scan_pipeline_worker(const std::vector<MapStep>& operators,
@@ -1991,7 +2012,7 @@ struct ScanPipelineWorker {
                                               const ExecutionContext& exec)
     -> std::expected<ScanPipelineWorker, std::string> {
     auto source = std::make_unique<ScanPipelineSource>();
-    ScanPipelineWorker worker{.source = source.get(), .chain = std::move(source)};
+    ScanPipelineWorker worker{.source = source.get(), .chain = std::move(source), .produce = {}};
     for (const MapStep& op_node : operators) {
         auto next = build_row_local_map_operator(op_node, std::move(worker.chain), scalars, externs,
                                                  exec, true);
@@ -2013,12 +2034,13 @@ struct ScanPipelineWorker {
 /// there is no materialized table or whole-window wait between those stages.
 class PipelinedScanOperator final : public Operator {
    public:
-    PipelinedScanOperator(const DeferredScan& scan, std::vector<SourceUnit> units,
+    /// `scan` is null when every worker has a `produce` function instead.
+    PipelinedScanOperator(const DeferredScan* scan, std::vector<SourceUnit> units,
                           std::vector<ScanPipelineWorker> workers, const ExecutionContext& exec,
                           WorkerPool& pool, std::shared_ptr<ScanWorkerSink> sink = nullptr,
                           std::unique_ptr<ExecutionContext> consumer_exec = nullptr,
                           std::optional<ScanPipelineWorker> consumer_worker = std::nullopt)
-        : scan_(&scan),
+        : scan_(scan),
           units_(std::move(units)),
           workers_(std::move(workers)),
           exec_(&exec),
@@ -2046,8 +2068,10 @@ class PipelinedScanOperator final : public Operator {
         start();
 
         while (next_sequence_ < units_.size()) {
-            while (consumer_worker_.has_value() && !ring_.can_take(next_sequence_) &&
-                   run_consumer_unit()) {
+            // With no pool workers (`build_unit_pipeline` on a one-thread pool)
+            // the ring has no producer to wait for: the consumer runs every unit.
+            while (consumer_worker_.has_value() &&
+                   (workers_.empty() || !ring_.can_take(next_sequence_)) && run_consumer_unit()) {
             }
             std::optional<Chunk> produced = ring_.take(next_sequence_);
             if (!produced.has_value()) {
@@ -2071,6 +2095,15 @@ class PipelinedScanOperator final : public Operator {
 
             empty_schema_carrier_.reset();
             const std::size_t unit = next_sequence_ - 1;
+            if (emit_batch_rows_ != 0) {
+                normalize_categorical_dictionaries(chunk);
+                batch_rows_ += chunk.rows();
+                batch_chunks_.push_back(std::move(chunk));
+                if (batch_rows_ >= emit_batch_rows_) {
+                    return emit_batch();
+                }
+                continue;
+            }
             if (sink_ == nullptr) {
                 normalize_categorical_dictionaries(chunk);
             } else {
@@ -2092,6 +2125,9 @@ class PipelinedScanOperator final : public Operator {
             return std::optional<Chunk>{std::move(chunk)};
         }
 
+        if (!batch_chunks_.empty()) {
+            return emit_batch();
+        }
         finish_workers();
         finished_ = true;
         if (empty_schema_carrier_.has_value()) {
@@ -2104,14 +2140,41 @@ class PipelinedScanOperator final : public Operator {
         return std::optional<Chunk>{};
     }
 
+    /// Append an operator to every worker's private chain (and the helping
+    /// consumer's), so it runs on the core that produced the unit. Only before
+    /// the first `next()`, and never under a worker sink, which was offered for
+    /// the chain as built. `attach` receives the context that chain runs under:
+    /// a step that may fan out must use it, because the consumer's is serial.
+    [[nodiscard]] auto attach_worker_step(const WorkerStepAttach& attach) -> bool {
+        if (started_ || sink_ != nullptr) {
+            return false;
+        }
+        for (auto& worker : workers_) {
+            worker.chain = attach(std::move(worker.chain), *exec_);
+        }
+        if (consumer_worker_.has_value()) {
+            consumer_worker_->chain = attach(std::move(consumer_worker_->chain), *consumer_exec_);
+        }
+        return true;
+    }
+
+    /// Emit consecutive non-empty units together until a chunk holds at least
+    /// `rows` rows (0 = one chunk per unit). The boundaries depend only on the
+    /// units' row counts, never on worker count or timing.
+    void set_emit_batch_rows(std::size_t rows) noexcept { emit_batch_rows_ = rows; }
+
    private:
     void start() {
         if (started_) {
             return;
         }
         started_ = true;
-        plan_ = plan_deferred_scan(*scan_);
-        batch_ = pool_->submit(workers_.size(), [this](std::size_t id) { run_worker(id); });
+        if (scan_ != nullptr) {
+            plan_ = plan_deferred_scan(*scan_);
+        }
+        if (!workers_.empty()) {
+            batch_ = pool_->submit(workers_.size(), [this](std::size_t id) { run_worker(id); });
+        }
     }
 
     void run_worker(std::size_t worker_id) noexcept {
@@ -2218,10 +2281,14 @@ class PipelinedScanOperator final : public Operator {
 
     [[nodiscard]] auto run_unit(ScanPipelineWorker& worker, std::size_t sequence,
                                 const ExecutionContext& exec) -> std::expected<Chunk, std::string> {
-        if (!plan_.has_value()) {
+        std::expected<Table, std::string> decoded;
+        if (worker.produce) {
+            decoded = worker.produce(sequence, exec);
+        } else if (!plan_.has_value()) {
             return std::unexpected("scan pipeline: unit run before the scan was planned");
+        } else {
+            decoded = materialize_deferred_scan_unit(*scan_, *plan_, units_[sequence], exec);
         }
-        auto decoded = materialize_deferred_scan_unit(*scan_, *plan_, units_[sequence], exec);
         if (!decoded.has_value()) {
             return std::unexpected(std::move(decoded.error()));
         }
@@ -2241,6 +2308,25 @@ class PipelinedScanOperator final : public Operator {
             return std::unexpected("scan pipeline: row-local chain reordered a source unit");
         }
         return chunk;
+    }
+
+    [[nodiscard]] auto emit_batch() -> std::expected<std::optional<Chunk>, std::string> {
+        Chunk out;
+        if (batch_chunks_.size() == 1) {
+            out = std::move(batch_chunks_.front());
+        } else {
+            auto table =
+                MaterializeOperator(std::make_unique<ChunkListSource>(std::move(batch_chunks_)))
+                    .run();
+            if (!table.has_value()) {
+                return fail(std::move(table.error()));
+            }
+            out = table_to_chunk(std::move(*table));
+        }
+        batch_chunks_.clear();
+        batch_rows_ = 0;
+        restamp(out);
+        return std::optional<Chunk>{std::move(out)};
     }
 
     void restamp(Chunk& chunk) noexcept {
@@ -2364,6 +2450,9 @@ class PipelinedScanOperator final : public Operator {
     std::vector<std::optional<Column<Categorical>>> cat_states_;
     std::optional<Chunk> empty_schema_carrier_;
     std::optional<WorkerPool::Batch> batch_;
+    std::size_t emit_batch_rows_ = 0;
+    std::vector<Chunk> batch_chunks_;
+    std::size_t batch_rows_ = 0;
     std::atomic<std::size_t> cursor_{0};
     std::size_t next_sequence_ = 0;
     std::size_t emitted_rows_ = 0;
@@ -2648,8 +2737,58 @@ auto make_deferred_scan_source(const DeferredScan& scan, std::vector<SourceUnit>
         exec.parallel_stats->pipelined_scans.fetch_add(1, std::memory_order_relaxed);
     }
     return std::make_unique<PipelinedScanOperator>(
-        scan, std::move(units), std::move(workers), exec, process_worker_pool(),
+        &scan, std::move(units), std::move(workers), exec, process_worker_pool(),
         take_offered_scan_worker_sink(), std::move(consumer_exec), std::move(consumer_worker));
+}
+
+auto build_unit_pipeline(std::vector<SourceUnit> units, const UnitProducerFactory& make_producer,
+                         const ExecutionContext& exec) -> OperatorPtr {
+    // The units, and so the chunks downstream sees, never depend on how many
+    // workers there are: with none to spare the calling thread runs them all,
+    // in the same order and with the same boundaries. Anything downstream that
+    // reduces per chunk then reduces identically at every core count.
+    const std::size_t worker_count = scan_pipeline_worker_count(units.size());
+    const auto make_worker = [&]() {
+        auto source = std::make_unique<ScanPipelineSource>();
+        ScanPipelineWorker worker{
+            .source = source.get(), .chain = std::move(source), .produce = {}};
+        worker.produce = make_producer();
+        return worker;
+    };
+    std::vector<ScanPipelineWorker> workers;
+    workers.reserve(worker_count);
+    for (std::size_t i = 0; i < worker_count; ++i) {
+        workers.push_back(make_worker());
+    }
+    std::unique_ptr<ExecutionContext> consumer_exec;
+    std::optional<ScanPipelineWorker> consumer_worker;
+    if (worker_count == 0 ||
+        scan_pipeline_needs_spare(worker_count + 1, process_worker_pool().size(), units.size())) {
+        consumer_exec = std::make_unique<ExecutionContext>(exec);
+        consumer_exec->parallel_threads = 1;
+        consumer_worker = make_worker();
+    }
+    if (exec.parallel_stats != nullptr) {
+        exec.parallel_stats->morsels.fetch_add(units.size(), std::memory_order_relaxed);
+        exec.parallel_stats->pipelined_scans.fetch_add(1, std::memory_order_relaxed);
+    }
+    // No worker sink: one is only ever offered for a row-local chain over a scan.
+    auto pipeline = std::make_unique<PipelinedScanOperator>(
+        nullptr, std::move(units), std::move(workers), exec, process_worker_pool(), nullptr,
+        std::move(consumer_exec), std::move(consumer_worker));
+    // Breakers above still fan out per chunk and size that fan-out from the
+    // chunk (distinct's floor, the aggregate's morsel cut): per-unit join output
+    // starved q16's distinct into a serial run (+95%). Batch to the decode
+    // unit's own target until those breakers are per-worker sinks
+    // (`plans/streaming-pipelines-plan.md`, slice 2).
+    constexpr std::size_t kEmitBatchRows = std::size_t{1} << 20;
+    pipeline->set_emit_batch_rows(kEmitBatchRows);
+    return pipeline;
+}
+
+auto try_attach_worker_step(Operator& op, const WorkerStepAttach& attach) -> bool {
+    auto* pipeline = dynamic_cast<PipelinedScanOperator*>(&op);
+    return pipeline != nullptr && pipeline->attach_worker_step(attach);
 }
 
 /// A breaker only earns a scheduler thread when its probe input can actually

@@ -354,6 +354,10 @@ void stage_park_end() noexcept;
 /// `ExecutionContext::parallel_join_probe`.
 [[nodiscard]] auto parallel_join_probe_from_env() -> std::optional<bool>;
 
+/// Whether `IBEX_STREAM_PROBES` asks for join probes inside streaming
+/// pipelines; applied to `ExecutionContext::stream_probes`.
+[[nodiscard]] auto stream_probes_from_env() -> std::optional<bool>;
+
 /// Rows per SOURCE chunk from `IBEX_CHUNK_ROWS`, or 0 when unset/invalid.
 ///
 /// Zero means "one chunk", which is what production does today. A non-zero

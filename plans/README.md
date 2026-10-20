@@ -57,6 +57,7 @@ history).
 
 | Plan | Notes |
 |---|---|
+| [streaming-pipelines-plan.md](streaming-pipelines-plan.md) | Proposal (2026-10-20): one worker takes one decode unit through the whole pipeline (probes, maps, per-worker sinks), for the 8-core idle and miss-cost gap measured on AWS. Records the `IBEX_PROBE_MORSELS` q09 deadlock diagnosis. |
 | [in-subquery-plan.md](in-subquery-plan.md) | Proposal: `x in (table_expr)` / `!(x in …)` as semi / null-aware anti join — a sibling of `exists`; readability, not new queries |
 | [extern-series-arguments-plan.md](extern-series-arguments-plan.md) | Proposal: `Series<T>` as a first-class extern argument, starting with CSV null tokens |
 | [project_http_plugin_plan.md](project_http_plugin_plan.md) | HTTP plugin MVP: simple registration API, blocking server, no decorators yet |

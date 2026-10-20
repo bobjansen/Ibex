@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <expected>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -52,6 +53,31 @@ namespace ibex::runtime::pipeline_executor_detail {
                                         const ScalarRegistry* scalars,
                                         const ExternRegistry* externs, const ExecutionContext& exec)
     -> std::expected<OperatorPtr, std::string>;
+
+/// One unit's rows, produced on the worker that runs the unit's chain. Each
+/// worker gets its own producer (`UnitProducerFactory`), so a producer may keep
+/// mutable state; `exec` is the context that worker runs under.
+using UnitProducer = std::function<std::expected<Table, std::string>(std::size_t unit,
+                                                                     const ExecutionContext& exec)>;
+using UnitProducerFactory = std::function<UnitProducer()>;
+
+/// A streaming pipeline over `units` whose rows come from `make_producer`
+/// rather than a scan decode: the same workers, ordered ring and dictionary
+/// remap as the pipelined scan, emitting one chunk per non-empty unit in unit
+/// order. On a pool with no worker to spare the calling thread runs every
+/// unit, so the emitted chunks are the same at every core count.
+[[nodiscard]] auto build_unit_pipeline(std::vector<SourceUnit> units,
+                                       const UnitProducerFactory& make_producer,
+                                       const ExecutionContext& exec) -> OperatorPtr;
+
+/// Wraps one worker chain in a further operator, under that chain's context.
+using WorkerStepAttach =
+    std::function<OperatorPtr(OperatorPtr chain, const ExecutionContext& exec)>;
+
+/// Append `attach` to every worker chain of `op` when `op` is a streaming
+/// pipeline that has not started (and carries no worker sink). False leaves
+/// `op` untouched and the caller runs the step above it as before.
+[[nodiscard]] auto try_attach_worker_step(Operator& op, const WorkerStepAttach& attach) -> bool;
 
 [[nodiscard]] auto has_multi_unit_deferred_scan(const ir::Node& node, const TableRegistry& registry,
                                                 const ExecutionContext& exec) -> bool;

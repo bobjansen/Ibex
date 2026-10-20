@@ -644,7 +644,7 @@ void LazyTable::split_dictionary_conjuncts(const std::vector<ir::Expr>& conjunct
 
 auto LazyTable::scan_dictionary_filters(const std::vector<ir::Expr>& conjuncts,
                                         const Selection* within, const ScalarRegistry* scalars,
-                                        const ExecutionContext& exec)
+                                        const ExecutionContext& exec, const SourceUnit* unit)
     -> std::expected<std::optional<Selection>, std::string> {
     auto* profile_entry = exec.execution_profile == nullptr
                               ? nullptr
@@ -683,7 +683,7 @@ auto LazyTable::scan_dictionary_filters(const std::vector<ir::Expr>& conjuncts,
         // Each conjunct narrows the previous one's answer rather than building
         // its own and intersecting: candidates first, then this column's test.
         const Selection* candidates = selected.has_value() ? &*selected : within;
-        auto part = (*reader)->dictionary_filter_scan(column, keep, candidates, nullptr, exec);
+        auto part = (*reader)->dictionary_filter_scan(column, keep, candidates, unit, exec);
         if (!part) {
             return std::unexpected(part.error());
         }
@@ -1365,9 +1365,81 @@ auto LazyTable::decode_whole_columns(const robin_hood::unordered_set<std::string
     return out;
 }
 
+auto LazyTable::unit_selection_ready(const std::string& key_name) const -> bool {
+    if (!reader_factory_ || cache_.contains(key_name)) {
+        return false;
+    }
+    const auto* field = schema_.find_entry(key_name);
+    return field != nullptr && std::holds_alternative<Column<std::int64_t>>(*field->column);
+}
+
+auto LazyTable::unit_key_selection_fallback(const std::vector<ir::Expr>& conjuncts,
+                                            const ExecutionContext& exec,
+                                            const ScalarRegistry* scalars,
+                                            const std::string& key_name, const SourceUnit& unit)
+    -> std::expected<std::optional<JoinKeySelection>, std::string> {
+    robin_hood::unordered_set<std::string> referenced;
+    for (const auto& conjunct : conjuncts) {
+        ir::collect_expr_column_refs(conjunct, referenced);
+    }
+    referenced.insert(key_name);
+    std::vector<std::string> names;
+    for (const auto& field : schema_.columns) {
+        if (referenced.contains(field.name)) {
+            names.push_back(field.name);
+        }
+    }
+    auto decoded = decode_columns(names, nullptr, &unit, exec);
+    if (!decoded) {
+        return std::unexpected(decoded.error());
+    }
+    const auto* entry = decoded->find_entry(key_name);
+    if (entry == nullptr || !std::holds_alternative<Column<std::int64_t>>(*entry->column)) {
+        return std::unexpected("lazy source: unit key column '" + key_name + "' is not Int64");
+    }
+    // Unit-local rows: every row, or the conjuncts' answer. No membership
+    // filter -- the probe that consumes this is exact.
+    Selection local;
+    if (!conjuncts.empty()) {
+        auto selected = filter_selection(*decoded, conjuncts, exec, scalars);
+        if (!selected) {
+            return std::unexpected(selected.error());
+        }
+        local = std::move(*selected);
+    } else {
+        local.resize(unit.rows);
+        for (std::size_t row = 0; row < unit.rows; ++row) {
+            local[row] = row;
+        }
+    }
+    JoinKeySelection out;
+    out.keys.name = key_name;
+    if (local.size() == unit.rows) {
+        out.keys.column = entry->column;
+        out.keys.validity = entry->validity;
+    } else {
+        out.keys.column = std::make_shared<ColumnValue>(
+            gather_column(*entry->column, local.data(), local.size(), &exec));
+        if (entry->validity.has_value()) {
+            ValidityBitmap validity(local.size(), true);
+            for (std::size_t row = 0; row < local.size(); ++row) {
+                validity.set(row, (*entry->validity)[local[row]]);
+            }
+            out.keys.validity = std::move(validity);
+        }
+    }
+    out.selected.resize(local.size());
+    for (std::size_t i = 0; i < local.size(); ++i) {
+        out.selected[i] = unit.start + local[i];
+    }
+    return std::optional{std::move(out)};
+}
+
 auto LazyTable::project_rows(const std::set<std::string>& names, const Selection& selected,
-                             const ExecutionContext& exec) -> std::expected<Table, std::string> {
-    const bool all_rows = selected.size() == rows_;
+                             const ExecutionContext& exec, const SourceUnit* unit)
+    -> std::expected<Table, std::string> {
+    // Every row of the decoded range: the whole source, or the whole unit.
+    const bool all_rows = selected.size() == (unit != nullptr ? unit->rows : rows_);
     // Columns already cached whole-file (predicate columns, or another scan
     // instance's decode) are gathered in memory — re-reading their pages
     // through the selection would repeat work already paid for.
@@ -1379,7 +1451,7 @@ auto LazyTable::project_rows(const std::set<std::string>& names, const Selection
     }
     Table decoded;
     if (!missing.empty()) {
-        auto res = decode_columns(missing, all_rows ? nullptr : &selected, nullptr, exec);
+        auto res = decode_columns(missing, all_rows ? nullptr : &selected, unit, exec);
         if (!res) {
             return std::unexpected(res.error());
         }
@@ -1396,7 +1468,7 @@ auto LazyTable::project_rows(const std::set<std::string>& names, const Selection
         }
         if (const auto cached = cache_.find(field.name); cached != cache_.end()) {
             const auto& entry = cached->second;
-            if (all_rows) {
+            if (all_rows && unit == nullptr) {
                 out.add_column_from(entry.name, entry);
             } else {
                 auto column = std::make_shared<ColumnValue>(
@@ -1530,7 +1602,8 @@ auto LazyTable::static_range_selection(const std::vector<ir::Expr>& conjuncts,
 }
 
 auto LazyTable::narrow_selection(const Selection& selected, const std::vector<ir::Expr>& conjuncts,
-                                 const ExecutionContext& exec, const ScalarRegistry* scalars)
+                                 const ExecutionContext& exec, const ScalarRegistry* scalars,
+                                 const SourceUnit* unit)
     -> std::expected<std::optional<Selection>, std::string> {
     const auto names = stageable_conjunct_columns(conjuncts);
     if (!names.has_value()) {
@@ -1540,7 +1613,7 @@ auto LazyTable::narrow_selection(const Selection& selected, const std::vector<ir
         return std::optional{Selection{}};
     }
 
-    auto stage = project_rows(*names, selected, exec);
+    auto stage = project_rows(*names, selected, exec, unit);
     if (!stage) {
         return std::unexpected(stage.error());
     }
@@ -1558,9 +1631,13 @@ auto LazyTable::narrow_selection(const Selection& selected, const std::vector<ir
 
 auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
                                    const ExecutionContext& exec, const ScalarRegistry* scalars,
-                                   const DynamicScanFilter& dynamic, const std::string& key_name)
+                                   const DynamicScanFilter& dynamic, const std::string& key_name,
+                                   const SourceUnit* unit)
     -> std::expected<std::optional<JoinKeySelection>, std::string> {
     if (!dynamic.has_membership()) {
+        if (unit != nullptr) {
+            return unit_key_selection_fallback(conjuncts, exec, scalars, key_name, *unit);
+        }
         return std::optional<JoinKeySelection>{};
     }
 
@@ -1606,7 +1683,7 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
         // again even on q03, whose conjunct keeps 1 in 20 key-scan rows (a
         // gate on "no conjunct follows" left q03/q07/q10/q21 2-7% slower).
         std::vector<std::int64_t> scanned_keys;
-        auto scan = scan_key_filter(key_name, dynamic, nullptr, exec, &scanned_keys);
+        auto scan = scan_key_filter(key_name, dynamic, unit, exec, &scanned_keys);
         if (!scan) {
             return std::unexpected(scan.error());
         }
@@ -1623,7 +1700,7 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
                 // test only looks at those rows, and its answer is the
                 // intersection already.
                 auto dict =
-                    scan_dictionary_filters(dictionary_conjuncts, &scan_rows, scalars, exec);
+                    scan_dictionary_filters(dictionary_conjuncts, &scan_rows, scalars, exec, unit);
                 if (!dict) {
                     return std::unexpected(dict.error());
                 }
@@ -1636,7 +1713,7 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
         }
         if (fused && !staged.empty()) {
             auto rest = narrow_selection(narrowed_rows.has_value() ? *narrowed_rows : scan_rows,
-                                         staged, exec, scalars);
+                                         staged, exec, scalars, unit);
             if (!rest) {
                 return std::unexpected(rest.error());
             }
@@ -1680,7 +1757,7 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
                     std::make_shared<ColumnValue>(Column<std::int64_t>{std::move(scanned_keys)});
                 return std::optional{std::move(out)};
             }
-            auto keys = project_rows({key_name}, out.selected, exec);
+            auto keys = project_rows({key_name}, out.selected, exec, unit);
             if (!keys) {
                 return std::unexpected(keys.error());
             }
@@ -1693,6 +1770,9 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
         }
         // No fused answer (unsupported key type, or the filter stopped
         // rejecting and the scan abandoned): the whole-column path stands.
+    }
+    if (unit != nullptr) {
+        return unit_key_selection_fallback(conjuncts, exec, scalars, key_name, *unit);
     }
 
     robin_hood::unordered_set<std::string> referenced;

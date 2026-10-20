@@ -279,7 +279,8 @@ auto materialize_deferred_scan_unit(const DeferredScan& scan, const DeferredScan
                                          plan.dynamic != nullptr ? &scan.key_column : nullptr);
 }
 
-auto deferred_scan_key_selection(const DeferredScan& scan, const ExecutionContext& exec)
+auto deferred_scan_key_selection(const DeferredScan& scan, const ExecutionContext& exec,
+                                 const SourceUnit* unit)
     -> std::expected<std::optional<LazyTable::JoinKeySelection>, std::string> {
     if (scan.filter == nullptr || !scan.filter->ready) {
         return std::optional<LazyTable::JoinKeySelection>{};
@@ -288,12 +289,12 @@ auto deferred_scan_key_selection(const DeferredScan& scan, const ExecutionContex
     // membership exists (see materialize_deferred_scan), and phase A only
     // runs with membership.
     return scan.lazy->join_key_selection(scan.conjuncts, exec, nullptr, *scan.filter,
-                                         scan.key_column);
+                                         scan.key_column, unit);
 }
 
 auto materialize_deferred_scan_rows(const DeferredScan& scan, const Selection& rows,
-                                    const ExecutionContext& exec, const ColumnEntry& key_column)
-    -> std::expected<Table, std::string> {
+                                    const ExecutionContext& exec, const ColumnEntry& key_column,
+                                    const SourceUnit* unit) -> std::expected<Table, std::string> {
     std::set<std::string> names = scan.demand;
     if (scan.demand_all) {
         for (const auto& field : scan.lazy->schema().columns) {
@@ -301,7 +302,7 @@ auto materialize_deferred_scan_rows(const DeferredScan& scan, const Selection& r
         }
     }
     names.erase(scan.key_column);
-    auto rest = scan.lazy->project_rows(names, rows, exec);
+    auto rest = scan.lazy->project_rows(names, rows, exec, unit);
     if (!rest) {
         return std::unexpected(rest.error());
     }

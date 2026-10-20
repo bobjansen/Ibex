@@ -322,6 +322,9 @@ void configure_parallel_from_env(ExecutionContext& exec) {
     if (const auto want = parallel_join_probe_from_env(); want.has_value()) {
         exec.parallel_join_probe = *want;
     }
+    if (const auto want = stream_probes_from_env(); want.has_value()) {
+        exec.stream_probes = *want;
+    }
     // Pin the COMPUTE budget to the core count. Every compute gate sizes itself
     // from `parallel_threads`, falling back to the pool size when it is 0 — and
     // the pool is now sized for decode, which wants more threads than cores

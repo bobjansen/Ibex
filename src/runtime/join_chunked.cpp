@@ -80,6 +80,7 @@
 #include "interpreter_internal.hpp"
 #include "join_chunked_internal.hpp"
 #include "join_internal.hpp"
+#include "pipeline_executor_internal.hpp"
 #include "runtime_internal.hpp"
 
 namespace ibex::runtime {
@@ -1908,8 +1909,135 @@ struct PrecomputedHashProbeInput {
     Table output;
 };
 
-using HashProbeInput =
-    std::variant<StreamingHashProbeInput, SwappedHashProbeInput, PrecomputedHashProbeInput>;
+/// A deferred probe that runs per unit inside a streaming pipeline
+/// (`ExecutionContext::stream_probes`): the pipeline is the probe.
+struct StreamedHashProbeInput {
+    OperatorPtr pipeline;
+};
+
+using HashProbeInput = std::variant<StreamingHashProbeInput, SwappedHashProbeInput,
+                                    PrecomputedHashProbeInput, StreamedHashProbeInput>;
+
+/// What every worker of a streamed two-phase probe reads and nobody writes.
+struct StreamedTwoPhaseShared {
+    const DeferredScan* scan = nullptr;
+    std::vector<SourceUnit> units;
+    /// The materialized build (left) side the index was built over.
+    std::shared_ptr<const Table> build;
+    /// The probe's right input: the scan itself, or Project/Rename/Update
+    /// wrappers over it, interpreted per unit with the scan's name bound to the
+    /// unit's decoded rows (as `interpret_wrapped_right` does for the whole).
+    const ir::Node* right_node = nullptr;
+    bool bare_scan = true;
+    const TableRegistry* registry = nullptr;
+    const ScalarRegistry* scalars = nullptr;
+    const ExternRegistry* externs = nullptr;
+    std::string scan_name;
+};
+
+/// One unit of the two-phase deferred probe, on the calling worker: the unit's
+/// key selection, a serial probe of its keys through the built left index,
+/// the selected decode of its payload, and the assembled join rows. The units'
+/// outputs, concatenated in unit order, are the rows (and the order) the
+/// whole-source `try_two_phase_probe` produces.
+auto run_streamed_two_phase_unit(const StreamedTwoPhaseShared& shared, JoinProbe& probe,
+                                 std::size_t unit_index, const ExecutionContext& exec)
+    -> std::expected<Table, std::string> {
+    const SourceUnit& unit = shared.units[unit_index];
+    auto phase = deferred_scan_key_selection(*shared.scan, exec, &unit);
+    if (!phase.has_value()) {
+        return std::unexpected(std::move(phase.error()));
+    }
+    if (!phase->has_value()) {
+        return std::unexpected("streamed join probe: the probe scan had no key selection");
+    }
+    auto sel = std::move(**phase);
+    const auto* keys_col = std::get_if<Column<std::int64_t>>(&*sel.keys.column);
+    if (keys_col == nullptr) {
+        return std::unexpected("streamed join probe: probe key is not Int64");
+    }
+    const auto* key_data = keys_col->data();
+    const ValidityBitmap* key_validity =
+        sel.keys.validity.has_value() ? &*sel.keys.validity : nullptr;
+    const std::size_t n = keys_col->size();
+
+    // `try_two_phase_probe`'s scan and replay, serially: this worker owns the unit.
+    std::vector<JoinProbe::SwappedHit> hits;
+    std::size_t total = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (key_validity != nullptr && !(*key_validity)[i]) {
+            continue;
+        }
+        const std::size_t head = probe.index().i64_heads.find_head(key_data[i]);
+        if (head == kJoinNil) {
+            continue;
+        }
+        hits.push_back(JoinProbe::SwappedHit{.rrow = i, .head = head});
+        for (std::size_t cur = head; cur != kJoinNil; cur = probe.index().chain_next[cur]) {
+            ++total;
+        }
+    }
+    const std::size_t n_hits = hits.size();
+    Selection survivors(n_hits);
+    std::vector<std::size_t> li(total, 0);
+    std::vector<std::size_t> ri(total, 0);
+    const bool gather_keys = n_hits != n;
+    Column<std::int64_t> gathered_keys;
+    if (gather_keys) {
+        gathered_keys.resize_for_overwrite(n_hits);
+    }
+    std::int64_t* gathered_out = gather_keys ? gathered_keys.data() : nullptr;
+    std::size_t pos = 0;
+    for (std::size_t h = 0; h < n_hits; ++h) {
+        const JoinProbe::SwappedHit& hit = hits[h];
+        survivors[h] = sel.selected[hit.rrow];
+        if (gathered_out != nullptr) {
+            gathered_out[h] = key_data[hit.rrow];
+        }
+        for (std::size_t cur = hit.head; cur != kJoinNil; cur = probe.index().chain_next[cur]) {
+            li[pos] = cur;
+            ri[pos] = h;
+            ++pos;
+        }
+    }
+    const bool ri_identity = total == n_hits;
+
+    ColumnEntry key_entry;
+    key_entry.name = sel.keys.name;
+    if (!gather_keys) {
+        key_entry.column = sel.keys.column;
+        key_entry.validity = sel.keys.validity;
+    } else {
+        key_entry.column = std::make_shared<ColumnValue>(std::move(gathered_keys));
+    }
+    auto right_rows =
+        materialize_deferred_scan_rows(*shared.scan, survivors, exec, key_entry, &unit);
+    if (!right_rows.has_value()) {
+        return std::unexpected(std::move(right_rows.error()));
+    }
+    Table right;
+    if (shared.bare_scan) {
+        right = std::move(*right_rows);
+    } else {
+        TableRegistry local = *shared.registry;
+        local.insert_or_assign(shared.scan_name, std::move(*right_rows));
+        auto wrapped =
+            materialize_plan(*shared.right_node, local, shared.scalars, shared.externs, exec);
+        if (!wrapped.has_value()) {
+            return std::unexpected(std::move(wrapped.error()));
+        }
+        right = std::move(*wrapped);
+    }
+    probe.right_ = std::make_shared<const Table>(std::move(right));
+
+    Table left_side;
+    left_side.columns.reserve(shared.build->columns.size());
+    for (const auto& c : shared.build->columns) {
+        left_side.add_column_from(c.name, c);
+    }
+    return probe.assemble_output(std::move(left_side), li.data(), ri.data(), total,
+                                 /*li_identity=*/false, ri_identity);
+}
 
 /// Inner hash join for no-predicate joins on a single key or two Int64 keys.
 ///
@@ -1984,6 +2112,9 @@ class ChunkedInnerJoinOperator final : public Operator {
             swapped_emitted_ = true;
             return std::optional<Chunk>{table_to_chunk(std::move(precomputed_output_))};
         }
+        if (mode_ == Mode::Streamed) {
+            return streamed_pipeline_->next();
+        }
 
         if (mode_ == Mode::Swapped) {
             if (swapped_emitted_) {
@@ -2047,6 +2178,10 @@ class ChunkedInnerJoinOperator final : public Operator {
             return HashProbeInput{
                 PrecomputedHashProbeInput{.output = std::move(precomputed_output_)}};
         }
+        if (mode_ == Mode::Streamed) {
+            return HashProbeInput{
+                StreamedHashProbeInput{.pipeline = std::move(streamed_pipeline_)}};
+        }
         if (mode_ == Mode::Swapped) {
             if (!left_table_.has_value()) {
                 return std::unexpected(
@@ -2069,7 +2204,7 @@ class ChunkedInnerJoinOperator final : public Operator {
     }
 
    private:
-    enum class Mode : std::uint8_t { Stream, Swapped, Precomputed };
+    enum class Mode : std::uint8_t { Stream, Swapped, Precomputed, Streamed };
 
     /// The chain terminator, shared with the index this operator probes.
     static constexpr std::size_t kNil = kJoinNil;
@@ -2105,7 +2240,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             if (auto err = resolve_deferred_probe()) {
                 return err;
             }
-            if (mode_ == Mode::Precomputed) {
+            if (mode_ == Mode::Precomputed || mode_ == Mode::Streamed) {
                 return std::nullopt;
             }
         }
@@ -2547,6 +2682,11 @@ class ChunkedInnerJoinOperator final : public Operator {
                 mode_ = Mode::Precomputed;
                 return std::nullopt;
             }
+            if (outcome == TwoPhase::Streamed) {
+                deferred_probe_ = nullptr;
+                mode_ = Mode::Streamed;
+                return std::nullopt;
+            }
             if (outcome == TwoPhase::RightMaterialized) {
                 // Phase A ran but full two-phase declined; its selection was
                 // reused to materialize right_, so fall through to the
@@ -2565,7 +2705,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         return std::nullopt;
     }
 
-    enum class TwoPhase : std::uint8_t { NotApplicable, RightMaterialized, Precomputed };
+    enum class TwoPhase : std::uint8_t { NotApplicable, RightMaterialized, Precomputed, Streamed };
 
     /// Interpret the Project/Rename/Update wrappers over an already
     /// materialized scan table by shadowing the scan name in a registry
@@ -2613,6 +2753,15 @@ class ChunkedInnerJoinOperator final : public Operator {
         if (build_entry == nullptr ||
             !std::holds_alternative<Column<std::int64_t>>(*build_entry->column)) {
             return std::nullopt;
+        }
+
+        if (deferred_exec_->stream_probes) {
+            if (auto err = try_stream_two_phase(build, outcome)) {
+                return err;
+            }
+            if (outcome == TwoPhase::Streamed) {
+                return std::nullopt;
+            }
         }
 
         auto phase = deferred_scan_key_selection(*deferred_probe_, *deferred_exec_);
@@ -2785,6 +2934,52 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
         precomputed_output_ = std::move(*out);
         outcome = TwoPhase::Precomputed;
+        return std::nullopt;
+    }
+
+    /// The two-phase probe as a streaming pipeline: build the left index here,
+    /// then let each unit of the probe scan run its key selection, probe,
+    /// selected decode and assembly on one worker (`run_streamed_two_phase_unit`).
+    /// Declines (outcome unchanged) when the scan cannot select per unit or has
+    /// a single unit. Never on worker count: see `build_unit_pipeline`.
+    auto try_stream_two_phase(const Table& build, TwoPhase& outcome) -> std::optional<std::string> {
+        const DeferredScan& scan = *deferred_probe_;
+        if (scan.lazy == nullptr || !scan.lazy->unit_selection_ready(scan.key_column)) {
+            return std::nullopt;
+        }
+        auto units = deferred_scan_units(scan);
+        if (units.size() < 2) {
+            return std::nullopt;
+        }
+        if (auto published = publish_build(
+                build_join_side(build, keys_->front().left, ExprType::Int,
+                                JoinOrientation::BuildLeft, build_partitions(build.rows())));
+            !published.has_value()) {
+            return std::move(published.error());
+        }
+        auto shared = std::make_shared<StreamedTwoPhaseShared>();
+        shared->scan = &scan;
+        shared->units = units;
+        shared->build = std::make_shared<const Table>(std::move(*left_materialized_));
+        left_materialized_.reset();
+        shared->right_node = deferred_right_node_;
+        shared->bare_scan = deferred_right_node_->kind() == ir::NodeKind::Scan;
+        shared->registry = deferred_registry_;
+        shared->scalars = deferred_scalars_;
+        shared->externs = deferred_externs_;
+        shared->scan_name = deferred_probe_name_;
+        auto prototype = std::make_shared<const JoinProbe>(probe_);
+        streamed_pipeline_ = pipeline_executor_detail::build_unit_pipeline(
+            std::move(units),
+            [shared, prototype]() -> pipeline_executor_detail::UnitProducer {
+                auto probe = std::make_shared<JoinProbe>(*prototype);
+                return [shared, probe](std::size_t unit, const ExecutionContext& exec) {
+                    probe->exec_ = &exec;
+                    return run_streamed_two_phase_unit(*shared, *probe, unit, exec);
+                };
+            },
+            *deferred_exec_);
+        outcome = TwoPhase::Streamed;
         return std::nullopt;
     }
 
@@ -3081,6 +3276,10 @@ class ChunkedInnerJoinOperator final : public Operator {
     // Precomputed mode: the two-phase deferred probe assembled the whole
     // join output during initialization.
     Table precomputed_output_;
+
+    // Streamed mode: the two-phase deferred probe runs per unit inside this
+    // streaming pipeline instead (`try_stream_two_phase`).
+    OperatorPtr streamed_pipeline_;
 };
 
 /// HashProbe for the runtime BuildLeft orientation. The build has already
@@ -3134,9 +3333,30 @@ class PrecomputedHashProbeOperator final : public Operator {
 /// by the build owns the only legal probe implementation for that orientation.
 auto build_hash_probe_operator(HashProbeInput input) -> std::expected<OperatorPtr, std::string> {
     if (auto* stream = std::get_if<StreamingHashProbeInput>(&input)) {
+        // A streaming left input whose units run on pool workers takes this
+        // probe into every worker's chain, so each unit is probed on the core
+        // that produced it (`ExecutionContext::stream_probes`).
+        if (stream->source != nullptr && !stream->materialized_source.has_value() &&
+            stream->probe.exec_ != nullptr && stream->probe.exec_->stream_probes) {
+            auto prototype = std::make_shared<const JoinProbe>(stream->probe);
+            const bool attached = pipeline_executor_detail::try_attach_worker_step(
+                *stream->source,
+                [prototype](OperatorPtr chain, const ExecutionContext& exec) -> OperatorPtr {
+                    JoinProbe probe = *prototype;
+                    probe.exec_ = &exec;
+                    return std::make_unique<JoinProbeOperator>(std::move(chain), std::move(probe),
+                                                               /*preserve_empty_morsels=*/true);
+                });
+            if (attached) {
+                return std::move(stream->source);
+            }
+        }
         return make_join_probe_operator(std::move(stream->source),
                                         std::move(stream->materialized_source),
                                         make_probe_factory(std::move(stream->probe)));
+    }
+    if (auto* streamed = std::get_if<StreamedHashProbeInput>(&input)) {
+        return std::move(streamed->pipeline);
     }
     if (auto* swapped = std::get_if<SwappedHashProbeInput>(&input)) {
         return OperatorPtr{std::make_unique<SwappedHashProbeOperator>(std::move(*swapped))};

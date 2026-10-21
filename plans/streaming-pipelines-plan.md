@@ -168,8 +168,12 @@ says so.
    its stage thread. Fixed by unbatching drained pipelines (`8854cd63`:
    streamed q07 -10.5%, q09 -7.2%). Copying the drain over the pool instead
    gained nothing and lost the append's overlap with the producer (q19, q14
-   regressed). Still open: q21's largest hole (~160 ms at one core, 8c) is
-   the aggregate's `try_owned` allocating and zeroing serially, not a join.
+   regressed). q21's largest hole (~180 ms at one core, 8c) was not a join
+   either: two serial zero-fills of aggregate scratch the parallel passes
+   overwrite (`gids_buf_` for a 60M-row chunk, the run-compressed key/count
+   arrays); not zero-filling them was q21 -15% (`7dcadc5b`). Zero-filled
+   row-sized scratch on the calling thread is worth hunting elsewhere: a
+   busy-core timeline shows it as one core of kernel page faults.
 4. **Semi/anti joins as probe steps** (q04, q21, q22).
 5. **Retire Layer B probe morsels** (`try_take_join_probe`,
    `build_probe_morsel_pipeline`, `IBEX_PROBE_MORSELS`), and rewrite

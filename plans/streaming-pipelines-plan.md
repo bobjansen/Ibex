@@ -159,6 +159,17 @@ says so.
    The largest slice (`aggregate_chunked.cpp`, 9.5k lines).
 3. **Hash build as a sink.** Build input streams into per-worker partitions
    instead of materialize-then-partition (q09, q18, q21).
+   **Measured first (2026-10-21, native, 8 P-cores, `perf` 20 ms busy-core
+   timelines):** the partitioned build is ~4% of cycles on q03/q09, in 20-50 ms
+   windows already 5-7 cores busy, and q18/q21 have no inner build worth
+   speaking of -- per-worker partitioning can buy ~5% at most. The serial
+   time was the "materialize" half: q09's drain of the streamed probe output
+   ran ~60 ms on one core, mostly the unit pipeline's 1M-row batching copy on
+   its stage thread. Fixed by unbatching drained pipelines (`8854cd63`:
+   streamed q07 -10.5%, q09 -7.2%). Copying the drain over the pool instead
+   gained nothing and lost the append's overlap with the producer (q19, q14
+   regressed). Still open: q21's largest hole (~160 ms at one core, 8c) is
+   the aggregate's `try_owned` allocating and zeroing serially, not a join.
 4. **Semi/anti joins as probe steps** (q04, q21, q22).
 5. **Retire Layer B probe morsels** (`try_take_join_probe`,
    `build_probe_morsel_pipeline`, `IBEX_PROBE_MORSELS`), and rewrite

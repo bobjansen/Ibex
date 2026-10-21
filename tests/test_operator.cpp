@@ -8,6 +8,7 @@
 #include <ibex/runtime/morsel.hpp>
 #include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/ops.hpp>
+#include <ibex/runtime/table_compare.hpp>
 #include <ibex/runtime/table_properties.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -23,6 +24,9 @@
 #include <utility>
 #include <variant>
 #include <vector>
+
+#include "interpreter_internal.hpp"
+#include "pipeline_executor_internal.hpp"
 
 using namespace ibex;
 
@@ -445,4 +449,91 @@ TEST_CASE("PartitionedTableSource stamps ascending sequence and absolute row_off
     auto done = source.next();
     REQUIRE(done.has_value());
     REQUIRE_FALSE(done.value().has_value());
+}
+
+namespace {
+
+/// A unit pipeline of `units` units of ten rows each, `x` = the row's index.
+auto ten_row_unit_pipeline(std::size_t units, const runtime::ExecutionContext& exec)
+    -> runtime::OperatorPtr {
+    std::vector<runtime::SourceUnit> list;
+    for (std::size_t u = 0; u < units; ++u) {
+        list.push_back(runtime::SourceUnit{.start = u * 10, .rows = 10});
+    }
+    return runtime::pipeline_executor_detail::build_unit_pipeline(
+        std::move(list),
+        [] {
+            return runtime::pipeline_executor_detail::UnitProducer{
+                [](std::size_t unit, const runtime::ExecutionContext& /*exec*/)
+                    -> std::expected<runtime::Table, std::string> {
+                    Column<std::int64_t> x;
+                    for (std::size_t r = 0; r < 10; ++r) {
+                        x.push_back(static_cast<std::int64_t>((unit * 10) + r));
+                    }
+                    runtime::Table table;
+                    table.add_column("x", std::move(x));
+                    return table;
+                }};
+        },
+        exec);
+}
+
+/// How many chunks `op` emits until it ends.
+auto count_chunks(runtime::Operator& op) -> std::size_t {
+    std::size_t chunks = 0;
+    while (true) {
+        auto chunk = op.next();
+        REQUIRE(chunk.has_value());
+        if (!chunk->has_value()) {
+            return chunks;
+        }
+        ++chunks;
+    }
+}
+
+}  // namespace
+
+TEST_CASE("A drain switches off a unit pipeline's output batching") {
+    runtime::ExecutionContext exec;
+    exec.parallel_threads = 4;
+    namespace detail = runtime::pipeline_executor_detail;
+
+    SECTION("batched, the four units leave as one chunk") {
+        auto op = ten_row_unit_pipeline(4, exec);
+        REQUIRE(count_chunks(*op) == 1);
+    }
+    SECTION("unbatched, one chunk per unit") {
+        auto op = ten_row_unit_pipeline(4, exec);
+        REQUIRE(detail::unbatch_pipeline_output(*op));
+        REQUIRE(count_chunks(*op) == 4);
+    }
+    SECTION("through a stage whose thread has not started") {
+        auto op = detail::make_pipelined_stage_if(ten_row_unit_pipeline(4, exec), true, exec,
+                                                  nullptr);
+        REQUIRE(detail::unbatch_pipeline_output(*op));
+        REQUIRE(count_chunks(*op) == 4);
+    }
+    SECTION("not once the stage has started") {
+        auto op = detail::make_pipelined_stage_if(ten_row_unit_pipeline(4, exec), true, exec,
+                                                  nullptr);
+        auto first = op->next();
+        REQUIRE(first.has_value());
+        REQUIRE_FALSE(detail::unbatch_pipeline_output(*op));
+    }
+    SECTION("not anything else") {
+        std::vector<runtime::Chunk> chunks;
+        chunks.push_back(make_int_chunk("x", {1, 2}));
+        VectorSource source{std::move(chunks)};
+        REQUIRE_FALSE(detail::unbatch_pipeline_output(source));
+    }
+    SECTION("materialize_operator drains it to the same table") {
+        auto expected = runtime::MaterializeOperator{ten_row_unit_pipeline(4, exec)}.run();
+        auto actual = runtime::materialize_operator(ten_row_unit_pipeline(4, exec));
+        REQUIRE(expected.has_value());
+        REQUIRE(actual.has_value());
+        REQUIRE(actual->rows() == 40);
+        const auto mismatch = runtime::compare_tables(*expected, *actual);
+        INFO((mismatch.has_value() ? mismatch->message() : std::string{}));
+        REQUIRE_FALSE(mismatch.has_value());
+    }
 }

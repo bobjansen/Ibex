@@ -2494,6 +2494,12 @@ class PipelinedStageOperator final : public Operator {
     PipelinedStageOperator(PipelinedStageOperator&&) = delete;
     auto operator=(PipelinedStageOperator&&) -> PipelinedStageOperator& = delete;
 
+    /// The child, while the producer thread has not started and so nothing else
+    /// touches it; null after.
+    [[nodiscard]] auto unstarted_child() noexcept -> Operator* {
+        return started_ ? nullptr : child_.get();
+    }
+
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         start();
         std::expected<std::optional<Chunk>, std::string> result = std::optional<Chunk>{};
@@ -2793,6 +2799,21 @@ auto build_unit_pipeline(std::vector<SourceUnit> units, const UnitProducerFactor
 auto is_attachable_worker_pipeline(const Operator& op) -> bool {
     const auto* pipeline = dynamic_cast<const PipelinedScanOperator*>(&op);
     return pipeline != nullptr && pipeline->can_attach_worker_step();
+}
+
+auto unbatch_pipeline_output(Operator& op) -> bool {
+    // A stage only moves its child's chunks to another thread: the batching is
+    // its child's, and the stage thread is where it would run.
+    if (auto* stage = dynamic_cast<PipelinedStageOperator*>(&op)) {
+        Operator* child = stage->unstarted_child();
+        return child != nullptr && unbatch_pipeline_output(*child);
+    }
+    auto* pipeline = dynamic_cast<PipelinedScanOperator*>(&op);
+    if (pipeline == nullptr) {
+        return false;
+    }
+    pipeline->set_emit_batch_rows(0);
+    return true;
 }
 
 auto try_attach_worker_step(Operator& op, const WorkerStepAttach& attach) -> bool {

@@ -591,8 +591,7 @@ auto interpret(const ir::Node& node, const TableRegistry& registry, const Scalar
     if (!op.has_value()) {
         return std::unexpected(std::move(op.error()));
     }
-    MaterializeOperator sink{std::move(op.value())};
-    return sink.run();
+    return materialize_operator(std::move(op.value()));
 }
 
 auto interpret(const ir::Node& node, const TableRegistry& registry, const ScalarRegistry* scalars,

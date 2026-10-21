@@ -84,6 +84,11 @@ using WorkerStepAttach =
 /// worth building the right for, without draining the left to measure it.
 [[nodiscard]] auto is_attachable_worker_pipeline(const Operator& op) -> bool;
 
+/// Stop `op` batching its output when it is a streaming pipeline: true when it
+/// was one. For a consumer that takes every chunk at once (a drain), where the
+/// batching only copies the rows an extra time on the consuming thread.
+auto unbatch_pipeline_output(Operator& op) -> bool;
+
 [[nodiscard]] auto has_multi_unit_deferred_scan(const ir::Node& node, const TableRegistry& registry,
                                                 const ExecutionContext& exec) -> bool;
 

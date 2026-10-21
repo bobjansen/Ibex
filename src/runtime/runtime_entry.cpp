@@ -55,6 +55,15 @@
 namespace ibex::runtime {
 
 auto materialize_operator(OperatorPtr op) -> std::expected<Table, std::string> {
+    // A drain takes every chunk, so a streaming pipeline's batching (its units'
+    // chunks glued to 1M rows for the per-chunk breakers above it) would only
+    // copy each row once more, serially, on the thread that emits them, before
+    // this copies it again. Unbatched: PDS-H SF-10 with streamed probes, 8
+    // cores, q07 -11%, q09 -8%, q03 -4%, q05 -2%. Appending as chunks arrive
+    // stays: it hides the copy behind the producer. Draining first and copying
+    // over the pool after the last chunk was measured too, and gained nothing
+    // over this while losing that overlap (q19 +1.9%, q14 +0.8%).
+    (void)pipeline_executor_detail::unbatch_pipeline_output(*op);
     MaterializeOperator sink{std::move(op)};
     return sink.run();
 }

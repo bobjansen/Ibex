@@ -1945,6 +1945,8 @@ enum class FloatCleanMode : std::uint8_t {
     const physical::Plan& plan, const ir::Node& node, const TableRegistry& registry,
     const ScalarRegistry* scalars, const ExternRegistry* externs, const ExecutionContext& exec,
     ModelResult* model_out) -> std::expected<OperatorPtr, std::string>;
+/// Drain `op` into a table: `MaterializeOperator`, with a streaming pipeline's
+/// output batching switched off first (`unbatch_pipeline_output`).
 [[nodiscard]] auto materialize_operator(OperatorPtr op) -> std::expected<Table, std::string>;
 /// Build `node` through the physical path (`build_operator`) and drain it to a
 /// table. The one way a materializing step evaluates a relational input: a

@@ -2577,7 +2577,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             if (left_ == nullptr) {
                 return std::optional<FusibleJoinProbe>{};
             }
-            auto drained = MaterializeOperator(std::move(left_)).run();
+            auto drained = materialize_operator(std::move(left_));
             if (!drained.has_value()) {
                 return std::unexpected(std::move(drained.error()));
             }
@@ -2621,7 +2621,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             left_materialized_.reset();
             use_materialized_left_ = false;
         } else {
-            auto left_res = MaterializeOperator(std::move(left_)).run();
+            auto left_res = materialize_operator(std::move(left_));
             if (!left_res.has_value()) {
                 return std::move(left_res.error());
             }
@@ -2696,7 +2696,7 @@ class ChunkedInnerJoinOperator final : public Operator {
                 .orientation = JoinOrientation::BuildRight});
         }
         if (deferred_probe_->lazy->rows() > kStreamRightThreshold) {
-            auto left_res = MaterializeOperator(std::move(left_)).run();
+            auto left_res = materialize_operator(std::move(left_));
             if (!left_res.has_value()) {
                 return std::move(left_res.error());
             }
@@ -2742,7 +2742,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         // Pre-filter row count: an upper bound on the decoded size, good
         // enough to decide whether the probe side is large enough to bother.
         if (deferred_probe_->lazy->rows() > kStreamRightThreshold) {
-            auto left_res = MaterializeOperator(std::move(left_)).run();
+            auto left_res = materialize_operator(std::move(left_));
             if (!left_res.has_value()) {
                 return std::move(left_res.error());
             }

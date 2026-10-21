@@ -508,14 +508,14 @@ TEST_CASE("A drain switches off a unit pipeline's output batching") {
         REQUIRE(count_chunks(*op) == 4);
     }
     SECTION("through a stage whose thread has not started") {
-        auto op = detail::make_pipelined_stage_if(ten_row_unit_pipeline(4, exec), true, exec,
-                                                  nullptr);
+        auto op =
+            detail::make_pipelined_stage_if(ten_row_unit_pipeline(4, exec), true, exec, nullptr);
         REQUIRE(detail::unbatch_pipeline_output(*op));
         REQUIRE(count_chunks(*op) == 4);
     }
     SECTION("not once the stage has started") {
-        auto op = detail::make_pipelined_stage_if(ten_row_unit_pipeline(4, exec), true, exec,
-                                                  nullptr);
+        auto op =
+            detail::make_pipelined_stage_if(ten_row_unit_pipeline(4, exec), true, exec, nullptr);
         auto first = op->next();
         REQUIRE(first.has_value());
         REQUIRE_FALSE(detail::unbatch_pipeline_output(*op));

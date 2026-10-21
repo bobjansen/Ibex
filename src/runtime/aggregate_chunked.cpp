@@ -8271,8 +8271,14 @@ class HashAggregateState final {
     // Flat accumulator storage: n_groups_ × n_aggs_ contiguous AggSlotCores.
     SlotArray<AggSlotCore> flat_slots_;
 
-    // Reusable per-chunk gids buffer to avoid repeated heap allocations.
-    std::vector<std::uint32_t> gids_buf_;
+    // Reusable per-chunk gids buffer to avoid repeated heap allocations. Not
+    // zero-filled on growth: every discovery path writes a gid for each row it
+    // is handed before anything reads one (a later chunk already reuses the
+    // previous chunk's stale gids). Checked by poisoning every row with an
+    // out-of-range gid: full ctest, parity and PDS-H at 1 and 8 cores unchanged.
+    // Zeroing cost q21 ~60 ms of one busy core: its one 60M-row chunk faulted
+    // a 240 MB buffer in serially for a run-compressed path that never reads it.
+    ::ibex::detail::NoInitVector<std::uint32_t> gids_buf_;
     AggregateDiscoveryTransfer discovery_transfer_;
 
     // Generic path (non-Categorical group keys).
@@ -8416,8 +8422,12 @@ class HashAggregateState final {
     std::optional<std::string> owned_async_pair_error_;
     std::size_t owned_async_pair_part_count_ = 0;
     bool owned_async_pair_mode_ = false;
-    std::vector<std::int64_t> owned_ordered_run_keys_;
-    std::vector<std::size_t> owned_ordered_run_counts_;
+    /// Run-compressed (key, length) pairs. Not zero-filled on growth: the
+    /// parallel emit pass writes every slot a chunk adds, and a zeroing
+    /// `resize` faulted q21's ~15M runs in serially on the calling thread
+    /// (~160 ms of one busy core at 8 cores).
+    ::ibex::detail::NoInitVector<std::int64_t> owned_ordered_run_keys_;
+    ::ibex::detail::NoInitVector<std::size_t> owned_ordered_run_counts_;
     bool owned_ordered_run_mode_ = false;
     bool owned_ordered_runs_nondecreasing_ = true;
     /// Set once this operator has committed to owned-partition mode. Per the

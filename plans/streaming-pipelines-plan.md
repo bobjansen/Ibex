@@ -81,9 +81,12 @@ and it morselizes a materialized table (a §5 dead end of `beat-both-plan.md`).
 ## Slices
 
 Each slice: the same answers 22/22 at 1 and 8 cores, rows and order exact,
-floats within tolerance (`src/runtime/CONTRACTS.md` §7), `ab_queries.py`
-locally, the 1-to-8-core CPI and idle split on the native Linux box (`perf_counters.py`),
-then AWS. A slice that does not move the 8-core wall is not landed.
+floats within tolerance (`src/runtime/CONTRACTS.md` §7), then AWS. A slice
+lands on an interleaved A/B on the native box at 8 P-cores (signed-rank per
+query; `MEASURING.md`): a net gain in total 8-core wall, and no query with a
+significant regression. An enabling step that is wall-neutral but cuts idle or
+CPI (`perf_counters.py`) may land only when the next slice depends on it, and
+says so.
 
 1. **Probe steps in the scan-pipeline worker chain.** A streaming inner probe
    (single-key and pair-int, against an already-built index) becomes a step of

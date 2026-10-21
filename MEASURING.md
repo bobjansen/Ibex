@@ -354,13 +354,21 @@ diff <(IBEX_CORES=8 ./build-release/tools/ibex_eval ... q.ibex) \
      <(IBEX_CORES=1 ./build-release/tools/ibex_eval ... q.ibex)
 ```
 
-### perf, and what does not work here
+### perf on the native box
 
-`perf record` works; **hardware counters do not**. This is WSL2, so
-`perf stat -e cache-misses,L1-dcache-load-misses` returns `<not supported>` for
-every PMU event. Do not build an argument on a cache-miss number you did not
-actually get — if you need to test a locality hypothesis, change the layout and
-measure wall time instead.
+The dev box is native Linux (i7-13700: CPUs 0-15 are 8 P-cores as hyperthread
+pairs, 16-23 E-cores), so hardware counters work. Put it in its measuring state
+first, and take it out after:
+
+```bash
+scripts/perf-box.sh on    # unprivileged perf, kernel symbols, NMI watchdog off, 3.2 GHz lock
+scripts/perf-box.sh off   # restore
+```
+
+N cores means one thread per P-core: `taskset -c 0,2,4,...` (the first N even
+CPUs), never `0-7`, which is 4 cores' hyperthreads. Release builds keep no frame
+pointers, so `-g` stops at the leaf; `--call-graph lbr` gives user-space callers
+cheaply, `dwarf` everything at a much higher cost.
 
 ```bash
 perf record -q -g --call-graph=dwarf,16384 -F 999 -o perf.data -- \
@@ -493,9 +501,9 @@ outcomes, not two — **same** (too small to matter), **unclear** (an effect the
 data cannot separate from noise; raise repeats), and a verdict. Reporting
 `unclear` as "no change" is how a real regression ships.
 
-Check the box is quiet first (`ps --sort=-pcpu -eo pcpu,comm | head`); WSL2
-load average lies. Never run a build while benchmarking, and see §1a on the
-post-commit hook.
+Check the box is quiet first (`ps --sort=-pcpu -eo pcpu,comm | head`) and
+locked (`scripts/perf-box.sh status`). Never run a build while benchmarking,
+and see §1a on the post-commit hook.
 
 ### Statistics cannot tell you a delta is CAUSED by your change
 

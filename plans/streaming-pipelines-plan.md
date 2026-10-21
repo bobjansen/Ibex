@@ -171,9 +171,14 @@ says so.
    regressed). q21's largest hole (~180 ms at one core, 8c) was not a join
    either: two serial zero-fills of aggregate scratch the parallel passes
    overwrite (`gids_buf_` for a 60M-row chunk, the run-compressed key/count
-   arrays); not zero-filling them was q21 -15% (`7dcadc5b`). Zero-filled
-   row-sized scratch on the calling thread is worth hunting elsewhere: a
-   busy-core timeline shows it as one core of kernel page faults.
+   arrays); not zero-filling them was q21 -15% (`7dcadc5b`). A hunt for more
+   (2026-10-21: page faults by thread over all 22 queries, both modes) found
+   none worth it. The main thread's large faulters are the drain's
+   chunk-by-chunk append (overlapped with the producer; see above) and
+   decode. The join build's `chain_next` fill and the two-phase probe's
+   `li`/`ri` zero-fills (~20 MB a query) were made unwritten, proven safe by
+   poisoning, and measured twice: ±2-3% per query that flipped sign between
+   runs, with a significant regression each time (q20). Not landed.
 4. **Semi/anti joins as probe steps** (q04, q21, q22).
 5. **Retire Layer B probe morsels** (`try_take_join_probe`,
    `build_probe_morsel_pipeline`, `IBEX_PROBE_MORSELS`), and rewrite

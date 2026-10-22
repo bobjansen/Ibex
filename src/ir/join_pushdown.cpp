@@ -12,8 +12,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <robin_hood.h>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -77,6 +79,103 @@ auto and_combine(std::vector<Expr> parts) -> Expr {
                                        .right = make_expr_ptr(std::move(parts[i]))}};
     }
     return acc;
+}
+
+/// Flatten the top-level OR spine of `expr` into its disjuncts.
+void collect_disjuncts(const Expr& expr, std::vector<const Expr*>& out) {
+    if (const auto* logical = std::get_if<LogicalExpr>(&expr.node);
+        logical != nullptr && logical->op == LogicalOp::Or && logical->left != nullptr &&
+        logical->right != nullptr) {
+        collect_disjuncts(*logical->left, out);
+        collect_disjuncts(*logical->right, out);
+        return;
+    }
+    out.push_back(&expr);
+}
+
+/// Fold disjuncts back into one left-associated OR chain.
+auto or_combine(std::vector<Expr> parts) -> Expr {
+    Expr acc = std::move(parts.front());
+    for (std::size_t i = 1; i < parts.size(); ++i) {
+        acc = Expr{.node = LogicalExpr{.op = LogicalOp::Or,
+                                       .left = make_expr_ptr(std::move(acc)),
+                                       .right = make_expr_ptr(std::move(parts[i]))}};
+    }
+    return acc;
+}
+
+auto expr_equal(const Expr& a, const Expr& b) -> bool;
+
+auto expr_ptr_equal(const ExprPtr& a, const ExprPtr& b) -> bool {
+    if (a == nullptr || b == nullptr) {
+        return a == nullptr && b == nullptr;
+    }
+    return expr_equal(*a, *b);
+}
+
+/// Structural equality, for the idempotence check in `already_filtered_on`.
+/// A rank is never row-local, so it never reaches a pushed filter; it compares
+/// unequal, which only ever costs a redundant filter, never a missing one.
+auto expr_equal(const Expr& a, const Expr& b) -> bool {
+    if (a.node.index() != b.node.index()) {
+        return false;
+    }
+    return std::visit(
+        [&b](const auto& lhs) -> bool {
+            using T = std::decay_t<decltype(lhs)>;
+            const auto& rhs = std::get<T>(b.node);
+            if constexpr (std::is_same_v<T, ColumnRef>) {
+                return lhs.name == rhs.name && lhs.source == rhs.source &&
+                       lhs.lexical == rhs.lexical && lhs.side == rhs.side;
+            } else if constexpr (std::is_same_v<T, Literal>) {
+                return lhs.value == rhs.value;
+            } else if constexpr (std::is_same_v<T, BinaryExpr> || std::is_same_v<T, CompareExpr> ||
+                                 std::is_same_v<T, LogicalExpr>) {
+                return lhs.op == rhs.op && expr_ptr_equal(lhs.left, rhs.left) &&
+                       expr_ptr_equal(lhs.right, rhs.right);
+            } else if constexpr (std::is_same_v<T, CallExpr>) {
+                if (lhs.callee != rhs.callee || lhs.args.size() != rhs.args.size() ||
+                    lhs.named_args.size() != rhs.named_args.size()) {
+                    return false;
+                }
+                for (std::size_t i = 0; i < lhs.args.size(); ++i) {
+                    if (!expr_ptr_equal(lhs.args[i], rhs.args[i])) {
+                        return false;
+                    }
+                }
+                for (std::size_t i = 0; i < lhs.named_args.size(); ++i) {
+                    if (lhs.named_args[i].name != rhs.named_args[i].name ||
+                        !expr_ptr_equal(lhs.named_args[i].value, rhs.named_args[i].value)) {
+                        return false;
+                    }
+                }
+                return true;
+            } else if constexpr (std::is_same_v<T, IsNullExpr>) {
+                return lhs.negated == rhs.negated && expr_ptr_equal(lhs.operand, rhs.operand);
+            } else {
+                return false;  // RankExpr
+            }
+        },
+        a.node);
+}
+
+/// Whether some Filter in `node`'s subtree already has `predicate` as one of
+/// its conjuncts. The pass runs more than once over one plan (lowering, then
+/// each REPL driver), and an implied predicate derived again on the next run
+/// must not be pushed a second time. Skipping a push is always sound.
+auto already_filtered_on(const Node& node, const Expr& predicate) -> bool {
+    if (node.kind() == NodeKind::Filter) {
+        std::vector<const Expr*> conjuncts;
+        collect_conjuncts(node_cast<FilterNode>(node).predicate(), conjuncts);
+        if (std::ranges::any_of(conjuncts, [&](const Expr* conjunct) {
+                return expr_equal(*conjunct, predicate);
+            })) {
+            return true;
+        }
+    }
+    return std::ranges::any_of(node.children(), [&](const NodePtr& child) {
+        return child != nullptr && already_filtered_on(*child, predicate);
+    });
 }
 
 /// Where one conjunct may be evaluated. `Above` is always sound.
@@ -144,6 +243,51 @@ auto remap_folded_key_refs_to_right(Expr expr, const std::vector<JoinKey>& keys)
     }
     ColumnNameMap(aliases).remap_expr_to_input(expr);
     return expr;
+}
+
+/// What a disjunction that must stay above the join implies about one input.
+///
+/// If every disjunct has conjuncts that `classify` confines to `side`, the
+/// disjunction implies the OR of those confined parts: on any row where the
+/// original is true some disjunct is true, so all of its conjuncts are -- under
+/// three-valued logic too, since a true AND needs every operand true. That
+/// implied predicate filters `side` before the join without losing a row, and
+/// the original stays above to do the rest. PDS-H q19's qualification OR names
+/// both tables in every branch; its part-only parts keep 4,754 of 2M parts and
+/// its quantity ranges union to 1-30, where nothing used to move at all.
+///
+/// nullopt when some disjunct has nothing confined to `side` (then nothing is
+/// implied about it) or `expr` is not a disjunction.
+auto implied_side_predicate(const Expr& expr, Destination side, const SchemaInfo& left,
+                            const SchemaInfo& right, const std::vector<JoinKey>& keys)
+    -> std::optional<Expr> {
+    std::vector<const Expr*> disjuncts;
+    collect_disjuncts(expr, disjuncts);
+    if (disjuncts.size() < 2) {
+        return std::nullopt;
+    }
+    std::vector<Expr> branches;
+    branches.reserve(disjuncts.size());
+    for (const Expr* disjunct : disjuncts) {
+        std::vector<const Expr*> conjuncts;
+        collect_conjuncts(*disjunct, conjuncts);
+        std::vector<Expr> confined;
+        for (const Expr* conjunct : conjuncts) {
+            const Destination dest = classify(*conjunct, left, right, keys);
+            if (dest == side) {
+                confined.push_back(*conjunct);
+            } else if (dest == Destination::BothSides) {
+                confined.push_back(side == Destination::Right
+                                       ? remap_folded_key_refs_to_right(*conjunct, keys)
+                                       : *conjunct);
+            }
+        }
+        if (confined.empty()) {
+            return std::nullopt;
+        }
+        branches.push_back(and_combine(std::move(confined)));
+    }
+    return or_combine(std::move(branches));
 }
 
 /// Rewrite one `Filter(pred, Join(a, b))` root. Children are assumed already
@@ -215,6 +359,25 @@ auto rewrite_filter_over_join(NodePtr node, const SourceSchemas& sources) -> Nod
                 break;
             case Destination::Above:
                 kept_parts.push_back(*conjunct);
+                // A disjunction that must stay above may still imply a filter
+                // on an input -- on the preserved side(s) only, by the same
+                // join-kind rule as above.
+                for (const Destination side : {Destination::Left, Destination::Right}) {
+                    const bool allowed = side == Destination::Left
+                                             ? (kind == JoinKind::Inner || kind == JoinKind::Left)
+                                             : (kind == JoinKind::Inner || kind == JoinKind::Right);
+                    if (!allowed) {
+                        continue;
+                    }
+                    auto implied = implied_side_predicate(*conjunct, side, left_schema,
+                                                          right_schema, join.keys());
+                    const auto& receiver = *join.children()[side == Destination::Left ? 0 : 1];
+                    if (!implied.has_value() || already_filtered_on(receiver, *implied)) {
+                        continue;
+                    }
+                    (side == Destination::Left ? left_parts : right_parts)
+                        .push_back(std::move(*implied));
+                }
                 break;
         }
     }

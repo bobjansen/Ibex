@@ -647,3 +647,87 @@ TEST_CASE("e2e lazy: head on the statement path decodes only the leading rows",
         CHECK(rows <= 2);
     }
 }
+
+// q19's shape: a qualification OR that names both tables in every branch. The
+// planner derives a filter for each table from it (the OR of each branch's
+// one-sided conjuncts) and keeps the OR above the join, so the answer must be
+// exactly the unfiltered one -- including where a null makes one branch
+// unknown but the other branch is true.
+namespace {
+
+/// q19's shape in miniature: parts {pk, brand, size}, lines {lk, qty, price},
+/// with a null brand on part 3 and a null quantity on part 4's second line.
+auto implied_part() -> Table {
+    Table part;
+    part.add_column("pk", Column<std::int64_t>{1, 2, 3, 4});
+    ibex::runtime::ValidityBitmap brand_valid(4, true);
+    brand_valid.set(2, false);  // part 3 has no brand
+    part.add_column("brand", Column<std::int64_t>{1, 2, 0, 1}, std::move(brand_valid));
+    part.add_column("size", Column<std::int64_t>{3, 12, 12, 20});
+    return part;
+}
+
+auto implied_line() -> Table {
+    Table line;
+    line.add_column("lk", Column<std::int64_t>{1, 1, 2, 3, 4, 4});
+    ibex::runtime::ValidityBitmap qty_valid(6, true);
+    qty_valid.set(5, false);  // the second line of part 4 has no quantity
+    line.add_column("qty", Column<std::int64_t>{3, 25, 25, 25, 4, 0}, std::move(qty_valid));
+    line.add_column("price", Column<std::int64_t>{10, 20, 30, 40, 50, 60});
+    return line;
+}
+
+constexpr const char* kImpliedQuery =
+    "(part join line on { pk = lk })[\n"
+    "    filter (brand == 1 && size <= 5 && qty <= 5) || (size >= 10 && qty >= 20),\n"
+    "    select { pk, price }\n"
+    "]";
+
+// Part 1 line 1: first branch. Parts 2 and 3: second branch (part 3's null
+// brand leaves the first branch unknown, the second is true). Part 4 fails
+// both; its null-quantity line is unknown in the second branch.
+const std::set<std::vector<std::int64_t>> kImpliedRows{{1, 10}, {2, 30}, {3, 40}};
+
+}  // namespace
+
+// q19's shape: a qualification OR that names both tables in every branch. The
+// planner derives a filter for each table from it (the OR of each branch's
+// one-sided conjuncts) and keeps the OR above the join, so the answer must be
+// exactly the unfiltered one -- including where a null makes one branch
+// unknown but the other branch is true.
+TEST_CASE("e2e lazy: a disjunction across join sides keeps exactly the qualifying rows",
+          "[e2e][lazy][implied]") {
+    const std::string src = std::string(R"(
+extern fn read_part() -> DataFrame from "x.hpp";
+extern fn read_line() -> DataFrame from "x.hpp";
+extern fn capture(df: DataFrame) -> Int from "x.hpp";
+
+let part = read_part();
+let line = read_line();
+let result = )") + kImpliedQuery +
+                            R"(;
+capture(result);
+result;
+)";
+    Table out = run_lazy_script(src.c_str(),
+                                {{"read_part", implied_part()}, {"read_line", implied_line()}});
+    REQUIRE(rows_of(out, {"pk", "price"}) == kImpliedRows);
+}
+
+// The same through the statement path: one interactive statement at a time.
+TEST_CASE("e2e lazy: a disjunction across join sides, statement at a time",
+          "[e2e][lazy][implied]") {
+    ExternRegistry registry;
+    register_lazy_source(registry, "read_part", implied_part());
+    register_lazy_source(registry, "read_line", implied_line());
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    REQUIRE(session
+                .execute("extern fn read_part() -> DataFrame from \"x.hpp\";\n"
+                         "extern fn read_line() -> DataFrame from \"x.hpp\";\n"
+                         "let part = read_part();\nlet line = read_line();")
+                .ok);
+    auto result = session.execute(std::string(kImpliedQuery) + ";");
+    REQUIRE(result.ok);
+    REQUIRE(result.table.has_value());
+    REQUIRE(rows_of(*result.table, {"pk", "price"}) == kImpliedRows);
+}

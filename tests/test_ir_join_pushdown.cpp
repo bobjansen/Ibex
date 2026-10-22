@@ -7,11 +7,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 using namespace ibex;
@@ -34,6 +36,12 @@ auto eq(ir::Expr left, ir::Expr right) -> ir::Expr {
 
 auto and_expr(ir::Expr left, ir::Expr right) -> ir::Expr {
     return ir::Expr{.node = ir::LogicalExpr{.op = ir::LogicalOp::And,
+                                            .left = ir::make_expr_ptr(std::move(left)),
+                                            .right = ir::make_expr_ptr(std::move(right))}};
+}
+
+auto or_expr(ir::Expr left, ir::Expr right) -> ir::Expr {
+    return ir::Expr{.node = ir::LogicalExpr{.op = ir::LogicalOp::Or,
                                             .left = ir::make_expr_ptr(std::move(left)),
                                             .right = ir::make_expr_ptr(std::move(right))}};
 }
@@ -95,6 +103,39 @@ auto semi_over_join_tree(ir::JoinKind semi_kind, std::string semi_key,
 auto filter_join_tree(ir::JoinKind kind, ir::Expr pred) -> ir::NodePtr {
     return make_filter({1}, std::move(pred),
                        make_join({2}, kind, {"k"}, make_scan({3}, "a"), make_scan({4}, "b")));
+}
+
+/// How many top-level conjuncts the Filter directly at `node` has (0 when
+/// `node` is not a Filter).
+auto conjunct_count(const ir::Node& node) -> std::size_t {
+    if (node.kind() != ir::NodeKind::Filter) {
+        return 0;
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    const auto& pred = static_cast<const ir::FilterNode&>(node).predicate();
+    std::size_t count = 0;
+    std::vector<const ir::Expr*> stack{&pred};
+    while (!stack.empty()) {
+        const ir::Expr* expr = stack.back();
+        stack.pop_back();
+        if (const auto* logical = std::get_if<ir::LogicalExpr>(&expr->node);
+            logical != nullptr && logical->op == ir::LogicalOp::And) {
+            stack.push_back(logical->left.get());
+            stack.push_back(logical->right.get());
+        } else {
+            ++count;
+        }
+    }
+    return count;
+}
+
+/// The top-level operator of the predicate of the Filter at `node`.
+auto filter_op(const ir::Node& node) -> std::optional<ir::LogicalOp> {
+    REQUIRE(node.kind() == ir::NodeKind::Filter);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    const auto& pred = static_cast<const ir::FilterNode&>(node).predicate();
+    const auto* logical = std::get_if<ir::LogicalExpr>(&pred.node);
+    return logical == nullptr ? std::nullopt : std::optional{logical->op};
 }
 
 /// The scan under `side`, unwrapping at most one Filter.
@@ -405,4 +446,72 @@ TEST_CASE("semi pushdown: does not descend a left join", "[ir][join_pushdown][se
     REQUIRE(out->children()[0]->kind() == ir::NodeKind::Join);
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
     REQUIRE(static_cast<const ir::JoinNode&>(*out->children()[0]).kind() == ir::JoinKind::Left);
+}
+
+// (ax==1 AND bx==2) OR (ax==3 AND bx==4) names both sides in every branch, so
+// it stays above -- but it implies (ax==1 OR ax==3) on `a` and (bx==2 OR bx==4)
+// on `b`, which may filter each input first (PDS-H q19's qualification OR).
+TEST_CASE("join pushdown: a disjunction across sides implies a filter on each side",
+          "[ir][join_pushdown][implied]") {
+    auto pred = or_expr(and_expr(eq(col("ax"), lit(1)), eq(col("bx"), lit(2))),
+                        and_expr(eq(col("ax"), lit(3)), eq(col("bx"), lit(4))));
+    auto out = ir::push_filters_into_joins(filter_join_tree(ir::JoinKind::Inner, std::move(pred)),
+                                           test_sources());
+    REQUIRE(out->kind() == ir::NodeKind::Filter);  // the original stays above
+    CHECK(filter_op(*out) == ir::LogicalOp::Or);
+    const auto& join = *out->children().front();
+    REQUIRE(join.kind() == ir::NodeKind::Join);
+    REQUIRE(join.children()[0]->kind() == ir::NodeKind::Filter);
+    REQUIRE(join.children()[1]->kind() == ir::NodeKind::Filter);
+    CHECK(scan_name(*join.children()[0]) == "a");
+    CHECK(scan_name(*join.children()[1]) == "b");
+    CHECK(filter_op(*join.children()[0]) == ir::LogicalOp::Or);
+    CHECK(filter_op(*join.children()[1]) == ir::LogicalOp::Or);
+}
+
+// A branch with nothing about `a` means the disjunction says nothing about `a`.
+TEST_CASE("join pushdown: no filter is implied for a side some branch does not constrain",
+          "[ir][join_pushdown][implied]") {
+    auto pred =
+        or_expr(and_expr(eq(col("ax"), lit(1)), eq(col("bx"), lit(2))), eq(col("bx"), lit(5)));
+    auto out = ir::push_filters_into_joins(filter_join_tree(ir::JoinKind::Inner, std::move(pred)),
+                                           test_sources());
+    REQUIRE(out->kind() == ir::NodeKind::Filter);
+    const auto& join = *out->children().front();
+    CHECK(join.children()[0]->kind() == ir::NodeKind::Scan);
+    REQUIRE(join.children()[1]->kind() == ir::NodeKind::Filter);
+    CHECK(filter_op(*join.children()[1]) == ir::LogicalOp::Or);
+}
+
+// The null-supplying side of an outer join is never pre-filtered, implied or
+// not: for a left join only `a` receives the implied filter.
+TEST_CASE("join pushdown: a left join takes an implied filter on its left side only",
+          "[ir][join_pushdown][implied]") {
+    auto pred = or_expr(and_expr(eq(col("ax"), lit(1)), eq(col("bx"), lit(2))),
+                        and_expr(eq(col("ax"), lit(3)), eq(col("bx"), lit(4))));
+    auto out = ir::push_filters_into_joins(filter_join_tree(ir::JoinKind::Left, std::move(pred)),
+                                           test_sources());
+    REQUIRE(out->kind() == ir::NodeKind::Filter);
+    const auto& join = *out->children().front();
+    CHECK(join.children()[0]->kind() == ir::NodeKind::Filter);
+    CHECK(join.children()[1]->kind() == ir::NodeKind::Scan);
+}
+
+// The pass runs more than once over one plan; a second run derives the same
+// implied filters and must not push them again.
+TEST_CASE("join pushdown: implied filters are pushed once across repeated runs",
+          "[ir][join_pushdown][implied]") {
+    auto pred = or_expr(and_expr(eq(col("ax"), lit(1)), eq(col("bx"), lit(2))),
+                        and_expr(eq(col("ax"), lit(3)), eq(col("bx"), lit(4))));
+    auto once = ir::push_filters_into_joins(filter_join_tree(ir::JoinKind::Inner, std::move(pred)),
+                                            test_sources());
+    auto twice = ir::push_filters_into_joins(std::move(once), test_sources());
+    REQUIRE(twice->kind() == ir::NodeKind::Filter);
+    CHECK(conjunct_count(*twice) == 1);
+    const auto& join = *twice->children().front();
+    REQUIRE(join.kind() == ir::NodeKind::Join);
+    CHECK(conjunct_count(*join.children()[0]) == 1);
+    CHECK(conjunct_count(*join.children()[1]) == 1);
+    CHECK(scan_name(*join.children()[0]) == "a");
+    CHECK(scan_name(*join.children()[1]) == "b");
 }

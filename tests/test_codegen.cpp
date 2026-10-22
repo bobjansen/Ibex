@@ -125,6 +125,35 @@ let lit = Table { g = [1, 2], pad = [0, 0], v = [1.0, 2.0] };
     }
 }
 
+// A compiled program gets the same implied-predicate pushdown as the REPL: the
+// disjunction names both inputs in every branch, so each input is filtered by
+// what it implies before the join, and the disjunction itself runs after it.
+TEST_CASE("lower/codegen: a disjunction across join sides filters each input first",
+          "[codegen][implied]") {
+    const char* src = R"(
+extern fn csv::read(path: String) -> DataFrame from "csv.hpp";
+let a = csv::read("a.csv") as DataFrame<{ k: Int64, ax: Int64 }>;
+let b = csv::read("b.csv") as DataFrame<{ k: Int64, bx: Int64 }>;
+(a join b on { k })[filter (ax == 1 && bx == 2) || (ax == 3 && bx == 4)];
+)";
+    auto parsed = parser::parse(src);
+    REQUIRE(parsed.has_value());
+    auto lowered = parser::lower(*parsed);
+    REQUIRE(lowered.has_value());
+    const auto out = emit_to_string(**lowered);
+    INFO(out);
+    const auto join = out.find("ibex::ops::inner_join(");
+    REQUIRE(join != std::string::npos);
+    std::size_t before = 0;
+    std::size_t after = 0;
+    for (auto pos = out.find("ibex::ops::filter("); pos != std::string::npos;
+         pos = out.find("ibex::ops::filter(", pos + 1)) {
+        (pos < join ? before : after) += 1;
+    }
+    CHECK(before == 2);  // one implied filter per input
+    CHECK(after == 1);   // the disjunction itself
+}
+
 TEST_CASE("lower/codegen: a qualified extern is called by its ibex::ext C++ name", "[codegen]") {
     const char* src = R"(
 namespace fs {

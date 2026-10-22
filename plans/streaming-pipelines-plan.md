@@ -206,7 +206,12 @@ says so.
    the `orders` scan decode only the 2.93M rows that can match. After it come
    ~6 ms of filter publication, ~51 ms of two-phase selection and ~42 ms of
    build; overlapping those with the lineitem stream would buy nothing, as
-   the stream keeps the pool 90-94% occupied (2026-10-22).
+   the stream keeps the pool 90-94% occupied (2026-10-22). `perf mem` on
+   streamed q09 found no memory story: 57% of its cycles are zstd at IPC
+   4.3, and its zstd instructions equal reading each needed column once.
+   Unstreamed q09 did 22% more: the whole-source fused key scan decoded the
+   join key twice (`f7268bcd`, unstreamed q09 -7.9%). Most of what streamed
+   probes gained on q09 was that duplicate decode.
 4. **Semi/anti joins as probe steps** (q04, q21, q22).
 5. **Retire Layer B probe morsels** (`try_take_join_probe`,
    `build_probe_morsel_pipeline`, `IBEX_PROBE_MORSELS`), and rewrite

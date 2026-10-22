@@ -2026,9 +2026,10 @@ auto run_streamed_two_phase_unit(const StreamedTwoPhaseShared& shared, JoinProbe
         }
     }
     const std::size_t n_hits = hits.size();
+    // Not zero-filled: the replay below writes every slot of all three.
     Selection survivors(n_hits);
-    std::vector<std::size_t> li(total, 0);
-    std::vector<std::size_t> ri(total, 0);
+    ::ibex::detail::NoInitVector<std::size_t> li(total);
+    ::ibex::detail::NoInitVector<std::size_t> ri(total);
     const bool gather_keys = n_hits != n;
     Column<std::int64_t> gathered_keys;
     if (gather_keys) {
@@ -2938,9 +2939,12 @@ class ChunkedInnerJoinOperator final : public Operator {
             total += probe_.swapped_parts_[w].total;
         }
 
+        // Not zero-filled: the replays write every slot of all three, on the
+        // workers, so the pages fault in there instead of serially here (q07
+        // spent ~15 ms of one core zeroing ~35 MB these overwrite).
         Selection survivors(n_hits);
-        std::vector<std::size_t> li(total, 0);
-        std::vector<std::size_t> ri(total, 0);
+        ::ibex::detail::NoInitVector<std::size_t> li(total);
+        ::ibex::detail::NoInitVector<std::size_t> ri(total);
         Column<std::int64_t> gathered_keys;
         const bool gather_keys = n_hits != n;
         if (gather_keys) {

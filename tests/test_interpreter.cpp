@@ -19427,7 +19427,7 @@ class StreamLeftReader final : public runtime::LazySourceReader {
 
     auto key_filter_scan(const std::string& /*key*/, const runtime::DynamicScanFilter& filter,
                          const runtime::SourceUnit* unit, const runtime::ExecutionContext&,
-                         std::vector<std::int64_t>* values)
+                         Column<std::int64_t>* values)
         -> std::expected<std::optional<runtime::Selection>, std::string> override {
         const runtime::SourceUnit whole{.start = 0, .rows = kUnits * kUnitRows};
         const runtime::SourceUnit& range = unit == nullptr ? whole : *unit;

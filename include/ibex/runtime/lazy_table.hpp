@@ -22,9 +22,6 @@
 
 namespace ibex::runtime {
 
-/// Ascending, zero-based row indices over a deferred source.
-using Selection = std::vector<std::size_t>;
-
 /// Decodes exactly the named columns from an underlying source. Supplied by
 /// whichever plugin backs the source (Parquet today); the names are always a
 /// subset of the schema the `LazyTable` was built with. A null selection means
@@ -115,7 +112,7 @@ class LazySourceReader {
                                                const DynamicScanFilter& /*filter*/,
                                                const SourceUnit* /*unit*/,
                                                const ExecutionContext& /*exec*/,
-                                               std::vector<std::int64_t>* /*values*/)
+                                               Column<std::int64_t>* /*values*/)
         -> std::expected<std::optional<Selection>, std::string> {
         return std::optional<Selection>{};
     }
@@ -398,7 +395,7 @@ class LazyTable {
         -> std::expected<Table, std::string>;
     [[nodiscard]] auto scan_key_filter(const std::string& key, const DynamicScanFilter& filter,
                                        const SourceUnit* unit, const ExecutionContext& exec,
-                                       std::vector<std::int64_t>* values = nullptr)
+                                       Column<std::int64_t>* values = nullptr)
         -> std::expected<std::optional<Selection>, std::string>;
     /// Rows of `unit` (the whole source when null) that satisfy `conjuncts`,
     /// decided inside the reader's decoder: the literal range on one integer

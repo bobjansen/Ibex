@@ -1124,6 +1124,13 @@ class ExternArgs;
                                          const Table& input, const ExternArgs& args)
     -> std::expected<void, std::string>;
 
+/// Ascending, zero-based row indices: a filter's survivors, or the rows of a
+/// deferred source to decode. Not value-initialized on `resize`: a selection
+/// sized up front is always filled by the code that sized it, often by several
+/// workers at once, and zeroing it first was a serial page-faulting pass on the
+/// calling thread (tens of MB on PDS-H lineitem key scans).
+using Selection = ::ibex::detail::NoInitVector<std::size_t>;
+
 /// Evaluate row-local filter conjuncts and return the surviving row indices in
 /// ascending order. Null predicate values do not survive (the same three-valued
 /// logic used by a Filter node). This is the seam used by deferred file readers
@@ -1136,7 +1143,7 @@ class ExternArgs;
 [[nodiscard]] auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts,
                                     const ExecutionContext& exec,
                                     const ScalarRegistry* scalars = nullptr)
-    -> std::expected<std::vector<std::size_t>, std::string>;
+    -> std::expected<Selection, std::string>;
 
 /// Predicts on new data with a previously fitted plugin model, reusing its
 /// native handle. Rebuilds the design matrix from `newdata` using the model's

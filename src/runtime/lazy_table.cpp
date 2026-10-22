@@ -98,7 +98,7 @@ auto LazyTable::scan_units() -> std::vector<SourceUnit> {
 
 auto LazyTable::scan_key_filter(const std::string& key, const DynamicScanFilter& filter,
                                 const SourceUnit* unit, const ExecutionContext& exec,
-                                std::vector<std::int64_t>* values)
+                                Column<std::int64_t>* values)
     -> std::expected<std::optional<Selection>, std::string> {
     auto* profile_entry = exec.execution_profile == nullptr
                               ? nullptr
@@ -383,9 +383,8 @@ auto membership_ranges(const ExecutionContext& exec, std::size_t n) -> std::size
 /// the per-range lists back in order.
 template <typename KeyAt, typename RowAt>
 auto keep_rows_parallel(std::size_t n, std::size_t ranges, const KeyColumn<KeyAt>& key,
-                        const DynamicScanFilter& filter, const RowAt& row_at)
-    -> std::vector<std::size_t> {
-    std::vector<std::vector<std::size_t>> parts(ranges);
+                        const DynamicScanFilter& filter, const RowAt& row_at) -> Selection {
+    std::vector<Selection> parts(ranges);
     const std::size_t grain = (n + ranges - 1) / ranges;
     auto batch = process_worker_pool().submit(ranges, [&](std::size_t r) {
         const std::size_t begin = r * grain;
@@ -407,7 +406,7 @@ auto keep_rows_parallel(std::size_t n, std::size_t ranges, const KeyColumn<KeyAt
     for (const auto& part : parts) {
         total += part.size();
     }
-    std::vector<std::size_t> kept;
+    Selection kept;
     kept.reserve(total);
     for (const auto& part : parts) {
         kept.insert(kept.end(), part.begin(), part.end());
@@ -419,7 +418,7 @@ auto keep_rows_parallel(std::size_t n, std::size_t ranges, const KeyColumn<KeyAt
 /// (selection untouched) when the sample says it barely rejects.
 template <typename KeyAt>
 void apply_membership_filter(const KeyColumn<KeyAt>& key, const DynamicScanFilter& filter,
-                             std::vector<std::size_t>& selected, const ExecutionContext& exec) {
+                             Selection& selected, const ExecutionContext& exec) {
     if (membership_pass_rate(key, filter, selected.size(), [&](std::size_t i) {
             return selected[i];
         }) > kMembershipPassRateCutoff) {
@@ -442,7 +441,7 @@ void apply_membership_filter(const KeyColumn<KeyAt>& key, const DynamicScanFilte
 template <typename KeyAt>
 auto membership_selection(const KeyColumn<KeyAt>& key, const DynamicScanFilter& filter,
                           std::size_t rows, const ExecutionContext& exec)
-    -> std::optional<std::vector<std::size_t>> {
+    -> std::optional<Selection> {
     const auto sampled_rate =
         membership_pass_rate(key, filter, rows, [](std::size_t i) { return i; });
     if (sampled_rate > kMembershipPassRateCutoff) {
@@ -454,7 +453,7 @@ auto membership_selection(const KeyColumn<KeyAt>& key, const DynamicScanFilter& 
     // One filter pass, not count-then-fill: a Bloom probe per key is the
     // expensive part here, and the sampled rate gives a good enough reserve
     // that push_back growth is rare.
-    std::vector<std::size_t> selected;
+    Selection selected;
     selected.reserve(
         std::min(rows, static_cast<std::size_t>(sampled_rate * 1.2 * static_cast<double>(rows)) +
                            kMembershipSampleMax));
@@ -805,7 +804,7 @@ auto LazyTable::project_where(const std::set<std::string>& names,
         const auto* key_schema = schema_.find(*dynamic_key);
         const bool reuse_key = names.contains(*dynamic_key) && key_schema != nullptr &&
                                std::holds_alternative<Column<std::int64_t>>(*key_schema);
-        std::vector<std::int64_t> key_values;
+        Column<std::int64_t> key_values;
         auto scan = scan_key_filter(*dynamic_key, *dynamic, nullptr, exec,
                                     reuse_key ? &key_values : nullptr);
         if (!scan) {
@@ -843,8 +842,7 @@ auto LazyTable::project_where(const std::set<std::string>& names,
                     }
                     if (have_keys && field.name == *dynamic_key) {
                         // A null key fails the filter, so every value is valid.
-                        out.add_column(field.name,
-                                       Column<std::int64_t>{std::exchange(key_values, {})});
+                        out.add_column(field.name, std::exchange(key_values, {}));
                         continue;
                     }
                     const auto* entry = decoded.find_entry(field.name);
@@ -896,7 +894,7 @@ auto LazyTable::project_where(const std::set<std::string>& names,
     const auto key = membership ? membership_key_column(predicates, *dynamic_key, *dynamic)
                                 : std::optional<AnyKeyColumn>{};
 
-    std::optional<std::vector<std::size_t>> selected;
+    std::optional<Selection> selected;
     if (!applied.empty()) {
         auto from_conjuncts = filter_selection(predicates, applied, exec, scalars);
         if (!from_conjuncts) {
@@ -1028,7 +1026,7 @@ auto LazyTable::project_unit(const std::set<std::string>& names, const SourceUni
     // A column another query already decoded whole is sliced rather than
     // re-read: the pages are gone from the equation, and the copy is exactly
     // this unit's rows.
-    std::vector<std::size_t> unit_rows;
+    Selection unit_rows;
     const auto slice_of = [&](const ColumnEntry& entry) -> ColumnEntry {
         if (unit_rows.empty() && unit.rows != 0) {
             unit_rows.resize(unit.rows);
@@ -1144,7 +1142,7 @@ auto LazyTable::project_where_unit(const std::set<std::string>& names,
         const auto* key_schema = schema_.find(*dynamic_key);
         const bool reuse_key = names.contains(*dynamic_key) && key_schema != nullptr &&
                                std::holds_alternative<Column<std::int64_t>>(*key_schema);
-        std::vector<std::int64_t> key_values;
+        Column<std::int64_t> key_values;
         auto scan =
             scan_key_filter(*dynamic_key, *dynamic, &unit, exec, reuse_key ? &key_values : nullptr);
         if (!scan) {
@@ -1182,8 +1180,7 @@ auto LazyTable::project_where_unit(const std::set<std::string>& names,
                     }
                     if (have_keys && field.name == *dynamic_key) {
                         // A null key fails the filter, so every value is valid.
-                        out.add_column(field.name,
-                                       Column<std::int64_t>{std::exchange(key_values, {})});
+                        out.add_column(field.name, std::exchange(key_values, {}));
                         continue;
                     }
                     const auto* entry = decoded.find_entry(field.name);
@@ -1648,10 +1645,12 @@ auto LazyTable::narrow_selection(const Selection& selected, const std::vector<ir
         return std::unexpected(local.error());
     }
     Selection out;
-    out.reserve(local->size());
-    for (const std::size_t row : *local) {
-        out.push_back(selected[row]);
-    }
+    out.resize(local->size());
+    for_row_ranges(&exec, local->size(), [&](std::size_t begin, std::size_t end) {
+        for (std::size_t i = begin; i < end; ++i) {
+            out[i] = selected[(*local)[i]];
+        }
+    });
     return std::optional{std::move(out)};
 }
 
@@ -1708,7 +1707,7 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
         // picked out of the scan's in memory, and that beat decoding them
         // again even on q03, whose conjunct keeps 1 in 20 key-scan rows (a
         // gate on "no conjunct follows" left q03/q07/q10/q21 2-7% slower).
-        std::vector<std::int64_t> scanned_keys;
+        Column<std::int64_t> scanned_keys;
         auto scan = scan_key_filter(key_name, dynamic, unit, exec, &scanned_keys);
         if (!scan) {
             return std::unexpected(scan.error());
@@ -1751,36 +1750,57 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
         }
         if (fused) {
             JoinKeySelection out;
+            ColumnValue keys_value;
             if (have_keys) {
                 if (scanned_keys.size() != scan_rows.size()) {
                     return std::unexpected(
                         "lazy source produced a key value count that differs from its rows");
                 }
+                keys_value = std::move(scanned_keys);
                 if (narrowed_rows.has_value()) {
                     // Keep the survivors' keys: both lists ascend, and every
-                    // survivor is one of the scan's rows.
-                    std::vector<std::int64_t> kept;
-                    kept.reserve(narrowed_rows->size());
-                    std::size_t j = 0;
-                    for (const std::size_t row : *narrowed_rows) {
-                        while (j < scan_rows.size() && scan_rows[j] != row) {
-                            ++j;
-                        }
-                        if (j == scan_rows.size()) {
-                            return std::unexpected(
-                                "lazy source narrowed to a row its key scan did not pass");
-                        }
-                        kept.push_back(scanned_keys[j++]);
+                    // survivor is one of the scan's rows. Each range of
+                    // survivors finds where it starts in the scan's rows and
+                    // walks forward from there, so the ranges run
+                    // concurrently; a serial walk over all scan rows held 7
+                    // cores idle on q03 (~25 ms).
+                    const Selection& survivors = *narrowed_rows;
+                    Selection positions;
+                    positions.resize(survivors.size());
+                    std::atomic<bool> missing{false};
+                    for_row_ranges(
+                        &exec, survivors.size(), [&](std::size_t begin, std::size_t end) {
+                            if (begin >= end) {
+                                return;
+                            }
+                            std::size_t j = static_cast<std::size_t>(
+                                std::lower_bound(scan_rows.begin(), scan_rows.end(),
+                                                 survivors[begin]) -
+                                scan_rows.begin());
+                            for (std::size_t i = begin; i < end; ++i) {
+                                while (j < scan_rows.size() && scan_rows[j] != survivors[i]) {
+                                    ++j;
+                                }
+                                if (j == scan_rows.size()) {
+                                    missing.store(true, std::memory_order_relaxed);
+                                    return;
+                                }
+                                positions[i] = j++;
+                            }
+                        });
+                    if (missing.load(std::memory_order_relaxed)) {
+                        return std::unexpected(
+                            "lazy source narrowed to a row its key scan did not pass");
                     }
-                    scanned_keys = std::move(kept);
+                    keys_value =
+                        gather_column(keys_value, positions.data(), positions.size(), &exec);
                 }
             }
             out.selected =
                 narrowed_rows.has_value() ? std::move(*narrowed_rows) : std::move(scan_rows);
             if (have_keys) {
                 out.keys.name = key_name;
-                out.keys.column =
-                    std::make_shared<ColumnValue>(Column<std::int64_t>{std::move(scanned_keys)});
+                out.keys.column = std::make_shared<ColumnValue>(std::move(keys_value));
                 return std::optional{std::move(out)};
             }
             auto keys = project_rows({key_name}, out.selected, exec, unit);

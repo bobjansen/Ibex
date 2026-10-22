@@ -45,7 +45,7 @@ auto select(const runtime::Table& table, const std::vector<ir::Expr>& conjuncts,
     -> std::vector<std::size_t> {
     auto out = runtime::filter_selection(table, conjuncts, exec, nullptr);
     REQUIRE(out.has_value());
-    return *out;
+    return {out->begin(), out->end()};
 }
 
 // 0..9 in every column, so a bound's arithmetic is easy to read off.

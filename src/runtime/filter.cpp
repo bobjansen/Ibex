@@ -3164,7 +3164,7 @@ void apply_set_spec(const SetSpec& spec, std::size_t base, std::size_t len, std:
 /// concatenating ranges in ascending order reproduces the serial answer bit for
 /// bit — there is no reduction and nothing to reassociate.
 void select_bounds_range(const std::vector<BoundsSpec>& specs, const std::vector<SetSpec>& sets,
-                         std::size_t begin, std::size_t end, std::vector<std::size_t>& selected) {
+                         std::size_t begin, std::size_t end, Selection& selected) {
     constexpr std::size_t kBlock = 4096;
     const std::size_t rows = end - begin;
     selected.reserve(std::min<std::size_t>(rows, kBlock));
@@ -3229,9 +3229,9 @@ auto select_bounds_morsels(const ExecutionContext& exec, std::size_t rows) -> st
 }
 
 auto select_bounds(const std::vector<BoundsSpec>& specs, const std::vector<SetSpec>& sets,
-                   const ExecutionContext& exec, std::size_t rows) -> std::vector<std::size_t> {
+                   const ExecutionContext& exec, std::size_t rows) -> Selection {
     constexpr std::size_t kBlock = 4096;
-    std::vector<std::size_t> selected;
+    Selection selected;
     for (const auto& spec : specs) {
         if (spec.unsatisfiable) {
             return selected;
@@ -3253,7 +3253,7 @@ auto select_bounds(const std::vector<BoundsSpec>& specs, const std::vector<SetSp
     // serial path does, with a full mask buffer.
     const std::size_t grain = ((rows / morsels) + kBlock - 1) / kBlock * kBlock;
     const std::size_t used = (rows + grain - 1) / grain;
-    std::vector<std::vector<std::size_t>> parts(used);
+    std::vector<Selection> parts(used);
 
     std::atomic<std::size_t> cursor{0};
     auto batch = process_worker_pool().submit(std::min(used, morsels), [&](std::size_t) {
@@ -3289,8 +3289,8 @@ auto select_bounds(const std::vector<BoundsSpec>& specs, const std::vector<SetSp
 /// already relies on. Count first, then left-pack, for the same reason the
 /// whole-table path does: sizing the result up front makes the fill branchless.
 auto select_conjunct_range(const ir::Expr& conjunct, const Table& input,
-                           const ScalarRegistry* scalars, RowRange rows,
-                           std::vector<std::size_t>& out) -> std::expected<void, std::string> {
+                           const ScalarRegistry* scalars, RowRange rows, Selection& out)
+    -> std::expected<void, std::string> {
     auto mask = compute_mask(conjunct, input, scalars, rows);
     if (!mask) {
         return std::unexpected(mask.error());
@@ -3320,8 +3320,7 @@ auto select_conjunct_range(const ir::Expr& conjunct, const Table& input,
 
 auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conjuncts,
                            const ExecutionContext& exec, const ScalarRegistry* scalars,
-                           std::vector<std::size_t> selected)
-    -> std::expected<std::vector<std::size_t>, std::string> {
+                           Selection selected) -> std::expected<Selection, std::string> {
     constexpr std::size_t kCompactionFactor = 4;
     const std::size_t rows = input.rows();
     if (selected.empty()) {
@@ -3378,7 +3377,7 @@ auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conj
             const std::vector<ir::Expr> stage_conjuncts(
                 conjuncts.begin() + static_cast<ConjunctDiff>(conjunct_index),
                 conjuncts.begin() + static_cast<ConjunctDiff>(group_end));
-            std::vector<std::size_t> local(selected.size());
+            Selection local(selected.size());
             // NOLINTNEXTLINE(modernize-use-ranges): Because Apple libc++
             std::iota(local.begin(), local.end(), std::size_t{0});
             auto local_selected =
@@ -3386,7 +3385,7 @@ auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conj
             if (!local_selected) {
                 return std::unexpected(local_selected.error());
             }
-            std::vector<std::size_t> next;
+            Selection next;
             next.reserve(local_selected->size());
             for (const std::size_t row : *local_selected) {
                 next.push_back(selected[row]);
@@ -3421,7 +3420,7 @@ auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conj
 
 auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts,
                       const ExecutionContext& exec, const ScalarRegistry* scalars)
-    -> std::expected<std::vector<std::size_t>, std::string> {
+    -> std::expected<Selection, std::string> {
     // Range conjuncts fuse into one blocked pass that yields the selection
     // directly; whatever doesn't fuse runs against that selection instead of
     // against every row.
@@ -3457,7 +3456,7 @@ auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts
         // order, so the selection is ascending and identical to the serial one.
         const std::size_t morsels =
             ir::is_subset_evaluable_expr(conjuncts.front()) ? select_bounds_morsels(exec, rows) : 1;
-        std::vector<std::size_t> selected;
+        Selection selected;
         if (morsels < 2) {
             if (auto packed = select_conjunct_range(conjuncts.front(), input, scalars,
                                                     RowRange::whole(rows), selected);
@@ -3468,7 +3467,7 @@ auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts
             constexpr std::size_t kBlock = 4096;
             const std::size_t grain = ((rows / morsels) + kBlock - 1) / kBlock * kBlock;
             const std::size_t used = (rows + grain - 1) / grain;
-            std::vector<std::vector<std::size_t>> parts(used);
+            std::vector<Selection> parts(used);
             std::vector<std::optional<std::string>> errors(used);
 
             std::atomic<std::size_t> cursor{0};
@@ -3512,7 +3511,7 @@ auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts
         return filter_selection_impl(input, rest, exec, scalars, std::move(selected));
     }
 
-    std::vector<std::size_t> selected(input.rows());
+    Selection selected(input.rows());
     // NOLINTNEXTLINE(modernize-use-ranges): Because Apple libc++
     std::iota(selected.begin(), selected.end(), std::size_t{0});
     return filter_selection_impl(input, conjuncts, exec, scalars, std::move(selected));

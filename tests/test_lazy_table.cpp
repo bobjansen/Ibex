@@ -261,7 +261,7 @@ class TextReader final : public runtime::LazySourceReader {
 
     auto key_filter_scan(const std::string& column, const runtime::DynamicScanFilter& filter,
                          const runtime::SourceUnit* unit, const runtime::ExecutionContext& /*exec*/,
-                         std::vector<std::int64_t>* /*values*/)
+                         Column<std::int64_t>* /*values*/)
         -> std::expected<std::optional<runtime::Selection>, std::string> override {
         state_->key_scan_calls.push_back(column);
         if (column != "n")
@@ -1455,8 +1455,7 @@ class DictReader final : public runtime::LazySourceReader {
 
     auto key_filter_scan(const std::string& /*key*/, const runtime::DynamicScanFilter& filter,
                          const runtime::SourceUnit* /*unit*/,
-                         const runtime::ExecutionContext& /*exec*/,
-                         std::vector<std::int64_t>* values)
+                         const runtime::ExecutionContext& /*exec*/, Column<std::int64_t>* values)
         -> std::expected<std::optional<runtime::Selection>, std::string> override {
         runtime::Selection selected;
         for (std::size_t r = 0; r < kFlags.size(); ++r) {
@@ -1704,6 +1703,97 @@ TEST_CASE("LazyTable: join_key_selection keeps the scan's keys through a staged 
     keys.add_column_from("k", (*phase)->keys);
     CHECK(int_column(keys, "k") == std::vector<std::int64_t>{14, 15});
     CHECK_FALSE(decoded_key(state));
+}
+
+namespace {
+
+/// 4096 rows with key `k = row / 2` and `v = row`. Big enough for a parallel
+/// pass to split its survivors into several ranges.
+constexpr std::size_t kSpreadRows = 4096;
+
+class SpreadReader final : public runtime::LazySourceReader {
+   public:
+    auto decode(const std::vector<std::string>& names, const runtime::Selection* selection,
+                const runtime::SourceUnit* /*unit*/, const runtime::ExecutionContext& /*exec*/)
+        -> std::expected<runtime::Table, std::string> override {
+        runtime::Table out;
+        const std::size_t n = selection == nullptr ? kSpreadRows : selection->size();
+        for (const auto& name : names) {
+            std::vector<std::int64_t> values;
+            values.reserve(n);
+            for (std::size_t i = 0; i < n; ++i) {
+                const std::size_t row = selection == nullptr ? i : (*selection)[i];
+                values.push_back(static_cast<std::int64_t>(name == "k" ? row / 2 : row));
+            }
+            out.add_column(name, Column<std::int64_t>{std::move(values)});
+        }
+        out.logical_rows = n;
+        return out;
+    }
+
+    auto key_filter_scan(const std::string& /*key*/, const runtime::DynamicScanFilter& filter,
+                         const runtime::SourceUnit* /*unit*/,
+                         const runtime::ExecutionContext& /*exec*/, Column<std::int64_t>* values)
+        -> std::expected<std::optional<runtime::Selection>, std::string> override {
+        runtime::Selection selected;
+        for (std::size_t row = 0; row < kSpreadRows; ++row) {
+            const auto key = static_cast<std::int64_t>(row / 2);
+            if (filter.passes(key)) {
+                selected.push_back(row);
+                if (values != nullptr) {
+                    values->push_back(key);
+                }
+            }
+        }
+        return std::optional{std::move(selected)};
+    }
+};
+
+}  // namespace
+
+// The survivors' keys are found by several ranges at once, each locating its
+// first survivor among the scan's rows; every range but the first starts
+// mid-scan, so a range that started in the wrong place would pair a survivor
+// with a neighbour's key.
+TEST_CASE("LazyTable: join_key_selection keeps the scan's keys across parallel ranges",
+          "[runtime][lazy_table][deferred_scan]") {
+    runtime::Table schema;
+    schema.add_column("k", Column<std::int64_t>{});
+    schema.add_column("v", Column<std::int64_t>{});
+    runtime::LazyTable lazy{
+        std::move(schema), kSpreadRows,
+        []() -> std::expected<runtime::LazySourceReaderPtr, std::string> {
+            return runtime::LazySourceReaderPtr{std::make_unique<SpreadReader>()};
+        }};
+    // Keys not divisible by 3: two rows each, so the scan keeps 2 of 3 pairs.
+    runtime::DynamicScanFilter filter;
+    filter.ready = true;
+    filter.bloom.emplace(kSpreadRows);
+    for (std::int64_t key = 0; key < static_cast<std::int64_t>(kSpreadRows / 2); ++key) {
+        if (key % 3 != 0) {
+            filter.in_list.push_back(key);
+            filter.bloom->insert(key);
+        }
+    }
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+
+    auto phase = lazy.join_key_selection({greater_than("v", 1000)}, parallel, nullptr, filter, "k");
+    REQUIRE(phase);
+    REQUIRE(phase->has_value());
+    runtime::Selection expected_rows;
+    std::vector<std::int64_t> expected_keys;
+    for (std::size_t row = 1001; row < kSpreadRows; ++row) {
+        if ((row / 2) % 3 != 0) {
+            expected_rows.push_back(row);
+            expected_keys.push_back(static_cast<std::int64_t>(row / 2));
+        }
+    }
+    CHECK((*phase)->selected == expected_rows);
+    runtime::Table keys;
+    keys.add_column_from("k", (*phase)->keys);
+    CHECK(int_column(keys, "k") == expected_keys);
 }
 
 // A source that keeps its values to itself still gets a correct key column:

@@ -2854,23 +2854,84 @@ inline auto key_scan_abandons(std::size_t scanned, std::size_t passing) -> bool 
            static_cast<double>(passing) > kAbandonPassRate * static_cast<double>(scanned);
 }
 
-/// Concatenate the per-group results in file order. Each part is ascending and
-/// the groups partition the file in order, so the result is sorted ascending —
-/// identical to what a single-threaded scan would have built, not merely
-/// equivalent to it. The passing key values, kept per group alongside the
-/// rows, concatenate the same way.
-template <typename T>
-inline auto merge_key_scan_parts(const std::vector<std::vector<T>>& parts) -> std::vector<T> {
+/// Below this many merged elements (8 MB) the copy stays on the calling
+/// thread: a pool round trip costs more than it saves. Per-unit scans sit
+/// below it -- q13's string filter scan merges ~270k rows per streamed unit,
+/// and at a 64k floor the extra round trip per unit, taken while the workers
+/// were busy with the pipeline, made q13 3% slower. Whole-source merges (q03's
+/// lineitem key scans, millions of rows) are far above it.
+inline constexpr std::size_t kParallelMergeMinElements = std::size_t{1} << 20;
+
+/// Copy each part to its file-order offset in `out`, which holds the parts'
+/// total and is not initialized. With `workers > 1` the parts are claimed off a
+/// cursor and copied concurrently: the destination is fresh memory, and a
+/// serial copy faulted it in on the calling thread while every worker that
+/// had just scanned the parts sat idle (q03's two lineitem key scans spent
+/// ~40 ms here, 8 cores to 1).
+template <typename Part, typename T>
+inline void copy_key_scan_parts(const std::vector<Part>& parts, T* out, std::size_t total,
+                                std::size_t workers) {
+    std::vector<std::size_t> offsets(parts.size());
+    std::size_t offset = 0;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        offsets[i] = offset;
+        offset += parts[i].size();
+    }
+    const auto copy = [&](std::size_t i) {
+        if (!parts[i].empty()) {
+            std::memcpy(out + offsets[i], parts[i].data(), parts[i].size() * sizeof(T));
+        }
+    };
+    if (workers <= 1 || parts.size() <= 1 || total < kParallelMergeMinElements) {
+        for (std::size_t i = 0; i < parts.size(); ++i) {
+            copy(i);
+        }
+        return;
+    }
+    std::atomic<std::size_t> cursor{0};
+    ibex::runtime::process_worker_pool()
+        .submit(std::min(workers, parts.size()),
+                [&](std::size_t) {
+                    for (;;) {
+                        const std::size_t i = cursor.fetch_add(1, std::memory_order_relaxed);
+                        if (i >= parts.size()) {
+                            return;
+                        }
+                        copy(i);
+                    }
+                })
+        .wait();
+}
+
+template <typename Part>
+inline auto key_scan_parts_total(const std::vector<Part>& parts) -> std::size_t {
     std::size_t total = 0;
     for (const auto& part : parts) {
         total += part.size();
     }
-    std::vector<T> selected;
-    selected.reserve(total);
-    for (const auto& part : parts) {
-        selected.insert(selected.end(), part.begin(), part.end());
-    }
+    return total;
+}
+
+/// Concatenate the per-group results in file order. Each part is ascending and
+/// the groups partition the file in order, so the result is sorted ascending —
+/// identical to what a single-threaded scan would have built, not merely
+/// equivalent to it. `workers` is how many the scan itself ran on.
+inline auto merge_key_scan_parts(const std::vector<ibex::runtime::Selection>& parts,
+                                 std::size_t workers = 1) -> ibex::runtime::Selection {
+    const std::size_t total = key_scan_parts_total(parts);
+    ibex::runtime::Selection selected;
+    selected.resize(total);  // not value-initialized: every slot is copied below
+    copy_key_scan_parts(parts, selected.data(), total, workers);
     return selected;
+}
+
+/// The passing key values, kept per group alongside the rows, concatenate the
+/// same way, straight into the column the caller hands on.
+inline void merge_key_scan_values(const std::vector<std::vector<std::int64_t>>& parts,
+                                  std::size_t workers, ibex::Column<std::int64_t>& out) {
+    const std::size_t total = key_scan_parts_total(parts);
+    out.resize_for_overwrite(total);
+    copy_key_scan_parts(parts, out.data(), total, workers);
 }
 
 /// Drives the fused key scan over `groups`, one reader per worker.
@@ -2899,7 +2960,7 @@ template <typename DType>
 inline auto filtered_key_selection(std::span<parquet::arrow::FileReader* const> readers,
                                    int leaf_index, const ibex::runtime::DynamicScanFilter& filter,
                                    const std::vector<KeyScanGroup>& groups,
-                                   std::vector<std::int64_t>* values)
+                                   ibex::Column<std::int64_t>* values)
     -> std::optional<ibex::runtime::Selection> {
     std::vector<ibex::runtime::Selection> parts(groups.size());
     std::vector<std::vector<std::int64_t>> value_parts(values != nullptr ? groups.size() : 0);
@@ -2908,9 +2969,9 @@ inline auto filtered_key_selection(std::span<parquet::arrow::FileReader* const> 
     };
     const auto answer = [&] {
         if (values != nullptr) {
-            *values = merge_key_scan_parts(value_parts);
+            merge_key_scan_values(value_parts, readers.size(), *values);
         }
-        return merge_key_scan_parts(parts);
+        return merge_key_scan_parts(parts, readers.size());
     };
 
     if (readers.size() <= 1 || groups.size() <= 1) {
@@ -3060,7 +3121,7 @@ inline auto filtered_dictionary_int32_selection(
         ibex::runtime::process_worker_pool().submit(readers.size(), run).wait();
     if (unsupported.load(std::memory_order_relaxed))
         return std::nullopt;
-    return merge_key_scan_parts(parts);
+    return merge_key_scan_parts(parts, readers.size());
 }
 
 /// One row group of `dictionary_filter_scan`: ask `keep` about each dictionary
@@ -3228,7 +3289,7 @@ inline auto filtered_dictionary_string_selection(
     if (unsupported.load(std::memory_order_relaxed)) {
         return std::nullopt;
     }
-    return merge_key_scan_parts(parts);
+    return merge_key_scan_parts(parts, readers.size());
 }
 
 /// ── Fused string filter scan ────────────────────────────────────────────────
@@ -3476,7 +3537,7 @@ inline auto filtered_string_page_stripes(const std::shared_ptr<arrow::io::Random
         run(0);
     else
         ibex::runtime::process_worker_pool().submit(workers, run).wait();
-    return merge_key_scan_parts(parts);
+    return merge_key_scan_parts(parts, workers);
 }
 
 /// Every row group, in file order, with the file row index each starts at.
@@ -3537,7 +3598,7 @@ inline auto filtered_string_selection(std::span<parquet::arrow::FileReader* cons
     if (nested.load(std::memory_order_relaxed)) {
         return std::nullopt;
     }
-    return merge_key_scan_parts(parts);
+    return merge_key_scan_parts(parts, readers.size());
 }
 
 /// Immutable reader construction inputs plus the bind-time reader. The first
@@ -3668,7 +3729,7 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
     auto key_filter_scan(const std::string& key, const ibex::runtime::DynamicScanFilter& filter,
                          const ibex::runtime::SourceUnit* unit,
                          const ibex::runtime::ExecutionContext& exec,
-                         std::vector<std::int64_t>* values)
+                         ibex::Column<std::int64_t>* values)
         -> std::expected<std::optional<ibex::runtime::Selection>, std::string> override {
         auto it = indices_->find(key);
         if (it == indices_->end()) {

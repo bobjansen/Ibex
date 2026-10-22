@@ -56,7 +56,7 @@ hash build, aggregate merge, order, distinct, window, materialized fallbacks.
   `DenseAggregateScanSink` (dense categorical only; q01 −30% at 8c on AWS).
 - A probe at the head of a morsel chain with the maps above it fused
   (`35e6108a`, `3172e533`), opt-in `IBEX_PROBE_MORSELS`: Layer B, over a
-  materialized table; measured a loss on its own (q09 +6.8%) and it deadlocks
+  materialized (drained) probe side; measured a loss on its own (q09 +6.8%) and it deadlocks
   q09 at SF-8 (below).
 - Immutable `JoinHashIndex` after `run_build`; build-before-probe is an explicit
   call.
@@ -201,8 +201,13 @@ says so.
 
 - Work runs on the core that produced the data: the async aggregate task queue
   cost q01 +27% by re-reading chunks cache-cold on another core.
-- Never morselize a materialized table: probe morsels cost q09 +6.8% for the
-  gather. Pipelines start at the decode unit.
+- Never materialize a stream in order to split it: start the pipeline at the
+  producer's units and take its chunks. Probe morsels drained the streamed
+  probe side and re-split it (q09 +6.8%). A table a breaker produced anyway
+  (sort, aggregate output, a materialized join side) is morselized when the
+  work above it pays for the split (`is_worth_morselizing`); keeping a long
+  pipeline after a breaker serial is the worse loss. The split itself must
+  cost next to nothing: `make_morsel_chunk` copies the range.
 - A ring costs when its consumer drains synchronously (Ascribe as pipelineable,
   +13–30%). The only ring left is at the pipeline's sink.
 - Keep scan/aggregate overlap: removing it cost q01 +44%, q15 +61%.

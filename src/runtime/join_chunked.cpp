@@ -1019,8 +1019,8 @@ struct JoinProbe {
             std::vector<SwappedHit> hits;
             std::size_t total = 0;
             scan(0, n_right, hits, total);
-            li.assign(total, 0);
-            ri.assign(total, 0);
+            li.resize(total);
+            ri.resize(total);
             replay(hits, 0);
             return;
         }
@@ -1046,8 +1046,12 @@ struct JoinProbe {
             part_offsets_[w] = total;
             total += swapped_parts_[w].total;
         }
-        li.assign(total, 0);
-        ri.assign(total, 0);
+        // Not zero-filled: the replays below write every slot, each part from
+        // its own prefix offset, so the pages fault in on the workers. The
+        // fill they replaced ran on one thread first (PDS-H q19: ~10 ms of a
+        // stage thread zeroing what was about to be overwritten).
+        li.resize(total);
+        ri.resize(total);
         {
             auto batch = pool.submit(
                 workers, [&](std::size_t w) { replay(swapped_parts_[w].hits, part_offsets_[w]); });

@@ -636,6 +636,48 @@ void collect_deferrable(const Node& node, const std::set<std::string>& sources,
 
 }  // namespace
 
+namespace {
+
+void collect_head_limits(const Node& node, std::map<NodeId, std::size_t>& limits) {
+    if (node.kind() == NodeKind::Head) {
+        const auto& head = node_cast<HeadNode>(node);
+        const auto count = head.count_literal();
+        if (head.group_by().empty() && count.has_value()) {
+            if (const auto* scan = projected_scan(node); scan != nullptr) {
+                auto& limit = limits[scan->id()];
+                limit = std::max(limit, *count);
+            }
+        }
+    }
+    for (const auto& child : node.children()) {
+        if (child != nullptr) {
+            collect_head_limits(*child, limits);
+        }
+    }
+}
+
+}  // namespace
+
+auto scan_row_limits(const Node& root) -> std::map<std::string, std::size_t> {
+    std::map<NodeId, std::size_t> by_scan;
+    collect_head_limits(root, by_scan);
+    std::map<std::string, std::size_t> limits;
+    std::set<std::string> unlimited;
+    for (const auto& occurrence : scan_predicates_by_occurrence(root)) {
+        const auto limit = by_scan.find(occurrence.scan);
+        if (limit == by_scan.end()) {
+            unlimited.insert(occurrence.source);
+            continue;
+        }
+        auto& merged = limits[occurrence.source];
+        merged = std::max(merged, limit->second);
+    }
+    for (const auto& source : unlimited) {
+        limits.erase(source);
+    }
+    return limits;
+}
+
 auto scan_source_counts(const Node& root) -> std::map<std::string, std::size_t> {
     std::map<std::string, std::size_t> counts;
     count_scan_occurrences(root, counts);

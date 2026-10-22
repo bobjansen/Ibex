@@ -57,6 +57,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <ranges>
 // NOLINTNEXTLINE(modernize-deprecated-headers) // Required for sigaction, sigemptyset, etc
 #include <signal.h>
@@ -157,6 +158,27 @@ using ResourceRegistry = robin_hood::unordered_map<std::string, runtime::Resourc
     return needed.all ? lazy.materialize(exec) : lazy.project(needed.names, exec);
 }
 
+/// Decode only the first `limit` rows of `needed` from an unfiltered lazy
+/// source (see `ir::scan_row_limits`). A selected decode touches only the
+/// units those rows lie in, so `t[head 5]` over PDS-H lineitem reads one row
+/// group rather than the whole 60M-row file, and leaves the source's column
+/// cache alone -- a fragment must not answer a later whole-column read.
+[[nodiscard]] auto decode_leading_lazy_rows(runtime::LazyTable& lazy,
+                                            const ir::ColumnDemand& needed, std::size_t limit,
+                                            const runtime::ExecutionContext& exec)
+    -> std::expected<runtime::Table, std::string> {
+    std::set<std::string> names = needed.names;
+    if (needed.all) {
+        for (const auto& field : lazy.schema().columns) {
+            names.insert(field.name);
+        }
+    }
+    runtime::Selection leading(std::min(limit, lazy.rows()));
+    // NOLINTNEXTLINE(modernize-use-ranges): Because Apple libc++
+    std::iota(leading.begin(), leading.end(), std::size_t{0});
+    return lazy.project_rows(names, leading, exec);
+}
+
 /// The pushable scan predicates of a plan, and which of them belong to a lazy
 /// source and so have been absorbed out of the tree.
 struct AbsorbedScanFilters {
@@ -192,8 +214,8 @@ struct AbsorbedScanFilters {
     const std::map<std::string, ir::ColumnDemand>& demand, const AbsorbedScanFilters& absorbed,
     const std::function<runtime::LazyTable*(const std::string&)>& resolve_lazy,
     const runtime::ExecutionContext& exec, const runtime::ScalarRegistry* scalars,
-    runtime::TableRegistry& registry, const std::function<bool(const std::string&)>& skip = {})
-    -> std::expected<void, std::string> {
+    runtime::TableRegistry& registry, const std::map<std::string, std::size_t>& row_limits,
+    const std::function<bool(const std::string&)>& skip = {}) -> std::expected<void, std::string> {
     // Group by the binding each name resolves to, not by the name itself.
     // `isolate_filtered_scan_instances` gives the occurrences of one repeatedly
     // scanned source separate names so each can keep its own predicate; they all
@@ -221,8 +243,11 @@ struct AbsorbedScanFilters {
         if (names.size() == 1) {
             const auto& name = *names.front();
             const bool filtered = absorbed.applied.contains(name);
-            auto table = decode_demanded_lazy_source(*lazy, demand.at(name), filtered,
-                                                     conjuncts_of(name), exec, scalars);
+            const auto limit = row_limits.find(name);
+            auto table = !filtered && limit != row_limits.end()
+                             ? decode_leading_lazy_rows(*lazy, demand.at(name), limit->second, exec)
+                             : decode_demanded_lazy_source(*lazy, demand.at(name), filtered,
+                                                           conjuncts_of(name), exec, scalars);
             if (!table.has_value()) {
                 return std::unexpected(table.error());
             }
@@ -3585,7 +3610,8 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             projected = tables;
         }
         if (auto ok = decode_demanded_lazy_sources(ir::required_columns(*lowered.value()), absorbed,
-                                                   resolve_lazy, exec, &scalars, projected);
+                                                   resolve_lazy, exec, &scalars, projected,
+                                                   ir::scan_row_limits(*lowered.value()));
             !ok.has_value()) {
             return std::unexpected(ok.error());
         }
@@ -5668,6 +5694,10 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
         absorbed_scan_selectivity.emplace(name, selectivity);
     }
     const auto demand = ir::required_columns(*rewritten);
+    // Sources read only through `head n`: decoded eagerly, first `n` rows only,
+    // rather than streamed -- a stream decodes a whole window of units before
+    // the head can stop it (8 units, ~8M rows, for one row of PDS-H lineitem).
+    const auto row_limits = ir::scan_row_limits(*rewritten);
     // Deferred probe scans: an eligible scan (sole feed of an inner
     // single-key join's right side, through projects/renames only) is not
     // decoded here. The join decodes it during execution, after
@@ -5739,7 +5769,8 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
             }
             auto* lazy = resolve_lazy(name);
             if (lazy == nullptr || lazy->scan_units().size() <= 1 || repeated_scan(name) ||
-                eager_only.contains(name)) {
+                eager_only.contains(name) ||
+                (row_limits.contains(name) && !absorbed.applied.contains(name))) {
                 continue;
             }
             // The left input of an inner join gets a slot for the join's built
@@ -5766,7 +5797,7 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
     // Everything not deferred or streamed is decoded eagerly into the
     // registry now, narrowed to its demand with its absorbed filter applied.
     if (auto ok = decode_demanded_lazy_sources(
-            demand, absorbed, resolve_lazy, exec, &scalars, tables,
+            demand, absorbed, resolve_lazy, exec, &scalars, tables, row_limits,
             [&](const std::string& name) { return deferred_scans.contains(name); });
         !ok.has_value()) {
         return std::unexpected(ok.error());

@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <expected>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -68,10 +69,16 @@ auto empty_like(const ibex::runtime::ColumnValue& src) -> ibex::runtime::ColumnV
 /// `live` is read when a scan decodes, not when the source is opened, so a sink
 /// that replaces `*live` is seen by every scan that runs after it -- the way a
 /// file rewritten between two reads behaves.
-void register_live_source(ExternRegistry& registry, std::string name, std::shared_ptr<Table> live) {
+///
+/// `decodes`, when given, records how many rows each decode served
+/// (`kWholeSource` for a decode with no selection).
+constexpr std::size_t kWholeSource = std::numeric_limits<std::size_t>::max();
+
+void register_live_source(ExternRegistry& registry, std::string name, std::shared_ptr<Table> live,
+                          std::shared_ptr<std::vector<std::size_t>> decodes = nullptr) {
     registry.register_lazy_table(
         std::move(name),
-        [live = std::move(live)](const ibex::runtime::ExternArgs&)
+        [live = std::move(live), decodes](const ibex::runtime::ExternArgs&)
             -> std::expected<ibex::runtime::LazyTablePtr, std::string> {
             Table schema;
             for (const auto& col : live->columns) {
@@ -80,8 +87,11 @@ void register_live_source(ExternRegistry& registry, std::string name, std::share
             const std::size_t rows = live->rows();
             return std::make_shared<ibex::runtime::LazyTable>(
                 std::move(schema), rows,
-                [live](const std::vector<std::string>& names,
-                       const Selection* selection) -> std::expected<Table, std::string> {
+                [live, decodes](const std::vector<std::string>& names,
+                                const Selection* selection) -> std::expected<Table, std::string> {
+                    if (decodes != nullptr) {
+                        decodes->push_back(selection == nullptr ? kWholeSource : selection->size());
+                    }
                     const Table& data = *live;
                     Selection all;
                     all.reserve(data.rows());
@@ -507,4 +517,133 @@ r;
 )";
     REQUIRE(ibex::repl::execute_script(src, script.registry));
     REQUIRE(i64(script.captured, "s") == std::vector<std::int64_t>{3});
+}
+
+namespace {
+
+/// Six rows with a repeated leading key: `a` = 1, 1, 2, 1, 3, 4.
+auto head_source() -> Table {
+    return make_table({{"a", {1, 1, 2, 1, 3, 4}}, {"b", {10, 20, 30, 40, 50, 60}}});
+}
+
+auto run_recorded(const char* script, std::vector<std::size_t>& decodes_out) -> Table {
+    ExternRegistry registry;
+    auto decodes = std::make_shared<std::vector<std::size_t>>();
+    register_live_source(registry, "read_t", std::make_shared<Table>(head_source()), decodes);
+    Table captured;
+    registry.register_scalar_table_consumer(
+        "capture", ibex::runtime::ScalarKind::Int,
+        [&](const Table& t, const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            captured = t;
+            return ibex::runtime::ExternValue{std::int64_t{0}};
+        });
+    REQUIRE(ibex::repl::execute_script(script, registry));
+    decodes_out = *decodes;
+    return captured;
+}
+
+}  // namespace
+
+// `t[head n]` over a lazy source reads only the source's first n rows. It
+// decoded the whole source first: `head 1` over PDS-H lineitem took 400 ms.
+TEST_CASE("e2e lazy: head decodes only the leading rows", "[e2e][lazy][head]") {
+    for (const char* query : {"t[head 2]", "t[select { a, b }, head 2]"}) {
+        INFO(query);
+        const std::string src = std::string(R"(
+extern fn read_t() -> DataFrame from "x.hpp";
+extern fn capture(df: DataFrame) -> Int from "x.hpp";
+let t = read_t();
+let h = )") + query + R"(;
+capture(h);
+h;
+)";
+        std::vector<std::size_t> decodes;
+        Table out = run_recorded(src.c_str(), decodes);
+        CHECK(i64(out, "a") == std::vector<std::int64_t>{1, 1});
+        CHECK(i64(out, "b") == std::vector<std::int64_t>{10, 20});
+        REQUIRE_FALSE(decodes.empty());
+        for (const auto rows : decodes) {
+            CHECK(rows <= 2);
+        }
+    }
+}
+
+TEST_CASE("e2e lazy: head 0 keeps the columns and reads no rows", "[e2e][lazy][head]") {
+    std::vector<std::size_t> decodes;
+    Table out = run_recorded(R"(
+extern fn read_t() -> DataFrame from "x.hpp";
+extern fn capture(df: DataFrame) -> Int from "x.hpp";
+let t = read_t();
+let h = t[head 0];
+capture(h);
+h;
+)",
+                             decodes);
+    CHECK(out.rows() == 0);
+    CHECK(out.find("a") != nullptr);
+    CHECK(out.find("b") != nullptr);
+    for (const auto rows : decodes) {
+        CHECK(rows == 0);
+    }
+}
+
+// A filter absorbed into the decode leaves `Head(Scan)` behind; the first rows
+// of the source are not the first rows that pass.
+TEST_CASE("e2e lazy: a filtered head still reads past the leading rows", "[e2e][lazy][head]") {
+    std::vector<std::size_t> decodes;
+    Table out = run_recorded(R"(
+extern fn read_t() -> DataFrame from "x.hpp";
+extern fn capture(df: DataFrame) -> Int from "x.hpp";
+let t = read_t();
+let h = t[filter a > 1, head 2];
+capture(h);
+h;
+)",
+                             decodes);
+    CHECK(i64(out, "a") == std::vector<std::int64_t>{2, 3});
+    CHECK(i64(out, "b") == std::vector<std::int64_t>{30, 50});
+}
+
+// A source read through `head` in one place and in full in another is not cut
+// short: the limit holds only when every occurrence is under a head.
+TEST_CASE("e2e lazy: a source also read in full is not limited", "[e2e][lazy][head]") {
+    std::vector<std::size_t> decodes;
+    Table out = run_recorded(R"(
+extern fn read_t() -> DataFrame from "x.hpp";
+extern fn capture(df: DataFrame) -> Int from "x.hpp";
+let t = read_t();
+let first = t[head 2, select { a }];
+let all = t[select { a2 = a, b }];
+let j = first join all on a == a2;
+capture(j);
+j;
+)",
+                             decodes);
+    // The two leading rows have a = 1, which matches three rows of the full
+    // source each.
+    CHECK(out.rows() == 6);
+}
+
+// The statement path (one interactive statement at a time) decodes up front
+// too, through the same helper.
+TEST_CASE("e2e lazy: head on the statement path decodes only the leading rows",
+          "[e2e][lazy][head]") {
+    ExternRegistry registry;
+    auto decodes = std::make_shared<std::vector<std::size_t>>();
+    register_live_source(registry, "read_t", std::make_shared<Table>(head_source()), decodes);
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    REQUIRE(session
+                .execute("extern fn read_t() -> DataFrame from \"x.hpp\";\n"
+                         "let t = read_t();")
+                .ok);
+    decodes->clear();
+    const auto result = session.execute("t[head 2];");
+    REQUIRE(result.ok);
+    REQUIRE(result.table.has_value());
+    CHECK(result.table->rows() == 2);
+    REQUIRE_FALSE(decodes->empty());
+    for (const auto rows : *decodes) {
+        CHECK(rows <= 2);
+    }
 }

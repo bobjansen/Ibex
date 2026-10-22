@@ -55,6 +55,18 @@ struct ScanOccurrence {
 /// once, shared, rather than streamed per occurrence.
 [[nodiscard]] auto scan_source_counts(const Node& root) -> std::map<std::string, std::size_t>;
 
+/// How many leading rows each source's consumers can ever read: a source is
+/// listed only when EVERY scan of it sits under an ungrouped `head n` with a
+/// literal `n`, through nothing but column-only Project, Rename and checked
+/// Ascribe nodes, and its limit is the largest such `n`. A caller may then
+/// decode just the source's first `n` rows instead of the whole source.
+///
+/// Structural only: a caller that has already absorbed a scan filter into its
+/// decode (`remove_applied_scan_filters` leaves `Head(Scan)` behind for
+/// `Head(Filter(Scan))`) must not apply a limit to that source, because the
+/// first `n` rows of the file are not the first `n` that pass.
+[[nodiscard]] auto scan_row_limits(const Node& root) -> std::map<std::string, std::size_t>;
+
 struct ScanInstanceSplit {
     NodePtr plan;
     /// Renamed probe-scan instance name -> the source it reads.

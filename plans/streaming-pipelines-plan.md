@@ -179,6 +179,19 @@ says so.
    `li`/`ri` zero-fills (~20 MB a query) were made unwritten, proven safe by
    poisoning, and measured twice: ±2-3% per query that flipped sign between
    runs, with a significant regression each time (q20). Not landed.
+   **What chunk-taking consumers could save (2026-10-22, 8 P-cores, temporary
+   trace in `materialize_operator`, 6 reps).** The work left after the last
+   chunk arrives is <0.3 ms on every drain of every query. The upper bound is
+   instead what appending inline costs the producer: drain time minus the
+   producer's time to EOF when its chunks are only moved into a vector. That
+   is ≤10 ms on every drain except three: q13's 14.8M-row `orders` drain into
+   the materialized left join (+65-72 ms of ~580; producer 310 ms, append
+   ~180), q22's 1.5M-row `customer` drain in `build_materialized_map_run`,
+   which re-morselizes it (+29-33 ms of ~160: the 33 ms append outlasts the
+   45 ms producer), and q09's streamed 3.3M-row drain in `initialize` (+13
+   ms). About 150 ms in all, out of ~11 s total. Collecting first and
+   concatenating afterwards was slower on every query, so the inline append is
+   mostly hidden.
 4. **Semi/anti joins as probe steps** (q04, q21, q22).
 5. **Retire Layer B probe morsels** (`try_take_join_probe`,
    `build_probe_morsel_pipeline`, `IBEX_PROBE_MORSELS`), and rewrite

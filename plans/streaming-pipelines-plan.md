@@ -191,7 +191,11 @@ says so.
    45 ms producer), and q09's streamed 3.3M-row drain in `initialize` (+13
    ms). About 150 ms in all, out of ~11 s total. Collecting first and
    concatenating afterwards was slower on every query, so the inline append is
-   mostly hidden.
+   mostly hidden. q22's drain is gone (`e05f7985`): its filter run stopped at
+   the row-local update below it, so the update streamed alone and the run
+   re-split its output. Over a lazy source the run now reaches down through
+   such updates (`Plan::stream_only_bottom_updates`): q22 -16.5% / -18.8%
+   streamed, nothing else moved.
 4. **Semi/anti joins as probe steps** (q04, q21, q22).
 5. **Retire Layer B probe morsels** (`try_take_join_probe`,
    `build_probe_morsel_pipeline`, `IBEX_PROBE_MORSELS`), and rewrite

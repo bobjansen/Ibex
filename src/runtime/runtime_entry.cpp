@@ -430,6 +430,38 @@ auto resolved_aggregate_parallelism(const physical::HashAggregateNodes& nodes,
 
 }  // namespace
 
+/// Defined below; the semi/anti join site offers its right side a scan sink on
+/// the same condition the aggregate does.
+auto is_row_local_chain_over_lazy_scan(const ir::Node& node, const TableRegistry& registry) -> bool;
+
+/// The row count of the deferred lazy source under a chain of Filter, Project,
+/// Rename and Update nodes, or nullopt when `node` is not such a chain. The
+/// source's count, not the chain's output: an upper bound, used only to order
+/// two sides' work.
+auto lazy_chain_source_rows(const ir::Node& node, const TableRegistry& registry,
+                            const ExecutionContext& exec) -> std::optional<std::size_t> {
+    const ir::Node* cur = &node;
+    while (cur->kind() == ir::NodeKind::Filter || cur->kind() == ir::NodeKind::Project ||
+           cur->kind() == ir::NodeKind::Rename || cur->kind() == ir::NodeKind::Update) {
+        if (cur->children().size() != 1 || cur->children().front() == nullptr) {
+            return std::nullopt;
+        }
+        cur = cur->children().front().get();
+    }
+    if (cur->kind() != ir::NodeKind::Scan) {
+        return std::nullopt;
+    }
+    const auto& name = ir::node_cast<ir::ScanNode>(*cur).source_name();
+    if (registry.contains(name)) {
+        return std::nullopt;
+    }
+    const auto* deferred = exec.deferred_scan(name);
+    if (deferred == nullptr || deferred->lazy == nullptr) {
+        return std::nullopt;
+    }
+    return deferred->lazy->rows();
+}
+
 /// Compatibility construction sites that do not own a physical Plan still use
 /// the same policy factories. Migrated joins take the `StreamingJoinNodes`
 /// overload above instead. Exported via `physical_executor_internal.hpp` for
@@ -469,15 +501,36 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
         // key column, chunk by chunk -- `materialize_row_local` here copied the
         // whole right side into one growing Table on this thread (214ms of
         // q04's 244ms build) to hand the join a contiguity it never used.
-        auto right =
-            build_operator(*join.children()[1], registry, scalars, externs, exec, model_out);
+        //
+        // A right side that is a row-local chain directly over a lazy scan is
+        // offered a scan-worker sink, so a swapped build can probe its chunks
+        // on the workers that decode them (q04's 37.9M line-item keys).
+        //
+        // Only when the left side's source is the smaller of the two: the sink
+        // makes the operator drain the left first, before the right's pipeline
+        // starts (starting it first parks its producers on pool threads while
+        // the left decodes -- the overlap the notes above record). q04: orders
+        // (15M) before lineitem (60M).
+        std::shared_ptr<ScanWorkerSink> scan_sink;
+        if (join.keys().size() == 1 && exec.can_fan_out() && exec.stream_scans &&
+            is_row_local_chain_over_lazy_scan(*join.children()[1], registry)) {
+            const auto left_rows = lazy_chain_source_rows(*join.children()[0], registry, exec);
+            const auto right_rows = lazy_chain_source_rows(*join.children()[1], registry, exec);
+            if (left_rows.has_value() && right_rows.has_value() && *left_rows < *right_rows) {
+                scan_sink = make_semi_anti_scan_sink();
+            }
+        }
+        auto right = [&] {
+            const ScanWorkerSinkOffer offer(scan_sink);
+            return build_operator(*join.children()[1], registry, scalars, externs, exec, model_out);
+        }();
         if (!right.has_value()) {
             return std::unexpected(std::move(right.error()));
         }
         return pipeline_executor_detail::make_pipelined_stage_if(
             make_chunked_semi_anti_join_operator(std::move(left_op.value()),
                                                  std::move(right.value()), join.kind(),
-                                                 &join.keys(), &exec),
+                                                 &join.keys(), &exec, scan_sink),
             stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
     }
     if (!plan.streaming_join.has_value()) {

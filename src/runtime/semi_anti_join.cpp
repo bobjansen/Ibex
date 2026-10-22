@@ -20,15 +20,19 @@
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <expected>
+#include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <robin_hood.h>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -39,20 +43,95 @@
 #include "interpreter_internal.hpp"
 #include "join_chunked_internal.hpp"
 #include "runtime_internal.hpp"
+#include "scan_worker_sink_internal.hpp"
 
 namespace ibex::runtime {
 
 namespace {
 
+/// The semi/anti join's hook into its right side's scan workers (see
+/// `ScanWorkerSink`): once the swapped build has its left-key map, each right
+/// chunk is probed against it on the worker that decoded it, and the consumer
+/// learns which emitted chunks need no probe of their own.
+///
+/// Marking a hit is idempotent -- the hits are a set -- so a chunk probed by a
+/// worker and again by the consumer is merely redundant. Dropping a chunk is
+/// the optimization, and is only done when its worker probed exactly the rows
+/// the pipeline emitted.
+class SemiAntiScanSink final : public ScanWorkerSink {
+   public:
+    /// Probes one right chunk on a worker; false when it could not (no Int64
+    /// key column), which leaves the chunk to the consumer.
+    using Probe = std::function<bool(const Chunk&)>;
+
+    void activate(Probe probe) {
+        const std::unique_lock lock(probe_mutex_);
+        probe_ = std::move(probe);
+    }
+
+    /// Waits out any worker still probing: afterwards nothing touches the
+    /// state the probe reads or writes.
+    void deactivate() {
+        const std::unique_lock lock(probe_mutex_);
+        probe_ = nullptr;
+    }
+
+    void on_worker_chunk(std::size_t unit, const Chunk& chunk) noexcept override {
+        {
+            const std::shared_lock lock(probe_mutex_);
+            if (!probe_) {
+                return;
+            }
+            try {
+                if (!probe_(chunk)) {
+                    return;
+                }
+            } catch (...) {  // NOLINT(bugprone-empty-catch) -- a hint; the chunk still flows
+                return;
+            }
+        }
+        const std::scoped_lock lock(probed_mutex_);
+        try {
+            probed_[unit] = chunk.rows();
+        } catch (...) {  // NOLINT(bugprone-empty-catch) -- as above
+        }
+    }
+
+    [[nodiscard]] auto on_emit(std::size_t unit, const Chunk& chunk,
+                               std::vector<DeferredCategoricalRemap> deferred) noexcept
+        -> bool override {
+        const std::scoped_lock lock(probed_mutex_);
+        current_probed_ = false;
+        if (const auto it = probed_.find(unit); it != probed_.end()) {
+            current_probed_ = it->second == chunk.rows();
+            probed_.erase(it);
+        }
+        return deferred.empty();
+    }
+
+    /// Whether the chunk the pipeline emitted last was fully probed on its
+    /// worker. Consuming thread only, between that emission and the next.
+    [[nodiscard]] auto current_probed() const -> bool { return current_probed_; }
+
+   private:
+    std::shared_mutex probe_mutex_;
+    Probe probe_;
+    std::mutex probed_mutex_;
+    robin_hood::unordered_flat_map<std::size_t, std::size_t> probed_;
+    bool current_probed_ = false;
+};
+
 class ChunkedSemiAntiJoinOperator final : public Operator {
    public:
     ChunkedSemiAntiJoinOperator(OperatorPtr left, OperatorPtr right, ir::JoinKind kind,
-                                const std::vector<ir::JoinKey>* keys, const ExecutionContext* exec)
+                                const std::vector<ir::JoinKey>* keys, const ExecutionContext* exec,
+                                std::shared_ptr<SemiAntiScanSink> scan_sink)
         : left_(std::move(left)),
           right_op_(std::move(right)),
           kind_(kind),
           keys_(keys),
-          exec_(exec) {}
+          exec_(exec),
+          scan_sink_(std::move(scan_sink)) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (!initialized_) {
@@ -245,11 +324,12 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     /// every chunk of every column into one growing buffer -- serially, on the
     /// calling thread. Nothing here wanted that: the operator reads one column
     /// and only ever scans it.
+    ///
+    /// A chunk the scan sink already probed on its worker is dropped rather
+    /// than held.
     auto drain_right_keys() -> std::optional<std::string> {
         const std::string& key_name = keys_->front().right;
         const std::string* key2_name = keys_->size() == 2 ? &(*keys_)[1].right : nullptr;
-        const std::size_t* type_index = nullptr;
-        std::size_t first_index = 0;
         while (true) {
             if (interrupt_requested()) {
                 return interrupt_message();
@@ -260,6 +340,9 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             }
             if (!chunk_res.value().has_value()) {
                 break;
+            }
+            if (scan_sink_ != nullptr && scan_sink_->current_probed()) {
+                continue;  // its keys are already in the hits
             }
             Chunk chunk = std::move(*chunk_res.value());
             ColumnEntry* entry = nullptr;
@@ -277,10 +360,9 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             }
             // One definition of the type across chunks, the check
             // `MaterializeOperator` used to make on the way to a Table.
-            if (type_index == nullptr) {
-                first_index = entry->column->index();
-                type_index = &first_index;
-            } else if (entry->column->index() != first_index) {
+            if (!right_key_index_.has_value()) {
+                right_key_index_ = entry->column->index();
+            } else if (entry->column->index() != *right_key_index_) {
                 return "ChunkedSemiAntiJoinOperator: right key column type differs across chunks";
             }
             if (key2_name != nullptr) {
@@ -306,6 +388,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             right_rows_ += column_size(*entry->column);
             right_key_chunks_.push_back(std::move(*entry));
         }
+        right_exhausted_ = true;
         right_op_.reset();
         return std::nullopt;
     }
@@ -356,9 +439,84 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     // keeps the rest). Restricted to integer keys, which every TPC-H join uses
     // and where the win is; other key types keep the streaming build-on-right.
     auto init_int_swapped() -> std::optional<std::string> {
-        // Drain the left into a list of chunks. Deliberately NOT
-        // `MaterializeOperator`: see the note in `next()` — concatenating them
-        // is a full copy of the left that nothing here needs.
+        if (auto err = buffer_left()) {
+            return err;
+        }
+        std::vector<const Column<std::int64_t>*> lcols;
+        std::size_t left_rows = 0;
+        if (left_key_columns(lcols, left_rows) && left_rows < right_rows_) {
+            build_swapped_left_map(lcols, left_rows);
+            scan_kept_right();
+        } else if (!try_build_dense_right()) {
+            // Left is not the smaller side (or its key vanished) and the right
+            // key span is too wide/sparse for a bitmap; the plain right set is
+            // as good, and the buffered left still emits.
+            right_i64_.reserve(right_rows_);
+            for_right_rows<std::int64_t>(0, right_rows_,
+                                         [&](std::int64_t value) { right_i64_.insert(value); });
+        }
+        return std::nullopt;
+    }
+
+    /// The swapped build with the right side streamed (`drain_left_first_`):
+    /// the left is buffered and its key map built BEFORE the right is pulled
+    /// at all, so the right's scan pipeline starts only then and every chunk
+    /// it produces is probed on the worker that decoded it
+    /// (`SemiAntiScanSink`). Without it the right side was drained whole --
+    /// 37.9M keys in q04 -- and only then scanned, in a burst after the decode
+    /// had finished.
+    ///
+    /// The left must come first: peeking at the right to decide started its
+    /// pipeline, whose parked producers then held pool threads while the left
+    /// decoded on the two that were left (q04 +13%; the build site records
+    /// two earlier overlap attempts that regressed the same way). So the
+    /// decision is made at plan time from source sizes, and nothing here
+    /// depends on it for correctness: the intersection of the left's keys
+    /// with the right's is the answer whichever side turns out larger.
+    /// Returns with `swapped_build_done_` unset when a key is not Int64; the
+    /// ordinary build then runs over what has been drained.
+    auto stream_swapped_build() -> std::optional<std::string> {
+        if (auto err = buffer_left()) {
+            return err;
+        }
+        std::vector<const Column<std::int64_t>*> lcols;
+        std::size_t left_rows = 0;
+        if (!left_key_columns(lcols, left_rows)) {
+            return std::nullopt;
+        }
+        build_swapped_left_map(lcols, left_rows);
+        scan_sink_->activate([this](const Chunk& chunk) { return probe_on_worker(chunk); });
+        auto err = drain_right_keys();
+        scan_sink_->deactivate();
+        if (err) {
+            return err;
+        }
+        if (right_key_index_.has_value() &&
+            !std::holds_alternative<Column<std::int64_t>>(*right_key_chunks_.front().column)) {
+            // Not an Int64 right key after all: drop the map and let the
+            // ordinary build use the (all kept) right chunks.
+            left_slots_.clear();
+            slot_hits_.clear();
+            left_seen_.clear();
+            left_candidates_.clear();
+            left_dense_ = false;
+            dense_i64_nbits_ = 0;
+            dense_i64_hits_.clear();
+            return std::nullopt;
+        }
+        right_kind_ = ExprType::Int;
+        scan_kept_right();
+        swapped_build_done_ = true;
+        return std::nullopt;
+    }
+
+    /// Drain the left into a list of chunks, once. Deliberately NOT
+    /// `MaterializeOperator`: see the note in `next()` -- concatenating them is
+    /// a full copy of the left that nothing here needs.
+    auto buffer_left() -> std::optional<std::string> {
+        if (left_drained_) {
+            return std::nullopt;
+        }
         while (true) {
             auto chunk = left_->next();
             if (!chunk.has_value()) {
@@ -369,201 +527,224 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             }
             left_buffered_.push_back(chunk_to_table(std::move(**chunk)));
         }
+        left_drained_ = true;
         swapped_ = true;
+        return std::nullopt;
+    }
 
-        // The left key column, chunk by chunk. Every chunk must carry it as an
-        // int64 for the intersection build to be worth taking; one that does not
-        // falls back to the plain right set below, exactly as a missing key
-        // column did when the left was one table.
-        std::vector<const Column<std::int64_t>*> lcols;
+    /// The buffered left's key column, chunk by chunk. Every chunk must carry
+    /// it as an int64 for the intersection build to be worth taking; one that
+    /// does not falls back to the plain right set, exactly as a missing key
+    /// column did when the left was one table.
+    auto left_key_columns(std::vector<const Column<std::int64_t>*>& lcols, std::size_t& left_rows)
+        -> bool {
         lcols.reserve(left_buffered_.size());
-        std::size_t left_rows = 0;
         for (const auto& part : left_buffered_) {
             const ColumnValue* lkey = part.find(keys_->front().left);
             const auto* lcol = lkey != nullptr ? std::get_if<Column<std::int64_t>>(lkey) : nullptr;
             if (lcol == nullptr) {
                 lcols.clear();
-                break;
+                return false;
             }
             lcols.push_back(lcol);
             left_rows += lcol->size();
         }
-        if (!lcols.empty() && left_rows < right_rows_) {
-            // A moderately dense integer key range does not need a hash lookup
-            // for every row on the large side. q22's 84k in-scope customer
-            // keys span only ~300k values: a byte-addressed candidate table is
-            // smaller than the hash map and turns the 3M-order intersection
-            // pass into two bounds checks plus array reads.
-            //
-            // Keep this a proved representation choice, not an assumption
-            // about TPC-H keys. Sparse or very wide ranges decline to the hash
-            // path below. Workers retain private hit arrays, so repeated right
-            // keys never race and the final OR is deterministic.
-            const auto try_dense_intersection = [&]() -> bool {
-                if (left_rows == 0) {
-                    return false;
-                }
-                std::int64_t min_key = std::numeric_limits<std::int64_t>::max();
-                std::int64_t max_key = std::numeric_limits<std::int64_t>::min();
-                for (const auto* lcol : lcols) {
-                    for (const std::int64_t value : *lcol) {
-                        min_key = std::min(min_key, value);
-                        max_key = std::max(max_key, value);
-                    }
-                }
-                const std::uint64_t difference =
-                    static_cast<std::uint64_t>(max_key) - static_cast<std::uint64_t>(min_key);
-                if (difference == std::numeric_limits<std::uint64_t>::max()) {
-                    return false;  // the inclusive span is not representable
-                }
-                const std::uint64_t span64 = difference + 1;
-                // Bit-packed, so the ceiling and the per-key density gate are
-                // both 8x looser than the old byte-addressed table: 64M slots =
-                // 8MB, at most 16 slots per left key.
-                constexpr std::uint64_t kMaxDenseSlots = 64ULL << 20U;
-                constexpr std::size_t kMaxRangePerKey = 16;
-                const std::size_t density_limit =
-                    left_rows > std::numeric_limits<std::size_t>::max() / kMaxRangePerKey
-                        ? std::numeric_limits<std::size_t>::max()
-                        : left_rows * kMaxRangePerKey;
-                if (span64 > kMaxDenseSlots || span64 > density_limit) {
-                    return false;
-                }
-                const auto slots = static_cast<std::size_t>(span64);
-                const std::size_t nwords = (slots + 63U) / 64U;
-                const auto slot_of = [min_key](std::int64_t value) {
-                    return static_cast<std::uint64_t>(value) - static_cast<std::uint64_t>(min_key);
-                };
-                std::vector<std::uint64_t> candidates(nwords, std::uint64_t{0});
-                for (const auto* lcol : lcols) {
-                    for (const std::int64_t value : *lcol) {
-                        const std::uint64_t slot = slot_of(value);
-                        candidates[dense_word(slot)] |= dense_bit(slot);
-                    }
-                }
-                const auto scan_range = [&](std::size_t lo, std::size_t hi, std::uint64_t* hits) {
-                    for_right_rows<std::int64_t>(lo, hi, [&](std::int64_t value) {
-                        if (value < min_key || value > max_key) {
-                            return;
-                        }
-                        const std::uint64_t slot = slot_of(value);
-                        if ((candidates[dense_word(slot)] & dense_bit(slot)) != 0) {
-                            hits[dense_word(slot)] |= dense_bit(slot);
-                        }
-                    });
-                };
+        return !lcols.empty();
+    }
 
-                std::vector<std::uint64_t> hits(nwords, std::uint64_t{0});
-                const std::size_t workers =
-                    intersect_worker_count(right_rows_, nwords * sizeof(std::uint64_t));
-                if (workers < 2) {
-                    scan_range(0, right_rows_, hits.data());
-                } else {
-                    std::vector<std::vector<std::uint64_t>> parts(
-                        workers, std::vector<std::uint64_t>(nwords, std::uint64_t{0}));
-                    const std::size_t grain = (right_rows_ + workers - 1) / workers;
-                    auto batch = process_worker_pool().submit(workers, [&](std::size_t worker) {
-                        const std::size_t begin = worker * grain;
-                        if (begin < right_rows_) {
-                            scan_range(begin, std::min(right_rows_, begin + grain),
-                                       parts[worker].data());
-                        }
-                    });
-                    batch.wait();
-                    for (const auto& part : parts) {
-                        for (std::size_t w = 0; w < nwords; ++w) {
-                            hits[w] |= part[w];
-                        }
+    /// The left-key map the right side is scanned against, and the zeroed hit
+    /// storage the scan marks.
+    ///
+    /// A moderately dense integer key range does not need a hash lookup for
+    /// every row on the large side. q22's 84k in-scope customer keys span only
+    /// ~300k values: a bit-packed candidate table is smaller than the hash map
+    /// and turns the 3M-order intersection pass into two bounds checks plus
+    /// array reads; its hits stay a bitmap (`dense_i64_hits_`) for the probe
+    /// of the buffered left. Sparse or very wide ranges take the hash map,
+    /// whose dense index per distinct key (`left_seen_`) is what lets the scan
+    /// split: each worker marks only existing slots, never inserts. Each
+    /// buffered left row's slot is recorded as the map is built, so the probe
+    /// of the buffered left is `hits[slot]` -- two array reads -- and the hits
+    /// never have to be turned back into a key set (that rebuild ran on one
+    /// thread after the scan: most of q04's ~40 ms single-worker tail).
+    void build_swapped_left_map(const std::vector<const Column<std::int64_t>*>& lcols,
+                                std::size_t left_rows) {
+        if (left_rows != 0) {
+            std::int64_t min_key = std::numeric_limits<std::int64_t>::max();
+            std::int64_t max_key = std::numeric_limits<std::int64_t>::min();
+            for (const auto* lcol : lcols) {
+                for (const std::int64_t value : *lcol) {
+                    min_key = std::min(min_key, value);
+                    max_key = std::max(max_key, value);
+                }
+            }
+            const std::uint64_t difference =
+                static_cast<std::uint64_t>(max_key) - static_cast<std::uint64_t>(min_key);
+            // Bit-packed, so the ceiling and the per-key density gate are both
+            // 8x looser than the old byte-addressed table: 64M slots = 8MB, at
+            // most 16 slots per left key.
+            constexpr std::uint64_t kMaxDenseSlots = 64ULL << 20U;
+            constexpr std::size_t kMaxRangePerKey = 16;
+            const std::size_t density_limit =
+                left_rows > std::numeric_limits<std::size_t>::max() / kMaxRangePerKey
+                    ? std::numeric_limits<std::size_t>::max()
+                    : left_rows * kMaxRangePerKey;
+            // An unrepresentable inclusive span (difference == max) is never
+            // dense either.
+            if (difference != std::numeric_limits<std::uint64_t>::max() &&
+                difference + 1 <= kMaxDenseSlots && difference + 1 <= density_limit) {
+                const auto slots = static_cast<std::size_t>(difference + 1);
+                const std::size_t nwords = (slots + 63U) / 64U;
+                left_candidates_.assign(nwords, std::uint64_t{0});
+                for (const auto* lcol : lcols) {
+                    for (const std::int64_t value : *lcol) {
+                        const std::uint64_t slot =
+                            static_cast<std::uint64_t>(value) - static_cast<std::uint64_t>(min_key);
+                        left_candidates_[dense_word(slot)] |= dense_bit(slot);
                     }
                 }
-                // Retain the dense representation for the buffered-left probe
-                // too. Converting the hits back into a hash set would throw
-                // away the representation win just before probing q22's 84k
-                // customer rows.
+                left_dense_ = true;
+                left_dense_max_ = max_key;
                 dense_i64_min_ = min_key;
                 dense_i64_nbits_ = slots;
-                dense_i64_hits_ = std::move(hits);
-                return true;
-            };
-            if (try_dense_intersection()) {
-                return std::nullopt;
+                dense_i64_hits_.assign(nwords, std::uint64_t{0});
+                return;
             }
-
-            // 57k inserts + 3.8M finds, versus 3.8M inserts the other way.
-            //
-            // The map stores a DENSE INDEX rather than a matched flag, which is
-            // what lets the 3.8M-row scan below be split. Ranges of the right
-            // column are independent — the scan only ever marks an existing
-            // slot, never inserts — so each worker marks into its own byte
-            // vector over the left keys and they are ORed afterwards. No
-            // atomics, and the answer cannot depend on the split: `right_i64_`
-            // is a set, so only WHICH keys were hit matters, not the order they
-            // were found in.
-            //
-            // Each buffered left row's slot is recorded as the map is built, so
-            // the probe of the buffered left is `hits[slot]` -- two array reads
-            // -- and the hits never have to be turned back into a key set.
-            // Rebuilding one (every hit key inserted into `right_i64_`, then a
-            // hash lookup per left row) ran on one thread after the parallel
-            // scan: most of q04's ~40 ms single-worker tail.
-            robin_hood::unordered_flat_map<std::int64_t, std::uint32_t> seen;
-            seen.reserve(left_rows);
-            std::uint32_t next_slot = 0;
-            left_slots_.resize(lcols.size());
-            for (std::size_t c = 0; c < lcols.size(); ++c) {
-                const auto& lcol = *lcols[c];
-                auto& slots = left_slots_[c];
-                slots.resize(lcol.size());
-                for (std::size_t row = 0; row < lcol.size(); ++row) {
-                    const auto [it, inserted] = seen.try_emplace(lcol[row], next_slot);
-                    next_slot += inserted ? 1U : 0U;
-                    slots[row] = it->second;
-                }
-            }
-            const std::size_t n_slots = next_slot;
-
-            const auto scan_range = [&](std::size_t lo, std::size_t hi, char* hits) {
-                for_right_rows<std::int64_t>(lo, hi, [&](std::int64_t value) {
-                    if (auto it = seen.find(value); it != seen.end()) {
-                        hits[it->second] = char{1};
-                    }
-                });
-            };
-
-            std::vector<char> hits(n_slots, char{0});
-            const std::size_t workers = intersect_worker_count(right_rows_, n_slots);
-            if (workers < 2) {
-                scan_range(0, right_rows_, hits.data());
-            } else {
-                // One private vector per worker, ORed below. `n_slots` bytes
-                // each, which is why the worker count is capped by a byte
-                // budget rather than by the pool size alone.
-                std::vector<std::vector<char>> parts(workers, std::vector<char>(n_slots, char{0}));
-                const std::size_t grain = (right_rows_ + workers - 1) / workers;
-                auto batch = process_worker_pool().submit(workers, [&](std::size_t w) {
-                    const std::size_t lo = w * grain;
-                    if (lo < right_rows_) {
-                        scan_range(lo, std::min(right_rows_, lo + grain), parts[w].data());
-                    }
-                });
-                batch.wait();
-                for (const auto& part : parts) {
-                    for (std::size_t slot = 0; slot < n_slots; ++slot) {
-                        hits[slot] = static_cast<char>(hits[slot] | part[slot]);
-                    }
-                }
-            }
-
-            slot_hits_ = std::move(hits);
-        } else if (!try_build_dense_right()) {
-            // Left is not the smaller side (or its key vanished) and the right
-            // key span is too wide/sparse for a bitmap; the plain right set is
-            // as good, and the buffered left still emits.
-            right_i64_.reserve(right_rows_);
-            for_right_rows<std::int64_t>(0, right_rows_,
-                                         [&](std::int64_t value) { right_i64_.insert(value); });
         }
-        return std::nullopt;
+
+        // 57k inserts + 3.8M finds, versus 3.8M inserts the other way.
+        left_seen_.reserve(left_rows);
+        std::uint32_t next_slot = 0;
+        left_slots_.resize(lcols.size());
+        for (std::size_t c = 0; c < lcols.size(); ++c) {
+            const auto& lcol = *lcols[c];
+            auto& slots = left_slots_[c];
+            slots.resize(lcol.size());
+            for (std::size_t row = 0; row < lcol.size(); ++row) {
+                const auto [it, inserted] = left_seen_.try_emplace(lcol[row], next_slot);
+                next_slot += inserted ? 1U : 0U;
+                slots[row] = it->second;
+            }
+        }
+        slot_hits_.assign(next_slot, char{0});
+    }
+
+    /// Mark the left slots right key `value` hits, into `words` (dense) or
+    /// `bytes` (hash).
+    void mark_right_key(std::int64_t value, std::uint64_t* words, char* bytes) const {
+        if (left_dense_) {
+            if (value < dense_i64_min_ || value > left_dense_max_) {
+                return;
+            }
+            const std::uint64_t slot =
+                static_cast<std::uint64_t>(value) - static_cast<std::uint64_t>(dense_i64_min_);
+            if ((left_candidates_[dense_word(slot)] & dense_bit(slot)) != 0) {
+                words[dense_word(slot)] |= dense_bit(slot);
+            }
+            return;
+        }
+        if (const auto it = left_seen_.find(value); it != left_seen_.end()) {
+            bytes[it->second] = char{1};
+        }
+    }
+
+    /// Scan the right keys the consumer holds into the hits. Ranges of the
+    /// held keys are independent -- the scan only marks existing slots -- so
+    /// each worker marks into its own copy of the hit storage and they are
+    /// ORed afterwards: no atomics, and only WHICH slots were hit matters, not
+    /// the order they were found in.
+    void scan_kept_right() {
+        if (right_rows_ == 0) {
+            return;
+        }
+        const std::size_t width = left_dense_ ? dense_i64_hits_.size() : slot_hits_.size();
+        const std::size_t bytes_per_copy = left_dense_ ? width * sizeof(std::uint64_t) : width;
+        const auto scan_range = [&](std::size_t lo, std::size_t hi, std::uint64_t* words,
+                                    char* bytes) {
+            for_right_rows<std::int64_t>(
+                lo, hi, [&](std::int64_t value) { mark_right_key(value, words, bytes); });
+        };
+        const std::size_t workers = intersect_worker_count(right_rows_, bytes_per_copy);
+        if (workers < 2) {
+            scan_range(0, right_rows_, dense_i64_hits_.data(), slot_hits_.data());
+            return;
+        }
+        std::vector<std::vector<std::uint64_t>> word_parts(
+            left_dense_ ? workers : 0, std::vector<std::uint64_t>(width, std::uint64_t{0}));
+        std::vector<std::vector<char>> byte_parts(left_dense_ ? 0 : workers,
+                                                  std::vector<char>(width, char{0}));
+        const std::size_t grain = (right_rows_ + workers - 1) / workers;
+        auto batch = process_worker_pool().submit(workers, [&](std::size_t w) {
+            const std::size_t lo = w * grain;
+            if (lo < right_rows_) {
+                scan_range(lo, std::min(right_rows_, lo + grain),
+                           left_dense_ ? word_parts[w].data() : nullptr,
+                           left_dense_ ? nullptr : byte_parts[w].data());
+            }
+        });
+        batch.wait();
+        for (const auto& part : word_parts) {
+            for (std::size_t i = 0; i < width; ++i) {
+                dense_i64_hits_[i] |= part[i];
+            }
+        }
+        for (const auto& part : byte_parts) {
+            for (std::size_t i = 0; i < width; ++i) {
+                slot_hits_[i] = static_cast<char>(slot_hits_[i] | part[i]);
+            }
+        }
+    }
+
+    /// One right chunk, probed on the scan worker that produced it, straight
+    /// into the shared hit storage. Workers race only to set bits or bytes
+    /// that are never cleared, so a relaxed atomic set is enough; the
+    /// consumer reads the storage only after `SemiAntiScanSink::deactivate`,
+    /// whose lock orders every worker's writes before it. Checking before
+    /// writing keeps a hot key's cache line from bouncing between cores (q04
+    /// has ~4 line items per order).
+    auto probe_on_worker(const Chunk& chunk) -> bool {
+        const std::string& key_name = keys_->front().right;
+        const ColumnEntry* entry = nullptr;
+        for (const auto& column : chunk.columns) {
+            if (column.name == key_name) {
+                entry = &column;
+                break;
+            }
+        }
+        const auto* col =
+            entry != nullptr ? std::get_if<Column<std::int64_t>>(entry->column.get()) : nullptr;
+        if (col == nullptr) {
+            return false;
+        }
+        const ValidityBitmap* validity = entry->validity.has_value() ? &*entry->validity : nullptr;
+        const std::int64_t* keys = col->data();
+        const std::size_t rows = col->size();
+        for (std::size_t row = 0; row < rows; ++row) {
+            if (validity != nullptr && !(*validity)[row]) {
+                continue;  // a null right key hits nothing
+            }
+            const std::int64_t value = keys[row];
+            if (left_dense_) {
+                if (value < dense_i64_min_ || value > left_dense_max_) {
+                    continue;
+                }
+                const std::uint64_t slot =
+                    static_cast<std::uint64_t>(value) - static_cast<std::uint64_t>(dense_i64_min_);
+                if ((left_candidates_[dense_word(slot)] & dense_bit(slot)) == 0) {
+                    continue;
+                }
+                std::atomic_ref<std::uint64_t> word(dense_i64_hits_[dense_word(slot)]);
+                if ((word.load(std::memory_order_relaxed) & dense_bit(slot)) == 0) {
+                    word.fetch_or(dense_bit(slot), std::memory_order_relaxed);
+                }
+            } else if (const auto it = left_seen_.find(value); it != left_seen_.end()) {
+                std::atomic_ref<char> hit(slot_hits_[it->second]);
+                if (hit.load(std::memory_order_relaxed) == char{0}) {
+                    hit.store(char{1}, std::memory_order_relaxed);
+                }
+            }
+        }
+        return true;
     }
 
     /// Two Int64 keys: a set of packed pairs, built from the drained key
@@ -599,8 +780,18 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         if (keys_->empty() || keys_->size() > 2) {
             return "ChunkedSemiAntiJoinOperator supports one key or two Int64 keys";
         }
-        if (auto err = drain_right_keys()) {
-            return err;
+        if (scan_sink_ != nullptr && keys_->size() == 1) {
+            if (auto err = stream_swapped_build()) {
+                return err;
+            }
+            if (swapped_build_done_) {
+                return std::nullopt;
+            }
+        }
+        if (!right_exhausted_) {
+            if (auto err = drain_right_keys()) {
+                return err;
+            }
         }
         if (keys_->size() == 2) {
             // Set even with an empty right, so `filter_chunk` takes the pair
@@ -1072,8 +1263,23 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     ExprType right_kind_ = ExprType::Int;
     const ExecutionContext* exec_ = nullptr;
 
+    /// Offered by the right side's scan pipeline when the plan chose to drain
+    /// the left first, or null (see `stream_swapped_build`).
+    std::shared_ptr<SemiAntiScanSink> scan_sink_;
+    bool right_exhausted_ = false;
+    bool left_drained_ = false;
+    bool swapped_build_done_ = false;
+    /// The right key column's variant index, the same in every chunk.
+    std::optional<std::size_t> right_key_index_;
+    /// The swapped build's left-key map (see `build_swapped_left_map`): a
+    /// candidate bitmap over `[dense_i64_min_, left_dense_max_]` when
+    /// `left_dense_`, else a dense index per distinct left key.
+    bool left_dense_ = false;
+    std::int64_t left_dense_max_ = 0;
+    std::vector<std::uint64_t> left_candidates_;
+    robin_hood::unordered_flat_map<std::int64_t, std::uint32_t> left_seen_;
     robin_hood::unordered_flat_set<std::int64_t> right_i64_;
-    /// The swapped hash build's answer, kept in the form the build produced
+    /// The swapped build's answer, kept in the form the build produced
     /// rather than as a key set: per buffered left chunk, each row's slot in
     /// the left-key map, and per slot whether the right side holds that key.
     /// Live iff `left_slots_` is non-empty; `filtering_chunk_` is the buffered
@@ -1115,11 +1321,18 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
 
 }  // namespace
 
+auto make_semi_anti_scan_sink() -> std::shared_ptr<ScanWorkerSink> {
+    return std::make_shared<SemiAntiScanSink>();
+}
+
 auto make_chunked_semi_anti_join_operator(OperatorPtr left, OperatorPtr right, ir::JoinKind kind,
                                           const std::vector<ir::JoinKey>* keys,
-                                          const ExecutionContext* exec) -> OperatorPtr {
-    return std::make_unique<ChunkedSemiAntiJoinOperator>(std::move(left), std::move(right), kind,
-                                                         keys, exec);
+                                          const ExecutionContext* exec,
+                                          const std::shared_ptr<ScanWorkerSink>& scan_sink)
+    -> OperatorPtr {
+    return std::make_unique<ChunkedSemiAntiJoinOperator>(
+        std::move(left), std::move(right), kind, keys, exec,
+        std::dynamic_pointer_cast<SemiAntiScanSink>(scan_sink));
 }
 
 auto is_streamable_semi_anti_join(const ir::JoinNode& join) -> bool {

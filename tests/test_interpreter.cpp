@@ -34,12 +34,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <initializer_list>
 #include <limits>
 #include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -18233,6 +18235,166 @@ TEST_CASE("Scan pipeline reports a failing unit whichever thread decodes it",
     REQUIRE_FALSE(out.has_value());
     CHECK(out.error().find("unit " + std::to_string(state->fail_unit) + " failed") !=
           std::string::npos);
+}
+
+// A multi-unit lazy source with one Int64 key column `k` (and a row number
+// `n`), its keys given by a function of the source row; nullopt is a null key.
+struct KeyedUnitState {
+    std::size_t units = 0;
+    std::size_t rows_per_unit = 0;
+    std::function<std::optional<std::int64_t>(std::size_t)> key_of;
+};
+
+class KeyedUnitReader final : public runtime::LazySourceReader {
+   public:
+    explicit KeyedUnitReader(std::shared_ptr<KeyedUnitState> state) : state_(std::move(state)) {}
+
+    auto decode_units() -> std::vector<runtime::SourceUnit> override {
+        std::vector<runtime::SourceUnit> units;
+        for (std::size_t u = 0; u < state_->units; ++u) {
+            units.push_back({.start = u * state_->rows_per_unit, .rows = state_->rows_per_unit});
+        }
+        return units;
+    }
+
+    auto decode(const std::vector<std::string>& names, const runtime::Selection* selection,
+                const runtime::SourceUnit* unit, const runtime::ExecutionContext& /*exec*/)
+        -> std::expected<runtime::Table, std::string> override {
+        std::vector<std::size_t> rows;
+        if (selection != nullptr) {
+            rows.assign(selection->begin(), selection->end());
+        } else {
+            const std::size_t start = unit != nullptr ? unit->start : 0;
+            const std::size_t count =
+                unit != nullptr ? unit->rows : state_->units * state_->rows_per_unit;
+            for (std::size_t i = 0; i < count; ++i) {
+                rows.push_back(start + i);
+            }
+        }
+        runtime::Table out;
+        for (const auto& name : names) {
+            Column<std::int64_t> values;
+            runtime::ValidityBitmap validity(rows.size(), true);
+            bool any_null = false;
+            for (std::size_t i = 0; i < rows.size(); ++i) {
+                if (name == "k") {
+                    const auto key = state_->key_of(rows[i]);
+                    values.push_back(key.value_or(0));
+                    if (!key.has_value()) {
+                        validity.set(i, false);
+                        any_null = true;
+                    }
+                } else {
+                    values.push_back(static_cast<std::int64_t>(rows[i]));
+                }
+            }
+            if (any_null) {
+                out.add_column(name, std::move(values), std::move(validity));
+            } else {
+                out.add_column(name, std::move(values));
+            }
+        }
+        out.logical_rows = rows.size();
+        return out;
+    }
+
+   private:
+    std::shared_ptr<KeyedUnitState> state_;
+};
+
+auto keyed_unit_lazy(const std::shared_ptr<KeyedUnitState>& state) -> runtime::LazyTablePtr {
+    runtime::Table schema;
+    schema.add_column("k", Column<std::int64_t>{});
+    schema.add_column("n", Column<std::int64_t>{});
+    return std::make_shared<runtime::LazyTable>(
+        std::move(schema), state->units * state->rows_per_unit,
+        [state]() -> std::expected<runtime::LazySourceReaderPtr, std::string> {
+            return runtime::LazySourceReaderPtr{std::make_unique<KeyedUnitReader>(state)};
+        });
+}
+
+// A semi/anti join whose left source is the smaller of two streamed lazy
+// sources drains the left first, builds its key map, and only then starts the
+// right's scan, whose chunks are probed on the workers that decode them. The
+// answer must be the ordinary one: duplicate right keys, null keys on both
+// sides, a dense left key range (bitmap) and one widened by an outlier (hash
+// map with per-row slots), semi and anti.
+TEST_CASE("Semi/anti join probes a streamed right side on its scan workers",
+          "[runtime][parallel][join]") {
+    constexpr std::size_t kLeftUnits = 4;
+    constexpr std::size_t kLeftRowsPerUnit = 1000;
+    constexpr std::size_t kRightUnits = 20;
+    constexpr std::size_t kRightRowsPerUnit = 5000;
+    // Right row r holds key 2 * (r % 9000) -- every even key below 18000, about
+    // eleven times each -- and every 997th right row is null.
+    const auto right_key = [](std::size_t r) -> std::optional<std::int64_t> {
+        if (r % 997 == 0) {
+            return std::nullopt;
+        }
+        return static_cast<std::int64_t>(2 * (r % 9000));
+    };
+    auto right_state = std::make_shared<KeyedUnitState>();
+    right_state->units = kRightUnits;
+    right_state->rows_per_unit = kRightRowsPerUnit;
+    right_state->key_of = right_key;
+    std::set<std::int64_t> right_keys;
+    for (std::size_t r = 0; r < kRightUnits * kRightRowsPerUnit; ++r) {
+        if (const auto key = right_key(r)) {
+            right_keys.insert(*key);
+        }
+    }
+
+    for (const bool outlier : {false, true}) {
+        INFO((outlier ? "hash map (outlier widens the key span)" : "dense key bitmap"));
+        // Left row i holds key 3 * i (some even, so some match), every 211th
+        // row is null, and with `outlier` the last row holds a far key.
+        const std::size_t left_rows = kLeftUnits * kLeftRowsPerUnit;
+        const auto left_key = [outlier](std::size_t i) -> std::optional<std::int64_t> {
+            if (i % 211 == 0) {
+                return std::nullopt;
+            }
+            if (outlier && i == left_rows - 1) {
+                return 1'000'000'000;
+            }
+            return static_cast<std::int64_t>(3 * i);
+        };
+        auto left_state = std::make_shared<KeyedUnitState>();
+        left_state->units = kLeftUnits;
+        left_state->rows_per_unit = kLeftRowsPerUnit;
+        left_state->key_of = left_key;
+
+        runtime::DeferredScanRegistry deferred;
+        for (const auto& [name, state] : {std::pair{std::string{"small"}, left_state},
+                                          std::pair{std::string{"big"}, right_state}}) {
+            deferred.emplace(name, runtime::DeferredScan{.lazy = keyed_unit_lazy(state),
+                                                         .conjuncts = {},
+                                                         .demand = {"k", "n"},
+                                                         .demand_all = false,
+                                                         .key_column = {},
+                                                         .filter = nullptr});
+        }
+        runtime::ParallelPipelineStats stats;
+        auto exec = many_unit_exec(deferred, stats);
+        const runtime::TableRegistry empty;
+        for (const char* query : {"small semi join big on k;", "small anti join big on k;"}) {
+            INFO(query);
+            const bool semi = std::string_view{query}.find("semi") != std::string_view::npos;
+            auto ir = require_ir(query);
+            auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
+            REQUIRE(out.has_value());
+            const auto* n = std::get_if<Column<std::int64_t>>(out->find("n"));
+            REQUIRE(n != nullptr);
+            std::vector<std::int64_t> expected;
+            for (std::size_t i = 0; i < left_rows; ++i) {
+                const auto key = left_key(i);
+                const bool match = key.has_value() && right_keys.contains(*key);
+                if (match == semi) {
+                    expected.push_back(static_cast<std::int64_t>(i));
+                }
+            }
+            REQUIRE(std::vector<std::int64_t>(n->begin(), n->end()) == expected);
+        }
+    }
 }
 
 // Streams four large units whose Categorical keys each carry their OWN

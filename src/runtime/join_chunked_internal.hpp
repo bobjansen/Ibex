@@ -22,6 +22,8 @@
 
 namespace ibex::runtime {
 
+class ScanWorkerSink;
+
 /// How many join probes, process-wide, resolved an Int key through the build
 /// side's direct-address head table instead of its hash map. For tests: the
 /// two give the same answer.
@@ -148,11 +150,17 @@ struct DeferredProbeScan {
 /// `right` is taken as an OPERATOR, not a materialized Table: the join reads
 /// one column of it and never needs its rows contiguous, so materializing it
 /// was a full serial copy of the right side for nothing.
-[[nodiscard]] auto make_chunked_semi_anti_join_operator(OperatorPtr left, OperatorPtr right,
-                                                        ir::JoinKind kind,
-                                                        const std::vector<ir::JoinKey>* keys,
-                                                        const ExecutionContext* exec)
+///
+/// `scan_sink`, when non-null, must come from `make_semi_anti_scan_sink` and
+/// have been offered to `right`'s scan pipeline (see `ScanWorkerSinkOffer`):
+/// the swapped build then probes right chunks on the workers that decode them.
+[[nodiscard]] auto make_chunked_semi_anti_join_operator(
+    OperatorPtr left, OperatorPtr right, ir::JoinKind kind, const std::vector<ir::JoinKey>* keys,
+    const ExecutionContext* exec, const std::shared_ptr<ScanWorkerSink>& scan_sink = nullptr)
     -> OperatorPtr;
+
+/// A scan-worker sink for `make_chunked_semi_anti_join_operator`.
+[[nodiscard]] auto make_semi_anti_scan_sink() -> std::shared_ptr<ScanWorkerSink>;
 
 [[nodiscard]] auto make_scheduled_chunked_inner_join_operator(
     OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys,

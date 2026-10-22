@@ -80,6 +80,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 // chunk to a Table and with it dropped the transport identity,
                 // so the fallback chunk takes the default.
                 hold_schema(left_buffered_[swapped_next_], ChunkIdentity{});
+                filtering_chunk_ = swapped_next_;
                 auto filtered = filter_chunk(std::move(left_buffered_[swapped_next_++]));
                 if (!filtered.has_value()) {
                     if (probe_error_.has_value()) {
@@ -498,14 +499,25 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             // atomics, and the answer cannot depend on the split: `right_i64_`
             // is a set, so only WHICH keys were hit matters, not the order they
             // were found in.
+            //
+            // Each buffered left row's slot is recorded as the map is built, so
+            // the probe of the buffered left is `hits[slot]` -- two array reads
+            // -- and the hits never have to be turned back into a key set.
+            // Rebuilding one (every hit key inserted into `right_i64_`, then a
+            // hash lookup per left row) ran on one thread after the parallel
+            // scan: most of q04's ~40 ms single-worker tail.
             robin_hood::unordered_flat_map<std::int64_t, std::uint32_t> seen;
             seen.reserve(left_rows);
             std::uint32_t next_slot = 0;
-            for (const auto* lcol : lcols) {
-                for (const std::int64_t v : *lcol) {
-                    if (seen.try_emplace(v, next_slot).second) {
-                        ++next_slot;
-                    }
+            left_slots_.resize(lcols.size());
+            for (std::size_t c = 0; c < lcols.size(); ++c) {
+                const auto& lcol = *lcols[c];
+                auto& slots = left_slots_[c];
+                slots.resize(lcol.size());
+                for (std::size_t row = 0; row < lcol.size(); ++row) {
+                    const auto [it, inserted] = seen.try_emplace(lcol[row], next_slot);
+                    next_slot += inserted ? 1U : 0U;
+                    slots[row] = it->second;
                 }
             }
             const std::size_t n_slots = next_slot;
@@ -542,11 +554,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 }
             }
 
-            for (const auto& [k, slot] : seen) {
-                if (hits[slot] != char{0}) {
-                    right_i64_.insert(k);
-                }
-            }
+            slot_hits_ = std::move(hits);
         } else if (!try_build_dense_right()) {
             // Left is not the smaller side (or its key vanished) and the right
             // key span is too wide/sparse for a bitmap; the plain right set is
@@ -920,6 +928,17 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                     return keep_matches ? match : !match;
                 });
             }
+            if (!left_slots_.empty()) {
+                // The swapped hash build: this is buffered left chunk
+                // `filtering_chunk_`, whose rows' slots were recorded when the
+                // left-key map was built (see `left_slots_`).
+                const std::uint32_t* const slots = left_slots_[filtering_chunk_].data();
+                const char* const hits = slot_hits_.data();
+                return filter_rows(std::move(t), [&, slots, hits](std::size_t row) {
+                    const bool match = !probe_is_null(row) && hits[slots[row]] != char{0};
+                    return keep_matches ? match : !match;
+                });
+            }
             return filter_rows(std::move(t), [&](std::size_t row) {
                 const bool match = !probe_is_null(row) && right_i64_.contains((*col)[row]);
                 return keep_matches ? match : !match;
@@ -1054,6 +1073,14 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     const ExecutionContext* exec_ = nullptr;
 
     robin_hood::unordered_flat_set<std::int64_t> right_i64_;
+    /// The swapped hash build's answer, kept in the form the build produced
+    /// rather than as a key set: per buffered left chunk, each row's slot in
+    /// the left-key map, and per slot whether the right side holds that key.
+    /// Live iff `left_slots_` is non-empty; `filtering_chunk_` is the buffered
+    /// chunk `filter_chunk` is probing.
+    std::vector<::ibex::detail::NoInitVector<std::uint32_t>> left_slots_;
+    std::vector<char> slot_hits_;
+    std::size_t filtering_chunk_ = 0;
     /// Two-Int64-key joins: the right's non-null key pairs. `pair_mode_`
     /// routes `filter_chunk` here instead of the single-key sets.
     bool pair_mode_ = false;

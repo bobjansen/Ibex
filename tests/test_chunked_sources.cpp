@@ -523,6 +523,74 @@ TEST_CASE("chunked semi/anti join: a multi-chunk right side matches one chunk",
     }
 }
 
+// The swapped hash build probes its buffered left by slot: each left row's
+// slot in the left-key map is recorded as the map is built, and a row matches
+// iff its slot was hit by the right scan. Duplicate left keys share a slot --
+// here every key appears twice, half the table apart, so the two copies land
+// in different buffered chunks -- and a null left key must match nothing even
+// though its zero-valued cell has a slot like any other.
+TEST_CASE("chunked semi/anti join: the swapped hash build probes duplicate and null left keys",
+          "[runtime][chunked][join]") {
+    constexpr std::int64_t kRightRows = 70'000;  // > kSemiSwapThreshold (65536)
+    constexpr std::int64_t kLeftRows = 40'000;
+    constexpr std::int64_t kDistinct = kLeftRows / 2;
+
+    Column<std::int64_t> right_id;
+    right_id.reserve(kRightRows);
+    for (std::int64_t r = 0; r < kRightRows; ++r) {
+        right_id.push_back(r * 2);  // even keys 0 .. 139998, zero included
+    }
+    runtime::Table right;
+    right.add_column("id", std::move(right_id));
+
+    // Left row i holds key i % kDistinct, except a far outlier that widens the
+    // key span past the dense bitmap's gate (the hash path, q04's), and every
+    // 777th row is null.
+    const auto left_key = [](std::int64_t i) -> std::int64_t {
+        return i == kLeftRows - 1 ? 100'000'000 : i % kDistinct;
+    };
+    const auto left_null = [](std::int64_t i) { return i % 777 == 0; };
+    Column<std::int64_t> left_id;
+    Column<std::int64_t> row_no;
+    runtime::ValidityBitmap left_valid;
+    for (std::int64_t i = 0; i < kLeftRows; ++i) {
+        left_id.push_back(left_null(i) ? 0 : left_key(i));
+        left_valid.push_back(!left_null(i));
+        row_no.push_back(i);
+    }
+    runtime::Table left;
+    left.add_column("id", std::move(left_id));
+    left.columns[0].validity = std::move(left_valid);
+    left.add_column("row_no", std::move(row_no));
+
+    runtime::TableRegistry registry;
+    registry.emplace("lhs", std::move(left));
+    registry.emplace("rhs", std::move(right));
+
+    const auto matches = [&](std::int64_t i) {
+        const std::int64_t id = left_key(i);
+        return !left_null(i) && id % 2 == 0 && id / 2 < kRightRows;
+    };
+    for (const char* query : {"lhs semi join rhs on id;", "lhs anti join rhs on id;"}) {
+        INFO(query);
+        const bool semi = std::string_view{query}.find("semi") != std::string_view::npos;
+        runtime::Table out;
+        {
+            const ChunkGrainGuard guard("2003");
+            out = run(query, registry);
+        }
+        const auto* rows = std::get_if<Column<std::int64_t>>(out.find("row_no"));
+        REQUIRE(rows != nullptr);
+        std::vector<std::int64_t> expected;
+        for (std::int64_t i = 0; i < kLeftRows; ++i) {
+            if (matches(i) == semi) {
+                expected.push_back(i);
+            }
+        }
+        REQUIRE(std::vector<std::int64_t>(rows->begin(), rows->end()) == expected);
+    }
+}
+
 TEST_CASE("chunked source groups two categorical keys identically to one chunk",
           "[runtime][chunked][categorical]") {
     // Two Categorical key columns is the shape that broke: interning column 0

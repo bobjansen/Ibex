@@ -2215,9 +2215,10 @@ TEST_CASE("E2E: count over a left join still uses the fused rewrite", "[e2e][joi
     require_tables_equal(out, run_parallel(src, tables, 2));
 }
 
-// The fused count over adjacent keys and over the same keys spread far apart,
-// against hand-computed counts: unsorted and negative left keys, right keys in
-// a gap of the range, below it and above it, and null counted values.
+// The fused count addresses a dense left key range directly and keeps a map
+// for sparse keys. Both are checked against hand-computed counts, over the
+// same shape scaled apart: unsorted and negative left keys, right keys in a
+// gap of the range, below it and above it, and null counted values.
 TEST_CASE("E2E: fused left-join count over dense and sparse keys", "[e2e][join][aggregate]") {
     const auto* src = "(l left join r on k)[select { n = count(v) }, by k];";
     for (const std::int64_t scale : {std::int64_t{1}, std::int64_t{1'000'000'000}}) {

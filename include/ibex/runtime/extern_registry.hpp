@@ -301,6 +301,31 @@ struct ExternFunction {
 class ExternRegistry {
    public:
     ExternRegistry() = default;
+    ExternRegistry(ExternRegistry&&) = default;
+    auto operator=(ExternRegistry&&) -> ExternRegistry& = default;
+    // Not copyable: a copy would run every shutdown hook a second time.
+    ExternRegistry(const ExternRegistry&) = delete;
+    auto operator=(const ExternRegistry&) -> ExternRegistry& = delete;
+
+    /// Runs the shutdown hooks, most recently registered first.
+    ~ExternRegistry() {
+        for (auto hook = shutdown_hooks_.rbegin(); hook != shutdown_hooks_.rend(); ++hook) {
+            try {
+                (*hook)();
+            } catch (...) {  // NOLINT(bugprone-empty-catch): teardown must not abort the host
+            }
+        }
+    }
+
+    /// Run `hook` when this registry is destroyed: for a plugin, the end of
+    /// the host's session -- before `main` returns, so before static
+    /// destruction. For teardown a library wants done while the process is
+    /// still whole: Arrow's S3 shutdown is unsafe once static destructors have
+    /// started (arrow::fs::FinalizeS3, GH-44071). Plugins stay loaded for the
+    /// life of the process, so a hook may live in plugin code.
+    void register_shutdown_hook(std::function<void()> hook) {
+        shutdown_hooks_.push_back(std::move(hook));
+    }
 
     /// Function pointers into the host process's own RNG engine (see
     /// RngBridge). Plugins that want reproducible-under-`seed_rng` random data
@@ -461,6 +486,7 @@ class ExternRegistry {
     std::atomic<bool>* host_interrupt_flag_ = interrupt_flag_address();
     std::atomic<WarningSink>* host_warning_sink_ = warning_sink_address();
     WorkerPoolAccessor host_worker_pool_ = worker_pool_accessor();
+    std::vector<std::function<void()>> shutdown_hooks_;
 };
 
 }  // namespace ibex::runtime

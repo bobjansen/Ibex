@@ -39,6 +39,10 @@
 #include <algorithm>
 #include <arrow/api.h>
 #include <arrow/filesystem/filesystem.h>
+#include <arrow/util/config.h>
+#if defined(ARROW_S3) && !defined(IBEX_ARROW_S3_MODULE_FILE) && !defined(IBEX_PARQUET_LOCAL_ONLY)
+#include <arrow/filesystem/s3fs.h>
+#endif
 #include <arrow/io/api.h>
 #include <arrow/util/bitmap_ops.h>
 #include <arrow/util/formatting.h>
@@ -196,7 +200,25 @@ inline auto download_https_to_temp(std::string_view url) -> std::string {
 }
 #endif
 
+#if !defined(IBEX_PARQUET_LOCAL_ONLY)
+/// Set when this code first opens an s3:// path. The shutdown hook reads it so
+/// that a process which never touched S3 -- nearly every one -- does nothing
+/// at exit, not even look for the module.
+inline std::atomic<bool> s3_opened{false};
+#endif
+
 #if defined(IBEX_ARROW_S3_MODULE_FILE)
+/// Where Arrow's S3 filesystem module lives: beside the libarrow this process
+/// loaded, which is where the build and the install both put it.
+inline auto s3_module_path() -> std::expected<std::filesystem::path, std::string> {
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<const void*>(&arrow::fs::LoadFileSystemFactories), &info) == 0 ||
+        info.dli_fname == nullptr) {
+        return std::unexpected("cannot locate libarrow to find " IBEX_ARROW_S3_MODULE_FILE);
+    }
+    return std::filesystem::path(info.dli_fname).parent_path() / IBEX_ARROW_S3_MODULE_FILE;
+}
+
 /// Register Arrow's S3 filesystem, which this build keeps in a loadable module
 /// beside libarrow rather than inside it: linking it put the bundled AWS SDK
 /// and libcurl's dependency chain into every process start. Loaded the first
@@ -204,17 +226,13 @@ inline auto download_https_to_temp(std::string_view url) -> std::string {
 /// as before. Throws (every time) if the module cannot be loaded.
 inline void ensure_s3_filesystem_registered() {
     static const std::string error = []() -> std::string {
-        Dl_info info{};
-        if (dladdr(reinterpret_cast<const void*>(&arrow::fs::LoadFileSystemFactories), &info) ==
-                0 ||
-            info.dli_fname == nullptr) {
-            return "cannot locate libarrow to find " IBEX_ARROW_S3_MODULE_FILE;
+        const auto module = s3_module_path();
+        if (!module) {
+            return module.error();
         }
-        const auto module =
-            std::filesystem::path(info.dli_fname).parent_path() / IBEX_ARROW_S3_MODULE_FILE;
-        const auto status = arrow::fs::LoadFileSystemFactories(module.string().c_str());
+        const auto status = arrow::fs::LoadFileSystemFactories(module->string().c_str());
         if (!status.ok()) {
-            return "failed to load the S3 filesystem module " + module.string() + " (" +
+            return "failed to load the S3 filesystem module " + module->string() + " (" +
                    status.ToString() + ")";
         }
         return {};
@@ -222,6 +240,41 @@ inline void ensure_s3_filesystem_registered() {
     if (!error.empty()) {
         throw std::runtime_error("parquet::read: S3 support unavailable: " + error);
     }
+}
+#endif
+
+#if !defined(IBEX_PARQUET_LOCAL_ONLY)
+/// Shut Arrow's S3 subsystem down if this process started it. Arrow requires
+/// FinalizeS3 once S3 is initialized, and calling it after static destruction
+/// has begun is unsafe (GH-44071); left to Arrow's own static destructor it
+/// warns "FinalizeS3 was not called even though S3 was initialized" and leaks
+/// the client finalizer. `register_backend` hands this to the host's registry
+/// as a shutdown hook, so it runs before `main` returns.
+inline void finalize_s3_if_initialized() {
+    if (!s3_opened.load(std::memory_order_acquire)) {
+        return;
+    }
+#if defined(IBEX_ARROW_S3_MODULE_FILE)
+    // The module exports the function under its C++ name; `RTLD_NOLOAD` only
+    // finds it if it was loaded (a failed load leaves nothing to finalize).
+    const auto module = s3_module_path();
+    if (!module) {
+        return;
+    }
+    void* handle = dlopen(module->string().c_str(), RTLD_NOW | RTLD_NOLOAD);
+    if (handle == nullptr) {
+        return;
+    }
+    using EnsureFinalized = arrow::Status (*)();
+    if (auto* ensure_finalized =
+            reinterpret_cast<EnsureFinalized>(dlsym(handle, "_ZN5arrow2fs17EnsureS3FinalizedEv"));
+        ensure_finalized != nullptr) {
+        (void)ensure_finalized();
+    }
+    dlclose(handle);  // balances RTLD_NOLOAD; the filesystem registry keeps it loaded
+#elif defined(ARROW_S3)
+    (void)arrow::fs::EnsureS3Finalized();
+#endif
 }
 #endif
 
@@ -246,6 +299,7 @@ inline auto open_parquet_input(std::string_view path)
         return input_result.ValueOrDie();
     }
     if (is_s3_uri(path)) {
+        s3_opened.store(true, std::memory_order_release);
 #if defined(IBEX_ARROW_S3_MODULE_FILE)
         ensure_s3_filesystem_registered();
 #endif

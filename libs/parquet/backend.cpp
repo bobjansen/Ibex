@@ -18,6 +18,9 @@
 namespace ibex::parquet {
 
 void register_backend(runtime::ExternRegistry& registry) {
+#if !defined(IBEX_PARQUET_LOCAL_ONLY)
+    registry.register_shutdown_hook(&finalize_s3_if_initialized);
+#endif
     registry.register_table(
         "parquet::read",
         [](const runtime::ExternArgs& args) -> std::expected<runtime::ExternValue, std::string> {

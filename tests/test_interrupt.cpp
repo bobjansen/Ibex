@@ -18,6 +18,7 @@
 #include <expected>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -167,6 +168,31 @@ TEST_CASE("Warnings go to the sink the host chose", "[interrupt][warnings]") {
     runtime::set_warning_sink(previous);
     runtime::warn("to stderr");
     CHECK(seen == std::vector<std::string>{"one", "two"});
+}
+
+// Plugins hand teardown that must happen while the process is still whole
+// (Arrow's S3 shutdown) to the host's registry, which runs it as the session
+// ends. Each hook runs once, newest first, and a failing one does not stop the
+// rest.
+TEST_CASE("Registry shutdown hooks run once, newest first, when it is destroyed",
+          "[interrupt][registry]") {
+    std::vector<int> ran;
+    {
+        runtime::ExternRegistry registry;
+        registry.register_shutdown_hook([&ran] { ran.push_back(1); });
+        registry.register_shutdown_hook([] { throw std::runtime_error("hook failed"); });
+        registry.register_shutdown_hook([&ran] { ran.push_back(3); });
+        CHECK(ran.empty());
+    }
+    CHECK(ran == std::vector<int>{3, 1});
+
+    ran.clear();
+    {
+        runtime::ExternRegistry source;
+        source.register_shutdown_hook([&ran] { ran.push_back(7); });
+        runtime::ExternRegistry moved = std::move(source);
+    }
+    CHECK(ran == std::vector<int>{7});  // the moved-from registry runs nothing
 }
 
 }  // namespace

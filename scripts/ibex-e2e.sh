@@ -202,6 +202,37 @@ if [[ "$SKIP_REPL" == false ]]; then
         echo "▸ SKIP: sparse plain-string page-boundary check (uv not found; fixture needs pyarrow)"
     fi
 
+    if command -v uv >/dev/null 2>&1; then
+        echo "▸ REPL smoke (parquet plugin, sparse read skipping pages by the offset index)"
+        # The fixture needs pyarrow to write a page index and small pages (see
+        # gen_parquet_sparse_page_index.py). The sparse path filters out every
+        # page holding no selected row before decompression; a row found at the
+        # wrong position among the kept pages prints another row's values.
+        uv run --project "$IBEX_ROOT" python "$IBEX_ROOT/tests/data/gen_parquet_sparse_page_index.py" \
+            "$IBEX_ROOT/tests/data/parquet_sparse_page_index_out.parquet"
+        repl_out="$(mktemp)"
+        printf ":load tests/data/parquet_sparse_page_index_check.ibex\n:quit\n" \
+            | IBEX_LIBRARY_PATH="$BUILD_DIR/tools" "$BUILD_DIR/tools/ibex" >"$repl_out" 2>&1
+        rm -f "$IBEX_ROOT/tests/data/parquet_sparse_page_index_out.parquet"
+        sparse_ok=1
+        for row in '1023 .*"text-001023" .*7161 ' '1024 .*"text-001024" .*7168 ' \
+            '150000 .*"text-150000" .*1050000 ' '299999 .*"text-299999" .*2099993 ' \
+            '300000 .*"text-300000" .*2100000 ' '310000 .*"text-310000" .*2170000 ' \
+            '400000 .*"text-400000" .*2800000 ' '400001 .*"text-400001" .*2800007 ' \
+            '512345 .*"text-512345" .*3586415 ' '599999 .*"text-599999" .*4199993 '; do
+            rg -n "$row" "$repl_out" >/dev/null || sparse_ok=0
+        done
+        if rg -n "error:" "$repl_out" >/dev/null || ! rg -n "rows: 10" "$repl_out" >/dev/null \
+            || [ "$sparse_ok" -ne 1 ]; then
+            cat "$repl_out" >&2
+            rm -f "$repl_out"
+            exit 1
+        fi
+        rm -f "$repl_out"
+    else
+        echo "▸ SKIP: sparse page-index read check (uv not found; fixture needs pyarrow)"
+    fi
+
     echo "▸ REPL smoke (parquet plugin, categorical cross-row-group dictionary remap)"
     repl_out="$(mktemp)"
     printf ":load tests/data/parquet_categorical_check.ibex\n:quit\n" \

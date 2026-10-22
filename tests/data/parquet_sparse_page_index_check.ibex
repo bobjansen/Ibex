@@ -1,0 +1,16 @@
+extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";
+
+// Regression check for sparse reads that skip pages by the offset index (see
+// gen_parquet_sparse_page_index.py). The pushed filter selects ten rows of
+// 600k: in the first row group a run straddling a page boundary (1023, 1024),
+// a mid-group row and the group's last row -- sparse by the rows-per-selected
+// threshold alone; in the second its first row, a run (400000, 400001), two
+// more and the file's last row -- six in 300k, which the threshold would send
+// to the dense path and the page plan keeps sparse. The payload columns decode
+// through the sparse path, which filters out every page holding none of them
+// before decompression; a row found at the wrong position in the kept pages
+// prints another row's values.
+let t = parquet::read("tests/data/parquet_sparse_page_index_out.parquet");
+t[filter id == 1023 || id == 1024 || id == 150000 || id == 299999 || id == 300000
+    || id == 310000 || id == 400000 || id == 400001 || id == 512345 || id == 599999,
+    select { id, s, v }];

@@ -1629,6 +1629,79 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
     return emitted;
 }
 
+/// Which data pages of one column chunk a sparse selection reads, from the
+/// chunk's offset index (a page index the writer stored; nullopt without one).
+///
+/// Skipping a row with TypedColumnReader::Skip still reads and decompresses
+/// every page it passes over, so a needle-in-haystack selection paid for the
+/// whole chunk: PDS-H q10 re-reads c_name/c_address/c_comment/... for its 20
+/// result customers, and that decompressed nearly every page of those wide
+/// zstd string columns, ~60 ms trailing off over 13 row groups. A page reader
+/// whose data-page filter rejects the pages no selected row lies in never
+/// decompresses them. The column reader then sees only the kept pages, so a
+/// row is addressed by its position in that kept stream: `kept_before[p]` is
+/// how many kept rows precede page p.
+/// A selection at most this dense (rows per selected row) is worth reading the
+/// offset index for: thinner ones leave most pages without a selected row.
+inline constexpr std::size_t kSparsePagePlanMinRowsPerSelected = 1024;
+
+struct SparsePagePlan {
+    std::vector<char> keep;                ///< per data page: holds a selected row
+    std::vector<std::size_t> first_row;    ///< per data page: group-local first row
+    std::vector<std::size_t> kept_before;  ///< per data page: kept rows before it
+};
+
+inline auto sparse_page_plan(parquet::ParquetFileReader& file, int group, int leaf_index,
+                             std::size_t group_rows, const ibex::runtime::Selection& selection,
+                             std::size_t begin, std::size_t end, std::size_t group_start)
+    -> std::optional<SparsePagePlan> {
+    auto page_index = file.GetPageIndexReader();
+    if (page_index == nullptr) {
+        return std::nullopt;
+    }
+    auto group_index = page_index->RowGroup(group);
+    auto offset_index = group_index == nullptr ? nullptr : group_index->GetOffsetIndex(leaf_index);
+    if (offset_index == nullptr) {
+        return std::nullopt;
+    }
+    const auto& pages = offset_index->page_locations();
+    if (pages.size() < 2) {
+        return std::nullopt;
+    }
+    SparsePagePlan plan;
+    plan.first_row.reserve(pages.size());
+    for (std::size_t p = 0; p < pages.size(); ++p) {
+        const auto first = pages[p].first_row_index;
+        // An index that does not describe this chunk's rows is not used.
+        if (first < 0 || static_cast<std::size_t>(first) >= group_rows || (p == 0 && first != 0) ||
+            (p > 0 && static_cast<std::size_t>(first) <= plan.first_row.back())) {
+            return std::nullopt;
+        }
+        plan.first_row.push_back(static_cast<std::size_t>(first));
+    }
+    plan.keep.assign(pages.size(), 0);
+    for (std::size_t i = begin; i < end; ++i) {
+        const std::size_t row = selection[i] - group_start;
+        const auto page = static_cast<std::size_t>(
+            std::upper_bound(plan.first_row.begin(), plan.first_row.end(), row) -
+            plan.first_row.begin() - 1);
+        plan.keep[page] = 1;
+    }
+    if (std::ranges::all_of(plan.keep, [](char k) { return k != 0; })) {
+        return std::nullopt;  // nothing to skip
+    }
+    plan.kept_before.resize(pages.size());
+    std::size_t kept = 0;
+    for (std::size_t p = 0; p < pages.size(); ++p) {
+        plan.kept_before[p] = kept;
+        if (plan.keep[p] != 0) {
+            const std::size_t next = p + 1 < pages.size() ? plan.first_row[p + 1] : group_rows;
+            kept += next - plan.first_row[p];
+        }
+    }
+    return plan;
+}
+
 template <typename DType, typename Emit>
 inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_index,
                                    const ibex::runtime::Selection* selection,
@@ -1688,21 +1761,68 @@ inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_
         // scattered selections the per-call overhead makes it a net loss.
         // Route needle-in-haystack selections through Skip and everything
         // else through dense batch decode + gather.
-        const bool group_sparse =
+        bool group_sparse =
             group_selected > 0 &&
             group_rows / group_selected > static_cast<std::size_t>(kDirectDecodeBatchRows);
+        // A page plan (see SparsePagePlan) also makes a selection sparse when
+        // it skips at least half the chunk's pages: the threshold above weighs
+        // Skip's per-call cost against decoding, but a skipped page is never
+        // decompressed at all. q10's 20-customer refetch puts two selected rows
+        // in some 122,880-row groups, which the threshold sends to the dense
+        // path below -- decompressing every page of c_comment for two rows.
+        // Only read the offset index for selections this thin.
+        std::optional<SparsePagePlan> plan;
+        if (selection != nullptr && group_null_free && group_selected > 0 &&
+            (group_sparse || group_selected * kSparsePagePlanMinRowsPerSelected <= group_rows)) {
+            plan = sparse_page_plan(*reader.parquet_reader(), group, leaf_index, group_rows,
+                                    *selection, selected_pos, selected_end, group_start);
+            if (plan.has_value() && !group_sparse) {
+                const auto kept = static_cast<std::size_t>(std::ranges::count(plan->keep, 1));
+                group_sparse = kept * 2 <= plan->keep.size();
+            }
+        }
         if (selection != nullptr && group_null_free && group_sparse) {
-            std::size_t source_row = group_start;
+            // Pages holding no selected row are filtered out before they are
+            // decompressed; positions below are then in the stream of kept
+            // pages.
+            std::vector<std::size_t> page_first;
+            std::vector<std::size_t> kept_before;
+            if (plan.has_value()) {
+                auto pager = row_group->GetColumnPageReader(leaf_index);
+                pager->set_data_page_filter([keep = std::move(plan->keep), page = std::size_t{0}](
+                                                const parquet::DataPageStats& /*stats*/) mutable {
+                    if (page >= keep.size()) {
+                        throw std::runtime_error(
+                            "parquet::read: column has more data pages than its offset "
+                            "index lists");
+                    }
+                    return keep[page++] == 0;
+                });
+                typed = std::static_pointer_cast<parquet::TypedColumnReader<DType>>(
+                    parquet::ColumnReader::Make(descriptor, std::move(pager)));
+                page_first = std::move(plan->first_row);
+                kept_before = std::move(plan->kept_before);
+            }
+            const auto stream_of = [&](std::size_t row) -> std::size_t {
+                if (page_first.empty()) {
+                    return row;
+                }
+                const auto page = static_cast<std::size_t>(
+                    std::upper_bound(page_first.begin(), page_first.end(), row) -
+                    page_first.begin() - 1);
+                return kept_before[page] + (row - page_first[page]);
+            };
+            std::size_t stream_row = 0;
             while (selected_pos < selected_end) {
                 const std::size_t target = (*selection)[selected_pos];
-                const std::size_t gap = target - source_row;
+                const std::size_t gap = stream_of(target - group_start) - stream_row;
                 if (gap != 0) {
                     const auto skipped = typed->Skip(static_cast<std::int64_t>(gap));
                     if (skipped != static_cast<std::int64_t>(gap)) {
                         throw std::runtime_error(
                             "parquet::read: column ended while skipping rejected rows");
                     }
-                    source_row += gap;
+                    stream_row += gap;
                 }
 
                 std::size_t run = 1;
@@ -1737,7 +1857,7 @@ inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_
                 }
                 emitted += run;
                 selected_pos += run;
-                source_row += run;
+                stream_row += run;
             }
             group_start += group_rows;
             continue;

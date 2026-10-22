@@ -18771,6 +18771,51 @@ TEST_CASE("Scan pipeline streams an update below its run", "[runtime][parallel][
     CHECK(unstreamed_stats.parallel_pipelines.load() == 1);
 }
 
+// The fused left-join count takes its right side a chunk at a time. Over a
+// four-unit lazy source the right side is a stream: every unit's rows must be
+// counted, the last one (held back until the stream ends) included. With a
+// repeated left key the fusion declines, and the kept chunks feed the ordinary
+// join instead.
+TEST_CASE("Fused left-join count over a streamed right side", "[runtime][parallel][join]") {
+    auto state = std::make_shared<PipelineReaderState>();
+    auto deferred = make_pipeline_deferred(state);
+    const auto run = [&](std::vector<std::int64_t> left_keys) {
+        runtime::Table left;
+        left.add_column("g", Column<std::int64_t>{std::move(left_keys)});
+        runtime::TableRegistry registry;
+        registry.emplace("l", std::move(left));
+        auto ir = require_ir(
+            "(l left join df[update { g = x % 10 }] on g)[select { n = count(x) }, by g];");
+        runtime::ParallelPipelineStats stats;
+        runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+        exec.parallel_threads = 4;
+        exec.parallel_min_rows = 0;
+        exec.parallel_min_cells = 0;
+        exec.parallel_stats = &stats;
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        INFO((out.has_value() ? std::string{} : out.error()));
+        REQUIRE(out.has_value());
+        CHECK(stats.pipelined_scans.load() == 1);
+        const auto* g = std::get_if<Column<std::int64_t>>(out->find("g"));
+        const auto* n = std::get_if<Column<std::int64_t>>(out->find("n"));
+        REQUIRE(g != nullptr);
+        REQUIRE(n != nullptr);
+        return std::pair{std::vector<std::int64_t>(g->begin(), g->end()),
+                         std::vector<std::int64_t>(n->begin(), n->end())};
+    };
+
+    // x is 0..3999, so each g in 0..9 has 400 rows, 100 in each unit; 42 none.
+    const auto counted = run({3, 0, 9, 42, 5, 1, 2, 4, 6, 7, 8});
+    CHECK(counted.first == std::vector<std::int64_t>{3, 0, 9, 42, 5, 1, 2, 4, 6, 7, 8});
+    CHECK(counted.second ==
+          std::vector<std::int64_t>{400, 400, 400, 0, 400, 400, 400, 400, 400, 400, 400});
+
+    // Key 3 twice: each copy meets all 400 of its rows.
+    const auto declined = run({3, 7, 3});
+    CHECK(declined.first == std::vector<std::int64_t>{3, 7});
+    CHECK(declined.second == std::vector<std::int64_t>{800, 400});
+}
+
 // A multi-key Categorical group-by must keep a key value that first appears in
 // a later chunk. Growing the FIRST key's dictionary adds cells without moving
 // any stride, and the dense cell index was only rebuilt on a stride change: the

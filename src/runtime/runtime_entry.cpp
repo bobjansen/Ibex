@@ -698,14 +698,72 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         if (!left.has_value()) {
             return std::unexpected(std::move(left.error()));
         }
-        auto right =
-            materialize_plan(*join.children()[1], registry, scalars, externs, exec, model_out);
+        auto right_op =
+            build_operator(*join.children()[1], registry, scalars, externs, exec, model_out);
+        if (!right_op.has_value()) {
+            return std::unexpected(std::move(right_op.error()));
+        }
+        (void)pipeline_executor_detail::unbatch_pipeline_output(**right_op);
+        // The right side is counted a chunk at a time as it streams in, never
+        // assembled: draining 14.8M rows of q13's `orders` into a table cost
+        // ~70 ms over decoding them. One chunk is held back, so a right side
+        // that arrives as a single chunk (a table) is counted across workers;
+        // a stream's chunks are counted on this thread while the pipeline
+        // decodes the next ones. Declined -- by the left side, or by a right
+        // key that is not Int64 -- the chunks are kept for the ordinary join.
+        auto counter = LeftJoinCounter::prepare(join, agg, *left, counted_column);
+        bool counting = counter.has_value();
+        std::vector<Chunk> kept;
+        std::optional<Chunk> pending;
+        std::size_t chunks = 0;
+        const auto mid_stream_change = [] {
+            return std::unexpected<std::string>(
+                "left join count: a right chunk's columns changed mid-stream");
+        };
+        while (true) {
+            auto next = (*right_op)->next();
+            if (!next.has_value()) {
+                return std::unexpected(std::move(next.error()));
+            }
+            if (!next->has_value()) {
+                break;
+            }
+            Chunk chunk = std::move(**next);
+            if (counting && chunks == 0 && !counter->accepts(chunk)) {
+                counting = false;
+            }
+            ++chunks;
+            if (!counting) {
+                kept.push_back(std::move(chunk));
+                continue;
+            }
+            if (pending.has_value() && !counter->count(*pending)) {
+                return mid_stream_change();
+            }
+            pending = std::move(chunk);
+        }
+        if (counting) {
+            if (pending.has_value() && !(chunks == 1 ? counter->count_parallel(*pending, &exec)
+                                                     : counter->count(*pending))) {
+                return mid_stream_change();
+            }
+            return make_table_source(counter->finish());
+        }
+        struct KeptChunks final : Operator {
+            std::vector<Chunk> chunks;
+            std::size_t next_chunk = 0;
+            auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+                if (next_chunk == chunks.size()) {
+                    return std::optional<Chunk>{};
+                }
+                return std::optional<Chunk>{std::move(chunks[next_chunk++])};
+            }
+        };
+        auto kept_source = std::make_unique<KeptChunks>();
+        kept_source->chunks = std::move(kept);
+        auto right = MaterializeOperator(std::move(kept_source)).run();
         if (!right.has_value()) {
             return std::unexpected(std::move(right.error()));
-        }
-        if (auto fused = left_join_count_table(join, agg, *left, *right, counted_column, &exec);
-            fused.has_value()) {
-            return make_table_source(std::move(*fused));
         }
         auto joined = join_table_impl(*left, *right, join.kind(), join.keys(), nullptr, scalars,
                                       compute_mask, join.suffix(), join.pending_order(),

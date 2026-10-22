@@ -2273,103 +2273,6 @@ auto count_flag_source_column(const ir::Expr& expr) -> std::optional<std::string
     return column != nullptr ? std::optional{column->name} : std::nullopt;
 }
 
-/// The counts behind `left_join_count_table`: one per (unique) left key, added
-/// to from any number of threads at once.
-///
-/// A left side whose keys cover a small, dense range -- TPC-H q13's 1.5M
-/// `c_custkey` are 1..1.5M -- is addressed directly, `key - lo`: no map to
-/// build, and a right row costs a range check and one atomic add instead of a
-/// hash probe. On q13 the serial map build alone was 48 ms. The density rule
-/// is `densify_int_heads`': a range at most eight times the key count, plus
-/// slack for small sides. Sparser keys keep the map, which names each key's
-/// left row.
-class LeftKeyCounts {
-   public:
-    /// False when the left keys repeat: the fusion needs one output row per key.
-    [[nodiscard]] auto prepare(const Column<std::int64_t>& keys, std::size_t rows) -> bool {
-        if (rows == 0) {
-            return true;
-        }
-        std::int64_t lo = keys[0];
-        std::int64_t hi = keys[0];
-        for (std::size_t row = 1; row < rows; ++row) {
-            lo = std::min(lo, keys[row]);
-            hi = std::max(hi, keys[row]);
-        }
-        const std::uint64_t span = static_cast<std::uint64_t>(hi) - static_cast<std::uint64_t>(lo);
-        if (span < (std::uint64_t{8} * rows) + 1024) {
-            dense_ = true;
-            lo_ = lo;
-            span_ = span;
-            std::vector<std::uint8_t> seen(static_cast<std::size_t>(span) + 1, 0);
-            for (std::size_t row = 0; row < rows; ++row) {
-                auto& mark = seen[slot_of(keys[row])];
-                if (mark != 0) {
-                    return false;
-                }
-                mark = 1;
-            }
-            counts_ = std::vector<std::atomic<std::int64_t>>(static_cast<std::size_t>(span) + 1);
-        } else {
-            slots_.reserve(rows);
-            for (std::size_t row = 0; row < rows; ++row) {
-                if (!slots_.emplace(keys[row], row).second) {
-                    return false;
-                }
-            }
-            counts_ = std::vector<std::atomic<std::int64_t>>(rows);
-        }
-        for (auto& count : counts_) {
-            count.store(0, std::memory_order_relaxed);
-        }
-        return true;
-    }
-
-    /// Count right rows `[begin, end)`: each matching a left key adds one,
-    /// unless `validity` says the counted column is null there.
-    void count(const std::int64_t* keys, const ValidityBitmap* validity, std::size_t begin,
-               std::size_t end) {
-        for (std::size_t row = begin; row < end; ++row) {
-            if (validity != nullptr && !(*validity)[row]) {
-                continue;
-            }
-            if (dense_) {
-                const std::uint64_t slot =
-                    static_cast<std::uint64_t>(keys[row]) - static_cast<std::uint64_t>(lo_);
-                if (slot <= span_) {
-                    counts_[static_cast<std::size_t>(slot)].fetch_add(1, std::memory_order_relaxed);
-                }
-            } else if (const auto it = slots_.find(keys[row]); it != slots_.end()) {
-                counts_[it->second].fetch_add(1, std::memory_order_relaxed);
-            }
-        }
-    }
-
-    /// Each left row's count, in left row order. After every `count` returned.
-    [[nodiscard]] auto finish(const std::int64_t* keys, std::size_t rows) const
-        -> Column<std::int64_t> {
-        Column<std::int64_t> out;
-        out.resize_for_overwrite(rows);
-        for (std::size_t row = 0; row < rows; ++row) {
-            const std::size_t slot = dense_ ? slot_of(keys[row]) : row;
-            out[row] = counts_[slot].load(std::memory_order_relaxed);
-        }
-        return out;
-    }
-
-   private:
-    [[nodiscard]] auto slot_of(std::int64_t key) const noexcept -> std::size_t {
-        return static_cast<std::size_t>(static_cast<std::uint64_t>(key) -
-                                        static_cast<std::uint64_t>(lo_));
-    }
-
-    bool dense_ = false;
-    std::int64_t lo_ = 0;
-    std::uint64_t span_ = 0;
-    robin_hood::unordered_flat_map<std::int64_t, std::size_t> slots_;
-    std::vector<std::atomic<std::int64_t>> counts_;
-};
-
 }  // namespace
 
 auto plan_fused_left_join_count(const ir::AggregateNode& aggregate)
@@ -2451,9 +2354,9 @@ auto fused_left_join_counted_column(const ir::AggregateNode& aggregate,
     return counted;
 }
 
-auto left_join_count_table(const ir::JoinNode& join, const ir::AggregateNode& aggregate,
-                           const Table& left, const Table& right, std::string_view counted_column,
-                           const ExecutionContext* exec) -> std::optional<Table> {
+auto LeftJoinCounter::prepare(const ir::JoinNode& join, const ir::AggregateNode& aggregate,
+                              const Table& left, std::string_view counted_column)
+    -> std::optional<LeftJoinCounter> {
     if (join.kind() != ir::JoinKind::Left || join.keys().size() != 1 ||
         join.predicate().has_value() || join.null_match() != ir::NullMatch::Never ||
         join.take() != ir::MatchSelection::All || join.expect().asserts_anything() ||
@@ -2466,37 +2369,80 @@ auto left_join_count_table(const ir::JoinNode& join, const ir::AggregateNode& ag
         aggregate.group_by().front().name != join.keys().front().left) {
         return std::nullopt;
     }
-    const auto& key = join.keys().front();
-    const auto& spec = aggregate.aggregations().front();
-    const auto* left_key = left.find_entry(key.left);
-    const auto* right_key = right.find_entry(key.right);
-    const auto* counted = right.find_entry(std::string(counted_column));
-    if (left_key == nullptr || right_key == nullptr || counted == nullptr ||
-        !std::holds_alternative<Column<std::int64_t>>(*left_key->column) ||
-        !std::holds_alternative<Column<std::int64_t>>(*right_key->column) ||
-        left_key->validity.has_value() || right_key->validity.has_value()) {
+    const auto* left_key = left.find_entry(join.keys().front().left);
+    if (left_key == nullptr || !std::holds_alternative<Column<std::int64_t>>(*left_key->column) ||
+        left_key->validity.has_value()) {
         return std::nullopt;
     }
-    const auto& left_values = std::get<Column<std::int64_t>>(*left_key->column);
-    const auto& right_values = std::get<Column<std::int64_t>>(*right_key->column);
+    LeftJoinCounter counter;
+    // The left keys are required to be unique by this fusion, so each names one
+    // output row and the counts need no merge: whoever counts a right row adds
+    // to its key's slot.
+    if (!counter.counts_.prepare(std::get<Column<std::int64_t>>(*left_key->column), left.rows())) {
+        return std::nullopt;
+    }
+    counter.left_keys_ = left_key->column;
+    counter.group_key_ = aggregate.group_by().front().name;
+    counter.alias_ = aggregate.aggregations().front().alias;
+    counter.right_key_ = join.keys().front().right;
+    counter.counted_ = std::string(counted_column);
+    return counter;
+}
 
-    // The left keys are required to be unique by this fusion, so their map can
-    // name output slots directly. That is both smaller than a right-sized
-    // count map and unlocks a row-parallel right scan: workers only read this
-    // completed map and atomically add to the matching left slot. No worker
-    // owns a partial map and there is nothing to merge afterwards.
-    LeftKeyCounts counts;
-    if (!counts.prepare(left_values, left.rows())) {
-        return std::nullopt;
+auto LeftJoinCounter::accepts(const Chunk& right) const -> bool {
+    const ColumnEntry* key = nullptr;
+    const ColumnEntry* counted = nullptr;
+    return columns_of(right, key, counted);
+}
+
+auto LeftJoinCounter::columns_of(const Chunk& right, const ColumnEntry*& key,
+                                 const ColumnEntry*& counted) const -> bool {
+    for (const auto& entry : right.columns) {
+        if (entry.name == right_key_) {
+            key = &entry;
+        }
+        if (entry.name == counted_) {
+            counted = &entry;
+        }
     }
-    const auto* counted_validity = counted->validity.has_value() ? &*counted->validity : nullptr;
+    return key != nullptr && counted != nullptr &&
+           std::holds_alternative<Column<std::int64_t>>(*key->column);
+}
+
+auto LeftJoinCounter::count(const Chunk& right) -> bool {
+    const ColumnEntry* key = nullptr;
+    const ColumnEntry* counted = nullptr;
+    if (!columns_of(right, key, counted)) {
+        return false;
+    }
+    counts_.count<false>(std::get<Column<std::int64_t>>(*key->column).data(),
+                         key->validity.has_value() ? &*key->validity : nullptr,
+                         counted->validity.has_value() ? &*counted->validity : nullptr, 0,
+                         right.rows());
+    return true;
+}
+
+auto LeftJoinCounter::count_parallel(const Chunk& right, const ExecutionContext* exec) -> bool {
+    const ColumnEntry* key = nullptr;
+    const ColumnEntry* counted = nullptr;
+    if (!columns_of(right, key, counted)) {
+        return false;
+    }
+    const std::int64_t* keys = std::get<Column<std::int64_t>>(*key->column).data();
+    const ValidityBitmap* key_validity = key->validity.has_value() ? &*key->validity : nullptr;
+    const ValidityBitmap* counted_validity =
+        counted->validity.has_value() ? &*counted->validity : nullptr;
     for_row_ranges(exec, right.rows(), [&](std::size_t begin, std::size_t end) {
-        counts.count(right_values.data(), counted_validity, begin, end);
+        counts_.count<true>(keys, key_validity, counted_validity, begin, end);
     });
-    Column<std::int64_t> out_counts = counts.finish(left_values.data(), left.rows());
+    return true;
+}
+
+auto LeftJoinCounter::finish() const -> Table {
+    const auto& keys = std::get<Column<std::int64_t>>(*left_keys_);
     Table out;
-    out.add_column(aggregate.group_by().front().name, *left_key->column);
-    out.add_column(spec.alias, std::move(out_counts));
+    out.add_column(group_key_, *left_keys_);
+    out.add_column(alias_, counts_.finish(keys.data(), keys.size()));
     return out;
 }
 

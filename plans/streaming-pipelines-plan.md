@@ -206,8 +206,11 @@ says so.
   probe side and re-split it (q09 +6.8%). A table a breaker produced anyway
   (sort, aggregate output, a materialized join side) is morselized when the
   work above it pays for the split (`is_worth_morselizing`); keeping a long
-  pipeline after a breaker serial is the worse loss. The split itself must
-  cost next to nothing: `make_morsel_chunk` copies the range.
+  pipeline after a breaker serial is the worse loss. The split's copy is not
+  what costs: `make_morsel_chunk` copies each range element by element, and a
+  bulk `memcpy` copy measured null over all 22 queries (2026-10-22, same
+  binary, 9 rounds, 8 cores: totals -0.14% / +0.12%). Each worker copies its
+  own range while it is cache-hot, in parallel.
 - A ring costs when its consumer drains synchronously (Ascribe as pipelineable,
   +13–30%). The only ring left is at the pipeline's sink.
 - Keep scan/aggregate overlap: removing it cost q01 +44%, q15 +61%.

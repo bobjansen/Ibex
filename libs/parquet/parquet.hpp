@@ -2092,6 +2092,60 @@ inline void sharded_dictionary(ShardedColumn& planned, int leaf_index,
 
 /// nullopt when this column cannot be split by row group — see `ShardedColumn`
 /// for which columns those are and why.
+/// Selected decodes with at most this many output rows split a string column
+/// by row group (see `sharded_string`); larger ones stay one task, since the
+/// shards are concatenated on the calling thread.
+inline constexpr std::size_t kShardedStringMaxRows = 64 * 1024;
+
+/// A string column split by row group for a small selected decode.
+///
+/// A string's destination offset depends on every preceding row, so shards
+/// cannot write disjoint slices of one buffer. They each decode into their own
+/// column instead, and `finalize` appends those in row-group order -- a bulk
+/// copy of the output, cheap only because the output is small, hence
+/// `kShardedStringMaxRows`. The case it exists for is a refetch of a few rows
+/// spread over many row groups: q10's 20 result customers re-read c_comment,
+/// c_address and c_phone as one task per column over all 13 row groups, the
+/// slowest bounding the decode at ~24 ms on 8 cores.
+inline void sharded_string(ShardedColumn& planned, int leaf_index,
+                           const ibex::runtime::Selection* selection,
+                           const DirectDecodeGroups& groups) {
+    const auto num_shards = static_cast<std::size_t>(groups.end - groups.begin);
+    auto parts = std::make_shared<std::vector<ibex::Column<std::string>>>(num_shards);
+    const int groups_begin = groups.begin;
+    planned.decode_range = [parts, leaf_index, selection, groups_begin](
+                               parquet::arrow::FileReader& reader, const DirectDecodeGroups& range,
+                               std::size_t /*output_start*/, std::size_t rows) -> std::size_t {
+        auto& part = (*parts)[static_cast<std::size_t>(range.begin - groups_begin)];
+        part.reserve(rows);
+        // Null-free by construction (plan_sharded_column), so the validity
+        // this collects is all-valid and not kept.
+        DirectValidity validity(rows);
+        const auto emitted =
+            decode_string_column(reader, leaf_index, selection, range, part, validity);
+        if (emitted != rows) {
+            throw std::runtime_error("parquet::read: decoded column has the wrong row count");
+        }
+        return emitted;
+    };
+    planned.finalize = [parts](ibex::runtime::ColumnEntry& entry) {
+        std::size_t rows = 0;
+        std::size_t chars = 0;
+        for (const auto& part : *parts) {
+            rows += part.size();
+            if (part.size() != 0) {
+                chars += part.offsets_data()[part.size()] - part.offsets_data()[0];
+            }
+        }
+        ibex::Column<std::string> out;
+        out.reserve(rows, chars);
+        for (const auto& part : *parts) {
+            out.append(part);
+        }
+        entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(out));
+    };
+}
+
 inline auto plan_sharded_column(parquet::arrow::FileReader& reader, const arrow::Field& field,
                                 int leaf_index, const ibex::runtime::Selection* selection,
                                 const DirectDecodeGroups& groups, std::size_t output_rows)
@@ -2172,6 +2226,13 @@ inline auto plan_sharded_column(parquet::arrow::FileReader& reader, const arrow:
         }
         case arrow::Type::DICTIONARY:
             sharded_dictionary(planned, leaf_index, selection, groups, output_rows);
+            break;
+        case arrow::Type::STRING:
+        case arrow::Type::LARGE_STRING:
+            if (selection == nullptr || output_rows > kShardedStringMaxRows) {
+                return std::nullopt;
+            }
+            sharded_string(planned, leaf_index, selection, groups);
             break;
         default:
             return std::nullopt;

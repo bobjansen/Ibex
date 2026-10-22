@@ -2461,100 +2461,126 @@ inline auto direct_decode_table(std::span<parquet::arrow::FileReader* const> rea
 
 }  // namespace
 
-/// Open `path` for deferred reading: take its schema and row count from the
-/// footer, and hand back a handle that decodes individual columns on demand.
-///
-/// This is what gives `let t = parquet::read(p)` projection pushdown. Binding
-/// touches metadata only; a query that references 4 of 16 columns decodes 4.
-/// Merge one column's footer statistics across every row group into a whole-file
-/// range. Integers only: `span = max - min + 1` is what the planner derives a
+/// One column chunk's footer statistics, as the merge below wants them. Integer
+/// ranges only: `span = max - min + 1` is what the planner derives a
 /// distinct-count estimate from, and that arithmetic means nothing for a double
 /// or a string.
-///
-/// Any chunk that cannot answer abandons the column entirely. A range merged
-/// from a subset of the row groups is not a conservative answer, it is a wrong
-/// one -- the planner would read it as "no value lies outside this".
-inline auto merge_column_stats(const parquet::FileMetaData& metadata, int leaf_index)
-    -> ibex::runtime::ColumnStats {
-    ibex::runtime::ColumnStats out;
-    std::size_t nulls = 0;
-    bool nulls_known = true;
-    bool range_known = true;
-    std::int64_t low = 0;
-    std::int64_t high = 0;
-
-    for (int group = 0; group < metadata.num_row_groups(); ++group) {
-        const auto chunk = metadata.RowGroup(group)->ColumnChunk(leaf_index);
-        if (!chunk->is_stats_set()) {
-            return {};
-        }
-        const auto stats = chunk->statistics();
-        if (stats == nullptr) {
-            return {};
-        }
-        if (stats->HasNullCount()) {
-            nulls += static_cast<std::size_t>(stats->null_count());
-        } else {
-            nulls_known = false;
-        }
-        if (!range_known || !stats->HasMinMax()) {
-            range_known = false;
-            continue;
-        }
-        std::int64_t chunk_low = 0;
-        std::int64_t chunk_high = 0;
-        if (stats->physical_type() == parquet::Type::INT64) {
-            const auto& typed = static_cast<const parquet::Int64Statistics&>(*stats);
-            chunk_low = typed.min();
-            chunk_high = typed.max();
-        } else if (stats->physical_type() == parquet::Type::INT32) {
-            const auto& typed = static_cast<const parquet::Int32Statistics&>(*stats);
-            chunk_low = typed.min();
-            chunk_high = typed.max();
-        } else {
-            range_known = false;  // not an integer column
-            continue;
-        }
-        if (!ibex::parquet_stats::usable_signed_range(chunk_low, chunk_high)) {
-            range_known = false;
-            continue;
-        }
-        if (group == 0 || chunk_low < low) {
-            low = chunk_low;
-        }
-        if (group == 0 || chunk_high > high) {
-            high = chunk_high;
-        }
+inline auto chunk_stats(const parquet::ColumnChunkMetaData& chunk)
+    -> ibex::parquet_stats::ChunkStats {
+    ibex::parquet_stats::ChunkStats out;
+    if (!chunk.is_stats_set()) {
+        return out;
     }
-
-    if (range_known && metadata.num_row_groups() > 0) {
-        out.min = low;
-        out.max = high;
+    const auto stats = chunk.statistics();
+    if (stats == nullptr) {
+        return out;
     }
-    if (nulls_known) {
-        out.null_count = nulls;
+    out.present = true;
+    if (stats->HasNullCount()) {
+        out.has_null_count = true;
+        out.null_count = static_cast<std::size_t>(stats->null_count());
     }
+    if (!stats->HasMinMax()) {
+        return out;
+    }
+    if (stats->physical_type() == parquet::Type::INT64) {
+        const auto& typed = static_cast<const parquet::Int64Statistics&>(*stats);
+        out.low = typed.min();
+        out.high = typed.max();
+    } else if (stats->physical_type() == parquet::Type::INT32) {
+        const auto& typed = static_cast<const parquet::Int32Statistics&>(*stats);
+        out.low = typed.min();
+        out.high = typed.max();
+    } else {
+        return out;
+    }
+    out.has_range = ibex::parquet_stats::usable_signed_range(out.low, out.high);
     return out;
 }
 
+/// Footers with fewer column chunks than this are merged on the calling thread.
+inline constexpr std::size_t kParallelStatsMinChunks = 1024;
+
 /// Whole-file per-column statistics, read from the footer that is already in
-/// memory. No page is decoded, so this costs a binding nothing.
+/// memory. No page is decoded.
+///
+/// Only INT32/INT64 leaves are read. Every consumer wants a column's integer
+/// range (a null count is only ever read next to one), and no other physical
+/// type can produce one; reading the rest anyway decoded a statistics object
+/// per chunk for nothing -- 16 x 489 of them for PDS-H lineitem, ~11 ms of a
+/// query's serial start-up. Large footers are merged over row-group ranges on
+/// the worker pool and the partial merges combined (`ColumnStatsMerge`), which
+/// is exactly the serial answer.
 inline auto read_column_stats(const parquet::FileMetaData& metadata,
                               const arrow::Schema& arrow_schema)
     -> ibex::runtime::SourceColumnStats {
     ibex::runtime::SourceColumnStats out;
     const auto* descr = metadata.schema();
+    std::vector<int> leaves;
     for (int leaf = 0; leaf < descr->num_columns(); ++leaf) {
+        const auto physical = descr->Column(leaf)->physical_type();
+        if (physical != parquet::Type::INT64 && physical != parquet::Type::INT32) {
+            continue;
+        }
         // A leaf's path is the Arrow field name only for flat schemas; nested
         // columns (a struct's fields) share a top-level name and must not be
         // conflated, so take only leaves whose path is a top-level field.
-        const std::string name = descr->Column(leaf)->path()->ToDotString();
-        if (arrow_schema.GetFieldIndex(name) < 0) {
+        if (arrow_schema.GetFieldIndex(descr->Column(leaf)->path()->ToDotString()) < 0) {
             continue;
         }
-        auto stats = merge_column_stats(metadata, leaf);
+        leaves.push_back(leaf);
+    }
+    const auto groups = static_cast<std::size_t>(metadata.num_row_groups());
+    if (leaves.empty() || groups == 0) {
+        return out;
+    }
+
+    using Merges = std::vector<ibex::parquet_stats::ColumnStatsMerge>;
+    const auto merge_groups = [&](std::size_t begin, std::size_t end, Merges& merges) {
+        merges.assign(leaves.size(), {});
+        for (std::size_t group = begin; group < end; ++group) {
+            const auto row_group = metadata.RowGroup(static_cast<int>(group));
+            for (std::size_t k = 0; k < leaves.size(); ++k) {
+                merges[k].add(chunk_stats(*row_group->ColumnChunk(leaves[k])));
+            }
+        }
+    };
+    auto& pool = ibex::runtime::process_worker_pool();
+    std::size_t ranges = 1;
+    if (groups * leaves.size() >= kParallelStatsMinChunks &&
+        !ibex::runtime::on_worker_pool_thread()) {
+        ranges = std::min(groups, pool.size());
+    }
+    std::vector<Merges> parts(ranges);
+    if (ranges <= 1) {
+        merge_groups(0, groups, parts[0]);
+    } else {
+        const std::size_t grain = (groups + ranges - 1) / ranges;
+        pool.submit(ranges,
+                    [&](std::size_t r) {
+                        const std::size_t begin = std::min(groups, r * grain);
+                        merge_groups(begin, std::min(groups, begin + grain), parts[r]);
+                    })
+            .wait();
+    }
+    for (std::size_t r = 1; r < ranges; ++r) {
+        for (std::size_t k = 0; k < leaves.size(); ++k) {
+            parts[0][k].combine(parts[r][k]);
+        }
+    }
+
+    for (std::size_t k = 0; k < leaves.size(); ++k) {
+        const auto& merged = parts[0][k];
+        ibex::runtime::ColumnStats stats;
+        if (merged.has_range()) {
+            stats.min = merged.low;
+            stats.max = merged.high;
+        }
+        if (merged.has_null_count()) {
+            stats.null_count = merged.nulls;
+        }
         if (stats.min.has_value() || stats.null_count.has_value()) {
-            out.emplace(name, stats);
+            out.emplace(descr->Column(leaves[k])->path()->ToDotString(), stats);
         }
     }
     return out;
@@ -4079,6 +4105,11 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
     std::size_t unit_count_;
 };
 
+/// Open `path` for deferred reading: take its schema and row count from the
+/// footer, and hand back a handle that decodes individual columns on demand.
+///
+/// This is what gives `let t = parquet::read(p)` projection pushdown. Binding
+/// touches metadata only; a query that references 4 of 16 columns decodes 4.
 inline auto read_parquet_lazy(std::string_view path) -> ibex::runtime::LazyTablePtr {
     std::string path_string{path};
     auto input = open_parquet_input(path);

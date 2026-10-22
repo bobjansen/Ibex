@@ -713,6 +713,29 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         if (!joined.has_value()) {
             return std::unexpected(std::move(joined.error()));
         }
+        // The nodes between the aggregate and the join were never built: the
+        // fusion reads the join output directly. Not fused after all, they run
+        // here, bottom-up -- among them the flag update `count(col)` lowers
+        // to, which made the column the aggregate sums. Skipping them failed
+        // the query ("aggregate column not found") on any left side with a
+        // repeated key or a key that is not a plain Int64.
+        std::vector<const ir::Node*> skipped;
+        for (const ir::Node* cur = agg.children().front().get(); cur != &join;
+             cur = cur->children().front().get()) {
+            skipped.push_back(cur);
+        }
+        for (auto it = skipped.rbegin(); it != skipped.rend(); ++it) {
+            const ir::Node& step = **it;
+            auto applied =
+                step.kind() == ir::NodeKind::Update
+                    ? update_table(std::move(*joined), ir::node_cast<ir::UpdateNode>(step).fields(),
+                                   scalars, externs, exec)
+                    : project_table(*joined, ir::node_cast<ir::ProjectNode>(step).columns());
+            if (!applied.has_value()) {
+                return std::unexpected(std::move(applied.error()));
+            }
+            joined = std::move(applied);
+        }
         auto result = aggregate_table(*joined, agg.group_by(), agg.aggregations(), &exec);
         if (!result.has_value()) {
             return std::unexpected(std::move(result.error()));

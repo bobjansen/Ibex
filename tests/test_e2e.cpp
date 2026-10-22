@@ -89,6 +89,7 @@ auto run(std::string_view src, const runtime::TableRegistry& tables,
     auto lowered = parser::lower(*parsed);
     REQUIRE(lowered.has_value());
     auto result = runtime::interpret(*lowered.value(), tables, scalars, externs);
+    INFO((result.has_value() ? std::string{} : result.error()));
     REQUIRE(result.has_value());
     return std::move(*result);
 }
@@ -2212,6 +2213,76 @@ TEST_CASE("E2E: count over a left join still uses the fused rewrite", "[e2e][joi
     CHECK(col_i64(out, "k") == std::vector<std::int64_t>{1, 2, 3});
     CHECK(col_i64(out, "n") == std::vector<std::int64_t>{2, 1, 0});
     require_tables_equal(out, run_parallel(src, tables, 2));
+}
+
+// The fused count over adjacent keys and over the same keys spread far apart,
+// against hand-computed counts: unsorted and negative left keys, right keys in
+// a gap of the range, below it and above it, and null counted values.
+TEST_CASE("E2E: fused left-join count over dense and sparse keys", "[e2e][join][aggregate]") {
+    const auto* src = "(l left join r on k)[select { n = count(v) }, by k];";
+    for (const std::int64_t scale : {std::int64_t{1}, std::int64_t{1'000'000'000}}) {
+        INFO("scale=" << scale);
+        const auto s = [scale](std::int64_t key) { return key * scale; };
+        runtime::Table left;
+        left.add_column("k", Column<std::int64_t>{s(5), s(-2), s(3), s(9), s(0)});
+        runtime::Table right;
+        right.add_column("k", Column<std::int64_t>{s(3), s(3), s(-2), s(9), s(4), s(-7), s(20),
+                                                   s(5), s(3), s(0)});
+        right.add_column(
+            "v", Column<std::int64_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+            runtime::ValidityBitmap{true, true, true, true, true, true, true, false, false, true});
+        runtime::TableRegistry tables;
+        tables.emplace("l", std::move(left));
+        tables.emplace("r", std::move(right));
+
+        // 5: its one match is null. -2: one. 3: three matches, one null. 9: one.
+        // 0: one. 4, -7 and 20 match no left key.
+        auto out = run(src, tables);
+        CHECK(col_i64(out, "k") == std::vector<std::int64_t>{s(5), s(-2), s(3), s(9), s(0)});
+        CHECK(col_i64(out, "n") == std::vector<std::int64_t>{0, 1, 2, 1, 1});
+        require_tables_equal(out, run_parallel(src, tables, 2, 4));
+    }
+}
+
+// A repeated left key cannot be fused (one output row per key), dense or not:
+// the ordinary join runs, so each copy of key 1 meets both right rows.
+TEST_CASE("E2E: fused left-join count declines repeated left keys", "[e2e][join][aggregate]") {
+    const auto* src = "(l left join r on k)[select { n = count(v) }, by k];";
+    for (const std::int64_t scale : {std::int64_t{1}, std::int64_t{1'000'000'000'000}}) {
+        INFO("scale=" << scale);
+        runtime::Table left;
+        left.add_column("k", Column<std::int64_t>{scale, 2 * scale, scale});
+        runtime::Table right;
+        right.add_column("k", Column<std::int64_t>{scale, scale, 2 * scale});
+        right.add_column("v", Column<std::int64_t>{1, 2, 3});
+        runtime::TableRegistry tables;
+        tables.emplace("l", std::move(left));
+        tables.emplace("r", std::move(right));
+
+        auto out = run(src, tables);
+        CHECK(col_i64(out, "k") == std::vector<std::int64_t>{scale, 2 * scale});
+        CHECK(col_i64(out, "n") == std::vector<std::int64_t>{4, 1});
+        require_tables_equal(out, run_parallel(src, tables, 2, 4));
+    }
+}
+
+// A key that is not Int64 is planned as the fusion but declined at run time,
+// so it takes the same ordinary path.
+TEST_CASE("E2E: fused left-join count declines a String key", "[e2e][join][aggregate]") {
+    runtime::Table left;
+    left.add_column("k", Column<std::string>{"a", "b", "c"});
+    runtime::Table right;
+    right.add_column("k", Column<std::string>{"a", "a", "b", "z"});
+    right.add_column("v", Column<std::int64_t>{1, 2, 3, 4});
+    runtime::TableRegistry tables;
+    tables.emplace("l", std::move(left));
+    tables.emplace("r", std::move(right));
+
+    const auto* src = "(l left join r on k)[select { n = count(v) }, by k];";
+    auto out = run(src, tables);
+    REQUIRE(out.rows() == 3);
+    CHECK(col_i64(out, "n") == std::vector<std::int64_t>{2, 1, 0});
+    require_tables_equal(out, run_parallel(src, tables, 2, 4));
 }
 
 TEST_CASE("E2E: a column-less row scaffold survives the parallel path", "[e2e][parallel]") {

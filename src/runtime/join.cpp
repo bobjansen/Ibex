@@ -2292,7 +2292,15 @@ auto plan_fused_left_join_count(const ir::AggregateNode& aggregate)
            (child->kind() == ir::NodeKind::Project || child->kind() == ir::NodeKind::Update) &&
            !child->children().empty()) {
         if (child->kind() == ir::NodeKind::Update) {
-            skipped_updates.push_back(ir::node_cast<ir::UpdateNode>(child));
+            const auto& update = ir::node_cast<ir::UpdateNode>(*child);
+            // The fallback, when the left keys turn out unusable at run time,
+            // applies the skipped nodes itself with the plain whole-table
+            // kernels; a guarded, grouped or tuple update is not one of those.
+            if (update.guard() != nullptr || !update.group_by().empty() ||
+                !update.tuple_fields().empty()) {
+                return std::nullopt;
+            }
+            skipped_updates.push_back(&update);
         }
         child = child->children().front().get();
     }

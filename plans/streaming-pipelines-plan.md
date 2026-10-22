@@ -195,7 +195,13 @@ says so.
    the row-local update below it, so the update streamed alone and the run
    re-split its output. Over a lazy source the run now reaches down through
    such updates (`Plan::stream_only_bottom_updates`): q22 -16.5% / -18.8%
-   streamed, nothing else moved.
+   streamed, nothing else moved. q13's drain fed the fused left-join count, which also
+   spent ~140 ms after it: a serial 48 ms map build over 1.5M customer keys
+   and an 85 ms probe pass. Dense keys are now addressed directly
+   (`679cbe54`, q13 -18.6%) and the right side streams into the counter a
+   chunk at a time (`d1b71845`, a further -19.2%): q13 ~570 -> ~400 ms, about
+   the time to decode and filter `orders`. Its declined fallback had been
+   failing outright (`796f6b0c`).
 4. **Semi/anti joins as probe steps** (q04, q21, q22).
 5. **Retire Layer B probe morsels** (`try_take_join_probe`,
    `build_probe_morsel_pipeline`, `IBEX_PROBE_MORSELS`), and rewrite

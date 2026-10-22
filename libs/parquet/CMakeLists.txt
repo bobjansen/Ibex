@@ -224,6 +224,28 @@ if(TARGET thrift AND NOT MSVC)
     target_compile_options(thrift PRIVATE -Wno-deprecated-declarations)
 endif()
 
+# Bind Arrow's references to its own definitions at link time (ELF only). Its
+# vtables and typeinfo otherwise leave ~19k symbolic relocations that the
+# dynamic loader resolves by global lookup on every process start: ~1.5 ms of
+# an empty script's ~7 ms. What it changes is which copy wins when a symbol is
+# defined both in Arrow and elsewhere; across ibex, the plugins and both Arrow
+# libraries those are code, vtables and typeinfo (libstdc++ compares typeinfo
+# by name, so exceptions and dynamic_cast are unaffected) plus two immutable
+# constants -- no mutable state is split. Recheck with `LD_DEBUG=bindings`
+# when bumping Arrow.
+if(UNIX AND NOT APPLE)
+    foreach(_ibex_arrow_symbolic arrow_shared parquet_shared arrow_ipc_shared)
+        if(TARGET ${_ibex_arrow_symbolic})
+            get_target_property(_ibex_arrow_symbolic_type ${_ibex_arrow_symbolic} TYPE)
+            if(_ibex_arrow_symbolic_type STREQUAL "SHARED_LIBRARY")
+                target_link_options(${_ibex_arrow_symbolic} PRIVATE "-Wl,-Bsymbolic")
+            endif()
+        endif()
+    endforeach()
+    unset(_ibex_arrow_symbolic)
+    unset(_ibex_arrow_symbolic_type)
+endif()
+
 if(WIN32 AND TARGET parquet_shared)
     # Arrow drops the "lib"/SONAME-version naming it uses on Linux/macOS
     # (libparquet.so.2200) on Windows, so parquet_shared's own DLL output is

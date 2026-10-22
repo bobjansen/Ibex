@@ -1545,6 +1545,39 @@ auto key_membership() -> runtime::DynamicScanFilter {
 
 }  // namespace
 
+// A whole-source scan whose join key is also an output takes the key's values
+// from the key scan, which decoded them to test them. Decoding the key again
+// for the selected rows decompressed its pages twice: unstreamed q09's
+// `l_partkey`, 22% more zstd work than the query's columns read once.
+TEST_CASE("LazyTable: project_where takes an output key's values from the key scan",
+          "[runtime][lazy_table][deferred_scan]") {
+    const auto filter = key_membership();
+    const std::string key = "k";
+    for (const bool values : {true, false}) {
+        INFO("source returns key values: " << values);
+        auto state = std::make_shared<DictSourceState>();
+        state->key_values = values;
+        auto lazy = make_dict_lazy(state);
+
+        auto table = lazy.project_where({"k", "v"}, {}, kExec, nullptr, &filter, &key);
+        REQUIRE(table);
+        CHECK(table->rows() == 4);
+        const auto* k = std::get_if<Column<std::int64_t>>(table->find("k"));
+        const auto* v = std::get_if<Column<std::int64_t>>(table->find("v"));
+        REQUIRE(k != nullptr);
+        REQUIRE(v != nullptr);
+        CHECK(std::vector<std::int64_t>(k->begin(), k->end()) ==
+              std::vector<std::int64_t>{10, 13, 14, 15});
+        CHECK(std::vector<std::int64_t>(v->begin(), v->end()) ==
+              std::vector<std::int64_t>{10, 13, 14, 15});
+        CHECK(table->columns.front().name == "k");
+        // The key is decoded only when the source did not hand its values back.
+        REQUIRE(state->decode_calls.size() == 1);
+        CHECK(state->decode_calls[0] ==
+              (values ? std::vector<std::string>{"v"} : std::vector<std::string>{"k", "v"}));
+    }
+}
+
 // q10's shape: a join-key membership plus an equality on a dictionary-encoded
 // string. The string predicate is decided per dictionary entry and intersected
 // with the key scan; the string column is never decoded.

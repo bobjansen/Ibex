@@ -211,7 +211,16 @@ says so.
    4.3, and its zstd instructions equal reading each needed column once.
    Unstreamed q09 did 22% more: the whole-source fused key scan decoded the
    join key twice (`f7268bcd`, unstreamed q09 -7.9%). Most of what streamed
-   probes gained on q09 was that duplicate decode.
+   probes gained on q09 was that duplicate decode. A hunt over all 22 queries
+   (2026-10-22: each query's zstd instructions against the sum of its
+   columns read once, both modes) found every query within 1% except two,
+   both a source read by two occurrences that each decode it: q18 +37%
+   (`lineitem_raw`'s streamed aggregate and its deferred probe both decode
+   `l_orderkey`, 3.8G of 10.7G) and q20 +7% (the semi-join reduction
+   duplicates `forest_parts join partsupp`, so `partsupp` is scanned twice).
+   `decode_demanded_lazy_sources` shares one decode between occurrences, but
+   only for sources decoded up front; streaming and deferred-probe scans are
+   skipped there.
 4. **Semi/anti joins as probe steps** (q04, q21, q22).
 5. **Retire Layer B probe morsels** (`try_take_join_probe`,
    `build_probe_morsel_pipeline`, `IBEX_PROBE_MORSELS`), and rewrite

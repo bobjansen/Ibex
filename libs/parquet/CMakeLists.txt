@@ -91,6 +91,11 @@ FetchContent_Declare(
     GIT_TAG        apache-arrow-22.0.0
     GIT_SHALLOW    TRUE
     SOURCE_SUBDIR  cpp
+    # With ARROW_S3_MODULE, keep S3 (and the AWS SDK) out of libarrow; upstream
+    # builds the module in addition to linking S3 into libarrow.
+    PATCH_COMMAND  ${CMAKE_COMMAND}
+                   -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/arrow-s3-module-only.patch
+                   -P ${CMAKE_CURRENT_LIST_DIR}/../../cmake/ApplyPatchOnce.cmake
 )
 set(ARROW_BUILD_SHARED ON CACHE BOOL "" FORCE)
 set(ARROW_BUILD_STATIC OFF CACHE BOOL "" FORCE)
@@ -133,7 +138,17 @@ if(IBEX_PARQUET_LOCAL_ONLY)
 else()
     set(ARROW_S3 ${IBEX_PARQUET_S3} CACHE BOOL "" FORCE)
 endif()
-set(ARROW_S3_MODULE OFF CACHE BOOL "" FORCE)
+# Arrow's S3 filesystem goes in its loadable module (arrow_s3fs) whenever
+# libcurl is loaded lazily (cmake/LazyCurl.cmake): built into libarrow, the
+# bundled AWS SDK links libcurl, and its dependency chain would load at every
+# process start anyway. ensure_s3_filesystem_registered() loads the module on
+# the first s3:// open.
+include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/LazyCurl.cmake")
+if(IBEX_LAZY_CURL AND ARROW_S3)
+    set(ARROW_S3_MODULE ON CACHE BOOL "" FORCE)
+else()
+    set(ARROW_S3_MODULE OFF CACHE BOOL "" FORCE)
+endif()
 # Arrow's SIMD kernels, selected by runtime CPU detection.
 #
 # ARROW_SIMD_LEVEL is the *compile-time baseline*, and DEFAULT resolves per
@@ -330,12 +345,25 @@ else()
     endif()
 endif()
 
+# The HTTPS reader's libcurl (cmake/LazyCurl.cmake).
+function(ibex_parquet_use_curl target)
+    if(NOT IBEX_PARQUET_LOCAL_ONLY)
+        ibex_link_curl(${target})
+    endif()
+endfunction()
+
 if(TARGET arrow_shared AND TARGET parquet_shared)
     target_link_libraries(ibex_parquet PRIVATE arrow_shared parquet_shared)
-    if(NOT IBEX_PARQUET_LOCAL_ONLY)
-        target_link_libraries(ibex_parquet PRIVATE CURL::libcurl)
-    endif()
+    ibex_parquet_use_curl(ibex_parquet)
     set(_ibex_arrow_shared_targets arrow_shared parquet_shared)
+    if(TARGET arrow_s3fs)
+        # Found beside libarrow at run time (ensure_s3_filesystem_registered),
+        # so it is shipped wherever libarrow is.
+        target_compile_definitions(ibex_parquet PRIVATE
+            IBEX_ARROW_S3_MODULE_FILE="$<TARGET_FILE_NAME:arrow_s3fs>")
+        add_dependencies(ibex_parquet arrow_s3fs)
+        list(APPEND _ibex_arrow_shared_targets arrow_s3fs)
+    endif()
     if(TARGET arrow_ipc_shared)
         # On some configs (observed on Windows) arrow_ipc_shared exists as a
         # target but isn't actually a shared/module library (e.g. IPC gets
@@ -371,7 +399,10 @@ if(TARGET arrow_shared AND TARGET parquet_shared)
     endif()
 
     foreach(_ibex_arrow_dep IN LISTS _ibex_arrow_shared_targets)
-        if(WIN32)
+        get_target_property(_ibex_arrow_dep_type ${_ibex_arrow_dep} TYPE)
+        if(WIN32 OR _ibex_arrow_dep_type STREQUAL "MODULE_LIBRARY")
+            # (A MODULE library -- arrow_s3fs -- has no SONAME either: it is
+            # dlopen'ed by file name.)
             # TARGET_SONAME_FILE is rejected outright ("not allowed for DLL
             # target platforms") on Windows -- there's no SONAME concept, so
             # copy the .dll itself via TARGET_FILE instead.
@@ -393,6 +424,7 @@ if(TARGET arrow_shared AND TARGET parquet_shared)
         )
     endforeach()
     unset(_ibex_arrow_dep_file)
+    unset(_ibex_arrow_dep_type)
 else()
     message(FATAL_ERROR "Arrow shared targets not found (arrow_shared/parquet_shared).")
 endif()
@@ -402,9 +434,7 @@ endif()
 # HTTPS reader (notably required by MinGW, which otherwise leaves
 # __imp_curl_* unresolved).
 target_link_libraries(ibex_parquet_plugin PRIVATE ibex_parquet)
-if(NOT IBEX_PARQUET_LOCAL_ONLY)
-    target_link_libraries(ibex_parquet_plugin PRIVATE CURL::libcurl)
-endif()
+ibex_parquet_use_curl(ibex_parquet_plugin)
 
 set(_ibex_parquet_stub "${_ibex_parquet_output_dir}/parquet.ibex")
 add_custom_command(

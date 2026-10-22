@@ -29,7 +29,10 @@ target_link_libraries(ibex_csv_plugin
 )
 
 if(CURL_FOUND)
-    target_link_libraries(ibex_csv_plugin PRIVATE CURL::libcurl)
+    # Loaded on first HTTPS read where supported (cmake/LazyCurl.cmake): any
+    # script declaring csv::write loads this plugin.
+    include("${PROJECT_SOURCE_DIR}/cmake/LazyCurl.cmake")
+    ibex_link_curl(ibex_csv_plugin)
     target_compile_definitions(ibex_csv_plugin PRIVATE IBEX_CSV_HAVE_CURL)
 else()
     message(STATUS "CURL not found: building csv plugin without HTTPS csv::read support")

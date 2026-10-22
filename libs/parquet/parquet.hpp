@@ -53,6 +53,9 @@
 #if !defined(IBEX_PARQUET_LOCAL_ONLY)
 #include <curl/curl.h>
 #endif
+#if defined(IBEX_ARROW_S3_MODULE_FILE)
+#include <dlfcn.h>
+#endif
 #include <filesystem>
 #include <limits>
 #include <map>
@@ -78,6 +81,9 @@
 #include <utility>
 #include <vector>
 
+#if !defined(IBEX_PARQUET_LOCAL_ONLY)
+#include "../common/curl_api.hpp"
+#endif
 #include "dictionary_policy.hpp"
 #include "selection_check.hpp"
 #include "stats_range.hpp"
@@ -132,15 +138,16 @@ inline auto write_http_chunk(char* ptr, std::size_t size, std::size_t nmemb, voi
 }
 
 inline auto download_https_to_temp(std::string_view url) -> std::string {
-    static const bool curl_initialized = [] {
-        return curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
+    const auto& api = ibex::lazy_curl::curl_api("parquet::read");
+    static const bool curl_initialized = [&api] {
+        return api.global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
     }();
     if (!curl_initialized) {
         throw std::runtime_error("parquet::read: failed to initialize HTTPS client");
     }
 
     auto [file, temp_path] = make_temp_parquet_file();
-    CURL* curl = curl_easy_init();
+    CURL* curl = api.easy_init();
     if (curl == nullptr) {
         close_and_remove_temp(file, temp_path);
         throw std::runtime_error("parquet::read: failed to create HTTPS client");
@@ -148,34 +155,34 @@ inline auto download_https_to_temp(std::string_view url) -> std::string {
 
     std::string url_string{url};
     char error_buffer[CURL_ERROR_SIZE] = {};
-    curl_easy_setopt(curl, CURLOPT_URL, url_string.c_str());
-    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_http_chunk);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, file);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "ibex-parquet/1");
+    api.easy_setopt(curl, CURLOPT_URL, url_string.c_str());
+    api.easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer);
+    api.easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_http_chunk);
+    api.easy_setopt(curl, CURLOPT_WRITEDATA, file);
+    api.easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    api.easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+    api.easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    api.easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+    api.easy_setopt(curl, CURLOPT_USERAGENT, "ibex-parquet/1");
     if (const char* ca_info = std::getenv("CURL_CA_BUNDLE");
         ca_info != nullptr && ca_info[0] != '\0') {
-        curl_easy_setopt(curl, CURLOPT_CAINFO, ca_info);
+        api.easy_setopt(curl, CURLOPT_CAINFO, ca_info);
     } else if (const char* ssl_cert_file = std::getenv("SSL_CERT_FILE");
                ssl_cert_file != nullptr && ssl_cert_file[0] != '\0') {
-        curl_easy_setopt(curl, CURLOPT_CAINFO, ssl_cert_file);
+        api.easy_setopt(curl, CURLOPT_CAINFO, ssl_cert_file);
     }
 
-    const CURLcode rc = curl_easy_perform(curl);
+    const CURLcode rc = api.easy_perform(curl);
     long response_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-    curl_easy_cleanup(curl);
+    api.easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+    api.easy_cleanup(curl);
 
     const int close_result = std::fclose(file);
     file = nullptr;
 
     if (rc != CURLE_OK) {
         close_and_remove_temp(file, temp_path);
-        std::string detail = error_buffer[0] != '\0' ? error_buffer : curl_easy_strerror(rc);
+        std::string detail = error_buffer[0] != '\0' ? error_buffer : api.easy_strerror(rc);
         throw std::runtime_error("parquet::read: failed to download '" + url_string + "' (" +
                                  detail + ", HTTP " + std::to_string(response_code) + ")");
     }
@@ -186,6 +193,35 @@ inline auto download_https_to_temp(std::string_view url) -> std::string {
     }
 
     return temp_path;
+}
+#endif
+
+#if defined(IBEX_ARROW_S3_MODULE_FILE)
+/// Register Arrow's S3 filesystem, which this build keeps in a loadable module
+/// beside libarrow rather than inside it: linking it put the bundled AWS SDK
+/// and libcurl's dependency chain into every process start. Loaded the first
+/// time an s3:// path is opened; `FileSystemFromUri` then resolves the scheme
+/// as before. Throws (every time) if the module cannot be loaded.
+inline void ensure_s3_filesystem_registered() {
+    static const std::string error = []() -> std::string {
+        Dl_info info{};
+        if (dladdr(reinterpret_cast<const void*>(&arrow::fs::LoadFileSystemFactories), &info) ==
+                0 ||
+            info.dli_fname == nullptr) {
+            return "cannot locate libarrow to find " IBEX_ARROW_S3_MODULE_FILE;
+        }
+        const auto module =
+            std::filesystem::path(info.dli_fname).parent_path() / IBEX_ARROW_S3_MODULE_FILE;
+        const auto status = arrow::fs::LoadFileSystemFactories(module.string().c_str());
+        if (!status.ok()) {
+            return "failed to load the S3 filesystem module " + module.string() + " (" +
+                   status.ToString() + ")";
+        }
+        return {};
+    }();
+    if (!error.empty()) {
+        throw std::runtime_error("parquet::read: S3 support unavailable: " + error);
+    }
 }
 #endif
 
@@ -210,6 +246,9 @@ inline auto open_parquet_input(std::string_view path)
         return input_result.ValueOrDie();
     }
     if (is_s3_uri(path)) {
+#if defined(IBEX_ARROW_S3_MODULE_FILE)
+        ensure_s3_filesystem_registered();
+#endif
         std::string object_path;
         auto fs_result = arrow::fs::FileSystemFromUri(path_string, &object_path);
         if (!fs_result.ok()) {

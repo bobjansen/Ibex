@@ -60,6 +60,8 @@
 #include <cstring>
 #ifdef IBEX_CSV_HAVE_CURL
 #include <curl/curl.h>
+
+#include "../common/curl_api.hpp"
 #endif
 #include <deque>
 #include <fast_float/fast_float.h>
@@ -780,10 +782,11 @@ inline auto csv_open_unique_temp(const std::filesystem::path& dir, std::string& 
 
 /// Download `url` to a fresh temp file and return its path. Caller owns the
 /// file and is responsible for removing it. Mirrors the parquet plugin's
-/// helper; if this gets a third caller, factor into a shared httpfs header.
+/// helper; both resolve libcurl through libs/common/curl_api.hpp.
 inline auto csv_download_https_to_temp(std::string_view url) -> std::string {
-    static const bool curl_initialized = [] {
-        return curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
+    const auto& api = ibex::lazy_curl::curl_api("csv::read");
+    static const bool curl_initialized = [&api] {
+        return api.global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
     }();
     if (!curl_initialized) {
         throw std::runtime_error("csv::read: failed to initialize HTTPS client");
@@ -811,7 +814,7 @@ inline auto csv_download_https_to_temp(std::string_view url) -> std::string {
         std::filesystem::remove(temp_path, rm_ec);
     };
 
-    CURL* curl = curl_easy_init();
+    CURL* curl = api.easy_init();
     if (curl == nullptr) {
         cleanup();
         throw std::runtime_error("csv::read: failed to create HTTPS client");
@@ -819,30 +822,30 @@ inline auto csv_download_https_to_temp(std::string_view url) -> std::string {
 
     std::string url_string{url};
     std::array<char, CURL_ERROR_SIZE> error_buffer{};
-    curl_easy_setopt(curl, CURLOPT_URL, url_string.c_str());
-    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer.data());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_http_chunk_csv);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "ibex-csv/1");
+    api.easy_setopt(curl, CURLOPT_URL, url_string.c_str());
+    api.easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer.data());
+    api.easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_http_chunk_csv);
+    api.easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+    api.easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    api.easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+    api.easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    api.easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+    api.easy_setopt(curl, CURLOPT_USERAGENT, "ibex-csv/1");
     // With the Schannel backend (the default on Windows) curl validates against
     // the system certificate store, so these overrides are only consulted when
     // the caller explicitly points at a bundle.
     if (const char* ca_info = std::getenv("CURL_CA_BUNDLE");
         ca_info != nullptr && ca_info[0] != '\0') {
-        curl_easy_setopt(curl, CURLOPT_CAINFO, ca_info);
+        api.easy_setopt(curl, CURLOPT_CAINFO, ca_info);
     } else if (const char* ssl_cert_file = std::getenv("SSL_CERT_FILE");
                ssl_cert_file != nullptr && ssl_cert_file[0] != '\0') {
-        curl_easy_setopt(curl, CURLOPT_CAINFO, ssl_cert_file);
+        api.easy_setopt(curl, CURLOPT_CAINFO, ssl_cert_file);
     }
 
-    const CURLcode rc = curl_easy_perform(curl);
+    const CURLcode rc = api.easy_perform(curl);
     long response_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-    curl_easy_cleanup(curl);
+    api.easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+    api.easy_cleanup(curl);
 
     // fclose flushes any buffered bytes; a non-zero result means the download
     // didn't fully land on disk.
@@ -853,7 +856,7 @@ inline auto csv_download_https_to_temp(std::string_view url) -> std::string {
         std::error_code rm_ec;
         std::filesystem::remove(temp_path, rm_ec);
         const std::string detail =
-            error_buffer[0] != '\0' ? error_buffer.data() : curl_easy_strerror(rc);
+            error_buffer[0] != '\0' ? error_buffer.data() : api.easy_strerror(rc);
         throw std::runtime_error("csv::read: failed to download '" + url_string + "' (" + detail +
                                  ", HTTP " + std::to_string(response_code) + ")");
     }

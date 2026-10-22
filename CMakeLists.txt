@@ -344,12 +344,13 @@ endforeach()
 # in the default component; this installs only the shared libraries, by SONAME,
 # beside the plugins. libs/parquet sets ARROW_RPATH_ORIGIN and
 # ARROW_INSTALL_NAME_RPATH so they resolve one another from there.
-foreach(_ibex_arrow_target arrow_shared parquet_shared arrow_ipc_shared)
+foreach(_ibex_arrow_target arrow_shared parquet_shared arrow_ipc_shared arrow_s3fs)
     if(NOT TARGET ${_ibex_arrow_target})
         continue()
     endif()
     get_target_property(_ibex_arrow_type ${_ibex_arrow_target} TYPE)
-    if(NOT _ibex_arrow_type STREQUAL "SHARED_LIBRARY")
+    # arrow_s3fs is a MODULE, loaded from beside libarrow on first s3:// use.
+    if(NOT _ibex_arrow_type MATCHES "^(SHARED|MODULE)_LIBRARY$")
         continue()
     endif()
     install(TARGETS ${_ibex_arrow_target}

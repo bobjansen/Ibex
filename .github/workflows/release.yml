@@ -153,7 +153,9 @@ jobs:
           - Parquet is built without S3 support: local and HTTPS reads work,
             s3:// paths do not.
           - Linux: needs glibc 2.39+ (Ubuntu 24.04 or newer) and the system
-            readline and curl libraries (apt install libreadline8t64 libcurl4t64).
+            readline library (apt install libreadline8t64); HTTPS reads also
+            need the system curl library (apt install libcurl4t64), loaded
+            only when an https:// path is read.
           EOF
 
           if [ "$RUNNER_OS" = "Windows" ]; then

@@ -1,0 +1,44 @@
+diff --git a/cpp/src/arrow/CMakeLists.txt b/cpp/src/arrow/CMakeLists.txt
+index e299e8f61..d2edd63d5 100644
+--- a/cpp/src/arrow/CMakeLists.txt
++++ b/cpp/src/arrow/CMakeLists.txt
+@@ -909,7 +909,9 @@ if(ARROW_FILESYSTEM)
+   if(ARROW_HDFS)
+     list(APPEND ARROW_FILESYSTEM_SRCS filesystem/hdfs.cc)
+   endif()
+-  if(ARROW_S3)
++  # Ibex: with ARROW_S3_MODULE the S3 filesystem lives only in the arrow_s3fs
++  # module, so libarrow does not carry the AWS SDK and its libcurl chain.
++  if(ARROW_S3 AND NOT ARROW_S3_MODULE)
+     list(APPEND ARROW_FILESYSTEM_SRCS filesystem/s3fs.cc)
+     set_source_files_properties(filesystem/s3fs.cc PROPERTIES SKIP_UNITY_BUILD_INCLUSION
+                                                               ON)
+@@ -933,9 +935,11 @@ if(ARROW_FILESYSTEM)
+     endforeach()
+   endif()
+   if(ARROW_S3)
+-    foreach(ARROW_FILESYSTEM_TARGET ${ARROW_FILESYSTEM_TARGETS})
+-      target_link_libraries(${ARROW_FILESYSTEM_TARGET} PRIVATE ${AWSSDK_LINK_LIBRARIES})
+-    endforeach()
++    if(NOT ARROW_S3_MODULE)
++      foreach(ARROW_FILESYSTEM_TARGET ${ARROW_FILESYSTEM_TARGETS})
++        target_link_libraries(${ARROW_FILESYSTEM_TARGET} PRIVATE ${AWSSDK_LINK_LIBRARIES})
++      endforeach()
++    endif()
+ 
+     if(ARROW_S3_MODULE)
+       if(NOT ARROW_BUILD_SHARED)
+diff --git a/cpp/src/arrow/filesystem/CMakeLists.txt b/cpp/src/arrow/filesystem/CMakeLists.txt
+index 5250ed2a8..6257817c7 100644
+--- a/cpp/src/arrow/filesystem/CMakeLists.txt
++++ b/cpp/src/arrow/filesystem/CMakeLists.txt
+@@ -122,7 +122,8 @@ if(ARROW_S3)
+     endif()
+   endif()
+ 
+-  if(ARROW_S3_MODULE)
++  # Ibex: the test targets below exist only with ARROW_BUILD_TESTS.
++  if(ARROW_S3_MODULE AND ARROW_BUILD_TESTS)
+     add_arrow_test(s3fs_module_test
+                    SOURCES
+                    s3fs_module_test.cc

@@ -1575,7 +1575,7 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
                                  const ScalarRegistry* scalars, const ExternRegistry* externs,
                                  const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
-    const std::vector<MapStep> operators = parallel_pipeline_operators(plan);
+    std::vector<MapStep> operators = parallel_pipeline_operators(plan);
     const ir::Node* input_node = physical::parallel_input_node(plan);
     if (input_node == nullptr) {
         return std::unexpected("map pipeline: parallel mode without an input");
@@ -1606,6 +1606,15 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
     // any scan pipeline beneath has finished with each chunk. A consumer's
     // worker sink offered for this input would see the wrong chunks.
     (void)take_offered_scan_worker_sink();
+    if (plan.stream_only_bottom_updates > 0) {
+        // The updates the run reached down through to stream its source come
+        // back out: the topmost is the run's input again, built on its own (and
+        // streamed by its own pipeline when it can be).
+        input_node = plan.steps[plan.parallel_end - plan.stream_only_bottom_updates].node;
+        operators.erase(
+            operators.begin(),
+            operators.begin() + static_cast<std::ptrdiff_t>(plan.stream_only_bottom_updates));
+    }
     if (plan.stream_only_updates == 0) {
         return build_materialized_map_run(plan, operators, input_node, registry, scalars, externs,
                                           exec, model_out);
@@ -1616,6 +1625,8 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
     // have placed them -- the whole-table update splits itself across threads.
     const auto split = operators.end() - static_cast<std::ptrdiff_t>(plan.stream_only_updates);
     const std::vector<MapStep> below(operators.begin(), split);
+    // `below` is never empty when bottom updates were taken out: the run they
+    // bounded had a step of its own.
     auto run = below.empty()
                    ? build_pipeline_source(plan, registry, scalars, externs, exec, model_out)
                    : build_materialized_map_run(plan, below, input_node, registry, scalars, externs,

@@ -369,6 +369,74 @@ TEST_CASE("A bare update bounds the parallel run", "[runtime][pipeline]") {
     }
 }
 
+TEST_CASE("An update below a run joins it only over a lazy source", "[runtime][pipeline]") {
+    // TPC-H q22's shape: a computed column, then a filter on it. Over a table
+    // the update bounds the run from below and is its input, as before.
+    {
+        auto program = require_parse("df[update { n = price * 2 }][filter n > 5];");
+        auto result = parser::lower(program);
+        REQUIRE(result.has_value());
+
+        const auto plan = pipeline_over_table(**result);
+        REQUIRE(runs_over_morsels(plan));
+        REQUIRE(plan.steps.size() == 2);
+        CHECK(plan.parallel_begin == 0);
+        CHECK(plan.parallel_end == 1);
+        CHECK(plan.stream_only_bottom_updates == 0);
+        const ir::Node* input = runtime::physical::parallel_input_node(plan);
+        REQUIRE(input != nullptr);
+        CHECK(input->kind() == ir::NodeKind::Update);
+    }
+    {
+        // Over a lazy source the run reaches down through the update to the
+        // scan, for a streamed run only.
+        auto program =
+            require_parse("df[update { n = price * 2 }][filter n > 5][select { price, n }];");
+        auto result = parser::lower(program);
+        REQUIRE(result.has_value());
+
+        const auto plan = pipeline_of(**result);
+        REQUIRE(runs_over_morsels(plan));
+        REQUIRE(plan.steps.size() == 2);
+        CHECK(plan.steps[1].node->kind() == ir::NodeKind::Update);
+        CHECK(plan.parallel_begin == 0);
+        CHECK(plan.parallel_end == 2);
+        CHECK(plan.stream_only_bottom_updates == 1);
+        CHECK(plan.stream_only_updates == 0);
+        const ir::Node* input = runtime::physical::parallel_input_node(plan);
+        REQUIRE(input != nullptr);
+        CHECK(input->kind() == ir::NodeKind::Scan);
+    }
+    {
+        // Updates both below and above: the run takes both, each counted.
+        auto program =
+            require_parse("df[update { n = price * 2 }][filter n > 5][update { m = n + 1 }];");
+        auto result = parser::lower(program);
+        REQUIRE(result.has_value());
+
+        const auto plan = pipeline_of(**result);
+        REQUIRE(runs_over_morsels(plan));
+        REQUIRE(plan.steps.size() == 3);
+        CHECK(plan.parallel_begin == 0);
+        CHECK(plan.parallel_end == 3);
+        CHECK(plan.stream_only_bottom_updates == 1);
+        CHECK(plan.stream_only_updates == 1);
+    }
+    {
+        // A filter between the update and the scan is not an update: the run
+        // above stays bounded and does not stream.
+        auto program =
+            require_parse("df[filter price > 1][update { n = price * 2 }][filter n > 5];");
+        auto result = parser::lower(program);
+        REQUIRE(result.has_value());
+
+        const auto plan = pipeline_of(**result);
+        REQUIRE(runs_over_morsels(plan));
+        CHECK(plan.parallel_end == 1);
+        CHECK(plan.stream_only_bottom_updates == 0);
+    }
+}
+
 TEST_CASE("A parallel pipeline requires per-row work", "[runtime][pipeline]") {
     // `project_table` and `rename_table` build their output with
     // `add_column_shared` — no rows are copied, and the cost is O(columns). An

@@ -18713,6 +18713,64 @@ TEST_CASE("Scan pipeline streams a bare row-local update", "[runtime][parallel][
     CHECK(unstreamed_stats.parallel_fields.load() >= 1);
 }
 
+// An update below a run (TPC-H q22: a computed column, then a filter on it)
+// joins the streamed run (`Plan::stream_only_bottom_updates`): one scan
+// pipeline computes, filters and projects each unit. Before, the update
+// streamed alone and a second, materialized run drained its output to
+// morselize the filter.
+TEST_CASE("Scan pipeline streams an update below its run", "[runtime][parallel][pipeline]") {
+    auto state = std::make_shared<PipelineReaderState>();
+    auto deferred = make_pipeline_deferred(state);
+    const runtime::TableRegistry empty;
+    auto ir = require_ir("df[update { y = x * 2 }][filter y > 1000][select { x, y }];");
+    REQUIRE(runtime::physical::plan_physical(*ir, empty, nullptr).stream_only_bottom_updates == 1);
+
+    const auto run = [&](bool stream, runtime::ParallelPipelineStats& stats) {
+        runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+        exec.parallel_threads = 4;
+        exec.parallel_min_rows = 0;
+        exec.parallel_min_cells = 0;
+        exec.parallel_grain = 256;
+        exec.parallel_stats = &stats;
+        exec.stream_scans = stream;
+        auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
+        INFO((out.has_value() ? std::string{} : out.error()));
+        REQUIRE(out.has_value());
+        const auto* x = std::get_if<Column<std::int64_t>>(out->find("x"));
+        const auto* y = std::get_if<Column<std::int64_t>>(out->find("y"));
+        REQUIRE(x != nullptr);
+        REQUIRE(y != nullptr);
+        REQUIRE(out->columns.size() == 2);
+        return std::pair{std::vector<std::int64_t>(x->begin(), x->end()),
+                         std::vector<std::int64_t>(y->begin(), y->end())};
+    };
+    std::vector<std::int64_t> expected_x;
+    std::vector<std::int64_t> expected_y;
+    for (std::int64_t row = 501; row < 4000; ++row) {
+        expected_x.push_back(row);
+        expected_y.push_back(row * 2);
+    }
+
+    runtime::ParallelPipelineStats streamed_stats;
+    const auto streamed = run(true, streamed_stats);
+    CHECK(streamed.first == expected_x);
+    CHECK(streamed.second == expected_y);
+    CHECK(streamed_stats.pipelined_scans.load() == 1);
+    // One pipeline, the stream itself: no materialized run above it draining
+    // and re-splitting its output (that shape counted two).
+    CHECK(streamed_stats.parallel_pipelines.load() == 1);
+    CHECK(streamed_stats.serial_pipelines.load() == 0);
+
+    // Not streamed, the update comes back out and is the run's input again.
+    state->allow_whole_decode = true;
+    runtime::ParallelPipelineStats unstreamed_stats;
+    const auto whole = run(false, unstreamed_stats);
+    CHECK(whole.first == expected_x);
+    CHECK(whole.second == expected_y);
+    CHECK(unstreamed_stats.pipelined_scans.load() == 0);
+    CHECK(unstreamed_stats.parallel_pipelines.load() == 1);
+}
+
 // A multi-key Categorical group-by must keep a key value that first appears in
 // a later chunk. Growing the FIRST key's dictionary adds cells without moving
 // any stride, and the dense cell index was only rebuilt on a stride change: the

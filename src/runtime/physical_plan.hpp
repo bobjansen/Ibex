@@ -550,6 +550,14 @@ struct Plan {
     /// update always runs over a materialized table (see
     /// `execution_capability(const ir::Node&)` for why).
     std::size_t stream_only_updates = 0;
+    /// The same at the BOTTOM of the run, `[parallel_end -
+    /// stream_only_bottom_updates, parallel_end)`: row-local updates between
+    /// the run and a lazy source (`df[update ...][filter ...]`). Streamed, a
+    /// worker computes them over its unit before the rest of the run. Not
+    /// streamed, the executor takes them back out and the topmost becomes the
+    /// run's input, which is where the run would otherwise have stopped. TPC-H
+    /// q22's `in_scope` drained a streamed update only to morselize it again.
+    std::size_t stream_only_bottom_updates = 0;
     std::vector<ColumnKernelSignature> source_signature;
     const ir::Node* root = nullptr;
     /// Set when `root` is a `Join`. Streaming joins are migrated and consumed

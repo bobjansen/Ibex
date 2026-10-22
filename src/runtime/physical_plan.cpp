@@ -444,7 +444,9 @@ auto fusible_chain_below(const ir::Node& node) -> FusibleChain {
 
 /// Extend a run that reaches a lazy source upward over the row-local updates
 /// directly above it, recording them as `stream_only_updates`. With no run at
-/// all, the updates at the bottom of the chain form one of their own.
+/// all, the updates at the bottom of the chain form one of their own. A run
+/// bounded from below only by such updates first reaches down through them
+/// (`stream_only_bottom_updates`).
 ///
 /// Only a lazy source can stream, and only a run that reaches it is the one
 /// that streams -- a run bounded from below by another step materializes that
@@ -456,7 +458,14 @@ void admit_stream_only_updates(Plan& plan, bool found_run) {
         return;
     }
     if (found_run && plan.parallel_end != plan.steps.size()) {
-        return;
+        const bool updates_to_source = std::all_of(
+            plan.steps.begin() + static_cast<std::ptrdiff_t>(plan.parallel_end), plan.steps.end(),
+            [](const MapStep& step) { return is_stream_admissible_update(*step.node); });
+        if (!updates_to_source) {
+            return;
+        }
+        plan.stream_only_bottom_updates = plan.steps.size() - plan.parallel_end;
+        plan.parallel_end = plan.steps.size();
     }
     std::size_t begin = found_run ? plan.parallel_begin : plan.steps.size();
     std::size_t admitted = 0;
@@ -917,6 +926,11 @@ auto explain_physical(const Plan& plan) -> std::string {
         if (plan.stream_only_updates > 0) {
             out += "; top ";
             out += std::to_string(plan.stream_only_updates);
+            out += " update(s) only when streamed";
+        }
+        if (plan.stream_only_bottom_updates > 0) {
+            out += "; bottom ";
+            out += std::to_string(plan.stream_only_bottom_updates);
             out += " update(s) only when streamed";
         }
         out += ')';

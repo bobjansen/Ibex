@@ -201,7 +201,12 @@ says so.
    (`679cbe54`, q13 -18.6%) and the right side streams into the counter a
    chunk at a time (`d1b71845`, a further -19.2%): q13 ~570 -> ~400 ms, about
    the time to decode and filter `orders`. Its declined fallback had been
-   failing outright (`796f6b0c`).
+   failing outright (`796f6b0c`). q09's drain (the `orders` join's deferred probe, 3.26M
+   lineitem-join rows) stays: its copy is ~13 ms, and the barrier is what lets
+   the `orders` scan decode only the 2.93M rows that can match. After it come
+   ~6 ms of filter publication, ~51 ms of two-phase selection and ~42 ms of
+   build; overlapping those with the lineitem stream would buy nothing, as
+   the stream keeps the pool 90-94% occupied (2026-10-22).
 4. **Semi/anti joins as probe steps** (q04, q21, q22).
 5. **Retire Layer B probe morsels** (`try_take_join_probe`,
    `build_probe_morsel_pipeline`, `IBEX_PROBE_MORSELS`), and rewrite

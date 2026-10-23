@@ -396,3 +396,77 @@ TEST_CASE("categorical first and last keep codes, and survive a dictionary chang
         CHECK(l.dictionary_ptr() == shared_dict);
     }
 }
+
+// A global (no `by`) First/Last over text keeps the first and the last non-null
+// value, across chunks as well as within one. The ungrouped text path once
+// overwrote on every row -- First answered Last -- and had no Last at all, so
+// Last was null.
+TEST_CASE("global text first and last keep the first and last non-null value",
+          "[aggregate][audit]") {
+    const bool categorical = GENERATE(false, true);
+    const bool with_nulls = GENERATE(false, true);
+    const bool chunked = GENERATE(false, true);
+    // Values: x y z | w v; with nulls the first row of each chunk and the last
+    // row overall are null, so the answers move to y and w.
+    const std::vector<std::vector<std::string>> parts{{"x", "y", "z"}, {"w", "v"}};
+    const auto make_chunk = [&](const std::vector<std::string>& values, bool last_part) {
+        runtime::Chunk c;
+        if (categorical) {
+            Column<Categorical> v;
+            for (const auto& s : values) {
+                v.push_back(s);
+            }
+            c.add_column("v", std::move(v));
+        } else {
+            Column<std::string> v;
+            for (const auto& s : values) {
+                v.push_back(s);
+            }
+            c.add_column("v", std::move(v));
+        }
+        if (with_nulls) {
+            c.columns[0].validity = runtime::ValidityBitmap(values.size(), true);
+            c.columns[0].validity->set(0, false);
+            if (last_part) {
+                c.columns[0].validity->set(values.size() - 1, false);
+            }
+        }
+        return c;
+    };
+    std::vector<runtime::Chunk> chunks;
+    if (chunked) {
+        chunks.push_back(make_chunk(parts[0], false));
+        chunks.push_back(make_chunk(parts[1], true));
+    } else {
+        // One chunk: the nulls land on rows 0 and 4 only.
+        auto c = make_chunk({"x", "y", "z", "w", "v"}, true);
+        chunks.push_back(std::move(c));
+    }
+    const std::vector<ir::ColumnRef> keys;
+    const std::vector<ir::AggSpec> aggs{
+        {.func = ir::AggFunc::First, .column = {.name = "v"}, .alias = "f"},
+        {.func = ir::AggFunc::Last, .column = {.name = "v"}, .alias = "l"}};
+    auto out = aggregate_chunks(std::move(chunks), keys, aggs);
+    REQUIRE(out.has_value());
+    REQUIRE(out->rows() == 1);
+    const auto text = [&](const char* name) -> std::string {
+        const auto& col = *out->find(name);
+        if (const auto* cat = std::get_if<Column<Categorical>>(&col)) {
+            return std::string((*cat)[0]);
+        }
+        return std::string(std::get<Column<std::string>>(col)[0]);
+    };
+    CHECK_FALSE(runtime::is_null(*out->find_entry("f"), 0));
+    CHECK_FALSE(runtime::is_null(*out->find_entry("l"), 0));
+    if (!with_nulls) {
+        CHECK(text("f") == "x");
+        CHECK(text("l") == "v");
+    } else if (chunked) {
+        // Chunk 1 is (null) y z, chunk 2 is (null) (null): w is null too.
+        CHECK(text("f") == "y");
+        CHECK(text("l") == "z");
+    } else {
+        CHECK(text("f") == "y");
+        CHECK(text("l") == "w");
+    }
+}

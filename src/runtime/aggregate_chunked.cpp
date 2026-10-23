@@ -7415,11 +7415,34 @@ class HashAggregateState final {
                             slot.mark_present();
                         }
                     });
-                } else if (func == ir::AggFunc::First) {
-                    each([&](std::size_t r) {
-                        text_at(agg_i) = value_at(r);
+                } else if (func == ir::AggFunc::First || func == ir::AggFunc::Last) {
+                    // The range's first non-null value, unless an earlier range
+                    // already gave one; or its last non-null value. One string
+                    // copied either way. (This used to overwrite on every row,
+                    // which made First answer Last, and had no Last at all.)
+                    const auto valid = [&](std::size_t row) {
+                        return !has_nulls || (*validity)[row];
+                    };
+                    std::optional<std::size_t> pick;
+                    if (func == ir::AggFunc::First) {
+                        for (std::size_t row = begin; row < end && !slot.present(); ++row) {
+                            if (valid(row)) {
+                                pick = row;
+                                break;
+                            }
+                        }
+                    } else {
+                        for (std::size_t row = end; row > begin; --row) {
+                            if (valid(row - 1)) {
+                                pick = row - 1;
+                                break;
+                            }
+                        }
+                    }
+                    if (pick.has_value()) {
+                        text_at(agg_i) = value_at(*pick);
                         slot.mark_present();
-                    });
+                    }
                 }
             }
         }

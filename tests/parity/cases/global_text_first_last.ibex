@@ -1,0 +1,5 @@
+// A global (no `by`) first/last over text: the first and the last value, in
+// the generated C++ as in the interpreter. The ungrouped text path once made
+// first answer last and left last null.
+let t = Table { s = ["x", "y", "z"], k = [1, 2, 3] };
+t[select { f = first(s), l = last(s), n = count() }];

@@ -343,11 +343,11 @@ auto as_timeframe(const runtime::Table& t, const std::string& column) -> runtime
     return delegate(std::move(atf_node), t);
 }
 
-auto ascribe(const runtime::Table& t, std::vector<ir::SchemaField> schema, bool open)
-    -> runtime::Table {
+auto ascribe(const runtime::Table& t, std::vector<ir::SchemaField> schema, bool open,
+             bool narrows) -> runtime::Table {
     ir::Builder b;
     auto scan_node = b.scan(kSrcKey);
-    auto asc_node = b.ascribe(std::move(schema), open);
+    auto asc_node = b.ascribe(std::move(schema), open, narrows);
     asc_node->add_child(std::move(scan_node));
     return delegate(std::move(asc_node), t);
 }

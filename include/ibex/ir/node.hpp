@@ -910,8 +910,8 @@ class AsTimeframeNode final : public Node {
 /// Unknown source.
 class AscribeNode final : public Node {
    public:
-    AscribeNode(NodeId id, std::vector<SchemaField> schema, bool open = false)
-        : Node(NodeKind::Ascribe, id), schema_(std::move(schema)), open_(open) {}
+    AscribeNode(NodeId id, std::vector<SchemaField> schema, bool open, bool narrows)
+        : Node(NodeKind::Ascribe, id), schema_(std::move(schema)), open_(open), narrows_(narrows) {}
 
     [[nodiscard]] auto schema() const noexcept -> const std::vector<SchemaField>& {
         return schema_;
@@ -919,6 +919,13 @@ class AscribeNode final : public Node {
     /// True if the ascription was written with a trailing `*` wildcard.
     /// Retained for source/IR fidelity; ascriptions always permit extras.
     [[nodiscard]] auto open() const noexcept -> bool { return open_; }
+
+    /// True for an ascription, typed `let` or declared return type: the result
+    /// keeps only the listed columns (SPEC.md 3.6). False for a function
+    /// parameter's schema, which checks the same contract but keeps the
+    /// caller's extra columns (SPEC.md 10.3) -- a pure check, an identity on
+    /// the data.
+    [[nodiscard]] auto narrows() const noexcept -> bool { return narrows_; }
 
     /// True once `check_ascriptions` has proven this ascription holds against a
     /// statically known input schema. The assertion is about *shape*, so proving
@@ -933,6 +940,7 @@ class AscribeNode final : public Node {
    private:
     std::vector<SchemaField> schema_;
     bool open_;
+    bool narrows_;
     bool checked_ = false;
 };
 

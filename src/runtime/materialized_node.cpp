@@ -524,7 +524,7 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
             // downstream, so it is not kept to be printed or carried into a
             // join either. An ascription listing no fields narrows nothing.
             const auto narrowed = [&](const Table& input) -> std::expected<Table, std::string> {
-                if (asc.schema().empty()) {
+                if (!asc.narrows() || asc.schema().empty()) {
                     return input;
                 }
                 std::set<std::string> names;

@@ -3594,7 +3594,9 @@ a validation allowance, not a source of dynamically discoverable column names.
 
 This contract is checked at **call time**. A missing required column, or a
 required column with the wrong type, is a call-time error that names the
-parameter and the offending column. The same contract applies to a function's
+parameter and the offending column. When the argument's schema is statically
+known and closed, a violation is reported while lowering instead, exactly as
+for an ascription (Section 3.6). The same contract applies to a function's
 declared **return type**: the value produced by the body is validated against
 the return schema on the same minimum-required-columns basis, and then
 narrowed to the declared columns as an ascription is (Section 3.6), because

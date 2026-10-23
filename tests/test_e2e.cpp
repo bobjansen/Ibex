@@ -262,6 +262,25 @@ TEST_CASE("E2E: a typed let checks and narrows like an ascription", "[e2e][ascri
     CHECK(err.find("missing column 'salary'") != std::string::npos);
 }
 
+TEST_CASE("E2E: an inlined function checks its parameter schemas", "[e2e][ascribe][udf]") {
+    // The statement path checked these at call time; the whole-script lowering
+    // inlined the call without any check. Extras still pass through.
+    auto tables = make_trades();
+    // A registry table's schema is unknown statically: the check runs on the data.
+    auto err = run_error("fn pay(t: DataFrame<{ salary: Int64 }>) -> DataFrame { t; }\npay(trades);",
+                         tables);
+    CHECK(err.find("missing column 'salary'") != std::string::npos);
+    auto ok = run("fn px(t: DataFrame<{ price: Int64 }>) -> DataFrame { t; }\npx(trades);", tables);
+    CHECK(ok.find("symbol") != nullptr);
+    // A statically known argument is rejected while lowering, naming the parameter.
+    auto parsed = parser::parse(
+        "fn pay(t: DataFrame<{ salary: Int64 }>) -> DataFrame { t; }\npay(Table { a = [1] });");
+    REQUIRE(parsed.has_value());
+    auto lowered = parser::lower(*parsed);
+    REQUIRE_FALSE(lowered.has_value());
+    CHECK(lowered.error().message.find("pay: parameter 't'") != std::string::npos);
+}
+
 TEST_CASE("E2E: a declared extern return schema narrows the call's result",
           "[e2e][ascribe]") {
     auto tables = make_trades();

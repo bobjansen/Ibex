@@ -107,7 +107,8 @@ auto clone_node_shallow(const Node& node, std::uint64_t& next) -> NodePtr {
         }
         case NodeKind::Ascribe: {
             const auto& ascribe = node_cast<AscribeNode>(node);
-            return std::make_unique<AscribeNode>(id, ascribe.schema(), ascribe.open());
+            return std::make_unique<AscribeNode>(id, ascribe.schema(), ascribe.open(),
+                                                 ascribe.narrows());
         }
         case NodeKind::Join: {
             const auto& join = node_cast<JoinNode>(node);

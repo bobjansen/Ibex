@@ -659,7 +659,11 @@ auto fuse_checked_ascriptions(NodePtr root) -> NodePtr {
         return root;
     }
     const auto& asc = node_cast<AscribeNode>(*root);
-    if (!asc.checked() || kids.size() != 1 || kids.front() == nullptr ||
+    // A proven parameter check is an identity on the data: nothing to keep.
+    if (asc.checked() && !asc.narrows() && kids.size() == 1 && kids.front() != nullptr) {
+        return std::move(kids.front());
+    }
+    if (!asc.checked() || !asc.narrows() || kids.size() != 1 || kids.front() == nullptr ||
         kids.front()->kind() != NodeKind::Scan) {
         return root;
     }
@@ -1181,6 +1185,11 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             // with "no" is not a reason to answer the second with it.
             const auto& asc = node_cast<AscribeNode>(node);
             const SchemaInfo input = child_schema(node, sources);
+            if (!asc.narrows()) {
+                // A parameter check keeps every column: the caller can still
+                // name its extras, so the input's schema is the result's.
+                return input.is_known() ? input : SchemaInfo::known(asc.schema(), /*open=*/true);
+            }
             std::vector<SchemaField> out = asc.schema();
             for (auto& field : out) {
                 if (const auto* from_input = input.find(field.name)) {

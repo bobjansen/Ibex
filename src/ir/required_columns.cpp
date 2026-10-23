@@ -444,7 +444,8 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
         // column asserts its shape, it does not ask for data.
         case NodeKind::Ascribe: {
             const auto& asc = node_cast<AscribeNode>(node);
-            const ColumnDemand narrowed = narrow_to_ascribed(need, asc.schema());
+            const ColumnDemand narrowed =
+                asc.narrows() ? narrow_to_ascribed(need, asc.schema()) : need;
             if (asc.checked()) {
                 // Already proven against the input's schema, so it reads nothing
                 // at all: pass the parent's demand straight through.

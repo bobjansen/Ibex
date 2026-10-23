@@ -1030,7 +1030,8 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 }
                 *out_ << "}";
             }
-            *out_ << "}, " << (asc.open() ? "true" : "false") << ");\n";
+            *out_ << "}, " << (asc.open() ? "true" : "false") << ", "
+                  << (asc.narrows() ? "true" : "false") << ");\n";
             return var;
         }
 

@@ -113,9 +113,11 @@ class Builder {
     /// wildcard schema and an exact one, and a caller that forgets it silently
     /// gets the stricter meaning instead of a compile error. The IR clone in
     /// lower.cpp did exactly that, turning `as { a: Int, * }` into `as { a: Int }`
-    /// on every cloned reference.
-    [[nodiscard]] auto ascribe(std::vector<SchemaField> schema, bool open) -> NodePtr {
-        return std::make_unique<AscribeNode>(next_id(), std::move(schema), open);
+    /// on every cloned reference. `narrows` is required for the same reason: a
+    /// clone that dropped it would turn a parameter check into a narrowing.
+    [[nodiscard]] auto ascribe(std::vector<SchemaField> schema, bool open, bool narrows)
+        -> NodePtr {
+        return std::make_unique<AscribeNode>(next_id(), std::move(schema), open, narrows);
     }
 
     [[nodiscard]] auto columns() -> NodePtr { return std::make_unique<ColumnsNode>(next_id()); }

@@ -1,0 +1,6 @@
+// A function parameter's table schema is checked but keeps the caller's extra
+// columns (SPEC.md 10.3), unlike a return type, which narrows. Interpreter and
+// generated C++ must agree on the surviving columns.
+fn by_tag(t: DataFrame<{ price: Float64 }>) -> DataFrame { t[order { price desc }]; }
+let wide = Table { id = [1, 2, 3], price = [10.0, 30.0, 20.0], tag = ["a", "b", "c"] };
+by_tag(wide);

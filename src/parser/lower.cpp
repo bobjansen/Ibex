@@ -2604,7 +2604,7 @@ class Lowerer {
         if (!base.has_value()) {
             return base;
         }
-        return ascribe_lowered(std::move(base.value()), ascribe.type);
+        return ascribe_lowered(std::move(base.value()), ascribe.type, /*narrows=*/true);
     }
 
     /// A declared table type over an already lowered plan: `let t: DataFrame<{...}>`
@@ -2620,10 +2620,22 @@ class Lowerer {
             schema == nullptr || schema->fields.empty()) {
             return base;
         }
-        return ascribe_lowered(std::move(base), type);
+        return ascribe_lowered(std::move(base), type, /*narrows=*/true);
     }
 
-    auto ascribe_lowered(ir::NodePtr lowered_base, const Type& type) -> LowerResult {
+    /// A function parameter's declared table type over the lowered argument:
+    /// the same check as an ascription, but the caller's extra columns are kept
+    /// (SPEC.md 10.3). The whole-script planner used to skip it, so a call
+    /// missing a declared column ran; the statement path rejects it.
+    auto checked_parameter(ir::NodePtr argument, const Type& type) -> LowerResult {
+        const auto* schema = std::get_if<SchemaType>(&type.arg);
+        if (schema == nullptr || schema->fields.empty()) {
+            return argument;
+        }
+        return ascribe_lowered(std::move(argument), type, /*narrows=*/false);
+    }
+
+    auto ascribe_lowered(ir::NodePtr lowered_base, const Type& type, bool narrows) -> LowerResult {
         LowerResult base = std::move(lowered_base);
         const auto* schema_type = std::get_if<SchemaType>(&type.arg);
         std::vector<ir::SchemaField> fields;
@@ -2655,7 +2667,7 @@ class Lowerer {
                 }
             }
         }
-        auto node = builder_.ascribe(std::move(fields), open);
+        auto node = builder_.ascribe(std::move(fields), open, narrows);
         node->add_child(std::move(base.value()));
         return node;
     }
@@ -4348,8 +4360,17 @@ class Lowerer {
             if (param.type.kind == Type::Kind::DataFrame ||
                 param.type.kind == Type::Kind::TimeFrame) {
                 auto lowered = lower_expr(*arg);
+                if (lowered.has_value()) {
+                    lowered = checked_parameter(std::move(lowered.value()), param.type);
+                }
                 if (!lowered.has_value()) {
                     cleanup();
+                    if (lowered.error().message.starts_with("schema ascription: ")) {
+                        return std::unexpected(LowerError{
+                            .message = fn.name + ": parameter '" + param.name + "': " +
+                                       lowered.error().message.substr(
+                                           std::string_view("schema ascription: ").size())});
+                    }
                     return lowered;
                 }
                 shadow(param.name, std::move(lowered.value()));
@@ -6872,7 +6893,7 @@ class Lowerer {
             }
             case ir::NodeKind::Ascribe: {
                 const auto& asc = ir::node_cast<ir::AscribeNode>(node);
-                clone = builder_.ascribe(asc.schema(), asc.open());
+                clone = builder_.ascribe(asc.schema(), asc.open(), asc.narrows());
                 break;
             }
             case ir::NodeKind::Columns: {

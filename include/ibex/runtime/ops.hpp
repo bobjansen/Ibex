@@ -219,8 +219,9 @@ void forward_cli_args(int argc, char** argv);
 [[nodiscard]] auto as_timeframe(const runtime::Table& t, const std::string& column)
     -> runtime::Table;
 
-[[nodiscard]] auto ascribe(const runtime::Table& t, std::vector<ir::SchemaField> schema, bool open)
-    -> runtime::Table;
+/// `narrows` defaults to true so C++ emitted before it existed still compiles.
+[[nodiscard]] auto ascribe(const runtime::Table& t, std::vector<ir::SchemaField> schema, bool open,
+                           bool narrows = true) -> runtime::Table;
 
 [[nodiscard]] auto columns(const runtime::Table& t) -> runtime::Table;
 

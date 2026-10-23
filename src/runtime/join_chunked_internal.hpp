@@ -130,6 +130,11 @@ struct DeferredProbeScan {
 [[nodiscard]] auto streamed_left_scan_of(const ir::Node& left, const ExecutionContext& exec)
     -> const DeferredScan*;
 
+/// Publish a membership filter (and bounds) over `build`'s valid `key_name`
+/// values into `slot`: what an inner join hands its streamed left scan.
+void publish_join_key_filter(const Table& build, const std::string& key_name,
+                             DynamicScanFilter& slot);
+
 /// Pipeline-owned adapter supplied by chunked.cpp. It may morselize an already
 /// materialized probe side before attaching worker-private probes.
 [[nodiscard]] auto make_join_probe_operator(OperatorPtr source,
@@ -156,8 +161,8 @@ struct DeferredProbeScan {
 /// the swapped build then probes right chunks on the workers that decode them.
 [[nodiscard]] auto make_chunked_semi_anti_join_operator(
     OperatorPtr left, OperatorPtr right, ir::JoinKind kind, const std::vector<ir::JoinKey>* keys,
-    const ExecutionContext* exec, const std::shared_ptr<ScanWorkerSink>& scan_sink = nullptr)
-    -> OperatorPtr;
+    const ExecutionContext* exec, const std::shared_ptr<ScanWorkerSink>& scan_sink = nullptr,
+    const DeferredScan* left_stream = nullptr) -> OperatorPtr;
 
 /// A scan-worker sink for `make_chunked_semi_anti_join_operator`.
 [[nodiscard]] auto make_semi_anti_scan_sink() -> std::shared_ptr<ScanWorkerSink>;

@@ -514,6 +514,19 @@ TEST_CASE("streamed_join_left_scans: the left scan of a single-key inner join",
     left_join->add_child(make_scan("small"));
     CHECK(ir::streamed_join_left_scans(*left_join, {"t"}).empty());
 
+    // A single-key semi join fills the slot too (its left keeps only rows the
+    // right matches); an anti join keeps the others and does not.
+    auto semi = std::make_unique<ir::JoinNode>(ir::NodeId{20}, ir::JoinKind::Semi,
+                                               std::vector<ir::JoinKey>{ir::JoinKey{"id"}});
+    semi->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
+    semi->add_child(make_scan("small"));
+    CHECK(ir::streamed_join_left_scans(*semi, {"t"}).contains("t"));
+    auto anti = std::make_unique<ir::JoinNode>(ir::NodeId{20}, ir::JoinKind::Anti,
+                                               std::vector<ir::JoinKey>{ir::JoinKey{"id"}});
+    anti->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
+    anti->add_child(make_scan("small"));
+    CHECK(ir::streamed_join_left_scans(*anti, {"t"}).empty());
+
     // A Filter between the scan and the join: dropping rows at the scan would
     // not commute with it, exactly as for a probe.
     ir::Expr predicate{

@@ -2102,6 +2102,13 @@ auto run_streamed_two_phase_unit(const StreamedTwoPhaseShared& shared, JoinProbe
 /// `join_table_impl`.
 class ChunkedInnerJoinOperator final : public Operator {
    public:
+    /// The streamed-left filter over `key_name`'s valid values, shared with the
+    /// semi join (`publish_join_key_filter`).
+    static void publish_key_filter(const Table& build, const std::string& key_name,
+                                   DynamicScanFilter& slot) {
+        publish_build_filter_column(build, key_name, slot);
+    }
+
     ChunkedInnerJoinOperator(OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys,
                              const ExecutionContext& exec, ir::JoinSuffixPolicy suffix = {},
                              const std::vector<ir::OrderKey>* pending_order = nullptr,
@@ -3555,6 +3562,11 @@ auto build_hash_probe_operator(HashProbeInput input) -> std::expected<OperatorPt
 auto deferred_probe_scan_of(const ir::Node& right, const ExecutionContext& exec)
     -> DeferredProbeScan {
     return deferred_probe_scan_impl(right, exec);
+}
+
+void publish_join_key_filter(const Table& build, const std::string& key_name,
+                             DynamicScanFilter& slot) {
+    ChunkedInnerJoinOperator::publish_key_filter(build, key_name, slot);
 }
 
 auto streamed_left_scan_of(const ir::Node& left, const ExecutionContext& exec)

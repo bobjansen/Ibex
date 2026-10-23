@@ -453,6 +453,17 @@ auto is_probe_shaped_join(const JoinNode& join) -> bool {
            join.children()[1] != nullptr;
 }
 
+/// A semi join the runtime streams (`is_streamable_semi_anti_join` in
+/// semi_anti_join.cpp) and fills a left slot from: one key, `nulls never`, no
+/// predicate. Keep in step with `ChunkedSemiAntiJoinOperator::publish_left_stream_filter`.
+auto is_slot_shaped_semi_join(const JoinNode& join) -> bool {
+    return join.kind() == JoinKind::Semi && join.keys().size() == 1 &&
+           join.null_match() == NullMatch::Never && join.take() == MatchSelection::All &&
+           !join.expect().asserts_anything() && !join.predicate().has_value() &&
+           join.children().size() == 2 && join.children()[0] != nullptr &&
+           join.children()[1] != nullptr;
+}
+
 /// Replace the single `Scan` at the bottom of a verified probe chain (only
 /// row-local Project / Rename / Update above it) with one named `instance`.
 void rename_chain_scan(NodePtr& node, const std::string& instance) {
@@ -784,8 +795,12 @@ auto streamed_join_left_scans(const Node& root, const std::set<std::string>& sou
         if (node.kind() == NodeKind::Join) {
             const auto& join = node_cast<JoinNode>(node);
             // The same shape a deferred probe needs, with one key: the runtime
-            // fills the slot only from its streaming single-key inner join.
-            if (is_probe_shaped_join(join) && join.keys().size() == 1) {
+            // fills the slot only from its streaming single-key inner join and
+            // its streaming single-key semi join (whose left keeps only rows
+            // the right's keys match, so the same filter is sound for it; an
+            // anti join keeps the others and gets no slot).
+            if ((is_probe_shaped_join(join) || is_slot_shaped_semi_join(join)) &&
+                join.keys().size() == 1) {
                 if (auto match = match_probe_chain(*join.children()[0], join.keys().front().left);
                     match.has_value() && sources.contains(match->first)) {
                     if (const auto count = counts.find(match->first);

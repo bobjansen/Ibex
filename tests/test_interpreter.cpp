@@ -19668,6 +19668,75 @@ TEST_CASE("A streamed left input is filtered by the join's built right side",
     }
 }
 
+TEST_CASE("A streamed semi join left input is filtered by its right keys",
+          "[runtime][join][semi][stream_filter]") {
+    // The semi join drains its small right side (keys 0..9 and a null) and
+    // fills the left scan's slot before pulling a left row: 160 of the 8000
+    // left rows can match. An anti join keeps the other rows, so it must leave
+    // the slot alone and decode everything.
+    runtime::Table right;
+    right.add_column("k", Column<std::int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0},
+                     runtime::ValidityBitmap{true, true, true, true, true, true, true, true,
+                                             true, true, false});
+    runtime::TableRegistry registry;
+    registry.emplace("right_t", std::move(right));
+
+    const auto run = [&](const char* query, bool with_slot, std::size_t threads) {
+        auto ir = require_ir(query);
+        auto state = std::make_shared<StreamLeftState>();
+        runtime::Table schema;
+        schema.add_column("k", Column<std::int64_t>{});
+        schema.add_column("payload", Column<std::int64_t>{});
+        auto lazy = std::make_shared<runtime::LazyTable>(
+            std::move(schema), StreamLeftReader::kUnits * StreamLeftReader::kUnitRows,
+            [state]() -> std::expected<runtime::LazySourceReaderPtr, std::string> {
+                return runtime::LazySourceReaderPtr{std::make_unique<StreamLeftReader>(state)};
+            });
+        auto slot = with_slot ? std::make_shared<runtime::DynamicScanFilter>() : nullptr;
+        runtime::DeferredScanRegistry deferred;
+        deferred.emplace("left_t", runtime::DeferredScan{
+                                       .lazy = std::move(lazy),
+                                       .conjuncts = {},
+                                       .demand = {"k", "payload"},
+                                       .demand_all = false,
+                                       .key_column = with_slot ? "k" : "",
+                                       .filter = nullptr,
+                                       .stream_filter = slot,
+                                   });
+        runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+        exec.parallel_threads = threads;
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        return std::tuple{std::move(*out), state, slot};
+    };
+
+    for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+        CAPTURE(threads);
+        {
+            auto [filtered, state, slot] = run("left_t semi join right_t on k;", true, threads);
+            auto [unfiltered, plain_state, no_slot] =
+                run("left_t semi join right_t on k;", false, threads);
+            REQUIRE(slot != nullptr);
+            CHECK(slot->ready);
+            CHECK(slot->has_membership());
+            CHECK(state->payload_rows.load() == 160);
+            CHECK(plain_state->payload_rows.load() == 8000);
+            REQUIRE(filtered.rows() == 160);
+            CHECK_FALSE(runtime::compare_tables(unfiltered, filtered).has_value());
+        }
+        {
+            auto [kept, state, slot] = run("left_t anti join right_t on k;", true, threads);
+            auto [plain, plain_state, no_slot] =
+                run("left_t anti join right_t on k;", false, threads);
+            REQUIRE(slot != nullptr);
+            CHECK_FALSE(slot->has_membership());
+            CHECK(state->payload_rows.load() == 8000);
+            REQUIRE(kept.rows() == 8000 - 160);
+            CHECK_FALSE(runtime::compare_tables(plain, kept).has_value());
+        }
+    }
+}
+
 TEST_CASE("Inner join probe fans out across workers and matches the serial probe",
           "[runtime][parallel][join]") {
     // Above the parallel probe's 1<<14 row gate so the fan-out actually

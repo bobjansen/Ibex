@@ -175,6 +175,9 @@ struct DeferrableProbeScan {
 /// Project / Rename / row-local Update only, and occur once in `root`: source
 /// name -> the join key in the scan's own column names.
 ///
+/// A single-key semi join qualifies too: its left keeps only rows whose key
+/// the right holds, so the same filter is sound for it.
+///
 /// The join builds on its right side when that side is small, then streams the
 /// left through it; the scan named here gets a filter slot
 /// (`runtime::DeferredScan::stream_filter`) the join fills with the built

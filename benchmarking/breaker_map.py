@@ -51,9 +51,15 @@ parallel one that runs for 370.
 Usage:
     python benchmarking/breaker_map.py [cores]        # default 8
     python benchmarking/breaker_map.py 8 --queries q01,q21
+    IBEX_STREAM_PROBES=0 python benchmarking/breaker_map.py 8
+
+ibex_eval runs in a clean environment, but every IBEX_* variable and
+GLIBC_TUNABLES set when this script starts is passed through (the report's
+header lists them), so a mode switch like IBEX_STREAM_PROBES takes effect.
 """
 
 import collections
+import os
 import pathlib
 import re
 import subprocess
@@ -110,10 +116,21 @@ def classify(label: str) -> tuple[str, str]:
     return "other", "unknown"
 
 
+# The caller's engine switches. Everything else stays out, so the runs do not
+# depend on the shell they were started from.
+PASSED_ENV = {
+    key: value
+    for key, value in os.environ.items()
+    if (key.startswith("IBEX_") or key == "GLIBC_TUNABLES")
+    and key not in ("IBEX_PROFILE_OPERATORS", "IBEX_CORES")
+}
+
+
 def run(query: pathlib.Path, cores: str) -> str:
     env = {
         "PATH": "/usr/bin:/bin",
         "HOME": str(pathlib.Path.home()),
+        **PASSED_ENV,
         "IBEX_PROFILE_OPERATORS": "1",
         "IBEX_CORES": cores,
     }
@@ -229,11 +246,17 @@ def is_reliable(closure: float, unqueued: float) -> bool:
 
 
 def main() -> int:
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    args = []
     only = None
-    for arg in sys.argv[1:]:
-        if arg.startswith("--queries="):
-            only = set(arg.split("=", 1)[1].split(","))
+    argv = iter(sys.argv[1:])
+    for arg in argv:
+        # `--queries=q01,q21` or `--queries q01,q21`; the second form used to
+        # be read as a positional and silently ran the whole suite.
+        if arg.startswith("--queries"):
+            value = arg.split("=", 1)[1] if "=" in arg else next(argv, "")
+            only = set(value.split(","))
+        elif not arg.startswith("--"):
+            args.append(arg)
     cores = args[0] if args else "8"
     if not EVAL.exists():
         print(f"missing {EVAL} -- build the release target first", file=sys.stderr)
@@ -244,6 +267,8 @@ def main() -> int:
 
     print(bench_env.scale_factor_line())
     print(f"# PDS-H, IBEX_CORES={cores}, build-release, second run of two")
+    passed = " ".join(f"{k}={v}" for k, v in sorted(PASSED_ENV.items())) or "(none)"
+    print(f"# passed through: {passed}")
     print("# idle_core_ms = self_ms * workers - pool_work_ms (capacity this operator left idle)")
 
     per_family = collections.defaultdict(float)

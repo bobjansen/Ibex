@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -304,4 +306,93 @@ TEST_CASE("serial int64 aggregate defers its index until a key goes backwards",
                      : 1U;
     }
     CHECK(wrong == 0);
+}
+
+// A grouped First/Last over a Categorical keeps the input's codes in its slots
+// and emits them against the input's dictionary, as long as every chunk shares
+// that dictionary. A chunk over another dictionary sends the aggregate back to
+// boxed strings, decoding what it already held -- the answer must not move.
+TEST_CASE("categorical first and last keep codes, and survive a dictionary change",
+          "[aggregate][audit][categorical]") {
+    const bool with_nulls = GENERATE(false, true);
+    const bool second_dictionary = GENERATE(false, true);
+    using Cat = Column<Categorical>;
+    const auto shared_dict =
+        std::make_shared<std::vector<std::string>>(std::vector<std::string>{"a", "b", "c", "d", "e"});
+    const auto shared_index = std::make_shared<Cat::index_map>();
+    for (std::size_t i = 0; i < shared_dict->size(); ++i) {
+        shared_index->emplace((*shared_dict)[i], static_cast<Cat::code_type>(i));
+    }
+    // Rows: k = 1 2 1 3 | 2 1 3 4, v = a b x x | c d x e, where x is null when
+    // `with_nulls` and otherwise the value named in `filler`.
+    const std::vector<std::int64_t> k1{1, 2, 1, 3};
+    const std::vector<std::int64_t> k2{2, 1, 3, 4};
+    const std::vector<std::string> v1{"a", "b", "c", "e"};
+    const std::vector<std::string> v2{"c", "d", "b", "e"};
+    const auto make_chunk = [&](const std::vector<std::int64_t>& keys,
+                                const std::vector<std::string>& values, bool own_dictionary,
+                                std::vector<bool> valid) {
+        runtime::Chunk c;
+        Column<std::int64_t> k;
+        for (const std::int64_t key : keys) {
+            k.push_back(key);
+        }
+        c.add_column("k", std::move(k));
+        Cat v = own_dictionary
+                    ? Cat{}
+                    : Cat{shared_dict, shared_index, Cat::codes_storage{}};
+        for (const auto& value : values) {
+            v.push_back(value);
+        }
+        c.add_column("v", std::move(v));
+        if (with_nulls) {
+            c.columns[1].validity = runtime::ValidityBitmap(valid.size(), true);
+            for (std::size_t row = 0; row < valid.size(); ++row) {
+                c.columns[1].validity->set(row, valid[row]);
+            }
+        }
+        return c;
+    };
+    std::vector<runtime::Chunk> chunks;
+    chunks.push_back(make_chunk(k1, v1, false, {true, true, false, false}));
+    chunks.push_back(make_chunk(k2, v2, second_dictionary, {true, true, false, true}));
+    const std::vector<ir::ColumnRef> keys{{.name = "k"}};
+    const std::vector<ir::AggSpec> aggs{
+        {.func = ir::AggFunc::First, .column = {.name = "v"}, .alias = "f"},
+        {.func = ir::AggFunc::Last, .column = {.name = "v"}, .alias = "l"}};
+    auto out = aggregate_chunks(std::move(chunks), keys, aggs);
+    REQUIRE(out.has_value());
+    REQUIRE(out->rows() == 4);
+    for (std::size_t g = 0; g < 4; ++g) {
+        CHECK(ints(*out, "k")[g] == static_cast<std::int64_t>(g + 1));
+    }
+    const auto& f = std::get<Cat>(*out->find("f"));
+    const auto& l = std::get<Cat>(*out->find("l"));
+    if (with_nulls) {
+        const std::vector<std::string> want_f{"a", "b", "", "e"};
+        const std::vector<std::string> want_l{"d", "c", "", "e"};
+        for (std::size_t g = 0; g < 4; ++g) {
+            INFO("group " << g);
+            CHECK(runtime::is_null(*out->find_entry("f"), g) == (g == 2));
+            CHECK(runtime::is_null(*out->find_entry("l"), g) == (g == 2));
+            if (g != 2) {
+                CHECK(std::string(f[g]) == want_f[g]);
+                CHECK(std::string(l[g]) == want_l[g]);
+            }
+        }
+    } else {
+        const std::vector<std::string> want_f{"a", "b", "e", "e"};
+        const std::vector<std::string> want_l{"d", "c", "b", "e"};
+        for (std::size_t g = 0; g < 4; ++g) {
+            INFO("group " << g);
+            CHECK(std::string(f[g]) == want_f[g]);
+            CHECK(std::string(l[g]) == want_l[g]);
+        }
+    }
+    // Over one dictionary the output shares it: the codes were kept, not the
+    // strings re-hashed into a new dictionary.
+    if (!second_dictionary) {
+        CHECK(f.dictionary_ptr() == shared_dict);
+        CHECK(l.dictionary_ptr() == shared_dict);
+    }
 }

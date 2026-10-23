@@ -1837,6 +1837,18 @@ class HashAggregateState final {
                     has_count_distinct_ = true;
                 }
             }
+            // Grouped only: the global aggregate's one group gains nothing.
+            cat_agg_coded_.assign(n_aggs_, 0U);
+            cat_agg_template_.assign(n_aggs_, std::nullopt);
+            if (!group_by_->empty()) {
+                for (std::size_t i = 0; i < n_aggs_; ++i) {
+                    cat_agg_coded_[i] = plan_[i].categorical &&
+                                                (plan_[i].func == ir::AggFunc::First ||
+                                                 plan_[i].func == ir::AggFunc::Last)
+                                            ? 1U
+                                            : 0U;
+                }
+            }
             if (has_count_distinct_) {
                 distinct_.resize(n_aggs_);
                 for (std::size_t i = 0; i < n_aggs_; ++i) {
@@ -1992,6 +2004,7 @@ class HashAggregateState final {
         if (auto err = prepare_chunk(chunk, group_entries, agg_entries)) {
             return err;
         }
+        settle_coded_categoricals(agg_entries);
         if (scan_sink_ != nullptr && !scan_sink_decided_) {
             scan_sink_decided_ = true;
             scan_sink_active_ = on_worker_partial_path();
@@ -6115,7 +6128,8 @@ class HashAggregateState final {
                               const std::vector<std::uint8_t>& seeded) {
         bool has_text = false;
         for (std::size_t a = 0; a < n_aggs_; ++a) {
-            has_text = has_text || (seeded[a] != 0U && plan_[a].kind == ExprType::String);
+            has_text = has_text || (seeded[a] != 0U && plan_[a].kind == ExprType::String &&
+                                    !cat_agg_coded(a));
         }
         if (has_text && text_store_.size() < flat_slots_.size()) {
             text_store_.resize(flat_slots_.size(), ScalarValue{std::string{}});
@@ -6131,6 +6145,8 @@ class HashAggregateState final {
                 slot.int_value = std::get<Column<bool>>(*entry.column)[row] ? 1 : 0;
             } else if (is_temporal(plan_[a].kind)) {
                 slot.int_value = temporal_raw(*entry.column, row);
+            } else if (cat_agg_coded(a)) {
+                slot.int_value = std::get<Column<Categorical>>(*entry.column).code_at(row);
             } else {
                 std::string value;
                 if (plan_[a].categorical) {
@@ -6211,6 +6227,46 @@ class HashAggregateState final {
     ///
     /// This mirrors `try_process_rows_cat_parallel`, which can skip the gid
     /// pass entirely because a Categorical code is already a dense index.
+    /// Whether aggregate `a` keeps Categorical codes in its slots
+    /// (`cat_agg_coded_`).
+    [[nodiscard]] auto cat_agg_coded(std::size_t a) const -> bool {
+        return a < cat_agg_coded_.size() && cat_agg_coded_[a] != 0U;
+    }
+
+    /// Keep each coded aggregate's codes meaningful for the chunk about to be
+    /// accumulated. The first chunk fixes the dictionary; a later chunk over
+    /// the same one changes nothing. A chunk over a DIFFERENT dictionary would
+    /// make its codes mean other strings, so that aggregate goes back to the
+    /// boxed path for good: every group it holds is decoded into
+    /// `text_store_` first, as if it had been boxed all along. The same rule
+    /// the group key store applies to a Categorical key (`Col::code_dict`).
+    void settle_coded_categoricals(const std::vector<const ColumnEntry*>& agg_entries) {
+        for (std::size_t a = 0; a < cat_agg_coded_.size(); ++a) {
+            if (cat_agg_coded_[a] == 0U) {
+                continue;
+            }
+            const auto& column = std::get<Column<Categorical>>(*agg_entries[a]->column);
+            auto& held = cat_agg_template_[a];
+            if (!held.has_value()) {
+                held = std::get<Column<Categorical>>(make_empty_like(*agg_entries[a]->column));
+                continue;
+            }
+            if (held->dictionary_ptr() == column.dictionary_ptr()) {
+                continue;
+            }
+            const auto& dict = held->dictionary();
+            for (std::size_t g = 0; g < n_groups_; ++g) {
+                const std::size_t at = (g * n_aggs_) + a;
+                if (flat_slots_[at].present()) {
+                    text_at(at) =
+                        ScalarValue{dict[static_cast<std::size_t>(flat_slots_[at].int_value)]};
+                }
+            }
+            cat_agg_coded_[a] = 0U;
+            held.reset();
+        }
+    }
+
     /// Can every aggregate be accumulated into a private slot array and merged?
     ///
     /// One definition for all three fused/partial paths. A boxed First/Last
@@ -6917,7 +6973,23 @@ class HashAggregateState final {
                 // both Column<std::string> and Column<Categorical>; the two
                 // share ScalarValue{std::string} as the wire format via
                 // append_scalar, which pushes into a Categorical dictionary
-                // when the target column is Categorical.
+                // when the target column is Categorical -- except a coded
+                // Categorical First/Last, which keeps the code in the slot.
+                if (cat_agg_coded(agg_i)) {
+                    const auto& cats = std::get<Column<Categorical>>(*entry.column);
+                    const bool last = plan_[agg_i].func == ir::AggFunc::Last;
+                    for (std::size_t row = begin; row < rows; ++row) {
+                        if (has_nulls && !(*validity)[row]) {
+                            continue;
+                        }
+                        auto& slot = slot_for(gids[row]);
+                        if (last || !slot.present()) {
+                            slot.int_value = cats.code_at(row);
+                            slot.mark_present();
+                        }
+                    }
+                    continue;
+                }
                 const bool categorical = plan_[agg_i].categorical;
                 const auto value_at = [&](std::size_t row) -> std::string {
                     if (categorical) {
@@ -7642,7 +7714,11 @@ class HashAggregateState final {
                     } else if (plan_[i].kind == ExprType::Timestamp) {
                         column = Column<Timestamp>{};
                     } else if (plan_[i].categorical) {
-                        column = Column<Categorical>{};
+                        // A coded aggregate's codes resolve against the input's
+                        // dictionary, which the template shares.
+                        column = cat_agg_coded(i) && cat_agg_template_[i].has_value()
+                                     ? ColumnValue{*cat_agg_template_[i]}
+                                     : ColumnValue{Column<Categorical>{}};
                     } else {
                         column = Column<std::string>{};
                     }
@@ -7711,6 +7787,9 @@ class HashAggregateState final {
         }
         for (std::size_t i = 0; i < aggregations_->size(); ++i) {
             slot_kind[group_by_->size() + i] = emit_slot_for_agg(plan_[i].func, plan_[i].kind);
+            if (cat_agg_coded(i) && cat_agg_template_[i].has_value()) {
+                slot_kind[group_by_->size() + i] = EmitSlot::Cat;
+            }
         }
         // A String key column's bytes before each `kEmitAlign` block of
         // groups, so a span knows where its bytes go. At 5M groups the one
@@ -7913,6 +7992,11 @@ class HashAggregateState final {
                                                         : nullptr;
             auto* doubles =
                 slot_kind[ci] == EmitSlot::F64 ? static_cast<double*>(slot_data[ci]) : nullptr;
+            // A coded Categorical First/Last: an absent group (its validity bit
+            // cleared above) takes code 0, which a present one proves exists.
+            auto* codes = slot_kind[ci] == EmitSlot::Cat
+                              ? static_cast<Column<Categorical>::code_type*>(slot_data[ci])
+                              : nullptr;
             const auto put_i = [&](std::size_t g, std::int64_t v) {
                 if (ints != nullptr) {
                     ints[g] = v;
@@ -7978,6 +8062,10 @@ class HashAggregateState final {
                         } else if (plan_[i].kind == ExprType::Timestamp) {
                             std::get<Column<Timestamp>>(column).push_back(
                                 Timestamp{slot.int_value});
+                        } else if (codes != nullptr) {
+                            codes[g] = slot.present() ? static_cast<Column<Categorical>::code_type>(
+                                                            slot.int_value)
+                                                      : 0;
                         } else {
                             // No valid row may have initialized the text side array.
                             if (slot.present()) {
@@ -8271,6 +8359,16 @@ class HashAggregateState final {
     /// has a value; an entry without one holds an empty string, a placeholder
     /// that costs no optional discriminator and is never read as a null.
     std::vector<ScalarValue> text_store_;
+    /// Per aggregate: a grouped First/Last over a Categorical input that keeps
+    /// the input's CODE in the slot's `int_value` instead of a boxed string in
+    /// `text_store_`. q10's carried `n_name` paid for the boxing three times
+    /// over: a serial fill of `text_store_` with string variants, a string per
+    /// group at seeding, and an Emission that re-hashed every group's string
+    /// into a fresh dictionary on one worker. Valid while every chunk's column
+    /// shares one dictionary (`settle_coded_categoricals`); the template is an
+    /// empty column over it, which the output column copies.
+    std::vector<std::uint8_t> cat_agg_coded_;
+    std::vector<std::optional<Column<Categorical>>> cat_agg_template_;
 
     // Flat accumulator storage: n_groups_ × n_aggs_ contiguous AggSlotCores.
     SlotArray<AggSlotCore> flat_slots_;

@@ -32,6 +32,7 @@
 #include <initializer_list>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <robin_hood.h>
 #include <stdexcept>
 #include <string>
@@ -309,9 +310,9 @@ class ExternRegistry {
 
     /// Runs the shutdown hooks, most recently registered first.
     ~ExternRegistry() {
-        for (auto hook = shutdown_hooks_.rbegin(); hook != shutdown_hooks_.rend(); ++hook) {
+        for (auto& hook : std::ranges::reverse_view(shutdown_hooks_)) {
             try {
-                (*hook)();
+                hook();
             } catch (...) {  // NOLINT(bugprone-empty-catch): teardown must not abort the host
             }
         }

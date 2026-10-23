@@ -125,12 +125,18 @@ fi
 # variables stop Ibex's worker pool and Polars' pool from each sizing themselves
 # from nproc and oversubscribing the pinned set. The per-engine ST rows below
 # override these, so the MT/ST contrast survives the pin.
+#
+# The pinned set is the first CORES CPUs this script may use, not 0..CORES-1:
+# where hyperthread siblings are numbered adjacently (0,1 = one core), 0-7 is
+# four cores. Run under an outer `taskset` naming one CPU per core to pin to
+# physical cores; unpinned, this is 0..CORES-1 as before.
 PIN=()
 if [[ -n "$CORES" ]]; then
-    PIN=(taskset -c "0-$((CORES - 1))")
+    PIN_CPUS="$(python3 -c "import os, sys; n = int(sys.argv[1]); print(','.join(str(c) for c in sorted(os.sched_getaffinity(0))[:n]))" "$CORES")"
+    PIN=(taskset -c "$PIN_CPUS")
     export IBEX_CORES="$CORES"
     export POLARS_MAX_THREADS="$CORES"
-    echo "=== pinned to ${CORES} cores (of $(nproc)) ==="
+    echo "=== pinned to ${CORES} cores (of $(nproc)): CPUs ${PIN_CPUS} ==="
 fi
 
 # ── Archiving ────────────────────────────────────────────────────────────────

@@ -27,6 +27,10 @@
 
 #include "execution_profile_internal.hpp"
 
+#if defined(__linux__)
+#include <sched.h>
+#endif
+
 namespace ibex::runtime {
 
 // A single-threaded WebAssembly build (Emscripten without `-pthread`, i.e. no
@@ -760,6 +764,24 @@ auto compute_thread_count() -> std::size_t {
         }
         return 1;
     }
+    return available_cpu_count();
+}
+
+auto available_cpu_count() -> std::size_t {
+#if defined(__linux__)
+    // The CPUs this thread may run on, not the machine's: under `taskset`, a
+    // cpuset cgroup or a container `--cpuset-cpus`, `hardware_concurrency()`
+    // still reports every CPU on the box. Sized from that, an 8-CPU `taskset`
+    // on this 24-thread box got a 24-thread compute budget and pool -- q01 ran
+    // ~620 ms against ~599 ms with `IBEX_CORES=8` (2026-10-23).
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        if (const int count = CPU_COUNT(&set); count > 0) {
+            return static_cast<std::size_t>(count);
+        }
+    }
+#endif
     const unsigned hardware = std::thread::hardware_concurrency();
     return hardware == 0 ? 1 : static_cast<std::size_t>(hardware);
 }

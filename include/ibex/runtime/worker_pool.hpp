@@ -310,8 +310,8 @@ void stage_park_begin() noexcept;
 void stage_park_end() noexcept;
 
 /// Thread budget for compute, from `IBEX_CORES`. Unset or `auto` means
-/// `std::thread::hardware_concurrency()`; an explicit count is used as given;
-/// anything unparseable or zero falls back to 1.
+/// `available_cpu_count()`; an explicit count is used as given; anything
+/// unparseable or zero falls back to 1.
 ///
 /// This is the COMPUTE budget, and deliberately not the pool size — decode
 /// wants more threads than cores and compute measurably does not, so the two
@@ -323,6 +323,12 @@ void stage_park_end() noexcept;
 /// means. The old name said "threads" while setting a core count and a pool
 /// size at once, which is exactly the conflation this split exists to undo.
 [[nodiscard]] auto compute_thread_count() -> std::size_t;
+
+/// The CPUs the calling thread may run on: its affinity mask on Linux (so
+/// `taskset`, cpusets and container CPU sets count), else
+/// `std::thread::hardware_concurrency()`; at least 1. CPU quotas
+/// (cgroup `cpu.max`) are not affinity and are not seen.
+[[nodiscard]] auto available_cpu_count() -> std::size_t;
 
 /// Size of the process worker pool, chosen for DECODE rather than compute.
 ///

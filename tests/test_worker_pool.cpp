@@ -32,6 +32,10 @@
 
 #include "execution_profile_internal.hpp"
 
+#if defined(__linux__)
+#include <sched.h>
+#endif
+
 using namespace ibex;
 
 namespace {
@@ -268,6 +272,49 @@ TEST_CASE("compute_thread_count is at least one", "[runtime][worker_pool]") {
     CHECK(runtime::compute_thread_count() >= 1);
     CHECK(runtime::process_worker_pool().size() >= 1);
 }
+
+#if defined(__linux__)
+TEST_CASE("compute_thread_count follows the CPU affinity, not the machine",
+          "[runtime][worker_pool]") {
+    cpu_set_t original;
+    CPU_ZERO(&original);
+    REQUIRE(sched_getaffinity(0, sizeof(original), &original) == 0);
+    // The lowest CPU this thread may already use, alone: what `taskset -c N`
+    // gives a process.
+    int first = -1;
+    for (int cpu = 0; cpu < CPU_SETSIZE && first < 0; ++cpu) {
+        if (CPU_ISSET(cpu, &original)) {
+            first = cpu;
+        }
+    }
+    REQUIRE(first >= 0);
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(first, &one);
+    REQUIRE(sched_setaffinity(0, sizeof(one), &one) == 0);
+
+    const char* saved = std::getenv("IBEX_CORES");
+    const std::optional<std::string> saved_cores =
+        saved == nullptr ? std::nullopt : std::optional<std::string>{saved};
+    runtime::unset_env("IBEX_CORES");
+    const std::size_t one_cpu = runtime::available_cpu_count();
+    const std::size_t budget = runtime::compute_thread_count();
+    runtime::set_env("IBEX_CORES", "3");
+    const std::size_t explicit_budget = runtime::compute_thread_count();
+    if (saved_cores.has_value()) {
+        runtime::set_env("IBEX_CORES", *saved_cores);
+    } else {
+        runtime::unset_env("IBEX_CORES");
+    }
+    REQUIRE(sched_setaffinity(0, sizeof(original), &original) == 0);
+
+    CHECK(one_cpu == 1);
+    CHECK(budget == 1);
+    // An explicit `IBEX_CORES` still wins over the affinity.
+    CHECK(explicit_budget == 3);
+    CHECK(runtime::available_cpu_count() == static_cast<std::size_t>(CPU_COUNT(&original)));
+}
+#endif
 
 TEST_CASE("process worker pool can be shut down and recreated", "[runtime][worker_pool]") {
     std::atomic<std::size_t> ran{0};

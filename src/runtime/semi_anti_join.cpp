@@ -249,47 +249,114 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     /// swapped build whose buffered left is NOT the smaller side (so
     /// `try_dense_intersection` does not apply) but whose right key span is
     /// still small and dense enough that a cache-resident bitmap beats a
-    /// multi-million-entry hash probe. q21: ~5M distinct order keys spanning
-    /// ~24M values -> a 3MB bitmap probed 15M times instead of an ~80MB
-    /// robin_hood set. Returns false to leave the hash build to the caller.
+    /// multi-million-entry hash probe. q21 (SF-10) builds two: 12.9M order
+    /// keys spanning 60M values, and 2.0M keys over the same span -> a 7.5MB
+    /// bitmap probed 36.5M times instead of a robin_hood set several times
+    /// that size. Returns false to leave the hash build to the caller.
+    ///
+    /// Both passes split across the pool by row range: the bounds pass keeps
+    /// per-worker extremes, the fill sets bits with relaxed atomic ORs (the
+    /// bits are a set, so only which were set matters). On one thread they
+    /// were the whole of q21's two ~25-40 ms windows with every worker idle.
     auto try_build_dense_right() -> bool {
         const std::size_t rows = right_rows_;
         if (rows == 0) {
             return false;
         }
-        std::int64_t min_key = std::numeric_limits<std::int64_t>::max();
-        std::int64_t max_key = std::numeric_limits<std::int64_t>::min();
-        std::size_t live = 0;
-        for_right_rows<std::int64_t>(0, rows, [&](std::int64_t value) {
-            min_key = std::min(min_key, value);
-            max_key = std::max(max_key, value);
-            ++live;
+        const std::size_t workers = right_pass_worker_count();
+        const std::size_t parts = std::max<std::size_t>(workers, 1);
+        const std::size_t grain = (rows + parts - 1) / parts;
+        const auto run = [&](const std::function<void(std::size_t)>& part) {
+            if (workers < 2) {
+                part(0);
+                return;
+            }
+            auto batch = process_worker_pool().submit(workers, part);
+            batch.wait();
+        };
+
+        struct Bounds {
+            std::int64_t min_key = std::numeric_limits<std::int64_t>::max();
+            std::int64_t max_key = std::numeric_limits<std::int64_t>::min();
+            std::size_t live = 0;
+        };
+        std::vector<Bounds> bounds(parts);
+        run([&](std::size_t w) {
+            const std::size_t lo = w * grain;
+            if (lo >= rows) {
+                return;
+            }
+            Bounds b;
+            for_right_rows<std::int64_t>(lo, std::min(rows, lo + grain), [&](std::int64_t value) {
+                b.min_key = std::min(b.min_key, value);
+                b.max_key = std::max(b.max_key, value);
+                ++b.live;
+            });
+            bounds[w] = b;
         });
-        if (live == 0) {
+        Bounds all;
+        for (const auto& b : bounds) {
+            all.min_key = std::min(all.min_key, b.min_key);
+            all.max_key = std::max(all.max_key, b.max_key);
+            all.live += b.live;
+        }
+        if (all.live == 0) {
             return false;
         }
+        const std::int64_t min_key = all.min_key;
         const std::uint64_t difference =
-            static_cast<std::uint64_t>(max_key) - static_cast<std::uint64_t>(min_key);
+            static_cast<std::uint64_t>(all.max_key) - static_cast<std::uint64_t>(min_key);
         if (difference == std::numeric_limits<std::uint64_t>::max()) {
             return false;
         }
         const std::uint64_t span = difference + 1;
-        // 8MB ceiling (64M slots) keeps the bitmap inside a large L3; at most
-        // 16 slots per live key keeps a sparse column on the hash path, where
-        // the bitmap would be mostly empty cache lines.
+        // 8MB ceiling (64M slots) keeps the bitmap inside a large L3. Below
+        // it the gate is size against the hash set it replaces: 64 slots per
+        // live key is 8 bytes per key, while a robin_hood set of int64 keys
+        // costs 9 bytes per slot at up to 80% load, rounded up to a power of
+        // two -- so the bitmap is the smaller structure up to this density,
+        // and its probe is a bounds check and a bit test, not a hash lookup.
+        // (16 used to be the limit; it sent q21's 2.0M keys over 60M values,
+        // 30 per key, to a serial 2M-insert hash build.)
         constexpr std::uint64_t kMaxDenseBits = 64ULL << 20U;
-        if (span > kMaxDenseBits || span > static_cast<std::uint64_t>(live) * 16U) {
+        constexpr std::uint64_t kMaxSlotsPerKey = 64;
+        if (span > kMaxDenseBits || span > static_cast<std::uint64_t>(all.live) * kMaxSlotsPerKey) {
             return false;
         }
         dense_i64_min_ = min_key;
         dense_i64_nbits_ = static_cast<std::size_t>(span);
         dense_i64_hits_.assign((dense_i64_nbits_ + 63U) / 64U, std::uint64_t{0});
-        for_right_rows<std::int64_t>(0, rows, [&](std::int64_t value) {
-            const std::uint64_t slot =
-                static_cast<std::uint64_t>(value) - static_cast<std::uint64_t>(min_key);
-            dense_i64_hits_[dense_word(slot)] |= dense_bit(slot);
+        std::uint64_t* words = dense_i64_hits_.data();
+        run([&](std::size_t w) {
+            const std::size_t lo = w * grain;
+            if (lo >= rows) {
+                return;
+            }
+            for_right_rows<std::int64_t>(lo, std::min(rows, lo + grain), [&](std::int64_t value) {
+                const std::uint64_t slot =
+                    static_cast<std::uint64_t>(value) - static_cast<std::uint64_t>(min_key);
+                if (workers < 2) {
+                    words[dense_word(slot)] |= dense_bit(slot);
+                } else {
+                    std::atomic_ref<std::uint64_t>(words[dense_word(slot)])
+                        .fetch_or(dense_bit(slot), std::memory_order_relaxed);
+                }
+            });
         });
         return true;
+    }
+
+    /// Workers for a pass over the drained right keys whose only shared
+    /// writes are idempotent atomic ORs, or 0 to run it here. The same row
+    /// floor as `filter_rows`; no byte budget, since no worker keeps a copy.
+    [[nodiscard]] auto right_pass_worker_count() const -> std::size_t {
+        if (exec_ == nullptr || !exec_->can_fan_out() || on_worker_pool_thread() ||
+            right_rows_ < kMinParallelPredicateRows) {
+            return 0;
+        }
+        const std::size_t workers =
+            std::min({exec_->compute_budget(), process_worker_pool().size(), std::size_t{64}});
+        return workers < 2 ? 0 : workers;
     }
 
     /// Workers for the swapped build's intersection scan, or 0 to run it here.

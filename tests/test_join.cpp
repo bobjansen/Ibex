@@ -955,25 +955,32 @@ TEST_CASE("join: dense right bitmap preserves membership when the buffered left 
     // Swapped build (right over 65,536), and the buffered left is NOT smaller
     // than the right -- so `try_dense_intersection` is skipped and the right
     // key column itself is turned into a bit-packed membership bitmap
-    // (`try_build_dense_right`). Two spans: step 3 stays under the old 2M
+    // (`try_build_dense_right`). Three spans: step 3 stays under the old 2M
     // byte-table cap; step 12 (~2.4M span) is only reachable now that the map
-    // is one bit per slot.
-    for (const std::int64_t span_step : {std::int64_t{3}, std::int64_t{12}}) {
+    // is one bit per slot; step 40 is 40 slots per key, past the old 16-per-key
+    // gate, and has enough right rows (over `kMinParallelPredicateRows`) for
+    // the bounds and fill passes to split across the pool.
+    struct Shape {
+        std::int64_t span_step;
+        std::int64_t right_rows;
+    };
+    for (const Shape shape : {Shape{3, 200'000}, Shape{12, 200'000}, Shape{40, 300'000}}) {
+        const std::int64_t span_step = shape.span_step;
         CAPTURE(span_step);
-        constexpr std::int64_t kRightRows = 200'000;
-        constexpr std::int64_t kLeftRows = 260'000;
+        const std::int64_t right_rows = shape.right_rows;
+        const std::int64_t left_rows = right_rows * 13 / 10;
 
         Column<std::int64_t> right_ids;
-        right_ids.reserve(kRightRows);
-        for (std::int64_t row = 0; row < kRightRows; ++row) {
+        right_ids.reserve(static_cast<std::size_t>(right_rows));
+        for (std::int64_t row = 0; row < right_rows; ++row) {
             right_ids.push_back(row * span_step);  // distinct, evenly spaced
         }
         Column<std::int64_t> left_ids;
-        left_ids.reserve(kLeftRows);
-        for (std::int64_t row = 0; row < kLeftRows; ++row) {
+        left_ids.reserve(static_cast<std::size_t>(left_rows));
+        for (std::int64_t row = 0; row < left_rows; ++row) {
             // Half land on a real right key, half fall between two of them.
-            left_ids.push_back((row % 2 == 0) ? (row % kRightRows) * span_step
-                                              : (row % kRightRows) * span_step + 1);
+            left_ids.push_back((row % 2 == 0) ? (row % right_rows) * span_step
+                                              : (row % right_rows) * span_step + 1);
         }
 
         runtime::Table lhs;
@@ -986,8 +993,8 @@ TEST_CASE("join: dense right bitmap preserves membership when the buffered left 
 
         auto semi = interpret_expr("lhs semi join rhs on id;", tables);
         auto anti = interpret_expr("lhs anti join rhs on id;", tables);
-        CHECK(semi.rows() == static_cast<std::size_t>(kLeftRows / 2));
-        CHECK(anti.rows() == static_cast<std::size_t>(kLeftRows / 2));
+        CHECK(semi.rows() == static_cast<std::size_t>(left_rows / 2));
+        CHECK(anti.rows() == static_cast<std::size_t>(left_rows / 2));
         for (const std::int64_t id : col_i64(semi, "id")) {
             CHECK(id % span_step == 0);
         }

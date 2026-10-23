@@ -3822,6 +3822,69 @@ auto try_bind_lazy_source(parser::Expr& expr, runtime::TableRegistry& tables,
     return lazy;
 }
 
+/// `let t = parquet::read(p) as DataFrame<{...}>;` -- the same lazy binding as
+/// a bare call, once the ascription is proven against the source's schema.
+///
+/// The ascription is a runtime-checked identity (SPEC.md 3.6): it asserts
+/// columns and types and lets extras through, so nothing about it needs the
+/// data. Without this, the ascribed form -- how every PDS-H query declares its
+/// sources -- fell through to the eager path, which decoded every column of
+/// the file at the `let`: `:load q21.ibex` spent 4.5 of its 7 s decoding
+/// orders and lineitem in full before the first query ran.
+///
+/// The check is the eager path's own: the call is bound to a temp lazy name,
+/// the expression lowered, and `check_and_fuse_ascriptions` run against the
+/// source schemas, so a missing or mistyped column reports the same error.
+/// Returns nullopt -- the eager path then runs as before -- when `expr` is not
+/// an ascribed lazy-source call, or when the schema cannot prove the
+/// ascription (the eager path checks it against the data).
+auto try_bind_ascribed_lazy_source(parser::Expr& expr, runtime::TableRegistry& tables,
+                                   LazyTableRegistry& lazy_tables,
+                                   runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
+                                   ModelRegistry& models, const FunctionRegistry& functions,
+                                   CompileTimeListRegistry& compile_time_lists,
+                                   const ExternDeclRegistry& extern_decls,
+                                   const runtime::ExternRegistry& externs)
+    -> std::optional<std::expected<runtime::LazyTablePtr, std::string>> {
+    auto* ascribe = std::get_if<parser::AscribeExpr>(&expr.node);
+    if (ascribe == nullptr || !ascribe->base ||
+        !std::holds_alternative<parser::CallExpr>(ascribe->base->node)) {
+        return std::nullopt;
+    }
+    InlineSourceRewrites rewrites(&lazy_tables);
+    if (auto err = rewrite_inline_sources(expr, rewrites, tables, lazy_tables, scalars, columns,
+                                          models, functions, compile_time_lists, extern_decls,
+                                          externs)) {
+        return std::unexpected(*err);
+    }
+    if (rewrites.temp_names.size() != 1) {
+        return std::nullopt;  // not a lazy source
+    }
+    const std::string& temp = rewrites.temp_names.front();
+    parser::LowerContext context = build_lower_context(
+        tables, lazy_tables, scalars, columns, models, functions, compile_time_lists, extern_decls);
+    auto lowered = parser::lower_expr(expr, context);
+    if (!lowered) {
+        return std::nullopt;  // the eager path reports it
+    }
+    if (auto ok = check_and_fuse_ascriptions(lowered.value(), context.source_schemas);
+        !ok.has_value()) {
+        return std::unexpected(ok.error());
+    }
+    // Fused into the scan means proven; anything else is left to the eager
+    // path's data check.
+    const ir::Node& plan = *lowered.value();
+    if (plan.kind() != ir::NodeKind::Scan) {
+        return std::nullopt;
+    }
+    const auto& scan = ir::node_cast<ir::ScanNode>(plan);
+    if (scan.source_name() != temp || !scan.ascribed_schema().has_value()) {
+        return std::nullopt;
+    }
+    // Copied out before `rewrites` retires the temp name.
+    return lazy_tables.at(temp);
+}
+
 /// Replace every inline lazy source in `expr` — `parquet::read(p)` in any table
 /// position — with a temp lazy binding, so the whole expression lowers to Scans
 /// and projection pushdown reaches all of them.
@@ -5144,9 +5207,15 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
         if (std::holds_alternative<parser::LetStmt>(stmt)) {
             const auto& let_stmt = std::get<parser::LetStmt>(stmt);
             if (!let_stmt.type.has_value()) {
-                if (auto lazy = try_bind_lazy_source(*let_stmt.value, tables, lazy_tables, scalars,
-                                                     columns, models, functions, compile_time_lists,
-                                                     extern_decls, externs)) {
+                auto lazy = try_bind_lazy_source(*let_stmt.value, tables, lazy_tables, scalars,
+                                                 columns, models, functions, compile_time_lists,
+                                                 extern_decls, externs);
+                if (!lazy) {
+                    lazy = try_bind_ascribed_lazy_source(
+                        *let_stmt.value, tables, lazy_tables, scalars, columns, models, functions,
+                        compile_time_lists, extern_decls, externs);
+                }
+                if (lazy) {
                     if (!*lazy) {
                         ibex::formatting::print("error: {}\n", lazy->error());
                         return false;

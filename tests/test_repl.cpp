@@ -1065,13 +1065,15 @@ result;
     }
 
     SECTION("statement-at-a-time path") {
-        // A scalar let is outside the batch planner's shape, so the same
-        // script runs through the statement executor.
+        // A typed scalar let is outside the batch planner's shape (it declines
+        // a non-DataFrame annotation), so the same script runs through the
+        // statement executor. An untyped `let x = 1;` no longer does: the
+        // batch planner takes those.
         const char* src = R"(
 extern fn read_fake() -> DataFrame from "fake.hpp";
 extern fn capture(df: DataFrame) -> Int from "fake.hpp";
 
-let force_statement_path = 1;
+let force_statement_path: Int64 = 1;
 let input = read_fake();
 let result = input[filter a > 1, select { n = count() }];
 capture(result);
@@ -1081,6 +1083,50 @@ result;
         REQUIRE(captured == std::vector<std::int64_t>{2});
         REQUIRE(decode_calls == std::vector<std::vector<std::string>>{{"a"}});
     }
+}
+
+TEST_CASE("REPL statement path keeps an ascribed lazy source lazy", "[repl][lazy][ascribe]") {
+    // `let t = read(p) as DataFrame<{...}>;` is how every PDS-H query declares
+    // its sources. The ascription only asserts columns and types, so the
+    // binding stays lazy and the query decodes just what it reads -- it used
+    // to fall to the eager path and decode every column at the `let`. The
+    // typed scalar `let` is what keeps this on the statement path: the
+    // whole-script planner declines a non-DataFrame annotation.
+    ibex::runtime::ExternRegistry registry;
+    std::vector<std::vector<std::string>> decode_calls;
+    std::vector<std::int64_t> captured;
+    register_recording_lazy_source(registry, decode_calls);
+    register_int_capture(registry, "n", captured);
+
+    const char* src = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+extern fn capture(df: DataFrame) -> Int from "fake.hpp";
+
+let force_statement_path: Int64 = 1;
+let input = read_fake() as DataFrame<{ a: Int64, b: Int64 }>;
+let result = input[filter a > 1, select { n = count() }];
+capture(result);
+result;
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+    REQUIRE(captured == std::vector<std::int64_t>{2});
+    REQUIRE(decode_calls == std::vector<std::vector<std::string>>{{"a"}});
+
+    // The ascription is still checked, at the `let`, against the schema.
+    decode_calls.clear();
+    const char* missing = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+let force_statement_path: Int64 = 1;
+let input = read_fake() as DataFrame<{ c: Int64 }>;
+)";
+    CHECK_FALSE(ibex::repl::execute_script(missing, registry));
+    const char* mistyped = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+let force_statement_path: Int64 = 1;
+let input = read_fake() as DataFrame<{ a: String }>;
+)";
+    CHECK_FALSE(ibex::repl::execute_script(mistyped, registry));
+    CHECK(decode_calls.empty());
 }
 
 TEST_CASE("REPL batch planner materializes a shared aggregate binding once", "[repl][batch]") {

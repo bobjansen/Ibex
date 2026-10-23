@@ -261,8 +261,8 @@ auto GroupPrefilter::may_pass(const AggSlotCore* slots) const noexcept -> bool {
 }
 
 auto GroupPrefilter::survivors(const AggSlotCore* slots, std::size_t groups, std::size_t stride,
-                               WorkerPool* pool, std::size_t workers) const
-    -> std::vector<std::uint32_t> {
+                               WorkerPool* pool, std::size_t workers, std::size_t max_keep) const
+    -> std::optional<std::vector<std::uint32_t>> {
     constexpr std::size_t kSerialGroups = std::size_t{1} << 16U;
     const auto scan = [&](std::size_t lo, std::size_t hi, std::vector<std::uint32_t>& out) {
         for (std::size_t g = lo; g < hi; ++g) {
@@ -274,6 +274,9 @@ auto GroupPrefilter::survivors(const AggSlotCore* slots, std::size_t groups, std
     if (pool == nullptr || workers < 2 || groups < kSerialGroups) {
         std::vector<std::uint32_t> out;
         scan(0, groups, out);
+        if (out.size() > max_keep) {
+            return std::nullopt;
+        }
         return out;
     }
     const std::size_t ranges = workers * 4;
@@ -295,6 +298,9 @@ auto GroupPrefilter::survivors(const AggSlotCore* slots, std::size_t groups, std
     std::size_t total = 0;
     for (const auto& part : parts) {
         total += part.size();
+    }
+    if (total > max_keep) {
+        return std::nullopt;
     }
     std::vector<std::uint32_t> out;
     out.reserve(total);

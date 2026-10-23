@@ -19,9 +19,13 @@
 // would not be exact -- and the filter decides it as before.
 
 #include <ibex/ir/node.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -33,8 +37,6 @@
 #include "runtime_internal.hpp"
 
 namespace ibex::runtime {
-
-class WorkerPool;
 
 /// One comparison of an aggregate output against a numeric literal, as the
 /// filter wrote it, normalized to `output <op> literal`.
@@ -75,10 +77,14 @@ class GroupPrefilter {
 
     /// Indices of the groups in `[0, groups)` that may pass, ascending. Group
     /// g's slots start at `slots + g * stride`. Fans out over `pool` when it
-    /// is non-null and `groups` is large.
+    /// is non-null and `groups` is large. Nullopt once more than `max_keep`
+    /// pass: a caller that would discard a long list (most groups pass, so
+    /// compacting is not worth it) learns that from the per-range counts,
+    /// before the ranges are concatenated.
     [[nodiscard]] auto survivors(const AggSlotCore* slots, std::size_t groups, std::size_t stride,
-                                 WorkerPool* pool, std::size_t workers) const
-        -> std::vector<std::uint32_t>;
+                                 WorkerPool* pool, std::size_t workers,
+                                 std::size_t max_keep = std::numeric_limits<std::size_t>::max())
+        const -> std::optional<std::vector<std::uint32_t>>;
 
    private:
     enum class Read : std::uint8_t { Count, Int, Double, Mean };
@@ -109,6 +115,44 @@ void compact_by_index(T* values, std::span<const std::uint32_t> keep, std::size_
             values[to + s] = std::move(values[from + s]);
         }
     }
+}
+
+/// `compact_by_index`, split across `pool` when it is non-null and the kept
+/// elements are many. In place it cannot split -- a range reads indices the
+/// next range overwrites -- so the kept elements are gathered by range into
+/// scratch, then moved back by range. The gather is the cost: kept groups
+/// scattered over a large slot array are a cache miss each (q21 keeps 2.0M of
+/// 15M groups, ~15 ms on one thread with every worker idle).
+template <typename T>
+void compact_by_index(T* values, std::span<const std::uint32_t> keep, std::size_t stride,
+                      WorkerPool* pool, std::size_t workers) {
+    constexpr std::size_t kSerialElements = std::size_t{1} << 16U;
+    const std::size_t total = keep.size() * stride;
+    if (pool == nullptr || workers < 2 || total < kSerialElements) {
+        compact_by_index(values, keep, stride);
+        return;
+    }
+    auto scratch = std::make_unique_for_overwrite<T[]>(total);
+    const std::size_t grain = (keep.size() + workers - 1) / workers;
+    const auto by_range = [&](const auto& body) {
+        auto batch = pool->submit(workers, [&](std::size_t w) {
+            const std::size_t lo = std::min(keep.size(), w * grain);
+            body(lo, std::min(keep.size(), lo + grain));
+        });
+        batch.wait();
+    };
+    by_range([&](std::size_t lo, std::size_t hi) {
+        for (std::size_t o = lo; o < hi; ++o) {
+            const std::size_t from = static_cast<std::size_t>(keep[o]) * stride;
+            for (std::size_t s = 0; s < stride; ++s) {
+                scratch[(o * stride) + s] = std::move(values[from + s]);
+            }
+        }
+    });
+    by_range([&](std::size_t lo, std::size_t hi) {
+        std::move(scratch.get() + (lo * stride), scratch.get() + (hi * stride),
+                  values + (lo * stride));
+    });
 }
 
 }  // namespace ibex::runtime

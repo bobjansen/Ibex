@@ -18,6 +18,7 @@
 #include <ibex/runtime/env.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/table_compare.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -370,6 +371,70 @@ TEST_CASE("aggregate prefilter: a null aggregate is left to the filter", "[aggre
     check_prefilter(registry, "s = sum(v), m = mean(v)", "k", "s > 2700.0", false);
     check_prefilter(registry, "s = sum(v)", "k", "s > 2700.0", false);
     check_prefilter(registry, "s = sum(v), m = mean(v)", "ks", "m < 30.0", false);
+}
+
+TEST_CASE("aggregate prefilter: survivors declines past max_keep, serially and in parallel",
+          "[aggregate][prefilter]") {
+    const std::vector<ir::AggSpec> aggs = {[] {
+        ir::AggSpec out;
+        out.func = ir::AggFunc::Count;
+        out.alias = "n";
+        return out;
+    }()};
+    const std::vector<runtime::ExprType> kinds = {runtime::ExprType::Int};
+    const auto prefilter = runtime::GroupPrefilter::resolve(
+        {{.output = "n", .op = ir::CompareOp::Gt, .literal = std::int64_t{5}}}, aggs, kinds);
+    REQUIRE(prefilter.has_value());
+    // Over the parallel scan's 65,536-group floor; two groups in eight pass.
+    constexpr std::size_t kGroups = 100'000;
+    std::vector<runtime::AggSlotCore> slots(kGroups);
+    std::vector<std::uint32_t> want;
+    for (std::size_t g = 0; g < kGroups; ++g) {
+        slots[g].count = static_cast<std::int64_t>(g % 8);
+        if (g % 8 > 5) {
+            want.push_back(static_cast<std::uint32_t>(g));
+        }
+    }
+    auto& pool = runtime::process_worker_pool();
+    for (runtime::WorkerPool* p : {static_cast<runtime::WorkerPool*>(nullptr), &pool}) {
+        INFO((p == nullptr ? "serial" : "parallel"));
+        const auto all = prefilter->survivors(slots.data(), kGroups, 1, p, 8);
+        REQUIRE(all.has_value());
+        CHECK(*all == want);
+        const auto at_cap = prefilter->survivors(slots.data(), kGroups, 1, p, 8, want.size());
+        REQUIRE(at_cap.has_value());
+        CHECK(*at_cap == want);
+        CHECK_FALSE(prefilter->survivors(slots.data(), kGroups, 1, p, 8, want.size() - 1)
+                        .has_value());
+    }
+}
+
+TEST_CASE("aggregate prefilter: the pool-split compaction matches the serial one",
+          "[aggregate][prefilter]") {
+    // Enough kept elements to split (the serial floor is 65,536), with a
+    // stride of one and of three (three aggregates per group).
+    constexpr std::size_t kGroups = 400'000;
+    std::vector<std::uint32_t> keep;
+    for (std::size_t g = 0; g < kGroups; ++g) {
+        if (g % 3 != 1 && g % 7 != 4) {
+            keep.push_back(static_cast<std::uint32_t>(g));
+        }
+    }
+    auto& pool = runtime::process_worker_pool();
+    for (const std::size_t stride : {std::size_t{1}, std::size_t{3}}) {
+        INFO("stride " << stride);
+        std::vector<std::int64_t> serial(kGroups * stride);
+        for (std::size_t i = 0; i < serial.size(); ++i) {
+            serial[i] = static_cast<std::int64_t>(i * 7 + 1);
+        }
+        std::vector<std::int64_t> parallel = serial;
+        runtime::compact_by_index(serial.data(), keep, stride);
+        runtime::compact_by_index(parallel.data(), keep, stride, &pool, 8);
+        serial.resize(keep.size() * stride);
+        parallel.resize(keep.size() * stride);
+        CHECK(parallel == serial);
+        CHECK(parallel[stride] == static_cast<std::int64_t>(keep[1] * stride * 7 + 1));
+    }
 }
 
 TEST_CASE("aggregate prefilter: whole queries answer as the aggregate then the filter",

@@ -1582,7 +1582,7 @@ class HashAggregateState final {
             auto& partition = partitions[p];
             const std::size_t groups = partition.keys.size();
             const auto keep =
-                prefilter->survivors(partition.slots.data(), groups, n_aggs_, nullptr, 1);
+                *prefilter->survivors(partition.slots.data(), groups, n_aggs_, nullptr, 1);
             if (keep.size() == groups) {
                 return;
             }
@@ -1617,8 +1617,9 @@ class HashAggregateState final {
     /// The same for every other strategy, on the finished group arrays, so
     /// Emission writes only what may pass. Declined when an aggregate keeps
     /// per-group state beside its slot (text values, moment scratch, distinct
-    /// sets), and when most groups pass: the compaction is serial, and at that
-    /// point the filter above does the same work on emitted rows.
+    /// sets), and when more than a quarter of the groups pass: at that point
+    /// the filter above does the same work on emitted rows. Both the survivor
+    /// scan and the compaction split across the pool when the plan allows it.
     IBEX_NOINLINE void prefilter_groups() {
         if (prefiltered_ || n_groups_ == 0) {
             return;
@@ -1631,29 +1632,32 @@ class HashAggregateState final {
         const bool fan = exec_ != nullptr && !on_worker_pool_thread() &&
                          par_.final_ordering.decline == physical::FanOutDecline::None &&
                          par_.final_ordering.worker_cap >= 2;
-        const auto keep = prefilter->survivors(flat_slots_.data(), n_groups_, n_aggs_,
-                                               fan ? &process_worker_pool() : nullptr,
-                                               fan ? par_.final_ordering.worker_cap : 1);
-        if (keep.size() * 4 > n_groups_) {
+        WorkerPool* const pool = fan ? &process_worker_pool() : nullptr;
+        const std::size_t workers = fan ? par_.final_ordering.worker_cap : 1;
+        const auto kept =
+            prefilter->survivors(flat_slots_.data(), n_groups_, n_aggs_, pool, workers,
+                                 /*max_keep=*/n_groups_ / 4);
+        if (!kept.has_value()) {
             return;
         }
-        compact_by_index(flat_slots_.data(), keep, n_aggs_);
+        const std::vector<std::uint32_t>& keep = *kept;
+        compact_by_index(flat_slots_.data(), keep, n_aggs_, pool, workers);
         (void)flat_slots_.grow_uninitialized(keep.size() * n_aggs_);
         // The key array Emission reads, chosen in Emission's own order.
         const std::size_t n_keys = group_by_->size();
         if (cat_fast_path_) {
             if (n_keys == 1) {
-                compact_by_index(cat_order_.data(), keep);
+                compact_by_index(cat_order_.data(), keep, 1, pool, workers);
                 cat_order_.resize(keep.size());
             } else {
-                compact_by_index(multi_cat_codes_flat_.data(), keep, n_keys);
+                compact_by_index(multi_cat_codes_flat_.data(), keep, n_keys, pool, workers);
                 multi_cat_codes_flat_.resize(keep.size() * n_keys);
             }
         } else if (str_fast_path_) {
-            compact_by_index(str_order_.data(), keep);
+            compact_by_index(str_order_.data(), keep, 1, pool, workers);
             str_order_.resize(keep.size());
         } else if (int_fast_path_) {
-            compact_by_index(int_order_.data(), keep);
+            compact_by_index(int_order_.data(), keep, 1, pool, workers);
             int_order_.resize(keep.size());
             if (int_null_gid_ != kNoGid) {
                 const auto it = std::ranges::find(keep, int_null_gid_);
@@ -1661,7 +1665,7 @@ class HashAggregateState final {
                     it == keep.end() ? kNoGid : static_cast<std::uint32_t>(it - keep.begin());
             }
         } else if (pair_int_fast_path_) {
-            compact_by_index(pair_order_.data(), keep);
+            compact_by_index(pair_order_.data(), keep, 1, pool, workers);
             pair_order_.resize(keep.size());
         } else {
             group_keys_.compact(keep);

@@ -924,11 +924,9 @@ inline auto dictionary_bytes(const parquet::FileMetaData& metadata, int col) -> 
 /// The number of entries in a column's dictionary, summed over row groups, or
 /// nullopt when any row group does not expose one.
 ///
-/// Read from the dictionary page's own header. Callers must bound this with
-/// `dictionary_bytes` first: a dictionary page is only bounded by the writer's
-/// page-size limit, and reading `l_comment`'s -- megabytes of strings this
-/// decision does not need -- to learn that it has far too many entries would
-/// cost more than the decision saves.
+/// Read the dictionary page's actual entry count. Its byte size does not
+/// establish cardinality: long strings and compression invalidate byte-based
+/// bounds. This inspection may read and decompress the dictionary page.
 inline auto dictionary_entry_count(parquet::ParquetFileReader& reader, int col)
     -> std::optional<std::int64_t> {
     const auto& metadata = *reader.metadata();
@@ -1032,38 +1030,13 @@ inline auto dictionary_column_indices(parquet::ParquetFileReader& reader) -> std
                 break;
             }
         }
-        // A dictionary must be small to be worth having. Reading a column as
-        // `Column<Categorical>` interns every dictionary entry, which costs
-        // ~400ns each and buys nothing when the dictionary is nearly as large
-        // as the column: supplier's s_name has one entry per row, and paying
-        // that turned a 20,000-row read into 9ms. Few entries is the condition
-        // that makes Categorical worth it on BOTH sides -- cheap to intern, and
-        // the representation downstream group-bys hash by code rather than by
-        // string. So this is a single test on the absolute entry count, with no
-        // row-count floor: `nation`'s 25 names stay categorical because 25
-        // entries are 25 entries, whatever the table's size.
+        // Decide from the actual count, never a presumed average string length.
+        // Reading the dictionary costs I/O, but rejecting a small dictionary
+        // of long repeated strings would materialize those strings per row.
         if (fully_dictionary) {
-            // Bracket the entry count from the dictionary's byte size before
-            // reading it. A BYTE_ARRAY entry is a 4-byte length plus at least
-            // one character, so `bytes / 5` is the most entries it can hold;
-            // and an entry averaging more than `kBoundStringBytes` is one this
-            // decision would reject anyway, since interning copies those bytes.
-            // Only a dictionary whose bracket straddles the threshold has to be
-            // read -- which leaves the small, genuinely borderline ones.
-            namespace policy = ibex::parquet_dict;
-            const std::int64_t rows = metadata.num_rows();
-            switch (policy::verdict_from_bytes(dictionary_bytes(metadata, col), rows)) {
-                case policy::Verdict::Keep:
-                    break;
-                case policy::Verdict::Dense:
-                    fully_dictionary = false;
-                    break;
-                case policy::Verdict::NeedsCount: {
-                    const auto entries = dictionary_entry_count(reader, col);
-                    fully_dictionary = entries.has_value() && policy::worth_keeping(*entries, rows);
-                    break;
-                }
-            }
+            const auto entries = dictionary_entry_count(reader, col);
+            fully_dictionary = entries.has_value() &&
+                               ibex::parquet_dict::worth_keeping(*entries, metadata.num_rows());
         }
         if (std::getenv("IBEX_DICT_ENTRY_DEBUG") != nullptr) {
             std::fprintf(stderr, "[dict] col=%-18s dict_bytes=%9lld -> %s\n",

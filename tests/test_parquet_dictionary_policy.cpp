@@ -37,39 +37,12 @@ TEST_CASE("dictionary policy drops a dictionary with an entry per row", "[parque
     CHECK_FALSE(policy::worth_keeping(16384, 20000));  // s_comment
 }
 
-TEST_CASE("dictionary policy settles the common cases from byte size alone",
+TEST_CASE("dictionary policy uses actual counts at the retention boundaries",
           "[parquet][dictionary]") {
-    // Reading a dictionary page is paid by every query that opens the file,
-    // including those that never touch the column, so the bytes have to settle
-    // as much as possible. These are the real SF-2 figures.
-    CHECK(policy::verdict_from_bytes(293, 25) == policy::Verdict::Keep);             // n_name
-    CHECK(policy::verdict_from_bytes(3707, 400000) == policy::Verdict::Keep);        // p_type
-    CHECK(policy::verdict_from_bytes(114057, 3000000) == policy::Verdict::Keep);     // o_clerk
-    CHECK(policy::verdict_from_bytes(12618454, 12000000) == policy::Verdict::Keep);  // l_comment
-
-    CHECK(policy::verdict_from_bytes(440020, 20000) == policy::Verdict::Dense);  // s_name
-    CHECK(policy::verdict_from_bytes(579071, 20000) == policy::Verdict::Dense);  // s_address
-    CHECK(policy::verdict_from_bytes(380020, 20000) == policy::Verdict::Dense);  // s_phone
-}
-
-TEST_CASE("dictionary policy reads the count only when the bounds straddle",
-          "[parquet][dictionary]") {
-    // A dictionary big enough that its widest and narrowest readings disagree
-    // is the only kind worth opening. Construct one directly: 200000 bytes over
-    // 500000 rows spans "at most 40000 entries" (not worth it: 80000 > 50000)
-    // and "at least 10000" (worth it: 20000 <= 500000).
-    CHECK(policy::most_entries_in(200000) == 40000);
-    CHECK(policy::fewest_entries_in(200000) == 10000);
-    CHECK_FALSE(policy::worth_keeping(policy::most_entries_in(200000), 50000));
-    CHECK(policy::worth_keeping(policy::fewest_entries_in(200000), 500000));
-    CHECK(policy::verdict_from_bytes(200000, 60000) == policy::Verdict::NeedsCount);
-}
-
-TEST_CASE("dictionary policy bounds bracket any real entry count", "[parquet][dictionary]") {
-    // The bounds exist to skip a read, so the upper one must never undercount:
-    // an entry cannot be smaller than a 4-byte length plus one character.
-    for (const std::int64_t bytes : {0, 5, 1000, 440020, 12618454}) {
-        CHECK(policy::most_entries_in(bytes) >= policy::fewest_entries_in(bytes));
-        CHECK(policy::most_entries_in(bytes) * 5 <= bytes + 4);
-    }
+    CHECK(policy::worth_keeping(8192, 8192));
+    CHECK_FALSE(policy::worth_keeping(8193, 8193));
+    CHECK(policy::worth_keeping(10000, 20000));
+    CHECK_FALSE(policy::worth_keeping(10001, 20000));
+    CHECK_FALSE(policy::worth_keeping(10001, 20001));
+    CHECK(policy::worth_keeping(100, 10000));  // also true for arbitrarily long labels
 }

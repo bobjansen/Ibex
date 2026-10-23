@@ -14,3 +14,13 @@ let t = parquet::read("tests/data/parquet_sparse_page_index_out.parquet");
 t[filter id == 1023 || id == 1024 || id == 150000 || id == 299999 || id == 300000
     || id == 310000 || id == 400000 || id == 400001 || id == 512345 || id == 599999,
     select { id, s, v }];
+
+// Whole decode: copying the lazy binding by name materializes every column of
+// both row groups. The string column decodes one task per row group and the
+// parts are concatenated afterwards, each shifted to its byte offset; a wrong
+// shift shows as a boundary row with another row's text, or a byte total that
+// is not 11 bytes a row.
+let full = t;
+full[filter id == 0 || id == 299999 || id == 300000 || id == 599999,
+    select { full_id = id, full_s = s }];
+full[select { full_rows = count(), full_bytes = sum(byte_length(s)) }];

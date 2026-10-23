@@ -2093,20 +2093,29 @@ inline void sharded_dictionary(ShardedColumn& planned, int leaf_index,
 /// nullopt when this column cannot be split by row group — see `ShardedColumn`
 /// for which columns those are and why.
 /// Selected decodes with at most this many output rows split a string column
-/// by row group (see `sharded_string`); larger ones stay one task, since the
-/// shards are concatenated on the calling thread.
+/// by row group (see `sharded_string`), as do whole-column decodes; a large
+/// selected decode stays one task (its concat would copy most of the column
+/// for a decode the selection already made cheap).
 inline constexpr std::size_t kShardedStringMaxRows = 64 * 1024;
 
-/// A string column split by row group for a small selected decode.
+/// Above this many output bytes, `sharded_string`'s concat copies its parts in
+/// parallel rather than on the calling thread.
+inline constexpr std::size_t kParallelStringConcatBytes = std::size_t{8} << 20U;
+
+/// A string column split by row group.
 ///
 /// A string's destination offset depends on every preceding row, so shards
-/// cannot write disjoint slices of one buffer. They each decode into their own
-/// column instead, and `finalize` appends those in row-group order -- a bulk
-/// copy of the output, cheap only because the output is small, hence
-/// `kShardedStringMaxRows`. The case it exists for is a refetch of a few rows
-/// spread over many row groups: q10's 20 result customers re-read c_comment,
-/// c_address and c_phone as one task per column over all 13 row groups, the
-/// slowest bounding the decode at ~24 ms on 8 cores.
+/// cannot write disjoint slices of one buffer while decoding. They each decode
+/// into their own column instead, and `finalize` lays those end to end in
+/// row-group order: each part's bytes go to a known offset and its row offsets
+/// shift by a constant, so the parts copy in parallel.
+///
+/// Two cases. A refetch of a few rows spread over many row groups: q10's 20
+/// result customers re-read c_comment, c_address and c_phone as one task per
+/// column over all 13 row groups, the slowest bounding the decode at ~24 ms on
+/// 8 cores. And a whole-column decode: one task decoding SF-10 lineitem's
+/// l_comment end to end ran alone for ~1.8 s after the other 15 columns had
+/// finished in 0.8 s (a statement-path `let` over a self-join, 2026-10-23).
 inline void sharded_string(ShardedColumn& planned, int leaf_index,
                            const ibex::runtime::Selection* selection,
                            const DirectDecodeGroups& groups) {
@@ -2129,19 +2138,60 @@ inline void sharded_string(ShardedColumn& planned, int leaf_index,
         return emitted;
     };
     planned.finalize = [parts](ibex::runtime::ColumnEntry& entry) {
-        std::size_t rows = 0;
-        std::size_t chars = 0;
-        for (const auto& part : *parts) {
-            rows += part.size();
-            if (part.size() != 0) {
-                chars += part.offsets_data()[part.size()] - part.offsets_data()[0];
-            }
+        const std::size_t n_parts = parts->size();
+        std::vector<std::size_t> row_start(n_parts + 1, 0);
+        std::vector<std::size_t> char_start(n_parts + 1, 0);
+        for (std::size_t p = 0; p < n_parts; ++p) {
+            const auto& part = (*parts)[p];
+            const std::size_t part_chars =
+                part.size() == 0 ? 0 : part.offsets_data()[part.size()] - part.offsets_data()[0];
+            row_start[p + 1] = row_start[p] + part.size();
+            char_start[p + 1] = char_start[p] + part_chars;
+        }
+        const std::size_t rows = row_start[n_parts];
+        const std::size_t chars = char_start[n_parts];
+        if (chars > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::runtime_error("parquet::read: string column exceeds 4 GiB");
         }
         ibex::Column<std::string> out;
-        out.reserve(rows, chars);
-        for (const auto& part : *parts) {
-            out.append(part);
+        out.resize_for_gather(rows, chars);
+        // Taken once: the mutable accessors may detach shared storage, which
+        // several workers must not do at once.
+        std::uint32_t* const out_offsets = out.offsets_data();
+        char* const out_chars = out.chars_data();
+        out_offsets[0] = 0;
+        const auto copy_part = [&](std::size_t p) {
+            const auto& part = (*parts)[p];
+            const std::size_t n = part.size();
+            if (n == 0) {
+                return;
+            }
+            const std::uint32_t* src = part.offsets_data();
+            const auto shift = static_cast<std::uint32_t>(char_start[p]) - src[0];
+            std::uint32_t* dst = out_offsets + row_start[p];
+            for (std::size_t i = 1; i <= n; ++i) {
+                dst[i] = src[i] + shift;
+            }
+            std::memcpy(out_chars + char_start[p], part.chars_data() + src[0], src[n] - src[0]);
+        };
+        auto& pool = ibex::runtime::process_worker_pool();
+        if (chars >= kParallelStringConcatBytes && n_parts > 1 && pool.size() > 1 &&
+            !ibex::runtime::on_worker_pool_thread()) {
+            std::atomic<std::size_t> next{0};
+            pool.submit(std::min(pool.size(), n_parts),
+                        [&](std::size_t) {
+                            for (std::size_t p = next.fetch_add(1, std::memory_order_relaxed);
+                                 p < n_parts; p = next.fetch_add(1, std::memory_order_relaxed)) {
+                                copy_part(p);
+                            }
+                        })
+                .wait();
+        } else {
+            for (std::size_t p = 0; p < n_parts; ++p) {
+                copy_part(p);
+            }
         }
+        parts->clear();
         entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(out));
     };
 }
@@ -2229,7 +2279,7 @@ inline auto plan_sharded_column(parquet::arrow::FileReader& reader, const arrow:
             break;
         case arrow::Type::STRING:
         case arrow::Type::LARGE_STRING:
-            if (selection == nullptr || output_rows > kShardedStringMaxRows) {
+            if (selection != nullptr && output_rows > kShardedStringMaxRows) {
                 return std::nullopt;
             }
             sharded_string(planned, leaf_index, selection, groups);

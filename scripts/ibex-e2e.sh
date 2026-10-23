@@ -222,6 +222,13 @@ if [[ "$SKIP_REPL" == false ]]; then
             '512345 .*"text-512345" .*3586415 ' '599999 .*"text-599999" .*4199993 '; do
             rg -n "$row" "$repl_out" >/dev/null || sparse_ok=0
         done
+        # The whole decode after it: row-group boundary rows keep their own text,
+        # and every row is 11 bytes (600000 rows, 6600000 bytes).
+        for row in '^\| 0 +\| "text-000000"' '^\| 299999 +\| "text-299999"' \
+            '^\| 300000 +\| "text-300000"' '^\| 599999 +\| "text-599999"' \
+            '^\| 600000 +\| 6600000 '; do
+            rg -n "$row" "$repl_out" >/dev/null || sparse_ok=0
+        done
         if rg -n "error:" "$repl_out" >/dev/null || ! rg -n "rows: 10" "$repl_out" >/dev/null \
             || [ "$sparse_ok" -ne 1 ]; then
             cat "$repl_out" >&2

@@ -14,15 +14,18 @@ namespace {
 constexpr const char* kMadvise = "always [madvise] never";
 }  // namespace
 
-TEST_CASE("huge_pages_tunables adds the huge-page tunable once", "[runtime][env]") {
+TEST_CASE("huge_pages_tunables adds the huge-page tunables once", "[runtime][env]") {
     // Unset: just the tunable.
     CHECK(huge_pages_tunables(nullptr, nullptr, nullptr, kMadvise) ==
-          std::optional<std::string>{"glibc.malloc.hugetlb=1"});
+          std::optional<std::string>{"glibc.malloc.hugetlb=1:glibc.malloc.top_pad=67108864"});
     CHECK(huge_pages_tunables("", nullptr, nullptr, kMadvise) ==
-          std::optional<std::string>{"glibc.malloc.hugetlb=1"});
+          std::optional<std::string>{"glibc.malloc.hugetlb=1:glibc.malloc.top_pad=67108864"});
     // Other tunables are kept, the new one appended.
     CHECK(huge_pages_tunables("glibc.malloc.arena_max=2", nullptr, nullptr, kMadvise) ==
-          std::optional<std::string>{"glibc.malloc.arena_max=2:glibc.malloc.hugetlb=1"});
+          std::optional<std::string>{"glibc.malloc.arena_max=2:glibc.malloc.hugetlb=1:glibc.malloc.top_pad=67108864"});
+    // A top pad the caller chose is kept.
+    CHECK(huge_pages_tunables("glibc.malloc.top_pad=1048576", nullptr, nullptr, kMadvise) ==
+          std::optional<std::string>{"glibc.malloc.top_pad=1048576:glibc.malloc.hugetlb=1"});
     // THP set to always works as well as madvise.
     CHECK(huge_pages_tunables(nullptr, nullptr, nullptr, "[always] madvise never").has_value());
     // `IBEX_NO_HUGEPAGES=0` is not an opt-out.

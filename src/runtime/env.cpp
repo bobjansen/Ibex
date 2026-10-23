@@ -65,6 +65,20 @@ auto huge_pages_tunables(const char* tunables, const char* opt_out, const char* 
     }
     out += kTunable;
     out += "=1";
+    // A worker thread allocates from its own glibc arena: a 64 MB reserved
+    // heap of which glibc enables, and marks MADV_HUGEPAGE, only the first
+    // part; what `grow_heap` enables later is never marked, so under THP's
+    // `madvise` mode the workers' memory stayed on 4 KB pages (q01: 1.86 GB
+    // unmarked, 168 MB marked). A top pad of the whole heap size makes glibc
+    // create each arena heap at full size, so all of it is marked at once.
+    // Untouched pages still cost nothing; peak RSS +5.8% summed over PDS-H.
+    // A top pad the caller chose is left alone.
+    constexpr std::string_view kTopPad = "glibc.malloc.top_pad";
+    if (current.find(kTopPad) == std::string_view::npos) {
+        out += ':';
+        out += kTopPad;
+        out += "=67108864";
+    }
     return out;
 }
 

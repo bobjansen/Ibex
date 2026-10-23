@@ -25,7 +25,8 @@ void unset_env(const std::string& name);
                                        const char* marker, std::string_view thp_enabled)
     -> std::optional<std::string>;
 
-/// Re-exec this process once with `glibc.malloc.hugetlb=1` added to
+/// Re-exec this process once with `glibc.malloc.hugetlb=1` (and a 64 MB
+/// `glibc.malloc.top_pad`, so worker-thread arenas are covered too) added to
 /// `GLIBC_TUNABLES`, so glibc backs its heaps with transparent huge pages.
 /// glibc reads tunables only at start-up, hence the re-exec. Call it first in
 /// `main`, before any thread or allocation that matters. Returns without doing

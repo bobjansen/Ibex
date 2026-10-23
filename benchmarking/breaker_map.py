@@ -31,6 +31,14 @@ window could explain -- overlap succeeding, not an error) without a matching
 reduction on the operator(s) it overlapped, which reads that shared capacity
 as unused when it was not. The result inflates idle on the concurrent side.
 
+`unqueued` counts pool threads with no task. Pipeline stage threads are not
+pool threads, so when work moves onto them (IBEX_STREAM_PROBES=1 moves ~0.6 s
+of q09's probe work there) the pool reads idle while the cores are busy.
+`stage` is the stage threads' live time and `net` = unqueued - stage, the
+capacity really left idle; rank and total by `net`. Checked on q09 against
+perf's sampled occupancy: equal in both modes (0.88 / 0.87) while `unqueued`
+doubled.
+
 So the identity to check is `sum(idle_core_ms) == pool_unqueued_ms` (the
 pool's own directly-sampled "nothing queued" time, not attributable per row),
 and it is printed as `closure` per query. Near 100% means this query's
@@ -276,9 +284,11 @@ def main() -> int:
     per_boundary = collections.defaultdict(float)
     grand_idle = 0.0
     grand_wall = 0.0
+    grand_net = 0.0
     unreliable: list[str] = []
     print(
         f"\n{'query':6}{'wall':>8}{'workers':>8}{'idle':>10}{'unqueued':>10}{'closure':>9}"
+        f"{'stage':>8}{'net':>8}"
         f"   top operators by idle core-ms"
     )
     details: dict[str, list[dict]] = {}
@@ -294,6 +304,9 @@ def main() -> int:
         details[query.stem] = attributed
         idle = sum(r["idle_core_ms"] for r in attributed)
         unqueued = summary.get("pool_unqueued_ms", 0.0)
+        stage = summary.get("stage_live_ms", 0.0)
+        net = max(0.0, unqueued - stage)
+        grand_net += net
         closure = 100.0 * idle / unqueued if unqueued > 0 else 0.0
         reliable = is_reliable(closure, unqueued)
         grand_wall += summary.get("wall_ms", 0.0)
@@ -313,7 +326,7 @@ def main() -> int:
         print(
             f"{query.stem:6}{summary.get('wall_ms', 0.0):8.1f}"
             f"{summary.get('workers', 0.0):8.0f}{idle:10.1f}{unqueued:10.1f}"
-            f"{closure:8.1f}%   {top}{flag}"
+            f"{closure:8.1f}%{stage:8.0f}{net:8.0f}   {top}{flag}"
         )
 
     if unreliable:
@@ -327,6 +340,10 @@ def main() -> int:
         )
     print(f"\n{'TOTAL':6}{grand_wall:8.1f}{'':8}{grand_idle:10.1f}"
           f"   (reliable queries only, {len(details) - len(unreliable)}/{len(details)})")
+    workers = float(cores) if cores.isdigit() else 0.0
+    if grand_wall > 0 and workers > 0:
+        print(f"# net idle (unqueued - stage, all queries): {grand_net:.0f} core-ms = "
+              f"{100.0 * grand_net / (grand_wall * workers):.1f}% of {workers:.0f} x wall")
 
     print("\n# idle core-ms by breaker family")
     for family, idle in sorted(per_family.items(), key=lambda kv: -kv[1]):

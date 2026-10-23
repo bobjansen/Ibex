@@ -924,14 +924,39 @@ inline auto dictionary_bytes(const parquet::FileMetaData& metadata, int col) -> 
 /// The number of entries in a column's dictionary, summed over row groups, or
 /// nullopt when any row group does not expose one.
 ///
-/// Read the dictionary page's actual entry count. Its byte size does not
-/// establish cardinality: long strings and compression invalidate byte-based
-/// bounds. This inspection may read and decompress the dictionary page.
-inline auto dictionary_entry_count(parquet::ParquetFileReader& reader, int col)
+/// The count is the one the dictionary page's own header declares. With
+/// `input`, only that header is read: a few bytes at the start of each chunk,
+/// parsed by `dictionary_header_entries`. Reading the page itself would fetch
+/// and decompress every entry -- `l_comment`'s megabytes, paid by every query
+/// that opens `lineitem` -- to learn a number the header already holds. The
+/// page reader is the fallback for anything the header parse cannot vouch for
+/// (no `input`, an encrypted column, a header that does not parse).
+inline auto dictionary_entry_count(parquet::ParquetFileReader& reader, int col,
+                                   arrow::io::RandomAccessFile* input = nullptr)
     -> std::optional<std::int64_t> {
     const auto& metadata = *reader.metadata();
     std::int64_t entries = 0;
     for (int group = 0; group < metadata.num_row_groups(); ++group) {
+        if (input != nullptr) {
+            const auto chunk = metadata.RowGroup(group)->ColumnChunk(col);
+            // Where the chunk starts, as Arrow's own reader computes it.
+            std::int64_t start = chunk->data_page_offset();
+            if (chunk->has_dictionary_page() && chunk->dictionary_page_offset() > 0 &&
+                start > chunk->dictionary_page_offset()) {
+                start = chunk->dictionary_page_offset();
+            }
+            if (chunk->crypto_metadata() == nullptr && start >= 0) {
+                const auto length = std::min<std::int64_t>(
+                    ibex::parquet_dict::kDictionaryHeaderReadBytes, chunk->total_compressed_size());
+                if (auto header = input->ReadAt(start, length); header.ok()) {
+                    if (const auto count = ibex::parquet_dict::dictionary_header_entries(
+                            (*header)->data(), static_cast<std::size_t>((*header)->size()))) {
+                        entries += *count;
+                        continue;
+                    }
+                }
+            }
+        }
         auto pages = reader.RowGroup(group)->GetColumnPageReader(col);
         if (pages == nullptr) {
             return std::nullopt;
@@ -1004,7 +1029,9 @@ inline auto is_dictionary_page_mismatch(const parquet::ParquetException& error) 
     return std::string_view{error.what()}.find("not dictionary encoded") != std::string_view::npos;
 }
 
-inline auto dictionary_column_indices(parquet::ParquetFileReader& reader) -> std::vector<int> {
+inline auto dictionary_column_indices(parquet::ParquetFileReader& reader,
+                                      arrow::io::RandomAccessFile* input = nullptr)
+    -> std::vector<int> {
     const auto& metadata = *reader.metadata();
     std::vector<int> out;
     for (int col = 0; col < metadata.num_columns(); ++col) {
@@ -1034,7 +1061,7 @@ inline auto dictionary_column_indices(parquet::ParquetFileReader& reader) -> std
         // Reading the dictionary costs I/O, but rejecting a small dictionary
         // of long repeated strings would materialize those strings per row.
         if (fully_dictionary) {
-            const auto entries = dictionary_entry_count(reader, col);
+            const auto entries = dictionary_entry_count(reader, col, input);
             fully_dictionary = entries.has_value() &&
                                ibex::parquet_dict::worth_keeping(*entries, metadata.num_rows());
         }
@@ -1056,7 +1083,9 @@ inline auto dictionary_column_indices(parquet::ParquetFileReader& reader) -> std
 /// materializing one `std::string` per row.
 /// `dictionary_column_indices`, computed once per file.
 inline auto cached_dictionary_column_indices(parquet::ParquetFileReader& reader,
-                                             const std::string& path) -> std::vector<int> {
+                                             const std::string& path,
+                                             arrow::io::RandomAccessFile* input)
+    -> std::vector<int> {
     static std::mutex mutex;
     static std::map<std::pair<std::string, std::int64_t>, std::vector<int>> cache;
     const auto key = std::pair{path, reader.metadata()->num_rows()};
@@ -1066,7 +1095,7 @@ inline auto cached_dictionary_column_indices(parquet::ParquetFileReader& reader,
             return it->second;
         }
     }
-    auto columns = dictionary_column_indices(reader);
+    auto columns = dictionary_column_indices(reader, input);
     const std::lock_guard lock(mutex);
     cache.emplace(key, columns);
     return columns;
@@ -1076,6 +1105,7 @@ inline auto make_parquet_reader(std::shared_ptr<arrow::io::RandomAccessFile> inp
                                 const std::string& path)
     -> std::unique_ptr<parquet::arrow::FileReader> {
     parquet::arrow::FileReaderBuilder builder;
+    arrow::io::RandomAccessFile* const file = input.get();
     auto status = builder.Open(std::move(input));
     if (!status.ok()) {
         throw std::runtime_error("parquet::read: failed to read: " + path + " (" +
@@ -1087,7 +1117,7 @@ inline auto make_parquet_reader(std::shared_ptr<arrow::io::RandomAccessFile> inp
     // a reader is built many times over a query's life (the pool hands out one
     // per worker). Keyed by path and row count so a file replaced underneath a
     // long-lived process is not answered from the old entry.
-    for (int col : cached_dictionary_column_indices(*builder.raw_reader(), path)) {
+    for (int col : cached_dictionary_column_indices(*builder.raw_reader(), path, file)) {
         properties.set_read_dictionary(col, true);
     }
     builder.properties(properties);
@@ -3944,7 +3974,8 @@ class ParquetLazyReaderFactoryState {
         // also keeps the choice identical across them, as it must be: two
         // readers disagreeing would give one column two representations.
         if (first_reader_ != nullptr) {
-            dictionary_columns_ = dictionary_column_indices(*first_reader_->parquet_reader());
+            dictionary_columns_ =
+                dictionary_column_indices(*first_reader_->parquet_reader(), input_.get());
         }
     }
 

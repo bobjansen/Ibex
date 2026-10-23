@@ -212,6 +212,13 @@ class LazyTable {
 
     /// Column names and types, with no rows. Cheap: known from metadata alone.
     [[nodiscard]] auto schema() const noexcept -> const Table& { return schema_; }
+
+    /// The same source showing only `names` (the rest of its schema hidden, in
+    /// schema order), for a declared schema that narrows it (SPEC.md 3.6). It
+    /// shares this source's readers and decodes nothing; columns already in
+    /// the cache are carried over. Names not in the schema are ignored.
+    [[nodiscard]] auto narrowed(const std::set<std::string>& names) const
+        -> std::shared_ptr<LazyTable>;
     [[nodiscard]] auto rows() const noexcept -> std::size_t { return rows_; }
     /// Per-column source metadata, for the planner. Read from the file's footer
     /// at bind time, so consulting it decodes nothing.

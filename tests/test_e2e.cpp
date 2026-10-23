@@ -238,11 +238,41 @@ TEST_CASE("E2E: schema ascription passes a conforming table through", "[e2e][asc
     CHECK(col_dbl(out, "b") == std::vector<double>{1.5, 2.5});
 }
 
-TEST_CASE("E2E: schema ascription preserves unlisted physical columns", "[e2e][ascribe]") {
+TEST_CASE("E2E: schema ascription narrows to the listed columns", "[e2e][ascribe]") {
+    // SPEC.md 3.6: extras are allowed in the input but not kept -- a column the
+    // type system cannot let you name is not printed or carried either.
     auto tables = make_trades();
     auto out = run("trades as DataFrame<{ price: Int64 }>;", tables);
     CHECK(col_i64(out, "price") == std::vector<std::int64_t>{10, 20, 30, 40, 50});
-    CHECK(out.find("symbol") != nullptr);
+    CHECK(out.find("symbol") == nullptr);
+    CHECK(out.columns.size() == 1);
+    // No fields asserts nothing and narrows nothing.
+    auto all = run("trades as DataFrame;", tables);
+    CHECK(all.find("symbol") != nullptr);
+}
+
+TEST_CASE("E2E: a typed let checks and narrows like an ascription", "[e2e][ascribe]") {
+    // The whole-script lowering used to drop the annotation: a missing column
+    // ran, and every column came through.
+    auto tables = make_trades();
+    auto out = run("let t: DataFrame<{ price: Int64 }> = trades;\nt;", tables);
+    CHECK(col_i64(out, "price") == std::vector<std::int64_t>{10, 20, 30, 40, 50});
+    CHECK(out.columns.size() == 1);
+    auto err = run_error("let t: DataFrame<{ salary: Int64 }> = trades;\nt;", tables);
+    CHECK(err.find("missing column 'salary'") != std::string::npos);
+}
+
+TEST_CASE("E2E: a declared return schema narrows a function's result", "[e2e][ascribe][udf]") {
+    auto tables = make_trades();
+    auto out = run(
+        "fn prices(t: DataFrame) -> DataFrame<{ price: Int64 }> { t; }\nprices(trades);", tables);
+    CHECK(out.columns.size() == 1);
+    CHECK(out.find("price") != nullptr);
+    // A bare `-> DataFrame` returns every column; a parameter schema keeps the
+    // caller's extras.
+    auto all = run("fn keep(t: DataFrame<{ price: Int64 }>) -> DataFrame { t; }\nkeep(trades);",
+                   tables);
+    CHECK(all.find("symbol") != nullptr);
 }
 
 // Over a source with an unknown static schema (a registry table), the

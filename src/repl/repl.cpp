@@ -1718,6 +1718,39 @@ auto validate_table_type(const runtime::Table& table, const parser::Type& type)
     return std::nullopt;
 }
 
+/// The columns a declared table type lists: what an ascription, a typed `let`
+/// or a function's return type narrows a table to (SPEC.md 3.6). Empty for a
+/// type that lists none -- a bare `DataFrame` asserts nothing and narrows
+/// nothing.
+auto declared_columns(const parser::Type& type) -> std::set<std::string> {
+    std::set<std::string> names;
+    if (const auto* schema = std::get_if<parser::SchemaType>(&type.arg)) {
+        for (const auto& field : schema->fields) {
+            names.insert(field.name);
+        }
+    }
+    return names;
+}
+
+/// `table` narrowed to what `type` declares (see `declared_columns`).
+auto narrow_to_declared(runtime::Table table, const parser::Type& type) -> runtime::Table {
+    const auto names = declared_columns(type);
+    if (names.empty()) {
+        return table;
+    }
+    return runtime::keep_columns(table, names);
+}
+
+/// A lazy source narrowed to what `type` declares, still undecoded.
+auto narrow_to_declared(runtime::LazyTablePtr lazy, const parser::Type& type)
+    -> runtime::LazyTablePtr {
+    const auto names = declared_columns(type);
+    if (names.empty()) {
+        return lazy;
+    }
+    return lazy->narrowed(names);
+}
+
 /// Returns true if `callee` is one of the type-name cast functions.
 auto is_cast_callee(std::string_view callee) -> bool {
     return callee == "Int64" || callee == "Int32" || callee == "Int" || callee == "Float64" ||
@@ -3886,8 +3919,9 @@ auto try_bind_ascribed_lazy_source(parser::Expr& expr, runtime::TableRegistry& t
     if (scan.source_name() != temp || !scan.ascribed_schema().has_value()) {
         return std::nullopt;
     }
-    // Copied out before `rewrites` retires the temp name.
-    return lazy_tables.at(temp);
+    // Copied out before `rewrites` retires the temp name, and narrowed to the
+    // ascribed columns: an unlisted one cannot be named, so it is not shown.
+    return narrow_to_declared(lazy_tables.at(temp), ascribe->type);
 }
 
 /// Replace every inline lazy source in `expr` — `parquet::read(p)` in any table
@@ -4726,7 +4760,7 @@ auto run_function(parser::CallExpr& call, const parser::FunctionDecl& fn,
                 if (auto err = validate_table_type(value.value(), *let_stmt.type)) {
                     return std::unexpected("type error: '" + let_stmt.name + "': " + *err);
                 }
-                auto table_value = std::move(value.value());
+                auto table_value = narrow_to_declared(std::move(value.value()), *let_stmt.type);
                 auto compile_time_list = extract_compile_time_string_list(table_value);
                 local_tables.insert_or_assign(let_stmt.name, std::move(table_value));
                 if (compile_time_list.has_value()) {
@@ -4904,7 +4938,7 @@ auto run_function(parser::CallExpr& call, const parser::FunctionDecl& fn,
         if (auto err = validate_table_type(table, fn.return_type)) {
             return std::unexpected(call.callee + ": return type mismatch: " + *err);
         }
-        return EvalValue{std::move(table)};
+        return EvalValue{narrow_to_declared(std::move(table), fn.return_type)};
     }
 
     if (fn.return_type.kind == parser::Type::Kind::Series) {
@@ -5285,7 +5319,9 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                             ibex::formatting::print("error: '{}': {}\n", let_stmt.name, *err);
                             return false;
                         }
-                        lazy_tables.insert_or_assign(let_stmt.name, std::move(lazy->value()));
+                        lazy_tables.insert_or_assign(
+                            let_stmt.name,
+                            narrow_to_declared(std::move(lazy->value()), *let_stmt.type));
                         tables.erase(let_stmt.name);
                         scalars.erase(let_stmt.name);
                         columns.erase(let_stmt.name);
@@ -5305,7 +5341,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                         ibex::formatting::print("error: '{}': {}\n", let_stmt.name, *err);
                         return false;
                     }
-                    auto table_value = std::move(value.value());
+                    auto table_value = narrow_to_declared(std::move(value.value()), *let_stmt.type);
                     auto compile_time_list = extract_compile_time_string_list(table_value);
                     lazy_tables.erase(let_stmt.name);
                     tables.insert_or_assign(let_stmt.name, std::move(table_value));

@@ -127,6 +127,20 @@ struct DemandSink {
 
 void visit(const Node& node, const ColumnDemand& need, DemandSink& out);
 
+/// `need` as seen below an ascription listing `fields`: "every column" becomes
+/// the listed ones. An ascription listing no fields narrows nothing.
+auto narrow_to_ascribed(const ColumnDemand& need, const std::vector<SchemaField>& fields)
+    -> ColumnDemand {
+    if (!need.all || fields.empty()) {
+        return need;
+    }
+    ColumnDemand narrowed;
+    for (const auto& field : fields) {
+        narrowed.add(field.name);
+    }
+    return narrowed;
+}
+
 /// Recurse into every child carrying `need`.
 void visit_children(const Node& node, const ColumnDemand& need, DemandSink& out) {
     for (const auto& child : node.children()) {
@@ -148,8 +162,14 @@ void visit_children_widened(const Node& node, DemandSink& out) {
 void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
     switch (node.kind()) {
         case NodeKind::Scan: {
-            out.sources[node_cast<ScanNode>(node).source_name()].merge(need);
-            out.source_nodes[&node].merge(need);
+            // A fused ascription narrows the scan exactly as the Ascribe node
+            // it replaced did.
+            const auto& scan = node_cast<ScanNode>(node);
+            const ColumnDemand narrowed = scan.ascribed_schema().has_value()
+                                              ? narrow_to_ascribed(need, scan.ascribed_schema()->fields)
+                                              : need;
+            out.sources[scan.source_name()].merge(narrowed);
+            out.source_nodes[&node].merge(narrowed);
             return;
         }
 
@@ -416,20 +436,22 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
             return;
         }
 
-        // An ascription asserts only that the named columns exist with the named
-        // types. Extra physical columns pass through but are not statically
-        // visible, so whether they are materialized is unobservable. Demand
-        // what the parent wants plus the names the check itself reads, and no
-        // more -- naming a column asserts its shape, it does not ask for data.
+        // An ascription asserts that the named columns exist with the named
+        // types, and its output carries exactly those columns (SPEC.md 3.6).
+        // So "every column" above it means every LISTED column, and nothing
+        // unlisted is ever demanded below it. Demand what the parent wants
+        // plus the names the check itself reads, and no more -- naming a
+        // column asserts its shape, it does not ask for data.
         case NodeKind::Ascribe: {
             const auto& asc = node_cast<AscribeNode>(node);
+            const ColumnDemand narrowed = narrow_to_ascribed(need, asc.schema());
             if (asc.checked()) {
                 // Already proven against the input's schema, so it reads nothing
                 // at all: pass the parent's demand straight through.
-                visit_children(node, need, out);
+                visit_children(node, narrowed, out);
                 return;
             }
-            ColumnDemand below = need;
+            ColumnDemand below = narrowed;
             for (const auto& field : asc.schema()) {
                 below.add(field.name);
             }

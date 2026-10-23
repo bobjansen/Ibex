@@ -2283,6 +2283,12 @@ class Lowerer {
                     }
                     continue;
                 }
+                if (let_stmt.type.has_value()) {
+                    value = declared_table_type(std::move(value.value()), *let_stmt.type);
+                    if (!value.has_value()) {
+                        return std::unexpected(value.error());
+                    }
+                }
                 if (bindings_ != nullptr) {
                     if (value.value()->kind() == ir::NodeKind::Model) {
                         // A fitted model is a value of the program: fitted once,
@@ -2424,6 +2430,13 @@ class Lowerer {
                 }
                 last_expr = std::move(value.value());
             }
+        }
+        if (function_ != nullptr && last_expr) {
+            auto declared = declared_table_type(std::move(last_expr), function_->return_type);
+            if (!declared.has_value()) {
+                return std::unexpected(declared.error());
+            }
+            last_expr = std::move(declared.value());
         }
         if (pending_unbind.has_value()) {
             resource_steps_.push_back(std::move(*pending_unbind));
@@ -2591,7 +2604,28 @@ class Lowerer {
         if (!base.has_value()) {
             return base;
         }
-        const auto* schema_type = std::get_if<SchemaType>(&ascribe.type.arg);
+        return ascribe_lowered(std::move(base.value()), ascribe.type);
+    }
+
+    /// A declared table type over an already lowered plan: `let t: DataFrame<{...}>`
+    /// and a function's `-> DataFrame<{...}>` mean what `as DataFrame<{...}>`
+    /// means -- the listed columns checked, and the result narrowed to them
+    /// (SPEC.md 3.6). Without this the whole-script planner checked neither: a
+    /// typed `let` naming a column the source lacks ran, and printed every
+    /// column. A type with no fields (`DataFrame`) asserts nothing and is left
+    /// off.
+    auto declared_table_type(ir::NodePtr base, const Type& type) -> LowerResult {
+        const auto* schema = std::get_if<SchemaType>(&type.arg);
+        if ((type.kind != Type::Kind::DataFrame && type.kind != Type::Kind::TimeFrame) ||
+            schema == nullptr || schema->fields.empty()) {
+            return base;
+        }
+        return ascribe_lowered(std::move(base), type);
+    }
+
+    auto ascribe_lowered(ir::NodePtr lowered_base, const Type& type) -> LowerResult {
+        LowerResult base = std::move(lowered_base);
+        const auto* schema_type = std::get_if<SchemaType>(&type.arg);
         std::vector<ir::SchemaField> fields;
         bool open = false;
         if (schema_type != nullptr) {
@@ -4343,6 +4377,13 @@ class Lowerer {
                 continue;
             }
             if (auto tbl = lower_expr(*let->value); tbl.has_value()) {
+                if (let->type.has_value()) {
+                    tbl = declared_table_type(std::move(tbl.value()), *let->type);
+                    if (!tbl.has_value()) {
+                        cleanup();
+                        return tbl;
+                    }
+                }
                 shadow(let->name, std::move(tbl.value()));
             } else {
                 auto scalar = lower_expr_to_ir(*let->value);
@@ -4355,7 +4396,10 @@ class Lowerer {
         }
         auto result = lower_expr(*body_shape->final_expr);
         cleanup();
-        return result;
+        if (!result.has_value()) {
+            return result;
+        }
+        return declared_table_type(std::move(result.value()), fn.return_type);
     }
 
     /// One `inner_column == outer(outer_column)` capture.

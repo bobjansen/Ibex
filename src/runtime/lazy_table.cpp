@@ -187,6 +187,22 @@ auto LazyTable::project_uncached(const std::set<std::string>& names, const Execu
     return out;
 }
 
+auto LazyTable::narrowed(const std::set<std::string>& names) const
+    -> std::shared_ptr<LazyTable> {
+    auto view = std::make_shared<LazyTable>(*this);
+    Table schema;
+    for (const auto& entry : schema_.columns) {
+        if (names.contains(entry.name)) {
+            schema.add_column_from(entry.name, entry);
+        }
+    }
+    view->schema_ = std::move(schema);
+    for (auto it = view->cache_.begin(); it != view->cache_.end();) {
+        it = names.contains(it->first) ? std::next(it) : view->cache_.erase(it);
+    }
+    return view;
+}
+
 auto LazyTable::project(const std::set<std::string>& names, const ExecutionContext& exec)
     -> std::expected<Table, std::string> {
     std::vector<std::string> missing;

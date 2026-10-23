@@ -519,11 +519,25 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
                 }
                 return false;
             };
+            // The result carries exactly the listed columns (SPEC.md 3.6),
+            // in the input's order: an unlisted column cannot be named
+            // downstream, so it is not kept to be printed or carried into a
+            // join either. An ascription listing no fields narrows nothing.
+            const auto narrowed = [&](const Table& input) -> std::expected<Table, std::string> {
+                if (asc.schema().empty()) {
+                    return input;
+                }
+                std::set<std::string> names;
+                for (const auto& field : asc.schema()) {
+                    names.insert(field.name);
+                }
+                return keep_columns(input, names);
+            };
             if (asc.checked()) {
                 // Proven against the input schema before execution, so the
                 // columns it names need not be materialized -- and must not
                 // be looked for here, since demand was narrowed on that basis.
-                return child;
+                return narrowed(t);
             }
             for (const auto& field : asc.schema()) {
                 const auto* col = t.find(field.name);
@@ -536,7 +550,7 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
                                            "' has the wrong type");
                 }
             }
-            return child;
+            return narrowed(t);
         }
         case ir::NodeKind::Columns: {
             if (node.children().empty()) {

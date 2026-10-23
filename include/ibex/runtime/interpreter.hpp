@@ -1104,6 +1104,13 @@ class ExternArgs;
 /// (`IBEX_PARALLEL`, `IBEX_MORSEL_ROWS`, `IBEX_PARALLEL_STATS`) on top of the
 /// defaults. Use the overload below to supply a context directly — that is
 /// also how a caller opts OUT of the environment.
+/// `input` with only the columns named in `names`, in `input`'s order, the
+/// ordering / time index carried through as a projection would. What a
+/// declared table schema leaves of a table (SPEC.md 3.6): an unlisted column
+/// cannot be named downstream, so it is not kept. Names `input` lacks are
+/// ignored. Columns are shared, not copied.
+[[nodiscard]] auto keep_columns(const Table& input, const std::set<std::string>& names) -> Table;
+
 [[nodiscard]] auto interpret(const ir::Node& node, const TableRegistry& registry,
                              const ScalarRegistry* scalars = nullptr,
                              const ExternRegistry* externs = nullptr,

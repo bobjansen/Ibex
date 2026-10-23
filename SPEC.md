@@ -632,8 +632,9 @@ A trailing `*` marks the schema **open**: it lists the columns that must be
 present but permits additional, unlisted columns. Without `*` a schema is
 **exact (closed)** — exactly the listed columns, no more. The distinction
 governs validation where a declared schema meets actual data (Section 6.6).
-Schema ascription is deliberately a minimum-required contract regardless of
-this marker (Section 3.6):
+Schema ascription, a typed `let` and a function's return type are
+deliberately a minimum-required contract regardless of this marker, and narrow
+the table to the listed columns either way (Section 3.6):
 
 ```
 { a: Int64 }       // exact: the table has exactly column a
@@ -647,8 +648,8 @@ that is absent — both are simply "not in the schema." This is what keeps colum
 access sound: every statically nameable column traces back to an assertion (a
 reader return schema, an ascription, or a literal) that guarantees its presence
 and type at runtime, so a name reference can never fault. To *use* an extra
-column you must assert it (e.g. re-ascribe a wider schema, Section 3.6); the
-assertion is what pays for the runtime guarantee. Consequently, passing a value
+column you must assert it (e.g. ascribe a wider schema to the source,
+Section 3.6); the assertion is what pays for the runtime guarantee. Consequently, passing a value
 of type `{ a, * }` to a context requiring column `c` is a type error even when
 `c` happens to be present in the underlying data — the type system cannot
 distinguish a present-but-unlisted `c` from an absent one, and must reject both.
@@ -668,7 +669,11 @@ or call:
   an error.
 - **DataFrame/TimeFrame schema annotations** require that all declared columns
   are present with the correct types. Extra columns in the value are allowed
-  (structural subtyping); missing or mistyped declared columns are errors.
+  (structural subtyping) but dropped: the bound table, and a function's
+  returned table, carry exactly the declared columns, as an ascription does
+  (Section 3.6). Missing or mistyped declared columns are errors. Function
+  **parameters** are the exception: there extra columns pass through (Section
+  10.3).
 - **Bare `DataFrame`** (no schema fields) skips validation and accepts any
   DataFrame value.
 
@@ -920,11 +925,13 @@ The ascribed type must be a `DataFrame` or `TimeFrame` type. As a shorthand, a
 bare schema after `as` — `expr as { ... }` — is sugar for
 `expr as DataFrame<{ ... }>` (the wildcard `*` is accepted too). Use the
 explicit `TimeFrame<{ ... }>` form to ascribe a TimeFrame. The ascription is a
-**runtime-checked identity** and a minimum-required-columns contract: every
-listed column must be present with a matching type, while additional columns
-are allowed and pass through unchanged. A missing or wrong-type column is an
-error. The trailing `*` has no additional effect for an ascription because
-extras are always permitted.
+**runtime-checked** minimum-required-columns contract that **narrows** its
+input: every listed column must be present with a matching type, additional
+columns are allowed in the input, and the result carries exactly the listed
+columns, in the input's order. A missing or wrong-type column is an error. The
+trailing `*` has no additional effect for an ascription: extras are always
+permitted in the input and never kept. An ascription with no fields
+(`as DataFrame`) asserts and narrows nothing.
 
 ```
 let trades = csv::read("trades.csv") as DataFrame<{ date: Date, px: Float64 }>;
@@ -935,12 +942,16 @@ otherwise be unknown. Sources such as `csv::read` produce a `DataFrame` with an
 implementation-inferred (statically unknown) schema; ascribing a schema lets the
 compiler treat the result as a known schema from that point onward, so
 downstream column references can be checked statically. Only the named columns
-are part of that static schema: physical extras cannot be referenced downstream
-until a later ascription names them. It is also the way to
+are part of that static schema, and only they are kept: a column the type
+system could not let you name is not printed, joined or written either. It is
+also the way to
 re-establish a known schema after a data-dependent operator (e.g. `dcast`).
 
-This matches `DataFrame<Schema>` function parameter contracts in Section 10.3:
-both say "at least these columns" and hide unlisted columns from static use.
+A typed `let` (`let t: DataFrame<{ ... }> = expr;`, Section 3.4) and a function's
+declared return type (`-> DataFrame<{ ... }>`, Section 10.3) mean exactly this
+ascription. `DataFrame<Schema>` function **parameters** check the same contract
+but keep the caller's extra columns (Section 10.3): the caller can still name
+them.
 
 When the input's schema is **statically known and closed** (for example a
 `Table { ... }` literal, or any pipeline built on one or on another
@@ -956,9 +967,9 @@ as the reader's exact output schema (add `*` if the reader may yield more
 columns), so a call like `read_typed(...)[select { typo }]` is checked
 statically against the declared columns.
 
-The runtime check is enforced on both execution paths: the interpreter/REPL and
-generated C++ (the `ibex_compile` path emits a validating `ibex::ops::ascribe`
-call).
+The runtime check and the narrowing are enforced on every execution path: the
+REPL statement by statement, the whole-script planner, and generated C++ (the
+`ibex_compile` path emits a validating, narrowing `ibex::ops::ascribe` call).
 
 ### 3.7 Built-in Enums
 
@@ -3582,11 +3593,15 @@ This contract is checked at **call time**. A missing required column, or a
 required column with the wrong type, is a call-time error that names the
 parameter and the offending column. The same contract applies to a function's
 declared **return type**: the value produced by the body is validated against
-the return schema on the same minimum-required-columns basis.
+the return schema on the same minimum-required-columns basis, and then
+narrowed to the declared columns as an ascription is (Section 3.6), because
+the declared schema is all the caller can name. A bare `-> DataFrame` returns
+every column.
 
 > The minimum-required-columns interpretation applies specifically when a
 > schema appears as a function parameter or return type: matching is by column
-> name, extra columns are allowed, and column order is not significant. This
+> name, extra columns are allowed (kept for a parameter, dropped for a return
+> type), and column order is not significant. This
 > differs from the structural schema **type equality** in Section 3.3 (same
 > fields, same order), which governs when two schema *types* are considered
 > identical.

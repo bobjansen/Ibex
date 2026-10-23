@@ -1193,6 +1193,44 @@ t;
     CHECK(ibex::repl::execute_script(src, registry));
 }
 
+TEST_CASE("REPL declared schemas narrow on the statement path", "[repl][lazy][ascribe]") {
+    // An ascribed or typed `let` shows only its declared columns, and so does a
+    // function's declared return type; an untyped `let` shows everything.
+    ibex::runtime::ExternRegistry registry;
+    std::vector<std::vector<std::string>> decode_calls;
+    register_recording_lazy_source(registry, decode_calls);
+    std::vector<std::vector<std::string>> seen;
+    registry.register_scalar_table_consumer(
+        "columns_of", ibex::runtime::ScalarKind::Int,
+        [&seen](const ibex::runtime::Table& table, const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            std::vector<std::string> names;
+            for (const auto& entry : table.columns) {
+                names.push_back(entry.name);
+            }
+            seen.push_back(std::move(names));
+            return ibex::runtime::ExternValue{std::int64_t{0}};
+        });
+    const char* src = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+extern fn columns_of(df: DataFrame) -> Int from "fake.hpp";
+fn just_b(t: DataFrame) -> DataFrame<{ b: Int64 }> { t; }
+
+let force_statement_path: Int64 = 1;
+let ascribed = read_fake() as DataFrame<{ a: Int64 }>;
+let typed: DataFrame<{ b: Int64 }> = read_fake();
+let plain = read_fake();
+columns_of(ascribed);
+columns_of(typed);
+columns_of(plain);
+columns_of(just_b(plain));
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+    REQUIRE(seen == std::vector<std::vector<std::string>>{{"a"}, {"b"}, {"a", "b"}, {"b"}});
+    // The narrowed bindings decoded only their own column.
+    CHECK(decode_calls.front() == std::vector<std::string>{"a"});
+}
+
 TEST_CASE("REPL batch planner materializes a shared aggregate binding once", "[repl][batch]") {
     // `agg` is consumed by two different sinks. Cloned per reference, each
     // sink's plan would re-read the source and re-run the aggregate (one lazy

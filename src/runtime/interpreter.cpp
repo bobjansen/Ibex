@@ -192,6 +192,21 @@ auto project_table(const Table& input, const std::vector<ir::ColumnRef>& columns
     return output;
 }
 
+auto keep_columns(const Table& input, const std::set<std::string>& names) -> Table {
+    std::vector<ir::ColumnRef> keep;
+    keep.reserve(names.size());
+    for (const auto& entry : input.columns) {
+        if (names.contains(entry.name)) {
+            keep.push_back(ir::ColumnRef{.name = entry.name});
+        }
+    }
+    if (keep.size() == input.columns.size()) {
+        return input;
+    }
+    // Every name comes from `input`, so the projection cannot fail.
+    return std::move(project_table(input, keep).value());
+}
+
 namespace {
 
 /// Whether synthesizing `[min, max]` bound conjuncts is worth it for this

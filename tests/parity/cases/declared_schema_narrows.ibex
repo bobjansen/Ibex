@@ -1,0 +1,8 @@
+// Declared table schemas narrow to their listed columns (SPEC.md 3.6): an
+// ascription, a typed `let` and a function's declared return type. Interpreter
+// and generated C++ must agree on which columns survive.
+fn ids(t: DataFrame) -> DataFrame<{ id: Int64 }> { t; }
+let wide = Table { id = [1, 2, 3], price = [10.0, 20.0, 30.0], tag = ["a", "b", "c"] };
+let typed: DataFrame<{ id: Int64, price: Float64 }> = wide;
+let ascribed = typed as DataFrame<{ price: Float64 }>;
+(ids(wide) join ascribed[update { id = 2 }] on { id })[order { id }];

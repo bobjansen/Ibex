@@ -376,7 +376,12 @@ def verify(rows: list[dict]) -> str:
 
 
 def taskset(threads: int) -> list[str]:
-    return ["taskset", "-c", f"0-{threads - 1}"]
+    # The first `threads` CPUs this runner may use, not 0..threads-1: on a box
+    # whose sibling hyperthreads are numbered adjacently (0,1 = one core), 0-7
+    # is four cores. Run the harness under an outer `taskset` naming one CPU
+    # per core to pin engines to physical cores; unpinned, this is 0..N-1.
+    cpus = sorted(os.sched_getaffinity(0))[:threads]
+    return ["taskset", "-c", ",".join(str(c) for c in cpus)]
 
 
 def tool_versions() -> dict[str, str]:

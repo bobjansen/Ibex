@@ -1129,6 +1129,70 @@ let input = read_fake() as DataFrame<{ a: String }>;
     CHECK(decode_calls.empty());
 }
 
+TEST_CASE("REPL typed let of a lazy source stays lazy and checks the schema",
+          "[repl][lazy]") {
+    // `let t: DataFrame<{...}> = read(p);` checks the declared columns against
+    // the source's schema and stays lazy. It used to evaluate the call
+    // eagerly -- every column of the file, on one thread.
+    ibex::runtime::ExternRegistry registry;
+    std::vector<std::vector<std::string>> decode_calls;
+    std::vector<std::int64_t> captured;
+    register_recording_lazy_source(registry, decode_calls);
+    register_int_capture(registry, "n", captured);
+
+    const char* src = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+extern fn capture(df: DataFrame) -> Int from "fake.hpp";
+
+let force_statement_path: Int64 = 1;
+let input: DataFrame<{ a: Int64 }> = read_fake();
+let result = input[filter a > 1, select { n = count() }];
+capture(result);
+result;
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+    REQUIRE(captured == std::vector<std::int64_t>{2});
+    REQUIRE(decode_calls == std::vector<std::vector<std::string>>{{"a"}});
+
+    decode_calls.clear();
+    const char* mistyped = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+let force_statement_path: Int64 = 1;
+let input: DataFrame<{ a: String }> = read_fake();
+)";
+    CHECK_FALSE(ibex::repl::execute_script(mistyped, registry));
+    const char* missing = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+let force_statement_path: Int64 = 1;
+let input: DataFrame<{ c: Int64 }> = read_fake();
+)";
+    CHECK_FALSE(ibex::repl::execute_script(missing, registry));
+    CHECK(decode_calls.empty());
+}
+
+TEST_CASE("REPL typed let accepts a dictionary-encoded column as String", "[repl]") {
+    // Readers dictionary-encode string columns (Parquet does); the language
+    // type is still String. A typed `let` naming one used to be rejected.
+    ibex::runtime::ExternRegistry registry;
+    registry.register_table(
+        "get_names",
+        [](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            ibex::runtime::Table t;
+            t.add_column("name", ibex::Column<ibex::Categorical>{
+                                     std::vector<std::string>{"x", "y"},
+                                     ibex::Column<ibex::Categorical>::codes_storage{0, 1, 0}});
+            return ibex::runtime::ExternValue{std::move(t)};
+        });
+    const char* src = R"(
+extern fn get_names() -> DataFrame from "fake.hpp";
+let force_statement_path: Int64 = 1;
+let t: DataFrame<{ name: String }> = get_names();
+t;
+)";
+    CHECK(ibex::repl::execute_script(src, registry));
+}
+
 TEST_CASE("REPL batch planner materializes a shared aggregate binding once", "[repl][batch]") {
     // `agg` is consumed by two different sinks. Cloned per reference, each
     // sink's plan would re-read the source and re-run the aggregate (one lazy

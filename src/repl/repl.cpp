@@ -1086,7 +1086,13 @@ auto column_type_matches(const runtime::ColumnValue& col, parser::ScalarType exp
         case parser::ScalarType::Bool:
             return std::holds_alternative<Column<bool>>(col);
         case parser::ScalarType::String:
-            return std::holds_alternative<Column<std::string>>(col);
+            // A dictionary-encoded column is a String to the language; the
+            // encoding is a storage choice (readers pick it per column). The
+            // IR's ascription check agrees (`ir::ascription_type_satisfies`).
+            // Rejecting it failed every typed `let` naming a Parquet string
+            // column: `let n: DataFrame<{n_name: String}> = parquet::read(p)`.
+            return std::holds_alternative<Column<std::string>>(col) ||
+                   std::holds_alternative<Column<Categorical>>(col);
         case parser::ScalarType::Date:
             return std::holds_alternative<Column<Date>>(col);
         case parser::ScalarType::Timestamp:
@@ -3777,9 +3783,8 @@ auto find_library_source(const std::string& name, const std::vector<std::string>
 /// subset that query references.
 ///
 /// Returns nullopt when `expr` is not such a call — the caller then evaluates it
-/// eagerly, exactly as before. Only an un-annotated `let` takes this path; a
-/// `let t: DataFrame<{...}> = ...` is checked against the declared schema first,
-/// and validating that is the eager path's job.
+/// eagerly, exactly as before. A `let t: DataFrame<{...}> = ...` takes it too,
+/// with the declared columns checked against the lazy schema first.
 auto try_bind_lazy_source(parser::Expr& expr, runtime::TableRegistry& tables,
                           LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
                           ColumnRegistry& columns, ModelRegistry& models,
@@ -5262,6 +5267,32 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                     continue;
                 }
                 if (expect_table) {
+                    // A lazy source checks the declared columns against its
+                    // schema and stays lazy: the declaration asserts columns
+                    // and types (extras allowed), so nothing here needs the
+                    // data. Evaluated eagerly, it decoded every column of the
+                    // file on this thread -- lineitem took 7.3 s with four
+                    // columns declared.
+                    if (auto lazy = try_bind_lazy_source(
+                            *let_stmt.value, tables, lazy_tables, scalars, columns, models,
+                            functions, compile_time_lists, extern_decls, externs)) {
+                        if (!*lazy) {
+                            ibex::formatting::print("error: {}\n", lazy->error());
+                            return false;
+                        }
+                        if (auto err = validate_table_type(lazy->value()->schema(),
+                                                           *let_stmt.type)) {
+                            ibex::formatting::print("error: '{}': {}\n", let_stmt.name, *err);
+                            return false;
+                        }
+                        lazy_tables.insert_or_assign(let_stmt.name, std::move(lazy->value()));
+                        tables.erase(let_stmt.name);
+                        scalars.erase(let_stmt.name);
+                        columns.erase(let_stmt.name);
+                        models.erase(let_stmt.name);
+                        compile_time_lists.erase(let_stmt.name);
+                        continue;
+                    }
                     runtime::ModelResult model_value;
                     auto value = eval_table_expr(*let_stmt.value, tables, lazy_tables, scalars,
                                                  columns, models, functions, compile_time_lists,

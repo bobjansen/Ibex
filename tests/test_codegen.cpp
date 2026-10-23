@@ -678,6 +678,11 @@ TEST_CASE("emitter: forward_cli_args changes the main signature", "[codegen]") {
     auto plain = emit_to_string(*project);
     CHECK(contains(plain, "int main() {"));
     CHECK_FALSE(contains(plain, "forward_cli_args"));
+
+    // Both mains re-exec for huge pages first, as `ibex` and `ibex_eval` do.
+    CHECK(contains(out, "int main(int argc, char** argv) {\n    ibex::runtime::enable_huge_pages();"));
+    CHECK(contains(plain, "int main() {\n    ibex::runtime::enable_huge_pages();"));
+    CHECK(contains(plain, "#include <ibex/runtime/env.hpp>"));
 }
 
 // --- Chained pipeline --------------------------------------------------------

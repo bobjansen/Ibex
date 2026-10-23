@@ -419,6 +419,7 @@ void Emitter::emit_header(std::ostream& out, const Config& config, const Script*
     out << "#include <variant>\n";
     out << "#include <vector>\n";
     out << "#include <ibex/runtime/ops.hpp>\n";
+    out << "#include <ibex/runtime/env.hpp>\n";
     out << "#include <ibex/runtime/extern_registry.hpp>\n";
 
     for (const auto& hdr : config.extern_headers) {
@@ -436,9 +437,11 @@ void Emitter::emit_header(std::ostream& out, const Config& config, const Script*
         out << "ibex::runtime::Table " << config.entry_point_name << "() {\n";
     } else if (config.forward_cli_args) {
         out << "int main(int argc, char** argv) {\n";
+        out << "    ibex::runtime::enable_huge_pages();\n";
         out << "    ibex::ops::forward_cli_args(argc, argv);\n\n";
     } else {
         out << "int main() {\n";
+        out << "    ibex::runtime::enable_huge_pages();\n";
     }
 
     const bool has_scalars = !config.scalar_bindings.empty() ||

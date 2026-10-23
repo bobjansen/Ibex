@@ -9,6 +9,7 @@
 // "unknown table" errors on otherwise valid scripts.
 
 #include <ibex/repl/repl.hpp>
+#include <ibex/runtime/env.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 
 #if defined(IBEX_HAS_PARQUET_BACKEND)
@@ -41,6 +42,8 @@ auto read_file(const std::string& path) -> std::string {
 }  // namespace
 
 auto main(int argc, char** argv) -> int {
+    ibex::runtime::enable_huge_pages();  // re-execs once; see env.hpp
+
     CLI::App app{"ibex_eval — run an Ibex script non-interactively"};
 
     std::string script_path;

@@ -91,13 +91,16 @@ namespace {
 //     8. No. It could only reach Ibex's own executables anyway, not the Python
 //     or R modules running inside someone else's process.
 //   - whole-heap huge pages (`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`): -8.0%
-//     fresh at 1 core, -4.9% at 8, neutral warm. The lever, if single runs
-//     matter: have `ibex`/`ibex_eval` re-exec themselves with the tunable.
+//     fresh at 1 core, -4.9% at 8, neutral warm. Re-measured 2026-10-23
+//     (SF-10, 8 cores): -6.1% / -6.8% total, all 22 queries faster, q21 -19%.
+//     Adopted: `ibex`, `ibex_eval` and compiled programs re-exec themselves
+//     with the tunable (`enable_huge_pages`, env.hpp). The Python and R
+//     modules run inside someone else's process and cannot; set the variable
+//     before starting that process.
 //   - huge pages for column buffers only (`madvise` in NoInitAllocator):
 //     -0.6% / -1.8%, q04 +5%; reverted. The gain comes from every allocation
 //     (hash tables, selection vectors, Arrow buffers), not one class of them.
-// Reopen when one-shot command-line runs become a target, or a warm process
-// shows page faults. The full write-up: the retired
+// The full write-up of the September round: the retired
 // plans/allocator-and-huge-pages.md (`git show 47918401:plans/allocator-and-huge-pages.md`).
 void tune_allocator_once() {
 #ifdef __GLIBC__

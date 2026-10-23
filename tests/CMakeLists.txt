@@ -21,6 +21,7 @@ set(IBEX_TEST_SOURCES
     test_fs.cpp
     test_json.cpp
     test_e2e.cpp
+    test_env.cpp
     test_e2e_lazy_queries.cpp
     test_execution_profile.cpp
     test_gather_kernel.cpp

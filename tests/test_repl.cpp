@@ -1231,6 +1231,58 @@ columns_of(just_b(plain));
     CHECK(decode_calls.front() == std::vector<std::string>{"a"});
 }
 
+TEST_CASE("REPL a declared extern return schema narrows on both paths",
+          "[repl][lazy][ascribe]") {
+    ibex::runtime::ExternRegistry registry;
+    std::vector<std::vector<std::string>> decode_calls;
+    register_recording_lazy_source(registry, decode_calls);
+    registry.register_table(
+        "read_eager",
+        [](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            ibex::runtime::Table t;
+            t.add_column("x", ibex::Column<std::int64_t>{1, 2});
+            t.add_column("y", ibex::Column<std::int64_t>{3, 4});
+            return ibex::runtime::ExternValue{std::move(t)};
+        });
+    std::vector<std::vector<std::string>> seen;
+    registry.register_scalar_table_consumer(
+        "columns_of", ibex::runtime::ScalarKind::Int,
+        [&seen](const ibex::runtime::Table& table, const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            std::vector<std::string> names;
+            for (const auto& entry : table.columns) {
+                names.push_back(entry.name);
+            }
+            seen.push_back(std::move(names));
+            return ibex::runtime::ExternValue{std::int64_t{0}};
+        });
+    const auto body = std::string{R"(
+extern fn read_fake() -> DataFrame<{ a: Int64 }> from "fake.hpp";
+extern fn read_eager() -> DataFrame<{ y: Int64 }> from "fake.hpp";
+extern fn columns_of(df: DataFrame) -> Int from "fake.hpp";
+let lazy = read_fake();
+let eager = read_eager();
+columns_of(lazy);
+columns_of(eager);
+columns_of(read_fake());
+eager;
+)"};
+    // The script ends in a table, so without the typed scalar `let` the
+    // whole-script planner takes it (checked with --report-planner).
+    for (const bool statement_path : {false, true}) {
+        CAPTURE(statement_path);
+        seen.clear();
+        decode_calls.clear();
+        const auto src = (statement_path ? "let force_statement_path: Int64 = 1;\n" : "") + body;
+        REQUIRE(ibex::repl::execute_script(src, registry));
+        REQUIRE(seen == std::vector<std::vector<std::string>>{{"a"}, {"y"}, {"a"}});
+        for (const auto& call : decode_calls) {
+            CHECK(call == std::vector<std::string>{"a"});
+        }
+    }
+}
+
 TEST_CASE("REPL batch planner materializes a shared aggregate binding once", "[repl][batch]") {
     // `agg` is consumed by two different sinks. Cloned per reference, each
     // sink's plan would re-read the source and re-run the aggregate (one lazy

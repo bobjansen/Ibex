@@ -3458,12 +3458,31 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             }
             args.push_back(std::move(value.value()));
         }
+        if (!fn->func) {
+            // A lazy-only source consumed whole here (an inline table argument,
+            // say): read it through its lazy reader. Calling the empty eager
+            // function threw bad_function_call.
+            if (!fn->lazy_table_func) {
+                return std::unexpected("extern function has no reader: " + call.callee);
+            }
+            auto lazy = fn->lazy_table_func(args);
+            if (!lazy) {
+                return std::unexpected(lazy.error());
+            }
+            if (lazy.value() == nullptr) {
+                return std::unexpected("lazy source declined and has no eager reader: " +
+                                       call.callee);
+            }
+            return narrow_to_declared(std::move(lazy.value()), decl.return_type)
+                ->materialize(command_exec());
+        }
         auto result = fn->func(args);
         if (!result) {
             return std::unexpected(result.error());
         }
         if (auto* table = std::get_if<runtime::Table>(&result.value())) {
-            return std::move(*table);
+            // A declared return schema narrows the result to its listed columns.
+            return narrow_to_declared(std::move(*table), decl.return_type);
         }
         return std::unexpected("extern function returned scalar: " + call.callee);
     };
@@ -3857,7 +3876,11 @@ auto try_bind_lazy_source(parser::Expr& expr, runtime::TableRegistry& tables,
     if (lazy.has_value() && lazy.value() == nullptr) {
         return std::nullopt;  // declined: the eager path evaluates the call
     }
-    return lazy;
+    if (!lazy.has_value()) {
+        return lazy;
+    }
+    // A declared return schema narrows the source to its listed columns.
+    return narrow_to_declared(std::move(lazy.value()), decl->second.return_type);
 }
 
 /// `let t = parquet::read(p) as DataFrame<{...}>;` -- the same lazy binding as

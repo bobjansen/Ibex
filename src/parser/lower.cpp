@@ -2901,7 +2901,15 @@ class Lowerer {
         if (!args.has_value()) {
             return std::unexpected(std::move(args.error()));
         }
-        return builder_.extern_call(call.callee, std::move(*args));
+        auto node = builder_.extern_call(call.callee, std::move(*args));
+        // A declared return schema narrows the call's result to its listed
+        // columns, as any declared table schema does (SPEC.md 3.6). Proven
+        // against the declaration itself, so it narrows without a data check.
+        if (const auto decl = table_extern_decls_.find(call.callee);
+            decl != table_extern_decls_.end() && decl->second != nullptr) {
+            return declared_table_type(std::move(node), decl->second->return_type);
+        }
+        return node;
     }
 
     /// The arguments of an extern call, with names and defaults bound and each

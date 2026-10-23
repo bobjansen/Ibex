@@ -262,6 +262,32 @@ TEST_CASE("E2E: a typed let checks and narrows like an ascription", "[e2e][ascri
     CHECK(err.find("missing column 'salary'") != std::string::npos);
 }
 
+TEST_CASE("E2E: a declared extern return schema narrows the call's result",
+          "[e2e][ascribe]") {
+    auto tables = make_trades();
+    runtime::ExternRegistry registry;
+    registry.register_table(
+        "get_trades",
+        [&tables](const runtime::ExternArgs&) -> std::expected<runtime::ExternValue, std::string> {
+            return runtime::ExternValue{tables.at("trades")};
+        });
+    // The reader yields price and symbol; the declaration names price only.
+    auto out = run("extern fn get_trades() -> DataFrame<{ price: Int64 }> from \"fake.hpp\";\n"
+                   "get_trades();",
+                   {}, nullptr, &registry);
+    CHECK(out.columns.size() == 1);
+    CHECK(out.find("price") != nullptr);
+    // `*` does not keep the rest either; a bare `DataFrame` keeps everything.
+    auto open = run("extern fn get_trades() -> DataFrame<{ price: Int64, * }> from \"fake.hpp\";\n"
+                    "get_trades();",
+                    {}, nullptr, &registry);
+    CHECK(open.columns.size() == 1);
+    auto bare =
+        run("extern fn get_trades() -> DataFrame from \"fake.hpp\";\nget_trades();", {}, nullptr,
+            &registry);
+    CHECK(bare.find("symbol") != nullptr);
+}
+
 TEST_CASE("E2E: a declared return schema narrows a function's result", "[e2e][ascribe][udf]") {
     auto tables = make_trades();
     auto out = run(

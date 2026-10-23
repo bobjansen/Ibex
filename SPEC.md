@@ -965,7 +965,10 @@ Declared **reader return schemas** remain exact/open schema declarations: an
 `extern fn read_typed(path: String) -> DataFrame<{ ... }>` declaration is taken
 as the reader's exact output schema (add `*` if the reader may yield more
 columns), so a call like `read_typed(...)[select { typo }]` is checked
-statically against the declared columns.
+statically against the declared columns. Like an ascription, the declaration
+also **narrows** the call's result to the listed columns, `*` or not: a column
+the reader yields beyond its declaration cannot be named, so it is not kept.
+The declaration is trusted rather than checked against the data.
 
 The runtime check and the narrowing are enforced on every execution path: the
 REPL statement by statement, the whole-script planner, and generated C++ (the

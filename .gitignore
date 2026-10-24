@@ -6,7 +6,13 @@ ibex.Rcheck/**
 
 # IDE & tool caches
 .idea/
-.vscode/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/README.md
+CMakeUserPresets.json
 .cache/
 *.swp
 *.swo

@@ -1,0 +1,71 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Clang: configure Debug",
+      "type": "process", "command": "cmake", "args": ["--preset", "clang-debug"],
+      "problemMatcher": [], "options": { "cwd": "${workspaceFolder}" }
+    },
+    {
+      "label": "Clang: build Debug",
+      "type": "process", "command": "cmake", "args": ["--build", "--preset", "clang-debug"],
+      "dependsOn": "Clang: configure Debug", "problemMatcher": ["$gcc"],
+      "group": { "kind": "build", "isDefault": true }
+    },
+    {
+      "label": "Clang: build tests",
+      "type": "process", "command": "cmake", "args": ["--build", "--preset", "clang-tests"],
+      "dependsOn": "Clang: configure Debug", "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Clang: test (fast)",
+      "type": "process", "command": "ctest", "args": ["--preset", "clang-fast"],
+      "dependsOn": "Clang: build tests", "problemMatcher": [],
+      "group": { "kind": "test", "isDefault": true }
+    },
+    {
+      "label": "Clang: test (full)",
+      "type": "process", "command": "ctest", "args": ["--preset", "clang-full"],
+      "dependsOn": "Clang: build Debug", "problemMatcher": [], "group": "test"
+    },
+    {
+      "label": "Clang: configure Release",
+      "type": "process", "command": "cmake", "args": ["--preset", "clang-release"], "problemMatcher": []
+    },
+    {
+      "label": "Clang: build Release",
+      "type": "process", "command": "cmake", "args": ["--build", "--preset", "clang-release"],
+      "dependsOn": "Clang: configure Release", "problemMatcher": ["$gcc"], "group": "build"
+    },
+    {
+      "label": "Clang: configure sanitizers",
+      "type": "process", "command": "cmake", "args": ["--preset", "clang-sanitizers"], "problemMatcher": []
+    },
+    {
+      "label": "Clang: build sanitizers",
+      "type": "process", "command": "cmake", "args": ["--build", "--preset", "clang-sanitizers"],
+      "dependsOn": "Clang: configure sanitizers", "problemMatcher": ["$gcc"], "group": "build"
+    },
+    {
+      "label": "Clang: test sanitizers",
+      "type": "process", "command": "ctest", "args": ["--preset", "clang-sanitizers"],
+      "dependsOn": "Clang: build sanitizers", "problemMatcher": [], "group": "test"
+    },
+    {
+      "label": "Clang: tidy current file",
+      "type": "process", "command": "clang-tidy-21",
+      "args": ["-p", "${workspaceFolder}/build", "--header-filter=^.*/include/ibex/.*\\.hpp$", "${file}"],
+      "dependsOn": "Clang: configure Debug", "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Clang: check format current file",
+      "type": "process", "command": "${workspaceFolder}/scripts/clang-format.sh",
+      "args": ["--dry-run", "--Werror", "${file}"], "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Clang: format current file",
+      "type": "process", "command": "${workspaceFolder}/scripts/clang-format.sh",
+      "args": ["-i", "${file}"], "problemMatcher": ["$gcc"]
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "cmake.useCMakePresets": "always",
+  "cmake.configureOnOpen": true,
+  "cmake.ctest.testExplorerIntegrationEnabled": true,
+  "cmake.debugConfig": { "type": "lldb" },
+  "clangd.arguments": [
+    "--background-index",
+    "--clang-tidy",
+    "--completion-style=detailed",
+    "--header-insertion=iwyu",
+    "--function-arg-placeholders",
+    "--enable-config"
+  ],
+  "clangd.checkUpdates": false,
+  "C_Cpp.intelliSenseEngine": "disabled",
+  "C_Cpp.autocomplete": "disabled",
+  "C_Cpp.errorSquiggles": "disabled",
+  "C_Cpp.codeAnalysis.runAutomatically": false,
+  "[cpp]": {
+    "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd",
+    "editor.formatOnSave": true,
+    "editor.inlayHints.enabled": "on"
+  },
+  "[c]": {
+    "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd",
+    "editor.formatOnSave": true
+  },
+  "files.associations": { "*.hpp": "cpp", "*.tpp": "cpp", "*.ipp": "cpp", "*.ibex": "ibex" },
+  "files.watcherExclude": {
+    "**/build/**": true,
+    "**/build-*/**": true,
+    "**/.cache/**": true
+  },
+  "search.exclude": { "**/build": true, "**/build-*": true, "**/.cache": true },
+  "files.exclude": { "**/.cache": true }
+}

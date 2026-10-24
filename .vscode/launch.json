@@ -1,0 +1,32 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Clang: debug Ibex REPL",
+      "type": "lldb", "request": "launch",
+      "program": "${workspaceFolder}/build/tools/ibex",
+      "args": [], "cwd": "${workspaceFolder}",
+      "terminal": "integrated", "preLaunchTask": "Clang: build Debug"
+    },
+    {
+      "name": "Clang: debug tests",
+      "type": "lldb", "request": "launch",
+      "program": "${workspaceFolder}/build/tests/ibex_tests",
+      "args": ["${input:testFilter}"], "cwd": "${workspaceFolder}",
+      "terminal": "integrated", "preLaunchTask": "Clang: build tests"
+    },
+    {
+      "name": "Clang: debug selected CMake target",
+      "type": "lldb", "request": "launch",
+      "program": "${command:cmake.launchTargetPath}",
+      "args": [], "cwd": "${workspaceFolder}", "terminal": "integrated"
+    },
+    {
+      "name": "Clang: attach",
+      "type": "lldb", "request": "attach", "pid": "${command:pickMyProcess}"
+    }
+  ],
+  "inputs": [
+    { "id": "testFilter", "type": "promptString", "description": "Catch2 test name, wildcard, or [tag]", "default": "*" }
+  ]
+}

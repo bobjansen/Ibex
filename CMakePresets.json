@@ -1,0 +1,68 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 26, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "clang-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": true
+      }
+    },
+    {
+      "name": "clang-debug",
+      "displayName": "Clang Debug (editor)",
+      "inherits": "clang-base",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "IBEX_BUILD_LIGHTGBM": false,
+        "IBEX_BUILD_PARQUET": false,
+        "IBEX_BUILD_UI": false,
+        "IBEX_BUILD_PYTHON_BRIDGE": false
+      }
+    },
+    {
+      "name": "clang-release",
+      "displayName": "Clang Release (benchmarks)",
+      "inherits": "clang-base",
+      "binaryDir": "${sourceDir}/build-release",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "clang-sanitizers",
+      "displayName": "Clang Debug + ASan / UBSan",
+      "inherits": "clang-debug",
+      "binaryDir": "${sourceDir}/build-sanitizers",
+      "cacheVariables": { "IBEX_ENABLE_SANITIZERS": true }
+    }
+  ],
+  "buildPresets": [
+    { "name": "clang-debug", "configurePreset": "clang-debug" },
+    { "name": "clang-release", "configurePreset": "clang-release" },
+    { "name": "clang-sanitizers", "configurePreset": "clang-sanitizers" },
+    { "name": "clang-tests", "configurePreset": "clang-debug", "targets": ["ibex_tests"] }
+  ],
+  "testPresets": [
+    {
+      "name": "clang-fast",
+      "configurePreset": "clang-debug",
+      "output": { "outputOnFailure": true },
+      "filter": { "exclude": { "label": "slow" } }
+    },
+    {
+      "name": "clang-full",
+      "configurePreset": "clang-debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "clang-sanitizers",
+      "configurePreset": "clang-sanitizers",
+      "output": { "outputOnFailure": true },
+      "filter": { "exclude": { "label": "slow" } }
+    }
+  ]
+}

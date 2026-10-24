@@ -76,8 +76,8 @@ unique and slice modules were not part of this initial survey.
 The adapter currently translates numeric sum/mean and row count (`pl.len()`).
 The observed aggregate rejections are:
 
-* Column `count`: 17; this requires its non-null-count semantics, not an alias
-  to row count.
+* Visitor `count`: 17; this name covers both non-null column count and
+  column length. Its `include_nulls` option distinguishes their semantics.
 * `first`: 13; `last`: 1; first/last non-null: 1 each.
 * `implode`: 7; `median`: 4.
 * `min`, `max`, `n_unique`: 1 each.
@@ -214,3 +214,38 @@ Polars can simplify an edge reduction over computed values into an expression
 Slice, which remains unsupported by this adapter; the computed-input path is
 covered with optimizer simplification disabled. Struct/list outputs remain
 outside the agreed scope.
+
+
+## Column count and length follow-up
+
+Both Python frontends now support `col("x").count()` (non-null values) and
+`col("x").len()` (all values including nulls), returning UInt32. Empty global
+reductions return zero, and empty grouped reductions produce no groups. NaN
+and false Boolean values count as present. Computed row-expression counts use
+a native non-null indicator reduction; simple columns use existing native
+`count(col)`. No native runtime changes were required.
+
+The visitor calls both forms `count`, with a Boolean `include_nulls` option.
+Of the 233 count rejections after the first/last work, 232 were column lengths;
+only one was a non-null count. All 233 now get past that translation: 116 reach
+reduction broadcasting in `with_columns`, 116 reach the `repeat` function, and
+one reaches an expression Filter. The selected survey still has 339 matching
+queries, 1,291 rejections, 60 fully passing tests, 286 tests with unsupported
+queries and 730 unexercised tests. There are zero mismatches or support
+regressions. Dedicated tests verify the newly accepted count semantics.
+
+Current first-blocker totals are below. Broadcasting is classified under
+grouping/update semantics, correcting two previously misclassified cast rejections.
+Structs and lists remain intentionally outside the project scope.
+
+| First blocker | Rejected collections | Observed gaps |
+|---|---:|---|
+| Input dtypes | 384 | UInt32/64, 128-bit integers, List, Struct, Decimal, Null, Time |
+| Plan operations | 271 | MapFunction 259; Distinct 5; Join 4; Slice 3 |
+| Functions/operators | 221 | Repeat 116; EqValidity 58; quantile 11; struct construction, fused/temporal arithmetic and others |
+| Literals | 179 | Null 58; unsigned/128-bit 118; Series 3 |
+| Grouping/update semantics | 126 | Reduction broadcasting 118; dynamic/rolling/UDF/sliced groups and computed keys 8 |
+| Expression operations | 50 | SortBy 36; Sort 9; Window 4; Filter 1 |
+| Aggregates | 35 | Median 16; list aggregation 8; Boolean/temporal means 8; numeric min/max and distinct count 3 |
+| Casts | 25 | Lossy temporal casts/timezone changes 24; temporal/non-temporal casts 1 |
+| **Total** | **1,291** | |

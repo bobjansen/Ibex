@@ -249,6 +249,7 @@
     ]
   },
   "unordered_tests": {
-    "tests/unit/operations/test_group_by.py::test_group_by_cse_alias_26423": "Upstream explicitly asserts check_row_order=False after unordered group_by."
+    "tests/unit/operations/test_group_by.py::test_group_by_cse_alias_26423": "Upstream explicitly asserts check_row_order=False after unordered group_by.",
+    "tests/unit/operations/test_group_by.py::test_group_by_first_nondet_24278": "Upstream compares only the sum of collected first-row indices across eleven unordered group_by collections; row order is not part of its contract. Compare the full row multiset here."
   }
 }

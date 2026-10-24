@@ -119,6 +119,13 @@ After adding boundary-only Int32 support, the same survey has 20 passing tests,
 matching queries and 1,557 rejections, with zero mismatches. These newly passing
 comparisons are now part of the required regression baseline.
 
+With Float32 input support, matches increase to 76 queries across 23 fully
+passing tests, with 1,554 query rejections, 323 unsupported tests and 730
+unexercised tests. There are no mismatches in these selected upstream tests.
+The engine's documented Float64-intermediate policy can deliberately differ
+from Polars' Float32 rounding; dedicated engine tests verify that policy.
+The upstream comparisons retain their original strict checks and tolerances.
+
 Expand `targets` to more upstream modules or use `--select` to investigate.
 When support improves, add newly passing query ordinals from the report to
 `required_pass_queries` so that losing support fails CI rather than silently

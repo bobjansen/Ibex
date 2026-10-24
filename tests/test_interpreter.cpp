@@ -19808,9 +19808,9 @@ TEST_CASE("A streamed semi join left input is filtered by its right keys",
     // left rows can match. An anti join keeps the other rows, so it must leave
     // the slot alone and decode everything.
     runtime::Table right;
-    right.add_column("k", Column<std::int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0},
-                     runtime::ValidityBitmap{true, true, true, true, true, true, true, true,
-                                             true, true, false});
+    right.add_column(
+        "k", Column<std::int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0},
+        runtime::ValidityBitmap{true, true, true, true, true, true, true, true, true, true, false});
     runtime::TableRegistry registry;
     registry.emplace("right_t", std::move(right));
 

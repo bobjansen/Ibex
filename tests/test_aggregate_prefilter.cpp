@@ -404,8 +404,8 @@ TEST_CASE("aggregate prefilter: survivors declines past max_keep, serially and i
         const auto at_cap = prefilter->survivors(slots.data(), kGroups, 1, p, 8, want.size());
         REQUIRE(at_cap.has_value());
         CHECK(*at_cap == want);
-        CHECK_FALSE(prefilter->survivors(slots.data(), kGroups, 1, p, 8, want.size() - 1)
-                        .has_value());
+        CHECK_FALSE(
+            prefilter->survivors(slots.data(), kGroups, 1, p, 8, want.size() - 1).has_value());
     }
 }
 

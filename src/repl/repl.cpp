@@ -3900,9 +3900,9 @@ auto try_bind_lazy_source(parser::Expr& expr, runtime::TableRegistry& tables,
 /// an ascribed lazy-source call, or when the schema cannot prove the
 /// ascription (the eager path checks it against the data).
 auto try_bind_ascribed_lazy_source(parser::Expr& expr, runtime::TableRegistry& tables,
-                                   LazyTableRegistry& lazy_tables,
-                                   runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                                   ModelRegistry& models, const FunctionRegistry& functions,
+                                   LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
+                                   ColumnRegistry& columns, ModelRegistry& models,
+                                   const FunctionRegistry& functions,
                                    CompileTimeListRegistry& compile_time_lists,
                                    const ExternDeclRegistry& extern_decls,
                                    const runtime::ExternRegistry& externs)
@@ -3913,9 +3913,9 @@ auto try_bind_ascribed_lazy_source(parser::Expr& expr, runtime::TableRegistry& t
         return std::nullopt;
     }
     InlineSourceRewrites rewrites(&lazy_tables);
-    if (auto err = rewrite_inline_sources(expr, rewrites, tables, lazy_tables, scalars, columns,
-                                          models, functions, compile_time_lists, extern_decls,
-                                          externs)) {
+    if (auto err =
+            rewrite_inline_sources(expr, rewrites, tables, lazy_tables, scalars, columns, models,
+                                   functions, compile_time_lists, extern_decls, externs)) {
         return std::unexpected(*err);
     }
     if (rewrites.temp_names.size() != 1) {
@@ -5273,9 +5273,9 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                                                  columns, models, functions, compile_time_lists,
                                                  extern_decls, externs);
                 if (!lazy) {
-                    lazy = try_bind_ascribed_lazy_source(
-                        *let_stmt.value, tables, lazy_tables, scalars, columns, models, functions,
-                        compile_time_lists, extern_decls, externs);
+                    lazy = try_bind_ascribed_lazy_source(*let_stmt.value, tables, lazy_tables,
+                                                         scalars, columns, models, functions,
+                                                         compile_time_lists, extern_decls, externs);
                 }
                 if (lazy) {
                     if (!*lazy) {
@@ -5337,8 +5337,8 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                             ibex::formatting::print("error: {}\n", lazy->error());
                             return false;
                         }
-                        if (auto err = validate_table_type(lazy->value()->schema(),
-                                                           *let_stmt.type)) {
+                        if (auto err =
+                                validate_table_type(lazy->value()->schema(), *let_stmt.type)) {
                             ibex::formatting::print("error: '{}': {}\n", let_stmt.name, *err);
                             return false;
                         }

@@ -188,8 +188,8 @@ TEST_CASE("required_columns: a semi or anti join reads only its keys from the ri
         CHECK_FALSE(demand.at("right").all);
         CHECK(demand.at("right").names == std::set<std::string>{"right_id"});
 
-        auto projected = with_child(std::make_unique<ir::ProjectNode>(ir::NodeId{3}, refs({"a"})),
-                                    make_join());
+        auto projected =
+            with_child(std::make_unique<ir::ProjectNode>(ir::NodeId{3}, refs({"a"})), make_join());
         demand = ir::required_columns(*projected);
         CHECK(demand.at("left").names == std::set<std::string>{"a", "left_id"});
         CHECK(demand.at("right").names == std::set<std::string>{"right_id"});

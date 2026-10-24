@@ -109,11 +109,11 @@ TEST_CASE("dictionary header count follows long-form field ids and skips unknown
           "[parquet][dictionary]") {
     // Field 1 written long-form (delta 0, explicit zigzag id), then an unknown
     // binary field 5 and an unknown list field 6 before the dictionary header.
-    std::vector<std::uint8_t> bytes{0x05, 0x02, 0x04,          // 1: type = 2
-                                    0x48, 0x03, 'a', 'b', 'c',  // 5: binary "abc"
-                                    0x19, 0x25, 0x02, 0x04,     // 6: list<i32>{1, 2}
-                                    0x1C,                       // 7: struct
-                                    0x15, 0x32,                 //   1: num_values = 25
+    std::vector<std::uint8_t> bytes{0x05, 0x02, 0x04,             // 1: type = 2
+                                    0x48, 0x03, 'a',  'b',  'c',  // 5: binary "abc"
+                                    0x19, 0x25, 0x02, 0x04,       // 6: list<i32>{1, 2}
+                                    0x1C,                         // 7: struct
+                                    0x15, 0x32,                   //   1: num_values = 25
                                     0x00, 0x00};
     CHECK(entries_of(bytes) == 25);
 }
@@ -125,7 +125,8 @@ TEST_CASE("dictionary header count declines anything but a whole dictionary page
 
     const auto whole = page_header(2, 410665, true);
     for (std::size_t cut = 0; cut < whole.size(); ++cut) {
-        const std::vector<std::uint8_t> truncated(whole.begin(), whole.begin() + static_cast<std::ptrdiff_t>(cut));
+        const std::vector<std::uint8_t> truncated(whole.begin(),
+                                                  whole.begin() + static_cast<std::ptrdiff_t>(cut));
         CHECK_FALSE(entries_of(truncated).has_value());
     }
 

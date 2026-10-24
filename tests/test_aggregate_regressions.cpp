@@ -317,8 +317,8 @@ TEST_CASE("categorical first and last keep codes, and survive a dictionary chang
     const bool with_nulls = GENERATE(false, true);
     const bool second_dictionary = GENERATE(false, true);
     using Cat = Column<Categorical>;
-    const auto shared_dict =
-        std::make_shared<std::vector<std::string>>(std::vector<std::string>{"a", "b", "c", "d", "e"});
+    const auto shared_dict = std::make_shared<std::vector<std::string>>(
+        std::vector<std::string>{"a", "b", "c", "d", "e"});
     const auto shared_index = std::make_shared<Cat::index_map>();
     for (std::size_t i = 0; i < shared_dict->size(); ++i) {
         shared_index->emplace((*shared_dict)[i], static_cast<Cat::code_type>(i));
@@ -338,9 +338,7 @@ TEST_CASE("categorical first and last keep codes, and survive a dictionary chang
             k.push_back(key);
         }
         c.add_column("k", std::move(k));
-        Cat v = own_dictionary
-                    ? Cat{}
-                    : Cat{shared_dict, shared_index, Cat::codes_storage{}};
+        Cat v = own_dictionary ? Cat{} : Cat{shared_dict, shared_index, Cat::codes_storage{}};
         for (const auto& value : values) {
             v.push_back(value);
         }

@@ -1842,11 +1842,11 @@ class HashAggregateState final {
             cat_agg_template_.assign(n_aggs_, std::nullopt);
             if (!group_by_->empty()) {
                 for (std::size_t i = 0; i < n_aggs_; ++i) {
-                    cat_agg_coded_[i] = plan_[i].categorical &&
-                                                (plan_[i].func == ir::AggFunc::First ||
+                    cat_agg_coded_[i] =
+                        plan_[i].categorical && (plan_[i].func == ir::AggFunc::First ||
                                                  plan_[i].func == ir::AggFunc::Last)
-                                            ? 1U
-                                            : 0U;
+                            ? 1U
+                            : 0U;
                 }
             }
             if (has_count_distinct_) {
@@ -6128,8 +6128,8 @@ class HashAggregateState final {
                               const std::vector<std::uint8_t>& seeded) {
         bool has_text = false;
         for (std::size_t a = 0; a < n_aggs_; ++a) {
-            has_text = has_text || (seeded[a] != 0U && plan_[a].kind == ExprType::String &&
-                                    !cat_agg_coded(a));
+            has_text = has_text ||
+                       (seeded[a] != 0U && plan_[a].kind == ExprType::String && !cat_agg_coded(a));
         }
         if (has_text && text_store_.size() < flat_slots_.size()) {
             text_store_.resize(flat_slots_.size(), ScalarValue{std::string{}});
@@ -8086,9 +8086,10 @@ class HashAggregateState final {
                             std::get<Column<Timestamp>>(column).push_back(
                                 Timestamp{slot.int_value});
                         } else if (codes != nullptr) {
-                            codes[g] = slot.present() ? static_cast<Column<Categorical>::code_type>(
-                                                            slot.int_value)
-                                                      : 0;
+                            codes[g] =
+                                slot.present()
+                                    ? static_cast<Column<Categorical>::code_type>(slot.int_value)
+                                    : 0;
                         } else {
                             // No valid row may have initialized the text side array.
                             if (slot.present()) {

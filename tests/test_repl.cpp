@@ -1129,8 +1129,7 @@ let input = read_fake() as DataFrame<{ a: String }>;
     CHECK(decode_calls.empty());
 }
 
-TEST_CASE("REPL typed let of a lazy source stays lazy and checks the schema",
-          "[repl][lazy]") {
+TEST_CASE("REPL typed let of a lazy source stays lazy and checks the schema", "[repl][lazy]") {
     // `let t: DataFrame<{...}> = read(p);` checks the declared columns against
     // the source's schema and stays lazy. It used to evaluate the call
     // eagerly -- every column of the file, on one thread.
@@ -1231,20 +1230,18 @@ columns_of(just_b(plain));
     CHECK(decode_calls.front() == std::vector<std::string>{"a"});
 }
 
-TEST_CASE("REPL a declared extern return schema narrows on both paths",
-          "[repl][lazy][ascribe]") {
+TEST_CASE("REPL a declared extern return schema narrows on both paths", "[repl][lazy][ascribe]") {
     ibex::runtime::ExternRegistry registry;
     std::vector<std::vector<std::string>> decode_calls;
     register_recording_lazy_source(registry, decode_calls);
-    registry.register_table(
-        "read_eager",
-        [](const ibex::runtime::ExternArgs&)
-            -> std::expected<ibex::runtime::ExternValue, std::string> {
-            ibex::runtime::Table t;
-            t.add_column("x", ibex::Column<std::int64_t>{1, 2});
-            t.add_column("y", ibex::Column<std::int64_t>{3, 4});
-            return ibex::runtime::ExternValue{std::move(t)};
-        });
+    registry.register_table("read_eager",
+                            [](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                ibex::runtime::Table t;
+                                t.add_column("x", ibex::Column<std::int64_t>{1, 2});
+                                t.add_column("y", ibex::Column<std::int64_t>{3, 4});
+                                return ibex::runtime::ExternValue{std::move(t)};
+                            });
     std::vector<std::vector<std::string>> seen;
     registry.register_scalar_table_consumer(
         "columns_of", ibex::runtime::ScalarKind::Int,

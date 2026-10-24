@@ -81,10 +81,10 @@ class GroupPrefilter {
     /// pass: a caller that would discard a long list (most groups pass, so
     /// compacting is not worth it) learns that from the per-range counts,
     /// before the ranges are concatenated.
-    [[nodiscard]] auto survivors(const AggSlotCore* slots, std::size_t groups, std::size_t stride,
-                                 WorkerPool* pool, std::size_t workers,
-                                 std::size_t max_keep = std::numeric_limits<std::size_t>::max())
-        const -> std::optional<std::vector<std::uint32_t>>;
+    [[nodiscard]] auto survivors(
+        const AggSlotCore* slots, std::size_t groups, std::size_t stride, WorkerPool* pool,
+        std::size_t workers, std::size_t max_keep = std::numeric_limits<std::size_t>::max()) const
+        -> std::optional<std::vector<std::uint32_t>>;
 
    private:
     enum class Read : std::uint8_t { Count, Int, Double, Mean };

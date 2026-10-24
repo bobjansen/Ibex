@@ -528,10 +528,9 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
             return std::unexpected(std::move(right.error()));
         }
         return pipeline_executor_detail::make_pipelined_stage_if(
-            make_chunked_semi_anti_join_operator(std::move(left_op.value()),
-                                                 std::move(right.value()), join.kind(),
-                                                 &join.keys(), &exec, scan_sink,
-                                                 streamed_left_scan_of(*join.children()[0], exec)),
+            make_chunked_semi_anti_join_operator(
+                std::move(left_op.value()), std::move(right.value()), join.kind(), &join.keys(),
+                &exec, scan_sink, streamed_left_scan_of(*join.children()[0], exec)),
             stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
     }
     if (!plan.streaming_join.has_value()) {

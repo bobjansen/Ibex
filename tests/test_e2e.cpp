@@ -267,8 +267,8 @@ TEST_CASE("E2E: an inlined function checks its parameter schemas", "[e2e][ascrib
     // inlined the call without any check. Extras still pass through.
     auto tables = make_trades();
     // A registry table's schema is unknown statically: the check runs on the data.
-    auto err = run_error("fn pay(t: DataFrame<{ salary: Int64 }>) -> DataFrame { t; }\npay(trades);",
-                         tables);
+    auto err = run_error(
+        "fn pay(t: DataFrame<{ salary: Int64 }>) -> DataFrame { t; }\npay(trades);", tables);
     CHECK(err.find("missing column 'salary'") != std::string::npos);
     auto ok = run("fn px(t: DataFrame<{ price: Int64 }>) -> DataFrame { t; }\npx(trades);", tables);
     CHECK(ok.find("symbol") != nullptr);
@@ -281,8 +281,7 @@ TEST_CASE("E2E: an inlined function checks its parameter schemas", "[e2e][ascrib
     CHECK(lowered.error().message.find("pay: parameter 't'") != std::string::npos);
 }
 
-TEST_CASE("E2E: a declared extern return schema narrows the call's result",
-          "[e2e][ascribe]") {
+TEST_CASE("E2E: a declared extern return schema narrows the call's result", "[e2e][ascribe]") {
     auto tables = make_trades();
     runtime::ExternRegistry registry;
     registry.register_table(
@@ -291,32 +290,33 @@ TEST_CASE("E2E: a declared extern return schema narrows the call's result",
             return runtime::ExternValue{tables.at("trades")};
         });
     // The reader yields price and symbol; the declaration names price only.
-    auto out = run("extern fn get_trades() -> DataFrame<{ price: Int64 }> from \"fake.hpp\";\n"
-                   "get_trades();",
-                   {}, nullptr, &registry);
+    auto out =
+        run("extern fn get_trades() -> DataFrame<{ price: Int64 }> from \"fake.hpp\";\n"
+            "get_trades();",
+            {}, nullptr, &registry);
     CHECK(out.columns.size() == 1);
     CHECK(out.find("price") != nullptr);
     // `*` does not keep the rest either; a bare `DataFrame` keeps everything.
-    auto open = run("extern fn get_trades() -> DataFrame<{ price: Int64, * }> from \"fake.hpp\";\n"
-                    "get_trades();",
-                    {}, nullptr, &registry);
+    auto open =
+        run("extern fn get_trades() -> DataFrame<{ price: Int64, * }> from \"fake.hpp\";\n"
+            "get_trades();",
+            {}, nullptr, &registry);
     CHECK(open.columns.size() == 1);
-    auto bare =
-        run("extern fn get_trades() -> DataFrame from \"fake.hpp\";\nget_trades();", {}, nullptr,
-            &registry);
+    auto bare = run("extern fn get_trades() -> DataFrame from \"fake.hpp\";\nget_trades();", {},
+                    nullptr, &registry);
     CHECK(bare.find("symbol") != nullptr);
 }
 
 TEST_CASE("E2E: a declared return schema narrows a function's result", "[e2e][ascribe][udf]") {
     auto tables = make_trades();
-    auto out = run(
-        "fn prices(t: DataFrame) -> DataFrame<{ price: Int64 }> { t; }\nprices(trades);", tables);
+    auto out = run("fn prices(t: DataFrame) -> DataFrame<{ price: Int64 }> { t; }\nprices(trades);",
+                   tables);
     CHECK(out.columns.size() == 1);
     CHECK(out.find("price") != nullptr);
     // A bare `-> DataFrame` returns every column; a parameter schema keeps the
     // caller's extras.
-    auto all = run("fn keep(t: DataFrame<{ price: Int64 }>) -> DataFrame { t; }\nkeep(trades);",
-                   tables);
+    auto all =
+        run("fn keep(t: DataFrame<{ price: Int64 }>) -> DataFrame { t; }\nkeep(trades);", tables);
     CHECK(all.find("symbol") != nullptr);
 }
 

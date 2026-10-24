@@ -187,8 +187,7 @@ auto LazyTable::project_uncached(const std::set<std::string>& names, const Execu
     return out;
 }
 
-auto LazyTable::narrowed(const std::set<std::string>& names) const
-    -> std::shared_ptr<LazyTable> {
+auto LazyTable::narrowed(const std::set<std::string>& names) const -> std::shared_ptr<LazyTable> {
     auto view = std::make_shared<LazyTable>(*this);
     Table schema;
     for (const auto& entry : schema_.columns) {

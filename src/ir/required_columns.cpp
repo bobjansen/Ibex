@@ -165,9 +165,10 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
             // A fused ascription narrows the scan exactly as the Ascribe node
             // it replaced did.
             const auto& scan = node_cast<ScanNode>(node);
-            const ColumnDemand narrowed = scan.ascribed_schema().has_value()
-                                              ? narrow_to_ascribed(need, scan.ascribed_schema()->fields)
-                                              : need;
+            const ColumnDemand narrowed =
+                scan.ascribed_schema().has_value()
+                    ? narrow_to_ascribed(need, scan.ascribed_schema()->fields)
+                    : need;
             out.sources[scan.source_name()].merge(narrowed);
             out.source_nodes[&node].merge(narrowed);
             return;

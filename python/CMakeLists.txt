@@ -114,6 +114,13 @@ if(IBEX_BUILD_TESTS AND IBEX_PYARROW_IMPORT_RESULT EQUAL 0)
                 "IBEX_TEST_PARQUET=${IBEX_PYTHON_HAS_PARQUET}"
                 "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/python/test_ibex_temporal.py"
         )
+        add_test(
+            NAME ibex_polars_first_last
+            COMMAND "${CMAKE_COMMAND}" -E env
+                "PYTHONPATH=${PROJECT_BINARY_DIR}/python:${PROJECT_SOURCE_DIR}/python"
+                "IBEX_TEST_PARQUET=${IBEX_PYTHON_HAS_PARQUET}"
+                "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/python/test_ibex_first_last.py"
+        )
         execute_process(
             COMMAND "${Python3_EXECUTABLE}" -c
                 "import pytest, hypothesis; assert pytest.__version__ == '9.0.3'; assert hypothesis.__version__ == '6.170.9'"

@@ -42,6 +42,9 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             return f"coalesce(sum({render(args[0])}), {bind(zero)})"
         if op == "mean":
             return f"mean({render(args[0])})"
+        if op in ("first", "last", "first_non_null", "last_non_null"):
+            native = op.removesuffix("_non_null") if op.endswith("_non_null") else op + "_null"
+            return f"{native}({render(args[0])})"
         if op in ("min", "max"):
             return f"{op}({render(args[0])})"
         if op == "len":
@@ -237,6 +240,13 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
             return pa.scalar(args[0]).type
         if op == "alias":
             return dtype(args[0])
+        if op in ("first", "last", "first_non_null", "last_non_null"):
+            result = dtype(args[0])
+            if not args[0]._row_reference:
+                raise NotImplementedError(f"{op} currently requires a row expression")
+            if result == pa.date32() and op.endswith("_non_null"):
+                raise NotImplementedError("null-skipping Date edge reductions are unsupported by Ibex")
+            return result
         if op in ("sum", "mean", "min", "max"):
             result = dtype(args[0])
             if result not in numeric or not args[0]._row_reference:

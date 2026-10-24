@@ -53,6 +53,19 @@ class Expr:
             raise NotImplementedError("nested reductions are not supported yet")
         return Expr("mean", (self,))
 
+    def first(self, *, ignore_nulls=False):
+        return self._edge("first", ignore_nulls)
+
+    def last(self, *, ignore_nulls=False):
+        return self._edge("last", ignore_nulls)
+
+    def _edge(self, name, ignore_nulls):
+        if self._aggregate:
+            raise NotImplementedError("nested reductions are not supported yet")
+        if type(ignore_nulls) is not bool:
+            raise TypeError("ignore_nulls must be a bool")
+        return Expr(name + ("_non_null" if ignore_nulls else ""), (self,))
+
     def is_between(self, lower_bound, upper_bound, closed="both"):
         if closed not in ("both", "left", "right", "none"):
             raise ValueError("closed must be 'both', 'left', 'right', or 'none'")
@@ -64,13 +77,13 @@ class Expr:
 
     @property
     def _aggregate(self):
-        return self._op in ("sum", "mean", "min", "max", "len") or any(
+        return self._op in ("sum", "mean", "min", "max", "first", "last", "first_non_null", "last_non_null", "len") or any(
             arg._aggregate for arg in self._args if isinstance(arg, Expr)
         )
 
     @property
     def _row_reference(self):
-        if self._op in ("sum", "mean", "min", "max", "len"):
+        if self._op in ("sum", "mean", "min", "max", "first", "last", "first_non_null", "last_non_null", "len"):
             return False
         return self._op == "col" or any(
             arg._row_reference for arg in self._args if isinstance(arg, Expr)

@@ -39,6 +39,7 @@ from pathlib import Path
 
 from print_table import FRAMEWORK_ORDER, QUERY_LABEL, QUERY_ORDER
 from extract_bench_code import extract_all, SOURCES
+from h2o.publication import archive_inputs as h2o_archive_inputs, read as read_h2o_checked
 
 GITHUB = "https://github.com/bobjansen/Ibex/blob/main"
 
@@ -287,24 +288,27 @@ H2O_DATA_LABEL = {
 def load_h2o(paths: list[Path]) -> dict:
     """h2o payload from run-h2o.sh artifacts or h2o/run.py TSVs, in order."""
     texts: list[tuple[str, str]] = []
+    checks: dict[str, str] = {}
     cpu = ""
     for p in paths:
         if p.name.endswith(".tar.gz"):
-            texts += _tar_member_texts(p, r"results/h2o_[^/]*\.tsv$")
+            for source, text, sidecar in h2o_archive_inputs(p):
+                texts.append((source, text))
+                checks[source] = sidecar
             for _, v in _tar_member_texts(p, r"results/versions\.txt$"):
                 m = re.search(r"Model name:\s*(.+)", v)
                 cpu = m.group(1).strip() if m else cpu
         else:
-            texts.append((p.name, p.read_text(encoding="utf-8")))
+            source = str(p)
+            texts.append((source, p.read_text(encoding="utf-8")))
+            checks[source] = p.with_name(p.name + ".checks.json").read_text(encoding="utf-8")
     # cells[(data, threads)][question][engine] = min ms; a later file wins per
     # (data, threads), so a re-run of one set replaces it whole.
     tables: dict[str, dict] = {}
     versions: dict[str, set] = defaultdict(set)
-    for _, text in texts:
+    for source, text in texts:
         fresh: dict[str, dict] = {}
-        for r in csv.DictReader(text.splitlines(), delimiter="\t"):
-            if r.get("status") != "ok":
-                continue
+        for r in read_h2o_checked(text, checks[source]):
             key = f"{r['data']}|{r['threads']}"
             table = fresh.setdefault(key, {"rows": [], "cells": {}})
             q = r["question"]
@@ -325,7 +329,7 @@ def load_h2o(paths: list[Path]) -> dict:
             {"key": "data", "label": "Data",
              "options": [{"value": d, "label": H2O_DATA_LABEL.get(d, d)} for d in data_sets],
              "default": data_sets[1] if len(data_sets) > 1 else (data_sets or [None])[0]},
-            {"key": "threads", "label": "Cores",
+            {"key": "threads", "label": "Threads",
              "options": [{"value": t, "label": t} for t in threads],
              "default": threads[-1] if threads else None},
         ],
@@ -538,9 +542,10 @@ __BENCHMARK_NAV__
       or data shapes were written alongside Ibex. Pick a data set and a core count.
     </p>
     <p class="bench-note">
-      <strong>Published run:</strong> October 16, 2026, r7i.4xlarge, 128 GiB,
-      SMT off; each engine pinned to the same 1 or 8 physical cores.
-      <a href="__GITHUB__/benchmarking/h2o/README.md#results-2026-10-16-aws-r7i4xlarge-1-and-8-physical-cores-1e7-rows">Dataset summaries and reproduction command</a>.
+      <strong>Result provenance:</strong> sources and engine versions are listed
+      above. Accepted artifacts retain the exact Release executable and plugin
+      fingerprints, runtime source hashes, and validation evidence.
+      <a href="__GITHUB__/benchmarking/h2o/README.md#running">Reproduction instructions</a>.
     </p>
     <p class="bench-note">
       <strong>What this measures.</strong> The data comes from the upstream R
@@ -551,17 +556,20 @@ __BENCHMARK_NAV__
       <code>v3</code>. Ibex declares the same string keys
       <code>Categorical</code> and otherwise picks its own types (Int64 and
       Float64, which move more bytes than the upstream Int32/Float32). Loading is
-      not timed; each question runs 1 warmup and 5 timed iterations, fully
-      materialising its result, and the table shows the fastest. Every answer is
-      checked across engines: the row count and upstream's checksum columns
-      must agree.
+      not timed. This harness uses resident DataFrames rather than upstream's
+      Polars IPC scans, and aligns all-null sums across engines. Each engine
+      reuses one process per dataset and releases preceding results outside
+      timing. Warmup counts and all samples are retained in the TSV; the table
+      shows the fastest fully materialised result. Every answer is
+      checked across engines with a mandatory bounded full-output pass and
+      key-bound fingerprints of every output column at the measured scale.
     </p>
     <div class="bench-controls" id="h2o-controls"></div>
     <p class="bench-note" id="h2o-examples"></p>
     <div class="tablewrap"><table class="bench" id="h2o-tbl"></table></div>
     <p class="bench-note" style="margin-top:1rem">
-      The summary rows compare Ibex with each engine over the questions all three
-      completed: the geometric mean of the per-question ratios, and the ratio of
+      Publication requires every question to pass for all three engines.
+      The summary rows show the geometric mean of the per-question ratios, and the ratio of
       the totals. Below 1 means Ibex is faster. The harness is
       <a href="__GITHUB__/benchmarking/h2o/run.py" target="_blank" rel="noopener">benchmarking/h2o/run.py</a>.
     </p>
@@ -850,7 +858,7 @@ function headlineRatios(suite, summary) {
       .filter(([k]) => k.endsWith("|" + cores) && k.startsWith(kind)).map(([, t]) => t);
     for (const [kind, name] of [["G1", "groupby"], ["J1", "join"]]) {
       const s = suiteSummary(H2O, pick(kind));
-      if (s.polars) head.push(chip("#h2o", `h2o ${name} · ${cores} cores · Ibex ÷ engine<br>`
+      if (s.polars) head.push(chip("#h2o", `h2o ${name} · ${cores} threads · Ibex ÷ engine<br>`
         + headlineRatios(H2O, s)));
     }
     const v = H2O.meta.versions;
@@ -1165,7 +1173,11 @@ def main(argv=None):
 
     max_rows_m = f"{max(payload['scales']) // 1_000_000}" if payload["scales"] else "16"
     pdsh = load_pdsh(args.pdsh) if args.pdsh else None
-    h2o = load_h2o(args.h2o) if args.h2o else None
+    try:
+        h2o = load_h2o(args.h2o) if args.h2o else None
+    except (OSError, ValueError, tarfile.TarError) as exc:
+        print(f"error: H2O publication rejected: {exc}", file=sys.stderr)
+        return 1
     suites = ["Ibex's own in-memory DataFrame suite"]
     if h2o:
         suites.append("the independent h2o db-benchmark")

@@ -137,8 +137,5 @@ while ! aws s3 ls "s3://${S3_BUCKET}/${RESULT_KEY}" --region "$REGION" >/dev/nul
 done
 
 aws s3 cp "s3://${S3_BUCKET}/${RESULT_KEY}" "$OUTPUT" --region "$REGION"
+python3 "$IBEX_ROOT/benchmarking/h2o/check_results.py" "$OUTPUT" --archive
 echo "Done: $OUTPUT"
-# A clean finish still reports a failed run.py; say so rather than read as success.
-if tar -xzOf "$OUTPUT" results/failures.txt 2>/dev/null | grep -q .; then
-    echo "WARNING: some core counts failed or mismatched; see results/failures.txt" >&2
-fi

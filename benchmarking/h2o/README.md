@@ -39,12 +39,22 @@ columns.
 
 - **Upstream data.** `gen_data.sh` runs the upstream R generators, vendored
   unmodified in `datagen/` (MPL-2.0). Every engine reads the same CSV.
-- **Upstream engine setup.** Polars and DuckDB use the schemas from the
+- **Upstream schemas, resident input adaptation.** Polars and DuckDB use the schemas from the
   upstream solutions. For Polars that is Int32 ids and values, string keys cast
   to Categorical, Float32 join values, and the streaming engine. For DuckDB it
   is ENUM keys where upstream uses them and FLOAT `v3`. Ibex reads the CSV with
   its own reader and picks its own types. The narrower upstream types move
   fewer bytes than Ibex's Int64/Float64, so they favour the other engines.
+  DuckDB explicitly sets `storage_compatibility_version='latest'`, as upstream
+  does. The pinned upstream Polars scripts scan memory-mapped IPC files; this
+  harness instead uses resident DataFrames for an in-memory comparison with
+  resident Ibex and DuckDB inputs. It does not reproduce upstream's IPC scan
+  path. These choices are recorded in each result's configuration.
+- **Explicit null semantics.** Upstream CSV empty fields are null in all
+  readers, including categorical keys. Bounded fixtures use a named null token
+  so that valid empty string keys can also be tested. Polars sums explicitly
+  return null for an all-null group, matching Ibex and DuckDB; upstream's bare
+  Polars sum returns zero in that case. This work is included in timing.
 - **Groupby string keys are Categorical in Ibex too.** Upstream casts `id1`,
   `id2` and `id3` to Categorical for Polars after loading, outside the timed
   section. Ibex is given the same instruction in its own syntax,
@@ -53,18 +63,48 @@ columns.
   String. At K=2e0 that is `id3` (5M levels), and until 2026-10-15 Ibex grouped
   it as a String while Polars grouped a prebuilt dictionary. DuckDB's upstream
   schema leaves `id3` as VARCHAR.
-- **Loading is not timed.** Data is loaded into memory once per process. Each
+- **Loading and cleanup are not timed.** One process per dataset and engine
+  loads its inputs once and runs all questions. Each preceding answer is
+  released before starting the next iteration's clock. Ibex's parent waits for
+  complete answer validation before sending the next question. Each
   question is timed for 1 warmup and 5 timed iterations, and the result is
   fully materialised: an Ibex `let`, a Polars `DataFrame`, a DuckDB TEMP table.
   We report the minimum, with the median in the TSV.
-- **Checked, not claimed.** Every engine's answer goes through upstream's "chk"
-  sums plus the row count. Engines must agree to within 1e-5 relative, which
-  is DuckDB's Float32 `v3`. Otherwise the row is `MISMATCH` and the script
-  exits non-zero.
-- **Same cores.** `--threads N` puts each engine under `taskset -c 0-(N-1)`
-  and sets `IBEX_CORES`, `POLARS_MAX_THREADS` and DuckDB `threads` to N. The
-  default of 8 is the cap for this box (see MEASURING.md). Run `--threads 1`
-  to compare per-core efficiency.
+- **Full bounded answers before timing.** All questions run on deterministic
+  768-row fixtures at one and two cores (one core for a single-core run).
+  The fixtures include nulls, quoted Unicode and empty keys, sparse negative
+  integer keys, unmatched joins and duplicate build-side keys. Every output
+  cell and duplicate row must agree; output order is unspecified. These are
+  validation fixtures, not replacements for the upstream timed data.
+- **Scale answers outside timing.** Every output column contributes to an
+  order-independent fingerprint. Integers and strings are exact; nulls, NaN
+  and infinities are distinct. Two 256-bit multiset accumulators include the
+  complete exact row, using four seeded 64-bit native row hashes. Float sums, squares, cross-column products and two
+  weighted moments are bound to that row in 64 buckets. Float32-derived
+  fields use 1e-6 relative/absolute tolerance; other floats use 1e-9 relative
+  and 1e-10 absolute tolerance. These fingerprints are probabilistic screens,
+  not complete proofs of scale answers. Upstream `chk` sums remain diagnostic.
+  Ibex exports through a pipe after timing, avoiding a scale-sized temporary
+  CSV. Validation adds wall time but does not enter reported samples.
+- **Failed runs stay pending.** Missing, duplicate, failed or mismatched engine
+  results make the whole comparison fail. Diagnostic artifacts remain under
+  `results/checks_<run-id>_*/`; accepted TSVs are replaced only after every
+  gate passes. Each accepted TSV has a `.tsv.checks.json` sidecar tied to its
+  contents by SHA-256 and a run identifier. Keep the sidecar with the TSV.
+  Website generation requires all three engines and all questions for each
+  dataset. AWS acceptance also requires every requested core count and dataset.
+- **Executable provenance.** First run `provenance.py --build` below. It
+  completes a Release build and records runtime source hashes, the executable,
+  CSV plugin, plugin declarations and CMake configuration. The runner checks
+  these before and after measurement. TSVs identify Ibex by executable SHA-256;
+  sidecars retain the build checkout, source changes and harness hashes.
+  Stale, replaced, Debug or unrecorded binaries cannot produce accepted results.
+- **Same CPU budget.** `--threads N` pins every engine to the first N allowed
+  logical CPUs and sets `IBEX_CORES`, `POLARS_MAX_THREADS` and DuckDB `threads`
+  to N. Logical CPUs may be SMT siblings: eight threads on the local box use
+  four physical cores. For physical-core comparisons, run under an outer
+  `taskset` selecting one logical CPU per physical core, or disable SMT as the
+  AWS launcher does. Run `--threads 1` to compare single-thread efficiency.
 - Ibex is timed by the REPL's `:timing`, which covers parse, plan and execute.
   Polars and DuckDB are timed with `time.perf_counter` around the call.
 
@@ -73,6 +113,7 @@ columns.
 ```sh
 benchmarking/h2o/gen_data.sh groupby 1e7 1e2 0 0     # -> benchmarking/data/h2o/G1_1e7_1e2_0_0.csv
 benchmarking/h2o/gen_data.sh join    1e7 0 0         # -> J1_1e7_NA_0_0.csv + small/medium/big
+python3 benchmarking/h2o/provenance.py --build-dir build-release --build
 uv run --project . benchmarking/h2o/run.py G1_1e7_1e2_0_0 J1_1e7_NA_0_0 [--threads 8]
 ```
 
@@ -83,6 +124,10 @@ fit on the dev box. Run it on AWS instead.
 
 Results go to `results/h2o_<stamp>_<T>t.tsv`, one row per (data, question,
 engine), with every timed sample kept.
+
+Historical TSVs below predate full-answer validation. They cannot be used as
+inputs to the current website generator without a new validated run; their
+original checksum passes are not upgraded retroactively.
 
 ## Results: 2026-10-16, AWS r7i.4xlarge, 1 and 8 physical cores, 1e7 rows
 

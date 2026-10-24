@@ -1017,7 +1017,8 @@ fi
 # so a failure still leaves its evidence.
 if [[ "${IBEX_H2O_MODE:-0}" == "1" ]]; then
     H2O_DIR=/ibex/benchmarking/h2o
-    H2O_OUT="$H2O_DIR/results"
+    H2O_WORK=/ibex/benchmarking/results/h2o-current
+    H2O_OUT="$H2O_WORK/results"
     ARTIFACT=/ibex/benchmarking/results/h2o.tar.gz
 
     finish_h2o() {
@@ -1031,8 +1032,10 @@ if [[ "${IBEX_H2O_MODE:-0}" == "1" ]]; then
             uv run --project /ibex python3 -c 'import duckdb, polars; print(f"duckdb={duckdb.__version__}"); print(f"polars={polars.__version__}")'
             lscpu
         } > "$H2O_OUT/versions.txt" 2>&1 || true
-        tar -C "$H2O_DIR" -czf "$ARTIFACT" results
-        aws s3 cp "$ARTIFACT" "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY}" --region "${IBEX_REGION}" || true
+        local key="${IBEX_RESULT_KEY%.tar.gz}.partial.tar.gz"
+        [[ "$code" -eq 0 ]] && key="$IBEX_RESULT_KEY"
+        tar -C "$H2O_WORK" -czf "$ARTIFACT" results
+        aws s3 cp "$ARTIFACT" "s3://${IBEX_S3_BUCKET}/${key}" --region "${IBEX_REGION}" || true
         shutdown -h now
         return "$code"
     }
@@ -1042,7 +1045,7 @@ if [[ "${IBEX_H2O_MODE:-0}" == "1" ]]; then
     # appears, so a partial there would pass for a finished run.
     push_partial_h2o() {
         mkdir -p /ibex/benchmarking/results
-        tar -C "$H2O_DIR" -czf "$ARTIFACT" results 2>/dev/null || return 0
+        tar -C "$H2O_WORK" -czf "$ARTIFACT" results 2>/dev/null || return 0
         aws s3 cp "$ARTIFACT" "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY%.tar.gz}.partial.tar.gz" \
             --region "${IBEX_REGION}" >/dev/null 2>&1 || true
     }
@@ -1050,6 +1053,9 @@ if [[ "${IBEX_H2O_MODE:-0}" == "1" ]]; then
     build_ibex
     uv sync --project /ibex
     mkdir -p "$H2O_OUT"
+    python3 "$H2O_DIR/provenance.py" --build-dir /ibex/build-release --build
+    uv run --project /ibex python3 "$H2O_DIR/check_results.py" "$H2O_OUT" --write-plan \
+        --data "$IBEX_H2O_DATA" --cores "${IBEX_H2O_CORES:-1}"
     # The generators need R + data.table; a baked AMI may predate either, and
     # this also exports the benchmark R library for Rscript below.
     ensure_current_r
@@ -1074,12 +1080,14 @@ if [[ "${IBEX_H2O_MODE:-0}" == "1" ]]; then
         write_host_memory_facts "$H2O_OUT/host/memory_${cores}c_before.txt"
         uv run --project /ibex "$H2O_DIR/run.py" "${H2O_DATA[@]}" --threads "$cores" \
             --warmup "${IBEX_WARMUP:-1}" --iters "${IBEX_ITERS:-5}" \
+            --out "$H2O_OUT/h2o_${cores}c.tsv" \
             > "$H2O_OUT/summary_${cores}c.txt" \
             || echo "run.py ${cores}c exited $?" >> "$H2O_OUT/failures.txt"
         cat "$H2O_OUT/summary_${cores}c.txt"
         write_host_memory_facts "$H2O_OUT/host/memory_${cores}c_after.txt"
         push_partial_h2o
     done
+    uv run --project /ibex python3 "$H2O_DIR/check_results.py" "$H2O_OUT"
     exit 0
 fi
 
@@ -1499,6 +1507,7 @@ fi
 
 if [[ "${IBEX_BUILD_REQUIRED:-1}" == "1" ]]; then
     build_ibex
+    python3 /ibex/benchmarking/h2o/provenance.py --build-dir /ibex/build-release --build
 else
     echo "Skipping Ibex CMake build (selected benchmark engine does not use it)."
 fi

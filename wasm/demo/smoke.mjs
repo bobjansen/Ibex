@@ -25,3 +25,8 @@ const decimals = run("decimal table", `Table {
 };`);
 assert.deepEqual(decimals.results[0].columns, [{ name: "amount", type: "Decimal(38, 2)" }]);
 assert.deepEqual(decimals.results[0].rows, [["123456789012345678901234567890123456.78"], ["-12.30"]]);
+
+const edges = run("null-preserving edge reducers", `Table { x = [1, 2, 3] }
+[update { x = case { x == 2 => x, else => NULL } }]
+[select { f = first_null(x), l = last_null(x), nf = first(x), nl = last(x) }];`);
+assert.deepEqual(edges.results[0].rows, [[null, null, 2, 2]]);

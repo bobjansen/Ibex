@@ -8,5 +8,5 @@ nullable[select {
     group,
     edge = first_null(x),  // NULL
     present = first(x),   // 2
-    tail = last_null(x),  // 3
+    ending = last_null(x),  // 3
 }, by group];

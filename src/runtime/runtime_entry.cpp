@@ -836,8 +836,8 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
              cur = cur->children().front().get()) {
             skipped.push_back(cur);
         }
-        for (const ir::Node* node : std::views::reverse(skipped)) {
-            const ir::Node& step = *node;
+        for (const ir::Node* skipped_node : std::views::reverse(skipped)) {
+            const ir::Node& step = *skipped_node;
             auto applied =
                 step.kind() == ir::NodeKind::Update
                     ? update_table(std::move(*joined), ir::node_cast<ir::UpdateNode>(step).fields(),

@@ -1230,8 +1230,22 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     bool has_nan = false;
                     if constexpr (std::is_same_v<T, double>) {
                         if (sv == nullptr && rows > 0) {
+#if defined(__AVX2__)
+                            std::size_t i = 0;
+                            for (; i + 4 <= rows; i += 4) {
+                                const __m256d block = _mm256_loadu_pd(col_values + i);
+                                const __m256d unordered = _mm256_cmp_pd(block, block, _CMP_UNORD_Q);
+                                if (_mm256_movemask_pd(unordered) != 0) {
+                                    has_nan = true;
+                                    break;
+                                }
+                            }
+                            for (; !has_nan && i < rows; ++i)
+                                has_nan = std::isnan(col_values[i]);
+#else
                             has_nan = std::any_of(col_values, col_values + rows,
                                                   [](double value) { return std::isnan(value); });
+#endif
                         }
                     }
                     if (sv != nullptr || has_nan) {

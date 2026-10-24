@@ -180,6 +180,29 @@ assert "pandas" not in sys.modules
                     self.assertIsNotNone(got)
                     self.assertAlmostEqual(got, expected, places=10)
 
+    def test_duckdb_ewma_nan_is_window_local(self):
+        nan = float("nan")
+        ns = [0, 30, 60, 90, 120, 150, 180, 210]
+        prices = [nan, 10., None, 20., 30., nan, None, 40.]
+        frame = pl.DataFrame({"ts": pl.Series([t * 10**9 for t in ns], dtype=pl.Datetime("ns")),
+                              "price": prices})
+        con = duckdb.connect()
+        con.register("fixture", frame.to_arrow())
+        con.execute("CREATE TABLE tf_data AS SELECT * FROM fixture")
+        query = dict(bench.timeframe_queries())["tf_rolling_ewma_1m"]
+        actual = con.sql(query).to_arrow_table().to_pylist()
+        for i, row in enumerate(actual):
+            expected = None
+            for t, price in zip(ns, prices):
+                if ns[i] - 60 < t <= ns[i] and price is not None:
+                    expected = price if expected is None else .9 * expected + .1 * price
+            if expected is None:
+                self.assertIsNone(row["e"])
+            elif math.isnan(expected):
+                self.assertTrue(math.isnan(row["e"]))
+            else:
+                self.assertAlmostEqual(row["e"], expected, places=10)
+
     def test_irregular_repeated_timestamps_and_full_window_outputs(self):
         ns = [0, 1_000_000_000, 59_500_000_000, 60_000_000_000,
               60_000_000_000, 60_500_000_000, 61_000_000_001]

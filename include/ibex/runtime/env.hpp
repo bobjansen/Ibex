@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <expected>
 #include <optional>
 #include <string>
@@ -17,7 +18,7 @@ namespace ibex::runtime {
 void set_env(const std::string& name, const std::string& value);
 void unset_env(const std::string& name);
 
-enum class AllocatorPolicy { Retain, System };
+enum class AllocatorPolicy : std::uint8_t { Retain, System };
 
 /// Resolve IBEX_ALLOCATOR_POLICY (retain/system), read before the first query.
 /// An explicit policy wins over the legacy IBEX_NO_MALLOC_TUNING opt-out.

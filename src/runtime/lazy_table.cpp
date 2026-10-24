@@ -1789,8 +1789,7 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
                                 return;
                             }
                             std::size_t j = static_cast<std::size_t>(
-                                std::lower_bound(scan_rows.begin(), scan_rows.end(),
-                                                 survivors[begin]) -
+                                std::ranges::lower_bound(scan_rows, survivors[begin]) -
                                 scan_rows.begin());
                             for (std::size_t i = begin; i < end; ++i) {
                                 while (j < scan_rows.size() && scan_rows[j] != survivors[i]) {

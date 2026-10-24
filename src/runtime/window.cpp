@@ -1227,27 +1227,33 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             beta_pow.push_back(beta_pow.back() * beta);
                         return beta_pow[k];
                     };
-                    bool has_nan = false;
-                    if constexpr (std::is_same_v<T, double>) {
-                        if (sv == nullptr && rows > 0) {
+                    const bool has_nan = [&] {
+                        if constexpr (std::is_same_v<T, double>) {
+                            if (sv == nullptr && rows > 0) {
 #if defined(__AVX2__)
-                            std::size_t i = 0;
-                            for (; i + 4 <= rows; i += 4) {
-                                const __m256d block = _mm256_loadu_pd(col_values + i);
-                                const __m256d unordered = _mm256_cmp_pd(block, block, _CMP_UNORD_Q);
-                                if (_mm256_movemask_pd(unordered) != 0) {
-                                    has_nan = true;
-                                    break;
+                                std::size_t i = 0;
+                                for (; i + 4 <= rows; i += 4) {
+                                    const __m256d block = _mm256_loadu_pd(col_values + i);
+                                    const __m256d unordered =
+                                        _mm256_cmp_pd(block, block, _CMP_UNORD_Q);
+                                    if (_mm256_movemask_pd(unordered) != 0) {
+                                        return true;
+                                    }
                                 }
-                            }
-                            for (; !has_nan && i < rows; ++i)
-                                has_nan = std::isnan(col_values[i]);
+                                for (; i < rows; ++i) {
+                                    if (std::isnan(col_values[i])) {
+                                        return true;
+                                    }
+                                }
+                                return false;
 #else
-                            has_nan = std::any_of(col_values, col_values + rows,
-                                                  [](double value) { return std::isnan(value); });
+                                return std::any_of(col_values, col_values + rows,
+                                                   [](double value) { return std::isnan(value); });
 #endif
+                            }
                         }
-                    }
+                        return false;
+                    }();
                     if (sv != nullptr || has_nan) {
                         // Apply the same recurrence in non-null observation
                         // coordinates. Null rows still define window bounds,
@@ -1261,7 +1267,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                         std::size_t nan_count = 0;
                         for (std::size_t i = 0; i < rows; ++i) {
                             if (valid_at(i)) {
-                                const double value = static_cast<double>(col_values[i]);
+                                const auto value = static_cast<double>(col_values[i]);
                                 const bool is_nan = std::isnan(value);
                                 // A NaN advances observation weights, but its
                                 // payload must not poison the removable sum.
@@ -1271,7 +1277,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             }
                             while (lo < i && should_drop(lo, i)) {
                                 if (valid_at(lo)) {
-                                    const double value = static_cast<double>(col_values[lo]);
+                                    const auto value = static_cast<double>(col_values[lo]);
                                     if (std::isnan(value))
                                         --nan_count;
                                     else
@@ -1295,7 +1301,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             seed = std::max(seed, lo);
                             while (!valid_at(seed))
                                 ++seed;
-                            const double first = static_cast<double>(col_values[seed]);
+                            const auto first = static_cast<double>(col_values[seed]);
                             if (count == 1)
                                 r = first;  // discard subtraction error on restart
                             result_values[i] = (alpha * r) + (beta * bpow(count - 1) * first);

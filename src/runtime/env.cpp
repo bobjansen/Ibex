@@ -4,6 +4,7 @@
 #include <ibex/runtime/env.hpp>
 
 #include <cstdlib>
+#include <expected>
 #include <fstream>
 #include <ios>
 #include <iterator>

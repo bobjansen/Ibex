@@ -31,6 +31,7 @@
 #include <expected>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -835,8 +836,8 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
              cur = cur->children().front().get()) {
             skipped.push_back(cur);
         }
-        for (auto it = skipped.rbegin(); it != skipped.rend(); ++it) {
-            const ir::Node& step = **it;
+        for (const ir::Node* node : std::views::reverse(skipped)) {
+            const ir::Node& step = *node;
             auto applied =
                 step.kind() == ir::NodeKind::Update
                     ? update_table(std::move(*joined), ir::node_cast<ir::UpdateNode>(step).fields(),

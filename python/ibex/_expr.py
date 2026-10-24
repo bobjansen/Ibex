@@ -87,12 +87,16 @@ class Expr:
 
     @property
     def _aggregate(self):
+        if self._op == "broadcast_length":
+            return False
         return self._op in ("sum", "mean", "min", "max", "count", "column_len", "first", "last", "first_non_null", "last_non_null", "len") or any(
             arg._aggregate for arg in self._args if isinstance(arg, Expr)
         )
 
     @property
     def _row_reference(self):
+        if self._op in ("repeat", "repeat_null", "broadcast_length"):
+            return True
         if self._op in ("sum", "mean", "min", "max", "count", "column_len", "first", "last", "first_non_null", "last_non_null", "len"):
             return False
         return self._op == "col" or any(

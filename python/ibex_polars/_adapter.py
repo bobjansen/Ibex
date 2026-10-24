@@ -7,6 +7,7 @@ fail during plan translation, before input preparation or native execution.
 """
 
 import json
+from datetime import date
 from pathlib import Path
 
 import polars as pl
@@ -64,10 +65,12 @@ class Adapter:
             raise NotImplementedError(f"unsupported Polars visitor version {self.visitor.version()}")
         self.nodes = {}
         self.expressions = {}
+        self.frame_length_columns = {}
 
     def expression(self, node):
-        # A column expression can be reused after an update changes its dtype.
-        key = (node, tuple(self.visitor.get_schema().items()))
+        # Dtypes and proofs of frame-sized lengths belong to the current input
+        # node: a filter can change the height without changing the schema.
+        key = (node, self.visitor.get_node(), tuple(self.visitor.get_schema().items()))
         if key in self.expressions:
             return self.expressions[key]
         value = self.visitor.view_expression(node)
@@ -143,8 +146,44 @@ class Adapter:
             else:
                 raise NotImplementedError(f"unsupported cast to {value.dtype} with options {value.options}")
         elif kind == "Function":
-            args = tuple(self.expression(child) for child in value.input)
             name = str(value.function_data[0]).split(".")[-1]
+            if name == "repeat":
+                if len(value.input) != 2 or len(value.function_data) != 1:
+                    raise NotImplementedError("unsupported repeat options")
+                length = self.expression(value.input[1])
+                frame_length = length._op == "len" or (
+                    length._op == "column_len" and length._args[0]._row_reference
+                    and not length._args[0]._aggregate
+                )
+                if length._op == "col":
+                    frame_length = length._args[0] in self.frame_length_columns.get(self.visitor.get_node(), ())
+                if not frame_length:
+                    raise NotImplementedError("repeat length must be the current frame row count")
+                scalar = self.visitor.view_expression(value.input[0])
+                if type(scalar).__name__ != "Literal":
+                    raise NotImplementedError("repeat currently requires a scalar literal")
+                if scalar.value is None:
+                    dtype = scalar.dtype
+                    if dtype in _INTEGER_LAYOUTS or is_temporal(dtype):
+                        placeholder = 0
+                    elif dtype in (pl.Float32, pl.Float64):
+                        placeholder = 0.0
+                    elif dtype == pl.Boolean:
+                        placeholder = False
+                    elif dtype in (pl.String, pl.Categorical):
+                        placeholder = ""
+                    elif dtype == pl.Date:
+                        placeholder = date(1970, 1, 1)
+                    else:
+                        raise NotImplementedError(f"unsupported repeat null type {dtype}")
+                    expr = Expr("repeat_null", (ibex.lit(placeholder),))
+                else:
+                    expr = Expr("repeat", (self.expression(value.input[0]),))
+                # A repeat consumes its length reduction and produces one value
+                # per input row; it is not itself an aggregate.
+                self.expressions[key] = expr
+                return expr
+            args = tuple(self.expression(child) for child in value.input)
             if name == "IsBetween" and len(args) == 3 and len(value.function_data) == 2:
                 types = [self.visitor.get_dtype(child) for child in value.input]
                 if any(is_temporal(dtype) for dtype in types) and len({dtype.base_type() for dtype in types}) != 1:
@@ -195,8 +234,14 @@ class Adapter:
                     raise NotImplementedError(f"unsupported resident column {name}: {dtype}")
             # PyDataFrame.select projects column handles, without collecting a
             # lazy query or evaluating user expressions in the Polars engine.
-            data = pl.DataFrame._from_pydf(node.df.select(list(schema)))
-            table = data.to_arrow()
+            if schema:
+                data = pl.DataFrame._from_pydf(node.df.select(list(schema)))
+                table = data.to_arrow()
+            else:
+                # Projection pushdown can remove every column from a len-only
+                # scan. Arrow/native tables need a column to retain its height.
+                height = pl.DataFrame._from_pydf(node.df).height
+                table = pa.table({"_ibex_height": pa.nulls(height, type=pa.int64())})
             for index, field in enumerate(table.schema):
                 if pa.types.is_timestamp(field.type) or pa.types.is_duration(field.type):
                     table = table.set_column(index, field.name, prepare_column(table.column(index)))
@@ -254,6 +299,14 @@ class Adapter:
                 frame = frame.select([self.named(expr) for expr in node.expr])
             elif kind == "HStack":
                 expressions = tuple(self.named(expr) for expr in node.exprs)
+                # Polars CSE lifts repeat's length into a WITH_COLUMNS field.
+                # Only row counts are admitted here, not arbitrary reductions.
+                lengths = {expr._name for expr in expressions if expr._args[0]._op in ("len", "column_len")}
+                expressions = tuple(
+                    Expr("broadcast_length", (expr._args[0],)).alias(expr._name)
+                    if expr._name in lengths else expr for expr in expressions
+                )
+                self.frame_length_columns[node_id] = lengths
                 if any(expr._aggregate for expr in expressions):
                     raise NotImplementedError("reduction broadcasting in HStack is not supported yet")
                 frame = frame._append("hstack", expressions).select(list(schema))

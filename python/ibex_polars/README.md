@@ -33,6 +33,13 @@ Column-expression `.len()` includes nulls and returns UInt32; for supported
 row expressions its result equals the frame row count. Polars exposes this
 through the same visitor aggregate as `.count()`, with `include_nulls=True`.
 
+`pl.repeat(value, pl.len())` and `pl.repeat(value, row_expression.len())`
+fill the current frame with a supported scalar literal, including typed nulls.
+These execute through native scalar broadcasting. Optimizer-generated repeats
+and their shared length columns are supported. Explicit literal lengths,
+non-scalar values, and lengths that might change the frame height remain
+unsupported. Untyped Null and other unsupported literal dtypes remain rejected.
+
 First/last reductions preserve the selected edge row's null by default;
 `ignore_nulls=True` selects the first/last present value instead. The default
 uses native `first_null`/`last_null`; the null-skipping variant uses native
@@ -44,7 +51,8 @@ The new native reducers currently materialize their input.
 
 Supported operations include resident DataFrame scans, single local Parquet
 files, filters, projections, simultaneous row-local column updates, numeric
-sums/means, first/last reductions, non-null column counts, row counts, column-key grouping and sorting. Supported resident
+sums/means, first/last reductions, non-null column counts, row counts,
+frame-sized scalar repeats, column-key grouping and sorting. Supported resident
 types are Int8, Int16, Int32, Int64, UInt8, UInt16, Float32, Float64, Boolean,
 String, Date and Categorical. Resident Datetime and Duration columns are also
 supported as described below. Numeric

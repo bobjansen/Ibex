@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Bob Jansen
 """Engine conformance, strict failures, caching and ownership tests."""
 
-from datetime import date
+from datetime import date, datetime, timedelta
 import gc
 import os
 from pathlib import Path
@@ -470,6 +470,73 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(result.schema["present"], pa.uint32())
         with self.assertRaises(NotImplementedError):
             ibex.col("x").count().count()
+
+    def test_repeat_scalar_and_typed_null_fill_the_current_frame(self):
+        cases = [(pl.Int8, -7), (pl.Int16, 1234), (pl.Int32, 70000), (pl.Int64, -(2**63)),
+                 (pl.UInt8, 255), (pl.UInt16, 65535), (pl.Float32, 1.25),
+                 (pl.Float64, float("nan")), (pl.Float64, float("inf")),
+                 (pl.Boolean, False), (pl.Boolean, True),
+                 (pl.String, '${untrusted}`"\\\ntext'), (pl.Date, date(2020, 1, 2)),
+                 (pl.Datetime("us"), datetime(2020, 1, 2, 3, 4, 5)),
+                 (pl.Duration("ns"), timedelta(microseconds=123))]
+        cases += [(dtype, None) for dtype in (
+            pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16,
+            pl.Float32, pl.Float64, pl.Boolean, pl.String, pl.Categorical,
+            pl.Date, pl.Datetime("us", "Europe/Amsterdam"), pl.Duration("ns"))]
+        for dtype, value in cases:
+            for empty in (False, True):
+                source = pl.LazyFrame({"x": pl.Series([None, 1, 2], dtype=pl.Int64)})
+                if empty:
+                    source = source.filter(pl.lit(False))
+                with self.subTest(dtype=dtype, value=value, empty=empty):
+                    for length in (pl.len(), pl.col("x").len(), (pl.col("x") + 1).len()):
+                        repeated = pl.repeat(pl.lit(value, dtype=dtype), length).alias("r")
+                        for flags in (pl.QueryOptFlags(), pl.QueryOptFlags.none()):
+                            self.equal(source.select(repeated), options=flags)
+                            self.equal(source.with_columns(repeated), options=flags)
+        # Length must follow the current filtered frame, not the bound source.
+        frame = pl.LazyFrame({"x": [None, 1, 2, 3]}).filter(pl.col("x") > 1)
+        self.equal(frame.select(pl.repeat("ok", pl.col("x").len()).alias("r")))
+        self.equal(frame.select(pl.repeat(pl.lit(date(2020, 1, 2)), pl.len()).alias("x"),
+                               (pl.col("x") + 1).alias("r")))
+
+    def test_repeat_translation_handles_optimizer_generated_constants(self):
+        for dtype in (pl.Int8, pl.Int16, pl.UInt8, pl.UInt16):
+            frame = pl.LazyFrame({"x": pl.Series([None, 0, 1], dtype=dtype)})
+            query = frame.select(pl.col("x").eq_missing(2**32).alias("no"),
+                                 pl.col("x").ne_missing(2**32).alias("yes"))
+            self.assertIn("repeat", query.explain())
+            with patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as execute:
+                result = self.equal(query)
+                self.assertEqual(execute.call_count, 1)
+            self.assertEqual(result.to_dict(as_series=False),
+                             {"no": [False, False, False], "yes": [True, True, True]})
+            self.equal(query.filter(pl.lit(False)))
+            self.equal(frame.filter(pl.lit(False)).select(
+                pl.col("x").eq_missing(2**32).alias("no"),
+                pl.col("x").ne_missing(2**32).alias("yes")))
+
+    def test_repeat_rejects_lengths_that_could_change_height_before_execution(self):
+        source = pl.LazyFrame({"x": [None, 1, 2]})
+        for length in (pl.lit(2), pl.lit(3), pl.col("x").count(), pl.len() - 1):
+            query = source.select(pl.repeat(7, length).alias("r"))
+            with self.subTest(length=length), patch.object(ibex_pyarrow, "execute_pipeline") as execute:
+                with self.assertRaises(NotImplementedError):
+                    query.collect(engine=IbexEngine(), optimizations=pl.QueryOptFlags.none())
+                execute.assert_not_called()
+        repeated = pl.repeat(7, pl.col("n").first())
+        changed_height = (source.with_columns(pl.len().alias("n"))
+                          .filter(pl.col("x") > 1).select(repeated.alias("r")))
+        with patch.object(ibex_pyarrow, "execute_pipeline") as execute:
+            with self.assertRaises(NotImplementedError):
+                changed_height.collect(engine=IbexEngine(), optimizations=pl.QueryOptFlags.none())
+            execute.assert_not_called()
+
+    def test_zero_column_scan_preserves_height_for_row_counts(self):
+        for size in (0, 3):
+            frame = pl.LazyFrame({"_ibex_height": pl.Series(range(size), dtype=pl.Int64)})
+            self.equal(frame.select(pl.len()))
+            self.equal(frame.select(pl.repeat(True, pl.len()).alias("_ibex_height")))
 
 
 if __name__ == "__main__":

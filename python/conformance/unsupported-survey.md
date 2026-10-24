@@ -164,3 +164,16 @@ The survey now has 23 passing tests, 323 tests with unsupported queries and
 730 unexercised tests; 76 matching queries, 1,554 rejections and zero mismatches.
 The upstream checks and tolerances remain unchanged. Newly matching queries
 are promoted into the required regression baseline.
+
+## Small-integer follow-up
+
+Int8, Int16, UInt8 and UInt16 now also use native Int64 storage. Arithmetic
+wraps in the signed or unsigned range of the planner's result dtype. Their
+sums promote to Int64, so they do not wrap at the original column width.
+Wrapping casts and safe widening casts are supported. UInt32 and UInt64
+resident and Parquet inputs remain explicitly unsupported.
+
+The same survey now has 45 passing tests, 301 tests containing unsupported
+queries and 730 unexercised tests. There are 132 matching queries and 1,498
+rejections, with zero mismatches or support regressions. Newly matching
+queries are added to the required baseline.

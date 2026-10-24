@@ -108,9 +108,14 @@ class Adapter:
             allowed = ("min", "max", "sum") if input_type.base_type() == pl.Duration else ("min", "max")
             if value.name not in ("count", "first", "last", "first_non_null", "last_non_null") and value.name not in (allowed if is_temporal(input_type) else ("sum", "mean")):
                 raise NotImplementedError(f"unsupported aggregate {value.name} for {input_type}")
-            if value.options not in (None, False):
+            # The visitor calls both Expr.count() and Expr.len() "count";
+            # its Boolean option is include_nulls, not a count execution hint.
+            operation = value.name
+            if value.name == "count" and value.options is True:
+                operation = "column_len"
+            elif value.options not in (None, False):
                 raise NotImplementedError(f"unsupported {value.name} aggregate options")
-            expr = Expr(value.name, (self.expression(value.arguments[0]),))
+            expr = Expr(operation, (self.expression(value.arguments[0]),))
         elif kind == "Len":
             expr = ibex.len()
         elif kind == "Cast":

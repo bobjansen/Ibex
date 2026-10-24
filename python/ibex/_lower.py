@@ -53,7 +53,9 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             return f"{native}({render(args[0])})"
         if op in ("min", "max"):
             return f"{op}({render(args[0])})"
-        if op == "len":
+        if op in ("len", "column_len"):
+            # Supported column-length operands are row expressions, so their
+            # length equals the frame's height, independently of null values.
             return "count()"
         if op == "cast":
             names = {pa.float64(): "Float64", pa.int64(): "Int64"}
@@ -258,10 +260,10 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
             if result not in numeric or not args[0]._row_reference:
                 raise NotImplementedError(f"{op} currently requires an Int64 or Float64 row expression")
             return pa.float64() if op == "mean" else result
-        if op == "count":
+        if op in ("count", "column_len"):
             dtype(args[0])
             if not args[0]._row_reference:
-                raise NotImplementedError("count currently requires a row expression")
+                raise NotImplementedError(f"{op} currently requires a row expression")
             return pa.uint32()
         if op == "len":
             return pa.uint32()

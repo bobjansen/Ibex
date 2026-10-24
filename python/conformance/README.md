@@ -153,6 +153,16 @@ text/categorical values, dates and temporal units/zones. Null-skipping Date
 reductions and Polars expression Slice rewrites remain unsupported; computed
 edge inputs are covered with optimizer simplification disabled.
 
+Column non-null counts and column-expression lengths are now translated with
+their distinct null policies and UInt32 outputs. The visitor names both forms
+`count`; its Boolean option specifies whether nulls are included. Of the 233
+previous count rejections, 232 were actually column lengths. After translation,
+116 reach unsupported reduction broadcasting, 116 reach `repeat`, and one
+reaches an expression Filter. The survey therefore remains at 339 matches and
+1,291 rejections, with zero mismatches or support regressions. Dedicated engine
+and independent-API tests verify empty/all-null counts, NaN, Boolean false,
+computed inputs, grouped counts and output types across supported dtypes.
+
 Expand `targets` to more upstream modules or use `--select` to investigate.
 When support improves, add newly passing query ordinals from the report to
 `required_pass_queries` so that losing support fails CI rather than silently

@@ -1,0 +1,6 @@
+polars==2.0.0
+# Match the upstream release's pytest pin; newer pytest adds fatal warnings.
+pytest==9.0.3
+hypothesis==6.170.9
+numpy
+pyarrow

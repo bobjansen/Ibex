@@ -82,10 +82,21 @@ jobs:
         if: runner.os == 'Linux' && matrix.build_type == 'Release'
         run: |
           python3 -m venv .venv
-          .venv/bin/python -m pip install pyarrow numpy pandas ipython polars==2.0.0
+          .venv/bin/python -m pip install pandas ipython -r python/conformance/requirements.txt
+
+      - name: Check out pinned Polars conformance tests
+        if: runner.os == 'Linux' && matrix.build_type == 'Release'
+        uses: actions/checkout@v6
+        with:
+          repository: pola-rs/polars
+          ref: 22a147de3d2bb2e44b97338a2510816c7105c9f2
+          path: .polars-upstream
+          persist-credentials: false
 
       - name: Configure (Linux)
         if: runner.os == 'Linux'
+        env:
+          IBEX_POLARS_UPSTREAM_DIR: ${{ matrix.build_type == 'Release' && format('{0}/.polars-upstream', github.workspace) || '' }}
         run: |
           cmake -B build \
             -G Ninja \
@@ -95,6 +106,7 @@ jobs:
             -DIBEX_ENABLE_SANITIZERS=${{ matrix.build_type == 'Debug' && 'ON' || 'OFF' }} \
             -DIBEX_BUILD_TESTS=ON \
             -DIBEX_BUILD_TOOLS=ON \
+            -DIBEX_POLARS_UPSTREAM_DIR="$IBEX_POLARS_UPSTREAM_DIR" \
             -DIBEX_BUILD_LIGHTGBM=OFF
       - name: Configure (macOS)
         if: runner.os == 'macOS'
@@ -122,6 +134,14 @@ jobs:
           ctest --test-dir build --output-on-failure \
             -R '^StreamBuffered feeds a TimeBucket stream from a producer thread$' \
             --repeat until-pass:3
+
+      - name: Upload Polars compatibility report
+        if: always() && runner.os == 'Linux' && matrix.build_type == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: polars-conformance
+          path: build/polars-conformance-results/*.json
+          if-no-files-found: ignore
 
   # The ADBC jobs (Linux and Windows) live in adbc.yml.
 

@@ -157,6 +157,29 @@ assert "pandas" not in sys.modules
                         else:
                             self.assertAlmostEqual(got, want, places=10)
 
+    def test_polars_prefix_ewma_recovers_after_valid_nan_expires(self):
+        nan = float("nan")
+        prices = [nan, 10., None, 20., 30., nan, None, 40., 50., 60.,
+                  None, None, 70., nan, nan, 80., 90., 100.]
+        ns = [i * 30 * 10**9 for i in range(len(prices))]
+        frame = pl.DataFrame({"ts": pl.Series(ns, dtype=pl.Datetime("ns")), "price": prices})
+        for engine in ("streaming", "in-memory"):
+            actual = python_bench.polars_windowed_ewma(frame.lazy()).collect(engine=engine)
+            self.assertTrue(actual.select("ts", "price").equals(frame))
+            for t, got in zip(ns, actual["e"]):
+                expected = None
+                for when, price in zip(ns, prices):
+                    if t - 60 * 10**9 < when <= t and price is not None:
+                        expected = price if expected is None else .9 * expected + .1 * price
+                if expected is None:
+                    self.assertIsNone(got)
+                elif math.isnan(expected):
+                    self.assertIsNotNone(got)
+                    self.assertTrue(math.isnan(got))
+                else:
+                    self.assertIsNotNone(got)
+                    self.assertAlmostEqual(got, expected, places=10)
+
     def test_irregular_repeated_timestamps_and_full_window_outputs(self):
         ns = [0, 1_000_000_000, 59_500_000_000, 60_000_000_000,
               60_000_000_000, 60_500_000_000, 61_000_000_001]

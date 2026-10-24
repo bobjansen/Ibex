@@ -3324,7 +3324,8 @@ Rolling functions are **aggregate-like**: they produce one scalar per row
 `rolling_ewma` starts from the first non-null value in each window. Each later
 non-null value `x` advances the result as `e = (1 - alpha) * e + alpha * x`.
 Null rows still occupy positions in count windows and time in duration windows,
-but do not seed, decay, or otherwise update the EWMA.
+but do not seed, decay, or otherwise update the EWMA. A valid NaN propagates
+while it remains in the window; the result recovers after it expires.
 For Decimal inputs, `rolling_sum` returns `Decimal(38, s)`; `rolling_min`,
 `rolling_max`, `rolling_first`, and `rolling_last` preserve `Decimal(p, s)`.
 The statistical rolling functions still require an explicit `Float64` cast.

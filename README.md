@@ -724,8 +724,9 @@ engines pass, with executable, package, harness and input fingerprints retained
 in the artifacts. Separate AWS workers must pass the same cross-worker gates.
 Polars computes finite-window EWMA using a native EWM prefix and a rolling
 boundary correction, skipping null observations without advancing their weights.
-DuckDB's ordered first/last aggregates explicitly preserve input
-order under parallel execution. Unused suites and optional DataFrame imports
+Valid NaNs propagate only while present in an EWMA window. DuckDB's ordered
+first/last aggregates explicitly preserve input order under parallel execution.
+Unused suites and optional DataFrame imports
 are released or avoided so they do not inflate later process-memory samples.
 
 To skip only specific frameworks:

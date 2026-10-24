@@ -150,22 +150,23 @@ def polars_windowed_ewma(frame):
     rather than joining on timestamps, which would multiply duplicate rows.
     """
     base = frame.with_columns(
-        pl.col("price").ewm_mean(alpha=0.1, adjust=False, ignore_nulls=True)
+        pl.col("price").fill_nan(0.0).ewm_mean(alpha=0.1, adjust=False, ignore_nulls=True)
         .forward_fill().alias("__ewma_prefix")
     ).with_columns(
         pl.col("__ewma_prefix").shift(1)
-        .fill_null(pl.col("price").drop_nulls().first()).alias("__ewma_before")
+        .fill_null(pl.col("price").fill_nan(0.0).drop_nulls().first()).alias("__ewma_before")
     )
     result = base.rolling(index_column="ts", period="60s", closed="right").agg(
         pl.col("price").drop_nulls().first().alias("__ewma_first"),
         pl.col("__ewma_before").filter(pl.col("price").is_not_null()).first().alias("__ewma_prior"),
         pl.col("price").count().alias("__ewma_count"),
+        pl.col("price").is_nan().fill_null(False).sum().alias("__ewma_nan_count"),
         pl.col("__ewma_prefix").last().alias("__ewma_end"),
     ).select(
-        pl.when(pl.col("__ewma_count") > 0).then(
+        pl.when(pl.col("__ewma_count") == 0).then(None).when(pl.col("__ewma_nan_count") > 0).then(float("nan")).otherwise(
             pl.col("__ewma_end") + pl.lit(0.9).pow(pl.col("__ewma_count")) *
             (pl.col("__ewma_first") - pl.col("__ewma_prior"))
-        ).otherwise(None).alias("e")
+        ).alias("e")
     )
     return pl.concat([frame, result.select("e")], how="horizontal")
 

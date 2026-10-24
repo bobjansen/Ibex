@@ -5828,6 +5828,62 @@ TEST_CASE("rolling_ewma skips null observations and returns null for empty windo
     }
 }
 
+TEST_CASE("rolling_ewma propagates NaNs only while they remain in the window",
+          "[null][rolling][ewma]") {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const std::vector<double> values{nan, 10., 0., 20., 30., nan, 0.,  40., 50.,
+                                     60., 0.,  0., 70., nan, nan, 80., 90., 100.};
+    const runtime::ValidityBitmap valid{true, true,  false, true, true, true, false, true, true,
+                                        true, false, false, true, true, true, true,  true, true};
+    for (const bool nullable : {false, true}) {
+        runtime::Table table;
+        Column<Timestamp> times;
+        Column<double> price;
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            times.push_back(ts_from_nanos(static_cast<std::int64_t>(i)));
+            price.push_back(nullable && !valid[i] ? nan : values[i]);
+        }
+        table.add_column("ts", std::move(times));
+        if (nullable)
+            table.add_column("val", std::move(price), valid);
+        else
+            table.add_column("val", std::move(price));
+        table.set_properties(runtime::TableProperties::time_frame("ts"));
+        runtime::TableRegistry registry;
+        registry.emplace("data", table);
+        for (const std::string window : {"3", "3ns"}) {
+            for (const std::string alpha_text : {"0.1", "0.5", "1.0"}) {
+                CAPTURE(nullable, window, alpha_text);
+                const double alpha = std::stod(alpha_text);
+                const auto source =
+                    "data[update { e = rolling_ewma(val, " + alpha_text + ", " + window + ") }];";
+                auto ir = require_ir(source.c_str());
+                auto result = runtime::interpret(*ir, registry);
+                REQUIRE(result.has_value());
+                const auto* entry = result->find_entry("e");
+                REQUIRE(entry != nullptr);
+                const auto& output = std::get<Column<double>>(*entry->column);
+                for (std::size_t i = 0; i < values.size(); ++i) {
+                    CAPTURE(i);
+                    std::optional<double> expected;
+                    for (std::size_t j = i > 2 ? i - 2 : 0; j <= i; ++j) {
+                        if (!nullable || valid[j])
+                            expected = expected ? (1.0 - alpha) * *expected + alpha * values[j]
+                                                : values[j];
+                    }
+                    CHECK(runtime::is_null(*entry, i) == !expected.has_value());
+                    if (expected) {
+                        if (std::isnan(*expected))
+                            CHECK(std::isnan(output[i]));
+                        else
+                            CHECK(output[i] == Catch::Approx(*expected).margin(1e-10));
+                    }
+                }
+            }
+        }
+    }
+}
+
 // --- Phase 1 null semantics ---------------------------------------------------
 
 TEST_CASE("null: right join unmatched rows produce null left columns", "[null][join]") {

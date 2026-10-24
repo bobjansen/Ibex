@@ -1227,7 +1227,14 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             beta_pow.push_back(beta_pow.back() * beta);
                         return beta_pow[k];
                     };
-                    if (sv != nullptr) {
+                    bool has_nan = false;
+                    if constexpr (std::is_same_v<T, double>) {
+                        if (sv == nullptr && rows > 0) {
+                            has_nan = std::any_of(col_values, col_values + rows,
+                                                  [](double value) { return std::isnan(value); });
+                        }
+                    }
+                    if (sv != nullptr || has_nan) {
                         // Apply the same recurrence in non-null observation
                         // coordinates. Null rows still define window bounds,
                         // but neither decay R nor advance the weight exponent.
@@ -1237,14 +1244,24 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                         std::size_t lo = 0;
                         std::size_t seed = 0;
                         std::size_t count = 0;
+                        std::size_t nan_count = 0;
                         for (std::size_t i = 0; i < rows; ++i) {
                             if (valid_at(i)) {
-                                r = (beta * r) + static_cast<double>(col_values[i]);
+                                const double value = static_cast<double>(col_values[i]);
+                                const bool is_nan = std::isnan(value);
+                                // A NaN advances observation weights, but its
+                                // payload must not poison the removable sum.
+                                r = (beta * r) + (is_nan ? 0.0 : value);
+                                nan_count += is_nan ? 1 : 0;
                                 ++count;
                             }
                             while (lo < i && should_drop(lo, i)) {
                                 if (valid_at(lo)) {
-                                    r -= bpow(count - 1) * static_cast<double>(col_values[lo]);
+                                    const double value = static_cast<double>(col_values[lo]);
+                                    if (std::isnan(value))
+                                        --nan_count;
+                                    else
+                                        r -= bpow(count - 1) * value;
                                     --count;
                                 }
                                 ++lo;
@@ -1255,6 +1272,10 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                                 if (!out_valid)
                                     out_valid.emplace(rows, true);
                                 out_valid->set(i, false);
+                                continue;
+                            }
+                            if (nan_count > 0) {
+                                result_values[i] = std::numeric_limits<double>::quiet_NaN();
                                 continue;
                             }
                             seed = std::max(seed, lo);

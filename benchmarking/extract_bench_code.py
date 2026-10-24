@@ -282,6 +282,8 @@ def _extract_python(rel: str, prefixes: tuple[str, ...], sql: bool = False) -> d
 # queries use raw strings so the DSL's own quotes need no escaping), so we parse it
 # explicitly rather than with one regex.
 _IBEX_HEAD = re.compile(r'\{\s*"(?P<name>[a-z][a-z0-9_]*)"\s*,\s*')
+_IBEX_DESIGNATED = re.compile(
+    r'\.name\s*=\s*"(?P<name>[a-z][a-z0-9_]*)"\s*,\s*\.source\s*=\s*')
 
 
 def _parse_cpp_string_value(src: str, i: int) -> str:
@@ -320,7 +322,8 @@ def _parse_cpp_string_value(src: str, i: int) -> str:
 def _extract_ibex() -> dict[str, str]:
     src = _read(IBEX_SRC)
     out: dict[str, str] = {}
-    for m in _IBEX_HEAD.finditer(src):
+    matches = [*_IBEX_HEAD.finditer(src), *_IBEX_DESIGNATED.finditer(src)]
+    for m in sorted(matches, key=lambda match: match.start()):
         name = m.group("name")
         dsl = _parse_cpp_string_value(src, m.end())
         if not dsl:
@@ -328,8 +331,10 @@ def _extract_ibex() -> dict[str, str]:
         # parse_X is the same DSL timed with parsing; fold onto X.
         if name.startswith("parse_"):
             name = name[len("parse_"):]
-        # skip obvious non-query string pairs (heuristic: real queries touch a table)
-        if "[" not in dsl and " join " not in dsl:
+        # A bare TimeFrame conversion is a complete benchmark query even though
+        # it has no bracket clause. Other string pairs without a table operation
+        # are labels, not query expressions.
+        if "[" not in dsl and " join " not in dsl and not dsl.startswith("as_timeframe("):
             continue
         out.setdefault(name, dsl)
     return out

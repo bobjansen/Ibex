@@ -80,10 +80,11 @@ CATEGORIES: list[tuple[str, list[str]]] = [
         "mean_by_symbol_day", "ohlc_by_symbol_day", "sum_by_user",
         "distinct_symbol"]),
     ("Column ops / update", [
-        "update_price_x2", "cumsum_price", "cumprod_price", "rand_uniform",
+        "select_one_column", "update_price_x2", "cumsum_price", "cumprod_price", "rand_uniform",
         "rand_normal", "rand_int", "rand_bernoulli"]),
     ("Scalar math builtins", [
-        "abs_price", "sqrt_price", "log_price", "exp_price",
+        "abs_price", "abs_int_price", "sqrt_price", "sqrt_coalesce_price",
+        "log_price", "exp_price",
         "round_price", "floor_price", "ceil_price"]),
     ("Grouped window functions", [
         "rank_by_symbol", "lag_by_symbol", "cumsum_by_symbol"]),
@@ -111,7 +112,8 @@ CATEGORIES: list[tuple[str, list[str]]] = [
     ("Fill / null propagation", ["fill_null", "fill_forward", "fill_backward"]),
     ("Time-series (TimeFrame)", [
         "as_timeframe", "tf_lag1", "tf_rolling_count_1m", "tf_rolling_sum_1m",
-        "tf_rolling_mean_5m", "tf_rolling_median_1m", "tf_rolling_std_1m",
+        "tf_rolling_min_1m", "tf_rolling_max_1m", "tf_rolling_mean_5m",
+        "tf_rolling_median_1m", "tf_rolling_std_1m",
         "tf_rolling_ewma_1m", "tf_resample_1m_ohlc", "tf_asof_join",
         "tf_asof_join_by_symbol"]),
 ]
@@ -254,9 +256,12 @@ def load_pdsh(path: Path) -> dict:
     for t in tables.values():
         t["rows"].sort(key=lambda row: row["id"])
     cpu = ""
+    dirty = None
     for _, text in manifests:
         try:
-            cpu = json.loads(text).get("cpu", "") or cpu
+            manifest = json.loads(text)
+            cpu = manifest.get("cpu", "") or cpu
+            dirty = bool(manifest.get("dirty")) or dirty
         except ValueError:
             pass
     version_text = next(iter(versions.values()), "")
@@ -270,6 +275,7 @@ def load_pdsh(path: Path) -> dict:
         "tables": tables,
         "meta": {"commit": commit[:8], "scale_factor": sf, "cpu": cpu,
                  "polars": found.get("polars", ""), "duckdb": found.get("duckdb", ""),
+                 "pdsh_commit": found.get("pdsh_commit", ""), "dirty": dirty,
                  "source": path.name},
     }
 
@@ -290,6 +296,7 @@ def load_h2o(paths: list[Path]) -> dict:
     texts: list[tuple[str, str]] = []
     checks: dict[str, str] = {}
     cpu = ""
+    ibex_commit = ""
     for p in paths:
         if p.name.endswith(".tar.gz"):
             for source, text, sidecar in h2o_archive_inputs(p):
@@ -298,6 +305,8 @@ def load_h2o(paths: list[Path]) -> dict:
             for _, v in _tar_member_texts(p, r"results/versions\.txt$"):
                 m = re.search(r"Model name:\s*(.+)", v)
                 cpu = m.group(1).strip() if m else cpu
+                commit_match = re.search(r"^ibex_commit=(.+)$", v, re.MULTILINE)
+                ibex_commit = commit_match.group(1).strip() if commit_match else ibex_commit
         else:
             source = str(p)
             texts.append((source, p.read_text(encoding="utf-8")))
@@ -335,6 +344,7 @@ def load_h2o(paths: list[Path]) -> dict:
         ],
         "tables": tables,
         "meta": {"versions": {k: sorted(v) for k, v in versions.items()}, "cpu": cpu,
+                 "commit": ibex_commit[:8],
                  "sources": [p.name for p in paths]},
     }
 
@@ -344,8 +354,8 @@ HTML_TEMPLATE = """<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Ibex | Benchmarks vs Polars, DuckDB, ClickHouse, DataFusion, data.table</title>
-  <meta name="description" content="Ibex benchmarked against Polars, DuckDB, ClickHouse, DataFusion and data.table across columnar DataFrame queries from 1M to __MAXM__M rows." />
+  <title>Ibex | Benchmarks vs Polars and DuckDB</title>
+  <meta name="description" content="Measured Ibex comparisons with Polars 2 and DuckDB 2, plus independent H2O and PDS-H benchmarks with per-query timings and answer checks." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
@@ -440,17 +450,18 @@ __BENCHMARK_NAV__
     <p class="section-label">Ibex's own suite</p>
     <h2>In-memory DataFrame queries</h2>
     <p class="section-sub">
-      Ibex against <strong>Polars</strong>, <strong>DuckDB</strong>,
-      <strong>ClickHouse</strong>, <strong>DataFusion</strong> and
-      <strong>data.table</strong> on the same columnar queries, from 1M to __MAXM__M
-      rows. Times are the mean of timed iterations.
+      Ibex against <strong>Polars 2.0.0</strong> and <strong>DuckDB 2.0.0</strong>
+      on the same columnar queries, from 1M to __MAXM__M rows. The table shows
+      six execution variants measured in this run; blank cells mean that a
+      variant was not measured for that query and size. Times are means of five
+      iterations.
     </p>
     <p class="bench-note">
-      <strong>Published run:</strong> October 12, 2026, Ibex <code>ffeb07ad</code>;
+      <strong>Published run:</strong> October 24, 2026, Ibex <code>950fafc1</code>;
       separate identical r7i.2xlarge instances per engine, 64 GiB, 8 vCPUs on
       4 physical cores with SMT on. Engines use their default thread budgets;
-      the <code>-st</code> columns use one thread. One warmup, 5 timed iterations.
-      Competitor package versions were not retained in this run's CSV or launch manifest.
+      the <code>-st</code> columns use one thread. Polars and DuckDB are both
+      version <code>2.0.0</code>. One warmup and five timed iterations.
       <a href="__GITHUB__/benchmarking/aws/README.md#reproduce-the-published-configurations">Reproduce this configuration</a>.
     </p>
     <div class="stats" id="stats"></div>
@@ -468,12 +479,21 @@ __BENCHMARK_NAV__
       faster of the two overall. Ibex's CSV reader dictionary-encodes string
       columns automatically, so a group-by on <code>symbol</code> runs on
       integer codes. Polars is given the same encoding (its string columns are
-      cast to <code>Categorical</code>); DuckDB, DataFusion, ClickHouse and
-      data.table group on plain strings, as they do by default. Tables are read
-      once and queried many times, so that is a real advantage, and part of the
-      distance to the SQL engines; Polars is the closest like-for-like
-      comparison on this page.
+      cast to <code>Categorical</code>); DuckDB groups on plain strings by
+      default. Tables are read once and queried many times, so that is a real
+      advantage.
     </p>
+    <p class="bench-note">
+      <strong>Answer checks.</strong> Deterministic queries are compared by
+      complete output on small fixtures before timing. Strict answer digests
+      check every measured query and size. This run had zero mismatches; checks
+      run outside the timed sections.
+    </p>
+    <p class="bench-note"><strong>Across the full matrix.</strong>
+      Ratios are Ibex time divided by the named engine's time; below 1 means
+      Ibex is faster. Geometric means weight each shared query/size cell equally;
+      total ratios compare summed times.</p>
+    <div class="tablewrap"><table class="bench" id="scale-summary"></table></div>
 
     <div class="bench-controls">
       <div class="grp"><span class="lbl">Rows</span><span id="scales"></span></div>
@@ -500,10 +520,9 @@ __BENCHMARK_NAV__
       parallelises some operators by default, so <code>ibex</code> is not a
       single-core number; <code>ibex-st</code> is the same build run with
       <code>IBEX_CORES=1</code>, which makes <code>ibex</code> vs
-      <code>ibex-st</code> Ibex's own threading gain. <code>polars-st</code>,
-      <code>duckdb-st</code>, <code>datafusion-st</code> and
-      <code>clickhouse-st</code> are the equivalent single-thread runs of their
-      engines, so <code>ibex-st</code> against those is the per-core comparison.
+      <code>ibex-st</code> Ibex's own threading gain. <code>polars-st</code>
+      and <code>duckdb-st</code> are the equivalent single-thread runs, so
+      <code>ibex-st</code> against those is the per-core comparison.
     </p>
     <p class="bench-note">
       <strong>Memory.</strong> The memory metrics show absolute peak resident set
@@ -513,13 +532,14 @@ __BENCHMARK_NAV__
       memory for the parallel speed-ups noted above.
     </p>
     <p class="bench-note">
-      <strong>Caveats.</strong> Every engine now materialises its full result.
+      <strong>Scope.</strong> This run includes Ibex, Polars and DuckDB only.
+      The TimeFrame constructor and two scalar builtins without matching
+      reference cases are Ibex-only and excluded from paired summaries.
+      Every displayed cell comes from this run; no older result is carried
+      forward. Each engine materialises its full result.
       <code>tf rolling EWMA</code> uses the bounded window definition in Ibex,
-      pandas and Polars. ClickHouse statistical/OHLC cells <em>cannot compute
-      correctly under the shared semantics</em> and are excluded from claims.
-      Each page is generated from a single run; <code>SQLite</code> and the
-      data.table <code>rolling median/std</code> cells are omitted (they dominate
-      wall-clock and add no competitive signal).
+      Polars and DuckDB. Variants absent from this AWS fleet, including other
+      engines, do not appear in this comparison.
     </p>
     <p class="bench-note">
       <strong>The code behind these numbers.</strong> Every query's exact code, in
@@ -540,6 +560,11 @@ __BENCHMARK_NAV__
       key cardinalities (K=100, 10 and 2, the last with 5M groups in <code>id3</code>),
       with 5% nulls and pre-sorted variants, and five joins. None of these queries
       or data shapes were written alongside Ibex. Pick a data set and a core count.
+    </p>
+    <p class="bench-note">
+      <strong>Published run:</strong> October 24, 2026, Ibex <code>950fafc1</code>;
+      r7i.4xlarge, 128 GiB, SMT off, pinned to 1 and 8 physical cores. One
+      warmup and five timed iterations per question.
     </p>
     <p class="bench-note">
       <strong>Result provenance:</strong> sources and engine versions are listed
@@ -594,10 +619,12 @@ __BENCHMARK_NAV__
       iterations after 1 warmup.
     </p>
     <p class="bench-note">
-      <strong>Published run:</strong> October 16, 2026, r7i.4xlarge, 128 GiB,
+      <strong>Published run:</strong> October 24, 2026, r7i.4xlarge, 128 GiB,
       SMT off; each engine pinned to the same 1, 2 or 8 physical cores.
-      Upstream revision <code>401908a307f1</code>. Per-run manifests record a
-      dirty working tree; the artifact retains those manifests.
+      Ibex <code>950fafc1</code>, upstream revision
+      <code>401908a307f133a2dffbe3f5e0e0fb2b50ea310b</code>, Polars
+      <code>2.0.0</code>, DuckDB <code>2.0.0</code>. The archive retains per-run
+      manifests for audit.
       <a href="__GITHUB__/benchmarking/aws/README.md#reproduce-the-published-configurations">Reproduce this configuration</a>.
     </p>
     <div class="bench-controls" id="pdsh-controls"></div>
@@ -690,6 +717,35 @@ function render() {
     h += "</tr>";
   }
   document.getElementById("tbl").innerHTML = h + "</tbody>";
+}
+
+function renderScaleSummary(P) {
+  const pairs = [
+    ["ibex", "polars", "Ibex / Polars"],
+    ["ibex-st", "polars-st", "Ibex-ST / Polars-ST"],
+    ["ibex", "duckdb", "Ibex / DuckDB"],
+    ["ibex-st", "duckdb-st", "Ibex-ST / DuckDB-ST"],
+  ];
+  let h = "<thead><tr><th class='qcol'>comparison</th><th>cells</th>"
+    + "<th>geomean ratio</th><th>total ratio</th></tr></thead><tbody>";
+  for (const [ibex, other, label] of pairs) {
+    const ratios = [];
+    let ibexTotal = 0, otherTotal = 0;
+    for (const scale of P.scales) {
+      const table = P.data[scale] || {};
+      for (const query of P.queries) {
+        const cell = table[query.id] || {};
+        if (cell[ibex] == null || cell[other] == null || cell[other] <= 0) continue;
+        ratios.push(cell[ibex] / cell[other]);
+        ibexTotal += cell[ibex];
+        otherTotal += cell[other];
+      }
+    }
+    const geo = Math.exp(ratios.reduce((sum, x) => sum + Math.log(x), 0) / ratios.length);
+    h += `<tr><td class='qcol'>${label}</td><td>${ratios.length}</td>`
+      + `<td>${geo.toFixed(3)}</td><td>${(ibexTotal / otherTotal).toFixed(3)}</td></tr>`;
+  }
+  document.getElementById("scale-summary").innerHTML = h + "</tbody>";
 }
 
 function setMetric(m) {
@@ -864,6 +920,7 @@ function headlineRatios(suite, summary) {
     const v = H2O.meta.versions;
     const ver = Object.entries(v).map(([e, xs]) => `${e} <code>${xs.join(", ")}</code>`).join(", ");
     initSuite("h2o", H2O, (H2O.meta.cpu ? `${H2O.meta.cpu} · ` : "")
+      + (H2O.meta.commit ? `Ibex commit <code>${H2O.meta.commit}</code> · ` : "")
       + `versions: ${ver} · sources: ${H2O.meta.sources.join(", ")}`);
   } else initSuite("h2o", null, "");
   if (PDSH) {
@@ -874,20 +931,23 @@ function headlineRatios(suite, summary) {
     const m = PDSH.meta;
     initSuite("pdsh", PDSH, `SF-${m.scale_factor}` + (m.cpu ? ` · ${m.cpu}` : "")
       + ` · Ibex commit <code>${m.commit}</code> · Polars <code>${m.polars}</code>, DuckDB <code>${m.duckdb}</code>`
+      + (m.pdsh_commit ? ` · upstream <code>${m.pdsh_commit.slice(0, 12)}</code>` : "")
+      + (m.dirty ? " · archive marks working tree dirty" : "")
       + ` · source: ${m.source}`);
   } else initSuite("pdsh", null, "");
   head.unshift(chip("#inmemory", `In-memory suite<br><strong>${PAYLOAD.queries.length}</strong> queries, `
-    + `<strong>${PAYLOAD.frameworks.length}</strong> engines`));
+    + `<strong>${PAYLOAD.frameworks.length}</strong> execution variants`));
   document.getElementById("headline").innerHTML = head.join("");
 })();
 
 (function init() {
   const P = PAYLOAD, big = P.scales[P.scales.length - 1];
   document.getElementById("stats").innerHTML =
-    `<span class='stat'><strong>${P.frameworks.length}</strong> engines</span>`
+    `<span class='stat'><strong>${P.frameworks.length}</strong> variants</span>`
     + `<span class='stat'><strong>${P.queries.length}</strong> queries</span>`
     + `<span class='stat'>1M&ndash;<strong>${(big/1e6)|0}M</strong> rows</span>`
     + `<span class='stat'>r7i.2xlarge &middot; 8 vCPU Sapphire Rapids</span>`;
+  renderScaleSummary(P);
   document.getElementById("scales").innerHTML = P.scales.map(n =>
     `<button class='opt' data-s='${n}'>${(n/1e6)}M</button>`).join("");
   document.querySelectorAll("#scales button").forEach(b =>

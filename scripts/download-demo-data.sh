@@ -11,12 +11,16 @@
 #
 # Downloads into:
 #   data/demo/
+#   data/flights-1m.parquet (path used by the parquet examples and smoke tests)
 #
 # Datasets:
 #   - palmerpenguins (small, clean teaching dataset)
 #   - Titanic (single-table tutorial dataset)
 #   - nycflights13 (relational join demo set)
 #   - NYC TLC green taxi parquet + zone lookup (optional; larger)
+#   - flights-1m.parquet from vega/falcon: the first 1M rows of the BTS
+#     on-time data (2006-01-01..2006-02-28), built by Falcon's
+#     data/convert_flights.ipynb; checksum-verified
 
 set -euo pipefail
 
@@ -111,6 +115,25 @@ download_csv_without_first_column() {
     rm -f "$tmp"
 }
 
+verify_sha256() {
+    local file="$1"
+    local expected="$2"
+    local actual
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual="$(sha256sum "$file" | cut -d' ' -f1)"
+    else
+        actual="$(shasum -a 256 "$file" | cut -d' ' -f1)"
+    fi
+
+    if [[ "$actual" != "$expected" ]]; then
+        echo "error: checksum mismatch for ${file#$IBEX_ROOT/}" >&2
+        echo "  expected $expected" >&2
+        echo "  actual   $actual" >&2
+        exit 1
+    fi
+}
+
 echo "▸ destination: $DATA_DIR"
 
 # palmerpenguins
@@ -152,5 +175,13 @@ if [[ "$SKIP_TAXI" == false ]]; then
         "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv" \
         "$DATA_DIR/nyc_taxi/taxi_zone_lookup.csv"
 fi
+
+# Falcon flights sample, pinned to the commit that added it.
+download \
+    "https://raw.githubusercontent.com/vega/falcon/a7351378997d5a3c5764b0f84d279e329f1132df/data/flights-1m.parquet" \
+    "$IBEX_ROOT/data/flights-1m.parquet"
+verify_sha256 \
+    "$IBEX_ROOT/data/flights-1m.parquet" \
+    "474d651871f360e798fd07cb591ffe7a8ef859e8cf7109610960871fb3bf44c5"
 
 echo "✓ demo datasets ready under ${DATA_DIR#$IBEX_ROOT/}"

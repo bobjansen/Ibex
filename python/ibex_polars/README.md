@@ -76,6 +76,12 @@ the required dtype correction. Columns declared as String retain String output.
 
 ## Validation and measurements
 
+The [upstream compatibility harness](../conformance/README.md) runs pinned,
+unmodified Polars tests and distinguishes supported queries, explicit
+rejections, mismatches, and tests that never exercise Ibex. It is the growing
+compatibility target; existing engine tests also cover ownership and execution
+boundaries that upstream tests do not check.
+
 ```bash
 PYTHONPATH=build-release/python:python .venv/bin/python python/test_ibex_polars.py
 PYTHONPATH=build-release/python:python IBEX_CORES=1 POLARS_MAX_THREADS=1 \

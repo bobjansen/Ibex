@@ -78,3 +78,7 @@ benchmarking/tpch/results/runs/
 
 # WASM playground artifacts (built in the Pages workflow)
 docs/playground/
+
+# Optional pinned upstream conformance checkout and local reports.
+/.polars-upstream/
+/polars-conformance-results/

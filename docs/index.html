@@ -96,7 +96,9 @@
         <span class="tour-tag">Language</span>
         <h3>Write columns as columns</h3>
         <p>Named clauses describe each transformation, and columns are
-        referenced directly by name. In Ibex you write <code>px</code>, not
+        referenced directly by name. Aggregates <code>first</code> and <code>last</code>
+        skip nulls; <code>first_null</code> and <code>last_null</code> preserve the edge row,
+        including its null value. In Ibex you write <code>px</code>, not
         <code>pl.col("px")</code>.</p>
       </article>
       <article class="card">

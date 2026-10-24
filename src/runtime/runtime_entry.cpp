@@ -130,6 +130,10 @@ auto aggregate_is_streamable(const ir::AggregateNode& agg) -> bool {
                 // since aggregation on those types is rejected upstream of the
                 // chunked path entirely, same as every other agg func).
                 return true;
+            case ir::AggFunc::FirstNull:
+            case ir::AggFunc::LastNull:
+                // Null-preserving edges currently use the materialized row-wise state.
+                return false;
             default:
                 // Median/Quantile need all values; Ewma is row-order coupled --
                 // these stay on the materializing path.

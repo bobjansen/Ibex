@@ -6758,6 +6758,12 @@ class Lowerer {
         if (name == "last") {
             return ir::AggFunc::Last;
         }
+        if (name == "first_null") {
+            return ir::AggFunc::FirstNull;
+        }
+        if (name == "last_null") {
+            return ir::AggFunc::LastNull;
+        }
         if (name == "median") {
             return ir::AggFunc::Median;
         }

@@ -2031,6 +2031,10 @@ auto Emitter::emit_agg_func(ir::AggFunc func) -> std::string {
             return "First";
         case ir::AggFunc::Last:
             return "Last";
+        case ir::AggFunc::FirstNull:
+            return "FirstNull";
+        case ir::AggFunc::LastNull:
+            return "LastNull";
         case ir::AggFunc::Median:
             return "Median";
         case ir::AggFunc::Stddev:

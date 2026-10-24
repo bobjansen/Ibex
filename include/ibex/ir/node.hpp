@@ -299,14 +299,16 @@ enum class AggFunc : std::uint8_t {
     Median,  ///< Middle value (ignores nulls; always returns double).
     Stddev,  ///< Sample standard deviation, n-1 denominator (ignores nulls; always returns double).
     Ewma,    ///< Exponentially weighted moving average: ewma(col, alpha) (always returns double).
-    Quantile,  ///< quantile(col, p): p-th quantile via linear interpolation (always returns
-               ///< double).
-    Skew,      ///< Sample skewness (Fisher–Pearson, n≥3; ignores nulls; always returns double).
-    Kurtosis,  ///< Sample excess kurtosis (n≥4; ignores nulls; always returns double).
-    Cov,       ///< cov(x, y): sample covariance, n-1 denominator, over the rows where both are
-               ///< non-null (n≥2; always returns double).
-    Corr,      ///< corr(x, y): Pearson correlation over the rows where both are non-null (n≥2,
-               ///< neither constant; always returns double).
+    Quantile,   ///< quantile(col, p): p-th quantile via linear interpolation (always returns
+                ///< double).
+    Skew,       ///< Sample skewness (Fisher–Pearson, n≥3; ignores nulls; always returns double).
+    Kurtosis,   ///< Sample excess kurtosis (n≥4; ignores nulls; always returns double).
+    Cov,        ///< cov(x, y): sample covariance, n-1 denominator, over the rows where both are
+                ///< non-null (n≥2; always returns double).
+    Corr,       ///< corr(x, y): Pearson correlation over the rows where both are non-null (n≥2,
+                ///< neither constant; always returns double).
+    FirstNull,  ///< First row value, including null; null for empty input.
+    LastNull,   ///< Last row value, including null; null for empty input.
 };
 
 /// Whether `func` reads two columns (`AggSpec::column` and `AggSpec::paired`).

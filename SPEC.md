@@ -770,6 +770,8 @@ mean(col)   // averages only non-null values
 median(col) // ignores null rows
 first(col)  // first non-null value; null for an all-null group
 last(col)   // last non-null value; null for an all-null group
+first_null(col) // value of the first row, including null; null for empty input
+last_null(col)  // value of the last row, including null; null for empty input
 std(col)    // ignores null rows; returns null if fewer than 2 non-null values
 ewma(col, alpha)  // ignores null rows; returns null for an empty group
 cov(x, y)   // only rows where both x and y are non-null; null if fewer than 2 such rows
@@ -777,7 +779,7 @@ corr(x, y)  // as cov, and null when either column is constant over those rows
 ```
 
 Over a `Decimal(p, s)` column, `sum` is `Decimal(38, s)` (exact, and an error
-past 38 digits); `min`, `max`, `first` and `last` keep the column's type;
+past 38 digits); `min`, `max`, `first`, `last`, `first_null` and `last_null` keep the column's type;
 `mean` divides the exact sum in decimal (without capping the quotient's scale at 38) and only then
 converts to `Float64`, so `mean` of `0.10, 0.20, 0.30` is exactly `0.2`; `count` and
 `count_distinct` are `Int64`. The statistical aggregates (`median`, `std`,

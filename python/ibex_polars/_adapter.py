@@ -14,11 +14,26 @@ import pyarrow as pa
 
 import ibex
 from ibex._expr import Expr
-from ibex._lower import lower
+from ibex._lower import _WIDENED_NUMERIC_TYPES, lower
 
 
 VISITOR_VERSION = (15, 2)
 POLARS_VERSION = "2.0.0"
+
+# These logical integer types all fit native Int64 storage. UInt32/UInt64
+# intentionally remain outside this subset.
+_INTEGER_LAYOUTS = {pl.Int32: (32, True), pl.Int64: (64, True)}
+_SUPPORTED_INPUT_TYPES = (*_INTEGER_LAYOUTS, pl.Float64, pl.Boolean, pl.String, pl.Date, pl.Categorical)
+
+
+def _integer_bounds(dtype):
+    bits, signed = _INTEGER_LAYOUTS[dtype]
+    return (-(2**(bits - 1)) if signed else 0, 2**(bits - int(signed)) - 1)
+
+
+def _wrap_integer(expr, dtype):
+    bits, signed = _INTEGER_LAYOUTS[dtype]
+    return expr if bits == 64 else Expr("wrap_integer", (expr, bits, signed))
 
 
 def check_version():
@@ -47,14 +62,16 @@ class Adapter:
         self.expressions = {}
 
     def expression(self, node):
-        if node in self.expressions:
-            return self.expressions[node]
+        # A column expression can be reused after an update changes its dtype.
+        key = (node, tuple(self.visitor.get_schema().items()))
+        if key in self.expressions:
+            return self.expressions[key]
         value = self.visitor.view_expression(node)
         kind = type(value).__name__
         if kind == "Column":
             expr = ibex.col(value.name)
         elif kind == "Literal":
-            if value.dtype not in (pl.Int32, pl.Int64, pl.Float64, pl.Boolean, pl.String, pl.Date):
+            if value.dtype not in (*_INTEGER_LAYOUTS, pl.Float64, pl.Boolean, pl.String, pl.Date):
                 raise NotImplementedError(f"unsupported literal type {value.dtype}")
             expr = ibex.lit(value.value)
         elif kind == "BinaryExpr":
@@ -77,9 +94,20 @@ class Adapter:
         elif kind == "Len":
             expr = ibex.len()
         elif kind == "Cast":
-            if value.dtype != pl.Float64 or value.options != 1:
+            original = self.visitor.get_dtype(value.expr)
+            if value.dtype in _INTEGER_LAYOUTS and original in _INTEGER_LAYOUTS:
+                source_min, source_max = _integer_bounds(original)
+                target_min, target_max = _integer_bounds(value.dtype)
+                if target_min <= source_min and source_max <= target_max:
+                    expr = self.expression(value.expr)
+                elif value.options == 2:
+                    expr = _wrap_integer(self.expression(value.expr), value.dtype)
+                else:
+                    raise NotImplementedError(f"unsupported checked/null-producing cast from {original} to {value.dtype}")
+            elif value.dtype == pl.Float64 and original in (*_INTEGER_LAYOUTS, pl.Float64):
+                expr = Expr("cast", (self.expression(value.expr), pa.float64()))
+            else:
                 raise NotImplementedError(f"unsupported cast to {value.dtype} with options {value.options}")
-            expr = Expr("cast", (self.expression(value.expr), pa.float64()))
         elif kind == "Function":
             args = tuple(self.expression(child) for child in value.input)
             name = str(value.function_data[0]).split(".")[-1]
@@ -95,11 +123,19 @@ class Adapter:
                 expr = Expr("is_null", args)
             elif name == "IsNotNull" and len(args) == 1:
                 expr = ~Expr("is_null", args)
+            elif name == "negate" and len(args) == 1 and self.visitor.get_dtype(node) in (pl.Int32,):
+                expr = ibex.lit(0) - args[0]
             else:
                 raise NotImplementedError(f"unsupported function {value.function_data}")
         else:
             raise NotImplementedError(f"unsupported Polars expression {kind} (node {node})")
-        self.expressions[node] = expr
+        # Keep narrow integers as logical types only. Each expression boundary
+        # must wrap before a later comparison, division, cast or reduction.
+        if kind in ("BinaryExpr", "Agg", "Function") and expr._op not in (
+            "polars_==", "polars_!=", "polars_<", "polars_<=", "polars_>", "polars_>=", "&&", "||", "!", "is_null"
+        ) and self.visitor.get_dtype(node) in _INTEGER_LAYOUTS:
+            expr = _wrap_integer(expr, self.visitor.get_dtype(node))
+        self.expressions[key] = expr
         return expr
 
     def named(self, expr):
@@ -115,19 +151,25 @@ class Adapter:
         if kind == "DataFrameScan":
             if node.selection is not None:
                 raise NotImplementedError("DataFrameScan selections are not supported yet")
-            supported = (pl.Int64, pl.Float64, pl.Boolean, pl.String, pl.Date, pl.Categorical)
             for name, dtype in schema.items():
-                if dtype.base_type() not in supported:
+                if dtype.base_type() not in _SUPPORTED_INPUT_TYPES:
                     raise NotImplementedError(f"unsupported resident column {name}: {dtype}")
             # PyDataFrame.select projects column handles, without collecting a
             # lazy query or evaluating user expressions in the Polars engine.
             data = pl.DataFrame._from_pydf(node.df.select(list(schema)))
-            frame = ibex.LazyFrame(("table", data.to_arrow()))
+            table = data.to_arrow()
+            for index, field in enumerate(table.schema):
+                if field.type in _WIDENED_NUMERIC_TYPES:
+                    table = table.set_column(index, field.name, table.column(index).cast(_WIDENED_NUMERIC_TYPES[field.type]))
+            frame = ibex.LazyFrame(("table", table))
         elif kind == "Scan":
             if node.scan_type[0] != "parquet" or len(node.paths) != 1:
                 raise NotImplementedError("only single local Parquet scans are supported")
             if not isinstance(node.paths[0], str) or Path(node.paths[0]).is_dir():
                 raise NotImplementedError("only single local Parquet file paths are supported")
+            for name, dtype in schema.items():
+                if dtype.base_type() not in _SUPPORTED_INPUT_TYPES:
+                    raise NotImplementedError(f"unsupported Parquet column {name}: {dtype}")
             options = node.file_options
             for name in ("row_count", "row_index", "include_file_paths", "n_rows", "hive_options",
                          "column_mapping", "default_values", "deletion_files", "table_statistics"):
@@ -157,6 +199,10 @@ class Adapter:
             frame = frame.select(list(schema))
         elif kind in ("Filter", "SimpleProjection", "Select", "HStack", "GroupBy", "Sort"):
             frame = self.frame(node.input)
+            # get_dtype resolves columns against the current visitor node.
+            # Resolve expressions against their INPUT, before output aliases
+            # or casts can change a column's logical dtype.
+            self.visitor.set_node(node.input)
             if kind == "Filter":
                 frame = frame.filter(self.expression(node.predicate.node))
             elif kind == "SimpleProjection":
@@ -176,7 +222,7 @@ class Adapter:
                     expr = self.expression(key.node)
                     if expr._op != "col" or expr._name != key.output_name:
                         raise NotImplementedError("computed or renamed grouping keys are not supported yet")
-                    if self.visitor.get_dtype(key.node) == pl.Float64:
+                    if self.visitor.get_dtype(key.node) in (pl.Float32, pl.Float64):
                         raise NotImplementedError("floating-point grouping keys are not supported yet")
                     keys.append(expr._name)
                 frame = frame.group_by(*keys, maintain_order=node.maintain_order).agg([self.named(expr) for expr in node.aggs])
@@ -201,10 +247,10 @@ class Adapter:
         expected = self.visitor.get_schema()
         frame = self.frame(root)
         # Validate the complete supported plan before native input binding.
-        lower(frame, validate=True)
+        lower(frame, validate=True, widen_numeric_inputs=True)
         if frame._source[0] == "table":
             prepared = ibex.DataFrame(frame._source[1]).lazy()
             frame = ibex.LazyFrame(prepared._source, frame._steps)
         result_schema = {}
-        source, bindings, scalars = lower(frame, validate=True, result_schema=result_schema)
+        source, bindings, scalars = lower(frame, validate=True, result_schema=result_schema, widen_numeric_inputs=True)
         return source, bindings, scalars, expected, result_schema

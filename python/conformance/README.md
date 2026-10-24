@@ -114,6 +114,11 @@ not an overall compatibility percentage. The native test bridge was linked
 against the existing release libraries with the branch's borrowed-column
 read fixes; CI builds the branch from source.
 
+After adding boundary-only Int32 support, the same survey has 20 passing tests,
+326 tests with unsupported queries, and 730 unexercised tests. There are 73
+matching queries and 1,557 rejections, with zero mismatches. These newly passing
+comparisons are now part of the required regression baseline.
+
 Expand `targets` to more upstream modules or use `--select` to investigate.
 When support improves, add newly passing query ordinals from the report to
 `required_pass_queries` so that losing support fails CI rather than silently

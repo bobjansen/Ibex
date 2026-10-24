@@ -53,6 +53,9 @@
     "tests/unit/operations/test_sort.py::test_sort_multiple_keys_maintain_order_reversed_input[streaming]": [
       1
     ],
+    "tests/unit/operations/test_group_by.py::test_group_by_mean_by_dtype[input5-expected5-Int32-Float64]": [
+      1
+    ],
     "tests/unit/operations/test_group_by.py::test_group_by_mean_by_dtype[input8-expected8-Float64-Float64]": [
       1
     ],
@@ -70,13 +73,25 @@
       1,
       2
     ],
+    "tests/unit/operations/test_group_by.py::test_lazy_group_by_reuse_11767": [
+      1,
+      2
+    ],
     "tests/unit/operations/test_group_by.py::test_unique_head_tail_26429[0]": [
       1
     ],
     "tests/unit/operations/test_group_by.py::test_group_by_cse_alias_26423": [
       1
     ],
+    "tests/unit/operations/arithmetic/test_arithmetic.py::test_arithmetic_supertype[Int8-Int32-Int32]": [
+      2,
+      4
+    ],
     "tests/unit/operations/arithmetic/test_arithmetic.py::test_arithmetic_supertype[Int8-Int64-Int64]": [
+      2,
+      4
+    ],
+    "tests/unit/operations/arithmetic/test_arithmetic.py::test_arithmetic_supertype[Int8-UInt16-Int32]": [
       2,
       4
     ],
@@ -84,7 +99,15 @@
       2,
       4
     ],
+    "tests/unit/operations/arithmetic/test_arithmetic.py::test_arithmetic_supertype[Int16-Int32-Int32]": [
+      2,
+      4
+    ],
     "tests/unit/operations/arithmetic/test_arithmetic.py::test_arithmetic_supertype[Int16-Int64-Int64]": [
+      2,
+      4
+    ],
+    "tests/unit/operations/arithmetic/test_arithmetic.py::test_arithmetic_supertype[Int16-UInt16-Int32]": [
       2,
       4
     ],
@@ -92,7 +115,23 @@
       2,
       4
     ],
+    "tests/unit/operations/arithmetic/test_arithmetic.py::test_arithmetic_supertype[Int32-Int32-Int32]": [
+      1,
+      2,
+      3,
+      4
+    ],
     "tests/unit/operations/arithmetic/test_arithmetic.py::test_arithmetic_supertype[Int32-Int64-Int64]": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "tests/unit/operations/arithmetic/test_arithmetic.py::test_arithmetic_supertype[Int32-UInt8-Int32]": [
+      2,
+      4
+    ],
+    "tests/unit/operations/arithmetic/test_arithmetic.py::test_arithmetic_supertype[Int32-UInt16-Int32]": [
       2,
       4
     ],

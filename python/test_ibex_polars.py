@@ -65,6 +65,65 @@ class EngineTests(unittest.TestCase):
             self.equal(frame.with_columns(x=pl.col("y"), y=pl.col("x") + 1), options=flags)
             self.equal(frame.select(v=pl.col("x") * pl.col("price")), options=flags)
 
+    def test_int32_uses_int64_storage_with_wrapping_at_expression_boundaries(self):
+        frame = pl.DataFrame({
+            "x": pl.Series([2**31 - 1, -(2**31), -1, 0, None], dtype=pl.Int32),
+            "y": pl.Series([2, -1, -(2**31), 2**31 - 1, 1], dtype=pl.Int32),
+            "wide": [1, 2, 3, 4, 5],
+        }).lazy()
+        queries = [
+            frame,
+            frame.select(add=pl.col("x") + 1, sub=pl.col("x") - 1, mul=pl.col("x") * 2),
+            frame.select(nested=(pl.col("x") + pl.col("y")) * pl.col("y")),
+            frame.select(negative=-pl.col("x")),
+            frame.select(test=(pl.col("x") + 1) > 0, ratio=(pl.col("x") + 1) / 2),
+            frame.filter((pl.col("x") + 1) > 0),
+            frame.select(wide=pl.col("x") + pl.col("wide"),
+                         converted=(pl.col("x") + 1).cast(pl.Int64)),
+            frame.with_columns(x=pl.col("x") + 1).with_columns(x=pl.col("x").cast(pl.Int64))
+                 .select(x=pl.col("x") + 1),
+            frame.sort("x"),
+        ]
+        for flags in (pl.QueryOptFlags(), pl.QueryOptFlags.none()):
+            for query in queries:
+                with self.subTest(query=query.explain(), flags=flags):
+                    self.equal(query, options=flags)
+
+        self.engine.prepare(frame)
+        _, tables, *_ = self.engine._prepare(frame, pl.QueryOptFlags())
+        native = ibex_pyarrow.execute_pipeline("input;", tables={"input": tables["_ibex_input"]})
+        self.assertEqual(native.schema.field("x").type, pa.int64())
+
+    def test_int32_grouping_reductions_and_empty_inputs(self):
+        for values in ([2**31 - 1, 1, None], [-(2**31), -1, None], [], [None, None]):
+            frame = pl.DataFrame({"x": pl.Series(values, dtype=pl.Int32),
+                                  "g": pl.Series(["a"] * len(values), dtype=pl.String)}).lazy()
+            for flags in (pl.QueryOptFlags(), pl.QueryOptFlags.none()):
+                self.equal(frame.select(total=pl.col("x").sum(), avg=pl.col("x").mean()), options=flags)
+                self.equal(frame.select(ratio=pl.col("x").sum() / 2), options=flags)
+                self.equal(frame.group_by("g", maintain_order=True).agg(
+                    total=pl.col("x").sum(), avg=pl.col("x").mean()), options=flags)
+                self.equal(frame.group_by("x", maintain_order=True).agg(pl.len()), options=flags)
+
+    def test_int32_explicit_wrapping_cast(self):
+        frame = pl.LazyFrame({"x": [2**63 - 1, -(2**63), 2**31, -(2**31) - 1, None]})
+        for flags in (pl.QueryOptFlags(), pl.QueryOptFlags.none()):
+            self.equal(frame.select(pl.col("x").cast(pl.Int32, wrap_numerical=True)), options=flags)
+        # Checked and null-producing narrowing casts are separate semantics.
+        with self.assertRaises(NotImplementedError):
+            frame.select(pl.col("x").cast(pl.Int32)).collect(engine=self.engine)
+
+    @unittest.skipIf(os.environ.get("IBEX_TEST_PARQUET") == "0", "Parquet backend disabled")
+    def test_int32_parquet_predicate_and_output_types(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "int32.parquet"
+            pq.write_table(pa.table({"x": pa.array([2**31 - 1, 1, None], type=pa.int32()),
+                                     "y": [10, 20, 30]}), path)
+            frame = pl.scan_parquet(path)
+            self.equal(frame.select("x"))
+            self.equal(frame.filter((pl.col("x") + 1) < 0).select("y"))
+            self.equal(frame.select(total=pl.col("x").sum()))
+
     def test_select_reads_original_columns_before_assigning_aliases(self):
         frame = pl.DataFrame({"x": [1, 2], "y": [10, 20],
                               "_ibex_select_0_0": [100, 200]}).lazy()

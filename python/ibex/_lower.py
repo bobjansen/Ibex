@@ -7,11 +7,16 @@ import pyarrow as pa
 from ._expr import Expr, _identifier
 
 
-def lower(frame, *, validate=False, result_schema=None):
+_WIDENED_NUMERIC_TYPES = {
+    pa.int32(): pa.int64(),
+}
+
+
+def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=False):
     scalars = {}
     tables = {}
 
-    step_types, schemas = _validate_types(frame) if validate else ([], [])
+    step_types, schemas = _validate_types(frame, widen_numeric_inputs=widen_numeric_inputs) if validate else ([], [])
     if result_schema is not None:
         result_schema.update(schemas[-1])
     current_types = {}
@@ -43,6 +48,16 @@ def lower(frame, *, validate=False, result_schema=None):
             return f"{names[args[1]]}({render(args[0])})"
         if op == "is_null":
             return f"is_null({render(args[0])})"
+        if op == "wrap_integer":
+            # Normalize a signed remainder to the logical integer range. Reduce
+            # first so even an Int64 aggregate result cannot overflow while
+            # adding the offset. Nulls propagate through native arithmetic.
+            value = render(args[0])
+            bits, signed = args[1:]
+            half = 2**(bits - 1) if signed else 0
+            modulus, offset = bind(2**bits), bind(2**bits + half)
+            normalized = f"((({value} % {modulus}) + {offset}) % {modulus})"
+            return f"({normalized} - {bind(half)})" if signed else normalized
         if op.removeprefix("polars_") in ("==", "!=", "<", "<=", ">", ">="):
             # Both Python frontends follow Polars: NaN equals itself and
             # compares greater than every non-NaN number. Keep this adaptation
@@ -176,7 +191,7 @@ def lower(frame, *, validate=False, result_schema=None):
     return prefix + source + ";", tables, scalars
 
 
-def _validate_types(frame):
+def _validate_types(frame, *, widen_numeric_inputs=False):
     """Check the prototype's supported types without decoding input rows."""
     kind, value = frame._source
     if kind == "parquet":
@@ -190,6 +205,10 @@ def _validate_types(frame):
     # the reference frame's Arrow boundary even for utf8 source buffers.
     columns = {name: pa.large_string() if dtype == pa.string() or pa.types.is_dictionary(dtype) else dtype
                for name, dtype in zip(schema.names, schema.types)}
+    if widen_numeric_inputs:
+        # The Polars adapter retains logical types in its visitor/output
+        # schema. Native Parquet decoding already widens narrow numeric types.
+        columns = {name: _WIDENED_NUMERIC_TYPES.get(dtype, dtype) for name, dtype in columns.items()}
     numeric = (pa.int64(), pa.float64())
     supported = numeric + (pa.uint32(), pa.bool_(), pa.string(), pa.large_string(), pa.date32())
 
@@ -231,6 +250,10 @@ def _validate_types(frame):
         if op == "is_null":
             dtype(args[0])
             return pa.bool_()
+        if op == "wrap_integer":
+            if dtype(args[0]) != pa.int64():
+                raise TypeError("integer wrapping requires an integral native expression")
+            return pa.int64()
         if op == "!":
             if dtype(args[0]) != pa.bool_():
                 raise TypeError("logical negation requires a Boolean expression")

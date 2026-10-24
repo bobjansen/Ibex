@@ -583,3 +583,19 @@ TEST_CASE("Arrow C Data round-trips decimal128 exactly", "[decimal][interop][arr
     schema.release(&schema);
     array.release(&array);
 }
+
+TEST_CASE("Decimal edge-row reducers preserve nulls and type", "[decimal][e2e][first_null]") {
+    runtime::Table t;
+    t.add_column("k", Column<std::int64_t>{1, 1, 2, 2});
+    t.add_column("x", dec_col(dec_type(8, 2), {"1.25", "2.50", "3.75", "5.00"}));
+    t.columns[1].validity = runtime::ValidityBitmap(4, true);
+    t.columns[1].validity->set(0, false);
+    t.columns[1].validity->set(3, false);
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+    auto out = run_ok("t[select { k, f = first_null(x), l = last_null(x) }, by k];", tables);
+    CHECK(type_of(out, "f") == dec_type(8, 2));
+    CHECK(type_of(out, "l") == dec_type(8, 2));
+    CHECK(texts(out, "f") == std::vector<std::string>{"null", "3.75"});
+    CHECK(texts(out, "l") == std::vector<std::string>{"2.50", "null"});
+}

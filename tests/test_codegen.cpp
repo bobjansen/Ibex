@@ -1402,3 +1402,14 @@ TEST_CASE("emitter: a model method that comes from a plugin is refused", "[codeg
     fit->add_child(make_source(b, "in.csv"));
     REQUIRE_THROWS_WITH(emit_to_string(*fit), Catch::Matchers::ContainsSubstring("plugin"));
 }
+
+TEST_CASE("emitter: null-preserving edge reducers", "[codegen][first_null]") {
+    ir::Builder b;
+    auto aggregate =
+        b.aggregate({}, {{.func = ir::AggFunc::FirstNull, .column = {.name = "x"}, .alias = "f"},
+                         {.func = ir::AggFunc::LastNull, .column = {.name = "x"}, .alias = "l"}});
+    aggregate->add_child(make_source(b, "ticks.csv"));
+    auto out = emit_to_string(*aggregate);
+    CHECK(contains(out, "ibex::ir::AggFunc::FirstNull"));
+    CHECK(contains(out, "ibex::ir::AggFunc::LastNull"));
+}

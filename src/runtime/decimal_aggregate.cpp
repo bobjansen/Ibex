@@ -59,6 +59,10 @@ auto agg_name(ir::AggFunc func) -> std::string_view {
             return "first";
         case ir::AggFunc::Last:
             return "last";
+        case ir::AggFunc::FirstNull:
+            return "first_null";
+        case ir::AggFunc::LastNull:
+            return "last_null";
         case ir::AggFunc::Median:
             return "median";
         case ir::AggFunc::Stddev:
@@ -309,6 +313,24 @@ auto aggregate_decimal_column(const ir::AggSpec& agg, const ColumnEntry& entry,
                 result.validity = std::move(validity);
             }
             return result;
+        }
+        case ir::AggFunc::FirstNull:
+        case ir::AggFunc::LastNull: {
+            std::vector<Int128> values(groups, 0);
+            std::vector<std::uint8_t> seen(groups, 0);
+            std::vector<std::uint8_t> selected_valid(groups, 0);
+            for (std::size_t row = 0; row < rows; ++row) {
+                const auto g = gids[row];
+                if (agg.func == ir::AggFunc::FirstNull && seen[g] != 0) {
+                    continue;
+                }
+                seen[g] = 1;
+                selected_valid[g] = present(row) ? 1 : 0;
+                if (selected_valid[g] != 0) {
+                    values[g] = data[row].units;
+                }
+            }
+            return decimal_result(in_type, values, selected_valid);
         }
         case ir::AggFunc::Min:
         case ir::AggFunc::Max:

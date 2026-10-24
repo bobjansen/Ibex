@@ -107,7 +107,8 @@ auto take_left_deep(NodePtr node, std::vector<NodePtr>& leaves, std::vector<Edge
 
 auto aggregate_order_insensitive(const AggregateNode& aggregate) -> bool {
     return std::ranges::none_of(aggregate.aggregations(), [](const AggSpec& spec) {
-        return spec.func == AggFunc::First || spec.func == AggFunc::Last;
+        return spec.func == AggFunc::First || spec.func == AggFunc::Last ||
+               spec.func == AggFunc::FirstNull || spec.func == AggFunc::LastNull;
     });
 }
 

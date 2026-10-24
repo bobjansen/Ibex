@@ -21,6 +21,7 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
     if result_schema is not None:
         result_schema.update(schemas[-1])
     current_types = {}
+    broadcast_length = None
 
     def bind(value):
         name = f"_ibex_scalar_{len(scalars)}"
@@ -35,6 +36,15 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             return bind(args[0])
         if op == "alias":
             return render(args[0])
+        if op == "broadcast_length":
+            return "^" + broadcast_length
+        if op == "repeat":
+            # A captured scalar is broadcast by the native projection/update
+            # operator. Length equality was proved by the Polars adapter.
+            return render(args[0])
+        if op == "repeat_null":
+            # The unreachable placeholder supplies the null's physical type.
+            return f"case {{ true => NULL, else => {render(args[0])} }}"
         if op == "sum":
             # Polars sum returns zero for empty/all-null inputs; Ibex's
             # native nullable sum returns null. Preserve the frontend contract.
@@ -154,6 +164,14 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
                 source += f"[update {{ {', '.join(updates)} }}]"
             source += f"[order {{ {', '.join(order)} }}]"
         elif operation == "hstack":
+            if any(expr._args[0]._op == "broadcast_length" for expr in expressions):
+                # Share the input before extracting its height. The native
+                # scalar binding then broadcasts in the same pipeline call.
+                shared = f"_ibex_repeat_input_{index}"
+                broadcast_length = f"_ibex_repeat_length_{index}"
+                prefix += f"let {shared} = {source};\n"
+                prefix += f"let {broadcast_length} = scalar({shared}[select {{ _ibex_repeat_count = count() }}]);\n"
+                source = shared
             if len(expressions) == 1:
                 expr = expressions[0]
                 source += f"[update {{ {_identifier(expr._name)} = {render(expr)} }}]"
@@ -247,6 +265,8 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
         if op == "lit":
             return pa.scalar(args[0]).type
         if op == "alias":
+            return dtype(args[0])
+        if op in ("repeat", "repeat_null", "broadcast_length"):
             return dtype(args[0])
         if op in ("first", "last", "first_non_null", "last_non_null"):
             result = dtype(args[0])

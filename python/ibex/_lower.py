@@ -43,7 +43,10 @@ def lower(frame, *, validate=False, result_schema=None):
             return f"{names[args[1]]}({render(args[0])})"
         if op == "is_null":
             return f"is_null({render(args[0])})"
-        if op.startswith("polars_"):
+        if op.removeprefix("polars_") in ("==", "!=", "<", "<=", ">", ">="):
+            # Both Python frontends follow Polars: NaN equals itself and
+            # compares greater than every non-NaN number. Keep this adaptation
+            # at the Python boundary; native Ibex comparisons stay unchanged.
             comparison = op.removeprefix("polars_")
             left, right = render(args[0]), render(args[1])
             if not any(current_types.get(id(arg)) == pa.float64() for arg in args):
@@ -140,6 +143,34 @@ def lower(frame, *, validate=False, result_schema=None):
             assignments = ", ".join(f"{_identifier(expr._name)} = {_identifier(name)}" for name, expr in zip(temporary_names, expressions))
             source += f"[update {{ {fields} }}][update {{ {assignments} }}]"
         else:
+            # Native select assignments are sequential. Python projections
+            # read the input schema, so stage expressions if an earlier alias
+            # would shadow a column used by a later expression.
+            def references(expr):
+                if expr._op == "col":
+                    return {expr._args[0]}
+                return set().union(*(references(arg) for arg in expr._args if isinstance(arg, Expr)))
+
+            inputs = [references(expr) for expr in expressions]
+            assigned = set()
+            shadowed = False
+            for expr, names in zip(expressions, inputs):
+                shadowed |= bool(assigned & names)
+                assigned.add(expr._name)
+            if operation == "select" and shadowed and not any(expr._aggregate for expr in expressions):
+                occupied = assigned | set().union(*inputs)
+                temporary_names = []
+                for field_index in range(len(expressions)):
+                    name = f"_ibex_select_{index}_{field_index}"
+                    while name in occupied:
+                        name += "_"
+                    occupied.add(name)
+                    temporary_names.append(name)
+                fields = ", ".join(f"{_identifier(name)} = {render(expr)}" for name, expr in zip(temporary_names, expressions))
+                source += f"[select {{ {fields} }}]"
+                fields = ", ".join(f"{_identifier(expr._name)} = {_identifier(name)}" for name, expr in zip(temporary_names, expressions))
+                source += f"[select {{ {fields} }}]"
+                continue
             fields = ", ".join(f"{_identifier(expr._name)} = {render(expr)}" for expr in expressions)
             source += f"[{operation} {{ {fields} }}]"
     return prefix + source + ";", tables, scalars

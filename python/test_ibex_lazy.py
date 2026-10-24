@@ -3,6 +3,8 @@
 """Semantic and execution-boundary checks; no Polars dependency."""
 
 from datetime import date
+import math
+import operator
 from pathlib import Path
 import os
 import subprocess
@@ -29,6 +31,31 @@ def q06(frame):
 
 
 class LazyTests(unittest.TestCase):
+    def test_nan_comparisons_follow_polars_total_order(self):
+        values = [None, float("nan"), -float("inf"), -1.0, 0.0, 1.0, float("inf")]
+        left = [a for a in values for _ in values]
+        right = values * len(values)
+        root = pl.DataFrame({"x": left, "y": right, "id": list(range(len(left)))}).lazy()
+
+        def key(value):
+            return (True, 0.0) if math.isnan(value) else (False, value)
+
+        for compare in (operator.eq, operator.ne, operator.lt, operator.le, operator.gt, operator.ge):
+            expected = [None if a is None or b is None else compare(key(a), key(b))
+                        for a, b in zip(left, right)]
+            with self.subTest(operator=compare.__name__):
+                predicate = compare(pl.col("x"), pl.col("y"))
+                self.assertEqual(root.select(predicate.alias("result")).collect()["result"].to_list(), expected)
+                self.assertEqual(root.filter(predicate).select("id").collect()["id"].to_list(),
+                                 [i for i, value in enumerate(expected) if value])
+                for scalar in (0, float("nan")):
+                    self.assertEqual(root.select(compare(pl.col("x"), scalar).alias("result"))
+                                     .collect()["result"].to_list(),
+                                     [None if a is None else compare(key(a), key(scalar)) for a in left])
+                    self.assertEqual(root.select(compare(pl.lit(scalar), pl.col("x")).alias("result"))
+                                     .collect()["result"].to_list(),
+                                     [None if a is None else compare(key(scalar), key(a)) for a in left])
+
     def test_independent_import_and_execution(self):
         code = '''
 import importlib.abc, sys
@@ -101,6 +128,28 @@ assert "polars" not in sys.modules
         for closed, expected in (("both", [1, 2]), ("left", [1]), ("right", [2]), ("none", [])):
             result = root.filter(pl.col("x").is_between(1, 2, closed=closed)).collect()
             self.assertEqual(result["x"].to_list(), expected)
+
+    def test_select_reads_original_columns_before_assigning_aliases(self):
+        root = pl.DataFrame({"x": [1, 2], "y": [10, 20],
+                             "_ibex_select_0_0": [100, 200]}).lazy()
+        cases = [
+            ((pl.col("y").alias("x"), pl.col("x").alias("y")),
+             {"x": [10, 20], "y": [1, 2]}),
+            (((pl.col("y") + 1).alias("x"), (pl.col("x") + 1).alias("y")),
+             {"x": [11, 21], "y": [2, 3]}),
+            ((pl.col("y").alias("x"), (pl.col("x") + pl.col("_ibex_select_0_0")).alias("y")),
+             {"x": [10, 20], "y": [101, 202]}),
+            ((pl.col("y").alias("_ibex_select_0_0"),
+              pl.col("_ibex_select_0_0").alias("y")),
+             {"_ibex_select_0_0": [10, 20], "y": [100, 200]}),
+        ]
+        for expressions, expected in cases:
+            with self.subTest(expected=expected):
+                query = root.select(*expressions)
+                self.assertEqual(query.collect().to_dict(as_series=False), expected)
+                self.assertEqual(query.select(*expected).collect().to_dict(as_series=False), expected)
+        self.assertEqual(root.select(pl.sum("y").alias("x"), pl.sum("x").alias("y"))
+                         .collect().to_dict(as_series=False), {"x": [30], "y": [3]})
 
     def test_constraints_and_expression_logic(self):
         result = pl.DataFrame({"x": [1, 2, 3], "ok": [True, True, False]}).lazy().filter(

@@ -65,6 +65,21 @@ class EngineTests(unittest.TestCase):
             self.equal(frame.with_columns(x=pl.col("y"), y=pl.col("x") + 1), options=flags)
             self.equal(frame.select(v=pl.col("x") * pl.col("price")), options=flags)
 
+    def test_select_reads_original_columns_before_assigning_aliases(self):
+        frame = pl.DataFrame({"x": [1, 2], "y": [10, 20],
+                              "_ibex_select_0_0": [100, 200]}).lazy()
+        projections = [
+            [pl.col("y").alias("x"), pl.col("x").alias("y")],
+            [(pl.col("y") + 1).alias("x"), (pl.col("x") + 1).alias("y")],
+            [pl.col("y").alias("x"), (pl.col("x") + pl.col("_ibex_select_0_0")).alias("y")],
+            [pl.col("y").alias("_ibex_select_0_0"), pl.col("_ibex_select_0_0").alias("y")],
+            [pl.sum("y").alias("x"), pl.sum("x").alias("y")],
+        ]
+        for flags in (pl.QueryOptFlags(), pl.QueryOptFlags.none()):
+            for expressions in projections:
+                with self.subTest(expressions=expressions, flags=flags):
+                    self.equal(frame.select(expressions), options=flags)
+
     def test_sort_directions_null_placement_and_stable_ties(self):
         frame = pl.DataFrame({"g": [None, "a", "a", "b", None], "h": [1, 2, 1, 0, 2],
                               "_ibex_sort_null_0_0": [10, 11, 12, 13, 14]}).lazy()

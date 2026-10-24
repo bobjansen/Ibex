@@ -100,7 +100,10 @@ Unsupported methods/options fail; implemented APIs reject unsupported
 expression shapes before native execution. Grouping supports scalar reductions
 and preserves first-occurrence group order when requested. Sorting supports
 per-key directions and null positions, with stable ties. Full Polars
-compatibility is not yet claimed.
+compatibility is not yet claimed. Floating-point comparisons follow Polars:
+NaN equals NaN and compares greater than every other number, including positive
+infinity. Null comparisons still return null. Sorting also places NaN above
+other numeric values, with null placement controlled by `nulls_last`.
 
 ## Check the actual upstream PDS-H query
 

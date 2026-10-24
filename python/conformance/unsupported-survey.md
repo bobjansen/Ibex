@@ -192,3 +192,25 @@ literals and temporal Parquet scans remain explicit rejections rather than
 silently losing precision, overflowing during rescaling or falling back to
 another execution engine. The accepted nanosecond range applies to both
 timestamps and durations.
+
+
+## First/last follow-up
+
+Polars default first/last reductions now select the edge row including its null
+through native `first_null`/`last_null`. The existing Ibex `first`/`last` still
+skip nulls and implement `ignore_nulls=True`. The new native reducers initially
+use materialized aggregation. Both empty global results (one null row) and
+empty grouped results (no groups) preserve their expected types.
+
+The same pinned survey now has 60 fully passing tests, 286 tests containing
+unsupported queries and 730 unexercised tests. Matching queries increased from
+132 to 339; rejections decreased from 1,498 to 1,291, with zero mismatches or
+support regressions. All 207 additional matches are required in the baseline.
+The nondeterministic first-index test compares sums upstream; its specific
+manifest rule compares full row multisets without requiring group order.
+
+Null-skipping Date reductions remain unsupported by the native implementation.
+Polars can simplify an edge reduction over computed values into an expression
+Slice, which remains unsupported by this adapter; the computed-input path is
+covered with optimizer simplification disabled. Struct/list outputs remain
+outside the agreed scope.

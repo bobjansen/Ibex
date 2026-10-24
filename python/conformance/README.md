@@ -96,9 +96,11 @@ zero passing comparisons, or regressions of previously passing queries in
 `required_pass_queries`. Explicitly unsupported features do not fail the run.
 
 Row order is checked by default. `unordered_tests` names individual tests whose
-upstream assertions explicitly set `check_row_order=False`, with the reason
-recorded in each report. Currently this covers `test_group_by_cse_alias_26423`:
-its unordered grouping can produce a different group order on each run.
+upstream assertions explicitly ignore order, with the reason recorded in each
+report. This covers `test_group_by_cse_alias_26423` (its assertion sets
+`check_row_order=False`) and `test_group_by_first_nondet_24278` (it compares only
+the sum of collected group indices). The harness still checks the full row
+multiset in both cases; unordered grouping can change group order on each run.
 There is no blanket sorting or dtype conversion to make comparisons pass.
 
 ## Initial survey and expansion
@@ -139,6 +141,17 @@ grouping, sorting, min/max and duration sums. The selected upstream survey
 remains at 132 matches: temporal cases in those modules now reach unsupported
 means, arithmetic, casts or the known timestamp-literal visitor limitation.
 No expected results or conformance tolerances were changed.
+
+First/last now use native null-preserving edge reducers by default and the
+existing null-skipping reducers for `ignore_nulls=True`. The survey has 339
+matching queries across 60 fully passing tests, 1,291 rejections, 286 tests
+with unsupported queries and 730 unexercised tests, with zero mismatches or
+support regressions. All 207 additional matching queries are required by CI.
+This run used a freshly built native bridge and runtime from this branch.
+Dedicated tests cover null edges, empty/all-null inputs, NaN, narrow integers,
+text/categorical values, dates and temporal units/zones. Null-skipping Date
+reductions and Polars expression Slice rewrites remain unsupported; computed
+edge inputs are covered with optimizer simplification disabled.
 
 Expand `targets` to more upstream modules or use `--select` to investigate.
 When support improves, add newly passing query ordinals from the report to

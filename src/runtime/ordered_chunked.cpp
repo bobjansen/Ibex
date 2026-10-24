@@ -1080,7 +1080,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
             std::visit(
                 [&](const auto& idx) {
                     for (std::size_t i = 0; i < n; ++i) {
-                        sorted[i] = winners[idx[i]];
+                        sorted[i] = winners[static_cast<std::size_t>(idx[i])];
                     }
                 },
                 order);

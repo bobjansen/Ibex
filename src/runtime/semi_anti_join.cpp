@@ -338,8 +338,15 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 if (workers < 2) {
                     words[dense_word(slot)] |= dense_bit(slot);
                 } else {
+#ifdef __cpp_lib_atomic_ref
                     std::atomic_ref<std::uint64_t>(words[dense_word(slot)])
                         .fetch_or(dense_bit(slot), std::memory_order_relaxed);
+#else
+                    // Match the integral atomic view used by the join/gather
+                    // kernels on libc++ versions without atomic_ref.
+                    reinterpret_cast<std::atomic<std::uint64_t>*>(&words[dense_word(slot)])
+                        ->fetch_or(dense_bit(slot), std::memory_order_relaxed);
+#endif
                 }
             });
         });
@@ -802,12 +809,21 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 if ((left_candidates_[dense_word(slot)] & dense_bit(slot)) == 0) {
                     continue;
                 }
+#ifdef __cpp_lib_atomic_ref
                 const std::atomic_ref<std::uint64_t> word(dense_i64_hits_[dense_word(slot)]);
+#else
+                auto& word = *reinterpret_cast<std::atomic<std::uint64_t>*>(
+                    &dense_i64_hits_[dense_word(slot)]);
+#endif
                 if ((word.load(std::memory_order_relaxed) & dense_bit(slot)) == 0) {
                     word.fetch_or(dense_bit(slot), std::memory_order_relaxed);
                 }
             } else if (const auto it = left_seen_.find(value); it != left_seen_.end()) {
+#ifdef __cpp_lib_atomic_ref
                 const std::atomic_ref<char> hit(slot_hits_[it->second]);
+#else
+                auto& hit = *reinterpret_cast<std::atomic<char>*>(&slot_hits_[it->second]);
+#endif
                 if (hit.load(std::memory_order_relaxed) == char{0}) {
                     hit.store(char{1}, std::memory_order_relaxed);
                 }

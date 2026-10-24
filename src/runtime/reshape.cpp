@@ -1512,7 +1512,9 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
     };
     struct RowHash {
         const std::uint64_t* hashes;
-        auto operator()(std::size_t r) const noexcept -> std::size_t { return hashes[r]; }
+        auto operator()(std::size_t r) const noexcept -> std::size_t {
+            return static_cast<std::size_t>(hashes[r]);
+        }
     };
     struct RowEq {
         const DcastRowKey* key;

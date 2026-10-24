@@ -30,7 +30,7 @@ raise before native binding/execution; there is no automatic fallback.
 Supported operations include resident DataFrame scans, single local Parquet
 files, filters, projections, simultaneous row-local column updates, numeric
 sums/means, row counts, column-key grouping and sorting. Supported resident
-types are Int32, Int64, Float64, Boolean, String, Date and Categorical. Numeric
+types are Int32, Int64, Float32, Float64, Boolean, String, Date and Categorical. Numeric
 coercion to Float64 and null predicates are supported. Joins, windows, UDFs,
 computed grouping/sort keys, floating-point grouping keys, aggregate broadcasting, explicit slice/top-k
 nodes, remote/multiple files, Enum, other numeric widths and nondefault scan
@@ -45,6 +45,17 @@ The declared Polars dtype is restored at export. Safe widening casts and explici
 integral casts with `wrap_numerical=True` are supported. Checked/null-producing
 integer casts that may overflow remain unsupported. UInt32 and UInt64 inputs
 remain unsupported, for resident tables and Parquet scans.
+
+Float32 inputs similarly widen once to Float64 for execution, including
+Parquet input. All arithmetic and reductions use Float64 intermediates; only
+declared Float32 output columns are downcast at the public result boundary.
+There is no emulation of intermediate Float32 rounding. This is an intentional
+compatibility difference: cancellation, intermediate overflow/underflow, and
+predicates can differ from Polars even when the final dtype is Float32. For
+example, a Float32 input `x = 2**24` followed by `y = x + 1` and `y - x` yields
+`1.0` here and `0.0` with Polars' intermediate Float32 rounding. Floating-point
+group keys and explicit narrowing casts from Float64 to Float32 remain
+unsupported. Float32-to-Float64 widening casts are supported.
 
 Reuse the same Engine and lazy query for repeated analytics. Its bounded cache
 (32 plans by default) retains translated plans and prepared resident inputs,

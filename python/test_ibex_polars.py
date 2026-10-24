@@ -124,6 +124,65 @@ class EngineTests(unittest.TestCase):
             self.equal(frame.filter((pl.col("x") + 1) < 0).select("y"))
             self.equal(frame.select(total=pl.col("x").sum()))
 
+    def test_float32_uses_float64_storage_and_preserves_output_types(self):
+        frame = pl.DataFrame({"x": pl.Series([1.5, -2.0, None, float("nan"), float("inf")], dtype=pl.Float32),
+                              "wide": [1.0, 2.0, 3.0, 4.0, 5.0]}).lazy()
+        queries = [frame, frame.select(value=pl.col("x") * 2.0),
+                   frame.select(test=pl.col("x") > 0), frame.filter(pl.col("x") > 0),
+                   frame.select(value=pl.col("x") + pl.col("wide")),
+                   frame.select(pl.col("x").cast(pl.Float64)), frame.sort("x")]
+        for flags in (pl.QueryOptFlags(), pl.QueryOptFlags.none()):
+            for query in queries:
+                self.equal(query, options=flags)
+        self.engine.prepare(frame)
+        _, tables, *_ = self.engine._prepare(frame, pl.QueryOptFlags())
+        native = ibex_pyarrow.execute_pipeline("input;", tables={"input": tables["_ibex_input"]})
+        self.assertEqual(native.schema.field("x").type, pa.float64())
+        with self.assertRaisesRegex(NotImplementedError, "floating-point grouping keys"):
+            frame.group_by("x").agg(pl.len()).collect(engine=self.engine)
+
+    def test_float32_rounds_only_at_export(self):
+        frame = pl.DataFrame({"x": pl.Series([float(2**24), None], dtype=pl.Float32)}).lazy()
+        staged = frame.with_columns(y=pl.col("x") + 1)
+        for flags in (pl.QueryOptFlags(), pl.QueryOptFlags.none()):
+            # Polars rounds y to Float32 inside the pipeline; our agreed mode
+            # retains the Float64 intermediate and rounds only public outputs.
+            query = staged.select(delta=pl.col("y") - pl.col("x"))
+            self.assertEqual(query.collect(optimizations=flags)["delta"].to_list(), [0.0, None])
+            result = query.collect(engine=self.engine, optimizations=flags)
+            self.assertEqual(result["delta"].to_list(), [1.0, None])
+            self.assertEqual(result.schema, {"delta": pl.Float32})
+            exported = staged.select("y").collect(engine=self.engine, optimizations=flags)
+            self.assertEqual(exported["y"].to_list(), [float(2**24), None])
+            selected = staged.filter(pl.col("y") > pl.col("x")).collect(engine=self.engine, optimizations=flags)
+            self.assertEqual(selected.height, 1)
+            large = pl.LazyFrame({"x": pl.Series([float(2**127)], dtype=pl.Float32)})
+            overflow = large.with_columns(y=pl.col("x") * 4).select(value=pl.col("y") / 4)
+            self.assertEqual(overflow.collect(optimizations=flags).item(), float("inf"))
+            self.assertEqual(overflow.collect(engine=self.engine, optimizations=flags).item(), float(2**127))
+
+    def test_float32_reductions_and_empty_inputs(self):
+        for values in ([1.0, 2.0, None], [], [None, None]):
+            frame = pl.DataFrame({"x": pl.Series(values, dtype=pl.Float32),
+                                  "g": pl.Series(["a"] * len(values), dtype=pl.String)}).lazy()
+            self.equal(frame.select(total=pl.col("x").sum(), avg=pl.col("x").mean()))
+            self.equal(frame.group_by("g", maintain_order=True).agg(
+                total=pl.col("x").sum(), avg=pl.col("x").mean()))
+        cancellation = pl.LazyFrame({"x": pl.Series([float(2**24), 1.0, -float(2**24)], dtype=pl.Float32)})
+        result = cancellation.select(pl.col("x").sum()).collect(engine=self.engine)
+        self.assertEqual(result.item(), 1.0)
+        self.assertEqual(result.schema, {"x": pl.Float32})
+
+    @unittest.skipIf(os.environ.get("IBEX_TEST_PARQUET") == "0", "Parquet backend disabled")
+    def test_float32_parquet(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "float32.parquet"
+            pq.write_table(pa.table({"x": pa.array([1.0, 2.0, None], type=pa.float32())}), path)
+            frame = pl.scan_parquet(path)
+            self.equal(frame)
+            self.equal(frame.select(value=pl.col("x") * 2.0))
+            self.equal(frame.select(total=pl.col("x").sum(), avg=pl.col("x").mean()))
+
     def test_select_reads_original_columns_before_assigning_aliases(self):
         frame = pl.DataFrame({"x": [1, 2], "y": [10, 20],
                               "_ibex_select_0_0": [100, 200]}).lazy()

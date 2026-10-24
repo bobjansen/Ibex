@@ -149,3 +149,18 @@ rejections decreased from 1,578 to 1,557, with zero mismatches. The modest gain
 relative to the original 331 Int32 first rejections illustrates the masked
 blockers: many queries now get farther but reject another operation. Newly
 matching queries are included in `required_pass_queries`.
+
+## Float32 follow-up
+
+Float32 inputs now widen to Float64, with Float64 arithmetic/reductions and
+only the declared Float32 outputs narrowed at export. This intentionally
+retains intermediate precision rather than reproducing Polars' Float32
+rounding. It can affect cancellation, overflow/underflow and predicate results;
+see the engine README and its explicit policy tests. No native Float32 variant
+or intermediate rounding operations were introduced. Float grouping keys and
+explicit Float64-to-Float32 narrowing casts remain unsupported.
+
+The survey now has 23 passing tests, 323 tests with unsupported queries and
+730 unexercised tests; 76 matching queries, 1,554 rejections and zero mismatches.
+The upstream checks and tolerances remain unchanged. Newly matching queries
+are promoted into the required regression baseline.

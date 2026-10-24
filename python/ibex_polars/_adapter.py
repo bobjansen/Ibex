@@ -23,7 +23,7 @@ POLARS_VERSION = "2.0.0"
 # These logical integer types all fit native Int64 storage. UInt32/UInt64
 # intentionally remain outside this subset.
 _INTEGER_LAYOUTS = {pl.Int32: (32, True), pl.Int64: (64, True)}
-_SUPPORTED_INPUT_TYPES = (*_INTEGER_LAYOUTS, pl.Float64, pl.Boolean, pl.String, pl.Date, pl.Categorical)
+_SUPPORTED_INPUT_TYPES = (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64, pl.Boolean, pl.String, pl.Date, pl.Categorical)
 
 
 def _integer_bounds(dtype):
@@ -71,7 +71,7 @@ class Adapter:
         if kind == "Column":
             expr = ibex.col(value.name)
         elif kind == "Literal":
-            if value.dtype not in (*_INTEGER_LAYOUTS, pl.Float64, pl.Boolean, pl.String, pl.Date):
+            if value.dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64, pl.Boolean, pl.String, pl.Date):
                 raise NotImplementedError(f"unsupported literal type {value.dtype}")
             expr = ibex.lit(value.value)
         elif kind == "BinaryExpr":
@@ -104,7 +104,9 @@ class Adapter:
                     expr = _wrap_integer(self.expression(value.expr), value.dtype)
                 else:
                     raise NotImplementedError(f"unsupported checked/null-producing cast from {original} to {value.dtype}")
-            elif value.dtype == pl.Float64 and original in (*_INTEGER_LAYOUTS, pl.Float64):
+            elif value.dtype == pl.Float32 and original == pl.Float32:
+                expr = self.expression(value.expr)
+            elif value.dtype == pl.Float64 and original in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64):
                 expr = Expr("cast", (self.expression(value.expr), pa.float64()))
             else:
                 raise NotImplementedError(f"unsupported cast to {value.dtype} with options {value.options}")

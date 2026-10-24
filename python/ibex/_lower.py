@@ -8,7 +8,7 @@ from ._expr import Expr, _identifier
 
 
 _WIDENED_NUMERIC_TYPES = {
-    pa.int32(): pa.int64(),
+    pa.int32(): pa.int64(), pa.float32(): pa.float64(),
 }
 
 

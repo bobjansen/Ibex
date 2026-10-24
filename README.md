@@ -580,6 +580,38 @@ See [`examples/ibex_dplyr.R`](examples/ibex_dplyr.R) for a complete runnable
 example with scalar capture, lazy translation, grouped aggregation, and
 collection back into R.
 
+## Independent lazy Python API (experimental)
+
+An independent `ibex` Python frontend now implements the first subset of the
+Polars 2.0 API, supporting PDS-H q06 and q01. It provides its own lazy frames and
+expressions; Polars is not a runtime dependency.
+
+```python
+import ibex as pl
+
+query = (
+    pl.scan_parquet("trades.parquet")
+    .filter(pl.col("price") > 10)
+    .with_columns((pl.col("price") * pl.col("size")).alias("notional"))
+    .select(pl.sum("notional"))
+)
+result = query.collect()
+```
+
+Collection executes one complete pipeline through the same evaluator as the
+CLI and R host. This source-tree prototype supports filter, select, single
+column updates, grouped sums/means/counts and sorting; joins and full API
+compatibility remain follow-up work. In-memory frames retain a prepared native
+input so repeated collection avoids conversion and reuses categorical keys.
+Results use Ibex containers backed by Arrow, with Arrow
+dtype descriptors. See [Python setup and compatibility scope](python/README.md)
+for build instructions and the unchanged upstream query conformance runners.
+[Local q01 measurements](python/q01-performance.md) include warm timings and
+the remaining first-use cost.
+The [grouped-mean example and measurements](python/grouped-mean-performance.md)
+show how one of the benchmark page's strongest supported wins translates into
+`import ibex as pl` on already-resident tables.
+
 ## IPython and Jupyter
 
 Ibex now has a Python bridge that returns `pyarrow.Table` objects and an

@@ -25,6 +25,10 @@ aggregation and sorting execute in Ibex. Polars supplies source column handles
 and converts the output into its public container/dtypes. Unsupported plans
 raise before native binding/execution; there is no automatic fallback.
 
+Column `count()` counts non-null values, while `pl.len()` counts all rows.
+Both return UInt32 and return zero for empty input. NaN and false Boolean
+values count as present. Computed row-expression counts are also supported.
+
 First/last reductions preserve the selected edge row's null by default;
 `ignore_nulls=True` selects the first/last present value instead. The default
 uses native `first_null`/`last_null`; the null-skipping variant uses native
@@ -36,7 +40,7 @@ The new native reducers currently materialize their input.
 
 Supported operations include resident DataFrame scans, single local Parquet
 files, filters, projections, simultaneous row-local column updates, numeric
-sums/means, first/last reductions, row counts, column-key grouping and sorting. Supported resident
+sums/means, first/last reductions, non-null column counts, row counts, column-key grouping and sorting. Supported resident
 types are Int8, Int16, Int32, Int64, UInt8, UInt16, Float32, Float64, Boolean,
 String, Date and Categorical. Resident Datetime and Duration columns are also
 supported as described below. Numeric

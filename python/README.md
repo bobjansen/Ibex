@@ -69,7 +69,7 @@ reported separately in the performance note below.
 | Area | Supported |
 |---|---|
 | Input | A single local Parquet file, or `DataFrame(dict_or_arrow_table).lazy()` |
-| Expressions | `col`, `lit`, aliases, numeric arithmetic, comparisons, Boolean `&`, `\|`, `~`, `is_between`, numeric `sum`/`mean`, `first`/`last`, row count `len` |
+| Expressions | `col`, `lit`, aliases, numeric arithmetic, comparisons, Boolean `&`, `\|`, `~`, `is_between`, numeric `sum`/`mean`, `first`/`last`, non-null column `count`, row count `len` |
 | Pipelines | `filter`, `select`, one expression per `with_columns`, column-key `group_by(...).agg(...)`, column-key `sort`, `collect`, source-only `explain` |
 | Results | Ibex `DataFrame`/`Series`, columns, shape, item, column lookup, `to_list`, `to_dict`, `to_arrow`, `to_pandas` |
 | Types | Int64, Float64, Bool, strings, Date; sums preserve Int64/Float64 and return zero for empty/all-null input; mean is Float64; row-count output is UInt32 |
@@ -104,6 +104,11 @@ compatibility is not yet claimed. Floating-point comparisons follow Polars:
 NaN equals NaN and compares greater than every other number, including positive
 infinity. Null comparisons still return null. Sorting also places NaN above
 other numeric values, with null placement controlled by `nulls_last`.
+
+`col("x").count()` counts non-null values and returns UInt32, including zero
+for empty/all-null inputs. NaN and false Boolean values are present values and
+are counted. `len()` counts all rows. Computed row expressions also support
+`.count()`; both forms execute in the same native pipeline.
 
 First/last reductions preserve the selected edge row's null by default;
 `ignore_nulls=True` selects the first/last present value instead. The default

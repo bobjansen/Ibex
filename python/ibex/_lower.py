@@ -40,6 +40,12 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             # native nullable sum returns null. Preserve the frontend contract.
             zero = 0.0 if current_types.get(id(expr)) == pa.float64() else 0
             return f"coalesce(sum({render(args[0])}), {bind(zero)})"
+        if op == "count":
+            if args[0]._op == "col":
+                return f"count({render(args[0])})"
+            # Native count accepts column names; computed inputs use the same
+            # non-null indicator reduction, including zero for empty input.
+            return f"coalesce(sum(Int64(!is_null({render(args[0])}))), {bind(0)})"
         if op == "mean":
             return f"mean({render(args[0])})"
         if op in ("first", "last", "first_non_null", "last_non_null"):
@@ -252,6 +258,11 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
             if result not in numeric or not args[0]._row_reference:
                 raise NotImplementedError(f"{op} currently requires an Int64 or Float64 row expression")
             return pa.float64() if op == "mean" else result
+        if op == "count":
+            dtype(args[0])
+            if not args[0]._row_reference:
+                raise NotImplementedError("count currently requires a row expression")
+            return pa.uint32()
         if op == "len":
             return pa.uint32()
         if op == "cast":

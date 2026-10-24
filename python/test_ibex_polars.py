@@ -421,6 +421,54 @@ class EngineTests(unittest.TestCase):
                     pl.scan_parquet(path, n_rows=1).collect(engine=self.engine)
                 execute.assert_not_called()
 
+    def test_non_null_count_preserves_zero_and_uint32_across_types(self):
+        for dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16,
+                      pl.Float32, pl.Float64, pl.Boolean, pl.String, pl.Categorical,
+                      pl.Date, pl.Datetime("ns", "Europe/Amsterdam"), pl.Duration("us")):
+            values = [None, 1, 2, None, None]
+            if dtype in (pl.String, pl.Categorical):
+                values = [None, "a", "b", None, None]
+            elif dtype == pl.Boolean:
+                values = [None, False, True, None, None]
+            elif dtype in (pl.Float32, pl.Float64):
+                values = [None, float("nan"), float("inf"), None, None]
+            frame = pl.DataFrame({"g": ["a", "a", "a", None, None],
+                                  "x": pl.Series(values, dtype=dtype)}).lazy()
+            expressions = [pl.col("x").count().alias("present"), pl.len().alias("rows")]
+            with self.subTest(dtype=dtype):
+                for flags in (pl.QueryOptFlags(), pl.QueryOptFlags.none()):
+                    result = self.equal(frame.select(expressions), options=flags)
+                    self.assertEqual(result.to_dict(as_series=False), {"present": [2], "rows": [5]})
+                    self.assertEqual(result.schema["present"], pl.UInt32)
+                    self.equal(frame.group_by("g", maintain_order=True).agg(expressions), options=flags)
+                    empty = frame.filter(pl.lit(False))
+                    result = self.equal(empty.select(expressions), options=flags)
+                    self.assertEqual(result.to_dict(as_series=False), {"present": [0], "rows": [0]})
+                    self.equal(empty.group_by("g").agg(expressions), options=flags)
+
+    def test_non_null_count_computed_inputs_and_shared_native_execution(self):
+        import ibex
+        frame = pl.LazyFrame({"g": ["a", "a", "b"], "x": [None, 2, 3]})
+        expressions = [(pl.col("x") + 1).count().alias("computed"),
+                       (pl.col("x") > 2).count().alias("booleans"),
+                       pl.col("x").count().alias("x")]
+        for flags in (pl.QueryOptFlags(), pl.QueryOptFlags.none()):
+            self.equal(frame.select(expressions), options=flags)
+            self.equal(frame.group_by("g", maintain_order=True).agg(expressions), options=flags)
+            self.equal(frame.filter(pl.lit(False)).select(expressions), options=flags)
+        query = frame.group_by("g", maintain_order=True).agg(expressions)
+        with patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as execute:
+            query.collect(engine=self.engine)
+            self.assertEqual(execute.call_count, 1)
+        result = ibex.DataFrame({"x": [None, 2, 3]}).lazy().select(
+            ibex.col("x").count().alias("present"),
+            (ibex.col("x") + 1).count().alias("computed"),
+            ibex.len().alias("rows")).collect()
+        self.assertEqual(result.to_dict(as_series=False), {"present": [2], "computed": [2], "rows": [3]})
+        self.assertEqual(result.schema["present"], pa.uint32())
+        with self.assertRaises(NotImplementedError):
+            ibex.col("x").count().count()
+
 
 if __name__ == "__main__":
     unittest.main()

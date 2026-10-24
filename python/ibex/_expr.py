@@ -48,6 +48,11 @@ class Expr:
             raise NotImplementedError("nested reductions are not supported yet")
         return Expr("sum", (self,))
 
+    def count(self):
+        if self._aggregate:
+            raise NotImplementedError("nested reductions are not supported yet")
+        return Expr("count", (self,))
+
     def mean(self):
         if self._aggregate:
             raise NotImplementedError("nested reductions are not supported yet")
@@ -77,13 +82,13 @@ class Expr:
 
     @property
     def _aggregate(self):
-        return self._op in ("sum", "mean", "min", "max", "first", "last", "first_non_null", "last_non_null", "len") or any(
+        return self._op in ("sum", "mean", "min", "max", "count", "first", "last", "first_non_null", "last_non_null", "len") or any(
             arg._aggregate for arg in self._args if isinstance(arg, Expr)
         )
 
     @property
     def _row_reference(self):
-        if self._op in ("sum", "mean", "min", "max", "first", "last", "first_non_null", "last_non_null", "len"):
+        if self._op in ("sum", "mean", "min", "max", "count", "first", "last", "first_non_null", "last_non_null", "len"):
             return False
         return self._op == "col" or any(
             arg._row_reference for arg in self._args if isinstance(arg, Expr)

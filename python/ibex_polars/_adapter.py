@@ -106,7 +106,7 @@ class Adapter:
                 raise NotImplementedError(f"unsupported aggregate {value.name}")
             input_type = self.visitor.get_dtype(value.arguments[0])
             allowed = ("min", "max", "sum") if input_type.base_type() == pl.Duration else ("min", "max")
-            if value.name not in ("first", "last", "first_non_null", "last_non_null") and value.name not in (allowed if is_temporal(input_type) else ("sum", "mean")):
+            if value.name not in ("count", "first", "last", "first_non_null", "last_non_null") and value.name not in (allowed if is_temporal(input_type) else ("sum", "mean")):
                 raise NotImplementedError(f"unsupported aggregate {value.name} for {input_type}")
             if value.options not in (None, False):
                 raise NotImplementedError(f"unsupported {value.name} aggregate options")

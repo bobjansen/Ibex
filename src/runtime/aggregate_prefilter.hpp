@@ -128,14 +128,15 @@ void compact_by_index(T* values, std::span<const std::uint32_t> keep, std::size_
                       WorkerPool* pool, std::size_t workers) {
     constexpr std::size_t kSerialElements = std::size_t{1} << 16U;
     const std::size_t total = keep.size() * stride;
-    if (pool == nullptr || workers < 2 || total < kSerialElements) {
+    const std::size_t active_workers = pool == nullptr ? 0 : std::min(workers, pool->size());
+    if (active_workers < 2 || total < kSerialElements) {
         compact_by_index(values, keep, stride);
         return;
     }
     auto scratch = std::make_unique_for_overwrite<T[]>(total);
-    const std::size_t grain = (keep.size() + workers - 1) / workers;
+    const std::size_t grain = (keep.size() + active_workers - 1) / active_workers;
     const auto by_range = [&](const auto& body) {
-        auto batch = pool->submit(workers, [&](std::size_t w) {
+        auto batch = pool->submit(active_workers, [&](std::size_t w) {
             const std::size_t lo = std::min(keep.size(), w * grain);
             body(lo, std::min(keep.size(), lo + grain));
         });

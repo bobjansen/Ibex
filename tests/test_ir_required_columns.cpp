@@ -167,6 +167,35 @@ TEST_CASE("required_columns: join demands its keys from both sides", "[ir][requi
     CHECK(demand.at("right").names == std::set<std::string>{"a", "id"});
 }
 
+TEST_CASE("required_columns: a semi or anti join reads only its keys from the right",
+          "[ir][required_columns]") {
+    // A semi/anti join emits left columns only, so nothing its parent reads can
+    // come from the right side -- not even when the parent reads everything.
+    // PDS-H q21 lost its join-key folding when a binding used only as a semi
+    // join's right side was marked as wholly read.
+    for (const auto kind : {ir::JoinKind::Semi, ir::JoinKind::Anti}) {
+        auto make_join = [&] {
+            auto join = std::make_unique<ir::JoinNode>(
+                ir::NodeId{2}, kind, std::vector<ir::JoinKey>{{"left_id", "right_id"}});
+            join->add_child(make_scan("left"));
+            join->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{9}, "right"));
+            return join;
+        };
+
+        const auto bare = make_join();
+        auto demand = ir::required_columns(*bare);
+        CHECK(demand.at("left").all);
+        CHECK_FALSE(demand.at("right").all);
+        CHECK(demand.at("right").names == std::set<std::string>{"right_id"});
+
+        auto projected = with_child(std::make_unique<ir::ProjectNode>(ir::NodeId{3}, refs({"a"})),
+                                    make_join());
+        demand = ir::required_columns(*projected);
+        CHECK(demand.at("left").names == std::set<std::string>{"a", "left_id"});
+        CHECK(demand.at("right").names == std::set<std::string>{"right_id"});
+    }
+}
+
 TEST_CASE("required_columns: mapped join demands each side's own key", "[ir][required_columns]") {
     auto join = std::make_unique<ir::JoinNode>(ir::NodeId{2}, ir::JoinKind::Inner,
                                                std::vector<ir::JoinKey>{{"left_id", "right_id"}});

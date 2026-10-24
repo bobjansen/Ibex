@@ -31,8 +31,8 @@
 # wall-clock, so reruns stay cheap. The web page reuses pinned numbers for these.
 #   - sqlite: never within 2x of the best engine and the slowest by far — skipped
 #     by default. Pass --with-sqlite to regenerate its (stable) baseline numbers.
-#   - duckdb: 0 wins and tracks the other columnar engines, so it runs only at a
-#     representative scale subset (DUCKDB_SCALES). Pass --duckdb-all-sizes for all.
+#   - DuckDB runs every requested size, with checked answers; historical win
+#     counts are not a reason to omit a competitor from a scale comparison.
 #   - data.table/dplyr frollapply (tf_rolling_median_1m, tf_rolling_std_1m):
 #     O(n*window) and the two biggest single cells in the run — skipped by
 #     default. Pass --with-frollapply to include them.
@@ -81,11 +81,6 @@ RESHAPE_MAX_ROWS="${RESHAPE_MAX_ROWS:-20000000}"
 # data point. When run (--with-sqlite), cap it at this size (gives a 1M/2M/4M
 # scaling trend) and skip it above; override via env to include or exclude more.
 SQLITE_MAX_ROWS="${SQLITE_MAX_ROWS:-4000000}"
-# duckdb is never the fastest engine in this suite (0 wins) and closely tracks
-# the other columnar engines, so running it at every scale costs wall-clock
-# without adding signal. Run it only at this representative subset; set
-# DUCKDB_SCALES="" (or pass --duckdb-all-sizes) to run every size.
-DUCKDB_SCALES="${DUCKDB_SCALES:-1000000,4000000,16000000}"
 SKIP_IBEX=0
 SKIP_IBEX_COMPILED=0
 SKIP_IBEX_ST=0
@@ -110,7 +105,6 @@ SKIP_CLICKHOUSE_ST=0
 # page), so they are off by default — see the header. Opt back in with the flags.
 SKIP_SQLITE=1
 SKIP_FROLLAPPLY=1
-DUCKDB_ALL_SIZES=0
 KEEP_DATA=0
 TO_README=0
 TO_README_ROWS=4000000
@@ -194,7 +188,7 @@ while [[ $# -gt 0 ]]; do
         --skip-clickhouse-st) SKIP_CLICKHOUSE_ST=1; shift ;;
         --skip-sqlite) SKIP_SQLITE=1; shift ;;
         --with-sqlite) SKIP_SQLITE=0; shift ;;
-        --duckdb-all-sizes) DUCKDB_ALL_SIZES=1; shift ;;
+        --duckdb-all-sizes) shift ;; # compatibility: this is now the default
         --with-frollapply) SKIP_FROLLAPPLY=0; shift ;;
         --keep-data)   KEEP_DATA=1; shift ;;
         --to-readme|--to_readme) TO_README=1; shift ;;
@@ -263,9 +257,13 @@ GEN_DATA="$SCRIPT_DIR/data/gen_data.py"
 SKIP_FILE="$OUTPUT_DIR/skip_cells.txt"
 
 mkdir -p "$DATA_ROOT" "$RESULT_ROOT" "$(dirname "$COMBINED_TSV")"
+provenance_args=(--build-dir "$BUILD_DIR" --scale-harness)
+[[ $SKIP_IBEX -eq 1 ]] && provenance_args+=(--without-ibex)
+uv run --project "$IBEX_ROOT" python3 "$SCRIPT_DIR/h2o/provenance.py" \
+    "${provenance_args[@]}" --out "$OUTPUT_DIR/runtime_provenance.json"
 # A failed preflight must not truncate the previous combined report.
 if [[ $SKIP_IBEX -eq 0 ]]; then
-    preflight_args=()
+    preflight_args=(--with-duckdb)
     [[ $SKIP_POLARS_IN_MEMORY -eq 0 ]] && preflight_args+=(--with-polars-in-memory)
     uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/verify_scale_answers.py" \
         --build-dir "$BUILD_DIR" --out "$OUTPUT_DIR/correctness" "${preflight_args[@]}"
@@ -280,7 +278,11 @@ if [[ $SKIP_PYTHON -eq 0 ]]; then
     [[ $SKIP_POLARS_ST -eq 0 ]] && checked_variants+=(polars-st)
     [[ $SKIP_POLARS_IN_MEMORY -eq 0 ]] && checked_variants+=(polars-in-memory)
 fi
-python3 -c 'import json, sys; json.dump(dict(sizes=[int(x) for x in sys.argv[2].split()], variants=sys.argv[3:]), open(sys.argv[1], "w"))' \
+if [[ $SKIP_DUCKDB -eq 0 ]]; then
+    checked_variants+=(duckdb)
+    [[ $SKIP_DUCKDB_ST -eq 0 ]] && checked_variants+=(duckdb-st)
+fi
+python3 -c 'import json, sys; json.dump(dict(sizes=[int(x) for x in sys.argv[2].split()], variants=sys.argv[3:], provenance_required=True), open(sys.argv[1], "w"))' \
     "$OUTPUT_DIR/checks_run.json" "${SIZES[*]}" "${checked_variants[@]}"
 : > "$SKIP_FILE"
 
@@ -493,7 +495,7 @@ for rows in "${SIZES[@]}"; do
     # by an interrupted run is reused as-is — and a truncated CSV in it fails
     # every engine at that size while the sweep reports success. Check the row
     # counts the generator was asked for before handing them to any harness.
-    for expected_file in prices prices_multi trades; do
+    for expected_file in prices prices_multi prices_ts trades events; do
         actual_rows=$(($(wc -l < "$size_data_dir/${expected_file}.csv") - 1))
         if [[ "$actual_rows" -ne "$rows" ]]; then
             echo "error: $size_data_dir/${expected_file}.csv has ${actual_rows} rows, expected ${rows}." >&2
@@ -502,10 +504,18 @@ for rows in "${SIZES[@]}"; do
         fi
     done
 
-    python3 -c 'import json, sys; json.dump(dict(rows=int(sys.argv[2]), reshape_rows=int(sys.argv[3]), timeframe_rows=int(sys.argv[4])), open(sys.argv[1], "w"))' \
-        "$size_result_dir/answer_plan.json" "$rows" "$RESHAPE_ROWS" "${TF_ROWS_OVERRIDE:-$rows}"
+    python3 - "$size_result_dir/answer_plan.json" "$rows" "$RESHAPE_ROWS" "${TF_ROWS_OVERRIDE:-$rows}" "$size_data_dir" <<'PY_PLAN'
+import hashlib, json, pathlib, sys
+root = pathlib.Path(sys.argv[5])
+checks = {}
+for name in ("prices", "prices_multi", "prices_ts", "trades", "events", "lookup", "users"):
+    with (root / (name + ".csv")).open("rb") as handle:
+        checks[name] = hashlib.file_digest(handle, "sha256").hexdigest()
+pathlib.Path(sys.argv[1]).write_text(json.dumps(dict(rows=int(sys.argv[2]), reshape_rows=int(sys.argv[3]),
+    timeframe_rows=int(sys.argv[4]), input_sha256=checks)) + "\n")
+PY_PLAN
 
-    for digest_stem in ibex ibex_st polars polars_st polars_in_memory; do
+    for digest_stem in ibex ibex_st polars polars_st polars_in_memory duckdb duckdb_st; do
         : > "$size_result_dir/${digest_stem}_digest.tsv"
     done
 
@@ -632,23 +642,6 @@ for rows in "${SIZES[@]}"; do
         fi
     fi
 
-    # Missing artifacts, missing measured-query coverage, and mismatched
-    # full-scale digests are fatal. Bounded full answers were checked above.
-    if [[ $SKIP_IBEX -eq 0 && $SKIP_PYTHON -eq 0 ]]; then
-        ibex_checked="ibex"
-        polars_checked="polars"
-        [[ $SKIP_IBEX_ST -eq 0 ]] && ibex_checked+=",ibex-st"
-        [[ $SKIP_POLARS_ST -eq 0 ]] && polars_checked+=",polars-st"
-        [[ $SKIP_POLARS_IN_MEMORY -eq 0 ]] && polars_checked+=",polars-in-memory"
-        answer_args=()
-        [[ "$RESHAPE_ROWS" -eq 0 ]] && answer_args+=(--without-reshape)
-        [[ "${TF_ROWS_OVERRIDE:-$rows}" -eq 0 ]] && answer_args+=(--without-timeframe)
-        python3 "$SCRIPT_DIR/check_scale_run.py" "$size_result_dir" \
-            "${answer_args[@]}" --ibex "$ibex_checked" --polars "$polars_checked" \
-            --contracts "$OUTPUT_DIR/correctness/answers.json" \
-            | tee "$size_result_dir/answers.txt"
-    fi
-
     if [[ $SKIP_R -eq 0 ]]; then
         echo "  → R (data.table + dplyr)"
         r_args=()
@@ -672,14 +665,10 @@ for rows in "${SIZES[@]}"; do
     run_duckdb=1
     if [[ $SKIP_DUCKDB -eq 1 ]]; then
         run_duckdb=0
-    elif [[ $DUCKDB_ALL_SIZES -eq 0 && -n "$DUCKDB_SCALES" ]] \
-            && ! in_csv_list "$rows" "$DUCKDB_SCALES"; then
-        run_duckdb=0
-        echo "  (duckdb skipped: ${rows} not in DUCKDB_SCALES=${DUCKDB_SCALES})"
     fi
     if [[ $run_duckdb -eq 1 ]]; then
         echo "  → duckdb"
-        uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_duckdb.py" \
+        IBEX_DIGEST_OUT="$size_result_dir/duckdb_digest.tsv" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_duckdb.py" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
             --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
@@ -693,7 +682,8 @@ for rows in "${SIZES[@]}"; do
             echo "  → duckdb (single thread)"
             duckdb_st_raw="$size_result_dir/duckdb_st_raw.tsv"
             duckdb_st_tsv="$size_result_dir/duckdb_st.tsv"
-            IBEX_FW_SUFFIX=-st uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_duckdb.py" \
+            IBEX_FW_SUFFIX=-st IBEX_DIGEST_OUT="$size_result_dir/duckdb_st_digest.tsv" \
+            uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_duckdb.py" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
                 --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
@@ -705,6 +695,29 @@ for rows in "${SIZES[@]}"; do
                 "$duckdb_st_raw" > "$duckdb_st_tsv"
             append_tagged_results "$rows" "$duckdb_st_tsv"
         fi
+    fi
+
+    # Gate all selected reference engines, after their answers exist.
+    if [[ $SKIP_IBEX -eq 0 ]]; then
+        ibex_checked="ibex"
+        polars_checked=""
+        duckdb_checked=""
+        [[ $SKIP_IBEX_ST -eq 0 ]] && ibex_checked+=",ibex-st"
+        if [[ $SKIP_PYTHON -eq 0 ]]; then
+            polars_checked="polars"
+            [[ $SKIP_POLARS_ST -eq 0 ]] && polars_checked+=",polars-st"
+            [[ $SKIP_POLARS_IN_MEMORY -eq 0 ]] && polars_checked+=",polars-in-memory"
+        fi
+        if [[ $SKIP_DUCKDB -eq 0 ]]; then
+            duckdb_checked="duckdb"
+            [[ $SKIP_DUCKDB_ST -eq 0 ]] && duckdb_checked+=",duckdb-st"
+        fi
+        answer_args=()
+        [[ "$RESHAPE_ROWS" -eq 0 ]] && answer_args+=(--without-reshape)
+        [[ "${TF_ROWS_OVERRIDE:-$rows}" -eq 0 ]] && answer_args+=(--without-timeframe)
+        python3 "$SCRIPT_DIR/check_scale_run.py" "$size_result_dir" \
+            "${answer_args[@]}" --ibex "$ibex_checked" --polars "$polars_checked" --duckdb "$duckdb_checked" \
+            --contracts "$OUTPUT_DIR/correctness/answers.json" | tee "$size_result_dir/answers.txt"
     fi
 
     if [[ $SKIP_DATAFUSION -eq 0 ]]; then
@@ -802,6 +815,8 @@ fi
 
 # Promote only a complete, validated run. Failed runs retain *.pending files
 # for diagnosis and cannot overwrite the last accepted report.
+uv run --project "$IBEX_ROOT" python3 "$SCRIPT_DIR/h2o/provenance.py" \
+    "${provenance_args[@]}" --compare "$OUTPUT_DIR/runtime_provenance.json"
 mv "$COMBINED_TSV" "$OUTPUT_DIR/scales.tsv"
 mv "$COMBINED_CSV" "$OUTPUT_DIR/scales.csv"
 COMBINED_TSV="$OUTPUT_DIR/scales.tsv"

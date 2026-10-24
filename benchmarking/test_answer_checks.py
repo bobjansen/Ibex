@@ -170,6 +170,47 @@ class AnswerChecks(unittest.TestCase):
             for name in ("scales.tsv", "scales.csv"):
                 self.assertEqual((root / name).read_text(), "previous validated results\n")
 
+    def test_duckdb_fleet_requires_checks_and_matching_worker_versions(self):
+        import check_scale_fleet as fleet
+        import package_scale_checks as package
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            archives = []
+            origin = {"harness": {"bench_duckdb.py": "a" * 64},
+                      "versions": {"polars": "2.0.0", "duckdb": "2.0.0"},
+                      "build_type": "Release", "artifacts": {"tools/ibex_bench": "b" * 64}}
+            for variant in ("ibex", "polars", "duckdb"):
+                base = root / variant
+                directory = base / "scales/720"
+                directory.mkdir(parents=True)
+                (base / "checks_run.json").write_text(json.dumps({"sizes": [720], "variants": [variant],
+                                                                  "provenance_required": True}))
+                (base / "runtime_provenance.json").write_text(json.dumps(origin))
+                (directory / "answer_plan.json").write_text(json.dumps({"rows": 720, "reshape_rows": 720,
+                                                                        "timeframe_rows": 720}))
+                name = "python.tsv" if variant == "polars" else variant + ".tsv"
+                (directory / name).write_text("framework\tquery\tavg_ms\trows\n" + variant + "\tq\t1\t1\n")
+                (directory / (variant + "_digest.tsv")).write_text("query\trows\tnumeric_sum\nq\t1\t2\n")
+                if variant == "ibex":
+                    (base / "correctness").mkdir()
+                    (base / "correctness/answers.json").write_text(json.dumps({"status": "passed", "checks": [
+                        {"engine": "streaming", "query_names": ["q"]},
+                        {"engine": "duckdb", "query_names": ["q"]}]}))
+                archive = root / (variant + ".tar.gz")
+                package.package(base, archive)
+                archives.append(archive)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertFalse(fleet.verify(*archives))
+                self.assertFalse(fleet.verify(archives[0], duckdb_archive=archives[2]))
+                (root / "duckdb/scales/720/duckdb_digest.tsv").write_text("query\trows\tnumeric_sum\nq\t1\t99\n")
+                package.package(root / "duckdb", archives[2])
+                self.assertTrue(fleet.verify(*archives))
+            origin["versions"]["duckdb"] = "1.5.4"
+            (root / "duckdb/runtime_provenance.json").write_text(json.dumps(origin))
+            package.package(root / "duckdb", archives[2])
+            with self.assertRaisesRegex(ValueError, "package versions differ"):
+                fleet.verify(*archives)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,6 +21,10 @@ FULL_ABS_TOL = 1e-10
 STOCHASTIC = {"rand_uniform", "rand_normal", "rand_int", "rand_bernoulli"}
 # Operations without a Polars counterpart, plus separate parse-overhead rows.
 IBEX_ONLY = {"as_timeframe", "abs_int_price", "sqrt_coalesce_price"}
+DUCKDB_UNSUPPORTED = frozenset()  # all deterministic queries have stock SQL counterparts
+ROW_PRESERVING = {"rank_by_symbol", "lag_by_symbol", "cumsum_by_symbol", "pmin_clip",
+                  "abs_price", "sqrt_price", "log_price", "exp_price", "round_price",
+                  "floor_price", "ceil_price", "sin_price", "cos_price", "tanh_price"}
 SORT_KEYS = {
     "sort_price": ["price"], "sort_price_desc": ["price"],
     "sort_symbol": ["symbol"], "sort_symbol_price": ["symbol", "price"],
@@ -157,7 +161,7 @@ def compare_answer(query, left, right):
         ordered = True
     else:
         ordered = query.startswith(("where_update_", "fill_")) or query in {
-            "select_one_column", "update_price_x2", "cumsum_price", "cumprod_price"}
+            "select_one_column", "update_price_x2", "cumsum_price", "cumprod_price"} or query in ROW_PRESERVING
     if not ordered:
         key = lambda row: tuple(cell_key(v) for v in row)
         lr, rr = sorted(lr, key=key), sorted(rr, key=key)
@@ -168,11 +172,11 @@ def compare_answer(query, left, right):
     return []
 
 
-def compare_directories(left, right, required=()):
+def compare_directories(left, right, required=(), excluded=()):
     a = {p.stem: p for p in pathlib.Path(left).glob("*.csv")}
     b = {p.stem: p for p in pathlib.Path(right).glob("*.csv")}
     ignored = STOCHASTIC | IBEX_ONLY | {q for q in a | b if q.startswith("parse_")}
-    expected = (set(a) | set(b) | set(required)) - ignored
+    expected = (set(a) | set(b) | set(required)) - ignored - set(excluded)
     if not expected:
         return ["no deterministic answers to compare"]
     errors = []

@@ -19,7 +19,6 @@ Usage:
 """
 import argparse, csv, os, pathlib, sys, time
 import numpy as np
-import pandas as pd
 import polars as pl
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -49,6 +48,10 @@ def pl_keys(frame):
     if not POLARS_CATEGORICAL:
         return frame
     return frame.with_columns(pl.col(pl.String).cast(pl.Categorical))
+
+
+def _timestamps_from_seconds(values):
+    return (np.asarray(values, dtype=np.int64) * 1000000000).astype("datetime64[ns]")
 
 
 # IBEX_DIGEST_OUT=path: write one answer digest per Polars query -- the row
@@ -109,6 +112,11 @@ def record_digest(fw, name, result):
         series = result.get_column(col)
         if dtype.is_float():
             series = series.fill_nan(None)
+        elif dtype.is_integer():
+            # UInt32 rank sums overflow at realistic scales. Widen BEFORE
+            # reducing, and use Int128 when even the Int64 bound is unsafe.
+            bound = max(abs(int(series.min() or 0)), abs(int(series.max() or 0))) * len(series)
+            series = series.cast(pl.Int128 if bound > 2**63 - 1 else pl.Int64)
         value = series.sum()
         if value is not None:
             total += float(value)
@@ -131,6 +139,35 @@ def _windowed_ewma(values, alpha=0.1):
     for value in values:
         result = float(value) if result is None else result + alpha * (float(value) - result)
     return result
+
+
+def polars_windowed_ewma(frame):
+    """Prefix EWM with a correction that restarts at each window's first value.
+
+    For k non-null observations, E_window = E_end + beta**k * (first - E_before).
+    NULLs do not advance the weights. Take E_end from the rolling group's last
+    row so all timestamp peers share the same window. Align outputs by position
+    rather than joining on timestamps, which would multiply duplicate rows.
+    """
+    base = frame.with_columns(
+        pl.col("price").ewm_mean(alpha=0.1, adjust=False, ignore_nulls=True)
+        .forward_fill().alias("__ewma_prefix")
+    ).with_columns(
+        pl.col("__ewma_prefix").shift(1)
+        .fill_null(pl.col("price").drop_nulls().first()).alias("__ewma_before")
+    )
+    result = base.rolling(index_column="ts", period="60s", closed="right").agg(
+        pl.col("price").drop_nulls().first().alias("__ewma_first"),
+        pl.col("__ewma_before").filter(pl.col("price").is_not_null()).first().alias("__ewma_prior"),
+        pl.col("price").count().alias("__ewma_count"),
+        pl.col("__ewma_prefix").last().alias("__ewma_end"),
+    ).select(
+        pl.when(pl.col("__ewma_count") > 0).then(
+            pl.col("__ewma_end") + pl.lit(0.9).pow(pl.col("__ewma_count")) *
+            (pl.col("__ewma_first") - pl.col("__ewma_prior"))
+        ).otherwise(None).alias("e")
+    )
+    return pl.concat([frame, result.select("e")], how="horizontal")
 
 
 def timer(fn, warmup: int, iters: int):
@@ -189,6 +226,7 @@ def derive_prices_ts(csv_path):
 
 
 def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
+    import pandas as pd
     _fw = "pandas"
     print("pandas: loading...", file=sys.stderr, flush=True)
     df = pd.read_csv(csv_path)
@@ -801,7 +839,7 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     run("sqrt_price", lambda: df.with_columns(pl.col("price").sqrt().alias("v")))
     run("log_price", lambda: df.with_columns(pl.col("price").log().alias("v")))
     run("exp_price", lambda: df.with_columns((pl.col("price") / 1000.0).exp().alias("v")))
-    run("round_price", lambda: df.with_columns(pl.col("price").round(0).alias("v")))
+    run("round_price", lambda: df.with_columns(pl.col("price").round(0, mode="half_away_from_zero").cast(pl.Int64).alias("v")))
     run("floor_price", lambda: df.with_columns(pl.col("price").floor().alias("v")))
     run("ceil_price", lambda: df.with_columns(pl.col("price").ceil().alias("v")))
     run("sin_price", lambda: df.with_columns(pl.col("price").sin().alias("v")))
@@ -1173,7 +1211,7 @@ def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     run("exp_price",
         lambda: scan().with_columns((pl.col("price") / 1000.0).exp().alias("v")).collect())
     run("round_price",
-        lambda: scan().with_columns(pl.col("price").round(0).alias("v")).collect())
+        lambda: scan().with_columns(pl.col("price").round(0, mode="half_away_from_zero").cast(pl.Int64).alias("v")).collect())
     run("floor_price",
         lambda: scan().with_columns(pl.col("price").floor().alias("v")).collect())
     run("ceil_price",
@@ -1264,6 +1302,7 @@ def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
 
 
 def bench_pandas_null(csv_path, csv_lookup_path, warmup, iters):
+    import pandas as pd
     _fw = "pandas"
     """Left join producing ~50% null right-column values."""
     print("pandas: loading for null bench...", file=sys.stderr, flush=True)
@@ -1377,6 +1416,7 @@ def bench_polars_null(csv_path, csv_lookup_path, warmup, iters):
 
 
 def bench_pandas_reshape(csv_multi_path, warmup, iters, reshape_rows):
+    import pandas as pd
     _fw = "pandas"
     """Melt (wide→long) and dcast (long→wide) on a synthetic OHLC table."""
     if reshape_rows <= 0:
@@ -1566,6 +1606,7 @@ def bench_polars_reshape(csv_multi_path, warmup, iters, reshape_rows):
 
 
 def bench_pandas_fill(n_rows, warmup, iters):
+    import pandas as pd
     _fw = "pandas"
     """fill_null, fill_forward (LOCF), fill_backward (NOCB) on 50% null numeric data."""
     print("pandas: building fill data...", file=sys.stderr, flush=True)
@@ -1678,6 +1719,7 @@ def bench_polars_fill(n_rows, warmup, iters):
 
 
 def bench_pandas_events(csv_events_path, warmup, iters, csv_users_path=None):
+    import pandas as pd
     _fw = "pandas"
     print("pandas: loading events...", file=sys.stderr, flush=True)
     df = pd.read_csv(csv_events_path)
@@ -1823,6 +1865,7 @@ def bench_polars_events(csv_events_path, warmup, iters, csv_users_path=None):
 
 
 def bench_pandas_tf(n_rows, warmup, iters):
+    import pandas as pd
     _fw = "pandas"
     """TimeFrame rolling + resample. Data mirrors ibex_bench's TF generator:
        1s-spaced UTC Timestamps, sawtooth price = 100.0 + (i % 100)."""
@@ -1874,7 +1917,7 @@ def bench_polars_tf(n_rows, warmup, iters):
     _fw = "polars"
     """TimeFrame rolling + resample on resident, optimized Polars queries."""
     print("polars: building tf data...", file=sys.stderr, flush=True)
-    ts = pd.to_datetime(np.arange(n_rows), unit="s")
+    ts = _timestamps_from_seconds(np.arange(n_rows))
     price = 100.0 + (np.arange(n_rows) % 100).astype(float)
     df = pl.DataFrame({"ts": ts, "price": price}).lazy()
     rows = []
@@ -1928,8 +1971,7 @@ def bench_polars_tf(n_rows, warmup, iters):
         lambda: df.with_columns(pl.col("price").rolling_std_by(
             "ts", window_size="60s", closed="right").fill_null(0.0).alias("s")))
     run("tf_rolling_ewma_1m",
-        lambda: df.with_columns(pl.col("price").rolling_map(
-            _windowed_ewma, window_size=60, min_samples=1).alias("e")))
+        lambda: polars_windowed_ewma(df))
     run("tf_resample_1m_ohlc",
         lambda: df.group_by_dynamic("ts", every="60s").agg(
             open=pl.col("price").first(), high=pl.col("price").max(),
@@ -1938,6 +1980,7 @@ def bench_polars_tf(n_rows, warmup, iters):
 
 
 def bench_pandas_asof(n_rows, warmup, iters):
+    import pandas as pd
     _fw = "pandas"
     """Tf as-of join: trades (left) joined to quotes (right) on time."""
     print("pandas: building asof data...", file=sys.stderr, flush=True)
@@ -1999,13 +2042,13 @@ def bench_polars_asof(n_rows, warmup, iters):
     # 100 symbols partition both sides (see pandas asof note).
     n_sym = 100
     quotes = pl.DataFrame({
-        "ts": pd.to_datetime(np.arange(n_rows), unit="s"),
+        "ts": _timestamps_from_seconds(np.arange(n_rows)),
         "symbol": np.arange(n_rows) % n_sym,
         "bid": 99.0 + (np.arange(n_rows) % 100) * 0.01,
     }).with_columns((pl.lit("SYM") + pl.col("symbol").cast(pl.Utf8)).alias("symbol")).sort("ts").pipe(pl_keys).lazy()
     sample = np.arange(0, n_rows, 10, dtype=np.int64)
     trades = pl.DataFrame({
-        "ts": pd.to_datetime(sample, unit="s") + pd.to_timedelta((sample * 37) % 999, unit="ms"),
+        "ts": (sample * 1000000000 + ((sample * 37) % 999) * 1000000).astype("datetime64[ns]"),
         "symbol": sample % n_sym,
         "qty": (sample * 13) % 99 + 1,
     }).with_columns((pl.lit("SYM") + pl.col("symbol").cast(pl.Utf8)).alias("symbol")).sort("ts").pipe(pl_keys).lazy()

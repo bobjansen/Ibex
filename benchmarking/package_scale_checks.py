@@ -12,6 +12,8 @@ def package(root, output):
     manifest = root / "checks_run.json"
     run = json.loads(manifest.read_text())
     paths = [manifest]
+    if run.get("provenance_required"):
+        paths.append(root / "runtime_provenance.json")
     for rows in run["sizes"]:
         directory = root / "scales" / str(rows)
         paths.append(directory / "answer_plan.json")

@@ -11,6 +11,7 @@ import argparse
 import csv
 import importlib.util
 import json
+import math
 import os
 import pathlib
 import re
@@ -18,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 
-from check_scale_answers import IBEX_ONLY, STOCHASTIC, compare_directories, read_answer
+from check_scale_answers import IBEX_ONLY, STOCHASTIC, DUCKDB_UNSUPPORTED, compare_directories, read_answer
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SUITES = ("core,cumulative,sort,window,groupagg,pipeline,join,fill,null,filter,"
@@ -36,6 +37,7 @@ def main():
     parser.add_argument("--build-dir", type=pathlib.Path, default=ROOT / "build-release")
     parser.add_argument("--out", type=pathlib.Path, required=True)
     parser.add_argument("--with-polars-in-memory", action="store_true")
+    parser.add_argument("--with-duckdb", action="store_true")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     work = pathlib.Path(tempfile.mkdtemp(prefix="full_answers_", dir=args.out))
@@ -62,7 +64,13 @@ def main():
                 frame = pd.read_csv(path)
                 if "symbol" in frame:
                     frame["symbol"] = frame["symbol"].replace("AAA", 'α,"quoted"')
-                    frame.to_csv(path, index=False)
+                if "price" in frame:
+                    # Exact ties and adjacent floats discriminate Nearest
+                    # (half away from zero) from bankers/double rounding.
+                    for i, value in enumerate((0.5, 1.5, 2.5, 3.5,
+                                                math.nextafter(0.5, 0.), math.nextafter(0.5, 1.))):
+                        frame.loc[i, "price"] = value
+                frame.to_csv(path, index=False)
             common = []
             for name, file in (("csv", "prices"), ("csv-multi", "prices_multi"),
                                ("csv-trades", "trades"), ("csv-events", "events"),
@@ -112,6 +120,34 @@ def main():
                 if errors:
                     raise ValueError("\n".join(errors))
                 print(f"full answers: {n} input rows, {cores} cores, {engine}, {len(required)} queries PASS", flush=True)
+            if args.with_duckdb:
+                for cores in (1, 2):
+                    answers = directory / f"duckdb_{cores}"
+                    timing = directory / f"duckdb_{cores}.tsv"
+                    command = [sys.executable, str(ROOT / "benchmarking/bench_duckdb.py"),
+                               *common, "--tf-rows", str(n), "--fill-rows", str(n),
+                               "--threads", str(cores), "--out", str(timing)]
+                    with (directory / f"duckdb_{cores}.log").open("w") as handle:
+                        subprocess.run(command, cwd=ROOT, env=base_env | {"IBEX_ANSWERS_DIR": str(answers)},
+                                       stdout=handle, stderr=subprocess.STDOUT, check=True)
+                    with timing.open() as handle:
+                        rows = list(csv.DictReader(handle, delimiter="\t"))
+                    measured = {row["query"] for row in rows} - STOCHASTIC
+                    if len(rows) != len({row["query"] for row in rows}):
+                        raise ValueError("duplicate DuckDB timing query")
+                    required = expected - DUCKDB_UNSUPPORTED
+                    if measured != required:
+                        raise ValueError(f"DuckDB coverage differs: missing {required-measured}, extra {measured-required}")
+                    for row in rows:
+                        check_exported_count(answers, row["query"], int(row["rows"]))
+                    errors = compare_directories(directory / f"ibex_{cores}", answers, required,
+                                                 excluded=DUCKDB_UNSUPPORTED)
+                    report["checks"].append({"rows": n, "cores": cores, "engine": "duckdb",
+                                             "queries": len(required), "query_names": sorted(required),
+                                             "unsupported": sorted(DUCKDB_UNSUPPORTED), "errors": errors})
+                    if errors:
+                        raise ValueError("\n".join(errors))
+                    print(f"full answers: {n} input rows, {cores} cores, duckdb, {len(required)} queries PASS", flush=True)
             errors = compare_directories(directory / "ibex_1", directory / "ibex_2", expected)
             if errors:
                 raise ValueError("serial/parallel: " + "\n".join(errors))

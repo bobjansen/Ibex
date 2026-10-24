@@ -25,6 +25,7 @@
 #                      ibex,python,r,duckdb,datafusion,clickhouse,sqlite
 #                    (default: ibex,python,r,duckdb,datafusion,clickhouse)
 #                    "python" = pandas + polars + polars-st;  "r" = data.table + dplyr.
+#   --skip-pandas    python worker runs only Polars (isolates its memory footprint)
 #   --sizes  LIST    dataset sizes (default: 1M,2M,4M,8M,16M,32M,50M)
 #   --warmup N       warmup iterations (default: 1)
 #   --iters  N       timed iterations  (default: 5)
@@ -54,6 +55,7 @@ TF_ROWS=""
 KEY_NAME=""
 ON_DEMAND=0
 ENGINES="ibex,python,r,duckdb,datafusion,clickhouse"
+SKIP_PANDAS=0
 
 # Per-engine run_scale_suite.sh args: each enables exactly one engine and skips
 # the rest. sqlite and ibex-compiled stay off unless their engine is selected.
@@ -97,6 +99,7 @@ declare -A ENGINE_BUILD_TARGETS=(
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --engines)   ENGINES="$2"; shift 2 ;;
+        --skip-pandas) SKIP_PANDAS=1; shift ;;
         --sizes)     SIZES="$2"; shift 2 ;;
         --warmup)    WARMUP="$2"; shift 2 ;;
         --iters)     ITERS="$2"; shift 2 ;;
@@ -109,6 +112,9 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
+if [[ $SKIP_PANDAS -eq 1 ]]; then
+    ENGINE_ARGS[python]+=" --skip-pandas"
+fi
 
 S3_BUCKET="${S3_BUCKET:?S3_BUCKET not set — run aws/setup.sh first}"
 
@@ -353,14 +359,26 @@ if (( partial > 0 || got != ${#ENGINE_LIST[@]} )); then
     echo "error: incomplete fleet; combined results remain under *.pending.csv" >&2
     exit 1
 fi
-if [[ -n "${INSTANCE_OF[ibex]+x}" && -n "${INSTANCE_OF[python]+x}" ]]; then
-    for engine in ibex python; do
+if [[ -n "${INSTANCE_OF[ibex]+x}" && ( -n "${INSTANCE_OF[python]+x}" || -n "${INSTANCE_OF[duckdb]+x}" ) ]]; then
+    checked_engines=(ibex)
+    polars_checks=()
+    if [[ -n "${INSTANCE_OF[python]+x}" ]]; then
+        checked_engines+=(python)
+        polars_checks=("$RESULT_DIR/python_checks.tar.gz")
+    fi
+    extra_checks=()
+    if [[ -n "${INSTANCE_OF[duckdb]+x}" ]]; then
+        checked_engines+=(duckdb)
+        extra_checks=(--duckdb "$RESULT_DIR/duckdb_checks.tar.gz")
+    fi
+    for engine in "${checked_engines[@]}"; do
         checks_key="${RESULT_KEY_OF[$engine]%scales.csv}checks.tar.gz"
         aws s3 cp "s3://${S3_BUCKET}/${checks_key}" "$RESULT_DIR/${engine}_checks.tar.gz" \
             --region "$REGION" --only-show-errors
     done
     python3 "$IBEX_ROOT/benchmarking/check_scale_fleet.py" \
-        "$RESULT_DIR/ibex_checks.tar.gz" "$RESULT_DIR/python_checks.tar.gz" \
+        "$RESULT_DIR/ibex_checks.tar.gz" "${polars_checks[@]}" \
+        "${extra_checks[@]}" \
         | tee "$RESULT_DIR/answers.txt"
 fi
 mv "$COMBINED" "$FINAL_COMBINED"

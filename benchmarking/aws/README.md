@@ -44,6 +44,22 @@ manifests record `dirty: true`; retain those manifests with the result when
 citing the run rather than describing it as a verified clean checkout.
 The in-memory CSV and launch manifest do not retain competitor package versions.
 
+The current H2O runner requires bounded full-output validation and key-bound
+scale fingerprints. Failed runs retain partial artifacts and return nonzero.
+Its TSV checks sidecars and requested dataset/core-count plan are required for
+publication. The historical H2O artifacts above predate these gates and need a
+new validated run before they can be passed to the current website generator.
+
+Current in-memory runs also require complete bounded answer checks against
+Polars 2 and DuckDB 2. DuckDB contributes scale digests at every requested size,
+including single-thread runs. Fleet acceptance compares them with Ibex's
+digests and verifies matching harness/package versions and input fingerprints
+before promoting the combined report. Finite-window EWMA uses DuckDB 2's native
+SQL list reduction; no DuckDB cells are silently filled from older results.
+For a comparison restricted to these columnar engines, use
+`run-per-engine.sh --engines ibex,python,duckdb --skip-pandas` so the Polars
+worker does not also load and benchmark pandas.
+
 Source artifacts, under `benchmarking/results/`:
 
 - `scales_aws_20261012T184009.csv` and its `.manifest.json`.

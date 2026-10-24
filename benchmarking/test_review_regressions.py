@@ -88,7 +88,7 @@ class ReviewRegressions(unittest.TestCase):
         from polars.testing import assert_frame_equal
 
         seconds = [0, 1, 1, 3, 60, 61, 301]
-        timestamps = bp.pd.to_datetime(seconds, unit="s")
+        timestamps = bp._timestamps_from_seconds(seconds)
         outputs = []
 
         def evaluate(fn, warmup, iters):
@@ -100,7 +100,7 @@ class ReviewRegressions(unittest.TestCase):
             return not name.startswith("tf_rolling_") or "ewma" in name
 
         with (
-            patch.object(bp.pd, "to_datetime", return_value=timestamps),
+            patch.object(bp, "_timestamps_from_seconds", return_value=timestamps),
             patch.object(bp, "timer", evaluate),
             patch.object(bp, "should_skip", skip),
             contextlib.redirect_stderr(io.StringIO()),

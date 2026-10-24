@@ -675,6 +675,7 @@ Every competing engine is a stock install (PyPI / CRAN) and the whole suite is
 one script, so anyone can re-run it end-to-end:
 
 ```bash
+python3 benchmarking/h2o/provenance.py --build-dir build-release --build
 benchmarking/run_scale_suite.sh --warmup 1 --iters 3   # -> benchmarking/results/scales.csv
 # the published numbers come from a clean AWS r7i.2xlarge box:
 ./benchmarking/aws/run.sh --on-demand
@@ -712,6 +713,20 @@ combined into:
 - `benchmarking/results/scales.csv`
 
 Both include a `dataset_rows` column.
+
+The scale runner requires a recorded Release build (the command above), checks
+complete bounded outputs against Polars 2 and DuckDB 2, and checks row-count and
+numeric-sum digests at each timed scale. These scale digests are screening
+checks; full bounded comparisons also verify columns, keys, nulls, duplicates,
+and required row order. DuckDB runs every requested scale, including finite-window
+EWMA using SQL list reduction. Results are promoted only after selected
+engines pass, with executable, package, harness and input fingerprints retained
+in the artifacts. Separate AWS workers must pass the same cross-worker gates.
+Polars computes finite-window EWMA using a native EWM prefix and a rolling
+boundary correction, skipping null observations without advancing their weights.
+DuckDB's ordered first/last aggregates explicitly preserve input
+order under parallel execution. Unused suites and optional DataFrame imports
+are released or avoided so they do not inflate later process-memory samples.
 
 To skip only specific frameworks:
 

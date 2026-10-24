@@ -22,6 +22,9 @@ import duckdb
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from bench_mem import reset_peak_rss, peak_rss_mb, CELL_CUTOFF_MS, should_skip, cut_row
 
+from arrow_answers import record as record_answer, write as write_digests
+
+
 # Absolute peak RSS (MiB) measured during the most recent timer() call.
 LAST_PEAK_RSS_MB = 0.0
 
@@ -92,6 +95,8 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
             fn, warmup, iters
         )
         n = result.num_rows
+        if avg_ms >= 0:
+            record_answer(name, result)
         print(
             f"  duckdb/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -123,8 +128,8 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         "ohlc_by_symbol",
         lambda: con.sql(
             "SELECT symbol, "
-            "FIRST(price) AS open, MAX(price) AS high, "
-            "MIN(price) AS low, LAST(price) AS last "
+            "FIRST(price ORDER BY rowid) AS open, MAX(price) AS high, "
+            "MIN(price) AS low, LAST(price ORDER BY rowid) AS last "
             "FROM prices GROUP BY symbol"
         ).to_arrow_table(),
     )
@@ -135,6 +140,8 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
             "SELECT *, price * 2 AS price_x2 FROM prices"
         ).to_arrow_table(),
     )
+
+    run("select_one_column", lambda: con.sql("SELECT price FROM prices").to_arrow_table())
 
     run(
         "distinct_symbol",
@@ -151,9 +158,9 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
     run(
         "order_head_topk_by_symbol",
         lambda: con.sql(
-            "SELECT * FROM (SELECT *, ROW_NUMBER() OVER ("
+            "SELECT * EXCLUDE(rn) FROM (SELECT *, ROW_NUMBER() OVER ("
             "PARTITION BY symbol ORDER BY price DESC) AS rn FROM prices) "
-            "WHERE rn <= 3"
+            "WHERE rn <= 3 ORDER BY symbol, price DESC"
         ).to_arrow_table(),
     )
 
@@ -168,9 +175,9 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
     run(
         "order_tail_topk_by_symbol",
         lambda: con.sql(
-            "SELECT * FROM (SELECT *, ROW_NUMBER() OVER ("
+            "SELECT * EXCLUDE(rn) FROM (SELECT *, ROW_NUMBER() OVER ("
             "PARTITION BY symbol ORDER BY price ASC) AS rn FROM prices) "
-            "WHERE rn <= 3"
+            "WHERE rn <= 3 ORDER BY symbol, price DESC"
         ).to_arrow_table(),
     )
 
@@ -209,17 +216,17 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         lambda: con.sql(
             "SELECT *, SUM(price) OVER ("
             "ORDER BY rowid ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
-            ") AS cs FROM prices"
+            ") AS cs FROM prices ORDER BY rowid"
         ).to_arrow_table(),
     )
 
-    # Cumulative product via exp(cumsum(ln)) — DuckDB has no PRODUCT window.
+    # Cumulative product using DuckDB 2's PRODUCT window (also handles zeros/negative inputs).
     run(
         "cumprod_price",
         lambda: con.sql(
-            "SELECT *, EXP(SUM(LN(price)) OVER ("
+            "SELECT *, PRODUCT(price) OVER ("
             "ORDER BY rowid ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
-            ")) AS cp FROM prices"
+            ") AS cp FROM prices ORDER BY rowid"
         ).to_arrow_table(),
     )
 
@@ -228,7 +235,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         "rank_by_symbol",
         lambda: con.sql(
             "SELECT *, DENSE_RANK() OVER ("
-            "PARTITION BY symbol ORDER BY price DESC) AS rk FROM prices"
+            "PARTITION BY symbol ORDER BY price DESC) AS rk FROM prices ORDER BY rowid"
         ).to_arrow_table(),
     )
 
@@ -236,7 +243,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         "lag_by_symbol",
         lambda: con.sql(
             "SELECT *, LAG(price, 1) OVER ("
-            "PARTITION BY symbol ORDER BY rowid) AS prev FROM prices"
+            "PARTITION BY symbol ORDER BY rowid) AS prev FROM prices ORDER BY rowid"
         ).to_arrow_table(),
     )
 
@@ -245,7 +252,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         lambda: con.sql(
             "SELECT *, SUM(price) OVER ("
             "PARTITION BY symbol ORDER BY rowid "
-            "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cs FROM prices"
+            "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cs FROM prices ORDER BY rowid"
         ).to_arrow_table(),
     )
 
@@ -308,7 +315,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
             "WITH z AS (SELECT symbol, "
             "(price - AVG(price) OVER (PARTITION BY symbol)) "
             "/ STDDEV_SAMP(price) OVER (PARTITION BY symbol) AS z FROM prices), "
-            "clipped AS (SELECT symbol, LEAST(GREATEST(z, -3.0), 3.0) AS clipped FROM z) "
+            "clipped AS (SELECT symbol, CASE WHEN z IS NULL THEN NULL ELSE LEAST(GREATEST(z, -3.0), 3.0) END AS clipped FROM z) "
             "SELECT symbol, AVG(clipped) AS mean_z, STDDEV_SAMP(clipped) AS sd_z "
             "FROM clipped GROUP BY symbol"
         ).to_arrow_table(),
@@ -362,7 +369,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         "where_update_window",
         lambda: con.sql(
             "SELECT symbol, price, CASE WHEN price > 900.0 THEN "
-            "LAG(price) OVER (ORDER BY rowid) ELSE NULL END AS prev FROM prices"
+            "LAG(price) OVER (ORDER BY rowid) ELSE NULL END AS prev FROM prices ORDER BY rowid"
         ).to_arrow_table(),
     )
 
@@ -414,7 +421,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
     if csv_multi_path:
         print("duckdb: loading multi...", file=sys.stderr, flush=True)
         con.execute(
-            f"CREATE OR REPLACE TABLE prices_multi AS SELECT * FROM read_csv_auto('{csv_multi_path}')"
+            f"CREATE OR REPLACE TABLE prices_multi AS SELECT * REPLACE(CAST(day AS VARCHAR) AS day) FROM read_csv_auto('{csv_multi_path}')"
         )
 
         run(
@@ -437,8 +444,8 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
             "ohlc_by_symbol_day",
             lambda: con.sql(
                 "SELECT symbol, day, "
-                "FIRST(price) AS open, MAX(price) AS high, "
-                "MIN(price) AS low, LAST(price) AS last "
+                "FIRST(price ORDER BY rowid) AS open, MAX(price) AS high, "
+                "MIN(price) AS low, LAST(price ORDER BY rowid) AS last "
                 "FROM prices_multi GROUP BY symbol, day"
             ).to_arrow_table(),
         )
@@ -491,9 +498,14 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         # Correlation over the numeric columns (price, qty).
         run(
             "corr_price_vol",
-            lambda: con.sql("SELECT CORR(price, qty) AS corr FROM trades").to_arrow_table(),
+            lambda: con.sql("SELECT CORR(price, qty) AS r FROM trades").to_arrow_table(),
         )
 
+    # Release this suite's inputs before the next suite (outside timing).
+    con.execute("DROP TABLE IF EXISTS prices")
+    con.execute("DROP TABLE IF EXISTS prices_ts")
+    con.execute("DROP TABLE IF EXISTS prices_multi")
+    con.execute("DROP TABLE IF EXISTS trades")
     return rows
 
 
@@ -516,6 +528,8 @@ def bench_duckdb_null(csv_path, csv_lookup_path, warmup, iters, con):
             fn, warmup, iters
         )
         n = result.num_rows
+        if avg_ms >= 0:
+            record_answer(name, result)
         print(
             f"  duckdb/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -564,10 +578,17 @@ def bench_duckdb_null(csv_path, csv_lookup_path, warmup, iters, con):
     run(
         "null_cross_join_small",
         lambda: con.sql(
-            "SELECT * FROM prices_small CROSS JOIN lookup_small"
+            "SELECT prices_small.*, lookup_small.symbol AS symbol_lookup, lookup_small.sector "
+            "FROM prices_small CROSS JOIN lookup_small"
         ).to_arrow_table(),
     )
 
+    # Release this suite's inputs before the next suite (outside timing).
+    con.execute("DROP TABLE IF EXISTS prices")
+    con.execute("DROP TABLE IF EXISTS lookup")
+    con.execute("DROP TABLE IF EXISTS lookup_symbols")
+    con.execute("DROP TABLE IF EXISTS prices_small")
+    con.execute("DROP TABLE IF EXISTS lookup_small")
     return rows
 
 
@@ -593,6 +614,8 @@ def bench_duckdb_reshape(warmup, iters, reshape_rows, con):
             fn, warmup, iters
         )
         n = result.num_rows
+        if avg_ms >= 0:
+            record_answer(name, result)
         print(
             f"  duckdb/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -616,12 +639,12 @@ def bench_duckdb_reshape(warmup, iters, reshape_rows, con):
     con.execute(f"""
         CREATE OR REPLACE TABLE wide AS
         SELECT
-            printf('S%04d', (i / {n_day})::INTEGER) AS symbol,
+            printf('S%04d', (i // {n_day})::INTEGER) AS symbol,
             ((i % {n_day}) + 1)::INTEGER AS day,
-            100.0 + (i % 1000) AS open,
-            101.0 + (i % 1000) AS high,
-            99.0  + (i % 1000) AS low,
-            100.5 + (i % 1000) AS close
+            100.0::DOUBLE + (i % 1000) AS open,
+            101.0::DOUBLE + (i % 1000) AS high,
+            99.0::DOUBLE + (i % 1000) AS low,
+            100.5::DOUBLE + (i % 1000) AS close
         FROM generate_series(0, {reshape_rows - 1}) t(i)
     """)
     print(
@@ -681,6 +704,12 @@ def bench_duckdb_reshape(warmup, iters, reshape_rows, con):
         ).to_arrow_table(),
     )
 
+    # Release this suite's inputs before the next suite (outside timing).
+    con.execute("DROP TABLE IF EXISTS wide")
+    con.execute("DROP TABLE IF EXISTS long_tbl")
+    con.execute("DROP TABLE IF EXISTS long_int")
+    con.execute("DROP TABLE IF EXISTS long_cat")
+    con.execute("DROP TYPE IF EXISTS measure")
     return rows
 
 
@@ -704,6 +733,8 @@ def bench_duckdb_events(csv_events_path, warmup, iters, con, csv_users_path=None
             fn, warmup, iters
         )
         n = result.num_rows
+        if avg_ms >= 0:
+            record_answer(name, result)
         print(
             f"  duckdb/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -769,6 +800,9 @@ def bench_duckdb_events(csv_events_path, warmup, iters, con, csv_users_path=None
             ).to_arrow_table(),
         )
 
+    # Release this suite's inputs before the next suite (outside timing).
+    con.execute("DROP TABLE IF EXISTS events")
+    con.execute("DROP TABLE IF EXISTS users")
     return rows
 
 
@@ -777,7 +811,7 @@ def bench_duckdb_fill(n_rows, warmup, iters, con):
     print("duckdb: building fill data...", file=sys.stderr, flush=True)
     con.execute(f"""
         CREATE OR REPLACE TABLE fill_data AS
-        SELECT CASE WHEN i % 2 = 0 THEN 100.0 + (i % 100) ELSE NULL END AS val
+        SELECT CASE WHEN i % 2 = 0 THEN 100.0::DOUBLE + (i % 100) ELSE NULL END AS val
         FROM generate_series(0, {n_rows - 1}) t(i)
     """)
     rows = []
@@ -791,6 +825,8 @@ def bench_duckdb_fill(n_rows, warmup, iters, con):
             fn, warmup, iters
         )
         n = result.num_rows
+        if avg_ms >= 0:
+            record_answer(name, result)
         print(
             f"  duckdb/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -814,7 +850,7 @@ def bench_duckdb_fill(n_rows, warmup, iters, con):
     run(
         "fill_null",
         lambda: con.sql(
-            "SELECT COALESCE(val, 0.0) AS v2 FROM fill_data"
+            "SELECT val, COALESCE(val, 0.0) AS v2 FROM fill_data"
         ).to_arrow_table(),
     )
     run(
@@ -826,20 +862,53 @@ def bench_duckdb_fill(n_rows, warmup, iters, con):
     run(
         "fill_forward",
         lambda: con.sql(
-            "SELECT LAST_VALUE(val IGNORE NULLS) OVER ("
+            "SELECT val, LAST_VALUE(val IGNORE NULLS) OVER ("
             "ORDER BY rowid ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
-            ") AS v2 FROM fill_data"
+            ") AS v2 FROM fill_data ORDER BY rowid"
         ).to_arrow_table(),
     )
     run(
         "fill_backward",
         lambda: con.sql(
-            "SELECT FIRST_VALUE(val IGNORE NULLS) OVER ("
+            "SELECT val, FIRST_VALUE(val IGNORE NULLS) OVER ("
             "ORDER BY rowid ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING"
-            ") AS v2 FROM fill_data"
+            ") AS v2 FROM fill_data ORDER BY rowid"
         ).to_arrow_table(),
     )
+    # Release this suite's inputs before the next suite (outside timing).
+    con.execute("DROP TABLE IF EXISTS fill_data")
     return rows
+
+
+def timeframe_queries():
+    # Integer nanoseconds express the open-left (t-duration, t] contract even
+    # for irregular or repeated timestamps; subtracting one second only works
+    # on the synthetic fixture's original one-second grid.
+    def w(seconds):
+        return (f"OVER (ORDER BY epoch_ns(ts) RANGE BETWEEN {seconds * 1000000000 - 1} "
+                "PRECEDING AND CURRENT ROW)")
+    expressions = [
+        ("tf_lag1", "lag(price) OVER (ORDER BY ts, rowid) AS prev"),
+        ("tf_rolling_count_1m", f"count(*) {w(60)} AS c"),
+        ("tf_rolling_sum_1m", f"sum(price) {w(60)} AS s"),
+        ("tf_rolling_mean_5m", f"avg(price) {w(300)} AS m"),
+        ("tf_rolling_min_1m", f"min(price) {w(60)} AS mn"),
+        ("tf_rolling_max_1m", f"max(price) {w(60)} AS mx"),
+        ("tf_rolling_median_1m", f"median(price) {w(60)} AS med"),
+        # Fixture prices are non-null; Ibex/Polars use zero for a singleton.
+        ("tf_rolling_std_1m", f"coalesce(stddev_samp(price) {w(60)}, 0.0) AS s"),
+        ("tf_rolling_ewma_1m",
+         f"list_reduce(list(price ORDER BY ts, rowid) FILTER (WHERE price IS NOT NULL) {w(60)}, "
+         "lambda a, b: a + 0.1 * (b - a)) AS e"),
+    ]
+    queries = [(name, f"SELECT *, {expr} FROM tf_data ORDER BY ts, rowid") for name, expr in expressions]
+    queries.append(("tf_resample_1m_ohlc",
+        "SELECT time_bucket(INTERVAL 60 SECONDS, ts) AS ts, "
+        "first(price ORDER BY ts, rowid) AS open, max(price) AS high, min(price) AS low, "
+        "last(price ORDER BY ts, rowid) AS close FROM tf_data GROUP BY 1 ORDER BY 1"))
+    # The finite-window EWMA uses stock SQL list reduction, seeded by the
+    # first non-null value, rather than an infinite-history EWM approximation.
+    return queries
 
 
 def bench_duckdb_tf(n_rows, warmup, iters, con):
@@ -848,7 +917,7 @@ def bench_duckdb_tf(n_rows, warmup, iters, con):
     con.execute(f"""
         CREATE OR REPLACE TABLE tf_data AS
         SELECT TIMESTAMP '1970-01-01' + INTERVAL (i) SECOND AS ts,
-               100.0 + (i % 100) AS price
+               100.0::DOUBLE + (i % 100) AS price
         FROM generate_series(0, {n_rows - 1}) t(i)
     """)
     rows = []
@@ -862,6 +931,8 @@ def bench_duckdb_tf(n_rows, warmup, iters, con):
             fn, warmup, iters
         )
         n = result.num_rows
+        if avg_ms >= 0:
+            record_answer(name, result)
         print(
             f"  duckdb/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr, flush=True,
@@ -869,36 +940,10 @@ def bench_duckdb_tf(n_rows, warmup, iters, con):
         rows.append(("duckdb", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}",
                      f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n, f"{LAST_PEAK_RSS_MB:.1f}"))
 
-    # On this one-second fixture, 59/299 seconds represent Ibex's
-    # (t-duration, t] interval using SQL's inclusive RANGE frame.
-    def w(period):
-        return (
-            f"OVER (ORDER BY ts RANGE BETWEEN INTERVAL {period} PRECEDING "
-            f"AND CURRENT ROW)"
-        )
-
-    run("tf_lag1",
-        lambda: con.sql("SELECT lag(price) OVER (ORDER BY ts) AS prev FROM tf_data").to_arrow_table())
-    run("tf_rolling_count_1m",
-        lambda: con.sql(f"SELECT count(*) {w('59 SECONDS')} AS c FROM tf_data").to_arrow_table())
-    run("tf_rolling_sum_1m",
-        lambda: con.sql(f"SELECT sum(price) {w('59 SECONDS')} AS s FROM tf_data").to_arrow_table())
-    run("tf_rolling_mean_5m",
-        lambda: con.sql(f"SELECT avg(price) {w('299 SECONDS')} AS m FROM tf_data").to_arrow_table())
-    run("tf_rolling_median_1m",
-        lambda: con.sql(f"SELECT median(price) {w('59 SECONDS')} AS med FROM tf_data").to_arrow_table())
-    run("tf_rolling_std_1m",
-        lambda: con.sql(f"SELECT stddev_samp(price) {w('59 SECONDS')} AS s FROM tf_data").to_arrow_table())
-    # DuckDB has no built-in time-aware EWMA. Skip — leave the cell empty so
-    # the page surfaces that rather than printing a misleading number.
-    run("tf_resample_1m_ohlc",
-        lambda: con.sql(
-            "SELECT time_bucket(INTERVAL 60 SECONDS, ts) AS bucket, "
-            "       first(price ORDER BY ts) AS open, "
-            "       max(price) AS high, min(price) AS low, "
-            "       last(price ORDER BY ts) AS close "
-            "FROM tf_data GROUP BY bucket ORDER BY bucket"
-        ).to_arrow_table())
+    for name, sql in timeframe_queries():
+        run(name, lambda sql=sql: con.sql(sql).to_arrow_table())
+    # Release this suite's inputs before the next suite (outside timing).
+    con.execute("DROP TABLE IF EXISTS tf_data")
     return rows
 
 
@@ -909,7 +954,7 @@ def bench_duckdb_asof(n_rows, warmup, iters, con):
         CREATE OR REPLACE TABLE quotes AS
         SELECT TIMESTAMP '1970-01-01' + INTERVAL (i) SECOND AS ts,
                'SYM' || (i % 100) AS symbol,
-               99.0 + (i % 100) * 0.01 AS bid
+               99.0::DOUBLE + (i % 100) * 0.01::DOUBLE AS bid
         FROM generate_series(0, {n_rows - 1}) t(i)
         ORDER BY ts;
     """)
@@ -936,6 +981,8 @@ def bench_duckdb_asof(n_rows, warmup, iters, con):
             fn, warmup, iters
         )
         n = result.num_rows
+        if avg_ms >= 0:
+            record_answer(name, result)
         print(
             f"  duckdb/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr, flush=True,
@@ -946,14 +993,17 @@ def bench_duckdb_asof(n_rows, warmup, iters, con):
     run("tf_asof_join",
         lambda: con.sql(
             "SELECT t.ts, t.qty, q.bid "
-            "FROM trades t ASOF LEFT JOIN quotes q ON t.ts >= q.ts"
+            "FROM trades t ASOF LEFT JOIN quotes q ON t.ts >= q.ts ORDER BY t.ts"
         ).to_arrow_table())
     run("tf_asof_join_by_symbol",
         lambda: con.sql(
-            "SELECT t.ts, t.qty, q.bid "
+            "SELECT t.ts, t.symbol, t.qty, q.bid "
             "FROM trades t ASOF LEFT JOIN quotes q "
-            "ON t.symbol = q.symbol AND t.ts >= q.ts"
+            "ON t.symbol = q.symbol AND t.ts >= q.ts ORDER BY t.ts"
         ).to_arrow_table())
+    # Release this suite's inputs before the next suite (outside timing).
+    con.execute("DROP TABLE IF EXISTS quotes")
+    con.execute("DROP TABLE IF EXISTS trades")
     return rows
 
 
@@ -1041,6 +1091,7 @@ def main():
             ]
         )
         w.writerows(all_rows)
+    write_digests()
     print(f"results written to {out}", file=sys.stderr)
 
 

@@ -29,6 +29,10 @@ Column `count()` counts non-null values, while `pl.len()` counts all rows.
 Both return UInt32 and return zero for empty input. NaN and false Boolean
 values count as present. Computed row-expression counts are also supported.
 
+Column-expression `.len()` includes nulls and returns UInt32; for supported
+row expressions its result equals the frame row count. Polars exposes this
+through the same visitor aggregate as `.count()`, with `include_nulls=True`.
+
 First/last reductions preserve the selected edge row's null by default;
 `ignore_nulls=True` selects the first/last present value instead. The default
 uses native `first_null`/`last_null`; the null-skipping variant uses native

@@ -434,16 +434,17 @@ class EngineTests(unittest.TestCase):
                 values = [None, float("nan"), float("inf"), None, None]
             frame = pl.DataFrame({"g": ["a", "a", "a", None, None],
                                   "x": pl.Series(values, dtype=dtype)}).lazy()
-            expressions = [pl.col("x").count().alias("present"), pl.len().alias("rows")]
+            expressions = [pl.col("x").count().alias("present"),
+                           pl.col("x").len().alias("length"), pl.len().alias("rows")]
             with self.subTest(dtype=dtype):
                 for flags in (pl.QueryOptFlags(), pl.QueryOptFlags.none()):
                     result = self.equal(frame.select(expressions), options=flags)
-                    self.assertEqual(result.to_dict(as_series=False), {"present": [2], "rows": [5]})
+                    self.assertEqual(result.to_dict(as_series=False), {"present": [2], "length": [5], "rows": [5]})
                     self.assertEqual(result.schema["present"], pl.UInt32)
                     self.equal(frame.group_by("g", maintain_order=True).agg(expressions), options=flags)
                     empty = frame.filter(pl.lit(False))
                     result = self.equal(empty.select(expressions), options=flags)
-                    self.assertEqual(result.to_dict(as_series=False), {"present": [0], "rows": [0]})
+                    self.assertEqual(result.to_dict(as_series=False), {"present": [0], "length": [0], "rows": [0]})
                     self.equal(empty.group_by("g").agg(expressions), options=flags)
 
     def test_non_null_count_computed_inputs_and_shared_native_execution(self):
@@ -451,7 +452,8 @@ class EngineTests(unittest.TestCase):
         frame = pl.LazyFrame({"g": ["a", "a", "b"], "x": [None, 2, 3]})
         expressions = [(pl.col("x") + 1).count().alias("computed"),
                        (pl.col("x") > 2).count().alias("booleans"),
-                       pl.col("x").count().alias("x")]
+                       pl.col("x").count().alias("x"),
+                       (pl.col("x") + 1).len().alias("length")]
         for flags in (pl.QueryOptFlags(), pl.QueryOptFlags.none()):
             self.equal(frame.select(expressions), options=flags)
             self.equal(frame.group_by("g", maintain_order=True).agg(expressions), options=flags)
@@ -463,8 +465,8 @@ class EngineTests(unittest.TestCase):
         result = ibex.DataFrame({"x": [None, 2, 3]}).lazy().select(
             ibex.col("x").count().alias("present"),
             (ibex.col("x") + 1).count().alias("computed"),
-            ibex.len().alias("rows")).collect()
-        self.assertEqual(result.to_dict(as_series=False), {"present": [2], "computed": [2], "rows": [3]})
+            ibex.col("x").len().alias("length"), ibex.len().alias("rows")).collect()
+        self.assertEqual(result.to_dict(as_series=False), {"present": [2], "computed": [2], "length": [3], "rows": [3]})
         self.assertEqual(result.schema["present"], pa.uint32())
         with self.assertRaises(NotImplementedError):
             ibex.col("x").count().count()

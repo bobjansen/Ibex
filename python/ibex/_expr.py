@@ -64,13 +64,13 @@ class Expr:
 
     @property
     def _aggregate(self):
-        return self._op in ("sum", "mean", "len") or any(
+        return self._op in ("sum", "mean", "min", "max", "len") or any(
             arg._aggregate for arg in self._args if isinstance(arg, Expr)
         )
 
     @property
     def _row_reference(self):
-        if self._op in ("sum", "mean", "len"):
+        if self._op in ("sum", "mean", "min", "max", "len"):
             return False
         return self._op == "col" or any(
             arg._row_reference for arg in self._args if isinstance(arg, Expr)

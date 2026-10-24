@@ -42,6 +42,8 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             return f"coalesce(sum({render(args[0])}), {bind(zero)})"
         if op == "mean":
             return f"mean({render(args[0])})"
+        if op in ("min", "max"):
+            return f"{op}({render(args[0])})"
         if op == "len":
             return "count()"
         if op == "cast":
@@ -235,7 +237,7 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
             return pa.scalar(args[0]).type
         if op == "alias":
             return dtype(args[0])
-        if op in ("sum", "mean"):
+        if op in ("sum", "mean", "min", "max"):
             result = dtype(args[0])
             if result not in numeric or not args[0]._row_reference:
                 raise NotImplementedError(f"{op} currently requires an Int64 or Float64 row expression")

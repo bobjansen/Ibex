@@ -15,6 +15,7 @@ import pyarrow as pa
 import ibex
 from ibex._expr import Expr
 from ibex._lower import _WIDENED_NUMERIC_TYPES, lower
+from ._temporal import NANOS_PER_UNIT, TEMPORAL_TYPES, is_temporal, literal_ticks, prepare_column
 
 
 VISITOR_VERSION = (15, 2)
@@ -26,7 +27,7 @@ _INTEGER_LAYOUTS = {
     pl.Int8: (8, True), pl.Int16: (16, True), pl.Int32: (32, True),
     pl.Int64: (64, True), pl.UInt8: (8, False), pl.UInt16: (16, False),
 }
-_SUPPORTED_INPUT_TYPES = (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64, pl.Boolean, pl.String, pl.Date, pl.Categorical)
+_SUPPORTED_INPUT_TYPES = (*_INTEGER_LAYOUTS, *TEMPORAL_TYPES, pl.Float32, pl.Float64, pl.Boolean, pl.String, pl.Date, pl.Categorical)
 
 
 def _integer_bounds(dtype):
@@ -74,6 +75,10 @@ class Adapter:
         if kind == "Column":
             expr = ibex.col(value.name)
         elif kind == "Literal":
+            if is_temporal(value.dtype):
+                expr = ibex.lit(literal_ticks(value.value, value.dtype))
+                self.expressions[key] = expr
+                return expr
             if value.dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64, pl.Boolean, pl.String, pl.Date):
                 raise NotImplementedError(f"unsupported literal type {value.dtype}")
             expr = ibex.lit(value.value)
@@ -85,12 +90,24 @@ class Adapter:
             if name not in operators:
                 raise NotImplementedError(f"unsupported binary operator {value.op}")
             operator = operators[name]
+            left_type, right_type = self.visitor.get_dtype(value.left), self.visitor.get_dtype(value.right)
+            if is_temporal(left_type) or is_temporal(right_type):
+                if operator not in ("==", "!=", "<", "<=", ">", ">="):
+                    raise NotImplementedError("temporal arithmetic is not supported yet")
+                if left_type.base_type() != right_type.base_type():
+                    raise NotImplementedError("comparison between these temporal types is unsupported")
+                if left_type.base_type() == pl.Datetime and (left_type.time_zone is None) != (right_type.time_zone is None):
+                    raise NotImplementedError("comparison between naive and zoned timestamps is unsupported")
             if operator in ("==", "!=", "<", "<=", ">", ">="):
                 operator = "polars_" + operator
             expr = Expr(operator, (self.expression(value.left), self.expression(value.right)))
         elif kind == "Agg":
-            if value.name not in ("sum", "mean") or len(value.arguments) != 1:
+            if len(value.arguments) != 1:
                 raise NotImplementedError(f"unsupported aggregate {value.name}")
+            input_type = self.visitor.get_dtype(value.arguments[0])
+            allowed = ("min", "max", "sum") if input_type.base_type() == pl.Duration else ("min", "max")
+            if value.name not in (allowed if is_temporal(input_type) else ("sum", "mean")):
+                raise NotImplementedError(f"unsupported aggregate {value.name} for {input_type}")
             if value.options not in (None, False):
                 raise NotImplementedError(f"unsupported {value.name} aggregate options")
             expr = Expr(value.name, (self.expression(value.arguments[0]),))
@@ -98,7 +115,14 @@ class Adapter:
             expr = ibex.len()
         elif kind == "Cast":
             original = self.visitor.get_dtype(value.expr)
-            if value.dtype in _INTEGER_LAYOUTS and original in _INTEGER_LAYOUTS:
+            if is_temporal(original) or is_temporal(value.dtype):
+                if original.base_type() != value.dtype.base_type():
+                    raise NotImplementedError("casts between temporal and non-temporal types are unsupported")
+                same_zone = original.base_type() != pl.Datetime or original.time_zone == value.dtype.time_zone
+                if not same_zone or NANOS_PER_UNIT[value.dtype.time_unit] > NANOS_PER_UNIT[original.time_unit]:
+                    raise NotImplementedError("lossy temporal casts and timezone changes are unsupported")
+                expr = self.expression(value.expr)
+            elif value.dtype in _INTEGER_LAYOUTS and original in _INTEGER_LAYOUTS:
                 source_min, source_max = _integer_bounds(original)
                 target_min, target_max = _integer_bounds(value.dtype)
                 if target_min <= source_min and source_max <= target_max:
@@ -117,6 +141,11 @@ class Adapter:
             args = tuple(self.expression(child) for child in value.input)
             name = str(value.function_data[0]).split(".")[-1]
             if name == "IsBetween" and len(args) == 3 and len(value.function_data) == 2:
+                types = [self.visitor.get_dtype(child) for child in value.input]
+                if any(is_temporal(dtype) for dtype in types) and len({dtype.base_type() for dtype in types}) != 1:
+                    raise NotImplementedError("temporal bounds must have matching kinds")
+                if types[0].base_type() == pl.Datetime and len({dtype.time_zone is None for dtype in types}) != 1:
+                    raise NotImplementedError("bounds cannot mix naive and zoned timestamps")
                 closed = value.function_data[1]
                 if closed not in ("left", "right", "both", "none"):
                     raise NotImplementedError(f"unsupported closed interval {closed}")
@@ -164,7 +193,9 @@ class Adapter:
             data = pl.DataFrame._from_pydf(node.df.select(list(schema)))
             table = data.to_arrow()
             for index, field in enumerate(table.schema):
-                if field.type in _WIDENED_NUMERIC_TYPES:
+                if pa.types.is_timestamp(field.type) or pa.types.is_duration(field.type):
+                    table = table.set_column(index, field.name, prepare_column(table.column(index)))
+                elif field.type in _WIDENED_NUMERIC_TYPES:
                     table = table.set_column(index, field.name, table.column(index).cast(_WIDENED_NUMERIC_TYPES[field.type]))
             frame = ibex.LazyFrame(("table", table))
         elif kind == "Scan":
@@ -173,6 +204,8 @@ class Adapter:
             if not isinstance(node.paths[0], str) or Path(node.paths[0]).is_dir():
                 raise NotImplementedError("only single local Parquet file paths are supported")
             for name, dtype in schema.items():
+                if is_temporal(dtype):
+                    raise NotImplementedError("temporal Parquet scans are not supported yet")
                 if dtype.base_type() not in _SUPPORTED_INPUT_TYPES:
                     raise NotImplementedError(f"unsupported Parquet column {name}: {dtype}")
             options = node.file_options

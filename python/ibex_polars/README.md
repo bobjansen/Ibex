@@ -31,12 +31,14 @@ Supported operations include resident DataFrame scans, single local Parquet
 files, filters, projections, simultaneous row-local column updates, numeric
 sums/means, row counts, column-key grouping and sorting. Supported resident
 types are Int8, Int16, Int32, Int64, UInt8, UInt16, Float32, Float64, Boolean,
-String, Date and Categorical. Numeric
+String, Date and Categorical. Resident Datetime and Duration columns are also
+supported as described below. Numeric
 coercion to Float64 and null predicates are supported. Joins, windows, UDFs,
 computed grouping/sort keys, floating-point grouping keys, aggregate broadcasting, explicit slice/top-k
 nodes, remote/multiple files, Enum, other numeric widths and nondefault scan
 policies are outside this slice. An already-sliced resident source is valid.
 Background, batch, async and sink execution are not implemented.
+Struct and list columns are intentionally outside the project scope.
 
 Narrow integers are Python-boundary types, not new native runtime variants.
 Resident inputs widen once to Int64 during preparation; Parquet decoding
@@ -61,6 +63,28 @@ example, a Float32 input `x = 2**24` followed by `y = x + 1` and `y - x` yields
 `1.0` here and `0.0` with Polars' intermediate Float32 rounding. Floating-point
 group keys and explicit narrowing casts from Float64 to Float32 remain
 unsupported. Float32-to-Float64 widening casts are supported.
+
+Resident Datetime and Duration columns use Int64 nanosecond ticks internally,
+with their logical units and timestamp timezones retained in the plan schema
+and restored at export. Conversion to nanoseconds is checked; values outside
+the signed Int64 nanosecond range are explicitly unsupported (approximately
+1677–2262 for timestamps, or ±292 years for durations). Nulls and nanosecond
+column precision are preserved without Python datetime conversion.
+
+The temporal subset covers projection/aliases, null checks, comparisons,
+filters, sorting, grouping/row counts, min/max, and duration sums. Casts to finer
+units are supported. Precision-losing unit casts, timezone changes, temporal
+arithmetic/means, calendar operations and dynamic/rolling groups remain
+unsupported. Some mixed-unit comparisons insert a precision-losing cast in
+Polars and therefore also reject. Duration sums use native Int64 arithmetic
+and must remain within its nanosecond range.
+
+Millisecond/microsecond timestamp literals and exact duration literals are
+supported. Nanosecond timestamp literals reject explicitly because the pinned
+Polars visitor converts them to microsecond-resolution Python datetimes.
+Temporal Parquet scans are also explicitly unsupported for now: the native
+reader needs checked temporal rescaling and duration/zone handling first.
+There is no fallback to a Polars or PyArrow data read.
 
 Reuse the same Engine and lazy query for repeated analytics. Its bounded cache
 (32 plans by default) retains translated plans and prepared resident inputs,

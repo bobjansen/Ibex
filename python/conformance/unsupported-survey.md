@@ -177,3 +177,18 @@ The same survey now has 45 passing tests, 301 tests containing unsupported
 queries and 730 unexercised tests. There are 132 matching queries and 1,498
 rejections, with zero mismatches or support regressions. Newly matching
 queries are added to the required baseline.
+
+## Initial temporal support
+
+Resident timestamps and durations now normalize to checked Int64 nanoseconds,
+preserving the logical unit and timezone for export. Basic transport, null
+checks, comparisons, filters, grouping, sorting, min/max and duration sums are
+covered by dedicated tests. No new native column variants were introduced.
+
+The pinned survey still has 132 matches and 1,498 rejections: its temporal
+cases expose subsequent blockers such as means, arithmetic, precision-losing
+casts and the visitor's timestamp-literal precision loss. Nanosecond timestamp
+literals and temporal Parquet scans remain explicit rejections rather than
+silently losing precision, overflowing during rescaling or falling back to
+another execution engine. The accepted nanosecond range applies to both
+timestamps and durations.

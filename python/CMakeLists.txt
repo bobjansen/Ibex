@@ -92,6 +92,20 @@ execute_process(
 )
 
 if(IBEX_BUILD_TESTS AND IBEX_PYARROW_IMPORT_RESULT EQUAL 0)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -c "import polars; assert polars.__version__ == '2.0.0'"
+        RESULT_VARIABLE IBEX_POLARS_IMPORT_RESULT
+        OUTPUT_QUIET ERROR_QUIET
+    )
+    if(IBEX_POLARS_IMPORT_RESULT EQUAL 0)
+        add_test(
+            NAME ibex_polars_engine
+            COMMAND "${CMAKE_COMMAND}" -E env
+                "PYTHONPATH=${PROJECT_BINARY_DIR}/python:${PROJECT_SOURCE_DIR}/python"
+                "IBEX_TEST_PARQUET=${IBEX_PYTHON_HAS_PARQUET}"
+                "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/python/test_ibex_polars.py"
+        )
+    endif()
     add_test(
         NAME ibex_python_lazy
         COMMAND "${CMAKE_COMMAND}" -E env

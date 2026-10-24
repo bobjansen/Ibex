@@ -58,14 +58,49 @@ def pl_keys(frame):
 DIGESTS = []
 
 
+def record_full_answer(name, result):
+    directory = os.environ.get("IBEX_ANSWERS_DIR")
+    if not directory:
+        return
+    path = pathlib.Path(directory) / (name + ".csv")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Normalize logical dates/times to Ibex's days/nanoseconds before iter_rows
+    # can truncate nanosecond precision through Python datetime.
+    for name_, dtype in result.schema.items():
+        if dtype == pl.Date:
+            result = result.with_columns(pl.col(name_).cast(pl.Int64))
+        elif isinstance(dtype, pl.Datetime):
+            result = result.with_columns(pl.col(name_).dt.epoch("ns"))
+    def cell(value):
+        if value is None:
+            return "n:"
+        if isinstance(value, bool):
+            return "b:" + str(int(value))
+        if isinstance(value, int):
+            return "i:" + str(value)
+        if isinstance(value, float):
+            return "f:" + repr(value)
+        if isinstance(value, str):
+            return "s:" + value
+        raise TypeError(f"unsupported answer value {type(value).__name__}")
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(result.columns)
+        writer.writerows([cell(value) for value in row] for row in result.iter_rows())
+
+
 def record_digest(fw, name, result):
-    if not fw.startswith("polars") or os.environ.get("IBEX_DIGEST_OUT") is None:
+    if not fw.startswith("polars") or not (os.environ.get("IBEX_DIGEST_OUT") or
+                                               os.environ.get("IBEX_ANSWERS_DIR")):
         return
     if isinstance(result, pl.LazyFrame):
         result = result.collect()
     if isinstance(result, pl.Series):
         result = result.to_frame()
     if not isinstance(result, pl.DataFrame):
+        return
+    record_full_answer(name, result)
+    if os.environ.get("IBEX_DIGEST_OUT") is None:
         return
     total = 0.0
     for col, dtype in result.schema.items():
@@ -838,7 +873,7 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         # Correlation matrix over the numeric columns (price, qty).
         run(
             "corr_price_vol",
-            lambda: dft.select(pl.corr("price", "qty").alias("corr")),
+            lambda: dft.select(pl.corr("price", "qty").alias("r")),
         )
 
     return rows
@@ -1219,7 +1254,7 @@ def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         # Correlation matrix over the numeric columns (price, qty).
         run(
             "corr_price_vol",
-            lambda: scan_trades().select(pl.corr("price", "qty").alias("corr")).collect(),
+            lambda: scan_trades().select(pl.corr("price", "qty").alias("r")).collect(),
         )
 
     return rows
@@ -1333,7 +1368,7 @@ def bench_polars_null(csv_path, csv_lookup_path, warmup, iters):
     run("null_anti_join", lambda: df.join(lookup_symbols, on="symbol", how="anti"))
     # Low-cardinality inner join: prices ⋈ lookup on symbol.
     run("inner_join_symbol", lambda: df.join(lookup, on="symbol", how="inner"))
-    run("null_cross_join_small", lambda: prices_small.join(lookup_small, how="cross"))
+    run("null_cross_join_small", lambda: prices_small.join(lookup_small, how="cross", suffix="_lookup"))
 
     return rows
 
@@ -1867,20 +1902,31 @@ def bench_polars_tf(n_rows, warmup, iters):
     # A materialized result may legitimately share input buffers.
     run("tf_lag1",
         lambda: df.with_columns(pl.col("price").shift(1).alias("prev")))
+    # Attach the result directly. Joining aggregates back on timestamps adds
+    # avoidable work and multiplies rows when timestamps repeat.
     run("tf_rolling_count_1m",
-        lambda: df.join(df.rolling(index_column="ts", period="60s").agg(c=pl.len()), on="ts"))
+        lambda: df.with_columns(pl.lit(1).alias("c")).with_columns(
+            pl.col("c").rolling_sum_by("ts", window_size="60s", closed="right")))
     run("tf_rolling_sum_1m",
-        lambda: df.join(df.rolling(index_column="ts", period="60s").agg(s=pl.col("price").sum()), on="ts"))
+        lambda: df.with_columns(pl.col("price").rolling_sum_by(
+            "ts", window_size="60s", closed="right").alias("s")))
     run("tf_rolling_mean_5m",
-        lambda: df.join(df.rolling(index_column="ts", period="5m").agg(m=pl.col("price").mean()), on="ts"))
+        lambda: df.with_columns(pl.col("price").rolling_mean_by(
+            "ts", window_size="5m", closed="right").alias("m")))
     run("tf_rolling_min_1m",
-        lambda: df.join(df.rolling(index_column="ts", period="60s").agg(mn=pl.col("price").min()), on="ts"))
+        lambda: df.with_columns(pl.col("price").rolling_min_by(
+            "ts", window_size="60s", closed="right").alias("mn")))
     run("tf_rolling_max_1m",
-        lambda: df.join(df.rolling(index_column="ts", period="60s").agg(mx=pl.col("price").max()), on="ts"))
+        lambda: df.with_columns(pl.col("price").rolling_max_by(
+            "ts", window_size="60s", closed="right").alias("mx")))
     run("tf_rolling_median_1m",
-        lambda: df.join(df.rolling(index_column="ts", period="60s").agg(med=pl.col("price").median()), on="ts"))
+        lambda: df.with_columns(pl.col("price").rolling_median_by(
+            "ts", window_size="60s", closed="right").alias("med")))
+    # Ibex defines a singleton's rolling std as zero. Prices in this fixture
+    # are non-null, so Polars' singleton null is the only null to normalize.
     run("tf_rolling_std_1m",
-        lambda: df.join(df.rolling(index_column="ts", period="60s").agg(s=pl.col("price").std()), on="ts"))
+        lambda: df.with_columns(pl.col("price").rolling_std_by(
+            "ts", window_size="60s", closed="right").fill_null(0.0).alias("s")))
     run("tf_rolling_ewma_1m",
         lambda: df.with_columns(pl.col("price").rolling_map(
             _windowed_ewma, window_size=60, min_samples=1).alias("e")))
@@ -1956,13 +2002,13 @@ def bench_polars_asof(n_rows, warmup, iters):
         "ts": pd.to_datetime(np.arange(n_rows), unit="s"),
         "symbol": np.arange(n_rows) % n_sym,
         "bid": 99.0 + (np.arange(n_rows) % 100) * 0.01,
-    }).with_columns(pl.col("symbol").cast(pl.Utf8)).sort("ts").pipe(pl_keys).lazy()
+    }).with_columns((pl.lit("SYM") + pl.col("symbol").cast(pl.Utf8)).alias("symbol")).sort("ts").pipe(pl_keys).lazy()
     sample = np.arange(0, n_rows, 10, dtype=np.int64)
     trades = pl.DataFrame({
         "ts": pd.to_datetime(sample, unit="s") + pd.to_timedelta((sample * 37) % 999, unit="ms"),
         "symbol": sample % n_sym,
         "qty": (sample * 13) % 99 + 1,
-    }).with_columns(pl.col("symbol").cast(pl.Utf8)).sort("ts").pipe(pl_keys).lazy()
+    }).with_columns((pl.lit("SYM") + pl.col("symbol").cast(pl.Utf8)).alias("symbol")).sort("ts").pipe(pl_keys).lazy()
     rows = []
 
     def run(name, fn):
@@ -1986,7 +2032,7 @@ def bench_polars_asof(n_rows, warmup, iters):
         )
 
     run("tf_asof_join",
-        lambda: trades.join_asof(quotes, on="ts", strategy="backward"))
+        lambda: trades.join_asof(quotes, on="ts", strategy="backward").select("ts", "qty", "bid"))
     run("tf_asof_join_by_symbol",
         lambda: trades.join_asof(quotes, on="ts", by="symbol", strategy="backward"))
     return rows

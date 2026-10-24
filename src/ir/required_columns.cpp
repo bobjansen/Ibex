@@ -431,6 +431,21 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
                 visit_children_widened(node, out);
                 return;
             }
+            // A semi or anti join emits only left columns, so its right side
+            // is read for the keys and the predicate and nothing the parent
+            // asks for. Passing the parent's demand on would mark a binding
+            // used only as a semi join's right side as wholly read (PDS-H
+            // q21's `waiting_lines`, which then kept every column and could
+            // not fold its mapped join keys).
+            if (join.kind() == JoinKind::Semi || join.kind() == JoinKind::Anti) {
+                right_below = ColumnDemand{};
+                for (const auto& key : join.keys()) {
+                    right_below.add(key.right);
+                }
+                if (join.predicate().has_value()) {
+                    collect_side_refs(*join.predicate(), right_below, JoinSide::Right);
+                }
+            }
             visit(*join.children()[0], left_below, out);
             visit(*join.children()[1], right_below, out);
             return;

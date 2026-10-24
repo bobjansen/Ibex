@@ -195,7 +195,7 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sf", default="8")
     ap.add_argument("--pdsh-root", type=pathlib.Path,
-                    default=pathlib.Path(os.environ.get("PDSH_ROOT", pathlib.Path.home() / "polars-benchmark")))
+                    default=bench_env.default_pdsh_root())
     ap.add_argument("--engines", default="ibex,polars",
                     help="comma list of ibex/polars/duckdb; `base:name` is a variant of "
                          "base (give it env with --variant-env)")

@@ -159,16 +159,17 @@ OUTPUT="$IBEX_ROOT/benchmarking/results/scales_aws_${TIMESTAMP}.csv"
 # with nothing after hours of runtime.
 recover_partial() {
     local why="$1"
+    local partial_output="${OUTPUT%.csv}.pending.csv"
     aws s3 ls "s3://${S3_BUCKET}/${PARTIAL_KEY}" --region "$REGION" &>/dev/null || return 1
-    aws s3 cp "s3://${S3_BUCKET}/${PARTIAL_KEY}" "$OUTPUT" --region "$REGION" --only-show-errors || return 1
-    local rows=$(( $(wc -l < "$OUTPUT") - 1 ))
+    aws s3 cp "s3://${S3_BUCKET}/${PARTIAL_KEY}" "$partial_output" --region "$REGION" --only-show-errors || return 1
+    local rows=$(( $(wc -l < "$partial_output") - 1 ))
     if (( rows < 1 )); then
-        rm -f "$OUTPUT"
+        rm -f "$partial_output"
         return 1
     fi
     echo ""
     echo "Recovered PARTIAL results (${why}): ${rows} row(s)"
-    echo "  benchmarking/results/scales_aws_${TIMESTAMP}.csv"
+    echo "  $partial_output"
     echo "WARNING: the largest sizes are missing — check which sizes completed"
     echo "         before comparing engines."
     return 0
@@ -184,7 +185,7 @@ while true; do
     if (( NOW - START > TIMEOUT )); then
         echo ""
         echo "Timed out after 6h."
-        recover_partial "timed out" && exit 0
+        recover_partial "timed out" && exit 1
         echo "Check instance logs:"
         echo "  aws ec2 get-console-output --instance-id $INSTANCE_ID --region $REGION --output text"
         exit 1
@@ -211,7 +212,7 @@ while true; do
             echo ""
             echo "Instance $INSTANCE_ID is '$STATE' without producing a final result —"
             echo "likely a spot interruption or a failed bootstrap."
-            recover_partial "$STATE" && exit 0
+            recover_partial "$STATE" && exit 1
             echo "Check the console:"
             echo "  aws ec2 get-console-output --instance-id $INSTANCE_ID --region $REGION --latest --output text"
             exit 1

@@ -1175,10 +1175,35 @@ let df = my_source("data/file.bin");
 
 All scripts respect `IBEX_ROOT`, `BUILD_DIR`, and `CXX` environment overrides.
 
+### Allocator policy
+
+`IBEX_ALLOCATOR_POLICY=retain` is the default for repeated analytical work.
+On glibc, the runtime keeps large allocations in arenas and disables automatic
+heap trimming so later queries can reuse resident buffers. The CLI also enables
+transparent huge pages when available. Freed buffers can remain resident between
+queries.
+
+Use `IBEX_ALLOCATOR_POLICY=system` to leave the host's glibc settings untouched,
+including automatic huge-page tuning:
+
+```bash
+IBEX_ALLOCATOR_POLICY=system ibex
+```
+
+Set the policy before process startup for the CLI, or before the first query
+when embedding Ibex. It is read once; changing it later does not undo allocator
+settings. An invalid value produces an error. An explicit policy takes priority
+over the compatibility opt-out `IBEX_NO_MALLOC_TUNING=1`. With no explicit
+policy, that opt-out selects `system`. `IBEX_NO_HUGEPAGES=1` remains available to
+disable only automatic huge pages while retaining arena reuse.
+
+This policy controls Ibex's glibc tuning. If the host uses jemalloc, configure its
+retention with `MALLOC_CONF` as described below.
+
 ### Performance: jemalloc
 
 The ibex runtime allocates and frees large column buffers (often 32–256 MB) on
-every query. With the default glibc allocator, each such free returns the
+every query. Without Ibex's retention tuning, glibc can return the
 physical pages to the OS via `munmap`; the next allocation re-faults them,
 adding 30–100 ms of page-fault overhead per operation at multi-million-row
 scale.
@@ -1209,8 +1234,8 @@ clang++ -std=c++23 ... my_program.cpp libibex_runtime.a ... \
 MALLOC_CONF=dirty_decay_ms:30000,muzzy_decay_ms:30000 ./my_program
 ```
 
-If jemalloc is unavailable the binary still runs correctly with the default
-allocator; only the warm-iteration performance degrades.
+Jemalloc is optional. With glibc, the default `retain` policy also enables reuse
+of large allocations.
 
 ## Editor Support
 

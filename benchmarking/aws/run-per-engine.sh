@@ -282,7 +282,8 @@ while (( REMAINING > 0 )); do
 done
 
 # ── Combine per-engine slices into one CSV ────────────────────────────────────
-COMBINED="$IBEX_ROOT/benchmarking/results/scales_aws_${TIMESTAMP}.csv"
+FINAL_COMBINED="$IBEX_ROOT/benchmarking/results/scales_aws_${TIMESTAMP}.csv"
+COMBINED="${FINAL_COMBINED%.csv}.pending.csv"
 HEADER="dataset_rows,framework,query,avg_ms,min_ms,max_ms,stddev_ms,p95_ms,p99_ms,rows,peak_rss_mb"
 echo "$HEADER" > "$COMBINED"
 got=0
@@ -345,3 +346,23 @@ if (( partial > 0 )); then
     echo "         their largest sizes. Do not read a scaling curve across engines"
     echo "         without checking which sizes each one actually reached."
 fi
+
+# Partial fleets remain diagnostic artifacts. A complete Ibex/Polars fleet
+# must pass cross-worker answer checks before its combined CSV is accepted.
+if (( partial > 0 || got != ${#ENGINE_LIST[@]} )); then
+    echo "error: incomplete fleet; combined results remain under *.pending.csv" >&2
+    exit 1
+fi
+if [[ -n "${INSTANCE_OF[ibex]+x}" && -n "${INSTANCE_OF[python]+x}" ]]; then
+    for engine in ibex python; do
+        checks_key="${RESULT_KEY_OF[$engine]%scales.csv}checks.tar.gz"
+        aws s3 cp "s3://${S3_BUCKET}/${checks_key}" "$RESULT_DIR/${engine}_checks.tar.gz" \
+            --region "$REGION" --only-show-errors
+    done
+    python3 "$IBEX_ROOT/benchmarking/check_scale_fleet.py" \
+        "$RESULT_DIR/ibex_checks.tar.gz" "$RESULT_DIR/python_checks.tar.gz" \
+        | tee "$RESULT_DIR/answers.txt"
+fi
+mv "$COMBINED" "$FINAL_COMBINED"
+mv "$MANIFEST" "${FINAL_COMBINED%.csv}.manifest.json"
+echo "Accepted combined results: $FINAL_COMBINED"

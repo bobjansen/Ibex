@@ -7,6 +7,7 @@
 #include <ibex/core/time.hpp>
 #include <ibex/ir/column_name_map.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/runtime/env.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/lazy_table.hpp>
@@ -82,7 +83,8 @@ namespace {
 // cross ~32 MB (cumsum 0.7 -> 3.3 ns/row from 4M to 8M rows). Serving large
 // allocations from the main arena and never trimming the heap top lets freed
 // buffers recycle already-faulted pages across the warmup/timed iterations.
-// glibc-only; a no-op elsewhere. Opt out via IBEX_NO_MALLOC_TUNING.
+// glibc-only; a no-op elsewhere. IBEX_ALLOCATOR_POLICY=system leaves the
+// host allocator alone; retain (the default) enables this reuse policy.
 //
 // What it does not fix is the FIRST run's faults: a fresh q21 touches ~2.7 GB
 // (~760k faults, against ~75k warm), which is why Ibex gains ~38% from a warm
@@ -102,18 +104,25 @@ namespace {
 //     (hash tables, selection vectors, Arrow buffers), not one class of them.
 // The full write-up of the September round: the retired
 // plans/allocator-and-huge-pages.md (`git show 47918401:plans/allocator-and-huge-pages.md`).
-void tune_allocator_once() {
-#ifdef __GLIBC__
+auto tune_allocator_once() -> std::expected<void, std::string> {
     static std::once_flag flag;
+    static std::expected<void, std::string> status;
     std::call_once(flag, [] {
-        if (const char* off = std::getenv("IBEX_NO_MALLOC_TUNING");
-            off != nullptr && off[0] != '\0' && off[0] != '0') {
+        const auto policy = allocator_policy(std::getenv("IBEX_ALLOCATOR_POLICY"),
+                                             std::getenv("IBEX_NO_MALLOC_TUNING"));
+        if (!policy) {
+            status = std::unexpected(policy.error());
             return;
         }
+        if (*policy == AllocatorPolicy::System) {
+            return;
+        }
+#ifdef __GLIBC__
         mallopt(M_MMAP_MAX, 0);         // large allocs from sbrk arena, not mmap
         mallopt(M_TRIM_THRESHOLD, -1);  // keep freed buffers resident for reuse
-    });
 #endif
+    });
+    return status;
 }
 
 }  // namespace
@@ -604,7 +613,9 @@ auto interpret(const ir::Node& node, const TableRegistry& registry, const Scalar
     if (!lease.held()) {
         return std::unexpected(query_in_flight_message());
     }
-    tune_allocator_once();
+    if (auto tuned = tune_allocator_once(); !tuned) {
+        return std::unexpected(tuned.error());
+    }
     auto op = build_operator(node, registry, scalars, externs, exec, model_out);
     if (!op.has_value()) {
         return std::unexpected(std::move(op.error()));

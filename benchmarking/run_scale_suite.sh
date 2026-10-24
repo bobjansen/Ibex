@@ -253,8 +253,8 @@ fi
 DATA_ROOT="$SCRIPT_DIR/data/scales"
 OUTPUT_DIR="${IBEX_SCALE_OUTPUT_DIR:-$SCRIPT_DIR/results}"
 RESULT_ROOT="$OUTPUT_DIR/scales"
-COMBINED_TSV="$OUTPUT_DIR/scales.tsv"
-COMBINED_CSV="$OUTPUT_DIR/scales.csv"
+COMBINED_TSV="$OUTPUT_DIR/scales.pending.tsv"
+COMBINED_CSV="$OUTPUT_DIR/scales.pending.csv"
 GEN_DATA="$SCRIPT_DIR/data/gen_data.py"
 # Carry-forward skip set. A harness cuts a cell whose warm iteration exceeds the
 # per-iteration budget and emits a sentinel row (avg_ms < 0); we record that
@@ -263,6 +263,25 @@ GEN_DATA="$SCRIPT_DIR/data/gen_data.py"
 SKIP_FILE="$OUTPUT_DIR/skip_cells.txt"
 
 mkdir -p "$DATA_ROOT" "$RESULT_ROOT" "$(dirname "$COMBINED_TSV")"
+# A failed preflight must not truncate the previous combined report.
+if [[ $SKIP_IBEX -eq 0 ]]; then
+    preflight_args=()
+    [[ $SKIP_POLARS_IN_MEMORY -eq 0 ]] && preflight_args+=(--with-polars-in-memory)
+    uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/verify_scale_answers.py" \
+        --build-dir "$BUILD_DIR" --out "$OUTPUT_DIR/correctness" "${preflight_args[@]}"
+fi
+checked_variants=()
+if [[ $SKIP_IBEX -eq 0 ]]; then
+    checked_variants+=(ibex)
+    [[ $SKIP_IBEX_ST -eq 0 ]] && checked_variants+=(ibex-st)
+fi
+if [[ $SKIP_PYTHON -eq 0 ]]; then
+    checked_variants+=(polars)
+    [[ $SKIP_POLARS_ST -eq 0 ]] && checked_variants+=(polars-st)
+    [[ $SKIP_POLARS_IN_MEMORY -eq 0 ]] && checked_variants+=(polars-in-memory)
+fi
+python3 -c 'import json, sys; json.dump(dict(sizes=[int(x) for x in sys.argv[2].split()], variants=sys.argv[3:]), open(sys.argv[1], "w"))' \
+    "$OUTPUT_DIR/checks_run.json" "${SIZES[*]}" "${checked_variants[@]}"
 : > "$SKIP_FILE"
 
 printf "dataset_rows\tframework\tquery\tavg_ms\tmin_ms\tmax_ms\tstddev_ms\tp95_ms\tp99_ms\trows\tpeak_rss_mb\n" > "$COMBINED_TSV"
@@ -483,6 +502,13 @@ for rows in "${SIZES[@]}"; do
         fi
     done
 
+    python3 -c 'import json, sys; json.dump(dict(rows=int(sys.argv[2]), reshape_rows=int(sys.argv[3]), timeframe_rows=int(sys.argv[4])), open(sys.argv[1], "w"))' \
+        "$size_result_dir/answer_plan.json" "$rows" "$RESHAPE_ROWS" "${TF_ROWS_OVERRIDE:-$rows}"
+
+    for digest_stem in ibex ibex_st polars polars_st polars_in_memory; do
+        : > "$size_result_dir/${digest_stem}_digest.tsv"
+    done
+
     csv="$size_data_dir/prices.csv"
     csv_multi="$size_data_dir/prices_multi.csv"
     csv_trades="$size_data_dir/trades.csv"
@@ -514,6 +540,7 @@ for rows in "${SIZES[@]}"; do
         ibex_st_tsv="$size_result_dir/ibex_st.tsv"
         IBEX_ROOT="$IBEX_ROOT" BUILD_DIR="$BUILD_DIR" \
             IBEX_CORES=1 IBEX_FW_SUFFIX=-st \
+            IBEX_DIGEST_OUT="$size_result_dir/ibex_st_digest.tsv" \
             bash "$SCRIPT_DIR/bench_ibex.sh" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
@@ -544,7 +571,7 @@ for rows in "${SIZES[@]}"; do
         if [[ $SKIP_PANDAS -eq 1 ]]; then
             py_args+=(--skip-pandas)
         fi
-        IBEX_DIGEST_OUT="$size_result_dir/polars_digest.tsv" \
+        POLARS_ENGINE_AFFINITY=streaming IBEX_DIGEST_OUT="$size_result_dir/polars_digest.tsv" \
         uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_python.py" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
@@ -559,7 +586,8 @@ for rows in "${SIZES[@]}"; do
             echo "  → polars (single thread)"
             polars_st_raw="$size_result_dir/polars_st_raw.tsv"
             polars_st_tsv="$size_result_dir/polars_st.tsv"
-            POLARS_MAX_THREADS=1 IBEX_FW_SUFFIX=-st uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_python.py" \
+            POLARS_MAX_THREADS=1 IBEX_FW_SUFFIX=-st POLARS_ENGINE_AFFINITY=streaming \
+            IBEX_DIGEST_OUT="$size_result_dir/polars_st_digest.tsv" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_python.py" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
                 --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
@@ -604,12 +632,21 @@ for rows in "${SIZES[@]}"; do
         fi
     fi
 
-    # Same answers, or the timings compare nothing: Ibex's digests against
-    # every Polars variant's. A report to read, not a gate -- see the script.
-    if [[ -s "$size_result_dir/ibex_digest.tsv" ]] &&
-        compgen -G "$size_result_dir/polars*_digest.tsv" > /dev/null; then
-        python3 "$SCRIPT_DIR/check_scale_answers.py" "$size_result_dir/ibex_digest.tsv" \
-            "$size_result_dir"/polars*_digest.tsv | tee "$size_result_dir/answers.txt"
+    # Missing artifacts, missing measured-query coverage, and mismatched
+    # full-scale digests are fatal. Bounded full answers were checked above.
+    if [[ $SKIP_IBEX -eq 0 && $SKIP_PYTHON -eq 0 ]]; then
+        ibex_checked="ibex"
+        polars_checked="polars"
+        [[ $SKIP_IBEX_ST -eq 0 ]] && ibex_checked+=",ibex-st"
+        [[ $SKIP_POLARS_ST -eq 0 ]] && polars_checked+=",polars-st"
+        [[ $SKIP_POLARS_IN_MEMORY -eq 0 ]] && polars_checked+=",polars-in-memory"
+        answer_args=()
+        [[ "$RESHAPE_ROWS" -eq 0 ]] && answer_args+=(--without-reshape)
+        [[ "${TF_ROWS_OVERRIDE:-$rows}" -eq 0 ]] && answer_args+=(--without-timeframe)
+        python3 "$SCRIPT_DIR/check_scale_run.py" "$size_result_dir" \
+            "${answer_args[@]}" --ibex "$ibex_checked" --polars "$polars_checked" \
+            --contracts "$OUTPUT_DIR/correctness/answers.json" \
+            | tee "$size_result_dir/answers.txt"
     fi
 
     if [[ $SKIP_R -eq 0 ]]; then
@@ -753,6 +790,23 @@ for rows in "${SIZES[@]}"; do
     echo
 done
 
+# Preserve a partial sweep under *.pending; never promote it as complete.
+if [[ ${#ENGINE_FAILURES[@]} -gt 0 ]]; then
+    echo >&2
+    echo "error: ${#ENGINE_FAILURES[@]} engine/size combination(s) failed; results are INCOMPLETE:" >&2
+    for failure in "${ENGINE_FAILURES[@]}"; do
+        echo "  - ${failure}" >&2
+    done
+    exit 1
+fi
+
+# Promote only a complete, validated run. Failed runs retain *.pending files
+# for diagnosis and cannot overwrite the last accepted report.
+mv "$COMBINED_TSV" "$OUTPUT_DIR/scales.tsv"
+mv "$COMBINED_CSV" "$OUTPUT_DIR/scales.csv"
+COMBINED_TSV="$OUTPUT_DIR/scales.tsv"
+COMBINED_CSV="$OUTPUT_DIR/scales.csv"
+
 echo "combined results written to:"
 echo "  $COMBINED_TSV"
 echo "  $COMBINED_CSV"
@@ -765,16 +819,4 @@ if [[ $TO_README -eq 1 ]]; then
     echo
     echo "README markdown written to:"
     echo "  $TO_README_OUT"
-fi
-
-# Exit non-zero on any engine failure, AFTER the results are combined and
-# written — a partial sweep is still worth having, it just must not be mistaken
-# for a complete one.
-if [[ ${#ENGINE_FAILURES[@]} -gt 0 ]]; then
-    echo >&2
-    echo "error: ${#ENGINE_FAILURES[@]} engine/size combination(s) failed; results are INCOMPLETE:" >&2
-    for failure in "${ENGINE_FAILURES[@]}"; do
-        echo "  - ${failure}" >&2
-    done
-    exit 1
 fi

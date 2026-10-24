@@ -15,20 +15,6 @@
 //      also late" — holds iff the order has EXACTLY ONE distinct late supplier,
 //      which must be l1's own (l1 is late by the outer filter).
 //
-//  This file does NOT use that rewrite. It keeps the shape Polars PDS-H q21
-//  used until polars-benchmark 401908a, which counts LINES instead of distinct
-//  suppliers: `n_supp_by_order` is lines per order and `n_supp_count` is late
-//  lines per order. That equals the SQL only when no order has two lines from
-//  the same supplier, which TPC-H does not guarantee (a line's supplier is one
-//  of its part's four, so two parts can share one). For the exact form, add
-//  `distinct { l_orderkey, l_suppkey }` before both counts.
-//
-//  Upstream's Polars q21 now applies the Saudi Arabia / status-F filters first
-//  and counts distinct suppliers only for the orders they leave. Each engine
-//  runs the shape that is fastest for it: on Ibex that is this one (SF-8,
-//  8 cores, 2026-10-08: ~565 ms here vs ~835 ms for a port of upstream's,
-//  whose dimension joins run in textual order), and the answers match.
-//
 //  l1 stays at line granularity (one row per late line), so count() counts
 //  waiting lines, matching the SQL.
 //
@@ -60,34 +46,36 @@ let lineitem_raw = parquet::read("benchmarking/data/tpch/parquet/lineitem.parque
     l_receiptdate: Date
 }>;
 
-// Match Polars' q1: orders with more than one line (Polars' proxy for "more
-// than one supplier"), joined to their late lines.
-let q1 = (
-    lineitem_raw[
-        select { n_supp_by_order = count() },
-        by { l_orderkey }
-    ][filter n_supp_by_order > 1]
-    join lineitem_raw[filter l_receiptdate > l_commitdate]
-        on { l_orderkey }
-);
-
-let q2 = q1[
-    select { n_supp_count = count() },
-    by { l_orderkey }
-];
-
-let result = (
-    (((q2 join q1 on { l_orderkey })
+// Follow upstream PDS-H: restrict the outer late lines by nation and order
+// status, then count distinct suppliers only for the remaining orders.
+let waiting_lines = (
+    (lineitem_raw[filter l_receiptdate > l_commitdate]
         join supplier_raw on { l_suppkey = s_suppkey })
-        join nation_raw on { s_nationkey = n_nationkey })
-        join orders_raw on { l_orderkey = o_orderkey })[
-    filter n_supp_count == 1 && n_name == "SAUDI ARABIA" && o_orderstatus == "F"
+        join nation_raw[filter n_name == "SAUDI ARABIA"]
+            on { s_nationkey = n_nationkey }
+) semi join orders_raw[filter o_orderstatus == "F"]
+    on { l_orderkey = o_orderkey };
+
+let relevant_lineitems = lineitem_raw semi join waiting_lines on { l_orderkey };
+let multiple_suppliers = relevant_lineitems[distinct { l_orderkey, l_suppkey }][
+    select { n_supp_by_order = count() }, by { l_orderkey }
+][filter n_supp_by_order > 1];
+
+let sole_late_supplier = relevant_lineitems[
+    filter l_receiptdate > l_commitdate
+][distinct { l_orderkey, l_suppkey }][
+    select { n_supp_count = count() }, by { l_orderkey }
+][filter n_supp_count == 1];
+
+// Preserve the original line granularity: two late lines from the sole late
+// supplier contribute two to numwait, rather than one supplier-level row.
+let result = (
+    (waiting_lines semi join multiple_suppliers on { l_orderkey })
+        semi join sole_late_supplier on { l_orderkey }
+)[
+    select { numwait = count() }, by { s_name }
 ][
-    select { numwait = count() },
-    by { s_name }
-][
-    order { numwait desc, s_name },
-    head 100
+    order { numwait desc, s_name }, head 100
 ];
 csv::write(result, "benchmarking/data/tpch/out/q21.csv");
 result;

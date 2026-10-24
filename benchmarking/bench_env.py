@@ -24,8 +24,14 @@ PARQUET_LINK = pathlib.Path(__file__).resolve().parent / "data/tpch/parquet"
 
 
 def default_pdsh_root() -> pathlib.Path:
-    """$PDSH_ROOT, else ~/polars-benchmark (run_bench.sh searches the same way)."""
-    return pathlib.Path(os.environ.get("PDSH_ROOT", pathlib.Path.home() / "polars-benchmark"))
+    """Prefer the user's code checkout; preserve explicit and legacy locations."""
+    if "PDSH_ROOT" in os.environ:
+        return pathlib.Path(os.environ["PDSH_ROOT"])
+    home = pathlib.Path.home()
+    candidates = [home / "code/polars-benchmark", home / "polars-benchmark",
+                  pathlib.Path(__file__).resolve().parents[2] / "polars-benchmark",
+                  pathlib.Path(__file__).resolve().parent / "tpch/polars-benchmark"]
+    return next((p for p in candidates if (p / "queries/polars").is_dir()), candidates[0])
 
 
 def pdsh_tables_root(pdsh_root: pathlib.Path) -> pathlib.Path:

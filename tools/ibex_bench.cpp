@@ -16,6 +16,7 @@
 #include <bit>
 #include <cstddef>
 #include <exception>
+#include <filesystem>
 #include <functional>
 #include <ios>
 #include <optional>
@@ -1749,7 +1750,66 @@ auto answer_digests() -> std::vector<AnswerDigest>& {
     return digests;
 }
 
+// Full, typed answers for untimed validation. Prefixes preserve null versus
+// empty String, exact integers, and non-finite floats across CSV round trips.
+auto record_full_answer(const std::string& query, const ibex::runtime::Table& table) -> void {
+    const char* directory = std::getenv("IBEX_ANSWERS_DIR");
+    if (directory == nullptr || directory[0] == '\0') {
+        return;
+    }
+    const auto path = std::filesystem::path(directory) / (query + ".csv");
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream out(path);
+    out.exceptions(std::ios::failbit | std::ios::badbit);
+    for (std::size_t c = 0; c < table.columns.size(); ++c) {
+        if (c != 0) {
+            out << ',';
+        }
+        ibex::csv::detail::csv_write_field(out, table.columns[c].name);
+    }
+    out << '\n';
+    for (std::size_t row = 0; row < table.rows(); ++row) {
+        for (std::size_t c = 0; c < table.columns.size(); ++c) {
+            if (c != 0) {
+                out << ',';
+            }
+            const auto& entry = table.columns[c];
+            if (ibex::runtime::is_null(entry, row)) {
+                out << "n:";
+                continue;
+            }
+            std::visit(
+                [&](const auto& col) {
+                    using C = std::decay_t<decltype(col)>;
+                    if constexpr (std::is_same_v<C, ibex::Column<std::string>> ||
+                                  std::is_same_v<C, ibex::Column<ibex::Categorical>>) {
+                        ibex::csv::detail::csv_write_field(out, "s:" + std::string(col[row]));
+                    } else if constexpr (std::is_same_v<C, ibex::Column<double>>) {
+                        out << "f:";
+                        ibex::csv::detail::csv_write_double(out, col[row]);
+                    } else if constexpr (std::is_same_v<C, ibex::Column<bool>>) {
+                        out << "b:" << (col[row] ? 1 : 0);
+                    } else if constexpr (std::is_same_v<C, ibex::Column<ibex::Date>>) {
+                        out << "i:" << col[row].days;
+                    } else if constexpr (std::is_same_v<C, ibex::Column<ibex::Timestamp>>) {
+                        out << "i:" << col[row].nanos;
+                    } else if constexpr (std::is_same_v<C, ibex::Column<ibex::Decimal>>) {
+                        out << "f:"
+                            << ibex::decimal::to_string(col[row].units,
+                                                        ibex::runtime::decimal_type_of(col).scale);
+                    } else {
+                        out << "i:" << col[row];
+                    }
+                },
+                *entry.column);
+        }
+        out << '\n';
+    }
+    out.close();
+}
+
 auto record_answer_digest(const std::string& query, const ibex::runtime::Table& table) -> void {
+    record_full_answer(query, table);
     if (std::getenv("IBEX_DIGEST_OUT") == nullptr) {
         return;
     }
@@ -1780,6 +1840,7 @@ auto write_answer_digests() -> void {
         return;
     }
     std::ofstream out(path);
+    out.exceptions(std::ios::failbit | std::ios::badbit);
     out << "query\trows\tnumeric_sum\n";
     out.precision(17);
     for (const auto& d : answer_digests()) {
@@ -1880,6 +1941,7 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
         }
 
         std::size_t last_rows = 0;
+        double peak_mb = 0.0;
         begin_peak_rss_window();
         std::vector<double> times(iters);
         for (std::size_t i = 0; i < iters; ++i) {
@@ -1895,8 +1957,11 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
             times[i] =
                 std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(t1 - t0)
                     .count();
+            if (i + 1 == iters) {
+                peak_mb = peak_rss_mb();
+                record_answer_digest(query.name, *result);
+            }
         }
-        const double peak_mb = peak_rss_mb();
         auto s = compute_stats(std::move(times));
         print_bench_line(query.name, iters, s, last_rows, peak_mb);
 
@@ -2056,6 +2121,10 @@ int main(int argc, char** argv) {
         ->delimiter(',');
 
     CLI11_PARSE(app, argc, argv);
+    if (include_read && std::getenv("IBEX_ANSWERS_DIR") != nullptr) {
+        ibex::formatting::print("error: full answer export requires resident benchmark mode\n");
+        return 1;
+    }
 
     std::unordered_set<std::string> selected_suites;
     const std::unordered_set<std::string> allowed_suites = {
@@ -3215,9 +3284,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Statistics benchmarks: the correlation matrix (CorrNode) over all numeric
-    // columns. Uses trades.csv (price:Double, qty:Int) for a 2x2 matrix; the
-    // cost is dominated by the two-pass mean/variance/covariance scan.
+    // Pairwise correlation, matching the scalar result returned by the
+    // competing engines. A whole correlation matrix is a different workload.
     if (status == 0 && run_suite("stats") && !csv_trades_path.empty()) {
         ibex::runtime::Table trades_table;
         try {
@@ -3230,7 +3298,8 @@ int main(int argc, char** argv) {
         trades_tables.emplace("trades", std::move(trades_table));
         ibex::formatting::print("\n-- Statistics benchmarks ({} trades rows) --\n",
                                 trades_tables.at("trades").rows());
-        const BenchQuery q{.name = "corr_price_vol", .source = "trades[corr]"};
+        const BenchQuery q{.name = "corr_price_vol",
+                           .source = "trades[select { r = corr(price, qty) }]"};
         ScanPaths sp;
         if (include_read) {
             sp.emplace_back("trades", csv_trades_path);

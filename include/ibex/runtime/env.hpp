@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <expected>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -16,13 +17,23 @@ namespace ibex::runtime {
 void set_env(const std::string& name, const std::string& value);
 void unset_env(const std::string& name);
 
+enum class AllocatorPolicy { Retain, System };
+
+/// Resolve IBEX_ALLOCATOR_POLICY (retain/system), read before the first query.
+/// An explicit policy wins over the legacy IBEX_NO_MALLOC_TUNING opt-out.
+/// Retain is the default; System leaves the host allocator untouched.
+[[nodiscard]] auto allocator_policy(const char* policy, const char* legacy_opt_out)
+    -> std::expected<AllocatorPolicy, std::string>;
+
 /// The `GLIBC_TUNABLES` value to re-exec with for whole-heap huge pages, or
 /// nullopt to leave the process as it is. Pure, so it can be tested: the inputs
 /// are the current `GLIBC_TUNABLES` (null when unset), the `IBEX_NO_HUGEPAGES`
 /// opt-out, the `IBEX_HUGEPAGES_REEXEC` marker a re-exec sets, and the text of
 /// /sys/kernel/mm/transparent_hugepage/enabled (empty when unreadable).
+/// System policy declines automatic changes, including huge pages/top pad.
 [[nodiscard]] auto huge_pages_tunables(const char* tunables, const char* opt_out,
-                                       const char* marker, std::string_view thp_enabled)
+                                       const char* marker, std::string_view thp_enabled,
+                                       AllocatorPolicy policy = AllocatorPolicy::Retain)
     -> std::optional<std::string>;
 
 /// Re-exec this process once with `glibc.malloc.hugetlb=1` (and a 64 MB

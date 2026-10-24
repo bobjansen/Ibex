@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Bob Jansen
 
-# run_bench.sh — time TPC-H/PDS-H queries: Ibex, this tree's Polars implementation,
-# and the upstream Polars PDS-H Polars + DuckDB implementations.
+# run_bench.sh — time TPC-H/PDS-H queries: Ibex and the upstream
+# Polars PDS-H Polars + DuckDB implementations.
 # Every engine is run in both its default multi-threaded configuration and a
 # one-thread configuration. Ibex's parallel islands are enabled explicitly for
 # the MT row and disabled for the ST row, making the comparison reproducible
@@ -30,7 +30,7 @@
 # a stale reference number is worthless (a slower box then reads as an ibex
 # regression). `--no-duckdb` is for an intentionally restricted comparison.
 # Needs a pola-rs/polars-benchmark checkout,
-# auto-found at ~/polars-benchmark or given by --pdsh-root / $PDSH_ROOT. For a
+# auto-found at ~/code/polars-benchmark or given by --pdsh-root / $PDSH_ROOT. For a
 # quick ibex-only look use bench_ibex.py instead.
 #
 # The Polars reference is its STREAMING executor, Polars' fastest. The in-memory
@@ -99,15 +99,12 @@ done
 # carries a DuckDB number forward. `bench_ibex.py` is the tool for a quick
 # ibex-only look.
 if [[ -z "$PDSH_ROOT" ]]; then
-    for cand in "$HOME/polars-benchmark" "$IBEX_ROOT/../polars-benchmark" \
-                "$SCRIPT_DIR/polars-benchmark"; do
-        if [[ -d "$cand/queries/polars" ]]; then PDSH_ROOT="$cand"; break; fi
-    done
+    PDSH_ROOT="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import bench_env; print(bench_env.default_pdsh_root())' "$SCRIPT_DIR/..")"
 fi
 
 if [[ -z "$PDSH_ROOT" || ! -d "$PDSH_ROOT/queries/polars" ]]; then
     echo "error: no pola-rs/polars-benchmark checkout found." >&2
-    echo "       git clone https://github.com/pola-rs/polars-benchmark.git ~/polars-benchmark" >&2
+    echo "       git clone https://github.com/pola-rs/polars-benchmark.git ~/code/polars-benchmark" >&2
     echo "       (or pass --pdsh-root DIR / set PDSH_ROOT). For ibex-only timing use bench_ibex.py." >&2
     exit 1
 fi

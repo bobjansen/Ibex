@@ -44,7 +44,7 @@ def main() -> int:
                              "the note in main().")
     parser.add_argument("--threads", type=int, default=None,
                         help="connection thread count (DuckDB only)")
-    parser.add_argument("--pdsh-root", type=pathlib.Path, required=True,
+    parser.add_argument("--pdsh-root", type=pathlib.Path, default=bench_env.default_pdsh_root(),
                         help="checkout of pola-rs/polars-benchmark")
     parser.add_argument("--sf", default="1")
     parser.add_argument("--warmup", type=int, default=1)

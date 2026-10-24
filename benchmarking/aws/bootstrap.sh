@@ -1524,35 +1524,44 @@ if [[ -n "${IBEX_TF_ROWS:-}" ]]; then
 fi
 
 # ── Upload results + self-terminate on ANY exit ───────────────────────────────
-# scales.csv is written incrementally (header at start, then per-size/per-engine
-# appends), so uploading on EXIT preserves completed sizes even when a later size
-# fails (e.g. an OOM at 16M). The trap also guarantees the instance shuts down
-# rather than idling after a failed suite.
+# Accepted results are promoted only after the suite's correctness gates pass.
+# Partial results live under a separate name and are never uploaded as final.
 CSV=/ibex/benchmarking/results/scales.csv
+PENDING_CSV=/ibex/benchmarking/results/scales.pending.csv
 PARTIAL_KEY="${IBEX_RESULT_KEY%scales.csv}scales.partial.csv"
+CHECKS_KEY="${IBEX_RESULT_KEY%scales.csv}checks.tar.gz"
 
 finish() {
     local code=$?
     [[ -n "${UPLOADER_PID:-}" ]] && kill "${UPLOADER_PID}" 2>/dev/null || true
-    if [[ -f "$CSV" ]]; then
-        if aws s3 cp "$CSV" \
-            "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY}" \
-            --region "${IBEX_REGION}"; then
-            echo "Results uploaded to s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY} (suite exit ${code})"
+    if [[ "$code" -eq 0 && -f "$CSV" ]]; then
+        # The fleet merger needs the digests and bounded-check report from the
+        # exact workers that ran, before it may accept their combined CSV.
+        if python3 /ibex/benchmarking/package_scale_checks.py \
+                /ibex/benchmarking/results /tmp/ibex-scale-checks.tar.gz &&
+           aws s3 cp /tmp/ibex-scale-checks.tar.gz \
+                "s3://${IBEX_S3_BUCKET}/${CHECKS_KEY}" --region "${IBEX_REGION}" &&
+           aws s3 cp "$CSV" "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY}" \
+                --region "${IBEX_REGION}"; then
+            echo "Validated results and correctness artifacts uploaded"
         else
-            echo "WARNING: result upload failed (suite exit ${code})"
+            echo "WARNING: final result upload failed"
         fi
+    elif [[ -f "$PENDING_CSV" ]]; then
+        aws s3 cp "$PENDING_CSV" "s3://${IBEX_S3_BUCKET}/${PARTIAL_KEY}" \
+            --region "${IBEX_REGION}" || true
+        echo "Incomplete run (suite exit ${code}); uploaded partial results only"
     else
-        echo "No results to upload (suite exit ${code})"
+        echo "No accepted results to upload (suite exit ${code})"
     fi
     shutdown -h now
 }
 trap finish EXIT
 
-# Periodic partial-result uploader: sync the in-progress scales.csv every 60s so
+# Periodic partial-result uploader: sync the in-progress scales.pending.csv every 60s so
 # completed sizes are visible long before the whole sweep finishes.
 ( while sleep 60; do
-      [[ -f "$CSV" ]] && aws s3 cp "$CSV" \
+      [[ -f "$PENDING_CSV" ]] && aws s3 cp "$PENDING_CSV" \
           "s3://${IBEX_S3_BUCKET}/${PARTIAL_KEY}" \
           --region "${IBEX_REGION}" --only-show-errors || true
   done ) &

@@ -277,7 +277,7 @@ class BenchmarkContract(unittest.TestCase):
                         # No secondary ordering key is specified: boundary ties
                         # may select different symbols, but not different prices.
                         self.assertEqual(a["price"].to_list(), b["price"].to_list())
-                        self.assertEqual(b.join(prices.unique(), on=prices.columns, how="anti").height, 0)
+                        self.assertEqual(b.join(bp.pl_keys(prices).unique(), on=prices.columns, how="anti").height, 0)
                         continue
                     assert_frame_equal(a.sort(a.columns), b.sort(b.columns),
                                        check_exact=False, rel_tol=1e-9, abs_tol=1e-10)

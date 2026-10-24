@@ -24,6 +24,24 @@
 
 namespace ibex::runtime {
 
+auto allocator_policy(const char* policy, const char* legacy_opt_out)
+    -> std::expected<AllocatorPolicy, std::string> {
+    const std::string_view value = policy == nullptr ? std::string_view{} : policy;
+    if (value == "retain") {
+        return AllocatorPolicy::Retain;
+    }
+    if (value == "system") {
+        return AllocatorPolicy::System;
+    }
+    if (!value.empty()) {
+        return std::unexpected("IBEX_ALLOCATOR_POLICY must be 'retain' or 'system'");
+    }
+    if (legacy_opt_out != nullptr && legacy_opt_out[0] != '\0' && legacy_opt_out[0] != '0') {
+        return AllocatorPolicy::System;
+    }
+    return AllocatorPolicy::Retain;
+}
+
 void set_env(const std::string& name, const std::string& value) {
 #ifdef _WIN32
     _putenv_s(name.c_str(), value.c_str());
@@ -41,8 +59,12 @@ void unset_env(const std::string& name) {
 }
 
 auto huge_pages_tunables(const char* tunables, const char* opt_out, const char* marker,
-                         std::string_view thp_enabled) -> std::optional<std::string> {
+                         std::string_view thp_enabled, AllocatorPolicy policy)
+    -> std::optional<std::string> {
     constexpr std::string_view kTunable = "glibc.malloc.hugetlb";
+    if (policy == AllocatorPolicy::System) {
+        return std::nullopt;
+    }
     if (opt_out != nullptr && opt_out[0] != '\0' && std::string_view{opt_out} != "0") {
         return std::nullopt;
     }
@@ -90,9 +112,14 @@ void enable_huge_pages() noexcept {
             std::getline(in, thp);
         }
         const char* tunables = std::getenv("GLIBC_TUNABLES");  // NOLINT(concurrency-mt-unsafe)
+        const auto policy = allocator_policy(std::getenv("IBEX_ALLOCATOR_POLICY"),
+                                             std::getenv("IBEX_NO_MALLOC_TUNING"));
+        if (!policy) {
+            return;  // the first query reports the invalid policy
+        }
         const auto next = huge_pages_tunables(
-            tunables, std::getenv("IBEX_NO_HUGEPAGES"),     // NOLINT(concurrency-mt-unsafe)
-            std::getenv("IBEX_HUGEPAGES_REEXEC"), thp);  // NOLINT(concurrency-mt-unsafe)
+            tunables, std::getenv("IBEX_NO_HUGEPAGES"),           // NOLINT(concurrency-mt-unsafe)
+            std::getenv("IBEX_HUGEPAGES_REEXEC"), thp, *policy);  // NOLINT(concurrency-mt-unsafe)
         if (!next.has_value()) {
             return;
         }

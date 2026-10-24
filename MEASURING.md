@@ -136,6 +136,7 @@ ones that matter for measurement:
 
 | Variable | Effect |
 |---|---|
+| `IBEX_ALLOCATOR_POLICY` | `retain` (default) reuses large glibc allocations and enables automatic huge pages in the CLI; `system` leaves host settings untouched. Set before startup/first query; do not switch within a run. |
 | `IBEX_CORES` | compute budget. **Pin it** — unset means `hardware_concurrency()`. Cap local cross-engine runs at 8; never 24 (polars thrashes and inflates Ibex ~1.7×) |
 | `IBEX_PROFILE_OPERATORS=1` | per-node + per-statement profile to stderr. The main diagnostic |
 | `IBEX_CORES=1` | one compute thread — the byte-identity A/B setting. There is no separate on/off switch: a budget of one *is* serial, and the aggregate morsel cut is keyed on rows, so every core count answers bit for bit. |
@@ -252,6 +253,31 @@ Rscript benchmarking/bench_r.R --csv ...          # R needs no wrapper
 `benchmarking/aws/run-all.sh` and `run-thread-scaling.sh` are the AWS two-tier
 framework. They are **deliberately not run** as a routine step — do not reach
 for them unless the task is explicitly "publish new numbers".
+
+### In-memory cross-engine correctness gate
+
+`run_scale_suite.sh` runs `verify_scale_answers.py` before timing an Ibex/Polars
+comparison (also on an Ibex-only fleet worker). It executes the actual harness queries at 720 and 4096 rows (String
+and Categorical keys), at one and two cores, and compares every output cell.
+Column names, nulls, NaNs, strings, duplicate rows, key/value associations and
+explicit sort order are checked. Stochastic RNG workloads are explicitly
+excluded. `IBEX_ANSWERS_DIR` exports typed CSV answers outside the timed section;
+use this only for bounded validation, not an entire large-scale run.
+
+At each timed scale, `check_scale_run.py` requires every measured supported
+query to have a digest and rejects row-count or numeric-sum mismatches. A
+missing expected query is an error unless its timing row explicitly marks it
+cut, or the scale plan disables reshape/TimeFrame work. These full-scale
+summaries are screens; the complete-output checks run on bounded fixtures.
+
+`check_scale_answers.py` fails on mismatches by default. `--report-only` is for
+diagnosis, never for accepting a run. Empty, malformed and duplicate digest
+records are errors even in that diagnostic mode. Failed scale runs leave
+`scales.pending.tsv`/`.csv` and preserve the last accepted combined reports.
+The bounded pass keeps its inputs, answers, logs and `answers.json` for audit.
+AWS workers upload small correctness sidecars before marking results complete;
+`check_scale_fleet.py` requires those sidecars and checks cross-worker digests
+and matching scale/reshape/TimeFrame plans before accepting a fleet merge.
 
 ### Profiling the whole suite
 

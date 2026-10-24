@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 """Small deterministic fixtures; these never contribute benchmark samples."""
 import copy
 import csv

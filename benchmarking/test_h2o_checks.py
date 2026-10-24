@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 """Adversarial H2O gate tests; no builds, engine queries or benchmark data."""
 import contextlib
 import copy

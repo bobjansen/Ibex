@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 """Fail closed on incomplete, unchecked or mixed-run H2O artifacts."""
 import csv
 import hashlib

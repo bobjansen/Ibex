@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 """H2O answer contracts shared by all three executors and publication.
 
 Scale fingerprints are order-independent screens, not proofs. Exact fields

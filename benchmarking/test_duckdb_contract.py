@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 """DuckDB 2 workload semantics, checked against independent small oracles."""
 import contextlib
 import io

@@ -133,6 +133,13 @@ arithmetic wraps at its planned width; small-integer sums promote to Int64.
 UInt32 and UInt64 inputs remain unsupported. The new matching queries are
 included in the required regression baseline.
 
+Basic resident timestamps/durations now use checked Int64 nanosecond storage.
+Their dedicated tests cover unit/timezone preservation, nulls, comparisons,
+grouping, sorting, min/max and duration sums. The selected upstream survey
+remains at 132 matches: temporal cases in those modules now reach unsupported
+means, arithmetic, casts or the known timestamp-literal visitor limitation.
+No expected results or conformance tolerances were changed.
+
 Expand `targets` to more upstream modules or use `--select` to investigate.
 When support improves, add newly passing query ordinals from the report to
 `required_pass_queries` so that losing support fails CI rather than silently

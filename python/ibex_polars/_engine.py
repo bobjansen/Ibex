@@ -10,6 +10,7 @@ import polars as pl
 import pyarrow as pa
 
 from ._adapter import Adapter, check_version, flag_key
+from ._temporal import is_temporal, storage_type
 
 check_version()
 
@@ -24,6 +25,9 @@ def _to_polars(result, expected, output):
     result = result.replace_schema_metadata(metadata or None)
     for index, name in enumerate(result.column_names):
         dtype = result.column(index).type
+        if is_temporal(expected[name]):
+            result = result.set_column(index, name, result.column(index).cast(storage_type(expected[name])))
+            continue
         # The shared lowerer's logical string type describes dictionary-backed
         # strings too. For categorical output, let Polars import the dictionary
         # directly instead of decoding every row and encoding it again.

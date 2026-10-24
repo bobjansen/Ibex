@@ -1212,12 +1212,6 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     //   drop left:  R -= beta^(i-lo)*col_values[lo]
                     // reproducing the from-scratch O(n*w) recurrence in one pass.
                     // beta_pow caches beta^k (k bounded by the window width).
-                    //
-                    // Null handling: the weights are position-based, so a null
-                    // can't be skipped without renumbering the whole window.
-                    // Instead a null contributes 0 (a "no-return" tick) — its
-                    // payload is never read. (NaN still propagates through the
-                    // recurrence; genuine NaNs in an EWMA input are out of scope.)
                     const double beta = 1.0 - alpha;
                     const auto* col_values = col.data();
                     auto val = [&](std::size_t j) -> double {
@@ -1233,6 +1227,47 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             beta_pow.push_back(beta_pow.back() * beta);
                         return beta_pow[k];
                     };
+                    if (sv != nullptr) {
+                        // Apply the same recurrence in non-null observation
+                        // coordinates. Null rows still define window bounds,
+                        // but neither decay R nor advance the weight exponent.
+                        // All cursors move forward, retaining O(n) work.
+                        std::optional<ValidityBitmap> out_valid;
+                        double r = 0.0;
+                        std::size_t lo = 0;
+                        std::size_t seed = 0;
+                        std::size_t count = 0;
+                        for (std::size_t i = 0; i < rows; ++i) {
+                            if (valid_at(i)) {
+                                r = (beta * r) + static_cast<double>(col_values[i]);
+                                ++count;
+                            }
+                            while (lo < i && should_drop(lo, i)) {
+                                if (valid_at(lo)) {
+                                    r -= bpow(count - 1) * static_cast<double>(col_values[lo]);
+                                    --count;
+                                }
+                                ++lo;
+                            }
+                            if (count == 0) {
+                                r = 0.0;
+                                result_values[i] = 0.0;  // null payload
+                                if (!out_valid)
+                                    out_valid.emplace(rows, true);
+                                out_valid->set(i, false);
+                                continue;
+                            }
+                            seed = std::max(seed, lo);
+                            while (!valid_at(seed))
+                                ++seed;
+                            const double first = static_cast<double>(col_values[seed]);
+                            if (count == 1)
+                                r = first;  // discard subtraction error on restart
+                            result_values[i] = (alpha * r) + (beta * bpow(count - 1) * first);
+                        }
+                        return ComputedColumn{.column = std::move(result),
+                                              .validity = std::move(out_valid)};
+                    }
                     double r = 0.0;
                     std::size_t lo = 0;
                     for (std::size_t i = 0; i < rows; ++i) {

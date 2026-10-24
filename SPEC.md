@@ -3310,7 +3310,7 @@ window argument (below); `lag` and `lead` do not.
 | `rolling_count()`          | Row count within window                                             |
 | `rolling_median(col)`      | Median within window (`Float64`); O(n log w) via sliding two-heap  |
 | `rolling_std(col)`         | Sample standard deviation within window (`Float64`; 0.0 when fewer than 2 rows) |
-| `rolling_ewma(col, alpha)` | EWMA within window (`Float64`); `alpha` is a numeric literal        |
+| `rolling_ewma(col, alpha)` | EWMA within window (`Float64`); skips nulls and returns null if no non-null values remain; `alpha` is a numeric literal |
 | `rolling_quantile(col, p)` | Quantile `p` within window (`Float64`); `p` is a numeric literal    |
 | `rolling_skew(col)`        | Sample skewness within window (`Float64`)                           |
 | `rolling_kurtosis(col)`    | Excess kurtosis within window (`Float64`)                           |
@@ -3321,6 +3321,10 @@ window argument (below); `lag` and `lead` do not.
 
 Rolling functions are **aggregate-like**: they produce one scalar per row
 (evaluated over the window) and are valid in both `select` and `update`.
+`rolling_ewma` starts from the first non-null value in each window. Each later
+non-null value `x` advances the result as `e = (1 - alpha) * e + alpha * x`.
+Null rows still occupy positions in count windows and time in duration windows,
+but do not seed, decay, or otherwise update the EWMA.
 For Decimal inputs, `rolling_sum` returns `Decimal(38, s)`; `rolling_min`,
 `rolling_max`, `rolling_first`, and `rolling_last` preserve `Decimal(p, s)`.
 The statistical rolling functions still require an explicit `Float64` cast.

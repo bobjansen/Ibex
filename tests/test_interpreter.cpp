@@ -5751,6 +5751,83 @@ TEST_CASE("rolling_ewma larger window") {
     CHECK((*e)[3] == Catch::Approx(32.5));
 }
 
+TEST_CASE("rolling_ewma skips null observations and returns null for empty windows",
+          "[null][rolling][ewma]") {
+    // Compare against a from-scratch recurrence: nulls occupy rows/time in
+    // the window, but neither seed nor advance the EWMA weights.
+    constexpr std::size_t kRows = 150;
+    for (const bool integers : {false, true}) {
+        for (const int pattern : {0, 1, 2}) {  // mixed, all-null, all-valid bitmap
+            CAPTURE(integers, pattern);
+            runtime::Table table;
+            Column<Timestamp> times;
+            Column<double> doubles;
+            Column<std::int64_t> ints;
+            runtime::ValidityBitmap valid;
+            std::vector<std::int64_t> nanos;
+            for (std::size_t i = 0; i < kRows; ++i) {
+                const auto t = static_cast<std::int64_t>(i * 2 + i / 11 * 20);
+                const auto value = static_cast<std::int64_t>((i * 37) % 101) - 50;
+                const bool present =
+                    pattern == 2 || (pattern == 0 && i >= 4 && i % 13 < 5 && i < 130);
+                nanos.push_back(t);
+                times.push_back(ts_from_nanos(t));
+                // Poison null payloads so accidentally reading one is visible.
+                doubles.push_back(present ? static_cast<double>(value)
+                                          : std::numeric_limits<double>::quiet_NaN());
+                ints.push_back(present ? value : std::numeric_limits<std::int64_t>::max());
+                valid.push_back(present);
+            }
+            table.add_column("ts", std::move(times));
+            if (integers) {
+                table.add_column("val", std::move(ints), valid);
+            } else {
+                table.add_column("val", std::move(doubles), valid);
+            }
+            table.set_properties(runtime::TableProperties::time_frame("ts"));
+            runtime::TableRegistry registry;
+            registry.emplace("data", table);
+            for (const bool count_window : {false, true}) {
+                for (const int width : {1, 7, 1000}) {
+                    for (const std::string alpha_text : {"0.1", "0.5", "1.0"}) {
+                        CAPTURE(count_window, width, alpha_text);
+                        const double alpha = std::stod(alpha_text);
+                        const std::string window =
+                            std::to_string(width) + (count_window ? "" : "ns");
+                        const std::string source = "data[update { e = rolling_ewma(val, " +
+                                                   alpha_text + ", " + window + ") }];";
+                        auto ir = require_ir(source.c_str());
+                        auto result = runtime::interpret(*ir, registry);
+                        REQUIRE(result.has_value());
+                        const auto* entry = result->find_entry("e");
+                        REQUIRE(entry != nullptr);
+                        const auto& output = std::get<Column<double>>(*entry->column);
+                        REQUIRE(output.size() == kRows);
+                        for (std::size_t i = 0; i < kRows; ++i) {
+                            CAPTURE(i);
+                            std::optional<double> expected;
+                            for (std::size_t j = 0; j <= i; ++j) {
+                                const bool in_window = count_window
+                                                           ? i - j < static_cast<std::size_t>(width)
+                                                           : nanos[j] > nanos[i] - width;
+                                if (in_window && valid[j]) {
+                                    const double value = static_cast<double>((j * 37) % 101) - 50.0;
+                                    expected = expected ? (1.0 - alpha) * *expected + alpha * value
+                                                        : value;
+                                }
+                            }
+                            CHECK(runtime::is_null(*entry, i) == !expected.has_value());
+                            if (expected) {
+                                CHECK(output[i] == Catch::Approx(*expected).margin(1e-10));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // --- Phase 1 null semantics ---------------------------------------------------
 
 TEST_CASE("null: right join unmatched rows produce null left columns", "[null][join]") {

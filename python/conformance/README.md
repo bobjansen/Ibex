@@ -126,6 +126,13 @@ The engine's documented Float64-intermediate policy can deliberately differ
 from Polars' Float32 rounding; dedicated engine tests verify that policy.
 The upstream comparisons retain their original strict checks and tolerances.
 
+Adding Int8, Int16, UInt8 and UInt16 support increases matches to 132 queries
+across 45 fully passing tests. There are 1,498 query rejections, 301 tests with
+unsupported queries and 730 unexercised tests, with zero mismatches. Narrow
+arithmetic wraps at its planned width; small-integer sums promote to Int64.
+UInt32 and UInt64 inputs remain unsupported. The new matching queries are
+included in the required regression baseline.
+
 Expand `targets` to more upstream modules or use `--select` to investigate.
 When support improves, add newly passing query ordinals from the report to
 `required_pass_queries` so that losing support fails CI rather than silently

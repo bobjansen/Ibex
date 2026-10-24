@@ -22,7 +22,10 @@ POLARS_VERSION = "2.0.0"
 
 # These logical integer types all fit native Int64 storage. UInt32/UInt64
 # intentionally remain outside this subset.
-_INTEGER_LAYOUTS = {pl.Int32: (32, True), pl.Int64: (64, True)}
+_INTEGER_LAYOUTS = {
+    pl.Int8: (8, True), pl.Int16: (16, True), pl.Int32: (32, True),
+    pl.Int64: (64, True), pl.UInt8: (8, False), pl.UInt16: (16, False),
+}
 _SUPPORTED_INPUT_TYPES = (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64, pl.Boolean, pl.String, pl.Date, pl.Categorical)
 
 
@@ -125,7 +128,7 @@ class Adapter:
                 expr = Expr("is_null", args)
             elif name == "IsNotNull" and len(args) == 1:
                 expr = ~Expr("is_null", args)
-            elif name == "negate" and len(args) == 1 and self.visitor.get_dtype(node) in (pl.Int32,):
+            elif name == "negate" and len(args) == 1 and self.visitor.get_dtype(node) in (pl.Int8, pl.Int16, pl.Int32):
                 expr = ibex.lit(0) - args[0]
             else:
                 raise NotImplementedError(f"unsupported function {value.function_data}")

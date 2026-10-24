@@ -113,6 +113,73 @@ class EngineTests(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             frame.select(pl.col("x").cast(pl.Int32)).collect(engine=self.engine)
 
+    def test_small_integer_arithmetic_wraps_and_reductions_promote(self):
+        for dtype, bits, signed in ((pl.Int8, 8, True), (pl.Int16, 16, True),
+                                    (pl.UInt8, 8, False), (pl.UInt16, 16, False)):
+            high = 2**(bits - int(signed)) - 1
+            low = -(2**(bits - 1)) if signed else 0
+            frame = pl.LazyFrame({"x": pl.Series([low, high, 1, 0, None], dtype=dtype),
+                                  "y": pl.Series([high, high, high, 1, 1], dtype=dtype),
+                                  "g": ["a"] * 5})
+            queries = [frame, frame.select(add=pl.col("x") + 1, sub=pl.col("x") - 1,
+                                           mul=pl.col("x") * pl.col("y")),
+                       frame.select(nested=(pl.col("x") + 1) * pl.col("y")),
+                       frame.select(test=(pl.col("x") + 1) > 0, ratio=(pl.col("x") + 1) / 2),
+                       frame.filter((pl.col("x") + 1) > 0), frame.sort("x"),
+                       frame.select(wide=(pl.col("x") + 1).cast(pl.Int64)),
+                       frame.group_by("x", maintain_order=True).agg(pl.len()),
+                       frame.group_by("g").agg(total=pl.col("x").sum(), avg=pl.col("x").mean())]
+            if signed:
+                queries.append(frame.select(negative=-pl.col("x")))
+            for flags in (pl.QueryOptFlags(), pl.QueryOptFlags.none()):
+                for query in queries:
+                    with self.subTest(dtype=dtype, query=query.explain(), flags=flags):
+                        self.equal(query, options=flags)
+                promoted = pl.LazyFrame({"x": pl.Series([high, high, None], dtype=dtype)})
+                result = self.equal(promoted.select(pl.col("x").sum()), options=flags)
+                self.assertEqual(result.item(), high * 2)
+                self.assertEqual(result.schema, {"x": pl.Int64})
+            for values in ([], [None, None]):
+                empty = pl.LazyFrame({"x": pl.Series(values, dtype=dtype)})
+                self.equal(empty)
+                self.equal(empty.select(total=pl.col("x").sum(), avg=pl.col("x").mean()))
+
+    def test_small_integer_wrapping_and_safe_widening_casts(self):
+        frame = pl.LazyFrame({"x": [-(2**63), -65537, -129, -1, 0, 128, 65536, 2**63 - 1, None]})
+        for dtype in (pl.Int8, pl.Int16, pl.UInt8, pl.UInt16):
+            for flags in (pl.QueryOptFlags(), pl.QueryOptFlags.none()):
+                self.equal(frame.select(pl.col("x").cast(dtype, wrap_numerical=True)), options=flags)
+            with self.assertRaises(NotImplementedError):
+                frame.select(pl.col("x").cast(dtype)).collect(engine=self.engine)
+        for source, target in ((pl.Int8, pl.Int16), (pl.UInt8, pl.Int16),
+                               (pl.UInt16, pl.Int32), (pl.Int16, pl.Float64)):
+            query = pl.LazyFrame({"x": pl.Series([0, 1, None], dtype=source)}).select(pl.col("x").cast(target))
+            self.equal(query)
+        for dtype in (pl.UInt8, pl.UInt16):
+            with self.assertRaises(NotImplementedError):
+                pl.LazyFrame({"x": pl.Series([1], dtype=dtype)}).select(-pl.col("x")).collect(engine=self.engine)
+
+    @unittest.skipIf(os.environ.get("IBEX_TEST_PARQUET") == "0", "Parquet backend disabled")
+    def test_small_integer_parquet_and_wide_unsigned_rejections(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for dtype, arrow_type in ((pl.Int8, pa.int8()), (pl.Int16, pa.int16()),
+                                      (pl.UInt8, pa.uint8()), (pl.UInt16, pa.uint16())):
+                path = Path(directory) / f"{dtype}.parquet"
+                pq.write_table(pa.table({"x": pa.array([0, 1, None], type=arrow_type)}), path)
+                frame = pl.scan_parquet(path)
+                self.equal(frame)
+                self.equal(frame.select(value=pl.col("x") - 1))
+                self.equal(frame.select(total=pl.col("x").sum()))
+            for dtype in (pl.UInt32, pl.UInt64):
+                data = pl.DataFrame({"x": pl.Series([0, 1, None], dtype=dtype)})
+                path = Path(directory) / f"{dtype}.parquet"
+                data.write_parquet(path)
+                for query in (data.lazy(), pl.scan_parquet(path)):
+                    with patch.object(ibex_pyarrow, "execute_pipeline") as execute:
+                        with self.assertRaises(NotImplementedError):
+                            query.collect(engine=self.engine)
+                        execute.assert_not_called()
+
     @unittest.skipIf(os.environ.get("IBEX_TEST_PARQUET") == "0", "Parquet backend disabled")
     def test_int32_parquet_predicate_and_output_types(self):
         with tempfile.TemporaryDirectory() as directory:

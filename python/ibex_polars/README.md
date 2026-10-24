@@ -30,21 +30,26 @@ raise before native binding/execution; there is no automatic fallback.
 Supported operations include resident DataFrame scans, single local Parquet
 files, filters, projections, simultaneous row-local column updates, numeric
 sums/means, row counts, column-key grouping and sorting. Supported resident
-types are Int32, Int64, Float32, Float64, Boolean, String, Date and Categorical. Numeric
+types are Int8, Int16, Int32, Int64, UInt8, UInt16, Float32, Float64, Boolean,
+String, Date and Categorical. Numeric
 coercion to Float64 and null predicates are supported. Joins, windows, UDFs,
 computed grouping/sort keys, floating-point grouping keys, aggregate broadcasting, explicit slice/top-k
 nodes, remote/multiple files, Enum, other numeric widths and nondefault scan
 policies are outside this slice. An already-sliced resident source is valid.
 Background, batch, async and sink execution are not implemented.
 
-Int32 is a Python-boundary type, not a new native runtime variant. Resident
-inputs widen once to Int64 during preparation; Parquet decoding already uses
-Int64 storage. Int32-valued arithmetic expressions and sums wrap modulo `2**32`
-into the signed range before later comparisons, casts, divisions or reductions.
-The declared Polars dtype is restored at export. Safe widening casts and explicit
-integral casts with `wrap_numerical=True` are supported. Checked/null-producing
-integer casts that may overflow remain unsupported. UInt32 and UInt64 inputs
-remain unsupported, for resident tables and Parquet scans.
+Narrow integers are Python-boundary types, not new native runtime variants.
+Resident inputs widen once to Int64 during preparation; Parquet decoding
+already uses Int64 storage. Arithmetic wraps modulo `2**bits` whenever the
+Polars planner declares a narrow integer result, using its signed or unsigned
+range. Wrapping happens before later comparisons, casts, divisions and
+reductions, and results recover the declared Polars dtype at export. Sums of
+Int8, Int16, UInt8 and UInt16 promote to Int64 and do not wrap at the input
+width; Int32 sums retain Int32 wrapping. Other mixed expressions also follow
+the planner's result dtype. Safe widening casts and explicit integral casts
+with `wrap_numerical=True` are supported. Checked or null-producing casts that
+could overflow their destination range remain unsupported. UInt32 and UInt64
+inputs remain unsupported, for both resident tables and Parquet scans.
 
 Float32 inputs similarly widen once to Float64 for execution, including
 Parquet input. All arithmetic and reductions use Float64 intermediates; only

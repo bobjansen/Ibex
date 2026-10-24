@@ -30,12 +30,21 @@ raise before native binding/execution; there is no automatic fallback.
 Supported operations include resident DataFrame scans, single local Parquet
 files, filters, projections, simultaneous row-local column updates, numeric
 sums/means, row counts, column-key grouping and sorting. Supported resident
-types are Int64, Float64, Boolean, String, Date and Categorical. Numeric
+types are Int32, Int64, Float64, Boolean, String, Date and Categorical. Numeric
 coercion to Float64 and null predicates are supported. Joins, windows, UDFs,
 computed grouping/sort keys, floating-point grouping keys, aggregate broadcasting, explicit slice/top-k
 nodes, remote/multiple files, Enum, other numeric widths and nondefault scan
 policies are outside this slice. An already-sliced resident source is valid.
 Background, batch, async and sink execution are not implemented.
+
+Int32 is a Python-boundary type, not a new native runtime variant. Resident
+inputs widen once to Int64 during preparation; Parquet decoding already uses
+Int64 storage. Int32-valued arithmetic expressions and sums wrap modulo `2**32`
+into the signed range before later comparisons, casts, divisions or reductions.
+The declared Polars dtype is restored at export. Safe widening casts and explicit
+integral casts with `wrap_numerical=True` are supported. Checked/null-producing
+integer casts that may overflow remain unsupported. UInt32 and UInt64 inputs
+remain unsupported, for resident tables and Parquet scans.
 
 Reuse the same Engine and lazy query for repeated analytics. Its bounded cache
 (32 plans by default) retains translated plans and prepared resident inputs,

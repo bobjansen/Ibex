@@ -135,3 +135,17 @@ After each change, rerun the survey to reveal next blockers and promote newly
 passing query ordinals into the regression baseline. Keep eager-only and
 unselected features visible as unmeasured rather than treating them as either
 supported or unsupported.
+
+## Int32 follow-up
+
+The adapter now widens Int32 inputs to native Int64 storage and wraps
+Int32-valued expression/reduction results modulo `2**32` into the signed range.
+It returns the declared Polars output types without introducing native Int32
+variants. Checked Int64-to-Int32 narrowing remains outside this support.
+
+The same survey now records 20 passing tests, 326 tests with unsupported
+queries and 730 unexercised tests. Query matches increased from 52 to 73;
+rejections decreased from 1,578 to 1,557, with zero mismatches. The modest gain
+relative to the original 331 Int32 first rejections illustrates the masked
+blockers: many queries now get farther but reject another operation. Newly
+matching queries are included in `required_pass_queries`.

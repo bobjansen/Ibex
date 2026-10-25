@@ -88,24 +88,14 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             normalized = f"((({value} % {modulus}) + {offset}) % {modulus})"
             return f"({normalized} - {bind(half)})" if signed else normalized
         if op.removeprefix("polars_") in ("==", "!=", "<", "<=", ">", ">="):
-            # Both Python frontends follow Polars: NaN equals itself and
-            # compares greater than every non-NaN number. Keep this adaptation
-            # at the Python boundary; native Ibex comparisons stay unchanged.
+            # Internal bridge calls lower to a comparison IR policy, preserving
+            # Polars' NaN ordering without expanding into scalar case expressions.
             comparison = op.removeprefix("polars_")
             left, right = render(args[0]), render(args[1])
             if not any(current_types.get(id(arg)) == pa.float64() for arg in args):
                 return f"({left} {comparison} {right})"
-            nan = [f"is_nan({value})" if current_types.get(id(arg)) == pa.float64() else "false"
-                   for arg, value in zip(args, (left, right))]
-            if comparison in ("==", "!="):
-                value = f"(({left} == {right}) || ({nan[0]} && {nan[1]}))"
-                if comparison == "!=":
-                    value = f"!({value})"
-            else:
-                a, b = nan if comparison in (">", ">=") else nan[::-1]
-                extra = a if comparison in (">=", "<=") else f"({a} && !({b}))"
-                value = f"(({left} {comparison} {right}) || {extra})"
-            return f"case {{ is_null({left}) || is_null({right}) => NULL, else => {value} }}"
+            name = {"==": "eq", "!=": "ne", "<": "lt", "<=": "le", ">": "gt", ">=": "ge"}[comparison]
+            return f"__ibex_nan_high_{name}({left}, {right})"
         if op == "!":
             return f"!({render(args[0])})"
         if op not in ("+", "-", "*", "/", "==", "!=", "<", "<=", ">", ">=", "&&", "||"):

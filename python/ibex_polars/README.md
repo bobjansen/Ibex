@@ -85,6 +85,10 @@ Mixed per-column row selections and nondefault scan-limit policies remain
 unsupported. Polars' own LazyFrame indexing restrictions still apply before
 translation; the independent API additionally supports full Python slicing.
 
+A select containing only `column.unique(maintain_order=...)` is translated to
+a one-column projection and native distinct. Multiple independently sized
+projection expressions and grouped list-valued uniqueness remain unsupported.
+
 Equality joins support `inner`, `left`, `right`, `full`, `semi`, and `anti`;
 `cross` joins are supported too. Keys must be scalar column names (including
 composite keys). Null matching, suffixes, key coalescing and requested ordering

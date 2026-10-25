@@ -173,6 +173,28 @@ class EngineTests(unittest.TestCase):
         result = self.equal(frame.select((pl.col("a") * pl.col("b") + pl.col("c")).alias("v")))
         self.assertEqual(result["v"][0], 0.)  # a hardware FMA would produce -2**-54
 
+    def test_single_unique_projection_uses_distinct_without_list_values(self):
+        for values, dtype in (([2, None, 2, 1, None], pl.Int64),
+                              (["b", None, "b", "a", None], pl.String),
+                              ([float("nan"), 0., -0., None, float("nan")], pl.Float64)):
+            frame = pl.DataFrame({"x": pl.Series(values, dtype=dtype)})
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "unique.parquet"
+                frame.write_parquet(path)
+                for source in (frame.lazy(), pl.scan_parquet(path)):
+                    for stable in (False, True):
+                        query = source.select(pl.col("x").unique(maintain_order=stable).alias("v"))
+                        self.equal(query if stable else query.sort("v"))
+                        self.equal(source.head(0).select(pl.col("x").unique().alias("v")))
+        source = pl.DataFrame({"x": [1, 2, 2], "y": [1, 2, 3]}).lazy()
+        with patch.object(ibex_pyarrow, "bind_table") as bind, patch.object(ibex_pyarrow, "execute_pipeline") as execute:
+            for query in (source.select(pl.col("x").unique(), pl.col("y")),
+                          source.group_by("y").agg(pl.col("x").unique())):
+                with self.assertRaises(NotImplementedError):
+                    self.engine.prepare(query)
+            bind.assert_not_called()
+            execute.assert_not_called()
+
     def test_conditional_expressions_preserve_types_and_null_predicates(self):
         frame = pl.DataFrame({"x": [1., None, -2., float("nan")], "p": [True, False, None, True],
                               "s": ["a", "b", None, "d"]}).lazy()

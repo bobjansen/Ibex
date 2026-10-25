@@ -168,6 +168,11 @@ eight-thread warm median to 191 ms versus streaming Polars' 179 ms. A paired
 executor comparison measures 296 → 191 ms with membership already fixed;
 at one thread it measures 1,259 → 1,208 ms (Polars: 1,165 ms). The report
 retains the earlier diagnostics, complete results and first-use measurements.
+The eight-query executor sweep improves seven queries: Q18 drops from 1,028
+to 438 ms at eight threads, Q3 from 524 to 401 ms, and Q4 from 302 to 258 ms.
+Q1 is a repeatable 3–5% regression. At one thread Q6 slows by 4% and Q18 by
+41%; disabling scan streaming removes Q18's regression. See the linked report
+for all samples and the fresh-process comparison.
 
 The optional conformance runner needs Polars 2.0 and the upstream benchmark's
 Python dependencies, checkout and generated data. It invokes the original

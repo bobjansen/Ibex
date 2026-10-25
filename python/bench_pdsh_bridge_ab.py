@@ -82,6 +82,9 @@ def main():
         'native_worktree_patch': subprocess.check_output(['git', 'diff', 'HEAD', '--', 'src', 'include'], cwd=root, text=True),
         'upstream_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=args.pdsh_root, text=True).strip(),
         'ibex_cores': os.environ.get('IBEX_CORES'), 'affinity': sorted(os.sched_getaffinity(0)),
+        'ibex_stream_scan': os.environ.get('IBEX_STREAM_SCAN'),
+        'ibex_decode_threads': os.environ.get('IBEX_DECODE_THREADS'),
+        'ibex_join_probe': os.environ.get('IBEX_JOIN_PROBE'),
         'cpu_frequency_khz': {n: Path('/sys/devices/system/cpu/cpu0/cpufreq', n).read_text().strip()
                               for n in ('scaling_min_freq', 'scaling_max_freq')},
         'data': [{'path': str(p), 'bytes': p.stat().st_size, 'mtime_ns': p.stat().st_mtime_ns} for p in paths],

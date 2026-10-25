@@ -344,13 +344,46 @@ collections of **1,359 → 536 ms**, versus **542 ms** for streaming Polars.
 File caches remain warm. The general sweep's first-per-query samples follow
 other queries in the same processes and must not be called fresh-process times.
 
+Warm medians in milliseconds at one thread, using the same method:
+
+| Query | Old executor | Shared executor | Paired change | Polars streaming |
+|---|---:|---:|---:|---:|
+| Q1 | 3,856 | 3,936 | +1.7% | 4,065 |
+| Q2 | 651 | 577 | -11.3% | 256 |
+| Q3 | 2,939 | 2,464 | -15.8% | 2,398 |
+| Q4 | 1,412 | 1,404 | -0.5% | 1,189 |
+| Q5 | 3,223 | 2,966 | -7.8% | 2,788 |
+| Q6 | 1,448 | 1,510 | +4.3% | 1,484 |
+| Q12 | 1,263 | 1,204 | -4.5% | 1,161 |
+| Q18 | 2,656 | 3,728 | +40.7% | 3,363 |
+
+The single-thread result is mixed: Q1 slows by 1.7%, Q6 by 4.3%, and
+Q18 by 40.7% (all six pairs lose for each). Q4 is effectively flat.
+Every timed output matches the in-memory Polars reference at both budgets.
+The thread configurations ran sequentially with CPUs pinned and no overlapping
+compilation or benchmarks. Ordinary desktop applications remained running.
+
+A focused Q18 check changes only `IBEX_STREAM_SCAN=0`. At one thread it
+measures **2,622 → 2,327 ms**, with the shared executor winning all six pairs
+(median paired improvement 11.1%); streaming Polars stays at 3,359 ms.
+Deferred probe registration and the shared logical planner remain enabled.
+Disabling scan streaming removes the regression, pointing to single-thread
+streaming admission as the next issue rather than a general planner regression.
+No engine policy has been changed in response to these measurements.
+A fresh-process single-thread check also loses: 3,713 → 4,225 ms, versus
+3,433 ms for streaming Polars. These are single observations per route,
+with warm files and the first collection timed before any reference query.
+
 The [paired runner](bench_pdsh_bridge_ab.py) accepts saved extension directories
 through `--before-dir` and `--after-dir`. Evidence retains all samples, bridge
 hashes, identical generated sources, dataset metadata and query hashes:
 
 - [Eight-thread sweep](pdsh-performance-results/pdsh-bound-streaming-eight.json)
+- [One-thread sweep](pdsh-performance-results/pdsh-bound-streaming-one.json)
 - [Twelve-pair Q1 repeat](pdsh-performance-results/pdsh-bound-streaming-q1-repeat-eight.json)
-- [Fresh-process Q18](pdsh-performance-results/pdsh-bound-fresh-q18-eight.json)
+- [Fresh-process Q18, eight threads](pdsh-performance-results/pdsh-bound-fresh-q18-eight.json)
+- [Fresh-process Q18, one thread](pdsh-performance-results/pdsh-bound-fresh-q18-one.json)
+- [Q18 with streaming disabled, one thread](pdsh-performance-results/pdsh-bound-streaming-q18-no-stream-one.json)
 
 ## Measurement method
 

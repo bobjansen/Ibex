@@ -43,25 +43,41 @@ relevant alongside warm throughput.
 
 ## Coverage
 
-The expanded adapter supports **8 of 22 queries: Q1–Q6, Q12 and Q18**.
-Q2, Q3, Q5, Q12 and Q18 are newly supported. All eight pass complete result
-comparisons against both standard Polars and Polars streaming on the unchanged
-SF10 Parquet inputs, at one and eight matched workers. The performance table
-above remains the earlier three-query baseline; the subsequent eight-query
-performance check below publishes the expanded timing results.
+The adapter now supports **16 of 22 queries: Q1–Q10, Q12, Q14 and Q17–Q20**.
+The latest additions are Q7, Q8, Q9, Q10, Q14, Q17, Q19 and Q20. All eight
+additions pass complete result comparisons against both in-memory Polars and
+streaming Polars on unchanged SF10 Parquet inputs, with matched one- and
+eight-thread budgets. The earlier eight queries retain their correctness and
+performance evidence below. New-query timings have not yet been measured.
 
-The remaining 14 queries fail explicitly before native execution. These are
+The remaining six queries fail explicitly before native execution. These are
 first blockers, not exhaustive inventories per query:
 
 | Queries | First translation blocker |
 |---|---|
-| Q7, Q17, Q19, Q20 | Polars visitor cannot expose joins with fused predicates |
-| Q8, Q10, Q14 | Floating decimal rounding (`round`, half-to-even) |
-| Q9 | Fused arithmetic (`fms`) |
 | Q11, Q22 | Inequality joins (`IEJoin`) |
 | Q13, Q16 | Regular-expression operators in string `contains` |
 | Q15 | Reductions broadcast inside a filter |
 | Q21 | Expression-level filtered aggregation (`Filter`) |
+
+Floating rounding now supports 0–15 decimal places, half-to-even and
+half-away-from-zero, nulls, non-finite values and signed zero. It guards native
+Int64 conversion and projects rounded reductions after aggregation, without
+materializing an intermediate query result. Larger precisions remain rejected.
+Fused arithmetic preserves operand order and separate multiply/add rounding.
+A single-expression `unique` projection uses native distinct; grouped list
+results and independently sized projection columns remain rejected.
+
+For the pinned visitor's exact `join with a fused predicate` failure,
+preparation copies the caller's flags and revisits the same logical query with
+Polars predicate pushdown disabled. This exposes ordinary join/filter nodes
+for the native optimizer. Other visitor failures still propagate, cardinality
+validation remains checked, and there is no execution fallback to Polars.
+The original caller flags and prepared-plan cache keys remain unchanged.
+
+[Full SF10 checks and coverage](pdsh-performance-results/expanded-16-checks.json)
+retain complete-result check outcomes, generated sources, query hashes and
+mutation evidence. The Python suite passes 118 tests and 692 subtests.
 
 The new translations cover compatible string representations, literal
 membership (including null policies), conditional expressions and typed null

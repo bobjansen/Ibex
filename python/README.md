@@ -148,6 +148,8 @@ remain unsupported. Every joined pipeline executes in one native call.
 
 For the full 22-query adapter coverage check and current scale-10 timings against
 both Polars executors, see [PDS-H engine performance](pdsh-performance.md).
+Its comparison-policy follow-up reduces default-thread Q6 from 8.20 s to 0.69 s
+while preserving Polars' NaN/null semantics.
 
 The optional conformance runner needs Polars 2.0 and the upstream benchmark's
 Python dependencies, checkout and generated data. It invokes the original

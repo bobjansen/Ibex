@@ -49,6 +49,10 @@ def main():
         'upstream_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=args.pdsh_root, text=True).strip(),
         'bridge_sha256': hashlib.sha256(bridge.read_bytes()).hexdigest(),
         'bridge': str(bridge), 'polars_version': pl.__version__,
+        'python_source_sha256': {
+            str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in (root / 'python/ibex_polars/_adapter.py', root / 'python/ibex_polars/_engine.py',
+                         root / 'python/ibex/_lower.py', Path(__file__).resolve())},
         'native_worktree_patch': subprocess.check_output(
             ['git', 'diff', 'HEAD', '--', 'src', 'include'], cwd=root, text=True),
         'ibex_cores': os.environ.get('IBEX_CORES'), 'polars_threads': pl.thread_pool_size(),
@@ -63,6 +67,9 @@ def main():
         'cpu_frequency_khz': {name: Path('/sys/devices/system/cpu/cpu0/cpufreq', name).read_text().strip()
                               for name in ('scaling_min_freq', 'scaling_max_freq')},
         'ibex_decode_threads': os.environ.get('IBEX_DECODE_THREADS'),
+        'ibex_stream_scan': os.environ.get('IBEX_STREAM_SCAN'),
+        'ibex_join_probe': os.environ.get('IBEX_JOIN_PROBE'),
+        'cpu_timing': 'process_time_ns over collection; sums all threads; excludes correctness checks',
         'queries': {},
     }
     def save():
@@ -85,6 +92,7 @@ def main():
             save()
             continue
         entry['prepare_ms'] = (time.perf_counter_ns() - started) / 1e6
+        entry['native_source'] = engine.explain(query)
         calls = {'polars': lambda: query.collect(engine='in-memory'),
                  'polars_streaming': lambda: query.collect(engine='streaming'),
                  'polars_ibex': lambda: query.collect(engine=engine)}
@@ -106,20 +114,30 @@ def main():
                 continue
             for _ in range(2):
                 for call in calls.values():
-                    call()
+                    assert_frame_equal(call(), outputs['polars'], check_row_order=True,
+                                       rel_tol=1e-10, abs_tol=1e-8)
             samples = {route: [] for route in calls}
+            cpu_samples = {route: [] for route in calls}
             previous = None
             for iteration in range(args.iters):
                 # Six permutations balance each route's position in each block.
                 order = list(permutations(calls))[iteration % 6]
                 for route in order:
                     started = time.perf_counter_ns()
+                    cpu_started = time.process_time_ns()
                     current = calls[route]()
+                    cpu_elapsed = (time.process_time_ns() - cpu_started) / 1e6
                     elapsed = (time.perf_counter_ns() - started) / 1e6
                     previous = current
+                    assert_frame_equal(current, outputs['polars'], check_row_order=True,
+                                       rel_tol=1e-10, abs_tol=1e-8)
                     samples[route].append(elapsed)
+                    cpu_samples[route].append(cpu_elapsed)
+                print(name, f'round {iteration + 1}/{args.iters}', flush=True)
             entry.update(status='passed', samples_ms=samples,
-                         median_ms={route: statistics.median(values) for route, values in samples.items()})
+                         median_ms={route: statistics.median(values) for route, values in samples.items()},
+                         cpu_samples_ms=cpu_samples,
+                         median_cpu_ms={route: statistics.median(values) for route, values in cpu_samples.items()})
             print(name, json.dumps(entry['median_ms']), flush=True)
         except Exception as exc:
             entry.update(status='failed', error=f'{type(exc).__name__}: {exc}')

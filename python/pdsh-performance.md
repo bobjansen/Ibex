@@ -47,8 +47,8 @@ The expanded adapter supports **8 of 22 queries: Q1–Q6, Q12 and Q18**.
 Q2, Q3, Q5, Q12 and Q18 are newly supported. All eight pass complete result
 comparisons against both standard Polars and Polars streaming on the unchanged
 SF10 Parquet inputs, at one and eight matched workers. The performance table
-above remains the earlier three-query baseline; this coverage pass does not
-publish new warm timing medians.
+above remains the earlier three-query baseline; the subsequent eight-query
+performance check below publishes the expanded timing results.
 
 The remaining 14 queries fail explicitly before native execution. These are
 first blockers, not exhaustive inventories per query:
@@ -124,6 +124,31 @@ Warm medians in milliseconds, eight threads:
 | Q12 | 203 | 173 | 2,528 |
 | Q18 | 1,474 | 540 | 1,022 |
 
+Warm medians in milliseconds, one thread:
+
+| Query | Polars in-memory | Polars streaming | Polars–Ibex |
+|---|---:|---:|---:|
+| Q1 | 5,458 | 4,033 | 3,995 |
+| Q2 | 315 | 252 | 659 |
+| Q3 | 3,117 | 2,372 | 2,940 |
+| Q4 | 1,890 | 1,184 | 1,430 |
+| Q5 | 3,949 | 2,768 | 3,265 |
+| Q6 | 1,495 | 1,477 | 1,447 |
+| Q12 | 1,374 | 1,154 | 3,464 |
+| Q18 | 6,386 | 3,306 | 2,705 |
+
+Q18 illustrates the importance of process warmth. At one thread the warm native
+median beats streaming Polars (2,705 vs 3,306 ms), but fresh-process first
+collections reverse that comparison (3,704 vs 3,374 ms). These separate workers
+each execute Q18 as their first query, with preparation outside timing and a
+warm file cache. Complete output values and dtypes match exactly across all
+three routes in this check. Each first-use value is one observation:
+
+| Threads | Polars in-memory | Polars streaming | Polars–Ibex |
+|---|---:|---:|---:|
+| One | 6,293 | 3,374 | 3,704 |
+| Eight | 1,466 | 530 | 1,364 |
+
 Q12 is the clear outlier, about 14.6× slower than streaming Polars. Its second
 profiled collection took 3,063 ms, of which the serial filter reported 2,819 ms;
 the inner join reported about 27 ms of build/next self time. Pool work plus
@@ -136,14 +161,18 @@ nonempty, null-free literal membership with its default null policy. Returning
 the existing OR-of-equalities branch directly removes an unnecessary surrounding
 null-handling case; equality already propagates the null. Both complete outputs
 match Polars. Over six alternating pairs, Q12 falls from **2,544 to 378 ms**.
-This restores scan filtering and demonstrates the importance of the expression
-shape. It is a diagnostic, not a shipped optimization; the main table measures
+A separate profile confirms that the diagnostic performs selected-column
+decoding, while the current plan retains the expensive standalone filter. This
+demonstrates the importance of the expression shape. It is a diagnostic, not a shipped optimization; the main table measures
 the committed adapter. Empty lists and alternate null policies require their
 existing handling. The diagnostic JSON retains both generated native sources,
 all samples and the driver used.
 
+- [One-thread timing samples](pdsh-performance-results/sf10-expanded-performance-single.json)
 - [Eight-thread timing samples](pdsh-performance-results/sf10-expanded-performance-eight.json)
+- [Q18 fresh-process collections](pdsh-performance-results/q18-fresh-process.json)
 - [Q12 operator profiles](pdsh-performance-results/q12-profile-eight.txt)
+- [Q12 diagnostic operator profiles](pdsh-performance-results/q12-membership-profile-eight.txt)
 - [Q12 membership diagnostic](pdsh-performance-results/q12-membership-diagnostic-eight.json)
 
 ## Measurement method

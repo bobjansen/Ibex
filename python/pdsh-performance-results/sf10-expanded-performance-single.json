@@ -1,0 +1,412 @@
+{
+  "git_head": "302b30da1f147d569e0bda6b51f6a219eaa82d4b",
+  "upstream_head": "401908a307f133a2dffbe3f5e0e0fb2b50ea310b",
+  "bridge_sha256": "468f4d1940a56813a92c079e2ed16afcdea3c87051bc6318cbd288218f453153",
+  "bridge": "/home/brj/ibex/build-release/python/ibex_pyarrow.cpython-314-x86_64-linux-gnu.so",
+  "polars_version": "2.0.0",
+  "native_worktree_patch": "diff --git a/src/runtime/paired_aggregate.cpp b/src/runtime/paired_aggregate.cpp\nindex 58d23f6c..684689cc 100644\n--- a/src/runtime/paired_aggregate.cpp\n+++ b/src/runtime/paired_aggregate.cpp\n@@ -1,16 +1,25 @@\n // SPDX-License-Identifier: AGPL-3.0-only\n // Copyright (C) 2026 Bob Jansen\n \n+#include <ibex/core/column.hpp>\n+#include <ibex/ir/node.hpp>\n+#include <ibex/runtime/interpreter.hpp>\n+#include <ibex/runtime/worker_pool.hpp>\n+\n #include <algorithm>\n #include <array>\n #include <cmath>\n+#include <cstddef>\n #include <cstdint>\n #include <iterator>\n #include <memory>\n #include <optional>\n+#include <utility>\n+#include <variant>\n #include <vector>\n \n #include \"interpreter_internal.hpp\"\n+#include \"welford.hpp\"\n \n namespace ibex::runtime {\n namespace {\n@@ -86,8 +95,8 @@ auto pair_moment(const Column<X>& xs, const Column<Y>& ys, const ValidityBitmap*\n     // then operate on small residuals, even for 1e12-offset inputs. Covariance\n     // and correlation are translation-invariant; no rounded absolute mean is\n     // needed. Do not use sum(x*x)-sum(x)^2/n, which loses small spreads.\n-    const double origin_x = static_cast<double>(xs[first]);\n-    const double origin_y = static_cast<double>(ys[first]);\n+    const auto origin_x = static_cast<double>(xs[first]);\n+    const auto origin_y = static_cast<double>(ys[first]);\n     const std::size_t blocks = (rows + kPairBlockRows - 1) / kPairBlockRows;\n     std::vector<CoMoment> partial(blocks);\n     const auto reduce = [&](std::size_t block) {\n@@ -155,7 +164,7 @@ auto global_paired_aggregate(const Table& input, const std::vector<ir::AggSpec>&\n         auto pair =\n             std::ranges::find_if(pairs, [&](const Pair& p) { return p.x == x && p.y == y; });\n         if (pair == pairs.end()) {\n-            pairs.push_back({x, y, pair_moment(*x, *y, exec)});\n+            pairs.push_back({.x = x, .y = y, .moment = pair_moment(*x, *y, exec)});\n             pair = std::prev(pairs.end());\n         }\n         Column<double> value;\ndiff --git a/src/runtime/semi_anti_join.cpp b/src/runtime/semi_anti_join.cpp\nindex 65b22d0c..49efa9e4 100644\n--- a/src/runtime/semi_anti_join.cpp\n+++ b/src/runtime/semi_anti_join.cpp\n@@ -14,6 +14,7 @@\n #include <ibex/core/decimal.hpp>\n #include <ibex/core/time.hpp>\n #include <ibex/ir/node.hpp>\n+#include <ibex/ir/schema.hpp>\n #include <ibex/runtime/interpreter.hpp>\n #include <ibex/runtime/interrupt.hpp>\n #include <ibex/runtime/operator.hpp>\n",
+  "ibex_cores": "1",
+  "polars_threads": 1,
+  "affinity": [
+    2
+  ],
+  "data": [
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/customer.parquet",
+      "bytes": 81366456,
+      "mtime_ns": 1792828808266811953
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/lineitem.parquet",
+      "bytes": 1801546483,
+      "mtime_ns": 1792828812385804504
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/nation.parquet",
+      "bytes": 3083,
+      "mtime_ns": 1792828814559800573
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/orders.parquet",
+      "bytes": 391488464,
+      "mtime_ns": 1792828815334799172
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/part.parquet",
+      "bytes": 41388677,
+      "mtime_ns": 1792828815922798108
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/partsupp.parquet",
+      "bytes": 295923709,
+      "mtime_ns": 1792828816386797269
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/region.parquet",
+      "bytes": 1827,
+      "mtime_ns": 1792828816660796774
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/supplier.parquet",
+      "bytes": 5208557,
+      "mtime_ns": 1792828816700796702
+    }
+  ],
+  "iterations": 6,
+  "check_only": false,
+  "query_numbers": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    12,
+    18
+  ],
+  "method": "Parquet collection; prepared translation; two warmups after first collection; alternating route order; previous-result destruction excluded; no result caching",
+  "correctness": "all rows, order and dtypes; rel_tol=1e-10 abs_tol=1e-8; both Polars executors compared",
+  "cpu_frequency_khz": {
+    "scaling_min_freq": "3200000",
+    "scaling_max_freq": "3200000"
+  },
+  "ibex_decode_threads": null,
+  "queries": {
+    "q01": {
+      "upstream_source_sha256": "2cc9026fec6e49373f866bb4b44f901f7811eb0116a1d55b637a3023c88e7bed",
+      "prepare_ms": 142.67074,
+      "first_collect_ms": {
+        "polars": 5555.577581,
+        "polars_streaming": 4390.945026,
+        "polars_ibex": 5249.801028
+      },
+      "output_rows": 4,
+      "status": "passed",
+      "samples_ms": {
+        "polars": [
+          5465.413919,
+          5450.251806,
+          5449.240082,
+          5486.064827,
+          5475.375965,
+          5409.837058
+        ],
+        "polars_streaming": [
+          4204.298759,
+          4033.377759,
+          3991.245022,
+          4032.060882,
+          4289.401524,
+          4029.784172
+        ],
+        "polars_ibex": [
+          3836.059913,
+          4147.615076,
+          4149.702194,
+          3840.111904,
+          4159.506198,
+          3842.125713
+        ]
+      },
+      "median_ms": {
+        "polars": 5457.8328624999995,
+        "polars_streaming": 4032.7193205000003,
+        "polars_ibex": 3994.8703944999997
+      }
+    },
+    "q02": {
+      "upstream_source_sha256": "4e2f637e2c077b98fb55529fb9c6c66ad0061108c3c8f1089f81a1aa923cd020",
+      "prepare_ms": 24.659539,
+      "first_collect_ms": {
+        "polars": 273.493499,
+        "polars_streaming": 387.459638,
+        "polars_ibex": 791.721066
+      },
+      "output_rows": 100,
+      "status": "passed",
+      "samples_ms": {
+        "polars": [
+          317.397402,
+          302.860074,
+          315.178098,
+          315.038991,
+          305.659549,
+          316.827566
+        ],
+        "polars_streaming": [
+          247.088502,
+          253.390299,
+          252.044516,
+          252.606415,
+          251.619547,
+          251.652742
+        ],
+        "polars_ibex": [
+          661.331059,
+          658.368019,
+          660.818553,
+          651.077345,
+          658.882791,
+          656.60366
+        ]
+      },
+      "median_ms": {
+        "polars": 315.1085445,
+        "polars_streaming": 251.848629,
+        "polars_ibex": 658.625405
+      }
+    },
+    "q03": {
+      "upstream_source_sha256": "92672a95b48a8eb675eba6ad600a59402d01a2a3d203a1f67f952cdedc2de8b1",
+      "prepare_ms": 28.026014,
+      "first_collect_ms": {
+        "polars": 3082.154697,
+        "polars_streaming": 2422.960625,
+        "polars_ibex": 2897.942605
+      },
+      "output_rows": 10,
+      "status": "passed",
+      "samples_ms": {
+        "polars": [
+          3121.99285,
+          3119.735434,
+          3099.358674,
+          3114.625476,
+          3128.307472,
+          3096.679478
+        ],
+        "polars_streaming": [
+          2430.068194,
+          2374.124451,
+          2366.899252,
+          2365.63427,
+          2406.209684,
+          2369.648994
+        ],
+        "polars_ibex": [
+          2919.257514,
+          2984.159424,
+          2966.749871,
+          2898.736854,
+          2960.733706,
+          2892.57357
+        ]
+      },
+      "median_ms": {
+        "polars": 3117.180455,
+        "polars_streaming": 2371.8867225000004,
+        "polars_ibex": 2939.99561
+      }
+    },
+    "q04": {
+      "upstream_source_sha256": "0f08b2d3aa354c692005e770cbeb6fe03687486ce77cda245b6790e1808d1a6d",
+      "prepare_ms": 23.31376,
+      "first_collect_ms": {
+        "polars": 1787.415015,
+        "polars_streaming": 1169.836204,
+        "polars_ibex": 1407.652921
+      },
+      "output_rows": 5,
+      "status": "passed",
+      "samples_ms": {
+        "polars": [
+          1885.550015,
+          1890.514101,
+          1894.436246,
+          1888.820374,
+          1905.241792,
+          1876.08054
+        ],
+        "polars_streaming": [
+          1180.144326,
+          1196.271322,
+          1165.58373,
+          1184.173676,
+          1183.178048,
+          1184.043492
+        ],
+        "polars_ibex": [
+          1412.694635,
+          1455.31809,
+          1444.82943,
+          1414.335794,
+          1455.282788,
+          1414.180665
+        ]
+      },
+      "median_ms": {
+        "polars": 1889.6672374999998,
+        "polars_streaming": 1183.61077,
+        "polars_ibex": 1429.5826120000002
+      }
+    },
+    "q05": {
+      "upstream_source_sha256": "06e9a007652f9cdbe9793faea756865ef3f8a2b5f2c071ee3f452f3620d74700",
+      "prepare_ms": 38.936523,
+      "first_collect_ms": {
+        "polars": 3976.500994,
+        "polars_streaming": 2921.412811,
+        "polars_ibex": 3193.078267
+      },
+      "output_rows": 5,
+      "status": "passed",
+      "samples_ms": {
+        "polars": [
+          3937.804769,
+          3932.430515,
+          3936.151065,
+          3970.535841,
+          3960.989352,
+          3981.685017
+        ],
+        "polars_streaming": [
+          2903.933112,
+          2765.73097,
+          2768.076814,
+          2767.775387,
+          2903.569104,
+          2743.516339
+        ],
+        "polars_ibex": [
+          3186.077292,
+          3341.034006,
+          3343.487369,
+          3190.299287,
+          3340.03597,
+          3190.654344
+        ]
+      },
+      "median_ms": {
+        "polars": 3949.3970605,
+        "polars_streaming": 2767.9261005,
+        "polars_ibex": 3265.3451569999997
+      }
+    },
+    "q06": {
+      "upstream_source_sha256": "5a35b2610a4cc4b3feccafcec8bde0201880d2f1e9477dd793017d19d405543b",
+      "prepare_ms": 7.637134,
+      "first_collect_ms": {
+        "polars": 1612.159607,
+        "polars_streaming": 1481.798251,
+        "polars_ibex": 1445.137294
+      },
+      "output_rows": 1,
+      "status": "passed",
+      "samples_ms": {
+        "polars": [
+          1495.071739,
+          1495.31633,
+          1492.523789,
+          1493.393303,
+          1495.753752,
+          1496.391787
+        ],
+        "polars_streaming": [
+          1477.216367,
+          1476.001595,
+          1476.861165,
+          1476.770527,
+          1476.938202,
+          1475.473426
+        ],
+        "polars_ibex": [
+          1444.968683,
+          1449.329056,
+          1449.494274,
+          1444.777594,
+          1459.737121,
+          1445.173245
+        ]
+      },
+      "median_ms": {
+        "polars": 1495.1940345,
+        "polars_streaming": 1476.815846,
+        "polars_ibex": 1447.2511505
+      }
+    },
+    "q12": {
+      "upstream_source_sha256": "5d42a263b1b3f2ef89f8799a85b57aeb8575fcb2b1b7e0311767b86a3731a40b",
+      "prepare_ms": 40.135619,
+      "first_collect_ms": {
+        "polars": 1365.128302,
+        "polars_streaming": 1182.14676,
+        "polars_ibex": 3530.462817
+      },
+      "output_rows": 2,
+      "status": "passed",
+      "samples_ms": {
+        "polars": [
+          1378.145479,
+          1375.065458,
+          1368.094748,
+          1372.855107,
+          1368.138512,
+          1374.493354
+        ],
+        "polars_streaming": [
+          1178.41145,
+          1152.951849,
+          1150.941362,
+          1153.91264,
+          1182.263531,
+          1153.779978
+        ],
+        "polars_ibex": [
+          3453.236278,
+          3477.629307,
+          3476.334149,
+          3453.31388,
+          3475.178526,
+          3445.228404
+        ]
+      },
+      "median_ms": {
+        "polars": 1373.6742305,
+        "polars_streaming": 1153.846309,
+        "polars_ibex": 3464.246203
+      }
+    },
+    "q18": {
+      "upstream_source_sha256": "94323643fcee16e888e700ed427fec857c60a3aa15a1a680cd04c90a2b8b2e23",
+      "prepare_ms": 66.057102,
+      "first_collect_ms": {
+        "polars": 6246.910478,
+        "polars_streaming": 3397.584982,
+        "polars_ibex": 2645.517664
+      },
+      "output_rows": 100,
+      "status": "passed",
+      "samples_ms": {
+        "polars": [
+          6354.387152,
+          6372.017512,
+          6384.284863,
+          6435.377016,
+          6395.142982,
+          6388.014054
+        ],
+        "polars_streaming": [
+          3332.464986,
+          3293.271292,
+          3281.28059,
+          3300.722353,
+          3390.462558,
+          3311.98369
+        ],
+        "polars_ibex": [
+          2640.374845,
+          2755.954626,
+          2759.646163,
+          2654.067658,
+          2758.622349,
+          2643.475497
+        ]
+      },
+      "median_ms": {
+        "polars": 6386.1494585,
+        "polars_streaming": 3306.3530215,
+        "polars_ibex": 2705.0111420000003
+      }
+    }
+  }
+}

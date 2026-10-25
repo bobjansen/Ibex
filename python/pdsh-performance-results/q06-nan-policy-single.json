@@ -1,0 +1,86 @@
+{
+  "git_head": "54a9c34796032fdddb2c35b44916d6f5b4f2c721",
+  "lineitem": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/lineitem.parquet",
+  "input_bytes": 1801546483,
+  "ibex_cores": "1",
+  "polars_max_threads": "1",
+  "affinity": [
+    2
+  ],
+  "workers": {
+    "before": {
+      "sha256": {
+        "bridge": "b22add761bb5cd6dacb8613fa14c7cebc89b9bd19b3a5a7600c96f9b4d46f16e",
+        "lowerer": "8081e18b09688c26431ba56df94f3b77a77968010a11f29c63fb7a518c9bdb83",
+        "query": "5a35b2610a4cc4b3feccafcec8bde0201880d2f1e9477dd793017d19d405543b"
+      },
+      "polars_version": "2.0.0",
+      "polars_threads": 1,
+      "source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\nparquet::read(^_ibex_scalar_0)[filter ((((case { is_null(`l_discount`) || is_null(^_ibex_scalar_1) => NULL, else => ((`l_discount` >= ^_ibex_scalar_1) || is_nan(`l_discount`)) } && case { is_null(`l_discount`) || is_null(^_ibex_scalar_2) => NULL, else => ((`l_discount` <= ^_ibex_scalar_2) || is_nan(^_ibex_scalar_2)) }) && (`l_quantity` < ^_ibex_scalar_3)) && ((`l_shipdate` >= ^_ibex_scalar_4) && (`l_shipdate` < ^_ibex_scalar_5))))][select { `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount`, `l_quantity` = `l_quantity`, `l_shipdate` = `l_shipdate` }][select { `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount` }][update { `revenue` = (`l_extendedprice` * `l_discount`) }][select { `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount`, `revenue` = `revenue` }][select { `revenue` = `revenue` }][select { `revenue` = coalesce(sum(`revenue`), ^_ibex_scalar_6) }];",
+      "first_collect_ms": {
+        "ibex": 10699.449311,
+        "polars": 1476.791275
+      },
+      "result": {
+        "revenue": [
+          1230113636.0101016
+        ]
+      }
+    },
+    "after": {
+      "sha256": {
+        "bridge": "3bb1b2b8be7db7817bf8f014909ce595c74284c8f8d48d16d7528ae1a325a475",
+        "lowerer": "c11fe4d4494a0b349a16c1fe76146c1ad3d29f4307af1f5667f49263eda2e4a5",
+        "query": "5a35b2610a4cc4b3feccafcec8bde0201880d2f1e9477dd793017d19d405543b"
+      },
+      "polars_version": "2.0.0",
+      "polars_threads": 1,
+      "source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\nparquet::read(^_ibex_scalar_0)[filter ((((__ibex_nan_high_ge(`l_discount`, ^_ibex_scalar_1) && __ibex_nan_high_le(`l_discount`, ^_ibex_scalar_2)) && (`l_quantity` < ^_ibex_scalar_3)) && ((`l_shipdate` >= ^_ibex_scalar_4) && (`l_shipdate` < ^_ibex_scalar_5))))][select { `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount`, `l_quantity` = `l_quantity`, `l_shipdate` = `l_shipdate` }][select { `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount` }][update { `revenue` = (`l_extendedprice` * `l_discount`) }][select { `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount`, `revenue` = `revenue` }][select { `revenue` = `revenue` }][select { `revenue` = coalesce(sum(`revenue`), ^_ibex_scalar_6) }];",
+      "first_collect_ms": {
+        "ibex": 2871.02529,
+        "polars": 1473.314082
+      },
+      "result": {
+        "revenue": [
+          1230113636.0101016
+        ]
+      }
+    }
+  },
+  "method": "two warmups after correctness collections; paired alternating route order; prepared Parquet collection including result conversion; previous-result destruction excluded",
+  "samples_ms": {
+    "before": [
+      9402.075385,
+      9402.376526,
+      9405.207366,
+      9412.201748,
+      9394.464679,
+      9405.311638
+    ],
+    "after": [
+      1980.941547,
+      1995.701784,
+      1984.210948,
+      1984.418839,
+      1990.880529,
+      1981.959169
+    ],
+    "polars": [
+      1470.253891,
+      1472.834479,
+      1472.6093,
+      1473.958397,
+      1474.083266,
+      1472.097672
+    ]
+  },
+  "median_ms": {
+    "before": 9403.791946000001,
+    "after": 1984.3148935,
+    "polars": 1472.7218895
+  },
+  "native_worktree_patch": "diff --git a/src/runtime/paired_aggregate.cpp b/src/runtime/paired_aggregate.cpp\nindex 58d23f6c..684689cc 100644\n--- a/src/runtime/paired_aggregate.cpp\n+++ b/src/runtime/paired_aggregate.cpp\n@@ -1,16 +1,25 @@\n // SPDX-License-Identifier: AGPL-3.0-only\n // Copyright (C) 2026 Bob Jansen\n \n+#include <ibex/core/column.hpp>\n+#include <ibex/ir/node.hpp>\n+#include <ibex/runtime/interpreter.hpp>\n+#include <ibex/runtime/worker_pool.hpp>\n+\n #include <algorithm>\n #include <array>\n #include <cmath>\n+#include <cstddef>\n #include <cstdint>\n #include <iterator>\n #include <memory>\n #include <optional>\n+#include <utility>\n+#include <variant>\n #include <vector>\n \n #include \"interpreter_internal.hpp\"\n+#include \"welford.hpp\"\n \n namespace ibex::runtime {\n namespace {\n@@ -86,8 +95,8 @@ auto pair_moment(const Column<X>& xs, const Column<Y>& ys, const ValidityBitmap*\n     // then operate on small residuals, even for 1e12-offset inputs. Covariance\n     // and correlation are translation-invariant; no rounded absolute mean is\n     // needed. Do not use sum(x*x)-sum(x)^2/n, which loses small spreads.\n-    const double origin_x = static_cast<double>(xs[first]);\n-    const double origin_y = static_cast<double>(ys[first]);\n+    const auto origin_x = static_cast<double>(xs[first]);\n+    const auto origin_y = static_cast<double>(ys[first]);\n     const std::size_t blocks = (rows + kPairBlockRows - 1) / kPairBlockRows;\n     std::vector<CoMoment> partial(blocks);\n     const auto reduce = [&](std::size_t block) {\n@@ -155,7 +164,7 @@ auto global_paired_aggregate(const Table& input, const std::vector<ir::AggSpec>&\n         auto pair =\n             std::ranges::find_if(pairs, [&](const Pair& p) { return p.x == x && p.y == y; });\n         if (pair == pairs.end()) {\n-            pairs.push_back({x, y, pair_moment(*x, *y, exec)});\n+            pairs.push_back({.x = x, .y = y, .moment = pair_moment(*x, *y, exec)});\n             pair = std::prev(pairs.end());\n         }\n         Column<double> value;\ndiff --git a/src/runtime/semi_anti_join.cpp b/src/runtime/semi_anti_join.cpp\nindex 65b22d0c..49efa9e4 100644\n--- a/src/runtime/semi_anti_join.cpp\n+++ b/src/runtime/semi_anti_join.cpp\n@@ -14,6 +14,7 @@\n #include <ibex/core/decimal.hpp>\n #include <ibex/core/time.hpp>\n #include <ibex/ir/node.hpp>\n+#include <ibex/ir/schema.hpp>\n #include <ibex/runtime/interpreter.hpp>\n #include <ibex/runtime/interrupt.hpp>\n #include <ibex/runtime/operator.hpp>\n",
+  "cpu_frequency_note": "i7-13700, performance governor, configured 3.2 GHz min/max",
+  "exact_before_after_result_match": true,
+  "iterations": 6
+}

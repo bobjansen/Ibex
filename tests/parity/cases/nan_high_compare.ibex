@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+// Internal frontend entry points must preserve their policy in generated C++.
+let t = Table { x = [-1.0, 0.0, 1.0, NULL] };
+t[update a = sqrt(x)][update {
+    eq = __ibex_nan_high_eq(a, a),
+    ne = __ibex_nan_high_ne(a, a),
+    lt = __ibex_nan_high_lt(a, 0.0),
+    le = __ibex_nan_high_le(a, 0.0),
+    gt = __ibex_nan_high_gt(a, 0.0),
+    ge = __ibex_nan_high_ge(a, 0.0)
+}][filter __ibex_nan_high_ge(a, 0.0)];

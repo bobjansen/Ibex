@@ -253,7 +253,20 @@ class Adapter:
                 self.expressions[key] = expr
                 return expr
             args = tuple(self.expression(child) for child in value.input)
-            if name == "IsBetween" and len(args) == 3 and len(value.function_data) == 2:
+            if name == "fused" and len(args) == 3 and len(value.function_data) == 2:
+                operation = value.function_data[1]
+                if any(self.visitor.get_dtype(child) not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64)
+                       for child in value.input):
+                    raise NotImplementedError("fused arithmetic requires supported numeric inputs")
+                if operation == "fma":
+                    expr = args[0] * args[1] + args[2]
+                elif operation == "fms":
+                    expr = args[0] * args[1] - args[2]
+                elif operation == "fsm":
+                    expr = args[0] - args[1] * args[2]
+                else:
+                    raise NotImplementedError(f"unsupported fused arithmetic {operation}")
+            elif name == "IsBetween" and len(args) == 3 and len(value.function_data) == 2:
                 types = [self.visitor.get_dtype(child) for child in value.input]
                 if any(is_temporal(dtype) for dtype in types) and len({dtype.base_type() for dtype in types}) != 1:
                     raise NotImplementedError("temporal bounds must have matching kinds")

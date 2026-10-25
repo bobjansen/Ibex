@@ -41,6 +41,10 @@ run after aggregation in the same native plan. Float32 follows the existing
 Float64-intermediate policy. Supported integer rounding is an identity.
 Higher precisions remain explicitly rejected.
 
+Optimizer-generated fused arithmetic (`fma`, `fms`, `fsm`) is translated to
+multiply/add/subtract in its original operand order, preserving separate
+floating-point rounding and the existing narrow-integer wrapping policy.
+
 Column-expression `.len()` includes nulls and returns UInt32; for supported
 row expressions its result equals the frame row count. Polars exposes this
 through the same visitor aggregate as `.count()`, with `include_nulls=True`.

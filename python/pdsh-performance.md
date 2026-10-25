@@ -8,7 +8,8 @@ Polars 2.0.0's in-memory executor, its streaming executor, and `IbexEngine`.
 It does not substitute the native hand-written Ibex PDS-H queries.
 
 The comparison-policy follow-up below reduces default-thread Q6 from 8.20 s to
-0.69 s. The initial suite table is retained as the pre-change baseline.
+0.69 s. The subsequent native planning follow-up below brings eight-thread Q6
+from 747 ms to 219 ms. The initial suite table remains the pre-change baseline.
 
 ## Results (initial baseline)
 
@@ -184,3 +185,88 @@ above:
   --lineitem ../polars-benchmark/data/tables/scale-10.0/lineitem.parquet \
   --out results/q06-policy.json
 ```
+
+
+## Bound constants, range choice, and NaN-aware bounds fusion
+
+The next investigation isolated three native engine issues. Scalar bindings were
+broadcast into columns and missed optimizations that recognized literal IR
+operands. Source filtering chose the first eligible column in predicate order.
+Finally, Polars NaN comparisons declined the blocked bounds kernels.
+
+Three separate commits address these:
+
+- `75935032`: resolve scalar references to typed literals in a local filter copy
+  for each execution, using the current registry and column scope precedence.
+  The reusable plan and its scalar bindings remain independent.
+- `f9664aea`: rank complete scan intervals by the fraction of the source min/max
+  domain they cover. This is a uniform-distribution estimate used only to choose
+  work order; it never determines which rows pass. Missing metadata and ties
+  retain predicate order.
+- `25d1f021`: fuse NaN-high comparisons against numeric bounds. Each absorbed
+  conjunct intersects a separate NaN acceptance flag. A NaN-high lower bound
+  admits NaNs; an IEEE comparison or a NaN-high upper/equality bound excludes
+  them. NaN literals and non-range inequalities retain the generic path.
+
+Paired measurements use the same upstream Q6, SF10 input, CPU settings and
+runner as above, with twelve alternating rounds. Local parallel comparisons
+are capped at eight threads. Each worker checks its complete result against
+Polars; before/after revenue is exactly equal. Both use the same Python adapter.
+
+| Threads | Before ms | After all three ms | Polars streaming ms |
+|---|---:|---:|---:|
+| One | 1,988 | 1,442 | 1,460 |
+| Eight | 747 | 219 | 189 |
+
+At eight threads this is 3.4× faster, reducing the gap to Polars streaming from
+558 ms to 30 ms. Fresh-process first collections, including translation, took
+1,257 ms before and 313 ms after, versus 192 ms for Polars in the target worker.
+Those are single observations on a warm file cache, not warm medians.
+
+The intermediate paired eight-thread runs measured 748 → 393 ms with scalar
+resolution alone and 749 → 264 ms after range selection. The last bounds-fusion
+step brings the final result to 219 ms. These are separate sessions, each
+paired against the original bridge, rather than a simultaneous four-way run.
+
+Validation: 2,371 CTest cases excluding the slow transpilation suite, 61 Python
+tests, strict GCC compilation, and the WebAssembly runtime build passed. A CSV
+plugin rebuilt through `ibex-plugin-build.sh` loaded and returned all 150 iris rows. Four network tests were skipped by
+their existing environment guards. Regression tests cover fresh bindings on a
+reused plan, lexical and column scope, typed nulls, source key-scan reachability,
+metadata/domain changes, full-width integer estimates, both float policies,
+NaNs, infinities, signed zero, reversed comparisons, mixed policies and exact
+selection equality at one, two, three and eight workers. Deliberately corrupting
+scalar resolution, disabling interval ranking, and rejecting NaNs in the fused
+kernel made every newly added test case fail in its corresponding mutation run;
+correct sources and binaries were restored.
+
+- [Scalar-resolution samples](pdsh-performance-results/q06-bound-constants-eight.json)
+- [Range-choice samples](pdsh-performance-results/q06-range-choice-eight.json)
+- [Combined one-thread samples](pdsh-performance-results/q06-native-constants-single.json)
+- [Combined eight-thread samples](pdsh-performance-results/q06-native-constants-eight.json)
+
+
+The native regression check found a separate cost on resident filters. Both
+sizes use twelve paired rounds, five iterations, one worker pinned to CPU 2,
+and the same generated three-column trades fixture (the million-row input
+repeats the 100,000-row fixture ten times outside timing).
+
+| Input rows | Filter | Before ms | After ms | Change |
+|---|---|---:|---:|---:|
+| 100,000 | Simple | 0.1560 | 0.1740 | +11.5% |
+| 100,000 | Arithmetic | 0.1800 | 0.2025 | +12.5% |
+| 1,000,000 | Simple | 1.6930 | 1.7865 | +5.5% |
+| 1,000,000 | Arithmetic | 2.0595 | 2.2120 | +7.4% |
+
+AND/OR filters were classified as noise at both sizes. These simple/arithmetic
+regressions remain recorded: 18–23 microseconds at 100,000 rows and 94–153
+microseconds at one million rows. Separate `perf` samples put most CPU in
+output gathering; its `kernel_filter.cpp.o` is byte-identical between baseline
+and target (SHA256 `b728048115002c73b1db571623d2385962faf7c11849c14b450d549d5ffc97d3`).
+The larger CPU shares are in the unchanged integer gather instantiations,
+whose linked addresses moved. This suggests code layout sensitivity, rather
+than demonstrating additional scalar-resolution work, and is not a resolved
+regression. Q6's measured improvement is reported alongside this limitation.
+
+- [Native filter A/B, 100,000 rows](pdsh-performance-results/native-constants-filter-ab.txt)
+- [Native filter A/B, one million rows](pdsh-performance-results/native-constants-filter-million-ab.txt)

@@ -1,0 +1,130 @@
+{
+  "git_head": "75935032db0c2efb7f51c63b9c6a14e12190552a",
+  "lineitem": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/lineitem.parquet",
+  "input_bytes": 1801546483,
+  "ibex_cores": "8",
+  "polars_max_threads": "8",
+  "affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23
+  ],
+  "workers": {
+    "before": {
+      "sha256": {
+        "bridge": "3bb1b2b8be7db7817bf8f014909ce595c74284c8f8d48d16d7528ae1a325a475",
+        "lowerer": "c11fe4d4494a0b349a16c1fe76146c1ad3d29f4307af1f5667f49263eda2e4a5",
+        "query": "5a35b2610a4cc4b3feccafcec8bde0201880d2f1e9477dd793017d19d405543b"
+      },
+      "polars_version": "2.0.0",
+      "polars_threads": 8,
+      "source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\nparquet::read(^_ibex_scalar_0)[filter ((((__ibex_nan_high_ge(`l_discount`, ^_ibex_scalar_1) && __ibex_nan_high_le(`l_discount`, ^_ibex_scalar_2)) && (`l_quantity` < ^_ibex_scalar_3)) && ((`l_shipdate` >= ^_ibex_scalar_4) && (`l_shipdate` < ^_ibex_scalar_5))))][select { `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount`, `l_quantity` = `l_quantity`, `l_shipdate` = `l_shipdate` }][select { `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount` }][update { `revenue` = (`l_extendedprice` * `l_discount`) }][select { `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount`, `revenue` = `revenue` }][select { `revenue` = `revenue` }][select { `revenue` = coalesce(sum(`revenue`), ^_ibex_scalar_6) }];",
+      "first_collect_ms": {
+        "ibex": 1235.239475,
+        "polars": 192.247691
+      },
+      "result": {
+        "revenue": [
+          1230113636.0101016
+        ]
+      }
+    },
+    "after": {
+      "sha256": {
+        "bridge": "ba58c3d87a5eb77568ff30b7d000b67406cd02010e4c1e43e2b68b9f60fe78c5",
+        "lowerer": "c11fe4d4494a0b349a16c1fe76146c1ad3d29f4307af1f5667f49263eda2e4a5",
+        "query": "5a35b2610a4cc4b3feccafcec8bde0201880d2f1e9477dd793017d19d405543b"
+      },
+      "polars_version": "2.0.0",
+      "polars_threads": 8,
+      "source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\nparquet::read(^_ibex_scalar_0)[filter ((((__ibex_nan_high_ge(`l_discount`, ^_ibex_scalar_1) && __ibex_nan_high_le(`l_discount`, ^_ibex_scalar_2)) && (`l_quantity` < ^_ibex_scalar_3)) && ((`l_shipdate` >= ^_ibex_scalar_4) && (`l_shipdate` < ^_ibex_scalar_5))))][select { `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount`, `l_quantity` = `l_quantity`, `l_shipdate` = `l_shipdate` }][select { `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount` }][update { `revenue` = (`l_extendedprice` * `l_discount`) }][select { `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount`, `revenue` = `revenue` }][select { `revenue` = `revenue` }][select { `revenue` = coalesce(sum(`revenue`), ^_ibex_scalar_6) }];",
+      "first_collect_ms": {
+        "ibex": 374.70146,
+        "polars": 194.86265
+      },
+      "result": {
+        "revenue": [
+          1230113636.0101016
+        ]
+      }
+    }
+  },
+  "iterations": 12,
+  "exact_before_after_result_match": true,
+  "native_worktree_patch": "diff --git a/src/runtime/lazy_table.cpp b/src/runtime/lazy_table.cpp\nindex 486be7dc..c7d54ca9 100644\n--- a/src/runtime/lazy_table.cpp\n+++ b/src/runtime/lazy_table.cpp\n@@ -1593,7 +1593,7 @@ auto LazyTable::static_range_selection(const std::vector<ir::Expr>& conjuncts,\n                                        const SourceUnit* unit, const ExecutionContext& exec,\n                                        const ScalarRegistry* scalars)\n     -> std::expected<std::optional<Selection>, std::string> {\n-    auto range = split_static_range(conjuncts, schema_, scalars);\n+    auto range = split_static_range(conjuncts, schema_, scalars, &stats_);\n     if (!range.has_value() || cache_.contains(range->column)) {\n         return std::optional<Selection>{};  // a cached key is cheaper tested in memory\n     }\ndiff --git a/src/runtime/paired_aggregate.cpp b/src/runtime/paired_aggregate.cpp\nindex 58d23f6c..684689cc 100644\n--- a/src/runtime/paired_aggregate.cpp\n+++ b/src/runtime/paired_aggregate.cpp\n@@ -1,16 +1,25 @@\n // SPDX-License-Identifier: AGPL-3.0-only\n // Copyright (C) 2026 Bob Jansen\n \n+#include <ibex/core/column.hpp>\n+#include <ibex/ir/node.hpp>\n+#include <ibex/runtime/interpreter.hpp>\n+#include <ibex/runtime/worker_pool.hpp>\n+\n #include <algorithm>\n #include <array>\n #include <cmath>\n+#include <cstddef>\n #include <cstdint>\n #include <iterator>\n #include <memory>\n #include <optional>\n+#include <utility>\n+#include <variant>\n #include <vector>\n \n #include \"interpreter_internal.hpp\"\n+#include \"welford.hpp\"\n \n namespace ibex::runtime {\n namespace {\n@@ -86,8 +95,8 @@ auto pair_moment(const Column<X>& xs, const Column<Y>& ys, const ValidityBitmap*\n     // then operate on small residuals, even for 1e12-offset inputs. Covariance\n     // and correlation are translation-invariant; no rounded absolute mean is\n     // needed. Do not use sum(x*x)-sum(x)^2/n, which loses small spreads.\n-    const double origin_x = static_cast<double>(xs[first]);\n-    const double origin_y = static_cast<double>(ys[first]);\n+    const auto origin_x = static_cast<double>(xs[first]);\n+    const auto origin_y = static_cast<double>(ys[first]);\n     const std::size_t blocks = (rows + kPairBlockRows - 1) / kPairBlockRows;\n     std::vector<CoMoment> partial(blocks);\n     const auto reduce = [&](std::size_t block) {\n@@ -155,7 +164,7 @@ auto global_paired_aggregate(const Table& input, const std::vector<ir::AggSpec>&\n         auto pair =\n             std::ranges::find_if(pairs, [&](const Pair& p) { return p.x == x && p.y == y; });\n         if (pair == pairs.end()) {\n-            pairs.push_back({x, y, pair_moment(*x, *y, exec)});\n+            pairs.push_back({.x = x, .y = y, .moment = pair_moment(*x, *y, exec)});\n             pair = std::prev(pairs.end());\n         }\n         Column<double> value;\ndiff --git a/src/runtime/semi_anti_join.cpp b/src/runtime/semi_anti_join.cpp\nindex 65b22d0c..49efa9e4 100644\n--- a/src/runtime/semi_anti_join.cpp\n+++ b/src/runtime/semi_anti_join.cpp\n@@ -14,6 +14,7 @@\n #include <ibex/core/decimal.hpp>\n #include <ibex/core/time.hpp>\n #include <ibex/ir/node.hpp>\n+#include <ibex/ir/schema.hpp>\n #include <ibex/runtime/interpreter.hpp>\n #include <ibex/runtime/interrupt.hpp>\n #include <ibex/runtime/operator.hpp>\ndiff --git a/src/runtime/static_range_filter.cpp b/src/runtime/static_range_filter.cpp\nindex 897807ab..65beaa12 100644\n--- a/src/runtime/static_range_filter.cpp\n+++ b/src/runtime/static_range_filter.cpp\n@@ -14,6 +14,7 @@\n #include <cstdint>\n #include <limits>\n #include <optional>\n+#include <set>\n #include <string>\n #include <variant>\n #include <vector>\n@@ -203,7 +204,8 @@ auto absorb(const Term& term, DynamicScanFilter& filter) -> bool {\n }  // namespace\n \n auto split_static_range(const std::vector<ir::Expr>& conjuncts, const Table& schema,\n-                        const ScalarRegistry* scalars) -> std::optional<StaticRange> {\n+                        const ScalarRegistry* scalars, const SourceColumnStats* stats)\n+    -> std::optional<StaticRange> {\n     std::vector<std::optional<Term>> terms;\n     terms.reserve(conjuncts.size());\n     for (const auto& conjunct : conjuncts) {\n@@ -213,38 +215,70 @@ auto split_static_range(const std::vector<ir::Expr>& conjuncts, const Table& sch\n         terms.push_back(as_term(bound ? *bound : conjunct));\n     }\n \n-    // The first column the reader can answer.\n-    std::optional<std::string> column;\n+    const auto range_for = [&](const std::string& column) -> std::optional<StaticRange> {\n+        StaticRange out;\n+        out.column = column;\n+        bool absorbed_any = false;\n+        for (std::size_t i = 0; i < conjuncts.size(); ++i) {\n+            const auto& term = terms[i];\n+            if (term && term->column == column) {\n+                if (!comparable(schema, *term)) {\n+                    return std::nullopt;\n+                }\n+                if (absorb(*term, out.filter)) {\n+                    absorbed_any = true;\n+                    continue;\n+                }\n+            }\n+            out.rest.push_back(conjuncts[i]);\n+        }\n+        return absorbed_any ? std::optional{std::move(out)} : std::nullopt;\n+    };\n+    const auto pass_fraction = [&](const StaticRange& range) -> long double {\n+        if (range.filter.min && range.filter.max && *range.filter.min > *range.filter.max) {\n+            return 0;\n+        }\n+        if (stats == nullptr) {\n+            return 1;\n+        }\n+        const auto it = stats->find(range.column);\n+        if (it == stats->end() || !it->second.min || !it->second.max ||\n+            *it->second.min > *it->second.max) {\n+            return 1;\n+        }\n+        const auto source_lo = *it->second.min;\n+        const auto source_hi = *it->second.max;\n+        const auto lo = std::max(source_lo, range.filter.min.value_or(source_lo));\n+        const auto hi = std::min(source_hi, range.filter.max.value_or(source_hi));\n+        if (lo > hi) {\n+            return 0;\n+        }\n+        // A uniform estimate is a planning heuristic, never a pruning proof.\n+        // Convert before subtracting so the full Int64 domain cannot overflow.\n+        return (static_cast<long double>(hi) - static_cast<long double>(lo) + 1) /\n+               (static_cast<long double>(source_hi) - static_cast<long double>(source_lo) + 1);\n+    };\n+    std::optional<StaticRange> best;\n+    long double best_fraction = 1;\n+    std::set<std::string> seen;\n     for (const auto& term : terms) {\n-        if (term.has_value() && comparable(schema, *term)) {\n-            column = term->column;\n-            break;\n+        if (!term || !comparable(schema, *term) || !seen.insert(term->column).second) {\n+            continue;\n         }\n-    }\n-    if (!column.has_value()) {\n-        return std::nullopt;\n-    }\n-\n-    StaticRange out;\n-    out.column = *column;\n-    bool absorbed_any = false;\n-    for (std::size_t i = 0; i < conjuncts.size(); ++i) {\n-        const auto& term = terms[i];\n-        if (term.has_value() && term->column == *column) {\n-            if (!comparable(schema, *term)) {\n-                return std::nullopt;\n-            }\n-            if (absorb(*term, out.filter)) {\n-                absorbed_any = true;\n-                continue;\n-            }\n+        auto range = range_for(term->column);\n+        if (stats == nullptr) {\n+            return range;  // preserve the original first-column rule without metadata\n+        }\n+        if (!range) {\n+            continue;\n+        }\n+        const auto fraction = pass_fraction(*range);\n+        if (!best || fraction < best_fraction) {\n+            best_fraction = fraction;\n+            best = std::move(range);\n         }\n-        out.rest.push_back(conjuncts[i]);\n-    }\n-    if (!absorbed_any) {\n-        return std::nullopt;\n     }\n-    return out;\n+    return best;\n }\n \n }  // namespace ibex::runtime\ndiff --git a/src/runtime/static_range_filter.hpp b/src/runtime/static_range_filter.hpp\nindex c382ca2e..30eafa5a 100644\n--- a/src/runtime/static_range_filter.hpp\n+++ b/src/runtime/static_range_filter.hpp\n@@ -5,6 +5,7 @@\n \n #include <ibex/ir/node.hpp>\n #include <ibex/runtime/interpreter.hpp>\n+#include <ibex/runtime/lazy_table.hpp>\n \n #include <optional>\n #include <string>\n@@ -24,9 +25,11 @@ struct StaticRange {\n };\n \n /// Split `conjuncts` into the comparisons of one integer-like column against\n-/// literals (including current scalar bindings) and the rest. The column is the first one with such\n-/// a comparison that the reader can answer; its other comparisons are folded into the same\n-/// interval. nullopt means no such column, and the ordinary filter path stands.\n+/// literals (including current scalar bindings) and the rest. Source min/max\n+/// statistics rank candidate intervals by their estimated surviving fraction.\n+/// Missing statistics and ties preserve predicate order. Other comparisons on\n+/// the chosen column are folded into the same interval. nullopt means no such\n+/// column, and the ordinary filter path stands.\n ///\n /// `schema` types the column, because the reader compares raw int64 bits and so\n /// must agree with what the ordinary filter would do with the same operands: an\n@@ -40,7 +43,8 @@ struct StaticRange {\n /// split declines, so the ordinary path can report the type error rather than\n /// have it hidden by the rows the interval already removed.\n [[nodiscard]] auto split_static_range(const std::vector<ir::Expr>& conjuncts, const Table& schema,\n-                                      const ScalarRegistry* scalars = nullptr)\n+                                      const ScalarRegistry* scalars = nullptr,\n+                                      const SourceColumnStats* stats = nullptr)\n     -> std::optional<StaticRange>;\n \n }  // namespace ibex::runtime\n",
+  "cpu_frequency_khz": {
+    "scaling_min_freq": "3200000",
+    "scaling_max_freq": "3200000"
+  },
+  "method": "two warmups after correctness collections; paired alternating route order; prepared Parquet collection including result conversion; previous-result destruction excluded",
+  "samples_ms": {
+    "before": [
+      747.448655,
+      752.158398,
+      751.390608,
+      747.135095,
+      758.200097,
+      765.326311,
+      758.804962,
+      763.512224,
+      740.251303,
+      742.842312,
+      739.39692,
+      744.938806
+    ],
+    "after": [
+      261.433592,
+      264.962514,
+      261.060559,
+      264.359266,
+      271.17256,
+      271.803696,
+      269.544558,
+      261.491163,
+      265.569662,
+      259.721074,
+      263.637643,
+      258.916406
+    ],
+    "polars": [
+      189.035757,
+      188.125054,
+      194.826235,
+      194.743009,
+      194.749669,
+      194.721062,
+      190.845268,
+      190.026955,
+      188.098779,
+      188.211114,
+      188.725346,
+      189.583042
+    ]
+  },
+  "median_ms": {
+    "before": 749.4196315,
+    "after": 263.9984545,
+    "polars": 189.8049985
+  }
+}

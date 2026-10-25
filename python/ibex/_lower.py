@@ -90,6 +90,8 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             return f"like({render(args[0])}, {render(args[1])})"
         if op == "year":
             return f"year({render(args[0])})"
+        if op == "is_nan":
+            return f"is_nan({render(args[0])})"
         if op == "is_null":
             return f"is_null({render(args[0])})"
         if op == "wrap_integer":
@@ -501,6 +503,10 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
         if op == "like":
             if any(dtype(arg) not in (pa.string(), pa.large_string()) for arg in args):
                 raise TypeError("string matching requires string operands")
+            return pa.bool_()
+        if op == "is_nan":
+            if dtype(args[0]) != pa.float64():
+                raise TypeError("is_nan requires a floating-point operand")
             return pa.bool_()
         if op == "year":
             if dtype(args[0]) != pa.date32():

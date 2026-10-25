@@ -541,15 +541,34 @@ class Adapter:
             elif kind == "GroupBy":
                 if node.apply or any(getattr(node.options, name) is not None for name in ("dynamic", "rolling")):
                     raise NotImplementedError("group UDFs and dynamic/rolling groups are unsupported")
-                keys = []
-                for key in node.keys:
+                keys, representatives = [], []
+                occupied = set(self.visitor.get_schema()) | set(schema)
+                def temporary(role):
+                    name = f"_ibex_group_{node_id}_{role}"
+                    while name in occupied:
+                        name += "_"
+                    occupied.add(name)
+                    return name
+                for index, key in enumerate(node.keys):
                     expr = self.expression(key.node)
                     if expr._op != "col" or expr._name != key.output_name:
                         raise NotImplementedError("computed or renamed grouping keys are not supported yet")
                     if self.visitor.get_dtype(key.node) in (pl.Float32, pl.Float64):
-                        raise NotImplementedError("floating-point grouping keys are not supported yet")
-                    keys.append(expr._name)
-                frame = frame.group_by(*keys, maintain_order=node.maintain_order).agg([self.named(expr) for expr in node.aggs])
+                        flag, normalized = temporary(f"nan_{index}"), temporary(f"value_{index}")
+                        is_nan = Expr("is_nan", (expr,))
+                        frame = frame._append("hstack", (
+                            Expr("case", (is_nan, ibex.lit(True), ibex.lit(False))).alias(flag),
+                            Expr("case", (is_nan, ibex.lit(0.0), expr)).alias(normalized)))
+                        keys.extend((flag, normalized))
+                        # Return an original key (including null) rather than
+                        # exposing the normalized helper values as labels.
+                        representatives.append(Expr("first", (expr,)).alias(expr._name))
+                    else:
+                        keys.append(expr._name)
+                frame = frame.group_by(*keys, maintain_order=node.maintain_order).agg(
+                    representatives + [self.named(expr) for expr in node.aggs])
+                if representatives:
+                    frame = frame.select(list(schema))
                 if node.options.slice is not None:
                     frame = frame.slice(*node.options.slice)
             elif kind == "Sort":

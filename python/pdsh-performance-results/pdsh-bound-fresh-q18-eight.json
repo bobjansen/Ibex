@@ -1,0 +1,111 @@
+{
+  "threads": "8",
+  "affinity": [
+    0,
+    2,
+    4,
+    6,
+    8,
+    10,
+    12,
+    14
+  ],
+  "query": "q18",
+  "method": "Three fresh processes per route, timed first collection; preparation before timing and full comparison against in-memory Polars after timing. Warm file cache. Alternating route order.",
+  "samples": {
+    "before": [
+      {
+        "ms": 1364.196969,
+        "shape": [
+          100,
+          6
+        ],
+        "schema": "Schema({'c_name': String, 'c_custkey': Int64, 'o_orderkey': Int64, 'o_orderdat': Date, 'o_totalprice': Float64, 'col6': Int64})",
+        "bridge_sha256": "468f4d1940a56813a92c079e2ed16afcdea3c87051bc6318cbd288218f453153"
+      },
+      {
+        "ms": 1358.137473,
+        "shape": [
+          100,
+          6
+        ],
+        "schema": "Schema({'c_name': String, 'c_custkey': Int64, 'o_orderkey': Int64, 'o_orderdat': Date, 'o_totalprice': Float64, 'col6': Int64})",
+        "bridge_sha256": "468f4d1940a56813a92c079e2ed16afcdea3c87051bc6318cbd288218f453153"
+      },
+      {
+        "ms": 1358.501543,
+        "shape": [
+          100,
+          6
+        ],
+        "schema": "Schema({'c_name': String, 'c_custkey': Int64, 'o_orderkey': Int64, 'o_orderdat': Date, 'o_totalprice': Float64, 'col6': Int64})",
+        "bridge_sha256": "468f4d1940a56813a92c079e2ed16afcdea3c87051bc6318cbd288218f453153"
+      }
+    ],
+    "after": [
+      {
+        "ms": 536.404753,
+        "shape": [
+          100,
+          6
+        ],
+        "schema": "Schema({'c_name': String, 'c_custkey': Int64, 'o_orderkey': Int64, 'o_orderdat': Date, 'o_totalprice': Float64, 'col6': Int64})",
+        "bridge_sha256": "914154775964611f22acd3b21d160a1a4026e232cdbc1ce139965878c16722d9"
+      },
+      {
+        "ms": 518.080689,
+        "shape": [
+          100,
+          6
+        ],
+        "schema": "Schema({'c_name': String, 'c_custkey': Int64, 'o_orderkey': Int64, 'o_orderdat': Date, 'o_totalprice': Float64, 'col6': Int64})",
+        "bridge_sha256": "914154775964611f22acd3b21d160a1a4026e232cdbc1ce139965878c16722d9"
+      },
+      {
+        "ms": 543.268242,
+        "shape": [
+          100,
+          6
+        ],
+        "schema": "Schema({'c_name': String, 'c_custkey': Int64, 'o_orderkey': Int64, 'o_orderdat': Date, 'o_totalprice': Float64, 'col6': Int64})",
+        "bridge_sha256": "914154775964611f22acd3b21d160a1a4026e232cdbc1ce139965878c16722d9"
+      }
+    ],
+    "polars_streaming": [
+      {
+        "ms": 541.66637,
+        "shape": [
+          100,
+          6
+        ],
+        "schema": "Schema({'c_name': String, 'c_custkey': Int64, 'o_orderkey': Int64, 'o_orderdat': Date, 'o_totalprice': Float64, 'col6': Int64})",
+        "bridge_sha256": "914154775964611f22acd3b21d160a1a4026e232cdbc1ce139965878c16722d9"
+      },
+      {
+        "ms": 534.387545,
+        "shape": [
+          100,
+          6
+        ],
+        "schema": "Schema({'c_name': String, 'c_custkey': Int64, 'o_orderkey': Int64, 'o_orderdat': Date, 'o_totalprice': Float64, 'col6': Int64})",
+        "bridge_sha256": "914154775964611f22acd3b21d160a1a4026e232cdbc1ce139965878c16722d9"
+      },
+      {
+        "ms": 585.998915,
+        "shape": [
+          100,
+          6
+        ],
+        "schema": "Schema({'c_name': String, 'c_custkey': Int64, 'o_orderkey': Int64, 'o_orderdat': Date, 'o_totalprice': Float64, 'col6': Int64})",
+        "bridge_sha256": "914154775964611f22acd3b21d160a1a4026e232cdbc1ce139965878c16722d9"
+      }
+    ]
+  },
+  "median_ms": {
+    "before": 1358.501543,
+    "after": 536.404753,
+    "polars_streaming": 541.66637
+  },
+  "worker": "import importlib,json,sys,time,hashlib\nfrom pathlib import Path\nimport polars as pl\nfrom polars.testing import assert_frame_equal\nimport ibex_pyarrow\nfrom ibex_polars import IbexEngine\nsys.path.insert(0,'/home/brj/code/polars-benchmark')\nr=Path('/home/brj/code/polars-benchmark/data/tables/scale-10.0')\nquery=importlib.import_module('queries.polars.q18').q(**{p.stem:pl.scan_parquet(p) for p in r.glob('*.parquet')})\nroute=sys.argv[1]\nengine=IbexEngine().prepare(query) if route=='ibex' else 'streaming'\nstart=time.perf_counter_ns()\nresult=query.collect(engine=engine)\nelapsed=(time.perf_counter_ns()-start)/1e6\nreference=query.collect(engine='in-memory')\nassert_frame_equal(result,reference,rel_tol=1e-10,abs_tol=1e-8)\nprint(json.dumps({'ms':elapsed,'shape':result.shape,'schema':str(result.schema),'bridge_sha256':hashlib.sha256(Path(ibex_pyarrow.__file__).read_bytes()).hexdigest()}))\n",
+  "driver": "import os,subprocess,json,sys,statistics\nfrom pathlib import Path\nroot=Path('/home/brj/ibex');samples={n:[] for n in ('before','after','polars_streaming')}\nfor i in range(3):\n for name in (list(samples) if i%2==0 else list(reversed(samples))):\n  directory='/tmp/q12-baseline' if name=='before' else str(root/'build-release/python')\n  env={**os.environ,'PYTHONPATH':directory+':'+str(root/'python')}\n  result=json.loads(subprocess.check_output([str(root/'.venv/bin/python'),'/tmp/pdsh-bridge-fresh.py','polars' if name=='polars_streaming' else 'ibex'],env=env,text=True))\n  samples[name].append(result)\n  print(name,result['ms'],flush=True)\nreport={'threads':os.environ.get('IBEX_CORES'),'affinity':sorted(os.sched_getaffinity(0)),'query':'q18','method':'Three fresh processes per route, timed first collection; preparation before timing and full comparison against in-memory Polars after timing. Warm file cache. Alternating route order.','samples':samples,'median_ms':{k:statistics.median(x['ms'] for x in v) for k,v in samples.items()},'worker':Path('/tmp/pdsh-bridge-fresh.py').read_text(),'driver':Path(__file__).read_text()}\nPath(sys.argv[1]).write_text(json.dumps(report,indent=2)+'\\n');print(report['median_ms'],flush=True)\n"
+}

@@ -308,6 +308,50 @@ full-scope checks and native A/B output. The
 [actual runtime profile](pdsh-performance-results/q12-bound-streaming-profile-eight.txt)
 contains two Q12 executions; use the second for warm profiling.
 
+## Shared executor: all supported queries
+
+A paired SF10 sweep compares the saved old bridge with the new bridge while
+using the same current Python adapter in both workers. Membership is already
+simplified on both sides, so this isolates the shared executor. Each worker
+prepares once per query; all complete outputs are checked against in-memory
+Polars, including every timed result. Two warmups follow the initial collection,
+then six rounds balance all six orderings of the two bridges and streaming
+Polars. Collection includes Parquet decoding and public result conversion.
+
+Warm medians in milliseconds at eight threads:
+
+| Query | Old executor | Shared executor | Paired change | Polars streaming |
+|---|---:|---:|---:|---:|
+| Q1 | 770 | 808 | +4.9% | 576 |
+| Q2 | 133 | 127 | −4.1% | 67 |
+| Q3 | 524 | 401 | −23.6% | 346 |
+| Q4 | 302 | 258 | −14.2% | 167 |
+| Q5 | 487 | 466 | −5.5% | 386 |
+| Q6 | 229 | 222 | −2.9% | 221 |
+| Q12 | 294 | 191 | −35.4% | 179 |
+| Q18 | 1,028 | 438 | −57.5% | 535 |
+
+Seven queries improve in this sweep, although Q6's small difference is less
+consistent (five of six pairs). Q2–Q5, Q12 and Q18 win all six pairs. Q1 is a
+regression: a separate twelve-pair repeat measures 777 → 800 ms, with a median
+paired slowdown of 3.2%; the new path loses all twelve pairs. The result is
+therefore a 3–5% repeatable slowdown rather than a uniform improvement.
+
+Q18's warm result beats streaming Polars, but fresh-process first collection
+is nearly level. Three independent processes per route, with preparation
+outside timing and full correctness checks afterwards, measure median first
+collections of **1,359 → 536 ms**, versus **542 ms** for streaming Polars.
+File caches remain warm. The general sweep's first-per-query samples follow
+other queries in the same processes and must not be called fresh-process times.
+
+The [paired runner](bench_pdsh_bridge_ab.py) accepts saved extension directories
+through `--before-dir` and `--after-dir`. Evidence retains all samples, bridge
+hashes, identical generated sources, dataset metadata and query hashes:
+
+- [Eight-thread sweep](pdsh-performance-results/pdsh-bound-streaming-eight.json)
+- [Twelve-pair Q1 repeat](pdsh-performance-results/pdsh-bound-streaming-q1-repeat-eight.json)
+- [Fresh-process Q18](pdsh-performance-results/pdsh-bound-fresh-q18-eight.json)
+
 ## Measurement method
 
 Each thread configuration runs in a separate process. One worker is pinned to

@@ -297,6 +297,31 @@ class EngineTests(unittest.TestCase):
             for last in (False, True):
                 self.equal(frame.sort("x", descending=descending, nulls_last=last, maintain_order=True))
 
+    def test_nan_high_comparison_matrix_resident_and_parquet(self):
+        values = [-float("inf"), -1., -0., 0., 1., float("inf"), float("nan"), None]
+        frame = pl.DataFrame({"id": range(64), "x": [x for x in values for _ in values],
+                              "y": values * len(values)})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nan-groups.parquet"
+            # Includes all-NaN/all-null row groups and mixed NaN/finite groups.
+            pq.write_table(frame.to_arrow(), path, row_group_size=8, write_statistics=True)
+            for source in (frame.lazy(), pl.scan_parquet(path)):
+                for name in ("__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__"):
+                    for right in (pl.col("y"), pl.lit(0.), pl.lit(float("nan")),
+                                  pl.lit(float("inf")), pl.lit(None, dtype=pl.Float64)):
+                        for left, rhs in ((pl.col("x"), right), (right, pl.col("x"))):
+                            predicate = getattr(left, name)(rhs)
+                            with self.subTest(source=type(source), comparison=name, expression=predicate):
+                                self.equal(source.select(predicate.alias("result")))
+                                self.equal(source.filter(predicate).select("id"))
+                                self.equal(source.filter(predicate | pl.col("x").is_null()).select("id"))
+                # Exercise conjunctive scan filtering, not only projected masks.
+                query = source.filter((pl.col("x") >= 0.) & (pl.col("x") <= 1.)).select("id")
+                self.equal(query)
+                native = self.engine.explain(query)
+                self.assertIn("__ibex_nan_high_ge", native)
+                self.assertNotIn("case {", native)
+
     def test_categorical_output_preserves_arrow_dictionary(self):
         # Exercise sliced/chunked codes, nulls and a dictionary whose order
         # differs from Polars' global category mapping. No native query is

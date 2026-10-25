@@ -1,0 +1,17 @@
+{
+  "latest": "202610251103-70bb644896a85ced",
+  "runs": [
+    {
+      "id": "202610251103-70bb644896a85ced",
+      "generated": "2026-10-25 11:03 UTC",
+      "commit": "950fafc1",
+      "url": "benchmark-history/202610251103-70bb644896a85ced/index.html"
+    },
+    {
+      "id": "202610241914-92a77146e16f4ee4",
+      "generated": "2026-10-24 19:14 UTC",
+      "commit": "950fafc1",
+      "url": "benchmark-history/202610241914-92a77146e16f4ee4/index.html"
+    }
+  ]
+}

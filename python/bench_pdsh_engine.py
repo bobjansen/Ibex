@@ -1,0 +1,119 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+"""Compare unchanged upstream PDS-H queries using Polars and IbexEngine.
+
+Parquet input is read during collection. Translation is prepared outside timing.
+Unsupported queries are recorded explicitly; no fallback or query rewrites.
+Run each thread configuration in a separate process with matched budgets.
+"""
+import argparse
+import hashlib
+import importlib
+from itertools import permutations
+import json
+import os
+from pathlib import Path
+import statistics
+import subprocess
+import sys
+import time
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--pdsh-root', type=Path, required=True)
+    parser.add_argument('--data', type=Path, required=True)
+    parser.add_argument('--iters', type=int, default=6)
+    parser.add_argument('--out', type=Path, required=True)
+    args = parser.parse_args()
+    if args.iters < 2 or args.iters % 2:
+        parser.error('--iters must be even and at least two')
+    root = Path(__file__).resolve().parents[1]
+    if 'CMAKE_BUILD_TYPE:STRING=Release' not in (root / 'build-release/CMakeCache.txt').read_text():
+        parser.error('build-release must be configured as Release')
+    import polars as pl
+    from polars.testing import assert_frame_equal
+    import ibex_pyarrow
+    from ibex_polars import IbexEngine
+
+    sys.path.insert(0, str(args.pdsh_root.resolve()))
+    paths = sorted(args.data.resolve().glob('*.parquet'))
+    if len(paths) != 8:
+        parser.error('--data must contain the eight PDS-H Parquet tables')
+    tables = {p.stem: pl.scan_parquet(p) for p in paths}
+    bridge = Path(ibex_pyarrow.__file__).resolve()
+    report = {
+        'git_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),
+        'upstream_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=args.pdsh_root, text=True).strip(),
+        'bridge_sha256': hashlib.sha256(bridge.read_bytes()).hexdigest(),
+        'bridge': str(bridge), 'polars_version': pl.__version__,
+        'ibex_cores': os.environ.get('IBEX_CORES'), 'polars_threads': pl.thread_pool_size(),
+        'affinity': sorted(os.sched_getaffinity(0)),
+        'data': [{'path': str(p), 'bytes': p.stat().st_size, 'mtime_ns': p.stat().st_mtime_ns} for p in paths],
+        'iterations': args.iters,
+        'method': 'Parquet collection; prepared translation; two warmups after first collection; alternating route order; previous-result destruction excluded; no result caching',
+        'correctness': 'all rows, order and dtypes; rel_tol=1e-10 abs_tol=1e-8; both Polars executors compared',
+        'cpu_frequency_khz': {name: Path('/sys/devices/system/cpu/cpu0/cpufreq', name).read_text().strip()
+                              for name in ('scaling_min_freq', 'scaling_max_freq')},
+        'ibex_decode_threads': os.environ.get('IBEX_DECODE_THREADS'),
+        'queries': {},
+    }
+    def save():
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(report, indent=2) + '\n')
+    for number in range(1, 23):
+        name = f'q{number:02}'
+        entry = report['queries'][name] = {}
+        module = importlib.import_module(f'queries.polars.q{number}')
+        entry['upstream_source_sha256'] = hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
+        query = module.q(**tables)
+        engine = IbexEngine()
+        started = time.perf_counter_ns()
+        try:
+            engine.prepare(query)
+        except Exception as exc:
+            entry.update(status='unsupported' if isinstance(exc, NotImplementedError) else 'failed',
+                         error=f'{type(exc).__name__}: {exc}')
+            print(name, entry['error'], flush=True)
+            save()
+            continue
+        entry['prepare_ms'] = (time.perf_counter_ns() - started) / 1e6
+        calls = {'polars': lambda: query.collect(engine='in-memory'),
+                 'polars_streaming': lambda: query.collect(engine='streaming'),
+                 'polars_ibex': lambda: query.collect(engine=engine)}
+        print(name, 'checking full results, then timing', flush=True)
+        try:
+            first, outputs = {}, {}
+            for route, call in calls.items():
+                started = time.perf_counter_ns()
+                outputs[route] = call()
+                first[route] = (time.perf_counter_ns() - started) / 1e6
+            for route in ('polars_streaming', 'polars_ibex'):
+                assert_frame_equal(outputs[route], outputs['polars'], check_row_order=True,
+                                   rel_tol=1e-10, abs_tol=1e-8)
+            entry.update(first_collect_ms=first, output_rows=outputs['polars'].height)
+            for _ in range(2):
+                for call in calls.values():
+                    call()
+            samples = {route: [] for route in calls}
+            previous = None
+            for iteration in range(args.iters):
+                # Six permutations balance each route's position in each block.
+                order = list(permutations(calls))[iteration % 6]
+                for route in order:
+                    started = time.perf_counter_ns()
+                    current = calls[route]()
+                    elapsed = (time.perf_counter_ns() - started) / 1e6
+                    previous = current
+                    samples[route].append(elapsed)
+            entry.update(status='passed', samples_ms=samples,
+                         median_ms={route: statistics.median(values) for route, values in samples.items()})
+            print(name, json.dumps(entry['median_ms']), flush=True)
+        except Exception as exc:
+            entry.update(status='failed', error=f'{type(exc).__name__}: {exc}')
+            print(name, entry['error'], flush=True)
+        save()
+
+
+if __name__ == '__main__':
+    main()

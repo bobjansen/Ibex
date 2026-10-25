@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 """Polars 2.0.0 reproducer: query is correct, visitor loses nanoseconds.
 
 Requires only polars==2.0.0. The final assertion intentionally fails.

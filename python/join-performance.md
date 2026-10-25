@@ -50,3 +50,42 @@ env -u IBEX_CORES -u POLARS_MAX_THREADS PYTHONPATH=build-release/python:python \
   .venv/bin/python python/bench_polars_joins.py --rows 1000000 --keys 200000 \
   --iters 12 --out /tmp/joins-default.json
 ```
+
+## Categorical output conversion follow-up
+
+The table above records the original converter. Commit `f0144ade` replaces
+Polars' per-row Arrow dictionary import with dictionary-label translation once
+per chunk and an integer gather into the requested Polars category mapping.
+Native execution and Arrow export are unchanged.
+
+A focused million-row / 10,000-category inner join compares both converters
+using the **same Release binary, prepared native plan and input bindings**.
+Twenty alternating-order repetitions follow two warmups; complete outputs match
+Polars, including dtypes. Preparation and correctness checks are outside timing.
+Collection includes native execution and conversion; conversion-only samples
+reuse one native Arrow result. Previous result destruction is outside timing.
+These focused inputs have their own seeded RNG sequence, so compare before and
+after here rather than treating these as replacements for the original suite.
+
+| Mode | Conversion before ms | Conversion after ms | Collection before ms | Collection after ms | Polars collection ms |
+|---|---:|---:|---:|---:|---:|
+| One thread | 11.65 | 2.54 | 14.47 | 5.03 | 7.95 |
+| Default (24 threads) | 11.52 | 2.51 | 13.17 | 4.41 | 2.11 |
+
+This reduces conversion time about 4.6× and full collection time about 2.9–3.0×.
+Default-thread Polars remains faster. The one-time preparation cost described
+above is unchanged. Tests cover different per-chunk dictionary orders, sliced
+indices, null indices and dictionary entries, empty outputs, named category
+mappings, UInt8/UInt16 physical category codes, and native projection/grouping.
+A mutation replacing null indices with zero causes the boundary test to fail.
+
+- [Focused A/B runner](bench_categorical_export.py)
+- [One-thread samples](join-performance-results/categorical-export-single.json)
+- [Default-thread samples](join-performance-results/categorical-export-default.json)
+
+```bash
+PYTHONPATH=build-release/python:python IBEX_CORES=1 POLARS_MAX_THREADS=1 \
+  .venv/bin/python python/bench_categorical_export.py --out /tmp/categorical-single.json
+env -u IBEX_CORES -u POLARS_MAX_THREADS PYTHONPATH=build-release/python:python \
+  .venv/bin/python python/bench_categorical_export.py --out /tmp/categorical-default.json
+```

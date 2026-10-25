@@ -63,6 +63,35 @@ class EngineTests(unittest.TestCase):
                 self.equal(source.filter(pl.col("s") == "ASIA"))
                 self.equal(source.select(matched=pl.col("s") != "EUROPE"))
 
+    def test_literal_membership_and_boolean_reductions(self):
+        frame = pl.DataFrame({"id": range(7), "s": ["MAIL", "SHIP", None, "", "AIR", "MAIL", None],
+                              "x": [float("nan"), 0., None, -0., 1., 2., 3.]})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "membership.parquet"
+            frame.write_parquet(path)
+            for source in (frame.lazy(), pl.scan_parquet(path)):
+                for column, choices in (("s", ["MAIL", "SHIP"]), ("s", [None, "MAIL"]),
+                                        ("s", []), ("x", [float("nan"), 0.]), ("x", [None])):
+                    for nulls_equal in (False, True):
+                        member = pl.col(column).is_in(choices, nulls_equal=nulls_equal)
+                        self.equal(source.select(member.alias("member")))
+                        self.equal(source.filter(member).select("id"))
+                        self.equal(source.group_by("s").agg(member.sum().alias("yes"),
+                                                              (~member).sum().alias("no")).sort("s"))
+                self.equal(source.head(0).select(pl.col("s").is_in(["MAIL"]).sum()))
+
+    def test_conditional_expressions_preserve_types_and_null_predicates(self):
+        frame = pl.DataFrame({"x": [1., None, -2., float("nan")], "p": [True, False, None, True],
+                              "s": ["a", "b", None, "d"]}).lazy()
+        for query in (
+            frame.select(pl.when("p").then(pl.col("x")).otherwise(0).alias("v")),
+            frame.select(pl.when("p").then(None).otherwise(pl.col("x")).alias("v")),
+            frame.select(pl.when("p").then(pl.col("s")).otherwise(pl.lit("other")).alias("v")),
+            frame.select(pl.when("p").then(pl.col("x")).otherwise(0).sum().alias("v")),
+            frame.select(pl.when("p").then(True).otherwise(None).alias("v")),
+        ):
+            self.equal(query)
+
     def test_empty_and_all_null_reductions(self):
         for values in ([], [None, None]):
             frame = pl.DataFrame({"g": pl.Series([], dtype=pl.String) if not values else ["a", "a"],

@@ -38,6 +38,24 @@ def _integer_bounds(dtype):
     return (-(2**(bits - 1)) if signed else 0, 2**(bits - int(signed)) - 1)
 
 
+def _null_literal(dtype):
+    if dtype == pl.Null:
+        return Expr("null", ())
+    if dtype in _INTEGER_LAYOUTS:
+        placeholder = 0
+    elif dtype in (pl.Float32, pl.Float64):
+        placeholder = 0.0
+    elif dtype == pl.Boolean:
+        placeholder = False
+    elif dtype == pl.String:
+        placeholder = ""
+    elif dtype == pl.Date:
+        placeholder = date(1970, 1, 1)
+    else:
+        raise NotImplementedError(f"unsupported null literal type {dtype}")
+    return Expr("typed_null", (ibex.lit(placeholder),))
+
+
 def _wrap_integer(expr, dtype):
     bits, signed = _INTEGER_LAYOUTS[dtype]
     return expr if bits == 64 else Expr("wrap_integer", (expr, bits, signed))
@@ -83,6 +101,10 @@ class Adapter:
         if kind == "Column":
             expr = ibex.col(value.name)
         elif kind == "Literal":
+            if value.value is None:
+                expr = _null_literal(value.dtype)
+                self.expressions[key] = expr
+                return expr
             if is_temporal(value.dtype):
                 expr = ibex.lit(literal_ticks(value.value, value.dtype))
                 self.expressions[key] = expr
@@ -109,6 +131,9 @@ class Adapter:
             if operator in ("==", "!=", "<", "<=", ">", ">="):
                 operator = "polars_" + operator
             expr = Expr(operator, (self.expression(value.left), self.expression(value.right)))
+        elif kind == "Ternary":
+            expr = Expr("case", (self.expression(value.predicate), self.expression(value.truthy),
+                                 self.expression(value.falsy)))
         elif kind == "Agg":
             if len(value.arguments) != 1:
                 raise NotImplementedError(f"unsupported aggregate {value.name}")
@@ -128,7 +153,9 @@ class Adapter:
             expr = ibex.len()
         elif kind == "Cast":
             original = self.visitor.get_dtype(value.expr)
-            if is_temporal(original) or is_temporal(value.dtype):
+            if original == pl.Null:
+                expr = _null_literal(value.dtype)
+            elif is_temporal(original) or is_temporal(value.dtype):
                 if original.base_type() != value.dtype.base_type():
                     raise NotImplementedError("casts between temporal and non-temporal types are unsupported")
                 same_zone = original.base_type() != pl.Datetime or original.time_zone == value.dtype.time_zone
@@ -186,6 +213,24 @@ class Adapter:
                     expr = Expr("repeat", (self.expression(value.input[0]),))
                 # A repeat consumes its length reduction and produces one value
                 # per input row; it is not itself an aggregate.
+                self.expressions[key] = expr
+                return expr
+            if name == "IsIn" and len(value.input) == 2 and len(value.function_data) == 2:
+                collection = self.visitor.view_expression(value.input[1])
+                if (type(collection).__name__ != "Literal" or collection.dtype.base_type() != pl.List
+                        or not isinstance(collection.value, list) or len(collection.value) > 256):
+                    raise NotImplementedError("membership requires a literal list of at most 256 scalar values")
+                child = self.expression(value.input[0])
+                present = ibex.lit(False)
+                for member in collection.value:
+                    if member is not None:
+                        present = present | Expr("polars_==", (child, ibex.lit(member)))
+                nulls_equal = value.function_data[1]
+                if type(nulls_equal) is not bool:
+                    raise NotImplementedError("unsupported membership null policy")
+                on_null = (ibex.lit(any(member is None for member in collection.value)) if nulls_equal
+                           else Expr("typed_null", (ibex.lit(False),)))
+                expr = Expr("case", (Expr("is_null", (child,)), on_null, present))
                 self.expressions[key] = expr
                 return expr
             args = tuple(self.expression(child) for child in value.input)

@@ -1131,9 +1131,43 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 const auto peer = plan[c].folded_peer_index;
                 if (peer.has_value()) {
                     const ColumnEntry& right_key = right.columns[*peer];
-                    // Build per-row: pick from left or right depending on null.
-                    // Key columns in outer joins are rare & small, so per-row is fine.
                     ColumnValue out_col = make_empty_like(*left.columns[c].column);
+                    if (!left.columns[c].validity.has_value() && !right_key.validity.has_value()) {
+                        const bool filled = std::visit(
+                            [&](auto& values) {
+                                using Col = std::decay_t<decltype(values)>;
+                                if constexpr (requires(Col& column) {
+                                                  column.resize_for_overwrite(std::size_t{});
+                                                  column.data();
+                                              }) {
+                                    const auto* lc = std::get_if<Col>(left.columns[c].column.get());
+                                    const auto* rc = std::get_if<Col>(right_key.column.get());
+                                    if (rc == nullptr) {
+                                        return false;
+                                    }
+                                    // Dispatch once per column and write disjoint ranges,
+                                    // rather than visiting and appending for every row.
+                                    values.resize_for_overwrite(total);
+                                    auto* dst = values.data();
+                                    const auto* ld = lc->data();
+                                    const auto* rd = rc->data();
+                                    for_row_ranges(
+                                        exec, total, [&](std::size_t begin, std::size_t end) {
+                                            for (std::size_t i = begin; i < end; ++i) {
+                                                dst[i] = left_idx[i] == kNull ? rd[right_idx[i]]
+                                                                              : ld[left_idx[i]];
+                                            }
+                                        });
+                                    return true;
+                                }
+                                return false;
+                            },
+                            out_col);
+                        if (filled) {
+                            output.replace_column(c, std::move(out_col), std::nullopt);
+                            continue;
+                        }
+                    }
                     std::visit([total](auto& cc) { cc.reserve(total); }, out_col);
                     // A key can be null in a row this join emitted: an
                     // unmatched row keeps its own null key under `nulls never`,

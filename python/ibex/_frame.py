@@ -68,6 +68,25 @@ class LazyFrame:
             raise ValueError("duplicate grouping keys")
         return LazyGroupBy(self, tuple(by), maintain_order)
 
+    def unique(self, subset=None, *, keep="any", maintain_order=False):
+        if keep not in ("any", "first", "last", "none"):
+            raise ValueError("keep must be 'any', 'first', 'last', or 'none'")
+        if type(maintain_order) is not bool:
+            raise TypeError("maintain_order must be a Boolean")
+        if subset is not None:
+            if isinstance(subset, str):
+                subset = (subset,)
+            elif isinstance(subset, (list, tuple)):
+                subset = tuple(subset)
+            else:
+                raise NotImplementedError("unique currently requires column-name subset keys")
+            for name in subset:
+                _identifier(name)
+            if not subset:
+                raise NotImplementedError("unique with an empty subset is unsupported")
+            subset = tuple(dict.fromkeys(subset))
+        return self._append("unique", (subset, keep, maintain_order))
+
     def sort(self, by, *more_by, descending=False, nulls_last=False, maintain_order=False):
         names = tuple(by) if isinstance(by, (list, tuple)) else (by,)
         names += more_by

@@ -291,6 +291,11 @@ class Adapter:
             if node.predicate is not None:
                 frame = frame.filter(self.expression(node.predicate.node))
             frame = frame.select(list(schema))
+        elif kind == "Distinct":
+            keep, subset, maintain_order, slice_ = node.options
+            if slice_ is not None:
+                raise NotImplementedError("slices folded into distinct are unsupported")
+            frame = self.frame(node.input).unique(subset, keep=keep, maintain_order=maintain_order)
         elif kind in ("Filter", "SimpleProjection", "Select", "HStack", "GroupBy", "Sort"):
             frame = self.frame(node.input)
             # get_dtype resolves columns against the current visitor node.

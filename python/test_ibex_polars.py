@@ -568,6 +568,75 @@ class EngineTests(unittest.TestCase):
                 query.collect(engine=IbexEngine())
             execute.assert_not_called()
 
+    def test_unique_whole_rows_across_supported_types(self):
+        for dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16,
+                      pl.Float32, pl.Float64, pl.Boolean, pl.String, pl.Categorical,
+                      pl.Date, pl.Datetime("ns", "Europe/Amsterdam"), pl.Duration("us")):
+            values = [None, 1, 1, None, 2, 2]
+            if dtype in (pl.String, pl.Categorical):
+                values = [None, "a", "a", None, "b", "b"]
+            elif dtype == pl.Boolean:
+                values = [None, False, False, None, True, True]
+            source = pl.LazyFrame({"x": pl.Series(values, dtype=dtype)})
+            for keep in ("any", "first", "last", "none"):
+                with self.subTest(dtype=dtype, keep=keep):
+                    for flags in (pl.QueryOptFlags(), pl.QueryOptFlags.none()):
+                        self.equal(source.unique(keep=keep, maintain_order=True), options=flags)
+                        self.equal(source.filter(pl.lit(False)).unique(keep=keep, maintain_order=True), options=flags)
+
+    def test_unique_float_keys_merge_nan_and_signed_zero(self):
+        for dtype in (pl.Float32, pl.Float64):
+            source = pl.LazyFrame({"k": pl.Series([float("nan"), float("nan"), 0.0, -0.0,
+                                                   1.0, 1.0, None, None, float("inf"), -float("inf")], dtype=dtype)})
+            for keep in ("any", "first", "last", "none"):
+                self.equal(source.unique(keep=keep, maintain_order=True))
+            data = pl.LazyFrame({"k": source.collect()["k"], "id": list(range(10))})
+            for keep in ("first", "last", "none"):
+                self.equal(data.unique(subset="k", keep=keep, maintain_order=True))
+
+    def test_unique_subset_selects_whole_rows_and_preserves_selected_row_order(self):
+        data = {"g": ["a", "b", "a", None, None, "c"],
+                "v": [None, 20, 30, None, 50, 60], "_ibex_unique_0_row": list(range(6))}
+        source = pl.LazyFrame(data)
+        for keep in ("first", "last", "none"):
+            for flags in (pl.QueryOptFlags(), pl.QueryOptFlags.none()):
+                self.equal(source.unique(subset="g", keep=keep, maintain_order=True), options=flags)
+                query = source.unique(subset="g", keep=keep, maintain_order=False)
+                assert_frame_equal(query.collect(engine=self.engine, optimizations=flags),
+                                   query.collect(optimizations=flags), check_row_order=False)
+        # Polars keep=any permits any representative; Ibex chooses the first.
+        result = source.unique(subset="g", keep="any", maintain_order=True).collect(engine=self.engine)
+        expected = source.unique(subset="g", keep="first", maintain_order=True).collect()
+        assert_frame_equal(result, expected)
+        keys = pl.LazyFrame({"a": [None, None, 1, 1, 1], "b": ["x", "x", "y", "y", "z"],
+                             "v": [None, 1, 2, 3, 4]})
+        self.equal(keys.unique(subset=["b", "a"], keep="last", maintain_order=True))
+        self.equal(source.unique(subset="g", keep="last", maintain_order=True)
+                   .filter(pl.col("v") > 25).select("g", "v"))
+
+    def test_unique_preserves_row_positions_across_large_inputs(self):
+        size = 150_003
+        source = pl.LazyFrame({"k": [i % 23 for i in range(size)], "id": list(range(size))})
+        for keep in ("first", "last", "none"):
+            self.equal(source.unique(subset="k", keep=keep, maintain_order=True))
+
+    def test_unique_shared_api_and_single_native_execution(self):
+        import ibex
+        data = {"g": [1, 1, 2], "v": [None, 3, 4]}
+        query = pl.LazyFrame(data).unique(subset="g", keep="last", maintain_order=True)
+        with patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as execute:
+            self.equal(query)
+            self.assertEqual(execute.call_count, 1)
+        result = ibex.DataFrame(data).lazy().unique(subset="g", keep="last", maintain_order=True).collect()
+        assert_frame_equal(pl.from_arrow(result.to_arrow()), query.collect())
+        self.assertIn("distinct {", ibex.DataFrame({"x": [1, 1, 2]}).lazy().unique().explain())
+        with self.assertRaises(NotImplementedError):
+            ibex.DataFrame(data).lazy().unique(subset=[])
+        with patch.object(ibex_pyarrow, "execute_pipeline") as execute:
+            with self.assertRaises(NotImplementedError):
+                pl.LazyFrame(data).unique().head(1).collect(engine=IbexEngine())
+            execute.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,560 @@
+{
+  "seed": 20261025,
+  "rows": 1000000,
+  "keys": 200000,
+  "iterations": 12,
+  "comparison": "prepared IbexEngine vs ordinary Polars auto collect; complete materialized results",
+  "timed": "collect including native execution and result export; input creation, preparation and assertions excluded",
+  "order": "alternating execution order per repetition; two warmups per route",
+  "polars_version": "2.0.0",
+  "polars_threads": 24,
+  "ibex_cores_env": null,
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23
+  ],
+  "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.43",
+  "cpu_model": "13th Gen Intel(R) Core(TM) i7-13700",
+  "build": "Release",
+  "binary": "/home/brj/ibex/build-release/python/ibex_pyarrow.cpython-314-x86_64-linux-gnu.so",
+  "binary_sha256": "4c5209b9b01bc58a479e6cde35bd1e1c806e29087be4f98e825b57c1e102c854",
+  "git_head": "0bc5cc98012fe63de2117efc0db71f38b2cd6d84",
+  "cases": {
+    "inner_unique": {
+      "left_rows": 1000000,
+      "right_rows": 200000,
+      "output_rows": 1000000,
+      "schema": {
+        "k": "Int64",
+        "x": "Float64",
+        "y": "Float64"
+      },
+      "engine_prepare_ms": 687.038838,
+      "cold_collect_ms": {
+        "polars": 5.909579,
+        "ibex_prepared": 5.429971
+      },
+      "ibex_prepare_plus_first_ms": 692.4688090000001,
+      "samples_ms": {
+        "polars": [
+          3.57303,
+          5.80712,
+          8.98082,
+          5.634491,
+          5.558813,
+          5.244565,
+          5.712325,
+          5.640944,
+          4.551327,
+          5.125908,
+          5.774375,
+          5.547403
+        ],
+        "ibex": [
+          6.345769,
+          7.119712,
+          6.459012,
+          7.068928,
+          8.658069,
+          6.369755,
+          5.703801,
+          6.633039,
+          6.219008,
+          4.234929,
+          6.013644,
+          6.249062
+        ]
+      },
+      "median_ms": {
+        "polars": 5.596652,
+        "ibex": 6.357761999999999
+      },
+      "iqr_ms": {
+        "polars": 0.5129367499999997,
+        "ibex": 0.5743442500000002
+      },
+      "speedup_polars_over_ibex": 0.8802864907494179,
+      "correctness": "all output rows, values and dtypes matched; order unspecified"
+    },
+    "left_partial": {
+      "left_rows": 1000000,
+      "right_rows": 100000,
+      "output_rows": 1000000,
+      "schema": {
+        "k": "Int64",
+        "x": "Float64",
+        "y": "Float64"
+      },
+      "engine_prepare_ms": 616.370953,
+      "cold_collect_ms": {
+        "polars": 4.193424,
+        "ibex_prepared": 4.3117
+      },
+      "ibex_prepare_plus_first_ms": 620.682653,
+      "samples_ms": {
+        "polars": [
+          6.62729,
+          5.513452,
+          5.54183,
+          4.55244,
+          4.035523,
+          5.588768,
+          3.607911,
+          5.446694,
+          5.401609,
+          4.207557,
+          6.235258,
+          3.56845
+        ],
+        "ibex": [
+          8.465403,
+          7.465568,
+          5.256689,
+          4.732016,
+          4.432342,
+          4.741416,
+          6.824858,
+          8.010899,
+          7.600662,
+          7.225749,
+          6.391615,
+          6.181416
+        ]
+      },
+      "median_ms": {
+        "polars": 5.4241515,
+        "ibex": 6.6082365
+      },
+      "iqr_ms": {
+        "polars": 1.3890159999999998,
+        "ibex": 2.3714707500000003
+      },
+      "speedup_polars_over_ibex": 0.8208167943141865,
+      "correctness": "all output rows, values and dtypes matched; order unspecified"
+    },
+    "full_partial": {
+      "left_rows": 1000000,
+      "right_rows": 240000,
+      "output_rows": 1041270,
+      "schema": {
+        "k": "Int64",
+        "x": "Float64",
+        "y": "Float64"
+      },
+      "engine_prepare_ms": 654.501454,
+      "cold_collect_ms": {
+        "polars": 8.58202,
+        "ibex_prepared": 17.560383
+      },
+      "ibex_prepare_plus_first_ms": 672.061837,
+      "samples_ms": {
+        "polars": [
+          9.066085,
+          13.595877,
+          15.382772,
+          8.8942,
+          8.773181,
+          7.191215,
+          7.773093,
+          6.659736,
+          6.360039,
+          10.358551,
+          11.252215,
+          9.14002
+        ],
+        "ibex": [
+          24.1378,
+          29.249695,
+          20.940678,
+          18.133347,
+          26.41619,
+          16.704956,
+          15.42185,
+          13.965811,
+          18.269439,
+          18.44777,
+          25.180396,
+          27.642163
+        ]
+      },
+      "median_ms": {
+        "polars": 8.9801425,
+        "ibex": 19.694224
+      },
+      "iqr_ms": {
+        "polars": 2.9543435000000002,
+        "ibex": 7.7130952499999985
+      },
+      "speedup_polars_over_ibex": 0.45597848892142184,
+      "correctness": "all output rows, values and dtypes matched; order unspecified"
+    },
+    "semi_half": {
+      "left_rows": 1000000,
+      "right_rows": 100000,
+      "output_rows": 500090,
+      "schema": {
+        "k": "Int64",
+        "x": "Float64"
+      },
+      "engine_prepare_ms": 593.239733,
+      "cold_collect_ms": {
+        "polars": 3.331059,
+        "ibex_prepared": 1.17771
+      },
+      "ibex_prepare_plus_first_ms": 594.417443,
+      "samples_ms": {
+        "polars": [
+          1.702114,
+          1.916843,
+          2.322386,
+          2.343123,
+          2.156783,
+          1.737635,
+          2.721763,
+          1.689397,
+          2.837945,
+          2.497911,
+          3.573796,
+          4.627549
+        ],
+        "ibex": [
+          1.169328,
+          0.987439,
+          1.251937,
+          0.939777,
+          1.101474,
+          1.231272,
+          1.467666,
+          1.26904,
+          1.95599,
+          1.207845,
+          1.474313,
+          0.96001
+        ]
+      },
+      "median_ms": {
+        "polars": 2.3327545,
+        "ibex": 1.2195585
+      },
+      "iqr_ms": {
+        "polars": 0.8787675000000001,
+        "ibex": 0.24573124999999996
+      },
+      "speedup_polars_over_ibex": 1.9127860615132444,
+      "correctness": "all output rows, values and dtypes matched; order unspecified"
+    },
+    "anti_half": {
+      "left_rows": 1000000,
+      "right_rows": 100000,
+      "output_rows": 499910,
+      "schema": {
+        "k": "Int64",
+        "x": "Float64"
+      },
+      "engine_prepare_ms": 575.966842,
+      "cold_collect_ms": {
+        "polars": 3.300828,
+        "ibex_prepared": 1.294141
+      },
+      "ibex_prepare_plus_first_ms": 577.260983,
+      "samples_ms": {
+        "polars": [
+          2.215185,
+          1.826335,
+          2.89511,
+          1.581758,
+          3.372924,
+          2.990767,
+          2.641004,
+          2.754142,
+          4.242185,
+          3.186154,
+          4.662311,
+          1.542775
+        ],
+        "ibex": [
+          1.621738,
+          0.910648,
+          1.451889,
+          0.959861,
+          1.857674,
+          1.173983,
+          1.877499,
+          1.025435,
+          1.795775,
+          1.429777,
+          1.70326,
+          1.003437
+        ]
+      },
+      "median_ms": {
+        "polars": 2.824626,
+        "ibex": 1.440833
+      },
+      "iqr_ms": {
+        "polars": 1.114874,
+        "ibex": 0.7064532499999998
+      },
+      "speedup_polars_over_ibex": 1.9604117895689506,
+      "correctness": "all output rows, values and dtypes matched; order unspecified"
+    },
+    "inner_many_to_many": {
+      "left_rows": 250000,
+      "right_rows": 50000,
+      "output_rows": 500000,
+      "schema": {
+        "k": "Int64",
+        "x": "Float64",
+        "y": "Float64"
+      },
+      "engine_prepare_ms": 156.044322,
+      "cold_collect_ms": {
+        "polars": 2.925694,
+        "ibex_prepared": 2.573753
+      },
+      "ibex_prepare_plus_first_ms": 158.618075,
+      "samples_ms": {
+        "polars": [
+          1.229468,
+          1.482205,
+          1.194718,
+          1.298038,
+          1.053773,
+          1.298481,
+          1.052853,
+          1.241446,
+          1.108541,
+          1.408945,
+          1.086187,
+          1.177477
+        ],
+        "ibex": [
+          2.658805,
+          2.07443,
+          2.403437,
+          2.108726,
+          2.557662,
+          2.101162,
+          2.509033,
+          2.314298,
+          2.336069,
+          2.527735,
+          3.442743,
+          2.563635
+        ]
+      },
+      "median_ms": {
+        "polars": 1.2120929999999999,
+        "ibex": 2.456235
+      },
+      "iqr_ms": {
+        "polars": 0.19519624999999996,
+        "ibex": 0.29625024999999994
+      },
+      "speedup_polars_over_ibex": 0.4934759906930729,
+      "correctness": "all output rows, values and dtypes matched; order unspecified"
+    },
+    "inner_composite": {
+      "left_rows": 1000000,
+      "right_rows": 200000,
+      "output_rows": 1000000,
+      "schema": {
+        "k": "Int64",
+        "x": "Float64",
+        "tenant": "Int64",
+        "y": "Float64"
+      },
+      "engine_prepare_ms": 911.38581,
+      "cold_collect_ms": {
+        "polars": 7.593625,
+        "ibex_prepared": 18.435917
+      },
+      "ibex_prepare_plus_first_ms": 929.821727,
+      "samples_ms": {
+        "polars": [
+          8.614505,
+          10.347112,
+          11.189888,
+          9.788008,
+          8.405545,
+          9.10556,
+          10.053917,
+          9.217036,
+          9.478777,
+          11.032048,
+          9.368209,
+          10.484087
+        ],
+        "ibex": [
+          20.27302,
+          25.208173,
+          31.633958,
+          22.416531,
+          21.422329,
+          26.384638,
+          16.64766,
+          25.200317,
+          20.637346,
+          21.371759,
+          28.714841,
+          22.728128
+        ]
+      },
+      "median_ms": {
+        "polars": 9.6333925,
+        "ibex": 22.572329500000002
+      },
+      "iqr_ms": {
+        "polars": 1.192188749999998,
+        "ibex": 4.314133499999997
+      },
+      "speedup_polars_over_ibex": 0.42677883556502216,
+      "correctness": "all output rows, values and dtypes matched; order unspecified"
+    },
+    "inner_categorical": {
+      "left_rows": 1000000,
+      "right_rows": 10000,
+      "output_rows": 1000000,
+      "schema": {
+        "k": "Categorical",
+        "x": "Float64",
+        "y": "Float64"
+      },
+      "engine_prepare_ms": 459.803103,
+      "cold_collect_ms": {
+        "polars": 3.319672,
+        "ibex_prepared": 14.320893
+      },
+      "ibex_prepare_plus_first_ms": 474.12399600000003,
+      "samples_ms": {
+        "polars": [
+          2.013908,
+          2.723891,
+          1.848642,
+          2.155469,
+          1.611307,
+          2.371795,
+          2.359108,
+          2.295509,
+          1.786767,
+          2.275147,
+          1.660945,
+          2.122166
+        ],
+        "ibex": [
+          13.163638,
+          13.752063,
+          13.221419,
+          13.023975,
+          13.151006,
+          12.924277,
+          14.784978,
+          13.045131,
+          13.296931,
+          13.157087,
+          13.189488,
+          12.916238
+        ]
+      },
+      "median_ms": {
+        "polars": 2.1388175,
+        "ibex": 13.160362500000002
+      },
+      "iqr_ms": {
+        "polars": 0.47823550000000004,
+        "ibex": 0.20045499999999983
+      },
+      "speedup_polars_over_ibex": 0.16251964943974756,
+      "correctness": "all output rows, values and dtypes matched; order unspecified"
+    },
+    "cross": {
+      "left_rows": 1000,
+      "right_rows": 100,
+      "output_rows": 100000,
+      "schema": {
+        "l": "Int64",
+        "r": "Int64"
+      },
+      "engine_prepare_ms": 0.832534,
+      "cold_collect_ms": {
+        "polars": 0.318347,
+        "ibex_prepared": 0.627479
+      },
+      "ibex_prepare_plus_first_ms": 1.460013,
+      "samples_ms": {
+        "polars": [
+          0.329726,
+          0.215495,
+          0.227685,
+          0.310956,
+          0.16749,
+          0.262727,
+          0.211265,
+          0.240734,
+          0.196191,
+          0.238907,
+          0.165566,
+          0.314315
+        ],
+        "ibex": [
+          0.398594,
+          0.384978,
+          0.368622,
+          0.401608,
+          0.364701,
+          0.346524,
+          0.389999,
+          0.359717,
+          0.378903,
+          0.34462,
+          0.402447,
+          0.374295
+        ]
+      },
+      "median_ms": {
+        "polars": 0.233296,
+        "ibex": 0.376599
+      },
+      "iqr_ms": {
+        "polars": 0.06728775000000001,
+        "ibex": 0.028692750000000045
+      },
+      "speedup_polars_over_ibex": 0.6194811988348349,
+      "correctness": "all output rows, values and dtypes matched; order unspecified"
+    }
+  },
+  "source_sha256": {
+    "python/bench_polars_joins.py": "ae6ecdacc1e83255679e9392cb21d54d80804b2810ce62aaa66ae14e42477c0b",
+    "python/ibex/__init__.py": "54b113e96b2a8906162652eb052c993a037ac649ae9c3df806975c5b45132ede",
+    "python/ibex/_expr.py": "85b2d9e1cabcbb3837370b8c6301c3896cfef664cee867b9a5628828735adc9b",
+    "python/ibex/_frame.py": "c06c163a26fc390dfeabe9d340dc71baf39702bc0556f3734b9b5978121439c3",
+    "python/ibex/_join.py": "9e3e6636ab778febdc46371fdf4f28cafbca70e48fe61669fa55e9a2c1ed397d",
+    "python/ibex/_lower.py": "8081e18b09688c26431ba56df94f3b77a77968010a11f29c63fb7a518c9bdb83",
+    "python/ibex_polars/__init__.py": "ff367504c12ccb725feb342c4eba07580e6ecf8a8fb079b16d8f52299bbc85f3",
+    "python/ibex_polars/_adapter.py": "f215c4b815e9f8d77cd18c1216a49700a7868fe6befa9f37529c9cc337b42a98",
+    "python/ibex_polars/_engine.py": "45d84b7668be74f3c2edda536eb0a962442730bdf8b525ae3885ddbea0dae735",
+    "python/ibex_polars/_temporal.py": "c22e3d4c6ad4f2d7f8565da46b44dd587ddaba036945089e9ef574f4e8754344"
+  }
+}

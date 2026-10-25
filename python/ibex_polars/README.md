@@ -210,3 +210,6 @@ CTest registers `ibex_polars_engine` when the pinned dependency is available.
 
 See [the Engine comparison](../polars-engine-performance.md) for resident
 grouped-mean timings, including preparation and first collection.
+
+Matched join timings, preparation costs, raw samples and reproduction commands
+are in the [join performance comparison](../join-performance.md).

@@ -1,0 +1,560 @@
+{
+  "seed": 20261025,
+  "rows": 1000000,
+  "keys": 200000,
+  "iterations": 12,
+  "comparison": "prepared IbexEngine vs ordinary Polars auto collect; complete materialized results",
+  "timed": "collect including native execution and result export; input creation, preparation and assertions excluded",
+  "order": "alternating execution order per repetition; two warmups per route",
+  "polars_version": "2.0.0",
+  "polars_threads": 1,
+  "ibex_cores_env": "1",
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23
+  ],
+  "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.43",
+  "cpu_model": "13th Gen Intel(R) Core(TM) i7-13700",
+  "build": "Release",
+  "binary": "/home/brj/ibex/build-release/python/ibex_pyarrow.cpython-314-x86_64-linux-gnu.so",
+  "binary_sha256": "4c5209b9b01bc58a479e6cde35bd1e1c806e29087be4f98e825b57c1e102c854",
+  "git_head": "0bc5cc98012fe63de2117efc0db71f38b2cd6d84",
+  "cases": {
+    "inner_unique": {
+      "left_rows": 1000000,
+      "right_rows": 200000,
+      "output_rows": 1000000,
+      "schema": {
+        "k": "Int64",
+        "x": "Float64",
+        "y": "Float64"
+      },
+      "engine_prepare_ms": 701.772578,
+      "cold_collect_ms": {
+        "polars": 17.382486,
+        "ibex_prepared": 9.99816
+      },
+      "ibex_prepare_plus_first_ms": 711.7707379999999,
+      "samples_ms": {
+        "polars": [
+          10.726174,
+          10.729081,
+          13.480972,
+          10.768714,
+          10.786238,
+          11.315976,
+          10.073049,
+          10.77679,
+          10.47473,
+          10.872543,
+          10.707003,
+          11.393227
+        ],
+        "ibex": [
+          6.758038,
+          7.77644,
+          6.746034,
+          6.305989,
+          6.687477,
+          6.400294,
+          6.731317,
+          6.365481,
+          6.694474,
+          6.328082,
+          6.679747,
+          6.509491
+        ]
+      },
+      "median_ms": {
+        "polars": 10.772752,
+        "ibex": 6.683612
+      },
+      "iqr_ms": {
+        "polars": 0.2620199999999997,
+        "ibex": 0.34340550000000025
+      },
+      "speedup_polars_over_ibex": 1.6118158863799994,
+      "correctness": "all output rows, values and dtypes matched; order unspecified"
+    },
+    "left_partial": {
+      "left_rows": 1000000,
+      "right_rows": 100000,
+      "output_rows": 1000000,
+      "schema": {
+        "k": "Int64",
+        "x": "Float64",
+        "y": "Float64"
+      },
+      "engine_prepare_ms": 616.548545,
+      "cold_collect_ms": {
+        "polars": 16.586173,
+        "ibex_prepared": 19.374361
+      },
+      "ibex_prepare_plus_first_ms": 635.922906,
+      "samples_ms": {
+        "polars": [
+          16.487805,
+          17.034607,
+          20.694096,
+          16.793922,
+          17.600434,
+          16.262514,
+          16.655517,
+          16.665183,
+          16.911977,
+          17.083125,
+          16.004199,
+          17.271804
+        ],
+        "ibex": [
+          19.197645,
+          18.637945,
+          19.254327,
+          18.62984,
+          19.517998,
+          18.710198,
+          19.392383,
+          18.918246,
+          19.603018,
+          18.771633,
+          19.509651,
+          18.416081
+        ]
+      },
+      "median_ms": {
+        "polars": 16.8529495,
+        "ibex": 19.057945500000002
+      },
+      "iqr_ms": {
+        "polars": 0.5167057499999963,
+        "ibex": 0.7295652500000038
+      },
+      "speedup_polars_over_ibex": 0.8843004352174267,
+      "correctness": "all output rows, values and dtypes matched; order unspecified"
+    },
+    "full_partial": {
+      "left_rows": 1000000,
+      "right_rows": 240000,
+      "output_rows": 1041270,
+      "schema": {
+        "k": "Int64",
+        "x": "Float64",
+        "y": "Float64"
+      },
+      "engine_prepare_ms": 640.585652,
+      "cold_collect_ms": {
+        "polars": 21.064124,
+        "ibex_prepared": 30.94349
+      },
+      "ibex_prepare_plus_first_ms": 671.529142,
+      "samples_ms": {
+        "polars": [
+          18.831003,
+          19.775611,
+          23.025127,
+          20.169972,
+          18.785808,
+          20.151486,
+          19.514357,
+          19.388884,
+          18.926034,
+          20.681241,
+          19.623881,
+          20.55995
+        ],
+        "ibex": [
+          32.002816,
+          30.070764,
+          30.743514,
+          30.149628,
+          35.834498,
+          30.017951,
+          32.824537,
+          39.491706,
+          30.932021,
+          30.660876,
+          30.570145,
+          30.00505
+        ]
+      },
+      "median_ms": {
+        "polars": 19.699746,
+        "ibex": 30.702195
+      },
+      "iqr_ms": {
+        "polars": 0.994295000000001,
+        "ibex": 2.078334250000001
+      },
+      "speedup_polars_over_ibex": 0.6416396612685185,
+      "correctness": "all output rows, values and dtypes matched; order unspecified"
+    },
+    "semi_half": {
+      "left_rows": 1000000,
+      "right_rows": 100000,
+      "output_rows": 500090,
+      "schema": {
+        "k": "Int64",
+        "x": "Float64"
+      },
+      "engine_prepare_ms": 595.841544,
+      "cold_collect_ms": {
+        "polars": 13.572019,
+        "ibex_prepared": 4.971852
+      },
+      "ibex_prepare_plus_first_ms": 600.813396,
+      "samples_ms": {
+        "polars": [
+          12.160703,
+          11.651529,
+          11.268675,
+          12.642285,
+          11.606465,
+          11.681937,
+          11.146258,
+          12.117927,
+          11.64801,
+          12.651114,
+          13.772422,
+          13.326463
+        ],
+        "ibex": [
+          4.692937,
+          4.471895,
+          4.74547,
+          4.602191,
+          4.762083,
+          4.697616,
+          4.645085,
+          4.70344,
+          4.684702,
+          4.574036,
+          8.935737,
+          4.859509
+        ]
+      },
+      "median_ms": {
+        "polars": 11.899932,
+        "ibex": 4.6952765
+      },
+      "iqr_ms": {
+        "polars": 1.0068684999999995,
+        "ibex": 0.11526175000000016
+      },
+      "speedup_polars_over_ibex": 2.5344475453149564,
+      "correctness": "all output rows, values and dtypes matched; order unspecified"
+    },
+    "anti_half": {
+      "left_rows": 1000000,
+      "right_rows": 100000,
+      "output_rows": 499910,
+      "schema": {
+        "k": "Int64",
+        "x": "Float64"
+      },
+      "engine_prepare_ms": 569.138426,
+      "cold_collect_ms": {
+        "polars": 12.366981,
+        "ibex_prepared": 4.938319
+      },
+      "ibex_prepare_plus_first_ms": 574.076745,
+      "samples_ms": {
+        "polars": [
+          12.660025,
+          12.717041,
+          13.169798,
+          11.488568,
+          11.304205,
+          11.467057,
+          12.883396,
+          12.463855,
+          12.322692,
+          13.295272,
+          11.502957,
+          13.716752
+        ],
+        "ibex": [
+          4.903322,
+          4.530313,
+          4.6162,
+          4.406635,
+          4.539462,
+          4.445755,
+          6.463169,
+          6.03576,
+          5.165946,
+          5.689434,
+          5.039572,
+          6.169811
+        ]
+      },
+      "median_ms": {
+        "polars": 12.56194,
+        "ibex": 4.9714469999999995
+      },
+      "iqr_ms": {
+        "polars": 1.45563675,
+        "ibex": 1.2388407499999996
+      },
+      "speedup_polars_over_ibex": 2.5268176448426387,
+      "correctness": "all output rows, values and dtypes matched; order unspecified"
+    },
+    "inner_many_to_many": {
+      "left_rows": 250000,
+      "right_rows": 50000,
+      "output_rows": 500000,
+      "schema": {
+        "k": "Int64",
+        "x": "Float64",
+        "y": "Float64"
+      },
+      "engine_prepare_ms": 150.836778,
+      "cold_collect_ms": {
+        "polars": 4.631495,
+        "ibex_prepared": 3.307299
+      },
+      "ibex_prepare_plus_first_ms": 154.144077,
+      "samples_ms": {
+        "polars": [
+          3.695057,
+          3.608144,
+          6.219576,
+          3.935001,
+          3.885645,
+          3.862119,
+          3.503798,
+          3.412749,
+          3.285119,
+          3.38903,
+          3.072083,
+          3.410343
+        ],
+        "ibex": [
+          4.054308,
+          3.641979,
+          4.109968,
+          3.773393,
+          3.27745,
+          3.331477,
+          2.840828,
+          2.952505,
+          2.852692,
+          2.807267,
+          2.848383,
+          2.756792
+        ]
+      },
+      "median_ms": {
+        "polars": 3.555971,
+        "ibex": 3.1149775
+      },
+      "iqr_ms": {
+        "polars": 0.46298574999999964,
+        "ibex": 0.8283382499999998
+      },
+      "speedup_polars_over_ibex": 1.1415719696209683,
+      "correctness": "all output rows, values and dtypes matched; order unspecified"
+    },
+    "inner_composite": {
+      "left_rows": 1000000,
+      "right_rows": 200000,
+      "output_rows": 1000000,
+      "schema": {
+        "k": "Int64",
+        "x": "Float64",
+        "tenant": "Int64",
+        "y": "Float64"
+      },
+      "engine_prepare_ms": 895.591127,
+      "cold_collect_ms": {
+        "polars": 35.539585,
+        "ibex_prepared": 63.034579
+      },
+      "ibex_prepare_plus_first_ms": 958.625706,
+      "samples_ms": {
+        "polars": [
+          31.436209,
+          29.585653,
+          34.048195,
+          31.661287,
+          31.291486,
+          30.803438,
+          27.72649,
+          31.522362,
+          30.696406,
+          29.513961,
+          32.174209,
+          29.462664
+        ],
+        "ibex": [
+          64.879855,
+          61.821632,
+          67.997532,
+          62.798078,
+          62.434575,
+          63.273437,
+          63.214875,
+          62.072365,
+          68.151633,
+          62.115897,
+          70.863909,
+          70.465409
+        ]
+      },
+      "median_ms": {
+        "polars": 31.047462,
+        "ibex": 63.244156000000004
+      },
+      "iqr_ms": {
+        "polars": 1.9893632500000002,
+        "ibex": 5.681151749999998
+      },
+      "speedup_polars_over_ibex": 0.4909143225818366,
+      "correctness": "all output rows, values and dtypes matched; order unspecified"
+    },
+    "inner_categorical": {
+      "left_rows": 1000000,
+      "right_rows": 10000,
+      "output_rows": 1000000,
+      "schema": {
+        "k": "Categorical",
+        "x": "Float64",
+        "y": "Float64"
+      },
+      "engine_prepare_ms": 461.320706,
+      "cold_collect_ms": {
+        "polars": 8.149882,
+        "ibex_prepared": 15.56671
+      },
+      "ibex_prepare_plus_first_ms": 476.887416,
+      "samples_ms": {
+        "polars": [
+          7.833015,
+          8.155291,
+          10.375801,
+          7.994033,
+          7.517994,
+          7.420261,
+          8.267552,
+          7.454749,
+          7.114859,
+          7.435824,
+          7.610134,
+          7.984012
+        ],
+        "ibex": [
+          14.604369,
+          14.426798,
+          14.589238,
+          14.303538,
+          16.64803,
+          14.726269,
+          15.367759,
+          13.713397,
+          16.404167,
+          14.762628,
+          14.036742,
+          15.109795
+        ]
+      },
+      "median_ms": {
+        "polars": 7.7215745,
+        "ibex": 14.665319
+      },
+      "iqr_ms": {
+        "polars": 0.5843297499999993,
+        "ibex": 0.7783030000000011
+      },
+      "speedup_polars_over_ibex": 0.5265193685865271,
+      "correctness": "all output rows, values and dtypes matched; order unspecified"
+    },
+    "cross": {
+      "left_rows": 1000,
+      "right_rows": 100,
+      "output_rows": 100000,
+      "schema": {
+        "l": "Int64",
+        "r": "Int64"
+      },
+      "engine_prepare_ms": 0.806769,
+      "cold_collect_ms": {
+        "polars": 0.259096,
+        "ibex_prepared": 0.618014
+      },
+      "ibex_prepare_plus_first_ms": 1.424783,
+      "samples_ms": {
+        "polars": [
+          0.268311,
+          0.269729,
+          0.204854,
+          0.238782,
+          0.112107,
+          0.166775,
+          0.119995,
+          0.15281,
+          0.113783,
+          0.147954,
+          0.10168,
+          0.135648
+        ],
+        "ibex": [
+          0.494253,
+          0.467897,
+          0.484751,
+          0.461935,
+          0.529875,
+          0.498236,
+          0.544379,
+          0.528124,
+          0.548244,
+          0.473389,
+          0.494436,
+          0.422196
+        ]
+      },
+      "median_ms": {
+        "polars": 0.15038200000000002,
+        "ibex": 0.49434449999999996
+      },
+      "iqr_ms": {
+        "polars": 0.09489399999999999,
+        "ibex": 0.05654575000000006
+      },
+      "speedup_polars_over_ibex": 0.304204861184862,
+      "correctness": "all output rows, values and dtypes matched; order unspecified"
+    }
+  },
+  "source_sha256": {
+    "python/bench_polars_joins.py": "ae6ecdacc1e83255679e9392cb21d54d80804b2810ce62aaa66ae14e42477c0b",
+    "python/ibex/__init__.py": "54b113e96b2a8906162652eb052c993a037ac649ae9c3df806975c5b45132ede",
+    "python/ibex/_expr.py": "85b2d9e1cabcbb3837370b8c6301c3896cfef664cee867b9a5628828735adc9b",
+    "python/ibex/_frame.py": "c06c163a26fc390dfeabe9d340dc71baf39702bc0556f3734b9b5978121439c3",
+    "python/ibex/_join.py": "9e3e6636ab778febdc46371fdf4f28cafbca70e48fe61669fa55e9a2c1ed397d",
+    "python/ibex/_lower.py": "8081e18b09688c26431ba56df94f3b77a77968010a11f29c63fb7a518c9bdb83",
+    "python/ibex_polars/__init__.py": "ff367504c12ccb725feb342c4eba07580e6ecf8a8fb079b16d8f52299bbc85f3",
+    "python/ibex_polars/_adapter.py": "f215c4b815e9f8d77cd18c1216a49700a7868fe6befa9f37529c9cc337b42a98",
+    "python/ibex_polars/_engine.py": "45d84b7668be74f3c2edda536eb0a962442730bdf8b525ae3885ddbea0dae735",
+    "python/ibex_polars/_temporal.py": "c22e3d4c6ad4f2d7f8565da46b44dd587ddaba036945089e9ef574f4e8754344"
+  }
+}

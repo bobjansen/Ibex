@@ -1683,6 +1683,57 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             n_groups += inserted ? 1U : 0U;
             row_gid[i] = it->second;
         }
+        if (kind == ir::JoinKind::Outer && !build_left && n_groups == n_build) {
+            // Unique right keys give exactly one output slot per left row.
+            // In insertion order the gid is already the right row number:
+            // no CSR indirection, growing worker vectors, or merge is needed.
+            std::vector<std::size_t> li;
+            std::vector<std::size_t> ri;
+            li.reserve(n_left + n_right);
+            ri.reserve(n_left + n_right);
+            li.resize(n_left);
+            ri.resize(n_left);
+            const auto* probe_data = left_ints.data();
+            const auto scan = [&](std::size_t begin, std::size_t end) {
+                for (std::size_t l = begin; l < end; ++l) {
+                    const auto it = key_gid.find(probe_data[l]);
+                    li[l] = l;
+                    ri[l] = it == key_gid.end() ? kNull : it->second;
+                }
+            };
+            const std::size_t workers = probe_workers(n_left);
+            if (workers == 0) {
+                scan(0, n_left);
+            } else {
+                auto& pool = process_worker_pool();
+                const std::size_t grain = (n_left + workers - 1) / workers;
+                auto batch = pool.submit(workers, [&](std::size_t w) {
+                    const std::size_t begin = w * grain;
+                    scan(begin, std::min(n_left, begin + grain));
+                });
+                batch.wait();
+                if (exec->parallel_stats != nullptr) {
+                    exec->parallel_stats->parallel_probes.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            // Mark from the completed row indices rather than having all
+            // workers contend on the same right-side match bitmap.
+            std::vector<std::uint8_t> matched(n_right, 0U);
+            for (const std::size_t r : ri) {
+                if (r != kNull) {
+                    matched[r] = 1U;
+                }
+            }
+            for (std::size_t r = 0; r < n_right; ++r) {
+                if (matched[r] == 0U) {
+                    li.push_back(kNull);
+                    ri.push_back(r);
+                }
+            }
+            materialize(li, ri);
+            return join_failure(output);
+        }
+
         const GroupedRows grouped = group_rows_csr(row_gid, n_groups);
 
         if (build_left) {

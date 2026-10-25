@@ -47,14 +47,25 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             # A captured scalar is broadcast by the native projection/update
             # operator. Length equality was proved by the Polars adapter.
             return render(args[0])
-        if op == "repeat_null":
+        if op == "null":
+            return "NULL"
+        if op == "case":
+            predicate, truthy, falsy = args
+            left, right = render(truthy), render(falsy)
+            if current_types.get(id(expr)) == pa.float64():
+                left, right = f"Float64({left})", f"Float64({right})"
+            return f"case {{ {render(predicate)} => {left}, else => {right} }}"
+        if op in ("repeat_null", "typed_null"):
             # The unreachable placeholder supplies the null's physical type.
             return f"case {{ true => NULL, else => {render(args[0])} }}"
         if op == "sum":
             # Polars sum returns zero for empty/all-null inputs; Ibex's
             # native nullable sum returns null. Preserve the frontend contract.
             zero = 0.0 if current_types.get(id(expr)) == pa.float64() else 0
-            return f"coalesce(sum({render(args[0])}), {bind(zero)})"
+            value = render(args[0])
+            if current_types.get(id(args[0])) == pa.bool_():
+                value = f"Int64({value})"
+            return f"coalesce(sum({value}), {bind(zero)})"
         if op == "count":
             if args[0]._op == "col":
                 return f"count({render(args[0])})"
@@ -439,7 +450,22 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
             return pa.large_string() if isinstance(args[0], str) else pa.scalar(args[0]).type
         if op == "alias":
             return dtype(args[0])
-        if op in ("repeat", "repeat_null", "broadcast_length"):
+        if op == "null":
+            return pa.null()
+        if op == "case":
+            if dtype(args[0]) != pa.bool_():
+                raise TypeError("conditional predicate must be Boolean")
+            left, right = dtype(args[1]), dtype(args[2])
+            if left == right:
+                return left
+            if pa.types.is_null(left):
+                return right
+            if pa.types.is_null(right):
+                return left
+            if left in numeric and right in numeric:
+                return pa.float64()
+            raise NotImplementedError("conditional branches must have compatible types")
+        if op in ("repeat", "repeat_null", "broadcast_length", "typed_null"):
             return dtype(args[0])
         if op in ("first", "last", "first_non_null", "last_non_null"):
             result = dtype(args[0])
@@ -450,6 +476,8 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
             return result
         if op in ("sum", "mean", "min", "max"):
             result = dtype(args[0])
+            if op == "sum" and result == pa.bool_() and args[0]._row_reference:
+                return pa.uint32()
             if result not in numeric or not args[0]._row_reference:
                 raise NotImplementedError(f"{op} currently requires an Int64 or Float64 row expression")
             return pa.float64() if op == "mean" else result

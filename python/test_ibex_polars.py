@@ -130,6 +130,21 @@ class EngineTests(unittest.TestCase):
                     query = source.group_by(keys, maintain_order=True).agg(pl.sum("v"), pl.len())
                     self.equal(query)
 
+    def test_extrema_and_distinct_counts_handle_nan_null_and_empty_groups(self):
+        for values in ([], [None, None], [float("nan"), None],
+                       [float("nan"), -1., float("inf"), -float("inf"), None, float("nan")]):
+            frame = pl.DataFrame({"x": pl.Series(values, dtype=pl.Float64), "g": pl.Series([1] * len(values), dtype=pl.Int64)})
+            for source in (frame.lazy(),):
+                self.equal(source.select(pl.col("x").min().alias("lo"), pl.col("x").max().alias("hi")))
+                self.equal(source.group_by("g").agg(pl.col("x").min().alias("lo"),
+                                                     (pl.col("x") * 2).max().alias("hi")))
+        frame = pl.DataFrame({"i": [1, 1, None, 2], "s": ["a", None, "a", "b"],
+                              "b": [True, None, True, False], "g": [1, 1, 2, 2]}).lazy()
+        for source in (frame, frame.head(0)):
+            self.equal(source.select(pl.col("i").min().alias("lo"), pl.col("i").max().alias("hi")))
+            self.equal(source.select(pl.col("i").n_unique(), pl.col("s").n_unique(), pl.col("b").n_unique()))
+            self.equal(source.group_by("g").agg(pl.col("i").n_unique(), pl.col("s").n_unique()).sort("g"))
+
     def test_empty_and_all_null_reductions(self):
         for values in ([], [None, None]):
             frame = pl.DataFrame({"g": pl.Series([], dtype=pl.String) if not values else ["a", "a"],

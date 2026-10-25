@@ -138,8 +138,20 @@ class Adapter:
             if len(value.arguments) != 1:
                 raise NotImplementedError(f"unsupported aggregate {value.name}")
             input_type = self.visitor.get_dtype(value.arguments[0])
+            if value.name in ("min", "max") and input_type in (pl.Float32, pl.Float64):
+                if value.options not in (None, False):
+                    raise NotImplementedError("unsupported extrema options")
+                expr = Expr("polars_" + value.name, (self.expression(value.arguments[0]),))
+                self.expressions[key] = expr
+                return expr
+            if value.name == "n_unique" and input_type in (*_INTEGER_LAYOUTS, pl.String, pl.Boolean):
+                if value.options not in (None, False):
+                    raise NotImplementedError("unsupported distinct-count options")
+                expr = Expr("n_unique", (self.expression(value.arguments[0]),))
+                self.expressions[key] = expr
+                return expr
             allowed = ("min", "max", "sum") if input_type.base_type() == pl.Duration else ("min", "max")
-            if value.name not in ("count", "first", "last", "first_non_null", "last_non_null") and value.name not in (allowed if is_temporal(input_type) else ("sum", "mean")):
+            if value.name not in ("count", "first", "last", "first_non_null", "last_non_null") and value.name not in (allowed if is_temporal(input_type) else ("sum", "mean", "min", "max")):
                 raise NotImplementedError(f"unsupported aggregate {value.name} for {input_type}")
             # The visitor calls both Expr.count() and Expr.len() "count";
             # its Boolean option is include_nulls, not a count execution hint.

@@ -606,7 +606,17 @@ class Adapter:
             elif kind == "SimpleProjection":
                 frame = frame.select(list(schema))
             elif kind == "Select":
-                frame = self._aggregate_rounding(frame, [self.named(expr) for expr in node.expr])
+                value = self.visitor.view_expression(node.expr[0].node) if len(node.expr) == 1 else None
+                if (type(value).__name__ == "Function" and len(value.input) == 1
+                        and len(value.function_data) == 2 and value.function_data[0] == "unique"
+                        and type(value.function_data[1]) is bool):
+                    child = self.expression(value.input[0])
+                    if child._aggregate or not child._row_reference:
+                        raise NotImplementedError("unique projection requires one row expression")
+                    frame = frame.select(child.alias(node.expr[0].output_name)).unique(
+                        maintain_order=value.function_data[1])
+                else:
+                    frame = self._aggregate_rounding(frame, [self.named(expr) for expr in node.expr])
             elif kind == "HStack":
                 expressions = tuple(self.named(expr) for expr in node.exprs)
                 frame = self._hstack(frame, expressions, list(schema), node_id)

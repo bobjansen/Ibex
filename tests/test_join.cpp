@@ -3174,6 +3174,59 @@ TEST_CASE("join: a parallel unique-key inner join gives the serial rows in order
     CHECK(wrong == 0);
 }
 
+TEST_CASE("outer join unique-right slots match the general nullable-key path",
+          "[join][outer][parallel]") {
+    constexpr std::size_t left_rows = 30'000;
+    constexpr std::size_t right_rows = 300;
+    Column<std::int64_t> lk, lv, rk, rv;
+    runtime::ValidityBitmap lv_valid(left_rows, true), rv_valid(right_rows, true);
+    for (std::size_t i = 0; i < left_rows; ++i) {
+        lk.push_back(static_cast<std::int64_t>((i * 37) % 500) - 250);
+        lv.push_back(static_cast<std::int64_t>(i));
+        lv_valid.set(i, i % 31 != 0);
+    }
+    for (std::size_t i = 0; i < right_rows; ++i) {
+        rk.push_back(static_cast<std::int64_t>(i * 2 + 1));
+        rv.push_back(static_cast<std::int64_t>(i * 5));
+        rv_valid.set(i, i % 13 != 0);
+    }
+    runtime::Table left, right, general_right;
+    left.add_column("k", lk);
+    left.add_column("lv", lv, lv_valid);
+    right.add_column("k", rk);
+    right.add_column("rv", rv, rv_valid);
+    // Identical key values with an all-valid bitmap force the general
+    // null-aware hash path, independently of the unique Int64 specialization.
+    general_right.add_column("k", rk, runtime::ValidityBitmap(right_rows, true));
+    general_right.add_column("rv", rv, rv_valid);
+    runtime::TableRegistry tables{{"l", left}, {"r", right}, {"g", general_right}};
+    auto parsed = parser::parse("l outer join g on k;");
+    REQUIRE(parsed.has_value());
+    auto general = parser::lower(*parsed);
+    REQUIRE(general.has_value());
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    auto expected = runtime::interpret(**general, tables, nullptr, nullptr, nullptr, serial);
+    REQUIRE(expected.has_value());
+    CHECK(expected->rows() == left_rows + 175);
+    parsed = parser::parse("l outer join r on k;");
+    REQUIRE(parsed.has_value());
+    auto specialized = parser::lower(*parsed);
+    REQUIRE(specialized.has_value());
+    runtime::ParallelPipelineStats stats;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_stats = &stats;
+    for (const auto* exec : {&serial, &parallel}) {
+        auto actual = runtime::interpret(**specialized, tables, nullptr, nullptr, nullptr, *exec);
+        REQUIRE(actual.has_value());
+        if (auto mismatch = runtime::compare_tables(*expected, *actual)) {
+            FAIL(mismatch->message());
+        }
+    }
+    CHECK(stats.parallel_probes.load() > 0);
+}
+
 TEST_CASE("semi and anti join match categorical keys whose dictionaries differ",
           "[join][semi][anti]") {
     // Built apart, the two key columns get their own dictionaries; the right

@@ -1,5 +1,29 @@
 # Polars versus Ibex join performance
 
+## Latest default-thread suite
+
+Rerun after the categorical conversion and bound-schema composite join fixes,
+using Release commit `e3560ab9` on the same i7-13700. Both thread settings were
+unset (24 threads); the original seeded inputs and complete-result correctness
+checks were retained. Medians below cover 12 alternating-order repetitions after
+two warmups. Collection includes native execution and Polars result conversion;
+plan preparation is excluded. Earlier tables below retain their original data.
+
+| Join | Polars ms | Polars–Ibex ms |
+|---|---:|---:|
+| Integer inner | 5.60 | 5.57 |
+| Left | 5.90 | 7.60 |
+| Full | 8.17 | 18.23 |
+| Semi | 1.86 | 1.36 |
+| Anti | 2.24 | 1.39 |
+| Many-to-many | 1.50 | 2.91 |
+| Composite keys | 8.82 | 9.43 |
+| Categorical keys | 2.90 | 6.75 |
+| Cross | 0.63 | 1.03 |
+
+[Latest raw samples, IQRs and provenance](join-performance-results/default-updated.json).
+
+
 Measured 2026-10-25 on a 13th Gen Intel(R) Core(TM) i7-13700, Linux, with Polars 2.0.0 and a Release Ibex bridge. The two runs use identical seeded resident inputs and the same source/binary hashes.
 
 Each number below is the median of 12 alternating-order repetitions after two warmups. Collection includes execution and conversion to a real Polars DataFrame. Ibex plans and bindings are prepared before timing; Polars uses ordinary `collect()` with its default auto engine. Input creation, preparation, and full-result correctness comparisons are outside the timed section.

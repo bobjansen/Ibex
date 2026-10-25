@@ -972,6 +972,42 @@
       14,
       15,
       16
+    ],
+    "tests/unit/operations/test_sort.py::test_sort_slice_fast_path_5245[<lambda>0]": [
+      1
+    ],
+    "tests/unit/operations/test_sort.py::test_sort_slice_fast_path_5245[<lambda>1]": [
+      1
+    ],
+    "tests/unit/operations/test_sort.py::test_sort_slice_fast_path_5245[<lambda>2]": [
+      1
+    ],
+    "tests/unit/operations/test_sort.py::test_limit_larger_than_sort[<lambda>0]": [
+      1
+    ],
+    "tests/unit/operations/test_sort.py::test_limit_larger_than_sort[<lambda>1]": [
+      1
+    ],
+    "tests/unit/operations/test_sort.py::test_limit_larger_than_sort[<lambda>2]": [
+      1
+    ],
+    "tests/unit/operations/test_sort.py::test_sort_top_k_fast_path": [
+      1
+    ],
+    "tests/unit/operations/test_group_by.py::test_unique_head_tail_26429[1]": [
+      1
+    ],
+    "tests/unit/operations/test_group_by.py::test_unique_head_tail_26429[4]": [
+      1
+    ],
+    "tests/unit/operations/test_group_by.py::test_unique_head_tail_26429[5]": [
+      1
+    ],
+    "tests/unit/operations/test_group_by.py::test_unique_head_tail_26429[6]": [
+      1
+    ],
+    "tests/unit/operations/test_group_by.py::test_unique_head_tail_26429[10]": [
+      1
     ]
   },
   "unordered_tests": {

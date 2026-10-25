@@ -525,6 +525,54 @@ auto cmp_col_scalar_into_double(ir::CompareOp op, const double* __restrict cp, d
 
 }  // namespace
 
+// Frontend-selected NaN ordering. Dispatch the operator once, outside the
+// vector loop. Null propagation remains the same bitmap operation as IEEE.
+template <ir::CompareOp Op, typename Left, typename Right>
+void nan_high_loop(const Left& left, const Right& right, uint8_t* out, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) {
+        const double a = static_cast<double>(left(i));
+        const double b = static_cast<double>(right(i));
+        const bool an = std::isnan(a), bn = std::isnan(b);
+        if constexpr (Op == ir::CompareOp::Eq)
+            out[i] = (a == b) || (an && bn);
+        if constexpr (Op == ir::CompareOp::Ne)
+            out[i] = !((a == b) || (an && bn));
+        if constexpr (Op == ir::CompareOp::Lt)
+            out[i] = (a < b) || (!an && bn);
+        if constexpr (Op == ir::CompareOp::Le)
+            out[i] = (a <= b) || bn;
+        if constexpr (Op == ir::CompareOp::Gt)
+            out[i] = (a > b) || (an && !bn);
+        if constexpr (Op == ir::CompareOp::Ge)
+            out[i] = (a >= b) || an;
+    }
+}
+
+template <typename Left, typename Right>
+void nan_high_mask(ir::CompareOp op, const Left& left, const Right& right, uint8_t* out,
+                   std::size_t n) {
+    switch (op) {
+        case ir::CompareOp::Eq:
+            nan_high_loop<ir::CompareOp::Eq>(left, right, out, n);
+            break;
+        case ir::CompareOp::Ne:
+            nan_high_loop<ir::CompareOp::Ne>(left, right, out, n);
+            break;
+        case ir::CompareOp::Lt:
+            nan_high_loop<ir::CompareOp::Lt>(left, right, out, n);
+            break;
+        case ir::CompareOp::Le:
+            nan_high_loop<ir::CompareOp::Le>(left, right, out, n);
+            break;
+        case ir::CompareOp::Gt:
+            nan_high_loop<ir::CompareOp::Gt>(left, right, out, n);
+            break;
+        case ir::CompareOp::Ge:
+            nan_high_loop<ir::CompareOp::Ge>(left, right, out, n);
+            break;
+    }
+}
+
 // Dispatch column-vs-scalar comparison over all type combinations.
 using LitVal = decltype(ir::Literal::value);
 namespace {
@@ -565,7 +613,8 @@ void cmp_bools(ir::CompareOp op, const Lhs& lhs, const Rhs& rhs, uint8_t* mp, st
 }
 
 auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, std::size_t off,
-                        const LitVal& lit, std::size_t n, const ValidityBitmap* validity = nullptr)
+                        const LitVal& lit, std::size_t n, const ValidityBitmap* validity = nullptr,
+                        ir::FloatComparison policy = ir::FloatComparison::IEEE)
     -> std::expected<Mask, std::string> {
     Mask result;
     result.value.resize(n);
@@ -575,6 +624,25 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, std::size_t of
         std::fill_n(mp, n, uint8_t{0});
         result.valid = std::vector<uint8_t>(n, 0);
         return result;
+    }
+    if (policy == ir::FloatComparison::NaNsEqualAndGreatest) {
+        const auto* d = std::get_if<double>(&lit);
+        const auto* integer = std::get_if<std::int64_t>(&lit);
+        if (const auto* column = std::get_if<Column<double>>(&col); column && (d || integer)) {
+            const double value = d ? *d : static_cast<double>(*integer);
+            nan_high_mask(
+                op, [&](std::size_t i) { return (*column)[off + i]; },
+                [&](std::size_t) { return value; }, mp, n);
+            result.apply_validity(validity, off, n);
+            return result;
+        }
+        if (const auto* column = std::get_if<Column<std::int64_t>>(&col); column && d) {
+            nan_high_mask(
+                op, [&](std::size_t i) { return (*column)[off + i]; },
+                [&](std::size_t) { return *d; }, mp, n);
+            result.apply_validity(validity, off, n);
+            return result;
+        }
     }
     if (const auto* bool_col = std::get_if<Column<bool>>(&col)) {
         const auto* value = std::get_if<bool>(&lit);
@@ -828,11 +896,34 @@ auto cmp_into(ir::CompareOp op, const L* __restrict lp, const R* __restrict rp,
 // bitmaps'); the produced mask is dense.
 auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, std::size_t lhs_off,
                  const ColumnValue& rhs, std::size_t rhs_off, std::size_t n,
-                 const ValidityBitmap* lv = nullptr, const ValidityBitmap* rv = nullptr)
+                 const ValidityBitmap* lv = nullptr, const ValidityBitmap* rv = nullptr,
+                 ir::FloatComparison policy = ir::FloatComparison::IEEE)
     -> std::expected<Mask, std::string> {
     Mask result;
     result.value.resize(n);
     uint8_t* mp = result.value.data();
+    if (policy == ir::FloatComparison::NaNsEqualAndGreatest) {
+        const auto* ld = std::get_if<Column<double>>(&lhs);
+        const auto* rd = std::get_if<Column<double>>(&rhs);
+        const auto* li = std::get_if<Column<std::int64_t>>(&lhs);
+        const auto* ri = std::get_if<Column<std::int64_t>>(&rhs);
+        const auto fill = [&](const auto& left, const auto& right) {
+            nan_high_mask(
+                op, [&](std::size_t i) { return left[lhs_off + i]; },
+                [&](std::size_t i) { return right[rhs_off + i]; }, mp, n);
+        };
+        if (ld && rd)
+            fill(*ld, *rd);
+        else if (ld && ri)
+            fill(*ld, *ri);
+        else if (li && rd)
+            fill(*li, *rd);
+        if ((ld && (rd || ri)) || (li && rd)) {
+            auto validity = merge_validity(lv, lhs_off, rv, rhs_off, n);
+            result.apply_validity(validity ? &*validity : nullptr, 0, n);
+            return result;
+        }
+    }
     if (std::holds_alternative<Column<Decimal>>(lhs) ||
         std::holds_alternative<Column<Decimal>>(rhs)) {
         if (!decimal_compare_columns(op, lhs, lhs_off, rhs, rhs_off, mp, n)) {
@@ -1028,7 +1119,7 @@ struct NumericCmpSpec {
 auto try_extract_numeric_cmp_spec(const ir::Expr& expr, const PredicateInput& input,
                                   std::size_t begin) -> std::optional<NumericCmpSpec> {
     const auto* cmp = std::get_if<ir::CompareExpr>(&expr.node);
-    if (cmp == nullptr) {
+    if (cmp == nullptr || cmp->float_comparison != ir::FloatComparison::IEEE) {
         return std::nullopt;
     }
 
@@ -1154,6 +1245,8 @@ auto try_extract_numeric_operand_spec(const ir::Expr& expr, const PredicateInput
 
 auto try_extract_numeric_arith_cmp_spec(const ir::CompareExpr& cmp, const PredicateInput& input,
                                         std::size_t begin) -> std::optional<NumericArithCmpSpec> {
+    if (cmp.float_comparison != ir::FloatComparison::IEEE)
+        return std::nullopt;
     const ir::BinaryExpr* bin = nullptr;
     const ir::Literal* lit = nullptr;
     ir::CompareOp op = cmp.op;
@@ -1957,7 +2050,7 @@ namespace {
 auto split_col_cmp_lit(const ir::Expr& expr)
     -> std::optional<std::tuple<const ir::ColumnRef*, ir::CompareOp, const ir::Literal*>> {
     const auto* cmp = std::get_if<ir::CompareExpr>(&expr.node);
-    if (cmp == nullptr) {
+    if (cmp == nullptr || cmp->float_comparison != ir::FloatComparison::IEEE) {
         return std::nullopt;
     }
     if (const auto* col = std::get_if<ir::ColumnRef>(&cmp->left->node);
@@ -2094,7 +2187,7 @@ auto compute_mask(const ir::Expr& expr, const PredicateInput& input, const Scala
                     if (!lhs)
                         return std::unexpected(lhs.error());
                     return compare_col_scalar(node.op, deref_col(*lhs), lhs->offset, lit->value, n,
-                                              lhs->get_validity());
+                                              lhs->get_validity(), node.float_comparison);
                 }
                 // Fast path: literal op column/expr (flip the operator).
                 if (const auto* lit = std::get_if<ir::Literal>(&node.left->node)) {
@@ -2102,7 +2195,8 @@ auto compute_mask(const ir::Expr& expr, const PredicateInput& input, const Scala
                     if (!rhs)
                         return std::unexpected(rhs.error());
                     return compare_col_scalar(flip_cmp(node.op), deref_col(*rhs), rhs->offset,
-                                              lit->value, n, rhs->get_validity());
+                                              lit->value, n, rhs->get_validity(),
+                                              node.float_comparison);
                 }
                 // General: both sides are column expressions.
                 auto lhs = eval_value_vec(*node.left, input, scalars, rows);
@@ -2111,8 +2205,9 @@ auto compute_mask(const ir::Expr& expr, const PredicateInput& input, const Scala
                 auto rhs = eval_value_vec(*node.right, input, scalars, rows);
                 if (!rhs)
                     return std::unexpected(rhs.error());
-                auto res = compare_vec(node.op, deref_col(*lhs), lhs->offset, deref_col(*rhs),
-                                       rhs->offset, n, lhs->get_validity(), rhs->get_validity());
+                auto res =
+                    compare_vec(node.op, deref_col(*lhs), lhs->offset, deref_col(*rhs), rhs->offset,
+                                n, lhs->get_validity(), rhs->get_validity(), node.float_comparison);
                 return res;
             } else if constexpr (std::is_same_v<T, ir::LogicalExpr>) {
                 if (node.op == ir::LogicalOp::Not) {

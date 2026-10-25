@@ -97,7 +97,8 @@ auto aggregate_prefilter_terms(const ir::Expr& predicate, const ir::AggregateNod
     AggregatePrefilter terms;
     for (const ir::Expr* conjunct : conjuncts) {
         const auto* comparison = std::get_if<ir::CompareExpr>(&conjunct->node);
-        if (comparison == nullptr || comparison->left == nullptr || comparison->right == nullptr) {
+        if (comparison == nullptr || comparison->float_comparison != ir::FloatComparison::IEEE ||
+            comparison->left == nullptr || comparison->right == nullptr) {
             continue;
         }
         const ir::ColumnRef* column = ir::as_column_ref(*comparison->left);

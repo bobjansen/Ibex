@@ -1413,3 +1413,20 @@ TEST_CASE("emitter: null-preserving edge reducers", "[codegen][first_null]") {
     CHECK(contains(out, "ibex::ir::AggFunc::FirstNull"));
     CHECK(contains(out, "ibex::ir::AggFunc::LastNull"));
 }
+
+TEST_CASE("internal NaN comparison policy survives lowering and code generation",
+          "[codegen][nan-high]") {
+    auto parsed = parser::parse(R"(
+        let t = Table { x = [0.0, 1.0] };
+        t[filter __ibex_nan_high_ge(x, 0.0)][select y = __ibex_nan_high_eq(x, x)];
+    )");
+    REQUIRE(parsed.has_value());
+    auto lowered = parser::lower(*parsed);
+    REQUIRE(lowered.has_value());
+    const auto out = emit_to_string(**lowered);
+    const std::string policy = "ibex::ir::FloatComparison::NaNsEqualAndGreatest";
+    const auto first = out.find(policy);
+    REQUIRE(first != std::string::npos);
+    CHECK(out.find(policy, first + policy.size()) != std::string::npos);
+    CHECK_FALSE(contains(out, "__ibex_nan_high_"));
+}

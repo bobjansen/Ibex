@@ -1729,7 +1729,9 @@ auto Emitter::emit_filter_expr(const ir::Expr& expr) -> std::string {
             } else if constexpr (std::is_same_v<T, ir::CompareExpr>) {
                 return "ibex::ops::filter_cmp(ibex::ir::CompareOp::" + emit_compare_op(node.op) +
                        ", " + emit_filter_expr(*node.left) + ", " + emit_filter_expr(*node.right) +
-                       ")";
+                       (node.float_comparison == ir::FloatComparison::IEEE
+                            ? ")"
+                            : ", ibex::ir::FloatComparison::NaNsEqualAndGreatest)");
             } else if constexpr (std::is_same_v<T, ir::LogicalExpr>) {
                 if (node.op == ir::LogicalOp::And) {
                     return "ibex::ops::filter_and(" + emit_filter_expr(*node.left) + ", " +
@@ -1867,7 +1869,10 @@ auto Emitter::emit_expr(const ir::Expr& expr) -> std::string {
                 // the generic ir::Expr constructors for these nodes despite the
                 // name, so a field and a predicate emit the same tree.
                 return "ibex::ops::filter_cmp(ibex::ir::CompareOp::" + emit_compare_op(node.op) +
-                       ", " + emit_expr(*node.left) + ", " + emit_expr(*node.right) + ")";
+                       ", " + emit_expr(*node.left) + ", " + emit_expr(*node.right) +
+                       (node.float_comparison == ir::FloatComparison::IEEE
+                            ? ")"
+                            : ", ibex::ir::FloatComparison::NaNsEqualAndGreatest)");
             } else if constexpr (std::is_same_v<T, ir::LogicalExpr>) {
                 if (node.op == ir::LogicalOp::And) {
                     return "ibex::ops::filter_and(" + emit_expr(*node.left) + ", " +

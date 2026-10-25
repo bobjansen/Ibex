@@ -4776,7 +4776,7 @@ auto try_fused_literal_guard(const Table& input, const ir::UpdateNode& update,
         return std::nullopt;
     }
     const auto* cmp = std::get_if<ir::CompareExpr>(&update.guard()->node);
-    if (cmp == nullptr) {
+    if (cmp == nullptr || cmp->float_comparison != ir::FloatComparison::IEEE) {
         return std::nullopt;
     }
     // Normalise to `column <op> literal`.

@@ -5275,6 +5275,36 @@ class Lowerer {
             return ir::Expr{.node = std::move(lowered)};
         }
         if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
+            if (call->callee.starts_with("__ibex_nan_high_")) {
+                std::optional<ir::CompareOp> op;
+                if (call->callee == "__ibex_nan_high_eq")
+                    op = ir::CompareOp::Eq;
+                if (call->callee == "__ibex_nan_high_ne")
+                    op = ir::CompareOp::Ne;
+                if (call->callee == "__ibex_nan_high_lt")
+                    op = ir::CompareOp::Lt;
+                if (call->callee == "__ibex_nan_high_le")
+                    op = ir::CompareOp::Le;
+                if (call->callee == "__ibex_nan_high_gt")
+                    op = ir::CompareOp::Gt;
+                if (call->callee == "__ibex_nan_high_ge")
+                    op = ir::CompareOp::Ge;
+                if (!op || call->args.size() != 2 || !call->named_args.empty()) {
+                    return std::unexpected(LowerError{
+                        .message = "internal NaN comparison requires two positional operands"});
+                }
+                auto left = lower_expr_to_ir(*call->args[0]);
+                if (!left)
+                    return std::unexpected(left.error());
+                auto right = lower_expr_to_ir(*call->args[1]);
+                if (!right)
+                    return std::unexpected(right.error());
+                return ir::Expr{.node = ir::CompareExpr{
+                                    .op = *op,
+                                    .left = ir::make_expr_ptr(std::move(*left)),
+                                    .right = ir::make_expr_ptr(std::move(*right)),
+                                    .float_comparison = ir::FloatComparison::NaNsEqualAndGreatest}};
+            }
             // Every correlation form is consumed by `lower_filter` before any
             // expression is lowered, so reaching here means one was written
             // somewhere the decorrelation cannot see.

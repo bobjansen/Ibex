@@ -348,7 +348,10 @@ auto simplify_expr(Expr expr, bool* changed) -> Expr {
                 const auto* ll = std::get_if<Literal>(&n.left->node);
                 const auto* rl = std::get_if<Literal>(&n.right->node);
                 if ((ll != nullptr) && (rl != nullptr)) {
-                    if (auto folded = fold_cmp(n.op, *ll, *rl); folded.has_value()) {
+                    if (auto folded = n.float_comparison == FloatComparison::IEEE
+                                          ? fold_cmp(n.op, *ll, *rl)
+                                          : std::nullopt;
+                        folded.has_value()) {
                         *changed = true;
                         return make_bool_lit(*folded);
                     }

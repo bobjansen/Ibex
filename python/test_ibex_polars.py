@@ -521,7 +521,8 @@ class EngineTests(unittest.TestCase):
     def test_version_and_unsupported_plans_fail_without_native_execution(self):
         base = pl.DataFrame({"x": [1.0, 2.0]}).lazy()
         with patch.object(ibex_pyarrow, "bind_table") as bind, patch.object(ibex_pyarrow, "execute_pipeline") as execute:
-            for query in (base.select(pl.col("x").median()), base.join(base, on="x", validate="1:1"),
+            for query in (base.select(pl.lit(None)), base.select(pl.col("x").median()),
+                          base.join(base, on="x", validate="1:1"),
                           base.with_columns(pl.col("x").mean().alias("average")),
                           base.group_by(pl.col("x") + 1).agg(pl.len()).head(1)):
                 with self.assertRaises(NotImplementedError):

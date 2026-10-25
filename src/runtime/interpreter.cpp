@@ -290,7 +290,7 @@ auto materialize_deferred_scan(const DeferredScan& scan, const ExecutionContext&
         return scan.demand_all ? scan.lazy->materialize(exec)
                                : scan.lazy->project(scan.demand, exec);
     }
-    return scan.lazy->project_where(plan.names, plan.conjuncts, exec, nullptr, plan.dynamic,
+    return scan.lazy->project_where(plan.names, plan.conjuncts, exec, scan.scalars, plan.dynamic,
                                     plan.dynamic != nullptr ? &scan.key_column : nullptr);
 }
 
@@ -301,7 +301,7 @@ auto deferred_scan_units(const DeferredScan& scan) -> std::vector<SourceUnit> {
 auto materialize_deferred_scan_unit(const DeferredScan& scan, const DeferredScanPlan& plan,
                                     const SourceUnit& unit, const ExecutionContext& exec)
     -> std::expected<Table, std::string> {
-    return scan.lazy->project_where_unit(plan.names, plan.conjuncts, unit, exec, nullptr,
+    return scan.lazy->project_where_unit(plan.names, plan.conjuncts, unit, exec, scan.scalars,
                                          plan.dynamic,
                                          plan.dynamic != nullptr ? &scan.key_column : nullptr);
 }
@@ -315,7 +315,7 @@ auto deferred_scan_key_selection(const DeferredScan& scan, const ExecutionContex
     // Static conjuncts only — bound conjuncts are never synthesized when
     // membership exists (see materialize_deferred_scan), and phase A only
     // runs with membership.
-    return scan.lazy->join_key_selection(scan.conjuncts, exec, nullptr, *scan.filter,
+    return scan.lazy->join_key_selection(scan.conjuncts, exec, scan.scalars, *scan.filter,
                                          scan.key_column, unit);
 }
 

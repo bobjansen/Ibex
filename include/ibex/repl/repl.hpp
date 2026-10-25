@@ -96,6 +96,9 @@ class ReplSession {
         /// Format each value to text as the terminal REPL does. A caller that
         /// reads `ExecutionResult::table` / `scalar` itself can skip it.
         bool render = true;
+        /// Execute table expressions with the script planner's deferred and
+        /// streaming scans. Statements still run in order and retain bindings.
+        bool plan_table_expressions = false;
     };
 
     [[nodiscard]] auto execute(std::string_view source) -> ExecutionResult;

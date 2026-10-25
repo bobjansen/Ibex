@@ -174,6 +174,10 @@ enum class CompareOp : std::uint8_t {
     Ge,
 };
 
+/// Float ordering is selected by frontends; ordinary Ibex operators use IEEE.
+/// NaNsEqualAndGreatest ignores NaN payloads and preserves ordinary signed-zero equality.
+enum class FloatComparison : std::uint8_t { IEEE, NaNsEqualAndGreatest };
+
 /// Logical connectives for boolean expressions. `Not` is unary (uses `left`).
 enum class LogicalOp : std::uint8_t {
     And,
@@ -186,6 +190,7 @@ struct CompareExpr {
     CompareOp op = CompareOp::Eq;
     ExprPtr left;
     ExprPtr right;
+    FloatComparison float_comparison = FloatComparison::IEEE;
 };
 
 /// Logical combination of boolean expressions. For `Not`, `right` is null.

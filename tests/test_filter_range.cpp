@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <type_traits>
@@ -523,4 +524,76 @@ TEST_CASE("morsel_grain derives a grain instead of asking for one", "[runtime][p
             CHECK(many < few);
         }
     }
+}
+
+TEST_CASE("NaN-high comparisons preserve nulls and sliced operands",
+          "[runtime][filter][nan-high]") {
+    const double inf = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const std::vector<double> values{-inf, -1.0, -0.0, 0.0, 1.0, inf, nan, 0.0};
+    const std::vector<int> rank{0, 1, 2, 2, 3, 4, 5, 0};
+    runtime::Table table;
+    Column<std::int64_t> ids;
+    Column<double> left, right;
+    runtime::ValidityBitmap lv(64, true), rv(64, true);
+    for (std::size_t a = 0; a < 8; ++a) {
+        for (std::size_t b = 0; b < 8; ++b) {
+            ids.push_back(static_cast<std::int64_t>(a * 8 + b));
+            left.push_back(values[a]);
+            right.push_back(values[b]);
+            lv.set(a * 8 + b, a != 7);
+            rv.set(a * 8 + b, b != 7);
+        }
+    }
+    table.add_column("id", ColumnValue{std::move(ids)});
+    table.add_column("a", ColumnValue{std::move(left)}, std::move(lv));
+    table.add_column("b", ColumnValue{std::move(right)}, std::move(rv));
+    for (auto op : {ir::CompareOp::Eq, ir::CompareOp::Ne, ir::CompareOp::Lt, ir::CompareOp::Le,
+                    ir::CompareOp::Gt, ir::CompareOp::Ge}) {
+        for (bool scalar : {false, true}) {
+            auto expression = cmp(op, col_ref("a"), scalar ? dlit(nan) : col_ref("b"));
+            std::get<ir::CompareExpr>(expression.node).float_comparison =
+                ir::FloatComparison::NaNsEqualAndGreatest;
+            auto result = runtime::filter_table_range(table, expression, RowRange{3, 58}, nullptr);
+            REQUIRE(result.has_value());
+            std::vector<std::int64_t> expected;
+            for (std::size_t i = 3; i < 61; ++i) {
+                const auto a = i / 8, b = scalar ? std::size_t{6} : i % 8;
+                if (a == 7 || b == 7)
+                    continue;
+                const int x = rank[a], y = rank[b];
+                bool keep = false;
+                switch (op) {
+                    case ir::CompareOp::Eq:
+                        keep = x == y;
+                        break;
+                    case ir::CompareOp::Ne:
+                        keep = x != y;
+                        break;
+                    case ir::CompareOp::Lt:
+                        keep = x < y;
+                        break;
+                    case ir::CompareOp::Le:
+                        keep = x <= y;
+                        break;
+                    case ir::CompareOp::Gt:
+                        keep = x > y;
+                        break;
+                    case ir::CompareOp::Ge:
+                        keep = x >= y;
+                        break;
+                }
+                if (keep)
+                    expected.push_back(static_cast<std::int64_t>(i));
+            }
+            const auto& actual = std::get<Column<std::int64_t>>(*result->columns[0].column);
+            REQUIRE(actual.size() == expected.size());
+            for (std::size_t i = 0; i < expected.size(); ++i)
+                CHECK(actual[i] == expected[i]);
+        }
+    }
+    auto ordinary =
+        runtime::filter_table(table, cmp(ir::CompareOp::Eq, col_ref("a"), dlit(nan)), nullptr);
+    REQUIRE(ordinary.has_value());
+    CHECK(ordinary->rows() == 0);
 }

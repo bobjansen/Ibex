@@ -150,7 +150,8 @@ void forward_cli_args(int argc, char** argv);
 [[nodiscard]] auto filter_decimal(DecimalValue v) -> ir::Expr;
 [[nodiscard]] auto filter_arith(ir::ArithmeticOp op, ir::Expr l, ir::Expr r) -> ir::Expr;
 [[nodiscard]] auto filter_call(std::string callee, std::vector<ir::Expr> args) -> ir::Expr;
-[[nodiscard]] auto filter_cmp(ir::CompareOp op, ir::Expr l, ir::Expr r) -> ir::Expr;
+[[nodiscard]] auto filter_cmp(ir::CompareOp op, ir::Expr l, ir::Expr r,
+                              ir::FloatComparison policy = ir::FloatComparison::IEEE) -> ir::Expr;
 [[nodiscard]] auto filter_and(ir::Expr l, ir::Expr r) -> ir::Expr;
 [[nodiscard]] auto filter_or(ir::Expr l, ir::Expr r) -> ir::Expr;
 [[nodiscard]] auto filter_not(ir::Expr operand) -> ir::Expr;

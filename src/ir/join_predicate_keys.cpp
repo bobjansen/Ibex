@@ -50,7 +50,8 @@ auto equality_conjuncts(const Expr& expr, std::vector<const CompareExpr*>& out) 
                equality_conjuncts(*logical->left, out) && equality_conjuncts(*logical->right, out);
     }
     const auto* compare = std::get_if<CompareExpr>(&expr.node);
-    if (compare == nullptr || compare->op != CompareOp::Eq || !compare->left || !compare->right) {
+    if (compare == nullptr || compare->float_comparison != FloatComparison::IEEE ||
+        compare->op != CompareOp::Eq || !compare->left || !compare->right) {
         return false;
     }
     const auto* lhs = std::get_if<ColumnRef>(&compare->left->node);

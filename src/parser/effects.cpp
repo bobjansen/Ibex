@@ -133,6 +133,12 @@ auto builtin_summaries() -> const robin_hood::unordered_map<std::string, Callabl
         {"rand_poisson", make_builtin_summary(kEffNondet)},
         {"rand_int", make_builtin_summary(kEffNondet)},
         {"is_nan", make_builtin_summary(EffectMask{0})},
+        {"__ibex_nan_high_eq", make_builtin_summary(EffectMask{0})},
+        {"__ibex_nan_high_ne", make_builtin_summary(EffectMask{0})},
+        {"__ibex_nan_high_lt", make_builtin_summary(EffectMask{0})},
+        {"__ibex_nan_high_le", make_builtin_summary(EffectMask{0})},
+        {"__ibex_nan_high_gt", make_builtin_summary(EffectMask{0})},
+        {"__ibex_nan_high_ge", make_builtin_summary(EffectMask{0})},
         {"null_if_nan", make_builtin_summary(EffectMask{0})},
         {"null_if_not_finite", make_builtin_summary(EffectMask{0})},
     };

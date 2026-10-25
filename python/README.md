@@ -146,6 +146,9 @@ remain unsupported. Every joined pipeline executes in one native call.
 
 ## Check the actual upstream PDS-H query
 
+For the full 22-query adapter coverage check and current scale-10 timings against
+both Polars executors, see [PDS-H engine performance](pdsh-performance.md).
+
 The optional conformance runner needs Polars 2.0 and the upstream benchmark's
 Python dependencies, checkout and generated data. It invokes the original
 `queries.polars.q6.q` function twice, using real Polars and Ibex. Only the

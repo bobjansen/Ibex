@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <set>
 #include <string>
 #include <variant>
 #include <vector>
@@ -203,7 +204,8 @@ auto absorb(const Term& term, DynamicScanFilter& filter) -> bool {
 }  // namespace
 
 auto split_static_range(const std::vector<ir::Expr>& conjuncts, const Table& schema,
-                        const ScalarRegistry* scalars) -> std::optional<StaticRange> {
+                        const ScalarRegistry* scalars, const SourceColumnStats* stats)
+    -> std::optional<StaticRange> {
     std::vector<std::optional<Term>> terms;
     terms.reserve(conjuncts.size());
     for (const auto& conjunct : conjuncts) {
@@ -213,38 +215,70 @@ auto split_static_range(const std::vector<ir::Expr>& conjuncts, const Table& sch
         terms.push_back(as_term(bound ? *bound : conjunct));
     }
 
-    // The first column the reader can answer.
-    std::optional<std::string> column;
+    const auto range_for = [&](const std::string& column) -> std::optional<StaticRange> {
+        StaticRange out;
+        out.column = column;
+        bool absorbed_any = false;
+        for (std::size_t i = 0; i < conjuncts.size(); ++i) {
+            const auto& term = terms[i];
+            if (term && term->column == column) {
+                if (!comparable(schema, *term)) {
+                    return std::nullopt;
+                }
+                if (absorb(*term, out.filter)) {
+                    absorbed_any = true;
+                    continue;
+                }
+            }
+            out.rest.push_back(conjuncts[i]);
+        }
+        return absorbed_any ? std::optional{std::move(out)} : std::nullopt;
+    };
+    const auto pass_fraction = [&](const StaticRange& range) -> long double {
+        if (range.filter.min && range.filter.max && *range.filter.min > *range.filter.max) {
+            return 0;
+        }
+        if (stats == nullptr) {
+            return 1;
+        }
+        const auto it = stats->find(range.column);
+        if (it == stats->end() || !it->second.min || !it->second.max ||
+            *it->second.min > *it->second.max) {
+            return 1;
+        }
+        const auto source_lo = *it->second.min;
+        const auto source_hi = *it->second.max;
+        const auto lo = std::max(source_lo, range.filter.min.value_or(source_lo));
+        const auto hi = std::min(source_hi, range.filter.max.value_or(source_hi));
+        if (lo > hi) {
+            return 0;
+        }
+        // A uniform estimate is a planning heuristic, never a pruning proof.
+        // Convert before subtracting so the full Int64 domain cannot overflow.
+        return (static_cast<long double>(hi) - static_cast<long double>(lo) + 1) /
+               (static_cast<long double>(source_hi) - static_cast<long double>(source_lo) + 1);
+    };
+    std::optional<StaticRange> best;
+    long double best_fraction = 1;
+    std::set<std::string> seen;
     for (const auto& term : terms) {
-        if (term.has_value() && comparable(schema, *term)) {
-            column = term->column;
-            break;
+        if (!term || !comparable(schema, *term) || !seen.insert(term->column).second) {
+            continue;
+        }
+        auto range = range_for(term->column);
+        if (stats == nullptr) {
+            return range;  // preserve the original first-column rule without metadata
+        }
+        if (!range) {
+            continue;
+        }
+        const auto fraction = pass_fraction(*range);
+        if (!best || fraction < best_fraction) {
+            best_fraction = fraction;
+            best = std::move(range);
         }
     }
-    if (!column.has_value()) {
-        return std::nullopt;
-    }
-
-    StaticRange out;
-    out.column = *column;
-    bool absorbed_any = false;
-    for (std::size_t i = 0; i < conjuncts.size(); ++i) {
-        const auto& term = terms[i];
-        if (term.has_value() && term->column == *column) {
-            if (!comparable(schema, *term)) {
-                return std::nullopt;
-            }
-            if (absorb(*term, out.filter)) {
-                absorbed_any = true;
-                continue;
-            }
-        }
-        out.rest.push_back(conjuncts[i]);
-    }
-    if (!absorbed_any) {
-        return std::nullopt;
-    }
-    return out;
+    return best;
 }
 
 }  // namespace ibex::runtime

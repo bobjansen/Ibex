@@ -155,6 +155,24 @@ class EngineTests(unittest.TestCase):
             bind.assert_not_called()
             execute.assert_not_called()
 
+    def test_fused_arithmetic_keeps_operand_order_nulls_and_separate_rounding(self):
+        for dtype in (pl.Int8, pl.Int64, pl.Float32, pl.Float64):
+            values = {"a": [2, 127, None, 0, -3], "b": [3, 3, 2, 0, 4], "c": [5, 2, 5, None, -1]}
+            frame = pl.DataFrame({k: pl.Series(v, dtype=dtype) for k, v in values.items()})
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "fused.parquet"
+                frame.write_parquet(path)
+                for source in (frame.lazy(), pl.scan_parquet(path)):
+                    for expression in (pl.col("a") * pl.col("b") + pl.col("c"),
+                                       pl.col("a") * pl.col("b") - pl.col("c"),
+                                       pl.col("a") - pl.col("b") * pl.col("c")):
+                        self.equal(source.select(expression.alias("v")))
+                        self.equal(source.head(0).select(expression.alias("v")))
+        frame = pl.DataFrame({"a": [1 + 2**-27, float("inf"), float("nan")],
+                              "b": [1 - 2**-27, 0., 1.], "c": [-1., 1., 2.]}).lazy()
+        result = self.equal(frame.select((pl.col("a") * pl.col("b") + pl.col("c")).alias("v")))
+        self.assertEqual(result["v"][0], 0.)  # a hardware FMA would produce -2**-54
+
     def test_conditional_expressions_preserve_types_and_null_predicates(self):
         frame = pl.DataFrame({"x": [1., None, -2., float("nan")], "p": [True, False, None, True],
                               "s": ["a", "b", None, "d"]}).lazy()

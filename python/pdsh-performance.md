@@ -111,14 +111,58 @@ wins all eight. Q7, Q8 and Q14 are relatively close to streaming (about 11–19%
 slower). Q10 is 2.6× slower, Q17 2.1×, and Q19 is the largest gap at 7.0×.
 These measurements identify the gaps; they do not establish their causes.
 
+One matched thread, pinned to CPU 2:
+
+| Query | Polars in-memory | Polars streaming | Polars–Ibex |
+|---|---:|---:|---:|
+| Q7 | 3,469 | 2,933 | 3,009 |
+| Q8 | 4,776 | 3,394 | 3,472 |
+| Q9 | 9,049 | 4,265 | 6,729 |
+| Q10 | 3,158 | 3,148 | 4,090 |
+| Q14 | 2,118 | 2,057 | 2,138 |
+| Q17 | 1,992 | 1,445 | 3,113 |
+| Q19 | 2,212 | 2,114 | 6,941 |
+| Q20 | 4,149 | 2,774 | 3,117 |
+
+Process CPU screen for Polars–Ibex (CPU seconds sum all engine threads):
+
+| Query | 1-thread CPU s | 8-thread CPU s | CPU 8/1 | Wall speedup |
+|---|---:|---:|---:|---:|
+| Q7 | 3.01 | 3.34 | 1.11× | 5.79× |
+| Q8 | 3.47 | 3.67 | 1.06× | 6.62× |
+| Q9 | 6.73 | 7.35 | 1.09× | 6.31× |
+| Q10 | 4.09 | 4.57 | 1.12× | 3.37× |
+| Q14 | 2.14 | 2.26 | 1.06× | 6.51× |
+| Q17 | 3.11 | 3.28 | 1.05× | 6.65× |
+| Q19 | 6.94 | 12.30 | 1.77× | 3.21× |
+| Q20 | 3.12 | 3.47 | 1.11× | 5.74× |
+
+CPU growth is a screen for parallel cost, not proof of redundant decoding.
+It can also reflect contention or per-task overhead; source/row counters are
+needed before attributing an increase to duplicated work. Q19 stands out:
+its CPU total rises 77% for a 3.21× wall speedup. Q10 also scales less well
+than the other additions, though its CPU growth is only 12%.
+
 [Eight-thread samples and generated plans](pdsh-performance-results/expanded-16-timings-eight.json)
 retain bridge and Python-source hashes, query/data provenance, preparation
 and first-per-query collection times, wall-time samples and process CPU
 samples. Process CPU counts all threads and excludes correctness checks.
+[One-thread samples and generated plans](pdsh-performance-results/expanded-16-timings-one.json)
+retain the matching serial run. Both budgets use the identical bridge and
+Python sources, and ran sequentially.
 First-per-query times follow other routes/queries in the same process and
 are not fresh-process first-use measurements.
 
-The new translations cover compatible string representations, literal
+Reproduce this extension's timings with `python/bench_pdsh_engine.py`,
+`--queries 7 8 9 10 14 17 19 20 --iters 6`, and the same upstream/data paths
+as the commands in Reproduction below. Use matched `IBEX_CORES` and
+`POLARS_MAX_THREADS`, pin one thread to CPU 2 and eight threads to
+0,2,4,6,8,10,12,14, and run the budgets sequentially. Rebuild the complete
+Release tree immediately before each run.
+
+## Earlier eight-query coverage
+
+The earlier extension covered compatible string representations, literal
 membership (including null policies), conditional expressions and typed null
 branches, Boolean sums, literal starts/ends/contains matching, Date year
 extraction, deterministic cached subplans, floating grouping keys, numeric
@@ -152,7 +196,8 @@ PYTHONPATH=build-release/python:python IBEX_CORES=8 POLARS_MAX_THREADS=8 \
   --check-only --out results/pdsh-coverage-eight.json
 ```
 
-Use `--queries 2 3 5 12 18` for just the newly supported queries. The JSON keeps
+For that earlier extension, use `--queries 2 3 5 12 18`; the latest additions
+use `--queries 7 8 9 10 14 17 19 20`. The JSON keeps
 all outcomes, upstream source hashes, generated native source for successful
 queries, input metadata and bridge identity. `first_collect_ms` is diagnostic
 first-use timing, not a warm benchmark result.

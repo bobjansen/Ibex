@@ -70,7 +70,7 @@ reported separately in the performance note below.
 |---|---|
 | Input | A single local Parquet file, or `DataFrame(dict_or_arrow_table).lazy()` |
 | Expressions | `col`, `lit`, aliases, numeric arithmetic, comparisons, Boolean `&`, `\|`, `~`, `is_between`, numeric `sum`/`mean`, `first`/`last`, non-null column `count`, row count `len` |
-| Pipelines | `filter`, `select`, one expression per `with_columns`, column-key `group_by(...).agg(...)`, column-key `sort`, `unique`, `collect`, source-only `explain` |
+| Pipelines | `filter`, `select`, one expression per `with_columns`, column-key `group_by(...).agg(...)`, column-key `sort`, `unique`, `slice`, `head`, `tail`, `gather_every`, Python row slicing, `collect`, source-only `explain` |
 | Results | Ibex `DataFrame`/`Series`, columns, shape, item, column lookup, `to_list`, `to_dict`, `to_arrow`, `to_pandas` |
 | Types | Int64, Float64, Bool, strings, Date; sums preserve Int64/Float64 and return zero for empty/all-null input; mean is Float64; row-count output is UInt32 |
 
@@ -127,6 +127,15 @@ columns. The `first`, `last`, and `none` modes are also supported; `any` chooses
 the first row. Results retain selected rows in input order. Nulls and NaNs
 compare equal within duplicate groups, and signed zeros compare equal.
 Empty subsets remain unsupported.
+
+Row selection supports `.slice(offset, length=None)`, `.head(n)`, `.tail(n)`,
+`.gather_every(n, offset=0)`, and Python indexing such as `[2:10:3]` or `[::-1]`.
+A temporary native `seq()` column supplies zero-based positions; bounds resolve
+after preceding operations, and the helper column is removed from results.
+Python indexing uses exclusive stops and supports negative bounds and steps.
+The Polars-style `.slice` uses offset/length semantics and clips the requested
+interval at the frame boundaries. Zero steps and negative lengths are errors.
+This initial lowering materializes positions rather than skipping input chunks.
 
 ## Check the actual upstream PDS-H query
 

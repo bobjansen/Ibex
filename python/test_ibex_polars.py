@@ -632,10 +632,7 @@ class EngineTests(unittest.TestCase):
         self.assertIn("distinct {", ibex.DataFrame({"x": [1, 1, 2]}).lazy().unique().explain())
         with self.assertRaises(NotImplementedError):
             ibex.DataFrame(data).lazy().unique(subset=[])
-        with patch.object(ibex_pyarrow, "execute_pipeline") as execute:
-            with self.assertRaises(NotImplementedError):
-                pl.LazyFrame(data).unique().head(1).collect(engine=IbexEngine())
-            execute.assert_not_called()
+        self.equal(pl.LazyFrame(data).unique(keep="first", maintain_order=True).head(1))
 
 
 if __name__ == "__main__":

@@ -68,6 +68,37 @@ class LazyFrame:
             raise ValueError("duplicate grouping keys")
         return LazyGroupBy(self, tuple(by), maintain_order)
 
+    def slice(self, offset, length=None):
+        if type(offset) is not int or (length is not None and type(length) is not int):
+            raise TypeError("slice offset and length must be integers")
+        if length is not None and length < 0:
+            raise ValueError("slice length must be non-negative")
+        return self._append("slice", (offset, length))
+
+    def head(self, n=5):
+        if type(n) is not int:
+            raise TypeError("head length must be an integer")
+        return self.slice(0, n)
+
+    def tail(self, n=5):
+        if type(n) is not int or n < 0:
+            raise ValueError("tail length must be a non-negative integer")
+        return self.slice(-n, n)
+
+    def gather_every(self, n, offset=0):
+        if type(n) is not int or n <= 0 or type(offset) is not int or offset < 0:
+            raise ValueError("gather_every requires a positive step and non-negative offset")
+        return self[slice(offset, None, n)]
+
+    def __getitem__(self, key):
+        if not isinstance(key, slice):
+            raise NotImplementedError("lazy indexing currently supports slices only")
+        if any(value is not None and type(value) is not int for value in (key.start, key.stop, key.step)):
+            raise TypeError("slice bounds and step must be integers")
+        if key.step == 0:
+            raise ValueError("slice step cannot be zero")
+        return self._append("python_slice", (key.start, key.stop, key.step or 1))
+
     def unique(self, subset=None, *, keep="any", maintain_order=False):
         if keep not in ("any", "first", "last", "none"):
             raise ValueError("keep must be 'any', 'first', 'last', or 'none'")

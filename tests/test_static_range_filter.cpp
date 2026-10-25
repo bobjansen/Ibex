@@ -251,3 +251,55 @@ TEST_CASE("static range: bound constants resolve per execution with column scope
     CHECK_FALSE(runtime::split_static_range({compare(ir::CompareOp::Gt, col("d"), ref("i"))},
                                             schema(), &scalars));
 }
+
+TEST_CASE("static range: metadata ranks complete intervals independently of predicate order",
+          "[runtime][static_range][range_choice]") {
+    const std::vector<ir::Expr> predicate{compare(ir::CompareOp::Lt, col("i"), lit(50)),
+                                          compare(ir::CompareOp::Ge, col("d"), date_lit(200)),
+                                          compare(ir::CompareOp::Lt, col("d"), date_lit(300))};
+    runtime::SourceColumnStats stats;
+    stats.emplace("i", runtime::ColumnStats{.min = 0, .max = 99, .null_count = std::nullopt});
+    stats.emplace("d", runtime::ColumnStats{.min = 0, .max = 999, .null_count = std::nullopt});
+    auto range = runtime::split_static_range(predicate, schema(), nullptr, &stats);
+    REQUIRE(range);
+    CHECK(range->column == "d");
+    CHECK(range->filter.min == 200);
+    CHECK(range->filter.max == 299);
+    REQUIRE(range->rest.size() == 1);
+    CHECK(std::get<ir::ColumnRef>(std::get<ir::CompareExpr>(range->rest[0].node).left->node).name ==
+          "i");
+    // Same bounds, different source domain: the integer constraint now wins.
+    stats.at("i").max = 999;
+    range = runtime::split_static_range(predicate, schema(), nullptr, &stats);
+    REQUIRE(range);
+    CHECK(range->column == "i");
+    CHECK(range->rest.size() == 2);
+    // Unknown metadata and equal estimates retain the original order.
+    stats.clear();
+    range = runtime::split_static_range(predicate, schema(), nullptr, &stats);
+    REQUIRE(range);
+    CHECK(range->column == "i");
+    stats.emplace("i", runtime::ColumnStats{.min = 0, .max = 99, .null_count = std::nullopt});
+    stats.emplace("d", runtime::ColumnStats{.min = 200, .max = 399, .null_count = std::nullopt});
+    range = runtime::split_static_range(predicate, schema(), nullptr, &stats);
+    REQUIRE(range);
+    CHECK(range->column == "i");
+}
+
+TEST_CASE("static range: estimates handle full-width domains and empty intersections",
+          "[runtime][static_range][range_choice]") {
+    runtime::SourceColumnStats stats;
+    stats.emplace("i", runtime::ColumnStats{.min = std::numeric_limits<std::int64_t>::min(),
+                                            .max = std::numeric_limits<std::int64_t>::max(),
+                                            .null_count = std::nullopt});
+    stats.emplace("d", runtime::ColumnStats{.min = 0, .max = 999, .null_count = std::nullopt});
+    const std::vector<ir::Expr> predicate{compare(ir::CompareOp::Lt, col("i"), lit(0)),
+                                          compare(ir::CompareOp::Ge, col("d"), date_lit(1000))};
+    auto range = runtime::split_static_range(predicate, schema(), nullptr, &stats);
+    REQUIRE(range);
+    CHECK(range->column == "d");
+    stats.at("d").max.reset();
+    range = runtime::split_static_range(predicate, schema(), nullptr, &stats);
+    REQUIRE(range);
+    CHECK(range->column == "i");
+}

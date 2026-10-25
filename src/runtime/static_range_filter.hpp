@@ -5,6 +5,7 @@
 
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/lazy_table.hpp>
 
 #include <optional>
 #include <string>
@@ -24,9 +25,11 @@ struct StaticRange {
 };
 
 /// Split `conjuncts` into the comparisons of one integer-like column against
-/// literals (including current scalar bindings) and the rest. The column is the first one with such
-/// a comparison that the reader can answer; its other comparisons are folded into the same
-/// interval. nullopt means no such column, and the ordinary filter path stands.
+/// literals (including current scalar bindings) and the rest. Source min/max
+/// statistics rank candidate intervals by their estimated surviving fraction.
+/// Missing statistics and ties preserve predicate order. Other comparisons on
+/// the chosen column are folded into the same interval. nullopt means no such
+/// column, and the ordinary filter path stands.
 ///
 /// `schema` types the column, because the reader compares raw int64 bits and so
 /// must agree with what the ordinary filter would do with the same operands: an
@@ -40,7 +43,8 @@ struct StaticRange {
 /// split declines, so the ordinary path can report the type error rather than
 /// have it hidden by the rows the interval already removed.
 [[nodiscard]] auto split_static_range(const std::vector<ir::Expr>& conjuncts, const Table& schema,
-                                      const ScalarRegistry* scalars = nullptr)
+                                      const ScalarRegistry* scalars = nullptr,
+                                      const SourceColumnStats* stats = nullptr)
     -> std::optional<StaticRange>;
 
 }  // namespace ibex::runtime

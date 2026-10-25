@@ -1663,6 +1663,11 @@ inline auto double_to_sortable_u64(double value) -> std::uint64_t {
                                    const std::vector<ir::AggSpec>& aggregations,
                                    const ExecutionContext* exec = nullptr)
     -> std::expected<Table, std::string>;
+/// Global cov/corr after aggregate_table has validated both numeric inputs.
+/// Fixed row blocks and merge order give bit-identical results at every budget.
+[[nodiscard]] auto global_paired_aggregate(const Table& input,
+                                           const std::vector<ir::AggSpec>& aggregations,
+                                           const ExecutionContext* exec) -> Table;
 /// The one row an aggregate with no `by` yields over an empty input (SQL's
 /// rule: the whole input is one group, even when it is empty). `count` and
 /// `count_distinct` are 0; every other aggregate is null. `empty_columns` is

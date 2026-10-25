@@ -68,6 +68,46 @@ class LazyFrame:
             raise ValueError("duplicate grouping keys")
         return LazyGroupBy(self, tuple(by), maintain_order)
 
+    def join(self, other, on=None, *, how="inner", left_on=None, right_on=None,
+             suffix="_right", nulls_equal=False, coalesce=None, maintain_order="none", validate="m:m", _left_columns=None, _right_columns=None):
+        if not isinstance(other, LazyFrame):
+            raise TypeError("join requires another lazy frame")
+        if how not in ("inner", "left", "right", "full", "semi", "anti", "cross"):
+            raise NotImplementedError(f"unsupported join kind {how}")
+        if validate != "m:m":
+            raise NotImplementedError("join cardinality validation is not supported yet")
+        if maintain_order is None:
+            maintain_order = "none"
+        if maintain_order not in ("none", "left", "right", "left_right", "right_left"):
+            raise ValueError("unsupported join ordering policy")
+        if how in ("semi", "anti") and maintain_order not in ("none", "left", "left_right"):
+            raise NotImplementedError("right ordering for semi/anti joins is unsupported")
+        if type(nulls_equal) is not bool or (coalesce is not None and type(coalesce) is not bool):
+            raise TypeError("join nulls_equal/coalesce must be Boolean")
+        if not isinstance(suffix, str):
+            raise TypeError("join suffix must be a string")
+        def keys(value):
+            value = (value,) if isinstance(value, str) else tuple(value or ())
+            for name in value:
+                _identifier(name)
+            if len(set(value)) != len(value):
+                raise NotImplementedError("duplicate join keys are unsupported")
+            return value
+        if on is not None:
+            if left_on is not None or right_on is not None:
+                raise ValueError("use on or left_on/right_on")
+            left_on = right_on = on
+        left_on, right_on = keys(left_on), keys(right_on)
+        if how == "cross":
+            if left_on or right_on:
+                raise ValueError("cross joins do not accept keys")
+        elif not left_on or len(left_on) != len(right_on):
+            raise ValueError("join needs equally sized left/right key lists")
+        coalesce = (how in ("inner", "left", "right")) if coalesce is None else coalesce
+        if how in ("semi", "anti", "cross"):
+            coalesce = False
+        return self._append("join", (other, left_on, right_on, how, suffix, nulls_equal, coalesce, maintain_order, _left_columns, _right_columns))
+
     def slice(self, offset, length=None):
         if type(offset) is not int or (length is not None and type(length) is not int):
             raise TypeError("slice offset and length must be integers")

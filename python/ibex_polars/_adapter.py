@@ -2,11 +2,13 @@
 # Copyright (C) 2026 Bob Jansen
 """Pinned adapter for Polars 2.0.0's private logical-plan visitor.
 
-Only visitor-provided node/expression IDs are accessed. Unknown nodes/options
-fail during plan translation, before input preparation or native execution.
+Visitor node/expression IDs drive translation. Original plan metadata supplies
+join validation flags omitted by the visitor. Unknown nodes/options fail before
+native input binding or execution.
 """
 
 import json
+import warnings
 from datetime import date
 from pathlib import Path
 
@@ -63,6 +65,8 @@ class Adapter:
         self.visitor = lf._ldf.with_optimizations(optimizations._pyoptflags).visit()
         if self.visitor.version() != VISITOR_VERSION:
             raise NotImplementedError(f"unsupported Polars visitor version {self.visitor.version()}")
+        self.original_frame = lf
+        self.checked_join_validation = False
         self.nodes = {}
         self.expressions = {}
         self.frame_length_columns = {}
@@ -223,6 +227,34 @@ class Adapter:
 
     def named(self, expr):
         return self.expression(expr.node).alias(expr.output_name)
+
+    def _check_join_validation(self):
+        if self.checked_join_validation:
+            return
+        # Visitor 15.2 omits JoinValidation. Read original plan metadata once
+        # so cardinality assertions cannot silently become unchecked joins.
+        def discard_payload(value):
+            if "df" in value and "schema" in value:
+                value["df"] = None
+            return value
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            plan = json.loads(self.original_frame.serialize(format="json"), object_hook=discard_payload)
+        def walk(value):
+            if isinstance(value, dict):
+                if "Join" in value:
+                    validation = value["Join"]["options"]["args"]["validation"]
+                    if validation != "ManyToMany":
+                        raise NotImplementedError("join cardinality validation is not supported by this visitor adapter")
+                for key, child in value.items():
+                    if key != "df":
+                        walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    if isinstance(child, (dict, list)):
+                        walk(child)
+        walk(plan)
+        self.checked_join_validation = True
 
     def _hstack(self, frame, expressions, output_names, node_id):
         # Polars CSE lifts repeat's length into a WITH_COLUMNS field.
@@ -388,6 +420,33 @@ class Adapter:
             if node.predicate is not None:
                 frame = frame.filter(self.expression(node.predicate.node))
             frame = frame.select(list(schema))
+        elif kind == "Join":
+            how, nulls_equal, slice_, suffix, coalesce, maintain_order = node.options
+            if not isinstance(how, str):
+                raise NotImplementedError(f"unsupported join options {how}")
+            how = how.lower()
+            left = self.frame(node.input_left)
+            right = self.frame(node.input_right)
+            def keys(expressions, input_node):
+                self.visitor.set_node(input_node)
+                result = []
+                for named in expressions:
+                    expr = self.expression(named.node)
+                    if expr._op != "col":
+                        raise NotImplementedError("computed join keys are unsupported")
+                    result.append(expr._name)
+                return result
+            left_on = keys(node.left_on, node.input_left)
+            self.visitor.set_node(node.input_left)
+            left_columns = tuple(self.visitor.get_schema())
+            right_on = keys(node.right_on, node.input_right)
+            right_columns = tuple(self.visitor.get_schema())
+            self._check_join_validation()
+            frame = left.join(right, left_on=left_on, right_on=right_on, how=how,
+                              suffix=suffix, nulls_equal=nulls_equal, coalesce=coalesce,
+                              maintain_order=maintain_order, _left_columns=left_columns, _right_columns=right_columns)
+            if slice_ is not None:
+                frame = frame.slice(*slice_)
         elif kind == "Slice":
             frame = self.frame(node.input).slice(node.offset, node.len)
         elif kind == "Distinct":
@@ -446,9 +505,18 @@ class Adapter:
         frame = self.frame(root)
         # Validate the complete supported plan before native input binding.
         lower(frame, validate=True, widen_numeric_inputs=True)
-        if frame._source[0] == "table":
-            prepared = ibex.DataFrame(frame._source[1]).lazy()
-            frame = ibex.LazyFrame(prepared._source, frame._steps)
+        prepared_sources = {}
+        def prepare_inputs(current):
+            source = current._source
+            if source[0] == "table":
+                key = id(source[1])
+                if key not in prepared_sources:
+                    prepared_sources[key] = ibex.DataFrame(source[1]).lazy()._source
+                source = prepared_sources[key]
+            steps = tuple((operation, (prepare_inputs(args[0]), *args[1:])) if operation == "join"
+                          else (operation, args) for operation, args in current._steps)
+            return ibex.LazyFrame(source, steps)
+        frame = prepare_inputs(frame)
         result_schema = {}
         source, bindings, scalars = lower(frame, validate=True, result_schema=result_schema, widen_numeric_inputs=True)
         return source, bindings, scalars, expected, result_schema

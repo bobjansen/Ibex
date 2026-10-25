@@ -233,16 +233,23 @@ class Adapter:
                         or not isinstance(collection.value, list) or len(collection.value) > 256):
                     raise NotImplementedError("membership requires a literal list of at most 256 scalar values")
                 child = self.expression(value.input[0])
-                present = ibex.lit(False)
+                present = None
                 for member in collection.value:
                     if member is not None:
-                        present = present | Expr("polars_==", (child, ibex.lit(member)))
+                        comparison = Expr("polars_==", (child, ibex.lit(member)))
+                        present = comparison if present is None else present | comparison
                 nulls_equal = value.function_data[1]
                 if type(nulls_equal) is not bool:
                     raise NotImplementedError("unsupported membership null policy")
                 on_null = (ibex.lit(any(member is None for member in collection.value)) if nulls_equal
                            else Expr("typed_null", (ibex.lit(False),)))
-                expr = Expr("case", (Expr("is_null", (child,)), on_null, present))
+                # Equality already propagates null. Keeping the comparison tree
+                # bare also lets the engine recognize a scan membership filter.
+                if present is not None and not nulls_equal:
+                    expr = present
+                else:
+                    expr = Expr("case", (Expr("is_null", (child,)), on_null,
+                                         ibex.lit(False) if present is None else present))
                 self.expressions[key] = expr
                 return expr
             args = tuple(self.expression(child) for child in value.input)

@@ -80,6 +80,17 @@ class EngineTests(unittest.TestCase):
                                                               (~member).sum().alias("no")).sort("s"))
                 self.equal(source.head(0).select(pl.col("s").is_in(["MAIL"]).sum()))
 
+    def test_membership_filter_keeps_bare_equality_chain(self):
+        query = pl.DataFrame({"s": ["MAIL", "SHIP", None]}).lazy().filter(
+            pl.col("s").is_in(["MAIL", "SHIP"]))
+        source = self.engine.explain(query)
+        self.assertNotIn("case {", source)
+        # Only the two choices are bound: no false seed in the OR tree.
+        self.assertEqual(source.count("=="), 2)
+        self.assertEqual(source.count("||"), 1)
+        self.assertEqual(source.count("^_ibex_scalar_"), 2)
+        self.equal(query)
+
     def test_conditional_expressions_preserve_types_and_null_predicates(self):
         frame = pl.DataFrame({"x": [1., None, -2., float("nan")], "p": [True, False, None, True],
                               "s": ["a", "b", None, "d"]}).lazy()

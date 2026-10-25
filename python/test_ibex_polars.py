@@ -127,6 +127,34 @@ class EngineTests(unittest.TestCase):
             bind.assert_not_called()
             execute.assert_not_called()
 
+    def test_fused_join_predicate_revisits_without_mutating_flags(self):
+        left = pl.DataFrame({"k": [1, 1, 2, None], "x": [1., 3., None, float("nan")]})
+        right = pl.DataFrame({"k": [1, 2, None], "y": [2., 4., 6.]})
+        predicates = [pl.col("x") < pl.col("y"),
+                      ((pl.col("x") == 1) & (pl.col("y") == 2)) |
+                      ((pl.col("x") == 3) & (pl.col("y") == 4))]
+        with tempfile.TemporaryDirectory() as directory:
+            lp, rp = Path(directory) / "left.parquet", Path(directory) / "right.parquet"
+            left.write_parquet(lp)
+            right.write_parquet(rp)
+            for l, r in ((left.lazy(), right.lazy()), (pl.scan_parquet(lp), pl.scan_parquet(rp))):
+                for predicate in predicates:
+                    query = l.join(r, on="k", nulls_equal=True).filter(predicate).sort("k", "x")
+                    flags = pl.QueryOptFlags()
+                    before = str(flags)
+                    with self.assertRaisesRegex(NotImplementedError, "join with a fused predicate"):
+                        Adapter(query, flags).compile()
+                    self.equal(query, options=flags)
+                    self.equal(query, options=flags)  # cached translation
+                    self.assertEqual(str(flags), before)
+                    self.assertTrue(flags.predicate_pushdown)
+        with patch.object(ibex_pyarrow, "bind_table") as bind, patch.object(ibex_pyarrow, "execute_pipeline") as execute:
+            with self.assertRaises(NotImplementedError):
+                self.engine.prepare(left.lazy().join(right.lazy(), on="k", validate="1:1")
+                                    .filter(pl.col("x") < pl.col("y")))
+            bind.assert_not_called()
+            execute.assert_not_called()
+
     def test_conditional_expressions_preserve_types_and_null_predicates(self):
         frame = pl.DataFrame({"x": [1., None, -2., float("nan")], "p": [True, False, None, True],
                               "s": ["a", "b", None, "d"]}).lazy()

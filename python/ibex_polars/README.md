@@ -25,6 +25,11 @@ aggregation and sorting execute in Ibex. Polars supplies source column handles
 and converts the output into its public container/dtypes. Unsupported plans
 raise before native binding/execution; there is no automatic fallback.
 
+When visitor 15.2 rejects a join with a fused predicate, preparation revisits
+the same query with Polars predicate pushdown disabled. This exposes ordinary
+join/filter nodes for Ibex to optimize. Caller flags are copied, all other
+visitor errors still propagate, and execution remains entirely in Ibex.
+
 Column `count()` counts non-null values, while `pl.len()` counts all rows.
 Both return UInt32 and return zero for empty input. NaN and false Boolean
 values count as present. Computed row-expression counts are also supported.

@@ -90,7 +90,17 @@ class IbexEngine(pl.Engine):
         if entry is not None and entry[0]() is lf:
             self._cache.move_to_end(key)
             return entry[1]
-        plan = Adapter(lf, optimizations).compile()
+        try:
+            plan = Adapter(lf, optimizations).compile()
+        except NotImplementedError as error:
+            if str(error) != "join with a fused predicate" or not optimizations.predicate_pushdown:
+                raise
+            # Visitor 15.2 cannot expose this optimized node. Revisit the same
+            # query as an ordinary join plus filter; Ibex can push it down.
+            # Copy the Rust flags so caller settings and cache keys stay intact.
+            flags = pl.QueryOptFlags._from_pyoptflags(optimizations._pyoptflags.copy())
+            flags.update(predicate_pushdown=False)
+            plan = Adapter(lf, flags).compile()
         if self._cache_size:
             owner = weakref.ref(self)
             def discard(reference):

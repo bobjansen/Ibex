@@ -8,6 +8,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -478,5 +480,127 @@ TEST_CASE("filter_selection: Date and Timestamp column-vs-column comparisons",
         CHECK(select(table, {cmp_cols(left, ir::CompareOp::Ge, right)}) == Rows{4, 5, 6, 7, 8, 9});
         // Swapped operands flip the answer.
         CHECK(select(table, {cmp_cols(right, ir::CompareOp::Lt, left)}) == Rows{5, 6, 7, 8, 9});
+    }
+}
+
+namespace {
+
+auto ordered_compare(double a, ir::CompareOp op, double b, ir::FloatComparison policy) -> bool {
+    const bool high = policy == ir::FloatComparison::NaNsEqualAndGreatest;
+    const bool an = std::isnan(a);
+    const bool bn = std::isnan(b);
+    const bool eq = (high && an && bn) || a == b;
+    const bool lt = (high && !an && bn) || a < b;
+    const bool gt = (high && an && !bn) || a > b;
+    switch (op) {
+        case ir::CompareOp::Eq:
+            return eq;
+        case ir::CompareOp::Ne:
+            return !eq;
+        case ir::CompareOp::Lt:
+            return lt;
+        case ir::CompareOp::Le:
+            return lt || eq;
+        case ir::CompareOp::Gt:
+            return gt;
+        case ir::CompareOp::Ge:
+            return gt || eq;
+    }
+    return false;
+}
+
+auto policy_cmp(ir::CompareOp op, double bound, ir::FloatComparison policy, bool reversed = false)
+    -> ir::Expr {
+    auto expr = cmp("d", op, lit_d(bound));
+    auto& comparison = std::get<ir::CompareExpr>(expr.node);
+    comparison.float_comparison = policy;
+    if (reversed) {
+        std::swap(comparison.left, comparison.right);
+    }
+    return expr;
+}
+
+}  // namespace
+
+TEST_CASE("filter_selection: fused bounds preserve both float policies across the value matrix",
+          "[filter][selection][nan_bounds]") {
+    const std::array values{-std::numeric_limits<double>::infinity(),
+                            -1.0,
+                            -0.0,
+                            0.0,
+                            1.0,
+                            std::numeric_limits<double>::infinity(),
+                            std::numeric_limits<double>::quiet_NaN()};
+    std::vector<double> data;
+    constexpr std::size_t rows = 5003;  // crosses blocked-kernel boundaries
+    runtime::ValidityBitmap validity(rows, true);
+    for (std::size_t row = 0; row < rows; ++row) {
+        data.push_back(values[row % values.size()]);
+        validity.set(row, row % 11 != 0);
+    }
+    runtime::Table table;
+    table.add_column("d", Column<double>{data}, validity);
+    for (const auto policy :
+         {ir::FloatComparison::IEEE, ir::FloatComparison::NaNsEqualAndGreatest}) {
+        for (const auto op : {ir::CompareOp::Eq, ir::CompareOp::Ne, ir::CompareOp::Lt,
+                              ir::CompareOp::Le, ir::CompareOp::Gt, ir::CompareOp::Ge}) {
+            for (const auto bound : values) {
+                for (const bool reversed : {false, true}) {
+                    INFO(static_cast<int>(policy) << " " << static_cast<int>(op) << " " << bound
+                                                  << " reversed=" << reversed);
+                    std::vector<std::size_t> expected;
+                    for (std::size_t row = 0; row < rows; ++row) {
+                        const auto a = reversed ? bound : data[row];
+                        const auto b = reversed ? data[row] : bound;
+                        if (validity[row] && ordered_compare(a, op, b, policy)) {
+                            expected.push_back(row);
+                        }
+                    }
+                    CHECK(select(table, {policy_cmp(op, bound, policy, reversed)}) == expected);
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("filter_selection: mixed policies and NaN-only bounds agree across worker counts",
+          "[filter][selection][nan_bounds]") {
+    constexpr std::size_t rows = 200003;
+    std::vector<double> data;
+    runtime::ValidityBitmap validity(rows, true);
+    for (std::size_t row = 0; row < rows; ++row) {
+        data.push_back(row % 3 == 0   ? std::numeric_limits<double>::quiet_NaN()
+                       : row % 3 == 1 ? std::numeric_limits<double>::infinity()
+                                      : 1.0);
+        validity.set(row, row % 11 != 0);
+    }
+    runtime::Table table;
+    table.add_column("d", Column<double>{data}, validity);
+    const auto high = ir::FloatComparison::NaNsEqualAndGreatest;
+    const auto ieee = ir::FloatComparison::IEEE;
+    const auto inf = std::numeric_limits<double>::infinity();
+    for (const auto upper_policy : {high, ieee}) {
+        for (const bool nan_only : {false, true}) {
+            auto lower = policy_cmp(nan_only ? ir::CompareOp::Gt : ir::CompareOp::Ge, inf, high);
+            auto upper = policy_cmp(ir::CompareOp::Ge, 0, upper_policy);
+            for (const bool reverse_order : {false, true}) {
+                const std::vector<ir::Expr> terms =
+                    reverse_order ? std::vector{upper, lower} : std::vector{lower, upper};
+                std::vector<std::size_t> expected;
+                for (std::size_t row = 0; row < rows; ++row) {
+                    if (validity[row] &&
+                        ordered_compare(data[row], nan_only ? ir::CompareOp::Gt : ir::CompareOp::Ge,
+                                        inf, high) &&
+                        ordered_compare(data[row], ir::CompareOp::Ge, 0, upper_policy)) {
+                        expected.push_back(row);
+                    }
+                }
+                for (const std::size_t threads : std::array<std::size_t, 4>{1, 2, 3, 8}) {
+                    runtime::ExecutionContext exec;
+                    exec.parallel_threads = threads;
+                    CHECK(select(table, terms, exec) == expected);
+                }
+            }
+        }
     }
 }

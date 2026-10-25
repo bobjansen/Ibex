@@ -17,7 +17,7 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
     scalars = {}
     tables = {}
 
-    needs_schema = validate or any(operation == "unique" for operation, _ in frame._steps)
+    needs_schema = validate or any(operation in ("unique", "slice", "python_slice") for operation, _ in frame._steps)
     step_types, schemas = _validate_types(frame, widen_numeric_inputs=widen_numeric_inputs) if needs_schema else ([], [])
     if result_schema is not None:
         result_schema.update(schemas[-1])
@@ -138,6 +138,70 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             fields = ", ".join(_identifier(name) for name in keys)
             fields += ", " + ", ".join(f"{_identifier(expr._name)} = {render(expr)}" for expr in aggregates)
             source += f"[select {{ {fields} }}, by {{ {', '.join(_identifier(name) for name in keys)} }}]"
+        elif operation in ("slice", "python_slice"):
+            columns = schemas[index]
+            row = f"_ibex_slice_row_{index}"
+            while row in columns:
+                row += "_"
+            row_ref = _identifier(row)
+            int_max = 2**63 - 1
+            def bounded(value):
+                return min(int_max, max(-2**63, value))
+            if operation == "slice":
+                offset, length = expressions
+                needs_height = offset < 0
+            else:
+                start, stop, step = expressions
+                needs_height = step < 0 or any(value is not None and value < 0 for value in (start, stop))
+            if needs_height:
+                shared, height = f"_ibex_slice_input_{index}", f"_ibex_slice_height_{index}"
+                prefix += f"let {shared} = {source};\n"
+                prefix += f"let {height} = scalar({shared}[select {{ _ibex_slice_count = count() }}]);\n"
+                source = shared
+                height_ref = "^" + height
+            def positive_bound(value):
+                if value >= 0:
+                    return str(bounded(value))
+                candidate = f"({height_ref} + ({bind(bounded(value))}))"
+                return f"(case {{ {candidate} < 0 => 0, else => {candidate} }})"
+            if operation == "slice":
+                begin = positive_bound(offset)
+                predicates = [f"{row_ref} >= {begin}"]
+                if length is not None:
+                    # Polars clips the requested interval, including any part
+                    # before row zero. Compute offset+length in Python first,
+                    # so extreme bounds cannot overflow native Int64 arithmetic.
+                    end = offset + length
+                    if offset >= 0:
+                        predicates.append(f"{row_ref} < {min(end, int_max)}")
+                    elif end < 0:
+                        predicates.append(f"{row_ref} < {positive_bound(end)}")
+                reverse = False
+            elif step > 0:
+                begin = positive_bound(start or 0)
+                predicates = [f"{row_ref} >= {begin}"]
+                if stop is not None:
+                    predicates.append(f"{row_ref} < {positive_bound(stop)}")
+                predicates.append(f"({row_ref} - {begin}) % {min(step, int_max)} == 0")
+                reverse = False
+            else:
+                def negative_bound(value, default):
+                    if value is None:
+                        return default
+                    if value >= 0:
+                        candidate = str(bounded(value))
+                        return f"(case {{ {candidate} >= {height_ref} => {height_ref} - 1, else => {candidate} }})"
+                    candidate = f"({height_ref} + ({bind(bounded(value))}))"
+                    return f"(case {{ {candidate} < -1 => -1, else => {candidate} }})"
+                begin = negative_bound(start, f"({height_ref} - 1)")
+                end = negative_bound(stop, "(-1)")
+                predicates = [f"{row_ref} <= {begin}", f"{row_ref} > {end}",
+                              f"({begin} - {row_ref}) % {min(-step, int_max)} == 0"]
+                reverse = True
+            source += f"[update {{ {row_ref} = seq() }}][filter {' && '.join(predicates)}]"
+            if reverse:
+                source += f"[order {{ {row_ref} desc }}]"
+            source += f"[select {{ {', '.join(_identifier(name) for name in columns)} }}]"
         elif operation == "unique":
             subset, keep, maintain_order = expressions
             columns = schemas[index]
@@ -370,6 +434,10 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
         if operation == "aggregate":
             keys, expressions = expressions
             key_types = [dtype(Expr("col", (name,))) for name in keys]
+        elif operation in ("slice", "python_slice"):
+            step_types.append(type_map)
+            schemas.append(dict(columns))
+            continue
         elif operation == "unique":
             subset, keep, maintain_order = expressions
             for name in columns:

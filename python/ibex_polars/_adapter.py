@@ -66,6 +66,7 @@ class Adapter:
         self.nodes = {}
         self.expressions = {}
         self.frame_length_columns = {}
+        self.sort_pruning_predicates = set()
 
     def expression(self, node):
         # Dtypes and proofs of frame-sized lengths belong to the current input
@@ -195,6 +196,10 @@ class Adapter:
                     raise NotImplementedError(f"unsupported closed interval {closed}")
                 expr = Expr("polars_>=" if closed in ("left", "both") else "polars_>", (args[0], args[1])) & Expr(
                     "polars_<=" if closed in ("right", "both") else "polars_<", (args[0], args[2]))
+            elif name == "dynamic_pred" and len(value.function_data) == 2 and value.function_data[1] in self.sort_pruning_predicates:
+                # This predicate is optional top-k pruning for a known sort.
+                # A full native sort followed by the slice needs no pruning.
+                expr = ibex.lit(True)
             elif name == "Not" and len(args) == 1:
                 expr = ~args[0]
             elif name == "IsNull" and len(args) == 1:
@@ -219,6 +224,77 @@ class Adapter:
     def named(self, expr):
         return self.expression(expr.node).alias(expr.output_name)
 
+    def _hstack(self, frame, expressions, output_names, node_id):
+        # Polars CSE lifts repeat's length into a WITH_COLUMNS field.
+        lengths = {expr._name for expr in expressions if expr._args[0]._op in ("len", "column_len")}
+        expressions = tuple(
+            Expr("broadcast_length", (expr._args[0],)).alias(expr._name)
+            if expr._name in lengths else expr for expr in expressions
+        )
+        self.frame_length_columns[node_id] = lengths
+        if any(expr._aggregate for expr in expressions):
+            raise NotImplementedError("reduction broadcasting in HStack is not supported yet")
+        if expressions:
+            frame = frame._append("hstack", expressions)
+        return frame.select(output_names)
+
+    def _row_selection(self, node_id, *, drop_height=False):
+        """Recognize uniform gather/reverse projections as a single row operation."""
+        previous = self.visitor.get_node()
+        try:
+            self.visitor.set_node(node_id)
+            node = self.visitor.view_current_node()
+            if type(node).__name__ != "Select" or not node.expr:
+                return None
+            self.visitor.set_node(node.input)
+            operation, operands = None, []
+            for named in node.expr:
+                value = self.visitor.view_expression(named.node)
+                if type(value).__name__ != "Function" or len(value.input) != 1:
+                    return None
+                data = value.function_data
+                if not ((data[0] == "reverse" and len(data) == 1) or
+                        (data[0] == "gather_every" and len(data) == 3 and data[2] > 0)):
+                    return None
+                if operation is not None and data != operation:
+                    return None
+                operation = data
+                operands.append((value.input[0], named.output_name))
+            # LazyFrame.gather_every inserts an empty struct solely to carry
+            # height, then drops it in a surrounding projection. Remove only
+            # that exact wrapper; this does not add user-facing struct support.
+            marker = self.visitor.view_current_node()
+            marker_schema = self.visitor.get_schema()
+            height = "__POLARS_INTERNAL_HEIGHT_COLUMN"
+            hidden = []
+            if drop_height and type(marker).__name__ == "HStack":
+                for named in marker.exprs:
+                    value = self.visitor.view_expression(named.node)
+                    if (named.output_name == height and type(value).__name__ == "Literal"
+                            and value.dtype == pl.Struct({}) and type(value.value) is dict and value.value == {}):
+                        hidden.append(named.node)
+            if hidden:
+                visible = []
+                for operand, alias in operands:
+                    value = self.visitor.view_expression(operand)
+                    if type(value).__name__ == "Column" and value.name == height and alias == height:
+                        continue
+                    visible.append((operand, alias))
+                operands = visible
+                frame = self.frame(marker.input)
+                self.visitor.set_node(marker.input)
+                expressions = tuple(self.named(expr) for expr in marker.exprs if expr.node not in hidden)
+                frame = self._hstack(frame, expressions, [name for name in marker_schema if name != height], node.input)
+            else:
+                frame = self.frame(node.input)
+            self.visitor.set_node(node.input)
+            frame = frame.select([self.expression(operand).alias(alias) for operand, alias in operands])
+            if operation[0] == "reverse":
+                return frame[::-1]
+            return frame.gather_every(operation[2], offset=operation[1])
+        finally:
+            self.visitor.set_node(previous)
+
     def frame(self, node_id):
         if node_id in self.nodes:
             return self.nodes[node_id]
@@ -226,6 +302,27 @@ class Adapter:
         node = self.visitor.view_current_node()
         kind = type(node).__name__
         schema = self.visitor.get_schema()
+        if kind == "Sort" and node.slice is not None and len(node.slice) == 3 and node.slice[2] is not None:
+            self.sort_pruning_predicates.add(node.slice[2])
+        if kind == "Select":
+            selected = self._row_selection(node_id)
+            if selected is not None:
+                self.nodes[node_id] = selected
+                return selected
+            if ("__POLARS_INTERNAL_HEIGHT_COLUMN" not in schema and
+                    all(type(self.visitor.view_expression(expr.node)).__name__ == "Column" for expr in node.expr)):
+                selected = self._row_selection(node.input, drop_height=True)
+                if selected is not None:
+                    self.visitor.set_node(node.input)
+                    frame = selected.select([self.named(expr) for expr in node.expr])
+                    self.nodes[node_id] = frame
+                    return frame
+        elif kind == "SimpleProjection" and "__POLARS_INTERNAL_HEIGHT_COLUMN" not in schema:
+            selected = self._row_selection(node.input, drop_height=True)
+            if selected is not None:
+                frame = selected.select(list(schema))
+                self.nodes[node_id] = frame
+                return frame
         if kind == "MapFunction" and len(node.function) == 2 and node.function[0] == "hint_sorted":
             # A sortedness assertion leaves rows unchanged. Ignore the claim
             # until native metadata propagation is implemented; existing native
@@ -291,11 +388,13 @@ class Adapter:
             if node.predicate is not None:
                 frame = frame.filter(self.expression(node.predicate.node))
             frame = frame.select(list(schema))
+        elif kind == "Slice":
+            frame = self.frame(node.input).slice(node.offset, node.len)
         elif kind == "Distinct":
             keep, subset, maintain_order, slice_ = node.options
-            if slice_ is not None:
-                raise NotImplementedError("slices folded into distinct are unsupported")
             frame = self.frame(node.input).unique(subset, keep=keep, maintain_order=maintain_order)
+            if slice_ is not None:
+                frame = frame.slice(*slice_)
         elif kind in ("Filter", "SimpleProjection", "Select", "HStack", "GroupBy", "Sort"):
             frame = self.frame(node.input)
             # get_dtype resolves columns against the current visitor node.
@@ -310,20 +409,10 @@ class Adapter:
                 frame = frame.select([self.named(expr) for expr in node.expr])
             elif kind == "HStack":
                 expressions = tuple(self.named(expr) for expr in node.exprs)
-                # Polars CSE lifts repeat's length into a WITH_COLUMNS field.
-                # Only row counts are admitted here, not arbitrary reductions.
-                lengths = {expr._name for expr in expressions if expr._args[0]._op in ("len", "column_len")}
-                expressions = tuple(
-                    Expr("broadcast_length", (expr._args[0],)).alias(expr._name)
-                    if expr._name in lengths else expr for expr in expressions
-                )
-                self.frame_length_columns[node_id] = lengths
-                if any(expr._aggregate for expr in expressions):
-                    raise NotImplementedError("reduction broadcasting in HStack is not supported yet")
-                frame = frame._append("hstack", expressions).select(list(schema))
+                frame = self._hstack(frame, expressions, list(schema), node_id)
             elif kind == "GroupBy":
-                if node.apply or any(getattr(node.options, name) is not None for name in ("dynamic", "rolling", "slice")):
-                    raise NotImplementedError("group UDFs, dynamic/rolling groups and aggregate slices are unsupported")
+                if node.apply or any(getattr(node.options, name) is not None for name in ("dynamic", "rolling")):
+                    raise NotImplementedError("group UDFs and dynamic/rolling groups are unsupported")
                 keys = []
                 for key in node.keys:
                     expr = self.expression(key.node)
@@ -333,9 +422,9 @@ class Adapter:
                         raise NotImplementedError("floating-point grouping keys are not supported yet")
                     keys.append(expr._name)
                 frame = frame.group_by(*keys, maintain_order=node.maintain_order).agg([self.named(expr) for expr in node.aggs])
+                if node.options.slice is not None:
+                    frame = frame.slice(*node.options.slice)
             elif kind == "Sort":
-                if node.slice is not None:
-                    raise NotImplementedError("sort slices/top-k are not supported yet")
                 keys = []
                 for key in node.by_column:
                     expr = self.expression(key.node)
@@ -344,6 +433,8 @@ class Adapter:
                     keys.append(expr._name)
                 stable, nulls_last, descending = node.sort_options
                 frame = frame.sort(keys, descending=descending, nulls_last=nulls_last, maintain_order=stable)
+                if node.slice is not None:
+                    frame = frame.slice(*node.slice[:2])
         else:
             raise NotImplementedError(f"unsupported Polars plan node {kind} (node {node_id})")
         self.nodes[node_id] = frame

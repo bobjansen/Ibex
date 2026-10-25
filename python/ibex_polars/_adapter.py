@@ -245,6 +245,24 @@ class Adapter:
                     raise NotImplementedError(f"unsupported closed interval {closed}")
                 expr = Expr("polars_>=" if closed in ("left", "both") else "polars_>", (args[0], args[1])) & Expr(
                     "polars_<=" if closed in ("right", "both") else "polars_<", (args[0], args[2]))
+            elif name in ("StartsWith", "EndsWith", "Contains") and len(args) == 2:
+                pattern = self.visitor.view_expression(value.input[1])
+                if type(pattern).__name__ != "Literal" or pattern.dtype != pl.String or not isinstance(pattern.value, str):
+                    raise NotImplementedError("string matching requires a non-null literal pattern")
+                if name == "Contains":
+                    if len(value.function_data) != 3 or type(value.function_data[1]) is not bool:
+                        raise NotImplementedError("unsupported string contains options")
+                    if not value.function_data[1] and any(char in r".^$*+?{}[]\|()" for char in pattern.value):
+                        raise NotImplementedError("regular-expression operators in contains are unsupported")
+                elif len(value.function_data) != 1:
+                    raise NotImplementedError("unsupported string matching options")
+                escaped = "".join("\\" + char if char in "\\%_" else char for char in pattern.value)
+                pattern = ("%" if name != "StartsWith" else "") + escaped + ("%" if name != "EndsWith" else "")
+                expr = Expr("like", (args[0], ibex.lit(pattern)))
+            elif name == "Year" and len(args) == 1 and len(value.function_data) == 1:
+                if self.visitor.get_dtype(value.input[0]) != pl.Date:
+                    raise NotImplementedError("year extraction currently requires Date input")
+                expr = Expr("year", args)
             elif name == "dynamic_pred" and len(value.function_data) == 2 and value.function_data[1] in self.sort_pruning_predicates:
                 # This predicate is optional top-k pruning for a known sort.
                 # A full native sort followed by the slice needs no pruning.
@@ -404,6 +422,12 @@ class Adapter:
             # A sortedness assertion leaves rows unchanged. Ignore the claim
             # until native metadata propagation is implemented; existing native
             # ordering proofs and general algorithms remain available.
+            frame = self.frame(node.input)
+            self.frame_length_columns[node_id] = self.frame_length_columns.get(node.input, set())
+        elif kind == "Cache":
+            # Supported subplans are deterministic. Reuse the immutable frame
+            # graph; native collection may recompute a shared subplan rather
+            # than maintaining Polars' physical cache. No Python collection.
             frame = self.frame(node.input)
             self.frame_length_columns[node_id] = self.frame_length_columns.get(node.input, set())
         elif kind == "DataFrameScan":

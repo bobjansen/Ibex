@@ -86,6 +86,10 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
         if op == "cast":
             names = {pa.float64(): "Float64", pa.int64(): "Int64"}
             return f"{names[args[1]]}({render(args[0])})"
+        if op == "like":
+            return f"like({render(args[0])}, {render(args[1])})"
+        if op == "year":
+            return f"year({render(args[0])})"
         if op == "is_null":
             return f"is_null({render(args[0])})"
         if op == "wrap_integer":
@@ -494,6 +498,14 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
             if target != pa.float64() or original not in numeric:
                 raise NotImplementedError("only numeric casts to Float64 are supported by this adapter")
             return target
+        if op == "like":
+            if any(dtype(arg) not in (pa.string(), pa.large_string()) for arg in args):
+                raise TypeError("string matching requires string operands")
+            return pa.bool_()
+        if op == "year":
+            if dtype(args[0]) != pa.date32():
+                raise NotImplementedError("year extraction currently requires Date input")
+            return pa.int64()
         if op == "is_null":
             dtype(args[0])
             return pa.bool_()

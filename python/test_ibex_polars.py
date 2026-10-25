@@ -92,6 +92,30 @@ class EngineTests(unittest.TestCase):
         ):
             self.equal(query)
 
+    def test_literal_string_matching_escapes_like_metacharacters(self):
+        frame = pl.DataFrame({"s": ["abc", "a_c", "100%", "a\\b", "αβ", "a\nb", None, ""]})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "patterns.parquet"
+            frame.write_parquet(path)
+            for source in (frame.lazy(), pl.scan_parquet(path)):
+                for pattern in ("a", "_", "%", "\\", "α", "", "a\nb"):
+                    for predicate in (pl.col("s").str.contains(pattern, literal=True),
+                                      pl.col("s").str.starts_with(pattern),
+                                      pl.col("s").str.ends_with(pattern)):
+                        self.equal(source.select(predicate.alias("v")))
+                        self.equal(source.filter(predicate))
+                self.equal(source.select(pl.col("s").str.contains("abc")))
+        for pattern in ("a.*b", "[", "^a", "a$"):
+            with self.assertRaisesRegex(NotImplementedError, "regular-expression"):
+                self.engine.prepare(frame.lazy().filter(pl.col("s").str.contains(pattern)))
+
+    def test_cache_markers_retain_subplans_and_date_years(self):
+        frame = pl.DataFrame({"key": [1, 2, 3], "day": [date(1969, 12, 31), None, date(2000, 2, 29)]}).lazy()
+        cached = frame.select("key", year=pl.col("day").dt.year()).cache()
+        self.equal(cached.join(cached, on="key").sort("key"))
+        self.equal(cached.filter(pl.col("key") > 1))
+        self.equal(frame.head(0).select(pl.col("day").dt.year()))
+
     def test_empty_and_all_null_reductions(self):
         for values in ([], [None, None]):
             frame = pl.DataFrame({"g": pl.Series([], dtype=pl.String) if not values else ["a", "a"],

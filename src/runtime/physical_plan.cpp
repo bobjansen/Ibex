@@ -628,7 +628,7 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
     }
     if (root.kind() == ir::NodeKind::Join) {
         const auto& join = ir::node_cast<ir::JoinNode>(root);
-        plan.join = plan_join(join);
+        plan.join = plan_join(join, schemas);
         // Streaming joins use physical operators; materializing joins use the
         // fallback and contribute to fallback statistics.
         if (plan.join.strategy == JoinStrategy::StreamingProbe) {
@@ -1228,7 +1228,7 @@ auto validate_hash_aggregate_edges(const HashAggregateNodes& nodes) -> std::opti
     return std::nullopt;
 }
 
-auto plan_join(const ir::JoinNode& join) -> JoinPlan {
+auto plan_join(const ir::JoinNode& join, const ir::SourceSchemas& sources) -> JoinPlan {
     JoinPlan out;
     out.describes = true;
     out.kind = join.kind();
@@ -1236,11 +1236,11 @@ auto plan_join(const ir::JoinNode& join) -> JoinPlan {
 
     // Use the shared eligibility gates so planning and execution agree on
     // supported join shapes. Check semi/anti before the inner-join strategies.
-    if (is_streamable_semi_anti_join(join)) {
+    if (is_streamable_semi_anti_join(join, sources)) {
         out.branch = JoinBranch::SemiAnti;
     } else if (is_streamable_inner_join(join)) {
         out.branch = JoinBranch::SingleKeyInner;
-    } else if (is_streamable_pair_int_join(join)) {
+    } else if (is_streamable_pair_int_join(join, sources)) {
         out.branch = JoinBranch::PairIntInner;
     }
     out.strategy = out.branch == JoinBranch::None ? JoinStrategy::MaterializeBoth
@@ -1259,7 +1259,7 @@ auto plan_join(const ir::JoinNode& join) -> JoinPlan {
         // NOLINTNEXTLINE(bugprone-branch-clone)
     } else if (join.keys().size() > 2) {
         out.decline = JoinDeclineReason::MultipleKeys;
-    } else if (join.keys().size() == 2 && !join_keys_provably_int64(join)) {
+    } else if (join.keys().size() == 2 && !join_keys_provably_int64(join, sources)) {
         // Two keys stream only as the all-Int64 pair shape -- inner through
         // `PairIntInner`, semi/anti through the semi/anti operator's pair set.
         out.decline = JoinDeclineReason::KeyTypesUnsupported;

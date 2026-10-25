@@ -142,21 +142,22 @@ auto aggregate_is_streamable(const ir::AggregateNode& agg) -> bool {
     });
 }
 
-auto is_streamable_pair_int_join(const ir::JoinNode& join) -> bool {
+auto is_streamable_pair_int_join(const ir::JoinNode& join, const ir::SourceSchemas& sources)
+    -> bool {
     if (join.kind() != ir::JoinKind::Inner || join.predicate().has_value() ||
         join.keys().size() != 2 || join.null_match() != ir::NullMatch::Never ||
         join.expect().asserts_anything() || join.take() != ir::MatchSelection::All) {
         return false;
     }
-    return join_keys_provably_int64(join);
+    return join_keys_provably_int64(join, sources);
 }
 
-auto join_keys_provably_int64(const ir::JoinNode& join) -> bool {
+auto join_keys_provably_int64(const ir::JoinNode& join, const ir::SourceSchemas& sources) -> bool {
     if (join.children().size() != 2) {
         return false;
     }
-    const ir::SchemaInfo left_schema = ir::infer_schema(*join.children()[0]);
-    const ir::SchemaInfo right_schema = ir::infer_schema(*join.children()[1]);
+    const ir::SchemaInfo left_schema = ir::infer_schema(*join.children()[0], sources);
+    const ir::SchemaInfo right_schema = ir::infer_schema(*join.children()[1], sources);
     if (!left_schema.is_known() || !right_schema.is_known()) {
         return false;
     }

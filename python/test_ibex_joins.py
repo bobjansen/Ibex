@@ -69,6 +69,17 @@ class JoinTests(unittest.TestCase):
         self.equal(left.join(right, on=["a", "b"], how="full", coalesce=True,
                              nulls_equal=True, maintain_order="left_right"))
 
+    def test_bound_integer_composite_keys(self):
+        left = pl.LazyFrame({"a": [1, 1, 2, 2, None, 1],
+                             "b": [2, 3, 4, None, 4, 3], "x": list(range(6))})
+        right = pl.LazyFrame({"a": [1, 1, 2, None],
+                              "b": [3, 3, 4, 4], "y": [10, 11, 12, 13]})
+        for how in ("inner", "semi", "anti"):
+            for nulls_equal in (False, True):
+                with self.subTest(how=how, nulls_equal=nulls_equal):
+                    self.equal(left.join(right, on=["a", "b"], how=how,
+                                         nulls_equal=nulls_equal), ordered=False)
+
     def test_order_modes_and_join_slice(self):
         left = pl.LazyFrame({"k": [2, 1, 2, 9], "x": [0, 1, 2, 3]})
         right = pl.LazyFrame({"k": [2, 2, 1, 10], "y": [4, 5, 6, 7]})

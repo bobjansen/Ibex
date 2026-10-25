@@ -80,6 +80,42 @@ auto execute_physical_plan(const runtime::physical::Plan& plan, const ir::Node& 
 
 }  // namespace
 
+TEST_CASE("Bound table schemas enable composite join planning", "[physical][plan][join]") {
+    using runtime::physical::JoinBranch;
+    using runtime::physical::JoinStrategy;
+    runtime::Table left;
+    left.add_column("k1", Column<std::int64_t>{1, 1, 2});
+    left.add_column("k2", Column<std::int64_t>{2, 3, 4});
+    runtime::Table right;
+    right.add_column("k1", Column<std::int64_t>{1, 2});
+    right.add_column("k2", Column<std::int64_t>{3, 4});
+    runtime::TableRegistry registry{{"a", left}, {"b", right}};
+    for (const char* source :
+         {"a join b on { k1, k2 };", "a semi join b on { k1, k2 };", "a anti join b on { k1, k2 };",
+          "(a[select { x = k1, y = k2 }]) join "
+          "(b[select { x = k1, y = k2 }]) on { x, y };"}) {
+        CAPTURE(source);
+        auto node = require_ir(source);
+        const auto unknown = runtime::physical::plan_physical(*node, {}, nullptr);
+        CHECK(unknown.join.strategy == JoinStrategy::MaterializeBoth);
+        const auto plan = runtime::physical::plan_physical(*node, registry, nullptr);
+        CHECK(plan.join.strategy == JoinStrategy::StreamingProbe);
+        CHECK(plan.join.branch != JoinBranch::None);
+        auto result = runtime::interpret(*node, registry);
+        REQUIRE(result.has_value());
+        CHECK(result->rows() == (std::string(source).find("anti") != std::string::npos ? 1 : 2));
+    }
+    SECTION("non-integer bound keys still materialize") {
+        runtime::Table floating;
+        floating.add_column("k1", Column<double>{1., 2.});
+        floating.add_column("k2", Column<double>{3., 4.});
+        registry.insert_or_assign("b", std::move(floating));
+        auto node = require_ir("a join b on { k1, k2 };");
+        const auto plan = runtime::physical::plan_physical(*node, registry, nullptr);
+        CHECK(plan.join.strategy == JoinStrategy::MaterializeBoth);
+    }
+}
+
 TEST_CASE("Physical plan lowers filter+select into a fused map step", "[physical][plan]") {
     // Canonicalize leaves Project(Filter(x)) alone; the planner fuses it into
     // one step, so the plan's step vocabulary still resolves the fused kernel —

@@ -175,6 +175,87 @@ all samples and the driver used.
 - [Q12 diagnostic operator profiles](pdsh-performance-results/q12-membership-profile-eight.txt)
 - [Q12 membership diagnostic](pdsh-performance-results/q12-membership-diagnostic-eight.json)
 
+## Q12: physical inspection and the execution entry point
+
+A deeper investigation used the REPL's read-only `:explain` machinery on the
+filter, join and aggregate portions, then compared actual execution profiles.
+The current adapter's line filter reports `serial(expression needs rows outside
+the morsel)`. Removing the unnecessary null-handling case reports
+`morsel-parallel`. Both joins report the same `StreamingProbe`, `SingleKeyInner`
+strategy and `orientation=runtime`. Handwritten native Q12 uses the same
+orders-to-lineitem source order. Reversing the compact native join measured
+291 vs 293 ms; explicit input schema annotations and removing projection/rename
+wrappers also made no material difference in this experiment.
+
+A second frontend cost is the redundant `false OR ...` seed in membership.
+After scalar binding, that leaf prevents the string IN-list extractor from
+recognizing an OR-chain consisting only of column/literal equalities. Removing
+it permits the existing fused set-filter path. All complete results match.
+The six-round alternating membership comparison measured:
+
+| Diagnostic representation | Eight-thread median ms |
+|---|---:|
+| Null wrapper removed, false OR seed retained | 371 |
+| Null wrapper and false OR seed removed | 297 |
+| Handwritten native source through Python bridge | 293 |
+| Polars streaming | 172 |
+
+The handwritten-source comparison above initially suggested no remaining
+frontend gap. Running the actual CLI benchmark exposed a distinction: **the
+same source does not enter the same execution path through the Python bridge.**
+
+`python/ibex_pyarrow_module.cpp::py_execute_pipeline` calls
+`ReplSession::execute`. That enters `execute_statements`; its table-expression
+evaluator applies logical rewrites and demand/filter pushdown, then eagerly
+calls `decode_demanded_lazy_sources` before `interpret`. By contrast,
+`execute_script` tries `try_execute_whole_script`, which executes the unified
+plan through `optimize_and_execute_plan`. That path additionally registers
+streaming scans and deferred probe scans in the execution context. The Python
+entry point does not currently use that registration path.
+
+Actual profiles distinguish the routes: CLI Q12 has a live streaming stage
+(`stage_threads_peak=1`), overlapping unit decoding and downstream execution;
+Python-hosted native Q12 has none (`stage_threads_peak=0`) and whole-column
+decodes precede its operators. This is stronger evidence than join source
+order or the unresolved capability plan alone.
+
+A controlled check runs identical native Q12 in two persistent CLI workers,
+changing only `IBEX_STREAM_SCAN`. Twelve alternating pairs after two warmups
+measure **197 ms with streaming enabled and 308 ms disabled**. Disabling it
+reproduces the approximate 293 ms Python-hosted result. The whole-script
+planner remains active on both sides; it is scan streaming that changes.
+
+The allocator hypothesis was tested and rejected as the main explanation.
+Disabling the CLI's huge-page startup adjustment left it around 195 ms;
+explicitly enabling the CLI's glibc huge-page/top-pad settings for Python left
+the handwritten Python-hosted query around 286 ms. These small differences do
+not explain the roughly 100 ms execution-path gap.
+
+Component diagnostics further separate the remaining work. Inputs for the
+resident join/aggregate are prepared outside timing. The read/filter checks
+force the relevant columns through counts and checksums, returning small
+outputs; these are separate queries and their times are not additive:
+
+| Component | Ibex ms | Polars streaming ms |
+|---|---:|---:|
+| Lineitem read/filter | 218 | 134 |
+| Orders read | 54 | 35 |
+| Join and aggregate with resident inputs | 35 | 33 |
+| Complete cleaned query | 296 | 173 |
+
+The next fixes are to simplify frontend membership and provide a bound-query
+execution path that shares whole-plan optimization and scan registration with
+the CLI. Calling the existing fresh-script planner blindly is insufficient:
+the library path must carry its injected table/scalar bindings and preserve
+session semantics. No production implementation changed in this investigation.
+
+The [deep-dive archive](pdsh-performance-results/q12-deep-dive.json) retains
+physical inspection inputs and outputs, both execution profiles, all paired
+samples, component checks, native query text and diagnostic drivers. One early
+multi-variant trial is explicitly excluded from numerical conclusions because
+all timings, including the Polars reference, drifted substantially; its cause
+was not established.
+
 ## Measurement method
 
 Each thread configuration runs in a separate process. One worker is pinned to

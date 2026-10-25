@@ -1,0 +1,2 @@
+let t = Table { x = [1000000000000.125, 1000000000000.25, 1000000000000.375, 1000000000000.5, 1000000000000.625], y = [2, 4, 7, 8, 11], flat = [3, 3, 3, 3, 3] };
+t[select { r = corr(x, y), c = cov(x, y), scaled = corr(x * -2.0, y + 1), constant_r = corr(x, flat), constant_c = cov(x, flat) }];

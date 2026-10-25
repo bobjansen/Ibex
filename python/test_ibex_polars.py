@@ -538,6 +538,36 @@ class EngineTests(unittest.TestCase):
             self.equal(frame.select(pl.len()))
             self.equal(frame.select(pl.repeat(True, pl.len()).alias("_ibex_height")))
 
+    def test_set_sorted_passes_through_without_reordering_or_extra_sort(self):
+        for descending in (False, True):
+            for nulls_last in (False, True):
+                data = pl.DataFrame({"k": [None, 2, 1, 1], "x": [0, 1, 2, 3]}).sort(
+                    "k", descending=descending, nulls_last=nulls_last)
+                base = data.lazy()
+                hinted = base.set_sorted("k", descending=descending, nulls_last=nulls_last)
+                for flags in (pl.QueryOptFlags(), pl.QueryOptFlags.none()):
+                    with self.subTest(descending=descending, nulls_last=nulls_last, flags=flags):
+                        self.equal(hinted, options=flags)
+                        self.assertEqual(self.engine.explain(hinted, optimizations=flags),
+                                         self.engine.explain(base, optimizations=flags))
+                        query = hinted.group_by("k", maintain_order=True).agg(
+                            first=pl.col("x").first(), last=pl.col("x").last(), n=pl.col("x").count())
+                        self.equal(query, options=flags)
+        data = pl.DataFrame({"a": [1, 1, 2], "b": [3, 2, 1], "x": [None, 7, 8]})
+        self.equal(data.lazy().set_sorted("a", "b", descending=[False, True]))
+        empty = data.head(0).lazy().set_sorted("a")
+        self.equal(empty)
+        self.equal(empty.group_by("a").agg(pl.col("x").first()))
+        query = data.lazy().sort("a").set_sorted("a").filter(pl.col("a") > 1).select("a", "x")
+        self.equal(query)
+
+    def test_set_sorted_does_not_accept_other_map_functions(self):
+        query = pl.LazyFrame({"a": [1, 2], "b": [3, 4]}).unpivot()
+        with patch.object(ibex_pyarrow, "execute_pipeline") as execute:
+            with self.assertRaisesRegex(NotImplementedError, "MapFunction"):
+                query.collect(engine=IbexEngine())
+            execute.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -47,6 +47,11 @@ uses native `first_null`/`last_null`; the null-skipping variant uses native
 reductions return no groups. Null-skipping Date reductions remain unsupported.
 The new native reducers currently materialize their input.
 
+`set_sorted(...)` is accepted as a pass-through hint: it preserves row order
+and adds no sorting operation. Its declared sortedness is not yet forwarded to
+native planning metadata; Ibex uses its existing ordering proofs or general
+algorithms. Other `MapFunction` variants remain unsupported.
+
 ## Scope and preparation
 
 Supported operations include resident DataFrame scans, single local Parquet

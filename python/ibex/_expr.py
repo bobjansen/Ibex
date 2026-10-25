@@ -89,7 +89,7 @@ class Expr:
     def _aggregate(self):
         if self._op == "broadcast_length":
             return False
-        return self._op in ("sum", "mean", "min", "max", "count", "column_len", "first", "last", "first_non_null", "last_non_null", "len") or any(
+        return self._op in ("sum", "mean", "min", "max", "polars_min", "polars_max", "n_unique", "count", "column_len", "first", "last", "first_non_null", "last_non_null", "len") or any(
             arg._aggregate for arg in self._args if isinstance(arg, Expr)
         )
 
@@ -97,7 +97,7 @@ class Expr:
     def _row_reference(self):
         if self._op in ("repeat", "repeat_null", "broadcast_length"):
             return True
-        if self._op in ("sum", "mean", "min", "max", "count", "column_len", "first", "last", "first_non_null", "last_non_null", "len"):
+        if self._op in ("sum", "mean", "min", "max", "polars_min", "polars_max", "n_unique", "count", "column_len", "first", "last", "first_non_null", "last_non_null", "len"):
             return False
         return self._op == "col" or any(
             arg._row_reference for arg in self._args if isinstance(arg, Expr)

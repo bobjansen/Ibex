@@ -77,6 +77,18 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
         if op in ("first", "last", "first_non_null", "last_non_null"):
             native = op.removesuffix("_non_null") if op.endswith("_non_null") else op + "_null"
             return f"{native}({render(args[0])})"
+        if op in ("polars_min", "polars_max"):
+            # Polars ignores NaNs when any ordinary value is present, but an
+            # all-NaN (non-null) group produces NaN. Native extrema use IEEE.
+            value = args[0]
+            clean = Expr("case", (Expr("is_nan", (value,)),
+                                  Expr("typed_null", (Expr("lit", (0.0,)),)), value))
+            # With no ordinary value, mean is NaN for all-NaN groups and
+            # null for empty/all-null groups. It supplies the exact fallback.
+            return f"coalesce({op.removeprefix('polars_')}({render(clean)}), mean({render(value)}))"
+        if op == "n_unique":
+            value = render(args[0])
+            return f"(count_distinct({value}) + coalesce(max(Int64(is_null({value}))), {bind(0)}))"
         if op in ("min", "max"):
             return f"{op}({render(args[0])})"
         if op in ("len", "column_len"):
@@ -480,6 +492,14 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
             if result == pa.date32() and op.endswith("_non_null"):
                 raise NotImplementedError("null-skipping Date edge reductions are unsupported by Ibex")
             return result
+        if op in ("polars_min", "polars_max"):
+            if dtype(args[0]) != pa.float64() or not args[0]._row_reference:
+                raise NotImplementedError("NaN-aware extrema require a floating row expression")
+            return pa.float64()
+        if op == "n_unique":
+            if dtype(args[0]) not in (pa.int64(), pa.bool_(), pa.string(), pa.large_string()) or not args[0]._row_reference:
+                raise NotImplementedError("distinct count currently requires integer, Boolean or string rows")
+            return pa.uint32()
         if op in ("sum", "mean", "min", "max"):
             result = dtype(args[0])
             if op == "sum" and result == pa.bool_() and args[0]._row_reference:

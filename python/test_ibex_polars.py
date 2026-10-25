@@ -52,6 +52,17 @@ class EngineTests(unittest.TestCase):
         )
         self.assertEqual(self.equal(query).item(), 19.0)
 
+    def test_string_predicates_normalize_arrow_string_width(self):
+        frame = pl.DataFrame({"s": ["ASIA", "EUROPE", None, ""]})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "strings.parquet"
+            # A utf8 Parquet schema and large_utf8 resident boundary represent
+            # the same logical string type.
+            pq.write_table(pa.table({"s": pa.array(frame["s"].to_list(), type=pa.string())}), path)
+            for source in (frame.lazy(), pl.scan_parquet(path)):
+                self.equal(source.filter(pl.col("s") == "ASIA"))
+                self.equal(source.select(matched=pl.col("s") != "EUROPE"))
+
     def test_empty_and_all_null_reductions(self):
         for values in ([], [None, None]):
             frame = pl.DataFrame({"g": pl.Series([], dtype=pl.String) if not values else ["a", "a"],

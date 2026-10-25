@@ -436,7 +436,7 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
                 raise NotImplementedError(f"column type {result} is not supported yet")
             return result
         if op == "lit":
-            return pa.scalar(args[0]).type
+            return pa.large_string() if isinstance(args[0], str) else pa.scalar(args[0]).type
         if op == "alias":
             return dtype(args[0])
         if op in ("repeat", "repeat_null", "broadcast_length"):

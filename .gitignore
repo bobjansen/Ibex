@@ -17,6 +17,7 @@ CMakeUserPresets.json
 *.swp
 *.swo
 *~
+tags
 
 # Compile commands (generated)
 compile_commands.json

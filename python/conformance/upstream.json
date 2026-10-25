@@ -977,5 +977,127 @@
   "unordered_tests": {
     "tests/unit/operations/test_group_by.py::test_group_by_cse_alias_26423": "Upstream explicitly asserts check_row_order=False after unordered group_by.",
     "tests/unit/operations/test_group_by.py::test_group_by_first_nondet_24278": "Upstream compares only the sum of collected first-row indices across eleven unordered group_by collections; row order is not part of its contract. Compare the full row multiset here."
+  },
+  "unordered_selection_tests": {
+    "tests/unit/operations/test_group_by.py::test_unique_head_tail_26429[0]": {
+      "allowed_rows": [
+        [
+          1
+        ],
+        [
+          2
+        ],
+        [
+          3
+        ],
+        [
+          4
+        ],
+        [
+          5
+        ]
+      ],
+      "reason": "Upstream unique() leaves row order unspecified and asserts only min(tail, 5) rows. Verify reference schema/height plus distinct rows drawn from its pinned x=1..5 input, rather than requiring the same arbitrary tail membership."
+    },
+    "tests/unit/operations/test_group_by.py::test_unique_head_tail_26429[1]": {
+      "allowed_rows": [
+        [
+          1
+        ],
+        [
+          2
+        ],
+        [
+          3
+        ],
+        [
+          4
+        ],
+        [
+          5
+        ]
+      ],
+      "reason": "Upstream unique() leaves row order unspecified and asserts only min(tail, 5) rows. Verify reference schema/height plus distinct rows drawn from its pinned x=1..5 input, rather than requiring the same arbitrary tail membership."
+    },
+    "tests/unit/operations/test_group_by.py::test_unique_head_tail_26429[4]": {
+      "allowed_rows": [
+        [
+          1
+        ],
+        [
+          2
+        ],
+        [
+          3
+        ],
+        [
+          4
+        ],
+        [
+          5
+        ]
+      ],
+      "reason": "Upstream unique() leaves row order unspecified and asserts only min(tail, 5) rows. Verify reference schema/height plus distinct rows drawn from its pinned x=1..5 input, rather than requiring the same arbitrary tail membership."
+    },
+    "tests/unit/operations/test_group_by.py::test_unique_head_tail_26429[5]": {
+      "allowed_rows": [
+        [
+          1
+        ],
+        [
+          2
+        ],
+        [
+          3
+        ],
+        [
+          4
+        ],
+        [
+          5
+        ]
+      ],
+      "reason": "Upstream unique() leaves row order unspecified and asserts only min(tail, 5) rows. Verify reference schema/height plus distinct rows drawn from its pinned x=1..5 input, rather than requiring the same arbitrary tail membership."
+    },
+    "tests/unit/operations/test_group_by.py::test_unique_head_tail_26429[6]": {
+      "allowed_rows": [
+        [
+          1
+        ],
+        [
+          2
+        ],
+        [
+          3
+        ],
+        [
+          4
+        ],
+        [
+          5
+        ]
+      ],
+      "reason": "Upstream unique() leaves row order unspecified and asserts only min(tail, 5) rows. Verify reference schema/height plus distinct rows drawn from its pinned x=1..5 input, rather than requiring the same arbitrary tail membership."
+    },
+    "tests/unit/operations/test_group_by.py::test_unique_head_tail_26429[10]": {
+      "allowed_rows": [
+        [
+          1
+        ],
+        [
+          2
+        ],
+        [
+          3
+        ],
+        [
+          4
+        ],
+        [
+          5
+        ]
+      ],
+      "reason": "Upstream unique() leaves row order unspecified and asserts only min(tail, 5) rows. Verify reference schema/height plus distinct rows drawn from its pinned x=1..5 input, rather than requiring the same arbitrary tail membership."
+    }
   }
 }

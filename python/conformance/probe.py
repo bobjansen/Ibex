@@ -12,9 +12,10 @@ from ibex_polars import IbexEngine
 
 
 class Probe:
-    def __init__(self, original, *, check_row_order=True):
+    def __init__(self, original, *, check_row_order=True, allowed_rows=None):
         self.original = original
         self.check_row_order = check_row_order
+        self.allowed_rows = allowed_rows
         self.events = []
         self.active = ContextVar("ibex_conformance_active", default=False)
 
@@ -66,12 +67,24 @@ class Probe:
                 event["reason"] = "Ibex returned a result without native execution"
             else:
                 try:
-                    assert_frame_equal(candidate, reference, check_row_order=self.check_row_order,
-                                       rel_tol=1e-12, abs_tol=1e-9)
+                    if self.allowed_rows is None:
+                        assert_frame_equal(candidate, reference, check_row_order=self.check_row_order,
+                                           rel_tol=1e-12, abs_tol=1e-9)
+                    else:
+                        # An explicitly pinned unordered unique+slice test may
+                        # select different valid rows on separate executions.
+                        assert candidate.columns == reference.columns, "column mismatch"
+                        assert candidate.schema == reference.schema, "dtype mismatch"
+                        assert candidate.height == reference.height, "height mismatch"
+                        domain = {tuple(row) for row in self.allowed_rows}
+                        for frame in (reference, candidate):
+                            rows = frame.rows()
+                            assert len(set(rows)) == len(rows), "duplicate selected rows"
+                            assert set(rows) <= domain, "selected row outside pinned input domain"
                 except AssertionError as error:
                     event["reason"] = str(error)
                 else:
-                    event.update(status="pass", result="matching_frame")
+                    event.update(status="pass", result="matching_frame" if self.allowed_rows is None else "matching_selection_contract")
                 # Upstream assertions also inspect actual accepted Ibex results.
                 return candidate
 

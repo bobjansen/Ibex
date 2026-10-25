@@ -15,11 +15,12 @@ from .probe import Probe
 
 
 class Plugin:
-    def __init__(self, mode, output, baseline=None, unordered_tests=None):
+    def __init__(self, mode, output, baseline=None, unordered_tests=None, selection_tests=None):
         self.mode = mode
         self.output = Path(output)
         self.baseline = baseline or {}
         self.unordered_tests = unordered_tests or {}
+        self.selection_tests = selection_tests or {}
         self.tests = {}
         self.collection_errors = []
 
@@ -29,7 +30,11 @@ class Plugin:
         if self.mode == "reference":
             yield
         else:
-            probe = Probe(pl.LazyFrame.collect, check_row_order=item.nodeid not in self.unordered_tests)
+            selection = self.selection_tests.get(item.nodeid)
+            probe = Probe(pl.LazyFrame.collect, check_row_order=item.nodeid not in self.unordered_tests,
+                          allowed_rows=selection["allowed_rows"] if selection else None)
+            if selection:
+                row["comparison_policy"] = {"unordered_selection": selection}
             if item.nodeid in self.unordered_tests:
                 row["comparison_policy"] = {"check_row_order": False, "reason": self.unordered_tests[item.nodeid]}
             def collect(frame, *args, **kwargs):
@@ -84,9 +89,11 @@ def classify(row, mode="candidate"):
 
 
 def pytest_configure(config):
+    pin = json.loads(Path(__file__).with_name("upstream.json").read_text())
     config.pluginmanager.register(Plugin(os.environ["IBEX_CONFORMANCE_MODE"],
                                         os.environ["IBEX_CONFORMANCE_OUTPUT"],
                                         json.loads(Path(os.environ["IBEX_CONFORMANCE_BASELINE"]).read_text())["tests"]
                                         if "IBEX_CONFORMANCE_BASELINE" in os.environ else None,
-                                        json.loads(Path(__file__).with_name("upstream.json").read_text()).get("unordered_tests")),
+                                        pin.get("unordered_tests"),
+                                        pin.get("unordered_selection_tests")),
                                   "ibex-conformance-recorder")

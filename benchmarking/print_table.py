@@ -195,7 +195,7 @@ QUERY_LABEL = {
     "where_update_multi": "guarded update (multi-field)",
     "where_update_window": "guarded update (window)",
     "where_update_nullable": "guarded update (nullable)",
-    "corr_price_vol": "correlation matrix",
+    "corr_price_vol": "pairwise correlation",
     "sort_price": "sort (full)",
     "sort_price_desc": "sort desc (full)",
     "sort_symbol": "sort symbol (full)",

@@ -54,6 +54,9 @@ history).
 | [grouped-chunkview-update-plan.md](grouped-chunkview-update-plan.md) | Mostly complete — `update …, by k` runs off an immutable `GroupedRowPlan` (CSR) instead of gather → per-group `Table` → scatter. Began as a sub-plan of the (retired) kernel-pipeline plan's Phase 2. | Remaining materialized shapes: `rank`, variable-width ordered state, `window`-clause `lag`/`lead`. |
 | [python-polars-backend-plan.md](python-polars-backend-plan.md) | Independent Python q06/q01 slices implemented, 2026-10-12; prepared in-memory inputs, grouped aggregates and sorting. Correctness and local warm/first-use measurements recorded. | First-use/preparation overhead and demanded-column binding; then Engine prototype/comparison, remaining PDS-H/API coverage and packaging. |
 
+Correlation work and the deferred compressed-DuckDB benchmark refresh are tracked
+in [correlation-and-duckdb-refresh.md](correlation-and-duckdb-refresh.md).
+
 ## Proposed — no implementation yet
 
 | Plan | Notes |

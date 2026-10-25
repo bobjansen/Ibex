@@ -281,6 +281,15 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         plan.push_back(item);
     }
 
+    // Paired global reductions have exactly one group. Do not discover that
+    // group once per row or allocate a row-to-group array before reducing it.
+    // Keep the validation above shared with the grouped/mixed-aggregate path.
+    if (group_by.empty() && !aggregations.empty() &&
+        std::ranges::all_of(aggregations,
+                            [](const ir::AggSpec& agg) { return ir::agg_is_paired(agg.func); })) {
+        return global_paired_aggregate(input, aggregations, exec);
+    }
+
     auto make_state = [&] -> AggState {
         AggState state;
         state.slots.reserve(aggregations.size());

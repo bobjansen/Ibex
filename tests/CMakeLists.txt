@@ -13,6 +13,7 @@ set(IBEX_TEST_SOURCES
     test_arrow_c_data.cpp
     test_args.cpp
     test_column.cpp
+    test_correlation.cpp
     test_csv.cpp
     test_csv_parallel.cpp
     test_csv_lazy.cpp

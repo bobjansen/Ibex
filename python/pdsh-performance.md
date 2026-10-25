@@ -102,6 +102,50 @@ all outcomes, upstream source hashes, generated native source for successful
 queries, input metadata and bridge identity. `first_collect_ms` is diagnostic
 first-use timing, not a warm benchmark result.
 
+## Expanded-query performance check
+
+A subsequent performance check measures all eight supported queries on the same
+SF10 data, Release build and 3.2 GHz CPU lock. One thread is pinned to CPU 2;
+eight threads use CPUs 0,2,4,6,8,10,12,14. Each query first passes complete result
+comparisons against both Polars executors, then two warmups and six rounds that
+balance all six executor orderings. Preparation and previous-result destruction
+are outside timing; Parquet reading and public result conversion are inside.
+
+Warm medians in milliseconds, eight threads:
+
+| Query | Polars in-memory | Polars streaming | Polars–Ibex |
+|---|---:|---:|---:|
+| Q1 | 806 | 567 | 800 |
+| Q2 | 47 | 61 | 137 |
+| Q3 | 425 | 336 | 527 |
+| Q4 | 303 | 165 | 298 |
+| Q5 | 526 | 381 | 494 |
+| Q6 | 220 | 213 | 224 |
+| Q12 | 203 | 173 | 2,528 |
+| Q18 | 1,474 | 540 | 1,022 |
+
+Q12 is the clear outlier, about 14.6× slower than streaming Polars. Its second
+profiled collection took 3,063 ms, of which the serial filter reported 2,819 ms;
+the inner join reported about 27 ms of build/next self time. Pool work plus
+unqueued time closes to pool capacity in this profile (1,306 + 23,201 ≈ 24,507
+thread-ms). This identifies filtering as the dominant issue, rather than merely
+inferring it from the overall speedup.
+
+A separate paired diagnostic changes only the frontend representation of
+nonempty, null-free literal membership with its default null policy. Returning
+the existing OR-of-equalities branch directly removes an unnecessary surrounding
+null-handling case; equality already propagates the null. Both complete outputs
+match Polars. Over six alternating pairs, Q12 falls from **2,544 to 378 ms**.
+This restores scan filtering and demonstrates the importance of the expression
+shape. It is a diagnostic, not a shipped optimization; the main table measures
+the committed adapter. Empty lists and alternate null policies require their
+existing handling. The diagnostic JSON retains both generated native sources,
+all samples and the driver used.
+
+- [Eight-thread timing samples](pdsh-performance-results/sf10-expanded-performance-eight.json)
+- [Q12 operator profiles](pdsh-performance-results/q12-profile-eight.txt)
+- [Q12 membership diagnostic](pdsh-performance-results/q12-membership-diagnostic-eight.json)
+
 ## Measurement method
 
 Each thread configuration runs in a separate process. One worker is pinned to

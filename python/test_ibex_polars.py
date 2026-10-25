@@ -91,6 +91,42 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(source.count("^_ibex_scalar_"), 2)
         self.equal(query)
 
+    def test_decimal_rounding_preserves_ties_special_values_and_zero_signs(self):
+        import math
+        import random
+        rng = random.Random(17)
+        values = [None, float("nan"), float("inf"), -float("inf"), 0., -0.,
+                  0.5, -0.5, 1.5, -1.5, 2.5, -2.5, 1.25, -1.25,
+                  1e308, -1e308, 5e-324, -5e-324, 2.**52, -(2.**52)]
+        values += [math.nextafter(x, direction) for x in (0.5, -0.5, 1.25, -1.25)
+                   for direction in (-math.inf, math.inf)]
+        values += [rng.uniform(-10000, 10000) for _ in range(50)]
+        for dtype in (pl.Float32, pl.Float64):
+            finite = [v for v in values if v is None or not math.isfinite(v) or abs(v) < 1e38]
+            frame = pl.DataFrame({"x": pl.Series(values if dtype == pl.Float64 else finite, dtype=dtype)})
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "round.parquet"
+                frame.write_parquet(path, row_group_size=8)
+                for source in (frame.lazy(), pl.scan_parquet(path)):
+                    for decimals in (0, 1, 2, 15):
+                        for mode in ("half_to_even", "half_away_from_zero"):
+                            with self.subTest(dtype=dtype, decimals=decimals, mode=mode):
+                                query = source.select(pl.col("x").round(decimals, mode=mode))
+                                actual = self.equal(query)
+                                expected = query.collect(engine="streaming")
+                                for a, b in zip(actual["x"], expected["x"]):
+                                    if a == 0 and b == 0:
+                                        self.assertEqual(math.copysign(1., a), math.copysign(1., b))
+                    self.equal(source.head(0).select(pl.col("x").round(2)))
+                    self.equal(source.with_columns(pl.col("x").is_null().alias("g")).group_by("g").agg(
+                        pl.col("x").sum().round(2)).sort("g"))
+        self.equal(pl.DataFrame({"x": [1, None, -2]}).lazy().select(pl.col("x").round(2)))
+        with patch.object(ibex_pyarrow, "bind_table") as bind, patch.object(ibex_pyarrow, "execute_pipeline") as execute:
+            with self.assertRaisesRegex(NotImplementedError, "decimal places"):
+                self.engine.prepare(pl.DataFrame({"x": [1.]}).lazy().select(pl.col("x").round(16)))
+            bind.assert_not_called()
+            execute.assert_not_called()
+
     def test_conditional_expressions_preserve_types_and_null_predicates(self):
         frame = pl.DataFrame({"x": [1., None, -2., float("nan")], "p": [True, False, None, True],
                               "s": ["a", "b", None, "d"]}).lazy()

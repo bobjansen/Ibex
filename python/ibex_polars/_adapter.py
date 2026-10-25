@@ -278,6 +278,19 @@ class Adapter:
                 escaped = "".join("\\" + char if char in "\\%_" else char for char in pattern.value)
                 pattern = ("%" if name != "StartsWith" else "") + escaped + ("%" if name != "EndsWith" else "")
                 expr = Expr("like", (args[0], ibex.lit(pattern)))
+            elif name == "round" and len(args) == 1 and len(value.function_data) == 3:
+                decimals, mode = value.function_data[1:]
+                if type(decimals) is not int or not 0 <= decimals <= 15:
+                    raise NotImplementedError("round supports decimal places from 0 to 15")
+                if mode not in ("half_to_even", "half_away_from_zero"):
+                    raise NotImplementedError("unsupported rounding mode")
+                dtype = self.visitor.get_dtype(value.input[0])
+                if dtype in _INTEGER_LAYOUTS:
+                    expr = args[0]
+                elif dtype in (pl.Float32, pl.Float64):
+                    expr = Expr("polars_round", (args[0], decimals, mode))
+                else:
+                    raise NotImplementedError(f"unsupported rounding input {dtype}")
             elif name == "Year" and len(args) == 1 and len(value.function_data) == 1:
                 if self.visitor.get_dtype(value.input[0]) != pl.Date:
                     raise NotImplementedError("year extraction currently requires Date input")
@@ -337,6 +350,33 @@ class Adapter:
                         walk(child)
         walk(plan)
         self.checked_join_validation = True
+
+    def _aggregate_rounding(self, frame, fields, *, keys=None, maintain_order=False):
+        def contains_round(expr):
+            return expr._op == "polars_round" or any(
+                contains_round(arg) for arg in expr._args if isinstance(arg, Expr))
+        if not any(expr._aggregate and contains_round(expr) for expr in fields):
+            return (frame.select(fields) if keys is None else
+                    frame.group_by(*keys, maintain_order=maintain_order).agg(fields))
+        # Guarded rounding is a row expression. Materialize its reductions
+        # first, then round the aggregate rows in the same native query plan.
+        occupied = set(self.visitor.get_schema()) | {expr._name for expr in fields}
+        reductions = []
+        def rewrite(expr):
+            if expr._aggregate and not contains_round(expr):
+                name = f"_ibex_round_aggregate_{len(reductions)}"
+                while name in occupied:
+                    name += "_"
+                occupied.add(name)
+                reductions.append(expr.alias(name))
+                return ibex.col(name)
+            return Expr(expr._op, tuple(rewrite(arg) if isinstance(arg, Expr) else arg
+                                       for arg in expr._args))
+        projected = [rewrite(expr).alias(expr._name) for expr in fields]
+        if keys is None:
+            return frame.select(reductions).select(projected)
+        return frame.group_by(*keys, maintain_order=maintain_order).agg(reductions).select(
+            [ibex.col(key) for key in keys] + projected)
 
     def _hstack(self, frame, expressions, output_names, node_id):
         # Polars CSE lifts repeat's length into a WITH_COLUMNS field.
@@ -553,7 +593,7 @@ class Adapter:
             elif kind == "SimpleProjection":
                 frame = frame.select(list(schema))
             elif kind == "Select":
-                frame = frame.select([self.named(expr) for expr in node.expr])
+                frame = self._aggregate_rounding(frame, [self.named(expr) for expr in node.expr])
             elif kind == "HStack":
                 expressions = tuple(self.named(expr) for expr in node.exprs)
                 frame = self._hstack(frame, expressions, list(schema), node_id)
@@ -584,8 +624,9 @@ class Adapter:
                         representatives.append(Expr("first", (expr,)).alias(expr._name))
                     else:
                         keys.append(expr._name)
-                frame = frame.group_by(*keys, maintain_order=node.maintain_order).agg(
-                    representatives + [self.named(expr) for expr in node.aggs])
+                frame = self._aggregate_rounding(
+                    frame, representatives + [self.named(expr) for expr in node.aggs],
+                    keys=keys, maintain_order=node.maintain_order)
                 if representatives:
                     frame = frame.select(list(schema))
                 if node.options.slice is not None:

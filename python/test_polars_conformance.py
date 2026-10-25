@@ -15,7 +15,7 @@ from conformance.run import support_regressions, upstream_digest
 
 
 class ProbeTests(unittest.TestCase):
-    def compare(self, *, reference=None, candidate=None, error=None, calls=1, reference_error=None, check_row_order=True):
+    def compare(self, *, reference=None, candidate=None, error=None, calls=1, reference_error=None, check_row_order=True, allowed_rows=None):
         import ibex_pyarrow
         reference = pl.DataFrame({"x": [1]}) if reference is None else reference
         candidate = reference if candidate is None else candidate
@@ -32,7 +32,7 @@ class ProbeTests(unittest.TestCase):
                 raise reference_error
             return reference
 
-        probe = Probe(collect, check_row_order=check_row_order)
+        probe = Probe(collect, check_row_order=check_row_order, allowed_rows=allowed_rows)
         with patch("conformance.probe.IbexEngine", return_value=engine), \
                 patch.object(ibex_pyarrow, "execute_pipeline", return_value=None):
             try:
@@ -70,6 +70,18 @@ class ProbeTests(unittest.TestCase):
             event, _ = self.compare(reference=pl.DataFrame({"x": [1, 2]}),
                                     candidate=pl.DataFrame({"x": values}), check_row_order=False)
             self.assertEqual(event["status"], status)
+
+    def test_pinned_unordered_selection_checks_values_types_size_and_uniqueness(self):
+        reference = pl.DataFrame({"x": [1, 2]})
+        for candidate, status in ((pl.DataFrame({"x": [2, 3]}), "pass"),
+                                  (pl.DataFrame({"x": [3, 2]}), "pass"),
+                                  (pl.DataFrame({"x": [3, 4]}), "mismatch"),
+                                  (pl.DataFrame({"x": [2, 2]}), "mismatch"),
+                                  (pl.DataFrame({"x": [3]}), "mismatch"),
+                                  (pl.DataFrame({"x": [2.0, 3.0]}), "mismatch")):
+            with self.subTest(candidate=candidate):
+                event, _ = self.compare(reference=reference, candidate=candidate, allowed_rows=[[1], [2], [3]])
+                self.assertEqual(event["status"], status)
 
     def test_native_failure_is_not_unsupported(self):
         event, _ = self.compare(error=RuntimeError("failed"))

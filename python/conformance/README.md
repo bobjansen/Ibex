@@ -103,6 +103,14 @@ the sum of collected group indices). The harness still checks the full row
 multiset in both cases; unordered grouping can change group order on each run.
 There is no blanket sorting or dtype conversion to make comparisons pass.
 
+`unordered_selection_tests` records exact tests that slice an unordered
+`unique()` result. Separate Polars executions may select different valid rows.
+For the pinned `test_unique_head_tail_26429` input, the harness checks schema,
+reference height, distinct selected rows, and membership in the declared
+`x=1..5` input domain. Wrong values, duplicate rows, wrong types and wrong row
+counts still fail. All other comparisons retain their existing strict checks;
+ordered slicing is checked with exact row/value comparisons.
+
 ## Initial survey and expansion
 
 See the [unsupported-feature survey](unsupported-survey.md) for grouped

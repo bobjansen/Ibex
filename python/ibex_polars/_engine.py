@@ -8,6 +8,7 @@ import weakref
 
 import polars as pl
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from ._adapter import Adapter, check_version, flag_key
 from ._temporal import is_temporal, storage_type
@@ -15,6 +16,21 @@ from ._temporal import is_temporal, storage_type
 check_version()
 
 from polars.lazyframe.query_result import SingleNodeQueryResult
+
+
+def _categorical_from_arrow(column, dtype, name):
+    """Translate dictionary entries once, then gather Polars category codes.
+
+    Arrow dictionaries are local to each chunk; their ordinals need not match
+    the requested Polars category mapping. Keep the mapping alive in `labels`
+    until the physical codes have acquired their categorical dtype.
+    """
+    parts = []
+    for chunk in column.chunks:
+        labels = pl.from_arrow(chunk.dictionary).cast(dtype, strict=True)
+        codes = pc.take(labels.to_physical().to_arrow(), chunk.indices)
+        parts.append(pl.from_arrow(codes).cat.to(dtype).alias(name))
+    return pl.concat(parts, rechunk=False) if parts else pl.Series(name, [], dtype=dtype)
 
 
 def _to_polars(result, expected, output):
@@ -29,13 +45,20 @@ def _to_polars(result, expected, output):
             result = result.set_column(index, name, result.column(index).cast(storage_type(expected[name])))
             continue
         # The shared lowerer's logical string type describes dictionary-backed
-        # strings too. For categorical output, let Polars import the dictionary
-        # directly instead of decoding every row and encoding it again.
+        # strings too. Preserve dictionaries for code-based categorical export.
         if expected[name].base_type() == pl.Categorical and pa.types.is_dictionary(dtype):
             continue
         if dtype != output[name]:
             result = result.set_column(index, name, result.column(index).cast(output[name]))
-    frame = pl.from_arrow(result)
+    categorical = {name: _categorical_from_arrow(result[name], dtype, name)
+                   for name, dtype in expected.items()
+                   if dtype.base_type() == pl.Categorical and pa.types.is_dictionary(result[name].type)}
+    if categorical:
+        frame = pl.DataFrame([categorical[name] if name in categorical
+                              else pl.from_arrow(result[name]).alias(name)
+                              for name in expected])
+    else:
+        frame = pl.from_arrow(result)
     assert isinstance(frame, pl.DataFrame)
     # Named category mappings still require conversion to the requested dtype.
     return frame if frame.schema == expected else frame.cast(expected, strict=True)

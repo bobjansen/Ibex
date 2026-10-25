@@ -307,14 +307,16 @@ class EngineTests(unittest.TestCase):
                                                 pa.array(["b", "z", "a"]))]
         table = pa.table({"g": pa.chunked_array(chunks), "x": [1., 2., 3., 4., 5., 6.]})
         output = {"g": pa.large_string(), "x": pa.float64()}
-        for dtype in (pl.Categorical(), pl.Categorical(pl.Categories("ibex_output_test"))):
+        for dtype in (pl.Categorical(), pl.Categorical(pl.Categories("ibex_output_test")),
+                      pl.Categorical(pl.Categories("ibex_output_u8", physical=pl.UInt8)),
+                      pl.Categorical(pl.Categories("ibex_output_u16", physical=pl.UInt16))):
             expected = pl.Schema({"g": dtype, "x": pl.Float64})
             with patch.object(pl, "from_arrow", wraps=pl.from_arrow) as convert:
                 result = _to_polars(table, expected, output)
-                passed = convert.call_args.args[0]
-                self.assertTrue(pa.types.is_dictionary(passed["g"].type))
-                for before, after in zip(table["g"].chunks, passed["g"].chunks):
-                    self.assertEqual(before.buffers()[1].address, after.buffers()[1].address)
+                # Never send a row-sized dictionary array through Polars'
+                # dictionary importer: only labels and integer codes.
+                self.assertFalse(any(pa.types.is_dictionary(call.args[0].type)
+                                     for call in convert.call_args_list))
             self.assertEqual(result.schema, expected)
             self.assertEqual(result["g"].to_list(), ["b", None, "a", "z", None, "b"])
             self.assertEqual(result["x"].to_list(), table["x"].to_pylist())
@@ -325,6 +327,17 @@ class EngineTests(unittest.TestCase):
         string_schema = pl.Schema({"g": pl.String, "x": pl.Float64})
         self.assertEqual(_to_polars(table, string_schema, output).schema, string_schema)
 
+    def test_categorical_output_empty_chunks_and_null_dictionary(self):
+        dtype = pl.Categorical(pl.Categories("ibex_null_dictionary"))
+        expected = pl.Schema({"g": dtype})
+        arrays = [pa.chunked_array([], type=pa.dictionary(pa.int32(), pa.string())),
+                  pa.chunked_array([pa.DictionaryArray.from_arrays(
+                      pa.array([0, None, 1], type=pa.int32()), pa.array([None, "a"]))])]
+        for array, values in zip(arrays, ([], [None, None, "a"])):
+            result = _to_polars(pa.table({"g": array}), expected, {"g": pa.large_string()})
+            self.assertEqual(result.schema, expected)
+            self.assertEqual(result["g"].to_list(), values)
+
     def test_categorical_output_from_native_projection_and_grouping(self):
         for dtype in (pl.Categorical, pl.Categorical(pl.Categories("ibex_pipeline_test"))):
             frame = pl.DataFrame({"g": ["z", None, "a", "z"], "x": [1., 2., 3., 4.]}).with_columns(
@@ -333,7 +346,9 @@ class EngineTests(unittest.TestCase):
             reference = query.collect(engine="streaming")
             with patch.object(pl, "from_arrow", wraps=pl.from_arrow) as convert:
                 result = query.collect(engine=self.engine)
-                self.assertTrue(pa.types.is_dictionary(convert.call_args.args[0]["g"].type))
+                self.assertFalse(any(isinstance(call.args[0], pa.Table) and
+                                     pa.types.is_dictionary(call.args[0]["g"].type)
+                                     for call in convert.call_args_list))
             assert_frame_equal(result, reference)
             self.equal(frame.lazy().group_by("g").agg(mean=pl.mean("x")).sort("g"))
 

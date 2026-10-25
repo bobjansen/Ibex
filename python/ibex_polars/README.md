@@ -29,6 +29,13 @@ Column `count()` counts non-null values, while `pl.len()` counts all rows.
 Both return UInt32 and return zero for empty input. NaN and false Boolean
 values count as present. Computed row-expression counts are also supported.
 
+Floating `round(decimals, mode=...)` supports 0–15 decimal places and both
+`half_to_even` and `half_away_from_zero`. It preserves nulls, NaNs, infinities
+and signed zero without converting large floats to Int64. Rounded reductions
+run after aggregation in the same native plan. Float32 follows the existing
+Float64-intermediate policy. Supported integer rounding is an identity.
+Higher precisions remain explicitly rejected.
+
 Column-expression `.len()` includes nulls and returns UInt32; for supported
 row expressions its result equals the frame row count. Polars exposes this
 through the same visitor aggregate as `.count()`, with `include_nulls=True`.

@@ -98,6 +98,24 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
         if op == "cast":
             names = {pa.float64(): "Float64", pa.int64(): "Int64"}
             return f"{names[args[1]]}({render(args[0])})"
+        if op == "polars_round":
+            value, decimals, mode = args
+            factor = Expr("lit", (10.0 ** decimals,))
+            scaled = value * factor
+            safe = (scaled > -(2.0 ** 52)) & (scaled < 2.0 ** 52)
+            # Native round returns Int64. Sanitize its argument BEFORE the
+            # conversion, including when a vector kernel evaluates both arms.
+            operand = Expr("case", (safe, scaled, Expr("lit", (0.0,))))
+            rounding = "Bankers" if mode == "half_to_even" else "Nearest"
+            integer = f"Float64(round({render(operand)}, {rounding}))"
+            zero = bind(0.0)
+            rounded = f"case {{ {integer} == {zero} => ({render(scaled)} * {zero}), else => {integer} }}"
+            integral = f"case {{ {render(safe)} => {rounded}, else => {render(scaled)} }}"
+            result = f"(({integral}) / {render(factor)})"
+            # Scaling may overflow; Polars restores the original non-finite
+            # input or finite input whose scaled result overflowed.
+            inf = bind(float("inf"))
+            return f"case {{ ({result} > -{inf}) && ({result} < {inf}) => {result}, else => {render(value)} }}"
         if op == "like":
             return f"like({render(args[0])}, {render(args[1])})"
         if op == "year":
@@ -524,6 +542,10 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
             if any(dtype(arg) not in (pa.string(), pa.large_string()) for arg in args):
                 raise TypeError("string matching requires string operands")
             return pa.bool_()
+        if op == "polars_round":
+            if dtype(args[0]) != pa.float64():
+                raise TypeError("floating rounding requires a floating-point operand")
+            return pa.float64()
         if op == "is_nan":
             if dtype(args[0]) != pa.float64():
                 raise TypeError("is_nan requires a floating-point operand")

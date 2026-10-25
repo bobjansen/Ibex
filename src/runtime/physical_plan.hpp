@@ -186,8 +186,9 @@ struct JoinPlan {
     std::size_t key_count = 0;
 };
 
-/// Classify a join. Pure: it reads the node and nothing else.
-[[nodiscard]] auto plan_join(const ir::JoinNode& join) -> JoinPlan;
+/// Classify a join from its IR and known source schemas, without reading rows.
+[[nodiscard]] auto plan_join(const ir::JoinNode& join, const ir::SourceSchemas& sources = {})
+    -> JoinPlan;
 
 /// `strategy=... decline=... keys=N build=<kind> probe=<kind>` for tests and
 /// `explain physical`.

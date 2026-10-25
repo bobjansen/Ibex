@@ -19,6 +19,7 @@
 #include <ibex/core/time.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/ir/schema.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
@@ -1371,20 +1372,23 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 /// rather than restating them: a plan that reimplemented these clauses said
 /// `MaterializeBoth` for a two-key Int64 join the builder streams, and its
 /// equivalence probe -- written from the same reading -- agreed with it.
-[[nodiscard]] auto is_streamable_semi_anti_join(const ir::JoinNode& join) -> bool;
+[[nodiscard]] auto is_streamable_semi_anti_join(const ir::JoinNode& join,
+                                                const ir::SourceSchemas& sources = {}) -> bool;
 
 /// Whether every aggregation can be computed incrementally, and so streamed
 /// rather than materialized. Shared so the physical planner relays it.
 [[nodiscard]] auto aggregate_is_streamable(const ir::AggregateNode& agg) -> bool;
 
 /// Two Int64 keys on both sides, schema-provable. Not a property of the node
-/// alone: it calls `infer_schema` on both children.
-[[nodiscard]] auto is_streamable_pair_int_join(const ir::JoinNode& join) -> bool;
+/// alone: it calls `infer_schema` on both children using the planning sources.
+[[nodiscard]] auto is_streamable_pair_int_join(const ir::JoinNode& join,
+                                               const ir::SourceSchemas& sources = {}) -> bool;
 
 /// Every key of `join` is Int64 on both sides, schema-provable -- the type
 /// half of `is_streamable_pair_int_join`, shared with the semi/anti gate's
 /// two-key case. Calls `infer_schema` on both children.
-[[nodiscard]] auto join_keys_provably_int64(const ir::JoinNode& join) -> bool;
+[[nodiscard]] auto join_keys_provably_int64(const ir::JoinNode& join,
+                                            const ir::SourceSchemas& sources = {}) -> bool;
 
 // filter.cpp — vectorized predicate evaluation and filtering.
 [[nodiscard]] auto compute_mask(const ir::Expr& expr, const PredicateInput& input,

@@ -1446,14 +1446,16 @@ auto make_chunked_semi_anti_join_operator(OperatorPtr left, OperatorPtr right, i
         std::dynamic_pointer_cast<SemiAntiScanSink>(scan_sink), left_stream);
 }
 
-auto is_streamable_semi_anti_join(const ir::JoinNode& join) -> bool {
+auto is_streamable_semi_anti_join(const ir::JoinNode& join, const ir::SourceSchemas& sources)
+    -> bool {
     // One key of any type the operator sets, or two keys that are provably
     // Int64 on both sides -- the pair shape `right_pairs_` holds. Checked
     // last because it is the only clause that infers a schema.
     return (join.kind() == ir::JoinKind::Semi || join.kind() == ir::JoinKind::Anti) &&
            !join.predicate().has_value() && join.null_match() == ir::NullMatch::Never &&
            !join.expect().asserts_anything() && join.take() == ir::MatchSelection::All &&
-           (join.keys().size() == 1 || (join.keys().size() == 2 && join_keys_provably_int64(join)));
+           (join.keys().size() == 1 ||
+            (join.keys().size() == 2 && join_keys_provably_int64(join, sources)));
 }
 
 }  // namespace ibex::runtime

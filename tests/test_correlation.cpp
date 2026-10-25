@@ -82,25 +82,37 @@ TEST_CASE("global paired moments are stable and independent of compute budget",
         check("c", std::nullopt);
         check("r", std::nullopt);
     } else {
-        // Independent long-double, two-pass oracle over the actual valid pairs.
-        long double mx = 0;
-        long double my = 0;
-        for (const auto& [x, y] : reference) {
-            mx += x;
-            my += y;
-        }
-        mx /= reference.size();
-        my /= reference.size();
-        long double xx = 0;
-        long double yy = 0;
-        long double xy = 0;
-        for (const auto& [x, y] : reference) {
-            xx += (x - mx) * (x - mx);
-            yy += (y - my) * (y - my);
-            xy += (x - mx) * (y - my);
-        }
-        check("c", static_cast<double>(xy / (reference.size() - 1)));
-        check("r", static_cast<double>(xy / std::sqrt(xx * yy)));
+        // Independent two-pass oracle. Translate before summing so it stays
+        // accurate when long double has only double precision (Apple Silicon).
+        // Exercise double explicitly on every platform to keep that regression
+        // visible even on hosts with extended-precision long double.
+        const auto check_reference = [&]<typename Float>() {
+            const auto origin_x = static_cast<Float>(reference.front().first);
+            const auto origin_y = static_cast<Float>(reference.front().second);
+            const auto count = static_cast<Float>(reference.size());
+            Float mx = 0;
+            Float my = 0;
+            for (const auto& [x, y] : reference) {
+                mx += static_cast<Float>(x) - origin_x;
+                my += static_cast<Float>(y) - origin_y;
+            }
+            mx /= count;
+            my /= count;
+            Float xx = 0;
+            Float yy = 0;
+            Float xy = 0;
+            for (const auto& [x, y] : reference) {
+                const auto dx = (static_cast<Float>(x) - origin_x) - mx;
+                const auto dy = (static_cast<Float>(y) - origin_y) - my;
+                xx += dx * dx;
+                yy += dy * dy;
+                xy += dx * dy;
+            }
+            check("c", static_cast<double>(xy / (count - 1)));
+            check("r", static_cast<double>(xy / std::sqrt(xx * yy)));
+        };
+        check_reference.template operator()<double>();
+        check_reference.template operator()<long double>();
     }
     for (const auto threads : {1U, 2U, 3U, 8U}) {
         runtime::ExecutionContext exec;

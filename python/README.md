@@ -148,6 +148,12 @@ remain unsupported. Every joined pipeline executes in one native call.
 
 For the full 22-query adapter coverage check and current scale-10 timings against
 both Polars executors, see [PDS-H engine performance](pdsh-performance.md).
+The engine now runs **Q1–Q6, Q12 and Q18 (8/22)**, checked on SF10 at one and
+eight workers. New translations include literal membership, conditionals,
+Boolean sums, basic string matching, Date years, deterministic cache markers,
+floating group keys, numeric extrema and null-inclusive distinct counts.
+Regex operators, floating decimal rounding and several join/aggregate visitor
+shapes remain unsupported; the linked report lists each query's first blocker.
 Its native planning follow-up reduces eight-thread Q6 from 747 ms to 219 ms
 (Polars streaming: 189 ms), preserving Polars' NaN/null semantics.
 

@@ -43,22 +43,64 @@ relevant alongside warm throughput.
 
 ## Coverage
 
-Only **Q1, Q4 and Q6** currently translate with the default optimization flags.
-All three pass complete result comparisons before timing.
-The other 19 queries are rejected, without falling back to Polars or rewriting
-the queries. These are first blockers, not exhaustive inventories per query:
+The expanded adapter supports **8 of 22 queries: Q1–Q6, Q12 and Q18**.
+Q2, Q3, Q5, Q12 and Q18 are newly supported. All eight pass complete result
+comparisons against both standard Polars and Polars streaming on the unchanged
+SF10 Parquet inputs, at one and eight matched workers. The performance table
+above remains the earlier three-query baseline; this coverage pass does not
+publish new warm timing medians.
+
+The remaining 14 queries fail explicitly before native execution. These are
+first blockers, not exhaustive inventories per query:
 
 | Queries | First translation blocker |
 |---|---|
-| Q2, Q8, Q18, Q21 | Cached subplans (`Cache`) |
-| Q3, Q5 | Unsupported comparison between operand types |
-| Q7, Q17, Q19, Q20 | Joins carrying fused predicates |
-| Q9, Q13 | String `contains` |
-| Q10 | Floating-point grouping keys |
+| Q7, Q17, Q19, Q20 | Polars visitor cannot expose joins with fused predicates |
+| Q8, Q10, Q14 | Floating decimal rounding (`round`, half-to-even) |
+| Q9 | Fused arithmetic (`fms`) |
 | Q11, Q22 | Inequality joins (`IEJoin`) |
-| Q12, Q16 | List literals |
-| Q14 | Conditional expression (`Ternary`) |
-| Q15 | Float64 `max` aggregate |
+| Q13, Q16 | Regular-expression operators in string `contains` |
+| Q15 | Reductions broadcast inside a filter |
+| Q21 | Expression-level filtered aggregation (`Filter`) |
+
+The new translations cover compatible string representations, literal
+membership (including null policies), conditional expressions and typed null
+branches, Boolean sums, literal starts/ends/contains matching, Date year
+extraction, deterministic cached subplans, floating grouping keys, numeric
+min/max and null-inclusive distinct counts over integer/Boolean/string values.
+String matching escapes native LIKE metacharacters; regex mode accepts only
+patterns without regex operators. Literal membership accepts at most 256
+scalar values and adds no list/struct column support. Cached deterministic
+subplans may be recomputed by native execution; this is not a physical result
+cache. Floating group keys normalize NaNs for equality and return original
+labels. Float extrema skip NaNs when ordinary values exist, return NaN for
+all-NaN groups, and null for empty/all-null inputs.
+
+Validation includes 113 Python tests and 660 subtests. New regressions exercise
+resident and Parquet strings/membership, null predicates and branches, NaN
+membership and groups, signed zeros, empty inputs, Date extraction, shared
+subplans, extrema and distinct-count null handling. Corrupting the corresponding
+translations makes the new regression cases fail; sources were restored before
+validation. Upstream query functions and optimization flags are unchanged, and
+query execution never falls back to Polars.
+
+- [Eight-worker full-result coverage](pdsh-performance-results/sf10-expanded-coverage-eight.json)
+- [One-worker full-result coverage](pdsh-performance-results/sf10-expanded-coverage-single.json)
+
+Reproduce the coverage check without benchmark loops:
+
+```bash
+PYTHONPATH=build-release/python:python IBEX_CORES=8 POLARS_MAX_THREADS=8 \
+  OPENBLAS_NUM_THREADS=1 .venv/bin/python python/bench_pdsh_engine.py \
+  --pdsh-root ../polars-benchmark \
+  --data ../polars-benchmark/data/tables/scale-10.0 \
+  --check-only --out results/pdsh-coverage-eight.json
+```
+
+Use `--queries 2 3 5 12 18` for just the newly supported queries. The JSON keeps
+all outcomes, upstream source hashes, generated native source for successful
+queries, input metadata and bridge identity. `first_collect_ms` is diagnostic
+first-use timing, not a warm benchmark result.
 
 ## Measurement method
 
@@ -115,7 +157,8 @@ here describe this i7-13700's P-core topology and need adapting on other hosts.
 - Excluded initial runs with competing load: [single](pdsh-performance-results/sf10-single-initial.json), [eight](pdsh-performance-results/sf10-eight-initial.json)
 
 The [runner](bench_pdsh_engine.py) records all 22 query outcomes in every report.
-There is no whole-suite performance score: 19 queries are unsupported.
+Those initial timing reports covered three queries. There is no whole-suite
+performance score; current coverage and its 14 remaining blockers appear above.
 
 ## Comparison-policy follow-up
 

@@ -124,6 +124,11 @@ class EngineTests(unittest.TestCase):
         with patch.object(ibex_pyarrow, "bind_table") as bind, patch.object(ibex_pyarrow, "execute_pipeline") as execute:
             with self.assertRaisesRegex(NotImplementedError, "decimal places"):
                 self.engine.prepare(pl.DataFrame({"x": [1.]}).lazy().select(pl.col("x").round(16)))
+            source = pl.DataFrame({"x": [1., 2.], "g": [1, 1]}).lazy()
+            for query in (source.select(pl.col("x"), pl.col("x").sum().round(2).alias("rounded")),
+                          source.group_by("g").agg(pl.col("x"), pl.col("x").sum().round(2).alias("rounded"))):
+                with self.assertRaises(NotImplementedError):
+                    self.engine.prepare(query)
             bind.assert_not_called()
             execute.assert_not_called()
 

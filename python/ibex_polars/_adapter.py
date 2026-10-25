@@ -371,6 +371,10 @@ class Adapter:
         if not any(expr._aggregate and contains_round(expr) for expr in fields):
             return (frame.select(fields) if keys is None else
                     frame.group_by(*keys, maintain_order=maintain_order).agg(fields))
+        if any(not expr._aggregate or expr._row_reference for expr in fields):
+            raise NotImplementedError("rounded aggregate projections require scalar reductions")
+        if keys is not None and any(expr._name in keys for expr in fields):
+            raise ValueError("aggregate output name conflicts with a grouping key")
         # Guarded rounding is a row expression. Materialize its reductions
         # first, then round the aggregate rows in the same native query plan.
         occupied = set(self.visitor.get_schema()) | {expr._name for expr in fields}

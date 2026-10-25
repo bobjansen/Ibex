@@ -14,6 +14,7 @@
 #include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/ir/schema.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/interrupt.hpp>
 #include <ibex/runtime/operator.hpp>

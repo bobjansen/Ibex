@@ -1,16 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/column.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/worker_pool.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include "interpreter_internal.hpp"
+#include "welford.hpp"
 
 namespace ibex::runtime {
 namespace {
@@ -86,8 +95,8 @@ auto pair_moment(const Column<X>& xs, const Column<Y>& ys, const ValidityBitmap*
     // then operate on small residuals, even for 1e12-offset inputs. Covariance
     // and correlation are translation-invariant; no rounded absolute mean is
     // needed. Do not use sum(x*x)-sum(x)^2/n, which loses small spreads.
-    const double origin_x = static_cast<double>(xs[first]);
-    const double origin_y = static_cast<double>(ys[first]);
+    const auto origin_x = static_cast<double>(xs[first]);
+    const auto origin_y = static_cast<double>(ys[first]);
     const std::size_t blocks = (rows + kPairBlockRows - 1) / kPairBlockRows;
     std::vector<CoMoment> partial(blocks);
     const auto reduce = [&](std::size_t block) {
@@ -155,7 +164,7 @@ auto global_paired_aggregate(const Table& input, const std::vector<ir::AggSpec>&
         auto pair =
             std::ranges::find_if(pairs, [&](const Pair& p) { return p.x == x && p.y == y; });
         if (pair == pairs.end()) {
-            pairs.push_back({x, y, pair_moment(*x, *y, exec)});
+            pairs.push_back({.x = x, .y = y, .moment = pair_moment(*x, *y, exec)});
             pair = std::prev(pairs.end());
         }
         Column<double> value;

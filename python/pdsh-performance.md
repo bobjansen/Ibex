@@ -179,8 +179,8 @@ all samples and the driver used.
 
 A deeper investigation used the REPL's read-only `:explain` machinery on the
 filter, join and aggregate portions, then compared actual execution profiles.
-The current adapter's line filter reports `serial(expression needs rows outside
-the morsel)`. Removing the unnecessary null-handling case reports
+Before the membership fix, the adapter's line filter reported
+`serial(expression needs rows outside the morsel)`. Removing the unnecessary null-handling case reports
 `morsel-parallel`. Both joins report the same `StreamingProbe`, `SingleKeyInner`
 strategy and `orientation=runtime`. Handwritten native Q12 uses the same
 orders-to-lineitem source order. Reversing the compact native join measured
@@ -211,7 +211,8 @@ calls `decode_demanded_lazy_sources` before `interpret`. By contrast,
 `execute_script` tries `try_execute_whole_script`, which executes the unified
 plan through `optimize_and_execute_plan`. That path additionally registers
 streaming scans and deferred probe scans in the execution context. The Python
-entry point does not currently use that registration path.
+entry point did not use that registration path before the bound-expression
+fix below.
 
 Actual profiles distinguish the routes: CLI Q12 has a live streaming stage
 (`stage_threads_peak=1`), overlapping unit decoding and downstream execution;
@@ -243,11 +244,10 @@ outputs; these are separate queries and their times are not additive:
 | Join and aggregate with resident inputs | 35 | 33 |
 | Complete cleaned query | 296 | 173 |
 
-The next fixes are to simplify frontend membership and provide a bound-query
-execution path that shares whole-plan optimization and scan registration with
-the CLI. Calling the existing fresh-script planner blindly is insufficient:
-the library path must carry its injected table/scalar bindings and preserve
-session semantics. No production implementation changed in this investigation.
+These findings motivated the membership and bound-expression fixes below.
+Calling the existing fresh-script planner blindly is insufficient: the library
+path must carry its injected table/scalar bindings and preserve session
+semantics. The measurements in this section preceded those production fixes.
 
 The [deep-dive archive](pdsh-performance-results/q12-deep-dive.json) retains
 physical inspection inputs and outputs, both execution profiles, all paired
@@ -255,6 +255,58 @@ samples, component checks, native query text and diagnostic drivers. One early
 multi-variant trial is explicitly excluded from numerical conclusions because
 all timings, including the Polars reference, drifted substantially; its cause
 was not established.
+
+## Q12: membership and bound-expression fixes
+
+The membership translation now emits a bare OR-chain of equalities when its
+null policy permits it. Empty/all-null lists and `nulls_equal=True` retain
+explicit null handling. Python pipelines also opt into the existing script
+executor for each table expression: source statistics, deferred probe scans
+and streaming scan registration are shared with the CLI. Statements retain
+their order and bindings; this does not fuse across a materialized prefix
+binding. Ordinary REPL execution keeps its default behavior.
+
+Deferred scan registrations now carry the call's scalar registry. The script
+path previously needed none, but Python predicates retain typed lexical
+bindings; both whole-source deferred probes and per-unit scans must receive
+them. The native regression reader refuses whole-file decoding, and the test
+fails when streaming is disabled. The actual Q12 profile now has a live
+streaming stage (`stage_threads_peak=1`).
+
+Twelve alternating pairs compare the saved pre-executor bridge with the new
+bridge, both using the fixed membership translation. These are Release SF10
+warm collection medians in milliseconds, with matched thread budgets:
+
+| Threads | Fixed membership, old executor | Fixed membership, new executor | Polars streaming |
+|---|---:|---:|---:|
+| 1 | 1,259.4 | 1,207.7 | 1,165.4 |
+| 8 | 296.0 | 191.4 | 179.1 |
+
+The executor wins all 12 pairs at each budget; median paired reductions are
+4.2% and 35.0% (exact two-sided sign-test p=0.000488 each). The eight-thread
+result is about 7% behind streaming Polars. The earlier pre-membership
+production result was about 2.5 seconds; that historical measurement was a
+separate run, not a paired baseline for this table.
+
+Fresh-process first Ibex collections were 1,713 → 1,218 ms at one thread and
+534 → 200 ms at eight threads. These use warm file caches, not cold storage;
+the Polars reference runs in a worker already warmed by Ibex. Desktop apps
+remained running; no compilation or other benchmark overlapped these timings.
+
+Complete SF10 results match both Polars executors for all eight supported
+queries (Q1–Q6, Q12, Q18) at eight threads. The focused Q12 comparison checks
+every row, dtype and ordering on every sample at both thread budgets. Python
+validation passes 114 tests and 660 subtests; native CTest reports zero
+failures in 2,372 cases, with four network tests skipped. GCC runtime and
+plugin rebuilds pass. The required native A/B has no regressions in its four
+filter cases; those small in-memory cases are a regression screen rather
+than evidence for this streaming change's benefit.
+
+The [paired results and drivers](pdsh-performance-results/q12-bound-streaming.json)
+retain samples, first-use measurements, bridge hashes, generated source,
+full-scope checks and native A/B output. The
+[actual runtime profile](pdsh-performance-results/q12-bound-streaming-profile-eight.txt)
+contains two Q12 executions; use the second for warm profiling.
 
 ## Measurement method
 

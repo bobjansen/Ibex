@@ -163,10 +163,11 @@ Regex operators, floating decimal rounding and several join/aggregate visitor
 shapes remain unsupported; the linked report lists each query's first blocker.
 Its native planning follow-up reduces eight-thread Q6 from 747 ms to 219 ms
 (Polars streaming: 189 ms), preserving Polars' NaN/null semantics.
-The expanded eight-query timing check finds Q12 at 2,528 ms versus streaming
-Polars' 173 ms; the report includes its filter profile and a diagnostic that
-reduces the frontend overhead without changing the result. Production timings
-and diagnostic timings are reported separately.
+Membership simplification and shared streaming scan planning reduce Q12's
+eight-thread warm median to 191 ms versus streaming Polars' 179 ms. A paired
+executor comparison measures 296 → 191 ms with membership already fixed;
+at one thread it measures 1,259 → 1,208 ms (Polars: 1,165 ms). The report
+retains the earlier diagnostics, complete results and first-use measurements.
 
 The optional conformance runner needs Polars 2.0 and the upstream benchmark's
 Python dependencies, checkout and generated data. It invokes the original

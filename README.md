@@ -600,6 +600,9 @@ executes again. Unsupported plans fail explicitly. This source-tree experiment
 pins Polars 2.0.0 and its private plan visitor. See
 [scope and setup](python/ibex_polars/README.md) and
 [resident-table measurements](python/polars-engine-performance.md).
+The [PDS-H comparison](python/pdsh-performance.md) covers eight unchanged
+queries on SF10. After membership and streaming fixes, Q12's eight-thread
+warm median is 191 ms versus Polars streaming's 179 ms.
 
 ## Independent lazy Python API (experimental)
 

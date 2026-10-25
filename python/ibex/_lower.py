@@ -607,6 +607,8 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
             schemas.append(dict(columns))
             continue
         types = [dtype(expr) for expr in expressions]
+        if any(pa.types.is_null(result) for result in types):
+            raise NotImplementedError("untyped null outputs require an explicit supported dtype")
         step_types.append(type_map)
         if operation == "filter":
             if any(result != pa.bool_() for result in types):

@@ -48,7 +48,7 @@ The latest additions are Q7, Q8, Q9, Q10, Q14, Q17, Q19 and Q20. All eight
 additions pass complete result comparisons against both in-memory Polars and
 streaming Polars on unchanged SF10 Parquet inputs, with matched one- and
 eight-thread budgets. The earlier eight queries retain their correctness and
-performance evidence below. New-query timings have not yet been measured.
+performance evidence below. The new-query measurements are reported next.
 
 The remaining six queries fail explicitly before native execution. These are
 first blockers, not exhaustive inventories per query:
@@ -78,6 +78,45 @@ The original caller flags and prepared-plan cache keys remain unchanged.
 [Full SF10 checks and coverage](pdsh-performance-results/expanded-16-checks.json)
 retain complete-result check outcomes, generated sources, query hashes and
 mutation evidence. The Python suite passes 118 tests and 692 subtests.
+
+## Newly supported queries: measurements
+
+The eight newly supported queries use unchanged upstream functions and SF10
+Parquet files. These are Release warm-process, warm-file-cache collection
+medians in milliseconds on the same i7-13700 locked at 3.2 GHz. Translation is
+prepared outside timing. Each route has an initial correctness collection and
+two warmups, followed by six rounds balancing all six executor orderings.
+Collection includes source reading, execution and public result conversion;
+previous-result destruction and full-result checks are outside timing.
+Every warmup and timed output matches in-memory Polars, including dtype,
+column names and row order (`rel_tol=1e-10`, `abs_tol=1e-8`). No execution falls
+back to Polars. Ordinary desktop apps remain running; no build or other
+benchmark overlapped these runs.
+
+Eight matched threads, pinned to CPUs 0,2,4,6,8,10,12,14:
+
+| Query | Polars in-memory | Polars streaming | Polars–Ibex |
+|---|---:|---:|---:|
+| Q7 | 502 | 435 | 520 |
+| Q8 | 621 | 472 | 525 |
+| Q9 | 1,363 | 632 | 1,067 |
+| Q10 | 568 | 474 | 1,213 |
+| Q14 | 305 | 281 | 328 |
+| Q17 | 288 | 219 | 468 |
+| Q19 | 308 | 311 | 2,164 |
+| Q20 | 775 | 413 | 543 |
+
+Polars–Ibex beats in-memory Polars on Q8, Q9 and Q20, but streaming Polars
+wins all eight. Q7, Q8 and Q14 are relatively close to streaming (about 11–19%
+slower). Q10 is 2.6× slower, Q17 2.1×, and Q19 is the largest gap at 7.0×.
+These measurements identify the gaps; they do not establish their causes.
+
+[Eight-thread samples and generated plans](pdsh-performance-results/expanded-16-timings-eight.json)
+retain bridge and Python-source hashes, query/data provenance, preparation
+and first-per-query collection times, wall-time samples and process CPU
+samples. Process CPU counts all threads and excludes correctness checks.
+First-per-query times follow other routes/queries in the same process and
+are not fresh-process first-use measurements.
 
 The new translations cover compatible string representations, literal
 membership (including null policies), conditional expressions and typed null

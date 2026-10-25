@@ -226,7 +226,13 @@ class Adapter:
         node = self.visitor.view_current_node()
         kind = type(node).__name__
         schema = self.visitor.get_schema()
-        if kind == "DataFrameScan":
+        if kind == "MapFunction" and len(node.function) == 2 and node.function[0] == "hint_sorted":
+            # A sortedness assertion leaves rows unchanged. Ignore the claim
+            # until native metadata propagation is implemented; existing native
+            # ordering proofs and general algorithms remain available.
+            frame = self.frame(node.input)
+            self.frame_length_columns[node_id] = self.frame_length_columns.get(node.input, set())
+        elif kind == "DataFrameScan":
             if node.selection is not None:
                 raise NotImplementedError("DataFrameScan selections are not supported yet")
             for name, dtype in schema.items():

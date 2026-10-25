@@ -175,6 +175,9 @@ to 438 ms at eight threads, Q3 from 524 to 401 ms, and Q4 from 302 to 258 ms.
 Q1 is a repeatable 3–5% regression. At one thread Q6 slows by 4% and Q18 by
 41%; disabling scan streaming removes Q18's regression. See the linked report
 for all samples and the fresh-process comparison.
+The eight new-query measurements are now published there too. At eight
+threads Q7, Q8 and Q14 are within 11–19% of streaming Polars; Q19 is the
+largest new gap at about 7× slower.
 
 The optional conformance runner needs Polars 2.0 and the upstream benchmark's
 Python dependencies, checkout and generated data. It invokes the original

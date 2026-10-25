@@ -2048,10 +2048,10 @@ namespace {
 
 // Split a conjunct into (column, op, literal), normalizing `literal op column`
 // into `column flip(op) literal`.
-auto split_col_cmp_lit(const ir::Expr& expr)
+auto split_col_cmp_lit(const ir::Expr& expr, bool allow_nan_high = false)
     -> std::optional<std::tuple<const ir::ColumnRef*, ir::CompareOp, const ir::Literal*>> {
     const auto* cmp = std::get_if<ir::CompareExpr>(&expr.node);
-    if (cmp == nullptr || cmp->float_comparison != ir::FloatComparison::IEEE) {
+    if (cmp == nullptr || (!allow_nan_high && cmp->float_comparison != ir::FloatComparison::IEEE)) {
         return std::nullopt;
     }
     if (const auto* col = std::get_if<ir::ColumnRef>(&cmp->left->node);
@@ -2820,6 +2820,10 @@ struct BoundsSpec {
     bool lo_incl = true;
     bool hi_incl = true;
     bool unsatisfiable = false;
+    // Each absorbed conjunct intersects this flag. IEEE comparisons and
+    // NaN-high upper/equality bounds reject NaNs; NaN-high lower bounds admit
+    // them, even when the finite interval itself becomes empty.
+    bool accept_nan = true;
 };
 
 template <typename T>
@@ -2845,7 +2849,8 @@ void tighten_hi(T& cur, bool& cur_incl, T v, bool incl) {
 // Fold one `column <op> literal` conjunct into the column's running range.
 // Returns false when the literal's type doesn't match the column's, leaving the
 // conjunct for the generic path rather than guessing at a conversion.
-auto merge_bound(BoundsSpec& spec, ir::CompareOp op, const ir::Literal& lit) -> bool {
+auto merge_bound(BoundsSpec& spec, ir::CompareOp op, const ir::Literal& lit,
+                 ir::FloatComparison policy) -> bool {
     if (op == ir::CompareOp::Ne) {
         return false;
     }
@@ -2880,9 +2885,13 @@ auto merge_bound(BoundsSpec& spec, ir::CompareOp op, const ir::Literal& lit) -> 
             return false;
         }
         if (std::isnan(vd)) {
-            return false;  // every comparison against NaN is false; not a range
+            return false;  // NaN literals retain their policy-aware generic path
         }
     }
+
+    spec.accept_nan = spec.accept_nan && !integral &&
+                      policy == ir::FloatComparison::NaNsEqualAndGreatest &&
+                      (op == ir::CompareOp::Gt || op == ir::CompareOp::Ge);
 
     const bool lower = op == ir::CompareOp::Gt || op == ir::CompareOp::Ge;
     const bool upper = op == ir::CompareOp::Lt || op == ir::CompareOp::Le;
@@ -3064,16 +3073,18 @@ auto build_bounds_plan(const Table& input, const std::vector<ir::Expr>& conjunct
             continue;
         }
 
-        auto split = split_col_cmp_lit(conjunct);
+        auto split = split_col_cmp_lit(conjunct, /*allow_nan_high=*/true);
         if (!split.has_value()) {
             plan.leftover.push_back(conjunct);
             continue;
         }
         const auto& [col, op, lit] = *split;
+        const auto policy = std::get<ir::CompareExpr>(conjunct.node).float_comparison;
 
         // A text equality (or inequality) is a membership test, not a range.
         if (const auto* text = std::get_if<std::string>(&lit->value)) {
-            if (op == ir::CompareOp::Eq || op == ir::CompareOp::Ne) {
+            if (policy == ir::FloatComparison::IEEE &&
+                (op == ir::CompareOp::Eq || op == ir::CompareOp::Ne)) {
                 const std::vector<std::string_view> values{std::string_view{*text}};
                 if (add_set_conjunct(*col, values, op == ir::CompareOp::Ne)) {
                     continue;
@@ -3117,7 +3128,7 @@ auto build_bounds_plan(const Table& input, const std::vector<ir::Expr>& conjunct
             candidate.validity = entry.validity.has_value() ? &*entry.validity : nullptr;
         }
 
-        if (!merge_bound(candidate, op, *lit)) {
+        if (!merge_bound(candidate, op, *lit, policy)) {
             plan.leftover.push_back(conjunct);
             continue;
         }
@@ -3135,35 +3146,44 @@ auto build_bounds_plan(const Table& input, const std::vector<ir::Expr>& conjunct
     return plan;
 }
 
-template <typename T, bool LoIncl, bool HiIncl>
+template <typename T, bool LoIncl, bool HiIncl, bool AcceptNaN>
+auto bounds_matches(T v, T lo, T hi) -> bool {
+    const bool in_range = (LoIncl ? v >= lo : v > lo) && (HiIncl ? v <= hi : v < hi);
+    if constexpr (AcceptNaN) {
+        return in_range || std::isnan(v);
+    }
+    return in_range;
+}
+
+template <typename T, bool LoIncl, bool HiIncl, bool AcceptNaN>
 void bounds_kernel(const T* __restrict values, T lo, T hi, std::uint8_t* __restrict mask,
                    std::size_t len, bool first) {
     if (first) {
         for (std::size_t i = 0; i < len; ++i) {
             const T v = values[i];
-            const bool ok = (LoIncl ? v >= lo : v > lo) && (HiIncl ? v <= hi : v < hi);
+            const bool ok = bounds_matches<T, LoIncl, HiIncl, AcceptNaN>(v, lo, hi);
             mask[i] = static_cast<std::uint8_t>(ok);
         }
         return;
     }
     for (std::size_t i = 0; i < len; ++i) {
         const T v = values[i];
-        const bool ok = (LoIncl ? v >= lo : v > lo) && (HiIncl ? v <= hi : v < hi);
+        const bool ok = bounds_matches<T, LoIncl, HiIncl, AcceptNaN>(v, lo, hi);
         mask[i] = static_cast<std::uint8_t>(mask[i] & static_cast<std::uint8_t>(ok));
     }
 }
 
-template <typename T>
+template <typename T, bool AcceptNaN = false>
 void bounds_range(const T* values, T lo, T hi, bool lo_incl, bool hi_incl, std::uint8_t* mask,
                   std::size_t len, bool first) {
     if (lo_incl && hi_incl) {
-        bounds_kernel<T, true, true>(values, lo, hi, mask, len, first);
+        bounds_kernel<T, true, true, AcceptNaN>(values, lo, hi, mask, len, first);
     } else if (lo_incl) {
-        bounds_kernel<T, true, false>(values, lo, hi, mask, len, first);
+        bounds_kernel<T, true, false, AcceptNaN>(values, lo, hi, mask, len, first);
     } else if (hi_incl) {
-        bounds_kernel<T, false, true>(values, lo, hi, mask, len, first);
+        bounds_kernel<T, false, true, AcceptNaN>(values, lo, hi, mask, len, first);
     } else {
-        bounds_kernel<T, false, false>(values, lo, hi, mask, len, first);
+        bounds_kernel<T, false, false, AcceptNaN>(values, lo, hi, mask, len, first);
     }
 }
 
@@ -3208,8 +3228,13 @@ void apply_bounds_spec(const BoundsSpec& spec, std::size_t base, std::size_t len
         }
         case BoundsKind::Double: {
             const auto* values = static_cast<const double*>(spec.data) + base;
-            bounds_range<double>(values, spec.lo_d, spec.hi_d, spec.lo_incl, spec.hi_incl, mask,
-                                 len, first);
+            if (spec.accept_nan) {
+                bounds_range<double, true>(values, spec.lo_d, spec.hi_d, spec.lo_incl, spec.hi_incl,
+                                           mask, len, first);
+            } else {
+                bounds_range<double>(values, spec.lo_d, spec.hi_d, spec.lo_incl, spec.hi_incl, mask,
+                                     len, first);
+            }
             break;
         }
     }
@@ -3333,7 +3358,7 @@ auto select_bounds(const std::vector<BoundsSpec>& specs, const std::vector<SetSp
     constexpr std::size_t kBlock = 4096;
     Selection selected;
     for (const auto& spec : specs) {
-        if (spec.unsatisfiable) {
+        if (spec.unsatisfiable && !spec.accept_nan) {
             return selected;
         }
     }

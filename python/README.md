@@ -70,7 +70,7 @@ reported separately in the performance note below.
 |---|---|
 | Input | A single local Parquet file, or `DataFrame(dict_or_arrow_table).lazy()` |
 | Expressions | `col`, `lit`, aliases, numeric arithmetic, comparisons, Boolean `&`, `\|`, `~`, `is_between`, numeric `sum`/`mean`, `first`/`last`, non-null column `count`, row count `len` |
-| Pipelines | `filter`, `select`, one expression per `with_columns`, column-key `group_by(...).agg(...)`, column-key `sort`, `collect`, source-only `explain` |
+| Pipelines | `filter`, `select`, one expression per `with_columns`, column-key `group_by(...).agg(...)`, column-key `sort`, `unique`, `collect`, source-only `explain` |
 | Results | Ibex `DataFrame`/`Series`, columns, shape, item, column lookup, `to_list`, `to_dict`, `to_arrow`, `to_pandas` |
 | Types | Int64, Float64, Bool, strings, Date; sums preserve Int64/Float64 and return zero for empty/all-null input; mean is Float64; row-count output is UInt32 |
 
@@ -120,6 +120,13 @@ uses native `first_null`/`last_null`; the null-skipping variant uses native
 `first`/`last`. Empty global reductions return one null row; empty grouped
 reductions return no groups. Null-skipping Date reductions remain unsupported.
 The new native reducers currently materialize their input.
+
+`unique(subset=None, keep="any", maintain_order=False)` removes duplicate rows
+or selects representatives by column-name subset keys while retaining all
+columns. The `first`, `last`, and `none` modes are also supported; `any` chooses
+the first row. Results retain selected rows in input order. Nulls and NaNs
+compare equal within duplicate groups, and signed zeros compare equal.
+Empty subsets remain unsupported.
 
 ## Check the actual upstream PDS-H query
 

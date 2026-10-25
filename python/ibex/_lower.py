@@ -17,7 +17,8 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
     scalars = {}
     tables = {}
 
-    step_types, schemas = _validate_types(frame, widen_numeric_inputs=widen_numeric_inputs) if validate else ([], [])
+    needs_schema = validate or any(operation == "unique" for operation, _ in frame._steps)
+    step_types, schemas = _validate_types(frame, widen_numeric_inputs=widen_numeric_inputs) if needs_schema else ([], [])
     if result_schema is not None:
         result_schema.update(schemas[-1])
     current_types = {}
@@ -137,6 +138,52 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             fields = ", ".join(_identifier(name) for name in keys)
             fields += ", " + ", ".join(f"{_identifier(expr._name)} = {render(expr)}" for expr in aggregates)
             source += f"[select {{ {fields} }}, by {{ {', '.join(_identifier(name) for name in keys)} }}]"
+        elif operation == "unique":
+            subset, keep, maintain_order = expressions
+            columns = schemas[index]
+            keys = tuple(columns) if subset is None else subset
+            fields = ", ".join(_identifier(name) for name in columns)
+            if set(keys) == set(columns) and keep in ("any", "first") and not any(
+                columns[name] == pa.float64() for name in keys
+            ):
+                source += f"[distinct {{ {fields} }}]"
+                continue
+            occupied = set(columns)
+            def temporary(role):
+                name = f"_ibex_unique_{index}_{role}"
+                while name in occupied:
+                    name += "_"
+                occupied.add(name)
+                return name
+            row = temporary("row")
+            updates = [f"{_identifier(row)} = seq()"]
+            group_keys = []
+            for key_index, name in enumerate(keys):
+                key = temporary(f"key_{key_index}")
+                value = _identifier(name)
+                if columns[name] == pa.float64():
+                    # Ibex keeps NaN keys distinct; Polars groups all NaNs.
+                    # The flag separates NaN from a genuine zero (and null).
+                    nan = temporary(f"nan_{key_index}")
+                    updates.append(f"{_identifier(nan)} = is_nan({value})")
+                    group_keys.append(nan)
+                    value = f"case {{ is_nan({value}) => 0.0, else => {value} }}"
+                updates.append(f"{_identifier(key)} = {value}")
+                group_keys.append(key)
+            ordinal, count = temporary("ordinal"), temporary("count")
+            edge = "last_null" if keep == "last" else "first_null"
+            aggregates = [_identifier(name) for name in group_keys]
+            aggregates += [f"{_identifier(name)} = {edge}({_identifier(name)})" for name in columns]
+            position = "max" if keep == "last" else "min"
+            aggregates += [f"{_identifier(ordinal)} = {position}({_identifier(row)})",
+                           f"{_identifier(count)} = count()"]
+            source += f"[update {{ {', '.join(updates)} }}]"
+            source += f"[select {{ {', '.join(aggregates)} }}, by {{ {', '.join(_identifier(name) for name in group_keys)} }}]"
+            if keep == "none":
+                source += f"[filter {_identifier(count)} == 1]"
+            # Stable order is permitted when maintain_order=False too. For
+            # keep=last, order by the selected row's original position.
+            source += f"[order {{ {_identifier(ordinal)} asc }}][select {{ {fields} }}]"
         elif operation == "sort":
             names, descending, nulls_last = expressions
             order = []
@@ -323,6 +370,16 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
         if operation == "aggregate":
             keys, expressions = expressions
             key_types = [dtype(Expr("col", (name,))) for name in keys]
+        elif operation == "unique":
+            subset, keep, maintain_order = expressions
+            for name in columns:
+                dtype(Expr("col", (name,)))
+            if subset is not None:
+                for name in subset:
+                    dtype(Expr("col", (name,)))
+            step_types.append(type_map)
+            schemas.append(dict(columns))
+            continue
         elif operation == "sort":
             for name in expressions[0]:
                 dtype(Expr("col", (name,)))

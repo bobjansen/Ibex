@@ -52,12 +52,21 @@ and adds no sorting operation. Its declared sortedness is not yet forwarded to
 native planning metadata; Ibex uses its existing ordering proofs or general
 algorithms. Other `MapFunction` variants remain unsupported.
 
+`unique(subset=None, keep="any", maintain_order=False)` is supported with
+column-name subset keys and `keep="any"`, `"first"`, `"last"`, or `"none"`.
+It retains all input columns and selects whole rows, including null payloads.
+Null keys compare equal; repeated NaNs form one duplicate group, and signed
+zeros compare equal. `keep="any"` chooses the first representative; output is
+stable even when ordering is not requested. Subset/last/none and floating-key
+cases currently use materialized native grouping. Empty subsets and slices
+folded into distinct remain unsupported, as do separate slice plan nodes.
+
 ## Scope and preparation
 
 Supported operations include resident DataFrame scans, single local Parquet
 files, filters, projections, simultaneous row-local column updates, numeric
 sums/means, first/last reductions, non-null column counts, row counts,
-frame-sized scalar repeats, column-key grouping and sorting. Supported resident
+frame-sized scalar repeats, distinct rows, column-key grouping and sorting. Supported resident
 types are Int8, Int16, Int32, Int64, UInt8, UInt16, Float32, Float64, Boolean,
 String, Date and Categorical. Resident Datetime and Duration columns are also
 supported as described below. Numeric

@@ -338,6 +338,17 @@ auto render_results() -> bool& {
     return render;
 }
 
+auto plan_table_expressions() -> bool& {
+    static thread_local bool enabled = false;
+    return enabled;
+}
+
+[[nodiscard]] auto optimize_and_execute_plan(
+    ir::NodePtr plan, const runtime::TableRegistry& base_tables,
+    const std::set<std::string>& lazy_callees, const runtime::ExternRegistry& externs,
+    const runtime::ScalarRegistry& scalars, bool root_order_insensitive = false,
+    const LazyTableRegistry& bound_lazy_sources = {}) -> std::expected<runtime::Table, std::string>;
+
 struct BoundCallArg {
     const parser::Param* param = nullptr;
     parser::Expr* expr = nullptr;
@@ -3622,6 +3633,18 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         lowered.value() = ir::optimize_plan(std::move(lowered.value()), optimization_context);
     }
 
+    if (plan_table_expressions() && model_out == nullptr) {
+        std::set<std::string> lazy_callees;
+        for (const auto& [name, _] : extern_decls) {
+            if (const auto* function = externs.find(name);
+                function != nullptr && function->lazy_table_func) {
+                lazy_callees.insert(name);
+            }
+        }
+        return optimize_and_execute_plan(std::move(*lowered), tables, lazy_callees, externs,
+                                         scalars, false, lazy_tables);
+    }
+
     // Projection pushdown. Ask the plan which columns it actually reads from
     // each source, and materialize only those from any lazy binding it scans.
     // `interpret` then runs against a registry in which every scanned source is
@@ -5584,19 +5607,22 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
 /// each over a distinct (already name-decomposed) plan. `base_tables` holds the
 /// builtins plus every shared binding materialized so far; `lazy_callees` names
 /// the extern readers to hoist into Scan nodes.
-[[nodiscard]] auto optimize_and_execute_plan(ir::NodePtr plan,
-                                             const runtime::TableRegistry& base_tables,
-                                             const std::set<std::string>& lazy_callees,
-                                             runtime::ExternRegistry& externs,
-                                             const runtime::ScalarRegistry& scalars,
-                                             bool root_order_insensitive = false)
-    -> std::expected<runtime::Table, std::string> {
+[[nodiscard]] auto optimize_and_execute_plan(
+    ir::NodePtr plan, const runtime::TableRegistry& base_tables,
+    const std::set<std::string>& lazy_callees, const runtime::ExternRegistry& externs,
+    const runtime::ScalarRegistry& scalars, bool root_order_insensitive,
+    const LazyTableRegistry& bound_lazy_sources) -> std::expected<runtime::Table, std::string> {
     auto [rewritten, sources] = ir::hoist_extern_sources(std::move(plan), lazy_callees);
     runtime::TableRegistry tables = base_tables;
-    LazyTableRegistry lazy_sources;
+    LazyTableRegistry lazy_sources = bound_lazy_sources;
     ir::SourceStats source_stats;
     ir::SourceSchemas& schemas = source_stats.schemas;
     ir::SourceRowCounts& row_counts = source_stats.rows;
+    for (const auto& [name, lazy] : lazy_sources) {
+        schemas.insert_or_assign(name, table_schema_info(lazy->schema()));
+        row_counts.insert_or_assign(name, lazy->rows());
+        source_stats.distinct.insert_or_assign(name, derive_column_distinct(*lazy));
+    }
     // Materialized shared bindings participate in schema-aware rewrites
     // (and cardinality estimates) with their exact schemas and sizes. A
     // materialized table carries no footer stats, so no distinct estimates.
@@ -5898,6 +5924,7 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
                       .demand_all = needed->second.all,
                       .key_column = std::move(info.key_column),
                       .filter = std::make_shared<runtime::DynamicScanFilter>(),
+                      .scalars = &scalars,
                   });
     }
     // Streaming scan registration: hand a multi-unit source to the plan
@@ -5950,6 +5977,7 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
                           .filter = nullptr,
                           .stream_filter =
                               slot ? std::make_shared<runtime::DynamicScanFilter>() : nullptr,
+                          .scalars = &scalars,
                       });
         }
     }
@@ -7356,15 +7384,23 @@ class CallBindings {
 /// Sets the thread's render flag for one execution.
 class RenderScope {
    public:
-    explicit RenderScope(bool render) : previous_(render_results()) { render_results() = render; }
+    explicit RenderScope(bool render, bool plan_tables)
+        : previous_(render_results()), previous_plan_(plan_table_expressions()) {
+        render_results() = render;
+        plan_table_expressions() = plan_tables;
+    }
     RenderScope(const RenderScope&) = delete;
     auto operator=(const RenderScope&) -> RenderScope& = delete;
     RenderScope(RenderScope&&) = delete;
     auto operator=(RenderScope&&) -> RenderScope& = delete;
-    ~RenderScope() { render_results() = previous_; }
+    ~RenderScope() {
+        render_results() = previous_;
+        plan_table_expressions() = previous_plan_;
+    }
 
    private:
     bool previous_;
+    bool previous_plan_;
 };
 
 }  // namespace
@@ -7386,7 +7422,7 @@ auto ReplSession::execute(std::string_view source, ExecuteOptions options) -> Ex
     const CallBindings call_bindings(impl_->tables, impl_->lazy_tables, impl_->scalars,
                                      impl_->columns, std::move(options.tables),
                                      std::move(options.scalars));
-    const RenderScope render(options.render);
+    const RenderScope render(options.render, options.plan_table_expressions);
     StdoutCapture capture;
     active_execution_result() = &result;
     const bool ok = execute_statements(

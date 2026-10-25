@@ -55,6 +55,13 @@ Each collection reads its source again; results are not cached. Parquet input
 decoding uses Ibex's lazy reader, not a Polars/PyArrow data read. The native
 endpoint currently holds the GIL during evaluation.
 
+Python table expressions use the script executor's source planning, including
+streaming Parquet units and deferred join probes. Typed scalar bindings remain
+available inside scan predicates. Prefix statements still execute in order;
+this does not merge statements across a materialized binding. Embedders can
+opt in through `ReplSession::ExecuteOptions::plan_table_expressions`; ordinary
+session execution keeps its existing behavior.
+
 For in-memory frames, `.lazy()` prepares and retains a native input once.
 Int64/Float64 Arrow payloads retain shared ownership; the current importer
 copies other layouts. Repeated strings are dictionary encoded using Ibex's

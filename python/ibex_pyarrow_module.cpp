@@ -1464,6 +1464,7 @@ PyObject* py_execute_pipeline(PyObject* /*self*/, PyObject* args, PyObject* kwar
         options.tables = std::move(*tables);
         options.scalars = std::move(*scalars);
         options.render = false;
+        options.plan_table_expressions = true;
         auto result = session.execute(source, std::move(options));
         if (!result.ok) {
             return set_python_error_from_message(PyExc_RuntimeError, result.error);

@@ -713,6 +713,9 @@ struct DeferredScan {
     /// -Wmissing-designated-field-initializers.
     // NOLINTNEXTLINE(readability-redundant-member-init)
     std::shared_ptr<DynamicScanFilter> stream_filter{};
+    /// Call-scoped lexical bindings used by static scan predicates. The
+    /// registry must outlive execution of this scan, including worker tasks.
+    const ScalarRegistry* scalars = nullptr;
 };
 
 /// A range of source rows a reader can decode without touching the rest.

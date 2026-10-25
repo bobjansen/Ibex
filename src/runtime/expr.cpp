@@ -838,8 +838,8 @@ auto validate_builtin(std::string_view name, const BuiltinFn& fn) -> void {
         builtin_invariant(name, "GeneratorExec is missing its column evaluator");
     }
     if (const auto* aggregate = std::get_if<AggregateExec>(&fn.exec);
-        aggregate != nullptr &&
-        static_cast<std::uint8_t>(aggregate->func) > static_cast<std::uint8_t>(ir::AggFunc::LastNull)) {
+        aggregate != nullptr && static_cast<std::uint8_t>(aggregate->func) >
+                                    static_cast<std::uint8_t>(ir::AggFunc::LastNull)) {
         builtin_invariant(name, "AggregateExec has an invalid aggregate function id");
     }
 }

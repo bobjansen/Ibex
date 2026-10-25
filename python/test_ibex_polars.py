@@ -116,6 +116,20 @@ class EngineTests(unittest.TestCase):
         self.equal(cached.filter(pl.col("key") > 1))
         self.equal(frame.head(0).select(pl.col("day").dt.year()))
 
+    def test_float_group_keys_canonicalize_nans_and_keep_original_representatives(self):
+        import struct
+        nan_a = struct.unpack("d", struct.pack("Q", 0x7ff8000000000001))[0]
+        nan_b = struct.unpack("d", struct.pack("Q", 0x7ff8000000000002))[0]
+        for dtype in (pl.Float32, pl.Float64):
+            frame = pl.DataFrame({"x": pl.Series([nan_a, nan_b, None, None, -0., 0., 1., 1.], dtype=dtype),
+                                  "y": [0., 0., 1., 1., None, None, float("inf"), float("inf")],
+                                  "v": [1, 2, 3, 4, 5, 6, 7, 8],
+                                  "_ibex_group_0_nan_0": range(8)})
+            for source in (frame.lazy(), frame.head(0).lazy()):
+                for keys in (["x"], ["x", "y"]):
+                    query = source.group_by(keys, maintain_order=True).agg(pl.sum("v"), pl.len())
+                    self.equal(query)
+
     def test_empty_and_all_null_reductions(self):
         for values in ([], [None, None]):
             frame = pl.DataFrame({"g": pl.Series([], dtype=pl.String) if not values else ["a", "a"],
@@ -269,8 +283,7 @@ class EngineTests(unittest.TestCase):
         _, tables, *_ = self.engine._prepare(frame, pl.QueryOptFlags())
         native = ibex_pyarrow.execute_pipeline("input;", tables={"input": tables["_ibex_input"]})
         self.assertEqual(native.schema.field("x").type, pa.float64())
-        with self.assertRaisesRegex(NotImplementedError, "floating-point grouping keys"):
-            frame.group_by("x").agg(pl.len()).collect(engine=self.engine)
+        self.equal(frame.group_by("x", maintain_order=True).agg(pl.len()))
 
     def test_float32_rounds_only_at_export(self):
         frame = pl.DataFrame({"x": pl.Series([float(2**24), None], dtype=pl.Float32)}).lazy()
@@ -493,9 +506,9 @@ class EngineTests(unittest.TestCase):
     def test_version_and_unsupported_plans_fail_without_native_execution(self):
         base = pl.DataFrame({"x": [1.0, 2.0]}).lazy()
         with patch.object(ibex_pyarrow, "bind_table") as bind, patch.object(ibex_pyarrow, "execute_pipeline") as execute:
-            for query in (base.select(pl.col("x").median()), base.join(base, on="x"),
+            for query in (base.select(pl.col("x").median()), base.join(base, on="x", validate="1:1"),
                           base.with_columns(pl.col("x").mean().alias("average")),
-                          base.group_by("x").agg(pl.len()).head(1)):
+                          base.group_by(pl.col("x") + 1).agg(pl.len()).head(1)):
                 with self.assertRaises(NotImplementedError):
                     query.collect(engine=self.engine)
             with patch.object(pl, "__version__", "9.0.0"):

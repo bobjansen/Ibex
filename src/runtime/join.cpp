@@ -23,7 +23,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -920,7 +919,6 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     struct MutableJoinIndices {
         std::vector<std::size_t>* left;
         std::vector<std::size_t>* right;
-        std::vector<std::size_t>* key_right;
     };
 
     /// Rewrite the emitted pairs so each left row keeps one match. Rows with no
@@ -931,7 +929,6 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     auto apply_take = [&](MutableJoinIndices indices) {
         auto& left_idx = *indices.left;
         auto& right_idx = *indices.right;
-        auto& key_right_idx = *indices.key_right;
         const std::size_t total = left_idx.size();
         std::vector<std::size_t> chosen(n_left, kNull);
         bool any_choice = false;
@@ -959,7 +956,6 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
         std::vector<std::size_t> out_left;
         std::vector<std::size_t> out_right;
-        std::vector<std::size_t> out_key;
         out_left.reserve(total);
         out_right.reserve(total);
         for (std::size_t i = 0; i < total; ++i) {
@@ -973,9 +969,6 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             }
             out_left.push_back(l);
             out_right.push_back(r);
-            if (!key_right_idx.empty()) {
-                out_key.push_back(key_right_idx[i]);
-            }
             if (preserve_right_rows && r != kNull) {
                 right_kept[r] = 1U;
             }
@@ -989,15 +982,12 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 if (right_kept[r] != 0U) {
                     continue;
                 }
-                out_key.resize(out_left.size(), kNull);
                 out_left.push_back(kNull);
                 out_right.push_back(r);
-                out_key.push_back(r);
             }
         }
         left_idx = std::move(out_left);
         right_idx = std::move(out_right);
-        key_right_idx = std::move(out_key);
     };
 
     auto join_failure = [&](Table& out) -> std::expected<Table, std::string> {
@@ -1085,11 +1075,10 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     // ── Materialize output columns from index arrays ─────────────────────
     // left_idx[i]  = left  row for output row i, or kNull for default.
     // right_idx[i] = right row for output row i, or kNull for default.
-    // key_right_idx: for outer/right join unmatched right rows, the right row
-    //   to fill key columns from; kNull elsewhere. Empty if not needed.
+    // Folded keys use right_idx wherever left_idx is null; a third index
+    // array would only duplicate that same right row at those positions.
     auto materialize = [&](const std::vector<std::size_t>& in_left_idx,
-                           const std::vector<std::size_t>& in_right_idx,
-                           const std::vector<std::size_t>& in_key_right_idx) {
+                           const std::vector<std::size_t>& in_right_idx) {
         // `expect` describes how the inputs actually match, so it is checked
         // against the pairs BEFORE `take` drops any of them -- otherwise
         // `take first` would satisfy every `expect n:1` by construction and the
@@ -1098,23 +1087,17 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
         std::vector<std::size_t> taken_left;
         std::vector<std::size_t> taken_right;
-        std::vector<std::size_t> taken_key;
         const std::vector<std::size_t>* left_idx_p = &in_left_idx;
         const std::vector<std::size_t>* right_idx_p = &in_right_idx;
-        const std::vector<std::size_t>* key_right_idx_p = &in_key_right_idx;
         if (take != ir::MatchSelection::All && take_error.empty()) {
             taken_left = in_left_idx;
             taken_right = in_right_idx;
-            taken_key = in_key_right_idx;
-            apply_take(MutableJoinIndices{
-                .left = &taken_left, .right = &taken_right, .key_right = &taken_key});
+            apply_take(MutableJoinIndices{.left = &taken_left, .right = &taken_right});
             left_idx_p = &taken_left;
             right_idx_p = &taken_right;
-            key_right_idx_p = &taken_key;
         }
         const std::vector<std::size_t>& left_idx = *left_idx_p;
         const std::vector<std::size_t>& right_idx = *right_idx_p;
-        const std::vector<std::size_t>& key_right_idx = *key_right_idx_p;
 
         const std::size_t total = left_idx.size();
 
@@ -1136,18 +1119,6 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             }
             run_gather_jobs(jobs, total);
         } else {
-            // Build a "safe" index: null positions get row 0 (overwritten below).
-            std::vector<std::size_t> safe_idx(total);
-            std::vector<std::size_t> null_pos;
-            for (std::size_t i = 0; i < total; ++i) {
-                if (left_idx[i] != kNull) {
-                    safe_idx[i] = left_idx[i];
-                } else {
-                    safe_idx[i] = 0;
-                    null_pos.push_back(i);
-                }
-            }
-
             // The plan's left columns are its first `left.columns.size()`
             // entries, in input order, so `plan[c]` describes `left.columns[c]`.
             std::vector<GatherJob> plain_jobs;
@@ -1158,7 +1129,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 // recorded which right column that is; recovering it from the
                 // key list here would restate folding rules it owns.
                 const auto peer = plan[c].folded_peer_index;
-                if (peer.has_value() && !key_right_idx.empty()) {
+                if (peer.has_value()) {
                     const ColumnEntry& right_key = right.columns[*peer];
                     // Build per-row: pick from left or right depending on null.
                     // Key columns in outer joins are rare & small, so per-row is fine.
@@ -1180,7 +1151,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                     for (std::size_t i = 0; i < total; ++i) {
                         const bool from_left = left_idx[i] != kNull;
                         const ColumnEntry& source = from_left ? left.columns[c] : right_key;
-                        const std::size_t row = from_left ? left_idx[i] : key_right_idx[i];
+                        const std::size_t row = from_left ? left_idx[i] : right_idx[i];
                         append_value(out_col, *source.column, row);
                         if (source.validity.has_value() && !(*source.validity)[row]) {
                             carry_null(i);
@@ -1239,8 +1210,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 ++pos;
             }
         }
-        static const std::vector<std::size_t> empty_key_idx;
-        materialize(li, ri, empty_key_idx);
+        materialize(li, ri);
         return join_failure(output);
     }
 
@@ -1270,7 +1240,6 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
         std::vector<std::size_t> left_idx;
         std::vector<std::size_t> right_idx;
-        std::vector<std::size_t> key_right_idx;
         std::vector<std::uint8_t> right_matched_pred;
         if (preserve_right_rows) {
             right_matched_pred.assign(n_right, 0U);
@@ -1342,13 +1311,11 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 if (right_matched_pred[r] == 0U) {
                     left_idx.push_back(kNull);
                     right_idx.push_back(r);
-                    key_right_idx.resize(left_idx.size(), kNull);
-                    key_right_idx.back() = r;
                 }
             }
         }
 
-        materialize(left_idx, right_idx, key_right_idx);
+        materialize(left_idx, right_idx);
         return join_failure(output);
     }
 
@@ -1450,8 +1417,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     // sequence). Preserving scan order costs nothing extra: this phase
     // already visits right rows in order once.
     auto build_indices_from_right_scan = [&](auto&& left_matches_for_right_row)
-        -> std::tuple<std::vector<std::size_t>, std::vector<std::size_t>,
-                      std::vector<std::size_t>> {
+        -> std::pair<std::vector<std::size_t>, std::vector<std::size_t>> {
         if (semi_join || anti_join) {
             // Membership join: left-only output. No right columns are
             // emitted, so there's no probe-side order to preserve here —
@@ -1471,7 +1437,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 }
             }
             std::vector<std::size_t> ri(li.size(), kNull);
-            return std::make_tuple(std::move(li), std::move(ri), std::vector<std::size_t>{});
+            return std::make_pair(std::move(li), std::move(ri));
         }
 
         // Preserving join: probe once per right row, in scan order, and
@@ -1530,30 +1496,25 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             }
         }
 
-        std::vector<std::size_t> kri;
         if (preserve_right_rows) {
             for (std::size_t r = 0; r < n_right; ++r) {
                 if (right_matched_flags[r] == 0U) {
                     li.push_back(kNull);
                     ri.push_back(r);
-                    kri.resize(li.size(), kNull);
-                    kri.back() = r;
                 }
             }
         }
 
-        return std::make_tuple(std::move(li), std::move(ri), std::move(kri));
+        return std::make_pair(std::move(li), std::move(ri));
     };
 
     // ── Helper: build index arrays from a left-row → right-matches lookup ─
     // Used by the large-left/small-right paths. An empty span means "no
     // match".
     auto build_indices_from_left_scan = [&](auto&& right_matches_for_left_row)
-        -> std::tuple<std::vector<std::size_t>, std::vector<std::size_t>,
-                      std::vector<std::size_t>> {
+        -> std::pair<std::vector<std::size_t>, std::vector<std::size_t>> {
         std::vector<std::size_t> li;
         std::vector<std::size_t> ri;
-        std::vector<std::size_t> kri;
         li.reserve(n_left);
         ri.reserve(n_left);
 
@@ -1609,13 +1570,11 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 if (right_matched_flags[r] == 0U) {
                     li.push_back(kNull);
                     ri.push_back(r);
-                    kri.resize(li.size(), kNull);
-                    kri.back() = r;
                 }
             }
         }
 
-        return std::make_tuple(std::move(li), std::move(ri), std::move(kri));
+        return std::make_pair(std::move(li), std::move(ri));
     };
 
     // ── Single string/categorical key fast path ──────────────────────────
@@ -1655,8 +1614,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 return it == key_gid.end() ? std::span<const std::size_t>{}
                                            : grouped.matches(it->second);
             };
-            auto [li, ri, kri] = build_indices_from_right_scan(lookup);
-            materialize(li, ri, kri);
+            auto [li, ri] = build_indices_from_right_scan(lookup);
+            materialize(li, ri);
             return join_failure(output);
         }
 
@@ -1683,8 +1642,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 const std::uint32_t gid = code_gid[static_cast<std::size_t>(codes[l])];
                 return gid == kNoGroup ? std::span<const std::size_t>{} : grouped.matches(gid);
             };
-            auto [li, ri, kri] = build_indices_from_left_scan(lookup);
-            materialize(li, ri, kri);
+            auto [li, ri] = build_indices_from_left_scan(lookup);
+            materialize(li, ri);
         } else {
             const auto& ls = std::get<Column<std::string>>(*left_keys[0]);
             if (preserve_left_only && grouped.unique()) {
@@ -1699,8 +1658,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 return it == key_gid.end() ? std::span<const std::size_t>{}
                                            : grouped.matches(it->second);
             };
-            auto [li, ri, kri] = build_indices_from_left_scan(lookup);
-            materialize(li, ri, kri);
+            auto [li, ri] = build_indices_from_left_scan(lookup);
+            materialize(li, ri);
         }
         return join_failure(output);
     }
@@ -1733,8 +1692,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 return it == key_gid.end() ? std::span<const std::size_t>{}
                                            : grouped.matches(it->second);
             };
-            auto [li, ri, kri] = build_indices_from_right_scan(lookup);
-            materialize(li, ri, kri);
+            auto [li, ri] = build_indices_from_right_scan(lookup);
+            materialize(li, ri);
             return join_failure(output);
         }
 
@@ -1752,8 +1711,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             return it == key_gid.end() ? std::span<const std::size_t>{}
                                        : grouped.matches(it->second);
         };
-        auto [li, ri, kri] = build_indices_from_left_scan(lookup);
-        materialize(li, ri, kri);
+        auto [li, ri] = build_indices_from_left_scan(lookup);
+        materialize(li, ri);
         return join_failure(output);
     }
 
@@ -2237,8 +2196,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     };
 
     if (build_left) {
-        auto [li, ri, kri] = build_indices_from_right_scan(lookup);
-        materialize(li, ri, kri);
+        auto [li, ri] = build_indices_from_right_scan(lookup);
+        materialize(li, ri);
         return join_failure(output);
     }
 
@@ -2254,8 +2213,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         return join_failure(output);
     }
 
-    auto [li, ri, kri] = build_indices_from_left_scan(lookup);
-    materialize(li, ri, kri);
+    auto [li, ri] = build_indices_from_left_scan(lookup);
+    materialize(li, ri);
     return join_failure(output);
 }
 

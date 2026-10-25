@@ -89,3 +89,40 @@ PYTHONPATH=build-release/python:python IBEX_CORES=1 POLARS_MAX_THREADS=1 \
 env -u IBEX_CORES -u POLARS_MAX_THREADS PYTHONPATH=build-release/python:python \
   .venv/bin/python python/bench_categorical_export.py --out /tmp/categorical-default.json
 ```
+
+## Composite key schema follow-up
+
+Implemented in `f63dada5`.
+
+The bound input schemas already reached native physical planning, but the
+composite join eligibility gates inferred key types without those schemas.
+Consequently, unannotated bound Int64 inputs used the general materialized join
+instead of the specialized two-integer-key streaming operator. Physical planning
+now passes its source schemas through the shared inner/semi/anti eligibility
+checks. Unknown and non-Int64 key types still decline the specialized path.
+This fixes native bound-table callers as well as the Python adapter.
+
+A focused Release A/B uses the bridge saved from `c8de38e1` and the corrected
+bridge, with the same seeded resident tables: 1,000,000 left rows, 200,000 unique
+right keys, and composite key `(tenant, k)` where `tenant = k % 17`. Both routes
+use prepared `IbexEngine` collection; complete rows and dtypes match Polars.
+Twenty paired repetitions alternate route order after two warmups. Preparation,
+correctness checks and previous-result destruction are outside timing. Both
+bridge binaries use the same Python converter. Polars uses ordinary collection.
+
+| Threads | Before ms | After ms | Polars ms |
+|---|---:|---:|---:|
+| One | 70.12 | 23.41 | 37.94 |
+| Default (24) | 19.30 | 7.26 | 7.10 |
+
+The improvement is about 3.0× single-threaded and 2.7× with default threading.
+These are focused diagnostics with their own seeded input generation, rather
+than replacements for the original suite table. Raw samples and bridge hashes:
+[one thread](join-performance-results/composite-schema-single.json),
+[default threads](join-performance-results/composite-schema-default.json).
+
+The native `compare_ibex_git.sh` join regression pass used 100,000-row generated
+inputs, six alternating repeats and one compute thread pinned to CPU 2. Its four
+queries (`inner_join_symbol`, `inner_join_user`, `join_filter_rank`,
+`join_update_group`) showed no detectable regression. Those single-key cases
+check collateral effects; the focused composite benchmark measures the fix.

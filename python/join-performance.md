@@ -150,3 +150,88 @@ inputs, six alternating repeats and one compute thread pinned to CPU 2. Its four
 queries (`inner_join_symbol`, `inner_join_user`, `join_filter_rank`,
 `join_update_group`) showed no detectable regression. Those single-key cases
 check collateral effects; the focused composite benchmark measures the fix.
+
+## Full join runtime follow-up
+
+Four native changes address probing and output assembly, benefiting both Ibex
+queries and the Polars adapter:
+
+- `ab001288`: workers grow private probe vectors and publish once, avoiding false
+  sharing of adjacent vector metadata.
+- `510553f1`: remove redundant outer-join key indices and unused assembly buffers.
+- `5a05cf58`: for null-free Int64 keys with a unique right build side, fill one
+  preallocated result slot per left row. This avoids CSR indirection, vector
+  growth and merging; unmatched right rows are appended after probing.
+- `e22960a9`: copy non-null fixed-width coalesced keys through typed ranges,
+  avoiding per-row variant dispatch. Other key representations retain the
+  general assembly path.
+
+The focused Release comparison uses the bridge saved from `6dbaeaba` against
+`e22960a9`, on an i7-13700 with cores locked at 3.2 GHz. These clock settings and
+inputs differ from the earlier broad suite; compare the paired numbers here.
+The main input has one million left rows drawn from 200,000 keys and 240,000
+unique right keys, including unmatched right rows. Seed: 20261025.
+
+Twenty paired repetitions alternate route order after two warmups, with each
+bridge in a persistent subprocess and only one route executing per sample.
+Preparation, correctness checking and previous-result destruction are outside
+timing. Collection includes execution and output conversion. Complete output
+rows, values and dtypes match Polars; output order is unspecified.
+
+| Route | Threads | Before ms | After ms | Polars ms |
+|---|---|---:|---:|---:|
+| Polars–Ibex | Default (24) | 19.06 | 11.63 | 8.27 |
+| Polars–Ibex | One | 44.42 | 30.14 | 29.79 |
+| Direct native query | Default (24) | 22.22 | 10.85 | 8.10 |
+
+The direct query uses native same-name-key coalescing, while the adapter uses
+its generated aliases. Its measurements still include Arrow export and Polars
+conversion; they are not execution-only timings.
+
+A row-count/cardinality sweep uses eight workers pinned to CPUs 0,2,…,14.
+The right input contains 1.2 times the key cardinality (rounded down). The sparse
+case multiplies keys by 100003. The small/high-cardinality case builds the left
+side and therefore does not use the new unique-right probe path.
+
+| Left rows | Key cardinality | Before ms | After ms | Polars ms |
+|---:|---:|---:|---:|---:|
+| 100,000 | 1,024 | 2.67 | 1.34 | 0.77 |
+| 100,000 | 200,000 | 9.35 | 8.12 | 3.11 |
+| 1,000,000 | 1,024 | 21.42 | 7.56 | 3.41 |
+| 1,000,000 | 200,000 | 26.80 | 13.96 | 9.26 |
+| 1,000,000 | 200,000, sparse | 27.21 | 14.30 | 9.61 |
+
+Validation: Release CTest reported zero failures across 2,359 registered tests
+with slow tests excluded; the join suite passed 190 cases, and the Python join
+suite passed 10 tests with 129 subtests. Strict GCC compilation passed. The CSV
+plugin was rebuilt using the plugin build script and loaded successfully.
+An independent regression compares the specialized probe with the general
+nullable-key path, including duplicate left keys, unmatched rows and nullable
+payloads. Deliberately corrupting either match indices or coalesced keys makes
+that regression fail.
+
+The native `compare_ibex_git.sh` collateral check compared `6dbaeaba` with the
+final source using 100,000-row generated inputs, six interleaved repeats, three
+iterations, and one worker pinned to CPU 2. All four existing join queries were
+classified as noise (suite geometric mean 0.997×). These check collateral effects;
+the focused measurements above exercise full joins.
+
+Runner: [bench_full_join.py](bench_full_join.py). Save the baseline Release
+`ibex_pyarrow` module in a separate directory before rebuilding the candidate:
+
+```bash
+.venv/bin/python python/bench_full_join.py \
+  --baseline-dir saved-release-bridge --threads 0 --out results/full.json
+```
+
+Raw samples, bridge hashes and configuration:
+[default](join-performance-results/full-final-default.json),
+[single thread](join-performance-results/full-final-single.json),
+[direct native](join-performance-results/full-native-final-default.json),
+[small/few](join-performance-results/full-sweep-small-few.json),
+[small/many](join-performance-results/full-sweep-small-many.json),
+[large/few](join-performance-results/full-sweep-large-few.json),
+[large/many](join-performance-results/full-sweep-large-many.json),
+[sparse](join-performance-results/full-sweep-large-sparse.json).
+The recorded `git_head` is the measurement-time commit; `target_native_ref`
+identifies the subsequently committed source, verified against the bridge hashes.

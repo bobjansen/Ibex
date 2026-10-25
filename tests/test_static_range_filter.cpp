@@ -217,3 +217,37 @@ TEST_CASE("static range: double literals that cannot stay exact are conjuncts",
     // A double literal is never compared with a Date column by the interval.
     CHECK_FALSE(split({compare(ir::CompareOp::Gt, col("d"), real(5.5))}).has_value());
 }
+
+TEST_CASE("static range: bound constants resolve per execution with column scope precedence",
+          "[runtime][static_range][bound_filter]") {
+    const auto ref = [](const std::string& name, bool lexical = true) {
+        return ir::Expr{ir::ColumnRef{.name = name, .lexical = lexical}};
+    };
+    const std::vector<ir::Expr> predicate{compare(ir::CompareOp::Ge, col("d"), ref("start")),
+                                          compare(ir::CompareOp::Lt, col("d"), ref("end"))};
+    runtime::ScalarRegistry scalars;
+    scalars.emplace("start", Date{5});
+    scalars.emplace("end", Date{10});
+    auto range = runtime::split_static_range(predicate, schema(), &scalars);
+    REQUIRE(range);
+    CHECK(range->filter.min == 5);
+    CHECK(range->filter.max == 9);
+    scalars.at("start") = Date{7};
+    range = runtime::split_static_range(predicate, schema(), &scalars);
+    REQUIRE(range);
+    CHECK(range->filter.min == 7);
+    // The caller's reusable predicate still contains a binding, not a literal.
+    const auto& cmp = std::get<ir::CompareExpr>(predicate[0].node);
+    CHECK(std::holds_alternative<ir::ColumnRef>(cmp.right->node));
+
+    scalars.emplace("i", std::int64_t{8});
+    CHECK_FALSE(runtime::split_static_range({compare(ir::CompareOp::Gt, col("d"), ref("i", false))},
+                                            schema(), &scalars));
+    range = runtime::split_static_range({compare(ir::CompareOp::Gt, col("d"), ref("i"))}, schema(),
+                                        &scalars);
+    REQUIRE(range);
+    CHECK(range->filter.min == 9);
+    scalars.at("i") = NullScalar{ScalarKind::Int};
+    CHECK_FALSE(runtime::split_static_range({compare(ir::CompareOp::Gt, col("d"), ref("i"))},
+                                            schema(), &scalars));
+}

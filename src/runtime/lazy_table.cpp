@@ -1593,7 +1593,7 @@ auto LazyTable::static_range_selection(const std::vector<ir::Expr>& conjuncts,
                                        const SourceUnit* unit, const ExecutionContext& exec,
                                        const ScalarRegistry* scalars)
     -> std::expected<std::optional<Selection>, std::string> {
-    auto range = split_static_range(conjuncts, schema_);
+    auto range = split_static_range(conjuncts, schema_, scalars);
     if (!range.has_value() || cache_.contains(range->column)) {
         return std::optional<Selection>{};  // a cached key is cheaper tested in memory
     }

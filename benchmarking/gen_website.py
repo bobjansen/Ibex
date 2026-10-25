@@ -37,6 +37,7 @@ import tarfile
 from collections import defaultdict
 from pathlib import Path
 
+from website_history import publish
 from print_table import FRAMEWORK_ORDER, QUERY_LABEL, QUERY_ORDER
 from extract_bench_code import extract_all, SOURCES
 from h2o.publication import archive_inputs as h2o_archive_inputs, read as read_h2o_checked
@@ -1256,7 +1257,6 @@ def main(argv=None):
                 .replace("__LEAD_SUITES__", html.escape(lead, quote=False))
                 .replace("__MAXM__", max_rows_m))
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(out_html, encoding="utf-8")
     print(f"wrote {args.out}  ({len(payload['queries'])} queries, "
           f"{len(payload['frameworks'])} engines, scales {payload['scales']})"
           + (f"; PDS-H cores {sorted(pdsh['tables'], key=int)}" if pdsh else "")
@@ -1269,7 +1269,7 @@ def main(argv=None):
                  .replace("__CODE_PAYLOAD__",
                           json.dumps(code_payload, separators=(",", ":"))))
     code_out = args.out.parent / "methodology.html"
-    code_out.write_text(code_html, encoding="utf-8")
+    publish(args.out, out_html, code_html)
     print(f"wrote {code_out}  ({len(code_payload['queries'])} queries x "
           f"{len(code_payload['engines'])} engines)")
     return 0

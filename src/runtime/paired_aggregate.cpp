@@ -24,7 +24,7 @@ auto lane_sum(const std::array<double, kPairLanes>& a) -> double {
 template <bool Nullable, typename X, typename Y>
 auto pair_block(const X* xs, const Y* ys, const ValidityBitmap* xv, const ValidityBitmap* yv,
                 std::size_t begin, std::size_t end, double origin_x, double origin_y) -> CoMoment {
-    const auto valid = [&](std::size_t row) {
+    const auto valid = [&]([[maybe_unused]] std::size_t row) {
         if constexpr (Nullable) {
             return (xv == nullptr || (*xv)[row]) && (yv == nullptr || (*yv)[row]);
         }

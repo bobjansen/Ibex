@@ -69,16 +69,33 @@ Mixed per-column row selections and nondefault scan-limit policies remain
 unsupported. Polars' own LazyFrame indexing restrictions still apply before
 translation; the independent API additionally supports full Python slicing.
 
+Equality joins support `inner`, `left`, `right`, `full`, `semi`, and `anti`;
+`cross` joins are supported too. Keys must be scalar column names (including
+composite keys). Null matching, suffixes, key coalescing and requested ordering
+are adapted to Polars semantics; NaNs match NaNs and signed zeros compare equal.
+Explicit ordering uses native row positions and a final sort. Semi/anti support
+`none`, `left`, and `left_right` ordering. Both inputs and all later operations
+execute within one native pipeline call, with separate prepared input bindings.
+
+As-of/non-equi joins, computed keys, and nondefault cardinality validation are
+unsupported. The pinned visitor omits the validation option, so preparation
+serializes the original plan metadata once to reject unsupported assertions.
+This includes resident input serialization and can be a substantial one-time
+cost; prepared collections cache the plan/bindings. Join benchmarks report
+preparation separately from hot execution/export timings. Polars scheduling
+hints are not forwarded to native scheduling.
+
 ## Scope and preparation
 
 Supported operations include resident DataFrame scans, single local Parquet
 files, filters, projections, simultaneous row-local column updates, numeric
 sums/means, first/last reductions, non-null column counts, row counts,
-frame-sized scalar repeats, distinct rows, row slices, column-key grouping and sorting. Supported resident
+frame-sized scalar repeats, distinct rows, row slices, equality/cross joins,
+column-key grouping and sorting. Supported resident
 types are Int8, Int16, Int32, Int64, UInt8, UInt16, Float32, Float64, Boolean,
 String, Date and Categorical. Resident Datetime and Duration columns are also
 supported as described below. Numeric
-coercion to Float64 and null predicates are supported. Joins, windows, UDFs,
+coercion to Float64 and null predicates are supported. Windows, UDFs,
 computed grouping/sort keys, floating-point grouping keys, aggregate broadcasting other than row counts, expression top-k
 operations, remote/multiple files, Enum, other numeric widths and nondefault scan
 policies are outside this slice. An already-sliced resident source is valid.

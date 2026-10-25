@@ -122,6 +122,13 @@ if(IBEX_BUILD_TESTS AND IBEX_PYARROW_IMPORT_RESULT EQUAL 0)
                 "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/python/test_ibex_first_last.py"
         )
         add_test(
+            NAME ibex_polars_joins
+            COMMAND "${CMAKE_COMMAND}" -E env
+                "PYTHONPATH=${PROJECT_BINARY_DIR}/python:${PROJECT_SOURCE_DIR}/python"
+                "IBEX_TEST_PARQUET=${IBEX_PYTHON_HAS_PARQUET}"
+                "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/python/test_ibex_joins.py"
+        )
+        add_test(
             NAME ibex_polars_slices
             COMMAND "${CMAKE_COMMAND}" -E env
                 "PYTHONPATH=${PROJECT_BINARY_DIR}/python:${PROJECT_SOURCE_DIR}/python"

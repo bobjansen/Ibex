@@ -5,6 +5,7 @@
 import pyarrow as pa
 
 from ._expr import Expr, _identifier
+from ._join import join_layout
 
 
 _WIDENED_NUMERIC_TYPES = {
@@ -13,11 +14,14 @@ _WIDENED_NUMERIC_TYPES = {
 }
 
 
-def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=False):
-    scalars = {}
-    tables = {}
+def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=False,
+          _state=None, _namespace="", _return_parts=False):
+    state = _state if _state is not None else {"scalars": {}, "tables": {}, "imports": set(), "next_join": 0}
+    scalars, tables = state["scalars"], state["tables"]
+    def internal(name):
+        return f"_ibex_{_namespace}{name}"
 
-    needs_schema = validate or any(operation in ("unique", "slice", "python_slice") for operation, _ in frame._steps)
+    needs_schema = validate or any(operation in ("unique", "slice", "python_slice", "join") for operation, _ in frame._steps)
     step_types, schemas = _validate_types(frame, widen_numeric_inputs=widen_numeric_inputs) if needs_schema else ([], [])
     if result_schema is not None:
         result_schema.update(schemas[-1])
@@ -110,20 +114,21 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
 
     kind, value = frame._source
     if kind == "parquet":
-        prefix = 'extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";\n'
+        prefix = '' if "parquet" in state["imports"] else 'extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";\n'
+        state["imports"].add("parquet")
         source = "parquet::read(" + bind(value) + ")"
     elif kind == "bound":
         prefix = ""
-        tables["_ibex_input"] = value.capsule
-        source = "_ibex_input"
+        tables[internal("input")] = value.capsule
+        source = internal("input")
     elif kind == "table":
         prefix = ""
         # Empty Tables yield no batches in the existing bridge. A typed empty
         # RecordBatch retains schema instead of falling back to list inference.
-        tables["_ibex_input"] = value if value.num_rows else pa.RecordBatch.from_arrays(
+        tables[internal("input")] = value if value.num_rows else pa.RecordBatch.from_arrays(
             [column.combine_chunks() for column in value.columns], schema=value.schema
         )
-        source = "_ibex_input"
+        source = internal("input")
     else:
         raise NotImplementedError(f"unsupported source: {kind}")
     for index, (operation, expressions) in enumerate(frame._steps):
@@ -131,6 +136,73 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
         if operation == "filter":
             predicate = " && ".join(f"({render(expr)})" for expr in expressions)
             source += "[filter " + predicate + "]"
+        elif operation == "join":
+            other, left_on, right_on, how, suffix, nulls_equal, coalesce, maintain_order, left_visible, right_visible = expressions
+            join_id = state["next_join"]
+            state["next_join"] += 1
+            (right_prefix, right_source), _, _ = lower(other, validate=validate, widen_numeric_inputs=widen_numeric_inputs,
+                _state=state, _namespace=f"join_{join_id}_", _return_parts=True)
+            prefix += right_prefix
+            right_columns = _validate_types(other, widen_numeric_inputs=widen_numeric_inputs)[1][-1]
+            # The current output schema is computed below, so recover the left
+            # schema from the preceding step (or the join's input frame).
+            before = frame.__class__(frame._source, frame._steps[:index])
+            left_columns = _validate_types(before, widen_numeric_inputs=widen_numeric_inputs)[1][-1]
+            occupied = set(left_columns) | set(right_columns)
+            def fresh(role):
+                name = f"_ibex_join_{join_id}_{role}"
+                while name in occupied:
+                    name += "_"
+                occupied.add(name)
+                return name
+            left_names = {name: fresh(f"l_{i}") for i, name in enumerate(left_columns)}
+            right_names = {name: fresh(f"r_{i}") for i, name in enumerate(right_columns)}
+            left_fields = [f"{_identifier(alias)} = {_identifier(name)}" for name, alias in left_names.items()]
+            right_fields = [f"{_identifier(alias)} = {_identifier(name)}" for name, alias in right_names.items()]
+            left_row, right_row = fresh("left_row"), fresh("right_row")
+            if maintain_order != "none":
+                left_fields.append(f"{_identifier(left_row)} = seq()")
+                if how not in ("semi", "anti"):
+                    right_fields.append(f"{_identifier(right_row)} = seq()")
+            left_source = source + f"[select {{ {', '.join(left_fields)} }}]"
+            right_source += f"[select {{ {', '.join(right_fields)} }}]"
+            mapped, left_updates, right_updates = [], [], []
+            for key_index, (left_key, right_key) in enumerate(zip(left_on, right_on)):
+                lkey, rkey = left_names[left_key], right_names[right_key]
+                if left_columns[left_key] == pa.float64():
+                    ln, rn = fresh(f"ln_{key_index}"), fresh(f"rn_{key_index}")
+                    lv, rv = fresh(f"lv_{key_index}"), fresh(f"rv_{key_index}")
+                    for updates, key, flag, value in ((left_updates, lkey, ln, lv), (right_updates, rkey, rn, rv)):
+                        updates += [f"{_identifier(flag)} = is_nan({_identifier(key)})",
+                                    f"{_identifier(value)} = case {{ is_nan({_identifier(key)}) => 0.0, else => {_identifier(key)} }}"]
+                    mapped += [(ln, rn), (lv, rv)]
+                else:
+                    mapped.append((lkey, rkey))
+            if left_updates:
+                left_source += f"[update {{ {', '.join(left_updates)} }}]"
+                right_source += f"[update {{ {', '.join(right_updates)} }}]"
+            native_kind = {"inner": "", "full": "outer ", "cross": "cross "}.get(how, how + " ")
+            source = f"(({left_source}) {native_kind}join ({right_source})"
+            if mapped:
+                source += " on { " + ", ".join(f"{_identifier(l)} = {_identifier(r)}" for l, r in mapped) + " }"
+                if nulls_equal:
+                    source += " nulls equal"
+            source += ")"
+            if maintain_order != "none":
+                order = [left_row] if how in ("semi", "anti") else (
+                    [right_row, left_row] if maintain_order in ("right", "right_left") else [left_row, right_row])
+                source += "[order { " + ", ".join(_identifier(name) + " asc" for name in order) + " }]"
+            visible_left = left_columns if left_visible is None else {name: left_columns[name] for name in left_visible}
+            visible_right = right_columns if right_visible is None else {name: right_columns[name] for name in right_visible}
+            fields = []
+            for output, side, name, paired in join_layout(visible_left, visible_right, left_on, right_on, how, coalesce, suffix):
+                value = _identifier(right_names[name]) if side == "right" else _identifier(left_names[name])
+                if side == "coalesce":
+                    value = f"coalesce({value}, {_identifier(right_names[paired])})"
+                fields.append(f"{_identifier(output)} = {value}")
+            if not fields:
+                fields.append("_ibex_join_height = 0")
+            source += f"[select {{ {', '.join(fields)} }}]"
         elif operation == "aggregate":
             keys, aggregates = expressions
             # Keep the complete aggregate in one native operator. The lowerer
@@ -154,7 +226,7 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
                 start, stop, step = expressions
                 needs_height = step < 0 or any(value is not None and value < 0 for value in (start, stop))
             if needs_height:
-                shared, height = f"_ibex_slice_input_{index}", f"_ibex_slice_height_{index}"
+                shared, height = internal(f"slice_input_{index}"), internal(f"slice_height_{index}")
                 prefix += f"let {shared} = {source};\n"
                 prefix += f"let {height} = scalar({shared}[select {{ _ibex_slice_count = count() }}]);\n"
                 source = shared
@@ -278,8 +350,8 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             if any(expr._args[0]._op == "broadcast_length" for expr in expressions):
                 # Share the input before extracting its height. The native
                 # scalar binding then broadcasts in the same pipeline call.
-                shared = f"_ibex_repeat_input_{index}"
-                broadcast_length = f"_ibex_repeat_length_{index}"
+                shared = internal(f"repeat_input_{index}")
+                broadcast_length = internal(f"repeat_length_{index}")
                 prefix += f"let {shared} = {source};\n"
                 prefix += f"let {broadcast_length} = scalar({shared}[select {{ _ibex_repeat_count = count() }}]);\n"
                 source = shared
@@ -331,7 +403,7 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
                 continue
             fields = ", ".join(f"{_identifier(expr._name)} = {render(expr)}" for expr in expressions)
             source += f"[{operation} {{ {fields} }}]"
-    return prefix + source + ";", tables, scalars
+    return ((prefix, source) if _return_parts else prefix + source + ";"), tables, scalars
 
 
 def _validate_types(frame, *, widen_numeric_inputs=False):
@@ -431,6 +503,30 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
     for operation, expressions in frame._steps:
         type_map = {}
         keys, key_types = (), []
+        if operation == "join":
+            other, left_on, right_on, how, suffix, nulls_equal, coalesce, maintain_order, left_visible, right_visible = expressions
+            right = _validate_types(other, widen_numeric_inputs=widen_numeric_inputs)[1][-1]
+            for name in columns:
+                dtype(Expr("col", (name,)))
+            for name in left_on:
+                dtype(Expr("col", (name,)))
+            if any(dtype_ not in supported for dtype_ in right.values()):
+                raise NotImplementedError("unsupported right join column type")
+            for name in right_on:
+                if name not in right:
+                    raise ValueError(f"right join key not found: {name}")
+            for left_key, right_key in zip(left_on, right_on):
+                if columns[left_key] != right[right_key]:
+                    raise NotImplementedError("join key types must have the same native representation")
+            visible_left = columns if left_visible is None else {name: columns[name] for name in left_visible}
+            visible_right = right if right_visible is None else {name: right[name] for name in right_visible}
+            layout = join_layout(visible_left, visible_right, left_on, right_on, how, coalesce, suffix)
+            columns = {output: (right[name] if side == "right" else columns[name]) for output, side, name, _ in layout}
+            if not columns:
+                columns = {"_ibex_join_height": pa.int64()}
+            step_types.append(type_map)
+            schemas.append(dict(columns))
+            continue
         if operation == "aggregate":
             keys, expressions = expressions
             key_types = [dtype(Expr("col", (name,))) for name in keys]

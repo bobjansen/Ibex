@@ -70,7 +70,7 @@ reported separately in the performance note below.
 |---|---|
 | Input | A single local Parquet file, or `DataFrame(dict_or_arrow_table).lazy()` |
 | Expressions | `col`, `lit`, aliases, numeric arithmetic, comparisons, Boolean `&`, `\|`, `~`, `is_between`, numeric `sum`/`mean`, `first`/`last`, non-null column `count`, row count `len` |
-| Pipelines | `filter`, `select`, one expression per `with_columns`, column-key `group_by(...).agg(...)`, column-key `sort`, `unique`, `slice`, `head`, `tail`, `gather_every`, Python row slicing, `collect`, source-only `explain` |
+| Pipelines | `filter`, `select`, one expression per `with_columns`, column-key `group_by(...).agg(...)`, column-key `sort`, `unique`, `slice`, `head`, `tail`, `gather_every`, Python row slicing, equality/cross `join`, `collect`, source-only `explain` |
 | Results | Ibex `DataFrame`/`Series`, columns, shape, item, column lookup, `to_list`, `to_dict`, `to_arrow`, `to_pandas` |
 | Types | Int64, Float64, Bool, strings, Date; sums preserve Int64/Float64 and return zero for empty/all-null input; mean is Float64; row-count output is UInt32 |
 
@@ -93,7 +93,7 @@ above, not the full Polars frame/series API. Columns with unsupported types
 are rejected when used; in-memory inputs reject unsupported types at `.lazy()`.
 Backticks, newlines, NUL and `${` in names are rejected by this renderer.
 
-Joins, selectors, computed group/sort keys, nested/list expressions, multi-expression
+Selectors, computed group/sort keys, nested/list expressions, multi-expression
 updates, reduction broadcasting, Python UDFs, literal-only projections and
 `collect(engine=...)` are not implemented. No operation falls back to Polars.
 Unsupported methods/options fail; implemented APIs reject unsupported
@@ -136,6 +136,13 @@ Python indexing uses exclusive stops and supports negative bounds and steps.
 The Polars-style `.slice` uses offset/length semantics and clips the requested
 interval at the frame boundaries. Zero steps and negative lengths are errors.
 This initial lowering materializes positions rather than skipping input chunks.
+
+`join(other, on=..., how=...)` supports inner, left, right, full, semi, anti,
+and cross joins. Use `left_on`/`right_on` for differently named column keys;
+composite keys, suffixes, null matching and key coalescing are supported.
+`maintain_order` accepts the Polars order policies; semi/anti support left-side
+ordering only. Nondefault `validate`, computed keys, as-of and non-equi joins
+remain unsupported. Every joined pipeline executes in one native call.
 
 ## Check the actual upstream PDS-H query
 

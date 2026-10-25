@@ -1409,9 +1409,14 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 }
                 // One match per row is the common case; a fan-out join grows
                 // past it, which is what a vector is for.
-                parts[w].li.reserve(end - begin);
-                parts[w].ri.reserve(end - begin);
-                body(begin, end, parts[w].li, parts[w].ri);
+                // Keep frequently updated vector metadata on this worker's
+                // stack. Adjacent Part objects can share a cache line; only
+                // publish their buffers once, after probing finishes.
+                Part local;
+                local.li.reserve(end - begin);
+                local.ri.reserve(end - begin);
+                body(begin, end, local.li, local.ri);
+                parts[w] = std::move(local);
             });
             batch.wait();
         }

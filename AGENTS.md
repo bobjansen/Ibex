@@ -11,6 +11,7 @@ Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named c
 - ccache auto-enabled if on PATH; install once (`apt install ccache`). Clean dirs rebuild faster
 - LTO negligible (hot paths inline). Parquet: separate rebuild via scripts/ibex-parquet-build.sh
 - E2E: scripts/ibex-e2e.sh. Hooks: scripts/install-hooks.sh. Format: scripts/clang-format.sh
+- Lint via `scripts/clang-tidy.sh -p <build-dir> <files>`; it discovers an installed clang-tidy on PATH. Set `CLANG_TIDY_BIN` to override the executable. `scripts/tidy-fix.sh <files>` uses the same selector; set `TIDY_FIX_BUILD_DIR` for a non-default build directory. It verifies fixes compile; review the diff and run relevant tests.
 - Fix warnings as they pop up. CMake re-run on CMakeLists changes is real dependency, not bug
 - **Parser/lexer/AST:** run full `ctest` (no `-LE slow`) before done
 - **New syntax:** add .ibex example + update SPEC.md + docs/index.html (must stay in sync, no local paths)

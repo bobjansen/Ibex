@@ -102,19 +102,10 @@ for path in sorted(paths):
 PY
 )
 
-CLANG_TIDY_BIN="${CLANG_TIDY_BIN:-}"
-if [[ -z "$CLANG_TIDY_BIN" ]]; then
-    for candidate in clang-tidy-20 clang-tidy-19 clang-tidy-18 clang-tidy; do
-        if command -v "$candidate" >/dev/null 2>&1; then
-            CLANG_TIDY_BIN="$candidate"
-            break
-        fi
-    done
-fi
-if [[ -z "$CLANG_TIDY_BIN" ]]; then
-    echo "error: clang-tidy not found" >&2
-    exit 1
-fi
+# Share tool discovery with direct lint runs. CLANG_TIDY_BIN remains an
+# optional executable/path override, interpreted by the wrapper.
+TIDY_COMMAND="$REPO_ROOT/scripts/clang-tidy.sh"
+"$TIDY_COMMAND" --version
 
 CLANG_FORMAT_BIN="${CLANG_FORMAT_BIN:-}"
 if [[ -z "$CLANG_FORMAT_BIN" ]]; then
@@ -201,7 +192,7 @@ for f in "${files[@]}"; do
     fi
     backup_file="$(mktemp)"
     cp -- "$f" "$backup_file"
-    if "$CLANG_TIDY_BIN" -p "$BUILD_DIR" --header-filter='' \
+    if "$TIDY_COMMAND" -p "$BUILD_DIR" --header-filter='' \
         --config="{Checks: '-*,misc-include-cleaner,modernize-use-designated-initializers',
                    CheckOptions: {misc-include-cleaner.UnusedIncludes: false,
                                   misc-include-cleaner.IgnoreHeaders: '(^|.*/)bits/.*'}}" \
@@ -224,7 +215,7 @@ for f in "${files[@]}"; do
         tidy_extra_args+=(--extra-arg=-std=gnu++23)
         tidy_extra_args+=("${header_include_args[@]}")
     fi
-    if "$CLANG_TIDY_BIN" -p "$BUILD_DIR" --header-filter='' \
+    if "$TIDY_COMMAND" -p "$BUILD_DIR" --header-filter='' \
         --checks='-*,misc-const-correctness' "${tidy_extra_args[@]}" --fix "$f"; then
         :
     else

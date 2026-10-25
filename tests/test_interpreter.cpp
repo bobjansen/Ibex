@@ -21045,3 +21045,57 @@ TEST_CASE("NullScalar: a null scalar records the kind it stands in for", "[nulls
     CHECK(std::hash<ibex::NullScalar>{}(int_null) ==
           std::hash<ibex::NullScalar>{}(ibex::NullScalar{ibex::ScalarKind::Int}));
 }
+
+TEST_CASE("bound filters reuse plans with fresh scalars and preserve lexical scope",
+          "[runtime][bound_filter]") {
+    runtime::Table table;
+    table.add_column("v", Column<std::int64_t>{1, 2, 3, 4});
+    table.add_column("limit", Column<std::int64_t>{0, 2, 0, 5});
+    runtime::TableRegistry tables;
+    tables.emplace("t", table);
+    runtime::ScalarRegistry scalars;
+    scalars.emplace("limit", std::int64_t{2});
+    for (const auto* source :
+         {"t[filter v > ^limit];", "t[filter v > ^limit + 0];", "t[filter !(v <= ^limit)];"}) {
+        const auto plan = require_ir(source);
+        for (const auto limit : {std::int64_t{2}, std::int64_t{3}, std::int64_t{0}}) {
+            scalars.at("limit") = limit;
+            const auto result = runtime::interpret(*plan, tables, &scalars);
+            REQUIRE(result);
+            CHECK(result->rows() == static_cast<std::size_t>(4 - limit));
+        }
+        scalars.at("limit") = NullScalar{ScalarKind::Int};
+        const auto result = runtime::interpret(*plan, tables, &scalars);
+        REQUIRE(result);
+        CHECK(result->rows() == 0);
+    }
+    const auto plan = require_ir("t[filter v > limit];");
+    const auto result = runtime::interpret(*plan, tables, &scalars);
+    REQUIRE(result);
+    REQUIRE(result->rows() == 2);
+    CHECK(std::get<Column<std::int64_t>>(*result->find("v"))[1] == 3);
+}
+
+TEST_CASE("bound filters preserve NaN ordering and null validity", "[runtime][bound_filter]") {
+    runtime::Table table;
+    table.add_column("v", Column<double>{-1.0, 1.0, std::numeric_limits<double>::quiet_NaN(), 2.0});
+    runtime::ValidityBitmap valid(4, true);
+    valid.set(3, false);
+    table.columns[0].validity = valid;
+    runtime::TableRegistry tables;
+    tables.emplace("t", table);
+    runtime::ScalarRegistry scalars;
+    scalars.emplace("bound", 0.0);
+    const auto plan = require_ir("t[filter __ibex_nan_high_gt(v, ^bound)];");
+    auto result = runtime::interpret(*plan, tables, &scalars);
+    REQUIRE(result);
+    CHECK(result->rows() == 2);
+    scalars.at("bound") = std::numeric_limits<double>::quiet_NaN();
+    result = runtime::interpret(*plan, tables, &scalars);
+    REQUIRE(result);
+    CHECK(result->rows() == 0);
+    scalars.at("bound") = NullScalar{ScalarKind::Double};
+    result = runtime::interpret(*plan, tables, &scalars);
+    REQUIRE(result);
+    CHECK(result->rows() == 0);
+}

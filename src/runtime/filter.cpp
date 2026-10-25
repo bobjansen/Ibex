@@ -44,6 +44,7 @@
 #include <variant>
 #include <vector>
 
+#include "bound_filter.hpp"
 #include "decimal_ops.hpp"
 #include "kernel_gather.hpp"
 #include "kernel_types.hpp"
@@ -2166,6 +2167,10 @@ auto try_in_list_mask(const ir::Expr& expr, const PredicateInput& input, RowRang
 // valid==nullopt means all rows are valid (common non-null path, zero overhead).
 auto compute_mask(const ir::Expr& expr, const PredicateInput& input, const ScalarRegistry* scalars,
                   RowRange rows) -> std::expected<Mask, std::string> {
+    if (auto bound = bind_filter_constants(
+            expr, scalars, [&](const std::string& name) { return input.find(name) != nullptr; })) {
+        return compute_mask(*bound, input, scalars, rows);
+    }
     const std::size_t n = rows.count;
     return std::visit(
         [&](const auto& node) -> std::expected<Mask, std::string> {
@@ -3516,6 +3521,20 @@ auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conj
 auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts,
                       const ExecutionContext& exec, const ScalarRegistry* scalars)
     -> std::expected<Selection, std::string> {
+    std::optional<std::vector<ir::Expr>> bound;
+    for (std::size_t i = 0; i < conjuncts.size(); ++i) {
+        if (auto expr = bind_filter_constants(conjuncts[i], scalars, [&](const std::string& name) {
+                return input.find_entry(name) != nullptr;
+            })) {
+            if (!bound) {
+                bound = conjuncts;
+            }
+            (*bound)[i] = std::move(*expr);
+        }
+    }
+    if (bound) {
+        return filter_selection(input, *bound, exec, scalars);
+    }
     // Range conjuncts fuse into one blocked pass that yields the selection
     // directly; whatever doesn't fuse runs against that selection instead of
     // against every row.

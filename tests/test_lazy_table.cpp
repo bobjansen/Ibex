@@ -1811,3 +1811,24 @@ TEST_CASE("LazyTable: join_key_selection decodes the key when the scan returns n
     CHECK(int_column(keys, "k") == std::vector<std::int64_t>{10, 13, 14, 15});
     CHECK(decoded_key(state));
 }
+
+TEST_CASE("LazyTable: bound ranges use the source key scan with fresh values",
+          "[runtime][lazy_table][bound_filter]") {
+    auto state = std::make_shared<TextSourceState>();
+    auto lazy = make_text_lazy(state);
+    auto predicate = greater_than("n", 1);
+    std::get<ir::CompareExpr>(predicate.node).right =
+        ir::make_expr_ptr(ir::Expr{ir::ColumnRef{.name = "bound", .lexical = true}});
+    runtime::ScalarRegistry scalars;
+    scalars.emplace("bound", std::int64_t{1});
+    for (const auto bound : {std::int64_t{1}, std::int64_t{3}}) {
+        scalars.at("bound") = bound;
+        const auto table = lazy.project_where({"s"}, {predicate}, kExec, &scalars);
+        REQUIRE(table);
+        CHECK(table->rows() == static_cast<std::size_t>(5 - bound));
+    }
+    CHECK(state->key_scan_calls == std::vector<std::string>{"n", "n"});
+    for (const auto& call : state->decode_calls) {
+        CHECK(std::ranges::find(call, "n") == call.end());
+    }
+}

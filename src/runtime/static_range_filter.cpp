@@ -18,6 +18,8 @@
 #include <variant>
 #include <vector>
 
+#include "bound_filter.hpp"
+
 namespace ibex::runtime {
 
 namespace {
@@ -200,12 +202,15 @@ auto absorb(const Term& term, DynamicScanFilter& filter) -> bool {
 
 }  // namespace
 
-auto split_static_range(const std::vector<ir::Expr>& conjuncts, const Table& schema)
-    -> std::optional<StaticRange> {
+auto split_static_range(const std::vector<ir::Expr>& conjuncts, const Table& schema,
+                        const ScalarRegistry* scalars) -> std::optional<StaticRange> {
     std::vector<std::optional<Term>> terms;
     terms.reserve(conjuncts.size());
     for (const auto& conjunct : conjuncts) {
-        terms.push_back(as_term(conjunct));
+        const auto bound = bind_filter_constants(conjunct, scalars, [&](const std::string& name) {
+            return schema.find_entry(name) != nullptr;
+        });
+        terms.push_back(as_term(bound ? *bound : conjunct));
     }
 
     // The first column the reader can answer.

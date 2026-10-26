@@ -17982,6 +17982,22 @@ TEST_CASE("substring slices codepoints, never splitting a UTF-8 byte sequence",
     CHECK(substring_over(v, "substring(v, 0, 1)") == std::vector<std::string>{"c", "日"});
 }
 
+TEST_CASE("substring clamps extreme bounds and preserves forward UTF-8 decoding",
+          "[interpreter][substring]") {
+    const std::vector<std::string> values{"", "é日本😀tail", std::string("a\xF0z", 3)};
+    CHECK(substring_over(values, "substring(v, 0, 2)") ==
+          std::vector<std::string>{"", "é日", std::string("a\xF0z", 3)});
+    CHECK(substring_over(values, "substring(v, -1, 1)") ==
+          std::vector<std::string>{"", "l", std::string("\xF0z", 2)});
+    CHECK(substring_over(values, "substring(v, -9223372036854775807 - 1, 1)") ==
+          std::vector<std::string>{"", "é", "a"});
+    CHECK(substring_over(values, "substring(v, 9223372036854775807, 1)") ==
+          std::vector<std::string>{"", "", ""});
+    CHECK(substring_over(values, "substring(v, 1, 9223372036854775807)") ==
+          std::vector<std::string>{"", "日本😀tail", std::string("\xF0z", 2)});
+    CHECK(substring_over(values, "substring(v, -2, -1)") == std::vector<std::string>{"", "", ""});
+}
+
 TEST_CASE("substring propagates null", "[interpreter][substring]") {
     Column<std::string> col;
     col.push_back("keep");

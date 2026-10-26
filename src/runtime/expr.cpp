@@ -862,18 +862,6 @@ auto utf8_codepoint_advance(std::string_view s, std::size_t i) -> std::size_t {
     return std::min(advance, s.size() - i);
 }
 
-auto utf8_codepoint_offsets(std::string_view s) -> std::vector<std::size_t> {
-    std::vector<std::size_t> offsets;
-    offsets.reserve(s.size() + 1);
-    std::size_t i = 0;
-    while (i < s.size()) {
-        offsets.push_back(i);
-        i += utf8_codepoint_advance(s, i);
-    }
-    offsets.push_back(s.size());
-    return offsets;
-}
-
 [[nodiscard]] auto utf8_codepoint_count(std::string_view s) -> std::int64_t {
     std::int64_t count = 0;
     for (std::size_t i = 0; i < s.size(); i += utf8_codepoint_advance(s, i)) {
@@ -888,23 +876,29 @@ auto utf8_codepoint_offsets(std::string_view s) -> std::vector<std::size_t> {
 /// rather than erroring, so an out-of-range slice is empty, not a failure.
 auto utf8_substring(const std::string& s, std::int64_t start, std::optional<std::int64_t> length)
     -> std::string {
-    const std::vector<std::size_t> offsets = utf8_codepoint_offsets(s);
-    const auto count = static_cast<std::int64_t>(offsets.size() - 1);
-
-    std::int64_t begin = start < 0 ? start + count : start;
-    begin = std::clamp<std::int64_t>(begin, 0, count);
-
-    std::int64_t end = count;
+    if (length.has_value() && *length <= 0) {
+        return {};
+    }
+    // Only negative starts need the full codepoint count. Walk forward with
+    // the same decoder even in that case, preserving malformed-byte behavior.
+    if (start < 0) {
+        start = std::max<std::int64_t>(0, start + utf8_codepoint_count(s));
+    }
+    std::size_t begin = 0;
+    while (begin < s.size() && start > 0) {
+        begin += utf8_codepoint_advance(s, begin);
+        --start;
+    }
+    std::size_t end = s.size();
     if (length.has_value()) {
-        if (*length <= 0) {
-            end = begin;
-        } else if (*length < count - begin) {
-            end = begin + *length;
+        end = begin;
+        auto remaining = *length;
+        while (end < s.size() && remaining > 0) {
+            end += utf8_codepoint_advance(s, end);
+            --remaining;
         }
     }
-    return s.substr(
-        offsets[static_cast<std::size_t>(begin)],
-        offsets[static_cast<std::size_t>(end)] - offsets[static_cast<std::size_t>(begin)]);
+    return s.substr(begin, end - begin);
 }
 
 auto string_length_kernel(const ir::CallExpr& call, const Table& input, std::size_t rows,

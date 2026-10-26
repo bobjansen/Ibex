@@ -1025,3 +1025,54 @@ branch and improving the seven LIKE alternatives are subsequent opportunities.
 No execution change is included in this investigation. Raw profiles, physical
 inspection and control samples are in
 `pdsh-performance-results/q22-investigation.json`.
+
+## Native substring: bounded scans without an offset array
+
+Commit `96f2a981` removes the per-call codepoint-offset allocation from native
+substring. Nonnegative starts scan only to the requested start and end; an
+omitted length copies the suffix without walking it first. Negative starts
+count codepoints, then locate the slice with the same forward decoder.
+Nonpositive lengths return immediately. This preserves the existing Unicode,
+clamping, null and malformed-byte behavior. It benefits both frontends; no
+Polars-specific execution change is involved. The scalar dispatch path remains
+and no new column kernel is included.
+
+The saved before/after Release bridges use identical Python adapters and SF10
+inputs. Twelve paired rounds balance all six before/after/Polars route orders;
+all complete outputs match the Polars reference. Only the clean eight-thread
+rerun is reported below; an earlier exploratory run overlapped a plugin build
+and is excluded. Pinning is CPU 2 for one thread and CPUs
+0,2,4,6,8,10,12,14 for eight. Warm collection medians, milliseconds:
+
+| Workload | Threads | Before | After | Polars streaming | Median paired change |
+|---|---:|---:|---:|---:|---:|
+| Full Q22 | 1 | 1,192.8 | 1,030.5 | 463.8 | −13.8% |
+| Full Q22 | 8 | 536.1 | 384.7 | 84.1 | −28.3% |
+| Customer phone prefix only | 1 | 265.2 | 184.5 | 63.2 | −31.5% |
+
+The focused prefix query reads all 1.5 million customer phones from Parquet,
+extracts their first two codepoints, and returns every prefix. It includes
+decode and result export, rather than timing only the helper. All three
+comparisons improve in every pair; two-sided exact signed-rank p=0.000488
+for each. The remaining gap includes scalar evaluation, repeated customer
+work and LIKE filtering; this change does not resolve those costs.
+
+The required `compare_ibex_git.sh` regression check compares `6a5a75d8` to
+the candidate on the scalar, filter and join suites, using twelve interleaved
+repeats, seven inner iterations and two warmups, pinned to eight P-cores.
+The sum of the 20 query medians changes by +0.54%; every query is classified
+as noise by the harness, and none has an unadjusted exact signed-rank p<0.05.
+This is a regression screen, not evidence that unrelated operators improve.
+
+Validation: all 2,379 fast CTest entries pass (four network-dependent skips);
+substring tests cover 97 assertions including extreme bounds and truncated
+UTF-8. Existing tests also cover null propagation and serial/parallel result
+identity. The CSV plugin is rebuilt using `scripts/ibex-plugin-build.sh` and
+a fresh load returns the expected count and sum. Formatting and diff checks
+pass.
+
+Raw before/after sources, bridge hashes, samples and the focused benchmark
+driver are preserved in `pdsh-performance-results/q22-substring-{one,eight,prefix-one}.json`.
+Native regression results and exact paired statistics are in
+`q22-substring-native-regression.txt` and `q22-substring-statistics.json`
+in the same directory.

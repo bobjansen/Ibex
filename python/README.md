@@ -171,6 +171,10 @@ slicing and literal alternatives. Q21 adds filtered distinct counts, including
 selected nulls but excluding rejected rows. General regex support, general
 inequality joins, mixed reduction/row projections and other filtered aggregates
 remain unsupported. The report records the accepted compatibility limits.
+Native substring now avoids allocating codepoint offsets and stops after the
+requested positive slice. Paired SF10 Q22 collections improve from 536 to
+385 ms at eight threads and from 1,193 to 1,030 ms at one thread; complete
+results match Polars. See the report for raw samples and regression checks.
 Its native planning follow-up reduces eight-thread Q6 from 747 ms to 219 ms
 (Polars streaming: 189 ms), preserving Polars' NaN/null semantics.
 Membership simplification and shared streaming scan planning reduce Q12's

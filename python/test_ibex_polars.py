@@ -370,6 +370,46 @@ class EngineTests(unittest.TestCase):
         self.equal(cached.filter(pl.col("key") > 1))
         self.equal(frame.head(0).select(pl.col("day").dt.year()))
 
+    def test_shared_cache_lowers_once_and_branches_keep_independent_updates(self):
+        frame = pl.LazyFrame({"key": [1, 2, 3], "phone": ["13-abc", None, "日本語"]})
+        cached = frame.with_columns(prefix=pl.col("phone").str.slice(0, 2)).cache()
+        left = cached.with_columns(pl.col("key") + 10)
+        right = cached.with_columns(pl.col("key") + 20)
+        query = left.join(right, on="prefix", nulls_equal=True).sort("key")
+        self.equal(query)
+        source = self.engine.explain(query)
+        self.assertEqual(source.count("substring("), 1)
+        self.assertEqual(source.count("let _ibex_cache_"), 1)
+        self.equal(query)  # bindings hold plans, not results from a prior collection
+
+    def test_nested_caches_and_distinct_cache_identities(self):
+        frame = pl.LazyFrame({"key": [1, 2, 3], "phone": ["13-abc", "31-def", None]})
+        inner = frame.with_columns(prefix=pl.col("phone").str.slice(0, 2)).cache()
+        outer = inner.filter(pl.col("key") > 1).cache()
+        query = outer.join(outer, on="key").join(inner.select("key"), on="key").sort("key")
+        self.equal(query)
+        source = self.engine.explain(query)
+        self.assertEqual(source.count("substring("), 1)
+        self.assertEqual(source.count("let _ibex_cache_"), 2)
+        # Independent explicit caches must not alias, even with the same schema.
+        other = frame.filter(pl.col("key") < 3).cache()
+        self.equal(outer.join(other, on="key").sort("key"))
+        self.equal(outer.head(0).join(inner, on="key"))
+
+    @unittest.skipIf(os.environ.get("IBEX_TEST_PARQUET") == "0", "Parquet backend disabled")
+    def test_shared_parquet_cache_is_scoped_to_one_collection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "input.parquet"
+            pq.write_table(pa.table({"key": [1, 2], "value": [3, 4]}), path)
+            cached = pl.scan_parquet(path).cache()
+            query = cached.join(cached.select("key"), on="key").sort("key")
+            self.equal(query)
+            source = self.engine.explain(query)
+            self.assertEqual(source.count("= parquet::read("), 1)
+            pq.write_table(pa.table({"key": [1, 2], "value": [30, 40]}), path)
+            result = self.equal(query)
+            self.assertEqual(result["value"].to_list(), [30, 40])
+
     def test_float_group_keys_canonicalize_nans_and_keep_original_representatives(self):
         import struct
         nan_a = struct.unpack("d", struct.pack("Q", 0x7ff8000000000001))[0]

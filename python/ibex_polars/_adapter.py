@@ -79,7 +79,7 @@ def _at_most_one_row(frame):
         elif operation == "slice" and args[1] is not None and 0 <= args[1] <= 1:
             one = True
         elif operation not in ("select", "filter", "update", "hstack", "aggregate", "slice",
-                                "python_slice", "sort", "unique"):
+                                "python_slice", "sort", "unique", "cache"):
             return False
     return one
 
@@ -555,10 +555,9 @@ class Adapter:
             frame = self.frame(node.input)
             self.frame_length_columns[node_id] = self.frame_length_columns.get(node.input, set())
         elif kind == "Cache":
-            # Supported subplans are deterministic. Reuse the immutable frame
-            # graph; native collection may recompute a shared subplan rather
-            # than maintaining Polars' physical cache. No Python collection.
-            frame = self.frame(node.input)
+            # Cache nodes can have different visitor node IDs while sharing
+            # one Polars cache identity. Preserve that identity until lowering.
+            frame = self.frame(node.input)._append("cache", node.id_)
             self.frame_length_columns[node_id] = self.frame_length_columns.get(node.input, set())
         elif kind == "DataFrameScan":
             if node.selection is not None:

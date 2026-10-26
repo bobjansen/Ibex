@@ -165,7 +165,24 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
         return f"({render(args[0])} {op} {render(args[1])})"
 
     kind, value = frame._source
-    if kind == "parquet":
+    cache_steps = [(index, key) for index, (operation, key) in enumerate(frame._steps)
+                   if operation == "cache"]
+    first_step = 0
+    if cache_steps:
+        index, key = cache_steps[-1]
+        cache_bindings = state.setdefault("cache_bindings", {})
+        prefix = ""
+        if key not in cache_bindings:
+            cached_input = frame.__class__(frame._source, frame._steps[:index])
+            (prefix, cached_source), _, _ = lower(
+                cached_input, validate=validate, widen_numeric_inputs=widen_numeric_inputs,
+                _state=state, _namespace=_namespace, _return_parts=True)
+            name = f"_ibex_cache_{len(cache_bindings)}"
+            cache_bindings[key] = name
+            prefix += f"let {name} = {cached_source};\n"
+        source = cache_bindings[key]
+        first_step = index + 1
+    elif kind == "parquet":
         prefix = '' if "parquet" in state["imports"] else 'extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";\n'
         state["imports"].add("parquet")
         source = "parquet::read(" + bind(value) + ")"
@@ -184,6 +201,8 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
     else:
         raise NotImplementedError(f"unsupported source: {kind}")
     for index, (operation, expressions) in enumerate(frame._steps):
+        if index < first_step:
+            continue
         current_types = step_types[index] if validate else {}
         if operation == "filter":
             reductions = {}
@@ -673,7 +692,7 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
         if operation == "aggregate":
             keys, expressions = expressions
             key_types = [dtype(Expr("col", (name,))) for name in keys]
-        elif operation in ("slice", "python_slice"):
+        elif operation in ("slice", "python_slice", "cache"):
             step_types.append(type_map)
             schemas.append(dict(columns))
             continue

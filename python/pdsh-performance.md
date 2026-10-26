@@ -43,21 +43,21 @@ relevant alongside warm throughput.
 
 ## Coverage
 
-The adapter now supports **16 of 22 queries: Q1–Q10, Q12, Q14 and Q17–Q20**.
-The latest additions are Q7, Q8, Q9, Q10, Q14, Q17, Q19 and Q20. All eight
+The adapter now supports **17 of 22 queries: Q1–Q10, Q12, Q14–Q15 and Q17–Q20**.
+The latest addition is Q15, using reduction broadcasting inside filters.
+The preceding additions were Q7, Q8, Q9, Q10, Q14, Q17, Q19 and Q20. All eight
 additions pass complete result comparisons against both in-memory Polars and
 streaming Polars on unchanged SF10 Parquet inputs, with matched one- and
 eight-thread budgets. The earlier eight queries retain their correctness and
 performance evidence below. The new-query measurements are reported next.
 
-The remaining six queries fail explicitly before native execution. These are
+The remaining five queries fail explicitly before native execution. These are
 first blockers, not exhaustive inventories per query:
 
 | Queries | First translation blocker |
 |---|---|
 | Q11, Q22 | Inequality joins (`IEJoin`) |
 | Q13, Q16 | Regular-expression operators in string `contains` |
-| Q15 | Reductions broadcast inside a filter |
 | Q21 | Expression-level filtered aggregation (`Filter`) |
 
 Floating rounding now supports 0–15 decimal places, half-to-even and
@@ -75,7 +75,7 @@ for the native optimizer. Other visitor failures still propagate, cardinality
 validation remains checked, and there is no execution fallback to Polars.
 The original caller flags and prepared-plan cache keys remain unchanged.
 
-[Full SF10 checks and coverage](pdsh-performance-results/expanded-16-checks.json)
+[Full SF10 checks and coverage](pdsh-performance-results/expanded-17-checks.json)
 retain complete-result check outcomes, generated sources, query hashes and
 mutation evidence. The Python suite passes 118 tests and 692 subtests.
 
@@ -159,6 +159,43 @@ as the commands in Reproduction below. Use matched `IBEX_CORES` and
 `POLARS_MAX_THREADS`, pin one thread to CPU 2 and eight threads to
 0,2,4,6,8,10,12,14, and run the budgets sequentially. Rebuild the complete
 Release tree immediately before each run.
+
+## Q15: reductions inside filters
+
+The Python lowerer now supports global reductions inside filter predicates.
+It shares the current input, computes the requested reductions in one native
+aggregate, extracts lexical scalars, and applies the predicate against that same
+input. All predicates in one filter see its pre-filter rows; consecutive filters
+reduce their own inputs. Generated names avoid input-column collisions. Existing
+NaN, null, empty-reduction and narrow-type policies remain in use. Nested
+reductions and mixed reduction/row projections remain unsupported.
+
+This enables the unchanged upstream Q15, including all ties for maximum supplier
+revenue. Native profiles show the supplier/revenue join executing once and
+producing 100,000 rows, followed by the one-row global reduction. The entire
+query executes in one native bridge call, without Python result extraction.
+No C++ engine changes are needed.
+
+Measured 2026-10-26 on the same SF10 inputs and 3.2GHz host. These are medians
+of twelve rounds after two warmups; all six route orders are balanced. Preparation
+and complete result checks are outside timing. One thread is pinned to CPU 2;
+eight threads use CPUs 0,2,4,6,8,10,12,14. The full Release tree was rebuilt before
+each measurement; no builds or tests ran alongside the timed collections.
+
+| Threads | Polars in-memory ms | Polars streaming ms | Polars–Ibex ms |
+|---|---:|---:|---:|
+| One | 1,904 | 1,869 | 1,784 |
+| Eight | 284 | 261 | 284 |
+
+All 17 supported queries match both Polars executors on SF10 at one and eight
+threads. All nine Python/conformance CTest groups pass. Regression tests cover
+ties, empty/all-null inputs, NaNs, scalar-only predicates, multiple reductions,
+consecutive-filter scope, temporary-name collisions and one-call execution.
+
+- [Full 22-query coverage checks at both budgets](pdsh-performance-results/expanded-17-checks.json)
+- [One-thread Q15 samples](pdsh-performance-results/q15-filter-reductions-one.json)
+- [Eight-thread Q15 samples](pdsh-performance-results/q15-filter-reductions-eight.json)
+- [Q15 source, operator profile and validation](pdsh-performance-results/q15-filter-reductions-evidence.json)
 
 ## Q19: projection and alias barriers
 

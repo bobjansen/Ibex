@@ -35,6 +35,11 @@ def _categorical_from_arrow(column, dtype, name):
 
 def _to_polars(result, expected, output):
     """Export the declared result schema without decoding categorical keys."""
+    if not expected:
+        # Arrow carries a row count for zero-column tables, but from_arrow
+        # loses that height. Drop a null-only carrier after conversion; its
+        # Arrow array needs no per-row value buffers or Python objects.
+        return pl.from_arrow(pa.table({"_ibex_height": pa.nulls(result.num_rows)})).drop("_ibex_height")
     result = result.select(list(expected))
     metadata = dict(result.schema.metadata or {})
     metadata.pop(b"ibex.ordering", None)

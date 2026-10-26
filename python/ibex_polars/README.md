@@ -105,6 +105,11 @@ cost; prepared collections cache the plan/bindings. Join benchmarks report
 preparation separately from hot execution/export timings. Polars scheduling
 hints are not forwarded to native scheduling.
 
+Native substring uses bounded codepoint scans without an offset array. Paired
+SF10 Q22 collections improve from 536 to 385 ms at eight threads and from
+1,193 to 1,030 ms at one thread, with complete result equality. See the
+[PDS performance report](../pdsh-performance.md) for measurements.
+
 ## Scope and preparation
 
 Supported operations include resident DataFrame scans, single local Parquet

@@ -1344,3 +1344,51 @@ Samples, generated sources, bridge/Python hashes and the driver are in
 in `q10-statistics.json`. `q10-evidence.json` contains the routing inspection,
 profiles, source-control driver and regression/test evidence.
 `q10-complete-eight.json` records the full-suite check.
+
+## Q22: remaining work after substring and cache fixes
+
+Investigation only; no implementation change. Current Q22 generated source is
+byte-identical to the preceding complete-suite sweep. The last clean
+shared-cache profile remains applicable: about 124 ms in the serial substring
+update, 32 ms in the country-filter stage, and 50 ms in the consumers
+(including orders decoding and the anti join). The host is busy during this
+follow-up, so no new timing claim is made.
+
+The next opportunity is to do the country test before deriving the prefix.
+All seven alternatives are two ASCII characters and the slice starts at zero
+with length two. For this shape, searching the sliced prefix for an
+alternative is equivalent to testing whether the original phone starts with
+that alternative. Full selected-frame checks confirm both formulations agree
+on SF10. Filtering phones first would reduce substring input from 1,500,000
+to 419,974 rows: **72% fewer slices**, independent of how fast each slice is.
+This does not undo shared-cache reuse: the selected country subtree can still
+be computed once and shared by the average and anti-join branches.
+
+The country test itself currently lowers to seven separate LIKE calls and an
+OR tree. Because the bounded prefix and every alternative have the same
+length, it is also an exact membership test on the prefix. A single lookup,
+or a fused prefix-membership predicate before slicing, can avoid repeated
+matching and intermediate masks. This equivalence requires the proven bounds;
+general `contains` expressions must retain substring semantics.
+
+A second opportunity is to compute the average from the unchanged shared
+country subtree, then apply `c_acctbal > average` on the anti join's left
+branch before joining orders. Complete sorted frame comparisons confirm the
+reordering preserves the selected rows:
+
+| Work item | Current | With earlier balance filter |
+|---|---:|---:|
+| Anti-join input customers | 419,974 | 190,691 |
+| Anti-join output customers | 140,489 | 63,914 |
+
+This removes about 55% of left-side probes, but still requires the same
+15-million-row orders membership build. The singleton cross join itself
+was only around 1.6 ms in the clean profile, so removing that node alone
+is not the main target.
+
+The priority is therefore country-prefix filtering and its placement, followed
+by the earlier balance predicate. A native substring column kernel remains
+a separate general improvement: the earlier fix removed the offset array,
+but scalar argument construction and dispatch still occur per row.
+Cardinality counts, full-frame equivalence checks and the inspection driver
+are in `pdsh-performance-results/q22-remaining-evidence.json`.

@@ -281,7 +281,7 @@ class Adapter:
                 pattern = self.visitor.view_expression(value.input[1])
                 if type(pattern).__name__ != "Literal" or pattern.dtype != pl.String or not isinstance(pattern.value, str):
                     raise NotImplementedError("string matching requires a non-null literal pattern")
-                fragments = [pattern.value]
+                alternatives = [pattern.value]
                 if name == "Contains":
                     if len(value.function_data) != 3 or type(value.function_data[1]) is not bool:
                         raise NotImplementedError("unsupported string contains options")
@@ -290,15 +290,39 @@ class Adapter:
                         # separated by .* use LIKE %. Unlike regex dot, this
                         # wildcard may also consume newlines. Other regex
                         # operators retain the explicit unsupported boundary.
-                        fragments = pattern.value.split(".*")
-                        if any(char in r".^$*+?{}[]\|()" for part in fragments for char in part):
-                            raise NotImplementedError("regular-expression operators other than .* in contains are unsupported")
+                        alternatives = pattern.value.split("|")
+                        if len(alternatives) > 256:
+                            raise NotImplementedError("contains supports at most 256 literal alternatives")
+                        if any(char in r".^$*+?{}[]\()" for alternative in alternatives
+                               for part in alternative.split(".*") for char in part):
+                            raise NotImplementedError("regular-expression operators other than .* and literal alternatives are unsupported")
                 elif len(value.function_data) != 1:
                     raise NotImplementedError("unsupported string matching options")
-                escaped = "%".join("".join("\\" + char if char in "\\%_" else char for char in part)
-                                   for part in fragments)
-                pattern = ("%" if name != "StartsWith" else "") + escaped + ("%" if name != "EndsWith" else "")
-                expr = Expr("like", (args[0], ibex.lit(pattern)))
+                expr = None
+                for alternative in alternatives:
+                    fragments = (alternative.split(".*") if name == "Contains" and not value.function_data[1]
+                                 else [alternative])
+                    escaped = "%".join("".join("\\" + char if char in "\\%_" else char for char in part)
+                                       for part in fragments)
+                    pattern = ("%" if name != "StartsWith" else "") + escaped + ("%" if name != "EndsWith" else "")
+                    match = Expr("like", (args[0], ibex.lit(pattern)))
+                    expr = match if expr is None else expr | match
+            elif name == "Slice" and len(args) == 3 and len(value.function_data) == 1:
+                if self.visitor.get_dtype(value.input[0]) != pl.String:
+                    raise NotImplementedError("string slicing requires String input")
+                offset, length = (self.visitor.view_expression(child) for child in value.input[1:])
+                if (type(offset).__name__ != "Literal" or type(offset.value) is not int or
+                        type(length).__name__ != "Literal" or type(length.value) is not int or length.value < 0):
+                    raise NotImplementedError("string slicing requires a literal offset and nonnegative length")
+                if offset.value < 0:
+                    # Polars clips the requested interval, while native
+                    # substring first clips the start and then takes length.
+                    begin = Expr("string_length", (args[0],)) + args[1]
+                    clipped = Expr("case", (begin < 0, args[2] + begin, args[2]))
+                    length_expr = Expr("case", (clipped < 0, ibex.lit(0), clipped))
+                    expr = Expr("substring", (args[0], args[1], length_expr))
+                else:
+                    expr = Expr("substring", args)
             elif name == "round" and len(args) == 1 and len(value.function_data) == 3:
                 decimals, mode = value.function_data[1:]
                 if type(decimals) is not int or not 0 <= decimals <= 15:

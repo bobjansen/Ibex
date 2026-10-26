@@ -294,6 +294,20 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(query.collect(engine=self.engine)["s"].to_list(), [True, True, True, None])
         self.assertEqual(query.collect(engine="streaming")["s"].to_list(), [False, True, True, None])
 
+    def test_string_slice_and_literal_alternatives(self):
+        frame = pl.DataFrame({"s": ["13-123", "31-456", "99-789", "αβγ", "😀éabc", "", None,
+                                    "foo|bar", "_%", "special requests"]}).lazy()
+        for offset in (0, 1, -1, -8, 100):
+            for length in (0, 1, 2, 20):
+                with self.subTest(offset=offset, length=length):
+                    self.equal(frame.select(pl.col("s").str.slice(offset, length)))
+        for pattern in ("13|31|23|29|30|18|17", "foo|bar", "α|😀", "_|%", "foo|", "",
+                        "special.*requests|13"):
+            self.equal(frame.select(pl.col("s").str.contains(pattern)))
+        self.equal(frame.select(pl.col("s").str.contains("foo|bar", literal=True)))
+        with self.assertRaisesRegex(NotImplementedError, "256"):
+            self.engine.prepare(frame.filter(pl.col("s").str.contains("|".join(["a"] * 257))))
+
     def test_cache_markers_retain_subplans_and_date_years(self):
         frame = pl.DataFrame({"key": [1, 2, 3], "day": [date(1969, 12, 31), None, date(2000, 2, 29)]}).lazy()
         cached = frame.select("key", year=pl.col("day").dt.year()).cache()

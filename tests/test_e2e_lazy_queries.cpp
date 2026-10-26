@@ -16,8 +16,10 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/lazy_table.hpp>
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <expected>
 #include <limits>
@@ -730,4 +732,64 @@ TEST_CASE("e2e lazy: a disjunction across join sides, statement at a time",
     REQUIRE(result.ok);
     REQUIRE(result.table.has_value());
     REQUIRE(rows_of(*result.table, {"pk", "price"}) == kImpliedRows);
+}
+
+TEST_CASE("e2e lazy: alias-wrapped join filters reach source payload decoding",
+          "[e2e][lazy][projection_filter]") {
+    ExternRegistry registry;
+    for (const auto& name : {std::string("read_a"), std::string("read_b")}) {
+        registry.register_lazy_table(
+            name,
+            [name](const ibex::runtime::ExternArgs&)
+                -> std::expected<ibex::runtime::LazyTablePtr, std::string> {
+                Table data;
+                data.add_column("k", Column<std::int64_t>{1, 2, 3, 4});
+                data.add_column("v", name == "read_a" ? Column<std::int64_t>{1, 3, 8, 9}
+                                                      : Column<std::int64_t>{2, 4, 6, 8});
+                data.add_column("payload", Column<std::int64_t>{10, 20, 30, 40});
+                Table schema;
+                for (const auto& column : data.columns) {
+                    schema.add_column(column.name, empty_like(*column.column));
+                }
+                return std::make_shared<ibex::runtime::LazyTable>(
+                    std::move(schema), 4,
+                    [data = std::move(data)](
+                        const std::vector<std::string>& names,
+                        const Selection* rows) -> std::expected<Table, std::string> {
+                        if (rows == nullptr && std::ranges::find(names, "payload") != names.end()) {
+                            return std::unexpected(
+                                "payload must be decoded after source filtering");
+                        }
+                        const Selection all{0, 1, 2, 3};
+                        const auto& selected = rows == nullptr ? all : *rows;
+                        Table result;
+                        for (const auto& name : names) {
+                            result.add_column(name, slice_column(*data.find(name), selected));
+                        }
+                        result.logical_rows = selected.size();
+                        return result;
+                    });
+            });
+    }
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    ibex::repl::ReplSession::ExecuteOptions options;
+    options.plan_table_expressions = true;
+    options.render = false;
+    const auto result = session.execute(R"(
+extern fn read_a() -> DataFrame from "x.hpp";
+extern fn read_b() -> DataFrame from "x.hpp";
+((read_a()[select {ak = k, av = v, ap = payload}]) join
+ (read_b()[select {bk = k, bv = v, bp = payload}]) on {ak = bk})
+[select {category = av, quantity = bv, left_value = ap, right_value = bp}]
+[select {category, quantity, left_value, right_value}]
+[filter (category == 1 && quantity == 2) || (category == 3 && quantity == 4)]
+[select {total = sum(left_value + right_value)}];
+)",
+                                        std::move(options));
+    CAPTURE(result.error);
+    REQUIRE(result.ok);
+    REQUIRE(result.table.has_value());
+    const auto* total = std::get_if<Column<std::int64_t>>(result.table->find("total"));
+    REQUIRE(total != nullptr);
+    CHECK((*total)[0] == 60);
 }

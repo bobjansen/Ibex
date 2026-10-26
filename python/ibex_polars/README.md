@@ -126,6 +126,13 @@ policies are outside this slice. An already-sliced resident source is valid.
 Background, batch, async and sink execution are not implemented.
 Struct and list columns are intentionally outside the project scope.
 
+As a temporary PDS compatibility rule, regex-mode `str.contains` accepts literal
+fragments separated by `.*` and lowers them to native LIKE `%` wildcards. Fragment
+order is preserved, and literal `%`/`_` characters are escaped. Unlike regex dot,
+these wildcards can cross newlines. Other regex operators, including anchors,
+character classes, escapes and flags, remain explicitly unsupported. Literal-mode
+`contains`, `starts_with` and `ends_with` retain their ordinary literal behavior.
+
 Narrow integers are Python-boundary types, not new native runtime variants.
 Resident inputs widen once to Int64 during preparation; Parquet decoding
 already uses Int64 storage. Arithmetic wraps modulo `2**bits` whenever the

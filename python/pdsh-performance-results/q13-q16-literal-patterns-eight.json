@@ -1,0 +1,307 @@
+{
+  "git_head": "872d8ce1b3504a1da2cf2923bf49d8d7911a91fd",
+  "upstream_head": "401908a307f133a2dffbe3f5e0e0fb2b50ea310b",
+  "upstream_worktree_patch": "diff --git a/queries/polars/q16.py b/queries/polars/q16.py\nindex a17c87d..bb739fd 100644\n--- a/queries/polars/q16.py\n+++ b/queries/polars/q16.py\n@@ -31,7 +31,7 @@ def q(\n     return (\n         part.join(partsupp, left_on=\"p_partkey\", right_on=\"ps_partkey\")\n         .filter(pl.col(\"p_brand\") != var1)\n-        .filter(pl.col(\"p_type\").str.contains(\"MEDIUM POLISHED*\").not_())\n+        .filter(pl.col(\"p_type\").str.starts_with(\"MEDIUM POLISHED\").not_())\n         .filter(pl.col(\"p_size\").is_in([49, 14, 23, 45, 19, 3, 36, 9]))\n         .join(supplier, left_on=\"ps_suppkey\", right_on=\"s_suppkey\", how=\"anti\")\n         .group_by(\"p_brand\", \"p_type\", \"p_size\")\n",
+  "bridge_sha256": "ba9da9eaf14522f80d9d445128fbf8dc3709a652a8e112c9660aae5c2dccf397",
+  "bridge": "/home/brj/ibex/build-release/python/ibex_pyarrow.cpython-314-x86_64-linux-gnu.so",
+  "polars_version": "2.0.0",
+  "python_source_sha256": {
+    "python/ibex_polars/_adapter.py": "c949c8986ccce39ed7057d5027e3e347488f33c9c313bd66c8c3067d21e5c961",
+    "python/ibex_polars/_engine.py": "d9f37b5db319523a93838fde1073f02474c740ac300f986390af29e74606e033",
+    "python/ibex/_lower.py": "8bd6298d245ee383809c9b9846989b61137ea1aeb732b762bcf46014f8eae260",
+    "python/bench_pdsh_engine.py": "f7363910754091f7c5271de8aa11485c91bcf69abb352f7ddb40a4083c8bd7f9"
+  },
+  "native_worktree_patch": "",
+  "ibex_cores": "8",
+  "polars_threads": 8,
+  "affinity": [
+    0,
+    2,
+    4,
+    6,
+    8,
+    10,
+    12,
+    14
+  ],
+  "data": [
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/customer.parquet",
+      "bytes": 81366456,
+      "mtime_ns": 1792828808266811953
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/lineitem.parquet",
+      "bytes": 1801546483,
+      "mtime_ns": 1792828812385804504
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/nation.parquet",
+      "bytes": 3083,
+      "mtime_ns": 1792828814559800573
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/orders.parquet",
+      "bytes": 391488464,
+      "mtime_ns": 1792828815334799172
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/part.parquet",
+      "bytes": 41388677,
+      "mtime_ns": 1792828815922798108
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/partsupp.parquet",
+      "bytes": 295923709,
+      "mtime_ns": 1792828816386797269
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/region.parquet",
+      "bytes": 1827,
+      "mtime_ns": 1792828816660796774
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/supplier.parquet",
+      "bytes": 5208557,
+      "mtime_ns": 1792828816700796702
+    }
+  ],
+  "iterations": 12,
+  "check_only": false,
+  "query_numbers": [
+    13,
+    16
+  ],
+  "method": "Parquet collection; prepared translation; two warmups after first collection; alternating route order; previous-result destruction excluded; no result caching",
+  "correctness": "all rows, order and dtypes; rel_tol=1e-10 abs_tol=1e-8; both Polars executors compared",
+  "cpu_frequency_khz": {
+    "scaling_min_freq": "3200000",
+    "scaling_max_freq": "3200000"
+  },
+  "ibex_decode_threads": null,
+  "ibex_stream_scan": null,
+  "ibex_join_probe": null,
+  "cpu_timing": "process_time_ns over collection; sums all threads; excludes correctness checks",
+  "queries": {
+    "q13": {
+      "upstream_source_sha256": "1734e09cb01bebf788107d1753bfc732d26286f045d68d4cef96b04c746ae6e0",
+      "prepare_ms": 13.589633,
+      "native_source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\n((parquet::read(^_ibex_scalar_0)[select { `c_custkey` = `c_custkey` }][select { `_ibex_join_0_l_0` = `c_custkey` }]) left join (parquet::read(^_ibex_scalar_1)[filter (!(like(`o_comment`, ^_ibex_scalar_2)))][select { `o_orderkey` = `o_orderkey`, `o_custkey` = `o_custkey`, `o_comment` = `o_comment` }][select { `o_orderkey` = `o_orderkey`, `o_custkey` = `o_custkey` }][select { `_ibex_join_0_r_0` = `o_orderkey`, `_ibex_join_0_r_1` = `o_custkey` }]) on { `_ibex_join_0_l_0` = `_ibex_join_0_r_1` })[select { `c_custkey` = `_ibex_join_0_l_0`, `o_orderkey` = `_ibex_join_0_r_0` }][select { `c_custkey`, `c_count` = count(`o_orderkey`) }, by { `c_custkey` }][select { `c_count` = `c_count` }][select { `c_count`, `len` = count() }, by { `c_count` }][select { `c_count` = `c_count`, `custdist` = `len` }][update { `_ibex_sort_null_6_0` = is_null(`custdist`), `_ibex_sort_null_6_1` = is_null(`c_count`) }][order { `_ibex_sort_null_6_0` desc, `custdist` desc, `_ibex_sort_null_6_1` desc, `c_count` desc }];",
+      "first_collect_ms": {
+        "polars": 875.883648,
+        "polars_streaming": 440.0558,
+        "polars_ibex": 912.832998
+      },
+      "output_rows": 46,
+      "status": "passed",
+      "samples_ms": {
+        "polars": [
+          849.997766,
+          849.397703,
+          832.158667,
+          852.006938,
+          856.8251,
+          802.324379,
+          836.748459,
+          858.612426,
+          808.75438,
+          874.708691,
+          841.582782,
+          804.455814
+        ],
+        "polars_streaming": [
+          441.510231,
+          455.268537,
+          422.037454,
+          445.541964,
+          444.971398,
+          451.042256,
+          454.284766,
+          443.469862,
+          418.137803,
+          449.353173,
+          453.008557,
+          464.731225
+        ],
+        "polars_ibex": [
+          706.39251,
+          736.976701,
+          701.323609,
+          688.869991,
+          752.565561,
+          719.278553,
+          745.905952,
+          777.762503,
+          730.955474,
+          786.529364,
+          814.83069,
+          752.109162
+        ]
+      },
+      "median_ms": {
+        "polars": 845.4902425,
+        "polars_streaming": 447.4475685,
+        "polars_ibex": 741.4413265000001
+      },
+      "cpu_samples_ms": {
+        "polars": [
+          4372.571334,
+          4332.627928,
+          4258.713311,
+          4322.722681,
+          4430.716523,
+          4137.593206,
+          4204.423698,
+          4383.646683,
+          4160.272233,
+          4312.543193,
+          4378.896969,
+          4185.329287
+        ],
+        "polars_streaming": [
+          3066.500851,
+          3141.599286,
+          2953.215934,
+          3112.31226,
+          3077.827196,
+          3137.05693,
+          3095.051603,
+          3122.764252,
+          2956.474638,
+          3150.703454,
+          3160.479119,
+          3118.576928
+        ],
+        "polars_ibex": [
+          4400.06511,
+          4463.978722,
+          4425.300587,
+          4346.096145,
+          4440.388703,
+          4358.442459,
+          4423.47317,
+          4484.90396,
+          4478.519494,
+          4394.010261,
+          4496.954402,
+          4347.774689
+        ]
+      },
+      "median_cpu_ms": {
+        "polars": 4317.632937,
+        "polars_streaming": 3115.444594,
+        "polars_ibex": 4424.3868784999995
+      }
+    },
+    "q16": {
+      "upstream_source_sha256": "791cb8099dff27a9905e14d976f8c351712ec74038cd50324ad2103d574c6b2b",
+      "prepare_ms": 135.841498,
+      "native_source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\n((((parquet::read(^_ibex_scalar_0)[filter ((((`p_brand` != ^_ibex_scalar_1) && ((((((((`p_size` == ^_ibex_scalar_2) || (`p_size` == ^_ibex_scalar_3)) || (`p_size` == ^_ibex_scalar_4)) || (`p_size` == ^_ibex_scalar_5)) || (`p_size` == ^_ibex_scalar_6)) || (`p_size` == ^_ibex_scalar_7)) || (`p_size` == ^_ibex_scalar_8)) || (`p_size` == ^_ibex_scalar_9))) && !(like(`p_type`, ^_ibex_scalar_10))))][select { `p_brand` = `p_brand`, `p_type` = `p_type`, `p_size` = `p_size`, `p_partkey` = `p_partkey` }][select { `_ibex_join_0_l_0` = `p_brand`, `_ibex_join_0_l_1` = `p_type`, `_ibex_join_0_l_2` = `p_size`, `_ibex_join_0_l_3` = `p_partkey` }]) join (parquet::read(^_ibex_scalar_11)[select { `ps_suppkey` = `ps_suppkey`, `ps_partkey` = `ps_partkey` }][select { `_ibex_join_0_r_0` = `ps_suppkey`, `_ibex_join_0_r_1` = `ps_partkey` }]) on { `_ibex_join_0_l_3` = `_ibex_join_0_r_1` })[select { `p_brand` = `_ibex_join_0_l_0`, `p_type` = `_ibex_join_0_l_1`, `p_size` = `_ibex_join_0_l_2`, `p_partkey` = `_ibex_join_0_l_3`, `ps_suppkey` = `_ibex_join_0_r_0` }][select { `p_brand` = `p_brand`, `p_type` = `p_type`, `p_size` = `p_size`, `ps_suppkey` = `ps_suppkey` }][select { `_ibex_join_1_l_0` = `p_brand`, `_ibex_join_1_l_1` = `p_type`, `_ibex_join_1_l_2` = `p_size`, `_ibex_join_1_l_3` = `ps_suppkey` }]) anti join (parquet::read(^_ibex_scalar_12)[filter (like(`s_comment`, ^_ibex_scalar_13))][select { `s_suppkey` = `s_suppkey`, `s_comment` = `s_comment` }][select { `s_suppkey` = `s_suppkey` }][select { `_ibex_join_1_r_0` = `s_suppkey` }]) on { `_ibex_join_1_l_3` = `_ibex_join_1_r_0` })[select { `p_brand` = `_ibex_join_1_l_0`, `p_type` = `_ibex_join_1_l_1`, `p_size` = `_ibex_join_1_l_2`, `ps_suppkey` = `_ibex_join_1_l_3` }][select { `p_brand`, `p_type`, `p_size`, `supplier_cnt` = (count_distinct(`ps_suppkey`) + coalesce(max(Int64(is_null(`ps_suppkey`))), ^_ibex_scalar_14)) }, by { `p_brand`, `p_type`, `p_size` }][update { `_ibex_sort_null_6_0` = is_null(`supplier_cnt`), `_ibex_sort_null_6_1` = is_null(`p_brand`), `_ibex_sort_null_6_2` = is_null(`p_type`), `_ibex_sort_null_6_3` = is_null(`p_size`) }][order { `_ibex_sort_null_6_0` desc, `supplier_cnt` desc, `_ibex_sort_null_6_1` desc, `p_brand` asc, `_ibex_sort_null_6_2` desc, `p_type` asc, `_ibex_sort_null_6_3` desc, `p_size` asc }];",
+      "first_collect_ms": {
+        "polars": 85.89432,
+        "polars_streaming": 110.969848,
+        "polars_ibex": 123.741761
+      },
+      "output_rows": 27840,
+      "status": "passed",
+      "samples_ms": {
+        "polars": [
+          93.228391,
+          97.891008,
+          97.136554,
+          99.86809,
+          95.33205,
+          101.615162,
+          95.253659,
+          95.849143,
+          99.113684,
+          104.096954,
+          93.772965,
+          95.631705
+        ],
+        "polars_streaming": [
+          114.642612,
+          114.18798,
+          123.418,
+          120.090823,
+          114.246997,
+          112.33055,
+          115.167782,
+          116.636731,
+          104.41764,
+          105.69919,
+          117.377916,
+          122.44379
+        ],
+        "polars_ibex": [
+          108.578542,
+          118.922892,
+          121.759434,
+          125.826232,
+          119.905247,
+          118.758224,
+          118.430895,
+          119.509792,
+          114.498701,
+          116.982455,
+          110.03722,
+          119.327319
+        ]
+      },
+      "median_ms": {
+        "polars": 96.49284850000001,
+        "polars_streaming": 114.905197,
+        "polars_ibex": 118.840558
+      },
+      "cpu_samples_ms": {
+        "polars": [
+          566.412904,
+          577.801268,
+          594.301067,
+          588.272773,
+          558.14577,
+          578.407457,
+          545.186888,
+          582.394122,
+          579.078687,
+          602.958668,
+          560.708091,
+          573.823247
+        ],
+        "polars_streaming": [
+          573.729072,
+          572.116889,
+          580.082338,
+          576.024039,
+          567.571157,
+          553.314989,
+          555.906536,
+          571.834196,
+          574.074239,
+          575.875841,
+          588.099355,
+          575.781773
+        ],
+        "polars_ibex": [
+          539.095665,
+          547.640982,
+          534.870926,
+          554.173023,
+          531.991531,
+          525.273716,
+          532.456523,
+          530.314409,
+          539.012581,
+          530.409208,
+          540.820164,
+          546.27288
+        ]
+      },
+      "median_cpu_ms": {
+        "polars": 578.1043625,
+        "polars_streaming": 573.9016555000001,
+        "polars_ibex": 536.9417535
+      }
+    }
+  }
+}

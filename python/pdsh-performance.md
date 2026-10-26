@@ -1,11 +1,13 @@
 # PDS-H through the Polars engine adapter
 
 Measured 2026-10-25 on an Intel i7-13700, Linux, Release build, with CPU frequency
-locked at 3.2 GHz. These are the unchanged upstream Polars query functions on
+locked at 3.2 GHz. These use the upstream Polars query functions on
 upstream-generated scale-10 Parquet data (59,986,052 lineitem rows and
 15,000,000 orders). This compares `query.collect` using
 Polars 2.0.0's in-memory executor, its streaming executor, and `IbexEngine`.
 It does not substitute the native hand-written Ibex PDS-H queries.
+The latest Q16 runs use a local correction from `contains("MEDIUM POLISHED*")`
+to `starts_with("MEDIUM POLISHED")`; its patch is included in the new evidence.
 
 The comparison-policy follow-up below reduces default-thread Q6 from 8.20 s to
 0.69 s. The subsequent native planning follow-up below brings eight-thread Q6
@@ -43,21 +45,22 @@ relevant alongside warm throughput.
 
 ## Coverage
 
-The adapter now supports **17 of 22 queries: Q1–Q10, Q12, Q14–Q15 and Q17–Q20**.
-The latest addition is Q15, using reduction broadcasting inside filters.
+The adapter now supports **19 of 22 queries: Q1–Q10 and Q12–Q20**.
+The latest additions are Q13 and the locally corrected Q16, using the temporary
+literal-`.*` to LIKE translation described below. Q15 adds reduction broadcasting
+inside filters.
 The preceding additions were Q7, Q8, Q9, Q10, Q14, Q17, Q19 and Q20. All eight
 additions pass complete result comparisons against both in-memory Polars and
 streaming Polars on unchanged SF10 Parquet inputs, with matched one- and
 eight-thread budgets. The earlier eight queries retain their correctness and
 performance evidence below. The new-query measurements are reported next.
 
-The remaining five queries fail explicitly before native execution. These are
+The remaining three queries fail explicitly before native execution. These are
 first blockers, not exhaustive inventories per query:
 
 | Queries | First translation blocker |
 |---|---|
 | Q11, Q22 | Inequality joins (`IEJoin`) |
-| Q13, Q16 | Regular-expression operators in string `contains` |
 | Q21 | Expression-level filtered aggregation (`Filter`) |
 
 Floating rounding now supports 0–15 decimal places, half-to-even and
@@ -75,7 +78,7 @@ for the native optimizer. Other visitor failures still propagate, cardinality
 validation remains checked, and there is no execution fallback to Polars.
 The original caller flags and prepared-plan cache keys remain unchanged.
 
-[Full SF10 checks and coverage](pdsh-performance-results/expanded-17-checks.json)
+[Full SF10 checks and coverage](pdsh-performance-results/expanded-19-checks.json)
 retain complete-result check outcomes, generated sources, query hashes and
 mutation evidence. The Python suite passes 118 tests and 692 subtests.
 
@@ -159,6 +162,46 @@ as the commands in Reproduction below. Use matched `IBEX_CORES` and
 `POLARS_MAX_THREADS`, pin one thread to CPU 2 and eight threads to
 0,2,4,6,8,10,12,14, and run the budgets sequentially. Rebuild the complete
 Release tree immediately before each run.
+
+## Q13 and Q16: temporary ordered-literal matching
+
+Regex-mode `contains` now recognizes literal fragments separated by `.*` and
+translates them to native LIKE `%`. It retains fragment order, escapes literal
+LIKE metacharacters, and rejects other regex operators. This is explicitly a
+temporary approximation: `%` may cross newlines whereas regex dot normally
+cannot. A regression test pins that accepted difference. Literal-mode matching
+continues to treat `.*` literally. No regex engine or C++ changes are introduced.
+
+Q13 uses `special.*requests`; Q16 uses `.*Customer.*Complaints.*`. Q16's other
+predicate is locally corrected to `starts_with("MEDIUM POLISHED")` in the
+benchmark checkout. The benchmark runner now captures local query patches as
+well as upstream HEAD and per-query source hashes, so the variation remains
+explicit. The full SF10 results of both queries match Polars at one and eight
+threads, as do the other 17 supported queries. All nine Python/conformance
+CTest groups pass. Remaining unsupported queries are Q11, Q21 and Q22.
+
+Warm medians on SF10, measured 2026-10-26 with twelve rounds, two warmups and
+all six execution orders balanced. The host remains locked at 3.2GHz; one
+thread is pinned to CPU 2, eight to CPUs 0,2,4,6,8,10,12,14. Preparation and full
+result comparisons are outside timing, and no builds or tests run alongside
+the measurements. Q16 uses the corrected prefix predicate in both engines.
+
+| Threads | Query | Polars in-memory ms | Polars streaming ms | Polars–Ibex ms |
+|---|---|---:|---:|---:|
+| One | Q13 | 4,034 | 3,013 | 3,793 |
+| One | Q16 | 456 | 433 | 383 |
+| Eight | Q13 | 845 | 447 | 741 |
+| Eight | Q16 | 96 | 115 | 119 |
+
+Q13 remains 26% slower than streaming Polars at one thread and 66% slower at
+eight, while outperforming its in-memory executor. This extension enables the
+query; it does not resolve that performance gap. Q16 is close to streaming
+Polars at eight threads and faster at one.
+
+- [Full 22-query checks at both budgets](pdsh-performance-results/expanded-19-checks.json)
+- [One-thread Q13/Q16 samples](pdsh-performance-results/q13-q16-literal-patterns-one.json)
+- [Eight-thread Q13/Q16 samples](pdsh-performance-results/q13-q16-literal-patterns-eight.json)
+- [Validation and local Q16 patch](pdsh-performance-results/q13-q16-literal-patterns-evidence.json)
 
 ## Q15: reductions inside filters
 
@@ -338,8 +381,8 @@ membership (including null policies), conditional expressions and typed null
 branches, Boolean sums, literal starts/ends/contains matching, Date year
 extraction, deterministic cached subplans, floating grouping keys, numeric
 min/max and null-inclusive distinct counts over integer/Boolean/string values.
-String matching escapes native LIKE metacharacters; regex mode accepts only
-patterns without regex operators. Literal membership accepts at most 256
+String matching escapes native LIKE metacharacters; the later compatibility
+rule above also accepts literal `.*` separators. Literal membership accepts at most 256
 scalar values and adds no list/struct column support. Cached deterministic
 subplans may be recomputed by native execution; this is not a physical result
 cache. Floating group keys normalize NaNs for equality and return original

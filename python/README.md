@@ -155,14 +155,17 @@ remain unsupported. Every joined pipeline executes in one native call.
 
 For the full 22-query adapter coverage check and current scale-10 timings against
 both Polars executors, see [PDS-H engine performance](pdsh-performance.md).
-The engine now runs **Q1–Q10, Q12, Q14–Q15 and Q17–Q20 (17/22)**, checked on SF10 at one and
+The engine now runs **Q1–Q10 and Q12–Q20 (19/22)**, checked on SF10 at one and
 eight workers. New translations include literal membership, conditionals,
 Boolean sums, basic string matching, Date years, deterministic cache markers,
 floating group keys, numeric extrema and null-inclusive distinct counts.
 The latest additions cover decimal rounding at 0–15 places, fused arithmetic,
 fused-join visitor adaptation and one-column unique projections. Q15 adds
 reductions inside filters: `revenue == revenue.max()` computes the reduction
-over the current input and preserves all maximum ties in one native call. Regex,
+over the current input and preserves all maximum ties in one native call.
+Q13 and Q16 use a temporary translation of literal `.*` fragments to LIKE `%`;
+unlike regex dot, the wildcard also crosses newlines. Q16 uses the locally
+corrected `starts_with("MEDIUM POLISHED")` predicate. General regex support,
 inequality joins, mixed reduction/row projections and filtered aggregates remain
 unsupported; the linked report lists each query's first blocker.
 Its native planning follow-up reduces eight-thread Q6 from 747 ms to 219 ms

@@ -1458,7 +1458,8 @@ TEST_CASE("A parallel multi-field update folds inside the chunk kernel",
 // deliberately: the table evaluator can still split it through its own range
 // writer, so declining is how such a field keeps its parallelism rather than
 // how it loses it. A substring with row-varying bounds is one: the direct
-// string plan deliberately accepts literal bounds only.
+// string plan deliberately accepts constant (literal or bound scalar) bounds
+// only.
 TEST_CASE("An unplanned expression keeps the table bridge", "[kernel][update][parallel]") {
     constexpr std::size_t kRows = 40'000;
     Column<std::string> name;
@@ -1494,4 +1495,48 @@ TEST_CASE("An unplanned expression keeps the table bridge", "[kernel][update][pa
     REQUIRE(head.size() == kRows);
     CHECK(head[0] == "bcd");
     CHECK(stats.chunk_direct_updates.load() == 0);
+}
+
+// The Polars adapter binds substring bounds as scalars (`^start`), not
+// literals. Those are still constants, so the direct parallel plan applies;
+// declining here left Q22's phone-prefix slice on one thread.
+TEST_CASE("Substring with bound scalar bounds takes the direct plan",
+          "[kernel][update][parallel]") {
+    constexpr std::size_t kRows = 40'000;
+    Column<std::string> phone;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        phone.push_back(r % 2 == 0 ? "13-555" : "31-777");
+    }
+    runtime::Chunk chunk;
+    chunk.add_column("phone", std::move(phone));
+    std::vector<ir::ExprPtr> args;
+    args.push_back(ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "phone"}}));
+    args.push_back(
+        ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "start", .lexical = true}}));
+    args.push_back(
+        ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "length", .lexical = true}}));
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "code",
+         .expr = ir::Expr{.node = ir::CallExpr{
+                              .callee = "substring", .args = std::move(args), .named_args = {}}}}};
+    runtime::ScalarRegistry scalars;
+    scalars.emplace("start", runtime::ScalarValue{std::int64_t{0}});
+    scalars.emplace("length", runtime::ScalarValue{std::int64_t{2}});
+
+    runtime::ParallelPipelineStats stats;
+    runtime::ExecutionContext exec;
+    exec.parallel_threads = 4;
+    exec.parallel_min_rows = 0;
+    exec.parallel_min_cells = 0;
+    exec.parallel_grain = 4'096;
+    exec.parallel_stats = &stats;
+
+    auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, &scalars, nullptr, exec);
+    REQUIRE(updated.has_value());
+    const auto& code = std::get<Column<std::string>>(*updated->columns[1].column);
+    REQUIRE(code.size() == kRows);
+    CHECK(code[0] == "13");
+    CHECK(code[kRows - 1] == "31");
+    CHECK(stats.chunk_direct_updates.load() > 0);
 }

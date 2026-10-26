@@ -52,6 +52,48 @@ class EngineTests(unittest.TestCase):
         )
         self.assertEqual(self.equal(query).item(), 19.0)
 
+    def test_filter_reductions_broadcast_over_the_current_input(self):
+        for values in ([1.0, 4.0, 4.0, None], [None, None], [],
+                       [float("nan"), 2.0, None], [float("nan"), float("nan")]):
+            with self.subTest(values=values):
+                frame = pl.DataFrame({"x": values}, schema={"x": pl.Float64}).lazy()
+                for predicate in (pl.col("x") == pl.col("x").max(),
+                                  pl.col("x") >= pl.col("x").mean(),
+                                  pl.col("x").count() == pl.len(),
+                                  pl.col("x").max() == pl.col("x").max()):
+                    with self.subTest(predicate=str(predicate)):
+                        self.equal(frame.filter(predicate))
+                self.equal(frame.filter(pl.len() == pl.len()))
+
+    def test_filter_reductions_share_input_and_preserve_step_boundaries(self):
+        frame = pl.DataFrame({"x": [1, 3, 5, 7, None], "y": [9, 8, 7, 6, 5]}).lazy()
+        # All predicates in one filter read the original input; a subsequent
+        # filter reduces only the survivors of the preceding operation.
+        self.equal(frame.filter(pl.col("x") > pl.col("x").mean(),
+                                pl.col("y") < pl.col("y").max()))
+        self.equal(frame.filter(pl.col("x") > 1)
+                   .filter(pl.col("x") >= pl.col("x").mean())
+                   .filter(pl.col("x") == pl.col("x").max()))
+        self.equal(frame.filter(pl.col("x") > ((pl.col("x").mean() + pl.col("x").min()) / 2)))
+        self.equal(frame.filter(pl.col("x") > pl.col("x").first()))
+
+    def test_q15_shape_keeps_all_maximum_revenue_ties(self):
+        supplier = pl.DataFrame({"key": [1, 2, 3, 4], "name": ["a", "b", "c", "d"]}).lazy()
+        revenue = pl.DataFrame({"key": [1, 1, 2, 3], "v": [4.0, 6.0, 10.0, 2.0]}).lazy()
+        revenue = revenue.group_by("key").agg(pl.col("v").sum().alias("total"))
+        query = (supplier.join(revenue, on="key")
+                 .filter(pl.col("total") == pl.col("total").max())
+                 .with_columns(pl.col("total").round(2)).sort("key"))
+        with patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as execute:
+            self.assertEqual(self.equal(query)["key"].to_list(), [1, 2])
+            execute.assert_called_once()
+
+    def test_filter_reduction_temporaries_do_not_shadow_input_columns(self):
+        frame = pl.DataFrame({"x": [1, 2, 6], "_ibex_filter_value_0_0": [9, 3, 12]}).lazy()
+        self.equal(frame.filter((pl.col("x") > pl.col("x").mean()) &
+                                (pl.col("_ibex_filter_value_0_0") >
+                                 pl.col("_ibex_filter_value_0_0").mean())))
+
     def test_string_predicates_normalize_arrow_string_width(self):
         frame = pl.DataFrame({"s": ["ASIA", "EUROPE", None, ""]})
         with tempfile.TemporaryDirectory() as directory:

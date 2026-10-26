@@ -167,7 +167,7 @@ assert "polars" not in sys.modules
             with self.assertRaises(NotImplementedError):
                 query.select(pl.sum("x"), pl.col("x").alias("y"))
             with self.assertRaises(NotImplementedError):
-                query.filter(pl.sum("x") > 0)
+                query.filter(pl.sum("x").sum() > 0)
             with self.assertRaises(TypeError):
                 query.collect(engine="streaming")
             with self.assertRaises(NotImplementedError):

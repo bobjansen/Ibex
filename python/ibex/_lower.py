@@ -4,7 +4,7 @@
 
 import pyarrow as pa
 
-from ._expr import Expr, _identifier
+from ._expr import Expr, _identifier, _REDUCTIONS
 from ._join import join_layout
 
 
@@ -21,12 +21,16 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
     def internal(name):
         return f"_ibex_{_namespace}{name}"
 
-    needs_schema = validate or any(operation in ("unique", "slice", "python_slice", "join") for operation, _ in frame._steps)
+    needs_schema = validate or any(
+        operation in ("unique", "slice", "python_slice", "join") or
+        (operation == "filter" and any(expr._aggregate for expr in expressions))
+        for operation, expressions in frame._steps)
     step_types, schemas = _validate_types(frame, widen_numeric_inputs=widen_numeric_inputs) if needs_schema else ([], [])
     if result_schema is not None:
         result_schema.update(schemas[-1])
     current_types = {}
     broadcast_length = None
+    filter_scalars = {}
 
     def bind(value):
         name = f"_ibex_scalar_{len(scalars)}"
@@ -34,6 +38,8 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
         return "^" + name
 
     def render(expr):
+        if id(expr) in filter_scalars:
+            return filter_scalars[id(expr)]
         op, args = expr._op, expr._args
         if op == "col":
             return _identifier(args[0])
@@ -171,7 +177,42 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
     for index, (operation, expressions) in enumerate(frame._steps):
         current_types = step_types[index] if validate else {}
         if operation == "filter":
+            reductions = {}
+            def collect_reductions(expr):
+                if expr._op in _REDUCTIONS:
+                    if any(arg._aggregate for arg in expr._args if isinstance(arg, Expr)):
+                        raise NotImplementedError("nested reductions are not supported yet")
+                    reductions.setdefault(id(expr), expr)
+                else:
+                    for arg in expr._args:
+                        if isinstance(arg, Expr):
+                            collect_reductions(arg)
+            for expr in expressions:
+                collect_reductions(expr)
+            if reductions:
+                # Every reduction reads the same pre-filter input. Share both
+                # the input and its one-row aggregate; scalar bindings preserve
+                # nulls and broadcast without an extra join or eager Python read.
+                shared = internal(f"filter_input_{index}")
+                aggregate = internal(f"filter_aggregate_{index}")
+                occupied = set(schemas[index])
+                names = []
+                for i in range(len(reductions)):
+                    name = internal(f"filter_value_{index}_{i}")
+                    while name in occupied:
+                        name += "_"
+                    occupied.add(name)
+                    names.append(name)
+                fields = ", ".join(f"{name} = {render(expr)}"
+                                   for name, expr in zip(names, reductions.values()))
+                prefix += f"let {shared} = {source};\n"
+                prefix += f"let {aggregate} = {shared}[select {{ {fields} }}];\n"
+                for key, name in zip(reductions, names):
+                    prefix += f'let {name} = scalar({aggregate}, "{name}");\n'
+                    filter_scalars[key] = "^" + name
+                source = shared
             predicate = " && ".join(f"({render(expr)})" for expr in expressions)
+            filter_scalars.clear()
             source += "[filter " + predicate + "]"
         elif operation == "join":
             other, left_on, right_on, how, suffix, nulls_equal, coalesce, maintain_order, left_visible, right_visible = expressions

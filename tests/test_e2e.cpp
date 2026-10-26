@@ -17,6 +17,7 @@
 #include <ibex/runtime/ops.hpp>
 #include <ibex/runtime/pipeline.hpp>
 #include <ibex/runtime/table_properties.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_message.hpp>
@@ -40,6 +41,7 @@
 #include <vector>
 
 #include "physical_plan.hpp"
+#include "pipeline_executor_internal.hpp"
 
 namespace {
 
@@ -2457,6 +2459,53 @@ TEST_CASE("E2E: morsel pipeline on worker threads matches serial output", "[e2e]
             }
         }
     }
+}
+
+TEST_CASE("E2E: a bounded morsel producer leaves room for downstream work",
+          "[e2e][parallel][morsel_reservation]") {
+    auto& pool = runtime::process_worker_pool();
+    if (pool.size() < 3) {
+        SKIP("requires at least three pool workers");
+    }
+    auto tables = make_wide_pipeline_table(7 * (pool.size() * 4 + 1));
+    // A computed selection requires the fused map chain rather than the
+    // two-phase filter, so the bounded ring is actually exercised.
+    auto parsed = parser::parse("t[filter price > 0, select { value = price + 1, qty }];");
+    REQUIRE(parsed.has_value());
+    auto lowered = parser::lower(*parsed);
+    REQUIRE(lowered.has_value());
+    runtime::ExecutionContext exec;
+    exec.parallel_threads = pool.size();
+    exec.parallel_grain = 7;
+    exec.parallel_min_rows = 0;
+    exec.parallel_min_cells = 0;
+    runtime::ParallelPipelineStats stats;
+    exec.parallel_stats = &stats;
+    auto plan = runtime::physical::plan_physical(**lowered, tables, nullptr);
+    auto built = runtime::pipeline_executor_detail::build_map_pipeline_parallel(
+        plan, tables, nullptr, nullptr, exec, nullptr);
+    REQUIRE(built.has_value());
+    auto op = std::move(*built);
+    auto first = op->next();
+    REQUIRE(first.has_value());
+    REQUIRE(first->has_value());
+    REQUIRE(stats.two_phase_filters.load() == 0);
+    REQUIRE(stats.parallel_pipelines.load() == 1);
+
+    // Stop consuming: producers eventually fill the ring. A downstream join
+    // still needs to complete a pool batch before it can consume again.
+    std::atomic<bool> completed{false};
+    auto downstream = pool.submit(1, [&](std::size_t) { completed.store(true); });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!completed.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    const bool completed_before_drain = completed.load();
+    // Cancellation frees parked producers even on regression, so this test
+    // reports a failure instead of hanging the whole test process.
+    op.reset();
+    downstream.wait();
+    CHECK(completed_before_drain);
 }
 
 TEST_CASE("E2E: a row-local update is parallelized inside the operator", "[e2e][parallel]") {

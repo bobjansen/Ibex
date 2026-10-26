@@ -30,8 +30,6 @@ class LazyFrame:
         )
         if not expressions:
             raise TypeError("filter requires at least one predicate")
-        if any(expr._aggregate for expr in expressions):
-            raise NotImplementedError("reductions inside filters are not supported yet")
         return self._append("filter", expressions)
 
     def select(self, *exprs, **named_exprs):

@@ -1419,3 +1419,38 @@ seven-LIKE country filter (~32 ms), the orders decode and the anti join
 (~48 ms together). The prefix-first and earlier-threshold rewrites above
 target those. Samples and profiles are in
 `pdsh-performance-results/q22-scalar-substring-bounds.json`.
+
+## Q22: country filter below the prefix slice, and borrowed string ranges
+
+Two changes that only pay off together.
+
+**Adapter: filter before a leading slice.** When a filter reads a column
+`c = slice(s, 0, n)` only through LIKE-shaped tests (`contains`,
+`starts_with`, `ends_with` or literal alternatives) whose literal text is
+exactly `n` codepoints, each test becomes `like(s, 'L%')`. That is
+equivalent row by row, including nulls, because `c` has at most `n`
+codepoints. The filter is then applied below the slice, so Q22 slices
+419,974 phones instead of 1,500,000. A literal of another length, any other
+use of `c`, or a nonzero start keeps the original placement.
+
+**Runtime: ranged column kernels borrow String inputs.** For a partial
+row range, `evaluate_field` used to copy each referenced column with
+per-row `push_back` before calling a column kernel such as `like`. With the
+filter now fused into the scan's ranged path, Q22 paid that copy once per
+alternative, seven times per range. String columns are now passed as an
+external view that shares the source column's ownership.
+
+| Q22, SF10 median ms | neither | pushdown only | borrow only | both | Polars streaming |
+|---|---:|---:|---:|---:|---:|
+| eight threads | 116.4 | 123.1 | 118.5 | **88.4** | 79.8 |
+| one thread | 642.0 | 486.3 | 644.6 | **496.1** | 440.9 |
+
+Pushdown alone wins at one thread but loses at eight, where the ranged
+copies dominate. Borrowing alone does nothing for Q22. All 22 queries still
+match both Polars executors. An earlier in-process A/B that toggled the
+rewrite under one `IbexEngine` was invalid: the prepared-plan cache served
+the first translation to both arms. Compare states in separate processes.
+Samples are in `pdsh-performance-results/q22-prefix-pushdown.json`.
+
+Remaining at eight threads: the orders decode and the anti join (~48 ms).
+Applying the balance threshold before the anti join is next.

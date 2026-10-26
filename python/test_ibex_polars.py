@@ -382,6 +382,31 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(source.count("let _ibex_cache_"), 1)
         self.equal(query)  # bindings hold plans, not results from a prior collection
 
+    def test_prefix_tests_on_a_leading_slice_filter_before_slicing(self):
+        phones = ["13-abc", None, "", "1", "13", "x13", "31", "日本語", "日", "1_z", "12z", "%1"]
+        frame = pl.LazyFrame({"key": list(range(len(phones))), "phone": phones})
+        sliced = frame.with_columns(prefix=pl.col("phone").str.slice(0, 2))
+        for predicate in (pl.col("prefix").str.contains("13|31|日本|1_"),
+                          pl.col("prefix").str.starts_with("日本"),
+                          pl.col("prefix").str.ends_with("31") | (pl.col("key") > 10),
+                          ~pl.col("prefix").str.contains("13")):
+            with self.subTest(predicate=str(predicate)):
+                query = sliced.filter(predicate).select("key", "prefix")
+                self.equal(query)
+                source = self.engine.explain(query)
+                self.assertNotIn("like(`prefix`", source)
+                self.assertLess(source.index("like(`phone`"), source.index("substring("))
+        # An alternative of another length, any other use of the slice, or a
+        # nonzero start keeps the filter above the slice.
+        for query in (sliced.filter(pl.col("prefix").str.contains("13|134")),
+                      sliced.filter(pl.col("prefix").str.contains("13|x")),
+                      sliced.filter(pl.col("prefix").str.contains("13") | (pl.col("prefix") == "31")),
+                      frame.with_columns(prefix=pl.col("phone").str.slice(1, 2))
+                      .filter(pl.col("prefix").str.contains("3-"))):
+            with self.subTest(query=str(query)):
+                self.equal(query.select("key", "prefix"))
+                self.assertIn("like(`prefix`", self.engine.explain(query))
+
     def test_nested_caches_and_distinct_cache_identities(self):
         frame = pl.LazyFrame({"key": [1, 2, 3], "phone": ["13-abc", "31-def", None]})
         inner = frame.with_columns(prefix=pl.col("phone").str.slice(0, 2)).cache()

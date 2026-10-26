@@ -159,6 +159,13 @@ assert "polars" not in sys.modules
         with self.assertRaises(TypeError):
             bool(pl.col("x") > 1)
 
+    def test_filter_reductions_execute_in_one_native_call(self):
+        query = pl.DataFrame({"x": [1, 2, 9]}).lazy().filter(pl.col("x") > pl.mean("x"))
+        self.assertIn("scalar(", query.explain())
+        with patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as execute:
+            self.assertEqual(query.collect()["x"].to_list(), [9])
+            execute.assert_called_once()
+
     def test_reject_unsupported_before_execution(self):
         query = pl.DataFrame({"x": [1]}).lazy()
         with patch.object(ibex_pyarrow, "execute_pipeline") as execute:

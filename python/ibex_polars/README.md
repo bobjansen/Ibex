@@ -111,12 +111,16 @@ Supported operations include resident DataFrame scans, single local Parquet
 files, filters, projections, simultaneous row-local column updates, numeric
 sums/means, first/last reductions, non-null column counts, row counts,
 frame-sized scalar repeats, distinct rows, row slices, equality/cross joins,
-column-key grouping and sorting. Supported resident
+column-key grouping and sorting. Filter predicates can contain global reductions,
+such as `pl.col("revenue") == pl.col("revenue").max()`. All reductions in a
+filter read its current input, before any predicate is applied; a later filter
+reduces its own input. The complete query still executes in one native call.
+Supported resident
 types are Int8, Int16, Int32, Int64, UInt8, UInt16, Float32, Float64, Boolean,
 String, Date and Categorical. Resident Datetime and Duration columns are also
 supported as described below. Numeric
 coercion to Float64 and null predicates are supported. Windows, UDFs,
-computed grouping/sort keys, floating-point grouping keys, aggregate broadcasting other than row counts, expression top-k
+computed grouping/sort keys, aggregate broadcasting in projections/updates other than row counts, expression top-k
 operations, remote/multiple files, Enum, other numeric widths and nondefault scan
 policies are outside this slice. An already-sliced resident source is valid.
 Background, batch, async and sink execution are not implemented.

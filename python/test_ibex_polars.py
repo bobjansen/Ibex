@@ -424,6 +424,29 @@ class EngineTests(unittest.TestCase):
                     query = source.group_by(keys, maintain_order=True).agg(pl.sum("v"), pl.len())
                     self.equal(query)
 
+    def test_float_key_representatives_stream_and_preserve_original_bits(self):
+        import struct
+        nan_a = struct.unpack("d", struct.pack("Q", 0x7ff8000000000001))[0]
+        nan_b = struct.unpack("d", struct.pack("Q", 0x7ff8000000000002))[0]
+        for dtype in (pl.Float32, pl.Float64):
+            for zero in (-0.0, 0.0):
+                with self.subTest(dtype=dtype, zero=zero):
+                    frame = pl.LazyFrame({"x": pl.Series(
+                        [None, None, nan_a, nan_b, zero, -zero, 1.0, 1.0], dtype=dtype),
+                        "v": list(range(8))})
+                    query = frame.group_by("x", maintain_order=True).agg(
+                        pl.len().alias("n"), pl.sum("v"))
+                    result = self.equal(query)
+                    source = self.engine.explain(query)
+                    self.assertIn("first(`x`)", source)
+                    self.assertNotIn("first_null(`x`)", source)
+                    self.assertIsNone(result["x"][0])
+                    if dtype == pl.Float64:
+                        self.assertEqual(struct.pack("d", result["x"][1]), struct.pack("d", nan_a))
+                    self.assertEqual(struct.pack("d", result["x"][2]), struct.pack("d", zero))
+                    self.assertEqual(result["n"].to_list(), [2, 2, 2, 2])
+                    self.assertEqual(result["v"].to_list(), [1, 5, 9, 13])
+
     def test_extrema_and_distinct_counts_handle_nan_null_and_empty_groups(self):
         for values in ([], [None, None], [float("nan"), None],
                        [float("nan"), -1., float("inf"), -float("inf"), None, float("nan")]):

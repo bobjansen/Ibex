@@ -8,6 +8,7 @@
 #include <ibex/core/time.hpp>
 #include <ibex/format.hpp>
 #include <ibex/ir/builder.hpp>
+#include <ibex/ir/canonicalize.hpp>
 #include <ibex/ir/cardinality.hpp>
 #include <ibex/ir/distinct_key_reduction.hpp>
 #include <ibex/ir/expr_predicates.hpp>
@@ -5820,6 +5821,10 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
     // walking the plan -- but it runs here so it sees the shape the joins
     // and the FD reduction leave behind.
     rewritten = ir::reduce_duplicate_distinct_columns(std::move(rewritten));
+    // Join pushdown introduces new filters above each input's projection and
+    // column aliases. Normalize those wrappers again so scan planning sees
+    // predicates on the source's own columns, before decoding any payload.
+    rewritten = ir::canonicalize(std::move(rewritten));
     // Give the probe side of a self-referenced source its own name so its
     // decode can be deferred and bounded by the build side while the other
     // occurrence still reads the whole table (TPC-H q18).

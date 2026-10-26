@@ -281,14 +281,22 @@ class Adapter:
                 pattern = self.visitor.view_expression(value.input[1])
                 if type(pattern).__name__ != "Literal" or pattern.dtype != pl.String or not isinstance(pattern.value, str):
                     raise NotImplementedError("string matching requires a non-null literal pattern")
+                fragments = [pattern.value]
                 if name == "Contains":
                     if len(value.function_data) != 3 or type(value.function_data[1]) is not bool:
                         raise NotImplementedError("unsupported string contains options")
-                    if not value.function_data[1] and any(char in r".^$*+?{}[]\|()" for char in pattern.value):
-                        raise NotImplementedError("regular-expression operators in contains are unsupported")
+                    if not value.function_data[1]:
+                        # Temporary PDS compatibility: ordered literal pieces
+                        # separated by .* use LIKE %. Unlike regex dot, this
+                        # wildcard may also consume newlines. Other regex
+                        # operators retain the explicit unsupported boundary.
+                        fragments = pattern.value.split(".*")
+                        if any(char in r".^$*+?{}[]\|()" for part in fragments for char in part):
+                            raise NotImplementedError("regular-expression operators other than .* in contains are unsupported")
                 elif len(value.function_data) != 1:
                     raise NotImplementedError("unsupported string matching options")
-                escaped = "".join("\\" + char if char in "\\%_" else char for char in pattern.value)
+                escaped = "%".join("".join("\\" + char if char in "\\%_" else char for char in part)
+                                   for part in fragments)
                 pattern = ("%" if name != "StartsWith" else "") + escaped + ("%" if name != "EndsWith" else "")
                 expr = Expr("like", (args[0], ibex.lit(pattern)))
             elif name == "round" and len(args) == 1 and len(value.function_data) == 3:

@@ -255,21 +255,44 @@ class EngineTests(unittest.TestCase):
             self.equal(query)
 
     def test_literal_string_matching_escapes_like_metacharacters(self):
-        frame = pl.DataFrame({"s": ["abc", "a_c", "100%", "a\\b", "αβ", "a\nb", None, ""]})
+        frame = pl.DataFrame({"s": ["abc", "a_c", "100%", "a\\b", "αβ", "a\nb", "a.*b", None, ""]})
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "patterns.parquet"
             frame.write_parquet(path)
             for source in (frame.lazy(), pl.scan_parquet(path)):
-                for pattern in ("a", "_", "%", "\\", "α", "", "a\nb"):
+                for pattern in ("a", "_", "%", "\\", "α", "", "a\nb", "a.*b"):
                     for predicate in (pl.col("s").str.contains(pattern, literal=True),
                                       pl.col("s").str.starts_with(pattern),
                                       pl.col("s").str.ends_with(pattern)):
                         self.equal(source.select(predicate.alias("v")))
                         self.equal(source.filter(predicate))
                 self.equal(source.select(pl.col("s").str.contains("abc")))
-        for pattern in ("a.*b", "[", "^a", "a$"):
+        for pattern in ("a.b", "a*", "[", "^a", "a$", "a.*b+", "(?s)a.*b"):
             with self.assertRaisesRegex(NotImplementedError, "regular-expression"):
                 self.engine.prepare(frame.lazy().filter(pl.col("s").str.contains(pattern)))
+
+    def test_ordered_literal_patterns_use_like_wildcards(self):
+        frame = pl.DataFrame({"s": ["special requests", "requests special", "specialrequests",
+                                    "special x special requests", "Customer x Complaints",
+                                    "Complaints Customer", "ababc", "abc", "abxxab",
+                                    "_%xx100%", "xyxx100z", "αxβ", "", None]})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ordered.parquet"
+            frame.write_parquet(path)
+            for source in (frame.lazy(), pl.scan_parquet(path)):
+                for pattern in ("special.*requests", ".*Customer.*Complaints.*", "ab.*bc",
+                                "ab.*ab", "_%.*100%", "α.*β", ".*", "ab.*.*bc"):
+                    with self.subTest(source=str(type(source)), pattern=pattern):
+                        predicate = pl.col("s").str.contains(pattern)
+                        self.equal(source.select(predicate.alias("match")))
+                        self.equal(source.filter(~predicate))
+
+    def test_ordered_literal_like_temporarily_matches_across_newlines(self):
+        frame = pl.DataFrame({"s": ["special\nrequests", "special\rrequests",
+                                    "x\nspecial requests", None]}).lazy()
+        query = frame.select(pl.col("s").str.contains("special.*requests"))
+        self.assertEqual(query.collect(engine=self.engine)["s"].to_list(), [True, True, True, None])
+        self.assertEqual(query.collect(engine="streaming")["s"].to_list(), [False, True, True, None])
 
     def test_cache_markers_retain_subplans_and_date_years(self):
         frame = pl.DataFrame({"key": [1, 2, 3], "day": [date(1969, 12, 31), None, date(2000, 2, 29)]}).lazy()

@@ -1189,3 +1189,76 @@ Raw sources, samples, CPU timings and complete run metadata are in
 exact signed-rank statistics are in `all22-statistics-eight.json`. Six rounds
 provide a broad survey: small differences need more repeats before making
 per-query performance claims. No builds or tests ran during collection.
+
+### One thread
+
+Same Release bridge and Python translation, pinned to CPU 2, with six timed
+rounds and complete result checks for every query. Warm medians, milliseconds:
+
+| Query | Polars in-memory | Polars streaming | Polars–Ibex | Ibex / streaming |
+|---|---:|---:|---:|---:|
+| Q01 | 5,627.8 | 4,073.8 | 4,153.9 | 1.02× |
+| Q02 | 307.6 | 250.9 | 321.5 | 1.28× |
+| Q03 | 3,184.9 | 2,406.8 | 2,558.4 | 1.06× |
+| Q04 | 1,972.5 | 1,214.3 | 1,489.8 | 1.23× |
+| Q05 | 4,063.9 | 2,793.3 | 3,059.2 | 1.10× |
+| Q06 | 1,501.0 | 1,486.7 | 1,513.3 | 1.02× |
+| Q07 | 3,497.2 | 2,944.1 | 2,985.3 | 1.01× |
+| Q08 | 4,813.4 | 3,433.2 | 3,552.0 | 1.03× |
+| Q09 | 8,948.3 | 4,284.8 | 6,812.9 | 1.59× |
+| Q10 | 3,360.2 | 3,361.5 | 4,380.4 | 1.30× |
+| Q11 | 821.6 | 450.1 | 487.4 | 1.08× |
+| Q12 | 1,467.3 | 1,229.1 | 1,288.5 | 1.05× |
+| Q13 | 4,415.8 | 3,237.5 | 4,067.0 | 1.26× |
+| Q14 | 2,237.3 | 2,175.4 | 2,249.9 | 1.03× |
+| Q15 | 2,010.1 | 1,980.3 | 1,906.7 | 0.96× |
+| Q16 | 476.8 | 450.6 | 400.4 | 0.89× |
+| Q17 | 2,105.4 | 1,544.4 | 1,948.7 | 1.26× |
+| Q18 | 6,552.8 | 3,404.7 | 2,200.4 | 0.65× |
+| Q19 | 2,244.0 | 2,146.9 | 2,912.2 | 1.36× |
+| Q20 | 4,225.8 | 2,857.5 | 3,110.7 | 1.09× |
+| Q21 | 6,451.9 | 4,719.3 | 4,494.5 | 0.95× |
+| Q22 | 560.0 | 452.1 | 661.9 | 1.46× |
+
+The geometric mean of per-query runtime ratios is **0.84× versus in-memory
+Polars** and **1.10× versus streaming Polars**. Ibex has lower medians on
+16/22 queries versus in-memory Polars and 4/22 versus streaming Polars; these
+counts are descriptive and do not establish small per-query wins. Sums of
+individual query medians are 70.846 s, 50.897 s and 56.555 s for in-memory
+Polars, streaming Polars and Polars–Ibex respectively.
+
+**Q9 rerun:** the original single-thread Q9 interval coincided with an observed
+host load average above 30. Its medians inflated to 21.617 s, 11.837 s and
+18.063 s across the three executors, versus the earlier correctness-run
+collections of roughly 8.9 s, 4.3 s and 7.5 s. The entire six-round Q9
+comparison was repeated in a fresh process after load settled below 2; all
+three routes returned to the timings shown above, with all outputs matching.
+The table uses that complete rerun, without selecting individual samples.
+This observation does not identify which activity caused the slowdown.
+
+`all22-one.json` is the combined report with an explicit Q9 override record.
+`all22-one-original.json` preserves the original full run, and
+`all22-one-q09-rerun.json` preserves the separate comparison.
+`all22-statistics-one.json` records paired ratios, unadjusted exact signed-rank
+statistics and the calculation driver. All are in `pdsh-performance-results/`.
+No native executable or Python implementation changed between the two budgets
+or the Q9 rerun; current file hashes match both reports.
+
+### Scaling and remaining gaps
+
+Against streaming Polars, the geometric-mean ratio grows from 1.10× at one
+thread to 1.37× at eight. For example, Q10 scales 3.67× in Ibex versus 7.23×
+in streaming Polars; Q18 scales 2.40× versus 6.44×; Q22 scales 3.04× versus
+5.80×. These measurements show where the relative gap grows with the thread
+budget; they do not establish whether the cause is scheduling, serial work,
+contention, or a different algorithm. Q9 remains slower at both budgets
+(1.59× at one thread and 1.73× at eight).
+
+For the large single-thread Q18 advantage, a separate first-collection check
+uses one fresh Python process per executor, with preparation outside timing
+and full result validation afterward. It measures 6.546 s for in-memory
+Polars, 3.422 s for streaming Polars and 2.675 s for Polars–Ibex, versus
+warm medians of 6.553 s, 3.405 s and 2.200 s. The advantage persists but is
+smaller on a fresh process. This is one observation per executor, not a
+statistical estimate. The driver and results are in
+`pdsh-performance-results/all22-fresh-q18-one.json`.

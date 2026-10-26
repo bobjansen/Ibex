@@ -1,0 +1,59 @@
+{
+  "method": "One fresh Python process per executor; preparation outside timer; first collection only; warm file cache; complete comparison after timing. This is a single observation, not a median.",
+  "driver": "import argparse,importlib,json,os,sys,time\nfrom pathlib import Path\nimport polars as pl\nfrom ibex_polars import IbexEngine\nsys.path.insert(0,'/home/brj/code/polars-benchmark')\nfrom bench_pdsh_engine import assert_query_result\np=argparse.ArgumentParser();p.add_argument('--query',type=int,required=True);p.add_argument('--route',required=True);a=p.parse_args()\nos.environ['SCALE_FACTOR']='10'\nroot=Path('/home/brj/code/polars-benchmark/data/tables/scale-10.0')\nquery=importlib.import_module(f'queries.polars.q{a.query}').q(**{p.stem:pl.scan_parquet(p) for p in root.glob('*.parquet')})\nengine=IbexEngine().prepare(query) if a.route=='ibex' else a.route\nstart=time.perf_counter_ns(); cpu_start=time.process_time_ns();result=query.collect(engine=engine);cpu=(time.process_time_ns()-cpu_start)/1e6;elapsed=(time.perf_counter_ns()-start)/1e6\nreference=query.collect(engine='streaming' if a.route!='streaming' else 'in-memory');assert_query_result(a.query,result,reference)\nprint(json.dumps({'query':a.query,'route':a.route,'fresh_process_collect_ms':elapsed,'cpu_ms':cpu,'shape':result.shape,'correctness':'passed','affinity':sorted(os.sched_getaffinity(0)),'polars_threads':pl.thread_pool_size()}))\n",
+  "results": [
+    {
+      "query": 18,
+      "route": "in-memory",
+      "fresh_process_collect_ms": 6545.60241,
+      "cpu_ms": 6544.68717,
+      "shape": [
+        100,
+        6
+      ],
+      "correctness": "passed",
+      "affinity": [
+        2
+      ],
+      "polars_threads": 1
+    },
+    {
+      "query": 18,
+      "route": "streaming",
+      "fresh_process_collect_ms": 3422.225254,
+      "cpu_ms": 3421.527193,
+      "shape": [
+        100,
+        6
+      ],
+      "correctness": "passed",
+      "affinity": [
+        2
+      ],
+      "polars_threads": 1
+    },
+    {
+      "query": 18,
+      "route": "ibex",
+      "fresh_process_collect_ms": 2674.63757,
+      "cpu_ms": 2674.284194,
+      "shape": [
+        100,
+        6
+      ],
+      "correctness": "passed",
+      "affinity": [
+        2
+      ],
+      "polars_threads": 1
+    }
+  ],
+  "git_head": "187130d03b463ca67cf5b59e47b69d8cfd4e9123",
+  "bridge_sha256": "2a18fb19bb239cc933bd637d98fd959f12267bfc6c53223532d0ebbdac80f824",
+  "python_source_sha256": {
+    "python/ibex_polars/_adapter.py": "1c9b063c05beb775e94d02c51be76bbeab30f84baac251dc534eac3abea82e0c",
+    "python/ibex_polars/_engine.py": "00565e68a39b73216fc46b32bdedb61518004a80ca9d0d513e01016f9da3858f",
+    "python/ibex/_lower.py": "41c18447b218ea3a3e70ee211c8c4d10b2940dfb3bff0ccbbfe549dcf209b574",
+    "python/bench_pdsh_engine.py": "96e16597524ca3399c32ad53de1aefe76540220cf8fc0f73934462327f77455d"
+  }
+}

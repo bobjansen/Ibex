@@ -62,7 +62,9 @@ class WorkerPool {
         ~Batch();
 
         /// Blocks until every worker body has returned. Rethrows the first
-        /// exception (by worker id) that escaped a body. Idempotent.
+        /// exception (by worker id) that escaped a body. Idempotent. A stage
+        /// thread may execute queued tasks belonging to this batch while it
+        /// waits, without taking unrelated pipeline producers.
         void wait();
 
        private:
@@ -143,6 +145,7 @@ class WorkerPool {
     [[nodiscard]] auto try_run_one_pending() noexcept -> bool;
 
    private:
+    [[nodiscard]] auto try_run_one_for_batch(const Batch::State* state) noexcept -> bool;
     [[nodiscard]] auto submit_unbarriered(std::function<void()> body) -> Batch;
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -111,6 +111,9 @@ Supported operations include resident DataFrame scans, single local Parquet
 files, filters, projections, simultaneous row-local column updates, numeric
 sums/means, first/last reductions, non-null column counts, row counts,
 frame-sized scalar repeats, distinct rows, row slices, equality/cross joins,
+numeric inequality joins with a provably singleton input, filtered distinct
+counts over integer/Boolean/string values, Unicode string slices with literal
+offsets and nonnegative literal lengths,
 column-key grouping and sorting. Filter predicates can contain global reductions,
 such as `pl.col("revenue") == pl.col("revenue").max()`. All reductions in a
 filter read its current input, before any predicate is applied; a later filter
@@ -121,14 +124,15 @@ String, Date and Categorical. Resident Datetime and Duration columns are also
 supported as described below. Numeric
 coercion to Float64 and null predicates are supported. Windows, UDFs,
 computed grouping/sort keys, aggregate broadcasting in projections/updates other than row counts, expression top-k
-operations, remote/multiple files, Enum, other numeric widths and nondefault scan
+operations, general inequality joins, other filtered aggregates, remote/multiple files, Enum, other numeric widths and nondefault scan
 policies are outside this slice. An already-sliced resident source is valid.
 Background, batch, async and sink execution are not implemented.
 Struct and list columns are intentionally outside the project scope.
 
 As a temporary PDS compatibility rule, regex-mode `str.contains` accepts literal
 fragments separated by `.*` and lowers them to native LIKE `%` wildcards. Fragment
-order is preserved, and literal `%`/`_` characters are escaped. Unlike regex dot,
+order is preserved, and up to 256 literal alternatives separated by `|` use OR.
+Literal `%`/`_` characters are escaped. Unlike regex dot,
 these wildcards can cross newlines. Other regex operators, including anchors,
 character classes, escapes and flags, remain explicitly unsupported. Literal-mode
 `contains`, `starts_with` and `ends_with` retain their ordinary literal behavior.
@@ -145,6 +149,8 @@ the planner's result dtype. Safe widening casts and explicit integral casts
 with `wrap_numerical=True` are supported. Checked or null-producing casts that
 could overflow their destination range remain unsupported. UInt32 and UInt64
 inputs remain unsupported, for both resident tables and Parquet scans.
+UInt32 scalar literals are accepted for comparisons with count results; their
+values fit Int64 without introducing a native UInt32 input variant.
 
 Float32 inputs similarly widen once to Float64 for execution, including
 Parquet input. All arithmetic and reductions use Float64 intermediates; only

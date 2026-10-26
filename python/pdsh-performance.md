@@ -45,23 +45,22 @@ relevant alongside warm throughput.
 
 ## Coverage
 
-The adapter now supports **19 of 22 queries: Q1–Q10 and Q12–Q20**.
-The latest additions are Q13 and the locally corrected Q16, using the temporary
-literal-`.*` to LIKE translation described below. Q15 adds reduction broadcasting
-inside filters.
+The adapter now supports **all 22 queries**, checked against both Polars
+executors on SF10 at one and eight threads. The final additions are Q11 and Q22
+(numeric inequality joins with a provably singleton input), Q22's Unicode
+string slicing and literal alternatives, and Q21's filtered distinct counts.
+General inequality joins and other filtered aggregates remain unsupported.
+Q13 and the locally corrected Q16 use the temporary literal-`.*` to LIKE rule
+described below. Q15 adds reduction broadcasting inside filters.
 The preceding additions were Q7, Q8, Q9, Q10, Q14, Q17, Q19 and Q20. All eight
 additions pass complete result comparisons against both in-memory Polars and
 streaming Polars on unchanged SF10 Parquet inputs, with matched one- and
 eight-thread budgets. The earlier eight queries retain their correctness and
 performance evidence below. The new-query measurements are reported next.
 
-The remaining three queries fail explicitly before native execution. These are
-first blockers, not exhaustive inventories per query:
-
-| Queries | First translation blocker |
-|---|---|
-| Q11, Q22 | Inequality joins (`IEJoin`) |
-| Q21 | Expression-level filtered aggregation (`Filter`) |
+Coverage is for these query shapes and accepted boundary policies; it does not
+claim complete Polars API compatibility. Q16 retains the explicit local prefix
+correction, and the temporary LIKE approximation can match across newlines.
 
 Floating rounding now supports 0–15 decimal places, half-to-even and
 half-away-from-zero, nulls, non-finite values and signed zero. It guards native
@@ -78,9 +77,9 @@ for the native optimizer. Other visitor failures still propagate, cardinality
 validation remains checked, and there is no execution fallback to Polars.
 The original caller flags and prepared-plan cache keys remain unchanged.
 
-[Full SF10 checks and coverage](pdsh-performance-results/expanded-19-checks.json)
+[Full SF10 checks and coverage](pdsh-performance-results/complete-22-checks.json)
 retain complete-result check outcomes, generated sources, query hashes and
-mutation evidence. The Python suite passes 118 tests and 692 subtests.
+mutation evidence. The configured Python and upstream conformance tests pass.
 
 ## Newly supported queries: measurements
 
@@ -163,6 +162,85 @@ as the commands in Reproduction below. Use matched `IBEX_CORES` and
 0,2,4,6,8,10,12,14, and run the budgets sequentially. Rebuild the complete
 Release tree immediately before each run.
 
+## Completing the suite: Q11, Q21 and Q22
+
+All 22 queries now pass complete result comparisons on SF10 at one and eight
+threads. Q16 retains the local prefix correction documented above. The final
+translations are deliberately bounded:
+
+- Q11 and Q22's `IEJoin` nodes compare against a global one-row aggregate.
+  The adapter proves that at least one input has at most one row, then emits
+  a cross join plus numeric predicates. This is linear in the other input's
+  size. General many-row inequality joins still fail before native binding.
+- Q22's literal `|` alternatives become ORs of LIKE matches, capped at 256.
+  String slicing uses native Unicode-codepoint substring with an adjustment
+  for Polars' clipping of negative-start intervals.
+- Q21's filtered distinct count masks rejected values for native distinct
+  counting, then adds a separate flag for a selected null. Rejected rows and
+  null predicates do not introduce an extra distinct null. Other filtered
+  aggregates remain unsupported. UInt32 count literals use Int64 storage;
+  UInt32 input columns remain unsupported.
+
+Q21 exposed a native scheduler deadlock after translation. Multiple bounded
+scan producers occupied every pool thread, while a stage waited for queued
+workers of its own exhausted scan to retire. A waiting stage now assists only
+tasks from that exact batch, skipping unrelated producers that could park on
+another ring. A deterministic two-worker regression fails before the fix and
+passes afterward; it also covers unbarriered task groups. This fix applies to
+Ibex's runtime generally, without adding a language keyword or query special case.
+
+The benchmark runner now infers the query scale from `scale-N`, or accepts
+`--scale-factor`. Q11's upstream default was 1 even with SF10 files; its proper
+SF10 threshold produces **8,685 rows**, rather than the misleading empty result.
+Q11 sorts only by value: two part keys tied at 8,481,255.12 reverse order between
+Polars' own executors. Validation checks descending values and complete keyed
+rows, allowing only tie reordering for Q11; other queries retain strict order
+checks. No query is rewritten to add a tie-breaker.
+
+The newly admitted count literals also exercised an upstream zero-width-frame
+test. Export now preserves the native row count through a null-only height
+carrier before dropping its column, instead of losing height in Arrow-to-Polars
+conversion. All 2,378 fast CTest cases finish without failures, including the
+Python/upstream conformance tests; four network cases use their existing skip
+guards. Interpreter/transpiled parity also passes. GCC, WebAssembly and
+the required plugin rebuild/load check pass. The final lock-style cleanup
+produces a byte-identical native object.
+
+Warm collection medians, measured 2026-10-26 on the 3.2GHz host with SF10 query
+parameters. Twelve rounds balance all six execution orders after two warmups.
+Preparation and full correctness comparisons are outside timing. One thread
+uses CPU 2; eight use CPUs 0,2,4,6,8,10,12,14. Release was rebuilt before each
+measurement and no tests or builds ran alongside timing.
+
+| Threads | Query | Polars in-memory ms | Polars streaming ms | Polars–Ibex ms |
+|---|---|---:|---:|---:|
+| One | Q11 | 781 | 420 | 820 |
+| One | Q21 | 6,351 | 4,662 | 6,644 |
+| One | Q22 | 555 | 451 | 1,207 |
+| Eight | Q11 | 146 | 78 | 162 |
+| Eight | Q21 | 1,087 | 688 | 3,589 |
+| Eight | Q22 | 111 | 85 | 534 |
+
+Functional coverage is complete; performance parity is not. At eight threads,
+Q11 is 2.1× slower than streaming Polars, Q21 5.2× and Q22 6.3×. These are
+targets for further investigation, not resolved performance issues.
+
+The native filter/join regression fixture uses twelve interleaved pairs against
+`ca71a346`, the runtime before stage assistance. Its eight-case sum changes by
+-0.18% at one worker and -0.77% at eight. All cases fit the script's IQR noise
+band, but unadjusted paired Wilcoxon tests flag two small slowdowns: one-worker
+categorical join (median 7.2455 → 7.3465 ms; paired change +0.93%, p=0.021), and
+eight-worker OR filter (0.205 → 0.219 ms; paired change +4.43%, p=0.035).
+The one-worker integer join and AND filter improve in those tests. These
+per-case shifts remain recorded; a flat suite total does not resolve them.
+
+- [All 22 SF10 checks at both budgets](pdsh-performance-results/complete-22-checks.json)
+- [Final three queries, one thread](pdsh-performance-results/completion-three-one.json)
+- [Final three queries, eight threads](pdsh-performance-results/completion-three-eight.json)
+- [Native regression comparison](pdsh-performance-results/completion-native-regression.txt)
+- [Native paired samples and statistics](pdsh-performance-results/completion-native-statistics.json)
+- [Validation, scheduler diagnosis and profiles](pdsh-performance-results/completion-evidence.json)
+
 ## Q13 and Q16: temporary ordered-literal matching
 
 Regex-mode `contains` now recognizes literal fragments separated by `.*` and
@@ -178,7 +256,8 @@ benchmark checkout. The benchmark runner now captures local query patches as
 well as upstream HEAD and per-query source hashes, so the variation remains
 explicit. The full SF10 results of both queries match Polars at one and eight
 threads, as do the other 17 supported queries. All nine Python/conformance
-CTest groups pass. Remaining unsupported queries are Q11, Q21 and Q22.
+CTest groups pass. At this stage the remaining unsupported queries were Q11,
+Q21 and Q22; the completion above supersedes that coverage count.
 
 Warm medians on SF10, measured 2026-10-26 with twelve rounds, two warmups and
 all six execution orders balanced. The host remains locked at 3.2GHz; one
@@ -230,7 +309,7 @@ each measurement; no builds or tests ran alongside the timed collections.
 | One | 1,904 | 1,869 | 1,784 |
 | Eight | 284 | 261 | 284 |
 
-All 17 supported queries match both Polars executors on SF10 at one and eight
+At that stage, all 17 supported queries matched both Polars executors on SF10 at one and eight
 threads. All nine Python/conformance CTest groups pass. Regression tests cover
 ties, empty/all-null inputs, NaNs, scalar-only predicates, multiple reductions,
 consecutive-filter scope, temporary-name collisions and one-call execution.
@@ -755,7 +834,7 @@ here describe this i7-13700's P-core topology and need adapting on other hosts.
 
 The [runner](bench_pdsh_engine.py) records all 22 query outcomes in every report.
 Those initial timing reports covered three queries. There is no whole-suite
-performance score; current coverage and its 14 remaining blockers appear above.
+performance score; completed coverage and the subsequent measurements appear above.
 
 ## Comparison-policy follow-up
 

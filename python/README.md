@@ -155,7 +155,7 @@ remain unsupported. Every joined pipeline executes in one native call.
 
 For the full 22-query adapter coverage check and current scale-10 timings against
 both Polars executors, see [PDS-H engine performance](pdsh-performance.md).
-The engine now runs **Q1–Q10 and Q12–Q20 (19/22)**, checked on SF10 at one and
+The engine now runs **all 22 PDS-H queries**, checked on SF10 at one and
 eight workers. New translations include literal membership, conditionals,
 Boolean sums, basic string matching, Date years, deterministic cache markers,
 floating group keys, numeric extrema and null-inclusive distinct counts.
@@ -165,9 +165,12 @@ reductions inside filters: `revenue == revenue.max()` computes the reduction
 over the current input and preserves all maximum ties in one native call.
 Q13 and Q16 use a temporary translation of literal `.*` fragments to LIKE `%`;
 unlike regex dot, the wildcard also crosses newlines. Q16 uses the locally
-corrected `starts_with("MEDIUM POLISHED")` predicate. General regex support,
-inequality joins, mixed reduction/row projections and filtered aggregates remain
-unsupported; the linked report lists each query's first blocker.
+corrected `starts_with("MEDIUM POLISHED")` predicate. Q11/Q22 add numeric
+inequality joins when an input is provably at most one row, plus Unicode string
+slicing and literal alternatives. Q21 adds filtered distinct counts, including
+selected nulls but excluding rejected rows. General regex support, general
+inequality joins, mixed reduction/row projections and other filtered aggregates
+remain unsupported. The report records the accepted compatibility limits.
 Its native planning follow-up reduces eight-thread Q6 from 747 ms to 219 ms
 (Polars streaming: 189 ms), preserving Polars' NaN/null semantics.
 Membership simplification and shared streaming scan planning reduce Q12's

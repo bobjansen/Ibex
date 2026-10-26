@@ -160,6 +160,73 @@ as the commands in Reproduction below. Use matched `IBEX_CORES` and
 0,2,4,6,8,10,12,14, and run the budgets sequentially. Rebuild the complete
 Release tree immediately before each run.
 
+## Q19: projection and alias barriers
+
+The Q19 investigation identifies missing predicate pushdown before the join.
+Actual profiles at both one and eight threads show the adapter joining all
+**59,986,052 lineitems**, then retaining only **1,134 rows**. The join and wide
+payload assembly happen before the selective ship-mode, instruction and
+brand/container/quantity predicates. The read-only physical inspection shows
+three fused filter/update/project steps over `MaterializedInput(Join)`.
+
+The optimizer already implements Q19's disjunction implications in
+`src/ir/join_pushdown.cpp`: it can prefilter each input while retaining the
+original mixed predicate above an inner join. But its walker recognizes a
+Filter directly over Join. The adapter inserts projections and restores its
+internal column aliases with computed selections (Update + Project), so that
+shape is hidden. Canonicalization has no filter-through-Project rule, and its
+filter-through-Update rule deliberately declines predicates reading outputs
+of the update. Native Rename has an inverse map and an existing commute rule.
+
+Controlled equivalent sources isolate these barriers. Each run uses six
+alternating rounds, with preparation outside timing and every complete result
+checked against streaming Polars. No production implementation was changed.
+**The host frequency policy has changed since the published tables above:**
+these new runs use dynamic powersave/turbo settings rather than the previous
+3.2GHz lock. Compare columns within these diagnostic runs; their absolute
+values are not directly comparable to the earlier published baseline.
+
+| Diagnostic representation | One thread ms | Eight threads ms |
+|---|---:|---:|
+| Current adapter | 5,107 | 1,674 |
+| Remove only identity projections | 5,571 | 1,910 |
+| Compact equivalent source | 1,631 | 229 |
+| Polars streaming | 1,318 | 192 |
+
+The compact source uses the same scalar bindings, predicates, aggregate and
+rounding as the adapter, with the join/filter adjacent. It filters `part`
+to **4,754 rows**, joins to **3,052 lineitems**, then applies the original
+mixed predicate to retain the same **1,134 rows**. Its join output is about
+19,655× smaller; the profiles show the large materialization disappearing.
+Both one- and eight-thread profiles reproduce these row counts. Removing
+identity selections alone leaves the alias-update barriers and does not
+reduce the 60-million-row join.
+
+Two additional eight-thread controls isolate the individual wrappers:
+
+| Representation | Median ms |
+|---|---:|
+| Compact source | 237 |
+| Same source with one plain projection before its filter | 1,681 |
+| Same source with a native Rename on demanded discount | 230 |
+
+A separate paired control inserts just `update { ship_mode = l_shipmode }`
+and makes the predicate read `ship_mode`: it measures **1,674 ms** versus
+**230 ms** for the compact source. Thus both a Project and a column-alias
+Update can independently block the existing join rewrite.
+
+The appropriate shared-optimizer fix is to commute filters through
+projections when the predicate's columns remain in scope, and to remap
+predicates through safe column aliases. It must preserve scalar shadowing,
+unknown-column errors, computed/nonlocal update semantics, outer-join rules
+and join cardinality assertions. The existing disjunction pushdown can then
+perform the selective input filtering; no Q19-specific kernel is needed.
+
+[Diagnostic samples, generated sources, drivers, plans and actual profiles](pdsh-performance-results/q19-pushdown-investigation.json)
+retain the evidence. All successful variants return revenue **30,104,438.09**.
+One failed predicate-only native-rename trial is explicitly excluded from
+numerical conclusions; the archive records that separate demand-pruning issue.
+
 ## Earlier eight-query coverage
 
 The earlier extension covered compatible string representations, literal

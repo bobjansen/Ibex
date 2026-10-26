@@ -330,6 +330,20 @@ class EngineTests(unittest.TestCase):
         self.equal(frame.join(pl.DataFrame({"bound": []}, schema={"bound": pl.Float64}).lazy(), how="cross")
                    .filter(pl.col("x") > pl.col("bound")).sort("id"))
 
+    def test_filtered_distinct_counts_selected_nulls_only(self):
+        for values in ([None, 7, None, 8, 9, 9], [None, "a", None, "b", "c", "c"],
+                       [None, True, None, False, True, True]):
+            frame = pl.DataFrame({"g": [1, 1, 2, 2, 3, None], "x": values,
+                                  "ok": [True, True, False, None, False, True]}).lazy()
+            reduction = pl.col("x").filter(pl.col("ok")).n_unique().alias("n")
+            self.equal(frame.group_by("g").agg(reduction).sort("g"))
+            self.equal(frame.select(reduction))
+            self.equal(frame.head(0).select(reduction))
+            self.equal(frame.group_by("g").agg(reduction).filter(pl.col("n") > 0).sort("g"))
+        frame = pl.DataFrame({"x": [None, 1, 1], "ok": [False, True, True]}).lazy()
+        self.assertEqual(self.equal(frame.select(pl.col("x").filter(pl.col("ok")).n_unique())).item(), 1)
+        self.assertEqual(self.equal(frame.select(pl.col("x").filter(pl.lit(False)).n_unique())).item(), 0)
+
     def test_cache_markers_retain_subplans_and_date_years(self):
         frame = pl.DataFrame({"key": [1, 2, 3], "day": [date(1969, 12, 31), None, date(2000, 2, 29)]}).lazy()
         cached = frame.select("key", year=pl.col("day").dt.year()).cache()

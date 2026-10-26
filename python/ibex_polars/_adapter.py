@@ -127,7 +127,7 @@ class Adapter:
                 expr = ibex.lit(literal_ticks(value.value, value.dtype))
                 self.expressions[key] = expr
                 return expr
-            if value.dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64, pl.Boolean, pl.String, pl.Date):
+            if value.dtype not in (*_INTEGER_LAYOUTS, pl.UInt32, pl.Float32, pl.Float64, pl.Boolean, pl.String, pl.Date):
                 raise NotImplementedError(f"unsupported literal type {value.dtype}")
             expr = ibex.lit(value.value)
         elif kind == "BinaryExpr":
@@ -165,7 +165,11 @@ class Adapter:
             if value.name == "n_unique" and input_type in (*_INTEGER_LAYOUTS, pl.String, pl.Boolean):
                 if value.options not in (None, False):
                     raise NotImplementedError("unsupported distinct-count options")
-                expr = Expr("n_unique", (self.expression(value.arguments[0]),))
+                child = self.visitor.view_expression(value.arguments[0])
+                if type(child).__name__ == "Filter":
+                    expr = Expr("filtered_n_unique", (self.expression(child.input), self.expression(child.by)))
+                else:
+                    expr = Expr("n_unique", (self.expression(value.arguments[0]),))
                 self.expressions[key] = expr
                 return expr
             allowed = ("min", "max", "sum") if input_type.base_type() == pl.Duration else ("min", "max")

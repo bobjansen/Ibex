@@ -736,9 +736,11 @@ class Adapter:
                             Expr("case", (is_nan, ibex.lit(True), ibex.lit(False))).alias(flag),
                             Expr("case", (is_nan, ibex.lit(0.0), expr)).alias(normalized)))
                         keys.extend((flag, normalized))
-                        # Return an original key (including null) rather than
-                        # exposing the normalized helper values as labels.
-                        representatives.append(Expr("first", (expr,)).alias(expr._name))
+                        # Each normalized group contains either only nulls or
+                        # only non-null keys. Skipping nulls therefore preserves
+                        # the original first key, including NaN payloads and
+                        # signed zero, while allowing native streaming reducers.
+                        representatives.append(Expr("first_non_null", (expr,)).alias(expr._name))
                     else:
                         keys.append(expr._name)
                 frame = self._aggregate_rounding(

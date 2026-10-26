@@ -1392,3 +1392,30 @@ a separate general improvement: the earlier fix removed the offset array,
 but scalar argument construction and dispatch still occur per row.
 Cardinality counts, full-frame equivalence checks and the inspection driver
 are in `pdsh-performance-results/q22-remaining-evidence.json`.
+
+## Q22: substring bounds bound as scalars now take the direct plan
+
+A fresh profile on an idle host showed the serial substring update was
+the largest single cost (114 ms of a 177 ms customer statement at eight
+threads). That update was serial because of where its constants came from,
+not because of its kernel: the adapter binds `start` and `length` as
+scalars (`^_ibex_scalar_1`), and `make_direct_string_plan` accepted only
+`Int` literals. The update therefore declined the direct, prefix-assigned
+parallel string plan and ran the per-row scalar evaluator on one thread.
+Bound `Int` scalars are now resolved like literals. A column of the same
+name still shadows a non-lexical reference, and row-varying bounds still
+decline.
+
+| Q22, SF10 | Before | After | Polars streaming |
+|---|---:|---:|---:|
+| eight threads, median ms | 219.1 | 116.4 | 75.8 |
+| one thread, median ms | 651.9 | 642.0 | 443.1 |
+
+The customer statement falls from 177 ms to 65 ms at eight threads. The
+substring self time drops from 114 ms to 17 ms, and the update now uses the
+pool. The one-thread gain is small, which confirms the eight-thread win is
+parallelism and not a cheaper slice. The remaining eight-thread cost is the
+seven-LIKE country filter (~32 ms), the orders decode and the anti join
+(~48 ms together). The prefix-first and earlier-threshold rewrites above
+target those. Samples and profiles are in
+`pdsh-performance-results/q22-scalar-substring-bounds.json`.

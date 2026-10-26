@@ -355,6 +355,14 @@ class EngineTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             assert_query_result(11, reference.head(2), reference)
 
+    def test_zero_width_reduction_filters_preserve_result_height(self):
+        frame = pl.DataFrame({"x": [1, 2, 3]}).lazy().drop("x")
+        for threshold in (0, 2, 3, 5):
+            with self.subTest(threshold=threshold):
+                result = self.equal(frame.filter(pl.len() > threshold))
+                self.assertEqual(result.width, 0)
+                self.assertEqual(result.height, 3 if threshold < 3 else 0)
+
     def test_cache_markers_retain_subplans_and_date_years(self):
         frame = pl.DataFrame({"key": [1, 2, 3], "day": [date(1969, 12, 31), None, date(2000, 2, 29)]}).lazy()
         cached = frame.select("key", year=pl.col("day").dt.year()).cache()

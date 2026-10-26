@@ -1,0 +1,347 @@
+{
+  "git_head": "5ec3c8c6c381a207875e4b3855b3c85a283d6d5c",
+  "threads": "8",
+  "total_of_query_medians_ms": {
+    "polars": 11232.5243245,
+    "polars_streaming": 7313.951466,
+    "polars_ibex": 10754.2357445
+  },
+  "geomean_ibex_over_streaming": 1.3735980362816689,
+  "geomean_ibex_over_in_memory": 1.017119866685745,
+  "ibex_lower_median_than_streaming": 1,
+  "ibex_lower_median_than_in_memory": 12,
+  "queries": {
+    "q01": {
+      "median_ms": {
+        "polars": 813.3711785,
+        "polars_streaming": 569.264638,
+        "polars_ibex": 834.4971045
+      },
+      "median_cpu_ms": {
+        "polars": 6151.682178499999,
+        "polars_streaming": 4325.6664435,
+        "polars_ibex": 4739.588345
+      },
+      "paired_ibex_over_streaming": 1.4827616397877095,
+      "signed_rank_p_unadjusted": 0.03125,
+      "ibex_faster_pairs": 0
+    },
+    "q02": {
+      "median_ms": {
+        "polars": 50.4043485,
+        "polars_streaming": 64.02709300000001,
+        "polars_ibex": 71.96153799999999
+      },
+      "median_cpu_ms": {
+        "polars": 320.82868299999996,
+        "polars_streaming": 279.536674,
+        "polars_ibex": 349.51404549999995
+      },
+      "paired_ibex_over_streaming": 1.1259910384448633,
+      "signed_rank_p_unadjusted": 0.0625,
+      "ibex_faster_pairs": 1
+    },
+    "q03": {
+      "median_ms": {
+        "polars": 441.23673299999996,
+        "polars_streaming": 348.868381,
+        "polars_ibex": 407.224102
+      },
+      "median_cpu_ms": {
+        "polars": 3221.932551,
+        "polars_streaming": 2434.632531,
+        "polars_ibex": 2729.2800735
+      },
+      "paired_ibex_over_streaming": 1.1724308268734769,
+      "signed_rank_p_unadjusted": 0.03125,
+      "ibex_faster_pairs": 0
+    },
+    "q04": {
+      "median_ms": {
+        "polars": 307.1612055,
+        "polars_streaming": 173.3899025,
+        "polars_ibex": 260.8703245
+      },
+      "median_cpu_ms": {
+        "polars": 2152.4569425,
+        "polars_streaming": 1235.669288,
+        "polars_ibex": 1708.7427785
+      },
+      "paired_ibex_over_streaming": 1.4697621681848254,
+      "signed_rank_p_unadjusted": 0.03125,
+      "ibex_faster_pairs": 0
+    },
+    "q05": {
+      "median_ms": {
+        "polars": 529.4647514999999,
+        "polars_streaming": 384.9185575,
+        "polars_ibex": 469.50153950000004
+      },
+      "median_cpu_ms": {
+        "polars": 4001.2358665,
+        "polars_streaming": 2822.9381265,
+        "polars_ibex": 3224.4306045
+      },
+      "paired_ibex_over_streaming": 1.2238726534952185,
+      "signed_rank_p_unadjusted": 0.03125,
+      "ibex_faster_pairs": 0
+    },
+    "q06": {
+      "median_ms": {
+        "polars": 221.99434200000002,
+        "polars_streaming": 221.3199595,
+        "polars_ibex": 218.3694885
+      },
+      "median_cpu_ms": {
+        "polars": 1523.3242655,
+        "polars_streaming": 1509.7903070000002,
+        "polars_ibex": 1603.474841
+      },
+      "paired_ibex_over_streaming": 0.9848193008023227,
+      "signed_rank_p_unadjusted": 0.0625,
+      "ibex_faster_pairs": 5
+    },
+    "q07": {
+      "median_ms": {
+        "polars": 491.233878,
+        "polars_streaming": 407.17533249999997,
+        "polars_ibex": 512.347365
+      },
+      "median_cpu_ms": {
+        "polars": 3616.2513575000003,
+        "polars_streaming": 2978.037679,
+        "polars_ibex": 3364.496758
+      },
+      "paired_ibex_over_streaming": 1.2650326873293603,
+      "signed_rank_p_unadjusted": 0.03125,
+      "ibex_faster_pairs": 0
+    },
+    "q08": {
+      "median_ms": {
+        "polars": 604.3995905,
+        "polars_streaming": 457.0784235,
+        "polars_ibex": 521.2298195000001
+      },
+      "median_cpu_ms": {
+        "polars": 4557.4382935,
+        "polars_streaming": 3440.8172645,
+        "polars_ibex": 3641.595956
+      },
+      "paired_ibex_over_streaming": 1.1414733659259677,
+      "signed_rank_p_unadjusted": 0.03125,
+      "ibex_faster_pairs": 0
+    },
+    "q09": {
+      "median_ms": {
+        "polars": 1336.1865205,
+        "polars_streaming": 619.307855,
+        "polars_ibex": 1068.766244
+      },
+      "median_cpu_ms": {
+        "polars": 9345.537886,
+        "polars_streaming": 4471.3630164999995,
+        "polars_ibex": 7317.551486
+      },
+      "paired_ibex_over_streaming": 1.6798970508691142,
+      "signed_rank_p_unadjusted": 0.03125,
+      "ibex_faster_pairs": 0
+    },
+    "q10": {
+      "median_ms": {
+        "polars": 551.076736,
+        "polars_streaming": 465.2421395,
+        "polars_ibex": 1193.9507715
+      },
+      "median_cpu_ms": {
+        "polars": 3661.990664,
+        "polars_streaming": 3376.0937354999996,
+        "polars_ibex": 4493.983663999999
+      },
+      "paired_ibex_over_streaming": 2.597788615682681,
+      "signed_rank_p_unadjusted": 0.03125,
+      "ibex_faster_pairs": 0
+    },
+    "q11": {
+      "median_ms": {
+        "polars": 140.7465545,
+        "polars_streaming": 80.91889499999999,
+        "polars_ibex": 98.890522
+      },
+      "median_cpu_ms": {
+        "polars": 804.255322,
+        "polars_streaming": 527.061918,
+        "polars_ibex": 538.6974625
+      },
+      "paired_ibex_over_streaming": 1.22665820860791,
+      "signed_rank_p_unadjusted": 0.03125,
+      "ibex_faster_pairs": 0
+    },
+    "q12": {
+      "median_ms": {
+        "polars": 202.951838,
+        "polars_streaming": 177.614671,
+        "polars_ibex": 192.03632850000002
+      },
+      "median_cpu_ms": {
+        "polars": 1385.3033295,
+        "polars_streaming": 1210.0980305,
+        "polars_ibex": 1316.2282195
+      },
+      "paired_ibex_over_streaming": 1.0853690966483671,
+      "signed_rank_p_unadjusted": 0.03125,
+      "ibex_faster_pairs": 0
+    },
+    "q13": {
+      "median_ms": {
+        "polars": 837.1396745,
+        "polars_streaming": 437.455258,
+        "polars_ibex": 739.238134
+      },
+      "median_cpu_ms": {
+        "polars": 4333.9207895,
+        "polars_streaming": 3094.5767530000003,
+        "polars_ibex": 4388.4001575
+      },
+      "paired_ibex_over_streaming": 1.6838682503937172,
+      "signed_rank_p_unadjusted": 0.03125,
+      "ibex_faster_pairs": 0
+    },
+    "q14": {
+      "median_ms": {
+        "polars": 295.7215085,
+        "polars_streaming": 277.507967,
+        "polars_ibex": 323.844111
+      },
+      "median_cpu_ms": {
+        "polars": 2143.875226,
+        "polars_streaming": 2082.4278355,
+        "polars_ibex": 2235.8251105
+      },
+      "paired_ibex_over_streaming": 1.166331835290031,
+      "signed_rank_p_unadjusted": 0.03125,
+      "ibex_faster_pairs": 0
+    },
+    "q15": {
+      "median_ms": {
+        "polars": 275.033449,
+        "polars_streaming": 259.56501749999995,
+        "polars_ibex": 284.1031125
+      },
+      "median_cpu_ms": {
+        "polars": 1966.5803879999999,
+        "polars_streaming": 1903.6077085000002,
+        "polars_ibex": 1926.3527465
+      },
+      "paired_ibex_over_streaming": 1.0863498862527399,
+      "signed_rank_p_unadjusted": 0.03125,
+      "ibex_faster_pairs": 0
+    },
+    "q16": {
+      "median_ms": {
+        "polars": 95.088049,
+        "polars_streaming": 106.78540749999999,
+        "polars_ibex": 113.6579935
+      },
+      "median_cpu_ms": {
+        "polars": 555.2445305,
+        "polars_streaming": 558.196065,
+        "polars_ibex": 534.098076
+      },
+      "paired_ibex_over_streaming": 1.0486004869760925,
+      "signed_rank_p_unadjusted": 0.03125,
+      "ibex_faster_pairs": 0
+    },
+    "q17": {
+      "median_ms": {
+        "polars": 278.58682799999997,
+        "polars_streaming": 222.08232950000001,
+        "polars_ibex": 283.6775965
+      },
+      "median_cpu_ms": {
+        "polars": 1933.908253,
+        "polars_streaming": 1510.673358,
+        "polars_ibex": 1914.831509
+      },
+      "paired_ibex_over_streaming": 1.270755353728077,
+      "signed_rank_p_unadjusted": 0.03125,
+      "ibex_faster_pairs": 0
+    },
+    "q18": {
+      "median_ms": {
+        "polars": 1454.4076694999999,
+        "polars_streaming": 528.582922,
+        "polars_ibex": 915.0810715
+      },
+      "median_cpu_ms": {
+        "polars": 6795.003870500001,
+        "polars_streaming": 3814.918995,
+        "polars_ibex": 2983.1284355
+      },
+      "paired_ibex_over_streaming": 1.7329059869714807,
+      "signed_rank_p_unadjusted": 0.03125,
+      "ibex_faster_pairs": 0
+    },
+    "q19": {
+      "median_ms": {
+        "polars": 296.97099000000003,
+        "polars_streaming": 303.101904,
+        "polars_ibex": 405.78501500000004
+      },
+      "median_cpu_ms": {
+        "polars": 2273.7169685,
+        "polars_streaming": 2165.1960475,
+        "polars_ibex": 2974.0317535000004
+      },
+      "paired_ibex_over_streaming": 1.3426925136047982,
+      "signed_rank_p_unadjusted": 0.03125,
+      "ibex_faster_pairs": 0
+    },
+    "q20": {
+      "median_ms": {
+        "polars": 807.66974,
+        "polars_streaming": 440.327906,
+        "polars_ibex": 554.4741140000001
+      },
+      "median_cpu_ms": {
+        "polars": 4624.994866499999,
+        "polars_streaming": 3061.1805194999997,
+        "polars_ibex": 3527.3572635
+      },
+      "paired_ibex_over_streaming": 1.2882114738801103,
+      "signed_rank_p_unadjusted": 0.03125,
+      "ibex_faster_pairs": 0
+    },
+    "q21": {
+      "median_ms": {
+        "polars": 1092.8124965,
+        "polars_streaming": 691.5052775,
+        "polars_ibex": 1067.279597
+      },
+      "median_cpu_ms": {
+        "polars": 6755.301986,
+        "polars_streaming": 5028.7919765,
+        "polars_ibex": 6035.349999
+      },
+      "paired_ibex_over_streaming": 1.5325092016543929,
+      "signed_rank_p_unadjusted": 0.03125,
+      "ibex_faster_pairs": 0
+    },
+    "q22": {
+      "median_ms": {
+        "polars": 108.866243,
+        "polars_streaming": 77.911629,
+        "polars_ibex": 217.449852
+      },
+      "median_cpu_ms": {
+        "polars": 733.9802485,
+        "polars_streaming": 485.36739450000005,
+        "polars_ibex": 722.3809
+      },
+      "paired_ibex_over_streaming": 2.765165521287011,
+      "signed_rank_p_unadjusted": 0.03125,
+      "ibex_faster_pairs": 0
+    }
+  },
+  "statistics_method": "Median paired Ibex/streaming ratios; exact two-sided signed-rank sign enumeration, omitting zero differences and averaging tied absolute ranks. P values are unadjusted across queries. Six rounds provide only a broad comparison; small gaps are not established wins.",
+  "driver": "from pathlib import Path\nimport json,statistics,math,itertools\n\ndef signed_rank_p(before,after):\n    ds=[a-b for a,b in zip(after,before) if a!=b]\n    order=sorted(range(len(ds)),key=lambda i:abs(ds[i]));ranks=[0.]*len(ds)\n    i=0\n    while i<len(ds):\n        j=i+1\n        while j<len(ds) and abs(ds[order[j]])==abs(ds[order[i]]):j+=1\n        for k in order[i:j]:ranks[k]=(i+1+j)/2\n        i=j\n    observed=abs(sum(r if d>0 else -r for r,d in zip(ranks,ds)))\n    if not ds:return 1.\n    return sum(abs(sum(s*r for s,r in zip(ss,ranks)))>=observed for ss in itertools.product((-1,1),repeat=len(ds)))/(2**len(ds))\n\ndef summarize(path):\n    d=json.loads(Path(path).read_text());assert len(d['queries'])==22 and all(q['status']=='passed' for q in d['queries'].values())\n    qs=d['queries'];r={};totals={k:sum(q['median_ms'][k] for q in qs.values()) for k in ('polars','polars_streaming','polars_ibex')}\n    for name,q in qs.items():\n        ratios=[a/b for a,b in zip(q['samples_ms']['polars_ibex'],q['samples_ms']['polars_streaming'])]\n        r[name]={'median_ms':q['median_ms'],'median_cpu_ms':q['median_cpu_ms'],'paired_ibex_over_streaming':statistics.median(ratios),'signed_rank_p_unadjusted':signed_rank_p(q['samples_ms']['polars_streaming'],q['samples_ms']['polars_ibex']),'ibex_faster_pairs':sum(x<1 for x in ratios)}\n    return {'git_head':d['git_head'],'threads':d['ibex_cores'],'total_of_query_medians_ms':totals,'geomean_ibex_over_streaming':math.exp(statistics.mean(math.log(q['median_ms']['polars_ibex']/q['median_ms']['polars_streaming']) for q in qs.values())),'geomean_ibex_over_in_memory':math.exp(statistics.mean(math.log(q['median_ms']['polars_ibex']/q['median_ms']['polars']) for q in qs.values())),'ibex_lower_median_than_streaming':sum(q['median_ms']['polars_ibex']<q['median_ms']['polars_streaming'] for q in qs.values()),'ibex_lower_median_than_in_memory':sum(q['median_ms']['polars_ibex']<q['median_ms']['polars'] for q in qs.values()),'queries':r}\n\ndef table(s):\n    lines=['| Query | Polars in-memory | Polars streaming | Polars\u2013Ibex | Ibex / streaming |','|---|---:|---:|---:|---:|']\n    for n,q in s['queries'].items():\n        v=q['median_ms'];lines.append(f\"| {n.upper()} | {v['polars']:,.1f} | {v['polars_streaming']:,.1f} | {v['polars_ibex']:,.1f} | {v['polars_ibex']/v['polars_streaming']:.2f}\u00d7 |\")\n    return '\\n'.join(lines)\n\nif __name__=='__main__':\n    import sys\n    s=summarize(sys.argv[1]);Path(sys.argv[2]).write_text(json.dumps(s,indent=2)+'\\n');print(table(s));print(json.dumps({k:v for k,v in s.items() if k!='queries'},indent=2))\n"
+}

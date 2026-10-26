@@ -1126,3 +1126,66 @@ generated source, native bridge hashes, Python file hashes, paired samples
 and the comparison driver. `q22-cache-evidence.json` contains the profile,
 test summaries and paired statistics; `q22-cache-complete-{one,eight}.json`
 contain the complete-suite correctness checks.
+
+## Complete 22-query comparison after shared-cache lowering
+
+Measured 2026-10-26 at `5ec3c8c6`, with the complete Release tree rebuilt.
+SF10, i7-13700 locked to 3.2 GHz; eight threads pinned to physical P-cores
+0,2,4,6,8,10,12,14. All 22 query results match both Polars executors,
+including order and dtypes, with the previously documented Q11 tie rule.
+The agreed Q16 prefix correction and temporary literal-pattern compatibility
+remain in use; the upstream patch and source hashes are retained in the raw report.
+
+Each query prepares outside timing, collects once for validation, warms each
+route twice, then collects in six timed rounds covering all six executor
+orderings. Every measured result is checked in full. Parquet decode, native
+execution and public result export are timed; preparation, correctness checks
+and prior-result destruction are excluded. These are warm collection medians
+in milliseconds. First-per-query timings in the raw report are not
+fresh-process measurements.
+
+### Eight threads
+
+| Query | Polars in-memory | Polars streaming | Polars–Ibex | Ibex / streaming |
+|---|---:|---:|---:|---:|
+| Q01 | 813.4 | 569.3 | 834.5 | 1.47× |
+| Q02 | 50.4 | 64.0 | 72.0 | 1.12× |
+| Q03 | 441.2 | 348.9 | 407.2 | 1.17× |
+| Q04 | 307.2 | 173.4 | 260.9 | 1.50× |
+| Q05 | 529.5 | 384.9 | 469.5 | 1.22× |
+| Q06 | 222.0 | 221.3 | 218.4 | 0.99× |
+| Q07 | 491.2 | 407.2 | 512.3 | 1.26× |
+| Q08 | 604.4 | 457.1 | 521.2 | 1.14× |
+| Q09 | 1,336.2 | 619.3 | 1,068.8 | 1.73× |
+| Q10 | 551.1 | 465.2 | 1,194.0 | 2.57× |
+| Q11 | 140.7 | 80.9 | 98.9 | 1.22× |
+| Q12 | 203.0 | 177.6 | 192.0 | 1.08× |
+| Q13 | 837.1 | 437.5 | 739.2 | 1.69× |
+| Q14 | 295.7 | 277.5 | 323.8 | 1.17× |
+| Q15 | 275.0 | 259.6 | 284.1 | 1.09× |
+| Q16 | 95.1 | 106.8 | 113.7 | 1.06× |
+| Q17 | 278.6 | 222.1 | 283.7 | 1.28× |
+| Q18 | 1,454.4 | 528.6 | 915.1 | 1.73× |
+| Q19 | 297.0 | 303.1 | 405.8 | 1.34× |
+| Q20 | 807.7 | 440.3 | 554.5 | 1.26× |
+| Q21 | 1,092.8 | 691.5 | 1,067.3 | 1.54× |
+| Q22 | 108.9 | 77.9 | 217.4 | 2.79× |
+
+The geometric mean of per-query Ibex/Polars ratios is **1.02× versus in-memory
+Polars** and **1.37× versus streaming Polars** (larger means slower). Summing
+the 22 individual medians gives 11.233 s for Polars in-memory, 7.314 s for
+Polars streaming and 10.754 s for Polars–Ibex; this sum is not a separately
+timed sequential suite run. Ibex has a lower median than in-memory Polars
+on 12 queries. Only Q6 has a lower median than streaming Polars, and its
+small difference should not be treated as an established win.
+
+The largest relative gaps against streaming are Q22 (2.79×) and Q10 (2.57×),
+followed by Q9 and Q18 (both 1.73×). The largest absolute excess is Q10
+(729 ms), followed by Q9 (449 ms), Q18 (386 ms) and Q21 (376 ms). This
+comparison identifies priorities; it does not establish the causes of those costs.
+
+Raw sources, samples, CPU timings and complete run metadata are in
+`pdsh-performance-results/all22-eight.json`. Paired ratios and unadjusted
+exact signed-rank statistics are in `all22-statistics-eight.json`. Six rounds
+provide a broad survey: small differences need more repeats before making
+per-query performance claims. No builds or tests ran during collection.

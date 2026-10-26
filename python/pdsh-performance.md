@@ -227,6 +227,73 @@ retain the evidence. All successful variants return revenue **30,104,438.09**.
 One failed predicate-only native-rename trial is explicitly excluded from
 numerical conclusions; the archive records that separate demand-pruning issue.
 
+### Shared optimizer implementation
+
+The native canonicalizer now moves row-local filters through projections when
+every referenced column remains visible. It also inverse-maps predicates through
+unguarded bare-column copies. Computed outputs, alias dependencies, duplicate
+definitions, lexical copies and nonlocal expressions retain their barriers.
+Unqualified names hidden by a projection stay above it, preserving scalar scope
+and unknown-column errors. Existing join-kind and cardinality-assertion gates
+remain in force.
+
+After join pushdown, the REPL canonicalizes the new input filters again before
+scan planning. This lets scan predicates reach source columns through aliases
+and projections, avoiding eager payload decoding. The Python adapter and the
+upstream query remain unchanged.
+
+The broader SF10 check exposed a bounded-morsel scheduling deadlock in Q7:
+all pool workers could park on output backpressure while a downstream stage
+waited for its join-probe batch. Long morsel pipelines now reserve one pool
+worker, as streaming scan pipelines already do. A focused regression stops
+consuming a producer and verifies that downstream work can still finish;
+failure cancels the producer so the test itself cannot hang.
+
+All 16 supported SF10 queries match full Polars results at both one and eight
+threads. Regression coverage includes retained null payloads and inner, left,
+right and full joins, plus a lazy-source test that rejects unfiltered payload
+decodes. Full CTest passes all 2,378 cases, including interpreter/transpiled
+parity, with four network tests skipped by their existing guards. The
+WebAssembly runtime builds, and a CSV plugin rebuilt through
+`ibex-plugin-build.sh` loads and returns the expected aggregate.
+
+Production Q19 measurements use twelve paired rounds with all six execution
+orders balanced, two warmups, the original SF10 query, the same Python adapter
+and complete output checks after every collection. Release bridges were saved
+before the native changes and rebuilt in full before each measurement. The
+host was locked at 3.2GHz; one thread is pinned to CPU 2 and eight threads to
+CPUs 0,2,4,6,8,10,12,14. These affinity restrictions differ from the earlier
+unpinned cross-engine tables, so compare columns within this new paired run.
+
+| Threads | Before ms | After ms | Polars streaming ms | Ibex speedup |
+|---|---:|---:|---:|---:|
+| One | 22,058 | 5,579 | 4,313 | 4.0× |
+| Eight | 2,126 | 398 | 306 | 5.3× |
+
+At eight threads the remaining gap is 92 ms (30%), down from 1,820 ms.
+Every paired collection is faster after the change at both thread counts.
+Actual production profiles reproduce the **3,052-row join**, **1,134 retained
+rows** and revenue **30,104,438.09** at both budgets. These profiles validate
+cardinality; the paired warm runs above supply the timing comparison.
+
+- [One-thread production samples](pdsh-performance-results/q19-production-one.json)
+- [Eight-thread production samples](pdsh-performance-results/q19-production-eight.json)
+- [Native filter/join regression comparison](pdsh-performance-results/q19-native-regression.txt)
+- [Native paired samples and signed-rank statistics](pdsh-performance-results/q19-native-statistics.json)
+- [Correctness, profiles and mutation evidence](pdsh-performance-results/q19-production-evidence.json)
+
+The native regression fixture uses million-row resident inputs and twelve
+interleaved pairs at both budgets. Its eight-case sum moves by +0.04% at one
+worker and +0.65% at eight. The comparison script's IQR rule labels every case
+noise, but a paired Wilcoxon check detects an eight-worker categorical join
+regression: **1.6335 → 1.6960 ms** (ratio of medians +3.8%; median of paired
+ratios **+7.1%, p=0.0015**). The other native cases do not resolve at p<0.05.
+Both Q19 improvements have p=0.00049. The native join, chunked-join and
+physical-planner object files are byte-identical between builds, while linked
+code addresses move. Code layout is a possible explanation, not a demonstrated
+cause or a resolved regression. This small native cost remains recorded
+alongside the Q19 improvement.
+
 ## Earlier eight-query coverage
 
 The earlier extension covered compatible string representations, literal

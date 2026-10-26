@@ -1,0 +1,123 @@
+ONE WORKER (CPU 2)
+
+HEAD is now at fa364d20 Diagnose Q19 predicate pushdown barriers with controlled plans
+Benchmarking base:   fa364d20@fa364d20
+Benchmarking target: WORKTREE@c2caddf3 (dirty)
+Using warmup=2, iters=7, repeats=12, interleave=on, replica-control=off
+Compiler path prefix map: on
+Build cache: /tmp/q19-core-perfcmp
+Pinning: taskset -c 2
+Ibex suite: filter,join
+Building base ...
+  base: build dir cached, configure skipped
+Building target ...
+  target: build dir cached, configure skipped
+Interleaving repeats with balanced run positions
+  -> base repeat 1/12
+  -> target repeat 1/12
+  -> target repeat 2/12
+  -> base repeat 2/12
+  -> base repeat 3/12
+  -> target repeat 3/12
+  -> target repeat 4/12
+  -> base repeat 4/12
+  -> base repeat 5/12
+  -> target repeat 5/12
+  -> target repeat 6/12
+  -> base repeat 6/12
+  -> base repeat 7/12
+  -> target repeat 7/12
+  -> target repeat 8/12
+  -> base repeat 8/12
+  -> base repeat 9/12
+  -> target repeat 9/12
+  -> target repeat 10/12
+  -> base repeat 10/12
+  -> base repeat 11/12
+  -> target repeat 11/12
+  -> target repeat 12/12
+  -> base repeat 12/12
+
+base=fa364d20@fa364d20
+target=WORKTREE@c2caddf3 (dirty)
+prefix_map=on
+replica_binary=not-requested
+
+framework  query              base_ms  target_ms  delta_ms  delta_pct  speedup_x  base_iqr_ms  target_iqr_ms  verdict  base_samples  target_samples  rows     replica_delta_ms  replica_iqr_ms  replica_relation
+ibex       filter_and         1.0810   1.1575     +0.0765   +7.08%     0.934      0.0647       0.0630         noise    12            12              99005    -                 -               -
+ibex       filter_arith       2.0220   2.0285     +0.0065   +0.32%     0.997      0.0525       0.0615         noise    12            12              671378   -                 -               -
+ibex       filter_or          1.1490   1.1335     -0.0155   -1.35%     1.014      0.0263       0.0645         noise    12            12              115743   -                 -               -
+ibex       filter_simple      1.6250   1.6280     +0.0030   +0.18%     0.998      0.0457       0.0212         noise    12            12              499999   -                 -               -
+ibex       inner_join_symbol  7.3450   7.3095     -0.0355   -0.48%     1.005      0.0967       0.1073         noise    12            12              500164   -                 -               -
+ibex       inner_join_user    11.4840  11.5140    +0.0300   +0.26%     0.997      0.0985       0.1088         noise    12            12              1000000  -                 -               -
+ibex       join_filter_rank   30.8820  30.8675    -0.0145   -0.05%     1.000      0.1728       0.1823         noise    12            12              1260     -                 -               -
+ibex       join_update_group  14.8320  14.8070    -0.0250   -0.17%     1.002      0.0980       0.2235         noise    12            12              756      -                 -               -
+
+Summary (totals + medians + geometric mean speedup):
+scope  queries  total_base_ms  total_target_ms  total_delta_ms  total_delta_pct  median_base_ms  median_target_ms  median_delta_ms  median_delta_pct  median_speedup_x  geom_speedup_x  geom_samples
+ALL    8        70.4200        70.4455          +0.0255         +0.04%           4.6835          4.6690            -0.0058          +0.07%            0.999             0.993           8
+ibex   8        70.4200        70.4455          +0.0255         +0.04%           4.6835          4.6690            -0.0058          +0.07%            0.999             0.993           8
+
+Kept temporary directory: /tmp/ibex-perfcmp.XroVfM
+
+EIGHT WORKERS (CPUs 0,2,4,6,8,10,12,14)
+
+HEAD is now at fa364d20 Diagnose Q19 predicate pushdown barriers with controlled plans
+Benchmarking base:   fa364d20@fa364d20
+Benchmarking target: WORKTREE@c2caddf3 (dirty)
+Using warmup=2, iters=7, repeats=12, interleave=on, replica-control=off
+Compiler path prefix map: on
+Build cache: /tmp/q19-core-perfcmp
+Pinning: taskset -c 0,2,4,6,8,10,12,14
+Ibex suite: filter,join
+Building base ...
+  base: build dir cached, configure skipped
+Building target ...
+  target: build dir cached, configure skipped
+Interleaving repeats with balanced run positions
+  -> base repeat 1/12
+  -> target repeat 1/12
+  -> target repeat 2/12
+  -> base repeat 2/12
+  -> base repeat 3/12
+  -> target repeat 3/12
+  -> target repeat 4/12
+  -> base repeat 4/12
+  -> base repeat 5/12
+  -> target repeat 5/12
+  -> target repeat 6/12
+  -> base repeat 6/12
+  -> base repeat 7/12
+  -> target repeat 7/12
+  -> target repeat 8/12
+  -> base repeat 8/12
+  -> base repeat 9/12
+  -> target repeat 9/12
+  -> target repeat 10/12
+  -> base repeat 10/12
+  -> base repeat 11/12
+  -> target repeat 11/12
+  -> target repeat 12/12
+  -> base repeat 12/12
+
+base=fa364d20@fa364d20
+target=WORKTREE@c2caddf3 (dirty)
+prefix_map=on
+replica_binary=not-requested
+
+framework  query              base_ms  target_ms  delta_ms  delta_pct  speedup_x  base_iqr_ms  target_iqr_ms  verdict  base_samples  target_samples  rows     replica_delta_ms  replica_iqr_ms  replica_relation
+ibex       filter_and         0.2100   0.2245     +0.0145   +6.90%     0.935      0.0227       0.0300         noise    12            12              99005    -                 -               -
+ibex       filter_arith       0.3610   0.3630     +0.0020   +0.55%     0.994      0.0505       0.0620         noise    12            12              671378   -                 -               -
+ibex       filter_or          0.2170   0.2355     +0.0185   +8.53%     0.921      0.0373       0.0327         noise    12            12              115743   -                 -               -
+ibex       filter_simple      0.3005   0.2990     -0.0015   -0.50%     1.005      0.0300       0.0425         noise    12            12              499999   -                 -               -
+ibex       inner_join_symbol  1.6335   1.6960     +0.0625   +3.83%     0.963      0.0940       0.1090         noise    12            12              500164   -                 -               -
+ibex       inner_join_user    9.1785   9.2445     +0.0660   +0.72%     0.993      0.1795       0.2508         noise    12            12              1000000  -                 -               -
+ibex       join_filter_rank   13.8210  13.8505    +0.0295   +0.21%     0.998      0.1273       0.2140         noise    12            12              1260     -                 -               -
+ibex       join_update_group  10.3170  10.3600    +0.0430   +0.42%     0.996      0.2302       0.1743         noise    12            12              756      -                 -               -
+
+Summary (totals + medians + geometric mean speedup):
+scope  queries  total_base_ms  total_target_ms  total_delta_ms  total_delta_pct  median_base_ms  median_target_ms  median_delta_ms  median_delta_pct  median_speedup_x  geom_speedup_x  geom_samples
+ALL    8        36.0385        36.2730          +0.2345         +0.65%           0.9972          1.0295            +0.0240          +0.64%            0.994             0.975           8
+ibex   8        36.0385        36.2730          +0.2345         +0.65%           0.9972          1.0295            +0.0240          +0.64%            0.994             0.975           8
+
+Kept temporary directory: /tmp/ibex-perfcmp.5cXyvU

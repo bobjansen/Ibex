@@ -417,6 +417,29 @@ TEST_CASE("evaluate_field over a partial range matches evaluating a gathered ran
     }
 }
 
+TEST_CASE("a ranged string kernel reads a borrowed view of an offset source",
+          "[filter][range]") {
+    // A partial range borrows String columns instead of copying them. When the
+    // source is itself a view starting mid-buffer, the borrowed window must
+    // start at the source's offset plus the range's, not at the range alone.
+    constexpr std::size_t kRows = 200;
+    constexpr std::size_t kSkip = 37;
+    auto owned = std::make_shared<Column<std::string>>();
+    for (std::size_t i = 0; i < kRows + kSkip; ++i) {
+        owned->push_back(i % 3 == 0 ? "13-" + std::to_string(i) : "31-" + std::to_string(i));
+    }
+    const auto& base = *owned;
+    runtime::Table table;
+    table.add_column("phone", Column<std::string>::from_external(owned, base.offsets_buffer_data(),
+                                                                 base.chars_buffer_data(), kSkip,
+                                                                 kRows));
+    const auto expr = call("like", {col_ref("phone"), slit("13%")});
+    for (const RowRange rows : {RowRange{.begin = 0, .count = 64}, RowRange{.begin = 5, .count = 7},
+                                RowRange{.begin = 130, .count = 70}}) {
+        check_field_range(table, *expr, rows, "like over an offset view");
+    }
+}
+
 TEST_CASE("a column-kernel leaf is never spliced under a partial range", "[filter][range]") {
     // `try_splice_column_leaf` evaluates its kernel over the WHOLE table, so it
     // must decline for every partial range — including one that begins at zero,

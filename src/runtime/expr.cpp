@@ -2991,6 +2991,25 @@ auto eval_call_columns(const ir::CallExpr& call, const ir::Expr& expr, const Tab
 // update_table and windowed_update_table (and through them the grouped,
 // guarded, and chunked variants), scalars, `map`, and evaluate_field_column all
 // dispatch here.
+namespace {
+
+/// A String range is borrowed, not copied: per-row appends were the cost of a
+/// ranged `like` (Q22 copied its phone column once per alternative). The view
+/// shares the source column's ownership, so a kernel that hands an argument
+/// back as its result cannot outlive the data it reads.
+auto borrow_or_gather_range(const ColumnEntry& entry, RowRange range) -> ColumnValue {
+    if (const auto* strings = std::get_if<Column<std::string>>(entry.column.get())) {
+        return with_meta_of(Column<std::string>::from_external(
+                                std::shared_ptr<const void>(entry.column),
+                                strings->offsets_buffer_data(), strings->chars_buffer_data(),
+                                strings->buffer_offset() + range.begin, range.count),
+                            *entry.column);
+    }
+    return gather_range(*entry.column, range.begin, range.end());
+}
+
+}  // namespace
+
 auto evaluate_field(const ir::Expr& expr, const Table& input, RowRange range,
                     const ColumnEvalCtx& ctx) -> std::expected<ComputedColumn, std::string> {
     const std::size_t table_rows = input.rows();
@@ -3012,7 +3031,7 @@ auto evaluate_field(const ir::Expr& expr, const Table& input, RowRange range,
                     continue;
                 }
                 if (const auto* entry = input.find_entry(ref.name)) {
-                    auto column = gather_range(*entry->column, range.begin, range.end());
+                    auto column = borrow_or_gather_range(*entry, range);
                     if (auto validity =
                             gather_validity(entry->validity, range.begin, range.end())) {
                         slice.add_column(ref.name, std::move(column), std::move(*validity));

@@ -61,6 +61,31 @@ def _wrap_integer(expr, dtype):
     return expr if bits == 64 else Expr("wrap_integer", (expr, bits, signed))
 
 
+def _like_literal(pattern):
+    """The literal text of a LIKE pattern that is X, X%, %X or %X% with no
+    other wildcard, or None. Backslash escapes as the adapter emits them."""
+    tokens, index = [], 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "\\" and index + 1 < len(pattern):
+            tokens.append((pattern[index + 1], False))
+            index += 2
+            continue
+        tokens.append((char, char in "%_"))
+        index += 1
+    if tokens and tokens[0] == ("%", True):
+        tokens = tokens[1:]
+    if tokens and tokens[-1] == ("%", True):
+        tokens = tokens[:-1]
+    if any(wildcard for _, wildcard in tokens):
+        return None
+    return "".join(char for char, _ in tokens)
+
+
+class _NoPrefixRewrite(Exception):
+    pass
+
+
 def check_version():
     if pl.__version__ != POLARS_VERSION:
         raise NotImplementedError(f"IbexEngine supports Polars {POLARS_VERSION}; found {pl.__version__}")
@@ -520,6 +545,69 @@ class Adapter:
         finally:
             self.visitor.set_node(previous)
 
+    def _filter_below_prefix_slice(self, input_id, predicate):
+        """Apply a filter below a leading string slice it only tests by prefix.
+
+        With c = slice(s, 0, n), c has at most n codepoints, so matching a
+        literal of exactly n codepoints anywhere in c (or at either end, or
+        exactly) is the same as s starting with it, nulls included. The
+        filter then runs before the slice, which only sees surviving rows.
+        Any other use of a computed column keeps the original placement.
+        """
+        projections, current = [], input_id
+        while True:
+            self.visitor.set_node(current)
+            node = self.visitor.view_current_node()
+            if type(node).__name__ == "SimpleProjection":
+                projections.append(current)
+                current = node.input
+            elif type(node).__name__ == "HStack":
+                break
+            else:
+                return None
+        hstack_id, hstack = current, node
+        self.visitor.set_node(hstack.input)
+        expressions = tuple(self.named(expr) for expr in hstack.exprs)
+        computed = {expr._args[1] for expr in expressions}
+        slices = {}
+        for expr in expressions:
+            value = expr._args[0]
+            if value._op != "substring" or len(value._args) != 3:
+                continue
+            source, offset, length = value._args
+            if (source._op == "col" and source._args[0] not in computed and
+                    offset._op == "lit" and type(offset._args[0]) is int and offset._args[0] == 0 and
+                    length._op == "lit" and type(length._args[0]) is int and length._args[0] >= 0):
+                slices[expr._args[1]] = (source._args[0], length._args[0])
+        if not slices:
+            return None
+
+        def rewrite(expr):
+            if expr._op == "like" and expr._args[0]._op == "col" and expr._args[0]._args[0] in slices:
+                pattern = expr._args[1]
+                text = (_like_literal(pattern._args[0]) if pattern._op == "lit" and
+                        isinstance(pattern._args[0], str) else None)
+                source, length = slices[expr._args[0]._args[0]]
+                if text is None or len(text) != length:
+                    raise _NoPrefixRewrite
+                escaped = "".join("\\" + char if char in "\\%_" else char for char in text)
+                return Expr("like", (ibex.col(source), ibex.lit(escaped + "%")))
+            if expr._op == "col" and expr._args[0] in computed:
+                raise _NoPrefixRewrite
+            return Expr(expr._op, tuple(rewrite(arg) if isinstance(arg, Expr) else arg for arg in expr._args))
+
+        try:
+            rewritten = rewrite(predicate)
+        except _NoPrefixRewrite:
+            return None
+        frame = self.frame(hstack.input).filter(rewritten)
+        self.visitor.set_node(hstack_id)
+        frame = self._hstack(frame, expressions, list(self.visitor.get_schema()), hstack_id)
+        for node_id in reversed(projections):
+            self.visitor.set_node(node_id)
+            frame = frame.select(list(self.visitor.get_schema()))
+        return frame
+
     def frame(self, node_id):
         if node_id in self.nodes:
             return self.nodes[node_id]
@@ -696,7 +784,9 @@ class Adapter:
             # or casts can change a column's logical dtype.
             self.visitor.set_node(node.input)
             if kind == "Filter":
-                frame = frame.filter(self.expression(node.predicate.node))
+                predicate = self.expression(node.predicate.node)
+                pushed = self._filter_below_prefix_slice(node.input, predicate)
+                frame = pushed if pushed is not None else frame.filter(predicate)
             elif kind == "SimpleProjection":
                 frame = frame.select(list(schema))
             elif kind == "Select":

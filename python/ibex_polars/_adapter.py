@@ -66,6 +66,24 @@ def check_version():
         raise NotImplementedError(f"IbexEngine supports Polars {POLARS_VERSION}; found {pl.__version__}")
 
 
+def _at_most_one_row(frame):
+    """Conservative bound: never expand a general inequality join to N*M."""
+    one = frame._source[0] == "table" and frame._source[1].num_rows <= 1
+    for operation, args in frame._steps:
+        if operation == "select" and all(expr._aggregate and not expr._row_reference for expr in args):
+            one = True  # global reductions produce one row, including empty input
+        elif operation == "join":
+            other, _, _, how, *_ = args
+            one = one and (how in ("semi", "anti") or
+                           (how != "full" and _at_most_one_row(other)))
+        elif operation == "slice" and args[1] is not None and 0 <= args[1] <= 1:
+            one = True
+        elif operation not in ("select", "filter", "update", "hstack", "aggregate", "slice",
+                                "python_slice", "sort", "unique"):
+            return False
+    return one
+
+
 def flag_key(flags):
     # QueryOptFlags has no value repr/hash. Its Rust options expose the actual
     # Boolean settings, including private flags absent from public properties.
@@ -597,6 +615,43 @@ class Adapter:
             if node.predicate is not None:
                 frame = frame.filter(self.expression(node.predicate.node))
             frame = frame.select(list(schema))
+        elif kind == "Join" and isinstance(node.options[0], tuple) and node.options[0][0] == "IEJoin":
+            how, nulls_equal, slice_, suffix, coalesce, maintain_order = node.options
+            operators = {"Lt": "<", "LtEq": "<=", "Gt": ">", "GtEq": ">="}
+            if len(how) != 3 or nulls_equal or coalesce or maintain_order != "none":
+                raise NotImplementedError(f"unsupported inequality join options {node.options}")
+            comparisons = [op for op in how[1:] if op is not None]
+            if len(node.left_on) != len(comparisons) or len(node.right_on) != len(comparisons):
+                raise NotImplementedError("unsupported inequality join key layout")
+            left, right = self.frame(node.input_left), self.frame(node.input_right)
+            if not (_at_most_one_row(left) or _at_most_one_row(right)):
+                raise NotImplementedError("inequality joins require an input with at most one row")
+            self.visitor.set_node(node.input_left)
+            left_columns = tuple(self.visitor.get_schema())
+            left_keys = [self.expression(key.node) for key in node.left_on]
+            left_types = [self.visitor.get_dtype(key.node) for key in node.left_on]
+            self.visitor.set_node(node.input_right)
+            right_columns = tuple(self.visitor.get_schema())
+            right_keys = [self.expression(key.node) for key in node.right_on]
+            right_types = [self.visitor.get_dtype(key.node) for key in node.right_on]
+            if any(dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64) for dtype in left_types + right_types):
+                raise NotImplementedError("inequality join keys currently require numeric operands")
+            rename = {name: name + suffix if name in left_columns else name for name in right_columns}
+            def rename_right(expr):
+                if expr._op == "col":
+                    return ibex.col(rename[expr._args[0]])
+                return Expr(expr._op, tuple(rename_right(arg) if isinstance(arg, Expr) else arg for arg in expr._args))
+            predicates = []
+            for op, lhs, rhs in zip(comparisons, left_keys, right_keys):
+                operator = operators.get(str(op).split(".")[-1])
+                if operator is None or lhs._aggregate or rhs._aggregate:
+                    raise NotImplementedError("unsupported inequality join comparison")
+                predicates.append(Expr("polars_" + operator, (lhs, rename_right(rhs))))
+            self._check_join_validation()
+            frame = left.join(right, how="cross", suffix=suffix,
+                              _left_columns=left_columns, _right_columns=right_columns).filter(*predicates)
+            if slice_ is not None:
+                frame = frame.slice(*slice_)
         elif kind == "Join":
             how, nulls_equal, slice_, suffix, coalesce, maintain_order = node.options
             if not isinstance(how, str):

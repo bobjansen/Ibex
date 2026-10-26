@@ -308,6 +308,28 @@ class EngineTests(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "256"):
             self.engine.prepare(frame.filter(pl.col("s").str.contains("|".join(["a"] * 257))))
 
+    def test_inequality_join_against_scalar_aggregate(self):
+        frame = pl.DataFrame({"x": [1.0, 2.0, None, float("nan"), 4.0], "id": [1, 2, 3, 4, 5]}).lazy()
+        for threshold in (pl.DataFrame({"x": [2.0]}).lazy(),
+                          pl.DataFrame({"x": [2.0, 4.0]}).lazy().select(pl.col("x").mean()),
+                          pl.DataFrame({"x": []}, schema={"x": pl.Float64}).lazy().select(pl.col("x").mean())):
+            for operator in (lambda a,b: a > b, lambda a,b: a >= b,
+                             lambda a,b: a < b, lambda a,b: a <= b):
+                query = frame.join(threshold, how="cross", suffix="_bound").filter(
+                    operator(pl.col("x"), pl.col("x_bound"))).sort("id")
+                self.equal(query)
+        general = frame.join(pl.DataFrame({"y": [1.0, 2.0]}).lazy(), how="cross").filter(pl.col("x") > pl.col("y"))
+        with patch.object(ibex_pyarrow, "bind_table", wraps=ibex_pyarrow.bind_table) as bind:
+            with self.assertRaisesRegex(NotImplementedError, "at most one row"):
+                self.engine.prepare(general)
+            bind.assert_not_called()
+        bounds = pl.DataFrame({"lo": [1.5], "hi": [4.0]}).lazy()
+        self.equal(frame.join(bounds, how="cross").filter(
+            (pl.col("x") > pl.col("lo")) & (pl.col("x") < pl.col("hi"))).sort("id"))
+        self.equal(bounds.join(frame, how="cross").filter(pl.col("hi") > pl.col("x")).sort("id"))
+        self.equal(frame.join(pl.DataFrame({"bound": []}, schema={"bound": pl.Float64}).lazy(), how="cross")
+                   .filter(pl.col("x") > pl.col("bound")).sort("id"))
+
     def test_cache_markers_retain_subplans_and_date_years(self):
         frame = pl.DataFrame({"key": [1, 2, 3], "day": [date(1969, 12, 31), None, date(2000, 2, 29)]}).lazy()
         cached = frame.select("key", year=pl.col("day").dt.year()).cache()

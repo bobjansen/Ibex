@@ -36,7 +36,9 @@ namespace ibex::ir {
 ///  R12. `Filter(Update(x))`          → `Update(Filter(x))`        — only when the Update is
 ///                                                                   row-local AND the predicate
 ///                                                                   references no column the
-///                                                                   Update produces.
+///                                                                   Update produces, or can be
+///                                                                   remapped through unguarded
+///                                                                   independent column copies.
 ///  R13. `Head(m, Head(n, x))`        → `Head(min(m,n), x)`         — both group_by empty.
 ///  R14. `Tail(m, Tail(n, x))`        → `Tail(min(m,n), x)`         — both group_by empty.
 ///  R15. `Order(Filter(... AND col==K AND ..., x))` drops `col` from Order keys (pinned by
@@ -66,6 +68,9 @@ namespace ibex::ir {
 ///       subset of the inner Project's, so dropping the inner Project is sound
 ///       and removes a redundant schema pass — particularly useful after R20
 ///       inserts a pruning Project below a Filter.
+///  R22. `Filter(Project(x))` → `Project(Filter(x))` for subset-evaluable predicates
+///       whose non-lexical column references all survive the projection. Hidden
+///       input columns must not shadow an unqualified scalar binding.
 ///
 /// Pure on IR: takes ownership and returns the rewritten tree. The emitted
 /// operator tree is identical to what `build_operator` would produce via its

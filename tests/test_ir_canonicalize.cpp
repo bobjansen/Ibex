@@ -298,13 +298,21 @@ TEST_CASE("canonicalize R12: Filter(Update(x)) sinks when predicate is independe
     REQUIRE(out->children().front()->children().front()->kind() == ir::NodeKind::Scan);
 }
 
-TEST_CASE("canonicalize R12: Filter(Update(x)) preserved when predicate reads update output",
+TEST_CASE("canonicalize R12: Filter(Update(x)) preserved when predicate reads computed output",
           "[ir][canonicalize]") {
     // Predicate references "b", which the update produces — swapping would
     // change the predicate's value.
+    std::vector<ir::FieldSpec> fields;
+    fields.push_back(
+        {.alias = "b",
+         .expr = ir::Expr{ir::BinaryExpr{
+             .op = ir::ArithmeticOp::Add,
+             .left = ir::make_expr_ptr(ir::Expr{ir::ColumnRef{.name = "raw_b"}}),
+             .right = ir::make_expr_ptr(ir::Expr{ir::Literal{.value = std::int64_t{1}}})}}});
     auto tree =
         with_child(make_filter_cmp_col({1}, "b", 500),
-                   with_child(make_update_row_local({2}, "b", "raw_b"), make_scan({3}, "t")));
+                   with_child(std::make_unique<ir::UpdateNode>(ir::NodeId{2}, std::move(fields)),
+                              make_scan({3}, "t")));
     auto out = ir::canonicalize(std::move(tree));
     REQUIRE(out->kind() == ir::NodeKind::Filter);
     REQUIRE(out->children().front()->kind() == ir::NodeKind::Update);
@@ -677,4 +685,93 @@ TEST_CASE("canonicalize R20: Aggregate(Order(x)) prunes without looping (regress
     REQUIRE(order.children().front()->kind() == ir::NodeKind::Project);
     const auto& project = *order.children().front();
     REQUIRE(project.children().front()->kind() == ir::NodeKind::Scan);
+}
+
+TEST_CASE("canonicalize R22: filters pass projections only with preserved scope",
+          "[ir][canonicalize][projection_filter]") {
+    SECTION("referenced columns survive") {
+        auto tree = with_child(make_filter({1}),
+                               with_child(make_project({2}, {"x", "y"}), make_scan({3}, "t")));
+        auto out = ir::canonicalize(std::move(tree));
+        REQUIRE(out->kind() == ir::NodeKind::Project);
+        REQUIRE(out->children().front()->kind() == ir::NodeKind::Filter);
+        REQUIRE(out->children().front()->children().front()->kind() == ir::NodeKind::Scan);
+    }
+    SECTION("hidden input column or unqualified scalar cannot become visible") {
+        auto tree =
+            with_child(make_filter({1}), with_child(make_project({2}, {"y"}), make_scan({3}, "t")));
+        auto out = ir::canonicalize(std::move(tree));
+        REQUIRE(out->kind() == ir::NodeKind::Filter);
+    }
+    SECTION("explicit lexical binding remains lexical") {
+        ir::CompareExpr cmp{
+            .op = ir::CompareOp::Eq,
+            .left = ir::make_expr_ptr(ir::Expr{ir::ColumnRef{.name = "x", .lexical = true}}),
+            .right = ir::make_expr_ptr(ir::Expr{ir::Literal{.value = std::int64_t{1}}})};
+        auto filter = std::make_unique<ir::FilterNode>(ir::NodeId{1}, ir::Expr{std::move(cmp)});
+        auto out = ir::canonicalize(with_child(
+            std::move(filter), with_child(make_project({2}, {"y"}), make_scan({3}, "t"))));
+        REQUIRE(out->kind() == ir::NodeKind::Project);
+        const auto& predicate =
+            static_cast<const ir::FilterNode&>(*out->children().front()).predicate();
+        REQUIRE(
+            std::get<ir::ColumnRef>(std::get<ir::CompareExpr>(predicate.node).left->node).lexical);
+    }
+    SECTION("nonlocal predicate is kept conservative") {
+        ir::CallExpr call{.callee = "cumsum", .args = {}, .named_args = {}};
+        call.args.push_back(ir::make_expr_ptr(ir::Expr{ir::ColumnRef{.name = "x"}}));
+        auto filter = std::make_unique<ir::FilterNode>(ir::NodeId{1}, ir::Expr{std::move(call)});
+        auto tree = with_child(std::move(filter),
+                               with_child(make_project({2}, {"x"}), make_scan({3}, "t")));
+        REQUIRE(ir::canonicalize(std::move(tree))->kind() == ir::NodeKind::Filter);
+    }
+}
+
+TEST_CASE("canonicalize R12: filter remaps safe column aliases",
+          "[ir][canonicalize][projection_filter]") {
+    const auto alias_update = [](std::vector<std::pair<std::string, std::string>> aliases) {
+        std::vector<ir::FieldSpec> fields;
+        for (const auto& [output, input] : aliases) {
+            fields.push_back({.alias = output, .expr = ir::Expr{ir::ColumnRef{.name = input}}});
+        }
+        return std::make_unique<ir::UpdateNode>(ir::NodeId{2}, std::move(fields));
+    };
+    SECTION("alias remaps to its input") {
+        auto tree = with_child(make_filter_cmp_col({1}, "b", 500),
+                               with_child(alias_update({{"b", "raw_b"}}), make_scan({3}, "t")));
+        auto out = ir::canonicalize(std::move(tree));
+        REQUIRE(out->kind() == ir::NodeKind::Update);
+        const auto& filter = static_cast<const ir::FilterNode&>(*out->children().front());
+        const auto& cmp = std::get<ir::CompareExpr>(filter.predicate().node);
+        REQUIRE(std::get<ir::ColumnRef>(cmp.left->node).name == "raw_b");
+    }
+    SECTION("alias dependencies remain conservative") {
+        auto tree =
+            with_child(make_filter_cmp_col({1}, "b", 500),
+                       with_child(alias_update({{"b", "a"}, {"a", "raw"}}), make_scan({3}, "t")));
+        REQUIRE(ir::canonicalize(std::move(tree))->kind() == ir::NodeKind::Filter);
+    }
+    SECTION("duplicate alias definitions are not remapped") {
+        auto tree =
+            with_child(make_filter_cmp_col({1}, "b", 500),
+                       with_child(alias_update({{"b", "a"}, {"b", "raw"}}), make_scan({3}, "t")));
+        REQUIRE(ir::canonicalize(std::move(tree))->kind() == ir::NodeKind::Filter);
+    }
+    SECTION("lexical scalar copies are not column aliases") {
+        std::vector<ir::FieldSpec> fields;
+        fields.push_back(
+            {.alias = "b", .expr = ir::Expr{ir::ColumnRef{.name = "raw_b", .lexical = true}}});
+        auto tree = with_child(
+            make_filter_cmp_col({1}, "b", 500),
+            with_child(std::make_unique<ir::UpdateNode>(ir::NodeId{2}, std::move(fields)),
+                       make_scan({3}, "t")));
+        REQUIRE(ir::canonicalize(std::move(tree))->kind() == ir::NodeKind::Filter);
+    }
+    SECTION("guarded aliases are not unconditional copies") {
+        auto update = alias_update({{"b", "raw_b"}});
+        update->set_guard(ir::Expr{ir::Literal{.value = false}});
+        auto tree = with_child(make_filter_cmp_col({1}, "b", 500),
+                               with_child(std::move(update), make_scan({3}, "t")));
+        REQUIRE(ir::canonicalize(std::move(tree))->kind() == ir::NodeKind::Filter);
+    }
 }

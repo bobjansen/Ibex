@@ -989,3 +989,39 @@ regression. Q6's measured improvement is reported alongside this limitation.
 
 - [Native filter A/B, 100,000 rows](pdsh-performance-results/native-constants-filter-ab.txt)
 - [Native filter A/B, one million rows](pdsh-performance-results/native-constants-filter-million-ab.txt)
+
+## Q22: initial bottleneck investigation
+
+Release profiling at SF10, pinned to eight P-cores, identifies the two
+country-code substring updates as the first target: 196.7 and 195.6 ms of
+self time out of 581.4 ms native execution. The anti join accounts for
+80.7 ms of next time (including its input wait); the singleton cross join
+adds only 1.6 ms of build time. Pool occupancy is 20.5%. These are diagnostic
+profile measurements, not replacement benchmark medians. Complete output
+matches Polars streaming at both one and eight threads.
+
+The read-only physical inspection of the customer substring update reports
+`serial(no leading parallel-map step)`. The native substring builtin has no
+column kernel: its scalar implementation allocates a codepoint-offset vector
+and walks the entire string for each row, even for a positive two-character
+prefix. The two customer branches independently perform this computation.
+At one thread their self times remain 200.3 and 200.2 ms, consistent with the
+serial bottleneck seen at eight threads. Profile row counts can include
+forwarded calls through wrappers and are not evidence of extra source reads.
+
+A controlled experiment keeps both customer variants in memory and leaves
+orders in Parquet. Shortening phone strings to their first two characters
+before collection leaves the final result unchanged, while still executing
+the same substring expression. Eight-sample medians are 505.2 ms for full
+phone strings and 378.0 ms for shortened strings. This sequential diagnostic
+is not a paired optimization benchmark; it supports targeting the substring
+walk but also shows that avoiding the full walk alone will leave substantial
+scalar-dispatch and other query costs.
+
+The recommended first change is a native substring column kernel that reads
+only the required codepoints for nonnegative bounded slices, preserves Unicode
+and null semantics, and can run across morsels. Sharing the filtered customer
+branch and improving the seven LIKE alternatives are subsequent opportunities.
+No execution change is included in this investigation. Raw profiles, physical
+inspection and control samples are in
+`pdsh-performance-results/q22-investigation.json`.

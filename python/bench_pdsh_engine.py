@@ -47,6 +47,8 @@ def main():
     report = {
         'git_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),
         'upstream_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=args.pdsh_root, text=True).strip(),
+        'upstream_worktree_patch': subprocess.check_output(
+            ['git', 'diff', 'HEAD', '--', 'queries/polars'], cwd=args.pdsh_root, text=True),
         'bridge_sha256': hashlib.sha256(bridge.read_bytes()).hexdigest(),
         'bridge': str(bridge), 'polars_version': pl.__version__,
         'python_source_sha256': {

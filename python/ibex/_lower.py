@@ -95,6 +95,11 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
         if op == "n_unique":
             value = render(args[0])
             return f"(count_distinct({value}) + coalesce(max(Int64(is_null({value}))), {bind(0)}))"
+        if op == "filtered_n_unique":
+            value, predicate = (render(arg) for arg in args)
+            selected = f"case {{ {predicate} => {value}, else => NULL }}"
+            selected_null = f"case {{ {predicate} => Int64(is_null({value})), else => 0 }}"
+            return f"(count_distinct({selected}) + coalesce(max({selected_null}), {bind(0)}))"
         if op in ("min", "max"):
             return f"{op}({render(args[0])})"
         if op in ("len", "column_len"):
@@ -563,6 +568,12 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
             if dtype(args[0]) not in (pa.int64(), pa.bool_(), pa.string(), pa.large_string()) or not args[0]._row_reference:
                 raise NotImplementedError("distinct count currently requires integer, Boolean or string rows")
             return pa.uint32()
+        if op == "filtered_n_unique":
+            if (dtype(args[0]) not in (pa.int64(), pa.bool_(), pa.string(), pa.large_string()) or
+                    not args[0]._row_reference or args[0]._aggregate or
+                    dtype(args[1]) != pa.bool_() or args[1]._aggregate):
+                raise NotImplementedError("filtered distinct count requires row values and a row-local Boolean predicate")
+            return pa.uint32()
         if op in ("sum", "mean", "min", "max"):
             result = dtype(args[0])
             if op == "sum" and result == pa.bool_() and args[0]._row_reference:
@@ -625,7 +636,7 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
                 raise TypeError("logical operators require Boolean expressions")
             return pa.bool_()
         if op.removeprefix("polars_") in ("==", "!=", "<", "<=", ">", ">="):
-            if left != right and not (left in numeric and right in numeric):
+            if left != right and not (left in (*numeric, pa.uint32()) and right in (*numeric, pa.uint32())):
                 raise NotImplementedError("comparison between these types is not supported yet")
             return pa.bool_()
         if left not in numeric or right not in numeric:

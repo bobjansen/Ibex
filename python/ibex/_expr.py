@@ -8,7 +8,7 @@ import builtins
 
 
 _REDUCTIONS = frozenset(("sum", "mean", "min", "max", "polars_min", "polars_max",
-                         "n_unique", "count", "column_len", "first", "last",
+                         "n_unique", "filtered_n_unique", "count", "column_len", "first", "last",
                          "first_non_null", "last_non_null", "len"))
 
 

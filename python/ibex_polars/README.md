@@ -112,6 +112,9 @@ SF10 Q22 collections improve from 536 to 385 ms at eight threads and from
 The complete 22-query suite has geometric-mean runtime ratios versus
 streaming Polars of 1.10× at one thread and 1.37× at eight; versus in-memory
 Polars, the ratios are 0.84× and 1.02×. Every measured result matches.
+The later Q10 follow-up preserves original floating-key labels while enabling
+streaming aggregation, improving paired medians 1,172 → 719 ms at eight
+threads and 4,136 → 3,966 ms at one. The suite ratios above predate that change.
 
 ## Scope and preparation
 

@@ -1,0 +1,34 @@
+{
+  "method": "Same generated source and bindings except first_null(c_acctbal) changed to first(c_acctbal); two warmups; all six route permutations; full result comparisons",
+  "samples_ms": {
+    "original": [
+      1240.999351,
+      1210.228112,
+      1163.364074,
+      1188.635338,
+      1176.134344,
+      1147.28231
+    ],
+    "non_null_representative": [
+      763.869942,
+      722.192215,
+      704.935798,
+      778.259294,
+      731.082839,
+      730.171373
+    ],
+    "polars_streaming": [
+      479.019367,
+      491.715508,
+      472.696906,
+      494.832099,
+      472.490969,
+      475.100213
+    ]
+  },
+  "median_ms": {
+    "original": 1182.384841,
+    "non_null_representative": 730.627106,
+    "polars_streaming": 477.05979
+  }
+}

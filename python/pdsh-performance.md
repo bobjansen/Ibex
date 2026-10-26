@@ -1129,6 +1129,10 @@ contain the complete-suite correctness checks.
 
 ## Complete 22-query comparison after shared-cache lowering
 
+The later Q10 follow-up below changes its floating-key representative reducer.
+The complete-suite tables and geometric means here describe this measured
+sweep; they do not combine timings from later comparisons.
+
 Measured 2026-10-26 at `5ec3c8c6`, with the complete Release tree rebuilt.
 SF10, i7-13700 locked to 3.2 GHz; eight threads pinned to physical P-cores
 0,2,4,6,8,10,12,14. All 22 query results match both Polars executors,
@@ -1262,3 +1266,81 @@ warm medians of 6.553 s, 3.405 s and 2.200 s. The advantage persists but is
 smaller on a fresh process. This is one observation per executor, not a
 statistical estimate. The driver and results are in
 `pdsh-performance-results/all22-fresh-q18-one.json`.
+
+## Q10: remove a generated null-preserving reducer from floating keys
+
+Commit `6b706267` changes only Python translation. Q10 has seven logical
+grouping keys, including `c_acctbal`. The adapter normalizes a floating key
+into a NaN flag and a normalized value, then reduces the original value to
+return the original group label. Its generated `first_null(c_acctbal)` made
+`aggregate_is_streamable` decline the entire aggregate. The first profile
+attributes 570.6 ms of 1,292.3 ms native execution to the materialized aggregate,
+with no worker tasks of its own. It groups 1,147,084 joined rows into 381,105
+groups before the final top 20.
+
+The representative can safely use null-skipping `first`:
+
+- Null keys have a null normalized value and are grouped separately. Every
+  original value in that group is null; either reducer returns null.
+- NaNs have a true flag and normalized zero. Every original value in that
+  group is non-null, so both reducers preserve the first NaN payload.
+- Ordinary values, including equal signed zeros, are non-null. Both reducers
+  preserve the same first value and zero sign.
+
+The adapter therefore uses its internal `first_non_null` operation for this
+generated label only. Ordinary Polars `first()` translation continues to
+preserve nulls. Read-only physical inspection changes from
+`Aggregate(MaterializeAll)` to the streaming/hash-fallback aggregate phase
+chain with parallel-capable discovery, accumulation, ordering and emission.
+A controlled source-only replacement preserves Q10's complete output and
+measures 1,182 → 731 ms at eight threads before the production change.
+
+Two persistent workers then compare the before/after Python packages with
+**identical Release bridges**, SF10 inputs and captured scalar bindings.
+Twelve paired rounds cover every three-route ordering twice; preparation and
+validation are outside timing. CPU 2 is used for one thread; physical P-cores
+0,2,4,6,8,10,12,14 for eight. Warm collection medians, milliseconds:
+
+| Threads | Before | After | Polars streaming | Median paired change |
+|---|---:|---:|---:|---:|
+| 1 | 4,136.4 | 3,965.8 | 3,151.8 | −3.8% |
+| 8 | 1,172.2 | 719.3 | 475.0 | −38.5% |
+
+Q10 improves in every pair at both budgets (two-sided exact signed-rank
+p=0.000488 each). The remaining eight-thread runtime is 1.51× streaming
+Polars, down from 2.47× in the same comparison. This removes a major serial
+barrier; it does not explain or resolve all remaining decode/join costs.
+
+Q10 is the first query in each newly launched comparison worker. Its first
+native collections are 4,310 → 4,149 ms at one thread and 1,292 → 812 ms at
+eight, so the gain also appears before repeated native collections. These
+are single observations after preparation and a Polars reference collection;
+they are not cold-storage or process-startup timings.
+
+Q18 is the only other suite query using the generated floating-key helper.
+Its one-thread medians are 2,070.7 → 2,047.8 ms (median paired −1.35%,
+11/12 faster pairs, unadjusted p=0.0161). At eight threads they are
+903.1 → 894.5 ms (median paired −0.13%, 6/12 faster pairs, p=0.519), an
+unclear effect. Its final grouping is small, so the large Q10 benefit should
+not be generalized to Q18.
+
+The later diagnostic profile confirms aggregate discovery now submits worker
+tasks. Its durations are excluded from before/after interpretation: the host
+load rose above 26, then 40, and all three executors slowed substantially.
+Those conditions occurred after the paired timing runs. The profile is
+retained as reachability evidence rather than a second performance result.
+
+The added regression fails against the old translation and passes after the
+change. It checks Float32/Float64, all-null groups, distinct NaN payloads and
+both orders of signed zero. Existing tests cover mixed keys and empty inputs.
+All nine Python/conformance CTest groups pass; a complete SF10 eight-thread
+check passes all 22 queries against both Polars executors. Both changed queries
+also pass all one-thread paired checks. The other 20 queries have byte-identical
+generated source relative to the preceding full-suite run. No runtime code
+or public API changes are included.
+
+Samples, generated sources, bridge/Python hashes and the driver are in
+`pdsh-performance-results/q10-{one,eight}.json`; exact paired statistics are
+in `q10-statistics.json`. `q10-evidence.json` contains the routing inspection,
+profiles, source-control driver and regression/test evidence.
+`q10-complete-eight.json` records the full-suite check.

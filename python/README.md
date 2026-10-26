@@ -179,9 +179,10 @@ Preserving Polars common-subplan cache identities removes Q22’s duplicate
 customer work: a further paired comparison improves 379 → 214 ms at eight
 threads and 1,034 → 659 ms at one. Shared native bindings are recomputed for
 each collection; prepared plans retain no intermediate query results.
-The complete 22-query eight-thread comparison has a geometric mean runtime
-ratio of 1.02× versus in-memory Polars and 1.37× versus streaming Polars.
-The report includes every query, paired samples and the largest remaining gaps.
+The complete 22-query comparison has geometric-mean runtime ratios of 0.84×
+versus in-memory Polars and 1.10× versus streaming Polars at one thread;
+at eight threads the ratios are 1.02× and 1.37×. The report includes every
+query, paired samples, the documented Q9 rerun and the largest remaining gaps.
 Its native planning follow-up reduces eight-thread Q6 from 747 ms to 219 ms
 (Polars streaming: 189 ms), preserving Polars' NaN/null semantics.
 Membership simplification and shared streaming scan planning reduce Q12's

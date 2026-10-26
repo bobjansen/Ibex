@@ -11,6 +11,7 @@ import hashlib
 import importlib
 from itertools import permutations
 import json
+import math
 import os
 from pathlib import Path
 import statistics
@@ -19,22 +20,49 @@ import sys
 import time
 
 
+def assert_query_result(number, actual, expected):
+    from polars.testing import assert_frame_equal
+    if number == 11:
+        # Q11 orders only by value. Equal-valued part keys may appear in
+        # either order, including between Polars' own two executors.
+        if not actual['value'].is_sorted(descending=True) or not expected['value'].is_sorted(descending=True):
+            raise AssertionError('Q11 value ordering is not descending')
+        assert_frame_equal(actual.select('value'), expected.select('value'), rel_tol=1e-10, abs_tol=1e-8)
+        actual = actual.sort(['value', 'ps_partkey'], descending=[True, False])
+        expected = expected.sort(['value', 'ps_partkey'], descending=[True, False])
+    assert_frame_equal(actual, expected, check_row_order=True, rel_tol=1e-10, abs_tol=1e-8)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--pdsh-root', type=Path, required=True)
     parser.add_argument('--data', type=Path, required=True)
+    parser.add_argument('--scale-factor', type=float, help='query parameter scale; inferred from a scale-N data directory')
     parser.add_argument('--iters', type=int, default=6)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--check-only', action='store_true', help='compare complete results without timing loops')
     parser.add_argument('--queries', type=int, nargs='+', choices=range(1, 23), default=list(range(1, 23)))
     args = parser.parse_args()
+    scale_factor = args.scale_factor
+    if scale_factor is None and args.data.resolve().name.startswith('scale-'):
+        try:
+            scale_factor = float(args.data.resolve().name.removeprefix('scale-'))
+        except ValueError:
+            parser.error('cannot infer scale factor; pass --scale-factor')
+    if scale_factor is None and 11 in args.queries:
+        parser.error('Q11 needs --scale-factor or a scale-N data directory')
+    if scale_factor is not None:
+        if not math.isfinite(scale_factor) or scale_factor <= 0:
+            parser.error('--scale-factor must be positive and finite')
+        # Q11 reads Settings() at module import and scales its threshold.
+        # Set this before loading any upstream query modules.
+        os.environ['SCALE_FACTOR'] = str(scale_factor)
     if not args.check_only and (args.iters < 2 or args.iters % 2):
         parser.error('--iters must be even and at least two')
     root = Path(__file__).resolve().parents[1]
     if 'CMAKE_BUILD_TYPE:STRING=Release' not in (root / 'build-release/CMakeCache.txt').read_text():
         parser.error('build-release must be configured as Release')
     import polars as pl
-    from polars.testing import assert_frame_equal
     import ibex_pyarrow
     from ibex_polars import IbexEngine
 
@@ -58,6 +86,7 @@ def main():
         'native_worktree_patch': subprocess.check_output(
             ['git', 'diff', 'HEAD', '--', 'src', 'include'], cwd=root, text=True),
         'ibex_cores': os.environ.get('IBEX_CORES'), 'polars_threads': pl.thread_pool_size(),
+        'scale_factor': scale_factor,
         'affinity': sorted(os.sched_getaffinity(0)),
         'data': [{'path': str(p), 'bytes': p.stat().st_size, 'mtime_ns': p.stat().st_mtime_ns} for p in paths],
         'iterations': 0 if args.check_only else args.iters,
@@ -65,7 +94,7 @@ def main():
         'method': ('Parquet collection; prepared translation; complete correctness comparisons; no warmups or timing loops'
                    if args.check_only else
                    'Parquet collection; prepared translation; two warmups after first collection; alternating route order; previous-result destruction excluded; no result caching'),
-        'correctness': 'all rows, order and dtypes; rel_tol=1e-10 abs_tol=1e-8; both Polars executors compared',
+        'correctness': 'all rows, order and dtypes; Q11 permits reordering only within value-sort ties while checking descending values; rel_tol=1e-10 abs_tol=1e-8; both Polars executors compared',
         'cpu_frequency_khz': {name: Path('/sys/devices/system/cpu/cpu0/cpufreq', name).read_text().strip()
                               for name in ('scaling_min_freq', 'scaling_max_freq')},
         'ibex_decode_threads': os.environ.get('IBEX_DECODE_THREADS'),
@@ -106,8 +135,7 @@ def main():
                 outputs[route] = call()
                 first[route] = (time.perf_counter_ns() - started) / 1e6
             for route in ('polars_streaming', 'polars_ibex'):
-                assert_frame_equal(outputs[route], outputs['polars'], check_row_order=True,
-                                   rel_tol=1e-10, abs_tol=1e-8)
+                assert_query_result(number, outputs[route], outputs['polars'])
             entry.update(first_collect_ms=first, output_rows=outputs['polars'].height)
             if args.check_only:
                 entry.update(status='passed', native_source=engine.explain(query))
@@ -116,8 +144,7 @@ def main():
                 continue
             for _ in range(2):
                 for call in calls.values():
-                    assert_frame_equal(call(), outputs['polars'], check_row_order=True,
-                                       rel_tol=1e-10, abs_tol=1e-8)
+                    assert_query_result(number, call(), outputs['polars'])
             samples = {route: [] for route in calls}
             cpu_samples = {route: [] for route in calls}
             previous = None
@@ -131,8 +158,7 @@ def main():
                     cpu_elapsed = (time.process_time_ns() - cpu_started) / 1e6
                     elapsed = (time.perf_counter_ns() - started) / 1e6
                     previous = current
-                    assert_frame_equal(current, outputs['polars'], check_row_order=True,
-                                       rel_tol=1e-10, abs_tol=1e-8)
+                    assert_query_result(number, current, outputs['polars'])
                     samples[route].append(elapsed)
                     cpu_samples[route].append(cpu_elapsed)
                 print(name, f'round {iteration + 1}/{args.iters}', flush=True)

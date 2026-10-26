@@ -344,6 +344,17 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.equal(frame.select(pl.col("x").filter(pl.col("ok")).n_unique())).item(), 1)
         self.assertEqual(self.equal(frame.select(pl.col("x").filter(pl.lit(False)).n_unique())).item(), 0)
 
+    def test_q11_validation_preserves_order_except_equal_value_ties(self):
+        from bench_pdsh_engine import assert_query_result
+        reference = pl.DataFrame({"ps_partkey": [1, 2, 3], "value": [5.0, 5.0, 1.0]})
+        assert_query_result(11, reference[[1, 0, 2]], reference)
+        with self.assertRaises(AssertionError):
+            assert_query_result(11, reference.reverse(), reference)
+        with self.assertRaises(AssertionError):
+            assert_query_result(11, reference.with_columns(pl.lit(9, dtype=pl.Int64).alias("ps_partkey")), reference)
+        with self.assertRaises(AssertionError):
+            assert_query_result(11, reference.head(2), reference)
+
     def test_cache_markers_retain_subplans_and_date_years(self):
         frame = pl.DataFrame({"key": [1, 2, 3], "day": [date(1969, 12, 31), None, date(2000, 2, 29)]}).lazy()
         cached = frame.select("key", year=pl.col("day").dt.year()).cache()

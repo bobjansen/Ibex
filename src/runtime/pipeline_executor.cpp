@@ -1232,8 +1232,14 @@ class TwoPhaseFilterOperator final : public Operator {
     // built it (or is about to, on its first fan-out).
     const std::size_t pool_size = process_worker_pool().size();
     const std::size_t budget = exec.compute_budget();
-    const std::size_t workers =
-        std::min({budget, pool_size, static_cast<std::size_t>(morsel_count)});
+    std::size_t workers = std::min({budget, pool_size, static_cast<std::size_t>(morsel_count)});
+    // A downstream stage may submit a join-probe batch while these workers
+    // are parked on the bounded output ring. Keep a worker available for that
+    // batch, as the streaming scan pipeline does. Short runs cannot saturate
+    // the ring (2W slots plus at most W claimed morsels).
+    if (workers == pool_size && morsel_count > workers * 3) {
+        --workers;
+    }
     return workers < 2 ? 0 : workers;
 }
 

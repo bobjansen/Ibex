@@ -1,0 +1,173 @@
+{
+  "git_head": "6276e6f73c71a1465d599caeb252ab751cdd7a4c",
+  "python_worktree_patch": "",
+  "python_before_sha256": {
+    "ibex_polars/_temporal.py": "c22e3d4c6ad4f2d7f8565da46b44dd587ddaba036945089e9ef574f4e8754344",
+    "ibex_polars/__init__.py": "ff367504c12ccb725feb342c4eba07580e6ecf8a8fb079b16d8f52299bbc85f3",
+    "ibex_polars/_engine.py": "00565e68a39b73216fc46b32bdedb61518004a80ca9d0d513e01016f9da3858f",
+    "ibex_polars/_adapter.py": "b9d3a758aae8991af1ad4d0f137761fc326975ca31bf10c80066546a6bea1cb7",
+    "ibex/_join.py": "9e3e6636ab778febdc46371fdf4f28cafbca70e48fe61669fa55e9a2c1ed397d",
+    "ibex/__init__.py": "54b113e96b2a8906162652eb052c993a037ac649ae9c3df806975c5b45132ede",
+    "ibex/_lower.py": "ddc258f8cb96cc58cfd4c4c347275123db1016cc350e47b7dc2420f1c6875536",
+    "ibex/_frame.py": "c05e577f4c1341b7958113833cde6de71cd5b5613ceb62cc357dd63717382a47",
+    "ibex/_expr.py": "e71ae58642e3519f81177718c3078f7999023796e62a1011a330161bc6f649e6"
+  },
+  "python_after_sha256": {
+    "ibex/_join.py": "9e3e6636ab778febdc46371fdf4f28cafbca70e48fe61669fa55e9a2c1ed397d",
+    "ibex/__init__.py": "54b113e96b2a8906162652eb052c993a037ac649ae9c3df806975c5b45132ede",
+    "ibex/_lower.py": "41c18447b218ea3a3e70ee211c8c4d10b2940dfb3bff0ccbbfe549dcf209b574",
+    "ibex/_frame.py": "c05e577f4c1341b7958113833cde6de71cd5b5613ceb62cc357dd63717382a47",
+    "ibex/_expr.py": "e71ae58642e3519f81177718c3078f7999023796e62a1011a330161bc6f649e6",
+    "ibex_polars/__init__.py": "ff367504c12ccb725feb342c4eba07580e6ecf8a8fb079b16d8f52299bbc85f3",
+    "ibex_polars/_engine.py": "00565e68a39b73216fc46b32bdedb61518004a80ca9d0d513e01016f9da3858f",
+    "ibex_polars/_adapter.py": "1c9b063c05beb775e94d02c51be76bbeab30f84baac251dc534eac3abea82e0c",
+    "ibex_polars/_temporal.py": "c22e3d4c6ad4f2d7f8565da46b44dd587ddaba036945089e9ef574f4e8754344"
+  },
+  "native_worktree_patch": "",
+  "upstream_head": "401908a307f133a2dffbe3f5e0e0fb2b50ea310b",
+  "ibex_cores": "1",
+  "affinity": [
+    2
+  ],
+  "ibex_stream_scan": null,
+  "ibex_decode_threads": null,
+  "ibex_join_probe": null,
+  "cpu_frequency_khz": {
+    "scaling_min_freq": "3200000",
+    "scaling_max_freq": "3200000"
+  },
+  "data": [
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/customer.parquet",
+      "bytes": 81366456,
+      "mtime_ns": 1792828808266811953
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/lineitem.parquet",
+      "bytes": 1801546483,
+      "mtime_ns": 1792828812385804504
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/nation.parquet",
+      "bytes": 3083,
+      "mtime_ns": 1792828814559800573
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/orders.parquet",
+      "bytes": 391488464,
+      "mtime_ns": 1792828815334799172
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/part.parquet",
+      "bytes": 41388677,
+      "mtime_ns": 1792828815922798108
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/partsupp.parquet",
+      "bytes": 295923709,
+      "mtime_ns": 1792828816386797269
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/region.parquet",
+      "bytes": 1827,
+      "mtime_ns": 1792828816660796774
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/supplier.parquet",
+      "bytes": 5208557,
+      "mtime_ns": 1792828816700796702
+    }
+  ],
+  "iterations": 12,
+  "queries": {
+    "q22": {
+      "status": "passed",
+      "metadata": {
+        "before": {
+          "source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\n((((parquet::read(^_ibex_scalar_0)[select { `c_custkey` = `c_custkey`, `c_phone` = `c_phone`, `c_acctbal` = `c_acctbal` }][update { `cntrycode` = substring(`c_phone`, ^_ibex_scalar_1, ^_ibex_scalar_2) }][select { `c_custkey` = `c_custkey`, `c_phone` = `c_phone`, `c_acctbal` = `c_acctbal`, `cntrycode` = `cntrycode` }][select { `c_acctbal` = `c_acctbal`, `c_custkey` = `c_custkey`, `cntrycode` = `cntrycode` }][filter (((((((like(`cntrycode`, ^_ibex_scalar_3) || like(`cntrycode`, ^_ibex_scalar_4)) || like(`cntrycode`, ^_ibex_scalar_5)) || like(`cntrycode`, ^_ibex_scalar_6)) || like(`cntrycode`, ^_ibex_scalar_7)) || like(`cntrycode`, ^_ibex_scalar_8)) || like(`cntrycode`, ^_ibex_scalar_9)))][select { `_ibex_join_0_l_0` = `c_acctbal`, `_ibex_join_0_l_1` = `c_custkey`, `_ibex_join_0_l_2` = `cntrycode` }]) anti join (parquet::read(^_ibex_scalar_10)[select { `o_custkey` = `o_custkey` }][select { `_ibex_join_0_r_0` = `o_custkey` }]) on { `_ibex_join_0_l_1` = `_ibex_join_0_r_0` })[select { `c_acctbal` = `_ibex_join_0_l_0`, `c_custkey` = `_ibex_join_0_l_1`, `cntrycode` = `_ibex_join_0_l_2` }][select { `c_acctbal` = `c_acctbal`, `cntrycode` = `cntrycode` }][select { `_ibex_join_1_l_0` = `c_acctbal`, `_ibex_join_1_l_1` = `cntrycode` }]) cross join (parquet::read(^_ibex_scalar_11)[select { `c_custkey` = `c_custkey`, `c_phone` = `c_phone`, `c_acctbal` = `c_acctbal` }][update { `cntrycode` = substring(`c_phone`, ^_ibex_scalar_12, ^_ibex_scalar_13) }][select { `c_custkey` = `c_custkey`, `c_phone` = `c_phone`, `c_acctbal` = `c_acctbal`, `cntrycode` = `cntrycode` }][select { `c_acctbal` = `c_acctbal`, `c_custkey` = `c_custkey`, `cntrycode` = `cntrycode` }][filter (((((((like(`cntrycode`, ^_ibex_scalar_14) || like(`cntrycode`, ^_ibex_scalar_15)) || like(`cntrycode`, ^_ibex_scalar_16)) || like(`cntrycode`, ^_ibex_scalar_17)) || like(`cntrycode`, ^_ibex_scalar_18)) || like(`cntrycode`, ^_ibex_scalar_19)) || like(`cntrycode`, ^_ibex_scalar_20)))][select { `c_acctbal` = `c_acctbal` }][filter (__ibex_nan_high_gt(`c_acctbal`, ^_ibex_scalar_21))][select { `avg_acctbal` = mean(`c_acctbal`) }][select { `_ibex_join_1_r_0` = `avg_acctbal` }]))[select { `c_acctbal` = `_ibex_join_1_l_0`, `cntrycode` = `_ibex_join_1_l_1`, `avg_acctbal` = `_ibex_join_1_r_0` }][filter (__ibex_nan_high_gt(`c_acctbal`, `avg_acctbal`))][select { `cntrycode` = `cntrycode`, `c_acctbal` = `c_acctbal` }][select { `cntrycode`, `_ibex_round_aggregate_0` = count(`c_acctbal`), `_ibex_round_aggregate_1` = coalesce(sum(`c_acctbal`), ^_ibex_scalar_22) }, by { `cntrycode` }][select { `cntrycode` = `cntrycode`, `numcust` = `_ibex_round_aggregate_0`, `totacctbal` = case { (((case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_31) > ^_ibex_scalar_32) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_33) < ^_ibex_scalar_34)) => case { Float64(round(case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_25) > ^_ibex_scalar_26) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_27) < ^_ibex_scalar_28)) => (`_ibex_round_aggregate_1` * ^_ibex_scalar_23), else => ^_ibex_scalar_24 }, Bankers)) == ^_ibex_scalar_29 => ((`_ibex_round_aggregate_1` * ^_ibex_scalar_30) * ^_ibex_scalar_29), else => Float64(round(case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_25) > ^_ibex_scalar_26) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_27) < ^_ibex_scalar_28)) => (`_ibex_round_aggregate_1` * ^_ibex_scalar_23), else => ^_ibex_scalar_24 }, Bankers)) }, else => (`_ibex_round_aggregate_1` * ^_ibex_scalar_35) }) / ^_ibex_scalar_36) > -^_ibex_scalar_37) && (((case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_31) > ^_ibex_scalar_32) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_33) < ^_ibex_scalar_34)) => case { Float64(round(case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_25) > ^_ibex_scalar_26) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_27) < ^_ibex_scalar_28)) => (`_ibex_round_aggregate_1` * ^_ibex_scalar_23), else => ^_ibex_scalar_24 }, Bankers)) == ^_ibex_scalar_29 => ((`_ibex_round_aggregate_1` * ^_ibex_scalar_30) * ^_ibex_scalar_29), else => Float64(round(case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_25) > ^_ibex_scalar_26) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_27) < ^_ibex_scalar_28)) => (`_ibex_round_aggregate_1` * ^_ibex_scalar_23), else => ^_ibex_scalar_24 }, Bankers)) }, else => (`_ibex_round_aggregate_1` * ^_ibex_scalar_35) }) / ^_ibex_scalar_36) < ^_ibex_scalar_37) => ((case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_31) > ^_ibex_scalar_32) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_33) < ^_ibex_scalar_34)) => case { Float64(round(case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_25) > ^_ibex_scalar_26) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_27) < ^_ibex_scalar_28)) => (`_ibex_round_aggregate_1` * ^_ibex_scalar_23), else => ^_ibex_scalar_24 }, Bankers)) == ^_ibex_scalar_29 => ((`_ibex_round_aggregate_1` * ^_ibex_scalar_30) * ^_ibex_scalar_29), else => Float64(round(case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_25) > ^_ibex_scalar_26) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_27) < ^_ibex_scalar_28)) => (`_ibex_round_aggregate_1` * ^_ibex_scalar_23), else => ^_ibex_scalar_24 }, Bankers)) }, else => (`_ibex_round_aggregate_1` * ^_ibex_scalar_35) }) / ^_ibex_scalar_36), else => `_ibex_round_aggregate_1` } }][update { `_ibex_sort_null_12_0` = is_null(`cntrycode`) }][order { `_ibex_sort_null_12_0` desc, `cntrycode` asc }];",
+          "output_shape": [
+            7,
+            3
+          ],
+          "schema": "Schema({'cntrycode': String, 'numcust': UInt32, 'totacctbal': Float64})",
+          "polars_version": "2.0.0",
+          "upstream_source_sha256": "db2bd21c39ecc82f1adf928c8b065cbc00b94a83a89d73396770d2f6ce2882a8",
+          "bridge": "/home/brj/ibex/build-release/python/ibex_pyarrow.cpython-314-x86_64-linux-gnu.so",
+          "bridge_sha256": "2a18fb19bb239cc933bd637d98fd959f12267bfc6c53223532d0ebbdac80f824",
+          "polars_threads": 1
+        },
+        "after": {
+          "source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\nlet _ibex_cache_0 = parquet::read(^_ibex_scalar_0)[select { `c_custkey` = `c_custkey`, `c_phone` = `c_phone`, `c_acctbal` = `c_acctbal` }][update { `cntrycode` = substring(`c_phone`, ^_ibex_scalar_1, ^_ibex_scalar_2) }][select { `c_custkey` = `c_custkey`, `c_phone` = `c_phone`, `c_acctbal` = `c_acctbal`, `cntrycode` = `cntrycode` }][select { `c_acctbal` = `c_acctbal`, `c_custkey` = `c_custkey`, `cntrycode` = `cntrycode` }][filter (((((((like(`cntrycode`, ^_ibex_scalar_3) || like(`cntrycode`, ^_ibex_scalar_4)) || like(`cntrycode`, ^_ibex_scalar_5)) || like(`cntrycode`, ^_ibex_scalar_6)) || like(`cntrycode`, ^_ibex_scalar_7)) || like(`cntrycode`, ^_ibex_scalar_8)) || like(`cntrycode`, ^_ibex_scalar_9)))];\n((((_ibex_cache_0[select { `_ibex_join_0_l_0` = `c_acctbal`, `_ibex_join_0_l_1` = `c_custkey`, `_ibex_join_0_l_2` = `cntrycode` }]) anti join (parquet::read(^_ibex_scalar_10)[select { `o_custkey` = `o_custkey` }][select { `_ibex_join_0_r_0` = `o_custkey` }]) on { `_ibex_join_0_l_1` = `_ibex_join_0_r_0` })[select { `c_acctbal` = `_ibex_join_0_l_0`, `c_custkey` = `_ibex_join_0_l_1`, `cntrycode` = `_ibex_join_0_l_2` }][select { `c_acctbal` = `c_acctbal`, `cntrycode` = `cntrycode` }][select { `_ibex_join_1_l_0` = `c_acctbal`, `_ibex_join_1_l_1` = `cntrycode` }]) cross join (_ibex_cache_0[select { `c_acctbal` = `c_acctbal` }][filter (__ibex_nan_high_gt(`c_acctbal`, ^_ibex_scalar_11))][select { `avg_acctbal` = mean(`c_acctbal`) }][select { `_ibex_join_1_r_0` = `avg_acctbal` }]))[select { `c_acctbal` = `_ibex_join_1_l_0`, `cntrycode` = `_ibex_join_1_l_1`, `avg_acctbal` = `_ibex_join_1_r_0` }][filter (__ibex_nan_high_gt(`c_acctbal`, `avg_acctbal`))][select { `cntrycode` = `cntrycode`, `c_acctbal` = `c_acctbal` }][select { `cntrycode`, `_ibex_round_aggregate_0` = count(`c_acctbal`), `_ibex_round_aggregate_1` = coalesce(sum(`c_acctbal`), ^_ibex_scalar_12) }, by { `cntrycode` }][select { `cntrycode` = `cntrycode`, `numcust` = `_ibex_round_aggregate_0`, `totacctbal` = case { (((case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_21) > ^_ibex_scalar_22) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_23) < ^_ibex_scalar_24)) => case { Float64(round(case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_15) > ^_ibex_scalar_16) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_17) < ^_ibex_scalar_18)) => (`_ibex_round_aggregate_1` * ^_ibex_scalar_13), else => ^_ibex_scalar_14 }, Bankers)) == ^_ibex_scalar_19 => ((`_ibex_round_aggregate_1` * ^_ibex_scalar_20) * ^_ibex_scalar_19), else => Float64(round(case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_15) > ^_ibex_scalar_16) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_17) < ^_ibex_scalar_18)) => (`_ibex_round_aggregate_1` * ^_ibex_scalar_13), else => ^_ibex_scalar_14 }, Bankers)) }, else => (`_ibex_round_aggregate_1` * ^_ibex_scalar_25) }) / ^_ibex_scalar_26) > -^_ibex_scalar_27) && (((case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_21) > ^_ibex_scalar_22) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_23) < ^_ibex_scalar_24)) => case { Float64(round(case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_15) > ^_ibex_scalar_16) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_17) < ^_ibex_scalar_18)) => (`_ibex_round_aggregate_1` * ^_ibex_scalar_13), else => ^_ibex_scalar_14 }, Bankers)) == ^_ibex_scalar_19 => ((`_ibex_round_aggregate_1` * ^_ibex_scalar_20) * ^_ibex_scalar_19), else => Float64(round(case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_15) > ^_ibex_scalar_16) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_17) < ^_ibex_scalar_18)) => (`_ibex_round_aggregate_1` * ^_ibex_scalar_13), else => ^_ibex_scalar_14 }, Bankers)) }, else => (`_ibex_round_aggregate_1` * ^_ibex_scalar_25) }) / ^_ibex_scalar_26) < ^_ibex_scalar_27) => ((case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_21) > ^_ibex_scalar_22) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_23) < ^_ibex_scalar_24)) => case { Float64(round(case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_15) > ^_ibex_scalar_16) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_17) < ^_ibex_scalar_18)) => (`_ibex_round_aggregate_1` * ^_ibex_scalar_13), else => ^_ibex_scalar_14 }, Bankers)) == ^_ibex_scalar_19 => ((`_ibex_round_aggregate_1` * ^_ibex_scalar_20) * ^_ibex_scalar_19), else => Float64(round(case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_15) > ^_ibex_scalar_16) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_17) < ^_ibex_scalar_18)) => (`_ibex_round_aggregate_1` * ^_ibex_scalar_13), else => ^_ibex_scalar_14 }, Bankers)) }, else => (`_ibex_round_aggregate_1` * ^_ibex_scalar_25) }) / ^_ibex_scalar_26), else => `_ibex_round_aggregate_1` } }][update { `_ibex_sort_null_13_0` = is_null(`cntrycode`) }][order { `_ibex_sort_null_13_0` desc, `cntrycode` asc }];",
+          "output_shape": [
+            7,
+            3
+          ],
+          "schema": "Schema({'cntrycode': String, 'numcust': UInt32, 'totacctbal': Float64})",
+          "polars_version": "2.0.0",
+          "upstream_source_sha256": "db2bd21c39ecc82f1adf928c8b065cbc00b94a83a89d73396770d2f6ce2882a8",
+          "bridge": "/home/brj/ibex/build-release/python/ibex_pyarrow.cpython-314-x86_64-linux-gnu.so",
+          "bridge_sha256": "2a18fb19bb239cc933bd637d98fd959f12267bfc6c53223532d0ebbdac80f824",
+          "polars_threads": 1
+        }
+      },
+      "first_per_query_ms": {
+        "before": 1084.505581,
+        "after": 697.336177,
+        "polars_streaming": 462.415839
+      },
+      "samples_ms": {
+        "before": [
+          1034.959936,
+          1037.512236,
+          1029.99207,
+          1036.751352,
+          1037.343681,
+          1029.057869,
+          1028.015523,
+          1036.84424,
+          1028.675123,
+          1033.643617,
+          1035.646899,
+          1029.109699
+        ],
+        "after": [
+          655.870694,
+          659.550038,
+          658.812911,
+          661.307376,
+          657.154205,
+          663.511876,
+          658.544623,
+          661.876735,
+          658.05246,
+          662.797153,
+          655.893564,
+          661.114122
+        ],
+        "polars_streaming": [
+          464.480981,
+          459.211463,
+          577.375165,
+          454.712384,
+          576.264897,
+          460.336161,
+          463.769,
+          459.267972,
+          460.327889,
+          455.486045,
+          461.560525,
+          580.483551
+        ]
+      },
+      "median_ms": {
+        "before": 1034.3017765,
+        "after": 659.1814744999999,
+        "polars_streaming": 460.948343
+      },
+      "median_paired_change_pct": -36.100696600369076,
+      "after_faster_pairs": 12
+    }
+  },
+  "driver": "# SPDX-License-Identifier: AGPL-3.0-only\n# Copyright (C) 2026 Bob Jansen\n\"\"\"Paired PDS-H comparison of two saved native bridges and streaming Polars.\n\nBoth workers use the same native bridge, isolating Python adapter changes.\nRun each thread budget separately, with matched IBEX_CORES/POLARS_MAX_THREADS.\n\"\"\"\nimport argparse\nimport hashlib\nimport importlib\nfrom itertools import permutations\nimport json\nimport os\nfrom pathlib import Path\nimport statistics\nimport subprocess\nimport sys\nimport time\n\n\ndef worker(args):\n    import ibex_pyarrow\n    import polars as pl\n    from polars.testing import assert_frame_equal\n    from ibex_polars import IbexEngine\n\n    sys.path.insert(0, str(args.pdsh_root.resolve()))\n    tables = {p.stem: pl.scan_parquet(p) for p in sorted(args.data.resolve().glob('*.parquet'))}\n    bridge = Path(ibex_pyarrow.__file__).resolve()\n    previous = None\n    for line in sys.stdin:\n        command = json.loads(line)\n        if 'prepare' in command:\n            module = importlib.import_module(f'queries.polars.q{command[\"prepare\"]}')\n            query = module.q(**tables)\n            engine = IbexEngine().prepare(query)\n            reference = query.collect(engine='in-memory')\n            previous = None\n            response = {\n                'source': engine.explain(query), 'output_shape': reference.shape,\n                'schema': str(reference.schema), 'polars_version': pl.__version__,\n                'upstream_source_sha256': hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest(),\n                'bridge': str(bridge), 'bridge_sha256': hashlib.sha256(bridge.read_bytes()).hexdigest(),\n                'polars_threads': pl.thread_pool_size(),\n            }\n        else:\n            start = time.perf_counter_ns()\n            current = query.collect(engine=engine if command['route'] == 'ibex' else 'streaming')\n            elapsed = (time.perf_counter_ns() - start) / 1e6\n            assert_frame_equal(current, reference, check_row_order=True, rel_tol=1e-10, abs_tol=1e-8)\n            previous = current  # destruction of the previous output is outside timing\n            response = {'ms': elapsed, 'correctness': 'passed'}\n        print(json.dumps(response), flush=True)\n\n\ndef main():\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument('--pdsh-root', type=Path, required=True)\n    parser.add_argument('--data', type=Path, required=True)\n    parser.add_argument('--before-dir', type=Path)\n    parser.add_argument('--after-dir', type=Path)\n    parser.add_argument('--out', type=Path)\n    parser.add_argument('--queries', type=int, nargs='+', default=[1, 2, 3, 4, 5, 6, 12, 18])\n    parser.add_argument('--iters', type=int, default=6)\n    parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)\n    args = parser.parse_args()\n    if args.worker:\n        worker(args)\n        return\n    if not all((args.before_dir, args.after_dir, args.out)):\n        parser.error('--before-dir, --after-dir and --out are required')\n    if args.iters < 6 or args.iters % 6:\n        parser.error('--iters must be a positive multiple of six to balance route order')\n    root = Path(\"/home/brj/ibex\")\n    if 'CMAKE_BUILD_TYPE:STRING=Release' not in (root / 'build-release/CMakeCache.txt').read_text():\n        parser.error('build-release must be configured as Release')\n    paths = sorted(args.data.resolve().glob('*.parquet'))\n    if len(paths) != 8:\n        parser.error('--data must contain the eight PDS-H Parquet tables')\n    report = {\n        'git_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),\n        'python_worktree_patch': subprocess.check_output(['git', 'diff', 'HEAD', '--', 'python'], cwd=root, text=True),\n        'python_before_sha256': {str(p.relative_to('/tmp/q22-cache-before-python')):hashlib.sha256(p.read_bytes()).hexdigest() for p in Path('/tmp/q22-cache-before-python').rglob('*.py')},\n        'python_after_sha256': {str(p.relative_to(root / 'python')):hashlib.sha256(p.read_bytes()).hexdigest() for package in ('ibex','ibex_polars') for p in (root / 'python' / package).rglob('*.py')},\n        'native_worktree_patch': subprocess.check_output(['git', 'diff', 'HEAD', '--', 'src', 'include'], cwd=root, text=True),\n        'upstream_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=args.pdsh_root, text=True).strip(),\n        'ibex_cores': os.environ.get('IBEX_CORES'), 'affinity': sorted(os.sched_getaffinity(0)),\n        'ibex_stream_scan': os.environ.get('IBEX_STREAM_SCAN'),\n        'ibex_decode_threads': os.environ.get('IBEX_DECODE_THREADS'),\n        'ibex_join_probe': os.environ.get('IBEX_JOIN_PROBE'),\n        'cpu_frequency_khz': {n: Path('/sys/devices/system/cpu/cpu0/cpufreq', n).read_text().strip()\n                              for n in ('scaling_min_freq', 'scaling_max_freq')},\n        'data': [{'path': str(p), 'bytes': p.stat().st_size, 'mtime_ns': p.stat().st_mtime_ns} for p in paths],\n        'iterations': args.iters, 'queries': {}, 'driver': Path(__file__).read_text(),\n        'method': 'Two persistent workers with identical native bridge and before/after Python adapters; one in-memory Polars reference per worker/query; first collection and two warmups per route; all six route permutations; collection includes Parquet decode and public result conversion; preparation, correctness checks and prior-output destruction outside timing. First-per-query timings are not fresh-process measurements. Every output is compared in full, including order and dtypes, rel_tol=1e-10 abs_tol=1e-8.',\n    }\n    workers = {}\n    def call(name, command):\n        process = workers[name]\n        process.stdin.write(json.dumps(command) + '\\n')\n        process.stdin.flush()\n        line = process.stdout.readline()\n        if not line:\n            raise RuntimeError(f'{name} worker exited: {process.poll()}')\n        return json.loads(line)\n    def save():\n        args.out.parent.mkdir(parents=True, exist_ok=True)\n        args.out.write_text(json.dumps(report, indent=2) + '\\n')\n    try:\n        for name, directory in (('before', args.before_dir), ('after', args.after_dir)):\n            env = {**os.environ, 'PYTHONPATH': str(directory.resolve()) + os.pathsep + (\"/tmp/q22-cache-before-python\" if name == \"before\" else str(root / 'python'))}\n            workers[name] = subprocess.Popen(\n                [sys.executable, str(Path(__file__).resolve()), '--worker', '--pdsh-root', str(args.pdsh_root), '--data', str(args.data)],\n                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env)\n        for number in args.queries:\n            name = f'q{number:02}'\n            print(name, 'preparing and checking complete results', flush=True)\n            entry = report['queries'][name] = {'status': 'running'}\n            metadata = {side: call(side, {'prepare': number}) for side in workers}\n            for field in ('schema', 'output_shape', 'upstream_source_sha256', 'polars_threads'):\n                assert metadata['before'][field] == metadata['after'][field], field\n            assert metadata['before']['bridge_sha256'] == metadata['after']['bridge_sha256']\n            entry['metadata'] = metadata\n            routes = {'before': ('before', 'ibex'), 'after': ('after', 'ibex'),\n                      'polars_streaming': ('after', 'polars')}\n            def collect(route):\n                side, engine = routes[route]\n                return call(side, {'route': engine})['ms']\n            entry['first_per_query_ms'] = {route: collect(route) for route in routes}\n            for _ in range(2):\n                for route in routes:\n                    collect(route)\n            samples = {route: [] for route in routes}\n            orders = list(permutations(routes))\n            for iteration in range(args.iters):\n                for route in orders[iteration % 6]:\n                    samples[route].append(collect(route))\n                print(name, f'round {iteration + 1}/{args.iters}', flush=True)\n            ratios = [a / b for a, b in zip(samples['after'], samples['before'])]\n            entry.update(status='passed', samples_ms=samples,\n                         median_ms={k: statistics.median(v) for k, v in samples.items()},\n                         median_paired_change_pct=100 * (statistics.median(ratios) - 1),\n                         after_faster_pairs=sum(a < b for a, b in zip(samples['after'], samples['before'])))\n            print(name, json.dumps(entry['median_ms']), flush=True)\n            save()\n    finally:\n        save()\n        for process in workers.values():\n            if process.poll() is None:\n                process.stdin.close()\n        for process in workers.values():\n            try:\n                process.wait(timeout=30)\n            except subprocess.TimeoutExpired:\n                process.kill()\n                process.wait()\n\n\nif __name__ == '__main__':\n    main()\n",
+  "method": "Two persistent workers with identical native bridge and before/after Python adapters; one in-memory Polars reference per worker/query; first collection and two warmups per route; all six route permutations; collection includes Parquet decode and public result conversion; preparation, correctness checks and prior-output destruction outside timing. First-per-query timings are not fresh-process measurements. Every output is compared in full, including order and dtypes, rel_tol=1e-10 abs_tol=1e-8."
+}

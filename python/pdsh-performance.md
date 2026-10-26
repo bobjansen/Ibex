@@ -462,9 +462,10 @@ extraction, deterministic cached subplans, floating grouping keys, numeric
 min/max and null-inclusive distinct counts over integer/Boolean/string values.
 String matching escapes native LIKE metacharacters; the later compatibility
 rule above also accepts literal `.*` separators. Literal membership accepts at most 256
-scalar values and adds no list/struct column support. Cached deterministic
-subplans may be recomputed by native execution; this is not a physical result
-cache. Floating group keys normalize NaNs for equality and return original
+scalar values and adds no list/struct column support. At that stage, cached
+deterministic subplans could be recomputed by native execution; the later
+cache-identity follow-up below replaces this with shared native bindings.
+Floating group keys normalize NaNs for equality and return original
 labels. Float extrema skip NaNs when ordinary values exist, return NaN for
 all-NaN groups, and null for empty/all-null inputs.
 
@@ -1076,3 +1077,52 @@ driver are preserved in `pdsh-performance-results/q22-substring-{one,eight,prefi
 Native regression results and exact paired statistics are in
 `q22-substring-native-regression.txt` and `q22-substring-statistics.json`
 in the same directory.
+
+## Preserve Polars common-subplan caches in native lowering
+
+Commit `6276e6f7` carries the Polars visitor's `Cache.id_` through the immutable
+frontend graph. Different visitor node IDs with the same cache identity now
+refer to one native `let` binding. Lowering emits dependencies before their
+consumers, including nested caches, and preserves independent cache IDs.
+This uses Polars' own common-subplan detection; there is no duplicate-plan
+detector in the adapter. The change is confined to Python translation.
+
+Q22's generated source now contains one customer scan, substring update and
+country filter, bound as `_ibex_cache_0` and reused for the mean and anti join.
+The complete query still uses one native pipeline call. Shared results live
+only during that call: subsequent collections reread Parquet and recompute
+the shared subtree. The engine's prepared-plan cache never retains these
+intermediate results.
+
+The paired comparison uses the same Release bridge in both processes,
+before-Python packages from `8e901bf4`, and after-Python packages from
+`6276e6f7`. Twelve rounds balance all six before/after/streaming route orders.
+Workers are pinned to CPU 2 at one thread and CPUs 0,2,4,6,8,10,12,14 at eight;
+SF10 inputs, warm file caches and the same Polars reference checks apply.
+Warm collection medians, milliseconds:
+
+| Threads | Before | Shared cache | Polars streaming | Median paired change |
+|---|---:|---:|---:|---:|
+| 1 | 1,034.3 | 659.2 | 460.9 | −36.1% |
+| 8 | 379.5 | 214.5 | 81.0 | −43.9% |
+
+Both comparisons improve in every pair, with two-sided exact signed-rank
+p=0.000488. Every complete output matches the reference, including order
+and dtypes. These gains are additional to the preceding substring change.
+An operator-profile diagnostic shows the substring update in the cache
+materialization statement, with no second substring update in the consumers.
+Profile wrapper row counts can include forwarded calls and must not be read
+as exact source-decode counts.
+
+Validation covers shared branches with independent updates, nested caches,
+independent cache identities, null strings, empty results and fresh Parquet
+contents on repeated collections. All 118 directly selected Python unit
+tests and all nine Python/conformance CTest groups pass. Full SF10 correctness
+checks pass for all 22 PDS queries at both one and eight threads, against
+both Polars executors. These checks are separate from the timing runs.
+
+`pdsh-performance-results/q22-cache-{one,eight}.json` retain before/after
+generated source, native bridge hashes, Python file hashes, paired samples
+and the comparison driver. `q22-cache-evidence.json` contains the profile,
+test summaries and paired statistics; `q22-cache-complete-{one,eight}.json`
+contain the complete-suite correctness checks.

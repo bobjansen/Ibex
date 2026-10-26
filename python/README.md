@@ -157,7 +157,7 @@ For the full 22-query adapter coverage check and current scale-10 timings agains
 both Polars executors, see [PDS-H engine performance](pdsh-performance.md).
 The engine now runs **all 22 PDS-H queries**, checked on SF10 at one and
 eight workers. New translations include literal membership, conditionals,
-Boolean sums, basic string matching, Date years, deterministic cache markers,
+Boolean sums, basic string matching, Date years, shared cached subplans,
 floating group keys, numeric extrema and null-inclusive distinct counts.
 The latest additions cover decimal rounding at 0–15 places, fused arithmetic,
 fused-join visitor adaptation and one-column unique projections. Q15 adds
@@ -175,6 +175,10 @@ Native substring now avoids allocating codepoint offsets and stops after the
 requested positive slice. Paired SF10 Q22 collections improve from 536 to
 385 ms at eight threads and from 1,193 to 1,030 ms at one thread; complete
 results match Polars. See the report for raw samples and regression checks.
+Preserving Polars common-subplan cache identities removes Q22’s duplicate
+customer work: a further paired comparison improves 379 → 214 ms at eight
+threads and 1,034 → 659 ms at one. Shared native bindings are recomputed for
+each collection; prepared plans retain no intermediate query results.
 Its native planning follow-up reduces eight-thread Q6 from 747 ms to 219 ms
 (Polars streaming: 189 ms), preserving Polars' NaN/null semantics.
 Membership simplification and shared streaming scan planning reduce Q12's

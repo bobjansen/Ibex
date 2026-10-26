@@ -197,6 +197,13 @@ optimization flags, are removed when the query is released, and are evicted
 when the limit is reached. Separate lazy query objects currently prepare
 inputs separately. `IbexEngine(cache_size=0)` disables retention.
 
+Polars common-subplan `Cache` nodes retain their cache identities and lower to
+shared native table bindings. Each shared subtree executes once per native
+collection and is reused by its branches, including nested caches. Results
+are released with that collection. This removes Q22’s duplicate customer work:
+paired SF10 medians improve 379 → 214 ms at eight threads and 1,034 → 659 ms
+at one thread, using identical native bridges.
+
 `engine.prepare(query)` performs plan translation and input preparation without
 executing the analytical query. It is optional; the first collection does it
 automatically. Polars projection pushdown limits preparation to demanded

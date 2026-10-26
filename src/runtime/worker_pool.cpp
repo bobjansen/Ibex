@@ -527,13 +527,35 @@ auto WorkerPool::try_run_one_pending() noexcept -> bool {
     return true;
 }
 
+auto WorkerPool::try_run_one_for_batch(const Batch::State* state) noexcept -> bool {
+    // A stage can wait behind producers parked on other rings. Assist only
+    // this batch: taking an unrelated producer could park the stage itself.
+    Task task;
+    {
+        const std::lock_guard lock(impl_->mutex);
+        const auto found =
+            std::find_if(impl_->queue.begin(), impl_->queue.end(), [state](const Task& pending) {
+                return pending.state.get() == state && pending.gen > t_running_gen;
+            });
+        if (found == impl_->queue.end()) {
+            return false;
+        }
+        task = std::move(*found);
+        impl_->queue.erase(found);
+    }
+    run_task(task);
+    return true;
+}
+
 auto WorkerPool::submit(std::size_t worker_count, std::function<void(std::size_t)> body) -> Batch {
     const std::size_t count = std::clamp<std::size_t>(worker_count, 1, threads_);
     auto state = std::make_shared<Batch::State>();
     state->body = std::move(body);
     state->remaining = count;
     state->profile_entry = current_execution_profile_entry();
-    state->assist_one = [this] { return try_run_one_pending(); };
+    state->assist_one = [this, waiting = state.get()] {
+        return on_stage_thread() ? try_run_one_for_batch(waiting) : try_run_one_pending();
+    };
     // A public submit is one fork-join round trip. TaskGroup uses the private
     // unbarriered submission below and accounts its single join at group wait.
     // Counting here needs no matching hook in Batch::wait() (which is
@@ -562,9 +584,10 @@ auto WorkerPool::submit(std::size_t worker_count, std::function<void(std::size_t
 
 namespace {
 
-/// Block until every worker body of `state` has returned. A pool worker helps
-/// its own pool while waiting, so a saturated set of parents can safely fork a
-/// child batch instead of deadlocking with every thread parked.
+/// Block until every worker body of `state` has returned. Pool workers assist
+/// nested work, and stage threads assist this batch only. Thus queued scan
+/// workers can retire after their input was drained even when other producers
+/// have filled the pool and parked on their output rings.
 ///
 /// One helper for all three wait sites (`wait()`, the move-assign, the
 /// destructor) so none of them can be the one that forgets to account for
@@ -574,7 +597,7 @@ namespace {
 /// The clock is read only when profiling installed an entry, so an unprofiled
 /// run pays one null check per wait rather than two `steady_clock::now()`.
 void wait_for_batch(WorkerPool::Batch::State& state, std::unique_lock<std::mutex>& lock) {
-    if (!on_worker_pool_thread()) {
+    if (!on_worker_pool_thread() && !on_stage_thread()) {
         if (state.profile_entry == nullptr || !state.account_wait) {
             state.done.wait(lock, [&state] { return state.remaining == 0; });
             return;
@@ -720,7 +743,9 @@ auto WorkerPool::submit_unbarriered(std::function<void()> body) -> Batch {
     state->remaining = count;
     state->profile_entry = current_execution_profile_entry();
     state->account_wait = false;
-    state->assist_one = [this] { return try_run_one_pending(); };
+    state->assist_one = [this, waiting = state.get()] {
+        return on_stage_thread() ? try_run_one_for_batch(waiting) : try_run_one_pending();
+    };
     const std::uint64_t gen = g_submit_gen.fetch_add(1, std::memory_order_relaxed) + 1;
     if (t_running_gen != 0) {
         t_outstanding_nested.fetch_add(1, std::memory_order_relaxed);

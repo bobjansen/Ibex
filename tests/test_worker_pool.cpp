@@ -100,6 +100,52 @@ TEST_CASE("WorkerPool clamps the worker count to the pool size", "[runtime][work
     CHECK(ran_zero.load() == 1);
 }
 
+TEST_CASE("a stage completes its own batch behind parked pipeline workers",
+          "[runtime][worker_pool][stage_batch]") {
+    runtime::WorkerPool pool(2);
+    std::atomic<std::size_t> parked{0};
+    std::atomic<bool> release{false};
+    auto blockers = pool.submit(2, [&](std::size_t) {
+        parked.fetch_add(1);
+        release.wait(false);
+    });
+    while (parked.load() != 2) {
+        std::this_thread::yield();
+    }
+    std::atomic<bool> unrelated_ran{false};
+    auto unrelated = pool.submit(1, [&](std::size_t) {
+        unrelated_ran.store(true);
+        release.wait(false);
+    });
+    std::atomic<std::size_t> completed{0};
+    std::atomic<bool> stage_done{false};
+    std::thread stage([&] {
+        const runtime::StageThreadScope scope;
+        auto batch = pool.submit(2, [&](std::size_t) { completed.fetch_add(1); });
+        batch.wait();
+        // TaskGroup uses unbarriered batches and must obey the same rule.
+        auto group = pool.task_group();
+        group.submit([&] { completed.fetch_add(1); });
+        group.wait();
+        stage_done.store(true);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!stage_done.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    const bool progressed = stage_done.load();
+    const bool ran_unrelated = unrelated_ran.load();
+    // Release even on regression so the test fails instead of hanging.
+    release.store(true);
+    release.notify_all();
+    stage.join();
+    blockers.wait();
+    unrelated.wait();
+    CHECK(progressed);
+    CHECK_FALSE(ran_unrelated);
+    CHECK(completed.load() == 3);
+}
+
 TEST_CASE("WorkerPool reuses its threads across batches", "[runtime][worker_pool]") {
     // The pool is process-owned precisely so no query pays thread creation.
     // Many small batches must therefore all be servable by the same threads.

@@ -532,7 +532,7 @@ auto WorkerPool::try_run_one_for_batch(const Batch::State* state) noexcept -> bo
     // this batch: taking an unrelated producer could park the stage itself.
     Task task;
     {
-        const std::lock_guard lock(impl_->mutex);
+        const std::scoped_lock lock(impl_->mutex);
         const auto found =
             std::find_if(impl_->queue.begin(), impl_->queue.end(), [state](const Task& pending) {
                 return pending.state.get() == state && pending.gen > t_running_gen;

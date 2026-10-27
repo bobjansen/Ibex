@@ -1944,7 +1944,8 @@ enum class FloatCleanMode : std::uint8_t {
                                          const TableRegistry& registry,
                                          const ScalarRegistry* scalars,
                                          const ExternRegistry* externs,
-                                         const ExecutionContext& exec, ModelResult* model_out)
+                                         const ExecutionContext& exec, ModelResult* model_out,
+                                         const ir::Node* input_node = nullptr)
     -> std::expected<OperatorPtr, std::string>;
 /// Execute an already-built migrated physical plan. Production's normal
 /// `build_operator` path calls the same implementation after planning; keeping

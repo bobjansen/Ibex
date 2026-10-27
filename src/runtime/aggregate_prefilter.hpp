@@ -20,6 +20,7 @@
 
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/worker_pool.hpp>
+#include <robin_hood.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -51,13 +52,24 @@ using AggregatePrefilter = std::vector<AggregatePrefilterTerm>;
 /// against a numeric literal. The rest of the predicate is simply not used:
 /// every conjunct must hold for a row to pass, so any subset of them is a
 /// sound early test.
-[[nodiscard]] auto aggregate_prefilter_terms(const ir::Expr& predicate,
-                                             const ir::AggregateNode& aggregate)
+///
+/// A literal may also be a bound numeric scalar (`^name`, resolved through
+/// `scalars`): the Polars adapter binds every constant. With `origins`, a
+/// compared column is any name it maps to an aggregate output (and the term
+/// is written against that output); without, only the outputs themselves.
+[[nodiscard]] auto aggregate_prefilter_terms(
+    const ir::Expr& predicate, const ir::AggregateNode& aggregate,
+    const ScalarRegistry* scalars = nullptr,
+    const robin_hood::unordered_map<std::string, std::string>* origins = nullptr)
     -> AggregatePrefilter;
 
-/// The terms for a map pipeline whose source is an aggregate and whose first
-/// step over it is a filter (fused or not). Empty otherwise.
-[[nodiscard]] auto aggregate_prefilter_for_source(const physical::Plan& plan) -> AggregatePrefilter;
+/// The terms for a map pipeline whose source is a grouped aggregate and whose
+/// first filter over it is reached through one-to-one row maps only: Project,
+/// and Update fields that copy an output or wrap it as `coalesce(output, c)`
+/// (the Polars adapter's empty-sum repair). Empty otherwise.
+[[nodiscard]] auto aggregate_prefilter_for_source(const physical::Plan& plan,
+                                                  const ScalarRegistry* scalars = nullptr)
+    -> AggregatePrefilter;
 
 /// The terms resolved against one aggregate's slot layout.
 class GroupPrefilter {

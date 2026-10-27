@@ -495,3 +495,52 @@ TEST_CASE("aggregate prefilter: whole queries answer as the aggregate then the f
         }
     }
 }
+
+TEST_CASE("aggregate prefilter: reaches through the adapter's coalesce and bound scalars",
+          "[aggregate][prefilter]") {
+    // The Polars adapter writes `sum` as `coalesce(sum(v), 0.0)` (an Update
+    // between the aggregate and the filter) and binds every constant as a
+    // scalar. A bare update also bounds a morsel run from below, so under the
+    // parallel contexts the filter's run asks for the update as its input
+    // rather than the aggregate. All of these must still prefilter, and still
+    // answer as the aggregate followed by the filter.
+    const auto registry = make_registry(/*null_values=*/true);
+    runtime::ScalarRegistry scalars;
+    scalars.emplace("limit", runtime::ScalarValue{2700.0});
+    for (const auto& [aggregate, predicate, tail] :
+         std::vector<std::tuple<std::string, std::string, std::string>>{
+             {"t[select { k, s = coalesce(sum(v), 0.0) }, by { k }]", "s > ^limit", ""},
+             {"t[select { k, s = coalesce(sum(v), 0.0) }, by { k }][select { k, s }]",
+              "s > ^limit", "[select { k }]"},
+             {"t[select { s = sum(v) }, by { k }][select { k, t = s }]", "t > 2700.0", ""},
+         }) {
+        INFO(aggregate << "[filter " << predicate << "]" << tail);
+        for (const auto& [name, base] : contexts()) {
+            INFO(name);
+            runtime::ExecutionContext exec = base;
+            auto profile = std::make_shared<runtime::ExecutionProfileState>(
+                /*worker_budget=*/8, /*report=*/false);
+            exec.execution_profile = profile;
+            const auto whole =
+                runtime::interpret(*lower_query(aggregate + "[filter " + predicate + "]" + tail + ";"),
+                                   registry, &scalars, nullptr, nullptr, exec);
+            REQUIRE(whole.has_value());
+            const auto rows = profile->snapshot();
+            const auto row = std::ranges::find_if(
+                rows, [](const auto& r) { return r.label.starts_with("aggregate"); });
+            REQUIRE(row != rows.end());
+            CHECK(row->rows < 50'000);
+            exec.execution_profile = nullptr;
+            auto grouped = runtime::interpret(*lower_query(aggregate + ";"), registry, &scalars,
+                                              nullptr, nullptr, exec);
+            REQUIRE(grouped.has_value());
+            runtime::TableRegistry staged;
+            staged.emplace("a", std::move(grouped.value()));
+            const auto expected =
+                runtime::interpret(*lower_query("a[filter " + predicate + "]" + tail + ";"), staged,
+                                   &scalars, nullptr, nullptr, exec);
+            REQUIRE(expected.has_value());
+            require_same(*expected, *whole);
+        }
+    }
+}

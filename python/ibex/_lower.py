@@ -168,7 +168,27 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
     cache_steps = [(index, key) for index, (operation, key) in enumerate(frame._steps)
                    if operation == "cache"]
     first_step = 0
-    if cache_steps:
+    # A cache over nothing but a Parquet read and plain-column selects shares
+    # no computation. Binding the selects materializes the read, and the
+    # native engine then aggregates and joins over an in-memory table instead
+    # of streaming the file (Q18's lineitem: 15M groups ordered on one
+    # thread). Bind the bare read instead, which stays lazy, and let each
+    # consumer apply the selects -- the shape of the native PDS-H queries.
+    projection_only = bool(cache_steps) and kind == "parquet" and all(
+        operation == "select" and all(
+            (expr._args[0] if expr._op == "alias" else expr)._op == "col" for expr in expressions)
+        for operation, expressions in frame._steps[:cache_steps[-1][0]])
+    if projection_only:
+        key = cache_steps[-1][1]
+        cache_bindings = state.setdefault("cache_bindings", {})
+        prefix = '' if "parquet" in state["imports"] else 'extern fn parquet::read(path: String) -> DataFrame from "parquet.hpp";\n'
+        state["imports"].add("parquet")
+        if key not in cache_bindings:
+            name = f"_ibex_cache_{len(cache_bindings)}"
+            cache_bindings[key] = name
+            prefix += f"let {name} = parquet::read({bind(value)});\n"
+        source = cache_bindings[key]
+    elif cache_steps:
         index, key = cache_steps[-1]
         cache_bindings = state.setdefault("cache_bindings", {})
         prefix = ""
@@ -201,7 +221,7 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
     else:
         raise NotImplementedError(f"unsupported source: {kind}")
     for index, (operation, expressions) in enumerate(frame._steps):
-        if index < first_step:
+        if index < first_step or operation == "cache":
             continue
         current_types = step_types[index] if validate else {}
         if operation == "filter":

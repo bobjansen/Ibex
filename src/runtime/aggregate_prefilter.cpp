@@ -40,9 +40,25 @@ auto inverted(ir::CompareOp op) -> ir::CompareOp {
     }
 }
 
-auto numeric_literal(const ir::Expr& expr) -> std::optional<std::variant<std::int64_t, double>> {
+auto numeric_literal(const ir::Expr& expr, const ScalarRegistry* scalars)
+    -> std::optional<std::variant<std::int64_t, double>> {
     const auto* literal = std::get_if<ir::Literal>(&expr.node);
     if (literal == nullptr) {
+        // A bound scalar is as constant as a literal for this query.
+        const auto* ref = std::get_if<ir::ColumnRef>(&expr.node);
+        if (ref == nullptr || !ref->lexical || scalars == nullptr) {
+            return std::nullopt;
+        }
+        const auto it = scalars->find(ref->name);
+        if (it == scalars->end()) {
+            return std::nullopt;
+        }
+        if (const auto* integer = std::get_if<std::int64_t>(&it->second)) {
+            return *integer;
+        }
+        if (const auto* real = std::get_if<double>(&it->second)) {
+            return *real;
+        }
         return std::nullopt;
     }
     if (const auto* integer = std::get_if<std::int64_t>(&literal->value)) {
@@ -90,7 +106,9 @@ constexpr double kExactDoubleLimit = 9007199254740992.0;  // 2^53
 
 }  // namespace
 
-auto aggregate_prefilter_terms(const ir::Expr& predicate, const ir::AggregateNode& aggregate)
+auto aggregate_prefilter_terms(const ir::Expr& predicate, const ir::AggregateNode& aggregate,
+                               const ScalarRegistry* scalars,
+                               const robin_hood::unordered_map<std::string, std::string>* origins)
     -> AggregatePrefilter {
     std::vector<const ir::Expr*> conjuncts;
     collect_conjuncts(predicate, conjuncts);
@@ -102,47 +120,118 @@ auto aggregate_prefilter_terms(const ir::Expr& predicate, const ir::AggregateNod
             continue;
         }
         const ir::ColumnRef* column = ir::as_column_ref(*comparison->left);
-        auto literal = numeric_literal(*comparison->right);
+        auto literal = numeric_literal(*comparison->right, scalars);
         ir::CompareOp op = comparison->op;
         if (column == nullptr || !literal.has_value()) {
             column = ir::as_column_ref(*comparison->right);
-            literal = numeric_literal(*comparison->left);
+            literal = numeric_literal(*comparison->left, scalars);
             op = inverted(op);
         }
         if (column == nullptr || !literal.has_value()) {
             continue;
         }
+        std::string output = column->name;
+        if (origins != nullptr) {
+            const auto origin = origins->find(column->name);
+            if (column->lexical || origin == origins->end()) {
+                continue;
+            }
+            output = origin->second;
+        }
         const bool is_output = std::ranges::any_of(
-            aggregate.aggregations(),
-            [&](const ir::AggSpec& spec) { return spec.alias == column->name; });
+            aggregate.aggregations(), [&](const ir::AggSpec& spec) { return spec.alias == output; });
         // A group-by key with the same name as an aggregate cannot happen (the
         // output would have two columns of that name), but a key alone is not
         // an aggregate output, so it is not read from the slots.
         if (!is_output) {
             continue;
         }
-        terms.push_back({.output = column->name, .op = op, .literal = *literal});
+        terms.push_back({.output = std::move(output), .op = op, .literal = *literal});
     }
     return terms;
 }
 
-auto aggregate_prefilter_for_source(const physical::Plan& plan) -> AggregatePrefilter {
+auto aggregate_prefilter_for_source(const physical::Plan& plan, const ScalarRegistry* scalars)
+    -> AggregatePrefilter {
     if (plan.steps.empty() || plan.source_node == nullptr ||
         plan.source_node->kind() != ir::NodeKind::Aggregate) {
         return {};
     }
-    // Steps are ordered sink first, so the one reading the source is last. It
-    // must be a filter directly over the aggregate: anything in between (an
-    // update that redefines the name, a rename) would change what the name
-    // means.
-    const MapStep& step = plan.steps.back();
-    if (step.node == nullptr || step.node->kind() != ir::NodeKind::Filter ||
-        step.node->children().empty() || step.node->children().front().get() != plan.source_node) {
+    const auto& aggregate = ir::node_cast<ir::AggregateNode>(*plan.source_node);
+    if (aggregate.group_by().empty()) {
         return {};
     }
-    const auto& filter = ir::node_cast<ir::FilterNode>(*step.node);
-    return aggregate_prefilter_terms(filter.predicate(),
-                                     ir::node_cast<ir::AggregateNode>(*plan.source_node));
+    // Which visible name holds which aggregate output, walking up from the
+    // source. Steps are ordered sink first, so the walk runs backwards. A
+    // Project keeps the names it lists; an Update copies an output under a
+    // new name, wraps it as `coalesce(output, c)`, or makes the name mean
+    // something else. `coalesce` is sound here because the prefilter keeps
+    // any group whose output is null: a non-null output IS the coalesced
+    // value, and a null one is left for the filter above to judge against
+    // `c`. Anything that can drop or duplicate rows ends the walk before the
+    // filter, which must then not be used.
+    robin_hood::unordered_map<std::string, std::string> origins;
+    for (const ir::AggSpec& spec : aggregate.aggregations()) {
+        origins.emplace(spec.alias, spec.alias);
+    }
+    const ir::Node* below = plan.source_node;
+    for (std::size_t index = plan.steps.size(); index-- > 0;) {
+        const ir::Node* node = plan.steps[index].node;
+        if (node == nullptr || node->children().empty() ||
+            node->children().front().get() != below) {
+            return {};
+        }
+        if (node->kind() == ir::NodeKind::Filter) {
+            return aggregate_prefilter_terms(ir::node_cast<ir::FilterNode>(*node).predicate(),
+                                             aggregate, scalars, &origins);
+        }
+        if (node->kind() == ir::NodeKind::Project) {
+            robin_hood::unordered_map<std::string, std::string> kept;
+            for (const ir::ColumnRef& column : ir::node_cast<ir::ProjectNode>(*node).columns()) {
+                if (const auto it = origins.find(column.name); it != origins.end()) {
+                    kept.emplace(column.name, it->second);
+                }
+            }
+            origins = std::move(kept);
+        } else if (node->kind() == ir::NodeKind::Update) {
+            const auto& update = ir::node_cast<ir::UpdateNode>(*node);
+            if (update.guard() != nullptr || !update.group_by().empty() ||
+                !update.tuple_fields().empty()) {
+                return {};
+            }
+            // Fields read the input, so resolve every one before assigning.
+            std::vector<std::pair<std::string, std::optional<std::string>>> assigned;
+            for (const ir::FieldSpec& field : update.fields()) {
+                const ir::Expr* source = &field.expr;
+                if (const auto* call = std::get_if<ir::CallExpr>(&field.expr.node);
+                    call != nullptr && call->callee == "coalesce" && call->args.size() == 2 &&
+                    call->named_args.empty() && call->args[0] != nullptr &&
+                    call->args[1] != nullptr &&
+                    numeric_literal(*call->args[1], scalars).has_value()) {
+                    source = call->args[0].get();
+                }
+                std::optional<std::string> origin;
+                if (const auto* ref = std::get_if<ir::ColumnRef>(&source->node);
+                    ref != nullptr && !ref->lexical) {
+                    if (const auto it = origins.find(ref->name); it != origins.end()) {
+                        origin = it->second;
+                    }
+                }
+                assigned.emplace_back(field.alias, std::move(origin));
+            }
+            for (auto& [alias, origin] : assigned) {
+                if (origin.has_value()) {
+                    origins.insert_or_assign(alias, std::move(*origin));
+                } else {
+                    origins.erase(alias);
+                }
+            }
+        } else {
+            return {};
+        }
+        below = node;
+    }
+    return {};
 }
 
 auto GroupPrefilter::resolve(const AggregatePrefilter& terms,

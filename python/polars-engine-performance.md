@@ -201,18 +201,39 @@ otherwise the query is refused rather than left unchecked. Data cannot spell
 a match (it is only ever numbers), and a column that happens to be called
 `validation` has a dtype name for its value, which is not matched.
 
-| `prepare()`, h2o J1 1e7 rows | before | after |
-|---|---|---|
-| q1-q4 | 23.1-25.0 s | 7.8-8.6 s |
-| q5 | 47.0 s | 16.1 s |
+| `prepare()`, h2o J1 1e7 rows | before | scanning the text | streaming plan |
+|---|---|---|---|
+| q1-q4 | 23.1-25.0 s | 7.8-8.6 s | 0.76-0.95 s |
+| q5 | 47.0 s | 16.1 s | 1.6 s |
 
-What remains is mostly `serialize_json` itself (6.2 s of 8.4 s), which is
-Polars'; removing it needs the visitor to report the validation. A substring
-search in place of the regex was measured and is no faster. Queries over
-Parquet scans carry no data in the plan and are unaffected; the 22 PDS-H
-queries still pass the full-result comparison with Polars (SF 10).
+Scanning the text still left Polars' own `serialize_json` (6.2 s of 8.4 s):
+serialization cost is not the encoding (binary takes 6.4 s for the same
+frame; four numeric columns alone take 2.3 s). So the data is not serialized
+at all when the plan cannot hold a validated join.
+
+The streaming engine runs only joins with the default cardinality check, and
+plans any other as an `in-memory-join`. `to_dot_streaming_phys` renders that
+graph from the plan without touching resident data (0 ms for 10M rows).
+`_joins_may_be_validated` therefore reads the validation from the plan text
+only when that graph contains an `in-memory-join` or cannot be rendered.
+Checked over 216 non-default validations (inner, left, right, full, semi and
+anti joins; one and two keys; `nulls_equal`; each `maintain_order`) none
+planned without the fallback, and no default join did. Polars rejects some
+combinations (for example 1:1 on a right join) while planning, which also
+takes the text path. A self-test on small frames confirms the contract on the
+installed Polars at first use; if it ever fails, every join reads the plan.
+
+What `prepare()` still costs is the data import: 0.7 s of the 0.8 s is building
+the 10M-entry dictionary for `id6`, whose rows are all distinct.
+
+Queries over Parquet scans carry no data in the plan; the 22 PDS-H queries
+still pass the full-result comparison with Polars (SF 10).
 
 `test_join_validation_is_read_without_decoding_the_resident_data` fails on the
-previous implementation ("plan decoded") and passes now. It also checks a
-column named `validation`, values that spell the pattern, and that a
-`validate="m:1"` join is still refused.
+original implementation ("plan decoded"), covers a column named `validation`
+and values that spell the pattern, and checks `validate="m:1"` is still
+refused. `test_default_join_validation_never_serializes_the_plan` fails on the
+text-scanning version ("plan serialized") for every join kind;
+`test_validated_joins_are_refused_whatever_the_join` and
+`test_join_validation_is_still_read_when_the_streaming_plan_cannot_tell` cover
+the refusal and the fallback.

@@ -1700,3 +1700,43 @@ Q21 is 1.24× streaming Polars (was 1.53×); native Q21 is ~750 ms. Its
 second statement (the distinct counts over lineitem) is the remaining
 difference. All 22 match; full ctest passes. Data is in
 `pdsh-performance-results/q21-direct-joins.json`.
+
+## Q10: what blocks the native FD path (investigation, no code change)
+
+Q10 is the largest remaining gap: ~690 ms through the adapter, ~440 ms
+native, ~464 ms streaming Polars. Decoding costs the same in both paths.
+Native Q10 groups by seven customer columns. The FD reduction cuts that to
+`c_custkey`, and the late-materialization lift then fetches the wide
+customer strings for the 20 surviving rows only. The adapter's query
+reaches neither. A prototype got through four blockers and stopped at a
+fifth:
+
+1. **Computed float keys.** The adapter groups `c_acctbal` by a NaN flag
+   and a normalized value (Polars NaN semantics). `rewrite_aggregate` and
+   `group_key_proof_candidates` require every key to have a base origin. A
+   row-local key computed from determined columns is itself determined; the
+   prototype traced such keys through their defining Updates.
+2. **`case` is not in the builtin table.** `__case` has no
+   `expr_predicates.cpp` entry, so `is_row_local_update_expr` refuses every
+   `case`, including one nested inside `Float64(round(...))`. Classifying it
+   globally measured neutral on Q10; the prototype used a local case-aware
+   check instead.
+3. **The uniqueness proof.** `customer` (1.5M rows) is over the ordinary
+   proof cap, and only the group-key proof budget applies. Fixing (1) in
+   `group_key_proof_candidates` let the proof and the reduction fire.
+4. **Reduction without the lift is slower.** With the strings carried as
+   `first()` aggregates, Q10 measured ~5–8% slower than grouping by them.
+   The reduction only pays together with the lift.
+5. **The lift's chain.** Between the aggregate and the top-k the adapter
+   puts the rounding Update for `sum().round(2)`, a constant
+   `filter(^scalar)`, the sort-flag Update and Projects. `aggregate_below`
+   accepts only Order and Project. Extending it to row-local Updates and
+   Filters that do not touch lifted columns got further, but the lift still
+   declined at a later node.
+
+A related piece: `slice(0, n)` lowered as `[head n]` instead of a `seq()`
+filter fuses into a top-k, but measured neutral on its own.
+
+None of the pieces is kept, because none improves Q10 alone and (4)
+regresses it. The next attempt should finish (5) first, then land
+(1)+(3)+(5) together behind one all-22 A/B.

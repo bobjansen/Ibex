@@ -467,13 +467,29 @@ void admit_stream_only_updates(Plan& plan, bool found_run) {
         plan.stream_only_bottom_updates = plan.steps.size() - plan.parallel_end;
         plan.parallel_end = plan.steps.size();
     }
+    // Projections and renames between those updates come along: a worker
+    // applies them to its unit for free, and stopping at one left the updates
+    // above it serial -- and the scan-worker sink of a join over the chain
+    // withdrawn. The adapter lowers each renaming `select` to an update and a
+    // projection, so q22's anti-join key reached its probe as Project, Update,
+    // Project, Update over the orders scan. At least one update must come, or
+    // the chain has no row work to stream.
     std::size_t begin = found_run ? plan.parallel_begin : plan.steps.size();
     std::size_t admitted = 0;
-    while (begin > 0 && is_stream_admissible_update(*plan.steps[begin - 1].node)) {
+    std::size_t admitted_updates = 0;
+    while (begin > 0) {
+        const ir::Node& node = *plan.steps[begin - 1].node;
+        if (is_stream_admissible_update(node)) {
+            ++admitted_updates;
+        } else if (execution_capability(node) != ExecutionCapability::ParallelMap ||
+                   !is_metadata_only_node(node.kind()) ||
+                   !map_step_expressions_are_subset_evaluable(node)) {
+            break;
+        }
         --begin;
         ++admitted;
     }
-    if (admitted == 0) {
+    if (admitted_updates == 0) {
         return;
     }
     if (!found_run) {

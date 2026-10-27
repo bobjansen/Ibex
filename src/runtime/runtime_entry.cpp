@@ -440,11 +440,11 @@ auto resolved_aggregate_parallelism(const physical::HashAggregateNodes& nodes,
 /// the same condition the aggregate does.
 auto is_row_local_chain_over_lazy_scan(const ir::Node& node, const TableRegistry& registry) -> bool;
 
-/// The row count of the deferred lazy source under a chain of Filter, Project,
-/// Rename and Update nodes, or nullopt when `node` is not such a chain. The
-/// source's count, not the chain's output: an upper bound, used only to order
-/// two sides' work.
-auto lazy_chain_source_rows(const ir::Node& node, const TableRegistry& registry,
+/// The row count of the source under a chain of Filter, Project, Rename and
+/// Update nodes -- a deferred lazy source or an in-memory table -- or nullopt
+/// when `node` is not such a chain. The source's count, not the chain's
+/// output: an upper bound, used only to order two sides' work.
+auto chain_source_rows(const ir::Node& node, const TableRegistry& registry,
                             const ExecutionContext& exec) -> std::optional<std::size_t> {
     const ir::Node* cur = &node;
     while (cur->kind() == ir::NodeKind::Filter || cur->kind() == ir::NodeKind::Project ||
@@ -458,8 +458,8 @@ auto lazy_chain_source_rows(const ir::Node& node, const TableRegistry& registry,
         return std::nullopt;
     }
     const auto& name = ir::node_cast<ir::ScanNode>(*cur).source_name();
-    if (registry.contains(name)) {
-        return std::nullopt;
+    if (const auto it = registry.find(name); it != registry.end()) {
+        return it->second.rows();
     }
     const auto* deferred = exec.deferred_scan(name);
     if (deferred == nullptr || deferred->lazy == nullptr) {
@@ -520,8 +520,10 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
         std::shared_ptr<ScanWorkerSink> scan_sink;
         if (join.keys().size() == 1 && exec.can_fan_out() && exec.stream_scans &&
             is_row_local_chain_over_lazy_scan(*join.children()[1], registry)) {
-            const auto left_rows = lazy_chain_source_rows(*join.children()[0], registry, exec);
-            const auto right_rows = lazy_chain_source_rows(*join.children()[1], registry, exec);
+            // A materialized left (q22's shared customer subtree) drains
+            // without decoding anything, which is the cheapest case of all.
+            const auto left_rows = chain_source_rows(*join.children()[0], registry, exec);
+            const auto right_rows = chain_source_rows(*join.children()[1], registry, exec);
             if (left_rows.has_value() && right_rows.has_value() && *left_rows < *right_rows) {
                 scan_sink = make_semi_anti_scan_sink();
             }

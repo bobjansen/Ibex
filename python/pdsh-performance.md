@@ -1454,3 +1454,46 @@ Samples are in `pdsh-performance-results/q22-prefix-pushdown.json`.
 
 Remaining at eight threads: the orders decode and the anti join (~48 ms).
 Applying the balance threshold before the anti join is next.
+
+## Q22: the anti join probes orders on the scan workers (and Q01 streams fully)
+
+A fresh profile showed the anti join's consumer statement (~42 ms at eight
+threads) draining all 15M order keys, then scanning them in one burst after
+decode (`scan_kept_right`, 14.7 ms serial plus a 13.6 ms barrier). The
+streamed swapped build already exists: the operator buffers the small left
+side and has each orders chunk probed by the worker that decoded it. Q22
+never reached it, for two independent reasons:
+
+* **The sink needed both sides to be lazy scans.** Q22's left side is the
+  materialized `_ibex_cache_0` binding. `chain_source_rows` now also sizes an
+  in-memory table, the cheapest left of all to drain first.
+* **The right chain could not stream to the probe.** The adapter lowers
+  each renaming `select` to an Update and a Project, so the join key reached
+  the join as Project, Update, Project, Update over the orders scan. The
+  planner only admitted updates directly above a streamed run and stopped
+  at the first projection. The steps above ran serially, and the sink was
+  withdrawn. Metadata-only projections and renames now come along with the
+  updates around them, as long as at least one update does.
+
+The second change is general. Q01's computed columns have the same shape
+over lineitem.
+
+| SF10, eight threads | Before | After | Rounds faster |
+|---|---:|---:|---:|
+| Q01 | 822.3 ms | 649.7 ms (−21.0%) | 5/5 |
+| Q22 | 87.8 ms | 82.3 ms (−6.3%) | 5/5 |
+| Q06 | 218.6 ms | 218.3 ms | 3/5 |
+| Q07 | 503.5 ms | 505.6 ms | 2/5 |
+
+Q22 at one thread is −1.0% (5/5 rounds). These are medians of five
+interleaved rounds, alternating the two bridge builds in separate processes.
+One sequential all-22 pass per state showed no other query moving beyond
+Polars' own drift, and all 22 match. Polars streaming takes ~76–82 ms on Q22
+in these sittings. Data is in
+`pdsh-performance-results/q22-streamed-anti-probe.json`.
+
+The earlier balance threshold before the anti join was also measured, by
+hand-reordering the query (not committed): no change at eight threads, −8% at
+one. Doing it properly needs a planner rule that swaps a singleton cross join
+below the anti join, seen through the adapter's projections, so it is
+deferred.

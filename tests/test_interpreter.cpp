@@ -18546,6 +18546,76 @@ TEST_CASE("Semi/anti join probes a streamed right side on its scan workers",
     }
 }
 
+// The same probe with the left side already materialized (q22's shared
+// customer subtree is a binding, not a lazy scan) and the right key renamed
+// on its way up, the way the Polars adapter lowers it. Both used to send the
+// right side down the drain-then-scan build; the answer must not change.
+TEST_CASE("Semi/anti join with an in-memory left probes a renamed streamed right",
+          "[runtime][parallel][join]") {
+    constexpr std::size_t kRightUnits = 20;
+    constexpr std::size_t kRightRowsPerUnit = 5000;
+    const auto right_key = [](std::size_t r) -> std::optional<std::int64_t> {
+        if (r % 997 == 0) {
+            return std::nullopt;
+        }
+        return static_cast<std::int64_t>(2 * (r % 9000));
+    };
+    auto right_state = std::make_shared<KeyedUnitState>();
+    right_state->units = kRightUnits;
+    right_state->rows_per_unit = kRightRowsPerUnit;
+    right_state->key_of = right_key;
+    std::set<std::int64_t> right_keys;
+    for (std::size_t r = 0; r < kRightUnits * kRightRowsPerUnit; ++r) {
+        if (const auto key = right_key(r)) {
+            right_keys.insert(*key);
+        }
+    }
+    runtime::DeferredScanRegistry deferred;
+    deferred.emplace("big", runtime::DeferredScan{.lazy = keyed_unit_lazy(right_state),
+                                                  .conjuncts = {},
+                                                  .demand = {"k", "n"},
+                                                  .demand_all = false,
+                                                  .key_column = {},
+                                                  .filter = nullptr});
+
+    constexpr std::size_t kLeftRows = 4000;
+    Column<std::int64_t> keys;
+    Column<std::int64_t> ids;
+    std::vector<bool> valid(kLeftRows, true);
+    for (std::size_t i = 0; i < kLeftRows; ++i) {
+        keys.push_back(static_cast<std::int64_t>(3 * i));
+        ids.push_back(static_cast<std::int64_t>(i));
+        valid[i] = i % 211 != 0;
+    }
+    runtime::Table small;
+    small.add_column("k", std::move(keys), std::move(valid));
+    small.add_column("id", std::move(ids));
+    runtime::TableRegistry registry;
+    registry.emplace("small", small);
+
+    runtime::ParallelPipelineStats stats;
+    auto exec = many_unit_exec(deferred, stats);
+    for (const char* query :
+         {"small semi join big[select { r0 = k }][select { k = r0 }] on k;",
+          "small anti join big[select { r0 = k }][select { k = r0 }] on k;"}) {
+        INFO(query);
+        const bool semi = std::string_view{query}.find("semi") != std::string_view::npos;
+        auto ir = require_ir(query);
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        const auto* id = std::get_if<Column<std::int64_t>>(out->find("id"));
+        REQUIRE(id != nullptr);
+        std::vector<std::int64_t> expected;
+        for (std::size_t i = 0; i < kLeftRows; ++i) {
+            const bool match = i % 211 != 0 && right_keys.contains(static_cast<std::int64_t>(3 * i));
+            if (match == semi) {
+                expected.push_back(static_cast<std::int64_t>(i));
+            }
+        }
+        REQUIRE(std::vector<std::int64_t>(id->begin(), id->end()) == expected);
+    }
+}
+
 // Streams four large units whose Categorical keys each carry their OWN
 // dictionary, in a different order per unit, the way Parquet row groups do; the
 // last unit adds a key value the others never saw. Values are exact in binary

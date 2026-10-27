@@ -542,7 +542,8 @@ struct Plan {
         return parallel_end - parallel_begin;
     }
     /// How many steps at the TOP of the run, `[parallel_begin, parallel_begin +
-    /// stream_only_updates)`, are row-local updates that belong to it only when
+    /// stream_only_updates)`, are row-local updates (and the projections or
+    /// renames between them) that belong to it only when
     /// the run streams its lazy source unit by unit. A streaming worker computes
     /// them in place over the unit it just decoded -- no gather, no concat --
     /// so they cost nothing to include and take a per-chunk fork-join off the

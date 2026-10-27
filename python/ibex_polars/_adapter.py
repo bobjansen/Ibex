@@ -8,6 +8,7 @@ native input binding or execution.
 """
 
 import json
+import re
 import warnings
 from datetime import date
 from pathlib import Path
@@ -31,6 +32,8 @@ _INTEGER_LAYOUTS = {
     pl.Int8: (8, True), pl.Int16: (16, True), pl.Int32: (32, True),
     pl.Int64: (64, True), pl.UInt8: (8, False), pl.UInt16: (16, False),
 }
+_JOIN_NODE = re.compile(r'\{"Join"\s*:\s*\{')
+_JOIN_VALIDATION = re.compile(r'"validation"\s*:\s*"(ManyToMany|ManyToOne|OneToMany|OneToOne)"')
 _SUPPORTED_INPUT_TYPES = (*_INTEGER_LAYOUTS, *TEMPORAL_TYPES, pl.Float32, pl.Float64, pl.Boolean, pl.String, pl.Date, pl.Categorical)
 
 
@@ -422,27 +425,20 @@ class Adapter:
             return
         # Visitor 15.2 omits JoinValidation. Read original plan metadata once
         # so cardinality assertions cannot silently become unchecked joins.
-        def discard_payload(value):
-            if "df" in value and "schema" in value:
-                value["df"] = None
-            return value
+        # Resident data serializes as an array of IPC bytes, one JSON number
+        # each, so decoding the document would build the data as Python
+        # integers. Only the text around the data is of interest, and none of
+        # the data can spell a quoted name.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            plan = json.loads(self.original_frame.serialize(format="json"), object_hook=discard_payload)
-        def walk(value):
-            if isinstance(value, dict):
-                if "Join" in value:
-                    validation = value["Join"]["options"]["args"]["validation"]
-                    if validation != "ManyToMany":
-                        raise NotImplementedError("join cardinality validation is not supported by this visitor adapter")
-                for key, child in value.items():
-                    if key != "df":
-                        walk(child)
-            elif isinstance(value, list):
-                for child in value:
-                    if isinstance(child, (dict, list)):
-                        walk(child)
-        walk(plan)
+            plan = self.original_frame.serialize(format="json")
+        # A field of that name that is not a join's, such as a column in a
+        # schema, has some other value and is not matched.
+        validations = _JOIN_VALIDATION.findall(plan)
+        if len(validations) != len(_JOIN_NODE.findall(plan)):
+            raise NotImplementedError("join cardinality validation could not be read from the plan")
+        if any(validation != "ManyToMany" for validation in validations):
+            raise NotImplementedError("join cardinality validation is not supported by this visitor adapter")
         self.checked_join_validation = True
 
     def _aggregate_rounding(self, frame, fields, *, keys=None, maintain_order=False):

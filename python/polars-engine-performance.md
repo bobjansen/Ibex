@@ -179,13 +179,40 @@ the gather) and `prepare()`. `G1 2e0 q2` reads 1.5 times slower in the rounds,
 but each process lands on either 6.3-6.6 ms or 9.2-9.5 ms for both versions
 (six processes each), so that is per-process variance, not this change.
 
-`prepare()` for joins over resident data is dominated by
-`Adapter._check_join_validation`, which serializes the whole plan, data
-included, to JSON to read each join's `validation` option (about 23 s of the
-25 s here). It is untouched by this change.
-
 Two regression tests (`test_categorical_results_reuse_the_ids_polars_assigned`
 and `test_categorical_ids_are_not_taken_from_a_look_alike_dictionary`) cover
 the fast path, nulls, multi-chunk input, equal-length dictionaries with
 different labels, and the fallback; the first fails on all five of its cases
 with the fast path disabled.
+
+## Join validation no longer decodes the resident data
+
+`prepare()` for a join over resident data cost 25 s for the 10M-row h2o join
+set, against 40 ms for Polars to run the join. Visitor 15.2 does not expose a
+join's `validation`, so `Adapter._check_join_validation` serialized the whole
+plan to JSON and decoded it to read that one enum. A resident DataFrame
+serializes as its Arrow IPC bytes written as a JSON array of numbers, so the
+plan was several hundred megabytes of text: 6 s to produce and 17 s to decode
+into Python integers.
+
+The plan text is now scanned instead of decoded: the join-validation enum
+names are matched, and their number must equal the number of `Join` nodes,
+otherwise the query is refused rather than left unchecked. Data cannot spell
+a match (it is only ever numbers), and a column that happens to be called
+`validation` has a dtype name for its value, which is not matched.
+
+| `prepare()`, h2o J1 1e7 rows | before | after |
+|---|---|---|
+| q1-q4 | 23.1-25.0 s | 7.8-8.6 s |
+| q5 | 47.0 s | 16.1 s |
+
+What remains is mostly `serialize_json` itself (6.2 s of 8.4 s), which is
+Polars'; removing it needs the visitor to report the validation. A substring
+search in place of the regex was measured and is no faster. Queries over
+Parquet scans carry no data in the plan and are unaffected; the 22 PDS-H
+queries still pass the full-result comparison with Polars (SF 10).
+
+`test_join_validation_is_read_without_decoding_the_resident_data` fails on the
+previous implementation ("plan decoded") and passes now. It also checks a
+column named `validation`, values that spell the pattern, and that a
+`validate="m:1"` join is still refused.

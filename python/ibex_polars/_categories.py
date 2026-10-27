@@ -36,18 +36,39 @@ def eligible(series):
 
 
 def unify(series):
-    """The column as one int32/utf8 dictionary chunk, and what its entries map to."""
-    physical = series.to_physical().rechunk().to_arrow()
-    if isinstance(physical, pa.ChunkedArray):
-        physical = physical.combine_chunks()
-    labels = series.drop_nulls().unique()
-    ids = labels.to_physical().to_numpy()
+    """The column as one int32/utf8 dictionary chunk, and what its entries map to.
+
+    One pass over the physical ids finds which labels occur, in id order.
+    """
+    ids_column = series.to_physical().to_arrow()
+    if isinstance(ids_column, pa.ChunkedArray):
+        ids_column = ids_column.combine_chunks()
+    nulls = None
+    if ids_column.null_count:
+        nulls = ids_column.is_null().to_numpy(zero_copy_only=False)
+        ids_column = ids_column.fill_null(0)
+    values = ids_column.to_numpy(zero_copy_only=False)
+    top = int(values.max())
+    if top >= 2**31:
+        raise NotImplementedError("categorical ids exceed the native Int32 code range")
+    present = np.zeros(top + 1, dtype=bool)
+    if nulls is None:
+        present[values] = True
+    else:
+        present[values[~nulls]] = True
+    ids = np.flatnonzero(present).astype(np.uint32)
+    labels = pl.Series(ids, dtype=pl.UInt32).cat.to(series.dtype).cast(pl.String)
     # The native importer reads 32-bit offsets, as it does for any utf8 column.
-    dictionary = labels.cast(pl.String).to_arrow().cast(pa.string())
-    codes_of = np.zeros(int(ids.max()) + 1, dtype=np.int32)
-    codes_of[ids] = np.arange(len(ids), dtype=np.int32)
-    nulls = physical.is_null().to_numpy(zero_copy_only=False) if physical.null_count else None
-    codes = codes_of[physical.fill_null(0).to_numpy(zero_copy_only=False)]
+    dictionary = labels.to_arrow().cast(pa.string())
+    if len(ids) == top - int(ids[0]) + 1:
+        # Ids a fresh cast assigns are consecutive: the code is the offset.
+        codes = values.view(np.int32) - np.int32(ids[0])
+    else:
+        codes_of = np.zeros(top + 1, dtype=np.int32)
+        codes_of[ids] = np.arange(len(ids), dtype=np.int32)
+        codes = codes_of[values]
+    if nulls is not None:
+        codes[nulls] = 0
     array = pa.DictionaryArray.from_arrays(pa.array(codes, mask=nulls), dictionary)
     return array, Known(dictionary, ids, series.dtype)
 

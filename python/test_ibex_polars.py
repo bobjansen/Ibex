@@ -19,7 +19,7 @@ import pyarrow.parquet as pq
 import ibex_pyarrow
 from ibex_polars import IbexEngine
 from ibex_polars._adapter import Adapter
-from ibex_polars import _categories, _engine
+from ibex_polars import _adapter as _adapter_module, _categories, _engine
 from ibex_polars._engine import _to_polars
 
 
@@ -935,6 +935,21 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(frame["g"].to_list(), [array.dictionary[1].as_py(), array.dictionary[0].as_py(), None,
                                                 array.dictionary[1].as_py()])
         self.assertEqual(frame.schema, expected)
+
+    def test_join_validation_is_read_without_decoding_the_resident_data(self):
+        # Resident data serializes as one JSON number per byte; decoding the
+        # plan to find each join's cardinality check made prepare() cost
+        # seconds per hundred megabytes. A column and values that spell the
+        # pattern must neither fool the scan nor trip it.
+        left = pl.DataFrame({"k": [1, 2, 3], "validation": ['"validation":"OneToOne"', '{"Join":{', "x"]})
+        right = pl.DataFrame({"k": [1, 2, 4], "y": [1., 2., 3.]})
+        query = left.lazy().join(right.lazy(), on="k").join(right.lazy(), on="k", suffix="_2")
+        with patch.object(_adapter_module.json, "loads", side_effect=AssertionError("plan decoded")):
+            self.engine.prepare(query)
+        self.equal(query.sort("k"))
+        with self.assertRaises(NotImplementedError):
+            self.engine.prepare(left.lazy().join(right.lazy(), on="k").join(
+                right.lazy(), on="k", suffix="_2", validate="m:1"))
 
     def test_prepare_projects_demanded_columns_without_query_collection(self):
         query = pl.DataFrame({"x": [1, 2], "unused": [[1], [2]]}).lazy().select(pl.sum("x"))

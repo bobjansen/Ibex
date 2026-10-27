@@ -1740,3 +1740,35 @@ filter fuses into a top-k, but measured neutral on its own.
 None of the pieces is kept, because none improves Q10 alone and (4)
 regresses it. The next attempt should finish (5) first, then land
 (1)+(3)+(5) together behind one all-22 A/B.
+
+## `case` classified as a row-local scalar
+
+`case { ... }` lowers to `__case`, which had no entry in the builtin
+function table (`src/ir/expr_predicates.cpp`). Every check that asks whether
+an expression is row-local or subset-evaluable therefore refused any
+expression containing a `case`. Such an Update was kept out of the morsel
+map kernels and streaming runs, and FD reduction and the payload lift
+skipped it. The runtime already evaluated `__case` column-wise and over row
+ranges, so the omission only cost plans. `__case` is now a row-local
+Scalar that absorbs nulls (a null condition falls through to the next arm,
+as `coalesce` does).
+
+Adapter, three interleaved all-22 rounds at eight threads, SF10:
+
+| Query | Before | After | Rounds faster |
+|---|---:|---:|---:|
+| Q20 | 503.0 ms | 460.7 ms (−8.4%) | 3/3 |
+| Q02 | 64.4 ms | 62.2 ms (−3.4%) | 3/3 |
+| Q10 | 686.6 ms | 696.1 ms (+1.4%) | 0/3 |
+| Q11 | 96.4 ms | 97.9 ms (+1.6%) | 0/3 |
+| all 22, geometric mean | | −0.4% | |
+
+Native PDS-H (`benchmarking/ab_queries.py`, eight cores): geometric mean
+−0.1%, every query "same" with identical output. The three it first marked
+unclear (Q03, Q16, Q17) were "same" at 20 repeats. The small consistent
+Q10 and Q11 costs are recorded rather than hidden. Full ctest and Python
+tests pass. A unit test pins the classification, including that a `case`
+with a `lag` arm is still not row-local, and the ranged-evaluation oracle
+now covers a `case` nested inside a call. Data is in
+`pdsh-performance-results/case-classification.json` and
+`case-classification-native-ab.txt`.

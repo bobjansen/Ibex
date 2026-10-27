@@ -46,6 +46,38 @@ TEST_CASE("unknown functions are never assumed to be scalar", "[ir][functions]")
     CHECK(ir::is_subset_evaluable_expr(scalar_call));
 }
 
+TEST_CASE("a case expression is a row-local scalar", "[ir][functions]") {
+    // `case { ... }` lowers to `__case`. Unlisted, every case counted as an
+    // unknown call, so an update containing one never ran in a map kernel.
+    auto col = [](std::string name) {
+        return ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = std::move(name)}});
+    };
+    auto lit = [](std::int64_t v) {
+        return ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = v}});
+    };
+    const auto make_case = [&](ir::ExprPtr arm) {
+        std::vector<ir::ExprPtr> args;
+        args.push_back(col("flag"));
+        args.push_back(std::move(arm));
+        args.push_back(lit(0));
+        return ir::Expr{
+            .node = ir::CallExpr{.callee = "__case", .args = std::move(args), .named_args = {}}};
+    };
+    CHECK(ir::fn_kind("__case") == ir::FnKind::Scalar);
+    CHECK(ir::scalar_null_behavior("__case") == ir::NullBehavior::Absorbs);
+    const auto plain = make_case(col("v"));
+    CHECK(ir::is_row_local_update_expr(plain));
+    CHECK(ir::is_subset_evaluable_expr(plain));
+    // Its arms are still checked: a case reading a neighbouring row is not
+    // row-local just because `__case` itself is.
+    std::vector<ir::ExprPtr> lag_args;
+    lag_args.push_back(col("v"));
+    const auto with_lag = make_case(ir::make_expr_ptr(
+        ir::Expr{.node = ir::CallExpr{.callee = "lag", .args = std::move(lag_args), .named_args = {}}}));
+    CHECK_FALSE(ir::is_row_local_update_expr(with_lag));
+    CHECK_FALSE(ir::is_subset_evaluable_expr(with_lag));
+}
+
 // Licenses cutting a group's rows at a window-bucket boundary. Anything that
 // reads across buckets must be refused, because the cut has no halo -- a false
 // positive here is a wrong answer, not a slow one.

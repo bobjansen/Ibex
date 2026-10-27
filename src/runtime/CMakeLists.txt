@@ -5,6 +5,7 @@ add_library(ibex_runtime STATIC
     aggregate.cpp
     aggregate_chunked.cpp
     aggregate_prefilter.cpp
+    bound_plan.cpp
     paired_aggregate.cpp
     chunk_conversion.cpp
     decimal_aggregate.cpp

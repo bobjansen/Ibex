@@ -448,6 +448,16 @@ using ScalarRegistry = robin_hood::unordered_map<std::string, ScalarValue>;
     std::span<const ir::DeferredScalarBinding> bindings, const TableRegistry& tables,
     ScalarRegistry& scalars, const ExternRegistry* externs) -> std::expected<void, std::string>;
 
+/// Specialize a lowered plan for one execution: every `^name` that names a
+/// binding in `scalars` becomes a literal of that value, in filter, update,
+/// join, head/tail count and fused filter-limit expressions. Extern call
+/// arguments stay as written: reader schemas are keyed by them. Literal-only
+/// planner and kernel gates then fire for bound constants too (the Polars
+/// adapter binds every constant). Call only on a plan that executes once,
+/// against exactly these bindings, never on one that is cached and run again.
+[[nodiscard]] auto bind_plan_constants(ir::NodePtr plan, const ScalarRegistry& scalars)
+    -> ir::NodePtr;
+
 class LazyTable;
 
 /// Register-blocked Bloom filter over int64 join keys: each key sets two bits

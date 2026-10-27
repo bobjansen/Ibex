@@ -3629,6 +3629,9 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     if (!lowered) {
         return std::unexpected(lowered.error().message);
     }
+    // Every earlier statement has run, so each `^name` holds its final value
+    // here. Bound first, so the rewrites below see the literals too.
+    lowered.value() = runtime::bind_plan_constants(std::move(lowered.value()), scalars);
 
     // Everything `parser::lower()` does after lowering a whole program, which
     // `lower_expr` does not do for a single statement. Without it a REPL
@@ -3980,6 +3983,7 @@ auto try_bind_ascribed_lazy_source(parser::Expr& expr, runtime::TableRegistry& t
     if (!lowered) {
         return std::nullopt;  // the eager path reports it
     }
+    lowered.value() = runtime::bind_plan_constants(std::move(lowered.value()), scalars);
     if (auto ok = check_and_fuse_ascriptions(lowered.value(), context.source_schemas);
         !ok.has_value()) {
         return std::unexpected(ok.error());
@@ -6321,6 +6325,15 @@ auto try_execute_whole_script(parser::Program& program, runtime::ExternRegistry&
     if (script->result == nullptr) {
         return decline("script ends in an effect, with no result plan");
     }
+    // Every scalar binding was materialized above, before lowering, so each
+    // `^name` the plans read already holds its value for this run.
+    script->result = runtime::bind_plan_constants(std::move(script->result), scalars);
+    for (auto& shared : script->shared_bindings) {
+        shared.plan = runtime::bind_plan_constants(std::move(shared.plan), scalars);
+    }
+    for (auto& sink : script->sinks) {
+        sink.input = runtime::bind_plan_constants(std::move(sink.input), scalars);
+    }
 
     // A shared binding's plan is evaluated on its own, inside `evaluate`,
     // where `ir::required_columns` has no consumer above the plan's root and
@@ -6523,6 +6536,7 @@ void print_physical_explain(parser::Expr& expr, const runtime::TableRegistry& ta
         ibex::formatting::print("error: {}\n", lowered.error().message);
         return;
     }
+    lowered.value() = runtime::bind_plan_constants(std::move(lowered.value()), scalars);
     lowered.value() = equality_joins_as_keys(std::move(lowered.value()), context.source_schemas);
     lowered.value() =
         ir::push_filters_into_joins(std::move(lowered.value()), context.source_schemas);

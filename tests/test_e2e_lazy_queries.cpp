@@ -216,6 +216,29 @@ joined;
             std::set<std::vector<std::int64_t>>{{1, 20}, {4, 40}, {4, 50}});
 }
 
+TEST_CASE("e2e lazy: a deferred scalar acts as a literal in the whole-script plan",
+          "[e2e][lazy]") {
+    // Every scalar binding is materialized before the script is lowered, so
+    // `^fill` is bound into the plan. `fill_null` takes only a literal fill
+    // value: unbound, the reference reached the kernel and was an error.
+    ibex::runtime::ValidityBitmap valid(4, true);
+    valid.set(1, false);
+    Table t;
+    t.add_column("x", Column<std::int64_t>{3, 0, 1, 5}, std::move(valid));
+
+    const char* src = R"(
+extern fn read_t() -> DataFrame from "x.hpp";
+extern fn capture(df: DataFrame) -> Int from "x.hpp";
+
+let fill = scalar(Table { v = [4] }, v);
+let result = read_t()[update { y = fill_null(x, ^fill) }][filter y > 3, select { y }];
+capture(result);
+result;
+)";
+    Table out = run_lazy_script(src, {{"read_t", std::move(t)}});
+    CHECK(i64(out, "y") == std::vector<std::int64_t>{4, 5});
+}
+
 TEST_CASE("e2e lazy: self-join keeps both occurrences distinct", "[e2e][lazy]") {
     // q21 / group-key-reduction shape: a source self-joined on a non-unique
     // column. A unique-key proof on one occurrence must not collapse rows of

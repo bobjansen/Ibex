@@ -18595,9 +18595,13 @@ TEST_CASE("Semi/anti join with an in-memory left probes a renamed streamed right
 
     runtime::ParallelPipelineStats stats;
     auto exec = many_unit_exec(deferred, stats);
+    // Renamed, and projection-only: a Project above the scan keeps the
+    // scan-worker probe (it cannot drop rows or rebind the key's name).
     for (const char* query :
          {"small semi join big[select { r0 = k }][select { k = r0 }] on k;",
-          "small anti join big[select { r0 = k }][select { k = r0 }] on k;"}) {
+          "small anti join big[select { r0 = k }][select { k = r0 }] on k;",
+          "small semi join big[select { k, n }][select { k }] on k;",
+          "small anti join big[select { k, n }][select { k }] on k;"}) {
         INFO(query);
         const bool semi = std::string_view{query}.find("semi") != std::string_view::npos;
         auto ir = require_ir(query);

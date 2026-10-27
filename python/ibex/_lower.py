@@ -274,6 +274,37 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             # schema from the preceding step (or the join's input frame).
             before = frame.__class__(frame._source, frame._steps[:index])
             left_columns = _validate_types(before, widen_numeric_inputs=widen_numeric_inputs)[1][-1]
+            # Without a name both sides carry (other than a key spelled alike on
+            # both), the join needs no renaming: it is emitted over the inputs'
+            # own names. Native join passes -- semi-join pushdown, filter
+            # pushdown into a join, join reordering -- look for a Join directly
+            # under its parent, and the renaming selects (copy updates) hid
+            # every adapter join from them: Q21 kept its orders semi join above
+            # the supplier and nation joins. Ordered, float-keyed (NaN keys
+            # need the flag/value pair below) and right/full/cross joins keep
+            # the renaming lowering, as does a folded key the output must still
+            # read from the right.
+            shared = set(left_columns) & set(right_columns)
+            direct = (maintain_order == "none" and how in ("inner", "left", "semi", "anti") and
+                      all(left_columns[key] != pa.float64() for key in left_on) and
+                      all(name in left_on and name in right_on and left_on.index(name) == right_on.index(name)
+                          for name in shared) and
+                      (how in ("semi", "anti") or coalesce or not shared))
+            if direct:
+                native_kind = {"inner": ""}.get(how, how + " ")
+                source = (f"(({source}) {native_kind}join ({right_source}) on {{ "
+                          + ", ".join(f"{_identifier(l)} = {_identifier(r)}" if l != r else _identifier(l)
+                                      for l, r in zip(left_on, right_on))
+                          + " }" + (" nulls equal" if nulls_equal else "") + ")")
+                visible_left = left_columns if left_visible is None else {name: left_columns[name] for name in left_visible}
+                visible_right = right_columns if right_visible is None else {name: right_columns[name] for name in right_visible}
+                fields = [_identifier(output) if output == name else f"{_identifier(output)} = {_identifier(name)}"
+                          for output, side, name, paired in join_layout(visible_left, visible_right, left_on, right_on,
+                                                                        how, coalesce, suffix)]
+                if not fields:
+                    fields.append("_ibex_join_height = 0")
+                source += f"[select {{ {', '.join(fields)} }}]"
+                continue
             occupied = set(left_columns) | set(right_columns)
             def fresh(role):
                 name = f"_ibex_join_{join_id}_{role}"

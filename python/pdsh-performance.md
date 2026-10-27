@@ -1651,3 +1651,52 @@ Q21's first statement now streams, but its wall time is set by the semi
 join against `orders`, so the small consistent loss there is recorded,
 not hidden. All 22 match; full ctest passes. Data is in
 `pdsh-performance-results/planned-let-bindings.json`.
+
+## Q21: direct adapter joins, semi pushdown through projections
+
+The adapter renamed every join's columns through selects
+(`_ibex_join_N_l_i = ...`), which lower to column-copy Updates. Native
+join passes look for a Join directly under its parent, so the renames hid
+every adapter join from them. Q21's `semi join orders` stayed above the
+supplier and nation joins instead of filtering lineitem first, as the
+native query is planned.
+
+* **Direct joins.** An inner, left, semi or anti join whose two sides share
+  no column name, other than a key spelled alike on both, is now emitted
+  over the inputs' own names (`(l) join (r) on { lk = rk }`), followed by
+  the output select. Ordered joins, float keys, right, full and cross joins,
+  and folded keys the output still reads from the right keep the renaming
+  lowering.
+* **Semi pushdown through a Project.** The adapter still selects the visible
+  columns after each join. `(Project(X ⋈ Y)) ⋉ Z` is `Project((X ⋈ Y) ⋉ Z)`,
+  because a Project only drops columns and must keep the semi's keys, so
+  `rewrite_semi_over_join` now peels Projects. It restores the plan when the
+  semi does not move.
+
+A first all-22 pass showed what the newly visible joins changed elsewhere:
+Q11 +23–33%, Q22 +13–22% and Q04 +3–8%. Two engine fixes followed:
+
+* **The scan-worker sink survives a plain Project.** A join's right side
+  became a bare Project over its scan, and the serial composer withdrew the
+  semi/anti probe sink for any serial step. A Project cannot drop rows or
+  rebind the key's name, so only other steps withdraw it now (Q22, Q04).
+* **The semi filter fans out at the probe phase's floor.** Once Q11's nation
+  join was reduced to a semi join, its per-chunk filter needed 2^18 rows to
+  fan out, and streamed chunks are smaller. It now uses
+  `join_probe_parallelism().row_floor` (2^14), the floor of the inner-join
+  probe it replaces.
+
+Three interleaved full-stack rounds after both, eight threads, SF10:
+
+| Query | Before | After | Change | Rounds faster |
+|---|---:|---:|---:|---:|
+| Q21 | 1,076.6 ms | 836.2 ms | −22% | 3/3 |
+| Q05 | 469.6 ms | 443.4 ms | −5.6% | 3/3 |
+| Q15 | 287.2 ms | 264.6 ms | −7.9% | 2/3 |
+| Q04, Q11, Q22 | | | within ±3% median | |
+| all 22, geometric mean | | | −2.4% | |
+
+Q21 is 1.24× streaming Polars (was 1.53×); native Q21 is ~750 ms. Its
+second statement (the distinct counts over lineitem) is the remaining
+difference. All 22 match; full ctest passes. Data is in
+`pdsh-performance-results/q21-direct-joins.json`.

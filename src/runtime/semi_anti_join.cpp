@@ -40,6 +40,7 @@
 #include <variant>
 #include <vector>
 
+#include "physical_plan.hpp"
 #include "chunk_conversion_internal.hpp"
 #include "interpreter_internal.hpp"
 #include "join_chunked_internal.hpp"
@@ -1077,8 +1078,12 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         // The context checks come before the pool binding: constructing the
         // pool spawns its threads eagerly, and a serial query must not pay.
         std::size_t morsels = 1;
+        // The probe phase's own floor: a streamed left side arrives in chunks
+        // well under the right-side passes' floor, and filtering it on one
+        // thread lost to the inner join a semi join replaces (Q11, once the
+        // adapter's joins became visible to `reduce_inner_joins_to_semi`).
         if (exec_ != nullptr && exec_->can_fan_out() && !on_worker_pool_thread() &&
-            rows >= kMinParallelPredicateRows &&
+            rows >= physical::join_probe_parallelism().row_floor &&
             filter_gather_is_thread_safe(t, layout->src_of_dst)) {
             // `submit` clamps its worker count to the pool size, so more
             // morsels than that would leave some unvisited.

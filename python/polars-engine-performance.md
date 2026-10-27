@@ -135,3 +135,57 @@ PYTHONPATH=build-release/python:python IBEX_CORES=8 taskset -c 0-7 \
 
 [Matched samples and source hashes](../benchmarking/results/python_categorical_output_20261012.json)
 retain the old conversion function as a baseline against the revised boundary.
+
+## Categorical results keep Polars' category ids
+
+On the h2o join set a Categorical column of 10M distinct labels cost about
+1.1 s to hand back to Polars, against 15 ms for Polars itself. The output
+boundary above avoids decoding rows, but a dictionary still had to be interned
+label by label (about 85 ns each) because Ibex's dictionary has no relation to
+Polars' category ids.
+
+Resident Categorical inputs now enter Ibex as one dictionary chunk whose
+entries remember the physical id Polars gave each label
+(`python/ibex_polars/_categories.py`). A result chunk whose dictionary equals a
+recorded one maps its codes to ids with a gather, and every Categorical column
+of the result is converted in one Polars query. Any other dictionary (a Parquet
+column, labels built inside a query) takes the previous label path. Columns
+whose physical type is not UInt32 and all-null columns are not recorded.
+Ibex copies the dictionary on export, so recognition is by length and then
+Arrow equality (13 ms for 10M labels), not by buffer identity.
+
+Building the unified input also replaces Polars' per-chunk Arrow export and
+Ibex's merge of those chunks, so `prepare()` drops too.
+
+h2o, 1e7 rows, 8 cores, fresh `IbexEngine` per question, three interleaved
+rounds of `run_h2o_adapter.py`, best of four iterations, every result compared
+with Polars 2.0 streaming. Ratio is candidate time over previous time.
+
+| dataset | question | before | after | ratio | `prepare()` before → after |
+|---|---|---|---|---|---|
+| J1 joins | q1 small inner | 1190 ms | 300 ms | 0.25 | 28.9 → 25.0 s |
+| J1 joins | q2 medium inner | 1232 ms | 327 ms | 0.27 | 28.4 → 24.6 s |
+| J1 joins | q3 medium left | 1349 ms | 406 ms | 0.30 | 27.0 → 23.3 s |
+| J1 joins | q4 medium on factor | 1186 ms | 309 ms | 0.26 | 27.0 → 23.1 s |
+| J1 joins | q5 big inner | 3004 ms | 713 ms | 0.24 | 55.6 → 47.0 s |
+| G1 2e0 | q3 sum+mean by id3 | 529 ms | 216 ms | 0.41 | 2.5 → 0.4 s |
+| G1 2e0 | q7 max-min by id3 | 536 ms | 211 ms | 0.39 | 2.6 → 0.4 s |
+| G1 2e0 | q10 six keys | 880 ms | 508 ms | 0.58 | 3.4 → 0.7 s |
+| G1 1e2 | geometric mean of 7 | | | 0.94 | |
+
+Joins are still 8 to 10 times slower than Polars. The join is about 30 ms
+natively; what remains is the export (a Polars `cat.to` check of the ids and
+the gather) and `prepare()`. `G1 2e0 q2` reads 1.5 times slower in the rounds,
+but each process lands on either 6.3-6.6 ms or 9.2-9.5 ms for both versions
+(six processes each), so that is per-process variance, not this change.
+
+`prepare()` for joins over resident data is dominated by
+`Adapter._check_join_validation`, which serializes the whole plan, data
+included, to JSON to read each join's `validation` option (about 23 s of the
+25 s here). It is untouched by this change.
+
+Two regression tests (`test_categorical_results_reuse_the_ids_polars_assigned`
+and `test_categorical_ids_are_not_taken_from_a_look_alike_dictionary`) cover
+the fast path, nulls, multi-chunk input, equal-length dictionaries with
+different labels, and the fallback; the first fails on all five of its cases
+with the fast path disabled.

@@ -1,0 +1,172 @@
+{
+  "data": "G1_1e7_1e2_0_1",
+  "threads": "8",
+  "queries": {
+    "q1": {
+      "desc": "sum v1 by id1",
+      "native": "_ibex_input[select { `id1`, `v1` = ((((coalesce(sum(`v1`), ^_ibex_scalar_0) % ^_ibex_scalar_1) + ^_ibex_scalar_2) % ^_ibex_scalar_1) - ^_ibex_scalar_3) }, by { `id1` }];",
+      "check": "ok",
+      "polars_ms": 9.497228005784564,
+      "ibex_ms": 5.706963987904601,
+      "polars_all": [
+        9.882667000056244,
+        11.272361007286236,
+        9.497228005784564,
+        12.159562000306323,
+        9.655873000156134
+      ],
+      "ibex_all": [
+        7.060671006911434,
+        6.249717000173405,
+        5.706963987904601,
+        6.689806992653757,
+        6.170127002405934
+      ],
+      "ratio": 0.6009083897352583
+    },
+    "q2": {
+      "desc": "sum v1 by id1:id2",
+      "native": "_ibex_input[select { `id1`, `id2`, `v1` = ((((coalesce(sum(`v1`), ^_ibex_scalar_0) % ^_ibex_scalar_1) + ^_ibex_scalar_2) % ^_ibex_scalar_1) - ^_ibex_scalar_3) }, by { `id1`, `id2` }];",
+      "check": "ok",
+      "polars_ms": 16.481290993397124,
+      "ibex_ms": 9.394148000865243,
+      "polars_all": [
+        19.17968800989911,
+        16.481290993397124,
+        18.51931599958334,
+        17.262369990930893,
+        17.554701989865862
+      ],
+      "ibex_all": [
+        10.47971700609196,
+        9.994334002840333,
+        9.394148000865243,
+        11.084201003541239,
+        10.306487005436793
+      ],
+      "ratio": 0.5699886012951781
+    },
+    "q3": {
+      "desc": "sum v1 mean v3 by id3",
+      "native": "_ibex_input[select { `id3`, `v1` = ((((coalesce(sum(`v1`), ^_ibex_scalar_0) % ^_ibex_scalar_1) + ^_ibex_scalar_2) % ^_ibex_scalar_1) - ^_ibex_scalar_3), `v3` = mean(`v3`) }, by { `id3` }];",
+      "check": "ok",
+      "polars_ms": 47.5176660111174,
+      "ibex_ms": 48.408725997433066,
+      "polars_all": [
+        47.5176660111174,
+        47.872153998469,
+        50.70284800603986,
+        53.16820601001382,
+        52.43855000298936
+      ],
+      "ibex_all": [
+        48.52615899289958,
+        48.90861999592744,
+        48.408725997433066,
+        50.3032720007468,
+        52.766843989957124
+      ],
+      "ratio": 1.0187521833691746
+    },
+    "q4": {
+      "desc": "mean v1:v3 by id4",
+      "native": "_ibex_input[select { `id4`, `v1` = mean(`v1`), `v2` = mean(`v2`), `v3` = mean(`v3`) }, by { `id4` }];",
+      "check": "ok",
+      "polars_ms": 14.502274003461935,
+      "ibex_ms": 13.034231000347063,
+      "polars_all": [
+        16.004411998437718,
+        14.502274003461935,
+        16.897788998903707,
+        15.242157009197399,
+        16.098596999654546
+      ],
+      "ibex_all": [
+        13.225634989794344,
+        13.08350199542474,
+        13.03625300351996,
+        13.865618995623663,
+        13.034231000347063
+      ],
+      "ratio": 0.8987715303983068
+    },
+    "q5": {
+      "desc": "sum v1:v3 by id6",
+      "native": "_ibex_input[select { `id6`, `v1` = ((((coalesce(sum(`v1`), ^_ibex_scalar_0) % ^_ibex_scalar_1) + ^_ibex_scalar_2) % ^_ibex_scalar_1) - ^_ibex_scalar_3), `v2` = ((((coalesce(sum(`v2`), ^_ibex_scalar_4) % ^_ibex_scalar_5) + ^_ibex_scalar_6) % ^_ibex_scalar_5) - ^_ibex_scalar_7), `v3` = coalesce(sum(`v3`), ^_ibex_scalar_8) }, by { `id6` }];",
+      "check": "ok",
+      "polars_ms": 50.525252998340875,
+      "ibex_ms": 48.21671098761726,
+      "polars_all": [
+        58.13505900732707,
+        60.66031199588906,
+        52.54476598929614,
+        50.525252998340875,
+        59.32231599581428
+      ],
+      "ibex_all": [
+        48.55282999051269,
+        48.21671098761726,
+        49.1293679951923,
+        49.69071099185385,
+        54.72630399162881
+      ],
+      "ratio": 0.9543091449576825
+    },
+    "q6": {
+      "desc": "median v3 sd v3 by id4 id5",
+      "error": "NotImplementedError: unsupported aggregate median for Float64"
+    },
+    "q7": {
+      "desc": "max v1 - min v2 by id3",
+      "native": "_ibex_input[select { `id3`, `range_v1_v2` = (((((((((max(`v1`) % ^_ibex_scalar_0) + ^_ibex_scalar_1) % ^_ibex_scalar_0) - ^_ibex_scalar_2) - ((((min(`v2`) % ^_ibex_scalar_3) + ^_ibex_scalar_4) % ^_ibex_scalar_3) - ^_ibex_scalar_5)) % ^_ibex_scalar_6) + ^_ibex_scalar_7) % ^_ibex_scalar_6) - ^_ibex_scalar_8) }, by { `id3` }];",
+      "check": "ok",
+      "polars_ms": 40.11818199069239,
+      "ibex_ms": 49.646733998088166,
+      "polars_all": [
+        40.21838400512934,
+        46.510789994499646,
+        40.11818199069239,
+        44.01053399487864,
+        41.934959997888654
+      ],
+      "ibex_all": [
+        51.90996199962683,
+        49.671939996187575,
+        49.646733998088166,
+        51.24355100269895,
+        50.36234100407455
+      ],
+      "ratio": 1.2375120589862831
+    },
+    "q8": {
+      "desc": "largest two v3 by id6",
+      "error": "NotImplementedError: unsupported Polars plan node MapFunction (node 3)"
+    },
+    "q9": {
+      "desc": "regression v1 v2 by id2 id4",
+      "error": "NotImplementedError: unsupported function ('corr', 'pearson')"
+    },
+    "q10": {
+      "desc": "sum v3 count by id1:id6",
+      "native": "_ibex_input[select { `id1`, `id2`, `id3`, `id4`, `id5`, `id6`, `v3` = coalesce(sum(`v3`), ^_ibex_scalar_0), `count` = count() }, by { `id1`, `id2`, `id3`, `id4`, `id5`, `id6` }];",
+      "check": "ok",
+      "polars_ms": 218.1395740044536,
+      "ibex_ms": 432.3522699996829,
+      "polars_all": [
+        259.6793910051929,
+        218.1395740044536,
+        233.6456399934832,
+        249.59882099938113,
+        280.5747490056092
+      ],
+      "ibex_all": [
+        449.98344499617815,
+        470.36779100017156,
+        432.3522699996829,
+        437.293883995153,
+        441.8109679972986
+      ],
+      "ratio": 1.9819983236551835
+    }
+  }
+}

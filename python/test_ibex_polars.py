@@ -422,6 +422,28 @@ class EngineTests(unittest.TestCase):
         self.equal(outer.head(0).join(inner, on="key"))
 
     @unittest.skipIf(os.environ.get("IBEX_TEST_PARQUET") == "0", "Parquet backend disabled")
+    def test_projection_only_parquet_cache_binds_the_lazy_read(self):
+        # Q18's shape: a cached scan with only column selects feeds an
+        # aggregate and a join. Binding the selects would materialize the file;
+        # the bare read stays lazy, and each consumer selects its own columns.
+        import re
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "input.parquet"
+            pq.write_table(pa.table({"key": [1, 1, 2, 3], "value": [3, 4, 5, 6], "other": [0, 0, 0, 0]}), path)
+            cached = pl.scan_parquet(path).select("key", "value").cache()
+            totals = cached.group_by("key").agg(pl.col("value").sum().alias("total")).filter(pl.col("total") > 4)
+            query = cached.join(totals, on="key").sort("key", "value")
+            self.equal(query)
+            source = self.engine.explain(query)
+            self.assertEqual(len(re.findall(r"let _ibex_cache_\d+ = parquet::read\(\^_ibex_scalar_\d+\);", source)), 1)
+            self.assertEqual(source.count("= parquet::read("), 1)
+            # A cache over a computation still shares the computed table.
+            computed = pl.scan_parquet(path).with_columns(twice=pl.col("value") * 2).cache()
+            query = computed.join(computed.select("key", "twice"), on="key").sort("key", "value")
+            self.equal(query)
+            self.assertIn("let _ibex_cache_0 = parquet::read(^_ibex_scalar_0)[", self.engine.explain(query))
+
+    @unittest.skipIf(os.environ.get("IBEX_TEST_PARQUET") == "0", "Parquet backend disabled")
     def test_shared_parquet_cache_is_scoped_to_one_collection(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "input.parquet"

@@ -1538,3 +1538,48 @@ No other query moved beyond its own spread. One all-22 round showed Q20
 ~460 and ~530 ms. Q09 is now 1.2× streaming Polars, down from 1.74×. All 22
 queries match, and the full ctest passes. Data is in
 `pdsh-performance-results/q09-deferred-source-schemas.json`.
+
+## Q18: lazy projection-only caches, and the prefilter through adapter shapes
+
+Native Q18 ran in ~390 ms; through the adapter it took ~910 ms (Polars
+streaming: ~520 ms). Nearly all the difference was one phase,
+`Aggregate.FinalOrdering`: 640 ms, mostly serial, ordering lineitem's 15M
+`l_orderkey` groups. Natively it is ~92 ms. Two independent causes:
+
+* **The Polars CACHE was materialized.** Q18's plan caches
+  `scan(lineitem).select(l_orderkey, l_quantity)` for its aggregate and its
+  join. The adapter bound each cache as `let _ibex_cache_N = <subtree>;`,
+  and a let with a select on top decodes the file into memory. The
+  aggregate then ran over an in-memory table, missing the streamed path and
+  its clustered cold merge. A cache over nothing but a Parquet read and
+  plain-column selects now binds the bare read
+  (`let _ibex_cache_N = parquet::read(...);`), which stays lazy, and each
+  consumer applies its own selects. This is the native queries' shape. A
+  cache over a computation (Q22's substring) still binds the computed
+  table. Only Q08 and Q18 change generated source.
+* **The HAVING prefilter could not see the adapter's shape.** The adapter
+  writes `sum` as `coalesce(sum(x), 0)` (Polars' empty sum), so an Update
+  sits between the aggregate and `[filter sum_quantity > ^threshold]`, and
+  the threshold is a bound scalar. `aggregate_prefilter_for_source` now
+  walks Project/Update steps up to the filter. It maps names through plain
+  copies and through `coalesce(output, c)`, which is sound because the
+  prefilter keeps any group whose output is null. It also resolves bound
+  numeric scalars. Separately, a morsel run bounded from below by a bare
+  update used to build its input with `build_operator` instead of
+  `build_pipeline_source`, which dropped the prefilter.
+  `build_pipeline_source` now takes the run's input node and composes the
+  steps between the source and it over the prefiltered aggregate.
+
+| SF10, eight threads | Before | After | Rounds faster |
+|---|---:|---:|---:|
+| Q18, both changes | 912 ms | 405 ms (−55.6%) | 5/5 |
+| Q18, prefilter only (lazy cache in both) | 435 ms | 396 ms (−9%) | 3/3 |
+| Q08 | 527 ms | 515 ms (−2.2%) | 3/5 |
+
+Q18 is now 0.77× streaming Polars. In the runtime-only all-22 rounds no
+other query moved beyond its spread (geometric mean +0.1%). All 22 match;
+full ctest passes. A/B note: `bench_pdsh_engine.py` lives in `python/`,
+and Python puts a script's directory first on `sys.path`, so an arm's
+`PYTHONPATH` package is shadowed by the repo's unless `PYTHONSAFEPATH=1`
+is set. The runner's recorded source hashes are those of the repo files.
+Data is in `pdsh-performance-results/q18-lazy-cache-and-prefilter.json`.

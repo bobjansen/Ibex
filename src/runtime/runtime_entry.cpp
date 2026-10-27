@@ -1155,41 +1155,62 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
 
 auto build_pipeline_source(const physical::Plan& pipeline, const TableRegistry& registry,
                            const ScalarRegistry* scalars, const ExternRegistry* externs,
-                           const ExecutionContext& exec, ModelResult* model_out)
-    -> std::expected<OperatorPtr, std::string> {
+                           const ExecutionContext& exec, ModelResult* model_out,
+                           const ir::Node* input_node) -> std::expected<OperatorPtr, std::string> {
     const ir::Node& node = *pipeline.source_node;
-    // A filter directly over a grouped aggregate hands the aggregate the
-    // comparisons it can decide on its own groups (aggregate_prefilter.hpp).
-    // The filter step still runs, so this changes which groups are emitted,
-    // never which rows the pipeline returns.
-    AggregatePrefilter prefilter = aggregate_prefilter_for_source(pipeline);
+    const ir::Node& input = input_node == nullptr ? node : *input_node;
+    // A filter over a grouped aggregate hands the aggregate the comparisons it
+    // can decide on its own groups (aggregate_prefilter.hpp). The filter step
+    // still runs, so this changes which groups are emitted, never which rows
+    // the pipeline returns.
+    AggregatePrefilter prefilter = aggregate_prefilter_for_source(pipeline, scalars);
+    // The steps from the source up to `input`, which a morsel run bounded from
+    // below by a bare update (`Filter(Update(Aggregate))`) asks for as its
+    // input. They are composed here, over the prefiltered aggregate, exactly
+    // as the serial composer would compose them.
+    std::size_t input_step = pipeline.steps.size();
+    if (&input != &node) {
+        const auto found = std::ranges::find(pipeline.steps, &input, &MapStep::node);
+        input_step = static_cast<std::size_t>(found - pipeline.steps.begin());
+        if (found == pipeline.steps.end()) {
+            prefilter.clear();
+        }
+    }
     if (prefilter.empty()) {
-        return build_operator(node, registry, scalars, externs, exec, model_out);
+        return build_operator(input, registry, scalars, externs, exec, model_out);
     }
     const physical::Plan plan = physical::plan_physical(
         node, registry, externs, physical::deferred_source_schemas(exec.deferred_scans));
-    if (!plan.migrated || plan.root != &node || !plan.aggregate.describes ||
-        ir::node_cast<ir::AggregateNode>(node).group_by().empty()) {
-        return build_operator(node, registry, scalars, externs, exec, model_out);
+    if (!plan.migrated || plan.root != &node || !plan.aggregate.describes) {
+        return build_operator(input, registry, scalars, externs, exec, model_out);
     }
     const auto build = [&] {
         physical::note_map_pipeline_executed();
         return physical_executor_detail::build_physical_aggregate(
             plan, node, registry, scalars, externs, exec, model_out, prefilter);
     };
-    if (exec.execution_profile == nullptr) {
-        return build();
-    }
-    auto* entry = execution_profile_entry(exec.execution_profile, node);
     std::expected<OperatorPtr, std::string> result;
-    {
-        const ExecutionProfileScope scope(entry, ProfilePhase::Build);
+    if (exec.execution_profile == nullptr) {
         result = build();
+    } else {
+        auto* entry = execution_profile_entry(exec.execution_profile, node);
+        {
+            const ExecutionProfileScope scope(entry, ProfilePhase::Build);
+            result = build();
+        }
+        if (result.has_value()) {
+            result = profile_operator(std::move(result.value()), exec.execution_profile, node);
+        }
     }
-    if (!result.has_value()) {
-        return result;
+    for (std::size_t index = pipeline.steps.size(); index-- > input_step && result.has_value();) {
+        const MapStep& step = pipeline.steps[index];
+        result = step.factory(step, std::move(result.value()), scalars, externs, exec,
+                              &pipeline.source_signature, false);
+        if (result.has_value() && exec.execution_profile != nullptr) {
+            result = profile_operator(std::move(result.value()), exec.execution_profile, *step.node);
+        }
     }
-    return profile_operator(std::move(result.value()), exec.execution_profile, node);
+    return result;
 }
 
 auto build_operator(const ir::Node& node, const TableRegistry& registry,

@@ -1428,12 +1428,11 @@ auto build_materialized_map_run(const physical::Plan& plan, const std::vector<Ma
         }
     }
     if (owned == nullptr) {
-        // When the run reaches the pipeline's own source, build it the way the
-        // serial composer does, so an aggregate under a filter gets its prefilter.
+        // Build the run's input through the pipeline's source, the way the
+        // serial composer does, so an aggregate under the run's filter gets
+        // its prefilter even when bare updates between them are the input.
         auto input_op =
-            input_node == plan.source_node
-                ? build_pipeline_source(plan, registry, scalars, externs, exec, model_out)
-                : build_operator(*input_node, registry, scalars, externs, exec, model_out);
+            build_pipeline_source(plan, registry, scalars, externs, exec, model_out, input_node);
         if (!input_op.has_value()) {
             return std::unexpected(std::move(input_op.error()));
         }

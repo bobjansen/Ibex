@@ -3370,6 +3370,29 @@ auto build_lower_context(const runtime::TableRegistry& tables, const LazyTableRe
     return context;
 }
 
+/// Whether `node` fits a model anywhere. Only the unplanned path captures a
+/// fitted model for the caller, so a `let` asking for one must stay there.
+// NOLINTNEXTLINE(misc-no-recursion)
+auto plan_fits_model(const ir::Node& node) -> bool {
+    if (node.kind() == ir::NodeKind::Model) {
+        return true;
+    }
+    if (node.kind() == ir::NodeKind::Program) {
+        const auto& program = ir::node_cast<ir::ProgramNode>(node);
+        for (const auto& preamble : program.preamble()) {
+            if (preamble != nullptr && plan_fits_model(*preamble)) {
+                return true;
+            }
+        }
+        if (plan_fits_model(program.main_node())) {
+            return true;
+        }
+    }
+    return std::ranges::any_of(node.children(), [](const ir::NodePtr& child) {
+        return child != nullptr && plan_fits_model(*child);
+    });
+}
+
 auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                      LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
                      ColumnRegistry& columns, ModelRegistry& models,
@@ -3634,7 +3657,12 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         lowered.value() = ir::optimize_plan(std::move(lowered.value()), optimization_context);
     }
 
-    if (plan_table_expressions() && model_out == nullptr) {
+    // A `let` passes `model_out` in case its value fits a model; any other
+    // table it binds (the Polars adapter's shared caches) is planned like an
+    // expression, with streaming and deferred-probe scans. It used to take the
+    // eager path whenever `model_out` was set: Q21's cached `l1` decoded
+    // lineitem whole instead of streaming it.
+    if (plan_table_expressions() && (model_out == nullptr || !plan_fits_model(**lowered))) {
         std::set<std::string> lazy_callees;
         for (const auto& [name, _] : extern_decls) {
             if (const auto* function = externs.find(name);

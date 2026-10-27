@@ -1624,3 +1624,30 @@ Three interleaved full-stack rounds at eight threads, SF10:
 Q13 is now 0.77× streaming Polars. Q02 and Q20 moved within their known
 spread. All 22 match; full ctest passes. Data is in
 `pdsh-performance-results/q13-bound-like-and-fused-count.json`.
+
+## Planned `let` bindings (found while profiling Q21)
+
+The adapter shares a computed subtree through `let _ibex_cache_N = <query>;`,
+and the bridge runs with `plan_table_expressions`. The planned branch of
+`eval_table_expr` required `model_out == nullptr`. A `let` always passes a
+model slot, in case its value fits a model, so every cache binding took the
+eager statement path: no streaming scans, no deferred probes. Q21's `l1`
+decoded lineitem in full behind a barrier. The planned branch now also runs
+when the lowered plan contains no Model node.
+
+Interleaved, four rounds, eight threads, SF10, only the six queries with a
+computed cache:
+
+| Query | Before | After | Rounds faster |
+|---|---:|---:|---:|
+| Q17 | 276 ms | 226 ms (−18%) | 4/4 |
+| Q02 | 70 ms | 64 ms (−8%) | 3/4 |
+| Q11 | 96 ms | 94 ms (−2%) | 4/4 |
+| Q22 | 81 ms | 79 ms (−2%) | 4/4 |
+| Q07 | 513 ms | 502 ms | 2/4 |
+| Q21 | 1,036 ms | 1,052 ms (+1.5%) | 0/4 |
+
+Q21's first statement now streams, but its wall time is set by the semi
+join against `orders`, so the small consistent loss there is recorded,
+not hidden. All 22 match; full ctest passes. Data is in
+`pdsh-performance-results/planned-let-bindings.json`.

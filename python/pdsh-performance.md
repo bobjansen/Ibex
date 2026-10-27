@@ -1772,3 +1772,43 @@ with a `lag` arm is still not row-local, and the ranged-evaluation oracle
 now covers a `case` nested inside a call. Data is in
 `pdsh-performance-results/case-classification.json` and
 `case-classification-native-ab.txt`.
+
+## Bound scalars bound into the plan
+
+The adapter binds every constant as a scalar (`^_ibex_scalar_N`), and several
+planner and kernel gates accept only an `ir::Literal`. Until now each such gate
+was fixed on its own (`bind_filter_constants` for scan filters, the substring
+operand lookup, the HAVING prefilter). `runtime::bind_plan_constants`
+(`src/runtime/bound_plan.cpp`) now does it once per execution: after a
+statement is lowered, every `^name` naming a scalar binding becomes a literal
+of that value in filter, update, join, head/tail count and fused filter-limit
+expressions, before the IR passes run. The REPL statement path, the
+single-lazy-source path, `:explain` and the whole-script driver all call it.
+The whole-script driver can, because it materializes every scalar binding
+before lowering. Bare names are left alone, since they may name a column, and
+so are extern call arguments, because reader schemas are keyed by them.
+`ibex_compile` has no values at compile time, so it keeps the references.
+
+Outside the benchmark this fixes real failures and missed plans:
+`fill_null(x, ^v)` used to be an error ("second argument must be a literal
+value"), and `[order v, head ^n]` ran a full sort where `head 2` fuses into
+a top-k.
+
+On PDS-H it changes a single plan. Q10's constant `filter(^s)` folds away,
+leaving a plain project (that filter is one of the nodes in front of the
+payload lift; see "Q10: what blocks the native FD path"). Every other adapter
+query has an identical operator profile. Timings are neutral:
+
+- Adapter, three interleaved all-22 rounds at eight threads, SF10: geometric
+  mean +0.1%.
+  - Q01 (−1.7%), Q11 (−2.3%) and Q20 (−1.2%) were faster in all three rounds.
+  - Q22 (+2.1%), Q15 (+3.8%, one outlier round) and Q13 (+1.4%) were slower in
+    all three, with plans identical to the baseline. That is code layout, not
+    the pass.
+- Native PDS-H (`benchmarking/ab_queries.py`, eight cores): geometric mean
+  +0.2%, every query "same" with identical output. Q10 was unclear at first and
+  "same" (−0.3%) at 20 repeats.
+
+Full release ctest and the Python tests pass. Data is in
+`pdsh-performance-results/bound-plan-constants.json` and
+`bound-plan-constants-native-ab.txt`.

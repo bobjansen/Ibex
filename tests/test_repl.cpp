@@ -3455,6 +3455,32 @@ TEST_CASE("ReplSession: a call's own tables and scalars last for that call", "[r
     CHECK_FALSE(session.table_binding("nothing").has_value());
 }
 
+TEST_CASE("ReplSession: bound scalars act as literals in the statement's plan", "[repl][session]") {
+    // `fill_null` takes only a literal fill value, so `^fill` used to be an
+    // error: a bound scalar reached the kernel as a reference. A call's own
+    // scalar and a session `let` both bind; a column named like a binding is
+    // still the column without `^`.
+    const bool planned = GENERATE(false, true);
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    REQUIRE(session.execute("let t = Table { x = [3, NULL, 1, 5], n = [9, 9, 9, 9] };").ok);
+    REQUIRE(session.execute("let n = 2;").ok);
+
+    ibex::repl::ReplSession::ExecuteOptions options;
+    options.scalars.insert_or_assign("fill", std::int64_t{4});
+    options.render = false;
+    options.plan_table_expressions = planned;
+    const auto r = session.execute(
+        "t[update { y = fill_null(x, ^fill) }][filter y > n - 6][order y, head ^n];",
+        std::move(options));
+    CAPTURE(r.error);
+    REQUIRE(r.ok);
+    REQUIRE(r.table.has_value());
+    const auto* y = std::get_if<ibex::Column<std::int64_t>>(r.table->find("y"));
+    REQUIRE(y != nullptr);
+    CHECK(std::vector<std::int64_t>(y->begin(), y->end()) == std::vector<std::int64_t>{4, 5});
+}
+
 TEST_CASE("ReplSession: planned expressions stream bound lazy sources", "[repl][session]") {
     // A reader which rejects whole-source decoding proves that the caller
     // actually registered streaming scans, rather than just lowering a plan.

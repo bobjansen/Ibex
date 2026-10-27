@@ -1,0 +1,33 @@
+# dataset: /home/brj/code/polars-benchmark/data/tables/scale-10.0  (/home/brj/ibex/benchmarking/data/tpch/parquet)
+# base=/tmp/claude-1000/-home-brj-ibex/d0bcaec2-6f0c-4cee-8dbe-0b9c33e04b8e/scratchpad/BIND/base/ibex_eval  target=/tmp/claude-1000/-home-brj-ibex/d0bcaec2-6f0c-4cee-8dbe-0b9c33e04b8e/scratchpad/BIND/cand/ibex_eval
+# IBEX_CORES=8 repeats=8 warmup=1 min_effect=2.0% alpha=0.05 taskset=0,2,4,6,8,10,12,14
+# base_ms/target_ms are the MIN of the repeats (cost); delta is the MEDIAN of
+#   the per-pair ratios (effect), which is what the p-value tests. disp = how far
+#   the base median sits above its min — large means the box was busy.
+query      base_ms  target_ms    delta   disp   pairs       p  verdict     output
+q01          607.4      609.6     0.3%   1.1%     4-4   0.742  same          same
+q02           67.5       68.0     0.6%   4.1%     2-6   0.742  same          same
+q03          405.0      403.3     0.6%   1.7%     4-4   0.742  same          same
+q04          242.8      243.8     0.8%   0.5%     2-6   0.250  same          same
+q05          468.1      467.7     0.5%   1.3%     3-5   0.547  same          same
+q06          228.8      228.0     0.2%   0.4%     3-5   0.945  same          same
+q07          489.0      491.0     0.6%   1.8%     3-5   0.312  same          same
+q08          510.2      511.9     0.4%   0.9%     3-5   0.844  same          same
+q09          695.4      705.4     0.2%   2.3%     4-4   0.641  same          same
+q10          447.9      450.6     2.1%   1.4%     2-6   0.055  unclear       same
+q11           63.7       63.4     1.5%   3.0%     3-5   0.945  same          same
+q12          201.1      200.7    -0.6%   2.0%     5-3   0.109  same          same
+q13          320.8      319.4     0.2%   0.6%     3-5   0.844  same          same
+q14          322.3      321.1    -0.5%   0.7%     6-2   0.250  same          same
+q15          277.6      275.9    -0.2%   0.8%     4-4   0.547  same          same
+q16          123.4      121.4    -1.9%   2.4%     7-1   0.016  same          same
+q17          234.1      238.9    -0.9%   3.2%     5-3   0.641  same          same
+q18          373.8      368.3     0.6%   0.4%     2-6   0.461  same          same
+q19          368.2      370.6     0.4%   1.9%     2-6   0.195  same          same
+q20          340.4      338.4     0.2%   0.7%     4-4   0.742  same          same
+q21          719.0      708.9    -1.2%   0.9%     5-3   0.547  same          same
+q22           94.9       94.2    -0.2%   0.5%     5-3   0.742  same          same
+TOTAL       7601.3     7600.5        —   (summed min cost, for scale only)
+# geomean of per-query paired ratios: 1.0016 (+0.2%)  <- the headline
+# same rows and order on all 22 queries (floats within tolerance)
+# UNCLEAR on 1: q10 — an effect above 2.0% that the paired test cannot separate from noise. Re-run those with more --repeats before claiming either way.

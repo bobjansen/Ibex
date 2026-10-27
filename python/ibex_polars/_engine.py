@@ -10,6 +10,7 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from . import _categories
 from ._adapter import Adapter, check_version, flag_key
 from ._temporal import is_temporal, storage_type
 
@@ -33,7 +34,18 @@ def _categorical_from_arrow(column, dtype, name):
     return pl.concat(parts, rechunk=False) if parts else pl.Series(name, [], dtype=dtype)
 
 
-def _to_polars(result, expected, output):
+def _known_categorical(column, dtype, name, categories):
+    """The column's Polars ids when every chunk carries a dictionary Ibex was given."""
+    parts = []
+    for chunk in column.chunks:
+        ids = _categories.physical(chunk, categories, dtype)
+        if ids is None:
+            return None
+        parts.append(ids)
+    return pl.concat(parts, rechunk=False).alias(name) if parts else None
+
+
+def _to_polars(result, expected, output, categories=()):
     """Export the declared result schema without decoding categorical keys."""
     if not expected:
         # Arrow carries a row count for zero-column tables, but from_arrow
@@ -55,9 +67,20 @@ def _to_polars(result, expected, output):
             continue
         if dtype != output[name]:
             result = result.set_column(index, name, result.column(index).cast(output[name]))
+    dictionaries = {name: dtype for name, dtype in expected.items()
+                    if dtype.base_type() == pl.Categorical and pa.types.is_dictionary(result[name].type)}
+    known = {}
+    for name, dtype in dictionaries.items():
+        ids = _known_categorical(result[name], dtype, name, categories)
+        if ids is not None:
+            known[name] = ids
     categorical = {name: _categorical_from_arrow(result[name], dtype, name)
-                   for name, dtype in expected.items()
-                   if dtype.base_type() == pl.Categorical and pa.types.is_dictionary(result[name].type)}
+                   for name, dtype in dictionaries.items() if name not in known}
+    if known:
+        # One query converts every column of ids, in parallel.
+        converted = pl.DataFrame(list(known.values())).with_columns(
+            [pl.col(name).cat.to(dictionaries[name]) for name in known])
+        categorical.update({name: converted.get_column(name) for name in known})
     if categorical:
         frame = pl.DataFrame([categorical[name] if name in categorical
                               else pl.from_arrow(result[name]).alias(name)
@@ -136,11 +159,11 @@ class IbexEngine(pl.Engine):
             raise NotImplementedError("IbexEngine does not support background collection or post-optimization callbacks")
         import ibex_pyarrow
         with self._lock:
-            source, bindings, scalars, expected, output = self._prepare(lf, optimizations)
+            source, bindings, scalars, expected, output, categories = self._prepare(lf, optimizations)
             result = ibex_pyarrow.execute_pipeline(source, tables=bindings, scalars=scalars)
         # Conversion/casting constructs the public Polars result; the query's
         # filters, arithmetic and reductions have already executed in Ibex.
-        return _to_polars(result, expected, output)
+        return _to_polars(result, expected, output, categories)
 
     def execute(self, lf, *, optimizations):
         return SingleNodeQueryResult(self.collect(lf, optimizations=optimizations))

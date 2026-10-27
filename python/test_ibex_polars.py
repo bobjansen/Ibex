@@ -19,6 +19,7 @@ import pyarrow.parquet as pq
 import ibex_pyarrow
 from ibex_polars import IbexEngine
 from ibex_polars._adapter import Adapter
+from ibex_polars import _categories, _engine
 from ibex_polars._engine import _to_polars
 
 
@@ -870,6 +871,70 @@ class EngineTests(unittest.TestCase):
                                      for call in convert.call_args_list))
             assert_frame_equal(result, reference)
             self.equal(frame.lazy().group_by("g").agg(mean=pl.mean("x")).sort("g"))
+
+    def test_categorical_results_reuse_the_ids_polars_assigned(self):
+        # Passthrough columns come back through the ids of the dictionary
+        # they were handed, not by interning every label again. Two columns of
+        # equal dictionary size but different labels, nulls and a multi-chunk
+        # input keep each column on its own dictionary.
+        first = pl.DataFrame({"a": ["x", "y", None, "z", "x"], "b": ["p", "q", "r", "p", None],
+                              "n": [1, 2, 3, 4, 5]}).with_columns(pl.col("a", "b").cast(pl.Categorical))
+        second = pl.DataFrame({"a": ["z", "w"], "b": ["s", "t"], "n": [6, 7]}).with_columns(
+            pl.col("a", "b").cast(pl.Categorical))
+        frame = pl.concat([first, second], rechunk=False)
+        self.assertGreater(frame["a"].n_chunks(), 1)
+        queries = (frame.lazy(), frame.lazy().filter(pl.col("n") > 2),
+                   frame.lazy().filter(pl.col("n") > 99),
+                   frame.lazy().select("b", "a"),
+                   frame.lazy().join(pl.DataFrame({"n": [1, 3, 6]}).lazy(), on="n"))
+        for query in queries:
+            with self.subTest(query=query.explain()):
+                with patch.object(_engine, "_categorical_from_arrow",
+                                  wraps=_engine._categorical_from_arrow) as interned:
+                    result = self.equal(query.sort("n") if "n" in query.collect_schema() else query)
+                    interned.assert_not_called()
+                self.assertEqual(result.schema, query.collect_schema())
+        # The ids are the ones Polars uses: a join on the result's column
+        # matches exactly the rows an equal-label comparison does.
+        result = frame.lazy().filter(pl.col("n") > 2).collect(engine=self.engine)
+        joined = result.join(frame.select("a", "n"), on="a", how="inner", nulls_equal=False)
+        labels = result["a"].drop_nulls().cast(pl.String)
+        expected = sum(frame["a"].cast(pl.String).eq(label).sum() for label in labels)
+        self.assertEqual(joined.height, expected)
+
+    def test_categorical_results_with_other_dictionaries_are_interned(self):
+        # A Parquet column's dictionary is not one Ibex was given, so its
+        # labels are interned as before.
+        frame = pl.DataFrame({"g": ["a", "b", "a", "c"], "n": [1, 2, 3, 4]}).with_columns(
+            pl.col("g").cast(pl.Categorical))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "categorical.parquet"
+            frame.write_parquet(path)
+            with patch.object(_engine, "_categorical_from_arrow",
+                              wraps=_engine._categorical_from_arrow) as interned:
+                self.equal(pl.scan_parquet(path).filter(pl.col("n") > 1))
+                self.assertTrue(interned.called)
+
+    def test_categorical_ids_are_not_taken_from_a_look_alike_dictionary(self):
+        # Same dictionary length, different labels: only equal contents may use
+        # the recorded ids.
+        source = pl.Series("g", ["a", "b"]).cast(pl.Categorical)
+        array, known = _categories.unify(source)
+        result = pa.table({"g": pa.chunked_array([pa.DictionaryArray.from_arrays(
+            pa.array([1, 0, None, 1], type=pa.int32()), pa.array(["c", "d"]))])})
+        expected = pl.Schema({"g": pl.Categorical()})
+        output = {"g": pa.large_string()}
+        frame = _to_polars(result, expected, output, [known])
+        self.assertEqual(frame["g"].to_list(), ["d", "c", None, "d"])
+        same = pa.table({"g": pa.chunked_array([pa.DictionaryArray.from_arrays(
+            pa.array([1, 0, None, 1], type=pa.int32()), array.dictionary)])})
+        with patch.object(_engine, "_categorical_from_arrow",
+                          wraps=_engine._categorical_from_arrow) as interned:
+            frame = _to_polars(same, expected, output, [known])
+            interned.assert_not_called()
+        self.assertEqual(frame["g"].to_list(), [array.dictionary[1].as_py(), array.dictionary[0].as_py(), None,
+                                                array.dictionary[1].as_py()])
+        self.assertEqual(frame.schema, expected)
 
     def test_prepare_projects_demanded_columns_without_query_collection(self):
         query = pl.DataFrame({"x": [1, 2], "unused": [[1], [2]]}).lazy().select(pl.sum("x"))

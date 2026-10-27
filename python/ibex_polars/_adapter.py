@@ -18,6 +18,7 @@ import pyarrow as pa
 import ibex
 from ibex._expr import Expr
 from ibex._lower import _WIDENED_NUMERIC_TYPES, lower
+from . import _categories
 from ._temporal import NANOS_PER_UNIT, TEMPORAL_TYPES, is_temporal, literal_ticks, prepare_column
 
 
@@ -128,6 +129,7 @@ class Adapter:
             raise NotImplementedError(f"unsupported Polars visitor version {self.visitor.version()}")
         self.original_frame = lf
         self.checked_join_validation = False
+        self.categories = []
         self.nodes = {}
         self.expressions = {}
         self.frame_length_columns = {}
@@ -657,7 +659,18 @@ class Adapter:
             # lazy query or evaluating user expressions in the Polars engine.
             if schema:
                 data = pl.DataFrame._from_pydf(node.df.select(list(schema)))
-                table = data.to_arrow()
+                # Categorical columns go in as one dictionary whose entries
+                # remember their Polars ids, which is also far cheaper than
+                # Polars' chunk-by-chunk Arrow export and Ibex's merge of it.
+                shared = [name for name in schema if _categories.eligible(data.get_column(name))]
+                rest = data.drop(shared)
+                table = rest.to_arrow() if rest.width else None
+                for name in shared:
+                    array, known = _categories.unify(data.get_column(name))
+                    self.categories.append(known)
+                    column = pa.chunked_array([array])
+                    table = pa.table({name: column}) if table is None else table.append_column(name, column)
+                table = table.select(list(schema))
             else:
                 # Projection pushdown can remove every column from a len-only
                 # scan. Arrow/native tables need a column to retain its height.
@@ -876,4 +889,4 @@ class Adapter:
         frame = prepare_inputs(frame)
         result_schema = {}
         source, bindings, scalars = lower(frame, validate=True, result_schema=result_schema, widen_numeric_inputs=True)
-        return source, bindings, scalars, expected, result_schema
+        return source, bindings, scalars, expected, result_schema, self.categories

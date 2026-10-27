@@ -399,6 +399,15 @@ TEST_CASE("evaluate_field over a partial range matches evaluating a gathered ran
              *call("__case", {ir::make_expr_ptr(cmp(ir::CompareOp::Gt, col_ref("id"), ilit(50))),
                               col_ref("nullable"), col_ref("flag"),
                               arith(ir::ArithmeticOp::Mul, col_ref("id"), ilit(2)), ilit(-1)}))});
+    // A case nested in another call: classified row-local, it is evaluated
+    // over the range rather than whole, the way the Polars adapter's rounded
+    // aggregates (`Float64(round(case { ... }))`) now are.
+    fields.push_back(
+        {.label = "case inside a call",
+         .expr = std::move(*call(
+             "abs", {call("__case", {ir::make_expr_ptr(cmp(ir::CompareOp::Gt, col_ref("id"), ilit(50))),
+                                     arith(ir::ArithmeticOp::Sub, col_ref("nullable"), ilit(300)),
+                                     col_ref("id")})}))});
     fields.push_back({.label = "row-local kernel builtin over a range",
                       .expr = std::move(*call("length", {col_ref("name")}))});
     fields.push_back({.label = "unary math over a computed nullable argument",

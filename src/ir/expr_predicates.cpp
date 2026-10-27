@@ -78,6 +78,11 @@ constexpr auto kBuiltinFunctionInfo = std::to_array<std::pair<std::string_view, 
     {"corr", {.kind = FnKind::Aggregate}},
     {"abs", {.kind = FnKind::Scalar}},
     {"__interp", {.kind = FnKind::Scalar}},
+    // `case { ... }` lowers to `__case`. Unlisted, every case expression was an
+    // unknown call: never row-local, never subset-evaluable, so an update with
+    // a `case` ran serially outside every map kernel. A null condition falls
+    // through to the next arm, so nulls are absorbed, as for `coalesce`.
+    {"__case", {.kind = FnKind::Scalar, .null_behavior = NullBehavior::Absorbs}},
     {"acos", {.kind = FnKind::Scalar}},
     {"asin", {.kind = FnKind::Scalar}},
     {"atan", {.kind = FnKind::Scalar}},

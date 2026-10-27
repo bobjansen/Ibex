@@ -1050,7 +1050,7 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, std::size_t lhs_off,
     }
     if (const auto* l = std::get_if<Column<Categorical>>(&lhs)) {
         if (const auto* r = std::get_if<Column<Categorical>>(&rhs)) {
-            if (l->dictionary_ptr() == r->dictionary_ptr()) {
+            if (l->dictionary_identity() == r->dictionary_identity()) {
                 const auto* lc = l->codes().data() + lhs_off;
                 const auto* rc = r->codes().data() + rhs_off;
                 switch (op) {

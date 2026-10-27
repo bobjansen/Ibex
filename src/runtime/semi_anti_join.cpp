@@ -993,12 +993,11 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             // the whole set goes in as text and the probe's dictionary-mapped
             // path handles it, which is what it already does for a probe
             // chunk whose dictionary is foreign.
-            const void* dictionary = static_cast<const void*>(first_cat->dictionary_ptr().get());
+            const void* dictionary = first_cat->dictionary_identity();
             const bool one_dictionary =
                 std::ranges::all_of(right_key_chunks_, [&](const ColumnEntry& chunk) {
                     const auto* col = std::get_if<Column<Categorical>>(chunk.column.get());
-                    return col != nullptr &&
-                           static_cast<const void*>(col->dictionary_ptr().get()) == dictionary;
+                    return col != nullptr && col->dictionary_identity() == dictionary;
                 });
             right_cat_dictionary_id_ = one_dictionary ? dictionary : nullptr;
             for (const auto& chunk : right_key_chunks_) {
@@ -1312,8 +1311,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         }
 
         if (const auto* col = std::get_if<Column<Categorical>>(key);
-            col != nullptr &&
-            static_cast<const void*>(col->dictionary_ptr().get()) == right_cat_dictionary_id_) {
+            col != nullptr && col->dictionary_identity() == right_cat_dictionary_id_) {
             return filter_rows(std::move(t), [&](std::size_t row) {
                 const bool match =
                     !probe_is_null(row) && right_cat_codes_.contains(col->code_at(row));
@@ -1322,10 +1320,10 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         }
 
         if (const auto* col = std::get_if<Column<Categorical>>(key)) {
-            const void* left_dict_id = static_cast<const void*>(col->dictionary_ptr().get());
+            const void* left_dict_id = col->dictionary_identity();
             if (left_cat_dictionary_id_ != left_dict_id) {
                 left_cat_dictionary_id_ = left_dict_id;
-                left_cat_matches_.assign(col->dictionary().size(), uint8_t{0});
+                left_cat_matches_.assign(col->dictionary_size(), uint8_t{0});
                 const auto& dict = col->dictionary();
                 for (std::size_t i = 0; i < dict.size(); ++i) {
                     left_cat_matches_[i] =

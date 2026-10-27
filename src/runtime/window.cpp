@@ -2129,7 +2129,7 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
         std::vector<std::int64_t> int_dict;  // for Int64 reconstruction
         const Column<Categorical>* cat = std::get_if<Column<Categorical>>(&key_cv);
         if (cat != nullptr) {
-            ncodes = cat->dictionary().size();
+            ncodes = cat->dictionary_size();
             if (ncodes > kMaxCodes) {
                 return std::nullopt;
             }
@@ -2239,7 +2239,7 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
             Column<Categorical>::codes_storage out_codes(out_code.begin(), out_code.end());
             out.add_column(
                 extra_group_by[0].name,
-                Column<Categorical>{cat->dictionary_ptr(), cat->index_ptr(), std::move(out_codes)});
+                cat->with_codes(std::move(out_codes)));
         } else if (!str_dict.empty()) {
             Column<std::string> key_out;
             key_out.reserve(n_out);

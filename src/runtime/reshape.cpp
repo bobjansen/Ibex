@@ -855,10 +855,10 @@ auto rbind_table(const std::vector<const Table*>& tables,
                     for (std::size_t ti = 1; shared_dict && ti < tables.size(); ++ti) {
                         const auto& src =
                             std::get<Col>(*tables[ti]->columns[col_pos[ti][ci]].column);
-                        shared_dict = src.dictionary_ptr() == first_src.dictionary_ptr();
+                        shared_dict = src.dictionary_identity() == first_src.dictionary_identity();
                     }
                     if (shared_dict) {
-                        dst = Col(first_src.dictionary_ptr(), first_src.index_ptr(), {});
+                        dst = first_src.with_codes();
                         dst.reserve(total_rows);
                         for (std::size_t ti = 0; ti < tables.size(); ++ti) {
                             const auto& src =
@@ -1041,7 +1041,7 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                     });
                     return out_col;
                 } else if constexpr (std::is_same_v<SrcCol, Column<Categorical>>) {
-                    Column<Categorical> out_col{src_col.dictionary_ptr(), src_col.index_ptr(), {}};
+                    Column<Categorical> out_col = src_col.with_codes();
                     out_col.resize(out_rows);
                     auto* dst_codes = out_col.codes_data();
                     with_measure_count([&]<std::size_t M>() {
@@ -1183,7 +1183,7 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                 });
                 return out_col;
             } else if constexpr (std::is_same_v<SrcCol, Column<Categorical>>) {
-                Column<Categorical> out_col{first_col.dictionary_ptr(), first_col.index_ptr(), {}};
+                Column<Categorical> out_col = first_col.with_codes();
                 out_col.resize(out_rows);
                 auto* dst_codes = out_col.codes_data();
                 for_rows([&](std::size_t begin, std::size_t end) {

@@ -543,7 +543,7 @@ class GroupKeyStore {
                         col.put_int(Kind::Bool, gid, column[row] ? 1 : 0, size());
                     } else if constexpr (std::is_same_v<C, Column<Categorical>>) {
                         col.put_cat(gid, std::string_view{column[row]}, column.code_at(row),
-                                    column.dictionary_ptr().get(), size());
+                                    column.dictionary_identity(), size());
                     } else if constexpr (std::is_same_v<C, Column<std::string>>) {
                         col.put_text(gid, std::string_view{column[row]}, size());
                     } else if constexpr (std::is_same_v<C, Column<Date>>) {
@@ -1014,7 +1014,7 @@ class GroupKeyStore {
                     col.claim(Kind::Text, groups, /*zero=*/false);
                     // As `put_cat`: codes stay usable while every group's
                     // code is against one dictionary.
-                    const void* dict = typed.dictionary_ptr().get();
+                    const void* dict = typed.dictionary_identity();
                     if (col.codes_usable && col.code_dict == nullptr) {
                         col.code_dict = dict;
                     } else if (col.codes_usable && col.code_dict != dict) {
@@ -1121,7 +1121,7 @@ class GroupKeyStore {
         if (col.kind == Kind::Unset) {
             return !col.codes_usable;
         }
-        return col.text_dict == nullptr || col.text_dict != cat->dictionary_ptr();
+        return col.text_dict == nullptr || col.text_dict.get() != cat->dictionary_identity();
     }
 
     /// The bytes `rows[lo .. hi)` of a text key column take; 0 otherwise.
@@ -3883,7 +3883,7 @@ class HashAggregateState final {
     auto key_bounds(const Reader& read, const ColumnValue& col, IntKeyKind kind, std::size_t rows)
         -> std::pair<std::int64_t, std::int64_t> {
         if (kind == IntKeyKind::Cat) {
-            const auto size = std::get<Column<Categorical>>(col).dictionary().size();
+            const auto size = std::get<Column<Categorical>>(col).dictionary_size();
             return {0, size == 0 ? 0 : static_cast<std::int64_t>(size) - 1};
         }
         std::int64_t lo = read(0);
@@ -5211,7 +5211,7 @@ class HashAggregateState final {
         plan.dict_sizes.resize(n_keys);
         plan.strides.resize(n_keys);
         for (std::size_t c = 0; c < n_keys; ++c) {
-            plan.dict_sizes[c] = static_cast<std::uint64_t>(cols[c]->dictionary().size());
+            plan.dict_sizes[c] = static_cast<std::uint64_t>(cols[c]->dictionary_size());
             if (plan.dict_sizes[c] == 0) {
                 plan.dict_sizes[c] = 1;  // avoid stride collapse
             }
@@ -5614,7 +5614,7 @@ class HashAggregateState final {
             // only grow and never reorder across chunks, so existing gids stay
             // valid and new dict entries just extend the array with sentinels.
             const auto* codes = cat_cols[0]->codes_data();
-            const std::size_t dict_size = cat_cols[0]->dictionary().size();
+            const std::size_t dict_size = cat_cols[0]->dictionary_size();
             if (cat_dense_gid_.size() < dict_size) {
                 cat_dense_gid_.resize(dict_size, kNoGid);
             }
@@ -6251,7 +6251,7 @@ class HashAggregateState final {
                 held = std::get<Column<Categorical>>(make_empty_like(*agg_entries[a]->column));
                 continue;
             }
-            if (held->dictionary_ptr() == column.dictionary_ptr()) {
+            if (held->dictionary_identity() == column.dictionary_identity()) {
                 continue;
             }
             const auto& dict = held->dictionary();
@@ -7210,7 +7210,7 @@ class HashAggregateState final {
         if (!aggs_are_slot_combinable()) {
             return false;
         }
-        const std::size_t dict_size = cat.dictionary().size();
+        const std::size_t dict_size = cat.dictionary_size();
         const std::size_t morsels = dense_morsel_count(dict_size, rows);
         if (morsels == 0) {
             return false;
@@ -7805,7 +7805,7 @@ class HashAggregateState final {
                     store_ints[ci] = ints;
                 } else if (const auto* cat = std::get_if<Column<Categorical>>(&col)) {
                     if (const auto* codes =
-                            group_keys_.cat_codes_against(ci, cat->dictionary_ptr().get())) {
+                            group_keys_.cat_codes_against(ci, cat->dictionary_identity())) {
                         slot_kind[ci] = EmitSlot::Cat;
                         store_codes[ci] = codes;
                     }

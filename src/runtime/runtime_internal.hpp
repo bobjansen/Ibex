@@ -190,8 +190,7 @@ inline auto make_gather_column(const ColumnValue& src, std::size_t rows) -> Colu
                 using ColT = std::decay_t<decltype(col)>;
                 if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
                     // Shares the source dictionary; only the codes are gathered.
-                    return Column<Categorical>(col.dictionary_ptr(), col.index_ptr(),
-                                               Column<Categorical>::codes_storage(rows));
+                    return col.with_codes(Column<Categorical>::codes_storage(rows));
                 } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
                     return ColT{};
                 } else if constexpr (!std::is_same_v<ColT, Column<bool>> &&
@@ -415,7 +414,7 @@ void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src,
                     }
                 }
                 return {
-                    Column<Categorical>(col.dictionary_ptr(), col.index_ptr(), std::move(codes)),
+                    col.with_codes(std::move(codes)),
                     std::move(bm)};
             } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
                 const auto* src_off = col.offsets_data();
@@ -825,8 +824,7 @@ inline auto append_defaults(ColumnValue& col, std::size_t count) -> void {
                             [](const auto& col) -> ColumnValue {
                                 using ColType = std::decay_t<decltype(col)>;
                                 if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
-                                    return Column<Categorical>{
-                                        col.dictionary_ptr(), col.index_ptr(), {}};
+                                    return col.with_codes();
                                 }
                                 return ColType{};
                             },

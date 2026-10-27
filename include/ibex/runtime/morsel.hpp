@@ -54,7 +54,7 @@ struct TableRangeMorsel {
                             [&](const auto& col) -> ColumnValue {
                                 using Col = std::decay_t<decltype(col)>;
                                 if constexpr (std::is_same_v<Col, Column<Categorical>>) {
-                                    Column<Categorical> out(col.dictionary_ptr(), col.index_ptr());
+                                    Column<Categorical> out = col.with_codes();
                                     out.reserve(end - begin);
                                     for (std::size_t r = begin; r < end; ++r) {
                                         out.push_code(col.code_at(r));

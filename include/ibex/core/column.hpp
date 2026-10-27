@@ -9,6 +9,7 @@
 #include <ibex/core/time_zone.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +18,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <robin_hood.h>
 #include <span>
@@ -664,6 +666,7 @@ class Column<Categorical> {
           dict_offset_(other.dict_offset_),
           dict_size_(other.dict_size_),
           dict_materialized_(other.dict_materialized_),
+          load_(other.load_),
           meta_(other.meta_) {}
 
     Column(Column&& other) noexcept
@@ -680,6 +683,7 @@ class Column<Categorical> {
           dict_offset_(other.dict_offset_),
           dict_size_(other.dict_size_),
           dict_materialized_(other.dict_materialized_),
+          load_(std::move(other.load_)),
           meta_(other.meta_) {
         other.codes_data_ = nullptr;
         other.codes_offset_ = 0;
@@ -726,6 +730,7 @@ class Column<Categorical> {
         std::swap(dict_offset_, other.dict_offset_);
         std::swap(dict_size_, other.dict_size_);
         std::swap(dict_materialized_, other.dict_materialized_);
+        load_.swap(other.load_);
         std::swap(meta_, other.meta_);
     }
 
@@ -743,8 +748,9 @@ class Column<Categorical> {
         }
         Column column;
         column.dict_ = std::make_shared<std::vector<std::string>>();
-        column.index_.reset();
         column.dict_materialized_ = false;
+        column.index_ = std::make_shared<index_map>();
+        column.load_ = std::make_shared<DictionaryLoad>();
         column.external_codes_owner_ = owner;
         column.codes_.clear();
         column.codes_data_ = codes;
@@ -781,6 +787,32 @@ class Column<Categorical> {
     }
     [[nodiscard]] auto dictionary_chars_buffer_data() const noexcept -> const char* {
         return dict_chars_data_;
+    }
+    /// Which dictionary this is, for telling whether two columns share one.
+    /// Unlike `dictionary_ptr()` it does not build the dictionary's strings, so
+    /// an adopted dictionary is left in the producer's buffers.
+    [[nodiscard]] auto dictionary_identity() const noexcept -> const void* { return dict_.get(); }
+
+    /// A column over this column's dictionary holding `codes`. The dictionary,
+    /// its index and any adopted buffers are shared and still unbuilt if they
+    /// were: nothing is read or copied, whatever the dictionary's size.
+    [[nodiscard]] auto with_codes(codes_storage codes = {}) const -> Column {
+        Column out(dict_, index_, std::move(codes));
+        out.external_dict_owner_ = external_dict_owner_;
+        out.dict_offsets_data_ = dict_offsets_data_;
+        out.dict_chars_data_ = dict_chars_data_;
+        out.dict_offset_ = dict_offset_;
+        out.dict_size_ = dict_size_;
+        out.dict_materialized_ = dict_materialized_;
+        out.load_ = load_;
+        return out;
+    }
+
+    /// Whether any column sharing this dictionary has built its string form.
+    /// An adopted dictionary stays in the producer's buffers until something
+    /// asks for `dictionary()` or `dictionary_ptr()`; this does not ask.
+    [[nodiscard]] auto dictionary_materialized() const noexcept -> bool {
+        return dict_materialized_ || (load_ != nullptr && load_->done.load(std::memory_order_acquire));
     }
     [[nodiscard]] auto dictionary_size() const noexcept -> size_type {
         return dictionary_is_external() ? dict_size_ : (dict_ == nullptr ? 0 : dict_->size());
@@ -921,26 +953,48 @@ class Column<Categorical> {
         return {dict_chars_data_ + start, end - start};
     }
 
+    /// Columns copied from one adopted dictionary share `dict_`, so the fill
+    /// runs once however many copies ask, and from whichever thread asks first.
     void materialize_dictionary() const {
         if (dict_materialized_) {
             return;
         }
-        dict_->reserve(dict_size_);
-        for (size_type i = 0; i < dict_size_; ++i) {
-            dict_->emplace_back(dictionary_at(i));
+        const auto fill = [this] {
+            dict_->reserve(dict_size_);
+            for (size_type i = 0; i < dict_size_; ++i) {
+                dict_->emplace_back(dictionary_at(i));
+            }
+        };
+        if (load_ != nullptr) {
+            std::call_once(load_->once, [&] {
+                fill();
+                load_->done.store(true, std::memory_order_release);
+            });
+        } else {
+            fill();
         }
         dict_materialized_ = true;
     }
 
-    void ensure_index() const {
-        if (index_ != nullptr) {
-            return;
-        }
-        index_ = std::make_shared<index_map>();
+    void build_index() const {
         index_->reserve(dictionary_size());
         for (size_type i = 0; i < dictionary_size(); ++i) {
             index_->emplace(std::string(dictionary_at(i)), static_cast<code_type>(i));
         }
+    }
+
+    /// An adopted dictionary's index is shared, empty, by every column over it
+    /// and filled once, by whichever of them first looks a value up.
+    void ensure_index() const {
+        if (load_ != nullptr) {
+            std::call_once(load_->index_once, [this] { build_index(); });
+            return;
+        }
+        if (index_ != nullptr) {
+            return;
+        }
+        index_ = std::make_shared<index_map>();
+        build_index();
     }
 
     void detach_dictionary() {
@@ -984,6 +1038,13 @@ class Column<Categorical> {
     size_type dict_offset_ = 0;
     size_type dict_size_ = 0;
     mutable bool dict_materialized_ = true;
+
+    struct DictionaryLoad {
+        std::once_flag once;
+        std::once_flag index_once;
+        std::atomic<bool> done{false};
+    };
+    std::shared_ptr<DictionaryLoad> load_;
 
     /// See `meta()`. Declared last so the hand-written constructors can append
     /// it to their member-init lists without tripping -Wreorder. Four bytes,

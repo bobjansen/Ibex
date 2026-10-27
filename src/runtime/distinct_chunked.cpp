@@ -321,11 +321,11 @@ class ChunkedDistinctOperator final : public Operator {
 
     auto gather_distinct_categorical_rows(Table t, const Column<Categorical>& col)
         -> std::optional<Table> {
-        const void* dict_id = static_cast<const void*>(col.dictionary_ptr().get());
+        const void* dict_id = col.dictionary_identity();
         if (cat_dictionary_id_ == nullptr || cat_dictionary_id_ == dict_id) {
             cat_dictionary_id_ = dict_id;
             const std::size_t rows = t.rows();
-            const std::size_t dict_size = col.dictionary().size();
+            const std::size_t dict_size = col.dictionary_size();
             // A Categorical code is a dense index into the dictionary, so
             // membership is an array read — hashing it was redundant work by
             // construction, one probe per ROW to discover at most `dict_size`

@@ -650,8 +650,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             }
             if (group_cats[i] != nullptr) {
                 output.add_column(group_by[i].name,
-                                  Column<Categorical>(group_cats[i]->dictionary_ptr(),
-                                                      group_cats[i]->index_ptr(), {}));
+                                  group_cats[i]->with_codes());
             } else {
                 output.add_column(group_by[i].name, make_empty_like(*column));
             }
@@ -1193,7 +1192,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         constexpr std::uint32_t kNoCatGid = std::numeric_limits<std::uint32_t>::max();
         std::vector<std::uint32_t> cat_gid_memo;
         if (key_cols.size() == 1 && key_cols.front().kind == KeyCol::Kind::Cat) {
-            cat_gid_memo.assign(key_cols.front().cat->dictionary().size(), kNoCatGid);
+            cat_gid_memo.assign(key_cols.front().cat->dictionary_size(), kNoCatGid);
         }
 
         // When the keys are all integers or codes with a small Cartesian span
@@ -1267,7 +1266,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 std::int64_t lo = 0;
                 std::int64_t hi = 0;
                 if (key_cols[c].kind == KeyCol::Kind::Cat) {
-                    hi = static_cast<std::int64_t>(key_cols[c].cat->dictionary().size()) - 1;
+                    hi = static_cast<std::int64_t>(key_cols[c].cat->dictionary_size()) - 1;
                 } else {
                     lo = std::numeric_limits<std::int64_t>::max();
                     hi = std::numeric_limits<std::int64_t>::min();
@@ -1828,9 +1827,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             // Pass 1: Assign group IDs. Categorical codes are dense dictionary indexes,
             // so use a direct code -> gid table instead of hashing each distinct code.
             constexpr std::uint32_t no_gid = std::numeric_limits<std::uint32_t>::max();
-            std::vector<std::uint32_t> code_to_id(col.dictionary().size(), no_gid);
+            std::vector<std::uint32_t> code_to_id(col.dictionary_size(), no_gid);
             std::vector<Column<Categorical>::code_type> order;
-            order.reserve(std::min<std::size_t>(rows, col.dictionary().size()));
+            order.reserve(std::min<std::size_t>(rows, col.dictionary_size()));
             // Flat AggSlot array: one contiguous allocation replaces n_groups heap allocations.
             // Layout: flat_slots[g * n_aggs + agg_i] is the slot for group g, aggregation agg_i.
             const std::size_t n_aggs = plan.size();

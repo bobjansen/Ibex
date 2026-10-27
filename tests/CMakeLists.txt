@@ -77,6 +77,7 @@ set(IBEX_TEST_SOURCES
     test_chunked_sources.cpp
     test_aggregate_prefilter.cpp
     test_bound_plan.cpp
+    test_dictionary_laziness.cpp
     test_operator.cpp
     test_table_compare.cpp
     test_worker_pool.cpp

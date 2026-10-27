@@ -1915,7 +1915,7 @@ class DeferredScanSourceOperator final : public Operator {
             if (!state.has_value()) {
                 state.emplace();
             }
-            if (state->dictionary_ptr() == local->dictionary_ptr()) {
+            if (state->dictionary_identity() == local->dictionary_identity()) {
                 continue;  // already speaks the shared dictionary
             }
             // Intern this chunk's dictionary into the shared one, reading back
@@ -2380,7 +2380,7 @@ class PipelinedScanOperator final : public Operator {
             if (!state.has_value()) {
                 state.emplace();
             }
-            if (state->dictionary_ptr() == local->dictionary_ptr()) {
+            if (state->dictionary_identity() == local->dictionary_identity()) {
                 continue;
             }
             const auto& dictionary = local->dictionary();

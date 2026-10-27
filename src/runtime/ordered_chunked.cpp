@@ -1208,7 +1208,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
         // the dictionary is fixed, so code -> gid is a function; memo it.
         cat_gid_memo_.clear();
         if (group_key_cols.size() == 1 && group_key_cols.front().kind == KeyCol::Kind::Cat) {
-            cat_gid_memo_.assign(group_key_cols.front().cat->dictionary().size(), kNoCatGid);
+            cat_gid_memo_.assign(group_key_cols.front().cat->dictionary_size(), kNoCatGid);
         }
 
         std::vector<const ColumnValue*> key_columns;

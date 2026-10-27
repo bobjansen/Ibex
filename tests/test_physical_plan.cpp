@@ -7,6 +7,7 @@
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/pipeline.hpp>
 
 #include <catch2/catch_message.hpp>
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <memory>
 #include <optional>
 #include <string>
@@ -114,6 +116,53 @@ TEST_CASE("Bound table schemas enable composite join planning", "[physical][plan
         const auto plan = runtime::physical::plan_physical(*node, registry, nullptr);
         CHECK(plan.join.strategy == JoinStrategy::MaterializeBoth);
     }
+}
+
+TEST_CASE("Deferred lazy sources give the planner their key types", "[physical][plan]") {
+    // A query built without ascriptions (the Polars adapter's) reads lazy
+    // sources the registry never holds. Their schemas used to be unknown to
+    // the planner, so a two-key Int64 join could not prove its key types and
+    // materialized both sides: Q09's 60M-row lineitem probe decoded whole.
+    using runtime::physical::JoinBranch;
+    using runtime::physical::JoinStrategy;
+    const auto lazy = [](bool string_keys) {
+        runtime::Table schema;
+        if (string_keys) {
+            schema.add_column("k1", Column<std::string>{});
+        } else {
+            schema.add_column("k1", Column<std::int64_t>{});
+        }
+        schema.add_column("k2", Column<std::int64_t>{});
+        return std::make_shared<runtime::LazyTable>(
+            std::move(schema), 10,
+            [](const std::vector<std::string>&,
+               const runtime::Selection*) -> std::expected<runtime::Table, std::string> {
+                return std::unexpected("planning only");
+            });
+    };
+    const auto deferred = [&](bool string_keys) {
+        runtime::DeferredScanRegistry registry;
+        for (const char* name : {"a", "b"}) {
+            runtime::DeferredScan scan;
+            scan.lazy = lazy(string_keys);
+            registry.emplace(name, std::move(scan));
+        }
+        return registry;
+    };
+    auto node = require_ir("a join b on { k1, k2 };");
+    const auto ints = deferred(false);
+    const auto typed = runtime::physical::plan_physical(
+        *node, {}, nullptr, runtime::physical::deferred_source_schemas(&ints));
+    CHECK(typed.join.strategy == JoinStrategy::StreamingProbe);
+    CHECK(typed.join.branch == JoinBranch::PairIntInner);
+    CHECK(runtime::physical::plan_physical(*node, {}, nullptr).join.strategy ==
+          JoinStrategy::MaterializeBoth);
+    // A string column's in-memory form is settled at decode, so it is never
+    // claimed: the same join over string keys proves nothing.
+    const auto strings = deferred(true);
+    const auto untyped = runtime::physical::plan_physical(
+        *node, {}, nullptr, runtime::physical::deferred_source_schemas(&strings));
+    CHECK(untyped.join.strategy == JoinStrategy::MaterializeBoth);
 }
 
 TEST_CASE("Physical plan lowers filter+select into a fused map step", "[physical][plan]") {

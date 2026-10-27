@@ -1299,7 +1299,8 @@ auto try_take_join_probe(const ir::Node& node, const TableRegistry& registry,
     if (std::getenv("IBEX_PROBE_MORSELS") == nullptr) {
         return std::optional<FusibleJoinProbe>{};
     }
-    const physical::Plan plan = physical::plan_physical(node, registry, externs);
+    const physical::Plan plan = physical::plan_physical(
+        node, registry, externs, physical::deferred_source_schemas(exec.deferred_scans));
     const physical::JoinPlan& jp = plan.join;
     if (!jp.describes || jp.strategy != physical::JoinStrategy::StreamingProbe ||
         (jp.branch != physical::JoinBranch::SingleKeyInner &&

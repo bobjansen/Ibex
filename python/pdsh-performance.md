@@ -1497,3 +1497,44 @@ hand-reordering the query (not committed): no change at eight threads, −8% at
 one. Doing it properly needs a planner rule that swaps a singleton cross join
 below the anti join, seen through the adapter's projections, so it is
 deferred.
+
+## Q09: the physical planner now sees lazy sources' key types
+
+Q09 was the largest remaining gap (1,055 ms against 606 ms for streaming
+Polars at eight threads). The native `.ibex` Q09 took 700 ms in the same
+sitting, process start included, so most of the gap was in how the
+adapter's query reached the engine.
+
+The profiles showed why. Native Q09 probes lineitem through a dynamic key
+scan: it decodes only the two join keys, keeps the rows matching the
+435k-row part/supplier build, then decodes the other columns for those rows.
+The adapter's plan decoded all six lineitem columns in full and probed all
+60M rows (`join inner keys=2` 330 ms self, 2.4 s pool work).
+
+The two-key join streams only when `is_streamable_pair_int_join` can prove
+both keys are Int64. Native Q09 proves that through its `as DataFrame<{...}>`
+ascriptions. An adapter query has no ascriptions, and the runtime called
+`plan_physical` with no source schemas: only in-memory registry tables were
+typed, and every deferred lazy scan was an unknown schema. The pair join
+therefore planned `MaterializeBoth`, although the probe scan had been
+registered as deferrable. The runtime now passes
+`deferred_source_schemas(exec.deferred_scans)` at all three planner call
+sites. Fixed-width columns are typed from each `LazyTable` schema; string
+columns stay untyped because plain versus dictionary form is settled only
+at decode.
+
+An earlier hypothesis was that the adapter's renaming selects (lowered as
+column-copy updates) hid the scan. Lowering them as `select` + `rename` was
+built and measured: no change in Q09. It was not kept.
+
+| SF10, eight threads | Before | After | Rounds faster |
+|---|---:|---:|---:|
+| Q09 (three all-22 rounds) | 1,062 ms | 739 ms (−30%) | 3/3 |
+| Q20 (five focused rounds) | 533 ms | 496 ms (−6.9%) | 5/5 |
+| all 22, geometric mean | | −1.3% | |
+
+No other query moved beyond its own spread. One all-22 round showed Q20
++9.5% and +10.8%; the focused five-round A/B reversed it. Q20 swings between
+~460 and ~530 ms. Q09 is now 1.2× streaming Polars, down from 1.74×. All 22
+queries match, and the full ctest passes. Data is in
+`pdsh-performance-results/q09-deferred-source-schemas.json`.

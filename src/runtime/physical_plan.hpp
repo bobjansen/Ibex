@@ -597,6 +597,14 @@ struct Plan {
                                  const ExternRegistry* externs,
                                  const ir::SourceSchemas& source_schemas = {}) -> Plan;
 
+/// The schemas of an execution's deferred lazy sources, for `plan_physical`.
+/// Without them a lazy scan is an unknown schema to the planner, and any
+/// branch that must prove key types declines: an adapter-built query (no
+/// ascriptions) sent Q09's two-key lineitem join to the materializing path.
+/// String columns are left untyped (see the definition).
+[[nodiscard]] auto deferred_source_schemas(const DeferredScanRegistry* deferred)
+    -> ir::SourceSchemas;
+
 /// Deterministic multi-line rendering for tests and debugging. A plan that
 /// cannot explain why it materialized is not an acceptable plan, so every
 /// fallback prints its reason.

@@ -407,6 +407,18 @@ class EngineTests(unittest.TestCase):
                 self.equal(query.select("key", "prefix"))
                 self.assertIn("like(`prefix`", self.engine.explain(query))
 
+    def test_identity_select_fields_are_bare_columns(self):
+        # `a = a` lowers to a copy update that reads `a` even when a later
+        # select drops it, so the scan keeps decoding the column. A bare name
+        # is a projection, which column demand sees through.
+        frame = pl.LazyFrame({"a": [1, 2], "b": ["x", "y"], "c": [3.0, 4.0]})
+        query = frame.select("a", "b").select(pl.col("a"), pl.col("b").alias("d"))
+        self.equal(query)
+        source = self.engine.explain(query)
+        # Polars merges the two selects; the identity field stays bare.
+        self.assertIn("[select { `a`, `d` = `b` }]", source)
+        self.assertNotIn("`a` = `a`", source)
+
     def test_nested_caches_and_distinct_cache_identities(self):
         frame = pl.LazyFrame({"key": [1, 2, 3], "phone": ["13-abc", "31-def", None]})
         inner = frame.with_columns(prefix=pl.col("phone").str.slice(0, 2)).cache()

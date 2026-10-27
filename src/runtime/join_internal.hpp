@@ -84,6 +84,10 @@ struct FusedLeftJoinCount {
     /// The column the count/sum reads, resolved back through any updates
     /// between the aggregate and the join.
     std::string counted_column;
+    /// The join-output column the group key copies, resolved the same way:
+    /// the aggregate's own key name unless a plain copy renamed it (the
+    /// Polars adapter renames every join column through a `select`).
+    std::string group_source;
 };
 
 [[nodiscard]] auto plan_fused_left_join_count(const ir::AggregateNode& aggregate)
@@ -207,7 +211,8 @@ class LeftJoinCounter {
     /// repeated left key, or a key that is not a null-free Int64. The ordinary
     /// join must be used then.
     [[nodiscard]] static auto prepare(const ir::JoinNode& join, const ir::AggregateNode& aggregate,
-                                      const Table& left, std::string_view counted_column)
+                                      const Table& left, std::string_view counted_column,
+                                      std::string_view group_source)
         -> std::optional<LeftJoinCounter>;
 
     /// Whether a right chunk can be counted: the right key is Int64 and the

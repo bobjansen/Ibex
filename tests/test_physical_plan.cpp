@@ -934,6 +934,27 @@ TEST_CASE("The plan classifies an aggregate by relaying the builder's predicates
         CHECK_FALSE(plan.counted_column.empty());
     }
 
+    SECTION("the fusion sees through plain copies of the join's columns") {
+        // The Polars adapter renames every join column through a select (an
+        // update of plain copies), so the group key and the counted column
+        // reach the aggregate under other names.
+        auto ir = require_ir(
+            "(l left join r on k)[select { g = k, c = v }][select { n = count(c) }, by g];");
+        REQUIRE(ir->kind() == ir::NodeKind::Aggregate);
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+        const auto plan =
+            runtime::physical::plan_aggregate(static_cast<const ir::AggregateNode&>(*ir));
+        CHECK(plan.strategy == AggregateStrategy::FusedLeftJoinCount);
+        CHECK(plan.counted_column == "v");
+        CHECK(plan.group_source == "k");
+        // A computed key is not a copy of the join's key.
+        auto computed = require_ir(
+            "(l left join r on k)[select { g = k + 1, c = v }][select { n = count(c) }, by g];");
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+        CHECK(runtime::physical::plan_aggregate(static_cast<const ir::AggregateNode&>(*computed))
+                  .strategy != AggregateStrategy::FusedLeftJoinCount);
+    }
+
     SECTION("an aggregate over a plain child names no fused join") {
         const auto plan = plan_of("t[select { s = sum(v) }, by k];");
         CHECK(plan.fused_join == nullptr);

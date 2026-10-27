@@ -13,6 +13,7 @@
 #include <ibex/ir/schema.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/pipeline.hpp>
 
 #include <algorithm>
@@ -568,6 +569,31 @@ auto is_stream_admissible_update(const ir::Node& node) -> bool {
     return std::ranges::all_of(fields, [](const ir::FieldSpec& field) {
         return ir::is_subset_evaluable_expr(field.expr);
     });
+}
+
+auto deferred_source_schemas(const DeferredScanRegistry* deferred) -> ir::SourceSchemas {
+    ir::SourceSchemas schemas;
+    if (deferred == nullptr) {
+        return schemas;
+    }
+    schemas.reserve(deferred->size());
+    for (const auto& [name, scan] : *deferred) {
+        if (scan.lazy == nullptr) {
+            continue;
+        }
+        std::vector<ir::SchemaField> fields;
+        fields.reserve(scan.lazy->schema().columns.size());
+        for (const ColumnEntry& column : scan.lazy->schema().columns) {
+            const ir::ColumnType type = runtime_column_type(*column.column);
+            // A string column's in-memory form (plain or dictionary) can be
+            // settled only when it decodes, so it stays untyped here.
+            const bool settled = type != ir::ColumnType::String && type != ir::ColumnType::Categorical;
+            fields.push_back({.name = column.name,
+                              .type = settled ? std::optional<ir::ColumnType>{type} : std::nullopt});
+        }
+        schemas.insert_or_assign(name, ir::SchemaInfo::known(std::move(fields), /*open=*/false));
+    }
+    return schemas;
 }
 
 auto plan_physical(const ir::Node& root, const TableRegistry& registry,

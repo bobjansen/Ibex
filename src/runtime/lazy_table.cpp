@@ -30,6 +30,7 @@
 #include <variant>
 #include <vector>
 
+#include "bound_filter.hpp"
 #include "execution_profile_internal.hpp"
 #include "runtime_internal.hpp"
 #include "static_range_filter.hpp"
@@ -518,6 +519,32 @@ auto as_like_predicate(const ir::Expr& expr, bool negated)
 
 }  // namespace
 
+namespace {
+
+/// The conjuncts with this execution's bound scalars resolved to literals, or
+/// nullopt when none refers to one. The fused page-decoder `like` takes only a
+/// literal pattern, and the Polars adapter binds every pattern as a scalar
+/// (Q13's `o_comment` filter decoded the column whole). A column of the same
+/// name shadows a non-lexical reference, as in `bind_filter_constants`.
+auto bind_scan_conjuncts(const std::vector<ir::Expr>& conjuncts, const ScalarRegistry* scalars,
+                         const Table& schema) -> std::optional<std::vector<ir::Expr>> {
+    const auto has_column = [&](const std::string& name) { return schema.find(name) != nullptr; };
+    std::optional<std::vector<ir::Expr>> bound;
+    for (std::size_t i = 0; i < conjuncts.size(); ++i) {
+        auto one = bind_filter_constants(conjuncts[i], scalars, has_column);
+        if (!one.has_value()) {
+            continue;
+        }
+        if (!bound.has_value()) {
+            bound = conjuncts;
+        }
+        (*bound)[i] = std::move(*one);
+    }
+    return bound;
+}
+
+}  // namespace
+
 auto LazyTable::fusable_string_conjuncts(const std::vector<ir::Expr>& conjuncts,
                                          const std::set<std::string>& names,
                                          std::vector<FusedStringConjunct>& fused,
@@ -725,7 +752,9 @@ auto LazyTable::selection_for(const std::set<std::string>& output_names,
     std::vector<FusedStringConjunct> fused;
     std::vector<ir::Expr> unfused;
     std::optional<Selection> fused_selection;
-    if (fusable_string_conjuncts(conjuncts, output_names, fused, unfused)) {
+    const auto bound_conjuncts = bind_scan_conjuncts(conjuncts, scalars, schema_);
+    if (fusable_string_conjuncts(bound_conjuncts.has_value() ? *bound_conjuncts : conjuncts, output_names,
+                                 fused, unfused)) {
         auto scan = scan_string_filters(fused, nullptr, exec);
         if (!scan) {
             return std::unexpected(scan.error());
@@ -883,7 +912,9 @@ auto LazyTable::project_where(const std::set<std::string>& names,
     std::vector<FusedStringConjunct> fused;
     std::vector<ir::Expr> unfused;
     std::optional<Selection> fused_selection;
-    if (fusable_string_conjuncts(conjuncts, names, fused, unfused)) {
+    const auto bound_conjuncts = bind_scan_conjuncts(conjuncts, scalars, schema_);
+    if (fusable_string_conjuncts(bound_conjuncts.has_value() ? *bound_conjuncts : conjuncts, names,
+                                 fused, unfused)) {
         auto scan = scan_string_filters(fused, nullptr, exec);
         if (!scan) {
             return std::unexpected(scan.error());
@@ -1214,7 +1245,9 @@ auto LazyTable::project_where_unit(const std::set<std::string>& names,
     std::vector<FusedStringConjunct> fused;
     std::vector<ir::Expr> unfused;
     std::optional<Selection> fused_selection;
-    if (fusable_string_conjuncts(conjuncts, names, fused, unfused)) {
+    const auto bound_conjuncts = bind_scan_conjuncts(conjuncts, scalars, schema_);
+    if (fusable_string_conjuncts(bound_conjuncts.has_value() ? *bound_conjuncts : conjuncts, names,
+                                 fused, unfused)) {
         auto scan = scan_string_filters(fused, &unit, exec);
         if (!scan) {
             return std::unexpected(scan.error());

@@ -1228,6 +1228,47 @@ TEST_CASE("LazyTable: an unnegated like fuses too", "[runtime][lazy_table][strin
     CHECK(state->scan_calls == std::vector<std::string>{"s"});
 }
 
+TEST_CASE("LazyTable: a like whose pattern is a bound scalar still fuses",
+          "[runtime][lazy_table][string_filter]") {
+    // The Polars adapter binds every pattern as `^name`. Resolved for this
+    // execution, it is a literal pattern like any other, on the whole-source
+    // and the per-unit path alike.
+    runtime::ScalarRegistry scalars;
+    scalars.emplace("pattern", runtime::ScalarValue{std::string{"%bad%"}});
+    ir::CallExpr call;
+    call.callee = "like";
+    call.args.push_back(ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "s"}}));
+    call.args.push_back(
+        ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "pattern", .lexical = true}}));
+    ir::LogicalExpr negation;
+    negation.op = ir::LogicalOp::Not;
+    negation.left = ir::make_expr_ptr(ir::Expr{.node = std::move(call)});
+    std::vector<ir::Expr> conjuncts;
+    conjuncts.push_back(ir::Expr{.node = std::move(negation)});
+
+    auto state = std::make_shared<TextSourceState>();
+    auto lazy = make_text_lazy(state);
+    auto table = lazy.project_where({"n"}, conjuncts, kExec, &scalars);
+    REQUIRE(table);
+    CHECK(int_column(*table, "n") == std::vector<std::int64_t>{0, 2, 4, 5});
+    CHECK(state->scan_calls == std::vector<std::string>{"s"});
+    for (const auto& decoded : state->decode_calls) {
+        CHECK(std::ranges::find(decoded, "s") == decoded.end());
+    }
+
+    auto unit_state = std::make_shared<TextSourceState>();
+    auto unit_lazy = make_text_lazy(unit_state);
+    std::vector<std::int64_t> kept;
+    for (const auto& unit : unit_lazy.scan_units()) {
+        auto part = unit_lazy.project_where_unit({"n"}, conjuncts, unit, kExec, &scalars);
+        REQUIRE(part.has_value());
+        const auto values = int_column(*part, "n");
+        kept.insert(kept.end(), values.begin(), values.end());
+    }
+    CHECK(kept == std::vector<std::int64_t>{0, 2, 4, 5});
+    CHECK_FALSE(unit_state->scan_calls.empty());
+}
+
 // --- Streaming a scan in units -------------------------------------------
 //
 // Phase 1 of plans/pipelined-execution-plan.md. The whole point of the design

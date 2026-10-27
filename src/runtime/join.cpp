@@ -2359,17 +2359,35 @@ auto plan_fused_left_join_count(const ir::AggregateNode& aggregate)
     }
     const auto& join = ir::node_cast<ir::JoinNode>(*child);
     auto counted = fused_left_join_counted_column(aggregate, skipped_updates);
+    if (aggregate.group_by().size() != 1) {
+        return std::nullopt;
+    }
+    // The group key, followed back through plain copies the same way.
+    std::string group_source = aggregate.group_by().front().name;
+    for (const ir::UpdateNode* update : skipped_updates) {
+        for (const ir::FieldSpec& field : update->fields()) {
+            if (field.alias != group_source) {
+                continue;
+            }
+            const auto* ref = std::get_if<ir::ColumnRef>(&field.expr.node);
+            if (ref == nullptr || ref->lexical) {
+                return std::nullopt;  // computed here, not read from the join
+            }
+            group_source = ref->name;
+        }
+    }
     const bool candidate = join.kind() == ir::JoinKind::Left && join.keys().size() == 1 &&
-                           !join.predicate().has_value() && aggregate.group_by().size() == 1 &&
+                           !join.predicate().has_value() &&
                            aggregate.aggregations().size() == 1 &&
                            (aggregate.aggregations().front().func == ir::AggFunc::Count ||
                             aggregate.aggregations().front().func == ir::AggFunc::Sum) &&
-                           counted.has_value() &&
-                           aggregate.group_by().front().name == join.keys().front().left;
+                           counted.has_value() && group_source == join.keys().front().left;
     if (!candidate) {
         return std::nullopt;
     }
-    return FusedLeftJoinCount{.join = &join, .counted_column = std::move(*counted)};
+    return FusedLeftJoinCount{.join = &join,
+                              .counted_column = std::move(*counted),
+                              .group_source = std::move(group_source)};
 }
 
 auto fused_left_join_counted_column(const ir::AggregateNode& aggregate,
@@ -2388,13 +2406,24 @@ auto fused_left_join_counted_column(const ir::AggregateNode& aggregate,
     for (const ir::UpdateNode* update : skipped_updates) {
         for (const ir::FieldSpec& field : update->fields()) {
             if (field.alias == group_key) {
-                // The group key would be computed here, not read from the join.
-                return std::nullopt;
+                // A plain copy of a join column is resolved by the caller;
+                // anything else computes the key here instead of reading it.
+                const auto* ref = std::get_if<ir::ColumnRef>(&field.expr.node);
+                if (ref == nullptr || ref->lexical) {
+                    return std::nullopt;
+                }
+                continue;
             }
             if (field.alias != counted) {
                 continue;
             }
+            // The count flag `count(col)` lowers to, or a plain copy of the
+            // counted column (its nulls are the source's nulls).
             auto source = count_flag_source_column(field.expr);
+            if (const auto* ref = std::get_if<ir::ColumnRef>(&field.expr.node);
+                !source.has_value() && ref != nullptr && !ref->lexical) {
+                source = ref->name;
+            }
             if (!source.has_value()) {
                 return std::nullopt;
             }
@@ -2405,8 +2434,8 @@ auto fused_left_join_counted_column(const ir::AggregateNode& aggregate,
 }
 
 auto LeftJoinCounter::prepare(const ir::JoinNode& join, const ir::AggregateNode& aggregate,
-                              const Table& left, std::string_view counted_column)
-    -> std::optional<LeftJoinCounter> {
+                              const Table& left, std::string_view counted_column,
+                              std::string_view group_source) -> std::optional<LeftJoinCounter> {
     if (join.kind() != ir::JoinKind::Left || join.keys().size() != 1 ||
         join.predicate().has_value() || join.null_match() != ir::NullMatch::Never ||
         join.take() != ir::MatchSelection::All || join.expect().asserts_anything() ||
@@ -2416,7 +2445,7 @@ auto LeftJoinCounter::prepare(const ir::JoinNode& join, const ir::AggregateNode&
          (aggregate.aggregations().front().func != ir::AggFunc::Sum ||
           counted_column == aggregate.aggregations().front().column.name)) ||
         aggregate.aggregations().front().column.name.empty() ||
-        aggregate.group_by().front().name != join.keys().front().left) {
+        group_source != join.keys().front().left) {
         return std::nullopt;
     }
     const auto* left_key = left.find_entry(join.keys().front().left);

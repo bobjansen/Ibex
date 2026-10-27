@@ -772,7 +772,7 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         // a stream's chunks are counted on this thread while the pipeline
         // decodes the next ones. Declined -- by the left side, or by a right
         // key that is not Int64 -- the chunks are kept for the ordinary join.
-        auto counter = LeftJoinCounter::prepare(join, agg, *left, counted_column);
+        auto counter = LeftJoinCounter::prepare(join, agg, *left, counted_column, ap.group_source);
         bool counting = counter.has_value();
         std::vector<Chunk> kept;
         std::optional<Chunk> pending;

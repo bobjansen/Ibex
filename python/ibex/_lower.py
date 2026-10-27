@@ -527,7 +527,17 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
                 fields = ", ".join(f"{_identifier(expr._name)} = {_identifier(name)}" for name, expr in zip(temporary_names, expressions))
                 source += f"[select {{ {fields} }}]"
                 continue
-            fields = ", ".join(f"{_identifier(expr._name)} = {render(expr)}" for expr in expressions)
+            def field(expr):
+                # An identity field is a bare column: `a = a` lowers to a copy
+                # update that reads `a` even when a later select drops it, so
+                # the scan keeps decoding it (Q13's o_comment, which then could
+                # not be filtered inside the page decoder).
+                value = expr._args[0] if expr._op == "alias" else expr
+                if (operation == "select" and value._op == "col" and value._args[0] == expr._name
+                        and id(expr) not in filter_scalars):
+                    return _identifier(expr._name)
+                return f"{_identifier(expr._name)} = {render(expr)}"
+            fields = ", ".join(field(expr) for expr in expressions)
             source += f"[{operation} {{ {fields} }}]"
     return ((prefix, source) if _return_parts else prefix + source + ";"), tables, scalars
 

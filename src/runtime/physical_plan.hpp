@@ -243,6 +243,8 @@ struct AggregatePlan {
     /// The column the fused count/sum reads, resolved back through any updates
     /// between the aggregate and the join. Empty unless fused.
     std::string counted_column;
+    /// The join-output column the group key copies (see `FusedLeftJoinCount`).
+    std::string group_source;
     /// Positional bindings for the streamed/hash aggregate input. Closed known
     /// schemas fill this during planning; lazy/unknown inputs bind it once at
     /// the first concrete chunk.

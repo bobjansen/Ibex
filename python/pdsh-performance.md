@@ -1583,3 +1583,44 @@ and Python puts a script's directory first on `sys.path`, so an arm's
 `PYTHONPATH` package is shadowed by the repo's unless `PYTHONSAFEPATH=1`
 is set. The runner's recorded source hashes are those of the repo files.
 Data is in `pdsh-performance-results/q18-lazy-cache-and-prefilter.json`.
+
+## Q13: page-decoder LIKE with bound patterns, bare identity selects, fused left-join count
+
+Native Q13 took ~325 ms; through the adapter ~720 ms (Polars streaming:
+~420 ms). The profile diff showed three adapter-side differences:
+
+* **The `o_comment` filter ran after decode.** Natively,
+  `!like(o_comment, "%special%requests%")` is answered inside the Parquet
+  page decoder and the string column is never built. The fused path takes
+  only a literal pattern, and the adapter binds every pattern as a scalar.
+  The three `fusable_string_conjuncts` call sites in `lazy_table.cpp` now
+  resolve this execution's bound scalars first, using the existing
+  `bind_filter_constants` with column-scope precedence.
+* **The filtered column was still demanded.** The adapter wrote identity
+  fields (`select { o_comment = o_comment, ... }`). Those lower to a
+  column-copy update that reads `o_comment` even though the next select
+  drops it, so the decoder still had to build the column. Identity fields
+  are now emitted as bare columns (`select { o_comment, ... }`), a plain
+  projection that column demand sees through. This alone is worth ~35 ms
+  on Q13, and it helps elsewhere by decoding fewer columns.
+* **The fused left-join count declined.** `customer left join orders` then
+  `count(o_orderkey) by c_custkey` is fused into a per-key counter
+  natively. The adapter renames the join's columns through a select, so
+  the group key and counted column reach the aggregate as plain copies,
+  which `plan_fused_left_join_count` rejected. Plain non-lexical copies
+  are now followed for both, and the group key's source is carried to
+  `LeftJoinCounter::prepare`.
+
+Three interleaved full-stack rounds at eight threads, SF10:
+
+| Query | Before | After | Change | Rounds faster |
+|---|---:|---:|---:|---:|
+| Q13 | 719.7 ms | 320.3 ms | −55.5% | 3/3 |
+| Q04 | 249.9 ms | 231.6 ms | −7.3% | 3/3 |
+| Q10 | 734.6 ms | 691.8 ms | −5.8% | 3/3 |
+| Q16 | 111.9 ms | 106.4 ms | −4.9% | 3/3 |
+| all 22, geometric mean | | | −5.6% | |
+
+Q13 is now 0.77× streaming Polars. Q02 and Q20 moved within their known
+spread. All 22 match; full ctest passes. Data is in
+`pdsh-performance-results/q13-bound-like-and-fused-count.json`.

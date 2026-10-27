@@ -1040,6 +1040,7 @@ auto plan_aggregate(const ir::AggregateNode& agg) -> AggregatePlan {
         out.strategy = AggregateStrategy::FusedLeftJoinCount;
         out.fused_join = fusion->join;
         out.counted_column = std::move(fusion->counted_column);
+        out.group_source = std::move(fusion->group_source);
         return out;
     }
     out.strategy = aggregate_is_streamable(agg) ? AggregateStrategy::StreamingSorted

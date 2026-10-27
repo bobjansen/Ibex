@@ -847,9 +847,18 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
                                        model_out);
     };
     // This step is composed serially over its child, so whatever pipeline
-    // builds the child does not produce the consumer's input.
-    (void)take_offered_scan_worker_sink();
+    // builds the child does not produce the consumer's input -- unless the
+    // step is a plain projection. A Project neither drops, adds nor reorders
+    // rows and cannot rebind a name, so a worker's probe of the scan's chunk
+    // is a probe of the consumer's. A Rename or an Update could put another
+    // column under the key's name, and a filter changes the rows: those still
+    // withdraw. (An adapter join's right side is often just a Project over the
+    // scan; withdrawing there lost Q22's and Q04's on-worker probes.)
     const MapStep& step = plan.steps[index];
+    if (step.node->kind() != ir::NodeKind::Project || step.fused_update != nullptr ||
+        step.fused_project != nullptr) {
+        (void)take_offered_scan_worker_sink();
+    }
     const ir::Node& node = *step.node;
     if (exec.execution_profile == nullptr) {
         auto child = build_child();

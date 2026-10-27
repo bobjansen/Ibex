@@ -419,6 +419,32 @@ class EngineTests(unittest.TestCase):
         self.assertIn("[select { `a`, `d` = `b` }]", source)
         self.assertNotIn("`a` = `a`", source)
 
+    def test_joins_without_shared_names_are_emitted_directly(self):
+        # Native join passes (semi pushdown, filter pushdown, reordering) look
+        # for a Join directly under its parent; the renaming selects hid them.
+        import re
+        renamed = re.compile(r"_ibex_join_\d+_[lr]_")
+        left = pl.LazyFrame({"lk": [1, 2, 2, 3, None], "lv": [10, 20, 21, 30, 40]})
+        right = pl.LazyFrame({"rk": [2, 3, 3, 4, None], "rv": ["b", "c", "c2", "d", "n"]})
+        same = pl.LazyFrame({"lk": [2, 3, 5], "sv": [7, 8, 9]})
+        for query in (left.join(right, left_on="lk", right_on="rk"),
+                      left.join(right, left_on="lk", right_on="rk", how="left"),
+                      left.join(right, left_on="lk", right_on="rk", how="semi"),
+                      left.join(right, left_on="lk", right_on="rk", how="anti"),
+                      left.join(same, on="lk"),
+                      left.join(same, on="lk", how="left")):
+            with self.subTest(query=str(query)):
+                self.equal(query.sort(pl.all(), nulls_last=True))
+                self.assertIsNone(renamed.search(self.engine.explain(query)))
+        # A shared non-key name, an ordered join and a full join keep renaming.
+        clash = pl.LazyFrame({"rk": [2, 3], "lv": [1, 2]})
+        for query in (left.join(clash, left_on="lk", right_on="rk"),
+                      left.join(right, left_on="lk", right_on="rk", maintain_order="left"),
+                      left.join(right, left_on="lk", right_on="rk", how="full")):
+            with self.subTest(query=str(query)):
+                self.equal(query.sort(pl.all(), nulls_last=True))
+                self.assertIsNotNone(renamed.search(self.engine.explain(query)))
+
     def test_nested_caches_and_distinct_cache_identities(self):
         frame = pl.LazyFrame({"key": [1, 2, 3], "phone": ["13-abc", "31-def", None]})
         inner = frame.with_columns(prefix=pl.col("phone").str.slice(0, 2)).cache()

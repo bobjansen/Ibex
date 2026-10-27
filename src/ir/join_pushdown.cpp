@@ -467,6 +467,30 @@ auto rewrite_semi_over_join(NodePtr node, const SourceSchemas& sources) -> NodeP
         !join_keys_are_folded(outer.keys())) {
         return node;
     }
+    // A Project between the semi join and the inner join only drops columns,
+    // and the semi reads nothing but its keys, which that Project must keep for
+    // the semi to name them: (Project(X ⋈ Y)) ⋉ Z is Project((X ⋈ Y) ⋉ Z).
+    // Peel it, push, and put it back on top -- only when the semi actually
+    // moved, so one that stays put keeps its plan. The Polars adapter selects
+    // the visible columns after every join, which hid Q21's orders semi join.
+    if (outer.children().size() == 2 && outer.children()[0] != nullptr &&
+        outer.children()[0]->kind() == NodeKind::Project &&
+        outer.children()[0]->children().size() == 1 &&
+        outer.children()[0]->children().front() != nullptr) {
+        const Node* const semi = node.get();
+        NodePtr project = std::move(outer.mutable_children()[0]);
+        outer.mutable_children()[0] = std::move(project->mutable_children().front());
+        project->mutable_children().clear();
+        NodePtr result = rewrite_semi_over_join(std::move(node), sources);
+        if (result.get() == semi) {
+            auto& unchanged = node_cast<JoinNode>(*result);
+            project->add_child(std::move(unchanged.mutable_children()[0]));
+            unchanged.mutable_children()[0] = std::move(project);
+            return result;
+        }
+        project->add_child(std::move(result));
+        return project;
+    }
     if (outer.children().size() != 2 || outer.children()[0] == nullptr ||
         outer.children()[1] == nullptr || outer.children()[0]->kind() != NodeKind::Join) {
         return node;

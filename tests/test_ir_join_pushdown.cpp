@@ -410,6 +410,46 @@ TEST_CASE("semi pushdown: key in the right side descends there", "[ir][join_push
     REQUIRE(scan_name(*right.children()[1]) == "c");
 }
 
+TEST_CASE("semi pushdown: a projection between the semi and the join is looked through",
+          "[ir][join_pushdown][semi]") {
+    // (Project(a JOIN b on k)) SEMI c on ax  ->  Project((a SEMI c on ax) JOIN b on k).
+    // The Polars adapter selects the visible columns after every join.
+    auto inner = make_join({2}, ir::JoinKind::Inner, {"k"}, make_scan({3}, "a"), make_scan({4}, "b"));
+    std::vector<ir::ColumnRef> cols{{.name = "ax"}, {.name = "k"}};
+    auto project = std::make_unique<ir::ProjectNode>(ir::NodeId{7}, std::move(cols));
+    project->add_child(std::move(inner));
+    auto semi = std::make_unique<ir::JoinNode>(ir::NodeId{1}, ir::JoinKind::Semi,
+                                               std::vector<ir::JoinKey>{std::string{"ax"}});
+    semi->add_child(std::move(project));
+    semi->add_child(make_scan({5}, "c"));
+
+    auto out = ir::push_semi_joins_down(std::move(semi), test_sources());
+    REQUIRE(out->kind() == ir::NodeKind::Project);
+    const auto& join = *out->children().front();
+    REQUIRE(join.kind() == ir::NodeKind::Join);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    REQUIRE(static_cast<const ir::JoinNode&>(join).kind() == ir::JoinKind::Inner);
+    const auto& left = *join.children()[0];
+    REQUIRE(left.kind() == ir::NodeKind::Join);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    REQUIRE(static_cast<const ir::JoinNode&>(left).kind() == ir::JoinKind::Semi);
+    REQUIRE(scan_name(*left.children()[0]) == "a");
+    REQUIRE(scan_name(*left.children()[1]) == "c");
+
+    // A semi that cannot move keeps its plan, projection and all.
+    auto plain = make_scan({3}, "a");
+    std::vector<ir::ColumnRef> kept{{.name = "ax"}};
+    auto over_scan = std::make_unique<ir::ProjectNode>(ir::NodeId{7}, std::move(kept));
+    over_scan->add_child(std::move(plain));
+    auto stays = std::make_unique<ir::JoinNode>(ir::NodeId{1}, ir::JoinKind::Semi,
+                                                std::vector<ir::JoinKey>{std::string{"ax"}});
+    stays->add_child(std::move(over_scan));
+    stays->add_child(make_scan({5}, "c"));
+    auto same = ir::push_semi_joins_down(std::move(stays), test_sources());
+    REQUIRE(same->kind() == ir::NodeKind::Join);
+    REQUIRE(same->children()[0]->kind() == ir::NodeKind::Project);
+}
+
 TEST_CASE("an anti join stays above the inner join", "[ir][join_pushdown][semi]") {
     // A semi join keeps only matches, and is pushed below an inner join
     // because it tends to be selective (q18 keeps 57 orders of millions). An

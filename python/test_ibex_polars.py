@@ -951,6 +951,45 @@ class EngineTests(unittest.TestCase):
             self.engine.prepare(left.lazy().join(right.lazy(), on="k").join(
                 right.lazy(), on="k", suffix="_2", validate="m:1"))
 
+    def test_default_join_validation_never_serializes_the_plan(self):
+        # Serializing a resident DataFrame costs seconds per hundred
+        # megabytes. A plan whose joins keep the default cardinality check is
+        # recognised from its streaming plan without it.
+        left = pl.DataFrame({"k": [1, 2, 3], "x": [1., 2., 3.]})
+        right = pl.DataFrame({"k": [1, 2, 4], "y": [1., 2., 3.]})
+        for how in ("inner", "left", "full", "semi", "anti"):
+            query = left.lazy().join(right.lazy(), on="k", how=how).join(
+                right.lazy(), on="k", how="inner", suffix="_2")
+            with self.subTest(how=how):
+                with patch.object(pl.LazyFrame, "serialize", side_effect=AssertionError("plan serialized")):
+                    self.engine.prepare(query)
+                self.equal(query.sort("k"))
+
+    def test_validated_joins_are_refused_whatever_the_join(self):
+        left = pl.DataFrame({"k": [1, 2, 3], "x": [1., 2., 3.]}).lazy()
+        right = pl.DataFrame({"k": [1, 2, 4], "y": [1., 2., 3.]}).lazy()
+        for how in ("inner", "left", "full"):
+            for validation in ("1:1", "m:1", "1:m"):
+                with self.subTest(how=how, validate=validation):
+                    nested = left.join(right, on="k", how=how, validate=validation).group_by("k").len()
+                    with self.assertRaises(NotImplementedError):
+                        IbexEngine().prepare(nested)
+
+    def test_join_validation_is_still_read_when_the_streaming_plan_cannot_tell(self):
+        left = pl.DataFrame({"k": [1, 2], "x": [1., 2.]}).lazy()
+        right = pl.DataFrame({"k": [1, 2], "y": [1., 2.]}).lazy()
+        _adapter_module._validation_shows_in_streaming_plan.cache_clear()
+        try:
+            with patch.object(_adapter_module, "_streaming_plan", side_effect=RuntimeError("no plan")):
+                with patch.object(pl.LazyFrame, "serialize", autospec=True,
+                                  side_effect=pl.LazyFrame.serialize) as serialized:
+                    self.engine.prepare(left.join(right, on="k"))
+                    serialized.assert_called()
+                with self.assertRaises(NotImplementedError):
+                    IbexEngine().prepare(left.join(right, on="k", validate="1:1"))
+        finally:
+            _adapter_module._validation_shows_in_streaming_plan.cache_clear()
+
     def test_prepare_projects_demanded_columns_without_query_collection(self):
         query = pl.DataFrame({"x": [1, 2], "unused": [[1], [2]]}).lazy().select(pl.sum("x"))
         with patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as execute:

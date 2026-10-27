@@ -7,6 +7,7 @@ join validation flags omitted by the visitor. Unknown nodes/options fail before
 native input binding or execution.
 """
 
+import functools
 import json
 import re
 import warnings
@@ -34,6 +35,40 @@ _INTEGER_LAYOUTS = {
 }
 _JOIN_NODE = re.compile(r'\{"Join"\s*:\s*\{')
 _JOIN_VALIDATION = re.compile(r'"validation"\s*:\s*"(ManyToMany|ManyToOne|OneToMany|OneToOne)"')
+def _streaming_plan(frame):
+    return frame._ldf.to_dot_streaming_phys(False)
+
+
+@functools.cache
+def _validation_shows_in_streaming_plan():
+    """Whether this Polars plans a validated join as the in-memory fallback.
+
+    The streaming engine runs only joins with the default cardinality check;
+    any other validation is planned as an `in-memory-join`. That is visible in
+    the plan graph without serializing any resident data. Confirm it on small
+    frames, so a Polars that changes it falls back to reading the plan.
+    """
+    try:
+        left = pl.LazyFrame({"k": [1, 2], "x": [1, 2]})
+        right = pl.LazyFrame({"k": [1, 2], "y": [1, 2]})
+        if "in-memory-join" in _streaming_plan(left.join(right, on="k")):
+            return False
+        return all("in-memory-join" in _streaming_plan(left.join(right, on="k", validate=validation))
+                   for validation in ("1:1", "m:1", "1:m"))
+    except Exception:
+        return False
+
+
+def _joins_may_be_validated(frame):
+    """False only when no join in the plan can carry a cardinality check."""
+    if not _validation_shows_in_streaming_plan():
+        return True
+    try:
+        return "in-memory-join" in _streaming_plan(frame)
+    except Exception:
+        return True
+
+
 _SUPPORTED_INPUT_TYPES = (*_INTEGER_LAYOUTS, *TEMPORAL_TYPES, pl.Float32, pl.Float64, pl.Boolean, pl.String, pl.Date, pl.Categorical)
 
 
@@ -423,8 +458,12 @@ class Adapter:
     def _check_join_validation(self):
         if self.checked_join_validation:
             return
+        if not _joins_may_be_validated(self.original_frame):
+            self.checked_join_validation = True
+            return
         # Visitor 15.2 omits JoinValidation. Read original plan metadata once
         # so cardinality assertions cannot silently become unchecked joins.
+        # Plans whose joins all have the default check never reach this point.
         # Resident data serializes as an array of IPC bytes, one JSON number
         # each, so decoding the document would build the data as Python
         # integers. Only the text around the data is of interest, and none of

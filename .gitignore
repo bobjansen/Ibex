@@ -17,6 +17,7 @@ CMakeUserPresets.json
 *.swp
 *.swo
 *~
+tags
 
 # Compile commands (generated)
 compile_commands.json
@@ -78,3 +79,7 @@ benchmarking/tpch/results/runs/
 
 # WASM playground artifacts (built in the Pages workflow)
 docs/playground/
+
+# Optional pinned upstream conformance checkout and local reports.
+/.polars-upstream/
+/polars-conformance-results/

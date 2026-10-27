@@ -12,6 +12,7 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -3408,6 +3409,7 @@ TEST_CASE("REPL session accepts input that ends with a function definition", "[r
 }
 
 TEST_CASE("ReplSession: a call's own tables and scalars last for that call", "[repl][session]") {
+    const bool planned = GENERATE(false, true);
     ibex::runtime::ExternRegistry registry;
     ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
     REQUIRE(session.execute("let kept = Table { v = [1, 2, 3] };").ok);
@@ -3423,7 +3425,9 @@ TEST_CASE("ReplSession: a call's own tables and scalars last for that call", "[r
     options.tables.insert_or_assign("kept", input);  // shadows the session's `kept`
     options.scalars.insert_or_assign("cutoff", std::int64_t{15});
     options.render = false;
-    const auto r = session.execute("let out = kept[filter v > cutoff]; out;", std::move(options));
+    options.plan_table_expressions = planned;
+    const auto r = session.execute("let out = kept[filter v > cutoff]; kept[filter v > ^cutoff];",
+                                   std::move(options));
     CAPTURE(r.error);
     REQUIRE(r.ok);
     REQUIRE(r.table.has_value());
@@ -3442,12 +3446,107 @@ TEST_CASE("ReplSession: a call's own tables and scalars last for that call", "[r
 
     // A call that rebinds its own table's name keeps the new binding.
     ibex::repl::ReplSession::ExecuteOptions rebinding;
+    rebinding.plan_table_expressions = planned;
     rebinding.tables.insert_or_assign("scratch", input);
     REQUIRE(session.execute("let scratch = scratch[filter v > 10];", std::move(rebinding)).ok);
     auto scratch = session.table_binding("scratch");
     REQUIRE(scratch.has_value());
     CHECK(int_column(*scratch, "v") == std::vector<std::int64_t>{20});
     CHECK_FALSE(session.table_binding("nothing").has_value());
+}
+
+TEST_CASE("ReplSession: bound scalars act as literals in the statement's plan", "[repl][session]") {
+    // `fill_null` takes only a literal fill value, so `^fill` used to be an
+    // error: a bound scalar reached the kernel as a reference. A call's own
+    // scalar and a session `let` both bind; a column named like a binding is
+    // still the column without `^`.
+    const bool planned = GENERATE(false, true);
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    REQUIRE(session.execute("let t = Table { x = [3, NULL, 1, 5], n = [9, 9, 9, 9] };").ok);
+    REQUIRE(session.execute("let n = 2;").ok);
+
+    ibex::repl::ReplSession::ExecuteOptions options;
+    options.scalars.insert_or_assign("fill", std::int64_t{4});
+    options.render = false;
+    options.plan_table_expressions = planned;
+    const auto r = session.execute(
+        "t[update { y = fill_null(x, ^fill) }][filter y > n - 6][order y, head ^n];",
+        std::move(options));
+    CAPTURE(r.error);
+    REQUIRE(r.ok);
+    REQUIRE(r.table.has_value());
+    const auto* y = std::get_if<ibex::Column<std::int64_t>>(r.table->find("y"));
+    REQUIRE(y != nullptr);
+    CHECK(std::vector<std::int64_t>(y->begin(), y->end()) == std::vector<std::int64_t>{4, 5});
+}
+
+TEST_CASE("ReplSession: planned expressions stream bound lazy sources", "[repl][session]") {
+    // A reader which rejects whole-source decoding proves that the caller
+    // actually registered streaming scans, rather than just lowering a plan.
+    class UnitReader final : public ibex::runtime::LazySourceReader {
+       public:
+        auto decode_units() -> std::vector<ibex::runtime::SourceUnit> override {
+            return {{.start = 0, .rows = 2}, {.start = 2, .rows = 2}};
+        }
+        auto decode(const std::vector<std::string>& names,
+                    const ibex::runtime::Selection* selection,
+                    const ibex::runtime::SourceUnit* unit, const ibex::runtime::ExecutionContext&)
+            -> std::expected<ibex::runtime::Table, std::string> override {
+            if (unit == nullptr) {
+                return std::unexpected("whole-source decode forbidden");
+            }
+            std::vector<std::int64_t> values;
+            for (auto row = unit->start; row < unit->start + unit->rows; ++row) {
+                if (selection == nullptr ||
+                    std::ranges::find(*selection, row) != selection->end()) {
+                    values.push_back(static_cast<std::int64_t>(row + 1));
+                }
+            }
+            ibex::runtime::Table result;
+            result.logical_rows = values.size();
+            for (const auto& name : names) {
+                result.add_column(name, ibex::Column<std::int64_t>{values});
+            }
+            return result;
+        }
+    };
+    ibex::runtime::ExternRegistry registry;
+    registry.register_lazy_table(
+        "units",
+        [](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::LazyTablePtr, std::string> {
+            ibex::runtime::Table schema;
+            schema.add_column("v", ibex::Column<std::int64_t>{});
+            return std::make_shared<ibex::runtime::LazyTable>(
+                std::move(schema), 4,
+                []() -> std::expected<ibex::runtime::LazySourceReaderPtr, std::string> {
+                    return std::make_unique<UnitReader>();
+                });
+        });
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    REQUIRE(
+        session.execute("extern fn units() -> DataFrame from \"fake.hpp\"; let input = units();")
+            .ok);
+    for (const auto* source : {"input", "units()"}) {
+        ibex::repl::ReplSession::ExecuteOptions options;
+        options.plan_table_expressions = true;
+        options.render = false;
+        options.scalars.insert_or_assign("cutoff", std::int64_t{2});
+        const auto result = session.execute(
+            std::string(source) + "[filter v > ^cutoff, select { total = sum(v) }];",
+            std::move(options));
+        CAPTURE(result.error);
+        REQUIRE(result.ok);
+        REQUIRE(result.table.has_value());
+        const auto* total = std::get_if<ibex::Column<std::int64_t>>(result.table->find("total"));
+        REQUIRE(total != nullptr);
+        CHECK((*total)[0] == 7);
+    }
+    // The option is call-scoped; a normal session call still decodes eagerly.
+    const auto ordinary = session.execute("input[select { total = sum(v) }];");
+    CHECK_FALSE(ordinary.ok);
+    CHECK(ordinary.error.find("whole-source decode forbidden") != std::string::npos);
 }
 
 TEST_CASE("ReplSession: print output comes back without rendering results", "[repl][session]") {

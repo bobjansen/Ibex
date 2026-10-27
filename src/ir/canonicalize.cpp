@@ -348,7 +348,10 @@ auto simplify_expr(Expr expr, bool* changed) -> Expr {
                 const auto* ll = std::get_if<Literal>(&n.left->node);
                 const auto* rl = std::get_if<Literal>(&n.right->node);
                 if ((ll != nullptr) && (rl != nullptr)) {
-                    if (auto folded = fold_cmp(n.op, *ll, *rl); folded.has_value()) {
+                    if (auto folded = n.float_comparison == FloatComparison::IEEE
+                                          ? fold_cmp(n.op, *ll, *rl)
+                                          : std::nullopt;
+                        folded.has_value()) {
                         *changed = true;
                         return make_bool_lit(*folded);
                     }
@@ -614,8 +617,38 @@ auto try_order_drop_pinned_keys(NodePtr node) -> TryResult {
     return {.changed = true, .node = std::move(new_order)};
 }
 
-// R12: Filter(Update(x)) → Update(Filter(x)) when Update is row-local and
-// the predicate reads none of the Update's output columns.
+// R22: Project preserves the values and order of its visible columns. Keep
+// unqualified names outside that scope above it: they may be scalar bindings
+// which a hidden input column would otherwise shadow after the commute.
+auto try_filter_past_project(NodePtr node) -> TryResult {
+    if (node->kind() != NodeKind::Filter || node->children().size() != 1 ||
+        node->children().front()->kind() != NodeKind::Project) {
+        return {.changed = false, .node = std::move(node)};
+    }
+    auto& filter = node_cast<FilterNode>(*node);
+    const auto& project = node_cast<ProjectNode>(*node->children().front());
+    if (project.children().size() != 1 || project.children().front() == nullptr ||
+        !is_subset_evaluable_expr(filter.predicate())) {
+        return {.changed = false, .node = std::move(node)};
+    }
+    robin_hood::unordered_set<std::string> refs;
+    collect_expr_column_refs(filter.predicate(), refs);
+    if (!std::ranges::all_of(refs, [&](const std::string& name) {
+            return std::ranges::any_of(project.columns(), [&](const ColumnRef& column) {
+                return !column.lexical && column.name == name;
+            });
+        })) {
+        return {.changed = false, .node = std::move(node)};
+    }
+    NodePtr project_owned = take_unique_child(*node);
+    node->add_child(take_unique_child(*project_owned));
+    project_owned->add_child(rewrite_root(std::move(node)));
+    return {.changed = true, .node = std::move(project_owned)};
+}
+
+// R12: an independent predicate can pass a row-local Update. A predicate
+// reading its outputs may also pass an unguarded column-copy update after
+// inverse mapping, provided no copied source is itself overwritten.
 auto try_filter_past_update(NodePtr node) -> TryResult {
     if (node->kind() != NodeKind::Filter || node->children().empty() ||
         node->children().front()->kind() != NodeKind::Update) {
@@ -631,14 +664,35 @@ auto try_filter_past_update(NodePtr node) -> TryResult {
         return {.changed = false, .node = std::move(node)};
     }
     robin_hood::unordered_set<std::string> pred_cols;
-    collect_filter_column_refs(filter.predicate(), pred_cols);
+    collect_expr_column_refs(filter.predicate(), pred_cols);
     const bool predicate_independent =
         std::none_of(upd.fields().begin(), upd.fields().end(),
                      [&](const FieldSpec& f) { return pred_cols.contains(f.alias); });
+    std::vector<RenameSpec> aliases;
     if (!predicate_independent) {
-        return {.changed = false, .node = std::move(node)};
+        if (upd.guard() != nullptr || !is_subset_evaluable_expr(filter.predicate())) {
+            return {.changed = false, .node = std::move(node)};
+        }
+        for (const auto& field : upd.fields()) {
+            if (!pred_cols.contains(field.alias)) {
+                continue;
+            }
+            const auto* ref = std::get_if<ColumnRef>(&field.expr.node);
+            if (std::ranges::count(upd.fields(), field.alias, &FieldSpec::alias) != 1 ||
+                ref == nullptr || ref->lexical ||
+                (ref->name != field.alias &&
+                 std::ranges::any_of(upd.fields(), [&](const FieldSpec& other) {
+                     return other.alias == ref->name;
+                 }))) {
+                return {.changed = false, .node = std::move(node)};
+            }
+            aliases.push_back({.new_name = field.alias, .old_name = ref->name});
+        }
     }
     Expr pred = filter.take_predicate();
+    if (!aliases.empty()) {
+        ColumnNameMap(aliases).remap_expr_to_input(pred);
+    }
     const auto filter_id = node->id();
     NodePtr filter_owned = std::move(node);
     NodePtr update_owned = take_unique_child(*filter_owned);
@@ -924,7 +978,7 @@ using RuleFn = TryResult (*)(NodePtr);
 // by later ones. Rule names mirror the Rx labels in canonicalize.hpp.
 // Shrink the size when removing a rule: a missing initializer is a null RuleFn,
 // and the driver calls it (942 tests segfaulted the one time that happened).
-constexpr std::array<std::pair<std::string_view, RuleFn>, 17> kRules{{
+constexpr std::array<std::pair<std::string_view, RuleFn>, 18> kRules{{
     {"R19:filter-merge", try_filter_merge},
     {"R17:simplify-predicate", try_simplify_predicate},
     {"R1:filter-past-order", try_filter_past_order},
@@ -933,6 +987,7 @@ constexpr std::array<std::pair<std::string_view, RuleFn>, 17> kRules{{
     {"R9:rename-compose", try_rename_compose},
     {"R10:rename-drop-identity", try_rename_drop_identity},
     {"R11:filter-past-rename", try_filter_past_rename},
+    {"R22:filter-past-project", try_filter_past_project},
     {"R13-14:limit-collapse", try_limit_collapse},
     {"R15:order-drop-pinned-keys", try_order_drop_pinned_keys},
     {"R12:filter-past-update", try_filter_past_update},

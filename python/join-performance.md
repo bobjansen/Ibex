@@ -1,0 +1,237 @@
+# Polars versus Ibex join performance
+
+## Latest default-thread suite
+
+Rerun after the categorical conversion and bound-schema composite join fixes,
+using Release commit `e3560ab9` on the same i7-13700. Both thread settings were
+unset (24 threads); the original seeded inputs and complete-result correctness
+checks were retained. Medians below cover 12 alternating-order repetitions after
+two warmups. Collection includes native execution and Polars result conversion;
+plan preparation is excluded. Earlier tables below retain their original data.
+
+| Join | Polars ms | Polars–Ibex ms |
+|---|---:|---:|
+| Integer inner | 5.60 | 5.57 |
+| Left | 5.90 | 7.60 |
+| Full | 8.17 | 18.23 |
+| Semi | 1.86 | 1.36 |
+| Anti | 2.24 | 1.39 |
+| Many-to-many | 1.50 | 2.91 |
+| Composite keys | 8.82 | 9.43 |
+| Categorical keys | 2.90 | 6.75 |
+| Cross | 0.63 | 1.03 |
+
+[Latest raw samples, IQRs and provenance](join-performance-results/default-updated.json).
+
+
+Measured 2026-10-25 on a 13th Gen Intel(R) Core(TM) i7-13700, Linux, with Polars 2.0.0 and a Release Ibex bridge. The two runs use identical seeded resident inputs and the same source/binary hashes.
+
+Each number below is the median of 12 alternating-order repetitions after two warmups. Collection includes execution and conversion to a real Polars DataFrame. Ibex plans and bindings are prepared before timing; Polars uses ordinary `collect()` with its default auto engine. Input creation, preparation, and full-result correctness comparisons are outside the timed section.
+
+The one-thread run sets both `IBEX_CORES=1` and `POLARS_MAX_THREADS=1`. The default run unsets both settings; Polars reports 24 threads and Ibex derives a 24-CPU compute budget from the recorded affinity.
+
+| Workload | Left / right rows | Output rows | 1 thread Polars ms | 1 thread Ibex ms | Default Polars ms | Default Ibex ms |
+|---|---:|---:|---:|---:|---:|---:|
+| Inner, unique integer RHS | 1,000,000 / 200,000 | 1,000,000 | 10.77 | 6.68 | 5.60 | 6.36 |
+| Left, half the keys matched | 1,000,000 / 100,000 | 1,000,000 | 16.85 | 19.06 | 5.42 | 6.61 |
+| Full, larger RHS key domain | 1,000,000 / 240,000 | 1,041,270 | 19.70 | 30.70 | 8.98 | 19.69 |
+| Semi, about half retained | 1,000,000 / 100,000 | 500,090 | 11.90 | 4.70 | 2.33 | 1.22 |
+| Anti, about half retained | 1,000,000 / 100,000 | 499,910 | 12.56 | 4.97 | 2.82 | 1.44 |
+| Inner, many-to-many | 250,000 / 50,000 | 500,000 | 3.56 | 3.11 | 1.21 | 2.46 |
+| Inner, two integer keys | 1,000,000 / 200,000 | 1,000,000 | 31.05 | 63.24 | 9.63 | 22.57 |
+| Inner, categorical key | 1,000,000 / 10,000 | 1,000,000 | 7.72 | 14.67 | 2.14 | 13.16 |
+| Cross | 1,000 / 100 | 100,000 | 0.15 | 0.49 | 0.23 | 0.38 |
+
+With one thread, Ibex has lower medians for the unique integer inner join (1.61×), semi/anti joins (about 2.53×), and the bounded many-to-many join (1.14×). With default threading, semi/anti remain faster in Ibex (about 1.9×), while Polars has lower medians for the other seven cases. Categorical keys (6.15×), composite keys (2.34×), and full joins (2.19×) show the largest default-thread gaps in this set. These are end-to-end frontend measurements and do not isolate the native join kernel.
+
+Preparation is currently a major first-use cost. The visitor omits join cardinality validation, so the adapter serializes original plan metadata once to reject unsupported validation assertions. Resident input serialization is included in that work. Prepared queries cache the resulting plan and input bindings.
+
+| Workload | Default Ibex prepare ms | Default Polars first collect ms | Default Ibex prepare + first collect ms |
+|---|---:|---:|---:|
+| Inner, unique integer RHS | 687.04 | 5.91 | 692.47 |
+| Left, half the keys matched | 616.37 | 4.19 | 620.68 |
+| Full, larger RHS key domain | 654.50 | 8.58 | 672.06 |
+| Semi, about half retained | 593.24 | 3.33 | 594.42 |
+| Anti, about half retained | 575.97 | 3.30 | 577.26 |
+| Inner, many-to-many | 156.04 | 2.93 | 158.62 |
+| Inner, two integer keys | 911.39 | 7.59 | 929.82 |
+| Inner, categorical key | 459.80 | 3.32 | 474.12 |
+| Cross | 0.83 | 0.32 | 1.46 |
+
+Warm semi/anti speedups therefore do not imply first-call wins. For example, default-thread semi collection takes 1.22 ms after preparation, but preparation plus the first collection takes 594 ms versus a 3.33 ms Polars first collection. Improving metadata access is a separate integration priority.
+
+All output rows, values and dtypes were compared against Polars before timing. Row order is unspecified in these benchmark joins and is excluded from equality checks. Timings are a local synthetic sample, not a general workload ranking; default-thread full-join samples in particular have substantial variation (Ibex IQR 7.71 ms). Raw samples and IQRs are retained below.
+
+- [One-thread samples and provenance](join-performance-results/single.json)
+- [Default-thread samples and provenance](join-performance-results/default.json)
+- [Benchmark runner](bench_polars_joins.py)
+
+```bash
+PYTHONPATH=build-release/python:python IBEX_CORES=1 POLARS_MAX_THREADS=1 \
+  .venv/bin/python python/bench_polars_joins.py --rows 1000000 --keys 200000 \
+  --iters 12 --out /tmp/joins-single.json
+env -u IBEX_CORES -u POLARS_MAX_THREADS PYTHONPATH=build-release/python:python \
+  .venv/bin/python python/bench_polars_joins.py --rows 1000000 --keys 200000 \
+  --iters 12 --out /tmp/joins-default.json
+```
+
+## Categorical output conversion follow-up
+
+The table above records the original converter. Commit `f0144ade` replaces
+Polars' per-row Arrow dictionary import with dictionary-label translation once
+per chunk and an integer gather into the requested Polars category mapping.
+Native execution and Arrow export are unchanged.
+
+A focused million-row / 10,000-category inner join compares both converters
+using the **same Release binary, prepared native plan and input bindings**.
+Twenty alternating-order repetitions follow two warmups; complete outputs match
+Polars, including dtypes. Preparation and correctness checks are outside timing.
+Collection includes native execution and conversion; conversion-only samples
+reuse one native Arrow result. Previous result destruction is outside timing.
+These focused inputs have their own seeded RNG sequence, so compare before and
+after here rather than treating these as replacements for the original suite.
+
+| Mode | Conversion before ms | Conversion after ms | Collection before ms | Collection after ms | Polars collection ms |
+|---|---:|---:|---:|---:|---:|
+| One thread | 11.65 | 2.54 | 14.47 | 5.03 | 7.95 |
+| Default (24 threads) | 11.52 | 2.51 | 13.17 | 4.41 | 2.11 |
+
+This reduces conversion time about 4.6× and full collection time about 2.9–3.0×.
+Default-thread Polars remains faster. The one-time preparation cost described
+above is unchanged. Tests cover different per-chunk dictionary orders, sliced
+indices, null indices and dictionary entries, empty outputs, named category
+mappings, UInt8/UInt16 physical category codes, and native projection/grouping.
+A mutation replacing null indices with zero causes the boundary test to fail.
+
+- [Focused A/B runner](bench_categorical_export.py)
+- [One-thread samples](join-performance-results/categorical-export-single.json)
+- [Default-thread samples](join-performance-results/categorical-export-default.json)
+
+```bash
+PYTHONPATH=build-release/python:python IBEX_CORES=1 POLARS_MAX_THREADS=1 \
+  .venv/bin/python python/bench_categorical_export.py --out /tmp/categorical-single.json
+env -u IBEX_CORES -u POLARS_MAX_THREADS PYTHONPATH=build-release/python:python \
+  .venv/bin/python python/bench_categorical_export.py --out /tmp/categorical-default.json
+```
+
+## Composite key schema follow-up
+
+Implemented in `f63dada5`.
+
+The bound input schemas already reached native physical planning, but the
+composite join eligibility gates inferred key types without those schemas.
+Consequently, unannotated bound Int64 inputs used the general materialized join
+instead of the specialized two-integer-key streaming operator. Physical planning
+now passes its source schemas through the shared inner/semi/anti eligibility
+checks. Unknown and non-Int64 key types still decline the specialized path.
+This fixes native bound-table callers as well as the Python adapter.
+
+A focused Release A/B uses the bridge saved from `c8de38e1` and the corrected
+bridge, with the same seeded resident tables: 1,000,000 left rows, 200,000 unique
+right keys, and composite key `(tenant, k)` where `tenant = k % 17`. Both routes
+use prepared `IbexEngine` collection; complete rows and dtypes match Polars.
+Twenty paired repetitions alternate route order after two warmups. Preparation,
+correctness checks and previous-result destruction are outside timing. Both
+bridge binaries use the same Python converter. Polars uses ordinary collection.
+
+| Threads | Before ms | After ms | Polars ms |
+|---|---:|---:|---:|
+| One | 70.12 | 23.41 | 37.94 |
+| Default (24) | 19.30 | 7.26 | 7.10 |
+
+The improvement is about 3.0× single-threaded and 2.7× with default threading.
+These are focused diagnostics with their own seeded input generation, rather
+than replacements for the original suite table. Raw samples and bridge hashes:
+[one thread](join-performance-results/composite-schema-single.json),
+[default threads](join-performance-results/composite-schema-default.json).
+
+The native `compare_ibex_git.sh` join regression pass used 100,000-row generated
+inputs, six alternating repeats and one compute thread pinned to CPU 2. Its four
+queries (`inner_join_symbol`, `inner_join_user`, `join_filter_rank`,
+`join_update_group`) showed no detectable regression. Those single-key cases
+check collateral effects; the focused composite benchmark measures the fix.
+
+## Full join runtime follow-up
+
+Four native changes address probing and output assembly, benefiting both Ibex
+queries and the Polars adapter:
+
+- `ab001288`: workers grow private probe vectors and publish once, avoiding false
+  sharing of adjacent vector metadata.
+- `510553f1`: remove redundant outer-join key indices and unused assembly buffers.
+- `5a05cf58`: for null-free Int64 keys with a unique right build side, fill one
+  preallocated result slot per left row. This avoids CSR indirection, vector
+  growth and merging; unmatched right rows are appended after probing.
+- `e22960a9`: copy non-null fixed-width coalesced keys through typed ranges,
+  avoiding per-row variant dispatch. Other key representations retain the
+  general assembly path.
+
+The focused Release comparison uses the bridge saved from `6dbaeaba` against
+`e22960a9`, on an i7-13700 with cores locked at 3.2 GHz. These clock settings and
+inputs differ from the earlier broad suite; compare the paired numbers here.
+The main input has one million left rows drawn from 200,000 keys and 240,000
+unique right keys, including unmatched right rows. Seed: 20261025.
+
+Twenty paired repetitions alternate route order after two warmups, with each
+bridge in a persistent subprocess and only one route executing per sample.
+Preparation, correctness checking and previous-result destruction are outside
+timing. Collection includes execution and output conversion. Complete output
+rows, values and dtypes match Polars; output order is unspecified.
+
+| Route | Threads | Before ms | After ms | Polars ms |
+|---|---|---:|---:|---:|
+| Polars–Ibex | Default (24) | 19.06 | 11.63 | 8.27 |
+| Polars–Ibex | One | 44.42 | 30.14 | 29.79 |
+| Direct native query | Default (24) | 22.22 | 10.85 | 8.10 |
+
+The direct query uses native same-name-key coalescing, while the adapter uses
+its generated aliases. Its measurements still include Arrow export and Polars
+conversion; they are not execution-only timings.
+
+A row-count/cardinality sweep uses eight workers pinned to CPUs 0,2,…,14.
+The right input contains 1.2 times the key cardinality (rounded down). The sparse
+case multiplies keys by 100003. The small/high-cardinality case builds the left
+side and therefore does not use the new unique-right probe path.
+
+| Left rows | Key cardinality | Before ms | After ms | Polars ms |
+|---:|---:|---:|---:|---:|
+| 100,000 | 1,024 | 2.67 | 1.34 | 0.77 |
+| 100,000 | 200,000 | 9.35 | 8.12 | 3.11 |
+| 1,000,000 | 1,024 | 21.42 | 7.56 | 3.41 |
+| 1,000,000 | 200,000 | 26.80 | 13.96 | 9.26 |
+| 1,000,000 | 200,000, sparse | 27.21 | 14.30 | 9.61 |
+
+Validation: Release CTest reported zero failures across 2,359 registered tests
+with slow tests excluded; the join suite passed 190 cases, and the Python join
+suite passed 10 tests with 129 subtests. Strict GCC compilation passed. The CSV
+plugin was rebuilt using the plugin build script and loaded successfully.
+An independent regression compares the specialized probe with the general
+nullable-key path, including duplicate left keys, unmatched rows and nullable
+payloads. Deliberately corrupting either match indices or coalesced keys makes
+that regression fail.
+
+The native `compare_ibex_git.sh` collateral check compared `6dbaeaba` with the
+final source using 100,000-row generated inputs, six interleaved repeats, three
+iterations, and one worker pinned to CPU 2. All four existing join queries were
+classified as noise (suite geometric mean 0.997×). These check collateral effects;
+the focused measurements above exercise full joins.
+
+Runner: [bench_full_join.py](bench_full_join.py). Save the baseline Release
+`ibex_pyarrow` module in a separate directory before rebuilding the candidate:
+
+```bash
+.venv/bin/python python/bench_full_join.py \
+  --baseline-dir saved-release-bridge --threads 0 --out results/full.json
+```
+
+Raw samples, bridge hashes and configuration:
+[default](join-performance-results/full-final-default.json),
+[single thread](join-performance-results/full-final-single.json),
+[direct native](join-performance-results/full-native-final-default.json),
+[small/few](join-performance-results/full-sweep-small-few.json),
+[small/many](join-performance-results/full-sweep-small-many.json),
+[large/few](join-performance-results/full-sweep-large-few.json),
+[large/many](join-performance-results/full-sweep-large-many.json),
+[sparse](join-performance-results/full-sweep-large-sparse.json).
+The recorded `git_head` is the measurement-time commit; `target_native_ref`
+identifies the subsequently committed source, verified against the bridge hashes.

@@ -19,6 +19,7 @@
 #include <ibex/core/time.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/ir/schema.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
@@ -1371,20 +1372,23 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 /// rather than restating them: a plan that reimplemented these clauses said
 /// `MaterializeBoth` for a two-key Int64 join the builder streams, and its
 /// equivalence probe -- written from the same reading -- agreed with it.
-[[nodiscard]] auto is_streamable_semi_anti_join(const ir::JoinNode& join) -> bool;
+[[nodiscard]] auto is_streamable_semi_anti_join(const ir::JoinNode& join,
+                                                const ir::SourceSchemas& sources = {}) -> bool;
 
 /// Whether every aggregation can be computed incrementally, and so streamed
 /// rather than materialized. Shared so the physical planner relays it.
 [[nodiscard]] auto aggregate_is_streamable(const ir::AggregateNode& agg) -> bool;
 
 /// Two Int64 keys on both sides, schema-provable. Not a property of the node
-/// alone: it calls `infer_schema` on both children.
-[[nodiscard]] auto is_streamable_pair_int_join(const ir::JoinNode& join) -> bool;
+/// alone: it calls `infer_schema` on both children using the planning sources.
+[[nodiscard]] auto is_streamable_pair_int_join(const ir::JoinNode& join,
+                                               const ir::SourceSchemas& sources = {}) -> bool;
 
 /// Every key of `join` is Int64 on both sides, schema-provable -- the type
 /// half of `is_streamable_pair_int_join`, shared with the semi/anti gate's
 /// two-key case. Calls `infer_schema` on both children.
-[[nodiscard]] auto join_keys_provably_int64(const ir::JoinNode& join) -> bool;
+[[nodiscard]] auto join_keys_provably_int64(const ir::JoinNode& join,
+                                            const ir::SourceSchemas& sources = {}) -> bool;
 
 // filter.cpp — vectorized predicate evaluation and filtering.
 [[nodiscard]] auto compute_mask(const ir::Expr& expr, const PredicateInput& input,
@@ -1663,6 +1667,11 @@ inline auto double_to_sortable_u64(double value) -> std::uint64_t {
                                    const std::vector<ir::AggSpec>& aggregations,
                                    const ExecutionContext* exec = nullptr)
     -> std::expected<Table, std::string>;
+/// Global cov/corr after aggregate_table has validated both numeric inputs.
+/// Fixed row blocks and merge order give bit-identical results at every budget.
+[[nodiscard]] auto global_paired_aggregate(const Table& input,
+                                           const std::vector<ir::AggSpec>& aggregations,
+                                           const ExecutionContext* exec) -> Table;
 /// The one row an aggregate with no `by` yields over an empty input (SQL's
 /// rule: the whole input is one group, even when it is empty). `count` and
 /// `count_distinct` are 0; every other aggregate is null. `empty_columns` is
@@ -1935,7 +1944,8 @@ enum class FloatCleanMode : std::uint8_t {
                                          const TableRegistry& registry,
                                          const ScalarRegistry* scalars,
                                          const ExternRegistry* externs,
-                                         const ExecutionContext& exec, ModelResult* model_out)
+                                         const ExecutionContext& exec, ModelResult* model_out,
+                                         const ir::Node* input_node = nullptr)
     -> std::expected<OperatorPtr, std::string>;
 /// Execute an already-built migrated physical plan. Production's normal
 /// `build_operator` path calls the same implementation after planning; keeping

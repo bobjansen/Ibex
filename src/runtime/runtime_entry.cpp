@@ -130,6 +130,10 @@ auto aggregate_is_streamable(const ir::AggregateNode& agg) -> bool {
                 // since aggregation on those types is rejected upstream of the
                 // chunked path entirely, same as every other agg func).
                 return true;
+            case ir::AggFunc::FirstNull:
+            case ir::AggFunc::LastNull:
+                // Null-preserving edges currently use the materialized row-wise state.
+                return false;
             default:
                 // Median/Quantile need all values; Ewma is row-order coupled --
                 // these stay on the materializing path.
@@ -138,21 +142,22 @@ auto aggregate_is_streamable(const ir::AggregateNode& agg) -> bool {
     });
 }
 
-auto is_streamable_pair_int_join(const ir::JoinNode& join) -> bool {
+auto is_streamable_pair_int_join(const ir::JoinNode& join, const ir::SourceSchemas& sources)
+    -> bool {
     if (join.kind() != ir::JoinKind::Inner || join.predicate().has_value() ||
         join.keys().size() != 2 || join.null_match() != ir::NullMatch::Never ||
         join.expect().asserts_anything() || join.take() != ir::MatchSelection::All) {
         return false;
     }
-    return join_keys_provably_int64(join);
+    return join_keys_provably_int64(join, sources);
 }
 
-auto join_keys_provably_int64(const ir::JoinNode& join) -> bool {
+auto join_keys_provably_int64(const ir::JoinNode& join, const ir::SourceSchemas& sources) -> bool {
     if (join.children().size() != 2) {
         return false;
     }
-    const ir::SchemaInfo left_schema = ir::infer_schema(*join.children()[0]);
-    const ir::SchemaInfo right_schema = ir::infer_schema(*join.children()[1]);
+    const ir::SchemaInfo left_schema = ir::infer_schema(*join.children()[0], sources);
+    const ir::SchemaInfo right_schema = ir::infer_schema(*join.children()[1], sources);
     if (!left_schema.is_known() || !right_schema.is_known()) {
         return false;
     }
@@ -435,11 +440,11 @@ auto resolved_aggregate_parallelism(const physical::HashAggregateNodes& nodes,
 /// the same condition the aggregate does.
 auto is_row_local_chain_over_lazy_scan(const ir::Node& node, const TableRegistry& registry) -> bool;
 
-/// The row count of the deferred lazy source under a chain of Filter, Project,
-/// Rename and Update nodes, or nullopt when `node` is not such a chain. The
-/// source's count, not the chain's output: an upper bound, used only to order
-/// two sides' work.
-auto lazy_chain_source_rows(const ir::Node& node, const TableRegistry& registry,
+/// The row count of the source under a chain of Filter, Project, Rename and
+/// Update nodes -- a deferred lazy source or an in-memory table -- or nullopt
+/// when `node` is not such a chain. The source's count, not the chain's
+/// output: an upper bound, used only to order two sides' work.
+auto chain_source_rows(const ir::Node& node, const TableRegistry& registry,
                             const ExecutionContext& exec) -> std::optional<std::size_t> {
     const ir::Node* cur = &node;
     while (cur->kind() == ir::NodeKind::Filter || cur->kind() == ir::NodeKind::Project ||
@@ -453,8 +458,8 @@ auto lazy_chain_source_rows(const ir::Node& node, const TableRegistry& registry,
         return std::nullopt;
     }
     const auto& name = ir::node_cast<ir::ScanNode>(*cur).source_name();
-    if (registry.contains(name)) {
-        return std::nullopt;
+    if (const auto it = registry.find(name); it != registry.end()) {
+        return it->second.rows();
     }
     const auto* deferred = exec.deferred_scan(name);
     if (deferred == nullptr || deferred->lazy == nullptr) {
@@ -515,8 +520,10 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
         std::shared_ptr<ScanWorkerSink> scan_sink;
         if (join.keys().size() == 1 && exec.can_fan_out() && exec.stream_scans &&
             is_row_local_chain_over_lazy_scan(*join.children()[1], registry)) {
-            const auto left_rows = lazy_chain_source_rows(*join.children()[0], registry, exec);
-            const auto right_rows = lazy_chain_source_rows(*join.children()[1], registry, exec);
+            // A materialized left (q22's shared customer subtree) drains
+            // without decoding anything, which is the cheapest case of all.
+            const auto left_rows = chain_source_rows(*join.children()[0], registry, exec);
+            const auto right_rows = chain_source_rows(*join.children()[1], registry, exec);
             if (left_rows.has_value() && right_rows.has_value() && *left_rows < *right_rows) {
                 scan_sink = make_semi_anti_scan_sink();
             }
@@ -765,7 +772,7 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         // a stream's chunks are counted on this thread while the pipeline
         // decodes the next ones. Declined -- by the left side, or by a right
         // key that is not Int64 -- the chunks are kept for the ordinary join.
-        auto counter = LeftJoinCounter::prepare(join, agg, *left, counted_column);
+        auto counter = LeftJoinCounter::prepare(join, agg, *left, counted_column, ap.group_source);
         bool counting = counter.has_value();
         std::vector<Chunk> kept;
         std::optional<Chunk> pending;
@@ -999,7 +1006,8 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     // per node, and it describes the whole map chain or migrated breaker. The
     // executor below is also callable with an already-built plan, which makes
     // plan-edge mutation tests exercise the same consumer production uses.
-    const physical::Plan plan = physical::plan_physical(node, registry, externs);
+    const physical::Plan plan = physical::plan_physical(
+        node, registry, externs, physical::deferred_source_schemas(exec.deferred_scans));
     if (plan.migrated) {
         return build_operator_from_physical_plan(plan, node, registry, scalars, externs, exec,
                                                  model_out);
@@ -1147,40 +1155,62 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
 
 auto build_pipeline_source(const physical::Plan& pipeline, const TableRegistry& registry,
                            const ScalarRegistry* scalars, const ExternRegistry* externs,
-                           const ExecutionContext& exec, ModelResult* model_out)
-    -> std::expected<OperatorPtr, std::string> {
+                           const ExecutionContext& exec, ModelResult* model_out,
+                           const ir::Node* input_node) -> std::expected<OperatorPtr, std::string> {
     const ir::Node& node = *pipeline.source_node;
-    // A filter directly over a grouped aggregate hands the aggregate the
-    // comparisons it can decide on its own groups (aggregate_prefilter.hpp).
-    // The filter step still runs, so this changes which groups are emitted,
-    // never which rows the pipeline returns.
-    AggregatePrefilter prefilter = aggregate_prefilter_for_source(pipeline);
-    if (prefilter.empty()) {
-        return build_operator(node, registry, scalars, externs, exec, model_out);
+    const ir::Node& input = input_node == nullptr ? node : *input_node;
+    // A filter over a grouped aggregate hands the aggregate the comparisons it
+    // can decide on its own groups (aggregate_prefilter.hpp). The filter step
+    // still runs, so this changes which groups are emitted, never which rows
+    // the pipeline returns.
+    AggregatePrefilter prefilter = aggregate_prefilter_for_source(pipeline, scalars);
+    // The steps from the source up to `input`, which a morsel run bounded from
+    // below by a bare update (`Filter(Update(Aggregate))`) asks for as its
+    // input. They are composed here, over the prefiltered aggregate, exactly
+    // as the serial composer would compose them.
+    std::size_t input_step = pipeline.steps.size();
+    if (&input != &node) {
+        const auto found = std::ranges::find(pipeline.steps, &input, &MapStep::node);
+        input_step = static_cast<std::size_t>(found - pipeline.steps.begin());
+        if (found == pipeline.steps.end()) {
+            prefilter.clear();
+        }
     }
-    const physical::Plan plan = physical::plan_physical(node, registry, externs);
-    if (!plan.migrated || plan.root != &node || !plan.aggregate.describes ||
-        ir::node_cast<ir::AggregateNode>(node).group_by().empty()) {
-        return build_operator(node, registry, scalars, externs, exec, model_out);
+    if (prefilter.empty()) {
+        return build_operator(input, registry, scalars, externs, exec, model_out);
+    }
+    const physical::Plan plan = physical::plan_physical(
+        node, registry, externs, physical::deferred_source_schemas(exec.deferred_scans));
+    if (!plan.migrated || plan.root != &node || !plan.aggregate.describes) {
+        return build_operator(input, registry, scalars, externs, exec, model_out);
     }
     const auto build = [&] {
         physical::note_map_pipeline_executed();
         return physical_executor_detail::build_physical_aggregate(
             plan, node, registry, scalars, externs, exec, model_out, prefilter);
     };
-    if (exec.execution_profile == nullptr) {
-        return build();
-    }
-    auto* entry = execution_profile_entry(exec.execution_profile, node);
     std::expected<OperatorPtr, std::string> result;
-    {
-        const ExecutionProfileScope scope(entry, ProfilePhase::Build);
+    if (exec.execution_profile == nullptr) {
         result = build();
+    } else {
+        auto* entry = execution_profile_entry(exec.execution_profile, node);
+        {
+            const ExecutionProfileScope scope(entry, ProfilePhase::Build);
+            result = build();
+        }
+        if (result.has_value()) {
+            result = profile_operator(std::move(result.value()), exec.execution_profile, node);
+        }
     }
-    if (!result.has_value()) {
-        return result;
+    for (std::size_t index = pipeline.steps.size(); index-- > input_step && result.has_value();) {
+        const MapStep& step = pipeline.steps[index];
+        result = step.factory(step, std::move(result.value()), scalars, externs, exec,
+                              &pipeline.source_signature, false);
+        if (result.has_value() && exec.execution_profile != nullptr) {
+            result = profile_operator(std::move(result.value()), exec.execution_profile, *step.node);
+        }
     }
-    return profile_operator(std::move(result.value()), exec.execution_profile, node);
+    return result;
 }
 
 auto build_operator(const ir::Node& node, const TableRegistry& registry,

@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <type_traits>
@@ -398,6 +399,15 @@ TEST_CASE("evaluate_field over a partial range matches evaluating a gathered ran
              *call("__case", {ir::make_expr_ptr(cmp(ir::CompareOp::Gt, col_ref("id"), ilit(50))),
                               col_ref("nullable"), col_ref("flag"),
                               arith(ir::ArithmeticOp::Mul, col_ref("id"), ilit(2)), ilit(-1)}))});
+    // A case nested in another call: classified row-local, it is evaluated
+    // over the range rather than whole, the way the Polars adapter's rounded
+    // aggregates (`Float64(round(case { ... }))`) now are.
+    fields.push_back(
+        {.label = "case inside a call",
+         .expr = std::move(*call(
+             "abs", {call("__case", {ir::make_expr_ptr(cmp(ir::CompareOp::Gt, col_ref("id"), ilit(50))),
+                                     arith(ir::ArithmeticOp::Sub, col_ref("nullable"), ilit(300)),
+                                     col_ref("id")})}))});
     fields.push_back({.label = "row-local kernel builtin over a range",
                       .expr = std::move(*call("length", {col_ref("name")}))});
     fields.push_back({.label = "unary math over a computed nullable argument",
@@ -413,6 +423,29 @@ TEST_CASE("evaluate_field over a partial range matches evaluating a gathered ran
                 check_field_range(table, f.expr, RowRange{.begin = begin, .count = count}, f.label);
             }
         }
+    }
+}
+
+TEST_CASE("a ranged string kernel reads a borrowed view of an offset source",
+          "[filter][range]") {
+    // A partial range borrows String columns instead of copying them. When the
+    // source is itself a view starting mid-buffer, the borrowed window must
+    // start at the source's offset plus the range's, not at the range alone.
+    constexpr std::size_t kRows = 200;
+    constexpr std::size_t kSkip = 37;
+    auto owned = std::make_shared<Column<std::string>>();
+    for (std::size_t i = 0; i < kRows + kSkip; ++i) {
+        owned->push_back(i % 3 == 0 ? "13-" + std::to_string(i) : "31-" + std::to_string(i));
+    }
+    const auto& base = *owned;
+    runtime::Table table;
+    table.add_column("phone", Column<std::string>::from_external(owned, base.offsets_buffer_data(),
+                                                                 base.chars_buffer_data(), kSkip,
+                                                                 kRows));
+    const auto expr = call("like", {col_ref("phone"), slit("13%")});
+    for (const RowRange rows : {RowRange{.begin = 0, .count = 64}, RowRange{.begin = 5, .count = 7},
+                                RowRange{.begin = 130, .count = 70}}) {
+        check_field_range(table, *expr, rows, "like over an offset view");
     }
 }
 
@@ -523,4 +556,76 @@ TEST_CASE("morsel_grain derives a grain instead of asking for one", "[runtime][p
             CHECK(many < few);
         }
     }
+}
+
+TEST_CASE("NaN-high comparisons preserve nulls and sliced operands",
+          "[runtime][filter][nan-high]") {
+    const double inf = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const std::vector<double> values{-inf, -1.0, -0.0, 0.0, 1.0, inf, nan, 0.0};
+    const std::vector<int> rank{0, 1, 2, 2, 3, 4, 5, 0};
+    runtime::Table table;
+    Column<std::int64_t> ids;
+    Column<double> left, right;
+    runtime::ValidityBitmap lv(64, true), rv(64, true);
+    for (std::size_t a = 0; a < 8; ++a) {
+        for (std::size_t b = 0; b < 8; ++b) {
+            ids.push_back(static_cast<std::int64_t>(a * 8 + b));
+            left.push_back(values[a]);
+            right.push_back(values[b]);
+            lv.set(a * 8 + b, a != 7);
+            rv.set(a * 8 + b, b != 7);
+        }
+    }
+    table.add_column("id", ColumnValue{std::move(ids)});
+    table.add_column("a", ColumnValue{std::move(left)}, std::move(lv));
+    table.add_column("b", ColumnValue{std::move(right)}, std::move(rv));
+    for (auto op : {ir::CompareOp::Eq, ir::CompareOp::Ne, ir::CompareOp::Lt, ir::CompareOp::Le,
+                    ir::CompareOp::Gt, ir::CompareOp::Ge}) {
+        for (bool scalar : {false, true}) {
+            auto expression = cmp(op, col_ref("a"), scalar ? dlit(nan) : col_ref("b"));
+            std::get<ir::CompareExpr>(expression.node).float_comparison =
+                ir::FloatComparison::NaNsEqualAndGreatest;
+            auto result = runtime::filter_table_range(table, expression, RowRange{3, 58}, nullptr);
+            REQUIRE(result.has_value());
+            std::vector<std::int64_t> expected;
+            for (std::size_t i = 3; i < 61; ++i) {
+                const auto a = i / 8, b = scalar ? std::size_t{6} : i % 8;
+                if (a == 7 || b == 7)
+                    continue;
+                const int x = rank[a], y = rank[b];
+                bool keep = false;
+                switch (op) {
+                    case ir::CompareOp::Eq:
+                        keep = x == y;
+                        break;
+                    case ir::CompareOp::Ne:
+                        keep = x != y;
+                        break;
+                    case ir::CompareOp::Lt:
+                        keep = x < y;
+                        break;
+                    case ir::CompareOp::Le:
+                        keep = x <= y;
+                        break;
+                    case ir::CompareOp::Gt:
+                        keep = x > y;
+                        break;
+                    case ir::CompareOp::Ge:
+                        keep = x >= y;
+                        break;
+                }
+                if (keep)
+                    expected.push_back(static_cast<std::int64_t>(i));
+            }
+            const auto& actual = std::get<Column<std::int64_t>>(*result->columns[0].column);
+            REQUIRE(actual.size() == expected.size());
+            for (std::size_t i = 0; i < expected.size(); ++i)
+                CHECK(actual[i] == expected[i]);
+        }
+    }
+    auto ordinary =
+        runtime::filter_table(table, cmp(ir::CompareOp::Eq, col_ref("a"), dlit(nan)), nullptr);
+    REQUIRE(ordinary.has_value());
+    CHECK(ordinary->rows() == 0);
 }

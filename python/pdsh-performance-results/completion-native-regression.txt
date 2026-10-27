@@ -1,0 +1,123 @@
+ONE WORKER
+
+HEAD is now at ca71a346 Translate filtered distinct counts without counting excluded nulls
+Benchmarking base:   ca71a346@ca71a346
+Benchmarking target: WORKTREE@edc4a13c (dirty)
+Using warmup=2, iters=7, repeats=12, interleave=on, replica-control=off
+Compiler path prefix map: on
+Build cache: /tmp/q19-core-perfcmp
+Pinning: taskset -c 2
+Ibex suite: filter,join
+Building base ...
+  base: build dir cached, configure skipped
+Building target ...
+  target: build dir cached, configure skipped
+Interleaving repeats with balanced run positions
+  -> base repeat 1/12
+  -> target repeat 1/12
+  -> target repeat 2/12
+  -> base repeat 2/12
+  -> base repeat 3/12
+  -> target repeat 3/12
+  -> target repeat 4/12
+  -> base repeat 4/12
+  -> base repeat 5/12
+  -> target repeat 5/12
+  -> target repeat 6/12
+  -> base repeat 6/12
+  -> base repeat 7/12
+  -> target repeat 7/12
+  -> target repeat 8/12
+  -> base repeat 8/12
+  -> base repeat 9/12
+  -> target repeat 9/12
+  -> target repeat 10/12
+  -> base repeat 10/12
+  -> base repeat 11/12
+  -> target repeat 11/12
+  -> target repeat 12/12
+  -> base repeat 12/12
+
+base=ca71a346@ca71a346
+target=WORKTREE@edc4a13c (dirty)
+prefix_map=on
+replica_binary=not-requested
+
+framework  query              base_ms  target_ms  delta_ms  delta_pct  speedup_x  base_iqr_ms  target_iqr_ms  verdict  base_samples  target_samples  rows     replica_delta_ms  replica_iqr_ms  replica_relation
+ibex       filter_and         1.1430   1.0890     -0.0540   -4.72%     1.050      0.0473       0.0822         noise    12            12              99005    -                 -               -
+ibex       filter_arith       2.0320   2.0455     +0.0135   +0.66%     0.993      0.0520       0.0387         noise    12            12              671378   -                 -               -
+ibex       filter_or          1.1500   1.1485     -0.0015   -0.13%     1.001      0.0403       0.0353         noise    12            12              115743   -                 -               -
+ibex       filter_simple      1.6220   1.6320     +0.0100   +0.62%     0.994      0.0450       0.0345         noise    12            12              499999   -                 -               -
+ibex       inner_join_symbol  7.2455   7.3465     +0.1010   +1.39%     0.986      0.0672       0.1268         noise    12            12              500164   -                 -               -
+ibex       inner_join_user    11.4520  11.3665    -0.0855   -0.75%     1.008      0.0560       0.0855         noise    12            12              1000000  -                 -               -
+ibex       join_filter_rank   30.8735  30.7395    -0.1340   -0.43%     1.004      0.5397       0.2265         noise    12            12              1260     -                 -               -
+ibex       join_update_group  14.7770  14.8010    +0.0240   +0.16%     0.998      0.1180       0.1052         noise    12            12              756      -                 -               -
+
+Summary (totals + medians + geometric mean speedup):
+scope  queries  total_base_ms  total_target_ms  total_delta_ms  total_delta_pct  median_base_ms  median_target_ms  median_delta_ms  median_delta_pct  median_speedup_x  geom_speedup_x  geom_samples
+ALL    8        70.2950        70.1685          -0.1265         -0.18%           4.6387          4.6960            +0.0042          +0.02%            1.000             1.004           8
+ibex   8        70.2950        70.1685          -0.1265         -0.18%           4.6387          4.6960            +0.0042          +0.02%            1.000             1.004           8
+
+Kept temporary directory: /tmp/ibex-perfcmp.JvkW1j
+
+EIGHT WORKERS
+
+HEAD is now at ca71a346 Translate filtered distinct counts without counting excluded nulls
+Benchmarking base:   ca71a346@ca71a346
+Benchmarking target: WORKTREE@edc4a13c (dirty)
+Using warmup=2, iters=7, repeats=12, interleave=on, replica-control=off
+Compiler path prefix map: on
+Build cache: /tmp/q19-core-perfcmp
+Pinning: taskset -c 0,2,4,6,8,10,12,14
+Ibex suite: filter,join
+Building base ...
+  base: build dir cached, configure skipped
+Building target ...
+  target: build dir cached, configure skipped
+Interleaving repeats with balanced run positions
+  -> base repeat 1/12
+  -> target repeat 1/12
+  -> target repeat 2/12
+  -> base repeat 2/12
+  -> base repeat 3/12
+  -> target repeat 3/12
+  -> target repeat 4/12
+  -> base repeat 4/12
+  -> base repeat 5/12
+  -> target repeat 5/12
+  -> target repeat 6/12
+  -> base repeat 6/12
+  -> base repeat 7/12
+  -> target repeat 7/12
+  -> target repeat 8/12
+  -> base repeat 8/12
+  -> base repeat 9/12
+  -> target repeat 9/12
+  -> target repeat 10/12
+  -> base repeat 10/12
+  -> base repeat 11/12
+  -> target repeat 11/12
+  -> target repeat 12/12
+  -> base repeat 12/12
+
+base=ca71a346@ca71a346
+target=WORKTREE@edc4a13c (dirty)
+prefix_map=on
+replica_binary=not-requested
+
+framework  query              base_ms  target_ms  delta_ms  delta_pct  speedup_x  base_iqr_ms  target_iqr_ms  verdict  base_samples  target_samples  rows     replica_delta_ms  replica_iqr_ms  replica_relation
+ibex       filter_and         0.2225   0.2215     -0.0010   -0.45%     1.005      0.0557       0.0302         noise    12            12              99005    -                 -               -
+ibex       filter_arith       0.3670   0.3945     +0.0275   +7.49%     0.930      0.0285       0.0488         noise    12            12              671378   -                 -               -
+ibex       filter_or          0.2050   0.2190     +0.0140   +6.83%     0.936      0.0105       0.0335         noise    12            12              115743   -                 -               -
+ibex       filter_simple      0.2975   0.2965     -0.0010   -0.34%     1.003      0.0195       0.0318         noise    12            12              499999   -                 -               -
+ibex       inner_join_symbol  1.6145   1.6230     +0.0085   +0.53%     0.995      0.0610       0.1127         noise    12            12              500164   -                 -               -
+ibex       inner_join_user    9.2255   9.0645     -0.1610   -1.75%     1.018      0.3005       0.2782         noise    12            12              1000000  -                 -               -
+ibex       join_filter_rank   13.8550  13.7705    -0.0845   -0.61%     1.006      0.4730       0.3392         noise    12            12              1260     -                 -               -
+ibex       join_update_group  10.3190  10.2400    -0.0790   -0.77%     1.008      0.1895       0.1618         noise    12            12              756      -                 -               -
+
+Summary (totals + medians + geometric mean speedup):
+scope  queries  total_base_ms  total_target_ms  total_delta_ms  total_delta_pct  median_base_ms  median_target_ms  median_delta_ms  median_delta_pct  median_speedup_x  geom_speedup_x  geom_samples
+ALL    8        36.1060        35.8295          -0.2765         -0.77%           0.9908          1.0088            -0.0010          -0.39%            1.004             0.987           8
+ibex   8        36.1060        35.8295          -0.2765         -0.77%           0.9908          1.0088            -0.0010          -0.39%            1.004             0.987           8
+
+Kept temporary directory: /tmp/ibex-perfcmp.Gx1wyk

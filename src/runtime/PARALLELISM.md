@@ -67,6 +67,11 @@ Three properties are load-bearing:
   thread's progress. Those get a raw `std::thread`, marked with
   `StageThreadScope` so the profiler attributes their work. This is the *only*
   non-pool thread species in the runtime.
+  A stage waiting for a batch may execute queued tasks from that exact batch.
+  It skips unrelated producers, which could park on rings the stage must drain.
+  This also lets exhausted scan workers retire when other live pipelines have
+  filled the pool; reserving one worker per pipeline alone cannot ensure that
+  progress across several overlapping pipelines.
 
 ### Two thread budgets, on purpose
 

@@ -1,0 +1,153 @@
+{
+  "data": "G1_1e7_2e0_0_0",
+  "threads": "8",
+  "queries": {
+    "q1": {
+      "desc": "sum v1 by id1",
+      "prepare_ms": 270.5250440048985,
+      "native": "_ibex_input[select { `id1`, `v1` = ((((coalesce(sum(`v1`), ^_ibex_scalar_0) % ^_ibex_scalar_1) + ^_ibex_scalar_2) % ^_ibex_scalar_1) - ^_ibex_scalar_3) }, by { `id1` }];",
+      "check": "ok",
+      "polars_ms": 8.655204001115635,
+      "ibex_ms": 4.982567988918163,
+      "polars_all": [
+        8.655204001115635,
+        11.517267004819587,
+        8.93824799277354,
+        8.89360900328029
+      ],
+      "ibex_all": [
+        5.202740998356603,
+        4.982567988918163,
+        5.193965989747085,
+        6.839447989477776
+      ],
+      "ratio": 0.5756730850336886
+    },
+    "q2": {
+      "desc": "sum v1 by id1:id2",
+      "prepare_ms": 265.79653900989797,
+      "native": "_ibex_input[select { `id1`, `id2`, `v1` = ((((coalesce(sum(`v1`), ^_ibex_scalar_0) % ^_ibex_scalar_1) + ^_ibex_scalar_2) % ^_ibex_scalar_1) - ^_ibex_scalar_3) }, by { `id1`, `id2` }];",
+      "check": "ok",
+      "polars_ms": 11.06740599789191,
+      "ibex_ms": 9.976693996577524,
+      "polars_all": [
+        11.06740599789191,
+        11.34575299511198,
+        11.418313995818608,
+        11.507268995046616
+      ],
+      "ibex_all": [
+        10.028786011389457,
+        9.976693996577524,
+        10.03445900278166,
+        10.020843998063356
+      ],
+      "ratio": 0.9014482705773925
+    },
+    "q3": {
+      "desc": "sum v1 mean v3 by id3",
+      "prepare_ms": 393.6043520079693,
+      "native": "_ibex_input[select { `id3`, `v1` = ((((coalesce(sum(`v1`), ^_ibex_scalar_0) % ^_ibex_scalar_1) + ^_ibex_scalar_2) % ^_ibex_scalar_1) - ^_ibex_scalar_3), `v3` = mean(`v3`) }, by { `id3` }];",
+      "check": "ok",
+      "polars_ms": 84.93079600157216,
+      "ibex_ms": 215.79237299738452,
+      "polars_all": [
+        84.93079600157216,
+        93.22642399638426,
+        89.42298700276297,
+        89.66349900583737
+      ],
+      "ibex_all": [
+        229.56354700727388,
+        215.79237299738452,
+        216.20396699290723,
+        229.04395399382338
+      ],
+      "ratio": 2.540802431586653
+    },
+    "q4": {
+      "desc": "mean v1:v3 by id4",
+      "prepare_ms": 130.66939399868716,
+      "native": "_ibex_input[select { `id4`, `v1` = mean(`v1`), `v2` = mean(`v2`), `v3` = mean(`v3`) }, by { `id4` }];",
+      "check": "ok",
+      "polars_ms": 14.322201008326374,
+      "ibex_ms": 13.465293988701887,
+      "polars_all": [
+        14.322201008326374,
+        14.994612007285468,
+        14.7159339976497,
+        14.586619989131577
+      ],
+      "ibex_all": [
+        15.83255200239364,
+        15.263060995494016,
+        15.207447009743191,
+        13.465293988701887
+      ],
+      "ratio": 0.9401693204049912
+    },
+    "q5": {
+      "desc": "sum v1:v3 by id6",
+      "prepare_ms": 132.8604529990116,
+      "native": "_ibex_input[select { `id6`, `v1` = ((((coalesce(sum(`v1`), ^_ibex_scalar_0) % ^_ibex_scalar_1) + ^_ibex_scalar_2) % ^_ibex_scalar_1) - ^_ibex_scalar_3), `v2` = ((((coalesce(sum(`v2`), ^_ibex_scalar_4) % ^_ibex_scalar_5) + ^_ibex_scalar_6) % ^_ibex_scalar_5) - ^_ibex_scalar_7), `v3` = coalesce(sum(`v3`), ^_ibex_scalar_8) }, by { `id6` }];",
+      "check": "ok",
+      "polars_ms": 92.22615099861287,
+      "ibex_ms": 192.6044370047748,
+      "polars_all": [
+        104.085220998968,
+        99.84613000415266,
+        92.22615099861287,
+        103.51452100439928
+      ],
+      "ibex_all": [
+        196.7216670018388,
+        194.34614699275699,
+        200.24479100538883,
+        192.6044370047748
+      ],
+      "ratio": 2.0883928790183566
+    },
+    "q7": {
+      "desc": "max v1 - min v2 by id3",
+      "prepare_ms": 373.39878900093026,
+      "native": "_ibex_input[select { `id3`, `range_v1_v2` = (((((((((max(`v1`) % ^_ibex_scalar_0) + ^_ibex_scalar_1) % ^_ibex_scalar_0) - ^_ibex_scalar_2) - ((((min(`v2`) % ^_ibex_scalar_3) + ^_ibex_scalar_4) % ^_ibex_scalar_3) - ^_ibex_scalar_5)) % ^_ibex_scalar_6) + ^_ibex_scalar_7) % ^_ibex_scalar_6) - ^_ibex_scalar_8) }, by { `id3` }];",
+      "check": "ok",
+      "polars_ms": 83.80726700124796,
+      "ibex_ms": 211.42611099639907,
+      "polars_all": [
+        83.80726700124796,
+        106.4901500067208,
+        89.279706007801,
+        88.13601799192838
+      ],
+      "ibex_all": [
+        211.42611099639907,
+        222.41532600310165,
+        219.66481499839574,
+        217.98213799775112
+      ],
+      "ratio": 2.5227658478977815
+    },
+    "q10": {
+      "desc": "sum v3 count by id1:id6",
+      "prepare_ms": 648.1909840076696,
+      "native": "_ibex_input[select { `id1`, `id2`, `id3`, `id4`, `id5`, `id6`, `v3` = coalesce(sum(`v3`), ^_ibex_scalar_0), `count` = count() }, by { `id1`, `id2`, `id3`, `id4`, `id5`, `id6` }];",
+      "check": "ok",
+      "polars_ms": 204.17828399513382,
+      "ibex_ms": 510.5675779923331,
+      "polars_all": [
+        212.9664509993745,
+        204.17828399513382,
+        215.30968400475103,
+        205.92454299912788
+      ],
+      "ibex_all": [
+        514.8245010059327,
+        513.0213790107518,
+        520.7109509938164,
+        510.5675779923331
+      ],
+      "ratio": 2.500596870549179
+    }
+  }
+}

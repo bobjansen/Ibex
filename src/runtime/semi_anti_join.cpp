@@ -14,6 +14,7 @@
 #include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/ir/schema.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/interrupt.hpp>
 #include <ibex/runtime/operator.hpp>
@@ -39,6 +40,7 @@
 #include <variant>
 #include <vector>
 
+#include "physical_plan.hpp"
 #include "chunk_conversion_internal.hpp"
 #include "interpreter_internal.hpp"
 #include "join_chunked_internal.hpp"
@@ -1076,8 +1078,12 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         // The context checks come before the pool binding: constructing the
         // pool spawns its threads eagerly, and a serial query must not pay.
         std::size_t morsels = 1;
+        // The probe phase's own floor: a streamed left side arrives in chunks
+        // well under the right-side passes' floor, and filtering it on one
+        // thread lost to the inner join a semi join replaces (Q11, once the
+        // adapter's joins became visible to `reduce_inner_joins_to_semi`).
         if (exec_ != nullptr && exec_->can_fan_out() && !on_worker_pool_thread() &&
-            rows >= kMinParallelPredicateRows &&
+            rows >= physical::join_probe_parallelism().row_floor &&
             filter_gather_is_thread_safe(t, layout->src_of_dst)) {
             // `submit` clamps its worker count to the pool size, so more
             // morsels than that would leave some unvisited.
@@ -1446,14 +1452,16 @@ auto make_chunked_semi_anti_join_operator(OperatorPtr left, OperatorPtr right, i
         std::dynamic_pointer_cast<SemiAntiScanSink>(scan_sink), left_stream);
 }
 
-auto is_streamable_semi_anti_join(const ir::JoinNode& join) -> bool {
+auto is_streamable_semi_anti_join(const ir::JoinNode& join, const ir::SourceSchemas& sources)
+    -> bool {
     // One key of any type the operator sets, or two keys that are provably
     // Int64 on both sides -- the pair shape `right_pairs_` holds. Checked
     // last because it is the only clause that infers a schema.
     return (join.kind() == ir::JoinKind::Semi || join.kind() == ir::JoinKind::Anti) &&
            !join.predicate().has_value() && join.null_match() == ir::NullMatch::Never &&
            !join.expect().asserts_anything() && join.take() == ir::MatchSelection::All &&
-           (join.keys().size() == 1 || (join.keys().size() == 2 && join_keys_provably_int64(join)));
+           (join.keys().size() == 1 ||
+            (join.keys().size() == 2 && join_keys_provably_int64(join, sources)));
 }
 
 }  // namespace ibex::runtime

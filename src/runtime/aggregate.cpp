@@ -223,7 +223,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         }
 
         if ((item.kind == ExprType::Date || item.kind == ExprType::Timestamp) &&
-            agg.func != ir::AggFunc::CountDistinct) {
+            agg.func != ir::AggFunc::CountDistinct && agg.func != ir::AggFunc::FirstNull &&
+            agg.func != ir::AggFunc::LastNull) {
             return std::unexpected("date/time aggregation not supported");
         }
 
@@ -249,7 +250,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             item.kind = ExprType::Double;
         }
 
-        if (agg.func == ir::AggFunc::Median || agg.func == ir::AggFunc::Stddev ||
+        if (agg.func == ir::AggFunc::FirstNull || agg.func == ir::AggFunc::LastNull ||
+            agg.func == ir::AggFunc::Median || agg.func == ir::AggFunc::Stddev ||
             agg.func == ir::AggFunc::Ewma || agg.func == ir::AggFunc::Quantile ||
             agg.func == ir::AggFunc::Skew || agg.func == ir::AggFunc::Kurtosis ||
             agg.func == ir::AggFunc::CountDistinct || ir::agg_is_paired(agg.func)) {
@@ -279,6 +281,15 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         plan.push_back(item);
     }
 
+    // Paired global reductions have exactly one group. Do not discover that
+    // group once per row or allocate a row-to-group array before reducing it.
+    // Keep the validation above shared with the grouped/mixed-aggregate path.
+    if (group_by.empty() && !aggregations.empty() &&
+        std::ranges::all_of(aggregations,
+                            [](const ir::AggSpec& agg) { return ir::agg_is_paired(agg.func); })) {
+        return global_paired_aggregate(input, aggregations, exec);
+    }
+
     auto make_state = [&] -> AggState {
         AggState state;
         state.slots.reserve(aggregations.size());
@@ -302,8 +313,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             if (ir::agg_is_paired(agg.func)) {
                 continue;  // the co-moment pass below, after grouping
             }
-            // Every aggregate that reads a value skips null rows: first/last
-            // are the first/last NON-null value (SPEC 3.5), not the first row.
+            // These reducers skip null rows. FirstNull/LastNull below select
+            // an edge row independently of its validity.
             if ((agg.func == ir::AggFunc::Sum || agg.func == ir::AggFunc::Mean ||
                  agg.func == ir::AggFunc::Min || agg.func == ir::AggFunc::Max ||
                  agg.func == ir::AggFunc::First || agg.func == ir::AggFunc::Last ||
@@ -314,6 +325,25 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 continue;
             }
             const ColumnValue& column = *agg_columns[i];
+            if (agg.func == ir::AggFunc::FirstNull || agg.func == ir::AggFunc::LastNull) {
+                // count records encounter, independently of the selected row's validity.
+                if (agg.func == ir::AggFunc::FirstNull && slot.count != 0) {
+                    continue;
+                }
+                slot.count = 1;
+                slot.has_value = agg_validity[i] == nullptr || (*agg_validity[i])[row];
+                if (slot.has_value) {
+                    ScalarValue value = scalar_from_column(column, row);
+                    if (const auto* iv = std::get_if<std::int64_t>(&value)) {
+                        slot.int_value = *iv;
+                    } else if (const auto* dv = std::get_if<double>(&value)) {
+                        slot.double_value = *dv;
+                    } else {
+                        slot.text_value = std::move(value);
+                    }
+                }
+                continue;
+            }
             if (agg.func == ir::AggFunc::First) {
                 if (!slot.has_value) {
                     ScalarValue value = scalar_from_column(column, row);
@@ -431,6 +461,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::CountDistinct:
                     case ir::AggFunc::First:
                     case ir::AggFunc::Last:
+                    case ir::AggFunc::FirstNull:
+                    case ir::AggFunc::LastNull:
                     case ir::AggFunc::Median:
                     case ir::AggFunc::Stddev:
                     case ir::AggFunc::Ewma:
@@ -472,6 +504,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::CountDistinct:
                     case ir::AggFunc::First:
                     case ir::AggFunc::Last:
+                    case ir::AggFunc::FirstNull:
+                    case ir::AggFunc::LastNull:
                     case ir::AggFunc::Median:
                     case ir::AggFunc::Stddev:
                     case ir::AggFunc::Ewma:
@@ -547,6 +581,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::CountDistinct:
                     case ir::AggFunc::First:
                     case ir::AggFunc::Last:
+                    case ir::AggFunc::FirstNull:
+                    case ir::AggFunc::LastNull:
                     case ir::AggFunc::Median:
                     case ir::AggFunc::Stddev:
                     case ir::AggFunc::Ewma:
@@ -587,6 +623,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::CountDistinct:
                     case ir::AggFunc::First:
                     case ir::AggFunc::Last:
+                    case ir::AggFunc::FirstNull:
+                    case ir::AggFunc::LastNull:
                     case ir::AggFunc::Median:
                     case ir::AggFunc::Stddev:
                     case ir::AggFunc::Ewma:
@@ -654,7 +692,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     break;
                 }
                 case ir::AggFunc::First:
-                case ir::AggFunc::Last: {
+                case ir::AggFunc::Last:
+                case ir::AggFunc::FirstNull:
+                case ir::AggFunc::LastNull: {
                     const auto* input_col = input.find(agg.column.name);
                     if (input_col == nullptr) {
                         return std::unexpected("aggregate column not found: " + agg.column.name);
@@ -707,6 +747,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     break;
                 case ir::AggFunc::First:
                 case ir::AggFunc::Last:
+                case ir::AggFunc::FirstNull:
+                case ir::AggFunc::LastNull:
                     if (slot.kind == ExprType::Int) {
                         append_scalar(*column, slot.int_value);
                     } else if (slot.kind == ExprType::Double) {
@@ -714,6 +756,12 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     } else if (slot.kind == ExprType::Bool) {
                         append_scalar(*column,
                                       slot.has_value ? slot.text_value : ScalarValue{false});
+                    } else if (slot.kind == ExprType::Date) {
+                        append_scalar(*column,
+                                      slot.has_value ? slot.text_value : ScalarValue{Date{}});
+                    } else if (slot.kind == ExprType::Timestamp) {
+                        append_scalar(*column,
+                                      slot.has_value ? slot.text_value : ScalarValue{Timestamp{}});
                     } else {
                         append_text_cell(*column, slot.text_value);
                     }
@@ -755,6 +803,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             case ir::AggFunc::Max:
             case ir::AggFunc::First:
             case ir::AggFunc::Last:
+            case ir::AggFunc::FirstNull:
+            case ir::AggFunc::LastNull:
                 return slot.has_value;
             // Median/Quantile/Skew/Kurtosis are reduced in the contiguous collect
             // pass, which records the group's value count in slot.count.
@@ -1691,7 +1741,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             const auto func = aggregations[i].func;
             if (func == ir::AggFunc::Sum || func == ir::AggFunc::Mean || func == ir::AggFunc::Min ||
                 func == ir::AggFunc::Max || func == ir::AggFunc::First ||
-                func == ir::AggFunc::Last || func == ir::AggFunc::Median ||
+                func == ir::AggFunc::Last || func == ir::AggFunc::FirstNull ||
+                func == ir::AggFunc::LastNull || func == ir::AggFunc::Median ||
                 func == ir::AggFunc::Stddev || func == ir::AggFunc::Ewma ||
                 func == ir::AggFunc::Quantile || func == ir::AggFunc::Skew ||
                 func == ir::AggFunc::Kurtosis || ir::agg_is_paired(func)) {

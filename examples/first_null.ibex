@@ -1,0 +1,12 @@
+// first/last skip nulls; first_null/last_null select the edge row even if null.
+let t = Table {
+    group = ["a", "a", "a"],
+    x = [1, 2, 3],
+};
+let nullable = t[update { x = case { x == 1 => NULL, else => x } }];
+nullable[select {
+    group,
+    edge = first_null(x),  // NULL
+    present = first(x),   // 2
+    ending = last_null(x),  // 3
+}, by group];

@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/column.hpp>
+#include <ibex/ir/canonicalize.hpp>
 #include <ibex/ir/join_pushdown.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/schema.hpp>
+#include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/table_compare.hpp>
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
@@ -405,6 +410,46 @@ TEST_CASE("semi pushdown: key in the right side descends there", "[ir][join_push
     REQUIRE(scan_name(*right.children()[1]) == "c");
 }
 
+TEST_CASE("semi pushdown: a projection between the semi and the join is looked through",
+          "[ir][join_pushdown][semi]") {
+    // (Project(a JOIN b on k)) SEMI c on ax  ->  Project((a SEMI c on ax) JOIN b on k).
+    // The Polars adapter selects the visible columns after every join.
+    auto inner = make_join({2}, ir::JoinKind::Inner, {"k"}, make_scan({3}, "a"), make_scan({4}, "b"));
+    std::vector<ir::ColumnRef> cols{{.name = "ax"}, {.name = "k"}};
+    auto project = std::make_unique<ir::ProjectNode>(ir::NodeId{7}, std::move(cols));
+    project->add_child(std::move(inner));
+    auto semi = std::make_unique<ir::JoinNode>(ir::NodeId{1}, ir::JoinKind::Semi,
+                                               std::vector<ir::JoinKey>{std::string{"ax"}});
+    semi->add_child(std::move(project));
+    semi->add_child(make_scan({5}, "c"));
+
+    auto out = ir::push_semi_joins_down(std::move(semi), test_sources());
+    REQUIRE(out->kind() == ir::NodeKind::Project);
+    const auto& join = *out->children().front();
+    REQUIRE(join.kind() == ir::NodeKind::Join);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    REQUIRE(static_cast<const ir::JoinNode&>(join).kind() == ir::JoinKind::Inner);
+    const auto& left = *join.children()[0];
+    REQUIRE(left.kind() == ir::NodeKind::Join);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    REQUIRE(static_cast<const ir::JoinNode&>(left).kind() == ir::JoinKind::Semi);
+    REQUIRE(scan_name(*left.children()[0]) == "a");
+    REQUIRE(scan_name(*left.children()[1]) == "c");
+
+    // A semi that cannot move keeps its plan, projection and all.
+    auto plain = make_scan({3}, "a");
+    std::vector<ir::ColumnRef> kept{{.name = "ax"}};
+    auto over_scan = std::make_unique<ir::ProjectNode>(ir::NodeId{7}, std::move(kept));
+    over_scan->add_child(std::move(plain));
+    auto stays = std::make_unique<ir::JoinNode>(ir::NodeId{1}, ir::JoinKind::Semi,
+                                                std::vector<ir::JoinKey>{std::string{"ax"}});
+    stays->add_child(std::move(over_scan));
+    stays->add_child(make_scan({5}, "c"));
+    auto same = ir::push_semi_joins_down(std::move(stays), test_sources());
+    REQUIRE(same->kind() == ir::NodeKind::Join);
+    REQUIRE(same->children()[0]->kind() == ir::NodeKind::Project);
+}
+
 TEST_CASE("an anti join stays above the inner join", "[ir][join_pushdown][semi]") {
     // A semi join keeps only matches, and is pushed below an inner join
     // because it tends to be selective (q18 keeps 57 orders of millions). An
@@ -514,4 +559,88 @@ TEST_CASE("join pushdown: implied filters are pushed once across repeated runs",
     CHECK(conjunct_count(*join.children()[1]) == 1);
     CHECK(scan_name(*join.children()[0]) == "a");
     CHECK(scan_name(*join.children()[1]) == "b");
+}
+
+TEST_CASE("join pushdown: projected aliases expose disjunctions without changing join semantics",
+          "[ir][join_pushdown][projection_filter]") {
+    const auto wrapped = [](ir::JoinKind kind) -> ir::NodePtr {
+        auto join = make_join({1}, kind, {{"k", "k"}}, make_scan({2}, "a"), make_scan({3}, "b"));
+        std::vector<ir::FieldSpec> fields;
+        fields.push_back({.alias = "view_ax", .expr = col("ax")});
+        fields.push_back({.alias = "view_bx", .expr = col("bx")});
+        fields.push_back({.alias = "view_payload", .expr = col("shared")});
+        auto update = std::make_unique<ir::UpdateNode>(ir::NodeId{4}, std::move(fields));
+        update->add_child(std::move(join));
+        auto project = std::make_unique<ir::ProjectNode>(
+            ir::NodeId{5}, std::vector<ir::ColumnRef>{
+                               {.name = "view_ax"}, {.name = "view_bx"}, {.name = "view_payload"}});
+        project->add_child(std::move(update));
+        auto pred = or_expr(and_expr(eq(col("view_ax"), lit(1)), eq(col("view_bx"), lit(2))),
+                            and_expr(eq(col("view_ax"), lit(3)), eq(col("view_bx"), lit(4))));
+        return make_filter({6}, std::move(pred), std::move(project));
+    };
+    runtime::Table left;
+    left.add_column("k", Column<std::int64_t>{1, 2, 3, 4});
+    left.add_column("ax", Column<std::int64_t>{1, 3, 5, 1});
+    left.columns.back().validity = runtime::ValidityBitmap{true, true, true, false};
+    left.add_column("shared", Column<std::int64_t>{11, 22, 33, 44});
+    left.columns.back().validity = runtime::ValidityBitmap{true, false, true, true};
+    runtime::Table right;
+    right.add_column("k", Column<std::int64_t>{1, 2, 3, 5});
+    right.add_column("bx", Column<std::int64_t>{2, 4, 6, 2});
+    right.add_column("shared", Column<std::int64_t>{0, 0, 0, 0});
+    runtime::TableRegistry tables;
+    tables.insert_or_assign("a", left);
+    tables.insert_or_assign("b", right);
+    for (const auto kind :
+         {ir::JoinKind::Inner, ir::JoinKind::Left, ir::JoinKind::Right, ir::JoinKind::Outer}) {
+        auto original = wrapped(kind);
+        auto expected = runtime::interpret(*original, tables);
+        REQUIRE(expected.has_value());
+        auto optimized =
+            ir::push_filters_into_joins(ir::canonicalize(wrapped(kind)), test_sources());
+        const auto* current = optimized.get();
+        while (current->kind() != ir::NodeKind::Join) {
+            REQUIRE(current->children().size() == 1);
+            current = current->children().front().get();
+        }
+        const auto left_kind = current->children()[0]->kind();
+        const auto right_kind = current->children()[1]->kind();
+        if (kind == ir::JoinKind::Inner) {
+            CHECK(left_kind == ir::NodeKind::Filter);
+            CHECK(right_kind == ir::NodeKind::Filter);
+        } else if (kind == ir::JoinKind::Left) {
+            CHECK(left_kind == ir::NodeKind::Filter);
+            CHECK(right_kind == ir::NodeKind::Scan);
+        } else if (kind == ir::JoinKind::Right) {
+            CHECK(left_kind == ir::NodeKind::Scan);
+            CHECK(right_kind == ir::NodeKind::Filter);
+        } else {
+            CHECK(left_kind == ir::NodeKind::Scan);
+            CHECK(right_kind == ir::NodeKind::Scan);
+        }
+        auto actual = runtime::interpret(*optimized, tables);
+        REQUIRE(actual.has_value());
+        // Pushdown can remove rows which required an outer-join null mask.
+        // An absent mask and an all-valid mask have identical logical values.
+        // Keep partial masks, including the retained null payload, intact.
+        for (auto* table : {&*expected, &*actual}) {
+            for (auto& column : table->columns) {
+                if (column.validity.has_value()) {
+                    bool all_valid = true;
+                    for (std::size_t row = 0; row < table->rows(); ++row) {
+                        all_valid = all_valid && (*column.validity)[row];
+                    }
+                    if (all_valid) {
+                        column.validity.reset();
+                    }
+                }
+            }
+        }
+        const auto mismatch = runtime::compare_tables(*expected, *actual);
+        CAPTURE(static_cast<int>(kind));
+        INFO((mismatch.has_value() ? mismatch->message() : "tables match"));
+        CHECK_FALSE(mismatch.has_value());
+        CHECK(actual->rows() == 2);
+    }
 }

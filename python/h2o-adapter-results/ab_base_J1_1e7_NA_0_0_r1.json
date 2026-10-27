@@ -1,0 +1,111 @@
+{
+  "data": "J1_1e7_NA_0_0",
+  "threads": "8",
+  "queries": {
+    "q1": {
+      "desc": "small inner on int",
+      "prepare_ms": 28607.387776995893,
+      "native": "((_ibex_input[select { `_ibex_join_0_l_0` = `id1`, `_ibex_join_0_l_1` = `id2`, `_ibex_join_0_l_2` = `id3`, `_ibex_join_0_l_3` = `id4`, `_ibex_join_0_l_4` = `id5`, `_ibex_join_0_l_5` = `id6`, `_ibex_join_0_l_6` = `v1` }]) join (_ibex_join_0_input[select { `_ibex_join_0_r_0` = `id1`, `_ibex_join_0_r_1` = `id4`, `_ibex_join_0_r_2` = `v2` }]) on { `_ibex_join_0_l_0` = `_ibex_join_0_r_0` })[select { `id1` = `_ibex_join_0_l_0`, `id2` = `_ibex_join_0_l_1`, `id3` = `_ibex_join_0_l_2`, `id4` = `_ibex_join_0_l_3`, `id5` = `_ibex_join_0_l_4`, `id6` = `_ibex_join_0_l_5`, `v1` = `_ibex_join_0_l_6`, `id4_right` = `_ibex_join_0_r_1`, `v2` = `_ibex_join_0_r_2` }];",
+      "check": "ok",
+      "polars_ms": 41.65304500202183,
+      "ibex_ms": 1250.6117610028014,
+      "polars_all": [
+        48.1581899948651,
+        47.76719099027105,
+        41.65304500202183,
+        43.079266004497185
+      ],
+      "ibex_all": [
+        1350.7117419940187,
+        1271.420577992103,
+        1250.6117610028014,
+        1258.7032209994504
+      ],
+      "ratio": 30.024497871454464
+    },
+    "q2": {
+      "desc": "medium inner on int",
+      "prepare_ms": 28362.72461700719,
+      "native": "((_ibex_input[select { `_ibex_join_0_l_0` = `id1`, `_ibex_join_0_l_1` = `id2`, `_ibex_join_0_l_2` = `id3`, `_ibex_join_0_l_3` = `id4`, `_ibex_join_0_l_4` = `id5`, `_ibex_join_0_l_5` = `id6`, `_ibex_join_0_l_6` = `v1` }]) join (_ibex_join_0_input[select { `_ibex_join_0_r_0` = `id1`, `_ibex_join_0_r_1` = `id2`, `_ibex_join_0_r_2` = `id4`, `_ibex_join_0_r_3` = `id5`, `_ibex_join_0_r_4` = `v2` }]) on { `_ibex_join_0_l_1` = `_ibex_join_0_r_1` })[select { `id1` = `_ibex_join_0_l_0`, `id2` = `_ibex_join_0_l_1`, `id3` = `_ibex_join_0_l_2`, `id4` = `_ibex_join_0_l_3`, `id5` = `_ibex_join_0_l_4`, `id6` = `_ibex_join_0_l_5`, `v1` = `_ibex_join_0_l_6`, `id1_right` = `_ibex_join_0_r_0`, `id4_right` = `_ibex_join_0_r_2`, `id5_right` = `_ibex_join_0_r_3`, `v2` = `_ibex_join_0_r_4` }];",
+      "check": "ok",
+      "polars_ms": 43.322302008164115,
+      "ibex_ms": 1232.208860994433,
+      "polars_all": [
+        43.322302008164115,
+        43.771390002802946,
+        45.35609399317764,
+        44.272963001276366
+      ],
+      "ibex_all": [
+        1316.4201940089697,
+        1284.6187310060486,
+        1232.208860994433,
+        1281.1120679980377
+      ],
+      "ratio": 28.4428297638067
+    },
+    "q3": {
+      "desc": "medium outer on int",
+      "prepare_ms": 26747.419904990238,
+      "native": "((_ibex_input[select { `_ibex_join_0_l_0` = `id1`, `_ibex_join_0_l_1` = `id2`, `_ibex_join_0_l_2` = `id3`, `_ibex_join_0_l_3` = `id4`, `_ibex_join_0_l_4` = `id5`, `_ibex_join_0_l_5` = `id6`, `_ibex_join_0_l_6` = `v1` }]) left join (_ibex_join_0_input[select { `_ibex_join_0_r_0` = `id1`, `_ibex_join_0_r_1` = `id2`, `_ibex_join_0_r_2` = `id4`, `_ibex_join_0_r_3` = `id5`, `_ibex_join_0_r_4` = `v2` }]) on { `_ibex_join_0_l_1` = `_ibex_join_0_r_1` })[select { `id1` = `_ibex_join_0_l_0`, `id2` = `_ibex_join_0_l_1`, `id3` = `_ibex_join_0_l_2`, `id4` = `_ibex_join_0_l_3`, `id5` = `_ibex_join_0_l_4`, `id6` = `_ibex_join_0_l_5`, `v1` = `_ibex_join_0_l_6`, `id1_right` = `_ibex_join_0_r_0`, `id4_right` = `_ibex_join_0_r_2`, `id5_right` = `_ibex_join_0_r_3`, `v2` = `_ibex_join_0_r_4` }];",
+      "check": "ok",
+      "polars_ms": 56.80688700522296,
+      "ibex_ms": 1359.0433250064962,
+      "polars_all": [
+        58.20482199487742,
+        58.34545800462365,
+        56.80688700522296,
+        58.448926007258706
+      ],
+      "ibex_all": [
+        1367.233002994908,
+        1382.4009640084114,
+        1384.58560599247,
+        1359.0433250064962
+      ],
+      "ratio": 23.92391832493026
+    },
+    "q4": {
+      "desc": "medium inner on factor",
+      "prepare_ms": 26643.207831002655,
+      "native": "((_ibex_input[select { `_ibex_join_0_l_0` = `id1`, `_ibex_join_0_l_1` = `id2`, `_ibex_join_0_l_2` = `id3`, `_ibex_join_0_l_3` = `id4`, `_ibex_join_0_l_4` = `id5`, `_ibex_join_0_l_5` = `id6`, `_ibex_join_0_l_6` = `v1` }]) join (_ibex_join_0_input[select { `_ibex_join_0_r_0` = `id1`, `_ibex_join_0_r_1` = `id2`, `_ibex_join_0_r_2` = `id4`, `_ibex_join_0_r_3` = `id5`, `_ibex_join_0_r_4` = `v2` }]) on { `_ibex_join_0_l_4` = `_ibex_join_0_r_3` })[select { `id1` = `_ibex_join_0_l_0`, `id2` = `_ibex_join_0_l_1`, `id3` = `_ibex_join_0_l_2`, `id4` = `_ibex_join_0_l_3`, `id5` = `_ibex_join_0_l_4`, `id6` = `_ibex_join_0_l_5`, `v1` = `_ibex_join_0_l_6`, `id1_right` = `_ibex_join_0_r_0`, `id2_right` = `_ibex_join_0_r_1`, `id4_right` = `_ibex_join_0_r_2`, `v2` = `_ibex_join_0_r_4` }];",
+      "check": "ok",
+      "polars_ms": 43.73691701039206,
+      "ibex_ms": 1199.500621005427,
+      "polars_all": [
+        43.73691701039206,
+        48.98196399153676,
+        46.325190996867605,
+        43.8561080081854
+      ],
+      "ibex_all": [
+        1206.3073760073166,
+        1224.4464660034282,
+        1231.3235320034437,
+        1199.500621005427
+      ],
+      "ratio": 27.42535832419146
+    },
+    "q5": {
+      "desc": "big inner on int",
+      "prepare_ms": 55631.337986007566,
+      "native": "((_ibex_input[select { `_ibex_join_0_l_0` = `id1`, `_ibex_join_0_l_1` = `id2`, `_ibex_join_0_l_2` = `id3`, `_ibex_join_0_l_3` = `id4`, `_ibex_join_0_l_4` = `id5`, `_ibex_join_0_l_5` = `id6`, `_ibex_join_0_l_6` = `v1` }]) join (_ibex_join_0_input[select { `_ibex_join_0_r_0` = `id1`, `_ibex_join_0_r_1` = `id2`, `_ibex_join_0_r_2` = `id3`, `_ibex_join_0_r_3` = `id4`, `_ibex_join_0_r_4` = `id5`, `_ibex_join_0_r_5` = `id6`, `_ibex_join_0_r_6` = `v2` }]) on { `_ibex_join_0_l_2` = `_ibex_join_0_r_2` })[select { `id1` = `_ibex_join_0_l_0`, `id2` = `_ibex_join_0_l_1`, `id3` = `_ibex_join_0_l_2`, `id4` = `_ibex_join_0_l_3`, `id5` = `_ibex_join_0_l_4`, `id6` = `_ibex_join_0_l_5`, `v1` = `_ibex_join_0_l_6`, `id1_right` = `_ibex_join_0_r_0`, `id2_right` = `_ibex_join_0_r_1`, `id4_right` = `_ibex_join_0_r_3`, `id5_right` = `_ibex_join_0_r_4`, `id6_right` = `_ibex_join_0_r_5`, `v2` = `_ibex_join_0_r_6` }];",
+      "check": "ok",
+      "polars_ms": 224.2476829997031,
+      "ibex_ms": 3004.4473440066213,
+      "polars_all": [
+        231.13581900543068,
+        224.2476829997031,
+        231.20723200554494,
+        225.44933400058653
+      ],
+      "ibex_all": [
+        3097.241205003229,
+        3061.3414800027385,
+        3109.1384219907923,
+        3004.4473440066213
+      ],
+      "ratio": 13.397896931718126
+    }
+  }
+}

@@ -1,0 +1,285 @@
+{
+  "git_head": "11cd303cbb2035b3f9909d281a8148bf31e3cdbd",
+  "upstream_head": "401908a307f133a2dffbe3f5e0e0fb2b50ea310b",
+  "bridge_sha256": "b22add761bb5cd6dacb8613fa14c7cebc89b9bd19b3a5a7600c96f9b4d46f16e",
+  "bridge": "/tmp/ibex-pdsh-snapshot/bridge/ibex_pyarrow.cpython-314-x86_64-linux-gnu.so",
+  "polars_version": "2.0.0",
+  "ibex_cores": "1",
+  "polars_threads": 1,
+  "affinity": [
+    2
+  ],
+  "data": [
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/customer.parquet",
+      "bytes": 81366456,
+      "mtime_ns": 1792828808266811953
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/lineitem.parquet",
+      "bytes": 1801546483,
+      "mtime_ns": 1792828812385804504
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/nation.parquet",
+      "bytes": 3083,
+      "mtime_ns": 1792828814559800573
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/orders.parquet",
+      "bytes": 391488464,
+      "mtime_ns": 1792828815334799172
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/part.parquet",
+      "bytes": 41388677,
+      "mtime_ns": 1792828815922798108
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/partsupp.parquet",
+      "bytes": 295923709,
+      "mtime_ns": 1792828816386797269
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/region.parquet",
+      "bytes": 1827,
+      "mtime_ns": 1792828816660796774
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/supplier.parquet",
+      "bytes": 5208557,
+      "mtime_ns": 1792828816700796702
+    }
+  ],
+  "iterations": 6,
+  "method": "Parquet collection; prepared translation; two warmups after first collection; alternating route order; previous-result destruction excluded; no result caching",
+  "correctness": "all rows, order and dtypes; rel_tol=1e-10 abs_tol=1e-8; both Polars executors compared",
+  "cpu_frequency_khz": {
+    "scaling_min_freq": "3200000",
+    "scaling_max_freq": "3200000"
+  },
+  "ibex_decode_threads": null,
+  "queries": {
+    "q01": {
+      "upstream_source_sha256": "2cc9026fec6e49373f866bb4b44f901f7811eb0116a1d55b637a3023c88e7bed",
+      "prepare_ms": 250.325642,
+      "first_collect_ms": {
+        "polars": 12668.888992,
+        "polars_streaming": 12086.788244,
+        "polars_ibex": 14247.463053
+      },
+      "output_rows": 4,
+      "status": "passed",
+      "samples_ms": {
+        "polars": [
+          12626.633482,
+          12572.500424,
+          12712.653991,
+          15766.320652,
+          14652.128954,
+          13589.555978
+        ],
+        "polars_streaming": [
+          12139.526619,
+          7198.513858,
+          10064.430179,
+          14436.169738,
+          8245.491821,
+          9751.082383
+        ],
+        "polars_ibex": [
+          8693.933302,
+          8100.057006,
+          8970.406614,
+          9348.796937,
+          9987.04431,
+          12773.992983
+        ]
+      },
+      "median_ms": {
+        "polars": 13151.1049845,
+        "polars_streaming": 9907.756281000002,
+        "polars_ibex": 9159.6017755
+      }
+    },
+    "q02": {
+      "upstream_source_sha256": "4e2f637e2c077b98fb55529fb9c6c66ad0061108c3c8f1089f81a1aa923cd020",
+      "status": "unsupported",
+      "error": "NotImplementedError: unsupported Polars plan node Cache (node 11)"
+    },
+    "q03": {
+      "upstream_source_sha256": "92672a95b48a8eb675eba6ad600a59402d01a2a3d203a1f67f952cdedc2de8b1",
+      "status": "unsupported",
+      "error": "NotImplementedError: comparison between these types is not supported yet"
+    },
+    "q04": {
+      "upstream_source_sha256": "0f08b2d3aa354c692005e770cbeb6fe03687486ce77cda245b6790e1808d1a6d",
+      "prepare_ms": 40.614287,
+      "first_collect_ms": {
+        "polars": 3981.810949,
+        "polars_streaming": 3785.331476,
+        "polars_ibex": 3595.51154
+      },
+      "output_rows": 5,
+      "status": "passed",
+      "samples_ms": {
+        "polars": [
+          4314.951312,
+          6348.443476,
+          3809.936996,
+          3727.785143,
+          3526.379398,
+          3506.093097
+        ],
+        "polars_streaming": [
+          3378.308578,
+          2595.75093,
+          2299.045267,
+          2310.524558,
+          2638.82941,
+          2314.007479
+        ],
+        "polars_ibex": [
+          5035.547905,
+          3438.175463,
+          2729.699065,
+          2652.849168,
+          2569.22851,
+          2494.3979
+        ]
+      },
+      "median_ms": {
+        "polars": 3768.8610694999998,
+        "polars_streaming": 2454.8792045,
+        "polars_ibex": 2691.2741164999998
+      }
+    },
+    "q05": {
+      "upstream_source_sha256": "06e9a007652f9cdbe9793faea756865ef3f8a2b5f2c071ee3f452f3620d74700",
+      "status": "unsupported",
+      "error": "NotImplementedError: comparison between these types is not supported yet"
+    },
+    "q06": {
+      "upstream_source_sha256": "5a35b2610a4cc4b3feccafcec8bde0201880d2f1e9477dd793017d19d405543b",
+      "prepare_ms": 24.830142,
+      "first_collect_ms": {
+        "polars": 3893.113618,
+        "polars_streaming": 2547.821224,
+        "polars_ibex": 20572.496384
+      },
+      "output_rows": 1,
+      "status": "passed",
+      "samples_ms": {
+        "polars": [
+          1496.148985,
+          1496.719456,
+          1496.043542,
+          1494.194296,
+          1495.52168,
+          1497.545786
+        ],
+        "polars_streaming": [
+          1478.795874,
+          1474.710868,
+          1472.994765,
+          1478.785562,
+          1478.412484,
+          1476.318342
+        ],
+        "polars_ibex": [
+          9440.41501,
+          9440.530971,
+          9427.362531,
+          9443.90744,
+          9459.499008,
+          9437.08312
+        ]
+      },
+      "median_ms": {
+        "polars": 1496.0962635,
+        "polars_streaming": 1477.365413,
+        "polars_ibex": 9440.4729905
+      }
+    },
+    "q07": {
+      "upstream_source_sha256": "cc44c92f52ae28e52c1d3dfda0f66d7a3057dfe439ac54938cfbc9e81dcb475e",
+      "status": "unsupported",
+      "error": "NotImplementedError: join with a fused predicate"
+    },
+    "q08": {
+      "upstream_source_sha256": "017ec52371d5d4e934b4604b636c4ae971c735cbf6dd1ea31cbe8191fe81d6a5",
+      "status": "unsupported",
+      "error": "NotImplementedError: unsupported Polars plan node Cache (node 9)"
+    },
+    "q09": {
+      "upstream_source_sha256": "54aaff0a27c86dae14fe74e4b8262d746d417ae079a829c3663d85624d5e37b8",
+      "status": "unsupported",
+      "error": "NotImplementedError: unsupported function (StringFunction.Contains, False, True)"
+    },
+    "q10": {
+      "upstream_source_sha256": "104bde7b76875765f88c73665093a6c105290c11b56885556d603e86076120fc",
+      "status": "unsupported",
+      "error": "NotImplementedError: floating-point grouping keys are not supported yet"
+    },
+    "q11": {
+      "upstream_source_sha256": "28bbc74d68b8be1a2ce880244425cf3f59f1d45763996209facd355bb3161e45",
+      "status": "unsupported",
+      "error": "NotImplementedError: unsupported join options ('IEJoin', Operator.Gt, None)"
+    },
+    "q12": {
+      "upstream_source_sha256": "5d42a263b1b3f2ef89f8799a85b57aeb8575fcb2b1b7e0311767b86a3731a40b",
+      "status": "unsupported",
+      "error": "NotImplementedError: unsupported literal type List(String)"
+    },
+    "q13": {
+      "upstream_source_sha256": "1734e09cb01bebf788107d1753bfc732d26286f045d68d4cef96b04c746ae6e0",
+      "status": "unsupported",
+      "error": "NotImplementedError: unsupported function (StringFunction.Contains, False, True)"
+    },
+    "q14": {
+      "upstream_source_sha256": "b7bd21090dec3fc94e30b200c12a7c11010e4adbd44c91ec2a9f4848af050503",
+      "status": "unsupported",
+      "error": "NotImplementedError: unsupported Polars expression Ternary (node 37)"
+    },
+    "q15": {
+      "upstream_source_sha256": "68cb07d4a75bfb540775300f698004b1070607b7f27ae5b33a8551c72e2e3ae2",
+      "status": "unsupported",
+      "error": "NotImplementedError: unsupported aggregate max for Float64"
+    },
+    "q16": {
+      "upstream_source_sha256": "ce4a44c56fa2b79dba34fc73e286017c5cfa7698f839ce957f865eb80d7bbdd8",
+      "status": "unsupported",
+      "error": "NotImplementedError: unsupported literal type List(Int64)"
+    },
+    "q17": {
+      "upstream_source_sha256": "b12744bcb8175684884b6be5ca037800a3a3fbcaa2cb3d387d3813d45698b9b6",
+      "status": "unsupported",
+      "error": "NotImplementedError: join with a fused predicate"
+    },
+    "q18": {
+      "upstream_source_sha256": "94323643fcee16e888e700ed427fec857c60a3aa15a1a680cd04c90a2b8b2e23",
+      "status": "unsupported",
+      "error": "NotImplementedError: unsupported Polars plan node Cache (node 1)"
+    },
+    "q19": {
+      "upstream_source_sha256": "bb32570928c5f9502fd96e87ac7da588a00b396c4a2c0acbed03b2340f9837fe",
+      "status": "unsupported",
+      "error": "NotImplementedError: join with a fused predicate"
+    },
+    "q20": {
+      "upstream_source_sha256": "19165d7bcfeacf77289ef3d8b27721f834e067511e62821af04d1f0d29bc28a7",
+      "status": "unsupported",
+      "error": "NotImplementedError: join with a fused predicate"
+    },
+    "q21": {
+      "upstream_source_sha256": "5ac37db9da516a82ec322cee95d3b4745e27782f4e72b6026db744d0dce2a229",
+      "status": "unsupported",
+      "error": "NotImplementedError: unsupported Polars plan node Cache (node 9)"
+    },
+    "q22": {
+      "upstream_source_sha256": "db2bd21c39ecc82f1adf928c8b065cbc00b94a83a89d73396770d2f6ce2882a8",
+      "status": "unsupported",
+      "error": "NotImplementedError: unsupported join options ('IEJoin', Operator.Gt, None)"
+    }
+  }
+}

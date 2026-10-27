@@ -549,3 +549,31 @@ before reading a scaling curve across them.
   rebuild the AMI.
 - Spot is the default (cheapest); `--on-demand` avoids capacity-reclaim risk on
   long full-suite runs.
+
+### Publish benchmark history and permalinks
+
+`benchmarking/gen_website.py` publishes the current page at
+`docs/benchmarks.html` and automatically keeps dated copies under
+`docs/benchmark-history/<publication-id>/index.html`. Each publication includes
+its methodology/code page and stylesheet. The history dropdown on the benchmark
+page links to these copies; use **Permalink to this publication** when citing a
+run in a blog post. Dates in the dropdown are publication dates in UTC; each
+suite still reports its own measurement date and commit.
+
+Run the generator with the usual CSV, `--h2o` and `--pdsh` inputs. It preserves
+the outgoing page before publishing the new results. Commit the updated pages
+and the entire `docs/benchmark-history/` directory together. Publication IDs
+include a content digest, so multiple publications on the same day remain
+separate and existing snapshots are never overwritten. GitHub Pages deploys
+these files with the rest of `docs/`.
+
+To seed history from an existing benchmark and methodology page without
+regenerating the measurements:
+
+```sh
+python3 benchmarking/website_history.py docs/benchmarks.html
+```
+
+History begins with the currently checked-in publication; earlier runs are not
+reconstructed from unverified result files. The viewer supports both directly opening the HTML files and serving `docs/`
+over HTTP. Commit both history index files (`index.json` and `index.js`).

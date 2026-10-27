@@ -1,0 +1,55 @@
+Previous HEAD position was 6dbaeaba Refresh default-thread join comparison after adapter fixes
+HEAD is now at 6abe2e53 Fix conformance SPDX headers and runtime formatting
+Preparing worktree (detached HEAD 54a9c347)
+Benchmarking base:   6abe2e53@6abe2e53
+Benchmarking target: 54a9c347@54a9c347
+Using warmup=1, iters=5, repeats=12, interleave=on, replica-control=off
+Compiler path prefix map: on
+Build cache: /tmp/ibex-composite-perfcmp
+Pinning: taskset -c 2
+Ibex suite: filter
+Building base ...
+  base: build dir cached, configure skipped
+Building target ...
+  target: configuring new build dir
+Interleaving repeats with balanced run positions
+  -> base repeat 1/12
+  -> target repeat 1/12
+  -> target repeat 2/12
+  -> base repeat 2/12
+  -> base repeat 3/12
+  -> target repeat 3/12
+  -> target repeat 4/12
+  -> base repeat 4/12
+  -> base repeat 5/12
+  -> target repeat 5/12
+  -> target repeat 6/12
+  -> base repeat 6/12
+  -> base repeat 7/12
+  -> target repeat 7/12
+  -> target repeat 8/12
+  -> base repeat 8/12
+  -> base repeat 9/12
+  -> target repeat 9/12
+  -> target repeat 10/12
+  -> base repeat 10/12
+  -> base repeat 11/12
+  -> target repeat 11/12
+  -> target repeat 12/12
+  -> base repeat 12/12
+
+base=6abe2e53@6abe2e53
+target=54a9c347@54a9c347
+prefix_map=on
+replica_binary=not-requested
+
+framework  query          base_ms  target_ms  delta_ms  delta_pct  speedup_x  base_iqr_ms  target_iqr_ms  verdict      base_samples  target_samples  rows   replica_delta_ms  replica_iqr_ms  replica_relation
+ibex       filter_and     0.1020   0.1020     +0.0000   +0.00%     1.000      0.0022       0.0010         noise        12            12              9868   -                 -               -
+ibex       filter_arith   0.2095   0.1920     -0.0175   -8.35%     1.091      0.0040       0.0020         improvement  12            12              67340  -                 -               -
+ibex       filter_or      0.1050   0.1055     +0.0005   +0.48%     0.995      0.0023       0.0043         noise        12            12              11712  -                 -               -
+ibex       filter_simple  0.1760   0.1585     -0.0175   -9.94%     1.110      0.0033       0.0025         improvement  12            12              49996  -                 -               -
+
+Summary (totals + medians + geometric mean speedup):
+scope  queries  total_base_ms  total_target_ms  total_delta_ms  total_delta_pct  median_base_ms  median_target_ms  median_delta_ms  median_delta_pct  median_speedup_x  geom_speedup_x  geom_samples
+ALL    4        0.5925         0.5580           -0.0345         -5.82%           0.1405          0.1320            -0.0087          -4.18%            1.046             1.048           4
+ibex   4        0.5925         0.5580           -0.0345         -5.82%           0.1405          0.1320            -0.0087          -4.18%            1.046             1.048           4

@@ -1,0 +1,195 @@
+{
+  "git_head": "69a66bad8fed3b60395ad5084caff159dbaede70",
+  "upstream_head": "401908a307f133a2dffbe3f5e0e0fb2b50ea310b",
+  "bridge_sha256": "ba9da9eaf14522f80d9d445128fbf8dc3709a652a8e112c9660aae5c2dccf397",
+  "bridge": "/home/brj/ibex/build-release/python/ibex_pyarrow.cpython-314-x86_64-linux-gnu.so",
+  "polars_version": "2.0.0",
+  "python_source_sha256": {
+    "python/ibex_polars/_adapter.py": "c41dc72c02519ef493ee8097df55e5efc3e3d3043cb98bdf33cac87687dec76a",
+    "python/ibex_polars/_engine.py": "d9f37b5db319523a93838fde1073f02474c740ac300f986390af29e74606e033",
+    "python/ibex/_lower.py": "8bd6298d245ee383809c9b9846989b61137ea1aeb732b762bcf46014f8eae260",
+    "python/bench_pdsh_engine.py": "9c6fceb1ebf501d906b650525a51692d585213543c1ab575af267e4c770840cb"
+  },
+  "native_worktree_patch": "",
+  "ibex_cores": "8",
+  "polars_threads": 8,
+  "affinity": [
+    0,
+    2,
+    4,
+    6,
+    8,
+    10,
+    12,
+    14
+  ],
+  "data": [
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/customer.parquet",
+      "bytes": 81366456,
+      "mtime_ns": 1792828808266811953
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/lineitem.parquet",
+      "bytes": 1801546483,
+      "mtime_ns": 1792828812385804504
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/nation.parquet",
+      "bytes": 3083,
+      "mtime_ns": 1792828814559800573
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/orders.parquet",
+      "bytes": 391488464,
+      "mtime_ns": 1792828815334799172
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/part.parquet",
+      "bytes": 41388677,
+      "mtime_ns": 1792828815922798108
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/partsupp.parquet",
+      "bytes": 295923709,
+      "mtime_ns": 1792828816386797269
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/region.parquet",
+      "bytes": 1827,
+      "mtime_ns": 1792828816660796774
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/supplier.parquet",
+      "bytes": 5208557,
+      "mtime_ns": 1792828816700796702
+    }
+  ],
+  "iterations": 12,
+  "check_only": false,
+  "query_numbers": [
+    15
+  ],
+  "method": "Parquet collection; prepared translation; two warmups after first collection; alternating route order; previous-result destruction excluded; no result caching",
+  "correctness": "all rows, order and dtypes; rel_tol=1e-10 abs_tol=1e-8; both Polars executors compared",
+  "cpu_frequency_khz": {
+    "scaling_min_freq": "3200000",
+    "scaling_max_freq": "3200000"
+  },
+  "ibex_decode_threads": null,
+  "ibex_stream_scan": null,
+  "ibex_join_probe": null,
+  "cpu_timing": "process_time_ns over collection; sums all threads; excludes correctness checks",
+  "queries": {
+    "q15": {
+      "upstream_source_sha256": "68cb07d4a75bfb540775300f698004b1070607b7f27ae5b33a8551c72e2e3ae2",
+      "prepare_ms": 165.549898,
+      "native_source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\nlet _ibex_filter_input_2 = ((parquet::read(^_ibex_scalar_0)[select { `s_suppkey` = `s_suppkey`, `s_name` = `s_name`, `s_address` = `s_address`, `s_phone` = `s_phone` }][select { `_ibex_join_0_l_0` = `s_suppkey`, `_ibex_join_0_l_1` = `s_name`, `_ibex_join_0_l_2` = `s_address`, `_ibex_join_0_l_3` = `s_phone` }]) join (parquet::read(^_ibex_scalar_1)[filter (((`l_shipdate` >= ^_ibex_scalar_2) && (`l_shipdate` < ^_ibex_scalar_3)))][select { `l_suppkey` = `l_suppkey`, `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount`, `l_shipdate` = `l_shipdate` }][select { `l_suppkey` = `l_suppkey`, `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount` }][select { `l_suppkey`, `total_revenue` = coalesce(sum((`l_extendedprice` * (^_ibex_scalar_4 - `l_discount`))), ^_ibex_scalar_5) }, by { `l_suppkey` }][select { `supplier_no` = `l_suppkey`, `total_revenue` = `total_revenue` }][select { `_ibex_join_0_r_0` = `supplier_no`, `_ibex_join_0_r_1` = `total_revenue` }]) on { `_ibex_join_0_l_0` = `_ibex_join_0_r_0` })[select { `s_suppkey` = `_ibex_join_0_l_0`, `s_name` = `_ibex_join_0_l_1`, `s_address` = `_ibex_join_0_l_2`, `s_phone` = `_ibex_join_0_l_3`, `total_revenue` = `_ibex_join_0_r_1` }];\nlet _ibex_filter_aggregate_2 = _ibex_filter_input_2[select { _ibex_filter_value_2_0 = coalesce(max(case { is_nan(`total_revenue`) => case { true => NULL, else => ^_ibex_scalar_6 }, else => `total_revenue` }), mean(`total_revenue`)) }];\nlet _ibex_filter_value_2_0 = scalar(_ibex_filter_aggregate_2, \"_ibex_filter_value_2_0\");\n_ibex_filter_input_2[filter (__ibex_nan_high_eq(`total_revenue`, ^_ibex_filter_value_2_0))][update { `total_revenue` = case { (((case { (((`total_revenue` * ^_ibex_scalar_15) > ^_ibex_scalar_16) && ((`total_revenue` * ^_ibex_scalar_17) < ^_ibex_scalar_18)) => case { Float64(round(case { (((`total_revenue` * ^_ibex_scalar_9) > ^_ibex_scalar_10) && ((`total_revenue` * ^_ibex_scalar_11) < ^_ibex_scalar_12)) => (`total_revenue` * ^_ibex_scalar_7), else => ^_ibex_scalar_8 }, Bankers)) == ^_ibex_scalar_13 => ((`total_revenue` * ^_ibex_scalar_14) * ^_ibex_scalar_13), else => Float64(round(case { (((`total_revenue` * ^_ibex_scalar_9) > ^_ibex_scalar_10) && ((`total_revenue` * ^_ibex_scalar_11) < ^_ibex_scalar_12)) => (`total_revenue` * ^_ibex_scalar_7), else => ^_ibex_scalar_8 }, Bankers)) }, else => (`total_revenue` * ^_ibex_scalar_19) }) / ^_ibex_scalar_20) > -^_ibex_scalar_21) && (((case { (((`total_revenue` * ^_ibex_scalar_15) > ^_ibex_scalar_16) && ((`total_revenue` * ^_ibex_scalar_17) < ^_ibex_scalar_18)) => case { Float64(round(case { (((`total_revenue` * ^_ibex_scalar_9) > ^_ibex_scalar_10) && ((`total_revenue` * ^_ibex_scalar_11) < ^_ibex_scalar_12)) => (`total_revenue` * ^_ibex_scalar_7), else => ^_ibex_scalar_8 }, Bankers)) == ^_ibex_scalar_13 => ((`total_revenue` * ^_ibex_scalar_14) * ^_ibex_scalar_13), else => Float64(round(case { (((`total_revenue` * ^_ibex_scalar_9) > ^_ibex_scalar_10) && ((`total_revenue` * ^_ibex_scalar_11) < ^_ibex_scalar_12)) => (`total_revenue` * ^_ibex_scalar_7), else => ^_ibex_scalar_8 }, Bankers)) }, else => (`total_revenue` * ^_ibex_scalar_19) }) / ^_ibex_scalar_20) < ^_ibex_scalar_21) => ((case { (((`total_revenue` * ^_ibex_scalar_15) > ^_ibex_scalar_16) && ((`total_revenue` * ^_ibex_scalar_17) < ^_ibex_scalar_18)) => case { Float64(round(case { (((`total_revenue` * ^_ibex_scalar_9) > ^_ibex_scalar_10) && ((`total_revenue` * ^_ibex_scalar_11) < ^_ibex_scalar_12)) => (`total_revenue` * ^_ibex_scalar_7), else => ^_ibex_scalar_8 }, Bankers)) == ^_ibex_scalar_13 => ((`total_revenue` * ^_ibex_scalar_14) * ^_ibex_scalar_13), else => Float64(round(case { (((`total_revenue` * ^_ibex_scalar_9) > ^_ibex_scalar_10) && ((`total_revenue` * ^_ibex_scalar_11) < ^_ibex_scalar_12)) => (`total_revenue` * ^_ibex_scalar_7), else => ^_ibex_scalar_8 }, Bankers)) }, else => (`total_revenue` * ^_ibex_scalar_19) }) / ^_ibex_scalar_20), else => `total_revenue` } }][select { `s_suppkey` = `s_suppkey`, `s_name` = `s_name`, `s_address` = `s_address`, `s_phone` = `s_phone`, `total_revenue` = `total_revenue` }][update { `_ibex_sort_null_5_0` = is_null(`s_suppkey`) }][order { `_ibex_sort_null_5_0` desc, `s_suppkey` asc }];",
+      "first_collect_ms": {
+        "polars": 294.672921,
+        "polars_streaming": 267.559373,
+        "polars_ibex": 332.047812
+      },
+      "output_rows": 1,
+      "status": "passed",
+      "samples_ms": {
+        "polars": [
+          275.713114,
+          288.073862,
+          282.082282,
+          292.08651,
+          282.925152,
+          275.820728,
+          284.916837,
+          269.328964,
+          292.848316,
+          286.739258,
+          289.753366,
+          276.281069
+        ],
+        "polars_streaming": [
+          248.377272,
+          268.038695,
+          260.594547,
+          252.413133,
+          257.82048,
+          248.904027,
+          267.116381,
+          253.404112,
+          260.415795,
+          264.606478,
+          271.78224,
+          267.760449
+        ],
+        "polars_ibex": [
+          279.47866,
+          285.712172,
+          282.671864,
+          291.307806,
+          282.788353,
+          280.026244,
+          285.060862,
+          287.184841,
+          281.052521,
+          283.776082,
+          294.405383,
+          284.321413
+        ]
+      },
+      "median_ms": {
+        "polars": 283.9209945,
+        "polars_streaming": 260.505171,
+        "polars_ibex": 284.0487475
+      },
+      "cpu_samples_ms": {
+        "polars": [
+          1970.015588,
+          1972.481212,
+          1968.662854,
+          1973.849377,
+          1976.139002,
+          1963.847473,
+          1956.345842,
+          1974.922734,
+          1972.280803,
+          1957.823173,
+          1958.667395,
+          1960.801922
+        ],
+        "polars_streaming": [
+          1882.885942,
+          1915.390757,
+          1893.516796,
+          1889.063724,
+          1892.722886,
+          1890.866472,
+          1909.351243,
+          1909.937337,
+          1891.087063,
+          1907.343119,
+          1891.725366,
+          1899.444699
+        ],
+        "polars_ibex": [
+          1929.523152,
+          1934.277855,
+          1918.867876,
+          1932.077332,
+          1932.438145,
+          1926.868273,
+          1928.947741,
+          1925.296776,
+          1903.80212,
+          1916.091334,
+          1916.990215,
+          1934.115903
+        ]
+      },
+      "median_cpu_ms": {
+        "polars": 1969.339221,
+        "polars_streaming": 1893.1198410000002,
+        "polars_ibex": 1927.908007
+      }
+    }
+  }
+}

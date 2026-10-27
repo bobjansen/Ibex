@@ -1,0 +1,42 @@
+{
+  "method": "fresh process per executor and budget; one prepared collection each; warm file cache; no previous query in worker",
+  "query": "q18",
+  "results": {
+    "1": {
+      "streaming": {
+        "ms": 3374.435302,
+        "rows": 100,
+        "exact_result_and_dtypes_match": true
+      },
+      "in-memory": {
+        "ms": 6293.305799,
+        "rows": 100,
+        "exact_result_and_dtypes_match": true
+      },
+      "polars_ibex": {
+        "ms": 3703.961132,
+        "rows": 100,
+        "exact_result_and_dtypes_match": true
+      }
+    },
+    "8": {
+      "streaming": {
+        "ms": 530.044519,
+        "rows": 100,
+        "exact_result_and_dtypes_match": true
+      },
+      "in-memory": {
+        "ms": 1466.212241,
+        "rows": 100,
+        "exact_result_and_dtypes_match": true
+      },
+      "polars_ibex": {
+        "ms": 1363.789118,
+        "rows": 100,
+        "exact_result_and_dtypes_match": true
+      }
+    }
+  },
+  "driver_source": "import importlib,sys,json,time,subprocess,os\nfrom pathlib import Path\nif len(sys.argv)>1:\n import polars as pl\n from ibex_polars import IbexEngine\n sys.path.insert(0,'/home/brj/code/polars-benchmark')\n root=Path('/home/brj/code/polars-benchmark/data/tables/scale-10.0')\n q=importlib.import_module('queries.polars.q18').q(**{p.stem:pl.scan_parquet(p) for p in root.glob('*.parquet')})\n route=sys.argv[1];engine=IbexEngine().prepare(q) if route=='polars_ibex' else route\n start=time.perf_counter_ns();r=q.collect(engine=engine);elapsed=(time.perf_counter_ns()-start)/1e6\n print(json.dumps({'ms':elapsed,'data':r.to_dict(as_series=False),'dtypes':list(map(str,r.dtypes))},default=str))\nelse:\n out={}\n for threads,affinity in [(1,'2'),(8,'0,2,4,6,8,10,12,14')]:\n  entries={};reference=None\n  for route in ['streaming','in-memory','polars_ibex']:\n   env=os.environ.copy();env.update(IBEX_CORES=str(threads),POLARS_MAX_THREADS=str(threads),OPENBLAS_NUM_THREADS='1')\n   result=json.loads(subprocess.check_output(['taskset','-c',affinity,sys.executable,__file__,route],env=env,text=True))\n   if reference is None: reference=(result['data'],result['dtypes'])\n   else: assert (result['data'],result['dtypes'])==reference\n   entries[route]={'ms':result['ms'],'rows':len(next(iter(result['data'].values()))),'exact_result_and_dtypes_match':True}\n  out[str(threads)]=entries\n report={'method':'fresh process per executor and budget; one prepared collection each; warm file cache; no previous query in worker', 'query':'q18', 'results':out}\n Path('/tmp/pdsh-q18-fresh.json').write_text(json.dumps(report,indent=2)+'\\n');print(json.dumps(out))\n",
+  "dataset_and_bridge_metadata": "sf10-expanded-performance-eight.json"
+}

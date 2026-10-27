@@ -7,6 +7,8 @@
 # venv interpreter with the active environment's headers and libraries.
 set(IBEX_PYTHON_EXECUTABLE "" CACHE FILEPATH
     "Python interpreter used to build and test the Ibex pyarrow bridge")
+set(IBEX_POLARS_UPSTREAM_DIR "" CACHE PATH
+    "Optional unmodified Polars 2.0.0 source tree for upstream conformance tests")
 
 if(IBEX_PYTHON_EXECUTABLE)
     set(Python3_EXECUTABLE "${IBEX_PYTHON_EXECUTABLE}")
@@ -33,12 +35,15 @@ target_link_libraries(ibex_pyarrow
     PRIVATE
         Ibex::parser
         Ibex::runtime
+        Ibex::repl
         Ibex::interop
         Ibex::CompilerOptions
         Python3::Module
 )
 
+set(IBEX_PYTHON_HAS_PARQUET 0)
 if(TARGET Ibex::parquet)
+    set(IBEX_PYTHON_HAS_PARQUET 1)
     target_link_libraries(ibex_pyarrow PRIVATE Ibex::parquet)
     target_compile_definitions(ibex_pyarrow PRIVATE IBEX_HAS_PARQUET_BACKEND=1)
 
@@ -89,6 +94,85 @@ execute_process(
 )
 
 if(IBEX_BUILD_TESTS AND IBEX_PYARROW_IMPORT_RESULT EQUAL 0)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -c "import polars; assert polars.__version__ == '2.0.0'"
+        RESULT_VARIABLE IBEX_POLARS_IMPORT_RESULT
+        OUTPUT_QUIET ERROR_QUIET
+    )
+    if(IBEX_POLARS_IMPORT_RESULT EQUAL 0)
+        add_test(
+            NAME ibex_polars_engine
+            COMMAND "${CMAKE_COMMAND}" -E env
+                "PYTHONPATH=${PROJECT_BINARY_DIR}/python:${PROJECT_SOURCE_DIR}/python"
+                "IBEX_TEST_PARQUET=${IBEX_PYTHON_HAS_PARQUET}"
+                "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/python/test_ibex_polars.py"
+        )
+        add_test(
+            NAME ibex_polars_temporal
+            COMMAND "${CMAKE_COMMAND}" -E env
+                "PYTHONPATH=${PROJECT_BINARY_DIR}/python:${PROJECT_SOURCE_DIR}/python"
+                "IBEX_TEST_PARQUET=${IBEX_PYTHON_HAS_PARQUET}"
+                "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/python/test_ibex_temporal.py"
+        )
+        add_test(
+            NAME ibex_polars_first_last
+            COMMAND "${CMAKE_COMMAND}" -E env
+                "PYTHONPATH=${PROJECT_BINARY_DIR}/python:${PROJECT_SOURCE_DIR}/python"
+                "IBEX_TEST_PARQUET=${IBEX_PYTHON_HAS_PARQUET}"
+                "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/python/test_ibex_first_last.py"
+        )
+        add_test(
+            NAME ibex_polars_joins
+            COMMAND "${CMAKE_COMMAND}" -E env
+                "PYTHONPATH=${PROJECT_BINARY_DIR}/python:${PROJECT_SOURCE_DIR}/python"
+                "IBEX_TEST_PARQUET=${IBEX_PYTHON_HAS_PARQUET}"
+                "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/python/test_ibex_joins.py"
+        )
+        add_test(
+            NAME ibex_polars_slices
+            COMMAND "${CMAKE_COMMAND}" -E env
+                "PYTHONPATH=${PROJECT_BINARY_DIR}/python:${PROJECT_SOURCE_DIR}/python"
+                "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/python/test_ibex_slices.py"
+        )
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}" -c
+                "import pytest, hypothesis; assert pytest.__version__ == '9.0.3'; assert hypothesis.__version__ == '6.170.9'"
+            RESULT_VARIABLE IBEX_POLARS_TEST_DEPS_RESULT
+            OUTPUT_QUIET ERROR_QUIET
+        )
+        if(IBEX_POLARS_TEST_DEPS_RESULT EQUAL 0)
+            add_test(
+                NAME ibex_polars_conformance_harness
+                COMMAND "${CMAKE_COMMAND}" -E env
+                    "PYTHONPATH=${PROJECT_BINARY_DIR}/python:${PROJECT_SOURCE_DIR}/python"
+                    "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/python/test_polars_conformance.py"
+            )
+        endif()
+        if(IBEX_POLARS_UPSTREAM_DIR)
+            if(NOT IBEX_POLARS_TEST_DEPS_RESULT EQUAL 0)
+                message(FATAL_ERROR
+                    "Upstream conformance requires python/conformance/requirements.txt in ${Python3_EXECUTABLE}")
+            endif()
+            add_test(
+                NAME ibex_polars_upstream
+                COMMAND "${CMAKE_COMMAND}" -E env
+                    "PYTHONPATH=${PROJECT_BINARY_DIR}/python:${PROJECT_SOURCE_DIR}/python"
+                    "${Python3_EXECUTABLE}" -m conformance.run
+                    --upstream "${IBEX_POLARS_UPSTREAM_DIR}"
+                    --report-dir "${PROJECT_BINARY_DIR}/polars-conformance-results"
+            )
+            set_tests_properties(ibex_polars_upstream PROPERTIES LABELS "python;conformance" TIMEOUT 300)
+        endif()
+    elseif(IBEX_POLARS_UPSTREAM_DIR)
+        message(FATAL_ERROR "Upstream conformance requires Polars 2.0.0")
+    endif()
+    add_test(
+        NAME ibex_python_lazy
+        COMMAND "${CMAKE_COMMAND}" -E env
+            "PYTHONPATH=${PROJECT_BINARY_DIR}/python:${PROJECT_SOURCE_DIR}/python"
+            "IBEX_TEST_PARQUET=${IBEX_PYTHON_HAS_PARQUET}"
+            "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/python/test_ibex_lazy.py"
+    )
     add_test(
         NAME ibex_pyarrow_smoke
         COMMAND "${CMAKE_COMMAND}" -E env
@@ -97,6 +181,9 @@ if(IBEX_BUILD_TESTS AND IBEX_PYARROW_IMPORT_RESULT EQUAL 0)
             "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/python/test_ibex_pyarrow.py"
     )
 elseif(IBEX_BUILD_TESTS)
+    if(IBEX_POLARS_UPSTREAM_DIR)
+        message(FATAL_ERROR "Upstream conformance requires PyArrow in ${Python3_EXECUTABLE}")
+    endif()
     message(STATUS
         "Skipping ibex_pyarrow_smoke: pyarrow is not importable in ${Python3_EXECUTABLE}")
 endif()

@@ -59,6 +59,44 @@ auto ints(const runtime::Table& t, const char* name) -> const Column<std::int64_
 }
 }  // namespace
 
+TEST_CASE("categorical aggregate reads borrowed numeric columns without detaching",
+          "[aggregate][arrow][adopt]") {
+    auto doubles = std::make_shared<std::vector<double>>(std::initializer_list<double>{1, 2, 3, 4});
+    auto integers = std::make_shared<std::vector<std::int64_t>>(
+        std::initializer_list<std::int64_t>{1, 2, 3, 4});
+    runtime::Chunk chunk;
+    Column<Categorical> first;
+    Column<Categorical> second;
+    for (const auto* key : {"a", "b", "a", "b"}) {
+        first.push_back(key);
+        second.push_back("day");
+    }
+    chunk.add_column("k", std::move(first));
+    chunk.add_column("day", std::move(second));
+    chunk.add_column("d", Column<double>::from_external(doubles, doubles->data(), doubles->size()));
+    chunk.add_column(
+        "i", Column<std::int64_t>::from_external(integers, integers->data(), integers->size()));
+    const auto double_column = chunk.columns[2].column;
+    const auto integer_column = chunk.columns[3].column;
+    auto result =
+        aggregate_chunks({chunk}, {{.name = "k"}, {.name = "day"}},
+                         {{.func = ir::AggFunc::Mean, .column = {.name = "d"}, .alias = "average"},
+                          {.func = ir::AggFunc::Sum, .column = {.name = "i"}, .alias = "total"}});
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+    const auto& borrowed_double = std::get<Column<double>>(std::as_const(*double_column));
+    const auto& borrowed_int = std::get<Column<std::int64_t>>(std::as_const(*integer_column));
+    REQUIRE(borrowed_double.is_external());
+    REQUIRE(borrowed_int.is_external());
+    REQUIRE(borrowed_double.data() == doubles->data());
+    REQUIRE(borrowed_int.data() == integers->data());
+    const auto& averages = std::get<Column<double>>(*result->find("average"));
+    REQUIRE(averages[0] == 2.0);
+    REQUIRE(averages[1] == 3.0);
+    REQUIRE(ints(*result, "total")[0] == 4);
+    REQUIRE(ints(*result, "total")[1] == 6);
+}
+
 TEST_CASE("duplicate ordering keys do not imply grouping contiguity", "[aggregate][audit]") {
     runtime::Chunk c;
     c.add_column("k", Column<std::int64_t>{1, 1, 1});
@@ -467,4 +505,129 @@ TEST_CASE("global text first and last keep the first and last non-null value",
         CHECK(text("f") == "y");
         CHECK(text("l") == "w");
     }
+}
+
+TEST_CASE("null-preserving edge aggregates select rows rather than present values",
+          "[aggregate][first_null]") {
+    const bool grouped = GENERATE(false, true);
+    const bool first_valid = GENERATE(false, true);
+    const bool last_valid = GENERATE(false, true);
+    const bool empty = GENERATE(false, true);
+    runtime::Table t;
+    t.add_column("k", Column<std::int64_t>{1, 1, 1, 2, 2, 2});
+    t.add_column("i", Column<std::int64_t>{10, 20, 30, 40, 50, 60});
+    t.add_column("d", Column<double>{1, 2, 3, 4, 5, 6});
+    t.add_column("b", Column<bool>{true, false, true, false, true, false});
+    t.add_column("s", Column<std::string>{"a", "b", "c", "d", "e", "f"});
+    Column<Categorical> cat;
+    for (const auto* value : {"a", "b", "c", "d", "e", "f"}) {
+        cat.push_back(value);
+    }
+    t.add_column("c", std::move(cat));
+    t.add_column("date", Column<Date>{Date{1}, Date{2}, Date{3}, Date{4}, Date{5}, Date{6}});
+    t.add_column("ts", Column<Timestamp>{Timestamp{1}, Timestamp{2}, Timestamp{3}, Timestamp{4},
+                                         Timestamp{5}, Timestamp{6}});
+    for (std::size_t i = 1; i < t.columns.size(); ++i) {
+        auto& validity = t.columns[i].validity;
+        validity = runtime::ValidityBitmap(6, true);
+        validity->set(0, first_valid);
+        validity->set(2, last_valid);
+        // The second group is entirely null.
+        for (std::size_t row = 3; row < 6; ++row) {
+            validity->set(row, false);
+        }
+    }
+    std::string source = empty ? "t[filter k < 0]" : "t";
+    source += "[select { ";
+    if (grouped) {
+        source += "k, ";
+    }
+    for (const auto* name : {"i", "d", "b", "s", "c", "date", "ts"}) {
+        source += std::string(name) + "f = first_null(" + name + "), " + name + "l = last_null(" +
+                  name + "), ";
+    }
+    source += grouped ? "}, by k];" : "}];";
+    auto parsed = parser::parse(source);
+    REQUIRE(parsed.has_value());
+    auto lowered = parser::lower(*parsed);
+    REQUIRE(lowered.has_value());
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+    auto result = runtime::interpret(**lowered, registry);
+    INFO((result.has_value() ? "" : result.error()));
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == (grouped ? (empty ? 0 : 2) : 1));
+    for (const auto* name : {"i", "d", "b", "s", "c", "date", "ts"}) {
+        const std::string f = std::string(name) + "f";
+        const std::string l = std::string(name) + "l";
+        if (result->rows() == 0) {
+            continue;
+        }
+        CHECK(runtime::is_null(*result->find_entry(f), 0) == (empty || !first_valid));
+        CHECK(runtime::is_null(*result->find_entry(l), 0) == (empty || !grouped || !last_valid));
+        if (grouped && !empty) {
+            CHECK(runtime::is_null(*result->find_entry(f), 1));
+            CHECK(runtime::is_null(*result->find_entry(l), 1));
+        }
+    }
+    if (!empty && first_valid) {
+        CHECK(ints(*result, "if")[0] == 10);
+        CHECK(std::get<Column<double>>(*result->find("df"))[0] == 1.0);
+        CHECK(std::get<Column<bool>>(*result->find("bf"))[0]);
+        CHECK(std::get<Column<std::string>>(*result->find("sf"))[0] == "a");
+        CHECK(std::get<Column<Categorical>>(*result->find("cf"))[0] == "a");
+    }
+    if (grouped && !empty && last_valid) {
+        CHECK(ints(*result, "il")[0] == 30);
+        CHECK(std::get<Column<std::string>>(*result->find("sl"))[0] == "c");
+    }
+}
+
+TEST_CASE("null-preserving aggregates compose and broadcast nulls", "[aggregate][first_null]") {
+    runtime::Table t;
+    t.add_column("k", Column<std::int64_t>{1, 1, 1});
+    t.add_column("x", Column<std::int64_t>{10, 20, 30});
+    t.columns[1].validity = runtime::ValidityBitmap(3, true);
+    t.columns[1].validity->set(0, false);
+    const auto source =
+        GENERATE("t[select { a = first_null(x) + sum(x), z = last_null(x + 1) }];",
+                 "t[update { a = first_null(x) + sum(x), z = last_null(x + 1) }, by k];");
+    auto parsed = parser::parse(source);
+    REQUIRE(parsed.has_value());
+    auto lowered = parser::lower(*parsed);
+    REQUIRE(lowered.has_value());
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+    auto result = runtime::interpret(**lowered, registry);
+    INFO((result.has_value() ? "" : result.error()));
+    REQUIRE(result.has_value());
+    for (std::size_t row = 0; row < result->rows(); ++row) {
+        CHECK(runtime::is_null(*result->find_entry("a"), row));
+        CHECK(ints(*result, "z")[row] == 31);
+    }
+}
+
+TEST_CASE("resample null-preserving edges keep bucket boundary nulls", "[aggregate][first_null]") {
+    runtime::Table t;
+    t.add_column("ts", Column<Timestamp>{Timestamp{0}, Timestamp{1}, Timestamp{10}, Timestamp{11}});
+    t.add_column("x", Column<std::int64_t>{1, 2, 3, 4});
+    t.columns[1].validity = runtime::ValidityBitmap(4, true);
+    t.columns[1].validity->set(0, false);
+    t.columns[1].validity->set(3, false);
+    t.set_properties(runtime::TableProperties::time_frame("ts"));
+    auto parsed =
+        parser::parse("t[resample 10ns, select { f = first_null(x), l = last_null(x) }];");
+    REQUIRE(parsed.has_value());
+    auto lowered = parser::lower(*parsed);
+    REQUIRE(lowered.has_value());
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+    auto result = runtime::interpret(**lowered, registry);
+    INFO((result.has_value() ? "" : result.error()));
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+    CHECK(runtime::is_null(*result->find_entry("f"), 0));
+    CHECK(ints(*result, "l")[0] == 2);
+    CHECK(ints(*result, "f")[1] == 3);
+    CHECK(runtime::is_null(*result->find_entry("l"), 1));
 }

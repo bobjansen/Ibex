@@ -1224,6 +1224,29 @@ auto resolve_string_interpolation_operand(const ir::Expr& expr, const PredicateI
     return std::nullopt;
 }
 
+/// An Int literal or a bound Int scalar (`^name`), e.g. substring bounds the
+/// Polars adapter passes as parameters. Columns of the same name shadow
+/// non-lexical refs, matching resolve_string_interpolation_operand.
+auto resolve_int_constant_operand(const ir::Expr& expr, const PredicateInput& input,
+                                  const ScalarRegistry* scalars) -> std::optional<std::int64_t> {
+    if (const auto* literal = std::get_if<ir::Literal>(&expr.node)) {
+        if (const auto* value = std::get_if<std::int64_t>(&literal->value)) {
+            return *value;
+        }
+        return std::nullopt;
+    }
+    const auto* ref = std::get_if<ir::ColumnRef>(&expr.node);
+    if (ref == nullptr || scalars == nullptr || (!ref->lexical && input.find(ref->name) != nullptr)) {
+        return std::nullopt;
+    }
+    if (const auto it = scalars->find(ref->name); it != scalars->end()) {
+        if (const auto* value = std::get_if<std::int64_t>(&it->second)) {
+            return *value;
+        }
+    }
+    return std::nullopt;
+}
+
 auto try_shared_string_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields,
                               const ScalarRegistry* scalars) -> std::optional<Chunk> {
     if (fields.size() != 1) {
@@ -1420,23 +1443,17 @@ auto make_direct_string_plan(const ir::Expr& expr, const PredicateInput& input,
             return std::nullopt;
         }
         auto source = resolve_string_interpolation_operand(*call->args[0], input, scalars);
-        const auto* start_literal = std::get_if<ir::Literal>(&call->args[1]->node);
-        const auto* start =
-            start_literal == nullptr ? nullptr : std::get_if<std::int64_t>(&start_literal->value);
-        if (!source.has_value() || start == nullptr || source->dates != nullptr ||
+        const auto start = resolve_int_constant_operand(*call->args[1], input, scalars);
+        if (!source.has_value() || !start.has_value() || source->dates != nullptr ||
             source->timestamps != nullptr) {
             return std::nullopt;
         }
         std::optional<std::int64_t> length;
         if (call->args.size() == 3) {
-            const auto* length_literal = std::get_if<ir::Literal>(&call->args[2]->node);
-            const auto* value = length_literal == nullptr
-                                    ? nullptr
-                                    : std::get_if<std::int64_t>(&length_literal->value);
-            if (value == nullptr) {
+            length = resolve_int_constant_operand(*call->args[2], input, scalars);
+            if (!length.has_value()) {
                 return std::nullopt;
             }
-            length = *value;
         }
         plan.kind = DirectStringPlan::Kind::Substring;
         plan.substring_source = *source;

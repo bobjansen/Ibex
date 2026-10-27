@@ -1,0 +1,412 @@
+{
+  "git_head": "edc4a13c52e7c810c4cd013e7e00913925f8569c",
+  "upstream_head": "401908a307f133a2dffbe3f5e0e0fb2b50ea310b",
+  "upstream_worktree_patch": "diff --git a/queries/polars/q16.py b/queries/polars/q16.py\nindex a17c87d..bb739fd 100644\n--- a/queries/polars/q16.py\n+++ b/queries/polars/q16.py\n@@ -31,7 +31,7 @@ def q(\n     return (\n         part.join(partsupp, left_on=\"p_partkey\", right_on=\"ps_partkey\")\n         .filter(pl.col(\"p_brand\") != var1)\n-        .filter(pl.col(\"p_type\").str.contains(\"MEDIUM POLISHED*\").not_())\n+        .filter(pl.col(\"p_type\").str.starts_with(\"MEDIUM POLISHED\").not_())\n         .filter(pl.col(\"p_size\").is_in([49, 14, 23, 45, 19, 3, 36, 9]))\n         .join(supplier, left_on=\"ps_suppkey\", right_on=\"s_suppkey\", how=\"anti\")\n         .group_by(\"p_brand\", \"p_type\", \"p_size\")\n",
+  "bridge_sha256": "75ec7c7c67749b2aa80bd2c4ab29ce39dc0fce972c0d4e1c136ac806703f0eb9",
+  "bridge": "/home/brj/ibex/build-release/python/ibex_pyarrow.cpython-314-x86_64-linux-gnu.so",
+  "polars_version": "2.0.0",
+  "python_source_sha256": {
+    "python/ibex_polars/_adapter.py": "b9d3a758aae8991af1ad4d0f137761fc326975ca31bf10c80066546a6bea1cb7",
+    "python/ibex_polars/_engine.py": "00565e68a39b73216fc46b32bdedb61518004a80ca9d0d513e01016f9da3858f",
+    "python/ibex/_lower.py": "ddc258f8cb96cc58cfd4c4c347275123db1016cc350e47b7dc2420f1c6875536",
+    "python/bench_pdsh_engine.py": "96e16597524ca3399c32ad53de1aefe76540220cf8fc0f73934462327f77455d"
+  },
+  "native_worktree_patch": "",
+  "ibex_cores": "1",
+  "polars_threads": 1,
+  "scale_factor": 10.0,
+  "affinity": [
+    2
+  ],
+  "data": [
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/customer.parquet",
+      "bytes": 81366456,
+      "mtime_ns": 1792828808266811953
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/lineitem.parquet",
+      "bytes": 1801546483,
+      "mtime_ns": 1792828812385804504
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/nation.parquet",
+      "bytes": 3083,
+      "mtime_ns": 1792828814559800573
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/orders.parquet",
+      "bytes": 391488464,
+      "mtime_ns": 1792828815334799172
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/part.parquet",
+      "bytes": 41388677,
+      "mtime_ns": 1792828815922798108
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/partsupp.parquet",
+      "bytes": 295923709,
+      "mtime_ns": 1792828816386797269
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/region.parquet",
+      "bytes": 1827,
+      "mtime_ns": 1792828816660796774
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/supplier.parquet",
+      "bytes": 5208557,
+      "mtime_ns": 1792828816700796702
+    }
+  ],
+  "iterations": 12,
+  "check_only": false,
+  "query_numbers": [
+    11,
+    21,
+    22
+  ],
+  "method": "Parquet collection; prepared translation; two warmups after first collection; alternating route order; previous-result destruction excluded; no result caching",
+  "correctness": "all rows, order and dtypes; Q11 permits reordering only within value-sort ties while checking descending values; rel_tol=1e-10 abs_tol=1e-8; both Polars executors compared",
+  "cpu_frequency_khz": {
+    "scaling_min_freq": "3200000",
+    "scaling_max_freq": "3200000"
+  },
+  "ibex_decode_threads": null,
+  "ibex_stream_scan": null,
+  "ibex_join_probe": null,
+  "cpu_timing": "process_time_ns over collection; sums all threads; excludes correctness checks",
+  "queries": {
+    "q11": {
+      "upstream_source_sha256": "28bbc74d68b8be1a2ce880244425cf3f59f1d45763996209facd355bb3161e45",
+      "prepare_ms": 143.410161,
+      "native_source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\n((((((parquet::read(^_ibex_scalar_0)[select { `ps_partkey` = `ps_partkey`, `ps_availqty` = `ps_availqty`, `ps_supplycost` = `ps_supplycost`, `ps_suppkey` = `ps_suppkey` }][select { `_ibex_join_0_l_0` = `ps_partkey`, `_ibex_join_0_l_1` = `ps_availqty`, `_ibex_join_0_l_2` = `ps_supplycost`, `_ibex_join_0_l_3` = `ps_suppkey` }]) join (parquet::read(^_ibex_scalar_1)[select { `s_nationkey` = `s_nationkey`, `s_suppkey` = `s_suppkey` }][select { `_ibex_join_0_r_0` = `s_nationkey`, `_ibex_join_0_r_1` = `s_suppkey` }]) on { `_ibex_join_0_l_3` = `_ibex_join_0_r_1` })[select { `ps_partkey` = `_ibex_join_0_l_0`, `ps_availqty` = `_ibex_join_0_l_1`, `ps_supplycost` = `_ibex_join_0_l_2`, `ps_suppkey` = `_ibex_join_0_l_3`, `s_nationkey` = `_ibex_join_0_r_0` }][select { `ps_partkey` = `ps_partkey`, `ps_availqty` = `ps_availqty`, `ps_supplycost` = `ps_supplycost`, `s_nationkey` = `s_nationkey` }][select { `_ibex_join_1_l_0` = `ps_partkey`, `_ibex_join_1_l_1` = `ps_availqty`, `_ibex_join_1_l_2` = `ps_supplycost`, `_ibex_join_1_l_3` = `s_nationkey` }]) join (parquet::read(^_ibex_scalar_2)[filter ((`n_name` == ^_ibex_scalar_3))][select { `n_nationkey` = `n_nationkey`, `n_name` = `n_name` }][select { `n_nationkey` = `n_nationkey` }][select { `_ibex_join_1_r_0` = `n_nationkey` }]) on { `_ibex_join_1_l_3` = `_ibex_join_1_r_0` })[select { `ps_partkey` = `_ibex_join_1_l_0`, `ps_availqty` = `_ibex_join_1_l_1`, `ps_supplycost` = `_ibex_join_1_l_2`, `s_nationkey` = `_ibex_join_1_l_3` }][select { `ps_partkey` = `ps_partkey`, `ps_supplycost` = `ps_supplycost`, `ps_availqty` = `ps_availqty` }][select { `ps_partkey`, `_ibex_round_aggregate_0` = coalesce(sum((`ps_supplycost` * Float64(`ps_availqty`))), ^_ibex_scalar_4) }, by { `ps_partkey` }][select { `ps_partkey` = `ps_partkey`, `value` = case { (((case { (((`_ibex_round_aggregate_0` * ^_ibex_scalar_13) > ^_ibex_scalar_14) && ((`_ibex_round_aggregate_0` * ^_ibex_scalar_15) < ^_ibex_scalar_16)) => case { Float64(round(case { (((`_ibex_round_aggregate_0` * ^_ibex_scalar_7) > ^_ibex_scalar_8) && ((`_ibex_round_aggregate_0` * ^_ibex_scalar_9) < ^_ibex_scalar_10)) => (`_ibex_round_aggregate_0` * ^_ibex_scalar_5), else => ^_ibex_scalar_6 }, Bankers)) == ^_ibex_scalar_11 => ((`_ibex_round_aggregate_0` * ^_ibex_scalar_12) * ^_ibex_scalar_11), else => Float64(round(case { (((`_ibex_round_aggregate_0` * ^_ibex_scalar_7) > ^_ibex_scalar_8) && ((`_ibex_round_aggregate_0` * ^_ibex_scalar_9) < ^_ibex_scalar_10)) => (`_ibex_round_aggregate_0` * ^_ibex_scalar_5), else => ^_ibex_scalar_6 }, Bankers)) }, else => (`_ibex_round_aggregate_0` * ^_ibex_scalar_17) }) / ^_ibex_scalar_18) > -^_ibex_scalar_19) && (((case { (((`_ibex_round_aggregate_0` * ^_ibex_scalar_13) > ^_ibex_scalar_14) && ((`_ibex_round_aggregate_0` * ^_ibex_scalar_15) < ^_ibex_scalar_16)) => case { Float64(round(case { (((`_ibex_round_aggregate_0` * ^_ibex_scalar_7) > ^_ibex_scalar_8) && ((`_ibex_round_aggregate_0` * ^_ibex_scalar_9) < ^_ibex_scalar_10)) => (`_ibex_round_aggregate_0` * ^_ibex_scalar_5), else => ^_ibex_scalar_6 }, Bankers)) == ^_ibex_scalar_11 => ((`_ibex_round_aggregate_0` * ^_ibex_scalar_12) * ^_ibex_scalar_11), else => Float64(round(case { (((`_ibex_round_aggregate_0` * ^_ibex_scalar_7) > ^_ibex_scalar_8) && ((`_ibex_round_aggregate_0` * ^_ibex_scalar_9) < ^_ibex_scalar_10)) => (`_ibex_round_aggregate_0` * ^_ibex_scalar_5), else => ^_ibex_scalar_6 }, Bankers)) }, else => (`_ibex_round_aggregate_0` * ^_ibex_scalar_17) }) / ^_ibex_scalar_18) < ^_ibex_scalar_19) => ((case { (((`_ibex_round_aggregate_0` * ^_ibex_scalar_13) > ^_ibex_scalar_14) && ((`_ibex_round_aggregate_0` * ^_ibex_scalar_15) < ^_ibex_scalar_16)) => case { Float64(round(case { (((`_ibex_round_aggregate_0` * ^_ibex_scalar_7) > ^_ibex_scalar_8) && ((`_ibex_round_aggregate_0` * ^_ibex_scalar_9) < ^_ibex_scalar_10)) => (`_ibex_round_aggregate_0` * ^_ibex_scalar_5), else => ^_ibex_scalar_6 }, Bankers)) == ^_ibex_scalar_11 => ((`_ibex_round_aggregate_0` * ^_ibex_scalar_12) * ^_ibex_scalar_11), else => Float64(round(case { (((`_ibex_round_aggregate_0` * ^_ibex_scalar_7) > ^_ibex_scalar_8) && ((`_ibex_round_aggregate_0` * ^_ibex_scalar_9) < ^_ibex_scalar_10)) => (`_ibex_round_aggregate_0` * ^_ibex_scalar_5), else => ^_ibex_scalar_6 }, Bankers)) }, else => (`_ibex_round_aggregate_0` * ^_ibex_scalar_17) }) / ^_ibex_scalar_18), else => `_ibex_round_aggregate_0` } }][select { `_ibex_join_2_l_0` = `ps_partkey`, `_ibex_join_2_l_1` = `value` }]) cross join (((((parquet::read(^_ibex_scalar_20)[select { `ps_partkey` = `ps_partkey`, `ps_availqty` = `ps_availqty`, `ps_supplycost` = `ps_supplycost`, `ps_suppkey` = `ps_suppkey` }][select { `_ibex_join_3_l_0` = `ps_partkey`, `_ibex_join_3_l_1` = `ps_availqty`, `_ibex_join_3_l_2` = `ps_supplycost`, `_ibex_join_3_l_3` = `ps_suppkey` }]) join (parquet::read(^_ibex_scalar_21)[select { `s_nationkey` = `s_nationkey`, `s_suppkey` = `s_suppkey` }][select { `_ibex_join_3_r_0` = `s_nationkey`, `_ibex_join_3_r_1` = `s_suppkey` }]) on { `_ibex_join_3_l_3` = `_ibex_join_3_r_1` })[select { `ps_partkey` = `_ibex_join_3_l_0`, `ps_availqty` = `_ibex_join_3_l_1`, `ps_supplycost` = `_ibex_join_3_l_2`, `ps_suppkey` = `_ibex_join_3_l_3`, `s_nationkey` = `_ibex_join_3_r_0` }][select { `ps_partkey` = `ps_partkey`, `ps_availqty` = `ps_availqty`, `ps_supplycost` = `ps_supplycost`, `s_nationkey` = `s_nationkey` }][select { `_ibex_join_4_l_0` = `ps_partkey`, `_ibex_join_4_l_1` = `ps_availqty`, `_ibex_join_4_l_2` = `ps_supplycost`, `_ibex_join_4_l_3` = `s_nationkey` }]) join (parquet::read(^_ibex_scalar_22)[filter ((`n_name` == ^_ibex_scalar_23))][select { `n_nationkey` = `n_nationkey`, `n_name` = `n_name` }][select { `n_nationkey` = `n_nationkey` }][select { `_ibex_join_4_r_0` = `n_nationkey` }]) on { `_ibex_join_4_l_3` = `_ibex_join_4_r_0` })[select { `ps_partkey` = `_ibex_join_4_l_0`, `ps_availqty` = `_ibex_join_4_l_1`, `ps_supplycost` = `_ibex_join_4_l_2`, `s_nationkey` = `_ibex_join_4_l_3` }][select { `ps_partkey` = `ps_partkey`, `ps_supplycost` = `ps_supplycost`, `ps_availqty` = `ps_availqty` }][select { `ps_supplycost` = `ps_supplycost`, `ps_availqty` = `ps_availqty` }][select { `_ibex_round_aggregate_0` = coalesce(sum((`ps_supplycost` * Float64(`ps_availqty`))), ^_ibex_scalar_24) }][select { `tmp` = (case { (((case { (((`_ibex_round_aggregate_0` * ^_ibex_scalar_33) > ^_ibex_scalar_34) && ((`_ibex_round_aggregate_0` * ^_ibex_scalar_35) < ^_ibex_scalar_36)) => case { Float64(round(case { (((`_ibex_round_aggregate_0` * ^_ibex_scalar_27) > ^_ibex_scalar_28) && ((`_ibex_round_aggregate_0` * ^_ibex_scalar_29) < ^_ibex_scalar_30)) => (`_ibex_round_aggregate_0` * ^_ibex_scalar_25), else => ^_ibex_scalar_26 }, Bankers)) == ^_ibex_scalar_31 => ((`_ibex_round_aggregate_0` * ^_ibex_scalar_32) * ^_ibex_scalar_31), else => Float64(round(case { (((`_ibex_round_aggregate_0` * ^_ibex_scalar_27) > ^_ibex_scalar_28) && ((`_ibex_round_aggregate_0` * ^_ibex_scalar_29) < ^_ibex_scalar_30)) => (`_ibex_round_aggregate_0` * ^_ibex_scalar_25), else => ^_ibex_scalar_26 }, Bankers)) }, else => (`_ibex_round_aggregate_0` * ^_ibex_scalar_37) }) / ^_ibex_scalar_38) > -^_ibex_scalar_39) && (((case { (((`_ibex_round_aggregate_0` * ^_ibex_scalar_33) > ^_ibex_scalar_34) && ((`_ibex_round_aggregate_0` * ^_ibex_scalar_35) < ^_ibex_scalar_36)) => case { Float64(round(case { (((`_ibex_round_aggregate_0` * ^_ibex_scalar_27) > ^_ibex_scalar_28) && ((`_ibex_round_aggregate_0` * ^_ibex_scalar_29) < ^_ibex_scalar_30)) => (`_ibex_round_aggregate_0` * ^_ibex_scalar_25), else => ^_ibex_scalar_26 }, Bankers)) == ^_ibex_scalar_31 => ((`_ibex_round_aggregate_0` * ^_ibex_scalar_32) * ^_ibex_scalar_31), else => Float64(round(case { (((`_ibex_round_aggregate_0` * ^_ibex_scalar_27) > ^_ibex_scalar_28) && ((`_ibex_round_aggregate_0` * ^_ibex_scalar_29) < ^_ibex_scalar_30)) => (`_ibex_round_aggregate_0` * ^_ibex_scalar_25), else => ^_ibex_scalar_26 }, Bankers)) }, else => (`_ibex_round_aggregate_0` * ^_ibex_scalar_37) }) / ^_ibex_scalar_38) < ^_ibex_scalar_39) => ((case { (((`_ibex_round_aggregate_0` * ^_ibex_scalar_33) > ^_ibex_scalar_34) && ((`_ibex_round_aggregate_0` * ^_ibex_scalar_35) < ^_ibex_scalar_36)) => case { Float64(round(case { (((`_ibex_round_aggregate_0` * ^_ibex_scalar_27) > ^_ibex_scalar_28) && ((`_ibex_round_aggregate_0` * ^_ibex_scalar_29) < ^_ibex_scalar_30)) => (`_ibex_round_aggregate_0` * ^_ibex_scalar_25), else => ^_ibex_scalar_26 }, Bankers)) == ^_ibex_scalar_31 => ((`_ibex_round_aggregate_0` * ^_ibex_scalar_32) * ^_ibex_scalar_31), else => Float64(round(case { (((`_ibex_round_aggregate_0` * ^_ibex_scalar_27) > ^_ibex_scalar_28) && ((`_ibex_round_aggregate_0` * ^_ibex_scalar_29) < ^_ibex_scalar_30)) => (`_ibex_round_aggregate_0` * ^_ibex_scalar_25), else => ^_ibex_scalar_26 }, Bankers)) }, else => (`_ibex_round_aggregate_0` * ^_ibex_scalar_37) }) / ^_ibex_scalar_38), else => `_ibex_round_aggregate_0` } * ^_ibex_scalar_40) }][select { `_ibex_join_2_r_0` = `tmp` }]))[select { `ps_partkey` = `_ibex_join_2_l_0`, `value` = `_ibex_join_2_l_1`, `tmp` = `_ibex_join_2_r_0` }][filter (__ibex_nan_high_gt(`value`, `tmp`))][select { `ps_partkey` = `ps_partkey`, `value` = `value` }][update { `_ibex_sort_null_10_0` = is_null(`value`), `_ibex_sort_nan_10_0` = is_nan(`value`) }][order { `_ibex_sort_null_10_0` desc, `_ibex_sort_nan_10_0` desc, `value` desc }];",
+      "first_collect_ms": {
+        "polars": 796.567084,
+        "polars_streaming": 405.276307,
+        "polars_ibex": 838.327591
+      },
+      "output_rows": 8685,
+      "status": "passed",
+      "samples_ms": {
+        "polars": [
+          805.129682,
+          801.453417,
+          776.191239,
+          792.855536,
+          759.689364,
+          777.850536,
+          679.921368,
+          792.665301,
+          762.482292,
+          784.297473,
+          800.370086,
+          766.061483
+        ],
+        "polars_streaming": [
+          407.27413,
+          431.579405,
+          411.064096,
+          430.457455,
+          409.150849,
+          431.699112,
+          428.572502,
+          421.143782,
+          400.851016,
+          419.214575,
+          402.46428,
+          432.792627
+        ],
+        "polars_ibex": [
+          820.323222,
+          807.177792,
+          821.695552,
+          785.251168,
+          819.493952,
+          815.443308,
+          794.564032,
+          829.821161,
+          833.234812,
+          781.764885,
+          829.644561,
+          820.606036
+        ]
+      },
+      "median_ms": {
+        "polars": 781.0740045,
+        "polars_streaming": 420.17917850000003,
+        "polars_ibex": 819.908587
+      },
+      "cpu_samples_ms": {
+        "polars": [
+          805.053521,
+          801.378228,
+          776.103106,
+          792.811162,
+          759.600025,
+          777.790545,
+          679.774076,
+          792.564937,
+          762.360253,
+          784.250154,
+          800.257104,
+          766.016481
+        ],
+        "polars_streaming": [
+          407.212536,
+          431.554346,
+          410.763204,
+          430.150197,
+          409.133225,
+          431.639681,
+          428.529361,
+          421.1141,
+          400.796264,
+          419.168693,
+          402.404768,
+          432.597869
+        ],
+        "polars_ibex": [
+          820.267778,
+          807.091554,
+          821.648059,
+          784.963235,
+          819.389174,
+          815.222656,
+          794.20857,
+          829.495351,
+          833.164072,
+          781.302254,
+          829.541671,
+          820.451819
+        ]
+      },
+      "median_cpu_ms": {
+        "polars": 781.0203495,
+        "polars_streaming": 420.14139650000004,
+        "polars_ibex": 819.828476
+      }
+    },
+    "q21": {
+      "upstream_source_sha256": "5ac37db9da516a82ec322cee95d3b4745e27782f4e72b6026db744d0dce2a229",
+      "prepare_ms": 175.606843,
+      "native_source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\n((((((((parquet::read(^_ibex_scalar_0)[filter ((`l_receiptdate` > `l_commitdate`))][select { `l_orderkey` = `l_orderkey`, `l_suppkey` = `l_suppkey`, `l_receiptdate` = `l_receiptdate`, `l_commitdate` = `l_commitdate` }][select { `l_orderkey` = `l_orderkey`, `l_suppkey` = `l_suppkey` }][select { `_ibex_join_0_l_0` = `l_orderkey`, `_ibex_join_0_l_1` = `l_suppkey` }]) join (parquet::read(^_ibex_scalar_1)[select { `s_name` = `s_name`, `s_nationkey` = `s_nationkey`, `s_suppkey` = `s_suppkey` }][select { `_ibex_join_0_r_0` = `s_name`, `_ibex_join_0_r_1` = `s_nationkey`, `_ibex_join_0_r_2` = `s_suppkey` }]) on { `_ibex_join_0_l_1` = `_ibex_join_0_r_2` })[select { `l_orderkey` = `_ibex_join_0_l_0`, `l_suppkey` = `_ibex_join_0_l_1`, `s_name` = `_ibex_join_0_r_0`, `s_nationkey` = `_ibex_join_0_r_1` }][select { `l_orderkey` = `l_orderkey`, `s_name` = `s_name`, `s_nationkey` = `s_nationkey` }][select { `_ibex_join_1_l_0` = `l_orderkey`, `_ibex_join_1_l_1` = `s_name`, `_ibex_join_1_l_2` = `s_nationkey` }]) join (parquet::read(^_ibex_scalar_2)[filter ((`n_name` == ^_ibex_scalar_3))][select { `n_nationkey` = `n_nationkey`, `n_name` = `n_name` }][select { `n_nationkey` = `n_nationkey` }][select { `_ibex_join_1_r_0` = `n_nationkey` }]) on { `_ibex_join_1_l_2` = `_ibex_join_1_r_0` })[select { `l_orderkey` = `_ibex_join_1_l_0`, `s_name` = `_ibex_join_1_l_1`, `s_nationkey` = `_ibex_join_1_l_2` }][select { `l_orderkey` = `l_orderkey`, `s_name` = `s_name` }][select { `_ibex_join_2_l_0` = `l_orderkey`, `_ibex_join_2_l_1` = `s_name` }]) semi join (parquet::read(^_ibex_scalar_4)[filter ((`o_orderstatus` == ^_ibex_scalar_5))][select { `o_orderkey` = `o_orderkey`, `o_orderstatus` = `o_orderstatus` }][select { `o_orderkey` = `o_orderkey` }][select { `_ibex_join_2_r_0` = `o_orderkey` }]) on { `_ibex_join_2_l_0` = `_ibex_join_2_r_0` })[select { `l_orderkey` = `_ibex_join_2_l_0`, `s_name` = `_ibex_join_2_l_1` }][select { `s_name` = `s_name`, `l_orderkey` = `l_orderkey` }][select { `_ibex_join_3_l_0` = `s_name`, `_ibex_join_3_l_1` = `l_orderkey` }]) join (((parquet::read(^_ibex_scalar_6)[select { `l_orderkey` = `l_orderkey`, `l_suppkey` = `l_suppkey`, `l_commitdate` = `l_commitdate`, `l_receiptdate` = `l_receiptdate` }][select { `_ibex_join_4_l_0` = `l_orderkey`, `_ibex_join_4_l_1` = `l_suppkey`, `_ibex_join_4_l_2` = `l_commitdate`, `_ibex_join_4_l_3` = `l_receiptdate` }]) semi join (((((((parquet::read(^_ibex_scalar_7)[filter ((`l_receiptdate` > `l_commitdate`))][select { `l_orderkey` = `l_orderkey`, `l_suppkey` = `l_suppkey`, `l_receiptdate` = `l_receiptdate`, `l_commitdate` = `l_commitdate` }][select { `l_orderkey` = `l_orderkey`, `l_suppkey` = `l_suppkey` }][select { `_ibex_join_5_l_0` = `l_orderkey`, `_ibex_join_5_l_1` = `l_suppkey` }]) join (parquet::read(^_ibex_scalar_8)[select { `s_name` = `s_name`, `s_nationkey` = `s_nationkey`, `s_suppkey` = `s_suppkey` }][select { `_ibex_join_5_r_0` = `s_name`, `_ibex_join_5_r_1` = `s_nationkey`, `_ibex_join_5_r_2` = `s_suppkey` }]) on { `_ibex_join_5_l_1` = `_ibex_join_5_r_2` })[select { `l_orderkey` = `_ibex_join_5_l_0`, `l_suppkey` = `_ibex_join_5_l_1`, `s_name` = `_ibex_join_5_r_0`, `s_nationkey` = `_ibex_join_5_r_1` }][select { `l_orderkey` = `l_orderkey`, `s_name` = `s_name`, `s_nationkey` = `s_nationkey` }][select { `_ibex_join_6_l_0` = `l_orderkey`, `_ibex_join_6_l_1` = `s_name`, `_ibex_join_6_l_2` = `s_nationkey` }]) join (parquet::read(^_ibex_scalar_9)[filter ((`n_name` == ^_ibex_scalar_10))][select { `n_nationkey` = `n_nationkey`, `n_name` = `n_name` }][select { `n_nationkey` = `n_nationkey` }][select { `_ibex_join_6_r_0` = `n_nationkey` }]) on { `_ibex_join_6_l_2` = `_ibex_join_6_r_0` })[select { `l_orderkey` = `_ibex_join_6_l_0`, `s_name` = `_ibex_join_6_l_1`, `s_nationkey` = `_ibex_join_6_l_2` }][select { `l_orderkey` = `l_orderkey`, `s_name` = `s_name` }][select { `_ibex_join_7_l_0` = `l_orderkey`, `_ibex_join_7_l_1` = `s_name` }]) semi join (parquet::read(^_ibex_scalar_11)[filter ((`o_orderstatus` == ^_ibex_scalar_12))][select { `o_orderkey` = `o_orderkey`, `o_orderstatus` = `o_orderstatus` }][select { `o_orderkey` = `o_orderkey` }][select { `_ibex_join_7_r_0` = `o_orderkey` }]) on { `_ibex_join_7_l_0` = `_ibex_join_7_r_0` })[select { `l_orderkey` = `_ibex_join_7_l_0`, `s_name` = `_ibex_join_7_l_1` }][select { `s_name` = `s_name`, `l_orderkey` = `l_orderkey` }][select { `l_orderkey` = `l_orderkey` }][select { `_ibex_join_4_r_0` = `l_orderkey` }]) on { `_ibex_join_4_l_0` = `_ibex_join_4_r_0` })[select { `l_orderkey` = `_ibex_join_4_l_0`, `l_suppkey` = `_ibex_join_4_l_1`, `l_commitdate` = `_ibex_join_4_l_2`, `l_receiptdate` = `_ibex_join_4_l_3` }][select { `l_orderkey` = `l_orderkey`, `l_suppkey` = `l_suppkey`, `l_receiptdate` = `l_receiptdate`, `l_commitdate` = `l_commitdate` }][select { `l_orderkey`, `n_supp` = (count_distinct(`l_suppkey`) + coalesce(max(Int64(is_null(`l_suppkey`))), ^_ibex_scalar_13)), `n_late_supp` = (count_distinct(case { (`l_receiptdate` > `l_commitdate`) => `l_suppkey`, else => NULL }) + coalesce(max(case { (`l_receiptdate` > `l_commitdate`) => Int64(is_null(`l_suppkey`)), else => 0 }), ^_ibex_scalar_14)) }, by { `l_orderkey` }][select { `l_orderkey` = `l_orderkey`, `n_late_supp` = `n_late_supp`, `n_supp` = `n_supp` }][filter (((`n_late_supp` == ^_ibex_scalar_15) && (`n_supp` > ^_ibex_scalar_16)))][select { `l_orderkey` = `l_orderkey` }][select { `_ibex_join_3_r_0` = `l_orderkey` }]) on { `_ibex_join_3_l_1` = `_ibex_join_3_r_0` })[select { `s_name` = `_ibex_join_3_l_0`, `l_orderkey` = `_ibex_join_3_l_1` }][select { `s_name` = `s_name` }][select { `s_name`, `numwait` = count() }, by { `s_name` }][update { `_ibex_sort_null_12_0` = is_null(`numwait`), `_ibex_sort_null_12_1` = is_null(`s_name`) }][order { `_ibex_sort_null_12_0` desc, `numwait` desc, `_ibex_sort_null_12_1` desc, `s_name` asc }][update { `_ibex_slice_row_13` = seq() }][filter `_ibex_slice_row_13` >= 0 && `_ibex_slice_row_13` < 100][select { `s_name`, `numwait` }];",
+      "first_collect_ms": {
+        "polars": 6386.041966,
+        "polars_streaming": 4728.524103,
+        "polars_ibex": 6741.366242
+      },
+      "output_rows": 100,
+      "status": "passed",
+      "samples_ms": {
+        "polars": [
+          6358.652417,
+          6326.697064,
+          6330.567962,
+          6404.07877,
+          6344.832953,
+          6399.43005,
+          6347.88526,
+          6333.074983,
+          6359.608272,
+          6307.765831,
+          6354.054997,
+          6372.479306
+        ],
+        "polars_streaming": [
+          4687.451963,
+          4624.272393,
+          4651.363225,
+          4618.746929,
+          4733.586213,
+          4629.801479,
+          4692.710464,
+          4696.733912,
+          4646.429812,
+          4673.139962,
+          4703.646755,
+          4637.020311
+        ],
+        "polars_ibex": [
+          6610.112555,
+          6664.153306,
+          6691.769906,
+          6623.865316,
+          6675.528223,
+          6605.834846,
+          6618.743734,
+          6687.582613,
+          6678.247167,
+          6607.147845,
+          6685.620719,
+          6605.010119
+        ]
+      },
+      "median_ms": {
+        "polars": 6350.9701285,
+        "polars_streaming": 4662.2515935,
+        "polars_ibex": 6644.009311
+      },
+      "cpu_samples_ms": {
+        "polars": [
+          6357.774064,
+          6325.754195,
+          6329.740457,
+          6391.7941,
+          6343.750853,
+          6398.627348,
+          6346.893529,
+          6331.818354,
+          6358.562694,
+          6306.677448,
+          6353.217354,
+          6363.877689
+        ],
+        "polars_streaming": [
+          4686.477216,
+          4623.65088,
+          4650.591301,
+          4617.984925,
+          4732.472694,
+          4629.088919,
+          4691.55738,
+          4684.823319,
+          4645.48401,
+          4664.409273,
+          4702.847595,
+          4636.260297
+        ],
+        "polars_ibex": [
+          6608.430791,
+          6662.397659,
+          6690.026511,
+          6621.909786,
+          6673.353423,
+          6603.709384,
+          6616.8589,
+          6685.186376,
+          6675.781669,
+          6604.988677,
+          6675.763463,
+          6602.19142
+        ]
+      },
+      "median_cpu_ms": {
+        "polars": 6350.055441500001,
+        "polars_streaming": 4657.500287000001,
+        "polars_ibex": 6642.1537225
+      }
+    },
+    "q22": {
+      "upstream_source_sha256": "db2bd21c39ecc82f1adf928c8b065cbc00b94a83a89d73396770d2f6ce2882a8",
+      "prepare_ms": 9.788421,
+      "native_source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\n((((parquet::read(^_ibex_scalar_0)[select { `c_custkey` = `c_custkey`, `c_phone` = `c_phone`, `c_acctbal` = `c_acctbal` }][update { `cntrycode` = substring(`c_phone`, ^_ibex_scalar_1, ^_ibex_scalar_2) }][select { `c_custkey` = `c_custkey`, `c_phone` = `c_phone`, `c_acctbal` = `c_acctbal`, `cntrycode` = `cntrycode` }][select { `c_acctbal` = `c_acctbal`, `c_custkey` = `c_custkey`, `cntrycode` = `cntrycode` }][filter (((((((like(`cntrycode`, ^_ibex_scalar_3) || like(`cntrycode`, ^_ibex_scalar_4)) || like(`cntrycode`, ^_ibex_scalar_5)) || like(`cntrycode`, ^_ibex_scalar_6)) || like(`cntrycode`, ^_ibex_scalar_7)) || like(`cntrycode`, ^_ibex_scalar_8)) || like(`cntrycode`, ^_ibex_scalar_9)))][select { `_ibex_join_0_l_0` = `c_acctbal`, `_ibex_join_0_l_1` = `c_custkey`, `_ibex_join_0_l_2` = `cntrycode` }]) anti join (parquet::read(^_ibex_scalar_10)[select { `o_custkey` = `o_custkey` }][select { `_ibex_join_0_r_0` = `o_custkey` }]) on { `_ibex_join_0_l_1` = `_ibex_join_0_r_0` })[select { `c_acctbal` = `_ibex_join_0_l_0`, `c_custkey` = `_ibex_join_0_l_1`, `cntrycode` = `_ibex_join_0_l_2` }][select { `c_acctbal` = `c_acctbal`, `cntrycode` = `cntrycode` }][select { `_ibex_join_1_l_0` = `c_acctbal`, `_ibex_join_1_l_1` = `cntrycode` }]) cross join (parquet::read(^_ibex_scalar_11)[select { `c_custkey` = `c_custkey`, `c_phone` = `c_phone`, `c_acctbal` = `c_acctbal` }][update { `cntrycode` = substring(`c_phone`, ^_ibex_scalar_12, ^_ibex_scalar_13) }][select { `c_custkey` = `c_custkey`, `c_phone` = `c_phone`, `c_acctbal` = `c_acctbal`, `cntrycode` = `cntrycode` }][select { `c_acctbal` = `c_acctbal`, `c_custkey` = `c_custkey`, `cntrycode` = `cntrycode` }][filter (((((((like(`cntrycode`, ^_ibex_scalar_14) || like(`cntrycode`, ^_ibex_scalar_15)) || like(`cntrycode`, ^_ibex_scalar_16)) || like(`cntrycode`, ^_ibex_scalar_17)) || like(`cntrycode`, ^_ibex_scalar_18)) || like(`cntrycode`, ^_ibex_scalar_19)) || like(`cntrycode`, ^_ibex_scalar_20)))][select { `c_acctbal` = `c_acctbal` }][filter (__ibex_nan_high_gt(`c_acctbal`, ^_ibex_scalar_21))][select { `avg_acctbal` = mean(`c_acctbal`) }][select { `_ibex_join_1_r_0` = `avg_acctbal` }]))[select { `c_acctbal` = `_ibex_join_1_l_0`, `cntrycode` = `_ibex_join_1_l_1`, `avg_acctbal` = `_ibex_join_1_r_0` }][filter (__ibex_nan_high_gt(`c_acctbal`, `avg_acctbal`))][select { `cntrycode` = `cntrycode`, `c_acctbal` = `c_acctbal` }][select { `cntrycode`, `_ibex_round_aggregate_0` = count(`c_acctbal`), `_ibex_round_aggregate_1` = coalesce(sum(`c_acctbal`), ^_ibex_scalar_22) }, by { `cntrycode` }][select { `cntrycode` = `cntrycode`, `numcust` = `_ibex_round_aggregate_0`, `totacctbal` = case { (((case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_31) > ^_ibex_scalar_32) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_33) < ^_ibex_scalar_34)) => case { Float64(round(case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_25) > ^_ibex_scalar_26) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_27) < ^_ibex_scalar_28)) => (`_ibex_round_aggregate_1` * ^_ibex_scalar_23), else => ^_ibex_scalar_24 }, Bankers)) == ^_ibex_scalar_29 => ((`_ibex_round_aggregate_1` * ^_ibex_scalar_30) * ^_ibex_scalar_29), else => Float64(round(case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_25) > ^_ibex_scalar_26) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_27) < ^_ibex_scalar_28)) => (`_ibex_round_aggregate_1` * ^_ibex_scalar_23), else => ^_ibex_scalar_24 }, Bankers)) }, else => (`_ibex_round_aggregate_1` * ^_ibex_scalar_35) }) / ^_ibex_scalar_36) > -^_ibex_scalar_37) && (((case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_31) > ^_ibex_scalar_32) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_33) < ^_ibex_scalar_34)) => case { Float64(round(case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_25) > ^_ibex_scalar_26) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_27) < ^_ibex_scalar_28)) => (`_ibex_round_aggregate_1` * ^_ibex_scalar_23), else => ^_ibex_scalar_24 }, Bankers)) == ^_ibex_scalar_29 => ((`_ibex_round_aggregate_1` * ^_ibex_scalar_30) * ^_ibex_scalar_29), else => Float64(round(case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_25) > ^_ibex_scalar_26) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_27) < ^_ibex_scalar_28)) => (`_ibex_round_aggregate_1` * ^_ibex_scalar_23), else => ^_ibex_scalar_24 }, Bankers)) }, else => (`_ibex_round_aggregate_1` * ^_ibex_scalar_35) }) / ^_ibex_scalar_36) < ^_ibex_scalar_37) => ((case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_31) > ^_ibex_scalar_32) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_33) < ^_ibex_scalar_34)) => case { Float64(round(case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_25) > ^_ibex_scalar_26) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_27) < ^_ibex_scalar_28)) => (`_ibex_round_aggregate_1` * ^_ibex_scalar_23), else => ^_ibex_scalar_24 }, Bankers)) == ^_ibex_scalar_29 => ((`_ibex_round_aggregate_1` * ^_ibex_scalar_30) * ^_ibex_scalar_29), else => Float64(round(case { (((`_ibex_round_aggregate_1` * ^_ibex_scalar_25) > ^_ibex_scalar_26) && ((`_ibex_round_aggregate_1` * ^_ibex_scalar_27) < ^_ibex_scalar_28)) => (`_ibex_round_aggregate_1` * ^_ibex_scalar_23), else => ^_ibex_scalar_24 }, Bankers)) }, else => (`_ibex_round_aggregate_1` * ^_ibex_scalar_35) }) / ^_ibex_scalar_36), else => `_ibex_round_aggregate_1` } }][update { `_ibex_sort_null_12_0` = is_null(`cntrycode`) }][order { `_ibex_sort_null_12_0` desc, `cntrycode` asc }];",
+      "first_collect_ms": {
+        "polars": 575.531913,
+        "polars_streaming": 478.947518,
+        "polars_ibex": 1197.513387
+      },
+      "output_rows": 7,
+      "status": "passed",
+      "samples_ms": {
+        "polars": [
+          554.252096,
+          555.884526,
+          540.351998,
+          568.432749,
+          572.287933,
+          546.370626,
+          511.435936,
+          560.575551,
+          540.447302,
+          554.909777,
+          555.03826,
+          540.237374
+        ],
+        "polars_streaming": [
+          439.806655,
+          575.526035,
+          444.292851,
+          457.789333,
+          442.241857,
+          460.273881,
+          440.847903,
+          575.953842,
+          441.943005,
+          459.063534,
+          441.990488,
+          460.322679
+        ],
+        "polars_ibex": [
+          1207.11995,
+          1209.739338,
+          1213.41284,
+          1196.261227,
+          1217.813073,
+          1207.833092,
+          1200.474611,
+          1216.83438,
+          1205.271553,
+          1194.167375,
+          1203.849494,
+          1208.747237
+        ]
+      },
+      "median_ms": {
+        "polars": 554.5809365,
+        "polars_streaming": 451.041092,
+        "polars_ibex": 1207.476521
+      },
+      "cpu_samples_ms": {
+        "polars": [
+          554.117676,
+          555.783912,
+          540.255286,
+          568.33204,
+          564.304514,
+          546.320175,
+          511.356243,
+          560.532552,
+          540.345772,
+          554.858371,
+          554.959938,
+          540.171157
+        ],
+        "polars_streaming": [
+          439.731683,
+          575.312547,
+          444.220636,
+          457.721159,
+          442.184638,
+          460.150984,
+          440.794049,
+          575.87484,
+          441.880148,
+          459.000419,
+          441.893706,
+          460.228571
+        ],
+        "polars_ibex": [
+          1206.787591,
+          1209.610297,
+          1213.235374,
+          1195.863247,
+          1217.278923,
+          1207.502427,
+          1200.087672,
+          1216.379031,
+          1204.901437,
+          1193.97912,
+          1203.685411,
+          1208.392785
+        ]
+      },
+      "median_cpu_ms": {
+        "polars": 554.4880235,
+        "polars_streaming": 450.9708975,
+        "polars_ibex": 1207.1450089999998
+      }
+    }
+  }
+}

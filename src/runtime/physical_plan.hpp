@@ -186,8 +186,9 @@ struct JoinPlan {
     std::size_t key_count = 0;
 };
 
-/// Classify a join. Pure: it reads the node and nothing else.
-[[nodiscard]] auto plan_join(const ir::JoinNode& join) -> JoinPlan;
+/// Classify a join from its IR and known source schemas, without reading rows.
+[[nodiscard]] auto plan_join(const ir::JoinNode& join, const ir::SourceSchemas& sources = {})
+    -> JoinPlan;
 
 /// `strategy=... decline=... keys=N build=<kind> probe=<kind>` for tests and
 /// `explain physical`.
@@ -242,6 +243,8 @@ struct AggregatePlan {
     /// The column the fused count/sum reads, resolved back through any updates
     /// between the aggregate and the join. Empty unless fused.
     std::string counted_column;
+    /// The join-output column the group key copies (see `FusedLeftJoinCount`).
+    std::string group_source;
     /// Positional bindings for the streamed/hash aggregate input. Closed known
     /// schemas fill this during planning; lazy/unknown inputs bind it once at
     /// the first concrete chunk.
@@ -541,7 +544,8 @@ struct Plan {
         return parallel_end - parallel_begin;
     }
     /// How many steps at the TOP of the run, `[parallel_begin, parallel_begin +
-    /// stream_only_updates)`, are row-local updates that belong to it only when
+    /// stream_only_updates)`, are row-local updates (and the projections or
+    /// renames between them) that belong to it only when
     /// the run streams its lazy source unit by unit. A streaming worker computes
     /// them in place over the unit it just decoded -- no gather, no concat --
     /// so they cost nothing to include and take a per-chunk fork-join off the
@@ -594,6 +598,14 @@ struct Plan {
 [[nodiscard]] auto plan_physical(const ir::Node& root, const TableRegistry& registry,
                                  const ExternRegistry* externs,
                                  const ir::SourceSchemas& source_schemas = {}) -> Plan;
+
+/// The schemas of an execution's deferred lazy sources, for `plan_physical`.
+/// Without them a lazy scan is an unknown schema to the planner, and any
+/// branch that must prove key types declines: an adapter-built query (no
+/// ascriptions) sent Q09's two-key lineitem join to the materializing path.
+/// String columns are left untyped (see the definition).
+[[nodiscard]] auto deferred_source_schemas(const DeferredScanRegistry* deferred)
+    -> ir::SourceSchemas;
 
 /// Deterministic multi-line rendering for tests and debugging. A plan that
 /// cannot explain why it materialized is not an acceptable plan, so every

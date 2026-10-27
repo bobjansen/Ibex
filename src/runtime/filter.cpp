@@ -44,6 +44,7 @@
 #include <variant>
 #include <vector>
 
+#include "bound_filter.hpp"
 #include "decimal_ops.hpp"
 #include "kernel_gather.hpp"
 #include "kernel_types.hpp"
@@ -525,6 +526,54 @@ auto cmp_col_scalar_into_double(ir::CompareOp op, const double* __restrict cp, d
 
 }  // namespace
 
+// Frontend-selected NaN ordering. Dispatch the operator once, outside the
+// vector loop. Null propagation remains the same bitmap operation as IEEE.
+template <ir::CompareOp Op, typename Left, typename Right>
+void nan_high_loop(const Left& left, const Right& right, uint8_t* out, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) {
+        const double a = static_cast<double>(left(i));
+        const double b = static_cast<double>(right(i));
+        const bool an = std::isnan(a), bn = std::isnan(b);
+        if constexpr (Op == ir::CompareOp::Eq)
+            out[i] = (a == b) || (an && bn);
+        if constexpr (Op == ir::CompareOp::Ne)
+            out[i] = !((a == b) || (an && bn));
+        if constexpr (Op == ir::CompareOp::Lt)
+            out[i] = (a < b) || (!an && bn);
+        if constexpr (Op == ir::CompareOp::Le)
+            out[i] = (a <= b) || bn;
+        if constexpr (Op == ir::CompareOp::Gt)
+            out[i] = (a > b) || (an && !bn);
+        if constexpr (Op == ir::CompareOp::Ge)
+            out[i] = (a >= b) || an;
+    }
+}
+
+template <typename Left, typename Right>
+void nan_high_mask(ir::CompareOp op, const Left& left, const Right& right, uint8_t* out,
+                   std::size_t n) {
+    switch (op) {
+        case ir::CompareOp::Eq:
+            nan_high_loop<ir::CompareOp::Eq>(left, right, out, n);
+            break;
+        case ir::CompareOp::Ne:
+            nan_high_loop<ir::CompareOp::Ne>(left, right, out, n);
+            break;
+        case ir::CompareOp::Lt:
+            nan_high_loop<ir::CompareOp::Lt>(left, right, out, n);
+            break;
+        case ir::CompareOp::Le:
+            nan_high_loop<ir::CompareOp::Le>(left, right, out, n);
+            break;
+        case ir::CompareOp::Gt:
+            nan_high_loop<ir::CompareOp::Gt>(left, right, out, n);
+            break;
+        case ir::CompareOp::Ge:
+            nan_high_loop<ir::CompareOp::Ge>(left, right, out, n);
+            break;
+    }
+}
+
 // Dispatch column-vs-scalar comparison over all type combinations.
 using LitVal = decltype(ir::Literal::value);
 namespace {
@@ -565,7 +614,8 @@ void cmp_bools(ir::CompareOp op, const Lhs& lhs, const Rhs& rhs, uint8_t* mp, st
 }
 
 auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, std::size_t off,
-                        const LitVal& lit, std::size_t n, const ValidityBitmap* validity = nullptr)
+                        const LitVal& lit, std::size_t n, const ValidityBitmap* validity = nullptr,
+                        ir::FloatComparison policy = ir::FloatComparison::IEEE)
     -> std::expected<Mask, std::string> {
     Mask result;
     result.value.resize(n);
@@ -575,6 +625,25 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, std::size_t of
         std::fill_n(mp, n, uint8_t{0});
         result.valid = std::vector<uint8_t>(n, 0);
         return result;
+    }
+    if (policy == ir::FloatComparison::NaNsEqualAndGreatest) {
+        const auto* d = std::get_if<double>(&lit);
+        const auto* integer = std::get_if<std::int64_t>(&lit);
+        if (const auto* column = std::get_if<Column<double>>(&col); column && (d || integer)) {
+            const double value = d ? *d : static_cast<double>(*integer);
+            nan_high_mask(
+                op, [&](std::size_t i) { return (*column)[off + i]; },
+                [&](std::size_t) { return value; }, mp, n);
+            result.apply_validity(validity, off, n);
+            return result;
+        }
+        if (const auto* column = std::get_if<Column<std::int64_t>>(&col); column && d) {
+            nan_high_mask(
+                op, [&](std::size_t i) { return (*column)[off + i]; },
+                [&](std::size_t) { return *d; }, mp, n);
+            result.apply_validity(validity, off, n);
+            return result;
+        }
     }
     if (const auto* bool_col = std::get_if<Column<bool>>(&col)) {
         const auto* value = std::get_if<bool>(&lit);
@@ -828,11 +897,34 @@ auto cmp_into(ir::CompareOp op, const L* __restrict lp, const R* __restrict rp,
 // bitmaps'); the produced mask is dense.
 auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, std::size_t lhs_off,
                  const ColumnValue& rhs, std::size_t rhs_off, std::size_t n,
-                 const ValidityBitmap* lv = nullptr, const ValidityBitmap* rv = nullptr)
+                 const ValidityBitmap* lv = nullptr, const ValidityBitmap* rv = nullptr,
+                 ir::FloatComparison policy = ir::FloatComparison::IEEE)
     -> std::expected<Mask, std::string> {
     Mask result;
     result.value.resize(n);
     uint8_t* mp = result.value.data();
+    if (policy == ir::FloatComparison::NaNsEqualAndGreatest) {
+        const auto* ld = std::get_if<Column<double>>(&lhs);
+        const auto* rd = std::get_if<Column<double>>(&rhs);
+        const auto* li = std::get_if<Column<std::int64_t>>(&lhs);
+        const auto* ri = std::get_if<Column<std::int64_t>>(&rhs);
+        const auto fill = [&](const auto& left, const auto& right) {
+            nan_high_mask(
+                op, [&](std::size_t i) { return left[lhs_off + i]; },
+                [&](std::size_t i) { return right[rhs_off + i]; }, mp, n);
+        };
+        if (ld && rd)
+            fill(*ld, *rd);
+        else if (ld && ri)
+            fill(*ld, *ri);
+        else if (li && rd)
+            fill(*li, *rd);
+        if ((ld && (rd || ri)) || (li && rd)) {
+            auto validity = merge_validity(lv, lhs_off, rv, rhs_off, n);
+            result.apply_validity(validity ? &*validity : nullptr, 0, n);
+            return result;
+        }
+    }
     if (std::holds_alternative<Column<Decimal>>(lhs) ||
         std::holds_alternative<Column<Decimal>>(rhs)) {
         if (!decimal_compare_columns(op, lhs, lhs_off, rhs, rhs_off, mp, n)) {
@@ -1028,7 +1120,7 @@ struct NumericCmpSpec {
 auto try_extract_numeric_cmp_spec(const ir::Expr& expr, const PredicateInput& input,
                                   std::size_t begin) -> std::optional<NumericCmpSpec> {
     const auto* cmp = std::get_if<ir::CompareExpr>(&expr.node);
-    if (cmp == nullptr) {
+    if (cmp == nullptr || cmp->float_comparison != ir::FloatComparison::IEEE) {
         return std::nullopt;
     }
 
@@ -1154,6 +1246,8 @@ auto try_extract_numeric_operand_spec(const ir::Expr& expr, const PredicateInput
 
 auto try_extract_numeric_arith_cmp_spec(const ir::CompareExpr& cmp, const PredicateInput& input,
                                         std::size_t begin) -> std::optional<NumericArithCmpSpec> {
+    if (cmp.float_comparison != ir::FloatComparison::IEEE)
+        return std::nullopt;
     const ir::BinaryExpr* bin = nullptr;
     const ir::Literal* lit = nullptr;
     ir::CompareOp op = cmp.op;
@@ -1954,10 +2048,10 @@ namespace {
 
 // Split a conjunct into (column, op, literal), normalizing `literal op column`
 // into `column flip(op) literal`.
-auto split_col_cmp_lit(const ir::Expr& expr)
+auto split_col_cmp_lit(const ir::Expr& expr, bool allow_nan_high = false)
     -> std::optional<std::tuple<const ir::ColumnRef*, ir::CompareOp, const ir::Literal*>> {
     const auto* cmp = std::get_if<ir::CompareExpr>(&expr.node);
-    if (cmp == nullptr) {
+    if (cmp == nullptr || (!allow_nan_high && cmp->float_comparison != ir::FloatComparison::IEEE)) {
         return std::nullopt;
     }
     if (const auto* col = std::get_if<ir::ColumnRef>(&cmp->left->node);
@@ -2073,6 +2167,10 @@ auto try_in_list_mask(const ir::Expr& expr, const PredicateInput& input, RowRang
 // valid==nullopt means all rows are valid (common non-null path, zero overhead).
 auto compute_mask(const ir::Expr& expr, const PredicateInput& input, const ScalarRegistry* scalars,
                   RowRange rows) -> std::expected<Mask, std::string> {
+    if (auto bound = bind_filter_constants(
+            expr, scalars, [&](const std::string& name) { return input.find(name) != nullptr; })) {
+        return compute_mask(*bound, input, scalars, rows);
+    }
     const std::size_t n = rows.count;
     return std::visit(
         [&](const auto& node) -> std::expected<Mask, std::string> {
@@ -2094,7 +2192,7 @@ auto compute_mask(const ir::Expr& expr, const PredicateInput& input, const Scala
                     if (!lhs)
                         return std::unexpected(lhs.error());
                     return compare_col_scalar(node.op, deref_col(*lhs), lhs->offset, lit->value, n,
-                                              lhs->get_validity());
+                                              lhs->get_validity(), node.float_comparison);
                 }
                 // Fast path: literal op column/expr (flip the operator).
                 if (const auto* lit = std::get_if<ir::Literal>(&node.left->node)) {
@@ -2102,7 +2200,8 @@ auto compute_mask(const ir::Expr& expr, const PredicateInput& input, const Scala
                     if (!rhs)
                         return std::unexpected(rhs.error());
                     return compare_col_scalar(flip_cmp(node.op), deref_col(*rhs), rhs->offset,
-                                              lit->value, n, rhs->get_validity());
+                                              lit->value, n, rhs->get_validity(),
+                                              node.float_comparison);
                 }
                 // General: both sides are column expressions.
                 auto lhs = eval_value_vec(*node.left, input, scalars, rows);
@@ -2111,8 +2210,9 @@ auto compute_mask(const ir::Expr& expr, const PredicateInput& input, const Scala
                 auto rhs = eval_value_vec(*node.right, input, scalars, rows);
                 if (!rhs)
                     return std::unexpected(rhs.error());
-                auto res = compare_vec(node.op, deref_col(*lhs), lhs->offset, deref_col(*rhs),
-                                       rhs->offset, n, lhs->get_validity(), rhs->get_validity());
+                auto res =
+                    compare_vec(node.op, deref_col(*lhs), lhs->offset, deref_col(*rhs), rhs->offset,
+                                n, lhs->get_validity(), rhs->get_validity(), node.float_comparison);
                 return res;
             } else if constexpr (std::is_same_v<T, ir::LogicalExpr>) {
                 if (node.op == ir::LogicalOp::Not) {
@@ -2720,6 +2820,10 @@ struct BoundsSpec {
     bool lo_incl = true;
     bool hi_incl = true;
     bool unsatisfiable = false;
+    // Each absorbed conjunct intersects this flag. IEEE comparisons and
+    // NaN-high upper/equality bounds reject NaNs; NaN-high lower bounds admit
+    // them, even when the finite interval itself becomes empty.
+    bool accept_nan = true;
 };
 
 template <typename T>
@@ -2745,7 +2849,8 @@ void tighten_hi(T& cur, bool& cur_incl, T v, bool incl) {
 // Fold one `column <op> literal` conjunct into the column's running range.
 // Returns false when the literal's type doesn't match the column's, leaving the
 // conjunct for the generic path rather than guessing at a conversion.
-auto merge_bound(BoundsSpec& spec, ir::CompareOp op, const ir::Literal& lit) -> bool {
+auto merge_bound(BoundsSpec& spec, ir::CompareOp op, const ir::Literal& lit,
+                 ir::FloatComparison policy) -> bool {
     if (op == ir::CompareOp::Ne) {
         return false;
     }
@@ -2780,9 +2885,13 @@ auto merge_bound(BoundsSpec& spec, ir::CompareOp op, const ir::Literal& lit) -> 
             return false;
         }
         if (std::isnan(vd)) {
-            return false;  // every comparison against NaN is false; not a range
+            return false;  // NaN literals retain their policy-aware generic path
         }
     }
+
+    spec.accept_nan = spec.accept_nan && !integral &&
+                      policy == ir::FloatComparison::NaNsEqualAndGreatest &&
+                      (op == ir::CompareOp::Gt || op == ir::CompareOp::Ge);
 
     const bool lower = op == ir::CompareOp::Gt || op == ir::CompareOp::Ge;
     const bool upper = op == ir::CompareOp::Lt || op == ir::CompareOp::Le;
@@ -2964,16 +3073,18 @@ auto build_bounds_plan(const Table& input, const std::vector<ir::Expr>& conjunct
             continue;
         }
 
-        auto split = split_col_cmp_lit(conjunct);
+        auto split = split_col_cmp_lit(conjunct, /*allow_nan_high=*/true);
         if (!split.has_value()) {
             plan.leftover.push_back(conjunct);
             continue;
         }
         const auto& [col, op, lit] = *split;
+        const auto policy = std::get<ir::CompareExpr>(conjunct.node).float_comparison;
 
         // A text equality (or inequality) is a membership test, not a range.
         if (const auto* text = std::get_if<std::string>(&lit->value)) {
-            if (op == ir::CompareOp::Eq || op == ir::CompareOp::Ne) {
+            if (policy == ir::FloatComparison::IEEE &&
+                (op == ir::CompareOp::Eq || op == ir::CompareOp::Ne)) {
                 const std::vector<std::string_view> values{std::string_view{*text}};
                 if (add_set_conjunct(*col, values, op == ir::CompareOp::Ne)) {
                     continue;
@@ -3017,7 +3128,7 @@ auto build_bounds_plan(const Table& input, const std::vector<ir::Expr>& conjunct
             candidate.validity = entry.validity.has_value() ? &*entry.validity : nullptr;
         }
 
-        if (!merge_bound(candidate, op, *lit)) {
+        if (!merge_bound(candidate, op, *lit, policy)) {
             plan.leftover.push_back(conjunct);
             continue;
         }
@@ -3035,35 +3146,44 @@ auto build_bounds_plan(const Table& input, const std::vector<ir::Expr>& conjunct
     return plan;
 }
 
-template <typename T, bool LoIncl, bool HiIncl>
+template <typename T, bool LoIncl, bool HiIncl, bool AcceptNaN>
+auto bounds_matches(T v, T lo, T hi) -> bool {
+    const bool in_range = (LoIncl ? v >= lo : v > lo) && (HiIncl ? v <= hi : v < hi);
+    if constexpr (AcceptNaN) {
+        return in_range || std::isnan(v);
+    }
+    return in_range;
+}
+
+template <typename T, bool LoIncl, bool HiIncl, bool AcceptNaN>
 void bounds_kernel(const T* __restrict values, T lo, T hi, std::uint8_t* __restrict mask,
                    std::size_t len, bool first) {
     if (first) {
         for (std::size_t i = 0; i < len; ++i) {
             const T v = values[i];
-            const bool ok = (LoIncl ? v >= lo : v > lo) && (HiIncl ? v <= hi : v < hi);
+            const bool ok = bounds_matches<T, LoIncl, HiIncl, AcceptNaN>(v, lo, hi);
             mask[i] = static_cast<std::uint8_t>(ok);
         }
         return;
     }
     for (std::size_t i = 0; i < len; ++i) {
         const T v = values[i];
-        const bool ok = (LoIncl ? v >= lo : v > lo) && (HiIncl ? v <= hi : v < hi);
+        const bool ok = bounds_matches<T, LoIncl, HiIncl, AcceptNaN>(v, lo, hi);
         mask[i] = static_cast<std::uint8_t>(mask[i] & static_cast<std::uint8_t>(ok));
     }
 }
 
-template <typename T>
+template <typename T, bool AcceptNaN = false>
 void bounds_range(const T* values, T lo, T hi, bool lo_incl, bool hi_incl, std::uint8_t* mask,
                   std::size_t len, bool first) {
     if (lo_incl && hi_incl) {
-        bounds_kernel<T, true, true>(values, lo, hi, mask, len, first);
+        bounds_kernel<T, true, true, AcceptNaN>(values, lo, hi, mask, len, first);
     } else if (lo_incl) {
-        bounds_kernel<T, true, false>(values, lo, hi, mask, len, first);
+        bounds_kernel<T, true, false, AcceptNaN>(values, lo, hi, mask, len, first);
     } else if (hi_incl) {
-        bounds_kernel<T, false, true>(values, lo, hi, mask, len, first);
+        bounds_kernel<T, false, true, AcceptNaN>(values, lo, hi, mask, len, first);
     } else {
-        bounds_kernel<T, false, false>(values, lo, hi, mask, len, first);
+        bounds_kernel<T, false, false, AcceptNaN>(values, lo, hi, mask, len, first);
     }
 }
 
@@ -3108,8 +3228,13 @@ void apply_bounds_spec(const BoundsSpec& spec, std::size_t base, std::size_t len
         }
         case BoundsKind::Double: {
             const auto* values = static_cast<const double*>(spec.data) + base;
-            bounds_range<double>(values, spec.lo_d, spec.hi_d, spec.lo_incl, spec.hi_incl, mask,
-                                 len, first);
+            if (spec.accept_nan) {
+                bounds_range<double, true>(values, spec.lo_d, spec.hi_d, spec.lo_incl, spec.hi_incl,
+                                           mask, len, first);
+            } else {
+                bounds_range<double>(values, spec.lo_d, spec.hi_d, spec.lo_incl, spec.hi_incl, mask,
+                                     len, first);
+            }
             break;
         }
     }
@@ -3233,7 +3358,7 @@ auto select_bounds(const std::vector<BoundsSpec>& specs, const std::vector<SetSp
     constexpr std::size_t kBlock = 4096;
     Selection selected;
     for (const auto& spec : specs) {
-        if (spec.unsatisfiable) {
+        if (spec.unsatisfiable && !spec.accept_nan) {
             return selected;
         }
     }
@@ -3421,6 +3546,20 @@ auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conj
 auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts,
                       const ExecutionContext& exec, const ScalarRegistry* scalars)
     -> std::expected<Selection, std::string> {
+    std::optional<std::vector<ir::Expr>> bound;
+    for (std::size_t i = 0; i < conjuncts.size(); ++i) {
+        if (auto expr = bind_filter_constants(conjuncts[i], scalars, [&](const std::string& name) {
+                return input.find_entry(name) != nullptr;
+            })) {
+            if (!bound) {
+                bound = conjuncts;
+            }
+            (*bound)[i] = std::move(*expr);
+        }
+    }
+    if (bound) {
+        return filter_selection(input, *bound, exec, scalars);
+    }
     // Range conjuncts fuse into one blocked pass that yields the selection
     // directly; whatever doesn't fuse runs against that selection instead of
     // against every row.

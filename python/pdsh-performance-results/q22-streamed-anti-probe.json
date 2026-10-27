@@ -1,0 +1,356 @@
+{
+  "method": "Interleaved A/B: five rounds alternating baseline (HEAD 3ca6cbf3) and candidate ibex_pyarrow bridge builds in separate processes, bench_pdsh_engine.py --iters 6 per round, SF10; eight: IBEX_CORES=8 taskset -c 0,2,..,14; one: IBEX_CORES=1 taskset -c 2. Per-round medians compared; exact two-sided signed-rank over 5 pairs (minimum p 0.0625).",
+  "bridge_sha256": {
+    "base": "2784ecfd631bdc0d6d0cf7b67acd533a630eadcb0f3c7c7c4680ed6ddeb0cdce",
+    "cand": "93bdd6f805bc8694473f634229da63dbeb6ab3a94890f6a15137dfb438e2e67c"
+  },
+  "rounds": {
+    "eight/q01": {
+      "base_ms": [
+        822.1406135,
+        819.5542335,
+        818.3122195,
+        823.5180685,
+        821.5489745
+      ],
+      "cand_ms": [
+        649.4777705,
+        654.818876,
+        634.188007,
+        645.6010289999999,
+        651.8312430000001
+      ]
+    },
+    "eight/q06": {
+      "base_ms": [
+        219.0710905,
+        219.04077,
+        218.7360385,
+        217.058355,
+        218.348524
+      ],
+      "cand_ms": [
+        218.5749045,
+        217.702515,
+        217.6805415,
+        218.42867999999999,
+        221.575064
+      ]
+    },
+    "eight/q07": {
+      "base_ms": [
+        495.88095450000003,
+        507.4681965,
+        501.048861,
+        507.2181925,
+        502.3862735
+      ],
+      "cand_ms": [
+        507.58680499999997,
+        496.985645,
+        510.39899,
+        495.69786799999997,
+        506.3524685
+      ]
+    },
+    "eight/q22": {
+      "base_ms": [
+        87.7731895,
+        88.8623595,
+        89.7186285,
+        86.5713555,
+        86.93023149999999
+      ],
+      "cand_ms": [
+        80.6258875,
+        82.61494,
+        84.1008085,
+        82.2493795,
+        81.87136050000001
+      ]
+    },
+    "one/q22": {
+      "base_ms": [
+        494.5418475,
+        494.1769445,
+        487.560379,
+        489.012424,
+        493.9809685
+      ],
+      "cand_ms": [
+        487.9441255,
+        491.71586049999996,
+        487.03833,
+        484.2159995,
+        481.70565899999997
+      ]
+    }
+  },
+  "all22_sequential_eight": {
+    "q01": {
+      "base_ms": {
+        "polars": 800.080802,
+        "polars_streaming": 581.8685485000001,
+        "polars_ibex": 823.2799365000001
+      },
+      "cand_ms": {
+        "polars": 772.0060085,
+        "polars_streaming": 556.456934,
+        "polars_ibex": 642.6431600000001
+      }
+    },
+    "q02": {
+      "base_ms": {
+        "polars": 47.1575335,
+        "polars_streaming": 63.2876045,
+        "polars_ibex": 72.30242050000001
+      },
+      "cand_ms": {
+        "polars": 45.7311125,
+        "polars_streaming": 59.765324,
+        "polars_ibex": 67.6831375
+      }
+    },
+    "q03": {
+      "base_ms": {
+        "polars": 445.2400465,
+        "polars_streaming": 379.6842375,
+        "polars_ibex": 432.94871650000005
+      },
+      "cand_ms": {
+        "polars": 417.4566645,
+        "polars_streaming": 339.99607349999997,
+        "polars_ibex": 395.584431
+      }
+    },
+    "q04": {
+      "base_ms": {
+        "polars": 301.4945315,
+        "polars_streaming": 166.48181499999998,
+        "polars_ibex": 254.293713
+      },
+      "cand_ms": {
+        "polars": 297.897612,
+        "polars_streaming": 160.0560385,
+        "polars_ibex": 244.342919
+      }
+    },
+    "q05": {
+      "base_ms": {
+        "polars": 529.2054645000001,
+        "polars_streaming": 387.988466,
+        "polars_ibex": 479.25678600000003
+      },
+      "cand_ms": {
+        "polars": 532.4296635000001,
+        "polars_streaming": 386.79683,
+        "polars_ibex": 470.82536600000003
+      }
+    },
+    "q06": {
+      "base_ms": {
+        "polars": 233.4892345,
+        "polars_streaming": 236.8689525,
+        "polars_ibex": 226.585042
+      },
+      "cand_ms": {
+        "polars": 228.82815549999998,
+        "polars_streaming": 216.099434,
+        "polars_ibex": 220.870551
+      }
+    },
+    "q07": {
+      "base_ms": {
+        "polars": 486.647557,
+        "polars_streaming": 403.00825,
+        "polars_ibex": 508.92998750000004
+      },
+      "cand_ms": {
+        "polars": 489.693534,
+        "polars_streaming": 409.131988,
+        "polars_ibex": 535.031168
+      }
+    },
+    "q08": {
+      "base_ms": {
+        "polars": 604.8805385000001,
+        "polars_streaming": 463.8388755,
+        "polars_ibex": 510.0503385
+      },
+      "cand_ms": {
+        "polars": 601.1723605,
+        "polars_streaming": 470.438771,
+        "polars_ibex": 529.5608635
+      }
+    },
+    "q09": {
+      "base_ms": {
+        "polars": 1333.8360145000001,
+        "polars_streaming": 617.3219320000001,
+        "polars_ibex": 1077.6859505
+      },
+      "cand_ms": {
+        "polars": 1288.750784,
+        "polars_streaming": 605.570524,
+        "polars_ibex": 1055.4172155
+      }
+    },
+    "q10": {
+      "base_ms": {
+        "polars": 553.4699395,
+        "polars_streaming": 466.0573575,
+        "polars_ibex": 727.6991955
+      },
+      "cand_ms": {
+        "polars": 547.0241675,
+        "polars_streaming": 462.23517449999997,
+        "polars_ibex": 729.5309015
+      }
+    },
+    "q11": {
+      "base_ms": {
+        "polars": 142.5477905,
+        "polars_streaming": 74.353186,
+        "polars_ibex": 95.435813
+      },
+      "cand_ms": {
+        "polars": 136.94620350000002,
+        "polars_streaming": 77.983816,
+        "polars_ibex": 93.5355155
+      }
+    },
+    "q12": {
+      "base_ms": {
+        "polars": 198.05893650000002,
+        "polars_streaming": 174.4359465,
+        "polars_ibex": 189.14279499999998
+      },
+      "cand_ms": {
+        "polars": 198.9167895,
+        "polars_streaming": 172.8970425,
+        "polars_ibex": 188.0306525
+      }
+    },
+    "q13": {
+      "base_ms": {
+        "polars": 838.561649,
+        "polars_streaming": 435.30970349999996,
+        "polars_ibex": 715.725801
+      },
+      "cand_ms": {
+        "polars": 849.9711884999999,
+        "polars_streaming": 463.44543350000004,
+        "polars_ibex": 744.456644
+      }
+    },
+    "q14": {
+      "base_ms": {
+        "polars": 289.8348775,
+        "polars_streaming": 265.4222465,
+        "polars_ibex": 319.739187
+      },
+      "cand_ms": {
+        "polars": 298.728336,
+        "polars_streaming": 273.328115,
+        "polars_ibex": 321.9967845
+      }
+    },
+    "q15": {
+      "base_ms": {
+        "polars": 290.01253499999996,
+        "polars_streaming": 257.931015,
+        "polars_ibex": 282.600951
+      },
+      "cand_ms": {
+        "polars": 298.727507,
+        "polars_streaming": 272.82152599999995,
+        "polars_ibex": 293.4305345
+      }
+    },
+    "q16": {
+      "base_ms": {
+        "polars": 88.7353525,
+        "polars_streaming": 103.4539185,
+        "polars_ibex": 116.023338
+      },
+      "cand_ms": {
+        "polars": 102.18187449999999,
+        "polars_streaming": 120.50939650000001,
+        "polars_ibex": 118.943105
+      }
+    },
+    "q17": {
+      "base_ms": {
+        "polars": 271.0550255,
+        "polars_streaming": 218.3102135,
+        "polars_ibex": 278.256276
+      },
+      "cand_ms": {
+        "polars": 287.5976045,
+        "polars_streaming": 223.422662,
+        "polars_ibex": 285.931253
+      }
+    },
+    "q18": {
+      "base_ms": {
+        "polars": 1409.2966145,
+        "polars_streaming": 516.2708640000001,
+        "polars_ibex": 890.630573
+      },
+      "cand_ms": {
+        "polars": 1459.43788,
+        "polars_streaming": 534.424291,
+        "polars_ibex": 913.3233805
+      }
+    },
+    "q19": {
+      "base_ms": {
+        "polars": 293.619848,
+        "polars_streaming": 298.2492635,
+        "polars_ibex": 398.473804
+      },
+      "cand_ms": {
+        "polars": 301.78999350000004,
+        "polars_streaming": 301.91517150000004,
+        "polars_ibex": 413.79272849999995
+      }
+    },
+    "q20": {
+      "base_ms": {
+        "polars": 778.7652645000001,
+        "polars_streaming": 397.3474195,
+        "polars_ibex": 517.419127
+      },
+      "cand_ms": {
+        "polars": 779.807404,
+        "polars_streaming": 419.92586900000003,
+        "polars_ibex": 528.33705
+      }
+    },
+    "q21": {
+      "base_ms": {
+        "polars": 1075.8252725000002,
+        "polars_streaming": 681.0317585,
+        "polars_ibex": 1052.262765
+      },
+      "cand_ms": {
+        "polars": 1118.797552,
+        "polars_streaming": 700.5030509999999,
+        "polars_ibex": 1065.768126
+      }
+    },
+    "q22": {
+      "base_ms": {
+        "polars": 110.966839,
+        "polars_streaming": 76.186859,
+        "polars_ibex": 88.3277895
+      },
+      "cand_ms": {
+        "polars": 119.77040249999999,
+        "polars_streaming": 82.229873,
+        "polars_ibex": 86.549463
+      }
+    }
+  },
+  "all22_note": "One sequential pass per state (candidate first); Polars itself drifted 3-9% between sittings. Normalized by Polars streaming, no query outside q01 moved beyond the noise; all 22 passed correctness in both."
+}

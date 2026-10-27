@@ -1,0 +1,49 @@
+{
+  "method": "Twelve paired rounds in all six route orderings repeated twice; exact two-sided signed-rank sign enumeration, zero differences excluded, average ranks for ties; p values unadjusted. Both workers use the identical native bridge.",
+  "queries": {
+    "q10": {
+      "one": {
+        "median_ms": {
+          "before": 4136.362459,
+          "after": 3965.7701564999998,
+          "polars_streaming": 3151.7643390000003
+        },
+        "median_paired_change_pct": -3.840516708786468,
+        "after_faster_pairs": 12,
+        "p": 0.00048828125
+      },
+      "eight": {
+        "median_ms": {
+          "before": 1172.176126,
+          "after": 719.3329395000001,
+          "polars_streaming": 474.99920099999997
+        },
+        "median_paired_change_pct": -38.536201631255594,
+        "after_faster_pairs": 12,
+        "p": 0.00048828125
+      }
+    },
+    "q18": {
+      "one": {
+        "median_ms": {
+          "before": 2070.7369335,
+          "after": 2047.839921,
+          "polars_streaming": 3400.224705
+        },
+        "median_paired_change_pct": -1.3547147345559507,
+        "after_faster_pairs": 11,
+        "p": 0.01611328125
+      },
+      "eight": {
+        "median_ms": {
+          "before": 903.05865,
+          "after": 894.494865,
+          "polars_streaming": 513.9030915000001
+        },
+        "median_paired_change_pct": -0.12751174848785185,
+        "after_faster_pairs": 6,
+        "p": 0.5185546875
+      }
+    }
+  }
+}

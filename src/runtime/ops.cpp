@@ -719,9 +719,11 @@ auto filter_call(std::string callee, std::vector<ir::Expr> args) -> ir::Expr {
     return ir::Expr{.node = std::move(call)};
 }
 
-auto filter_cmp(ir::CompareOp op, ir::Expr l, ir::Expr r) -> ir::Expr {
-    return ir::Expr{.node = ir::CompareExpr{
-                        .op = op, .left = mk_expr(std::move(l)), .right = mk_expr(std::move(r))}};
+auto filter_cmp(ir::CompareOp op, ir::Expr l, ir::Expr r, ir::FloatComparison policy) -> ir::Expr {
+    return ir::Expr{.node = ir::CompareExpr{.op = op,
+                                            .left = mk_expr(std::move(l)),
+                                            .right = mk_expr(std::move(r)),
+                                            .float_comparison = policy}};
 }
 
 auto filter_and(ir::Expr l, ir::Expr r) -> ir::Expr {

@@ -174,6 +174,10 @@ enum class CompareOp : std::uint8_t {
     Ge,
 };
 
+/// Float ordering is selected by frontends; ordinary Ibex operators use IEEE.
+/// NaNsEqualAndGreatest ignores NaN payloads and preserves ordinary signed-zero equality.
+enum class FloatComparison : std::uint8_t { IEEE, NaNsEqualAndGreatest };
+
 /// Logical connectives for boolean expressions. `Not` is unary (uses `left`).
 enum class LogicalOp : std::uint8_t {
     And,
@@ -186,6 +190,7 @@ struct CompareExpr {
     CompareOp op = CompareOp::Eq;
     ExprPtr left;
     ExprPtr right;
+    FloatComparison float_comparison = FloatComparison::IEEE;
 };
 
 /// Logical combination of boolean expressions. For `Not`, `right` is null.
@@ -299,14 +304,16 @@ enum class AggFunc : std::uint8_t {
     Median,  ///< Middle value (ignores nulls; always returns double).
     Stddev,  ///< Sample standard deviation, n-1 denominator (ignores nulls; always returns double).
     Ewma,    ///< Exponentially weighted moving average: ewma(col, alpha) (always returns double).
-    Quantile,  ///< quantile(col, p): p-th quantile via linear interpolation (always returns
-               ///< double).
-    Skew,      ///< Sample skewness (Fisher–Pearson, n≥3; ignores nulls; always returns double).
-    Kurtosis,  ///< Sample excess kurtosis (n≥4; ignores nulls; always returns double).
-    Cov,       ///< cov(x, y): sample covariance, n-1 denominator, over the rows where both are
-               ///< non-null (n≥2; always returns double).
-    Corr,      ///< corr(x, y): Pearson correlation over the rows where both are non-null (n≥2,
-               ///< neither constant; always returns double).
+    Quantile,   ///< quantile(col, p): p-th quantile via linear interpolation (always returns
+                ///< double).
+    Skew,       ///< Sample skewness (Fisher–Pearson, n≥3; ignores nulls; always returns double).
+    Kurtosis,   ///< Sample excess kurtosis (n≥4; ignores nulls; always returns double).
+    Cov,        ///< cov(x, y): sample covariance, n-1 denominator, over the rows where both are
+                ///< non-null (n≥2; always returns double).
+    Corr,       ///< corr(x, y): Pearson correlation over the rows where both are non-null (n≥2,
+                ///< neither constant; always returns double).
+    FirstNull,  ///< First row value, including null; null for empty input.
+    LastNull,   ///< Last row value, including null; null for empty input.
 };
 
 /// Whether `func` reads two columns (`AggSpec::column` and `AggSpec::paired`).

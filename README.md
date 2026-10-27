@@ -580,6 +580,66 @@ See [`examples/ibex_dplyr.R`](examples/ibex_dplyr.R) for a complete runnable
 example with scalar capture, lazy translation, grouped aggregation, and
 collection back into R.
 
+## Polars Engine (experimental)
+
+The `ibex_polars` prototype executes supported real Polars lazy queries in Ibex
+and returns Polars DataFrames. Original PDS-H q01/q06 imports and query bodies
+remain unchanged:
+
+```python
+import polars as pl
+from ibex_polars import IbexEngine
+
+engine = IbexEngine()
+query = trades.lazy().group_by("symbol", "day").agg(avg_price=pl.mean("price"))
+result = query.collect(engine=engine)
+```
+
+Reuse the Engine and query to retain prepared resident inputs; every collection
+executes again. Unsupported plans fail explicitly. This source-tree experiment
+pins Polars 2.0.0 and its private plan visitor. See
+[scope and setup](python/ibex_polars/README.md) and
+[resident-table measurements](python/polars-engine-performance.md).
+The [PDS-H comparison](python/pdsh-performance.md) covers sixteen unchanged
+queries on SF10, with warm timings for both eight-query extensions. After
+membership and streaming fixes, Q12's eight-thread
+warm median is 191 ms versus Polars streaming's 179 ms. The shared executor
+also lowers Q18 from 1,028 to 438 ms, while Q1 regresses by about 3–5%.
+At one thread Q18 instead regresses from 2,656 to 3,728 ms; disabling scan
+streaming removes that regression.
+
+## Independent lazy Python API (experimental)
+
+An independent `ibex` Python frontend now implements the first subset of the
+Polars 2.0 API, supporting PDS-H q06 and q01. It provides its own lazy frames and
+expressions; Polars is not a runtime dependency.
+
+```python
+import ibex as pl
+
+query = (
+    pl.scan_parquet("trades.parquet")
+    .filter(pl.col("price") > 10)
+    .with_columns((pl.col("price") * pl.col("size")).alias("notional"))
+    .select(pl.sum("notional"))
+)
+result = query.collect()
+```
+
+Collection executes one complete pipeline through the same evaluator as the
+CLI and R host. This source-tree prototype supports filter, select, single
+column updates, grouped sums/means/counts and sorting; joins and full API
+compatibility remain follow-up work. In-memory frames retain a prepared native
+input so repeated collection avoids conversion and reuses categorical keys.
+Results use Ibex containers backed by Arrow, with Arrow
+dtype descriptors. See [Python setup and compatibility scope](python/README.md)
+for build instructions and the unchanged upstream query conformance runners.
+[Local q01 measurements](python/q01-performance.md) include warm timings and
+the remaining first-use cost.
+The [grouped-mean example and measurements](python/grouped-mean-performance.md)
+show how one of the benchmark page's strongest supported wins translates into
+`import ibex as pl` on already-resident tables.
+
 ## IPython and Jupyter
 
 Ibex now has a Python bridge that returns `pyarrow.Table` objects and an

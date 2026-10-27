@@ -1,0 +1,279 @@
+{
+  "git_head": "18696f67e3fc5ad83b69db8476f892562b8d6cf7",
+  "upstream_head": "401908a307f133a2dffbe3f5e0e0fb2b50ea310b",
+  "bridge_sha256": "468f4d1940a56813a92c079e2ed16afcdea3c87051bc6318cbd288218f453153",
+  "bridge": "/home/brj/ibex/build-release/python/ibex_pyarrow.cpython-314-x86_64-linux-gnu.so",
+  "polars_version": "2.0.0",
+  "native_worktree_patch": "diff --git a/src/runtime/paired_aggregate.cpp b/src/runtime/paired_aggregate.cpp\nindex 58d23f6c..684689cc 100644\n--- a/src/runtime/paired_aggregate.cpp\n+++ b/src/runtime/paired_aggregate.cpp\n@@ -1,16 +1,25 @@\n // SPDX-License-Identifier: AGPL-3.0-only\n // Copyright (C) 2026 Bob Jansen\n \n+#include <ibex/core/column.hpp>\n+#include <ibex/ir/node.hpp>\n+#include <ibex/runtime/interpreter.hpp>\n+#include <ibex/runtime/worker_pool.hpp>\n+\n #include <algorithm>\n #include <array>\n #include <cmath>\n+#include <cstddef>\n #include <cstdint>\n #include <iterator>\n #include <memory>\n #include <optional>\n+#include <utility>\n+#include <variant>\n #include <vector>\n \n #include \"interpreter_internal.hpp\"\n+#include \"welford.hpp\"\n \n namespace ibex::runtime {\n namespace {\n@@ -86,8 +95,8 @@ auto pair_moment(const Column<X>& xs, const Column<Y>& ys, const ValidityBitmap*\n     // then operate on small residuals, even for 1e12-offset inputs. Covariance\n     // and correlation are translation-invariant; no rounded absolute mean is\n     // needed. Do not use sum(x*x)-sum(x)^2/n, which loses small spreads.\n-    const double origin_x = static_cast<double>(xs[first]);\n-    const double origin_y = static_cast<double>(ys[first]);\n+    const auto origin_x = static_cast<double>(xs[first]);\n+    const auto origin_y = static_cast<double>(ys[first]);\n     const std::size_t blocks = (rows + kPairBlockRows - 1) / kPairBlockRows;\n     std::vector<CoMoment> partial(blocks);\n     const auto reduce = [&](std::size_t block) {\n@@ -155,7 +164,7 @@ auto global_paired_aggregate(const Table& input, const std::vector<ir::AggSpec>&\n         auto pair =\n             std::ranges::find_if(pairs, [&](const Pair& p) { return p.x == x && p.y == y; });\n         if (pair == pairs.end()) {\n-            pairs.push_back({x, y, pair_moment(*x, *y, exec)});\n+            pairs.push_back({.x = x, .y = y, .moment = pair_moment(*x, *y, exec)});\n             pair = std::prev(pairs.end());\n         }\n         Column<double> value;\ndiff --git a/src/runtime/semi_anti_join.cpp b/src/runtime/semi_anti_join.cpp\nindex 65b22d0c..49efa9e4 100644\n--- a/src/runtime/semi_anti_join.cpp\n+++ b/src/runtime/semi_anti_join.cpp\n@@ -14,6 +14,7 @@\n #include <ibex/core/decimal.hpp>\n #include <ibex/core/time.hpp>\n #include <ibex/ir/node.hpp>\n+#include <ibex/ir/schema.hpp>\n #include <ibex/runtime/interpreter.hpp>\n #include <ibex/runtime/interrupt.hpp>\n #include <ibex/runtime/operator.hpp>\n",
+  "ibex_cores": "8",
+  "polars_threads": 8,
+  "affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23
+  ],
+  "data": [
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/customer.parquet",
+      "bytes": 81366456,
+      "mtime_ns": 1792828808266811953
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/lineitem.parquet",
+      "bytes": 1801546483,
+      "mtime_ns": 1792828812385804504
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/nation.parquet",
+      "bytes": 3083,
+      "mtime_ns": 1792828814559800573
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/orders.parquet",
+      "bytes": 391488464,
+      "mtime_ns": 1792828815334799172
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/part.parquet",
+      "bytes": 41388677,
+      "mtime_ns": 1792828815922798108
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/partsupp.parquet",
+      "bytes": 295923709,
+      "mtime_ns": 1792828816386797269
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/region.parquet",
+      "bytes": 1827,
+      "mtime_ns": 1792828816660796774
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/supplier.parquet",
+      "bytes": 5208557,
+      "mtime_ns": 1792828816700796702
+    }
+  ],
+  "iterations": 0,
+  "check_only": true,
+  "query_numbers": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22
+  ],
+  "method": "Parquet collection; prepared translation; complete correctness comparisons; no warmups or timing loops",
+  "correctness": "all rows, order and dtypes; rel_tol=1e-10 abs_tol=1e-8; both Polars executors compared",
+  "cpu_frequency_khz": {
+    "scaling_min_freq": "3200000",
+    "scaling_max_freq": "3200000"
+  },
+  "ibex_decode_threads": null,
+  "queries": {
+    "q01": {
+      "upstream_source_sha256": "2cc9026fec6e49373f866bb4b44f901f7811eb0116a1d55b637a3023c88e7bed",
+      "prepare_ms": 141.500613,
+      "first_collect_ms": {
+        "polars": 800.923537,
+        "polars_streaming": 533.906614,
+        "polars_ibex": 1428.944625
+      },
+      "output_rows": 4,
+      "status": "passed",
+      "native_source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\nparquet::read(^_ibex_scalar_0)[filter ((`l_shipdate` <= ^_ibex_scalar_1))][select { `l_returnflag` = `l_returnflag`, `l_linestatus` = `l_linestatus`, `l_quantity` = `l_quantity`, `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount`, `l_tax` = `l_tax`, `l_shipdate` = `l_shipdate` }][select { `l_returnflag` = `l_returnflag`, `l_linestatus` = `l_linestatus`, `l_quantity` = `l_quantity`, `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount`, `l_tax` = `l_tax` }][update { `__POLARS_CSER_0x100000005` = (`l_extendedprice` * (^_ibex_scalar_2 - `l_discount`)) }][select { `l_returnflag` = `l_returnflag`, `l_linestatus` = `l_linestatus`, `l_quantity` = `l_quantity`, `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount`, `l_tax` = `l_tax`, `__POLARS_CSER_0x100000005` = `__POLARS_CSER_0x100000005` }][select { `l_returnflag`, `l_linestatus`, `sum_qty` = coalesce(sum(`l_quantity`), ^_ibex_scalar_3), `sum_base_price` = coalesce(sum(`l_extendedprice`), ^_ibex_scalar_4), `sum_disc_price` = coalesce(sum(`__POLARS_CSER_0x100000005`), ^_ibex_scalar_5), `sum_charge` = coalesce(sum((`__POLARS_CSER_0x100000005` * (^_ibex_scalar_6 + `l_tax`))), ^_ibex_scalar_7), `avg_qty` = mean(`l_quantity`), `avg_price` = mean(`l_extendedprice`), `avg_disc` = mean(`l_discount`), `count_order` = count() }, by { `l_returnflag`, `l_linestatus` }][update { `_ibex_sort_null_6_0` = is_null(`l_returnflag`), `_ibex_sort_null_6_1` = is_null(`l_linestatus`) }][order { `_ibex_sort_null_6_0` desc, `l_returnflag` asc, `_ibex_sort_null_6_1` desc, `l_linestatus` asc }];"
+    },
+    "q02": {
+      "upstream_source_sha256": "4e2f637e2c077b98fb55529fb9c6c66ad0061108c3c8f1089f81a1aa923cd020",
+      "prepare_ms": 24.339621,
+      "first_collect_ms": {
+        "polars": 54.455434,
+        "polars_streaming": 58.530352,
+        "polars_ibex": 127.39973
+      },
+      "output_rows": 100,
+      "status": "passed",
+      "native_source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\n((((((((((parquet::read(^_ibex_scalar_0)[filter (((`p_size` == ^_ibex_scalar_1) && like(`p_type`, ^_ibex_scalar_2)))][select { `p_partkey` = `p_partkey`, `p_mfgr` = `p_mfgr`, `p_size` = `p_size`, `p_type` = `p_type` }][select { `p_partkey` = `p_partkey`, `p_mfgr` = `p_mfgr` }][select { `_ibex_join_0_l_0` = `p_partkey`, `_ibex_join_0_l_1` = `p_mfgr` }]) join (parquet::read(^_ibex_scalar_3)[select { `ps_suppkey` = `ps_suppkey`, `ps_supplycost` = `ps_supplycost`, `ps_partkey` = `ps_partkey` }][select { `_ibex_join_0_r_0` = `ps_suppkey`, `_ibex_join_0_r_1` = `ps_supplycost`, `_ibex_join_0_r_2` = `ps_partkey` }]) on { `_ibex_join_0_l_0` = `_ibex_join_0_r_2` })[select { `p_partkey` = `_ibex_join_0_l_0`, `p_mfgr` = `_ibex_join_0_l_1`, `ps_suppkey` = `_ibex_join_0_r_0`, `ps_supplycost` = `_ibex_join_0_r_1` }][select { `p_partkey` = `p_partkey`, `p_mfgr` = `p_mfgr`, `ps_supplycost` = `ps_supplycost`, `ps_suppkey` = `ps_suppkey` }][select { `_ibex_join_1_l_0` = `p_partkey`, `_ibex_join_1_l_1` = `p_mfgr`, `_ibex_join_1_l_2` = `ps_supplycost`, `_ibex_join_1_l_3` = `ps_suppkey` }]) join (parquet::read(^_ibex_scalar_4)[select { `s_suppkey` = `s_suppkey`, `s_name` = `s_name`, `s_address` = `s_address`, `s_nationkey` = `s_nationkey`, `s_phone` = `s_phone`, `s_acctbal` = `s_acctbal`, `s_comment` = `s_comment` }][select { `_ibex_join_1_r_0` = `s_suppkey`, `_ibex_join_1_r_1` = `s_name`, `_ibex_join_1_r_2` = `s_address`, `_ibex_join_1_r_3` = `s_nationkey`, `_ibex_join_1_r_4` = `s_phone`, `_ibex_join_1_r_5` = `s_acctbal`, `_ibex_join_1_r_6` = `s_comment` }]) on { `_ibex_join_1_l_3` = `_ibex_join_1_r_0` })[select { `p_partkey` = `_ibex_join_1_l_0`, `p_mfgr` = `_ibex_join_1_l_1`, `ps_supplycost` = `_ibex_join_1_l_2`, `ps_suppkey` = `_ibex_join_1_l_3`, `s_name` = `_ibex_join_1_r_1`, `s_address` = `_ibex_join_1_r_2`, `s_nationkey` = `_ibex_join_1_r_3`, `s_phone` = `_ibex_join_1_r_4`, `s_acctbal` = `_ibex_join_1_r_5`, `s_comment` = `_ibex_join_1_r_6` }][select { `p_partkey` = `p_partkey`, `p_mfgr` = `p_mfgr`, `ps_supplycost` = `ps_supplycost`, `s_name` = `s_name`, `s_address` = `s_address`, `s_phone` = `s_phone`, `s_acctbal` = `s_acctbal`, `s_comment` = `s_comment`, `s_nationkey` = `s_nationkey` }][select { `_ibex_join_2_l_0` = `p_partkey`, `_ibex_join_2_l_1` = `p_mfgr`, `_ibex_join_2_l_2` = `ps_supplycost`, `_ibex_join_2_l_3` = `s_name`, `_ibex_join_2_l_4` = `s_address`, `_ibex_join_2_l_5` = `s_phone`, `_ibex_join_2_l_6` = `s_acctbal`, `_ibex_join_2_l_7` = `s_comment`, `_ibex_join_2_l_8` = `s_nationkey` }]) join (parquet::read(^_ibex_scalar_5)[select { `n_name` = `n_name`, `n_regionkey` = `n_regionkey`, `n_nationkey` = `n_nationkey` }][select { `_ibex_join_2_r_0` = `n_name`, `_ibex_join_2_r_1` = `n_regionkey`, `_ibex_join_2_r_2` = `n_nationkey` }]) on { `_ibex_join_2_l_8` = `_ibex_join_2_r_2` })[select { `p_partkey` = `_ibex_join_2_l_0`, `p_mfgr` = `_ibex_join_2_l_1`, `ps_supplycost` = `_ibex_join_2_l_2`, `s_name` = `_ibex_join_2_l_3`, `s_address` = `_ibex_join_2_l_4`, `s_phone` = `_ibex_join_2_l_5`, `s_acctbal` = `_ibex_join_2_l_6`, `s_comment` = `_ibex_join_2_l_7`, `s_nationkey` = `_ibex_join_2_l_8`, `n_name` = `_ibex_join_2_r_0`, `n_regionkey` = `_ibex_join_2_r_1` }][select { `p_partkey` = `p_partkey`, `p_mfgr` = `p_mfgr`, `ps_supplycost` = `ps_supplycost`, `s_name` = `s_name`, `s_address` = `s_address`, `s_phone` = `s_phone`, `s_acctbal` = `s_acctbal`, `s_comment` = `s_comment`, `n_name` = `n_name`, `n_regionkey` = `n_regionkey` }][select { `_ibex_join_3_l_0` = `p_partkey`, `_ibex_join_3_l_1` = `p_mfgr`, `_ibex_join_3_l_2` = `ps_supplycost`, `_ibex_join_3_l_3` = `s_name`, `_ibex_join_3_l_4` = `s_address`, `_ibex_join_3_l_5` = `s_phone`, `_ibex_join_3_l_6` = `s_acctbal`, `_ibex_join_3_l_7` = `s_comment`, `_ibex_join_3_l_8` = `n_name`, `_ibex_join_3_l_9` = `n_regionkey` }]) join (parquet::read(^_ibex_scalar_6)[filter ((`r_name` == ^_ibex_scalar_7))][select { `r_regionkey` = `r_regionkey`, `r_name` = `r_name` }][select { `r_regionkey` = `r_regionkey` }][select { `_ibex_join_3_r_0` = `r_regionkey` }]) on { `_ibex_join_3_l_9` = `_ibex_join_3_r_0` })[select { `p_partkey` = `_ibex_join_3_l_0`, `p_mfgr` = `_ibex_join_3_l_1`, `ps_supplycost` = `_ibex_join_3_l_2`, `s_name` = `_ibex_join_3_l_3`, `s_address` = `_ibex_join_3_l_4`, `s_phone` = `_ibex_join_3_l_5`, `s_acctbal` = `_ibex_join_3_l_6`, `s_comment` = `_ibex_join_3_l_7`, `n_name` = `_ibex_join_3_l_8`, `n_regionkey` = `_ibex_join_3_l_9` }][select { `p_partkey` = `p_partkey`, `ps_supplycost` = `ps_supplycost`, `p_mfgr` = `p_mfgr`, `s_name` = `s_name`, `s_address` = `s_address`, `s_phone` = `s_phone`, `s_acctbal` = `s_acctbal`, `s_comment` = `s_comment`, `n_name` = `n_name` }][select { `p_partkey` = `p_partkey`, `ps_supplycost` = `ps_supplycost` }][select { `p_partkey`, `ps_supplycost` = coalesce(min(case { is_nan(`ps_supplycost`) => case { true => NULL, else => ^_ibex_scalar_8 }, else => `ps_supplycost` }), mean(`ps_supplycost`)) }, by { `p_partkey` }][select { `_ibex_join_4_l_0` = `p_partkey`, `_ibex_join_4_l_1` = `ps_supplycost` }][update { `_ibex_join_4_ln_1` = is_nan(`_ibex_join_4_l_1`), `_ibex_join_4_lv_1` = case { is_nan(`_ibex_join_4_l_1`) => 0.0, else => `_ibex_join_4_l_1` } }]) join (((((((((parquet::read(^_ibex_scalar_9)[filter (((`p_size` == ^_ibex_scalar_10) && like(`p_type`, ^_ibex_scalar_11)))][select { `p_partkey` = `p_partkey`, `p_mfgr` = `p_mfgr`, `p_size` = `p_size`, `p_type` = `p_type` }][select { `p_partkey` = `p_partkey`, `p_mfgr` = `p_mfgr` }][select { `_ibex_join_5_l_0` = `p_partkey`, `_ibex_join_5_l_1` = `p_mfgr` }]) join (parquet::read(^_ibex_scalar_12)[select { `ps_suppkey` = `ps_suppkey`, `ps_supplycost` = `ps_supplycost`, `ps_partkey` = `ps_partkey` }][select { `_ibex_join_5_r_0` = `ps_suppkey`, `_ibex_join_5_r_1` = `ps_supplycost`, `_ibex_join_5_r_2` = `ps_partkey` }]) on { `_ibex_join_5_l_0` = `_ibex_join_5_r_2` })[select { `p_partkey` = `_ibex_join_5_l_0`, `p_mfgr` = `_ibex_join_5_l_1`, `ps_suppkey` = `_ibex_join_5_r_0`, `ps_supplycost` = `_ibex_join_5_r_1` }][select { `p_partkey` = `p_partkey`, `p_mfgr` = `p_mfgr`, `ps_supplycost` = `ps_supplycost`, `ps_suppkey` = `ps_suppkey` }][select { `_ibex_join_6_l_0` = `p_partkey`, `_ibex_join_6_l_1` = `p_mfgr`, `_ibex_join_6_l_2` = `ps_supplycost`, `_ibex_join_6_l_3` = `ps_suppkey` }]) join (parquet::read(^_ibex_scalar_13)[select { `s_suppkey` = `s_suppkey`, `s_name` = `s_name`, `s_address` = `s_address`, `s_nationkey` = `s_nationkey`, `s_phone` = `s_phone`, `s_acctbal` = `s_acctbal`, `s_comment` = `s_comment` }][select { `_ibex_join_6_r_0` = `s_suppkey`, `_ibex_join_6_r_1` = `s_name`, `_ibex_join_6_r_2` = `s_address`, `_ibex_join_6_r_3` = `s_nationkey`, `_ibex_join_6_r_4` = `s_phone`, `_ibex_join_6_r_5` = `s_acctbal`, `_ibex_join_6_r_6` = `s_comment` }]) on { `_ibex_join_6_l_3` = `_ibex_join_6_r_0` })[select { `p_partkey` = `_ibex_join_6_l_0`, `p_mfgr` = `_ibex_join_6_l_1`, `ps_supplycost` = `_ibex_join_6_l_2`, `ps_suppkey` = `_ibex_join_6_l_3`, `s_name` = `_ibex_join_6_r_1`, `s_address` = `_ibex_join_6_r_2`, `s_nationkey` = `_ibex_join_6_r_3`, `s_phone` = `_ibex_join_6_r_4`, `s_acctbal` = `_ibex_join_6_r_5`, `s_comment` = `_ibex_join_6_r_6` }][select { `p_partkey` = `p_partkey`, `p_mfgr` = `p_mfgr`, `ps_supplycost` = `ps_supplycost`, `s_name` = `s_name`, `s_address` = `s_address`, `s_phone` = `s_phone`, `s_acctbal` = `s_acctbal`, `s_comment` = `s_comment`, `s_nationkey` = `s_nationkey` }][select { `_ibex_join_7_l_0` = `p_partkey`, `_ibex_join_7_l_1` = `p_mfgr`, `_ibex_join_7_l_2` = `ps_supplycost`, `_ibex_join_7_l_3` = `s_name`, `_ibex_join_7_l_4` = `s_address`, `_ibex_join_7_l_5` = `s_phone`, `_ibex_join_7_l_6` = `s_acctbal`, `_ibex_join_7_l_7` = `s_comment`, `_ibex_join_7_l_8` = `s_nationkey` }]) join (parquet::read(^_ibex_scalar_14)[select { `n_name` = `n_name`, `n_regionkey` = `n_regionkey`, `n_nationkey` = `n_nationkey` }][select { `_ibex_join_7_r_0` = `n_name`, `_ibex_join_7_r_1` = `n_regionkey`, `_ibex_join_7_r_2` = `n_nationkey` }]) on { `_ibex_join_7_l_8` = `_ibex_join_7_r_2` })[select { `p_partkey` = `_ibex_join_7_l_0`, `p_mfgr` = `_ibex_join_7_l_1`, `ps_supplycost` = `_ibex_join_7_l_2`, `s_name` = `_ibex_join_7_l_3`, `s_address` = `_ibex_join_7_l_4`, `s_phone` = `_ibex_join_7_l_5`, `s_acctbal` = `_ibex_join_7_l_6`, `s_comment` = `_ibex_join_7_l_7`, `s_nationkey` = `_ibex_join_7_l_8`, `n_name` = `_ibex_join_7_r_0`, `n_regionkey` = `_ibex_join_7_r_1` }][select { `p_partkey` = `p_partkey`, `p_mfgr` = `p_mfgr`, `ps_supplycost` = `ps_supplycost`, `s_name` = `s_name`, `s_address` = `s_address`, `s_phone` = `s_phone`, `s_acctbal` = `s_acctbal`, `s_comment` = `s_comment`, `n_name` = `n_name`, `n_regionkey` = `n_regionkey` }][select { `_ibex_join_8_l_0` = `p_partkey`, `_ibex_join_8_l_1` = `p_mfgr`, `_ibex_join_8_l_2` = `ps_supplycost`, `_ibex_join_8_l_3` = `s_name`, `_ibex_join_8_l_4` = `s_address`, `_ibex_join_8_l_5` = `s_phone`, `_ibex_join_8_l_6` = `s_acctbal`, `_ibex_join_8_l_7` = `s_comment`, `_ibex_join_8_l_8` = `n_name`, `_ibex_join_8_l_9` = `n_regionkey` }]) join (parquet::read(^_ibex_scalar_15)[filter ((`r_name` == ^_ibex_scalar_16))][select { `r_regionkey` = `r_regionkey`, `r_name` = `r_name` }][select { `r_regionkey` = `r_regionkey` }][select { `_ibex_join_8_r_0` = `r_regionkey` }]) on { `_ibex_join_8_l_9` = `_ibex_join_8_r_0` })[select { `p_partkey` = `_ibex_join_8_l_0`, `p_mfgr` = `_ibex_join_8_l_1`, `ps_supplycost` = `_ibex_join_8_l_2`, `s_name` = `_ibex_join_8_l_3`, `s_address` = `_ibex_join_8_l_4`, `s_phone` = `_ibex_join_8_l_5`, `s_acctbal` = `_ibex_join_8_l_6`, `s_comment` = `_ibex_join_8_l_7`, `n_name` = `_ibex_join_8_l_8`, `n_regionkey` = `_ibex_join_8_l_9` }][select { `p_partkey` = `p_partkey`, `ps_supplycost` = `ps_supplycost`, `p_mfgr` = `p_mfgr`, `s_name` = `s_name`, `s_address` = `s_address`, `s_phone` = `s_phone`, `s_acctbal` = `s_acctbal`, `s_comment` = `s_comment`, `n_name` = `n_name` }][select { `p_mfgr` = `p_mfgr`, `s_name` = `s_name`, `s_address` = `s_address`, `s_phone` = `s_phone`, `s_acctbal` = `s_acctbal`, `s_comment` = `s_comment`, `n_name` = `n_name`, `p_partkey` = `p_partkey`, `ps_supplycost` = `ps_supplycost` }][select { `_ibex_join_4_r_0` = `p_mfgr`, `_ibex_join_4_r_1` = `s_name`, `_ibex_join_4_r_2` = `s_address`, `_ibex_join_4_r_3` = `s_phone`, `_ibex_join_4_r_4` = `s_acctbal`, `_ibex_join_4_r_5` = `s_comment`, `_ibex_join_4_r_6` = `n_name`, `_ibex_join_4_r_7` = `p_partkey`, `_ibex_join_4_r_8` = `ps_supplycost` }][update { `_ibex_join_4_rn_1` = is_nan(`_ibex_join_4_r_8`), `_ibex_join_4_rv_1` = case { is_nan(`_ibex_join_4_r_8`) => 0.0, else => `_ibex_join_4_r_8` } }]) on { `_ibex_join_4_l_0` = `_ibex_join_4_r_7`, `_ibex_join_4_ln_1` = `_ibex_join_4_rn_1`, `_ibex_join_4_lv_1` = `_ibex_join_4_rv_1` })[select { `p_partkey` = `_ibex_join_4_l_0`, `ps_supplycost` = `_ibex_join_4_l_1`, `p_mfgr` = `_ibex_join_4_r_0`, `s_name` = `_ibex_join_4_r_1`, `s_address` = `_ibex_join_4_r_2`, `s_phone` = `_ibex_join_4_r_3`, `s_acctbal` = `_ibex_join_4_r_4`, `s_comment` = `_ibex_join_4_r_5`, `n_name` = `_ibex_join_4_r_6` }][select { `s_acctbal` = `s_acctbal`, `s_name` = `s_name`, `n_name` = `n_name`, `p_partkey` = `p_partkey`, `p_mfgr` = `p_mfgr`, `s_address` = `s_address`, `s_phone` = `s_phone`, `s_comment` = `s_comment` }][update { `_ibex_sort_null_15_0` = is_null(`s_acctbal`), `_ibex_sort_nan_15_0` = is_nan(`s_acctbal`), `_ibex_sort_null_15_1` = is_null(`n_name`), `_ibex_sort_null_15_2` = is_null(`s_name`), `_ibex_sort_null_15_3` = is_null(`p_partkey`) }][order { `_ibex_sort_null_15_0` desc, `_ibex_sort_nan_15_0` desc, `s_acctbal` desc, `_ibex_sort_null_15_1` desc, `n_name` asc, `_ibex_sort_null_15_2` desc, `s_name` asc, `_ibex_sort_null_15_3` desc, `p_partkey` asc }][update { `_ibex_slice_row_16` = seq() }][filter `_ibex_slice_row_16` >= 0 && `_ibex_slice_row_16` < 100][select { `s_acctbal`, `s_name`, `n_name`, `p_partkey`, `p_mfgr`, `s_address`, `s_phone`, `s_comment` }];"
+    },
+    "q03": {
+      "upstream_source_sha256": "92672a95b48a8eb675eba6ad600a59402d01a2a3d203a1f67f952cdedc2de8b1",
+      "prepare_ms": 27.384553,
+      "first_collect_ms": {
+        "polars": 395.186384,
+        "polars_streaming": 310.76533,
+        "polars_ibex": 529.002879
+      },
+      "output_rows": 10,
+      "status": "passed",
+      "native_source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\n((((parquet::read(^_ibex_scalar_0)[filter ((`c_mktsegment` == ^_ibex_scalar_1))][select { `c_custkey` = `c_custkey`, `c_mktsegment` = `c_mktsegment` }][select { `c_custkey` = `c_custkey` }][select { `_ibex_join_0_l_0` = `c_custkey` }]) join (parquet::read(^_ibex_scalar_2)[filter ((`o_orderdate` < ^_ibex_scalar_3))][select { `o_orderkey` = `o_orderkey`, `o_orderdate` = `o_orderdate`, `o_shippriority` = `o_shippriority`, `o_custkey` = `o_custkey` }][select { `_ibex_join_0_r_0` = `o_orderkey`, `_ibex_join_0_r_1` = `o_orderdate`, `_ibex_join_0_r_2` = `o_shippriority`, `_ibex_join_0_r_3` = `o_custkey` }]) on { `_ibex_join_0_l_0` = `_ibex_join_0_r_3` })[select { `c_custkey` = `_ibex_join_0_l_0`, `o_orderkey` = `_ibex_join_0_r_0`, `o_orderdate` = `_ibex_join_0_r_1`, `o_shippriority` = `_ibex_join_0_r_2` }][select { `o_orderkey` = `o_orderkey`, `o_orderdate` = `o_orderdate`, `o_shippriority` = `o_shippriority` }][select { `_ibex_join_1_l_0` = `o_orderkey`, `_ibex_join_1_l_1` = `o_orderdate`, `_ibex_join_1_l_2` = `o_shippriority` }]) join (parquet::read(^_ibex_scalar_4)[filter ((`l_shipdate` > ^_ibex_scalar_5))][select { `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount`, `l_orderkey` = `l_orderkey`, `l_shipdate` = `l_shipdate` }][select { `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount`, `l_orderkey` = `l_orderkey` }][select { `_ibex_join_1_r_0` = `l_extendedprice`, `_ibex_join_1_r_1` = `l_discount`, `_ibex_join_1_r_2` = `l_orderkey` }]) on { `_ibex_join_1_l_0` = `_ibex_join_1_r_2` })[select { `o_orderkey` = `_ibex_join_1_l_0`, `o_orderdate` = `_ibex_join_1_l_1`, `o_shippriority` = `_ibex_join_1_l_2`, `l_extendedprice` = `_ibex_join_1_r_0`, `l_discount` = `_ibex_join_1_r_1` }][update { `revenue` = (`l_extendedprice` * (^_ibex_scalar_6 - `l_discount`)) }][select { `o_orderkey` = `o_orderkey`, `o_orderdate` = `o_orderdate`, `o_shippriority` = `o_shippriority`, `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount`, `revenue` = `revenue` }][select { `o_orderkey` = `o_orderkey`, `o_orderdate` = `o_orderdate`, `o_shippriority` = `o_shippriority`, `revenue` = `revenue` }][select { `o_orderkey`, `o_orderdate`, `o_shippriority`, `revenue` = coalesce(sum(`revenue`), ^_ibex_scalar_7) }, by { `o_orderkey`, `o_orderdate`, `o_shippriority` }][select { `l_orderkey` = `o_orderkey`, `revenue` = `revenue`, `o_orderdate` = `o_orderdate`, `o_shippriority` = `o_shippriority` }][update { `_ibex_sort_null_11_0` = is_null(`revenue`), `_ibex_sort_nan_11_0` = is_nan(`revenue`), `_ibex_sort_null_11_1` = is_null(`o_orderdate`) }][order { `_ibex_sort_null_11_0` desc, `_ibex_sort_nan_11_0` desc, `revenue` desc, `_ibex_sort_null_11_1` desc, `o_orderdate` asc }][update { `_ibex_slice_row_12` = seq() }][filter `_ibex_slice_row_12` >= 0 && `_ibex_slice_row_12` < 10][select { `l_orderkey`, `revenue`, `o_orderdate`, `o_shippriority` }];"
+    },
+    "q04": {
+      "upstream_source_sha256": "0f08b2d3aa354c692005e770cbeb6fe03687486ce77cda245b6790e1808d1a6d",
+      "prepare_ms": 22.855956,
+      "first_collect_ms": {
+        "polars": 297.53433,
+        "polars_streaming": 154.021735,
+        "polars_ibex": 282.739556
+      },
+      "output_rows": 5,
+      "status": "passed",
+      "native_source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\n((parquet::read(^_ibex_scalar_0)[filter (((`o_orderdate` >= ^_ibex_scalar_1) && (`o_orderdate` < ^_ibex_scalar_2)))][select { `o_orderpriority` = `o_orderpriority`, `o_orderkey` = `o_orderkey`, `o_orderdate` = `o_orderdate` }][select { `o_orderpriority` = `o_orderpriority`, `o_orderkey` = `o_orderkey` }][select { `_ibex_join_0_l_0` = `o_orderpriority`, `_ibex_join_0_l_1` = `o_orderkey` }]) semi join (parquet::read(^_ibex_scalar_3)[filter ((`l_commitdate` < `l_receiptdate`))][select { `l_orderkey` = `l_orderkey`, `l_commitdate` = `l_commitdate`, `l_receiptdate` = `l_receiptdate` }][select { `l_orderkey` = `l_orderkey` }][select { `_ibex_join_0_r_0` = `l_orderkey` }]) on { `_ibex_join_0_l_1` = `_ibex_join_0_r_0` })[select { `o_orderpriority` = `_ibex_join_0_l_0`, `o_orderkey` = `_ibex_join_0_l_1` }][select { `o_orderpriority` = `o_orderpriority` }][select { `o_orderpriority`, `order_count` = count() }, by { `o_orderpriority` }][update { `_ibex_sort_null_6_0` = is_null(`o_orderpriority`) }][order { `_ibex_sort_null_6_0` desc, `o_orderpriority` asc }];"
+    },
+    "q05": {
+      "upstream_source_sha256": "06e9a007652f9cdbe9793faea756865ef3f8a2b5f2c071ee3f452f3620d74700",
+      "prepare_ms": 38.184383,
+      "first_collect_ms": {
+        "polars": 505.312777,
+        "polars_streaming": 360.6624,
+        "polars_ibex": 492.30895
+      },
+      "output_rows": 5,
+      "status": "passed",
+      "native_source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\n((((((((((parquet::read(^_ibex_scalar_0)[filter ((`r_name` == ^_ibex_scalar_1))][select { `r_regionkey` = `r_regionkey`, `r_name` = `r_name` }][select { `r_regionkey` = `r_regionkey` }][select { `_ibex_join_0_l_0` = `r_regionkey` }]) join (parquet::read(^_ibex_scalar_2)[select { `n_nationkey` = `n_nationkey`, `n_name` = `n_name`, `n_regionkey` = `n_regionkey` }][select { `_ibex_join_0_r_0` = `n_nationkey`, `_ibex_join_0_r_1` = `n_name`, `_ibex_join_0_r_2` = `n_regionkey` }]) on { `_ibex_join_0_l_0` = `_ibex_join_0_r_2` })[select { `r_regionkey` = `_ibex_join_0_l_0`, `n_nationkey` = `_ibex_join_0_r_0`, `n_name` = `_ibex_join_0_r_1` }][select { `n_nationkey` = `n_nationkey`, `n_name` = `n_name` }][select { `_ibex_join_1_l_0` = `n_nationkey`, `_ibex_join_1_l_1` = `n_name` }]) join (parquet::read(^_ibex_scalar_3)[select { `c_custkey` = `c_custkey`, `c_nationkey` = `c_nationkey` }][select { `_ibex_join_1_r_0` = `c_custkey`, `_ibex_join_1_r_1` = `c_nationkey` }]) on { `_ibex_join_1_l_0` = `_ibex_join_1_r_1` })[select { `n_nationkey` = `_ibex_join_1_l_0`, `n_name` = `_ibex_join_1_l_1`, `c_custkey` = `_ibex_join_1_r_0` }][select { `_ibex_join_2_l_0` = `n_nationkey`, `_ibex_join_2_l_1` = `n_name`, `_ibex_join_2_l_2` = `c_custkey` }]) join (parquet::read(^_ibex_scalar_4)[filter (((`o_orderdate` >= ^_ibex_scalar_5) && (`o_orderdate` < ^_ibex_scalar_6)))][select { `o_orderkey` = `o_orderkey`, `o_custkey` = `o_custkey`, `o_orderdate` = `o_orderdate` }][select { `o_orderkey` = `o_orderkey`, `o_custkey` = `o_custkey` }][select { `_ibex_join_2_r_0` = `o_orderkey`, `_ibex_join_2_r_1` = `o_custkey` }]) on { `_ibex_join_2_l_2` = `_ibex_join_2_r_1` })[select { `n_nationkey` = `_ibex_join_2_l_0`, `n_name` = `_ibex_join_2_l_1`, `c_custkey` = `_ibex_join_2_l_2`, `o_orderkey` = `_ibex_join_2_r_0` }][select { `n_nationkey` = `n_nationkey`, `n_name` = `n_name`, `o_orderkey` = `o_orderkey` }][select { `_ibex_join_3_l_0` = `n_nationkey`, `_ibex_join_3_l_1` = `n_name`, `_ibex_join_3_l_2` = `o_orderkey` }]) join (parquet::read(^_ibex_scalar_7)[select { `l_suppkey` = `l_suppkey`, `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount`, `l_orderkey` = `l_orderkey` }][select { `_ibex_join_3_r_0` = `l_suppkey`, `_ibex_join_3_r_1` = `l_extendedprice`, `_ibex_join_3_r_2` = `l_discount`, `_ibex_join_3_r_3` = `l_orderkey` }]) on { `_ibex_join_3_l_2` = `_ibex_join_3_r_3` })[select { `n_nationkey` = `_ibex_join_3_l_0`, `n_name` = `_ibex_join_3_l_1`, `o_orderkey` = `_ibex_join_3_l_2`, `l_suppkey` = `_ibex_join_3_r_0`, `l_extendedprice` = `_ibex_join_3_r_1`, `l_discount` = `_ibex_join_3_r_2` }][select { `n_name` = `n_name`, `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount`, `l_suppkey` = `l_suppkey`, `n_nationkey` = `n_nationkey` }][select { `_ibex_join_4_l_0` = `n_name`, `_ibex_join_4_l_1` = `l_extendedprice`, `_ibex_join_4_l_2` = `l_discount`, `_ibex_join_4_l_3` = `l_suppkey`, `_ibex_join_4_l_4` = `n_nationkey` }]) join (parquet::read(^_ibex_scalar_8)[select { `s_suppkey` = `s_suppkey`, `s_nationkey` = `s_nationkey` }][select { `_ibex_join_4_r_0` = `s_suppkey`, `_ibex_join_4_r_1` = `s_nationkey` }]) on { `_ibex_join_4_l_3` = `_ibex_join_4_r_0`, `_ibex_join_4_l_4` = `_ibex_join_4_r_1` })[select { `n_name` = `_ibex_join_4_l_0`, `l_extendedprice` = `_ibex_join_4_l_1`, `l_discount` = `_ibex_join_4_l_2`, `l_suppkey` = `_ibex_join_4_l_3`, `n_nationkey` = `_ibex_join_4_l_4` }][select { `n_name` = `n_name`, `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount` }][update { `revenue` = (`l_extendedprice` * (^_ibex_scalar_9 - `l_discount`)) }][select { `n_name` = `n_name`, `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount`, `revenue` = `revenue` }][select { `n_name` = `n_name`, `revenue` = `revenue` }][select { `n_name`, `revenue` = coalesce(sum(`revenue`), ^_ibex_scalar_10) }, by { `n_name` }][update { `_ibex_sort_null_16_0` = is_null(`revenue`), `_ibex_sort_nan_16_0` = is_nan(`revenue`) }][order { `_ibex_sort_null_16_0` desc, `_ibex_sort_nan_16_0` desc, `revenue` desc }];"
+    },
+    "q06": {
+      "upstream_source_sha256": "5a35b2610a4cc4b3feccafcec8bde0201880d2f1e9477dd793017d19d405543b",
+      "prepare_ms": 7.881473,
+      "first_collect_ms": {
+        "polars": 193.964956,
+        "polars_streaming": 189.372371,
+        "polars_ibex": 218.794711
+      },
+      "output_rows": 1,
+      "status": "passed",
+      "native_source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\nparquet::read(^_ibex_scalar_0)[filter ((((__ibex_nan_high_ge(`l_discount`, ^_ibex_scalar_1) && __ibex_nan_high_le(`l_discount`, ^_ibex_scalar_2)) && (`l_quantity` < ^_ibex_scalar_3)) && ((`l_shipdate` >= ^_ibex_scalar_4) && (`l_shipdate` < ^_ibex_scalar_5))))][select { `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount`, `l_quantity` = `l_quantity`, `l_shipdate` = `l_shipdate` }][select { `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount` }][update { `revenue` = (`l_extendedprice` * `l_discount`) }][select { `l_extendedprice` = `l_extendedprice`, `l_discount` = `l_discount`, `revenue` = `revenue` }][select { `revenue` = `revenue` }][select { `revenue` = coalesce(sum(`revenue`), ^_ibex_scalar_6) }];"
+    },
+    "q07": {
+      "upstream_source_sha256": "cc44c92f52ae28e52c1d3dfda0f66d7a3057dfe439ac54938cfbc9e81dcb475e",
+      "status": "unsupported",
+      "error": "NotImplementedError: join with a fused predicate"
+    },
+    "q08": {
+      "upstream_source_sha256": "017ec52371d5d4e934b4604b636c4ae971c735cbf6dd1ea31cbe8191fe81d6a5",
+      "status": "unsupported",
+      "error": "NotImplementedError: unsupported function ('round', 2, 'half_to_even')"
+    },
+    "q09": {
+      "upstream_source_sha256": "54aaff0a27c86dae14fe74e4b8262d746d417ae079a829c3663d85624d5e37b8",
+      "status": "unsupported",
+      "error": "NotImplementedError: unsupported function ('fused', 'fms')"
+    },
+    "q10": {
+      "upstream_source_sha256": "104bde7b76875765f88c73665093a6c105290c11b56885556d603e86076120fc",
+      "status": "unsupported",
+      "error": "NotImplementedError: unsupported function ('round', 2, 'half_to_even')"
+    },
+    "q11": {
+      "upstream_source_sha256": "28bbc74d68b8be1a2ce880244425cf3f59f1d45763996209facd355bb3161e45",
+      "status": "unsupported",
+      "error": "NotImplementedError: unsupported join options ('IEJoin', Operator.Gt, None)"
+    },
+    "q12": {
+      "upstream_source_sha256": "5d42a263b1b3f2ef89f8799a85b57aeb8575fcb2b1b7e0311767b86a3731a40b",
+      "prepare_ms": 23.837711,
+      "first_collect_ms": {
+        "polars": 188.848949,
+        "polars_streaming": 152.950774,
+        "polars_ibex": 3072.242629
+      },
+      "output_rows": 2,
+      "status": "passed",
+      "native_source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\n((parquet::read(^_ibex_scalar_0)[select { `o_orderpriority` = `o_orderpriority`, `o_orderkey` = `o_orderkey` }][select { `_ibex_join_0_l_0` = `o_orderpriority`, `_ibex_join_0_l_1` = `o_orderkey` }]) join (parquet::read(^_ibex_scalar_1)[filter (((((`l_commitdate` < `l_receiptdate`) && ((`l_receiptdate` >= ^_ibex_scalar_2) && (`l_receiptdate` < ^_ibex_scalar_3))) && (`l_shipdate` < `l_commitdate`)) && case { is_null(`l_shipmode`) => case { true => NULL, else => ^_ibex_scalar_4 }, else => ((^_ibex_scalar_5 || (`l_shipmode` == ^_ibex_scalar_6)) || (`l_shipmode` == ^_ibex_scalar_7)) }))][select { `l_shipmode` = `l_shipmode`, `l_orderkey` = `l_orderkey`, `l_commitdate` = `l_commitdate`, `l_receiptdate` = `l_receiptdate`, `l_shipdate` = `l_shipdate` }][select { `l_shipmode` = `l_shipmode`, `l_orderkey` = `l_orderkey` }][select { `_ibex_join_0_r_0` = `l_shipmode`, `_ibex_join_0_r_1` = `l_orderkey` }]) on { `_ibex_join_0_l_1` = `_ibex_join_0_r_1` })[select { `o_orderpriority` = `_ibex_join_0_l_0`, `o_orderkey` = `_ibex_join_0_l_1`, `l_shipmode` = `_ibex_join_0_r_0` }][select { `o_orderpriority` = `o_orderpriority`, `l_shipmode` = `l_shipmode` }][update { `line_count` = case { is_null(`o_orderpriority`) => case { true => NULL, else => ^_ibex_scalar_8 }, else => ((^_ibex_scalar_9 || (`o_orderpriority` == ^_ibex_scalar_10)) || (`o_orderpriority` == ^_ibex_scalar_11)) } }][select { `o_orderpriority` = `o_orderpriority`, `l_shipmode` = `l_shipmode`, `line_count` = `line_count` }][select { `l_shipmode` = `l_shipmode`, `line_count` = `line_count` }][select { `l_shipmode`, `high_line_count` = coalesce(sum(Int64(`line_count`)), ^_ibex_scalar_12), `low_line_count` = coalesce(sum(Int64(!(`line_count`))), ^_ibex_scalar_13) }, by { `l_shipmode` }][update { `_ibex_sort_null_7_0` = is_null(`l_shipmode`) }][order { `_ibex_sort_null_7_0` desc, `l_shipmode` asc }];"
+    },
+    "q13": {
+      "upstream_source_sha256": "1734e09cb01bebf788107d1753bfc732d26286f045d68d4cef96b04c746ae6e0",
+      "status": "unsupported",
+      "error": "NotImplementedError: regular-expression operators in contains are unsupported"
+    },
+    "q14": {
+      "upstream_source_sha256": "b7bd21090dec3fc94e30b200c12a7c11010e4adbd44c91ec2a9f4848af050503",
+      "status": "unsupported",
+      "error": "NotImplementedError: unsupported function ('round', 2, 'half_to_even')"
+    },
+    "q15": {
+      "upstream_source_sha256": "68cb07d4a75bfb540775300f698004b1070607b7f27ae5b33a8551c72e2e3ae2",
+      "status": "unsupported",
+      "error": "NotImplementedError: reductions inside filters are not supported yet"
+    },
+    "q16": {
+      "upstream_source_sha256": "ce4a44c56fa2b79dba34fc73e286017c5cfa7698f839ce957f865eb80d7bbdd8",
+      "status": "unsupported",
+      "error": "NotImplementedError: regular-expression operators in contains are unsupported"
+    },
+    "q17": {
+      "upstream_source_sha256": "b12744bcb8175684884b6be5ca037800a3a3fbcaa2cb3d387d3813d45698b9b6",
+      "status": "unsupported",
+      "error": "NotImplementedError: join with a fused predicate"
+    },
+    "q18": {
+      "upstream_source_sha256": "94323643fcee16e888e700ed427fec857c60a3aa15a1a680cd04c90a2b8b2e23",
+      "prepare_ms": 64.845239,
+      "first_collect_ms": {
+        "polars": 1428.100552,
+        "polars_streaming": 487.023507,
+        "polars_ibex": 985.47217
+      },
+      "output_rows": 100,
+      "status": "passed",
+      "native_source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\n((((((parquet::read(^_ibex_scalar_0)[select { `o_orderkey` = `o_orderkey`, `o_custkey` = `o_custkey`, `o_totalprice` = `o_totalprice`, `o_orderdate` = `o_orderdate` }][select { `_ibex_join_0_l_0` = `o_orderkey`, `_ibex_join_0_l_1` = `o_custkey`, `_ibex_join_0_l_2` = `o_totalprice`, `_ibex_join_0_l_3` = `o_orderdate` }]) semi join (parquet::read(^_ibex_scalar_1)[select { `l_orderkey` = `l_orderkey`, `l_quantity` = `l_quantity` }][select { `l_orderkey`, `sum_quantity` = coalesce(sum(`l_quantity`), ^_ibex_scalar_2) }, by { `l_orderkey` }][filter ((`sum_quantity` > ^_ibex_scalar_3))][select { `l_orderkey` = `l_orderkey` }][select { `_ibex_join_0_r_0` = `l_orderkey` }]) on { `_ibex_join_0_l_0` = `_ibex_join_0_r_0` })[select { `o_orderkey` = `_ibex_join_0_l_0`, `o_custkey` = `_ibex_join_0_l_1`, `o_totalprice` = `_ibex_join_0_l_2`, `o_orderdate` = `_ibex_join_0_l_3` }][select { `_ibex_join_1_l_0` = `o_orderkey`, `_ibex_join_1_l_1` = `o_custkey`, `_ibex_join_1_l_2` = `o_totalprice`, `_ibex_join_1_l_3` = `o_orderdate` }]) join (parquet::read(^_ibex_scalar_4)[select { `l_orderkey` = `l_orderkey`, `l_quantity` = `l_quantity` }][select { `l_quantity` = `l_quantity`, `l_orderkey` = `l_orderkey` }][select { `_ibex_join_1_r_0` = `l_quantity`, `_ibex_join_1_r_1` = `l_orderkey` }]) on { `_ibex_join_1_l_0` = `_ibex_join_1_r_1` })[select { `o_orderkey` = `_ibex_join_1_l_0`, `o_custkey` = `_ibex_join_1_l_1`, `o_totalprice` = `_ibex_join_1_l_2`, `o_orderdate` = `_ibex_join_1_l_3`, `l_quantity` = `_ibex_join_1_r_0` }][select { `_ibex_join_2_l_0` = `o_orderkey`, `_ibex_join_2_l_1` = `o_custkey`, `_ibex_join_2_l_2` = `o_totalprice`, `_ibex_join_2_l_3` = `o_orderdate`, `_ibex_join_2_l_4` = `l_quantity` }]) join (parquet::read(^_ibex_scalar_5)[select { `c_name` = `c_name`, `c_custkey` = `c_custkey` }][select { `_ibex_join_2_r_0` = `c_name`, `_ibex_join_2_r_1` = `c_custkey` }]) on { `_ibex_join_2_l_1` = `_ibex_join_2_r_1` })[select { `o_orderkey` = `_ibex_join_2_l_0`, `o_custkey` = `_ibex_join_2_l_1`, `o_totalprice` = `_ibex_join_2_l_2`, `o_orderdate` = `_ibex_join_2_l_3`, `l_quantity` = `_ibex_join_2_l_4`, `c_name` = `_ibex_join_2_r_0` }][select { `c_name` = `c_name`, `o_custkey` = `o_custkey`, `o_orderkey` = `o_orderkey`, `o_orderdate` = `o_orderdate`, `o_totalprice` = `o_totalprice`, `l_quantity` = `l_quantity` }][update { `_ibex_hstack_5_0` = case { is_nan(`o_totalprice`) => ^_ibex_scalar_6, else => ^_ibex_scalar_7 }, `_ibex_hstack_5_1` = case { is_nan(`o_totalprice`) => Float64(^_ibex_scalar_8), else => Float64(`o_totalprice`) } }][update { `_ibex_group_9_nan_4` = `_ibex_hstack_5_0`, `_ibex_group_9_value_4` = `_ibex_hstack_5_1` }][select { `c_name`, `o_custkey`, `o_orderkey`, `o_orderdate`, `_ibex_group_9_nan_4`, `_ibex_group_9_value_4`, `o_totalprice` = first_null(`o_totalprice`), `col6` = coalesce(sum(`l_quantity`), ^_ibex_scalar_9) }, by { `c_name`, `o_custkey`, `o_orderkey`, `o_orderdate`, `_ibex_group_9_nan_4`, `_ibex_group_9_value_4` }][select { `c_name` = `c_name`, `o_custkey` = `o_custkey`, `o_orderkey` = `o_orderkey`, `o_orderdate` = `o_orderdate`, `o_totalprice` = `o_totalprice`, `col6` = `col6` }][select { `c_name` = `c_name`, `c_custkey` = `o_custkey`, `o_orderkey` = `o_orderkey`, `o_orderdat` = `o_orderdate`, `o_totalprice` = `o_totalprice`, `col6` = `col6` }][update { `_ibex_sort_null_9_0` = is_null(`o_totalprice`), `_ibex_sort_nan_9_0` = is_nan(`o_totalprice`), `_ibex_sort_null_9_1` = is_null(`o_orderdat`) }][order { `_ibex_sort_null_9_0` desc, `_ibex_sort_nan_9_0` desc, `o_totalprice` desc, `_ibex_sort_null_9_1` desc, `o_orderdat` asc }][update { `_ibex_slice_row_10` = seq() }][filter `_ibex_slice_row_10` >= 0 && `_ibex_slice_row_10` < 100][select { `c_name`, `c_custkey`, `o_orderkey`, `o_orderdat`, `o_totalprice`, `col6` }];"
+    },
+    "q19": {
+      "upstream_source_sha256": "bb32570928c5f9502fd96e87ac7da588a00b396c4a2c0acbed03b2340f9837fe",
+      "status": "unsupported",
+      "error": "NotImplementedError: join with a fused predicate"
+    },
+    "q20": {
+      "upstream_source_sha256": "19165d7bcfeacf77289ef3d8b27721f834e067511e62821af04d1f0d29bc28a7",
+      "status": "unsupported",
+      "error": "NotImplementedError: join with a fused predicate"
+    },
+    "q21": {
+      "upstream_source_sha256": "5ac37db9da516a82ec322cee95d3b4745e27782f4e72b6026db744d0dce2a229",
+      "status": "unsupported",
+      "error": "NotImplementedError: unsupported Polars expression Filter (node 39)"
+    },
+    "q22": {
+      "upstream_source_sha256": "db2bd21c39ecc82f1adf928c8b065cbc00b94a83a89d73396770d2f6ce2882a8",
+      "status": "unsupported",
+      "error": "NotImplementedError: unsupported join options ('IEJoin', Operator.Gt, None)"
+    }
+  }
+}

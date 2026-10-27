@@ -369,6 +369,41 @@ TEST_CASE("A bare update bounds the parallel run", "[runtime][pipeline]") {
     }
 }
 
+TEST_CASE("Projections between stream-only updates stream with them", "[runtime][pipeline]") {
+    // A renaming select lowers to an update and a projection, so two of them
+    // put a projection between updates. Stopping the climb at it left the
+    // updates above serial, and a join's scan-worker sink withdrawn (q22's
+    // anti-join key over the orders scan).
+    auto program =
+        require_parse("df[update { n = price * 2 }][select { n }][update { m = n + 1 }][select { m }];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+    {
+        const auto plan = pipeline_of(**result);
+        REQUIRE(runs_over_morsels(plan));
+        REQUIRE(plan.steps.size() >= 3);
+        CHECK(std::ranges::any_of(plan.steps, [](const auto& step) {
+            return step.node->kind() == ir::NodeKind::Project;
+        }));
+        CHECK(plan.parallel_begin == 0);
+        CHECK(plan.parallel_end == plan.steps.size());
+        CHECK(plan.stream_only_updates == plan.steps.size());
+    }
+    {
+        // Over a table nothing streams, so nothing is admitted.
+        const auto plan = pipeline_over_table(**result);
+        CHECK(plan.stream_only_updates == 0);
+    }
+    {
+        // Projections alone are no row work and still form no run.
+        auto projections = require_parse("df[select { price }];");
+        auto lowered = parser::lower(projections);
+        REQUIRE(lowered.has_value());
+        const auto plan = pipeline_of(**lowered);
+        CHECK(plan.stream_only_updates == 0);
+    }
+}
+
 TEST_CASE("An update below a run joins it only over a lazy source", "[runtime][pipeline]") {
     // TPC-H q22's shape: a computed column, then a filter on it. Over a table
     // the update bounds the run from below and is its input, as before.

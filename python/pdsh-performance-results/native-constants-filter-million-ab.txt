@@ -1,0 +1,62 @@
+HEAD is now at 17fb8c15 Verify NaN policy parity and record Q6 performance gains
+HEAD is now at 25d1f021 Fuse numeric filter bounds with NaN-high comparisons
+warning: prices_multi CSV not found: /home/brj/ibex/benchmarking/data/prices_multi.csv
+         queries needing it are skipped on BOTH sides
+warning: events CSV not found: /home/brj/ibex/benchmarking/data/events.csv
+         queries needing it are skipped on BOTH sides
+warning: lookup CSV not found: /home/brj/ibex/benchmarking/data/lookup.csv
+         queries needing it are skipped on BOTH sides
+warning: users CSV not found: /home/brj/ibex/benchmarking/data/users.csv
+         queries needing it are skipped on BOTH sides
+Benchmarking base:   17fb8c15@17fb8c15
+Benchmarking target: 25d1f021@25d1f021
+Using warmup=1, iters=5, repeats=12, interleave=on, replica-control=off
+Compiler path prefix map: on
+Build cache: /tmp/ibex-composite-perfcmp
+Pinning: taskset -c 2
+Ibex suite: filter
+Building base ...
+  base: build dir cached, configure skipped
+Building target ...
+  target: build dir cached, configure skipped
+Interleaving repeats with balanced run positions
+  -> base repeat 1/12
+  -> target repeat 1/12
+  -> target repeat 2/12
+  -> base repeat 2/12
+  -> base repeat 3/12
+  -> target repeat 3/12
+  -> target repeat 4/12
+  -> base repeat 4/12
+  -> base repeat 5/12
+  -> target repeat 5/12
+  -> target repeat 6/12
+  -> base repeat 6/12
+  -> base repeat 7/12
+  -> target repeat 7/12
+  -> target repeat 8/12
+  -> base repeat 8/12
+  -> base repeat 9/12
+  -> target repeat 9/12
+  -> target repeat 10/12
+  -> base repeat 10/12
+  -> base repeat 11/12
+  -> target repeat 11/12
+  -> target repeat 12/12
+  -> base repeat 12/12
+
+base=17fb8c15@17fb8c15
+target=25d1f021@25d1f021
+prefix_map=on
+replica_binary=not-requested
+
+framework  query          base_ms  target_ms  delta_ms  delta_pct  speedup_x  base_iqr_ms  target_iqr_ms  verdict     base_samples  target_samples  rows    replica_delta_ms  replica_iqr_ms  replica_relation
+ibex       filter_and     1.0925   1.1025     +0.0100   +0.92%     0.991      0.1517       0.1018         noise       12            12              98680   -                 -               -
+ibex       filter_arith   2.0595   2.2120     +0.1525   +7.40%     0.931      0.0325       0.0395         regression  12            12              673400  -                 -               -
+ibex       filter_or      1.1280   1.1170     -0.0110   -0.98%     1.010      0.1062       0.0730         noise       12            12              117120  -                 -               -
+ibex       filter_simple  1.6930   1.7865     +0.0935   +5.52%     0.948      0.0600       0.0345         regression  12            12              499960  -                 -               -
+
+Summary (totals + medians + geometric mean speedup):
+scope  queries  total_base_ms  total_target_ms  total_delta_ms  total_delta_pct  median_base_ms  median_target_ms  median_delta_ms  median_delta_pct  median_speedup_x  geom_speedup_x  geom_samples
+ALL    4        5.9730         6.2180           +0.2450         +4.10%           1.4105          1.4518            +0.0517          +3.22%            0.969             0.969           4
+ibex   4        5.9730         6.2180           +0.2450         +4.10%           1.4105          1.4518            +0.0517          +3.22%            0.969             0.969           4

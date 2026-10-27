@@ -13,6 +13,7 @@
 #include <ibex/ir/schema.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/pipeline.hpp>
 
 #include <algorithm>
@@ -467,13 +468,29 @@ void admit_stream_only_updates(Plan& plan, bool found_run) {
         plan.stream_only_bottom_updates = plan.steps.size() - plan.parallel_end;
         plan.parallel_end = plan.steps.size();
     }
+    // Projections and renames between those updates come along: a worker
+    // applies them to its unit for free, and stopping at one left the updates
+    // above it serial -- and the scan-worker sink of a join over the chain
+    // withdrawn. The adapter lowers each renaming `select` to an update and a
+    // projection, so q22's anti-join key reached its probe as Project, Update,
+    // Project, Update over the orders scan. At least one update must come, or
+    // the chain has no row work to stream.
     std::size_t begin = found_run ? plan.parallel_begin : plan.steps.size();
     std::size_t admitted = 0;
-    while (begin > 0 && is_stream_admissible_update(*plan.steps[begin - 1].node)) {
+    std::size_t admitted_updates = 0;
+    while (begin > 0) {
+        const ir::Node& node = *plan.steps[begin - 1].node;
+        if (is_stream_admissible_update(node)) {
+            ++admitted_updates;
+        } else if (execution_capability(node) != ExecutionCapability::ParallelMap ||
+                   !is_metadata_only_node(node.kind()) ||
+                   !map_step_expressions_are_subset_evaluable(node)) {
+            break;
+        }
         --begin;
         ++admitted;
     }
-    if (admitted == 0) {
+    if (admitted_updates == 0) {
         return;
     }
     if (!found_run) {
@@ -554,6 +571,31 @@ auto is_stream_admissible_update(const ir::Node& node) -> bool {
     });
 }
 
+auto deferred_source_schemas(const DeferredScanRegistry* deferred) -> ir::SourceSchemas {
+    ir::SourceSchemas schemas;
+    if (deferred == nullptr) {
+        return schemas;
+    }
+    schemas.reserve(deferred->size());
+    for (const auto& [name, scan] : *deferred) {
+        if (scan.lazy == nullptr) {
+            continue;
+        }
+        std::vector<ir::SchemaField> fields;
+        fields.reserve(scan.lazy->schema().columns.size());
+        for (const ColumnEntry& column : scan.lazy->schema().columns) {
+            const ir::ColumnType type = runtime_column_type(*column.column);
+            // A string column's in-memory form (plain or dictionary) can be
+            // settled only when it decodes, so it stays untyped here.
+            const bool settled = type != ir::ColumnType::String && type != ir::ColumnType::Categorical;
+            fields.push_back({.name = column.name,
+                              .type = settled ? std::optional<ir::ColumnType>{type} : std::nullopt});
+        }
+        schemas.insert_or_assign(name, ir::SchemaInfo::known(std::move(fields), /*open=*/false));
+    }
+    return schemas;
+}
+
 auto plan_physical(const ir::Node& root, const TableRegistry& registry,
                    const ExternRegistry* externs, const ir::SourceSchemas& source_schemas) -> Plan {
     Plan plan;
@@ -628,7 +670,7 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
     }
     if (root.kind() == ir::NodeKind::Join) {
         const auto& join = ir::node_cast<ir::JoinNode>(root);
-        plan.join = plan_join(join);
+        plan.join = plan_join(join, schemas);
         // Streaming joins use physical operators; materializing joins use the
         // fallback and contribute to fallback statistics.
         if (plan.join.strategy == JoinStrategy::StreamingProbe) {
@@ -998,6 +1040,7 @@ auto plan_aggregate(const ir::AggregateNode& agg) -> AggregatePlan {
         out.strategy = AggregateStrategy::FusedLeftJoinCount;
         out.fused_join = fusion->join;
         out.counted_column = std::move(fusion->counted_column);
+        out.group_source = std::move(fusion->group_source);
         return out;
     }
     out.strategy = aggregate_is_streamable(agg) ? AggregateStrategy::StreamingSorted
@@ -1228,7 +1271,7 @@ auto validate_hash_aggregate_edges(const HashAggregateNodes& nodes) -> std::opti
     return std::nullopt;
 }
 
-auto plan_join(const ir::JoinNode& join) -> JoinPlan {
+auto plan_join(const ir::JoinNode& join, const ir::SourceSchemas& sources) -> JoinPlan {
     JoinPlan out;
     out.describes = true;
     out.kind = join.kind();
@@ -1236,11 +1279,11 @@ auto plan_join(const ir::JoinNode& join) -> JoinPlan {
 
     // Use the shared eligibility gates so planning and execution agree on
     // supported join shapes. Check semi/anti before the inner-join strategies.
-    if (is_streamable_semi_anti_join(join)) {
+    if (is_streamable_semi_anti_join(join, sources)) {
         out.branch = JoinBranch::SemiAnti;
     } else if (is_streamable_inner_join(join)) {
         out.branch = JoinBranch::SingleKeyInner;
-    } else if (is_streamable_pair_int_join(join)) {
+    } else if (is_streamable_pair_int_join(join, sources)) {
         out.branch = JoinBranch::PairIntInner;
     }
     out.strategy = out.branch == JoinBranch::None ? JoinStrategy::MaterializeBoth
@@ -1259,7 +1302,7 @@ auto plan_join(const ir::JoinNode& join) -> JoinPlan {
         // NOLINTNEXTLINE(bugprone-branch-clone)
     } else if (join.keys().size() > 2) {
         out.decline = JoinDeclineReason::MultipleKeys;
-    } else if (join.keys().size() == 2 && !join_keys_provably_int64(join)) {
+    } else if (join.keys().size() == 2 && !join_keys_provably_int64(join, sources)) {
         // Two keys stream only as the all-Int64 pair shape -- inner through
         // `PairIntInner`, semi/anti through the semi/anti operator's pair set.
         out.decline = JoinDeclineReason::KeyTypesUnsupported;

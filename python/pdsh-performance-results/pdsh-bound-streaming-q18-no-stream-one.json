@@ -1,0 +1,131 @@
+{
+  "git_head": "285290bd45e8938b1dbc33380c6ef068d0d59fb7",
+  "native_worktree_patch": "",
+  "upstream_head": "401908a307f133a2dffbe3f5e0e0fb2b50ea310b",
+  "ibex_cores": "1",
+  "affinity": [
+    2
+  ],
+  "cpu_frequency_khz": {
+    "scaling_min_freq": "3200000",
+    "scaling_max_freq": "3200000"
+  },
+  "data": [
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/customer.parquet",
+      "bytes": 81366456,
+      "mtime_ns": 1792828808266811953
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/lineitem.parquet",
+      "bytes": 1801546483,
+      "mtime_ns": 1792828812385804504
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/nation.parquet",
+      "bytes": 3083,
+      "mtime_ns": 1792828814559800573
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/orders.parquet",
+      "bytes": 391488464,
+      "mtime_ns": 1792828815334799172
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/part.parquet",
+      "bytes": 41388677,
+      "mtime_ns": 1792828815922798108
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/partsupp.parquet",
+      "bytes": 295923709,
+      "mtime_ns": 1792828816386797269
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/region.parquet",
+      "bytes": 1827,
+      "mtime_ns": 1792828816660796774
+    },
+    {
+      "path": "/home/brj/code/polars-benchmark/data/tables/scale-10.0/supplier.parquet",
+      "bytes": 5208557,
+      "mtime_ns": 1792828816700796702
+    }
+  ],
+  "iterations": 6,
+  "queries": {
+    "q18": {
+      "status": "passed",
+      "metadata": {
+        "before": {
+          "source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\n((((((parquet::read(^_ibex_scalar_0)[select { `o_orderkey` = `o_orderkey`, `o_custkey` = `o_custkey`, `o_totalprice` = `o_totalprice`, `o_orderdate` = `o_orderdate` }][select { `_ibex_join_0_l_0` = `o_orderkey`, `_ibex_join_0_l_1` = `o_custkey`, `_ibex_join_0_l_2` = `o_totalprice`, `_ibex_join_0_l_3` = `o_orderdate` }]) semi join (parquet::read(^_ibex_scalar_1)[select { `l_orderkey` = `l_orderkey`, `l_quantity` = `l_quantity` }][select { `l_orderkey`, `sum_quantity` = coalesce(sum(`l_quantity`), ^_ibex_scalar_2) }, by { `l_orderkey` }][filter ((`sum_quantity` > ^_ibex_scalar_3))][select { `l_orderkey` = `l_orderkey` }][select { `_ibex_join_0_r_0` = `l_orderkey` }]) on { `_ibex_join_0_l_0` = `_ibex_join_0_r_0` })[select { `o_orderkey` = `_ibex_join_0_l_0`, `o_custkey` = `_ibex_join_0_l_1`, `o_totalprice` = `_ibex_join_0_l_2`, `o_orderdate` = `_ibex_join_0_l_3` }][select { `_ibex_join_1_l_0` = `o_orderkey`, `_ibex_join_1_l_1` = `o_custkey`, `_ibex_join_1_l_2` = `o_totalprice`, `_ibex_join_1_l_3` = `o_orderdate` }]) join (parquet::read(^_ibex_scalar_4)[select { `l_orderkey` = `l_orderkey`, `l_quantity` = `l_quantity` }][select { `l_quantity` = `l_quantity`, `l_orderkey` = `l_orderkey` }][select { `_ibex_join_1_r_0` = `l_quantity`, `_ibex_join_1_r_1` = `l_orderkey` }]) on { `_ibex_join_1_l_0` = `_ibex_join_1_r_1` })[select { `o_orderkey` = `_ibex_join_1_l_0`, `o_custkey` = `_ibex_join_1_l_1`, `o_totalprice` = `_ibex_join_1_l_2`, `o_orderdate` = `_ibex_join_1_l_3`, `l_quantity` = `_ibex_join_1_r_0` }][select { `_ibex_join_2_l_0` = `o_orderkey`, `_ibex_join_2_l_1` = `o_custkey`, `_ibex_join_2_l_2` = `o_totalprice`, `_ibex_join_2_l_3` = `o_orderdate`, `_ibex_join_2_l_4` = `l_quantity` }]) join (parquet::read(^_ibex_scalar_5)[select { `c_name` = `c_name`, `c_custkey` = `c_custkey` }][select { `_ibex_join_2_r_0` = `c_name`, `_ibex_join_2_r_1` = `c_custkey` }]) on { `_ibex_join_2_l_1` = `_ibex_join_2_r_1` })[select { `o_orderkey` = `_ibex_join_2_l_0`, `o_custkey` = `_ibex_join_2_l_1`, `o_totalprice` = `_ibex_join_2_l_2`, `o_orderdate` = `_ibex_join_2_l_3`, `l_quantity` = `_ibex_join_2_l_4`, `c_name` = `_ibex_join_2_r_0` }][select { `c_name` = `c_name`, `o_custkey` = `o_custkey`, `o_orderkey` = `o_orderkey`, `o_orderdate` = `o_orderdate`, `o_totalprice` = `o_totalprice`, `l_quantity` = `l_quantity` }][update { `_ibex_hstack_5_0` = case { is_nan(`o_totalprice`) => ^_ibex_scalar_6, else => ^_ibex_scalar_7 }, `_ibex_hstack_5_1` = case { is_nan(`o_totalprice`) => Float64(^_ibex_scalar_8), else => Float64(`o_totalprice`) } }][update { `_ibex_group_9_nan_4` = `_ibex_hstack_5_0`, `_ibex_group_9_value_4` = `_ibex_hstack_5_1` }][select { `c_name`, `o_custkey`, `o_orderkey`, `o_orderdate`, `_ibex_group_9_nan_4`, `_ibex_group_9_value_4`, `o_totalprice` = first_null(`o_totalprice`), `col6` = coalesce(sum(`l_quantity`), ^_ibex_scalar_9) }, by { `c_name`, `o_custkey`, `o_orderkey`, `o_orderdate`, `_ibex_group_9_nan_4`, `_ibex_group_9_value_4` }][select { `c_name` = `c_name`, `o_custkey` = `o_custkey`, `o_orderkey` = `o_orderkey`, `o_orderdate` = `o_orderdate`, `o_totalprice` = `o_totalprice`, `col6` = `col6` }][select { `c_name` = `c_name`, `c_custkey` = `o_custkey`, `o_orderkey` = `o_orderkey`, `o_orderdat` = `o_orderdate`, `o_totalprice` = `o_totalprice`, `col6` = `col6` }][update { `_ibex_sort_null_9_0` = is_null(`o_totalprice`), `_ibex_sort_nan_9_0` = is_nan(`o_totalprice`), `_ibex_sort_null_9_1` = is_null(`o_orderdat`) }][order { `_ibex_sort_null_9_0` desc, `_ibex_sort_nan_9_0` desc, `o_totalprice` desc, `_ibex_sort_null_9_1` desc, `o_orderdat` asc }][update { `_ibex_slice_row_10` = seq() }][filter `_ibex_slice_row_10` >= 0 && `_ibex_slice_row_10` < 100][select { `c_name`, `c_custkey`, `o_orderkey`, `o_orderdat`, `o_totalprice`, `col6` }];",
+          "output_shape": [
+            100,
+            6
+          ],
+          "schema": "Schema({'c_name': String, 'c_custkey': Int64, 'o_orderkey': Int64, 'o_orderdat': Date, 'o_totalprice': Float64, 'col6': Int64})",
+          "polars_version": "2.0.0",
+          "upstream_source_sha256": "94323643fcee16e888e700ed427fec857c60a3aa15a1a680cd04c90a2b8b2e23",
+          "bridge": "/tmp/q12-baseline/ibex_pyarrow.cpython-314-x86_64-linux-gnu.so",
+          "bridge_sha256": "468f4d1940a56813a92c079e2ed16afcdea3c87051bc6318cbd288218f453153",
+          "polars_threads": 1
+        },
+        "after": {
+          "source": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\n((((((parquet::read(^_ibex_scalar_0)[select { `o_orderkey` = `o_orderkey`, `o_custkey` = `o_custkey`, `o_totalprice` = `o_totalprice`, `o_orderdate` = `o_orderdate` }][select { `_ibex_join_0_l_0` = `o_orderkey`, `_ibex_join_0_l_1` = `o_custkey`, `_ibex_join_0_l_2` = `o_totalprice`, `_ibex_join_0_l_3` = `o_orderdate` }]) semi join (parquet::read(^_ibex_scalar_1)[select { `l_orderkey` = `l_orderkey`, `l_quantity` = `l_quantity` }][select { `l_orderkey`, `sum_quantity` = coalesce(sum(`l_quantity`), ^_ibex_scalar_2) }, by { `l_orderkey` }][filter ((`sum_quantity` > ^_ibex_scalar_3))][select { `l_orderkey` = `l_orderkey` }][select { `_ibex_join_0_r_0` = `l_orderkey` }]) on { `_ibex_join_0_l_0` = `_ibex_join_0_r_0` })[select { `o_orderkey` = `_ibex_join_0_l_0`, `o_custkey` = `_ibex_join_0_l_1`, `o_totalprice` = `_ibex_join_0_l_2`, `o_orderdate` = `_ibex_join_0_l_3` }][select { `_ibex_join_1_l_0` = `o_orderkey`, `_ibex_join_1_l_1` = `o_custkey`, `_ibex_join_1_l_2` = `o_totalprice`, `_ibex_join_1_l_3` = `o_orderdate` }]) join (parquet::read(^_ibex_scalar_4)[select { `l_orderkey` = `l_orderkey`, `l_quantity` = `l_quantity` }][select { `l_quantity` = `l_quantity`, `l_orderkey` = `l_orderkey` }][select { `_ibex_join_1_r_0` = `l_quantity`, `_ibex_join_1_r_1` = `l_orderkey` }]) on { `_ibex_join_1_l_0` = `_ibex_join_1_r_1` })[select { `o_orderkey` = `_ibex_join_1_l_0`, `o_custkey` = `_ibex_join_1_l_1`, `o_totalprice` = `_ibex_join_1_l_2`, `o_orderdate` = `_ibex_join_1_l_3`, `l_quantity` = `_ibex_join_1_r_0` }][select { `_ibex_join_2_l_0` = `o_orderkey`, `_ibex_join_2_l_1` = `o_custkey`, `_ibex_join_2_l_2` = `o_totalprice`, `_ibex_join_2_l_3` = `o_orderdate`, `_ibex_join_2_l_4` = `l_quantity` }]) join (parquet::read(^_ibex_scalar_5)[select { `c_name` = `c_name`, `c_custkey` = `c_custkey` }][select { `_ibex_join_2_r_0` = `c_name`, `_ibex_join_2_r_1` = `c_custkey` }]) on { `_ibex_join_2_l_1` = `_ibex_join_2_r_1` })[select { `o_orderkey` = `_ibex_join_2_l_0`, `o_custkey` = `_ibex_join_2_l_1`, `o_totalprice` = `_ibex_join_2_l_2`, `o_orderdate` = `_ibex_join_2_l_3`, `l_quantity` = `_ibex_join_2_l_4`, `c_name` = `_ibex_join_2_r_0` }][select { `c_name` = `c_name`, `o_custkey` = `o_custkey`, `o_orderkey` = `o_orderkey`, `o_orderdate` = `o_orderdate`, `o_totalprice` = `o_totalprice`, `l_quantity` = `l_quantity` }][update { `_ibex_hstack_5_0` = case { is_nan(`o_totalprice`) => ^_ibex_scalar_6, else => ^_ibex_scalar_7 }, `_ibex_hstack_5_1` = case { is_nan(`o_totalprice`) => Float64(^_ibex_scalar_8), else => Float64(`o_totalprice`) } }][update { `_ibex_group_9_nan_4` = `_ibex_hstack_5_0`, `_ibex_group_9_value_4` = `_ibex_hstack_5_1` }][select { `c_name`, `o_custkey`, `o_orderkey`, `o_orderdate`, `_ibex_group_9_nan_4`, `_ibex_group_9_value_4`, `o_totalprice` = first_null(`o_totalprice`), `col6` = coalesce(sum(`l_quantity`), ^_ibex_scalar_9) }, by { `c_name`, `o_custkey`, `o_orderkey`, `o_orderdate`, `_ibex_group_9_nan_4`, `_ibex_group_9_value_4` }][select { `c_name` = `c_name`, `o_custkey` = `o_custkey`, `o_orderkey` = `o_orderkey`, `o_orderdate` = `o_orderdate`, `o_totalprice` = `o_totalprice`, `col6` = `col6` }][select { `c_name` = `c_name`, `c_custkey` = `o_custkey`, `o_orderkey` = `o_orderkey`, `o_orderdat` = `o_orderdate`, `o_totalprice` = `o_totalprice`, `col6` = `col6` }][update { `_ibex_sort_null_9_0` = is_null(`o_totalprice`), `_ibex_sort_nan_9_0` = is_nan(`o_totalprice`), `_ibex_sort_null_9_1` = is_null(`o_orderdat`) }][order { `_ibex_sort_null_9_0` desc, `_ibex_sort_nan_9_0` desc, `o_totalprice` desc, `_ibex_sort_null_9_1` desc, `o_orderdat` asc }][update { `_ibex_slice_row_10` = seq() }][filter `_ibex_slice_row_10` >= 0 && `_ibex_slice_row_10` < 100][select { `c_name`, `c_custkey`, `o_orderkey`, `o_orderdat`, `o_totalprice`, `col6` }];",
+          "output_shape": [
+            100,
+            6
+          ],
+          "schema": "Schema({'c_name': String, 'c_custkey': Int64, 'o_orderkey': Int64, 'o_orderdat': Date, 'o_totalprice': Float64, 'col6': Int64})",
+          "polars_version": "2.0.0",
+          "upstream_source_sha256": "94323643fcee16e888e700ed427fec857c60a3aa15a1a680cd04c90a2b8b2e23",
+          "bridge": "/home/brj/ibex/build-release/python/ibex_pyarrow.cpython-314-x86_64-linux-gnu.so",
+          "bridge_sha256": "914154775964611f22acd3b21d160a1a4026e232cdbc1ce139965878c16722d9",
+          "polars_threads": 1
+        }
+      },
+      "first_per_query_ms": {
+        "before": 4047.604056,
+        "after": 3090.659554,
+        "polars_streaming": 3421.279113
+      },
+      "samples_ms": {
+        "before": [
+          2621.550042,
+          2628.564531,
+          2601.544899,
+          2631.029438,
+          2623.375629,
+          2613.512092
+        ],
+        "after": [
+          2316.174319,
+          2342.691435,
+          2316.270058,
+          2336.139662,
+          2317.47985,
+          2337.680917
+        ],
+        "polars_streaming": [
+          3361.862371,
+          3350.197378,
+          3346.10756,
+          3372.186868,
+          3381.554685,
+          3356.495277
+        ]
+      },
+      "median_ms": {
+        "before": 2622.4628355,
+        "after": 2326.809756,
+        "polars_streaming": 3359.178824
+      },
+      "median_paired_change_pct": -11.086872752090182,
+      "after_faster_pairs": 6
+    }
+  },
+  "driver": "# SPDX-License-Identifier: AGPL-3.0-only\n# Copyright (C) 2026 Bob Jansen\n\"\"\"Paired PDS-H comparison of two saved native bridges and streaming Polars.\n\nBoth workers use the same Python adapter, isolating native executor changes.\nRun each thread budget separately, with matched IBEX_CORES/POLARS_MAX_THREADS.\n\"\"\"\nimport argparse\nimport hashlib\nimport importlib\nfrom itertools import permutations\nimport json\nimport os\nfrom pathlib import Path\nimport statistics\nimport subprocess\nimport sys\nimport time\n\n\ndef worker(args):\n    import ibex_pyarrow\n    import polars as pl\n    from polars.testing import assert_frame_equal\n    from ibex_polars import IbexEngine\n\n    sys.path.insert(0, str(args.pdsh_root.resolve()))\n    tables = {p.stem: pl.scan_parquet(p) for p in sorted(args.data.resolve().glob('*.parquet'))}\n    bridge = Path(ibex_pyarrow.__file__).resolve()\n    previous = None\n    for line in sys.stdin:\n        command = json.loads(line)\n        if 'prepare' in command:\n            module = importlib.import_module(f'queries.polars.q{command[\"prepare\"]}')\n            query = module.q(**tables)\n            engine = IbexEngine().prepare(query)\n            reference = query.collect(engine='in-memory')\n            previous = None\n            response = {\n                'source': engine.explain(query), 'output_shape': reference.shape,\n                'schema': str(reference.schema), 'polars_version': pl.__version__,\n                'upstream_source_sha256': hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest(),\n                'bridge': str(bridge), 'bridge_sha256': hashlib.sha256(bridge.read_bytes()).hexdigest(),\n                'polars_threads': pl.thread_pool_size(),\n            }\n        else:\n            start = time.perf_counter_ns()\n            current = query.collect(engine=engine if command['route'] == 'ibex' else 'streaming')\n            elapsed = (time.perf_counter_ns() - start) / 1e6\n            assert_frame_equal(current, reference, check_row_order=True, rel_tol=1e-10, abs_tol=1e-8)\n            previous = current  # destruction of the previous output is outside timing\n            response = {'ms': elapsed, 'correctness': 'passed'}\n        print(json.dumps(response), flush=True)\n\n\ndef main():\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument('--pdsh-root', type=Path, required=True)\n    parser.add_argument('--data', type=Path, required=True)\n    parser.add_argument('--before-dir', type=Path)\n    parser.add_argument('--after-dir', type=Path)\n    parser.add_argument('--out', type=Path)\n    parser.add_argument('--queries', type=int, nargs='+', default=[1, 2, 3, 4, 5, 6, 12, 18])\n    parser.add_argument('--iters', type=int, default=6)\n    parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)\n    args = parser.parse_args()\n    if args.worker:\n        worker(args)\n        return\n    if not all((args.before_dir, args.after_dir, args.out)):\n        parser.error('--before-dir, --after-dir and --out are required')\n    if args.iters < 6 or args.iters % 6:\n        parser.error('--iters must be a positive multiple of six to balance route order')\n    root = Path(__file__).resolve().parents[1]\n    if 'CMAKE_BUILD_TYPE:STRING=Release' not in (root / 'build-release/CMakeCache.txt').read_text():\n        parser.error('build-release must be configured as Release')\n    paths = sorted(args.data.resolve().glob('*.parquet'))\n    if len(paths) != 8:\n        parser.error('--data must contain the eight PDS-H Parquet tables')\n    report = {\n        'git_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),\n        'native_worktree_patch': subprocess.check_output(['git', 'diff', 'HEAD', '--', 'src', 'include'], cwd=root, text=True),\n        'upstream_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=args.pdsh_root, text=True).strip(),\n        'ibex_cores': os.environ.get('IBEX_CORES'), 'affinity': sorted(os.sched_getaffinity(0)),\n        'cpu_frequency_khz': {n: Path('/sys/devices/system/cpu/cpu0/cpufreq', n).read_text().strip()\n                              for n in ('scaling_min_freq', 'scaling_max_freq')},\n        'data': [{'path': str(p), 'bytes': p.stat().st_size, 'mtime_ns': p.stat().st_mtime_ns} for p in paths],\n        'iterations': args.iters, 'queries': {}, 'driver': Path(__file__).read_text(),\n        'method': 'Two persistent bridge workers with identical Python adapter; one in-memory Polars reference per worker/query; first collection and two warmups per route; all six route permutations; collection includes Parquet decode and public result conversion; preparation, correctness checks and prior-output destruction outside timing. First-per-query timings are not fresh-process measurements. Every output is compared in full, including order and dtypes, rel_tol=1e-10 abs_tol=1e-8.',\n    }\n    workers = {}\n    def call(name, command):\n        process = workers[name]\n        process.stdin.write(json.dumps(command) + '\\n')\n        process.stdin.flush()\n        line = process.stdout.readline()\n        if not line:\n            raise RuntimeError(f'{name} worker exited: {process.poll()}')\n        return json.loads(line)\n    def save():\n        args.out.parent.mkdir(parents=True, exist_ok=True)\n        args.out.write_text(json.dumps(report, indent=2) + '\\n')\n    try:\n        for name, directory in (('before', args.before_dir), ('after', args.after_dir)):\n            env = {**os.environ, 'PYTHONPATH': str(directory.resolve()) + os.pathsep + str(root / 'python')}\n            workers[name] = subprocess.Popen(\n                [sys.executable, str(Path(__file__).resolve()), '--worker', '--pdsh-root', str(args.pdsh_root), '--data', str(args.data)],\n                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env)\n        for number in args.queries:\n            name = f'q{number:02}'\n            print(name, 'preparing and checking complete results', flush=True)\n            entry = report['queries'][name] = {'status': 'running'}\n            metadata = {side: call(side, {'prepare': number}) for side in workers}\n            for field in ('source', 'schema', 'output_shape', 'upstream_source_sha256', 'polars_threads'):\n                assert metadata['before'][field] == metadata['after'][field], field\n            assert metadata['before']['bridge_sha256'] != metadata['after']['bridge_sha256']\n            entry['metadata'] = metadata\n            routes = {'before': ('before', 'ibex'), 'after': ('after', 'ibex'),\n                      'polars_streaming': ('after', 'polars')}\n            def collect(route):\n                side, engine = routes[route]\n                return call(side, {'route': engine})['ms']\n            entry['first_per_query_ms'] = {route: collect(route) for route in routes}\n            for _ in range(2):\n                for route in routes:\n                    collect(route)\n            samples = {route: [] for route in routes}\n            orders = list(permutations(routes))\n            for iteration in range(args.iters):\n                for route in orders[iteration % 6]:\n                    samples[route].append(collect(route))\n                print(name, f'round {iteration + 1}/{args.iters}', flush=True)\n            ratios = [a / b for a, b in zip(samples['after'], samples['before'])]\n            entry.update(status='passed', samples_ms=samples,\n                         median_ms={k: statistics.median(v) for k, v in samples.items()},\n                         median_paired_change_pct=100 * (statistics.median(ratios) - 1),\n                         after_faster_pairs=sum(a < b for a, b in zip(samples['after'], samples['before'])))\n            print(name, json.dumps(entry['median_ms']), flush=True)\n            save()\n    finally:\n        save()\n        for process in workers.values():\n            if process.poll() is None:\n                process.stdin.close()\n        for process in workers.values():\n            try:\n                process.wait(timeout=30)\n            except subprocess.TimeoutExpired:\n                process.kill()\n                process.wait()\n\n\nif __name__ == '__main__':\n    main()\n",
+  "method": "Two persistent bridge workers with identical Python adapter; one in-memory Polars reference per worker/query; first collection and two warmups per route; all six route permutations; collection includes Parquet decode and public result conversion; preparation, correctness checks and prior-output destruction outside timing. First-per-query timings are not fresh-process measurements. Every output is compared in full, including order and dtypes, rel_tol=1e-10 abs_tol=1e-8.",
+  "ibex_stream_scan": "0",
+  "diagnostic_command": "IBEX_STREAM_SCAN=0 IBEX_CORES=1 POLARS_MAX_THREADS=1 OPENBLAS_NUM_THREADS=1 taskset -c 2 .venv/bin/python python/bench_pdsh_bridge_ab.py --before-dir /tmp/q12-baseline --after-dir build-release/python --pdsh-root /home/brj/code/polars-benchmark --data /home/brj/code/polars-benchmark/data/tables/scale-10.0 --queries 18"
+}

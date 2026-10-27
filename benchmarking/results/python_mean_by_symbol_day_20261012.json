@@ -1,0 +1,544 @@
+{
+  "date": "2026-10-12",
+  "runs": [
+    {
+      "query": "mean_by_symbol_day",
+      "rows": 1000000,
+      "groups": 1008,
+      "input": "prices_multi generator: 252 symbols, four string days, seed 43; in-memory Arrow",
+      "native_source": "_ibex_input[select { `symbol`, `day`, `avg_price` = mean(`price`) }, by { `symbol`, `day` }];",
+      "input_prepare_ms": {
+        "ibex": 33.314114,
+        "polars_string": 22.847058,
+        "polars_categorical": 45.015571
+      },
+      "first_collect_ms": {
+        "ibex": 7.311901,
+        "polars_string": 9.078569,
+        "polars_categorical": 5.765532
+      },
+      "samples_ms": {
+        "ibex": [
+          2.257324,
+          2.282209,
+          1.990917,
+          2.310007,
+          2.120012,
+          2.139965,
+          2.248751,
+          2.320629,
+          2.061713,
+          2.39188,
+          2.235851,
+          2.733596
+        ],
+        "polars_string": [
+          8.398579,
+          8.894434,
+          7.797453,
+          7.582834,
+          7.738791,
+          7.623897,
+          7.70401,
+          7.734891,
+          7.523193,
+          7.822147,
+          7.859469,
+          7.810532
+        ],
+        "polars_categorical": [
+          6.081522,
+          5.726762,
+          5.604547,
+          5.574623,
+          5.648852,
+          5.674358,
+          5.440123,
+          5.648657,
+          5.633642,
+          5.668453,
+          5.71953,
+          6.108712
+        ]
+      },
+      "median_ms": {
+        "ibex": 2.2530375,
+        "polars_string": 7.768122,
+        "polars_categorical": 5.6586525000000005
+      },
+      "native_endpoint_samples_ms": [
+        2.169912,
+        1.855987,
+        1.59644,
+        1.575683,
+        1.629273,
+        1.48335,
+        1.518596,
+        1.548152,
+        1.554272,
+        1.576242,
+        1.619171,
+        1.580891
+      ],
+      "result_sha256": "2ef71e032fc531ba521e779bedc3bace01717c4e0fc446b039b59dc2e46d2a20",
+      "ibex_cores": "1",
+      "polars_threads": 1,
+      "cpu_affinity": [
+        2
+      ],
+      "polars_version": "2.0.0",
+      "platform": "Linux-6.18.40.1-microsoft-standard-WSL2-x86_64-with-glibc2.41",
+      "build": "Release",
+      "ibex_head": "34f117b0e667f95dad71f31790f0438318e8ea24",
+      "worktree_dirty": true,
+      "source_sha256": {
+        "python/ibex/__init__.py": "54b113e96b2a8906162652eb052c993a037ac649ae9c3df806975c5b45132ede",
+        "python/ibex/_lower.py": "f52c2bc31913d93d3f07454ff1a43b7ff5bdcb5d128829246368183eb6e8f8ff",
+        "python/ibex/_expr.py": "7d93e378cd7086d55c87b6c78a95fa68fe28b0c60d02a72d4d4b5ca6c7e44bdd",
+        "python/ibex/_frame.py": "6bbeadfec57d55ef9ce023b675486f87d4cb1d87dc229e2916030375773ec617",
+        "python/ibex_pyarrow_module.cpp": "d697977212dd7cc351e6fb7fc174a6b559e14ad96fe20decd0001e2442b49b34",
+        "python/bench_mean_by_symbol_day.py": "92ffa7f308a71dd191510ad09eb92b37ff7a2a5421c0d78f46261b3c075a4a0a"
+      },
+      "website_reference": {
+        "meta": {
+          "generated": "2026-09-06 11:38 UTC",
+          "commit": "4d007b1c",
+          "sources": [
+            "scales_aws_20260905_combined.csv"
+          ]
+        },
+        "rows": 16000000,
+        "ibex_ms": 12.773,
+        "polars_ms": 275.478,
+        "ratio": 21.567212087998122
+      },
+      "notes": [
+        "Input preparation outside collection timings; no result caching.",
+        "Both reference routes use the current installed engine; string mode matches historical key representation, not its old engine version/hardware.",
+        "Categorical reference keys are prepared outside timers, matching the current repo benchmark contract.",
+        "Result verification decodes key representations and aligns unordered groups outside timers.",
+        "Native endpoint diagnostics include parsing, planning, execution and Arrow export; they are a separate timing block."
+      ],
+      "paired": {
+        "polars_string": {
+          "median_speedup": 3.538914723873929,
+          "wilcoxon_p": 0.00048828125,
+          "wins": 12
+        },
+        "polars_categorical": {
+          "median_speedup": 2.533703177625886,
+          "wilcoxon_p": 0.00048828125,
+          "wins": 12
+        }
+      }
+    },
+    {
+      "query": "mean_by_symbol_day",
+      "rows": 1000000,
+      "groups": 1008,
+      "input": "prices_multi generator: 252 symbols, four string days, seed 43; in-memory Arrow",
+      "native_source": "_ibex_input[select { `symbol`, `day`, `avg_price` = mean(`price`) }, by { `symbol`, `day` }];",
+      "input_prepare_ms": {
+        "ibex": 33.60156,
+        "polars_string": 23.866453,
+        "polars_categorical": 52.054786
+      },
+      "first_collect_ms": {
+        "ibex": 9.796021,
+        "polars_string": 13.208286,
+        "polars_categorical": 4.997776
+      },
+      "samples_ms": {
+        "ibex": [
+          1.218395,
+          1.142053,
+          1.077675,
+          1.37624,
+          1.218897,
+          1.00412,
+          1.341674,
+          1.211267,
+          1.134693,
+          1.219019,
+          1.213146,
+          1.046528
+        ],
+        "polars_string": [
+          3.107586,
+          5.007241,
+          3.270604,
+          4.332423,
+          3.245779,
+          4.59606,
+          3.397112,
+          3.217879,
+          2.982127,
+          2.865846,
+          4.709107,
+          3.221715
+        ],
+        "polars_categorical": [
+          2.463738,
+          2.968291,
+          2.41219,
+          2.776892,
+          2.546505,
+          2.390749,
+          2.521413,
+          2.406018,
+          2.99605,
+          2.233987,
+          2.800879,
+          2.735076
+        ]
+      },
+      "median_ms": {
+        "ibex": 1.2122065000000002,
+        "polars_string": 3.2581915,
+        "polars_categorical": 2.533959
+      },
+      "native_endpoint_samples_ms": [
+        1.011039,
+        0.633628,
+        0.663243,
+        0.573732,
+        0.58974,
+        0.505742,
+        0.562252,
+        0.585941,
+        0.782471,
+        0.623028,
+        0.509735,
+        0.506081
+      ],
+      "result_sha256": "2ef71e032fc531ba521e779bedc3bace01717c4e0fc446b039b59dc2e46d2a20",
+      "ibex_cores": "8",
+      "polars_threads": 8,
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "polars_version": "2.0.0",
+      "platform": "Linux-6.18.40.1-microsoft-standard-WSL2-x86_64-with-glibc2.41",
+      "build": "Release",
+      "ibex_head": "34f117b0e667f95dad71f31790f0438318e8ea24",
+      "worktree_dirty": true,
+      "source_sha256": {
+        "python/ibex/__init__.py": "54b113e96b2a8906162652eb052c993a037ac649ae9c3df806975c5b45132ede",
+        "python/ibex/_lower.py": "f52c2bc31913d93d3f07454ff1a43b7ff5bdcb5d128829246368183eb6e8f8ff",
+        "python/ibex/_expr.py": "7d93e378cd7086d55c87b6c78a95fa68fe28b0c60d02a72d4d4b5ca6c7e44bdd",
+        "python/ibex/_frame.py": "6bbeadfec57d55ef9ce023b675486f87d4cb1d87dc229e2916030375773ec617",
+        "python/ibex_pyarrow_module.cpp": "d697977212dd7cc351e6fb7fc174a6b559e14ad96fe20decd0001e2442b49b34",
+        "python/bench_mean_by_symbol_day.py": "92ffa7f308a71dd191510ad09eb92b37ff7a2a5421c0d78f46261b3c075a4a0a"
+      },
+      "website_reference": {
+        "meta": {
+          "generated": "2026-09-06 11:38 UTC",
+          "commit": "4d007b1c",
+          "sources": [
+            "scales_aws_20260905_combined.csv"
+          ]
+        },
+        "rows": 16000000,
+        "ibex_ms": 12.773,
+        "polars_ms": 275.478,
+        "ratio": 21.567212087998122
+      },
+      "notes": [
+        "Input preparation outside collection timings; no result caching.",
+        "Both reference routes use the current installed engine; string mode matches historical key representation, not its old engine version/hardware.",
+        "Categorical reference keys are prepared outside timers, matching the current repo benchmark contract.",
+        "Result verification decodes key representations and aligns unordered groups outside timers.",
+        "Native endpoint diagnostics include parsing, planning, execution and Arrow export; they are a separate timing block."
+      ],
+      "paired": {
+        "polars_string": {
+          "median_speedup": 2.8488762680893798,
+          "wilcoxon_p": 0.00048828125,
+          "wins": 12
+        },
+        "polars_categorical": {
+          "median_speedup": 2.163757946783483,
+          "wilcoxon_p": 0.00048828125,
+          "wins": 12
+        }
+      }
+    },
+    {
+      "query": "mean_by_symbol_day",
+      "rows": 16000000,
+      "groups": 1008,
+      "input": "prices_multi generator: 252 symbols, four string days, seed 43; in-memory Arrow",
+      "native_source": "_ibex_input[select { `symbol`, `day`, `avg_price` = mean(`price`) }, by { `symbol`, `day` }];",
+      "input_prepare_ms": {
+        "ibex": 599.672361,
+        "polars_string": 407.382638,
+        "polars_categorical": 760.237706
+      },
+      "first_collect_ms": {
+        "ibex": 150.038895,
+        "polars_string": 123.221421,
+        "polars_categorical": 83.847005
+      },
+      "samples_ms": {
+        "ibex": [
+          33.826938,
+          26.203519,
+          26.112246,
+          26.801497,
+          27.799184,
+          28.998023,
+          25.858753,
+          26.472991,
+          26.569657,
+          27.130785,
+          26.903799,
+          26.987676
+        ],
+        "polars_string": [
+          119.303022,
+          117.341546,
+          120.005615,
+          127.479377,
+          121.534932,
+          115.782892,
+          124.480264,
+          120.119189,
+          119.15842,
+          116.478307,
+          120.282315,
+          129.118158
+        ],
+        "polars_categorical": [
+          83.884711,
+          82.799171,
+          82.495394,
+          84.999067,
+          83.134534,
+          84.361293,
+          88.306681,
+          82.957206,
+          84.126469,
+          88.43763,
+          82.630908,
+          85.946364
+        ]
+      },
+      "median_ms": {
+        "ibex": 26.852648000000002,
+        "polars_string": 120.062402,
+        "polars_categorical": 84.00559
+      },
+      "native_endpoint_samples_ms": [
+        26.057057,
+        27.628861,
+        25.672737,
+        25.78611,
+        26.050987,
+        25.969424,
+        27.135512,
+        25.687633,
+        25.898858,
+        25.676278,
+        26.118602,
+        26.339287
+      ],
+      "result_sha256": "80674a38913c6e22c8bc815f060a0decf7fd18080e6665be4d574870c050040c",
+      "ibex_cores": "1",
+      "polars_threads": 1,
+      "cpu_affinity": [
+        2
+      ],
+      "polars_version": "2.0.0",
+      "platform": "Linux-6.18.40.1-microsoft-standard-WSL2-x86_64-with-glibc2.41",
+      "build": "Release",
+      "ibex_head": "34f117b0e667f95dad71f31790f0438318e8ea24",
+      "worktree_dirty": true,
+      "source_sha256": {
+        "python/ibex/__init__.py": "54b113e96b2a8906162652eb052c993a037ac649ae9c3df806975c5b45132ede",
+        "python/ibex/_lower.py": "f52c2bc31913d93d3f07454ff1a43b7ff5bdcb5d128829246368183eb6e8f8ff",
+        "python/ibex/_expr.py": "7d93e378cd7086d55c87b6c78a95fa68fe28b0c60d02a72d4d4b5ca6c7e44bdd",
+        "python/ibex/_frame.py": "6bbeadfec57d55ef9ce023b675486f87d4cb1d87dc229e2916030375773ec617",
+        "python/ibex_pyarrow_module.cpp": "d697977212dd7cc351e6fb7fc174a6b559e14ad96fe20decd0001e2442b49b34",
+        "python/bench_mean_by_symbol_day.py": "92ffa7f308a71dd191510ad09eb92b37ff7a2a5421c0d78f46261b3c075a4a0a"
+      },
+      "website_reference": {
+        "meta": {
+          "generated": "2026-09-06 11:38 UTC",
+          "commit": "4d007b1c",
+          "sources": [
+            "scales_aws_20260905_combined.csv"
+          ]
+        },
+        "rows": 16000000,
+        "ibex_ms": 12.773,
+        "polars_ms": 275.478,
+        "ratio": 21.567212087998122
+      },
+      "notes": [
+        "Input preparation outside collection timings; no result caching.",
+        "Both reference routes use the current installed engine; string mode matches historical key representation, not its old engine version/hardware.",
+        "Categorical reference keys are prepared outside timers, matching the current repo benchmark contract.",
+        "Result verification decodes key representations and aligns unordered groups outside timers.",
+        "Native endpoint diagnostics include parsing, planning, execution and Arrow export; they are a separate timing block."
+      ],
+      "paired": {
+        "polars_string": {
+          "median_speedup": 4.481419585797878,
+          "wilcoxon_p": 0.00048828125,
+          "wins": 12
+        },
+        "polars_categorical": {
+          "median_speedup": 3.1595550240188484,
+          "wilcoxon_p": 0.00048828125,
+          "wins": 12
+        }
+      }
+    },
+    {
+      "query": "mean_by_symbol_day",
+      "rows": 16000000,
+      "groups": 1008,
+      "input": "prices_multi generator: 252 symbols, four string days, seed 43; in-memory Arrow",
+      "native_source": "_ibex_input[select { `symbol`, `day`, `avg_price` = mean(`price`) }, by { `symbol`, `day` }];",
+      "input_prepare_ms": {
+        "ibex": 529.772853,
+        "polars_string": 145.859655,
+        "polars_categorical": 319.25273400000003
+      },
+      "first_collect_ms": {
+        "ibex": 161.992405,
+        "polars_string": 22.66731,
+        "polars_categorical": 14.894027
+      },
+      "samples_ms": {
+        "ibex": [
+          8.692027,
+          8.433849,
+          8.759,
+          8.433578,
+          8.107929,
+          9.957162,
+          8.411134,
+          9.486248,
+          8.477093,
+          8.476482,
+          8.593171,
+          8.548873
+        ],
+        "polars_string": [
+          22.023242,
+          21.415859,
+          22.027838,
+          20.208802,
+          21.592947,
+          20.364473,
+          20.404889,
+          21.153222,
+          20.128853,
+          19.489267,
+          19.859522,
+          19.20754
+        ],
+        "polars_categorical": [
+          13.032936,
+          13.393598,
+          13.282074,
+          12.951217,
+          14.175218,
+          14.181399,
+          13.50945,
+          13.179407,
+          14.355524,
+          13.360423,
+          13.300722,
+          14.860605
+        ]
+      },
+      "median_ms": {
+        "ibex": 8.512983,
+        "polars_string": 20.384681,
+        "polars_categorical": 13.3770105
+      },
+      "native_endpoint_samples_ms": [
+        9.790207,
+        8.069418,
+        8.867353,
+        8.174809,
+        8.317509,
+        8.363829,
+        8.416649,
+        7.962991,
+        8.476642,
+        8.370267,
+        8.646475,
+        7.681121
+      ],
+      "result_sha256": "80674a38913c6e22c8bc815f060a0decf7fd18080e6665be4d574870c050040c",
+      "ibex_cores": "8",
+      "polars_threads": 8,
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "polars_version": "2.0.0",
+      "platform": "Linux-6.18.40.1-microsoft-standard-WSL2-x86_64-with-glibc2.41",
+      "build": "Release",
+      "ibex_head": "34f117b0e667f95dad71f31790f0438318e8ea24",
+      "worktree_dirty": true,
+      "source_sha256": {
+        "python/ibex/__init__.py": "54b113e96b2a8906162652eb052c993a037ac649ae9c3df806975c5b45132ede",
+        "python/ibex/_lower.py": "f52c2bc31913d93d3f07454ff1a43b7ff5bdcb5d128829246368183eb6e8f8ff",
+        "python/ibex/_expr.py": "7d93e378cd7086d55c87b6c78a95fa68fe28b0c60d02a72d4d4b5ca6c7e44bdd",
+        "python/ibex/_frame.py": "6bbeadfec57d55ef9ce023b675486f87d4cb1d87dc229e2916030375773ec617",
+        "python/ibex_pyarrow_module.cpp": "d697977212dd7cc351e6fb7fc174a6b559e14ad96fe20decd0001e2442b49b34",
+        "python/bench_mean_by_symbol_day.py": "92ffa7f308a71dd191510ad09eb92b37ff7a2a5421c0d78f46261b3c075a4a0a"
+      },
+      "website_reference": {
+        "meta": {
+          "generated": "2026-09-06 11:38 UTC",
+          "commit": "4d007b1c",
+          "sources": [
+            "scales_aws_20260905_combined.csv"
+          ]
+        },
+        "rows": 16000000,
+        "ibex_ms": 12.773,
+        "polars_ms": 275.478,
+        "ratio": 21.567212087998122
+      },
+      "notes": [
+        "Input preparation outside collection timings; no result caching.",
+        "Both reference routes use the current installed engine; string mode matches historical key representation, not its old engine version/hardware.",
+        "Categorical reference keys are prepared outside timers, matching the current repo benchmark contract.",
+        "Result verification decodes key representations and aligns unordered groups outside timers.",
+        "Native endpoint diagnostics include parsing, planning, execution and Arrow export; they are a separate timing block."
+      ],
+      "paired": {
+        "polars_string": {
+          "median_speedup": 2.385365301341806,
+          "wilcoxon_p": 0.00048828125,
+          "wins": 12
+        },
+        "polars_categorical": {
+          "median_speedup": 1.5620000660649456,
+          "wilcoxon_p": 0.00048828125,
+          "wins": 12
+        }
+      }
+    }
+  ],
+  "verification": "All groups compared by decoded key and numeric tolerance; native one/eight core results exactly match at both scales."
+}

@@ -1,0 +1,18 @@
+{
+  "source_unchanged": true,
+  "source_sha256": "085bdee90352ba052e82041d447ba2a7cc6d3fd74fbc345fde6df0513dbb1d84",
+  "full_country_filter_results_match": true,
+  "threshold_reorder_results_match": true,
+  "raw_prefix_filter_results_match": true,
+  "substring_input_rows_current": 1500000,
+  "substring_input_rows_after_prefix_filter": 419974,
+  "in_country_rows": 419974,
+  "above_average_rows": 190691,
+  "anti_rows_before_threshold": 140489,
+  "anti_rows_after_threshold": 63914,
+  "positive_average": 4998.152960977118,
+  "method": "Cardinality and equivalence checks only; no performance timings. Membership equivalence relies on the two-codepoint prefix, and does not apply to general contains expressions.",
+  "git_head": "4939e22e7cb837e3821fc37a726d0de03576f04b",
+  "driver": "import json,sys,hashlib\nfrom pathlib import Path\nimport polars as pl\nfrom polars.testing import assert_frame_equal\nfrom ibex_polars import IbexEngine\nsys.path.insert(0,'/home/brj/code/polars-benchmark')\nfrom queries.polars.q22 import q\nroot=Path('/home/brj/code/polars-benchmark/data/tables/scale-10.0');tables={p.stem:pl.scan_parquet(p) for p in root.glob('*.parquet')};query=q(**tables)\nsource=IbexEngine().explain(query)\nbaseline=json.loads(Path('python/pdsh-performance-results/all22-eight.json').read_text())['queries']['q22']['native_source'];assert source==baseline\ncustomer=tables['customer'].with_columns(pl.col('c_phone').str.slice(0,2).alias('cntrycode'))\nregex=customer.filter(pl.col('cntrycode').str.contains('13|31|23|29|30|18|17')).select('c_custkey','c_acctbal','cntrycode').collect(engine='streaming')\nmember=customer.filter(pl.col('cntrycode').is_in(['13','31','23','29','30','18','17'])).select('c_custkey','c_acctbal','cntrycode').collect(engine='streaming')\nassert_frame_equal(regex,member)\nprefix = tables['customer'].filter(pl.any_horizontal([\n    pl.col('c_phone').str.starts_with(code) for code in ['13','31','23','29','30','18','17']\n])).with_columns(pl.col('c_phone').str.slice(0,2).alias('cntrycode')).select('c_custkey','c_acctbal','cntrycode').collect(engine='streaming')\nassert_frame_equal(regex,prefix)\n\navg=regex.filter(pl.col('c_acctbal')>0)['c_acctbal'].mean()\norders=tables['orders'].select('o_custkey')\noriginal=regex.lazy().join(orders,left_on='c_custkey',right_on='o_custkey',how='anti').collect(engine='streaming')\nfiltered=regex.filter(pl.col('c_acctbal')>avg)\nearly=filtered.lazy().join(orders,left_on='c_custkey',right_on='o_custkey',how='anti').collect(engine='streaming')\nlate=original.filter(pl.col('c_acctbal')>avg)\nassert_frame_equal(early.sort('c_custkey'),late.sort('c_custkey'))\nprint(json.dumps({'source_unchanged':True,'source_sha256':hashlib.sha256(source.encode()).hexdigest(),'full_country_filter_results_match':True,'threshold_reorder_results_match':True,'raw_prefix_filter_results_match':True,'substring_input_rows_current':1500000,'substring_input_rows_after_prefix_filter':prefix.height,'in_country_rows':regex.height,'above_average_rows':filtered.height,'anti_rows_before_threshold':original.height,'anti_rows_after_threshold':early.height,'positive_average':avg,'method':'Cardinality and equivalence checks only; no performance timings. Membership equivalence relies on the two-codepoint prefix, and does not apply to general contains expressions.'},indent=2))\n",
+  "timing_reference": "q22-cache-evidence.json: last clean shared-cache Q22 profile; current Q22 generated source is byte-identical to the full 22-query baseline."
+}

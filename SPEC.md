@@ -770,6 +770,8 @@ mean(col)   // averages only non-null values
 median(col) // ignores null rows
 first(col)  // first non-null value; null for an all-null group
 last(col)   // last non-null value; null for an all-null group
+first_null(col) // value of the first row, including null; null for empty input
+last_null(col)  // value of the last row, including null; null for empty input
 std(col)    // ignores null rows; returns null if fewer than 2 non-null values
 ewma(col, alpha)  // ignores null rows; returns null for an empty group
 cov(x, y)   // only rows where both x and y are non-null; null if fewer than 2 such rows
@@ -777,7 +779,7 @@ corr(x, y)  // as cov, and null when either column is constant over those rows
 ```
 
 Over a `Decimal(p, s)` column, `sum` is `Decimal(38, s)` (exact, and an error
-past 38 digits); `min`, `max`, `first` and `last` keep the column's type;
+past 38 digits); `min`, `max`, `first`, `last`, `first_null` and `last_null` keep the column's type;
 `mean` divides the exact sum in decimal (without capping the quotient's scale at 38) and only then
 converts to `Float64`, so `mean` of `0.10, 0.20, 0.30` is exactly `0.2`; `count` and
 `count_distinct` are `Int64`. The statistical aggregates (`median`, `std`,
@@ -5196,6 +5198,35 @@ points are provided:
 
 - `eval_table(source, tables=None, scalars=None)` evaluates an in-memory Ibex source string
 - `eval_file(path, tables=None, scalars=None)` evaluates a `.ibex` file from disk
+
+An additional `execute_pipeline(source, tables=None, scalars=None)` endpoint
+executes a complete generated pipeline through `repl::ReplSession`, sharing
+the CLI/R host's planner and lazy readers. Existing evaluation entry points
+retain their behavior. The independent experimental `ibex` Python package
+uses this endpoint after rendering immutable expression/pipeline nodes with
+typed scalar bindings. Its first Polars 2.0 API subset supports single-file
+Parquet scans, filtering, projection, one-expression updates, numeric
+sums/means, row counts, column-key grouping and sorting, covering upstream
+PDS-H q06 and q01 query bodies. In-memory frames retain prepared native inputs,
+applying the existing categorical promotion heuristic once at binding. Each
+collection executes the pipeline again; query results are not cached.
+Collection returns an
+Ibex DataFrame backed by Arrow; schema/dtype descriptors are currently Arrow
+types, with UInt32 row counts and large-UTF8 strings at the public Arrow boundary.
+Polars is not required by the package. Joins and full API
+compatibility are follow-up work; unsupported behavior has no Polars fallback.
+See `python/README.md` for the implemented scope and conformance runner.
+
+The experimental `ibex_polars.IbexEngine` provides an alternative frontend:
+real Polars lazy plans are optimized by Polars, translated through its private
+visitor, and executed using the same native pipeline endpoint. Collection
+returns real Polars DataFrames. The initial slice covers upstream q01/q06,
+resident inputs, simultaneous row-local updates, null predicates and Polars
+floating-point comparison/sort ordering. It pins Polars 2.0.0 and visitor
+version `(15, 2)`; unsupported plans fail without automatic fallback.
+A bounded, weakly owned plan cache retains prepared resident inputs and respects
+optimization flags; each collection executes again. See
+`python/ibex_polars/README.md` for scope, ownership and preparation costs.
 
 The optional `tables` binding map adopts supported single-batch PyArrow buffers
 through Arrow C Data and retains their producer ownership; fragmented inputs

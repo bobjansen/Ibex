@@ -96,7 +96,9 @@
         <span class="tour-tag">Language</span>
         <h3>Write columns as columns</h3>
         <p>Named clauses describe each transformation, and columns are
-        referenced directly by name. In Ibex you write <code>px</code>, not
+        referenced directly by name. Aggregates <code>first</code> and <code>last</code>
+        skip nulls; <code>first_null</code> and <code>last_null</code> preserve the edge row,
+        including its null value. In Ibex you write <code>px</code>, not
         <code>pl.col("px")</code>.</p>
       </article>
       <article class="card">
@@ -105,6 +107,12 @@
         <p>Use Python or R notebooks, the web UI, or a REPL for exploration and
         modelling, then use C++23 codegen for native binaries. Type errors are
         caught before the pipeline runs.</p>
+        <p>An experimental independent Python API supports lazy scans,
+        filters, column updates, grouped aggregates and sorting with Polars-style calls.
+        <a href="https://github.com/bobjansen/Ibex/blob/main/python/README.md">Setup and current compatibility scope</a>.</p>
+        <p>A second experimental frontend executes supported real Polars lazy queries
+        with <code>collect(engine=IbexEngine())</code>, including PDS-H q01 and q06.
+        <a href="https://github.com/bobjansen/Ibex/blob/main/python/ibex_polars/README.md">Engine scope and setup</a>.</p>
       </article>
     </div>
   </section>

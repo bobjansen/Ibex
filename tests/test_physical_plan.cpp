@@ -7,6 +7,7 @@
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/pipeline.hpp>
 
 #include <catch2/catch_message.hpp>
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <memory>
 #include <optional>
 #include <string>
@@ -79,6 +81,89 @@ auto execute_physical_plan(const runtime::physical::Plan& plan, const ir::Node& 
 }
 
 }  // namespace
+
+TEST_CASE("Bound table schemas enable composite join planning", "[physical][plan][join]") {
+    using runtime::physical::JoinBranch;
+    using runtime::physical::JoinStrategy;
+    runtime::Table left;
+    left.add_column("k1", Column<std::int64_t>{1, 1, 2});
+    left.add_column("k2", Column<std::int64_t>{2, 3, 4});
+    runtime::Table right;
+    right.add_column("k1", Column<std::int64_t>{1, 2});
+    right.add_column("k2", Column<std::int64_t>{3, 4});
+    runtime::TableRegistry registry{{"a", left}, {"b", right}};
+    for (const char* source :
+         {"a join b on { k1, k2 };", "a semi join b on { k1, k2 };", "a anti join b on { k1, k2 };",
+          "(a[select { x = k1, y = k2 }]) join "
+          "(b[select { x = k1, y = k2 }]) on { x, y };"}) {
+        CAPTURE(source);
+        auto node = require_ir(source);
+        const auto unknown = runtime::physical::plan_physical(*node, {}, nullptr);
+        CHECK(unknown.join.strategy == JoinStrategy::MaterializeBoth);
+        const auto plan = runtime::physical::plan_physical(*node, registry, nullptr);
+        CHECK(plan.join.strategy == JoinStrategy::StreamingProbe);
+        CHECK(plan.join.branch != JoinBranch::None);
+        auto result = runtime::interpret(*node, registry);
+        REQUIRE(result.has_value());
+        CHECK(result->rows() == (std::string(source).find("anti") != std::string::npos ? 1 : 2));
+    }
+    SECTION("non-integer bound keys still materialize") {
+        runtime::Table floating;
+        floating.add_column("k1", Column<double>{1., 2.});
+        floating.add_column("k2", Column<double>{3., 4.});
+        registry.insert_or_assign("b", std::move(floating));
+        auto node = require_ir("a join b on { k1, k2 };");
+        const auto plan = runtime::physical::plan_physical(*node, registry, nullptr);
+        CHECK(plan.join.strategy == JoinStrategy::MaterializeBoth);
+    }
+}
+
+TEST_CASE("Deferred lazy sources give the planner their key types", "[physical][plan]") {
+    // A query built without ascriptions (the Polars adapter's) reads lazy
+    // sources the registry never holds. Their schemas used to be unknown to
+    // the planner, so a two-key Int64 join could not prove its key types and
+    // materialized both sides: Q09's 60M-row lineitem probe decoded whole.
+    using runtime::physical::JoinBranch;
+    using runtime::physical::JoinStrategy;
+    const auto lazy = [](bool string_keys) {
+        runtime::Table schema;
+        if (string_keys) {
+            schema.add_column("k1", Column<std::string>{});
+        } else {
+            schema.add_column("k1", Column<std::int64_t>{});
+        }
+        schema.add_column("k2", Column<std::int64_t>{});
+        return std::make_shared<runtime::LazyTable>(
+            std::move(schema), 10,
+            [](const std::vector<std::string>&,
+               const runtime::Selection*) -> std::expected<runtime::Table, std::string> {
+                return std::unexpected("planning only");
+            });
+    };
+    const auto deferred = [&](bool string_keys) {
+        runtime::DeferredScanRegistry registry;
+        for (const char* name : {"a", "b"}) {
+            runtime::DeferredScan scan;
+            scan.lazy = lazy(string_keys);
+            registry.emplace(name, std::move(scan));
+        }
+        return registry;
+    };
+    auto node = require_ir("a join b on { k1, k2 };");
+    const auto ints = deferred(false);
+    const auto typed = runtime::physical::plan_physical(
+        *node, {}, nullptr, runtime::physical::deferred_source_schemas(&ints));
+    CHECK(typed.join.strategy == JoinStrategy::StreamingProbe);
+    CHECK(typed.join.branch == JoinBranch::PairIntInner);
+    CHECK(runtime::physical::plan_physical(*node, {}, nullptr).join.strategy ==
+          JoinStrategy::MaterializeBoth);
+    // A string column's in-memory form is settled at decode, so it is never
+    // claimed: the same join over string keys proves nothing.
+    const auto strings = deferred(true);
+    const auto untyped = runtime::physical::plan_physical(
+        *node, {}, nullptr, runtime::physical::deferred_source_schemas(&strings));
+    CHECK(untyped.join.strategy == JoinStrategy::MaterializeBoth);
+}
 
 TEST_CASE("Physical plan lowers filter+select into a fused map step", "[physical][plan]") {
     // Canonicalize leaves Project(Filter(x)) alone; the planner fuses it into
@@ -847,6 +932,27 @@ TEST_CASE("The plan classifies an aggregate by relaying the builder's predicates
         REQUIRE(plan.fused_join != nullptr);
         CHECK(plan.fused_join->kind() == ir::NodeKind::Join);
         CHECK_FALSE(plan.counted_column.empty());
+    }
+
+    SECTION("the fusion sees through plain copies of the join's columns") {
+        // The Polars adapter renames every join column through a select (an
+        // update of plain copies), so the group key and the counted column
+        // reach the aggregate under other names.
+        auto ir = require_ir(
+            "(l left join r on k)[select { g = k, c = v }][select { n = count(c) }, by g];");
+        REQUIRE(ir->kind() == ir::NodeKind::Aggregate);
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+        const auto plan =
+            runtime::physical::plan_aggregate(static_cast<const ir::AggregateNode&>(*ir));
+        CHECK(plan.strategy == AggregateStrategy::FusedLeftJoinCount);
+        CHECK(plan.counted_column == "v");
+        CHECK(plan.group_source == "k");
+        // A computed key is not a copy of the join's key.
+        auto computed = require_ir(
+            "(l left join r on k)[select { g = k + 1, c = v }][select { n = count(c) }, by g];");
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+        CHECK(runtime::physical::plan_aggregate(static_cast<const ir::AggregateNode&>(*computed))
+                  .strategy != AggregateStrategy::FusedLeftJoinCount);
     }
 
     SECTION("an aggregate over a plain child names no fused join") {

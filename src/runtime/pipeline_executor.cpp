@@ -1232,8 +1232,14 @@ class TwoPhaseFilterOperator final : public Operator {
     // built it (or is about to, on its first fan-out).
     const std::size_t pool_size = process_worker_pool().size();
     const std::size_t budget = exec.compute_budget();
-    const std::size_t workers =
-        std::min({budget, pool_size, static_cast<std::size_t>(morsel_count)});
+    std::size_t workers = std::min({budget, pool_size, static_cast<std::size_t>(morsel_count)});
+    // A downstream stage may submit a join-probe batch while these workers
+    // are parked on the bounded output ring. Keep a worker available for that
+    // batch, as the streaming scan pipeline does. Short runs cannot saturate
+    // the ring (2W slots plus at most W claimed morsels).
+    if (workers == pool_size && morsel_count > workers * 3) {
+        --workers;
+    }
     return workers < 2 ? 0 : workers;
 }
 
@@ -1293,7 +1299,8 @@ auto try_take_join_probe(const ir::Node& node, const TableRegistry& registry,
     if (std::getenv("IBEX_PROBE_MORSELS") == nullptr) {
         return std::optional<FusibleJoinProbe>{};
     }
-    const physical::Plan plan = physical::plan_physical(node, registry, externs);
+    const physical::Plan plan = physical::plan_physical(
+        node, registry, externs, physical::deferred_source_schemas(exec.deferred_scans));
     const physical::JoinPlan& jp = plan.join;
     if (!jp.describes || jp.strategy != physical::JoinStrategy::StreamingProbe ||
         (jp.branch != physical::JoinBranch::SingleKeyInner &&
@@ -1421,12 +1428,11 @@ auto build_materialized_map_run(const physical::Plan& plan, const std::vector<Ma
         }
     }
     if (owned == nullptr) {
-        // When the run reaches the pipeline's own source, build it the way the
-        // serial composer does, so an aggregate under a filter gets its prefilter.
+        // Build the run's input through the pipeline's source, the way the
+        // serial composer does, so an aggregate under the run's filter gets
+        // its prefilter even when bare updates between them are the input.
         auto input_op =
-            input_node == plan.source_node
-                ? build_pipeline_source(plan, registry, scalars, externs, exec, model_out)
-                : build_operator(*input_node, registry, scalars, externs, exec, model_out);
+            build_pipeline_source(plan, registry, scalars, externs, exec, model_out, input_node);
         if (!input_op.has_value()) {
             return std::unexpected(std::move(input_op.error()));
         }

@@ -1,0 +1,49 @@
+{
+  "diagnostic_only": true,
+  "changed_expression_nodes": [
+    52,
+    17
+  ],
+  "samples_ms": {
+    "current": [
+      2559.004315,
+      2508.588692,
+      2537.02026,
+      2523.351431,
+      2550.746271,
+      2568.715361
+    ],
+    "plain_membership": [
+      377.778588,
+      380.994248,
+      380.466426,
+      378.8354,
+      366.91817,
+      359.295201
+    ]
+  },
+  "median_ms": {
+    "current": 2543.8832654999997,
+    "plain_membership": 378.30699400000003
+  },
+  "source": {
+    "current": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\n((parquet::read(^_ibex_scalar_0)[select { `o_orderpriority` = `o_orderpriority`, `o_orderkey` = `o_orderkey` }][select { `_ibex_join_0_l_0` = `o_orderpriority`, `_ibex_join_0_l_1` = `o_orderkey` }]) join (parquet::read(^_ibex_scalar_1)[filter (((((`l_commitdate` < `l_receiptdate`) && ((`l_receiptdate` >= ^_ibex_scalar_2) && (`l_receiptdate` < ^_ibex_scalar_3))) && (`l_shipdate` < `l_commitdate`)) && case { is_null(`l_shipmode`) => case { true => NULL, else => ^_ibex_scalar_4 }, else => ((^_ibex_scalar_5 || (`l_shipmode` == ^_ibex_scalar_6)) || (`l_shipmode` == ^_ibex_scalar_7)) }))][select { `l_shipmode` = `l_shipmode`, `l_orderkey` = `l_orderkey`, `l_commitdate` = `l_commitdate`, `l_receiptdate` = `l_receiptdate`, `l_shipdate` = `l_shipdate` }][select { `l_shipmode` = `l_shipmode`, `l_orderkey` = `l_orderkey` }][select { `_ibex_join_0_r_0` = `l_shipmode`, `_ibex_join_0_r_1` = `l_orderkey` }]) on { `_ibex_join_0_l_1` = `_ibex_join_0_r_1` })[select { `o_orderpriority` = `_ibex_join_0_l_0`, `o_orderkey` = `_ibex_join_0_l_1`, `l_shipmode` = `_ibex_join_0_r_0` }][select { `o_orderpriority` = `o_orderpriority`, `l_shipmode` = `l_shipmode` }][update { `line_count` = case { is_null(`o_orderpriority`) => case { true => NULL, else => ^_ibex_scalar_8 }, else => ((^_ibex_scalar_9 || (`o_orderpriority` == ^_ibex_scalar_10)) || (`o_orderpriority` == ^_ibex_scalar_11)) } }][select { `o_orderpriority` = `o_orderpriority`, `l_shipmode` = `l_shipmode`, `line_count` = `line_count` }][select { `l_shipmode` = `l_shipmode`, `line_count` = `line_count` }][select { `l_shipmode`, `high_line_count` = coalesce(sum(Int64(`line_count`)), ^_ibex_scalar_12), `low_line_count` = coalesce(sum(Int64(!(`line_count`))), ^_ibex_scalar_13) }, by { `l_shipmode` }][update { `_ibex_sort_null_7_0` = is_null(`l_shipmode`) }][order { `_ibex_sort_null_7_0` desc, `l_shipmode` asc }];",
+    "plain_membership": "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";\n((parquet::read(^_ibex_scalar_0)[select { `o_orderpriority` = `o_orderpriority`, `o_orderkey` = `o_orderkey` }][select { `_ibex_join_0_l_0` = `o_orderpriority`, `_ibex_join_0_l_1` = `o_orderkey` }]) join (parquet::read(^_ibex_scalar_1)[filter (((((`l_commitdate` < `l_receiptdate`) && ((`l_receiptdate` >= ^_ibex_scalar_2) && (`l_receiptdate` < ^_ibex_scalar_3))) && (`l_shipdate` < `l_commitdate`)) && ((^_ibex_scalar_4 || (`l_shipmode` == ^_ibex_scalar_5)) || (`l_shipmode` == ^_ibex_scalar_6))))][select { `l_shipmode` = `l_shipmode`, `l_orderkey` = `l_orderkey`, `l_commitdate` = `l_commitdate`, `l_receiptdate` = `l_receiptdate`, `l_shipdate` = `l_shipdate` }][select { `l_shipmode` = `l_shipmode`, `l_orderkey` = `l_orderkey` }][select { `_ibex_join_0_r_0` = `l_shipmode`, `_ibex_join_0_r_1` = `l_orderkey` }]) on { `_ibex_join_0_l_1` = `_ibex_join_0_r_1` })[select { `o_orderpriority` = `_ibex_join_0_l_0`, `o_orderkey` = `_ibex_join_0_l_1`, `l_shipmode` = `_ibex_join_0_r_0` }][select { `o_orderpriority` = `o_orderpriority`, `l_shipmode` = `l_shipmode` }][update { `line_count` = ((^_ibex_scalar_7 || (`o_orderpriority` == ^_ibex_scalar_8)) || (`o_orderpriority` == ^_ibex_scalar_9)) }][select { `o_orderpriority` = `o_orderpriority`, `l_shipmode` = `l_shipmode`, `line_count` = `line_count` }][select { `l_shipmode` = `l_shipmode`, `line_count` = `line_count` }][select { `l_shipmode`, `high_line_count` = coalesce(sum(Int64(`line_count`)), ^_ibex_scalar_10), `low_line_count` = coalesce(sum(Int64(!(`line_count`))), ^_ibex_scalar_11) }, by { `l_shipmode` }][update { `_ibex_sort_null_7_0` = is_null(`l_shipmode`) }][order { `_ibex_sort_null_7_0` desc, `l_shipmode` asc }];"
+  },
+  "correctness": "both complete results match Polars streaming",
+  "method": "two correctness checks, two warmups, six alternating paired rounds; previous-result destruction excluded",
+  "threads": 8,
+  "affinity": [
+    0,
+    2,
+    4,
+    6,
+    8,
+    10,
+    12,
+    14
+  ],
+  "diagnostic_change": "For default-null-policy membership over a nonempty null-free literal list, return the existing OR-of-equalities branch instead of its enclosing null-handling case. Only preparation is patched; query logic runs natively. No production modification.",
+  "driver_source": "import sys,importlib,json,time,statistics\nfrom pathlib import Path\nfrom unittest.mock import patch\nimport polars as pl\nfrom polars.testing import assert_frame_equal\nfrom ibex_polars import IbexEngine\nfrom ibex_polars._adapter import Adapter\nsys.path.insert(0,'/home/brj/code/polars-benchmark')\nbase=Path('/home/brj/code/polars-benchmark/data/tables/scale-10.0')\nq=importlib.import_module('queries.polars.q12').q(lineitem=pl.scan_parquet(base/'lineitem.parquet'), orders=pl.scan_parquet(base/'orders.parquet'))\noriginal=Adapter.expression\nchanged=[]\ndef simplified(self,node):\n result=original(self,node)\n value=self.visitor.view_expression(node)\n if type(value).__name__=='Function' and str(value.function_data[0]).split('.')[-1]=='IsIn' and value.function_data[1] is False:\n  collection=self.visitor.view_expression(value.input[1])\n  if type(collection).__name__=='Literal' and collection.value and all(x is not None for x in collection.value):\n   assert result._op=='case';changed.append(node);return result._args[2]\n return result\nengines={'current':IbexEngine().prepare(q)}\nwith patch.object(Adapter,'expression',simplified):engines['plain_membership']=IbexEngine().prepare(q)\nexpected=q.collect(engine='streaming')\nfor name,e in engines.items():\n assert_frame_equal(q.collect(engine=e),expected,rel_tol=1e-10,abs_tol=1e-8)\n for _ in range(2):q.collect(engine=e)\nsamples={name:[] for name in engines};previous=None\nfor i in range(6):\n for name in (list(engines) if i%2==0 else list(reversed(engines))):\n  start=time.perf_counter_ns();current=q.collect(engine=engines[name]);elapsed=(time.perf_counter_ns()-start)/1e6\n  previous=current;samples[name].append(elapsed)\nreport={'diagnostic_only':True,'changed_expression_nodes':changed,'samples_ms':samples,\n 'median_ms':{n:statistics.median(v) for n,v in samples.items()},\n 'source':{n:e.explain(q) for n,e in engines.items()},'correctness':'both complete results match Polars streaming'}\nPath('/tmp/pdsh-q12-membership-diagnostic.json').write_text(json.dumps(report,indent=2)+'\\n')\nprint(json.dumps(report['median_ms']),flush=True)\n",
+  "profile_driver_source": "exec(open('/tmp/pdsh-q12-membership-diagnostic.py').read().split(\"engines={'current'\")[0])\nwith patch.object(Adapter,'expression',simplified):e=IbexEngine().prepare(q)\nfor i in range(2):\n start=time.perf_counter();r=q.collect(engine=e);print('COLLECT',i,(time.perf_counter()-start)*1000,r.shape,flush=True)\n"
+}

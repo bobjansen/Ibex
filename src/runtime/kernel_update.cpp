@@ -2558,79 +2558,50 @@ auto write_fixed_width_numeric_binary(const ir::Expr& expr, const PredicateInput
     const std::size_t rows = range.count;
     const std::size_t begin = range.begin;
     if (output_kind == FixedWidthNumericKind::Double && output.doubles != nullptr) {
-        const double* lp = left.is_column && left.kind == ExprType::Double
-                               ? std::get<Column<double>>(*left.column).data() + begin
-                               : nullptr;
-        const double* rp = right.is_column && right.kind == ExprType::Double
-                               ? std::get<Column<double>>(*right.column).data() + begin
-                               : nullptr;
-        auto write = [&](auto op) {
-            if (lp != nullptr && rp != nullptr) {
-                for (std::size_t i = 0; i < rows; ++i)
-                    output.doubles[i] = op(lp[i], rp[i]);
-            } else if (lp != nullptr) {
-                const double scalar = numeric_double_value(right);
-                for (std::size_t i = 0; i < rows; ++i)
-                    output.doubles[i] = op(lp[i], scalar);
-            } else if (rp != nullptr) {
-                const double scalar = numeric_double_value(left);
-                for (std::size_t i = 0; i < rows; ++i)
-                    output.doubles[i] = op(scalar, rp[i]);
-            } else {
-                const double lhs = numeric_double_value(left);
-                const double rhs = numeric_double_value(right);
-                for (std::size_t i = 0; i < rows; ++i)
-                    output.doubles[i] = op(lhs, rhs);
+        // Each operand resolves once to a per-row reader, so every column/scalar
+        // mix (Int columns widened to Double included) runs a branch-free loop.
+        const auto with_reader = [begin](const NumericOperand& operand, auto&& body) {
+            if (!operand.is_column) {
+                const double value = numeric_double_value(operand);
+                return body([value](std::size_t) { return value; });
             }
-        };
-        if ((!left.is_column || lp != nullptr) && (!right.is_column || rp != nullptr)) {
-            switch (binary->op) {
-                case ir::ArithmeticOp::Add:
-                    write([](double a, double b) { return a + b; });
-                    break;
-                case ir::ArithmeticOp::Sub:
-                    write([](double a, double b) { return a - b; });
-                    break;
-                case ir::ArithmeticOp::Mul:
-                    write([](double a, double b) { return a * b; });
-                    break;
-                case ir::ArithmeticOp::Div:
-                    write([](double a, double b) { return a / b; });
-                    break;
-                case ir::ArithmeticOp::Mod:
-                    write([](double a, double b) { return std::fmod(a, b); });
-                    break;
-            }
-            return true;
-        }
-        const auto read = [](const NumericOperand& operand, std::size_t row) {
-            if (!operand.is_column)
-                return numeric_double_value(operand);
             if (operand.kind == ExprType::Int) {
-                return static_cast<double>(std::get<Column<std::int64_t>>(*operand.column)[row]);
+                const std::int64_t* p =
+                    std::get<Column<std::int64_t>>(*operand.column).data() + begin;
+                return body([p](std::size_t i) { return static_cast<double>(p[i]); });
             }
-            return std::get<Column<double>>(*operand.column)[row];
+            const double* p = std::get<Column<double>>(*operand.column).data() + begin;
+            return body([p](std::size_t i) { return p[i]; });
         };
-        for (std::size_t i = 0; i < rows; ++i) {
-            const double lhs = read(left, begin + i);
-            const double rhs = read(right, begin + i);
-            switch (binary->op) {
-                case ir::ArithmeticOp::Add:
-                    output.doubles[i] = lhs + rhs;
-                    break;
-                case ir::ArithmeticOp::Sub:
-                    output.doubles[i] = lhs - rhs;
-                    break;
-                case ir::ArithmeticOp::Mul:
-                    output.doubles[i] = lhs * rhs;
-                    break;
-                case ir::ArithmeticOp::Div:
-                    output.doubles[i] = lhs / rhs;
-                    break;
-                case ir::ArithmeticOp::Mod:
-                    output.doubles[i] = std::fmod(lhs, rhs);
-                    break;
+        auto write = [&](auto op) {
+            if (!left.is_column && !right.is_column) {
+                std::fill_n(output.doubles, rows,
+                            op(numeric_double_value(left), numeric_double_value(right)));
+                return;
             }
+            with_reader(left, [&](auto lhs) {
+                with_reader(right, [&](auto rhs) {
+                    for (std::size_t i = 0; i < rows; ++i)
+                        output.doubles[i] = op(lhs(i), rhs(i));
+                });
+            });
+        };
+        switch (binary->op) {
+            case ir::ArithmeticOp::Add:
+                write([](double a, double b) { return a + b; });
+                break;
+            case ir::ArithmeticOp::Sub:
+                write([](double a, double b) { return a - b; });
+                break;
+            case ir::ArithmeticOp::Mul:
+                write([](double a, double b) { return a * b; });
+                break;
+            case ir::ArithmeticOp::Div:
+                write([](double a, double b) { return a / b; });
+                break;
+            case ir::ArithmeticOp::Mod:
+                write([](double a, double b) { return std::fmod(a, b); });
+                break;
         }
         return true;
     }
@@ -2643,18 +2614,24 @@ auto write_fixed_width_numeric_binary(const ir::Expr& expr, const PredicateInput
         const std::int64_t ls = left.is_column ? 0 : numeric_int_value(left);
         const std::int64_t rs = right.is_column ? 0 : numeric_int_value(right);
         auto write = [&](auto op) {
+            // Locals, not captures: write is not inlined, and an int64_t store may
+            // alias the closure's size_t/int64_t fields, so a captured trip count
+            // or scalar is reloaded every row and the loop never vectorizes.
+            const std::size_t n = rows;
+            const std::int64_t l = ls;
+            const std::int64_t r = rs;
+            std::int64_t* const out = output.ints;
             if (lp != nullptr && rp != nullptr) {
-                for (std::size_t i = 0; i < rows; ++i)
-                    output.ints[i] = op(lp[i], rp[i]);
+                for (std::size_t i = 0; i < n; ++i)
+                    out[i] = op(lp[i], rp[i]);
             } else if (lp != nullptr) {
-                for (std::size_t i = 0; i < rows; ++i)
-                    output.ints[i] = op(lp[i], rs);
+                for (std::size_t i = 0; i < n; ++i)
+                    out[i] = op(lp[i], r);
             } else if (rp != nullptr) {
-                for (std::size_t i = 0; i < rows; ++i)
-                    output.ints[i] = op(ls, rp[i]);
+                for (std::size_t i = 0; i < n; ++i)
+                    out[i] = op(l, rp[i]);
             } else {
-                for (std::size_t i = 0; i < rows; ++i)
-                    output.ints[i] = op(ls, rs);
+                std::fill_n(out, n, op(l, r));
             }
         };
         switch (binary->op) {

@@ -395,6 +395,10 @@ auto arith_vec(ir::ArithmeticOp op, const ColumnValue& lhs, std::size_t lhs_off,
             }
         }
     }
+    if (std::holds_alternative<Column<bool>>(lhs) || std::holds_alternative<Column<bool>>(rhs)) {
+        return std::unexpected(
+            "filter: Bool arithmetic not supported; convert explicitly with Int64(x)");
+    }
     return std::unexpected("filter: arithmetic on string column");
 }
 
@@ -2261,28 +2265,38 @@ auto compute_mask(const ir::Expr& expr, const PredicateInput& input, const Scala
                 auto right = compute_mask(*node.right, input, scalars, rows);
                 if (!right)
                     return std::unexpected(right.error());
-                const uint8_t* lp = left->value.data();
+                // Raw pointers and a local count: a byte store through the
+                // vector's operator[] may alias its data pointer and n, which
+                // would then be reloaded every row and block vectorization.
+                const std::size_t count = n;
+                uint8_t* out = left->value.data();
+                const uint8_t* lp = out;
                 const uint8_t* rp = right->value.data();
-                for (std::size_t i = 0; i < n; ++i)
-                    left->value[i] = is_and ? (lp[i] & rp[i]) : (lp[i] | rp[i]);
+                for (std::size_t i = 0; i < count; ++i)
+                    out[i] = is_and ? (lp[i] & rp[i]) : (lp[i] | rp[i]);
                 if (left->valid || right->valid) {
                     if (!left->valid)
                         left->valid.emplace(n, uint8_t{1});
                     if (!right->valid)
                         right->valid.emplace(n, uint8_t{1});
-                    const uint8_t* lval = left->valid->data();
+                    uint8_t* out_valid = left->valid->data();
+                    const uint8_t* lval = out_valid;
                     const uint8_t* rval = right->valid->data();
-                    for (std::size_t i = 0; i < n; ++i) {
-                        if (is_and) {
+                    // One loop per operator: a branch inside would leave a
+                    // conditional byte store per arm, which does not vectorize.
+                    if (is_and) {
+                        for (std::size_t i = 0; i < count; ++i) {
                             // definitively false if either side is a known false
                             const uint8_t a_false = lval[i] & (1U - lp[i]);
                             const uint8_t b_false = rval[i] & (1U - rp[i]);
-                            (*left->valid)[i] = (lval[i] & rval[i]) | a_false | b_false;
-                        } else {
+                            out_valid[i] = (lval[i] & rval[i]) | a_false | b_false;
+                        }
+                    } else {
+                        for (std::size_t i = 0; i < count; ++i) {
                             // definitively true if either side is a known true
                             const uint8_t a_true = lval[i] & lp[i];
                             const uint8_t b_true = rval[i] & rp[i];
-                            (*left->valid)[i] = (lval[i] & rval[i]) | a_true | b_true;
+                            out_valid[i] = (lval[i] & rval[i]) | a_true | b_true;
                         }
                     }
                 }

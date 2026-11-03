@@ -3730,6 +3730,12 @@ TEST_CASE("A typed NULL literal is a null of its type in every position", "[inte
     auto some = runtime::interpret(*require_ir("t[filter a == Int64(NULL) || a > 2];"), registry);
     REQUIRE(some.has_value());
     CHECK(some->rows() == 1);
+    // Likewise `&& false` makes a null known false, so its negation keeps the
+    // row; `&& true` leaves it null, and the row is dropped.
+    auto negated =
+        runtime::interpret(*require_ir("t[filter !(a == Int64(NULL) && a > 2)];"), registry);
+    REQUIRE(negated.has_value());
+    CHECK(negated->rows() == 2);
 }
 
 TEST_CASE("text aggregates preserve missing payloads and long strings",
@@ -12838,6 +12844,77 @@ TEST_CASE("update: rowwise min/max work in interpreted expressions", "[update][m
     CHECK(max_abc[1] == Catch::Approx(10.3));
     CHECK(min_abc[1] == Catch::Approx(10.1));
     CHECK(mid_abc[1] == Catch::Approx(10.2));
+}
+
+TEST_CASE("grouped update: two-operand pmin/pmax aggregate arguments pick per row",
+          "[update][aggregate][math]") {
+    // A grouped update evaluates an aggregate's argument as a field, where a
+    // two-operand pmin/pmax runs the fast elementwise loop: column/column,
+    // column/scalar and scalar/column each have their own loop.
+    runtime::Table table;
+    table.add_column("g", Column<std::int64_t>{1, 1, 2, 2});
+    table.add_column("x", Column<double>{1.5, 2.5, 0.5, 9.0});
+    table.add_column("y", Column<double>{2.0, 1.0, 3.0, 4.0});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir(
+        "t[update { lo = sum(pmin(x, y)), hi = sum(pmax(x, y)), "
+        "cap = sum(pmin(x, 2.0)), lift = sum(pmax(2.0, y)) }, by g];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 4);
+
+    const auto& g = std::get<Column<std::int64_t>>(*result->find("g"));
+    const auto& lo = std::get<Column<double>>(*result->find("lo"));
+    const auto& hi = std::get<Column<double>>(*result->find("hi"));
+    const auto& cap = std::get<Column<double>>(*result->find("cap"));
+    const auto& lift = std::get<Column<double>>(*result->find("lift"));
+    for (std::size_t row = 0; row < 4; ++row) {
+        // Row-wise: pmin(x, y) = [1.5, 1, 0.5, 4], pmax(x, y) = [2, 2.5, 3, 9],
+        // pmin(x, 2) = [1.5, 2, 0.5, 2], pmax(2, y) = [2, 2, 3, 4]. All exact.
+        const bool first = g[row] == 1;
+        CHECK(lo[row] == (first ? 2.5 : 4.5));
+        CHECK(hi[row] == (first ? 4.5 : 12.0));
+        CHECK(cap[row] == (first ? 3.5 : 2.5));
+        CHECK(lift[row] == (first ? 4.0 : 7.0));
+    }
+}
+
+TEST_CASE("arithmetic on a Bool operand is a type error", "[update][types]") {
+    // A Bool is not implicitly an Int64 in arithmetic (SPEC 3.2); `Int64(b)` is
+    // the explicit conversion. Division shows why: `n / b` is either `n` or a
+    // division by zero, never a useful number.
+    runtime::Table table;
+    table.add_column("x", Column<double>{1.5, 2.5});
+    table.add_column("a", Column<std::int64_t>{1, 2});
+    table.add_column("f", Column<bool>{true, false});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    for (const char* source : {
+             "t[update { z = x * f }];",
+             "t[update { z = f + x }];",
+             "t[update { z = a / f }];",
+             "t[update { z = a % f }];",
+             "t[update { z = a - true }];",
+             "t[update { z = false * x }];",
+             "t[filter x * f > 1.0];",
+             "t[filter a + true > 1];",
+             "t[select { s = sum(a + f) }];",
+         }) {
+        INFO("query: " << source);
+        auto result = runtime::interpret(*require_ir(source), registry);
+        REQUIRE_FALSE(result.has_value());
+        CHECK_THAT(result.error(), Catch::Matchers::ContainsSubstring("Bool"));
+    }
+
+    // The explicit cast is the supported spelling.
+    auto cast = runtime::interpret(*require_ir("t[update { z = a + Int64(f) }];"), registry);
+    REQUIRE(cast.has_value());
+    const auto& z = std::get<Column<std::int64_t>>(*cast->find("z"));
+    CHECK(z[0] == 2);
+    CHECK(z[1] == 2);
 }
 
 TEST_CASE("rep missing positional argument returns error") {

@@ -2137,6 +2137,12 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
             left.value() == ExprType::Timestamp || right.value() == ExprType::Timestamp) {
             return std::unexpected("date/time arithmetic not supported");
         }
+        if (left.value() == ExprType::Bool || right.value() == ExprType::Bool) {
+            // Not an implicit 0/1 (SPEC 3.2): `n / b` would be `n` or a division
+            // by zero. Counting a predicate is spelled `Int64(b)`.
+            return std::unexpected(
+                "Bool arithmetic not supported; convert explicitly with Int64(x)");
+        }
         if (bin->op == ir::ArithmeticOp::Div) {
             return ExprType::Double;
         }

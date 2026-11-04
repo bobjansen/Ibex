@@ -2656,7 +2656,6 @@ auto filter_gather_is_thread_safe(const Table& input, const std::vector<std::siz
         return std::visit(
             [](const auto& col) {
                 using ColT = std::decay_t<decltype(col)>;
-                // NOLINTNEXTLINE(bugprone-branch-clone)
                 if constexpr (std::is_same_v<ColT, Column<bool>>) {
                     return true;  // bit-packed; shared-word rule
                 } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {

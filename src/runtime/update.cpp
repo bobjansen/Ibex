@@ -2696,7 +2696,6 @@ auto lift_group_state(ir::Expr& expr, const Table& input, std::size_t& counter,
             if constexpr (std::is_same_v<NodeT, ir::ColumnRef> ||
                           std::is_same_v<NodeT, ir::Literal>) {
                 return true;
-                // NOLINTNEXTLINE(bugprone-branch-clone) -- distinct constexpr case, same verdict
             } else if constexpr (std::is_same_v<NodeT, ir::RankExpr>) {
                 return false;
             } else if constexpr (std::is_same_v<NodeT, ir::IsNullExpr>) {

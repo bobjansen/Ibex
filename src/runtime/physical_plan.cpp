@@ -1301,7 +1301,6 @@ auto plan_join(const ir::JoinNode& join, const ir::SourceSchemas& sources) -> Jo
         out.decline = JoinDeclineReason::UnsupportedKind;
     } else if (join.predicate().has_value()) {
         out.decline = JoinDeclineReason::HasPredicate;
-        // NOLINTNEXTLINE(bugprone-branch-clone)
     } else if (join.keys().size() > 2) {
         out.decline = JoinDeclineReason::MultipleKeys;
     } else if (join.keys().size() == 2 && !join_keys_provably_int64(join, sources)) {

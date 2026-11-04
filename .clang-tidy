@@ -26,6 +26,7 @@ Checks: >
   -cppcoreguidelines-avoid-non-const-global-variables,
   -cppcoreguidelines-owning-memory,
   -bugprone-easily-swappable-parameters,
+  -bugprone-branch-clone,
   -cppcoreguidelines-pro-type-union-access,
   -cppcoreguidelines-pro-type-vararg,
   -misc-use-internal-linkage
@@ -37,6 +38,10 @@ Checks: >
 # Confirmed live in the editor: without these, operator[] bounds-access noise
 # floods every file, contradicting the already-excluded pro-bounds-* siblings.
 # Do not remove based on `clang-tidy-20 --list-checks` alone.
+# bugprone-branch-clone: every hit was a deliberate repeat -- `if constexpr`
+# type dispatch giving several types the same verdict, each with its own
+# reason comment, or priority-ordered decline chains. It was only ever
+# silenced with NOLINT, never led to a fix.
 # Without this, clang-tidy parses included headers but only reports
 # diagnostics located in the main file (the .cpp) being compiled, so issues
 # inside our own headers were silently dropped in CI even though every

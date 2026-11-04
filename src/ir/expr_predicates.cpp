@@ -210,7 +210,6 @@ auto every_call(const Expr& expr, OkCall ok) -> bool {
                                            [&](const auto& a) { return every_call(*a, ok); }) &&
                        std::ranges::all_of(
                            n.named_args, [&](const auto& na) { return every_call(*na.value, ok); });
-                // NOLINTNEXTLINE(bugprone-branch-clone)
             } else if constexpr (std::is_same_v<T, RankExpr>) {
                 return false;
             } else {

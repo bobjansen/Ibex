@@ -34,10 +34,9 @@ if(IBEX_KAFKA_VENDOR_AVROCPP)
         SOURCE_SUBDIR  lang/c++
     )
 
-    set(_ibex_saved_suppress_dev_warnings "${CMAKE_SUPPRESS_DEVELOPER_WARNINGS}")
-    set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS 1)
+    ibex_begin_third_party()
     FetchContent_MakeAvailable(avrocpp)
-    set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS "${_ibex_saved_suppress_dev_warnings}")
+    ibex_end_third_party()
 
     if(TARGET avrocpp_s)
         set(IBEX_KAFKA_AVRO_TARGET avrocpp_s)

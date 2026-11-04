@@ -4,6 +4,7 @@
 # Dependencies.cmake — External dependencies via FetchContent
 
 include(FetchContent)
+include(${CMAKE_CURRENT_LIST_DIR}/QuietThirdParty.cmake)
 
 # Every dependency below is pinned to a fixed GIT_TAG, so once it has been
 # populated into _deps/ once, there is nothing new to fetch. Without this,
@@ -53,6 +54,8 @@ function(ibex_silence_external_target target_name)
         # generator's default WarningLevel.
     endif()
 endfunction()
+
+ibex_begin_third_party()
 
 if(NOT IBEX_MINIMAL_RUNTIME)
     # CLI11 — command-line parsing
@@ -129,3 +132,5 @@ if(IBEX_BUILD_TESTS)
     ibex_silence_external_target(Catch2WithMain)
     list(APPEND CMAKE_MODULE_PATH "${Catch2_SOURCE_DIR}/extras")
 endif()
+
+ibex_end_third_party()

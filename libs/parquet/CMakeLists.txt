@@ -26,6 +26,7 @@ if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
 endif()
 
 include(FetchContent)
+include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/QuietThirdParty.cmake")
 
 # Embedders can omit remote transports entirely. The R package uses this mode:
 # it needs fast, reliable local-file Parquet support and should not build the
@@ -173,8 +174,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
 else()
     set(ARROW_CXXFLAGS "" CACHE STRING "" FORCE)
 endif()
-set(_ibex_saved_suppress_dev_warnings "${CMAKE_SUPPRESS_DEVELOPER_WARNINGS}")
-set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS 1)
+ibex_begin_third_party()
 set(ARROW_WITH_THRIFT ON CACHE BOOL "" FORCE)
 set(Thrift_SOURCE "BUNDLED" CACHE STRING "" FORCE)
 set(ARROW_WITH_ZLIB ON CACHE BOOL "" FORCE)
@@ -215,6 +215,27 @@ if(ARROW_S3)
         URL      https://github.com/aws/aws-lc/archive/v1.73.0.tar.gz
         URL_HASH SHA256=e33ae89e7d09d7b23a900f68b62088d8813c260ac564b016e543ee3540ebcce3
     )
+    # aws-lc warns that ENABLE_PRE_SONAME_BUILD is deprecated whenever it is
+    # merely *defined* — and its own option() caches it on the first
+    # configure, so every reconfigure warns about a value nobody set. Drop the
+    # cache entry while it still holds aws-lc's default (ON) so option()
+    # recreates the same value silently; a deliberate OFF is kept.
+    if(DEFINED CACHE{ENABLE_PRE_SONAME_BUILD} AND "$CACHE{ENABLE_PRE_SONAME_BUILD}")
+        unset(ENABLE_PRE_SONAME_BUILD CACHE)
+    endif()
+    # Same URL and hash as Arrow 22's bundled aws-sdk-cpp (ARROW_AWSSDK_BUILD_*
+    # in arrow's cpp/thirdparty/versions.txt), declared first so this one wins.
+    # The patch only deletes the unconditional LEGACY_BUILD=ON warning; bump
+    # both together with Arrow.
+    FetchContent_Declare(
+        aws-sdk-cpp
+        SYSTEM OVERRIDE_FIND_PACKAGE EXCLUDE_FROM_ALL TRUE
+        URL      https://github.com/aws/aws-sdk-cpp/archive/1.11.587.tar.gz
+        URL_HASH SHA256=b9944ba9905a68d6e53abb4f36ab2b3bd18ac88d8571647bb9f2b8026b76f8cd
+        PATCH_COMMAND ${CMAKE_COMMAND}
+                      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/aws-sdk-cpp-no-legacy-build-warning.patch
+                      -P ${CMAKE_CURRENT_LIST_DIR}/../../cmake/ApplyPatchOnce.cmake
+    )
 endif()
 set(CMAKE_PROJECT_aws-cpp-sdk-all_INCLUDE_BEFORE
     "${IBEX_ROOT}/cmake/AwsSdkCppModulePath.cmake")
@@ -229,7 +250,7 @@ FetchContent_MakeAvailable(arrow)
 if(WIN32 AND DEFINED boost_SOURCE_DIR)
     file(REMOVE "${boost_SOURCE_DIR}/libs/locale/include/cwctype")
 endif()
-set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS "${_ibex_saved_suppress_dev_warnings}")
+ibex_end_third_party()
 
 # Bundled thrift uses deprecated std::iterator; suppress the warning on its
 # target. -Wno-deprecated-declarations is a GCC/Clang spelling; cl.exe reads

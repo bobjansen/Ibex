@@ -1,0 +1,17 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -6,12 +6,8 @@
+ 
+ option(LEGACY_BUILD "If enabled, the SDK will use 1.11.0 version of CMake files to build" ON)
+ if (LEGACY_BUILD)
+-    message(WARNING "In 1.11 releases, we are releasing experimental alternative building mode."
+-            "By setting -DLEGACY_BUILD=OFF you can test our advances in modern CMake building and "
+-            "provide early feedback. "
+-            "The legacy support is set by default in 1.11, when you complete build updating scripts please "
+-            "update the build flags as mentioned in README.md and set -DLEGACY_BUILD=OFF. "
+-            "The legacy support will be removed at 1.12.0 release.")
++    # ibex: upstream nag about the experimental non-legacy build removed;
++    # it fires on every configure and LEGACY_BUILD=OFF is not an option yet.
+ 
+     if (POLICY CMP0077)
+         cmake_policy(SET CMP0077 OLD) # CMP0077: option() honors normal variables. Introduced in 3.13

@@ -1940,13 +1940,10 @@ enum class FloatCleanMode : std::uint8_t {
 /// Build a map pipeline's source (`pipeline.source_node`): `build_operator`,
 /// except that an aggregate under a filter receives the filter's aggregate
 /// comparisons as a prefilter (aggregate_prefilter.hpp).
-[[nodiscard]] auto build_pipeline_source(const physical::Plan& pipeline,
-                                         const TableRegistry& registry,
-                                         const ScalarRegistry* scalars,
-                                         const ExternRegistry* externs,
-                                         const ExecutionContext& exec, ModelResult* model_out,
-                                         const ir::Node* input_node = nullptr)
-    -> std::expected<OperatorPtr, std::string>;
+[[nodiscard]] auto build_pipeline_source(
+    const physical::Plan& pipeline, const TableRegistry& registry, const ScalarRegistry* scalars,
+    const ExternRegistry* externs, const ExecutionContext& exec, ModelResult* model_out,
+    const ir::Node* input_node = nullptr) -> std::expected<OperatorPtr, std::string>;
 /// Execute an already-built migrated physical plan. Production's normal
 /// `build_operator` path calls the same implementation after planning; keeping
 /// this seam explicit lets mutation tests prove that executor behavior follows

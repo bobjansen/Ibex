@@ -414,7 +414,8 @@ TEST_CASE("semi pushdown: a projection between the semi and the join is looked t
           "[ir][join_pushdown][semi]") {
     // (Project(a JOIN b on k)) SEMI c on ax  ->  Project((a SEMI c on ax) JOIN b on k).
     // The Polars adapter selects the visible columns after every join.
-    auto inner = make_join({2}, ir::JoinKind::Inner, {"k"}, make_scan({3}, "a"), make_scan({4}, "b"));
+    auto inner =
+        make_join({2}, ir::JoinKind::Inner, {"k"}, make_scan({3}, "a"), make_scan({4}, "b"));
     std::vector<ir::ColumnRef> cols{{.name = "ax"}, {.name = "k"}};
     auto project = std::make_unique<ir::ProjectNode>(ir::NodeId{7}, std::move(cols));
     project->add_child(std::move(inner));

@@ -812,7 +812,8 @@ class Column<Categorical> {
     /// An adopted dictionary stays in the producer's buffers until something
     /// asks for `dictionary()` or `dictionary_ptr()`; this does not ask.
     [[nodiscard]] auto dictionary_materialized() const noexcept -> bool {
-        return dict_materialized_ || (load_ != nullptr && load_->done.load(std::memory_order_acquire));
+        return dict_materialized_ ||
+               (load_ != nullptr && load_->done.load(std::memory_order_acquire));
     }
     [[nodiscard]] auto dictionary_size() const noexcept -> size_type {
         return dictionary_is_external() ? dict_size_ : (dict_ == nullptr ? 0 : dict_->size());

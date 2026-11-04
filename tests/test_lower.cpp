@@ -374,8 +374,8 @@ TEST_CASE("Projections between stream-only updates stream with them", "[runtime]
     // put a projection between updates. Stopping the climb at it left the
     // updates above serial, and a join's scan-worker sink withdrawn (q22's
     // anti-join key over the orders scan).
-    auto program =
-        require_parse("df[update { n = price * 2 }][select { n }][update { m = n + 1 }][select { m }];");
+    auto program = require_parse(
+        "df[update { n = price * 2 }][select { n }][update { m = n + 1 }][select { m }];");
     auto result = parser::lower(program);
     REQUIRE(result.has_value());
     {

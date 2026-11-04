@@ -587,9 +587,11 @@ auto deferred_source_schemas(const DeferredScanRegistry* deferred) -> ir::Source
             const ir::ColumnType type = runtime_column_type(*column.column);
             // A string column's in-memory form (plain or dictionary) can be
             // settled only when it decodes, so it stays untyped here.
-            const bool settled = type != ir::ColumnType::String && type != ir::ColumnType::Categorical;
-            fields.push_back({.name = column.name,
-                              .type = settled ? std::optional<ir::ColumnType>{type} : std::nullopt});
+            const bool settled =
+                type != ir::ColumnType::String && type != ir::ColumnType::Categorical;
+            fields.push_back(
+                {.name = column.name,
+                 .type = settled ? std::optional<ir::ColumnType>{type} : std::nullopt});
         }
         schemas.insert_or_assign(name, ir::SchemaInfo::known(std::move(fields), /*open=*/false));
     }

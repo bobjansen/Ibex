@@ -20,7 +20,6 @@
 
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/worker_pool.hpp>
-#include <robin_hood.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -28,6 +27,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <robin_hood.h>
 #include <span>
 #include <string>
 #include <variant>

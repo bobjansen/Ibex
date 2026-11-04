@@ -2377,8 +2377,7 @@ auto plan_fused_left_join_count(const ir::AggregateNode& aggregate)
         }
     }
     const bool candidate = join.kind() == ir::JoinKind::Left && join.keys().size() == 1 &&
-                           !join.predicate().has_value() &&
-                           aggregate.aggregations().size() == 1 &&
+                           !join.predicate().has_value() && aggregate.aggregations().size() == 1 &&
                            (aggregate.aggregations().front().func == ir::AggFunc::Count ||
                             aggregate.aggregations().front().func == ir::AggFunc::Sum) &&
                            counted.has_value() && group_source == join.keys().front().left;

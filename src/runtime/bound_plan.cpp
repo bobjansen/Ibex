@@ -57,7 +57,8 @@ void bind_node(ir::NodePtr& node, const ScalarRegistry& scalars) {
             if (has_binding(filter.predicate(), scalars)) {
                 auto predicate = filter.take_predicate();
                 bind_expr(predicate, scalars);
-                replace_node(node, std::make_unique<ir::FilterNode>(node->id(), std::move(predicate)));
+                replace_node(node,
+                             std::make_unique<ir::FilterNode>(node->id(), std::move(predicate)));
             }
             break;
         }

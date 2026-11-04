@@ -510,8 +510,8 @@ TEST_CASE("aggregate prefilter: reaches through the adapter's coalesce and bound
     for (const auto& [aggregate, predicate, tail] :
          std::vector<std::tuple<std::string, std::string, std::string>>{
              {"t[select { k, s = coalesce(sum(v), 0.0) }, by { k }]", "s > ^limit", ""},
-             {"t[select { k, s = coalesce(sum(v), 0.0) }, by { k }][select { k, s }]",
-              "s > ^limit", "[select { k }]"},
+             {"t[select { k, s = coalesce(sum(v), 0.0) }, by { k }][select { k, s }]", "s > ^limit",
+              "[select { k }]"},
              {"t[select { s = sum(v) }, by { k }][select { k, t = s }]", "t > 2700.0", ""},
          }) {
         INFO(aggregate << "[filter " << predicate << "]" << tail);
@@ -521,9 +521,9 @@ TEST_CASE("aggregate prefilter: reaches through the adapter's coalesce and bound
             auto profile = std::make_shared<runtime::ExecutionProfileState>(
                 /*worker_budget=*/8, /*report=*/false);
             exec.execution_profile = profile;
-            const auto whole =
-                runtime::interpret(*lower_query(aggregate + "[filter " + predicate + "]" + tail + ";"),
-                                   registry, &scalars, nullptr, nullptr, exec);
+            const auto whole = runtime::interpret(
+                *lower_query(aggregate + "[filter " + predicate + "]" + tail + ";"), registry,
+                &scalars, nullptr, nullptr, exec);
             REQUIRE(whole.has_value());
             const auto rows = profile->snapshot();
             const auto row = std::ranges::find_if(

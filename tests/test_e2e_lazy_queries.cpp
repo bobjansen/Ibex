@@ -228,8 +228,7 @@ joined;
             std::set<std::vector<std::int64_t>>{{1, 20}, {4, 40}, {4, 50}});
 }
 
-TEST_CASE("e2e lazy: a deferred scalar acts as a literal in the whole-script plan",
-          "[e2e][lazy]") {
+TEST_CASE("e2e lazy: a deferred scalar acts as a literal in the whole-script plan", "[e2e][lazy]") {
     // Every scalar binding is materialized before the script is lowered, so
     // `^fill` is bound into the plan. `fill_null` takes only a literal fill
     // value: unbound, the reference reached the kernel and was an error.

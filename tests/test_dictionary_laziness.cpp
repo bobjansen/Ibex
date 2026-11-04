@@ -49,9 +49,9 @@ auto adopted_keys(std::size_t rows) -> Column<Categorical> {
     for (std::size_t i = 0; i < rows; ++i) {
         buffers->codes.push_back(kFirstUsed + static_cast<std::int32_t>(i % 3));
     }
-    return Column<Categorical>::from_external(
-        buffers, buffers->codes.data(), 0, rows, buffers->offsets.data(), buffers->chars.data(), 0,
-        kDictionary);
+    return Column<Categorical>::from_external(buffers, buffers->codes.data(), 0, rows,
+                                              buffers->offsets.data(), buffers->chars.data(), 0,
+                                              kDictionary);
 }
 
 struct Fixture {

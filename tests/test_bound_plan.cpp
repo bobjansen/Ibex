@@ -26,12 +26,14 @@ using namespace ibex;
 namespace {
 
 auto ref(std::string name, bool lexical) -> ir::ExprPtr {
-    return ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = std::move(name), .lexical = lexical}});
+    return ir::make_expr_ptr(
+        ir::Expr{.node = ir::ColumnRef{.name = std::move(name), .lexical = lexical}});
 }
 
 auto greater(std::string column, ir::ExprPtr right) -> ir::Expr {
-    return ir::Expr{.node = ir::CompareExpr{
-                        .op = ir::CompareOp::Gt, .left = ref(std::move(column), false), .right = std::move(right)}};
+    return ir::Expr{.node = ir::CompareExpr{.op = ir::CompareOp::Gt,
+                                            .left = ref(std::move(column), false),
+                                            .right = std::move(right)}};
 }
 
 auto literal_of(const ir::ExprPtr& expr) -> const ir::Literal* {
@@ -123,9 +125,10 @@ TEST_CASE("bind_plan_constants leaves names it cannot prove are bindings",
 
 TEST_CASE("bind_plan_constants keeps a binding's type, null and NaN", "[runtime][bound_plan]") {
     ir::Builder b;
-    auto filter = b.filter(ir::Expr{.node = ir::LogicalExpr{.op = ir::LogicalOp::And,
-                                                            .left = ir::make_expr_ptr(greater("x", ref("none", true))),
-                                                            .right = ir::make_expr_ptr(greater("x", ref("nan", true)))}});
+    auto filter = b.filter(ir::Expr{
+        .node = ir::LogicalExpr{.op = ir::LogicalOp::And,
+                                .left = ir::make_expr_ptr(greater("x", ref("none", true))),
+                                .right = ir::make_expr_ptr(greater("x", ref("nan", true)))}});
     filter->add_child(b.scan("t"));
 
     runtime::ScalarRegistry scalars;
@@ -133,7 +136,8 @@ TEST_CASE("bind_plan_constants keeps a binding's type, null and NaN", "[runtime]
     scalars.insert_or_assign("nan", std::nan(""));
     auto bound = runtime::bind_plan_constants(std::move(filter), scalars);
 
-    const auto& both = std::get<ir::LogicalExpr>(ir::node_cast<ir::FilterNode>(*bound).predicate().node);
+    const auto& both =
+        std::get<ir::LogicalExpr>(ir::node_cast<ir::FilterNode>(*bound).predicate().node);
     const auto* none = literal_of(right_of(*both.left));
     REQUIRE(none != nullptr);
     REQUIRE(std::holds_alternative<NullScalar>(none->value));
@@ -146,7 +150,8 @@ TEST_CASE("bind_plan_constants keeps a binding's type, null and NaN", "[runtime]
 TEST_CASE("bind_plan_constants reaches join predicates and fused filter-limits",
           "[runtime][bound_plan]") {
     ir::Builder b;
-    auto join = b.join(ir::JoinKind::Inner, {ir::JoinKey{"k", "k"}}, greater("x", ref("low", true)));
+    auto join =
+        b.join(ir::JoinKind::Inner, {ir::JoinKey{"k", "k"}}, greater("x", ref("low", true)));
     join->add_child(b.scan("l"));
     join->add_child(b.scan("r"));
     auto fused = b.filter_head(greater("x", ref("low", true)), 2);

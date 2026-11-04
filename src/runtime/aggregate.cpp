@@ -649,8 +649,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 return std::unexpected("group-by column not found: " + group_by[i].name);
             }
             if (group_cats[i] != nullptr) {
-                output.add_column(group_by[i].name,
-                                  group_cats[i]->with_codes());
+                output.add_column(group_by[i].name, group_cats[i]->with_codes());
             } else {
                 output.add_column(group_by[i].name, make_empty_like(*column));
             }

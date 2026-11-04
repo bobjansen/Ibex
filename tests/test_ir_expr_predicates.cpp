@@ -72,8 +72,8 @@ TEST_CASE("a case expression is a row-local scalar", "[ir][functions]") {
     // row-local just because `__case` itself is.
     std::vector<ir::ExprPtr> lag_args;
     lag_args.push_back(col("v"));
-    const auto with_lag = make_case(ir::make_expr_ptr(
-        ir::Expr{.node = ir::CallExpr{.callee = "lag", .args = std::move(lag_args), .named_args = {}}}));
+    const auto with_lag = make_case(ir::make_expr_ptr(ir::Expr{
+        .node = ir::CallExpr{.callee = "lag", .args = std::move(lag_args), .named_args = {}}}));
     CHECK_FALSE(ir::is_row_local_update_expr(with_lag));
     CHECK_FALSE(ir::is_subset_evaluable_expr(with_lag));
 }

@@ -405,9 +405,10 @@ TEST_CASE("evaluate_field over a partial range matches evaluating a gathered ran
     fields.push_back(
         {.label = "case inside a call",
          .expr = std::move(*call(
-             "abs", {call("__case", {ir::make_expr_ptr(cmp(ir::CompareOp::Gt, col_ref("id"), ilit(50))),
-                                     arith(ir::ArithmeticOp::Sub, col_ref("nullable"), ilit(300)),
-                                     col_ref("id")})}))});
+             "abs",
+             {call("__case", {ir::make_expr_ptr(cmp(ir::CompareOp::Gt, col_ref("id"), ilit(50))),
+                              arith(ir::ArithmeticOp::Sub, col_ref("nullable"), ilit(300)),
+                              col_ref("id")})}))});
     fields.push_back({.label = "row-local kernel builtin over a range",
                       .expr = std::move(*call("length", {col_ref("name")}))});
     fields.push_back({.label = "unary math over a computed nullable argument",
@@ -426,8 +427,7 @@ TEST_CASE("evaluate_field over a partial range matches evaluating a gathered ran
     }
 }
 
-TEST_CASE("a ranged string kernel reads a borrowed view of an offset source",
-          "[filter][range]") {
+TEST_CASE("a ranged string kernel reads a borrowed view of an offset source", "[filter][range]") {
     // A partial range borrows String columns instead of copying them. When the
     // source is itself a view starting mid-buffer, the borrowed window must
     // start at the source's offset plus the range's, not at the range alone.
@@ -439,9 +439,9 @@ TEST_CASE("a ranged string kernel reads a borrowed view of an offset source",
     }
     const auto& base = *owned;
     runtime::Table table;
-    table.add_column("phone", Column<std::string>::from_external(owned, base.offsets_buffer_data(),
-                                                                 base.chars_buffer_data(), kSkip,
-                                                                 kRows));
+    table.add_column("phone",
+                     Column<std::string>::from_external(owned, base.offsets_buffer_data(),
+                                                        base.chars_buffer_data(), kSkip, kRows));
     const auto expr = call("like", {col_ref("phone"), slit("13%")});
     for (const RowRange rows : {RowRange{.begin = 0, .count = 64}, RowRange{.begin = 5, .count = 7},
                                 RowRange{.begin = 130, .count = 70}}) {

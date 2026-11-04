@@ -2237,9 +2237,7 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
         // Categorical into a String would be a schema change, not a speedup.
         if (cat != nullptr) {
             Column<Categorical>::codes_storage out_codes(out_code.begin(), out_code.end());
-            out.add_column(
-                extra_group_by[0].name,
-                cat->with_codes(std::move(out_codes)));
+            out.add_column(extra_group_by[0].name, cat->with_codes(std::move(out_codes)));
         } else if (!str_dict.empty()) {
             Column<std::string> key_out;
             key_out.reserve(n_out);

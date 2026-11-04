@@ -753,8 +753,8 @@ auto LazyTable::selection_for(const std::set<std::string>& output_names,
     std::vector<ir::Expr> unfused;
     std::optional<Selection> fused_selection;
     const auto bound_conjuncts = bind_scan_conjuncts(conjuncts, scalars, schema_);
-    if (fusable_string_conjuncts(bound_conjuncts.has_value() ? *bound_conjuncts : conjuncts, output_names,
-                                 fused, unfused)) {
+    if (fusable_string_conjuncts(bound_conjuncts.has_value() ? *bound_conjuncts : conjuncts,
+                                 output_names, fused, unfused)) {
         auto scan = scan_string_filters(fused, nullptr, exec);
         if (!scan) {
             return std::unexpected(scan.error());

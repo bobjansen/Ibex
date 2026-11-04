@@ -141,8 +141,9 @@ auto aggregate_prefilter_terms(const ir::Expr& predicate, const ir::AggregateNod
             }
             output = origin->second;
         }
-        const bool is_output = std::ranges::any_of(
-            aggregate.aggregations(), [&](const ir::AggSpec& spec) { return spec.alias == output; });
+        const bool is_output =
+            std::ranges::any_of(aggregate.aggregations(),
+                                [&](const ir::AggSpec& spec) { return spec.alias == output; });
         // A group-by key with the same name as an aggregate cannot happen (the
         // output would have two columns of that name), but a key alone is not
         // an aggregate output, so it is not read from the slots.

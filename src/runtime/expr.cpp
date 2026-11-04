@@ -3006,11 +3006,11 @@ namespace {
 /// back as its result cannot outlive the data it reads.
 auto borrow_or_gather_range(const ColumnEntry& entry, RowRange range) -> ColumnValue {
     if (const auto* strings = std::get_if<Column<std::string>>(entry.column.get())) {
-        return with_meta_of(Column<std::string>::from_external(
-                                std::shared_ptr<const void>(entry.column),
-                                strings->offsets_buffer_data(), strings->chars_buffer_data(),
-                                strings->buffer_offset() + range.begin, range.count),
-                            *entry.column);
+        return with_meta_of(
+            Column<std::string>::from_external(
+                std::shared_ptr<const void>(entry.column), strings->offsets_buffer_data(),
+                strings->chars_buffer_data(), strings->buffer_offset() + range.begin, range.count),
+            *entry.column);
     }
     return gather_range(*entry.column, range.begin, range.end());
 }

@@ -413,9 +413,7 @@ void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src,
                         bm.set(i, false);
                     }
                 }
-                return {
-                    col.with_codes(std::move(codes)),
-                    std::move(bm)};
+                return {col.with_codes(std::move(codes)), std::move(bm)};
             } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
                 const auto* src_off = col.offsets_data();
                 const char* src_char = col.chars_data();

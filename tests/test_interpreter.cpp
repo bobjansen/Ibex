@@ -18674,11 +18674,10 @@ TEST_CASE("Semi/anti join with an in-memory left probes a renamed streamed right
     auto exec = many_unit_exec(deferred, stats);
     // Renamed, and projection-only: a Project above the scan keeps the
     // scan-worker probe (it cannot drop rows or rebind the key's name).
-    for (const char* query :
-         {"small semi join big[select { r0 = k }][select { k = r0 }] on k;",
-          "small anti join big[select { r0 = k }][select { k = r0 }] on k;",
-          "small semi join big[select { k, n }][select { k }] on k;",
-          "small anti join big[select { k, n }][select { k }] on k;"}) {
+    for (const char* query : {"small semi join big[select { r0 = k }][select { k = r0 }] on k;",
+                              "small anti join big[select { r0 = k }][select { k = r0 }] on k;",
+                              "small semi join big[select { k, n }][select { k }] on k;",
+                              "small anti join big[select { k, n }][select { k }] on k;"}) {
         INFO(query);
         const bool semi = std::string_view{query}.find("semi") != std::string_view::npos;
         auto ir = require_ir(query);
@@ -18688,7 +18687,8 @@ TEST_CASE("Semi/anti join with an in-memory left probes a renamed streamed right
         REQUIRE(id != nullptr);
         std::vector<std::int64_t> expected;
         for (std::size_t i = 0; i < kLeftRows; ++i) {
-            const bool match = i % 211 != 0 && right_keys.contains(static_cast<std::int64_t>(3 * i));
+            const bool match =
+                i % 211 != 0 && right_keys.contains(static_cast<std::int64_t>(3 * i));
             if (match == semi) {
                 expected.push_back(static_cast<std::int64_t>(i));
             }

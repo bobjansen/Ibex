@@ -1236,7 +1236,8 @@ auto resolve_int_constant_operand(const ir::Expr& expr, const PredicateInput& in
         return std::nullopt;
     }
     const auto* ref = std::get_if<ir::ColumnRef>(&expr.node);
-    if (ref == nullptr || scalars == nullptr || (!ref->lexical && input.find(ref->name) != nullptr)) {
+    if (ref == nullptr || scalars == nullptr ||
+        (!ref->lexical && input.find(ref->name) != nullptr)) {
         return std::nullopt;
     }
     if (const auto it = scalars->find(ref->name); it != scalars->end()) {

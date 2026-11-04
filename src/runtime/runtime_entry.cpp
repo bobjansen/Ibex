@@ -445,7 +445,7 @@ auto is_row_local_chain_over_lazy_scan(const ir::Node& node, const TableRegistry
 /// when `node` is not such a chain. The source's count, not the chain's
 /// output: an upper bound, used only to order two sides' work.
 auto chain_source_rows(const ir::Node& node, const TableRegistry& registry,
-                            const ExecutionContext& exec) -> std::optional<std::size_t> {
+                       const ExecutionContext& exec) -> std::optional<std::size_t> {
     const ir::Node* cur = &node;
     while (cur->kind() == ir::NodeKind::Filter || cur->kind() == ir::NodeKind::Project ||
            cur->kind() == ir::NodeKind::Rename || cur->kind() == ir::NodeKind::Update) {
@@ -1207,7 +1207,8 @@ auto build_pipeline_source(const physical::Plan& pipeline, const TableRegistry& 
         result = step.factory(step, std::move(result.value()), scalars, externs, exec,
                               &pipeline.source_signature, false);
         if (result.has_value() && exec.execution_profile != nullptr) {
-            result = profile_operator(std::move(result.value()), exec.execution_profile, *step.node);
+            result =
+                profile_operator(std::move(result.value()), exec.execution_profile, *step.node);
         }
     }
     return result;

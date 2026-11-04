@@ -535,13 +535,14 @@ auto cmp_col_scalar_into_double(ir::CompareOp op, const double* __restrict cp, d
 template <ir::CompareOp Op, typename Left, typename Right>
 void nan_high_loop(const Left& left, const Right& right, uint8_t* out, std::size_t n) {
     for (std::size_t i = 0; i < n; ++i) {
-        const double a = static_cast<double>(left(i));
-        const double b = static_cast<double>(right(i));
-        const bool an = std::isnan(a), bn = std::isnan(b);
+        const auto a = static_cast<double>(left(i));
+        const auto b = static_cast<double>(right(i));
+        const bool an = std::isnan(a);
+        const bool bn = std::isnan(b);
         if constexpr (Op == ir::CompareOp::Eq)
             out[i] = (a == b) || (an && bn);
         if constexpr (Op == ir::CompareOp::Ne)
-            out[i] = !((a == b) || (an && bn));
+            out[i] = (a != b) && (!an || !bn);
         if constexpr (Op == ir::CompareOp::Lt)
             out[i] = (a < b) || (!an && bn);
         if constexpr (Op == ir::CompareOp::Le)

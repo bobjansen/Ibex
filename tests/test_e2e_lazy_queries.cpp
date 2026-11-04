@@ -20,13 +20,16 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -77,7 +80,7 @@ auto empty_like(const ibex::runtime::ColumnValue& src) -> ibex::runtime::ColumnV
 constexpr std::size_t kWholeSource = std::numeric_limits<std::size_t>::max();
 
 void register_live_source(ExternRegistry& registry, std::string name, std::shared_ptr<Table> live,
-                          std::shared_ptr<std::vector<std::size_t>> decodes = nullptr) {
+                          const std::shared_ptr<std::vector<std::size_t>>& decodes = nullptr) {
     registry.register_lazy_table(
         std::move(name),
         [live = std::move(live), decodes](const ibex::runtime::ExternArgs&)
@@ -128,6 +131,15 @@ void register_lazy_source(ExternRegistry& registry, std::string name, Table data
     register_live_source(registry, std::move(name), std::make_shared<Table>(std::move(data)));
 }
 
+/// The table an execution returned. Throws (failing the test) when there is
+/// none -- unlike `REQUIRE`, a guard clang-tidy can see.
+auto table_of(const ibex::repl::ExecutionResult& result) -> const Table& {
+    if (!result.table.has_value()) {
+        throw std::runtime_error("execution returned no table: " + result.error);
+    }
+    return *result.table;
+}
+
 /// Run `script` through the whole-script planner and return the table handed to
 /// its `capture(df)` sink. Fails the test if the script does not execute.
 auto run_lazy_script(const char* script, std::vector<std::pair<std::string, Table>> sources)
@@ -151,13 +163,13 @@ auto run_lazy_script(const char* script, std::vector<std::pair<std::string, Tabl
     return captured;
 }
 
-auto i64(Table& t, const char* name) -> std::vector<std::int64_t> {
+auto i64(const Table& t, const char* name) -> std::vector<std::int64_t> {
     const auto* col = std::get_if<Column<std::int64_t>>(t.find(name));
     REQUIRE(col != nullptr);
     return {col->begin(), col->end()};
 }
 
-auto rows_of(Table& t, const std::vector<const char*>& cols)
+auto rows_of(const Table& t, const std::vector<const char*>& cols)
     -> std::set<std::vector<std::int64_t>> {
     std::vector<std::vector<std::int64_t>> columns;
     columns.reserve(cols.size());
@@ -475,7 +487,8 @@ struct DiskScript {
     std::shared_ptr<Table> disk;
     Table captured;
 
-    explicit DiskScript(Table initial, Table fresh) : disk(std::make_shared<Table>(initial)) {
+    explicit DiskScript(const Table& initial, Table fresh)
+        : disk(std::make_shared<Table>(initial)) {
         register_live_source(registry, "read_disk", disk);
         register_lazy_source(registry, "read_fresh", std::move(fresh));
         registry.register_scalar_table_consumer(
@@ -665,8 +678,7 @@ TEST_CASE("e2e lazy: head on the statement path decodes only the leading rows",
     decodes->clear();
     const auto result = session.execute("t[head 2];");
     REQUIRE(result.ok);
-    REQUIRE(result.table.has_value());
-    CHECK(result.table->rows() == 2);
+    CHECK(table_of(result).rows() == 2);
     REQUIRE_FALSE(decodes->empty());
     for (const auto rows : *decodes) {
         CHECK(rows <= 2);
@@ -711,7 +723,9 @@ constexpr const char* kImpliedQuery =
 // Part 1 line 1: first branch. Parts 2 and 3: second branch (part 3's null
 // brand leaves the first branch unknown, the second is true). Part 4 fails
 // both; its null-quantity line is unknown in the second branch.
-const std::set<std::vector<std::int64_t>> kImpliedRows{{1, 10}, {2, 30}, {3, 40}};
+auto implied_rows() -> std::set<std::vector<std::int64_t>> {
+    return {{1, 10}, {2, 30}, {3, 40}};
+}
 
 }  // namespace
 
@@ -736,7 +750,7 @@ result;
 )";
     Table out = run_lazy_script(src.c_str(),
                                 {{"read_part", implied_part()}, {"read_line", implied_line()}});
-    REQUIRE(rows_of(out, {"pk", "price"}) == kImpliedRows);
+    REQUIRE(rows_of(out, {"pk", "price"}) == implied_rows());
 }
 
 // The same through the statement path: one interactive statement at a time.
@@ -753,17 +767,15 @@ TEST_CASE("e2e lazy: a disjunction across join sides, statement at a time",
                 .ok);
     auto result = session.execute(std::string(kImpliedQuery) + ";");
     REQUIRE(result.ok);
-    REQUIRE(result.table.has_value());
-    REQUIRE(rows_of(*result.table, {"pk", "price"}) == kImpliedRows);
+    REQUIRE(rows_of(table_of(result), {"pk", "price"}) == implied_rows());
 }
 
-TEST_CASE("e2e lazy: a let binding a table query is planned like an expression",
-          "[e2e][lazy][projection_filter]") {
-    // The Polars adapter shares a computed subtree through `let`. A let passes
-    // a model slot to the evaluator in case its value fits a model; that alone
-    // used to send every let down the eager path, where the join filter never
-    // reaches the payload decode and this source refuses the request.
-    ExternRegistry registry;
+namespace {
+
+/// Registers `read_a` and `read_b`: lazy 4-row sources {k, v, payload} that
+/// refuse to decode `payload` without a row selection, so a query only
+/// succeeds if the join filter reaches the source before the payload decode.
+void register_payload_guarded_sources(ExternRegistry& registry) {
     for (const auto& name : {std::string("read_a"), std::string("read_b")}) {
         registry.register_lazy_table(
             name,
@@ -790,14 +802,27 @@ TEST_CASE("e2e lazy: a let binding a table query is planned like an expression",
                         const Selection all{0, 1, 2, 3};
                         const auto& selected = rows == nullptr ? all : *rows;
                         Table result;
-                        for (const auto& name : names) {
-                            result.add_column(name, slice_column(*data.find(name), selected));
+                        for (const auto& column_name : names) {
+                            result.add_column(column_name,
+                                              slice_column(*data.find(column_name), selected));
                         }
                         result.logical_rows = selected.size();
                         return result;
                     });
             });
     }
+}
+
+}  // namespace
+
+TEST_CASE("e2e lazy: a let binding a table query is planned like an expression",
+          "[e2e][lazy][projection_filter]") {
+    // The Polars adapter shares a computed subtree through `let`. A let passes
+    // a model slot to the evaluator in case its value fits a model; that alone
+    // used to send every let down the eager path, where the join filter never
+    // reaches the payload decode and this source refuses the request.
+    ExternRegistry registry;
+    register_payload_guarded_sources(registry);
     ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
     ibex::repl::ReplSession::ExecuteOptions options;
     options.plan_table_expressions = true;
@@ -815,8 +840,7 @@ picked[select {total = sum(left_value + right_value)}];
                                         std::move(options));
     CAPTURE(result.error);
     REQUIRE(result.ok);
-    REQUIRE(result.table.has_value());
-    const auto* total = std::get_if<Column<std::int64_t>>(result.table->find("total"));
+    const auto* total = std::get_if<Column<std::int64_t>>(table_of(result).find("total"));
     REQUIRE(total != nullptr);
     CHECK((*total)[0] == 60);
 }
@@ -824,40 +848,7 @@ picked[select {total = sum(left_value + right_value)}];
 TEST_CASE("e2e lazy: alias-wrapped join filters reach source payload decoding",
           "[e2e][lazy][projection_filter]") {
     ExternRegistry registry;
-    for (const auto& name : {std::string("read_a"), std::string("read_b")}) {
-        registry.register_lazy_table(
-            name,
-            [name](const ibex::runtime::ExternArgs&)
-                -> std::expected<ibex::runtime::LazyTablePtr, std::string> {
-                Table data;
-                data.add_column("k", Column<std::int64_t>{1, 2, 3, 4});
-                data.add_column("v", name == "read_a" ? Column<std::int64_t>{1, 3, 8, 9}
-                                                      : Column<std::int64_t>{2, 4, 6, 8});
-                data.add_column("payload", Column<std::int64_t>{10, 20, 30, 40});
-                Table schema;
-                for (const auto& column : data.columns) {
-                    schema.add_column(column.name, empty_like(*column.column));
-                }
-                return std::make_shared<ibex::runtime::LazyTable>(
-                    std::move(schema), 4,
-                    [data = std::move(data)](
-                        const std::vector<std::string>& names,
-                        const Selection* rows) -> std::expected<Table, std::string> {
-                        if (rows == nullptr && std::ranges::find(names, "payload") != names.end()) {
-                            return std::unexpected(
-                                "payload must be decoded after source filtering");
-                        }
-                        const Selection all{0, 1, 2, 3};
-                        const auto& selected = rows == nullptr ? all : *rows;
-                        Table result;
-                        for (const auto& name : names) {
-                            result.add_column(name, slice_column(*data.find(name), selected));
-                        }
-                        result.logical_rows = selected.size();
-                        return result;
-                    });
-            });
-    }
+    register_payload_guarded_sources(registry);
     ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
     ibex::repl::ReplSession::ExecuteOptions options;
     options.plan_table_expressions = true;
@@ -875,8 +866,7 @@ extern fn read_b() -> DataFrame from "x.hpp";
                                         std::move(options));
     CAPTURE(result.error);
     REQUIRE(result.ok);
-    REQUIRE(result.table.has_value());
-    const auto* total = std::get_if<Column<std::int64_t>>(result.table->find("total"));
+    const auto* total = std::get_if<Column<std::int64_t>>(table_of(result).find("total"));
     REQUIRE(total != nullptr);
     CHECK((*total)[0] == 60);
 }

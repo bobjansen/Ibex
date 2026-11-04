@@ -4,7 +4,6 @@
 #include "aggregate_prefilter.hpp"
 
 #include <ibex/ir/node.hpp>
-#include <ibex/runtime/pipeline.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
@@ -13,10 +12,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <robin_hood.h>
 #include <span>
+#include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
+#include "ibex/runtime/interpreter.hpp"
 #include "interpreter_internal.hpp"
 #include "physical_plan.hpp"
 #include "runtime_internal.hpp"

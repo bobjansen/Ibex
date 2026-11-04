@@ -4,7 +4,6 @@
 #pragma once
 
 #include <ibex/core/scalar_value.hpp>
-#include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/required_columns.hpp>
 
@@ -16,9 +15,7 @@
 #include <optional>
 #include <robin_hood.h>
 #include <string>
-#include <string_view>
 #include <utility>
-#include <variant>
 #include <vector>
 
 namespace ibex::codegen {

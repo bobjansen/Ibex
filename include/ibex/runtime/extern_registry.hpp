@@ -11,7 +11,7 @@
 // loader reports "has no ibex_register symbol".
 #include <cstddef>
 #include <variant>
-#if defined(_WIN32)
+#ifdef _WIN32
 #define IBEX_PLUGIN_EXPORT __declspec(dllexport)
 #else
 #define IBEX_PLUGIN_EXPORT

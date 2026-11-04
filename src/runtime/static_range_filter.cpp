@@ -16,10 +16,12 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
 #include "bound_filter.hpp"
+#include "ibex/runtime/lazy_table.hpp"
 
 namespace ibex::runtime {
 

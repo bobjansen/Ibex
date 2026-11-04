@@ -20,4 +20,26 @@ if [[ -z "$CLANG_TIDY_BIN" ]]; then
     exit 1
 fi
 
+# Default the compile database to the repo's Debug build dir, so
+# `scripts/clang-tidy.sh <files>` works without `-p`. An explicit -p wins, and
+# arguments after `--` mean the caller supplied the compile flags themselves.
+needs_build_dir=1
+for arg in "$@"; do
+    case "$arg" in
+        -p | --p | -p=* | --p=* | -- | --version | -version | --help | -help | --list-checks | -list-checks)
+            needs_build_dir=0
+            break
+            ;;
+    esac
+done
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "$needs_build_dir" -eq 1 ]]; then
+    if [[ ! -f "$REPO_ROOT/build/compile_commands.json" ]]; then
+        echo "error: $REPO_ROOT/build/compile_commands.json not found; configure build/ or pass -p <build-dir>" >&2
+        exit 1
+    fi
+    set -- -p "$REPO_ROOT/build" "$@"
+fi
+
 exec "$CLANG_TIDY_BIN" "$@"

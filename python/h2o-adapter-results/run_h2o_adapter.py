@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 """Run the h2o questions through Polars streaming and IbexEngine (same resident frames)."""
 import argparse, json, math, sys, time, traceback, pathlib, os
 sys.path.insert(0, "/home/brj/ibex/benchmarking")

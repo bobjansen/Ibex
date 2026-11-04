@@ -18,8 +18,10 @@ shared worker pool, and rejoins before it returns. Two coarser layers sit on top
 — **pipeline overlap** between a scan and its consumer, and a **morsel pipeline**
 over a maximal chain of row-local operators. Scheduling is **dynamic
 self-scheduling** off a shared atomic cursor: no work stealing, no deques, no
-priorities, no DAG. Every parallel path produces **byte-identical output** to its
-serial counterpart at any core count.
+priorities, no DAG. Every parallel path produces the **same rows, in the same
+order, with the same non-float values** as its serial counterpart at any core
+count; float results may differ in their last bits (see the determinism
+contract).
 
 ## The one invariant: one query at a time
 
@@ -38,26 +40,26 @@ design.
 
 `include/ibex/runtime/worker_pool.hpp`, `src/runtime/worker_pool.cpp`.
 
-A deliberately boring **fork–join** pool: pre-spawned threads, one
+A plain **fork–join** pool: pre-spawned threads, one
 mutex+condvar FIFO task queue, a completion latch. No futures, no continuations,
 no DAG scheduler, no work stealing.
 
 - **`submit(n, body)`** runs `body(worker_id)` for `id ∈ [0, n)` and returns a
-  `Batch`; `Batch::wait()` is the barrier and rethrows the first exception *by
-  worker id* (deterministic error selection).
+  `Batch`; `Batch::wait()` is the barrier and rethrows the first exception _by
+  worker id_ (deterministic error selection).
 - **`TaskGroup`** takes tasks one at a time with a single end-of-stream join —
   the shape a streaming sink wants when its input arrives one chunk at a time
   (used by the async hot-table aggregate). Adding a task is not a fork/join
   round trip.
 
-Three properties are load-bearing:
+Three properties the rest of the design depends on:
 
 - **The calling thread is not a worker.** In a morsel pipeline it is the ordered
   merger's consumer and must stay free.
 - **Nested `submit` is safe.** A pool worker blocked in `wait_for_batch`
-  *cooperatively runs queued tasks* while it waits, so a saturated set of
+  _cooperatively runs queued tasks_ while it waits, so a saturated set of
   parents forking child batches cannot deadlock. Therefore the
-  `on_worker_pool_thread()` check at the ~29 fan-out sites is a **performance
+  `on_worker_pool_thread()` check at the ~70 call sites is a **performance
   gate, not a correctness gate**: it declines to re-divide a pool an outer
   fan-out already saturated, because that only adds dispatch and merge overhead.
   ("Outermost wins" — but by choice, not because the inner level would break.)
@@ -65,7 +67,7 @@ Three properties are load-bearing:
   `PipelinedStageOperator`'s producer is long-lived and parks on its consumer's
   ring backpressure — a fixed pool cannot host occupants that block on another
   thread's progress. Those get a raw `std::thread`, marked with
-  `StageThreadScope` so the profiler attributes their work. This is the *only*
+  `StageThreadScope` so the profiler attributes their work. This is the _only_
   non-pool thread species in the runtime.
   A stage waiting for a batch may execute queued tasks from that exact batch.
   It skips unrelated producers, which could park on rings the stage must drain.
@@ -75,16 +77,16 @@ Three properties are load-bearing:
 
 ### Two thread budgets, on purpose
 
-| Budget | Source | Governs |
-|---|---|---|
-| **Compute** | `IBEX_CORES` → `compute_thread_count()` → `ExecutionContext::compute_budget()` | every compute fan-out |
+| Budget        | Source                                                                                           | Governs                  |
+| ------------- | ------------------------------------------------------------------------------------------------ | ------------------------ |
+| **Compute**   | `IBEX_CORES` → `compute_thread_count()` → `ExecutionContext::compute_budget()`                   | every compute fan-out    |
 | **Pool size** | `decode_thread_count()` (`IBEX_DECODE_THREADS` / `IBEX_DECODE_SATURATION`, default saturation 8) | threads actually spawned |
 
 Decode is memory-latency bound and profits from **oversubscription** until the
 memory system saturates; compute is not and measurably regresses under it
 (q01 +4.6%, q17 +3.2% when a compute path accidentally used the pool size).
 **Every compute fan-out sizes itself from `compute_budget()`**; only
-`scan_pipeline_worker_count` draws on the whole pool, deliberately.
+`scan_pipeline_worker_count` draws on the whole pool.
 `IBEX_THREADS` (which used to conflate the two) is read only to warn once.
 
 ## The three layers of parallelism
@@ -115,7 +117,9 @@ compute across a **pipeline breaker** (join build, aggregate, sort).
 A maximal bottom-up chain of **row-local, chunk-preserving** operators (filter /
 project / rename / row-local update / their fused forms) run as **one
 independent task per morsel**, with an **order-preserving merge** that makes the
-output byte-identical to the serial chain regardless of completion order.
+output identical in rows and order to the serial chain regardless of completion
+order (a row-local chain does no cross-row float reduction, so this one is exact
+in floats too).
 
 `MorselPipelineOperator` (`pipeline_executor.cpp`) is the executor. Key rules:
 
@@ -125,38 +129,38 @@ output byte-identical to the serial chain regardless of completion order.
 2. **Grain** (`morsel_grain`): aim for ~4 morsels per thread, clamped to
    `[4096, 65536]`. Derived, not tuned — a 1000× sweep found no grain in that
    band that loses to serial.
-3. **Whether to morselize at all** is a two-dimensional gate on rows *and*
+3. **Whether to morselize at all** is a two-dimensional gate on rows _and_
    cells (`parallel_min_rows` + `parallel_min_cells`), because a morsel's cost
-   is dominated by copying rows out, which scales with table *width*. A refusal
+   is dominated by copying rows out, which scales with table _width_. A refusal
    runs the chain as **one whole-table chunk**, never a serial sweep of morsels
    (conflating those measured 100ms vs 36ms).
 4. **`TwoPhaseFilterOperator`** specialization — when the chain is exactly one
    range-native filter (+ a metadata-only project/rename tail): phase A counts
    survivors per morsel, a serial prefix sum turns counts into offsets, phase B
    re-runs the morsels writing disjoint output slices. No merger, no ring, one
-   chunk emitted and *moved* into the result. This is the largest morsel-pipeline
+   chunk emitted and _moved_ into the result. This is the largest morsel-pipeline
    win and why every island shape now beats serial.
 
 The naming moved from "island" to "morsel pipeline" when the abstraction
-dissolved into a pipeline *mode* (`2b960a21`); older prose still says "island".
+dissolved into a pipeline _mode_ (`2b960a21`); older prose still says "island".
 
 ### Layer C — intra-operator fan-out
 
 The bulk of the wins. Every site is fork–join inside one operator call, with a
 private gate. Summarized by parallel axis:
 
-| Operator | Axis | Determinism device |
-|---|---|---|
-| Fused bounds scan | row ranges, block-aligned to 4096 | per-range survivor lists concatenated in range order |
-| Group discovery (`try_discover_partitioned`) | radix/hash partitioning by key hash | partition-local ids, then a serial first-occurrence merge assigns global ids in row order |
-| Grouped / ungrouped aggregation | partial pre-aggregation into per-morsel private slots, then merge | morsel count derived from **rows**, merged in ascending morsel order → machine-independent float reduction |
-| Owned aggregation (single-Int64 / PairIntKey) | partition-owned key maps + slots | merge-path co-ranking on globally-unique `first_rows` (parallel finalize) |
-| Hash join probe | probe rows; build side is a shared read-only index, never threaded | per-worker `(li, ri)` pairs concatenated in range order |
-| Semi/anti predicate | probe rows against a frozen set | ascending concat |
-| Distinct | packed-key partitions | workers record a keep-flag at a row, never a position |
-| Sort — gather | (column × row range) tasks, 64-row-aligned | permutation already fixed; disjoint writes |
-| Sort — per-group slice sort / rank | one group per task | groups own disjoint row spans |
-| Parquet decode | (column × row group) tasks, one `FileReader` per worker | tasks write disjoint output ranges |
+| Operator                                      | Axis                                                               | Determinism device                                                                                         |
+| --------------------------------------------- | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| Fused bounds scan                             | row ranges, block-aligned to 4096                                  | per-range survivor lists concatenated in range order                                                       |
+| Group discovery (`try_discover_partitioned`)  | radix/hash partitioning by key hash                                | partition-local ids, then a serial first-occurrence merge assigns global ids in row order                  |
+| Grouped / ungrouped aggregation               | partial pre-aggregation into per-morsel private slots, then merge  | morsel count derived from **rows**, merged in ascending morsel order → machine-independent float reduction |
+| Owned aggregation (single-Int64 / PairIntKey) | partition-owned key maps + slots                                   | merge-path co-ranking on globally-unique `first_rows` (parallel finalize)                                  |
+| Hash join probe                               | probe rows; build side is a shared read-only index, never threaded | per-worker `(li, ri)` pairs concatenated in range order                                                    |
+| Semi/anti predicate                           | probe rows against a frozen set                                    | ascending concat                                                                                           |
+| Distinct                                      | packed-key partitions                                              | workers record a keep-flag at a row, never a position                                                      |
+| Sort — gather                                 | (column × row range) tasks, 64-row-aligned                         | permutation already fixed; disjoint writes                                                                 |
+| Sort — per-group slice sort / rank            | one group per task                                                 | groups own disjoint row spans                                                                              |
+| Parquet decode                                | (column × row group) tasks, one `FileReader` per worker            | tasks write disjoint output ranges                                                                         |
 
 Recurring idioms: **private-state-then-merge** wherever a reduction exists;
 **disjoint-slice writes** wherever one does not; **count → prefix-sum →
@@ -170,23 +174,23 @@ several remaining breaker internals do not.
 
 ### The stable parts
 
-| Concern | Owner |
-|---|---|
-| Plan shape, pushdown, join order | logical IR / optimizer — never an execution accident |
+| Concern                                                                                             | Owner                                                                                                                             |
+| --------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Plan shape, pushdown, join order                                                                    | logical IR / optimizer — never an execution accident                                                                              |
 | Compute budget + the on/off switches (`stream_scans`, `parallel_join_probe`, derived `can_fan_out`) | **`ExecutionContext`**, one authority per setting, applied once by `configure_parallel_from_env` — never a `getenv` at a use site |
-| Running bodies, joining, deterministic error order | `WorkerPool` — no scheduling policy, no eligibility opinion |
+| Running bodies, joining, deterministic error order                                                  | `WorkerPool` — no scheduling policy, no eligibility opinion                                                                       |
 
 ### Parallelism ownership, by operator category
 
-| Category | Whether parallel + how | Represented in `physical::Plan`? | `explain physical` shows it? |
-|---|---|---|---|
-| **Map chains** (Filter/Project/Rename/row-local Update, fused) | **The physical planner owns it end to end.** `plan.mode` (`Serial`/`MorselParallel`), `parallel_begin`/`parallel_end` (which steps run over morsels), and per-step `MapStep` (capability + kernel factory + column signature). | **Yes, fully.** | Yes. |
-| **Join** | The plan owns the **structure** — `JoinPlan` carries build side + runtime-resolved orientation (`49188c71`) — and **both** fan-out phases: `build_partitions` reads `par_.build`, `probe_parallel_workers` reads `par_.probe` (slices 4–5). What stays in the operator is the kill switch / nesting / per-chunk floor. Output assembly is inside `ChunkedInnerJoinOperator`. | **Yes** (structure + both phases, both authoritative). | Structure + both phases. |
-| **Aggregate** | The plan owns the adaptive strategy, positional `AggregateColumnMapping`, and four typed hash-fallback nodes (discovery → accumulation → final ordering → emission). Each node carries and authoritatively supplies its own fan-out policy. A serial coordinator invokes every node: discovery transfers one bounded chunk of group IDs/column bindings to accumulation, or marks a one-pass kernel explicitly fused; final ordering and emission are separate. | **Yes, structural and authoritative.** | Strategy + typed chain + all four node policies. |
-| **Distinct** | The plan owns the `dedup` policy (floor, ceiling, packed-key strategy, optional estimate); the builder resolves it and the operator reads it. Nesting, the first concrete chunk's row count, and the derived partition count remain runtime decisions. | **Yes, authoritative.** | Yes. |
-| **Order** | The plan describes one `sort` phase. The actual radix-sort/gather fan-out reads shared `ExecutionContext` knobs in `sort.cpp`, so this phase is descriptive rather than authoritative. | **Yes, descriptive.** | Yes. |
-| **TopK / Head / Tail / FilterHead / FilterTail** | Plan-built serial breaker operators. They have no current fan-out point; TopK deliberately uses a bounded streaming heap rather than a full sort. | **Yes; no parallel policy.** | Serial-by-design reason. |
-| **Remaining Layer C fan-out inside operators** (sort gather, decode, semi/anti predicate, and data-dependent aggregate specialization gates) | The operator owns decisions not yet promoted. Migrated Distinct, Join, and Aggregate paths instead read their resolved plan policy and retain only runtime/data-dependent admission checks. | Mixed. | Only promoted phases. |
+| Category                                                                                                                                     | Whether parallel + how                                                                                                                                                                                                                                                                                                                                                                                                                                              | Represented in `physical::Plan`?                       | `explain physical` shows it?                     |
+| -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ | ------------------------------------------------ |
+| **Map chains** (Filter/Project/Rename/row-local Update, fused)                                                                               | **The physical planner owns it end to end.** `plan.mode` (`Serial`/`MorselParallel`), `parallel_begin`/`parallel_end` (which steps run over morsels), and per-step `MapStep` (capability + kernel factory + column signature).                                                                                                                                                                                                                                      | **Yes, fully.**                                        | Yes.                                             |
+| **Join**                                                                                                                                     | The plan owns the **structure** — `JoinPlan` carries build side + runtime-resolved orientation (`49188c71`) — and **both** fan-out phases: `build_partitions` reads `par_.build`, `probe_parallel_workers` reads `par_.probe` (slices 4–5). What stays in the operator is the kill switch / nesting / per-chunk floor. Output assembly is inside `ChunkedInnerJoinOperator`.                                                                                      | **Yes** (structure + both phases, both authoritative). | Structure + both phases.                         |
+| **Aggregate**                                                                                                                                | The plan owns the adaptive strategy, positional `AggregateColumnMapping`, and four typed hash-fallback nodes (discovery → accumulation → final ordering → emission). Each node carries and authoritatively supplies its own fan-out policy. A serial coordinator invokes every node: discovery transfers one bounded chunk of group IDs/column bindings to accumulation, or marks a one-pass kernel explicitly fused; final ordering and emission are separate. | **Yes, structural and authoritative.**                 | Strategy + typed chain + all four node policies. |
+| **Distinct**                                                                                                                                 | The plan owns the `dedup` policy (floor, ceiling, packed-key strategy, optional estimate); the builder resolves it and the operator reads it. Nesting, the first concrete chunk's row count, and the derived partition count remain runtime decisions.                                                                                                                                                                                                              | **Yes, authoritative.**                                | Yes.                                             |
+| **Order**                                                                                                                                    | The plan describes one `sort` phase. The actual radix-sort/gather fan-out reads shared `ExecutionContext` knobs in `sort.cpp`, so this phase is descriptive rather than authoritative.                                                                                                                                                                                                                                                                              | **Yes, descriptive.**                                  | Yes.                                             |
+| **TopK / Head / Tail / FilterHead / FilterTail**                                                                                             | Plan-built serial breaker operators. They have no current fan-out point; TopK deliberately uses a bounded streaming heap rather than a full sort.                                                                                                                                                                                                                                                                                                                   | **Yes; no parallel policy.**                           | Serial-by-design reason.                         |
+| **Remaining Layer C fan-out inside operators** (sort gather, decode, semi/anti predicate, and data-dependent aggregate specialization gates) | The operator owns decisions not yet promoted. Migrated Distinct, Join, and Aggregate paths instead read their resolved plan policy and retain only runtime/data-dependent admission checks.                                                                                                                                                                                                                                                                         | Mixed.                                                 | Only promoted phases.                            |
 
 **There is not yet one owner for every breaker's parallelism.** The physical
 plan owns map chains and the promoted Distinct, Join, and Aggregate policies;
@@ -197,13 +201,12 @@ typed node may fan out under that node's policy.
 
 ### The split enforced by migrated parallel paths
 
-**The plan says whether parallel execution is *permitted*; the operator handles
+**The plan says whether parallel execution is _permitted_; the operator handles
 facts available only at runtime** (actual rows/cells, morsel count,
 `on_worker_pool_thread()`, and data-dependent specialization gates).
 `plan.mode == MorselParallel` is a capability, and a serial execution of that
-plan (`can_fan_out()` false) must still be correct — a q19 crash under
-`IBEX_CORES=1` came from an executor that checked only `plan.mode`. Breakers not
-yet promoted still combine these halves at their use sites.
+plan (`can_fan_out()` false) must still be correct. Breakers not yet promoted
+still combine these halves at their use sites.
 
 ## Worked example: `t[distinct { g, v }]`
 
@@ -227,54 +230,60 @@ by the physical plan.
 
 ## The determinism contract
 
-Byte-identical output between serial and parallel at any core count, any grain,
-any threshold. This is the best property the codebase has — it makes every
-threshold a free parameter, movable without a correctness argument, and makes
-`diff <(IBEX_CORES=1 …) <(IBEX_CORES=8 …)` the primary verification method.
+The same rows, in the same order, with the same non-float values, between serial
+and parallel at any core count, any grain, any threshold (`CONTRACTS.md` §7).
+Floats may differ in their last bits: the order of floating-point operations
+(a parallel sum, a per-unit partial) is not part of the contract and no device
+exists to fix it. This keeps every threshold a free parameter, movable without
+a correctness argument. Verification is `IBEX_CORES=1` against `IBEX_CORES=8`
+with exact comparison of everything except floats, which match within tolerance
+(`benchmarking/ab_queries.py`, `outputs_match`).
 
 The devices:
+
 1. Row order reconstructed **positionally** — sequence, range order, or a
    prefix-summed offset — never by completion order.
-2. Float reduction order fixed by a **data-derived** partition (the aggregate
-   derives morsel count from row count, never thread count).
+2. Where cheap, float reduction order follows a **data-derived** partition (the
+   aggregate derives morsel count from row count, never thread count). This
+   is best effort, retired as a guarantee: new parallel paths need neither
+   this device nor an exception.
 3. Group ids assigned by **first occurrence in row order**, after the parallel
    phase, so ids do not vary with thread count.
 4. Errors selected by **lowest sequence / lowest worker id**; an interrupt
    outranks a data error.
 
-The only legitimate exceptions: PDS-H q01/q09/q15 differ by ≤1 ulp from parallel
-float reduction order (itself thread-count-independent), enumerated in
-`plans/beat-both-plan.md` §4. Anything else that differs is a bug. The former
-two-Int64-key owned-aggregate divergence no longer reproduces; the
-"two-key grouped aggregate is deterministic across thread counts" regression
-test now guards the serial and parallel paths.
+A different row, row order, key, count, integer, string or decimal is a bug;
+a last-bit float difference is not. (The old q01/q09/q15 exception list is
+gone with the byte-identical bar.) The former two-Int64-key owned-aggregate
+divergence no longer reproduces; the "two-key grouped aggregate is
+deterministic across thread counts" regression test still guards the serial and
+parallel paths.
 
-**Rejected: weakening first-occurrence group order** (2026-08-17; someone will
-propose it again). Declaring group-by output order unspecified would drop the
-serial first-occurrence merge in `try_discover_partitioned` and let grouped
-aggregation stream its output. The prize was ~26 ms of ~172 ms on q18 at 3M
-groups, the worst case. Against it: it spends this contract, it blunts the
-`diff` verification above, and it breaks scripts (Ibex follows `data.table`,
-where `by=` keeps first appearance). Do instead: elide the merge at *plan*
-level when the consumer provably ignores order (it feeds an `order`, a scalar
-aggregate or a join) — a required-ordering property propagated down the plan.
-Not built.
+**Rejected: weakening first-occurrence group order** (2026-08-17). Declaring
+group-by output order unspecified would drop the serial first-occurrence merge
+in `try_discover_partitioned` and let grouped aggregation stream its output. The
+gain was ~26 ms of ~172 ms on q18 at 3M groups, the worst case. Against it: it
+gives up this contract, it weakens the serial-vs-parallel comparison above, and
+it breaks scripts (Ibex follows `data.table`, where `by=` keeps first
+appearance). Do instead: elide the merge at _plan_ level when the consumer
+provably ignores order (it feeds an `order`, a scalar aggregate or a join) — a
+required-ordering property propagated down the plan. Not built.
 
 ## Configuration surface
 
-| Variable | Reads | Meaning |
-|---|---|---|
-| `IBEX_CORES` | `compute_thread_count()` | compute budget (`auto` = `hardware_concurrency`; **parallel is on whenever this is ≥ 2**, which is the default on any multicore box) |
-| `IBEX_DECODE_THREADS` | `decode_thread_count()` | absolute pool-size override |
-| `IBEX_DECODE_SATURATION` | `decode_thread_count()` | memory-system saturation point (default 8) |
-| `IBEX_MORSEL_ROWS` | `morsel_rows_from_env()` | morsel grain override; also lowers `parallel_min_rows` to it |
-| `IBEX_STREAM_SCAN` | `stream_scans_from_env()` | Layer A streaming scan on/off (default on) |
-| `IBEX_JOIN_PROBE` | `parallel_join_probe_from_env()` | parallel join probe on/off (default on) |
-| `IBEX_CHUNK_ROWS` | `source_chunk_rows_from_env()` | force multi-chunk sources (test-only) |
-| `IBEX_PARALLEL_STATS` | `process_pipeline_stats()` | print `ParallelPipelineStats` at exit — the only way to tell "ran parallel" from "silently fell back to serial" |
-| `IBEX_PROFILE_OPERATORS` | `execution_profile_requested()` | per-operator phase profile (barrier wait, ring wait, occupancy) |
-| `IBEX_THREADS` | — | **ignored**, warns once (split into `IBEX_CORES` + `IBEX_DECODE_THREADS`) |
-| ~~`IBEX_PARALLEL`~~ | removed | serial is `IBEX_CORES=1` — a budget of one *is* parallelism off, with no second spelling that can disagree |
+| Variable                 | Reads                            | Meaning                                                                                                                              |
+| ------------------------ | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `IBEX_CORES`             | `compute_thread_count()`         | compute budget (`auto` = `hardware_concurrency`; **parallel is on whenever this is ≥ 2**, which is the default on any multicore box) |
+| `IBEX_DECODE_THREADS`    | `decode_thread_count()`          | absolute pool-size override                                                                                                          |
+| `IBEX_DECODE_SATURATION` | `decode_thread_count()`          | memory-system saturation point (default 8)                                                                                           |
+| `IBEX_MORSEL_ROWS`       | `morsel_rows_from_env()`         | morsel grain override; also lowers `parallel_min_rows` to it                                                                         |
+| `IBEX_STREAM_SCAN`       | `stream_scans_from_env()`        | Layer A streaming scan on/off (default on)                                                                                           |
+| `IBEX_JOIN_PROBE`        | `parallel_join_probe_from_env()` | parallel join probe on/off (default on)                                                                                              |
+| `IBEX_CHUNK_ROWS`        | `source_chunk_rows_from_env()`   | force multi-chunk sources (test-only)                                                                                                |
+| `IBEX_PARALLEL_STATS`    | `process_pipeline_stats()`       | print `ParallelPipelineStats` at exit — the only way to tell "ran parallel" from "silently fell back to serial"                      |
+| `IBEX_PROFILE_OPERATORS` | `execution_profile_requested()`  | per-operator phase profile (barrier wait, ring wait, occupancy)                                                                      |
+| `IBEX_THREADS`           | —                                | **ignored**, warns once (split into `IBEX_CORES` + `IBEX_DECODE_THREADS`)                                                            |
+| ~~`IBEX_PARALLEL`~~      | removed                          | serial is `IBEX_CORES=1` — a budget of one _is_ parallelism off, with no second spelling that can disagree                           |
 
 The decoder and the operators **must never read the environment directly** —
 `ExecutionContext` is the single authority, so there is no second copy free to
@@ -304,15 +313,15 @@ bugs: each new operator copies whichever neighbour it was written next to.
   (`multi_cat_find_or_insert` is serial).
 - **I6** — private row thresholds (`parallel_min_rows`, `kMinProbeRows`,
   `kMinParallelPredicateRows`, `kDefaultPartitionMinRows`, …) beside the two
-  `ExecutionContext` knobs. Break-evens genuinely differ per operator; the
+  `ExecutionContext` knobs. Break-evens differ per operator; the
   problem is that none can be swept without recompiling. Convergence:
   `ExecutionContext`-scaled multiples.
-- **I7** — `parallel_min_cells` (width) is consulted by 2 of ~30 sites, though
+- **I7** — `parallel_min_cells` (width) is consulted by 2 sites (`pipeline_executor.cpp`, `sort.cpp`) against ~20 for `parallel_min_rows`, though
   "131k rows won at 6 columns, lost at 2" applies equally to filter gather,
   join concat and aggregate emission.
 - **I9** — worker-count caps differ arbitrarily (`min(…, 64)`, `min(…, 16)`,
   uncapped), undocumented.
-- **I10** — aggregate emission gates a group count against a *row* threshold.
+- **I10** — aggregate emission gates a group count against a _row_ threshold.
 - **I12** — two thread species: the long-lived stage thread of
   `PipelinedStageOperator` (parks on consumer backpressure; hosting it on the
   pool would deadlock) is named and counted (`on_stage_thread()`,
@@ -320,18 +329,21 @@ bugs: each new operator copies whichever neighbour it was written next to.
 - **I13** — cancellation reaches Layers A/B but not intra-operator fan-outs
   (Layer C). Consistent with the per-node/chunk/statement contract; the gap
   grows as operators get bigger parallel sections.
-- **I14** — two grain philosophies: island grain from thread count, aggregate
-  morsel count from row count (for float determinism). Nothing warns that
-  reusing `island_grain` inside a reduction breaks determinism.
+- **I14** — two grain philosophies: `morsel_grain` from thread count, aggregate
+  morsel count from row count (for float reproducibility, no longer a
+  guarantee). Reusing `morsel_grain` inside a reduction would make float
+  results vary with thread count, now tolerated but avoidable.
 
 **Not inconsistencies** (recorded so they are not "fixed"):
+
 - prefix sums in `TwoPhaseFilterOperator` / `try_discover_partitioned` are
   serial on purpose: O(morsels), not O(rows);
 - a refused island runs as one whole-table chunk, not a serial morsel sweep
   (fix for a measured 3× regression);
-- `parallel_threads` deliberately does not cap the scan pipeline.
+- `parallel_threads` does not cap the scan pipeline.
 
 **Measured and dropped:**
+
 - **A task scheduler / work stealing** (2026-08-21): `pool_idle_ms` and
   `stage_park_ms` were ~0 on all 22 queries while ~67% of the pool sat with
   nothing queued, so stealing had nothing to steal. Revisit only if occupancy
@@ -352,14 +364,14 @@ Status: **built for Distinct, Order, streaming Join and streaming Aggregate**
 (2026-08-29); written 2026-08-27 as the spec the breaker migration built
 toward, before the code, so it could be checked once rather than argued during
 every slice. Nothing here changes a determinism device or a kernel — it moves
-*who decides* and *where the tunable lives*, not *how the work is done*.
+_who decides_ and _where the tunable lives_, not _how the work is done_.
 
 ## The principle
 
 **Every fan-out point in the engine is described by the physical plan.** The
 planner computes the policy; `explain physical` prints it; a test asserts it; a
 benchmark gates it. The operator becomes an executor of that policy plus two
-genuinely-runtime checks it alone can make.
+runtime-only checks it alone can make.
 
 Map chains already meet this (`plan.mode`, `parallel_begin/end`, per-step
 `MapStep`). The target extends the same treatment to every breaker.
@@ -367,16 +379,16 @@ Map chains already meet this (`plan.mode`, `parallel_begin/end`, per-step
 ## What the planner decides vs. what the operator decides
 
 The split is the same one `JoinPlan` already made deliberately (it names the two
-inputs and leaves *which side is hashed* to the build phase, because that
+inputs and leaves _which side is hashed_ to the build phase, because that
 depends on measured row counts a plan cannot know):
 
-| Decided by the **planner**, at plan time | Decided by the **operator**, at run time |
-|---|---|
-| Is this fan-out permitted by the query's budget? (`exec.can_fan_out()`) | Am I running nested under another fan-out? (`on_worker_pool_thread()`) |
-| The worker **cap** — `min(compute_budget, pool_size, this-breaker's-own-max)`, computed **once, here**, not open-coded per operator | Did this input clear the row floor? (`rows >= floor`, checked on the first chunk of a streaming source) |
-| The row **floor** — a named constant per breaker category, in `physical_plan.hpp`, not in `chunked.cpp` | The partition count, when the plan left it "derive": `min(cap, …)` from the actual first-chunk row count |
-| The partition **strategy** (packed-key / radix-hash / owned) | — |
-| A row **estimate** when one is available (footer stats for a bare scan; child's exact count for `Distinct(Distinct(…))`), and the fan-out **prediction** that follows from it | — |
+| Decided by the **planner**, at plan time                                                                                                                                      | Decided by the **operator**, at run time                                                                 |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Is this fan-out permitted by the query's budget? (`exec.can_fan_out()`)                                                                                                       | Am I running nested under another fan-out? (`on_worker_pool_thread()`)                                   |
+| The worker **cap** — `min(compute_budget, pool_size, this-breaker's-own-max)`, computed **once, here**, not open-coded per operator                                           | Did this input clear the row floor? (`rows >= floor`, checked on the first chunk of a streaming source)  |
+| The row **floor** — a named constant per breaker category, in `physical_plan.hpp`, not in `chunked.cpp`                                                                       | The partition count, when the plan left it "derive": `min(cap, …)` from the actual first-chunk row count |
+| The partition **strategy** (packed-key / radix-hash / owned)                                                                                                                  | —                                                                                                        |
+| A row **estimate** when one is available (footer stats for a bare scan; child's exact count for `Distinct(Distinct(…))`), and the fan-out **prediction** that follows from it | —                                                                                                        |
 
 `on_worker_pool_thread()` cannot move to the plan: the plan is built once, but
 the same operator can be constructed and pulled from a nested context (a join's
@@ -490,10 +502,11 @@ keys, which `explain_breaker` does not walk.)
 ## Migration invariants
 
 Every slice:
-- **Byte-identical** serial and parallel output — `diff <(IBEX_CORES=1) <(IBEX_CORES=8)` on all 22 PDS-H answers, plus the full 1800-test suite.
+
+- **Same answers** serial and parallel — rows and order exact, floats within tolerance (`CONTRACTS.md` §7) — comparing `IBEX_CORES=1` with `IBEX_CORES=8` on all 22 PDS-H answers, plus the full test suite.
 - **`ParallelPipelineStats` counters unchanged** for every PDS-H query (the fan-out happened the same number of times).
 - **The `BreakerParallelism` for a query is deterministic** — same across runs, same across thread counts (it's a function of `ExecutionContext` + footer stats, both stable).
-- **Observability before authority.** For each breaker: land the planner computing `BreakerParallelism` + `explain physical` printing it, with the operator keeping its existing logic and a *debug assert* that its runtime decision matches the plan's prediction where the plan could predict. Only once that has run clean (full suite, both core counts) does the second slice delete the operator's copy and have it read the plan.
+- **Observability before authority.** For each breaker: land the planner computing `BreakerParallelism` + `explain physical` printing it, with the operator keeping its existing logic and a _debug assert_ that its runtime decision matches the plan's prediction where the plan could predict. Only once that has run clean (full suite, both core counts) does the second slice delete the operator's copy and have it read the plan.
 
 ## Non-goals
 
@@ -506,7 +519,7 @@ Every slice:
 - **Not ownership of the `chunked.cpp` split.** This contract enabled it; the
   split finished 2026-08-31 (`runtime_entry.cpp` plus one file per family).
 - **Not a row-count estimator project.** The estimate is opportunistic (footer
-  stats, exact child counts). `partition_count = 0 / derive` is the honest
+  stats, exact child counts). `partition_count = 0 / derive` is the
   default and preserves today's behavior exactly.
 
 ## Sequence and blockers
@@ -518,7 +531,7 @@ Every slice:
    `dedup_plan_.decline` / `.worker_cap`; `kMinRows` / the open-coded
    `min(budget, pool, 64)` / `check_dedup_plan` deleted). Byte-identical.
 2. **Order** — **DONE (descriptive).** One fan-out point, and it already lives
-   in `sort.cpp` (`radix_sort`, `gather_rows_parallel`) gated on the *shared*
+   in `sort.cpp` (`radix_sort`, `gather_rows_parallel`) gated on the _shared_
    `parallel_min_rows` / `parallel_min_cells` knobs, not a private constant —
    `ChunkedOrderOperator` just buffers and calls `order_table`. So the plan
    carries one `sort` phase (`PartitionStrategy::RowRange`, `row_floor` left 0 →
@@ -527,8 +540,7 @@ Every slice:
    the operator changed. The move also fixed `explain physical` for every
    migrated breaker (Head/streaming-join/streaming-aggregate all used to print
    `MapPipeline\n  source: TableScan()`). `resolve_breaker_parallelism` now
-   makes the shared knob the default and a non-zero `row_floor` (distinct's
-   32768) a visible per-operator override.
+   makes the shared knob the default and a non-zero `row_floor` (distinct's 32768) a visible per-operator override.
 
    **TopK is not in this bucket.** `ChunkedOrderedLimitOperator` is a serial
    streaming bounded-heap operator — O(n·log k), one pass, `push_heap` /
@@ -537,11 +549,12 @@ Every slice:
    the plan records "serial, by design", like `Head`. Parallelizing it (per-range
    local heaps + merge) is barely worth it for small k, and Ibex already wins
    top-k ~12×. Do not fold it into the Order port.
+
 3. **Join** — **DONE (slices 3–5).** Slice 3 (descriptive): a streaming join's
    plan carries two phases, `hash-build` (`PartitionStrategy::HeadTable`, floor
    `1U << 17U`) and `probe` (`PartitionStrategy::Range`, floor `1U << 14U`), and
    `explain physical` prints the strategy line plus both. Slices 4–5 (authority):
-   `resolved_join_parallelism` resolves *both* phases where the
+   `resolved_join_parallelism` resolves _both_ phases where the
    `ExecutionContext` is in hand (every join construction site shares it, as one
    `physical::JoinParallelism`). `ChunkedInnerJoinOperator::build_partitions`
    reads `par_.build` and `JoinProbe::probe_parallel_workers` reads `par_.probe`,
@@ -554,10 +567,11 @@ Every slice:
    a slow query.
 
    **Not a speed slice.** The hash build's parallel fill landed earlier
-   (`2458bfda` + `36e93fbd`, measured q21 −8.5%); slices 3–5 moved the *decision*
+   (`2458bfda` + `36e93fbd`, measured q21 −8.5%); slices 3–5 moved the _decision_
    onto the plan, byte-identical throughout. The `probe_parallel_workers`
    `on_worker_pool_thread()` veto was measured to fire 0/52 on PDS-H, so folding
    it changed nothing.
+
 4. **Aggregate** — four typed structural nodes now own the hash fallback's
    scheduling policy. **Determinism blocker cleared (2026-08-27):**
    the `try_owned` vs serial re-association divergence recorded below does not

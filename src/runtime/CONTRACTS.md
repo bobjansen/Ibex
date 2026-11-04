@@ -129,8 +129,9 @@ Owner: `operator.hpp`.
   worker id wins, and an interrupt outranks a recorded data error. Every
   parallel path reconstructs row order positionally (sequence, range order,
   prefix-summed offset) — never by completion order — so serial and parallel
-  outputs are byte-identical, which is what lets every threshold in the
-  engine move without a correctness argument.
+  outputs agree in rows, order and non-float values (floats within
+  tolerance, §7), which is what lets every threshold in the engine move
+  without a correctness argument.
 * Per-chunk interruption boundaries: long *pipelines* check
   `interrupt_requested()` between chunks; intra-operator fan-outs
   historically do not (documented gap, I13 in `PARALLELISM.md`).

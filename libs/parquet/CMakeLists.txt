@@ -177,6 +177,12 @@ endif()
 ibex_begin_third_party()
 set(ARROW_WITH_THRIFT ON CACHE BOOL "" FORCE)
 set(Thrift_SOURCE "BUNDLED" CACHE STRING "" FORCE)
+# Arrow uses Thrift only to (de)serialize Parquet metadata in memory; Thrift's
+# SSL transport (TSSLSocket) is never linked in. Thrift builds it whenever it
+# finds any OpenSSL, and its 0.2x sources use APIs OpenSSL 4 removed
+# (TLSv1_method, ASN1_STRING_data, non-const X509 getters) — which breaks the
+# macOS build as soon as Homebrew's openssl@4 is on the runner.
+set(WITH_OPENSSL OFF CACHE BOOL "" FORCE)
 set(ARROW_WITH_ZLIB ON CACHE BOOL "" FORCE)
 set(ZLIB_SOURCE "SYSTEM" CACHE STRING "" FORCE)
 # See cmake/ThriftZlibFix.cmake: on Windows, under the vcpkg toolchain,

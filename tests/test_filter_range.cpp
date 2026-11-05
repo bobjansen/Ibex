@@ -197,6 +197,19 @@ auto predicates() -> std::vector<NamedPredicate> {
     out.push_back({.label = "is not null",
                    .expr = ir::Expr{
                        .node = ir::IsNullExpr{.operand = col_ref("nullable"), .negated = true}}});
+    // Not a column of the input: evaluated as a value and tested on its
+    // validity. The value is computed, so dense; only a borrowed column
+    // carries the range's offset, and that takes the branch above.
+    out.push_back(
+        {.label = "is null of an expression",
+         .expr = ir::Expr{.node = ir::IsNullExpr{
+                              .operand = arith(ir::ArithmeticOp::Add, col_ref("nullable"), ilit(1)),
+                              .negated = false}}});
+    out.push_back(
+        {.label = "is not null of an expression",
+         .expr = ir::Expr{.node = ir::IsNullExpr{
+                              .operand = arith(ir::ArithmeticOp::Mul, col_ref("nullable"), ilit(2)),
+                              .negated = true}}});
     out.push_back({.label = "column vs column",
                    .expr = cmp(ir::CompareOp::Lt, col_ref("id"), col_ref("nullable"))});
     out.push_back(
@@ -886,5 +899,40 @@ TEST_CASE("pack_nonzero_bytes sets one bit per nonzero byte at any length",
         }
         // Words past the last one it needs are not touched.
         REQUIRE(words[(n + 63) / 64] == ~std::uint64_t{0});
+    }
+}
+
+TEST_CASE("and_validity_into_bytes clears exactly the null rows at any offset",
+          "[runtime][filter][validity]") {
+    constexpr std::size_t kRows = 300;
+    const auto rows = patterned_bits(kRows, 17);
+    const auto mask_rows = patterned_bits(kRows, 41);
+    for (const std::size_t ext_off : {std::size_t{0}, std::size_t{5}}) {
+        const auto pair = make_bitmap_pair(rows, ext_off);
+        for (const auto* source : {&pair.owned, &pair.external}) {
+            for (const std::size_t off :
+                 {std::size_t{0}, std::size_t{1}, std::size_t{64}, std::size_t{77}}) {
+                for (const std::size_t n : {std::size_t{0}, std::size_t{7}, std::size_t{64},
+                                            std::size_t{150}, kRows - off}) {
+                    INFO("ext_off=" << ext_off << " external=" << (source == &pair.external)
+                                    << " off=" << off << " n=" << n);
+                    std::vector<std::uint8_t> mask(n + 1, std::uint8_t{0xEE});
+                    for (std::size_t i = 0; i < n; ++i) {
+                        mask[i] = static_cast<std::uint8_t>(mask_rows[i]);
+                    }
+                    runtime::and_validity_into_bytes(*source, off, n, mask.data());
+                    for (std::size_t i = 0; i < n; ++i) {
+                        REQUIRE(mask[i] ==
+                                static_cast<std::uint8_t>(mask_rows[i] && rows[off + i]));
+                    }
+                    REQUIRE(mask[n] == 0xEE);  // nothing touched past n
+                    runtime::flip_mask_bytes(mask.data(), n);
+                    for (std::size_t i = 0; i < n; ++i) {
+                        REQUIRE(mask[i] ==
+                                static_cast<std::uint8_t>(!(mask_rows[i] && rows[off + i])));
+                    }
+                }
+            }
+        }
     }
 }

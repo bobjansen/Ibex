@@ -96,9 +96,10 @@ static_assert(std::endian::native == std::endian::little,
     return (lo >> shift) | (hi << (64 - shift));
 }
 
-/// Row `off + i` of `v` as a 0/1 byte in `out[i]`, for `i < n`. Writes nothing
-/// past `out + n`.
-inline void unpack_validity_bytes(const ValidityBitmap& v, std::size_t off, std::size_t n,
+/// Rows `[off, off + n)` of `v`, one 0/1 byte per row, stored into `out` or
+/// (with `kAnd`) ANDed into it. Shared by the two public forms below.
+template <bool kAnd>
+inline void spread_validity_bytes(const ValidityBitmap& v, std::size_t off, std::size_t n,
                                   std::uint8_t* out) noexcept {
     const std::uint8_t* bytes = v.buffer_data();
     const std::size_t byte_count = validity_byte_count(v);
@@ -113,15 +114,46 @@ inline void unpack_validity_bytes(const ValidityBitmap& v, std::size_t off, std:
     for (; base + 64 <= n; base += 64) {
         const std::uint64_t word = load_bits64(bytes, byte_count, first + base);
         for (unsigned k = 0; k < 64; k += 8) {
-            const std::uint64_t spread_bytes = spread((word >> k) & 0xFFU);
+            std::uint64_t spread_bytes = spread((word >> k) & 0xFFU);
+            if constexpr (kAnd) {
+                std::uint64_t current = 0;
+                std::memcpy(&current, out + base + k, sizeof(current));
+                spread_bytes &= current;
+            }
             std::memcpy(out + base + k, &spread_bytes, sizeof(spread_bytes));
         }
     }
     if (base < n) {
         const std::uint64_t word = load_bits64(bytes, byte_count, first + base);
         for (std::size_t i = base; i < n; ++i) {
-            out[i] = static_cast<std::uint8_t>((word >> (i - base)) & 1U);
+            const auto bit = static_cast<std::uint8_t>((word >> (i - base)) & 1U);
+            if constexpr (kAnd) {
+                out[i] = static_cast<std::uint8_t>(out[i] & bit);
+            } else {
+                out[i] = bit;
+            }
         }
+    }
+}
+
+/// Row `off + i` of `v` as a 0/1 byte in `out[i]`, for `i < n`. Writes nothing
+/// past `out + n`.
+inline void unpack_validity_bytes(const ValidityBitmap& v, std::size_t off, std::size_t n,
+                                  std::uint8_t* out) noexcept {
+    spread_validity_bytes<false>(v, off, n, out);
+}
+
+/// Clear `mask[i]` for every null row `off + i` of `v`, for `i < n`. With 0/1
+/// mask bytes this is `mask[i] &= valid(off + i)`.
+inline void and_validity_into_bytes(const ValidityBitmap& v, std::size_t off, std::size_t n,
+                                    std::uint8_t* mask) noexcept {
+    spread_validity_bytes<true>(v, off, n, mask);
+}
+
+/// Turn 0/1 mask bytes into their negation in place.
+inline void flip_mask_bytes(std::uint8_t* mask, std::size_t n) noexcept {
+    for (std::size_t i = 0; i < n; ++i) {
+        mask[i] = static_cast<std::uint8_t>(mask[i] ^ 1U);
     }
 }
 

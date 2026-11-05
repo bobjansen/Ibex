@@ -57,6 +57,7 @@
 
 #include "decimal_ops.hpp"
 #include "interpreter_internal.hpp"
+#include "kernel_gather.hpp"
 #include "numeric_math.hpp"
 #include "runtime_internal.hpp"
 
@@ -658,8 +659,15 @@ auto numeric_cast_kernel(const ir::CallExpr& call, const Table& input, std::size
             Column<std::int64_t> out;
             out.resize(rows);
             auto* op = out.data();
-            for (std::size_t i = 0; i < rows; ++i) {
-                op[i] = (*bools)[i] ? 1 : 0;
+            // A word of source bits per 64 rows: `operator[]` per row
+            // re-tests for an external buffer and keeps this scalar.
+            const kernel::BoolView view{*bools};
+            for (std::size_t base = 0; base < rows; base += 64) {
+                const std::uint64_t word = view.source_word(base);
+                const std::size_t len = std::min<std::size_t>(64, rows - base);
+                for (std::size_t b = 0; b < len; ++b) {
+                    op[base + b] = static_cast<std::int64_t>((word >> b) & 1U);
+                }
             }
             return ComputedColumn{.column = ColumnValue{std::move(out)},
                                   .validity = std::move(out_validity)};

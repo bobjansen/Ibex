@@ -25,6 +25,10 @@
 #include <variant>
 #include <vector>
 
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
 namespace ibex::runtime {
 
 enum class ExprType : std::uint8_t {
@@ -145,6 +149,42 @@ inline void and_validity_bits(ValidityBitmap& out, const ValidityBitmap& v, std:
     ValidityBitmap out(n, true);
     and_validity_bits(out, v, off, n);
     return out;
+}
+
+/// Bit `i` set when `bytes[i] != 0`, for the first `lim` (at most 64) bytes;
+/// higher bits are zero. The byte-mask-to-bitmap step of every filter result:
+/// a whole word at a time, where a per-row `set()` re-tests for an external
+/// buffer and does a read-modify-write per bit.
+[[nodiscard]] inline auto pack_nonzero_bytes(const std::uint8_t* bytes, std::size_t lim) noexcept
+    -> std::uint64_t {
+#ifdef __AVX2__
+    if (lim == 64) {
+        const __m256i zero = _mm256_setzero_si256();
+        __m256i lo;
+        __m256i hi;
+        std::memcpy(&lo, bytes, sizeof(lo));
+        std::memcpy(&hi, bytes + 32, sizeof(hi));
+        const auto lo_zero =
+            static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, zero)));
+        const auto hi_zero =
+            static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, zero)));
+        return ~(static_cast<std::uint64_t>(lo_zero) | (static_cast<std::uint64_t>(hi_zero) << 32));
+    }
+#endif
+    std::uint64_t bits = 0;
+    for (std::size_t i = 0; i < lim; ++i) {
+        bits |= static_cast<std::uint64_t>(bytes[i] != 0) << i;
+    }
+    return bits;
+}
+
+/// Pack `n` mask bytes into `words` (at least `(n + 63) / 64` of them),
+/// overwriting each; bits past `n` in the last word come out zero.
+inline void pack_nonzero_bytes_into(const std::uint8_t* bytes, std::size_t n,
+                                    std::uint64_t* words) noexcept {
+    for (std::size_t w = 0; w * 64 < n; ++w) {
+        words[w] = pack_nonzero_bytes(bytes + (w * 64), std::min<std::size_t>(64, n - (w * 64)));
+    }
 }
 
 struct Mask {

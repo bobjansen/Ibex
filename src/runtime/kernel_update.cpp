@@ -2019,19 +2019,17 @@ auto write_direct_predicate_range(const DirectPredicatePlan& plan, const Predica
         return std::unexpected(std::move(mask.error()));
     }
     const SharedBitWords shared = SharedBitWords::of_run(output.begin, output.count);
-    for (std::size_t offset = 0; offset < output.count; ++offset) {
-        if (mask->value[offset] != 0) {
-            const std::size_t row = output.begin + offset;
-            or_bits_into_word(output.words, row / 64, std::uint64_t{1} << (row % 64), shared);
-        }
+    std::size_t out_bit = output.begin;
+    for (std::size_t offset = 0; offset < output.count; offset += 64) {
+        const std::size_t lim = std::min<std::size_t>(64, output.count - offset);
+        append_packed_bool_bits(pack_nonzero_bytes(mask->value.data() + offset, lim), lim,
+                                output.words, out_bit, shared);
     }
     if (!mask->valid.has_value()) {
         return std::optional<ValidityBitmap>{};
     }
     ValidityBitmap validity(output.count, false);
-    for (std::size_t offset = 0; offset < output.count; ++offset) {
-        validity.set(offset, (*mask->valid)[offset] != 0);
-    }
+    pack_nonzero_bytes_into(mask->valid->data(), output.count, validity.words_data());
     return std::optional<ValidityBitmap>{std::move(validity)};
 }
 

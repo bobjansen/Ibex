@@ -855,3 +855,36 @@ TEST_CASE("index_contains finds a value at any block position", "[runtime][join]
         }
     }
 }
+
+TEST_CASE("pack_nonzero_bytes sets one bit per nonzero byte at any length",
+          "[runtime][filter][validity]") {
+    // Every byte value, including the >= 0x80 ones a signed compare would
+    // read as negative, in a pattern that is not periodic in 64.
+    std::array<std::uint8_t, 200> bytes{};
+    for (std::size_t i = 0; i < bytes.size(); ++i) {
+        bytes[i] = (i % 3 == 0) ? 0 : static_cast<std::uint8_t>((i * 37) & 0xFFU);
+    }
+    for (std::size_t start = 0; start < 8; ++start) {
+        for (std::size_t lim = 0; lim <= 64; ++lim) {
+            INFO("start=" << start << " lim=" << lim);
+            const std::uint64_t bits = runtime::pack_nonzero_bytes(bytes.data() + start, lim);
+            for (std::size_t i = 0; i < 64; ++i) {
+                const bool want = i < lim && bytes[start + i] != 0;
+                REQUIRE(((bits >> i) & 1U) == static_cast<std::uint64_t>(want));
+            }
+        }
+    }
+    for (const std::size_t n : {std::size_t{0}, std::size_t{1}, std::size_t{63}, std::size_t{64},
+                                std::size_t{65}, std::size_t{130}, std::size_t{200}}) {
+        INFO("n=" << n);
+        std::array<std::uint64_t, 5> words{};
+        words.fill(~std::uint64_t{0});
+        runtime::pack_nonzero_bytes_into(bytes.data(), n, words.data());
+        for (std::size_t i = 0; i < ((n + 63) / 64) * 64; ++i) {
+            const bool want = i < n && bytes[i] != 0;
+            REQUIRE(((words[i / 64] >> (i % 64)) & 1U) == static_cast<std::uint64_t>(want));
+        }
+        // Words past the last one it needs are not touched.
+        REQUIRE(words[(n + 63) / 64] == ~std::uint64_t{0});
+    }
+}

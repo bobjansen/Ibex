@@ -15,12 +15,15 @@
 // covers the operators that sweep did not reach.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -260,4 +263,82 @@ TEST_CASE("null keys: an empty string key does not take the run-length sentinel"
     REQUIRE(out.rows() == 2);
     CHECK(ints(out, "n") == std::vector<std::int64_t>{2, 2});
     CHECK(ints(out, "total") == std::vector<std::int64_t>{3, 30});
+}
+
+namespace {
+
+/// Seven rows; rows 1 and 4 are null. `rank` is each non-null row's position
+/// in ascending order, and every typed key below encodes it monotonically --
+/// including a genuine zero (rank 2), which is also what a null slot holds.
+constexpr std::array<int, 7> kRank{3, -1, 1, 5, -1, 2, 4};
+
+auto null_ordering_table() -> runtime::TableRegistry {
+    runtime::ValidityBitmap valid(kRank.size(), true);
+    std::vector<std::int64_t> i64;
+    std::vector<double> f64;
+    std::vector<std::string> str;
+    Column<Categorical>::codes_storage codes;
+    std::vector<Date> dates;
+    std::vector<Timestamp> stamps;
+    std::vector<std::int64_t> row;
+    for (std::size_t r = 0; r < kRank.size(); ++r) {
+        const int k = kRank[r];
+        const bool is_null = k < 0;
+        if (is_null) {
+            valid.set(r, false);
+        }
+        i64.push_back(is_null ? 0 : k - 2);
+        f64.push_back(is_null ? 0.0 : (k * 1.5) - 3.0);
+        str.emplace_back(is_null ? "" : std::string(1, static_cast<char>('a' + k)));
+        // Dictionary deliberately not in value order: e, a, d, b, c, f.
+        constexpr std::array<int, 6> kCodeOf{1, 3, 4, 2, 0, 5};
+        codes.push_back(is_null ? 0 : kCodeOf[static_cast<std::size_t>(k)]);
+        dates.push_back(Date{.days = is_null ? 0 : k - 2});
+        stamps.push_back(Timestamp{.nanos = is_null ? 0 : k - 2});
+        row.push_back(static_cast<std::int64_t>(r));
+    }
+    runtime::Table t;
+    t.add_column("i", Column<std::int64_t>{i64}, valid);
+    t.add_column("f", Column<double>{f64}, valid);
+    t.add_column("s", Column<std::string>{str}, valid);
+    t.add_column("c",
+                 Column<Categorical>{std::vector<std::string>{"e", "a", "d", "b", "c", "f"},
+                                     std::move(codes)},
+                 valid);
+    t.add_column("dt", Column<Date>{dates}, valid);
+    t.add_column("ts", Column<Timestamp>{stamps}, valid);
+    // Two groups for the multi-key case: rows 0-3 and 4-6.
+    t.add_column("g", Column<std::int64_t>{0, 0, 0, 0, 1, 1, 1});
+    t.add_column("row", Column<std::int64_t>{row});
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+    return tables;
+}
+
+}  // namespace
+
+TEST_CASE("null keys: order puts nulls last for every key type and direction", "[nulls][keys]") {
+    // Non-null rows by rank, ascending: 2, 5, 0, 6, 3; descending the reverse.
+    // The nulls (rows 1 and 4) follow in input order either way.
+    const std::vector<std::int64_t> ascending{2, 5, 0, 6, 3, 1, 4};
+    const std::vector<std::int64_t> descending{3, 6, 0, 5, 2, 1, 4};
+    const auto tables = null_ordering_table();
+    for (const std::string key : {"i", "f", "s", "c", "dt", "ts"}) {
+        INFO("key " << key);
+        CHECK(ints(run("t[order { " + key + " }];", tables), "row") == ascending);
+        CHECK(ints(run("t[order { " + key + " desc }];", tables), "row") == descending);
+    }
+}
+
+TEST_CASE("null keys: a nullable second key puts nulls last within each group", "[nulls][keys]") {
+    // Group 0 holds rows 0-3 (ranks 3, null, 1, 5); group 1 rows 4-6
+    // (null, 2, 4).
+    const auto tables = null_ordering_table();
+    for (const std::string key : {"i", "f", "s", "c", "dt", "ts"}) {
+        INFO("key " << key);
+        CHECK(ints(run("t[order { g, " + key + " }];", tables), "row") ==
+              std::vector<std::int64_t>{2, 0, 3, 1, 5, 6, 4});
+        CHECK(ints(run("t[order { g desc, " + key + " desc }];", tables), "row") ==
+              std::vector<std::int64_t>{6, 5, 4, 3, 0, 2, 1});
+    }
 }

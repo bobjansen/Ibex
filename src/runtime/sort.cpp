@@ -979,8 +979,11 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
     }
 
     // Fast path: single ascending F64 key — map each double to an order-preserving
-    // uint64 and radix sort, avoiding the comparison-based stable_sort.
-    if (flat_keys.size() == 1 && flat_keys[0].kind == FlatKind::F64 && flat_keys[0].ascending) {
+    // uint64 and radix sort, avoiding the comparison-based stable_sort. Like
+    // every radix path here it ranks values alone, so a null-bearing key must
+    // not take it: its nulls would sort by the zero in their slot.
+    if (!has_null_keys && flat_keys.size() == 1 && flat_keys[0].kind == FlatKind::F64 &&
+        flat_keys[0].ascending) {
         std::vector<std::uint64_t> radix_keys(rows);
         const auto& f = flat_keys[0].f64;
         for_row_ranges(&exec, rows, [&](std::size_t begin, std::size_t end) {

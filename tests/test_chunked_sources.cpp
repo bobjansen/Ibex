@@ -31,11 +31,13 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <expected>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -874,6 +876,46 @@ TEST_CASE("chunked single-column distinct migrates partitioned values on a null 
     // again for 103 rows -- which is what this asserted against before the
     // partitions were seeded too.
     REQUIRE(result.rows() == static_cast<std::size_t>(kValues) + 1);
+}
+
+TEST_CASE("chunked single-column distinct keeps one NaN across a null-chunk migration",
+          "[runtime][chunked][distinct][validity][nan]") {
+    // The typed double store holds one NaN; the first null-bearing chunk
+    // migrates it into the generic index, which must hash it as the same key
+    // a later NaN of a DIFFERENT payload probes with -- every NaN is one key.
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("nan_tail_keys", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        runtime::Chunk dense;
+        runtime::ColumnEntry dense_entry;
+        dense_entry.name = "a";
+        dense_entry.column = std::make_shared<runtime::ColumnValue>(
+            // Not the canonical quiet NaN: a store that hashes raw bits must
+            // not happen to agree with the canonical hash.
+            Column<double>{1.5, std::bit_cast<double>(std::uint64_t{0x7ff8000000000077ULL}), 2.5});
+        dense.columns.push_back(std::move(dense_entry));
+        chunks.push_back(std::move(dense));
+
+        runtime::Chunk nullable;
+        runtime::ColumnEntry nullable_entry;
+        nullable_entry.name = "a";
+        nullable_entry.column = std::make_shared<runtime::ColumnValue>(
+            Column<double>{std::bit_cast<double>(std::uint64_t{0xfff8000000000042ULL}), 0.0, 2.5});
+        runtime::ValidityBitmap valid;
+        valid.push_back(true);
+        valid.push_back(false);
+        valid.push_back(true);
+        nullable_entry.validity = std::move(valid);
+        nullable.columns.push_back(std::move(nullable_entry));
+        chunks.push_back(std::move(nullable));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+    const auto result = run_extern(
+        "extern fn nan_tail_keys() -> DataFrame from \"x.hpp\"; nan_tail_keys()[distinct { a }];",
+        externs);
+    // 1.5, NaN, 2.5 and the null.
+    REQUIRE(result.rows() == 4);
 }
 
 TEST_CASE("chunked aggregate: moment aggregates agree serially and in parallel",

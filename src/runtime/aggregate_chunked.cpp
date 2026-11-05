@@ -651,7 +651,7 @@ class GroupKeyStore {
                     mix(std::hash<bool>{}(col.ints[gid] != 0));
                     break;
                 case Kind::Double:
-                    mix(std::hash<double>{}(col.doubles[gid]));
+                    mix(key_double_hash(col.doubles[gid]));  // as hash_key_row
                     break;
                 case Kind::Text:
                     mix(std::hash<std::string_view>{}(col.text(gid)));
@@ -667,7 +667,7 @@ class GroupKeyStore {
     }
 
     /// `key_equals_row` against the group's key: null matches only null, and
-    /// doubles compare with `==` (NaN never matches; -0.0 finds 0.0).
+    /// doubles compare by key class (every NaN is one key; -0.0 finds 0.0).
     [[nodiscard]] auto equals_row(std::size_t gid, const std::vector<KeyCol>& cols,
                                   std::size_t row) const -> bool {
         for (std::size_t i = 0; i < cols.size(); ++i) {
@@ -687,7 +687,7 @@ class GroupKeyStore {
                     }
                     break;
                 case KeyCol::Kind::Double:
-                    if (!(col.doubles[gid] == key_col.f64[row])) {
+                    if (!key_doubles_equal(col.doubles[gid], key_col.f64[row])) {
                         return false;
                     }
                     break;
@@ -6677,11 +6677,9 @@ class HashAggregateState final {
             const ExprType kind = plan_[a].kind;
             const auto bits_at = [&](std::size_t row) -> std::uint64_t {
                 switch (kind) {
-                    case ExprType::Double: {
-                        const double value =
-                            std::get<Column<double>>(std::as_const(*entry.column)).data()[row];
-                        return std::bit_cast<std::uint64_t>(value == 0.0 ? 0.0 : value);
-                    }
+                    case ExprType::Double:
+                        return key_double_bits(
+                            std::get<Column<double>>(std::as_const(*entry.column)).data()[row]);
                     case ExprType::Date:
                         return static_cast<std::uint32_t>(
                             std::get<Column<Date>>(*entry.column)[row].days);

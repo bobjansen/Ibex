@@ -16,14 +16,18 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/table_properties.hpp>
 
 #include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -33,6 +37,8 @@
 #include <utility>
 #include <variant>
 #include <vector>
+
+#include "../src/runtime/interpreter_internal.hpp"
 
 using namespace ibex;
 
@@ -343,5 +349,234 @@ TEST_CASE("null keys: a nullable second key puts nulls last within each group", 
               std::vector<std::int64_t>{2, 0, 3, 1, 5, 6, 4});
         CHECK(ints(run("t[order { g desc, " + key + " desc }];", tables), "row") ==
               std::vector<std::int64_t>{6, 5, 4, 3, 0, 2, 1});
+    }
+}
+
+namespace {
+
+/// Float64 key `k` with three NaNs of different payloads and signs, -0.0 next
+/// to 0.0, two 1.0s and a null. Values are powers of two so every group's sum
+/// names exactly which rows it holds.
+///
+///   row:  0     1    2      3     4    5      6     7
+///   k:    NaN   1.0  -NaN   -0.0  0.0  NaN'   null  1.0
+///   v:    1     2    4      8     16   32     64    128
+auto nan_keys() -> runtime::TableRegistry {
+    const double nan_a = std::numeric_limits<double>::quiet_NaN();
+    const double nan_b = -std::numeric_limits<double>::quiet_NaN();
+    // A different payload, not just a different sign.
+    const auto nan_c = std::bit_cast<double>(std::uint64_t{0x7ff8000000000123ULL});
+    runtime::Table t;
+    runtime::ValidityBitmap kv(8, true);
+    kv.set(6, false);
+    t.add_column("k", Column<double>{nan_a, 1.0, nan_b, -0.0, 0.0, nan_c, 0.0, 1.0}, kv);
+    t.add_column("g", Column<std::int64_t>{7, 7, 7, 7, 7, 7, 7, 7});
+    t.add_column("v", Column<std::int64_t>{1, 2, 4, 8, 16, 32, 64, 128});
+    t.add_column("pk", Column<std::string>{"a", "a", "b", "a", "b", "c", "a", "b"});
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+    return tables;
+}
+
+auto sorted(std::vector<std::int64_t> values) -> std::vector<std::int64_t> {
+    std::ranges::sort(values);
+    return values;
+}
+
+}  // namespace
+
+// NaN keys form ONE group whatever their payload or sign, as in Polars, DuckDB
+// and PostgreSQL; -0.0 and 0.0 form one group; null stays its own group.
+// Groups: NaN rows {0,2,5} = 37, 1.0 rows {1,7} = 130, zero rows {3,4} = 24,
+// null row {6} = 64.
+TEST_CASE("NaN keys: by groups every NaN together", "[nulls][keys][nan]") {
+    const auto tables = nan_keys();
+    const std::vector<std::int64_t> sums{24, 37, 64, 130};
+    CHECK(sorted(ints(run("t[select { s = sum(v) }, by { k }];", tables), "s")) == sums);
+    CHECK(sorted(ints(run("t[select { s = sum(v) }, by { k, g }];", tables), "s")) == sums);
+    CHECK(sorted(ints(run("t[select { s = sum(v) }, by { g, k }];", tables), "s")) == sums);
+    CHECK(ints(run("t[update { s = sum(v) }, by { k }];", tables), "s") ==
+          std::vector<std::int64_t>{37, 130, 37, 24, 24, 37, 64, 130});
+    CHECK(ints(run("t[update { s = sum(v) }, by { k, g }];", tables), "s") ==
+          std::vector<std::int64_t>{37, 130, 37, 24, 24, 37, 64, 130});
+    // The first row of each group.
+    CHECK(sorted(ints(run("t[head 1, by { k }];", tables), "v")) ==
+          std::vector<std::int64_t>{1, 2, 8, 64});
+}
+
+TEST_CASE("NaN keys: distinct and count_distinct see one NaN", "[nulls][keys][nan]") {
+    const auto tables = nan_keys();
+    CHECK(run("t[distinct { k }];", tables).rows() == 4);
+    CHECK(run("t[distinct { k, g }];", tables).rows() == 4);
+    // Non-null distinct values: NaN, 1.0 and zero.
+    CHECK(ints(run("t[select { n = count_distinct(k) }];", tables), "n") ==
+          std::vector<std::int64_t>{3});
+    CHECK(sorted(ints(run("t[select { n = count_distinct(k) }, by { g }];", tables), "n")) ==
+          std::vector<std::int64_t>{3});
+}
+
+TEST_CASE("NaN keys: dcast puts every NaN row key in one row", "[nulls][keys][nan]") {
+    const auto tables = nan_keys();
+    // Row keys NaN, 1.0, zero and null: four rows.
+    CHECK(run("t[dcast pk, select { v }, by { k }];", tables).rows() == 4);
+}
+
+namespace {
+
+/// The same rows as `nan_keys` without the null row, so key paths that only
+/// take null-free columns (the typed single-key maps and distinct sets) run.
+/// Groups: NaN rows {0,2,5} = 37, 1.0 rows {1,6} = 66, zero rows {3,4} = 24.
+auto nan_keys_no_nulls() -> runtime::TableRegistry {
+    const auto nan_c = std::bit_cast<double>(std::uint64_t{0x7ff8000000000123ULL});
+    runtime::Table t;
+    t.add_column("k",
+                 Column<double>{std::numeric_limits<double>::quiet_NaN(), 1.0,
+                                -std::numeric_limits<double>::quiet_NaN(), -0.0, 0.0, nan_c, 1.0});
+    t.add_column("g", Column<std::int64_t>{7, 7, 7, 7, 7, 7, 7});
+    t.add_column("v", Column<std::int64_t>{1, 2, 4, 8, 16, 32, 64});
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+    return tables;
+}
+
+/// Many distinct keys, so group tables grow and rehash, with a NaN of a
+/// different payload every 100 rows: 2,000 real keys plus one NaN group.
+auto many_keys_with_nans() -> runtime::TableRegistry {
+    constexpr std::size_t kRows = 4000;
+    std::vector<double> k(kRows);
+    std::vector<std::int64_t> v(kRows, 1);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        k[i] = (i % 100 == 0) ? std::bit_cast<double>(std::uint64_t{0x7ff8000000000000ULL} | i)
+                              : static_cast<double>(i % 2000) + 0.5;
+    }
+    runtime::Table t;
+    t.add_column("k", Column<double>{std::move(k)});
+    t.add_column("v", Column<std::int64_t>{std::move(v)});
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+    return tables;
+}
+
+}  // namespace
+
+TEST_CASE("NaN keys: null-free typed key paths group every NaN together", "[nulls][keys][nan]") {
+    const auto tables = nan_keys_no_nulls();
+    CHECK(sorted(ints(run("t[select { s = sum(v) }, by { k }];", tables), "s")) ==
+          std::vector<std::int64_t>{24, 37, 66});
+    CHECK(ints(run("t[update { s = sum(v) }, by { k }];", tables), "s") ==
+          std::vector<std::int64_t>{37, 66, 37, 24, 24, 37, 66});
+    CHECK(run("t[distinct { k }];", tables).rows() == 3);
+    CHECK(ints(run("t[select { n = count_distinct(k) }];", tables), "n") ==
+          std::vector<std::int64_t>{3});
+    CHECK(ints(run("t[select { n = count_distinct(k) }, by { g }];", tables), "n") ==
+          std::vector<std::int64_t>{3});
+}
+
+TEST_CASE("NaN keys: one NaN group survives a growing group table", "[nulls][keys][nan]") {
+    const auto tables = many_keys_with_nans();
+    // Rows with i % 100 == 0 are NaN (40 of them); the other 3,960 rows hold
+    // 1,980 distinct values (the ones whose i % 2000 is a multiple of 100 only
+    // ever appear as NaN rows).
+    CHECK(run("t[select { n = count() }, by { k }];", tables).rows() == 1981);
+    CHECK(run("t[distinct { k }];", tables).rows() == 1981);
+    CHECK(ints(run("t[select { n = count_distinct(k) }];", tables), "n") ==
+          std::vector<std::int64_t>{1981});
+}
+
+TEST_CASE("NaN keys: the materialized aggregate groups every NaN together", "[nulls][keys][nan]") {
+    // `aggregate_table` is what the physical fallback and the decimal path run;
+    // a script never reaches it, so it is called directly. Both fixtures: the
+    // null-free one takes the typed single-key map, the null one the encoded
+    // key path.
+    const std::vector<ir::AggSpec> aggs{
+        ir::AggSpec{.func = ir::AggFunc::Sum, .column = {.name = "v"}, .alias = "s"},
+        ir::AggSpec{.func = ir::AggFunc::CountDistinct, .column = {.name = "k"}, .alias = "n"}};
+    // `sum` alone for the keyed cases: `count_distinct` routes the whole
+    // aggregate down its own path, past the typed key maps under test.
+    const std::vector<ir::AggSpec> sum_only{
+        ir::AggSpec{.func = ir::AggFunc::Sum, .column = {.name = "v"}, .alias = "s"}};
+    const std::vector<ir::ColumnRef> by_k{{.name = "k"}};
+    const std::vector<ir::ColumnRef> by_g{{.name = "g"}};
+    const std::vector<ir::ColumnRef> by_k_g{{.name = "k"}, {.name = "g"}};
+    {
+        const auto tables = nan_keys_no_nulls();
+        const auto& t = tables.at("t");
+        auto out = runtime::aggregate_table(t, by_k, sum_only);
+        REQUIRE(out.has_value());
+        CHECK(sorted(ints(*out, "s")) == std::vector<std::int64_t>{24, 37, 66});
+        auto two = runtime::aggregate_table(t, by_k_g, sum_only);
+        REQUIRE(two.has_value());
+        CHECK(sorted(ints(*two, "s")) == std::vector<std::int64_t>{24, 37, 66});
+        auto distinct = runtime::aggregate_table(t, by_g, aggs);
+        REQUIRE(distinct.has_value());
+        CHECK(ints(*distinct, "n") == std::vector<std::int64_t>{3});
+    }
+    {
+        const auto tables = nan_keys();
+        const auto& t = tables.at("t");
+        auto out = runtime::aggregate_table(t, by_k, sum_only);
+        REQUIRE(out.has_value());
+        CHECK(sorted(ints(*out, "s")) == std::vector<std::int64_t>{24, 37, 64, 130});
+        auto two = runtime::aggregate_table(t, by_k_g, sum_only);
+        REQUIRE(two.has_value());
+        CHECK(sorted(ints(*two, "s")) == std::vector<std::int64_t>{24, 37, 64, 130});
+        auto distinct = runtime::aggregate_table(t, by_g, aggs);
+        REQUIRE(distinct.has_value());
+        CHECK(ints(*distinct, "n") == std::vector<std::int64_t>{3});
+    }
+}
+
+TEST_CASE("NaN keys: a NaN join key still matches nothing", "[nulls][keys][nan]") {
+    // Grouping puts every NaN in one group; joins keep IEEE `==` (SPEC 5.6).
+    // They share the key hash, which now sends every NaN to one bucket -- that
+    // must change where a NaN probes, never what it matches.
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    runtime::Table l;
+    l.add_column("k", Column<double>{nan, 1.0, -0.0});
+    l.add_column("lv", Column<std::int64_t>{1, 2, 3});
+    runtime::Table r;
+    r.add_column("k", Column<double>{nan, 1.0, 0.0});
+    r.add_column("rv", Column<std::int64_t>{10, 20, 30});
+    runtime::TableRegistry tables;
+    tables.emplace("l", std::move(l));
+    tables.emplace("r", std::move(r));
+    // 1.0 and the zeros match; the NaNs do not.
+    CHECK(sorted(ints(run("l join r on k;", tables), "lv")) == std::vector<std::int64_t>{2, 3});
+    CHECK(sorted(ints(run("l join r on { k, k };", tables), "lv")) ==
+          std::vector<std::int64_t>{2, 3});
+    CHECK(ints(run("l semi join r on k;", tables), "lv") == std::vector<std::int64_t>{2, 3});
+    CHECK(ints(run("l anti join r on k;", tables), "lv") == std::vector<std::int64_t>{1});
+}
+
+TEST_CASE("NaN keys: an as-of join's NaN equality key matches nothing", "[nulls][keys][nan]") {
+    // The as-of join matches equality keys with IEEE `==`: a NaN right row is
+    // never a candidate, and a NaN left row stays unmatched, even against a
+    // NaN of the same bits. One equality key takes a typed path; a second key
+    // takes the `Key` map.
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    for (const bool second_key : {false, true}) {
+        INFO("second key " << second_key);
+        runtime::Table lhs;
+        lhs.add_column("ts", Column<Timestamp>{Timestamp{10}, Timestamp{20}, Timestamp{30}});
+        lhs.add_column("k", Column<double>{nan, 1.0, nan});
+        runtime::Table rhs;
+        rhs.add_column("ts", Column<Timestamp>{Timestamp{5}, Timestamp{6}, Timestamp{7}});
+        rhs.add_column("k", Column<double>{nan, 1.0, nan});
+        if (second_key) {
+            lhs.add_column("g", Column<std::int64_t>{4, 4, 4});
+            rhs.add_column("g", Column<std::int64_t>{4, 4, 4});
+        }
+        lhs.add_column("lv", Column<std::int64_t>{1, 2, 3});
+        rhs.add_column("rv", Column<std::int64_t>{10, 20, 30});
+        lhs.set_properties(runtime::TableProperties::time_frame("ts"));
+        rhs.set_properties(runtime::TableProperties::time_frame("ts"));
+        runtime::TableRegistry tables;
+        tables.emplace("lhs", std::move(lhs));
+        tables.emplace("rhs", std::move(rhs));
+        const auto out = run(
+            second_key ? "lhs asof join rhs on { ts, k, g };" : "lhs asof join rhs on { ts, k };",
+            tables);
+        REQUIRE(out.rows() == 3);
+        CHECK(nulls(out, "rv") == std::vector<bool>{true, false, true});
     }
 }

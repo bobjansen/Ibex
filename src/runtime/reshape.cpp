@@ -88,14 +88,13 @@ constexpr std::uint32_t kDcastNoPivot = std::numeric_limits<std::uint32_t>::max(
 /// Equality compares the VALUES, so it is exact for every column type by
 /// construction: there is no per-column code to keep injective. Two nulls in
 /// the same column are equal (a null row key is a group of its own), a null
-/// and a value are not. A Float64 compares by bit pattern with -0.0 folded
-/// onto 0.0, so the two group together and every NaN with the same bits forms
-/// one group, as with any other key.
+/// and a value are not. A Float64 compares by key class: -0.0 groups with 0.0
+/// and every NaN is one row key, as with any other key.
 struct DcastRowKey {
     std::vector<const ColumnEntry*> columns;
 
     [[nodiscard]] static auto double_bits(double value) noexcept -> std::uint64_t {
-        return std::bit_cast<std::uint64_t>(value == 0.0 ? 0.0 : value);
+        return key_double_bits(value);
     }
 
     [[nodiscard]] auto equal(std::size_t a, std::size_t b) const -> bool {

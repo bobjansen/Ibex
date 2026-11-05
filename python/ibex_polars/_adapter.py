@@ -855,37 +855,18 @@ class Adapter:
             elif kind == "GroupBy":
                 if node.apply or any(getattr(node.options, name) is not None for name in ("dynamic", "rolling")):
                     raise NotImplementedError("group UDFs and dynamic/rolling groups are unsupported")
-                keys, representatives = [], []
-                occupied = set(self.visitor.get_schema()) | set(schema)
-                def temporary(role):
-                    name = f"_ibex_group_{node_id}_{role}"
-                    while name in occupied:
-                        name += "_"
-                    occupied.add(name)
-                    return name
-                for index, key in enumerate(node.keys):
+                keys = []
+                for key in node.keys:
                     expr = self.expression(key.node)
                     if expr._op != "col" or expr._name != key.output_name:
                         raise NotImplementedError("computed or renamed grouping keys are not supported yet")
-                    if self.visitor.get_dtype(key.node) in (pl.Float32, pl.Float64):
-                        flag, normalized = temporary(f"nan_{index}"), temporary(f"value_{index}")
-                        is_nan = Expr("is_nan", (expr,))
-                        frame = frame._append("hstack", (
-                            Expr("case", (is_nan, ibex.lit(True), ibex.lit(False))).alias(flag),
-                            Expr("case", (is_nan, ibex.lit(0.0), expr)).alias(normalized)))
-                        keys.extend((flag, normalized))
-                        # Each normalized group contains either only nulls or
-                        # only non-null keys. Skipping nulls therefore preserves
-                        # the original first key, including NaN payloads and
-                        # signed zero, while allowing native streaming reducers.
-                        representatives.append(Expr("first_non_null", (expr,)).alias(expr._name))
-                    else:
-                        keys.append(expr._name)
+                    # A float key goes through as-is: native grouping puts every
+                    # NaN in one group and -0.0 with 0.0, as Polars does, and
+                    # each group keeps its first row's key value.
+                    keys.append(expr._name)
                 frame = self._aggregate_rounding(
-                    frame, representatives + [self.named(expr) for expr in node.aggs],
+                    frame, [self.named(expr) for expr in node.aggs],
                     keys=keys, maintain_order=node.maintain_order)
-                if representatives:
-                    frame = frame.select(list(schema))
                 if node.options.slice is not None:
                     frame = frame.slice(*node.options.slice)
             elif kind == "Sort":

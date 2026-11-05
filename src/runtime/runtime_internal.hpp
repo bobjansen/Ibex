@@ -12,10 +12,13 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <optional>
+#include <robin_hood.h>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -218,6 +221,54 @@ inline void pack_nonzero_bytes_into(const std::uint8_t* bytes, std::size_t n,
         words[w] = pack_nonzero_bytes(bytes + (w * 64), std::min<std::size_t>(64, n - (w * 64)));
     }
 }
+
+// ─── Float64 key identity ───────────────────────────────────────────────────
+//
+// How a Float64 behaves as a `by`, `distinct`, `count_distinct` or `dcast`
+// key: every NaN is ONE key whatever its payload or sign, and -0.0 is 0.0 --
+// what Polars, DuckDB and PostgreSQL do. IEEE `==` gives each NaN a group of
+// its own, which no grouping wants. Joins keep `==` (SPEC section 5.6): a NaN
+// join key matches nothing. Every grouping hash and equality on a double goes
+// through these, so a hash and the equality it pairs with cannot disagree.
+
+/// The representative of `v`'s key class: one quiet NaN, and 0.0 for -0.0.
+[[nodiscard]] inline auto canonical_key_double(double v) noexcept -> double {
+    if (std::isnan(v)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return v == 0.0 ? 0.0 : v;
+}
+
+/// Whether two doubles are the same key: `==`, plus NaN equals NaN.
+[[nodiscard]] inline auto key_doubles_equal(double a, double b) noexcept -> bool {
+    return a == b || (std::isnan(a) && std::isnan(b));
+}
+
+/// The bits of `v`'s key class; equal exactly when `key_doubles_equal`.
+[[nodiscard]] inline auto key_double_bits(double v) noexcept -> std::uint64_t {
+    return std::bit_cast<std::uint64_t>(canonical_key_double(v));
+}
+
+/// The hash of `v`'s key class.
+[[nodiscard]] inline auto key_double_hash(double v) noexcept -> std::size_t {
+    return std::hash<double>{}(canonical_key_double(v));
+}
+
+/// Hash and equality for a hash container keyed on a double grouping key.
+struct KeyDoubleHash {
+    auto operator()(double v) const noexcept -> std::size_t { return key_double_hash(v); }
+};
+struct KeyDoubleEq {
+    auto operator()(double a, double b) const noexcept -> bool { return key_doubles_equal(a, b); }
+};
+
+/// Hash and equality for a container keyed on a grouping value of type `T`:
+/// the key-class pair for a double, the container defaults otherwise.
+template <typename T>
+using GroupKeyHash =
+    std::conditional_t<std::is_same_v<T, double>, KeyDoubleHash, robin_hood::hash<T>>;
+template <typename T>
+using GroupKeyEq = std::conditional_t<std::is_same_v<T, double>, KeyDoubleEq, std::equal_to<T>>;
 
 struct Mask {
     /// One byte per row, and every filter kernel writes all of them — so the

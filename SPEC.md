@@ -805,6 +805,11 @@ holds:
   With a composite key, `{0, null}`, `{null, 0}` and `{0, 0}` are three
   different keys. The same rule applies to `update ... by`, `head`/`tail ... by`
   and `dcast` row keys.
+- **NaN in a Float64 key**: every NaN is one value for `by`, `distinct`,
+  `count_distinct`, and `dcast` row keys, whatever its payload or sign, and
+  `-0.0` and `0.0` are one value. This matches Polars, DuckDB and PostgreSQL.
+  NaN is not null: a NaN group and a null group are different. Joins
+  compare keys with IEEE `==`, so a NaN join key matches nothing.
 - **`order`**: nulls sort last under both `asc` and `desc`. Their position does
   not flip with the direction.
 - **Joins**: a null key matches nothing, not even another null, unless the

@@ -524,8 +524,11 @@ class EngineTests(unittest.TestCase):
                         pl.len().alias("n"), pl.sum("v"))
                     result = self.equal(query)
                     source = self.engine.explain(query)
-                    self.assertIn("first(`x`)", source)
-                    self.assertNotIn("first_null(`x`)", source)
+                    # Grouped on the column itself: native grouping puts every
+                    # NaN in one group and -0.0 with 0.0, so no NaN flag or
+                    # normalized key is generated.
+                    self.assertIn("by { `x` }", source)
+                    self.assertNotIn("is_nan", source)
                     self.assertIsNone(result["x"][0])
                     if dtype == pl.Float64:
                         self.assertEqual(struct.pack("d", result["x"][1]), struct.pack("d", nan_a))

@@ -244,8 +244,8 @@ class ChunkedDistinctOperator final : public Operator {
     /// is the key buffer.
     template <typename T>
     struct TypedDedup {
-        robin_hood::unordered_flat_set<T> seen;
-        std::vector<robin_hood::unordered_flat_set<T>> parts;
+        robin_hood::unordered_flat_set<T, GroupKeyHash<T>, GroupKeyEq<T>> seen;
+        std::vector<robin_hood::unordered_flat_set<T, GroupKeyHash<T>, GroupKeyEq<T>>> parts;
     };
 
     template <typename T>
@@ -846,7 +846,7 @@ class ChunkedDistinctOperator final : public Operator {
         if (std::holds_alternative<Column<double>>(column)) {
             seed_generic_dedup_from(
                 seen_f64_, [](double v) -> ScalarValue { return v; },
-                [](double v) { return mix_one(std::hash<double>{}(v)); });
+                [](double v) { return mix_one(key_double_hash(v)); });
             return true;
         }
         if (std::holds_alternative<Column<bool>>(column)) {

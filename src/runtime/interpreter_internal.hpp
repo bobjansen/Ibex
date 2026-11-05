@@ -241,9 +241,16 @@ struct KeyHash {
             if (key.is_null(i)) {
                 continue;  // undefined payload — the mask already says "null"
             }
-            const std::size_t h =
-                std::visit([](const auto& v) { return std::hash<std::decay_t<decltype(v)>>{}(v); },
-                           key.values[i]);
+            const std::size_t h = std::visit(
+                [](const auto& v) -> std::size_t {
+                    using T = std::decay_t<decltype(v)>;
+                    if constexpr (std::is_same_v<T, double>) {
+                        return key_double_hash(v);  // one hash for every NaN
+                    } else {
+                        return std::hash<T>{}(v);
+                    }
+                },
+                key.values[i]);
             hash_combine(h);
         }
         hash_combine(std::hash<std::uint64_t>{}(key.null_mask));
@@ -251,7 +258,10 @@ struct KeyHash {
     }
 };
 
-struct KeyEq {
+/// Grouping equality: a double compares by key class (`key_doubles_equal`),
+/// so every NaN is one key. `KeyEqIeee` keeps IEEE `==` for joins.
+template <bool kNanIsKey>
+struct BasicKeyEq {
     auto operator()(const Key& a, const Key& b) const -> bool {
         if (a.null_mask != b.null_mask || a.values.size() != b.values.size()) {
             return false;
@@ -260,6 +270,16 @@ struct KeyEq {
             if (a.is_null(i)) {
                 continue;  // both null here (masks are equal) — payloads irrelevant
             }
+            if constexpr (kNanIsKey) {
+                const auto* x = std::get_if<double>(&a.values[i]);
+                const auto* y = std::get_if<double>(&b.values[i]);
+                if (x != nullptr && y != nullptr) {
+                    if (!key_doubles_equal(*x, *y)) {
+                        return false;
+                    }
+                    continue;
+                }
+            }
             if (a.values[i] != b.values[i]) {
                 return false;
             }
@@ -267,6 +287,8 @@ struct KeyEq {
         return true;
     }
 };
+using KeyEq = BasicKeyEq<true>;
+using KeyEqIeee = BasicKeyEq<false>;
 
 /// Append one column's cell to a grouping key, recording it as null when the
 /// column's validity bit is clear. Every Key builder should go through this —
@@ -415,9 +437,10 @@ inline auto hash_key_row(const std::vector<KeyCol>& cols, std::size_t row) -> st
                 mix(std::hash<std::int64_t>{}(col.i64[row]));
                 break;
             case KeyCol::Kind::Double:
-                // std::hash<double> folds -0.0 onto 0.0, keeping it consistent
-                // with the `==` used to compare them below.
-                mix(std::hash<double>{}(col.f64[row]));
+                // The key class: -0.0 with 0.0 and every NaN together, as
+                // `key_equals_row` compares them. A join, which compares with
+                // `==`, only sees NaNs share a bucket.
+                mix(key_double_hash(col.f64[row]));
                 break;
             case KeyCol::Kind::Bool:
                 mix(std::hash<bool>{}((*col.boolean)[row]));
@@ -471,6 +494,8 @@ inline auto hash_key_value(const Key& key) -> std::uint64_t {
                     // Units only, as hash_key_row's Dec case: the row side has
                     // no per-row type to mix in.
                     return decimal::hash_units(v.units);
+                } else if constexpr (std::is_same_v<T, double>) {
+                    return key_double_hash(v);
                 } else {
                     return std::hash<T>{}(v);
                 }
@@ -482,8 +507,8 @@ inline auto hash_key_value(const Key& key) -> std::uint64_t {
 }
 
 /// Does the group's stored key describe this row? Mirrors KeyEq: null matches
-/// only null, and a double compares with `==`, so NaN keys stay distinct and
-/// -0.0 still finds the 0.0 group — exactly as a boxed Key comparison did.
+/// only null, and a double compares by key class, so every NaN is one group
+/// and -0.0 finds the 0.0 group — exactly as a boxed Key comparison does.
 inline auto key_equals_row(const Key& key, const std::vector<KeyCol>& cols, std::size_t row)
     -> bool {
     for (std::size_t i = 0; i < cols.size(); ++i) {
@@ -503,7 +528,7 @@ inline auto key_equals_row(const Key& key, const std::vector<KeyCol>& cols, std:
                 }
                 break;
             case KeyCol::Kind::Double:
-                if (!(std::get<double>(value) == col.f64[row])) {
+                if (!key_doubles_equal(std::get<double>(value), col.f64[row])) {
                     return false;
                 }
                 break;

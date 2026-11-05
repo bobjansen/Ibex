@@ -2159,7 +2159,9 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 }
 
                 if (!grouped_done) {
-                    robin_hood::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq>
+                    // IEEE equality: a NaN join key matches nothing (SPEC 5.6),
+                    // unlike a NaN group key.
+                    robin_hood::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEqIeee>
                         right_groups;
                     right_groups.reserve(n_right);
                     for (std::size_t r = 0; r < n_right; ++r) {
@@ -2175,7 +2177,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                         right_groups[group].push_back(r);
                     }
 
-                    robin_hood::unordered_map<Key, std::size_t, KeyHash, KeyEq> right_pos;
+                    robin_hood::unordered_map<Key, std::size_t, KeyHash, KeyEqIeee> right_pos;
                     right_pos.reserve(right_groups.size());
 
                     for (std::size_t l = 0; l < n_left; ++l) {

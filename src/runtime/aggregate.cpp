@@ -1464,10 +1464,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 if (const auto* ic = std::get_if<Column<std::int64_t>>(&col)) {
                     count_with([&](std::size_t row) { return (*ic)[row]; });
                 } else if (const auto* dc = std::get_if<Column<double>>(&col)) {
-                    count_with([&](std::size_t row) {
-                        const double value = (*dc)[row];
-                        return std::bit_cast<std::uint64_t>(value == 0.0 ? 0.0 : value);
-                    });
+                    count_with([&](std::size_t row) { return key_double_bits((*dc)[row]); });
                 } else if (const auto* bc = std::get_if<Column<bool>>(&col)) {
                     count_with(
                         [&](std::size_t row) -> std::uint8_t { return (*bc)[row] ? 1U : 0U; });
@@ -1992,7 +1989,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         }
         if (std::holds_alternative<Column<double>>(key_column)) {
             const auto& col = std::get<Column<double>>(key_column);
-            robin_hood::unordered_flat_map<double, std::size_t> index;
+            robin_hood::unordered_flat_map<double, std::size_t, KeyDoubleHash, KeyDoubleEq> index;
             index.reserve(rows);
             std::vector<double> order;
             order.reserve(rows);
@@ -2274,7 +2271,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     }
                 } else {
                     cc.codes.resize(rows);
-                    robin_hood::unordered_flat_map<T, std::uint32_t> map;
+                    robin_hood::unordered_flat_map<T, std::uint32_t, GroupKeyHash<T>, GroupKeyEq<T>>
+                        map;
                     map.reserve(64);
                     // A boxed key is a ScalarValue; a decimal one needs its
                     // column's precision and scale to mean anything.

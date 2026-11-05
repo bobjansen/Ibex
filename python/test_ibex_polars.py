@@ -4,6 +4,7 @@
 
 from datetime import date, datetime, timedelta
 import gc
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -1250,6 +1251,22 @@ class EngineTests(unittest.TestCase):
             data = pl.LazyFrame({"k": source.collect()["k"], "id": list(range(10))})
             for keep in ("first", "last", "none"):
                 self.equal(data.unique(subset="k", keep=keep, maintain_order=True))
+        # The kept row's own key value survives, including the sign of zero,
+        # which frame equality does not compare.
+        for zeros in ([0.0, -0.0], [-0.0, 0.0]):
+            source = pl.LazyFrame({"k": zeros, "id": [0, 1]})
+            for query in (source.select("k").unique(keep="first", maintain_order=True),
+                          source.unique(subset="k", keep="first", maintain_order=True),
+                          source.unique(subset="k", keep="last", maintain_order=True)):
+                with self.subTest(zeros=zeros):
+                    signs = [math.copysign(1.0, value) for value in query.collect(engine=self.engine)["k"]]
+                    expected = [math.copysign(1.0, value) for value in query.collect()["k"]]
+                    self.assertEqual(signs, expected)
+        frame = pl.LazyFrame({"k": [float("nan"), 1.0]})
+        for query in (frame.unique(maintain_order=True), frame.unique(keep="last", maintain_order=True)):
+            text = self.engine.explain(query)
+            self.assertNotIn("is_nan", text)
+        self.assertIn("distinct", self.engine.explain(frame.unique(maintain_order=True)))
 
     def test_unique_subset_selects_whole_rows_and_preserves_selected_row_order(self):
         data = {"g": ["a", "b", "a", None, None, "c"],

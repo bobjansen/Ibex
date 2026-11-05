@@ -445,9 +445,9 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             columns = schemas[index]
             keys = tuple(columns) if subset is None else subset
             fields = ", ".join(_identifier(name) for name in columns)
-            if set(keys) == set(columns) and keep in ("any", "first") and not any(
-                columns[name] == pa.float64() for name in keys
-            ):
+            # Native grouping puts every NaN in one group and -0.0 with 0.0,
+            # as Polars does, and keeps each group's first-row key value.
+            if set(keys) == set(columns) and keep in ("any", "first"):
                 source += f"[distinct {{ {fields} }}]"
                 continue
             occupied = set(columns)
@@ -462,15 +462,7 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             group_keys = []
             for key_index, name in enumerate(keys):
                 key = temporary(f"key_{key_index}")
-                value = _identifier(name)
-                if columns[name] == pa.float64():
-                    # Ibex keeps NaN keys distinct; Polars groups all NaNs.
-                    # The flag separates NaN from a genuine zero (and null).
-                    nan = temporary(f"nan_{key_index}")
-                    updates.append(f"{_identifier(nan)} = is_nan({value})")
-                    group_keys.append(nan)
-                    value = f"case {{ is_nan({value}) => 0.0, else => {value} }}"
-                updates.append(f"{_identifier(key)} = {value}")
+                updates.append(f"{_identifier(key)} = {_identifier(name)}")
                 group_keys.append(key)
             ordinal, count = temporary("ordinal"), temporary("count")
             edge = "last_null" if keep == "last" else "first_null"

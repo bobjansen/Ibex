@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Bob Jansen
-"""Row slices lower to seq/filter, with bounds resolved at the current stage."""
+"""Row slices lower to head/tail, or to seq/filter with bounds resolved at the current stage."""
 
 import unittest
 from unittest.mock import patch
@@ -74,6 +74,27 @@ class SliceTests(unittest.TestCase):
             self.equal(source.unique(subset="g", keep="last", maintain_order=True).slice(offset, length))
             self.equal(source.group_by("g", maintain_order=True).agg(pl.col("x").sum()).slice(offset, length))
         self.equal(source.slice(1, 3).filter(pl.col("x") > 1).slice(-1, 1))
+
+    def test_prefix_and_suffix_slices_lower_to_head_and_tail(self):
+        frame = ibex.DataFrame({"x": [3, 1, 2]}).lazy()
+        for query, clause in ((frame.head(2), "[head 2]"), (frame[:2], "[head 2]"),
+                              (frame.slice(0, 2**100), f"[head {2**63 - 1}]"),
+                              (frame.tail(2), "[tail 2]"), (frame[-2:], "[tail 2]"),
+                              (frame.slice(-2, 5), "[tail 2]"),
+                              (frame.sort("x").head(2), "[head 2]")):
+            with self.subTest(clause=clause):
+                text = query.explain()
+                self.assertIn(clause, text)
+                self.assertNotIn("seq()", text)
+        for query in (frame.slice(0), frame[:], frame[0:]):
+            self.assertEqual(query.explain(), "_ibex_input;")
+        # A slice that starts inside the input or ends before its last row
+        # still needs row positions.
+        for query in (frame.slice(1, 1), frame.slice(-3, 1), frame[:-1], frame[1:], frame[::2]):
+            self.assertIn("seq()", query.explain())
+        source = pl.LazyFrame({"x": [3, 1, 2]})
+        for query in (source.head(2), source.sort("x", descending=True).head(2), source.tail(2)):
+            self.equal(query)
 
     def test_row_positions_span_large_inputs(self):
         size = 150_003

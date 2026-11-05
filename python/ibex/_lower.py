@@ -368,6 +368,15 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             fields += ", " + ", ".join(f"{_identifier(expr._name)} = {render(expr)}" for expr in aggregates)
             source += f"[select {{ {fields} }}, by {{ {', '.join(_identifier(name) for name in keys)} }}]"
         elif operation in ("slice", "python_slice"):
+            edge = _slice_edge(operation, expressions)
+            if edge is not None:
+                # A prefix or suffix slice is a native head/tail, which the
+                # planner can fuse with an order into a top-k and which
+                # needs no row-number column or input height.
+                clause, count = edge
+                if clause is not None:
+                    source += f"[{clause} {min(count, 2**63 - 1)}]"
+                continue
             columns = schemas[index]
             row = f"_ibex_slice_row_{index}"
             while row in columns:
@@ -571,6 +580,33 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             fields = ", ".join(field(expr) for expr in expressions)
             source += f"[{operation} {{ {fields} }}]"
     return ((prefix, source) if _return_parts else prefix + source + ";"), tables, scalars
+
+
+def _slice_edge(operation, expressions):
+    """Return (clause, count) for a slice that keeps a prefix or a suffix.
+
+    clause is "head" or "tail", or None when the slice keeps every row.
+    Returns None when the slice needs row positions.
+    """
+    if operation == "slice":
+        offset, length = expressions
+        if offset == 0:
+            return (None, 0) if length is None else ("head", length)
+        # Polars clips [h + offset, h + offset + length) to the input, so
+        # a negative offset whose interval reaches the end is a suffix.
+        if offset < 0 and (length is None or offset + length >= 0):
+            return ("tail", -offset)
+        return None
+    start, stop, step = expressions
+    if step != 1:
+        return None
+    if start is None or start == 0:
+        if stop is None:
+            return (None, 0)
+        return ("head", stop) if stop >= 0 else None
+    if start < 0 and stop is None:
+        return ("tail", -start)
+    return None
 
 
 def _validate_types(frame, *, widen_numeric_inputs=False):

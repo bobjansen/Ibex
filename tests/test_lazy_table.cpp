@@ -2009,3 +2009,65 @@ TEST_CASE("LazyTable: a unit sliced from a cached whole column keeps its rows an
     // Every unit came from the cache, not a decode.
     CHECK(*decodes == 1);
 }
+
+TEST_CASE("LazyTable: a unit's join keys keep their nulls when a conjunct drops rows",
+          "[runtime][lazy_table][deferred_scan]") {
+    // The fallback with no membership filter: the conjunct is on another
+    // column, so null keys survive it and their validity has to be gathered
+    // through the selected rows, not copied from the unit's first rows.
+    const auto make = [](const std::shared_ptr<std::size_t>& decodes) {
+        runtime::Table schema;
+        schema.add_column("i", Column<std::int64_t>{});
+        schema.add_column("d", Column<double>{});
+        return runtime::LazyTable{
+            std::move(schema), kMixedRows,
+            [decodes]() -> std::expected<runtime::LazySourceReaderPtr, std::string> {
+                return runtime::LazySourceReaderPtr{std::make_unique<MixedReader>(decodes)};
+            }};
+    };
+    auto reference_lazy = make(std::make_shared<std::size_t>(0));
+    auto whole = reference_lazy.project({"i", "d"}, kExec);
+    REQUIRE(whole);
+    const auto* key = whole->find_entry("i");
+    const auto* other = whole->find_entry("d");
+    REQUIRE(key != nullptr);
+    REQUIRE(other != nullptr);
+    if (!key->validity.has_value() || !other->validity.has_value()) {
+        FAIL("the fixture's columns are nullable");
+        return;
+    }
+    const auto& key_valid = *key->validity;
+    const auto& other_valid = *other->validity;
+    const auto& other_values = std::get<Column<double>>(*other->column);
+
+    auto lazy = make(std::make_shared<std::size_t>(0));
+    std::vector<ir::Expr> conjuncts;
+    conjuncts.push_back(less_than("d", 60.0));
+    const runtime::DynamicScanFilter no_membership;
+    std::size_t null_keys = 0;
+    for (const auto& unit : lazy.scan_units()) {
+        INFO("unit start=" << unit.start);
+        auto phase = lazy.join_key_selection(conjuncts, kExec, nullptr, no_membership, "i", &unit);
+        REQUIRE(phase);
+        REQUIRE(phase->has_value());
+        const auto got = phase->value_or(runtime::LazyTable::JoinKeySelection{});
+        runtime::Selection expected;
+        for (std::size_t row = unit.start; row < unit.start + unit.rows; ++row) {
+            if (other_valid[row] && other_values[row] < 60.0) {
+                expected.push_back(row);
+            }
+        }
+        REQUIRE(got.selected == expected);
+        if (expected.empty() || expected.size() == unit.rows) {
+            continue;
+        }
+        REQUIRE(got.keys.validity.has_value());
+        const auto got_valid = got.keys.validity.value_or(runtime::ValidityBitmap{});
+        REQUIRE(got_valid.size() == expected.size());
+        for (std::size_t k = 0; k < expected.size(); ++k) {
+            CHECK(got_valid[k] == key_valid[expected[k]]);
+            null_keys += key_valid[expected[k]] ? 0 : 1;
+        }
+    }
+    CHECK(null_keys > 0);  // the case under test actually occurred
+}

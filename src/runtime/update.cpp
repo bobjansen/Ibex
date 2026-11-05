@@ -2924,10 +2924,12 @@ auto broadcast_general_group_aggregates(const Table& staged,
                               gather_column(*result->column, indices.data(), rows, &exec)),
                           .validity = std::nullopt};
         if (result->validity.has_value()) {
+            // The column above splits across row ranges; its validity takes
+            // the same 64-aligned ranges through the shared gather kernel.
             ValidityBitmap validity(rows, true);
-            for (std::size_t r = 0; r < rows; ++r) {
-                validity.set(r, (*result->validity)[indices[r]]);
-            }
+            for_row_ranges(&exec, rows, [&](std::size_t lo, std::size_t hi) {
+                gather_validity_range(validity, *result->validity, indices, lo, hi);
+            });
             entry.validity = std::move(validity);
         }
         broadcast.push_back(std::move(entry));
@@ -3757,9 +3759,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
             // with no validity bitmap and read the undefined null payload.
             if (entry.validity.has_value()) {
                 ValidityBitmap vb(row_idx.size(), true);
-                for (std::size_t k = 0; k < row_idx.size(); ++k) {
-                    vb.set(k, (*entry.validity)[row_idx[k]]);
-                }
+                gather_validity_range(vb, *entry.validity, row_idx, 0, row_idx.size());
                 sub.add_column(entry.name, std::move(gathered), std::move(vb));
             } else {
                 sub.add_column(entry.name, std::move(gathered));
@@ -5812,9 +5812,7 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
             // grouped_windowed_update_table).
             if (entry.validity.has_value()) {
                 ValidityBitmap vb(row_idx.size(), true);
-                for (std::size_t k = 0; k < row_idx.size(); ++k) {
-                    vb.set(k, (*entry.validity)[row_idx[k]]);
-                }
+                gather_validity_range(vb, *entry.validity, row_idx, 0, row_idx.size());
                 sub.add_column(entry.name, std::move(gathered), std::move(vb));
             } else {
                 sub.add_column(entry.name, std::move(gathered));

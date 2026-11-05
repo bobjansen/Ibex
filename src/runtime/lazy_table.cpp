@@ -1533,9 +1533,9 @@ auto LazyTable::unit_key_selection_fallback(const std::vector<ir::Expr>& conjunc
             gather_column(*entry->column, local.data(), local.size(), &exec));
         if (entry->validity.has_value()) {
             ValidityBitmap validity(local.size(), true);
-            for (std::size_t row = 0; row < local.size(); ++row) {
-                validity.set(row, (*entry->validity)[local[row]]);
-            }
+            gather_validity_range(validity, *entry->validity,
+                                  std::span<const std::size_t>{local.data(), local.size()}, 0,
+                                  local.size());
             out.keys.validity = std::move(validity);
         }
     }

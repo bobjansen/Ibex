@@ -6534,8 +6534,9 @@ class HashAggregateState final {
                         if (!gathers(a)) {
                             continue;
                         }
-                        auto [column, validity] = gather_entry_with_nulls(
-                            *agg_entries[a], at, n, std::numeric_limits<std::size_t>::max());
+                        // `at` holds real rows only: no sentinel to scan for.
+                        auto [column, validity] =
+                            gather_entry_with_nulls(*agg_entries[a], at, n, std::nullopt);
                         block.values[a].column = std::make_shared<ColumnValue>(std::move(column));
                         block.values[a].validity = std::move(validity);
                     }

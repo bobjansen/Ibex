@@ -290,9 +290,14 @@ auto find_candidate_time_column(const Table& side) -> std::optional<std::string>
 /// on a worker is `gather_entries`' decision, made once for all the columns.
 /// Passing a context here would re-open that decision per column, which is the
 /// per-column fan-out this batching exists to remove.
-auto gather_entry(const ColumnEntry& entry, const std::size_t* idx, std::size_t total)
-    -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
-    return gather_entry_with_nulls(entry, idx, total, kNull);
+///
+/// `has_sentinel` is the side's answer, scanned once by the caller; without it
+/// every column rescanned the whole index array for a sentinel it already knew
+/// was absent.
+auto gather_entry(const ColumnEntry& entry, const std::size_t* idx, std::size_t total,
+                  bool has_sentinel) -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
+    return gather_entry_with_nulls(entry, idx, total,
+                                   has_sentinel ? std::optional<std::size_t>{kNull} : std::nullopt);
 }
 
 /// True when `idx` holds at least one `kNull`, i.e. an output row with no
@@ -331,7 +336,7 @@ auto gather_entries(std::span<const GatherJob> jobs, std::size_t total,
         });
     }
     return gather_columns_batched(column_jobs, total, exec, [&](std::size_t j) -> GatheredColumn {
-        return gather_entry(*jobs[j].entry, jobs[j].idx, total);
+        return gather_entry(*jobs[j].entry, jobs[j].idx, total, jobs[j].has_sentinel);
     });
 }
 

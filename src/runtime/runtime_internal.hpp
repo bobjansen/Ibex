@@ -496,24 +496,26 @@ void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src,
     return hit != 0;
 }
 
-/// Bulk-gather rows from `src`, treating sentinel values (kNull = SIZE_MAX) as null positions
-/// that receive default values. Returns the new column plus a validity bitmap if any nulls exist.
-// n is the array length, kNull the sentinel value; distinct roles, not realistically
-// confusable at the handful of call sites.
+/// Bulk-gather rows from `src`, treating sentinel values (`null_index`, e.g. SIZE_MAX) as null
+/// positions that receive default values. Returns the new column plus a validity bitmap if any
+/// nulls exist. `null_index` is nullopt when the caller already knows `indices` holds no
+/// sentinel: the answer is the same, without a scan of the whole index array per column.
 [[nodiscard]] inline auto gather_column_with_nulls(const ColumnValue& src,
                                                    const std::size_t* indices, std::size_t n,
-                                                   std::size_t kNull, const ExecutionContext* exec)
+                                                   std::optional<std::size_t> null_index,
+                                                   const ExecutionContext* exec)
     -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
     auto gathered = std::visit(
         [&](const auto& col) -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
             using ColT = std::decay_t<decltype(col)>;
-            if (!index_contains(indices, n, kNull)) {
+            if (!null_index.has_value() || !index_contains(indices, n, *null_index)) {
                 // The no-sentinel fast path is a plain gather, so it gets the
                 // shared kernel and the caller's parallelism. The sentinel path
                 // below stays serial: it branches per row and writes a validity
                 // bit alongside each value, which is a different kernel.
                 return {gather_column(src, indices, n, exec), std::nullopt};
             }
+            const std::size_t kNull = *null_index;
             ValidityBitmap bm(n, true);
             if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
                 Column<Categorical>::codes_storage codes(n);
@@ -588,16 +590,21 @@ void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src,
 /// A gathered column and the validity bitmap that came with it.
 using GatheredColumn = std::pair<ColumnValue, std::optional<ValidityBitmap>>;
 
-/// Gather a whole column entry through `idx`, serially. A `kNull` index and a
-/// null source row both come out null, so the result carries the sentinel
-/// nulls and the source's own together.
+/// Gather a whole column entry through `idx`, serially. A `null_index` entry
+/// and a null source row both come out null, so the result carries the
+/// sentinel nulls and the source's own together. Pass nullopt when `idx` is
+/// known to hold no sentinel (see `gather_column_with_nulls`).
 [[nodiscard]] inline auto gather_entry_with_nulls(const ColumnEntry& entry, const std::size_t* idx,
-                                                  std::size_t total, std::size_t kNull)
+                                                  std::size_t total,
+                                                  std::optional<std::size_t> null_index)
     -> GatheredColumn {
-    auto [column, validity] = gather_column_with_nulls(*entry.column, idx, total, kNull, nullptr);
+    auto [column, validity] =
+        gather_column_with_nulls(*entry.column, idx, total, null_index, nullptr);
     if (!entry.validity.has_value()) {
         return {std::move(column), std::move(validity)};
     }
+    // No sentinel: every index is a real row, and SIZE_MAX is never one.
+    const std::size_t kNull = null_index.value_or(static_cast<std::size_t>(-1));
     ValidityBitmap bitmap =
         validity.has_value() ? std::move(*validity) : ValidityBitmap(total, true);
     for (std::size_t i = 0; i < total; ++i) {

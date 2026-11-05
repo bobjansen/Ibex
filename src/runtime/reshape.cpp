@@ -1658,7 +1658,10 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
     }
     auto gathered =
         gather_columns_batched(jobs, out_rows, exec, [&](std::size_t j) -> GatheredColumn {
-            return gather_entry_with_nulls(*sources[j], jobs[j].idx, out_rows, kMissingCell);
+            // `indivisible` is set exactly for the pivots with a missing cell.
+            return gather_entry_with_nulls(
+                *sources[j], jobs[j].idx, out_rows,
+                jobs[j].indivisible ? std::optional<std::size_t>{kMissingCell} : std::nullopt);
         });
 
     // A column keeps a validity bitmap only when it has a null to carry.

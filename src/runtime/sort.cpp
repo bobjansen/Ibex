@@ -913,6 +913,57 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
         flat_keys.push_back(std::move(fk));
     }
 
+    // Fold null-ness into the keys, so a null-bearing key takes the radix
+    // paths below instead of a serial comparison sort that reads the bitmap
+    // per comparison. Each nullable key gets a 0/1 "is null" key just ahead
+    // of it: always ascending, so nulls land last whatever the direction, and
+    // the null rows' own values are set equal, so the stable radix keeps them
+    // in input order. A lone string key is the exception: the comparator is
+    // its fallback anyway (high cardinality), and the multi-key radix would
+    // ordinal-encode it uncapped.
+    const bool lone_string = flat_keys.size() == 1 && flat_keys[0].kind == FlatKind::Str;
+    if (has_null_keys && !lone_string) {
+        std::vector<FlatKey> folded;
+        folded.reserve(flat_keys.size() * 2);
+        std::vector<std::uint8_t> valid_bytes;
+        for (auto& fk : flat_keys) {
+            if (fk.validity == nullptr) {
+                folded.push_back(std::move(fk));
+                continue;
+            }
+            valid_bytes.resize(rows);
+            unpack_validity_bytes(*fk.validity, 0, rows, valid_bytes.data());
+            FlatKey flag;
+            flag.kind = FlatKind::I64;
+            flag.u64.resize(rows);
+            for (std::size_t r = 0; r < rows; ++r) {
+                // Sign-flipped like every I64 key: 0 for a value, 1 for a null.
+                flag.u64[r] = static_cast<std::uint64_t>(1U - valid_bytes[r]) ^ kSignFlip;
+            }
+            for (std::size_t r = 0; r < rows; ++r) {
+                if (valid_bytes[r] != 0) {
+                    continue;
+                }
+                switch (fk.kind) {
+                    case FlatKind::I64:
+                        fk.u64[r] = kSignFlip;
+                        break;
+                    case FlatKind::F64:
+                        fk.f64[r] = 0.0;
+                        break;
+                    case FlatKind::Str:
+                        fk.str[r] = std::string_view{};
+                        break;
+                }
+            }
+            fk.validity = nullptr;
+            folded.push_back(std::move(flag));
+            folded.push_back(std::move(fk));
+        }
+        flat_keys = std::move(folded);
+        has_null_keys = false;
+    }
+
     // Fast path: a single dense-ranked key with few distinct values — counting
     // sort. One increment and one write per row over a bucket array that fits in
     // L1, against the general radix's EIGHT byte-histograms per row.

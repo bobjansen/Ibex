@@ -269,8 +269,11 @@ namespace {
 
 /// Seven rows; rows 1 and 4 are null. `rank` is each non-null row's position
 /// in ascending order, and every typed key below encodes it monotonically --
-/// including a genuine zero (rank 2), which is also what a null slot holds.
+/// including a genuine zero (rank 2). The null slots hold leftover values that
+/// would order row 4 before row 1 if a sort read them; nulls must keep input
+/// order instead.
 constexpr std::array<int, 7> kRank{3, -1, 1, 5, -1, 2, 4};
+constexpr std::array<int, 7> kNullPayload{0, 6, 0, 0, 0, 0, 0};
 
 auto null_ordering_table() -> runtime::TableRegistry {
     runtime::ValidityBitmap valid(kRank.size(), true);
@@ -282,19 +285,19 @@ auto null_ordering_table() -> runtime::TableRegistry {
     std::vector<Timestamp> stamps;
     std::vector<std::int64_t> row;
     for (std::size_t r = 0; r < kRank.size(); ++r) {
-        const int k = kRank[r];
-        const bool is_null = k < 0;
+        const bool is_null = kRank[r] < 0;
+        const int k = is_null ? kNullPayload[r] : kRank[r];
         if (is_null) {
             valid.set(r, false);
         }
-        i64.push_back(is_null ? 0 : k - 2);
-        f64.push_back(is_null ? 0.0 : (k * 1.5) - 3.0);
-        str.emplace_back(is_null ? "" : std::string(1, static_cast<char>('a' + k)));
-        // Dictionary deliberately not in value order: e, a, d, b, c, f.
-        constexpr std::array<int, 6> kCodeOf{1, 3, 4, 2, 0, 5};
-        codes.push_back(is_null ? 0 : kCodeOf[static_cast<std::size_t>(k)]);
-        dates.push_back(Date{.days = is_null ? 0 : k - 2});
-        stamps.push_back(Timestamp{.nanos = is_null ? 0 : k - 2});
+        i64.push_back(k - 2);
+        f64.push_back((k * 1.5) - 3.0);
+        str.emplace_back(1, static_cast<char>('a' + k));
+        // Dictionary deliberately not in value order: e, a, d, b, c, f, g.
+        constexpr std::array<int, 7> kCodeOf{1, 3, 4, 2, 0, 5, 6};
+        codes.push_back(kCodeOf[static_cast<std::size_t>(k)]);
+        dates.push_back(Date{.days = k - 2});
+        stamps.push_back(Timestamp{.nanos = k - 2});
         row.push_back(static_cast<std::int64_t>(r));
     }
     runtime::Table t;
@@ -302,7 +305,7 @@ auto null_ordering_table() -> runtime::TableRegistry {
     t.add_column("f", Column<double>{f64}, valid);
     t.add_column("s", Column<std::string>{str}, valid);
     t.add_column("c",
-                 Column<Categorical>{std::vector<std::string>{"e", "a", "d", "b", "c", "f"},
+                 Column<Categorical>{std::vector<std::string>{"e", "a", "d", "b", "c", "f", "g"},
                                      std::move(codes)},
                  valid);
     t.add_column("dt", Column<Date>{dates}, valid);

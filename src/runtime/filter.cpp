@@ -73,75 +73,28 @@ namespace ibex::runtime {
 
 // Column result: either a pointer into the table (zero-copy) or an owned computed column,
 // plus optional validity tracking for null propagation.
-namespace {
-
-/// Copy `n` bits starting at `off` into a dense bitmap. Bit-by-bit: an offset
-/// slice is generally not word-aligned, and this only runs when a borrowed
-/// column with nulls is read under a non-whole range.
-auto slice_validity(const ValidityBitmap& v, std::size_t off, std::size_t n) -> ValidityBitmap {
-    ValidityBitmap out(n, false);
-    for (std::size_t i = 0; i < n; ++i) {
-        out.set(i, v[off + i]);
-    }
-    return out;
-}
-
-}  // namespace
-
 auto merge_validity(const ValidityBitmap* a, std::size_t a_off, const ValidityBitmap* b,
                     std::size_t b_off, std::size_t n) -> std::optional<ValidityBitmap> {
     if (!a && !b)
         return std::nullopt;
-    // The word-wise path below assumes bit i of each input is row i AND that
-    // copying a whole source bitmap yields exactly `n` bits. A non-zero offset
-    // breaks the first; a range that starts at 0 but is shorter than the source
-    // breaks the second — it would return a bitmap of the source's length, not
-    // the range's. Both take the general path.
+    // Whole-width, unshifted operands keep the cheap paths: a shared copy of
+    // one side, or an owned copy ANDed word for word. A non-zero offset, or a
+    // range shorter than its source (whose copy would be the source's length,
+    // not `n`), reads through the word-wise slice instead.
     const bool exact_width = (a == nullptr || a->size() == n) && (b == nullptr || b->size() == n);
-    if (a_off != 0 || b_off != 0 || !exact_width) {
-        // Offset slice: build both sides dense, then AND.
+    if (a_off == 0 && b_off == 0 && exact_width) {
         if (!a)
-            return slice_validity(*b, b_off, n);
-        if (!b)
-            return slice_validity(*a, a_off, n);
-        ValidityBitmap out = slice_validity(*a, a_off, n);
-        if (a == b && a_off == b_off)
-            return out;
-        for (std::size_t i = 0; i < n; ++i) {
-            if (!(*b)[b_off + i]) {
-                out.set(i, false);
-            }
-        }
-        return out;
+            return ValidityBitmap(*b);
+        if (!b || a == b)
+            return ValidityBitmap(*a);
     }
     if (!a)
-        return ValidityBitmap(*b);
-    if (!b)
-        return ValidityBitmap(*a);
-    if (a == b)
-        return ValidityBitmap(*a);
-    ValidityBitmap out(*a);
-    if (b->buffer_offset() != 0) {
-        for (std::size_t i = 0; i < n; ++i) {
-            if (!(*b)[i]) {
-                out.set(i, false);
-            }
-        }
-        return out;
-    }
-    constexpr std::size_t kBitsPerWord = sizeof(ValidityBitmap::word_type) * 8;
-    const auto full_words = n / kBitsPerWord;
-    const auto tail_bits = n % kBitsPerWord;
-    auto* __restrict out_words = out.words_data();
-    const auto* __restrict b_words = b->words_data();
-
-    for (std::size_t w = 0; w < full_words; ++w) {
-        out_words[w] &= b_words[w];
-    }
-    if (tail_bits != 0) {
-        const auto mask = (ValidityBitmap::word_type{1} << tail_bits) - 1;
-        out_words[full_words] = (out_words[full_words] & ~mask) |
-                                ((out_words[full_words] & b_words[full_words]) & mask);
+        return slice_validity_bits(*b, b_off, n);
+    ValidityBitmap out = (a_off == 0 && a->size() == n && !a->is_external())
+                             ? ValidityBitmap(*a)
+                             : slice_validity_bits(*a, a_off, n);
+    if (b != nullptr && (a != b || a_off != b_off)) {
+        and_validity_bits(out, *b, b_off, n);
     }
     return out;
 }

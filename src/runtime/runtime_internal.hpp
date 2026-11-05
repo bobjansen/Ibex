@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -53,6 +54,99 @@ struct StringViewEq {
     }
 };
 
+// ─── Word-wise validity reads ────────────────────────────────────────────────
+//
+// A validity bitmap is read through its byte buffer (`buffer_data()` from
+// `buffer_offset()`), so an owned bitmap and an external Arrow slice at any bit
+// offset take the same path. `operator[]` per row re-tests for an external
+// buffer and reassembles one bit at a time; under a partial RowRange, which is
+// every morsel after the first, that was the whole cost of carrying nulls.
+
+static_assert(std::endian::native == std::endian::little,
+              "validity buffers are read as little-endian words");
+
+/// Bytes of `v`'s buffer a read may touch: exactly enough for its bits, so a
+/// load never runs past an external buffer sized to its slice.
+[[nodiscard]] inline auto validity_byte_count(const ValidityBitmap& v) noexcept -> std::size_t {
+    return (v.buffer_offset() + v.size() + 7) / 8;
+}
+
+/// The 64 bits of `bytes` starting at bit `bit`; bits past `byte_count` read 0.
+[[nodiscard]] inline auto load_bits64(const std::uint8_t* bytes, std::size_t byte_count,
+                                      std::size_t bit) noexcept -> std::uint64_t {
+    const std::size_t at = bit / 8;
+    const auto shift = static_cast<unsigned>(bit % 8);
+    const std::size_t avail = byte_count > at ? byte_count - at : 0;
+    std::uint64_t lo = 0;
+    if (avail >= 8) {
+        std::memcpy(&lo, bytes + at, sizeof(lo));
+    } else {
+        for (std::size_t k = 0; k < avail; ++k) {
+            lo |= std::uint64_t{bytes[at + k]} << (8 * k);
+        }
+    }
+    if (shift == 0) {
+        return lo;
+    }
+    const std::uint64_t hi = avail > 8 ? std::uint64_t{bytes[at + 8]} : 0;
+    return (lo >> shift) | (hi << (64 - shift));
+}
+
+/// Row `off + i` of `v` as a 0/1 byte in `out[i]`, for `i < n`. Writes nothing
+/// past `out + n`.
+inline void unpack_validity_bytes(const ValidityBitmap& v, std::size_t off, std::size_t n,
+                                  std::uint8_t* out) noexcept {
+    const std::uint8_t* bytes = v.buffer_data();
+    const std::size_t byte_count = validity_byte_count(v);
+    const std::size_t first = v.buffer_offset() + off;
+    // Spread 8 bits to 8 bytes: replicate the byte, keep bit k in byte k, then
+    // carry each nonzero byte (a single power of two) into its low bit.
+    const auto spread = [](std::uint64_t byte) noexcept {
+        const std::uint64_t x = (byte * 0x0101010101010101ULL) & 0x8040201008040201ULL;
+        return ((x + 0x7F7F7F7F7F7F7F7FULL) >> 7U) & 0x0101010101010101ULL;
+    };
+    std::size_t base = 0;
+    for (; base + 64 <= n; base += 64) {
+        const std::uint64_t word = load_bits64(bytes, byte_count, first + base);
+        for (unsigned k = 0; k < 64; k += 8) {
+            const std::uint64_t spread_bytes = spread((word >> k) & 0xFFU);
+            std::memcpy(out + base + k, &spread_bytes, sizeof(spread_bytes));
+        }
+    }
+    if (base < n) {
+        const std::uint64_t word = load_bits64(bytes, byte_count, first + base);
+        for (std::size_t i = base; i < n; ++i) {
+            out[i] = static_cast<std::uint8_t>((word >> (i - base)) & 1U);
+        }
+    }
+}
+
+/// AND rows `[off, off + n)` of `v` into the first `n` bits of `out` (which
+/// must hold at least `n` bits). Bits of `out` past `n` are left as they are.
+inline void and_validity_bits(ValidityBitmap& out, const ValidityBitmap& v, std::size_t off,
+                              std::size_t n) {
+    const std::uint8_t* bytes = v.buffer_data();
+    const std::size_t byte_count = validity_byte_count(v);
+    const std::size_t first = v.buffer_offset() + off;
+    auto* words = out.words_data();
+    const std::size_t full = n / 64;
+    for (std::size_t w = 0; w < full; ++w) {
+        words[w] &= load_bits64(bytes, byte_count, first + (w * 64));
+    }
+    if (const std::size_t tail = n % 64; tail != 0) {
+        const std::uint64_t keep_high = ~((std::uint64_t{1} << tail) - 1);
+        words[full] &= load_bits64(bytes, byte_count, first + (full * 64)) | keep_high;
+    }
+}
+
+/// Rows `[off, off + n)` of `v` as a dense owned bitmap of `n` bits.
+[[nodiscard]] inline auto slice_validity_bits(const ValidityBitmap& v, std::size_t off,
+                                              std::size_t n) -> ValidityBitmap {
+    ValidityBitmap out(n, true);
+    and_validity_bits(out, v, off, n);
+    return out;
+}
+
 struct Mask {
     /// One byte per row, and every filter kernel writes all of them — so the
     /// buffer is left uninitialized rather than filled first. The fill is a
@@ -69,10 +163,8 @@ struct Mask {
         if (v == nullptr) {
             return;
         }
-        valid.emplace(n, uint8_t{1});
-        for (std::size_t i = 0; i < n; ++i) {
-            (*valid)[i] = static_cast<uint8_t>((*v)[off + i]);
-        }
+        valid.emplace(n);
+        unpack_validity_bytes(*v, off, n, valid->data());
     }
 };
 

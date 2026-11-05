@@ -21,9 +21,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <type_traits>
@@ -32,6 +34,7 @@
 #include <vector>
 
 #include "interpreter_internal.hpp"
+#include "runtime_internal.hpp"
 
 using namespace ibex;
 using runtime::ColumnValue;
@@ -628,4 +631,121 @@ TEST_CASE("NaN-high comparisons preserve nulls and sliced operands",
         runtime::filter_table(table, cmp(ir::CompareOp::Eq, col_ref("a"), dlit(nan)), nullptr);
     REQUIRE(ordinary.has_value());
     CHECK(ordinary->rows() == 0);
+}
+
+namespace {
+
+/// A bitmap of `bits` rows with a pattern no word-wise shortcut reproduces by
+/// accident: runs, isolated bits and word-straddling stretches.
+auto patterned_bits(std::size_t bits, std::uint64_t seed) -> std::vector<bool> {
+    std::vector<bool> out(bits);
+    std::uint64_t x = seed;
+    for (std::size_t i = 0; i < bits; ++i) {
+        x = (x * 6364136223846793005ULL) + 1442695040888963407ULL;
+        out[i] = ((x >> 33U) % 5U) != 0U;
+    }
+    return out;
+}
+
+/// The same rows as an owned bitmap and as an external (Arrow) slice whose
+/// buffer is exactly as long as its bits need, starting `ext_off` bits in.
+struct BitmapPair {
+    runtime::ValidityBitmap owned;
+    runtime::ValidityBitmap external;
+};
+
+auto make_bitmap_pair(const std::vector<bool>& rows, std::size_t ext_off) -> BitmapPair {
+    BitmapPair pair{.owned = runtime::ValidityBitmap(rows), .external = {}};
+    auto buffer = std::make_shared<std::vector<std::uint8_t>>((ext_off + rows.size() + 7) / 8,
+                                                              std::uint8_t{0xA5});
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        const std::size_t bit = ext_off + i;
+        auto& byte = (*buffer)[bit / 8];
+        const auto mask = static_cast<std::uint8_t>(1U << (bit % 8));
+        byte = rows[i] ? static_cast<std::uint8_t>(byte | mask)
+                       : static_cast<std::uint8_t>(byte & ~mask);
+    }
+    pair.external =
+        runtime::ValidityBitmap::from_external(buffer, buffer->data(), ext_off, rows.size());
+    return pair;
+}
+
+}  // namespace
+
+TEST_CASE("word-wise validity reads match per-bit reads at any offset",
+          "[runtime][filter][validity]") {
+    constexpr std::size_t kRows = 300;
+    const auto rows = patterned_bits(kRows, 7);
+    for (const std::size_t ext_off : {std::size_t{0}, std::size_t{3}, std::size_t{13}}) {
+        const auto pair = make_bitmap_pair(rows, ext_off);
+        for (const auto* source : {&pair.owned, &pair.external}) {
+            for (std::size_t off = 0; off < 140; off += (off < 70 ? 1 : 7)) {
+                for (std::size_t n = 0; off + n <= kRows; n += (n < 70 ? 1 : 13)) {
+                    INFO("ext_off=" << ext_off << " external=" << (source == &pair.external)
+                                    << " off=" << off << " n=" << n);
+                    std::vector<std::uint8_t> bytes(n + 1, std::uint8_t{0xEE});
+                    runtime::unpack_validity_bytes(*source, off, n, bytes.data());
+                    const auto sliced = runtime::slice_validity_bits(*source, off, n);
+                    REQUIRE(sliced.size() == n);
+                    REQUIRE_FALSE(sliced.is_external());
+                    auto anded = runtime::ValidityBitmap(n, true);
+                    runtime::and_validity_bits(anded, *source, off, n);
+                    for (std::size_t i = 0; i < n; ++i) {
+                        REQUIRE(bytes[i] == static_cast<std::uint8_t>(rows[off + i]));
+                        REQUIRE(sliced[i] == rows[off + i]);
+                        REQUIRE(anded[i] == rows[off + i]);
+                    }
+                    REQUIRE(bytes[n] == 0xEE);  // nothing written past n
+                    // ANDing into a longer bitmap leaves its rows past n alone.
+                    auto wider = runtime::ValidityBitmap(n + 70, true);
+                    runtime::and_validity_bits(wider, *source, off, n);
+                    for (std::size_t i = n; i < n + 70; ++i) {
+                        REQUIRE(wider[i]);
+                    }
+                    // Tail bits past n stay clear, so word-wise consumers of
+                    // the result (merge, popcount) never see stale rows.
+                    if (n % 64 != 0) {
+                        const auto last = sliced.words_data()[n / 64];
+                        REQUIRE((last >> (n % 64)) == 0U);
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("merge_validity and Mask::apply_validity read sliced operands row by row",
+          "[runtime][filter][validity]") {
+    constexpr std::size_t kRows = 260;
+    const auto a_rows = patterned_bits(kRows, 11);
+    const auto b_rows = patterned_bits(kRows, 29);
+    const auto a = make_bitmap_pair(a_rows, 5);
+    const auto b = make_bitmap_pair(b_rows, 0);
+    for (const auto* av : {&a.owned, &a.external}) {
+        for (const auto* bv : {&b.owned, &b.external}) {
+            for (const auto [a_off, b_off, n] :
+                 {std::array<std::size_t, 3>{0, 0, kRows}, {0, 0, 200}, {1, 0, 190},
+                  {0, 63, 197}, {64, 64, 130}, {77, 3, 129}, {5, 5, 255}}) {
+                INFO("a_off=" << a_off << " b_off=" << b_off << " n=" << n);
+                const auto merged_opt = runtime::merge_validity(av, a_off, bv, b_off, n);
+                REQUIRE(merged_opt.has_value());
+                const auto merged = merged_opt.value_or(runtime::ValidityBitmap{});
+                REQUIRE(merged.size() == n);
+                const auto a_only_opt = runtime::merge_validity(av, a_off, nullptr, 0, n);
+                REQUIRE(a_only_opt.has_value());
+                const auto a_only = a_only_opt.value_or(runtime::ValidityBitmap{});
+                REQUIRE(a_only.size() == n);
+                runtime::Mask mask;
+                mask.apply_validity(av, a_off, n);
+                REQUIRE(mask.valid.has_value());
+                const auto valid = mask.valid.value_or(std::vector<std::uint8_t>{});
+                REQUIRE(valid.size() == n);
+                for (std::size_t i = 0; i < n; ++i) {
+                    REQUIRE(merged[i] == (a_rows[a_off + i] && b_rows[b_off + i]));
+                    REQUIRE(a_only[i] == a_rows[a_off + i]);
+                    REQUIRE(valid[i] == static_cast<std::uint8_t>(a_rows[a_off + i]));
+                }
+            }
+        }
+    }
 }

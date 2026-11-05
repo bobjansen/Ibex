@@ -16,6 +16,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <expected>
 #include <initializer_list>
 #include <map>
@@ -179,6 +180,29 @@ class ValidityBitmap {
         words_.back() &= low_bits_mask(rem);
     }
 
+    /// The 64 bits of `bytes` starting at bit `bit`, LSB first; bits past
+    /// `byte_count` read as zero, so a load never runs off an external buffer
+    /// sized to its slice.
+    static auto load_word(const std::uint8_t* bytes, size_type byte_count, size_type bit) noexcept
+        -> word_type {
+        const size_type at = bit / 8;
+        const auto shift = static_cast<unsigned>(bit % 8);
+        const size_type avail = byte_count > at ? byte_count - at : 0;
+        word_type lo = 0;
+        if (avail >= sizeof(word_type)) {
+            std::memcpy(&lo, bytes + at, sizeof(lo));
+        } else {
+            for (size_type k = 0; k < avail; ++k) {
+                lo |= word_type{bytes[at + k]} << (8 * k);
+            }
+        }
+        if (shift == 0) {
+            return lo;
+        }
+        const word_type hi = avail > sizeof(word_type) ? word_type{bytes[at + 8]} : 0;
+        return (lo >> shift) | (hi << (kBitsPerWord - shift));
+    }
+
     auto drop_external() noexcept -> void {
         external_owner_.reset();
         external_data_ = nullptr;
@@ -311,8 +335,53 @@ class ValidityBitmap {
         words_.resize(new_words, 0);
         size_bits_ = count_bits;
         if (value) {
-            for (size_type i = old_size; i < count_bits; ++i) {
-                set(i, true);
+            // Whole words, not a set() per bit: the bits past `old_size` in
+            // its word are zero (the tail invariant), so OR-ing them on is safe.
+            size_type w = word_index(old_size);
+            if (bit_offset(old_size) != 0) {
+                words_[w] |= ~low_bits_mask(bit_offset(old_size));
+                ++w;
+            }
+            for (; w < new_words; ++w) {
+                words_[w] = ~word_type{0};
+            }
+            clear_unused_tail_bits();
+        }
+    }
+
+    /// Append the first `count` bits of `src` (owned, or an external slice at
+    /// any offset; `count <= src.size()`) after the last bit of this bitmap, a
+    /// word at a time.
+    auto append(const ValidityBitmap& src, size_type count) -> void {
+        if (&src == this) {
+            // Not unnecessary: `src` is `*this`, and the resize below would
+            // move the words it is read from.
+            // NOLINTNEXTLINE(performance-unnecessary-copy-initialization)
+            const ValidityBitmap copy = src;
+            append(copy, count);
+            return;
+        }
+        const size_type n = std::min(count, src.size_bits_);
+        if (n == 0) {
+            return;
+        }
+        detach_external();
+        const size_type old_size = size_bits_;
+        // Geometric growth from `resize`, never an exact `reserve`: a concat
+        // appends once per chunk, and an exact reservation each time would
+        // reallocate and copy the whole bitmap per chunk.
+        words_.resize(words_for_bits(old_size + n), 0);
+        size_bits_ = old_size + n;
+        const std::uint8_t* bytes = src.buffer_data();
+        const size_type first = src.buffer_offset();
+        const size_type byte_count = (first + n + 7) / 8;
+        const auto shift = static_cast<unsigned>(bit_offset(old_size));
+        size_type dst = word_index(old_size);
+        for (size_type b = 0; b < n; b += kBitsPerWord, ++dst) {
+            const word_type w = load_word(bytes, byte_count, first + b) & low_bits_mask(n - b);
+            words_[dst] |= w << shift;
+            if (shift != 0 && dst + 1 < words_.size()) {
+                words_[dst + 1] |= w >> (kBitsPerWord - shift);
             }
         }
     }

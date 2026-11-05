@@ -194,15 +194,13 @@ inline void materialize_append_validity(std::optional<ValidityBitmap>& dst_valid
         // The result was implicitly all-valid so far; materialize that prefix.
         dst_valid.emplace(prev_rows, true);
     }
-    dst_valid->reserve(prev_rows + src_rows);
+    // Word-wise either way. A push_back(operator[]) per row was 5% of a 1-core
+    // grouped update over a nullable 1e7-row table, and an exact reserve() per
+    // chunk reallocated the whole bitmap each time.
     if (src_valid.has_value()) {
-        for (std::size_t r = 0; r < src_rows; ++r) {
-            dst_valid->push_back((*src_valid)[r]);
-        }
+        dst_valid->append(*src_valid, src_rows);
     } else {
-        for (std::size_t r = 0; r < src_rows; ++r) {
-            dst_valid->push_back(true);
-        }
+        dst_valid->resize(prev_rows + src_rows, true);
     }
 }
 

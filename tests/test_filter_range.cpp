@@ -14,6 +14,7 @@
 #include <ibex/core/column.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/table_compare.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
@@ -934,5 +935,82 @@ TEST_CASE("and_validity_into_bytes clears exactly the null rows at any offset",
                 }
             }
         }
+    }
+}
+
+TEST_CASE("ValidityBitmap append and an all-valid resize keep every bit at any alignment",
+          "[runtime][validity]") {
+    const auto head_rows = patterned_bits(200, 5);
+    const auto tail_rows = patterned_bits(200, 23);
+    for (const std::size_t head :
+         {std::size_t{0}, std::size_t{1}, std::size_t{63}, std::size_t{64}, std::size_t{100}}) {
+        for (const std::size_t ext_off : {std::size_t{0}, std::size_t{3}}) {
+            const auto pair = make_bitmap_pair(tail_rows, ext_off);
+            for (const auto* source : {&pair.owned, &pair.external}) {
+                for (const std::size_t count : {std::size_t{0}, std::size_t{1}, std::size_t{64},
+                                                std::size_t{129}, tail_rows.size()}) {
+                    INFO("head=" << head << " ext_off=" << ext_off << " external="
+                                 << (source == &pair.external) << " count=" << count);
+                    const std::vector<bool> prefix(
+                        head_rows.begin(), head_rows.begin() + static_cast<std::ptrdiff_t>(head));
+                    runtime::ValidityBitmap appended(prefix);
+                    appended.append(*source, count);
+                    runtime::ValidityBitmap filled(prefix);
+                    filled.resize(head + count, true);
+                    REQUIRE(appended.size() == head + count);
+                    REQUIRE(filled.size() == head + count);
+                    for (std::size_t i = 0; i < head; ++i) {
+                        REQUIRE(appended[i] == head_rows[i]);
+                        REQUIRE(filled[i] == head_rows[i]);
+                    }
+                    for (std::size_t i = 0; i < count; ++i) {
+                        REQUIRE(appended[head + i] == tail_rows[i]);
+                        REQUIRE(filled[head + i]);
+                    }
+                    // Tail bits past size stay clear for word-wise readers.
+                    for (const auto* bm : {&appended, &filled}) {
+                        if (const std::size_t rem = bm->size() % 64; rem != 0) {
+                            REQUIRE((bm->words_data()[bm->size() / 64] >> rem) == 0U);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Appending a bitmap to itself doubles it.
+    runtime::ValidityBitmap self(head_rows);
+    self.append(self, self.size());
+    REQUIRE(self.size() == 2 * head_rows.size());
+    for (std::size_t i = 0; i < self.size(); ++i) {
+        REQUIRE(self[i] == head_rows[i % head_rows.size()]);
+    }
+}
+
+TEST_CASE("materialize_append_validity concatenates chunk bitmaps and all-valid chunks",
+          "[runtime][validity]") {
+    // Chunks of uneven size, alternating nullable and all-valid, starting with
+    // an all-valid one so the prefix backfill runs too.
+    const std::array<std::size_t, 5> sizes{70, 33, 64, 1, 90};
+    std::optional<runtime::ValidityBitmap> result;
+    std::vector<bool> expected;
+    std::size_t rows = 0;
+    for (std::size_t c = 0; c < sizes.size(); ++c) {
+        std::optional<runtime::ValidityBitmap> chunk;
+        if (c % 2 == 1) {
+            const auto bits = patterned_bits(sizes[c], 100 + c);
+            chunk = make_bitmap_pair(bits, c).external;
+            expected.insert(expected.end(), bits.begin(), bits.end());
+        } else {
+            expected.insert(expected.end(), sizes[c], true);
+        }
+        runtime::materialize_append_validity(result, rows, chunk, sizes[c]);
+        rows += sizes[c];
+    }
+    REQUIRE(result.has_value());
+    const auto bitmap = result.value_or(runtime::ValidityBitmap{});
+    REQUIRE(bitmap.size() == expected.size());
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        INFO("row " << i);
+        REQUIRE(bitmap[i] == expected[i]);
     }
 }

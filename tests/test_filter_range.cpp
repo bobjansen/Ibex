@@ -749,3 +749,82 @@ TEST_CASE("merge_validity and Mask::apply_validity read sliced operands row by r
         }
     }
 }
+
+TEST_CASE("categorical columns over one dictionary compare by code under a partial range",
+          "[runtime][filter][categorical]") {
+    using Cat = Column<Categorical>;
+    // Sorted, so code order is string order and the expected rows can be
+    // derived from the strings themselves.
+    const std::vector<std::string> words{"a", "b", "c", "d", "e"};
+    const auto dict = std::make_shared<std::vector<std::string>>(words);
+    const auto index = std::make_shared<Cat::index_map>();
+    for (std::size_t i = 0; i < words.size(); ++i) {
+        index->emplace(words[i], static_cast<Cat::code_type>(i));
+    }
+    constexpr std::size_t kRows = 157;
+    Column<std::int64_t> ids;
+    Cat left{dict, index, Cat::codes_storage{}};
+    Cat right{dict, index, Cat::codes_storage{}};
+    std::vector<std::size_t> lw(kRows);
+    std::vector<std::size_t> rw(kRows);
+    const auto right_valid = patterned_bits(kRows, 3);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        lw[i] = (i * 7U) % words.size();
+        rw[i] = ((i * 3U) + 1U) % words.size();
+        ids.push_back(static_cast<std::int64_t>(i));
+        left.push_back(words[lw[i]]);
+        right.push_back(words[rw[i]]);
+    }
+    REQUIRE(left.dictionary_identity() == right.dictionary_identity());
+    runtime::Table table;
+    table.add_column("id", ColumnValue{std::move(ids)});
+    table.add_column("l", ColumnValue{std::move(left)});
+    table.add_column("r", ColumnValue{std::move(right)}, runtime::ValidityBitmap(right_valid));
+    const RowRange range{.begin = 13, .count = 130};
+    for (auto op : {ir::CompareOp::Eq, ir::CompareOp::Ne, ir::CompareOp::Lt, ir::CompareOp::Le,
+                    ir::CompareOp::Gt, ir::CompareOp::Ge}) {
+        for (const bool literal : {false, true}) {
+            INFO("op=" << static_cast<int>(op) << " literal=" << literal);
+            auto result = runtime::filter_table_range(
+                table, cmp(op, col_ref("l"), literal ? slit("c") : col_ref("r")), range, nullptr);
+            REQUIRE(result.has_value());
+            std::vector<std::int64_t> expected;
+            for (std::size_t i = range.begin; i < range.begin + range.count; ++i) {
+                if (!literal && !right_valid[i]) {
+                    continue;
+                }
+                const auto x = lw[i];
+                const auto y = literal ? std::size_t{2} : rw[i];
+                bool keep = false;
+                switch (op) {
+                    case ir::CompareOp::Eq:
+                        keep = x == y;
+                        break;
+                    case ir::CompareOp::Ne:
+                        keep = x != y;
+                        break;
+                    case ir::CompareOp::Lt:
+                        keep = x < y;
+                        break;
+                    case ir::CompareOp::Le:
+                        keep = x <= y;
+                        break;
+                    case ir::CompareOp::Gt:
+                        keep = x > y;
+                        break;
+                    case ir::CompareOp::Ge:
+                        keep = x >= y;
+                        break;
+                }
+                if (keep) {
+                    expected.push_back(static_cast<std::int64_t>(i));
+                }
+            }
+            const auto& actual = std::get<Column<std::int64_t>>(*result->columns[0].column);
+            REQUIRE(actual.size() == expected.size());
+            for (std::size_t i = 0; i < expected.size(); ++i) {
+                CHECK(actual[i] == expected[i]);
+            }
+        }
+    }
+}

@@ -669,15 +669,19 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, std::size_t of
         }
         if (const auto* cat_col = std::get_if<Column<Categorical>>(&col)) {
             if (auto code = cat_col->find_code(*s)) {
-                const auto* codes = cat_col->codes().data();
+                // codes_data(), not codes(): on external (Arrow) codes, codes()
+                // copies the whole column into a cache on first use, from
+                // whichever morsel gets there first.
+                const auto* codes = cat_col->codes_data() + off;
+                const auto wanted = *code;
                 switch (op) {
                     case ir::CompareOp::Eq:
                         for (std::size_t i = 0; i < n; ++i)
-                            mp[i] = codes[off + i] == *code;
+                            mp[i] = codes[i] == wanted;
                         break;
                     case ir::CompareOp::Ne:
                         for (std::size_t i = 0; i < n; ++i)
-                            mp[i] = codes[off + i] != *code;
+                            mp[i] = codes[i] != wanted;
                         break;
                     case ir::CompareOp::Lt:
                         for (std::size_t i = 0; i < n; ++i)
@@ -1009,34 +1013,11 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, std::size_t lhs_off,
     if (const auto* l = std::get_if<Column<Categorical>>(&lhs)) {
         if (const auto* r = std::get_if<Column<Categorical>>(&rhs)) {
             if (l->dictionary_identity() == r->dictionary_identity()) {
-                const auto* lc = l->codes().data() + lhs_off;
-                const auto* rc = r->codes().data() + rhs_off;
-                switch (op) {
-                    case ir::CompareOp::Eq:
-                        for (std::size_t i = 0; i < n; ++i)
-                            mp[i] = lc[i] == rc[i];
-                        break;
-                    case ir::CompareOp::Ne:
-                        for (std::size_t i = 0; i < n; ++i)
-                            mp[i] = lc[i] != rc[i];
-                        break;
-                    case ir::CompareOp::Lt:
-                        for (std::size_t i = 0; i < n; ++i)
-                            mp[i] = lc[i] < rc[i];
-                        break;
-                    case ir::CompareOp::Le:
-                        for (std::size_t i = 0; i < n; ++i)
-                            mp[i] = lc[i] <= rc[i];
-                        break;
-                    case ir::CompareOp::Gt:
-                        for (std::size_t i = 0; i < n; ++i)
-                            mp[i] = lc[i] > rc[i];
-                        break;
-                    case ir::CompareOp::Ge:
-                        for (std::size_t i = 0; i < n; ++i)
-                            mp[i] = lc[i] >= rc[i];
-                        break;
-                }
+                // Shared dictionary: compare the codes. Through cmp_into for
+                // its __restrict pointers: the byte store into mp
+                // may otherwise alias the code arrays and the trip count, and
+                // the loops never vectorized.
+                cmp_into(op, l->codes_data() + lhs_off, r->codes_data() + rhs_off, mp, n);
                 return return_with_validity();
             }
             cmp_string_views(*l, *r);

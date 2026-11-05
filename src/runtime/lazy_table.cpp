@@ -19,6 +19,7 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <robin_hood.h>
 #include <set>
@@ -1048,6 +1049,56 @@ auto LazyTable::project_where(const std::set<std::string>& names,
     return out;
 }
 
+namespace {
+
+/// Rows `[start, start + rows)` of `src` as a new column. Contiguous storage
+/// (numbers, dates, decimals, categorical codes) is copied straight across;
+/// the bit-packed Bool and the offset-based String take the gather kernel over
+/// an index range instead. Either way `exec` splits the work as a gather would.
+auto copy_row_range(const ColumnValue& src, std::size_t start, std::size_t rows,
+                    const ExecutionContext* exec) -> ColumnValue {
+    ColumnValue out = make_gather_column(src, rows);
+    const bool copied = std::visit(
+        [&](auto& dst) -> bool {
+            using ColT = std::decay_t<decltype(dst)>;
+            const auto& col = std::get<ColT>(src);
+            if constexpr (std::is_same_v<ColT, Column<std::string>> ||
+                          std::is_same_v<ColT, Column<bool>>) {
+                return false;
+            } else {
+                // Mutable access detaches, so take both pointers once, before
+                // the ranges run.
+                const auto* from = [&] {
+                    if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                        return col.codes_data() + start;
+                    } else {
+                        return col.data() + start;
+                    }
+                }();
+                auto* to = [&] {
+                    if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                        return dst.codes_data();
+                    } else {
+                        return dst.data();
+                    }
+                }();
+                for_row_ranges(exec, rows, [&](std::size_t lo, std::size_t hi) {
+                    std::copy(from + lo, from + hi, to + lo);
+                });
+                return true;
+            }
+        },
+        out);
+    if (copied) {
+        return out;
+    }
+    Selection idx(rows);
+    std::ranges::iota(idx, start);
+    return gather_column(src, idx.data(), rows, exec);
+}
+
+}  // namespace
+
 auto LazyTable::project_unit(const std::set<std::string>& names, const SourceUnit& unit,
                              const ExecutionContext& exec) -> std::expected<Table, std::string> {
     std::vector<std::string> missing;
@@ -1072,24 +1123,13 @@ auto LazyTable::project_unit(const std::set<std::string>& names, const SourceUni
     // A column another query already decoded whole is sliced rather than
     // re-read: the pages are gone from the equation, and the copy is exactly
     // this unit's rows.
-    Selection unit_rows;
     const auto slice_of = [&](const ColumnEntry& entry) -> ColumnEntry {
-        if (unit_rows.empty() && unit.rows != 0) {
-            unit_rows.resize(unit.rows);
-            for (std::size_t row = 0; row < unit.rows; ++row) {
-                unit_rows[row] = unit.start + row;
-            }
-        }
         ColumnEntry sliced;
         sliced.name = entry.name;
         sliced.column = std::make_shared<ColumnValue>(
-            gather_column(*entry.column, unit_rows.data(), unit_rows.size(), &exec));
+            copy_row_range(*entry.column, unit.start, unit.rows, &exec));
         if (entry.validity.has_value()) {
-            ValidityBitmap bits(unit.rows, true);
-            for (std::size_t row = 0; row < unit.rows; ++row) {
-                bits.set(row, (*entry.validity)[unit.start + row]);
-            }
-            sliced.validity = std::move(bits);
+            sliced.validity = slice_validity_bits(*entry.validity, unit.start, unit.rows);
         }
         return sliced;
     };

@@ -19,6 +19,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -1872,4 +1873,139 @@ TEST_CASE("LazyTable: bound ranges use the source key scan with fresh values",
     for (const auto& call : state->decode_calls) {
         CHECK(std::ranges::find(call, "n") == call.end());
     }
+}
+
+namespace {
+
+/// A source of every column layout a unit slice copies differently: plain
+/// values (Int64, Double), categorical codes, bit-packed Bool and offset-based
+/// String, with nulls in each. Units are uneven and straddle 64-row words, so a
+/// slice has to read its validity from an unaligned bit.
+constexpr std::size_t kMixedRows = 300;
+constexpr std::array<runtime::SourceUnit, 3> kMixedUnits{
+    runtime::SourceUnit{.start = 0, .rows = 70}, runtime::SourceUnit{.start = 70, .rows = 133},
+    runtime::SourceUnit{.start = 203, .rows = 97}};
+
+auto mixed_null(std::size_t row, std::size_t salt) -> bool {
+    return ((row * 7) + salt) % 5 == 0;
+}
+
+class MixedReader final : public runtime::LazySourceReader {
+   public:
+    explicit MixedReader(std::shared_ptr<std::size_t> decodes) : decodes_(std::move(decodes)) {}
+
+    auto decode_units() -> std::vector<runtime::SourceUnit> override {
+        return {kMixedUnits.begin(), kMixedUnits.end()};
+    }
+
+    auto decode(const std::vector<std::string>& names, const runtime::Selection* /*selection*/,
+                const runtime::SourceUnit* unit, const runtime::ExecutionContext& /*exec*/)
+        -> std::expected<runtime::Table, std::string> override {
+        ++*decodes_;
+        const std::size_t begin = unit == nullptr ? 0 : unit->start;
+        const std::size_t rows = unit == nullptr ? kMixedRows : unit->rows;
+        runtime::Table out;
+        for (std::size_t c = 0; c < names.size(); ++c) {
+            runtime::ValidityBitmap validity(rows, true);
+            for (std::size_t i = 0; i < rows; ++i) {
+                validity.set(i, !mixed_null(begin + i, c));
+            }
+            const auto& name = names[c];
+            if (name == "i") {
+                std::vector<std::int64_t> values(rows);
+                std::ranges::iota(values, static_cast<std::int64_t>(begin));
+                out.add_column(name, Column<std::int64_t>{std::move(values)}, std::move(validity));
+            } else if (name == "d") {
+                std::vector<double> values(rows);
+                for (std::size_t i = 0; i < rows; ++i) {
+                    values[i] = static_cast<double>(begin + i) / 4.0;
+                }
+                out.add_column(name, Column<double>{std::move(values)}, std::move(validity));
+            } else if (name == "c") {
+                Column<Categorical>::codes_storage codes(rows);
+                for (std::size_t i = 0; i < rows; ++i) {
+                    codes[i] = static_cast<Column<Categorical>::code_type>((begin + i) % 3);
+                }
+                out.add_column(
+                    name,
+                    Column<Categorical>{std::vector<std::string>{"p", "q", "r"}, std::move(codes)},
+                    std::move(validity));
+            } else if (name == "b") {
+                std::vector<bool> values(rows);
+                for (std::size_t i = 0; i < rows; ++i) {
+                    values[i] = ((begin + i) % 3) == 1;
+                }
+                out.add_column(name, Column<bool>{values}, std::move(validity));
+            } else {
+                std::vector<std::string> values;
+                values.reserve(rows);
+                for (std::size_t i = 0; i < rows; ++i) {
+                    values.push_back("s" + std::to_string(begin + i));
+                }
+                out.add_column(name, Column<std::string>{values}, std::move(validity));
+            }
+        }
+        out.logical_rows = rows;
+        return out;
+    }
+
+   private:
+    std::shared_ptr<std::size_t> decodes_;
+};
+
+}  // namespace
+
+TEST_CASE("LazyTable: a unit sliced from a cached whole column keeps its rows and nulls",
+          "[runtime][lazy_table][stream]") {
+    auto decodes = std::make_shared<std::size_t>(0);
+    runtime::Table schema;
+    schema.add_column("i", Column<std::int64_t>{});
+    schema.add_column("d", Column<double>{});
+    schema.add_column("c", Column<Categorical>{});
+    schema.add_column("b", Column<bool>{});
+    schema.add_column("s", Column<std::string>{});
+    runtime::LazyTable lazy{
+        std::move(schema), kMixedRows,
+        [decodes]() -> std::expected<runtime::LazySourceReaderPtr, std::string> {
+            return runtime::LazySourceReaderPtr{std::make_unique<MixedReader>(decodes)};
+        }};
+    const std::set<std::string> names{"i", "d", "c", "b", "s"};
+    auto whole = lazy.project(names, kExec);
+    REQUIRE(whole);
+    REQUIRE(*decodes == 1);
+
+    for (const auto& unit : lazy.scan_units()) {
+        INFO("unit start=" << unit.start);
+        auto part = lazy.project_where_unit(names, {}, unit, kExec);
+        REQUIRE(part);
+        REQUIRE(part->rows() == unit.rows);
+        for (const auto& name : names) {
+            INFO("column " << name);
+            const auto* sliced = part->find_entry(name);
+            const auto* source = whole->find_entry(name);
+            REQUIRE(sliced != nullptr);
+            REQUIRE(source != nullptr);
+            if (!sliced->validity.has_value() || !source->validity.has_value()) {
+                FAIL("a nullable column lost its validity");
+                continue;
+            }
+            const auto& got_valid = *sliced->validity;
+            const auto& want_valid = *source->validity;
+            REQUIRE(got_valid.size() == unit.rows);
+            REQUIRE(sliced->column->index() == source->column->index());
+            std::visit(
+                [&](const auto& got) {
+                    using ColT = std::decay_t<decltype(got)>;
+                    const auto& want = std::get<ColT>(*source->column);
+                    REQUIRE(got.size() == unit.rows);
+                    for (std::size_t row = 0; row < unit.rows; ++row) {
+                        CHECK(got[row] == want[unit.start + row]);
+                        CHECK(got_valid[row] == want_valid[unit.start + row]);
+                    }
+                },
+                *sliced->column);
+        }
+    }
+    // Every unit came from the cache, not a decode.
+    CHECK(*decodes == 1);
 }

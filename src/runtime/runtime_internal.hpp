@@ -472,6 +472,30 @@ void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src,
     return out;
 }
 
+/// True when `value` occurs in `idx[0, n)`. The usual question is "did a join
+/// emit any null sentinel", and the usual answer is no, so the whole index is
+/// read: it goes as a vectorized OR over fixed blocks, stopping at the first
+/// block with a hit, where a test-and-exit per row stays scalar.
+[[nodiscard]] inline auto index_contains(const std::size_t* idx, std::size_t n,
+                                         std::size_t value) noexcept -> bool {
+    constexpr std::size_t kBlock = 512;
+    std::size_t i = 0;
+    for (; i + kBlock <= n; i += kBlock) {
+        std::uint64_t hit = 0;
+        for (std::size_t k = 0; k < kBlock; ++k) {
+            hit |= static_cast<std::uint64_t>(idx[i + k] == value);
+        }
+        if (hit != 0) {
+            return true;
+        }
+    }
+    std::uint64_t hit = 0;
+    for (; i < n; ++i) {
+        hit |= static_cast<std::uint64_t>(idx[i] == value);
+    }
+    return hit != 0;
+}
+
 /// Bulk-gather rows from `src`, treating sentinel values (kNull = SIZE_MAX) as null positions
 /// that receive default values. Returns the new column plus a validity bitmap if any nulls exist.
 // n is the array length, kNull the sentinel value; distinct roles, not realistically
@@ -483,10 +507,7 @@ void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src,
     auto gathered = std::visit(
         [&](const auto& col) -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
             using ColT = std::decay_t<decltype(col)>;
-            bool has_null = false;
-            for (std::size_t i = 0; i < n && !has_null; ++i)
-                has_null = (indices[i] == kNull);
-            if (!has_null) {
+            if (!index_contains(indices, n, kNull)) {
                 // The no-sentinel fast path is a plain gather, so it gets the
                 // shared kernel and the caller's parallelism. The sentinel path
                 // below stays serial: it branches per row and writes a validity

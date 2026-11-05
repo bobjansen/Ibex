@@ -828,3 +828,30 @@ TEST_CASE("categorical columns over one dictionary compare by code under a parti
         }
     }
 }
+
+TEST_CASE("index_contains finds a value at any block position", "[runtime][join][sentinel]") {
+    constexpr std::size_t kNull = SIZE_MAX;
+    for (const std::size_t n : {std::size_t{0}, std::size_t{1}, std::size_t{511}, std::size_t{512},
+                                std::size_t{513}, std::size_t{1024}, std::size_t{1500}}) {
+        std::vector<std::size_t> idx(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            idx[i] = i;
+        }
+        INFO("n=" << n);
+        CHECK_FALSE(runtime::index_contains(idx.data(), n, kNull));
+        for (const std::size_t at : {std::size_t{0}, std::size_t{1}, std::size_t{510},
+                                     std::size_t{511}, std::size_t{512}, std::size_t{1023},
+                                     std::size_t{1024}, n - 1}) {
+            if (n == 0 || at >= n) {
+                continue;
+            }
+            INFO("at=" << at);
+            const std::size_t saved = idx[at];
+            idx[at] = kNull;
+            CHECK(runtime::index_contains(idx.data(), n, kNull));
+            // A sentinel just past `n` is not part of the index.
+            CHECK_FALSE(runtime::index_contains(idx.data(), at, kNull));
+            idx[at] = saved;
+        }
+    }
+}

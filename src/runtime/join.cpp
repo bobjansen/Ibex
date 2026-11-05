@@ -298,12 +298,7 @@ auto gather_entry(const ColumnEntry& entry, const std::size_t* idx, std::size_t 
 /// True when `idx` holds at least one `kNull`, i.e. an output row with no
 /// counterpart on this side.
 auto index_has_sentinel(const std::size_t* idx, std::size_t total) -> bool {
-    for (std::size_t i = 0; i < total; ++i) {
-        if (idx[i] == kNull) {
-            return true;
-        }
-    }
-    return false;
+    return index_contains(idx, total, kNull);
 }
 
 /// One output column the join still has to gather.
@@ -1103,10 +1098,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
         // ── Left columns ──
         // Check whether any left rows are null (outer/right join unmatched).
-        bool has_left_nulls = false;
-        for (std::size_t i = 0; i < total && !has_left_nulls; ++i) {
-            has_left_nulls = (left_idx[i] == kNull);
-        }
+        const bool has_left_nulls = index_has_sentinel(left_idx.data(), total);
 
         if (!has_left_nulls) {
             std::vector<GatherJob> jobs;

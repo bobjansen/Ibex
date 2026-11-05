@@ -7,6 +7,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -579,4 +580,141 @@ TEST_CASE("payload lift keeps a lifted column a node below the aggregate still r
     const auto* project = project_below(*agg);
     REQUIRE(project != nullptr);
     CHECK(names_of(*project) == std::vector<std::string>{"c_custkey", "c_name", "v"});
+}
+
+namespace {
+
+auto col_expr(std::string name) -> ir::Expr {
+    return ir::Expr{.node = ir::ColumnRef{.name = std::move(name)}};
+}
+
+/// `name > 0`.
+auto positive(std::string name) -> ir::Expr {
+    return ir::Expr{.node = ir::CompareExpr{
+                        .op = ir::CompareOp::Gt,
+                        .left = ir::ExprPtr{col_expr(std::move(name))},
+                        .right = ir::ExprPtr{ir::Expr{.node = ir::Literal{std::int64_t{0}}}}}};
+}
+
+auto update_node(ir::NodePtr input, std::string alias, ir::Expr expr) -> ir::NodePtr {
+    std::vector<ir::FieldSpec> fields;
+    fields.push_back(ir::FieldSpec{.alias = std::move(alias), .expr = std::move(expr)});
+    auto node = std::make_unique<ir::UpdateNode>(ir::NodeId{30}, std::move(fields));
+    node->add_child(std::move(input));
+    return node;
+}
+
+auto filter_node(ir::NodePtr input, ir::Expr predicate) -> ir::NodePtr {
+    auto node = std::make_unique<ir::FilterNode>(ir::NodeId{31}, std::move(predicate));
+    node->add_child(std::move(input));
+    return node;
+}
+
+auto project_node(ir::NodePtr input, std::vector<std::string> names) -> ir::NodePtr {
+    auto node = std::make_unique<ir::ProjectNode>(ir::NodeId{32}, refs(std::move(names)));
+    node->add_child(std::move(input));
+    return node;
+}
+
+/// The Polars adapter's q10 shape: between the aggregate and the top-k sit a
+/// filter, an update computing the sort column, a projection and a sort-flag
+/// update.
+auto adapter_chain(ir::NodePtr agg) -> ir::NodePtr {
+    auto filtered = filter_node(std::move(agg), positive("total"));
+    auto revenue = update_node(std::move(filtered), "revenue",
+                               ir::Expr{.node = ir::BinaryExpr{
+                                            .op = ir::ArithmeticOp::Mul,
+                                            .left = ir::ExprPtr{col_expr("total")},
+                                            .right = ir::ExprPtr{col_expr("total")}}});
+    auto projected =
+        project_node(std::move(revenue), {"c_custkey", "c_name", "revenue", "c_phone"});
+    auto flagged = update_node(std::move(projected), "flag", positive("revenue"));
+    return fused_topk(std::move(flagged), "revenue", 20);
+}
+
+auto customer_sources() -> ir::SourceSchemas {
+    ir::SourceSchemas sources;
+    sources.emplace("customer", source({"c_custkey", "c_name", "c_phone", "v"}, "c_custkey"));
+    return sources;
+}
+
+}  // namespace
+
+TEST_CASE("payload lift passes updates, filters and projections that leave lifted columns alone") {
+    const auto sources = customer_sources();
+    auto plan = adapter_chain(aggregate({"c_custkey", "c_name", "c_phone"}, scan("customer")));
+    plan = ir::reduce_functionally_dependent_group_keys(std::move(plan), sources);
+
+    const auto* join = find_join(*plan);
+    REQUIRE(join != nullptr);
+    const auto* agg = find_aggregate(*plan);
+    REQUIRE(agg != nullptr);
+    REQUIRE(agg->aggregations().size() == 1);
+    CHECK(agg->aggregations().front().alias == "total");
+
+    // Below the top-k: the updates and the filter survive as they were, and
+    // the projection loses only the lifted columns.
+    const ir::Node* link = join->children().front()->children().front().get();
+    REQUIRE(link->kind() == ir::NodeKind::Update);
+    CHECK(static_cast<const ir::UpdateNode&>(*link).fields().front().alias == "flag");
+    link = link->children().front().get();
+    REQUIRE(link->kind() == ir::NodeKind::Project);
+    CHECK(names_of(static_cast<const ir::ProjectNode&>(*link)) ==
+          std::vector<std::string>{"c_custkey", "revenue"});
+    link = link->children().front().get();
+    REQUIRE(link->kind() == ir::NodeKind::Update);
+    CHECK(static_cast<const ir::UpdateNode&>(*link).fields().front().alias == "revenue");
+    link = link->children().front().get();
+    REQUIRE(link->kind() == ir::NodeKind::Filter);
+    // The reduction's own column-order projection, narrowed the same way.
+    link = link->children().front().get();
+    REQUIRE(link->kind() == ir::NodeKind::Project);
+    CHECK(names_of(static_cast<const ir::ProjectNode&>(*link)) ==
+          std::vector<std::string>{"c_custkey", "total"});
+    CHECK(link->children().front()->kind() == ir::NodeKind::Aggregate);
+
+    // The caller still sees the projection's columns plus the appended flag.
+    REQUIRE(plan->kind() == ir::NodeKind::Project);
+    CHECK(names_of(static_cast<const ir::ProjectNode&>(*plan)) ==
+          std::vector<std::string>{"c_custkey", "c_name", "revenue", "c_phone", "flag"});
+}
+
+TEST_CASE("payload lift declines a link that touches a lifted column or drops the key") {
+    const auto sources = customer_sources();
+    const auto agg = [] { return aggregate({"c_custkey", "c_name"}, scan("customer")); };
+    ir::NodePtr plan;
+    SECTION("an update reads a lifted column") {
+        plan = fused_topk(update_node(agg(), "label", col_expr("c_name")), "total", 20);
+    }
+    SECTION("an update overwrites a lifted column") {
+        plan = fused_topk(update_node(agg(), "c_name", col_expr("total")), "total", 20);
+    }
+    SECTION("an update overwrites the key") {
+        plan = fused_topk(update_node(agg(), "c_custkey", col_expr("total")), "total", 20);
+    }
+    SECTION("an update's guard reads a lifted column") {
+        auto update = update_node(agg(), "extra", col_expr("total"));
+        static_cast<ir::UpdateNode&>(*update).set_guard(positive("c_name"));
+        plan = fused_topk(std::move(update), "total", 20);
+    }
+    SECTION("a grouped update") {
+        std::vector<ir::FieldSpec> fields;
+        fields.push_back(ir::FieldSpec{.alias = "extra", .expr = col_expr("total")});
+        auto update = std::make_unique<ir::UpdateNode>(ir::NodeId{30}, std::move(fields),
+                                                       std::vector<ir::TupleFieldSpec>{},
+                                                       refs({"c_custkey"}));
+        update->add_child(agg());
+        plan = fused_topk(std::move(update), "total", 20);
+    }
+    SECTION("a filter reads a lifted column") {
+        plan = fused_topk(filter_node(agg(), positive("c_name")), "total", 20);
+    }
+    SECTION("a projection drops the key") {
+        plan = fused_topk(project_node(agg(), {"c_name", "total"}), "total", 20);
+    }
+    plan = ir::reduce_functionally_dependent_group_keys(std::move(plan), sources);
+    CHECK(find_join(*plan) == nullptr);
+    const auto* reduced = find_aggregate(*plan);
+    REQUIRE(reduced != nullptr);
+    CHECK(reduced->aggregations().size() == 2);
 }

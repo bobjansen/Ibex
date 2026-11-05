@@ -306,14 +306,50 @@ struct LiftPlan {
     std::vector<AggSpec> lifted;  ///< `First` aggregates to move above the top-k.
 };
 
-/// The `Aggregate` under a chain of `Order`/`Project` nodes, or nullptr.
+/// Whether `expr` reads any column in `names`. Conservative: an expression
+/// kind this does not know reads everything.
+// NOLINTNEXTLINE(misc-no-recursion)
+auto expr_reads_any(const Expr& expr, const std::set<std::string>& names) -> bool {
+    const auto reads = [&](const ExprPtr& sub) {
+        return sub != nullptr && expr_reads_any(*sub, names);
+    };
+    return std::visit(
+        [&](const auto& n) -> bool {
+            using T = std::decay_t<decltype(n)>;
+            if constexpr (std::is_same_v<T, ColumnRef>) {
+                return !n.lexical && names.contains(n.name);
+            } else if constexpr (std::is_same_v<T, Literal>) {
+                return false;
+            } else if constexpr (std::is_same_v<T, BinaryExpr> || std::is_same_v<T, CompareExpr> ||
+                                 std::is_same_v<T, LogicalExpr>) {
+                return reads(n.left) || reads(n.right);
+            } else if constexpr (std::is_same_v<T, IsNullExpr>) {
+                return reads(n.operand);
+            } else if constexpr (std::is_same_v<T, CallExpr>) {
+                return std::ranges::any_of(n.args, reads) ||
+                       std::ranges::any_of(n.named_args,
+                                           [&](const auto& named) { return reads(named.value); });
+            } else if constexpr (std::is_same_v<T, RankExpr>) {
+                return std::ranges::any_of(
+                    n.order_keys, [&](const OrderKey& key) { return names.contains(key.name); });
+            } else {
+                return true;
+            }
+        },
+        expr.node);
+}
+
+/// The `Aggregate` under a chain of `Order`, `Project`, `Update` and `Filter`
+/// nodes, or nullptr. Whether each link lets the lift through is
+/// `chain_passes_lift`'s decision.
 auto aggregate_below(Node& node, std::vector<Node*>& chain) -> AggregateNode* {
     Node* cur = &node;
     while (cur != nullptr) {
         if (cur->kind() == NodeKind::Aggregate) {
             return &node_cast<AggregateNode>(*cur);
         }
-        if (cur->kind() != NodeKind::Order && cur->kind() != NodeKind::Project) {
+        if (cur->kind() != NodeKind::Order && cur->kind() != NodeKind::Project &&
+            cur->kind() != NodeKind::Update && cur->kind() != NodeKind::Filter) {
             return nullptr;
         }
         chain.push_back(cur);
@@ -323,6 +359,68 @@ auto aggregate_below(Node& node, std::vector<Node*>& chain) -> AggregateNode* {
         cur = cur->mutable_children().front().get();
     }
     return nullptr;
+}
+
+/// Whether every link between the top-k and the aggregate leaves the lifted
+/// columns and the group key alone, so they can be removed below the top-k
+/// and joined back above it. An `Update` or `Filter` may sit there -- the
+/// Polars adapter puts a rounding update, a projection and sort-flag updates
+/// between them -- as long as it neither reads a lifted column nor assigns a
+/// lifted column or the key; the rows and their order below the top-k do not
+/// change, so whatever else it computes comes out the same. A projection must
+/// keep the key, which the re-fetch joins on.
+auto chain_passes_lift(const std::vector<Node*>& chain, const std::string& key,
+                       const std::set<std::string>& lifted) -> bool {
+    return std::ranges::all_of(chain, [&](const Node* link) {
+        switch (link->kind()) {
+            case NodeKind::Order:
+                return true;
+            case NodeKind::Project:
+                return std::ranges::any_of(node_cast<ProjectNode>(*link).columns(),
+                                           [&](const ColumnRef& col) { return col.name == key; });
+            case NodeKind::Filter:
+                return !expr_reads_any(node_cast<FilterNode>(*link).predicate(), lifted);
+            case NodeKind::Update: {
+                const auto& update = node_cast<UpdateNode>(*link);
+                if (!update.group_by().empty() || !update.tuple_fields().empty() ||
+                    (update.guard() != nullptr && expr_reads_any(*update.guard(), lifted))) {
+                    return false;
+                }
+                return std::ranges::none_of(update.fields(), [&](const FieldSpec& field) {
+                    return field.alias == key || lifted.contains(field.alias) ||
+                           expr_reads_any(field.expr, lifted);
+                });
+            }
+            default:
+                return false;
+        }
+    });
+}
+
+/// The columns the top of `chain` produces, in order: the aggregate's keys
+/// and aggregates, then each link bottom-up (a projection replaces the list,
+/// an update replaces a column in place or appends it, as `update_schema`
+/// does).
+auto chain_output_columns(const std::vector<Node*>& chain, const AggregateNode& agg)
+    -> std::vector<ColumnRef> {
+    std::vector<ColumnRef> columns = agg.group_by();
+    for (const auto& spec : agg.aggregations()) {
+        columns.push_back(ColumnRef{.name = spec.alias});
+    }
+    for (const Node* link : std::views::reverse(chain)) {
+        if (link->kind() == NodeKind::Project) {
+            columns = node_cast<ProjectNode>(*link).columns();
+        } else if (link->kind() == NodeKind::Update) {
+            for (const auto& field : node_cast<UpdateNode>(*link).fields()) {
+                if (std::ranges::none_of(columns, [&](const ColumnRef& col) {
+                        return col.name == field.alias;
+                    })) {
+                    columns.push_back(ColumnRef{.name = field.alias});
+                }
+            }
+        }
+    }
+    return columns;
 }
 
 /// Find the `ScanNode` with `id`, so a re-fetch can copy its source name and
@@ -450,43 +548,17 @@ auto plan_lift(Node& head_node, const Node& root, const SourceSchemas& sources)
             return std::nullopt;
         }
     }
+    std::set<std::string> lifted_names;
+    for (const auto& spec : lifted) {
+        lifted_names.insert(spec.alias);
+    }
+    if (!chain_passes_lift(chain, agg->group_by().front().name, lifted_names)) {
+        return std::nullopt;
+    }
 
     return LiftPlan{.group_key = agg->group_by().front(),
                     .key_origin = key_origin,
                     .lifted = std::move(lifted)};
-}
-
-/// Whether `expr` reads any column in `names`. Conservative: an expression
-/// kind this does not know reads everything.
-// NOLINTNEXTLINE(misc-no-recursion)
-auto expr_reads_any(const Expr& expr, const std::set<std::string>& names) -> bool {
-    const auto reads = [&](const ExprPtr& sub) {
-        return sub != nullptr && expr_reads_any(*sub, names);
-    };
-    return std::visit(
-        [&](const auto& n) -> bool {
-            using T = std::decay_t<decltype(n)>;
-            if constexpr (std::is_same_v<T, ColumnRef>) {
-                return !n.lexical && names.contains(n.name);
-            } else if constexpr (std::is_same_v<T, Literal>) {
-                return false;
-            } else if constexpr (std::is_same_v<T, BinaryExpr> || std::is_same_v<T, CompareExpr> ||
-                                 std::is_same_v<T, LogicalExpr>) {
-                return reads(n.left) || reads(n.right);
-            } else if constexpr (std::is_same_v<T, IsNullExpr>) {
-                return reads(n.operand);
-            } else if constexpr (std::is_same_v<T, CallExpr>) {
-                return std::ranges::any_of(n.args, reads) ||
-                       std::ranges::any_of(n.named_args,
-                                           [&](const auto& named) { return reads(named.value); });
-            } else if constexpr (std::is_same_v<T, RankExpr>) {
-                return std::ranges::any_of(
-                    n.order_keys, [&](const OrderKey& key) { return names.contains(key.name); });
-            } else {
-                return true;
-            }
-        },
-        expr.node);
 }
 
 /// Drop the lifted columns' source names from the projections in the
@@ -569,25 +641,9 @@ auto apply_lift(NodePtr head_node, const Node& root, const LiftPlan& plan, std::
     std::vector<ColumnRef> final_columns;
     {
         std::vector<Node*> chain;
-        Node* below = head_node->mutable_children().front().get();
-        const AggregateNode* agg = aggregate_below(*below, chain);
-        const Node* topmost_project = nullptr;
-        for (const Node* link : chain) {
-            if (link->kind() == NodeKind::Project) {
-                topmost_project = link;
-                break;
-            }
-        }
-        if (topmost_project != nullptr) {
-            final_columns = node_cast<ProjectNode>(*topmost_project).columns();
-        } else {
-            for (const auto& key : agg->group_by()) {
-                final_columns.push_back(key);
-            }
-            for (const auto& spec : agg->aggregations()) {
-                final_columns.push_back(ColumnRef{.name = spec.alias});
-            }
-        }
+        const AggregateNode* agg =
+            aggregate_below(*head_node->mutable_children().front(), chain);
+        final_columns = chain_output_columns(chain, *agg);
     }
 
     // Strip the lifted columns from the aggregate and from every projection
@@ -606,28 +662,24 @@ auto apply_lift(NodePtr head_node, const Node& root, const LiftPlan& plan, std::
         narrowed->add_child(std::move(agg->mutable_children().front()));
         prune_lifted_inputs(*narrowed, plan);
 
-        // Rebuild the chain bottom-up, dropping lifted columns from projections.
-        NodePtr rebuilt = std::move(narrowed);
-        for (auto& it : std::views::reverse(chain)) {
-            Node& link = *it;
-            if (link.kind() == NodeKind::Project) {
+        // Narrow each projection in place, top-down; every other link keeps
+        // its own node, so an update or filter stays exactly what it was.
+        NodePtr* slot = &head_node->mutable_children().front();
+        while ((*slot)->kind() != NodeKind::Aggregate) {
+            if ((*slot)->kind() == NodeKind::Project) {
                 std::vector<ColumnRef> cols;
-                for (const auto& col : node_cast<ProjectNode>(link).columns()) {
+                for (const auto& col : node_cast<ProjectNode>(**slot).columns()) {
                     if (!is_lifted(col.name)) {
                         cols.push_back(col);
                     }
                 }
-                auto project = std::make_unique<ProjectNode>(link.id(), std::move(cols));
-                project->add_child(std::move(rebuilt));
-                rebuilt = std::move(project);
-            } else {
-                auto order =
-                    std::make_unique<OrderNode>(link.id(), node_cast<OrderNode>(link).keys());
-                order->add_child(std::move(rebuilt));
-                rebuilt = std::move(order);
+                auto project = std::make_unique<ProjectNode>((*slot)->id(), std::move(cols));
+                project->add_child(std::move((*slot)->mutable_children().front()));
+                *slot = std::move(project);
             }
+            slot = &(*slot)->mutable_children().front();
         }
-        head_node->mutable_children().front() = std::move(rebuilt);
+        *slot = std::move(narrowed);
     }
 
     // The re-fetch side: the same source, projected to the key plus the lifted

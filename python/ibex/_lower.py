@@ -119,14 +119,23 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             operand = Expr("case", (safe, scaled, Expr("lit", (0.0,))))
             rounding = "Bankers" if mode == "half_to_even" else "Nearest"
             integer = f"Float64(round({render(operand)}, {rounding}))"
-            zero = bind(0.0)
-            rounded = f"case {{ {integer} == {zero} => ({render(scaled)} * {zero}), else => {integer} }}"
-            integral = f"case {{ {render(safe)} => {rounded}, else => {render(scaled)} }}"
-            result = f"(({integral}) / {render(factor)})"
-            # Scaling may overflow; Polars restores the original non-finite
-            # input or finite input whose scaled result overflowed.
+            # Native round returns Int64, so a zero result loses its sign;
+            # Polars keeps the operand's. Reflecting the subtraction gives
+            # integer itself when it is nonzero and, when it is zero, a zero
+            # signed like scaled (-0 - -0 is +0, -0 - +0 is -0), with
+            # integer computed once.
+            minus_one, zero = bind(-1.0), bind(0.0)
+            rounded = f"((({integer} * {minus_one}) - ({render(scaled)} * {zero})) * {minus_one})"
+            # Polars returns the original input when scaling overflows or the
+            # input is not finite. A safe scaled value rounds to a finite
+            # result, and a finite unsafe one divides to a finite result
+            # (factor >= 1), so only scaled needs the finiteness test, and each
+            # subexpression appears once.
             inf = bind(float("inf"))
-            return f"case {{ ({result} > -{inf}) && ({result} < {inf}) => {result}, else => {render(value)} }}"
+            factor_ref = render(factor)
+            finite = f"(({render(scaled)} > -{inf}) && ({render(scaled)} < {inf}))"
+            return (f"case {{ {render(safe)} => ({rounded} / {factor_ref}), "
+                    f"{finite} => ({render(scaled)} / {factor_ref}), else => {render(value)} }}")
         if op == "like":
             return f"like({render(args[0])}, {render(args[1])})"
         if op == "substring":

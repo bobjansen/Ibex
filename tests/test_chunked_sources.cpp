@@ -3076,3 +3076,94 @@ TEST_CASE("chunked top-k puts every NaN above every number", "[runtime][chunked]
     CHECK(asc[3] == std::numeric_limits<double>::infinity());
     CHECK(std::isnan(asc[4]));
 }
+
+namespace {
+
+/// Two chunks of (g, k, v); `k` is null where `null_rows` says. The first
+/// chunk can be null-free so a typed top-k heap is chosen before a null
+/// arrives -- the case where nulls must not take a different heap.
+auto register_null_scores(runtime::ExternRegistry& externs, bool first_chunk_has_nulls) {
+    externs.register_chunked_table(
+        "null_scores", [first_chunk_has_nulls](const runtime::ExternArgs&) {
+            std::vector<runtime::Chunk> chunks;
+            struct Part {
+                std::vector<std::int64_t> g;
+                std::vector<double> k;
+                std::vector<std::int64_t> v;
+                std::vector<bool> valid;
+            };
+            // Null slots hold 0.0, below every real key, so a heap that reads the
+            // raw value ranks them first ascending.
+            std::vector<Part> parts{
+                {{1, 1, 2},
+                 {first_chunk_has_nulls ? 0.0 : 5.0, 3.0, 4.0},
+                 {1, 2, 3},
+                 {!first_chunk_has_nulls, true, true}},
+                {{1, 2, 2}, {0.0, 0.0, 1.0}, {4, 5, 6}, {false, false, true}},
+            };
+            for (auto& part : parts) {
+                runtime::Chunk chunk;
+                runtime::ColumnEntry g;
+                g.name = "g";
+                g.column = std::make_shared<runtime::ColumnValue>(Column<std::int64_t>{part.g});
+                runtime::ColumnEntry k;
+                k.name = "k";
+                k.column = std::make_shared<runtime::ColumnValue>(Column<double>{part.k});
+                if (std::ranges::any_of(part.valid, [](bool b) { return !b; })) {
+                    runtime::ValidityBitmap valid(part.valid.size(), true);
+                    for (std::size_t i = 0; i < part.valid.size(); ++i) {
+                        if (!part.valid[i]) {
+                            valid.set(i, false);
+                        }
+                    }
+                    k.validity = std::move(valid);
+                }
+                runtime::ColumnEntry v;
+                v.name = "v";
+                v.column = std::make_shared<runtime::ColumnValue>(Column<std::int64_t>{part.v});
+                chunk.columns.push_back(std::move(g));
+                chunk.columns.push_back(std::move(k));
+                chunk.columns.push_back(std::move(v));
+                chunks.push_back(std::move(chunk));
+            }
+            return std::expected<runtime::OperatorPtr, std::string>{
+                std::make_unique<VectorSource>(std::move(chunks))};
+        });
+}
+
+auto int_column(const runtime::Table& t, const std::string& name) -> std::vector<std::int64_t> {
+    const auto* col = std::get_if<Column<std::int64_t>>(t.find(name));
+    REQUIRE(col != nullptr);
+    return {col->begin(), col->end()};
+}
+
+}  // namespace
+
+TEST_CASE("chunked top-k sorts a null key last", "[runtime][chunked][topk][nulls]") {
+    const auto decl = std::string{"extern fn null_scores() -> DataFrame from \"x.hpp\"; "};
+    for (const bool first_has_nulls : {false, true}) {
+        DYNAMIC_SECTION("first chunk has nulls: " << first_has_nulls) {
+            runtime::ExternRegistry externs;
+            register_null_scores(externs, first_has_nulls);
+            // Keys by v: 1 -> 5.0 (null when first_has_nulls), 2 -> 3.0,
+            // 3 -> 4.0, 4 -> null, 5 -> null, 6 -> 1.0.
+            const auto asc = int_column(
+                run_extern(decl + "null_scores()[order { k asc }, head 4];", externs), "v");
+            // Either the three values then v1's null (first to arrive), or
+            // all four values; never a null ranked as its slot's 0.0.
+            CHECK(asc == std::vector<std::int64_t>{6, 2, 3, 1});
+            const auto desc = int_column(
+                run_extern(decl + "null_scores()[order { k desc }, head 3];", externs), "v");
+            CHECK(desc == (first_has_nulls ? std::vector<std::int64_t>{3, 2, 6}
+                                           : std::vector<std::int64_t>{1, 3, 2}));
+            // Grouped, k <= 16: the POD heaps. g = 1: v 1, 2, 4; g = 2: v 3, 5, 6.
+            const auto grouped = int_column(
+                run_extern(decl + "null_scores()[order { k asc }, head 2, by g];", externs), "v");
+            std::vector<std::int64_t> sorted_grouped = grouped;
+            std::ranges::sort(sorted_grouped);
+            // g = 1 keeps 3.0 and then 5.0 or v1's first-arriving null; g = 2
+            // keeps 1.0 and 4.0 ahead of v5's null.
+            CHECK(sorted_grouped == std::vector<std::int64_t>{1, 2, 3, 6});
+        }
+    }
+}

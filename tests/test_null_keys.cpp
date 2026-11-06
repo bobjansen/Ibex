@@ -651,3 +651,15 @@ TEST_CASE("NaN order: the shared Float64 order helpers", "[order][nan]") {
     CHECK(runtime::double_to_sortable_u64(inf) < runtime::double_to_sortable_u64(-nan));
     CHECK(runtime::double_to_sortable_u64(-inf) < runtime::double_to_sortable_u64(-1.0));
 }
+
+TEST_CASE("top-k sorts a null key last, as order does", "[order][topk][nulls]") {
+    // `order` puts nulls last under asc and desc; a top-k over the same key
+    // must keep exactly the rows `order` then `head` would. Null row v = 64.
+    const auto with_null = nan_keys();
+    CHECK(ints(run("t[order { k asc }, head 7];", with_null), "v") ==
+          std::vector<std::int64_t>{8, 16, 2, 128, 1, 4, 32});
+    CHECK(ints(run("t[order { k asc }, head 8];", with_null), "v") ==
+          std::vector<std::int64_t>{8, 16, 2, 128, 1, 4, 32, 64});
+    CHECK(ints(run("t[order { k desc }, head 7];", with_null), "v") ==
+          std::vector<std::int64_t>{1, 4, 32, 2, 128, 8, 16});
+}

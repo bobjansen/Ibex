@@ -514,6 +514,16 @@ class ChunkedOrderedLimitOperator final : public Operator {
 
     [[nodiscard]] auto row_comes_first(const Entry& lhs, const Entry& rhs) const -> bool {
         for (std::size_t i = 0; i < lhs.key.values.size(); ++i) {
+            // A null sorts after every value under asc and desc alike, as
+            // `order` puts it; two nulls tie. A null slot's value is undefined.
+            const bool lhs_null = lhs.key.is_null(i);
+            const bool rhs_null = rhs.key.is_null(i);
+            if (lhs_null != rhs_null) {
+                return rhs_null;
+            }
+            if (lhs_null) {
+                continue;
+            }
             const int cmp = compare_scalar_for_order(lhs.key.values[i], rhs.key.values[i]);
             if (cmp == 0) {
                 continue;
@@ -625,8 +635,16 @@ class ChunkedOrderedLimitOperator final : public Operator {
 
     template <typename T>
     auto process_single_key_chunk(const Table& chunk, const Column<T>& key_column, bool ascending,
-                                  const std::vector<KeyCol>& group_key_cols)
+                                  const std::vector<KeyCol>& group_key_cols,
+                                  const std::vector<const ColumnEntry*>& key_columns)
         -> std::optional<std::string> {
+        // A null cell holds its type's zero, and the typed heaps below compare
+        // raw values, so they would rank a null as a zero instead of last. The
+        // POD heaps flag a null themselves (they hold their own storage, which
+        // a later chunk must keep feeding); every other typed branch shares
+        // the Entry heaps with the boxed path, which carries the null.
+        const ValidityBitmap* key_validity =
+            key_columns.front()->validity.has_value() ? &*key_columns.front()->validity : nullptr;
         // `chunk.rows()` is a std::visit over the column variant, and this loop
         // runs once per input row — it measured as ~15% of a top-k query while
         // sitting in the loop CONDITION. `key_column[row]` likewise re-tests
@@ -659,8 +677,11 @@ class ChunkedOrderedLimitOperator final : public Operator {
                             return key_at(r);
                         }
                     },
-                    ascending, group_key_cols, rows);
+                    ascending, group_key_cols, rows, key_validity);
             }
+        }
+        if (key_validity != nullptr) {
+            return process_boxed_chunk(chunk, key_columns, group_key_cols);
         }
         // Grouped by one Categorical key with no nulls, across workers: each
         // fixed row range keeps a heap per dictionary code, then per code the
@@ -813,6 +834,10 @@ class ChunkedOrderedLimitOperator final : public Operator {
     static constexpr std::size_t kPodMaxCount = 16;
     /// A ref of a row in the chunk being processed, not yet in a piece.
     static constexpr std::uint64_t kPodCurrentChunk = std::uint64_t{1} << 63;
+    /// Set in `PodEntry::sequence` when the row's order key is null: a
+    /// sequence never reaches 2^63, so the flag costs no space. A null sorts
+    /// after every value under asc and desc alike, as `order` puts it.
+    static constexpr std::uint64_t kPodNullKey = std::uint64_t{1} << 63;
 
     template <typename K>
     struct PodEntry {
@@ -846,20 +871,25 @@ class ChunkedOrderedLimitOperator final : public Operator {
     template <typename K>
     [[nodiscard]] auto pod_better(const PodEntry<K>& lhs, const PodEntry<K>& rhs,
                                   bool ascending) const -> bool {
-        // `single_key_better`, on the flat entry.
-        if (key_ties(lhs.key, rhs.key)) {
-            return keep_mode_ == KeepMode::First ? (lhs.sequence < rhs.sequence)
-                                                 : (rhs.sequence < lhs.sequence);
+        // `single_key_better`, on the flat entry, with a null key last.
+        const bool lhs_null = (lhs.sequence & kPodNullKey) != 0;
+        const bool rhs_null = (rhs.sequence & kPodNullKey) != 0;
+        if (lhs_null == rhs_null && (lhs_null || key_ties(lhs.key, rhs.key))) {
+            const std::uint64_t lhs_sequence = lhs.sequence & ~kPodNullKey;
+            const std::uint64_t rhs_sequence = rhs.sequence & ~kPodNullKey;
+            return keep_mode_ == KeepMode::First ? (lhs_sequence < rhs_sequence)
+                                                 : (rhs_sequence < lhs_sequence);
         }
-        const bool lhs_first =
-            ascending ? key_before(lhs.key, rhs.key) : key_before(rhs.key, lhs.key);
+        const bool lhs_first = lhs_null != rhs_null ? rhs_null
+                                                    : (ascending ? key_before(lhs.key, rhs.key)
+                                                                 : key_before(rhs.key, lhs.key));
         return keep_mode_ == KeepMode::First ? lhs_first : !lhs_first;
     }
 
     template <typename K, typename KeyAt>
     auto process_grouped_pod(const Table& chunk, const KeyAt& key_at, bool ascending,
-                             const std::vector<KeyCol>& group_key_cols, std::size_t rows)
-        -> std::optional<std::string> {
+                             const std::vector<KeyCol>& group_key_cols, std::size_t rows,
+                             const ValidityBitmap* key_validity) -> std::optional<std::string> {
         if (!pod_active_) {
             // One integer key, read as its raw value; fixed for the stream,
             // since a group must be found by the same index in every chunk.
@@ -1005,7 +1035,10 @@ class ChunkedOrderedLimitOperator final : public Operator {
                             return new_group();
                         });
                 }
-                const PodEntry<K> entry{key_at(row), base + row, kPodCurrentChunk | row};
+                const bool null_key = key_validity != nullptr && !(*key_validity)[row];
+                const PodEntry<K> entry{null_key ? K{} : key_at(row),
+                                        (base + row) | (null_key ? kPodNullKey : 0),
+                                        kPodCurrentChunk | row};
                 PodEntry<K>* heap = part.heaps.data() + (static_cast<std::size_t>(gid) * k);
                 std::uint32_t& size = part.sizes[gid];
                 if (size == k) {
@@ -1117,8 +1150,10 @@ class ChunkedOrderedLimitOperator final : public Operator {
             winners = std::move(sorted);
         };
         std::vector<std::uint64_t> radix(n);
+        bool any_null = false;
         for (std::size_t i = 0; i < n; ++i) {
-            radix[i] = winners[i].sequence;
+            radix[i] = winners[i].sequence & ~kPodNullKey;
+            any_null = any_null || (winners[i].sequence & kPodNullKey) != 0;
         }
         permute(radix_sort_u64_asc(std::move(radix), n, workers));
         radix.assign(n, 0);
@@ -1132,6 +1167,15 @@ class ChunkedOrderedLimitOperator final : public Operator {
             radix[i] = pod_ascending_ ? bits : ~bits;
         }
         permute(radix_sort_u64_asc(std::move(radix), n, workers));
+        if (any_null) {
+            // Most significant of all: null keys last, the passes above kept
+            // them in (key, arrival) order and a null's key is a placeholder.
+            radix.assign(n, 0);
+            for (std::size_t i = 0; i < n; ++i) {
+                radix[i] = (winners[i].sequence & kPodNullKey) != 0 ? 1 : 0;
+            }
+            permute(radix_sort_u64_asc(std::move(radix), n, workers));
+        }
         return winners;
     }
 
@@ -1239,10 +1283,10 @@ class ChunkedOrderedLimitOperator final : public Operator {
             cat_gid_memo_.assign(group_key_cols.front().cat->dictionary_size(), kNoCatGid);
         }
 
-        std::vector<const ColumnValue*> key_columns;
+        std::vector<const ColumnEntry*> key_columns;
         key_columns.reserve(keys_->size());
         for (const auto& key : *keys_) {
-            const auto* column = chunk.find(key.name);
+            const auto* column = chunk.find_entry(key.name);
             if (column == nullptr) {
                 return "order column not found: " + key.name +
                        " (available: " + format_columns(chunk) + ")";
@@ -1252,24 +1296,37 @@ class ChunkedOrderedLimitOperator final : public Operator {
 
         if (keys_->size() == 1) {
             const bool ascending = keys_->front().ascending;
-            const ColumnValue& key_column = *key_columns.front();
+            const ColumnValue& key_column = *key_columns.front()->column;
             if (const auto* col = std::get_if<Column<std::int64_t>>(&key_column)) {
-                return process_single_key_chunk(chunk, *col, ascending, group_key_cols);
+                return process_single_key_chunk(chunk, *col, ascending, group_key_cols,
+                                                key_columns);
             }
             if (const auto* col = std::get_if<Column<double>>(&key_column)) {
-                return process_single_key_chunk(chunk, *col, ascending, group_key_cols);
+                return process_single_key_chunk(chunk, *col, ascending, group_key_cols,
+                                                key_columns);
             }
             if (const auto* col = std::get_if<Column<bool>>(&key_column)) {
-                return process_single_key_chunk(chunk, *col, ascending, group_key_cols);
+                return process_single_key_chunk(chunk, *col, ascending, group_key_cols,
+                                                key_columns);
             }
             if (const auto* col = std::get_if<Column<Date>>(&key_column)) {
-                return process_single_key_chunk(chunk, *col, ascending, group_key_cols);
+                return process_single_key_chunk(chunk, *col, ascending, group_key_cols,
+                                                key_columns);
             }
             if (const auto* col = std::get_if<Column<Timestamp>>(&key_column)) {
-                return process_single_key_chunk(chunk, *col, ascending, group_key_cols);
+                return process_single_key_chunk(chunk, *col, ascending, group_key_cols,
+                                                key_columns);
             }
         }
 
+        return process_boxed_chunk(chunk, key_columns, group_key_cols);
+    }
+
+    /// Every row boxed into a `Key` that carries its nulls: any key count or
+    /// type, and the one path a null-bearing key takes into the Entry heaps.
+    auto process_boxed_chunk(const Table& chunk, const std::vector<const ColumnEntry*>& key_columns,
+                             const std::vector<KeyCol>& group_key_cols)
+        -> std::optional<std::string> {
         // As above: `rows()` visits the column variant, so it does not belong
         // in a per-row loop condition.
         const std::size_t rows = chunk.rows();
@@ -1282,7 +1339,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
             Entry entry;
             entry.key.values.reserve(keys_->size());
             for (const auto* column : key_columns) {
-                entry.key.values.push_back(scalar_from_column(*column, row));
+                push_key_value(entry.key, *column, row);
             }
             entry.sequence = next_sequence_++;
             if (heap->size() == count_ && !entry_preferred(entry, heap->front())) {

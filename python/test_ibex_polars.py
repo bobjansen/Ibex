@@ -810,6 +810,7 @@ class EngineTests(unittest.TestCase):
                     self.equal(frame.sort("x", descending=descending, nulls_last=last, maintain_order=True))
                     self.equal(frame.sort(["g", "x"], descending=[False, descending], nulls_last=last,
                                           maintain_order=True))
+                    self.equal(frame.sort("x", descending=descending, nulls_last=last).head(3).select("x"))
         self.assertNotIn("is_nan", self.engine.explain(frame.sort("x")))
 
     def test_nan_high_comparison_matrix_resident_and_parquet(self):

@@ -3,6 +3,7 @@
 
 #include <ibex/ir/column_origins.hpp>
 #include <ibex/ir/group_key_reduction.hpp>
+#include <ibex/ir/join_output.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/schema.hpp>
 
@@ -15,6 +16,7 @@
 #include <ranges>
 #include <set>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -571,22 +573,68 @@ auto plan_lift(Node& head_node, const Node& root, const SourceSchemas& sources)
 /// projection; canonicalize puts one there (q10: under the revenue update),
 /// which left q10 decoding and joining all of customer's text again.
 ///
-/// Walks down through Project, Update and Filter only, and never drops a
+/// Walks down through Project, Update, Filter and Join, and never drops a
 /// column the aggregate or a node on the way still reads -- or one an update
 /// redefines, whose name below it is a different column.
-void prune_lifted_inputs(AggregateNode& agg, const LiftPlan& plan) {
-    std::set<std::string> droppable;
-    for (const auto& spec : plan.lifted) {
-        droppable.insert(spec.column.name);
+///
+/// Joins matter because a frontend may project every input and every join
+/// result (the Polars adapter does): native q10 with one identity `select` on
+/// customer went from ~425 to ~510 ms at eight cores, decoding and joining the
+/// lifted text for all 427K filtered rows instead of 20.
+void prune_droppable(NodePtr* slot, std::set<std::string> droppable, const SourceSchemas& sources);
+
+/// Continue `prune_droppable` into a join's inputs. A column goes down the one
+/// side whose output it is, under its own name: not a key, not renamed by a
+/// collision, not a semi/anti join's right side. A residual predicate could
+/// read anything, so a join with one is left alone.
+// NOLINTNEXTLINE(misc-no-recursion)
+void prune_join_inputs(JoinNode& join, const std::set<std::string>& droppable,
+                       const SourceSchemas& sources) {
+    if (join.predicate().has_value() || join.children().size() != 2 ||
+        join.children()[0] == nullptr || join.children()[1] == nullptr) {
+        return;
     }
-    for (const auto& key : agg.group_by()) {
-        droppable.erase(key.name);
+    const SchemaInfo left = infer_schema(*join.children()[0], sources);
+    const SchemaInfo right = infer_schema(*join.children()[1], sources);
+    if (!left.is_known() || !right.is_known()) {
+        return;
     }
-    for (const auto& spec : agg.aggregations()) {
-        droppable.erase(spec.column.name);
-        droppable.erase(spec.paired.name);
+    const auto names_of = [](const SchemaInfo& info) {
+        std::vector<std::string_view> names;
+        names.reserve(info.fields().size());
+        for (const auto& field : info.fields()) {
+            names.emplace_back(field.name);
+        }
+        return names;
+    };
+    const std::vector<std::string_view> left_names = names_of(left);
+    const std::vector<std::string_view> right_names = names_of(right);
+    const auto planned =
+        plan_join_output(join.kind(), join.keys(), left_names, right_names, join.suffix());
+    if (!planned.has_value()) {
+        return;
     }
-    NodePtr* slot = agg.children().empty() ? nullptr : &agg.mutable_children().front();
+    std::set<std::string> per_side[2];
+    for (const auto& column : *planned) {
+        if (!droppable.contains(column.name) || column.is_key ||
+            column.folded_peer_index.has_value()) {
+            continue;
+        }
+        const bool from_left = column.side == JoinOutputSide::Left;
+        const auto& names = from_left ? left_names : right_names;
+        if (names[column.source_index] == column.name) {
+            per_side[from_left ? 0 : 1].insert(column.name);
+        }
+    }
+    for (std::size_t side = 0; side < 2; ++side) {
+        if (!per_side[side].empty()) {
+            prune_droppable(&join.mutable_children()[side], std::move(per_side[side]), sources);
+        }
+    }
+}
+
+// NOLINTNEXTLINE(misc-no-recursion)
+void prune_droppable(NodePtr* slot, std::set<std::string> droppable, const SourceSchemas& sources) {
     while (slot != nullptr && *slot != nullptr && !droppable.empty()) {
         Node& node = **slot;
         if (node.kind() == NodeKind::Project) {
@@ -620,6 +668,9 @@ void prune_lifted_inputs(AggregateNode& agg, const LiftPlan& plan) {
             if (expr_reads_any(node_cast<FilterNode>(node).predicate(), droppable)) {
                 return;
             }
+        } else if (node.kind() == NodeKind::Join) {
+            prune_join_inputs(node_cast<JoinNode>(node), droppable, sources);
+            return;
         } else {
             return;
         }
@@ -627,10 +678,27 @@ void prune_lifted_inputs(AggregateNode& agg, const LiftPlan& plan) {
     }
 }
 
+void prune_lifted_inputs(AggregateNode& agg, const LiftPlan& plan, const SourceSchemas& sources) {
+    std::set<std::string> droppable;
+    for (const auto& spec : plan.lifted) {
+        droppable.insert(spec.column.name);
+    }
+    for (const auto& key : agg.group_by()) {
+        droppable.erase(key.name);
+    }
+    for (const auto& spec : agg.aggregations()) {
+        droppable.erase(spec.column.name);
+        droppable.erase(spec.paired.name);
+    }
+    if (!agg.children().empty()) {
+        prune_droppable(&agg.mutable_children().front(), std::move(droppable), sources);
+    }
+}
+
 /// Rewrite `head_node` (a `Head` or `TopK`) into `Project(Order(Join(head,
 /// scan)))`, with the lifted columns removed from everything below.
-auto apply_lift(NodePtr head_node, const Node& root, const LiftPlan& plan, std::uint64_t& next)
-    -> NodePtr {
+auto apply_lift(NodePtr head_node, const Node& root, const LiftPlan& plan,
+                const SourceSchemas& sources, std::uint64_t& next) -> NodePtr {
     const auto is_lifted = [&](const std::string& name) {
         return std::ranges::any_of(plan.lifted,
                                    [&](const AggSpec& spec) { return spec.alias == name; });
@@ -660,7 +728,7 @@ auto apply_lift(NodePtr head_node, const Node& root, const LiftPlan& plan, std::
         auto narrowed =
             std::make_unique<AggregateNode>(agg->id(), agg->group_by(), std::move(kept));
         narrowed->add_child(std::move(agg->mutable_children().front()));
-        prune_lifted_inputs(*narrowed, plan);
+        prune_lifted_inputs(*narrowed, plan, sources);
 
         // Narrow each projection in place, top-down; every other link keeps
         // its own node, so an update or filter stays exactly what it was.
@@ -747,7 +815,7 @@ auto lift_walk(NodePtr node, const Node& root, const SourceSchemas& sources, std
     }
     if (is_limit_node(*node)) {
         if (auto plan = plan_lift(*node, root, sources); plan.has_value()) {
-            return apply_lift(std::move(node), root, *plan, next);
+            return apply_lift(std::move(node), root, *plan, sources, next);
         }
     }
     return node;

@@ -718,3 +718,90 @@ TEST_CASE("payload lift declines a link that touches a lifted column or drops th
     REQUIRE(reduced != nullptr);
     CHECK(reduced->aggregations().size() == 2);
 }
+
+namespace {
+
+/// The ProjectNode directly over the scan with `id`, anywhere under `node`.
+// NOLINTNEXTLINE(misc-no-recursion)
+auto project_over_scan(const ir::Node& node, std::uint64_t id) -> const ir::ProjectNode* {
+    if (node.kind() == ir::NodeKind::Project && !node.children().empty() &&
+        node.children().front() != nullptr &&
+        node.children().front()->kind() == ir::NodeKind::Scan &&
+        node.children().front()->id().value == id) {
+        return static_cast<const ir::ProjectNode*>(&node);
+    }
+    for (const auto& child : node.children()) {
+        if (child != nullptr) {
+            if (const auto* found = project_over_scan(*child, id); found != nullptr) {
+                return found;
+            }
+        }
+    }
+    return nullptr;
+}
+
+/// The Polars adapter's shape below q10's aggregate: every join input and the
+/// join itself are projected.
+/// `Project{c_custkey, c_name, v}(Project{c_custkey, c_name}(customer) join
+/// Project{o_custkey, v}(orders) on c_custkey = o_custkey [predicate])`.
+auto projected_join(std::optional<ir::Expr> predicate) -> ir::NodePtr {
+    auto customer =
+        std::make_unique<ir::ProjectNode>(ir::NodeId{40}, refs({"c_custkey", "c_name"}));
+    customer->add_child(scan_id("customer", 1));
+    auto orders = std::make_unique<ir::ProjectNode>(ir::NodeId{41}, refs({"o_custkey", "v"}));
+    orders->add_child(scan_id("orders", 2));
+    std::vector<ir::JoinKey> keys{ir::JoinKey{std::string{"c_custkey"}, std::string{"o_custkey"}}};
+    auto join = std::make_unique<ir::JoinNode>(ir::NodeId{42}, ir::JoinKind::Inner, std::move(keys),
+                                               std::move(predicate));
+    join->add_child(std::move(customer));
+    join->add_child(std::move(orders));
+    auto above =
+        std::make_unique<ir::ProjectNode>(ir::NodeId{43}, refs({"c_custkey", "c_name", "v"}));
+    above->add_child(std::move(join));
+    return above;
+}
+
+auto customer_orders_sources() -> ir::SourceSchemas {
+    ir::SourceSchemas sources;
+    sources.emplace("customer", source({"c_custkey", "c_name", "c_comment"}, "c_custkey"));
+    sources.emplace("orders", source({"o_orderkey", "o_custkey", "v"}, "o_orderkey"));
+    return sources;
+}
+
+}  // namespace
+
+TEST_CASE("payload lift drops lifted columns from projections below a join") {
+    // A projection under the join still naming c_name keeps the scan decoding
+    // it for every row and the join carrying it. Adapter q10 at eight cores:
+    // ~510 -> ~420 ms once these are narrowed too.
+    auto plan =
+        fused_topk(aggregate({"c_custkey", "c_name"}, projected_join(std::nullopt)), "total", 20);
+    plan = ir::reduce_functionally_dependent_group_keys(std::move(plan), customer_orders_sources());
+    REQUIRE(find_join(*plan) != nullptr);
+    const auto* agg = find_aggregate(*plan);
+    REQUIRE(agg != nullptr);
+    REQUIRE(agg->group_by().size() == 1);
+    const auto* above = project_below(*agg);
+    REQUIRE(above != nullptr);
+    CHECK(names_of(*above) == std::vector<std::string>{"c_custkey", "v"});
+    const auto* customer = project_over_scan(*agg, 1);
+    REQUIRE(customer != nullptr);
+    CHECK(names_of(*customer) == std::vector<std::string>{"c_custkey"});
+    const auto* orders = project_over_scan(*agg, 2);
+    REQUIRE(orders != nullptr);
+    CHECK(names_of(*orders) == std::vector<std::string>{"o_custkey", "v"});
+}
+
+TEST_CASE("payload lift keeps a lifted column a join predicate below the aggregate reads") {
+    // The residual predicate reads c_name, so the customer side still needs it
+    // even though the projection above the join no longer does.
+    auto plan = fused_topk(aggregate({"c_custkey", "c_name"}, projected_join(positive("c_name"))),
+                           "total", 20);
+    plan = ir::reduce_functionally_dependent_group_keys(std::move(plan), customer_orders_sources());
+    REQUIRE(find_join(*plan) != nullptr);
+    const auto* agg = find_aggregate(*plan);
+    REQUIRE(agg != nullptr);
+    const auto* customer = project_over_scan(*agg, 1);
+    REQUIRE(customer != nullptr);
+    CHECK(names_of(*customer) == std::vector<std::string>{"c_custkey", "c_name"});
+}

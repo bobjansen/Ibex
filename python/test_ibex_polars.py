@@ -838,6 +838,41 @@ class EngineTests(unittest.TestCase):
                 self.assertIn("__ibex_nan_high_ge", native)
                 self.assertNotIn("case {", native)
 
+    def test_dictionary_string_filter_after_join_key_scan(self):
+        # Q19's shape: a filtered part side bounds a deferred line-item probe,
+        # whose key scan's candidates are then tested on a dictionary-encoded
+        # string column, code by code. Polars writes every column nullable, so
+        # most batches are nullable with no null in them (the dense path);
+        # some row groups carry nulls and one is all null, which must not be
+        # read as dense. A part column in the output keeps the join inner: with
+        # only line-item columns it is reduced to a semi join, whose streamed
+        # right side never takes this scan.
+        import random
+        rng = random.Random(19)
+        words = ["DELIVER IN PERSON", "COLLECT COD", "NONE", "TAKE BACK RETURN"]
+        rows = 200_000
+        s = [rng.choice(words) for _ in range(rows)]
+        for i in range(40_000, 60_000):
+            s[i] = None if i % 3 == 0 else s[i]
+        for i in range(120_000, 140_000):
+            s[i] = None
+        line = pl.DataFrame({"id": range(rows), "l_partkey": [rng.randrange(10_000) for _ in range(rows)],
+                             "s": s})
+        part = pl.DataFrame({"p_partkey": range(10_000), "p_size": [rng.randrange(1, 51) for _ in range(10_000)]})
+        with tempfile.TemporaryDirectory() as directory:
+            line_path = Path(directory) / "line.parquet"
+            part_path = Path(directory) / "part.parquet"
+            pq.write_table(line.to_arrow(), line_path, row_group_size=20_000, use_dictionary=True)
+            pq.write_table(part.to_arrow(), part_path, row_group_size=10_000)
+            for predicate in (pl.col("s") == "DELIVER IN PERSON",
+                              pl.col("s").is_in(["NONE", "COLLECT COD"]),
+                              pl.col("s") != "NONE"):
+                with self.subTest(predicate=str(predicate)):
+                    query = (pl.scan_parquet(part_path).filter(pl.col("p_size") <= 5)
+                             .join(pl.scan_parquet(line_path), left_on="p_partkey", right_on="l_partkey")
+                             .filter(predicate).select("id", "p_size").sort("id"))
+                    self.equal(query)
+
     def test_categorical_output_preserves_arrow_dictionary(self):
         # Exercise sliced/chunked codes, nulls and a dictionary whose order
         # differs from Polars' global category mapping. No native query is

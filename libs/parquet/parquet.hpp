@@ -3563,7 +3563,14 @@ inline auto filtered_dictionary_string_group_scan(parquet::arrow::FileReader& re
         };
         const std::size_t batch_first = group.base + row;
         const std::size_t batch_end = batch_first + static_cast<std::size_t>(levels);
-        if (within != nullptr && !optional) {
+        // A nullable column whose batch holds no null is laid out like a
+        // non-nullable one: every row has a code, at its own offset, so only
+        // the candidates need looking at. Polars writes every column nullable,
+        // so this is the common case; sending it to the per-row path below
+        // walked and flagged every row of every batch (q19's l_shipinstruct
+        // and l_shipmode: 476 -> 68 ms at one core).
+        const bool dense = !optional || codes_read == levels;
+        if (within != nullptr && dense) {
             // No nulls: a row's code is at its offset, so only candidates are
             // looked at.
             if (codes_read != levels) {

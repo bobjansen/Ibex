@@ -820,6 +820,40 @@ auto streamed_join_left_scans(const Node& root, const std::set<std::string>& sou
     return out;
 }
 
+auto streamed_semi_join_right_scans(const Node& root, const std::set<std::string>& sources)
+    -> std::map<std::string, std::string> {
+    std::map<std::string, std::string> out;
+    if (sources.empty()) {
+        return out;
+    }
+    std::map<std::string, std::size_t> counts;
+    count_scan_occurrences(root, counts);
+    const auto walk = [&](const Node& node, const auto& self) -> void {
+        if (node.kind() == NodeKind::Join) {
+            const auto& join = node_cast<JoinNode>(node);
+            // A right row whose key no left row holds can never make a left
+            // row match, so a semi join may filter its right by the left's
+            // keys. Same streamed shape as the left slot above.
+            if (is_slot_shaped_semi_join(join)) {
+                if (auto match = match_probe_chain(*join.children()[1], join.keys().front().right);
+                    match.has_value() && sources.contains(match->first)) {
+                    if (const auto count = counts.find(match->first);
+                        count != counts.end() && count->second == 1) {
+                        out.emplace(match->first, std::move(match->second));
+                    }
+                }
+            }
+        }
+        for (const auto& child : node.children()) {
+            if (child != nullptr) {
+                self(*child, self);
+            }
+        }
+    };
+    walk(root, walk);
+    return out;
+}
+
 auto remove_applied_scan_filters(NodePtr root, const std::set<std::string>& applied_sources)
     -> NodePtr {
     if (root == nullptr || applied_sources.empty()) {

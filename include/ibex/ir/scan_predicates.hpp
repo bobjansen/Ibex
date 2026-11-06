@@ -188,6 +188,20 @@ struct DeferrableProbeScan {
 [[nodiscard]] auto streamed_join_left_scans(const Node& root, const std::set<std::string>& sources)
     -> std::map<std::string, std::string>;
 
+/// Streamed scans that are the RIGHT input of a single-key semi join, through
+/// Project / Rename / row-local Update only, and occur once in `root`: source
+/// name -> the join key in the scan's own column names.
+///
+/// A right row whose key no left row holds cannot make any left row match, so
+/// the join may fill this scan's `stream_filter` slot with the LEFT side's
+/// keys before pulling a right row; the scan then decodes its other columns
+/// only for rows that can matter (q04: lineitem's two dates for the ~4% of
+/// rows whose order passed the date filter). The join decides at run time,
+/// from both sides' row counts, whether to fill it.
+[[nodiscard]] auto streamed_semi_join_right_scans(const Node& root,
+                                                  const std::set<std::string>& sources)
+    -> std::map<std::string, std::string>;
+
 /// Remove row-local filters which have already been applied by a lazy source.
 /// `applied_sources` must contain only sources for which the caller actually
 /// materialized the selection. The implementation repeats the scan-predicate

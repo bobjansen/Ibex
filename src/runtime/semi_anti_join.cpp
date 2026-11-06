@@ -128,14 +128,15 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     ChunkedSemiAntiJoinOperator(OperatorPtr left, OperatorPtr right, ir::JoinKind kind,
                                 const std::vector<ir::JoinKey>* keys, const ExecutionContext* exec,
                                 std::shared_ptr<SemiAntiScanSink> scan_sink,
-                                const DeferredScan* left_stream)
+                                const DeferredScan* left_stream, const DeferredScan* right_stream)
         : left_(std::move(left)),
           right_op_(std::move(right)),
           kind_(kind),
           keys_(keys),
           exec_(exec),
           scan_sink_(std::move(scan_sink)),
-          left_stream_(left_stream) {}
+          left_stream_(left_stream),
+          right_stream_(right_stream) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (!initialized_) {
@@ -563,6 +564,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             return std::nullopt;
         }
         build_swapped_left_map(lcols, left_rows);
+        publish_right_stream_filter(lcols, left_rows);
         scan_sink_->activate([this](const Chunk& chunk) { return probe_on_worker(chunk); });
         auto err = drain_right_keys();
         scan_sink_->deactivate();
@@ -861,6 +863,33 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             }
         }
         return std::nullopt;
+    }
+
+    /// Fill the streamed RIGHT scan's slot from the buffered left keys, before
+    /// a single right row is pulled: a right row whose key no left row holds
+    /// cannot make any left row match, so the scan need only decode the rest
+    /// of its columns for rows that can (q04: lineitem's two dates for the
+    /// ~4% of rows whose order passed the date filter). The same half-the-
+    /// scan rule as the left slot below; the worker probe stays the exact test.
+    void publish_right_stream_filter(const std::vector<const Column<std::int64_t>*>& lcols,
+                                     std::size_t left_rows) {
+        if (right_stream_ == nullptr || kind_ != ir::JoinKind::Semi || keys_->size() != 1) {
+            return;
+        }
+        DynamicScanFilter& slot = *right_stream_->stream_filter;
+        if (left_rows * 2 <= right_stream_->lazy->rows()) {
+            Column<std::int64_t> keys;
+            keys.reserve(left_rows);
+            for (const auto* col : lcols) {
+                for (std::size_t row = 0; row < col->size(); ++row) {
+                    keys.push_back((*col)[row]);
+                }
+            }
+            Table build;
+            build.add_column(keys_->front().left, std::move(keys));
+            publish_join_key_filter(build, keys_->front().left, slot);
+        }
+        slot.ready = true;
     }
 
     /// Fill the streamed left scan's slot from the drained right keys, before
@@ -1381,6 +1410,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     std::shared_ptr<SemiAntiScanSink> scan_sink_;
     /// The streamed left scan's filter slot (`streamed_left_scan_of`), or null.
     const DeferredScan* left_stream_ = nullptr;
+    const DeferredScan* right_stream_ = nullptr;
     bool right_exhausted_ = false;
     bool left_drained_ = false;
     bool swapped_build_done_ = false;
@@ -1444,10 +1474,11 @@ auto make_chunked_semi_anti_join_operator(OperatorPtr left, OperatorPtr right, i
                                           const std::vector<ir::JoinKey>* keys,
                                           const ExecutionContext* exec,
                                           const std::shared_ptr<ScanWorkerSink>& scan_sink,
-                                          const DeferredScan* left_stream) -> OperatorPtr {
+                                          const DeferredScan* left_stream,
+                                          const DeferredScan* right_stream) -> OperatorPtr {
     return std::make_unique<ChunkedSemiAntiJoinOperator>(
         std::move(left), std::move(right), kind, keys, exec,
-        std::dynamic_pointer_cast<SemiAntiScanSink>(scan_sink), left_stream);
+        std::dynamic_pointer_cast<SemiAntiScanSink>(scan_sink), left_stream, right_stream);
 }
 
 auto is_streamable_semi_anti_join(const ir::JoinNode& join, const ir::SourceSchemas& sources)

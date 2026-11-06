@@ -5985,6 +5985,7 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
     // union once into the registry.
     const auto scan_counts = ir::scan_source_counts(*rewritten);
     const auto streamed_left = ir::streamed_join_left_scans(*rewritten, deferrable_names);
+    const auto semi_right = ir::streamed_semi_join_right_scans(*rewritten, deferrable_names);
     const auto repeated_scan = [&](const std::string& name) {
         const auto it = scan_counts.find(name);
         return it != scan_counts.end() && it->second > 1;
@@ -6006,7 +6007,13 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
             // build side (hence its output order) cannot change.
             const bool absorbed_filter = absorbed.applied.contains(name);
             const auto left_of_join = streamed_left.find(name);
-            const bool slot = left_of_join != streamed_left.end() && !absorbed_filter;
+            // A semi join's right input may carry its own absorbed filter:
+            // the join's swap choice reads source row counts, which the
+            // filter does not change, and the slot only narrows further.
+            const auto right_of_semi = semi_right.find(name);
+            const bool left_slot = left_of_join != streamed_left.end() && !absorbed_filter;
+            const bool right_slot = !left_slot && right_of_semi != semi_right.end();
+            const bool slot = left_slot || right_slot;
             deferred_scans.emplace(
                 name, runtime::DeferredScan{
                           .lazy = resolve_lazy_ptr(name),
@@ -6014,7 +6021,9 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
                                                        : std::vector<ir::Expr>{},
                           .demand = needed.names,
                           .demand_all = needed.all,
-                          .key_column = slot ? left_of_join->second : std::string{},
+                          .key_column = left_slot    ? left_of_join->second
+                                        : right_slot ? right_of_semi->second
+                                                     : std::string{},
                           .filter = nullptr,
                           .stream_filter =
                               slot ? std::make_shared<runtime::DynamicScanFilter>() : nullptr,

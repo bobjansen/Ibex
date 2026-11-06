@@ -125,8 +125,9 @@ struct DeferredProbeScan {
 [[nodiscard]] auto deferred_probe_scan_of(const ir::Node& right, const ExecutionContext& exec)
     -> DeferredProbeScan;
 
-/// The streamed scan under a join's `left` input that carries a
-/// `stream_filter` slot (`ir::streamed_join_left_scans`), or null.
+/// The streamed scan under a join input that carries a `stream_filter` slot
+/// (`ir::streamed_join_left_scans` for a left input,
+/// `ir::streamed_semi_join_right_scans` for a semi join's right), or null.
 [[nodiscard]] auto streamed_left_scan_of(const ir::Node& left, const ExecutionContext& exec)
     -> const DeferredScan*;
 
@@ -162,7 +163,8 @@ void publish_join_key_filter(const Table& build, const std::string& key_name,
 [[nodiscard]] auto make_chunked_semi_anti_join_operator(
     OperatorPtr left, OperatorPtr right, ir::JoinKind kind, const std::vector<ir::JoinKey>* keys,
     const ExecutionContext* exec, const std::shared_ptr<ScanWorkerSink>& scan_sink = nullptr,
-    const DeferredScan* left_stream = nullptr) -> OperatorPtr;
+    const DeferredScan* left_stream = nullptr, const DeferredScan* right_stream = nullptr)
+    -> OperatorPtr;
 
 /// A scan-worker sink for `make_chunked_semi_anti_join_operator`.
 [[nodiscard]] auto make_semi_anti_scan_sink() -> std::shared_ptr<ScanWorkerSink>;

@@ -570,6 +570,52 @@ TEST_CASE("streamed_join_left_scans: the left scan of a single-key inner join",
     CHECK(ir::streamed_join_left_scans(*filtered, {"t"}).empty());
 }
 
+TEST_CASE("streamed_semi_join_right_scans: the right scan of a single-key semi join",
+          "[ir][scan_predicates][deferred_scan]") {
+    const auto join_of = [](ir::JoinKind kind, ir::NodePtr left, ir::NodePtr right) {
+        auto join = std::make_unique<ir::JoinNode>(ir::NodeId{20}, kind,
+                                                   std::vector<ir::JoinKey>{ir::JoinKey{"id"}});
+        join->add_child(std::move(left));
+        join->add_child(std::move(right));
+        return join;
+    };
+    // A right row no left key matches cannot keep a left row, so the right
+    // scan of a semi join takes the left's keys.
+    auto semi = join_of(ir::JoinKind::Semi, make_scan("small"),
+                        std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
+    auto right = ir::streamed_semi_join_right_scans(*semi, {"t", "small"});
+    REQUIRE(right.contains("t"));
+    CHECK(right.at("t") == "id");
+    CHECK_FALSE(right.contains("small"));
+
+    // Not yet for an anti join (sound, but unmeasured), nor an inner one
+    // (its right is the deferred probe's business).
+    auto anti = join_of(ir::JoinKind::Anti, make_scan("small"),
+                        std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
+    CHECK(ir::streamed_semi_join_right_scans(*anti, {"t"}).empty());
+    auto inner = join_of(ir::JoinKind::Inner, make_scan("small"),
+                         std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
+    CHECK(ir::streamed_semi_join_right_scans(*inner, {"t"}).empty());
+
+    // A scan read twice cannot take one join's filter.
+    auto twice = join_of(ir::JoinKind::Semi, std::make_unique<ir::ScanNode>(ir::NodeId{3}, "t"),
+                         std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
+    CHECK(ir::streamed_semi_join_right_scans(*twice, {"t"}).empty());
+
+    // A Filter between the scan and the join does not commute with dropping
+    // rows at the scan.
+    ir::Expr predicate{
+        .node = ir::CompareExpr{
+            .op = ir::CompareOp::Gt,
+            .left = col("id"),
+            .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{0}}})}};
+    auto filtered =
+        join_of(ir::JoinKind::Semi, make_scan("small"),
+                with_child(std::make_unique<ir::FilterNode>(ir::NodeId{4}, std::move(predicate)),
+                           std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t")));
+    CHECK(ir::streamed_semi_join_right_scans(*filtered, {"t"}).empty());
+}
+
 TEST_CASE("deferrable_probe_scans: an unfiltered build side is declined",
           "[ir][scan_predicates][deferred_scan]") {
     // The row-count gate alone says yes -- 1.5M build rows against 12M probe

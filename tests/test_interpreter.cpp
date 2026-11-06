@@ -20037,6 +20037,77 @@ TEST_CASE("A streamed semi join left input is filtered by its right keys",
     }
 }
 
+TEST_CASE("A streamed semi join right input is filtered by its left keys",
+          "[runtime][join][semi][stream_filter]") {
+    // The mirror of the test above: a small left (keys 0..9 and a null) and a
+    // large streamed right. The swapped build buffers the left and fills the
+    // right scan's slot before pulling a right row, so the right decodes its
+    // other columns only where its key can match: 160 of 8000 rows, measured
+    // on `payload`. The scan keeps a conjunct of its own (q04's
+    // `l_commitdate < l_receiptdate`), here on the key so `payload` stays an
+    // output-only column. The swap needs a fan-out; one thread drains the
+    // right first and leaves the slot unfilled.
+    runtime::Table left;
+    left.add_column(
+        "k", Column<std::int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0},
+        runtime::ValidityBitmap{true, true, true, true, true, true, true, true, true, true, false});
+    runtime::TableRegistry registry;
+    registry.emplace("small", std::move(left));
+
+    const auto run = [&](const char* query, bool with_slot, std::size_t threads) {
+        auto ir = require_ir(query);
+        auto state = std::make_shared<StreamLeftState>();
+        runtime::Table schema;
+        schema.add_column("k", Column<std::int64_t>{});
+        schema.add_column("payload", Column<std::int64_t>{});
+        auto lazy = std::make_shared<runtime::LazyTable>(
+            std::move(schema), StreamLeftReader::kUnits * StreamLeftReader::kUnitRows,
+            [state]() -> std::expected<runtime::LazySourceReaderPtr, std::string> {
+                return runtime::LazySourceReaderPtr{std::make_unique<StreamLeftReader>(state)};
+            });
+        auto slot = with_slot ? std::make_shared<runtime::DynamicScanFilter>() : nullptr;
+        std::vector<ir::Expr> conjuncts;
+        conjuncts.push_back(ir::Expr{ir::CompareExpr{
+            .op = ir::CompareOp::Ge,
+            .left = ir::make_expr_ptr(ir::Expr{ir::ColumnRef{.name = "k"}}),
+            .right = ir::make_expr_ptr(ir::Expr{ir::Literal{.value = std::int64_t{0}}}),
+        }});
+        runtime::DeferredScanRegistry deferred;
+        deferred.emplace("right_t", runtime::DeferredScan{
+                                        .lazy = std::move(lazy),
+                                        .conjuncts = std::move(conjuncts),
+                                        .demand = {"k", "payload"},
+                                        .demand_all = false,
+                                        .key_column = with_slot ? "k" : "",
+                                        .filter = nullptr,
+                                        .stream_filter = slot,
+                                    });
+        runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+        exec.parallel_threads = threads;
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        return std::tuple{std::move(*out), state, slot};
+    };
+
+    for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+        CAPTURE(threads);
+        auto [filtered, state, slot] = run("small semi join right_t on k;", true, threads);
+        auto [unfiltered, plain_state, no_slot] =
+            run("small semi join right_t on k;", false, threads);
+        REQUIRE(slot != nullptr);
+        CHECK(plain_state->payload_rows.load() == 8000);
+        if (threads > 1) {
+            CHECK(slot->ready);
+            CHECK(slot->has_membership());
+            CHECK(state->payload_rows.load() == 160);
+        } else {
+            CHECK(state->payload_rows.load() == 8000);
+        }
+        REQUIRE(filtered.rows() == 10);
+        CHECK_FALSE(runtime::compare_tables(unfiltered, filtered).has_value());
+    }
+}
+
 TEST_CASE("Inner join probe fans out across workers and matches the serial probe",
           "[runtime][parallel][join]") {
     // Above the parallel probe's 1<<14 row gate so the fan-out actually

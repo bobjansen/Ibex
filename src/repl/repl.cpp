@@ -24,6 +24,7 @@
 #include <ibex/ir/required_columns.hpp>
 #include <ibex/ir/scan_predicates.hpp>
 #include <ibex/ir/schema.hpp>
+#include <ibex/ir/sort_key_reduction.hpp>
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/names.hpp>
@@ -5849,6 +5850,9 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
     // Two occurrences of one source in a self-join are kept apart by the
     // scan-node identity carried in `ColumnOrigin`, not by a rewrite.
     rewritten = ir::reduce_functionally_dependent_group_keys(std::move(rewritten), schemas);
+    // Schema-aware like the reduction above: a null flag a frontend sorts on
+    // is constant once its operand is proved null-free, so drop the key.
+    rewritten = ir::drop_constant_null_flag_sort_keys(std::move(rewritten), schemas);
     // Needs no schema or uniqueness proof of its own -- it decides by
     // walking the plan -- but it runs here so it sees the shape the joins
     // and the FD reduction leave behind.

@@ -161,3 +161,20 @@ TEST_CASE("probed key restriction: declined when the probe side cannot be replay
         plan(ir::JoinKind::Left, std::move(extern_probe)), stats());
     CHECK(restriction_of(*root) == nullptr);
 }
+
+TEST_CASE("probed key restriction: a filter below a distinct probe still counts",
+          "[ir][probed-keys]") {
+    // The probe side keys into a filtered, de-duplicated slice of `facts`, so
+    // the filter is what makes it smaller than the aggregate's 400k groups.
+    // A Distinct over it must not hide that cut (the adapter's PDS-H q20
+    // probes through `distinct { p_partkey }` of a filtered part table).
+    auto filter = std::make_unique<ir::FilterNode>(ir::NodeId{4},
+                                                   ir::Expr{.node = ir::Literal{.value = true}});
+    filter->add_child(make_scan(ir::NodeId{3}, "facts"));
+    auto distinct = std::make_unique<ir::DistinctNode>(ir::NodeId{5});
+    distinct->add_child(std::move(filter));
+    auto root =
+        ir::restrict_aggregates_to_probed_keys(plan(ir::JoinKind::Inner, std::move(distinct)),
+                                               stats());
+    CHECK(restriction_of(*root) != nullptr);
+}

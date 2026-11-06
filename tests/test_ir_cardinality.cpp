@@ -253,3 +253,20 @@ TEST_CASE("cardinality loses the unique key when a projection drops it", "[ir][c
 
     CHECK_FALSE(ir::estimate_cardinality(*join, {{"supplier", 10'000}}).rows.has_value());
 }
+
+TEST_CASE("cardinality bounds a distinct by its input", "[ir][cardinality]") {
+    // Distinct only removes rows, so the filtered count below it is an upper
+    // bound -- and the filter's selectivity must survive it.
+    ir::Builder builder;
+    auto filter = builder.filter(ir::Expr{.node = ir::Literal{.value = true}});
+    filter->add_child(builder.scan("orders"));
+    auto distinct = builder.distinct();
+    distinct->add_child(std::move(filter));
+
+    const auto estimate =
+        ir::estimate_cardinality(*distinct, {{"orders", 1'500}}, {},
+                                 {.filter_selectivity = 0.1, .absorbed_scan_selectivity = {}});
+    REQUIRE(estimate.rows.has_value());
+    CHECK(*estimate.rows == 150);
+    CHECK(estimate.heuristic);
+}

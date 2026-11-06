@@ -125,6 +125,17 @@ auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSche
             }
             return {.rows = std::min(*input.rows, *limit), .heuristic = input.heuristic};
         }
+        // Distinct only removes rows, so its input's count is a hard upper
+        // bound. Used as the point estimate, like the inner-join bound below,
+        // it reads high whenever there are duplicates. Leaving it unestimated
+        // instead hid every filter beneath it: the adapter's PDS-H q20 probes
+        // through `distinct { p_partkey }` of a `like`-filtered part table, and
+        // without the filter's cut the probed-key restriction compared the
+        // footer's 2M part keys with 2M groups and declined.
+        case NodeKind::Distinct: {
+            auto input = child();
+            return {.rows = input.rows, .heuristic = true};
+        }
         // An aggregate emits one row per distinct group, so its size is the
         // distinct cardinality of its group keys -- which needs statistics we
         // do not have, so a grouped aggregate goes unestimated. An UNgrouped

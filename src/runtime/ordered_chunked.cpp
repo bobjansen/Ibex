@@ -539,23 +539,15 @@ class ChunkedOrderedLimitOperator final : public Operator {
                                              : row_comes_first(rhs, lhs);
     }
 
-    /// Key equality and strict order for the typed heaps: the Float64 order for
-    /// a double (every NaN ties and sorts last ascending), `==`/`<` otherwise.
+    /// Three-way key compare for the typed heaps: the Float64 order for a
+    /// double (every NaN ties and sorts last ascending), `<` otherwise. One
+    /// call per input row, so it keeps the old `==`-then-`<` cost.
     template <typename T>
-    [[nodiscard]] static auto key_ties(const T& lhs, const T& rhs) -> bool {
+    [[nodiscard]] static auto key_compare(const T& lhs, const T& rhs) -> int {
         if constexpr (std::is_same_v<T, double>) {
-            return order_compare_double(lhs, rhs) == 0;
+            return order_compare_double(lhs, rhs);
         } else {
-            return lhs == rhs;
-        }
-    }
-
-    template <typename T>
-    [[nodiscard]] static auto key_before(const T& lhs, const T& rhs) -> bool {
-        if constexpr (std::is_same_v<T, double>) {
-            return order_less_double(lhs, rhs);
-        } else {
-            return lhs < rhs;
+            return lhs < rhs ? -1 : (rhs < lhs ? 1 : 0);
         }
     }
 
@@ -566,11 +558,12 @@ class ChunkedOrderedLimitOperator final : public Operator {
         if (rhs_key == nullptr) {
             invariant_violation("ChunkedOrderedLimitOperator: single-key type mismatch");
         }
-        if (key_ties(lhs, *rhs_key)) {
+        const int cmp = key_compare(lhs, *rhs_key);
+        if (cmp == 0) {
             return keep_mode_ == KeepMode::First ? (lhs_sequence < rhs.sequence)
                                                  : (rhs.sequence < lhs_sequence);
         }
-        const bool lhs_first = ascending ? key_before(lhs, *rhs_key) : key_before(*rhs_key, lhs);
+        const bool lhs_first = ascending ? cmp < 0 : cmp > 0;
         return keep_mode_ == KeepMode::First ? lhs_first : !lhs_first;
     }
 
@@ -871,18 +864,27 @@ class ChunkedOrderedLimitOperator final : public Operator {
     template <typename K>
     [[nodiscard]] auto pod_better(const PodEntry<K>& lhs, const PodEntry<K>& rhs,
                                   bool ascending) const -> bool {
-        // `single_key_better`, on the flat entry, with a null key last.
-        const bool lhs_null = (lhs.sequence & kPodNullKey) != 0;
-        const bool rhs_null = (rhs.sequence & kPodNullKey) != 0;
-        if (lhs_null == rhs_null && (lhs_null || key_ties(lhs.key, rhs.key))) {
-            const std::uint64_t lhs_sequence = lhs.sequence & ~kPodNullKey;
-            const std::uint64_t rhs_sequence = rhs.sequence & ~kPodNullKey;
-            return keep_mode_ == KeepMode::First ? (lhs_sequence < rhs_sequence)
-                                                 : (rhs_sequence < lhs_sequence);
+        // `single_key_better`, on the flat entry, with a null key last. Either
+        // flag set is rare: the common case pays one test for both.
+        bool lhs_first = false;
+        if (((lhs.sequence | rhs.sequence) & kPodNullKey) != 0) [[unlikely]] {
+            const bool lhs_null = (lhs.sequence & kPodNullKey) != 0;
+            const bool rhs_null = (rhs.sequence & kPodNullKey) != 0;
+            if (lhs_null == rhs_null) {
+                const std::uint64_t lhs_sequence = lhs.sequence & ~kPodNullKey;
+                const std::uint64_t rhs_sequence = rhs.sequence & ~kPodNullKey;
+                return keep_mode_ == KeepMode::First ? (lhs_sequence < rhs_sequence)
+                                                     : (rhs_sequence < lhs_sequence);
+            }
+            lhs_first = rhs_null;
+        } else {
+            const int cmp = key_compare(lhs.key, rhs.key);
+            if (cmp == 0) {
+                return keep_mode_ == KeepMode::First ? (lhs.sequence < rhs.sequence)
+                                                     : (rhs.sequence < lhs.sequence);
+            }
+            lhs_first = ascending ? cmp < 0 : cmp > 0;
         }
-        const bool lhs_first = lhs_null != rhs_null ? rhs_null
-                                                    : (ascending ? key_before(lhs.key, rhs.key)
-                                                                 : key_before(rhs.key, lhs.key));
         return keep_mode_ == KeepMode::First ? lhs_first : !lhs_first;
     }
 

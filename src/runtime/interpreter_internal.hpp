@@ -1644,19 +1644,26 @@ void sort_key_index_slice(std::uint64_t* keys, std::size_t* idx, std::size_t n,
 // [1, NaN, 0]. Every place that orders doubles goes through one of these two,
 // so the radix, comparison, top-k and rank paths cannot disagree.
 
-/// Three-way compare under the Float64 order: -1, 0 or 1.
+/// Three-way compare under the Float64 order: -1, 0 or 1. The ordered cases
+/// come first, so a NaN-free comparison costs what IEEE `<`/`>` cost (the
+/// top-k heaps make one per input row); a NaN is only tested for once the
+/// pair compares unordered.
 inline auto order_compare_double(double lhs, double rhs) -> int {
-    const bool lhs_nan = std::isnan(lhs);
-    const bool rhs_nan = std::isnan(rhs);
-    if (lhs_nan || rhs_nan) {
-        return static_cast<int>(lhs_nan) - static_cast<int>(rhs_nan);
+    if (lhs < rhs) {
+        return -1;
     }
-    return static_cast<int>(lhs > rhs) - static_cast<int>(lhs < rhs);
+    if (rhs < lhs) {
+        return 1;
+    }
+    if (lhs == rhs) {
+        return 0;  // including -0.0 against 0.0
+    }
+    return static_cast<int>(std::isnan(lhs)) - static_cast<int>(std::isnan(rhs));
 }
 
 /// `lhs` sorts strictly before `rhs` under the Float64 order.
 inline auto order_less_double(double lhs, double rhs) -> bool {
-    return !std::isnan(lhs) && (std::isnan(rhs) || lhs < rhs);
+    return lhs < rhs || (!(lhs >= rhs) && std::isnan(rhs) && !std::isnan(lhs));
 }
 
 // Map a double to a uint64 whose unsigned order is the Float64 order, so

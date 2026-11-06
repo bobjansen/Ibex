@@ -2350,6 +2350,7 @@ class HashAggregateState final {
         // Build the deferred index from the groups numbered so far: the serial
         // loop is about to probe it.
         const auto materialize_int_index = [&] {
+            deferred_int_index_builds().fetch_add(1, std::memory_order_relaxed);
             int_index_.reserve(n_groups_);
             for (std::size_t g = 0; g < n_groups_; ++g) {
                 int_index_.emplace(int_order_[g], static_cast<std::uint32_t>(g));
@@ -2370,6 +2371,18 @@ class HashAggregateState final {
             std::uint32_t gid{};
             if (have_prev && key == prev_key) {
                 gid = prev_gid;
+            } else if (int_index_deferred_ && n_groups_ != 0 && key == int_max_key_) {
+                // The previous CHUNK's last group, continued across the
+                // boundary: `prev_key` starts over with each chunk, but while
+                // deferred every group was numbered in increasing key order,
+                // so the largest key is the newest group. Without this, one
+                // l_orderkey split between two streamed chunks built the
+                // whole index and hashed every later row (q18 at one core:
+                // discovery 1.85 s streamed vs 0.44 s materialized).
+                gid = static_cast<std::uint32_t>(n_groups_ - 1);
+                prev_key = key;
+                prev_gid = gid;
+                have_prev = true;
             } else if (int_index_deferred_ && (n_groups_ == 0 || key > int_max_key_)) {
                 // Above every key seen, so new; see `int_index_deferred_`.
                 gid = static_cast<std::uint32_t>(n_groups_);
@@ -8470,8 +8483,9 @@ class HashAggregateState final {
     robin_hood::unordered_flat_map<std::int64_t, std::uint32_t> int_index_;
     /// While the serial loop has only ever met keys in strictly increasing
     /// order of first appearance, `int_index_` is left empty: a key equal to
-    /// the previous row's is that row's group, and a key above every key seen
-    /// is necessarily new, so no lookup is needed. Sorted input (TPC-H's
+    /// the previous row's -- or, across a chunk boundary, to `int_max_key_` --
+    /// is that row's group, and a key above every key seen is necessarily
+    /// new, so no lookup is needed. Sorted input (TPC-H's
     /// l_orderkey) then never builds the map at all. The first key that goes
     /// backwards builds `int_index_` once from `int_order_` and clears this.
     bool int_index_deferred_ = true;
@@ -9548,6 +9562,11 @@ class ChunkedSortedAggregateOperator final : public Operator {
 };
 
 }  // namespace
+
+auto deferred_int_index_builds() -> std::atomic<std::uint64_t>& {
+    static std::atomic<std::uint64_t> count{0};
+    return count;
+}
 
 auto packed_nullable_key_chunks() -> std::atomic<std::uint64_t>& {
     static std::atomic<std::uint64_t> count{0};

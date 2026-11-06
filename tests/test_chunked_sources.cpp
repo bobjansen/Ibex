@@ -3167,3 +3167,75 @@ TEST_CASE("chunked top-k sorts a null key last", "[runtime][chunked][topk][nulls
         }
     }
 }
+
+namespace {
+
+/// A chunked (k, v) source: one chunk per entry of `keys`, v = 1 per row.
+void register_int_key_chunks(runtime::ExternRegistry& externs,
+                             std::vector<std::vector<std::int64_t>> keys) {
+    externs.register_chunked_table("int_key_chunks", [keys](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        for (const auto& part : keys) {
+            runtime::Chunk chunk;
+            runtime::ColumnEntry k;
+            k.name = "k";
+            k.column = std::make_shared<runtime::ColumnValue>(Column<std::int64_t>{part});
+            runtime::ColumnEntry v;
+            v.name = "v";
+            v.column = std::make_shared<runtime::ColumnValue>(
+                Column<std::int64_t>(std::vector<std::int64_t>(part.size(), 1)));
+            chunk.columns.push_back(std::move(k));
+            chunk.columns.push_back(std::move(v));
+            chunks.push_back(std::move(chunk));
+        }
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+}
+
+auto run_extern_serial(const std::string& source, const runtime::ExternRegistry& externs)
+    -> runtime::Table {
+    auto program = parser::parse(source);
+    REQUIRE(program.has_value());
+    auto ir = parser::lower(program.value());
+    REQUIRE(ir.has_value());
+    const runtime::TableRegistry registry;
+    runtime::ExecutionContext exec;
+    exec.parallel_threads = 1;
+    auto result = runtime::interpret(*ir.value(), registry, nullptr, &externs, nullptr, exec);
+    REQUIRE(result.has_value());
+    return std::move(*result);
+}
+
+}  // namespace
+
+TEST_CASE("chunked int aggregate keeps sorted keys unindexed across chunk boundaries",
+          "[runtime][chunked][aggregate]") {
+    // A sorted key (TPC-H l_orderkey) whose groups straddle chunk boundaries:
+    // the next chunk starts with the previous chunk's last key. That is still
+    // ascending, so the serial loop must not build its hash index for it --
+    // it did, and hashed every later row (q18 at one core: 1.85 s vs 0.44 s).
+    const auto query = std::string{
+        "extern fn int_key_chunks() -> DataFrame from \"x.hpp\"; "
+        "int_key_chunks()[select { n = sum(v) }, by k];"};
+    {
+        runtime::ExternRegistry externs;
+        register_int_key_chunks(externs, {{1, 2, 2}, {2, 3, 3}, {3, 4}});
+        const auto before = runtime::deferred_int_index_builds().load();
+        const auto out = run_extern_serial(query, externs);
+        CHECK(runtime::deferred_int_index_builds().load() == before);
+        CHECK(int_column(out, "k") == std::vector<std::int64_t>{1, 2, 3, 4});
+        CHECK(int_column(out, "n") == std::vector<std::int64_t>{1, 3, 3, 1});
+    }
+    {
+        // A key that goes back really is out of order: the index is built,
+        // and the old group is found, not duplicated.
+        runtime::ExternRegistry externs;
+        register_int_key_chunks(externs, {{1, 2, 2}, {2, 3}, {1, 4}});
+        const auto before = runtime::deferred_int_index_builds().load();
+        const auto out = run_extern_serial(query, externs);
+        CHECK(runtime::deferred_int_index_builds().load() > before);
+        CHECK(int_column(out, "k") == std::vector<std::int64_t>{1, 2, 3, 4});
+        CHECK(int_column(out, "n") == std::vector<std::int64_t>{2, 3, 1, 1});
+    }
+}

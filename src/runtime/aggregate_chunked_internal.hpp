@@ -33,6 +33,11 @@ namespace ibex::runtime {
 /// path gives the same answer, so only this tells the two apart.
 [[nodiscard]] auto packed_nullable_key_chunks() -> std::atomic<std::uint64_t>&;
 
+/// How many times, process-wide, the single-int serial loop gave up its
+/// deferred index (`int_index_deferred_`) and built the hash map. For tests:
+/// the map gives the same answer, only slower, so only this tells them apart.
+[[nodiscard]] auto deferred_int_index_builds() -> std::atomic<std::uint64_t>&;
+
 /// How many Categorical key columns, process-wide, an aggregate's key store
 /// began holding as codes alone, its text read through the dictionary. For
 /// tests: storing the text too gives the same answer.

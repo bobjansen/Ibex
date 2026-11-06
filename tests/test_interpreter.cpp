@@ -3904,6 +3904,44 @@ TEST_CASE("is_nan accepts a computed argument", "[interpreter][update][nan]") {
     CHECK((*bad)[2] == false);
 }
 
+TEST_CASE("AND of true and null is null", "[interpreter][update][null]") {
+    // SPEC 3.5: `true AND null` is null, `false AND null` false. The mask
+    // combine wrote the AND over the left side's values in place and only then
+    // computed validity from them, so a true left beside a null right read as
+    // a known false and came out a valid false. Filters never saw it (null
+    // keeps no row either way); a stored or cast predicate did.
+    runtime::Table table;
+    table.add_column("i", Column<std::int64_t>{3, 3, 0, 1, 1},
+                     std::vector<bool>{true, true, false, true, true});
+    table.add_column("j", Column<std::int64_t>{0, 5, 0, 0, 5},
+                     std::vector<bool>{false, true, false, false, true});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+    auto ir = require_ir(
+        "t[update { a = (i != 1) && (j > 2), b = (j > 2) && (i != 1), o = (i == 1) || (j > 2) }];");
+    auto out = runtime::interpret(*ir, registry);
+    REQUIRE(out.has_value());
+    // Rows: true&&null, true&&true, null&&null, false&&null, false&&true.
+    const std::vector<std::optional<bool>> want_and{std::nullopt, true, std::nullopt, false, false};
+    // (i == 1) || (j > 2): false||null, false||true, null||null, true||null, true||true.
+    const std::vector<std::optional<bool>> want_or{std::nullopt, true, std::nullopt, true, true};
+    const auto read = [&](const char* name) {
+        const auto* entry = out->find_entry(name);
+        REQUIRE(entry != nullptr);
+        const auto* values = std::get_if<Column<bool>>(entry->column.get());
+        REQUIRE(values != nullptr);
+        std::vector<std::optional<bool>> got;
+        for (std::size_t r = 0; r < values->size(); ++r) {
+            const bool valid = !entry->validity.has_value() || (*entry->validity)[r];
+            got.push_back(valid ? std::optional<bool>{(*values)[r]} : std::nullopt);
+        }
+        return got;
+    };
+    CHECK(read("a") == want_and);
+    CHECK(read("b") == want_and);
+    CHECK(read("o") == want_or);
+}
+
 TEST_CASE("windowed update keeps validity on plain computed fields",
           "[interpreter][window][null]") {
     // A computed field inside `window ... update` must carry input nulls the

@@ -2161,8 +2161,11 @@ auto compute_mask(const ir::Expr& expr, const PredicateInput& input, const Scala
                 uint8_t* out = left->value.data();
                 const uint8_t* lp = out;
                 const uint8_t* rp = right->value.data();
-                for (std::size_t i = 0; i < count; ++i)
-                    out[i] = is_and ? (lp[i] & rp[i]) : (lp[i] | rp[i]);
+                // Validity FIRST: it reads each side's own value, and the
+                // combined value is written over the left side's in place.
+                // In the other order `true AND null` read the combined 0 as a
+                // known-false left side and came out a valid false (SPEC 3.5:
+                // it is null).
                 if (left->valid || right->valid) {
                     if (!left->valid)
                         left->valid.emplace(n, uint8_t{1});
@@ -2189,6 +2192,8 @@ auto compute_mask(const ir::Expr& expr, const PredicateInput& input, const Scala
                         }
                     }
                 }
+                for (std::size_t i = 0; i < count; ++i)
+                    out[i] = is_and ? (lp[i] & rp[i]) : (lp[i] | rp[i]);
                 return std::move(*left);
             } else if constexpr (std::is_same_v<T, ir::IsNullExpr>) {
                 // IS NULL / IS NOT NULL: test the operand column's validity.

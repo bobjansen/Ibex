@@ -580,3 +580,74 @@ TEST_CASE("NaN keys: an as-of join's NaN equality key matches nothing", "[nulls]
         CHECK(nulls(out, "rv") == std::vector<bool>{true, false, true});
     }
 }
+
+// Float64 ORDER: every NaN, whatever its sign or payload, ties with every
+// other NaN and sorts above +inf, so it lands last under `asc` and first under
+// `desc`; -0.0 ties with 0.0; null stays last under both (Polars, DuckDB and
+// PostgreSQL all put NaN above every number). Rows of `nan_keys_no_nulls`:
+//   k: NaN 1.0 -NaN -0.0 0.0 NaN' 1.0   v: 1 2 4 8 16 32 64
+TEST_CASE("NaN order: every sort path puts NaN above every number", "[order][nan]") {
+    const auto plain = nan_keys_no_nulls();
+    // Single ascending Float64 key: the double radix fast path.
+    CHECK(ints(run("t[order { k asc }];", plain), "v") ==
+          std::vector<std::int64_t>{8, 16, 2, 64, 1, 4, 32});
+    // Single descending numeric key: the multi-key radix path.
+    CHECK(ints(run("t[order { k desc }];", plain), "v") ==
+          std::vector<std::int64_t>{1, 4, 32, 2, 64, 8, 16});
+    CHECK(ints(run("t[order { g asc, k desc }];", plain), "v") ==
+          std::vector<std::int64_t>{1, 4, 32, 2, 64, 8, 16});
+
+    // A null-bearing key takes the comparison sort. Null row v = 64.
+    const auto with_null = nan_keys();
+    CHECK(ints(run("t[order { k asc }];", with_null), "v") ==
+          std::vector<std::int64_t>{8, 16, 2, 128, 1, 4, 32, 64});
+    CHECK(ints(run("t[order { k desc }];", with_null), "v") ==
+          std::vector<std::int64_t>{1, 4, 32, 2, 128, 8, 16, 64});
+}
+
+TEST_CASE("NaN order: top-k keeps NaN above every number", "[order][topk][nan]") {
+    const auto plain = nan_keys_no_nulls();
+    CHECK(ints(run("t[order { k desc }, head 4];", plain), "v") ==
+          std::vector<std::int64_t>{1, 4, 32, 2});
+    CHECK(ints(run("t[order { k asc }, head 3];", plain), "v") ==
+          std::vector<std::int64_t>{8, 16, 2});
+    const auto with_null = nan_keys();
+    CHECK(ints(run("t[order { k desc }, head 3];", with_null), "v") ==
+          std::vector<std::int64_t>{1, 4, 32});
+}
+
+TEST_CASE("NaN order: rank ties every NaN and ranks it last ascending", "[order][rank][nan]") {
+    const auto plain = nan_keys_no_nulls();
+    // Zeros rank 1, the 1.0s 2, every NaN 3.
+    CHECK(ints(run("t[update { r = rank(k, method = dense) }];", plain), "r") ==
+          std::vector<std::int64_t>{3, 2, 3, 1, 1, 3, 2});
+}
+
+TEST_CASE("NaN order: a NaN in the middle is not already sorted", "[order][nan]") {
+    // `<` against a NaN is false both ways, so a scan for a decreasing step
+    // with `<` passes [1, NaN, 0].
+    runtime::Table t;
+    t.add_column("k", Column<double>{1.0, std::numeric_limits<double>::quiet_NaN(), 0.0});
+    t.add_column("v", Column<std::int64_t>{1, 2, 3});
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+    CHECK(ints(run("t[order { k asc }];", tables), "v") == std::vector<std::int64_t>{3, 1, 2});
+}
+
+TEST_CASE("NaN order: the shared Float64 order helpers", "[order][nan]") {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    const auto payload = std::bit_cast<double>(std::uint64_t{0x7ff8000000000123ULL});
+    CHECK(runtime::order_compare_double(nan, -nan) == 0);
+    CHECK(runtime::order_compare_double(nan, payload) == 0);
+    CHECK(runtime::order_compare_double(nan, inf) == 1);
+    CHECK(runtime::order_compare_double(-inf, -nan) == -1);
+    CHECK(runtime::order_compare_double(-0.0, 0.0) == 0);
+    CHECK(runtime::order_less_double(inf, nan));
+    CHECK_FALSE(runtime::order_less_double(nan, inf));
+    CHECK_FALSE(runtime::order_less_double(nan, nan));
+    CHECK(runtime::double_to_sortable_u64(-nan) == runtime::double_to_sortable_u64(payload));
+    CHECK(runtime::double_to_sortable_u64(-0.0) == runtime::double_to_sortable_u64(0.0));
+    CHECK(runtime::double_to_sortable_u64(inf) < runtime::double_to_sortable_u64(-nan));
+    CHECK(runtime::double_to_sortable_u64(-inf) < runtime::double_to_sortable_u64(-1.0));
+}

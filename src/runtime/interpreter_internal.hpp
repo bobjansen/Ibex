@@ -1637,12 +1637,38 @@ struct RadixSliceScratch {
 void sort_key_index_slice(std::uint64_t* keys, std::size_t* idx, std::size_t n,
                           RadixSliceScratch& scratch);
 
-// Map an IEEE-754 double to a uint64 whose unsigned order matches ascending
-// double order, so radix_sort_u64_asc can sort doubles directly. For positive
-// values flip the sign bit; for negatives flip all bits. NaNs (sign bit clear)
-// sort to the end. The transform is a bijection, so radix stays stable.
+// Float64 ORDER (SPEC 3.5, Null Keys): every NaN, whatever its sign or payload,
+// ties with every other NaN and sorts above +inf; -0.0 ties with 0.0. That is a
+// total order, which IEEE `<` is not -- a comparison sort fed `<` with a NaN in
+// it has no defined result, and a "never decreases" scan with `<` passes
+// [1, NaN, 0]. Every place that orders doubles goes through one of these two,
+// so the radix, comparison, top-k and rank paths cannot disagree.
+
+/// Three-way compare under the Float64 order: -1, 0 or 1.
+inline auto order_compare_double(double lhs, double rhs) -> int {
+    const bool lhs_nan = std::isnan(lhs);
+    const bool rhs_nan = std::isnan(rhs);
+    if (lhs_nan || rhs_nan) {
+        return static_cast<int>(lhs_nan) - static_cast<int>(rhs_nan);
+    }
+    return static_cast<int>(lhs > rhs) - static_cast<int>(lhs < rhs);
+}
+
+/// `lhs` sorts strictly before `rhs` under the Float64 order.
+inline auto order_less_double(double lhs, double rhs) -> bool {
+    return !std::isnan(lhs) && (std::isnan(rhs) || lhs < rhs);
+}
+
+// Map a double to a uint64 whose unsigned order is the Float64 order, so
+// radix_sort_u64_asc can sort doubles directly: NaN is canonicalized to the
+// positive quiet NaN (above +inf) and -0.0 to 0.0, then positive values flip
+// the sign bit and negatives flip all bits. Ties map to one code, so radix
+// stays stable.
 inline auto double_to_sortable_u64(double value) -> std::uint64_t {
-    const auto bits = std::bit_cast<std::uint64_t>(value);
+    constexpr std::uint64_t kQuietNan = 0x7FF8'0000'0000'0000ULL;
+    auto bits = std::bit_cast<std::uint64_t>(value);
+    bits = (bits & ~(std::uint64_t{1} << 63)) > 0x7FF0'0000'0000'0000ULL ? kQuietNan : bits;
+    bits = (bits << 1U) == 0 ? 0 : bits;
     return bits ^ ((static_cast<std::uint64_t>(-static_cast<std::int64_t>(bits >> 63))) |
                    (std::uint64_t{1} << 63));
 }

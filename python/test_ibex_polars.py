@@ -796,6 +796,22 @@ class EngineTests(unittest.TestCase):
             for last in (False, True):
                 self.equal(frame.sort("x", descending=descending, nulls_last=last, maintain_order=True))
 
+    def test_sort_ties_every_nan_and_both_zeros(self):
+        # Native order needs no NaN flag: every NaN, sign or payload, ties and
+        # sorts above +inf, and -0.0 ties with 0.0, as in Polars.
+        import struct
+        negative_nan = struct.unpack("<d", struct.pack("<Q", 0xFFF8000000000000))[0]
+        payload_nan = struct.unpack("<d", struct.pack("<Q", 0x7FF8000000000123))[0]
+        frame = pl.DataFrame({"x": [0., float("nan"), -0., negative_nan, None, float("inf"), payload_nan, 1.],
+                              "g": [1, 0, 1, 0, 1, 0, 1, 0], "id": range(8)}).lazy()
+        for descending in (False, True):
+            for last in (False, True):
+                with self.subTest(descending=descending, nulls_last=last):
+                    self.equal(frame.sort("x", descending=descending, nulls_last=last, maintain_order=True))
+                    self.equal(frame.sort(["g", "x"], descending=[False, descending], nulls_last=last,
+                                          maintain_order=True))
+        self.assertNotIn("is_nan", self.engine.explain(frame.sort("x")))
+
     def test_nan_high_comparison_matrix_resident_and_parquet(self):
         values = [-float("inf"), -1., -0., 0., 1., float("inf"), float("nan"), None]
         frame = pl.DataFrame({"id": range(64), "x": [x for x in values for _ in values],

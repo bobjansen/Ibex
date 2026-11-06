@@ -812,6 +812,11 @@ holds:
   compare keys with IEEE `==`, so a NaN join key matches nothing.
 - **`order`**: nulls sort last under both `asc` and `desc`. Their position does
   not flip with the direction.
+- **NaN in a Float64 sort key**: every NaN, whatever its payload or sign, ties
+  with every other NaN and sorts above `+inf`, so it comes last under `asc` and
+  first under `desc`; nulls still come after it. `-0.0` ties with `0.0`. This holds
+  for `order`, `order ..., head`/`tail` and `rank`, and matches Polars, DuckDB
+  and PostgreSQL.
 - **Joins**: a null key matches nothing, not even another null, unless the
   join says `nulls equal` (Section 5.6).
 

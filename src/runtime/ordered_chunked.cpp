@@ -267,8 +267,17 @@ class ChunkedOrderOperator final : public Operator {
                                 break;
                             }
                         }
-                    } else if constexpr (std::is_same_v<ColT, Column<std::int64_t>> ||
-                                         std::is_same_v<ColT, Column<double>>) {
+                    } else if constexpr (std::is_same_v<ColT, Column<double>>) {
+                        handled = true;
+                        for (std::size_t i = 1; i < rows; ++i) {
+                            const bool bad = asc ? order_less_double(col[i], col[i - 1])
+                                                 : order_less_double(col[i - 1], col[i]);
+                            if (bad) {
+                                sorted = false;
+                                break;
+                            }
+                        }
+                    } else if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
                         handled = true;
                         for (std::size_t i = 1; i < rows; ++i) {
                             const bool bad = asc ? (col[i] < col[i - 1]) : (col[i] > col[i - 1]);
@@ -520,6 +529,26 @@ class ChunkedOrderedLimitOperator final : public Operator {
                                              : row_comes_first(rhs, lhs);
     }
 
+    /// Key equality and strict order for the typed heaps: the Float64 order for
+    /// a double (every NaN ties and sorts last ascending), `==`/`<` otherwise.
+    template <typename T>
+    [[nodiscard]] static auto key_ties(const T& lhs, const T& rhs) -> bool {
+        if constexpr (std::is_same_v<T, double>) {
+            return order_compare_double(lhs, rhs) == 0;
+        } else {
+            return lhs == rhs;
+        }
+    }
+
+    template <typename T>
+    [[nodiscard]] static auto key_before(const T& lhs, const T& rhs) -> bool {
+        if constexpr (std::is_same_v<T, double>) {
+            return order_less_double(lhs, rhs);
+        } else {
+            return lhs < rhs;
+        }
+    }
+
     template <typename T>
     [[nodiscard]] auto single_key_better(const T& lhs, std::size_t lhs_sequence, const Entry& rhs,
                                          bool ascending) const -> bool {
@@ -527,11 +556,11 @@ class ChunkedOrderedLimitOperator final : public Operator {
         if (rhs_key == nullptr) {
             invariant_violation("ChunkedOrderedLimitOperator: single-key type mismatch");
         }
-        if (lhs == *rhs_key) {
+        if (key_ties(lhs, *rhs_key)) {
             return keep_mode_ == KeepMode::First ? (lhs_sequence < rhs.sequence)
                                                  : (rhs.sequence < lhs_sequence);
         }
-        const bool lhs_first = ascending ? (lhs < *rhs_key) : (lhs > *rhs_key);
+        const bool lhs_first = ascending ? key_before(lhs, *rhs_key) : key_before(*rhs_key, lhs);
         return keep_mode_ == KeepMode::First ? lhs_first : !lhs_first;
     }
 
@@ -818,11 +847,12 @@ class ChunkedOrderedLimitOperator final : public Operator {
     [[nodiscard]] auto pod_better(const PodEntry<K>& lhs, const PodEntry<K>& rhs,
                                   bool ascending) const -> bool {
         // `single_key_better`, on the flat entry.
-        if (lhs.key == rhs.key) {
+        if (key_ties(lhs.key, rhs.key)) {
             return keep_mode_ == KeepMode::First ? (lhs.sequence < rhs.sequence)
                                                  : (rhs.sequence < lhs.sequence);
         }
-        const bool lhs_first = ascending ? (lhs.key < rhs.key) : (lhs.key > rhs.key);
+        const bool lhs_first =
+            ascending ? key_before(lhs.key, rhs.key) : key_before(rhs.key, lhs.key);
         return keep_mode_ == KeepMode::First ? lhs_first : !lhs_first;
     }
 
@@ -1095,9 +1125,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
         for (std::size_t i = 0; i < n; ++i) {
             std::uint64_t bits = 0;
             if constexpr (std::is_same_v<K, double>) {
-                // -0.0 and 0.0 compare equal, so they must tie here too.
-                const double key = winners[i].key == 0.0 ? 0.0 : winners[i].key;
-                bits = double_to_sortable_u64(key);
+                bits = double_to_sortable_u64(winners[i].key);
             } else {
                 bits = static_cast<std::uint64_t>(winners[i].key) ^ (std::uint64_t{1} << 63U);
             }

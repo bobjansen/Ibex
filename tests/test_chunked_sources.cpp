@@ -3034,3 +3034,45 @@ TEST_CASE("chunked aggregate: packed keys keep Categorical columns as codes acro
         }
     }
 }
+
+TEST_CASE("chunked top-k puts every NaN above every number", "[runtime][chunked][topk][nan]") {
+    // The streaming top-k heaps compare keys themselves; with IEEE `<` a NaN
+    // neither beats nor loses to anything, so where it landed depended on
+    // arrival order. Under the Float64 order every NaN sorts above +inf.
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("nan_scores", [&](const runtime::ExternArgs&) {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        const double inf = std::numeric_limits<double>::infinity();
+        std::vector<runtime::Chunk> chunks;
+        for (auto values :
+             {std::vector<double>{3.0, nan, -0.0}, std::vector<double>{inf, -nan, 1.0}}) {
+            runtime::Chunk chunk;
+            runtime::ColumnEntry entry;
+            entry.name = "k";
+            entry.column =
+                std::make_shared<runtime::ColumnValue>(Column<double>{std::move(values)});
+            chunk.columns.push_back(std::move(entry));
+            chunks.push_back(std::move(chunk));
+        }
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+    const auto decl = std::string{"extern fn nan_scores() -> DataFrame from \"x.hpp\"; "};
+    const auto keys = [](const runtime::Table& t) {
+        const auto* col = std::get_if<Column<double>>(t.find("k"));
+        REQUIRE(col != nullptr);
+        return std::vector<double>(col->begin(), col->end());
+    };
+    const auto desc = keys(run_extern(decl + "nan_scores()[order { k desc }, head 3];", externs));
+    REQUIRE(desc.size() == 3);
+    CHECK(std::isnan(desc[0]));
+    CHECK(std::isnan(desc[1]));
+    CHECK(desc[2] == std::numeric_limits<double>::infinity());
+    const auto asc = keys(run_extern(decl + "nan_scores()[order { k asc }, head 5];", externs));
+    REQUIRE(asc.size() == 5);
+    CHECK(asc[0] == 0.0);
+    CHECK(asc[1] == 1.0);
+    CHECK(asc[2] == 3.0);
+    CHECK(asc[3] == std::numeric_limits<double>::infinity());
+    CHECK(std::isnan(asc[4]));
+}

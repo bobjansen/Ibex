@@ -59,6 +59,8 @@ auto compare_scalar_for_order(const ScalarValue& lhs, const ScalarValue& rhs) ->
                 return ord < 0 ? -1 : (ord > 0 ? 1 : 0);
             } else if constexpr (std::is_same_v<L, R> && std::is_same_v<L, NullScalar>) {
                 return 0;  // two nulls tie
+            } else if constexpr (std::is_same_v<L, R> && std::is_same_v<L, double>) {
+                return order_compare_double(l, r);
             } else if constexpr (std::is_same_v<L, R>) {
                 if (l < r) {
                     return -1;
@@ -206,11 +208,8 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
                 auto r = fc.u64[rhs];
                 return (l > r) - (l < r);
             }
-            case FlatKind::F64: {
-                auto l = fc.f64[lhs];
-                auto r = fc.f64[rhs];
-                return (l > r) - (l < r);
-            }
+            case FlatKind::F64:
+                return order_compare_double(fc.f64[lhs], fc.f64[rhs]);
             case FlatKind::Str: {
                 const auto& l = fc.str[lhs];
                 const auto& r = fc.str[rhs];
@@ -592,8 +591,9 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
     const FlatCol* solo_key = radix_order ? order_flat.data() : nullptr;
     auto same_rank_keys = [&](std::size_t lhs, std::size_t rhs) -> bool {
         if (solo_key != nullptr) {
-            return solo_key->kind == FlatKind::F64 ? solo_key->f64[lhs] == solo_key->f64[rhs]
-                                                   : solo_key->u64[lhs] == solo_key->u64[rhs];
+            return solo_key->kind == FlatKind::F64
+                       ? order_compare_double(solo_key->f64[lhs], solo_key->f64[rhs]) == 0
+                       : solo_key->u64[lhs] == solo_key->u64[rhs];
         }
         return equal_rank_keys(lhs, rhs);
     };

@@ -1178,10 +1178,9 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
                     break;
                 }
                 case FlatKind::F64: {
-                    auto l = fk.f64[lhs];
-                    auto r = fk.f64[rhs];
-                    if (l != r)
-                        return fk.ascending ? (l < r) : (l > r);
+                    const int cmp = order_compare_double(fk.f64[lhs], fk.f64[rhs]);
+                    if (cmp != 0)
+                        return fk.ascending ? (cmp < 0) : (cmp > 0);
                     break;
                 }
                 case FlatKind::Str: {

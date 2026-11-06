@@ -500,15 +500,8 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
                     occupied.add(temporary)
                     updates.append(f"{_identifier(temporary)} = is_null({_identifier(name)})")
                     order.append(f"{_identifier(temporary)} desc")
-                if operation == "sort" and validate and schemas[index].get(name) == pa.float64():
-                    # Polars orders NaN above infinity; Ibex's native numeric
-                    # comparison uses IEEE unordered semantics. Stage a flag.
-                    temporary = f"_ibex_sort_nan_{index}_{key_index}"
-                    while temporary in occupied:
-                        temporary += "_"
-                    occupied.add(temporary)
-                    updates.append(f"{_identifier(temporary)} = is_nan({_identifier(name)})")
-                    order.append(f"{_identifier(temporary)} {'desc' if reverse else 'asc'}")
+                # NaN needs no flag: native order puts every NaN above +inf,
+                # as Polars does (SPEC 3.5, Null Keys).
                 order.append(f"{_identifier(name)} {'desc' if reverse else 'asc'}")
             if updates:
                 source += f"[update {{ {', '.join(updates)} }}]"

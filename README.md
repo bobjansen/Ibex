@@ -600,13 +600,15 @@ executes again. Unsupported plans fail explicitly. This source-tree experiment
 pins Polars 2.0.0 and its private plan visitor. See
 [scope and setup](python/ibex_polars/README.md) and
 [resident-table measurements](python/polars-engine-performance.md).
-The [PDS-H comparison](python/pdsh-performance.md) covers sixteen unchanged
-queries on SF10, with warm timings for both eight-query extensions. After
-membership and streaming fixes, Q12's eight-thread
-warm median is 191 ms versus Polars streaming's 179 ms. The shared executor
-also lowers Q18 from 1,028 to 438 ms, while Q1 regresses by about 3–5%.
-At one thread Q18 instead regresses from 2,656 to 3,728 ms; disabling scan
-streaming removes that regression.
+The [PDS-H comparison](python/pdsh-performance.md) runs all 22 unchanged
+upstream queries on SF10 through the engine; every result matches Polars,
+including row order and dtypes. Against Polars 2.0 streaming, re-run in the
+same sitting (2026-11-06, i7-13700 at a fixed 3.2 GHz), the geometric mean of
+per-query time ratios is **1.08× at eight threads** and **1.02× at one
+thread** (above 1 means Ibex is slower). Ibex is faster on 4/22 queries at
+eight threads (Q10, Q11, Q13, Q18) and 8/22 at one; the largest remaining
+eight-thread gaps are Q04 (1.39×), Q19 (1.30×) and Q20 (1.27×). Q18 at one
+thread regressed since the previous sweep (0.65× → 1.11×) and is open.
 
 ## Independent lazy Python API (experimental)
 

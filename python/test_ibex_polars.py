@@ -838,6 +838,19 @@ class EngineTests(unittest.TestCase):
                 self.assertIn("__ibex_nan_high_ge", native)
                 self.assertNotIn("case {", native)
 
+    def test_filtered_len_counts_nulls_as_failing(self):
+        # filter(p).select(pl.len()) lowers to sum(Int64(p)): a null predicate
+        # row must count as failing, not as its placeholder's 0 or 1 (it
+        # counted `s != "NONE"` nulls as passing), and `true & null` is null.
+        frame = pl.DataFrame({"s": ["a", None, "b", None, "NONE", "a"],
+                              "i": [1, None, 2, 3, None, 1],
+                              "j": [None, 5, None, 1, 1, 9]}).lazy()
+        for predicate in (pl.col("s") != "NONE", pl.col("s") == "a", pl.col("i") != 1,
+                          (pl.col("i") != 1) & (pl.col("j") > 2), (pl.col("i") > 1) | (pl.col("j") > 2)):
+            with self.subTest(predicate=str(predicate)):
+                self.equal(frame.filter(predicate).select(pl.len()))
+                self.equal(frame.select(predicate.alias("p")))
+
     def test_dictionary_string_filter_after_join_key_scan(self):
         # Q19's shape: a filtered part side bounds a deferred line-item probe,
         # whose key scan's candidates are then tested on a dictionary-encoded

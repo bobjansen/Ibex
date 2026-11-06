@@ -3942,6 +3942,113 @@ TEST_CASE("AND of true and null is null", "[interpreter][update][null]") {
     CHECK(read("o") == want_or);
 }
 
+TEST_CASE("Int64 of a predicate keeps the predicate's nulls", "[interpreter][update][null]") {
+    // `Int64(<predicate>)` has a direct writer that collected its nulls from
+    // the input columns -- and that walk does not look under a comparison, so
+    // `Int64(i != 1)` came out fully valid with every null row written as its
+    // placeholder's 0 or 1. The Polars adapter counts `filter(p).select(len())`
+    // as `sum(Int64(p))`, so the count was wrong too. The predicate's own
+    // three-valued validity is the answer: null where a comparison sees a
+    // null, but `false && null` is false and `is_null(i)` is never null.
+    constexpr std::size_t kRows = 100000;  // enough rows to split into ranges
+    std::vector<std::int64_t> i_values(kRows);
+    std::vector<std::int64_t> j_values(kRows);
+    std::vector<bool> i_valid(kRows);
+    std::vector<bool> j_valid(kRows);
+    for (std::size_t r = 0; r < kRows; ++r) {
+        i_values[r] = static_cast<std::int64_t>(r % 5);
+        j_values[r] = static_cast<std::int64_t>(r % 7);
+        i_valid[r] = r % 3 != 0;
+        j_valid[r] = r % 4 != 0;
+    }
+    runtime::Table table;
+    table.add_column("i", Column<std::int64_t>{i_values}, i_valid);
+    table.add_column("j", Column<std::int64_t>{j_values}, j_valid);
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    // Expected value per row, nullopt for null, from the 3VL rules.
+    using Tri = std::optional<bool>;
+    const auto ne1 = [&](std::size_t r) -> Tri {
+        return i_valid[r] ? Tri{i_values[r] != 1} : std::nullopt;
+    };
+    const auto gt2 = [&](std::size_t r) -> Tri {
+        return j_valid[r] ? Tri{j_values[r] > 2} : std::nullopt;
+    };
+    const auto both = [&](std::size_t r) -> Tri {
+        const Tri a = ne1(r);
+        const Tri b = gt2(r);
+        if (a == Tri{false} || b == Tri{false}) {
+            return false;
+        }
+        if (!a.has_value() || !b.has_value()) {
+            return std::nullopt;
+        }
+        return true;
+    };
+    const auto check_field = [&](const runtime::Table& out, const char* name, const auto& want) {
+        const auto* entry = out.find_entry(name);
+        REQUIRE(entry != nullptr);
+        const auto* values = std::get_if<Column<std::int64_t>>(entry->column.get());
+        REQUIRE(values != nullptr);
+        std::size_t wrong = 0;
+        std::string first_wrong;
+        for (std::size_t r = 0; r < kRows; ++r) {
+            const Tri expected = want(r);
+            const bool valid = !entry->validity.has_value() || (*entry->validity)[r];
+            if (valid != expected.has_value() || (valid && (*values)[r] != (*expected ? 1 : 0))) {
+                if (wrong++ < 3) {
+                    first_wrong +=
+                        " row " + std::to_string(r) + " got " +
+                        (valid ? std::to_string((*values)[r]) : "null") + " want " +
+                        (expected.has_value() ? std::to_string(*expected ? 1 : 0) : "null");
+                }
+            }
+        }
+        INFO(name << first_wrong);
+        CHECK(wrong == 0);
+    };
+    const auto count_true = [&](const auto& want) {
+        std::int64_t n = 0;
+        for (std::size_t r = 0; r < kRows; ++r) {
+            n += want(r) == Tri{true} ? 1 : 0;
+        }
+        return n;
+    };
+
+    for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+        CAPTURE(threads);
+        runtime::ExecutionContext exec;
+        exec.parallel_threads = threads;
+        exec.parallel_min_rows = 0;
+        auto ir = require_ir(
+            "t[update { a = Int64(i != 1), b = Int32(i != 1), c = Int64((i != 1) && (j > 2)), "
+            "d = Int64(is_null(i)) }];");
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        check_field(*out, "a", ne1);
+        check_field(*out, "c", both);
+        check_field(*out, "d", [&](std::size_t r) -> Tri { return !i_valid[r]; });
+
+        // One field per update: the serial single-field direct writer.
+        auto single = require_ir("t[update { a = Int64(i != 1) }];");
+        auto single_out = runtime::interpret(*single, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(single_out.has_value());
+        check_field(*single_out, "a", ne1);
+
+        auto counted = require_ir(
+            "t[select { n = sum(Int64(i != 1)), m = sum(Int64((i != 1) && (j > 2))) }];");
+        auto sums = runtime::interpret(*counted, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(sums.has_value());
+        const auto* n = std::get_if<Column<std::int64_t>>(sums->find("n"));
+        const auto* m = std::get_if<Column<std::int64_t>>(sums->find("m"));
+        REQUIRE(n != nullptr);
+        REQUIRE(m != nullptr);
+        CHECK((*n)[0] == count_true(ne1));
+        CHECK((*m)[0] == count_true(both));
+    }
+}
+
 TEST_CASE("windowed update keeps validity on plain computed fields",
           "[interpreter][window][null]") {
     // A computed field inside `window ... update` must carry input nulls the

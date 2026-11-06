@@ -1304,12 +1304,16 @@ auto try_planned_fixed_width_update(const Chunk& input, const std::vector<ir::Fi
         return std::nullopt;
     }
     const auto range = ::ibex::runtime::RowRange::whole(view.rows());
-    auto validity = collect_expr_validity(fields.front().expr, source, range);
+    std::optional<ValidityBitmap> validity;
+    if (!direct_field_owns_validity(*plan)) {
+        validity = collect_expr_validity(fields.front().expr, source, range);
+    }
     if (plan->numeric_kind == FixedWidthNumericKind::Int) {
         Column<std::int64_t> values;
         values.resize_for_overwrite(view.rows());
         if (!write_direct_field_range(*plan, source, range, scalars,
-                                      {.numeric = {.ints = values.data(), .doubles = nullptr}})) {
+                                      {.numeric = {.ints = values.data(), .doubles = nullptr}},
+                                      &validity)) {
             return std::nullopt;
         }
         return write_direct_update(input, fields.front().alias,
@@ -1320,7 +1324,8 @@ auto try_planned_fixed_width_update(const Chunk& input, const std::vector<ir::Fi
     Column<double> values;
     values.resize_for_overwrite(view.rows());
     if (!write_direct_field_range(*plan, source, range, scalars,
-                                  {.numeric = {.ints = nullptr, .doubles = values.data()}})) {
+                                  {.numeric = {.ints = nullptr, .doubles = values.data()}},
+                                  &validity)) {
         return std::nullopt;
     }
     return write_direct_update(input, fields.front().alias,
@@ -1905,9 +1910,14 @@ auto try_plan_direct_fixed_width_field(const ir::Expr& expr, const PredicateInpu
     return try_plan_direct_string_length_field(expr, input);
 }
 
+auto direct_field_owns_validity(const DirectFieldPlan& plan) -> bool {
+    return plan.kind == DirectFieldKind::PredicateInt;
+}
+
 auto write_direct_field_range(const DirectFieldPlan& plan, const PredicateInput& input,
                               ::ibex::runtime::RowRange range, const ScalarRegistry* scalars,
-                              DirectOutputWindow output) -> bool {
+                              DirectOutputWindow output,
+                              std::optional<ValidityBitmap>* own_validity) -> bool {
     if (plan.kind == DirectFieldKind::NumericBinary) {
         return plan.expression != nullptr &&
                write_fixed_width_numeric_binary(*plan.expression, input, range, scalars,
@@ -1921,8 +1931,28 @@ auto write_direct_field_range(const DirectFieldPlan& plan, const PredicateInput&
         if (!mask.has_value()) {
             return false;  // decline the range; the caller's fallback owns the diagnostic
         }
+        // The predicate's own 3VL validity, not its inputs': `Int64(i != 1)`
+        // is null where `i` is, and `Int64(false && null)` is 0. Collecting it
+        // from the input columns saw no column under a comparison at all and
+        // wrote every null row as its placeholder's 0 or 1.
+        std::optional<ValidityBitmap> validity;
+        if (mask->valid.has_value()) {
+            if (own_validity == nullptr) {
+                return false;  // nowhere to put the nulls: the evaluator keeps them
+            }
+            ValidityBitmap bits(range.count, true);
+            for (std::size_t offset = 0; offset < range.count; ++offset) {
+                if ((*mask->valid)[offset] == 0) {
+                    bits.set(offset, false);
+                }
+            }
+            validity = std::move(bits);
+        }
         for (std::size_t offset = 0; offset < range.count; ++offset) {
             output.numeric.ints[offset] = mask->value[offset] != 0 ? 1 : 0;
+        }
+        if (own_validity != nullptr) {
+            *own_validity = std::move(validity);
         }
         return true;
     }
@@ -3022,10 +3052,13 @@ auto evaluate_field_windows(const ir::Expr& expr, const DirectFieldRoute& route,
                   dst_int != nullptr) ||
                  (route.fixed_width->numeric_kind == FixedWidthNumericKind::Double &&
                   dst_double != nullptr));
+            std::optional<ValidityBitmap> own_validity;
             if (fixed_width_destination &&
                 write_direct_field_range(*route.fixed_width, input, range, scalars,
-                                         {.numeric = window})) {
-                pieces[index] = collect_expr_validity(expr, input, range);
+                                         {.numeric = window}, &own_validity)) {
+                pieces[index] = direct_field_owns_validity(*route.fixed_width)
+                                    ? std::move(own_validity)
+                                    : collect_expr_validity(expr, input, range);
                 if (route.fixed_width->kind == DirectFieldKind::NumericBinary) {
                     used_direct_numeric.store(true, std::memory_order_relaxed);
                 }

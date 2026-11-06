@@ -253,11 +253,22 @@ struct DirectStringPlan {
                                                      const PredicateInput& input,
                                                      const ScalarRegistry* scalars)
     -> std::optional<DirectFieldPlan>;
-[[nodiscard]] auto write_direct_field_range(const DirectFieldPlan& plan,
-                                            const PredicateInput& input,
-                                            ::ibex::runtime::RowRange range,
-                                            const ScalarRegistry* scalars,
-                                            DirectOutputWindow output) -> bool;
+/// Write `plan`'s values for `range` into `output`. Most plans' nulls are
+/// exactly their input columns' (`collect_expr_validity`), and they leave
+/// `own_validity` alone. `PredicateInt` is the exception: a predicate's nulls
+/// follow three-valued logic (`false && null` is false, `is_null(x)` is never
+/// null), which no union of input masks gives, so it reports the validity its
+/// mask computed in `*own_validity` -- and declines a range whose mask has
+/// nulls when the caller passed nowhere to put them. See
+/// `direct_field_owns_validity`.
+[[nodiscard]] auto write_direct_field_range(
+    const DirectFieldPlan& plan, const PredicateInput& input, ::ibex::runtime::RowRange range,
+    const ScalarRegistry* scalars, DirectOutputWindow output,
+    std::optional<ValidityBitmap>* own_validity = nullptr) -> bool;
+
+/// Whether `write_direct_field_range` reports this plan's validity itself
+/// (in `own_validity`) instead of the caller collecting it from the inputs.
+[[nodiscard]] auto direct_field_owns_validity(const DirectFieldPlan& plan) -> bool;
 [[nodiscard]] auto try_plan_direct_predicate_field(const ir::Expr& expr)
     -> std::optional<DirectPredicatePlan>;
 [[nodiscard]] auto write_direct_predicate_range(const DirectPredicatePlan& plan,

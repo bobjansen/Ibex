@@ -608,7 +608,9 @@ per-query time ratios is **1.08× at eight threads** and **1.02× at one
 thread** (above 1 means Ibex is slower). Ibex is faster on 4/22 queries at
 eight threads (Q10, Q11, Q13, Q18) and 8/22 at one; the largest remaining
 eight-thread gaps are Q04 (1.39×), Q19 (1.30×) and Q20 (1.27×). Q18 at one
-thread regressed since the previous sweep (0.65× → 1.11×) and is open.
+thread regressed since the previous sweep (0.65× → 1.11×): the lazy cache that
+made it 2.5× faster at eight threads puts it on the streamed path, which at one
+thread is slower natively too. That is open.
 
 ## Independent lazy Python API (experimental)
 

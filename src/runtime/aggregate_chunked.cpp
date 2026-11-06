@@ -1383,7 +1383,7 @@ class HashAggregateState final {
     /// need cross-merging: the exact per-group distinct count is the sum over
     /// shards of the pairs each holds. That is also what lets the per-chunk
     /// insert fan out -- each worker owns a disjoint slice of the shards and
-    /// scans the whole column, inserting only the pairs that land in its slice.
+    /// inserts the rows `partition_by_shard` bucketed into them.
     ///
     /// Fixed-width values are bit-cast into `bits`; text is kept verbatim in
     /// `str` (gid prefixed, 4 bytes little-endian) so equal strings across
@@ -6626,6 +6626,80 @@ class HashAggregateState final {
         }
     }
 
+    /// The non-null rows of [0, rows), bucketed by the shard their
+    /// `(gid, value)` pair hashes to: shard `s` owns
+    /// `rows[offset[s] .. offset[s + 1])`, in ascending row order.
+    struct ShardRows {
+        std::vector<std::uint32_t> rows;
+        std::array<std::size_t, kDistinctShards + 1> offset{};
+    };
+
+    /// Hash every row ONCE, in parallel, and bucket it by shard. The shard
+    /// workers then visit only their own rows: scanning the whole column per
+    /// worker hashed each row once per worker, which at 8 workers was most
+    /// of the accumulation (PDS-H q21's two `n_unique`s over 3.5M rows).
+    template <typename ShardOf>
+    [[nodiscard]] auto partition_by_shard(std::size_t workers, std::size_t rows,
+                                          const ValidityBitmap* validity,
+                                          const ShardOf& shard_of) const -> ShardRows {
+        constexpr std::uint8_t kNull = 0xFF;
+        static_assert(kDistinctShards < kNull);
+        std::vector<std::uint8_t> shard(rows);
+        std::vector<std::array<std::size_t, kDistinctShards>> counts(workers);
+        const std::size_t span = (rows + workers - 1) / workers;
+        const auto for_each_range = [&](const auto& fn) {
+            auto& pool = process_worker_pool();
+            std::atomic<std::size_t> cursor{0};
+            auto batch = pool.submit(workers, [&](std::size_t) {
+                while (true) {
+                    const std::size_t w = cursor.fetch_add(1, std::memory_order_relaxed);
+                    if (w >= workers) {
+                        return;
+                    }
+                    const std::size_t lo = std::min(rows, w * span);
+                    fn(w, lo, std::min(rows, lo + span));
+                }
+            });
+            batch.wait();
+        };
+        for_each_range([&](std::size_t w, std::size_t lo, std::size_t hi) {
+            auto& count = counts[w];
+            count.fill(0);
+            for (std::size_t row = lo; row < hi; ++row) {
+                if (validity != nullptr && !(*validity)[row]) {
+                    shard[row] = kNull;
+                    continue;
+                }
+                const auto s = static_cast<std::uint8_t>(shard_of(row));
+                shard[row] = s;
+                ++count[s];
+            }
+        });
+        ShardRows out;
+        // starts[w][s]: where range w writes its first shard-s row.
+        std::vector<std::array<std::size_t, kDistinctShards>> starts(workers);
+        std::size_t at = 0;
+        for (std::size_t s = 0; s < kDistinctShards; ++s) {
+            out.offset[s] = at;
+            for (std::size_t w = 0; w < workers; ++w) {
+                starts[w][s] = at;
+                at += counts[w][s];
+            }
+        }
+        out.offset[kDistinctShards] = at;
+        out.rows.resize(at);
+        for_each_range([&](std::size_t w, std::size_t lo, std::size_t hi) {
+            auto& next = starts[w];
+            for (std::size_t row = lo; row < hi; ++row) {
+                const std::uint8_t s = shard[row];
+                if (s != kNull) {
+                    out.rows[next[s]++] = static_cast<std::uint32_t>(row);
+                }
+            }
+        });
+        return out;
+    }
+
     /// Fold rows [0, rows) of every CountDistinct aggregation's input column
     /// into its shards. `gids == nullptr` means the ungrouped single group 0.
     void accumulate_distinct(const std::uint32_t* gids,
@@ -6662,28 +6736,42 @@ class HashAggregateState final {
                     categorical ? nullptr : &std::get<Column<std::string>>(*entry.column);
                 const Column<Categorical>* ccol =
                     categorical ? &std::get<Column<Categorical>>(*entry.column) : nullptr;
-                const auto insert_range = [&](std::size_t lo, std::size_t hi) {
+                const auto view_at = [&](std::size_t row) -> std::string_view {
+                    return categorical ? std::string_view{(*ccol)[row]}
+                                       : std::string_view{(*scol)[row]};
+                };
+                const auto shard_of = [&](std::size_t row) -> std::size_t {
+                    const std::string_view sv = view_at(row);
+                    return (robin_hood::hash_bytes(sv.data(), sv.size()) ^
+                            robin_hood::hash_int(gid_at(row))) &
+                           (kDistinctShards - 1);
+                };
+                const auto insert = [&](std::string& key, std::size_t row, std::size_t shard) {
+                    const std::uint32_t gid = gid_at(row);
+                    key.resize(sizeof(gid));
+                    std::memcpy(key.data(), &gid, sizeof(gid));
+                    key.append(view_at(row));
+                    da.str[shard].insert(key);
+                };
+                if (shard_workers < 2) {
                     std::string key;
                     for (std::size_t row = 0; row < rows; ++row) {
-                        if (validity != nullptr && !(*validity)[row]) {
-                            continue;
+                        if (validity == nullptr || (*validity)[row]) {
+                            insert(key, row, shard_of(row));
                         }
-                        const std::string_view sv = categorical ? std::string_view{(*ccol)[row]}
-                                                                : std::string_view{(*scol)[row]};
-                        const std::uint32_t gid = gid_at(row);
-                        const std::size_t h = robin_hood::hash_bytes(sv.data(), sv.size()) ^
-                                              robin_hood::hash_int(gid);
-                        const std::size_t shard = h & (kDistinctShards - 1);
-                        if (shard < lo || shard >= hi) {
-                            continue;
-                        }
-                        key.resize(sizeof(gid));
-                        std::memcpy(key.data(), &gid, sizeof(gid));
-                        key.append(sv);
-                        da.str[shard].insert(key);
                     }
-                };
-                run_shard_ranges(shard_workers, insert_range);
+                    continue;
+                }
+                const ShardRows parts = partition_by_shard(shard_workers, rows, validity, shard_of);
+                run_shard_ranges(shard_workers, [&](std::size_t lo, std::size_t hi) {
+                    std::string key;
+                    for (std::size_t shard = lo; shard < hi; ++shard) {
+                        for (std::size_t i = parts.offset[shard]; i < parts.offset[shard + 1];
+                             ++i) {
+                            insert(key, parts.rows[i], shard);
+                        }
+                    }
+                });
                 continue;
             }
 
@@ -6707,20 +6795,29 @@ class HashAggregateState final {
                                 .data()[row]);
                 }
             };
-            const auto insert_range = [&](std::size_t lo, std::size_t hi) {
-                for (std::size_t row = 0; row < rows; ++row) {
-                    if (validity != nullptr && !(*validity)[row]) {
-                        continue;
-                    }
-                    const DistinctKey k{.gid = gid_at(row), .bits = bits_at(row)};
-                    const std::size_t shard = DistinctKeyHash{}(k) & (kDistinctShards - 1);
-                    if (shard < lo || shard >= hi) {
-                        continue;
-                    }
-                    da.num[shard].insert(k);
-                }
+            const auto key_at = [&](std::size_t row) -> DistinctKey {
+                return DistinctKey{.gid = gid_at(row), .bits = bits_at(row)};
             };
-            run_shard_ranges(shard_workers, insert_range);
+            const auto shard_of = [&](std::size_t row) -> std::size_t {
+                return DistinctKeyHash{}(key_at(row)) & (kDistinctShards - 1);
+            };
+            if (shard_workers < 2) {
+                for (std::size_t row = 0; row < rows; ++row) {
+                    if (validity == nullptr || (*validity)[row]) {
+                        const DistinctKey k = key_at(row);
+                        da.num[DistinctKeyHash{}(k) & (kDistinctShards - 1)].insert(k);
+                    }
+                }
+                continue;
+            }
+            const ShardRows parts = partition_by_shard(shard_workers, rows, validity, shard_of);
+            run_shard_ranges(shard_workers, [&](std::size_t lo, std::size_t hi) {
+                for (std::size_t shard = lo; shard < hi; ++shard) {
+                    for (std::size_t i = parts.offset[shard]; i < parts.offset[shard + 1]; ++i) {
+                        da.num[shard].insert(key_at(parts.rows[i]));
+                    }
+                }
+            });
         }
     }
 

@@ -3942,6 +3942,81 @@ TEST_CASE("AND of true and null is null", "[interpreter][update][null]") {
     CHECK(read("o") == want_or);
 }
 
+TEST_CASE("count_distinct counts every (group, value) pair across shard workers",
+          "[interpreter][aggregate][count_distinct]") {
+    // Past 64k rows a count_distinct fans its inserts out over shard workers,
+    // each owning a slice of the shards. Every non-null row must land in
+    // exactly one worker's slice: a row dropped or inserted twice would change
+    // a group's count. Numbers and strings take separate insert paths, so
+    // both are checked, with nulls, grouped and ungrouped.
+    constexpr std::size_t kRows = 200000;
+    constexpr std::size_t kGroups = 997;
+    std::vector<std::int64_t> g_values(kRows);
+    std::vector<std::int64_t> v_values(kRows);
+    std::vector<std::string> s_values(kRows);
+    std::vector<bool> v_valid(kRows);
+    std::vector<bool> s_valid(kRows);
+    for (std::size_t r = 0; r < kRows; ++r) {
+        g_values[r] = static_cast<std::int64_t>(r % kGroups);
+        v_values[r] = static_cast<std::int64_t>((r * 7) % 4099);
+        s_values[r] = "s" + std::to_string((r * 3) % 2111);
+        v_valid[r] = r % 11 != 0;
+        s_valid[r] = r % 13 != 0;
+    }
+    runtime::Table table;
+    table.add_column("g", Column<std::int64_t>{g_values});
+    table.add_column("v", Column<std::int64_t>{v_values}, v_valid);
+    table.add_column("s", Column<std::string>{s_values}, s_valid);
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    std::vector<std::set<std::int64_t>> v_seen(kGroups);
+    std::vector<std::set<std::string>> s_seen(kGroups);
+    std::set<std::int64_t> v_all;
+    std::set<std::string> s_all;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        if (v_valid[r]) {
+            v_seen[r % kGroups].insert(v_values[r]);
+            v_all.insert(v_values[r]);
+        }
+        if (s_valid[r]) {
+            s_seen[r % kGroups].insert(s_values[r]);
+            s_all.insert(s_values[r]);
+        }
+    }
+
+    for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+        CAPTURE(threads);
+        runtime::ExecutionContext exec;
+        exec.parallel_threads = threads;
+        exec.parallel_min_rows = 0;
+
+        auto grouped =
+            require_ir("t[select { nv = count_distinct(v), ns = count_distinct(s) }, by { g }];");
+        auto out = runtime::interpret(*grouped, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        REQUIRE(out->rows() == kGroups);
+        const auto& g = std::get<Column<std::int64_t>>(*out->find_entry("g")->column);
+        const auto& nv = std::get<Column<std::int64_t>>(*out->find_entry("nv")->column);
+        const auto& ns = std::get<Column<std::int64_t>>(*out->find_entry("ns")->column);
+        std::size_t wrong = 0;
+        for (std::size_t i = 0; i < kGroups; ++i) {
+            const auto group = static_cast<std::size_t>(g[i]);
+            wrong += nv[i] != static_cast<std::int64_t>(v_seen[group].size()) ? 1 : 0;
+            wrong += ns[i] != static_cast<std::int64_t>(s_seen[group].size()) ? 1 : 0;
+        }
+        CHECK(wrong == 0);
+
+        auto global = require_ir("t[select { nv = count_distinct(v), ns = count_distinct(s) }];");
+        auto total = runtime::interpret(*global, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(total.has_value());
+        CHECK(std::get<Column<std::int64_t>>(*total->find_entry("nv")->column)[0] ==
+              static_cast<std::int64_t>(v_all.size()));
+        CHECK(std::get<Column<std::int64_t>>(*total->find_entry("ns")->column)[0] ==
+              static_cast<std::int64_t>(s_all.size()));
+    }
+}
+
 TEST_CASE("Int64 of a predicate keeps the predicate's nulls", "[interpreter][update][null]") {
     // `Int64(<predicate>)` has a direct writer that collected its nulls from
     // the input columns -- and that walk does not look under a comparison, so

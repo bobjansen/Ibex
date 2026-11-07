@@ -559,8 +559,8 @@ Every slice:
    `physical::JoinParallelism`). `ChunkedInnerJoinOperator::build_partitions`
    reads `par_.build` and `JoinProbe::probe_parallel_workers` reads `par_.probe`,
    neither re-deriving the floor or the `min(budget, pool, 64)` cap. The checks
-   that stay in the operator are the ones only it can make: a kill switch
-   (`IBEX_JOIN_BUILD_SERIAL` / the `parallel_join_probe` toggle), nesting
+   that stay in the operator are the ones only it can make: the
+   `parallel_join_probe` toggle (probe only), nesting
    (`on_worker_pool_thread`), and whether this side/chunk cleared the floor. Both
    fan-outs now have a `ParallelPipelineStats` counter (`parallel_hash_builds`,
    `parallel_probes`) so a gate that silently stopped matching is a red test, not

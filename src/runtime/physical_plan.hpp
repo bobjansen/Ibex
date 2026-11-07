@@ -362,8 +362,8 @@ struct BreakerPhase {
 /// cap. Both used to be private constants in `chunked.cpp`
 /// (`ChunkedInnerJoinOperator::build_partitions`, `JoinProbe::probe_parallel_workers`);
 /// the operator now reads its resolved copy of each from the plan. The two
-/// checks that stay in the operator are the ones only it can make: a kill switch
-/// (`IBEX_JOIN_BUILD_SERIAL` / the `parallel_join_probe` toggle), nesting
+/// checks that stay in the operator are the ones only it can make: the
+/// `parallel_join_probe` toggle (probe only), nesting
 /// (`on_worker_pool_thread`), and whether this side/chunk cleared the floor.
 [[nodiscard]] auto join_hash_build_parallelism() -> BreakerParallelism;
 [[nodiscard]] auto join_probe_parallelism() -> BreakerParallelism;

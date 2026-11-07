@@ -37,7 +37,6 @@
 #include <ibex/core/compiler.hpp>
 #include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
-#include <ibex/format.hpp>
 #include <ibex/ir/join_output.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>
@@ -51,7 +50,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -946,8 +944,7 @@ struct JoinProbe {
     /// (`physical::join_probe_parallelism`), read from `probe_plan_`.
     /// src/runtime/PARALLELISM.md, "Target: parallelism as a plan decision".
     /// The checks that stay here are the ones only the operator can make:
-    /// `parallel_join_probe` (a feature toggle, kept operator-side like the hash
-    /// build's `IBEX_JOIN_BUILD_SERIAL`), nesting (`on_worker_pool_thread` -- no
+    /// `parallel_join_probe` (a feature toggle), nesting (`on_worker_pool_thread` -- no
     /// nested pool submissions), and whether *this chunk* cleared the floor (a
     /// streamed probe side's per-chunk row count is not a plan-time fact).
     [[nodiscard]] auto probe_parallel_workers(std::size_t n) const -> std::size_t {
@@ -2555,19 +2552,14 @@ class ChunkedInnerJoinOperator final : public Operator {
     /// the physical plan (`physical::join_hash_build_parallelism`), resolved by
     /// the builder and read from `par_.build`. src/runtime/PARALLELISM.md,
     /// "Target: parallelism as a plan decision". The conditions that stay here
-    /// are the ones only the operator can judge: the `IBEX_JOIN_BUILD_SERIAL`
-    /// kill switch, whether it is nested under another fan-out
+    /// are the ones only the operator can judge: whether it is nested under
+    /// another fan-out
     /// (`on_worker_pool_thread` -- no nested pool submissions), and whether
     /// *this* build side cleared the floor (its row count is not known until
     /// the side is materialized). The floor is higher than the probe's because
     /// a partitioned build makes three passes over the keys where a serial
     /// build makes one.
     [[nodiscard]] auto build_partitions(std::size_t n) const -> std::size_t {
-        // Kill switch, and the A/B handle: with it set, the same binary runs
-        // the serial build, so the two can be interleaved without rebuilding.
-        if (std::getenv("IBEX_JOIN_BUILD_SERIAL") != nullptr) {
-            return 1;
-        }
         if (par_.build.decline != physical::FanOutDecline::None || par_.build.worker_cap < 2 ||
             on_worker_pool_thread() || n < par_.build.row_floor) {
             return 1;
@@ -2843,11 +2835,6 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
         *right_ = std::move(*right);
         deferred_probe_ = nullptr;
-        if (std::getenv("IBEX_DEBUG_PAIR_DEFER") != nullptr) {
-            ibex::formatting::print(stderr,
-                                    "[pair_defer] filter_published={} right_rows_after_filter={}\n",
-                                    static_cast<int>(use_materialized_left_), right_->rows());
-        }
         return initialize_pair();
     }
 

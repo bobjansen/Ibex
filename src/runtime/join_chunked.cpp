@@ -3700,12 +3700,10 @@ auto make_chunked_inner_join_operator(OperatorPtr left, Table right,
 
 namespace {
 
+/// Run the build at plan-execution time, then hand the probe to its own
+/// operator.
 auto finish_scheduled_join(std::unique_ptr<ChunkedInnerJoinOperator> op)
     -> std::expected<OperatorPtr, std::string> {
-    static const bool lazy = std::getenv("IBEX_JOIN_BUILD_LAZY") != nullptr;
-    if (lazy) {
-        return OperatorPtr{std::move(op)};
-    }
     if (auto err = op->run_build()) {
         return std::unexpected(std::move(*err));
     }

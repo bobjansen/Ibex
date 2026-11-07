@@ -19,6 +19,7 @@
 #include <ibex/ir/join_reorder.hpp>
 #include <ibex/ir/join_semi_reduction.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/ir/null_flag_aggregates.hpp>
 #include <ibex/ir/optimizer.hpp>
 #include <ibex/ir/probed_key_restriction.hpp>
 #include <ibex/ir/required_columns.hpp>
@@ -5853,6 +5854,9 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
     // Schema-aware like the reduction above: a null flag a frontend sorts on
     // is constant once its operand is proved null-free, so drop the key.
     rewritten = ir::drop_constant_null_flag_sort_keys(std::move(rewritten), schemas);
+    // The same proof for the null term an `n_unique` lowering adds:
+    // `max(Int64(is_null(x)))` per group is 0 once `x` is null-free.
+    rewritten = ir::fold_constant_null_flag_aggregates(std::move(rewritten), schemas);
     // Needs no schema or uniqueness proof of its own -- it decides by
     // walking the plan -- but it runs here so it sees the shape the joins
     // and the FD reduction leave behind.

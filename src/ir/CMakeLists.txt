@@ -25,6 +25,7 @@ add_library(ibex_ir STATIC
     distinct_key_reduction.cpp
     group_key_reduction.cpp
     scan_predicates.cpp
+    null_flag_aggregates.cpp
     sort_key_reduction.cpp
     probed_key_restriction.cpp
     replayable.cpp

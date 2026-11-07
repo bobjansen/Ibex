@@ -52,6 +52,7 @@ set(IBEX_TEST_SOURCES
     test_static_range_filter.cpp
     test_ir_distinct_key_reduction.cpp
     test_ir_group_key_reduction.cpp
+    test_ir_null_flag_aggregates.cpp
     test_ir_sort_key_reduction.cpp
     test_ir_required_columns.cpp
     test_ir_schema.cpp

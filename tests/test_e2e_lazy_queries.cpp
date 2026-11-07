@@ -869,3 +869,73 @@ extern fn read_b() -> DataFrame from "x.hpp";
     REQUIRE(total != nullptr);
     CHECK((*total)[0] == 60);
 }
+
+TEST_CASE("e2e lazy: a footer that counts no nulls folds an n_unique null term",
+          "[e2e][lazy][nulls]") {
+    // The Polars adapter lowers `n_unique(v)` with a null term,
+    // `coalesce(max(Int64(is_null(v))), 0)`, which is 0 per group once `v` is
+    // proved null-free. A lazy source proves that from its metadata: a column
+    // whose footer counts no nulls holds none. Here `y` is read by nothing
+    // but that term, so whether it is ever decoded shows whether the proof
+    // reached the planner.
+    const auto run = [](bool footer_counts_nulls) {
+        auto decoded = std::make_shared<std::set<std::string>>();
+        auto data = std::make_shared<Table>(
+            make_table({{"g", {1, 1, 2}}, {"x", {10, 20, 10}}, {"y", {5, 6, 7}}}));
+        ibex::runtime::SourceColumnStats stats;
+        if (footer_counts_nulls) {
+            for (const char* name : {"g", "x", "y"}) {
+                stats[name].null_count = 0;
+            }
+        }
+        ExternRegistry registry;
+        registry.register_lazy_table(
+            "read_t",
+            [data, decoded, stats](const ibex::runtime::ExternArgs&)
+                -> std::expected<ibex::runtime::LazyTablePtr, std::string> {
+                Table schema;
+                for (const auto& col : data->columns) {
+                    schema.add_column(col.name, empty_like(*col.column));
+                }
+                return std::make_shared<ibex::runtime::LazyTable>(
+                    std::move(schema), data->rows(),
+                    [data, decoded](
+                        const std::vector<std::string>& names,
+                        const Selection* selection) -> std::expected<Table, std::string> {
+                        Selection all;
+                        for (std::size_t i = 0; i < data->rows(); ++i) {
+                            all.push_back(i);
+                        }
+                        const Selection& want = selection == nullptr ? all : *selection;
+                        Table out;
+                        for (const auto& name : names) {
+                            decoded->insert(name);
+                            out.add_column(name, slice_column(*data->find(name), want));
+                        }
+                        out.logical_rows = want.size();
+                        return out;
+                    },
+                    stats);
+            });
+        Table captured;
+        registry.register_scalar_table_consumer(
+            "capture", ibex::runtime::ScalarKind::Int,
+            [&](const Table& t, const ibex::runtime::ExternArgs&)
+                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                captured = t;
+                return ibex::runtime::ExternValue{std::int64_t{0}};
+            });
+        const char* src = R"(
+extern fn read_t() -> DataFrame from "x.hpp";
+extern fn capture(df: DataFrame) -> Int from "x.hpp";
+let r = read_t()[select { n = count_distinct(x) + coalesce(max(Int64(is_null(y))), 0) }, by { g }];
+capture(r);
+r;
+)";
+        REQUIRE(ibex::repl::execute_script(src, registry));
+        CHECK(rows_of(captured, {"g", "n"}) == std::set<std::vector<std::int64_t>>{{1, 2}, {2, 1}});
+        return decoded->contains("y");
+    };
+    CHECK_FALSE(run(true));  // proved null-free: the term folds, `y` is never read
+    CHECK(run(false));       // no proof: the term is computed from `y`
+}

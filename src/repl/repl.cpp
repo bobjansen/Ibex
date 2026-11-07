@@ -1175,6 +1175,26 @@ auto materialized_schema_info(const runtime::Table& table) -> ir::SchemaInfo {
     return ir::SchemaInfo::known(std::move(fields), /*open=*/false);
 }
 
+/// `table_schema_info` for a lazy source, with the nullability proof its
+/// metadata carries: a column whose footer counts no nulls in any chunk holds
+/// none. A column the metadata says nothing about stays `Maybe`. Polars
+/// writes every Parquet column as nullable, so without this no adapter source
+/// column was ever proved null-free.
+auto lazy_schema_info(const runtime::LazyTable& lazy) -> ir::SchemaInfo {
+    const auto& stats = lazy.column_stats();
+    std::vector<ir::SchemaField> fields;
+    fields.reserve(lazy.schema().columns.size());
+    for (const auto& entry : lazy.schema().columns) {
+        const auto found = stats.find(entry.name);
+        const bool null_free = found != stats.end() && found->second.null_count == std::size_t{0};
+        fields.push_back(
+            ir::SchemaField{.name = entry.name,
+                            .type = column_ir_type(*entry.column),
+                            .nulls = null_free ? ir::Nullability::Never : ir::Nullability::Maybe});
+    }
+    return ir::SchemaInfo::known(std::move(fields), /*open=*/false);
+}
+
 /// Turn a source's raw footer statistics into the per-column distinct-value
 /// ESTIMATES the join-order cost model ranks with. This is where the estimation
 /// policy lives -- the plugin reports only what the file says.
@@ -5654,7 +5674,7 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
     ir::SourceSchemas& schemas = source_stats.schemas;
     ir::SourceRowCounts& row_counts = source_stats.rows;
     for (const auto& [name, lazy] : lazy_sources) {
-        schemas.insert_or_assign(name, table_schema_info(lazy->schema()));
+        schemas.insert_or_assign(name, lazy_schema_info(*lazy));
         row_counts.insert_or_assign(name, lazy->rows());
         source_stats.distinct.insert_or_assign(name, derive_column_distinct(*lazy));
     }
@@ -5704,7 +5724,7 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
         // every base source reached the cost model with no unique key at
         // all. Proving it here is what puts a real bound under join
         // ordering rather than an estimate.
-        schemas.insert_or_assign(source.source_name, table_schema_info(lazy.value()->schema()));
+        schemas.insert_or_assign(source.source_name, lazy_schema_info(*lazy.value()));
         row_counts.insert_or_assign(source.source_name, lazy.value()->rows());
         source_stats.distinct.insert_or_assign(source.source_name,
                                                derive_column_distinct(*lazy.value()));

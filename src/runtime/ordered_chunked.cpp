@@ -825,6 +825,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
     // (key, sequence) order `build_output` sorts by.
 
     static constexpr std::size_t kPodMaxCount = 16;
+    static constexpr std::size_t kPodPartsPerWorker = 8;
     /// A ref of a row in the chunk being processed, not yet in a piece.
     static constexpr std::uint64_t kPodCurrentChunk = std::uint64_t{1} << 63;
     /// Set in `PodEntry::sequence` when the row's order key is null: a
@@ -907,11 +908,14 @@ class ChunkedOrderedLimitOperator final : public Operator {
         if (parts.empty()) {
             // Fixed by the first chunk: a group's partition is a function of
             // its hash and this count, for the life of the operator.
+            // Several per worker: each partition's index and heaps are a
+            // fraction of the groups (h2o q8 at K=2: 5M), small enough to stay
+            // in cache, and partitions are claimed dynamically.
             std::size_t count = 1;
             while (count * 2 <= workers) {
                 count *= 2;
             }
-            parts.resize(count);
+            parts.resize(count == 1 ? 1 : count * kPodPartsPerWorker);
         }
         const std::size_t n_parts = parts.size();
         const std::uint64_t base = next_sequence_;
@@ -993,13 +997,104 @@ class ChunkedOrderedLimitOperator final : public Operator {
         const auto part_of = [n_parts](std::uint64_t hash) {
             return static_cast<std::size_t>(hash >> 40U) & (n_parts - 1);
         };
+        // Every row to its partition, in row order within each, so a
+        // partition's worker reads only its own rows: each scanning all of
+        // them was 8x the hash reads, and at more partitions far worse.
+        std::vector<std::uint32_t> part_rows(rows);
+        std::vector<std::size_t> part_begin(n_parts + 1, 0);
+        // With one integer group key, what the probe reads of a row travels
+        // with it: the key, the order key and both null flags, so a partition
+        // reads its own contiguous slice. Read through the row instead, every
+        // partition touched a line per row of three row-indexed arrays that
+        // its neighbours' rows share -- each line fetched up to once per
+        // partition (h2o q8 at K=2: the probe was ~190 ms).
+        const bool carry = pod_int_key_ && n_parts > 1;
+        std::vector<std::int64_t> carried_key;
+        std::vector<K> carried_value;
+        std::vector<std::uint8_t> carried_nulls;  ///< bit 0 group key, bit 1 order key
+        if (carry) {
+            carried_key.resize(rows);
+            carried_value.resize(rows);
+            carried_nulls.resize(rows);
+        }
+        if (n_parts == 1) {
+            for (std::size_t row = 0; row < rows; ++row) {
+                part_rows[row] = static_cast<std::uint32_t>(row);
+            }
+            part_begin[1] = rows;
+        } else {
+            const std::size_t ranges = std::max<std::size_t>(workers, 1);
+            const std::size_t grain = (rows + ranges - 1) / ranges;
+            std::vector<std::size_t> counts(ranges * n_parts, 0);
+            const auto each_range = [&](const auto& body) {
+                if (ranges < 2) {
+                    body(std::size_t{0});
+                    return;
+                }
+                auto batch = process_worker_pool().submit(ranges, body);
+                batch.wait();
+            };
+            each_range([&](std::size_t r) {
+                const std::size_t begin = std::min(rows, r * grain);
+                const std::size_t end = std::min(rows, begin + grain);
+                std::size_t* local = counts.data() + (r * n_parts);
+                for (std::size_t row = begin; row < end; ++row) {
+                    ++local[part_of(hashes[row])];
+                }
+            });
+            std::size_t total = 0;
+            for (std::size_t p = 0; p < n_parts; ++p) {
+                part_begin[p] = total;
+                for (std::size_t r = 0; r < ranges; ++r) {
+                    const std::size_t c = counts[(r * n_parts) + p];
+                    counts[(r * n_parts) + p] = total;
+                    total += c;
+                }
+            }
+            part_begin[n_parts] = total;
+            each_range([&](std::size_t r) {
+                const std::size_t begin = std::min(rows, r * grain);
+                const std::size_t end = std::min(rows, begin + grain);
+                std::size_t* next = counts.data() + (r * n_parts);
+                for (std::size_t row = begin; row < end; ++row) {
+                    const std::size_t at = next[part_of(hashes[row])]++;
+                    part_rows[at] = static_cast<std::uint32_t>(row);
+                    if (carry) {
+                        const bool group_null = key0.is_null(row);
+                        const bool order_null =
+                            key_validity != nullptr && !(*key_validity)[row];
+                        carried_key[at] = group_null ? 0 : int_key(row);
+                        carried_value[at] = order_null ? K{} : key_at(row);
+                        carried_nulls[at] = static_cast<std::uint8_t>((group_null ? 1U : 0U) |
+                                                                      (order_null ? 2U : 0U));
+                    }
+                }
+            });
+        }
         const auto run_partition = [&](std::size_t p) {
             PodPartition<K>& part = parts[p];
-            for (std::size_t row = 0; row < rows; ++row) {
-                const std::uint64_t hash = hashes[row];
-                if (part_of(hash) != p) {
-                    continue;
+            // Once a sample of this partition's rows shows most start groups
+            // (h2o q8 at K=2: two rows a group), size its index and heaps for
+            // the rest at that rate rather than regrow and rehash on the way.
+            constexpr std::size_t kReserveSample = 1024;
+            const std::size_t sample_end = part_begin[p] + kReserveSample;
+            const std::size_t groups_at_start = part.sizes.size();
+            for (std::size_t at = part_begin[p]; at < part_begin[p + 1]; ++at) {
+                if (at == sample_end && part_begin[p + 1] - at > 4 * kReserveSample) {
+                    const std::size_t fresh = part.sizes.size() - groups_at_start;
+                    if (fresh * 2 > kReserveSample) {
+                        const std::size_t total =
+                            part.sizes.size() + ((part_begin[p + 1] - at) * fresh / kReserveSample);
+                        if (pod_int_key_) {
+                            part.int_index.reserve(total);
+                        }
+                        part.sizes.reserve(total);
+                        part.stamp.reserve(total);
+                        part.touched.reserve(total);
+                        part.heaps.reserve(total * k);
+                    }
                 }
+                const std::size_t row = part_rows[at];
                 const auto new_group = [&] {
                     const auto gid = static_cast<std::uint32_t>(part.sizes.size());
                     part.sizes.push_back(0);
@@ -1009,13 +1104,14 @@ class ChunkedOrderedLimitOperator final : public Operator {
                 };
                 std::uint32_t gid = 0;
                 if (pod_int_key_) {
-                    if (key0.is_null(row)) {
+                    if (carry ? (carried_nulls[at] & 1U) != 0 : key0.is_null(row)) {
                         if (part.null_gid == std::numeric_limits<std::uint32_t>::max()) {
                             part.null_gid = new_group();
                         }
                         gid = part.null_gid;
                     } else {
-                        auto [it, fresh] = part.int_index.try_emplace(int_key(row), 0U);
+                        auto [it, fresh] = part.int_index.try_emplace(
+                            carry ? carried_key[at] : int_key(row), 0U);
                         if (fresh) {
                             it->second = new_group();
                         }
@@ -1023,7 +1119,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
                     }
                 } else {
                     gid = part.index.find_or_insert_hashed(
-                        hash,
+                        hashes[row],
                         [&](std::uint32_t g) {
                             return key_equals_row(part.keys[g], group_key_cols, row);
                         },
@@ -1037,8 +1133,11 @@ class ChunkedOrderedLimitOperator final : public Operator {
                             return new_group();
                         });
                 }
-                const bool null_key = key_validity != nullptr && !(*key_validity)[row];
-                const PodEntry<K> entry{null_key ? K{} : key_at(row),
+                const bool null_key = carry ? (carried_nulls[at] & 2U) != 0
+                                            : key_validity != nullptr && !(*key_validity)[row];
+                const PodEntry<K> entry{null_key ? K{}
+                                        : carry  ? carried_value[at]
+                                                 : key_at(row),
                                         (base + row) | (null_key ? kPodNullKey : 0),
                                         kPodCurrentChunk | row};
                 PodEntry<K>* heap = part.heaps.data() + (static_cast<std::size_t>(gid) * k);
@@ -1080,8 +1179,56 @@ class ChunkedOrderedLimitOperator final : public Operator {
         // A row's place in the piece is its rank among the kept rows: mark,
         // then number in row order (no sort; at 5M groups nearly every row
         // is kept).
-        std::vector<std::uint32_t> rank(rows, 0);
-        for (auto& part : parts) {
+        // Each pass below is per partition or per row range: at 5M groups
+        // nearly every row is kept, and serially these were ~100 ms.
+        const auto each_part = [&](const auto& body) {
+            if (workers < 2 || n_parts < 2) {
+                for (std::size_t p = 0; p < n_parts; ++p) {
+                    body(p);
+                }
+                return;
+            }
+            std::atomic<std::size_t> cursor{0};
+            auto batch = process_worker_pool().submit(std::min(workers, n_parts), [&](std::size_t) {
+                for (std::size_t p = cursor.fetch_add(1); p < n_parts; p = cursor.fetch_add(1)) {
+                    body(p);
+                }
+            });
+            batch.wait();
+        };
+        // How many of this chunk's rows a heap still holds. When that is
+        // most of them the chunk is kept whole and a row is its own place,
+        // so the ranks below are not needed.
+        std::vector<std::size_t> part_kept(n_parts, 0);
+        each_part([&](std::size_t p) {
+            const auto& part = parts[p];
+            std::size_t count = 0;
+            for (const std::uint32_t gid : part.touched) {
+                const PodEntry<K>* heap = part.heaps.data() + (static_cast<std::size_t>(gid) * k);
+                for (std::uint32_t i = 0; i < part.sizes[gid]; ++i) {
+                    count += (heap[i].ref & kPodCurrentChunk) != 0 ? 1 : 0;
+                }
+            }
+            part_kept[p] = count;
+        });
+        std::size_t kept_rows = 0;
+        for (const std::size_t count : part_kept) {
+            kept_rows += count;
+        }
+        if (kept_rows == 0) {
+            for (auto& part : parts) {
+                part.touched.clear();
+            }
+            return std::nullopt;
+        }
+        // Mostly kept (many groups, few rows each): keep the chunk itself,
+        // whose columns are shared, rather than copying nearly all of it.
+        const bool whole_chunk = kept_rows * 2 >= rows;
+        std::vector<std::uint32_t> rank(whole_chunk ? 0 : rows, 0);
+        std::vector<std::uint32_t> kept;
+        if (!whole_chunk) {
+        each_part([&](std::size_t p) {
+            const auto& part = parts[p];
             for (const std::uint32_t gid : part.touched) {
                 const PodEntry<K>* heap = part.heaps.data() + (static_cast<std::size_t>(gid) * k);
                 for (std::uint32_t i = 0; i < part.sizes[gid]; ++i) {
@@ -1090,25 +1237,49 @@ class ChunkedOrderedLimitOperator final : public Operator {
                     }
                 }
             }
-        }
-        std::vector<std::uint32_t> kept;
-        for (std::size_t row = 0; row < rows; ++row) {
-            if (rank[row] != 0) {
-                rank[row] = static_cast<std::uint32_t>(kept.size());
-                kept.push_back(static_cast<std::uint32_t>(row));
+        });
+        // A kept row's rank is its place among the kept rows, in row order.
+        {
+            const std::size_t ranges = std::max<std::size_t>(workers, 1);
+            const std::size_t grain = (rows + ranges - 1) / ranges;
+            std::vector<std::size_t> first(ranges + 1, 0);
+            const auto each_range = [&](const auto& body) {
+                if (ranges < 2) {
+                    body(std::size_t{0});
+                    return;
+                }
+                auto batch = process_worker_pool().submit(ranges, body);
+                batch.wait();
+            };
+            each_range([&](std::size_t r) {
+                const std::size_t begin = std::min(rows, r * grain);
+                const std::size_t end = std::min(rows, begin + grain);
+                std::size_t n = 0;
+                for (std::size_t row = begin; row < end; ++row) {
+                    n += rank[row] != 0 ? 1 : 0;
+                }
+                first[r + 1] = n;
+            });
+            for (std::size_t r = 0; r < ranges; ++r) {
+                first[r + 1] += first[r];
             }
+            kept.resize(first[ranges]);
+            each_range([&](std::size_t r) {
+                const std::size_t begin = std::min(rows, r * grain);
+                const std::size_t end = std::min(rows, begin + grain);
+                auto at = static_cast<std::uint32_t>(first[r]);
+                for (std::size_t row = begin; row < end; ++row) {
+                    if (rank[row] != 0) {
+                        rank[row] = at;
+                        kept[at++] = static_cast<std::uint32_t>(row);
+                    }
+                }
+            });
         }
-        // Mostly kept (many groups, few rows each): keep the chunk itself,
-        // whose columns are shared, rather than copying nearly all of it.
-        const bool whole_chunk = kept.size() * 2 >= rows;
-        if (kept.empty()) {
-            for (auto& part : parts) {
-                part.touched.clear();
-            }
-            return std::nullopt;
         }
         const auto piece = static_cast<std::uint64_t>(pod_pieces_.size());
-        for (auto& part : parts) {
+        each_part([&](std::size_t p) {
+            auto& part = parts[p];
             for (const std::uint32_t gid : part.touched) {
                 PodEntry<K>* heap = part.heaps.data() + (static_cast<std::size_t>(gid) * k);
                 for (std::uint32_t i = 0; i < part.sizes[gid]; ++i) {
@@ -1119,66 +1290,182 @@ class ChunkedOrderedLimitOperator final : public Operator {
                 }
             }
             part.touched.clear();
-        }
+        });
         pod_piece_rows_ += whole_chunk ? rows : kept.size();
         pod_pieces_.push_back(whole_chunk ? chunk : gather_rows(chunk, kept));
         pod_compact_if_sparse<K>();
         return std::nullopt;
     }
 
-    /// The live entries of every heap, in output order.
+    /// The live entries' refs, in output order: `row_comes_first`, the order
+    /// key then arrival, with null keys last. Two stable radix passes over
+    /// indexes (arrival first, then the key gathered in that order), composed
+    /// at the end, rather than permuting the 24-byte entries after each; every
+    /// pass is split across workers. At h2o q8's K=2 there are 7.3M winners,
+    /// and the serial collection and permutes were ~300 ms.
     template <typename K>
-    auto pod_winners() -> std::vector<PodEntry<K>> {
-        std::vector<PodEntry<K>> winners;
-        for (const auto& part : pod_partitions<K>()) {
+    auto pod_winners() -> std::vector<std::uint64_t> {
+        auto& parts = pod_partitions<K>();
+        const std::size_t n_parts = parts.size();
+        std::vector<std::size_t> part_first(n_parts + 1, 0);
+        for (std::size_t p = 0; p < n_parts; ++p) {
+            std::size_t live = 0;
+            for (const auto size : parts[p].sizes) {
+                live += size;
+            }
+            part_first[p + 1] = part_first[p] + live;
+        }
+        const std::size_t n = part_first[n_parts];
+        const std::size_t workers = group_barrier_worker_count(exec_, n);
+        std::vector<std::uint64_t> sequence(n);
+        std::vector<std::uint64_t> key_bits(n);
+        std::vector<std::uint64_t> refs(n);
+        std::vector<std::uint8_t> null_key(n);
+        std::atomic<bool> any_null{false};
+        const auto each_part = [&](const auto& body) {
+            if (workers < 2 || n_parts < 2) {
+                for (std::size_t p = 0; p < n_parts; ++p) {
+                    body(p);
+                }
+                return;
+            }
+            std::atomic<std::size_t> cursor{0};
+            auto batch = process_worker_pool().submit(std::min(workers, n_parts), [&](std::size_t) {
+                for (std::size_t p = cursor.fetch_add(1); p < n_parts; p = cursor.fetch_add(1)) {
+                    body(p);
+                }
+            });
+            batch.wait();
+        };
+        each_part([&](std::size_t p) {
+            const auto& part = parts[p];
+            std::size_t at = part_first[p];
+            bool nulls = false;
             for (std::size_t gid = 0; gid < part.sizes.size(); ++gid) {
                 const PodEntry<K>* heap = part.heaps.data() + (gid * count_);
-                winners.insert(winners.end(), heap, heap + part.sizes[gid]);
+                for (std::uint32_t i = 0; i < part.sizes[gid]; ++i, ++at) {
+                    const PodEntry<K>& entry = heap[i];
+                    sequence[at] = entry.sequence & ~kPodNullKey;
+                    const bool null = (entry.sequence & kPodNullKey) != 0;
+                    nulls = nulls || null;
+                    null_key[at] = null ? 1 : 0;
+                    std::uint64_t bits = 0;
+                    if constexpr (std::is_same_v<K, double>) {
+                        bits = double_to_sortable_u64(entry.key);
+                    } else {
+                        bits = static_cast<std::uint64_t>(entry.key) ^ (std::uint64_t{1} << 63U);
+                    }
+                    key_bits[at] = pod_ascending_ ? bits : ~bits;
+                    refs[at] = entry.ref;
+                }
             }
-        }
-        // `row_comes_first`: the order key, then arrival. Two stable radix
-        // passes, arrival first: equal keys then keep arrival order.
-        const std::size_t n = winners.size();
-        const std::size_t workers = group_barrier_worker_count(exec_, n);
-        const auto permute = [&](const SortIdx& order) {
-            std::vector<PodEntry<K>> sorted(n);
+            if (nulls) {
+                any_null.store(true, std::memory_order_relaxed);
+            }
+        });
+        // `order[i]` indexes the entries; each pass sorts by one more
+        // significant key, stably, so equal keys keep the order before it.
+        std::vector<std::uint64_t> order(n);
+        for_row_ranges(&exec_, n, [&](std::size_t begin, std::size_t end) {
+            for (std::size_t i = begin; i < end; ++i) {
+                order[i] = i;
+            }
+        });
+        const auto pass = [&](const std::vector<std::uint64_t>& key) {
+            std::vector<std::uint64_t> gathered(n);
+            for_row_ranges(&exec_, n, [&](std::size_t begin, std::size_t end) {
+                for (std::size_t i = begin; i < end; ++i) {
+                    gathered[i] = key[order[i]];
+                }
+            });
+            const SortIdx sorted = radix_sort_u64_asc(std::move(gathered), n, workers);
+            std::vector<std::uint64_t> next(n);
             std::visit(
                 [&](const auto& idx) {
-                    for (std::size_t i = 0; i < n; ++i) {
-                        sorted[i] = winners[static_cast<std::size_t>(idx[i])];
-                    }
+                    for_row_ranges(&exec_, n, [&](std::size_t begin, std::size_t end) {
+                        for (std::size_t i = begin; i < end; ++i) {
+                            next[i] = order[static_cast<std::size_t>(idx[i])];
+                        }
+                    });
                 },
-                order);
-            winners = std::move(sorted);
+                sorted);
+            order = std::move(next);
         };
-        std::vector<std::uint64_t> radix(n);
-        bool any_null = false;
-        for (std::size_t i = 0; i < n; ++i) {
-            radix[i] = winners[i].sequence & ~kPodNullKey;
-            any_null = any_null || (winners[i].sequence & kPodNullKey) != 0;
-        }
-        permute(radix_sort_u64_asc(std::move(radix), n, workers));
-        radix.assign(n, 0);
-        for (std::size_t i = 0; i < n; ++i) {
-            std::uint64_t bits = 0;
-            if constexpr (std::is_same_v<K, double>) {
-                bits = double_to_sortable_u64(winners[i].key);
-            } else {
-                bits = static_cast<std::uint64_t>(winners[i].key) ^ (std::uint64_t{1} << 63U);
+        // Arrival first. Sequences are distinct row numbers below
+        // `next_sequence_`, so when the winners are a fair share of the rows
+        // seen, placing each at its sequence and reading the places in order
+        // sorts them outright, with no radix pass.
+        const std::uint64_t span = next_sequence_;
+        if (n != 0 && span <= (std::uint64_t{4} * n) + 4096 &&
+            span < std::numeric_limits<std::uint32_t>::max()) {
+            constexpr std::uint32_t kEmpty = std::numeric_limits<std::uint32_t>::max();
+            const auto places = static_cast<std::size_t>(span);
+            std::vector<std::uint32_t> at_sequence(places);
+            for_row_ranges(&exec_, places, [&](std::size_t begin, std::size_t end) {
+                std::fill(at_sequence.begin() + static_cast<std::ptrdiff_t>(begin),
+                          at_sequence.begin() + static_cast<std::ptrdiff_t>(end), kEmpty);
+            });
+            for_row_ranges(&exec_, n, [&](std::size_t begin, std::size_t end) {
+                for (std::size_t i = begin; i < end; ++i) {
+                    at_sequence[static_cast<std::size_t>(sequence[i])] =
+                        static_cast<std::uint32_t>(i);
+                }
+            });
+            const std::size_t ranges = std::max<std::size_t>(workers, 1);
+            const std::size_t grain = (places + ranges - 1) / ranges;
+            std::vector<std::size_t> first(ranges + 1, 0);
+            const auto each_range = [&](const auto& body) {
+                if (ranges < 2) {
+                    body(std::size_t{0});
+                    return;
+                }
+                auto batch = process_worker_pool().submit(ranges, body);
+                batch.wait();
+            };
+            each_range([&](std::size_t r) {
+                const std::size_t begin = std::min(places, r * grain);
+                const std::size_t end = std::min(places, begin + grain);
+                std::size_t count = 0;
+                for (std::size_t q = begin; q < end; ++q) {
+                    count += at_sequence[q] != kEmpty ? 1 : 0;
+                }
+                first[r + 1] = count;
+            });
+            for (std::size_t r = 0; r < ranges; ++r) {
+                first[r + 1] += first[r];
             }
-            radix[i] = pod_ascending_ ? bits : ~bits;
+            each_range([&](std::size_t r) {
+                const std::size_t begin = std::min(places, r * grain);
+                const std::size_t end = std::min(places, begin + grain);
+                std::size_t out = first[r];
+                for (std::size_t q = begin; q < end; ++q) {
+                    if (at_sequence[q] != kEmpty) {
+                        order[out++] = at_sequence[q];
+                    }
+                }
+            });
+        } else {
+            pass(sequence);
         }
-        permute(radix_sort_u64_asc(std::move(radix), n, workers));
-        if (any_null) {
+        pass(key_bits);
+        if (any_null.load(std::memory_order_relaxed)) {
             // Most significant of all: null keys last, the passes above kept
             // them in (key, arrival) order and a null's key is a placeholder.
-            radix.assign(n, 0);
-            for (std::size_t i = 0; i < n; ++i) {
-                radix[i] = (winners[i].sequence & kPodNullKey) != 0 ? 1 : 0;
-            }
-            permute(radix_sort_u64_asc(std::move(radix), n, workers));
+            std::vector<std::uint64_t> nulls(n);
+            for_row_ranges(&exec_, n, [&](std::size_t begin, std::size_t end) {
+                for (std::size_t i = begin; i < end; ++i) {
+                    nulls[i] = null_key[i];
+                }
+            });
+            pass(nulls);
         }
-        return winners;
+        std::vector<std::uint64_t> out(n);
+        for_row_ranges(&exec_, n, [&](std::size_t begin, std::size_t end) {
+            for (std::size_t i = begin; i < end; ++i) {
+                out[i] = refs[order[i]];
+            }
+        });
+        return out;
     }
 
     /// The stored pieces as one table, and each piece's first row in it.
@@ -1245,13 +1532,16 @@ class ChunkedOrderedLimitOperator final : public Operator {
             return empty_template_.value_or(Table{});
         }
         auto [table, offsets] = pod_concat_pieces();
-        std::vector<std::uint64_t> rows;
-        rows.reserve(winners.size());
-        for (const auto& entry : winners) {
-            rows.push_back(offsets[entry.ref >> 32U] + (entry.ref & 0xffffffffU));
-        }
-        Table out = gather_rows(table, rows);
-        out.set_properties(out.properties().with_ordering(*keys_));
+        std::vector<std::size_t> rows(winners.size());
+        for_row_ranges(&exec_, rows.size(), [&](std::size_t begin, std::size_t end) {
+            for (std::size_t i = begin; i < end; ++i) {
+                rows[i] = offsets[winners[i] >> 32U] + (winners[i] & 0xffffffffU);
+            }
+        });
+        // Across workers: the winners are in order-key order, so this is a
+        // random gather of every output row (7.3M at h2o q8's K=2), bound by
+        // latency rather than bandwidth -- serially it was ~90 ms.
+        Table out = permute_table_rows(table, rows, *keys_, exec_);
         return out;
     }
 

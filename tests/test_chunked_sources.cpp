@@ -41,6 +41,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -1997,6 +1998,239 @@ TEST_CASE("packed group-by keys: nullable key columns keep the packed path",
         CHECK(runtime::packed_nullable_key_chunks().load() > packed_before);
         check(*sr);
         check(*pr);
+    }
+}
+
+TEST_CASE("chunked aggregate: a nullable Categorical key keeps the dense code path",
+          "[runtime][chunked][aggregate][parallel]") {
+    // h2o q1/q3/q7 on the 5%-NA data: `by id1` where id1 is a Categorical
+    // with a validity bitmap. The null rows become one extra dense cell
+    // instead of sending every row through the generic hash path. Each null
+    // row's code is a real label's code, so a path that read the code under
+    // a null would merge the null group into that label's. The first and last
+    // stretches are all valid, so in chunks the null group appears in a later
+    // chunk and a chunk after it carries no nulls at all. `sum`/`count` take
+    // the fused morsels; adding `first(s)` (a String) takes the gid path.
+    constexpr std::size_t kRows = (std::size_t{1} << 20) + 4'096;
+    constexpr std::size_t kValidHead = 50'000;
+    constexpr std::size_t kValidTail = 60'000;
+    std::vector<std::string> labels;
+    for (int l = 0; l < 50; ++l) {
+        labels.push_back("id" + std::to_string(l));
+    }
+    Column<Categorical>::codes_storage codes;
+    Column<std::string> s;
+    Column<std::int64_t> q;
+    runtime::ValidityBitmap c_valid;
+    using Cell = std::optional<std::int64_t>;
+    struct Expect {
+        std::int64_t count = 0;
+        std::int64_t total = 0;
+        std::string first;
+    };
+    std::vector<Cell> order;
+    std::map<Cell, Expect> groups;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        const auto cv = static_cast<std::int64_t>((i * 7919) % 47);
+        const bool ok = i < kValidHead || i >= kRows - kValidTail || i % 20 != 13;
+        const auto qv = static_cast<std::int64_t>(i % 97);
+        const std::string sv = "s" + std::to_string(i % 1'009);
+        codes.push_back(static_cast<Column<Categorical>::code_type>(cv));
+        s.push_back(sv);
+        q.push_back(qv);
+        c_valid.push_back(ok);
+        const Cell key = ok ? Cell{cv} : std::nullopt;
+        auto [it, inserted] = groups.emplace(key, Expect{});
+        if (inserted) {
+            order.push_back(key);
+            it->second.first = sv;
+        }
+        ++it->second.count;
+        it->second.total += qv;
+    }
+    runtime::Table t;
+    t.add_column("c", Column<Categorical>(labels, std::move(codes)));
+    t.columns.back().validity = std::move(c_valid);
+    t.add_column("s", std::move(s));
+    t.add_column("q", std::move(q));
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    for (const bool with_first : {false, true}) {
+        INFO("with first(s): " << with_first);
+        auto program = parser::parse(
+            with_first ? "t[select { total = sum(q), n = count(), f = first(s) }, by c];"
+                       : "t[select { total = sum(q), n = count() }, by c];");
+        REQUIRE(program.has_value());
+        auto ir = parser::lower(program.value());
+        REQUIRE(ir.has_value());
+        const auto check = [&](const runtime::Table& out) {
+            REQUIRE(out.rows() == order.size());
+            const auto* oc = out.find_entry("c");
+            REQUIRE(oc != nullptr);
+            const auto& cc = std::get<Column<Categorical>>(*oc->column);
+            const auto& ot = std::get<Column<std::int64_t>>(*out.find("total"));
+            const auto& on = std::get<Column<std::int64_t>>(*out.find("n"));
+            std::set<Cell> seen;
+            for (std::size_t g = 0; g < out.rows(); ++g) {
+                INFO("group " << g);
+                const Cell key = runtime::is_null(*oc, g)
+                                     ? std::nullopt
+                                     : Cell{static_cast<std::int64_t>(std::ranges::find(
+                                                labels, std::string(cc[g])) -
+                                            labels.begin())};
+                REQUIRE(groups.contains(key));
+                REQUIRE(seen.insert(key).second);
+                CHECK(key == order[g]);  // first-occurrence order
+                const Expect& want = groups.at(key);
+                REQUIRE(on[g] == want.count);
+                REQUIRE(ot[g] == want.total);
+                if (with_first) {
+                    const auto& of = std::get<Column<std::string>>(*out.find("f"));
+                    REQUIRE(std::string(of[g]) == want.first);
+                }
+            }
+            REQUIRE(seen.contains(std::nullopt));
+        };
+        for (const bool chunked : {false, true}) {
+            INFO("chunked: " << chunked);
+            std::optional<ChunkGrainGuard> guard;
+            if (chunked) {
+                guard.emplace("20000");
+            }
+            runtime::ExecutionContext serial;
+            serial.parallel_threads = 1;
+            runtime::ExecutionContext parallel;
+            parallel.parallel_threads = 8;
+            parallel.parallel_min_rows = 0;
+            const auto before = runtime::nullable_cat_key_chunks().load();
+            const auto sr =
+                runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, serial);
+            const auto pr =
+                runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+            INFO((sr.has_value() ? std::string{} : sr.error()));
+            REQUIRE(sr.has_value());
+            INFO((pr.has_value() ? std::string{} : pr.error()));
+            REQUIRE(pr.has_value());
+            // Guards the test: the nullable key really stayed on the code path.
+            CHECK(runtime::nullable_cat_key_chunks().load() > before);
+            check(*sr);
+            check(*pr);
+        }
+    }
+
+    // A filter over the aggregate compacts the groups before emission; the
+    // null group (~5% of rows; each label has ~2%) is the only survivor and
+    // must still come out null.
+    const std::int64_t null_rows = groups.at(std::nullopt).count;
+    auto program = parser::parse("t[select { n = count() }, by c][filter n > 30000];");
+    REQUIRE(program.has_value());
+    auto ir = parser::lower(program.value());
+    REQUIRE(ir.has_value());
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 8;
+    parallel.parallel_min_rows = 0;
+    const auto kept = runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+    REQUIRE(kept.has_value());
+    REQUIRE(kept->rows() == 1);
+    const auto* kc = kept->find_entry("c");
+    REQUIRE(kc != nullptr);
+    CHECK(runtime::is_null(*kc, 0));
+    CHECK(std::get<Column<std::int64_t>>(*kept->find("n"))[0] == null_rows);
+}
+
+TEST_CASE("chunked aggregate: a Categorical key's null group survives bitmap-free chunks",
+          "[runtime][chunked][aggregate][validity]") {
+    // Parquet omits an all-valid row group's bitmap, and a streamed
+    // dictionary grows as row groups bring new values. So one Categorical
+    // key alternates: no bitmap over {a, b}; nulls (the null cell, one past
+    // the two codes); the dictionary grows to {a, b, c, d} and a bitmap-free
+    // chunk uses c and d -- c's code is the cell the nulls used; nulls again.
+    // The null group made in chunk two must be the one chunk four adds to,
+    // and c must not land on it.
+    using Cat = Column<Categorical>;
+    struct GrowingSource final : runtime::Operator {
+        std::shared_ptr<std::vector<std::string>> dict =
+            std::make_shared<std::vector<std::string>>(std::vector<std::string>{"a", "b"});
+        std::shared_ptr<Cat::index_map> index = std::make_shared<Cat::index_map>();
+        std::size_t pos = 0;
+
+        auto make(std::vector<std::int32_t> codes, std::vector<std::int64_t> q,
+                  std::optional<std::vector<bool>> valid) -> runtime::Chunk {
+            runtime::Chunk out;
+            runtime::ColumnEntry key;
+            key.name = "c";
+            key.column = std::make_shared<runtime::ColumnValue>(
+                Cat(dict, index, Cat::codes_storage(codes.begin(), codes.end())));
+            if (valid.has_value()) {
+                runtime::ValidityBitmap bits;
+                for (const bool v : *valid) {
+                    bits.push_back(v);
+                }
+                key.validity = std::move(bits);
+            }
+            runtime::ColumnEntry value;
+            value.name = "q";
+            value.column = std::make_shared<runtime::ColumnValue>(Column<std::int64_t>(q));
+            out.columns.push_back(std::move(key));
+            out.columns.push_back(std::move(value));
+            return out;
+        }
+
+        auto next() -> std::expected<std::optional<runtime::Chunk>, std::string> override {
+            switch (pos++) {
+                case 0:
+                    for (std::size_t c = 0; c < dict->size(); ++c) {
+                        (*index)[(*dict)[c]] = static_cast<std::int32_t>(c);
+                    }
+                    return make({0, 1, 0}, {1, 2, 4}, std::nullopt);
+                case 1:
+                    // Null rows hold the codes of a and b underneath.
+                    return make({0, 1, 1, 0}, {8, 16, 32, 64},
+                                std::vector<bool>{false, false, true, false});
+                case 2:
+                    for (const char* label : {"c", "d"}) {
+                        (*index)[label] = static_cast<std::int32_t>(dict->size());
+                        dict->emplace_back(label);
+                    }
+                    return make({2, 3, 3}, {128, 256, 512}, std::nullopt);
+                case 3:
+                    return make({3, 2}, {1024, 2048}, std::vector<bool>{false, true});
+                default:
+                    return std::optional<runtime::Chunk>{};
+            }
+        }
+    };
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("cat_null_keys", [&](const runtime::ExternArgs&) {
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<GrowingSource>()};
+    });
+    const auto before = runtime::nullable_cat_key_chunks().load();
+    const auto result = run_extern(
+        "extern fn cat_null_keys() -> DataFrame from \"x.hpp\"; "
+        "cat_null_keys()[select { total = sum(q), n = count() }, by c];",
+        externs);
+    CHECK(runtime::nullable_cat_key_chunks().load() - before == 2);
+    REQUIRE(result.rows() == 5);
+    const auto* key = result.find_entry("c");
+    REQUIRE(key != nullptr);
+    const auto& codes = std::get<Cat>(*key->column);
+    const auto& total = std::get<Column<std::int64_t>>(*result.find("total"));
+    const auto& n = std::get<Column<std::int64_t>>(*result.find("n"));
+    // First-occurrence order: a, b, null, c, d.
+    const std::vector<std::optional<std::string>> want_key{"a", "b", std::nullopt, "c", "d"};
+    const std::vector<std::int64_t> want_total{1 + 4, 2 + 32, 8 + 16 + 64 + 1024, 128 + 2048,
+                                               256 + 512};
+    const std::vector<std::int64_t> want_n{2, 2, 4, 2, 2};
+    for (std::size_t g = 0; g < 5; ++g) {
+        INFO("group " << g);
+        REQUIRE(runtime::is_null(*key, g) == !want_key[g].has_value());
+        if (want_key[g].has_value()) {
+            CHECK(std::string(codes[g]) == *want_key[g]);
+        }
+        CHECK(total[g] == want_total[g]);
+        CHECK(n[g] == want_n[g]);
     }
 }
 

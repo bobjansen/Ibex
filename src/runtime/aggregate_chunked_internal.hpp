@@ -33,6 +33,11 @@ namespace ibex::runtime {
 /// path gives the same answer, so only this tells the two apart.
 [[nodiscard]] auto packed_nullable_key_chunks() -> std::atomic<std::uint64_t>&;
 
+/// How many chunks, process-wide, an aggregate grouped on one Categorical
+/// key with a validity bitmap through the dense code array (its nulls one
+/// extra cell). For tests: the generic path gives the same answer.
+[[nodiscard]] auto nullable_cat_key_chunks() -> std::atomic<std::uint64_t>&;
+
 /// How many times, process-wide, the single-int serial loop gave up its
 /// deferred index (`int_index_deferred_`) and built the hash map. For tests:
 /// the map gives the same answer, only slower, so only this tells them apart.

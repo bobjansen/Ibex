@@ -1649,6 +1649,11 @@ class HashAggregateState final {
             if (n_keys == 1) {
                 compact_by_index(cat_order_.data(), keep, 1, pool, workers);
                 cat_order_.resize(keep.size());
+                if (cat_null_gid_ != kNoGid) {
+                    const auto it = std::ranges::find(keep, cat_null_gid_);
+                    cat_null_gid_ =
+                        it == keep.end() ? kNoGid : static_cast<std::uint32_t>(it - keep.begin());
+                }
             } else {
                 compact_by_index(multi_cat_codes_flat_.data(), keep, n_keys, pool, workers);
                 multi_cat_codes_flat_.resize(keep.size() * n_keys);
@@ -1878,8 +1883,10 @@ class HashAggregateState final {
             bool all_cat = true;
             for (const auto* e : group_entries) {
                 group_templates_.push_back(make_empty_like(*e->column));
+                // One nullable Categorical key keeps the code path: its nulls
+                // are one extra dense cell (`process_rows_cat_nullable`).
                 if (!std::holds_alternative<Column<Categorical>>(*e->column) ||
-                    e->validity.has_value()) {
+                    (e->validity.has_value() && group_entries.size() != 1)) {
                     all_cat = false;
                 }
             }
@@ -2047,7 +2054,9 @@ class HashAggregateState final {
         // A data-sized packed key keeps a null cell per nullable column, so
         // only `build_packed_key` below can say whether this chunk's nulls fit.
         const bool packed_takes_nulls = packed_fast_path_ && encoder_.size_cells_from_data;
-        if ((cat_fast_path_ || str_fast_path_ || pair_int_fast_path_ ||
+        // So does a single Categorical key, as one more dense cell.
+        const bool cat_takes_nulls = cat_fast_path_ && group_entries.size() == 1;
+        if (((cat_fast_path_ && !cat_takes_nulls) || str_fast_path_ || pair_int_fast_path_ ||
              (packed_fast_path_ && !packed_takes_nulls)) &&
             std::ranges::any_of(group_entries, [](const ColumnEntry* entry) {
                 return entry->validity.has_value();
@@ -5056,7 +5065,14 @@ class HashAggregateState final {
         if (n_keys == 1) {
             seed_generic_index_from_keys(n_groups_, [&](std::size_t i) {
                 Key key;
-                key.values.emplace_back(std::string(decode(0, cat_order_[i])));
+                if (i == cat_null_gid_) {
+                    // The null group's code is a placeholder, maybe into an
+                    // empty dictionary; a null key's value is never read.
+                    key.set_null(0);
+                    key.values.emplace_back(std::string{});
+                } else {
+                    key.values.emplace_back(std::string(decode(0, cat_order_[i])));
+                }
                 return key;
             });
         } else {
@@ -5599,6 +5615,11 @@ class HashAggregateState final {
         const std::size_t n_keys = cat_cols.size();
         const bool single_key = n_keys == 1;
 
+        if (single_key && group_entries[0]->validity.has_value()) {
+            process_rows_cat_nullable(*cat_cols[0], *group_entries[0]->validity, agg_entries,
+                                      rows);
+            return std::nullopt;
+        }
         if (single_key && rows > 0 &&
             try_process_rows_cat_parallel(*cat_cols[0], agg_entries, rows)) {
             publish_fused_accumulation();
@@ -7313,6 +7334,74 @@ class HashAggregateState final {
         }
     }
 
+    /// One Categorical key with a validity bitmap: a null row is cell
+    /// `n_codes`, one past every code, so it groups through the same dense
+    /// array as the codes and never reads the code stored under it. The
+    /// null cell lives at the end of `cat_dense_gid_` only for this chunk;
+    /// its gid is kept in `cat_null_gid_`, so a later chunk -- with nulls or
+    /// without, with a grown dictionary or not -- indexes codes as before.
+    void process_rows_cat_nullable(const Column<Categorical>& cat, const ValidityBitmap& valid,
+                                   const std::vector<const ColumnEntry*>& agg_entries,
+                                   std::size_t rows) {
+        nullable_cat_key_chunks().fetch_add(1, std::memory_order_relaxed);
+        const std::size_t n_codes = std::max(cat_dense_gid_.size(), cat.dictionary_size());
+        cat_dense_gid_.resize(n_codes, kNoGid);
+        const std::size_t null_cell = n_codes;
+        const std::size_t n_cells = n_codes + 1;
+        cat_dense_gid_.push_back(cat_null_gid_);
+        const auto* codes = cat.codes_data();
+        const auto cell_of = [&](std::size_t row) -> std::size_t {
+            return valid[row] ? static_cast<std::size_t>(codes[row]) : null_cell;
+        };
+        const auto record = [&](std::size_t cell, std::uint32_t gid) {
+            if (cell == null_cell) {
+                cat_null_gid_ = gid;
+                cat_order_.push_back(0);
+            } else {
+                cat_order_.push_back(static_cast<Column<Categorical>::code_type>(cell));
+            }
+        };
+        const std::size_t morsels =
+            aggs_are_slot_combinable() ? dense_morsel_count(n_cells, rows) : 0;
+        if (morsels != 0) {
+            cat_null_cells_.resize(rows);
+            auto* cells = cat_null_cells_.data();
+            run_dense_fused(
+                cells, n_cells, agg_entries, rows, cat_dense_gid_, morsels,
+                [&](std::size_t begin, std::size_t end) {
+                    for (std::size_t row = begin; row < end; ++row) {
+                        cells[row] = static_cast<std::uint32_t>(cell_of(row));
+                    }
+                },
+                [&](std::size_t cell) {
+                    const std::uint32_t gid = alloc_group();
+                    record(cell, gid);
+                    return gid;
+                });
+            cat_dense_gid_.pop_back();
+            publish_fused_accumulation();
+            return;
+        }
+        gids_buf_.resize(rows);
+        auto* gids = gids_buf_.data();
+        if (!try_assign_dense_gids_parallel(rows, n_cells, cat_dense_gid_.data(), cell_of, record,
+                                            gids)) {
+            std::uint32_t* dense = cat_dense_gid_.data();
+            for (std::size_t row = 0; row < rows; ++row) {
+                const std::size_t cell = cell_of(row);
+                std::uint32_t gid = dense[cell];
+                if (gid == kNoGid) {
+                    gid = alloc_group();
+                    dense[cell] = gid;
+                    record(cell, gid);
+                }
+                gids[row] = gid;
+            }
+        }
+        cat_dense_gid_.pop_back();
+        publish_discovered(agg_entries, rows);
+    }
+
     auto try_process_rows_cat_parallel(const Column<Categorical>& cat,
                                        const std::vector<const ColumnEntry*>& agg_entries,
                                        std::size_t rows) -> bool {
@@ -8027,6 +8116,11 @@ class HashAggregateState final {
             key_validity[0].assign(n_groups_, true);
             key_validity[0].set(int_null_gid_, false);
         }
+        if (cat_fast_path_ && cat_null_gid_ != kNoGid) {
+            any_null_keys = 1;
+            key_validity[0].assign(n_groups_, true);
+            key_validity[0].set(cat_null_gid_, false);
+        }
 
         // One definition of "store this raw integer key at group g". The
         // destination was pre-sized above, so this is an indexed write; the
@@ -8544,6 +8638,10 @@ class HashAggregateState final {
     std::vector<std::uint32_t> int_dense_cells_;
     /// The null key's group, made only by the dense path; kNoGid if none.
     std::uint32_t int_null_gid_ = kNoGid;
+    /// The single-Categorical path's null group (`process_rows_cat_nullable`);
+    /// its `cat_order_` entry is a placeholder code.
+    std::uint32_t cat_null_gid_ = kNoGid;
+    std::vector<std::uint32_t> cat_null_cells_;
 
     // Single-Categorical fast path: code → gid via direct array (codes are a
     // dense [0, dict_size) index, so no hashing is needed).
@@ -9661,6 +9759,11 @@ class ChunkedSortedAggregateOperator final : public Operator {
 }  // namespace
 
 auto deferred_int_index_builds() -> std::atomic<std::uint64_t>& {
+    static std::atomic<std::uint64_t> count{0};
+    return count;
+}
+
+auto nullable_cat_key_chunks() -> std::atomic<std::uint64_t>& {
     static std::atomic<std::uint64_t> count{0};
     return count;
 }

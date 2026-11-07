@@ -9,7 +9,6 @@
 #include <ibex/core/compiler.hpp>
 #include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
-#include <ibex/format.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
@@ -20,11 +19,9 @@
 #include <array>
 #include <atomic>
 #include <bit>
-#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -36,7 +33,6 @@
 #include <mutex>
 #include <new>
 #include <optional>
-#include <ratio>
 #include <robin_hood.h>
 #include <shared_mutex>
 #include <span>
@@ -2026,10 +2022,6 @@ class HashAggregateState final {
 
     auto discover_chunk(const Chunk& chunk) -> std::optional<std::string> {
         discovery_transfer_ = {};
-        if (std::getenv("IBEX_AGG_PARTITION_DEBUG") != nullptr) {
-            ibex::formatting::print(stderr, "[agg_process_chunk] rows={} group_by_size={}\n",
-                                    chunk.rows(), group_by_->size());
-        }
         // Counted here, once per chunk, because the partition gate below asks
         // how much input this OPERATOR has — a question the per-call row count
         // stopped answering the moment sources began arriving in pieces.
@@ -3162,11 +3154,6 @@ class HashAggregateState final {
 
         owned_rows_seen_ += rows;
         owned_mode_ = true;
-        if (std::getenv("IBEX_AGG_PARTITION_DEBUG") != nullptr) {
-            ibex::formatting::print(
-                stderr, "[agg_owned] chunk rows={} part_count={} total_rows={}\n", rows,
-                partitions.size(), static_cast<unsigned long long>(owned_rows_seen_));
-        }
         return true;
     }
 
@@ -3555,8 +3542,6 @@ class HashAggregateState final {
         }
 
         if (owned_ordered_runs_nondecreasing_) {
-            const bool ord_timing = std::getenv("IBEX_ORDERED_RUN_TIMING") != nullptr;
-            const auto ord_t0 = std::chrono::steady_clock::now();
             const std::size_t run_count = owned_ordered_run_keys_.size();
             const std::int64_t* const rk = owned_ordered_run_keys_.data();
             const std::size_t* const rc = owned_ordered_run_counts_.data();
@@ -3671,16 +3656,6 @@ class HashAggregateState final {
                         slots[group_base[w] - 1].count += carry[w];
                     }
                 }
-            }
-
-            if (ord_timing) {
-                const auto ms = std::chrono::duration<double, std::milli>(
-                                    std::chrono::steady_clock::now() - ord_t0)
-                                    .count();
-                ibex::formatting::print(stderr,
-                                        "[ord_run] finalize nondecreasing runs={} groups={} "
-                                        "workers={} {}ms\n",
-                                        run_count, total, workers, ms);
             }
             return;
         }

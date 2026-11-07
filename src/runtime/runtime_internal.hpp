@@ -638,13 +638,13 @@ void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src,
                 // bit alongside each value, which is a different kernel.
                 return {gather_column(src, indices, n, exec), std::nullopt};
             }
-            const std::size_t kNull = *null_index;
+            const std::size_t null_row = *null_index;
             ValidityBitmap bm(n, true);
             if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
                 Column<Categorical>::codes_storage codes(n);
                 const auto* sp = col.codes_data();
                 for (std::size_t i = 0; i < n; ++i) {
-                    if (indices[i] != kNull) {
+                    if (indices[i] != null_row) {
                         codes[i] = sp[indices[i]];
                     } else {
                         codes[i] = 0;
@@ -657,7 +657,7 @@ void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src,
                 const char* src_char = col.chars_data();
                 std::size_t total_chars = 0;
                 for (std::size_t i = 0; i < n; ++i) {
-                    if (indices[i] != kNull)
+                    if (indices[i] != null_row)
                         total_chars += src_off[indices[i] + 1] - src_off[indices[i]];
                 }
                 ColT dst;
@@ -667,7 +667,7 @@ void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src,
                 dst_off[0] = 0;
                 std::uint32_t cur = 0;
                 for (std::size_t i = 0; i < n; ++i) {
-                    if (indices[i] != kNull) {
+                    if (indices[i] != null_row) {
                         std::uint32_t len = src_off[indices[i] + 1] - src_off[indices[i]];
                         ::memcpy(dst_char + cur, src_char + src_off[indices[i]], len);
                         cur += len;
@@ -681,7 +681,7 @@ void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src,
                 ColT dst;
                 dst.resize(n, false);
                 for (std::size_t i = 0; i < n; ++i) {
-                    if (indices[i] != kNull) {
+                    if (indices[i] != null_row) {
                         dst.set(i, col[indices[i]]);
                     } else {
                         bm.set(i, false);
@@ -694,7 +694,7 @@ void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src,
                 auto* dp = dst.data();
                 const auto* sp = col.data();
                 for (std::size_t i = 0; i < n; ++i) {
-                    if (indices[i] != kNull) {
+                    if (indices[i] != null_row) {
                         dp[i] = sp[indices[i]];
                     } else {
                         dp[i] = {};
@@ -727,11 +727,11 @@ using GatheredColumn = std::pair<ColumnValue, std::optional<ValidityBitmap>>;
         return {std::move(column), std::move(validity)};
     }
     // No sentinel: every index is a real row, and SIZE_MAX is never one.
-    const std::size_t kNull = null_index.value_or(static_cast<std::size_t>(-1));
+    const std::size_t null_row = null_index.value_or(static_cast<std::size_t>(-1));
     ValidityBitmap bitmap =
         validity.has_value() ? std::move(*validity) : ValidityBitmap(total, true);
     for (std::size_t i = 0; i < total; ++i) {
-        if (idx[i] != kNull && !(*entry.validity)[idx[i]]) {
+        if (idx[i] != null_row && !(*entry.validity)[idx[i]]) {
             bitmap.set(i, false);
         }
     }

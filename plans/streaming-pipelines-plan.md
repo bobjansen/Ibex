@@ -54,16 +54,16 @@ hash build, aggregate merge, order, distinct, window, materialized fallbacks.
   (`build_scan_pipeline_worker`, `PipelinedScanOperator`).
 - A per-worker aggregate on the producing core: `ScanWorkerSink` /
   `DenseAggregateScanSink` (dense categorical only; q01 −30% at 8c on AWS).
-- A probe at the head of a morsel chain with the maps above it fused
-  (`35e6108a`, `3172e533`), opt-in `IBEX_PROBE_MORSELS`: Layer B, over a
-  materialized (drained) probe side; measured a loss on its own (q09 +6.8%) and it deadlocks
-  q09 at SF-8 (below).
+- (Deleted 2026-11-07.) A probe at the head of a morsel chain with the maps
+  above it fused (`35e6108a`, `3172e533`), opt-in `IBEX_PROBE_MORSELS`:
+  Layer B, over a materialized (drained) probe side; measured a loss on its
+  own (q09 +6.8%) and it deadlocked q09 at SF-8 (below).
 - Immutable `JoinHashIndex` after `run_build`; build-before-probe is an explicit
   call.
 - Ordered rings and unit `sequence` numbers: merging per-unit results in unit
   order is what keeps row order identical.
 
-## The `IBEX_PROBE_MORSELS` deadlock (diagnosed 2026-10-20, not fixed)
+## The `IBEX_PROBE_MORSELS` deadlock (diagnosed 2026-10-20; path deleted 2026-11-07)
 
 SF-8 q09, 8 cores, hangs at 0% CPU (SF-1 completes). Stacks: all 8 pool
 workers park in `OrderedChunkRing::acquire` (the probe-morsel ring is full);
@@ -76,7 +76,9 @@ when the waiting worker has nested work of its own
 spin and nesting failures). Loosening that gate is the wrong fix: the shape
 breaks the rule that long-lived blocking occupants do not belong in the pool,
 and it morselizes a materialized table (a §5 dead end of `beat-both-plan.md`).
-**Decision:** do not fix; slice 1 supersedes the path, and slice 5 deletes it.
+**Decision:** do not fix; slice 1 supersedes the path. Slice 5's deletion
+was done early, on 2026-11-07. Slice 1 must not rebuild this shape: a probe
+step belongs in the scan-unit chain, not over a drained, re-split table.
 
 ## Slices
 
@@ -222,9 +224,9 @@ says so.
    only for sources decoded up front; streaming and deferred-probe scans are
    skipped there.
 4. **Semi/anti joins as probe steps** (q04, q21, q22).
-5. **Retire Layer B probe morsels** (`try_take_join_probe`,
-   `build_probe_morsel_pipeline`, `IBEX_PROBE_MORSELS`), and rewrite
-   `PARALLELISM.md`'s layer model.
+5. **Rewrite `PARALLELISM.md`'s layer model.** The Layer B probe morsels it
+   was to retire (`try_take_join_probe`, `build_probe_morsel_pipeline`,
+   `IBEX_PROBE_MORSELS`) were deleted on 2026-11-07.
 
 ## Constraints from history (each was measured)
 

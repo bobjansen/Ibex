@@ -43,6 +43,7 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/interrupt.hpp>
 #include <ibex/runtime/lazy_table.hpp>
+#include <ibex/runtime/morsel.hpp>
 #include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
@@ -1965,18 +1966,17 @@ class JoinProbeOperator final : public Operator {
     SchemaCarrier schema_;
 };
 
-auto make_probe_factory(JoinProbe probe) -> JoinProbeFactory {
-    const ExecutionContext* exec = probe.exec_;
-    auto state = std::make_shared<JoinProbe>(std::move(probe));
-    return JoinProbeFactory{[state](OperatorPtr child, bool preserve_empty) -> OperatorPtr {
-                                return std::make_unique<JoinProbeOperator>(std::move(child), *state,
-                                                                           preserve_empty);
-                            },
-                            [state](OperatorPtr child, bool preserve_empty) -> OperatorPtr {
-                                return std::make_unique<JoinProbeOperator>(
-                                    std::move(child), std::move(*state), preserve_empty);
-                            },
-                            exec};
+/// One probe operator over the probe side: the drained table when the build
+/// phase materialized it, otherwise the streaming `source`.
+auto make_join_probe_operator(OperatorPtr source, std::optional<Table> materialized_source,
+                              JoinProbe probe) -> std::expected<OperatorPtr, std::string> {
+    OperatorPtr probe_source = materialized_source.has_value()
+                                   ? make_table_source(std::move(*materialized_source))
+                                   : std::move(source);
+    if (probe_source == nullptr) {
+        return std::unexpected("join probe has no probe-side source");
+    }
+    return std::make_unique<JoinProbeOperator>(std::move(probe_source), std::move(probe));
 }
 
 /// The runtime value carried by the physical HashBuild -> HashProbe edge.
@@ -2627,13 +2627,8 @@ class ChunkedInnerJoinOperator final : public Operator {
             use_materialized_left_ = false;
         }
 
-        // The probe side is kept rather than consumed. Building the probe
-        // operator here would settle a question a caller above may want to
-        // answer differently: a map pipeline over this join can take the probe
-        // and run it at the head of its own worker chains, which is the Umbra
-        // shape -- one build pipeline, then a probe pipeline whose maps run in
-        // the same worker as the probe. `take_fusible_probe` is that handoff,
-        // and it has to happen before `ensure_probe_op` commits.
+        // The probe side is kept; `ensure_probe_op` turns it into the probe's
+        // source on first pull.
         probe_side_ = std::move(materialized_probe_side);
         if (!probe_side_.has_value() && left_ == nullptr) {
             // Every way of losing the probe side is a bug in the branches
@@ -2646,16 +2641,12 @@ class ChunkedInnerJoinOperator final : public Operator {
     }
 
     /// Build Stream mode's probe operator, once, on first use.
-    ///
-    /// Split from `adopt_build` so a caller that wants to fuse this probe into
-    /// its own pipeline has a window in which the decision is still open --
-    /// see `take_fusible_probe`.
     auto ensure_probe_op() -> std::optional<std::string> {
         if (probe_op_ != nullptr) {
             return std::nullopt;
         }
-        auto built = make_join_probe_operator(std::move(left_), std::move(probe_side_),
-                                              make_probe_factory(std::move(probe_)));
+        auto built =
+            make_join_probe_operator(std::move(left_), std::move(probe_side_), std::move(probe_));
         if (!built.has_value()) {
             return std::move(built.error());
         }
@@ -2665,42 +2656,6 @@ class ChunkedInnerJoinOperator final : public Operator {
     }
 
    public:
-    /// Hand the probe and its input to a caller that will run them itself.
-    /// Empty unless this join settled on `BuildRight` and nothing has pulled
-    /// from it yet: a swapped or precomputed join emits one table and has no
-    /// probe pipeline to give.
-    ///
-    /// A probe side that is still streaming gets materialized here, which
-    /// sounds like a cost added and is not: the caller is a parallel map
-    /// pipeline, which was going to materialize the join's OUTPUT and
-    /// morselize that. This materializes the probe side instead, and the
-    /// join's output is then never assembled at all -- it is produced a morsel
-    /// at a time inside the workers. Which of the two tables is larger is a
-    /// real question and a measured one; it is not a question of whether a
-    /// materialization exists.
-    ///
-    /// The operator is left without a probe and must be discarded.
-    [[nodiscard]] auto take_fusible_probe()
-        -> std::expected<std::optional<FusibleJoinProbe>, std::string> {
-        if (mode_ != Mode::Stream || probe_op_ != nullptr) {
-            return std::optional<FusibleJoinProbe>{};
-        }
-        if (!probe_side_.has_value()) {
-            if (left_ == nullptr) {
-                return std::optional<FusibleJoinProbe>{};
-            }
-            auto drained = materialize_operator(std::move(left_));
-            if (!drained.has_value()) {
-                return std::unexpected(std::move(drained.error()));
-            }
-            probe_side_ = std::move(*drained);
-        }
-        FusibleJoinProbe out{.probe_side = std::move(*probe_side_),
-                             .probe = make_probe_factory(std::move(probe_))};
-        probe_side_.reset();
-        return std::optional<FusibleJoinProbe>{std::move(out)};
-    }
-
    private:
     /// Two-fixed-width-int-key path: narrow first cut of the streaming
     /// two-key join. Non-deferred case: `right_` is already a whole `Table`
@@ -3507,14 +3462,12 @@ class ChunkedInnerJoinOperator final : public Operator {
     /// the orientation is BuildRight, since from then on the probe is an
     /// operator of its own and this class is build-side only.
     JoinProbe probe_;
-    /// The probe side, drained by the build phase and held until either
-    /// `ensure_probe_op` turns it into a source or `take_fusible_probe` hands
-    /// it to a pipeline above. Empty when the probe side streams from `left_`.
+    /// The probe side, drained by the build phase and held until
+    /// `ensure_probe_op` turns it into a source. Empty when the probe side
+    /// streams from `left_`.
     std::optional<Table> probe_side_;
     /// Stream mode's probe, constructed on first use: one
-    /// `JoinProbeOperator` over the probe-side child, or -- when that child
-    /// was already materialized and is big enough -- a morsel pipeline of
-    /// several of them over its morsels. Null in the Swapped and Precomputed
+    /// `JoinProbeOperator` over the probe-side child. Null in the Swapped and Precomputed
     /// modes, which emit one table rather than streaming.
     OperatorPtr probe_op_;
 
@@ -3639,7 +3592,7 @@ auto build_hash_probe_operator(HashProbeInput input) -> std::expected<OperatorPt
         }
         return make_join_probe_operator(std::move(stream->source),
                                         std::move(stream->materialized_source),
-                                        make_probe_factory(std::move(stream->probe)));
+                                        std::move(stream->probe));
     }
     if (auto* streamed = std::get_if<StreamedHashProbeInput>(&input)) {
         return std::move(streamed->pipeline);
@@ -3724,20 +3677,6 @@ auto make_scheduled_deferred_inner_join_operator(
     return finish_scheduled_join(std::make_unique<ChunkedInnerJoinOperator>(
         std::move(left), right_node, registry, scalars, externs, exec, keys, probe,
         std::move(probe_name), std::move(suffix), pending_order, parallelism, std::move(columns)));
-}
-
-auto take_fusible_join_probe(OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys,
-                             const ExecutionContext& exec, ir::JoinSuffixPolicy suffix,
-                             const std::vector<ir::OrderKey>* pending_order,
-                             physical::JoinParallelism parallelism)
-    -> std::expected<std::optional<FusibleJoinProbe>, std::string> {
-    auto op =
-        std::make_unique<ChunkedInnerJoinOperator>(std::move(left), std::move(right), keys, exec,
-                                                   std::move(suffix), pending_order, parallelism);
-    if (auto err = op->run_build()) {
-        return std::unexpected(std::move(*err));
-    }
-    return op->take_fusible_probe();
 }
 
 }  // namespace ibex::runtime

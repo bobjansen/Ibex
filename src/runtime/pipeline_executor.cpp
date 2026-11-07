@@ -21,8 +21,6 @@
 //     TwoPhaseFilterOperator  a lone range-native filter: count survivors per
 //                             morsel, prefix-sum, then write disjoint slices of
 //                             one output chunk. No ring, no merge.
-//   try_take_join_probe / build_probe_morsel_pipeline put a streaming join's
-//   probe at the head of the worker chains (see join_chunked.cpp).
 //
 // Layer A — pipeline overlap across a breaker (called from runtime_entry.cpp)
 //   PipelinedScanOperator   workers each claim one source unit (e.g. a
@@ -94,7 +92,6 @@
 #include "execution_profile_internal.hpp"
 #include "interpreter_internal.hpp"
 #include "join_chunked_internal.hpp"
-#include "physical_executor_internal.hpp"
 #include "pipeline_executor_internal.hpp"
 #include "runtime_internal.hpp"
 #include "scan_worker_sink_internal.hpp"
@@ -364,17 +361,13 @@ struct MorselWorkerChain {
 [[nodiscard]] auto build_morsel_worker_chain(const std::vector<MapStep>& operators,
                                              const Table& input, const ScalarRegistry* scalars,
                                              const ExternRegistry* externs,
-                                             const ExecutionContext& exec,
-                                             const JoinProbeFactory* probe_head = nullptr)
+                                             const ExecutionContext& exec)
     -> std::expected<MorselWorkerChain, std::string> {
     // A qualifying head is absorbed into the source rather than built as an
     // operator above it — same output, without materializing the morsel first.
-    // Not available under a probe head: that optimization reads the first
-    // operator as a filter over the SOURCE's rows, and with a probe between
-    // them the source's rows are the probe side, not the filter's input.
     std::size_t first_op = 0;
     std::unique_ptr<MorselSource> source;
-    if (!operators.empty() && probe_head == nullptr) {
+    if (!operators.empty()) {
         if (auto head = range_filter_head(operators.front(), input); head.has_value()) {
             source = std::make_unique<RangeFilterMorselSource>(input, head->predicate,
                                                                head->project, scalars);
@@ -386,14 +379,6 @@ struct MorselWorkerChain {
     }
 
     MorselWorkerChain worker{.source = source.get(), .chain = std::move(source)};
-    // The probe runs first, on this worker's own morsel of the probe side, and
-    // every map above it runs in the same worker on the probe's output. That
-    // is the whole point of the fused shape: the join's output is never
-    // assembled as a table between the probe and the maps.
-    if (probe_head != nullptr) {
-        worker.chain = probe_head->attach(std::move(worker.chain),
-                                          /*preserve_empty_morsels=*/true);
-    }
     for (std::size_t i = first_op; i < operators.size(); ++i) {
         const MapStep& op_node = operators[i];
         // `preserve_empty_morsels` is what makes one input morsel yield exactly
@@ -1275,118 +1260,6 @@ class TwoPhaseFilterOperator final : public Operator {
 
 }  // namespace pipeline_executor_detail
 
-// Internal linkage to match the forward declarations beside the join, which
-// sit inside this TU's anonymous namespace; the definitions must live down
-// here because they use the morsel executor, which is defined below the join.
-namespace pipeline_executor_detail {
-
-/// Build a streaming join here and take its probe, so a map pipeline above it
-/// can run that probe at the head of its own worker chains.
-///
-/// Returns an empty optional -- not an error -- for every join this cannot
-/// fuse: a materializing one, a semi/anti one, a deferred probe scan (whose
-/// right subtree must be interpreted by the join itself, after it publishes
-/// build-side bounds), and any orientation that leaves no materialized probe
-/// side. The caller then materializes the join's output as it always did.
-///
-/// Narrow on purpose. The point is to establish that two pipelines meeting at
-/// a barrier can be built and can produce the right answer; widening the
-/// shapes is cheap once that is true, and pointless before.
-auto try_take_join_probe(const ir::Node& node, const TableRegistry& registry,
-                         const ScalarRegistry* scalars, const ExternRegistry* externs,
-                         const ExecutionContext& exec, ModelResult* model_out)
-    -> std::expected<std::optional<FusibleJoinProbe>, std::string> {
-    if (std::getenv("IBEX_PROBE_MORSELS") == nullptr) {
-        return std::optional<FusibleJoinProbe>{};
-    }
-    const physical::Plan plan = physical::plan_physical(
-        node, registry, externs, physical::deferred_source_schemas(exec.deferred_scans));
-    const physical::JoinPlan& jp = plan.join;
-    if (!jp.describes || jp.strategy != physical::JoinStrategy::StreamingProbe ||
-        (jp.branch != physical::JoinBranch::SingleKeyInner &&
-         jp.branch != physical::JoinBranch::PairIntInner)) {
-        return std::optional<FusibleJoinProbe>{};
-    }
-    const auto& join = ir::node_cast<ir::JoinNode>(node);
-    if (deferred_probe_scan_of(*join.children()[1], exec).scan != nullptr) {
-        return std::optional<FusibleJoinProbe>{};
-    }
-
-    auto left_op = build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
-    if (!left_op.has_value()) {
-        return std::unexpected(std::move(left_op.error()));
-    }
-    auto right = materialize_plan(*join.children()[1], registry, scalars, externs, exec, model_out);
-    if (!right.has_value()) {
-        return std::unexpected(std::move(right.error()));
-    }
-    return take_fusible_join_probe(std::move(left_op.value()), std::move(right.value()),
-                                   &join.keys(), exec, join.suffix(), &join.pending_order(),
-                                   physical_executor_detail::resolved_join_parallelism(exec));
-}
-
-auto probe_morsel_workers(const Table& input, const ExecutionContext& exec) -> std::size_t {
-    // OPT-IN, and the measurement is why. On its own this is a LOSS: the
-    // probe already fans out inside one chunk (`probe_ranges_parallel`) with
-    // no copy, and morselizing replaces that with a per-morsel gather plus an
-    // ordered merge. Measured at 8 cores, interleaved, median of 15:
-    // q05 +1.7%, q09 +6.8% -- the only two PDS-H queries where it fires.
-    //
-    // It is wired anyway because the gather is not what this shape is for.
-    // A probe morsel becomes worth its gather when the filters and
-    // projections above the join run in the SAME chain, so the join's output
-    // is never materialized between them. That needs the probe admitted into
-    // the plan's step vocabulary, which is the next piece; this is the half
-    // that had to work first. This remains opt-in: the former "22/22" claim is
-    // stale, and SF4 q09 currently stalls in both the pre-extraction baseline
-    // and this tree when the knob is enabled. Resolve that independently
-    // before admitting this shape by default.
-    if (std::getenv("IBEX_PROBE_MORSELS") == nullptr) {
-        return 0;
-    }
-    if (!exec.can_fan_out() || on_worker_pool_thread()) {
-        return 0;
-    }
-    if (!is_worth_morselizing(exec, input.rows(), input.columns.size())) {
-        return 0;
-    }
-    const std::size_t grain = morsel_grain(exec, input.rows());
-    return morsel_worker_count(exec, partitioned_morsel_count(input, grain));
-}
-
-auto build_probe_morsel_pipeline(Table input, const JoinProbeFactory& probe, std::size_t workers,
-                                 const ExecutionContext& exec)
-    -> std::expected<OperatorPtr, std::string> {
-    auto owned = std::make_unique<Table>(std::move(input));
-    const std::size_t grain = morsel_grain(exec, owned->rows());
-    const auto expected_morsels = partitioned_morsel_count(*owned, grain);
-    if (exec.parallel_stats != nullptr) {
-        exec.parallel_stats->parallel_pipelines.fetch_add(1, std::memory_order_relaxed);
-        exec.parallel_stats->morsels.fetch_add(expected_morsels, std::memory_order_relaxed);
-    }
-
-    static const std::vector<MapStep> no_steps;
-    std::vector<MorselWorkerChain> chains;
-    chains.reserve(workers);
-    for (std::size_t i = 0; i < workers; ++i) {
-        // The chain is source + probe. Each worker gets its OWN `JoinProbe` --
-        // its scratch vectors and its per-chunk categorical head table are
-        // per-worker state -- and they share one build, because the index and
-        // the build side are both `shared_ptr<const>` and have been since
-        // `f6a1a632` and `6df9a966`. Copying the probe is what that ownership
-        // was for.
-        auto worker = build_morsel_worker_chain(no_steps, *owned, nullptr, nullptr, exec, &probe);
-        if (!worker.has_value()) {
-            return std::unexpected(std::move(worker.error()));
-        }
-        chains.push_back(std::move(worker.value()));
-    }
-    return std::make_unique<MorselPipelineOperator>(std::move(owned), std::move(chains), grain,
-                                                    expected_morsels, process_worker_pool());
-}
-
-}  // namespace pipeline_executor_detail
-
 namespace pipeline_executor_detail {
 
 /// The steps of a plan's parallel prefix, ordered source-to-sink. A plan
@@ -1400,48 +1273,27 @@ auto parallel_pipeline_operators(const physical::Plan& plan) -> std::vector<MapS
     return operators;
 }
 
-/// The morsel run over a MATERIALIZED input: a fused join probe, a two-phase
-/// filter, morsel workers, or one whole-table chunk when splitting is not worth
-/// it. `operators` are the run's steps, source-to-sink.
+/// The morsel run over a MATERIALIZED input: a two-phase filter, morsel
+/// workers, or one whole-table chunk when splitting is not worth it. `operators` are the run's
+/// steps, source-to-sink.
 auto build_materialized_map_run(const physical::Plan& plan, const std::vector<MapStep>& operators,
                                 const ir::Node* input_node, const TableRegistry& registry,
                                 const ScalarRegistry* scalars, const ExternRegistry* externs,
                                 const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
-    // Fused probe: when this pipeline's input is a streaming join, take its
-    // build and its probe side and run the probe at the head of every worker
-    // chain, instead of materializing the join's OUTPUT and morselizing that.
-    // The probe side becomes the morsel source, so the join's output is never
-    // assembled as a table at all -- it is produced a morsel at a time by the
-    // same worker that then runs the maps over it. Two pipelines meeting at a
-    // barrier, which is the shape this plan has been working toward.
-    std::optional<JoinProbeFactory> fused_probe;
-    std::unique_ptr<Table> owned;
-    if (input_node->kind() == ir::NodeKind::Join) {
-        auto fused = try_take_join_probe(*input_node, registry, scalars, externs, exec, model_out);
-        if (!fused.has_value()) {
-            return std::unexpected(std::move(fused.error()));
-        }
-        if (fused->has_value()) {
-            owned = std::make_unique<Table>(std::move((*fused)->probe_side));
-            fused_probe = std::move((*fused)->probe);
-        }
+    // Build the run's input through the pipeline's source, the way the serial
+    // composer does, so an aggregate under the run's filter gets its
+    // prefilter even when bare updates between them are the input.
+    auto input_op =
+        build_pipeline_source(plan, registry, scalars, externs, exec, model_out, input_node);
+    if (!input_op.has_value()) {
+        return std::unexpected(std::move(input_op.error()));
     }
-    if (owned == nullptr) {
-        // Build the run's input through the pipeline's source, the way the
-        // serial composer does, so an aggregate under the run's filter gets
-        // its prefilter even when bare updates between them are the input.
-        auto input_op =
-            build_pipeline_source(plan, registry, scalars, externs, exec, model_out, input_node);
-        if (!input_op.has_value()) {
-            return std::unexpected(std::move(input_op.error()));
-        }
-        auto input_tbl = materialize_operator(std::move(input_op.value()));
-        if (!input_tbl.has_value()) {
-            return std::unexpected(std::move(input_tbl.error()));
-        }
-        owned = std::make_unique<Table>(std::move(input_tbl.value()));
+    auto input_tbl = materialize_operator(std::move(input_op.value()));
+    if (!input_tbl.has_value()) {
+        return std::unexpected(std::move(input_tbl.error()));
     }
+    auto owned = std::make_unique<Table>(std::move(input_tbl.value()));
     const std::size_t grain = morsel_grain(exec, owned->rows());
     const auto expected_morsels = partitioned_morsel_count(*owned, grain);
     // Morselize only when the work would actually fan out. Splitting earns its
@@ -1477,9 +1329,8 @@ auto build_materialized_map_run(const physical::Plan& plan, const std::vector<Ma
     }
 
     if (worker_count >= 2) {
-        const auto head = (operators.empty() || fused_probe.has_value())
-                              ? std::nullopt
-                              : range_filter_head(operators.front(), *owned);
+        const auto head =
+            operators.empty() ? std::nullopt : range_filter_head(operators.front(), *owned);
         if (exec.parallel_stats != nullptr && head.has_value()) {
             exec.parallel_stats->range_heads.fetch_add(1, std::memory_order_relaxed);
         }
@@ -1517,9 +1368,7 @@ auto build_materialized_map_run(const physical::Plan& plan, const std::vector<Ma
         std::vector<MorselWorkerChain> workers;
         workers.reserve(worker_count);
         for (std::size_t i = 0; i < worker_count; ++i) {
-            auto worker =
-                build_morsel_worker_chain(operators, *owned, scalars, externs, exec,
-                                          fused_probe.has_value() ? &*fused_probe : nullptr);
+            auto worker = build_morsel_worker_chain(operators, *owned, scalars, externs, exec);
             if (!worker.has_value()) {
                 return std::unexpected(std::move(worker.error()));
             }
@@ -1537,12 +1386,6 @@ auto build_materialized_map_run(const physical::Plan& plan, const std::vector<Ma
         // Morselizing here instead would add a per-morsel gather and a merge
         // concat to buy parallelism that was already judged not worth having.
         OperatorPtr serial = make_table_source(std::move(*owned));
-        if (fused_probe.has_value()) {
-            // Not worth morselizing, but the probe was already taken from the
-            // join and there is nothing to give it back to: run it here, over
-            // the whole probe side, with the maps above it as before.
-            serial = fused_probe->attach_move(std::move(serial));
-        }
         for (const MapStep& op_node : operators) {
             auto next = build_row_local_map_operator(op_node, std::move(serial), scalars, externs,
                                                      exec, false);

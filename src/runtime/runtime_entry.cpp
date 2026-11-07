@@ -225,26 +225,6 @@ auto build_unary_materializing_operator(const ir::Node& child_node, const TableR
 
 }  // namespace
 
-auto make_join_probe_operator(OperatorPtr source, std::optional<Table> materialized_source,
-                              JoinProbeFactory probe) -> std::expected<OperatorPtr, std::string> {
-    const ExecutionContext* exec = probe.execution_context();
-    if (materialized_source.has_value() && exec != nullptr) {
-        if (const std::size_t workers =
-                pipeline_executor_detail::probe_morsel_workers(*materialized_source, *exec);
-            workers >= 2) {
-            return pipeline_executor_detail::build_probe_morsel_pipeline(
-                std::move(*materialized_source), probe, workers, *exec);
-        }
-    }
-    OperatorPtr probe_source = materialized_source.has_value()
-                                   ? make_table_source(std::move(*materialized_source))
-                                   : std::move(source);
-    if (probe_source == nullptr) {
-        return std::unexpected("join probe has no probe-side source");
-    }
-    return probe.attach_move(std::move(probe_source));
-}
-
 /// Planner seam: returns a pull-based operator that, when drained,
 /// produces the logical result of `node`. Chunked operators exist
 /// today for node kinds that are safe and useful to stream; any other

@@ -26,12 +26,6 @@ namespace ibex::runtime::pipeline_executor_detail {
                                                 bool preserve_empty_morsels)
     -> std::expected<OperatorPtr, std::string>;
 
-[[nodiscard]] auto probe_morsel_workers(const Table& input, const ExecutionContext& exec)
-    -> std::size_t;
-[[nodiscard]] auto build_probe_morsel_pipeline(Table input, const JoinProbeFactory& probe,
-                                               std::size_t workers, const ExecutionContext& exec)
-    -> std::expected<OperatorPtr, std::string>;
-
 [[nodiscard]] auto build_map_pipeline_parallel(const physical::Plan& plan,
                                                const TableRegistry& registry,
                                                const ScalarRegistry* scalars,

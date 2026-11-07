@@ -61,7 +61,7 @@ in [correlation-and-duckdb-refresh.md](correlation-and-duckdb-refresh.md).
 
 | Plan | Notes |
 |---|---|
-| [streaming-pipelines-plan.md](streaming-pipelines-plan.md) | Proposal (2026-10-20): one worker takes one decode unit through the whole pipeline (probes, maps, per-worker sinks), for the 8-core idle and miss-cost gap measured on AWS. Records the `IBEX_PROBE_MORSELS` q09 deadlock diagnosis. |
+| [streaming-pipelines-plan.md](streaming-pipelines-plan.md) | Proposal (2026-10-20): one worker takes one decode unit through the whole pipeline (probes, maps, per-worker sinks), for the 8-core idle and miss-cost gap measured on AWS. Records the q09 deadlock diagnosis of the (since deleted) `IBEX_PROBE_MORSELS` path. |
 | [in-subquery-plan.md](in-subquery-plan.md) | Proposal: `x in (table_expr)` / `!(x in …)` as semi / null-aware anti join — a sibling of `exists`; readability, not new queries |
 | [extern-series-arguments-plan.md](extern-series-arguments-plan.md) | Proposal: `Series<T>` as a first-class extern argument, starting with CSV null tokens |
 | [project_http_plugin_plan.md](project_http_plugin_plan.md) | HTTP plugin MVP: simple registration API, blocking server, no decorators yet |
@@ -212,8 +212,6 @@ in active plans to `plans/done/...` paths refer to that history.
     `MalformedMapNode` (confirm, then delete or make them
     `invariant_violation`); bare streaming sources (a deferred `Scan`, a
     chunked `ExternCall`) inflate the `note_materialized_call` backlog;
-  - `IBEX_PROBE_MORSELS=1` (opt-in probe morsels) still stalls SF-4 q09: fix
-    it or delete the opt-in;
   - deferred, with their reopen conditions: `KernelContext` (when kernels
     share scratch or a cancellation owner), per-pipeline scheduling accounting
     (a multi-producer change, or queues forming), splitting the test binary by

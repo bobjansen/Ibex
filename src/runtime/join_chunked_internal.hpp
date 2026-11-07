@@ -87,41 +87,6 @@ inline auto pair_key_columns(const Table& side, const std::string& name0, const 
     return out;
 }
 
-/// Copyable construction handle for one worker-private streaming join probe.
-/// Attaching normally clones the pristine probe state for a worker; the
-/// single-consumer path moves it directly into its operator. Both retain
-/// shared ownership of the immutable hash build.
-class JoinProbeFactory {
-   public:
-    using Attach = std::function<OperatorPtr(OperatorPtr, bool)>;
-
-    JoinProbeFactory() = default;
-    JoinProbeFactory(Attach attach, Attach attach_move, const ExecutionContext* exec)
-        : attach_(std::move(attach)), attach_move_(std::move(attach_move)), exec_(exec) {}
-
-    [[nodiscard]] auto attach(OperatorPtr child, bool preserve_empty_morsels = false) const
-        -> OperatorPtr {
-        return attach_(std::move(child), preserve_empty_morsels);
-    }
-    [[nodiscard]] auto attach_move(OperatorPtr child, bool preserve_empty_morsels = false)
-        -> OperatorPtr {
-        return attach_move_(std::move(child), preserve_empty_morsels);
-    }
-    [[nodiscard]] auto execution_context() const noexcept -> const ExecutionContext* {
-        return exec_;
-    }
-
-   private:
-    Attach attach_;
-    Attach attach_move_;
-    const ExecutionContext* exec_ = nullptr;
-};
-
-struct FusibleJoinProbe {
-    Table probe_side;
-    JoinProbeFactory probe;
-};
-
 struct DeferredProbeScan {
     const DeferredScan* scan = nullptr;
     const std::string* name = nullptr;
@@ -140,13 +105,6 @@ struct DeferredProbeScan {
 /// values into `slot`: what an inner join hands its streamed left scan.
 void publish_join_key_filter(const Table& build, const std::string& key_name,
                              DynamicScanFilter& slot);
-
-/// Pipeline-owned adapter supplied by chunked.cpp. It may morselize an already
-/// materialized probe side before attaching worker-private probes.
-[[nodiscard]] auto make_join_probe_operator(OperatorPtr source,
-                                            std::optional<Table> materialized_source,
-                                            JoinProbeFactory probe)
-    -> std::expected<OperatorPtr, std::string>;
 
 [[nodiscard]] auto make_chunked_inner_join_operator(
     OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys,
@@ -190,13 +148,5 @@ void publish_join_key_filter(const Table& build, const std::string& key_name,
     physical::JoinParallelism parallelism = {},
     std::optional<ir::JoinColumnMapping> columns = std::nullopt)
     -> std::expected<OperatorPtr, std::string>;
-
-[[nodiscard]] auto take_fusible_join_probe(OperatorPtr left, Table right,
-                                           const std::vector<ir::JoinKey>* keys,
-                                           const ExecutionContext& exec,
-                                           ir::JoinSuffixPolicy suffix = {},
-                                           const std::vector<ir::OrderKey>* pending_order = nullptr,
-                                           physical::JoinParallelism parallelism = {})
-    -> std::expected<std::optional<FusibleJoinProbe>, std::string>;
 
 }  // namespace ibex::runtime

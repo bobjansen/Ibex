@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 """parquet::read reuses a parsed footer only for the exact file version it came from.
 
 The Parquet plugin caches each local file's parsed footer, dictionary-column

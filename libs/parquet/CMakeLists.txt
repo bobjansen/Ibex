@@ -195,8 +195,91 @@ if(WIN32)
     set(CMAKE_PROJECT_thrift_INCLUDE_BEFORE "${IBEX_ROOT}/cmake/ThriftZlibFix.cmake")
 endif()
 set(ARROW_WITH_ZSTD ON CACHE BOOL "" FORCE)
-set(zstd_SOURCE "BUNDLED" CACHE STRING "" FORCE)
-set(ZSTD_SOURCE "BUNDLED" CACHE STRING "" FORCE)
+# Zstandard decompression is most of a Parquet scan's CPU (PDS-H q07: two
+# thirds), and GCC compiles zstd's sequence decoder ~16% faster than Clang
+# does: 1.5.7 measured 1300 vs 1120 MB/s on one core, -O2 and -O3 alike for
+# either compiler (a PDS-H lineitem scan at 8 cores went 315 -> 291 ms). So
+# where GCC exists, build the same pinned release Arrow would bundle -- same
+# options, static and PIC -- with GCC, once, at configure time, and hand it to
+# Arrow as a "system" zstd. Anything else keeps Arrow's own bundled build.
+option(IBEX_ZSTD_WITH_GCC "Build Parquet's Zstandard with GCC (faster decompression)" ON)
+set(_ibex_zstd_from_gcc FALSE)
+if(IBEX_ZSTD_WITH_GCC AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_program(IBEX_ZSTD_C_COMPILER NAMES gcc)
+    set(_ibex_zstd_is_gcc FALSE)
+    if(IBEX_ZSTD_C_COMPILER)
+        execute_process(COMMAND "${IBEX_ZSTD_C_COMPILER}" --version
+                        OUTPUT_VARIABLE _ibex_zstd_cc_version ERROR_QUIET)
+        # A `gcc` that is Clang underneath (as on macOS) has nothing to offer.
+        if(_ibex_zstd_cc_version MATCHES "Free Software Foundation")
+            set(_ibex_zstd_is_gcc TRUE)
+        endif()
+    endif()
+    if(_ibex_zstd_is_gcc)
+        # The release and checksum Arrow 22 pins (cpp/thirdparty/versions.txt).
+        FetchContent_Declare(
+            ibex_zstd
+            URL https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+            URL_HASH SHA256=eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
+            SOURCE_SUBDIR _not_a_subproject)
+        FetchContent_MakeAvailable(ibex_zstd)
+        set(_ibex_zstd_prefix "${CMAKE_BINARY_DIR}/_deps/ibex_zstd-install")
+        set(_ibex_zstd_build "${CMAKE_BINARY_DIR}/_deps/ibex_zstd-gcc-build")
+        set(_ibex_zstd_args
+            -DCMAKE_C_COMPILER=${IBEX_ZSTD_C_COMPILER}
+            -DCMAKE_BUILD_TYPE=Release
+            "-DCMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG"
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+            -DZSTD_BUILD_PROGRAMS=OFF
+            -DZSTD_BUILD_SHARED=OFF
+            -DZSTD_BUILD_STATIC=ON
+            -DZSTD_MULTITHREAD_SUPPORT=OFF
+            -DCMAKE_INSTALL_PREFIX=${_ibex_zstd_prefix}
+            -DCMAKE_INSTALL_LIBDIR=lib)
+        string(SHA256 _ibex_zstd_key "${ibex_zstd_SOURCE_DIR};${_ibex_zstd_args};${_ibex_zstd_cc_version}")
+        set(_ibex_zstd_stamp "${_ibex_zstd_prefix}/ibex-zstd.stamp")
+        set(_ibex_zstd_have "")
+        if(EXISTS "${_ibex_zstd_stamp}")
+            file(READ "${_ibex_zstd_stamp}" _ibex_zstd_have)
+        endif()
+        if(NOT _ibex_zstd_have STREQUAL _ibex_zstd_key
+           OR NOT EXISTS "${_ibex_zstd_prefix}/lib/libzstd.a")
+            message(STATUS "Building Zstandard 1.5.7 with ${IBEX_ZSTD_C_COMPILER}")
+            execute_process(
+                COMMAND "${CMAKE_COMMAND}" -S "${ibex_zstd_SOURCE_DIR}/build/cmake"
+                        -B "${_ibex_zstd_build}" -G "${CMAKE_GENERATOR}" ${_ibex_zstd_args}
+                RESULT_VARIABLE _ibex_zstd_rc OUTPUT_QUIET)
+            if(_ibex_zstd_rc EQUAL 0)
+                execute_process(COMMAND "${CMAKE_COMMAND}" --build "${_ibex_zstd_build}"
+                                RESULT_VARIABLE _ibex_zstd_rc OUTPUT_QUIET)
+            endif()
+            if(_ibex_zstd_rc EQUAL 0)
+                execute_process(COMMAND "${CMAKE_COMMAND}" --install "${_ibex_zstd_build}"
+                                RESULT_VARIABLE _ibex_zstd_rc OUTPUT_QUIET)
+            endif()
+            if(_ibex_zstd_rc EQUAL 0)
+                file(WRITE "${_ibex_zstd_stamp}" "${_ibex_zstd_key}")
+            else()
+                message(WARNING "Building Zstandard with GCC failed; using Arrow's bundled build")
+            endif()
+        endif()
+        if(EXISTS "${_ibex_zstd_stamp}" AND EXISTS "${_ibex_zstd_prefix}/lib/libzstd.a")
+            set(_ibex_zstd_from_gcc TRUE)
+        endif()
+    endif()
+endif()
+if(_ibex_zstd_from_gcc)
+    # Arrow's FindzstdAlt tries find_package(zstd) first, which honours
+    # zstd_ROOT and finds the static target zstd's own install exports.
+    set(zstd_SOURCE "SYSTEM" CACHE STRING "" FORCE)
+    set(ZSTD_SOURCE "SYSTEM" CACHE STRING "" FORCE)
+    set(zstd_ROOT "${_ibex_zstd_prefix}" CACHE PATH "" FORCE)
+    set(ZSTD_ROOT "${_ibex_zstd_prefix}" CACHE PATH "" FORCE)
+    set(ARROW_ZSTD_USE_SHARED OFF CACHE BOOL "" FORCE)
+else()
+    set(zstd_SOURCE "BUNDLED" CACHE STRING "" FORCE)
+    set(ZSTD_SOURCE "BUNDLED" CACHE STRING "" FORCE)
+endif()
 set(ARROW_WITH_BROTLI OFF CACHE BOOL "" FORCE)
 set(ARROW_WITH_LZ4 OFF CACHE BOOL "" FORCE)
 set(ARROW_WITH_SNAPPY ON CACHE BOOL "" FORCE)

@@ -952,8 +952,9 @@ class GroupKeyStore {
     /// Groups `first .. first + rows.size()` take the keys at `rows` of
     /// `entries` -- the packed discovery's new groups, which it numbers
     /// serially and so must not copy keys for while it does. Split like
-    /// `prepare_fill`: this (serial) sizes the store and sets the null masks,
-    /// then `prepare_column_rows` and `fill_column_rows_range` write them.
+    /// `prepare_fill`: this (serial) sizes the store, then
+    /// `fill_null_masks_rows_range`, `prepare_column_rows` and
+    /// `fill_column_rows_range` write the masks and keys.
     void prepare_fill_rows(std::size_t first, const std::vector<const ColumnEntry*>& entries,
                            std::span<const std::size_t> rows) {
         // A codes-only column this chunk cannot extend with codes stores its
@@ -968,15 +969,24 @@ class GroupKeyStore {
             resize(first + rows.size(), /*zero=*/false);
         }
         ensure_columns(entries.size());
-        for (std::size_t n = 0; n < rows.size(); ++n) {
+    }
+
+    /// The null masks of groups `first + lo .. first + hi`, from `rows`. At
+    /// h2o q10's ~1e7 groups over six nullable keys this was ~80 ms of
+    /// random bitmap reads on one thread; ranges write disjoint masks.
+    void fill_null_masks_rows_range(std::size_t first, const std::vector<const ColumnEntry*>& entries,
+                                    std::span<const std::size_t> rows, std::size_t lo,
+                                    std::size_t hi) {
+        for (std::size_t n = lo; n < hi; ++n) {
             null_masks_[first + n] = 0;
         }
         for (std::size_t i = 0; i < entries.size() && i < kMaxKeyColumns; ++i) {
             if (!entries[i]->validity.has_value()) {
                 continue;
             }
-            for (std::size_t n = 0; n < rows.size(); ++n) {
-                if (runtime::is_null(*entries[i], rows[n])) {
+            const ValidityBitmap& valid = *entries[i]->validity;
+            for (std::size_t n = lo; n < hi; ++n) {
+                if (!valid[rows[n]]) {
                     null_masks_[first + n] |= std::uint64_t{1} << i;
                 }
             }
@@ -6124,8 +6134,8 @@ class HashAggregateState final {
         const std::size_t ranges = std::clamp<std::size_t>(rows.size() / kMinRangeRows, 1,
                                                            std::max<std::size_t>(1, workers * 4));
         const std::size_t grain = (rows.size() + ranges - 1) / ranges;
-        const auto fan = [&](const auto& body) {
-            const std::size_t tasks = columns * ranges;
+        const auto fan = [&](const auto& body, std::size_t task_columns = 0) {
+            const std::size_t tasks = (task_columns == 0 ? columns : task_columns) * ranges;
             if (workers < 2 || tasks < 2) {
                 for (std::size_t t = 0; t < tasks; ++t) {
                     body(t / ranges, t % ranges);
@@ -6188,9 +6198,13 @@ class HashAggregateState final {
         }
         fan([&](std::size_t c, std::size_t r) {
             const auto [lo, hi] = range_of(r);
+            if (c == columns) {
+                group_keys_.fill_null_masks_rows_range(first, group_entries, rows, lo, hi);
+                return;
+            }
             group_keys_.fill_column_rows_range(c, first, *group_entries[c]->column, rows, lo, hi,
                                                text_at[(c * (ranges + 1)) + r]);
-        });
+        }, columns + 1);
     }
 
     /// Store non-null First aggregates at the row that creates each new group.

@@ -2595,6 +2595,98 @@ TEST_CASE("chunked aggregate: multi-key Categorical null cells survive dictionar
     }
 }
 
+TEST_CASE("packed group-by keys: null masks of many new groups are filled per row range",
+          "[runtime][chunked][aggregate][parallel]") {
+    // h2o q10 on its 5%-NA data creates ~1e7 groups in one discovery, and
+    // their null masks are written in row ranges across workers. ~400k new
+    // groups here, so the fill splits into several ranges: every group's
+    // nulls must land on that group, in every range. Three nullable keys
+    // (a Categorical and two Int64), each null under a real payload.
+    constexpr std::size_t kRows = 500'000;
+    const std::vector<std::string> labels{"p", "q", "r", "s", "t", "u", "v"};
+    Column<Categorical>::codes_storage codes;
+    Column<std::int64_t> a;
+    Column<std::int64_t> b;
+    Column<std::int64_t> q;
+    runtime::ValidityBitmap c_valid;
+    runtime::ValidityBitmap a_valid;
+    runtime::ValidityBitmap b_valid;
+    using Cell = std::optional<std::int64_t>;
+    using Key = std::tuple<Cell, Cell, Cell>;
+    std::map<Key, std::pair<std::int64_t, std::int64_t>> sums;  // count, total
+    for (std::size_t i = 0; i < kRows; ++i) {
+        const std::size_t k = (i * 7919) % 400'009;
+        const auto cv = static_cast<std::int64_t>(k % 7);
+        const auto av = static_cast<std::int64_t>(k / 7);
+        const auto bv = static_cast<std::int64_t>(k % 3) - 1;
+        const bool c_ok = i % 17 != 3;
+        const bool a_ok = i % 19 != 5;
+        const bool b_ok = i % 23 != 7;
+        const auto qv = static_cast<std::int64_t>(i % 97);
+        codes.push_back(static_cast<Column<Categorical>::code_type>(cv));
+        a.push_back(av);
+        b.push_back(bv);
+        q.push_back(qv);
+        c_valid.push_back(c_ok);
+        a_valid.push_back(a_ok);
+        b_valid.push_back(b_ok);
+        const Key key{c_ok ? Cell{cv} : std::nullopt, a_ok ? Cell{av} : std::nullopt,
+                      b_ok ? Cell{bv} : std::nullopt};
+        auto& sum = sums[key];
+        ++sum.first;
+        sum.second += qv;
+    }
+    runtime::Table t;
+    t.add_column("c", Column<Categorical>(labels, std::move(codes)));
+    t.columns.back().validity = std::move(c_valid);
+    t.add_column("a", std::move(a));
+    t.columns.back().validity = std::move(a_valid);
+    t.add_column("b", std::move(b));
+    t.columns.back().validity = std::move(b_valid);
+    t.add_column("q", std::move(q));
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+    auto program = parser::parse("t[select { total = sum(q), n = count() }, by { c, a, b }];");
+    REQUIRE(program.has_value());
+    auto ir = parser::lower(program.value());
+    REQUIRE(ir.has_value());
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 8;
+    parallel.parallel_min_rows = 0;
+    const auto before = runtime::packed_nullable_key_chunks().load();
+    const auto out = runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+    INFO((out.has_value() ? std::string{} : out.error()));
+    REQUIRE(out.has_value());
+    CHECK(runtime::packed_nullable_key_chunks().load() > before);
+    REQUIRE(out->rows() == sums.size());
+    const auto* oc = out->find_entry("c");
+    const auto* oa = out->find_entry("a");
+    const auto* ob = out->find_entry("b");
+    REQUIRE(oc != nullptr);
+    REQUIRE(oa != nullptr);
+    REQUIRE(ob != nullptr);
+    const auto& cc = std::get<Column<Categorical>>(*oc->column);
+    const auto& ac = std::get<Column<std::int64_t>>(*oa->column);
+    const auto& bc = std::get<Column<std::int64_t>>(*ob->column);
+    const auto& ot = std::get<Column<std::int64_t>>(*out->find("total"));
+    const auto& on = std::get<Column<std::int64_t>>(*out->find("n"));
+    std::set<Key> seen;
+    for (std::size_t g = 0; g < out->rows(); ++g) {
+        const Cell kc = runtime::is_null(*oc, g)
+                            ? std::nullopt
+                            : Cell{static_cast<std::int64_t>(
+                                  std::ranges::find(labels, std::string(cc[g])) - labels.begin())};
+        const Cell ka = runtime::is_null(*oa, g) ? std::nullopt : Cell{ac[g]};
+        const Cell kb = runtime::is_null(*ob, g) ? std::nullopt : Cell{bc[g]};
+        const Key key{kc, ka, kb};
+        INFO("group " << g);
+        REQUIRE(sums.contains(key));
+        REQUIRE(seen.insert(key).second);
+        REQUIRE(on[g] == sums.at(key).first);
+        REQUIRE(ot[g] == sums.at(key).second);
+    }
+}
+
 TEST_CASE("chunked aggregate: a narrow-span Int64 key groups through a dense array",
           "[runtime][chunked][aggregate]") {
     // h2o q4's shape: one Int64 key over ~100 distinct values. Its span is a

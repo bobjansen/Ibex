@@ -302,6 +302,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         return state;
     };
 
+    // Set once the aggregates are known: std() is folded by the moment pass
+    // after grouping rather than per row here.
+    bool moment_after_grouping = false;
     auto update_state = [&](AggSlot* slots, std::size_t row) -> std::optional<std::string> {
         for (std::size_t i = 0; i < aggregations.size(); ++i) {
             const auto& agg = aggregations[i];
@@ -384,6 +387,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 // dominant cost of median/quantile by-group. CountDistinct fills a
                 // per-group set in its own pass after grouping for the same reason.
                 continue;
+            }
+            if (agg.func == ir::AggFunc::Stddev && moment_after_grouping) {
+                continue;  // the moment pass below, after grouping
             }
             if (agg.func == ir::AggFunc::Stddev) {
                 double x{};
@@ -1134,6 +1140,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         std::vector<std::size_t> collect_aggs;
         std::vector<std::size_t> count_distinct_aggs;
         std::vector<std::size_t> paired_aggs;
+        std::vector<std::size_t> moment_aggs;
         for (std::size_t i = 0; i < plan.size(); ++i) {
             if (plan[i].func == ir::AggFunc::Median || plan[i].func == ir::AggFunc::Quantile ||
                 plan[i].func == ir::AggFunc::Skew || plan[i].func == ir::AggFunc::Kurtosis) {
@@ -1142,7 +1149,21 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 count_distinct_aggs.push_back(i);
             } else if (ir::agg_is_paired(plan[i].func)) {
                 paired_aggs.push_back(i);
+            } else if (plan[i].func == ir::AggFunc::Stddev &&
+                       (std::holds_alternative<Column<double>>(*agg_columns[i]) ||
+                        std::holds_alternative<Column<std::int64_t>>(*agg_columns[i]))) {
+                moment_aggs.push_back(i);
             }
+        }
+        // std() alongside a collected aggregate (h2o q6: median and sd by two
+        // ids) used to fold per row in the serial state loop -- the only
+        // serial pass left there. With row_gid already needed, it folds per
+        // row range after grouping instead, like cov/corr.
+        moment_after_grouping = !moment_aggs.empty() &&
+                                (!collect_aggs.empty() || !count_distinct_aggs.empty() ||
+                                 !paired_aggs.empty());
+        if (!moment_after_grouping) {
+            moment_aggs.clear();
         }
         // Every path below writes each row's group id before anything reads it.
         ::ibex::detail::NoInitVector<std::uint32_t> row_gid;
@@ -1210,7 +1231,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         // cov/corr are folded after grouping too, so they count here.
         const bool collect_only =
             !collect_aggs.empty() || !paired_aggs.empty()
-                ? collect_aggs.size() + paired_aggs.size() == aggregations.size()
+                ? collect_aggs.size() + paired_aggs.size() + moment_aggs.size() ==
+                      aggregations.size()
                 : false;
         std::vector<std::int64_t> cell_lo(key_cols.size(), 0);
         std::vector<std::uint64_t> cell_stride(key_cols.size(), 0);
@@ -1538,6 +1560,49 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     slot.has_value = result.has_value();
                     slot.double_value = result.value_or(0.0);
                 }
+            }
+        }
+
+        // std(): each row range folds its rows into per-group moments, merged
+        // per group in range order, into the slot's count, mean and M2.
+        for (const std::size_t ai : moment_aggs) {
+            const std::size_t n_groups = states.size();
+            const ColumnValue& col = *agg_columns[ai];
+            const ValidityBitmap* vb = agg_validity[ai];
+            const auto fold = [&](std::span<Moment> acc, std::size_t begin, std::size_t end) {
+                const auto run = [&](const auto* data) {
+                    for (std::size_t row = begin; row < end; ++row) {
+                        if (vb == nullptr || (*vb)[row]) {
+                            moment_add(acc[row_gid[row]], static_cast<double>(data[row]));
+                        }
+                    }
+                };
+                if (const auto* d = std::get_if<Column<double>>(&col)) {
+                    run(d->data());
+                } else {
+                    run(std::get<Column<std::int64_t>>(col).data());
+                }
+            };
+            std::vector<Moment> acc(n_groups);
+            constexpr std::size_t kMaxPartialGroups = std::size_t{1} << 20;
+            if (range_workers >= 2 && rows > 0 && n_groups * range_workers <= kMaxPartialGroups) {
+                std::vector<Moment> partial(range_workers * n_groups);
+                for_row_range(range_workers, [&](std::size_t r, std::size_t b, std::size_t e) {
+                    fold(std::span<Moment>(partial).subspan(r * n_groups, n_groups), b, e);
+                });
+                for (std::size_t r = 0; r < range_workers; ++r) {
+                    for (std::size_t g = 0; g < n_groups; ++g) {
+                        moment_merge(acc[g], partial[(r * n_groups) + g]);
+                    }
+                }
+            } else {
+                fold(acc, 0, rows);
+            }
+            for (std::size_t g = 0; g < n_groups; ++g) {
+                AggSlot& slot = states[g].slots[ai];
+                slot.count = static_cast<std::int64_t>(acc[g].n);
+                slot.double_value = acc[g].mean;
+                slot.m2 = acc[g].m2;
             }
         }
 

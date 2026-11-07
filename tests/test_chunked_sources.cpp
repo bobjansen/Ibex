@@ -2742,6 +2742,102 @@ TEST_CASE("median by integer and Categorical keys: parallel cell grouping matche
     }
 }
 
+TEST_CASE("std beside median: the per-range moment pass skips nulls and merges ranges",
+          "[runtime][aggregate][median]") {
+    // std() next to a collected aggregate folds per row range after grouping
+    // and merges the ranges' moments per group. An Int64 value column with
+    // nulls: null rows hold a large payload a fold must not read; group 7 has
+    // one valid value (std null), group 8 none (median and std null). Checked
+    // serially and on eight workers, through the cell and the index paths.
+    constexpr std::size_t kRows = 300'000;
+    Column<std::int64_t> g;
+    Column<std::int64_t> wide;
+    Column<std::int64_t> v;
+    runtime::ValidityBitmap valid;
+    std::map<std::int64_t, std::vector<double>> want;
+    std::vector<std::int64_t> order;
+    bool seen_one = false;
+    for (std::size_t row = 0; row < kRows; ++row) {
+        auto key = static_cast<std::int64_t>((row * 7919) % 7);
+        if (row == 1'000) {
+            key = 7;
+        } else if (row % 50'000 == 17) {
+            key = 8;
+        }
+        const auto value = static_cast<std::int64_t>((row * 2'654'435'761ULL) % 100'003) - 50'000;
+        bool ok = row % 11 != 4;
+        if (key == 7) {
+            ok = !seen_one;
+            seen_one = true;
+        } else if (key == 8) {
+            ok = false;
+        }
+        g.push_back(key);
+        wide.push_back(key * 1'000'000'007);
+        v.push_back(ok ? value : 1'000'000'000'000);
+        valid.push_back(ok);
+        if (!want.contains(key)) {
+            order.push_back(key);
+        }
+        auto& values = want[key];
+        if (ok) {
+            values.push_back(static_cast<double>(value));
+        }
+    }
+    runtime::Table t;
+    t.add_column("g", g);
+    t.add_column("w", wide);
+    t.add_column("v", v);
+    t.columns.back().validity = std::move(valid);
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    for (const char* key : {"g", "w"}) {
+        INFO("by " << key);
+        auto program = parser::parse(std::string("t[select { m = median(v), s = std(v) }, by ") +
+                                     key + "];");
+        REQUIRE(program.has_value());
+        auto ir = parser::lower(program.value());
+        REQUIRE(ir.has_value());
+        for (const std::size_t threads : {std::size_t{1}, std::size_t{8}}) {
+            INFO("threads " << threads);
+            runtime::ExecutionContext exec;
+            exec.parallel_threads = threads;
+            exec.parallel_min_rows = 0;
+            const auto out = runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, exec);
+            REQUIRE(out.has_value());
+            REQUIRE(out->rows() == order.size());
+            const auto* se = out->find_entry("s");
+            const auto* me = out->find_entry("m");
+            REQUIRE(se != nullptr);
+            REQUIRE(me != nullptr);
+            const auto& sd_col = std::get<Column<double>>(*se->column);
+            for (std::size_t r = 0; r < order.size(); ++r) {
+                const std::int64_t k = order[r];
+                INFO("group " << k);
+                const auto& values = want.at(k);
+                const std::size_t n = values.size();
+                REQUIRE(runtime::is_null(*me, r) == (n == 0));
+                REQUIRE(runtime::is_null(*se, r) == (n < 2));
+                if (n < 2) {
+                    continue;
+                }
+                double mean = 0.0;
+                for (const double x : values) {
+                    mean += x;
+                }
+                mean /= static_cast<double>(n);
+                double m2 = 0.0;
+                for (const double x : values) {
+                    m2 += (x - mean) * (x - mean);
+                }
+                const double sd = std::sqrt(m2 / static_cast<double>(n - 1));
+                REQUIRE(std::abs(sd_col[r] - sd) <= 1e-9 * sd);
+            }
+        }
+    }
+}
+
 TEST_CASE("grouped top-k: partitioned flat heaps take each group's stable-sort rows",
           "[runtime][chunked][topk]") {
     // h2o q8: `order { v desc }, head 2, by g` over many groups. The groups

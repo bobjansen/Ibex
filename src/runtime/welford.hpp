@@ -24,6 +24,38 @@ inline void welford_add(double x, std::size_t count, double& mean, double& m2) n
     m2 = std::fma(delta, x - mean, m2);
 }
 
+/// A running count, mean and M2 -- what `welford_add` folds and std() finishes
+/// from -- for passes that fold row ranges separately and then combine them.
+struct Moment {
+    double n = 0.0;
+    double mean = 0.0;
+    double m2 = 0.0;
+};
+
+inline void moment_add(Moment& m, double x) noexcept {
+    m.n += 1.0;
+    const double delta = x - m.mean;
+    m.mean += delta / m.n;
+    m.m2 = std::fma(delta, x - m.mean, m.m2);
+}
+
+/// Fold `b` into `a` (Chan et al.'s pairwise combination), as
+/// `co_moment_merge` does for a pair.
+inline void moment_merge(Moment& a, const Moment& b) noexcept {
+    if (b.n == 0.0) {
+        return;
+    }
+    if (a.n == 0.0) {
+        a = b;
+        return;
+    }
+    const double n = a.n + b.n;
+    const double d = b.mean - a.mean;
+    a.m2 = std::fma(d * d, a.n * b.n / n, a.m2 + b.m2);
+    a.mean = std::fma(d, b.n / n, a.mean);
+    a.n = n;
+}
+
 /// The running co-moment of a pair (x, y): its count, both means, and the
 /// centred sums Σ(x - mean_x)(y - mean_y), Σ(x - mean_x)², Σ(y - mean_y)² --
 /// what cov() and corr() finish from. The same Welford-style update as

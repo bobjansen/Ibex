@@ -603,11 +603,11 @@ pins Polars 2.0.0 and its private plan visitor. See
 The [PDS-H comparison](python/pdsh-performance.md) runs all 22 unchanged
 upstream queries on SF10 through the engine; every result matches Polars,
 including row order and dtypes. Against Polars 2.0 streaming, re-run in the
-same sitting (2026-11-06, `dbc7d426`, i7-13700 at a fixed 3.2 GHz), the
-geometric mean of per-query time ratios is **1.05× at eight threads** and
-**0.98× at one thread** (above 1 means Ibex is slower). Ibex is faster on
-6/22 queries at eight threads and 9/22 at one; the largest remaining
-eight-thread gaps are Q20 (1.25×), Q21 (1.24×) and Q07 (1.22×).
+same sitting (2026-11-07, `be821bbe`, i7-13700 at a fixed 3.2 GHz), the
+geometric mean of per-query time ratios is **0.94× at eight threads** and
+**0.88× at one thread** (below 1 means Ibex is faster). Ibex is faster on
+12/22 queries at eight threads and 18/22 at one; the largest remaining
+eight-thread gaps are Q09 (1.10×), Q05 (1.09×), and Q04 and Q14 (1.08×).
 
 ## Independent lazy Python API (experimental)
 

@@ -1505,7 +1505,8 @@ class HashAggregateState final {
     /// first chunk (`prepare_worker_shadow`).
     [[nodiscard]] auto on_worker_partial_path() const -> bool {
         return initialized_ && columns_.has_value() && cat_fast_path_ && group_by_->size() >= 2 &&
-               multi_dense_ && !has_count_distinct_ && aggs_are_slot_combinable();
+               multi_dense_ && !multi_cat_any_nullable_ && !has_count_distinct_ &&
+               aggs_are_slot_combinable();
     }
 
     /// Prepare this operator as a scan worker's SHADOW: fixed from the first
@@ -1883,10 +1884,25 @@ class HashAggregateState final {
             bool all_cat = true;
             for (const auto* e : group_entries) {
                 group_templates_.push_back(make_empty_like(*e->column));
-                // One nullable Categorical key keeps the code path: its nulls
-                // are one extra dense cell (`process_rows_cat_nullable`).
-                if (!std::holds_alternative<Column<Categorical>>(*e->column) ||
-                    (e->validity.has_value() && group_entries.size() != 1)) {
+                // Nullable Categorical keys keep the code path: a null is one
+                // extra dense cell per column (`process_rows_cat_nullable`,
+                // `process_rows_cat_multi_nullable`).
+                if (!std::holds_alternative<Column<Categorical>>(*e->column)) {
+                    all_cat = false;
+                }
+            }
+            if (all_cat && group_entries.size() >= 2) {
+                // Nullable keys only while their cells index densely: past
+                // that, three or more go to the packed path, which keeps a null
+                // cell too and partitions discovery, rather than the generic.
+                std::vector<const Column<Categorical>*> key_cols;
+                std::vector<std::uint8_t> nullable;
+                for (const auto* e : group_entries) {
+                    key_cols.push_back(&std::get<Column<Categorical>>(*e->column));
+                    nullable.push_back(e->validity.has_value() ? 1U : 0U);
+                }
+                if (std::ranges::any_of(nullable, [](std::uint8_t n) { return n != 0U; }) &&
+                    !cat_cell_plan(key_cols, nullable).dense_possible) {
                     all_cat = false;
                 }
             }
@@ -2054,8 +2070,8 @@ class HashAggregateState final {
         // A data-sized packed key keeps a null cell per nullable column, so
         // only `build_packed_key` below can say whether this chunk's nulls fit.
         const bool packed_takes_nulls = packed_fast_path_ && encoder_.size_cells_from_data;
-        // So does a single Categorical key, as one more dense cell.
-        const bool cat_takes_nulls = cat_fast_path_ && group_entries.size() == 1;
+        // So do Categorical keys, as one more dense cell per column.
+        const bool cat_takes_nulls = cat_fast_path_;
         if (((cat_fast_path_ && !cat_takes_nulls) || str_fast_path_ || pair_int_fast_path_ ||
              (packed_fast_path_ && !packed_takes_nulls)) &&
             std::ranges::any_of(group_entries, [](const ColumnEntry* entry) {
@@ -5080,8 +5096,13 @@ class HashAggregateState final {
                 Key key;
                 key.values.reserve(n_keys);
                 for (std::size_t c = 0; c < n_keys; ++c) {
-                    key.values.emplace_back(
-                        std::string(decode(c, multi_cat_codes_flat_[(i * n_keys) + c])));
+                    const auto code = multi_cat_codes_flat_[(i * n_keys) + c];
+                    if (code < 0) {
+                        key.set_null(c);
+                        key.values.emplace_back(std::string{});
+                    } else {
+                        key.values.emplace_back(std::string(decode(c, code)));
+                    }
                 }
                 return key;
             });
@@ -5226,22 +5247,30 @@ class HashAggregateState final {
     ///
     /// Computed once per chunk and shared by the fused parallel path and the
     /// serial loops, so the two cannot disagree about what a cell is.
+    ///
+    /// A `nullable` column has one more cell than codes, the last, for its
+    /// null rows; a group's stored code for it is -1. Empty means none is.
     struct CatCellPlan {
         std::vector<std::uint64_t> dict_sizes;
         std::vector<std::uint64_t> strides;
+        std::vector<std::uint8_t> nullable;
         std::uint64_t total_cells = 1;
         bool dense_possible = false;
     };
 
-    [[nodiscard]] static auto cat_cell_plan(const std::vector<const Column<Categorical>*>& cols)
+    [[nodiscard]] static auto cat_cell_plan(const std::vector<const Column<Categorical>*>& cols,
+                                            const std::vector<std::uint8_t>& nullable = {})
         -> CatCellPlan {
         CatCellPlan plan;
         const std::size_t n_keys = cols.size();
         plan.dict_sizes.resize(n_keys);
         plan.strides.resize(n_keys);
+        plan.nullable = nullable;
         for (std::size_t c = 0; c < n_keys; ++c) {
             plan.dict_sizes[c] = static_cast<std::uint64_t>(cols[c]->dictionary_size());
-            if (plan.dict_sizes[c] == 0) {
+            if (!nullable.empty() && nullable[c] != 0U) {
+                plan.dict_sizes[c] += 1;  // the null cell, last
+            } else if (plan.dict_sizes[c] == 0) {
                 plan.dict_sizes[c] = 1;  // avoid stride collapse
             }
         }
@@ -5267,8 +5296,10 @@ class HashAggregateState final {
         const std::size_t n_keys = plan.strides.size();
         std::uint64_t cell = 0;
         for (std::size_t c = 0; c < n_keys; ++c) {
-            cell += static_cast<std::uint64_t>(multi_cat_codes_flat_[(g * n_keys) + c]) *
-                    plan.strides[c];
+            const auto code = multi_cat_codes_flat_[(g * n_keys) + c];
+            const std::uint64_t index =
+                code < 0 ? plan.dict_sizes[c] - 1 : static_cast<std::uint64_t>(code);
+            cell += index * plan.strides[c];
         }
         return cell;
     }
@@ -5328,7 +5359,11 @@ class HashAggregateState final {
         for (std::size_t c = 0; c < plan.strides.size(); ++c) {
             const std::uint64_t code =
                 (static_cast<std::uint64_t>(cell) / plan.strides[c]) % plan.dict_sizes[c];
-            multi_cat_codes_flat_.push_back(static_cast<Column<Categorical>::code_type>(code));
+            const bool null =
+                !plan.nullable.empty() && plan.nullable[c] != 0U && code == plan.dict_sizes[c] - 1;
+            multi_cat_codes_flat_.push_back(
+                null ? Column<Categorical>::code_type{-1}
+                     : static_cast<Column<Categorical>::code_type>(code));
         }
         return alloc_group();
     }
@@ -5615,6 +5650,12 @@ class HashAggregateState final {
         const std::size_t n_keys = cat_cols.size();
         const bool single_key = n_keys == 1;
 
+        if (!single_key && (multi_cat_any_nullable_ ||
+                            std::ranges::any_of(group_entries, [](const ColumnEntry* e) {
+                                return e->validity.has_value();
+                            }))) {
+            return process_rows_cat_multi_nullable(group_entries, agg_entries, rows);
+        }
         if (single_key && group_entries[0]->validity.has_value()) {
             process_rows_cat_nullable(*cat_cols[0], *group_entries[0]->validity, agg_entries,
                                       rows);
@@ -7334,6 +7375,79 @@ class HashAggregateState final {
         }
     }
 
+    /// Two or more Categorical keys, once any of them has carried a bitmap:
+    /// each nullable column gets one more cell than codes, the last, for its
+    /// nulls (`CatCellPlan::nullable`), and a group stores -1 for a null
+    /// key. Every later chunk of this operator comes here, bitmap or not, so
+    /// the cell layout never changes under the code-only paths. A cell space
+    /// too big to index densely goes to the generic path.
+    auto process_rows_cat_multi_nullable(const std::vector<const ColumnEntry*>& group_entries,
+                                         const std::vector<const ColumnEntry*>& agg_entries,
+                                         std::size_t rows) -> std::optional<std::string> {
+        nullable_cat_key_chunks().fetch_add(1, std::memory_order_relaxed);
+        translate_deferred_keys();
+        const std::size_t n_keys = group_entries.size();
+        multi_cat_nullable_.resize(n_keys, 0U);
+        std::vector<const Column<Categorical>*> cat_cols(n_keys);
+        std::vector<const ValidityBitmap*> valid(n_keys, nullptr);
+        for (std::size_t c = 0; c < n_keys; ++c) {
+            cat_cols[c] = &std::get<Column<Categorical>>(*group_entries[c]->column);
+            if (group_entries[c]->validity.has_value()) {
+                valid[c] = &*group_entries[c]->validity;
+                multi_cat_nullable_[c] = 1U;
+                multi_cat_any_nullable_ = true;
+            }
+        }
+        const CatCellPlan plan = cat_cell_plan(cat_cols, multi_cat_nullable_);
+        if (!multi_dense_ || !plan.dense_possible) {
+            migrate_cat_fast_path_to_generic(n_keys);
+            return process_rows_generic(group_entries, agg_entries, rows);
+        }
+        ensure_multi_cat_dense(plan);
+        std::vector<const Column<Categorical>::code_type*> raws(n_keys);
+        for (std::size_t c = 0; c < n_keys; ++c) {
+            raws[c] = cat_cols[c]->codes_data();
+        }
+        multi_cat_cells_.resize(rows);
+        auto* cells = multi_cat_cells_.data();
+        const auto fill = [&](std::size_t begin, std::size_t end) {
+            for (std::size_t row = begin; row < end; ++row) {
+                std::uint64_t cell = 0;
+                for (std::size_t c = 0; c < n_keys; ++c) {
+                    const std::uint64_t index =
+                        valid[c] != nullptr && !(*valid[c])[row]
+                            ? plan.dict_sizes[c] - 1
+                            : static_cast<std::uint64_t>(raws[c][row]);
+                    cell += index * plan.strides[c];
+                }
+                cells[row] = static_cast<std::uint32_t>(cell);
+            }
+        };
+        const auto n_cells = static_cast<std::size_t>(plan.total_cells);
+        const std::size_t morsels =
+            aggs_are_slot_combinable() ? dense_morsel_count(n_cells, rows) : 0;
+        if (morsels != 0) {
+            run_dense_fused(cells, n_cells, agg_entries, rows, multi_cat_cell_dense_, morsels, fill,
+                            [&](std::size_t cell) { return new_multi_cat_group(plan, cell); });
+            publish_fused_accumulation();
+            return std::nullopt;
+        }
+        fill(0, rows);
+        gids_buf_.resize(rows);
+        auto* gids = gids_buf_.data();
+        std::uint32_t* dense = multi_cat_cell_dense_.data();
+        for (std::size_t row = 0; row < rows; ++row) {
+            std::uint32_t gid = dense[cells[row]];
+            if (gid == kNoGid) {
+                gid = new_multi_cat_group(plan, cells[row]);
+                dense[cells[row]] = gid;
+            }
+            gids[row] = gid;
+        }
+        publish_discovered(agg_entries, rows);
+        return std::nullopt;
+    }
+
     /// One Categorical key with a validity bitmap: a null row is cell
     /// `n_codes`, one past every code, so it groups through the same dense
     /// array as the codes and never reads the code stored under it. The
@@ -8121,6 +8235,23 @@ class HashAggregateState final {
             key_validity[0].assign(n_groups_, true);
             key_validity[0].set(cat_null_gid_, false);
         }
+        if (cat_fast_path_ && multi_cat_any_nullable_) {
+            const std::size_t n_keys = group_by_->size();
+            for (std::size_t c = 0; c < n_keys && c < kMaxKeyColumns; ++c) {
+                if (multi_cat_nullable_[c] == 0U) {
+                    continue;
+                }
+                for (std::size_t g = 0; g < n_groups_; ++g) {
+                    if (multi_cat_codes_flat_[(g * n_keys) + c] < 0) {
+                        if ((any_null_keys & (std::uint64_t{1} << c)) == 0) {
+                            any_null_keys |= std::uint64_t{1} << c;
+                            key_validity[c].assign(n_groups_, true);
+                        }
+                        key_validity[c].set(g, false);
+                    }
+                }
+            }
+        }
 
         // One definition of "store this raw integer key at group g". The
         // destination was pre-sized above, so this is an indexed write; the
@@ -8167,6 +8298,11 @@ class HashAggregateState final {
                 if (n_keys == 1) {
                     for (std::size_t g = lo; g < hi; ++g) {
                         codes[g] = cat_order_[g];
+                    }
+                } else if (multi_cat_any_nullable_) {
+                    for (std::size_t g = lo; g < hi; ++g) {
+                        const auto code = multi_cat_codes_flat_[(g * n_keys) + ci];
+                        codes[g] = code < 0 ? 0 : code;  // null: placeholder, bit clear
                     }
                 } else {
                     for (std::size_t g = lo; g < hi; ++g) {
@@ -8642,6 +8778,10 @@ class HashAggregateState final {
     /// its `cat_order_` entry is a placeholder code.
     std::uint32_t cat_null_gid_ = kNoGid;
     std::vector<std::uint32_t> cat_null_cells_;
+    /// Per multi-key column: has any chunk carried a bitmap for it? Sticky,
+    /// so its null cell -- and every group's -1 code -- keeps a place.
+    std::vector<std::uint8_t> multi_cat_nullable_;
+    bool multi_cat_any_nullable_ = false;
 
     // Single-Categorical fast path: code → gid via direct array (codes are a
     // dense [0, dict_size) index, so no hashing is needed).

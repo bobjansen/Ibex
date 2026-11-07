@@ -2234,6 +2234,285 @@ TEST_CASE("chunked aggregate: a Categorical key's null group survives bitmap-fre
     }
 }
 
+TEST_CASE("chunked aggregate: nullable multi-key Categoricals keep the dense cell path",
+          "[runtime][chunked][aggregate][parallel]") {
+    // h2o q2 on the 5%-NA data: `by { id1, id2 }`, both nullable. Each
+    // nullable column gets one more cell for its nulls. Null rows hold real
+    // codes underneath. Run with both keys nullable and with only the second;
+    // `sum`/`count` take the fused morsels, `first(s)` the serial cell loop.
+    constexpr std::size_t kRows = (std::size_t{1} << 20) + 4'096;
+    constexpr std::size_t kValidHead = 50'000;
+    constexpr std::size_t kValidTail = 60'000;
+    std::vector<std::string> c_labels;
+    for (int l = 0; l < 50; ++l) {
+        c_labels.push_back("c" + std::to_string(l));
+    }
+    const std::vector<std::string> d_labels{"d0", "d1", "d2", "d3", "d4", "d5", "d6"};
+    using Cell = std::optional<std::int64_t>;
+    using Key = std::pair<Cell, Cell>;
+    struct Expect {
+        std::int64_t count = 0;
+        std::int64_t total = 0;
+        std::string first;
+    };
+    for (const bool c_nullable : {true, false}) {
+        INFO("c nullable: " << c_nullable);
+        Column<Categorical>::codes_storage c_codes;
+        Column<Categorical>::codes_storage d_codes;
+        Column<std::string> s;
+        Column<std::int64_t> q;
+        runtime::ValidityBitmap c_valid;
+        runtime::ValidityBitmap d_valid;
+        std::vector<Key> order;
+        std::map<Key, Expect> groups;
+        for (std::size_t i = 0; i < kRows; ++i) {
+            const auto cv = static_cast<std::int64_t>((i * 7919) % 47);
+            const auto dv = static_cast<std::int64_t>((i * 104'729) % 7);
+            const bool edge = i < kValidHead || i >= kRows - kValidTail;
+            const bool c_ok = !c_nullable || edge || i % 20 != 13;
+            const bool d_ok = edge || i % 31 != 5;
+            const auto qv = static_cast<std::int64_t>(i % 97);
+            const std::string sv = "s" + std::to_string(i % 1'009);
+            c_codes.push_back(static_cast<Column<Categorical>::code_type>(cv));
+            d_codes.push_back(static_cast<Column<Categorical>::code_type>(dv));
+            s.push_back(sv);
+            q.push_back(qv);
+            c_valid.push_back(c_ok);
+            d_valid.push_back(d_ok);
+            const Key key{c_ok ? Cell{cv} : std::nullopt, d_ok ? Cell{dv} : std::nullopt};
+            auto [it, inserted] = groups.emplace(key, Expect{});
+            if (inserted) {
+                order.push_back(key);
+                it->second.first = sv;
+            }
+            ++it->second.count;
+            it->second.total += qv;
+        }
+        runtime::Table t;
+        t.add_column("c", Column<Categorical>(c_labels, std::move(c_codes)));
+        if (c_nullable) {
+            t.columns.back().validity = std::move(c_valid);
+        }
+        t.add_column("d", Column<Categorical>(d_labels, std::move(d_codes)));
+        t.columns.back().validity = std::move(d_valid);
+        t.add_column("s", std::move(s));
+        t.add_column("q", std::move(q));
+        runtime::TableRegistry registry;
+        registry.emplace("t", std::move(t));
+
+        const auto key_of = [](const runtime::ColumnEntry& entry,
+                               const std::vector<std::string>& labels, std::size_t g) -> Cell {
+            if (runtime::is_null(entry, g)) {
+                return std::nullopt;
+            }
+            const auto& col = std::get<Column<Categorical>>(*entry.column);
+            return static_cast<std::int64_t>(std::ranges::find(labels, std::string(col[g])) -
+                                             labels.begin());
+        };
+        for (const bool with_first : {false, true}) {
+            INFO("with first(s): " << with_first);
+            auto program = parser::parse(
+                with_first
+                    ? "t[select { total = sum(q), n = count(), f = first(s) }, by { c, d }];"
+                    : "t[select { total = sum(q), n = count() }, by { c, d }];");
+            REQUIRE(program.has_value());
+            auto ir = parser::lower(program.value());
+            REQUIRE(ir.has_value());
+            const auto check = [&](const runtime::Table& out) {
+                REQUIRE(out.rows() == order.size());
+                const auto* oc = out.find_entry("c");
+                const auto* od = out.find_entry("d");
+                REQUIRE(oc != nullptr);
+                REQUIRE(od != nullptr);
+                const auto& ot = std::get<Column<std::int64_t>>(*out.find("total"));
+                const auto& on = std::get<Column<std::int64_t>>(*out.find("n"));
+                for (std::size_t g = 0; g < out.rows(); ++g) {
+                    INFO("group " << g);
+                    const Key key{key_of(*oc, c_labels, g), key_of(*od, d_labels, g)};
+                    REQUIRE(groups.contains(key));
+                    CHECK(key == order[g]);  // first-occurrence order
+                    const Expect& want = groups.at(key);
+                    REQUIRE(on[g] == want.count);
+                    REQUIRE(ot[g] == want.total);
+                    if (with_first) {
+                        const auto& of = std::get<Column<std::string>>(*out.find("f"));
+                        REQUIRE(std::string(of[g]) == want.first);
+                    }
+                }
+            };
+            for (const bool chunked : {false, true}) {
+                INFO("chunked: " << chunked);
+                std::optional<ChunkGrainGuard> guard;
+                if (chunked) {
+                    guard.emplace("20000");
+                }
+                runtime::ExecutionContext serial;
+                serial.parallel_threads = 1;
+                runtime::ExecutionContext parallel;
+                parallel.parallel_threads = 8;
+                parallel.parallel_min_rows = 0;
+                const auto before = runtime::nullable_cat_key_chunks().load();
+                const auto sr =
+                    runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, serial);
+                const auto pr =
+                    runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+                INFO((sr.has_value() ? std::string{} : sr.error()));
+                REQUIRE(sr.has_value());
+                INFO((pr.has_value() ? std::string{} : pr.error()));
+                REQUIRE(pr.has_value());
+                // Guards the test: the nullable keys really stayed on the cells.
+                CHECK(runtime::nullable_cat_key_chunks().load() > before);
+                check(*sr);
+                check(*pr);
+            }
+        }
+    }
+}
+
+TEST_CASE("chunked aggregate: multi-key Categorical null cells survive dictionary growth",
+          "[runtime][chunked][aggregate][validity]") {
+    // Two Categorical keys over growing shared dictionaries, bitmaps coming
+    // and going: the first key's growth adds cells without moving a stride,
+    // the second's moves them, and both move the null cells. The last chunk
+    // grows the first dictionary past the dense cell limit, so the groups --
+    // null keys included -- migrate to the generic path mid-stream.
+    using Cat = Column<Categorical>;
+    struct Dict {
+        std::shared_ptr<std::vector<std::string>> labels;
+        std::shared_ptr<Cat::index_map> index = std::make_shared<Cat::index_map>();
+        explicit Dict(std::vector<std::string> start)
+            : labels(std::make_shared<std::vector<std::string>>(std::move(start))) {
+            for (std::size_t c = 0; c < labels->size(); ++c) {
+                (*index)[(*labels)[c]] = static_cast<std::int32_t>(c);
+            }
+        }
+        void add(const std::string& label) {
+            (*index)[label] = static_cast<std::int32_t>(labels->size());
+            labels->push_back(label);
+        }
+    };
+    struct GrowingSource final : runtime::Operator {
+        Dict c{{"a", "b"}};
+        Dict d{{"x", "y"}};
+        std::size_t pos = 0;
+        std::int64_t next_q = 1;
+
+        auto column(const Dict& dict, const std::vector<std::int32_t>& codes,
+                    const std::vector<bool>& valid, const char* name) -> runtime::ColumnEntry {
+            runtime::ColumnEntry entry;
+            entry.name = name;
+            entry.column = std::make_shared<runtime::ColumnValue>(
+                Cat(dict.labels, dict.index, Cat::codes_storage(codes.begin(), codes.end())));
+            if (!valid.empty()) {
+                runtime::ValidityBitmap bits;
+                for (const bool v : valid) {
+                    bits.push_back(v);
+                }
+                entry.validity = std::move(bits);
+            }
+            return entry;
+        }
+        // An empty validity vector means no bitmap. q is 1, 2, 4, ... in row
+        // order across the stream, so every row's contribution is distinct.
+        auto make(const std::vector<std::int32_t>& c_codes, const std::vector<bool>& c_valid,
+                  const std::vector<std::int32_t>& d_codes, const std::vector<bool>& d_valid)
+            -> runtime::Chunk {
+            runtime::Chunk out;
+            out.columns.push_back(column(c, c_codes, c_valid, "c"));
+            out.columns.push_back(column(d, d_codes, d_valid, "d"));
+            Column<std::int64_t> q;
+            for (std::size_t r = 0; r < c_codes.size(); ++r) {
+                q.push_back(next_q);
+                next_q *= 2;
+            }
+            runtime::ColumnEntry value;
+            value.name = "q";
+            value.column = std::make_shared<runtime::ColumnValue>(std::move(q));
+            out.columns.push_back(std::move(value));
+            return out;
+        }
+
+        auto next() -> std::expected<std::optional<runtime::Chunk>, std::string> override {
+            switch (pos++) {
+                case 0:  // (a,x) (b,y) (a,x)
+                    return make({0, 1, 0}, {}, {0, 1, 0}, {});
+                case 1:  // (a,-) (b,y) (b,-); d's nulls hold x underneath
+                    return make({0, 1, 1}, {}, {0, 1, 0}, {false, true, false});
+                case 2:  // c grows to {a,b,c}, no bitmaps: (c,x) (c,y)
+                    c.add("c");
+                    return make({2, 2}, {}, {0, 1}, {});
+                case 3:  // d grows to {x,y,z}; c's nulls hold a, d's hold y:
+                         // (-,z) (c,z) (-,x) (a,-) (a,x) -- the last two find the
+                         // groups chunk one made, through two rebuilt arrays
+                    d.add("z");
+                    return make({0, 2, 0, 0, 0}, {false, true, false, true, true}, {2, 2, 0, 1, 0},
+                                {true, true, true, false, true});
+                case 4:  // c grows past the dense limit: (a,-) (b,y) (new,x)
+                    for (int l = 0; l < 1'100'000; ++l) {
+                        c.add("g" + std::to_string(l));
+                    }
+                    return make({0, 1, static_cast<std::int32_t>(c.labels->size() - 1)}, {},
+                                {1, 1, 0}, {false, true, true});
+                default:
+                    return std::optional<runtime::Chunk>{};
+            }
+        }
+    };
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("cat_pair_keys", [&](const runtime::ExternArgs&) {
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<GrowingSource>()};
+    });
+    const auto before = runtime::nullable_cat_key_chunks().load();
+    const auto result = run_extern(
+        "extern fn cat_pair_keys() -> DataFrame from \"x.hpp\"; "
+        "cat_pair_keys()[select { total = sum(q), n = count() }, by { c, d }];",
+        externs);
+    // Chunks one to four; the fourth migrates.
+    CHECK(runtime::nullable_cat_key_chunks().load() - before == 4);
+    using Name = std::optional<std::string>;
+    struct Want {
+        Name c;
+        Name d;
+        std::int64_t total;
+        std::int64_t n;
+    };
+    // Row q values: chunk 0 = 1, 2, 4; 1 = 8, 16, 32; 2 = 64, 128;
+    // 3 = 256, 512, 1024, 2048, 4096; 4 = 8192, 16384, 32768.
+    const std::vector<Want> want{
+        {"a", "x", 1 + 4 + 4096, 3},
+        {"b", "y", 2 + 16 + 16384, 3},
+        {"a", std::nullopt, 8 + 2048 + 8192, 3},
+        {"b", std::nullopt, 32, 1},
+        {"c", "x", 64, 1},
+        {"c", "y", 128, 1},
+        {std::nullopt, "z", 256, 1},
+        {"c", "z", 512, 1},
+        {std::nullopt, "x", 1024, 1},
+        {"g1099999", "x", 32768, 1},
+    };
+    REQUIRE(result.rows() == want.size());
+    const auto* oc = result.find_entry("c");
+    const auto* od = result.find_entry("d");
+    REQUIRE(oc != nullptr);
+    REQUIRE(od != nullptr);
+    const auto name = [](const runtime::ColumnEntry& entry, std::size_t g) -> Name {
+        if (runtime::is_null(entry, g)) {
+            return std::nullopt;
+        }
+        return std::string(std::get<Cat>(*entry.column)[g]);
+    };
+    const auto& total = std::get<Column<std::int64_t>>(*result.find("total"));
+    const auto& n = std::get<Column<std::int64_t>>(*result.find("n"));
+    for (std::size_t g = 0; g < want.size(); ++g) {
+        INFO("group " << g);
+        CHECK(name(*oc, g) == want[g].c);
+        CHECK(name(*od, g) == want[g].d);
+        CHECK(total[g] == want[g].total);
+        CHECK(n[g] == want[g].n);
+    }
+}
+
 TEST_CASE("chunked aggregate: a narrow-span Int64 key groups through a dense array",
           "[runtime][chunked][aggregate]") {
     // h2o q4's shape: one Int64 key over ~100 distinct values. Its span is a

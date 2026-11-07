@@ -9,15 +9,44 @@ set -euo pipefail
 usage() {
     cat <<'EOF'
 usage: scripts/clang-format.sh [clang-format args] <files...>
+       scripts/clang-format.sh -r [clang-format args] [paths...]
+
+  -r, --recursive   format every C/C++ source (.c .cc .cpp .cxx .h .hh .hpp
+                    .hxx .ipp .inl) under each path, or under the repository
+                    root when no path is given. Inside a git work tree only
+                    files git would track are taken (tracked, or untracked and
+                    not ignored), so build trees and fetched dependencies are
+                    skipped. `-ir` / `-ri` are `-i -r`. In this mode every
+                    argument that does not start with `-` is a path, so pass
+                    clang-format options in their `--opt=value` form.
 
 Examples:
   scripts/clang-format.sh -i src/core/foo.cpp
-  git ls-files '*.cpp' '*.hpp' | xargs scripts/clang-format.sh -i
+  scripts/clang-format.sh -ir                    # the whole repository, in place
+  scripts/clang-format.sh -ir src/runtime tests  # just these trees
+  scripts/clang-format.sh -r --dry-run --Werror  # check only, nonzero on drift
   echo 'int main(){return 0;}' | scripts/clang-format.sh
 EOF
 }
 
-if [[ "$#" -eq 0 && -t 0 ]]; then
+recursive=0
+args=()
+for arg in "$@"; do
+    case "$arg" in
+        -r | --recursive) recursive=1 ;;
+        -ir | -ri)
+            recursive=1
+            args+=(-i)
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *) args+=("$arg") ;;
+    esac
+done
+
+if [[ "$recursive" -eq 0 && "${#args[@]}" -eq 0 && -t 0 ]]; then
     echo "error: no input provided; refusing to wait on an interactive stdin" >&2
     usage >&2
     exit 64
@@ -38,4 +67,51 @@ if [[ -z "$CLANG_FORMAT_BIN" ]]; then
     exit 1
 fi
 
-exec "$CLANG_FORMAT_BIN" "$@"
+if [[ "$recursive" -eq 0 ]]; then
+    exec "$CLANG_FORMAT_BIN" "${args[@]+"${args[@]}"}"
+fi
+
+options=()
+paths=()
+for arg in "${args[@]+"${args[@]}"}"; do
+    if [[ "$arg" == -* ]]; then
+        options+=("$arg")
+    else
+        paths+=("$arg")
+    fi
+done
+if [[ "${#paths[@]}" -eq 0 ]]; then
+    paths=("$(git rev-parse --show-toplevel 2>/dev/null || pwd)")
+fi
+for path in "${paths[@]}"; do
+    if [[ ! -e "$path" ]]; then
+        echo "error: no such file or directory: $path" >&2
+        exit 66
+    fi
+done
+
+source_pattern='\.(c|cc|cpp|cxx|h|hh|hpp|hxx|ipp|inl)$'
+list_sources() {
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        # --full-name is not used: paths stay relative to the current
+        # directory, which is where clang-format runs.
+        git ls-files -z --cached --others --exclude-standard -- "${paths[@]}" |
+            tr '\0' '\n' | grep -E "$source_pattern" || true
+    else
+        find "${paths[@]}" -type f | grep -E "$source_pattern" || true
+    fi
+}
+
+mapfile -t files < <(list_sources | sort -u)
+# Tracked files deleted in the work tree are still listed by git.
+existing=()
+for file in "${files[@]+"${files[@]}"}"; do
+    [[ -f "$file" ]] && existing+=("$file")
+done
+if [[ "${#existing[@]}" -eq 0 ]]; then
+    echo "clang-format.sh: no C/C++ sources under: ${paths[*]}" >&2
+    exit 0
+fi
+
+printf '%s\0' "${existing[@]}" |
+    xargs -0 "$CLANG_FORMAT_BIN" "${options[@]+"${options[@]}"}"

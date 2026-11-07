@@ -328,19 +328,19 @@ auto detect_join_key_kind(const ColumnValue& col, ExprType& out) -> std::optiona
     return std::nullopt;
 }
 
-/// The hash build. Chains each build row to the next row carrying the same key,
-/// iterating in reverse so a chain walks forward during the probe -- which is
-/// what makes the streamed output match the nested-loop inner join's ordering.
+/// The hash build: fill one `PartitionedHeads` from `n` build rows, serially
+/// when it has one partition and over the worker pool when it has more. Each
+/// row is chained to the next row carrying the same key, inserting in reverse
+/// so a chain walks forward during the probe -- which is what makes the
+/// streamed output match the nested-loop inner join's ordering.
 ///
-/// A null key matches nothing, not even another null (SQL / Polars). So a
-/// null-keyed build row is never indexed, and a null-keyed probe row is never
-/// looked up. Both halves are needed: a null cell's payload is unspecified
+/// A null key matches nothing, not even another null (SQL / Polars), so rows
+/// for which `is_null` holds are never indexed; the probe skips null-keyed
+/// rows too. Both halves are needed: a null cell's payload is unspecified
 /// (whatever the reader or producing operator left there), so a null probe key
 /// could otherwise find any genuine key.
-/// Fill one `PartitionedHeads` from `n` build rows, serially when it has one
-/// partition and over the worker pool when it has more.
 ///
-/// The two paths must produce a bit-identical index, and the reason they do is
+/// The serial and parallel paths must produce a bit-identical index, and the reason they do is
 /// worth stating rather than trusting. The serial build walks rows from `n-1`
 /// down to 0, so a key's head is its LOWEST row and its chain ascends. The
 /// parallel build scatters rows into partitions keeping them ascending within

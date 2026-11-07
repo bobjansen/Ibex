@@ -7,7 +7,6 @@
 #include <ibex/ir/schema.hpp>
 
 #include <algorithm>
-#include <cmath>
 #include <cstddef>
 #include <map>
 #include <optional>
@@ -45,88 +44,16 @@ struct JoinEdge {
     std::vector<std::string> keys;
 };
 
-/// The predicate of a Filter-family node directly, or nullptr for anything
-/// else (including no filter at all). Doesn't need to be exhaustive -- a
-/// shape this misses just gets the blind heuristic selectivity, same as
-/// before this existed.
-auto leaf_predicate(const Node& node) -> const Expr* {
-    switch (node.kind()) {
-        case NodeKind::Filter:
-            return &node_cast<FilterNode>(node).predicate();
-        default:
-            return nullptr;
-    }
-}
-
-/// The single lazy source a relation leaf ultimately reads, walking down
-/// through the row-wise, cardinality-preserving operators PDS-H's aligned
-/// query shapes actually use above a scan (Filter/Project/Update/Rename).
-/// Returns nullptr for anything wider (a leaf that
-/// isn't one source, or an operator shape not walked here) -- same "decline,
-/// don't guess" contract as `leaf_predicate`.
-auto leaf_source_name(const Node& node) -> const std::string* {
-    const Node* cur = &node;
-    while (true) {
-        switch (cur->kind()) {
-            case NodeKind::Scan:
-                return &node_cast<ScanNode>(*cur).source_name();
-            case NodeKind::Filter:
-            case NodeKind::Project:
-            case NodeKind::Update:
-            case NodeKind::Rename:
-                if (cur->children().size() != 1 || cur->children().front() == nullptr) {
-                    return nullptr;
-                }
-                cur = cur->children().front().get();
-                continue;
-            default:
-                return nullptr;
-        }
-    }
-}
-
 /// Accept precisely the left-deep shape emitted by ordinary chained `join`
 /// expressions. The restriction keeps key ownership unambiguous for the first
 /// physical rewrite; bushy trees and predicates stay in their source order.
-///
-/// `all_filters_sampled` starts true and is cleared the first time a leaf
-/// carries a predicate that `stats.sample` could not turn into a real
-/// selectivity (no sampler, source not lazy, decode failed, ...). It is how
-/// `choose_inner_join_order` decides whether it is safe to reorder past
-/// `kMaxReorderRelations`: real numbers from every filter in the chain, or
-/// decline exactly as before this existed -- a chain with even one
-/// unmeasured filter keeps the old, conservative behavior rather than
-/// guessing on the relations that matter most for the wide-chain failure
-/// mode this guards against.
 auto collect_left_deep(const Node& node, const SourceStats& stats, std::vector<Relation>& relations,
-                       std::vector<JoinEdge>& edges, bool& all_filters_sampled) -> bool {
+                       std::vector<JoinEdge>& edges) -> bool {
     if (node.kind() != NodeKind::Join) {
-        auto estimate = estimate_cardinality(node, stats.rows, stats.schemas);
+        const auto estimate = estimate_cardinality(node, stats.rows, stats.schemas);
         const auto schema = infer_schema(node, stats.schemas);
         if (!estimate.rows.has_value() || !schema.is_known()) {
             return false;
-        }
-        if (const auto* predicate = leaf_predicate(node)) {
-            bool sampled_this_leaf = false;
-            if (stats.sample) {
-                if (const auto* source = leaf_source_name(node)) {
-                    const auto total = stats.rows.find(*source);
-                    if (total != stats.rows.end()) {
-                        if (auto sample = stats.sample(*source, predicate, {});
-                            sample.has_value() && sample->predicate_passed.has_value() &&
-                            sample->sampled_rows > 0) {
-                            const double selectivity =
-                                static_cast<double>(*sample->predicate_passed) /
-                                static_cast<double>(sample->sampled_rows);
-                            estimate.rows = static_cast<std::size_t>(
-                                std::llround(static_cast<double>(total->second) * selectivity));
-                            estimate.heuristic = false;  // a measured value, not a guess
-                            sampled_this_leaf = true;
-                        }
-                    }
-                }
-            }
-            all_filters_sampled = all_filters_sampled && sampled_this_leaf;
         }
         relations.push_back(Relation{.node = &node,
                                      .rows = static_cast<double>(*estimate.rows),
@@ -143,8 +70,8 @@ auto collect_left_deep(const Node& node, const SourceStats& stats, std::vector<R
     if (!is_reorderable_inner_join(join)) {
         return false;
     }
-    if (!collect_left_deep(*join.children()[0], stats, relations, edges, all_filters_sampled) ||
-        !collect_left_deep(*join.children()[1], stats, relations, edges, all_filters_sampled)) {
+    if (!collect_left_deep(*join.children()[0], stats, relations, edges) ||
+        !collect_left_deep(*join.children()[1], stats, relations, edges)) {
         return false;
     }
     Relation& right = relations.back();
@@ -360,9 +287,7 @@ auto choose_inner_join_order(const Node& root, const SourceStats& stats)
     -> std::optional<std::vector<std::size_t>> {
     std::vector<Relation> relations;
     std::vector<JoinEdge> edges;
-    bool all_filters_sampled = true;
-    if (!collect_left_deep(root, stats, relations, edges, all_filters_sampled) ||
-        relations.size() < 2) {
+    if (!collect_left_deep(root, stats, relations, edges) || relations.size() < 2) {
         return std::nullopt;
     }
     // Chains beyond this many relations are left in their author's order. The
@@ -374,29 +299,10 @@ auto choose_inner_join_order(const Node& root, const SourceStats& stats)
     // Long-chain ordering genuinely needs join-graph-aware statistics a Parquet
     // footer does not carry; until then, respect what the author wrote.
     //
-    // `stats.sample` is that statistics source when the driver supplies one:
-    // real, data-sampled filter selectivity in place of the blind heuristic,
-    // and real sampled key-distinct counts in place of a footer min/max span
-    // (see `distinct_below`'s NodeKind::Scan case in cardinality.cpp -- the
-    // q09 l_orderkey trap that broke an earlier unguarded attempt was a
-    // distinct-count error, not a selectivity one, and this addresses both).
-    //
-    // The cap itself is NOT raised yet, even with real numbers in hand: wiring
-    // this up and testing against q05/q08/q09 (the >5-relation queries) found
-    // a SECOND, independent problem past the cost model -- join_reorder.cpp's
-    // rewrite step (`connecting_keys` picking the wrong edge; see its fix)
-    // was never exercised on a graph with composite/multi-relation key
-    // dependencies (q05's supplier connects via TWO different keys to TWO
-    // different relations) and produces wrong answers on q09 and a hard
-    // error on q05 once relations.size() > 5 is actually allowed through.
-    // `all_filters_sampled` is threaded through and kept here (unused by the
-    // cap below) because the sampling and the sampled-distinct fix in
-    // cardinality.cpp are real, verified improvements to the ALREADY-allowed
-    // <=5 case and should not wait on the rewrite being hardened for wider
-    // graphs -- that is a separate, scoped follow-up, not a reason to hold
-    // this back.
+    // Raising the cap also needs join_reorder.cpp's rewrite hardened: with
+    // more than five relations allowed through it gave wrong answers on q09
+    // and a hard error on q05 (composite, multi-relation key dependencies).
     constexpr std::size_t kMaxReorderRelations = 5;
-    (void)all_filters_sampled;
     if (relations.size() > kMaxReorderRelations) {
         return std::nullopt;
     }

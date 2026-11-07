@@ -1213,11 +1213,11 @@ inline auto all_decode_groups(const parquet::FileMetaData& metadata) -> DirectDe
 inline auto chunk_has_no_nulls(const parquet::FileMetaData& metadata, int group, int leaf_index)
     -> bool {
     const auto chunk = metadata.RowGroup(group)->ColumnChunk(leaf_index);
-    if (!chunk->is_stats_set()) {
-        return false;
-    }
-    const auto stats = chunk->statistics();
-    return stats != nullptr && stats->HasNullCount() && stats->null_count() == 0;
+    // The encoded form, not `statistics()`: the null count is the same field
+    // either way, and the typed object costs a pool-allocated min/max buffer
+    // pair per chunk (see `chunk_stats`).
+    const auto stats = chunk->encoded_statistics();
+    return stats != nullptr && stats->has_null_count && stats->null_count == 0;
 }
 
 inline auto groups_have_no_nulls(const parquet::FileMetaData& metadata,
@@ -2792,10 +2792,56 @@ inline auto direct_decode_table(std::span<parquet::arrow::FileReader* const> rea
 /// ranges only: `span = max - min + 1` is what the planner derives a
 /// distinct-count estimate from, and that arithmetic means nothing for a double
 /// or a string.
-inline auto chunk_stats(const parquet::ColumnChunkMetaData& chunk)
+inline auto chunk_stats(const parquet::ColumnChunkMetaData& chunk, bool type_defined_order)
     -> ibex::parquet_stats::ChunkStats {
     ibex::parquet_stats::ChunkStats out;
     if (!chunk.is_stats_set()) {
+        return out;
+    }
+    // Arrow's typed `statistics()` allocates a min/max buffer pair from its
+    // memory pool for every chunk, and this runs for every integer chunk of
+    // a file each time it is opened: PDS-H lineitem (489 groups) opened in
+    // 7.8 ms with it and 6.8 ms without, paid on every collect. The encoded
+    // statistics are the same thrift fields, unparsed: read the null count
+    // and the PLAIN-encoded (little-endian) integer bounds directly.
+    // Typed statistics take the V2 `min_value`/`max_value` only under a
+    // TYPE_DEFINED column order and the legacy pair otherwise, while the
+    // encoded form prefers V2 whenever present, so the fast path is taken
+    // only where the two agree (the caller reads the order off the schema).
+    if (type_defined_order) {
+        const auto encoded = chunk.encoded_statistics();
+        if (encoded == nullptr) {
+            return out;
+        }
+        out.present = true;
+        if (encoded->has_null_count) {
+            out.has_null_count = true;
+            out.null_count = static_cast<std::size_t>(encoded->null_count);
+        }
+        if (!encoded->has_min || !encoded->has_max) {
+            return out;
+        }
+        const auto read_bounds = [&]<typename T>() -> bool {
+            if (encoded->min().size() != sizeof(T) || encoded->max().size() != sizeof(T)) {
+                return false;
+            }
+            T low{};
+            T high{};
+            std::memcpy(&low, encoded->min().data(), sizeof(T));
+            std::memcpy(&high, encoded->max().data(), sizeof(T));
+            out.low = low;
+            out.high = high;
+            return true;
+        };
+        const auto physical = chunk.type();
+        const bool read = physical == parquet::Type::INT64 ? read_bounds.operator()<std::int64_t>()
+                          : physical == parquet::Type::INT32
+                              ? read_bounds.operator()<std::int32_t>()
+                              : false;
+        if (!read) {
+            return out;
+        }
+        out.has_range = ibex::parquet_stats::usable_signed_range(out.low, out.high);
         return out;
     }
     const auto stats = chunk.statistics();
@@ -2862,13 +2908,21 @@ inline auto read_column_stats(const parquet::FileMetaData& metadata,
         return out;
     }
 
+    std::vector<char> type_defined(leaves.size(), 0);
+    for (std::size_t k = 0; k < leaves.size(); ++k) {
+        type_defined[k] = descr->Column(leaves[k])->column_order().get_order() ==
+                                  parquet::ColumnOrder::TYPE_DEFINED_ORDER
+                              ? 1
+                              : 0;
+    }
     using Merges = std::vector<ibex::parquet_stats::ColumnStatsMerge>;
     const auto merge_groups = [&](std::size_t begin, std::size_t end, Merges& merges) {
         merges.assign(leaves.size(), {});
         for (std::size_t group = begin; group < end; ++group) {
             const auto row_group = metadata.RowGroup(static_cast<int>(group));
             for (std::size_t k = 0; k < leaves.size(); ++k) {
-                merges[k].add(chunk_stats(*row_group->ColumnChunk(leaves[k])));
+                merges[k].add(
+                    chunk_stats(*row_group->ColumnChunk(leaves[k]), type_defined[k] != 0));
             }
         }
     };

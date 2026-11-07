@@ -1913,7 +1913,9 @@ class MixedReader final : public runtime::LazySourceReader {
             const auto& name = names[c];
             if (name == "i") {
                 std::vector<std::int64_t> values(rows);
-                std::ranges::iota(values, static_cast<std::int64_t>(begin));
+                // NOLINTNEXTLINE(modernize-use-ranges): Apple libc++ does not provide
+                // ranges::iota.
+                std::iota(values.begin(), values.end(), static_cast<std::int64_t>(begin));
                 out.add_column(name, Column<std::int64_t>{std::move(values)}, std::move(validity));
             } else if (name == "d") {
                 std::vector<double> values(rows);

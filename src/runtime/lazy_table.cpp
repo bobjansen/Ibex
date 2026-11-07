@@ -1093,7 +1093,8 @@ auto copy_row_range(const ColumnValue& src, std::size_t start, std::size_t rows,
         return out;
     }
     Selection idx(rows);
-    std::ranges::iota(idx, start);
+    // NOLINTNEXTLINE(modernize-use-ranges): Apple libc++ does not provide ranges::iota.
+    std::iota(idx.begin(), idx.end(), start);
     return gather_column(src, idx.data(), rows, exec);
 }
 

@@ -7,8 +7,10 @@
 #include <ibex/ir/schema.hpp>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <ranges>
 #include <set>
 #include <string>
 #include <utility>
@@ -208,14 +210,14 @@ void fold(NodePtr& post_slot, const SourceSchemas& sources) {
         rebuilt->add_child(std::move(below));
         below = std::move(rebuilt);
     }
-    for (auto it = projections.rbegin(); it != projections.rend(); ++it) {
+    for (NodePtr* const projection : std::ranges::reverse_view(projections)) {
         std::vector<ColumnRef> columns;
-        for (const auto& column : node_cast<ProjectNode>(***it).columns()) {
+        for (const auto& column : node_cast<ProjectNode>(**projection).columns()) {
             if (!dropped.contains(column.name)) {
                 columns.push_back(column);
             }
         }
-        auto rebuilt = std::make_unique<ProjectNode>((**it)->id(), std::move(columns));
+        auto rebuilt = std::make_unique<ProjectNode>((*projection)->id(), std::move(columns));
         rebuilt->add_child(std::move(below));
         below = std::move(rebuilt);
     }

@@ -8,6 +8,7 @@
 #include <ibex/ir/schema.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -613,7 +614,7 @@ void prune_join_inputs(JoinNode& join, const std::set<std::string>& droppable,
     if (!planned.has_value()) {
         return;
     }
-    std::set<std::string> per_side[2];
+    std::array<std::set<std::string>, 2> per_side;
     for (const auto& column : *planned) {
         if (!droppable.contains(column.name) || column.is_key ||
             column.folded_peer_index.has_value()) {

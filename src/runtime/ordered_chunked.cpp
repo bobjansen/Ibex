@@ -9,7 +9,6 @@
 // `tail_table` rather than driving an ordering operator); `as_timeframe` is a
 // whole-table `run_materialized_node` implementation with no streaming operator.
 
-#include <algorithm>
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
@@ -639,8 +638,10 @@ class ChunkedOrderedLimitOperator final : public Operator {
         // POD heaps flag a null themselves (they hold their own storage, which
         // a later chunk must keep feeding); every other typed branch shares
         // the Entry heaps with the boxed path, which carries the null.
-        const ValidityBitmap* key_validity =
-            key_columns.front()->validity.has_value() ? &*key_columns.front()->validity : nullptr;
+        // One reference, so the check and the dereference are visibly the
+        // same optional (bugprone-unchecked-optional-access).
+        const std::optional<ValidityBitmap>& key_bitmap = key_columns.front()->validity;
+        const ValidityBitmap* key_validity = key_bitmap.has_value() ? &*key_bitmap : nullptr;
         // `chunk.rows()` is a std::visit over the column variant, and this loop
         // runs once per input row — it measured as ~15% of a top-k query while
         // sitting in the loop CONDITION. `key_column[row]` likewise re-tests
@@ -996,8 +997,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
         }
         std::vector<std::uint32_t> grown(static_cast<std::size_t>(span), kPodNoGid);
         const auto shift = static_cast<std::size_t>(pod_dense_lo_ - lo);
-        std::ranges::copy(pod_dense_gid_,
-                  grown.begin() + static_cast<std::ptrdiff_t>(shift));
+        std::ranges::copy(pod_dense_gid_, grown.begin() + static_cast<std::ptrdiff_t>(shift));
         pod_dense_gid_ = std::move(grown);
         pod_dense_lo_ = lo;
     }

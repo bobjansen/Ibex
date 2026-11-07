@@ -982,10 +982,11 @@ class GroupKeyStore {
             null_masks_[first + n] = 0;
         }
         for (std::size_t i = 0; i < entries.size() && i < kMaxKeyColumns; ++i) {
-            if (!entries[i]->validity.has_value()) {
+            const std::optional<ValidityBitmap>& bits = entries[i]->validity;
+            if (!bits.has_value()) {
                 continue;
             }
-            const ValidityBitmap& valid = *entries[i]->validity;
+            const ValidityBitmap& valid = *bits;
             for (std::size_t n = lo; n < hi; ++n) {
                 if (!valid[rows[n]]) {
                     null_masks_[first + n] |= std::uint64_t{1} << i;
@@ -5702,9 +5703,12 @@ class HashAggregateState final {
                             }))) {
             return process_rows_cat_multi_nullable(group_entries, agg_entries, rows);
         }
-        if (single_key && group_entries[0]->validity.has_value()) {
-            process_rows_cat_nullable(*cat_cols[0], *group_entries[0]->validity, agg_entries, rows);
-            return std::nullopt;
+        if (single_key) {
+            if (const std::optional<ValidityBitmap>& key_bits = group_entries[0]->validity;
+                key_bits.has_value()) {
+                process_rows_cat_nullable(*cat_cols[0], *key_bits, agg_entries, rows);
+                return std::nullopt;
+            }
         }
         if (single_key && rows > 0 &&
             try_process_rows_cat_parallel(*cat_cols[0], agg_entries, rows)) {
@@ -7445,8 +7449,9 @@ class HashAggregateState final {
         std::vector<const ValidityBitmap*> valid(n_keys, nullptr);
         for (std::size_t c = 0; c < n_keys; ++c) {
             cat_cols[c] = &std::get<Column<Categorical>>(*group_entries[c]->column);
-            if (group_entries[c]->validity.has_value()) {
-                valid[c] = &*group_entries[c]->validity;
+            if (const std::optional<ValidityBitmap>& bits = group_entries[c]->validity;
+                bits.has_value()) {
+                valid[c] = &*bits;
                 multi_cat_nullable_[c] = 1U;
                 multi_cat_any_nullable_ = true;
             }

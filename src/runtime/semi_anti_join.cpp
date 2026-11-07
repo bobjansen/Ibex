@@ -881,9 +881,8 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             Column<std::int64_t> keys;
             keys.reserve(left_rows);
             for (const auto* col : lcols) {
-                for (std::size_t row = 0; row < col->size(); ++row) {
-                    keys.push_back((*col)[row]);
-                }
+                // `insert` returns an iterator; the copy is all that is wanted.
+                (void)keys.insert(keys.end(), col->begin(), col->end());
             }
             Table build;
             build.add_column(keys_->front().left, std::move(keys));

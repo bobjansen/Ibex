@@ -6,7 +6,6 @@
 #include <ibex/core/column.hpp>
 #include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
-#include <ibex/format.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/join_output.hpp>
 #include <ibex/ir/node.hpp>
@@ -21,7 +20,6 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <expected>
 #include <iterator>
 #include <optional>
@@ -47,9 +45,8 @@ namespace {
 constexpr std::size_t kKindSlots = 256;
 
 /// Process-wide observability counters for the physical planner. Monotonic,
-/// relaxed atomics, read only as `after - before` deltas (tests) or dumped in
-/// `physical_fallback_report()`. Bundled behind a function-local static so the
-/// state has one owner and dodges the global-mutable-state lint.
+/// relaxed atomics, read only as `after - before` deltas (tests). Bundled behind a function-local
+/// static so the state has one owner and dodges the global-mutable-state lint.
 struct PlanStats {
     std::atomic<std::uint64_t> plans_built{0};
     std::atomic<std::uint64_t> map_pipelines{0};
@@ -1396,108 +1393,5 @@ auto physical_fallbacks_for(ir::NodeKind kind) -> std::uint64_t {
 auto node_kind_name(ir::NodeKind kind) -> std::string_view {
     return node_kind_name_impl(kind);
 }
-
-namespace {
-
-/// Classify fallbacks as `accepted` materialized operations or `backlog`
-/// candidates for optimization when profiling justifies it. Bare `Scan` sources
-/// use `EmptyChain` and are excluded from this classification by the reporter.
-auto fallback_disposition(ir::NodeKind kind) -> std::string_view {
-    switch (kind) {
-        case ir::NodeKind::Join:  // non-equi / nulls-equal / expect — materializing by design
-        case ir::NodeKind::Melt:
-        case ir::NodeKind::Dcast:
-        case ir::NodeKind::Transpose:
-        case ir::NodeKind::Matmul:
-        case ir::NodeKind::Cov:
-        case ir::NodeKind::Corr:
-        case ir::NodeKind::Columns:
-        case ir::NodeKind::Rbind:
-        case ir::NodeKind::Construct:
-        case ir::NodeKind::Stream:
-        case ir::NodeKind::Program:
-        case ir::NodeKind::Model:
-            return "accepted";
-        default:
-            // Window / Resample / grouped Update and anything else: a candidate
-            // to revisit if it ever measures as hot.
-            return "backlog";
-    }
-}
-
-}  // namespace
-
-auto physical_fallback_report() -> std::string {
-    // Descending by count, each line tagged `accepted` (permanent
-    // MaterializedCall) or `backlog` (optimize when profiled hot).
-    std::vector<std::pair<std::uint64_t, ir::NodeKind>> rows;
-    for (std::size_t i = 0; i < kKindSlots; ++i) {
-        const std::uint64_t n = plan_stats().fallback_by_kind[i].load(std::memory_order_relaxed);
-        if (n != 0) {
-            rows.emplace_back(n, static_cast<ir::NodeKind>(i));
-        }
-    }
-    std::ranges::sort(rows, [](const auto& a, const auto& b) { return a.first > b.first; });
-    std::string out;
-    for (const auto& [count, kind] : rows) {
-        out += "plan fallback: kind=";
-        out += node_kind_name_impl(kind);
-        out += " count=" + std::to_string(count);
-        if (kind != ir::NodeKind::Scan) {
-            out += " (";
-            out += fallback_disposition(kind);
-            out += ')';
-        }
-        out += '\n';
-    }
-    return out;
-}
-
-namespace {
-
-/// Setting `IBEX_PLAN_STATS` enables exit-time plan counters and fallback counts
-/// by node kind, tagged with their accepted/backlog disposition.
-struct FallbackReporter {
-    // The struct is only declared const in this file.
-    bool enabled = std::getenv("IBEX_PLAN_STATS") != nullptr;
-
-    FallbackReporter() = default;
-    FallbackReporter(const FallbackReporter&) = delete;
-    FallbackReporter& operator=(const FallbackReporter&) = delete;
-    FallbackReporter(FallbackReporter&&) = delete;
-    FallbackReporter& operator=(FallbackReporter&&) = delete;
-
-    ~FallbackReporter() noexcept {
-        if (!enabled) {
-            return;
-        }
-        try {
-            ibex::formatting::print(
-                stderr,
-                "plan stats: plans={} pipelines={} fallbacks={} not_map_chain={} "
-                "empty_chain={} malformed={}\n",
-                physical_plans_built(), physical_map_pipelines(), physical_materialized_calls(),
-                plan_stats()
-                    .fallback_by_reason[static_cast<std::size_t>(FallbackReason::NotMapChain)]
-                    .load(std::memory_order_relaxed),
-                plan_stats()
-                    .fallback_by_reason[static_cast<std::size_t>(FallbackReason::EmptyChain)]
-                    .load(std::memory_order_relaxed),
-                plan_stats()
-                    .fallback_by_reason[static_cast<std::size_t>(FallbackReason::MalformedMapNode)]
-                    .load(std::memory_order_relaxed));
-            const std::string report = physical_fallback_report();
-            if (!report.empty()) {
-                ibex::formatting::print(stderr, "{}", report);
-            }
-        } catch (...) {  // NOLINT(bugprone-empty-catch) -- best-effort exit diagnostics
-            // Exit-time diagnostics are best effort; never unwind from a destructor.
-        }
-    }
-};
-
-const FallbackReporter g_fallback_reporter;
-
-}  // namespace
 
 }  // namespace ibex::runtime::physical

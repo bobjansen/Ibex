@@ -11,8 +11,6 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <cstdio>
-#include <cstdlib>
 #include <map>
 #include <memory>
 #include <optional>
@@ -22,8 +20,6 @@
 #include <utility>
 #include <variant>
 #include <vector>
-
-#include "ibex/format.hpp"
 
 namespace ibex::ir {
 /// Above this fraction of its own base table, a build side covers too much of
@@ -425,16 +421,6 @@ auto build_side_worth_deferring(const JoinNode& join, const std::string& probe_s
     }
     // Cheap check first, so the origin trace is only paid where it can matter.
     const auto ratio = build_side_key_domain_ratio(join, row_counts, schemas, *build_est.rows);
-    if (std::getenv("IBEX_PROBE_GATE_DEBUG") != nullptr) {
-        const auto origin =
-            column_origin_of(*join.children()[0], join.keys().front().left, schemas);
-
-        ibex::formatting::print(
-            stderr, "[probe-gate] probe={} key={} build_rows={} origin={} ratio={}\n",
-            probe_source.c_str(), join.keys().front().left.c_str(), *build_est.rows,
-            origin.has_value() ? origin->source.c_str() : "<none>",
-            ratio.has_value() ? std::to_string(*ratio).c_str() : "<none>");
-    }
     return !ratio.has_value() || *ratio < kMaxBuildDomainCoverage;
 }
 

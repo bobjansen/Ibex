@@ -651,8 +651,4 @@ void note_materialized_call(FallbackReason reason, ir::NodeKind kind);
 /// Printable name for any node kind, including the ones that are not map steps.
 [[nodiscard]] auto node_kind_name(ir::NodeKind kind) -> std::string_view;
 
-/// One `plan fallback:` line per node kind that fell back, descending by count.
-/// Empty when nothing did. Printed at exit under `IBEX_PLAN_STATS`.
-[[nodiscard]] auto physical_fallback_report() -> std::string;
-
 }  // namespace ibex::runtime::physical

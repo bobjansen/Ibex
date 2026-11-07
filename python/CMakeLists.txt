@@ -174,6 +174,13 @@ if(IBEX_BUILD_TESTS AND IBEX_PYARROW_IMPORT_RESULT EQUAL 0)
             "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/python/test_ibex_lazy.py"
     )
     add_test(
+        NAME ibex_python_parquet_footer_cache
+        COMMAND "${CMAKE_COMMAND}" -E env
+            "PYTHONPATH=${PROJECT_BINARY_DIR}/python:${PROJECT_SOURCE_DIR}/python"
+            "IBEX_TEST_PARQUET=${IBEX_PYTHON_HAS_PARQUET}"
+            "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/python/test_ibex_parquet_footer_cache.py"
+    )
+    add_test(
         NAME ibex_pyarrow_smoke
         COMMAND "${CMAKE_COMMAND}" -E env
             "PYTHONPATH=${PROJECT_BINARY_DIR}/python"

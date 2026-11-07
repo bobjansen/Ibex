@@ -62,6 +62,7 @@
 #endif
 #include <filesystem>
 #include <limits>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -84,6 +85,9 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#endif
 
 #if !defined(IBEX_PARQUET_LOCAL_ONLY)
 #include "../common/curl_api.hpp"
@@ -1082,22 +1086,184 @@ inline auto dictionary_column_indices(parquet::ParquetFileReader& reader,
 /// dictionary-encoded string column straight back as a dictionary rather than
 /// materializing one `std::string` per row.
 /// `dictionary_column_indices`, computed once per file.
+/// What one `fstat` says about the exact file version an open descriptor
+/// reads. Two opens that agree on all of it are reading the same bytes,
+/// barring the cases `parsed_footer_cache_entry` rules out or that need
+/// deliberate manipulation (see there).
+struct LocalFileVersion {
+    std::uint64_t device = 0;
+    std::uint64_t inode = 0;
+    std::int64_t size = 0;
+    std::int64_t mtime_ns = 0;
+    std::int64_t ctime_ns = 0;
+    auto operator==(const LocalFileVersion&) const -> bool = default;
+};
+
+/// The version of the local file behind `input`, or nullopt for anything that
+/// is not a local file descriptor (object storage, a downloaded temporary, a
+/// platform without `fstat`). Nullopt means "do not cache".
+inline auto local_file_version(const arrow::io::RandomAccessFile& input)
+    -> std::optional<LocalFileVersion> {
+#if defined(_WIN32)
+    (void)input;
+    return std::nullopt;
+#else
+    const auto* file = dynamic_cast<const arrow::io::ReadableFile*>(&input);
+    if (file == nullptr) {
+        return std::nullopt;
+    }
+    struct stat info{};
+    if (::fstat(file->file_descriptor(), &info) != 0 || !S_ISREG(info.st_mode)) {
+        return std::nullopt;
+    }
+    const auto ns = [](const timespec& t) {
+        return (static_cast<std::int64_t>(t.tv_sec) * 1'000'000'000) + t.tv_nsec;
+    };
+#if defined(__APPLE__)
+    const std::int64_t mtime = ns(info.st_mtimespec);
+    const std::int64_t ctime = ns(info.st_ctimespec);
+#else
+    const std::int64_t mtime = ns(info.st_mtim);
+    const std::int64_t ctime = ns(info.st_ctim);
+#endif
+    return LocalFileVersion{.device = static_cast<std::uint64_t>(info.st_dev),
+                            .inode = static_cast<std::uint64_t>(info.st_ino),
+                            .size = static_cast<std::int64_t>(info.st_size),
+                            .mtime_ns = mtime,
+                            .ctime_ns = ctime};
+#endif
+}
+
+/// Everything `read_parquet_lazy` derives from a file's footer, none of it
+/// mutable once built: shared by every LazyTable opened on that version.
+struct ParsedParquetFooter {
+    LocalFileVersion version;
+    std::shared_ptr<parquet::FileMetaData> metadata;
+    std::shared_ptr<arrow::Schema> schema;
+    std::shared_ptr<const std::map<std::string, int>> indices;
+    std::vector<int> dictionary_columns;
+    ibex::runtime::SourceColumnStats stats;
+};
+
+/// A process-wide cache of parsed footers, validated on every use.
+///
+/// Opening a source parses its footer, probes its dictionary columns and
+/// merges its column statistics: 6.8 ms for PDS-H SF10 lineitem, paid on
+/// every query that reads it (a prepared engine query re-runs the script
+/// each collect). Polars keeps the footer on the LazyFrame and never looks
+/// at the file again, so a file rewritten in place gives silently wrong
+/// counts and pruning; this cache must not.
+///
+/// An entry is used only when the descriptor about to be read `fstat`s to
+/// the version the entry was built from -- device, inode, size, and mtime
+/// and ctime to the nanosecond -- and any difference re-parses. Checking the
+/// open descriptor, not the path, ties the check to the bytes actually read:
+/// a file replaced by rename is a new inode.
+///
+/// Two gaps are closed on insert, not on lookup. File timestamps tick
+/// coarsely (a few ms on Linux), so a same-size rewrite inside one tick of
+/// the parse would leave every field equal: an entry is stored only once the
+/// file's newest timestamp is `kParquetFooterSettleNs` old -- git's "racily
+/// clean" rule. And a write landing during the parse moves the timestamps:
+/// the descriptor is stat'ed again afterwards and a mismatch is not stored.
+///
+/// What remains needs deliberate manipulation: a same-size, same-inode
+/// rewrite whose mtime AND ctime both come back unchanged. A process can set
+/// mtime with `utime`, but every write and every `utime` sets ctime to the
+/// current time; restoring it takes a system clock change or a write to the
+/// raw device, both of which need root.
+inline constexpr std::int64_t kParquetFooterSettleNs = 2'000'000'000;
+inline constexpr std::size_t kParquetFooterCacheEntries = 64;
+
+struct ParsedParquetFooterCache {
+    std::mutex mutex;
+    /// Most recently used first; `entries` maps a path to its node.
+    std::list<std::pair<std::string, std::shared_ptr<const ParsedParquetFooter>>> order;
+    robin_hood::unordered_flat_map<std::string, decltype(order)::iterator> entries;
+};
+
+inline auto parsed_footer_cache() -> ParsedParquetFooterCache& {
+    static ParsedParquetFooterCache cache;
+    return cache;
+}
+
+/// The cached footer for `path` if it was built from exactly `version`.
+inline auto lookup_parsed_footer(const std::string& path, const LocalFileVersion& version)
+    -> std::shared_ptr<const ParsedParquetFooter> {
+    auto& cache = parsed_footer_cache();
+    const std::lock_guard lock(cache.mutex);
+    const auto it = cache.entries.find(path);
+    if (it == cache.entries.end()) {
+        return nullptr;
+    }
+    if (it->second->second->version != version) {
+        cache.order.erase(it->second);  // stale: the file changed
+        cache.entries.erase(it);
+        return nullptr;
+    }
+    cache.order.splice(cache.order.begin(), cache.order, it->second);
+    return cache.order.front().second;
+}
+
+/// Whether a footer parsed from `before` may be stored, given what the
+/// descriptor stats to now (`after`). See `ParsedParquetFooterCache`.
+inline auto parsed_footer_cache_entry(const LocalFileVersion& before, const LocalFileVersion& after)
+    -> bool {
+    if (before != after) {
+        return false;  // written while it was being parsed
+    }
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    return now - std::max(before.mtime_ns, before.ctime_ns) >= kParquetFooterSettleNs;
+}
+
+inline void store_parsed_footer(const std::string& path,
+                                std::shared_ptr<const ParsedParquetFooter> footer) {
+    auto& cache = parsed_footer_cache();
+    const std::lock_guard lock(cache.mutex);
+    if (const auto it = cache.entries.find(path); it != cache.entries.end()) {
+        cache.order.erase(it->second);
+        cache.entries.erase(it);
+    }
+    cache.order.emplace_front(path, std::move(footer));
+    cache.entries[path] = cache.order.begin();
+    while (cache.order.size() > kParquetFooterCacheEntries) {
+        cache.entries.erase(cache.order.back().first);
+        cache.order.pop_back();
+    }
+}
+
 inline auto cached_dictionary_column_indices(parquet::ParquetFileReader& reader,
                                              const std::string& path,
                                              arrow::io::RandomAccessFile* input)
     -> std::vector<int> {
+    // One entry per path, replaced whenever the file it describes changes. A
+    // local file is matched by its exact version (`LocalFileVersion`), so a
+    // rewrite with the same row count is not answered from the old entry; a
+    // remote object has no cheap version, so it is matched by row count only.
+    struct Entry {
+        std::int64_t rows = 0;
+        std::optional<LocalFileVersion> version;
+        std::vector<int> columns;
+    };
     static std::mutex mutex;
-    static std::map<std::pair<std::string, std::int64_t>, std::vector<int>> cache;
-    const auto key = std::pair{path, reader.metadata()->num_rows()};
+    static robin_hood::unordered_node_map<std::string, Entry> cache;
+    std::optional<LocalFileVersion> version;
+    if (input != nullptr) {
+        version = local_file_version(*input);
+    }
+    const std::int64_t rows = reader.metadata()->num_rows();
     {
         const std::lock_guard lock(mutex);
-        if (const auto it = cache.find(key); it != cache.end()) {
-            return it->second;
+        if (const auto it = cache.find(path);
+            it != cache.end() && it->second.rows == rows && it->second.version == version) {
+            return it->second.columns;
         }
     }
     auto columns = dictionary_column_indices(reader, input);
     const std::lock_guard lock(mutex);
-    cache.emplace(key, columns);
+    cache[path] = Entry{.rows = rows, .version = version, .columns = columns};
     return columns;
 }
 
@@ -4020,6 +4186,18 @@ inline auto filtered_string_selection(std::span<parquet::arrow::FileReader* cons
 /// consumers build independent readers from the shared, already-parsed footer.
 class ParquetLazyReaderFactoryState {
    public:
+    /// From a cached footer: its dictionary columns were decided when it was
+    /// parsed, against the same file version.
+    ParquetLazyReaderFactoryState(std::shared_ptr<arrow::io::RandomAccessFile> input,
+                                  std::shared_ptr<parquet::FileMetaData> metadata,
+                                  std::unique_ptr<parquet::arrow::FileReader> first_reader,
+                                  std::string path, std::vector<int> dictionary_columns)
+        : input_(std::move(input)),
+          metadata_(std::move(metadata)),
+          dictionary_columns_(std::move(dictionary_columns)),
+          first_reader_(std::move(first_reader)),
+          path_(std::move(path)) {}
+
     ParquetLazyReaderFactoryState(std::shared_ptr<arrow::io::RandomAccessFile> input,
                                   std::shared_ptr<parquet::FileMetaData> metadata,
                                   std::unique_ptr<parquet::arrow::FileReader> first_reader,
@@ -4052,6 +4230,10 @@ class ParquetLazyReaderFactoryState {
 
     [[nodiscard]] auto input() const -> const std::shared_ptr<arrow::io::RandomAccessFile>& {
         return input_;
+    }
+
+    [[nodiscard]] auto dictionary_columns() const -> const std::vector<int>& {
+        return dictionary_columns_;
     }
 
    private:
@@ -4502,36 +4684,66 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
 inline auto read_parquet_lazy(std::string_view path) -> ibex::runtime::LazyTablePtr {
     std::string path_string{path};
     auto input = open_parquet_input(path);
+    const auto version = local_file_version(*input);
 
-    // This reader exists only long enough to bind immutable metadata. Decode
-    // work receives fresh readers from the factory below.
-    auto metadata_reader = make_parquet_reader(input, path_string);
+    std::shared_ptr<const ParsedParquetFooter> footer;
+    std::shared_ptr<ParquetLazyReaderFactoryState> factory_state;
+    if (version.has_value()) {
+        footer = lookup_parsed_footer(path_string, *version);
+    }
+    if (footer != nullptr) {
+        // The descriptor just opened stats to the version the entry was built
+        // from (`ParsedParquetFooterCache`): no footer read, parse, dictionary
+        // probe or statistics merge.
+        auto first_reader =
+            make_parquet_reader(input, path_string, footer->metadata, footer->dictionary_columns);
+        factory_state = std::make_shared<ParquetLazyReaderFactoryState>(
+            std::move(input), footer->metadata, std::move(first_reader), path_string,
+            footer->dictionary_columns);
+    } else {
+        // This reader exists only long enough to bind immutable metadata.
+        // Decode work receives fresh readers from the factory below.
+        auto metadata_reader = make_parquet_reader(input, path_string);
 
-    std::shared_ptr<arrow::Schema> arrow_schema;
-    auto st = metadata_reader->GetSchema(&arrow_schema);
-    if (!st.ok()) {
-        throw std::runtime_error("parquet::read: failed to read schema: " + path_string + " (" +
-                                 st.ToString() + ")");
+        std::shared_ptr<arrow::Schema> arrow_schema;
+        auto st = metadata_reader->GetSchema(&arrow_schema);
+        if (!st.ok()) {
+            throw std::runtime_error("parquet::read: failed to read schema: " + path_string + " (" +
+                                     st.ToString() + ")");
+        }
+        auto parquet_metadata = metadata_reader->parquet_reader()->metadata();
+
+        // Column name -> field index, so a demand expressed in names can be
+        // turned into the indices Arrow's selective read wants.
+        auto indices = std::make_shared<const std::map<std::string, int>>([&arrow_schema] {
+            std::map<std::string, int> result;
+            for (int i = 0; i < arrow_schema->num_fields(); ++i) {
+                result.emplace(arrow_schema->field(i)->name(), i);
+            }
+            return result;
+        }());
+
+        factory_state = std::make_shared<ParquetLazyReaderFactoryState>(
+            input, parquet_metadata, std::move(metadata_reader), path_string);
+        auto parsed = std::make_shared<ParsedParquetFooter>(
+            ParsedParquetFooter{.version = version.value_or(LocalFileVersion{}),
+                                .metadata = parquet_metadata,
+                                .schema = arrow_schema,
+                                .indices = std::move(indices),
+                                .dictionary_columns = factory_state->dictionary_columns(),
+                                .stats = read_column_stats(*parquet_metadata, *arrow_schema)});
+        if (version.has_value()) {
+            const auto after = local_file_version(*factory_state->input());
+            if (after.has_value() && parsed_footer_cache_entry(*version, *after)) {
+                store_parsed_footer(path_string, parsed);
+            }
+        }
+        footer = std::move(parsed);
     }
 
-    const auto rows =
-        static_cast<std::size_t>(metadata_reader->parquet_reader()->metadata()->num_rows());
-    auto parquet_metadata = metadata_reader->parquet_reader()->metadata();
-
-    // Column name -> field index, so a demand expressed in names can be turned
-    // into the indices Arrow's selective read wants.
-    auto indices = std::make_shared<const std::map<std::string, int>>([&arrow_schema] {
-        std::map<std::string, int> result;
-        for (int i = 0; i < arrow_schema->num_fields(); ++i) {
-            result.emplace(arrow_schema->field(i)->name(), i);
-        }
-        return result;
-    }());
-
-    auto factory_state = std::make_shared<ParquetLazyReaderFactoryState>(
-        std::move(input), parquet_metadata, std::move(metadata_reader), path_string);
+    const auto rows = static_cast<std::size_t>(footer->metadata->num_rows());
     ibex::runtime::LazySourceReaderFactory reader_factory =
-        [factory_state, indices, arrow_schema, rows,
+        [factory_state, indices = footer->indices, arrow_schema = footer->schema, rows,
          path_string]() -> std::expected<ibex::runtime::LazySourceReaderPtr, std::string> {
         try {
             auto reader = factory_state->make_reader();
@@ -4544,8 +4756,7 @@ inline auto read_parquet_lazy(std::string_view path) -> ibex::runtime::LazyTable
     };
 
     return std::make_shared<ibex::runtime::LazyTable>(
-        schema_table_from_arrow(*arrow_schema), rows, std::move(reader_factory),
-        read_column_stats(*parquet_metadata, *arrow_schema));
+        schema_table_from_arrow(*footer->schema), rows, std::move(reader_factory), footer->stats);
 }
 
 namespace ibex::ext::parquet {

@@ -229,9 +229,11 @@ struct DenseRangeHeads {
 
     void partition(std::size_t count) { parts = std::clamp<std::size_t>(count, 1, 256); }
     [[nodiscard]] auto partition_count() const noexcept -> std::size_t { return parts; }
+    /// `at < slots <= 2^27` (`build_dense_int_heads`) and `parts <= 256`, so
+    /// the product stays below 2^35: no wider type needed.
     [[nodiscard]] auto part_of(std::int64_t key) const noexcept -> std::size_t {
         const std::uint64_t at = static_cast<std::uint64_t>(key) - static_cast<std::uint64_t>(lo);
-        return static_cast<std::size_t>((static_cast<unsigned __int128>(at) * parts) / slots);
+        return static_cast<std::size_t>((at * parts) / slots);
     }
     void reserve(std::size_t /*n*/) {}
     auto try_emplace(std::int64_t key, std::size_t row) -> std::pair<std::size_t*, bool> {

@@ -16,7 +16,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>

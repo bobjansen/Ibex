@@ -49,7 +49,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -236,7 +235,7 @@ struct DenseRangeHeads {
         return static_cast<std::size_t>((at * parts) / slots);
     }
     void reserve(std::size_t /*n*/) {}
-    auto try_emplace(std::int64_t key, std::size_t row) -> std::pair<std::size_t*, bool> {
+    auto try_emplace(std::int64_t key, std::size_t row) const -> std::pair<std::size_t*, bool> {
         std::size_t* slot =
             heads->data() + (static_cast<std::uint64_t>(key) - static_cast<std::uint64_t>(lo));
         if (*slot == kJoinNil) {

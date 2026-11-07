@@ -9,6 +9,7 @@
 // `tail_table` rather than driving an ordering operator); `as_timeframe` is a
 // whole-table `run_materialized_node` implementation with no streaming operator.
 
+#include <algorithm>
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
@@ -35,6 +36,7 @@
 #include <vector>
 
 #include "chunk_conversion_internal.hpp"
+#include "ibex/core/compiler.hpp"
 #include "interpreter_internal.hpp"
 #include "physical_executor_internal.hpp"
 #include "runtime_internal.hpp"
@@ -994,7 +996,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
         }
         std::vector<std::uint32_t> grown(static_cast<std::size_t>(span), kPodNoGid);
         const auto shift = static_cast<std::size_t>(pod_dense_lo_ - lo);
-        std::copy(pod_dense_gid_.begin(), pod_dense_gid_.end(),
+        std::ranges::copy(pod_dense_gid_,
                   grown.begin() + static_cast<std::ptrdiff_t>(shift));
         pod_dense_gid_ = std::move(grown);
         pod_dense_lo_ = lo;

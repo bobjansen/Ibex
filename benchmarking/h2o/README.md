@@ -132,13 +132,13 @@ retroactively.
 
 ## Results: 2026-11-07, local i7-13700, 1 and 8 threads, 1e7 rows
 
-Ibex `a8bc06d9`, Polars 2.0.0 (streaming), DuckDB 2.0.0, on the development
+Ibex `70b86e24`, Polars 2.0.0 (streaming), DuckDB 2.0.0, on the development
 box (i7-13700 at a fixed 3.2 GHz). Eight threads ran on CPUs 0,2,…,14, one
 logical CPU per performance core, and one thread on CPU 2; every engine was
 pinned to the same CPUs. All 110 (data, question, thread-count) comparisons
 passed full answer validation (`h2o-answers-v2`) with all three engines. The
-results are `results/h2o_20261107b_local_{8t,1t}.tsv` and their
-`.tsv.checks.json` sidecars (run ids `2e77ebe0…` and `8be19532…`). This is a
+results are `results/h2o_20261107e_local_{8t,1t}.tsv` and their
+`.tsv.checks.json` sidecars (run ids `db31b7b2…` and `12e29c4d…`). This is a
 local survey, not the website snapshot: the box, CPU and DuckDB version
 differ from the AWS run below, which the website still shows.
 
@@ -148,33 +148,32 @@ means Ibex is faster.
 
 | data | threads | ibex/polars geomean | ibex/polars total | ibex/duckdb geomean | ibex/duckdb total |
 |---|---:|---:|---:|---:|---:|
-| J1_1e7_NA_0_0 (join) | 1 | 0.63 | 0.54 | 0.15 | 0.17 |
-| G1_1e7_1e2_0_0 | 1 | 0.46 | 0.62 | 0.48 | 0.51 |
-| G1_1e7_1e2_5_0 (NAs) | 1 | 0.50 | 0.59 | 0.60 | 0.58 |
-| G1_1e7_1e2_0_1 (sorted) | 1 | 0.49 | 0.61 | 0.51 | 0.50 |
-| G1_1e7_1e1_0_0 | 1 | 0.43 | 0.58 | 0.53 | 0.65 |
-| G1_1e7_2e0_0_0 | 1 | 0.47 | 0.43 | 0.57 | 0.68 |
-| J1_1e7_NA_0_0 (join) | 8 | 1.02 | 0.94 | 0.34 | 0.40 |
-| G1_1e7_1e2_0_0 | 8 | 0.59 | 0.61 | 0.68 | 0.72 |
-| G1_1e7_1e2_5_0 (NAs) | 8 | 0.61 | 0.62 | 0.74 | 0.74 |
-| G1_1e7_1e2_0_1 (sorted) | 8 | 0.59 | 0.58 | 0.67 | 0.71 |
-| G1_1e7_1e1_0_0 | 8 | 0.58 | 0.30 | 0.62 | 0.64 |
-| G1_1e7_2e0_0_0 | 8 | 0.59 | 0.16 | 0.75 | 0.78 |
+| J1_1e7_NA_0_0 (join) | 1 | 0.62 | 0.51 | 0.14 | 0.17 |
+| G1_1e7_1e2_0_0 | 1 | 0.41 | 0.52 | 0.44 | 0.45 |
+| G1_1e7_1e2_5_0 (NAs) | 1 | 0.47 | 0.53 | 0.56 | 0.52 |
+| G1_1e7_1e2_0_1 (sorted) | 1 | 0.46 | 0.56 | 0.47 | 0.44 |
+| G1_1e7_1e1_0_0 | 1 | 0.40 | 0.45 | 0.48 | 0.48 |
+| G1_1e7_2e0_0_0 | 1 | 0.44 | 0.33 | 0.53 | 0.53 |
+| J1_1e7_NA_0_0 (join) | 8 | 0.94 | 0.87 | 0.32 | 0.38 |
+| G1_1e7_1e2_0_0 | 8 | 0.62 | 0.62 | 0.71 | 0.74 |
+| G1_1e7_1e2_5_0 (NAs) | 8 | 0.65 | 0.63 | 0.80 | 0.78 |
+| G1_1e7_1e2_0_1 (sorted) | 8 | 0.60 | 0.59 | 0.65 | 0.70 |
+| G1_1e7_1e1_0_0 | 8 | 0.56 | 0.31 | 0.70 | 0.69 |
+| G1_1e7_2e0_0_0 | 8 | 0.62 | 0.16 | 0.88 | 0.83 |
 
-- **1 thread:** Ibex leads both engines on every dataset by both summaries.
-  The only question it loses is q8 against DuckDB (1.67–1.94×).
-- **8 threads:** every groupby dataset leads both engines by both summaries.
-  The join leads DuckDB and is level with Polars: its total is 0.94, its
-  geometric mean 1.02, from q1–q4 at 1.01–1.16×. q3 (medium outer, ~40 ms)
-  alternates between about 36 and 49 ms on this box from run to run, and
-  read 48.3 ms here.
-- **q8 (per-group top-2), after `a8bc06d9`:** at 8 threads it now beats
-  DuckDB at K=100 (66 / 75 ms Ibex / DuckDB, 0.89× on the plain, NA and
-  sorted data) and trails it at K=10 (148 / 133 ms, 1.11×) and K=2
-  (248 / 187 ms, 1.33×; 743 ms before), while beating Polars 3.7–18×.
-- **Close to Polars at 8 threads:** q10 (six keys, ~1e7 groups) 1.05–1.13×
-  on four datasets and 0.97× sorted; K=2 q9 (corr by two keys, 4 groups)
-  1.09×.
+- **Every dataset leads both engines by both summaries, at 1 and 8 threads.**
+- **1 thread:** Ibex is faster on all 55 questions against Polars and on 54
+  against DuckDB. The exception is q8 on the NA data (240 / 232 ms), where
+  the harness's `filter is_not_null(v3)` materialises 9.5M rows first.
+  q8 elsewhere beats DuckDB 0.73–0.83× (K=2: 839 / 1013 ms; 1691 ms before
+  `fb73f7d7`) and Polars 2.6–6.3×.
+- **8 threads:** q8 (per-group top-2) beats DuckDB at K=100 (69 / 83 ms,
+  0.83×; sorted 0.90×), is level on the NA data (1.02×) and trails at
+  K=10 (160 / 133 ms, 1.20×) and K=2 (267 / 176 ms, 1.52×; 743 ms before
+  `a8bc06d9`), while beating Polars 3.8–17×. q10 (six keys, ~1e7 groups) is
+  1.00–1.18× Polars. K=2 q9 (corr by two keys, 4 groups, ~16 ms against
+  Polars) read 1.67×; it is the noisiest cell, between 15 and 27 ms across
+  today's runs.
 - **Changes since the AWS run below** (2026-11-07): nullable Categorical keys
   stay on the dense code paths (`56ac685b`, `059b7e67`; the harness has
   loaded empty fields as null keys since `da68fd4b`, which had pushed the NA
@@ -183,7 +182,8 @@ means Ibex is faster.
   (`7e4927ba`, join q5 311 → ~170 ms), parallel new-group null masks
   (`2d6d11d8`), dense Int64 numbering across workers for up to 16M ids
   (`372973d3`, `7cf0ea7a`, q5), kept packed keys in partitioned discovery
-  (`f0f08916`, q10) and grouped top-k spread across workers (`a8bc06d9`, q8).
+  (`f0f08916`, q10), grouped top-k spread across workers (`a8bc06d9`, q8)
+  and, on one thread, found by key offset with prefetching (`fb73f7d7`, q8).
 
 ## Results: 2026-10-16, AWS r7i.4xlarge, 1 and 8 physical cores, 1e7 rows
 

@@ -258,6 +258,88 @@ TEST_CASE("multi-key categorical aggregate: the fused parallel path matches a re
     }
 }
 
+TEST_CASE("inner join: a large dense Int build side fills a direct-address table",
+          "[runtime][chunked][join]") {
+    // h2o's big join: ~1e7 near-unique Int keys over a span near the row
+    // count build straight into a direct-address head table, its partitions
+    // contiguous key ranges. Repeated keys must chain exactly as the hash
+    // build chains them -- output row order follows the chains -- so every
+    // result is compared, order included, against the same join with the
+    // direct build turned off. Nulls hold in-range payloads; probe keys fall
+    // below, above and far outside the range. Both join orders, so both the
+    // probe and the swapped probe read the table, serially and fanned out.
+    constexpr std::size_t kBuildRows = 200'000;
+    constexpr std::size_t kProbeRows = 300'000;
+    constexpr std::int64_t kLo = -1'000;
+    Column<std::int64_t> bk;
+    Column<std::int64_t> bv;
+    runtime::ValidityBitmap b_valid;
+    for (std::size_t r = 0; r < kBuildRows; ++r) {
+        // ~1.5x as many slots as rows; every 9th row repeats an earlier key.
+        auto key = kLo + static_cast<std::int64_t>((r * 3) / 2);
+        if (r % 9 == 4) {
+            key = kLo + static_cast<std::int64_t>(((r / 3) * 3) / 2);
+        }
+        const bool ok = r % 41 != 6;
+        bk.push_back(ok ? key : kLo + 5);
+        bv.push_back(static_cast<std::int64_t>(r));
+        b_valid.push_back(ok);
+    }
+    Column<std::int64_t> pk;
+    Column<std::int64_t> pv;
+    runtime::ValidityBitmap p_valid;
+    for (std::size_t i = 0; i < kProbeRows; ++i) {
+        auto key = kLo - 50 + static_cast<std::int64_t>((i * 7919) % (kBuildRows * 2));
+        if (i % 1'001 == 3) {
+            key = i % 2 == 0 ? std::numeric_limits<std::int64_t>::min()
+                             : std::numeric_limits<std::int64_t>::max();
+        }
+        const bool ok = i % 37 != 3;
+        pk.push_back(ok ? key : kLo + 5);
+        pv.push_back(static_cast<std::int64_t>(i) * 10);
+        p_valid.push_back(ok);
+    }
+    runtime::Table build;
+    build.add_column("k", std::move(bk));
+    build.columns.back().validity = std::move(b_valid);
+    build.add_column("bv", std::move(bv));
+    runtime::Table probe;
+    probe.add_column("k", std::move(pk));
+    probe.columns.back().validity = std::move(p_valid);
+    probe.add_column("pv", std::move(pv));
+    runtime::TableRegistry registry;
+    registry.emplace("b", std::move(build));
+    registry.emplace("p", std::move(probe));
+
+    for (const char* query : {"p join b on k;", "b join p on k;"}) {
+        INFO(query);
+        auto program = parser::parse(query);
+        REQUIRE(program.has_value());
+        auto ir = parser::lower(program.value());
+        REQUIRE(ir.has_value());
+        for (const std::size_t threads : {std::size_t{1}, std::size_t{8}}) {
+            INFO("threads " << threads);
+            runtime::ExecutionContext exec;
+            exec.parallel_threads = threads;
+            exec.parallel_min_rows = 0;
+            const auto before = runtime::dense_int_join_builds().load();
+            const auto direct =
+                runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, exec);
+            REQUIRE(direct.has_value());
+            CHECK(runtime::dense_int_join_builds().load() > before);
+            runtime::set_env("IBEX_DISABLE_DENSE_JOIN_BUILD", "1");
+            const auto hashed =
+                runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, exec);
+            runtime::unset_env("IBEX_DISABLE_DENSE_JOIN_BUILD");
+            REQUIRE(hashed.has_value());
+            REQUIRE(direct->rows() > 100'000);
+            if (auto mismatch = runtime::compare_tables(*hashed, *direct); mismatch.has_value()) {
+                FAIL(mismatch->message());
+            }
+        }
+    }
+}
+
 TEST_CASE("inner join: a small dense Int build side probes by direct address",
           "[runtime][chunked][join]") {
     // A build side whose keys cover a small range (h2o's id1/id2 joins) is

@@ -24,6 +24,11 @@ namespace ibex::runtime {
 
 class ScanWorkerSink;
 
+/// How many join builds, process-wide, filled an Int key's heads straight into
+/// a direct-address table (no hash maps). For tests: the maps give the same
+/// answer, in the same order.
+[[nodiscard]] auto dense_int_join_builds() -> std::atomic<std::uint64_t>&;
+
 /// How many join probes, process-wide, resolved an Int key through the build
 /// side's direct-address head table instead of its hash map. For tests: the
 /// two give the same answer.

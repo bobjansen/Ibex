@@ -85,6 +85,11 @@
 
 namespace ibex::runtime {
 
+auto dense_int_join_builds() -> std::atomic<std::uint64_t>& {
+    static std::atomic<std::uint64_t> count{0};
+    return count;
+}
+
 auto dense_int_join_probes() -> std::atomic<std::uint64_t>& {
     static std::atomic<std::uint64_t> count{0};
     return count;
@@ -213,6 +218,33 @@ struct PartitionedHeads {
     }
 };
 
+/// Head rows for Int keys in [lo, lo + slots) at `key - lo`: the shape
+/// `fill_partitioned_heads` fills, with a partition being a contiguous key
+/// range, so each partition's worker writes its own slice of the array.
+struct DenseRangeHeads {
+    std::vector<std::size_t>* heads = nullptr;
+    std::int64_t lo = 0;
+    std::uint64_t slots = 0;
+    std::size_t parts = 1;
+
+    void partition(std::size_t count) { parts = std::clamp<std::size_t>(count, 1, 256); }
+    [[nodiscard]] auto partition_count() const noexcept -> std::size_t { return parts; }
+    [[nodiscard]] auto part_of(std::int64_t key) const noexcept -> std::size_t {
+        const std::uint64_t at = static_cast<std::uint64_t>(key) - static_cast<std::uint64_t>(lo);
+        return static_cast<std::size_t>((static_cast<unsigned __int128>(at) * parts) / slots);
+    }
+    void reserve(std::size_t /*n*/) {}
+    auto try_emplace(std::int64_t key, std::size_t row) -> std::pair<std::size_t*, bool> {
+        std::size_t* slot = heads->data() + (static_cast<std::uint64_t>(key) -
+                                             static_cast<std::uint64_t>(lo));
+        if (*slot == kJoinNil) {
+            *slot = row;
+            return {slot, true};
+        }
+        return {slot, false};
+    }
+};
+
 /// Everything a hash build produces and a hash probe consumes: the chained
 /// index over one side's key column, plus what the probe needs to interpret it.
 ///
@@ -238,6 +270,16 @@ struct JoinHashIndex {
     /// `densify_int_heads`). Empty otherwise.
     std::vector<std::size_t> i64_dense;
     std::int64_t i64_dense_lo = 0;
+    /// The head row for an Int `key`, from whichever of the two holds it.
+    /// A build straight into `i64_dense` leaves `i64_heads` empty.
+    [[nodiscard]] auto find_int_head(std::int64_t key) const -> std::size_t {
+        if (!i64_dense.empty()) {
+            const std::uint64_t at =
+                static_cast<std::uint64_t>(key) - static_cast<std::uint64_t>(i64_dense_lo);
+            return at < i64_dense.size() ? i64_dense[at] : kJoinNil;
+        }
+        return i64_heads.find_head(key);
+    }
     PartitionedHeads<double> f64_heads;
     PartitionedHeads<bool> bool_heads;
     PartitionedHeads<Date> date_heads;
@@ -460,6 +502,66 @@ void densify_int_heads(JoinHashIndex& index) {
     }
 }
 
+/// Build an Int key's heads straight into a direct-address table when the
+/// keys fill most of their range. h2o's big join builds on 1e7 near-unique
+/// `id3` values over a span of ~1e7; `densify_int_heads` stops at 2^20 keys,
+/// so that build ran the partitioned hash maps -- 160 ms of the query -- to
+/// answer what an array index answers. The same chains as the map build: the
+/// fill is `fill_partitioned_heads`, its partitions contiguous key ranges.
+template <class IsNull>
+auto build_dense_int_heads(JoinHashIndex& index, const Column<std::int64_t>& col,
+                           const IsNull& is_null, std::size_t partitions) -> bool {
+    constexpr std::uint64_t kMaxSlots = std::uint64_t{1} << 27;
+    const std::size_t n = col.size();
+    if (n < (std::size_t{1} << 16) || std::getenv("IBEX_DISABLE_DENSE_JOIN_BUILD") != nullptr) {
+        return false;
+    }
+    const auto* data = col.data();
+    auto& pool = process_worker_pool();
+    const std::size_t ranges = std::max<std::size_t>(1, std::min(pool.size(), partitions));
+    const std::size_t grain = (n + ranges - 1) / ranges;
+    std::vector<std::int64_t> los(ranges, std::numeric_limits<std::int64_t>::max());
+    std::vector<std::int64_t> his(ranges, std::numeric_limits<std::int64_t>::min());
+    const auto bounds = [&](std::size_t r) {
+        const std::size_t begin = std::min(n, r * grain);
+        const std::size_t end = std::min(n, begin + grain);
+        std::int64_t lo = los[r];
+        std::int64_t hi = his[r];
+        for (std::size_t row = begin; row < end; ++row) {
+            if (!is_null(row)) {
+                lo = std::min(lo, data[row]);
+                hi = std::max(hi, data[row]);
+            }
+        }
+        los[r] = lo;
+        his[r] = hi;
+    };
+    if (ranges > 1) {
+        auto batch = pool.submit(ranges, bounds);
+        batch.wait();
+    } else {
+        bounds(0);
+    }
+    const std::int64_t lo = *std::ranges::min_element(los);
+    const std::int64_t hi = *std::ranges::max_element(his);
+    if (lo > hi) {
+        return false;  // every key null
+    }
+    const std::uint64_t span = static_cast<std::uint64_t>(hi) - static_cast<std::uint64_t>(lo);
+    if (span >= kMaxSlots || span >= (std::uint64_t{2} * n) + 1024) {
+        return false;
+    }
+    index.i64_dense.assign(static_cast<std::size_t>(span) + 1, kJoinNil);
+    index.i64_dense_lo = lo;
+    DenseRangeHeads heads{.heads = &index.i64_dense, .lo = lo, .slots = span + 1};
+    heads.partition(partitions);
+    fill_partitioned_heads(
+        heads, n, [data](std::size_t r) { return data[r]; }, is_null, index.chain_next,
+        index.unique);
+    dense_int_join_builds().fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 auto build_join_hash_index(const Table& build_side, const std::string& key_name, ExprType key_kind,
                            std::size_t partitions) -> std::expected<JoinHashIndex, std::string> {
     const ColumnValue* key = build_side.find(key_name);
@@ -490,8 +592,10 @@ auto build_join_hash_index(const Table& build_side, const std::string& key_name,
         const auto* col = std::get_if<Column<std::int64_t>>(key);
         if (col == nullptr)
             return std::unexpected("inner join: build-side key type mismatch");
-        build_scalar(*col, index.i64_heads);
-        densify_int_heads(index);
+        if (!build_dense_int_heads(index, *col, is_null, partitions)) {
+            build_scalar(*col, index.i64_heads);
+            densify_int_heads(index);
+        }
     } else if (key_kind == ExprType::Double) {
         const auto* col = std::get_if<Column<double>>(key);
         if (col == nullptr)
@@ -1501,7 +1605,8 @@ struct JoinProbe {
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
             const auto* data = col->data();
-            do_phase1([&](std::size_t r) { return data[r]; }, index().i64_heads);
+            probe_swapped(
+                n_right, [&](std::size_t r) { return index().find_int_head(data[r]); }, li, ri);
         } else if (index().key_kind == ExprType::Double) {
             const auto* col = std::get_if<Column<double>>(rkey);
             if (col == nullptr)
@@ -2020,7 +2125,7 @@ auto run_streamed_two_phase_unit(const StreamedTwoPhaseShared& shared, JoinProbe
         if (key_validity != nullptr && !(*key_validity)[i]) {
             continue;
         }
-        const std::size_t head = probe.index().i64_heads.find_head(key_data[i]);
+        const std::size_t head = probe.index().find_int_head(key_data[i]);
         if (head == kJoinNil) {
             continue;
         }
@@ -2906,7 +3011,7 @@ class ChunkedInnerJoinOperator final : public Operator {
                 if (key_validity != nullptr && !(*key_validity)[i]) {
                     continue;
                 }
-                const std::size_t head = probe_.index().i64_heads.find_head(key_data[i]);
+                const std::size_t head = probe_.index().find_int_head(key_data[i]);
                 if (head == kNil) {
                     continue;
                 }

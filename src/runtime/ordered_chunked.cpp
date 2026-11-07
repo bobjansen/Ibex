@@ -922,7 +922,8 @@ class ChunkedOrderedLimitOperator final : public Operator {
             return;  // every key null: nothing to place yet
         }
         if (pod_dense_cells_are_gids_) {
-            const std::int64_t old_hi = pod_dense_lo_ + static_cast<std::int64_t>(pod_dense_cells_) - 1;
+            const std::int64_t old_hi =
+                pod_dense_lo_ + static_cast<std::int64_t>(pod_dense_cells_) - 1;
             if (lo >= pod_dense_lo_ && hi <= old_hi) {
                 return;
             }
@@ -945,7 +946,8 @@ class ChunkedOrderedLimitOperator final : public Operator {
             lo = std::min(lo, pod_dense_lo_);
             hi = std::max(hi, old_hi);
         }
-        const std::uint64_t span = static_cast<std::uint64_t>(hi) - static_cast<std::uint64_t>(lo) + 1;
+        const std::uint64_t span =
+            static_cast<std::uint64_t>(hi) - static_cast<std::uint64_t>(lo) + 1;
         const bool fits = span != 0 && span <= kMaxCells &&
                           (pod_dense_ || span <= (std::uint64_t{4} * rows) + 1024);
         if (!fits) {
@@ -1170,8 +1172,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
                     part_rows[at] = static_cast<std::uint32_t>(row);
                     if (carry) {
                         const bool group_null = key0.is_null(row);
-                        const bool order_null =
-                            key_validity != nullptr && !(*key_validity)[row];
+                        const bool order_null = key_validity != nullptr && !(*key_validity)[row];
                         carried_key[at] = group_null ? 0 : int_key(row);
                         carried_value[at] = order_null ? K{} : key_at(row);
                         carried_nulls[at] = static_cast<std::uint8_t>((group_null ? 1U : 0U) |
@@ -1263,8 +1264,8 @@ class ChunkedOrderedLimitOperator final : public Operator {
                         }
                         gid = slot;
                     } else {
-                        auto [it, fresh] = part.int_index.try_emplace(
-                            carry ? carried_key[at] : int_key(row), 0U);
+                        auto [it, fresh] =
+                            part.int_index.try_emplace(carry ? carried_key[at] : int_key(row), 0U);
                         if (fresh) {
                             it->second = new_group();
                         }
@@ -1405,55 +1406,56 @@ class ChunkedOrderedLimitOperator final : public Operator {
         std::vector<std::uint32_t> rank(whole_chunk ? 0 : rows, 0);
         std::vector<std::uint32_t> kept;
         if (!whole_chunk) {
-        each_part([&](std::size_t p) {
-            const auto& part = parts[p];
-            for (const std::uint32_t gid : part.touched) {
-                const PodEntry<K>* heap = part.heaps.data() + (static_cast<std::size_t>(gid) * k);
-                for (std::uint32_t i = 0; i < part.sizes[gid]; ++i) {
-                    if ((heap[i].ref & kPodCurrentChunk) != 0) {
-                        rank[static_cast<std::uint32_t>(heap[i].ref)] = 1;
-                    }
-                }
-            }
-        });
-        // A kept row's rank is its place among the kept rows, in row order.
-        {
-            const std::size_t ranges = std::max<std::size_t>(workers, 1);
-            const std::size_t grain = (rows + ranges - 1) / ranges;
-            std::vector<std::size_t> first(ranges + 1, 0);
-            const auto each_range = [&](const auto& body) {
-                if (ranges < 2) {
-                    body(std::size_t{0});
-                    return;
-                }
-                auto batch = process_worker_pool().submit(ranges, body);
-                batch.wait();
-            };
-            each_range([&](std::size_t r) {
-                const std::size_t begin = std::min(rows, r * grain);
-                const std::size_t end = std::min(rows, begin + grain);
-                std::size_t n = 0;
-                for (std::size_t row = begin; row < end; ++row) {
-                    n += rank[row] != 0 ? 1 : 0;
-                }
-                first[r + 1] = n;
-            });
-            for (std::size_t r = 0; r < ranges; ++r) {
-                first[r + 1] += first[r];
-            }
-            kept.resize(first[ranges]);
-            each_range([&](std::size_t r) {
-                const std::size_t begin = std::min(rows, r * grain);
-                const std::size_t end = std::min(rows, begin + grain);
-                auto at = static_cast<std::uint32_t>(first[r]);
-                for (std::size_t row = begin; row < end; ++row) {
-                    if (rank[row] != 0) {
-                        rank[row] = at;
-                        kept[at++] = static_cast<std::uint32_t>(row);
+            each_part([&](std::size_t p) {
+                const auto& part = parts[p];
+                for (const std::uint32_t gid : part.touched) {
+                    const PodEntry<K>* heap =
+                        part.heaps.data() + (static_cast<std::size_t>(gid) * k);
+                    for (std::uint32_t i = 0; i < part.sizes[gid]; ++i) {
+                        if ((heap[i].ref & kPodCurrentChunk) != 0) {
+                            rank[static_cast<std::uint32_t>(heap[i].ref)] = 1;
+                        }
                     }
                 }
             });
-        }
+            // A kept row's rank is its place among the kept rows, in row order.
+            {
+                const std::size_t ranges = std::max<std::size_t>(workers, 1);
+                const std::size_t grain = (rows + ranges - 1) / ranges;
+                std::vector<std::size_t> first(ranges + 1, 0);
+                const auto each_range = [&](const auto& body) {
+                    if (ranges < 2) {
+                        body(std::size_t{0});
+                        return;
+                    }
+                    auto batch = process_worker_pool().submit(ranges, body);
+                    batch.wait();
+                };
+                each_range([&](std::size_t r) {
+                    const std::size_t begin = std::min(rows, r * grain);
+                    const std::size_t end = std::min(rows, begin + grain);
+                    std::size_t n = 0;
+                    for (std::size_t row = begin; row < end; ++row) {
+                        n += rank[row] != 0 ? 1 : 0;
+                    }
+                    first[r + 1] = n;
+                });
+                for (std::size_t r = 0; r < ranges; ++r) {
+                    first[r + 1] += first[r];
+                }
+                kept.resize(first[ranges]);
+                each_range([&](std::size_t r) {
+                    const std::size_t begin = std::min(rows, r * grain);
+                    const std::size_t end = std::min(rows, begin + grain);
+                    auto at = static_cast<std::uint32_t>(first[r]);
+                    for (std::size_t row = begin; row < end; ++row) {
+                        if (rank[row] != 0) {
+                            rank[row] = at;
+                            kept[at++] = static_cast<std::uint32_t>(row);
+                        }
+                    }
+                });
+            }
         }
         const auto piece = static_cast<std::uint64_t>(pod_pieces_.size());
         each_part([&](std::size_t p) {

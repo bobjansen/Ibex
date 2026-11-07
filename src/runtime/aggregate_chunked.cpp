@@ -974,7 +974,8 @@ class GroupKeyStore {
     /// The null masks of groups `first + lo .. first + hi`, from `rows`. At
     /// h2o q10's ~1e7 groups over six nullable keys this was ~80 ms of
     /// random bitmap reads on one thread; ranges write disjoint masks.
-    void fill_null_masks_rows_range(std::size_t first, const std::vector<const ColumnEntry*>& entries,
+    void fill_null_masks_rows_range(std::size_t first,
+                                    const std::vector<const ColumnEntry*>& entries,
                                     std::span<const std::size_t> rows, std::size_t lo,
                                     std::size_t hi) {
         for (std::size_t n = lo; n < hi; ++n) {
@@ -4218,8 +4219,8 @@ class HashAggregateState final {
                 int_order_[gid] = lo + static_cast<std::int64_t>(cell);
             }
         };
-        if (try_assign_dense_gids_parallel(rows, n_cells + 1, int_dense_gid_.data(), cell_of,
-                                           grow, record_at, gids)) {
+        if (try_assign_dense_gids_parallel(rows, n_cells + 1, int_dense_gid_.data(), cell_of, grow,
+                                           record_at, gids)) {
             publish_discovered(agg_entries, rows);
             return true;
         }
@@ -5702,8 +5703,7 @@ class HashAggregateState final {
             return process_rows_cat_multi_nullable(group_entries, agg_entries, rows);
         }
         if (single_key && group_entries[0]->validity.has_value()) {
-            process_rows_cat_nullable(*cat_cols[0], *group_entries[0]->validity, agg_entries,
-                                      rows);
+            process_rows_cat_nullable(*cat_cols[0], *group_entries[0]->validity, agg_entries, rows);
             return std::nullopt;
         }
         if (single_key && rows > 0 &&
@@ -6232,15 +6232,17 @@ class HashAggregateState final {
                 prepare(c);
             }
         }
-        fan([&](std::size_t c, std::size_t r) {
-            const auto [lo, hi] = range_of(r);
-            if (c == columns) {
-                group_keys_.fill_null_masks_rows_range(first, group_entries, rows, lo, hi);
-                return;
-            }
-            group_keys_.fill_column_rows_range(c, first, *group_entries[c]->column, rows, lo, hi,
-                                               text_at[(c * (ranges + 1)) + r]);
-        }, columns + 1);
+        fan(
+            [&](std::size_t c, std::size_t r) {
+                const auto [lo, hi] = range_of(r);
+                if (c == columns) {
+                    group_keys_.fill_null_masks_rows_range(first, group_entries, rows, lo, hi);
+                    return;
+                }
+                group_keys_.fill_column_rows_range(c, first, *group_entries[c]->column, rows, lo,
+                                                   hi, text_at[(c * (ranges + 1)) + r]);
+            },
+            columns + 1);
     }
 
     /// Store non-null First aggregates at the row that creates each new group.
@@ -7465,10 +7467,9 @@ class HashAggregateState final {
             for (std::size_t row = begin; row < end; ++row) {
                 std::uint64_t cell = 0;
                 for (std::size_t c = 0; c < n_keys; ++c) {
-                    const std::uint64_t index =
-                        valid[c] != nullptr && !(*valid[c])[row]
-                            ? plan.dict_sizes[c] - 1
-                            : static_cast<std::uint64_t>(raws[c][row]);
+                    const std::uint64_t index = valid[c] != nullptr && !(*valid[c])[row]
+                                                    ? plan.dict_sizes[c] - 1
+                                                    : static_cast<std::uint64_t>(raws[c][row]);
                     cell += index * plan.strides[c];
                 }
                 cells[row] = static_cast<std::uint32_t>(cell);

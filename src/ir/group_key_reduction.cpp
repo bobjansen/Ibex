@@ -414,9 +414,8 @@ auto chain_output_columns(const std::vector<Node*>& chain, const AggregateNode& 
             columns = node_cast<ProjectNode>(*link).columns();
         } else if (link->kind() == NodeKind::Update) {
             for (const auto& field : node_cast<UpdateNode>(*link).fields()) {
-                if (std::ranges::none_of(columns, [&](const ColumnRef& col) {
-                        return col.name == field.alias;
-                    })) {
+                if (std::ranges::none_of(
+                        columns, [&](const ColumnRef& col) { return col.name == field.alias; })) {
                     columns.push_back(ColumnRef{.name = field.alias});
                 }
             }
@@ -709,8 +708,7 @@ auto apply_lift(NodePtr head_node, const Node& root, const LiftPlan& plan,
     std::vector<ColumnRef> final_columns;
     {
         std::vector<Node*> chain;
-        const AggregateNode* agg =
-            aggregate_below(*head_node->mutable_children().front(), chain);
+        const AggregateNode* agg = aggregate_below(*head_node->mutable_children().front(), chain);
         final_columns = chain_output_columns(chain, *agg);
     }
 

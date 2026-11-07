@@ -621,11 +621,11 @@ auto project_node(ir::NodePtr input, std::vector<std::string> names) -> ir::Node
 /// update.
 auto adapter_chain(ir::NodePtr agg) -> ir::NodePtr {
     auto filtered = filter_node(std::move(agg), positive("total"));
-    auto revenue = update_node(std::move(filtered), "revenue",
-                               ir::Expr{.node = ir::BinaryExpr{
-                                            .op = ir::ArithmeticOp::Mul,
-                                            .left = ir::ExprPtr{col_expr("total")},
-                                            .right = ir::ExprPtr{col_expr("total")}}});
+    auto revenue =
+        update_node(std::move(filtered), "revenue",
+                    ir::Expr{.node = ir::BinaryExpr{.op = ir::ArithmeticOp::Mul,
+                                                    .left = ir::ExprPtr{col_expr("total")},
+                                                    .right = ir::ExprPtr{col_expr("total")}}});
     auto projected =
         project_node(std::move(revenue), {"c_custkey", "c_name", "revenue", "c_phone"});
     auto flagged = update_node(std::move(projected), "flag", positive("revenue"));

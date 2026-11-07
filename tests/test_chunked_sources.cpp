@@ -2156,11 +2156,11 @@ TEST_CASE("chunked aggregate: a nullable Categorical key keeps the dense code pa
             std::set<Cell> seen;
             for (std::size_t g = 0; g < out.rows(); ++g) {
                 INFO("group " << g);
-                const Cell key = runtime::is_null(*oc, g)
-                                     ? std::nullopt
-                                     : Cell{static_cast<std::int64_t>(std::ranges::find(
-                                                labels, std::string(cc[g])) -
-                                            labels.begin())};
+                const Cell key =
+                    runtime::is_null(*oc, g)
+                        ? std::nullopt
+                        : Cell{static_cast<std::int64_t>(
+                              std::ranges::find(labels, std::string(cc[g])) - labels.begin())};
                 REQUIRE(groups.contains(key));
                 REQUIRE(seen.insert(key).second);
                 CHECK(key == order[g]);  // first-occurrence order
@@ -2212,7 +2212,8 @@ TEST_CASE("chunked aggregate: a nullable Categorical key keeps the dense code pa
     runtime::ExecutionContext parallel;
     parallel.parallel_threads = 8;
     parallel.parallel_min_rows = 0;
-    const auto kept = runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+    const auto kept =
+        runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
     REQUIRE(kept.has_value());
     REQUIRE(kept->rows() == 1);
     const auto* kc = kept->find_entry("c");
@@ -2285,8 +2286,7 @@ TEST_CASE("chunked aggregate: a Categorical key's null group survives bitmap-fre
     };
     runtime::ExternRegistry externs;
     externs.register_chunked_table("cat_null_keys", [&](const runtime::ExternArgs&) {
-        return std::expected<runtime::OperatorPtr, std::string>{
-            std::make_unique<GrowingSource>()};
+        return std::expected<runtime::OperatorPtr, std::string>{std::make_unique<GrowingSource>()};
     });
     const auto before = runtime::nullable_cat_key_chunks().load();
     const auto result = run_extern(
@@ -2394,9 +2394,8 @@ TEST_CASE("chunked aggregate: nullable multi-key Categoricals keep the dense cel
         for (const bool with_first : {false, true}) {
             INFO("with first(s): " << with_first);
             auto program = parser::parse(
-                with_first
-                    ? "t[select { total = sum(q), n = count(), f = first(s) }, by { c, d }];"
-                    : "t[select { total = sum(q), n = count() }, by { c, d }];");
+                with_first ? "t[select { total = sum(q), n = count(), f = first(s) }, by { c, d }];"
+                           : "t[select { total = sum(q), n = count() }, by { c, d }];");
             REQUIRE(program.has_value());
             auto ir = parser::lower(program.value());
             REQUIRE(ir.has_value());
@@ -2542,8 +2541,7 @@ TEST_CASE("chunked aggregate: multi-key Categorical null cells survive dictionar
     };
     runtime::ExternRegistry externs;
     externs.register_chunked_table("cat_pair_keys", [&](const runtime::ExternArgs&) {
-        return std::expected<runtime::OperatorPtr, std::string>{
-            std::make_unique<GrowingSource>()};
+        return std::expected<runtime::OperatorPtr, std::string>{std::make_unique<GrowingSource>()};
     });
     const auto before = runtime::nullable_cat_key_chunks().load();
     const auto result = run_extern(
@@ -2968,8 +2966,8 @@ TEST_CASE("std beside median: the per-range moment pass skips nulls and merges r
 
     for (const char* key : {"g", "w"}) {
         INFO("by " << key);
-        auto program = parser::parse(std::string("t[select { m = median(v), s = std(v) }, by ") +
-                                     key + "];");
+        auto program =
+            parser::parse(std::string("t[select { m = median(v), s = std(v) }, by ") + key + "];");
         REQUIRE(program.has_value());
         auto ir = parser::lower(program.value());
         REQUIRE(ir.has_value());
@@ -2978,7 +2976,8 @@ TEST_CASE("std beside median: the per-range moment pass skips nulls and merges r
             runtime::ExecutionContext exec;
             exec.parallel_threads = threads;
             exec.parallel_min_rows = 0;
-            const auto out = runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, exec);
+            const auto out =
+                runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, exec);
             REQUIRE(out.has_value());
             REQUIRE(out->rows() == order.size());
             const auto* se = out->find_entry("s");
@@ -3133,7 +3132,8 @@ TEST_CASE("grouped top-k: partitioned flat heaps take each group's stable-sort r
             runtime::ExecutionContext exec;
             exec.parallel_threads = threads;
             exec.parallel_min_rows = 0;
-            const auto p = runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, exec);
+            const auto p =
+                runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, exec);
             REQUIRE(p.has_value());
             REQUIRE(p->rows() == want.size());
             const auto& pid = std::get<Column<std::int64_t>>(*p->find("id"));

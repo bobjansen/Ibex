@@ -737,9 +737,13 @@ TEST_CASE("merge_validity and Mask::apply_validity read sliced operands row by r
     const auto b = make_bitmap_pair(b_rows, 0);
     for (const auto* av : {&a.owned, &a.external}) {
         for (const auto* bv : {&b.owned, &b.external}) {
-            for (const auto [a_off, b_off, n] :
-                 {std::array<std::size_t, 3>{0, 0, kRows}, {0, 0, 200}, {1, 0, 190},
-                  {0, 63, 197}, {64, 64, 130}, {77, 3, 129}, {5, 5, 255}}) {
+            for (const auto [a_off, b_off, n] : {std::array<std::size_t, 3>{0, 0, kRows},
+                                                 {0, 0, 200},
+                                                 {1, 0, 190},
+                                                 {0, 63, 197},
+                                                 {64, 64, 130},
+                                                 {77, 3, 129},
+                                                 {5, 5, 255}}) {
                 INFO("a_off=" << a_off << " b_off=" << b_off << " n=" << n);
                 const auto merged_opt = runtime::merge_validity(av, a_off, bv, b_off, n);
                 REQUIRE(merged_opt.has_value());
@@ -853,9 +857,9 @@ TEST_CASE("index_contains finds a value at any block position", "[runtime][join]
         }
         INFO("n=" << n);
         CHECK_FALSE(runtime::index_contains(idx.data(), n, kNull));
-        for (const std::size_t at : {std::size_t{0}, std::size_t{1}, std::size_t{510},
-                                     std::size_t{511}, std::size_t{512}, std::size_t{1023},
-                                     std::size_t{1024}, n - 1}) {
+        for (const std::size_t at :
+             {std::size_t{0}, std::size_t{1}, std::size_t{510}, std::size_t{511}, std::size_t{512},
+              std::size_t{1023}, std::size_t{1024}, n - 1}) {
             if (n == 0 || at >= n) {
                 continue;
             }

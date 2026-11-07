@@ -78,9 +78,7 @@ static auto sha1(const std::uint8_t* data, std::size_t len) -> Sha1Digest {
     std::uint32_t h0 = 0x67452301u, h1 = 0xEFCDAB89u, h2 = 0x98BADCFEu, h3 = 0x10325476u,
                   h4 = 0xC3D2E1F0u;
 
-    auto rol32 = [](std::uint32_t v, int n) -> std::uint32_t {
-        return (v << n) | (v >> (32 - n));
-    };
+    auto rol32 = [](std::uint32_t v, int n) -> std::uint32_t { return (v << n) | (v >> (32 - n)); };
 
     std::vector<std::uint8_t> msg(data, data + len);
     msg.push_back(0x80u);

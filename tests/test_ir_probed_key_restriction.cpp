@@ -173,8 +173,7 @@ TEST_CASE("probed key restriction: a filter below a distinct probe still counts"
     filter->add_child(make_scan(ir::NodeId{3}, "facts"));
     auto distinct = std::make_unique<ir::DistinctNode>(ir::NodeId{5});
     distinct->add_child(std::move(filter));
-    auto root =
-        ir::restrict_aggregates_to_probed_keys(plan(ir::JoinKind::Inner, std::move(distinct)),
-                                               stats());
+    auto root = ir::restrict_aggregates_to_probed_keys(
+        plan(ir::JoinKind::Inner, std::move(distinct)), stats());
     CHECK(restriction_of(*root) != nullptr);
 }

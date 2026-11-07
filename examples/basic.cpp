@@ -38,7 +38,7 @@ auto main() -> int {
     project->add_child(std::move(filter));
 
     ibex::formatting::print("plan root: node id={}, kind={}\n", project->id().value,
-               static_cast<int>(project->kind()));
+                            static_cast<int>(project->kind()));
     ibex::formatting::print("plan has {} children\n", project->children().size());
 
     return 0;

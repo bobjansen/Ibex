@@ -1159,9 +1159,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         // ids) used to fold per row in the serial state loop -- the only
         // serial pass left there. With row_gid already needed, it folds per
         // row range after grouping instead, like cov/corr.
-        moment_after_grouping = !moment_aggs.empty() &&
-                                (!collect_aggs.empty() || !count_distinct_aggs.empty() ||
-                                 !paired_aggs.empty());
+        moment_after_grouping =
+            !moment_aggs.empty() &&
+            (!collect_aggs.empty() || !count_distinct_aggs.empty() || !paired_aggs.empty());
         if (!moment_after_grouping) {
             moment_aggs.clear();
         }

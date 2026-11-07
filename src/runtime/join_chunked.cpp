@@ -235,8 +235,8 @@ struct DenseRangeHeads {
     }
     void reserve(std::size_t /*n*/) {}
     auto try_emplace(std::int64_t key, std::size_t row) -> std::pair<std::size_t*, bool> {
-        std::size_t* slot = heads->data() + (static_cast<std::uint64_t>(key) -
-                                             static_cast<std::uint64_t>(lo));
+        std::size_t* slot =
+            heads->data() + (static_cast<std::uint64_t>(key) - static_cast<std::uint64_t>(lo));
         if (*slot == kJoinNil) {
             *slot = row;
             return {slot, true};

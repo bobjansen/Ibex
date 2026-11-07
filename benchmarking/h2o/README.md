@@ -125,9 +125,62 @@ fit on the dev box. Run it on AWS instead.
 Results go to `results/h2o_<stamp>_<T>t.tsv`, one row per (data, question,
 engine), with every timed sample kept.
 
-Historical TSVs below predate full-answer validation. They cannot be used as
-inputs to the current website generator without a new validated run; their
-original checksum passes are not upgraded retroactively.
+The AWS TSVs in the sections after the 2026-11-07 one predate full-answer
+validation. They cannot be used as inputs to the current website generator
+without a new validated run; their original checksum passes are not upgraded
+retroactively.
+
+## Results: 2026-11-07, local i7-13700, 1 and 8 threads, 1e7 rows
+
+Ibex `f0f08916`, Polars 2.0.0 (streaming), DuckDB 2.0.0, on the development
+box (i7-13700 at a fixed 3.2 GHz). Eight threads ran on CPUs 0,2,…,14, one
+logical CPU per performance core, and one thread on CPU 2; every engine was
+pinned to the same CPUs. All 110 (data, question, thread-count) comparisons
+passed full answer validation (`h2o-answers-v2`) with all three engines. The
+results are `results/h2o_20261107_local_{8t,1t}.tsv` and their
+`.tsv.checks.json` sidecars (run ids `ef850cec…` and `4ae95d27…`). This
+is a local survey, not the website snapshot: the box, CPU and DuckDB version
+differ from the AWS run below, which the website still shows.
+
+Loading is excluded, each question fully materialises its result, with 1
+warmup and 5 timed iterations, and the ratios use the minimum times. Below 1
+means Ibex is faster.
+
+| data | threads | ibex/polars geomean | ibex/polars total | ibex/duckdb geomean | ibex/duckdb total |
+|---|---:|---:|---:|---:|---:|
+| J1_1e7_NA_0_0 (join) | 1 | 0.61 | 0.52 | 0.14 | 0.16 |
+| G1_1e7_1e2_0_0 | 1 | 0.46 | 0.62 | 0.48 | 0.52 |
+| G1_1e7_1e2_5_0 (NAs) | 1 | 0.49 | 0.58 | 0.60 | 0.58 |
+| G1_1e7_1e2_0_1 (sorted) | 1 | 0.49 | 0.62 | 0.52 | 0.51 |
+| G1_1e7_1e1_0_0 | 1 | 0.43 | 0.59 | 0.53 | 0.65 |
+| G1_1e7_2e0_0_0 | 1 | 0.48 | 0.47 | 0.60 | 0.77 |
+| J1_1e7_NA_0_0 (join) | 8 | 0.96 | 0.88 | 0.32 | 0.39 |
+| G1_1e7_1e2_0_0 | 8 | 0.61 | 0.65 | 0.71 | 0.78 |
+| G1_1e7_1e2_5_0 (NAs) | 8 | 0.64 | 0.66 | 0.80 | 0.80 |
+| G1_1e7_1e2_0_1 (sorted) | 8 | 0.61 | 0.63 | 0.71 | 0.78 |
+| G1_1e7_1e1_0_0 | 8 | 0.64 | 0.39 | 0.69 | 0.84 |
+| G1_1e7_2e0_0_0 | 8 | 0.68 | 0.25 | 0.98 | 1.32 |
+
+- **1 thread:** Ibex leads both engines on every dataset by both summaries.
+  The only question it loses is q8 against DuckDB (1.85–2.10×).
+- **8 threads:** Ibex leads Polars on every dataset by both summaries, and
+  DuckDB on every dataset except K=2's total. That total is q8: per-group
+  top-2 takes 754 / 4546 / 168 ms (Ibex / Polars / DuckDB) at K=2 and 333 /
+  1374 / 135 ms at K=10; q8 loses to DuckDB on every dataset (1.30–4.49×)
+  while beating Polars 2.6–5.9×.
+- **Close to Polars at 8 threads:** q10 (six keys, ~1e7 groups) 1.02–1.14×
+  on four datasets and 0.96× sorted; q5 at K=10 1.02×. K=2 q9 (corr by two
+  keys, 4 groups, ~16 ms) read 1.62×; it is the noisiest cell (an earlier
+  15-iteration re-run gave 17.2 vs 16.1 ms min, 25 vs 17 ms median).
+- **Changes since the AWS run below** (2026-11-07): nullable Categorical keys
+  stay on the dense code paths (`56ac685b`, `059b7e67`; the harness has
+  loaded empty fields as null keys since `da68fd4b`, which had pushed the NA
+  dataset's 8-thread ratio to 1.49), `std()` beside a median folds per row
+  range (`a4b4834c`, q6), a dense Int join key builds a direct-address table
+  (`7e4927ba`, join q5 311 → ~170 ms), parallel new-group null masks
+  (`2d6d11d8`), dense Int64 numbering across workers for up to 16M ids
+  (`372973d3`, `7cf0ea7a`, q5) and kept packed keys in partitioned discovery
+  (`f0f08916`, q10).
 
 ## Results: 2026-10-16, AWS r7i.4xlarge, 1 and 8 physical cores, 1e7 rows
 

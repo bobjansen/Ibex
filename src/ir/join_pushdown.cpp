@@ -395,15 +395,36 @@ auto rewrite_filter_over_join(NodePtr node, const SourceSchemas& sources) -> Nod
         if (parts.empty()) {
             return child;
         }
-        const bool child_is_join = child->kind() == NodeKind::Join;
+        // A projection chain over a join: the filter goes below it, onto the
+        // join. Filter and Project commute -- the parts read only columns the
+        // projection keeps (that is how `classify` placed them), so those
+        // columns exist below it too. A frontend that prunes after every join
+        // (the Polars adapter's `[select ...]`) otherwise stopped each pushed
+        // conjunct one join early: PDS-H q07's shipdate range never reached
+        // lineitem, so its join emitted 4.8M rows instead of 1.5M.
+        NodePtr* slot = &child;
+        while ((*slot)->kind() == NodeKind::Project && (*slot)->children().size() == 1 &&
+               (*slot)->children().front() != nullptr) {
+            NodePtr* below = &(*slot)->mutable_children().front();
+            if ((*below)->kind() != NodeKind::Project && (*below)->kind() != NodeKind::Join) {
+                break;
+            }
+            slot = below;
+        }
+        if ((*slot)->kind() == NodeKind::Project) {
+            slot = &child;  // the chain does not end at a join: stay on top
+        }
+        const bool target_is_join = (*slot)->kind() == NodeKind::Join;
         auto pushed = std::make_unique<FilterNode>(fresh_id(), and_combine(std::move(parts)));
-        pushed->add_child(std::move(child));
-        if (child_is_join) {
+        pushed->add_child(std::move(*slot));
+        if (target_is_join) {
             // The receiving side is itself a join: push through it too. Each
             // conjunct only ever moves downward, so this terminates.
-            return rewrite_filter_over_join(std::move(pushed), sources);
+            *slot = rewrite_filter_over_join(std::move(pushed), sources);
+        } else {
+            *slot = std::move(pushed);
         }
-        return pushed;
+        return child;
     };
     join_owned->add_child(wrap(std::move(left_child), std::move(left_parts)));
     join_owned->add_child(wrap(std::move(right_child), std::move(right_parts)));

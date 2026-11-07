@@ -336,6 +336,41 @@ TEST_CASE("join pushdown: filter over nested joins pushes through both levels",
     REQUIRE(scan_name(*inner_join.children()[0]) == "a");
 }
 
+TEST_CASE("join pushdown: a filter crosses projections to reach a nested join",
+          "[ir][join_pushdown]") {
+    // Filter(ax==1, Join(Project(Project(Join(a, b))), c)) -- the shape a
+    // frontend that prunes after every join builds (the Polars adapter's
+    // `[select ...]`). The conjunct must reach `a`, not stop above the
+    // projections one join early.
+    ir::SourceSchemas sources = test_sources();
+    sources.insert_or_assign(
+        "c", ir::SchemaInfo::known({{.name = "k", .type = ir::ColumnType::Int64},
+                                    {.name = "cx", .type = ir::ColumnType::Int64}}));
+    const auto project = [](ir::NodeId id, ir::NodePtr child) {
+        auto node = std::make_unique<ir::ProjectNode>(
+            id, std::vector<ir::ColumnRef>{ir::ColumnRef{.name = "k"}, ir::ColumnRef{.name = "ax"},
+                                           ir::ColumnRef{.name = "bx"}});
+        node->add_child(std::move(child));
+        return node;
+    };
+    auto inner =
+        make_join({2}, ir::JoinKind::Inner, {"k"}, make_scan({3}, "a"), make_scan({4}, "b"));
+    auto pruned = project({8}, project({7}, std::move(inner)));
+    auto outer = make_join({5}, ir::JoinKind::Inner, {"k"}, std::move(pruned), make_scan({6}, "c"));
+    auto out = ir::push_filters_into_joins(
+        make_filter({1}, eq(col("ax"), lit(1)), std::move(outer)), sources);
+    REQUIRE(out->kind() == ir::NodeKind::Join);
+    const ir::Node* side = out->children()[0].get();
+    REQUIRE(side->kind() == ir::NodeKind::Project);
+    side = side->children()[0].get();
+    REQUIRE(side->kind() == ir::NodeKind::Project);
+    const auto& inner_join = *side->children()[0];
+    REQUIRE(inner_join.kind() == ir::NodeKind::Join);
+    REQUIRE(inner_join.children()[0]->kind() == ir::NodeKind::Filter);
+    CHECK(scan_name(*inner_join.children()[0]) == "a");
+    CHECK(inner_join.children()[1]->kind() == ir::NodeKind::Scan);
+}
+
 TEST_CASE("join pushdown: schema flows through a Project side", "[ir][join_pushdown]") {
     // Left side is Project{k, ax}(Scan a) — its schema is Known even without a
     // source schema; refs to the projected-away `shared` cannot push left.

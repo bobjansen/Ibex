@@ -6584,58 +6584,59 @@ class HashAggregateState final {
                    plan_[a].func != ir::AggFunc::CountDistinct;
         };
 
+        // One block per morsel: its rows' gids and aggregate values gathered
+        // once, grouped by owning range (`start`), so the owner of range r
+        // accumulates [start[r], start[r+1]) of every block. One gather per
+        // aggregate per morsel: at 5e6 groups a block per (morsel, range) was
+        // ~1000 allocations of ~270 rows for every 64k-row morsel.
         struct Block {
+            std::vector<std::size_t> start;
             std::vector<std::uint32_t> gids;
             std::vector<ColumnEntry> values;  // per aggregate; unset when not gathered
         };
         for (std::size_t w0 = 0; w0 < rows; w0 += kWindowRows) {
             const std::size_t w1 = std::min(rows, w0 + kWindowRows);
             const std::size_t n_morsels = (w1 - w0 + kMorselRows - 1) / kMorselRows;
-            std::vector<Block> blocks(n_morsels * n_ranges);
+            std::vector<Block> blocks(n_morsels);
             fan(n_morsels, [&](std::size_t m) {
                 const std::size_t begin = w0 + (m * kMorselRows);
                 const std::size_t end = std::min(w1, begin + kMorselRows);
-                std::vector<std::size_t> start(n_ranges + 1, 0);
+                Block& block = blocks[m];
+                std::vector<std::size_t>& start = block.start;
+                start.assign(n_ranges + 1, 0);
                 for (std::size_t row = begin; row < end; ++row) {
                     ++start[(gids[row] >> shift) + 1];
                 }
                 for (std::size_t r = 0; r < n_ranges; ++r) {
                     start[r + 1] += start[r];
                 }
-                std::vector<std::size_t> idx(end - begin);
+                const std::size_t n = end - begin;
+                std::vector<std::size_t> idx(n);
                 std::vector<std::size_t> fill(start.begin(), start.end() - 1);
                 for (std::size_t row = begin; row < end; ++row) {
                     idx[fill[gids[row] >> shift]++] = row;
                 }
-                for (std::size_t r = 0; r < n_ranges; ++r) {
-                    const std::size_t n = start[r + 1] - start[r];
-                    if (n == 0) {
+                block.gids.resize(n);
+                for (std::size_t i = 0; i < n; ++i) {
+                    block.gids[i] = gids[idx[i]];
+                }
+                block.values.resize(n_aggs_);
+                for (std::size_t a = 0; a < n_aggs_; ++a) {
+                    if (!gathers(a)) {
                         continue;
                     }
-                    const std::size_t* at = idx.data() + start[r];
-                    Block& block = blocks[(m * n_ranges) + r];
-                    block.gids.resize(n);
-                    for (std::size_t i = 0; i < n; ++i) {
-                        block.gids[i] = gids[at[i]];
-                    }
-                    block.values.resize(n_aggs_);
-                    for (std::size_t a = 0; a < n_aggs_; ++a) {
-                        if (!gathers(a)) {
-                            continue;
-                        }
-                        // `at` holds real rows only: no sentinel to scan for.
-                        auto [column, validity] =
-                            gather_entry_with_nulls(*agg_entries[a], at, n, std::nullopt);
-                        block.values[a].column = std::make_shared<ColumnValue>(std::move(column));
-                        block.values[a].validity = std::move(validity);
-                    }
+                    // `idx` holds real rows only: no sentinel to scan for.
+                    auto [column, validity] =
+                        gather_entry_with_nulls(*agg_entries[a], idx.data(), n, std::nullopt);
+                    block.values[a].column = std::make_shared<ColumnValue>(std::move(column));
+                    block.values[a].validity = std::move(validity);
                 }
             });
             fan(n_ranges, [&](std::size_t r) {
                 std::vector<const ColumnEntry*> entries(agg_entries);
                 for (std::size_t m = 0; m < n_morsels; ++m) {
-                    Block& block = blocks[(m * n_ranges) + r];
-                    if (block.gids.empty()) {
+                    const Block& block = blocks[m];
+                    if (block.start[r] == block.start[r + 1]) {
                         continue;
                     }
                     for (std::size_t a = 0; a < n_aggs_; ++a) {
@@ -6643,9 +6644,9 @@ class HashAggregateState final {
                             entries[a] = &block.values[a];
                         }
                     }
-                    accumulate_columns_into(block.gids.data(), entries, 0, block.gids.size(),
-                                            flat_slots_.data(), scratch_.data(), skip);
-                    block = {};
+                    accumulate_columns_into(block.gids.data(), entries, block.start[r],
+                                            block.start[r + 1], flat_slots_.data(), scratch_.data(),
+                                            skip);
                 }
             });
         }

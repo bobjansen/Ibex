@@ -4039,12 +4039,14 @@ class HashAggregateState final {
     /// Returns false when the key's span is too wide, leaving the caller on
     /// its hash paths.
     ///
-    /// It starts only on the first chunk, and only when the span is at most a
-    /// quarter of the rows: the array is then denser than the data, and the
+    /// It starts only on the first chunk, and only when the span is at most
+    /// a quarter of the rows -- half (`kIntDenseRowsPerCell`) in a chunk big
+    /// enough to number its gids across workers: the array is then denser
+    /// than the data, and the
     /// hash paths it displaces (async hot sum, owned and partitioned
     /// discovery) all assume they start from no groups. Later chunks widen
     /// the bounds the way the pair path does -- rebuild from `int_order_`,
-    /// gids unchanged -- up to `kDenseCellLimit`. Past that it retires for
+    /// gids unchanged -- up to `kIntDenseCellLimit`. Past that it retires for
     /// good: partitioned discovery seeds from `int_order_` and the serial loop
     /// rebuilds `int_index_` from it (`int_serial_groups_` no longer matches),
     /// and neither may be followed by this path again, since it would not see
@@ -4135,8 +4137,13 @@ class HashAggregateState final {
         // whole int64 range wraps to 0 and is rejected with the rest.
         const std::uint64_t span =
             static_cast<std::uint64_t>(hi) - static_cast<std::uint64_t>(lo) + 1;
-        const bool fits = span != 0 && span <= kDenseCellLimit &&
-                          (int_dense_active_ || span * kIntDenseRowsPerCell <= rows);
+        // Two rows a cell only where the gids are numbered across workers
+        // (`try_assign_dense_gids_parallel`'s 2^20 rows): smaller chunks keep
+        // four, and the streamed and partitioned paths built for them.
+        const std::uint64_t rows_per_cell =
+            rows >= kParallelDenseGidRows ? kIntDenseRowsPerCell : 4;
+        const bool fits = span != 0 && span <= kIntDenseCellLimit &&
+                          (int_dense_active_ || span * rows_per_cell <= rows);
         if (!fits) {
             int_dense_retired_ = true;
             return false;
@@ -4202,16 +4209,17 @@ class HashAggregateState final {
 
         gids_buf_.resize(rows);
         auto* gids = gids_buf_.data();
-        const auto record = [&](std::size_t cell, std::uint32_t gid) {
+        const auto grow = [&](std::size_t k) { int_order_.resize(int_order_.size() + k); };
+        const auto record_at = [&](std::size_t cell, std::uint32_t gid) {
             if (cell == null_cell) {
-                int_null_gid_ = gid;
-                int_order_.push_back(0);
+                int_null_gid_ = gid;  // one cell, so one writer
+                int_order_[gid] = 0;
             } else {
-                int_order_.push_back(lo + static_cast<std::int64_t>(cell));
+                int_order_[gid] = lo + static_cast<std::int64_t>(cell);
             }
         };
         if (try_assign_dense_gids_parallel(rows, n_cells + 1, int_dense_gid_.data(), cell_of,
-                                           record, gids)) {
+                                           grow, record_at, gids)) {
             publish_discovered(agg_entries, rows);
             return true;
         }
@@ -4232,22 +4240,24 @@ class HashAggregateState final {
     /// for when there are too many cells for the fused per-morsel partials
     /// (h2o q5's ~1e6 int ids, q3's ~1e6 Categorical codes): serially that
     /// probe was the whole of Discovery, on one core. `cell_at(row)` is the
-    /// row's cell in [0, n_cells); a new cell becomes the next gid, and
-    /// `record(cell, gid)` stores its key.
+    /// row's cell in [0, n_cells); a new cell becomes the next gid.
+    /// `grow(k)` sizes the caller's per-group key store for `k` more groups,
+    /// then `record(cell, gid)` stores each new group's key at `gid` --
+    /// concurrently, from several workers, each with distinct gids.
     ///
     /// Groups are still created in first-row order, so the gids are the
     /// serial loop's. Workers first record each new cell's first row (an
     /// atomic minimum; the cells are parked in `gids`), then each row range
-    /// lists, in row order, the cells whose first row it holds. Walking the
-    /// ranges in order numbers the groups, whose slots are grown once; then
-    /// the workers fill `gids`.
-    template <typename CellAt, typename Record>
+    /// lists, in row order, the cells whose first row it holds. The ranges'
+    /// counts give each its first gid, so the ranges number their own cells
+    /// at once -- serially, numbering h2o q5's 5e6 ids was most of Discovery;
+    /// then the workers fill `gids`.
+    template <typename CellAt, typename Grow, typename Record>
     auto try_assign_dense_gids_parallel(std::size_t rows, std::size_t n_cells, std::uint32_t* dense,
-                                        const CellAt& cell_at, const Record& record,
-                                        std::uint32_t* gids) -> bool {
-        constexpr std::size_t kMinRows = std::size_t{1} << 20;
+                                        const CellAt& cell_at, const Grow& grow,
+                                        const Record& record, std::uint32_t* gids) -> bool {
         constexpr std::uint32_t kUnseen = std::numeric_limits<std::uint32_t>::max();
-        if (rows < kMinRows || rows >= kUnseen || exec_ == nullptr ||
+        if (rows < kParallelDenseGidRows || rows >= kUnseen || exec_ == nullptr ||
             par_.accumulation.decline != physical::FanOutDecline::None ||
             par_.accumulation.worker_cap < 2 || on_worker_pool_thread() ||
             std::getenv("IBEX_DISABLE_PARALLEL_DENSE_GIDS") != nullptr) {
@@ -4269,12 +4279,15 @@ class HashAggregateState final {
             batch.wait();
         };
 
+        // With no group yet every cell is new, so neither pass reads `dense`:
+        // at h2o q5's 5e6 ids it and `first` are 20 MB each, past L3 together.
+        const bool all_new = n_groups_ == 0;
         std::vector<std::uint32_t> first(n_cells, kUnseen);
         fan([&](std::size_t, std::size_t begin, std::size_t end) {
             for (std::size_t row = begin; row < end; ++row) {
                 const auto cell = static_cast<std::uint32_t>(cell_at(row));
                 gids[row] = cell;
-                if (dense[cell] != kNoGid) {
+                if (!all_new && dense[cell] != kNoGid) {
                     continue;
                 }
                 atomic_store_min(first[cell], static_cast<std::uint32_t>(row));
@@ -4284,21 +4297,27 @@ class HashAggregateState final {
         fan([&](std::size_t r, std::size_t begin, std::size_t end) {
             for (std::size_t row = begin; row < end; ++row) {
                 const std::uint32_t cell = gids[row];
-                if (dense[cell] == kNoGid && first[cell] == row) {
+                if (first[cell] == row && (all_new || dense[cell] == kNoGid)) {
                     fresh[r].push_back(cell);
                 }
             }
         });
-        auto gid = static_cast<std::uint32_t>(n_groups_);
-        for (const auto& cells : fresh) {
-            for (const std::uint32_t cell : cells) {
-                dense[cell] = gid;
-                record(cell, gid);
-                ++gid;
-            }
+        std::vector<std::size_t> first_gid(n_ranges + 1, n_groups_);
+        for (std::size_t r = 0; r < n_ranges; ++r) {
+            first_gid[r + 1] = first_gid[r] + fresh[r].size();
         }
-        if (gid != n_groups_) {
-            n_groups_ = gid;
+        const std::size_t added = first_gid[n_ranges] - n_groups_;
+        if (added != 0) {
+            grow(added);
+            fan([&](std::size_t r, std::size_t, std::size_t) {
+                auto gid = static_cast<std::uint32_t>(first_gid[r]);
+                for (const std::uint32_t cell : fresh[r]) {
+                    dense[cell] = gid;
+                    record(cell, gid);
+                    ++gid;
+                }
+            });
+            n_groups_ = first_gid[n_ranges];
             size_group_arrays();
         }
         fan([&](std::size_t, std::size_t begin, std::size_t end) {
@@ -5707,8 +5726,9 @@ class HashAggregateState final {
             const bool parallel = try_assign_dense_gids_parallel(
                 rows, dict_size, dense,
                 [codes](std::size_t row) { return static_cast<std::size_t>(codes[row]); },
-                [&](std::size_t code, std::uint32_t) {
-                    cat_order_.push_back(static_cast<Column<Categorical>::code_type>(code));
+                [&](std::size_t k) { cat_order_.resize(cat_order_.size() + k); },
+                [&](std::size_t code, std::uint32_t gid) {
+                    cat_order_[gid] = static_cast<Column<Categorical>::code_type>(code);
                 },
                 gids);
             for (std::size_t row = 0; !parallel && row < rows; ++row) {
@@ -7513,8 +7533,17 @@ class HashAggregateState final {
         }
         gids_buf_.resize(rows);
         auto* gids = gids_buf_.data();
-        if (!try_assign_dense_gids_parallel(rows, n_cells, cat_dense_gid_.data(), cell_of, record,
-                                            gids)) {
+        const auto grow = [&](std::size_t k) { cat_order_.resize(cat_order_.size() + k); };
+        const auto record_at = [&](std::size_t cell, std::uint32_t gid) {
+            if (cell == null_cell) {
+                cat_null_gid_ = gid;  // one cell, so one writer
+                cat_order_[gid] = 0;
+            } else {
+                cat_order_[gid] = static_cast<Column<Categorical>::code_type>(cell);
+            }
+        };
+        if (!try_assign_dense_gids_parallel(rows, n_cells, cat_dense_gid_.data(), cell_of, grow,
+                                            record_at, gids)) {
             std::uint32_t* dense = cat_dense_gid_.data();
             for (std::size_t row = 0; row < rows; ++row) {
                 const std::size_t cell = cell_of(row);
@@ -8780,7 +8809,15 @@ class HashAggregateState final {
 
     // Single-integer dense path (`try_process_rows_int_dense`): `key - min`
     // indexes `int_dense_gid_`; `int_order_` stays the key of each group.
-    static constexpr std::uint64_t kIntDenseRowsPerCell = 4;
+    static constexpr std::uint64_t kIntDenseRowsPerCell = 2;
+    /// Rows below which `try_assign_dense_gids_parallel` declines.
+    static constexpr std::size_t kParallelDenseGidRows = std::size_t{1} << 20;
+    /// The single-int dense path's own bound. Its cells are a u32 gid each
+    /// (plus a u32 first row while numbering), and at two rows a cell that is
+    /// at most 4 bytes per row; h2o q5 at K=2 is 5e6 ids over 1e7 rows, and
+    /// numbered densely across workers it beat the hash discovery 58 -> 104
+    /// ms. The Categorical paths keep `kDenseCellLimit`.
+    static constexpr std::uint64_t kIntDenseCellLimit = 16'000'000ULL;
     bool int_dense_active_ = false;
     bool int_dense_retired_ = false;
     std::int64_t int_dense_min_ = 0;

@@ -3402,12 +3402,16 @@ TEST_CASE("chunked aggregate: parallel dense gid numbering keeps first-seen orde
     // are now numbered across workers; the groups must still come out in
     // first-seen order, which is checked against a reference here, and equal
     // the serial numbering, for an Int64 key with and without nulls (the null
-    // cell) and a Categorical key.
-    constexpr std::size_t kRows = (std::size_t{1} << 20) + 4'321;
+    // cell) and a Categorical key. The second half of the rows draws from
+    // twice the keys, so in 1.05M-row chunks the second chunk numbers new
+    // groups across workers on top of existing ones, past the first chunk's
+    // key range.
+    constexpr std::size_t kRows = (std::size_t{1} << 21) + 4'321;
     constexpr std::int64_t kGroups = 150'001;
+    constexpr std::int64_t kAllGroups = (2 * kGroups) + 1;
     std::vector<std::string> labels;
-    labels.reserve(static_cast<std::size_t>(kGroups));
-    for (std::int64_t i = 0; i < kGroups; ++i) {
+    labels.reserve(static_cast<std::size_t>(kAllGroups));
+    for (std::int64_t i = 0; i < kAllGroups; ++i) {
         labels.push_back("k" + std::to_string(i));
     }
     Column<std::int64_t> g;
@@ -3416,7 +3420,9 @@ TEST_CASE("chunked aggregate: parallel dense gid numbering keeps first-seen orde
     Column<std::int64_t> v;
     std::vector<std::int64_t> key_of_row(kRows);
     for (std::size_t row = 0; row < kRows; ++row) {
-        const auto key = static_cast<std::int64_t>((row * 2'654'435'761ULL) % kGroups);
+        const auto key = static_cast<std::int64_t>(
+            (row * 2'654'435'761ULL) %
+            static_cast<std::uint64_t>(row < kRows / 2 ? kGroups : kAllGroups));
         key_of_row[row] = key;
         g.push_back(key);
         g_valid.push_back(row % 17 != 5);
@@ -3436,10 +3442,10 @@ TEST_CASE("chunked aggregate: parallel dense gid numbering keeps first-seen orde
         // First-seen order of the keys; -1 stands for the null group.
         std::vector<std::int64_t> order;
         {
-            std::vector<std::uint8_t> seen(static_cast<std::size_t>(kGroups) + 1, 0);
+            std::vector<std::uint8_t> seen(static_cast<std::size_t>(kAllGroups) + 1, 0);
             for (std::size_t row = 0; row < kRows; ++row) {
                 const bool null = key == "gn" && row % 17 == 5;
-                const std::size_t slot = null ? static_cast<std::size_t>(kGroups)
+                const std::size_t slot = null ? static_cast<std::size_t>(kAllGroups)
                                               : static_cast<std::size_t>(key_of_row[row]);
                 if (seen[slot] == 0U) {
                     seen[slot] = 1U;
@@ -3451,39 +3457,46 @@ TEST_CASE("chunked aggregate: parallel dense gid numbering keeps first-seen orde
         REQUIRE(program.has_value());
         auto ir = parser::lower(program.value());
         REQUIRE(ir.has_value());
-        const auto run = [&](bool parallel_gids) {
-            if (!parallel_gids) {
-                runtime::set_env("IBEX_DISABLE_PARALLEL_DENSE_GIDS", "1");
+        for (const bool chunked : {false, true}) {
+            INFO("chunked: " << chunked);
+            std::optional<ChunkGrainGuard> guard;
+            if (chunked) {
+                guard.emplace("1050000");
             }
-            runtime::ExecutionContext parallel;
-            parallel.parallel_threads = 8;
-            parallel.parallel_min_rows = 0;
-            auto out =
-                runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
-            runtime::unset_env("IBEX_DISABLE_PARALLEL_DENSE_GIDS");
-            return out;
-        };
-        const auto serial = run(false);
-        const auto fanned = run(true);
-        REQUIRE(serial.has_value());
-        REQUIRE(fanned.has_value());
-        const auto mismatch = runtime::compare_tables(*serial, *fanned);
-        INFO((mismatch.has_value() ? mismatch->message() : std::string{}));
-        REQUIRE_FALSE(mismatch.has_value());
+            const auto run = [&](bool parallel_gids) {
+                if (!parallel_gids) {
+                    runtime::set_env("IBEX_DISABLE_PARALLEL_DENSE_GIDS", "1");
+                }
+                runtime::ExecutionContext parallel;
+                parallel.parallel_threads = 8;
+                parallel.parallel_min_rows = 0;
+                auto out =
+                    runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+                runtime::unset_env("IBEX_DISABLE_PARALLEL_DENSE_GIDS");
+                return out;
+            };
+            const auto serial = run(false);
+            const auto fanned = run(true);
+            REQUIRE(serial.has_value());
+            REQUIRE(fanned.has_value());
+            const auto mismatch = runtime::compare_tables(*serial, *fanned);
+            INFO((mismatch.has_value() ? mismatch->message() : std::string{}));
+            REQUIRE_FALSE(mismatch.has_value());
 
-        REQUIRE(fanned->rows() == order.size());
-        const auto* entry = fanned->find_entry(key);
-        REQUIRE(entry != nullptr);
-        for (std::size_t i = 0; i < order.size(); ++i) {
-            INFO("group " << i);
-            if (order[i] < 0) {
-                REQUIRE(runtime::is_null(*entry, i));
-            } else if (key == "c") {
-                REQUIRE(std::string(std::get<Column<Categorical>>(*entry->column)[i]) ==
-                        labels[static_cast<std::size_t>(order[i])]);
-            } else {
-                REQUIRE_FALSE(runtime::is_null(*entry, i));
-                REQUIRE(std::get<Column<std::int64_t>>(*entry->column)[i] == order[i]);
+            REQUIRE(fanned->rows() == order.size());
+            const auto* entry = fanned->find_entry(key);
+            REQUIRE(entry != nullptr);
+            for (std::size_t i = 0; i < order.size(); ++i) {
+                INFO("group " << i);
+                if (order[i] < 0) {
+                    REQUIRE(runtime::is_null(*entry, i));
+                } else if (key == "c") {
+                    REQUIRE(std::string(std::get<Column<Categorical>>(*entry->column)[i]) ==
+                            labels[static_cast<std::size_t>(order[i])]);
+                } else {
+                    REQUIRE_FALSE(runtime::is_null(*entry, i));
+                    REQUIRE(std::get<Column<std::int64_t>>(*entry->column)[i] == order[i]);
+                }
             }
         }
     }

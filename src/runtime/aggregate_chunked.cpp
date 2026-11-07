@@ -4653,6 +4653,22 @@ class HashAggregateState final {
         const std::size_t grain = (rows + ranges - 1) / ranges;
         part_of_row_.resize(rows);
         std::vector<std::size_t> counts(ranges * part_count, 0);
+        using Probe = std::decay_t<decltype(key_at(std::size_t{0}))>;
+        constexpr bool kScatterViews = std::is_same_v<Probe, std::string_view>;
+        // Any small plain probe key travels the same way: a packed key built
+        // from six columns at a sparse row was six cache misses per probe
+        // (h2o q10). The generic path's probe is a fat handle; it does not.
+        constexpr bool kScatterKeys = std::is_trivially_copyable_v<Probe> && sizeof(Probe) <= 32;
+        // Such a key is built once, here, and kept in row order for the
+        // scatter: building it again there re-read every key column -- six at
+        // h2o q10, ~360 MB a pass over 1e7 rows -- where this reads 8 bytes a
+        // row.
+        constexpr bool kKeepKeys = kScatterKeys && sizeof(Probe) <= 8;
+        // NOLINTNEXTLINE(misc-const-correctness) -- written when kKeepKeys, below
+        ::ibex::detail::NoInitVector<Probe> row_keys;
+        if constexpr (kKeepKeys) {
+            row_keys.resize(rows);
+        }
         {
             auto batch = pool.submit(ranges, [&](std::size_t r) {
                 const std::size_t begin = r * grain;
@@ -4660,7 +4676,11 @@ class HashAggregateState final {
                 std::size_t* row_counts = counts.data() + (r * part_count);
                 Hash hasher;
                 for (std::size_t row = begin; row < end; ++row) {
-                    const auto part = static_cast<std::uint8_t>(hasher(key_at(row)) & part_mask);
+                    const auto key = key_at(row);
+                    if constexpr (kKeepKeys) {
+                        row_keys[row] = key;
+                    }
+                    const auto part = static_cast<std::uint8_t>(hasher(key) & part_mask);
                     part_of_row_[row] = part;
                     ++row_counts[part];
                 }
@@ -4690,12 +4710,6 @@ class HashAggregateState final {
         // order, it costs a sequential pass, where the probe below would
         // otherwise miss on the offsets before it could even prefetch the
         // bytes.
-        using Probe = std::decay_t<decltype(key_at(std::size_t{0}))>;
-        constexpr bool kScatterViews = std::is_same_v<Probe, std::string_view>;
-        // Any small plain probe key travels the same way: a packed key built
-        // from six columns at a sparse row was six cache misses per probe
-        // (h2o q10). The generic path's probe is a fat handle; it does not.
-        constexpr bool kScatterKeys = std::is_trivially_copyable_v<Probe> && sizeof(Probe) <= 32;
         // NOLINTNEXTLINE(misc-const-correctness) -- written when kScatterKeys, below
         ::ibex::detail::NoInitVector<Probe> scattered_keys;
         scatter_rows_.resize(rows);
@@ -4710,7 +4724,9 @@ class HashAggregateState final {
                 for (std::size_t row = begin; row < end; ++row) {
                     const std::size_t at = cursor[part_of_row_[row]]++;
                     scatter_rows_[at] = row;
-                    if constexpr (kScatterKeys) {
+                    if constexpr (kKeepKeys) {
+                        scattered_keys[at] = row_keys[row];
+                    } else if constexpr (kScatterKeys) {
                         scattered_keys[at] = key_at(row);
                     }
                 }

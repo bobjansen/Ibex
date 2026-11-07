@@ -20,6 +20,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <expected>
 #include <functional>
 #include <limits>
@@ -889,6 +890,114 @@ class ChunkedOrderedLimitOperator final : public Operator {
         return keep_mode_ == KeepMode::First ? lhs_first : !lhs_first;
     }
 
+    static constexpr std::uint32_t kPodNoGid = std::numeric_limits<std::uint32_t>::max();
+
+    /// Decide, for a chunk, whether its single partition finds groups by
+    /// `key - lo` (`pod_dense_`). On one thread the probe was the whole of
+    /// h2o q8 -- a hash-map lookup per row, most rows then rejected by one
+    /// comparison with the group's worst kept entry -- and `id6`'s values
+    /// fill their range. Only the first chunk may start it, since the map
+    /// would not know its groups; a later chunk that widens the range
+    /// rebuilds the array, and one that widens it too far moves the groups
+    /// into `int_index` for good.
+    template <typename K, typename IntKey>
+    void prepare_pod_dense(PodPartition<K>& part, const KeyCol& key0, const IntKey& int_key,
+                           std::size_t rows) {
+        constexpr std::uint64_t kMaxCells = std::uint64_t{1} << 26;
+        if (pod_dense_retired_ || (!pod_dense_ && !part.sizes.empty()) ||
+            std::getenv("IBEX_DISABLE_DENSE_TOPK_KEY") != nullptr) {
+            pod_dense_retired_ = true;
+            return;
+        }
+        std::int64_t lo = std::numeric_limits<std::int64_t>::max();
+        std::int64_t hi = std::numeric_limits<std::int64_t>::min();
+        for (std::size_t row = 0; row < rows; ++row) {
+            if (!key0.is_null(row)) {
+                const std::int64_t v = int_key(row);
+                lo = std::min(lo, v);
+                hi = std::max(hi, v);
+            }
+        }
+        if (lo > hi) {
+            return;  // every key null: nothing to place yet
+        }
+        if (pod_dense_cells_are_gids_) {
+            const std::int64_t old_hi = pod_dense_lo_ + static_cast<std::int64_t>(pod_dense_cells_) - 1;
+            if (lo >= pod_dense_lo_ && hi <= old_hi) {
+                return;
+            }
+            // The cells cannot move, so the groups move into the map, keeping
+            // their ids; a cell no row reached stays an empty group.
+            for (std::size_t cell = 0; cell < pod_dense_cells_; ++cell) {
+                if (part.sizes[cell] != 0) {
+                    part.int_index.emplace(pod_dense_lo_ + static_cast<std::int64_t>(cell),
+                                           static_cast<std::uint32_t>(cell));
+                }
+            }
+            pod_dense_ = false;
+            pod_dense_cells_are_gids_ = false;
+            pod_dense_retired_ = true;
+            return;
+        }
+        if (pod_dense_) {
+            const std::int64_t old_hi =
+                pod_dense_lo_ + static_cast<std::int64_t>(pod_dense_gid_.size()) - 1;
+            lo = std::min(lo, pod_dense_lo_);
+            hi = std::max(hi, old_hi);
+        }
+        const std::uint64_t span = static_cast<std::uint64_t>(hi) - static_cast<std::uint64_t>(lo) + 1;
+        const bool fits = span != 0 && span <= kMaxCells &&
+                          (pod_dense_ || span <= (std::uint64_t{4} * rows) + 1024);
+        if (!fits) {
+            if (pod_dense_) {
+                for (std::size_t cell = 0; cell < pod_dense_gid_.size(); ++cell) {
+                    if (pod_dense_gid_[cell] != kPodNoGid) {
+                        part.int_index.emplace(pod_dense_lo_ + static_cast<std::int64_t>(cell),
+                                               pod_dense_gid_[cell]);
+                    }
+                }
+                std::vector<std::uint32_t>().swap(pod_dense_gid_);
+                pod_dense_ = false;
+            }
+            pod_dense_retired_ = true;
+            return;
+        }
+        if (!pod_dense_ && span <= rows) {
+            // At most a cell a row: make every cell's group now.
+            pod_dense_lo_ = lo;
+            pod_dense_ = true;
+            pod_dense_cells_are_gids_ = true;
+            pod_dense_cells_ = static_cast<std::size_t>(span);
+            part.sizes.assign(pod_dense_cells_, 0);
+            part.stamp.assign(pod_dense_cells_, 0);
+            part.heaps.resize(pod_dense_cells_ * count_);
+            return;
+        }
+        if (!pod_dense_) {
+            pod_dense_gid_.assign(static_cast<std::size_t>(span), kPodNoGid);
+            pod_dense_lo_ = lo;
+            pod_dense_ = true;
+            // The cells bound the groups, so grow the per-group arrays once:
+            // at 5M groups their doubling copied the heaps (24 bytes an
+            // entry) over and over. Capacity alone touches no pages.
+            const std::size_t groups = std::min(static_cast<std::size_t>(span), rows);
+            part.sizes.reserve(groups);
+            part.stamp.reserve(groups);
+            part.touched.reserve(groups);
+            part.heaps.reserve(groups * count_);
+            return;
+        }
+        if (lo == pod_dense_lo_ && span == pod_dense_gid_.size()) {
+            return;
+        }
+        std::vector<std::uint32_t> grown(static_cast<std::size_t>(span), kPodNoGid);
+        const auto shift = static_cast<std::size_t>(pod_dense_lo_ - lo);
+        std::copy(pod_dense_gid_.begin(), pod_dense_gid_.end(),
+                  grown.begin() + static_cast<std::ptrdiff_t>(shift));
+        pod_dense_gid_ = std::move(grown);
+        pod_dense_lo_ = lo;
+    }
+
     template <typename K, typename KeyAt>
     auto process_grouped_pod(const Table& chunk, const KeyAt& key_at, bool ascending,
                              const std::vector<KeyCol>& group_key_cols, std::size_t rows,
@@ -1071,6 +1180,23 @@ class ChunkedOrderedLimitOperator final : public Operator {
                 }
             });
         }
+        if (pod_int_key_ && n_parts == 1) {
+            prepare_pod_dense(parts.front(), key0, int_key, rows);
+        } else {
+            pod_dense_retired_ = true;
+        }
+        const bool dense = pod_dense_;
+        const bool cells_are_gids = pod_dense_cells_are_gids_;
+        // Which groups this chunk changed is tracked per row (`stamp`,
+        // `touched`) only when there are many more groups than rows; else
+        // the bookkeeping below visits every group, which costs less than a
+        // random `stamp` access per row (h2o q8 at K=2 on one thread: one
+        // chunk, 5M groups).
+        std::size_t groups_before = 0;
+        for (const auto& part : parts) {
+            groups_before += part.sizes.size();
+        }
+        const bool track = groups_before > 3 * rows;
         const auto run_partition = [&](std::size_t p) {
             PodPartition<K>& part = parts[p];
             // Once a sample of this partition's rows shows most start groups
@@ -1095,6 +1221,22 @@ class ChunkedOrderedLimitOperator final : public Operator {
                     }
                 }
                 const std::size_t row = part_rows[at];
+                if (cells_are_gids) {
+                    // A row's group is its key, so fetch the group's size and
+                    // heap a few rows ahead: at 5M groups each is a cache
+                    // miss, and this loop otherwise waits on them one by one.
+                    constexpr std::size_t kAhead = 16;
+                    if (at + kAhead < part_begin[p + 1]) {
+                        const std::size_t ahead = part_rows[at + kAhead];
+                        if (!key0.is_null(ahead)) {
+                            const auto cell = static_cast<std::size_t>(
+                                static_cast<std::uint64_t>(int_key(ahead)) -
+                                static_cast<std::uint64_t>(pod_dense_lo_));
+                            ::ibex::detail::prefetch(part.sizes.data() + cell);
+                            ::ibex::detail::prefetch(part.heaps.data() + (cell * k));
+                        }
+                    }
+                }
                 const auto new_group = [&] {
                     const auto gid = static_cast<std::uint32_t>(part.sizes.size());
                     part.sizes.push_back(0);
@@ -1109,6 +1251,17 @@ class ChunkedOrderedLimitOperator final : public Operator {
                             part.null_gid = new_group();
                         }
                         gid = part.null_gid;
+                    } else if (cells_are_gids) {
+                        gid = static_cast<std::uint32_t>(static_cast<std::uint64_t>(int_key(row)) -
+                                                         static_cast<std::uint64_t>(pod_dense_lo_));
+                    } else if (dense) {
+                        std::uint32_t& slot = pod_dense_gid_[static_cast<std::size_t>(
+                            static_cast<std::uint64_t>(int_key(row)) -
+                            static_cast<std::uint64_t>(pod_dense_lo_))];
+                        if (slot == kPodNoGid) {
+                            slot = new_group();
+                        }
+                        gid = slot;
                     } else {
                         auto [it, fresh] = part.int_index.try_emplace(
                             carry ? carried_key[at] : int_key(row), 0U);
@@ -1154,7 +1307,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
                     ++size;
                     std::push_heap(heap, heap + size, worse_first);
                 }
-                if (part.stamp[gid] != chunk_stamp) {
+                if (track && part.stamp[gid] != chunk_stamp) {
                     part.stamp[gid] = chunk_stamp;
                     part.touched.push_back(gid);
                 }
@@ -1174,6 +1327,31 @@ class ChunkedOrderedLimitOperator final : public Operator {
             }
         }
 
+        if (!track) {
+            // Every group, as `touched` would hold had each been stamped.
+            const auto all_groups = [&](std::size_t p) {
+                auto& part = parts[p];
+                part.touched.resize(part.sizes.size());
+                for (std::size_t gid = 0; gid < part.sizes.size(); ++gid) {
+                    part.touched[gid] = static_cast<std::uint32_t>(gid);
+                }
+            };
+            if (workers >= 2 && n_parts >= 2) {
+                std::atomic<std::size_t> cursor{0};
+                auto batch =
+                    process_worker_pool().submit(std::min(workers, n_parts), [&](std::size_t) {
+                        for (std::size_t p = cursor.fetch_add(1); p < n_parts;
+                             p = cursor.fetch_add(1)) {
+                            all_groups(p);
+                        }
+                    });
+                batch.wait();
+            } else {
+                for (std::size_t p = 0; p < n_parts; ++p) {
+                    all_groups(p);
+                }
+            }
+        }
         // Copy the rows this chunk left in a heap into a piece, and point
         // their entries at it.
         // A row's place in the piece is its rank among the kept rows: mark,
@@ -1713,6 +1891,18 @@ class ChunkedOrderedLimitOperator final : public Operator {
     bool pod_active_ = false;
     bool pod_ascending_ = true;
     bool pod_int_key_ = false;
+    /// One partition and one integer key whose values fill a small range: a
+    /// group is found at `pod_dense_gid_[key - pod_dense_lo_]` rather than
+    /// through `int_index` (see `prepare_pod_dense`). Off for good once a
+    /// chunk's keys do not fit.
+    bool pod_dense_ = false;
+    /// The dense cells ARE the gids: group `key - lo` was made up front, so a
+    /// row needs no gid lookup at all (`pod_dense_gid_` stays empty).
+    bool pod_dense_cells_are_gids_ = false;
+    std::size_t pod_dense_cells_ = 0;
+    bool pod_dense_retired_ = false;
+    std::int64_t pod_dense_lo_ = 0;
+    std::vector<std::uint32_t> pod_dense_gid_;
     std::size_t pod_chunks_ = 0;
     std::vector<PodPartition<std::int64_t>> pod_int_;
     std::vector<PodPartition<double>> pod_double_;

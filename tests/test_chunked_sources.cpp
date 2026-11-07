@@ -3028,6 +3028,12 @@ TEST_CASE("grouped top-k: partitioned flat heaps take each group's stable-sort r
         bool rising;  // every row beats the last: the store must compact
         std::string grain;
         std::int64_t groups = 50'021;  // past rows / 2, a chunk is kept whole
+        // 0: `row * 7919 % groups`. 1: `row / 3`, a range every chunk widens.
+        // 2: per 70001-row chunk, `r * 3` (more cells than rows, fewer than
+        // four a row), the same shifted down (the range widens below its
+        // start), `r * 3` again, huge keys (too wide: the groups move into
+        // the map), then `r * 3` again, so every move is read back.
+        int keys = 0;
     };
     for (const Case& test :
          {Case{"t[order { v desc }, head 2, by g]", true, false, 2, false, ""},
@@ -3035,8 +3041,12 @@ TEST_CASE("grouped top-k: partitioned flat heaps take each group's stable-sort r
           Case{"t[order { v }, head 3, by g]", false, false, 3, false, "70001"},
           Case{"t[order { v }, tail 2, by g]", false, true, 2, false, "70001"},
           Case{"t[order { v desc }, head 1, by g]", true, false, 1, true, "300000"},
-          Case{"t[order { v desc }, head 2, by g]", true, false, 2, false, "70001", 300'007}}) {
-        INFO(test.query << " grain '" << test.grain << "' rising " << test.rising);
+          Case{"t[order { v desc }, head 2, by g]", true, false, 2, false, "70001", 300'007},
+          Case{"t[order { v desc }, head 2, by g]", true, false, 2, false, "70001", 0, 1},
+          Case{"t[order { v }, head 2, by g]", false, false, 2, false, "70001", 0, 2},
+          Case{"t[order { v desc }, head 2, by g]", true, false, 2, false, "", 0, 2}}) {
+        INFO(test.query << " grain '" << test.grain << "' rising " << test.rising << " keys "
+                        << test.keys);
         const std::size_t rows = test.rising ? 1'500'000 : 400'000;
         Column<std::int64_t> g;
         Column<double> v;
@@ -3044,7 +3054,25 @@ TEST_CASE("grouped top-k: partitioned flat heaps take each group's stable-sort r
         runtime::ValidityBitmap g_valid;
         g_valid.assign(rows, true);
         for (std::size_t row = 0; row < rows; ++row) {
-            const auto key = static_cast<std::int64_t>(row * 7919) % test.groups;
+            std::int64_t key = 0;
+            if (test.keys == 1) {
+                key = static_cast<std::int64_t>(row / 3);
+            } else if (test.keys == 2) {
+                const auto r = static_cast<std::int64_t>(row % 70'001);
+                switch (row / 70'001) {
+                    case 1:
+                        key = (r * 3) - 300'000;
+                        break;
+                    case 3:
+                        key = 1'000'000'000'000 + r;
+                        break;
+                    default:
+                        key = r * 3;
+                        break;
+                }
+            } else {
+                key = static_cast<std::int64_t>(row * 7919) % test.groups;
+            }
             g.push_back(key);
             if (!test.rising && row % 997 == 0) {
                 g_valid.set(row, false);  // one null group
@@ -3098,17 +3126,21 @@ TEST_CASE("grouped top-k: partitioned flat heaps take each group's stable-sort r
         REQUIRE(program.has_value());
         auto ir = parser::lower(program.value());
         REQUIRE(ir.has_value());
-        runtime::ExecutionContext parallel;
-        parallel.parallel_threads = 8;
-        parallel.parallel_min_rows = 0;
-        const auto p =
-            runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
-        REQUIRE(p.has_value());
-        REQUIRE(p->rows() == want.size());
-        const auto& pid = std::get<Column<std::int64_t>>(*p->find("id"));
-        for (std::size_t i = 0; i < want.size(); ++i) {
-            INFO("output row " << i);
-            REQUIRE(static_cast<std::size_t>(pid[i]) == want[i]);
+        // One thread takes the single-partition path, whose groups are
+        // found by `key - lo` while the keys allow it.
+        for (const std::size_t threads : {std::size_t{8}, std::size_t{1}}) {
+            INFO("threads " << threads);
+            runtime::ExecutionContext exec;
+            exec.parallel_threads = threads;
+            exec.parallel_min_rows = 0;
+            const auto p = runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, exec);
+            REQUIRE(p.has_value());
+            REQUIRE(p->rows() == want.size());
+            const auto& pid = std::get<Column<std::int64_t>>(*p->find("id"));
+            for (std::size_t i = 0; i < want.size(); ++i) {
+                INFO("output row " << i);
+                REQUIRE(static_cast<std::size_t>(pid[i]) == want[i]);
+            }
         }
     }
 }

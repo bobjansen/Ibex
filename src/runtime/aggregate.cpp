@@ -122,9 +122,10 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     }
 
     // A key column's nulls have to become their own group. Every path below keys
-    // off the column's *value*, and a null slot holds the type's zero value, so
-    // without this a null key would silently merge into the genuine `0` / `""`
-    // group and the null group would vanish from the result.
+    // off the column's *value*, and a null slot's payload is unspecified, so
+    // without this a null key would silently merge into whichever genuine group
+    // its leftover payload happens to match, and the null group would vanish
+    // from the result.
     //
     // Only a key column that actually has nulls pays for this: when there are
     // none — the overwhelmingly common case — the fast paths below run exactly
@@ -2559,8 +2560,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     if (!output.has_value()) {
         return std::unexpected(output.error());
     }
-    // The null group's key cell carries the type's zero value plus a clear
-    // validity bit — the same shape a null takes anywhere else in a Table.
+    // The null group's key cell is marked by a clear validity bit; its payload
+    // is unspecified, as for any null in a Table.
     std::vector<ValidityBitmap> key_validity(n_keys);
     for (std::size_t ci = 0; ci < n_keys; ++ci) {
         if (per_col[ci].null_code != kNoNullCode) {

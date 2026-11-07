@@ -8275,9 +8275,10 @@ class HashAggregateState final {
             }
         }
 
-        // The null group's key cell carries the type's zero value plus a clear
-        // validity bit. Only the generic Key path can produce one — the cat/str
-        // fast paths above are only taken for key columns with no nulls.
+        // The null group's key cell is marked by a clear validity bit; its
+        // payload is unspecified, as for any null in a Table. Only the generic
+        // Key path can produce one — the cat/str fast paths above are only
+        // taken for key columns with no nulls.
         std::vector<ValidityBitmap> key_validity(group_by_->size());
         std::uint64_t any_null_keys = 0;
         if (!cat_fast_path_ && !str_fast_path_ && !int_fast_path_ && !pair_int_fast_path_) {

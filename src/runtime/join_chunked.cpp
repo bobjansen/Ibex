@@ -334,8 +334,9 @@ auto detect_join_key_kind(const ColumnValue& col, ExprType& out) -> std::optiona
 ///
 /// A null key matches nothing, not even another null (SQL / Polars). So a
 /// null-keyed build row is never indexed, and a null-keyed probe row is never
-/// looked up. Both halves are needed: a null cell holds the type's zero value,
-/// so a null probe key would otherwise find a genuine `0`.
+/// looked up. Both halves are needed: a null cell's payload is unspecified
+/// (whatever the reader or producing operator left there), so a null probe key
+/// could otherwise find any genuine key.
 /// Fill one `PartitionedHeads` from `n` build rows, serially when it has one
 /// partition and over the worker pool when it has more.
 ///

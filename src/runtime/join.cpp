@@ -686,8 +686,9 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     //
     // Enforcing it takes both halves: a null-keyed row is never inserted into the
     // hash index, and a null-keyed probe row is never looked up. The second half
-    // is not redundant — a null cell carries the type's zero value, so a null
-    // probe key would otherwise hit a genuine `0` on the other side.
+    // is not redundant — a null cell's payload is unspecified (whatever the
+    // reader or producing operator left there), so a null probe key could
+    // otherwise hit any genuine key on the other side.
     std::vector<const ValidityBitmap*> left_key_validity;
     std::vector<const ValidityBitmap*> right_key_validity;
     bool has_null_keys = false;

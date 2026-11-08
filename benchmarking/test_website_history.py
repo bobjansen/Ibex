@@ -49,6 +49,19 @@ class WebsiteHistory(unittest.TestCase):
             self.assertEqual(archived.with_name('styles.css').read_text(), 'original css')
             self.assertEqual(out.read_text().count('id="benchmark-history"'), 1)
 
+    def test_history_labels_each_suite_with_its_own_commit(self):
+        # The suites are measured at different commits; the in-memory one
+        # alone used to label the whole publication.
+        suites = {'PAYLOAD': '950fafc1aaaa', 'H2O': 'b23a1390bbbb', 'PDSH': 'b23a1390bbbb'}
+        body = ''.join(f'<script>const {name} = ' + json.dumps({'meta': {'commit': commit,
+                       'generated': '2026-11-08 15:17 UTC'}}) + ';</script>' for name, commit in suites.items())
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / 'benchmarks.html'
+            (Path(tmp) / 'styles.css').write_text('css')
+            publish(out, '<html><head></head><body><div class="headline"></div>' + body + '</body></html>', 'code')
+            run = json.loads((Path(tmp) / 'benchmark-history/index.json').read_text())['runs'][0]
+            self.assertEqual(run['commit'], 'h2o + PDS-H b23a1390, in-memory 950fafc1')
+
 
 if __name__ == '__main__':
     unittest.main()

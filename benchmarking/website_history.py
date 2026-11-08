@@ -31,6 +31,25 @@ def decorate(page: str, run_id: str) -> str:
     return strip_controls(page).replace('<div class="headline"', controls + '\n    <div class="headline"', 1)
 
 
+SUITES = (('const H2O = ', 'h2o'), ('const PDSH = ', 'PDS-H'), ('const PAYLOAD = ', 'in-memory'))
+
+
+def suite_commits(page: str) -> str:
+    """Each suite's measured commit, e.g. 'h2o + PDS-H b23a1390, in-memory 950fafc1'.
+
+    The suites are measured separately, so no one commit describes a page.
+    """
+    by_commit = {}
+    for marker, label in SUITES:
+        if marker not in page:
+            continue
+        data, _ = json.JSONDecoder().raw_decode(page.split(marker, 1)[1])
+        commit = (data.get('meta') or {}).get('commit') if isinstance(data, dict) else None
+        if commit:
+            by_commit.setdefault(commit[:8], []).append(label)
+    return ', '.join(f"{' + '.join(labels)} {commit}" for commit, labels in by_commit.items()) or 'unknown'
+
+
 def archive(out: Path, page: str, methodology: str) -> tuple[str, dict]:
     """Content-derived ids keep repeated publication safe, even within a minute."""
     page = strip_controls(page)
@@ -64,7 +83,7 @@ def archive(out: Path, page: str, methodology: str) -> tuple[str, dict]:
                 raise ValueError(f'refusing to overwrite benchmark snapshot: {path}')
         else:
             path.write_text(content, encoding='utf-8')
-    entry = {'id': run_id, 'generated': generated, 'commit': meta.get('commit', 'unknown'),
+    entry = {'id': run_id, 'generated': generated, 'commit': suite_commits(page),
              'url': f'benchmark-history/{run_id}/index.html'}
     return run_id, entry
 

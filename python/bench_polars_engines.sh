@@ -94,8 +94,10 @@ for n in "${THREAD_LIST[@]}"; do
         fi
         if ((${#JOIN[@]})); then
             echo "=== h2o join, $n threads (CPUs $cpus) ===" >&2
+            # Naming the five join questions also limits the groupby fixture
+            # checks to q1-q5, which IbexEngine translates.
             taskset -c "$cpus" "$PY" "$ROOT/benchmarking/h2o/run.py" "${JOIN[@]}" "${h2o[@]}" \
-                --out "$OUT/h2o_join_${n}t.tsv" || status=1
+                --questions q1 q2 q3 q4 q5 --out "$OUT/h2o_join_${n}t.tsv" || status=1
         fi
     fi
     if ((!SKIP_PDSH)); then

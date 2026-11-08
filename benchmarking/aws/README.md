@@ -13,6 +13,7 @@ pull the results back as a CSV. Three layers:
 | `run-thread-scaling.sh` | local    | One box, the suite once per thread count — how each engine converts cores into throughput. |
 | `run-tpch.sh`        | local       | One instance runs the TPC-H/PDS-H quartet and downloads a TSV artifact. |
 | `run-h2o.sh`         | local       | One instance runs the h2o db-benchmark (Ibex, Polars, DuckDB) per core count and downloads a TSV artifact. |
+| `run-polars-engines.sh` | local    | One instance runs the same Polars code on Polars streaming and IbexEngine over PDS-H and h2o per thread count. |
 | `run-window-ohlc.sh` | local       | One instance runs the window-OHLC suite (Ibex/Polars/DuckDB) and downloads a TSV artifact. |
 | `run-r-only.sh`      | local       | One 8-core instance runs the R-only suite (data.table/dplyr/ibex-r) across a size sweep. |
 | `compare-git.sh`     | local       | A/B **two git commits** of ibex on one clean box (low-noise perf verdict). |
@@ -236,6 +237,31 @@ downloads `benchmarking/results/tpch_aws_<timestamp>.tar.gz`; extract it to get
 one TSV per framework and a `versions.txt` manifest. Use `--sf 1,10` to run
 multiple scale factors sequentially. SF-10 needs materially more disk/RAM; use
 `--type r7i.4xlarge` when in doubt.
+
+## 3a.1b Polars engines (Polars streaming vs IbexEngine)
+
+```bash
+git push
+./benchmarking/aws/run-polars-engines.sh --on-demand
+```
+
+The same Polars query code, collected by Polars' streaming engine and by
+`IbexEngine` (`python/ibex_polars`), on one r7i.4xlarge with SMT off, at 8
+and then 1 threads. It runs `python/bench_polars_engines.sh` on the box:
+all 22 unchanged upstream PDS-H queries at SF-10 (upstream's generator,
+medians of 6 interleaved rounds, every result compared in full), and the h2o
+groupby and join questions on the upstream R generators' data (the harness's
+bounded answer checks, minimum of 5 iterations). Groupby covers the questions
+`IbexEngine` translates, all but q6, q8 and q9. The box builds the Python
+bridge against the uv venv's interpreter and checks that it imports before
+generating any data.
+
+The artifact `benchmarking/results/polars_engines_aws_<timestamp>.tar.gz`
+holds the h2o TSVs and checks sidecars, the PDS-H JSON reports, `summary.md`
+(`python/summarize_polars_engines.py`), `versions.txt` and the bench log. A
+failed check at one thread count is listed in `failures.txt`, the other
+counts still run, and the archive arrives under the `PARTIAL` name. These runs
+are never inputs to `gen_website.py`.
 
 ## 3a.2 Window-OHLC (Ibex vs Polars vs DuckDB)
 

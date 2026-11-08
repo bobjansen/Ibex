@@ -38,6 +38,9 @@
 #   IBEX_AMI_STATUS_KEY — S3 key to write "ok"/"fail" to (provision-only mode)
 #   IBEX_R_ONLY_MODE  — "1" to run the R-only suite (run-r-only.sh)
 #   IBEX_R_ONLY_CORES — cores the R-only sweep is pinned to (default: nproc)
+#   IBEX_POLARS_ENGINES_MODE — "1" for Polars streaming vs IbexEngine
+#                       (run-polars-engines.sh), with IBEX_PE_THREADS,
+#                       IBEX_PE_H2O_DATA, IBEX_PE_SF and IBEX_PE_PDSH_ITERS
 
 set -euo pipefail
 
@@ -322,6 +325,10 @@ ensure_compiler_compare_toolchain() {
 # unconditional find_program(npm REQUIRED), so on a box without Node the whole
 # CONFIGURE aborts and every target dies -- including ibex_bench, which never
 # touches the UI. The bench AMI has no npm.
+# Extra configure arguments for one mode (the Polars-engines mode points the
+# Python bridge at the uv venv's interpreter).
+IBEX_CMAKE_EXTRA_ARGS=()
+
 build_ibex() {
     cmake -B /ibex/build-release -G Ninja \
         -DCMAKE_C_COMPILER="clang-${CLANG_VERSION}" \
@@ -332,6 +339,7 @@ build_ibex() {
         -DIBEX_ENABLE_MARCH_NATIVE=ON \
         -DIBEX_ENABLE_LTO=OFF \
         -DCMAKE_BUILD_TYPE=Release \
+        "${IBEX_CMAKE_EXTRA_ARGS[@]}" \
         -S /ibex
     if [[ -n "${IBEX_BUILD_TARGETS:-}" ]]; then
         local targets=()
@@ -340,6 +348,61 @@ build_ibex() {
     else
         ninja -C /ibex/build-release
     fi
+}
+
+# ── Benchmark data shared by several modes ────────────────────────────────────
+# PDS-H: upstream pola-rs/polars-benchmark, pinned so an artifact can always be
+# reproduced. 401908a (2026-10-01) is the first that runs on Polars 2
+# (`engine=` instead of the removed `streaming=`); its data generator is
+# unchanged.
+PDSH_REPO=https://github.com/pola-rs/polars-benchmark.git
+PDSH_COMMIT=401908a307f133a2dffbe3f5e0e0fb2b50ea310b
+PDSH_ROOT=/opt/polars-benchmark
+
+pdsh_checkout() {
+    if [[ ! -d "$PDSH_ROOT/.git" ]]; then
+        git clone "$PDSH_REPO" "$PDSH_ROOT"
+    fi
+    git -C "$PDSH_ROOT" fetch --quiet origin "$PDSH_COMMIT"
+    git -C "$PDSH_ROOT" checkout --force "$PDSH_COMMIT"
+    # The data comes from polars-benchmark's own generator (tpchgen-cli, then
+    # Polars' parquet writer, pinned by its requirements.txt), never from Ibex,
+    # so the layout cannot be said to favour Ibex. Its venv needs CPython 3.12
+    # (no `ray` wheel for newer); uv fetches one if the box lacks it. --seed
+    # because the Makefile's install-deps bootstraps uv through pip.
+    command -v make >/dev/null || apt_get_retry install -y --no-install-recommends make
+    if [[ ! -x "$PDSH_ROOT/.venv/bin/tpchgen-cli" ]]; then
+        rm -rf "$PDSH_ROOT/.venv"
+        uv venv --seed --python 3.12 "$PDSH_ROOT/.venv"
+        make -C "$PDSH_ROOT" install-deps
+    fi
+}
+
+# Prints upstream's spelling of a scale factor ("10" -> "10.0") after
+# generating its tables under $PDSH_ROOT/data/tables/scale-<that>.
+pdsh_data_tables() {
+    local pdsh_scale
+    pdsh_scale="$(python3 -c 'import sys; print(float(sys.argv[1]))' "$1")"
+    # Command substitution drops set -e, so a failed make must fail here.
+    make -C "$PDSH_ROOT" data-tables SCALE_FACTOR="$pdsh_scale" >&2 || return 1
+    echo "$pdsh_scale"
+}
+
+# h2o: upstream's own R generators (vendored, seeded), so every engine reads
+# the same CSV. Each data name is parsed back into the generator's arguments.
+# The generators need R + data.table; a baked AMI may predate either, and this
+# also exports the benchmark R library for Rscript.
+h2o_gen_data() {
+    ensure_current_r
+    local data kind n k na sorted
+    for data in "$@"; do
+        IFS='_' read -r kind n k na sorted <<< "$data"
+        if [[ "$kind" == "G1" ]]; then
+            bash /ibex/benchmarking/h2o/gen_data.sh groupby "$n" "$k" "$na" "$sorted"
+        else
+            bash /ibex/benchmarking/h2o/gen_data.sh join "$n" "$na" "$sorted"
+        fi
+    done
 }
 
 # ── Host memory facts + perf counters ─────────────────────────────────────────
@@ -856,12 +919,7 @@ fi
 if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
     # PDS-H is intentionally kept separate from the scale suite: it uses TPC-H
     # data and reports a per-query TSV rather than synthetic scale-query rows.
-    # The upstream checkout is pinned so an artifact can always be reproduced.
-    # 401908a (2026-10-01) is the first that runs on Polars 2 (`engine=`
-    # instead of the removed `streaming=`); its data generator is unchanged.
-    PDSH_REPO=https://github.com/pola-rs/polars-benchmark.git
-    PDSH_COMMIT=401908a307f133a2dffbe3f5e0e0fb2b50ea310b
-    PDSH_ROOT=/opt/polars-benchmark
+    # The upstream checkout is pinned (see pdsh_checkout).
     ARTIFACT=/ibex/benchmarking/results/tpch.tar.gz
 
     finish_tpch() {
@@ -900,29 +958,12 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
 
     build_ibex
     ensure_perf || echo "perf unavailable; PDS-H runs without perf stat counters" >&2
-    if [[ ! -d "$PDSH_ROOT/.git" ]]; then
-        git clone "$PDSH_REPO" "$PDSH_ROOT"
-    fi
-    git -C "$PDSH_ROOT" fetch --quiet origin "$PDSH_COMMIT"
-    git -C "$PDSH_ROOT" checkout --force "$PDSH_COMMIT"
+    pdsh_checkout
     uv sync --project /ibex
-
-    # The data comes from polars-benchmark's own generator (tpchgen-cli, then
-    # Polars' parquet writer, pinned by its requirements.txt), never from Ibex,
-    # so the layout cannot be said to favour Ibex. Its venv needs CPython 3.12
-    # (no `ray` wheel for newer); uv fetches one if the box lacks it. --seed
-    # because the Makefile's install-deps bootstraps uv through pip.
-    command -v make >/dev/null || apt_get_retry install -y --no-install-recommends make
-    if [[ ! -x "$PDSH_ROOT/.venv/bin/tpchgen-cli" ]]; then
-        rm -rf "$PDSH_ROOT/.venv"
-        uv venv --seed --python 3.12 "$PDSH_ROOT/.venv"
-        make -C "$PDSH_ROOT" install-deps
-    fi
 
     IFS=',' read -r -a TPCH_SCALES <<< "${IBEX_TPCH_SCALES:-1}"
     for scale in "${TPCH_SCALES[@]}"; do
-        pdsh_scale="$(python3 -c 'import sys; print(float(sys.argv[1]))' "$scale")"
-        make -C "$PDSH_ROOT" data-tables SCALE_FACTOR="$pdsh_scale"
+        pdsh_scale="$(pdsh_data_tables "$scale")"
         # --cores is load-bearing on a big box: run_bench.sh pins every engine to
         # the same set, and without it Polars sizes its pool from nproc, thrashes
         # above ~8 threads, and inflates Ibex's lead. run-tpch.sh resolves the
@@ -1056,21 +1097,8 @@ if [[ "${IBEX_H2O_MODE:-0}" == "1" ]]; then
     python3 "$H2O_DIR/provenance.py" --build-dir /ibex/build-release --build
     uv run --project /ibex python3 "$H2O_DIR/check_results.py" "$H2O_OUT" --write-plan \
         --data "$IBEX_H2O_DATA" --cores "${IBEX_H2O_CORES:-1}"
-    # The generators need R + data.table; a baked AMI may predate either, and
-    # this also exports the benchmark R library for Rscript below.
-    ensure_current_r
-
-    # Upstream's own R generators (vendored, seeded): every engine reads the
-    # same CSV. Each data name is parsed back into the generator's arguments.
     IFS=',' read -r -a H2O_DATA <<< "${IBEX_H2O_DATA}"
-    for data in "${H2O_DATA[@]}"; do
-        IFS='_' read -r kind n k na sorted <<< "$data"
-        if [[ "$kind" == "G1" ]]; then
-            bash "$H2O_DIR/gen_data.sh" groupby "$n" "$k" "$na" "$sorted"
-        else
-            bash "$H2O_DIR/gen_data.sh" join "$n" "$na" "$sorted"
-        fi
-    done
+    h2o_gen_data "${H2O_DATA[@]}"
 
     # A MISMATCH makes run.py exit non-zero after writing its TSV; record that
     # and carry on, so one bad cell does not cost the other core counts.
@@ -1088,6 +1116,88 @@ if [[ "${IBEX_H2O_MODE:-0}" == "1" ]]; then
         push_partial_h2o
     done
     uv run --project /ibex python3 "$H2O_DIR/check_results.py" "$H2O_OUT"
+    exit 0
+fi
+
+# ── Polars-engines mode (run-polars-engines.sh) ──────────────────────────────
+# The same Polars query code on Polars' streaming engine and on IbexEngine
+# (python/ibex_polars), over PDS-H and the h2o db-benchmark, via
+# python/bench_polars_engines.sh. One run per thread count in
+# IBEX_PE_THREADS, on this one box; each finished count is pushed as a partial
+# artifact, and the final one ships from the EXIT trap with the bench log.
+if [[ "${IBEX_POLARS_ENGINES_MODE:-0}" == "1" ]]; then
+    PE_WORK=/ibex/benchmarking/results/polars-engines-current
+    PE_OUT="$PE_WORK/results"
+    ARTIFACT=/ibex/benchmarking/results/polars-engines.tar.gz
+
+    finish_polars_engines() {
+        local code=$?
+        set +e
+        mkdir -p /ibex/benchmarking/results "$PE_OUT"
+        echo "exit_code=$code" > "$PE_OUT/exit_code.txt"
+        cp /var/log/ibex-bench.log "$PE_OUT/ibex-bench.log" 2>/dev/null
+        {
+            echo "ibex_commit=$(git -C /ibex rev-parse HEAD)"
+            echo "pdsh_commit=$PDSH_COMMIT"
+            /ibex/.venv/bin/python -c 'import sys, polars, pyarrow; print(f"python={sys.version.split()[0]}"); print(f"polars={polars.__version__}"); print(f"pyarrow={pyarrow.__version__}")'
+            lscpu
+        } > "$PE_OUT/versions.txt" 2>&1
+        # The run's own failed-validation directories hold the evidence.
+        /ibex/.venv/bin/python /ibex/python/summarize_polars_engines.py "$PE_OUT" \
+            > "$PE_OUT/summary.md" 2>&1
+        local key="${IBEX_RESULT_KEY%.tar.gz}.partial.tar.gz"
+        [[ "$code" -eq 0 ]] && key="$IBEX_RESULT_KEY"
+        tar -C "$PE_WORK" -czf "$ARTIFACT" results
+        aws s3 cp "$ARTIFACT" "s3://${IBEX_S3_BUCKET}/${key}" --region "${IBEX_REGION}" || true
+        shutdown -h now
+        return "$code"
+    }
+    trap finish_polars_engines EXIT
+
+    # Its own key: the launcher's wait loop exits as soon as the final key
+    # appears, so a partial there would pass for a finished run.
+    push_partial_polars_engines() {
+        mkdir -p /ibex/benchmarking/results
+        tar -C "$PE_WORK" -czf "$ARTIFACT" results 2>/dev/null || return 0
+        aws s3 cp "$ARTIFACT" "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY%.tar.gz}.partial.tar.gz" \
+            --region "${IBEX_REGION}" >/dev/null 2>&1 || true
+    }
+
+    # The venv first, so the bridge is built for the interpreter that imports
+    # it. Both variables: a fresh configure otherwise keeps whichever Python
+    # the vendored AWS SDK found first.
+    uv sync --project /ibex
+    IBEX_CMAKE_EXTRA_ARGS=(-DIBEX_BUILD_PYTHON_BRIDGE=ON -DIBEX_BUILD_PARQUET=ON
+                           -DIBEX_PYTHON_EXECUTABLE=/ibex/.venv/bin/python
+                           -DPython3_EXECUTABLE=/ibex/.venv/bin/python)
+    build_ibex
+    PYTHONSAFEPATH=1 PYTHONPATH=/ibex/build-release/python:/ibex/python \
+        /ibex/.venv/bin/python -c 'import ibex_pyarrow; from ibex_polars import IbexEngine'
+    mkdir -p "$PE_OUT"
+    python3 /ibex/benchmarking/h2o/provenance.py --build-dir /ibex/build-release --build
+
+    IFS=',' read -r -a PE_H2O_DATA <<< "${IBEX_PE_H2O_DATA}"
+    h2o_gen_data "${PE_H2O_DATA[@]}"
+    pdsh_checkout
+    pe_scale="$(pdsh_data_tables "${IBEX_PE_SF:-10}")"
+
+    # A failed validation makes the driver exit non-zero after the other
+    # suites ran; record it and carry on, so one bad cell does not cost the
+    # other thread counts.
+    IFS=',' read -r -a PE_THREAD_LIST <<< "${IBEX_PE_THREADS:-8,1}"
+    for threads in "${PE_THREAD_LIST[@]}"; do
+        echo "=== Polars engines: ${threads} thread(s) ==="
+        write_host_memory_facts "$PE_OUT/host/memory_${threads}t_before.txt"
+        bash /ibex/python/bench_polars_engines.sh --threads "$threads" \
+            --pdsh-root "$PDSH_ROOT" --pdsh-data "$PDSH_ROOT/data/tables/scale-${pe_scale}" \
+            --h2o-data "$IBEX_PE_H2O_DATA" --warmup "${IBEX_WARMUP:-1}" --iters "${IBEX_ITERS:-5}" \
+            --pdsh-iters "${IBEX_PE_PDSH_ITERS:-6}" --out-dir "$PE_OUT" \
+            || echo "bench_polars_engines.sh ${threads}t exited $?" >> "$PE_OUT/failures.txt"
+        write_host_memory_facts "$PE_OUT/host/memory_${threads}t_after.txt"
+        push_partial_polars_engines
+    done
+    # Any failure fails the run, so its artifact lands under the partial key.
+    [[ ! -s "$PE_OUT/failures.txt" ]]
     exit 0
 fi
 

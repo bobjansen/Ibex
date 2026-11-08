@@ -209,6 +209,7 @@ pl.Config.<span class="fn-name">set_engine_affinity</span>(<span class="str">"au
           <li><code>filter</code>, <code>select</code>, <code>with_columns</code>, arithmetic, comparisons, Boolean logic, <code>is_between</code>, <code>is_in</code>, <code>when/then/otherwise</code>, null checks and casts.</li>
           <li>Column-key <code>group_by</code> with <code>sum</code>, <code>mean</code>, <code>min</code>, <code>max</code>, <code>count</code>, <code>len</code>, <code>n_unique</code>, <code>first</code>/<code>last</code>, including the null-on-empty sum <code>pl.when(x.count() &gt; 0).then(x.sum())</code>.</li>
           <li>Equality joins (<code>inner</code>, <code>left</code>, <code>right</code>, <code>full</code>, <code>semi</code>, <code>anti</code>), cross joins, composite keys and suffixes.</li>
+          <li>Per-group rows: <code>group_by(...).head(n)</code>, and <code>agg(pl.col(x).top_k(k)).explode(...)</code> on a numeric column.</li>
           <li>Sorting, <code>unique</code>, <code>slice</code>/<code>head</code>/<code>tail</code>, rounding, string slicing and <code>starts_with</code>/<code>ends_with</code>/<code>contains</code>, Date years.</li>
           <li>Integer, float, Boolean, String, Categorical, Date, Datetime and Duration columns.</li>
         </ul>
@@ -216,7 +217,7 @@ pl.Config.<span class="fn-name">set_engine_affinity</span>(<span class="str">"au
       <article class="card">
         <h3>Not yet</h3>
         <ul>
-          <li><code>median</code>, quantiles, <code>std</code> and <code>corr</code> as aggregates; <code>top_k</code> and <code>explode</code>.</li>
+          <li><code>median</code>, quantiles, <code>std</code> and <code>corr</code> as aggregates; list-valued results (<code>agg(pl.col(x).head(n))</code> without <code>explode</code>), and <code>explode</code> other than of a per-group head or top_k.</li>
           <li>Window expressions (<code>over</code>), computed group or sort keys, Python UDFs.</li>
           <li>As-of and general non-equi joins, nondefault join validation.</li>
           <li>General regular expressions; multiple or remote files; struct and list columns.</li>
@@ -236,9 +237,9 @@ pl.Config.<span class="fn-name">set_engine_affinity</span>(<span class="str">"au
     result = query.<span class="fn-name">collect</span>(engine=<span class="str">"streaming"</span>)</code></pre>
     <p>
       On the two public benchmark suites: all 22 PDS-H queries run, and of the
-      h2o db-benchmark, all five joins and seven of the ten groupby questions;
-      q6 (median and standard deviation), q8 (top two per group) and q9
-      (correlation) are the gaps listed above.
+      h2o db-benchmark, all five joins and eight of the ten groupby
+      questions; q6 (median and standard deviation) and q9 (correlation) are
+      the gaps listed above.
     </p>
   </section>
 

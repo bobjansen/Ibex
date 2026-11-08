@@ -108,6 +108,25 @@ assert "polars" not in sys.modules
         self.assertEqual(larger.collect().item(), 5)
         self.assertEqual(root.collect()["x"].to_list(), [1, 2, 3])
 
+    def test_grouped_head_keeps_each_groups_first_rows(self):
+        # Keys first, then the other columns in input order. Without
+        # maintain_order rows keep their input order; with it each group's
+        # rows come together, groups in first-occurrence order. Null keys
+        # form one group.
+        frame = pl.DataFrame({"x": [5, 4, 3, 2, 1, 9], "g": ["a", "b", "a", "b", "a", None],
+                              "y": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]}).lazy()
+        self.assertEqual(frame.group_by("g").head(2).collect().to_dict(as_series=False),
+                         {"g": ["a", "b", "a", "b", None], "x": [5, 4, 3, 2, 9],
+                          "y": [1.0, 2.0, 3.0, 4.0, 6.0]})
+        self.assertEqual(frame.group_by("g", maintain_order=True).head(2).collect().to_dict(as_series=False),
+                         {"g": ["a", "a", "b", "b", None], "x": [5, 3, 4, 2, 9],
+                          "y": [1.0, 3.0, 2.0, 4.0, 6.0]})
+        self.assertEqual(frame.group_by("g").head(0).collect().to_dict(as_series=False),
+                         {"g": [], "x": [], "y": []})
+        self.assertEqual(frame.group_by("g", "x").head(1).collect().shape, (6, 3))
+        with self.assertRaises(ValueError):
+            frame.group_by("g").head(-1)
+
     def test_empty_and_all_null_sum(self):
         for dtype in (pa.float64(), pa.int64()):
             for values in ([], [None, None]):

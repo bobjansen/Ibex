@@ -216,6 +216,16 @@ class LazyGroupBy:
             raise ValueError("aggregate output name conflicts with a grouping key")
         return self._frame._append("aggregate", (self._keys, expressions))
 
+    def head(self, n=5):
+        """The first n rows of each group, in input order, keys first.
+
+        With maintain_order=True the groups come in first-occurrence order,
+        each group's rows together; otherwise rows keep their input order.
+        """
+        if type(n) is not int or n < 0:
+            raise ValueError("head length must be a non-negative integer")
+        return self._frame._append("group_head", (self._keys, n, self._maintain_order))
+
 
 class Series:
     def __init__(self, name, array):

@@ -678,6 +678,35 @@ class EngineTests(unittest.TestCase):
                 pl.LazyFrame({"x": pl.Series([1], dtype=dtype)}).select(-pl.col("x")).collect(engine=self.engine)
 
     @unittest.skipIf(os.environ.get("IBEX_TEST_PARQUET") == "0", "Parquet backend disabled")
+    def test_grouped_head_and_top_k_explode(self):
+        # Polars plans both as per-group lists that explode back into rows.
+        # Without maintain_order Polars promises no row order, and top_k no
+        # order within a group, so those compare sorted.
+        frame = pl.DataFrame({"x": [5, 4, 3, None, 1, 9, 7], "g": ["a", "b", "a", "b", "a", None, "c"],
+                              "y": [1.0, float("nan"), 3.0, 4.0, 5.0, 6.0, None]},
+                             schema_overrides={"g": pl.Categorical}).lazy()
+        def unordered(query):
+            expected = query.collect(engine="streaming")
+            actual = query.collect(engine=self.engine)
+            assert_frame_equal(actual.sort(actual.columns, nulls_last=True),
+                               expected.sort(expected.columns, nulls_last=True))
+        self.equal(frame.group_by("g", maintain_order=True).head(2))
+        self.equal(frame.group_by("g", maintain_order=True).head(10))
+        unordered(frame.group_by("g").head(1))
+        unordered(frame.group_by("g", "x").head(1))
+        for column in ("x", "y"):
+            unordered(frame.group_by("g").agg(pl.col(column).top_k(2).alias("t")).explode("t"))
+        # h2o q8.
+        unordered(frame.drop_nulls("y").group_by("g").agg(pl.col("y").top_k(2).alias("largest2_y"))
+                  .explode("largest2_y"))
+        for query in (frame.group_by("g").head(0),
+                      frame.group_by("g", maintain_order=True).agg(pl.col("x").top_k(2)).explode("x"),
+                      frame.group_by("x").agg(pl.col("g").top_k(1)).explode("g"),
+                      frame.group_by("g").agg(pl.col("x").head(2), pl.col("y").head(1)).explode("x", "y"),
+                      frame.group_by("g").agg(pl.col("x").head(2))):
+            with self.subTest(query=query.explain()), self.assertRaises(NotImplementedError):
+                self.engine.prepare(query)
+
     def test_row_limits_pushed_into_a_parquet_scan(self):
         # Polars pushes head/slice/tail on a bare scan into the scan itself
         # (`n_rows`, an offset and a length); an explicit n_rows applies

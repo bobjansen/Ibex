@@ -22,7 +22,7 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
         return f"_ibex_{_namespace}{name}"
 
     needs_schema = validate or any(
-        operation in ("unique", "slice", "python_slice", "join") or
+        operation in ("unique", "slice", "python_slice", "join", "group_head") or
         (operation == "filter" and any(expr._aggregate for expr in expressions))
         for operation, expressions in frame._steps)
     step_types, schemas = _validate_types(frame, widen_numeric_inputs=widen_numeric_inputs) if needs_schema else ([], [])
@@ -494,6 +494,30 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             # Stable order is permitted when maintain_order=False too. For
             # keep=last, order by the selected row's original position.
             source += f"[order {{ {_identifier(ordinal)} asc }}][select {{ {fields} }}]"
+        elif operation == "group_head":
+            keys, count, maintain_order = expressions
+            columns = schemas[index]
+            by = ", ".join(_identifier(name) for name in keys)
+            fields = ", ".join(_identifier(name) for name in columns)
+            count = min(count, 2**63 - 1)
+            if not maintain_order:
+                # Native grouped head keeps each group's first rows in the
+                # current row order (SPEC: head with by).
+                source += f"[head {count}, by {{ {by} }}][select {{ {fields} }}]"
+                continue
+            occupied = set(columns)
+            def temporary(role):
+                name = f"_ibex_group_head_{index}_{role}"
+                while name in occupied:
+                    name += "_"
+                occupied.add(name)
+                return _identifier(name)
+            row, first = temporary("row"), temporary("first")
+            # Polars explodes one list per group: groups in first-occurrence
+            # order, each group's rows together, in input order.
+            source += (f"[update {{ {row} = seq() }}][head {count}, by {{ {by} }}]"
+                       f"[update {{ {first} = min({row}) }}, by {{ {by} }}]"
+                       f"[order {{ {first} asc, {row} asc }}][select {{ {fields} }}]")
         elif operation == "sort":
             names, descending, nulls_last = expressions
             order = []
@@ -801,6 +825,15 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
             if subset is not None:
                 for name in subset:
                     dtype(Expr("col", (name,)))
+            step_types.append(type_map)
+            schemas.append(dict(columns))
+            continue
+        elif operation == "group_head":
+            keys = expressions[0]
+            for name in (*keys, *columns):
+                dtype(Expr("col", (name,)))
+            columns = {name: columns[name] for name in keys} | {
+                name: value for name, value in columns.items() if name not in keys}
             step_types.append(type_map)
             schemas.append(dict(columns))
             continue

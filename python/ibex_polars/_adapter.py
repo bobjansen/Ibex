@@ -649,6 +649,87 @@ class Adapter:
             frame = frame.select(list(self.visitor.get_schema()))
         return frame
 
+    def _literal_count(self, node):
+        value = self.visitor.view_expression(node)
+        if (type(value).__name__ != "Literal" or type(value.value) is not int
+                or value.dtype not in (*_INTEGER_LAYOUTS, pl.UInt32) or value.value < 0):
+            raise NotImplementedError("per-group row counts must be non-negative integer literals")
+        return value.value
+
+    def _exploded_group_head(self, node):
+        """Polars' plan for a per-group row selection: lists, then explode.
+
+        `group_by(keys).head(n)` aggregates `col.slice(0, n).implode()` for
+        every other column, and `agg(col.top_k(k)).explode(...)` aggregates
+        `col.top_k(k).implode()`; both explode the lists back into rows. Each
+        becomes the native per-group `head` (SPEC: head with by), top_k after
+        a descending sort with nulls last and NaN above every number, as
+        Polars ranks them. A group's top_k values keep no promised order.
+        """
+        _, exploded, _empty_as_null, _keep_nulls = node.function
+        self.visitor.set_node(node.input)
+        group = self.visitor.view_current_node()
+        if type(group).__name__ != "GroupBy":
+            raise NotImplementedError("explode is supported only for per-group head and top_k")
+        if group.apply or group.options.slice is not None or any(
+                getattr(group.options, name) is not None for name in ("dynamic", "rolling")):
+            raise NotImplementedError("unsupported group options for a per-group selection")
+        # Keys and aggregates resolve against the group's input.
+        self.visitor.set_node(group.input)
+        keys = []
+        for key in group.keys:
+            expr = self.expression(key.node)
+            if expr._op != "col" or expr._name != key.output_name:
+                raise NotImplementedError("computed or renamed grouping keys are not supported yet")
+            keys.append(expr._name)
+        heads, top = [], None
+        for agg in group.aggs:
+            value = self.visitor.view_expression(agg.node)
+            if type(value).__name__ != "Agg" or value.name != "implode":
+                raise NotImplementedError("explode is supported only for per-group head and top_k")
+            inner = self.visitor.view_expression(value.arguments[0])
+            inner_kind = type(inner).__name__
+            if inner_kind == "Slice":
+                column = self.visitor.view_expression(inner.input)
+                if (type(column).__name__ != "Column" or column.name != agg.output_name
+                        or self._literal_count(inner.offset) != 0):
+                    raise NotImplementedError("per-group slices must be head(n) of a column")
+                heads.append((column.name, self._literal_count(inner.length)))
+            elif (inner_kind == "Function" and inner.function_data == ("top_k", False)
+                    and len(inner.input) == 2):
+                column = self.visitor.view_expression(inner.input[0])
+                if type(column).__name__ != "Column":
+                    raise NotImplementedError("top_k is supported only on a column")
+                if self.visitor.get_dtype(inner.input[0]) not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64):
+                    raise NotImplementedError("top_k is supported only on numeric columns")
+                top = (column.name, agg.output_name, self._literal_count(inner.input[1]))
+            else:
+                raise NotImplementedError("explode is supported only for per-group head and top_k")
+        outputs = [agg.output_name for agg in group.aggs]
+        if sorted(exploded) != sorted(outputs) or len(set(outputs)) != len(outputs):
+            raise NotImplementedError("explode must expand every per-group list")
+        frame = self.frame(group.input)
+        if top is not None:
+            if heads or len(group.aggs) != 1:
+                raise NotImplementedError("top_k is supported as the only aggregate")
+            if group.maintain_order:
+                raise NotImplementedError("top_k with maintain_order=True is not supported yet")
+            name, output, count = top
+            if count == 0:
+                raise NotImplementedError("per-group top_k(0) is not supported")
+            frame = (frame.select([*keys, name])
+                     .sort(name, descending=True, nulls_last=True, maintain_order=True)
+                     .group_by(keys).head(count))
+            return frame.select([*(ibex.col(key) for key in keys), ibex.col(name).alias(output)])
+        counts = {count for _, count in heads}
+        if len(counts) != 1:
+            raise NotImplementedError("per-group head needs one row count for every column")
+        if 0 in counts:
+            # Polars explodes each group's empty list into one null row.
+            raise NotImplementedError("per-group head(0) is not supported")
+        frame = frame.select([*keys, *(name for name, _ in heads)])
+        return frame.group_by(keys, maintain_order=group.maintain_order).head(counts.pop())
+
     def frame(self, node_id):
         if node_id in self.nodes:
             return self.nodes[node_id]
@@ -677,7 +758,9 @@ class Adapter:
                 frame = selected.select(list(schema))
                 self.nodes[node_id] = frame
                 return frame
-        if kind == "MapFunction" and len(node.function) == 2 and node.function[0] == "hint_sorted":
+        if kind == "MapFunction" and node.function and node.function[0] == "explode":
+            frame = self._exploded_group_head(node)
+        elif kind == "MapFunction" and len(node.function) == 2 and node.function[0] == "hint_sorted":
             # A sortedness assertion leaves rows unchanged. Ignore the claim
             # until native metadata propagation is implemented; existing native
             # ordering proofs and general algorithms remain available.

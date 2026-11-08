@@ -27,7 +27,21 @@ If CMake has cached headers from a different interpreter, also set
 This is a source-tree prototype; standalone wheels and distribution naming
 are follow-up work.
 
-With `build-release/python:python` on `PYTHONPATH`:
+Python has to find both `build-release/python` (the extension) and `python/`
+(the packages) from whatever directory it runs in. Register them with the
+venv once:
+
+```bash
+.venv/bin/python -c 'import pathlib, site; root = pathlib.Path.cwd(); pathlib.Path(site.getsitepackages()[0], "ibex.pth").write_text(f"{root}/build-release/python\n{root}/python\n")'
+```
+
+Run it from the repository root. The venv's Python then imports `ibex_polars`
+and `ibex_pyarrow` from any directory. Alternatively, set
+`PYTHONPATH="$PWD/build-release/python:$PWD/python"` from the repository root
+in every shell; the relative form `build-release/python:python` only works
+while the current directory is the repository root.
+
+Then:
 
 ```python
 from datetime import date

@@ -76,7 +76,19 @@ cmake --build build-release --target ibex_pyarrow --parallel 4</code></pre>
     <p>
       The build produces the <code>ibex_pyarrow</code> extension in
       <code>build-release/python</code>; the <code>ibex_polars</code> package
-      lives in <code>python/</code>. Put both on the path:
+      lives in <code>python/</code>. Python has to find both, from whatever
+      directory your code runs in. The simplest way is to register them with
+      the venv once; run this <strong>from the repository root</strong>:
+    </p>
+<pre><code>.venv/bin/python -c <span class="str">'import pathlib, site; root = pathlib.Path.cwd(); pathlib.Path(site.getsitepackages()[0], "ibex.pth").write_text(f"{root}/build-release/python\n{root}/python\n")'</span></code></pre>
+    <p>
+      From then on, the venv's Python imports the engine from any directory:
+    </p>
+<pre><code><span class="kw">cd</span> /anywhere &amp;&amp; /path/to/Ibex/.venv/bin/python -c <span class="str">"from ibex_polars import IbexEngine; print('ok')"</span></code></pre>
+    <p>
+      If you would rather not touch the venv, set <code>PYTHONPATH</code>
+      instead. It has to hold absolute paths, so set it from the repository
+      root, and set it again in every new shell:
     </p>
 <pre><code><span class="kw">export</span> PYTHONPATH="$PWD/build-release/python:$PWD/python"</code></pre>
     <p>

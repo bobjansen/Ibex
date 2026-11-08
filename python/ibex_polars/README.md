@@ -13,9 +13,21 @@ result = query.collect(engine=engine)
 ```
 
 The source-tree prototype uses the same native extension as the independent
-API; follow the [build instructions](../README.md). Install `polars==2.0.0`
-and put `build-release/python:python` on `PYTHONPATH`. There is no standalone
-wheel yet. Imports and upstream q01/q06 query bodies remain unchanged; select
+API; follow the [build instructions](../README.md). Install `polars==2.0.0`.
+There is no standalone wheel yet. Register both directories with the venv
+once:
+
+```bash
+.venv/bin/python -c 'import pathlib, site; root = pathlib.Path.cwd(); pathlib.Path(site.getsitepackages()[0], "ibex.pth").write_text(f"{root}/build-release/python\n{root}/python\n")'
+```
+
+Run it from the repository root. The venv's Python then imports `ibex_polars`
+and `ibex_pyarrow` from any directory. Alternatively, set
+`PYTHONPATH="$PWD/build-release/python:$PWD/python"` from the repository root
+in every shell; the relative form `build-release/python:python` only works
+while the current directory is the repository root.
+
+Imports and upstream q01/q06 query bodies remain unchanged; select
 the Engine at collection. `pl.Config.set_engine_affinity(engine)` can select
 it as the default for lazy collection.
 

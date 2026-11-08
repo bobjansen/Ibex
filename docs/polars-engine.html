@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ibex | Polars Engine</title>
+  <meta name="description" content="Run unchanged Polars lazy queries on Ibex: build the IbexEngine, collect with engine=IbexEngine(), prepare and explain queries, set threads, and see what the engine supports." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css" />
+  <script src="./code-copy.js" defer></script>
+</head>
+<body>
+<main class="page">
+
+  <nav class="nav">
+    <span class="nav-logo">Ibex</span>
+    <div class="nav-links">
+      <a class="nav-link" href="./index.html">Home</a>
+      <a class="nav-link active" href="./docs.html">Docs</a>
+      <a class="nav-link" href="./examples.html">Examples</a>
+      <a class="nav-link" href="./playground.html">Playground</a>
+      <a class="nav-link" href="./benchmarks.html">Benchmarks</a>
+      <a class="nav-link" href="./reference.html">Reference</a>
+      <a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </div>
+  </nav>
+
+  <section class="hero">
+    <img class="hero-logo" src="./Ibex.png" alt="Ibex logo" />
+    <p class="eyebrow">Polars Engine</p>
+    <h1>Run your Polars queries on Ibex</h1>
+    <p class="lead">
+      Keep writing Polars. <code>IbexEngine</code> is a Polars execution
+      engine: you build a lazy query with the ordinary Polars API, choose the
+      engine when you collect, and get a real Polars <code>DataFrame</code>
+      back. Polars builds and optimizes the plan; Ibex executes all of it.
+    </p>
+    <div class="cta-row">
+      <a class="button primary" href="#quickstart">Quickstart</a>
+      <a class="button" href="#support">What is supported</a>
+      <a class="button" href="./docs.html">Back to Docs</a>
+    </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Status</p>
+    <h2>Experimental, built from source</h2>
+    <p>
+      The engine runs every query of the
+      <a href="https://github.com/pola-rs/polars-benchmark" target="_blank" rel="noopener">PDS-H benchmark</a>
+      unchanged, with results that match Polars in full. It is still a
+      source-tree prototype: there is no wheel yet, and the adapter is pinned
+      to <strong>Polars 2.0.0</strong>, because it reads Polars' internal plan
+      format, which can change between releases.
+    </p>
+  </section>
+
+  <section class="section" id="install">
+    <p class="section-label">Install</p>
+    <h2>Build the native bridge</h2>
+    <p>
+      You need Clang 20, CMake 3.31+, Ninja, and a Python with development
+      headers, <code>pyarrow</code> and <code>polars==2.0.0</code> installed.
+      Build Ibex with the Python bridge and Parquet support, pointing CMake at
+      that Python:
+    </p>
+<pre><code>git clone https://github.com/bobjansen/Ibex.git &amp;&amp; <span class="kw">cd</span> Ibex
+python3 -m venv .venv &amp;&amp; .venv/bin/pip install polars==2.0.0 pyarrow
+cmake -S . -B build-release -G Ninja \
+  -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release \
+  -DIBEX_BUILD_PYTHON_BRIDGE=ON -DIBEX_BUILD_PARQUET=ON \
+  -DIBEX_PYTHON_EXECUTABLE="$PWD/.venv/bin/python"
+cmake --build build-release --target ibex_pyarrow --parallel 4</code></pre>
+    <p>
+      The build produces the <code>ibex_pyarrow</code> extension in
+      <code>build-release/python</code>; the <code>ibex_polars</code> package
+      lives in <code>python/</code>. Put both on the path:
+    </p>
+<pre><code><span class="kw">export</span> PYTHONPATH="$PWD/build-release/python:$PWD/python"</code></pre>
+    <p>
+      If CMake picked up headers from a different interpreter, also set
+      <code>Python3_INCLUDE_DIR</code> to the include directory of the Python
+      you selected.
+    </p>
+  </section>
+
+  <section class="section" id="quickstart">
+    <p class="section-label">Quickstart</p>
+    <h2>Choose the engine at collect</h2>
+    <p>
+      Nothing about the query changes. Pass an <code>IbexEngine</code> to
+      <code>collect</code>:
+    </p>
+<pre><code><span class="kw">import</span> polars <span class="kw">as</span> pl
+<span class="kw">from</span> ibex_polars <span class="kw">import</span> IbexEngine
+
+trades = pl.<span class="fn-name">DataFrame</span>({
+    <span class="str">"symbol"</span>: [<span class="str">"A"</span>, <span class="str">"A"</span>, <span class="str">"B"</span>, <span class="str">"B"</span>],
+    <span class="str">"day"</span>: [<span class="num">1</span>, <span class="num">1</span>, <span class="num">1</span>, <span class="num">2</span>],
+    <span class="str">"price"</span>: [<span class="num">10.0</span>, <span class="num">11.0</span>, <span class="num">20.0</span>, <span class="num">21.0</span>],
+    <span class="str">"qty"</span>: [<span class="num">5</span>, <span class="num">7</span>, <span class="num">2</span>, <span class="num">3</span>],
+})
+
+query = (
+    trades.<span class="fn-name">lazy</span>()
+    .<span class="fn-name">filter</span>(pl.<span class="fn-name">col</span>(<span class="str">"qty"</span>) &gt; <span class="num">2</span>)
+    .<span class="fn-name">group_by</span>(<span class="str">"symbol"</span>, <span class="str">"day"</span>)
+    .<span class="fn-name">agg</span>(avg_price=pl.<span class="fn-name">mean</span>(<span class="str">"price"</span>), volume=pl.<span class="fn-name">sum</span>(<span class="str">"qty"</span>))
+    .<span class="fn-name">sort</span>(<span class="str">"symbol"</span>, <span class="str">"day"</span>)
+)
+
+engine = <span class="fn-name">IbexEngine</span>()
+result = query.<span class="fn-name">collect</span>(engine=engine)   <span class="cm"># a polars.DataFrame</span></code></pre>
+<pre><code>shape: (2, 4)
+┌────────┬─────┬───────────┬────────┐
+│ symbol ┆ day ┆ avg_price ┆ volume │
+│ ---    ┆ --- ┆ ---       ┆ ---    │
+│ str    ┆ i64 ┆ f64       ┆ i64    │
+╞════════╪═════╪═══════════╪════════╡
+│ A      ┆ 1   ┆ 10.5      ┆ 12     │
+│ B      ┆ 2   ┆ 21.0      ┆ 3      │
+└────────┴─────┴───────────┴────────┘</code></pre>
+    <p>
+      Sources can be resident <code>DataFrame</code>s, as above, or a local
+      Parquet file through <code>pl.scan_parquet(path)</code>, which Ibex reads
+      with its own lazy Parquet reader. To make Ibex the default for every
+      lazy collect, set the engine affinity:
+    </p>
+<pre><code>pl.Config.<span class="fn-name">set_engine_affinity</span>(engine)
+result = query.<span class="fn-name">collect</span>()          <span class="cm"># runs on Ibex</span>
+pl.Config.<span class="fn-name">set_engine_affinity</span>(<span class="str">"auto"</span>)  <span class="cm"># back to Polars</span></code></pre>
+  </section>
+
+  <section class="section" id="prepare">
+    <p class="section-label">Prepare and explain</p>
+    <h2>Translate once, collect many times</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3><code>engine.prepare(query)</code></h3>
+        <p>
+          Translates the plan and binds its inputs without running it. The
+          first collect does this implicitly. Preparing a query over resident
+          frames converts those frames once, which can take noticeably longer
+          than a collect for large inputs; prepare first if you want to keep
+          that out of a timed path. The engine keeps up to 32 prepared plans
+          (<code>IbexEngine(cache_size=N)</code>, <code>0</code> to disable).
+          Plans are cached, results never are: each collect reads its sources
+          again.
+        </p>
+      </article>
+      <article class="card">
+        <h3><code>engine.explain(query)</code></h3>
+        <p>
+          Returns the Ibex program the query becomes, so you can see exactly
+          what runs. Literals cross as typed bindings
+          (<code>^_ibex_scalar_N</code>), never as text pasted into the source.
+        </p>
+      </article>
+    </div>
+<pre><code>engine.<span class="fn-name">prepare</span>(query)
+<span class="fn-name">print</span>(engine.<span class="fn-name">explain</span>(query))</code></pre>
+<pre><code>_ibex_input[filter ((`qty` &gt; ^_ibex_scalar_0))]
+  [select { `symbol`, `day`, `avg_price` = mean(`price`),
+            `volume` = coalesce(sum(`qty`), ^_ibex_scalar_1) }, by { `symbol`, `day` }]
+  [update { `_ibex_sort_null_2_0` = is_null(`symbol`), `_ibex_sort_null_2_1` = is_null(`day`) }]
+  [order { `_ibex_sort_null_2_0` desc, `symbol` asc, `_ibex_sort_null_2_1` desc, `day` asc }];</code></pre>
+    <p>
+      The output above is wrapped for the page. The <code>coalesce</code> and
+      the null-sort columns are how Polars semantics are kept: a Polars sum of
+      no values is zero where Ibex's is null, and Polars' sort puts nulls
+      first.
+    </p>
+  </section>
+
+  <section class="section" id="threads">
+    <p class="section-label">Threads</p>
+    <h2>Setting the thread budget</h2>
+    <p>
+      Ibex sizes its worker pool from the machine. Set
+      <code>IBEX_CORES</code> before the first collect to cap it, the
+      counterpart of Polars' <code>POLARS_MAX_THREADS</code>; set both to the
+      same value when comparing the two engines.
+    </p>
+<pre><code>IBEX_CORES=8 POLARS_MAX_THREADS=8 python my_pipeline.py</code></pre>
+  </section>
+
+  <section class="section" id="support">
+    <p class="section-label">Coverage</p>
+    <h2>What runs on Ibex</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3>Supported</h3>
+        <ul>
+          <li>Resident <code>DataFrame</code>s and single local Parquet files.</li>
+          <li><code>filter</code>, <code>select</code>, <code>with_columns</code>, arithmetic, comparisons, Boolean logic, <code>is_between</code>, <code>is_in</code>, <code>when/then/otherwise</code>, null checks and casts.</li>
+          <li>Column-key <code>group_by</code> with <code>sum</code>, <code>mean</code>, <code>min</code>, <code>max</code>, <code>count</code>, <code>len</code>, <code>n_unique</code>, <code>first</code>/<code>last</code>, including the null-on-empty sum <code>pl.when(x.count() &gt; 0).then(x.sum())</code>.</li>
+          <li>Equality joins (<code>inner</code>, <code>left</code>, <code>right</code>, <code>full</code>, <code>semi</code>, <code>anti</code>), cross joins, composite keys and suffixes.</li>
+          <li>Sorting, <code>unique</code>, <code>slice</code>/<code>head</code>/<code>tail</code>, rounding, string slicing and <code>starts_with</code>/<code>ends_with</code>/<code>contains</code>, Date years.</li>
+          <li>Integer, float, Boolean, String, Categorical, Date, Datetime and Duration columns.</li>
+        </ul>
+      </article>
+      <article class="card">
+        <h3>Not yet</h3>
+        <ul>
+          <li><code>median</code>, quantiles, <code>std</code> and <code>corr</code> as aggregates; <code>top_k</code> and <code>explode</code>.</li>
+          <li>Window expressions (<code>over</code>), computed group or sort keys, Python UDFs.</li>
+          <li>As-of and general non-equi joins, nondefault join validation.</li>
+          <li>General regular expressions; multiple or remote files; struct and list columns.</li>
+          <li>Background, async and sink execution.</li>
+        </ul>
+      </article>
+    </div>
+    <p>
+      There is <strong>no silent fallback</strong>. A plan the engine cannot
+      translate raises <code>NotImplementedError</code> before anything runs,
+      naming the construct. If you want Polars to take over in that case, say
+      so explicitly:
+    </p>
+<pre><code><span class="kw">try</span>:
+    result = query.<span class="fn-name">collect</span>(engine=engine)
+<span class="kw">except</span> NotImplementedError <span class="kw">as</span> exc:   <span class="cm"># e.g. "unsupported aggregate median for Float64"</span>
+    result = query.<span class="fn-name">collect</span>(engine=<span class="str">"streaming"</span>)</code></pre>
+    <p>
+      On the two public benchmark suites: all 22 PDS-H queries run, and of the
+      h2o db-benchmark, all five joins and seven of the ten groupby questions;
+      q6 (median and standard deviation), q8 (top two per group) and q9
+      (correlation) are the gaps listed above.
+    </p>
+  </section>
+
+  <section class="section" id="benchmark">
+    <p class="section-label">Performance</p>
+    <h2>Measure it on your own machine</h2>
+    <p>
+      <code>python/bench_polars_engines.sh</code> runs the same Polars code on
+      Polars' streaming engine and on <code>IbexEngine</code>, over PDS-H
+      (scale 10, Parquet) and the h2o db-benchmark (10M rows, resident), at 8
+      and 1 threads, and checks every answer. Pin it to one CPU per physical
+      core:
+    </p>
+<pre><code>taskset -c 0,2,4,6,8,10,12,14 python/bench_polars_engines.sh \
+    --pdsh-root ../polars-benchmark
+python/summarize_polars_engines.py python/polars-engines-results/&lt;stamp&gt;</code></pre>
+    <p>
+      The <a href="./benchmarks.html">benchmarks page</a> compares Ibex's own
+      language against Polars and DuckDB on the same suites; the
+      <a href="https://github.com/bobjansen/Ibex/blob/main/python/pdsh-performance.md" target="_blank" rel="noopener">PDS-H engine report</a>
+      has per-query measurements of the Polars engine.
+    </p>
+  </section>
+
+  <footer class="footer">
+    <span>Ibex - typed DataFrame pipelines</span>
+    <a href="./docs.html">Back to Docs</a>
+  </footer>
+
+</main>
+</body>
+</html>

@@ -9,6 +9,7 @@ import weakref
 import polars as pl
 import pyarrow as pa
 import pyarrow.compute as pc
+import numpy as np
 
 from . import _categories
 from ._adapter import Adapter, check_version, flag_key
@@ -62,8 +63,38 @@ def _known_ids(name, known):
     return pl.lit(pl.Series(known.ids, dtype=pl.UInt32)).gather(pl.col(name))
 
 
-def _to_polars(result, expected, output, categories=()):
+def _left_rows(rows, source):
+    """The rows of `source` a join's left row numbers name, in their order."""
+    numbers = rows.to_numpy(zero_copy_only=False) if rows.null_count == 0 else None
+    if numbers is not None and len(numbers) and (len(numbers) == 1 or (numbers[1:] > numbers[:-1]).all()):
+        # Each row at most once, in order: a filter, parallel over columns.
+        keep = np.zeros(source.height, dtype=bool)
+        keep[numbers] = True
+        return source.filter(pl.Series(keep))
+    return source[pl.from_arrow(rows)]
+
+
+def _to_polars(result, expected, output, categories=(), left_rows=None):
     """Export the declared result schema without decoding categorical keys."""
+    if left_rows is not None:
+        # A join's left columns, taken from the original frame by row number.
+        row, source = left_rows
+        column = result[row]
+        # combine_chunks copies even a single chunk.
+        left = _left_rows(column.chunk(0) if column.num_chunks == 1 else column.combine_chunks(), source)
+        # Polars' output is the left columns, then the right ones; the native
+        # result's right columns are those, in order, but named against a
+        # left side of only keys and a row number, so they are renamed here.
+        right_names = list(expected)[source.width:]
+        left_count = list(result.column_names).index(row) + 1
+        native = result.select(list(range(left_count, result.num_columns)))
+        if native.num_columns != len(right_names):
+            raise RuntimeError("native join output does not match the plan's right columns")
+        native = native.rename_columns(right_names)
+        rest = {name: expected[name] for name in right_names}
+        right = _to_polars(native, rest, {**output, **dict(zip(right_names, (output[n] for n in result.column_names[left_count:])))},
+                           categories) if rest else None
+        return pl.DataFrame([*left.get_columns(), *(right.get_columns() if right is not None else [])])
     if not expected:
         # Arrow carries a row count for zero-column tables, but from_arrow
         # loses that height. Drop a null-only carrier after conversion; its
@@ -181,11 +212,11 @@ class IbexEngine(pl.Engine):
             raise NotImplementedError("IbexEngine does not support background collection or post-optimization callbacks")
         import ibex_pyarrow
         with self._lock:
-            source, bindings, scalars, expected, output, categories = self._prepare(lf, optimizations)
+            source, bindings, scalars, expected, output, categories, left_rows = self._prepare(lf, optimizations)
             result = ibex_pyarrow.execute_pipeline(source, tables=bindings, scalars=scalars)
         # Conversion/casting constructs the public Polars result; the query's
         # filters, arithmetic and reductions have already executed in Ibex.
-        return _to_polars(result, expected, output, categories)
+        return _to_polars(result, expected, output, categories, left_rows)
 
     def execute(self, lf, *, optimizations):
         return SingleNodeQueryResult(self.collect(lf, optimizations=optimizations))

@@ -14,6 +14,7 @@ import warnings
 from datetime import date
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import pyarrow as pa
 
@@ -168,6 +169,9 @@ class Adapter:
         self.original_frame = lf
         self.checked_join_validation = False
         self.categories = []
+        # (row-number column, left frame): see _passthrough_join.
+        self.left_rows = None
+        self.root = None
         self.nodes = {}
         self.expressions = {}
         self.frame_length_columns = {}
@@ -757,6 +761,111 @@ class Adapter:
         frame = frame.select([*keys, *(name for name, _ in heads)])
         return frame.group_by(keys, maintain_order=group.maintain_order).head(counts.pop())
 
+    def _resident_table(self, node, schema, *, row_number=None):
+        """The Arrow table a resident DataFrameScan binds, of `schema`'s columns.
+
+        `row_number`, when given, names an extra Int64 column of row positions
+        (see `_passthrough_join`).
+        """
+        if node.selection is not None:
+            raise NotImplementedError("DataFrameScan selections are not supported yet")
+        for name, dtype in schema.items():
+            if dtype.base_type() not in _SUPPORTED_INPUT_TYPES:
+                raise NotImplementedError(f"unsupported resident column {name}: {dtype}")
+        # PyDataFrame.select projects column handles, without collecting a
+        # lazy query or evaluating user expressions in the Polars engine.
+        if schema:
+            data = pl.DataFrame._from_pydf(node.df.select(list(schema)))
+            # Categorical columns go in as one dictionary whose entries
+            # remember their Polars ids, which is also far cheaper than
+            # Polars' chunk-by-chunk Arrow export and Ibex's merge of it.
+            shared = [name for name in schema if _categories.eligible(data.get_column(name))]
+            rest = data.drop(shared)
+            table = rest.to_arrow() if rest.width else None
+            for name in shared:
+                array, known = _categories.unify(data.get_column(name))
+                self.categories.append(known)
+                column = pa.chunked_array([array])
+                table = pa.table({name: column}) if table is None else table.append_column(name, column)
+            table = table.select(list(schema))
+        else:
+            # Projection pushdown can remove every column from a len-only
+            # scan. Arrow/native tables need a column to retain its height.
+            height = pl.DataFrame._from_pydf(node.df).height
+            table = pa.table({"_ibex_height": pa.nulls(height, type=pa.int64())})
+        for index, field in enumerate(table.schema):
+            if pa.types.is_timestamp(field.type) or pa.types.is_duration(field.type):
+                table = table.set_column(index, field.name, prepare_column(table.column(index)))
+            elif field.type in _WIDENED_NUMERIC_TYPES:
+                table = table.set_column(index, field.name, table.column(index).cast(_WIDENED_NUMERIC_TYPES[field.type]))
+        if row_number is not None:
+            height = pl.DataFrame._from_pydf(node.df).height
+            table = table.append_column(row_number, pa.array(np.arange(height, dtype=np.int64)))
+        return table
+
+    def _passthrough_join(self, node_id, node, schema):
+        """A root equality join whose left input is a resident frame, with the
+        left columns rebuilt in Polars from row numbers; None when it does not apply.
+
+        The output's left columns are rows of the left frame. The native join
+        carries the left keys and one Int64 row number instead, and the result
+        takes those rows from the original Polars frame: a filter when the
+        row numbers strictly increase (each left row at most once, in order,
+        as Ibex's probe emits them), a gather otherwise. That skips exporting
+        and re-importing them, and above all the `cat.to` that rebuilding a
+        Categorical from Ibex's codes costs, which checks every id against the
+        category mapping and dominates a join with millions of output rows of
+        a high-cardinality key. The join must be the plan's root, so no later
+        step reads the columns.
+        """
+        how, nulls_equal, slice_, suffix, coalesce, maintain_order = node.options
+        if (node_id != self.root or not isinstance(how, str) or how.lower() not in ("inner", "left")
+                or slice_ is not None):
+            return None
+        self.visitor.set_node(node.input_left)
+        scan = self.visitor.view_current_node()
+        if type(scan).__name__ != "DataFrameScan" or node.input_left in self.nodes or scan.selection is not None:
+            return None
+        left_columns = dict(self.visitor.get_schema())
+        left_on = []
+        for named in node.left_on:
+            expr = self.expression(named.node)
+            if expr._op != "col":
+                return None
+            left_on.append(expr._name)
+        self.visitor.set_node(node.input_right)
+        right_columns = tuple(self.visitor.get_schema())
+        right_on = []
+        for named in node.right_on:
+            expr = self.expression(named.node)
+            if expr._op != "col":
+                return None
+            right_on.append(expr._name)
+        # Polars' output: every left column, then the right ones (keys only
+        # when not coalesced), names the left already has suffixed.
+        def layout(columns):
+            return list(left_columns) + [name + suffix if name in left_columns else name for name in columns]
+        for right_out in ([name for name in right_columns if name not in right_on], list(right_columns)):
+            if list(schema) == layout(right_out):
+                break
+        else:
+            return None
+        if not any(dtype.base_type() == pl.Categorical for dtype in left_columns.values()):
+            return None
+        row = "_ibex_join_row"
+        while row in left_columns or row in schema:
+            row += "_"
+        native_left = {name: left_columns[name] for name in dict.fromkeys(left_on)}
+        left = ibex.LazyFrame(("table", self._resident_table(scan, native_left, row_number=row)))
+        right = self.frame(node.input_right)
+        source = pl.DataFrame._from_pydf(scan.df.select(list(left_columns)))
+        self.left_rows = (row, source)
+        self._check_join_validation()
+        return left.join(right, left_on=left_on, right_on=right_on, how=how.lower(),
+                         suffix=suffix, nulls_equal=nulls_equal, coalesce=coalesce,
+                         maintain_order=maintain_order,
+                         _left_columns=tuple(native_left) + (row,), _right_columns=right_columns)
+
     def frame(self, node_id):
         if node_id in self.nodes:
             return self.nodes[node_id]
@@ -799,38 +908,7 @@ class Adapter:
             frame = self.frame(node.input)._append("cache", node.id_)
             self.frame_length_columns[node_id] = self.frame_length_columns.get(node.input, set())
         elif kind == "DataFrameScan":
-            if node.selection is not None:
-                raise NotImplementedError("DataFrameScan selections are not supported yet")
-            for name, dtype in schema.items():
-                if dtype.base_type() not in _SUPPORTED_INPUT_TYPES:
-                    raise NotImplementedError(f"unsupported resident column {name}: {dtype}")
-            # PyDataFrame.select projects column handles, without collecting a
-            # lazy query or evaluating user expressions in the Polars engine.
-            if schema:
-                data = pl.DataFrame._from_pydf(node.df.select(list(schema)))
-                # Categorical columns go in as one dictionary whose entries
-                # remember their Polars ids, which is also far cheaper than
-                # Polars' chunk-by-chunk Arrow export and Ibex's merge of it.
-                shared = [name for name in schema if _categories.eligible(data.get_column(name))]
-                rest = data.drop(shared)
-                table = rest.to_arrow() if rest.width else None
-                for name in shared:
-                    array, known = _categories.unify(data.get_column(name))
-                    self.categories.append(known)
-                    column = pa.chunked_array([array])
-                    table = pa.table({name: column}) if table is None else table.append_column(name, column)
-                table = table.select(list(schema))
-            else:
-                # Projection pushdown can remove every column from a len-only
-                # scan. Arrow/native tables need a column to retain its height.
-                height = pl.DataFrame._from_pydf(node.df).height
-                table = pa.table({"_ibex_height": pa.nulls(height, type=pa.int64())})
-            for index, field in enumerate(table.schema):
-                if pa.types.is_timestamp(field.type) or pa.types.is_duration(field.type):
-                    table = table.set_column(index, field.name, prepare_column(table.column(index)))
-                elif field.type in _WIDENED_NUMERIC_TYPES:
-                    table = table.set_column(index, field.name, table.column(index).cast(_WIDENED_NUMERIC_TYPES[field.type]))
-            frame = ibex.LazyFrame(("table", table))
+            frame = ibex.LazyFrame(("table", self._resident_table(node, schema)))
         elif kind == "Scan":
             if node.scan_type[0] != "parquet" or len(node.paths) != 1:
                 raise NotImplementedError("only single local Parquet scans are supported")
@@ -911,6 +989,8 @@ class Adapter:
                               _left_columns=left_columns, _right_columns=right_columns).filter(*predicates)
             if slice_ is not None:
                 frame = frame.slice(*slice_)
+        elif kind == "Join" and (passed := self._passthrough_join(node_id, node, schema)) is not None:
+            frame = passed
         elif kind == "Join":
             how, nulls_equal, slice_, suffix, coalesce, maintain_order = node.options
             if not isinstance(how, str):
@@ -1007,6 +1087,7 @@ class Adapter:
 
     def compile(self):
         root = self.visitor.get_node()
+        self.root = root
         expected = self.visitor.get_schema()
         frame = self.frame(root)
         # Validate the complete supported plan before native input binding.
@@ -1025,4 +1106,4 @@ class Adapter:
         frame = prepare_inputs(frame)
         result_schema = {}
         source, bindings, scalars = lower(frame, validate=True, result_schema=result_schema, widen_numeric_inputs=True)
-        return source, bindings, scalars, expected, result_schema, self.categories
+        return source, bindings, scalars, expected, result_schema, self.categories, self.left_rows

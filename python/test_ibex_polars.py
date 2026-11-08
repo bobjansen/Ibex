@@ -678,6 +678,35 @@ class EngineTests(unittest.TestCase):
                 pl.LazyFrame({"x": pl.Series([1], dtype=dtype)}).select(-pl.col("x")).collect(engine=self.engine)
 
     @unittest.skipIf(os.environ.get("IBEX_TEST_PARQUET") == "0", "Parquet backend disabled")
+    def test_root_join_takes_left_columns_from_the_left_frame(self):
+        # A root equality join over a resident left frame carries only the
+        # left keys and a row number natively; the left columns come from the
+        # original frame (a filter when each left row appears once, in order,
+        # a gather otherwise). Checked against both Polars executors' layout:
+        # coalesced or not, suffixes, null keys, duplicate right keys (rows
+        # repeat, so the gather), an empty result and narrow input types.
+        left = pl.DataFrame({"k": [1, 2, 3, 4, 1, None], "c": ["a", "b", "c", "a", "z", "b"],
+                             "v": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], "i": [9, 8, 7, 6, 5, 4]},
+                            schema_overrides={"k": pl.Int32, "v": pl.Float32, "i": pl.Int16}
+                            ).with_columns(pl.col("c").cast(pl.Categorical))
+        right = pl.DataFrame({"k": [1, 2, 9, None], "c": ["p", "q", "r", None], "w": [10.0, 20.0, 30.0, 40.0]},
+                             schema_overrides={"k": pl.Int32}).with_columns(pl.col("c").cast(pl.Categorical))
+        repeated = pl.concat([right, right.head(2)])
+        def unordered(query):
+            expected = query.collect(engine="streaming")
+            actual = query.collect(engine=self.engine)
+            self.assertIsNotNone(self.engine._prepare(query, pl.QueryOptFlags())[6])
+            assert_frame_equal(actual.sort(actual.columns, nulls_last=True),
+                               expected.sort(expected.columns, nulls_last=True))
+        lazy, other = left.lazy(), right.lazy()
+        for query in (lazy.join(other, on="k"), lazy.join(other, on="k", how="left"),
+                      lazy.join(other, on="k", how="left", suffix="_s"),
+                      lazy.join(other, on="k", coalesce=False), lazy.join(other, on="k", nulls_equal=True),
+                      lazy.join(other, on="c"), lazy.join(repeated.lazy(), on="k", how="left"),
+                      lazy.join(other.filter(pl.col("w") > 99), on="k")):
+            with self.subTest(query=query.explain()):
+                unordered(query)
+
     def test_categorical_results_keep_their_polars_ids(self):
         # A result column that still carries the dictionary Ibex was given
         # maps its codes back to Polars ids: plus an offset when the ids are

@@ -99,6 +99,36 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             # With no ordinary value, mean is NaN for all-NaN groups and
             # null for empty/all-null groups. It supplies the exact fallback.
             return f"coalesce({op.removeprefix('polars_')}({render(clean)}), mean({render(value)}))"
+        if op == "polars_median":
+            return f"median({render(args[0])})"
+        # A floating median is three reductions and a row expression over them
+        # (median_pick), placed after the aggregate like rounding: native
+        # grouping takes no conditional over reductions as a field.
+        if op == "present_count":
+            return f"sum(Int64(!is_null({render(args[0])})))"
+        if op == "nan_count":
+            return f"coalesce(sum(Int64(is_nan({render(args[0])}))), {bind(0)})"
+        if op == "nan_high_median":
+            value = render(args[0])
+            return f"median(case {{ is_nan({value}) => {bind(float('inf'))}, else => {value} }})"
+        if op == "median_pick":
+            # Polars ranks NaN above every number, so a NaN at a middle
+            # position makes the median NaN. Of n present values with k NaNs,
+            # the NaNs fill sorted positions n-k..n-1 and the upper middle is
+            # floor(n/2): a middle is NaN exactly when 2(n-k) <= n. Otherwise
+            # the NaNs, read as +inf, lie above both middles.
+            present, nans, ranked = (render(arg) for arg in args)
+            return (f"case {{ {present} > 0 && 2 * ({present} - {nans}) <= {present} => "
+                    f"{bind(float('nan'))}, else => {ranked} }}")
+        if op == "polars_std":
+            return f"std({render(args[0])})"
+        if op == "polars_corr":
+            # Native corr follows SQL: null for fewer than two complete pairs,
+            # a constant column or NaN input. Polars returns NaN for each.
+            return f"coalesce(corr({render(args[0])}, {render(args[1])}), {bind(float('nan'))})"
+        if op == "square":
+            value = render(args[0])
+            return f"({value} * {value})"
         if op == "n_unique":
             value = render(args[0])
             return f"(count_distinct({value}) + coalesce(max(Int64(is_null({value}))), {bind(0)}))"
@@ -701,6 +731,31 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
             if result == pa.date32() and op.endswith("_non_null"):
                 raise NotImplementedError("null-skipping Date edge reductions are unsupported by Ibex")
             return result
+        if op in ("present_count", "nan_count"):
+            if dtype(args[0]) != pa.float64() or not args[0]._row_reference:
+                raise NotImplementedError(f"{op} requires a floating row expression")
+            return pa.int64()
+        if op == "nan_high_median":
+            if dtype(args[0]) != pa.float64() or not args[0]._row_reference:
+                raise NotImplementedError("NaN-aware median requires a floating row expression")
+            return pa.float64()
+        if op == "median_pick":
+            types = [dtype(arg) for arg in args]
+            if types != [pa.int64(), pa.int64(), pa.float64()]:
+                raise NotImplementedError("median_pick takes two counts and a median")
+            return pa.float64()
+        if op in ("polars_median", "polars_std"):
+            if dtype(args[0]) not in (pa.int64(), pa.float64()) or not args[0]._row_reference:
+                raise NotImplementedError(f"{op.removeprefix('polars_')} requires a numeric row expression")
+            return pa.float64()
+        if op == "polars_corr":
+            if any(dtype(arg) not in (pa.int64(), pa.float64()) or not arg._row_reference for arg in args):
+                raise NotImplementedError("corr requires two numeric row expressions")
+            return pa.float64()
+        if op == "square":
+            if dtype(args[0]) != pa.float64():
+                raise NotImplementedError("squaring requires a floating expression")
+            return pa.float64()
         if op in ("polars_min", "polars_max"):
             if dtype(args[0]) != pa.float64() or not args[0]._row_reference:
                 raise NotImplementedError("NaN-aware extrema require a floating row expression")

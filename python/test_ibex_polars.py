@@ -678,6 +678,37 @@ class EngineTests(unittest.TestCase):
                 pl.LazyFrame({"x": pl.Series([1], dtype=dtype)}).select(-pl.col("x")).collect(engine=self.engine)
 
     @unittest.skipIf(os.environ.get("IBEX_TEST_PARQUET") == "0", "Parquet backend disabled")
+    def test_median_std_and_corr_follow_polars_nan_and_null_rules(self):
+        # Polars ranks NaN above every number in a median (so [1, NaN, 3]
+        # has median 3), and corr is NaN, not SQL's null, for fewer than two
+        # complete pairs, a constant column or NaN input. std is the sample
+        # standard deviation, null for one value. h2o q6 and q9 use these.
+        nan, inf = float("nan"), float("inf")
+        groups = {"one": ([1.0], [2.0]), "const": ([1.0, 1.0, 1.0], [2.0, 3.0, 4.0]),
+                  "nan": ([1.0, nan, 3.0], [1.0, 2.0, 3.0]), "nan_even": ([1.0, nan, 3.0, 2.0], [1.0, 2.0, 3.0, 4.0]),
+                  "nan_half": ([nan, nan, 1.0], [1.0, 2.0, 3.0]), "all_nan": ([nan, nan], [1.0, 2.0]),
+                  "inf": ([inf, 1.0, nan], [1.0, 2.0, 3.0]), "nulls": ([1.0, None, 3.0, 4.0], [2.0, 5.0, None, 1.0]),
+                  "all_null": ([None, None], [1.0, 2.0]), "y_null": ([1.0, 2.0, 3.0], [None, None, 4.0]),
+                  "signed_zero": ([-0.0, 0.0, 1.0], [1.0, 2.0, 3.0]), "nan_null": ([nan, None, 2.0, 3.0], [1.0, 2.0, 3.0, 4.0])}
+        frame = pl.DataFrame({"g": [g for g, (xs, _) in groups.items() for _ in xs],
+                              "x": [x for xs, _ in groups.values() for x in xs],
+                              "y": [y for _, ys in groups.values() for y in ys]}).lazy()
+        actual = self.equal(frame.group_by("g", maintain_order=True).agg(
+            pl.median("x").alias("median"), pl.std("x").alias("sd"), pl.corr("x", "y").alias("r"),
+            (pl.corr("x", "y") ** 2).alias("r2")))
+        self.assertEqual(actual.filter(pl.col("g") == "nan")["median"].item(), 3.0)
+        ints = pl.DataFrame({"g": ["a", "a", "a", "b", "c", "c"], "i": [1, 2, 3, 5, None, 4],
+                             "j": [2, 4, 7, 1, 3, 3]}, schema_overrides={"i": pl.Int32, "j": pl.Int32}).lazy()
+        self.equal(ints.group_by("g", maintain_order=True).agg(
+            pl.median("i"), pl.std("i").alias("sd"), (pl.corr("i", "j") ** 2).alias("r2")))
+        self.equal(frame.select(pl.median("x").alias("m"), pl.std("y").alias("s"),
+                                (pl.corr("x", "y") ** 2).alias("r2")))
+        for query in (frame.group_by("g").agg(pl.col("x").std(ddof=0)), frame.select(pl.col("x") ** 3),
+                      frame.group_by("g").agg(pl.corr("x", "y", method="spearman")),
+                      ints.select(pl.col("i") ** 2)):
+            with self.subTest(query=query.explain()), self.assertRaises(NotImplementedError):
+                self.engine.prepare(query)
+
     def test_grouped_head_and_top_k_explode(self):
         # Polars plans both as per-group lists that explode back into rows.
         # Without maintain_order Polars promises no row order, and top_k no
@@ -1173,7 +1204,7 @@ class EngineTests(unittest.TestCase):
     def test_version_and_unsupported_plans_fail_without_native_execution(self):
         base = pl.DataFrame({"x": [1.0, 2.0]}).lazy()
         with patch.object(ibex_pyarrow, "bind_table") as bind, patch.object(ibex_pyarrow, "execute_pipeline") as execute:
-            for query in (base.select(pl.lit(None)), base.select(pl.col("x").median()),
+            for query in (base.select(pl.lit(None)), base.select(pl.col("x").quantile(0.3)),
                           base.join(base, on="x", validate="1:1"),
                           base.with_columns(pl.col("x").mean().alias("average")),
                           base.group_by(pl.col("x") + 1).agg(pl.len()).head(1)):

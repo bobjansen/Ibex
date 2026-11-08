@@ -227,6 +227,18 @@ class Adapter:
                 expr = Expr("polars_" + value.name, (self.expression(value.arguments[0]),))
                 self.expressions[key] = expr
                 return expr
+            if value.name in ("median", "std") and input_type in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64):
+                # Polars' std option is ddof; native std is the sample (ddof 1).
+                if value.options != (None if value.name == "median" else 1):
+                    raise NotImplementedError(f"unsupported {value.name} options {value.options!r}")
+                child = self.expression(value.arguments[0])
+                if value.name == "median" and input_type in (pl.Float32, pl.Float64):
+                    expr = Expr("median_pick", (Expr("present_count", (child,)), Expr("nan_count", (child,)),
+                                                Expr("nan_high_median", (child,))))
+                else:
+                    expr = Expr("polars_" + value.name, (child,))
+                self.expressions[key] = expr
+                return expr
             if value.name == "n_unique" and input_type in (*_INTEGER_LAYOUTS, pl.String, pl.Boolean):
                 if value.options not in (None, False):
                     raise NotImplementedError("unsupported distinct-count options")
@@ -435,6 +447,20 @@ class Adapter:
                 # This predicate is optional top-k pruning for a known sort.
                 # A full native sort followed by the slice needs no pruning.
                 expr = ibex.lit(True)
+            elif name == "corr" and value.function_data == ("corr", "pearson") and len(args) == 2:
+                if any(self.visitor.get_dtype(child) not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64)
+                       for child in value.input):
+                    raise NotImplementedError("corr requires numeric inputs")
+                expr = Expr("polars_corr", args)
+            elif name == "pow" and len(args) == 2 and len(value.function_data) == 1:
+                # Only x ** 2 on a float: x * x, which IEEE rounds exactly as
+                # pow(x, 2) does. Other exponents and bases stay unsupported.
+                exponent = self.visitor.view_expression(value.input[1])
+                if (type(exponent).__name__ != "Literal" or exponent.value != 2
+                        or type(exponent.value) is not int
+                        or self.visitor.get_dtype(value.input[0]) != pl.Float64):
+                    raise NotImplementedError("pow is supported only as a Float64 squared")
+                expr = Expr("square", (args[0],))
             elif name == "Not" and len(args) == 1:
                 expr = ~args[0]
             elif name == "IsNull" and len(args) == 1:
@@ -486,7 +512,8 @@ class Adapter:
 
     def _aggregate_rounding(self, frame, fields, *, keys=None, maintain_order=False):
         def contains_round(expr):
-            return expr._op == "polars_round" or any(
+            # Row expressions over a reduction's result: rounding, squaring.
+            return expr._op in ("polars_round", "square", "median_pick") or any(
                 contains_round(arg) for arg in expr._args if isinstance(arg, Expr))
         if not any(expr._aggregate and contains_round(expr) for expr in fields):
             return (frame.select(fields) if keys is None else

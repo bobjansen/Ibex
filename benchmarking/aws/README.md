@@ -251,8 +251,9 @@ and then 1 threads. It runs `python/bench_polars_engines.sh` on the box:
 all 22 unchanged upstream PDS-H queries at SF-10 (upstream's generator,
 medians of 6 interleaved rounds, every result compared in full), and the h2o
 groupby and join questions on the upstream R generators' data (the harness's
-bounded answer checks, minimum of 5 iterations). Groupby covers the questions
-`IbexEngine` translates, all but q6 and q9. The box builds the Python
+bounded answer checks, minimum of 5 iterations), all ten groupby questions
+and all five joins. `summary.md` reports each query's `IbexEngine` prepare
+time beside the timings, which exclude it. The box builds the Python
 bridge against the uv venv's interpreter and checks that it imports before
 generating any data.
 

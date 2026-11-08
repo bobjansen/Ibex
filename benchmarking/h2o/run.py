@@ -323,12 +323,16 @@ def polars_worker(data: str, task: str, nas: bool, wanted, warmup, iters, full=F
     for qid, desc, chk_cols, _, pq, _ in questions_for(task, nas):
         if wanted and qid not in wanted:
             continue
-        query, executor = pq(*frames), "streaming"
+        query, executor, prepare_ms = pq(*frames), "streaming", None
         if engine == "polars-ibex":
             # A fresh engine per question: its prepared-plan cache is keyed
             # by query, so a shared one could serve a stale translation.
+            # Preparing translates the plan and imports the resident frames,
+            # once; it is outside the timed collects, so it is reported.
             executor = IbexEngine()
+            t0 = time.perf_counter()
             executor.prepare(query)
+            prepare_ms = (time.perf_counter() - t0) * 1000.0
         times, ans = [], None
         for _ in range(warmup + iters):
             ans = None
@@ -338,6 +342,8 @@ def polars_worker(data: str, task: str, nas: bool, wanted, warmup, iters, full=F
         chk = [float(ans[c].cast(pl.Float64).sum()) for c in chk_cols]
         answer = fingerprint_frames(task, qid, engine, ans.columns, ans.iter_slices(65536), full)
         results.append(ok(engine, qid, desc, times[warmup:], ans.height, chk, answer))
+        if prepare_ms is not None:
+            results[-1]["prepare_ms"] = prepare_ms
         del query, executor
     return results
 

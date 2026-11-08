@@ -207,7 +207,7 @@ pl.Config.<span class="fn-name">set_engine_affinity</span>(<span class="str">"au
         <ul>
           <li>Resident <code>DataFrame</code>s and single local Parquet files.</li>
           <li><code>filter</code>, <code>select</code>, <code>with_columns</code>, arithmetic, comparisons, Boolean logic, <code>is_between</code>, <code>is_in</code>, <code>when/then/otherwise</code>, null checks and casts.</li>
-          <li>Column-key <code>group_by</code> with <code>sum</code>, <code>mean</code>, <code>min</code>, <code>max</code>, <code>count</code>, <code>len</code>, <code>n_unique</code>, <code>first</code>/<code>last</code>, including the null-on-empty sum <code>pl.when(x.count() &gt; 0).then(x.sum())</code>.</li>
+          <li>Column-key <code>group_by</code> with <code>sum</code>, <code>mean</code>, <code>min</code>, <code>max</code>, <code>count</code>, <code>len</code>, <code>n_unique</code>, <code>first</code>/<code>last</code>, <code>median</code>, <code>std</code> (ddof 1), Pearson <code>corr</code> and its square, including the null-on-empty sum <code>pl.when(x.count() &gt; 0).then(x.sum())</code>.</li>
           <li>Equality joins (<code>inner</code>, <code>left</code>, <code>right</code>, <code>full</code>, <code>semi</code>, <code>anti</code>), cross joins, composite keys and suffixes.</li>
           <li>Per-group rows: <code>group_by(...).head(n)</code>, and <code>agg(pl.col(x).top_k(k)).explode(...)</code> on a numeric column.</li>
           <li>Sorting, <code>unique</code>, <code>slice</code>/<code>head</code>/<code>tail</code>, rounding, string slicing and <code>starts_with</code>/<code>ends_with</code>/<code>contains</code>, Date years.</li>
@@ -217,7 +217,7 @@ pl.Config.<span class="fn-name">set_engine_affinity</span>(<span class="str">"au
       <article class="card">
         <h3>Not yet</h3>
         <ul>
-          <li><code>median</code>, quantiles, <code>std</code> and <code>corr</code> as aggregates; list-valued results (<code>agg(pl.col(x).head(n))</code> without <code>explode</code>), and <code>explode</code> other than of a per-group head or top_k.</li>
+          <li>Quantiles, <code>var</code>, <code>std</code> with another ddof, Spearman <code>corr</code>, and powers other than a float squared; list-valued results (<code>agg(pl.col(x).head(n))</code> without <code>explode</code>), and <code>explode</code> other than of a per-group head or top_k.</li>
           <li>Window expressions (<code>over</code>), computed group or sort keys, Python UDFs.</li>
           <li>As-of and general non-equi joins, nondefault join validation.</li>
           <li>General regular expressions; multiple or remote files; struct and list columns.</li>
@@ -233,13 +233,11 @@ pl.Config.<span class="fn-name">set_engine_affinity</span>(<span class="str">"au
     </p>
 <pre><code><span class="kw">try</span>:
     result = query.<span class="fn-name">collect</span>(engine=engine)
-<span class="kw">except</span> NotImplementedError <span class="kw">as</span> exc:   <span class="cm"># e.g. "unsupported aggregate median for Float64"</span>
+<span class="kw">except</span> NotImplementedError <span class="kw">as</span> exc:   <span class="cm"># e.g. "unsupported function ('quantile', 'nearest')"</span>
     result = query.<span class="fn-name">collect</span>(engine=<span class="str">"streaming"</span>)</code></pre>
     <p>
       On the two public benchmark suites: all 22 PDS-H queries run, and of the
-      h2o db-benchmark, all five joins and eight of the ten groupby
-      questions; q6 (median and standard deviation) and q9 (correlation) are
-      the gaps listed above.
+      h2o db-benchmark, all ten groupby questions and all five joins.
     </p>
   </section>
 
@@ -250,7 +248,10 @@ pl.Config.<span class="fn-name">set_engine_affinity</span>(<span class="str">"au
       <code>python/bench_polars_engines.sh</code> runs the same Polars code on
       Polars' streaming engine and on <code>IbexEngine</code>, over PDS-H
       (scale 10, Parquet) and the h2o db-benchmark (10M rows, resident), at 8
-      and 1 threads, and checks every answer. Pin it to one CPU per physical
+      and 1 threads, and checks every answer. It reports each query's
+      <code>prepare()</code> time beside the timed collects: for resident
+      frames, preparing imports them once, which Polars never does. Pin it
+      to one CPU per physical
       core:
     </p>
 <pre><code>taskset -c 0,2,4,6,8,10,12,14 python/bench_polars_engines.sh \

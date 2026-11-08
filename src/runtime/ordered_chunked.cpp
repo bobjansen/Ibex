@@ -20,7 +20,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <expected>
 #include <functional>
 #include <limits>
@@ -907,8 +906,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
     void prepare_pod_dense(PodPartition<K>& part, const KeyCol& key0, const IntKey& int_key,
                            std::size_t rows) {
         constexpr std::uint64_t kMaxCells = std::uint64_t{1} << 26;
-        if (pod_dense_retired_ || (!pod_dense_ && !part.sizes.empty()) ||
-            std::getenv("IBEX_DISABLE_DENSE_TOPK_KEY") != nullptr) {
+        if (pod_dense_retired_ || (!pod_dense_ && !part.sizes.empty())) {
             pod_dense_retired_ = true;
             return;
         }

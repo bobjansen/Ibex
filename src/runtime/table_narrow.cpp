@@ -6,7 +6,7 @@
 #include <ibex/runtime/interpreter.hpp>
 
 #include <atomic>
-#include <cstdlib>
+#include <cstddef>
 #include <optional>
 #include <set>
 #include <string>
@@ -23,10 +23,6 @@ auto narrowed_column_count() -> std::size_t {
 
 auto narrow_to_columns(const Table& table, const std::set<std::string>& demanded)
     -> std::optional<Table> {
-    static const bool disabled = std::getenv("IBEX_DISABLE_EAGER_PROJECTION") != nullptr;
-    if (disabled) {
-        return std::nullopt;
-    }
     std::set<std::string> keep = demanded;
     const auto& props = table.properties();
     if (props.ordering().has_value()) {

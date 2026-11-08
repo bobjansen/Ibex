@@ -26,7 +26,6 @@ namespace ibex::runtime {
 /// properties stay true of the cut. A demand naming no column keeps the table
 /// whole: a plan reading none (`x[select { n = count() }]`) still needs the
 /// row count, which a column-less table would lose.
-/// `IBEX_DISABLE_EAGER_PROJECTION` turns narrowing off.
 [[nodiscard]] auto narrow_to_columns(const Table& table, const std::set<std::string>& demanded)
     -> std::optional<Table>;
 

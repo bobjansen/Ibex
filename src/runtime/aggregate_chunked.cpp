@@ -1986,8 +1986,7 @@ class HashAggregateState final {
                 // the layout), which is what lets three Int64 keys plus three
                 // Categoricals pack at all; a chunk that outgrows the layout
                 // migrates to the generic path below.
-                encoder_.size_cells_from_data =
-                    std::getenv("IBEX_DISABLE_RANGED_PACKED_KEY") == nullptr;
+                encoder_.size_cells_from_data = true;
                 //
                 // Not when `cat_fast_path_` already owns the shape (three or
                 // more Categoricals). It dispatches first, so the packed flag
@@ -2320,21 +2319,19 @@ class HashAggregateState final {
         }
         std::vector<std::uint8_t> discovery_first(n_aggs_, 0U);
         bool has_discovery_first = false;
-        if (std::getenv("IBEX_DISABLE_DISCOVERY_FIRST") == nullptr) {
-            for (std::size_t a = 0; a < n_aggs_; ++a) {
-                if (discovery_first_eligible_[a] == 0U) {
-                    continue;
-                }
-                if (agg_entries[a]->validity.has_value()) {
-                    // A group may still be waiting for its first non-null
-                    // value. Keep this field on the ordinary scan for every
-                    // later chunk too, even if that later chunk has no nulls.
-                    discovery_first_eligible_[a] = 0U;
-                    continue;
-                }
-                discovery_first[a] = 1U;
-                has_discovery_first = true;
+        for (std::size_t a = 0; a < n_aggs_; ++a) {
+            if (discovery_first_eligible_[a] == 0U) {
+                continue;
             }
+            if (agg_entries[a]->validity.has_value()) {
+                // A group may still be waiting for its first non-null value.
+                // Keep this field on the ordinary scan for every later chunk
+                // too, even if that later chunk has no nulls.
+                discovery_first_eligible_[a] = 0U;
+                continue;
+            }
+            discovery_first[a] = 1U;
+            has_discovery_first = true;
         }
         const std::size_t groups_before = n_groups_;
         std::vector<std::size_t> first_rows;
@@ -2662,9 +2659,7 @@ class HashAggregateState final {
                                const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
         -> bool {
         if (!owned_async_hot_mode_) {
-            if (std::getenv("IBEX_DISABLE_OWNED_PAIR_AGG") != nullptr ||
-                std::getenv("IBEX_DISABLE_ASYNC_HOT_AGG") != nullptr || n_groups_ > 0 ||
-                partitioned_active_ || owned_mode_ || n_aggs_ != 1 ||
+            if (n_groups_ > 0 || partitioned_active_ || owned_mode_ || n_aggs_ != 1 ||
                 plan_[0].func != ir::AggFunc::Sum ||
                 (plan_[0].kind != ExprType::Double && plan_[0].kind != ExprType::Int) ||
                 int_key_kind_ != IntKeyKind::Int64 || scratch_stride_ != 0 || exec_ == nullptr ||
@@ -2813,8 +2808,7 @@ class HashAggregateState final {
                             const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
         -> bool {
         if (!owned_async_pair_mode_) {
-            if (std::getenv("IBEX_DISABLE_ASYNC_PAIR_AGG") != nullptr || n_groups_ > 0 ||
-                partitioned_active_ || owned_mode_ || n_aggs_ != 1 ||
+            if (n_groups_ > 0 || partitioned_active_ || owned_mode_ || n_aggs_ != 1 ||
                 plan_[0].func != ir::AggFunc::Sum ||
                 (plan_[0].kind != ExprType::Double && plan_[0].kind != ExprType::Int) ||
                 pair_packs_u64_ || scratch_stride_ != 0 || exec_ == nullptr ||
@@ -2891,17 +2885,12 @@ class HashAggregateState final {
     ///   several -- widen only after that shape is actually benchmarked.
     /// - Row-wise fusion only: with exactly one aggregate a second full row
     ///   scan can only add cost, never locality it does not already have.
-    /// - No env-var mode selector: this runs whenever eligible, the same way
-    ///   `try_discover_partitioned` has no toggle either. `IBEX_DISABLE_
-    ///   OWNED_PAIR_AGG=1` is a kill switch for the unusual case that needs
-    ///   one, not a normal control surface.
+    /// - No env-var mode selector or kill switch: this runs whenever
+    ///   eligible, the same way `try_discover_partitioned` does.
     template <typename Key, typename Hash, typename KeyAt, typename Partitions>
     auto try_owned(const KeyAt& key_at, std::size_t rows, std::uint32_t* gids,
                    const std::vector<const ColumnEntry*>& agg_entries, Partitions& partitions,
                    std::size_t min_rows) -> bool {
-        if (std::getenv("IBEX_DISABLE_OWNED_PAIR_AGG") != nullptr) {
-            return false;
-        }
         if (!owned_mode_) {
             if (n_groups_ > 0 || partitioned_active_) {
                 return false;
@@ -2961,7 +2950,7 @@ class HashAggregateState final {
         if constexpr (std::is_same_v<Key, std::int64_t>) {
             compress_runs = owned_ordered_run_mode_;
             if (!compress_runs && !owned_mode_ && plan_[0].func == ir::AggFunc::Count &&
-                rows >= 64 && std::getenv("IBEX_DISABLE_ORDERED_RUN_AGG") == nullptr) {
+                rows >= 64) {
                 const std::size_t sampled = std::min<std::size_t>(rows, 8192);
                 std::size_t repeats = 0;
                 Key previous = key_at(0);
@@ -3557,8 +3546,7 @@ class HashAggregateState final {
             // is a strategy specialization, floor beside its code).
             std::size_t workers = 1;
             if (exec_ != nullptr && par_.final_ordering.decline == physical::FanOutDecline::None &&
-                !on_worker_pool_thread() && run_count >= (std::size_t{1} << 16U) &&
-                std::getenv("IBEX_DISABLE_PARALLEL_ORDERED_MERGE") == nullptr) {
+                !on_worker_pool_thread() && run_count >= (std::size_t{1} << 16U)) {
                 workers = std::min({par_.final_ordering.worker_cap, run_count / 8192});
             }
 
@@ -4096,8 +4084,7 @@ class HashAggregateState final {
         if (int_dense_retired_ || rows == 0) {
             return false;
         }
-        if (!int_dense_active_ && (n_groups_ > 0 || partitioned_active_ || owned_mode_ ||
-                                   std::getenv("IBEX_DISABLE_INT_DENSE_KEY") != nullptr)) {
+        if (!int_dense_active_ && (n_groups_ > 0 || partitioned_active_ || owned_mode_)) {
             int_dense_retired_ = true;
             return false;
         }
@@ -8922,8 +8909,7 @@ class HashAggregateState final {
 
     // --- Partition-owned aggregation (step 2 of the partition-owned
     // aggregate API): the PairIntKey path only, admitted
-    // by `try_owned_pair`'s gates. `IBEX_DISABLE_OWNED_PAIR_AGG=1` is its kill
-    // switch.
+    // by `try_owned_pair`'s gates.
 
     /// A partition's group discovery AND its own final aggregate state --
     /// no global gid, no global `flat_slots_` entry, until

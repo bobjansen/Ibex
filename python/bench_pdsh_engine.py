@@ -42,6 +42,8 @@ def main():
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--check-only', action='store_true', help='compare complete results without timing loops')
     parser.add_argument('--queries', type=int, nargs='+', choices=range(1, 23), default=list(range(1, 23)))
+    parser.add_argument('--skip-in-memory', action='store_true',
+                        help="time only Polars' streaming engine and IbexEngine; streaming is then the reference")
     args = parser.parse_args()
     scale_factor = args.scale_factor
     if scale_factor is None and args.data.resolve().name.startswith('scale-'):
@@ -91,10 +93,13 @@ def main():
         'data': [{'path': str(p), 'bytes': p.stat().st_size, 'mtime_ns': p.stat().st_mtime_ns} for p in paths],
         'iterations': 0 if args.check_only else args.iters,
         'check_only': args.check_only, 'query_numbers': args.queries,
+        'routes': ['polars_streaming', 'polars_ibex'] if args.skip_in_memory else ['polars', 'polars_streaming', 'polars_ibex'],
         'method': ('Parquet collection; prepared translation; complete correctness comparisons; no warmups or timing loops'
                    if args.check_only else
                    'Parquet collection; prepared translation; two warmups after first collection; alternating route order; previous-result destruction excluded; no result caching'),
-        'correctness': 'all rows, order and dtypes; Q11 permits reordering only within value-sort ties while checking descending values; rel_tol=1e-10 abs_tol=1e-8; both Polars executors compared',
+        'correctness': 'all rows, order and dtypes; Q11 permits reordering only within value-sort ties while checking descending values; rel_tol=1e-10 abs_tol=1e-8; ' + (
+            'IbexEngine compared against Polars streaming' if args.skip_in_memory else
+            'streaming and IbexEngine compared against Polars in-memory'),
         'cpu_frequency_khz': {name: Path('/sys/devices/system/cpu/cpu0/cpufreq', name).read_text().strip()
                               for name in ('scaling_min_freq', 'scaling_max_freq')},
         'ibex_decode_threads': os.environ.get('IBEX_DECODE_THREADS'),
@@ -127,6 +132,9 @@ def main():
         calls = {'polars': lambda: query.collect(engine='in-memory'),
                  'polars_streaming': lambda: query.collect(engine='streaming'),
                  'polars_ibex': lambda: query.collect(engine=engine)}
+        if args.skip_in_memory:
+            del calls['polars']
+        reference = next(iter(calls))
         print(name, 'checking full results' + ('' if args.check_only else ', then timing'), flush=True)
         try:
             first, outputs = {}, {}
@@ -134,23 +142,25 @@ def main():
                 started = time.perf_counter_ns()
                 outputs[route] = call()
                 first[route] = (time.perf_counter_ns() - started) / 1e6
-            for route in ('polars_streaming', 'polars_ibex'):
-                assert_query_result(number, outputs[route], outputs['polars'])
-            entry.update(first_collect_ms=first, output_rows=outputs['polars'].height)
+            for route in calls:
+                if route != reference:
+                    assert_query_result(number, outputs[route], outputs[reference])
+            entry.update(first_collect_ms=first, output_rows=outputs[reference].height)
             if args.check_only:
                 entry.update(status='passed', native_source=engine.explain(query))
-                print(name, 'passed', outputs['polars'].shape, flush=True)
+                print(name, 'passed', outputs[reference].shape, flush=True)
                 save()
                 continue
             for _ in range(2):
                 for call in calls.values():
-                    assert_query_result(number, call(), outputs['polars'])
+                    assert_query_result(number, call(), outputs[reference])
             samples = {route: [] for route in calls}
             cpu_samples = {route: [] for route in calls}
             previous = None
             for iteration in range(args.iters):
-                # Six permutations balance each route's position in each block.
-                order = list(permutations(calls))[iteration % 6]
+                # Every permutation in turn balances each route's position.
+                orders = list(permutations(calls))
+                order = orders[iteration % len(orders)]
                 for route in order:
                     started = time.perf_counter_ns()
                     cpu_started = time.process_time_ns()
@@ -158,7 +168,7 @@ def main():
                     cpu_elapsed = (time.process_time_ns() - cpu_started) / 1e6
                     elapsed = (time.perf_counter_ns() - started) / 1e6
                     previous = current
-                    assert_query_result(number, current, outputs['polars'])
+                    assert_query_result(number, current, outputs[reference])
                     samples[route].append(elapsed)
                     cpu_samples[route].append(cpu_elapsed)
                 print(name, f'round {iteration + 1}/{args.iters}', flush=True)

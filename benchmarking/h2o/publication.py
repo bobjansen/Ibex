@@ -10,7 +10,7 @@ import math
 import re
 import tarfile
 
-from .answers import CHECK_VERSION, ENGINES, RUN_CONFIG, compare, contract
+from .answers import ADAPTER_ENGINES, CHECK_VERSION, ENGINES, RUN_CONFIG, compare, contract
 
 
 def validate(text, manifest, publication=True):
@@ -22,7 +22,8 @@ def validate(text, manifest, publication=True):
     if (type(manifest.get("threads")) is not int or manifest["threads"] < 1
             or not isinstance(manifest.get("run_id"), str) or not manifest["run_id"]):
         raise ValueError("invalid H2O run identity or core count")
-    if len(engines) != len(set(engines)) or len(engines) < 2 or not set(engines) <= set(ENGINES):
+    if (len(engines) != len(set(engines)) or len(engines) < 2
+            or not set(engines) <= set(ENGINES) | set(ADAPTER_ENGINES)):
         raise ValueError("invalid H2O engine coverage")
     if publication and set(engines) != set(ENGINES):
         raise ValueError("H2O publication requires all three engines")
@@ -45,12 +46,16 @@ def validate(text, manifest, publication=True):
     preflight = manifest.get("preflight", {})
     if preflight.get("status") != "passed":
         raise ValueError("H2O bounded full answers did not pass")
+    question_filter = set(manifest.get("question_filter") or [])
+    if publication and question_filter:
+        raise ValueError("H2O publication requires every question")
     expected_small = set()
     for data, task in (("G1_768_2_0_0", "groupby"), ("G1_768_2_5_1", "groupby"),
                        ("J1_1e7_NA_0_0", "join"), ("J1_1e7_NA_5_1", "join")):
         for cores in {1, min(2, manifest["threads"])}:
             for i in range(1, 11 if task == "groupby" else 6):
-                expected_small.add((data, task, f"q{i}", cores))
+                if not question_filter or f"q{i}" in question_filter:
+                    expected_small.add((data, task, f"q{i}", cores))
     actual_small = []
     for check in preflight.get("checks", []):
         if check["status"] != "ok" or check["engines"] != engines:

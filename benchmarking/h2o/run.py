@@ -35,6 +35,12 @@ Usage:
   uv run --project <ibex-root> benchmarking/h2o/run.py G1_1e7_1e2_0_0 J1_1e7_NA_0_0 \\
       [--threads 8] [--engines ibex polars duckdb] [--questions q1 q2]
 
+`--engines polars polars-ibex` instead compares Polars' two executors for the
+same Polars query code: its streaming engine and IbexEngine (the Ibex Polars
+engine from python/ibex_polars, imported with build-release's bridge). Each
+question gets a fresh IbexEngine, prepared before its timed collects. These
+runs are validated like any other and can never be published.
+
 The data name selects the task (G1_* groupby, J1_* join); generate it first
 with gen_data.sh.
 """
@@ -58,7 +64,7 @@ import uuid
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 from h2o import preflight, provenance
-from h2o.answers import (CHECK_VERSION, ENGINES, RUN_CONFIG, PipeCapture, compare,
+from h2o.answers import (ADAPTER_ENGINES, CHECK_VERSION, ENGINES, RUN_CONFIG, PipeCapture, compare,
                         fingerprint_frames, ibex_columns)
 from h2o.publication import read as validate_result_file
 
@@ -288,8 +294,12 @@ def to_ms(v: float, unit: str) -> float:
 
 # ── Polars / DuckDB (run in a child process: Polars fixes its pool at import) ─
 
-def polars_worker(data: str, task: str, nas: bool, wanted, warmup, iters, full=False) -> list[dict]:
+def polars_worker(data: str, task: str, nas: bool, wanted, warmup, iters, full=False,
+                  engine="polars") -> list[dict]:
     import polars as pl
+    if engine == "polars-ibex":
+        sys.path[:0] = [str(BUILD_DIR / "python"), str(IBEX_ROOT / "python")]
+        from ibex_polars import IbexEngine
     if task == "groupby":
         df = (pl.read_csv(DATA_DIR / f"{data}.csv", null_values=NULL_TOKEN,
                           schema_overrides={"id4": pl.Int32, "id5": pl.Int32, "id6": pl.Int32,
@@ -313,15 +323,22 @@ def polars_worker(data: str, task: str, nas: bool, wanted, warmup, iters, full=F
     for qid, desc, chk_cols, _, pq, _ in questions_for(task, nas):
         if wanted and qid not in wanted:
             continue
+        query, executor = pq(*frames), "streaming"
+        if engine == "polars-ibex":
+            # A fresh engine per question: its prepared-plan cache is keyed
+            # by query, so a shared one could serve a stale translation.
+            executor = IbexEngine()
+            executor.prepare(query)
         times, ans = [], None
         for _ in range(warmup + iters):
             ans = None
             t0 = time.perf_counter()
-            ans = pq(*frames).collect(engine="streaming")
+            ans = query.collect(engine=executor)
             times.append((time.perf_counter() - t0) * 1000.0)
         chk = [float(ans[c].cast(pl.Float64).sum()) for c in chk_cols]
-        answer = fingerprint_frames(task, qid, "polars", ans.columns, ans.iter_slices(65536), full)
-        results.append(ok("polars", qid, desc, times[warmup:], ans.height, chk, answer))
+        answer = fingerprint_frames(task, qid, engine, ans.columns, ans.iter_slices(65536), full)
+        results.append(ok(engine, qid, desc, times[warmup:], ans.height, chk, answer))
+        del query, executor
     return results
 
 
@@ -383,7 +400,8 @@ def duckdb_worker(data: str, task: str, nas: bool, wanted, warmup, iters, thread
 
 
 def run_worker(engine: str, args) -> list[dict]:
-    env = dict(os.environ, POLARS_MAX_THREADS=str(args.threads), H2O_DATA_DIR=str(DATA_DIR), H2O_NULL_TOKEN=NULL_TOKEN)
+    env = dict(os.environ, POLARS_MAX_THREADS=str(args.threads), IBEX_CORES=str(args.threads),
+               H2O_DATA_DIR=str(DATA_DIR), H2O_NULL_TOKEN=NULL_TOKEN)
     cmd = taskset(args.threads) + [sys.executable, str(pathlib.Path(__file__).resolve()),
                                    "--worker", engine, args.data_one, "--threads", str(args.threads),
                                    "--warmup", str(args.warmup), "--iters", str(args.iters)]
@@ -464,19 +482,25 @@ def taskset(threads: int) -> list[str]:
 
 
 def tool_versions(build_record=None) -> dict[str, str]:
+    import hashlib
     import duckdb
     import polars
+    bridges = sorted((BUILD_DIR / "python").glob("ibex_pyarrow*.so"))
+    bridge = "sha256:" + hashlib.sha256(bridges[0].read_bytes()).hexdigest() if bridges else "missing"
     return {"ibex": "sha256:" + build_record["artifacts"]["tools/ibex"] if build_record else "unused",
             "polars": polars.__version__,
+            "polars-ibex": f"polars {polars.__version__}, bridge {bridge}",
             "duckdb": duckdb.__version__}
 
 
 def report(data: str, by_q: dict[str, list[dict]], engines: list[str]) -> bool:
     fmt = lambda v: "—" if math.isnan(v) else (f"{v:.0f}" if v >= 100 else f"{v:.1f}")
     ratio = lambda a, b: "—" if math.isnan(a) or math.isnan(b) else f"{a / b:.2f}"
-    others = [e for e in engines if e != "ibex"]
+    # Ratios put Ibex, or else the Ibex Polars engine, over each other engine.
+    subject = next((e for e in ("ibex", "polars-ibex") if e in engines), None)
+    others = [e for e in engines if e != subject]
     head = ["q", "question"] + [f"{e} ms" for e in engines] + \
-           ([f"ibex/{e}" for e in others] if "ibex" in engines else []) + ["check"]
+           ([f"{subject}/{e}" for e in others] if subject else []) + ["check"]
     lines = [head]
     all_ok = True
     for qid, rows in by_q.items():
@@ -489,22 +513,22 @@ def report(data: str, by_q: dict[str, list[dict]], engines: list[str]) -> bool:
         all_ok &= status == "ok"
         desc = next((r["desc"] for r in rows if r["desc"]), "")
         line = [qid, desc] + [fmt(mins[e]) for e in engines]
-        if "ibex" in engines:
-            line += [ratio(mins["ibex"], mins[e]) for e in others]
+        if subject:
+            line += [ratio(mins[subject], mins[e]) for e in others]
         lines.append(line + [status])
     print(f"\n{data}  (min ms; ratio < 1 means Ibex is faster)")
     widths = [max(len(str(l[i])) for l in lines) for i in range(len(head) - 1)]
     for l in lines:
         print("  ".join(str(c).ljust(w) for c, w in zip(l, widths)) + "  " + l[-1])
-    if "ibex" in engines:
+    if subject:
         for e in others:
-            pairs = [(per["ibex"]["min_ms"], per[e]["min_ms"]) for per in
+            pairs = [(per[subject]["min_ms"], per[e]["min_ms"]) for per in
                      ({r["engine"]: r for r in rows} for rows in by_q.values())
-                     if "ibex" in per and e in per and verify(list(per.values()), engines) == "ok"]
+                     if subject in per and e in per and verify(list(per.values()), engines) == "ok"]
             if pairs:
                 gm = math.exp(statistics.mean(math.log(a / b) for a, b in pairs))
                 tot = sum(a for a, _ in pairs) / sum(b for _, b in pairs)
-                print(f"ibex/{e}: geomean {gm:.2f}, total {tot:.2f} over {len(pairs)} questions")
+                print(f"{subject}/{e}: geomean {gm:.2f}, total {tot:.2f} over {len(pairs)} questions")
     return all_ok
 
 
@@ -519,14 +543,15 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--timeout", type=float, default=1800.0, help="per engine process, seconds")
     ap.add_argument("--out", default=None, help="TSV path (default results/h2o_<stamp>_<T>t.tsv)")
-    ap.add_argument("--worker", choices=["polars", "duckdb"], help=argparse.SUPPRESS)
+    ap.add_argument("--worker", choices=["polars", "polars-ibex", "duckdb"], help=argparse.SUPPRESS)
     ap.add_argument("--capture-full", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
     if (args.threads < 1 or args.iters < 1 or args.warmup < 0 or args.timeout <= 0
             or not math.isfinite(args.timeout)):
         ap.error("threads/iters/timeout must be positive and warmup nonnegative")
-    if len(set(args.engines)) != len(args.engines) or not set(args.engines) <= set(ENGINES):
-        ap.error("engines must be unique members of ibex, polars, duckdb")
+    if (len(set(args.engines)) != len(args.engines)
+            or not set(args.engines) <= set(ENGINES) | set(ADAPTER_ENGINES)):
+        ap.error("engines must be unique members of ibex, polars, duckdb, polars-ibex")
     if not args.worker and len(args.engines) < 2:
         ap.error("answer validation requires at least two engines")
     for data in args.data:
@@ -540,9 +565,9 @@ def main() -> int:
 
     if args.worker:
         task, nas = parse_data_name(args.data[0])
-        if args.worker == "polars":
+        if args.worker in ("polars", "polars-ibex"):
             res = polars_worker(args.data[0], task, nas, args.questions, args.warmup, args.iters,
-                                args.capture_full)
+                                args.capture_full, args.worker)
         else:
             res = duckdb_worker(args.data[0], task, nas, args.questions, args.warmup, args.iters,
                                 args.threads, args.capture_full)
@@ -553,7 +578,9 @@ def main() -> int:
         print(f"error: {IBEX_BIN} not found — build build-release first", file=sys.stderr)
         return 1
     try:
-        build_record = provenance.verify(BUILD_DIR, IBEX_ROOT) if "ibex" in args.engines else None
+        # The Ibex Polars engine runs build-release's bridge, so it needs the same check.
+        build_record = (provenance.verify(BUILD_DIR, IBEX_ROOT)
+                        if {"ibex", "polars-ibex"} & set(args.engines) else None)
     except (OSError, ValueError) as exc:
         print(f"error: unverified Ibex build: {exc}", file=sys.stderr)
         return 1
@@ -566,6 +593,7 @@ def main() -> int:
     work = pathlib.Path(tempfile.mkdtemp(prefix=f"checks_{run_id}_", dir=out.parent))
     checks = {"version": CHECK_VERSION, "run_id": run_id, "status": "failed",
               "data": args.data, "engines": args.engines, "threads": args.threads,
+              "question_filter": args.questions,
               "questions": {}, "preflight": {"status": "failed"}, "results": []}
     checks.update(config=RUN_CONFIG, input_null_token=NULL_TOKEN, provenance=build_record, versions=versions,
                   harness={p.name: provenance.sha(p) for p in HERE.glob("*.py")})

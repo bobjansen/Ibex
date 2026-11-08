@@ -139,27 +139,31 @@ class H2OChecks(unittest.TestCase):
             self.assertFalse(run.report("test", {"q1": rows}, list(answers.ENGINES)))
         self.assertNotIn("geomean", out.getvalue())
 
-    def artifact(self):
+    def artifact(self, engines=answers.ENGINES, questions=()):
         data = "G1_1e7_1e2_0_0"
-        engines = list(answers.ENGINES)
-        rows = [self.result(e, f"q{i}") for i in range(1, 11) for e in engines]
+        engines = list(engines)
+        wanted = lambda i: not questions or f"q{i}" in questions
+        rows = [self.result(e, f"q{i}") for i in range(1, 11) if wanted(i) for e in engines]
         checks = []
         for small, task in (("G1_768_2_0_0", "groupby"), ("G1_768_2_5_1", "groupby"),
                             ("J1_1e7_NA_0_0", "join"), ("J1_1e7_NA_5_1", "join")):
             for cores in (1, 2):
                 for i in range(1, 11 if task == "groupby" else 6):
-                    checks.append(dict(data=small, task=task, question=f"q{i}", cores=cores,
-                                       engines=engines, status="ok"))
+                    if wanted(i):
+                        checks.append(dict(data=small, task=task, question=f"q{i}", cores=cores,
+                                           engines=engines, status="ok"))
         manifest = dict(version=answers.CHECK_VERSION, status="passed", run_id="test-id",
                         data=[data], engines=engines, threads=8,
-                        questions={data: [f"q{i}" for i in range(1, 11)]},
+                        questions={data: [f"q{i}" for i in range(1, 11) if wanted(i)]},
+                        question_filter=list(questions),
                         preflight=dict(status="passed", checks=checks),
                         results=[dict(data=data, task="groupby", rows=rows)])
         manifest.update(config=answers.RUN_CONFIG, input_null_token="", harness={"run.py": "a" * 64},
                         provenance={"build_type": "Release", "sources": {"src/example.cpp": "b" * 64},
                                     "artifacts": dict.fromkeys(("tools/ibex", "tools/csv.so", "tools/csv.ibex",
                                                                 "CMakeCache.txt"), "c" * 64)},
-                        versions={"ibex": "sha256:" + "c" * 64, "polars": "2.0.0", "duckdb": "2.0.0"})
+                        versions={"ibex": "sha256:" + "c" * 64, "polars": "2.0.0", "duckdb": "2.0.0",
+                                  "polars-ibex": "polars 2.0.0, bridge sha256:" + "e" * 64})
         handle = io.StringIO(newline="")
         writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
         writer.writerow(["data", "question", "engine", "status", "validation", "run_id", "threads",
@@ -191,6 +195,25 @@ class H2OChecks(unittest.TestCase):
                 publication.validate(text, bad)
         with self.assertRaises(ValueError):
             publication.validate(text.replace("1.000", "0.001"), manifest)
+
+    def test_adapter_engine_and_question_filter_are_never_published(self):
+        # Polars' streaming engine against IbexEngine over the questions the
+        # adapter supports: accepted as a local run, refused for publication.
+        text, manifest = self.artifact(("polars", "polars-ibex"), ("q1", "q7"))
+        self.assertEqual(len(publication.validate(text, manifest, publication=False)), 4)
+        with self.assertRaises(ValueError):
+            publication.validate(text, manifest)
+        for mutation in (lambda m: m["preflight"]["checks"].pop(),
+                         lambda m: m.update(question_filter=["q1"]),
+                         lambda m: m.update(engines=["polars", "polars-ibex", "pandas"])):
+            bad = copy.deepcopy(manifest)
+            mutation(bad)
+            with self.assertRaises(ValueError):
+                publication.validate(text, bad, publication=False)
+        text, manifest = self.artifact(questions=("q1", "q7"))
+        self.assertEqual(len(publication.validate(text, manifest, publication=False)), 6)
+        with self.assertRaises(ValueError):
+            publication.validate(text, manifest)
 
     def test_archive_requires_requested_cores_and_zero_exit(self):
         text, manifest = self.artifact()

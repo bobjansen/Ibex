@@ -96,16 +96,19 @@ def run(harness, args, work):
         harness.DATA_DIR = work / "fixtures"
         harness.NULL_TOKEN = NULL_TOKEN
         for data, task, nas in fixtures(harness.DATA_DIR):
-            expected = [q[0] for q in harness.questions_for(task, nas)]
+            # A --questions filter applies to the fixtures too (never in a
+            # publication, which requires every question).
+            expected = [q[0] for q in harness.questions_for(task, nas)
+                        if not args.questions or q[0] in args.questions]
             # Cover serial and parallel execution, independently of timed cores.
             for cores in sorted({1, min(2, args.threads)}):
                 small = copy.copy(args)
                 small.data_one, small.threads = data, cores
-                small.warmup, small.iters, small.questions, small.capture_full = 0, 1, [], True
+                small.warmup, small.iters, small.questions, small.capture_full = 0, 1, expected, True
                 rows = []
                 for engine in args.engines:
                     if engine == "ibex":
-                        rows += harness.ibex_run(data, task, nas, [], 0, 1, cores, args.timeout, full=True)
+                        rows += harness.ibex_run(data, task, nas, expected, 0, 1, cores, args.timeout, full=True)
                     else:
                         rows += harness.run_worker(engine, small)
                 (work / f"{data}_{cores}c.json").write_text(json.dumps(rows) + "\n")

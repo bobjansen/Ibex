@@ -17,6 +17,9 @@ import io
 from itertools import combinations
 
 ENGINES = ("ibex", "polars", "duckdb")
+# The same Polars queries collected by IbexEngine (python/ibex_polars). Validated
+# like the others, but never part of a publication.
+ADAPTER_ENGINES = ("polars-ibex",)
 CHECK_VERSION = "h2o-answers-v2"
 RUN_CONFIG = {"inputs": "resident-csv", "process_lifetime": "one-per-dataset-per-engine",
               "answer_cleanup": "outside-timing", "polars_engine": "streaming",
@@ -134,7 +137,7 @@ def canonical_names(task, qid, engine, names):
             name = "right_" + name[len(table) + 1:]
         elif engine == "ibex" and name.endswith("_" + table):
             name = "right_" + name[:-len(table) - 1]
-        elif engine == "polars" and name.endswith("_right"):
+        elif engine in ("polars", "polars-ibex") and name.endswith("_right"):
             name = "right_" + name[:-6]
         result.append(name)
     return result

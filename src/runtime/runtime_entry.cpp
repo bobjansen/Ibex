@@ -22,7 +22,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -33,7 +32,6 @@
 #include <optional>
 #include <ranges>
 #include <string>
-#include <type_traits>
 #include <utility>
 #include <vector>
 

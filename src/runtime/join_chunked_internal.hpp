@@ -29,6 +29,10 @@ class ScanWorkerSink;
 /// answer, in the same order.
 [[nodiscard]] auto dense_int_join_builds() -> std::atomic<std::uint64_t>&;
 
+/// For tests only: cleared, every join build takes the hash maps, so a test
+/// can compare the direct-address build against them. Set by default.
+[[nodiscard]] auto dense_int_join_build_enabled() -> std::atomic<bool>&;
+
 /// How many join probes, process-wide, resolved an Int key through the build
 /// side's direct-address head table instead of its hash map. For tests: the
 /// two give the same answer.

@@ -327,10 +327,12 @@ TEST_CASE("inner join: a large dense Int build side fills a direct-address table
                 runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, exec);
             REQUIRE(direct.has_value());
             CHECK(runtime::dense_int_join_builds().load() > before);
-            runtime::set_env("IBEX_DISABLE_DENSE_JOIN_BUILD", "1");
+            runtime::dense_int_join_build_enabled().store(false);
+            const auto before_hashed = runtime::dense_int_join_builds().load();
             const auto hashed =
                 runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, exec);
-            runtime::unset_env("IBEX_DISABLE_DENSE_JOIN_BUILD");
+            runtime::dense_int_join_build_enabled().store(true);
+            CHECK(runtime::dense_int_join_builds().load() == before_hashed);
             REQUIRE(hashed.has_value());
             REQUIRE(direct->rows() > 100'000);
             if (auto mismatch = runtime::compare_tables(*hashed, *direct); mismatch.has_value()) {
@@ -3362,8 +3364,8 @@ TEST_CASE("chunked aggregate: owned gid ranges accumulate many groups exactly as
     // workers, each group's rows still in row order on one thread, so the
     // answer must equal the serial one bit for bit -- the Double sums, First
     // and Last included. A null-bearing value column rides along. The serial
-    // answer is the same query with the path switched off; a hand-computed
-    // reference pins the Int64 sums and counts too.
+    // answer is the same query on one thread, where the path cannot fan out;
+    // a hand-computed reference pins the Int64 sums and counts too.
     constexpr std::int64_t kRows = (std::int64_t{1} << 20) + 12'345;
     constexpr std::int64_t kGroups = 200'003;
     runtime::TableRegistry registry;
@@ -3397,15 +3399,10 @@ TEST_CASE("chunked aggregate: owned gid ranges accumulate many groups exactly as
     auto ir = parser::lower(program.value());
     REQUIRE(ir.has_value());
     const auto run = [&](bool owned) {
-        if (!owned) {
-            runtime::set_env("IBEX_DISABLE_OWNED_RANGE_ACCUMULATION", "1");
-        }
-        runtime::ExecutionContext parallel;
-        parallel.parallel_threads = 8;
-        parallel.parallel_min_rows = 0;
-        auto out = runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
-        runtime::unset_env("IBEX_DISABLE_OWNED_RANGE_ACCUMULATION");
-        return out;
+        runtime::ExecutionContext exec;
+        exec.parallel_threads = owned ? 8 : 1;
+        exec.parallel_min_rows = 0;
+        return runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, exec);
     };
     const auto serial = run(false);
     const auto owned = run(true);
@@ -3496,16 +3493,10 @@ TEST_CASE("chunked aggregate: parallel dense gid numbering keeps first-seen orde
                 guard.emplace("1050000");
             }
             const auto run = [&](bool parallel_gids) {
-                if (!parallel_gids) {
-                    runtime::set_env("IBEX_DISABLE_PARALLEL_DENSE_GIDS", "1");
-                }
-                runtime::ExecutionContext parallel;
-                parallel.parallel_threads = 8;
-                parallel.parallel_min_rows = 0;
-                auto out =
-                    runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
-                runtime::unset_env("IBEX_DISABLE_PARALLEL_DENSE_GIDS");
-                return out;
+                runtime::ExecutionContext exec;
+                exec.parallel_threads = parallel_gids ? 8 : 1;
+                exec.parallel_min_rows = 0;
+                return runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, exec);
             };
             const auto serial = run(false);
             const auto fanned = run(true);

@@ -51,7 +51,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <expected>
@@ -86,6 +85,11 @@ namespace ibex::runtime {
 auto dense_int_join_builds() -> std::atomic<std::uint64_t>& {
     static std::atomic<std::uint64_t> count{0};
     return count;
+}
+
+auto dense_int_join_build_enabled() -> std::atomic<bool>& {
+    static std::atomic<bool> enabled{true};
+    return enabled;
 }
 
 auto dense_int_join_probes() -> std::atomic<std::uint64_t>& {
@@ -515,7 +519,8 @@ auto build_dense_int_heads(JoinHashIndex& index, const Column<std::int64_t>& col
                            const IsNull& is_null, std::size_t partitions) -> bool {
     constexpr std::uint64_t kMaxSlots = std::uint64_t{1} << 27;
     const std::size_t n = col.size();
-    if (n < (std::size_t{1} << 16) || std::getenv("IBEX_DISABLE_DENSE_JOIN_BUILD") != nullptr) {
+    if (n < (std::size_t{1} << 16) ||
+        !dense_int_join_build_enabled().load(std::memory_order_relaxed)) {
         return false;
     }
     const auto* data = col.data();

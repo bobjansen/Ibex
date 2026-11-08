@@ -4223,8 +4223,7 @@ class HashAggregateState final {
         constexpr std::uint32_t kUnseen = std::numeric_limits<std::uint32_t>::max();
         if (rows < kParallelDenseGidRows || rows >= kUnseen || exec_ == nullptr ||
             par_.accumulation.decline != physical::FanOutDecline::None ||
-            par_.accumulation.worker_cap < 2 || on_worker_pool_thread() ||
-            std::getenv("IBEX_DISABLE_PARALLEL_DENSE_GIDS") != nullptr) {
+            par_.accumulation.worker_cap < 2 || on_worker_pool_thread()) {
             return false;
         }
         const std::size_t threads = par_.accumulation.worker_cap;
@@ -6549,8 +6548,7 @@ class HashAggregateState final {
         constexpr std::size_t kRangeBytes = std::size_t{1} << 20;
         if (rows < kMinRows || n_groups_ < kMinGroups || exec_ == nullptr ||
             par_.accumulation.decline != physical::FanOutDecline::None ||
-            par_.accumulation.worker_cap < 2 || on_worker_pool_thread() ||
-            std::getenv("IBEX_DISABLE_OWNED_RANGE_ACCUMULATION") != nullptr) {
+            par_.accumulation.worker_cap < 2 || on_worker_pool_thread()) {
             return false;
         }
         for (std::size_t a = 0; a < n_aggs_; ++a) {

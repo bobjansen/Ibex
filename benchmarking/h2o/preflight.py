@@ -100,6 +100,10 @@ def run(harness, args, work):
             # publication, which requires every question).
             expected = [q[0] for q in harness.questions_for(task, nas)
                         if not args.questions or q[0] in args.questions]
+            if not expected:
+                # Nothing requested applies to this fixture's task; an empty
+                # list would mean every question to the workers.
+                continue
             # Cover serial and parallel execution, independently of timed cores.
             for cores in sorted({1, min(2, args.threads)}):
                 small = copy.copy(args)

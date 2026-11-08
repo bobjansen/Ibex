@@ -125,10 +125,74 @@ fit on the dev box. Run it on AWS instead.
 Results go to `results/h2o_<stamp>_<T>t.tsv`, one row per (data, question,
 engine), with every timed sample kept.
 
-The AWS TSVs in the sections after the 2026-11-07 one predate full-answer
-validation. They cannot be used as inputs to the current website generator
-without a new validated run; their original checksum passes are not upgraded
-retroactively.
+The 2026-11-08 AWS run and the 2026-11-07 local run passed full-answer
+validation. The AWS TSVs in the sections after them predate it. They cannot
+be used as inputs to the current website generator; their original checksum
+passes are not upgraded retroactively.
+
+## Results: 2026-11-08, AWS r7i.4xlarge, 1 and 8 physical cores, 1e7 rows
+
+Ibex `b23a1390`, Polars 2.0.0 (streaming), DuckDB 2.0.0, on one clean
+r7i.4xlarge (Xeon Platinum 8488C, 128 GiB). SMT was off and every engine
+was pinned to the same 1 or 8 physical cores. All 110 (data, question,
+core-count) comparisons passed full answer validation (`h2o-answers-v2`)
+with all three engines. The artifact is
+`results/h2o_aws_20261108T134649.tar.gz`, with run ids `2b9ec8b0…` (1 core)
+and `10df7b14…` (8 cores).
+
+Loading is excluded, and each question fully materialises its result. There
+was 1 warmup and 5 timed iterations, and the ratios use the minimum times.
+Below 1 means Ibex is faster.
+
+| data | cores | ibex/polars geomean | ibex/polars total | ibex/duckdb geomean | ibex/duckdb total |
+|---|---:|---:|---:|---:|---:|
+| J1_1e7_NA_0_0 (join) | 1 | 0.69 | 0.49 | 0.18 | 0.19 |
+| G1_1e7_1e2_0_0 | 1 | 0.50 | 0.56 | 0.52 | 0.53 |
+| G1_1e7_1e2_5_0 (NAs) | 1 | 0.48 | 0.54 | 0.57 | 0.55 |
+| G1_1e7_1e2_0_1 (sorted) | 1 | 0.50 | 0.56 | 0.52 | 0.49 |
+| G1_1e7_1e1_0_0 | 1 | 0.48 | 0.51 | 0.58 | 0.58 |
+| G1_1e7_2e0_0_0 | 1 | 0.51 | 0.40 | 0.61 | 0.63 |
+| J1_1e7_NA_0_0 (join) | 8 | 0.86 | 0.81 | 0.24 | 0.31 |
+| G1_1e7_1e2_0_0 | 8 | 0.64 | 0.63 | 0.75 | 0.78 |
+| G1_1e7_1e2_5_0 (NAs) | 8 | 0.68 | 0.63 | 0.85 | 0.80 |
+| G1_1e7_1e2_0_1 (sorted) | 8 | 0.63 | 0.63 | 0.73 | 0.79 |
+| G1_1e7_1e1_0_0 | 8 | 0.60 | 0.31 | 0.66 | 0.66 |
+| G1_1e7_2e0_0_0 | 8 | 0.69 | 0.16 | 0.85 | 0.82 |
+
+- **Every dataset leads both engines by both summaries, at 1 and 8 cores.**
+  On 2026-10-16, Ibex trailed DuckDB at 8 cores on K=2e0 (1.10 / 1.27), and
+  the join total trailed Polars (1.40).
+- **1 core:** Ibex is faster than Polars on all 55 questions, and faster than
+  DuckDB on 54. The exception is K=2 q8 (1212 / 1159 ms, 1.05×).
+- **8 cores:** Ibex is faster than Polars on 42 questions and faster than
+  DuckDB on 43. The losses against Polars:
+  - q10 (six keys, ~1e7 groups) is 1.04–1.17× on every groupby dataset. On
+    2026-10-16 it was 1.36–1.54×.
+  - q7 is 1.18–1.31× at K=100.
+  - At K=2, q9 is 1.33× (22 / 16 ms), q4 1.19× and q5 1.19×.
+
+  The losses against DuckDB:
+  - q8 (per-group top-2) is 1.18–1.50× on every groupby dataset, while it
+    beats Polars 3.2–17×.
+  - q4 is up to 1.53× (K=2, 17 / 11 ms).
+  - At K=2, q9 is 1.41× and q2 1.29×.
+- **Join:** the big join q5 now takes 157 ms against 204 ms for Polars
+  (0.77×). On 2026-10-16 it took 334 against 197 ms (1.69×). q1–q4 are
+  0.79–0.98× Polars at 8 cores.
+- **AWS against the dev box:** these ratios are close to the 2026-11-07 local
+  ones at 8 cores (0.60–0.69 against 0.56–0.65 vs Polars), but above them at
+  1 core (0.48–0.51 against 0.40–0.47). The two runs differ in box, CPU and
+  commit, and the commits only removed switches that were off by default.
+
+To reproduce the configuration, check out `b23a1390` in a separate clone,
+complete the [AWS setup](../aws/README.md#1-one-time-setup), then run:
+
+```sh
+./benchmarking/aws/run-h2o.sh --on-demand --type r7i.4xlarge \
+    --threads-per-core 1 --cores 1,8 --warmup 1 --iters 5
+```
+
+The runner launches a paid EC2 instance and downloads the result archive.
 
 ## Results: 2026-11-07, local i7-13700, 1 and 8 threads, 1e7 rows
 
@@ -139,8 +203,7 @@ pinned to the same CPUs. All 110 (data, question, thread-count) comparisons
 passed full answer validation (`h2o-answers-v2`) with all three engines. The
 results are `results/h2o_20261107e_local_{8t,1t}.tsv` and their
 `.tsv.checks.json` sidecars (run ids `db31b7b2…` and `12e29c4d…`). This is a
-local survey, not the website snapshot: the box, CPU and DuckDB version
-differ from the AWS run below, which the website still shows.
+local survey: the box and CPU differ from the AWS run above.
 
 Loading is excluded, each question fully materialises its result, with 1
 warmup and 5 timed iterations, and the ratios use the minimum times. Below 1
@@ -185,7 +248,7 @@ means Ibex is faster.
   (`f0f08916`, q10), grouped top-k spread across workers (`a8bc06d9`, q8)
   and, on one thread, found by key offset with prefetching (`fb73f7d7`, q8).
 
-## Results: 2026-10-16, AWS r7i.4xlarge, 1 and 8 physical cores, 1e7 rows
+## Previous results: 2026-10-16, AWS r7i.4xlarge, 1 and 8 physical cores, 1e7 rows
 
 Ibex `9c99d03b`, Polars 2.0.0 (streaming), DuckDB 1.5.4, on one clean
 r7i.4xlarge (Xeon Platinum 8488C, 128 GiB), with SMT off and every engine

@@ -3147,6 +3147,99 @@ TEST_CASE("grouped top-k: partitioned flat heaps take each group's stable-sort r
     }
 }
 
+TEST_CASE("chunked grouped head: the first rows of every key, across chunks",
+          "[runtime][chunked][head]") {
+    // `head n, by k` with no order: each key's first n rows in input order,
+    // and the kept rows in input order. Keys are probed in place, one Key per
+    // group, so a group found in one chunk must be the same group in the next.
+    // Composite keys mix a nullable string with a double whose NaNs form one
+    // group and whose -0.0 groups with 0.0, as grouping does everywhere.
+    constexpr std::size_t kRows = 50'000;
+    Column<std::int64_t> k;
+    runtime::ValidityBitmap k_valid;
+    k_valid.assign(kRows, true);
+    Column<std::string> s;
+    runtime::ValidityBitmap s_valid;
+    s_valid.assign(kRows, true);
+    Column<double> d;
+    Column<std::int64_t> id;
+    const std::array<double, 4> doubles{0.0, -0.0, std::numeric_limits<double>::quiet_NaN(), 1.5};
+    for (std::size_t row = 0; row < kRows; ++row) {
+        k.push_back(static_cast<std::int64_t>((row * 7919) % 1'009));
+        if (row % 101 == 0) {
+            k_valid.set(row, false);
+        }
+        s.push_back("s" + std::to_string((row * 31) % 17));
+        if (row % 89 == 0) {
+            s_valid.set(row, false);
+        }
+        d.push_back(doubles[(row / 5) % doubles.size()]);
+        id.push_back(static_cast<std::int64_t>(row));
+    }
+    // Reference group labels: nulls as their own group, NaN as one, -0.0 as 0.
+    const auto int_group = [&](std::size_t row) {
+        return k_valid[row] ? std::to_string(k[row]) : std::string{"null"};
+    };
+    const auto pair_group = [&](std::size_t row) {
+        const double value = d[row];
+        const std::string number =
+            std::isnan(value) ? "nan" : std::to_string(value == 0.0 ? 0.0 : value);
+        return (s_valid[row] ? std::string{s[row]} : std::string{"null"}) + "|" + number;
+    };
+    // Labels first: the columns move into the table below.
+    std::vector<std::string> int_groups;
+    std::vector<std::string> pair_groups;
+    int_groups.reserve(kRows);
+    pair_groups.reserve(kRows);
+    for (std::size_t row = 0; row < kRows; ++row) {
+        int_groups.push_back(int_group(row));
+        pair_groups.push_back(pair_group(row));
+    }
+    runtime::Table t;
+    t.add_column("k", std::move(k), std::move(k_valid));
+    t.add_column("s", std::move(s), std::move(s_valid));
+    t.add_column("d", std::move(d));
+    t.add_column("id", std::move(id));
+    struct Case {
+        std::string query;
+        std::size_t n;
+        bool pair;
+    };
+    for (const Case& test :
+         {Case{"t[head 3, by { k }];", 3, false}, Case{"t[head 1, by { k }];", 1, false},
+          Case{"t[head 2, by { s, d }];", 2, true}}) {
+        std::map<std::string, std::size_t> taken;
+        std::vector<std::int64_t> want;
+        for (std::size_t row = 0; row < kRows; ++row) {
+            if (taken[test.pair ? pair_groups[row] : int_groups[row]]++ < test.n) {
+                want.push_back(static_cast<std::int64_t>(row));
+            }
+        }
+        runtime::TableRegistry registry;
+        registry.emplace("t", t);
+        for (const std::string grain : {"", "997", "50000"}) {
+            INFO(test.query << " grain '" << grain << "'");
+            std::optional<ChunkGrainGuard> guard;
+            if (!grain.empty()) {
+                guard.emplace(grain);
+            }
+            auto program = parser::parse(test.query);
+            REQUIRE(program.has_value());
+            auto ir = parser::lower(program.value());
+            REQUIRE(ir.has_value());
+            const auto p = runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, {});
+            REQUIRE(p.has_value());
+            const auto& got = std::get<Column<std::int64_t>>(*p->find("id"));
+            std::vector<std::int64_t> rows;
+            rows.reserve(got.size());
+            for (std::size_t i = 0; i < got.size(); ++i) {
+                rows.push_back(got[i]);
+            }
+            CHECK(rows == want);
+        }
+    }
+}
+
 TEST_CASE("chunked aggregate: a nullable narrow-span Int64 key keeps the dense array",
           "[runtime][chunked][aggregate][validity]") {
     // h2o q4 with NAs: `by id4` where id4 has nulls. The null key is one more

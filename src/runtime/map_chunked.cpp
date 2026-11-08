@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <expected>
 #include <memory>
@@ -610,26 +611,75 @@ class ChunkedHeadOperator final : public Operator {
         }
 
         Table t = chunk_to_table(std::move(chunk));
+        // Resolve the key columns once per chunk, not once per row and key.
+        std::vector<const ColumnEntry*> entries;
+        entries.reserve(group_by_->size());
+        for (const auto& ref : *group_by_) {
+            const auto* entry = t.find_entry(ref.name);
+            if (entry == nullptr) {
+                return std::unexpected("head group-by column not found: " + ref.name +
+                                       " (available: " + format_columns(t) + ")");
+            }
+            entries.push_back(entry);
+        }
+        std::vector<KeyCol> cols;
+        cols.reserve(entries.size());
+        for (const auto* entry : entries) {
+            auto col = make_key_col(*entry);
+            if (!col.has_value()) {
+                break;
+            }
+            cols.push_back(*col);
+        }
+        // The in-place index and the boxed map hold different groups, so a
+        // chunk that cannot use the first moves every later chunk to the
+        // second (as streaming distinct does). make_key_col covers every
+        // built-in type, so the boxed path is a fallback that should not run.
+        if (cols.size() != entries.size() && !boxed_ && !group_keys_.empty()) {
+            for (std::size_t gid = 0; gid < group_keys_.size(); ++gid) {
+                seen_counts_[group_keys_[gid]] = group_counts_[gid];
+            }
+            group_keys_.clear();
+            group_counts_.clear();
+            key_index_ = KeyRowIndex{};
+        }
+        boxed_ = boxed_ || cols.size() != entries.size();
+
         std::vector<std::size_t> idx;
         idx.reserve(std::min(rows, count_ * std::max<std::size_t>(1, group_by_->size())));
-
-        for (std::size_t row = 0; row < rows; ++row) {
+        const auto make_key = [&](std::size_t row) {
             Key key;
-            key.values.reserve(group_by_->size());
-            for (const auto& ref : *group_by_) {
-                const auto* entry = t.find_entry(ref.name);
-                if (entry == nullptr) {
-                    return std::unexpected("head group-by column not found: " + ref.name +
-                                           " (available: " + format_columns(t) + ")");
-                }
+            key.values.reserve(entries.size());
+            for (const auto* entry : entries) {
                 push_key_value(key, *entry, row);
             }
-            auto& seen = seen_counts_[key];
-            if (seen >= count_) {
-                continue;
+            return key;
+        };
+        if (!boxed_) {
+            for (std::size_t row = 0; row < rows; ++row) {
+                // A Key is built once per group; a row of a known group hashes
+                // and compares in place.
+                const std::uint32_t gid = key_index_.find_or_insert(group_keys_, cols, row, [&] {
+                    group_keys_.push_back(make_key(row));
+                    group_counts_.push_back(0);
+                    return static_cast<std::uint32_t>(group_keys_.size() - 1);
+                });
+                auto& seen = group_counts_[gid];
+                if (seen >= count_) {
+                    continue;
+                }
+                ++seen;
+                idx.push_back(row);
             }
-            ++seen;
-            idx.push_back(row);
+        } else {
+            for (std::size_t row = 0; row < rows; ++row) {
+                auto& seen = seen_counts_[make_key(row)];
+                if (seen >= count_) {
+                    continue;
+                }
+                ++seen;
+                idx.push_back(row);
+            }
         }
 
         if (idx.empty()) {
@@ -646,6 +696,12 @@ class ChunkedHeadOperator final : public Operator {
     const std::vector<ir::ColumnRef>* group_by_;
     std::size_t remaining_;
     bool done_ = false;
+    /// Groups seen so far, probed in place (`KeyRowIndex`), with each group's
+    /// rows kept; `seen_counts_` instead once a chunk needed boxed keys.
+    KeyRowIndex key_index_;
+    std::vector<Key> group_keys_;
+    std::vector<std::size_t> group_counts_;
+    bool boxed_ = false;
     robin_hood::unordered_flat_map<Key, std::size_t, KeyHash, KeyEq> seen_counts_;
 };
 

@@ -8,8 +8,8 @@
 #   * h2o db-benchmark: benchmarking/h2o/run.py --engines polars polars-ibex
 #     (the harness's Polars queries on resident frames, bounded full-answer
 #     validation, min of --iters after --warmup). Groupby runs the questions
-#     IbexEngine supports, --h2o-questions; q6 (median), q8 (top_k + explode)
-#     and q9 (corr) are not translated yet. Joins run all five. And
+#     IbexEngine supports, --h2o-questions; q6 (median) and q9 (corr) are
+#     not translated yet. Joins run all five. And
 #   * PDS-H: python/bench_pdsh_engine.py --skip-in-memory (the unchanged
 #     upstream Polars queries on Parquet, every result compared in full,
 #     medians of --pdsh-iters interleaved rounds).
@@ -29,7 +29,7 @@
 #   --pdsh-data DIR      PDS-H Parquet tables (default <pdsh-root>/data/tables/scale-10.0)
 #   --threads LIST       comma-separated thread counts (default 8,1)
 #   --h2o-data LIST      comma-separated h2o datasets (default: the six 1e7 sets)
-#   --h2o-questions LIST groupby questions (default q1,q2,q3,q4,q5,q7,q10)
+#   --h2o-questions LIST groupby questions (default q1,q2,q3,q4,q5,q7,q8,q10)
 #   --warmup N / --iters N   h2o warmups and timed iterations (default 1 / 5)
 #   --pdsh-iters N       PDS-H interleaved rounds, even (default 6)
 #   --out-dir DIR        results (default python/polars-engines-results/<stamp>)
@@ -40,7 +40,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${PYTHON:-$ROOT/.venv/bin/python}"
 PDSH_ROOT="" PDSH_DATA="" THREADS="8,1" WARMUP=1 ITERS=5 PDSH_ITERS=6 OUT="" SKIP_H2O=0 SKIP_PDSH=0
 H2O_DATA="J1_1e7_NA_0_0,G1_1e7_1e2_0_0,G1_1e7_1e2_5_0,G1_1e7_1e2_0_1,G1_1e7_1e1_0_0,G1_1e7_2e0_0_0"
-H2O_QUESTIONS="q1,q2,q3,q4,q5,q7,q10"
+H2O_QUESTIONS="q1,q2,q3,q4,q5,q7,q8,q10"
 while (($#)); do
     case "$1" in
         --pdsh-root) PDSH_ROOT="$2"; shift 2 ;;

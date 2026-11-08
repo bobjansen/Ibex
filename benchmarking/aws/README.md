@@ -252,7 +252,7 @@ all 22 unchanged upstream PDS-H queries at SF-10 (upstream's generator,
 medians of 6 interleaved rounds, every result compared in full), and the h2o
 groupby and join questions on the upstream R generators' data (the harness's
 bounded answer checks, minimum of 5 iterations). Groupby covers the questions
-`IbexEngine` translates, all but q6, q8 and q9. The box builds the Python
+`IbexEngine` translates, all but q6 and q9. The box builds the Python
 bridge against the uv venv's interpreter and checks that it imports before
 generating any data.
 

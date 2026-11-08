@@ -678,6 +678,25 @@ class EngineTests(unittest.TestCase):
                 pl.LazyFrame({"x": pl.Series([1], dtype=dtype)}).select(-pl.col("x")).collect(engine=self.engine)
 
     @unittest.skipIf(os.environ.get("IBEX_TEST_PARQUET") == "0", "Parquet backend disabled")
+    def test_categorical_results_keep_their_polars_ids(self):
+        # A result column that still carries the dictionary Ibex was given
+        # maps its codes back to Polars ids: plus an offset when the ids are
+        # consecutive, through a lookup when they are not. Casting `b` after
+        # `a` gives `b` an id range that starts above zero, and `c` reuses
+        # labels `a` registered, so its ids have gaps. Nulls stay null.
+        frame = pl.DataFrame({"a": ["pa1", "pa2", None, "pa1", "pa3", "pa2"],
+                              "b": ["pb1", "pb2", "pb1", None, "pb2", "pb3"],
+                              "c": ["pa3", "pc1", "pa1", "pc1", None, "pa3"],
+                              "x": [1, 2, 3, 4, 5, 6]})
+        for name in ("a", "b", "c"):
+            frame = frame.with_columns(pl.col(name).cast(pl.Categorical))
+        lazy = frame.lazy()
+        for query in (lazy.group_by("a", "b", "c").agg(pl.sum("x")).sort("x"),
+                      lazy.filter(pl.col("x") > 1).select("c", "a", "x"),
+                      lazy.group_by("c", maintain_order=True).agg(pl.len())):
+            with self.subTest(query=query.explain()):
+                self.equal(query)
+
     def test_median_std_and_corr_follow_polars_nan_and_null_rules(self):
         # Polars ranks NaN above every number in a median (so [1, NaN, 3]
         # has median 3), and corr is NaN, not SQL's null, for fewer than two

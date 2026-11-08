@@ -5,7 +5,8 @@
 A resident Polars Categorical column reaches Ibex as one dictionary chunk whose
 entries are the column's distinct labels, and each entry remembers the physical
 id Polars gave its label. A result column that still carries that dictionary
-maps its codes back to those ids with a gather. Only other dictionaries have to
+maps its codes back to those ids: an offset when the ids are consecutive, a
+lookup otherwise. Only other dictionaries have to
 be interned label by label, which costs tens of nanoseconds per distinct label.
 """
 
@@ -23,6 +24,9 @@ class Known:
     dictionary: pa.Array
     ids: np.ndarray
     dtype: pl.DataType
+    #: ids[0] when the ids are consecutive, as a fresh cast assigns them:
+    #: entry i then has id offset + i, so a result's codes need no gather.
+    offset: int | None = None
 
 
 def eligible(series):
@@ -70,11 +74,12 @@ def unify(series):
     if nulls is not None:
         codes[nulls] = 0
     array = pa.DictionaryArray.from_arrays(pa.array(codes, mask=nulls), dictionary)
-    return array, Known(dictionary, ids, series.dtype)
+    consecutive = len(ids) == top - int(ids[0]) + 1
+    return array, Known(dictionary, ids, series.dtype, int(ids[0]) if consecutive else None)
 
 
-def physical(chunk, categories, dtype):
-    """Polars ids of a result chunk, or None unless its dictionary is a known one.
+def known_for(chunk, categories, dtype):
+    """The Known a result chunk's dictionary is, or None.
 
     Lengths are compared first so that only a plausible dictionary is read.
     """
@@ -82,12 +87,5 @@ def physical(chunk, categories, dtype):
     for known in categories:
         if known.dtype == dtype and len(known.dictionary) == len(dictionary) \
                 and known.dictionary.equals(dictionary):
-            break
-    else:
-        return None
-    indices = chunk.indices
-    nulls = indices.is_null().to_numpy(zero_copy_only=False) if indices.null_count else None
-    if nulls is not None:
-        indices = indices.fill_null(0)
-    ids = known.ids[indices.to_numpy(zero_copy_only=False)]
-    return pl.from_arrow(pa.array(ids, pa.uint32(), mask=nulls))
+            return known
+    return None

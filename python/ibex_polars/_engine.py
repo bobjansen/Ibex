@@ -34,15 +34,32 @@ def _categorical_from_arrow(column, dtype, name):
     return pl.concat(parts, rechunk=False) if parts else pl.Series(name, [], dtype=dtype)
 
 
-def _known_categorical(column, dtype, name, categories):
-    """The column's Polars ids when every chunk carries a dictionary Ibex was given."""
-    parts = []
+def _known_codes(column, dtype, name, categories):
+    """(codes, Known) when every chunk carries the same dictionary Ibex was given.
+
+    The column's Polars ids are then a function of its codes alone: the codes
+    plus the Known's offset when its ids are consecutive, or a lookup in its
+    ids otherwise. The caller applies that inside one Polars query, so the
+    columns convert in parallel and no codes are copied here.
+    """
+    known, parts = None, []
     for chunk in column.chunks:
-        ids = _categories.physical(chunk, categories, dtype)
-        if ids is None:
+        found = _categories.known_for(chunk, categories, dtype)
+        if found is None or (known is not None and found is not known):
             return None
-        parts.append(ids)
-    return pl.concat(parts, rechunk=False).alias(name) if parts else None
+        known = found
+        # Codes are non-negative, so viewing them as UInt32 is exact and free.
+        parts.append(pl.from_arrow(chunk.indices.view(pa.uint32())))
+    if known is None:
+        return None
+    return pl.concat(parts, rechunk=False).alias(name), known
+
+
+def _known_ids(name, known):
+    """The Polars ids of column `name`'s codes, as an expression (nulls stay null)."""
+    if known.offset is not None:
+        return pl.col(name) + known.offset if known.offset else pl.col(name)
+    return pl.lit(pl.Series(known.ids, dtype=pl.UInt32)).gather(pl.col(name))
 
 
 def _to_polars(result, expected, output, categories=()):
@@ -65,21 +82,26 @@ def _to_polars(result, expected, output, categories=()):
         # strings too. Preserve dictionaries for code-based categorical export.
         if expected[name].base_type() == pl.Categorical and pa.types.is_dictionary(dtype):
             continue
+        if (pa.types.is_integer(dtype) and pa.types.is_integer(output[name])
+                and expected[name].is_integer()):
+            # Integer widths narrow in the final strict Polars cast, which
+            # converts every column in one query instead of one Arrow pass each.
+            continue
         if dtype != output[name]:
             result = result.set_column(index, name, result.column(index).cast(output[name]))
     dictionaries = {name: dtype for name, dtype in expected.items()
                     if dtype.base_type() == pl.Categorical and pa.types.is_dictionary(result[name].type)}
-    known = {}
+    known, mappings = {}, {}
     for name, dtype in dictionaries.items():
-        ids = _known_categorical(result[name], dtype, name, categories)
-        if ids is not None:
-            known[name] = ids
+        codes = _known_codes(result[name], dtype, name, categories)
+        if codes is not None:
+            known[name], mappings[name] = codes
     categorical = {name: _categorical_from_arrow(result[name], dtype, name)
                    for name, dtype in dictionaries.items() if name not in known}
     if known:
         # One query converts every column of ids, in parallel.
         converted = pl.DataFrame(list(known.values())).with_columns(
-            [pl.col(name).cat.to(dictionaries[name]) for name in known])
+            [_known_ids(name, mappings[name]).cat.to(dictionaries[name]).alias(name) for name in known])
         categorical.update({name: converted.get_column(name) for name in known})
     if categorical:
         frame = pl.DataFrame([categorical[name] if name in categorical

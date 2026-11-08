@@ -732,7 +732,7 @@ class Adapter:
                 if dtype.base_type() not in _SUPPORTED_INPUT_TYPES:
                     raise NotImplementedError(f"unsupported Parquet column {name}: {dtype}")
             options = node.file_options
-            for name in ("row_count", "row_index", "include_file_paths", "n_rows", "hive_options",
+            for name in ("row_count", "row_index", "include_file_paths", "hive_options",
                          "column_mapping", "default_values", "deletion_files", "table_statistics"):
                 if getattr(options, name) is not None:
                     raise NotImplementedError(f"unsupported scan option {name}")
@@ -755,6 +755,12 @@ class Adapter:
             if cloud.get("config") is not None or cloud.get("credential_provider") is not None:
                 raise NotImplementedError("cloud scan configuration is not supported")
             frame = ibex.scan_parquet(node.paths[0])
+            if options.n_rows is not None:
+                # head/slice/tail pushed into the scan: (offset, length), with
+                # a negative offset counting from the end. It precedes the
+                # predicate, as an explicit scan_parquet(n_rows=...) does.
+                offset, length = options.n_rows
+                frame = frame.slice(offset, length)
             if node.predicate is not None:
                 frame = frame.filter(self.expression(node.predicate.node))
             frame = frame.select(list(schema))

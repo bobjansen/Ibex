@@ -678,6 +678,21 @@ class EngineTests(unittest.TestCase):
                 pl.LazyFrame({"x": pl.Series([1], dtype=dtype)}).select(-pl.col("x")).collect(engine=self.engine)
 
     @unittest.skipIf(os.environ.get("IBEX_TEST_PARQUET") == "0", "Parquet backend disabled")
+    def test_row_limits_pushed_into_a_parquet_scan(self):
+        # Polars pushes head/slice/tail on a bare scan into the scan itself
+        # (`n_rows`, an offset and a length); an explicit n_rows applies
+        # before a later filter's pushed-down predicate.
+        frame = pl.DataFrame({"g": ["a", "b", "a", "b", "a", "c"], "x": [5, 4, 3, 2, 1, 0]})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp, "rows.parquet"))
+            frame.write_parquet(path)
+            scan = pl.scan_parquet(path)
+            for query in (scan.head(2), scan.slice(1, 3), scan.tail(2), scan.head(0), scan.head(100),
+                          scan.select("x").head(3), scan.head(4).filter(pl.col("x") > 2),
+                          pl.scan_parquet(path, n_rows=3).filter(pl.col("x") > 3),
+                          scan.head(5).group_by("g").agg(pl.sum("x")).sort("g")):
+                self.equal(query)
+
     def test_small_integer_parquet_and_wide_unsigned_rejections(self):
         with tempfile.TemporaryDirectory() as directory:
             for dtype, arrow_type in ((pl.Int8, pa.int8()), (pl.Int16, pa.int16()),
@@ -1159,7 +1174,7 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(query.collect(engine=self.engine).item(), 7.0)
             with patch.object(ibex_pyarrow, "execute_pipeline") as execute:
                 with self.assertRaises(NotImplementedError):
-                    pl.scan_parquet(path, n_rows=1).collect(engine=self.engine)
+                    pl.scan_parquet(path, row_index_name="i").collect(engine=self.engine)
                 execute.assert_not_called()
 
     def test_non_null_count_preserves_zero_and_uint32_across_types(self):

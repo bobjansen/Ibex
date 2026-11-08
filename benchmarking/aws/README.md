@@ -23,6 +23,9 @@ pull the results back as a CSV. Three layers:
 
 All scripts read `S3_BUCKET` / `AWS_REGION` / `IBEX_AMI` from `.config` (written
 by `setup.sh` and `build-ami.sh`); override via env or `--region`.
+Credentials come from the standard AWS CLI chain. If they live under a named
+profile, export it (`AWS_PROFILE=<name>`): otherwise the launchers stop with
+"Unable to locate credentials" before creating an instance.
 
 ## Published benchmark snapshot
 
@@ -31,24 +34,24 @@ with its own timing boundary and provenance:
 
 | Suite | Measured | Ibex commit | Machine and budget | Timing |
 |---|---|---|---|---|
-| In-memory DataFrame | 2026-10-12 | `ffeb07ad` | r7i.2xlarge, 64 GiB; separate identical instance per engine; 8 vCPUs on 4 physical cores, SMT on; default engine thread budgets, plus single-thread variants | Load once, excluded; full result materialisation; mean of 5 iterations after 1 warmup |
-| H2O, 10M rows | 2026-10-16 | `9c99d03b` | One r7i.4xlarge, Xeon Platinum 8488C, 128 GiB; SMT off; all engines pinned to the same 1 or 8 physical cores | Load once, excluded; full result materialisation; minimum of 5 iterations after 1 warmup |
-| PDS-H, SF10 | 2026-10-16 | `9c99d03b` | One r7i.4xlarge, Xeon Platinum 8488C, 128 GiB; SMT off; all engines pinned to the same 1, 2 or 8 physical cores | Parquet reads included in each query; full result materialisation; mean of 5 iterations after 1 warmup |
+| In-memory DataFrame | 2026-10-24 | `950fafc1` | r7i.2xlarge, 64 GiB; separate identical instance per engine (Ibex, Polars, DuckDB); 8 vCPUs on 4 physical cores, SMT on; default engine thread budgets, plus single-thread variants | Load once, excluded; full result materialisation; mean of 5 iterations after 1 warmup |
+| H2O, 10M rows | 2026-11-08 | `b23a1390` | One r7i.4xlarge, Xeon Platinum 8488C, 128 GiB; SMT off; all engines pinned to the same 1 or 8 physical cores | Load once, excluded; full result materialisation; minimum of 5 iterations after 1 warmup |
+| PDS-H, SF10 | 2026-11-08 | `b23a1390` | One r7i.4xlarge, Xeon Platinum 8488C, 128 GiB; SMT off; all engines pinned to the same 1, 2 or 8 physical cores | Parquet reads included in each query; full result materialisation; mean of 5 iterations after 1 warmup |
 
-H2O and PDS-H use Polars **2.0.0** (streaming) and DuckDB **1.5.4**.
+H2O and PDS-H use Polars **2.0.0** (streaming) and DuckDB **2.0.0**.
 PDS-H pins upstream `pola-rs/polars-benchmark` at `401908a307f1`;
-H2O pins `duckdblabs/db-benchmark` at `3b074bc319`. H2O checks row counts
-and upstream checksum sums across engines; PDS-H checks all 22 Ibex answers
-against Polars at the measured scale before timing. The PDS-H per-run
-manifests record `dirty: true`; retain those manifests with the result when
-citing the run rather than describing it as a verified clean checkout.
+H2O pins `duckdblabs/db-benchmark` at `3b074bc319`. H2O validates every
+answer across all three engines (`h2o-answers-v2`, all 110 data/question/core
+comparisons); PDS-H checks all 22 Ibex answers against Polars at each
+measured core count before timing (66 checks). Both runs' manifests record a
+clean checkout (`dirty: false`).
 The in-memory CSV and launch manifest do not retain competitor package versions.
 
 The current H2O runner requires bounded full-output validation and key-bound
 scale fingerprints. Failed runs retain partial artifacts and return nonzero.
 Its TSV checks sidecars and requested dataset/core-count plan are required for
-publication. The historical H2O artifacts above predate these gates and need a
-new validated run before they can be passed to the current website generator.
+publication. H2O artifacts from before 2026-11-08 predate these gates and
+cannot be passed to the current website generator.
 
 Current in-memory runs also require complete bounded answer checks against
 Polars 2 and DuckDB 2. DuckDB contributes scale digests at every requested size,
@@ -62,9 +65,9 @@ worker does not also load and benchmark pandas.
 
 Source artifacts, under `benchmarking/results/`:
 
-- `scales_aws_20261012T184009.csv` and its `.manifest.json`.
-- `h2o_aws_20261016T074103.tar.gz` (samples, checks and `versions.txt`).
-- `tpch_aws_20261016T060314.tar.gz` (samples, per-run manifests and `versions.txt`).
+- `scales_aws_20261024T152444.csv` and its `.manifest.json`.
+- `h2o_aws_20261108T134649.tar.gz` (samples, checks sidecars and `versions.txt`).
+- `tpch_aws_20261108T134649.tar.gz` (samples, per-run manifests and `versions.txt`).
 
 Report geometric means **and** ratios of total query times. The former gives
 equal weight to multiplicative differences per question; the latter gives
@@ -76,16 +79,20 @@ For example, at 8 physical cores (times in ms):
 
 | Suite / question | Ibex | Polars | DuckDB |
 |---|---:|---:|---:|
-| H2O K=100, q1 (sum by id1) | 2.505 | 7.916 | 3.266 |
-| H2O K=100, q6 (median and stddev) | 162.82 | 105.69 | 111.15 |
-| H2O K=2, q8 (top two per group) | 870.48 | 4167.26 | 211.11 |
-| H2O join q5 (big inner join) | 333.953 | 197.452 | 446.076 |
-| PDS-H q02 | 58.02 | 62.28 | 109.81 |
-| PDS-H q04 | 282.40 | 158.51 | 226.34 |
+| H2O K=100, q1 (sum by id1) | 3.754 | 9.811 | 6.466 |
+| H2O K=100, q6 (median and stddev) | 41.820 | 101.144 | 68.783 |
+| H2O K=2, q8 (top two per group) | 268.401 | 4604.510 | 178.704 |
+| H2O join q5 (big inner join) | 157.218 | 204.080 | 354.134 |
+| PDS-H q02 | 50.18 | 64.67 | 108.71 |
+| PDS-H q04 | 167.87 | 161.35 | 217.72 |
 
-Across all PDS-H queries at 8 cores, Ibex/Polars is **1.20 geometric mean,
-1.22 total**; Ibex/DuckDB is **0.94 geometric mean, 0.96 total**. H2O's
-8-core joins are **0.99 geometric mean, 1.40 total** against Polars.
+Across all PDS-H queries at 8 cores, Ibex/Polars is **0.94 geometric mean,
+0.96 total**; Ibex/DuckDB is **0.77 geometric mean, 0.81 total**. Ibex wins
+10 of the 22 queries against Polars and 21 against DuckDB (q01 is 1.25×).
+At 1 and 2 cores, Ibex/Polars is 0.86 and 0.88 geometric mean, and
+Ibex/DuckDB 0.70 and 0.73. H2O's 8-core joins are **0.86 geometric mean,
+0.81 total** against Polars, and every groupby dataset leads both engines by
+both summaries at 1 and 8 cores.
 The [H2O README](../h2o/README.md) lists every dataset's summaries at both
 core counts; the website exposes every query.
 
@@ -97,14 +104,15 @@ instances and download new measurements; exact times will vary. Dependencies
 are resolved by each revision's harness and AMI, so compare its recorded
 versions with the snapshot above.
 
-At `ffeb07ad`:
+At `950fafc1`:
 
 ```bash
 ./benchmarking/aws/run-per-engine.sh --on-demand --type r7i.2xlarge \
+    --engines ibex,python,duckdb --skip-pandas \
     --sizes 1M,2M,4M,8M,16M,32M,50M --warmup 1 --iters 5
 ```
 
-At `9c99d03b`:
+At `b23a1390`:
 
 ```bash
 ./benchmarking/aws/run-h2o.sh --on-demand --type r7i.4xlarge \
@@ -118,9 +126,9 @@ repository root at the current revision:
 
 ```bash
 python3 benchmarking/gen_website.py \
-    benchmarking/results/scales_aws_20261012T184009.csv --commit ffeb07ad \
-    --h2o benchmarking/results/h2o_aws_20261016T074103.tar.gz \
-    --pdsh benchmarking/results/tpch_aws_20261016T060314.tar.gz
+    benchmarking/results/scales_aws_20261024T152444.csv --commit 950fafc1 \
+    --h2o benchmarking/results/h2o_aws_20261108T134649.tar.gz \
+    --pdsh benchmarking/results/tpch_aws_20261108T134649.tar.gz
 ```
 
 ## vCPUs are hyperthreads

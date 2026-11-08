@@ -100,8 +100,10 @@ def main():
         'correctness': 'all rows, order and dtypes; Q11 permits reordering only within value-sort ties while checking descending values; rel_tol=1e-10 abs_tol=1e-8; ' + (
             'IbexEngine compared against Polars streaming' if args.skip_in_memory else
             'streaming and IbexEngine compared against Polars in-memory'),
-        'cpu_frequency_khz': {name: Path('/sys/devices/system/cpu/cpu0/cpufreq', name).read_text().strip()
-                              for name in ('scaling_min_freq', 'scaling_max_freq')},
+        # Virtual machines (EC2 among them) often expose no cpufreq at all.
+        'cpu_frequency_khz': {name: path.read_text().strip() if path.exists() else None
+                              for name in ('scaling_min_freq', 'scaling_max_freq')
+                              for path in [Path('/sys/devices/system/cpu/cpu0/cpufreq', name)]},
         'ibex_decode_threads': os.environ.get('IBEX_DECODE_THREADS'),
         'ibex_stream_scan': os.environ.get('IBEX_STREAM_SCAN'),
         'ibex_join_probe': os.environ.get('IBEX_JOIN_PROBE'),

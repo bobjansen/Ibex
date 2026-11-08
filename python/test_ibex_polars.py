@@ -35,6 +35,24 @@ class EngineTests(unittest.TestCase):
         assert_frame_equal(actual, expected, rel_tol=1e-12, abs_tol=1e-9)
         return actual
 
+    def test_sum_that_is_null_when_a_group_has_no_values(self):
+        # Polars documents `when(x.count() > 0).then(x.sum())` for a sum that
+        # is null rather than zero on an empty group, and folds it into one
+        # sum aggregate. The h2o harness uses it for SQL sum semantics.
+        frame = pl.DataFrame({"g": ["a", "a", "b", "c"], "x": [1, None, None, 2_000_000_000],
+                              "y": [1.5, None, None, 2.0], "f": [True, None, None, False]},
+                             schema={"g": pl.Categorical, "x": pl.Int32, "y": pl.Float64,
+                                     "f": pl.Boolean}).lazy()
+        total = lambda name: pl.when(pl.col(name).count() > 0).then(pl.col(name).sum()).otherwise(None)
+        actual = self.equal(frame.group_by("g").agg(
+            total("x").alias("x"), (total("x") + total("x")).alias("x2"),
+            total("y").alias("y"), total("f").alias("f")).sort("g"))
+        self.assertEqual(actual["x"].to_list(), [1, None, 2_000_000_000])
+        self.assertEqual(actual["y"].to_list(), [1.5, None, 2.0])
+        self.assertEqual(actual["f"].to_list(), [1, None, 0])
+        self.equal(frame.select(total("x").alias("x"), total("y").alias("y")))
+        self.equal(frame.filter(pl.col("x").is_null()).select(total("x").alias("x")))
+
     def test_grouped_mean_counts_null_keys_and_output_types(self):
         query = pl.DataFrame({"g": ["b", None, "a", "b", None], "h": [1, 1, 2, 1, 1],
                               "x": [2, None, 7, 4, None]}).lazy().group_by("g", "h").agg(

@@ -245,6 +245,10 @@ class Adapter:
             operation = value.name
             if value.name == "count" and value.options is True:
                 operation = "column_len"
+            elif value.name == "sum" and value.options is True:
+                # Polars folds `when(x.count() > 0).then(x.sum())` into a sum
+                # whose option makes empty and all-null input null, not zero.
+                operation = "nullable_sum"
             elif value.options not in (None, False):
                 raise NotImplementedError(f"unsupported {value.name} aggregate options")
             expr = Expr(operation, (self.expression(value.arguments[0]),))

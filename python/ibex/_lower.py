@@ -72,6 +72,13 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             if current_types.get(id(args[0])) == pa.bool_():
                 value = f"Int64({value})"
             return f"coalesce(sum({value}), {bind(zero)})"
+        if op == "nullable_sum":
+            # Polars' `when(x.count() > 0).then(x.sum())`, a sum that is null
+            # for empty/all-null input: exactly Ibex's native sum.
+            value = render(args[0])
+            if current_types.get(id(args[0])) == pa.bool_():
+                value = f"Int64({value})"
+            return f"sum({value})"
         if op == "count":
             if args[0]._op == "col":
                 return f"count({render(args[0])})"
@@ -684,9 +691,9 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
                     dtype(args[1]) != pa.bool_() or args[1]._aggregate):
                 raise NotImplementedError("filtered distinct count requires row values and a row-local Boolean predicate")
             return pa.uint32()
-        if op in ("sum", "mean", "min", "max"):
+        if op in ("sum", "nullable_sum", "mean", "min", "max"):
             result = dtype(args[0])
-            if op == "sum" and result == pa.bool_() and args[0]._row_reference:
+            if op in ("sum", "nullable_sum") and result == pa.bool_() and args[0]._row_reference:
                 return pa.uint32()
             if result not in numeric or not args[0]._row_reference:
                 raise NotImplementedError(f"{op} currently requires an Int64 or Float64 row expression")

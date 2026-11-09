@@ -21557,3 +21557,26 @@ TEST_CASE("bound filters preserve NaN ordering and null validity", "[runtime][bo
     REQUIRE(result);
     CHECK(result->rows() == 0);
 }
+
+TEST_CASE("compact storage computes expressions and reductions in Int64",
+          "[compact-int32][interpreter]") {
+    runtime::Table input;
+    input.add_column("g", Column<std::int64_t>{1, 1});
+    input.add_column("v", Column<std::int64_t>::from_compact_int32({2000000000, 2000000000}));
+    input.add_column("w", Column<std::int64_t>{3000000000LL, 3000000000LL});
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(input));
+    for (const auto& query :
+         {"t[select { s = sum(v), p = sum(v * v), m = sum(v + w) }];",
+          "t[select { s = sum(v), p = sum(v * v), m = sum(v + w) }, by { g }];"}) {
+        auto plan = require_ir(query);
+        auto result = runtime::interpret(*plan, registry);
+        REQUIRE(result.has_value());
+        const auto value = [&](const char* name) {
+            return std::get<Column<std::int64_t>>(*result->find_entry(name)->column)[0];
+        };
+        REQUIRE(value("s") == INT64_C(4000000000));
+        REQUIRE(value("p") == INT64_C(8000000000000000000));
+        REQUIRE(value("m") == INT64_C(10000000000));
+    }
+}

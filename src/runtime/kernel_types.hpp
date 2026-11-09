@@ -78,6 +78,38 @@ class ColumnView {
     const ValidityBitmap* validity_;
 };
 
+/// Integer input values can have either physical width. Pointer-only kernels
+/// must explicitly request an owned widening rather than assume contiguity.
+template <>
+class ColumnView<std::int64_t> {
+   public:
+    ColumnView(const std::int64_t* data, std::size_t rows, const ValidityBitmap* validity) noexcept
+        : wide_(data), rows_(rows), validity_(validity) {}
+    ColumnView(const Column<std::int64_t>& column, const ValidityBitmap* validity) noexcept
+        : wide_(column.is_compact_int32() ? nullptr : column.data()),
+          compact_(column.is_compact_int32() ? column.compact_int32_data() : nullptr),
+          rows_(column.size()),
+          validity_(validity) {}
+    [[nodiscard]] auto rows() const noexcept -> std::size_t { return rows_; }
+    [[nodiscard]] auto data() const noexcept -> const std::int64_t* { return wide_; }
+    [[nodiscard]] auto compact_data() const noexcept -> const std::int32_t* { return compact_; }
+    [[nodiscard]] auto validity() const noexcept -> const ValidityBitmap* { return validity_; }
+    [[nodiscard]] auto is_valid(std::size_t row) const noexcept -> bool {
+        return !validity_ || (*validity_)[row];
+    }
+    [[nodiscard]] auto value(std::size_t row) const noexcept -> std::int64_t {
+        return compact_ ? static_cast<std::int64_t>(compact_[row]) : wide_[row];
+    }
+
+   private:
+    // A kernel view has no iterator position. Bind the physical base once;
+    // retaining IntegerView here leaves its offset in selected-row hot loops.
+    const std::int64_t* wide_;
+    const std::int32_t* compact_ = nullptr;
+    std::size_t rows_;
+    const ValidityBitmap* validity_;
+};
+
 /// Non-owning view of a chunk's columns, addressed by absolute position.
 /// Column identity is by position, not name: a kernel is told positions by
 /// the pipeline that resolved names once at construction. Carries the

@@ -361,3 +361,42 @@ TEST_CASE("word-block gather keeps every survivor at every density and stays in 
         }
     }
 }
+
+TEST_CASE("compact integer gather retains width without narrowing values",
+          "[compact-int32][gather]") {
+    runtime::ColumnValue source =
+        Column<std::int64_t>::from_compact_int32({INT32_MIN, INT32_MAX, 2000000000});
+    const std::vector<std::size_t> indices{2, 0, 1, 2};
+    auto result = runtime::gather_column(source, indices.data(), indices.size(), nullptr);
+    const auto& output = std::get<Column<std::int64_t>>(result);
+    REQUIRE(output.is_compact_int32());
+    REQUIRE(output.compact_int32_data()[0] == 2000000000);
+    REQUIRE(output[1] == INT64_C(-2147483648));
+    REQUIRE(output[2] == INT64_C(2147483647));
+    REQUIRE(output[0] + output[3] == INT64_C(4000000000));
+}
+
+TEST_CASE("nullable compact batched gather writes its physical output directly",
+          "[compact-int32][no-cache]") {
+    ibex::runtime::ColumnValue source = ibex::Column<std::int64_t>::from_compact_int32({5, 7});
+    constexpr auto missing = std::numeric_limits<std::size_t>::max();
+    const std::size_t index[]{1, missing, 0};
+    const std::vector<ibex::runtime::ColumnGatherJob> jobs{
+        {.column = &source, .idx = index, .null_index = missing}};
+    if (ibex::runtime::process_worker_pool().size() < 2)
+        SKIP("requires two pool workers");
+    const ibex::runtime::ExecutionContext exec{
+        .parallel_threads = 2, .parallel_min_rows = 0, .parallel_min_cells = 0};
+    auto gathered = ibex::runtime::gather_columns_batched(
+        jobs, 3, &exec, [](std::size_t) -> ibex::runtime::GatheredColumn {
+            FAIL("the test must reach the ranged compact writer");
+            return {};
+        });
+    const auto& result = std::get<ibex::Column<std::int64_t>>(gathered[0].first);
+    REQUIRE(result.is_compact_int32());
+    REQUIRE(result.compact_int32_data()[0] == 7);
+    REQUIRE(result.compact_int32_data()[1] == 0);
+    REQUIRE(result.compact_int32_data()[2] == 5);
+    REQUIRE(gathered[0].second.has_value());
+    REQUIRE_FALSE((*gathered[0].second)[1]);
+}

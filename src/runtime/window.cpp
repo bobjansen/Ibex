@@ -740,7 +740,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
                     return std::unexpected("rolling_mean: column must be numeric (Int or Float)");
                 } else {
-                    const auto* values = col.data();
+                    const auto values = value_reader(col);
                     Column<double> result;
                     result.resize(rows);
                     auto* result_values = result.data();
@@ -893,7 +893,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     ColT result;
                     result.resize_for_overwrite(rows);
                     auto* result_values = result.data();
-                    const auto* col_values = col.data();
+                    const auto col_values = value_reader(col);
                     std::optional<ValidityBitmap> out_valid;
                     // One instantiation per (window kind x has-nulls).
                     //
@@ -1022,7 +1022,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     Column<double> result;
                     result.resize_for_overwrite(rows);
                     auto* result_values = result.data();
-                    const auto* col_values = col.data();
+                    const auto col_values = value_reader(col);
                     std::optional<ValidityBitmap> out_valid;
                     std::size_t nan_cnt = 0;  // valid-but-NaN values in window
                     // Only finite, non-null values enter the heaps; NULLs are
@@ -1092,7 +1092,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     Column<double> result;
                     result.resize_for_overwrite(rows);
                     auto* result_values = result.data();
-                    const auto* col_values = col.data();
+                    const auto col_values = value_reader(col);
                     std::optional<ValidityBitmap> out_valid;
                     // Specialised per (window kind x has-nulls), as in
                     // `rolling_sum`. Welford carries two doubles across the row
@@ -1213,7 +1213,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     // reproducing the from-scratch O(n*w) recurrence in one pass.
                     // beta_pow caches beta^k (k bounded by the window width).
                     const double beta = 1.0 - alpha;
-                    const auto* col_values = col.data();
+                    const auto col_values = value_reader(col);
                     auto val = [&](std::size_t j) -> double {
                         return valid_at(j) ? static_cast<double>(col_values[j]) : 0.0;
                     };
@@ -1370,7 +1370,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     Column<double> result;
                     result.resize_for_overwrite(rows);
                     auto* result_values = result.data();
-                    const auto* col_values = col.data();
+                    const auto col_values = value_reader(col);
                     std::optional<ValidityBitmap> out_valid;
                     std::size_t nan_cnt = 0;  // valid-but-NaN values in window
                     // As in rolling_median: only finite, non-null values enter
@@ -1430,7 +1430,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     Column<double> result;
                     result.resize_for_overwrite(rows);
                     auto* result_values = result.data();
-                    const auto* col_values = col.data();
+                    const auto col_values = value_reader(col);
                     std::optional<ValidityBitmap> out_valid;
                     // The mean comes from a running sum (O(1) per row); the
                     // centered moments are still computed from the raw values,
@@ -1517,7 +1517,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     Column<double> result;
                     result.resize_for_overwrite(rows);
                     auto* result_values = result.data();
-                    const auto* col_values = col.data();
+                    const auto col_values = value_reader(col);
                     std::optional<ValidityBitmap> out_valid;
                     // As rolling_skew: running mean, moments recomputed per row.
                     // Kurtosis is the one that punishes an incremental m4 hardest

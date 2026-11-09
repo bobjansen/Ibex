@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <compare>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -91,6 +92,21 @@ auto operator!=(const NoInitAllocator<T>& /*_*/, const NoInitAllocator<U>& /*_*/
 /// the note in `Mask`.
 template <typename T>
 using NoInitVector = std::vector<T, NoInitAllocator<T>>;
+/// Physical signed Int32 backing of a logical Int64 column. Reading never
+/// attaches a second representation; operations explicitly own any widening.
+struct CompactIntBacking {
+    NoInitVector<std::int32_t> values;
+    std::shared_ptr<const void> owner;
+    const std::int32_t* external = nullptr;
+    std::size_t external_size = 0;
+    [[nodiscard]] auto data32() const noexcept -> std::span<const std::int32_t> {
+        return owner ? std::span<const std::int32_t>(external, external_size)
+                     : std::span<const std::int32_t>(values);
+    }
+    [[nodiscard]] auto capacity() const noexcept -> std::size_t {
+        return owner ? external_size : values.capacity();
+    }
+};
 }  // namespace ibex::detail
 
 namespace ibex {
@@ -101,6 +117,91 @@ concept ColumnElement = std::regular<T> && std::totally_ordered<T>;
 
 /// Tag type for dictionary-encoded categorical columns.
 struct Categorical {};
+
+/// Non-owning logical Int64 reader over either physical integer width. Values
+/// are promoted before being returned. Also a random-access value iterator;
+/// deliberately not contiguous and never convertible to an Int64 pointer.
+class IntegerView {
+   public:
+    using value_type = std::int64_t;
+    using difference_type = std::ptrdiff_t;
+    using reference = std::int64_t;
+    using pointer = void;
+    using iterator_category = std::random_access_iterator_tag;
+    IntegerView() = default;
+    IntegerView(std::nullptr_t) noexcept {}
+    IntegerView(const std::int64_t* data) noexcept : wide_(data) {}
+    explicit IntegerView(const std::int32_t* data) noexcept : compact_(data) {}
+    template <std::integral Index>
+    [[nodiscard]] auto operator[](Index row) const noexcept -> value_type {
+        const auto at = offset_ + static_cast<difference_type>(row);
+        return compact_ ? static_cast<value_type>(compact_[at]) : wide_[at];
+    }
+    [[nodiscard]] auto physical_data() const noexcept -> const void* {
+        return compact_ ? static_cast<const void*>(compact_ + offset_)
+                        : static_cast<const void*>(wide_data());
+    }
+    [[nodiscard]] auto operator*() const noexcept -> value_type { return (*this)[0]; }
+    explicit operator bool() const noexcept { return wide_ || compact_; }
+    [[nodiscard]] auto wide_data() const noexcept -> const std::int64_t* {
+        return wide_ ? wide_ + offset_ : nullptr;
+    }
+    auto operator+=(difference_type n) noexcept -> IntegerView& {
+        offset_ += n;
+        return *this;
+    }
+    auto operator-=(difference_type n) noexcept -> IntegerView& {
+        offset_ -= n;
+        return *this;
+    }
+    auto operator++() noexcept -> IntegerView& { return *this += 1; }
+    auto operator--() noexcept -> IntegerView& { return *this -= 1; }
+    auto operator++(int) noexcept -> IntegerView {
+        auto copy = *this;
+        ++*this;
+        return copy;
+    }
+    auto operator--(int) noexcept -> IntegerView {
+        auto copy = *this;
+        --*this;
+        return copy;
+    }
+    template <std::integral Index>
+    friend auto operator+(IntegerView v, Index n) noexcept -> IntegerView {
+        return v += static_cast<difference_type>(n);
+    }
+    template <std::integral Index>
+    friend auto operator+(Index n, IntegerView v) noexcept -> IntegerView {
+        return v += static_cast<difference_type>(n);
+    }
+    template <std::integral Index>
+    friend auto operator-(IntegerView v, Index n) noexcept -> IntegerView {
+        return v -= static_cast<difference_type>(n);
+    }
+    friend auto operator-(IntegerView a, IntegerView b) noexcept -> difference_type {
+        // Mutable iterators may arrive as raw pointers already advanced to
+        // their position, whereas logical iterators keep an explicit offset.
+        const auto base = a.compact_ ? (a.compact_ == b.compact_ ? 0 : a.compact_ - b.compact_)
+                                     : (a.wide_ == b.wide_ ? 0 : a.wide_ - b.wide_);
+        return base + a.offset_ - b.offset_;
+    }
+    friend auto operator==(IntegerView a, IntegerView b) noexcept -> bool {
+        if (static_cast<bool>(a.compact_) != static_cast<bool>(b.compact_))
+            return false;
+        return (a - b) == 0;
+    }
+    friend auto operator<=>(IntegerView a, IntegerView b) noexcept {
+        return (a - b) <=> difference_type{0};
+    }
+    friend auto operator==(IntegerView v, std::nullptr_t) noexcept -> bool {
+        return !v.wide_ && !v.compact_;
+    }
+
+   private:
+    const std::int64_t* wide_ = nullptr;
+    const std::int32_t* compact_ = nullptr;
+    difference_type offset_ = 0;
+};
 
 /// A typed contiguous column.
 ///
@@ -122,7 +223,9 @@ class Column {
     using size_type = std::size_t;
     using storage_type = std::vector<T, detail::NoInitAllocator<T>>;
     using iterator = T*;
-    using const_iterator = const T*;
+    using const_iterator =
+        std::conditional_t<std::is_same_v<T, std::int64_t>, IntegerView, const T*>;
+    using const_reference = std::conditional_t<std::is_same_v<T, std::int64_t>, T, const T&>;
     using reverse_iterator = std::reverse_iterator<iterator>;
     using const_reverse_iterator = std::reverse_iterator<const_iterator>;
 
@@ -200,6 +303,9 @@ class Column {
     /// original element offset for Arrow C Data round trips.
     [[nodiscard]] static auto from_external(std::shared_ptr<const void> owner, const T* values,
                                             size_type offset, size_type size) -> Column {
+        if (offset == static_cast<size_type>(-1)) {
+            throw std::invalid_argument("external column offset is reserved");
+        }
         if (!owner) {
             throw std::invalid_argument("external column requires a lifetime owner");
         }
@@ -214,6 +320,120 @@ class Column {
         return column;
     }
 
+    /// Experimental compact Int32 backing of a logically Int64 column.
+    /// Arithmetic readers retain Int64 semantics; no narrowing is implicit.
+    [[nodiscard]] static auto from_compact_int32(detail::NoInitVector<std::int32_t> values)
+        -> Column
+        requires std::is_same_v<T, std::int64_t>
+    {
+        auto backing = std::make_shared<detail::CompactIntBacking>();
+        backing->values = std::move(values);
+        Column result;
+        result.external_size_ = backing->values.size();
+        result.external_offset_ = static_cast<size_type>(-1);
+        result.external_owner_ = std::move(backing);
+        return result;
+    }
+    /// Adopt immutable signed Int32 storage without allocating a widened copy.
+    /// The pointer includes any slice offset; owner keeps its buffer alive.
+    [[nodiscard]] static auto from_external_int32(std::shared_ptr<const void> owner,
+                                                  const std::int32_t* values, size_type size)
+        -> Column
+        requires std::is_same_v<T, std::int64_t>
+    {
+        if (!owner || (values == nullptr && size != 0)) {
+            throw std::invalid_argument("external Int32 column requires an owner and data buffer");
+        }
+        auto backing = std::make_shared<detail::CompactIntBacking>();
+        backing->owner = std::move(owner);
+        backing->external = values;
+        backing->external_size = size;
+        Column result;
+        result.external_size_ = size;
+        result.external_offset_ = static_cast<size_type>(-1);
+        result.external_owner_ = std::move(backing);
+        return result;
+    }
+
+    /// Explicitly materialize logical integers into independent owned Int64
+    /// storage. The requesting operation owns its lifetime; no source cache.
+    [[nodiscard]] auto widened_int64() const -> Column
+        requires std::is_same_v<T, std::int64_t>
+    {
+        Column result;
+        result.set_meta(meta_);
+        result.reserve(size());
+        visit_integer_storage([&](auto values) {
+            for (auto value : values)
+                result.push_back(static_cast<T>(value));
+        });
+        return result;
+    }
+
+    [[nodiscard]] auto integer_view() const noexcept -> IntegerView
+        requires std::is_same_v<T, std::int64_t>
+    {
+        return is_compact_int32() ? IntegerView(compact_int32_data())
+                                  : IntegerView(is_external() ? external_data_ : data_.data());
+    }
+
+    /// Dispatch once per kernel to its physical integer input span. The visitor
+    /// must widen operands to Int64 before arithmetic, and return the same type
+    /// for both span types. Spans borrow this column and never populate a cache.
+    template <typename Visitor>
+    decltype(auto) visit_integer_storage(Visitor&& visitor) const
+        requires std::is_same_v<T, std::int64_t>
+    {
+        if (is_compact_int32()) {
+            return std::invoke(std::forward<Visitor>(visitor),
+                               std::span<const std::int32_t>(compact_int32_data(), size()));
+        }
+        return std::invoke(std::forward<Visitor>(visitor),
+                           std::span<const std::int64_t>(data_ptr(), size()));
+    }
+
+    [[nodiscard]] auto is_compact_int32() const noexcept -> bool {
+        if constexpr (std::is_same_v<T, std::int64_t>) {
+            return external_owner_ && external_offset_ == static_cast<size_type>(-1);
+        }
+        return false;
+    }
+    [[nodiscard]] auto compact_int32_data() const noexcept -> const std::int32_t* {
+        return is_compact_int32()
+                   ? static_cast<const detail::CompactIntBacking*>(external_owner_.get())
+                         ->data32()
+                         .data()
+                   : nullptr;
+    }
+    auto compact_int32_output() -> std::int32_t* {
+        if (!is_compact_int32() || external_owner_.use_count() != 1) {
+            throw std::logic_error("compact output must have exclusive ownership");
+        }
+        const auto* backing = static_cast<const detail::CompactIntBacking*>(external_owner_.get());
+        if (backing->owner) {
+            throw std::logic_error("cannot mutate borrowed compact backing");
+        }
+        // Only presized fresh gather outputs use this accessor, before widening.
+        return const_cast<detail::CompactIntBacking*>(
+                   static_cast<const detail::CompactIntBacking*>(external_owner_.get()))
+            ->values.data();
+    }
+
+    /// Concatenate logical integer values, retaining compact backing only
+    /// while both sides are compact. No arithmetic or implicit narrowing.
+    void append_integer_values(const Column& source)
+        requires std::is_same_v<T, std::int64_t>
+    {
+        if (source.empty())
+            return;
+        if (this == &source || is_compact_int32() || source.is_compact_int32()) [[unlikely]] {
+            append_integer_values_slow(source);
+            return;
+        }
+        const auto* first = source.data();
+        (void)insert(end(), first, first + source.size());
+    }
+
     /// Whether reads currently refer to adopted storage rather than `data_`.
     [[nodiscard]] auto is_external() const noexcept -> bool {
         return static_cast<bool>(external_owner_);
@@ -221,14 +441,16 @@ class Column {
 
     /// Base storage pointer and logical element offset. Most callers should use
     /// `data()`; these accessors exist for zero-copy Arrow C Data export.
-    [[nodiscard]] auto buffer_data() const noexcept -> const T* {
+    [[nodiscard]] auto buffer_data() const noexcept(!std::is_same_v<T, std::int64_t>) -> const T* {
+        if (is_compact_int32())
+            return data_ptr();
         if (!is_external()) {
             return data_.data();
         }
         return external_data_ != nullptr ? external_data_ - external_offset_ : external_data_;
     }
     [[nodiscard]] auto buffer_offset() const noexcept -> size_type {
-        return is_external() ? external_offset_ : 0;
+        return is_compact_int32() ? 0 : (is_external() ? external_offset_ : 0);
     }
 
     /// Number of elements.
@@ -237,11 +459,11 @@ class Column {
     }
 
     /// Immutable element access (bounds-checked).
-    [[nodiscard]] auto at(size_type idx) const -> const T& {
+    [[nodiscard]] auto at(size_type idx) const -> const_reference {
         if (idx >= size()) {
             throw std::out_of_range("Column::at");
         }
-        return data_ptr()[idx];
+        return (*this)[idx];
     }
 
     /// Mutable element access (bounds-checked).
@@ -251,8 +473,12 @@ class Column {
     }
 
     /// Unchecked element access.
-    [[nodiscard]] auto operator[](size_type idx) const noexcept -> const T& {
-        return data_ptr()[idx];
+    [[nodiscard]] auto operator[](size_type idx) const noexcept -> const_reference {
+        if constexpr (std::is_same_v<T, std::int64_t>) {
+            if (is_compact_int32())
+                return static_cast<T>(compact_int32_data()[idx]);
+        }
+        return is_external() ? external_data_[idx] : data_[idx];
     }
 
     /// Unchecked mutable element access.
@@ -262,7 +488,10 @@ class Column {
     }
 
     /// Zero-copy immutable view of the underlying data.
-    [[nodiscard]] auto span() const noexcept -> std::span<const T> { return {data_ptr(), size()}; }
+    [[nodiscard]] auto span() const noexcept(!std::is_same_v<T, std::int64_t>)
+        -> std::span<const T> {
+        return {data_ptr(), size()};
+    }
 
     /// Mutable view, detaching adopted storage first.
     [[nodiscard]] auto span() -> std::span<T> {
@@ -400,12 +629,29 @@ class Column {
 
     /// Reserve capacity.
     void reserve(size_type capacity) {
+        if constexpr (std::is_same_v<T, std::int64_t>) {
+            if (is_compact_int32()) {
+                // Reservation concerns element slots, not arithmetic width.
+                // A no-op reserve must not detach shared immutable storage.
+                if (capacity > this->capacity()) {
+                    mutable_compact_backing().values.reserve(capacity);
+                }
+                return;
+            }
+        }
         detach_external();
         data_.reserve(capacity);
     }
 
-    /// Current capacity.
+    /// Capacity in logical elements at the current physical representation.
+    /// Promotion may allocate, but retains this reservation.
     [[nodiscard]] auto capacity() const noexcept -> size_type {
+        if constexpr (std::is_same_v<T, std::int64_t>) {
+            if (is_compact_int32()) {
+                return static_cast<const detail::CompactIntBacking*>(external_owner_.get())
+                    ->capacity();
+            }
+        }
         return is_external() ? external_size_ : data_.capacity();
     }
 
@@ -460,15 +706,17 @@ class Column {
         detach_external();
         return data_.data();
     }
-    [[nodiscard]] auto data() const noexcept -> const T* { return data_ptr(); }
+    [[nodiscard]] auto data() const noexcept(!std::is_same_v<T, std::int64_t>) -> const T* {
+        return data_ptr();
+    }
 
     /// First and last elements.
-    [[nodiscard]] auto front() const -> const T& { return *data_ptr(); }
+    [[nodiscard]] auto front() const noexcept -> const_reference { return (*this)[0]; }
     [[nodiscard]] auto front() -> T& {
         detach_external();
         return data_.front();
     }
-    [[nodiscard]] auto back() const -> const T& { return data_ptr()[size() - 1]; }
+    [[nodiscard]] auto back() const noexcept -> const_reference { return (*this)[size() - 1]; }
     [[nodiscard]] auto back() -> T& {
         detach_external();
         return data_.back();
@@ -478,7 +726,11 @@ class Column {
     template <std::predicate<const T&> Pred>
     [[nodiscard]] auto filter(Pred pred) const -> Column<T> {
         std::vector<T> result;
-        std::ranges::copy_if(span(), std::back_inserter(result), pred);
+        for (size_type row = 0; row < size(); ++row) {
+            const auto& value = (*this)[row];
+            if (pred(value))
+                result.push_back(value);
+        }
         return Column<T>{std::move(result)};
     }
 
@@ -489,7 +741,8 @@ class Column {
         using U = std::invoke_result_t<F, const T&>;
         std::vector<U> result;
         result.reserve(size());
-        std::ranges::transform(span(), std::back_inserter(result), func);
+        for (size_type row = 0; row < size(); ++row)
+            result.push_back(func((*this)[row]));
         return Column<U>{std::move(result)};
     }
 
@@ -502,40 +755,119 @@ class Column {
         detach_external();
         return iterator_at(data_.size());
     }
-    [[nodiscard]] auto begin() const noexcept -> const_iterator { return data_ptr(); }
-    [[nodiscard]] auto end() const noexcept -> const_iterator {
-        return empty() ? data_ptr() : data_ptr() + size();
+    [[nodiscard]] auto begin() const noexcept(!std::is_same_v<T, std::int64_t>) -> const_iterator {
+        if constexpr (std::is_same_v<T, std::int64_t>)
+            return integer_view();
+        else
+            return data_ptr();
     }
-    [[nodiscard]] auto cbegin() const noexcept -> const_iterator { return begin(); }
-    [[nodiscard]] auto cend() const noexcept -> const_iterator { return end(); }
+    [[nodiscard]] auto end() const noexcept(!std::is_same_v<T, std::int64_t>) -> const_iterator {
+        return empty() ? begin() : begin() + static_cast<std::ptrdiff_t>(size());
+    }
+    [[nodiscard]] auto cbegin() const noexcept(!std::is_same_v<T, std::int64_t>) -> const_iterator {
+        return begin();
+    }
+    [[nodiscard]] auto cend() const noexcept(!std::is_same_v<T, std::int64_t>) -> const_iterator {
+        return end();
+    }
     [[nodiscard]] auto rbegin() -> reverse_iterator { return reverse_iterator{end()}; }
     [[nodiscard]] auto rend() -> reverse_iterator { return reverse_iterator{begin()}; }
-    [[nodiscard]] auto rbegin() const noexcept -> const_reverse_iterator {
+    [[nodiscard]] auto rbegin() const noexcept(!std::is_same_v<T, std::int64_t>)
+        -> const_reverse_iterator {
         return const_reverse_iterator{end()};
     }
-    [[nodiscard]] auto rend() const noexcept -> const_reverse_iterator {
+    [[nodiscard]] auto rend() const noexcept(!std::is_same_v<T, std::int64_t>)
+        -> const_reverse_iterator {
         return const_reverse_iterator{begin()};
     }
-    [[nodiscard]] auto crbegin() const noexcept -> const_reverse_iterator { return rbegin(); }
-    [[nodiscard]] auto crend() const noexcept -> const_reverse_iterator { return rend(); }
+    [[nodiscard]] auto crbegin() const noexcept(!std::is_same_v<T, std::int64_t>)
+        -> const_reverse_iterator {
+        return rbegin();
+    }
+    [[nodiscard]] auto crend() const noexcept(!std::is_same_v<T, std::int64_t>)
+        -> const_reverse_iterator {
+        return rend();
+    }
 
    private:
+    IBEX_NOINLINE void append_integer_values_slow(const Column& source)
+        requires std::is_same_v<T, std::int64_t>
+    {
+        if (this == &source && !is_compact_int32()) {
+            const Column copy(source);
+            append_integer_values(copy);
+            return;
+        }
+
+        if (source.empty())
+            return;
+        if (source.is_compact_int32() &&
+            (is_compact_int32() || (empty() && !is_external() && data_.capacity() == 0))) {
+            // Retain the source while making a private destination, including
+            // self-append and two columns sharing the same backing.
+            const auto source_owner = source.external_owner_;
+            const auto* first = source.compact_int32_data();
+            const auto count = source.size();
+            if (!is_compact_int32()) {
+                auto meta = meta_;
+                *this = from_compact_int32({});
+                meta_ = meta;
+            }
+            auto& values = mutable_compact_backing().values;
+            values.insert(values.end(), first, first + count);
+            external_size_ = values.size();
+            return;
+        }
+        detach_external();
+        if (source.is_compact_int32()) {
+            const auto* first = source.compact_int32_data();
+            data_.insert(data_.end(), first, first + source.size());
+        } else {
+            const auto* first = source.data();
+            data_.insert(data_.end(), first, first + source.size());
+        }
+    }
+
+    IBEX_NOINLINE auto mutable_compact_backing() -> detail::CompactIntBacking&
+        requires std::is_same_v<T, std::int64_t>
+    {
+        const auto* backing = static_cast<const detail::CompactIntBacking*>(external_owner_.get());
+        if (external_owner_.use_count() != 1 || backing->owner) {
+            auto owned = std::make_shared<detail::CompactIntBacking>();
+            owned->values.reserve(backing->capacity());
+            const auto input = backing->data32();
+            if (!input.empty())
+                owned->values.assign(input.begin(), input.end());
+            external_owner_ = std::move(owned);
+        }
+        return *const_cast<detail::CompactIntBacking*>(
+            static_cast<const detail::CompactIntBacking*>(external_owner_.get()));
+    }
+
     /// Reads resolve the storage in use rather than reading a mirror kept in
     /// step by every mutation. The branch is on a `shared_ptr` null check that
     /// is constant for a column's whole lifetime, so it predicts perfectly;
     /// eagerly mirroring instead cost three stores inside `push_back`, which
     /// made appending to an owned column several times slower and dominated
     /// profiles of every kernel that builds its output that way.
-    [[nodiscard]] auto data_ptr() const noexcept -> const T* {
+    [[nodiscard]] auto data_ptr() const noexcept(!std::is_same_v<T, std::int64_t>) -> const T* {
+        if constexpr (std::is_same_v<T, std::int64_t>) {
+            if (is_compact_int32()) {
+                throw std::logic_error(
+                    "compact Int32 storage requires a physical read or explicit widening");
+            }
+        }
         return is_external() ? external_data_ : data_.data();
     }
 
-    [[nodiscard]] auto iterator_offset(const_iterator pos) const noexcept -> size_type {
-        const auto* first = data_ptr();
-        if (pos == first) {
-            return 0;
+    [[nodiscard]] auto iterator_offset(const_iterator pos) const
+        noexcept(!std::is_same_v<T, std::int64_t>) -> size_type {
+        if constexpr (std::is_same_v<T, std::int64_t>) {
+            return static_cast<size_type>(pos - begin());
+        } else {
+            const auto* first = data_ptr();
+            return pos == first ? 0 : static_cast<size_type>(pos - first);
         }
-        return static_cast<size_type>(pos - first);
     }
 
     void drop_external() noexcept {
@@ -562,6 +894,18 @@ class Column {
     // NOLINTNEXTLINE(readability-function-size)
     IBEX_NOINLINE void detach_external_slow() {
         storage_type owned;
+        if constexpr (std::is_same_v<T, std::int64_t>) {
+            if (is_compact_int32()) {
+                owned.reserve(capacity());
+                if (external_size_ != 0) {
+                    const auto* values = compact_int32_data();
+                    owned.insert(owned.end(), values, values + external_size_);
+                }
+                data_ = std::move(owned);
+                drop_external();
+                return;
+            }
+        }
         owned.reserve(external_size_);
         if (external_size_ != 0) {
             owned.insert(owned.end(), external_data_, external_data_ + external_size_);

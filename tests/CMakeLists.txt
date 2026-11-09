@@ -13,6 +13,8 @@ set(IBEX_TEST_SOURCES
     test_arrow_c_data.cpp
     test_args.cpp
     test_column.cpp
+    test_compact_int32.cpp
+    test_integer_no_cache.cpp
     test_correlation.cpp
     test_csv.cpp
     test_csv_parallel.cpp
@@ -139,6 +141,21 @@ target_link_libraries(ibex_tests
         nlohmann_json::nlohmann_json
         fast_float
 )
+
+if(TARGET ibex_parquet)
+    target_sources(ibex_tests PRIVATE test_parquet_int32_ingestion.cpp)
+    target_include_directories(ibex_tests SYSTEM PRIVATE
+        $<TARGET_PROPERTY:ibex_parquet,INCLUDE_DIRECTORIES>)
+    target_link_libraries(ibex_tests PRIVATE ibex_parquet parquet_shared arrow_shared)
+    target_compile_definitions(ibex_tests PRIVATE
+        $<TARGET_PROPERTY:ibex_parquet,COMPILE_DEFINITIONS>)
+    foreach(_cores 1 8)
+        add_test(NAME ibex_int32_ingestion_${_cores}
+            COMMAND ibex_tests "[int32-ingestion]")
+        set_tests_properties(ibex_int32_ingestion_${_cores} PROPERTIES
+            ENVIRONMENT "IBEX_COMPACT_INT32=1;IBEX_CORES=${_cores}")
+    endforeach()
+endif()
 
 if(CURL_FOUND)
     target_link_libraries(ibex_tests PRIVATE CURL::libcurl)

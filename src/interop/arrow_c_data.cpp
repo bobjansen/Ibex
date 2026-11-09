@@ -9,6 +9,7 @@
 #include <ibex/core/time_zone.hpp>
 #include <ibex/interop/arrow_c_data.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/runtime/env.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/table_properties.hpp>
 
@@ -821,9 +822,10 @@ auto import_dictionary_strings(const ArrowArray& dictionary)
 /// an Int64 exactly, so the conversion is lossless and needs no range check --
 /// including at null positions, whose payload Arrow leaves unspecified. The
 /// widening is a real conversion, so unlike a native Int64 column this cannot
-/// adopt the producer's buffer.
+/// adopt the producer's buffer. Signed Int32 is the exception when compact
+/// storage is enabled: an adopting import retains the physical buffer and owner.
 template <typename Raw>
-auto import_widened_int_column(const ArrowArray& array)
+auto import_widened_int_column(const ArrowArray& array, const std::shared_ptr<const void>& owner)
     -> std::expected<runtime::ColumnValue, std::string> {
     static_assert(sizeof(Raw) <= 4, "widening import is only lossless below 64 bits");
     if (array.buffers == nullptr || array.n_buffers < 2 ||
@@ -831,6 +833,22 @@ auto import_widened_int_column(const ArrowArray& array)
         return std::unexpected("Arrow integer array is missing a data buffer");
     }
     const auto* values = static_cast<const Raw*>(array.buffers[1]);
+    if constexpr (std::is_same_v<Raw, std::int32_t>) {
+        if (runtime::compact_int32_enabled()) {
+            if (owner) {
+                return runtime::ColumnValue{Column<std::int64_t>::from_external_int32(
+                    owner, values == nullptr ? nullptr : values + array.offset,
+                    static_cast<std::size_t>(array.length))};
+            }
+            ibex::detail::NoInitVector<std::int32_t> compact(
+                static_cast<std::size_t>(array.length));
+            for (std::int64_t i = 0; i < array.length; ++i) {
+                compact[static_cast<std::size_t>(i)] = values[array.offset + i];
+            }
+            return runtime::ColumnValue{
+                Column<std::int64_t>::from_compact_int32(std::move(compact))};
+        }
+    }
     Column<std::int64_t> column;
     column.reserve(static_cast<std::size_t>(array.length));
     for (std::int64_t i = 0; i < array.length; ++i) {
@@ -1149,7 +1167,8 @@ auto import_column(const ArrowArray& array, const ArrowSchema& schema,
     // as "always categorical" is why a plain int32 column -- an ordinary R
     // integer, among others -- failed with a complaint about missing dictionary
     // storage rather than being imported.
-    using NarrowIntImport = std::expected<runtime::ColumnValue, std::string> (*)(const ArrowArray&);
+    using NarrowIntImport = std::expected<runtime::ColumnValue, std::string> (*)(
+        const ArrowArray&, const std::shared_ptr<const void>&);
     std::optional<NarrowIntImport> narrow_int;
     if (schema.dictionary == nullptr) {
         if (format == "c") {
@@ -1195,7 +1214,7 @@ auto import_column(const ArrowArray& array, const ArrowSchema& schema,
     } else if (format == "u") {
         column = import_string_column(array, owner);
     } else if (narrow_int.has_value()) {
-        column = (*narrow_int)(array);
+        column = (*narrow_int)(array, owner);
     } else if (format == "i") {
         column = import_categorical_column(array, schema, owner);
     } else if ((format == "w:16" || format == "z") && is_uuid_column(schema)) {
@@ -1208,7 +1227,7 @@ auto import_column(const ArrowArray& array, const ArrowSchema& schema,
     const bool buffer_adopted =
         owner && (format == "l" || format == "g" || format == "b" || format == "tdD" ||
                   (timestamp.has_value() && timestamp->nanos_per_unit == 1) || format == "u" ||
-                  (format == "i" && !narrow_int.has_value()));
+                  (format == "i" && (!narrow_int.has_value() || runtime::compact_int32_enabled())));
     return std::pair{
         std::move(*column),
         import_validity(array, buffer_adopted ? owner : std::shared_ptr<const void>{})};
@@ -1280,7 +1299,7 @@ auto export_column_schema(const runtime::ColumnEntry& entry, ArrowSchema* out_sc
         [&](const auto& col) -> std::expected<void, std::string> {
             using ColT = std::decay_t<decltype(col)>;
             if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
-                set_format("l");
+                set_format(col.is_compact_int32() ? "i" : "l");
             } else if constexpr (std::is_same_v<ColT, Column<double>>) {
                 set_format("g");
             } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
@@ -1350,6 +1369,30 @@ auto export_column_array(const runtime::ColumnEntry& entry,
                 entry.validity.has_value() ? count_nulls(*entry.validity) : 0;
 
             if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
+                if (col.is_compact_int32()) {
+                    auto state = std::make_unique<ArrayExportState>();
+                    const void* validity = nullptr;
+                    if (entry.validity.has_value()) {
+                        if (entry.validity->buffer_offset() == 0) {
+                            validity = entry.validity->buffer_data();
+                        } else {
+                            auto rebased =
+                                std::make_shared<runtime::ValidityBitmap>(col.size(), true);
+                            for (std::size_t row = 0; row < col.size(); ++row)
+                                rebased->set(row, (*entry.validity)[row]);
+                            validity = rebased->buffer_data();
+                            state->extra_owner = std::move(rebased);
+                        }
+                    }
+                    state->buffers_storage = {validity, col.compact_int32_data()};
+                    state->buffers = std::make_unique<const void*[]>(2);
+                    std::copy(state->buffers_storage.begin(), state->buffers_storage.end(),
+                              state->buffers.get());
+                    state->table_owner = std::move(owner);
+                    finalize_array(out_array, std::move(state),
+                                   static_cast<std::int64_t>(col.size()), null_count);
+                    return {};
+                }
                 auto state = primitive_buffers(entry, col);
                 if (!state) {
                     return std::unexpected(state.error());

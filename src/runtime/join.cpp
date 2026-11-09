@@ -1147,8 +1147,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                                     // rather than visiting and appending for every row.
                                     values.resize_for_overwrite(total);
                                     auto* dst = values.data();
-                                    const auto* ld = lc->data();
-                                    const auto* rd = rc->data();
+                                    const auto ld = value_reader(*lc);
+                                    const auto rd = value_reader(*rc);
                                     for_row_ranges(
                                         exec, total, [&](std::size_t begin, std::size_t end) {
                                             for (std::size_t i = begin; i < end; ++i) {
@@ -1703,7 +1703,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         const auto& right_ints = std::get<Column<std::int64_t>>(*right_keys[0]);
 
         // Which side is indexed was decided once, above.
-        const auto* build_data = build_left ? left_ints.data() : right_ints.data();
+        const auto build_data = build_left ? left_ints.integer_view() : right_ints.integer_view();
         const std::size_t n_build = build_left ? n_left : n_right;
 
         robin_hood::unordered_map<std::int64_t, std::uint32_t> key_gid;
@@ -1725,7 +1725,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             ri.reserve(n_left + n_right);
             li.resize(n_left);
             ri.resize(n_left);
-            const auto* probe_data = left_ints.data();
+            const auto probe_data = left_ints.integer_view();
             const auto scan = [&](std::size_t begin, std::size_t end) {
                 for (std::size_t l = begin; l < end; ++l) {
                     const auto it = key_gid.find(probe_data[l]);
@@ -1769,7 +1769,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         const GroupedRows grouped = group_rows_csr(row_gid, n_groups);
 
         if (build_left) {
-            const auto* probe_data = right_ints.data();
+            const auto probe_data = right_ints.integer_view();
             auto lookup = [&](std::size_t r) -> std::span<const std::size_t> {
                 auto it = key_gid.find(probe_data[r]);
                 return it == key_gid.end() ? std::span<const std::size_t>{}
@@ -1780,7 +1780,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             return join_failure(output);
         }
 
-        const auto* probe_data = left_ints.data();
+        const auto probe_data = left_ints.integer_view();
         if (preserve_left_only && grouped.unique()) {
             probe_left_identity([&](std::size_t l) {
                 auto it = key_gid.find(probe_data[l]);
@@ -2493,7 +2493,7 @@ auto LeftJoinCounter::count(const Chunk& right) -> bool {
     if (!columns_of(right, key, counted)) {
         return false;
     }
-    counts_.count<false>(std::get<Column<std::int64_t>>(*key->column).data(),
+    counts_.count<false>(std::get<Column<std::int64_t>>(*key->column).integer_view(),
                          key->validity.has_value() ? &*key->validity : nullptr,
                          counted->validity.has_value() ? &*counted->validity : nullptr, 0,
                          right.rows());
@@ -2506,7 +2506,7 @@ auto LeftJoinCounter::count_parallel(const Chunk& right, const ExecutionContext*
     if (!columns_of(right, key, counted)) {
         return false;
     }
-    const std::int64_t* keys = std::get<Column<std::int64_t>>(*key->column).data();
+    const auto keys = std::get<Column<std::int64_t>>(*key->column).integer_view();
     const ValidityBitmap* key_validity = key->validity.has_value() ? &*key->validity : nullptr;
     const ValidityBitmap* counted_validity =
         counted->validity.has_value() ? &*counted->validity : nullptr;

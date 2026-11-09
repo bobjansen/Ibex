@@ -147,8 +147,8 @@ class LeftKeyCounts {
     /// one, unless the key is null (it matches nothing) or `counted_validity`
     /// says the counted column is null there. `Atomic` when other threads count
     /// at the same time; a lone counter adds without the locked instruction.
-    template <bool Atomic>
-    void count(const std::int64_t* keys, const ValidityBitmap* key_validity,
+    template <bool Atomic, typename Keys>
+    void count(Keys keys, const ValidityBitmap* key_validity,
                const ValidityBitmap* counted_validity, std::size_t begin, std::size_t end) {
         for (std::size_t row = begin; row < end; ++row) {
             if ((key_validity != nullptr && !(*key_validity)[row]) ||

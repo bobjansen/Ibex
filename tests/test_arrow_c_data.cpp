@@ -16,6 +16,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <expected>
 #include <initializer_list>
@@ -1558,4 +1559,126 @@ TEST_CASE("Arrow C Data schema-only import of a column-less struct is empty",
     auto empty = ibex::interop::empty_table_from_arrow_schema(root);
     REQUIRE(empty.has_value());
     CHECK(empty->columns.empty());
+}
+
+namespace {
+struct CompactImportMode {
+    std::optional<std::string> previous;
+    CompactImportMode() {
+        if (const auto* value = std::getenv("IBEX_COMPACT_INT32"))
+            previous = value;
+        set("1");
+    }
+    ~CompactImportMode() { set(previous ? previous->c_str() : nullptr); }
+    static void set(const char* value) {
+#ifdef _WIN32
+        _putenv_s("IBEX_COMPACT_INT32", value ? value : "");
+#else
+        if (value)
+            ::setenv("IBEX_COMPACT_INT32", value, 1);
+        else
+            ::unsetenv("IBEX_COMPACT_INT32");
+#endif
+    }
+};
+struct Int32Release {
+    std::shared_ptr<ForeignIntColumn<std::int32_t>> source;
+    std::shared_ptr<int> releases;
+};
+void release_int32_source(ArrowArray* array) {
+    auto* state = static_cast<Int32Release*>(array->private_data);
+    ++*state->releases;
+    array->release = nullptr;
+    delete state;
+}
+}  // namespace
+
+TEST_CASE("Arrow Int32 adoption retains sliced physical values and validity",
+          "[interop][arrow][int][ingestion]") {
+    CompactImportMode mode;
+    auto source = std::make_shared<ForeignIntColumn<std::int32_t>>(
+        std::initializer_list<std::int32_t>{99, INT32_MIN, 77, INT32_MAX, 99}, "i");
+    const std::uint8_t bits = 0x0a;  // positions 1 and 3 valid, position 2 null
+    source->child_buffers[0] = &bits;
+    source->child.offset = 1;
+    source->child.length = source->array.length = 3;
+    source->child.null_count = 1;
+    auto releases = std::make_shared<int>(0);
+    source->array.release = release_int32_source;
+    source->array.private_data = new Int32Release{source, releases};
+    const auto* original = source->values.data() + 1;
+    auto imported = ibex::interop::adopt_table_from_arrow(&source->array, source->schema);
+    REQUIRE(imported.has_value());
+    REQUIRE(source->array.release == nullptr);
+    source.reset();
+    REQUIRE(*releases == 0);
+    auto* entry = imported->find_entry("n");
+    REQUIRE(entry != nullptr);
+    auto& values = std::get<ibex::Column<std::int64_t>>(*entry->column);
+    REQUIRE(values.is_compact_int32());
+    REQUIRE(values.compact_int32_data() == original);
+    REQUIRE(values.compact_int32_data()[0] == INT32_MIN);
+    REQUIRE(values.compact_int32_data()[2] == INT32_MAX);
+    REQUIRE(entry->validity.has_value());
+    REQUIRE((*entry->validity)[0]);
+    REQUIRE_FALSE((*entry->validity)[1]);
+    REQUIRE((*entry->validity)[2]);
+    // A wider write detaches from foreign storage without truncation.
+    values[0] = INT64_C(4000000000);
+    REQUIRE(std::as_const(values)[0] == INT64_C(4000000000));
+    REQUIRE(original[0] == INT32_MIN);  // validity still retains the producer
+    imported = std::unexpected("released");
+    REQUIRE(*releases == 1);
+}
+
+TEST_CASE("Arrow borrowed Int32 import copies slices and unsigned values stay wide",
+          "[interop][arrow][int][ingestion]") {
+    CompactImportMode mode;
+    ForeignIntColumn<std::int32_t> source({99, INT32_MIN, INT32_MAX}, "i");
+    source.child.offset = 1;
+    source.child.length = source.array.length = 2;
+    auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
+    REQUIRE(imported.has_value());
+    const auto& values = std::get<ibex::Column<std::int64_t>>(*imported->find("n"));
+    REQUIRE(values.is_compact_int32());
+    REQUIRE(values.compact_int32_data() != source.values.data() + 1);
+    source.values[1] = 0;
+    REQUIRE(values.compact_int32_data()[0] == INT32_MIN);
+    ForeignIntColumn<std::uint32_t> unsigned_source({UINT32_MAX}, "I");
+    auto unsigned_result =
+        ibex::interop::import_table_from_arrow(unsigned_source.array, unsigned_source.schema);
+    REQUIRE(unsigned_result.has_value());
+    const auto& unsigned_values = std::get<ibex::Column<std::int64_t>>(*unsigned_result->find("n"));
+    REQUIRE_FALSE(unsigned_values.is_compact_int32());
+    REQUIRE(unsigned_values[0] == INT64_C(4294967295));
+}
+
+TEST_CASE("Arrow exports compact integers without a wide buffer",
+          "[interop][arrow][compact-int32][no-cache]") {
+    auto table = std::make_shared<ibex::runtime::Table>();
+    auto column = ibex::Column<std::int64_t>::from_compact_int32({INT32_MIN, 0, INT32_MAX});
+    const auto* original = column.compact_int32_data();
+    auto bitmap_owner =
+        std::make_shared<std::array<std::uint8_t, 1>>(std::array<std::uint8_t, 1>{0x0a});
+    auto validity =
+        ibex::runtime::ValidityBitmap::from_external(bitmap_owner, bitmap_owner->data(), 1, 3);
+    table->add_column("v", std::move(column), std::move(validity));
+    ArrowArray array{};
+    ArrowSchema schema{};
+    auto exported = ibex::interop::export_table_to_arrow(
+        std::shared_ptr<const ibex::runtime::Table>(table), &array, &schema);
+    REQUIRE(exported.has_value());
+    CHECK(std::string(schema.children[0]->format) == "i");
+    REQUIRE(array.children[0]->offset == 0);
+    REQUIRE(array.children[0]->buffers[1] == original);
+    REQUIRE(array.children[0]->null_count == 1);
+    const auto* bits = static_cast<const std::uint8_t*>(array.children[0]->buffers[0]);
+    REQUIRE((bits[0] & 7) == 5);
+    table.reset();
+    bitmap_owner.reset();
+    const auto* values = static_cast<const std::int32_t*>(array.children[0]->buffers[1]);
+    CHECK(values[0] == INT32_MIN);
+    CHECK(values[2] == INT32_MAX);
+    ibex::interop::release_arrow_array(&array);
+    ibex::interop::release_arrow_schema(&schema);
 }

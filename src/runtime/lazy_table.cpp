@@ -260,7 +260,7 @@ constexpr std::size_t kMembershipSampleMax = 65536;
 /// type so the per-row filter loops carry no type dispatch.
 template <typename T>
 struct ElementKeyAt {
-    const T* data = nullptr;
+    std::conditional_t<std::is_same_v<T, std::int64_t>, IntegerView, const T*> data = nullptr;
     [[nodiscard]] auto operator()(std::size_t row) const -> std::int64_t {
         return join_key_domain(data[row]);
     }
@@ -333,7 +333,12 @@ auto membership_key_column(const Table& predicates, const std::string& key_name,
                                  std::is_same_v<C, Column<Date>> ||
                                  std::is_same_v<C, Column<Timestamp>>) {
                 using T = typename C::value_type;
-                return KeyColumn<ElementKeyAt<T>>{.at = {.data = col.data()}, .validity = validity};
+                if constexpr (std::is_same_v<T, std::int64_t>)
+                    return KeyColumn<ElementKeyAt<T>>{.at = {.data = col.integer_view()},
+                                                      .validity = validity};
+                else
+                    return KeyColumn<ElementKeyAt<T>>{.at = {.data = col.data()},
+                                                      .validity = validity};
             } else {
                 return std::nullopt;
             }
@@ -1066,6 +1071,10 @@ auto copy_row_range(const ColumnValue& src, std::size_t start, std::size_t rows,
                           std::is_same_v<ColT, Column<bool>>) {
                 return false;
             } else {
+                if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
+                    if (col.is_compact_int32())
+                        return false;
+                }
                 // Mutable access detaches, so take both pointers once, before
                 // the ranges run.
                 const auto* from = [&] {

@@ -172,7 +172,7 @@ struct NumericTreeNode {
     ir::ArithmeticOp op = ir::ArithmeticOp::Add;
     std::uint32_t left = 0;
     std::uint32_t right = 0;
-    const std::int64_t* ints = nullptr;
+    IntegerView ints = nullptr;
     const double* doubles = nullptr;
     std::int64_t int_scalar = 0;
     double double_scalar = 0.0;

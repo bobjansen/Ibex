@@ -34,6 +34,14 @@
 
 namespace ibex::runtime {
 
+template <typename T>
+[[nodiscard]] inline auto value_reader(const Column<T>& column) {
+    if constexpr (std::is_same_v<T, std::int64_t>)
+        return column.integer_view();
+    else
+        return column.data();
+}
+
 enum class ExprType : std::uint8_t {
     Int,
     Double,
@@ -403,6 +411,12 @@ inline auto make_gather_column(const ColumnValue& src, std::size_t rows) -> Colu
         std::visit(
             [&](const auto& col) -> ColumnValue {
                 using ColT = std::decay_t<decltype(col)>;
+                if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
+                    if (col.is_compact_int32()) {
+                        return ColT::from_compact_int32(
+                            ::ibex::detail::NoInitVector<std::int32_t>(rows));
+                    }
+                }
                 if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
                     // Shares the source dictionary; only the codes are gathered.
                     return col.with_codes(Column<Categorical>::codes_storage(rows));
@@ -518,8 +532,18 @@ void gather_range_into(ColumnValue& dst_v, const ColumnValue& src_v, std::span<c
                         dst->set(pos, src[static_cast<std::size_t>(idx[pos])]);
                     }
                 } else {
+                    if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
+                        if (src.is_compact_int32()) {
+                            auto* dp = dst->compact_int32_output();
+                            const auto* sp = src.compact_int32_data();
+                            for (std::size_t pos = lo; pos < hi; ++pos) {
+                                dp[pos] = sp[static_cast<std::size_t>(idx[pos])];
+                            }
+                            return;
+                        }
+                    }
                     auto* dp = dst->data();
-                    const auto* sp = src.data();
+                    const auto sp = value_reader(src);
                     for (std::size_t pos = lo; pos < hi; ++pos) {
                         dp[pos] = sp[static_cast<std::size_t>(idx[pos])];
                     }
@@ -692,7 +716,7 @@ void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src,
                 ColT dst;
                 dst.resize(n);
                 auto* dp = dst.data();
-                const auto* sp = col.data();
+                const auto sp = value_reader(col);
                 for (std::size_t i = 0; i < n; ++i) {
                     if (indices[i] != null_row) {
                         dp[i] = sp[indices[i]];
@@ -1003,8 +1027,20 @@ template <typename GatherWhole>
                 } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
                     invariant_violation("gather_columns_batched: bool with nulls is whole-column");
                 } else {
+                    if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
+                        if (src.is_compact_int32()) {
+                            auto* dp = dst.compact_int32_output();
+                            const auto* sp = src.compact_int32_data();
+                            for (std::size_t pos = task.lo; pos < task.hi; ++pos) {
+                                const std::size_t row = idx[pos];
+                                dp[pos] = row != null_row ? sp[row] : 0;
+                                mark(pos, row);
+                            }
+                            return;
+                        }
+                    }
                     auto* dp = dst.data();
-                    const auto* sp = src.data();
+                    const auto sp = value_reader(src);
                     for (std::size_t pos = task.lo; pos < task.hi; ++pos) {
                         const std::size_t row = idx[pos];
                         dp[pos] = row != null_row ? sp[row] : typename ColT::value_type{};

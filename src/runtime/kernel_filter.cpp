@@ -194,7 +194,7 @@ void gather_chunk_selection_into(Chunk& output, const ChunkView& input,
                 } else {
                     using T = ColT::value_type;
                     gather_selected(
-                        ColumnView<T>(src.data(), src.size(), nullptr), selected,
+                        ColumnView<T>(src, nullptr), selected,
                         OutputSpan<T>{.data = out->data(), .begin = 0, .count = selection.kept});
                 }
             },

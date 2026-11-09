@@ -752,7 +752,7 @@ auto numeric_cast_kernel(const ir::CallExpr& call, const Table& input, std::size
         Column<double> out;
         out.resize(rows);
         auto* op = out.data();
-        const auto* ip = ints->data();
+        const auto ip = ints->integer_view();
         for (std::size_t i = 0; i < rows; ++i) {
             op[i] = static_cast<double>(ip[i]);
         }
@@ -2820,7 +2820,7 @@ auto unary_math_over_column(UnaryMath fn, const ColResult& arg, std::size_t n, E
         validity = gather_validity(std::optional<ValidityBitmap>{*v}, arg.offset, arg.offset + n);
     }
     if (const auto* ints = std::get_if<Column<std::int64_t>>(&source)) {
-        const std::int64_t* src = ints->data() + arg.offset;
+        const auto src = ints->integer_view() + arg.offset;
         if (unary_math_is_type_preserving(fn)) {
             if (type != ExprType::Int) {
                 return std::nullopt;
@@ -3213,6 +3213,15 @@ auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_
                         }
                     }
                 } else {
+                    if constexpr (std::is_same_v<T, std::int64_t>) {
+                        if (col.is_compact_int32()) {
+                            if (n < rows) {
+                                const auto from = col.integer_view() + (is_lag ? 0 : n);
+                                std::copy_n(from, rows - n, out.data() + (is_lag ? n : 0));
+                            }
+                            return out;
+                        }
+                    }
                     if (is_lag) {
                         if (n < rows)
                             std::memcpy(out.data() + n, col.data(), (rows - n) * sizeof(T));
@@ -3322,7 +3331,7 @@ auto eval_cumsum_cumprod_column(const ir::CallExpr& call, const Table& input, bo
                 // fill `resize` would do — that fill is a second full pass over
                 // the output, as expensive as the computation itself.
                 result.resize_for_overwrite(rows);
-                const T* in = col.data();
+                const auto in = value_reader(col);
                 T* out = result.data();
                 T acc = is_prod ? T{1} : T{0};
                 for (std::size_t i = 0; i < rows; ++i) {
@@ -3358,8 +3367,8 @@ auto eval_cumsum_cumprod_column(const ir::CallExpr& call, const Table& input, bo
 /// first valid row (after the last) -- get T{}; their nulls are the caller's,
 /// from the returned edge: the first valid row for LOCF, one past the last for
 /// NOCB (`rows` / 0 when there is none).
-template <typename T, typename Valid>
-auto fill_carry_ranges(const T* in, T* dst, std::size_t rows, const Valid& is_valid,
+template <typename Source, typename T, typename Valid>
+auto fill_carry_ranges(Source in, T* dst, std::size_t rows, const Valid& is_valid,
                        std::size_t ranges, bool forward) -> std::size_t {
     constexpr std::size_t kNone = std::numeric_limits<std::size_t>::max();
     const std::size_t grain = (rows + ranges - 1) / ranges;
@@ -3566,7 +3575,7 @@ auto eval_fill_forward(const ir::CallExpr& call, const Table& input, const Execu
                 // pointers on every row, because the store to the output may
                 // alias the members they read -- about twenty instructions and a
                 // spilled carry per row for one load, one bit test and one store.
-                const T* const in = col.data();
+                const auto in = value_reader(col);
                 T* const dst = out.data();
                 const std::uint8_t* const bits = validity.buffer_data();
                 const std::size_t bit_base = validity.buffer_offset();
@@ -3670,7 +3679,7 @@ auto eval_fill_backward(const ir::CallExpr& call, const Table& input, const Exec
                 // storage resolved once; see eval_fill_forward.
                 ColT result;
                 ColumnAppender<ColT> out(result, rows);
-                const T* const in = col.data();
+                const auto in = value_reader(col);
                 T* const dst = out.data();
                 const std::uint8_t* const bits = validity.buffer_data();
                 const std::size_t bit_base = validity.buffer_offset();

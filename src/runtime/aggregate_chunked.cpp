@@ -2244,12 +2244,12 @@ class HashAggregateState final {
                           const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
         -> std::optional<std::string> {
         const ColumnValue& key_col = *group_entries[0]->column;
-        const std::int64_t* i64 = nullptr;
+        IntegerView i64 = nullptr;
         const Date* dates = nullptr;
         const Timestamp* stamps = nullptr;
         switch (int_key_kind_) {
             case IntKeyKind::Int64:
-                i64 = std::get<Column<std::int64_t>>(key_col).data();
+                i64 = std::get<Column<std::int64_t>>(key_col).integer_view();
                 break;
             case IntKeyKind::Date:
                 dates = std::get<Column<Date>>(key_col).data();
@@ -2517,8 +2517,8 @@ class HashAggregateState final {
     template <typename ValueT>
     static void process_owned_hot_chunk_typed(OwnedHotChunk& job) noexcept {
         try {
-            const auto* keys = std::get<Column<std::int64_t>>(*job.key_column).data();
-            const auto* values = std::get<Column<ValueT>>(*job.sum_column).data();
+            const auto keys = std::get<Column<std::int64_t>>(*job.key_column).integer_view();
+            const auto values = value_reader(std::get<Column<ValueT>>(*job.sum_column));
             const ValidityBitmap* validity =
                 job.sum_validity.has_value() ? &*job.sum_validity : nullptr;
             constexpr std::uint32_t kEmpty = std::numeric_limits<std::uint32_t>::max();
@@ -2761,9 +2761,9 @@ class HashAggregateState final {
     template <typename ValueT>
     static void process_owned_pair_chunk_typed(OwnedPairChunk& job) noexcept {
         try {
-            const auto* first = std::get<Column<std::int64_t>>(*job.first_column).data();
-            const auto* second = std::get<Column<std::int64_t>>(*job.second_column).data();
-            const auto* values = std::get<Column<ValueT>>(*job.sum_column).data();
+            const auto first = std::get<Column<std::int64_t>>(*job.first_column).integer_view();
+            const auto second = std::get<Column<std::int64_t>>(*job.second_column).integer_view();
+            const auto values = value_reader(std::get<Column<ValueT>>(*job.sum_column));
             const ValidityBitmap* validity =
                 job.sum_validity.has_value() ? &*job.sum_validity : nullptr;
             const PairIntKeyHash hasher;
@@ -3683,7 +3683,7 @@ class HashAggregateState final {
         // key per row and re-derives the pointer every time, which on 8M rows
         // over two keys was most of this loop.
         struct RawKeyReader {
-            const std::int64_t* i64 = nullptr;
+            IntegerView i64 = nullptr;
             const Date* dates = nullptr;
             const Timestamp* stamps = nullptr;
             const Column<Categorical>::code_type* codes = nullptr;
@@ -3708,7 +3708,7 @@ class HashAggregateState final {
             reader.kind = kind;
             switch (kind) {
                 case IntKeyKind::Int64:
-                    reader.i64 = std::get<Column<std::int64_t>>(col).data();
+                    reader.i64 = std::get<Column<std::int64_t>>(col).integer_view();
                     break;
                 case IntKeyKind::Date:
                     reader.dates = std::get<Column<Date>>(col).data();
@@ -7079,8 +7079,8 @@ class HashAggregateState final {
                         break;
                 }
             } else if (plan_[agg_i].kind == ExprType::Int) {
-                const std::int64_t* data =
-                    std::get<Column<std::int64_t>>(std::as_const(*entry.column)).data();
+                const auto data =
+                    std::get<Column<std::int64_t>>(std::as_const(*entry.column)).integer_view();
                 switch (plan_[agg_i].func) {
                     case ir::AggFunc::Sum:
                         for (std::size_t row = begin; row < rows; ++row) {
@@ -7680,8 +7680,8 @@ class HashAggregateState final {
                         break;
                 }
             } else if (plan_[agg_i].kind == ExprType::Int) {
-                const std::int64_t* data =
-                    std::get<Column<std::int64_t>>(std::as_const(*entry.column)).data();
+                const auto data =
+                    std::get<Column<std::int64_t>>(std::as_const(*entry.column)).integer_view();
                 switch (func) {
                     case ir::AggFunc::Sum:
                         each([&](std::size_t r) {
@@ -8648,7 +8648,7 @@ class HashAggregateState final {
             }
             switch (col.kind) {
                 case KeyCol::Kind::Int64:
-                    ::ibex::detail::prefetch(col.i64 + row);
+                    ::ibex::detail::prefetch((col.i64 + row).physical_data());
                     break;
                 case KeyCol::Kind::Double:
                     ::ibex::detail::prefetch(col.f64 + row);
@@ -9686,8 +9686,8 @@ class ChunkedSortedAggregateOperator final : public Operator {
                 accumulate_typed(slot, &cur_scratch_[i * kMomentScratch], plan_[i].func, data,
                                  entry, has_nulls, start, end);
             } else {
-                const std::int64_t* data =
-                    std::get<Column<std::int64_t>>(std::as_const(*entry.column)).data();
+                const auto data =
+                    std::get<Column<std::int64_t>>(std::as_const(*entry.column)).integer_view();
                 accumulate_typed(slot, &cur_scratch_[i * kMomentScratch], plan_[i].func, data,
                                  entry, has_nulls, start, end);
             }
@@ -9698,9 +9698,9 @@ class ChunkedSortedAggregateOperator final : public Operator {
     /// `scratch` is this aggregate's per-group scratch (2 doubles for the
     /// higher moments); it stays a parameter so this helper remains static and
     /// has no reach into operator state.
-    static void accumulate_typed(AggSlotCore& slot, double* scratch, ir::AggFunc func,
-                                 const T* data, const ColumnEntry& entry, bool has_nulls,
-                                 std::size_t start, std::size_t end) {
+    static void accumulate_typed(AggSlotCore& slot, double* scratch, ir::AggFunc func, T data,
+                                 const ColumnEntry& entry, bool has_nulls, std::size_t start,
+                                 std::size_t end) {
         const auto valid = [&](std::size_t row) { return !has_nulls || (*entry.validity)[row]; };
         switch (func) {
             case ir::AggFunc::Sum:
@@ -9708,7 +9708,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                     if (!valid(row)) {
                         continue;
                     }
-                    if constexpr (std::is_same_v<T, double>) {
+                    if constexpr (std::is_same_v<T, const double*>) {
                         slot.double_value += data[row];
                     } else {
                         slot.int_value += data[row];
@@ -9730,7 +9730,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                     if (!valid(row)) {
                         continue;
                     }
-                    if constexpr (std::is_same_v<T, double>) {
+                    if constexpr (std::is_same_v<T, const double*>) {
                         slot.double_value =
                             slot.present() ? std::min(slot.double_value, data[row]) : data[row];
                     } else {
@@ -9745,7 +9745,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                     if (!valid(row)) {
                         continue;
                     }
-                    if constexpr (std::is_same_v<T, double>) {
+                    if constexpr (std::is_same_v<T, const double*>) {
                         slot.double_value =
                             slot.present() ? std::max(slot.double_value, data[row]) : data[row];
                     } else {
@@ -9778,7 +9778,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                     if (!valid(row) || slot.present()) {
                         continue;
                     }
-                    if constexpr (std::is_same_v<T, double>) {
+                    if constexpr (std::is_same_v<T, const double*>) {
                         slot.double_value = data[row];
                     } else {
                         slot.int_value = data[row];
@@ -9791,7 +9791,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                     if (!valid(row)) {
                         continue;
                     }
-                    if constexpr (std::is_same_v<T, double>) {
+                    if constexpr (std::is_same_v<T, const double*>) {
                         slot.double_value = data[row];
                     } else {
                         slot.int_value = data[row];

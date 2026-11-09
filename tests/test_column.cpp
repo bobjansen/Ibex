@@ -491,3 +491,72 @@ TEST_CASE("Column<int> emplace_back", "[core][column]") {
     REQUIRE(col[0] == 0);
     REQUIRE(col[1] == 42);
 }
+
+TEST_CASE("compact Int32 backing keeps Int64 values and copy-on-write", "[compact-int32][core]") {
+    using Col = ibex::Column<std::int64_t>;
+    auto source = Col::from_compact_int32({INT32_MIN, INT32_MAX, 2000000000});
+    REQUIRE(source.is_compact_int32());
+    REQUIRE(source.size() == 3);
+    auto copy = source;
+    REQUIRE(std::as_const(source)[0] == INT64_C(-2147483648));
+    REQUIRE(std::as_const(copy)[1] == INT64_C(2147483647));
+    REQUIRE(source.buffer_offset() == 0);
+    REQUIRE_THROWS_AS(source.buffer_data(), std::logic_error);
+    copy[0] = INT64_C(4000000000);
+    REQUIRE_FALSE(copy.is_compact_int32());
+    REQUIRE(std::as_const(copy)[0] == INT64_C(4000000000));
+    REQUIRE(std::as_const(source)[0] == INT64_C(-2147483648));
+    REQUIRE_NOTHROW(source.compact_int32_output());
+    auto moved = std::move(copy);
+    moved.push_back(INT64_C(5000000000));
+    REQUIRE(std::as_const(moved)[3] == INT64_C(5000000000));
+    source.clear();
+    REQUIRE(source.empty());
+    REQUIRE_FALSE(source.is_compact_int32());
+}
+
+TEST_CASE("compact concatenation preserves copy-on-write and wide promotion",
+          "[compact-int32][core]") {
+    using Col = ibex::Column<std::int64_t>;
+    auto a = Col::from_compact_int32({INT32_MIN, INT32_MAX});
+    auto b = a;
+    a.reserve(16);
+    REQUIRE(a.is_compact_int32());
+    REQUIRE(a.capacity() >= 16);
+    a.append_integer_values(b);
+    REQUIRE(a.is_compact_int32());
+    REQUIRE(a.size() == 4);
+    REQUIRE(b.size() == 2);
+    REQUIRE(a.compact_int32_data()[2] == INT32_MIN);
+    a.append_integer_values(a);
+    REQUIRE(a.size() == 8);
+    auto wide = Col{INT64_C(5000000000)};
+    a.append_integer_values(wide);
+    REQUIRE_FALSE(a.is_compact_int32());
+    REQUIRE(std::as_const(a)[8] == INT64_C(5000000000));
+    REQUIRE(a.capacity() >= 16);
+    auto wide_self = Col{INT64_C(5000000000)};
+    wide_self.append_integer_values(wide_self);
+    REQUIRE(wide_self.size() == 2);
+    REQUIRE(std::as_const(wide_self)[1] == INT64_C(5000000000));
+    auto reserved = Col::from_compact_int32({INT32_MIN});
+    reserved.reserve(16);
+    REQUIRE(reserved.is_compact_int32());
+    REQUIRE(reserved.capacity() >= 16);
+    REQUIRE(std::as_const(reserved)[0] == INT32_MIN);
+    reserved.push_back(INT64_C(5000000000));
+    REQUIRE_FALSE(reserved.is_compact_int32());
+    REQUIRE(reserved.capacity() >= 16);
+    REQUIRE(std::as_const(reserved)[1] == INT64_C(5000000000));
+    Col preallocated;
+    preallocated.reserve(16);
+    preallocated.append_integer_values(b);
+    REQUIRE_FALSE(preallocated.is_compact_int32());
+    REQUIRE(preallocated.capacity() >= 16);
+    REQUIRE(std::as_const(preallocated)[0] == INT32_MIN);
+    REQUIRE(std::as_const(b)[1] == INT64_C(2147483647));
+    Col empty;
+    empty.append_integer_values(b);
+    REQUIRE(empty.is_compact_int32());
+    REQUIRE(empty.compact_int32_data()[0] == INT32_MIN);
+}

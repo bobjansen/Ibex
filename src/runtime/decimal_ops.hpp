@@ -173,7 +173,7 @@ namespace ibex::runtime {
 /// own scale, Int64 columns at scale 0. Anything else is not decimal-numeric.
 struct DecimalColumnView {
     const Decimal* dec = nullptr;
-    const std::int64_t* i64 = nullptr;
+    IntegerView i64 = nullptr;
     DecimalType type;
 
     [[nodiscard]] auto units(std::size_t i) const -> Int128 {
@@ -192,7 +192,7 @@ template <typename F>
     }
     if (const auto* i = std::get_if<Column<std::int64_t>>(&col)) {
         return DecimalColumnView{
-            .dec = nullptr, .i64 = i->data() + off, .type = decimal::kInt64Type};
+            .dec = nullptr, .i64 = i->integer_view() + off, .type = decimal::kInt64Type};
     }
     return std::nullopt;
 }

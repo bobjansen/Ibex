@@ -248,14 +248,25 @@ auto arith_into(ir::ArithmeticOp op, const L* __restrict lp, const R* __restrict
 auto arith_vec(ir::ArithmeticOp op, const ColumnValue& lhs, std::size_t lhs_off,
                const ColumnValue& rhs, std::size_t rhs_off, std::size_t n)
     -> std::expected<ColumnValue, std::string> {
+    const ColumnValue* lhs_input = &lhs;
+    const ColumnValue* rhs_input = &rhs;
+    ColumnValue left_storage, right_storage;
+    if (const auto* col = std::get_if<Column<std::int64_t>>(&lhs); col && col->is_compact_int32()) {
+        left_storage = col->widened_int64();
+        lhs_input = &left_storage;
+    }
+    if (const auto* col = std::get_if<Column<std::int64_t>>(&rhs); col && col->is_compact_int32()) {
+        right_storage = col->widened_int64();
+        rhs_input = &right_storage;
+    }
     // int64 × int64 → int64, except `/`: division yields Float64 regardless
     // of operand types — matching type inference and the fused numeric and
     // per-row paths (`20/0` → inf, not safe_idiv's 0). Only `%` stays
     // integral. Previously this truncated, so `sum(x*x)/sum(x)` in an
     // aggregate-broadcast field and `coalesce(a,b)/b` in a vectorized field
     // disagreed with plain `a/b`.
-    if (const auto* l = std::get_if<Column<std::int64_t>>(&lhs)) {
-        if (const auto* r = std::get_if<Column<std::int64_t>>(&rhs)) {
+    if (const auto* l = std::get_if<Column<std::int64_t>>(lhs_input)) {
+        if (const auto* r = std::get_if<Column<std::int64_t>>(rhs_input)) {
             if (op == ir::ArithmeticOp::Div) {
                 Column<double> out;
                 out.resize(n);
@@ -272,21 +283,22 @@ auto arith_vec(ir::ArithmeticOp op, const ColumnValue& lhs, std::size_t lhs_off,
             arith_into(op, l->data() + lhs_off, r->data() + rhs_off, out.data(), n);
             return ColumnValue{std::move(out)};
         }
-        if (const auto* r = std::get_if<Column<double>>(&rhs)) {  // int64 × double → double
+        if (const auto* r = std::get_if<Column<double>>(rhs_input)) {  // int64 × double → double
             Column<double> out;
             out.resize(n);
             arith_into(op, l->data() + lhs_off, r->data() + rhs_off, out.data(), n);
             return ColumnValue{std::move(out)};
         }
     }
-    if (const auto* l = std::get_if<Column<double>>(&lhs)) {
-        if (const auto* r = std::get_if<Column<std::int64_t>>(&rhs)) {  // double × int64 → double
+    if (const auto* l = std::get_if<Column<double>>(lhs_input)) {
+        if (const auto* r =
+                std::get_if<Column<std::int64_t>>(rhs_input)) {  // double × int64 → double
             Column<double> out;
             out.resize(n);
             arith_into(op, l->data() + lhs_off, r->data() + rhs_off, out.data(), n);
             return ColumnValue{std::move(out)};
         }
-        if (const auto* r = std::get_if<Column<double>>(&rhs)) {  // double × double → double
+        if (const auto* r = std::get_if<Column<double>>(rhs_input)) {  // double × double → double
             Column<double> out;
             out.resize(n);
             arith_into(op, l->data() + lhs_off, r->data() + rhs_off, out.data(), n);
@@ -294,8 +306,8 @@ auto arith_vec(ir::ArithmeticOp op, const ColumnValue& lhs, std::size_t lhs_off,
         }
     }
     if (op == ir::ArithmeticOp::Sub) {
-        if (const auto* l = std::get_if<Column<Date>>(&lhs)) {
-            if (const auto* r = std::get_if<Column<Date>>(&rhs)) {
+        if (const auto* l = std::get_if<Column<Date>>(lhs_input)) {
+            if (const auto* r = std::get_if<Column<Date>>(rhs_input)) {
                 Column<std::int64_t> out;
                 out.resize(n);
                 for (std::size_t i = 0; i < n; ++i) {
@@ -319,9 +331,9 @@ namespace {
 
 template <typename ColT, typename LitT>
 
-auto cmp_col_scalar_into(ir::CompareOp op, const ColT* __restrict cp, LitT rv,
-                         uint8_t* __restrict mp, std::size_t n) -> void {
-    using Common = std::common_type_t<ColT, LitT>;
+auto cmp_col_scalar_into(ir::CompareOp op, ColT cp, LitT rv, uint8_t* __restrict mp, std::size_t n)
+    -> void {
+    using Common = std::common_type_t<std::remove_cvref_t<decltype(cp[0])>, LitT>;
     const auto crv = static_cast<Common>(rv);
     switch (op) {
         case ir::CompareOp::Eq:
@@ -715,7 +727,7 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, std::size_t of
     }
 
     if (const auto* int_col = std::get_if<Column<std::int64_t>>(&col)) {
-        const std::int64_t* cp = int_col->data() + off;
+        const auto cp = int_col->integer_view() + off;
         if (const auto* i = std::get_if<std::int64_t>(&lit)) {
             cmp_col_scalar_into(op, cp, *i, mp, n);
             result.apply_validity(validity, off, n);
@@ -781,9 +793,9 @@ namespace {
 
 template <typename L, typename R>
 
-auto cmp_into(ir::CompareOp op, const L* __restrict lp, const R* __restrict rp,
-              uint8_t* __restrict mp, std::size_t n) -> void {
-    using Common = std::common_type_t<L, R>;
+auto cmp_into(ir::CompareOp op, L lp, R rp, uint8_t* __restrict mp, std::size_t n) -> void {
+    using Common = std::common_type_t<std::remove_cvref_t<decltype(lp[0])>,
+                                      std::remove_cvref_t<decltype(rp[0])>>;
     switch (op) {
         case ir::CompareOp::Eq:
             for (std::size_t i = 0; i < n; ++i)
@@ -858,7 +870,7 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, std::size_t lhs_off,
     }
     if (const auto* l = std::get_if<Column<std::int64_t>>(&lhs)) {
         if (const auto* r = std::get_if<Column<std::int64_t>>(&rhs)) {
-            cmp_into(op, l->data() + lhs_off, r->data() + rhs_off, mp, n);
+            cmp_into(op, value_reader(*l) + lhs_off, value_reader(*r) + rhs_off, mp, n);
             {
                 auto merged_v = merge_validity(lv, lhs_off, rv, rhs_off, n);
                 result.apply_validity(merged_v ? &*merged_v : nullptr, 0, n);
@@ -866,7 +878,7 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, std::size_t lhs_off,
             }
         }
         if (const auto* r = std::get_if<Column<double>>(&rhs)) {
-            cmp_into(op, l->data() + lhs_off, r->data() + rhs_off, mp, n);
+            cmp_into(op, value_reader(*l) + lhs_off, value_reader(*r) + rhs_off, mp, n);
             {
                 auto merged_v = merge_validity(lv, lhs_off, rv, rhs_off, n);
                 result.apply_validity(merged_v ? &*merged_v : nullptr, 0, n);
@@ -876,7 +888,7 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, std::size_t lhs_off,
     }
     if (const auto* l = std::get_if<Column<double>>(&lhs)) {
         if (const auto* r = std::get_if<Column<double>>(&rhs)) {
-            cmp_into(op, l->data() + lhs_off, r->data() + rhs_off, mp, n);
+            cmp_into(op, value_reader(*l) + lhs_off, value_reader(*r) + rhs_off, mp, n);
             {
                 auto merged_v = merge_validity(lv, lhs_off, rv, rhs_off, n);
                 result.apply_validity(merged_v ? &*merged_v : nullptr, 0, n);
@@ -884,7 +896,7 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, std::size_t lhs_off,
             }
         }
         if (const auto* r = std::get_if<Column<std::int64_t>>(&rhs)) {
-            cmp_into(op, l->data() + lhs_off, r->data() + rhs_off, mp, n);
+            cmp_into(op, value_reader(*l) + lhs_off, value_reader(*r) + rhs_off, mp, n);
             {
                 auto merged_v = merge_validity(lv, lhs_off, rv, rhs_off, n);
                 result.apply_validity(merged_v ? &*merged_v : nullptr, 0, n);
@@ -900,7 +912,7 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, std::size_t lhs_off,
     // cmp_into's per-op loops and __restrict pointers don't depend on that.
     if (const auto* l = std::get_if<Column<Date>>(&lhs)) {
         if (const auto* r = std::get_if<Column<Date>>(&rhs)) {
-            cmp_into(op, l->data() + lhs_off, r->data() + rhs_off, mp, n);
+            cmp_into(op, value_reader(*l) + lhs_off, value_reader(*r) + rhs_off, mp, n);
             {
                 auto merged_v = merge_validity(lv, lhs_off, rv, rhs_off, n);
                 result.apply_validity(merged_v ? &*merged_v : nullptr, 0, n);
@@ -910,7 +922,7 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, std::size_t lhs_off,
     }
     if (const auto* l = std::get_if<Column<Timestamp>>(&lhs)) {
         if (const auto* r = std::get_if<Column<Timestamp>>(&rhs)) {
-            cmp_into(op, l->data() + lhs_off, r->data() + rhs_off, mp, n);
+            cmp_into(op, value_reader(*l) + lhs_off, value_reader(*r) + rhs_off, mp, n);
             {
                 auto merged_v = merge_validity(lv, lhs_off, rv, rhs_off, n);
                 result.apply_validity(merged_v ? &*merged_v : nullptr, 0, n);
@@ -1056,6 +1068,8 @@ auto try_extract_numeric_cmp_spec(const ir::Expr& expr, const PredicateInput& in
     NumericCmpSpec spec{};
     spec.op = op;
     if (const auto* int_column = std::get_if<Column<std::int64_t>>(entry->column.get())) {
+        if (int_column->is_compact_int32())
+            return std::nullopt;
         spec.kind = NumericSpecKind::Int64;
         spec.i64 = int_column->data() + begin;
     } else if (const auto* double_column = std::get_if<Column<double>>(entry->column.get())) {
@@ -1129,6 +1143,8 @@ auto try_extract_numeric_operand_spec(const ir::Expr& expr, const PredicateInput
         return std::nullopt;
     }
     if (const auto* int_column = std::get_if<Column<std::int64_t>>(entry->column.get())) {
+        if (int_column->is_compact_int32())
+            return std::nullopt;
         spec.kind = NumericSpecKind::Int64;
         spec.i64 = int_column->data() + begin;
         return spec;
@@ -2488,7 +2504,7 @@ void gather_selection_into(Table& output, const Table& input,
                 } else {
                     using T = ColT::value_type;
                     kernel::gather_selected(
-                        kernel::ColumnView<T>(src.data(), src.size(), nullptr),
+                        kernel::ColumnView<T>(src, nullptr),
                         kernel::Selection{kernel::RowWordBlocks{
                             .words = sel.keep_words.data(),
                             .word_count = sel.keep_words.size(),
@@ -3002,6 +3018,10 @@ auto build_bounds_plan(const Table& input, const std::vector<ir::Expr>& conjunct
         } else {
             const auto& column = *entry.column;
             if (const auto* c_int = std::get_if<Column<std::int64_t>>(&column)) {
+                if (c_int->is_compact_int32()) {
+                    plan.leftover.push_back(conjunct);
+                    continue;
+                }
                 candidate.kind = BoundsKind::Int64;
                 candidate.data = c_int->data();
             } else if (const auto* c_dbl = std::get_if<Column<double>>(&column)) {

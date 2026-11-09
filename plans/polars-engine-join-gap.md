@@ -1,5 +1,8 @@
 # IbexEngine join gap (handoff, 2026-11-08)
 
+Raw experiment output is retained locally under `benchmarking/results/local/`;
+the scripts and summarized findings are versioned here.
+
 Status: open. Read this first if you are picking up the h2o join results of
 the Polars-engines benchmark.
 
@@ -76,12 +79,327 @@ q1 now, broken down (94 ms):
   lookup), codes viewed as UInt32, integer narrowing left to the final cast.
 - Plan tuple from `Adapter.compile()` is now 7 elements: `source, bindings,
   scalars, expected, result_schema, categories, left_rows`.
-  (`python/bench_full_join.py`, `bench_polars_result.py` and
-  `bench_categorical_export.py` still unpack an older 5-tuple; they were stale
-  before this work.)
+  The three historical conversion/join scripts now consume this tuple.
+  `bench_categorical_export.py` deliberately disables root reconstruction for
+  both converters, since the historical converter requires complete Arrow payloads.
 
 Tried and dropped: gathering only the Categorical columns by row number (q1
 170 → **390 ms**, because of the `gather` cost above).
+
+## Current implementation sequence
+
+1. **Identity reconstruction implemented and validated.** When the left
+   row numbers strictly increase, cover the whole source, and have endpoints
+   0 and height-1, return the original frame. This avoids mask allocation and
+   filtering without changing ordering, multiplicity, or category mappings.
+   The 10M-row q3 paired A/B at eight threads measured 202.4 → 171.8 ms
+   (median paired candidate/base 0.855, p=0.00098). Full outputs and dtypes
+   match Polars. Raw samples (`join-gap-identity-8t.json`, local raw output).
+   q1 and q5 control ratios were 1.034 (p=0.233) and 1.014 (p=0.339):
+   unresolved, not evidence of equivalence or a regression.
+   Control samples (`join-gap-identity-controls-8t.json`, local raw output).
+   The direct identity/order test is mutation-checked; all 90 engine tests pass.
+2. **Isolation completed; native output experiment now recorded below.** Both
+   lookup and `cat.to` cost materially on q3; validation dominates q5's 10M
+   category mapping. Benchmark Arrow `take` versus the current Polars gather
+   for exact UInt32 IDs with validity preserved, then verify full end-to-end
+   improvement. Independently compare right-row reconstruction against full
+   categorical conversion, with nullable q3 and high-cardinality q5 gates.
+   Do not remove validation without a supported construction path and proven
+   mapping/lifetime invariants. q5 also merits a separate dictionary-recognition
+   experiment: its known-code extraction costs ~11 ms.
+3. **Native ordered selection metadata remains a bounded opportunity.**
+   q1/q5 spend ~18–20 ms checking order and building masks; q3 spends only
+   ~5 ms checking order after identity reuse. Avoiding that work still leaves
+   ~16–17 ms of filtering for subsets. A mask needs an explicit source-order
+   and uniqueness guarantee; repeated/reordered results must retain row indices.
+4. **Fused narrow export is separate.** Narrowing on export still performs a
+   conversion unless fused with materialization. Preserving narrow types
+   throughout execution is a larger runtime project.
+
+The proposed adapter-only Float32 cast change was checked and dropped: for
+these joins the lowerer's output schema already says Float64, so Arrow does
+not narrow it; the final Polars cast already produces Float32. Moving it to
+that cast cannot save work.
+
+For Python-only engine changes, save the baseline engine before editing and run:
+
+```bash
+git show HEAD:python/ibex_polars/_engine.py > build-release/join-gap-base-engine.py
+cmake --build build-release -j6
+PYTHONSAFEPATH=1 PYTHONPATH=build-release/python:python \
+IBEX_CORES=8 POLARS_MAX_THREADS=8 taskset -c 0,2,4,6,8,10,12,14 \
+.venv/bin/python python/bench_join_gap.py \
+    --baseline-engine build-release/join-gap-base-engine.py --out build-release/join-gap-ab.json
+```
+
+This uses the same native bridge and adapter on both sides, loading the saved
+Python engine in a separate module namespace. It is valid for engine-only
+changes, not adapter/native changes. The saved module hash is in the report.
+Native hot-path edits still require `compare_ibex_git.sh` as in MEASURING.md.
+
+## Reconstruction profile after identity reuse (8 threads)
+
+Full 10M-row inputs, 12 alternating iterations and two warmups; q1/q3/q5
+outputs passed complete equality checks against Polars. Reassembled and
+cached-left diagnostic outputs additionally match production conversion in
+exact row order. Raw samples and provenance (`join-gap-reconstruction-8t.json`, local raw output).
+
+| Diagnostic stage (ms) | q1 | q3 | q5 |
+|---|---:|---:|---:|
+| Full conversion | 80.65 | 130.11 | 195.24 |
+| Left reconstruction | 38.05 | 5.36 | 40.25 |
+| Order check | 4.94 | 5.42 | 5.71 |
+| Mask construction | 13.42 | identity: skipped | 14.24 |
+| Left filter | 15.52 | identity: skipped | 17.49 |
+| Right conversion | 34.11 | 106.57 | 144.61 |
+| Final assembly | 0.07 | 0.06 | 0.07 |
+
+These are independent warmed stages, not an additive decomposition. Cache
+conditions and column parallelism matter: q3's full conversion measured 130 ms
+here versus 118 ms in the adjacent whole-harness conversion samples. A
+counterfactual reusing a precomputed left frame measures right conversion plus
+assembly, but excludes producing that frame; it is not an achieved speedup.
+
+All row-index arrays have one chunk and no nulls; extracting the Arrow array
+and its NumPy view takes <0.02 ms each. Chunk combination is not the bottleneck
+in these cases. q1/q5 are ordered unique subsets; q3 is identity.
+
+Right-column conversion includes ID remapping, categorical validation, and
+numeric casts. Every measured categorical hits the known-dictionary path but
+uses **lookup**, not a constant offset. q1 `id4_right` takes 29 ms. q3's two
+categoricals take 71–73 ms each in isolation (parallel together), and its
+nullable Int32 takes 30 ms. Each q3 right column has 1,001,588 nulls; this is
+an observation, not proof that nulls cause the difference. q5 `id6_right`
+takes 120 ms, versus 29–34 ms for its other categoricals. Float32 export is
+only ~5 ms per column in this run.
+
+Reproduce after a complete Release rebuild:
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH=build-release/python:python \
+IBEX_CORES=8 POLARS_MAX_THREADS=8 taskset -c 0,2,4,6,8,10,12,14 \
+.venv/bin/python python/bench_join_gap.py --questions q1 q3 q5 \
+    --reconstruction --out build-release/join-reconstruction.json
+```
+
+## Category isolation results (2026-11-08)
+
+The real-output profile now times `_known_codes`, `_known_ids` alone,
+`cat.to` on already-remapped IDs, and the current combined expression.
+The split and combined paths produce identical categoricals, including order,
+IDs and nulls. Full join outputs continue to pass Polars equality checks.
+Times below are medians of 12 alternating runs after two warmups at 8 threads.
+Independent stages reuse inputs; they are diagnostic and need not add exactly.
+
+| Real right column | Dictionary entries | Nulls | Known codes ms | Lookup ms | `cat.to` ms | Combined expression ms |
+|---|---:|---:|---:|---:|---:|---:|
+| q1 id4_right | 10 | 0 | 0.13 | 13.76 | 14.54 | 28.20 |
+| q3 id4_right | 10 | 1,001,588 | 0.13 | 37.50 | 32.72 | 70.02 |
+| q3 id5_right | 10,000 | 1,001,588 | 0.14 | 39.45 | 35.18 | 72.66 |
+| q5 id4_right | 10 | 0 | 0.13 | 13.47 | 14.54 | 28.19 |
+| q5 id5_right | 10,000 | 0 | 0.14 | 14.01 | 18.73 | 32.58 |
+| q5 id6_right | 10,000,000 | 0 | 10.94 | 24.43 | 82.17 | 104.04 |
+
+Real-output samples (`join-gap-category-isolation-8t.json`, local raw output).
+`cat.to` here includes the public categorical construction/validation operation;
+it is not an internal function profile. Known-code extraction includes dictionary
+recognition and wrapping code buffers, not only dictionary equality.
+
+A separate fixed-seed sweep uses one million rows, independent named category
+mappings, reversed dictionary-to-ID lookup, three cardinalities and null
+fractions 0/10/50%. It validates against gathering the original categorical
+labels. Named mappings avoid contamination by unrelated registered categories.
+
+| Categories | Null fraction | Lookup ms (8t) | `cat.to` ms (8t) | Combined ms (8t) |
+|---|---:|---:|---:|---:|
+| 10 | 0% | 1.31 | 1.67 | 2.92 |
+| 10 | 10% | 3.98 | 3.41 | 7.12 |
+| 10 | 50% | 6.46 | 5.77 | 12.14 |
+| 10,000 | 0% | 1.33 | 2.04 | 3.43 |
+| 10,000 | 10% | 3.72 | 3.59 | 7.27 |
+| 10,000 | 50% | 6.49 | 5.89 | 12.28 |
+| 1,000,000 | 0% | 2.76 | 9.89 | 12.70 |
+| 1,000,000 | 10% | 4.96 | 12.89 | 18.57 |
+| 1,000,000 | 50% | 7.23 | 10.20 | 17.66 |
+
+The 1-thread control (`join-gap-category-sweep-1t.json`, local raw output) closely
+matches the 8-thread sweep (`join-gap-category-sweep-8t.json`, local raw output):
+these single-column expressions gain little from the larger pool. Multiple
+columns can still execute in parallel. The sweep supports null handling as
+an independent cost in both stages, while high mapping cardinality especially
+penalizes `cat.to`. It does not isolate CPU branch prediction or cache misses,
+and does not imply a monotonic null penalty: at 1M categories, 50% nulls costs
+less validation time than 10%, with fewer nonnull IDs to validate.
+
+Reproduce the real profile with the reconstruction command above. Run the
+controlled sweep separately at each thread budget (full Release rebuild first):
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH=build-release/python:python \
+IBEX_CORES=8 POLARS_MAX_THREADS=8 taskset -c 0,2,4,6,8,10,12,14 \
+.venv/bin/python python/bench_category_isolation.py --out build-release/category-sweep-8t.json
+# For the control: IBEX_CORES=1 POLARS_MAX_THREADS=1 taskset -c 0.
+```
+
+## Right-row prototype: evidence for a broader boundary redesign
+
+`python/prototype_right_rows.py` is benchmark-only, not enabled in the public
+engine. It carries right keys plus a row index natively, then gathers original
+Polars payload columns with nullable indices. Existing adapter eligibility and
+layout checks are reused. Preparation still visits the original right payload;
+the prototype has a single-query strong cache, not production cache semantics.
+
+At eight threads, 12 paired samples on full inputs:
+
+| Query | Current ms | Prototype ms | Median paired prototype/current |
+|---|---:|---:|---:|
+| q1 | 94.8 | 81.8 | 0.868 |
+| q3 | 166.9 | 109.2 | 0.654 |
+| q5 | 375.4 | 595.4 | 1.587 |
+
+Raw samples (`join-gap-right-rows-8t.json`, local raw output). All comparisons have
+p=0.00049; full outputs and dtypes matched streaming Polars. Focused tests pass
+at 1 and 8 threads for nulls, duplicates, empty/chunked right inputs, suffixes,
+composite keys and explicit order. Reversing reconstruction output makes the
+correctness tests fail. Expression gather handles all-null indices, where the
+DataFrame indexing helper failed for an empty right table.
+
+The one-thread q3 control (`join-gap-right-rows-1t.json`, local raw output) shows
+no resolved improvement: current 497.9 ms, prototype 496.4 ms, paired ratio
+1.021, p=0.970. The eight-thread benefit therefore does not establish less
+work; more favorable parallel execution may explain part of it.
+
+q5 is a decisive regression: native/export drops to 113 ms, but reconstruction
+rises to 482 ms. Moving payload work to Polars gather is not a general solution.
+Run with `bench_join_gap.py --right-rows`; do not combine with reconstruction
+profiling or a saved baseline engine. The baseline is the current public engine.
+
+The architectural direction to investigate is preserving foreign payload
+representations and category ownership across execution, then materializing
+selected payloads once into final physical buffers. Join-key normalization
+must remain separate from opaque payload storage. Narrow numeric payloads
+should not require widening/narrowing; categorical payloads should preserve
+mapping identity and valid source codes rather than round-trip through a new
+dictionary and per-row revalidation. A native bridge needs a supported way to
+retain/construct these Polars columns, with explicit ownership and lifetime
+rules; feasibility is not yet established. Measure that output boundary in
+isolation before committing to a general runtime redesign. Random payload
+access on q5 remains real work even after conversion passes are removed.
+
+## Native physical-output experiment
+
+See [build/test instructions](../python/experiments/README.md). The standalone
+C++ Release kernel writes original-width payload values and validity directly
+into final buffers. Categorical codes remain original Polars IDs; there is no
+dictionary reconstruction or ID remapping. Null selection indices produce null
+payloads. Inputs and mapping owners remain alive through conversion.
+
+The supported categorical attachment still calls `cat.to`. Polars' checked
+2.0.0 plugin FFI transports logical Arrow columns; a supported direct mapping
+handle attachment was not established. No internal Rust ABI layout is accessed
+or mutated. This experiment therefore tests native physical materialization
+plus the remaining public attachment cost, not validation-free categoricals.
+
+Full-input paired results at eight threads (12 samples, two warmups):
+
+| Query | Current ms | Native-output prototype ms | Paired ratio | p | Physical gather ms | Categorical attach ms |
+|---|---:|---:|---:|---:|---:|---:|
+| q3 | 179.9 | 98.3 | 0.555 | 0.00049 | 18.1 | 35.9 |
+| q5 | 381.4 | 401.1 | 1.046 | 0.00928 | 152.5 | 82.9 |
+
+Raw samples (`join-gap-native-output-8t.json`, local raw output). Standalone gather
+and attachment measurements are not additive decompositions. The first kernel
+used runtime-sized copies; specializing 4/8-byte copies reduced physical gather
+from ~26 to ~18 ms on q3 and ~168 to ~153 ms on q5. These are diagnostic
+successive runs, not a paired claim about copy specialization.
+
+One-thread control, same full inputs and paired protocol:
+
+| Query | Current ms | Native-output prototype ms | Paired ratio | Physical gather ms | Categorical attach ms |
+|---|---:|---:|---:|---:|---:|
+| q3 | 499.6 | 397.3 | 0.811 | 126.6 | 68.9 |
+| q5 | 867.2 | 1338.1 | 1.524 | 915.1 | 59.4 |
+
+One-thread raw samples (`join-gap-native-output-1t.json`, local raw output); both
+comparisons p=0.00049. q3 improves at both budgets, while q5 regresses at both.
+The standalone gather times confirm that late random access remains substantial
+work even when codes and widths are preserved. These kernel measurements do not
+establish an optimum for a native materializer; they measure this implementation.
+
+Checks: complete benchmark outputs match streaming Polars, native tests pass at
+1/8 threads for empty/all-null selections, bitmap boundaries, named/default
+categories, Float32 bit patterns, source-owner lifetime and invalid indices.
+A separately compiled corrupt-gather/bounds-check mutant makes all three tests
+fail. Default engine/runtime/plugin behavior is unchanged by this experiment.
+
+q3 supports the small-right-table direction. q5 remains a resolved regression:
+the random gather itself is expensive, and validation still costs ~83 ms.
+Do not enable this as a general output path. A next architectural experiment
+must either preserve categorical ownership through a supported native interface
+or fuse payload materialization into the join to avoid a separate random gather;
+this prototype establishes neither capability. Keep the public engine unchanged.
+
+## q5 fixed-width control: original, all Int32, all Int64
+
+`python/bench_join_widths.py` runs the current public engine and streaming
+Polars in one process, alternating all routes over 12 paired iterations after
+two warmups. It checks complete outputs for each representation. Encoding and
+input preparation are outside collection timers. Categorical labels become
+shared physical IDs; Float32 payloads become exact Int32 IEEE bit patterns,
+then widen by sign extension for the Int64 variant. No float values are rounded
+or truncated. This is a storage-only join control, not a numeric-arithmetic
+benchmark. All variants produce 9M rows from the full q5 inputs.
+
+At eight threads:
+
+| Representation | Ibex collect ms | Polars ms | Native + export ms | Conversion ms | Paired Ibex/Polars |
+|---|---:|---:|---:|---:|---:|
+| original | 377.90 | 254.25 | 187.26 | 190.21 | 1.496 |
+| int32 | 263.31 | 246.97 | 212.89 | 42.86 | 1.074 |
+| int64 | 211.00 | 297.87 | 208.62 | 0.27 | 0.710 |
+
+Eight-thread samples (`join-gap-widths-8t.json`, local raw output). Every engine
+comparison has p=0.00049. Polars' paired Int64/Int32 ratio is 1.236 (p=0.00049),
+while Ibex's is 0.797 (p=0.00049). Numeric-mode native/export times are unresolved
+between widths (ratio 0.976, p=0.052); both execute/export Int64 columns.
+
+Numeric Int32 and Int64 use the same adapter path, without left reconstruction.
+The original categorical input enables left reconstruction, so original versus
+numeric differences include that plan change as well as categorical conversion.
+Output physical buffers are 468 MB for Int32 and 936 MB for Int64. Input/output
+byte estimates exclude separately owned categorical mapping storage.
+
+One-thread control (same protocol, all full-output checks passed):
+
+| Representation | Ibex collect ms | Polars ms | Native + export ms | Conversion ms | Paired Ibex/Polars |
+|---|---:|---:|---:|---:|---:|
+| original | 814.91 | 1514.40 | 544.76 | 242.02 | 0.536 |
+| int32 | 970.81 | 1475.26 | 680.01 | 199.00 | 0.644 |
+| int64 | 640.71 | 1712.93 | 677.63 | 0.22 | 0.376 |
+
+One-thread samples (`join-gap-widths-1t.json`, local raw output). All engine
+comparisons p=0.00049. Paired Int64/Int32 ratios: Polars 1.178, Ibex 0.695
+(both p=0.00049). Native/export remains unresolved between numeric widths
+(ratio 1.019, p=0.470). The conversion stages use immutable prepared results
+and differ in cache conditions from collect, so medians need not add exactly.
+The lossless encoding was separately round-trip checked with categorical nulls,
+Float32 signed zero, NaN, infinity and negative values.
+
+The result supports a native Int32 payload experiment: Polars benefits from
+narrower buffers, whereas Ibex currently widens and then narrows them (43 ms
+standalone narrowing/conversion here). This does not predict the speed of a
+native Int32 build, isolate key width from payload width, or remove the original
+categorical mapping/validation cost. Test payload width first with key handling
+held fixed before considering a global integer-width change.
+
+Reproduce after a complete Release rebuild, separately with budgets 1 and 8:
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH=build-release/python:python \
+IBEX_CORES=8 POLARS_MAX_THREADS=8 taskset -c 0,2,4,6,8,10,12,14 \
+.venv/bin/python python/bench_join_widths.py --out build-release/join-widths-8t.json
+```
 
 ## Ideas not yet tried, roughly by expected payoff
 
@@ -122,8 +440,8 @@ Validated run of the join set (fixture answer checks + timings + prepare ms):
 
 ```bash
 taskset -c 0,2,4,6,8,10,12,14 python/bench_polars_engines.sh --skip-pdsh \
-    --threads 8 --h2o-data J1_1e7_NA_0_0 --out-dir /tmp/joincheck
-.venv/bin/python python/summarize_polars_engines.py /tmp/joincheck
+    --threads 8 --h2o-data J1_1e7_NA_0_0 --out-dir build-release/joincheck
+.venv/bin/python python/summarize_polars_engines.py build-release/joincheck
 ```
 
 Splitting one question into native vs conversion (the pattern used above):
@@ -150,13 +468,73 @@ print(f"native {(t1 - t0) * 1e3:.0f} ms, conversion {(time.perf_counter() - t1) 
 ```
 
 Run it with `IBEX_CORES=8 POLARS_MAX_THREADS=8 taskset -c 0,2,4,6,8,10,12,14`,
-repeat a few times and take the minimum. Re-run Polars in the same sitting;
+use this only for diagnosis. For acceptance, use the paired harness below;
 never compare against a cached Polars number.
+
+### Reproducible paired join measurements
+
+The table above is historical, unpaired evidence. Use `python/bench_join_gap.py`
+for new measurements. After rebuilding the complete Release tree, run separately:
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH=build-release/python:python \
+IBEX_CORES=1 POLARS_MAX_THREADS=1 taskset -c 0 \
+.venv/bin/python python/bench_join_gap.py --out build-release/join-gap-1t.json
+
+PYTHONSAFEPATH=1 PYTHONPATH=build-release/python:python \
+IBEX_CORES=8 POLARS_MAX_THREADS=8 taskset -c 0,2,4,6,8,10,12,14 \
+.venv/bin/python python/bench_join_gap.py --out build-release/join-gap-8t.json
+```
+
+The harness validates complete outputs and dtypes against streaming Polars,
+ignoring unspecified join order. It warms each route twice, alternates route
+order for 12 paired iterations, and records raw samples, medians, median paired
+Ibex/Polars ratios and unadjusted Wilcoxon p-values. These compare engines, not
+before/after revisions; runtime changes still require the git A/B gate in
+MEASURING.md. Provenance includes binary and adapter hashes, Git status, thread
+budget and CPU affinity. Input CSV loading is excluded.
+
+`prepare` uses a fresh engine each time (warm process); `ibex_cached` uses the
+public collect path with a prepared query. `native_export` includes Arrow
+export; `conversion` reuses an immutable result. The latter two are diagnostic
+measurements with different cache conditions, not an additive decomposition.
+`--limit 10000 --iters 6` runs a smoke check explicitly marked nonrepresentative
+in its JSON. Never use truncated inputs for published ratios.
 
 Tests: `.venv/bin/python python/test_ibex_polars.py` (no pytest in the venv;
 `uv run --with pytest python -m pytest -q python/test_polars_conformance.py`
 for the conformance suite). Every new path should come with a test that fails
 when the path is broken; check by mutating the code.
+
+### Paired remeasurement (2026-11-08, 8 threads)
+
+Full 10M-row inputs; complete outputs and dtypes passed against streaming
+Polars. Twelve alternating pairs, two warmups. Times are medians in ms;
+ratios are medians of paired ratios, not ratios of medians.
+
+| Query | Cached Ibex | Polars streaming | Prepare | Native + export | Conversion | Paired ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| q1 | 101.7 | 36.4 | 40.5 | 21.9 | 76.6 | 2.83 |
+| q2 | 119.2 | 39.1 | 45.6 | 25.7 | 92.8 | 2.99 |
+| q3 | 189.3 | 52.0 | 45.6 | 51.3 | 138.1 | 3.46 |
+| q4 | 117.6 | 40.5 | 84.6 | 24.5 | 88.2 | 2.89 |
+| q5 | 394.8 | 276.8 | 867.0 | 193.4 | 200.0 | 1.41 |
+
+Raw samples and provenance: 8-thread JSON (`join-gap-20261108-8t.json`, local raw output).
+Split timings are standalone diagnostics and need not sum to cached collect.
+
+One-thread control, same protocol and complete-output checks:
+
+| Query | Cached Ibex ms | Polars ms | Paired ratio | Wilcoxon p |
+|---|---:|---:|---:|---:|
+| q1 | 173.2 | 187.8 | 0.91 | 0.0923 |
+| q2 | 246.4 | 203.7 | 1.21 | 0.0049 |
+| q3 | 520.7 | 361.6 | 1.44 | 0.0005 |
+| q4 | 236.3 | 232.9 | 1.01 | 0.5693 |
+| q5 | 862.2 | 1565.2 | 0.55 | 0.0005 |
+
+q1 and q4 are unresolved, not evidence of a speedup or equivalence.
+Raw samples and provenance: 1-thread JSON (`join-gap-20261108-1t.json`, local raw output).
 
 ## Where this fits
 

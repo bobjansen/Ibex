@@ -28,7 +28,7 @@ p.add_argument('--suite', choices=['groupagg','join','core','filter'], default='
 p.add_argument('--csv-lookup', type=Path)
 p.add_argument('--csv-trades', type=Path)
 p.add_argument('--queries', nargs='+')
-p.add_argument('--switch', choices=['IBEX_DIAG_BIND_COLLECT_COUNTS', 'IBEX_DIAG_BIND_COLLECT_SCATTER', 'IBEX_DIAG_BIND_CAT_PROBE', 'IBEX_DIAG_BIND_FLOAT_ACCUMULATION', 'IBEX_DIAG_BIND_ARITHMETIC_MASK', 'IBEX_DIAG_UNROLL_GATHER'], default='IBEX_DIAG_BIND_COLLECT_COUNTS')
+p.add_argument('--switch', choices=['IBEX_DIAG_BIND_COLLECT_COUNTS', 'IBEX_DIAG_BIND_COLLECT_SCATTER', 'IBEX_DIAG_BIND_CAT_PROBE', 'IBEX_DIAG_BIND_FLOAT_ACCUMULATION', 'IBEX_DIAG_BIND_ARITHMETIC_MASK', 'IBEX_DIAG_UNROLL_GATHER', 'IBEX_DIAG_ALIGN_GATHER'], default='IBEX_DIAG_BIND_COLLECT_COUNTS')
 p.add_argument('--out', type=Path, required=True)
 a = p.parse_args()
 if a.repeats < 12 or a.repeats % 6: p.error('repeats must be a multiple of six, at least twelve')

@@ -1,7 +1,7 @@
 # Native Int32 storage experiment
 
 Developed on `experiment/native-int32` from d123a11f, then integrated into the
-main `python` branch in c68a8288 alongside the earlier Python work.
+main `python` branch in 207232d9 alongside the earlier Python work.
 
 This experiment compiles the same C++ source twice with `Value=int32_t` and
 `Value=int64_t`. It uses Ibex's existing `Column<T>` implementation, including
@@ -115,7 +115,7 @@ remaining performance gate.
 
 `check_read_memory.cpp` is an isolated memory mechanism check, not a timing
 benchmark. The identical source was built at -O3 -DNDEBUG against the cached
-715bf960 column header and the new header, using the same other includes.
+2d381eb9 column header and the new header, using the same other includes.
 At 50M values the old read allocates about 381 MiB for its cached Int64 view;
 the new read has no RSS growth. Both verify the same independent Int64
 checksum. Raw results/provenance are in `no-cache-read-memory.json`.
@@ -124,7 +124,7 @@ To reproduce (paths are persistent; binaries and generated headers are scratch):
 
 ```bash
 mkdir -p build-memory-baseline/include/ibex/core
-git show 715bf960:include/ibex/core/column.hpp > build-memory-baseline/include/ibex/core/column.hpp
+git show 2d381eb9:include/ibex/core/column.hpp > build-memory-baseline/include/ibex/core/column.hpp
 clang++ -O3 -DNDEBUG -std=c++23 -I build-memory-baseline/include -I include \
   -isystem "$ROBIN_HOOD_INCLUDE" benchmarking/int32/check_read_memory.cpp \
   -o build-memory-baseline/read-memory
@@ -133,3 +133,6 @@ clang++ -O3 -DNDEBUG -std=c++23 -I include -isystem "$ROBIN_HOOD_INCLUDE" \
 build-memory-baseline/read-memory 50000000
 build-release/read-memory 50000000
 ```
+
+Historical measurement identifiers map to the rebased source commits in
+[history-revisions.md](history-revisions.md).

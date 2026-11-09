@@ -1,7 +1,7 @@
 # Preserve physical Int32 in runtime filter results
 
 The main `python` worktree contains the native Int32 implementation and the
-physical-pointer gather fix (merge c68a8288). Compact ingestion remains opt-in;
+physical-pointer gather fix (merge 207232d9). Compact ingestion remains opt-in;
 this follow-up preserves the physical width of columns that are already compact.
 
 Table and native-chunk filters now use shared helpers to allocate an Int32
@@ -109,7 +109,7 @@ The wide-workload git regression slice uses the established harness first:
 mkdir -p build-filter-storage/perfcmp
 IBEX_CORES=1 IBEX_COMPACT_INT32=0 IBEX_PERFCMP_JOBS=6 \
 IBEX_PERFCMP_TMPDIR="$PWD/build-filter-storage/perfcmp" \
-benchmarking/compare_ibex_git.sh --base dff7f963 --target WORKTREE \
+benchmarking/compare_ibex_git.sh --base 31041264 --target WORKTREE \
   --ibex-suite core,filter,join,groupagg \
   --csv "$PWD/benchmarking/data/prices.csv" \
   --csv-multi "$PWD/benchmarking/data/prices_multi.csv" \

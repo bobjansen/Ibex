@@ -1,0 +1,11 @@
+diff --git a/src/runtime/kernel_gather.hpp b/src/runtime/kernel_gather.hpp
+index 508cbc33..6b4fc553 100644
+--- a/src/runtime/kernel_gather.hpp
++++ b/src/runtime/kernel_gather.hpp
+@@ -76,0 +77,2 @@ auto gather_selected_values(const Input* src, std::size_t rows, const Selection&
++                // Align the inner selected-row loop independently of surrounding
++                // code layout. Padding adds no per-value instructions.
+@@ -79,0 +82,3 @@ auto gather_selected_values(const Input* src, std::size_t rows, const Selection&
++#if __has_cpp_attribute(clang::code_align)
++                    [[clang::code_align(32)]]
++#endif

@@ -1,0 +1,62 @@
+--- a/src/runtime/kernel_gather.hpp
++++ b/src/runtime/kernel_gather.hpp
+@@ -13,0 +14 @@
++#include <cstdlib>
+@@ -14,0 +16 @@
++#include <string_view>
+@@ -25,0 +28,5 @@
++
++inline const bool diagnostic_align_gather = [] {
++    const char* flag = std::getenv("IBEX_DIAG_ALIGN_GATHER");
++    return flag != nullptr && std::string_view(flag) == "1";
++}();
+@@ -48,0 +56,44 @@
++auto aligned_gather_selected_values(const Input* src, std::size_t rows, const Selection& selection,
++                                    OutputSpan<T> out) noexcept -> void {
++    std::visit(
++        [=](const auto& sel) {
++            using S = std::decay_t<decltype(sel)>;
++            T* dp = out.data + out.begin;
++            if constexpr (std::is_same_v<S, RowRange>) {
++                if (out.count != 0) {
++                    if constexpr (std::is_same_v<Input, T>) {
++                        std::memcpy(dp, src + sel.begin, out.count * sizeof(T));
++                    } else {
++                        for (std::size_t row = 0; row < out.count; ++row)
++                            dp[row] = src[sel.begin + row];
++                    }
++                }
++            } else if constexpr (std::is_same_v<S, RowIndices>) {
++                for (std::size_t i = 0; i < sel.count; ++i) {
++                    dp[i] = src[sel[i]];
++                }
++            } else if constexpr (std::is_same_v<S, RowBitmap>) {
++                std::size_t j = 0;
++                for (std::size_t r = 0; r < rows; ++r) {
++                    if (sel.test(r)) {
++                        dp[j++] = src[r];
++                    }
++                }
++            } else {  // RowWordBlocks
++                std::size_t j = 0;
++                for (std::size_t w = 0; w < sel.word_count; ++w) {
++                    std::uint64_t bits = sel.words[w];
++                    const std::size_t base = sel.row_base + (w * 64);
++                    [[clang::code_align(32)]] while (bits != 0) {
++                        const auto bit = static_cast<std::size_t>(std::countr_zero(bits));
++                        dp[j++] = src[base + bit];
++                        bits &= (bits - 1);
++                    }
++                }
++            }
++        },
++        selection);
++}
++
++template <typename Input, typename T>
++    requires std::is_trivially_copyable_v<T>
+@@ -50,0 +102,4 @@
++    if (diagnostic_align_gather) {
++        aligned_gather_selected_values(src, rows, selection, out);
++        return;
++    }

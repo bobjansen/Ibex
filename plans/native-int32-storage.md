@@ -1,6 +1,6 @@
 # Native compact Int32 storage
 
-Status: integrated into the main `python` branch in c68a8288, including the
+Status: integrated into the main `python` branch in 207232d9, including the
 validated physical-pointer gather fix. Compact ingestion remains opt-in through
 `IBEX_COMPACT_INT32=1`; the broader existing-workload performance gate remains
 open. Integration does not enable compact ingestion by default.
@@ -86,7 +86,7 @@ and matching plugin rebuilds pass. Logs are in `build-release/no-cache-*.log`.
 
 A memory mechanism check compiles the identical standalone
 [check_read_memory.cpp](../benchmarking/int32/check_read_memory.cpp) against the
-cached checkpoint (715bf960) and current column headers, at -O3 -DNDEBUG.
+cached checkpoint (2d381eb9) and current column headers, at -O3 -DNDEBUG.
 Fifty million signed Int32 values are constructed outside the read loop and
 both binaries verify the complete Int64 checksum against an independent
 formula. Peak RSS before/after logical reads is 198,696/589,224 KiB for the
@@ -101,7 +101,7 @@ The operation-owned contiguous arithmetic conversion remains a cost to measure;
 removing the column cache does not eliminate every operation's need for wide
 output or scratch buffers.
 
-The final Release comparison is against the cached checkpoint 715bf960, not
+The final Release comparison is against the cached checkpoint 2d381eb9, not
 against the original Python branch. It uses 12 paired/interleaved repeats,
 five inner iterations, one pinned core and a byte-identical unchanged control.
 Across 23 existing queries, summed medians are 585.219/587.086 ms (+0.32%).
@@ -258,7 +258,7 @@ IBEX_COMPACT_INT32=1 IBEX_CORES=8 build-release/tools/ibex_eval \
   --plugin-path build-release/tools query.ibex
 ```
 
-Before promotion: resolve the remaining arithmetic-filter uncertainty described
+Before promotion: finish isolating the dense-filter/code-placement issue described
 below and measure real Parquet arithmetic workloads, including peak memory. The operation-owned
 contiguous-arithmetic conversion is explicit but still costs a copy; typed
 readers can also affect generated code and must pass the performance gate.
@@ -271,7 +271,7 @@ before selection iteration. Neither width carries iterator-offset bookkeeping
 inside the selected-row loop. Native Release assembly has six instructions per
 selected value at both widths, with sign extension folded into the Int32 load.
 
-A 20-pair git A/B against cache-free checkpoint 6e1f4938, with unchanged replica
+A 20-pair git A/B against cache-free checkpoint 2b236e89, with unchanged replica
 control, improves the four wide CSV filters by 2.3–3.1%; all survive Holm
 correction and the control comparisons are unresolved. This addresses the
 localized gather regression without restoring a widening cache. It does not
@@ -305,7 +305,7 @@ Float64 accumulation runs in a separate kernel with explicit bounds and slot
 strides; categorical dictionary-memo joins bind code/head pointers once. There
 are no additional integer-width cases in these loops and arithmetic is unchanged.
 
-Against the original pre-Int32 native baseline `c4489863`, the final 23-query,
+Against the original pre-Int32 native baseline `0caffc17`, the final 23-query,
 20-pair one-core comparison puts median/quantile 0.50%/0.62% ahead, OHLC 18.54%
 ahead and categorical join 15.11% ahead. These survive Holm correction. The
 historical std regression does not reproduce; the final build is 2.93% ahead,
@@ -327,3 +327,33 @@ of equivalence. Compact ingestion stays opt-in; the broader promotion gate
 remains open on that uncertainty and real Parquet arithmetic/memory coverage.
 
 See the [diagnosis, reproducible scripts, counterfactual patches and raw results](../benchmarking/int32/aggregate-regressions/README.md).
+
+
+## Dense-filter/code-placement investigation
+
+A focused 30-pair comparison now resolves arithmetic +1.03% against the original
+native baseline; a separate 24-pair run finds +1.21–1.46%, with/without an unused
+input preload. A similar simple-filter effect shows this is not unique to
+multiplication. Current arithmetic queries retire about 0.51% fewer instructions;
+the Int64 selected-copy loop has exactly the original six instruction bytes.
+There is no additional Int32 width branch in that row loop.
+
+Placement does differ: the original Int64 loop starts on a 32-byte boundary;
+the current one starts 16 bytes into a block. A same-executable alignment
+counterfactual improves arithmetic by 0.83%, reduces the undelivered-uop event
+by 31.55% and legacy-decoder uops by 59.56%, while adding padding outside the
+row loops. This establishes a code-layout component, not the exact share of
+the complete historical delta.
+
+The local alignment hint is **rejected**. Its broad 23-query gate regresses
+categorical join 2.82% and grouped head top-K 0.31%, both surviving Holm
+correction. Its arithmetic estimate versus the original is still +0.67%,
+unresolved. Correctness, strict GCC and WebAssembly builds pass, but that does
+not make the performance tradeoff acceptable. Runtime source and active native
+binaries are restored to `98aa0d7b`.
+
+The remaining gate stays open. Future placement experiments must preserve
+join/TopK performance; adding arithmetic dtype cases or changing the native
+allocator is not supported by this evidence. The [full diagnosis, scripts,
+raw measurements and rejected patches](../benchmarking/int32/arithmetic-filter/README.md)
+are retained for review and reproduction.

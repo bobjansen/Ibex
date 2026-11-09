@@ -46,6 +46,27 @@
 
 namespace ibex::runtime {
 
+namespace {
+// Counts are already shifted to the caller's destination bins. Keep source
+// bounds and validity dispatch outside the row loop, away from captured state
+// in the general aggregate evaluator.
+IBEX_NOINLINE void count_collect_groups(const std::uint32_t* groups, std::size_t rows,
+                                        const ValidityBitmap* validity,
+                                        std::size_t* counts) noexcept {
+    if (validity == nullptr) {
+        for (std::size_t row = 0; row < rows; ++row) {
+            ++counts[groups[row]];
+        }
+    } else {
+        for (std::size_t row = 0; row < rows; ++row) {
+            if ((*validity)[row]) {
+                ++counts[groups[row]];
+            }
+        }
+    }
+}
+}  // namespace
+
 auto global_aggregate_of_empty(const std::vector<ColumnEntry>& empty_columns,
                                const std::vector<ir::AggSpec>& aggregations)
     -> std::vector<ColumnEntry> {
@@ -1648,11 +1669,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     }
                     offsets[n_groups] = total;
                 } else {
-                    for (std::size_t row = 0; row < rows; ++row) {
-                        if (vb == nullptr || (*vb)[row]) {
-                            ++offsets[row_gid[row] + 1];
-                        }
-                    }
+                    count_collect_groups(row_gid.data(), rows, vb, offsets.data() + 1);
                     for (std::size_t g = 0; g < n_groups; ++g) {
                         offsets[g + 1] += offsets[g];
                     }

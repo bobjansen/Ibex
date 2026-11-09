@@ -1426,10 +1426,12 @@ struct JoinProbe {
                 // keys than there are rows to answer.
                 if (dict.size() < n) {
                     resolve_categorical_heads(dict);
+                    const auto* codes = c_cat->codes_data();
+                    const auto* heads = probe_code_heads_.data();
                     li_identity = probe_resolved(
                         n,
-                        [&](std::size_t i) {
-                            return probe_code_heads_[static_cast<std::size_t>(c_cat->code_at(i))];
+                        [codes, heads](std::size_t i) {
+                            return heads[static_cast<std::size_t>(codes[i])];
                         },
                         li, ri);
                 } else {

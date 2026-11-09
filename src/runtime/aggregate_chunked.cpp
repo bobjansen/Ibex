@@ -6926,6 +6926,117 @@ class HashAggregateState final {
         return out;
     }
 
+    // A physical Float64 column has no integer-reader metadata. Bind shape,
+    // validity and slot strides once, so unused integer paths cannot inflate
+    // its row-loop register state.
+    template <typename GidT, bool HasNulls>
+    IBEX_NOINLINE static void accumulate_double_column(
+        const GidT* gids, const double* data, const ValidityBitmap* validity, std::size_t begin,
+        std::size_t end, AggSlotCore* base, std::size_t n_aggs, std::size_t agg_i,
+        double* scratch_base, std::size_t scratch_stride, std::size_t scratch_offset,
+        ir::AggFunc func) {
+        const auto slot_for = [=](GidT g) -> AggSlotCore& {
+            return base[static_cast<std::size_t>(g) * n_aggs + agg_i];
+        };
+        const auto scratch_at = [=](GidT g) -> double* {
+            return scratch_base + static_cast<std::size_t>(g) * scratch_stride + scratch_offset;
+        };
+        switch (func) {
+            case ir::AggFunc::Sum:
+                for (std::size_t row = begin; row < end; ++row) {
+                    if constexpr (HasNulls) {
+                        if (!(*validity)[row])
+                            continue;
+                    }
+                    auto& slot = slot_for(gids[row]);
+                    slot.double_value += data[row];
+                    slot.mark_present();
+                }
+                break;
+            case ir::AggFunc::Mean:
+                for (std::size_t row = begin; row < end; ++row) {
+                    if constexpr (HasNulls) {
+                        if (!(*validity)[row])
+                            continue;
+                    }
+                    auto& slot = slot_for(gids[row]);
+                    slot.double_value += data[row];
+                    slot.count++;
+                }
+                break;
+            case ir::AggFunc::Min:
+                for (std::size_t row = begin; row < end; ++row) {
+                    if constexpr (HasNulls) {
+                        if (!(*validity)[row])
+                            continue;
+                    }
+                    auto& slot = slot_for(gids[row]);
+                    const double v = data[row];
+                    slot.double_value = slot.present() ? std::min(slot.double_value, v) : v;
+                    slot.mark_present();
+                }
+                break;
+            case ir::AggFunc::Max:
+                for (std::size_t row = begin; row < end; ++row) {
+                    if constexpr (HasNulls) {
+                        if (!(*validity)[row])
+                            continue;
+                    }
+                    auto& slot = slot_for(gids[row]);
+                    const double v = data[row];
+                    slot.double_value = slot.present() ? std::max(slot.double_value, v) : v;
+                    slot.mark_present();
+                }
+                break;
+            case ir::AggFunc::Stddev:
+                for (std::size_t row = begin; row < end; ++row) {
+                    if constexpr (HasNulls) {
+                        if (!(*validity)[row])
+                            continue;
+                    }
+                    agg_update_stddev(slot_for(gids[row]), scratch_at(gids[row])[0], data[row]);
+                }
+                break;
+            case ir::AggFunc::Skew:
+            case ir::AggFunc::Kurtosis:
+                for (std::size_t row = begin; row < end; ++row) {
+                    if constexpr (HasNulls) {
+                        if (!(*validity)[row])
+                            continue;
+                    }
+                    double* scr = scratch_at(gids[row]);
+                    agg_update_moments(slot_for(gids[row]), scr[0], scr[1], scr[2], data[row]);
+                }
+                break;
+            case ir::AggFunc::First:
+                for (std::size_t row = begin; row < end; ++row) {
+                    if constexpr (HasNulls) {
+                        if (!(*validity)[row])
+                            continue;
+                    }
+                    auto& slot = slot_for(gids[row]);
+                    if (!slot.present()) {
+                        slot.double_value = data[row];
+                        slot.mark_present();
+                    }
+                }
+                break;
+            case ir::AggFunc::Last:
+                for (std::size_t row = begin; row < end; ++row) {
+                    if constexpr (HasNulls) {
+                        if (!(*validity)[row])
+                            continue;
+                    }
+                    auto& slot = slot_for(gids[row]);
+                    slot.double_value = data[row];
+                    slot.mark_present();
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
     /// Scatter-accumulate rows [begin, end) into `base`, indexed by
     /// `gids[row] * n_aggs_ + agg_i`. `base` is the caller's slot array —
     /// `flat_slots_` for the serial path, a worker-private array for the
@@ -6998,86 +7109,16 @@ class HashAggregateState final {
                 // Read through a const variant so parallel workers cannot
                 // detach (and race on) borrowed Arrow storage.
                 const double* data = std::get<Column<double>>(std::as_const(*entry.column)).data();
-                switch (plan_[agg_i].func) {
-                    case ir::AggFunc::Sum:
-                        for (std::size_t row = begin; row < rows; ++row) {
-                            if (has_nulls && !(*validity)[row])
-                                continue;
-                            auto& slot = slot_for(gids[row]);
-                            slot.double_value += data[row];
-                            slot.mark_present();
-                        }
-                        break;
-                    case ir::AggFunc::Mean:
-                        for (std::size_t row = begin; row < rows; ++row) {
-                            if (has_nulls && !(*validity)[row])
-                                continue;
-                            auto& slot = slot_for(gids[row]);
-                            slot.double_value += data[row];
-                            slot.count++;
-                        }
-                        break;
-                    case ir::AggFunc::Min:
-                        for (std::size_t row = begin; row < rows; ++row) {
-                            if (has_nulls && !(*validity)[row])
-                                continue;
-                            auto& slot = slot_for(gids[row]);
-                            const double v = data[row];
-                            slot.double_value = slot.present() ? std::min(slot.double_value, v) : v;
-                            slot.mark_present();
-                        }
-                        break;
-                    case ir::AggFunc::Max:
-                        for (std::size_t row = begin; row < rows; ++row) {
-                            if (has_nulls && !(*validity)[row])
-                                continue;
-                            auto& slot = slot_for(gids[row]);
-                            const double v = data[row];
-                            slot.double_value = slot.present() ? std::max(slot.double_value, v) : v;
-                            slot.mark_present();
-                        }
-                        break;
-                    case ir::AggFunc::Stddev:
-                        for (std::size_t row = begin; row < rows; ++row) {
-                            if (has_nulls && !(*validity)[row])
-                                continue;
-                            agg_update_stddev(slot_for(gids[row]), scratch_at(gids[row])[0],
-                                              data[row]);
-                        }
-                        break;
-                    case ir::AggFunc::Skew:
-                    case ir::AggFunc::Kurtosis:
-                        for (std::size_t row = begin; row < rows; ++row) {
-                            if (has_nulls && !(*validity)[row])
-                                continue;
-                            double* scr = scratch_at(gids[row]);
-                            agg_update_moments(slot_for(gids[row]), scr[0], scr[1], scr[2],
-                                               data[row]);
-                        }
-                        break;
-                    case ir::AggFunc::First:
-                        for (std::size_t row = begin; row < rows; ++row) {
-                            if (has_nulls && !(*validity)[row])
-                                continue;
-                            auto& slot = slot_for(gids[row]);
-                            if (!slot.present()) {
-                                slot.double_value = data[row];
-                                slot.mark_present();
-                            }
-                        }
-                        break;
-                    case ir::AggFunc::Last:
-                        for (std::size_t row = begin; row < rows; ++row) {
-                            if (has_nulls && !(*validity)[row])
-                                continue;
-                            auto& slot = slot_for(gids[row]);
-                            slot.double_value = data[row];
-                            slot.mark_present();
-                        }
-                        break;
-                    default:
-                        break;
+                if (has_nulls) {
+                    accumulate_double_column<GidT, true>(
+                        gids, data, validity, begin, rows, fs, n_aggs_, agg_i, scratch_base,
+                        scratch_stride_, scratch_offset_[agg_i], plan_[agg_i].func);
+                } else {
+                    accumulate_double_column<GidT, false>(
+                        gids, data, validity, begin, rows, fs, n_aggs_, agg_i, scratch_base,
+                        scratch_stride_, scratch_offset_[agg_i], plan_[agg_i].func);
                 }
+                continue;
             } else if (plan_[agg_i].kind == ExprType::Int) {
                 const auto data =
                     std::get<Column<std::int64_t>>(std::as_const(*entry.column)).integer_view();

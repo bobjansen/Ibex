@@ -1,0 +1,282 @@
+--- a/src/runtime/aggregate.cpp
++++ b/src/runtime/aggregate.cpp
+@@ -47,0 +48,21 @@
++
++namespace {
++// Counts are already shifted to the caller's destination bins. Keep source
++// bounds and validity dispatch outside the row loop, away from captured state
++// in the general aggregate evaluator.
++IBEX_NOINLINE void count_collect_groups(const std::uint32_t* groups, std::size_t rows,
++                                        const ValidityBitmap* validity,
++                                        std::size_t* counts) noexcept {
++    if (validity == nullptr) {
++        for (std::size_t row = 0; row < rows; ++row) {
++            ++counts[groups[row]];
++        }
++    } else {
++        for (std::size_t row = 0; row < rows; ++row) {
++            if ((*validity)[row]) {
++                ++counts[groups[row]];
++            }
++        }
++    }
++}
++}  // namespace
+@@ -1651,5 +1672 @@
+-                    for (std::size_t row = 0; row < rows; ++row) {
+-                        if (vb == nullptr || (*vb)[row]) {
+-                            ++offsets[row_gid[row] + 1];
+-                        }
+-                    }
++                    count_collect_groups(row_gid.data(), rows, vb, offsets.data() + 1);
+--- a/src/runtime/join_chunked.cpp
++++ b/src/runtime/join_chunked.cpp
+@@ -1428,0 +1429,2 @@
++                    const auto* codes = c_cat->codes_data();
++                    const auto* heads = probe_code_heads_.data();
+@@ -1431,2 +1433,2 @@
+-                        [&](std::size_t i) {
+-                            return probe_code_heads_[static_cast<std::size_t>(c_cat->code_at(i))];
++                        [codes, heads](std::size_t i) {
++                            return heads[static_cast<std::size_t>(codes[i])];
+--- a/src/runtime/aggregate_chunked.cpp
++++ b/src/runtime/aggregate_chunked.cpp
+@@ -6928,0 +6929,111 @@
++    // A physical Float64 column has no integer-reader metadata. Bind shape,
++    // validity and slot strides once, so unused integer paths cannot inflate
++    // its row-loop register state.
++    template <typename GidT, bool HasNulls>
++    IBEX_NOINLINE static void accumulate_double_column(
++        const GidT* gids, const double* data, const ValidityBitmap* validity, std::size_t begin,
++        std::size_t end, AggSlotCore* base, std::size_t n_aggs, std::size_t agg_i,
++        double* scratch_base, std::size_t scratch_stride, std::size_t scratch_offset,
++        ir::AggFunc func) {
++        const auto slot_for = [=](GidT g) -> AggSlotCore& {
++            return base[static_cast<std::size_t>(g) * n_aggs + agg_i];
++        };
++        const auto scratch_at = [=](GidT g) -> double* {
++            return scratch_base + static_cast<std::size_t>(g) * scratch_stride + scratch_offset;
++        };
++        switch (func) {
++            case ir::AggFunc::Sum:
++                for (std::size_t row = begin; row < end; ++row) {
++                    if constexpr (HasNulls) {
++                        if (!(*validity)[row])
++                            continue;
++                    }
++                    auto& slot = slot_for(gids[row]);
++                    slot.double_value += data[row];
++                    slot.mark_present();
++                }
++                break;
++            case ir::AggFunc::Mean:
++                for (std::size_t row = begin; row < end; ++row) {
++                    if constexpr (HasNulls) {
++                        if (!(*validity)[row])
++                            continue;
++                    }
++                    auto& slot = slot_for(gids[row]);
++                    slot.double_value += data[row];
++                    slot.count++;
++                }
++                break;
++            case ir::AggFunc::Min:
++                for (std::size_t row = begin; row < end; ++row) {
++                    if constexpr (HasNulls) {
++                        if (!(*validity)[row])
++                            continue;
++                    }
++                    auto& slot = slot_for(gids[row]);
++                    const double v = data[row];
++                    slot.double_value = slot.present() ? std::min(slot.double_value, v) : v;
++                    slot.mark_present();
++                }
++                break;
++            case ir::AggFunc::Max:
++                for (std::size_t row = begin; row < end; ++row) {
++                    if constexpr (HasNulls) {
++                        if (!(*validity)[row])
++                            continue;
++                    }
++                    auto& slot = slot_for(gids[row]);
++                    const double v = data[row];
++                    slot.double_value = slot.present() ? std::max(slot.double_value, v) : v;
++                    slot.mark_present();
++                }
++                break;
++            case ir::AggFunc::Stddev:
++                for (std::size_t row = begin; row < end; ++row) {
++                    if constexpr (HasNulls) {
++                        if (!(*validity)[row])
++                            continue;
++                    }
++                    agg_update_stddev(slot_for(gids[row]), scratch_at(gids[row])[0], data[row]);
++                }
++                break;
++            case ir::AggFunc::Skew:
++            case ir::AggFunc::Kurtosis:
++                for (std::size_t row = begin; row < end; ++row) {
++                    if constexpr (HasNulls) {
++                        if (!(*validity)[row])
++                            continue;
++                    }
++                    double* scr = scratch_at(gids[row]);
++                    agg_update_moments(slot_for(gids[row]), scr[0], scr[1], scr[2], data[row]);
++                }
++                break;
++            case ir::AggFunc::First:
++                for (std::size_t row = begin; row < end; ++row) {
++                    if constexpr (HasNulls) {
++                        if (!(*validity)[row])
++                            continue;
++                    }
++                    auto& slot = slot_for(gids[row]);
++                    if (!slot.present()) {
++                        slot.double_value = data[row];
++                        slot.mark_present();
++                    }
++                }
++                break;
++            case ir::AggFunc::Last:
++                for (std::size_t row = begin; row < end; ++row) {
++                    if constexpr (HasNulls) {
++                        if (!(*validity)[row])
++                            continue;
++                    }
++                    auto& slot = slot_for(gids[row]);
++                    slot.double_value = data[row];
++                    slot.mark_present();
++                }
++                break;
++            default:
++                break;
++        }
++    }
++
+@@ -7001,80 +7112,10 @@
+-                switch (plan_[agg_i].func) {
+-                    case ir::AggFunc::Sum:
+-                        for (std::size_t row = begin; row < rows; ++row) {
+-                            if (has_nulls && !(*validity)[row])
+-                                continue;
+-                            auto& slot = slot_for(gids[row]);
+-                            slot.double_value += data[row];
+-                            slot.mark_present();
+-                        }
+-                        break;
+-                    case ir::AggFunc::Mean:
+-                        for (std::size_t row = begin; row < rows; ++row) {
+-                            if (has_nulls && !(*validity)[row])
+-                                continue;
+-                            auto& slot = slot_for(gids[row]);
+-                            slot.double_value += data[row];
+-                            slot.count++;
+-                        }
+-                        break;
+-                    case ir::AggFunc::Min:
+-                        for (std::size_t row = begin; row < rows; ++row) {
+-                            if (has_nulls && !(*validity)[row])
+-                                continue;
+-                            auto& slot = slot_for(gids[row]);
+-                            const double v = data[row];
+-                            slot.double_value = slot.present() ? std::min(slot.double_value, v) : v;
+-                            slot.mark_present();
+-                        }
+-                        break;
+-                    case ir::AggFunc::Max:
+-                        for (std::size_t row = begin; row < rows; ++row) {
+-                            if (has_nulls && !(*validity)[row])
+-                                continue;
+-                            auto& slot = slot_for(gids[row]);
+-                            const double v = data[row];
+-                            slot.double_value = slot.present() ? std::max(slot.double_value, v) : v;
+-                            slot.mark_present();
+-                        }
+-                        break;
+-                    case ir::AggFunc::Stddev:
+-                        for (std::size_t row = begin; row < rows; ++row) {
+-                            if (has_nulls && !(*validity)[row])
+-                                continue;
+-                            agg_update_stddev(slot_for(gids[row]), scratch_at(gids[row])[0],
+-                                              data[row]);
+-                        }
+-                        break;
+-                    case ir::AggFunc::Skew:
+-                    case ir::AggFunc::Kurtosis:
+-                        for (std::size_t row = begin; row < rows; ++row) {
+-                            if (has_nulls && !(*validity)[row])
+-                                continue;
+-                            double* scr = scratch_at(gids[row]);
+-                            agg_update_moments(slot_for(gids[row]), scr[0], scr[1], scr[2],
+-                                               data[row]);
+-                        }
+-                        break;
+-                    case ir::AggFunc::First:
+-                        for (std::size_t row = begin; row < rows; ++row) {
+-                            if (has_nulls && !(*validity)[row])
+-                                continue;
+-                            auto& slot = slot_for(gids[row]);
+-                            if (!slot.present()) {
+-                                slot.double_value = data[row];
+-                                slot.mark_present();
+-                            }
+-                        }
+-                        break;
+-                    case ir::AggFunc::Last:
+-                        for (std::size_t row = begin; row < rows; ++row) {
+-                            if (has_nulls && !(*validity)[row])
+-                                continue;
+-                            auto& slot = slot_for(gids[row]);
+-                            slot.double_value = data[row];
+-                            slot.mark_present();
+-                        }
+-                        break;
+-                    default:
+-                        break;
+-                }
++                if (has_nulls) {
++                    accumulate_double_column<GidT, true>(
++                        gids, data, validity, begin, rows, fs, n_aggs_, agg_i, scratch_base,
++                        scratch_stride_, scratch_offset_[agg_i], plan_[agg_i].func);
++                } else {
++                    accumulate_double_column<GidT, false>(
++                        gids, data, validity, begin, rows, fs, n_aggs_, agg_i, scratch_base,
++                        scratch_stride_, scratch_offset_[agg_i], plan_[agg_i].func);
++                }
++                continue;
+--- a/src/runtime/kernel_gather.hpp
++++ b/src/runtime/kernel_gather.hpp
+@@ -13,0 +14 @@
++#include <cstdlib>
+@@ -14,0 +16 @@
++#include <string_view>
+@@ -25,0 +28,5 @@
++
++inline const bool diagnostic_unroll_gather = [] {
++    const char* flag = std::getenv("IBEX_DIAG_UNROLL_GATHER");
++    return flag != nullptr && std::string_view(flag) == "1";
++}();
+@@ -75,0 +83,23 @@
++                if (diagnostic_unroll_gather) {
++                    std::size_t j = 0;
++                    for (std::size_t w = 0; w < sel.word_count; ++w) {
++                        std::uint64_t bits = sel.words[w];
++                        const std::size_t base = sel.row_base + (w * 64);
++                        auto remaining = std::popcount(bits);
++                        while (remaining >= 4) {
++                            for (std::size_t k = 0; k < 4; ++k) {
++                                const auto bit = static_cast<std::size_t>(std::countr_zero(bits));
++                                dp[j + k] = src[base + bit];
++                                bits &= (bits - 1);
++                            }
++                            j += 4;
++                            remaining -= 4;
++                        }
++                        while (bits != 0) {
++                            const auto bit = static_cast<std::size_t>(std::countr_zero(bits));
++                            dp[j++] = src[base + bit];
++                            bits &= (bits - 1);
++                        }
++                    }
++                    return;
++                }

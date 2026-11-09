@@ -1,0 +1,39 @@
+--- a/src/runtime/aggregate.cpp
++++ b/src/runtime/aggregate.cpp
+@@ -47,0 +48,21 @@
++
++namespace {
++// Counts are already shifted to the caller's destination bins. Keep source
++// bounds and validity dispatch outside the row loop, away from captured state
++// in the general aggregate evaluator.
++IBEX_NOINLINE void count_collect_groups(const std::uint32_t* groups, std::size_t begin,
++                                        std::size_t end, const ValidityBitmap* validity,
++                                        std::size_t* counts) noexcept {
++    if (validity == nullptr) {
++        for (std::size_t row = begin; row < end; ++row) {
++            ++counts[groups[row]];
++        }
++    } else {
++        for (std::size_t row = begin; row < end; ++row) {
++            if ((*validity)[row]) {
++                ++counts[groups[row]];
++            }
++        }
++    }
++}
++}  // namespace
+@@ -1651,3 +1672,11 @@
+-                    for (std::size_t row = 0; row < rows; ++row) {
+-                        if (vb == nullptr || (*vb)[row]) {
+-                            ++offsets[row_gid[row] + 1];
++                    static const bool bind_counts = [] {
++                        const char* flag = std::getenv("IBEX_DIAG_BIND_COLLECT_COUNTS");
++                        return flag != nullptr && std::string_view(flag) == "1";
++                    }();
++                    if (bind_counts) {
++                        count_collect_groups(row_gid.data(), 0, rows, vb, offsets.data() + 1);
++                    } else {
++                        for (std::size_t row = 0; row < rows; ++row) {
++                            if (vb == nullptr || (*vb)[row]) {
++                                ++offsets[row_gid[row] + 1];
++                            }

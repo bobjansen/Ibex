@@ -219,7 +219,7 @@ at one thread, and 618.7 to 510.2 ms at eight threads. This establishes a
 materialized-join benefit, not a general arithmetic or whole-suite speedup.
 Raw samples and binary hash (`compact-query-results.json`, local raw output).
 
-## Existing-workload regression gate
+## Historical existing-workload regression gate
 
 `compare_ibex_git.sh` compared HEAD to WORKTREE with balanced interleaving,
 12 repeats, five inner iterations, one pinned core, explicit datasets and an
@@ -227,9 +227,9 @@ unchanged replica build. Both baseline binaries were byte-identical. The
 23-query core/filter/join/groupagg slice was ~0.94% slower in summed medians.
 Paired analysis flags `std_by_symbol` at +7.5% (p=0.00049, Holm p=0.011 over
 23 comparisons), with +6.8% against the unchanged control. Median and quantile
-also show smaller resolved effects in this final run. These regressions are not
-cleared. Their mechanism is not yet attributed; code layout/inlining remains a
-hypothesis rather than a finding.
+also show smaller resolved effects in this final run. At that checkpoint these regressions were not
+cleared. Their mechanism was not attributed; code layout/inlining remained a
+hypothesis rather than a finding. The repair results below supersede that status.
 
 A prior longer, focused 24-pair rerun also showed std +6.1% (p=0.010), while
 its unchanged control had no resolved difference. The shell comparison's
@@ -258,8 +258,8 @@ IBEX_COMPACT_INT32=1 IBEX_CORES=8 build-release/tools/ibex_eval \
   --plugin-path build-release/tools query.ibex
 ```
 
-Before promotion: profile the existing-workload regressions and measure real
-Parquet arithmetic workloads, including peak memory. The operation-owned
+Before promotion: resolve the remaining arithmetic-filter uncertainty described
+below and measure real Parquet arithmetic workloads, including peak memory. The operation-owned
 contiguous-arithmetic conversion is explicit but still costs a copy; typed
 readers can also affect generated code and must pass the performance gate.
 
@@ -295,3 +295,35 @@ changes after Holm correction. Compact ingestion remains opt-in, and the
 broader historical gate is not cleared by this filter-only result.
 
 See [the design, checks, reproducible drivers and raw samples](../benchmarking/int32/filter-storage/README.md).
+
+
+## Aggregate and categorical-probe regression repair
+
+The follow-up keeps storage decisions and captured metadata out of row loops:
+collected aggregation binds bounds and validity before counting group bins;
+Float64 accumulation runs in a separate kernel with explicit bounds and slot
+strides; categorical dictionary-memo joins bind code/head pointers once. There
+are no additional integer-width cases in these loops and arithmetic is unchanged.
+
+Against the original pre-Int32 native baseline `c4489863`, the final 23-query,
+20-pair one-core comparison puts median/quantile 0.50%/0.62% ahead, OHLC 18.54%
+ahead and categorical join 15.11% ahead. These survive Holm correction. The
+historical std regression does not reproduce; the final build is 2.93% ahead,
+without attributing that entire cross-build effect to these edits. Same-executable
+switch experiments independently support the retained count, Float64 and probe
+changes; attempted scatter, predicate-outline and gather-unroll changes were
+measured and discarded.
+
+At eight cores, a 12-pair 23-query gate resolves an OHLC improvement of 14.53%
+(11.27% including parse); the other comparisons are unresolved. Full typed
+answers for all 23 queries match the original at both core budgets and both
+ingestion settings. Both modes pass 2,488 fast runtime tests and 133 Python
+integration tests; standalone Arrow checks and the strict GCC runtime build pass.
+
+The one-core arithmetic-filter estimate remains +1.54%, Holm p=0.179. Its
+predicate's normalized instructions match the original, and neither tested
+filter change helped. This remains an open performance question, not evidence
+of equivalence. Compact ingestion stays opt-in; the broader promotion gate
+remains open on that uncertainty and real Parquet arithmetic/memory coverage.
+
+See the [diagnosis, reproducible scripts, counterfactual patches and raw results](../benchmarking/int32/aggregate-regressions/README.md).

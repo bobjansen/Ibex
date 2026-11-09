@@ -1,0 +1,83 @@
+--- a/src/runtime/aggregate.cpp
++++ b/src/runtime/aggregate.cpp
+@@ -47,0 +48,38 @@
++
++namespace {
++// Counts are already shifted to the caller's destination bins. Keep source
++// bounds and validity dispatch outside the row loop, away from captured state
++// in the general aggregate evaluator.
++IBEX_NOINLINE void count_collect_groups(const std::uint32_t* groups, std::size_t begin,
++                                        std::size_t end, const ValidityBitmap* validity,
++                                        std::size_t* counts) noexcept {
++    if (validity == nullptr) {
++        for (std::size_t row = begin; row < end; ++row) {
++            ++counts[groups[row]];
++        }
++    } else {
++        for (std::size_t row = begin; row < end; ++row) {
++            if ((*validity)[row]) {
++                ++counts[groups[row]];
++            }
++        }
++    }
++}
++template <typename T>
++IBEX_NOINLINE void scatter_collect_values(const T* values, const std::uint32_t* groups,
++                                          std::size_t begin, std::size_t end,
++                                          const ValidityBitmap* validity, std::size_t* next,
++                                          double* output) noexcept {
++    if (validity == nullptr) {
++        for (std::size_t row = begin; row < end; ++row) {
++            output[next[groups[row]]++] = static_cast<double>(values[row]);
++        }
++    } else {
++        for (std::size_t row = begin; row < end; ++row) {
++            if ((*validity)[row]) {
++                output[next[groups[row]]++] = static_cast<double>(values[row]);
++            }
++        }
++    }
++}
++}  // namespace
+@@ -1651,5 +1689 @@
+-                    for (std::size_t row = 0; row < rows; ++row) {
+-                        if (vb == nullptr || (*vb)[row]) {
+-                            ++offsets[row_gid[row] + 1];
+-                        }
+-                    }
++                    count_collect_groups(row_gid.data(), 0, rows, vb, offsets.data() + 1);
+@@ -1682,4 +1716,30 @@
+-                if (const auto* dc = std::get_if<Column<double>>(&col)) {
+-                    scatter(*dc);
+-                } else if (const auto* ic = std::get_if<Column<std::int64_t>>(&col)) {
+-                    scatter(*ic);
++                static const bool bind_scatter = [] {
++                    const char* flag = std::getenv("IBEX_DIAG_BIND_COLLECT_SCATTER");
++                    return flag != nullptr && std::string_view(flag) == "1";
++                }();
++                if (bind_scatter) {
++                    const auto bound_scatter = [&](const auto* values) {
++                        if (parallel_collect) {
++                            for_row_range(
++                                range_workers, [&](std::size_t r, std::size_t b, std::size_t e) {
++                                    scatter_collect_values(values, row_gid.data(), b, e, vb,
++                                                           range_cursor.data() + r * n_groups,
++                                                           buf.data());
++                                });
++                        } else {
++                            scatter_collect_values(values, row_gid.data(), 0, rows, vb,
++                                                   cursor.data(), buf.data());
++                        }
++                    };
++                    if (const auto* dc = std::get_if<Column<double>>(&col)) {
++                        bound_scatter(dc->data());
++                    } else if (const auto* ic = std::get_if<Column<std::int64_t>>(&col)) {
++                        ic->visit_integer_storage(
++                            [&](auto values) { bound_scatter(values.data()); });
++                    }
++                } else {
++                    if (const auto* dc = std::get_if<Column<double>>(&col)) {
++                        scatter(*dc);
++                    } else if (const auto* ic = std::get_if<Column<std::int64_t>>(&col)) {
++                        scatter(*ic);
++                    }

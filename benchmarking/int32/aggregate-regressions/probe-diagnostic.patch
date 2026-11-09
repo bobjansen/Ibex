@@ -1,0 +1,64 @@
+--- a/src/runtime/aggregate.cpp
++++ b/src/runtime/aggregate.cpp
+@@ -47,0 +48,21 @@
++
++namespace {
++// Counts are already shifted to the caller's destination bins. Keep source
++// bounds and validity dispatch outside the row loop, away from captured state
++// in the general aggregate evaluator.
++IBEX_NOINLINE void count_collect_groups(const std::uint32_t* groups, std::size_t rows,
++                                        const ValidityBitmap* validity,
++                                        std::size_t* counts) noexcept {
++    if (validity == nullptr) {
++        for (std::size_t row = 0; row < rows; ++row) {
++            ++counts[groups[row]];
++        }
++    } else {
++        for (std::size_t row = 0; row < rows; ++row) {
++            if ((*validity)[row]) {
++                ++counts[groups[row]];
++            }
++        }
++    }
++}
++}  // namespace
+@@ -1651,5 +1672 @@
+-                    for (std::size_t row = 0; row < rows; ++row) {
+-                        if (vb == nullptr || (*vb)[row]) {
+-                            ++offsets[row_gid[row] + 1];
+-                        }
+-                    }
++                    count_collect_groups(row_gid.data(), rows, vb, offsets.data() + 1);
+--- a/src/runtime/join_chunked.cpp
++++ b/src/runtime/join_chunked.cpp
+@@ -53,0 +54 @@
++#include <cstdlib>
+@@ -1429,6 +1430,22 @@
+-                    li_identity = probe_resolved(
+-                        n,
+-                        [&](std::size_t i) {
+-                            return probe_code_heads_[static_cast<std::size_t>(c_cat->code_at(i))];
+-                        },
+-                        li, ri);
++                    static const bool bind_probe = [] {
++                        const char* flag = std::getenv("IBEX_DIAG_BIND_CAT_PROBE");
++                        return flag != nullptr && std::string_view(flag) == "1";
++                    }();
++                    if (bind_probe) {
++                        const auto* codes = c_cat->codes_data();
++                        const auto* heads = probe_code_heads_.data();
++                        li_identity = probe_resolved(
++                            n,
++                            [codes, heads](std::size_t i) {
++                                return heads[static_cast<std::size_t>(codes[i])];
++                            },
++                            li, ri);
++                    } else {
++                        li_identity = probe_resolved(
++                            n,
++                            [&](std::size_t i) {
++                                return probe_code_heads_[static_cast<std::size_t>(
++                                    c_cat->code_at(i))];
++                            },
++                            li, ri);
++                    }

@@ -1,8 +1,9 @@
 # Native compact Int32 storage
 
-Status: prototype implemented on `experiment/native-int32`; correctness gates
-pass. Existing-workload performance gate remains open. Do not merge or enable
-by default until the measured regressions are understood.
+Status: integrated into the main `python` branch in c68a8288, including the
+validated physical-pointer gather fix. Compact ingestion remains opt-in through
+`IBEX_COMPACT_INT32=1`; the broader existing-workload performance gate remains
+open. Integration does not enable compact ingestion by default.
 
 ## Design constraint update
 

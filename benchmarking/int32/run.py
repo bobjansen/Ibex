@@ -14,8 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ab_queries import wilcoxon_p
 
 p=argparse.ArgumentParser(description=__doc__)
-p.add_argument('--base',type=Path,default=Path('/tmp/ibex-native-width64'))
-p.add_argument('--target',type=Path,default=Path('/tmp/ibex-native-width32'))
+p.add_argument('--base',type=Path,default=Path('build-release/ibex-native-width64'))
+p.add_argument('--target',type=Path,default=Path('build-release/ibex-native-width32'))
 p.add_argument('--rows',nargs='+',type=int,default=[1000000,10000000])
 p.add_argument('--groups',nargs='+',type=int,default=[1000,100000])
 p.add_argument('--iters',type=int,default=12)

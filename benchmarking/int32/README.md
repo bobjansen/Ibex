@@ -1,7 +1,7 @@
 # Native Int32 storage experiment
 
-Branch: `experiment/native-int32`, based on the `python` branch at d123a11f.
-The original checkout's uncommitted Python work is preserved separately.
+Developed on `experiment/native-int32` from d123a11f, then integrated into the
+main `python` branch in c68a8288 alongside the earlier Python work.
 
 This experiment compiles the same C++ source twice with `Value=int32_t` and
 `Value=int64_t`. It uses Ibex's existing `Column<T>` implementation, including
@@ -55,7 +55,7 @@ export ROBIN_HOOD_INCLUDE="$PWD/build-release/_deps/robin_hood-src/src/include"
 for bits in 32 64; do
   clang++ -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wconversion -Wshadow \
     -Werror -I include -isystem "$ROBIN_HOOD_INCLUDE" -DVALUE_BITS=$bits \
-    benchmarking/int32/native_width.cpp -o /tmp/ibex-native-width$bits
+    benchmarking/int32/native_width.cpp -o build-release/ibex-native-width$bits
 done
 cmake --build build-release -j6
 taskset -c 2 .venv/bin/python benchmarking/int32/run.py --out benchmarking/results/local/int32/native-widths-rerun.json
@@ -71,7 +71,7 @@ Compact integer backing is now implemented on this branch behind
 `IBEX_COMPACT_INT32=1`, with Int64 logical/arithmetic semantics. See
 [the implementation plan](../../plans/native-int32-storage.md) for guarantees,
 correctness checks, actual interpreter-query measurements and the unresolved
-existing-workload regression. It is an experiment, not cleared for merging.
+existing-workload regression. It remains opt-in while the broader performance gate is open.
 
 The actual query control is `tools/bench_compact_int32.cpp`; its driver is:
 

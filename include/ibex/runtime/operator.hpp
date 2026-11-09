@@ -243,6 +243,8 @@ inline void append_column_values(ColumnValue& dst_value, const ColumnValue& src_
                 for (std::size_t r = 0; r < src.size(); ++r) {
                     dst.push_back(src[r]);
                 }
+            } else if constexpr (std::is_same_v<Col, Column<std::int64_t>>) {
+                dst.append_integer_values(src);
             } else {
                 (void)dst.insert(dst.end(), src.begin(), src.end());
             }

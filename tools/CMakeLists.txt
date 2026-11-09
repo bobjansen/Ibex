@@ -263,3 +263,7 @@ endif()
 install(TARGETS ibex_eval_bin
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
 )
+
+# Native compact-storage experiment: actual join operator with fixed Int64 keys.
+add_executable(ibex_bench_compact_int32 bench_compact_int32.cpp)
+target_link_libraries(ibex_bench_compact_int32 PRIVATE Ibex::parser Ibex::runtime Ibex::CompilerOptions)

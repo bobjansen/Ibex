@@ -31,6 +31,7 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
+#include <ibex/runtime/env.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/operator.hpp>
@@ -761,6 +762,24 @@ inline void populate_from_arrow_table(const std::shared_ptr<arrow::Table>& table
         };
         // Restore the zero-at-a-null-slot invariant that the bulk value copy
         // does not maintain. A no-op when the column has no nulls.
+        if (col->type()->id() == arrow::Type::INT32 && ibex::runtime::compact_int32_enabled()) {
+            if (col->num_chunks() == 1 && col->null_count() == 0) {
+                const auto& ints = static_cast<const arrow::Int32Array&>(*col->chunk(0));
+                emit(ibex::Column<std::int64_t>::from_external_int32(
+                    col->chunk(0), ints.raw_values(), static_cast<std::size_t>(ints.length())));
+                continue;
+            }
+            ibex::detail::NoInitVector<std::int32_t> values;
+            values.reserve(static_cast<std::size_t>(col->length()));
+            for (const auto& chunk : col->chunks()) {
+                const auto& ints = static_cast<const arrow::Int32Array&>(*chunk);
+                for (std::int64_t row = 0; row < ints.length(); ++row) {
+                    values.push_back(ints.IsNull(row) ? 0 : ints.Value(row));
+                }
+            }
+            emit(ibex::Column<std::int64_t>::from_compact_int32(std::move(values)));
+            continue;
+        }
         switch (col->type()->id()) {
             case arrow::Type::INT8:
             case arrow::Type::INT16:
@@ -2378,6 +2397,25 @@ inline auto plan_sharded_column(parquet::arrow::FileReader& reader, const arrow:
     ShardedColumn planned;
     planned.entry.name = field.name();
     const auto id = field.type()->id();
+    if (id == arrow::Type::INT32 && ibex::runtime::compact_int32_enabled()) {
+        auto col = ibex::Column<std::int64_t>::from_compact_int32(
+            ibex::detail::NoInitVector<std::int32_t>(output_rows));
+        auto* base = col.compact_int32_output();
+        planned.entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(col));
+        planned.decode_range = [base, leaf_index, selection](parquet::arrow::FileReader& reader,
+                                                             const DirectDecodeGroups& range,
+                                                             std::size_t start, std::size_t rows) {
+            DirectValidity validity(rows);
+            const auto emitted = decode_numeric_into<parquet::Int32Type, std::int32_t, true>(
+                reader, leaf_index, selection, range, base + start, rows, validity,
+                [](std::int32_t value) { return value; });
+            if (emitted != rows || validity.position != rows || validity.has_null) {
+                throw std::runtime_error("compact Parquet decode row-count/null mismatch");
+            }
+            return emitted;
+        };
+        return planned;
+    }
     switch (id) {
         case arrow::Type::INT8:
         case arrow::Type::INT16:
@@ -2472,6 +2510,17 @@ inline auto direct_column(parquet::arrow::FileReader& reader, const arrow::Field
             throw std::runtime_error("parquet::read: decoded column has the wrong row count");
         }
     };
+
+    if (field.type()->id() == arrow::Type::INT32 && ibex::runtime::compact_int32_enabled()) {
+        auto out = ibex::Column<std::int64_t>::from_compact_int32(
+            ibex::detail::NoInitVector<std::int32_t>(output_rows));
+        verify(decode_numeric_into<parquet::Int32Type, std::int32_t, true>(
+            reader, leaf_index, selection, groups, out.compact_int32_output(), output_rows,
+            validity, [](std::int32_t value) { return value; }));
+        entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(out));
+        entry.validity = std::move(validity).finish();
+        return entry;
+    }
 
     switch (field.type()->id()) {
         case arrow::Type::INT8:

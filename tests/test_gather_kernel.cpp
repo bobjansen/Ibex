@@ -361,3 +361,17 @@ TEST_CASE("word-block gather keeps every survivor at every density and stays in 
         }
     }
 }
+
+TEST_CASE("compact integer gather retains width without narrowing values",
+          "[compact-int32][gather]") {
+    runtime::ColumnValue source =
+        Column<std::int64_t>::from_compact_int32({INT32_MIN, INT32_MAX, 2000000000});
+    const std::vector<std::size_t> indices{2, 0, 1, 2};
+    auto result = runtime::gather_column(source, indices.data(), indices.size(), nullptr);
+    const auto& output = std::get<Column<std::int64_t>>(result);
+    REQUIRE(output.is_compact_int32());
+    REQUIRE(output.compact_int32_data()[0] == 2000000000);
+    REQUIRE(output[1] == INT64_C(-2147483648));
+    REQUIRE(output[2] == INT64_C(2147483647));
+    REQUIRE(output[0] + output[3] == INT64_C(4000000000));
+}

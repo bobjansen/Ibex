@@ -10,9 +10,9 @@ runtime. Scan and random gather are direct typed loops; group is a count-map
 control, not the complete runtime aggregate operator. No Polars or Python data
 conversion runs inside the measured workload. Python only orchestrates workers.
 
-The interpreter still stores integer columns as Int64. This is evidence about
+For this original control, the interpreter stored integer columns as Int64. This is evidence about
 native storage/kernel potential, not a working Int32 interpreter build or an
-end-to-end query speedup. Production sources are unchanged, so it does not yet
+end-to-end query speedup. This control did not change production sources, so it does not
 measure dispatch/code-size effects from integrating another runtime column type.
 
 ## Results
@@ -58,19 +58,47 @@ for bits in 32 64; do
     benchmarking/int32/native_width.cpp -o /tmp/ibex-native-width$bits
 done
 cmake --build build-release -j6
-taskset -c 2 .venv/bin/python benchmarking/int32/run.py --out /tmp/native-widths.json
+taskset -c 2 .venv/bin/python benchmarking/int32/run.py --out benchmarking/results/local/int32/native-widths-rerun.json
 ```
 
 The coordinator uses `benchmarking/ab_queries.py`'s Wilcoxon implementation.
 The source is templated identically for both builds and needs no runtime
 per-row width branches. Cross-type answers are compared after every sample.
 
-## Next native experiment
+## Native runtime prototype
 
-Preserve compact integer payload storage through a native filter/join while
-retaining existing Int64 logical/arithmetic semantics and key handling. Measure
-actual query gains, null handling and promotion costs. Use the required git-state
-A/B harness and Int64 regression suite once runtime code changes; the current
-experiment changes no runtime hot path. Evaluate compact hash keys separately,
-including real entry sizes and operator profiles, before increasing dispatch
-coverage. A global Int32 replacement is not justified by these controls.
+Compact integer backing is now implemented on this branch behind
+`IBEX_COMPACT_INT32=1`, with Int64 logical/arithmetic semantics. See
+[the implementation plan](../../plans/native-int32-storage.md) for guarantees,
+correctness checks, actual interpreter-query measurements and the unresolved
+existing-workload regression. It is an experiment, not cleared for merging.
+
+The actual query control is `tools/bench_compact_int32.cpp`; its driver is:
+
+```bash
+cmake --build build-release -j6
+.venv/bin/python benchmarking/int32/run_compact_join.py \
+  --out benchmarking/results/local/int32/native-compact-query-rerun.json
+```
+
+It parses `lhs join rhs on id` and executes it through `runtime::interpret`,
+with Int64 keys, shuffled left keys, three right payloads and complete output
+association checks. It honors both one- and eight-thread compute budgets.
+The earlier direct `join_tables` wrapper control was serial regardless of
+`IBEX_CORES`; its timings are not used as parallel-query evidence.
+
+`check_parquet.py` checks native file decoding/results across compact on/off,
+one/eight threads and an optional original engine. `check_mutation.py` runs
+the original seven compact test cases against a separately compiled corrupt producer.
+`paired_report.py` analyzes retained git-comparison repeat files using paired
+Wilcoxon tests and an unchanged control, rather than the shell harness's
+IQR-based display label. Final raw sample arrays are checked in alongside
+these scripts.
+
+The ingestion follow-up preserves physical Int32 in the serial Parquet decoder,
+including nullable/selected reads, and adopts owned Arrow Int32 buffers.
+`check_ingestion.py --arrow-build <configured-release-build> --mutations`
+rebuilds the matching Parquet plugin and runs physical-width/lifetime tests
+against an existing Arrow dependency. It also demonstrates that restoring eager
+serial widening makes the tests fail. See the plan for validation and remaining
+storage migration work.

@@ -403,6 +403,12 @@ inline auto make_gather_column(const ColumnValue& src, std::size_t rows) -> Colu
         std::visit(
             [&](const auto& col) -> ColumnValue {
                 using ColT = std::decay_t<decltype(col)>;
+                if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
+                    if (col.is_compact_int32()) {
+                        return ColT::from_compact_int32(
+                            ::ibex::detail::NoInitVector<std::int32_t>(rows));
+                    }
+                }
                 if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
                     // Shares the source dictionary; only the codes are gathered.
                     return col.with_codes(Column<Categorical>::codes_storage(rows));
@@ -518,6 +524,16 @@ void gather_range_into(ColumnValue& dst_v, const ColumnValue& src_v, std::span<c
                         dst->set(pos, src[static_cast<std::size_t>(idx[pos])]);
                     }
                 } else {
+                    if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
+                        if (src.is_compact_int32()) {
+                            auto* dp = dst->compact_int32_output();
+                            const auto* sp = src.compact_int32_data();
+                            for (std::size_t pos = lo; pos < hi; ++pos) {
+                                dp[pos] = sp[static_cast<std::size_t>(idx[pos])];
+                            }
+                            return;
+                        }
+                    }
                     auto* dp = dst->data();
                     const auto* sp = src.data();
                     for (std::size_t pos = lo; pos < hi; ++pos) {

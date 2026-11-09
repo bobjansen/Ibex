@@ -43,32 +43,32 @@ struct OutputSpan {
 /// the engine's native mask word-at-a-time — the exact loop
 /// `gather_selection_into` ran before this kernel existed, so porting onto it
 /// is behavior- and performance-neutral by construction.
-template <typename T>
+template <typename Input, typename T>
     requires std::is_trivially_copyable_v<T>
-auto gather_selected(ColumnView<T> src, const Selection& selection, OutputSpan<T> out) noexcept
-    -> void {
+auto gather_selected_values(const Input* src, std::size_t rows, const Selection& selection,
+                            OutputSpan<T> out) noexcept -> void {
     std::visit(
-        [&](const auto& sel) {
+        [=](const auto& sel) {
             using S = std::decay_t<decltype(sel)>;
             T* dp = out.data + out.begin;
             if constexpr (std::is_same_v<S, RowRange>) {
                 if (out.count != 0) {
-                    if (const auto* contiguous = src.data()) {
-                        std::memcpy(dp, contiguous + sel.begin, out.count * sizeof(T));
+                    if constexpr (std::is_same_v<Input, T>) {
+                        std::memcpy(dp, src + sel.begin, out.count * sizeof(T));
                     } else {
                         for (std::size_t row = 0; row < out.count; ++row)
-                            dp[row] = src.value(sel.begin + row);
+                            dp[row] = src[sel.begin + row];
                     }
                 }
             } else if constexpr (std::is_same_v<S, RowIndices>) {
                 for (std::size_t i = 0; i < sel.count; ++i) {
-                    dp[i] = src.value(sel[i]);
+                    dp[i] = src[sel[i]];
                 }
             } else if constexpr (std::is_same_v<S, RowBitmap>) {
                 std::size_t j = 0;
-                for (std::size_t r = 0; r < src.rows(); ++r) {
+                for (std::size_t r = 0; r < rows; ++r) {
                     if (sel.test(r)) {
-                        dp[j++] = src.value(r);
+                        dp[j++] = src[r];
                     }
                 }
             } else {  // RowWordBlocks
@@ -78,13 +78,28 @@ auto gather_selected(ColumnView<T> src, const Selection& selection, OutputSpan<T
                     const std::size_t base = sel.row_base + (w * 64);
                     while (bits != 0) {
                         const auto bit = static_cast<std::size_t>(std::countr_zero(bits));
-                        dp[j++] = src.value(base + bit);
+                        dp[j++] = src[base + bit];
                         bits &= (bits - 1);
                     }
                 }
             }
         },
         selection);
+}
+
+/// Resolve the physical input width before selection iteration. The copy
+/// kernel receives a plain pointer, with no per-value width/iterator dispatch.
+template <typename T>
+    requires std::is_trivially_copyable_v<T>
+auto gather_selected(ColumnView<T> src, const Selection& selection, OutputSpan<T> out) noexcept
+    -> void {
+    if constexpr (std::is_same_v<T, std::int64_t>) {
+        if (const auto* compact = src.compact_data()) {
+            gather_selected_values(compact, src.rows(), selection, out);
+            return;
+        }
+    }
+    gather_selected_values(src.data(), src.rows(), selection, out);
 }
 
 // --- Bit-packed and variable-width representations -------------------------

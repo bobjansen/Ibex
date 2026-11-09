@@ -261,3 +261,18 @@ Before promotion: profile the existing-workload regressions and measure real
 Parquet arithmetic workloads, including peak memory. The operation-owned
 contiguous-arithmetic conversion is explicit but still costs a copy; typed
 readers can also affect generated code and must pass the performance gate.
+
+## Gather-loop follow-up
+
+The diagnosed wide-filter overhead has a focused implementation fix: kernel
+ColumnView stores physical base pointers, and gather chooses Int32/Int64 once
+before selection iteration. Neither width carries iterator-offset bookkeeping
+inside the selected-row loop. Native Release assembly has six instructions per
+selected value at both widths, with sign extension folded into the Int32 load.
+
+A 20-pair git A/B against cache-free checkpoint 6e1f4938, with unchanged replica
+control, improves the four wide CSV filters by 2.3–3.1%; all survive Holm
+correction and the control comparisons are unresolved. This addresses the
+localized gather regression without restoring a widening cache. It does not
+clear the entire Int32 performance gate or claim faster physical Int32 filtering.
+See the [implementation, validation and raw evidence](../benchmarking/int32/gather-loop/README.md).

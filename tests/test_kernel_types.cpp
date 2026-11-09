@@ -1085,6 +1085,65 @@ TEST_CASE("gather_selected over every selection shape agrees", "[kernel][gather]
     REQUIRE(d[3] == 105);
 }
 
+TEST_CASE("integer gather dispatches both widths before every selection shape",
+          "[kernel][gather][compact-int32]") {
+    using namespace ibex::runtime::kernel;
+    // Exercise sign extension, physical source offsets, nonzero output windows,
+    // duplicate/reordered indices, empty words, and more than one mask word.
+    std::vector<std::int32_t> physical(140);
+    for (std::size_t i = 0; i < physical.size(); ++i) {
+        physical[i] = i % 2 ? INT32_MIN : INT32_MAX;
+    }
+    for (const bool compact : {false, true}) {
+        CAPTURE(compact);
+        std::vector<std::int64_t> values(physical.begin(), physical.end());
+        if (!compact) {
+            values[4] = INT64_MAX;
+            values[5] = INT64_MIN;
+        }
+        auto column =
+            compact
+                ? Column<std::int64_t>::from_compact_int32(
+                      ibex::detail::NoInitVector<std::int32_t>(physical.begin(), physical.end()))
+                : Column<std::int64_t>(values);
+        const ColumnView<std::int64_t> view(column, nullptr);
+        REQUIRE(view.rows() == physical.size());
+        REQUIRE((view.compact_data() != nullptr) == compact);
+        REQUIRE((view.data() == nullptr) == compact);
+        REQUIRE(view.value(0) == INT32_MAX);
+        REQUIRE(view.value(1) == INT32_MIN);
+        const std::vector<std::size_t> indices{72, 2, 72, 1};
+        ibex::runtime::ValidityBitmap bitmap;
+        for (std::size_t i = 0; i < physical.size(); ++i) {
+            bitmap.push_back(i == 1 || i == 2 || i == 72);
+        }
+        const std::uint64_t words[]{0b110, 0, 0b1};
+        const std::vector<Selection> selections{
+            RowRange{.begin = 1, .end = 5},
+            RowIndices{.data = indices.data(), .count = indices.size()},
+            RowBitmap{&bitmap},
+            RowWordBlocks{.words = words, .word_count = 3, .row_base = 3},
+            RowRange{.begin = 0, .end = 0},
+            RowIndices{.data = nullptr, .count = 0},
+            RowWordBlocks{.words = nullptr, .word_count = 0, .row_base = 0}};
+        const std::vector<std::vector<std::size_t>> expected_rows{
+            {1, 2, 3, 4}, {72, 2, 72, 1}, {1, 2, 72}, {4, 5, 131}, {}, {}, {}};
+        for (std::size_t shape = 0; shape < selections.size(); ++shape) {
+            CAPTURE(shape);
+            const auto& selected = expected_rows[shape];
+            std::vector<std::int64_t> output(selected.size() + 4, -7);
+            gather_selected(view, selections[shape],
+                            OutputSpan<std::int64_t>{
+                                .data = output.data(), .begin = 2, .count = selected.size()});
+            std::vector<std::int64_t> expected(output.size(), -7);
+            for (std::size_t i = 0; i < selected.size(); ++i) {
+                expected[i + 2] = values[selected[i]];
+            }
+            REQUIRE(output == expected);
+        }
+    }
+}
+
 TEST_CASE("gather_selected honours the output offset for disjoint windows", "[kernel][gather]") {
     Column<std::int64_t> col{1, 2, 3, 4, 5, 6};
     using ibex::runtime::kernel::ColumnView;

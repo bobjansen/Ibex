@@ -67,6 +67,10 @@ def _left_rows(rows, source):
     """The rows of `source` a join's left row numbers name, in their order."""
     numbers = rows.to_numpy(zero_copy_only=False) if rows.null_count == 0 else None
     if numbers is not None and len(numbers) and (len(numbers) == 1 or (numbers[1:] > numbers[:-1]).all()):
+        # Strictly increasing, bounded indices covering the entire source are
+        # the identity permutation. Keep the original buffers and categories.
+        if len(numbers) == source.height and numbers[0] == 0 and numbers[-1] == source.height - 1:
+            return source
         # Each row at most once, in order: a filter, parallel over columns.
         keep = np.zeros(source.height, dtype=bool)
         keep[numbers] = True

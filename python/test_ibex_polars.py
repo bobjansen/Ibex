@@ -707,6 +707,17 @@ class EngineTests(unittest.TestCase):
             with self.subTest(query=query.explain()):
                 unordered(query)
 
+    def test_left_row_identity_preserves_buffers_and_order(self):
+        source = pl.DataFrame({"c": ["b", None, "a"], "v": [3, 1, 2]}).with_columns(
+            pl.col("c").cast(pl.Categorical))
+        self.assertIs(_engine._left_rows(pa.array([0, 1, 2]), source), source)
+        for indices in ([2, 0, 1], [0, 0, 2], [0, 2], [], [1]):
+            with self.subTest(indices=indices):
+                actual = _engine._left_rows(pa.array(indices, type=pa.int64()), source)
+                assert_frame_equal(actual, source[pl.Series(indices, dtype=pl.Int64)])
+        single = source.head(1)
+        self.assertIs(_engine._left_rows(pa.array([0]), single), single)
+
     def test_categorical_results_keep_their_polars_ids(self):
         # A result column that still carries the dictionary Ibex was given
         # maps its codes back to Polars ids: plus an offset when the ids are

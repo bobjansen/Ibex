@@ -83,3 +83,12 @@ docs/playground/
 # Optional pinned upstream conformance checkout and local reports.
 /.polars-upstream/
 /polars-conformance-results/
+
+# Generated benchmark runs stay local; version drivers and concise summaries.
+/benchmarking/results/local/
+/benchmarking/int32/**/*.json
+/plans/measurements/*.json
+/python/polars-engines-results/*/
+/python/pdsh-performance-results/
+/python/h2o-adapter-results/
+/python/join-performance-results/

@@ -4,6 +4,9 @@
 Statically typed DSL for columnar DataFrame/TimeFrame manipulation. Transpiles to C++23.
 Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named clauses.
 
+## Persistent storage
+- `/tmp` is for disposable temporary files and may be cleared at any time. Keep source changes, experiment worktrees, measurement results and durable notes in persistent storage. Use Git branches for experiments.
+
 ## Build
 - Clang 20, CMake 3.31+, Ninja. Debug/Release: `cmake -B build{-release} -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE={Debug,Release}`
 - **Always benchmark `build-release/`, not debug (4× slower)**

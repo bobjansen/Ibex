@@ -53,7 +53,12 @@ auto gather_selected(ColumnView<T> src, const Selection& selection, OutputSpan<T
             T* dp = out.data + out.begin;
             if constexpr (std::is_same_v<S, RowRange>) {
                 if (out.count != 0) {
-                    std::memcpy(dp, src.data() + sel.begin, out.count * sizeof(T));
+                    if (const auto* contiguous = src.data()) {
+                        std::memcpy(dp, contiguous + sel.begin, out.count * sizeof(T));
+                    } else {
+                        for (std::size_t row = 0; row < out.count; ++row)
+                            dp[row] = src.value(sel.begin + row);
+                    }
                 }
             } else if constexpr (std::is_same_v<S, RowIndices>) {
                 for (std::size_t i = 0; i < sel.count; ++i) {

@@ -1299,7 +1299,7 @@ auto export_column_schema(const runtime::ColumnEntry& entry, ArrowSchema* out_sc
         [&](const auto& col) -> std::expected<void, std::string> {
             using ColT = std::decay_t<decltype(col)>;
             if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
-                set_format("l");
+                set_format(col.is_compact_int32() ? "i" : "l");
             } else if constexpr (std::is_same_v<ColT, Column<double>>) {
                 set_format("g");
             } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
@@ -1369,6 +1369,30 @@ auto export_column_array(const runtime::ColumnEntry& entry,
                 entry.validity.has_value() ? count_nulls(*entry.validity) : 0;
 
             if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
+                if (col.is_compact_int32()) {
+                    auto state = std::make_unique<ArrayExportState>();
+                    const void* validity = nullptr;
+                    if (entry.validity.has_value()) {
+                        if (entry.validity->buffer_offset() == 0) {
+                            validity = entry.validity->buffer_data();
+                        } else {
+                            auto rebased =
+                                std::make_shared<runtime::ValidityBitmap>(col.size(), true);
+                            for (std::size_t row = 0; row < col.size(); ++row)
+                                rebased->set(row, (*entry.validity)[row]);
+                            validity = rebased->buffer_data();
+                            state->extra_owner = std::move(rebased);
+                        }
+                    }
+                    state->buffers_storage = {validity, col.compact_int32_data()};
+                    state->buffers = std::make_unique<const void*[]>(2);
+                    std::copy(state->buffers_storage.begin(), state->buffers_storage.end(),
+                              state->buffers.get());
+                    state->table_owner = std::move(owner);
+                    finalize_array(out_array, std::move(state),
+                                   static_cast<std::int64_t>(col.size()), null_count);
+                    return {};
+                }
                 auto state = primitive_buffers(entry, col);
                 if (!state) {
                     return std::unexpected(state.error());

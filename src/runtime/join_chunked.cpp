@@ -523,7 +523,7 @@ auto build_dense_int_heads(JoinHashIndex& index, const Column<std::int64_t>& col
         !dense_int_join_build_enabled().load(std::memory_order_relaxed)) {
         return false;
     }
-    const auto* data = col.data();
+    const auto data = value_reader(col);
     auto& pool = process_worker_pool();
     const std::size_t ranges = std::max<std::size_t>(1, std::min(pool.size(), partitions));
     const std::size_t grain = (n + ranges - 1) / ranges;
@@ -588,7 +588,7 @@ auto build_join_hash_index(const Table& build_side, const std::string& key_name,
         return index.validity != nullptr && !(*index.validity)[row];
     };
     const auto build_scalar = [&]<typename ColT, typename Heads>(const ColT& col, Heads& heads) {
-        const auto* data = col.data();
+        const auto data = value_reader(col);
         heads.partition(partitions);
         fill_partitioned_heads(
             heads, col.size(), [data](std::size_t r) { return data[r]; }, is_null, index.chain_next,
@@ -667,8 +667,8 @@ auto build_join_pair_index(const Column<std::int64_t>& col0, const Column<std::i
     index.key_kind = ExprType::Int;
     const std::size_t n = col0.size();
     index.chain_next.assign(n, kJoinNil);
-    const auto* d0 = col0.data();
-    const auto* d1 = col1.data();
+    const auto d0 = value_reader(col0);
+    const auto d1 = value_reader(col1);
     index.pair_heads.partition(partitions);
     fill_partitioned_heads(
         index.pair_heads, n,
@@ -1354,7 +1354,7 @@ struct JoinProbe {
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
-            const auto* data = col->data();
+            const auto data = value_reader(*col);
             if (const auto& dense = index().i64_dense; !dense.empty()) {
                 const auto lo = static_cast<std::uint64_t>(index().i64_dense_lo);
                 const std::size_t slots = dense.size();
@@ -1376,7 +1376,7 @@ struct JoinProbe {
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
-            const auto* data = col->data();
+            const auto data = value_reader(*col);
             li_identity =
                 probe_scalar(index().f64_heads, n, [&](std::size_t i) { return data[i]; }, li, ri);
         } else if (index().key_kind == ExprType::Bool) {
@@ -1391,7 +1391,7 @@ struct JoinProbe {
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
-            const auto* data = col->data();
+            const auto data = value_reader(*col);
             li_identity =
                 probe_scalar(index().date_heads, n, [&](std::size_t i) { return data[i]; }, li, ri);
         } else if (index().key_kind == ExprType::Timestamp) {
@@ -1399,7 +1399,7 @@ struct JoinProbe {
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
-            const auto* data = col->data();
+            const auto data = value_reader(*col);
             li_identity =
                 probe_scalar(index().ts_heads, n, [&](std::size_t i) { return data[i]; }, li, ri);
         } else if (index().key_kind == ExprType::Decimal) {
@@ -1413,7 +1413,7 @@ struct JoinProbe {
                     " vs " + decimal::type_name(index().dec_type) +
                     "; cast one side to the other's scale with Decimal(x, precision, scale)");
             }
-            const auto* data = col->data();
+            const auto data = value_reader(*col);
             li_identity =
                 probe_scalar(index().dec_heads, n, [&](std::size_t i) { return data[i]; }, li, ri);
         } else if (index().key_kind == ExprType::String) {
@@ -1479,8 +1479,8 @@ struct JoinProbe {
         li.reserve(n);
         ri.reserve(n);
 
-        const auto* d0 = col0->data();
-        const auto* d1 = col1->data();
+        const auto d0 = value_reader(*col0);
+        const auto d1 = value_reader(*col1);
         const auto is_null = [&](std::size_t r) {
             return (v0 != nullptr && !(*v0)[r]) || (v1 != nullptr && !(*v1)[r]);
         };
@@ -1610,14 +1610,14 @@ struct JoinProbe {
             const auto* col = std::get_if<Column<std::int64_t>>(rkey);
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
-            const auto* data = col->data();
+            const auto data = value_reader(*col);
             probe_swapped(
                 n_right, [&](std::size_t r) { return index().find_int_head(data[r]); }, li, ri);
         } else if (index().key_kind == ExprType::Double) {
             const auto* col = std::get_if<Column<double>>(rkey);
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
-            const auto* data = col->data();
+            const auto data = value_reader(*col);
             do_phase1([&](std::size_t r) { return data[r]; }, index().f64_heads);
         } else if (index().key_kind == ExprType::Bool) {
             const auto* col = std::get_if<Column<bool>>(rkey);
@@ -1628,13 +1628,13 @@ struct JoinProbe {
             const auto* col = std::get_if<Column<Date>>(rkey);
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
-            const auto* data = col->data();
+            const auto data = value_reader(*col);
             do_phase1([&](std::size_t r) { return data[r]; }, index().date_heads);
         } else if (index().key_kind == ExprType::Timestamp) {
             const auto* col = std::get_if<Column<Timestamp>>(rkey);
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
-            const auto* data = col->data();
+            const auto data = value_reader(*col);
             do_phase1([&](std::size_t r) { return data[r]; }, index().ts_heads);
         } else if (index().key_kind == ExprType::Decimal) {
             const auto* col = std::get_if<Column<Decimal>>(rkey);
@@ -1646,7 +1646,7 @@ struct JoinProbe {
                     " vs " + decimal::type_name(index().dec_type) +
                     "; cast one side to the other's scale with Decimal(x, precision, scale)");
             }
-            const auto* data = col->data();
+            const auto data = value_reader(*col);
             do_phase1([&](std::size_t r) { return data[r]; }, index().dec_heads);
         } else if (index().key_kind == ExprType::String) {
             if (const auto* c_cat = std::get_if<Column<Categorical>>(rkey)) {
@@ -1715,8 +1715,8 @@ struct JoinProbe {
         }
         const ValidityBitmap* v0 = e0.validity.has_value() ? &*e0.validity : nullptr;
         const ValidityBitmap* v1 = e1.validity.has_value() ? &*e1.validity : nullptr;
-        const auto* d0 = col0->data();
-        const auto* d1 = col1->data();
+        const auto d0 = value_reader(*col0);
+        const auto d1 = value_reader(*col1);
         const std::size_t n_right = right_->rows();
 
         const auto head_of = [&](std::size_t r) -> std::size_t {
@@ -2118,7 +2118,7 @@ auto run_streamed_two_phase_unit(const StreamedTwoPhaseShared& shared, JoinProbe
     if (keys_col == nullptr) {
         return std::unexpected("streamed join probe: probe key is not Int64");
     }
-    const auto* key_data = keys_col->data();
+    const auto key_data = value_reader(*keys_col);
     const ValidityBitmap* key_validity =
         sel.keys.validity.has_value() ? &*sel.keys.validity : nullptr;
     const std::size_t n = keys_col->size();
@@ -2945,7 +2945,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         // Probe the candidate keys in scan order; record one hit per
         // surviving row plus the expanded (build row, survivor) pairs — the
         // same probe-order-major layout emit_swapped produces.
-        const auto* key_data = keys_col->data();
+        const auto key_data = value_reader(*keys_col);
         const ValidityBitmap* key_validity =
             sel.keys.validity.has_value() ? &*sel.keys.validity : nullptr;
         const std::size_t n = keys_col->size();
@@ -3286,7 +3286,7 @@ class ChunkedInnerJoinOperator final : public Operator {
                 } else if constexpr (std::is_same_v<C, Column<std::int64_t>> ||
                                      std::is_same_v<C, Column<Date>> ||
                                      std::is_same_v<C, Column<Timestamp>>) {
-                    const auto* data = col.data();
+                    const auto data = value_reader(col);
                     publish_build_filter_keys(
                         [data](std::size_t r) { return join_key_domain(data[r]); }, col.size(),
                         validity, slot);

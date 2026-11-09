@@ -258,8 +258,8 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, RowRange r
         }
         return ColumnValue{std::move(out)};
     };
-    auto make_int_result = [&](auto op_fn, const std::int64_t* lp, std::int64_t ls,
-                               const std::int64_t* rp, std::int64_t rs) -> ColumnValue {
+    auto make_int_result = [&](auto op_fn, IntegerView lp, std::int64_t ls, IntegerView rp,
+                               std::int64_t rs) -> ColumnValue {
         Column<std::int64_t> out;
         out.resize_for_overwrite(rows);
         std::int64_t* dst = out.data();
@@ -334,12 +334,14 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, RowRange r
             out.assign(rows, value);
             return ColumnValue{std::move(out)};
         }
-        const std::int64_t* lp = (left->is_column && left->kind == ExprType::Int)
-                                     ? std::get<Column<std::int64_t>>(*left->column).data() + begin
-                                     : nullptr;
-        const std::int64_t* rp = (right->is_column && right->kind == ExprType::Int)
-                                     ? std::get<Column<std::int64_t>>(*right->column).data() + begin
-                                     : nullptr;
+        const IntegerView lp =
+            (left->is_column && left->kind == ExprType::Int)
+                ? std::get<Column<std::int64_t>>(*left->column).integer_view() + begin
+                : nullptr;
+        const IntegerView rp =
+            (right->is_column && right->kind == ExprType::Int)
+                ? std::get<Column<std::int64_t>>(*right->column).integer_view() + begin
+                : nullptr;
         const std::int64_t ls = left->is_column ? 0 : get_int_value(*left, 0);
         const std::int64_t rs = right->is_column ? 0 : get_int_value(*right, 0);
         const bool left_ok = !left->is_column || lp != nullptr;
@@ -393,7 +395,7 @@ struct NumericUpdateNode {
     ir::ArithmeticOp op = ir::ArithmeticOp::Add;
     std::uint32_t left = 0;
     std::uint32_t right = 0;
-    const std::int64_t* i64 = nullptr;
+    IntegerView i64 = nullptr;
     const double* dbl = nullptr;
     std::int64_t int_lit = 0;
     double dbl_lit = 0.0;
@@ -746,7 +748,8 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
             // Leaves are read as `node.i64[block_offset + i]` with a block
             // offset relative to the range, so advancing the base pointer here
             // is all the range costs the tree.
-            node.i64 = std::get<Column<std::int64_t>>(*operand->column).data() + range.begin;
+            node.i64 =
+                std::get<Column<std::int64_t>>(*operand->column).integer_view() + range.begin;
         } else {
             node.kind = NumericUpdateNode::Kind::DoubleColumn;
             node.dbl = std::get<Column<double>>(*operand->column).data() + range.begin;
@@ -944,7 +947,13 @@ auto eval_numeric_int_node_block(const NumericUpdateNode& node, std::uint32_t id
     auto& value = int_values[idx];
     switch (node.kind) {
         case NumericUpdateNode::Kind::IntColumn:
-            value = NumericBlockValue<std::int64_t>{.data = node.i64 + row_offset};
+            if (const auto* wide = node.i64.wide_data()) {
+                value = NumericBlockValue<std::int64_t>{.data = wide + row_offset};
+            } else {
+                for (std::size_t i = 0; i < count; ++i)
+                    dst[i] = node.i64[row_offset + i];
+                value = NumericBlockValue<std::int64_t>{.data = dst};
+            }
             return;
         case NumericUpdateNode::Kind::IntLiteral:
             value = NumericBlockValue<std::int64_t>{.scalar = node.int_lit};
@@ -1178,12 +1187,12 @@ auto try_fast_update_pminmax(const ir::Expr& expr, const Table& input, RowRange 
         return ColumnValue{std::move(out)};
     }
     if (output_kind == ExprType::Int) {
-        const std::int64_t* lp = left->is_column
-                                     ? std::get<Column<std::int64_t>>(*left->column).data() + begin
-                                     : nullptr;
-        const std::int64_t* rp = right->is_column
-                                     ? std::get<Column<std::int64_t>>(*right->column).data() + begin
-                                     : nullptr;
+        const IntegerView lp =
+            left->is_column ? std::get<Column<std::int64_t>>(*left->column).integer_view() + begin
+                            : nullptr;
+        const IntegerView rp =
+            right->is_column ? std::get<Column<std::int64_t>>(*right->column).integer_view() + begin
+                             : nullptr;
         Column<std::int64_t> out;
         out.resize_for_overwrite(rows);
         run(out.data(), lp, left->is_column ? std::int64_t{0} : get_int_value(*left, 0), rp,
@@ -2399,7 +2408,7 @@ auto grouped_shift_by_rows(const NativeGroupedOrderedCall& ordered, const Column
             const Column<T>& values) -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
         Column<T> result;
         result.resize_for_overwrite(rows);
-        const T* const in = values.data();
+        const auto in = value_reader(values);
         T* const out = result.data();
         const std::uint32_t* const gid = row_gid.data();
         ValidityBitmap valid(rows, true);
@@ -2538,7 +2547,7 @@ auto compute_grouped_ordered_column(const NativeGroupedOrderedCall& ordered,
         // for adopted Arrow storage and reloads its buffer pointer, and the
         // stores to the output may alias what those read, so none of it hoists:
         // that is the per-row cost of a gather that should be a load and a store.
-        const T* const in = values.data();
+        const auto in = value_reader(values);
         T* const out = result.data();
         const std::uint8_t* const validity_bits =
             source.validity ? source.validity->buffer_data() : nullptr;
@@ -3876,7 +3885,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
                     }
                 } else {
                     auto* dp = dcol.data();
-                    const auto* sp = scol->data() + skip;
+                    const auto sp = value_reader(*scol) + skip;
                     for (std::size_t i = 0; i < indices.size(); ++i) {
                         dp[indices[i]] = sp[i];
                     }
@@ -4600,7 +4609,7 @@ auto try_fused_literal_guard(const Table& input, const ir::UpdateNode& update,
             return std::nullopt;
         }
         const auto fill = [&]<typename T>(T v) -> std::optional<Table> {
-            const T* old = std::get<Column<T>>(*entry->column).data();
+            const auto old = value_reader(std::get<Column<T>>(*entry->column));
             const std::uint64_t* words = entry->validity->words_data();
             const std::size_t n = input.rows();
             Column<T> out;
@@ -4674,8 +4683,8 @@ auto try_fused_literal_guard(const Table& input, const ir::UpdateNode& update,
         return std::nullopt;
     }
     const auto run = [&]<typename T>(T c, T v) -> std::optional<Table> {
-        const T* x = std::get<Column<T>>(*guard->column).data();
-        const T* old = std::get<Column<T>>(*target->column).data();
+        const auto x = value_reader(std::get<Column<T>>(*guard->column));
+        const auto old = value_reader(std::get<Column<T>>(*target->column));
         const std::size_t n = input.rows();
         Column<T> out;
         out.resize_for_overwrite(n);
@@ -5107,7 +5116,7 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                                 out.resize(n);
                             }
                             typename Col::value_type* dst = out.data();
-                            const typename Col::value_type* src = old_col.data();
+                            const auto src = value_reader(old_col);
                             if (parallel) {
                                 for_row_ranges(&exec, n,
                                                [dst, src, matched_bytes, value](std::size_t begin,
@@ -5403,8 +5412,9 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                             out.resize(n);
                         }
                         Value* dst = out.data();
-                        const Value* new_data = src.data();
-                        const Value* old_data = oldc != nullptr ? oldc->data() : nullptr;
+                        const auto new_data = value_reader(src);
+                        const decltype(new_data) old_data =
+                            oldc != nullptr ? value_reader(*oldc) : nullptr;
                         // A row is valid when it takes a valid value from its
                         // side: the new value where matched, the old one (if
                         // any) elsewhere. Worked a word at a time from the
@@ -5938,7 +5948,7 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
                     }
                 } else {
                     auto* dp = dcol.data();
-                    const auto* sp = scol->data();
+                    const auto sp = value_reader(*scol);
                     for (std::size_t i = 0; i < indices.size(); ++i) {
                         dp[indices[i]] = sp[i];
                     }

@@ -91,7 +91,7 @@ struct PackedKeyEncoder {
     /// bit offset it occupies in the packed key.
     struct PackCol {
         enum class Kind : std::uint8_t { Int64, Date, Ts, Bool, Cat, Str } kind{Kind::Int64};
-        const std::int64_t* i64 = nullptr;
+        IntegerView i64 = nullptr;
         const Date* date = nullptr;
         const Timestamp* ts = nullptr;
         const Column<bool>* boolean = nullptr;
@@ -296,7 +296,7 @@ struct PackedKeyEncoder {
             const ColumnValue& column = *entry.column;
             if (const auto* c_int = std::get_if<Column<std::int64_t>>(&column)) {
                 col.kind = PackCol::Kind::Int64;
-                col.i64 = c_int->data();
+                col.i64 = c_int->integer_view();
                 bytes += 8;
             } else if (const auto* c_date = std::get_if<Column<Date>>(&column)) {
                 col.kind = PackCol::Kind::Date;
@@ -385,7 +385,7 @@ struct PackedKeyEncoder {
     /// widen the window.
     /// Split over up to `tasks` ranges of `run` (see `build_packed_key`).
     template <typename T, typename Get, typename Run>
-    [[nodiscard]] static auto observe_range(const T* data, std::size_t n, Get get,
+    [[nodiscard]] static auto observe_range(T data, std::size_t n, Get get,
                                             const ValidityBitmap* valid, std::size_t tasks,
                                             const Run& run) -> Observed {
         constexpr std::size_t kMinRangeRows = std::size_t{1} << 16;
@@ -535,7 +535,7 @@ struct PackedKeyEncoder {
             col.valid = valid;
             if (const auto* c_int = std::get_if<Column<std::int64_t>>(&column)) {
                 col.kind = PackCol::Kind::Int64;
-                col.i64 = c_int->data();
+                col.i64 = c_int->integer_view();
                 seen[k] = observe_range(
                     col.i64, c_int->size(), [](std::int64_t v) { return v; }, valid, tasks, run);
             } else if (const auto* c_date = std::get_if<Column<Date>>(&column)) {

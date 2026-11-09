@@ -78,6 +78,31 @@ class ColumnView {
     const ValidityBitmap* validity_;
 };
 
+/// Integer input values can have either physical width. Pointer-only kernels
+/// must explicitly request an owned widening rather than assume contiguity.
+template <>
+class ColumnView<std::int64_t> {
+   public:
+    ColumnView(const std::int64_t* data, std::size_t rows, const ValidityBitmap* validity) noexcept
+        : values_(data), rows_(rows), validity_(validity) {}
+    ColumnView(const Column<std::int64_t>& column, const ValidityBitmap* validity) noexcept
+        : values_(column.integer_view()), rows_(column.size()), validity_(validity) {}
+    [[nodiscard]] auto rows() const noexcept -> std::size_t { return rows_; }
+    [[nodiscard]] auto data() const noexcept -> const std::int64_t* { return values_.wide_data(); }
+    [[nodiscard]] auto validity() const noexcept -> const ValidityBitmap* { return validity_; }
+    [[nodiscard]] auto is_valid(std::size_t row) const noexcept -> bool {
+        return !validity_ || (*validity_)[row];
+    }
+    [[nodiscard]] auto value(std::size_t row) const noexcept -> std::int64_t {
+        return values_[row];
+    }
+
+   private:
+    IntegerView values_;
+    std::size_t rows_;
+    const ValidityBitmap* validity_;
+};
+
 /// Non-owning view of a chunk's columns, addressed by absolute position.
 /// Column identity is by position, not name: a kernel is told positions by
 /// the pipeline that resolved names once at construction. Carries the

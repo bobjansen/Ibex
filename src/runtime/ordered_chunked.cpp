@@ -646,9 +646,10 @@ class ChunkedOrderedLimitOperator final : public Operator {
         // sitting in the loop CONDITION. `key_column[row]` likewise re-tests
         // for adopted (Arrow) storage on every element. Resolve both once.
         const std::size_t rows = chunk.rows();
-        const T* key_values = nullptr;
+        std::conditional_t<std::is_same_v<T, std::int64_t>, IntegerView, const T*> key_values =
+            nullptr;
         if constexpr (is_dense_column_v<Column<T>>) {
-            key_values = key_column.data();
+            key_values = value_reader(key_column);
         }
         // `Column<bool>` is bit-packed and has no dense buffer, so it keeps the
         // indexed read. Every T reaching here is trivially copyable.

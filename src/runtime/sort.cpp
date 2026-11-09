@@ -701,7 +701,7 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
             // Checked by range (each range also against its predecessor's last
             // row): an already-sorted TimeFrame pays this scan every time it is
             // established, so it should not be serial.
-            const auto range_sorted = [&](const auto* values, const auto& key) {
+            const auto range_sorted = [&](const auto values, const auto& key) {
                 std::atomic<bool> sorted{true};
                 for_row_ranges(&exec, rows, [&](std::size_t begin, std::size_t end) {
                     for (std::size_t i = std::max<std::size_t>(begin, 1); i < end; ++i) {
@@ -721,7 +721,8 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
                         already_sorted =
                             range_sorted(col.data(), [](const Timestamp& t) { return t.nanos; });
                     } else if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
-                        already_sorted = range_sorted(col.data(), [](std::int64_t v) { return v; });
+                        already_sorted =
+                            range_sorted(col.integer_view(), [](std::int64_t v) { return v; });
                     } else if constexpr (std::is_same_v<ColT, Column<Date>>) {
                         already_sorted =
                             range_sorted(col.data(), [](const Date& d) { return d.days; });

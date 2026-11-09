@@ -797,7 +797,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             return false;
         }
         const ValidityBitmap* validity = entry->validity.has_value() ? &*entry->validity : nullptr;
-        const std::int64_t* keys = col->data();
+        const auto keys = col->integer_view();
         const std::size_t rows = col->size();
         for (std::size_t row = 0; row < rows; ++row) {
             if (validity != nullptr && !(*validity)[row]) {
@@ -1240,7 +1240,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 // column and the validity bitmap for adopted Arrow storage:
                 // the probe runs inside `filter_rows`'s packing loop, where
                 // none of it hoists on its own. Resolve them once.
-                const std::int64_t* const keys = col->data();
+                const auto keys = col->integer_view();
                 const auto dense_min = static_cast<std::uint64_t>(dense_i64_min_);
                 const std::uint64_t dense_slots = dense_i64_nbits_;
                 const std::uint64_t* const hits = dense_i64_hits_.data();

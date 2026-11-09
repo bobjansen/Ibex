@@ -89,7 +89,7 @@ The earlier direct `join_tables` wrapper control was serial regardless of
 
 `check_parquet.py` checks native file decoding/results across compact on/off,
 one/eight threads and an optional original engine. `check_mutation.py` runs
-the original seven compact test cases against a separately compiled corrupt producer.
+ten selected compact test cases against a separately compiled corrupt producer.
 `paired_report.py` analyzes retained git-comparison repeat files using paired
 Wilcoxon tests and an unchanged control, rather than the shell harness's
 IQR-based display label. Final raw sample arrays are checked in alongside
@@ -102,3 +102,34 @@ rebuilds the matching Parquet plugin and runs physical-width/lifetime tests
 against an existing Arrow dependency. It also demonstrates that restoring eager
 serial widening makes the tests fail. See the plan for validation and remaining
 storage migration work.
+
+## Cached fallback removal
+
+The column-owned Int64 cache is removed. Const scalar integer access and
+`integer_view()` return logical Int64 values directly from physical Int32 or
+Int64 storage. The iterator is random-access and not contiguous. Compact
+columns reject Int64 pointer/span requests; `widened_int64()` explicitly
+returns an independent owned conversion when an operation needs one. Native
+Arrow export emits Int32 directly. See the plan for semantics, checks and the
+remaining performance gate.
+
+`check_read_memory.cpp` is an isolated memory mechanism check, not a timing
+benchmark. The identical source was built at -O3 -DNDEBUG against the cached
+715bf960 column header and the new header, using the same other includes.
+At 50M values the old read allocates about 381 MiB for its cached Int64 view;
+the new read has no RSS growth. Both verify the same independent Int64
+checksum. Raw results/provenance are in `no-cache-read-memory.json`.
+
+To reproduce (paths are persistent; binaries and generated headers are scratch):
+
+```bash
+mkdir -p build-memory-baseline/include/ibex/core
+git show 715bf960:include/ibex/core/column.hpp > build-memory-baseline/include/ibex/core/column.hpp
+clang++ -O3 -DNDEBUG -std=c++23 -I build-memory-baseline/include -I include \
+  -isystem "$ROBIN_HOOD_INCLUDE" benchmarking/int32/check_read_memory.cpp \
+  -o build-memory-baseline/read-memory
+clang++ -O3 -DNDEBUG -std=c++23 -I include -isystem "$ROBIN_HOOD_INCLUDE" \
+  benchmarking/int32/check_read_memory.cpp -o build-release/read-memory
+build-memory-baseline/read-memory 50000000
+build-release/read-memory 50000000
+```

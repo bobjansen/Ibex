@@ -291,7 +291,7 @@ struct NumericColumns {
         if (doubles[j] != nullptr) {
             std::copy(doubles[j]->data() + begin, doubles[j]->data() + end, out);
         } else {
-            const std::int64_t* src = ints[j]->data();
+            const auto src = ints[j]->integer_view();
             for (std::size_t i = begin; i < end; ++i) {
                 out[i - begin] = static_cast<double>(src[i]);
             }
@@ -884,7 +884,9 @@ auto rbind_table(const std::vector<const Table*>& tables,
                     for (std::size_t ti = 0; ti < tables.size(); ++ti) {
                         const auto& src =
                             std::get<Col>(*tables[ti]->columns[col_pos[ti][ci]].column);
-                        if constexpr (requires { src.span(); }) {
+                        if constexpr (std::is_same_v<Col, Column<std::int64_t>>) {
+                            dst.append_integer_values(src);
+                        } else if constexpr (requires { src.span(); }) {
                             auto sp = src.span();
                             (void)dst.insert(dst.end(), sp.begin(), sp.end());
                         } else {
@@ -1079,7 +1081,7 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                         out_col.resize(out_rows);
                     }
                     auto* dst = out_col.data();
-                    const auto* src = src_col.data();
+                    const auto src = value_reader(src_col);
                     with_measure_count([&]<std::size_t M>() {
                         const std::size_t m = M == 0 ? n_measures : M;
                         for_rows([&](std::size_t begin, std::size_t end) {

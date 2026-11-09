@@ -1043,7 +1043,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         break;
                 }
             } else if (item.int_col != nullptr) {
-                const std::int64_t* data = item.int_col->data();
+                const auto data = item.int_col->integer_view();
                 switch (item.func) {
                     case ir::AggFunc::Sum: {
                         std::vector<std::int64_t> acc(n_groups, 0);
@@ -1398,7 +1398,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         break;
                     }
                     default: {
-                        const std::int64_t* ints = col.i64;
+                        const auto ints = col.i64;
                         with_values([=](std::size_t row) { return ints[row]; });
                         break;
                     }
@@ -1570,7 +1570,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             const ColumnValue& col = *agg_columns[ai];
             const ValidityBitmap* vb = agg_validity[ai];
             const auto fold = [&](std::span<Moment> acc, std::size_t begin, std::size_t end) {
-                const auto run = [&](const auto* data) {
+                const auto run = [&](const auto data) {
                     for (std::size_t row = begin; row < end; ++row) {
                         if (vb == nullptr || (*vb)[row]) {
                             moment_add(acc[row_gid[row]], static_cast<double>(data[row]));
@@ -1580,7 +1580,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 if (const auto* d = std::get_if<Column<double>>(&col)) {
                     run(d->data());
                 } else {
-                    run(std::get<Column<std::int64_t>>(col).data());
+                    run(std::get<Column<std::int64_t>>(col).integer_view());
                 }
             };
             std::vector<Moment> acc(n_groups);
@@ -1660,7 +1660,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 buf.resize(offsets[n_groups]);
                 std::copy(offsets.begin(), offsets.end() - 1, cursor.begin());
                 auto scatter = [&](const auto& typed) {
-                    const auto* data = typed.data();
+                    const auto data = value_reader(typed);
                     if (parallel_collect) {
                         for_row_range(
                             range_workers, [&](std::size_t r, std::size_t b, std::size_t e) {

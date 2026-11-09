@@ -192,7 +192,7 @@ auto compile_shift_node(const ir::CallExpr& call, const PredicateInput& input,
     node.source_rows = input.rows();
     if (operand->kind == ExprType::Int) {
         node.kind = NumericTreeNode::Kind::IntShift;
-        node.ints = std::get<Column<std::int64_t>>(*operand->column).data();
+        node.ints = std::get<Column<std::int64_t>>(*operand->column).integer_view();
     } else {
         node.kind = NumericTreeNode::Kind::DoubleShift;
         node.doubles = std::get<Column<double>>(*operand->column).data();
@@ -287,7 +287,7 @@ auto compile_numeric_tree(const ir::Expr& expr, const PredicateInput& input,
     if (operand->is_column) {
         if (operand->kind == ExprType::Int) {
             node.kind = NumericTreeNode::Kind::IntColumn;
-            node.ints = std::get<Column<std::int64_t>>(*operand->column).data();
+            node.ints = std::get<Column<std::int64_t>>(*operand->column).integer_view();
         } else {
             node.kind = NumericTreeNode::Kind::DoubleColumn;
             node.doubles = std::get<Column<double>>(*operand->column).data();
@@ -348,11 +348,11 @@ auto combine_tree_blocks(const NumericTreeBlock<T>& left, const NumericTreeBlock
 /// itself when every row's source is in bounds, else a copy with 0 at the rows
 /// that fall off either end (they are null).
 template <typename T, typename Source>
-auto shift_tree_block(const NumericTreeNode& node, const Source* source, std::size_t row,
+auto shift_tree_block(const NumericTreeNode& node, Source source, std::size_t row,
                       std::size_t count, T* dst) -> NumericTreeBlock<T> {
     const std::int64_t first = static_cast<std::int64_t>(row) + node.shift;
     const auto rows = static_cast<std::int64_t>(node.source_rows);
-    if constexpr (std::is_same_v<T, Source>) {
+    if constexpr (std::is_same_v<Source, const T*>) {
         if (first >= 0 && first + static_cast<std::int64_t>(count) <= rows) {
             return {.data = source + first, .scalar = T{}};
         }
@@ -439,7 +439,11 @@ auto eval_int_tree_node(const NumericTreeNode& node,
     using Block = NumericTreeBlock<std::int64_t>;
     switch (node.kind) {
         case NumericTreeNode::Kind::IntColumn:
-            return {.data = node.ints + row, .scalar = 0};
+            if (const auto* wide = node.ints.wide_data())
+                return {.data = wide + row, .scalar = 0};
+            for (std::size_t i = 0; i < count; ++i)
+                dst[i] = node.ints[row + i];
+            return {.data = dst, .scalar = 0};
         case NumericTreeNode::Kind::IntShift:
             return shift_tree_block(node, node.ints, row, count, dst);
         case NumericTreeNode::Kind::IntScalar:
@@ -2175,7 +2179,8 @@ namespace {
 /// so it ran at ~2 ns per row where the work is a bit test and a load.
 template <typename T>
 struct ResolvedOperand {
-    const T* data = nullptr;             // null for a literal
+    std::conditional_t<std::is_same_v<T, std::int64_t>, IntegerView, const T*> data =
+        nullptr;                         // null for a literal
     const std::uint8_t* bits = nullptr;  // null: every row valid
     std::size_t bit_base = 0;
     T literal{};
@@ -2223,7 +2228,7 @@ auto resolve_validity_operands(const DirectValidityPlan& plan, std::size_t range
             if (column == nullptr) {
                 return std::nullopt;
             }
-            operand.data = column->data() + range_begin;
+            operand.data = value_reader(*column) + range_begin;
             if (value.column->validity.has_value()) {
                 operand.bits = value.column->validity->buffer_data();
                 operand.bit_base = value.column->validity->buffer_offset() + range_begin;
@@ -2247,7 +2252,7 @@ auto write_resolved_validity_range(const std::vector<ResolvedOperand<T>>& operan
     // blends; the head and tail rows that do not fill a byte go one by one.
     if (operands.size() == 2 && operands[0].data != nullptr && !operands[0].is_null &&
         operands[1].data == nullptr && !operands[1].is_null) {
-        const T* const in = operands[0].data;
+        const auto in = operands[0].data;
         const T fill = operands[1].literal;
         const std::uint8_t* const bits = operands[0].bits;
         if (bits == nullptr) {
@@ -2595,8 +2600,8 @@ auto write_fixed_width_numeric_binary(const ir::Expr& expr, const PredicateInput
                 return body([value](std::size_t) { return value; });
             }
             if (operand.kind == ExprType::Int) {
-                const std::int64_t* p =
-                    std::get<Column<std::int64_t>>(*operand.column).data() + begin;
+                const auto p =
+                    std::get<Column<std::int64_t>>(*operand.column).integer_view() + begin;
                 return body([p](std::size_t i) { return static_cast<double>(p[i]); });
             }
             const double* p = std::get<Column<double>>(*operand.column).data() + begin;
@@ -2635,11 +2640,12 @@ auto write_fixed_width_numeric_binary(const ir::Expr& expr, const PredicateInput
         return true;
     }
     if (output_kind == FixedWidthNumericKind::Int && output.ints != nullptr) {
-        const std::int64_t* lp =
-            left.is_column ? std::get<Column<std::int64_t>>(*left.column).data() + begin : nullptr;
-        const std::int64_t* rp = right.is_column
-                                     ? std::get<Column<std::int64_t>>(*right.column).data() + begin
-                                     : nullptr;
+        const IntegerView lp =
+            left.is_column ? std::get<Column<std::int64_t>>(*left.column).integer_view() + begin
+                           : nullptr;
+        const IntegerView rp =
+            right.is_column ? std::get<Column<std::int64_t>>(*right.column).integer_view() + begin
+                            : nullptr;
         const std::int64_t ls = left.is_column ? 0 : numeric_int_value(left);
         const std::int64_t rs = right.is_column ? 0 : numeric_int_value(right);
         auto write = [&](auto op) {

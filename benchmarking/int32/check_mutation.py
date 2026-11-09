@@ -37,7 +37,7 @@ static auto require_ir(const char* source) -> ir::NodePtr {
 }
 '''+body)
     objects=[]
-    sources=[root/'tests/test_column.cpp',root/'tests/test_gather_kernel.cpp',root/'tests/test_compact_int32.cpp',unit]
+    sources=[root/'tests/test_column.cpp',root/'tests/test_gather_kernel.cpp',root/'tests/test_compact_int32.cpp',root/'tests/test_integer_no_cache.cpp',unit]
     for number,src in enumerate(sources):
         key='test_interpreter.cpp' if src==unit else src.name
         entry=next(e for e in entries if e['file'].endswith('/tests/'+key))
@@ -54,8 +54,8 @@ static auto require_ir(const char* source) -> ir::NodePtr {
     libs=[build/f'src/{name}/libibex_{name}.a' for name in ('repl','parser','runtime','ir','core')]
     subprocess.run(['clang++',*objects,'-Wl,--start-group',*[str(f) for f in libs],'-Wl,--end-group',
                     str(catch/'libCatch2Main.a'),str(catch/'libCatch2.a'),'-ldl','-lmvec','-pthread','-o',str(binary)],check=True)
-    result=subprocess.run([str(binary),'[compact-int32]~[ingestion]','--reporter','compact'],capture_output=True,text=True)
+    result=subprocess.run([str(binary),'[compact-int32]~[ingestion]~[dense]','--reporter','compact'],capture_output=True,text=True)
     print(result.stdout)
-    if result.returncode==0 or '7 failed' not in result.stdout:
-        raise AssertionError('the corrupt compact producer must fail all seven tests: '+result.stderr)
-    print('All seven compact tests reject a corrupt producer; production source and binary untouched.')
+    if result.returncode==0 or '10 failed' not in result.stdout:
+        raise AssertionError('the corrupt compact producer must fail all ten tests: '+result.stderr)
+    print('All ten compact tests reject a corrupt producer; production source and binary untouched.')

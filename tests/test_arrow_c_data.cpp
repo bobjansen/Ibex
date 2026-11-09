@@ -1652,3 +1652,33 @@ TEST_CASE("Arrow borrowed Int32 import copies slices and unsigned values stay wi
     REQUIRE_FALSE(unsigned_values.is_compact_int32());
     REQUIRE(unsigned_values[0] == INT64_C(4294967295));
 }
+
+TEST_CASE("Arrow exports compact integers without a wide buffer",
+          "[interop][arrow][compact-int32][no-cache]") {
+    auto table = std::make_shared<ibex::runtime::Table>();
+    auto column = ibex::Column<std::int64_t>::from_compact_int32({INT32_MIN, 0, INT32_MAX});
+    const auto* original = column.compact_int32_data();
+    auto bitmap_owner =
+        std::make_shared<std::array<std::uint8_t, 1>>(std::array<std::uint8_t, 1>{0x0a});
+    auto validity =
+        ibex::runtime::ValidityBitmap::from_external(bitmap_owner, bitmap_owner->data(), 1, 3);
+    table->add_column("v", std::move(column), std::move(validity));
+    ArrowArray array{};
+    ArrowSchema schema{};
+    auto exported = ibex::interop::export_table_to_arrow(
+        std::shared_ptr<const ibex::runtime::Table>(table), &array, &schema);
+    REQUIRE(exported.has_value());
+    CHECK(std::string(schema.children[0]->format) == "i");
+    REQUIRE(array.children[0]->offset == 0);
+    REQUIRE(array.children[0]->buffers[1] == original);
+    REQUIRE(array.children[0]->null_count == 1);
+    const auto* bits = static_cast<const std::uint8_t*>(array.children[0]->buffers[0]);
+    REQUIRE((bits[0] & 7) == 5);
+    table.reset();
+    bitmap_owner.reset();
+    const auto* values = static_cast<const std::int32_t*>(array.children[0]->buffers[1]);
+    CHECK(values[0] == INT32_MIN);
+    CHECK(values[2] == INT32_MAX);
+    ibex::interop::release_arrow_array(&array);
+    ibex::interop::release_arrow_schema(&schema);
+}

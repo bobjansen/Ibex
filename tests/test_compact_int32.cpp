@@ -131,7 +131,7 @@ TEST_CASE("empty and invalid external Int32 storage are handled", "[compact-int3
     auto empty = Integer::from_external_int32(owner, nullptr, 0);
     REQUIRE(empty.empty());
     REQUIRE(empty.visit_integer_storage([](auto values) { return values.size(); }) == 0);
-    REQUIRE(std::as_const(empty).data() == nullptr);
+    REQUIRE_THROWS_AS(std::as_const(empty).data(), std::logic_error);
     empty.append_integer_values(Integer::from_compact_int32({42}));
     REQUIRE(empty.compact_int32_data()[0] == 42);
 }

@@ -501,12 +501,12 @@ TEST_CASE("compact Int32 backing keeps Int64 values and copy-on-write", "[compac
     REQUIRE(std::as_const(source)[0] == INT64_C(-2147483648));
     REQUIRE(std::as_const(copy)[1] == INT64_C(2147483647));
     REQUIRE(source.buffer_offset() == 0);
-    REQUIRE(source.buffer_data()[2] == INT64_C(2000000000));
+    REQUIRE_THROWS_AS(source.buffer_data(), std::logic_error);
     copy[0] = INT64_C(4000000000);
     REQUIRE_FALSE(copy.is_compact_int32());
     REQUIRE(std::as_const(copy)[0] == INT64_C(4000000000));
     REQUIRE(std::as_const(source)[0] == INT64_C(-2147483648));
-    REQUIRE_THROWS_AS(source.compact_int32_output(), std::logic_error);
+    REQUIRE_NOTHROW(source.compact_int32_output());
     auto moved = std::move(copy);
     moved.push_back(INT64_C(5000000000));
     REQUIRE(std::as_const(moved)[3] == INT64_C(5000000000));

@@ -322,7 +322,7 @@ inline void push_key_value(Key& key, const ColumnValue& column, const ValidityBi
 struct KeyCol {
     enum class Kind : std::uint8_t { Int64, Double, Bool, Str, Cat, Date, Ts, Dec };
     Kind kind{Kind::Int64};
-    const std::int64_t* i64{nullptr};
+    IntegerView i64{nullptr};
     const double* f64{nullptr};
     const Column<bool>* boolean{nullptr};
     const Column<std::string>* str{nullptr};
@@ -354,7 +354,7 @@ inline auto make_key_col(const ColumnValue& column, const ValidityBitmap* validi
     key_col.validity = validity;
     if (const auto* c_int = std::get_if<Column<std::int64_t>>(&column)) {
         key_col.kind = KeyCol::Kind::Int64;
-        key_col.i64 = c_int->data();
+        key_col.i64 = c_int->integer_view();
     } else if (const auto* c_dbl = std::get_if<Column<double>>(&column)) {
         key_col.kind = KeyCol::Kind::Double;
         key_col.f64 = c_dbl->data();

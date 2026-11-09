@@ -2432,7 +2432,8 @@ void presize_filter_output(Table& output, const Table& input,
                     // Every output row is written by exactly one gather, so
                     // value-initializing here would be a wasted pass over the
                     // whole column.
-                    dst.resize_for_overwrite(rows_total);
+                    kernel::presize_fixed_width_gather(
+                        dst, std::get<ColT>(*input.columns[src_of_dst[d]].column), rows_total);
                 } else {
                     // Bool must be zero-filled: the bit appender ORs into its
                     // destination word rather than assigning it.
@@ -2502,16 +2503,13 @@ void gather_selection_into(Table& output, const Table& input,
                         kernel::BoolOutputSpan{
                             .words = out->words_data(), .begin = dst.row, .count = sel.kept});
                 } else {
-                    using T = ColT::value_type;
-                    kernel::gather_selected(
-                        kernel::ColumnView<T>(src, nullptr),
-                        kernel::Selection{kernel::RowWordBlocks{
-                            .words = sel.keep_words.data(),
-                            .word_count = sel.keep_words.size(),
-                            .row_base = rows.begin,
-                        }},
-                        kernel::OutputSpan<T>{
-                            .data = out->data(), .begin = dst.row, .count = sel.kept});
+                    kernel::gather_selected_column(src, *out,
+                                                   kernel::Selection{kernel::RowWordBlocks{
+                                                       .words = sel.keep_words.data(),
+                                                       .word_count = sel.keep_words.size(),
+                                                       .row_base = rows.begin,
+                                                   }},
+                                                   dst.row, sel.kept);
                 }
             },
             *src_entry.column);

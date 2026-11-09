@@ -141,7 +141,8 @@ void presize_filter_chunk_output(Chunk& output, const ChunkView& input,
                                       ::ibex::detail::overwrite_safe_v<
                                           typename ColT::value_type>)) {
                     // Every code or fixed-width value is written by the gather.
-                    dst.resize_for_overwrite(rows_total);
+                    presize_fixed_width_gather(
+                        dst, std::get<ColT>(*input.entry(src_of_dst[d]).column), rows_total);
                 } else {
                     // Bool must be zero-filled: the bit appender ORs into its
                     // destination word rather than assigning it.
@@ -192,10 +193,7 @@ void gather_chunk_selection_into(Chunk& output, const ChunkView& input,
                         BoolOutputSpan{
                             .words = out->words_data(), .begin = 0, .count = selection.kept});
                 } else {
-                    using T = ColT::value_type;
-                    gather_selected(
-                        ColumnView<T>(src, nullptr), selected,
-                        OutputSpan<T>{.data = out->data(), .begin = 0, .count = selection.kept});
+                    gather_selected_column(src, *out, selected, 0, selection.kept);
                 }
             },
             *src_entry.column);

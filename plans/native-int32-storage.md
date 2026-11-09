@@ -277,3 +277,21 @@ correction and the control comparisons are unresolved. This addresses the
 localized gather regression without restoring a widening cache. It does not
 clear the entire Int32 performance gate or claim faster physical Int32 filtering.
 See the [implementation, validation and raw evidence](../benchmarking/int32/gather-loop/README.md).
+
+
+## Preserve compact filter output
+
+Runtime table and native-chunk filters now preserve physical Int32 when sizing
+and copying compact output, including projections, limits and parallel windows.
+Width dispatch remains outside selected-row loops, using the existing Int32
+copy kernel; original Int64 columns stay wide. Logical/arithmetic semantics and
+aggregate result width remain Int64.
+
+The eight-case resident filter sweep resolves gains in seven cases; the small
+1M-row/10%-selection case at eight cores is unresolved. At 10M rows/50%
+selection, the before/after gains are 12.2% at one core and 13.3% at eight cores,
+with 40% less output value storage. The 23-query wide slice has no resolved
+changes after Holm correction. Compact ingestion remains opt-in, and the
+broader historical gate is not cleared by this filter-only result.
+
+See [the design, checks, reproducible drivers and raw samples](../benchmarking/int32/filter-storage/README.md).

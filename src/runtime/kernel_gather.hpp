@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
+#include <utility>
 #include <variant>
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -100,6 +101,43 @@ auto gather_selected(ColumnView<T> src, const Selection& selection, OutputSpan<T
         }
     }
     gather_selected_values(src.data(), src.rows(), selection, out);
+}
+
+/// Allocate a fresh fixed-width gather destination with the source's physical
+/// width. Existing Int64 storage is never narrowed based on its values.
+template <typename T>
+auto presize_fixed_width_gather(Column<T>& output, const Column<T>& source, std::size_t count)
+    -> void {
+    if constexpr (std::is_same_v<T, std::int64_t>) {
+        if (source.is_compact_int32()) {
+            auto compact =
+                Column<T>::from_compact_int32(::ibex::detail::NoInitVector<std::int32_t>(count));
+            compact.set_meta(output.meta());
+            output = std::move(compact);
+            return;
+        }
+    }
+    output.resize_for_overwrite(count);
+}
+
+/// Gather into the presized physical destination. Width dispatch stays outside
+/// selection iteration, and compact payloads are copied without widening.
+template <typename T>
+    requires std::is_trivially_copyable_v<T>
+auto gather_selected_column(const Column<T>& source, Column<T>& output, const Selection& selection,
+                            std::size_t begin, std::size_t count) -> void {
+    if constexpr (std::is_same_v<T, std::int64_t>) {
+        if (source.is_compact_int32()) {
+            gather_selected(
+                ColumnView<std::int32_t>(source.compact_int32_data(), source.size(), nullptr),
+                selection,
+                OutputSpan<std::int32_t>{
+                    .data = output.compact_int32_output(), .begin = begin, .count = count});
+            return;
+        }
+    }
+    gather_selected(ColumnView<T>(source, nullptr), selection,
+                    OutputSpan<T>{.data = output.data(), .begin = begin, .count = count});
 }
 
 // --- Bit-packed and variable-width representations -------------------------

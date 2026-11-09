@@ -18,7 +18,6 @@ import numpy as np
 import polars as pl
 from polars.testing import assert_frame_equal
 import ibex_pyarrow
-from ibex_polars import IbexEngine
 from ibex_polars._engine import _to_polars
 
 
@@ -38,13 +37,21 @@ def main():
                          'x': rng.random(1000000)})
     right = pl.DataFrame({'k': categories, 'y': rng.random(10000)})
     query = left.lazy().join(right.lazy(), on='k')
-    engine = IbexEngine()
-    source, bindings, scalars, expected, output = engine._prepare(query, pl.QueryOptFlags())
+    # Historical converters require all payload columns in Arrow. Compile both
+    # sides with the same complete-payload plan, without root reconstruction.
+    from ibex_polars._adapter import Adapter
+    class CompletePayloadAdapter(Adapter):
+        def _passthrough_join(self, node_id, node, schema):
+            return None
+    source, bindings, scalars, expected, output, categories, left_rows = CompletePayloadAdapter(
+        query, pl.QueryOptFlags()).compile()
     def execute():
         return ibex_pyarrow.execute_pipeline(source, tables=bindings, scalars=scalars)
+    if left_rows is not None:
+        raise RuntimeError("conversion A/B requires a complete Arrow result")
     raw = execute()
     reference = query.collect()
-    converters = {'before': namespace['_to_polars'], 'after': _to_polars}
+    converters = {'before': namespace['_to_polars'], 'after': lambda raw, expected, output: _to_polars(raw, expected, output, categories, left_rows)}
     for convert in converters.values():
         assert_frame_equal(convert(raw, expected, output), reference, check_row_order=False)
     report = {'base': args.base, 'git_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
@@ -55,7 +62,8 @@ def main():
     for stage in ('conversion', 'collect'):
         calls = {name: (lambda convert=convert: convert(raw if stage == 'conversion' else execute(), expected, output))
                  for name, convert in converters.items()}
-        calls['polars'] = query.collect if stage == 'collect' else lambda: pl.from_arrow(raw)
+        if stage == 'collect':
+            calls['polars'] = lambda: query.collect(engine='streaming')
         for call in calls.values():
             call(); call()
         samples = {name: [] for name in calls}

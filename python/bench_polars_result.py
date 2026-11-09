@@ -59,10 +59,10 @@ def main():
     }
     reports = []
     for label, query in queries.items():
-        source, bindings, scalars, expected, output = engine._prepare(query, pl.QueryOptFlags())
+        source, bindings, scalars, expected, output, categories, left_rows = engine._prepare(query, pl.QueryOptFlags())
         raw = ibex_pyarrow.execute_pipeline(source, tables=bindings, scalars=scalars)
         calls = {"before": lambda: previous_boundary(raw, expected, output),
-                 "after": lambda: _to_polars(raw, expected, output)}
+                 "after": lambda: _to_polars(raw, expected, output, categories, left_rows)}
         reference = query.collect(engine="streaming")
         for call in calls.values():
             assert_frame_equal(call(), reference, check_row_order=False, rel_tol=1e-12, abs_tol=1e-9)

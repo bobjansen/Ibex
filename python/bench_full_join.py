@@ -32,12 +32,12 @@ def worker(args):
     right = pl.DataFrame({'k': right_keys, 'y': rng.random(len(right_keys))})
     query = left.lazy().join(right.lazy(), on='k', how='full', coalesce=True)
     engine = IbexEngine()
-    source, bindings, scalars, expected, output = engine._prepare(query, pl.QueryOptFlags())
+    source, bindings, scalars, expected, output, categories, left_rows = engine._prepare(query, pl.QueryOptFlags())
     if args.direct:
         source = '_ibex_input outer join _ibex_join_0_input on k;'
     def collect():
         return _to_polars(ibex_pyarrow.execute_pipeline(source, tables=bindings, scalars=scalars),
-                          expected, output)
+                          expected, output, categories, left_rows)
     actual = collect()
     assert_frame_equal(actual, query.collect(), check_row_order=False)
     for _ in range(2):

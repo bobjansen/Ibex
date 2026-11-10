@@ -10,9 +10,14 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <initializer_list>
 #include <iterator>
+#include <memory>
 #include <numeric>
+#include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 TEST_CASE("compact integer reads never attach a widened representation",
           "[compact-int32][no-cache]") {
@@ -88,6 +93,49 @@ auto inputs(bool compact, bool nulls) -> ibex::runtime::TableRegistry {
     return result;
 }
 }  // namespace
+
+TEST_CASE("integer membership joins retain signed boundaries in offset storage",
+          "[compact-int32][no-cache][join]") {
+    using Col = ibex::Column<std::int64_t>;
+    for (const bool compact : {false, true}) {
+        for (const bool nullable : {false, true}) {
+            auto narrow = std::make_shared<std::vector<std::int32_t>>(
+                std::initializer_list<std::int32_t>{9, 9, INT32_MIN, -1, 0, 1, INT32_MAX, -1});
+            auto wide = std::make_shared<std::vector<std::int64_t>>(narrow->begin(), narrow->end());
+            const Col input = compact ? Col::from_external_int32(narrow, narrow->data() + 2, 6)
+                                      : Col::from_external(wide, wide->data(), 2, 6);
+            ibex::runtime::Table left, right;
+            if (nullable)
+                left.add_column("k", input, std::vector<bool>{false, true, true, true, true, true});
+            else
+                left.add_column("k", input);
+            left.add_column("id", Col{0, 1, 2, 3, 4, 5});
+            right.add_column("k", compact ? Col::from_compact_int32({INT32_MIN, INT32_MAX})
+                                          : Col{INT32_MIN, INT32_MAX});
+            ibex::runtime::TableRegistry tables{{"l", std::move(left)}, {"r", std::move(right)}};
+            for (const char* kind : {"semi", "anti"}) {
+                CAPTURE(compact, nullable, kind);
+                auto parsed = ibex::parser::parse(std::string("l ") + kind + " join r on k;");
+                REQUIRE(parsed.has_value());
+                auto plan = ibex::parser::lower(*parsed);
+                REQUIRE(plan.has_value());
+                auto result = ibex::runtime::interpret(**plan, tables);
+                REQUIRE(result.has_value());
+                const auto& ids = std::get<Col>(*result->find("id"));
+                const std::vector<std::int64_t> expected =
+                    std::string_view(kind) == "semi"
+                        ? (nullable ? std::vector<std::int64_t>{4}
+                                    : std::vector<std::int64_t>{0, 4})
+                        : (nullable ? std::vector<std::int64_t>{0, 1, 2, 3, 5}
+                                    : std::vector<std::int64_t>{1, 2, 3, 5});
+                CHECK(std::vector<std::int64_t>(ids.begin(), ids.end()) == expected);
+                if (nullable && std::string_view(kind) == "anti")
+                    CHECK(ibex::runtime::is_null(*result->find_entry("k"), 0));
+            }
+            CHECK(input.is_compact_int32() == compact);
+        }
+    }
+}
 
 TEST_CASE("native integer operators agree without a cached wide input",
           "[compact-int32][no-cache]") {

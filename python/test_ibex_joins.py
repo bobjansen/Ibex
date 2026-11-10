@@ -19,6 +19,21 @@ from ibex_polars import IbexEngine
 
 
 class JoinTests(unittest.TestCase):
+    def test_native_categorical_membership_joins_skip_null_dictionary_codes(self):
+        # Independent dictionaries, an offset left buffer, and null payloads
+        # that name otherwise matching values exercise the native memo probe.
+        key = pa.DictionaryArray.from_arrays(
+            pa.array([2, 2, None, 0, 1, 2, 0], type=pa.int32()),
+            pa.array(["a", "b", "c"])).slice(2)
+        left = ibex.DataFrame(pa.table({"k": key, "id": range(5)})).lazy()
+        right = ibex.DataFrame(pa.table({"k": pa.DictionaryArray.from_arrays(
+            pa.array([1, None, None], type=pa.int32()), pa.array(["b", "a"]))})).lazy()
+        for how, expected in (("semi", {"k": ["a", "a"], "id": [1, 4]}),
+                              ("anti", {"k": [None, "b", "c"], "id": [0, 2, 3]})):
+            with self.subTest(how=how):
+                actual = left.join(right, on="k", how=how).collect().to_arrow()
+                self.assertEqual(actual.to_pydict(), expected)
+
     def equal(self, query, *, ordered=True):
         for flags in (pl.QueryOptFlags(), pl.QueryOptFlags.none()):
             expected = query.collect(optimizations=flags)

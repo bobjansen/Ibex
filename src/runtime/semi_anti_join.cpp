@@ -11,6 +11,7 @@
 // (`is_streamable_semi_anti_join`).
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/compiler.hpp>
 #include <ibex/core/decimal.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
@@ -50,6 +51,66 @@
 namespace ibex::runtime {
 
 namespace {
+
+using IntegerMembership = robin_hood::unordered_flat_set<std::int64_t>;
+
+auto contains_key(const IntegerMembership* members, std::int64_t key) -> bool {
+    return members->contains(key);
+}
+auto contains_key(const std::uint8_t* members, std::int32_t code) -> bool {
+    return members[static_cast<std::size_t>(code)] != 0U;
+}
+
+// All row-loop state is passed by value. Width and nullability are selected
+// before packing, and one indirect call handles up to 64 keys.
+template <typename Key, typename Membership, bool Nullable>
+IBEX_NOINLINE auto pack_membership(const void* input, const void* membership,
+                                   const std::uint8_t* valid, std::size_t bit_base,
+                                   std::size_t begin, std::size_t count) -> std::uint64_t {
+    const auto* keys = static_cast<const Key*>(input);
+    const auto* members = static_cast<const Membership*>(membership);
+    std::uint64_t bits = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto row = begin + i;
+        const auto bit = bit_base + row;
+        const bool live = !Nullable || ((valid[bit >> 3] >> (bit & 7U)) & 1U) != 0U;
+        // Null dictionary codes may contain arbitrary payloads. Do not index
+        // membership storage until the validity bit has been checked.
+        const bool match = live && contains_key(members, keys[row]);
+        bits |= static_cast<std::uint64_t>(match) << i;
+    }
+    return bits;
+}
+
+struct MembershipProbe {
+    using Pack = std::uint64_t (*)(const void*, const void*, const std::uint8_t*, std::size_t,
+                                   std::size_t, std::size_t);
+    const void* keys;
+    const void* members;
+    const std::uint8_t* valid;
+    std::size_t bit_base;
+    bool keep_matches;
+    Pack pack;
+
+    [[nodiscard]] auto word(std::size_t begin, std::size_t count) const -> std::uint64_t {
+        const auto matches = pack(keys, members, valid, bit_base, begin, count);
+        const auto mask = count == 64 ? std::numeric_limits<std::uint64_t>::max()
+                                      : (std::uint64_t{1} << count) - 1;
+        return keep_matches ? matches : matches ^ mask;
+    }
+};
+
+template <typename Key, typename Membership>
+auto bind_membership(const Key* keys, const Membership* members, const ValidityBitmap* validity,
+                     bool keep_matches) -> MembershipProbe {
+    return {.keys = keys,
+            .members = members,
+            .valid = validity != nullptr ? validity->buffer_data() : nullptr,
+            .bit_base = validity != nullptr ? validity->buffer_offset() : 0,
+            .keep_matches = keep_matches,
+            .pack = validity != nullptr ? &pack_membership<Key, Membership, true>
+                                        : &pack_membership<Key, Membership, false>};
+}
 
 /// The semi/anti join's hook into its right side's scan workers (see
 /// `ScanWorkerSink`): once the swapped build has its left-key map, each right
@@ -1147,8 +1208,12 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 const std::size_t base = range.begin + (w * 64);
                 const std::size_t lim = std::min<std::size_t>(64, range.begin + range.count - base);
                 std::uint64_t bits = 0;
-                for (std::size_t k = 0; k < lim; ++k) {
-                    bits |= static_cast<std::uint64_t>(pred(base + k)) << k;
+                if constexpr (requires { pred.word(base, lim); }) {
+                    bits = pred.word(base, lim);
+                } else {
+                    for (std::size_t k = 0; k < lim; ++k) {
+                        bits |= static_cast<std::uint64_t>(pred(base + k)) << k;
+                    }
                 }
                 sel.keep_words[w] = bits;
                 sel.kept += static_cast<std::size_t>(std::popcount(bits));
@@ -1272,11 +1337,14 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                     return keep_matches ? match : !match;
                 });
             }
-            return filter_rows(std::move(t), [&](std::size_t row) {
-                const bool match = !probe_is_null(row) && right_i64_.contains((*col)[row]);
-                return keep_matches ? match : !match;
+            // Resolve the physical width and source buffer before probing;
+            // hash lookup must not repeatedly inspect Column storage state.
+            const auto probe = col->visit_integer_storage([&](auto values) {
+                return bind_membership(values.data(), &right_i64_, probe_validity, keep_matches);
             });
+            return filter_rows(std::move(t), probe);
         }
+
         if (right_kind_ == ExprType::Double) {
             const auto* col = std::get_if<Column<double>>(key);
             if (col == nullptr) {
@@ -1358,11 +1426,9 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                         static_cast<uint8_t>(right_strings_.contains(std::string_view{dict[i]}));
                 }
             }
-            return filter_rows(std::move(t), [&](std::size_t row) {
-                const auto code = static_cast<std::size_t>(col->code_at(row));
-                const bool match = left_cat_matches_[code] != 0U;
-                return keep_matches ? match : !match;
-            });
+            const auto probe = bind_membership(col->codes_data(), left_cat_matches_.data(),
+                                               probe_validity, keep_matches);
+            return filter_rows(std::move(t), probe);
         }
         if (const auto* col = std::get_if<Column<std::string>>(key)) {
             return filter_rows(std::move(t), [&](std::size_t row) {

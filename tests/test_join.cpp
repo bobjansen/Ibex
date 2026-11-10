@@ -3258,6 +3258,53 @@ TEST_CASE("semi and anti join match categorical keys whose dictionaries differ",
     CHECK(rows_of("l anti join r on k;") == std::vector<std::int64_t>{2, 4});
 }
 
+TEST_CASE("categorical semi and anti joins never match nulls across dictionaries",
+          "[join][semi][anti][null][categorical]") {
+    for (const std::size_t rows : {65U, 300001U}) {
+        Column<Categorical> keys;
+        Column<std::int64_t> ids;
+        runtime::ValidityBitmap valid(rows, true);
+        for (std::size_t row = 0; row < rows; ++row) {
+            keys.push_back(row % 3 == 0 ? "a" : row % 3 == 1 ? "b" : "c");
+            ids.push_back(static_cast<std::int64_t>(row));
+            valid.set(row, row % 29 != 0);
+        }
+        Column<Categorical> right_keys;
+        for (const char* key : {"b", "a", "b"})
+            right_keys.push_back(key);
+        runtime::Table left, right;
+        left.add_column("k", std::move(keys), valid);
+        left.add_column("id", std::move(ids));
+        right.add_column("k", std::move(right_keys), std::vector<bool>{false, true, false});
+        runtime::TableRegistry registry{{"l", std::move(left)}, {"r", std::move(right)}};
+        for (const std::size_t cores : {1U, 4U}) {
+            runtime::ExecutionContext exec;
+            exec.parallel_threads = cores;
+            for (const char* kind : {"semi", "anti"}) {
+                CAPTURE(rows, cores, kind);
+                auto parsed = parser::parse(std::string("l ") + kind + " join r on k;");
+                REQUIRE(parsed.has_value());
+                auto plan = parser::lower(*parsed);
+                REQUIRE(plan.has_value());
+                auto actual = runtime::interpret(**plan, registry, nullptr, nullptr, nullptr, exec);
+                REQUIRE(actual.has_value());
+                const auto& output = std::get<Column<std::int64_t>>(*actual->find("id"));
+                std::size_t kept = 0;
+                for (std::size_t row = 0; row < rows; ++row) {
+                    const bool match = valid[row] && row % 3 == 0;
+                    if (match != (std::string_view(kind) == "semi"))
+                        continue;
+                    REQUIRE(kept < actual->rows());
+                    REQUIRE(output[kept] == static_cast<std::int64_t>(row));
+                    CHECK(runtime::is_null(*actual->find_entry("k"), kept) == !valid[row]);
+                    ++kept;
+                }
+                CHECK(actual->rows() == kept);
+            }
+        }
+    }
+}
+
 TEST_CASE("semi and anti join: a parallel probe keeps exactly the matching rows",
           "[join][semi][anti][parallel]") {
     // Past the operator's parallel floor (1 << 18 rows), so the morsel path

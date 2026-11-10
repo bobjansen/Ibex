@@ -1,0 +1,19 @@
+diff --git a/src/runtime/semi_anti_join.cpp b/src/runtime/semi_anti_join.cpp
+index a652dda3..22d56a04 100644
+--- a/src/runtime/semi_anti_join.cpp
++++ b/src/runtime/semi_anti_join.cpp
+@@ -27,0 +28 @@
++#include <cstdlib>
+@@ -1274,0 +1276,12 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
++            if (const char* bind = std::getenv("IBEX_DIAG_BIND_SEMI_KEYS");
++                bind != nullptr && bind[0] == '1') {
++                return col->visit_integer_storage([&](auto values) {
++                    const auto* const keys = values.data();
++                    const auto* const members = &right_i64_;
++                    return filter_rows(std::move(t), [=](std::size_t row) {
++                        const bool match = !probe_is_null(row) &&
++                                           members->contains(static_cast<std::int64_t>(keys[row]));
++                        return keep_matches ? match : !match;
++                    });
++                });
++            }

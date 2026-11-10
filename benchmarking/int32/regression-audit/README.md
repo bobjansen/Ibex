@@ -9,6 +9,10 @@ The subsequent [integer-abs repair](../integer-abs/README.md) records the fix,
 its same-executable isolation and fresh production gates. Measurements below
 describe the runtime before that repair.
 
+The [semi/anti membership probe repair](../symbol-semi-anti/README.md) records
+the fix for the symbol semi/anti joins, and a categorical null-key bug found
+along the way.
+
 The comparison is the pre-Int32 baseline `0caffc17` against `d0ee5dd1`, whose
 runtime is unchanged from `98aa0d7b`. Compact ingestion is **off** throughout:
 these measurements check existing wide workloads, not compact-input speedups.

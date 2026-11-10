@@ -146,8 +146,12 @@ touch them:
   +1.0% / -0.2% (1 / 8 cores, unresolved). The earlier integer-abs gate
   (`a9443d01`, which changed only `expr.cpp`) already had it at +2.5% / +5.2%
   (p=0.064 / 0.052, unresolved). The shift therefore lines up with that
-  earlier commit. It has not been isolated, and it may be a code-placement
-  effect.
+  earlier commit. Four follow-up timeframe gates did **not** reproduce the
+  +4.9%. They put the integer-abs commit alone at +2.9% / +3.2% and the
+  pre-Int32 baseline comparison at +1.2% / +1.7%, none resolved. The fastest
+  repeats match the base, which points to code placement rather than a
+  slower loop. See the
+  [integer-abs follow-up](../integer-abs/README.md#follow-up-tf_rolling_sum_1m).
 
 `tf_rolling_ewma_1m` is +0.5% (audit: +1.29%) and is unresolved.
 

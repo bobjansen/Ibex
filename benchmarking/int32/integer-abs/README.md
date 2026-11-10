@@ -87,6 +87,40 @@ falls from 11.6010 to 10.0260 ms, with matching row/call counters and eight task
 These sequential profiles corroborate operator location; the unprofiled paired
 runs provide effect estimates.
 
+## Follow-up: `tf_rolling_sum_1m`
+
+A later run against `60ac018e` resolved `tf_rolling_sum_1m` at +4.9%. That
+was the audit's one-core focused configuration, recorded in the
+[semi/anti README](../symbol-semi-anti/README.md#against-the-pre-int32-baseline).
+The broad gates above had already pointed the same way: +2.5% / +5.2% at
+one / eight cores, p=0.064 / 0.052, unresolved. Rolling sum's operator
+lives in `window.cpp`, but its dispatch lives in `expr.cpp`, the only file
+this commit changed.
+
+Four timeframe-suite gates then checked it, each with 18 interleaved
+triplets, nine iterations, two warmups and Holm correction across 13 rows.
+Every replica was byte-identical to its base.
+
+| Comparison | Cores | Paired effect | Holm p |
+| --- | ---: | ---: | ---: |
+| `16de4eb3` → `a9443d01` (this commit only) | 1 | +2.9% | 1.0 |
+| `16de4eb3` → `a9443d01` (this commit only) | 8 | +3.2% | 0.11 (raw 0.010) |
+| `0caffc17` → `a9443d01` (pre-Int32 baseline) | 1 | +1.2% | 1.0 |
+| `0caffc17` → `a9443d01` (pre-Int32 baseline) | 8 | +1.7% | 0.057 (raw 0.006) |
+
+The +4.9% does not reproduce, and no slowdown resolves. The target's fastest
+repeats match the base: 2.249 vs 2.240 ms at one core in the isolation run.
+Its median rises because of a wider tail of slow repeats, up to 2.59 vs
+2.51 ms. A per-row slowdown would move the fastest repeats too, so this
+looks more like code placement, but that has not been shown with a
+same-binary counterfactual.
+
+Other timeframe rows are faster. Against `0caffc17`, rolling min, max and
+median resolve 1.3-2.8% faster at both core counts. For this commit alone,
+`tf_rolling_median_1m` is -2.4% at one core and `tf_rolling_ewma_1m` -0.6% at
+eight cores. Raw results and the driver `run.sh` are in
+`benchmarking/results/local/int32/2026-11-10-rolling-sum/`.
+
 ## Correctness and retained evidence
 
 - Full Release rebuild, CSV/JSON plugin rebuilds, and strict GCC runtime build

@@ -536,6 +536,42 @@ One-thread control, same protocol and complete-output checks:
 q1 and q4 are unresolved, not evidence of a speedup or equivalence.
 Raw samples and provenance: 1-thread JSON (`join-gap-20261108-1t.json`, local raw output).
 
+### Compact Int32 pass-through (2026-11-10)
+
+With `IBEX_COMPACT_INT32=1`, the adapter binds resident Int32 columns
+unchanged. The native Arrow importer adopts the buffer, lowering still types
+the column as Int64, and export returns physical Int32, so the final strict
+Polars cast has nothing to narrow. Float32 and the smaller integer types still
+widen. The h2o `id1`-`id3` keys are Int32.
+
+Each setting ran once, in its own process, with the same code. Compact off
+reproduces the HEAD path. Medians in ms (compact off → on); the ratio is the
+median paired IbexEngine/Polars-streaming ratio within each run:
+
+| Query | 8t cached | 8t conversion | 8t ratio | 1t cached | 1t ratio |
+|---|---:|---:|---:|---:|---:|
+| q1 | 106.7 → 101.5 | 79.7 → 77.0 | 2.91 → 2.87 | 190.9 → 179.9 | 1.05 → 0.97 |
+| q2 | 114.7 → 106.6 | 98.8 → 85.7 | 2.93 → 2.74 | 262.8 → 230.5 | 1.14 → 1.09 |
+| q3 | 169.5 → 148.6 | 124.1 → 95.8 | 3.41 → 2.95 | 511.3 → 500.6 | 1.42 → 1.32 |
+| q4 | 121.3 → 103.5 | 92.0 → 75.3 | 3.42 → 2.51 | 229.4 → 175.7 | 1.00 → 0.89 |
+| q5 | 392.3 → 362.4 | 202.7 → 188.0 | 1.50 → 1.37 | 904.9 → 780.4 | 0.56 → 0.50 |
+
+- **Preparation:** about 10 ms faster wherever the widening copy is removed
+  (q4's stays 85-89 ms).
+- **Remaining gap:** the categorical `cat.to` conversion and left-column
+  reconstruction above, plus Float32 widening.
+- **Status:** compact ingestion is still opt-in. These are sequential runs,
+  not an interleaved A/B.
+- **Raw output:** `benchmarking/results/local/int32/2026-11-10-h2o-engine/`.
+
+The 2026-11-10 baseline at `5d33f14e` matches the 11-08 paired remeasurement
+above at eight threads. Every stage is within noise; q4's higher median comes
+from slow repeats, and its fastest runs are unchanged.
+
+One-thread q1/q2 native execution plus export is about 10 ms slower than on
+11-08 (q1 fastest run 51.6 → 61.7 ms). That comparison spans two sittings and
+two CPUs (0 then 2), and has not been A/B'd.
+
 ## Where this fits
 
 - The AWS run of the Polars-engines benchmark

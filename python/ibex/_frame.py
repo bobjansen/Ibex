@@ -296,7 +296,11 @@ class DataFrame:
     def lazy(self):
         for name in self.columns:
             _identifier(name)
+        from ._lower import _compact_int32
         supported = (pa.int64(), pa.float64(), pa.bool_(), pa.string(), pa.large_string(), pa.date32())
+        if _compact_int32():
+            # Bound as compact storage; Int64 semantics (see `_compact_int32`).
+            supported += (pa.int32(),)
         if any(dtype not in supported and not (
             pa.types.is_dictionary(dtype) and dtype.value_type in (pa.string(), pa.large_string())
         ) for dtype in self._table.schema.types):

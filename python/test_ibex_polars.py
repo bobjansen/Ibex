@@ -610,7 +610,44 @@ class EngineTests(unittest.TestCase):
         self.engine.prepare(frame)
         _, tables, *_ = self.engine._prepare(frame, pl.QueryOptFlags())
         native = ibex_pyarrow.execute_pipeline("input;", tables={"input": tables["_ibex_input"]})
-        self.assertEqual(native.schema.field("x").type, pa.int64())
+        # Compact storage keeps the physical width through export; either way
+        # the values are the Int64-semantics column checked above.
+        compact = _adapter_module._compact_int32()
+        self.assertEqual(native.schema.field("x").type, pa.int32() if compact else pa.int64())
+
+    def test_compact_int32_resident_inputs_bind_without_widening(self):
+        frame = pl.DataFrame({
+            "k": pl.Series([3, None, -(2**31), 2**31 - 1, 7], dtype=pl.Int32),
+            "v": pl.Series([1.0, 2.0, 3.0, 4.0, None], dtype=pl.Float32),
+        }).lazy()
+        right = pl.DataFrame({"k": pl.Series([7, -(2**31), 5], dtype=pl.Int32),
+                              "w": pl.Series([1, 2, 3], dtype=pl.Int32)}).lazy()
+        queries = [
+            frame.filter(pl.col("k") != 3),
+            frame.select(s=pl.col("k") + 1, wide=pl.col("k").cast(pl.Int64)),
+            # Streaming join order is unspecified unless maintained.
+            frame.join(right, on="k", how="left", maintain_order="left"),
+            frame.join(right, on="k", maintain_order="left"),
+            frame.group_by("k", maintain_order=True).agg(pl.col("v").sum()),
+        ]
+        for compact, bound in (("0", pa.int64()), ("1", pa.int32())):
+            with patch.dict(os.environ, {"IBEX_COMPACT_INT32": compact}):
+                # A fresh uncached engine per setting: plans bind their inputs.
+                self.engine = IbexEngine(cache_size=0)
+                with self.subTest(compact=compact):
+                    _, tables, *_ = self.engine._prepare(frame, pl.QueryOptFlags())
+                    # Bound inputs are native handles; export shows their storage.
+                    native = ibex_pyarrow.execute_pipeline(
+                        "input;", tables={"input": tables["_ibex_input"]})
+                    self.assertEqual(native.schema.field("k").type, bound)
+                    # Float32 still widens; only signed Int32 has compact storage.
+                    self.assertEqual(native.schema.field("v").type, pa.float64())
+                    self.assertEqual(native.column("k").to_pylist(),
+                                     [3, None, -(2**31), 2**31 - 1, 7])
+                for query in queries:
+                    for flags in (pl.QueryOptFlags(), pl.QueryOptFlags.none()):
+                        with self.subTest(compact=compact, query=query.explain(), flags=flags):
+                            self.equal(query, options=flags)
 
     def test_int32_grouping_reductions_and_empty_inputs(self):
         for values in ([2**31 - 1, 1, None], [-(2**31), -1, None], [], [None, None]):

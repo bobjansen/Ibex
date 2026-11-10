@@ -20,7 +20,7 @@ import pyarrow as pa
 
 import ibex
 from ibex._expr import Expr
-from ibex._lower import _WIDENED_NUMERIC_TYPES, lower
+from ibex._lower import _WIDENED_NUMERIC_TYPES, _compact_int32, lower
 from . import _categories
 from ._temporal import NANOS_PER_UNIT, TEMPORAL_TYPES, is_temporal, literal_ticks, prepare_column
 
@@ -796,7 +796,7 @@ class Adapter:
         for index, field in enumerate(table.schema):
             if pa.types.is_timestamp(field.type) or pa.types.is_duration(field.type):
                 table = table.set_column(index, field.name, prepare_column(table.column(index)))
-            elif field.type in _WIDENED_NUMERIC_TYPES:
+            elif field.type in _WIDENED_NUMERIC_TYPES and not (field.type == pa.int32() and _compact_int32()):
                 table = table.set_column(index, field.name, table.column(index).cast(_WIDENED_NUMERIC_TYPES[field.type]))
         if row_number is not None:
             height = pl.DataFrame._from_pydf(node.df).height

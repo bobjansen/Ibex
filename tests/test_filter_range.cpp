@@ -444,6 +444,69 @@ TEST_CASE("evaluate_field over a partial range matches evaluating a gathered ran
     }
 }
 
+TEST_CASE("integer abs preserves boundaries and nulls over offset physical storage",
+          "[filter][range][compact-int32][math]") {
+    // Exercise the column evaluator directly: a whole update may instead use
+    // the fused numeric tree. Cover vector-length boundaries and scalar tails.
+    const auto check = []<typename T>() {
+        constexpr std::size_t kSkip = 5;
+        constexpr std::size_t kRows = 96;
+        const std::array<T, 5> values{std::numeric_limits<T>::min(), T{-7}, T{0},
+                                      std::numeric_limits<T>::max(), T{-1}};
+        auto backing = std::make_shared<std::vector<T>>();
+        for (std::size_t row = 0; row < kSkip + kRows; ++row) {
+            backing->push_back(values[row % values.size()]);
+        }
+        const auto input = [&] {
+            if constexpr (std::is_same_v<T, std::int32_t>) {
+                return Column<std::int64_t>::from_external_int32(backing, backing->data() + kSkip,
+                                                                 kRows);
+            } else {
+                return Column<std::int64_t>::from_external(backing, backing->data(), kSkip, kRows);
+            }
+        }();
+        const auto expr = call("abs", {col_ref("v")});
+        const runtime::ColumnEvalCtx ctx{
+            .scalars = nullptr, .externs = nullptr, .window = std::nullopt};
+        for (const bool nullable : {false, true}) {
+            runtime::Table table;
+            runtime::ValidityBitmap validity(kRows, true);
+            for (std::size_t row = 0; row < kRows; ++row) {
+                validity.set(row, row % 7 != 0);
+            }
+            if (nullable) {
+                table.add_column("v", input, validity);
+            } else {
+                table.add_column("v", input);
+            }
+            for (const std::size_t begin : {0U, 3U, 7U}) {
+                for (const std::size_t count : {0U, 1U, 15U, 16U, 17U, 65U}) {
+                    CAPTURE(sizeof(T), nullable, begin, count);
+                    auto result = runtime::evaluate_field(*expr, table, {begin, count}, ctx);
+                    REQUIRE(result.has_value());
+                    const auto& actual = std::get<Column<std::int64_t>>(result->column);
+                    REQUIRE(actual.size() == count);
+                    for (std::size_t row = 0; row < count; ++row) {
+                        const bool valid = !nullable || validity[begin + row];
+                        CHECK((!result->validity.has_value() || (*result->validity)[row]) == valid);
+                        if (valid) {
+                            const auto value =
+                                static_cast<std::int64_t>((*backing)[kSkip + begin + row]);
+                            const auto expected = value == std::numeric_limits<std::int64_t>::min()
+                                                      ? value
+                                                      : (value < 0 ? -value : value);
+                            CHECK(actual[row] == expected);
+                        }
+                    }
+                }
+            }
+        }
+        CHECK(input.is_compact_int32() == std::is_same_v<T, std::int32_t>);
+    };
+    check.operator()<std::int32_t>();
+    check.operator()<std::int64_t>();
+}
+
 TEST_CASE("a ranged string kernel reads a borrowed view of an offset source", "[filter][range]") {
     // A partial range borrows String columns instead of copying them. When the
     // source is itself a view starting mid-buffer, the borrowed window must

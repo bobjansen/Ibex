@@ -8,6 +8,7 @@
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/compiler.hpp>
 #include <ibex/core/decimal.hpp>
 #include <ibex/core/enums.hpp>
 #include <ibex/core/time.hpp>
@@ -2808,6 +2809,16 @@ auto eval_case_columns(const ir::CallExpr& call, const ir::Expr& expr, const Tab
         .validity = any_null ? std::optional<ValidityBitmap>{std::move(validity)} : std::nullopt};
 }
 
+// Pass all loop state by value: stores through dst must not force reloads of
+// a storage visitor's captured offset/count, nor mutable Column detach checks.
+template <typename Input>
+IBEX_NOINLINE void integer_abs_into(const Input* src, std::int64_t* dst, std::size_t offset,
+                                    std::size_t count) {
+    for (std::size_t i = 0; i < count; ++i) {
+        dst[i] = safe_iabs(static_cast<std::int64_t>(src[offset + i]));
+    }
+}
+
 // Unary math (sqrt, log, abs, floor, ...) over an evaluated argument column:
 // one vectorized kernel rather than a call per row, whatever produced the
 // argument. floor/ceil/trunc of an Int are the Int itself. nullopt for a
@@ -2820,7 +2831,6 @@ auto unary_math_over_column(UnaryMath fn, const ColResult& arg, std::size_t n, E
         validity = gather_validity(std::optional<ValidityBitmap>{*v}, arg.offset, arg.offset + n);
     }
     if (const auto* ints = std::get_if<Column<std::int64_t>>(&source)) {
-        const auto src = ints->integer_view() + arg.offset;
         if (unary_math_is_type_preserving(fn)) {
             if (type != ExprType::Int) {
                 return std::nullopt;
@@ -2828,11 +2838,15 @@ auto unary_math_over_column(UnaryMath fn, const ColResult& arg, std::size_t n, E
             Column<std::int64_t> out;
             out.resize_for_overwrite(n);
             if (fn == UnaryMath::Abs) {
-                for (std::size_t i = 0; i < n; ++i) {
-                    out.data()[i] = safe_iabs(src[i]);
-                }
+                // Bind storage before iterating: neither mutable-output detach
+                // checks nor physical-width selection belong in the row loop.
+                auto* const dst = out.data();
+                const auto offset = arg.offset;
+                ints->visit_integer_storage([dst, offset, n](auto values) {
+                    integer_abs_into(values.data(), dst, offset, n);
+                });
             } else {
-                std::copy_n(src, n, out.data());
+                std::copy_n(ints->integer_view() + arg.offset, n, out.data());
             }
             return ComputedColumn{.column = std::move(out), .validity = std::move(validity)};
         }
@@ -2841,6 +2855,7 @@ auto unary_math_over_column(UnaryMath fn, const ColResult& arg, std::size_t n, E
         }
         Column<double> out;
         out.resize_for_overwrite(n);
+        const auto src = ints->integer_view() + arg.offset;
         for (std::size_t i = 0; i < n; ++i) {
             out.data()[i] = static_cast<double>(src[i]);
         }

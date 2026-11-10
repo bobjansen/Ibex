@@ -1,0 +1,16 @@
+diff --git a/src/runtime/expr.cpp b/src/runtime/expr.cpp
+--- a/src/runtime/expr.cpp
++++ b/src/runtime/expr.cpp
+@@ -2831,2 +2831,10 @@
+-                for (std::size_t i = 0; i < n; ++i) {
+-                    out.data()[i] = safe_iabs(src[i]);
++                if (const char* bind = std::getenv("IBEX_DIAG_BIND_INTEGER_OUTPUT");
++                    bind != nullptr && bind[0] == '1') {
++                    auto* const dst = out.data();
++                    for (std::size_t i = 0; i < n; ++i) {
++                        dst[i] = safe_iabs(src[i]);
++                    }
++                } else {
++                    for (std::size_t i = 0; i < n; ++i) {
++                        out.data()[i] = safe_iabs(src[i]);
++                    }

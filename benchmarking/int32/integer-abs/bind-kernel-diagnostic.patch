@@ -1,0 +1,40 @@
+diff --git a/src/runtime/expr.cpp b/src/runtime/expr.cpp
+--- a/src/runtime/expr.cpp
++++ b/src/runtime/expr.cpp
+@@ -10,0 +11 @@
++#include <ibex/core/compiler.hpp>
+@@ -2810,0 +2812,10 @@
++// Pass all loop state by value: stores through dst must not force reloads of
++// a storage visitor's captured offset/count, nor mutable Column detach checks.
++template <typename Input>
++IBEX_NOINLINE void integer_abs_into(const Input* src, std::int64_t* dst, std::size_t offset,
++                                    std::size_t count) {
++    for (std::size_t i = 0; i < count; ++i) {
++        dst[i] = safe_iabs(static_cast<std::int64_t>(src[offset + i]));
++    }
++}
++
+@@ -2823 +2833,0 @@
+-        const auto src = ints->integer_view() + arg.offset;
+@@ -2831,2 +2841,14 @@
+-                for (std::size_t i = 0; i < n; ++i) {
+-                    out.data()[i] = safe_iabs(src[i]);
++                if (const char* bind = std::getenv("IBEX_DIAG_BIND_INTEGER_OUTPUT");
++                    bind != nullptr && bind[0] == '1') {
++                    // Bind storage before iterating: neither mutable-output detach
++                    // checks nor physical-width selection belong in the row loop.
++                    auto* const dst = out.data();
++                    const auto offset = arg.offset;
++                    ints->visit_integer_storage([dst, offset, n](auto values) {
++                        integer_abs_into(values.data(), dst, offset, n);
++                    });
++                } else {
++                    const auto src = ints->integer_view() + arg.offset;
++                    for (std::size_t i = 0; i < n; ++i) {
++                        out.data()[i] = safe_iabs(src[i]);
++                    }
+@@ -2835 +2857 @@
+-                std::copy_n(src, n, out.data());
++                std::copy_n(ints->integer_view() + arg.offset, n, out.data());
+@@ -2843,0 +2866 @@
++        const auto src = ints->integer_view() + arg.offset;

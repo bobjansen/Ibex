@@ -5,6 +5,10 @@ integer `abs`, symbol semi/anti joins, and rolling EWMA. Integer `abs` also
 regresses substantially at eight cores. The promotion gate remains open.
 No runtime changes were made during this audit.
 
+The subsequent [integer-abs repair](../integer-abs/README.md) records the fix,
+its same-executable isolation and fresh production gates. Measurements below
+describe the runtime before that repair.
+
 The comparison is the pre-Int32 baseline `0caffc17` against `d0ee5dd1`, whose
 runtime is unchanged from `98aa0d7b`. Compact ingestion is **off** throughout:
 these measurements check existing wide workloads, not compact-input speedups.

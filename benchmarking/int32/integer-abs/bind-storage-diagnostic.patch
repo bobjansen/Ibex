@@ -1,0 +1,30 @@
+diff --git a/src/runtime/expr.cpp b/src/runtime/expr.cpp
+--- a/src/runtime/expr.cpp
++++ b/src/runtime/expr.cpp
+@@ -2823 +2822,0 @@
+-        const auto src = ints->integer_view() + arg.offset;
+@@ -2831,2 +2830,17 @@
+-                for (std::size_t i = 0; i < n; ++i) {
+-                    out.data()[i] = safe_iabs(src[i]);
++                if (const char* bind = std::getenv("IBEX_DIAG_BIND_INTEGER_OUTPUT");
++                    bind != nullptr && bind[0] == '1') {
++                    // Bind storage before iterating: neither mutable-output detach
++                    // checks nor physical-width selection belong in the row loop.
++                    auto* const dst = out.data();
++                    const auto offset = arg.offset;
++                    ints->visit_integer_storage([dst, offset, n](auto values) {
++                        const auto* const src = values.data();
++                        for (std::size_t i = 0; i < n; ++i) {
++                            dst[i] = safe_iabs(static_cast<std::int64_t>(src[offset + i]));
++                        }
++                    });
++                } else {
++                    const auto src = ints->integer_view() + arg.offset;
++                    for (std::size_t i = 0; i < n; ++i) {
++                        out.data()[i] = safe_iabs(src[i]);
++                    }
+@@ -2835 +2849 @@
+-                std::copy_n(src, n, out.data());
++                std::copy_n(ints->integer_view() + arg.offset, n, out.data());
+@@ -2843,0 +2858 @@
++        const auto src = ints->integer_view() + arg.offset;

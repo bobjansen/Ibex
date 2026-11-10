@@ -68,10 +68,22 @@ per-row width branches. Cross-type answers are compared after every sample.
 ## Native runtime prototype
 
 Compact integer backing is now implemented on this branch behind
-`IBEX_COMPACT_INT32=1`, with Int64 logical/arithmetic semantics. See
-[the implementation plan](../../plans/native-int32-storage.md) for guarantees,
-correctness checks, actual interpreter-query measurements and the unresolved
-existing-workload regression. It remains opt-in while the broader performance gate is open.
+`IBEX_COMPACT_INT32=1`, with Int64 logical/arithmetic semantics. The
+guarantees are in [the runtime contracts](../../src/runtime/CONTRACTS.md)
+(§8); the retired implementation plan, with its correctness checks and
+historical gates, is `git show df1235da:plans/native-int32-storage.md`. It
+remains opt-in while the broader performance gate is open.
+
+`lhs join rhs on id` with Int64 keys and three right-side integer payloads,
+inputs built before timing, result materialization timed, two warmups and 12
+alternating pairs (all p=0.00049):
+
+| Rows | Threads | Wide ms | Compact ms | Paired compact/wide |
+|---:|---:|---:|---:|---:|
+| 1,000,000 | 1 | 14.33 | 11.08 | 0.777 |
+| 10,000,000 | 1 | 292.61 | 253.67 | 0.867 |
+| 1,000,000 | 8 | 6.88 | 5.92 | 0.863 |
+| 10,000,000 | 8 | 104.64 | 97.77 | 0.933 |
 
 The actual query control is `tools/bench_compact_int32.cpp`; its driver is:
 

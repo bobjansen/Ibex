@@ -209,3 +209,42 @@ partial) is not part of the contract, and no device exists to fix it.
 Answer checks compare floats with a tolerance (`benchmarking/ab_queries.py`,
 `outputs_match`). A different row, row order, key, count, integer, string or
 decimal is a bug.
+
+## 8. Compact Int32 storage (opt-in, `IBEX_COMPACT_INT32=1`)
+
+Normative comments: `include/ibex/core/column.hpp` (`from_compact_int32`,
+`visit_integer_storage`, `widened_int64`, `IntegerView`) and
+`include/ibex/runtime/env.hpp`. Plan retired 2026-11-10:
+`git show df1235da:plans/native-int32-storage.md`; measurements and
+diagnoses are in `benchmarking/int32/*/README.md`.
+
+* **Ingestion only.** With the flag on, signed Int32 from Parquet (sharded,
+  serial and selected-row decoders) and Arrow (adopted C Data buffers keep
+  the producer's buffer, slice and owner) keeps Int32 backing. Nothing
+  narrows an Int64 by value; UInt32 stays Int64; floats are unchanged.
+* **The column is logically Int64.** There is no Int32 `ColumnValue`
+  alternative and no Int32 arithmetic: readers return Int64 before any
+  arithmetic, and every result (arithmetic, aggregate, scalar) is Int64.
+* **No implicit wide copy.** A compact column has no Int64 pointer: const
+  `data()`, `span()` and `buffer_data()` throw. An operation that needs
+  contiguous Int64 calls `widened_int64()` and owns the copy; nothing is
+  cached on, or attached to, the source. Mutable Int64 access promotes the
+  destination under copy-on-write. Restoring a column-owned wide cache is
+  not the fix for a slow kernel.
+* **Dispatch width once, outside row loops.** Kernels take the typed span
+  from `visit_integer_storage()` (or a physical `ColumnView` pointer) at
+  entry; a per-row width branch or iterator bookkeeping inside a selected-row
+  loop is what cost the early filter regressions. `IntegerView` is a
+  random-access, not contiguous, logical reader for code that is not hot.
+* **Payloads keep their width.** Gathers (selection, batched and serial
+  sentinel), filters, projections and concatenation write Int32 output for
+  Int32 input; Arrow export emits physical Int32, rebasing sliced validity.
+* **`reserve(n)` / `capacity()`** count logical element slots in the current
+  backing, not bytes; promotion keeps the reservation.
+* **ABI.** The compact tag reuses the otherwise invalid `SIZE_MAX` external
+  offset; inline accessors changed, so plugins must be rebuilt against
+  matching headers before they can receive compact columns.
+* **Code placement.** Identical code moves 1–3% across builds (e.g.
+  `filter_arith`); a local alignment hint that fixed one loop regressed
+  categorical join and grouped top-K, and was rejected. Judge a placement
+  effect by the paired gate with an unchanged replica control.

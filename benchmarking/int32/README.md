@@ -136,3 +136,13 @@ build-release/read-memory 50000000
 
 Historical measurement identifiers map to the rebased source commits in
 [history-revisions.md](history-revisions.md).
+
+## End-to-end PDS-H check
+
+The [SF-10 PDS-H run](pdsh-sf10/README.md) at `429b4e25` matches every Polars
+answer. Against the previous native run (`a4dead37`, 2026-10-23), every query
+is faster once q21's query-text change is accounted for. The geomean
+Ibex/Polars 2 streaming is 0.888 at 8 cores and 0.844 at 1 core; against
+DuckDB it is 0.734 and 0.774. The two points are about 290 commits apart,
+so this shows no end-to-end regression on the branch, not gains attributable
+to Int32 storage.

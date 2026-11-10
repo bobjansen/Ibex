@@ -12,9 +12,11 @@ Against `f1eb185c` it resolves `null_semi_join` -2.3% and `null_anti_join`
 -2.1% at one core in the 91-row broad gate. The earlier
 [regression audit](../regression-audit/README.md) measured these two
 categorical queries at +2.07% / +2.22% against the pre-Int32 baseline
-`0caffc17`. That comparison against the original baseline was **not** rerun
-here, so the audit regression counts as likely recovered, not shown to be zero.
-In the dedicated integer-key benchmark, both widths are 25-49% faster.
+`0caffc17`. Rerunning that exact configuration against `60ac018e` (see
+[Against the pre-Int32 baseline](#against-the-pre-int32-baseline)) gives
+-1.9% / -1.7%: the regression is gone, and the small improvement is not
+resolved after correction. In the dedicated integer-key benchmark, both widths
+are 25-49% faster.
 
 It also fixes a correctness bug. The categorical path indexed its memo with
 the dictionary code of null rows, whose payload is arbitrary. A null row could
@@ -117,6 +119,40 @@ At one million rows, 1 core, without nulls, the ratios are Int64 0.68 / 0.55
 
 The focused core/groupagg/null suite (one core, 12 triplets, five iterations)
 has no slowdown. Null semi and anti joins resolve at -1.7% / -1.85% there.
+
+## Against the pre-Int32 baseline
+
+This uses the audit's one-core focused confirmation unchanged: base
+`0caffc17`, target `60ac018e`, suites `scalar,null,timeframe`, 18 interleaved
+triplets, nine iterations, two warmups, CPU 2, Holm correction across 29 rows.
+An eight-core run of the `null` suite uses the same repeat counts. Both
+replicas are byte-identical to the base, and no control/base comparison
+resolves.
+
+| Query | Audit (`d0ee5dd1`) | Now (`60ac018e`) | Holm p now |
+| --- | ---: | ---: | ---: |
+| `null_semi_join`, 1 core | +2.07% (p=0.0057) | -1.87% | 0.39 |
+| `null_anti_join`, 1 core | +2.22% (p=0.0057) | -1.73% | 0.32 |
+| `null_semi_join`, 8 cores | | -1.97% | 0.99 |
+| `null_anti_join`, 8 cores | | +1.97% | 1.0 |
+
+The same one-core run also resolves four TimeFrame rows. This change does not
+touch them:
+
+- `tf_rolling_min_1m` -3.0%, `tf_rolling_max_1m` -2.1% and
+  `tf_rolling_median_1m` -1.5%, all faster.
+- `tf_rolling_sum_1m` **+4.9%** (Holm p=0.041). The audit measured it flat
+  (+0.07%) in this configuration. The broad gate for this change has it at
+  +1.0% / -0.2% (1 / 8 cores, unresolved). The earlier integer-abs gate
+  (`a9443d01`, which changed only `expr.cpp`) already had it at +2.5% / +5.2%
+  (p=0.064 / 0.052, unresolved). The shift therefore lines up with that
+  earlier commit. It has not been isolated, and it may be a code-placement
+  effect.
+
+`tf_rolling_ewma_1m` is +0.5% (audit: +1.29%) and is unresolved.
+
+Raw results: `vs-0caffc17/` in the local evidence directory, including its
+`run.sh`.
 
 ## Correctness checks
 

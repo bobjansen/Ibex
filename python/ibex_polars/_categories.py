@@ -78,6 +78,25 @@ def unify(series):
     return array, Known(dictionary, ids, series.dtype, int(ids[0]) if consecutive else None)
 
 
+def ids_fit_int32(series):
+    """Whether `ids_as_int32` can carry the column: UInt32 ids below 2**31."""
+    if series.dtype.base_type() != pl.Categorical or series.to_physical().dtype != pl.UInt32:
+        return False
+    top = series.to_physical().max()
+    return top is None or top < 2**31
+
+
+def ids_as_int32(series):
+    """The column's Polars category ids as one Int32 array (nulls stay null).
+
+    The ids fit (`ids_fit_int32`), so viewing them as Int32 is exact and free.
+    """
+    ids = series.to_physical().to_arrow()
+    if isinstance(ids, pa.ChunkedArray):
+        ids = ids.combine_chunks()
+    return ids.view(pa.int32())
+
+
 def known_for(chunk, categories, dtype):
     """The Known a result chunk's dictionary is, or None.
 

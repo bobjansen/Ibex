@@ -761,11 +761,13 @@ class Adapter:
         frame = frame.select([*keys, *(name for name, _ in heads)])
         return frame.group_by(keys, maintain_order=group.maintain_order).head(counts.pop())
 
-    def _resident_table(self, node, schema, *, row_number=None):
+    def _resident_table(self, node, schema, *, row_number=None, ids=()):
         """The Arrow table a resident DataFrameScan binds, of `schema`'s columns.
 
         `row_number`, when given, names an extra Int64 column of row positions
-        (see `_passthrough_join`).
+        (see `_passthrough_join`). The Categorical columns named in `ids` bind
+        as their Polars category ids, compact Int32, instead of a dictionary:
+        only for columns nothing but a join reads, since Ibex sees integers.
         """
         if node.selection is not None:
             raise NotImplementedError("DataFrameScan selections are not supported yet")
@@ -779,9 +781,12 @@ class Adapter:
             # Categorical columns go in as one dictionary whose entries
             # remember their Polars ids, which is also far cheaper than
             # Polars' chunk-by-chunk Arrow export and Ibex's merge of it.
-            shared = [name for name in schema if _categories.eligible(data.get_column(name))]
-            rest = data.drop(shared)
+            shared = [name for name in schema if name not in ids and _categories.eligible(data.get_column(name))]
+            rest = data.drop([*shared, *ids])
             table = rest.to_arrow() if rest.width else None
+            for name in ids:
+                column = pa.chunked_array([_categories.ids_as_int32(data.get_column(name))])
+                table = pa.table({name: column}) if table is None else table.append_column(name, column)
             for name in shared:
                 array, known = _categories.unify(data.get_column(name))
                 self.categories.append(known)
@@ -857,7 +862,7 @@ class Adapter:
             row += "_"
         native_left = {name: left_columns[name] for name in dict.fromkeys(left_on)}
         left = ibex.LazyFrame(("table", self._resident_table(scan, native_left, row_number=row)))
-        right = self.frame(node.input_right)
+        right = self._payload_ids_right(node.input_right, right_on) or self.frame(node.input_right)
         source = pl.DataFrame._from_pydf(scan.df.select(list(left_columns)))
         self.left_rows = (row, source)
         self._check_join_validation()
@@ -865,6 +870,31 @@ class Adapter:
                          suffix=suffix, nulls_equal=nulls_equal, coalesce=coalesce,
                          maintain_order=maintain_order,
                          _left_columns=tuple(native_left) + (row,), _right_columns=right_columns)
+
+    def _payload_ids_right(self, node_id, right_on):
+        """A root join's resident right input with its payload Categoricals as ids, or None.
+
+        Only the join reads that input, and it reads only the keys, so a
+        non-key Categorical never needs its labels in Ibex: it binds as its
+        Polars ids and comes back as them, needing `cat.to` but no lookup of
+        Ibex codes. Needs compact Int32 storage, or Ibex would widen the ids.
+        """
+        if not _compact_int32() or node_id in self.nodes:
+            return None
+        self.visitor.set_node(node_id)
+        scan = self.visitor.view_current_node()
+        if type(scan).__name__ != "DataFrameScan" or scan.selection is not None:
+            return None
+        schema = dict(self.visitor.get_schema())
+        data = pl.DataFrame._from_pydf(scan.df.select(list(schema)))
+        ids = tuple(name for name, dtype in schema.items()
+                    if name not in right_on and dtype.base_type() == pl.Categorical
+                    and _categories.ids_fit_int32(data.get_column(name)))
+        if not ids:
+            return None
+        frame = ibex.LazyFrame(("table", self._resident_table(scan, schema, ids=ids)))
+        self.nodes[node_id] = frame
+        return frame
 
     def frame(self, node_id):
         if node_id in self.nodes:

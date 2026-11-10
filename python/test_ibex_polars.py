@@ -649,6 +649,38 @@ class EngineTests(unittest.TestCase):
                         with self.subTest(compact=compact, query=query.explain(), flags=flags):
                             self.equal(query, options=flags)
 
+    def test_compact_root_join_carries_right_categoricals_as_ids(self):
+        # Root joins of a resident left frame with a Categorical: the right
+        # payload Categorical binds as Polars ids, the right key keeps labels.
+        left = pl.DataFrame({
+            "k": pl.Series([1, 2, 3, 4, 2, None], dtype=pl.Int32),
+            "c": ["a", "b", "c", "d", "b", "a"],
+        }).with_columns(pl.col("c").cast(pl.Categorical)).lazy()
+        # "zz" and "only-right" are categories the left never uses; a null id.
+        right = pl.DataFrame({
+            "k": pl.Series([2, 3, 9, 4], dtype=pl.Int32),
+            "c": ["zz", None, "b", "only-right"],
+            "w": [0.5, 0.25, 0.125, 1.0],
+        }).with_columns(pl.col("c").cast(pl.Categorical)).lazy()
+        # The native result names right columns as the right table does.
+        queries = {
+            "inner": (left.join(right, on="k", maintain_order="left"), "c"),
+            "left": (left.join(right, on="k", how="left", maintain_order="left"), "c"),
+            # Keyed on the Categorical, it must keep its labels on both sides.
+            "categorical key": (left.join(right, on="c", maintain_order="left"), None),
+        }
+        for compact, payload in (("0", pa.types.is_dictionary), ("1", pa.types.is_integer)):
+            with patch.dict(os.environ, {"IBEX_COMPACT_INT32": compact}):
+                self.engine = IbexEngine(cache_size=0)
+                for label, (query, column) in queries.items():
+                    with self.subTest(compact=compact, query=label):
+                        self.equal(query)
+                        if column is None:
+                            continue
+                        source, tables, scalars, *_ = self.engine._prepare(query, pl.QueryOptFlags())
+                        raw = ibex_pyarrow.execute_pipeline(source, tables=tables, scalars=scalars)
+                        self.assertTrue(payload(raw.schema.field(column).type), raw.schema)
+
     def test_int32_grouping_reductions_and_empty_inputs(self):
         for values in ([2**31 - 1, 1, None], [-(2**31), -1, None], [], [None, None]):
             frame = pl.DataFrame({"x": pl.Series(values, dtype=pl.Int32),

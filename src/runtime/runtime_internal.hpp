@@ -713,6 +713,24 @@ void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src,
                 }
                 return {std::move(dst), std::move(bm)};
             } else {
+                if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
+                    // Compact stays compact, as in `gather_columns_batched`.
+                    if (col.is_compact_int32()) {
+                        auto dst =
+                            ColT::from_compact_int32(::ibex::detail::NoInitVector<std::int32_t>(n));
+                        auto* dp = dst.compact_int32_output();
+                        const auto* sp = col.compact_int32_data();
+                        for (std::size_t i = 0; i < n; ++i) {
+                            if (indices[i] != null_row) {
+                                dp[i] = sp[indices[i]];
+                            } else {
+                                dp[i] = 0;
+                                bm.set(i, false);
+                            }
+                        }
+                        return {std::move(dst), std::move(bm)};
+                    }
+                }
                 ColT dst;
                 dst.resize(n);
                 auto* dp = dst.data();

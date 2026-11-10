@@ -637,6 +637,43 @@ unresolved. Raw output: `native-mask-{1,8}t.json` in the directory above. The
 binding test covers boundary words, worker-split ranges, repeats, disorder and
 bounds; weakening `<=` to `<` fails it.
 
+### Right payload Categoricals as compact Int32 ids (2026-11-10)
+
+With `IBEX_COMPACT_INT32=1`, when a passthrough join's right input is itself
+a resident `DataFrameScan`, only the join reads it, and only its keys. Its
+non-key Categorical columns therefore bind as their Polars category ids
+(`_categories.ids_as_int32`, compact Int32) instead of a dictionary, and come
+back as those ids. `_to_polars` recognises a Categorical whose result is an
+integer column, views it as UInt32 and runs only `cat.to` (which still checks
+every id): no lookup from Ibex codes to Polars ids. A Categorical join key
+keeps its dictionary.
+
+A left join's unmatched rows took the serial sentinel gather
+(`gather_column_with_nulls`), which widened compact payloads to Int64; it now
+keeps them compact, as the batched gather already did. Test: "left join
+keeps an unmatched compact payload compact" (fails without the fix).
+
+h2o J1, compact on, the committed packages (A) against the change (B), same
+binary, whole harness processes alternated A B A B. Medians of the paired
+Ibex/Polars ratios, Mann-Whitney between sides:
+
+| | 8t A | 8t B | B/A | p (n=24) | 1t A | 1t B | B/A | p (n=12) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| q1 | 1.31 | 1.24 | 0.948 | 0.053 | 0.86 | 0.83 | 0.965 | 0.69 |
+| q2 | 1.46 | 1.35 | 0.929 | 0.002 | 1.14 | 0.91 | 0.794 | 0.033 |
+| q3 | 1.70 | 1.43 | 0.841 | <0.0001 | 1.53 | 1.19 | 0.781 | 0.0001 |
+| q4 | 1.26 | 1.24 | 0.982 | 0.17 | 0.90 | 0.75 | 0.836 | 0.065 |
+| q5 | 0.96 | 0.88 | 0.917 | 0.0005 | 0.56 | 0.47 | 0.849 | 0.0001 |
+
+Runtime gate (`compare_ibex_git.sh`, join suite, compact off, interleaved
+with replica control, base `04dd8165`): 8c level (`inner_join_user` 0.983,
+Holm p 0.010; others p ≥ 0.33). 1c `inner_join_symbol` 1.029 (Holm p
+0.0005; 1.027 against the replica control), others level. The only changed
+code symbol in `join.cpp.o` is the sentinel gather (1935 → 2458 bytes);
+`inner_join_symbol` returns from it before the new branch, so its executed
+code is identical and the change is attributed to placement. Raw output:
+`benchmarking/results/local/int32/2026-11-10-conversion/ids/`.
+
 ## Where this fits
 
 - The AWS run of the Polars-engines benchmark

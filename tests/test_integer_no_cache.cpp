@@ -242,3 +242,24 @@ TEST_CASE("compact integer keys and aggregates agree at one million rows",
         }
     }
 }
+
+TEST_CASE("left join keeps an unmatched compact payload compact",
+          "[compact-int32][no-cache][join]") {
+    // Rows 4 and 6 of t (g = 3) have no match in r, so the gather of r's `w`
+    // takes the sentinel path; at six rows it runs serially.
+    auto parsed = ibex::parser::parse("t left join r on g;");
+    REQUIRE(parsed.has_value());
+    auto plan = ibex::parser::lower(*parsed);
+    REQUIRE(plan.has_value());
+    auto wide = ibex::runtime::interpret(**plan, inputs(false, false));
+    REQUIRE(wide.has_value());
+    auto actual = ibex::runtime::interpret(**plan, inputs(true, false));
+    REQUIRE(actual.has_value());
+    auto mismatch = ibex::runtime::compare_tables(*wide, *actual);
+    if (mismatch)
+        FAIL(mismatch->message());
+    const auto* entry = actual->find_entry("w");
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->validity.has_value());
+    REQUIRE(std::get<ibex::Column<std::int64_t>>(*entry->column).is_compact_int32());
+}

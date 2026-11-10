@@ -58,7 +58,12 @@ def _known_codes(column, dtype, name, categories):
 
 
 def _known_ids(name, known):
-    """The Polars ids of column `name`'s codes, as an expression (nulls stay null)."""
+    """The Polars ids of column `name`'s codes, as an expression (nulls stay null).
+
+    `known` is None when the codes are the ids.
+    """
+    if known is None:
+        return pl.col(name)
     if known.offset is not None:
         return pl.col(name) + known.offset if known.offset else pl.col(name)
     return pl.lit(pl.Series(known.ids, dtype=pl.UInt32)).gather(pl.col(name))
@@ -148,6 +153,9 @@ def _to_polars(result, expected, output, categories=(), left_rows=None):
         # strings too. Preserve dictionaries for code-based categorical export.
         if expected[name].base_type() == pl.Categorical and pa.types.is_dictionary(dtype):
             continue
+        if expected[name].base_type() == pl.Categorical and pa.types.is_integer(dtype):
+            # Polars category ids carried through Ibex as an integer payload.
+            continue
         if (pa.types.is_integer(dtype) and pa.types.is_integer(output[name])
                 and expected[name].is_integer()):
             # Integer widths narrow in the final strict Polars cast, which
@@ -158,7 +166,21 @@ def _to_polars(result, expected, output, categories=(), left_rows=None):
     dictionaries = {name: dtype for name, dtype in expected.items()
                     if dtype.base_type() == pl.Categorical and pa.types.is_dictionary(result[name].type)}
     known, mappings = {}, {}
-    for name, dtype in dictionaries.items():
+    for name, dtype in expected.items():
+        if dtype.base_type() == pl.Categorical and pa.types.is_integer(result[name].type):
+            # The ids themselves (`Adapter._resident_table(ids=...)`): no
+            # lookup, only `cat.to`, which still checks every id. Non-negative,
+            # so viewing them as UInt32 is exact and free.
+            column = result[name]
+            if column.type != pa.int32():
+                raise RuntimeError(f"category ids of {name} came back as {column.type}")
+            known[name] = pl.from_arrow(pa.chunked_array([chunk.view(pa.uint32()) for chunk in column.chunks],
+                                                         type=pa.uint32())).alias(name)
+            mappings[name] = None
+            dictionaries[name] = dtype
+    for name, dtype in list(dictionaries.items()):
+        if name in known:
+            continue
         codes = _known_codes(result[name], dtype, name, categories)
         if codes is not None:
             known[name], mappings[name] = codes

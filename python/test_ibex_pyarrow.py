@@ -444,7 +444,43 @@ def main() -> int:
                 "expected built-in parquet::read() to fail for a missing Parquet path"
             )
 
+    check_left_row_mask()
     return 0
+
+
+def check_left_row_mask() -> None:
+    """The bitmap names exactly the rows given; any disorder or bound breach is None."""
+    import numpy as np
+
+    def mask(numbers, height):
+        bits = ibex_pyarrow.left_row_mask(np.asarray(numbers, dtype=np.int64), height)
+        if bits is None:
+            return None
+        array = pa.Array.from_buffers(pa.bool_(), height, [None, pa.py_buffer(bits)])
+        return array.to_numpy(zero_copy_only=False)
+
+    assert mask([], 0).tolist() == []
+    assert mask([], 3).tolist() == [False] * 3
+    assert mask([63, 64], 65).tolist() == [False] * 63 + [True, True]
+    for numbers, height in (([1, 1], 3), ([2, 1], 3), ([-1], 3), ([3], 3)):
+        assert mask(numbers, height) is None, (numbers, height)
+    # Large enough to split across workers, whose ranges share boundary words.
+    rng = np.random.default_rng(7)
+    height = 1_000_003
+    numbers = np.sort(rng.choice(height, 700_001, replace=False))
+    expected = np.zeros(height, dtype=bool)
+    expected[numbers] = True
+    assert np.array_equal(mask(numbers, height), expected)
+    for index in (1, len(numbers) // 2 + 1, len(numbers) - 1):
+        repeated = numbers.copy()
+        repeated[index] = repeated[index - 1]
+        assert mask(repeated, height) is None, index
+    try:
+        ibex_pyarrow.left_row_mask(np.zeros(2, dtype=np.int32), 3)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("expected an int32 buffer to be rejected")
 
 
 if __name__ == "__main__":

@@ -11,11 +11,17 @@
 #include <ibex/repl/repl.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <Python.h>
 
 #include <datetime.h>
 
+#include <algorithm>
+#include <atomic>
+#include <bit>
+#include <cstdint>
+#include <cstring>
 #include <dlfcn.h>
 #include <exception>
 #include <expected>
@@ -23,8 +29,10 @@
 #include <fstream>
 #include <memory>
 #include <robin_hood.h>
+#include <span>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -1480,7 +1488,108 @@ PyObject* py_execute_pipeline(PyObject* /*self*/, PyObject* args, PyObject* kwar
     }
 }
 
+/// Sets one bit per row number in a zeroed bitmap of `height` rows. Returns
+/// false when the numbers are not strictly increasing within [0, height).
+/// Workers own disjoint index ranges; the numbers they name may share a
+/// boundary word with a neighbour, so every word is published with an atomic
+/// OR. On invalid input the bitmap is discarded, but there is still no race.
+auto fill_left_row_mask(std::span<const std::int64_t> numbers, std::int64_t height,
+                        std::span<std::uint64_t> words) -> bool {
+    constexpr std::size_t kMinRowsPerWorker = 1U << 16U;
+    auto& pool = ibex::runtime::process_worker_pool();
+    const std::size_t workers =
+        std::clamp<std::size_t>(numbers.size() / kMinRowsPerWorker, 1, pool.size());
+    std::atomic<bool> valid{true};
+    auto body = [&](std::size_t worker) {
+        const std::size_t begin = numbers.size() * worker / workers;
+        const std::size_t end = numbers.size() * (worker + 1) / workers;
+        std::int64_t previous = begin == 0 ? -1 : numbers[begin - 1];
+        std::size_t word = 0;
+        std::uint64_t bits = 0;
+        for (std::size_t i = begin; i < end; ++i) {
+            const std::int64_t value = numbers[i];
+            if (value <= previous || value >= height) {
+                valid.store(false, std::memory_order_relaxed);
+                return;
+            }
+            previous = value;
+            const auto index = static_cast<std::size_t>(value) / 64U;
+            if (index != word) {
+                if (bits != 0U) {
+                    std::atomic_ref(words[word]).fetch_or(bits, std::memory_order_relaxed);
+                }
+                word = index;
+                bits = 0;
+            }
+            bits |= std::uint64_t{1} << (static_cast<std::size_t>(value) % 64U);
+        }
+        if (bits != 0U) {
+            std::atomic_ref(words[word]).fetch_or(bits, std::memory_order_relaxed);
+        }
+    };
+    if (workers == 1) {
+        body(0);
+    } else {
+        pool.submit(workers, body).wait();
+    }
+    return valid.load(std::memory_order_relaxed);
+}
+
+PyObject* py_left_row_mask(PyObject* /*self*/, PyObject* args) {
+    static_assert(std::endian::native == std::endian::little,
+                  "Arrow bitmaps are LSB-first bytes; words are stored little-endian");
+    PyObject* numbers_obj = nullptr;
+    long long height = 0;
+    if (!PyArg_ParseTuple(args, "OL", &numbers_obj, &height)) {
+        return nullptr;
+    }
+    if (height < 0) {
+        return set_python_error_from_message(PyExc_ValueError, "height must be non-negative");
+    }
+    Py_buffer view;
+    if (PyObject_GetBuffer(numbers_obj, &view, PyBUF_C_CONTIGUOUS | PyBUF_FORMAT) != 0) {
+        return nullptr;
+    }
+    const std::string_view format = view.format != nullptr ? view.format : "B";
+    const bool int64 = view.itemsize == 8 && !format.empty() &&
+                       (format.back() == 'q' || format.back() == 'l') &&
+                       (format.size() == 1 || format.front() == '<' || format.front() == '=' ||
+                        format.front() == '@');
+    if (!int64) {
+        PyBuffer_Release(&view);
+        return set_python_error_from_message(PyExc_TypeError,
+                                             "row numbers must be a contiguous int64 buffer");
+    }
+    const std::span numbers(static_cast<const std::int64_t*>(view.buf),
+                            static_cast<std::size_t>(view.len) / sizeof(std::int64_t));
+    const auto word_count = (static_cast<std::size_t>(height) + 63U) / 64U;
+    std::vector<std::uint64_t> words;
+    bool valid = false;
+    try {
+        words.assign(word_count, 0);
+        Py_BEGIN_ALLOW_THREADS;
+        valid = fill_left_row_mask(numbers, height, words);
+        Py_END_ALLOW_THREADS;
+    } catch (const std::exception& error) {
+        PyBuffer_Release(&view);
+        return set_python_error_from_message(PyExc_RuntimeError, error.what());
+    }
+    PyBuffer_Release(&view);
+    if (!valid) {
+        Py_RETURN_NONE;
+    }
+    const auto byte_count = (static_cast<std::size_t>(height) + 7U) / 8U;
+    PyObject* bytes = PyBytes_FromStringAndSize(nullptr, static_cast<Py_ssize_t>(byte_count));
+    if (bytes != nullptr && byte_count != 0) {
+        std::memcpy(PyBytes_AS_STRING(bytes), words.data(), byte_count);
+    }
+    return bytes;
+}
+
 PyMethodDef kModuleMethods[] = {
+    {"left_row_mask", py_left_row_mask, METH_VARARGS,
+     PyDoc_STR("left_row_mask(numbers, height): Arrow bitmap of the rows a strictly increasing "
+               "int64 buffer names, or None.")},
     {"bind_table", py_bind_table, METH_O,
      PyDoc_STR("Prepare and retain an immutable native input once for repeated pipelines.")},
     {"execute_pipeline", _PyCFunction_CAST(py_execute_pipeline), METH_VARARGS | METH_KEYWORDS,

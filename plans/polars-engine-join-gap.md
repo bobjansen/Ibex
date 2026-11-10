@@ -412,9 +412,8 @@ IBEX_CORES=8 POLARS_MAX_THREADS=8 taskset -c 0,2,4,6,8,10,12,14 \
    Int32/Float32 columns, the narrowing casts disappear (~12 ms per column).
    Touches the native import widening, so it is a runtime change, not adapter
    work.
-3. **Let the native join emit the left-row mask** (or a "matched" bitmap) when
-   each left row appears at most once, instead of row numbers: removes the
-   order check and the numpy mask build (~17 ms of q1).
+3. ~~**Let the native join emit the left-row mask**~~ Done 2026-11-10 as a
+   parallel binding helper over the row numbers (see "Native left-row mask").
 4. **Skip the right-hand Categorical `cat.to`** by any means Polars allows
    (none found in the public API; check Polars 2 internals or ask upstream).
 5. The general version of all this is producing Polars columns natively
@@ -606,6 +605,37 @@ One thread is neutral: every paired ratio for steps 1+2 and step 3 is
 
 q1/q2/q4's critical path is now the serial numpy order check and mask build
 (~18 ms); the native join emitting the mask is the next step.
+
+### Native left-row mask (2026-11-10)
+
+`ibex_pyarrow.left_row_mask(numbers, height)` checks that int64 row numbers
+strictly increase within `[0, height)` and sets their bits in an Arrow
+bitmap, in one pass over the process worker pool with the GIL released
+(`None` otherwise; `_left_rows` then falls back to the gather). Workers own
+disjoint index ranges and publish each 64-bit word with a relaxed atomic OR,
+so neighbours sharing a boundary word cannot race, even on invalid input.
+Standalone, 9M of 10M rows at 8 threads, the numpy path it replaces was
+4.1 ms order check + 11.1 ms mask; `pl.from_arrow` of the bitmap is free.
+
+It lives in the binding rather than the join operator: whether each left row
+appears at most once is only known at run time, the row-number column is
+still needed for the gather case, and a second join output would need IR
+plumbing for the same ~15 ms.
+
+Paired `--baseline-engine` A/B against `97cfa159` (same native binary):
+
+| | 8t before | 8t after | ratio | p | vs Polars | 1t ratio | 1t p |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| q1 | 61.8 | 45.2 | 0.732 | 0.0005 | 1.29 | 0.987 | 0.57 |
+| q2 | 67.5 | 55.1 | 0.800 | 0.0005 | 1.56 | 1.006 | 0.91 |
+| q3 | 81.6 | 85.0 | 1.031 | 0.27 | 1.86 | 1.012 | 0.20 |
+| q4 | 64.2 | 53.3 | 0.813 | 0.0005 | 1.46 | 1.020 | 0.30 |
+| q5 | 261.9 | 256.5 | 0.974 | 0.30 | 0.99 | 1.037 | 0.20 |
+
+q3 is the identity case and q5 is bound by its right columns; both are
+unresolved. Raw output: `native-mask-{1,8}t.json` in the directory above. The
+binding test covers boundary words, worker-split ranges, repeats, disorder and
+bounds; weakening `<=` to `<` fails it.
 
 ## Where this fits
 

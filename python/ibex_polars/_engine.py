@@ -79,20 +79,26 @@ def _overlap():
 
 def _left_rows(rows, source):
     """The rows of `source` a join's left row numbers name, in their order."""
+    import ibex_pyarrow
+
     numbers = rows.to_numpy(zero_copy_only=False) if rows.null_count == 0 else None
-    if numbers is not None and len(numbers) and (len(numbers) == 1 or (numbers[1:] > numbers[:-1]).all()):
-        # Strictly increasing, bounded indices covering the entire source are
-        # the identity permutation. Keep the original buffers and categories.
-        if len(numbers) == source.height and numbers[0] == 0 and numbers[-1] == source.height - 1:
-            return source
-        # Each row at most once, in order: a filter. Streaming filters morsels
-        # on every thread, not one thread per column; the flag's name is
-        # longer than any column's, so it cannot collide.
-        keep = np.zeros(source.height, dtype=bool)
-        keep[numbers] = True
-        flag = "_ibex_keep" + "_" * max((len(n) for n in source.columns), default=0)
-        return source.with_columns(pl.Series(flag, keep)).lazy().filter(pl.col(flag)).drop(flag).collect(
-            engine="streaming")
+    if numbers is not None and len(numbers) and numbers.dtype == np.int64:
+        # One parallel native pass checks that the numbers strictly increase
+        # within the source and sets their bits: each row at most once, in
+        # order, so the rows are a filter of the source.
+        bits = ibex_pyarrow.left_row_mask(numbers, source.height)
+        if bits is not None:
+            # Strictly increasing and as many as the source: the identity.
+            # Keep the original buffers and categories.
+            if len(numbers) == source.height:
+                return source
+            # Streaming filters morsels on every thread, not one thread per
+            # column; the flag's name is longer than any column's, so it
+            # cannot collide.
+            flag = "_ibex_keep" + "_" * max((len(n) for n in source.columns), default=0)
+            keep = pl.from_arrow(pa.Array.from_buffers(pa.bool_(), source.height, [None, pa.py_buffer(bits)]))
+            return source.with_columns(keep.alias(flag)).lazy().filter(pl.col(flag)).drop(flag).collect(
+                engine="streaming")
     return source[pl.from_arrow(rows)]
 
 

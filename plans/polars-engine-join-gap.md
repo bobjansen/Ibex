@@ -572,6 +572,41 @@ One-thread q1/q2 native execution plus export is about 10 ms slower than on
 11-08 (q1 fastest run 51.6 → 61.7 ms). That comparison spans two sittings and
 two CPUs (0 then 2), and has not been A/B'd.
 
+### Parallel conversion (2026-11-10)
+
+`cat.to` validates every id serially per chunk (`from_cats_and_dtype` in
+polars-core), so an eager call runs one thread per column. Polars 2.0.0 has
+no Python-reachable unchecked constructor: Arrow and plugin imports rebuild
+dictionaries with `from_str_iter`, primitive imports ignore
+`_PL_CATEGORICAL2`, `scatter` rejects UInt32 values, `ext.to` needs the exact
+storage dtype. Upstream marks the unchecked numeric cast "remove after
+exposing to/from physical functions"; an unchecked `from_physical` is the
+thing to ask for. Standalone, 9M ids at 8 threads: eager `cat.to` 15.1 ms
+(10 categories) / 102.9 ms (10M); the same expression in a streaming query
+2.6 / 17.5 ms.
+
+`_engine._to_polars` now (1) rebuilds the left columns on a helper thread
+while the right columns convert, when the Polars pool has more than one
+thread; (2) maps ids and runs `cat.to` in a streaming query; (3) runs the
+left mask filter and the final strict cast in streaming queries. Each step
+was a paired `--baseline-engine` A/B against the previous one (12 samples):
+
+| 8 threads | `7f411695` | + overlap | + streaming `cat.to` | + streaming filter/cast | vs Polars |
+|---|---:|---:|---:|---:|---:|
+| q1 | 98.2 | 66.6 | 62.7 (p 0.34) | 61.1 | 1.82 |
+| q2 | 126.0 | 84.5 | 68.7 | 64.4 | 1.84 |
+| q3 | 180.2 | 169.8 (p 0.064) | 107.9 | 81.2 | 1.77 |
+| q4 | 117.4 | 81.6 | 66.8 | 66.6 | 1.88 |
+| q5 | 394.2 | 361.9 | 269.7 | 250.8 | 1.02 |
+
+Unmarked steps have p ≤ 0.016. Columns chain medians from separate runs.
+One thread is neutral: every paired ratio for steps 1+2 and step 3 is
+0.94–1.02, p ≥ 0.18. Raw output:
+`benchmarking/results/local/int32/2026-11-10-conversion/`.
+
+q1/q2/q4's critical path is now the serial numpy order check and mask build
+(~18 ms); the native join emitting the mask is the next step.
+
 ## Where this fits
 
 - The AWS run of the Polars-engines benchmark

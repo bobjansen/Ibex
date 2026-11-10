@@ -3,6 +3,7 @@
 """Engine entry point and bounded, weakly owned prepared-plan cache."""
 
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import threading
 import weakref
 
@@ -63,6 +64,19 @@ def _known_ids(name, known):
     return pl.lit(pl.Series(known.ids, dtype=pl.UInt32)).gather(pl.col(name))
 
 
+_OVERLAP = None
+_OVERLAP_LOCK = threading.Lock()
+
+
+def _overlap():
+    """One helper thread for work that overlaps a collect's own conversion."""
+    global _OVERLAP
+    with _OVERLAP_LOCK:
+        if _OVERLAP is None:
+            _OVERLAP = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ibex-polars-convert")
+        return _OVERLAP
+
+
 def _left_rows(rows, source):
     """The rows of `source` a join's left row numbers name, in their order."""
     numbers = rows.to_numpy(zero_copy_only=False) if rows.null_count == 0 else None
@@ -71,10 +85,14 @@ def _left_rows(rows, source):
         # the identity permutation. Keep the original buffers and categories.
         if len(numbers) == source.height and numbers[0] == 0 and numbers[-1] == source.height - 1:
             return source
-        # Each row at most once, in order: a filter, parallel over columns.
+        # Each row at most once, in order: a filter. Streaming filters morsels
+        # on every thread, not one thread per column; the flag's name is
+        # longer than any column's, so it cannot collide.
         keep = np.zeros(source.height, dtype=bool)
         keep[numbers] = True
-        return source.filter(pl.Series(keep))
+        flag = "_ibex_keep" + "_" * max((len(n) for n in source.columns), default=0)
+        return source.with_columns(pl.Series(flag, keep)).lazy().filter(pl.col(flag)).drop(flag).collect(
+            engine="streaming")
     return source[pl.from_arrow(rows)]
 
 
@@ -85,7 +103,12 @@ def _to_polars(result, expected, output, categories=(), left_rows=None):
         row, source = left_rows
         column = result[row]
         # combine_chunks copies even a single chunk.
-        left = _left_rows(column.chunk(0) if column.num_chunks == 1 else column.combine_chunks(), source)
+        rows = column.chunk(0) if column.num_chunks == 1 else column.combine_chunks()
+        # The left rebuild reads only the original frame and the right
+        # conversion only Ibex's columns; both release the GIL, so with a
+        # parallel Polars pool they overlap instead of running in sequence.
+        pending = _overlap().submit(_left_rows, rows, source) if pl.thread_pool_size() > 1 else None
+        left = None if pending is not None else _left_rows(rows, source)
         # Polars' output is the left columns, then the right ones; the native
         # result's right columns are those, in order, but named against a
         # left side of only keys and a row number, so they are renamed here.
@@ -98,6 +121,8 @@ def _to_polars(result, expected, output, categories=(), left_rows=None):
         rest = {name: expected[name] for name in right_names}
         right = _to_polars(native, rest, {**output, **dict(zip(right_names, (output[n] for n in result.column_names[left_count:])))},
                            categories) if rest else None
+        if pending is not None:
+            left = pending.result()
         return pl.DataFrame([*left.get_columns(), *(right.get_columns() if right is not None else [])])
     if not expected:
         # Arrow carries a row count for zero-column tables, but from_arrow
@@ -134,9 +159,12 @@ def _to_polars(result, expected, output, categories=(), left_rows=None):
     categorical = {name: _categorical_from_arrow(result[name], dtype, name)
                    for name, dtype in dictionaries.items() if name not in known}
     if known:
-        # One query converts every column of ids, in parallel.
-        converted = pl.DataFrame(list(known.values())).with_columns(
-            [_known_ids(name, mappings[name]).cat.to(dictionaries[name]).alias(name) for name in known])
+        # One streaming query converts every column of ids. `cat.to` checks
+        # each id serially per chunk; streaming splits the rows into morsels,
+        # so the check runs on every thread instead of one per column.
+        converted = pl.DataFrame(list(known.values())).lazy().with_columns(
+            [_known_ids(name, mappings[name]).cat.to(dictionaries[name]).alias(name) for name in known]
+        ).collect(engine="streaming")
         categorical.update({name: converted.get_column(name) for name in known})
     if categorical:
         frame = pl.DataFrame([categorical[name] if name in categorical
@@ -146,7 +174,7 @@ def _to_polars(result, expected, output, categories=(), left_rows=None):
         frame = pl.from_arrow(result)
     assert isinstance(frame, pl.DataFrame)
     # Named category mappings still require conversion to the requested dtype.
-    return frame if frame.schema == expected else frame.cast(expected, strict=True)
+    return frame if frame.schema == expected else frame.lazy().cast(expected, strict=True).collect(engine="streaming")
 
 
 class IbexEngine(pl.Engine):

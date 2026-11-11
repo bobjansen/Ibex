@@ -7,7 +7,7 @@ from datetime import date, datetime
 import builtins
 
 
-_REDUCTIONS = frozenset(("sum", "nullable_sum", "polars_median", "present_count", "nan_count", "nan_high_median", "polars_std", "polars_corr", "mean", "min", "max", "polars_min", "polars_max",
+_REDUCTIONS = frozenset(("sum", "nullable_sum", "polars_median", "polars_std", "polars_corr", "mean", "min", "max", "polars_min", "polars_max",
                          "n_unique", "filtered_n_unique", "count", "column_len", "first", "last",
                          "first_non_null", "last_non_null", "len"))
 

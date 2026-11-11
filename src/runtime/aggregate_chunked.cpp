@@ -3750,7 +3750,8 @@ class HashAggregateState final {
             // hash disappears entirely -- the same trick, and the same reason,
             // as the all-Categorical Cartesian path. `by { day }` over 4
             // distinct days was costing 34ms on 8M rows purely in hash probes.
-            if (try_process_rows_pair_dense(key_a_at, key_b_at, group_entries, agg_entries, rows)) {
+            if (try_process_rows_pair_dense(key_a_at, key_b_at, group_entries, agg_entries, rows,
+                                            /*require_density=*/false)) {
                 return std::nullopt;
             }
             // Discovery across workers, for the case the dense array cannot
@@ -3830,19 +3831,44 @@ class HashAggregateState final {
             return std::nullopt;
         }
 
-        if (try_async_pair_sum(group_entries, agg_entries, rows)) {
+        // Two 64-bit keys with a small Cartesian span (h2o's `by { id4, id5 }`,
+        // 100 x 100) number their groups through the same flat cell array as
+        // the packed pair above; through the hashed paths below, discovery of
+        // 10M rows ran on one core. Like the single-int dense path it starts
+        // only on the first chunk and only where the array is denser than the
+        // rows. Once it declines it never runs again: the hashed paths do not
+        // feed its array. If it had numbered groups, the serial loop below
+        // takes over from `pair_index_`, rebuilt from `pair_order_`.
+        if (!pair_dense_retired_ && (pair_dense_active_ || n_groups_ == 0)) {
+            if (try_process_rows_pair_dense(key_a_at, key_b_at, group_entries, agg_entries, rows,
+                                            /*require_density=*/true)) {
+                return std::nullopt;
+            }
+            pair_dense_retired_ = true;
+            if (pair_dense_active_) {
+                pair_index_.reserve(pair_order_.size());
+                for (std::size_t g = 0; g < pair_order_.size(); ++g) {
+                    pair_index_.emplace(pack(pair_order_[g].first, pair_order_[g].second),
+                                        static_cast<std::uint32_t>(g));
+                }
+            }
+        }
+
+        if (!pair_dense_active_ && try_async_pair_sum(group_entries, agg_entries, rows)) {
             publish_fused_accumulation();
             return std::nullopt;
         }
 
-        if (try_owned<PairIntKey, PairIntKeyHash>(
+        if (!pair_dense_active_ &&
+            try_owned<PairIntKey, PairIntKeyHash>(
                 [&](std::size_t row) { return pack(key_a_at(row), key_b_at(row)); }, rows, gids,
                 agg_entries, owned_pair_partitions_, kPairOwnedMinRows)) {
             publish_fused_accumulation();
             return std::nullopt;
         }
 
-        if (try_discover_partitioned<PairIntKey, PairIntKeyHash>(
+        if (!pair_dense_active_ &&
+            try_discover_partitioned<PairIntKey, PairIntKeyHash>(
                 [&](std::size_t row) { return pack(key_a_at(row), key_b_at(row)); }, rows, gids,
                 pair_partitions_, [&](std::size_t n) { pair_order_.resize(n); },
                 [&](const PairIntKey& key, std::uint32_t gid, std::size_t) {
@@ -3899,14 +3925,10 @@ class HashAggregateState final {
             const auto size = std::get<Column<Categorical>>(col).dictionary_size();
             return {0, size == 0 ? 0 : static_cast<std::int64_t>(size) - 1};
         }
-        std::int64_t lo = read(0);
-        std::int64_t hi = lo;
-        for (std::size_t row = 1; row < rows; ++row) {
-            const std::int64_t v = read(row);
-            lo = std::min(lo, v);
-            hi = std::max(hi, v);
-        }
-        return {lo, hi};
+        // Pair keys are never null here. In pieces on the pool when it may
+        // fan out: serially, two keys over h2o's 10M rows were most of what
+        // was left of Discovery once the pair cells were numbered in parallel.
+        return int_key_bounds(read, nullptr, rows);
     }
 
     /// Group a packed 32-bit key pair through a flat cell array. Returns false
@@ -3923,7 +3945,7 @@ class HashAggregateState final {
                                      // One caller
                                      const std::vector<const ColumnEntry*>& group_entries,
                                      const std::vector<const ColumnEntry*>& agg_entries,
-                                     std::size_t rows) -> bool {
+                                     std::size_t rows, bool require_density) -> bool {
         if (rows == 0) {
             return false;
         }
@@ -3945,13 +3967,23 @@ class HashAggregateState final {
 
         // Spans are computed in unsigned arithmetic so a domain that legitimately
         // straddles zero cannot overflow the subtraction.
-        const auto a_span = static_cast<std::uint64_t>(a_max - a_min) + 1;
-        const auto b_span = static_cast<std::uint64_t>(b_max - b_min) + 1;
-        if (b_span != 0 && a_span > kDenseCellLimit / b_span) {
+        // A span of the whole 64-bit range wraps to 0 and declines.
+        const auto a_span =
+            static_cast<std::uint64_t>(a_max) - static_cast<std::uint64_t>(a_min) + 1;
+        const auto b_span =
+            static_cast<std::uint64_t>(b_max) - static_cast<std::uint64_t>(b_min) + 1;
+        if (a_span == 0 || b_span == 0 || a_span > kDenseCellLimit / b_span) {
             return false;  // product overflows the dense budget
         }
         const std::uint64_t cells = a_span * b_span;
         if (cells > kDenseCellLimit) {
+            return false;
+        }
+        // 64-bit keys measure their domain, so the array must also be denser
+        // than the data (the single-int path's rule).
+        const std::uint64_t rows_per_cell =
+            rows >= kParallelDenseGidRows ? kIntDenseRowsPerCell : 4;
+        if (require_density && !pair_dense_active_ && cells * rows_per_cell > rows) {
             return false;
         }
 
@@ -3976,8 +4008,51 @@ class HashAggregateState final {
             pair_dense_a_max_ = a_max;
         }
 
+        // As the single-key path: fused per-morsel partials when the
+        // aggregates combine slot by slot, else gids numbered across workers,
+        // else one serial pass. Serially, numbering h2o's 10M rows by
+        // `{ id4, id5 }` was 80% of `sum(v3)` at eight cores.
+        const auto n_cells = static_cast<std::size_t>(cells);
+        const auto cell_of = [&](std::size_t row) -> std::size_t {
+            return static_cast<std::size_t>(
+                (static_cast<std::uint64_t>(key_a_at(row) - a_min) * b_span) +
+                static_cast<std::uint64_t>(key_b_at(row) - b_min));
+        };
+        const auto key_of_cell = [&](std::size_t cell) -> std::pair<std::int64_t, std::int64_t> {
+            return {a_min + static_cast<std::int64_t>(cell / b_span),
+                    b_min + static_cast<std::int64_t>(cell % b_span)};
+        };
+        const std::size_t morsels = dense_morsel_count(n_cells, rows);
+        if (morsels != 0 && aggs_are_slot_combinable()) {
+            pair_dense_cells_.resize(rows);
+            auto* cell_buf = pair_dense_cells_.data();
+            run_dense_fused(
+                cell_buf, n_cells, agg_entries, rows, pair_dense_gid_, morsels,
+                [&](std::size_t begin, std::size_t end) {
+                    // On the morsel's own worker, into its own slice.
+                    for (std::size_t row = begin; row < end; ++row) {
+                        cell_buf[row] = static_cast<std::uint32_t>(cell_of(row));
+                    }
+                },
+                [&](std::size_t cell) {
+                    const std::uint32_t gid = alloc_group();
+                    pair_order_.push_back(key_of_cell(cell));
+                    return gid;
+                });
+            publish_fused_accumulation();
+            return true;
+        }
+
         gids_buf_.resize(rows);
         auto* gids = gids_buf_.data();
+        if (try_assign_dense_gids_parallel(
+                rows, n_cells, pair_dense_gid_.data(), cell_of,
+                [&](std::size_t k) { pair_order_.resize(pair_order_.size() + k); },
+                [&](std::size_t cell, std::uint32_t gid) { pair_order_[gid] = key_of_cell(cell); },
+                gids)) {
+            publish_discovered(agg_entries, rows);
+            return true;
+        }
         std::uint32_t* dense = pair_dense_gid_.data();
         for (std::size_t row = 0; row < rows; ++row) {
             const std::int64_t a = key_a_at(row);
@@ -9021,12 +9096,16 @@ class HashAggregateState final {
     /// enumerate. Cells are numbered from the mins below, so widening them
     /// rebuilds the array.
     std::vector<std::uint32_t> pair_dense_gid_;
+    /// Per-row cells for the fused pair path (`run_dense_fused`).
+    std::vector<std::uint32_t> pair_dense_cells_;
     std::int64_t pair_dense_a_min_ = 0;
     std::int64_t pair_dense_a_max_ = 0;
     std::int64_t pair_dense_b_min_ = 0;
     std::int64_t pair_dense_b_max_ = 0;
     std::uint64_t pair_dense_b_span_ = 0;
     bool pair_dense_active_ = false;
+    /// The Int64 pair's dense path declined once; it never runs again.
+    bool pair_dense_retired_ = false;
 
     /// Per-aggregation streaming `count_distinct` state, populated in `plan_`
     /// order only for the `CountDistinct` aggs. Empty when the node has none.

@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <expected>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -1441,6 +1442,96 @@ TEST_CASE("chunked aggregate: an Int64 sum by one Int64 key streams through the 
             INFO("group " << i);
             REQUIRE(pg[i] == want_keys[i]);
             REQUIRE(pv[i] == want_sums.at(want_keys[i]));
+        }
+    }
+}
+
+TEST_CASE("chunked aggregate: two Int64 keys number groups through a dense pair array",
+          "[runtime][chunked][aggregate]") {
+    // `by { id4, id5 }` over two small Int64 domains (h2o) numbers its groups
+    // through a flat cell array, as two Categorical/Date keys do. Chunks of
+    // 70001 rows: the first starts the array, the second widens both bounds
+    // (the array is rebuilt from the groups so far), the fourth jumps past the
+    // cell budget (the path retires; the hash index is rebuilt from the same
+    // groups, and old keys there must not become second groups). A table
+    // whose first chunk is sparser than its cells never starts the array.
+    // Groups come out in first-seen order with exact sums, at 1 and 8 threads.
+    struct Case {
+        const char* name;
+        std::function<std::pair<std::int64_t, std::int64_t>(std::int64_t)> key;
+    };
+    const std::vector<Case> cases{
+        {"widen then retire",
+         [](std::int64_t row) -> std::pair<std::int64_t, std::int64_t> {
+             const std::int64_t chunk = row / 70'001;
+             if (chunk == 0) {
+                 return {(row * 7) % 100, row % 10};
+             }
+             if (chunk == 1) {
+                 return {((row * 7) % 200) - 50, (row % 30) - 10};
+             }
+             if (chunk == 3 && row % 3 == 0) {
+                 return {std::int64_t{1'000'000'000'000} + (row % 5), row % 4};
+             }
+             return {((row * 11) % 200) - 50, (row % 30) - 10};
+         }},
+        {"too sparse to start",
+         [](std::int64_t row) -> std::pair<std::int64_t, std::int64_t> {
+             return {(row * 7919) % 50'000, row % 3};
+         }},
+    };
+    constexpr std::int64_t kRows = 330'000;
+    for (const auto& c : cases) {
+        INFO(c.name);
+        runtime::TableRegistry registry;
+        std::vector<std::pair<std::int64_t, std::int64_t>> want_keys;
+        std::map<std::pair<std::int64_t, std::int64_t>, std::int64_t> want_sums;
+        {
+            Column<std::int64_t> a;
+            Column<std::int64_t> b;
+            Column<std::int64_t> v;
+            for (std::int64_t row = 0; row < kRows; ++row) {
+                const auto key = c.key(row);
+                const std::int64_t value = (row % 997) - 400;
+                a.push_back(key.first);
+                b.push_back(key.second);
+                v.push_back(value);
+                if (!want_sums.contains(key)) {
+                    want_keys.push_back(key);
+                }
+                want_sums[key] += value;
+            }
+            runtime::Table t;
+            t.add_column("a", std::move(a));
+            t.add_column("b", std::move(b));
+            t.add_column("v", std::move(v));
+            registry.emplace("t", std::move(t));
+        }
+        // Two aggregates, so neither the async pair sum nor the owned path
+        // claims the query ahead of the dense array.
+        auto program = parser::parse("t[select { s = sum(v), n = count() }, by { a, b }];");
+        REQUIRE(program.has_value());
+        auto ir = parser::lower(program.value());
+        REQUIRE(ir.has_value());
+        const ChunkGrainGuard guard{"70001"};
+        for (const std::size_t threads : {std::size_t{1}, std::size_t{8}}) {
+            INFO("threads " << threads);
+            runtime::ExecutionContext exec;
+            exec.parallel_threads = threads;
+            exec.parallel_min_rows = 0;
+            const auto out =
+                runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, exec);
+            REQUIRE(out.has_value());
+            REQUIRE(out->rows() == want_keys.size());
+            const auto& pa = std::get<Column<std::int64_t>>(*out->find("a"));
+            const auto& pb = std::get<Column<std::int64_t>>(*out->find("b"));
+            const auto& ps = std::get<Column<std::int64_t>>(*out->find("s"));
+            for (std::size_t i = 0; i < want_keys.size(); ++i) {
+                INFO("group " << i);
+                REQUIRE(pa[i] == want_keys[i].first);
+                REQUIRE(pb[i] == want_keys[i].second);
+                REQUIRE(ps[i] == want_sums.at(want_keys[i]));
+            }
         }
     }
 }
@@ -2916,13 +3007,13 @@ TEST_CASE("median by integer and Categorical keys: parallel cell grouping matche
     }
 }
 
-TEST_CASE("std beside median: the per-range moment pass skips nulls and merges ranges",
+TEST_CASE("std, alone or beside median: the per-range moment pass skips nulls and merges ranges",
           "[runtime][aggregate][median]") {
-    // std() next to a collected aggregate folds per row range after grouping
-    // and merges the ranges' moments per group. An Int64 value column with
-    // nulls: null rows hold a large payload a fold must not read; group 7 has
-    // one valid value (std null), group 8 none (median and std null). Checked
-    // serially and on eight workers, through the cell and the index paths.
+    // std() alone (the chunked aggregate) or next to a collected aggregate
+    // (folded per row range after grouping, ranges' moments merged per group). An Int64 value
+    // column with nulls: null rows hold a large payload a fold must not read; group 7 has one valid
+    // value (std null), group 8 none (median and std null). Checked serially and on eight workers,
+    // through the cell and the index paths.
     constexpr std::size_t kRows = 300'000;
     Column<std::int64_t> g;
     Column<std::int64_t> wide;
@@ -2966,10 +3057,12 @@ TEST_CASE("std beside median: the per-range moment pass skips nulls and merges r
     runtime::TableRegistry registry;
     registry.emplace("t", std::move(t));
 
-    for (const char* key : {"g", "w"}) {
-        INFO("by " << key);
+    for (const auto& [key, with_median] : {std::pair{"g", false}, std::pair{"w", false},
+                                           std::pair{"g", true}, std::pair{"w", true}}) {
+        INFO("by " << key << (with_median ? ", with median" : ", std alone"));
         auto program =
-            parser::parse(std::string("t[select { m = median(v), s = std(v) }, by ") + key + "];");
+            parser::parse(std::string("t[select { ") + (with_median ? "m = median(v), " : "") +
+                          "s = std(v) }, by " + key + "];");
         REQUIRE(program.has_value());
         auto ir = parser::lower(program.value());
         REQUIRE(ir.has_value());
@@ -2985,14 +3078,16 @@ TEST_CASE("std beside median: the per-range moment pass skips nulls and merges r
             const auto* se = out->find_entry("s");
             const auto* me = out->find_entry("m");
             REQUIRE(se != nullptr);
-            REQUIRE(me != nullptr);
+            REQUIRE((me != nullptr) == with_median);
             const auto& sd_col = std::get<Column<double>>(*se->column);
             for (std::size_t r = 0; r < order.size(); ++r) {
                 const std::int64_t k = order[r];
                 INFO("group " << k);
                 const auto& values = want.at(k);
                 const std::size_t n = values.size();
-                REQUIRE(runtime::is_null(*me, r) == (n == 0));
+                if (me != nullptr) {
+                    REQUIRE(runtime::is_null(*me, r) == (n == 0));
+                }
                 REQUIRE(runtime::is_null(*se, r) == (n < 2));
                 if (n < 2) {
                     continue;

@@ -2,7 +2,7 @@
 
 For unchanged real Polars lazy queries using `.collect(engine=IbexEngine())`,
 see the [Polars Engine prototype](ibex_polars/README.md) and
-[Engine comparison](polars-engine-performance.md).
+[Engine comparison](performance.md).
 
 The `ibex` module under this directory is an independent frontend with an
 initial subset of the Polars 2.0 API. Polars is not a runtime dependency.
@@ -168,7 +168,7 @@ remain unsupported. Every joined pipeline executes in one native call.
 ## Check the actual upstream PDS-H query
 
 For the full 22-query adapter coverage check and current scale-10 timings against
-both Polars executors, see [PDS-H engine performance](pdsh-performance.md).
+both Polars executors, see [PDS-H engine performance](performance.md#pds-h-through-ibexengine-scale-10).
 The engine now runs **all 22 PDS-H queries**, checked on SF10 at one and
 eight workers. New translations include literal membership, conditionals,
 Boolean sums, basic string matching, Date years, shared cached subplans,
@@ -252,10 +252,10 @@ PYTHONPATH=build-release/python:python IBEX_CORES=1 POLARS_MAX_THREADS=1 \
 
 Omit `--in-memory` to use lazy Parquet scans. The runner compares all output
 columns and types, including UInt32 counts and Float64 means. See
-[q01 performance measurements](q01-performance.md) for the release-build
+[q01 performance measurements](performance.md#pds-h-q01-through-the-ibex-package) for the release-build
 in-memory comparison, input preparation and first-use limitations.
 
 For a workload where the benchmark page shows a strong Ibex win, see
-[grouped mean by symbol and day](grouped-mean-performance.md): the direct
+[grouped mean by symbol and day](performance.md#resident-grouped-mean-ibexengine-and-import-ibex-as-pl): the direct
 `import ibex as pl` translation, a runnable example, and fresh resident-table
 measurements against both string and categorical reference keys.

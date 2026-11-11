@@ -120,7 +120,7 @@ hints are not forwarded to native scheduling.
 Native substring uses bounded codepoint scans without an offset array. Paired
 SF10 Q22 collections improve from 536 to 385 ms at eight threads and from
 1,193 to 1,030 ms at one thread, with complete result equality. See the
-[PDS performance report](../pdsh-performance.md) for measurements.
+[PDS-H performance summary](../performance.md#pds-h-through-ibexengine-scale-10) for measurements.
 The complete 22-query suite has geometric-mean runtime ratios versus
 streaming Polars of 1.10× at one thread and 1.37× at eight; versus in-memory
 Polars, the ratios are 0.84× and 1.02×. Every measured result matches.
@@ -275,8 +275,8 @@ The focused suite checks null/empty behavior, simultaneous updates, category
 types, caching, ownership, demand projection and failures without fallback.
 CTest registers `ibex_polars_engine` when the pinned dependency is available.
 
-See [the Engine comparison](../polars-engine-performance.md) for resident
+See [the performance summary](../performance.md#resident-grouped-mean-ibexengine-and-import-ibex-as-pl) for resident
 grouped-mean timings, including preparation and first collection.
 
 Matched join timings, preparation costs, raw samples and reproduction commands
-are in the [join performance comparison](../join-performance.md).
+are in the [join performance summary](../performance.md#synthetic-joins-through-ibexengine).

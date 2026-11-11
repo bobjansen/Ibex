@@ -599,8 +599,8 @@ Reuse the Engine and query to retain prepared resident inputs; every collection
 executes again. Unsupported plans fail explicitly. This source-tree experiment
 pins Polars 2.0.0 and its private plan visitor. See
 [scope and setup](python/ibex_polars/README.md) and
-[resident-table measurements](python/polars-engine-performance.md).
-The [PDS-H comparison](python/pdsh-performance.md) runs all 22 unchanged
+[resident-table measurements](python/performance.md#resident-grouped-mean-ibexengine-and-import-ibex-as-pl).
+The [PDS-H comparison](python/performance.md#pds-h-through-ibexengine-scale-10) runs all 22 unchanged
 upstream queries on SF10 through the engine; every result matches Polars,
 including row order and dtypes. Against Polars 2.0 streaming, re-run in the
 same sitting (2026-11-07, `c0a3b8ae`, i7-13700 at a fixed 3.2 GHz), the
@@ -635,9 +635,9 @@ input so repeated collection avoids conversion and reuses categorical keys.
 Results use Ibex containers backed by Arrow, with Arrow
 dtype descriptors. See [Python setup and compatibility scope](python/README.md)
 for build instructions and the unchanged upstream query conformance runners.
-[Local q01 measurements](python/q01-performance.md) include warm timings and
+[Local q01 measurements](python/performance.md#pds-h-q01-through-the-ibex-package) include warm timings and
 the remaining first-use cost.
-The [grouped-mean example and measurements](python/grouped-mean-performance.md)
+The [grouped-mean example and measurements](python/performance.md#resident-grouped-mean-ibexengine-and-import-ibex-as-pl)
 show how one of the benchmark page's strongest supported wins translates into
 `import ibex as pl` on already-resident tables.
 

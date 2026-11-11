@@ -24,7 +24,7 @@ categorical threshold; this avoids the initial raw-import route's repeated
 conversion and plain-string grouping costs. Seventeen focused tests pass,
 including nullable keys, empty groups, source ownership and dictionary reuse.
 Release measurements vary input size, group count and thread budget; see
-`python/q01-performance.md`. Warm results are competitive, but first use
+`python/performance.md` (q01 section). Warm results are competitive, but first use
 including input preparation remains slower in the recorded local case.
 Priorities before expanding the API: investigate first-use allocations and
 prepare only demanded input columns; keep preparation costs visible.
@@ -39,7 +39,7 @@ weakly owned cache prepares only demanded resident columns and retains input
 ownership; repeated collection always executes. The adapter preserves
 simultaneous update semantics, count/category output types, null sorting and
 Polars' NaN comparison/order behavior. See `python/ibex_polars/README.md` and
-`python/polars-engine-performance.md`.
+`python/performance.md`.
 
 The resident categorical experiment also exposed a native aggregate reader
 calling a mutable `.data()` through a shared pointer, detaching borrowed Arrow

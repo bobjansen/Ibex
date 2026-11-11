@@ -25,8 +25,6 @@ from h2o import run as h2o
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--native-output', action='store_true', help='Experimental C++ physical materializer')
-    parser.add_argument('--right-rows', action='store_true', help='Benchmark prototype against current engine')
     parser.add_argument('--reconstruction', action='store_true', help='Measure reconstruction sub-stages')
     parser.add_argument('--baseline-engine', type=Path, help='Saved _engine.py for Python-only paired A/B')
     parser.add_argument('--data', default='J1_1e7_NA_0_0')
@@ -35,8 +33,6 @@ def main():
     parser.add_argument('--limit', type=int, help='Smoke check only: truncate each input')
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
-    if args.native_output:
-        args.right_rows = True
     if args.iters < 6 or args.iters % 2 or (args.limit is not None and args.limit < 1):
         parser.error('even --iters >= 6 and positive --limit required')
     if set(args.questions) - {f'q{i}' for i in range(1, 6)}:
@@ -46,14 +42,6 @@ def main():
     import ibex_pyarrow
     from ibex_polars import IbexEngine, _engine
     engine_type, converter = IbexEngine, _engine._to_polars
-    if args.right_rows:
-        if args.baseline_engine or args.reconstruction:
-            parser.error('--right-rows cannot combine with --baseline-engine or --reconstruction')
-        from prototype_right_rows import RightRowsEngine, to_polars
-        engine_type, converter = RightRowsEngine, to_polars
-        if args.native_output:
-            from prototype_native_output import NativeOutputEngine, to_polars
-            engine_type, converter = NativeOutputEngine, to_polars
     binary = Path(ibex_pyarrow.__file__).resolve()
     if not binary.is_relative_to(ROOT / 'build-release/python'):
         parser.error('PYTHONPATH must select build-release/python')
@@ -65,8 +53,6 @@ def main():
     if args.baseline_engine:
         baseline = {'__name__': 'ibex_polars._baseline_engine', '__package__': 'ibex_polars'}
         exec(compile(args.baseline_engine.read_text(), str(args.baseline_engine), 'exec'), baseline)
-    if args.right_rows:
-        baseline = {'IbexEngine': IbexEngine}
     frames = []
     for label, path in h2o.join_tables(args.data).items():
         keys = {'x': 3, 'small': 1, 'medium': 2, 'big': 3}[label]
@@ -84,15 +70,6 @@ def main():
               'affinity': sorted(os.sched_getaffinity(0)), 'iterations': args.iters,
               'correctness': 'full output values and dtypes; join order unspecified',
               'timing': __doc__, 'cases': []}
-    if args.right_rows:
-        report['prototype'] = 'right rows; unoptimized preparation, single-query strong cache'
-        path = ROOT / 'python/prototype_right_rows.py'
-        report['source_sha256'][str(path.relative_to(ROOT))] = hashlib.sha256(path.read_bytes()).hexdigest()
-    if args.native_output:
-        report['prototype'] = 'native physical output; supported cat.to attachment; unoptimized preparation'
-        for path in (ROOT / 'python/prototype_native_output.py', ROOT / 'python/experiments/materialize.cpp',
-                     Path(os.environ.get('IBEX_MATERIALIZER_LIB', str(Path(__file__).resolve().parents[1] / 'build-release/ibex-materialize.so')))):
-            report['source_sha256'][str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
     if args.baseline_engine:
         report['baseline_engine_sha256'] = hashlib.sha256(args.baseline_engine.read_bytes()).hexdigest()
     for name, description, _, _, make_query, _ in h2o.join_questions(False):
@@ -113,11 +90,6 @@ def main():
         if baseline is not None:
             baseline_engine = baseline['IbexEngine']().prepare(query)
             calls['ibex_baseline'] = lambda: query.collect(engine=baseline_engine)
-        if args.native_output and left_rows is not None and len(left_rows) == 4:
-            _, right_row, _, payload = left_rows
-            physical = payload.physical(raw[right_row])
-            calls['physical_materialize'] = lambda: payload.physical(raw[right_row])
-            calls['categorical_attach'] = lambda: payload.attach(physical)
         reference = calls['polars_streaming']()
         for route in ('ibex_cached', 'conversion', *(['ibex_baseline'] if baseline is not None else [])):
             assert_frame_equal(calls[route](), reference, check_row_order=False)

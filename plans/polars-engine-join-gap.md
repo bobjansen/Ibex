@@ -75,13 +75,12 @@ apply (8t q1 1.29×, q3 1.86×, q5 0.99× at `cd08c604`).
 ## Measured dead ends (details in the diary version)
 
 - Gathering only the Categorical columns by row number: q1 170 → 390 ms.
-- Right-row prototype (`python/prototype_right_rows.py`): carry right row
-  numbers and gather original payloads in Polars. q3 −35% at 8t, but q5
-  +59% at both budgets: the random gather moves to Polars, which is slower.
-- Native physical-output prototype (`python/prototype_native_output.py`,
-  `python/experiments/`): write final buffers in C++, then attach via
-  `cat.to`. q3 −45% at 8t, q5 +5% / +52% (8t / 1t): late random access
-  is real work, and validation still costs ~83 ms on q5.
+- Right-row prototype (removed): carry right row numbers and gather the
+  original payloads in Polars. q3 −35% at 8t, but q5 +59% at both
+  budgets: the random gather moves to Polars, which is slower.
+- Native physical-output prototype (removed): write final buffers in C++,
+  then attach via `cat.to`. q3 −45% at 8t, q5 +5% / +52% (8t / 1t): late
+  random access is real work, and validation still costs ~83 ms on q5.
 
 ## Open
 
@@ -134,5 +133,5 @@ decomposition; `--reconstruction` profiles the conversion sub-stages.
 - The AWS Polars-engines run (`benchmarking/aws/run-polars-engines.sh
   --on-demand`, paid; needs the commit pushed and `AWS_PROFILE=ibex-bench`)
   has not been launched; it would publish these ratios.
-- `docs/polars-engine.html` and `python/pdsh-performance.md` describe the
-  engine; `python/polars-engine-performance.md` has older join measurements.
+- `docs/polars-engine.html` describes the engine; `python/performance.md`
+  summarises where it stands on PDS-H, h2o and synthetic joins.

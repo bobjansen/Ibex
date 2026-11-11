@@ -6,7 +6,7 @@
 Reads <dir>/h2o_*_<N>t.tsv (benchmarking/h2o/run.py, engines polars and
 polars-ibex) and <dir>/pdsh_<N>t.json (bench_pdsh_engine.py --skip-in-memory).
 h2o uses each question's minimum, as the h2o harness does; PDS-H uses medians,
-as python/pdsh-performance.md does. Ratios are IbexEngine over Polars
+as python/performance.md does. Ratios are IbexEngine over Polars
 streaming, so below 1 means IbexEngine is faster.
 
 IbexEngine prepares each query once before its timed collects: it translates

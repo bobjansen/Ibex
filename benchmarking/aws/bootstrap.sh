@@ -378,6 +378,19 @@ pdsh_checkout() {
     fi
 }
 
+# Fixes for upstream query bugs (benchmarking/pdsh-patches/*.patch), applied
+# after the checkout resets the tree. Only for the IbexEngine comparison, whose
+# local checkout carries the same fixes; the recorded upstream_worktree_patch
+# shows what ran.
+pdsh_apply_patches() {
+    local patch
+    for patch in /ibex/benchmarking/pdsh-patches/*.patch; do
+        [[ -e "$patch" ]] || continue
+        git -C "$PDSH_ROOT" apply "$patch" || return 1
+        echo "applied $(basename "$patch") to $PDSH_ROOT"
+    done
+}
+
 # Prints upstream's spelling of a scale factor ("10" -> "10.0") after
 # generating its tables under $PDSH_ROOT/data/tables/scale-<that>.
 pdsh_data_tables() {
@@ -1139,6 +1152,8 @@ if [[ "${IBEX_POLARS_ENGINES_MODE:-0}" == "1" ]]; then
         {
             echo "ibex_commit=$(git -C /ibex rev-parse HEAD)"
             echo "pdsh_commit=$PDSH_COMMIT"
+            echo "pdsh_patches=$(cd /ibex/benchmarking/pdsh-patches 2>/dev/null && ls -- *.patch 2>/dev/null | tr '\n' ' ')"
+            echo "compact_int32=${IBEX_COMPACT_INT32:-0}"
             /ibex/.venv/bin/python -c 'import sys, polars, pyarrow; print(f"python={sys.version.split()[0]}"); print(f"polars={polars.__version__}"); print(f"pyarrow={pyarrow.__version__}")'
             lscpu
         } > "$PE_OUT/versions.txt" 2>&1
@@ -1179,7 +1194,13 @@ if [[ "${IBEX_POLARS_ENGINES_MODE:-0}" == "1" ]]; then
     IFS=',' read -r -a PE_H2O_DATA <<< "${IBEX_PE_H2O_DATA}"
     h2o_gen_data "${PE_H2O_DATA[@]}"
     pdsh_checkout
+    pdsh_apply_patches
     pe_scale="$(pdsh_data_tables "${IBEX_PE_SF:-10}")"
+    # Opt-in compact Int32 storage (src/runtime/CONTRACTS.md §8), for every
+    # IbexEngine collection below.
+    if [[ "${IBEX_PE_COMPACT_INT32:-0}" == "1" ]]; then
+        export IBEX_COMPACT_INT32=1
+    fi
 
     # A failed validation makes the driver exit non-zero after the other
     # suites ran; record it and carry on, so one bad cell does not cost the

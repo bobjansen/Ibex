@@ -24,7 +24,12 @@
 #   --volume-size GB     root volume (default 150)
 #   --warmup N / --iters N   h2o warmups and timed iterations (default 1 / 5)
 #   --pdsh-iters N       PDS-H interleaved rounds, even (default 6)
+#   --compact-int32      run IbexEngine with IBEX_COMPACT_INT32=1 (opt-in
+#                        compact Int32 storage); recorded in versions.txt
 #   --key KEY / --region R / --on-demand
+#
+# The PDS-H checkout gets benchmarking/pdsh-patches/*.patch (upstream query
+# bugs, e.g. q16's regex), as the local checkout does.
 #
 # The commit must be pushed: the box clones origin and checks out HEAD.
 #
@@ -52,6 +57,7 @@ ITERS=5
 PDSH_ITERS=6
 KEY_NAME=""
 ON_DEMAND=0
+COMPACT_INT32=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -67,7 +73,8 @@ while [[ $# -gt 0 ]]; do
         --key) KEY_NAME="$2"; shift 2 ;;
         --region) REGION="$2"; shift 2 ;;
         --on-demand) ON_DEMAND=1; shift ;;
-        -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
+        --compact-int32) COMPACT_INT32=1; shift ;;
+        -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -118,6 +125,7 @@ fi
 echo "Commit : ${COMMIT:0:8} ($BRANCH)"
 echo "Suites : PDS-H SF-${SF} (${PDSH_ITERS} rounds); h2o ${DATA} (${WARMUP} warmup + ${ITERS} iterations)"
 echo "Threads: ${THREADS} (ThreadsPerCore=${THREADS_PER_CORE})"
+echo "Compact: IBEX_COMPACT_INT32=${COMPACT_INT32}"
 echo "Type   : $INSTANCE_TYPE ($([[ "$ON_DEMAND" -eq 1 ]] && echo on-demand || echo spot))"
 echo "Box    : $(bench_topology_line "$REGION" "$INSTANCE_TYPE")"
 echo "Result : s3://$S3_BUCKET/$RESULT_KEY"
@@ -125,6 +133,7 @@ echo "Result : s3://$S3_BUCKET/$RESULT_KEY"
 USER_DATA=$(bench_user_data "$REPO_URL" "$COMMIT" \
     "IBEX_POLARS_ENGINES_MODE=1" "IBEX_PE_THREADS=${THREADS}" "IBEX_PE_SF=${SF}" \
     "IBEX_PE_H2O_DATA=${DATA}" "IBEX_PE_PDSH_ITERS=${PDSH_ITERS}" \
+    "IBEX_PE_COMPACT_INT32=${COMPACT_INT32}" \
     "IBEX_WARMUP=${WARMUP}" "IBEX_ITERS=${ITERS}" \
     "IBEX_S3_BUCKET=${S3_BUCKET}" "IBEX_RESULT_KEY=${RESULT_KEY}" "IBEX_REGION=${REGION}")
 INSTANCE_ID=$(aws ec2 run-instances --region "$REGION" --instance-type "$INSTANCE_TYPE" --image-id "$AMI" \

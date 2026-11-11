@@ -52,7 +52,7 @@ history).
 | [non-row-local-filter-plan.md](non-row-local-filter-plan.md) | Stage 1 shipped | `lag`/`lead`/`is_null` in filter work. Remaining: `rank(...)` in filter/select with `by`, explicit `order {}` context, rolling functions in filter (`price > rolling_mean(price)`) |
 | [bigger-than-ram-plan.md](bigger-than-ram-plan.md) | Phase 4 bullet 1 of 4 done | Out-of-core execution. Done: chunked/streaming `read_parquet` (branch `chunked-parquet-read`; ~6.5× lower peak RSS, ~1.7× faster, verified local + AWS). Next: column projection pushdown, row-group stats pushdown, directory/Hive datasets (rest of Phase 4), then Phase 1 spill infrastructure (prerequisite for Phases 2–3, 6–7: external sort, out-of-core join, adaptive spill selection) |
 | [grouped-chunkview-update-plan.md](grouped-chunkview-update-plan.md) | Mostly complete — `update …, by k` runs off an immutable `GroupedRowPlan` (CSR) instead of gather → per-group `Table` → scatter. Began as a sub-plan of the (retired) kernel-pipeline plan's Phase 2. | Remaining materialized shapes: `rank`, variable-width ordered state, `window`-clause `lag`/`lead`. |
-| [polars-engine-join-gap.md](polars-engine-join-gap.md) | **Open, 2026-11-10.** h2o joins through IbexEngine at 8 threads: 1.24–1.43× Polars streaming (q5 0.88×) with compact Int32 on, from 2.9–3.4× on 11-10 morning: parallel conversion (97cfa159), native left-row mask (04dd8165), right payload Categoricals as compact Int32 ids (df1235da). | `cat.to`'s per-row validation (no unchecked constructor reachable in Polars 2.0.0); Float32 still widens; the id path needs compact on; groupby q10 / K=2 have the same cause. |
+| [polars-engine-join-gap.md](polars-engine-join-gap.md) | **Open, 2026-11-10.** h2o joins through IbexEngine at 8 threads: 1.24–1.43× Polars streaming (q5 0.88×) with compact Int32 on, from 2.9–3.4× on 11-10 morning: parallel conversion (ce53b9bb), native left-row mask (cd08c604), right payload Categoricals as compact Int32 ids (a929c528). | `cat.to`'s per-row validation (no unchecked constructor reachable in Polars 2.0.0); Float32 still widens; the id path needs compact on; groupby q10 / K=2 have the same cause. |
 | [python-polars-backend-plan.md](python-polars-backend-plan.md) | Independent Python q06/q01 slices implemented, 2026-10-12; prepared in-memory inputs, grouped aggregates and sorting. Correctness and local warm/first-use measurements recorded. | First-use/preparation overhead and demanded-column binding; then Engine prototype/comparison, remaining PDS-H/API coverage and packaging. |
 
 Correlation work and the deferred compressed-DuckDB benchmark refresh are tracked
@@ -84,7 +84,7 @@ in active plans to `plans/done/...` paths refer to that history.
 
 - **Retired 2026-11-10**: **native-int32-storage.md** — compact Int32
   backing for logically Int64 columns, opt-in through `IBEX_COMPACT_INT32=1`.
-  Read it at `git show df1235da:plans/native-int32-storage.md`; the contract
+  Read it at `git show a929c528:plans/native-int32-storage.md`; the contract
   is `src/runtime/CONTRACTS.md` §8, the evidence `benchmarking/int32/`. Left:
   making compact the default needs its own gate with compact on (every
   ibex_bench suite, PDS-H SF-10 native and adapter, peak memory on real

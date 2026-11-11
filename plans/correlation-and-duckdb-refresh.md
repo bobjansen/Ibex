@@ -31,7 +31,7 @@ Correctness validation completed on this worktree:
 Performance validation is deferred while the local machine is busy. Do not
 report a speedup from the implementation alone. On a quiet machine, rebuild the
 complete Release tree and use `benchmarking/compare_ibex_git.sh` with
-`--base a0e373a3 --target WORKTREE --interleave --ibex-suite stats`, forwarding
+`--base 7acbc081 --target WORKTREE --interleave --ibex-suite stats`, forwarding
 the actual `--csv-trades` path. Check operator profiles, answers, and thread
 byte identity as well as wall time. Repeat for multiple row counts and nullable
 versus non-null inputs. Check mixed/global and H2O grouped corr/cov for regressions.

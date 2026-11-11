@@ -8,11 +8,11 @@ invert the completed word once. All other filter, allocation and gather work
 is shared with the existing `filter_rows` path. No column type, narrowing rule,
 allocator policy or environment switch is introduced.
 
-Against `f1eb185c` it resolves `null_semi_join` -2.3% and `null_anti_join`
+Against `89ddea58` it resolves `null_semi_join` -2.3% and `null_anti_join`
 -2.1% at one core in the 91-row broad gate. The earlier
 [regression audit](../regression-audit/README.md) measured these two
 categorical queries at +2.07% / +2.22% against the pre-Int32 baseline
-`0caffc17`. Rerunning that exact configuration against `60ac018e` (see
+`7f5e27c4`. Rerunning that exact configuration against `a88f9769` (see
 [Against the pre-Int32 baseline](#against-the-pre-int32-baseline)) gives
 -1.9% / -1.7%: the regression is gone, and the small improvement is not
 resolved after correction. In the dedicated integer-key benchmark, both widths
@@ -74,7 +74,7 @@ values match their Int64 build-side equivalents.
 
 All builds are Release/native, compact ingestion is off, and the frequency is
 locked at 3.2 GHz. CPU affinity is `2` or `0,2,4,6,8,10,12,14`. Base is
-`f1eb185c`; target is the working tree with this change. Each gate has an
+`89ddea58`; target is the working tree with this change. Each gate has an
 unchanged replica that is byte-identical to the base. No build or other
 benchmark ran during timing. Effects are medians of paired ratios.
 
@@ -123,13 +123,13 @@ has no slowdown. Null semi and anti joins resolve at -1.7% / -1.85% there.
 ## Against the pre-Int32 baseline
 
 This uses the audit's one-core focused confirmation unchanged: base
-`0caffc17`, target `60ac018e`, suites `scalar,null,timeframe`, 18 interleaved
+`7f5e27c4`, target `a88f9769`, suites `scalar,null,timeframe`, 18 interleaved
 triplets, nine iterations, two warmups, CPU 2, Holm correction across 29 rows.
 An eight-core run of the `null` suite uses the same repeat counts. Both
 replicas are byte-identical to the base, and no control/base comparison
 resolves.
 
-| Query | Audit (`d0ee5dd1`) | Now (`60ac018e`) | Holm p now |
+| Query | Audit (`55ac34fa`) | Now (`a88f9769`) | Holm p now |
 | --- | ---: | ---: | ---: |
 | `null_semi_join`, 1 core | +2.07% (p=0.0057) | -1.87% | 0.39 |
 | `null_anti_join`, 1 core | +2.22% (p=0.0057) | -1.73% | 0.32 |
@@ -144,7 +144,7 @@ touch them:
 - `tf_rolling_sum_1m` **+4.9%** (Holm p=0.041). The audit measured it flat
   (+0.07%) in this configuration. The broad gate for this change has it at
   +1.0% / -0.2% (1 / 8 cores, unresolved). The earlier integer-abs gate
-  (`a9443d01`, which changed only `expr.cpp`) already had it at +2.5% / +5.2%
+  (`7500a910`, which changed only `expr.cpp`) already had it at +2.5% / +5.2%
   (p=0.064 / 0.052, unresolved). The shift therefore lines up with that
   earlier commit. Four follow-up timeframe gates did **not** reproduce the
   +4.9%. They put the integer-abs commit alone at +2.9% / +3.2% and the
@@ -155,7 +155,7 @@ touch them:
 
 `tf_rolling_ewma_1m` is +0.5% (audit: +1.29%) and is unresolved.
 
-Raw results: `vs-0caffc17/` in the local evidence directory, including its
+Raw results: `vs-7f5e27c4/` in the local evidence directory, including its
 `run.sh`.
 
 ## Correctness checks

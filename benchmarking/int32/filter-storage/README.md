@@ -1,7 +1,7 @@
 # Preserve physical Int32 in runtime filter results
 
 The main `python` worktree contains the native Int32 implementation and the
-physical-pointer gather fix (merge 207232d9). Compact ingestion remains opt-in;
+physical-pointer gather fix (merge 638444d1). Compact ingestion remains opt-in;
 this follow-up preserves the physical width of columns that are already compact.
 
 Table and native-chunk filters now use shared helpers to allocate an Int32

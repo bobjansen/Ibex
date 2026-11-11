@@ -35,7 +35,7 @@ SUITES = (('const H2O = ', 'h2o'), ('const PDSH = ', 'PDS-H'), ('const PAYLOAD =
 
 
 def suite_commits(page: str) -> str:
-    """Each suite's measured commit, e.g. 'h2o + PDS-H b23a1390, in-memory 950fafc1'.
+    """Each suite's measured commit, e.g. 'h2o + PDS-H 618c0455, in-memory 950fafc1'.
 
     The suites are measured separately, so no one commit describes a page.
     """

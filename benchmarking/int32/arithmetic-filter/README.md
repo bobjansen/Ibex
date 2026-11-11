@@ -5,10 +5,10 @@ storage at `benchmarking/results/local/int32/2026-11-09/arithmetic-filter/`. The
 filenames below refer to that local evidence directory.
 
 **Outcome: layout sensitivity established; local alignment candidate rejected.**
-The runtime remains unchanged from `98aa0d7b`.
+The runtime remains unchanged from `f528640a`.
 
-Starting point: `98aa0d7b`, after the aggregate and categorical-probe repairs.
-Original native baseline: `0caffc17`. Compact ingestion stays opt-in. There is
+Starting point: `f528640a`, after the aggregate and categorical-probe repairs.
+Original native baseline: `7f5e27c4`. Compact ingestion stays opt-in. There is
 no allocator replacement or arithmetic-width change in this work.
 
 ## Reproducing and locating the difference
@@ -145,7 +145,7 @@ not attribute the entire 2.82% cross-build change to one loop or padding alone.
 The runtime hint was removed. The proposed five-line change remains reviewable
 as [candidate-gather-alignment.patch](candidate-gather-alignment.patch), and the
 counterfactual source remains in [alignment-diagnostic.patch](alignment-diagnostic.patch).
-Both apply to `98aa0d7b` with `git apply --unidiff-zero`.
+Both apply to `f528640a` with `git apply --unidiff-zero`.
 Diagnostic build hashes (`diagnostic-build.json`, local evidence), stage build provenance (`stage-build.json`, local evidence),
 and conditions/checks (`conditions.json`, local evidence) identify the evidence.
 
@@ -168,7 +168,7 @@ The original focused run (from the repository root):
 
 ```bash
 IBEX_CORES=1 IBEX_COMPACT_INT32=0 IBEX_PERFCMP_JOBS=6 \
-benchmarking/compare_ibex_git.sh --base 0caffc17 --target 98aa0d7b \
+benchmarking/compare_ibex_git.sh --base 7f5e27c4 --target f528640a \
   --ibex-suite filter --csv "$PWD/benchmarking/data/prices.csv" \
   --csv-trades "$PWD/benchmarking/data/trades.csv" \
   --interleave --replica-control --repeats 30 --warmup 3 --iters 25 \
@@ -176,7 +176,7 @@ benchmarking/compare_ibex_git.sh --base 0caffc17 --target 98aa0d7b \
 ```
 
 For the controlled alignment test, build the diagnostic patch in a separate
-branch/worktree at `98aa0d7b`, with Clang Release `-march=native`, and run this
+branch/worktree at `f528640a`, with Clang Release `-march=native`, and run this
 checkout's retained driver:
 
 ```bash

@@ -1,6 +1,6 @@
 # PDS-H SF-10 end-to-end check, 2026-11-10
 
-`429b4e25` (Int32 branch, clean tree; runtime identical to `60ac018e`) runs
+`8721190e` (Int32 branch, clean tree; runtime identical to `a88f9769`) runs
 all 22 PDS-H queries at SF-10 against Polars 2 streaming and DuckDB in one
 sitting. All 22 answers match Polars. Compared with the previous native run
 (`a4dead37`, 2026-10-23), **every query is faster once the q21 query-text
@@ -21,10 +21,10 @@ taskset -c 0,2,4,6,8,10,12,14 benchmarking/tpch/run_bench.sh \
 - One CPU per physical core. The outer `taskset` is required: without it,
   `run_bench.sh` pins CPUs 0-7, which are 4 physical cores plus their SMT
   siblings. A first attempt today made that mistake: every engine read 25-37%
-  slower, and that archive (`20261110T181219Z_429b4e25_sf10`) is not used here.
+  slower, and that archive (`20261110T181219Z_8721190e_sf10`) is not used here.
 - Data: polars-benchmark's own SF-10 tables (`pdsh_commit` 401908a, tpchgen
   2.0.2).
-- Archives: `benchmarking/tpch/results/runs/20261110T183010Z_429b4e25_sf10`
+- Archives: `benchmarking/tpch/results/runs/20261110T183010Z_8721190e_sf10`
   (now) and `20261023T194138Z_a4dead37-dirty_sf10` (before; the dirty file
   was only `.gitignore`).
 
@@ -34,7 +34,7 @@ is comparable, so the Ibex change is attributable to Ibex.
 
 ## Summary
 
-| Geomean over 22 queries | 10-23 (`a4dead37`) | Now (`429b4e25`) |
+| Geomean over 22 queries | 10-23 (`a4dead37`) | Now (`8721190e`) |
 | --- | ---: | ---: |
 | Ibex now / Ibex 10-23, 8 cores | | 0.873 |
 | Ibex now / Ibex 10-23, 1 core | | 0.877 |

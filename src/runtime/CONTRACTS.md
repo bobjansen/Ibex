@@ -215,7 +215,7 @@ decimal is a bug.
 Normative comments: `include/ibex/core/column.hpp` (`from_compact_int32`,
 `visit_integer_storage`, `widened_int64`, `IntegerView`) and
 `include/ibex/runtime/env.hpp`. Plan retired 2026-11-10:
-`git show df1235da:plans/native-int32-storage.md`; measurements and
+`git show a929c528:plans/native-int32-storage.md`; measurements and
 diagnoses are in `benchmarking/int32/*/README.md`.
 
 * **Ingestion only.** With the flag on, signed Int32 from Parquet (sharded,

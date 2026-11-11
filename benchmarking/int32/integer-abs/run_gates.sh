@@ -31,7 +31,7 @@ run_gate() {
     echo "$name complete"
 }
 
-run_gate before-after-one 16de4eb3 1 all 12 1 3
-run_gate before-after-eight 16de4eb3 8 all 12 1 3
-run_gate original-one 0caffc17 1 scalar 18 2 9
-run_gate original-eight 0caffc17 8 scalar 18 2 15
+run_gate before-after-one b551d071 1 all 12 1 3
+run_gate before-after-eight b551d071 8 all 12 1 3
+run_gate original-one 7f5e27c4 1 scalar 18 2 9
+run_gate original-eight 7f5e27c4 8 scalar 18 2 15

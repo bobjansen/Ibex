@@ -365,6 +365,7 @@ pdsh_checkout() {
     fi
     git -C "$PDSH_ROOT" fetch --quiet origin "$PDSH_COMMIT"
     git -C "$PDSH_ROOT" checkout --force "$PDSH_COMMIT"
+    pdsh_apply_patches
     # The data comes from polars-benchmark's own generator (tpchgen-cli, then
     # Polars' parquet writer, pinned by its requirements.txt), never from Ibex,
     # so the layout cannot be said to favour Ibex. Its venv needs CPython 3.12
@@ -378,10 +379,9 @@ pdsh_checkout() {
     fi
 }
 
-# Fixes for upstream query bugs (benchmarking/pdsh-patches/*.patch), applied
-# after the checkout resets the tree. Only for the IbexEngine comparison, whose
-# local checkout carries the same fixes; the recorded upstream_worktree_patch
-# shows what ran.
+# Fixes for upstream query bugs (benchmarking/pdsh-patches/*.patch), applied by
+# pdsh_checkout after it resets the tree, so every engine and every mode runs
+# the same fixed queries, as locally. Manifests and versions.txt record them.
 pdsh_apply_patches() {
     local patch
     for patch in /ibex/benchmarking/pdsh-patches/*.patch; do
@@ -950,6 +950,7 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
         {
             echo "ibex_commit=$(git -C /ibex rev-parse HEAD)"
             echo "pdsh_commit=$PDSH_COMMIT"
+            echo "pdsh_patches=$(cd /ibex/benchmarking/pdsh-patches 2>/dev/null && ls -- *.patch 2>/dev/null | tr '\n' ' ')"
             uv run --project /ibex python3 -c 'import duckdb, polars; print(f"duckdb={duckdb.__version__}"); print(f"polars={polars.__version__}")'
         } > /ibex/benchmarking/tpch/results/versions.txt 2>&1 || true
         tar -C /ibex/benchmarking/tpch -czf "$ARTIFACT" results
@@ -1194,7 +1195,6 @@ if [[ "${IBEX_POLARS_ENGINES_MODE:-0}" == "1" ]]; then
     IFS=',' read -r -a PE_H2O_DATA <<< "${IBEX_PE_H2O_DATA}"
     h2o_gen_data "${PE_H2O_DATA[@]}"
     pdsh_checkout
-    pdsh_apply_patches
     pe_scale="$(pdsh_data_tables "${IBEX_PE_SF:-10}")"
     # Opt-in compact Int32 storage (src/runtime/CONTRACTS.md §8), for every
     # IbexEngine collection below.

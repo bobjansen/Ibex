@@ -19,7 +19,7 @@ rather than once per mask word. Each full selection visitor occupies 426 bytes.
 
 ## Focused performance gate
 
-The existing git A/B harness compared frozen ed1f9a17 against this working-tree
+The existing git A/B harness compared frozen 7aa08c09 against this working-tree
 change, including a byte-identical unchanged baseline replica. Twenty paired,
 interleaved repeats, two warmups, twenty timed iterations per process, one core
 pinned to CPU 2 at the existing 3.2GHz lock. Inputs are the existing 4M-row wide
@@ -51,7 +51,7 @@ Reproduce from this worktree after rebuilding the complete Release tree:
 mkdir -p build-loop-check/perfcmp
 IBEX_CORES=1 IBEX_COMPACT_INT32=0 IBEX_PERFCMP_JOBS=6 \
 IBEX_PERFCMP_TMPDIR="$PWD/build-loop-check/perfcmp" \
-benchmarking/compare_ibex_git.sh --base ed1f9a17 --target WORKTREE \
+benchmarking/compare_ibex_git.sh --base 7aa08c09 --target WORKTREE \
   --ibex-suite filter --csv-trades /home/brj/ibex/benchmarking/data/trades.csv \
   --csv /home/brj/ibex/benchmarking/data/prices.csv \
   --interleave --replica-control --repeats 20 --warmup 2 --iters 20 \

@@ -23,7 +23,7 @@ from ibex_polars._engine import _to_polars
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--base', default='9a06d28d')
+    parser.add_argument('--base', default='200873fc')
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]

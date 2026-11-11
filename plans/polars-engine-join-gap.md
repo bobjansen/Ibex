@@ -2,7 +2,7 @@
 
 Status: open, 2026-11-10. Compacted from the working diary; the full version
 (every profile, prototype and paired table) is
-`git show a929c528:plans/polars-engine-join-gap.md`. Raw outputs are local,
+`git show ed7fd554:plans/polars-engine-join-gap.md`. Raw outputs are local,
 under `benchmarking/results/local/` (named in that version).
 
 ## The problem
@@ -16,7 +16,7 @@ already ahead there (gm 0.93× at 8 cores, 0.88× at 1 core).
 
 ## Where it stands (i7-13700, 3.2 GHz locked, `IBEX_COMPACT_INT32=1`)
 
-Ibex/Polars streaming, median of paired ratios, at `a929c528`:
+Ibex/Polars streaming, median of paired ratios, at `ed7fd554`:
 
 | | 8 threads | 1 thread |
 |---|---:|---:|
@@ -26,9 +26,9 @@ Ibex/Polars streaming, median of paired ratios, at `a929c528`:
 | q4 medium inner on factor | 1.24 | 0.75 |
 | q5 big inner on int | 0.88 | 0.47 |
 
-On the morning of 2026-11-10 (`cf74c102`, compact off) the 8-thread ratios
+On the morning of 2026-11-10 (`f1208c16`, compact off) the 8-thread ratios
 were 2.9–3.4× (q5 1.5×). With compact off, the first two steps below still
-apply (8t q1 1.29×, q3 1.86×, q5 0.99× at `cd08c604`).
+apply (8t q1 1.29×, q3 1.86×, q5 0.99× at `75a7c840`).
 
 ## Why conversion costs what it does
 
@@ -53,21 +53,21 @@ apply (8t q1 1.29×, q3 1.86×, q5 0.99× at `cd08c604`).
 
 ## What is in the tree
 
-- **Left columns from the left frame** (b45bc098): a root inner/left equality
+- **Left columns from the left frame** (ba06dff9): a root inner/left equality
   join over a resident left `DataFrameScan` binds only the left keys plus an
   Int64 row number; `_engine._left_rows` rebuilds the left columns from the
   original frame (identity when every row survives in order, a streaming
   mask filter when they strictly increase, a gather otherwise).
-- **Known dictionaries** (f28bc821): categorical results carrying the
+- **Known dictionaries** (0cd258fe): categorical results carrying the
   dictionary Ibex was given map codes to Polars ids by offset or lookup.
-- **Int32 pass-through** (585929e4): with compact on, Int32 inputs bind
+- **Int32 pass-through** (e4afeb39): with compact on, Int32 inputs bind
   unchanged.
-- **Parallel conversion** (ce53b9bb): left and right halves overlap on a
+- **Parallel conversion** (b8109aa2): left and right halves overlap on a
   helper thread; id mapping, `cat.to`, the left filter and the final cast run
   as streaming queries.
-- **Native left-row mask** (cd08c604): `ibex_pyarrow.left_row_mask` checks
+- **Native left-row mask** (75a7c840): `ibex_pyarrow.left_row_mask` checks
   strict increase and builds the Arrow bitmap in one pass on the worker pool.
-- **Right payload Categoricals as ids** (a929c528): with compact on, a root
+- **Right payload Categoricals as ids** (ed7fd554): with compact on, a root
   join's resident right input binds its non-key Categoricals as compact Int32
   Polars ids; they return as ids and need only `cat.to`. The serial sentinel
   gather now keeps compact payloads compact.

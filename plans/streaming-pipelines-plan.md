@@ -167,13 +167,13 @@ says so.
    speaking of -- per-worker partitioning can buy ~5% at most. The serial
    time was the "materialize" half: q09's drain of the streamed probe output
    ran ~60 ms on one core, mostly the unit pipeline's 1M-row batching copy on
-   its stage thread. Fixed by unbatching drained pipelines (`8854cd63`:
+   its stage thread. Fixed by unbatching drained pipelines (`e4ae691e`:
    streamed q07 -10.5%, q09 -7.2%). Copying the drain over the pool instead
    gained nothing and lost the append's overlap with the producer (q19, q14
    regressed). q21's largest hole (~180 ms at one core, 8c) was not a join
    either: two serial zero-fills of aggregate scratch the parallel passes
    overwrite (`gids_buf_` for a 60M-row chunk, the run-compressed key/count
-   arrays); not zero-filling them was q21 -15% (`7dcadc5b`). A hunt for more
+   arrays); not zero-filling them was q21 -15% (`61bfb9fd`). A hunt for more
    (2026-10-21: page faults by thread over all 22 queries, both modes) found
    none worth it. The main thread's large faulters are the drain's
    chunk-by-chunk append (overlapped with the producer; see above) and
@@ -193,17 +193,17 @@ says so.
    45 ms producer), and q09's streamed 3.3M-row drain in `initialize` (+13
    ms). About 150 ms in all, out of ~11 s total. Collecting first and
    concatenating afterwards was slower on every query, so the inline append is
-   mostly hidden. q22's drain is gone (`e05f7985`): its filter run stopped at
+   mostly hidden. q22's drain is gone (`6bc4ef49`): its filter run stopped at
    the row-local update below it, so the update streamed alone and the run
    re-split its output. Over a lazy source the run now reaches down through
    such updates (`Plan::stream_only_bottom_updates`): q22 -16.5% / -18.8%
    streamed, nothing else moved. q13's drain fed the fused left-join count, which also
    spent ~140 ms after it: a serial 48 ms map build over 1.5M customer keys
    and an 85 ms probe pass. Dense keys are now addressed directly
-   (`679cbe54`, q13 -18.6%) and the right side streams into the counter a
-   chunk at a time (`d1b71845`, a further -19.2%): q13 ~570 -> ~400 ms, about
+   (`b3426a83`, q13 -18.6%) and the right side streams into the counter a
+   chunk at a time (`d89a0238`, a further -19.2%): q13 ~570 -> ~400 ms, about
    the time to decode and filter `orders`. Its declined fallback had been
-   failing outright (`796f6b0c`). q09's drain (the `orders` join's deferred probe, 3.26M
+   failing outright (`d4bd1634`). q09's drain (the `orders` join's deferred probe, 3.26M
    lineitem-join rows) stays: its copy is ~13 ms, and the barrier is what lets
    the `orders` scan decode only the 2.93M rows that can match. After it come
    ~6 ms of filter publication, ~51 ms of two-phase selection and ~42 ms of
@@ -212,7 +212,7 @@ says so.
    streamed q09 found no memory story: 57% of its cycles are zstd at IPC
    4.3, and its zstd instructions equal reading each needed column once.
    Unstreamed q09 did 22% more: the whole-source fused key scan decoded the
-   join key twice (`f7268bcd`, unstreamed q09 -7.9%). Most of what streamed
+   join key twice (`a0329ea4`, unstreamed q09 -7.9%). Most of what streamed
    probes gained on q09 was that duplicate decode. A hunt over all 22 queries
    (2026-10-22: each query's zstd instructions against the sum of its
    columns read once, both modes) found every query within 1% except two,

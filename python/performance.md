@@ -18,7 +18,7 @@ Raw samples stay on the measuring machine; they are not versioned.
 ## PDS-H through `IbexEngine` (scale 10)
 
 Upstream `polars-benchmark` query functions, unchanged, on upstream-generated
-Parquet. Ibex/Polars-streaming medians, 2026-11-07 afternoon (`c0a3b8ae`);
+Parquet. Ibex/Polars-streaming medians, 2026-11-07 afternoon (`075948ae`);
 all 22 answers match at both budgets.
 
 | Query | 8 threads | 1 thread | Query | 8 threads | 1 thread |
@@ -39,7 +39,7 @@ Geometric mean **0.93× at 8 threads** (faster on 13/22; summed medians 6.75 s
 against 7.16 s) and **0.88× at 1 thread** (19/22; 42.4 s against 49.0 s).
 A 2026-11-10 resweep reproduced both means (0.933 / 0.880) with one change:
 Q22 at one thread rose from 455 to 527 ms, in the adapter path only (native
-Q22 did not move), between `c0a3b8ae` and the 11-10 head; not yet bisected.
+Q22 did not move), between `075948ae` and the 11-10 head; not yet bisected.
 The largest remaining gaps are Q01 and Q09 at 8 threads (memory-bound
 aggregation at eight workers) and Q19/Q04 at one.
 

@@ -36,8 +36,8 @@ with its own timing boundary and provenance:
 | Suite | Measured | Ibex commit | Machine and budget | Timing |
 |---|---|---|---|---|
 | In-memory DataFrame | 2026-10-24 | `950fafc1` | r7i.2xlarge, 64 GiB; separate identical instance per engine (Ibex, Polars, DuckDB); 8 vCPUs on 4 physical cores, SMT on; default engine thread budgets, plus single-thread variants | Load once, excluded; full result materialisation; mean of 5 iterations after 1 warmup |
-| H2O, 10M rows | 2026-11-08 | `618c0455` | One r7i.4xlarge, Xeon Platinum 8488C, 128 GiB; SMT off; all engines pinned to the same 1 or 8 physical cores | Load once, excluded; full result materialisation; minimum of 5 iterations after 1 warmup |
-| PDS-H, SF10 | 2026-11-08 | `618c0455` | One r7i.4xlarge, Xeon Platinum 8488C, 128 GiB; SMT off; all engines pinned to the same 1, 2 or 8 physical cores | Parquet reads included in each query; full result materialisation; mean of 5 iterations after 1 warmup |
+| H2O, 10M rows | 2026-11-08 | `23436ea7` | One r7i.4xlarge, Xeon Platinum 8488C, 128 GiB; SMT off; all engines pinned to the same 1 or 8 physical cores | Load once, excluded; full result materialisation; minimum of 5 iterations after 1 warmup |
+| PDS-H, SF10 | 2026-11-08 | `23436ea7` | One r7i.4xlarge, Xeon Platinum 8488C, 128 GiB; SMT off; all engines pinned to the same 1, 2 or 8 physical cores | Parquet reads included in each query; full result materialisation; mean of 5 iterations after 1 warmup |
 
 H2O and PDS-H use Polars **2.0.0** (streaming) and DuckDB **2.0.0**.
 PDS-H pins upstream `pola-rs/polars-benchmark` at `401908a307f1`;
@@ -113,7 +113,7 @@ At `950fafc1`:
     --sizes 1M,2M,4M,8M,16M,32M,50M --warmup 1 --iters 5
 ```
 
-At `618c0455`:
+At `23436ea7`:
 
 ```bash
 ./benchmarking/aws/run-h2o.sh --on-demand --type r7i.4xlarge \

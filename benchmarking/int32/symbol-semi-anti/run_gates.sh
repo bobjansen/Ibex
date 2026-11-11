@@ -31,8 +31,8 @@ run_gate() {
     echo "$name complete"
 }
 
-run_gate before-after-one 89ddea58 1 all 12 1 3
-run_gate before-after-eight 89ddea58 8 all 12 1 3
+run_gate before-after-one cdae65cb 1 all 12 1 3
+run_gate before-after-eight cdae65cb 8 all 12 1 3
 .venv/bin/python benchmarking/int32/symbol-semi-anti/build.py \
     --base-build "$HOME/.cache/ibex/perfcmp/base/build" \
     --target-build "$HOME/.cache/ibex/perfcmp/target-worktree/build" \

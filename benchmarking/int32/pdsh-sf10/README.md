@@ -1,9 +1,9 @@
 # PDS-H SF-10 end-to-end check, 2026-11-10
 
-`8721190e` (Int32 branch, clean tree; runtime identical to `a88f9769`) runs
+`8b70b057` (Int32 branch, clean tree; runtime identical to `eca66476`) runs
 all 22 PDS-H queries at SF-10 against Polars 2 streaming and DuckDB in one
 sitting. All 22 answers match Polars. Compared with the previous native run
-(`a4dead37`, 2026-10-23), **every query is faster once the q21 query-text
+(`5f43038d`, 2026-10-23), **every query is faster once the q21 query-text
 change is accounted for** (see [q21](#q21-a-query-text-change-not-an-engine-regression)).
 
 This compares two points about 290 commits apart, not the Int32 work alone.
@@ -21,10 +21,10 @@ taskset -c 0,2,4,6,8,10,12,14 benchmarking/tpch/run_bench.sh \
 - One CPU per physical core. The outer `taskset` is required: without it,
   `run_bench.sh` pins CPUs 0-7, which are 4 physical cores plus their SMT
   siblings. A first attempt today made that mistake: every engine read 25-37%
-  slower, and that archive (`20261110T181219Z_8721190e_sf10`) is not used here.
+  slower, and that archive (`20261110T181219Z_8b70b057_sf10`) is not used here.
 - Data: polars-benchmark's own SF-10 tables (`pdsh_commit` 401908a, tpchgen
   2.0.2).
-- Archives: `benchmarking/tpch/results/runs/20261110T183010Z_8721190e_sf10`
+- Archives: `benchmarking/tpch/results/runs/20261110T183010Z_8b70b057_sf10`
   (now) and `20261023T194138Z_a4dead37-dirty_sf10` (before; the dirty file
   was only `.gitignore`).
 
@@ -34,7 +34,7 @@ is comparable, so the Ibex change is attributable to Ibex.
 
 ## Summary
 
-| Geomean over 22 queries | 10-23 (`a4dead37`) | Now (`8721190e`) |
+| Geomean over 22 queries | 10-23 (`5f43038d`) | Now (`8b70b057`) |
 | --- | ---: | ---: |
 | Ibex now / Ibex 10-23, 8 cores | | 0.873 |
 | Ibex now / Ibex 10-23, 1 core | | 0.877 |
@@ -102,7 +102,7 @@ median is the sample.
 
 | q21 text | Median ms | Paired ratio vs old | Wilcoxon p |
 | --- | ---: | ---: | ---: |
-| Old (`a4dead37`) | 562.5 | | |
+| Old (`5f43038d`) | 562.5 | | |
 | New (HEAD) | 630.8 | 1.111 | 0.002 |
 
 - **Same answer:** both texts give byte-identical output at SF-10, apart
@@ -120,7 +120,7 @@ q21 numbers from before 2026-10-24 measure a different, cheaper workload.
 ```bash
 D=benchmarking/results/local/int32/2026-11-10-q21-bisect   # any persistent dir
 mkdir -p "$D"
-git show a4dead37:benchmarking/tpch/queries/q21.ibex | grep -v '^\s*csv::write(' > "$D/q21_old.ibex"
+git show 5f43038d:benchmarking/tpch/queries/q21.ibex | grep -v '^\s*csv::write(' > "$D/q21_old.ibex"
 grep -v '^\s*csv::write(' benchmarking/tpch/queries/q21.ibex > "$D/q21_new.ibex"
 readlink -f benchmarking/data/tpch/parquet   # must be .../scale-10.0
 .venv/bin/python benchmarking/int32/pdsh-sf10/ab_query.py \

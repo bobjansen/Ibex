@@ -1,8 +1,8 @@
 # Integer-expression abs repair, 2026-11-10
 
-The production change (`7500a910`) improves `abs(round(price, Floor) - 300)` by **3.58% at
-one core and 12.69% at eight cores** against the current runtime (`b551d071`,
-code-equivalent to `f528640a`). Both survive Holm correction across the 91-case
+The production change (`e8ee725b`) improves `abs(round(price, Floor) - 300)` by **3.58% at
+one core and 12.69% at eight cores** against the current runtime (`4670348f`,
+code-equivalent to `d05888c0`). Both survive Holm correction across the 91-case
 resident suite. No new slowdown resolves in either broad before/after gate.
 
 The fix selects physical input storage once, resolves the mutable destination
@@ -59,7 +59,7 @@ production executable; production performance is measured separately below.
 
 Effects are medians of paired ratios, so they need not equal ratios of separate
 median times. The original-baseline comparisons are unresolved, not equivalence tests.
-The old baseline is `7f5e27c4`. The one-core observed gap is recovered; the
+The old baseline is `99eaa20c`. The one-core observed gap is recovered; the
 eight-core estimates are much smaller than the earlier +15.56% result but
 are not declared zero. The first original-eight run resolved an unrelated
 cosine control at -3.48%, so it was repeated independently. No candidate/base
@@ -89,7 +89,7 @@ runs provide effect estimates.
 
 ## Follow-up: `tf_rolling_sum_1m`
 
-A later run against `a88f9769` resolved `tf_rolling_sum_1m` at +4.9%. That
+A later run against `eca66476` resolved `tf_rolling_sum_1m` at +4.9%. That
 was the audit's one-core focused configuration, recorded in the
 [semi/anti README](../symbol-semi-anti/README.md#against-the-pre-int32-baseline).
 The broad gates above had already pointed the same way: +2.5% / +5.2% at
@@ -103,10 +103,10 @@ Every replica was byte-identical to its base.
 
 | Comparison | Cores | Paired effect | Holm p |
 | --- | ---: | ---: | ---: |
-| `b551d071` → `7500a910` (this commit only) | 1 | +2.9% | 1.0 |
-| `b551d071` → `7500a910` (this commit only) | 8 | +3.2% | 0.11 (raw 0.010) |
-| `7f5e27c4` → `7500a910` (pre-Int32 baseline) | 1 | +1.2% | 1.0 |
-| `7f5e27c4` → `7500a910` (pre-Int32 baseline) | 8 | +1.7% | 0.057 (raw 0.006) |
+| `4670348f` → `e8ee725b` (this commit only) | 1 | +2.9% | 1.0 |
+| `4670348f` → `e8ee725b` (this commit only) | 8 | +3.2% | 0.11 (raw 0.010) |
+| `99eaa20c` → `e8ee725b` (pre-Int32 baseline) | 1 | +1.2% | 1.0 |
+| `99eaa20c` → `e8ee725b` (pre-Int32 baseline) | 8 | +1.7% | 0.057 (raw 0.006) |
 
 The +4.9% does not reproduce, and no slowdown resolves. The target's fastest
 repeats match the base: 2.249 vs 2.240 ms at one core in the isolation run.
@@ -115,7 +115,7 @@ Its median rises because of a wider tail of slow repeats, up to 2.59 vs
 looks more like code placement, but that has not been shown with a
 same-binary counterfactual.
 
-Other timeframe rows are faster. Against `7f5e27c4`, rolling min, max and
+Other timeframe rows are faster. Against `99eaa20c`, rolling min, max and
 median resolve 1.3-2.8% faster at both core counts. For this commit alone,
 `tf_rolling_median_1m` is -2.4% at one core and `tf_rolling_ewma_1m` -0.6% at
 eight cores. Raw results and the driver `run.sh` are in
@@ -174,7 +174,7 @@ Wilcoxon/Holm analyzer. It compares the source before this repair against the
 working tree, then the original baseline against the working tree.
 
 For the final same-executable experiment, apply
-[bind-kernel-diagnostic.patch](bind-kernel-diagnostic.patch) to `b551d071` in a
+[bind-kernel-diagnostic.patch](bind-kernel-diagnostic.patch) to `4670348f` in a
 separate branch/worktree with `git apply --unidiff-zero`, and build
 Release/native. Run:
 

@@ -1,7 +1,7 @@
 # Native Int32 storage experiment
 
-Developed on `experiment/native-int32` from 858b7bd2, then integrated into the
-main `python` branch in 638444d1 alongside the earlier Python work.
+Developed on `experiment/native-int32` from a329ac4e, then integrated into the
+main `python` branch in d81edba3 alongside the earlier Python work.
 
 This experiment compiles the same C++ source twice with `Value=int32_t` and
 `Value=int64_t`. It uses Ibex's existing `Column<T>` implementation, including
@@ -71,7 +71,7 @@ Compact integer backing is now implemented on this branch behind
 `IBEX_COMPACT_INT32=1`, with Int64 logical/arithmetic semantics. The
 guarantees are in [the runtime contracts](../../src/runtime/CONTRACTS.md)
 (§8); the retired implementation plan, with its correctness checks and
-historical gates, is `git show a929c528:plans/native-int32-storage.md`. It
+historical gates, is `git show ed7fd554:plans/native-int32-storage.md`. It
 remains opt-in while the broader performance gate is open.
 
 `lhs join rhs on id` with Int64 keys and three right-side integer payloads,
@@ -127,7 +127,7 @@ remaining performance gate.
 
 `check_read_memory.cpp` is an isolated memory mechanism check, not a timing
 benchmark. The identical source was built at -O3 -DNDEBUG against the cached
-86cecb05 column header and the new header, using the same other includes.
+a2cf5b10 column header and the new header, using the same other includes.
 At 50M values the old read allocates about 381 MiB for its cached Int64 view;
 the new read has no RSS growth. Both verify the same independent Int64
 checksum. Raw results/provenance are in `no-cache-read-memory.json`.
@@ -136,7 +136,7 @@ To reproduce (paths are persistent; binaries and generated headers are scratch):
 
 ```bash
 mkdir -p build-memory-baseline/include/ibex/core
-git show 86cecb05:include/ibex/core/column.hpp > build-memory-baseline/include/ibex/core/column.hpp
+git show a2cf5b10:include/ibex/core/column.hpp > build-memory-baseline/include/ibex/core/column.hpp
 clang++ -O3 -DNDEBUG -std=c++23 -I build-memory-baseline/include -I include \
   -isystem "$ROBIN_HOOD_INCLUDE" benchmarking/int32/check_read_memory.cpp \
   -o build-memory-baseline/read-memory
@@ -151,8 +151,8 @@ Historical measurement identifiers map to the rebased source commits in
 
 ## End-to-end PDS-H check
 
-The [SF-10 PDS-H run](pdsh-sf10/README.md) at `8721190e` matches every Polars
-answer. Against the previous native run (`a4dead37`, 2026-10-23), every query
+The [SF-10 PDS-H run](pdsh-sf10/README.md) at `8b70b057` matches every Polars
+answer. Against the previous native run (`5f43038d`, 2026-10-23), every query
 is faster once q21's query-text change is accounted for. The geomean
 Ibex/Polars 2 streaming is 0.888 at 8 cores and 0.844 at 1 core; against
 DuckDB it is 0.734 and 0.774. The two points are about 290 commits apart,

@@ -4,13 +4,13 @@ Raw measurement JSONs and generated provenance are kept in persistent ignored
 storage at `benchmarking/results/local/int32/2026-11-09/aggregate-regressions/`. The scripts, patches and findings are versioned; JSON
 filenames below refer to that local evidence directory.
 
-This follows the native Int32 integration at `dba1d6cc`. Compact ingestion
+This follows the native Int32 integration at `ed5e6b3e`. Compact ingestion
 remains opt-in. These changes improve existing wide workloads without changing
 integer width, overflow behavior, or aggregate arithmetic.
 
 ## Diagnosis and retained changes
 
-A fresh original-baseline comparison (`7f5e27c4` versus `dba1d6cc`, 20 paired
+A fresh original-baseline comparison (`99eaa20c` versus `ed5e6b3e`, 20 paired
 repeats, one pinned core) reproduced median +2.72% and quantile +2.85%. The
 historical standard-deviation regression did **not** reproduce: its paired
 ratio was 0.9954, p=0.076. This is unresolved, not an equivalence result.
@@ -72,7 +72,7 @@ times between those build configurations are not a causal comparison.
 ## Reproduction and retained evidence
 
 Diagnostic build metadata (`diagnostic-builds.json`, local evidence) names patches relative to
-`dba1d6cc`, hashes and persistent frozen binaries. Each patch describes the
+`ed5e6b3e`, hashes and persistent frozen binaries. Each patch describes the
 **cumulative** source state of its corresponding executable, including earlier
 retained changes. Apply one patch with `git apply --unidiff-zero` to a separate branch from that revision,
 build Release, and use [toggle_kernel.py](toggle_kernel.py), for example:
@@ -101,7 +101,7 @@ assembly remain under `build-int32-regressions/`, outside Git.
 
 ## Three-fix broad comparison
 
-The 23-query, 20-pair comparison (`three-fix-gate.json`, local evidence) against `7f5e27c4`
+The 23-query, 20-pair comparison (`three-fix-gate.json`, local evidence) against `99eaa20c`
 uses one pinned core, seven inner iterations, two warmups, all six explicit
 CSV paths and an unchanged replica. Median/quantile are ahead of baseline by
 0.50%/0.62%, OHLC by 18.54%, categorical join by 15.11%. These survive Holm

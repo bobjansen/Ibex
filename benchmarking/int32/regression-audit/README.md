@@ -13,8 +13,8 @@ The [semi/anti membership probe repair](../symbol-semi-anti/README.md) records
 the fix for the symbol semi/anti joins, and a categorical null-key bug found
 along the way.
 
-The comparison is the pre-Int32 baseline `7f5e27c4` against `55ac34fa`, whose
-runtime is unchanged from `f528640a`. Compact ingestion is **off** throughout:
+The comparison is the pre-Int32 baseline `99eaa20c` against `291e4ca1`, whose
+runtime is unchanged from `d05888c0`. Compact ingestion is **off** throughout:
 these measurements check existing wide workloads, not compact-input speedups.
 
 ## Confirmed regressions
@@ -105,7 +105,7 @@ out="$PWD/benchmarking/results/local/int32/2026-11-10-regression-audit"
 mkdir -p "$out"
 IBEX_CORES=1 IBEX_COMPACT_INT32=0 IBEX_PERFCMP_JOBS=6 \
 IBEX_PERFCMP_TMPDIR="$out" \
-benchmarking/compare_ibex_git.sh --base 7f5e27c4 --target 55ac34fa \
+benchmarking/compare_ibex_git.sh --base 99eaa20c --target 291e4ca1 \
   --ibex-suite all --interleave --replica-control \
   --repeats 12 --warmup 2 --iters 5 --taskset 2 \
   --csv "$PWD/benchmarking/data/prices.csv" \

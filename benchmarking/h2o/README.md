@@ -132,7 +132,7 @@ passes are not upgraded retroactively.
 
 ## Results: 2026-11-08, AWS r7i.4xlarge, 1 and 8 physical cores, 1e7 rows
 
-Ibex `618c0455`, Polars 2.0.0 (streaming), DuckDB 2.0.0, on one clean
+Ibex `23436ea7`, Polars 2.0.0 (streaming), DuckDB 2.0.0, on one clean
 r7i.4xlarge (Xeon Platinum 8488C, 128 GiB). SMT was off and every engine
 was pinned to the same 1 or 8 physical cores. All 110 (data, question,
 core-count) comparisons passed full answer validation (`h2o-answers-v2`)
@@ -184,7 +184,7 @@ Below 1 means Ibex is faster.
   1 core (0.48–0.51 against 0.40–0.47). The two runs differ in box, CPU and
   commit, and the commits only removed switches that were off by default.
 
-To reproduce the configuration, check out `618c0455` in a separate clone,
+To reproduce the configuration, check out `23436ea7` in a separate clone,
 complete the [AWS setup](../aws/README.md#1-one-time-setup), then run:
 
 ```sh
@@ -196,7 +196,7 @@ The runner launches a paid EC2 instance and downloads the result archive.
 
 ## Results: 2026-11-07, local i7-13700, 1 and 8 threads, 1e7 rows
 
-Ibex `38a70100`, Polars 2.0.0 (streaming), DuckDB 2.0.0, on the development
+Ibex `5a5e6941`, Polars 2.0.0 (streaming), DuckDB 2.0.0, on the development
 box (i7-13700 at a fixed 3.2 GHz). Eight threads ran on CPUs 0,2,…,14, one
 logical CPU per performance core, and one thread on CPU 2; every engine was
 pinned to the same CPUs. All 110 (data, question, thread-count) comparisons
@@ -229,24 +229,24 @@ means Ibex is faster.
   against DuckDB. The exception is q8 on the NA data (240 / 232 ms), where
   the harness's `filter is_not_null(v3)` materialises 9.5M rows first.
   q8 elsewhere beats DuckDB 0.73–0.83× (K=2: 839 / 1013 ms; 1691 ms before
-  `8210810e`) and Polars 2.6–6.3×.
+  `5d30bf00`) and Polars 2.6–6.3×.
 - **8 threads:** q8 (per-group top-2) beats DuckDB at K=100 (69 / 83 ms,
   0.83×; sorted 0.90×), is level on the NA data (1.02×) and trails at
   K=10 (160 / 133 ms, 1.20×) and K=2 (267 / 176 ms, 1.52×; 743 ms before
-  `246086e9`), while beating Polars 3.8–17×. q10 (six keys, ~1e7 groups) is
+  `9e39c37b`), while beating Polars 3.8–17×. q10 (six keys, ~1e7 groups) is
   1.00–1.18× Polars. K=2 q9 (corr by two keys, 4 groups, ~16 ms against
   Polars) read 1.67×; it is the noisiest cell, between 15 and 27 ms across
   today's runs.
 - **Changes since the AWS run below** (2026-11-07): nullable Categorical keys
-  stay on the dense code paths (`2c5f4870`, `9415174b`; the harness has
+  stay on the dense code paths (`ae5cb95f`, `b1a3854b`; the harness has
   loaded empty fields as null keys since `da68fd4b`, which had pushed the NA
   dataset's 8-thread ratio to 1.49), `std()` beside a median folds per row
-  range (`24479236`, q6), a dense Int join key builds a direct-address table
-  (`2ac7895e`, join q5 311 → ~170 ms), parallel new-group null masks
-  (`4f9ccbbc`), dense Int64 numbering across workers for up to 16M ids
-  (`124cfa39`, `eb917d3d`, q5), kept packed keys in partitioned discovery
-  (`4d92bd84`, q10), grouped top-k spread across workers (`246086e9`, q8)
-  and, on one thread, found by key offset with prefetching (`8210810e`, q8).
+  range (`3d384612`, q6), a dense Int join key builds a direct-address table
+  (`49d623e4`, join q5 311 → ~170 ms), parallel new-group null masks
+  (`65068f95`), dense Int64 numbering across workers for up to 16M ids
+  (`4b34bdfd`, `d9fad1ca`, q5), kept packed keys in partitioned discovery
+  (`94215949`, q10), grouped top-k spread across workers (`9e39c37b`, q8)
+  and, on one thread, found by key offset with prefetching (`5d30bf00`, q8).
 
 ## Previous results: 2026-10-16, AWS r7i.4xlarge, 1 and 8 physical cores, 1e7 rows
 

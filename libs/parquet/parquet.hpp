@@ -2402,12 +2402,13 @@ inline auto plan_sharded_column(parquet::arrow::FileReader& reader, const arrow:
             ibex::detail::NoInitVector<std::int32_t>(output_rows));
         auto* base = col.compact_int32_output();
         planned.entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(col));
-        planned.decode_range = [base, leaf_index, selection](parquet::arrow::FileReader& reader,
-                                                             const DirectDecodeGroups& range,
-                                                             std::size_t start, std::size_t rows) {
+        planned.decode_range = [base, leaf_index, selection](
+                                   parquet::arrow::FileReader& file_reader,
+                                   const DirectDecodeGroups& range, std::size_t start,
+                                   std::size_t rows) {
             DirectValidity validity(rows);
             const auto emitted = decode_numeric_into<parquet::Int32Type, std::int32_t, true>(
-                reader, leaf_index, selection, range, base + start, rows, validity,
+                file_reader, leaf_index, selection, range, base + start, rows, validity,
                 [](std::int32_t value) { return value; });
             if (emitted != rows || validity.position != rows || validity.has_null) {
                 throw std::runtime_error("compact Parquet decode row-count/null mismatch");

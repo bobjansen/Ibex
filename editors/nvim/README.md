@@ -6,11 +6,18 @@ files. Plain Vim syntax, so no Tree-sitter grammar is needed.
 ## Install
 
 Add this directory to the runtime path. With
-[lazy.nvim](https://github.com/folke/lazy.nvim):
+[lazy.nvim](https://github.com/folke/lazy.nvim), as e.g.
+`~/.config/nvim/lua/plugins/ibex.lua`:
 
 ```lua
-{ dir = "/path/to/ibex/editors/nvim" }
+return {
+  { dir = vim.fn.expand("~/ibex/editors/nvim"), name = "ibex", lazy = false },
+}
 ```
+
+`lazy = false` loads it at startup so filetype detection is in place before
+the first `.ibex` buffer. If `lua/plugins/` held no other spec, this file
+also cures lazy's `No specs found for module "plugins"` startup error.
 
 Without a plugin manager, in `init.lua`:
 

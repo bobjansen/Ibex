@@ -235,12 +235,8 @@ class Adapter:
                 # Polars' std option is ddof; native std is the sample (ddof 1).
                 if value.options != (None if value.name == "median" else 1):
                     raise NotImplementedError(f"unsupported {value.name} options {value.options!r}")
-                child = self.expression(value.arguments[0])
-                if value.name == "median" and input_type in (pl.Float32, pl.Float64):
-                    expr = Expr("median_pick", (Expr("present_count", (child,)), Expr("nan_count", (child,)),
-                                                Expr("nan_high_median", (child,))))
-                else:
-                    expr = Expr("polars_" + value.name, (child,))
+                # Native median ranks NaN above every number, as Polars does.
+                expr = Expr("polars_" + value.name, (self.expression(value.arguments[0]),))
                 self.expressions[key] = expr
                 return expr
             if value.name == "n_unique" and input_type in (*_INTEGER_LAYOUTS, pl.String, pl.Boolean):
@@ -517,7 +513,7 @@ class Adapter:
     def _aggregate_rounding(self, frame, fields, *, keys=None, maintain_order=False):
         def contains_round(expr):
             # Row expressions over a reduction's result: rounding, squaring.
-            return expr._op in ("polars_round", "square", "median_pick") or any(
+            return expr._op in ("polars_round", "square") or any(
                 contains_round(arg) for arg in expr._args if isinstance(arg, Expr))
         if not any(expr._aggregate and contains_round(expr) for expr in fields):
             return (frame.select(fields) if keys is None else

@@ -7178,6 +7178,100 @@ TEST_CASE("Interpret quantile aggregation (p=0 and p=1)") {
     CHECK((*qv_max)[0] == Catch::Approx(5.0));
 }
 
+TEST_CASE("median and quantile rank NaN above every number like Polars and DuckDB") {
+    // NaN sorts above +inf (as in `order`), so it fills the top positions: a
+    // selected position inside that tail is NaN, one below it is not. Expected
+    // values are Polars 2.0's (DuckDB's quantile_cont agrees). The bare
+    // `nth_element` used to give group 1 a NaN median and group 3 a quantile
+    // of 2, depending on where the NaNs happened to land.
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    Column<double> raw{nan, 1.0, 2.0, 3.0, nan, nan, 5.0, 4.0, nan,
+                       nan, 0.0, 7.0, 0.0, nan, nan, 3.0, 1.0, 2.0};
+    runtime::ValidityBitmap valid(raw.size(), true);
+    valid.set(12, false);  // group 4: {7, null, NaN}
+    runtime::Table table;
+    table.add_column("g",
+                     Column<std::int64_t>{1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 6, 6, 6});
+    table.add_column("v", std::move(raw), std::move(valid));
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    struct Expected {
+        double median, q25, q75;
+    };
+    const auto check = [&](double actual, double expected) {
+        if (std::isnan(expected)) {
+            CHECK(std::isnan(actual));
+        } else {
+            CHECK(actual == Catch::Approx(expected));
+        }
+    };
+
+    SECTION("grouped") {
+        auto ir = require_ir(
+            "t[select { m = median(v), q25 = quantile(v, 0.25), q75 = quantile(v, 0.75) }, by g];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* g = std::get_if<Column<std::int64_t>>(result->find("g"));
+        const auto* m = std::get_if<Column<double>>(result->find("m"));
+        const auto* q25 = std::get_if<Column<double>>(result->find("q25"));
+        const auto* q75 = std::get_if<Column<double>>(result->find("q75"));
+        REQUIRE(g != nullptr);
+        REQUIRE(m != nullptr);
+        REQUIRE(q25 != nullptr);
+        REQUIRE(q75 != nullptr);
+        REQUIRE(g->size() == 6);
+        const std::array<Expected, 6> expected{{{2.5, 1.75, nan},
+                                                {nan, nan, nan},
+                                                {nan, 3.0, nan},
+                                                {nan, nan, nan},
+                                                {nan, nan, nan},
+                                                {2.0, 1.5, 2.5}}};
+        for (std::size_t row = 0; row < g->size(); ++row) {
+            const auto key = (*g)[row];
+            INFO("group " << key);
+            const auto& e = expected.at(static_cast<std::size_t>(key - 1));
+            check((*m)[row], e.median);
+            check((*q25)[row], e.q25);
+            check((*q75)[row], e.q75);
+        }
+    }
+
+    SECTION("ungrouped") {
+        auto ir = require_ir(
+            "t[select { m = median(v), q25 = quantile(v, 0.25), q75 = quantile(v, 0.75) }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* m = std::get_if<Column<double>>(result->find("m"));
+        const auto* q25 = std::get_if<Column<double>>(result->find("q25"));
+        const auto* q75 = std::get_if<Column<double>>(result->find("q75"));
+        REQUIRE(m != nullptr);
+        REQUIRE(q25 != nullptr);
+        REQUIRE(q75 != nullptr);
+        check((*m)[0], 5.0);
+        check((*q25)[0], 2.0);
+        check((*q75)[0], nan);
+    }
+
+    SECTION("an exact position below the NaN tail is the number itself") {
+        // {1, 2, NaN}: p=0.5 lands exactly on 2, so no interpolation towards
+        // the NaN above it; p=0.75 interpolates into it.
+        runtime::Table small;
+        small.add_column("v", Column<double>{1.0, nan, 2.0});
+        runtime::TableRegistry small_registry;
+        small_registry.emplace("s", small);
+        auto ir = require_ir(
+            "s[select { q0 = quantile(v, 0.0), q50 = quantile(v, 0.5), q75 = quantile(v, 0.75), "
+            "q100 = quantile(v, 1.0) }];");
+        auto result = runtime::interpret(*ir, small_registry);
+        REQUIRE(result.has_value());
+        check(std::get<Column<double>>(*result->find("q0"))[0], 1.0);
+        check(std::get<Column<double>>(*result->find("q50"))[0], 2.0);
+        check(std::get<Column<double>>(*result->find("q75"))[0], nan);
+        check(std::get<Column<double>>(*result->find("q100"))[0], nan);
+    }
+}
+
 TEST_CASE("Interpret quantile grouped") {
     runtime::Table table;
     // Group A: {1,3,5} -> p=0.5 -> 3.0

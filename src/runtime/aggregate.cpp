@@ -1716,30 +1716,57 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     AggSlot& slot = states[g].slots[ai];
                     slot.count = static_cast<std::int64_t>(n);
                     double result = 0.0;
-                    if (f == ir::AggFunc::Median) {
-                        if (n > 0) {
-                            const std::size_t mid = n / 2;
-                            std::nth_element(lo, lo + static_cast<std::ptrdiff_t>(mid), hi);
-                            const double upper = lo[mid];
-                            result = (n % 2 == 0)
-                                         ? (*std::max_element(
-                                                lo, lo + static_cast<std::ptrdiff_t>(mid)) +
-                                            upper) /
-                                               2.0
-                                         : upper;
-                        }
-                    } else if (f == ir::AggFunc::Quantile) {
-                        if (n > 0) {
+                    if (f == ir::AggFunc::Median || f == ir::AggFunc::Quantile) {
+                        // NaN ranks above every number, as in `order` (and
+                        // Polars and DuckDB): the NaNs fill the top positions.
+                        // Selecting among the numbers alone keeps the strict
+                        // weak ordering `nth_element` needs; a selected
+                        // position in the NaN tail is NaN.
+                        double* const numbers_end =
+                            std::partition(lo, hi, [](double v) { return !std::isnan(v); });
+                        const auto numbers = static_cast<std::size_t>(numbers_end - lo);
+                        constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+                        if (f == ir::AggFunc::Median) {
+                            if (n > 0) {
+                                const std::size_t mid = n / 2;
+                                if (mid >= numbers) {
+                                    result = kNaN;
+                                } else {
+                                    std::nth_element(lo, lo + static_cast<std::ptrdiff_t>(mid),
+                                                     numbers_end);
+                                    const double upper = lo[mid];
+                                    result = (n % 2 == 0)
+                                                 ? (*std::max_element(
+                                                        lo, lo + static_cast<std::ptrdiff_t>(mid)) +
+                                                    upper) /
+                                                       2.0
+                                                 : upper;
+                                }
+                            }
+                        } else if (n > 0) {
                             const double idx = p * static_cast<double>(n - 1);
                             const auto qlo = static_cast<std::size_t>(idx);
                             const double frac = idx - static_cast<double>(qlo);
-                            std::nth_element(lo, lo + static_cast<std::ptrdiff_t>(qlo), hi);
-                            const double vlo = lo[qlo];
-                            const double vhi =
-                                (qlo + 1 < n) ? *std::min_element(
-                                                    lo + static_cast<std::ptrdiff_t>(qlo + 1), hi)
-                                              : vlo;
-                            result = vlo + (frac * (vhi - vlo));
+                            if (qlo >= numbers) {
+                                result = kNaN;
+                            } else {
+                                std::nth_element(lo, lo + static_cast<std::ptrdiff_t>(qlo),
+                                                 numbers_end);
+                                const double vlo = lo[qlo];
+                                if (frac == 0.0) {
+                                    // An exact position needs no neighbour, so
+                                    // a NaN (or inf) above it cannot leak in.
+                                    result = vlo;
+                                } else {
+                                    const double vhi =
+                                        qlo + 1 < numbers
+                                            ? *std::min_element(
+                                                  lo + static_cast<std::ptrdiff_t>(qlo + 1),
+                                                  numbers_end)
+                                            : kNaN;
+                                    result = vlo + (frac * (vhi - vlo));
+                                }
+                            }
                         }
                     } else if (f == ir::AggFunc::Skew) {
                         if (n >= 3) {

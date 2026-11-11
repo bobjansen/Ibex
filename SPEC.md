@@ -767,7 +767,7 @@ count()     // counts all rows regardless of null
 count(col)  // counts only the non-null values of col; 0 (not null) if there are none
 count_distinct(col)  // counts the distinct non-null values of col; 0 (not null) if there are none
 mean(col)   // averages only non-null values
-median(col) // ignores null rows
+median(col) // ignores null rows; NaN ranks above every number
 first(col)  // first non-null value; null for an all-null group
 last(col)   // last non-null value; null for an all-null group
 first_null(col) // value of the first row, including null; null for empty input
@@ -816,7 +816,8 @@ holds:
   with every other NaN and sorts above `+inf`, so it comes last under `asc` and
   first under `desc`; nulls still come after it. `-0.0` ties with `0.0`. This holds
   for `order`, `order ..., head`/`tail` and `rank`, and matches Polars, DuckDB
-  and PostgreSQL.
+  and PostgreSQL. The `median` and `quantile` aggregates rank NaN the same way
+  (a selected position among the NaNs is NaN), as Polars and DuckDB do.
 - **Joins**: a null key matches nothing, not even another null, unless the
   join says `nulls equal` (Section 5.6).
 
@@ -2914,7 +2915,8 @@ The following built-in functions are **aggregate functions**. They consume a
 | `count_distinct(col)` | `Series<T>`        | `Int64`    | Counts the number of **distinct non-null** values of `col` in the group; `0` (not null) for a group with none. `T` may be any scalar type. |
 | `first(col)`          | `Series<T>`        | `T`        | Any of `min`'s types, and `Bool`. |
 | `last(col)`           | `Series<T>`        | `T`        | As `first`. |
-| `median(col)`         | `Series<Numeric>`  | `Float64`  | Middle value; null rows are ignored. Even-length groups return the average of the two middle values. |
+| `median(col)`         | `Series<Numeric>`  | `Float64`  | Middle value; null rows are ignored. Even-length groups return the average of the two middle values. NaN ranks above every number (as in `order`), so the result is NaN exactly when a middle position holds a NaN. |
+| `quantile(col, p)`    | `Series<Numeric>`  | `Float64`  | Linear-interpolation quantile at `p` ∈ [0, 1], a numeric literal: position `p·(n − 1)` among the `n` non-null values, interpolated between its two neighbours. Null rows are ignored; NaN ranks as in `median`, so interpolating towards a NaN gives NaN, while an exact position below the NaNs gives that value. `quantile(col, 0.5)` is `median(col)`. |
 | `std(col)`            | `Series<Numeric>`  | `Float64`  | Sample standard deviation (denominator n − 1). Returns null for groups with fewer than 2 non-null values. |
 | `ewma(col, alpha)`    | `Series<Numeric>`  | `Float64`  | Exponentially weighted moving average. `alpha` ∈ (0, 1] is a numeric literal; rows are processed in storage order within each group. Returns null if the group is empty. |
 | `cov(x, y)`           | `Series<Numeric>` × 2 | `Float64` | Sample covariance (denominator n − 1) over the rows where **both** `x` and `y` are non-null. Returns null for groups with fewer than 2 such rows. Either argument may be an expression. |

@@ -2252,7 +2252,7 @@ auto write_resolved_validity_range(const std::vector<ResolvedOperand<T>>& operan
     // blends; the head and tail rows that do not fill a byte go one by one.
     if (operands.size() == 2 && operands[0].data != nullptr && !operands[0].is_null &&
         operands[1].data == nullptr && !operands[1].is_null) {
-        const auto in = operands[0].data;
+        const auto& in = operands[0].data;
         const T fill = operands[1].literal;
         const std::uint8_t* const bits = operands[0].bits;
         if (bits == nullptr) {

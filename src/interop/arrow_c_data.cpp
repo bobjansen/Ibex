@@ -13,6 +13,7 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/table_properties.hpp>
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <charconv>

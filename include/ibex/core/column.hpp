@@ -18,6 +18,7 @@
 #include <functional>
 #include <initializer_list>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -303,7 +304,7 @@ class Column {
     /// original element offset for Arrow C Data round trips.
     [[nodiscard]] static auto from_external(std::shared_ptr<const void> owner, const T* values,
                                             size_type offset, size_type size) -> Column {
-        if (offset == static_cast<size_type>(-1)) {
+        if (offset == kCompactInt32Offset) {
             throw std::invalid_argument("external column offset is reserved");
         }
         if (!owner) {
@@ -330,7 +331,7 @@ class Column {
         backing->values = std::move(values);
         Column result;
         result.external_size_ = backing->values.size();
-        result.external_offset_ = static_cast<size_type>(-1);
+        result.external_offset_ = kCompactInt32Offset;
         result.external_owner_ = std::move(backing);
         return result;
     }
@@ -350,7 +351,7 @@ class Column {
         backing->external_size = size;
         Column result;
         result.external_size_ = size;
-        result.external_offset_ = static_cast<size_type>(-1);
+        result.external_offset_ = kCompactInt32Offset;
         result.external_owner_ = std::move(backing);
         return result;
     }
@@ -394,7 +395,7 @@ class Column {
 
     [[nodiscard]] auto is_compact_int32() const noexcept -> bool {
         if constexpr (std::is_same_v<T, std::int64_t>) {
-            return external_owner_ && external_offset_ == static_cast<size_type>(-1);
+            return external_owner_ && external_offset_ == kCompactInt32Offset;
         }
         return false;
     }
@@ -414,9 +415,7 @@ class Column {
             throw std::logic_error("cannot mutate borrowed compact backing");
         }
         // Only presized fresh gather outputs use this accessor, before widening.
-        return const_cast<detail::CompactIntBacking*>(
-                   static_cast<const detail::CompactIntBacking*>(external_owner_.get()))
-            ->values.data();
+        return writable_compact_backing().values.data();
     }
 
     /// Concatenate logical integer values, retaining compact backing only
@@ -794,8 +793,7 @@ class Column {
         requires std::is_same_v<T, std::int64_t>
     {
         if (this == &source && !is_compact_int32()) {
-            const Column copy(source);
-            append_integer_values(copy);
+            append_integer_values(Column(source));
             return;
         }
 
@@ -840,6 +838,15 @@ class Column {
                 owned->values.assign(input.begin(), input.end());
             external_owner_ = std::move(owned);
         }
+        return writable_compact_backing();
+    }
+
+    /// Compact backings are only ever allocated non-const (by
+    /// `from_compact_int32` or `mutable_compact_backing`); `external_owner_`
+    /// stores them as `const void` only because it also holds borrowed
+    /// buffers. Callers must hold the sole reference.
+    auto writable_compact_backing() -> detail::CompactIntBacking& {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
         return *const_cast<detail::CompactIntBacking*>(
             static_cast<const detail::CompactIntBacking*>(external_owner_.get()));
     }
@@ -924,6 +931,10 @@ class Column {
     const T* external_data_ = nullptr;
     size_type external_offset_ = 0;
     size_type external_size_ = 0;
+
+    /// `external_offset_` value marking compact Int32 backing; no Arrow slice
+    /// can start there.
+    static constexpr size_type kCompactInt32Offset = std::numeric_limits<size_type>::max();
 
     /// See `meta()`. Declared last so the hand-written constructors can append
     /// it to their member-init lists without tripping -Wreorder. Four bytes,

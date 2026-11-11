@@ -1376,7 +1376,7 @@ struct JoinProbe {
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
-            const auto data = value_reader(*col);
+            const auto* const data = value_reader(*col);
             li_identity =
                 probe_scalar(index().f64_heads, n, [&](std::size_t i) { return data[i]; }, li, ri);
         } else if (index().key_kind == ExprType::Bool) {
@@ -1391,7 +1391,7 @@ struct JoinProbe {
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
-            const auto data = value_reader(*col);
+            const auto* const data = value_reader(*col);
             li_identity =
                 probe_scalar(index().date_heads, n, [&](std::size_t i) { return data[i]; }, li, ri);
         } else if (index().key_kind == ExprType::Timestamp) {
@@ -1399,7 +1399,7 @@ struct JoinProbe {
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
-            const auto data = value_reader(*col);
+            const auto* const data = value_reader(*col);
             li_identity =
                 probe_scalar(index().ts_heads, n, [&](std::size_t i) { return data[i]; }, li, ri);
         } else if (index().key_kind == ExprType::Decimal) {
@@ -1413,7 +1413,7 @@ struct JoinProbe {
                     " vs " + decimal::type_name(index().dec_type) +
                     "; cast one side to the other's scale with Decimal(x, precision, scale)");
             }
-            const auto data = value_reader(*col);
+            const auto* const data = value_reader(*col);
             li_identity =
                 probe_scalar(index().dec_heads, n, [&](std::size_t i) { return data[i]; }, li, ri);
         } else if (index().key_kind == ExprType::String) {
@@ -1619,7 +1619,7 @@ struct JoinProbe {
             const auto* col = std::get_if<Column<double>>(rkey);
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
-            const auto data = value_reader(*col);
+            const auto* const data = value_reader(*col);
             do_phase1([&](std::size_t r) { return data[r]; }, index().f64_heads);
         } else if (index().key_kind == ExprType::Bool) {
             const auto* col = std::get_if<Column<bool>>(rkey);
@@ -1630,13 +1630,13 @@ struct JoinProbe {
             const auto* col = std::get_if<Column<Date>>(rkey);
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
-            const auto data = value_reader(*col);
+            const auto* const data = value_reader(*col);
             do_phase1([&](std::size_t r) { return data[r]; }, index().date_heads);
         } else if (index().key_kind == ExprType::Timestamp) {
             const auto* col = std::get_if<Column<Timestamp>>(rkey);
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
-            const auto data = value_reader(*col);
+            const auto* const data = value_reader(*col);
             do_phase1([&](std::size_t r) { return data[r]; }, index().ts_heads);
         } else if (index().key_kind == ExprType::Decimal) {
             const auto* col = std::get_if<Column<Decimal>>(rkey);
@@ -1648,7 +1648,7 @@ struct JoinProbe {
                     " vs " + decimal::type_name(index().dec_type) +
                     "; cast one side to the other's scale with Decimal(x, precision, scale)");
             }
-            const auto data = value_reader(*col);
+            const auto* const data = value_reader(*col);
             do_phase1([&](std::size_t r) { return data[r]; }, index().dec_heads);
         } else if (index().key_kind == ExprType::String) {
             if (const auto* c_cat = std::get_if<Column<Categorical>>(rkey)) {

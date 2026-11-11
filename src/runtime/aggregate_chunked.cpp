@@ -6936,10 +6936,10 @@ class HashAggregateState final {
         double* scratch_base, std::size_t scratch_stride, std::size_t scratch_offset,
         ir::AggFunc func) {
         const auto slot_for = [=](GidT g) -> AggSlotCore& {
-            return base[static_cast<std::size_t>(g) * n_aggs + agg_i];
+            return base[(static_cast<std::size_t>(g) * n_aggs) + agg_i];
         };
         const auto scratch_at = [=](GidT g) -> double* {
-            return scratch_base + static_cast<std::size_t>(g) * scratch_stride + scratch_offset;
+            return scratch_base + (static_cast<std::size_t>(g) * scratch_stride) + scratch_offset;
         };
         switch (func) {
             case ir::AggFunc::Sum:

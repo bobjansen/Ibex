@@ -250,7 +250,8 @@ auto arith_vec(ir::ArithmeticOp op, const ColumnValue& lhs, std::size_t lhs_off,
     -> std::expected<ColumnValue, std::string> {
     const ColumnValue* lhs_input = &lhs;
     const ColumnValue* rhs_input = &rhs;
-    ColumnValue left_storage, right_storage;
+    ColumnValue left_storage;
+    ColumnValue right_storage;
     if (const auto* col = std::get_if<Column<std::int64_t>>(&lhs); col && col->is_compact_int32()) {
         left_storage = col->widened_int64();
         lhs_input = &left_storage;

@@ -205,6 +205,8 @@ archive_run() {
         printf '  "answers_checked": "%s",\n' "$ANSWERS_CHECKED"
         printf '  "dataset": "%s",\n' "$PARQUET_DIR"
         printf '  "pdsh_commit": "%s",\n' "$(git -C "$PDSH_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+        # Upstream files changed in the checkout (benchmarking/pdsh-patches).
+        printf '  "pdsh_patched_files": "%s",\n' "$(git -C "$PDSH_ROOT" diff --name-only HEAD 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
         printf '  "tpchgen_cli": "%s",\n' "$("$PDSH_ROOT/.venv/bin/tpchgen-cli" --version 2>/dev/null | head -1 || echo unknown)"
         printf '  "label": "%s"\n' "$LABEL"
         printf '}\n'

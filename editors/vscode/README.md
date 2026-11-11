@@ -4,20 +4,17 @@ Syntax highlighting for `.ibex` files.
 
 ## Install locally (no Marketplace needed)
 
-Copy the extension folder into VS Code's extensions directory, then restart VS Code:
+In VS Code, open the Command Palette and run **Developer: Install Extension
+from Location...**, then pick this directory (`editors/vscode`). Open any
+`.ibex` file; it is highlighted right away.
 
-```bash
-# Linux / WSL
-cp -r editors/vscode ~/.vscode/extensions/ibex-language-0.2.0
+After pulling grammar changes, reload the window (**Developer: Reload
+Window**); if the old highlighting persists, run the install command again.
 
-# macOS
-cp -r editors/vscode ~/.vscode/extensions/ibex-language-0.2.0
-```
-
-Open any `.ibex` file — it should be highlighted automatically.
-
-Upgrading from 0.1.0: remove `~/.vscode/extensions/ibex-language-0.1.0` first,
-or VS Code may keep loading the old grammar.
+Copying the folder into `~/.vscode/extensions/` no longer works: VS Code only
+loads extensions registered in `~/.vscode/extensions/extensions.json`, so a
+copied folder is silently ignored. Remove any such copy
+(`ibex-language-0.1.0` from older instructions).
 
 ## What is highlighted
 

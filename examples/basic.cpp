@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+// basic.cpp — the Ibex C++ API without the DSL: column filter/transform and
+// a hand-built IR plan (scan -> filter -> project).
+//
+// Build (from the repository root; examples are on by default via
+// IBEX_BUILD_EXAMPLES):
+//   cmake -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release
+//   cmake --build build --target ibex_example_basic
+//   ./build/examples/ibex_example_basic
+
 #include <ibex/core/column.hpp>
 #include <ibex/format.hpp>
 #include <ibex/ir/builder.hpp>

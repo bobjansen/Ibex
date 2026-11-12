@@ -1260,16 +1260,32 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         std::vector<std::uint64_t> cell_stride(key_cols.size(), 0);
         std::vector<std::uint64_t> cell_null(key_cols.size(), 0);
         std::size_t n_cells = 0;
-        const auto cell_key = [&](const KeyCol& col, std::size_t row) -> std::int64_t {
+        // `body(key_at)` with a reader typed for this key column, chosen once:
+        // a per-row switch on the kind and IntegerView's per-row width test
+        // cost h2o q6 (median, sd by id4, id5) ~4% at one core.
+        const auto with_key_reader = [](const KeyCol& col, const auto& body) {
             switch (col.kind) {
-                case KeyCol::Kind::Cat:
-                    return static_cast<std::int64_t>(col.cat->code_at(row));
-                case KeyCol::Kind::Date:
-                    return col.date[row].days;
-                case KeyCol::Kind::Ts:
-                    return col.ts[row].nanos;
+                case KeyCol::Kind::Cat: {
+                    const auto* codes = col.cat->codes_data();
+                    body(
+                        [codes](std::size_t row) { return static_cast<std::int64_t>(codes[row]); });
+                    return;
+                }
+                case KeyCol::Kind::Date: {
+                    const Date* dates = col.date;
+                    body([dates](std::size_t row) -> std::int64_t { return dates[row].days; });
+                    return;
+                }
+                case KeyCol::Kind::Ts: {
+                    const Timestamp* stamps = col.ts;
+                    body([stamps](std::size_t row) { return stamps[row].nanos; });
+                    return;
+                }
                 default:
-                    return col.i64[row];
+                    with_physical_values(col.i64, [&](const auto* ints) {
+                        body([ints](std::size_t row) -> std::int64_t { return ints[row]; });
+                    });
+                    return;
             }
         };
         const bool cell_keys =
@@ -1293,14 +1309,16 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         }
                         auto& [lo, hi] = bounds[(r * key_cols.size()) + c];
                         const KeyCol& col = key_cols[c];
-                        for (std::size_t row = b; row < e; ++row) {
-                            if (col.is_null(row)) {
-                                continue;
+                        with_key_reader(col, [&](const auto& key_at) {
+                            for (std::size_t row = b; row < e; ++row) {
+                                if (col.is_null(row)) {
+                                    continue;
+                                }
+                                const std::int64_t v = key_at(row);
+                                lo = std::min(lo, v);
+                                hi = std::max(hi, v);
                             }
-                            const std::int64_t v = cell_key(col, row);
-                            lo = std::min(lo, v);
-                            hi = std::max(hi, v);
-                        }
+                        });
                     }
                 });
             }
@@ -1401,30 +1419,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         return (*valid)[row] ? part(value_at(row)) : null_part;
                     });
                 };
-                switch (col.kind) {
-                    case KeyCol::Kind::Cat: {
-                        const auto* codes = col.cat->codes_data();
-                        with_values(
-                            [=](std::size_t row) { return static_cast<std::int64_t>(codes[row]); });
-                        break;
-                    }
-                    case KeyCol::Kind::Date: {
-                        const Date* dates = col.date;
-                        with_values(
-                            [=](std::size_t row) -> std::int64_t { return dates[row].days; });
-                        break;
-                    }
-                    case KeyCol::Kind::Ts: {
-                        const Timestamp* stamps = col.ts;
-                        with_values([=](std::size_t row) { return stamps[row].nanos; });
-                        break;
-                    }
-                    default: {
-                        const auto ints = col.i64;
-                        with_values([=](std::size_t row) { return ints[row]; });
-                        break;
-                    }
-                }
+                with_key_reader(col, with_values);
             };
             if (key_cols.size() == 1) {
                 with_part(0, group_cells);

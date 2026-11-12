@@ -57,6 +57,15 @@ decltype(auto) with_physical_values(const Column<T>& column, Body&& body) {
     return body(column.data());
 }
 
+/// The same for a reader already resolved to an `IntegerView`.
+template <typename Body>
+decltype(auto) with_physical_values(IntegerView view, Body&& body) {
+    if (const auto* wide = view.wide_data()) {
+        return body(wide);
+    }
+    return body(static_cast<const std::int32_t*>(view.physical_data()));
+}
+
 enum class ExprType : std::uint8_t {
     Int,
     Double,

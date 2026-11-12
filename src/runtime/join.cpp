@@ -2535,7 +2535,10 @@ auto LeftJoinCounter::finish() const -> Table {
     const auto& keys = std::get<Column<std::int64_t>>(*left_keys_);
     Table out;
     out.add_column(group_key_, *left_keys_);
-    out.add_column(alias_, counts_.finish(keys.data(), keys.size()));
+    // data() throws for compact Int32 keys; read them at their own width.
+    out.add_column(alias_, with_physical_values(keys, [&](const auto* values) {
+                       return counts_.finish(values, keys.size());
+                   }));
     return out;
 }
 

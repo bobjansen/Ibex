@@ -169,7 +169,15 @@ TEST_CASE("native integer operators agree without a cached wide input",
                                   "t left join r on g;",
                                   "t outer join r on g;",
                                   "t semi join r on g;",
-                                  "t anti join r on g;"}) {
+                                  "t anti join r on g;",
+                                  // Distinct counts hash Int keys; a left
+                                  // join counted by its unique left key is
+                                  // fused into LeftJoinCounter.
+                                  "t[select {c=count_distinct(v)}, by {g}];",
+                                  "t[select {c=count_distinct(v)}];",
+                                  "(r left join t on g)[select {c=count(v)}, by g];",
+                                  // Global corr/cov read both sides raw.
+                                  "t[select {r=corr(v, g), c=cov(v, h)}];"}) {
             DYNAMIC_SECTION(query << " nulls=" << nulls) {
                 CAPTURE(query, nulls);
                 auto parsed = ibex::parser::parse(query);

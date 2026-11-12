@@ -147,7 +147,12 @@ def _to_polars(result, expected, output, categories=(), left_rows=None):
     for index, name in enumerate(result.column_names):
         dtype = result.column(index).type
         if is_temporal(expected[name]):
-            result = result.set_column(index, name, result.column(index).cast(storage_type(expected[name])))
+            # Through Int64: compact storage can export Int32 ticks, and Arrow
+            # casts only Int64 to timestamp/duration.
+            ticks = result.column(index)
+            if ticks.type != pa.int64():
+                ticks = ticks.cast(pa.int64())
+            result = result.set_column(index, name, ticks.cast(storage_type(expected[name])))
             continue
         # The shared lowerer's logical string type describes dictionary-backed
         # strings too. Preserve dictionaries for code-based categorical export.

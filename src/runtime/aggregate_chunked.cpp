@@ -6931,6 +6931,18 @@ class HashAggregateState final {
             }
 
             const ExprType kind = plan_[a].kind;
+            // An Int column's values, resolved once: data() throws for compact
+            // Int32 storage. The width test is loop-invariant beside the hash
+            // insert, and both widths give the same sign-extended key bits.
+            const std::int64_t* wide_ints = nullptr;
+            const std::int32_t* narrow_ints = nullptr;
+            if (const auto* ints = std::get_if<Column<std::int64_t>>(entry.column.get())) {
+                if (ints->is_compact_int32()) {
+                    narrow_ints = ints->compact_int32_data();
+                } else {
+                    wide_ints = std::as_const(*ints).data();
+                }
+            }
             const auto bits_at = [&](std::size_t row) -> std::uint64_t {
                 switch (kind) {
                     case ExprType::Double:
@@ -6945,9 +6957,9 @@ class HashAggregateState final {
                     case ExprType::Bool:
                         return std::get<Column<bool>>(*entry.column)[row] ? 1U : 0U;
                     default:  // Int
-                        return static_cast<std::uint64_t>(
-                            std::get<Column<std::int64_t>>(std::as_const(*entry.column))
-                                .data()[row]);
+                        return static_cast<std::uint64_t>(narrow_ints != nullptr
+                                                              ? std::int64_t{narrow_ints[row]}
+                                                              : wide_ints[row]);
                 }
             };
             const auto key_at = [&](std::size_t row) -> DistinctKey {

@@ -168,8 +168,9 @@ class LeftKeyCounts {
     }
 
     /// Each left row's count, in left row order. After every `count` returned.
-    [[nodiscard]] auto finish(const std::int64_t* keys, std::size_t rows) const
-        -> Column<std::int64_t> {
+    /// `Key` is the left keys' physical type: Int64, or Int32 for compact.
+    template <typename Key>
+    [[nodiscard]] auto finish(const Key* keys, std::size_t rows) const -> Column<std::int64_t> {
         Column<std::int64_t> out;
         out.resize_for_overwrite(rows);
         for (std::size_t row = 0; row < rows; ++row) {

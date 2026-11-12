@@ -939,3 +939,84 @@ r;
     CHECK_FALSE(run(true));  // proved null-free: the term folds, `y` is never read
     CHECK(run(false));       // no proof: the term is computed from `y`
 }
+
+TEST_CASE("e2e lazy: a compact Int32 dimension key is proved unique and joined",
+          "[e2e][lazy][compact-int32]") {
+    // A Parquet Int32 key decodes as compact storage. The whole-script
+    // planner's uniqueness proof decodes the dimension's key and read it
+    // through data(), which throws for compact columns: the script failed.
+    const auto compact = [](std::vector<std::int32_t> values) {
+        return Column<std::int64_t>::from_compact_int32(
+            ibex::detail::NoInitVector<std::int32_t>(values.begin(), values.end()));
+    };
+    const auto register_compact = [&](ExternRegistry& registry, const char* name, Table data,
+                                      ibex::runtime::SourceColumnStats stats) {
+        auto shared = std::make_shared<Table>(std::move(data));
+        registry.register_lazy_table(
+            name,
+            [shared, stats](const ibex::runtime::ExternArgs&)
+                -> std::expected<ibex::runtime::LazyTablePtr, std::string> {
+                Table schema;
+                for (const auto& col : shared->columns) {
+                    schema.add_column(col.name, Column<std::int64_t>{});
+                }
+                return std::make_shared<ibex::runtime::LazyTable>(
+                    std::move(schema), shared->rows(),
+                    [shared](const std::vector<std::string>& names,
+                             const Selection* selection) -> std::expected<Table, std::string> {
+                        Table out;
+                        for (const auto& col_name : names) {
+                            const auto& col = std::get<Column<std::int64_t>>(*shared->find(col_name));
+                            ibex::detail::NoInitVector<std::int32_t> values;
+                            const std::size_t n =
+                                selection == nullptr ? col.size() : selection->size();
+                            values.reserve(n);
+                            for (std::size_t i = 0; i < n; ++i) {
+                                const std::size_t row = selection == nullptr ? i : (*selection)[i];
+                                values.push_back(col.compact_int32_data()[row]);
+                            }
+                            out.add_column(col_name, Column<std::int64_t>::from_compact_int32(
+                                                         std::move(values)));
+                        }
+                        out.logical_rows =
+                            selection == nullptr ? shared->rows() : selection->size();
+                        return out;
+                    },
+                    stats);
+            });
+    };
+    ExternRegistry registry;
+    Table fact;
+    fact.add_column("k", compact({10, 11, 12, 10, 14, 13, 11, 10}));
+    fact.add_column("v", compact({1, 2, 1, 2, 1, 2, 1, 2}));
+    Table dim;
+    dim.add_column("k", compact({10, 11, 12, 13, 14}));
+    dim.add_column("w", compact({100, 200, 300, 400, 500}));
+    ibex::runtime::SourceColumnStats dim_stats;
+    dim_stats["k"] = {.min = 10, .max = 14, .null_count = 0};
+    dim_stats["w"] = {.min = 100, .max = 500, .null_count = 0};
+    register_compact(registry, "read_f", std::move(fact), {});
+    register_compact(registry, "read_d", std::move(dim), dim_stats);
+    Table captured;
+    registry.register_scalar_table_consumer(
+        "capture", ibex::runtime::ScalarKind::Int,
+        [&](const Table& t, const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            captured = t;
+            return ibex::runtime::ExternValue{std::int64_t{0}};
+        });
+    const char* src = R"(
+extern fn read_f() -> DataFrame from "x.hpp";
+extern fn read_d() -> DataFrame from "x.hpp";
+extern fn capture(df: DataFrame) -> Int from "x.hpp";
+let f = read_f();
+let d = read_d();
+let r = (f join d on k)[select { s = sum(w), c = count() }, by v];
+capture(r);
+r;
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+    // v = 1: k 10, 12, 14, 11 -> 100 + 300 + 500 + 200; v = 2: k 11, 10, 13, 10.
+    CHECK(rows_of(captured, {"v", "s", "c"}) ==
+          std::set<std::vector<std::int64_t>>{{1, 1100, 4}, {2, 800, 4}});
+}

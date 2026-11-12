@@ -99,16 +99,20 @@ auto pair_moment(const Column<X>& xs, const Column<Y>& ys, const ValidityBitmap*
     const auto origin_y = static_cast<double>(ys[first]);
     const std::size_t blocks = (rows + kPairBlockRows - 1) / kPairBlockRows;
     std::vector<CoMoment> partial(blocks);
+    // Each side at its physical width: data() throws for compact Int32.
     const auto reduce = [&](std::size_t block) {
         const std::size_t begin = block * kPairBlockRows;
         const std::size_t end = std::min(rows, begin + kPairBlockRows);
-        if (xv == nullptr && yv == nullptr) {
-            partial[block] =
-                pair_block<false>(xs.data(), ys.data(), xv, yv, begin, end, origin_x, origin_y);
-        } else {
-            partial[block] =
-                pair_block<true>(xs.data(), ys.data(), xv, yv, begin, end, origin_x, origin_y);
-        }
+        with_physical_values(xs, [&](const auto* x_values) {
+            with_physical_values(ys, [&](const auto* y_values) {
+                partial[block] =
+                    xv == nullptr && yv == nullptr
+                        ? pair_block<false>(x_values, y_values, xv, yv, begin, end, origin_x,
+                                            origin_y)
+                        : pair_block<true>(x_values, y_values, xv, yv, begin, end, origin_x,
+                                           origin_y);
+            });
+        });
     };
     const std::size_t workers =
         std::min(blocks, exec != nullptr ? group_barrier_worker_count(*exec, rows) : 0);

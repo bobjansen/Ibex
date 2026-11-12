@@ -1408,21 +1408,24 @@ auto prove_unique_columns(runtime::LazyTable& lazy, const std::set<std::string>&
         }
         std::vector<bool> seen(static_cast<std::size_t>(span), false);
         const std::int64_t base = *stats.min;
-        bool unique = true;
-        const auto* data = values->data();
-        for (std::size_t i = 0; i < rows; ++i) {
-            const auto offset = int64_offset(data[i], base);
-            if (offset >= span) {
-                unique = false;  // outside the footer's own range: trust nothing
-                break;
+        // A Parquet Int32 key decodes as compact storage, whose data() throws;
+        // read the values at their physical width.
+        const auto all_distinct = [&](const auto* data) {
+            for (std::size_t i = 0; i < rows; ++i) {
+                const auto offset = int64_offset(data[i], base);
+                if (offset >= span) {
+                    return false;  // outside the footer's own range: trust nothing
+                }
+                const auto slot = static_cast<std::size_t>(offset);
+                if (seen[slot]) {
+                    return false;
+                }
+                seen[slot] = true;
             }
-            const auto slot = static_cast<std::size_t>(offset);
-            if (seen[slot]) {
-                unique = false;
-                break;
-            }
-            seen[slot] = true;
-        }
+            return true;
+        };
+        const bool unique = values->is_compact_int32() ? all_distinct(values->compact_int32_data())
+                                                       : all_distinct(values->data());
         if (unique) {
             if (std::getenv("IBEX_UNIQUE_KEY_STATS") != nullptr) {
                 (void)std::fprintf(stderr, "[unique] %s rows=%zu span=%llu\n", name.c_str(), rows,

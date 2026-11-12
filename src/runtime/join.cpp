@@ -1147,15 +1147,21 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                                     // rather than visiting and appending for every row.
                                     values.resize_for_overwrite(total);
                                     auto* dst = values.data();
-                                    const auto ld = value_reader(*lc);
-                                    const auto rd = value_reader(*rc);
-                                    for_row_ranges(
-                                        exec, total, [&](std::size_t begin, std::size_t end) {
-                                            for (std::size_t i = begin; i < end; ++i) {
-                                                dst[i] = left_idx[i] == kNull ? rd[right_idx[i]]
-                                                                              : ld[left_idx[i]];
-                                            }
+                                    using V = typename Col::value_type;
+                                    with_physical_values(*lc, [&](const auto* ld) {
+                                        with_physical_values(*rc, [&](const auto* rd) {
+                                            for_row_ranges(
+                                                exec, total,
+                                                [&](std::size_t begin, std::size_t end) {
+                                                    for (std::size_t i = begin; i < end; ++i) {
+                                                        dst[i] =
+                                                            left_idx[i] == kNull
+                                                                ? static_cast<V>(rd[right_idx[i]])
+                                                                : static_cast<V>(ld[left_idx[i]]);
+                                                    }
+                                                });
                                         });
+                                    });
                                     return true;
                                 }
                                 return false;

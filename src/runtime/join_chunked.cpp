@@ -523,50 +523,50 @@ auto build_dense_int_heads(JoinHashIndex& index, const Column<std::int64_t>& col
         !dense_int_join_build_enabled().load(std::memory_order_relaxed)) {
         return false;
     }
-    const auto data = value_reader(col);
-    auto& pool = process_worker_pool();
-    const std::size_t ranges = std::max<std::size_t>(1, std::min(pool.size(), partitions));
-    const std::size_t grain = (n + ranges - 1) / ranges;
-    std::vector<std::int64_t> los(ranges, std::numeric_limits<std::int64_t>::max());
-    std::vector<std::int64_t> his(ranges, std::numeric_limits<std::int64_t>::min());
-    const auto bounds = [&](std::size_t r) {
-        const std::size_t begin = std::min(n, r * grain);
-        const std::size_t end = std::min(n, begin + grain);
-        std::int64_t lo = los[r];
-        std::int64_t hi = his[r];
-        for (std::size_t row = begin; row < end; ++row) {
-            if (!is_null(row)) {
-                lo = std::min(lo, data[row]);
-                hi = std::max(hi, data[row]);
+    return with_physical_values(col, [&](const auto* data) {
+        const auto key_at = [data](std::size_t r) -> std::int64_t { return data[r]; };
+        auto& pool = process_worker_pool();
+        const std::size_t ranges = std::max<std::size_t>(1, std::min(pool.size(), partitions));
+        const std::size_t grain = (n + ranges - 1) / ranges;
+        std::vector<std::int64_t> los(ranges, std::numeric_limits<std::int64_t>::max());
+        std::vector<std::int64_t> his(ranges, std::numeric_limits<std::int64_t>::min());
+        const auto bounds = [&](std::size_t r) {
+            const std::size_t begin = std::min(n, r * grain);
+            const std::size_t end = std::min(n, begin + grain);
+            std::int64_t lo = los[r];
+            std::int64_t hi = his[r];
+            for (std::size_t row = begin; row < end; ++row) {
+                if (!is_null(row)) {
+                    lo = std::min(lo, key_at(row));
+                    hi = std::max(hi, key_at(row));
+                }
             }
+            los[r] = lo;
+            his[r] = hi;
+        };
+        if (ranges > 1) {
+            auto batch = pool.submit(ranges, bounds);
+            batch.wait();
+        } else {
+            bounds(0);
         }
-        los[r] = lo;
-        his[r] = hi;
-    };
-    if (ranges > 1) {
-        auto batch = pool.submit(ranges, bounds);
-        batch.wait();
-    } else {
-        bounds(0);
-    }
-    const std::int64_t lo = *std::ranges::min_element(los);
-    const std::int64_t hi = *std::ranges::max_element(his);
-    if (lo > hi) {
-        return false;  // every key null
-    }
-    const std::uint64_t span = static_cast<std::uint64_t>(hi) - static_cast<std::uint64_t>(lo);
-    if (span >= kMaxSlots || span >= (std::uint64_t{2} * n) + 1024) {
-        return false;
-    }
-    index.i64_dense.assign(static_cast<std::size_t>(span) + 1, kJoinNil);
-    index.i64_dense_lo = lo;
-    DenseRangeHeads heads{.heads = &index.i64_dense, .lo = lo, .slots = span + 1};
-    heads.partition(partitions);
-    fill_partitioned_heads(
-        heads, n, [data](std::size_t r) { return data[r]; }, is_null, index.chain_next,
-        index.unique);
-    dense_int_join_builds().fetch_add(1, std::memory_order_relaxed);
-    return true;
+        const std::int64_t lo = *std::ranges::min_element(los);
+        const std::int64_t hi = *std::ranges::max_element(his);
+        if (lo > hi) {
+            return false;  // every key null
+        }
+        const std::uint64_t span = static_cast<std::uint64_t>(hi) - static_cast<std::uint64_t>(lo);
+        if (span >= kMaxSlots || span >= (std::uint64_t{2} * n) + 1024) {
+            return false;
+        }
+        index.i64_dense.assign(static_cast<std::size_t>(span) + 1, kJoinNil);
+        index.i64_dense_lo = lo;
+        DenseRangeHeads heads{.heads = &index.i64_dense, .lo = lo, .slots = span + 1};
+        heads.partition(partitions);
+        fill_partitioned_heads(heads, n, key_at, is_null, index.chain_next, index.unique);
+        dense_int_join_builds().fetch_add(1, std::memory_order_relaxed);
+        return true;
+    });
 }
 
 auto build_join_hash_index(const Table& build_side, const std::string& key_name, ExprType key_kind,
@@ -588,11 +588,13 @@ auto build_join_hash_index(const Table& build_side, const std::string& key_name,
         return index.validity != nullptr && !(*index.validity)[row];
     };
     const auto build_scalar = [&]<typename ColT, typename Heads>(const ColT& col, Heads& heads) {
-        const auto data = value_reader(col);
         heads.partition(partitions);
-        fill_partitioned_heads(
-            heads, col.size(), [data](std::size_t r) { return data[r]; }, is_null, index.chain_next,
-            index.unique);
+        with_physical_values(col, [&](const auto* data) {
+            fill_partitioned_heads(
+                heads, col.size(),
+                [data](std::size_t r) -> typename ColT::value_type { return data[r]; }, is_null,
+                index.chain_next, index.unique);
+        });
     };
 
     if (key_kind == ExprType::Int) {
@@ -667,19 +669,22 @@ auto build_join_pair_index(const Column<std::int64_t>& col0, const Column<std::i
     index.key_kind = ExprType::Int;
     const std::size_t n = col0.size();
     index.chain_next.assign(n, kJoinNil);
-    const auto d0 = value_reader(col0);
-    const auto d1 = value_reader(col1);
     index.pair_heads.partition(partitions);
-    fill_partitioned_heads(
-        index.pair_heads, n,
-        [d0, d1](std::size_t r) {
-            return JoinHashIndex::PairKey{.a = static_cast<std::uint64_t>(d0[r]),
-                                          .b = static_cast<std::uint64_t>(d1[r])};
-        },
-        [v0, v1](std::size_t r) {
-            return (v0 != nullptr && !(*v0)[r]) || (v1 != nullptr && !(*v1)[r]);
-        },
-        index.chain_next, index.unique);
+    with_physical_values(col0, [&](const auto* d0) {
+        with_physical_values(col1, [&](const auto* d1) {
+            fill_partitioned_heads(
+                index.pair_heads, n,
+                [d0, d1](std::size_t r) {
+                    return JoinHashIndex::PairKey{
+                        .a = static_cast<std::uint64_t>(static_cast<std::int64_t>(d0[r])),
+                        .b = static_cast<std::uint64_t>(static_cast<std::int64_t>(d1[r]))};
+                },
+                [v0, v1](std::size_t r) {
+                    return (v0 != nullptr && !(*v0)[r]) || (v1 != nullptr && !(*v1)[r]);
+                },
+                index.chain_next, index.unique);
+        });
+    });
     return index;
 }
 
@@ -1354,23 +1359,24 @@ struct JoinProbe {
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
-            const auto data = value_reader(*col);
-            if (const auto& dense = index().i64_dense; !dense.empty()) {
-                const auto lo = static_cast<std::uint64_t>(index().i64_dense_lo);
-                const std::size_t slots = dense.size();
-                const std::size_t* heads = dense.data();
-                dense_int_join_probes().fetch_add(1, std::memory_order_relaxed);
-                li_identity = probe_resolved(
-                    n,
-                    [&](std::size_t i) {
-                        const std::uint64_t at = static_cast<std::uint64_t>(data[i]) - lo;
-                        return at < slots ? heads[at] : kNil;
-                    },
-                    li, ri);
-            } else {
-                li_identity = probe_scalar(
-                    index().i64_heads, n, [&](std::size_t i) { return data[i]; }, li, ri);
-            }
+            with_physical_values(*col, [&](const auto* data) {
+                const auto key_at = [data](std::size_t i) -> std::int64_t { return data[i]; };
+                if (const auto& dense = index().i64_dense; !dense.empty()) {
+                    const auto lo = static_cast<std::uint64_t>(index().i64_dense_lo);
+                    const std::size_t slots = dense.size();
+                    const std::size_t* heads = dense.data();
+                    dense_int_join_probes().fetch_add(1, std::memory_order_relaxed);
+                    li_identity = probe_resolved(
+                        n,
+                        [&](std::size_t i) {
+                            const std::uint64_t at = static_cast<std::uint64_t>(key_at(i)) - lo;
+                            return at < slots ? heads[at] : kNil;
+                        },
+                        li, ri);
+                } else {
+                    li_identity = probe_scalar(index().i64_heads, n, key_at, li, ri);
+                }
+            });
         } else if (index().key_kind == ExprType::Double) {
             const auto* col = std::get_if<Column<double>>(key);
             if (col == nullptr) {
@@ -1481,16 +1487,19 @@ struct JoinProbe {
         li.reserve(n);
         ri.reserve(n);
 
-        const auto d0 = value_reader(*col0);
-        const auto d1 = value_reader(*col1);
         const auto is_null = [&](std::size_t r) {
             return (v0 != nullptr && !(*v0)[r]) || (v1 != nullptr && !(*v1)[r]);
         };
-        const auto get_key = [&](std::size_t r) {
-            return JoinHashIndex::PairKey{.a = static_cast<std::uint64_t>(d0[r]),
-                                          .b = static_cast<std::uint64_t>(d1[r])};
-        };
-        const bool li_identity = probe_pair(n, is_null, get_key, li, ri);
+        const bool li_identity = with_physical_values(*col0, [&](const auto* d0) {
+            return with_physical_values(*col1, [&](const auto* d1) {
+                const auto get_key = [&](std::size_t r) {
+                    return JoinHashIndex::PairKey{
+                        .a = static_cast<std::uint64_t>(static_cast<std::int64_t>(d0[r])),
+                        .b = static_cast<std::uint64_t>(static_cast<std::int64_t>(d1[r]))};
+                };
+                return probe_pair(n, is_null, get_key, li, ri);
+            });
+        });
 
         const std::size_t total = li_identity ? ri.size() : li.size();
         return assemble_output(std::move(left_chunk), li.data(), ri.data(), total, li_identity);
@@ -1612,9 +1621,14 @@ struct JoinProbe {
             const auto* col = std::get_if<Column<std::int64_t>>(rkey);
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
-            const auto data = value_reader(*col);
-            probe_swapped(
-                n_right, [&](std::size_t r) { return index().find_int_head(data[r]); }, li, ri);
+            with_physical_values(*col, [&](const auto* data) {
+                probe_swapped(
+                    n_right,
+                    [&](std::size_t r) {
+                        return index().find_int_head(static_cast<std::int64_t>(data[r]));
+                    },
+                    li, ri);
+            });
         } else if (index().key_kind == ExprType::Double) {
             const auto* col = std::get_if<Column<double>>(rkey);
             if (col == nullptr)
@@ -1717,22 +1731,23 @@ struct JoinProbe {
         }
         const ValidityBitmap* v0 = e0.validity.has_value() ? &*e0.validity : nullptr;
         const ValidityBitmap* v1 = e1.validity.has_value() ? &*e1.validity : nullptr;
-        const auto d0 = value_reader(*col0);
-        const auto d1 = value_reader(*col1);
         const std::size_t n_right = right_->rows();
-
-        const auto head_of = [&](std::size_t r) -> std::size_t {
-            if ((v0 != nullptr && !(*v0)[r]) || (v1 != nullptr && !(*v1)[r])) {
-                return kNil;
-            }
-            const JoinHashIndex::PairKey key{.a = static_cast<std::uint64_t>(d0[r]),
-                                             .b = static_cast<std::uint64_t>(d1[r])};
-            return index().pair_heads.find_head(key);
-        };
-
         IndexVec li;
         IndexVec ri;
-        probe_swapped(n_right, head_of, li, ri);
+        with_physical_values(*col0, [&](const auto* d0) {
+            with_physical_values(*col1, [&](const auto* d1) {
+                const auto head_of = [&](std::size_t r) -> std::size_t {
+                    if ((v0 != nullptr && !(*v0)[r]) || (v1 != nullptr && !(*v1)[r])) {
+                        return kNil;
+                    }
+                    const JoinHashIndex::PairKey key{
+                        .a = static_cast<std::uint64_t>(static_cast<std::int64_t>(d0[r])),
+                        .b = static_cast<std::uint64_t>(static_cast<std::int64_t>(d1[r]))};
+                    return index().pair_heads.find_head(key);
+                };
+                probe_swapped(n_right, head_of, li, ri);
+            });
+        });
 
         Table left_copy;
         left_copy.columns.reserve(left_table.columns.size());
@@ -2120,7 +2135,6 @@ auto run_streamed_two_phase_unit(const StreamedTwoPhaseShared& shared, JoinProbe
     if (keys_col == nullptr) {
         return std::unexpected("streamed join probe: probe key is not Int64");
     }
-    const auto key_data = value_reader(*keys_col);
     const ValidityBitmap* key_validity =
         sel.keys.validity.has_value() ? &*sel.keys.validity : nullptr;
     const std::size_t n = keys_col->size();
@@ -2128,19 +2142,23 @@ auto run_streamed_two_phase_unit(const StreamedTwoPhaseShared& shared, JoinProbe
     // `try_two_phase_probe`'s scan and replay, serially: this worker owns the unit.
     std::vector<JoinProbe::SwappedHit> hits;
     std::size_t total = 0;
-    for (std::size_t i = 0; i < n; ++i) {
-        if (key_validity != nullptr && !(*key_validity)[i]) {
-            continue;
+    with_physical_values(*keys_col, [&](const auto* key_data) {
+        for (std::size_t i = 0; i < n; ++i) {
+            if (key_validity != nullptr && !(*key_validity)[i]) {
+                continue;
+            }
+            const std::size_t head =
+                probe.index().find_int_head(static_cast<std::int64_t>(key_data[i]));
+            if (head == kJoinNil) {
+                continue;
+            }
+            hits.push_back(JoinProbe::SwappedHit{.rrow = i, .head = head});
+            for (std::size_t cur = head; cur != kJoinNil; cur = probe.index().chain_next[cur]) {
+                ++total;
+            }
         }
-        const std::size_t head = probe.index().find_int_head(key_data[i]);
-        if (head == kJoinNil) {
-            continue;
-        }
-        hits.push_back(JoinProbe::SwappedHit{.rrow = i, .head = head});
-        for (std::size_t cur = head; cur != kJoinNil; cur = probe.index().chain_next[cur]) {
-            ++total;
-        }
-    }
+    });
+    const auto key_data = value_reader(*keys_col);  // the per-hit replay below
     const std::size_t n_hits = hits.size();
     // Not zero-filled: the replay below writes every slot of all three.
     Selection survivors(n_hits);
@@ -2959,19 +2977,23 @@ class ChunkedInnerJoinOperator final : public Operator {
         // the gate declines, so the serial path is the same code.
         const auto scan = [&](std::size_t begin, std::size_t end,
                               std::vector<JoinProbe::SwappedHit>& hits, std::size_t& total) {
-            for (std::size_t i = begin; i < end; ++i) {
-                if (key_validity != nullptr && !(*key_validity)[i]) {
-                    continue;
+            with_physical_values(*keys_col, [&](const auto* keys) {
+                for (std::size_t i = begin; i < end; ++i) {
+                    if (key_validity != nullptr && !(*key_validity)[i]) {
+                        continue;
+                    }
+                    const std::size_t head =
+                        probe_.index().find_int_head(static_cast<std::int64_t>(keys[i]));
+                    if (head == kNil) {
+                        continue;
+                    }
+                    hits.push_back(JoinProbe::SwappedHit{.rrow = i, .head = head});
+                    for (std::size_t cur = head; cur != kNil;
+                         cur = probe_.index().chain_next[cur]) {
+                        ++total;
+                    }
                 }
-                const std::size_t head = probe_.index().find_int_head(key_data[i]);
-                if (head == kNil) {
-                    continue;
-                }
-                hits.push_back(JoinProbe::SwappedHit{.rrow = i, .head = head});
-                for (std::size_t cur = head; cur != kNil; cur = probe_.index().chain_next[cur]) {
-                    ++total;
-                }
-            }
+            });
         };
         const std::size_t workers = probe_.probe_parallel_workers(n);
         if (workers == 0) {
@@ -3288,10 +3310,14 @@ class ChunkedInnerJoinOperator final : public Operator {
                 } else if constexpr (std::is_same_v<C, Column<std::int64_t>> ||
                                      std::is_same_v<C, Column<Date>> ||
                                      std::is_same_v<C, Column<Timestamp>>) {
-                    const auto data = value_reader(col);
-                    publish_build_filter_keys(
-                        [data](std::size_t r) { return join_key_domain(data[r]); }, col.size(),
-                        validity, slot);
+                    with_physical_values(col, [&](const auto* data) {
+                        publish_build_filter_keys(
+                            [data](std::size_t r) {
+                                return join_key_domain(
+                                    static_cast<typename C::value_type>(data[r]));
+                            },
+                            col.size(), validity, slot);
+                    });
                 } else if constexpr (std::is_same_v<C, Column<std::string>>) {
                     publish_build_filter_strings(col, validity, slot);
                 } else if constexpr (std::is_same_v<C, Column<Categorical>>) {

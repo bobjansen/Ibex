@@ -42,6 +42,21 @@ template <typename T>
         return column.data();
 }
 
+/// Calls `body` with a raw pointer to `column`'s physical values: `const T*`,
+/// or `const std::int32_t*` for an Int64 column held as compact Int32. The
+/// width is tested once per call, not per row: hot loops that read through
+/// `value_reader`'s `IntegerView` instead cost h2o's one-core joins ~10%.
+/// `body` is instantiated for both widths and must return one type.
+template <typename T, typename Body>
+decltype(auto) with_physical_values(const Column<T>& column, Body&& body) {
+    if constexpr (std::is_same_v<T, std::int64_t>) {
+        if (column.is_compact_int32()) {
+            return body(column.compact_int32_data());
+        }
+    }
+    return body(column.data());
+}
+
 enum class ExprType : std::uint8_t {
     Int,
     Double,
@@ -542,8 +557,9 @@ void gather_range_into(ColumnValue& dst_v, const ColumnValue& src_v, std::span<c
                             return;
                         }
                     }
+                    // Compact sources returned above: the raw Int64 pointer.
                     auto* dp = dst->data();
-                    const auto sp = value_reader(src);
+                    const auto* sp = src.data();
                     for (std::size_t pos = lo; pos < hi; ++pos) {
                         dp[pos] = sp[static_cast<std::size_t>(idx[pos])];
                     }
@@ -734,7 +750,7 @@ void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src,
                 ColT dst;
                 dst.resize(n);
                 auto* dp = dst.data();
-                const auto sp = value_reader(col);
+                const auto* sp = col.data();  // compact sources returned above
                 for (std::size_t i = 0; i < n; ++i) {
                     if (indices[i] != null_row) {
                         dp[i] = sp[indices[i]];
@@ -1058,7 +1074,7 @@ template <typename GatherWhole>
                         }
                     }
                     auto* dp = dst.data();
-                    const auto sp = value_reader(src);
+                    const auto* sp = src.data();  // compact sources returned above
                     for (std::size_t pos = task.lo; pos < task.hi; ++pos) {
                         const std::size_t row = idx[pos];
                         dp[pos] = row != null_row ? sp[row] : typename ColT::value_type{};

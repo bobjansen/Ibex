@@ -2427,11 +2427,18 @@ class HashAggregateState final {
             return std::nullopt;
         };
         switch (int_key_kind_) {
-            case IntKeyKind::Int64:
-                return with_physical_values(
-                    std::get<Column<std::int64_t>>(key_col), [&](const auto* data) {
-                        return run([data](std::size_t row) -> std::int64_t { return data[row]; });
-                    });
+            case IntKeyKind::Int64: {
+                // Not with_physical_values: Clang 18 drops the member-template
+                // instantiations `run` needs when reached through a second
+                // generic lambda (-Wundefined-internal).
+                const auto& keys = std::get<Column<std::int64_t>>(key_col);
+                if (keys.is_compact_int32()) {
+                    const std::int32_t* narrow = keys.compact_int32_data();
+                    return run([narrow](std::size_t row) -> std::int64_t { return narrow[row]; });
+                }
+                const std::int64_t* wide = keys.data();
+                return run([wide](std::size_t row) -> std::int64_t { return wide[row]; });
+            }
             case IntKeyKind::Date: {
                 const Date* dates = std::get<Column<Date>>(key_col).data();
                 return run([dates](std::size_t row) -> std::int64_t { return dates[row].days; });

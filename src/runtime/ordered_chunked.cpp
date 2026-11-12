@@ -632,6 +632,35 @@ class ChunkedOrderedLimitOperator final : public Operator {
                                   const std::vector<KeyCol>& group_key_cols,
                                   const std::vector<const ColumnEntry*>& key_columns)
         -> std::optional<std::string> {
+        // The key's physical values, resolved once. A compact Int64 key is read
+        // as its Int32 values and widened per row: through IntegerView it tested
+        // the width per element, and widening the column first cost top-k +22%.
+        // An explicit second instantiation, not a generic lambda: Clang 18 drops
+        // member-template instantiations reached through nested generic lambdas.
+        if constexpr (std::is_same_v<T, std::int64_t>) {
+            if (key_column.is_compact_int32()) {
+                return process_single_key_values(chunk, key_column,
+                                                 key_column.compact_int32_data(), ascending,
+                                                 group_key_cols, key_columns);
+            }
+        }
+        if constexpr (is_dense_column_v<Column<T>>) {
+            return process_single_key_values(chunk, key_column, key_column.data(), ascending,
+                                             group_key_cols, key_columns);
+        } else {
+            // `Column<bool>` is bit-packed and has no dense buffer; it keeps
+            // the indexed read and never reads `key_values`.
+            return process_single_key_values(chunk, key_column, static_cast<const T*>(nullptr),
+                                             ascending, group_key_cols, key_columns);
+        }
+    }
+
+    template <typename T, typename Value>
+    auto process_single_key_values(const Table& chunk, const Column<T>& key_column,
+                                   const Value* key_values, bool ascending,
+                                   const std::vector<KeyCol>& group_key_cols,
+                                   const std::vector<const ColumnEntry*>& key_columns)
+        -> std::optional<std::string> {
         // A null cell holds its type's zero, and the typed heaps below compare
         // raw values, so they would rank a null as a zero instead of last. The
         // POD heaps flag a null themselves (they hold their own storage, which
@@ -646,20 +675,10 @@ class ChunkedOrderedLimitOperator final : public Operator {
         // sitting in the loop CONDITION. `key_column[row]` likewise re-tests
         // for adopted (Arrow) storage on every element. Resolve both once.
         const std::size_t rows = chunk.rows();
-        // An Int64 key through IntegerView tested its width per element too;
-        // a compact one is widened once instead. (The bit-packed `bool`
-        // instantiation never fills it.)
-        // NOLINTNEXTLINE(misc-const-correctness)
-        ::ibex::detail::NoInitVector<T> widened_sort_key;
-        const T* key_values = nullptr;
-        if constexpr (is_dense_column_v<Column<T>>) {
-            key_values = contiguous_values(key_column, widened_sort_key);
-        }
-        // `Column<bool>` is bit-packed and has no dense buffer, so it keeps the
-        // indexed read. Every T reaching here is trivially copyable.
+        // Every T reaching here is trivially copyable.
         auto key_at = [&](std::size_t r) -> T {
             if constexpr (is_dense_column_v<Column<T>>) {
-                return key_values[r];
+                return static_cast<T>(key_values[r]);
             } else {
                 return key_column[r];
             }

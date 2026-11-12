@@ -347,14 +347,19 @@ auto combine_tree_blocks(const NumericTreeBlock<T>& left, const NumericTreeBlock
 /// A shift node's values for block rows [row, row + count): the source slice
 /// itself when every row's source is in bounds, else a copy with 0 at the rows
 /// that fall off either end (they are null).
-template <typename T, typename Source>
-auto shift_tree_block(const NumericTreeNode& node, Source source, std::size_t row,
+template <typename T, typename Value>
+auto shift_tree_block(const NumericTreeNode& node, const Value* source, std::size_t row,
                       std::size_t count, T* dst) -> NumericTreeBlock<T> {
     const std::int64_t first = static_cast<std::int64_t>(row) + node.shift;
     const auto rows = static_cast<std::int64_t>(node.source_rows);
-    if constexpr (std::is_same_v<Source, const T*>) {
-        if (first >= 0 && first + static_cast<std::int64_t>(count) <= rows) {
+    if (first >= 0 && first + static_cast<std::int64_t>(count) <= rows) {
+        if constexpr (std::is_same_v<Value, T>) {
             return {.data = source + first, .scalar = T{}};
+        } else {
+            // A narrower or other-typed source in bounds: one converting copy.
+            std::transform(source + first, source + first + static_cast<std::int64_t>(count), dst,
+                           [](Value value) { return static_cast<T>(value); });
+            return {.data = dst, .scalar = T{}};
         }
     }
     for (std::size_t i = 0; i < count; ++i) {
@@ -364,20 +369,36 @@ auto shift_tree_block(const NumericTreeNode& node, Source source, std::size_t ro
     return {.data = dst, .scalar = T{}};
 }
 
+/// An Int column's block as `T`: the width is tested once per block, not per
+/// element (IntegerView's per-element test cost compact `a * 3 + b` +34%).
+template <typename T>
+void int_column_block(IntegerView ints, std::size_t row, std::size_t count, T* dst) {
+    with_physical_values(ints, [&](const auto* values) {
+        std::transform(values + row, values + row + count, dst,
+                       [](auto value) { return static_cast<T>(value); });
+    });
+}
+
+template <typename T>
+auto int_shift_block(const NumericTreeNode& node, std::size_t row, std::size_t count, T* dst)
+    -> NumericTreeBlock<T> {
+    return with_physical_values(node.ints, [&](const auto* values) {
+        return shift_tree_block(node, values, row, count, dst);
+    });
+}
+
 auto eval_double_tree_node(const NumericTreeNode& node,
                            const std::vector<NumericTreeBlock<double>>& values, std::size_t row,
                            std::size_t count, double* dst) -> NumericTreeBlock<double> {
     using Block = NumericTreeBlock<double>;
     switch (node.kind) {
         case NumericTreeNode::Kind::IntColumn:
-            for (std::size_t i = 0; i < count; ++i) {
-                dst[i] = static_cast<double>(node.ints[row + i]);
-            }
+            int_column_block(node.ints, row, count, dst);
             return {.data = dst, .scalar = 0.0};
         case NumericTreeNode::Kind::DoubleColumn:
             return {.data = node.doubles + row, .scalar = 0.0};
         case NumericTreeNode::Kind::IntShift:
-            return shift_tree_block(node, node.ints, row, count, dst);
+            return int_shift_block(node, row, count, dst);
         case NumericTreeNode::Kind::DoubleShift:
             return shift_tree_block(node, node.doubles, row, count, dst);
         case NumericTreeNode::Kind::IntScalar:
@@ -441,11 +462,10 @@ auto eval_int_tree_node(const NumericTreeNode& node,
         case NumericTreeNode::Kind::IntColumn:
             if (const auto* wide = node.ints.wide_data())
                 return {.data = wide + row, .scalar = 0};
-            for (std::size_t i = 0; i < count; ++i)
-                dst[i] = node.ints[row + i];
+            int_column_block(node.ints, row, count, dst);
             return {.data = dst, .scalar = 0};
         case NumericTreeNode::Kind::IntShift:
-            return shift_tree_block(node, node.ints, row, count, dst);
+            return int_shift_block(node, row, count, dst);
         case NumericTreeNode::Kind::IntScalar:
             return {.data = nullptr, .scalar = node.int_scalar};
         case NumericTreeNode::Kind::IntAbs: {

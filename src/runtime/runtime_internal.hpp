@@ -57,6 +57,36 @@ decltype(auto) with_physical_values(const Column<T>& column, Body&& body) {
     return body(column.data());
 }
 
+/// Widen `count` Int32 values into `dst`. A large output is written with
+/// streaming stores, as glibc's memmove does for the equal-width copy it
+/// replaces: a plain vector store reads each output line first, which cost a
+/// 5M-row compact `lag` +22% against the wide memcpy.
+inline void widen_int32(const std::int32_t* src, std::size_t count, std::int64_t* dst) noexcept {
+#ifdef __AVX2__
+    // 8 MB of output: well past L2, where the read-for-ownership is the cost.
+    constexpr std::size_t kStreamRows = std::size_t{1} << 20;
+    if (count >= kStreamRows) {
+        std::size_t i = 0;
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        for (; i < count && (reinterpret_cast<std::uintptr_t>(dst + i) & 31U) != 0; ++i) {
+            dst[i] = src[i];
+        }
+        for (; i + 4 <= count; i += 4) {
+            // NOLINTBEGIN(cppcoreguidelines-pro-type-reinterpret-cast)
+            const __m128i narrow = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
+            _mm256_stream_si256(reinterpret_cast<__m256i*>(dst + i), _mm256_cvtepi32_epi64(narrow));
+            // NOLINTEND(cppcoreguidelines-pro-type-reinterpret-cast)
+        }
+        _mm_sfence();
+        for (; i < count; ++i) {
+            dst[i] = src[i];
+        }
+        return;
+    }
+#endif
+    std::copy_n(src, count, dst);
+}
+
 /// A raw `const T*` over `column`'s values for a long kernel that is not
 /// worth compiling per width: the column's own buffer, or for a compact Int64
 /// column a copy widened once into `scratch` (the operation's own explicit
@@ -67,9 +97,8 @@ template <typename T>
                                      ::ibex::detail::NoInitVector<T>& scratch) -> const T* {
     if constexpr (std::is_same_v<T, std::int64_t>) {
         if (column.is_compact_int32()) {
-            const auto* compact = column.compact_int32_data();
             scratch.resize(column.size());
-            std::copy(compact, compact + column.size(), scratch.begin());
+            widen_int32(column.compact_int32_data(), column.size(), scratch.data());
             return scratch.data();
         }
     }

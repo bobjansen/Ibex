@@ -207,23 +207,34 @@ pin to one CPU with `IBEX_CORES=1` and, through `systemd-run`, a 16G memory
 cap; the script times queries and does not check answers (the
 `[compact-int32]` tests in `tests/test_integer_no_cache.cpp` do).
 
-Compact against Int64 storage, `build-release` at the commit that made
-compact the default, two rounds of five (minimum, ms):
+Compact against Int64 storage, one `build-release`, two rounds of five
+(minimum, ms). "At flip" is the commit that made compact the default; the
+element-wise losses it showed were fixed after it:
 
-| Query | Int64 | Int32 | Int32 vs Int64 |
-|---|---:|---:|---:|
-| `filter a > 500000` / `a > b` | 27.1 / 28.2 | 19.5 / 19.6 | -28% / -31% |
-| `order { a }` | 283.9 | 218.3 | -23% |
-| `cumsum(a)` | 3.9 | 3.0 | -23% |
-| semi / anti join on `k` | 37.1 / 37.0 | 29.7 / 29.5 | -20% |
-| `Float64(a)` | 5.5 | 4.6 | -16% |
-| group-bys (5 shapes), corr | | | -1.4% to -3.6% |
-| left / outer join on `k` | 309.1 / 327.9 | 309.3 / 311.6 | +0.1% / -5.0% |
-| `melt` | 59.6 | 62.7 | +5% |
-| top-k by `g` / top-k | 57.7 / 12.1 | 64.2 / 14.7 | +11% / +22% |
-| `lag(a, 1)` | 2.3 | 2.8 | +21% |
-| `abs(a)` | 3.5 | 4.5 | +27% |
-| fill forward / backward | 8.7 / 8.6 | 11.5 / 11.6 | +32% / +35% |
-| `a * 3 + b` / `pmax(a, b)` | 5.9 / 4.7 | 7.8 / 6.7 | +34% / +43% |
+| Query | Int64 | Int32 | Int32 vs Int64 | At flip |
+|---|---:|---:|---:|---:|
+| `filter a > 500000` / `a > b` | 27.4 / 28.3 | 19.7 / 19.9 | -28% / -30% | -28% / -31% |
+| `lag(a, 1)` | 2.3 | 1.4 | -39% | +21% |
+| `order { a }` | 280.4 | 215.2 | -23% | -23% |
+| semi / anti join on `k` | 37.5 / 37.6 | 29.5 / 29.6 | -21% | -20% |
+| `cumsum(a)` | 3.9 | 3.1 | -21% | -23% |
+| `Float64(a)` | 5.6 | 4.6 | -19% | -16% |
+| fill forward / backward | 4.2 / 4.2 | 3.8 / 3.7 | -10% / -12% | +32% / +35% |
+| `corr(a, b)` by `g` | 24.5 | 21.8 | -11% | -4% |
+| `abs(a)` / `a * 3 + b` / `pmax(a, b)` | 3.6 / 5.9 / 4.6 | 3.4 / 5.6 / 4.5 | -7% / -6% / -3% | +27% / +34% / +43% |
+| left / outer join on `k` | 307.5 / 328.5 | 308.1 / 311.6 | +0.2% / -5% | +0.1% / -5% |
+| group-bys (4 shapes) | | | -0.9% to -2.8% | -1.4% to -2.9% |
+| `melt` | 58.8 | 59.0 | +0.4% | +5% |
+| top-k / top-k by `g` | 11.3 / 57.8 | 11.2 / 58.4 | -1% / +1.1% | +22% / +11% |
+| grouped `lag` | 116.5 | 118.2 | +1.4% | +2.3% |
 
-The losses are open: those kernels read compact input slower than wide.
+The fixes: the numeric-tree leaves (`IntColumn`, `lag`/`lead` nodes), the
+single-shift copy, the fills and top-k's sort key read the physical Int32
+values and widen as they store, instead of through `IntegerView` or a whole
+column widened first; melt widens its measures a block at a time. Large
+widening copies (`widen_int32`, also behind `contiguous_values`) stream
+their stores past 2^20 values, as glibc's memmove does for the wide copy.
+The fills became branch-free at both widths: Clang compiled the carry's
+ternary as a branch on the null bit, which 10% scattered nulls mispredict,
+so the Int64 fills also fell from 8.6 / 8.0 to 4.3 / 4.2 ms (perfcmp slots,
+CSV input). Every other Int64 query stayed within noise of the flip commit.

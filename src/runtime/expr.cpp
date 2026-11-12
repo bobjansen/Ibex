@@ -3233,8 +3233,10 @@ auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_
                     if constexpr (std::is_same_v<T, std::int64_t>) {
                         if (col.is_compact_int32()) {
                             if (n < rows) {
-                                const auto from = col.integer_view() + (is_lag ? 0 : n);
-                                std::copy_n(from, rows - n, out.data() + (is_lag ? n : 0));
+                                // A raw widening copy; through IntegerView it
+                                // tested the width per element (+29%).
+                                widen_int32(col.compact_int32_data() + (is_lag ? 0 : n),
+                                            rows - n, out.data() + (is_lag ? n : 0));
                             }
                             return out;
                         }
@@ -3384,8 +3386,24 @@ auto eval_cumsum_cumprod_column(const ir::CallExpr& call, const Table& input, bo
 /// first valid row (after the last) -- get T{}; their nulls are the caller's,
 /// from the returned edge: the first valid row for LOCF, one past the last for
 /// NOCB (`rows` / 0 when there is none).
+/// The carry step of a fill: `value` at a valid row, else `carry`, without a
+/// branch. As a plain ternary Clang compiled a branch on the null bit, which
+/// a scattered 10% of nulls mispredicts (fill_backward over Int64 7.3-9.1 ms
+/// with code placement alone, against 5.3 branch-free): x86's cmov conversion
+/// turns a select whose operand comes straight from a load into a branch. The
+/// empty asm makes `value` an opaque register, so the select stays a cmov.
+template <typename T>
+[[nodiscard]] inline auto fill_pick(bool valid, T value, T carry) noexcept -> T {
+#if defined(__GNUC__) || defined(__clang__)
+    if constexpr (std::is_integral_v<T>) {
+        asm("" : "+r"(value));
+    }
+#endif
+    return valid ? value : carry;
+}
+
 template <typename Source, typename T, typename Valid>
-auto fill_carry_ranges(Source in, T* dst, std::size_t rows, const Valid& is_valid,
+auto fill_carry_ranges(Source in, T* dst, std::size_t rows, Valid is_valid,
                        std::size_t ranges, bool forward) -> std::size_t {
     constexpr std::size_t kNone = std::numeric_limits<std::size_t>::max();
     const std::size_t grain = (rows + ranges - 1) / ranges;
@@ -3427,7 +3445,7 @@ auto fill_carry_ranges(Source in, T* dst, std::size_t rows, const Valid& is_vali
     }
     run([&](std::size_t r, std::size_t b, std::size_t e) {
         bool have = carry[r] != kNone;
-        T value = have ? in[carry[r]] : T{};
+        T value = have ? T{in[carry[r]]} : T{};
         if (forward) {
             for (std::size_t i = b; i < e; ++i) {
                 if (is_valid(i)) {
@@ -3592,9 +3610,9 @@ auto eval_fill_forward(const ir::CallExpr& call, const Table& input, const Execu
                 // pointers on every row, because the store to the output may
                 // alias the members they read -- about twenty instructions and a
                 // spilled carry per row for one load, one bit test and one store.
-                // IntegerView's per-row width test did the same for Int64.
-                ::ibex::detail::NoInitVector<T> widened;
-                const T* const in = contiguous_values(col, widened);
+                // IntegerView's per-row width test did the same for Int64, and
+                // widening a compact column first cost +32%: the loop below is
+                // compiled per physical width and widens as it stores.
                 T* const dst = out.data();
                 const std::uint8_t* const bits = validity.buffer_data();
                 const std::size_t bit_base = validity.buffer_offset();
@@ -3605,36 +3623,42 @@ auto eval_fill_forward(const ir::CallExpr& call, const Table& input, const Execu
 
                 const std::size_t workers =
                     exec != nullptr ? group_barrier_worker_count(*exec, rows) : 0;
-                if (workers >= 2) {
-                    const std::size_t lead = fill_carry_ranges(in, dst, rows, is_valid, workers,
-                                                               /*forward=*/true);
-                    if (lead > 0) {
+                with_physical_values(col, [&, rows](const auto* const in) {
+                    // `rows` and the predicate by value: by reference an Int64
+                    // store to `dst` may alias them, and they were reloaded
+                    // every row (+10%).
+                    const auto valid = is_valid;
+                    if (workers >= 2) {
+                        const std::size_t lead = fill_carry_ranges(in, dst, rows, valid,
+                                                                   workers, /*forward=*/true);
+                        if (lead > 0) {
+                            out_validity.emplace(rows, true);
+                            for (std::size_t row = 0; row < lead; ++row) {
+                                out_validity->set(row, false);
+                            }
+                        }
+                        return;
+                    }
+                    // Leading nulls have no value to carry; they stay null.
+                    std::size_t i = 0;
+                    while (i < rows && !valid(i)) {
+                        dst[i] = T{};
+                        ++i;
+                    }
+                    if (i > 0) {
                         out_validity.emplace(rows, true);
-                        for (std::size_t row = 0; row < lead; ++row) {
+                        for (std::size_t row = 0; row < i; ++row) {
                             out_validity->set(row, false);
                         }
                     }
-                    return FillResult{std::move(result), std::move(out_validity)};
-                }
-                // Leading nulls have no value to carry; they stay null.
-                std::size_t i = 0;
-                while (i < rows && !is_valid(i)) {
-                    dst[i] = T{};
-                    ++i;
-                }
-                if (i > 0) {
-                    out_validity.emplace(rows, true);
-                    for (std::size_t row = 0; row < i; ++row) {
-                        out_validity->set(row, false);
+                    if (i < rows) {
+                        T carry = in[i];
+                        for (; i < rows; ++i) {
+                            carry = fill_pick(valid(i), T{in[i]}, carry);
+                            dst[i] = carry;
+                        }
                     }
-                }
-                if (i < rows) {
-                    T carry = in[i];
-                    for (; i < rows; ++i) {
-                        carry = is_valid(i) ? in[i] : carry;
-                        dst[i] = carry;
-                    }
-                }
+                });
             } else {
                 // carry: last seen valid value (safe for string_view: points into source col).
                 T carry{};
@@ -3698,8 +3722,6 @@ auto eval_fill_backward(const ir::CallExpr& call, const Table& input, const Exec
                 // storage resolved once; see eval_fill_forward.
                 ColT result;
                 ColumnAppender<ColT> out(result, rows);
-                ::ibex::detail::NoInitVector<T> widened;
-                const T* const in = contiguous_values(col, widened);
                 T* const dst = out.data();
                 const std::uint8_t* const bits = validity.buffer_data();
                 const std::size_t bit_base = validity.buffer_offset();
@@ -3710,35 +3732,41 @@ auto eval_fill_backward(const ir::CallExpr& call, const Table& input, const Exec
 
                 const std::size_t workers =
                     exec != nullptr ? group_barrier_worker_count(*exec, rows) : 0;
-                if (workers >= 2) {
-                    const std::size_t trail = fill_carry_ranges(in, dst, rows, is_valid, workers,
-                                                                /*forward=*/false);
-                    if (trail < rows) {
+                with_physical_values(col, [&, rows](const auto* const in) {
+                    // `rows` and the predicate by value: by reference an Int64
+                    // store to `dst` may alias them, and they were reloaded
+                    // every row (+10%).
+                    const auto valid = is_valid;
+                    if (workers >= 2) {
+                        const std::size_t trail = fill_carry_ranges(in, dst, rows, valid,
+                                                                    workers, /*forward=*/false);
+                        if (trail < rows) {
+                            out_validity.emplace(rows, true);
+                            for (std::size_t row = trail; row < rows; ++row) {
+                                out_validity->set(row, false);
+                            }
+                        }
+                        return;
+                    }
+                    // Trailing nulls have no following value; they stay null.
+                    std::size_t end = rows;
+                    while (end > 0 && !valid(end - 1)) {
+                        dst[--end] = T{};
+                    }
+                    if (end < rows) {
                         out_validity.emplace(rows, true);
-                        for (std::size_t row = trail; row < rows; ++row) {
+                        for (std::size_t row = end; row < rows; ++row) {
                             out_validity->set(row, false);
                         }
                     }
-                    return FillResult{std::move(result), std::move(out_validity)};
-                }
-                // Trailing nulls have no following value; they stay null.
-                std::size_t end = rows;
-                while (end > 0 && !is_valid(end - 1)) {
-                    dst[--end] = T{};
-                }
-                if (end < rows) {
-                    out_validity.emplace(rows, true);
-                    for (std::size_t row = end; row < rows; ++row) {
-                        out_validity->set(row, false);
+                    if (end > 0) {
+                        T next = in[end - 1];
+                        for (std::size_t i = end; i-- > 0;) {
+                            next = fill_pick(valid(i), T{in[i]}, next);
+                            dst[i] = next;
+                        }
                     }
-                }
-                if (end > 0) {
-                    T next = in[end - 1];
-                    for (std::size_t i = end; i-- > 0;) {
-                        next = is_valid(i) ? in[i] : next;
-                        dst[i] = next;
-                    }
-                }
+                });
                 return FillResult{std::move(result), std::move(out_validity)};
             } else {
                 // Scan right-to-left to compute (value, valid) for each row,

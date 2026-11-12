@@ -260,6 +260,107 @@ TEST_CASE("compact integer keys and aggregates agree at one million rows",
     }
 }
 
+TEST_CASE("compact element-wise kernels agree past the streaming-widen threshold",
+          "[compact-int32][no-cache][dense]") {
+    // Above 2^20 rows the widening copies stream; an odd count leaves a tail,
+    // and lag/lead offsets start the source off the output's alignment. The
+    // fills run branch-free over a scattered 10% of nulls; their answers are
+    // also checked against a carry computed here, since a shared bug would
+    // make the wide and compact paths agree.
+    constexpr std::size_t rows = (std::size_t{1} << 20) + 7;
+    const auto value_at = [](std::size_t i) {
+        return static_cast<std::int32_t>((i * 2654435761U) % 2000001U) - 1000000;
+    };
+    const auto null_at = [](std::size_t i) { return (i * 7919U) % 10U == 3U; };
+    const auto registry = [&](bool compact) {
+        ibex::runtime::TableRegistry result;
+        ibex::runtime::Table table;
+        const auto column = [&](auto fn) {
+            ibex::detail::NoInitVector<std::int32_t> values(rows);
+            for (std::size_t i = 0; i < rows; ++i)
+                values[i] = fn(i);
+            if (compact)
+                return ibex::Column<std::int64_t>::from_compact_int32(std::move(values));
+            ibex::Column<std::int64_t> wide;
+            wide.reserve(rows);
+            for (auto value : values)
+                wide.push_back(value);
+            return wide;
+        };
+        table.add_column("g", column([](std::size_t i) { return static_cast<std::int32_t>(i % 89); }));
+        table.add_column("v", column(value_at));
+        ibex::runtime::ValidityBitmap validity(rows, true);
+        for (std::size_t i = 0; i < rows; ++i)
+            if (null_at(i))
+                validity.set(i, false);
+        table.add_column("n", column(value_at), std::move(validity));
+        // Always wide, so melt and the arithmetic mix widths.
+        ibex::Column<std::int64_t> w;
+        w.reserve(rows);
+        for (std::size_t i = 0; i < rows; ++i)
+            w.push_back(static_cast<std::int64_t>(i % 1000));
+        table.add_column("w", std::move(w));
+        result.emplace("t", std::move(table));
+        return result;
+    };
+    auto wide = registry(false), compact = registry(true);
+    const auto run = [](const char* query, const ibex::runtime::TableRegistry& tables) {
+        auto parsed = ibex::parser::parse(query);
+        REQUIRE(parsed.has_value());
+        auto plan = ibex::parser::lower(*parsed);
+        REQUIRE(plan.has_value());
+        auto result = ibex::runtime::interpret(**plan, tables);
+        REQUIRE(result.has_value());
+        return std::move(*result);
+    };
+    for (const char* query :
+         {"t[update {x=v*3+w, y=abs(v), z=pmax(v, w), d=Float64(v)/2.0}];",
+          // One shift alone takes eval_lag_lead_column's streamed copy; with
+          // other fields it is a numeric-tree node instead.
+          "t[update {p=lag(v, 1)}];", "t[update {p=lag(v, 2)}];", "t[update {q=lead(v, 3)}];",
+          "t[update {q=lead(v, 0)}];", "t[order {v}];",
+          "t[update {p=lag(v, 1), q=lead(v, 3), r=lag(v, 0)}];",
+          "t[update {f=fill_forward(n), b=fill_backward(n)}];",
+          "t[select {v, w}][melt v];", "t[select {g, v, w}][melt g];",
+          "t[select {g, v, n}][melt g];", "t[order {v desc}, head 7];",
+          "t[order {v}, head 3, by g];"}) {
+        DYNAMIC_SECTION(query) {
+            auto expected = run(query, wide);
+            auto actual = run(query, compact);
+            if (auto mismatch = ibex::runtime::compare_tables(expected, actual))
+                FAIL(mismatch->message());
+        }
+    }
+    SECTION("fills match a hand-computed carry") {
+        auto filled = run("t[update {f=fill_forward(n), b=fill_backward(n)}];", compact);
+        const auto& forward = *filled.find_entry("f");
+        const auto& backward = *filled.find_entry("b");
+        const auto& f = std::get<ibex::Column<std::int64_t>>(*forward.column);
+        const auto& b = std::get<ibex::Column<std::int64_t>>(*backward.column);
+        std::int64_t carry = 0;
+        bool have = false;
+        for (std::size_t i = 0; i < rows; ++i) {
+            if (!null_at(i)) {
+                carry = value_at(i);
+                have = true;
+            }
+            REQUIRE(ibex::runtime::is_null(forward, i) == !have);
+            if (have)
+                REQUIRE(f[i] == carry);
+        }
+        have = false;
+        for (std::size_t i = rows; i-- > 0;) {
+            if (!null_at(i)) {
+                carry = value_at(i);
+                have = true;
+            }
+            REQUIRE(ibex::runtime::is_null(backward, i) == !have);
+            if (have)
+                REQUIRE(b[i] == carry);
+        }
+    }
+}
+
 TEST_CASE("left join keeps an unmatched compact payload compact",
           "[compact-int32][no-cache][join]") {
     // Rows 4 and 6 of t (g = 3) have no match in r, so the gather of r's `w`

@@ -400,3 +400,28 @@ TEST_CASE("nullable compact batched gather writes its physical output directly",
     REQUIRE(gathered[0].second.has_value());
     REQUIRE_FALSE((*gathered[0].second)[1]);
 }
+
+TEST_CASE("widen_int32 copies every value at every alignment and length",
+          "[compact-int32][kernel]") {
+    // Past 2^20 values the copy streams after an alignment prologue; the
+    // offsets move the output's start, the lengths leave every tail size.
+    constexpr std::size_t stream = std::size_t{1} << 20;
+    constexpr std::int64_t guard = 0x5a5a5a5a5a5a5a5a;
+    for (std::size_t count : {std::size_t{0}, std::size_t{1}, std::size_t{5}, stream - 1, stream,
+                              stream + 1, stream + 2, stream + 3, stream + 7}) {
+        std::vector<std::int32_t> source(count);
+        for (std::size_t i = 0; i < count; ++i)
+            source[i] = static_cast<std::int32_t>((i * 2654435761U) ^ 0x80000000U);
+        for (std::size_t offset = 0; offset < 4; ++offset) {
+            CAPTURE(count, offset);
+            std::vector<std::int64_t> out(count + offset + 1, guard);
+            runtime::widen_int32(source.data(), count, out.data() + offset);
+            for (std::size_t i = 0; i < offset; ++i)
+                REQUIRE(out[i] == guard);
+            for (std::size_t i = 0; i < count; ++i)
+                if (out[offset + i] != source[i])
+                    FAIL("value " << i << " is " << out[offset + i]);
+            REQUIRE(out[offset + count] == guard);
+        }
+    }
+}

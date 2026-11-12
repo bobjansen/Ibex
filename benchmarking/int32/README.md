@@ -158,3 +158,42 @@ Ibex/Polars 2 streaming is 0.888 at 8 cores and 0.844 at 1 core; against
 DuckDB it is 0.734 and 0.774. The two points are about 290 commits apart,
 so this shows no end-to-end regression on the branch, not gains attributable
 to Int32 storage.
+
+## Integer read paths
+
+`6bdbc65b` made Int64 readers return an `IntegerView`, which tests the
+physical width (Int64 or compact Int32) on every element. In tight loops that
+test is not free, even with compact storage off. [integer_paths.py](integer_paths.py)
+is the probe that found where: 24 queries over seeded 5M-row tables, each
+aimed at one family of loops that read Int64 columns (filters, casts, math,
+lag/cumsum/fills, grouped shifts, sorts and top-k, semi/anti/left/outer joins,
+wide/pair/mixed/packed group keys, corr, melt).
+
+At one core, `be3c9ef4` (before the view) against `caf898de` showed a
+column-vs-column filter `a > b` at 26 -> 258 ms (`cmp_into` stopped
+vectorizing), `Float64(a)` +10.6%, the single-Int64-key left join +9.1% and
+outer join +3.9%, `fill_forward`/`fill_backward` +6%/+7.5%, top-k on an Int64
+sort key +6% and grouped `lag` +3.6%. After `37ad93b2` every query is at or
+below its `be3c9ef4` time (`a > b` 25.6 ms, left join -8.8%). The h2o joins
+and groupby questions behind the same series are in the commit messages of
+`daa66570` through `37ad93b2`.
+
+The fixes follow two patterns, both in `src/runtime/runtime_internal.hpp`:
+`with_physical_values(column, body)` tests the width once and compiles a short
+loop per width; `contiguous_values(column, scratch)` gives a long kernel a raw
+`const T*`, the column's own buffer or, for compact storage, a copy widened
+once. Wrapping a large inline switch in a generic lambda instead cost h2o q7
+60% (`a94cbb44`; fixed out of line in `4458c329`).
+
+```bash
+.venv/bin/python benchmarking/int32/integer_paths.py gen   # -> benchmarking/data/int32_paths
+.venv/bin/python benchmarking/int32/integer_paths.py run \
+    --ibex <build A>/tools/ibex --ibex <build B>/tools/ibex --rounds 2
+```
+
+Compare builds made with the same flags (for example two
+`~/.cache/ibex/perfcmp` slots, which build with `-march=native`, or two
+Release trees), each with its CSV plugin next to the binary. Runs pin to one
+CPU with `IBEX_CORES=1` and, through `systemd-run`, a 16G memory cap; the
+script times queries and does not check answers (the
+`[compact-int32]` tests in `tests/test_integer_no_cache.cpp` do).

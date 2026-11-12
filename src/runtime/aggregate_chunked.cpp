@@ -2244,215 +2244,209 @@ class HashAggregateState final {
                           const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
         -> std::optional<std::string> {
         const ColumnValue& key_col = *group_entries[0]->column;
-        IntegerView i64 = nullptr;
-        const Date* dates = nullptr;
-        const Timestamp* stamps = nullptr;
-        switch (int_key_kind_) {
-            case IntKeyKind::Int64:
-                i64 = std::get<Column<std::int64_t>>(key_col).integer_view();
-                break;
-            case IntKeyKind::Date:
-                dates = std::get<Column<Date>>(key_col).data();
-                break;
-            case IntKeyKind::Ts:
-                stamps = std::get<Column<Timestamp>>(key_col).data();
-                break;
-            case IntKeyKind::Cat:
-                // A lone Categorical key never selects this path: it is
-                // all-Categorical by definition, so `cat_fast_path_` claims it
-                // and dispatches first. Only the pair path admits `Cat`.
-                return "HashAggregateState: categorical key on the single-int path";
-        }
-        const auto key_at = [&](std::size_t row) -> std::int64_t {
-            switch (int_key_kind_) {
-                case IntKeyKind::Int64:
-                    return i64[row];
-                case IntKeyKind::Date:
-                    return dates[row].days;
-                case IntKeyKind::Ts:
-                    return stamps[row].nanos;
-                case IntKeyKind::Cat:
-                    break;
+        // The key's reader is chosen once, so each path below is compiled for
+        // one reader: a per-row switch on the key kind plus IntegerView's
+        // per-row width test cost h2o's one-core `by id4` ~4%.
+        const auto run = [&](const auto& key_at) -> std::optional<std::string> {
+            // A key whose values span few cells next to the rows (`by id4` over
+            // 100 ids) is indexed like a Categorical code, `key - min`: no hash,
+            // and the morsel partials fan out even when the input is one chunk.
+            const std::optional<ValidityBitmap>& key_validity = group_entries[0]->validity;
+            const ValidityBitmap* key_valid = key_validity.has_value() ? &*key_validity : nullptr;
+            if (try_process_rows_int_dense(key_at, key_valid, agg_entries, rows)) {
+                return std::nullopt;
             }
-            return 0;
-        };
+            // Every path below reads raw values, so a null row -- or a null group
+            // the dense path already made -- moves the groups to the generic path.
+            if (key_valid != nullptr || int_null_gid_ != kNoGid) {
+                migrate_int_fast_path_to_generic();
+                return process_rows_generic(group_entries, agg_entries, rows);
+            }
 
-        // A key whose values span few cells next to the rows (`by id4` over
-        // 100 ids) is indexed like a Categorical code, `key - min`: no hash,
-        // and the morsel partials fan out even when the input is one chunk.
-        const std::optional<ValidityBitmap>& key_validity = group_entries[0]->validity;
-        const ValidityBitmap* key_valid = key_validity.has_value() ? &*key_validity : nullptr;
-        if (try_process_rows_int_dense(key_at, key_valid, agg_entries, rows)) {
-            return std::nullopt;
-        }
-        // Every path below reads raw values, so a null row -- or a null group
-        // the dense path already made -- moves the groups to the generic path.
-        if (key_valid != nullptr || int_null_gid_ != kNoGid) {
-            migrate_int_fast_path_to_generic();
-            return process_rows_generic(group_entries, agg_entries, rows);
-        }
+            // The q18 shape (one Int64 key and one Int64 or Double sum) is a streaming sink,
+            // not a sequence of per-chunk fork/join pipelines. Each chunk becomes
+            // one independent hot-table task; the caller immediately pulls the
+            // next chunk, and all tasks join once at end-of-stream. Besides removing
+            // the three barriers per chunk, this keeps the common clustered key in
+            // a 4096-slot cache-resident reduction and sends only cold/pre-aggregated
+            // records to the persistent partition maps.
+            if (try_async_hot_int_sum(group_entries[0]->column, agg_entries, rows)) {
+                publish_fused_accumulation();
+                return std::nullopt;
+            }
 
-        // The q18 shape (one Int64 key and one Int64 or Double sum) is a streaming sink,
-        // not a sequence of per-chunk fork/join pipelines. Each chunk becomes
-        // one independent hot-table task; the caller immediately pulls the
-        // next chunk, and all tasks join once at end-of-stream. Besides removing
-        // the three barriers per chunk, this keeps the common clustered key in
-        // a 4096-slot cache-resident reduction and sends only cold/pre-aggregated
-        // records to the persistent partition maps.
-        if (try_async_hot_int_sum(group_entries[0]->column, agg_entries, rows)) {
-            publish_fused_accumulation();
-            return std::nullopt;
-        }
+            gids_buf_.resize(rows);
+            auto* gids = gids_buf_.data();
 
-        gids_buf_.resize(rows);
-        auto* gids = gids_buf_.data();
-
-        // A non-null First value is fixed at the same row that creates its
-        // group. Record it during discovery and omit the later all-row scan.
-        // Group-key reduction turns q10's six descriptive keys into exactly
-        // this shape; scanning 229k rows once per carried field was redundant.
-        if (discovery_first_eligible_.empty()) {
-            discovery_first_eligible_.resize(n_aggs_, 0U);
+            // A non-null First value is fixed at the same row that creates its
+            // group. Record it during discovery and omit the later all-row scan.
+            // Group-key reduction turns q10's six descriptive keys into exactly
+            // this shape; scanning 229k rows once per carried field was redundant.
+            if (discovery_first_eligible_.empty()) {
+                discovery_first_eligible_.resize(n_aggs_, 0U);
+                for (std::size_t a = 0; a < n_aggs_; ++a) {
+                    discovery_first_eligible_[a] = plan_[a].func == ir::AggFunc::First ? 1U : 0U;
+                }
+            }
+            std::vector<std::uint8_t> discovery_first(n_aggs_, 0U);
+            bool has_discovery_first = false;
             for (std::size_t a = 0; a < n_aggs_; ++a) {
-                discovery_first_eligible_[a] = plan_[a].func == ir::AggFunc::First ? 1U : 0U;
+                if (discovery_first_eligible_[a] == 0U) {
+                    continue;
+                }
+                if (agg_entries[a]->validity.has_value()) {
+                    // A group may still be waiting for its first non-null value.
+                    // Keep this field on the ordinary scan for every later chunk
+                    // too, even if that later chunk has no nulls.
+                    discovery_first_eligible_[a] = 0U;
+                    continue;
+                }
+                discovery_first[a] = 1U;
+                has_discovery_first = true;
             }
-        }
-        std::vector<std::uint8_t> discovery_first(n_aggs_, 0U);
-        bool has_discovery_first = false;
-        for (std::size_t a = 0; a < n_aggs_; ++a) {
-            if (discovery_first_eligible_[a] == 0U) {
-                continue;
-            }
-            if (agg_entries[a]->validity.has_value()) {
-                // A group may still be waiting for its first non-null value.
-                // Keep this field on the ordinary scan for every later chunk
-                // too, even if that later chunk has no nulls.
-                discovery_first_eligible_[a] = 0U;
-                continue;
-            }
-            discovery_first[a] = 1U;
-            has_discovery_first = true;
-        }
-        const std::size_t groups_before = n_groups_;
-        std::vector<std::size_t> first_rows;
+            const std::size_t groups_before = n_groups_;
+            std::vector<std::size_t> first_rows;
 
-        // Partition-owned accumulation, the same shape the PairIntKey path
-        // above takes. It fuses discovery and the sum/count into one pass over
-        // partition-local state, so the global first-occurrence numbering --
-        // and with it the whole second `accumulate_gids` scan of every row --
-        // is deferred to a single merge over GROUPS at emission.
-        //
-        // `int_order_` holds the raw key whatever `int_key_kind_` is; the emit
-        // side reconstructs Date/Timestamp/Categorical from it exactly as it
-        // does for the ordinary int path, so this needs no kind-specific arm.
-        if (try_owned<std::int64_t, robin_hood::hash<std::int64_t>>(
-                key_at, rows, gids, agg_entries, owned_int_partitions_, kIntOwnedMinRows)) {
-            publish_fused_accumulation();
-            return std::nullopt;
-        }
-
-        if (try_discover_partitioned<std::int64_t, robin_hood::hash<std::int64_t>>(
-                key_at, rows, gids, int_partitions_,
-                [&](std::size_t n) {
-                    int_order_.resize(n);
-                    if (has_discovery_first) {
-                        first_rows.resize(n - groups_before);
-                    }
-                },
-                [&](std::int64_t key, std::uint32_t gid, std::size_t row) {
-                    int_order_[gid] = key;
-                    if (has_discovery_first) {
-                        first_rows[gid - groups_before] = row;
-                    }
-                },
-                kDefaultPartitionMinRows, [&](std::uint32_t gid) { return int_order_[gid]; })) {
-            if (has_discovery_first) {
-                seed_discovery_first(groups_before, first_rows, agg_entries, discovery_first);
+            // Partition-owned accumulation, the same shape the PairIntKey path
+            // above takes. It fuses discovery and the sum/count into one pass over
+            // partition-local state, so the global first-occurrence numbering --
+            // and with it the whole second `accumulate_gids` scan of every row --
+            // is deferred to a single merge over GROUPS at emission.
+            //
+            // `int_order_` holds the raw key whatever `int_key_kind_` is; the emit
+            // side reconstructs Date/Timestamp/Categorical from it exactly as it
+            // does for the ordinary int path, so this needs no kind-specific arm.
+            if (try_owned<std::int64_t, robin_hood::hash<std::int64_t>>(
+                    key_at, rows, gids, agg_entries, owned_int_partitions_, kIntOwnedMinRows)) {
+                publish_fused_accumulation();
+                return std::nullopt;
             }
-            publish_discovered(agg_entries, rows, has_discovery_first ? &discovery_first : nullptr);
-            return std::nullopt;
-        }
 
-        // Build the deferred index from the groups numbered so far: the serial
-        // loop is about to probe it.
-        const auto materialize_int_index = [&] {
-            deferred_int_index_builds().fetch_add(1, std::memory_order_relaxed);
-            int_index_.reserve(n_groups_);
-            for (std::size_t g = 0; g < n_groups_; ++g) {
-                int_index_.emplace(int_order_[g], static_cast<std::uint32_t>(g));
-            }
-            int_index_deferred_ = false;
-        };
-        if (int_index_deferred_ && n_groups_ != int_serial_groups_) {
-            materialize_int_index();
-        }
-
-        // Run-length shortcut, as in the string path: sorted/chunked input often
-        // repeats the key, so skip the map lookup when it matches the last row.
-        std::int64_t prev_key = 0;
-        std::uint32_t prev_gid = std::numeric_limits<std::uint32_t>::max();
-        bool have_prev = false;
-        for (std::size_t row = 0; row < rows; ++row) {
-            const std::int64_t key = key_at(row);
-            std::uint32_t gid{};
-            if (have_prev && key == prev_key) {
-                gid = prev_gid;
-            } else if (int_index_deferred_ && n_groups_ != 0 && key == int_max_key_) {
-                // The previous CHUNK's last group, continued across the
-                // boundary: `prev_key` starts over with each chunk, but while
-                // deferred every group was numbered in increasing key order,
-                // so the largest key is the newest group. Without this, one
-                // l_orderkey split between two streamed chunks built the
-                // whole index and hashed every later row (q18 at one core:
-                // discovery 1.85 s streamed vs 0.44 s materialized).
-                gid = static_cast<std::uint32_t>(n_groups_ - 1);
-                prev_key = key;
-                prev_gid = gid;
-                have_prev = true;
-            } else if (int_index_deferred_ && (n_groups_ == 0 || key > int_max_key_)) {
-                // Above every key seen, so new; see `int_index_deferred_`.
-                gid = static_cast<std::uint32_t>(n_groups_);
-                int_order_.push_back(key);
-                int_max_key_ = key;
-                ++n_groups_;
-                ++int_serial_groups_;
-                size_group_arrays();
+            if (try_discover_partitioned<std::int64_t, robin_hood::hash<std::int64_t>>(
+                    key_at, rows, gids, int_partitions_,
+                    [&](std::size_t n) {
+                        int_order_.resize(n);
+                        if (has_discovery_first) {
+                            first_rows.resize(n - groups_before);
+                        }
+                    },
+                    [&](std::int64_t key, std::uint32_t gid, std::size_t row) {
+                        int_order_[gid] = key;
+                        if (has_discovery_first) {
+                            first_rows[gid - groups_before] = row;
+                        }
+                    },
+                    kDefaultPartitionMinRows, [&](std::uint32_t gid) { return int_order_[gid]; })) {
                 if (has_discovery_first) {
-                    first_rows.push_back(row);
+                    seed_discovery_first(groups_before, first_rows, agg_entries, discovery_first);
                 }
-                prev_key = key;
-                prev_gid = gid;
-                have_prev = true;
-            } else {
-                if (int_index_deferred_) {
-                    materialize_int_index();
+                publish_discovered(agg_entries, rows,
+                                   has_discovery_first ? &discovery_first : nullptr);
+                return std::nullopt;
+            }
+
+            // Build the deferred index from the groups numbered so far: the serial
+            // loop is about to probe it.
+            const auto materialize_int_index = [&] {
+                deferred_int_index_builds().fetch_add(1, std::memory_order_relaxed);
+                int_index_.reserve(n_groups_);
+                for (std::size_t g = 0; g < n_groups_; ++g) {
+                    int_index_.emplace(int_order_[g], static_cast<std::uint32_t>(g));
                 }
-                auto it = int_index_.find(key);
-                if (it == int_index_.end()) {
+                int_index_deferred_ = false;
+            };
+            if (int_index_deferred_ && n_groups_ != int_serial_groups_) {
+                materialize_int_index();
+            }
+
+            // Run-length shortcut, as in the string path: sorted/chunked input often
+            // repeats the key, so skip the map lookup when it matches the last row.
+            std::int64_t prev_key = 0;
+            std::uint32_t prev_gid = std::numeric_limits<std::uint32_t>::max();
+            bool have_prev = false;
+            for (std::size_t row = 0; row < rows; ++row) {
+                const std::int64_t key = key_at(row);
+                std::uint32_t gid{};
+                if (have_prev && key == prev_key) {
+                    gid = prev_gid;
+                } else if (int_index_deferred_ && n_groups_ != 0 && key == int_max_key_) {
+                    // The previous CHUNK's last group, continued across the
+                    // boundary: `prev_key` starts over with each chunk, but while
+                    // deferred every group was numbered in increasing key order,
+                    // so the largest key is the newest group. Without this, one
+                    // l_orderkey split between two streamed chunks built the
+                    // whole index and hashed every later row (q18 at one core:
+                    // discovery 1.85 s streamed vs 0.44 s materialized).
+                    gid = static_cast<std::uint32_t>(n_groups_ - 1);
+                    prev_key = key;
+                    prev_gid = gid;
+                    have_prev = true;
+                } else if (int_index_deferred_ && (n_groups_ == 0 || key > int_max_key_)) {
+                    // Above every key seen, so new; see `int_index_deferred_`.
                     gid = static_cast<std::uint32_t>(n_groups_);
-                    int_index_.emplace(key, gid);
                     int_order_.push_back(key);
+                    int_max_key_ = key;
                     ++n_groups_;
                     ++int_serial_groups_;
                     size_group_arrays();
                     if (has_discovery_first) {
                         first_rows.push_back(row);
                     }
+                    prev_key = key;
+                    prev_gid = gid;
+                    have_prev = true;
                 } else {
-                    gid = it->second;
+                    if (int_index_deferred_) {
+                        materialize_int_index();
+                    }
+                    auto it = int_index_.find(key);
+                    if (it == int_index_.end()) {
+                        gid = static_cast<std::uint32_t>(n_groups_);
+                        int_index_.emplace(key, gid);
+                        int_order_.push_back(key);
+                        ++n_groups_;
+                        ++int_serial_groups_;
+                        size_group_arrays();
+                        if (has_discovery_first) {
+                            first_rows.push_back(row);
+                        }
+                    } else {
+                        gid = it->second;
+                    }
+                    prev_key = key;
+                    prev_gid = gid;
+                    have_prev = true;
                 }
-                prev_key = key;
-                prev_gid = gid;
-                have_prev = true;
+                gids[row] = gid;
             }
-            gids[row] = gid;
-        }
 
-        if (has_discovery_first) {
-            seed_discovery_first(groups_before, first_rows, agg_entries, discovery_first);
+            if (has_discovery_first) {
+                seed_discovery_first(groups_before, first_rows, agg_entries, discovery_first);
+            }
+            publish_discovered(agg_entries, rows, has_discovery_first ? &discovery_first : nullptr);
+            return std::nullopt;
+        };
+        switch (int_key_kind_) {
+            case IntKeyKind::Int64:
+                return with_physical_values(
+                    std::get<Column<std::int64_t>>(key_col), [&](const auto* data) {
+                        return run([data](std::size_t row) -> std::int64_t { return data[row]; });
+                    });
+            case IntKeyKind::Date: {
+                const Date* dates = std::get<Column<Date>>(key_col).data();
+                return run([dates](std::size_t row) -> std::int64_t { return dates[row].days; });
+            }
+            case IntKeyKind::Ts: {
+                const Timestamp* stamps = std::get<Column<Timestamp>>(key_col).data();
+                return run([stamps](std::size_t row) -> std::int64_t { return stamps[row].nanos; });
+            }
+            case IntKeyKind::Cat:
+                break;
         }
-        publish_discovered(agg_entries, rows, has_discovery_first ? &discovery_first : nullptr);
-        return std::nullopt;
+        // A lone Categorical key never selects this path: it is
+        // all-Categorical by definition, so `cat_fast_path_` claims it
+        // and dispatches first. Only the pair path admits `Cat`.
+        return "HashAggregateState: categorical key on the single-int path";
     }
 
     static constexpr std::size_t kOwnedHotSlots = 4096;
@@ -7195,88 +7189,93 @@ class HashAggregateState final {
                 }
                 continue;
             } else if (plan_[agg_i].kind == ExprType::Int) {
-                const auto data =
-                    std::get<Column<std::int64_t>>(std::as_const(*entry.column)).integer_view();
-                switch (plan_[agg_i].func) {
-                    case ir::AggFunc::Sum:
-                        for (std::size_t row = begin; row < rows; ++row) {
-                            if (has_nulls && !(*validity)[row])
-                                continue;
-                            auto& slot = slot_for(gids[row]);
-                            slot.int_value += data[row];
-                            slot.mark_present();
+                // One width test, then a raw-pointer loop per width.
+                with_physical_values(
+                    std::get<Column<std::int64_t>>(std::as_const(*entry.column)),
+                    [&](const auto* data) {
+                        switch (plan_[agg_i].func) {
+                            case ir::AggFunc::Sum:
+                                for (std::size_t row = begin; row < rows; ++row) {
+                                    if (has_nulls && !(*validity)[row])
+                                        continue;
+                                    auto& slot = slot_for(gids[row]);
+                                    slot.int_value += data[row];
+                                    slot.mark_present();
+                                }
+                                break;
+                            case ir::AggFunc::Mean:
+                                for (std::size_t row = begin; row < rows; ++row) {
+                                    if (has_nulls && !(*validity)[row])
+                                        continue;
+                                    auto& slot = slot_for(gids[row]);
+                                    slot.double_value += static_cast<double>(data[row]);
+                                    slot.count++;
+                                }
+                                break;
+                            case ir::AggFunc::Min:
+                                for (std::size_t row = begin; row < rows; ++row) {
+                                    if (has_nulls && !(*validity)[row])
+                                        continue;
+                                    auto& slot = slot_for(gids[row]);
+                                    const std::int64_t v = data[row];
+                                    slot.int_value =
+                                        slot.present() ? std::min(slot.int_value, v) : v;
+                                    slot.mark_present();
+                                }
+                                break;
+                            case ir::AggFunc::Max:
+                                for (std::size_t row = begin; row < rows; ++row) {
+                                    if (has_nulls && !(*validity)[row])
+                                        continue;
+                                    auto& slot = slot_for(gids[row]);
+                                    const std::int64_t v = data[row];
+                                    slot.int_value =
+                                        slot.present() ? std::max(slot.int_value, v) : v;
+                                    slot.mark_present();
+                                }
+                                break;
+                            case ir::AggFunc::Stddev:
+                                for (std::size_t row = begin; row < rows; ++row) {
+                                    if (has_nulls && !(*validity)[row])
+                                        continue;
+                                    agg_update_stddev(slot_for(gids[row]), scratch_at(gids[row])[0],
+                                                      static_cast<double>(data[row]));
+                                }
+                                break;
+                            case ir::AggFunc::Skew:
+                            case ir::AggFunc::Kurtosis:
+                                for (std::size_t row = begin; row < rows; ++row) {
+                                    if (has_nulls && !(*validity)[row])
+                                        continue;
+                                    double* scr = scratch_at(gids[row]);
+                                    agg_update_moments(slot_for(gids[row]), scr[0], scr[1], scr[2],
+                                                       static_cast<double>(data[row]));
+                                }
+                                break;
+                            case ir::AggFunc::First:
+                                for (std::size_t row = begin; row < rows; ++row) {
+                                    if (has_nulls && !(*validity)[row])
+                                        continue;
+                                    auto& slot = slot_for(gids[row]);
+                                    if (!slot.present()) {
+                                        slot.int_value = data[row];
+                                        slot.mark_present();
+                                    }
+                                }
+                                break;
+                            case ir::AggFunc::Last:
+                                for (std::size_t row = begin; row < rows; ++row) {
+                                    if (has_nulls && !(*validity)[row])
+                                        continue;
+                                    auto& slot = slot_for(gids[row]);
+                                    slot.int_value = data[row];
+                                    slot.mark_present();
+                                }
+                                break;
+                            default:
+                                break;
                         }
-                        break;
-                    case ir::AggFunc::Mean:
-                        for (std::size_t row = begin; row < rows; ++row) {
-                            if (has_nulls && !(*validity)[row])
-                                continue;
-                            auto& slot = slot_for(gids[row]);
-                            slot.double_value += static_cast<double>(data[row]);
-                            slot.count++;
-                        }
-                        break;
-                    case ir::AggFunc::Min:
-                        for (std::size_t row = begin; row < rows; ++row) {
-                            if (has_nulls && !(*validity)[row])
-                                continue;
-                            auto& slot = slot_for(gids[row]);
-                            const std::int64_t v = data[row];
-                            slot.int_value = slot.present() ? std::min(slot.int_value, v) : v;
-                            slot.mark_present();
-                        }
-                        break;
-                    case ir::AggFunc::Max:
-                        for (std::size_t row = begin; row < rows; ++row) {
-                            if (has_nulls && !(*validity)[row])
-                                continue;
-                            auto& slot = slot_for(gids[row]);
-                            const std::int64_t v = data[row];
-                            slot.int_value = slot.present() ? std::max(slot.int_value, v) : v;
-                            slot.mark_present();
-                        }
-                        break;
-                    case ir::AggFunc::Stddev:
-                        for (std::size_t row = begin; row < rows; ++row) {
-                            if (has_nulls && !(*validity)[row])
-                                continue;
-                            agg_update_stddev(slot_for(gids[row]), scratch_at(gids[row])[0],
-                                              static_cast<double>(data[row]));
-                        }
-                        break;
-                    case ir::AggFunc::Skew:
-                    case ir::AggFunc::Kurtosis:
-                        for (std::size_t row = begin; row < rows; ++row) {
-                            if (has_nulls && !(*validity)[row])
-                                continue;
-                            double* scr = scratch_at(gids[row]);
-                            agg_update_moments(slot_for(gids[row]), scr[0], scr[1], scr[2],
-                                               static_cast<double>(data[row]));
-                        }
-                        break;
-                    case ir::AggFunc::First:
-                        for (std::size_t row = begin; row < rows; ++row) {
-                            if (has_nulls && !(*validity)[row])
-                                continue;
-                            auto& slot = slot_for(gids[row]);
-                            if (!slot.present()) {
-                                slot.int_value = data[row];
-                                slot.mark_present();
-                            }
-                        }
-                        break;
-                    case ir::AggFunc::Last:
-                        for (std::size_t row = begin; row < rows; ++row) {
-                            if (has_nulls && !(*validity)[row])
-                                continue;
-                            auto& slot = slot_for(gids[row]);
-                            slot.int_value = data[row];
-                            slot.mark_present();
-                        }
-                        break;
-                    default:
-                        break;
-                }
+                    });
             } else {
                 // ExprType::String — First/Last only (the type gate in
                 // process_chunk rejects every other function here). Covers
@@ -7796,66 +7795,71 @@ class HashAggregateState final {
                         break;
                 }
             } else if (plan_[agg_i].kind == ExprType::Int) {
-                const auto data =
-                    std::get<Column<std::int64_t>>(std::as_const(*entry.column)).integer_view();
-                switch (func) {
-                    case ir::AggFunc::Sum:
-                        each([&](std::size_t r) {
-                            slot.int_value += data[r];
-                            slot.mark_present();
-                        });
-                        break;
-                    case ir::AggFunc::Mean:
-                        each([&](std::size_t r) {
-                            slot.double_value += static_cast<double>(data[r]);
-                            slot.count++;
-                        });
-                        break;
-                    case ir::AggFunc::Min:
-                        each([&](std::size_t r) {
-                            slot.int_value =
-                                slot.present() ? std::min(slot.int_value, data[r]) : data[r];
-                            slot.mark_present();
-                        });
-                        break;
-                    case ir::AggFunc::Max:
-                        each([&](std::size_t r) {
-                            slot.int_value =
-                                slot.present() ? std::max(slot.int_value, data[r]) : data[r];
-                            slot.mark_present();
-                        });
-                        break;
-                    case ir::AggFunc::Stddev:
-                        each([&](std::size_t r) {
-                            agg_update_stddev(slot, scratch_base[scratch_offset_[agg_i]],
-                                              static_cast<double>(data[r]));
-                        });
-                        break;
-                    case ir::AggFunc::Skew:
-                    case ir::AggFunc::Kurtosis:
-                        each([&](std::size_t r) {
-                            double* scr = scratch_base + scratch_offset_[agg_i];
-                            agg_update_moments(slot, scr[0], scr[1], scr[2],
-                                               static_cast<double>(data[r]));
-                        });
-                        break;
-                    case ir::AggFunc::First:
-                        each([&](std::size_t r) {
-                            if (!slot.present()) {
-                                slot.int_value = data[r];
-                                slot.mark_present();
-                            }
-                        });
-                        break;
-                    case ir::AggFunc::Last:
-                        each([&](std::size_t r) {
-                            slot.int_value = data[r];
-                            slot.mark_present();
-                        });
-                        break;
-                    default:
-                        break;
-                }
+                // One width test, then a raw-pointer loop per width.
+                with_physical_values(
+                    std::get<Column<std::int64_t>>(std::as_const(*entry.column)),
+                    [&](const auto* data) {
+                        switch (func) {
+                            case ir::AggFunc::Sum:
+                                each([&](std::size_t r) {
+                                    slot.int_value += data[r];
+                                    slot.mark_present();
+                                });
+                                break;
+                            case ir::AggFunc::Mean:
+                                each([&](std::size_t r) {
+                                    slot.double_value += static_cast<double>(data[r]);
+                                    slot.count++;
+                                });
+                                break;
+                            case ir::AggFunc::Min:
+                                each([&](std::size_t r) {
+                                    const std::int64_t v = data[r];
+                                    slot.int_value =
+                                        slot.present() ? std::min(slot.int_value, v) : v;
+                                    slot.mark_present();
+                                });
+                                break;
+                            case ir::AggFunc::Max:
+                                each([&](std::size_t r) {
+                                    const std::int64_t v = data[r];
+                                    slot.int_value =
+                                        slot.present() ? std::max(slot.int_value, v) : v;
+                                    slot.mark_present();
+                                });
+                                break;
+                            case ir::AggFunc::Stddev:
+                                each([&](std::size_t r) {
+                                    agg_update_stddev(slot, scratch_base[scratch_offset_[agg_i]],
+                                                      static_cast<double>(data[r]));
+                                });
+                                break;
+                            case ir::AggFunc::Skew:
+                            case ir::AggFunc::Kurtosis:
+                                each([&](std::size_t r) {
+                                    double* scr = scratch_base + scratch_offset_[agg_i];
+                                    agg_update_moments(slot, scr[0], scr[1], scr[2],
+                                                       static_cast<double>(data[r]));
+                                });
+                                break;
+                            case ir::AggFunc::First:
+                                each([&](std::size_t r) {
+                                    if (!slot.present()) {
+                                        slot.int_value = data[r];
+                                        slot.mark_present();
+                                    }
+                                });
+                                break;
+                            case ir::AggFunc::Last:
+                                each([&](std::size_t r) {
+                                    slot.int_value = data[r];
+                                    slot.mark_present();
+                                });
+                                break;
+                            default:
+                                break;
+                        }
+                    });
             } else {
                 // ExprType::String — First/Last only, same wire format as the
                 // grouped path (ScalarValue{std::string}).
@@ -9806,10 +9810,13 @@ class ChunkedSortedAggregateOperator final : public Operator {
                 accumulate_typed(slot, &cur_scratch_[i * kMomentScratch], plan_[i].func, data,
                                  entry, has_nulls, start, end);
             } else {
-                const auto data =
-                    std::get<Column<std::int64_t>>(std::as_const(*entry.column)).integer_view();
-                accumulate_typed(slot, &cur_scratch_[i * kMomentScratch], plan_[i].func, data,
-                                 entry, has_nulls, start, end);
+                // One width test, then a raw-pointer loop per width.
+                with_physical_values(std::get<Column<std::int64_t>>(std::as_const(*entry.column)),
+                                     [&](const auto* data) {
+                                         accumulate_typed(slot, &cur_scratch_[i * kMomentScratch],
+                                                          plan_[i].func, data, entry, has_nulls,
+                                                          start, end);
+                                     });
             }
         }
     }
@@ -9854,8 +9861,8 @@ class ChunkedSortedAggregateOperator final : public Operator {
                         slot.double_value =
                             slot.present() ? std::min(slot.double_value, data[row]) : data[row];
                     } else {
-                        slot.int_value =
-                            slot.present() ? std::min(slot.int_value, data[row]) : data[row];
+                        const std::int64_t v = data[row];
+                        slot.int_value = slot.present() ? std::min(slot.int_value, v) : v;
                     }
                     slot.mark_present();
                 }
@@ -9869,8 +9876,8 @@ class ChunkedSortedAggregateOperator final : public Operator {
                         slot.double_value =
                             slot.present() ? std::max(slot.double_value, data[row]) : data[row];
                     } else {
-                        slot.int_value =
-                            slot.present() ? std::max(slot.int_value, data[row]) : data[row];
+                        const std::int64_t v = data[row];
+                        slot.int_value = slot.present() ? std::max(slot.int_value, v) : v;
                     }
                     slot.mark_present();
                 }

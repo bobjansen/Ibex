@@ -9,7 +9,6 @@
 #include <ibex/core/time_zone.hpp>
 #include <ibex/interop/arrow_c_data.hpp>
 #include <ibex/ir/node.hpp>
-#include <ibex/runtime/env.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/table_properties.hpp>
 
@@ -823,8 +822,8 @@ auto import_dictionary_strings(const ArrowArray& dictionary)
 /// an Int64 exactly, so the conversion is lossless and needs no range check --
 /// including at null positions, whose payload Arrow leaves unspecified. The
 /// widening is a real conversion, so unlike a native Int64 column this cannot
-/// adopt the producer's buffer. Signed Int32 is the exception when compact
-/// storage is enabled: an adopting import retains the physical buffer and owner.
+/// adopt the producer's buffer. Signed Int32 is the exception: it keeps compact
+/// storage, and an adopting import retains the physical buffer and owner.
 template <typename Raw>
 auto import_widened_int_column(const ArrowArray& array, const std::shared_ptr<const void>& owner)
     -> std::expected<runtime::ColumnValue, std::string> {
@@ -835,27 +834,24 @@ auto import_widened_int_column(const ArrowArray& array, const std::shared_ptr<co
     }
     const auto* values = static_cast<const Raw*>(array.buffers[1]);
     if constexpr (std::is_same_v<Raw, std::int32_t>) {
-        if (runtime::compact_int32_enabled()) {
-            if (owner) {
-                return runtime::ColumnValue{Column<std::int64_t>::from_external_int32(
-                    owner, values == nullptr ? nullptr : values + array.offset,
-                    static_cast<std::size_t>(array.length))};
-            }
-            ibex::detail::NoInitVector<std::int32_t> compact(
-                static_cast<std::size_t>(array.length));
-            for (std::int64_t i = 0; i < array.length; ++i) {
-                compact[static_cast<std::size_t>(i)] = values[array.offset + i];
-            }
-            return runtime::ColumnValue{
-                Column<std::int64_t>::from_compact_int32(std::move(compact))};
+        if (owner) {
+            return runtime::ColumnValue{Column<std::int64_t>::from_external_int32(
+                owner, values == nullptr ? nullptr : values + array.offset,
+                static_cast<std::size_t>(array.length))};
         }
+        ibex::detail::NoInitVector<std::int32_t> compact(static_cast<std::size_t>(array.length));
+        for (std::int64_t i = 0; i < array.length; ++i) {
+            compact[static_cast<std::size_t>(i)] = values[array.offset + i];
+        }
+        return runtime::ColumnValue{Column<std::int64_t>::from_compact_int32(std::move(compact))};
+    } else {
+        Column<std::int64_t> column;
+        column.reserve(static_cast<std::size_t>(array.length));
+        for (std::int64_t i = 0; i < array.length; ++i) {
+            column.push_back(static_cast<std::int64_t>(values[array.offset + i]));
+        }
+        return runtime::ColumnValue{std::move(column)};
     }
-    Column<std::int64_t> column;
-    column.reserve(static_cast<std::size_t>(array.length));
-    for (std::int64_t i = 0; i < array.length; ++i) {
-        column.push_back(static_cast<std::int64_t>(values[array.offset + i]));
-    }
-    return runtime::ColumnValue{std::move(column)};
 }
 
 /// Import a float32 column, widening to the Float64 Ibex stores. Every float32
@@ -1228,7 +1224,7 @@ auto import_column(const ArrowArray& array, const ArrowSchema& schema,
     const bool buffer_adopted =
         owner && (format == "l" || format == "g" || format == "b" || format == "tdD" ||
                   (timestamp.has_value() && timestamp->nanos_per_unit == 1) || format == "u" ||
-                  (format == "i" && (!narrow_int.has_value() || runtime::compact_int32_enabled())));
+                  format == "i");
     return std::pair{
         std::move(*column),
         import_validity(array, buffer_adopted ? owner : std::shared_ptr<const void>{})};

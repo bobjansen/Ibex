@@ -210,18 +210,19 @@ Answer checks compare floats with a tolerance (`benchmarking/ab_queries.py`,
 `outputs_match`). A different row, row order, key, count, integer, string or
 decimal is a bug.
 
-## 8. Compact Int32 storage (opt-in, `IBEX_COMPACT_INT32=1`)
+## 8. Compact Int32 storage
 
 Normative comments: `include/ibex/core/column.hpp` (`from_compact_int32`,
-`visit_integer_storage`, `widened_int64`, `IntegerView`) and
-`include/ibex/runtime/env.hpp`. Plan retired 2026-11-10:
+`visit_integer_storage`, `widened_int64`, `IntegerView`). Plan retired
+2026-11-10:
 `git show ed7fd554:plans/native-int32-storage.md`; measurements and
 diagnoses are in `benchmarking/int32/*/README.md`.
 
-* **Ingestion only.** With the flag on, signed Int32 from Parquet (sharded,
+* **Always on, at ingestion only.** Signed Int32 from Parquet (sharded,
   serial and selected-row decoders) and Arrow (adopted C Data buffers keep
   the producer's buffer, slice and owner) keeps Int32 backing. Nothing
-  narrows an Int64 by value; UInt32 stays Int64; floats are unchanged.
+  narrows an Int64 by value; UInt32 stays Int64; floats are unchanged. It was
+  opt-in through `IBEX_COMPACT_INT32=1` until 2026-11-12; there is no switch.
 * **The column is logically Int64.** There is no Int32 `ColumnValue`
   alternative and no Int32 arithmetic: readers return Int64 before any
   arithmetic, and every result (arithmetic, aggregate, scalar) is Int64.

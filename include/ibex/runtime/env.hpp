@@ -12,12 +12,6 @@
 
 namespace ibex::runtime {
 
-/// Experimental compact storage; logical integers and arithmetic remain Int64.
-[[nodiscard]] inline auto compact_int32_enabled() noexcept -> bool {
-    const char* value = std::getenv("IBEX_COMPACT_INT32");
-    return value != nullptr && std::string_view(value) == "1";
-}
-
 /// Portable env-var mutation. `std::getenv` is enough to read one everywhere,
 /// but writing needs `setenv`/`unsetenv` on POSIX vs `_putenv_s` on MSVC —
 /// this pair hides that split for the few callers (tests, mostly) that need

@@ -1562,25 +1562,6 @@ TEST_CASE("Arrow C Data schema-only import of a column-less struct is empty",
 }
 
 namespace {
-struct CompactImportMode {
-    std::optional<std::string> previous;
-    CompactImportMode() {
-        if (const auto* value = std::getenv("IBEX_COMPACT_INT32"))
-            previous = value;
-        set("1");
-    }
-    ~CompactImportMode() { set(previous ? previous->c_str() : nullptr); }
-    static void set(const char* value) {
-#ifdef _WIN32
-        _putenv_s("IBEX_COMPACT_INT32", value ? value : "");
-#else
-        if (value)
-            ::setenv("IBEX_COMPACT_INT32", value, 1);
-        else
-            ::unsetenv("IBEX_COMPACT_INT32");
-#endif
-    }
-};
 struct Int32Release {
     std::shared_ptr<ForeignIntColumn<std::int32_t>> source;
     std::shared_ptr<int> releases;
@@ -1595,7 +1576,6 @@ void release_int32_source(ArrowArray* array) {
 
 TEST_CASE("Arrow Int32 adoption retains sliced physical values and validity",
           "[interop][arrow][int][ingestion]") {
-    CompactImportMode mode;
     auto source = std::make_shared<ForeignIntColumn<std::int32_t>>(
         std::initializer_list<std::int32_t>{99, INT32_MIN, 77, INT32_MAX, 99}, "i");
     const std::uint8_t bits = 0x0a;  // positions 1 and 3 valid, position 2 null
@@ -1633,7 +1613,6 @@ TEST_CASE("Arrow Int32 adoption retains sliced physical values and validity",
 
 TEST_CASE("Arrow borrowed Int32 import copies slices and unsigned values stay wide",
           "[interop][arrow][int][ingestion]") {
-    CompactImportMode mode;
     ForeignIntColumn<std::int32_t> source({99, INT32_MIN, INT32_MAX}, "i");
     source.child.offset = 1;
     source.child.length = source.array.length = 2;

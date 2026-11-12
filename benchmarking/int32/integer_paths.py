@@ -12,11 +12,19 @@ filter 10x and several of the others 4-11%; this is the probe that found them.
   integer_paths.py gen               # seeded tables -> benchmarking/data/int32_paths
   integer_paths.py run --ibex A/tools/ibex --ibex B/tools/ibex --rounds 2
 
+`gen` writes each table three times, with the same values: CSV, and Parquet
+with the integer columns as Int64 (`parquet64`) and as Int32 (`parquet`, which
+loads as compact Int32 storage, src/runtime/CONTRACTS.md section 8). The two
+Parquet inputs differ only in width, so `run --input parquet64,parquet` (the
+default) is the compact-vs-wide A/B; with one binary it prints that ratio.
+
 `run` alternates the given REPL binaries (each with its own plugin directory,
 the binary's), one warmup and --iters timed collections per query, and prints
 the minimum per query and binary. Answers are not checked; this measures speed
 only. Every run is pinned to one CPU with IBEX_CORES=1 and, where systemd-run
 is available, capped at --memory-cap so a broken build cannot exhaust the box.
+The Parquet input needs a build with the Parquet plugin; the perfcmp cache
+slots have none, so use Release trees there.
 """
 import argparse
 import os
@@ -25,6 +33,8 @@ import re
 import shutil
 import subprocess
 import sys
+
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA = ROOT / "benchmarking" / "data" / "int32_paths"
@@ -61,8 +71,6 @@ SCALE = {"us": 1e-3, "ms": 1.0, "s": 1e3}
 
 
 def generate(out: Path) -> None:
-    import numpy as np
-
     out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(20261112)
     a = rng.integers(0, 1_000_000, ROWS)
@@ -71,9 +79,12 @@ def generate(out: Path) -> None:
     h = rng.integers(0, 100, ROWS)
     k = rng.integers(0, 5_000_000, ROWS)
     v = rng.integers(0, 100, ROWS)
-    n = rng.integers(-1000, 1000, ROWS).astype(object)
-    n[rng.random(ROWS) < 0.1] = ""  # 10% null, for the fills
-    s = np.char.add("u", rng.integers(0, 1_000, ROWS).astype(str))
+    n_values = rng.integers(-1000, 1000, ROWS)
+    n_null = rng.random(ROWS) < 0.1  # 10% null, for the fills
+    n = n_values.astype(object)
+    n[n_null] = ""
+    s_ids = rng.integers(0, 1_000, ROWS)
+    s = np.char.add("u", s_ids.astype(str))
     with open(out / "t.csv", "w") as f:
         f.write("a,b,g,h,k,v,n,s\n")
         for start in range(0, ROWS, 500_000):
@@ -81,18 +92,47 @@ def generate(out: Path) -> None:
             f.write("\n".join(",".join(map(str, row)) for row in zip(
                 a[part], b[part], g[part], h[part], k[part], v[part], n[part], s[part])) + "\n")
     right = rng.permutation(5_000_000)[:2_500_000]  # unique keys, half of t's domain
+    w = rng.integers(0, 1_000, right.size)
     with open(out / "r.csv", "w") as f:
         f.write("k,w\n")
-        f.write("\n".join(f"{x},{y}" for x, y in zip(right, rng.integers(0, 1_000, right.size))))
+        f.write("\n".join(f"{x},{y}" for x, y in zip(right, w)))
         f.write("\n")
+    write_parquet(out, a, b, g, h, k, v, n_values, n_null, s, right, w)
     print(f"wrote {out}")
 
 
-def time_build(binary: Path, data: Path, queries, iters: int, cpu: int,
+def write_parquet(out: Path, a, b, g, h, k, v, n_values, n_null, s, right, w) -> None:
+    """The CSV tables again as Parquet, integer columns as Int32 and as Int64."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    def i32(values, mask=None):
+        return pa.array(values.astype(np.int32), type=pa.int32(), mask=mask)
+
+    t = pa.table({"a": i32(a), "b": i32(b), "g": i32(g), "h": i32(h), "k": i32(k),
+                  "v": i32(v), "n": i32(n_values, n_null), "s": pa.array(s)})
+    r = pa.table({"k": i32(right), "w": i32(w)})
+    for name, table in (("t", t), ("r", r)):
+        pq.write_table(table, out / f"{name}.parquet")
+        wide = pa.schema([pa.field(f.name, pa.int64() if f.type == pa.int32() else f.type)
+                          for f in table.schema])
+        pq.write_table(table.cast(wide), out / f"{name}64.parquet")
+
+
+def time_build(binary: Path, data: Path, source: str, queries, iters: int, cpu: int,
                memory_cap: str) -> dict[str, float | None]:
-    script = ['import "csv";',
-              f'let t = csv::read("{data}/t.csv", nulls = "<empty>");',
-              f'let r = csv::read("{data}/r.csv", nulls = "<empty>");']
+    if source == "csv":
+        script = ['import "csv";',
+                  f'let t = csv::read("{data}/t.csv", nulls = "<empty>");',
+                  f'let r = csv::read("{data}/r.csv", nulls = "<empty>");']
+    else:
+        stem = "64" if source == "parquet64" else ""
+        # The projection binds the tables in memory, as csv::read does. A bare
+        # lazy read would have each filter re-decode the file (selected-row
+        # decode, ~200 ms of the 230 ms filter_scalar took that way).
+        script = ['import "parquet";',
+                  f'let t = parquet::read("{data}/t{stem}.parquet")[select {{ a, b, g, h, k, v, n, s }}];',
+                  f'let r = parquet::read("{data}/r{stem}.parquet")[select {{ k, w }}];']
     for name, query in queries:
         script.append(f'print("@@{name}");')
         for i in range(1 + iters):  # the first collection is a warmup
@@ -133,6 +173,8 @@ def main() -> None:
     run.add_argument("--rounds", type=int, default=1, help="alternations of the binaries")
     run.add_argument("--iters", type=int, default=5, help="timed collections per query")
     run.add_argument("--only", help="comma-separated query names")
+    run.add_argument("--input", default="parquet64,parquet",
+                     help="comma-separated: csv, parquet64 (Int64), parquet (compact Int32)")
     run.add_argument("--cpu", type=int, default=2, help="the one CPU to pin to (a P-core)")
     run.add_argument("--memory-cap", default="16G", help="systemd-run MemoryMax ('' disables)")
     args = ap.parse_args()
@@ -147,26 +189,46 @@ def main() -> None:
         if unknown:
             ap.error(f"unknown queries: {', '.join(sorted(unknown))}")
         queries = [q for q in QUERIES if q[0] in wanted]
-    if not (args.data / "t.csv").exists():
-        ap.error(f"{args.data}/t.csv missing; run `{Path(__file__).name} gen` first")
-    best: dict[tuple[int, str], float] = {}
+    sources = args.input.split(",")
+    files = {"csv": "t.csv", "parquet": "t.parquet", "parquet64": "t64.parquet"}
+    if set(sources) - set(files):
+        ap.error(f"--input takes {', '.join(files)}, not {args.input}")
+    for source in sources:
+        if not (args.data / files[source]).exists():
+            ap.error(f"{args.data}/{files[source]} missing; run `{Path(__file__).name} gen` first")
+    best: dict[tuple[int, str, str], float] = {}
     for _ in range(args.rounds):
         for i, binary in enumerate(binaries):
-            for name, ms in time_build(binary, args.data.resolve(), queries, args.iters, args.cpu,
-                                       args.memory_cap).items():
-                if ms is not None:
-                    best[(i, name)] = min(ms, best.get((i, name), ms))
-    head = "query".ljust(20) + "".join(f"{f'build {i}':>12}" for i in range(len(binaries)))
+            for source in sources:
+                for name, ms in time_build(binary, args.data.resolve(), source, queries,
+                                           args.iters, args.cpu, args.memory_cap).items():
+                    if ms is not None:
+                        key = (i, source, name)
+                        best[key] = min(ms, best.get(key, ms))
+    if len(binaries) == 1 and len(sources) == 2:
+        print("query".ljust(20) + "".join(f"{x:>11}" for x in sources) + f"{'2 vs 1':>10}")
+        for name, _ in queries:
+            cells = [best.get((0, x, name)) for x in sources]
+            row = name.ljust(20) + "".join(
+                f"{c:11.2f}" if c is not None else f"{'FAILED':>11}" for c in cells)
+            if None not in cells:
+                row += f"{(cells[1] / cells[0] - 1) * 100:+9.1f}%"
+            print(row)
+        print(f"build 0: {binaries[0]}")
+        return
+    head = "query".ljust(20) + f"{'input':>10}" + "".join(
+        f"{f'build {i}':>12}" for i in range(len(binaries)))
     if len(binaries) == 2:
         head += f"{'1 vs 0':>10}"
     print(head)
     for name, _ in queries:
-        cells = [best.get((i, name)) for i in range(len(binaries))]
-        row = name.ljust(20) + "".join(f"{c:12.2f}" if c is not None else f"{'FAILED':>12}"
-                                      for c in cells)
-        if len(binaries) == 2 and None not in cells:
-            row += f"{(cells[1] / cells[0] - 1) * 100:+9.1f}%"
-        print(row)
+        for source in sources:
+            cells = [best.get((i, source, name)) for i in range(len(binaries))]
+            row = name.ljust(20) + f"{source:>10}" + "".join(
+                f"{c:12.2f}" if c is not None else f"{'FAILED':>12}" for c in cells)
+            if len(binaries) == 2 and None not in cells:
+                row += f"{(cells[1] / cells[0] - 1) * 100:+9.1f}%"
+            print(row)
     for i, binary in enumerate(binaries):
         print(f"build {i}: {binary}")
 

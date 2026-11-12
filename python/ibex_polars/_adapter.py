@@ -20,7 +20,7 @@ import pyarrow as pa
 
 import ibex
 from ibex._expr import Expr
-from ibex._lower import _WIDENED_NUMERIC_TYPES, _compact_int32, lower
+from ibex._lower import _WIDENED_NUMERIC_TYPES, lower
 from . import _categories
 from ._temporal import NANOS_PER_UNIT, TEMPORAL_TYPES, is_temporal, literal_ticks, prepare_column
 
@@ -797,7 +797,7 @@ class Adapter:
         for index, field in enumerate(table.schema):
             if pa.types.is_timestamp(field.type) or pa.types.is_duration(field.type):
                 table = table.set_column(index, field.name, prepare_column(table.column(index)))
-            elif field.type in _WIDENED_NUMERIC_TYPES and not (field.type == pa.int32() and _compact_int32()):
+            elif field.type in _WIDENED_NUMERIC_TYPES and field.type != pa.int32():
                 table = table.set_column(index, field.name, table.column(index).cast(_WIDENED_NUMERIC_TYPES[field.type]))
         if row_number is not None:
             height = pl.DataFrame._from_pydf(node.df).height
@@ -873,9 +873,9 @@ class Adapter:
         Only the join reads that input, and it reads only the keys, so a
         non-key Categorical never needs its labels in Ibex: it binds as its
         Polars ids and comes back as them, needing `cat.to` but no lookup of
-        Ibex codes. Needs compact Int32 storage, or Ibex would widen the ids.
+        Ibex codes. Compact Int32 storage keeps the ids unwidened.
         """
-        if not _compact_int32() or node_id in self.nodes:
+        if node_id in self.nodes:
             return None
         self.visitor.set_node(node_id)
         scan = self.visitor.view_current_node()

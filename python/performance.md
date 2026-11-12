@@ -49,7 +49,7 @@ see the [published benchmark snapshot](../benchmarking/aws/README.md#published-b
 ## h2o joins through `IbexEngine`
 
 `J1_1e7_NA_0_0`, a 10M-row `x` joined to small / medium / big tables, with
-`IBEX_COMPACT_INT32=1`; median paired Ibex/Polars ratios, 2026-11-10:
+compact Int32 storage (then `IBEX_COMPACT_INT32=1`, now the default); median paired Ibex/Polars ratios, 2026-11-10:
 
 | Question | 8 threads | 1 thread |
 |---|---:|---:|

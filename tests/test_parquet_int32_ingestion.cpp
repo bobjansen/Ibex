@@ -4,7 +4,7 @@
 
 #include "../libs/parquet/parquet.hpp"
 
-// These tests run with IBEX_COMPACT_INT32=1. They inspect physical buffers:
+// Signed Int32 keeps compact storage. These tests inspect physical buffers:
 // equivalent Int64 output alone cannot detect accidental eager widening.
 namespace {
 auto int32_array(bool nulls) -> std::shared_ptr<arrow::Array> {
@@ -47,8 +47,6 @@ void check_values(const ibex::runtime::ColumnEntry& entry, bool nulls) {
 
 TEST_CASE("Parquet Arrow fallback retains single-chunk slices and normalizes nullable chunks",
           "[parquet][int32-ingestion]") {
-    if (!ibex::runtime::compact_int32_enabled())
-        SKIP("requires IBEX_COMPACT_INT32=1");
     auto array = int32_array(false)->Slice(1, 2);
     std::weak_ptr<const void> lifetime = array;
     auto table = arrow::Table::Make(arrow::schema({arrow::field("v", arrow::int32())}), {array});
@@ -75,8 +73,6 @@ TEST_CASE("Parquet Arrow fallback retains single-chunk slices and normalizes nul
 TEST_CASE(
     "Parquet direct Int32 decoding preserves width for nulls selections and missing statistics",
     "[parquet][int32-ingestion]") {
-    if (!ibex::runtime::compact_int32_enabled())
-        SKIP("requires IBEX_COMPACT_INT32=1");
     for (bool nulls : {false, true})
         for (bool statistics : {false, true}) {
             CAPTURE(nulls, statistics);

@@ -154,7 +154,7 @@ if(TARGET ibex_parquet)
         add_test(NAME ibex_int32_ingestion_${_cores}
             COMMAND ibex_tests "[int32-ingestion]")
         set_tests_properties(ibex_int32_ingestion_${_cores} PROPERTIES
-            ENVIRONMENT "IBEX_COMPACT_INT32=1;IBEX_CORES=${_cores}")
+            ENVIRONMENT "IBEX_CORES=${_cores}")
     endforeach()
 endif()
 

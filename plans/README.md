@@ -83,12 +83,13 @@ lists them, and the removal commit's parent still has every file. Citations
 in active plans to `plans/done/...` paths refer to that history.
 
 - **Retired 2026-11-10**: **native-int32-storage.md** — compact Int32
-  backing for logically Int64 columns, opt-in through `IBEX_COMPACT_INT32=1`.
+  backing for logically Int64 columns, opt-in through `IBEX_COMPACT_INT32=1`
+  until 2026-11-12, when it became the only behaviour and the switch went.
   Read it at `git show ed7fd554:plans/native-int32-storage.md`; the contract
-  is `src/runtime/CONTRACTS.md` §8, the evidence `benchmarking/int32/`. Left:
-  making compact the default needs its own gate with compact on (every
-  ibex_bench suite, PDS-H SF-10 native and adapter, peak memory on real
-  Parquet arithmetic); the one-core arithmetic-filter +1–1.5% is a
+  is `src/runtime/CONTRACTS.md` §8, the evidence `benchmarking/int32/`. The
+  default flipped before the full gate it named had run with compact on
+  (every ibex_bench suite, PDS-H SF-10 native and adapter, peak memory on real
+  Parquet arithmetic); the AWS polars-engines run at 013dbbfb did. The one-core arithmetic-filter +1–1.5% is a
   placement effect still open (the alignment hint was rejected).
 - **Retired 2026-10-05**, overtaken or done. Read any of them at
   `git show 587bc2e4:plans/<name>`.

@@ -67,12 +67,14 @@ per-row width branches. Cross-type answers are compared after every sample.
 
 ## Native runtime prototype
 
-Compact integer backing is now implemented on this branch behind
-`IBEX_COMPACT_INT32=1`, with Int64 logical/arithmetic semantics. The
+Compact integer backing is implemented with Int64 logical/arithmetic
+semantics, and since 2026-11-12 it is the only behaviour: the opt-in
+`IBEX_COMPACT_INT32=1` switch, and with it the wide Int32 ingestion, is gone. The
 guarantees are in [the runtime contracts](../../src/runtime/CONTRACTS.md)
 (§8); the retired implementation plan, with its correctness checks and
-historical gates, is `git show ed7fd554:plans/native-int32-storage.md`. It
-remains opt-in while the broader performance gate is open.
+historical gates, is `git show ed7fd554:plans/native-int32-storage.md`.
+Scripts below that set `IBEX_COMPACT_INT32` predate that; the variable is now
+ignored.
 
 `lhs join rhs on id` with Int64 keys and three right-side integer payloads,
 inputs built before timing, result materialization timed, two warmups and 12
@@ -169,31 +171,59 @@ aimed at one family of loops that read Int64 columns (filters, casts, math,
 lag/cumsum/fills, grouped shifts, sorts and top-k, semi/anti/left/outer joins,
 wide/pair/mixed/packed group keys, corr, melt).
 
-At one core, `be3c9ef4` (before the view) against `caf898de` showed a
+At one core, `be3c9ef4` (before the view) against `68b5957f` showed a
 column-vs-column filter `a > b` at 26 -> 258 ms (`cmp_into` stopped
 vectorizing), `Float64(a)` +10.6%, the single-Int64-key left join +9.1% and
 outer join +3.9%, `fill_forward`/`fill_backward` +6%/+7.5%, top-k on an Int64
-sort key +6% and grouped `lag` +3.6%. After `37ad93b2` every query is at or
+sort key +6% and grouped `lag` +3.6%. After `781be0c7` every query is at or
 below its `be3c9ef4` time (`a > b` 25.6 ms, left join -8.8%). The h2o joins
 and groupby questions behind the same series are in the commit messages of
-`daa66570` through `37ad93b2`.
+`f80dd2db` through `781be0c7`.
 
 The fixes follow two patterns, both in `src/runtime/runtime_internal.hpp`:
 `with_physical_values(column, body)` tests the width once and compiles a short
 loop per width; `contiguous_values(column, scratch)` gives a long kernel a raw
 `const T*`, the column's own buffer or, for compact storage, a copy widened
 once. Wrapping a large inline switch in a generic lambda instead cost h2o q7
-60% (`a94cbb44`; fixed out of line in `4458c329`).
+60% (`7cdc4ed3`; fixed out of line in `fd9e6668`).
 
 ```bash
 .venv/bin/python benchmarking/int32/integer_paths.py gen   # -> benchmarking/data/int32_paths
-.venv/bin/python benchmarking/int32/integer_paths.py run \
+# compact Int32 against Int64 storage, one build (the default inputs)
+.venv/bin/python benchmarking/int32/integer_paths.py run --rounds 2
+# two builds, on any of csv, parquet64, parquet
+.venv/bin/python benchmarking/int32/integer_paths.py run --input csv \
     --ibex <build A>/tools/ibex --ibex <build B>/tools/ibex --rounds 2
 ```
 
-Compare builds made with the same flags (for example two
-`~/.cache/ibex/perfcmp` slots, which build with `-march=native`, or two
-Release trees), each with its CSV plugin next to the binary. Runs pin to one
-CPU with `IBEX_CORES=1` and, through `systemd-run`, a 16G memory cap; the
-script times queries and does not check answers (the
+`gen` writes the tables as CSV and twice as Parquet, with the integer columns
+as Int64 (`t64.parquet`) and as Int32 (`t.parquet`, loaded as compact
+storage). The Parquet pair differs only in width; the script binds both in
+memory with a projection, since a lazy read would re-decode the file in every
+filter. Compare builds made with the same flags (two Release trees, or two
+`~/.cache/ibex/perfcmp` slots, which build with `-march=native` and have no
+Parquet plugin, so CSV only), each with its plugins next to the binary. Runs
+pin to one CPU with `IBEX_CORES=1` and, through `systemd-run`, a 16G memory
+cap; the script times queries and does not check answers (the
 `[compact-int32]` tests in `tests/test_integer_no_cache.cpp` do).
+
+Compact against Int64 storage, `build-release` at the commit that made
+compact the default, two rounds of five (minimum, ms):
+
+| Query | Int64 | Int32 | Int32 vs Int64 |
+|---|---:|---:|---:|
+| `filter a > 500000` / `a > b` | 27.1 / 28.2 | 19.5 / 19.6 | -28% / -31% |
+| `order { a }` | 283.9 | 218.3 | -23% |
+| `cumsum(a)` | 3.9 | 3.0 | -23% |
+| semi / anti join on `k` | 37.1 / 37.0 | 29.7 / 29.5 | -20% |
+| `Float64(a)` | 5.5 | 4.6 | -16% |
+| group-bys (5 shapes), corr | | | -1.4% to -3.6% |
+| left / outer join on `k` | 309.1 / 327.9 | 309.3 / 311.6 | +0.1% / -5.0% |
+| `melt` | 59.6 | 62.7 | +5% |
+| top-k by `g` / top-k | 57.7 / 12.1 | 64.2 / 14.7 | +11% / +22% |
+| `lag(a, 1)` | 2.3 | 2.8 | +21% |
+| `abs(a)` | 3.5 | 4.5 | +27% |
+| fill forward / backward | 8.7 / 8.6 | 11.5 / 11.6 | +32% / +35% |
+| `a * 3 + b` / `pmax(a, b)` | 5.9 / 4.7 | 7.8 / 6.7 | +34% / +43% |
+
+The losses are open: those kernels read compact input slower than wide.

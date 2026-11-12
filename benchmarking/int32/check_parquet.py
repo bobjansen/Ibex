@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Bob Jansen
-"""Byte-identity checks for native compact Parquet decoding and Int64 results."""
+"""Byte-identity checks for native compact Parquet decoding and Int64 results.
+
+Compact Int32 is the only ingestion since 2026-11-12, so the wide decoders are
+reached only through --reference-root: a tree built before that, run with its
+IBEX_COMPACT_INT32=0.
+"""
 import argparse
 import json
 import os
@@ -37,16 +42,16 @@ with tempfile.TemporaryDirectory(prefix='ibex-compact-parquet-') as temp:
         script=temp/(name+'.ibex')
         script.write_text(f'import "parquet";\nlet t=parquet::read("{temp/fixture}.parquet");\n{query}\n')
         outputs=[]
-        routes=[(a.root,'0'),(a.root,'1')]
+        routes=[(a.root,None)]
         if a.reference_root:routes.insert(0,(a.reference_root,'0'))
         for cores in ('1','8'):
             for root,mode in routes:
                 r=subprocess.run([str(root/'build-release/tools/ibex_eval'),'--plugin-path',str(root/'build-release/tools'),str(script)],
-                    env=dict(os.environ,IBEX_CORES=cores,IBEX_COMPACT_INT32=mode),capture_output=True,text=True)
+                    env=dict(os.environ,IBEX_CORES=cores,**({'IBEX_COMPACT_INT32':mode} if mode else {})),capture_output=True,text=True)
                 if r.returncode:raise RuntimeError((name,cores,mode,r.stderr))
                 outputs.append(r.stdout)
         if len(set(outputs))!=1:raise AssertionError((name,outputs))
         records.append({'case':name,'byte_identical':True,'stdout':outputs[-1]})
-        print(name+': byte-identical, 1/8 threads, compact on/off'+(' and reference' if a.reference_root else ''))
+        print(name+': byte-identical, 1/8 threads'+(', compact and the wide reference' if a.reference_root else ''))
 a.out.parent.mkdir(parents=True,exist_ok=True)
 a.out.write_text(json.dumps(records,indent=2)+'\n')

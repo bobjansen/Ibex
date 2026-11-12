@@ -2,7 +2,6 @@
 # Copyright (C) 2026 Bob Jansen
 """Render one complete pipeline; captured values never become source text."""
 
-import os
 
 import pyarrow as pa
 
@@ -14,17 +13,6 @@ _WIDENED_NUMERIC_TYPES = {
     pa.int8(): pa.int64(), pa.int16(): pa.int64(), pa.int32(): pa.int64(),
     pa.uint8(): pa.int64(), pa.uint16(): pa.int64(), pa.float32(): pa.float64(),
 }
-
-
-def _compact_int32():
-    """Whether native import keeps signed Int32 compact (logically Int64).
-
-    Mirrors `ibex::runtime::compact_int32_enabled()`. When set, an in-memory
-    Int32 column is bound as-is: the native importer adopts its buffer, so
-    no widening copy is made before binding and none is narrowed on export.
-    Lowering still types it as Int64 under `widen_numeric_inputs`.
-    """
-    return os.environ.get("IBEX_COMPACT_INT32") == "1"
 
 
 def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=False,

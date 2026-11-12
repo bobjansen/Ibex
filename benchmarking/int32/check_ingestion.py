@@ -80,7 +80,7 @@ def run_test(source, name, should_fail=False):
     subprocess.run(invocation, check=True)
     binary = work / name
     subprocess.run([compiler, str(obj), *catch_link, *link, '-o', str(binary)], check=True)
-    env = dict(os.environ, IBEX_COMPACT_INT32='1')
+    env = dict(os.environ)
     for cores in ('1', '8'):
         result = subprocess.run([str(binary), '[int32-ingestion]', '--reporter', 'compact'],
                                 env=dict(env, IBEX_CORES=cores), capture_output=True, text=True)
@@ -95,7 +95,7 @@ if args.mutations:
     original = (root / 'libs/parquet/parquet.hpp').read_text()
     # In an isolated header copy, remove just the serial compact decoder.
     start = original.index('inline auto direct_column(')
-    condition = 'if (field.type()->id() == arrow::Type::INT32 && ibex::runtime::compact_int32_enabled())'
+    condition = 'if (field.type()->id() == arrow::Type::INT32)'
     assert condition in original[start:]
     mutant = original[:start] + original[start:].replace(condition, 'if (false)', 1)
     mutant_header = work / 'serial-wide-mutant.hpp'

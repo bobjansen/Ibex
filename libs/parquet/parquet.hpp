@@ -31,7 +31,6 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
-#include <ibex/runtime/env.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/operator.hpp>
@@ -762,7 +761,7 @@ inline void populate_from_arrow_table(const std::shared_ptr<arrow::Table>& table
         };
         // Restore the zero-at-a-null-slot invariant that the bulk value copy
         // does not maintain. A no-op when the column has no nulls.
-        if (col->type()->id() == arrow::Type::INT32 && ibex::runtime::compact_int32_enabled()) {
+        if (col->type()->id() == arrow::Type::INT32) {
             if (col->num_chunks() == 1 && col->null_count() == 0) {
                 const auto& ints = static_cast<const arrow::Int32Array&>(*col->chunk(0));
                 emit(ibex::Column<std::int64_t>::from_external_int32(
@@ -2397,7 +2396,7 @@ inline auto plan_sharded_column(parquet::arrow::FileReader& reader, const arrow:
     ShardedColumn planned;
     planned.entry.name = field.name();
     const auto id = field.type()->id();
-    if (id == arrow::Type::INT32 && ibex::runtime::compact_int32_enabled()) {
+    if (id == arrow::Type::INT32) {
         auto col = ibex::Column<std::int64_t>::from_compact_int32(
             ibex::detail::NoInitVector<std::int32_t>(output_rows));
         auto* base = col.compact_int32_output();
@@ -2512,7 +2511,7 @@ inline auto direct_column(parquet::arrow::FileReader& reader, const arrow::Field
         }
     };
 
-    if (field.type()->id() == arrow::Type::INT32 && ibex::runtime::compact_int32_enabled()) {
+    if (field.type()->id() == arrow::Type::INT32) {
         auto out = ibex::Column<std::int64_t>::from_compact_int32(
             ibex::detail::NoInitVector<std::int32_t>(output_rows));
         verify(decode_numeric_into<parquet::Int32Type, std::int32_t, true>(

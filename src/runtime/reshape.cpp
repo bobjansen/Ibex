@@ -1216,8 +1216,11 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                 auto* dst = out_col.data();
                 std::vector<const typename SrcCol::value_type*> srcs;
                 srcs.reserve(n_measures);
-                for (const auto* src : measures) {
-                    srcs.push_back(src->data());
+                // A compact Int32 measure is widened once into its scratch,
+                // so the interleave below stays a raw-pointer copy.
+                std::vector<detail::NoInitVector<typename SrcCol::value_type>> scratch(n_measures);
+                for (std::size_t j = 0; j < n_measures; ++j) {
+                    srcs.push_back(contiguous_values(*measures[j], scratch[j]));
                 }
                 with_measure_count([&]<std::size_t M>() {
                     const std::size_t m = M == 0 ? n_measures : M;

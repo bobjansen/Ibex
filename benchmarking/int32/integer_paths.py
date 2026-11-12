@@ -70,28 +70,28 @@ TIME_RE = re.compile(r"^time:\s*([\d.]+)\s*(us|ms|s)\s*$")
 SCALE = {"us": 1e-3, "ms": 1.0, "s": 1e3}
 
 
-def generate(out: Path) -> None:
+def generate(out: Path, rows: int = ROWS) -> None:
     out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(20261112)
-    a = rng.integers(0, 1_000_000, ROWS)
-    b = rng.integers(0, 1_000_000, ROWS)
-    g = rng.integers(0, 1_000, ROWS)
-    h = rng.integers(0, 100, ROWS)
-    k = rng.integers(0, 5_000_000, ROWS)
-    v = rng.integers(0, 100, ROWS)
-    n_values = rng.integers(-1000, 1000, ROWS)
-    n_null = rng.random(ROWS) < 0.1  # 10% null, for the fills
+    a = rng.integers(0, 1_000_000, rows)
+    b = rng.integers(0, 1_000_000, rows)
+    g = rng.integers(0, 1_000, rows)
+    h = rng.integers(0, 100, rows)
+    k = rng.integers(0, rows, rows)
+    v = rng.integers(0, 100, rows)
+    n_values = rng.integers(-1000, 1000, rows)
+    n_null = rng.random(rows) < 0.1  # 10% null, for the fills
     n = n_values.astype(object)
     n[n_null] = ""
-    s_ids = rng.integers(0, 1_000, ROWS)
+    s_ids = rng.integers(0, 1_000, rows)
     s = np.char.add("u", s_ids.astype(str))
     with open(out / "t.csv", "w") as f:
         f.write("a,b,g,h,k,v,n,s\n")
-        for start in range(0, ROWS, 500_000):
+        for start in range(0, rows, 500_000):
             part = slice(start, start + 500_000)
             f.write("\n".join(",".join(map(str, row)) for row in zip(
                 a[part], b[part], g[part], h[part], k[part], v[part], n[part], s[part])) + "\n")
-    right = rng.permutation(5_000_000)[:2_500_000]  # unique keys, half of t's domain
+    right = rng.permutation(rows)[:rows // 2]  # unique keys, half of t's domain
     w = rng.integers(0, 1_000, right.size)
     with open(out / "r.csv", "w") as f:
         f.write("k,w\n")
@@ -166,6 +166,9 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
     gen = sub.add_parser("gen", help="write the seeded input tables")
     gen.add_argument("--data", type=Path, default=DATA)
+    gen.add_argument("--rows", type=int, default=ROWS,
+                     help="rows of t (r gets half as many unique keys); non-default sizes "
+                          "belong in another --data directory")
     run = sub.add_parser("run", help="time the queries per binary")
     run.add_argument("--ibex", type=Path, action="append",
                      help="REPL binary; repeat to compare (default build-release/tools/ibex)")
@@ -179,7 +182,7 @@ def main() -> None:
     run.add_argument("--memory-cap", default="16G", help="systemd-run MemoryMax ('' disables)")
     args = ap.parse_args()
     if args.cmd == "gen":
-        generate(args.data)
+        generate(args.data, args.rows)
         return
     binaries = args.ibex or [ROOT / "build-release" / "tools" / "ibex"]
     queries = QUERIES

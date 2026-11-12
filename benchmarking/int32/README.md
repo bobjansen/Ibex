@@ -234,6 +234,11 @@ values and widen as they store, instead of through `IntegerView` or a whole
 column widened first; melt widens its measures a block at a time. Large
 widening copies (`widen_int32`, also behind `contiguous_values`) stream
 their stores past 2^20 values, as glibc's memmove does for the wide copy.
+Streaming bypasses the cache, so a widened scratch that the kernel reads
+straight back could lose where it would have fit in L3 (30 MB here). Checked
+with `gen --rows 2000000` (16 MB per widened column) against a build that
+never streams: `lag` +26% without streaming (+87% at 5M rows), every other
+query within +-2%, joins and sorts included.
 The fills became branch-free at both widths: Clang compiled the carry's
 ternary as a branch on the null bit, which 10% scattered nulls mispredict,
 so the Int64 fills also fell from 8.6 / 8.0 to 4.3 / 4.2 ms (perfcmp slots,

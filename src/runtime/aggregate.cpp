@@ -1677,30 +1677,44 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 }
                 buf.resize(offsets[n_groups]);
                 std::copy(offsets.begin(), offsets.end() - 1, cursor.begin());
-                auto scatter = [&](const auto& typed) {
-                    const auto data = value_reader(typed);
+                // Whether any scattered value is NaN, noted while it is in a
+                // register: without one, the reduce below skips moving NaNs
+                // aside, a whole extra pass over every group's values.
+                bool any_nan = false;
+                auto scatter = [&](const auto* data) {
+                    using V = std::remove_cvref_t<decltype(*data)>;
                     if (parallel_collect) {
+                        std::vector<char> range_nan(range_workers, 0);
                         for_row_range(
                             range_workers, [&](std::size_t r, std::size_t b, std::size_t e) {
                                 std::size_t* next = range_cursor.data() + (r * n_groups);
+                                bool nan = false;
                                 for (std::size_t row = b; row < e; ++row) {
                                     if (vb == nullptr || (*vb)[row]) {
-                                        buf[next[row_gid[row]]++] = static_cast<double>(data[row]);
+                                        const auto v = static_cast<double>(data[row]);
+                                        nan |= std::is_floating_point_v<V> && std::isnan(v);
+                                        buf[next[row_gid[row]]++] = v;
                                     }
                                 }
+                                range_nan[r] = static_cast<char>(nan);
                             });
+                        any_nan = std::ranges::any_of(range_nan, [](char c) { return c != 0; });
                         return;
                     }
+                    bool nan = false;
                     for (std::size_t row = 0; row < rows; ++row) {
                         if (vb == nullptr || (*vb)[row]) {
-                            buf[cursor[row_gid[row]]++] = static_cast<double>(data[row]);
+                            const auto v = static_cast<double>(data[row]);
+                            nan |= std::is_floating_point_v<V> && std::isnan(v);
+                            buf[cursor[row_gid[row]]++] = v;
                         }
                     }
+                    any_nan = nan;
                 };
                 if (const auto* dc = std::get_if<Column<double>>(&col)) {
-                    scatter(*dc);
+                    scatter(dc->data());
                 } else if (const auto* ic = std::get_if<Column<std::int64_t>>(&col)) {
-                    scatter(*ic);
+                    with_physical_values(*ic, scatter);
                 }
 
                 const ir::AggFunc f = plan[ai].func;
@@ -1723,7 +1737,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         // weak ordering `nth_element` needs; a selected
                         // position in the NaN tail is NaN.
                         double* const numbers_end =
-                            std::partition(lo, hi, [](double v) { return !std::isnan(v); });
+                            any_nan
+                                ? std::partition(lo, hi, [](double v) { return !std::isnan(v); })
+                                : hi;
                         const auto numbers = static_cast<std::size_t>(numbers_end - lo);
                         constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
                         if (f == ir::AggFunc::Median) {

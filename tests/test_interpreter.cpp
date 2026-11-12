@@ -7253,6 +7253,59 @@ TEST_CASE("median and quantile rank NaN above every number like Polars and DuckD
         check((*q75)[0], nan);
     }
 
+    SECTION("the parallel collect pass sees NaN in any row range") {
+        // Enough rows for the ranges to fan out. NaNs sit only in one late
+        // row range (group 1) and in most of group 2's rows, so a pass that
+        // dropped any range's NaN flag would select over NaNs and disagree
+        // with the serial answer. Group 0 has none and must equal its median.
+        constexpr std::size_t kBig = 300'000;
+        Column<std::int64_t> bg;
+        Column<double> bv;
+        for (std::size_t r = 0; r < kBig; ++r) {
+            const auto group = static_cast<std::int64_t>(r % 3);
+            double v = static_cast<double>((r * 7919) % 10'007);
+            if ((group == 1 && r > kBig - 5'000) || (group == 2 && r % 5 != 0)) {
+                v = nan;
+            }
+            bg.push_back(group);
+            bv.push_back(v);
+        }
+        runtime::Table big;
+        big.add_column("g", std::move(bg));
+        big.add_column("v", std::move(bv));
+        runtime::TableRegistry big_registry;
+        big_registry.emplace("b", std::move(big));
+        auto ir = require_ir("b[select { m = median(v), q = quantile(v, 0.9) }, by g];");
+        const auto run_with = [&](std::size_t threads) {
+            runtime::ExecutionContext exec;
+            exec.parallel_threads = threads;
+            exec.parallel_min_rows = 0;
+            auto out = runtime::interpret(*ir, big_registry, nullptr, nullptr, nullptr, exec);
+            REQUIRE(out.has_value());
+            return std::move(*out);
+        };
+        const auto serial = run_with(1);
+        const auto parallel = run_with(8);
+        for (const char* name : {"m", "q"}) {
+            INFO(name);
+            const auto& s_col = std::get<Column<double>>(*serial.find(name));
+            const auto& p_col = std::get<Column<double>>(*parallel.find(name));
+            REQUIRE(s_col.size() == 3);
+            for (std::size_t row = 0; row < 3; ++row) {
+                INFO("group " << row);
+                if (std::isnan(s_col[row])) {
+                    CHECK(std::isnan(p_col[row]));
+                } else {
+                    CHECK(p_col[row] == s_col[row]);
+                }
+            }
+        }
+        // Group 2 is 80% NaN, so both middles and the 0.9 position are NaN;
+        // group 1's few NaNs sit above its median.
+        CHECK(std::isnan(std::get<Column<double>>(*parallel.find("m"))[2]));
+        CHECK(!std::isnan(std::get<Column<double>>(*parallel.find("m"))[1]));
+    }
+
     SECTION("an exact position below the NaN tail is the number itself") {
         // {1, 2, NaN}: p=0.5 lands exactly on 2, so no interpolation towards
         // the NaN above it; p=0.75 interpolates into it.

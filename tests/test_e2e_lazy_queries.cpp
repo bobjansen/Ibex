@@ -966,7 +966,8 @@ TEST_CASE("e2e lazy: a compact Int32 dimension key is proved unique and joined",
                              const Selection* selection) -> std::expected<Table, std::string> {
                         Table out;
                         for (const auto& col_name : names) {
-                            const auto& col = std::get<Column<std::int64_t>>(*shared->find(col_name));
+                            const auto& col =
+                                std::get<Column<std::int64_t>>(*shared->find(col_name));
                             ibex::detail::NoInitVector<std::int32_t> values;
                             const std::size_t n =
                                 selection == nullptr ? col.size() : selection->size();

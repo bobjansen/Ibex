@@ -3235,8 +3235,8 @@ auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_
                             if (n < rows) {
                                 // A raw widening copy; through IntegerView it
                                 // tested the width per element (+29%).
-                                widen_int32(col.compact_int32_data() + (is_lag ? 0 : n),
-                                            rows - n, out.data() + (is_lag ? n : 0));
+                                widen_int32(col.compact_int32_data() + (is_lag ? 0 : n), rows - n,
+                                            out.data() + (is_lag ? n : 0));
                             }
                             return out;
                         }
@@ -3403,8 +3403,8 @@ template <typename T>
 }
 
 template <typename Source, typename T, typename Valid>
-auto fill_carry_ranges(Source in, T* dst, std::size_t rows, Valid is_valid,
-                       std::size_t ranges, bool forward) -> std::size_t {
+auto fill_carry_ranges(Source in, T* dst, std::size_t rows, Valid is_valid, std::size_t ranges,
+                       bool forward) -> std::size_t {
     constexpr std::size_t kNone = std::numeric_limits<std::size_t>::max();
     const std::size_t grain = (rows + ranges - 1) / ranges;
     std::vector<std::size_t> edge(ranges, kNone);   // last (LOCF) / first (NOCB) valid
@@ -3629,8 +3629,8 @@ auto eval_fill_forward(const ir::CallExpr& call, const Table& input, const Execu
                     // every row (+10%).
                     const auto valid = is_valid;
                     if (workers >= 2) {
-                        const std::size_t lead = fill_carry_ranges(in, dst, rows, valid,
-                                                                   workers, /*forward=*/true);
+                        const std::size_t lead =
+                            fill_carry_ranges(in, dst, rows, valid, workers, /*forward=*/true);
                         if (lead > 0) {
                             out_validity.emplace(rows, true);
                             for (std::size_t row = 0; row < lead; ++row) {
@@ -3738,8 +3738,8 @@ auto eval_fill_backward(const ir::CallExpr& call, const Table& input, const Exec
                     // every row (+10%).
                     const auto valid = is_valid;
                     if (workers >= 2) {
-                        const std::size_t trail = fill_carry_ranges(in, dst, rows, valid,
-                                                                    workers, /*forward=*/false);
+                        const std::size_t trail =
+                            fill_carry_ranges(in, dst, rows, valid, workers, /*forward=*/false);
                         if (trail < rows) {
                             out_validity.emplace(rows, true);
                             for (std::size_t row = trail; row < rows; ++row) {

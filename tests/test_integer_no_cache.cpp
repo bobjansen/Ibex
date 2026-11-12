@@ -142,42 +142,28 @@ TEST_CASE("native integer operators agree without a cached wide input",
     for (bool nulls : {false, true}) {
         auto wide = inputs(false, nulls);
         auto compact = inputs(true, nulls);
-        for (const char* query : {"t[filter v>=0];",
-                                  "t[filter v>g];",
-                                  "t[select {x=Float64(v)}];",
-                                  "t[filter v*2+g>=0];",
-                                  "t[select {s=sum(v), lo=min(v), hi=max(v), n=count(v)}];",
-                                  "t[select {s=sum(v), m=mean(v), d=std(v)}, by {g}];",
-                                  "t[select {s=sum(v)}, by {g,h}];",
-                                  "t[select {m=median(v), q=quantile(v,0.5)}, by {g}];",
-                                  "t[order v];",
-                                  "t[order v desc, head 3];",
-                                  "t[distinct {g,h}];",
-                                  "t[update {x=v+3000000000, y=v*v, z=abs(v)}];",
-                                  "t[update {x=lag(v,1), y=lead(v,1), z=cumsum(v)}];",
-                                  "t[update {x=coalesce(v,0)}];",
-                                  "t[select {x=coalesce(v,0)*coalesce(v,0)}];",
-                                  "rbind(t,t);",
-                                  "t[melt g];",
-                                  "t[melt {g,h}];",
-                                  "t[where v>0 update {v=42}];",
-                                  "t[where g==1 update {v=v+1}];",
-                                  "t[where is_null(v) update {v=42}];",
-                                  "t[update {x=lag(v,1)}, by {g}];",
-                                  "t[update {x=fill_forward(v), y=fill_backward(v)}];",
-                                  "t join r on g;",
-                                  "t left join r on g;",
-                                  "t outer join r on g;",
-                                  "t semi join r on g;",
-                                  "t anti join r on g;",
-                                  // Distinct counts hash Int keys; a left
-                                  // join counted by its unique left key is
-                                  // fused into LeftJoinCounter.
-                                  "t[select {c=count_distinct(v)}, by {g}];",
-                                  "t[select {c=count_distinct(v)}];",
-                                  "(r left join t on g)[select {c=count(v)}, by g];",
-                                  // Global corr/cov read both sides raw.
-                                  "t[select {r=corr(v, g), c=cov(v, h)}];"}) {
+        for (const char* query :
+             {"t[filter v>=0];", "t[filter v>g];", "t[select {x=Float64(v)}];",
+              "t[filter v*2+g>=0];", "t[select {s=sum(v), lo=min(v), hi=max(v), n=count(v)}];",
+              "t[select {s=sum(v), m=mean(v), d=std(v)}, by {g}];",
+              "t[select {s=sum(v)}, by {g,h}];",
+              "t[select {m=median(v), q=quantile(v,0.5)}, by {g}];", "t[order v];",
+              "t[order v desc, head 3];", "t[distinct {g,h}];",
+              "t[update {x=v+3000000000, y=v*v, z=abs(v)}];",
+              "t[update {x=lag(v,1), y=lead(v,1), z=cumsum(v)}];", "t[update {x=coalesce(v,0)}];",
+              "t[select {x=coalesce(v,0)*coalesce(v,0)}];", "rbind(t,t);", "t[melt g];",
+              "t[melt {g,h}];", "t[where v>0 update {v=42}];", "t[where g==1 update {v=v+1}];",
+              "t[where is_null(v) update {v=42}];", "t[update {x=lag(v,1)}, by {g}];",
+              "t[update {x=fill_forward(v), y=fill_backward(v)}];", "t join r on g;",
+              "t left join r on g;", "t outer join r on g;", "t semi join r on g;",
+              "t anti join r on g;",
+              // Distinct counts hash Int keys; a left
+              // join counted by its unique left key is
+              // fused into LeftJoinCounter.
+              "t[select {c=count_distinct(v)}, by {g}];", "t[select {c=count_distinct(v)}];",
+              "(r left join t on g)[select {c=count(v)}, by g];",
+              // Global corr/cov read both sides raw.
+              "t[select {r=corr(v, g), c=cov(v, h)}];"}) {
             DYNAMIC_SECTION(query << " nulls=" << nulls) {
                 CAPTURE(query, nulls);
                 auto parsed = ibex::parser::parse(query);
@@ -295,7 +281,8 @@ TEST_CASE("compact element-wise kernels agree past the streaming-widen threshold
                 wide.push_back(value);
             return wide;
         };
-        table.add_column("g", column([](std::size_t i) { return static_cast<std::int32_t>(i % 89); }));
+        table.add_column("g",
+                         column([](std::size_t i) { return static_cast<std::int32_t>(i % 89); }));
         table.add_column("v", column(value_at));
         ibex::runtime::ValidityBitmap validity(rows, true);
         for (std::size_t i = 0; i < rows; ++i)
@@ -328,10 +315,9 @@ TEST_CASE("compact element-wise kernels agree past the streaming-widen threshold
           "t[update {p=lag(v, 1)}];", "t[update {p=lag(v, 2)}];", "t[update {q=lead(v, 3)}];",
           "t[update {q=lead(v, 0)}];", "t[order {v}];",
           "t[update {p=lag(v, 1), q=lead(v, 3), r=lag(v, 0)}];",
-          "t[update {f=fill_forward(n), b=fill_backward(n)}];",
-          "t[select {v, w}][melt v];", "t[select {g, v, w}][melt g];",
-          "t[select {g, v, n}][melt g];", "t[order {v desc}, head 7];",
-          "t[order {v}, head 3, by g];"}) {
+          "t[update {f=fill_forward(n), b=fill_backward(n)}];", "t[select {v, w}][melt v];",
+          "t[select {g, v, w}][melt g];", "t[select {g, v, n}][melt g];",
+          "t[order {v desc}, head 7];", "t[order {v}, head 3, by g];"}) {
         DYNAMIC_SECTION(query) {
             auto expected = run(query, wide);
             auto actual = run(query, compact);

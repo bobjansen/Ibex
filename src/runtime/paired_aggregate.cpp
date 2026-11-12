@@ -105,12 +105,11 @@ auto pair_moment(const Column<X>& xs, const Column<Y>& ys, const ValidityBitmap*
         const std::size_t end = std::min(rows, begin + kPairBlockRows);
         with_physical_values(xs, [&](const auto* x_values) {
             with_physical_values(ys, [&](const auto* y_values) {
-                partial[block] =
-                    xv == nullptr && yv == nullptr
-                        ? pair_block<false>(x_values, y_values, xv, yv, begin, end, origin_x,
-                                            origin_y)
-                        : pair_block<true>(x_values, y_values, xv, yv, begin, end, origin_x,
-                                           origin_y);
+                partial[block] = xv == nullptr && yv == nullptr
+                                     ? pair_block<false>(x_values, y_values, xv, yv, begin, end,
+                                                         origin_x, origin_y)
+                                     : pair_block<true>(x_values, y_values, xv, yv, begin, end,
+                                                        origin_x, origin_y);
             });
         });
     };

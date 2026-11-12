@@ -104,9 +104,9 @@ auto release_arrow_stream(ArrowArrayStream* stream) noexcept -> void;
 /// On success, ownership is moved from `array` into the returned table and
 /// `array->release` is cleared. Int64 and double payloads remain in their Arrow
 /// buffers and detach on the first mutable Column access. Signed Int32
-/// buffers are also retained, with Int64 logical semantics. Other unsupported native-width layouts are copied. The schema is borrowed
-/// only for the duration of the call. On failure, `array` is left untouched and remains owned by
-/// the caller.
+/// buffers are also retained, with Int64 logical semantics. Other unsupported native-width layouts
+/// are copied. The schema is borrowed only for the duration of the call. On failure, `array` is
+/// left untouched and remains owned by the caller.
 [[nodiscard]] auto adopt_table_from_arrow(ArrowArray* array, const ArrowSchema& schema)
     -> std::expected<runtime::Table, std::string>;
 

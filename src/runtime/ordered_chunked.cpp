@@ -639,9 +639,8 @@ class ChunkedOrderedLimitOperator final : public Operator {
         // member-template instantiations reached through nested generic lambdas.
         if constexpr (std::is_same_v<T, std::int64_t>) {
             if (key_column.is_compact_int32()) {
-                return process_single_key_values(chunk, key_column,
-                                                 key_column.compact_int32_data(), ascending,
-                                                 group_key_cols, key_columns);
+                return process_single_key_values(chunk, key_column, key_column.compact_int32_data(),
+                                                 ascending, group_key_cols, key_columns);
             }
         }
         if constexpr (is_dense_column_v<Column<T>>) {

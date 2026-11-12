@@ -1235,35 +1235,35 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                     srcs[j] = measures[j]->data();
                 }
                 if constexpr (std::is_same_v<V, std::int64_t>) {
-                if (any_narrow) {
-                    // A compact Int32 measure is widened a block at a time
-                    // into scratch that stays in L1, then interleaved; widening
-                    // whole columns first cost melt +5%.
-                    constexpr std::size_t kBlock = 1024;
-                    for_rows([&](std::size_t begin, std::size_t end) {
-                        detail::NoInitVector<V> scratch(n_measures * kBlock);
-                        std::vector<const V*> block(n_measures);
-                        for (std::size_t at = begin; at < end; at += kBlock) {
-                            const std::size_t count = std::min(kBlock, end - at);
-                            for (std::size_t j = 0; j < n_measures; ++j) {
-                                if (narrow[j] == nullptr) {
-                                    block[j] = srcs[j] + at;
-                                    continue;
-                                }
-                                V* widened = scratch.data() + (j * kBlock);
-                                std::copy_n(narrow[j] + at, count, widened);
-                                block[j] = widened;
-                            }
-                            for (std::size_t r = 0; r < count; ++r) {
-                                V* out = dst + ((at + r) * n_measures);
+                    if (any_narrow) {
+                        // A compact Int32 measure is widened a block at a time
+                        // into scratch that stays in L1, then interleaved; widening
+                        // whole columns first cost melt +5%.
+                        constexpr std::size_t kBlock = 1024;
+                        for_rows([&](std::size_t begin, std::size_t end) {
+                            detail::NoInitVector<V> scratch(n_measures * kBlock);
+                            std::vector<const V*> block(n_measures);
+                            for (std::size_t at = begin; at < end; at += kBlock) {
+                                const std::size_t count = std::min(kBlock, end - at);
                                 for (std::size_t j = 0; j < n_measures; ++j) {
-                                    out[j] = block[j][r];
+                                    if (narrow[j] == nullptr) {
+                                        block[j] = srcs[j] + at;
+                                        continue;
+                                    }
+                                    V* widened = scratch.data() + (j * kBlock);
+                                    std::copy_n(narrow[j] + at, count, widened);
+                                    block[j] = widened;
+                                }
+                                for (std::size_t r = 0; r < count; ++r) {
+                                    V* out = dst + ((at + r) * n_measures);
+                                    for (std::size_t j = 0; j < n_measures; ++j) {
+                                        out[j] = block[j][r];
+                                    }
                                 }
                             }
-                        }
-                    });
-                    return out_col;
-                }
+                        });
+                        return out_col;
+                    }
                 }
                 with_measure_count([&]<std::size_t M>() {
                     const std::size_t m = M == 0 ? n_measures : M;

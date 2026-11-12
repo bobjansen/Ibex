@@ -1051,14 +1051,29 @@ class ChunkedOrderedLimitOperator final : public Operator {
             batch.wait();
         };
         const KeyCol& key0 = group_key_cols.front();
-        const auto int_key = [&key0](std::size_t row) -> std::int64_t {
+        // An Int64 key as a raw pointer, as before IntegerView: the view's
+        // per-row width test cost h2o q8 (top two by id6) ~5% at one core. A
+        // compact key is widened here once per chunk, this operation's own
+        // explicit widening, so only compact storage pays for it.
+        ::ibex::detail::NoInitVector<std::int64_t> widened_key;
+        const std::int64_t* key_i64 = nullptr;
+        if (key0.kind == KeyCol::Kind::Int64) {
+            key_i64 = key0.i64.wide_data();
+            if (key_i64 == nullptr) {
+                const auto* compact = static_cast<const std::int32_t*>(key0.i64.physical_data());
+                widened_key.resize(rows);
+                std::copy(compact, compact + rows, widened_key.begin());
+                key_i64 = widened_key.data();
+            }
+        }
+        const auto int_key = [&key0, key_i64](std::size_t row) -> std::int64_t {
             switch (key0.kind) {
                 case KeyCol::Kind::Date:
                     return key0.date[row].days;
                 case KeyCol::Kind::Ts:
                     return key0.ts[row].nanos;
                 default:
-                    return key0.i64[row];
+                    return key_i64[row];
             }
         };
         // Any fixed value: a null's partition only has to be the same in

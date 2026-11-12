@@ -216,6 +216,9 @@ TEST_CASE("compact integer keys and aggregates agree at one million rows",
         add(
             table, "v", [](std::size_t i) { return static_cast<std::int32_t>(i % 101) - 50; },
             rows);
+        add(
+            table, "h", [](std::size_t i) { return static_cast<std::int32_t>((i / 7) % 13); },
+            rows);
         add(lookup, "g", [](std::size_t i) { return static_cast<std::int32_t>(i); }, 997);
         add(lookup, "w", [](std::size_t i) { return static_cast<std::int32_t>(i * 2); }, 997);
         result.emplace("t", std::move(table));
@@ -227,7 +230,15 @@ TEST_CASE("compact integer keys and aggregates agree at one million rows",
          {"t[select {s=sum(v)}, by {g}];", "t[select {s=sum(v), m=mean(v), d=std(v)}, by {g}];",
           "t[filter v>=0][select {s=sum(v)}, by {g}];", "t[update {x=v*v+g}][select {s=sum(x)}];",
           "(t join r on g)[select {s=sum(v), n=count()}];",
-          "(t left join r on g)[select {n=count(w)}, by {g}];"}) {
+          "(t left join r on g)[select {n=count(w)}, by {g}];",
+          // The raw-pointer readers that replaced per-row IntegerView reads:
+          // grouped top-k by an Int64 key, the collect path's cells, the
+          // out-of-line Int64 accumulator and the single-int and pair keys.
+          "t[order {v desc}, head 2, by g];",
+          "t[select {md=median(v), q=quantile(v, 0.9)}, by {g}];",
+          "t[select {md=median(v), d=std(v)}, by {g, h}];",
+          "t[select {lo=min(v), hi=max(v), f=first(v), l=last(v)}, by {g}];",
+          "t[select {s=sum(v), m=mean(v)}, by {g, h}];"}) {
         DYNAMIC_SECTION(query) {
             auto parsed = ibex::parser::parse(query);
             REQUIRE(parsed.has_value());

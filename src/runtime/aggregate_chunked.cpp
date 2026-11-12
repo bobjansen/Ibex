@@ -7243,15 +7243,6 @@ class HashAggregateState final {
             const auto slot_for = [&](GidT g) -> AggSlotCore& {
                 return fs[(static_cast<std::size_t>(g) * n_aggs_) + agg_i];
             };
-            // Moment accumulators, laid out beside `base` and indexed the same
-            // way. A worker-private slot array needs a worker-private scratch
-            // to match, or two morsels would accumulate one group's variance
-            // into the same doubles.
-            const auto scratch_at = [&](GidT g) -> double* {
-                return scratch_base + (static_cast<std::size_t>(g) * scratch_stride_) +
-                       scratch_offset_[agg_i];
-            };
-
             if (plan_[agg_i].func == ir::AggFunc::Count) {
                 for (std::size_t row = begin; row < rows; ++row) {
                     slot_for(gids[row]).count++;

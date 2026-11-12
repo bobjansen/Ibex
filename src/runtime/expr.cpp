@@ -753,10 +753,12 @@ auto numeric_cast_kernel(const ir::CallExpr& call, const Table& input, std::size
         Column<double> out;
         out.resize(rows);
         auto* op = out.data();
-        const auto ip = ints->integer_view();
-        for (std::size_t i = 0; i < rows; ++i) {
-            op[i] = static_cast<double>(ip[i]);
-        }
+        // One width test, not IntegerView's per element: a vectorized loop.
+        with_physical_values(*ints, [&](const auto* ip) {
+            for (std::size_t i = 0; i < rows; ++i) {
+                op[i] = static_cast<double>(ip[i]);
+            }
+        });
         return ComputedColumn{.column = ColumnValue{std::move(out)},
                               .validity = std::move(out_validity)};
     }
@@ -3590,7 +3592,9 @@ auto eval_fill_forward(const ir::CallExpr& call, const Table& input, const Execu
                 // pointers on every row, because the store to the output may
                 // alias the members they read -- about twenty instructions and a
                 // spilled carry per row for one load, one bit test and one store.
-                const auto in = value_reader(col);
+                // IntegerView's per-row width test did the same for Int64.
+                ::ibex::detail::NoInitVector<T> widened;
+                const T* const in = contiguous_values(col, widened);
                 T* const dst = out.data();
                 const std::uint8_t* const bits = validity.buffer_data();
                 const std::size_t bit_base = validity.buffer_offset();
@@ -3694,7 +3698,8 @@ auto eval_fill_backward(const ir::CallExpr& call, const Table& input, const Exec
                 // storage resolved once; see eval_fill_forward.
                 ColT result;
                 ColumnAppender<ColT> out(result, rows);
-                const auto in = value_reader(col);
+                ::ibex::detail::NoInitVector<T> widened;
+                const T* const in = contiguous_values(col, widened);
                 T* const dst = out.data();
                 const std::uint8_t* const bits = validity.buffer_data();
                 const std::size_t bit_base = validity.buffer_offset();

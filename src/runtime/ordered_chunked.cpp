@@ -646,10 +646,14 @@ class ChunkedOrderedLimitOperator final : public Operator {
         // sitting in the loop CONDITION. `key_column[row]` likewise re-tests
         // for adopted (Arrow) storage on every element. Resolve both once.
         const std::size_t rows = chunk.rows();
-        std::conditional_t<std::is_same_v<T, std::int64_t>, IntegerView, const T*> key_values =
-            nullptr;
+        // An Int64 key through IntegerView tested its width per element too;
+        // a compact one is widened once instead. (The bit-packed `bool`
+        // instantiation never fills it.)
+        // NOLINTNEXTLINE(misc-const-correctness)
+        ::ibex::detail::NoInitVector<T> widened_sort_key;
+        const T* key_values = nullptr;
         if constexpr (is_dense_column_v<Column<T>>) {
-            key_values = value_reader(key_column);
+            key_values = contiguous_values(key_column, widened_sort_key);
         }
         // `Column<bool>` is bit-packed and has no dense buffer, so it keeps the
         // indexed read. Every T reaching here is trivially copyable.

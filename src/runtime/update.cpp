@@ -2408,7 +2408,8 @@ auto grouped_shift_by_rows(const NativeGroupedOrderedCall& ordered, const Column
             const Column<T>& values) -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
         Column<T> result;
         result.resize_for_overwrite(rows);
-        const auto in = value_reader(values);
+        ::ibex::detail::NoInitVector<T> widened;  // only for a compact Int64 input
+        const T* const in = contiguous_values(values, widened);
         T* const out = result.data();
         const std::uint32_t* const gid = row_gid.data();
         ValidityBitmap valid(rows, true);

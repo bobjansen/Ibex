@@ -57,6 +57,25 @@ decltype(auto) with_physical_values(const Column<T>& column, Body&& body) {
     return body(column.data());
 }
 
+/// A raw `const T*` over `column`'s values for a long kernel that is not
+/// worth compiling per width: the column's own buffer, or for a compact Int64
+/// column a copy widened once into `scratch` (the operation's own explicit
+/// widening, so only compact storage pays for it). `scratch` must outlive the
+/// pointer.
+template <typename T>
+[[nodiscard]] auto contiguous_values(const Column<T>& column,
+                                     ::ibex::detail::NoInitVector<T>& scratch) -> const T* {
+    if constexpr (std::is_same_v<T, std::int64_t>) {
+        if (column.is_compact_int32()) {
+            const auto* compact = column.compact_int32_data();
+            scratch.resize(column.size());
+            std::copy(compact, compact + column.size(), scratch.begin());
+            return scratch.data();
+        }
+    }
+    return column.data();
+}
+
 /// The same for a reader already resolved to an `IntegerView`.
 template <typename Body>
 decltype(auto) with_physical_values(IntegerView view, Body&& body) {

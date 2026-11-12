@@ -728,14 +728,16 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, std::size_t of
     }
 
     if (const auto* int_col = std::get_if<Column<std::int64_t>>(&col)) {
-        const auto cp = int_col->integer_view() + off;
+        // A raw pointer per width, not IntegerView's per-element width test.
         if (const auto* i = std::get_if<std::int64_t>(&lit)) {
-            cmp_col_scalar_into(op, cp, *i, mp, n);
+            with_physical_values(
+                *int_col, [&](const auto* cp) { cmp_col_scalar_into(op, cp + off, *i, mp, n); });
             result.apply_validity(validity, off, n);
             return result;
         }
         if (const auto* d = std::get_if<double>(&lit)) {
-            cmp_col_scalar_into(op, cp, *d, mp, n);
+            with_physical_values(
+                *int_col, [&](const auto* cp) { cmp_col_scalar_into(op, cp + off, *d, mp, n); });
             result.apply_validity(validity, off, n);
             return result;
         }
@@ -871,7 +873,12 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, std::size_t lhs_off,
     }
     if (const auto* l = std::get_if<Column<std::int64_t>>(&lhs)) {
         if (const auto* r = std::get_if<Column<std::int64_t>>(&rhs)) {
-            cmp_into(op, value_reader(*l) + lhs_off, value_reader(*r) + rhs_off, mp, n);
+            // Raw pointers, one width test per side: through IntegerView the
+            // per-element width tests kept cmp_into from vectorizing.
+            with_physical_values(*l, [&](const auto* lp) {
+                with_physical_values(
+                    *r, [&](const auto* rp) { cmp_into(op, lp + lhs_off, rp + rhs_off, mp, n); });
+            });
             {
                 auto merged_v = merge_validity(lv, lhs_off, rv, rhs_off, n);
                 result.apply_validity(merged_v ? &*merged_v : nullptr, 0, n);
@@ -879,7 +886,9 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, std::size_t lhs_off,
             }
         }
         if (const auto* r = std::get_if<Column<double>>(&rhs)) {
-            cmp_into(op, value_reader(*l) + lhs_off, value_reader(*r) + rhs_off, mp, n);
+            with_physical_values(*l, [&](const auto* lp) {
+                cmp_into(op, lp + lhs_off, r->data() + rhs_off, mp, n);
+            });
             {
                 auto merged_v = merge_validity(lv, lhs_off, rv, rhs_off, n);
                 result.apply_validity(merged_v ? &*merged_v : nullptr, 0, n);
@@ -897,7 +906,9 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, std::size_t lhs_off,
             }
         }
         if (const auto* r = std::get_if<Column<std::int64_t>>(&rhs)) {
-            cmp_into(op, value_reader(*l) + lhs_off, value_reader(*r) + rhs_off, mp, n);
+            with_physical_values(*r, [&](const auto* rp) {
+                cmp_into(op, l->data() + lhs_off, rp + rhs_off, mp, n);
+            });
             {
                 auto merged_v = merge_validity(lv, lhs_off, rv, rhs_off, n);
                 result.apply_validity(merged_v ? &*merged_v : nullptr, 0, n);

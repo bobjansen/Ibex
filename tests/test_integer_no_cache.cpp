@@ -238,7 +238,11 @@ TEST_CASE("compact integer keys and aggregates agree at one million rows",
           "t[select {md=median(v), q=quantile(v, 0.9)}, by {g}];",
           "t[select {md=median(v), d=std(v)}, by {g, h}];",
           "t[select {lo=min(v), hi=max(v), f=first(v), l=last(v)}, by {g}];",
-          "t[select {s=sum(v), m=mean(v)}, by {g, h}];"}) {
+          "t[select {s=sum(v), m=mean(v)}, by {g, h}];",
+          // ... and the column-vs-column filter, cast, Int64 sort-key top-k,
+          // grouped lag and single-Int64-key outer join.
+          "t[filter v > h];", "t[update {d=Float64(v)}];", "t[order {v desc}, head 5];",
+          "t[update {p=lag(v, 1)}, by g];", "t outer join r on g;"}) {
         DYNAMIC_SECTION(query) {
             auto parsed = ibex::parser::parse(query);
             REQUIRE(parsed.has_value());

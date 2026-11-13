@@ -3407,3 +3407,135 @@ TEST_CASE("semi and anti join: a parallel probe keeps exactly the matching rows"
         }
     }
 }
+
+TEST_CASE("integer key joins agree with the general path on dense, sparse and compact keys",
+          "[join][int][compact]") {
+    // The single-Int key path probes a direct-address gid table when the build
+    // keys fill their range, a hash map otherwise, and reads a compact Int32
+    // probe key at its own width. Keys with an all-valid bitmap take the
+    // general null-aware path instead, an independent oracle for every shape:
+    // keys below and above the dense range, negatives, sparse keys, duplicate
+    // build keys, a build on the left, and compact storage on either side.
+    struct Shape {
+        const char* name;
+        std::size_t left_rows;
+        std::size_t right_rows;
+        std::int64_t right_scale;  // right key i -> (i % distinct) * scale - offset
+        std::size_t right_distinct;
+    };
+    const std::vector<Shape> shapes{
+        {.name = "dense unique",
+         .left_rows = 20'000,
+         .right_rows = 1'000,
+         .right_scale = 1,
+         .right_distinct = 1'000},
+        {.name = "sparse unique",
+         .left_rows = 20'000,
+         .right_rows = 1'000,
+         .right_scale = 1'000'003,
+         .right_distinct = 1'000},
+        {.name = "dense duplicates",
+         .left_rows = 20'000,
+         .right_rows = 3'000,
+         .right_scale = 1,
+         .right_distinct = 1'000},
+        {.name = "build left",
+         .left_rows = 500,
+         .right_rows = 20'000,
+         .right_scale = 1,
+         .right_distinct = 1'200},
+    };
+    const auto keys_of = [](std::size_t rows, auto key_at, bool compact) {
+        if (compact) {
+            ::ibex::detail::NoInitVector<std::int32_t> narrow(rows);
+            for (std::size_t i = 0; i < rows; ++i) {
+                narrow[i] = static_cast<std::int32_t>(key_at(i));
+            }
+            return Column<std::int64_t>::from_compact_int32(std::move(narrow));
+        }
+        Column<std::int64_t> wide;
+        for (std::size_t i = 0; i < rows; ++i) {
+            wide.push_back(key_at(i));
+        }
+        return wide;
+    };
+    for (const auto& shape : shapes) {
+        const std::int64_t offset = 50;
+        const auto right_key = [&](std::size_t i) {
+            return (static_cast<std::int64_t>(i % shape.right_distinct) * shape.right_scale) -
+                   offset;
+        };
+        // Left keys reach below and above the right's range, and every right
+        // key, so matched and unmatched rows both occur.
+        const auto left_key = [&](std::size_t i) {
+            const auto span = static_cast<std::int64_t>(shape.right_distinct) + 120;
+            return ((static_cast<std::int64_t>((i * 7919) % static_cast<std::size_t>(span)) - 60) *
+                    shape.right_scale) -
+                   offset;
+        };
+        Column<std::int64_t> lv;
+        Column<std::int64_t> rv;
+        for (std::size_t i = 0; i < shape.left_rows; ++i) {
+            lv.push_back(static_cast<std::int64_t>(i));
+        }
+        for (std::size_t i = 0; i < shape.right_rows; ++i) {
+            rv.push_back(static_cast<std::int64_t>(i * 3));
+        }
+        for (const bool compact_left : {false, true}) {
+            for (const bool compact_right : {false, true}) {
+                runtime::Table left;
+                runtime::Table right;
+                runtime::Table general_left;
+                left.add_column("k", keys_of(shape.left_rows, left_key, compact_left));
+                left.add_column("lv", lv);
+                right.add_column("k", keys_of(shape.right_rows, right_key, compact_right));
+                right.add_column("rv", rv);
+                general_left.add_column("k", keys_of(shape.left_rows, left_key, false),
+                                        runtime::ValidityBitmap(shape.left_rows, true));
+                general_left.add_column("lv", lv);
+                runtime::TableRegistry tables{{"l", left}, {"r", right}, {"g", general_left}};
+                for (const std::string kind : {"left join", "outer join", "right join"}) {
+                    INFO(shape.name << " " << kind << " compact_left=" << compact_left
+                                    << " compact_right=" << compact_right);
+                    const auto run = [&](const std::string& lhs) {
+                        std::string source = lhs;
+                        source += " ";
+                        source += kind;
+                        source += " r on k;";
+                        auto parsed = parser::parse(source);
+                        REQUIRE(parsed.has_value());
+                        auto lowered = parser::lower(*parsed);
+                        REQUIRE(lowered.has_value());
+                        runtime::ExecutionContext exec;
+                        exec.parallel_threads = 4;
+                        auto out =
+                            runtime::interpret(**lowered, tables, nullptr, nullptr, nullptr, exec);
+                        REQUIRE(out.has_value());
+                        return std::move(*out);
+                    };
+                    const auto expected = run("g");
+                    const auto actual = run("l");
+                    // Cell values and null flags; how validity is stored
+                    // (the oracle's key always carries a bitmap) is not
+                    // part of the answer.
+                    const auto cells = [](const runtime::Table& t) {
+                        std::vector<std::optional<std::int64_t>> out;
+                        for (const std::string name : {"k", "lv", "rv"}) {
+                            const auto* entry = t.find_entry(name);
+                            REQUIRE(entry != nullptr);
+                            const auto& values = std::get<Column<std::int64_t>>(*entry->column);
+                            for (std::size_t row = 0; row < t.rows(); ++row) {
+                                out.push_back(runtime::is_null(*entry, row)
+                                                  ? std::nullopt
+                                                  : std::optional<std::int64_t>{values[row]});
+                            }
+                        }
+                        return out;
+                    };
+                    CHECK(actual.rows() == expected.rows());
+                    CHECK(cells(actual) == cells(expected));
+                }
+            }
+        }
+    }
+}

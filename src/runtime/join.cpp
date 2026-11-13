@@ -18,6 +18,7 @@
 #include <cstring>
 #include <expected>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <robin_hood.h>
 #include <span>
@@ -1707,17 +1708,17 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         std::holds_alternative<Column<std::int64_t>>(*left_keys[0])) {
         const auto& left_ints = std::get<Column<std::int64_t>>(*left_keys[0]);
         const auto& right_ints = std::get<Column<std::int64_t>>(*right_keys[0]);
-
-        // Raw key buffers, resolved once: through IntegerView every build and
-        // probe read tested the width (left join +9% at one core). A compact
-        // key is widened once into its scratch.
-        ::ibex::detail::NoInitVector<std::int64_t> left_widened;
-        ::ibex::detail::NoInitVector<std::int64_t> right_widened;
-        const std::int64_t* const left_data = contiguous_values(left_ints, left_widened);
-        const std::int64_t* const right_data = contiguous_values(right_ints, right_widened);
-        // Which side is indexed was decided once, above.
-        const std::int64_t* const build_data = build_left ? left_data : right_data;
+        // Which side is indexed was decided once, above; the other is probed.
+        const auto& probe_ints = build_left ? right_ints : left_ints;
         const std::size_t n_build = build_left ? n_left : n_right;
+
+        // Raw build keys, resolved once: through IntegerView every read tested
+        // the width (left join +9% at one core). A compact build key is
+        // widened into its scratch; the probe side is read at its own width
+        // below, so a compact probe key is never widened.
+        ::ibex::detail::NoInitVector<std::int64_t> build_widened;
+        const std::int64_t* const build_data =
+            contiguous_values(build_left ? left_ints : right_ints, build_widened);
 
         robin_hood::unordered_map<std::int64_t, std::uint32_t> key_gid;
         key_gid.reserve(n_build);
@@ -1728,88 +1729,128 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             n_groups += inserted ? 1U : 0U;
             row_gid[i] = it->second;
         }
-        if (kind == ir::JoinKind::Outer && !build_left && n_groups == n_build) {
-            // Unique right keys give exactly one output slot per left row.
-            // In insertion order the gid is already the right row number:
-            // no CSR indirection, growing worker vectors, or merge is needed.
-            std::vector<std::size_t> li;
-            std::vector<std::size_t> ri;
-            li.reserve(n_left + n_right);
-            ri.reserve(n_left + n_right);
-            li.resize(n_left);
-            ri.resize(n_left);
-            const std::int64_t* const probe_data = left_data;
-            const auto scan = [&](std::size_t begin, std::size_t end) {
-                for (std::size_t l = begin; l < end; ++l) {
-                    const auto it = key_gid.find(probe_data[l]);
-                    li[l] = l;
-                    ri[l] = it == key_gid.end() ? kNull : it->second;
+
+        // A direct-address gid table when the build keys fill enough of their
+        // range: a probe row is then a bounds check and one load instead of a
+        // hash. h2o's left join (10M rows onto 1e4 keys `id2` = 1..1e4) spent
+        // 60% of its 54 ms in the map probe. At most four slots per key, so
+        // the table stays about the size of the map it shadows.
+        std::vector<std::uint32_t> dense_gid;
+        std::int64_t dense_lo = 0;
+        if (n_groups > 0) {
+            std::int64_t lo = std::numeric_limits<std::int64_t>::max();
+            std::int64_t hi = std::numeric_limits<std::int64_t>::min();
+            for (const auto& entry : key_gid) {
+                lo = std::min(lo, entry.first);
+                hi = std::max(hi, entry.first);
+            }
+            const std::uint64_t span =
+                static_cast<std::uint64_t>(hi) - static_cast<std::uint64_t>(lo);
+            if (span < (std::uint64_t{1} << 27) && span < (std::uint64_t{4} * n_groups) + 1024) {
+                dense_gid.assign(static_cast<std::size_t>(span) + 1, kNoGroup);
+                dense_lo = lo;
+                for (const auto& entry : key_gid) {
+                    dense_gid[static_cast<std::size_t>(static_cast<std::uint64_t>(entry.first) -
+                                                       static_cast<std::uint64_t>(lo))] =
+                        entry.second;
                 }
+            }
+        }
+
+        // `probe_gid(row)` is the probe side's row's build gid, or kNoGroup.
+        const auto run_probe = [&](const auto& probe_gid) -> std::expected<Table, std::string> {
+            if (kind == ir::JoinKind::Outer && !build_left && n_groups == n_build) {
+                // Unique right keys give exactly one output slot per left row.
+                // In insertion order the gid is already the right row number:
+                // no CSR indirection, growing worker vectors, or merge is needed.
+                std::vector<std::size_t> li;
+                std::vector<std::size_t> ri;
+                li.reserve(n_left + n_right);
+                ri.reserve(n_left + n_right);
+                li.resize(n_left);
+                ri.resize(n_left);
+                const auto scan = [&](std::size_t begin, std::size_t end) {
+                    for (std::size_t l = begin; l < end; ++l) {
+                        const std::uint32_t gid = probe_gid(l);
+                        li[l] = l;
+                        ri[l] = gid == kNoGroup ? kNull : std::size_t{gid};
+                    }
+                };
+                const std::size_t workers = probe_workers(n_left);
+                if (workers == 0) {
+                    scan(0, n_left);
+                } else {
+                    auto& pool = process_worker_pool();
+                    const std::size_t grain = (n_left + workers - 1) / workers;
+                    auto batch = pool.submit(workers, [&](std::size_t w) {
+                        const std::size_t begin = w * grain;
+                        scan(begin, std::min(n_left, begin + grain));
+                    });
+                    batch.wait();
+                    if (exec->parallel_stats != nullptr) {
+                        exec->parallel_stats->parallel_probes.fetch_add(1,
+                                                                        std::memory_order_relaxed);
+                    }
+                }
+                // Mark from the completed row indices rather than having all
+                // workers contend on the same right-side match bitmap.
+                std::vector<std::uint8_t> matched(n_right, 0U);
+                for (const std::size_t r : ri) {
+                    if (r != kNull) {
+                        matched[r] = 1U;
+                    }
+                }
+                for (std::size_t r = 0; r < n_right; ++r) {
+                    if (matched[r] == 0U) {
+                        li.push_back(kNull);
+                        ri.push_back(r);
+                    }
+                }
+                materialize(li, ri);
+                return join_failure(output);
+            }
+
+            const GroupedRows grouped = group_rows_csr(row_gid, n_groups);
+            auto lookup = [&](std::size_t row) -> std::span<const std::size_t> {
+                const std::uint32_t gid = probe_gid(row);
+                return gid == kNoGroup ? std::span<const std::size_t>{} : grouped.matches(gid);
             };
-            const std::size_t workers = probe_workers(n_left);
-            if (workers == 0) {
-                scan(0, n_left);
-            } else {
-                auto& pool = process_worker_pool();
-                const std::size_t grain = (n_left + workers - 1) / workers;
-                auto batch = pool.submit(workers, [&](std::size_t w) {
-                    const std::size_t begin = w * grain;
-                    scan(begin, std::min(n_left, begin + grain));
+
+            if (build_left) {
+                auto [li, ri] = build_indices_from_right_scan(lookup);
+                materialize(li, ri);
+                return join_failure(output);
+            }
+
+            if (preserve_left_only && grouped.unique()) {
+                probe_left_identity([&](std::size_t l) {
+                    const std::uint32_t gid = probe_gid(l);
+                    return gid == kNoGroup ? kNull : grouped.rows[grouped.offsets[gid]];
                 });
-                batch.wait();
-                if (exec->parallel_stats != nullptr) {
-                    exec->parallel_stats->parallel_probes.fetch_add(1, std::memory_order_relaxed);
-                }
+                return join_failure(output);
             }
-            // Mark from the completed row indices rather than having all
-            // workers contend on the same right-side match bitmap.
-            std::vector<std::uint8_t> matched(n_right, 0U);
-            for (const std::size_t r : ri) {
-                if (r != kNull) {
-                    matched[r] = 1U;
-                }
-            }
-            for (std::size_t r = 0; r < n_right; ++r) {
-                if (matched[r] == 0U) {
-                    li.push_back(kNull);
-                    ri.push_back(r);
-                }
-            }
+
+            auto [li, ri] = build_indices_from_left_scan(lookup);
             materialize(li, ri);
             return join_failure(output);
-        }
-
-        const GroupedRows grouped = group_rows_csr(row_gid, n_groups);
-
-        if (build_left) {
-            const std::int64_t* const probe_data = right_data;
-            auto lookup = [&](std::size_t r) -> std::span<const std::size_t> {
-                auto it = key_gid.find(probe_data[r]);
-                return it == key_gid.end() ? std::span<const std::size_t>{}
-                                           : grouped.matches(it->second);
-            };
-            auto [li, ri] = build_indices_from_right_scan(lookup);
-            materialize(li, ri);
-            return join_failure(output);
-        }
-
-        const std::int64_t* const probe_data = left_data;
-        if (preserve_left_only && grouped.unique()) {
-            probe_left_identity([&](std::size_t l) {
-                auto it = key_gid.find(probe_data[l]);
-                return it == key_gid.end() ? kNull : grouped.rows[grouped.offsets[it->second]];
-            });
-            return join_failure(output);
-        }
-
-        auto lookup = [&](std::size_t l) -> std::span<const std::size_t> {
-            auto it = key_gid.find(probe_data[l]);
-            return it == key_gid.end() ? std::span<const std::size_t>{}
-                                       : grouped.matches(it->second);
         };
-        auto [li, ri] = build_indices_from_left_scan(lookup);
-        materialize(li, ri);
-        return join_failure(output);
+
+        return with_physical_values(probe_ints, [&](const auto* const probe) {
+            if (!dense_gid.empty()) {
+                const std::uint32_t* const table = dense_gid.data();
+                const std::uint64_t slots = dense_gid.size();
+                const auto lo = static_cast<std::uint64_t>(dense_lo);
+                return run_probe([table, slots, lo, probe](std::size_t row) -> std::uint32_t {
+                    const std::uint64_t at =
+                        static_cast<std::uint64_t>(static_cast<std::int64_t>(probe[row])) - lo;
+                    return at < slots ? table[at] : kNoGroup;
+                });
+            }
+            return run_probe([&key_gid, probe](std::size_t row) -> std::uint32_t {
+                const auto it = key_gid.find(static_cast<std::int64_t>(probe[row]));
+                return it == key_gid.end() ? kNoGroup : it->second;
+            });
+        });
     }
 
     // ── Asof join ────────────────────────────────────────────────────────

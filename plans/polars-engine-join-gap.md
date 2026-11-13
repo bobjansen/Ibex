@@ -1,6 +1,6 @@
 # IbexEngine join gap
 
-Status: open, 2026-11-10. Compacted from the working diary; the full version
+Status: open, 2026-11-10; q3 fixed 2026-11-13. Compacted from the working diary; the full version
 (every profile, prototype and paired table) is
 `git show ed7fd554:plans/polars-engine-join-gap.md`. Raw outputs are local,
 under `benchmarking/results/local/` (named in that version).
@@ -16,15 +16,16 @@ already ahead there (gm 0.93× at 8 cores, 0.88× at 1 core).
 
 ## Where it stands (i7-13700, 3.2 GHz locked, `IBEX_COMPACT_INT32=1`)
 
-Ibex/Polars streaming, median of paired ratios, at `ed7fd554`:
+Ibex/Polars streaming, median of paired ratios, at `ed7fd554` and after the
+2026-11-13 dense left-join probe:
 
-| | 8 threads | 1 thread |
-|---|---:|---:|
-| q1 small inner on int | 1.24 | 0.83 |
-| q2 medium inner on int | 1.35 | 0.91 |
-| q3 medium outer (left) on int | 1.43 | 1.19 |
-| q4 medium inner on factor | 1.24 | 0.75 |
-| q5 big inner on int | 0.88 | 0.47 |
+| | 8 threads | 1 thread | 8t 11-13 | 1t 11-13 |
+|---|---:|---:|---:|---:|
+| q1 small inner on int | 1.24 | 0.83 | 1.23 | 0.79 |
+| q2 medium inner on int | 1.35 | 0.91 | 1.36 | 0.89 |
+| q3 medium outer (left) on int | 1.43 | 1.19 | 0.92 | 0.75 |
+| q4 medium inner on factor | 1.24 | 0.75 | 1.26 | 0.77 |
+| q5 big inner on int | 0.88 | 0.47 | 0.83 | 0.47 |
 
 On the morning of 2026-11-10 (`f1208c16`, compact off) the 8-thread ratios
 were 2.9–3.4× (q5 1.5×). With compact off, the first two steps below still
@@ -72,6 +73,19 @@ apply (8t q1 1.29×, q3 1.86×, q5 0.99× at `75a7c840`).
   Polars ids; they return as ids and need only `cat.to`. The serial sentinel
   gather now keeps compact payloads compact.
 
+- **Dense left-join probe** (2026-11-13): q3 is the one left join, and
+  left joins never stream (`plan_join` declines them as `UnsupportedKind`),
+  so it ran `join_table_impl`'s single-Int path. That path widened the
+  compact 10M-row probe key serially and probed a robin_hood map per row:
+  54 of q3's 55 ms native, the export under 1 ms. It now probes a
+  direct-address gid table when the build keys fill their range (at most
+  four slots per key) and reads the probe key at its own width. Native q3 at
+  8t 50 → 26 ms; Ibex/Polars at `bench_join_gap.py` 8t 1.52 → 0.92, 1t
+  1.18 → 0.75; q1/q2/q4/q5 unchanged. Native PDS-H A/B: gm 0.996 (8c),
+  0.989 (1c), nothing worse than 3%. Adapter PDS-H A/B (IbexEngine, two
+  bridges alternated, all 22 answers checked): Ibex gm 0.998 (8c), 1.001
+  (1c), Polars streaming flat in both arms; neutral.
+
 ## Measured dead ends (details in the diary version)
 
 - Gathering only the Categorical columns by row number: q1 170 → 390 ms.
@@ -90,8 +104,11 @@ apply (8t q1 1.29×, q3 1.86×, q5 0.99× at `75a7c840`).
    is tiny could rebuild from right row numbers, measured ~16 ms per 9M rows,
    about the same as validation for a small mapping).
 2. **Float32 payloads still widen** on import and narrow on export.
-3. **The id path needs compact on.** Flipping compact to the default is its
-   own gate (`plans/README.md`, retired native-int32 entry).
+3. **Left joins do not stream.** The dense probe fixed q3's probe cost, but
+   the whole-table path still materializes both inputs and gathers in one
+   pass. A streaming left-join operator is the structural fix.
+
+Compact Int32 became the default on 2026-11-12, so the id path is always on.
 4. **Same cause elsewhere:** h2o groupby q10 (~10M result groups) and the K=2
    q3/q7 groupbys; q6 is slow for an unrelated reason (NaN-safe median over a
    computed expression takes a slow native path).

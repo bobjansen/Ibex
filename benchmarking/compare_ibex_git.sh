@@ -174,7 +174,7 @@ if [[ -n "$IBEX_SUITE" ]]; then
         tok="${tok//[[:space:]]/}"
         tok="${tok,,}"
         tok="${tok//-/_}"
-        if [[ "$tok" != "merge_validity" && "$tok" != "rng_micro" ]]; then
+        if [[ "$tok" != "merge_validity" && "$tok" != "rng_micro" && "$tok" != "parquet" ]]; then
             NEEDS_CSV=1
             break
         fi
@@ -337,7 +337,7 @@ build_key() {
         echo "repo=$GIT_COMMON_DIR"
         echo "cc=$(command -v "$cc" || echo "$cc"): $("$cc" --version 2>/dev/null | head -1)"
         echo "cxx=$(command -v "$cxx" || echo "$cxx"): $("$cxx" --version 2>/dev/null | head -1)"
-        echo "generator=Ninja type=Release march_native=ON lightgbm=OFF parquet=OFF python_bridge=OFF"
+        echo "generator=Ninja type=Release march_native=ON lightgbm=OFF parquet=ON python_bridge=OFF"
         echo "prefix_map=$PREFIX_MAP_ENABLED"
         echo "src=$src_dir"
         echo "build=$build_dir"
@@ -379,7 +379,7 @@ ensure_build() {
             -DCMAKE_BUILD_TYPE=Release \
             -DIBEX_ENABLE_MARCH_NATIVE=ON \
             -DIBEX_BUILD_LIGHTGBM=OFF \
-            -DIBEX_BUILD_PARQUET=OFF \
+            -DIBEX_BUILD_PARQUET=ON \
             -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
             "${canonical_path_args[@]}" >"$log_file" 2>&1; then
             cat "$log_file" >&2

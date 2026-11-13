@@ -133,6 +133,18 @@ if(TARGET Ibex::Sanitizers)
     target_link_libraries(ibex_bench PRIVATE Ibex::Sanitizers)
 endif()
 
+# The `parquet` suite (ibex_bench_parquet.cpp): synthetic Parquet files run
+# through the same session path IbexEngine uses. Built only with the bundled
+# backend; without it `--suite parquet` reports that it is unavailable.
+if(TARGET Ibex::parquet)
+    target_sources(ibex_bench PRIVATE ibex_bench_parquet.cpp)
+    target_include_directories(ibex_bench SYSTEM PRIVATE
+        $<TARGET_PROPERTY:ibex_parquet,INCLUDE_DIRECTORIES>)
+    target_link_libraries(ibex_bench PRIVATE Ibex::parquet Ibex::repl parquet_shared arrow_shared)
+    target_compile_definitions(ibex_bench PRIVATE IBEX_HAS_PARQUET_BACKEND=1
+        $<TARGET_PROPERTY:ibex_parquet,COMPILE_DEFINITIONS>)
+endif()
+
 install(TARGETS ibex_bench
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
 )

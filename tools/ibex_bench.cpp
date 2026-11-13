@@ -59,6 +59,10 @@ const char* malloc_conf = "dirty_decay_ms:-1,muzzy_decay_ms:-1";
 #include <immintrin.h>
 #endif
 
+#ifdef IBEX_HAS_PARQUET_BACKEND
+#include "ibex_bench_parquet.hpp"
+#endif
+
 namespace {
 
 auto normalize_input(std::string_view input) -> std::string {
@@ -1848,6 +1852,56 @@ auto write_answer_digests() -> void {
     }
 }
 
+#ifdef IBEX_HAS_PARQUET_BACKEND
+/// One `parquet` suite query: a fresh session per iteration, timing parse,
+/// planning, the scans and the result. The files stay in the page cache, and
+/// the footer cache persists across iterations as it does across collects.
+auto run_parquet_benchmark(const ibex::bench_parquet::BenchQuery& query, std::size_t warmup_iters,
+                           std::size_t iters) -> int {
+    for (std::size_t i = 0; i < warmup_iters; ++i) {
+        if (auto result = ibex::bench_parquet::run_query(query); !result) {
+            ibex::formatting::print("error: {} failed: {}\n", query.name, result.error());
+            return 1;
+        }
+    }
+    std::size_t last_rows = 0;
+    double peak_mb = 0.0;
+    begin_peak_rss_window();
+    std::vector<double> times(iters);
+    for (std::size_t i = 0; i < iters; ++i) {
+        auto t0 = std::chrono::steady_clock::now();
+        auto result = ibex::bench_parquet::run_query(query);
+        auto t1 = std::chrono::steady_clock::now();
+        if (!result) {
+            ibex::formatting::print("error: {} failed: {}\n", query.name, result.error());
+            return 1;
+        }
+        last_rows = result->rows();
+        times[i] =
+            std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(t1 - t0).count();
+        if (i + 1 == iters) {
+            peak_mb = peak_rss_mb();
+            record_answer_digest(query.name, *result);
+        }
+    }
+    auto s = compute_stats(std::move(times));
+    print_bench_line(query.name, iters, s, last_rows, peak_mb);
+    return 0;
+}
+
+/// `--parquet-dir` default: persistent, because the files take seconds to
+/// write and /tmp may be RAM.
+auto default_parquet_bench_dir() -> std::string {
+    if (const char* cache = std::getenv("XDG_CACHE_HOME"); cache != nullptr && cache[0] != '\0') {
+        return (std::filesystem::path(cache) / "ibex" / "bench-parquet").string();
+    }
+    if (const char* home = std::getenv("HOME"); home != nullptr && home[0] != '\0') {
+        return (std::filesystem::path(home) / ".cache" / "ibex" / "bench-parquet").string();
+    }
+    return (std::filesystem::temp_directory_path() / "ibex-bench-parquet").string();
+}
+#endif
+
 auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& tables,
                    std::size_t warmup_iters, std::size_t iters, bool include_parse,
                    const ScanPaths& scan_paths = {}) -> int {
@@ -2052,6 +2106,8 @@ int main(int argc, char** argv) {
     std::size_t bool_rows = 4'000'000;
     std::size_t decimal_rows = 4'000'000;
     std::size_t filter_micro_rows = 0;
+    std::size_t parquet_rows = 16'000'000;
+    std::string parquet_dir;
     std::vector<std::string> suites;
 
     app.add_option("--csv", csv_path, "CSV file path (symbol, price)")->check(CLI::ExistingFile);
@@ -2112,12 +2168,20 @@ int main(int argc, char** argv) {
         ->check(CLI::NonNegativeNumber);
     app.add_option("--decimal-rows", decimal_rows,
                    "Rows for the decimal micro benchmarks (Int64 vs Float64 vs Decimal)");
+    app.add_option("--parquet-rows", parquet_rows,
+                   "Fact rows for the parquet suite (default: 16000000); its dimension has "
+                   "a thirtieth as many")
+        ->check(CLI::PositiveNumber);
+    app.add_option("--parquet-dir", parquet_dir,
+                   "Where the parquet suite writes and reuses its files "
+                   "(default: $XDG_CACHE_HOME or ~/.cache, ibex/bench-parquet)");
     app.add_option("--suite", suites,
                    "Benchmark suite(s) to run (comma-separated or repeated). "
                    "Supported: all, core, cumulative, sort, window, groupagg, pipeline, join, "
                    "rng, fill, null, filter, multi, "
                    "events, reshape, timeframe, transform, stats, scalar, merge_validity, "
-                   "rng_micro, bool, filter_micro")
+                   "rng_micro, bool, filter_micro, decimal, parquet (micro suites and parquet "
+                   "run only when named)")
         ->delimiter(',');
 
     CLI11_PARSE(app, argc, argv);
@@ -2128,10 +2192,11 @@ int main(int argc, char** argv) {
 
     std::unordered_set<std::string> selected_suites;
     const std::unordered_set<std::string> allowed_suites = {
-        "all",      "core",         "cumulative", "sort",      "window",         "groupagg",
-        "pipeline", "join",         "rng",        "fill",      "null",           "filter",
-        "multi",    "events",       "reshape",    "timeframe", "merge_validity", "rng_micro",
-        "bool",     "filter_micro", "transform",  "stats",     "scalar",         "decimal"};
+        "all",       "core",           "cumulative", "sort",    "window",
+        "groupagg",  "pipeline",       "join",       "rng",     "fill",
+        "null",      "filter",         "multi",      "events",  "reshape",
+        "timeframe", "merge_validity", "rng_micro",  "bool",    "filter_micro",
+        "transform", "stats",          "scalar",     "decimal", "parquet"};
     for (const auto& token : suites) {
         auto normalized = normalize_suite_name(token);
         if (!allowed_suites.contains(normalized)) {
@@ -2152,7 +2217,7 @@ int main(int argc, char** argv) {
         }
         // Keep legacy --suite all behavior stable; micro suites are opt-in.
         return suite != "merge_validity" && suite != "rng_micro" && suite != "bool" &&
-               suite != "filter_micro" && suite != "decimal";
+               suite != "filter_micro" && suite != "decimal" && suite != "parquet";
     };
 
     int status = 0;
@@ -4128,6 +4193,36 @@ int main(int argc, char** argv) {
                     return digest_int(out_int);
                 });
         }
+    }
+
+    // Parquet scans, filters and joins over synthetic files shaped like PDS-H's
+    // (1M-row groups, ZSTD, footer statistics), run through IbexEngine's session
+    // path. Opt-in: the first run writes ~0.5 GB under --parquet-dir.
+    if (status == 0 && selected_suites.contains("parquet")) {
+#ifdef IBEX_HAS_PARQUET_BACKEND
+        if (parquet_dir.empty()) {
+            parquet_dir = default_parquet_bench_dir();
+        }
+        auto files = ibex::bench_parquet::prepare_files(parquet_dir, parquet_rows);
+        if (!files) {
+            ibex::formatting::print("error: {}\n", files.error());
+            return 1;
+        }
+        ibex::formatting::print(
+            "\n-- Parquet benchmarks ({} fact x {} dim x {} orders rows, {}) --\n",
+            files->fact_rows, files->dim_rows, files->order_rows,
+            std::filesystem::path(files->fact).parent_path().string());
+        for (const auto& query : ibex::bench_parquet::queries(*files)) {
+            status = run_parquet_benchmark(query, warmup_iters, iters);
+            if (status != 0) {
+                break;
+            }
+        }
+#else
+        ibex::formatting::print(
+            "error: the parquet suite needs a build with IBEX_BUILD_PARQUET=ON\n");
+        return 1;
+#endif
     }
 
     write_answer_digests();

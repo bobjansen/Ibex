@@ -94,7 +94,7 @@ if [[ -n "$SUITE" ]]; then
         tok="${tok//[[:space:]]/}"
         tok="${tok,,}"
         tok="${tok//-/_}"
-        if [[ "$tok" != "merge_validity" && "$tok" != "rng_micro" ]]; then
+        if [[ "$tok" != "merge_validity" && "$tok" != "rng_micro" && "$tok" != "parquet" ]]; then
             NEEDS_CSV=1
             break
         fi

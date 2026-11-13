@@ -234,6 +234,16 @@ once per side and later runs are incremental ninja builds with ccache hits on
 unchanged files. Delete the cache dir — or pass `--no-cache` — when a
 from-scratch build is required.
 
+The cached builds include the Parquet backend, so `--ibex-suite parquet` A/Bs
+the Parquet read path: scans, literal filters, and inner, left, semi and anti
+joins with streamed key filters. Its input is synthetic files shaped like
+PDS-H's (1M-row groups, ZSTD, footer statistics; 16M fact rows by default,
+`--parquet-rows`), written once under `~/.cache/ibex/bench-parquet` and reused.
+The queries run through IbexEngine's session path (`ReplSession` with planned
+table expressions), not the whole-script planner the native `.ibex` files use.
+The suite only runs when named, and a ref older than the suite rejects
+`--suite parquet`, so both sides must contain it.
+
 Check the query list in the report before reading the numbers.
 `bench_ibex.sh` defaults each optional table (`--csv-trades`, `--csv-events`,
 …) to a path under the worktree's own `benchmarking/data/`, where no data

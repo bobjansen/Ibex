@@ -2323,8 +2323,48 @@ class ChunkedInnerJoinOperator final : public Operator {
     /// The streamed-left filter over `key_name`'s valid values, shared with the
     /// semi join (`publish_join_key_filter`).
     static void publish_key_filter(const Table& build, const std::string& key_name,
-                                   DynamicScanFilter& slot) {
+                                   DynamicScanFilter& slot, const DeferredScan& scan) {
         publish_build_filter_column(build, key_name, slot);
+        drop_filter_rejecting_nothing(slot, scan);
+    }
+
+    /// Drop a streamed scan slot's membership when the scan's own statistics
+    /// prove it rejects nothing: the bitmap holds every key in [min, max] (an
+    /// unfiltered dimension keyed 1..N) and the scan's whole key range lies
+    /// inside that interval. Each decode unit of a streamed scan runs its own
+    /// fused key scan, which decodes and tests the unit's whole key column
+    /// before its pass-rate rule can abandon, and nothing carries that across
+    /// units: lineitem streamed against all 2M part keys decoded `l_partkey`
+    /// twice in 61 of 62 units (inner join 0.69 s -> 0.51 s at 8 cores, 3.08 s
+    /// -> 2.02 s at one, once dropped). The bounds stay as raw facts; they
+    /// cannot prune a source inside them (`bounds_worth_applying`).
+    ///
+    /// Int64 keys only: the statistics are file values, which are the filter's
+    /// integers only for an Int64 column. Without statistics the bitmap stays,
+    /// since a full range can still prune a wider probe. Streamed slots only: a
+    /// deferred probe's two-phase path needs the membership
+    /// (`try_two_phase_probe`).
+    static void drop_filter_rejecting_nothing(DynamicScanFilter& slot, const DeferredScan& scan) {
+        if (slot.bitmap == nullptr || !slot.min.has_value() || !slot.max.has_value() ||
+            scan.lazy == nullptr) {
+            return;
+        }
+        const std::uint64_t span =
+            static_cast<std::uint64_t>(*slot.max) - static_cast<std::uint64_t>(*slot.min) + 1;
+        if (slot.distinct_keys != span) {
+            return;
+        }
+        const auto* key_type = scan.lazy->schema().find(scan.key_column);
+        if (key_type == nullptr || !std::holds_alternative<Column<std::int64_t>>(*key_type)) {
+            return;
+        }
+        const auto& stats = scan.lazy->column_stats();
+        const auto stat = stats.find(scan.key_column);
+        if (stat == stats.end() || !stat->second.min.has_value() || !stat->second.max.has_value() ||
+            *stat->second.min < *slot.min || *stat->second.max > *slot.max) {
+            return;
+        }
+        slot.bitmap.reset();
     }
 
     ChunkedInnerJoinOperator(OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys,
@@ -2678,8 +2718,14 @@ class ChunkedInnerJoinOperator final : public Operator {
         DynamicScanFilter& slot = *left_stream_->stream_filter;
         if (n_right * 2 <= left_stream_->lazy->rows()) {
             publish_build_filter_column(*right_, right_key_name, slot);
+            drop_filter_rejecting_nothing(slot, *left_stream_);
         }
         slot.ready = true;
+        // A dropped filter answers false, so the orientation is measured by
+        // draining the left (it reaches the right's rows and builds right, as
+        // the shortcut would). Taking the shortcut instead left the same probe
+        // ~0.3 s slower at one core on lineitem x part, with the same
+        // instructions, chunks and index (2.31 s vs 2.02 s; equal at 8 cores).
         return slot.has_membership();
     }
 
@@ -3762,8 +3808,8 @@ auto deferred_probe_scan_of(const ir::Node& right, const ExecutionContext& exec)
 }
 
 void publish_join_key_filter(const Table& build, const std::string& key_name,
-                             DynamicScanFilter& slot) {
-    ChunkedInnerJoinOperator::publish_key_filter(build, key_name, slot);
+                             DynamicScanFilter& slot, const DeferredScan& scan) {
+    ChunkedInnerJoinOperator::publish_key_filter(build, key_name, slot, scan);
 }
 
 auto streamed_left_scan_of(const ir::Node& left, const ExecutionContext& exec)

@@ -36,6 +36,24 @@ abandonment, so every unit pays again. The cost is about 1.25 s of decode
 work at 8 cores (scan CPU 2599 ms vs 1340 ms; zstd samples 1.8×), 0.19 s of
 wall time at 8 cores and 1.13 s at 1 core.
 
+**Fixed 2026-11-13 for the case measured here**
+(`ChunkedInnerJoinOperator::drop_filter_rejecting_nothing`): a streamed slot
+drops its bitmap when the bitmap is full and the scan's Int64 key statistics
+lie inside `[min, max]`. That is when the filter provably rejects nothing.
+- Inner join: 0.68 → 0.51 s at 8 cores, 3.08 → 2.02 s at 1 core; the answers
+  are identical.
+- Native PDS-H A/B: gm 0.999 (8 cores), 1.008 (1 core). All 22 outputs are
+  identical, and q04's 1-core +3.9% did not reproduce over three alternating
+  rounds.
+- Without statistics (CSV, an in-memory lazy source) the bitmap stays: a full
+  range can still prune a wider probe.
+- The join keeps measuring orientation by draining the left. The no-drain
+  shortcut left the same probe ~0.3 s slower at 1 core: same instructions,
+  chunks, index and LLC misses, just more cycles. That is not explained yet.
+
+Still open: a filter that is not full but still rejects little keeps the
+per-unit retry. The sticky abandon below is the general fix.
+
 Fix options, cheapest first:
 
 - **Treat a full bitmap as a range.** A bitmap whose population count equals

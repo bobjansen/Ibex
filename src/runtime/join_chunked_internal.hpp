@@ -106,9 +106,11 @@ struct DeferredProbeScan {
     -> const DeferredScan*;
 
 /// Publish a membership filter (and bounds) over `build`'s valid `key_name`
-/// values into `slot`: what an inner join hands its streamed left scan.
+/// values into `slot`, the streamed `scan`'s: what an inner join hands its
+/// streamed left scan. A membership the scan's statistics prove rejects
+/// nothing is dropped (`drop_filter_rejecting_nothing`).
 void publish_join_key_filter(const Table& build, const std::string& key_name,
-                             DynamicScanFilter& slot);
+                             DynamicScanFilter& slot, const DeferredScan& scan);
 
 [[nodiscard]] auto make_chunked_inner_join_operator(
     OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys,

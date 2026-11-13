@@ -20207,6 +20207,7 @@ TEST_CASE("A join under a node the plan does not migrate keeps its deferred prob
 struct StreamLeftState {
     std::atomic<std::size_t> payload_rows{0};
     std::atomic<int> key_decodes{0};
+    std::atomic<int> key_scans{0};
 };
 
 class StreamLeftReader final : public runtime::LazySourceReader {
@@ -20258,6 +20259,7 @@ class StreamLeftReader final : public runtime::LazySourceReader {
                          const runtime::SourceUnit* unit, const runtime::ExecutionContext&,
                          Column<std::int64_t>* values)
         -> std::expected<std::optional<runtime::Selection>, std::string> override {
+        state_->key_scans.fetch_add(1);
         const runtime::SourceUnit whole{.start = 0, .rows = kUnits * kUnitRows};
         const runtime::SourceUnit& range = unit == nullptr ? whole : *unit;
         runtime::Selection selected;
@@ -20332,6 +20334,110 @@ TEST_CASE("A streamed left input is filtered by the join's built right side",
         REQUIRE(filtered.rows() == 160);
         const auto mismatch = runtime::compare_tables(unfiltered, filtered);
         CHECK_FALSE(mismatch.has_value());
+    }
+}
+
+TEST_CASE("A streamed left filter the scan's statistics prove rejects nothing is dropped",
+          "[runtime][join][stream_filter]") {
+    // The left keys are row % 500, so 0..499. A right side holding every key
+    // of an interval that covers the left's whole range (0..499, or -5..600)
+    // rejects nothing, which the left's statistics prove: the join drops the
+    // bitmap and the left decodes plainly, with no per-unit key scan. A full
+    // interval narrower than the left (0..9), or no statistics, keeps it.
+    struct Case {
+        const char* name;
+        std::int64_t right_lo;
+        std::int64_t right_hi;
+        bool stats;
+        bool dropped;
+    };
+    for (const Case c :
+         {Case{.name = "covers exactly",
+               .right_lo = 0,
+               .right_hi = 499,
+               .stats = true,
+               .dropped = true},
+          Case{.name = "covers wider",
+               .right_lo = -5,
+               .right_hi = 600,
+               .stats = true,
+               .dropped = true},
+          Case{.name = "narrower", .right_lo = 0, .right_hi = 9, .stats = true, .dropped = false},
+          Case{.name = "no statistics",
+               .right_lo = 0,
+               .right_hi = 499,
+               .stats = false,
+               .dropped = false}}) {
+        runtime::Table right;
+        Column<std::int64_t> keys;
+        Column<std::int64_t> tags;
+        for (std::int64_t k = c.right_lo; k <= c.right_hi; ++k) {
+            keys.push_back(k);
+            tags.push_back(k * 10);
+        }
+        right.add_column("k", std::move(keys));
+        right.add_column("tag", std::move(tags));
+        runtime::TableRegistry registry;
+        registry.emplace("right_t", std::move(right));
+        auto ir = require_ir("left_t join right_t on k;");
+        for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+            INFO(c.name << " threads=" << threads);
+            const auto run = [&](bool with_slot) {
+                auto state = std::make_shared<StreamLeftState>();
+                runtime::Table schema;
+                schema.add_column("k", Column<std::int64_t>{});
+                schema.add_column("payload", Column<std::int64_t>{});
+                runtime::SourceColumnStats stats;
+                if (c.stats) {
+                    stats["k"] = runtime::ColumnStats{.min = 0, .max = 499, .null_count = 0};
+                }
+                auto lazy = std::make_shared<runtime::LazyTable>(
+                    std::move(schema), StreamLeftReader::kUnits * StreamLeftReader::kUnitRows,
+                    [state]() -> std::expected<runtime::LazySourceReaderPtr, std::string> {
+                        return runtime::LazySourceReaderPtr{
+                            std::make_unique<StreamLeftReader>(state)};
+                    },
+                    std::move(stats));
+                auto slot = with_slot ? std::make_shared<runtime::DynamicScanFilter>() : nullptr;
+                runtime::DeferredScanRegistry deferred;
+                deferred.emplace("left_t", runtime::DeferredScan{
+                                               .lazy = std::move(lazy),
+                                               .conjuncts = {},
+                                               .demand = {"k", "payload"},
+                                               .demand_all = false,
+                                               .key_column = with_slot ? "k" : "",
+                                               .filter = nullptr,
+                                               .stream_filter = slot,
+                                           });
+                runtime::ExecutionContext exec{.deferred_scans = &deferred,
+                                               .execution_profile = nullptr};
+                exec.parallel_threads = threads;
+                auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+                REQUIRE(out.has_value());
+                return std::tuple{std::move(*out), state, slot};
+            };
+            auto [filtered, state, slot] = run(true);
+            auto [unfiltered, plain_state, no_slot] = run(false);
+            REQUIRE(slot != nullptr);
+            CHECK(slot->ready);
+            const auto matching =
+                static_cast<std::size_t>((std::min<std::int64_t>(c.right_hi, 499) -
+                                          std::max<std::int64_t>(c.right_lo, 0) + 1) *
+                                         16);
+            if (c.dropped) {
+                CHECK_FALSE(slot->has_membership());
+                CHECK(state->key_scans.load() == 0);
+                CHECK(state->payload_rows.load() == 8000);
+            } else {
+                CHECK(slot->has_membership());
+                CHECK(state->key_scans.load() > 0);
+                CHECK(state->payload_rows.load() == matching);
+            }
+            CHECK(filtered.rows() == matching);
+            CHECK(filtered.rows() == unfiltered.rows());
+            const auto mismatch = runtime::compare_tables(unfiltered, filtered);
+            CHECK_FALSE(mismatch.has_value());
+        }
     }
 }
 

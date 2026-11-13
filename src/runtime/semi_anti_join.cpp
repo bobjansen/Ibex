@@ -947,7 +947,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             }
             Table build;
             build.add_column(keys_->front().left, std::move(keys));
-            publish_join_key_filter(build, keys_->front().left, slot);
+            publish_join_key_filter(build, keys_->front().left, slot, *right_stream_);
         }
         slot.ready = true;
     }
@@ -970,7 +970,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                                          [&](std::int64_t v) { keys.push_back(v); });
             Table build;
             build.add_column(keys_->front().right, std::move(keys));
-            publish_join_key_filter(build, keys_->front().right, slot);
+            publish_join_key_filter(build, keys_->front().right, slot, *left_stream_);
         }
         slot.ready = true;
     }

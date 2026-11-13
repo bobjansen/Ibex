@@ -152,6 +152,8 @@ enum class JoinBranch : std::uint8_t {
     SingleKeyInner,
     /// `is_streamable_pair_int_join` -- two provably-Int64 keys.
     PairIntInner,
+    /// `is_streamable_left_join` -- one key; the right side is always indexed.
+    SingleKeyLeft,
 };
 
 /// What the plan knows about a `Join` node.

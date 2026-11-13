@@ -226,6 +226,8 @@ auto join_branch_name(JoinBranch branch) -> std::string_view {
             return "SingleKeyInner";
         case JoinBranch::PairIntInner:
             return "PairIntInner";
+        case JoinBranch::SingleKeyLeft:
+            return "SingleKeyLeft";
     }
     return "?";
 }
@@ -1283,6 +1285,8 @@ auto plan_join(const ir::JoinNode& join, const ir::SourceSchemas& sources) -> Jo
         out.branch = JoinBranch::SingleKeyInner;
     } else if (is_streamable_pair_int_join(join, sources)) {
         out.branch = JoinBranch::PairIntInner;
+    } else if (is_streamable_left_join(join)) {
+        out.branch = JoinBranch::SingleKeyLeft;
     }
     out.strategy = out.branch == JoinBranch::None ? JoinStrategy::MaterializeBoth
                                                   : JoinStrategy::StreamingProbe;
@@ -1292,11 +1296,14 @@ auto plan_join(const ir::JoinNode& join, const ir::SourceSchemas& sources) -> Jo
     // relay above, that is a bug in the explanation and the assert says so
     // rather than letting a plan claim a reason it did not act on.
     const bool kind_ok = join.kind() == ir::JoinKind::Inner || join.kind() == ir::JoinKind::Semi ||
-                         join.kind() == ir::JoinKind::Anti;
+                         join.kind() == ir::JoinKind::Anti || join.kind() == ir::JoinKind::Left;
     if (!kind_ok) {
         out.decline = JoinDeclineReason::UnsupportedKind;
     } else if (join.predicate().has_value()) {
         out.decline = JoinDeclineReason::HasPredicate;
+    } else if (join.kind() == ir::JoinKind::Left && join.keys().size() > 1) {
+        // The left join streams on one key only; no pair path.
+        out.decline = JoinDeclineReason::MultipleKeys;
     } else if (join.keys().size() > 2) {
         out.decline = JoinDeclineReason::MultipleKeys;
     } else if (join.keys().size() == 2 && !join_keys_provably_int64(join, sources)) {

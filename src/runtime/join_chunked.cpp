@@ -811,6 +811,10 @@ struct JoinProbe {
     std::shared_ptr<const JoinHashIndex> index_;
     /// True when the join keys are the two-Int64 pair shape.
     bool pair_mode_ = false;
+    /// A left join: every probe row is emitted, one without a match (or with a
+    /// null key) once, with `kNil` as its right row so its right columns come
+    /// out null. Only the stream orientation (probe = left) runs it.
+    bool left_outer_ = false;
 
     /// Reset per probe chunk.
     const ValidityBitmap* probe_validity_ = nullptr;
@@ -1177,6 +1181,61 @@ struct JoinProbe {
         }
     }
 
+    // A left join's probe: every probe row is emitted, a row with no match or a
+    // null key once with ri = kNil. A unique build gives every row exactly one
+    // output row, so li is the identity and only ri is written (returns true;
+    // `li` is left empty and must not be read). Otherwise each row's chain is
+    // walked in order, as the inner probe does, plus the misses; per-range
+    // output in range order, so the result does not depend on the fan-out.
+    template <typename HeadOf>
+    auto probe_left_outer(std::size_t n, const HeadOf& head_of, IndexVec& li, IndexVec& ri)
+        -> bool {
+        if (index().unique) {
+            li.clear();
+            ri.resize(n);
+            std::size_t* const rp = ri.data();
+            const auto fill = [&](std::size_t begin, std::size_t end) {
+                for (std::size_t l = begin; l < end; ++l) {
+                    rp[l] = probe_is_null(l) ? kNil : head_of(l);
+                }
+            };
+            const std::size_t workers = probe_parallel_workers(n);
+            if (workers == 0) {
+                fill(0, n);
+                return true;
+            }
+            const std::size_t grain = (n + workers - 1) / workers;
+            auto batch = process_worker_pool().submit(workers, [&](std::size_t w) {
+                const std::size_t begin = std::min(n, w * grain);
+                fill(begin, std::min(n, begin + grain));
+            });
+            batch.wait();
+            if (exec_->parallel_stats != nullptr) {
+                exec_->parallel_stats->parallel_probes.fetch_add(1, std::memory_order_relaxed);
+            }
+            return true;
+        }
+        const auto scan = [&](std::size_t begin, std::size_t end, IndexVec& out_l,
+                              IndexVec& out_r) {
+            for (std::size_t l = begin; l < end; ++l) {
+                const std::size_t head = probe_is_null(l) ? kNil : head_of(l);
+                if (head == kNil) {
+                    out_l.push_back(l);
+                    out_r.push_back(kNil);
+                    continue;
+                }
+                for (std::size_t cur = head; cur != kNil; cur = index().chain_next[cur]) {
+                    out_l.push_back(l);
+                    out_r.push_back(cur);
+                }
+            }
+        };
+        if (!probe_ranges_parallel(n, li, ri, scan)) {
+            scan(0, n, li, ri);
+        }
+        return false;
+    }
+
     // Stream mode: walk the probe side (a left chunk), for each row look
     // up the right-keyed chain and append (li, ri) in probe-scan order.
     // Returns true if every probe row matched exactly once (li == 0..n-1).
@@ -1185,6 +1244,10 @@ struct JoinProbe {
     template <typename Map, typename GetKey>
     auto probe_scalar(const Map& heads, std::size_t n, GetKey get, IndexVec& li, IndexVec& ri)
         -> bool {
+        if (left_outer_) {
+            return probe_left_outer(
+                n, [&](std::size_t l) { return heads.find_head(get(l)); }, li, ri);
+        }
         // One body for both paths, so the parallel and serial results cannot
         // drift: the parallel one runs it per range, the serial one once.
         const auto scan = [&](std::size_t begin, std::size_t end, IndexVec& out_l,
@@ -1259,6 +1322,9 @@ struct JoinProbe {
     // key to hash — see `resolve_categorical_heads`.
     template <typename GetHead>
     auto probe_resolved(std::size_t n, GetHead head_of, IndexVec& li, IndexVec& ri) -> bool {
+        if (left_outer_) {
+            return probe_left_outer(n, head_of, li, ri);
+        }
         const auto scan = [&](std::size_t begin, std::size_t end, IndexVec& out_l,
                               IndexVec& out_r) {
             for (std::size_t l = begin; l < end; ++l) {
@@ -1798,6 +1864,23 @@ struct JoinProbe {
             [&](std::span<const ColumnGatherJob> jobs) -> std::vector<GatheredColumn> {
             return gather_columns_batched(jobs, total, exec_, [&](std::size_t j) -> GatheredColumn {
                 const auto& job = jobs[j];
+                if (job.null_index.has_value()) {
+                    // A left join's unmatched rows: null, together with the
+                    // source's own nulls.
+                    auto [column, validity] = gather_column_with_nulls(*job.column, job.idx, total,
+                                                                       job.null_index, nullptr);
+                    if (job.validity != nullptr) {
+                        ValidityBitmap bitmap = validity.has_value() ? std::move(*validity)
+                                                                     : ValidityBitmap(total, true);
+                        for (std::size_t i = 0; i < total; ++i) {
+                            if (job.idx[i] != *job.null_index && !(*job.validity)[job.idx[i]]) {
+                                bitmap.set(i, false);
+                            }
+                        }
+                        validity = std::move(bitmap);
+                    }
+                    return {std::move(column), std::move(validity)};
+                }
                 ColumnValue gathered = gather_column(*job.column, job.idx, total, nullptr);
                 std::optional<ValidityBitmap> val;
                 if (job.validity != nullptr) {
@@ -1893,14 +1976,19 @@ struct JoinProbe {
                                        right_->columns[right_emit_idx_[e]]);
             }
         } else {
+            // Only a left join's probe writes `kNil` into `ri`, and only for a
+            // row it kept without a match.
+            const bool right_misses = left_outer_ && std::find(ri, ri + total, kNil) != ri + total;
             std::vector<ColumnGatherJob> jobs;
             jobs.reserve(right_emit_idx_.size());
             for (const auto index : right_emit_idx_) {
                 const auto& rc = right_->columns[index];
-                jobs.push_back({.column = rc.column.get(),
-                                .validity = rc.validity.has_value() ? &*rc.validity : nullptr,
-                                .idx = ri,
-                                .indivisible = false});
+                jobs.push_back(
+                    {.column = rc.column.get(),
+                     .validity = rc.validity.has_value() ? &*rc.validity : nullptr,
+                     .idx = ri,
+                     .indivisible = false,
+                     .null_index = right_misses ? std::optional<std::size_t>{kNil} : std::nullopt});
             }
             auto gathered = gather_batch(jobs);
             for (std::size_t e = 0; e < right_emit_idx_.size(); ++e) {
@@ -2322,6 +2410,15 @@ class ChunkedInnerJoinOperator final : public Operator {
         return probe_op_->next();
     }
 
+    /// Make this a left join: keep every left row, a row without a match once
+    /// with null right columns. Set before the build runs. The right side is
+    /// then always the one indexed; a left smaller than the right, which the
+    /// inner join would index instead, runs the materialized join.
+    void keep_unmatched_left() {
+        left_outer_ = true;
+        probe_.left_outer_ = true;
+    }
+
     /// Run this join's build phase to completion.
     ///
     /// The build is a phase with an explicit caller now, not a side effect of
@@ -2542,6 +2639,23 @@ class ChunkedInnerJoinOperator final : public Operator {
                 return std::move(left_res.error());
             }
             left_table = std::move(*left_res);
+        }
+
+        if (left_outer_) {
+            // A left join cannot index its left side here: the swapped probe
+            // emits matches only. Both sides are materialized now, so the
+            // materialized join answers it, as it did before this streamed.
+            static const std::vector<ir::OrderKey> kNoOrder;
+            auto joined = join_table_impl(
+                left_table, *right_, ir::JoinKind::Left, *keys_, nullptr, nullptr, nullptr,
+                probe_.suffix_, pending_order_ != nullptr ? *pending_order_ : kNoOrder,
+                ir::NullMatch::Never, {}, ir::MatchSelection::All, probe_.exec_);
+            if (!joined.has_value()) {
+                return std::move(joined.error());
+            }
+            precomputed_output_ = std::move(*joined);
+            mode_ = Mode::Precomputed;
+            return std::nullopt;
         }
 
         // Evaluated only when swapping was otherwise preferred: it is not a
@@ -3544,6 +3658,8 @@ class ChunkedInnerJoinOperator final : public Operator {
     // Precomputed mode: the two-phase deferred probe assembled the whole
     // join output during initialization.
     Table precomputed_output_;
+    /// `keep_unmatched_left`: a left join.
+    bool left_outer_ = false;
 
     // Streamed mode: the two-phase deferred probe runs per unit inside this
     // streaming pipeline instead (`try_stream_two_phase`).
@@ -3698,6 +3814,18 @@ auto make_scheduled_chunked_inner_join_operator(
     return finish_scheduled_join(std::make_unique<ChunkedInnerJoinOperator>(
         std::move(left), std::move(right), keys, exec, std::move(suffix), pending_order,
         parallelism, std::move(columns), left_stream));
+}
+
+auto make_scheduled_chunked_left_join_operator(
+    OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys,
+    const ExecutionContext& exec, ir::JoinSuffixPolicy suffix,
+    const std::vector<ir::OrderKey>* pending_order, physical::JoinParallelism parallelism,
+    std::optional<ir::JoinColumnMapping> columns) -> std::expected<OperatorPtr, std::string> {
+    auto op = std::make_unique<ChunkedInnerJoinOperator>(std::move(left), std::move(right), keys,
+                                                         exec, std::move(suffix), pending_order,
+                                                         parallelism, std::move(columns));
+    op->keep_unmatched_left();
+    return finish_scheduled_join(std::move(op));
 }
 
 auto make_scheduled_deferred_inner_join_operator(

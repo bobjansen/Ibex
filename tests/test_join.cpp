@@ -10,8 +10,10 @@
 #include <ibex/ir/schema.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
+#include <ibex/runtime/env.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/table_compare.hpp>
+#include <ibex/runtime/table_format.hpp>
 #include <ibex/runtime/table_properties.hpp>
 
 #include <catch2/catch_message.hpp>
@@ -20,6 +22,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
@@ -29,6 +32,7 @@
 #include <vector>
 
 #include "interpreter_internal.hpp"
+#include "physical_plan.hpp"
 
 using namespace ibex;
 
@@ -436,11 +440,11 @@ TEST_CASE("join: left join emits matches in right-scan order when left side is s
     rhs.add_column("id", Column<std::int64_t>{1, 2, 1, 3, 5});
     rhs.add_column("rval", Column<std::int64_t>{100, 200, 101, 300, 500});
 
-    runtime::TableRegistry tables;
-    tables.emplace("lhs", std::move(lhs));
-    tables.emplace("rhs", std::move(rhs));
-
-    auto out = interpret_expr("lhs left join rhs on id;", tables);
+    // The materialized join directly: a query would now stream this left join
+    // (a five-row right side is always the one indexed) and emit left order.
+    auto joined = runtime::join_tables(lhs, rhs, ir::JoinKind::Left, {"id"});
+    REQUIRE(joined.has_value());
+    const auto& out = *joined;
 
     CHECK(out.rows() == 4);
     CHECK(col_i64(out, "id") == std::vector<std::int64_t>{1, 2, 1, 4});
@@ -3535,6 +3539,248 @@ TEST_CASE("integer key joins agree with the general path on dense, sparse and co
                     CHECK(actual.rows() == expected.rows());
                     CHECK(cells(actual) == cells(expected));
                 }
+            }
+        }
+    }
+}
+
+namespace {
+
+/// Sets `IBEX_CHUNK_ROWS` for a scope ("" = whole-table sources).
+class ChunkGrainGuard {
+   public:
+    explicit ChunkGrainGuard(const std::string& grain) {
+        if (const char* value = std::getenv("IBEX_CHUNK_ROWS"); value != nullptr) {
+            saved_ = value;
+        }
+        runtime::set_env("IBEX_CHUNK_ROWS", grain);
+    }
+    ~ChunkGrainGuard() {
+        if (saved_.has_value()) {
+            runtime::set_env("IBEX_CHUNK_ROWS", *saved_);
+        } else {
+            runtime::unset_env("IBEX_CHUNK_ROWS");
+        }
+    }
+    ChunkGrainGuard(const ChunkGrainGuard&) = delete;
+    auto operator=(const ChunkGrainGuard&) -> ChunkGrainGuard& = delete;
+    ChunkGrainGuard(ChunkGrainGuard&&) = delete;
+    auto operator=(ChunkGrainGuard&&) -> ChunkGrainGuard& = delete;
+
+   private:
+    std::optional<std::string> saved_;
+};
+
+/// Every output row rendered (a null cell as `<null>`), sorted: the rows a join
+/// produced as a multiset, since row order is outside the join contract.
+auto sorted_rows(const runtime::Table& t) -> std::vector<std::string> {
+    std::vector<std::string> rows(t.rows());
+    for (const auto& entry : t.columns) {
+        for (std::size_t r = 0; r < t.rows(); ++r) {
+            rows[r] += runtime::is_null(entry, r) ? "<null>" : runtime::format_cell(entry, r);
+            rows[r] += '|';
+        }
+    }
+    std::ranges::sort(rows);
+    return rows;
+}
+
+/// One left join case: the inputs and a name.
+struct LeftJoinCase {
+    std::string name;
+    runtime::Table left;
+    runtime::Table right;
+};
+
+/// Int keys: `left_key(i)` / `right_key(i)`, every `left_null`-th left key and
+/// every 17th right key null (0 = none), a payload on each side, every 13th
+/// right one null.
+template <typename LeftKey, typename RightKey>
+auto int_case(std::string name, std::size_t left_rows, std::size_t right_rows, LeftKey left_key,
+              RightKey right_key, std::size_t left_null, bool compact) -> LeftJoinCase {
+    const auto keys = [&](std::size_t rows, const auto& key_at) {
+        if (compact) {
+            ::ibex::detail::NoInitVector<std::int32_t> narrow(rows);
+            for (std::size_t i = 0; i < rows; ++i) {
+                narrow[i] = static_cast<std::int32_t>(key_at(i));
+            }
+            return Column<std::int64_t>::from_compact_int32(std::move(narrow));
+        }
+        Column<std::int64_t> wide;
+        for (std::size_t i = 0; i < rows; ++i) {
+            wide.push_back(key_at(i));
+        }
+        return wide;
+    };
+    LeftJoinCase c{.name = std::move(name), .left = {}, .right = {}};
+    runtime::ValidityBitmap lvalid(left_rows, true);
+    Column<std::int64_t> lv;
+    for (std::size_t i = 0; i < left_rows; ++i) {
+        lv.push_back(static_cast<std::int64_t>(i));
+        if (left_null != 0 && i % left_null == 3) {
+            lvalid.set(i, false);
+        }
+    }
+    runtime::ValidityBitmap rkvalid(right_rows, true);
+    runtime::ValidityBitmap rvvalid(right_rows, true);
+    Column<std::int64_t> rv;
+    for (std::size_t i = 0; i < right_rows; ++i) {
+        rv.push_back(static_cast<std::int64_t>(i * 10));
+        if (i % 17 == 5) {
+            rkvalid.set(i, false);
+        }
+        if (i % 13 == 2) {
+            rvvalid.set(i, false);
+        }
+    }
+    if (left_null != 0) {
+        c.left.add_column("k", keys(left_rows, left_key), lvalid);
+    } else {
+        c.left.add_column("k", keys(left_rows, left_key));
+    }
+    c.left.add_column("v", lv);
+    c.right.add_column("k", keys(right_rows, right_key), rkvalid);
+    c.right.add_column("rv", rv, rvvalid);
+    return c;
+}
+
+}  // namespace
+
+TEST_CASE("streaming left join agrees with the materialized left join", "[join][left][stream]") {
+    // The streamed left join (`JoinBranch::SingleKeyLeft`) against
+    // `join_tables`, the materialized join, on the same inputs: the same rows
+    // and names, for every probe path -- unique and duplicate build keys, dense
+    // and hashed Int, compact keys, String, Categorical with a different
+    // dictionary per side, Double, Date; null keys on either side, a null right
+    // payload, empty and all-unmatched inputs, a right
+    // side past the small-right threshold (drained left) and a left smaller
+    // than such a right (the materialized fallback); whole and chunked left
+    // input, serial and parallel.
+    std::vector<LeftJoinCase> cases;
+    const auto mod = [](std::size_t m, std::int64_t shift) {
+        return
+            [m, shift](std::size_t i) { return static_cast<std::int64_t>((i * 7919) % m) + shift; };
+    };
+    const auto iota = [](std::int64_t scale) {
+        return [scale](std::size_t i) { return static_cast<std::int64_t>(i) * scale; };
+    };
+    cases.push_back(int_case("dense unique", 40'000, 1'000, mod(1'200, -50), iota(1), 97, false));
+    cases.push_back(int_case(
+        "sparse unique", 40'000, 1'000,
+        [](std::size_t i) { return static_cast<std::int64_t>((i * 7919) % 1'200) * 1'000'003; },
+        iota(1'000'003), 97, false));
+    cases.push_back(int_case(
+        "duplicates", 40'000, 1'000, mod(500, 0),
+        [](std::size_t i) { return static_cast<std::int64_t>(i % 400); }, 0, false));
+    cases.push_back(int_case("compact", 40'000, 1'000, mod(1'200, -50), iota(1), 97, true));
+    cases.push_back(
+        int_case("big right drained", 150'000, 70'000, mod(90'000, 0), iota(1), 0, false));
+    cases.push_back(
+        int_case("small left fallback", 1'000, 70'000, mod(90'000, 0), iota(1), 31, false));
+    cases.push_back(int_case("all unmatched", 20'000, 500, mod(1'000, 5'000), iota(1), 0, false));
+    cases.push_back(int_case("empty left", 0, 500, mod(10, 0), iota(1), 0, false));
+    cases.push_back(int_case("empty right", 20'000, 0, mod(10, 0), iota(1), 0, false));
+    {
+        // String left, String right; Categorical left over its own dictionary.
+        LeftJoinCase strings{.name = "string", .left = {}, .right = {}};
+        LeftJoinCase cats{.name = "categorical", .left = {}, .right = {}};
+        Column<std::string> ls;
+        Column<std::int64_t> lv;
+        Column<Categorical>::codes_storage codes;
+        std::vector<std::string> left_dict;
+        left_dict.reserve(700);
+        for (std::size_t d = 0; d < 700; ++d) {
+            left_dict.push_back("s" + std::to_string(699 - d));
+        }
+        for (std::size_t i = 0; i < 30'000; ++i) {
+            const std::size_t code = (i * 31) % 700;
+            ls.push_back(left_dict[code]);
+            codes.push_back(static_cast<Column<Categorical>::code_type>(code));
+            lv.push_back(static_cast<std::int64_t>(i));
+        }
+        Column<std::string> rs;
+        Column<std::int64_t> rv;
+        std::vector<std::string> right_dict;
+        Column<Categorical>::codes_storage rcodes;
+        for (std::size_t r = 0; r < 600; ++r) {
+            rs.push_back("s" + std::to_string(r % 500));  // s0..s499, duplicated
+            right_dict.push_back("s" + std::to_string(r));
+            rcodes.push_back(static_cast<Column<Categorical>::code_type>(r % 500));
+            rv.push_back(static_cast<std::int64_t>(r));
+        }
+        strings.left.add_column("k", ls);
+        strings.left.add_column("lv", lv);
+        strings.right.add_column("k", rs);
+        strings.right.add_column("rv", rv);
+        cats.left.add_column("k", Column<Categorical>(left_dict, std::move(codes)));
+        cats.left.add_column("lv", lv);
+        cats.right.add_column("k", Column<Categorical>(right_dict, std::move(rcodes)));
+        cats.right.add_column("rv", rv);
+        cases.push_back(std::move(strings));
+        cases.push_back(std::move(cats));
+    }
+    {
+        LeftJoinCase doubles{.name = "double", .left = {}, .right = {}};
+        LeftJoinCase dates{.name = "date", .left = {}, .right = {}};
+        Column<double> ld;
+        Column<Date> lt;
+        Column<std::int64_t> lv;
+        for (std::size_t i = 0; i < 25'000; ++i) {
+            const auto key = static_cast<std::int32_t>((i * 13) % 900);
+            ld.push_back(static_cast<double>(key) * 0.5);
+            lt.push_back(Date{.days = key});
+            lv.push_back(static_cast<std::int64_t>(i));
+        }
+        Column<double> rd;
+        Column<Date> rt;
+        Column<std::int64_t> rv;
+        for (std::size_t r = 0; r < 700; ++r) {
+            rd.push_back(static_cast<double>(r) * 0.5);
+            rt.push_back(Date{.days = static_cast<std::int32_t>(r)});
+            rv.push_back(static_cast<std::int64_t>(r));
+        }
+        doubles.left.add_column("k", ld);
+        doubles.left.add_column("lv", lv);
+        doubles.right.add_column("k", rd);
+        doubles.right.add_column("rv", rv);
+        dates.left.add_column("k", lt);
+        dates.left.add_column("lv", lv);
+        dates.right.add_column("k", rt);
+        dates.right.add_column("rv", rv);
+        cases.push_back(std::move(doubles));
+        cases.push_back(std::move(dates));
+    }
+
+    auto parsed = parser::parse("l left join r on k;");
+    REQUIRE(parsed.has_value());
+    auto lowered = parser::lower(*parsed);
+    REQUIRE(lowered.has_value());
+    for (const auto& c : cases) {
+        INFO(c.name);
+        auto expected = runtime::join_tables(c.left, c.right, ir::JoinKind::Left, {"k"});
+        if (!expected.has_value()) {
+            FAIL(expected.error());
+        }
+        const auto want = sorted_rows(*expected);
+        const runtime::TableRegistry tables{{"l", c.left}, {"r", c.right}};
+        REQUIRE(runtime::physical::plan_physical(**lowered, tables, nullptr).join.branch ==
+                runtime::physical::JoinBranch::SingleKeyLeft);
+        for (const char* grain : {"", "777"}) {
+            const ChunkGrainGuard chunks(grain);
+            for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+                INFO(c.name << " grain=" << grain << " threads=" << threads);
+                runtime::ExecutionContext exec;
+                exec.parallel_threads = threads;
+                const auto fallbacks =
+                    runtime::physical::physical_fallbacks_for(ir::NodeKind::Join);
+                auto actual =
+                    runtime::interpret(**lowered, tables, nullptr, nullptr, nullptr, exec);
+                REQUIRE(actual.has_value());
+                // Streamed: the join never reached the materialized fallback node.
+                CHECK(runtime::physical::physical_fallbacks_for(ir::NodeKind::Join) == fallbacks);
+                CHECK(column_names(*actual) == column_names(*expected));
+                CHECK(actual->rows() == expected->rows());
+                CHECK(sorted_rows(*actual) == want);
             }
         }
     }

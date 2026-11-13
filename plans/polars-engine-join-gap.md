@@ -1,6 +1,6 @@
 # IbexEngine join gap
 
-Status: open, 2026-11-10; q3 fixed 2026-11-13. Compacted from the working diary; the full version
+Status: open, 2026-11-10; q3 fixed 2026-11-13 (dense probe, then streaming left join). Compacted from the working diary; the full version
 (every profile, prototype and paired table) is
 `git show ed7fd554:plans/polars-engine-join-gap.md`. Raw outputs are local,
 under `benchmarking/results/local/` (named in that version).
@@ -23,7 +23,7 @@ Ibex/Polars streaming, median of paired ratios, at `ed7fd554` and after the
 |---|---:|---:|---:|---:|
 | q1 small inner on int | 1.24 | 0.83 | 1.23 | 0.79 |
 | q2 medium inner on int | 1.35 | 0.91 | 1.36 | 0.89 |
-| q3 medium outer (left) on int | 1.43 | 1.19 | 0.92 | 0.75 |
+| q3 medium outer (left) on int | 1.43 | 1.19 | 0.83 | 0.71 |
 | q4 medium inner on factor | 1.24 | 0.75 | 1.26 | 0.77 |
 | q5 big inner on int | 0.88 | 0.47 | 0.83 | 0.47 |
 
@@ -104,9 +104,13 @@ apply (8t q1 1.29×, q3 1.86×, q5 0.99× at `75a7c840`).
    is tiny could rebuild from right row numbers, measured ~16 ms per 9M rows,
    about the same as validation for a small mapping).
 2. **Float32 payloads still widen** on import and narrow on export.
-3. **Left joins do not stream.** The dense probe fixed q3's probe cost, but
-   the whole-table path still materializes both inputs and gathers in one
-   pass. A streaming left-join operator is the structural fix.
+3. **Left joins stream since 2026-11-13** (single key; `JoinBranch::SingleKeyLeft`):
+   the inner join's operator indexes the right side and keeps unmatched left
+   rows with null right columns. q3 8t 0.92 → 0.83, 1t 0.75 → 0.71. Still
+   materialized: outer/right joins (they need a build-side matched bitmap),
+   two-key left joins, and a left join whose left side is smaller than a right
+   side above 64K rows (the operator runs `join_table_impl` on the drained
+   sides, as before).
 
 Compact Int32 became the default on 2026-11-12, so the id path is always on.
 4. **Same cause elsewhere:** h2o groupby q10 (~10M result groups) and the K=2

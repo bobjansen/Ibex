@@ -1391,6 +1391,9 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 /// handle. Collapsing the implementation while leaving the gate duplicated would
 /// have replaced one drift hazard with a subtler one.
 [[nodiscard]] auto is_streamable_inner_join(const ir::JoinNode& join) -> bool;
+/// A single-key left join the streaming join runs (`ChunkedInnerJoinOperator`
+/// with unmatched left rows kept).
+[[nodiscard]] auto is_streamable_left_join(const ir::JoinNode& join) -> bool;
 
 /// The other two streaming gates, shared for the same reason as the one above
 /// and with the same hazard in mind. The physical planner reads all three

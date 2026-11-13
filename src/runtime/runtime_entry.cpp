@@ -88,6 +88,16 @@ auto is_streamable_inner_join(const ir::JoinNode& join) -> bool {
            !join.expect().asserts_anything() && join.take() == ir::MatchSelection::All;
 }
 
+auto is_streamable_left_join(const ir::JoinNode& join) -> bool {
+    // The inner join's structural gate, for a left join: the build indexes the
+    // right side and every left chunk streams through it, a miss emitting its
+    // row with null right columns. `nulls equal` stays on the materialized
+    // join for the reason above.
+    return join.kind() == ir::JoinKind::Left && !join.predicate().has_value() &&
+           join.keys().size() == 1 && join.null_match() == ir::NullMatch::Never &&
+           !join.expect().asserts_anything() && join.take() == ir::MatchSelection::All;
+}
+
 /// Two-fixed-width-int-key inner join (TPC-H q09's `lineitem` join is the
 /// motivating case). Same structural gate as `is_streamable_inner_join`
 /// plus a static schema check -- both keys, on both sides, must be provably
@@ -576,6 +586,35 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
             std::move(left_op.value()), std::move(right.value()), &join.keys(), exec, join.suffix(),
             &join.pending_order(), resolved_join_parallelism(nodes, exec), nodes.columns,
             streamed_left_scan_of(*join.children()[0], exec));
+        if (!built.has_value()) {
+            return std::unexpected(std::move(built.error()));
+        }
+        return pipeline_executor_detail::make_pipelined_stage_if(
+            std::move(*built), stage_probe, exec,
+            execution_profile_entry(exec.execution_profile, node));
+    }
+    // Streaming single-key left join: the inner join's operator with unmatched
+    // left rows kept. Only the plain shape: the right side materializes and is
+    // indexed, and the left streams through it. No deferred probe (a right scan
+    // pruned by left keys) and no streamed-left filter (a left join keeps the
+    // rows such a filter would drop); `ir::is_probe_shaped_join` registers
+    // neither for a left join.
+    if (jp.branch == physical::JoinBranch::SingleKeyLeft) {
+        const bool stage_probe = pipeline_executor_detail::has_multi_unit_deferred_scan(
+            *join.children()[0], registry, exec);
+        auto left_op =
+            build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
+        if (!left_op.has_value()) {
+            return std::unexpected(std::move(left_op.error()));
+        }
+        auto right =
+            materialize_plan(*join.children()[1], registry, scalars, externs, exec, model_out);
+        if (!right.has_value()) {
+            return std::unexpected(std::move(right.error()));
+        }
+        auto built = make_scheduled_chunked_left_join_operator(
+            std::move(left_op.value()), std::move(right.value()), &join.keys(), exec, join.suffix(),
+            &join.pending_order(), resolved_join_parallelism(nodes, exec), nodes.columns);
         if (!built.has_value()) {
             return std::unexpected(std::move(built.error()));
         }

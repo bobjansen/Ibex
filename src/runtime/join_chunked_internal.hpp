@@ -144,6 +144,18 @@ void publish_join_key_filter(const Table& build, const std::string& key_name,
     std::optional<ir::JoinColumnMapping> columns = std::nullopt,
     const DeferredScan* left_stream = nullptr) -> std::expected<OperatorPtr, std::string>;
 
+/// The streaming single-key left join (`is_streamable_left_join`): the inner
+/// join's operator, always indexing `right`, with every left row emitted --
+/// a row without a match once, with null right columns. A left smaller than
+/// the right runs the materialized join instead (it would index the left).
+[[nodiscard]] auto make_scheduled_chunked_left_join_operator(
+    OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys,
+    const ExecutionContext& exec, ir::JoinSuffixPolicy suffix = {},
+    const std::vector<ir::OrderKey>* pending_order = nullptr,
+    physical::JoinParallelism parallelism = {},
+    std::optional<ir::JoinColumnMapping> columns = std::nullopt)
+    -> std::expected<OperatorPtr, std::string>;
+
 [[nodiscard]] auto make_scheduled_deferred_inner_join_operator(
     OperatorPtr left, const ir::Node* right_node, const TableRegistry* registry,
     const ScalarRegistry* scalars, const ExternRegistry* externs, const ExecutionContext& exec,

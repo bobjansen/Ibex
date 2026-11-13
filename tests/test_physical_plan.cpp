@@ -820,10 +820,12 @@ TEST_CASE("The plan classifies a join and builds the streaming ones", "[physical
         // implied a full gate had passed -- a coupling nothing would have
         // reported if a later gate broke it.
         CHECK(plan_of("(a join b on k);").branch == JoinBranch::SingleKeyInner);
-        CHECK(plan_of("(a left join b on k);").branch == JoinBranch::None);
+        CHECK(plan_of("(a left join b on k);").branch == JoinBranch::SingleKeyLeft);
+        CHECK(plan_of("(a outer join b on k);").branch == JoinBranch::None);
         // None exactly when both sides materialize, in both directions.
-        for (const char* src : {"(a join b on k);", "(a semi join b on k);",
-                                "(a left join b on k);", "(a join b on x < y);"}) {
+        for (const char* src :
+             {"(a join b on k);", "(a semi join b on k);", "(a left join b on k);",
+              "(a outer join b on k);", "(a join b on x < y);"}) {
             CAPTURE(src);
             const auto plan = plan_of(src);
             CHECK((plan.branch == JoinBranch::None) ==
@@ -832,8 +834,12 @@ TEST_CASE("The plan classifies a join and builds the streaming ones", "[physical
     }
 
     SECTION("every decline is named, not a bare conjunction") {
-        CHECK(plan_of("(a left join b on k);").decline == JoinDeclineReason::UnsupportedKind);
+        CHECK(plan_of("(a outer join b on k);").decline == JoinDeclineReason::UnsupportedKind);
         CHECK(plan_of("(a join b on x < y);").decline == JoinDeclineReason::HasPredicate);
+        // The left join streams on one key only, with no pair path.
+        CHECK(plan_of("(a left join b on { k1, k2 });").decline == JoinDeclineReason::MultipleKeys);
+        CHECK(plan_of("(a left join b on k nulls equal);").decline ==
+              JoinDeclineReason::NullsEqual);
         // Two keys decline for a schema reason, not a count one: the pair path
         // takes exactly two keys, but only when both are provably Int64 on both
         // sides. With no schema here, they are not provable.
@@ -841,9 +847,9 @@ TEST_CASE("The plan classifies a join and builds the streaming ones", "[physical
               JoinDeclineReason::KeyTypesUnsupported);
         CHECK(plan_of("(a join b on { k1, k2, k3 });").decline == JoinDeclineReason::MultipleKeys);
         CHECK(plan_of("(a join b on k nulls equal);").decline == JoinDeclineReason::NullsEqual);
-        for (const char* src :
-             {"(a left join b on k);", "(a join b on x < y);", "(a join b on { k1, k2 });",
-              "(a join b on { k1, k2, k3 });", "(a join b on k nulls equal);"}) {
+        for (const char* src : {"(a outer join b on k);", "(a join b on x < y);",
+                                "(a join b on { k1, k2 });", "(a join b on { k1, k2, k3 });",
+                                "(a join b on k nulls equal);", "(a left join b on { k1, k2 });"}) {
             CAPTURE(src);
             const auto plan = plan_of(src);
             CHECK(plan.strategy == JoinStrategy::MaterializeBoth);
@@ -863,8 +869,13 @@ TEST_CASE("The plan classifies a join and builds the streaming ones", "[physical
         CHECK(sp.migrated);
         CHECK(sp.join.describes);
         CHECK(sp.join.branch == JoinBranch::SingleKeyInner);
+        auto left = require_ir("(a left join b on k);");
+        const auto lp = runtime::physical::plan_physical(*left, empty, nullptr);
+        CHECK(lp.migrated);
+        CHECK(lp.join.branch == JoinBranch::SingleKeyLeft);
+        CHECK(lp.streaming_join.has_value());
 
-        auto materializing = require_ir("(a left join b on k);");
+        auto materializing = require_ir("(a outer join b on k);");
         const auto mp = runtime::physical::plan_physical(*materializing, empty, nullptr);
         // Still a fallback, and still counted as one. If this became migrated
         // too the backlog would be measuring the label rather than the port.
@@ -1395,7 +1406,7 @@ TEST_CASE("The plan describes a streaming join's two fan-out phases", "[physical
     }
 
     SECTION("a materializing join carries no fan-out phases") {
-        const auto [tree, plan] = serial_plan("(a left join b on k);");
+        const auto [tree, plan] = serial_plan("(a outer join b on k);");
         REQUIRE_FALSE(plan.streaming_join.has_value());
         REQUIRE(plan.breaker_phases.empty());
     }

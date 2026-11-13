@@ -94,6 +94,18 @@ if(IBEX_TARGETS_X86 AND IBEX_HAS_AVX2)
     endif()
 endif()
 
+# ── Loop alignment for the semi/anti join ─────────────────────────────────────
+# The semi/anti join's dense key-marking loop (scan_kept_right, probe_on_worker)
+# runs ~4 instructions per right row. Its speed depends on where the linker
+# happens to place the loop head: the same instructions start 16-byte aligned
+# after an unrelated edit elsewhere, and PDS-H q22 at 1 core runs 500 -> 560 ms.
+# Aligning this file's loop heads to a cache line pins the layout. The flag is
+# scoped to one file to keep code-size growth out of the rest of the runtime.
+check_cxx_compiler_flag(-falign-loops=64 IBEX_HAS_ALIGN_LOOPS)
+if(IBEX_HAS_ALIGN_LOOPS)
+    set_source_files_properties(semi_anti_join.cpp PROPERTIES COMPILE_OPTIONS -falign-loops=64)
+endif()
+
 if(TARGET Ibex::Sanitizers)
     target_link_libraries(ibex_runtime PRIVATE Ibex::Sanitizers)
 endif()

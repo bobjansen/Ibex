@@ -3468,6 +3468,61 @@ inline auto footer_covered_fraction(const parquet::FileMetaData& metadata, int l
     return total == 0 ? 0.0 : static_cast<double>(covered) / static_cast<double>(total);
 }
 
+/// The pass rate a bitmap filter can be expected to have over `unit`'s rows,
+/// from its row groups' footer ranges: each group contributes its rows times
+/// the bitmap's density over the group's [min, max] (keys outside the filter's
+/// interval count as rejected). Uniform keys within a group are the one
+/// assumption a min/max pair supports, so a probe column over a sparse domain
+/// reads low, and keeps its filter. Nullopt when a group in scope has no
+/// statistics, or the filter has no bitmap.
+///
+/// Decided per unit, not from running totals, so clustered keys keep the
+/// filter where it prunes: a unit in a sparse stretch of the build's keys reads
+/// low and is filtered, while a unit the build covers densely reads high.
+template <typename DType>
+inline auto footer_estimated_pass(const parquet::FileMetaData& metadata, int leaf_index,
+                                  const ibex::runtime::DynamicScanFilter& filter,
+                                  const ibex::runtime::SourceUnit& unit) -> std::optional<double> {
+    if (filter.bitmap == nullptr) {
+        return std::nullopt;
+    }
+    double expected = 0.0;
+    std::size_t total = 0;
+    std::size_t base = 0;
+    for (int group = 0; group < metadata.num_row_groups(); ++group) {
+        const auto group_rows = static_cast<std::size_t>(metadata.RowGroup(group)->num_rows());
+        const bool in_scope = base >= unit.start && base < unit.start + unit.rows;
+        base += group_rows;
+        if (!in_scope) {
+            continue;
+        }
+        total += group_rows;
+        const auto chunk = metadata.RowGroup(group)->ColumnChunk(leaf_index);
+        if (!chunk->is_stats_set()) {
+            return std::nullopt;
+        }
+        const auto stats = chunk->statistics();
+        if (stats == nullptr || !stats->HasMinMax() || stats->physical_type() != DType::type_num) {
+            return std::nullopt;
+        }
+        const auto& typed_stats = static_cast<const parquet::TypedStatistics<DType>&>(*stats);
+        const auto lo = static_cast<std::int64_t>(typed_stats.min());
+        const auto hi = static_cast<std::int64_t>(typed_stats.max());
+        if (hi < lo) {
+            return std::nullopt;
+        }
+        const double span =
+            static_cast<double>(static_cast<std::uint64_t>(hi) - static_cast<std::uint64_t>(lo)) +
+            1.0;
+        expected += static_cast<double>(group_rows) *
+                    (static_cast<double>(filter.bitmap->count_range(lo, hi)) / span);
+    }
+    if (total == 0) {
+        return std::nullopt;
+    }
+    return expected / static_cast<double>(total);
+}
+
 /// The abandon rule itself, over totals accumulated in file order. Both the
 /// serial and the parallel driver ask this same question at the same points,
 /// so they cannot drift apart.
@@ -4427,6 +4482,25 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
                      : footer_covered_fraction<parquet::Int32Type>(
                            metadata, leaf_index, filter, unit)) > filter.footer_pass_rate_limit) {
                 return std::optional<ibex::runtime::Selection>{};
+            }
+            // A unit whose footer predicts the bitmap passes most of its rows
+            // answers "every row" without a scan. The fused scan cannot abandon
+            // before it has decoded and tested a whole group, and a unit is
+            // usually one group, so the scan would decode the key only to be
+            // abandoned and decoded again (lineitem against 90% of part's keys).
+            // The probe the filter feeds is exact, so passing rows the bitmap
+            // would have rejected costs work, never rows.
+            if (unit != nullptr && filter.bitmap != nullptr) {
+                const auto pass = physical == parquet::Type::INT64
+                                      ? footer_estimated_pass<parquet::Int64Type>(
+                                            metadata, leaf_index, filter, *unit)
+                                      : footer_estimated_pass<parquet::Int32Type>(
+                                            metadata, leaf_index, filter, *unit);
+                if (pass.has_value() && *pass > kAbandonPassRate) {
+                    ibex::runtime::Selection every(unit->rows);
+                    std::iota(every.begin(), every.end(), unit->start);
+                    return std::optional{std::move(every)};
+                }
             }
             const auto target = scan_shard_target(unit, exec);
             if (physical == parquet::Type::INT64) {

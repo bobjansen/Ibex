@@ -637,6 +637,32 @@ class JoinKeyBitmap {
                ((words_[static_cast<std::size_t>(offset >> 6U)] >> (offset & 63U)) & 1U) != 0;
     }
 
+    /// How many keys in [lo, hi] are present: the build keys a probe key
+    /// spread evenly over that interval could match, for one popcount per
+    /// word. The interval is clamped to the bitmap; an empty one counts 0.
+    [[nodiscard]] auto count_range(std::int64_t lo, std::int64_t hi) const noexcept -> std::size_t {
+        const std::int64_t last = base_ + static_cast<std::int64_t>(bits_ - 1);
+        lo = std::max(lo, base_);
+        hi = std::min(hi, last);
+        if (lo > hi) {
+            return 0;
+        }
+        const auto a = static_cast<std::uint64_t>(lo) - static_cast<std::uint64_t>(base_);
+        const auto b = static_cast<std::uint64_t>(hi) - static_cast<std::uint64_t>(base_);
+        const auto first = static_cast<std::size_t>(a >> 6U);
+        const auto end = static_cast<std::size_t>(b >> 6U);
+        const std::uint64_t low_mask = ~std::uint64_t{0} << (a & 63U);
+        const std::uint64_t high_mask = ~std::uint64_t{0} >> (63U - (b & 63U));
+        if (first == end) {
+            return static_cast<std::size_t>(std::popcount(words_[first] & low_mask & high_mask));
+        }
+        std::size_t n = static_cast<std::size_t>(std::popcount(words_[first] & low_mask));
+        for (std::size_t w = first + 1; w < end; ++w) {
+            n += static_cast<std::size_t>(std::popcount(words_[w]));
+        }
+        return n + static_cast<std::size_t>(std::popcount(words_[end] & high_mask));
+    }
+
     /// The number of distinct keys inserted: the exact build-side key
     /// cardinality, for one pass over the words.
     [[nodiscard]] auto count() const noexcept -> std::size_t {

@@ -51,8 +51,29 @@ lie inside `[min, max]`. That is when the filter provably rejects nothing.
   shortcut left the same probe ~0.3 s slower at 1 core: same instructions,
   chunks, index and LLC misses, just more cycles. That is not explained yet.
 
-Still open: a filter that is not full but still rejects little keeps the
-per-unit retry. The sticky abandon below is the general fix.
+**Per-unit footer estimate, 2026-11-13** (instead of a sticky abandon). A
+cumulative tally that abandons for good would lose the filter on clustered keys:
+early units pass everything and later ones would be pruned. So each unit is
+decided on its own row groups' statistics. `footer_estimated_pass` weights each
+group's rows by the bitmap's density over the group's footer [min, max]
+(`JoinKeyBitmap::count_range`). When the estimate is above the source's own
+abandon rate (75%), `key_filter_scan` answers "every row" without decoding, and
+the unit decodes plainly. Otherwise it filters as before.
+- part filtered to 90% of keys, lineitem joined to it: 8 cores 0.61 → 0.54 s,
+  1 core 3.23 → 2.19 s.
+- Selective `p_size < 5`: unchanged (0.24 s, 1.55 s).
+- Clustered lineitem join orders[`o_orderkey <= 15M`]: unchanged (0.32 s,
+  ~0.95 s), so the pruning is kept.
+- Native PDS-H A/B: gm 0.998 (8 cores), 1.001 (1 core); all 22 outputs
+  identical.
+
+Limits:
+- The estimate assumes keys spread evenly over a group's range. A sparse probe
+  domain (TPC-H order keys use about a quarter of their range) reads low and
+  keeps its filter, i.e. today's behaviour.
+- Bloom filters (sparse build keys) and sources without statistics still retry
+  per unit. A tally with periodic re-tests (so clustered data can switch the
+  filter back on) would cover them; there is no measured case yet.
 
 Fix options, cheapest first:
 

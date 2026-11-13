@@ -3785,3 +3785,36 @@ TEST_CASE("streaming left join agrees with the materialized left join", "[join][
         }
     }
 }
+
+TEST_CASE("JoinKeyBitmap::count_range counts the keys present in an interval",
+          "[join][stream_filter]") {
+    // Against a brute-force count, over intervals inside one word, across
+    // words, at the bitmap's ends, clamped from outside it, and empty.
+    runtime::JoinKeyBitmap bitmap(-70, 200);
+    std::vector<bool> present(271, false);
+    for (std::int64_t k = -70; k <= 200; ++k) {
+        if ((k * 7 + 3) % 5 < 2 || k == -70 || k == 200) {
+            bitmap.insert(k);
+            present[static_cast<std::size_t>(k + 70)] = true;
+        }
+    }
+    const auto brute = [&](std::int64_t lo, std::int64_t hi) {
+        std::size_t n = 0;
+        for (std::int64_t k = std::max<std::int64_t>(lo, -70); k <= std::min<std::int64_t>(hi, 200);
+             ++k) {
+            n += present[static_cast<std::size_t>(k + 70)] ? 1U : 0U;
+        }
+        return n;
+    };
+    for (std::int64_t lo = -100; lo <= 230; lo += 7) {
+        for (std::int64_t hi = lo - 3; hi <= 230; hi += 11) {
+            INFO("lo=" << lo << " hi=" << hi);
+            CHECK(bitmap.count_range(lo, hi) == brute(lo, hi));
+        }
+    }
+    CHECK(bitmap.count_range(-70, 200) == bitmap.count());
+    CHECK(bitmap.count_range(-70, -70) == 1);
+    CHECK(bitmap.count_range(200, 200) == 1);
+    CHECK(bitmap.count_range(201, 1000) == 0);
+    CHECK(bitmap.count_range(-1000, -71) == 0);
+}

@@ -1039,21 +1039,28 @@ struct JoinProbe {
     }
 
     /// A unique build side across workers: each fixed range resolves its rows'
-    /// heads once and counts its matches, then writes its (left, right) pairs
-    /// straight into its own slice of `li`/`ri` -- no per-range vectors and no
+    /// heads once, straight into `ri`, and counts its matches. When every row
+    /// matched, `ri` is the answer and `li` the identity: `identity` is set,
+    /// `li` is left empty, and there is no second batch -- on an all-matching
+    /// probe (lineitem x part) the second batch and the `li` write were a third
+    /// of the probe's pool work. Otherwise each range writes its (left, right)
+    /// pairs into its own slice of `li`/`ri` -- no per-range vectors and no
     /// concatenation. The pairs and their order are the serial probe's.
     // Out of line: inlined, it grew the serial probe around it enough to cost
     // the one-core path ~10% on inner_join_symbol.
     template <typename HeadOf>
     IBEX_NOINLINE auto probe_unique_ranges(std::size_t n, const HeadOf& head_of, IndexVec& li,
-                                           IndexVec& ri) -> bool {
+                                           IndexVec& ri, bool& identity) -> bool {
+        identity = false;
         const std::size_t workers = probe_parallel_workers(n);
         if (workers == 0) {
             return false;
         }
         auto& pool = process_worker_pool();
         const std::size_t grain = (n + workers - 1) / workers;
-        IndexVec heads(n);
+        // Heads land in `ri` first: it is the answer when every row matches.
+        ri.resize(n);
+        std::size_t* const resolved = ri.data();
         std::vector<std::size_t> counts(workers, 0);
         {
             auto batch = pool.submit(workers, [&](std::size_t w) {
@@ -1062,12 +1069,15 @@ struct JoinProbe {
                 std::size_t count = 0;
                 for (std::size_t l = begin; l < end; ++l) {
                     const std::size_t head = probe_is_null(l) ? kNil : head_of(l);
-                    heads[l] = head;
+                    resolved[l] = head;
                     count += head != kNil ? 1U : 0U;
                 }
                 counts[w] = count;
             });
             batch.wait();
+        }
+        if (exec_->parallel_stats != nullptr) {
+            exec_->parallel_stats->parallel_probes.fetch_add(1, std::memory_order_relaxed);
         }
         std::size_t total = 0;
         for (std::size_t& c : counts) {
@@ -1075,6 +1085,15 @@ struct JoinProbe {
             c = total;
             total += here;
         }
+        if (total == n) {
+            li.clear();
+            identity = true;
+            return true;
+        }
+        // Some rows missed: compact. The ranges' outputs can overlap their
+        // inputs, so the heads move aside first.
+        const IndexVec heads = std::move(ri);
+        ri = IndexVec{};
         li.resize(total);
         ri.resize(total);
         {
@@ -1091,9 +1110,6 @@ struct JoinProbe {
                 }
             });
             batch.wait();
-        }
-        if (exec_->parallel_stats != nullptr) {
-            exec_->parallel_stats->parallel_probes.fetch_add(1, std::memory_order_relaxed);
         }
         return true;
     }
@@ -1266,10 +1282,11 @@ struct JoinProbe {
                 }
             }
         };
-        if (index().unique &&
+        if (bool identity = false;
+            index().unique &&
             probe_unique_ranges(
-                n, [&](std::size_t l) { return heads.find_head(get(l)); }, li, ri)) {
-            return li.size() == n;
+                n, [&](std::size_t l) { return heads.find_head(get(l)); }, li, ri, identity)) {
+            return identity;
         }
         if (probe_ranges_parallel(n, li, ri, scan)) {
             // `li_identity` means li == 0..n-1, which for a unique build side
@@ -1337,8 +1354,9 @@ struct JoinProbe {
                 }
             }
         };
-        if (index().unique && probe_unique_ranges(n, head_of, li, ri)) {
-            return li.size() == n;
+        if (bool identity = false;
+            index().unique && probe_unique_ranges(n, head_of, li, ri, identity)) {
+            return identity;
         }
         if (probe_ranges_parallel(n, li, ri, scan)) {
             return index().unique && li.size() == n;

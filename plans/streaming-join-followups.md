@@ -92,6 +92,15 @@ is no `kNil`, and compact both only when there are misses (a second pass over
 PDS-H: q03/q05/q10 probe selective unique builds, where the compaction pass
 is the new cost.
 
+**Fixed 2026-11-13** (parallel path; the serial path already matched the left
+join at 1 core). The first batch writes heads into `ri` and counts matches.
+When every row matched, `li` is the identity and the second batch is skipped;
+otherwise it compacts as before.
+- lineitem x part inner at 8 cores: 0.50 → 0.44 s, equal to the left join.
+  Join serial time 100 → 34 ms, tasks 1512 → 1016.
+- Native PDS-H 8c A/B: gm 1.002, nothing beyond 2%; all 22 outputs identical.
+- h2o joins at 8 threads: q1 1.23 → 1.23, q2 1.36 → 1.31, q4 1.26 → 1.23.
+
 ## 2. Two-key left join
 
 **Now:** `plan_join` declines it (`MultipleKeys`), so `join_table_impl`

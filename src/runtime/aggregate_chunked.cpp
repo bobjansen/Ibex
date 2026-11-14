@@ -2320,8 +2320,11 @@ class HashAggregateState final {
             // serial loop below numbers it by comparison alone, and every
             // hashed fan-out (owned, partitioned) would only add work. Numbered
             // in parallel here when it is big enough to split.
-            if (try_discover_sorted_int(key_at, rows, gids,
-                                        has_discovery_first ? &first_rows : nullptr)) {
+            if (try_discover_sorted<std::int64_t>(
+                    key_at, rows, gids, has_discovery_first ? &first_rows : nullptr,
+                    sorted_int_declined_, int_index_deferred_, int_serial_groups_, int_max_key_,
+                    [&](std::size_t n) { int_order_.resize(n); },
+                    [&](std::uint32_t gid, std::int64_t key) { int_order_[gid] = key; })) {
                 if (has_discovery_first) {
                     seed_discovery_first(groups_before, first_rows, agg_entries, discovery_first);
                 }
@@ -3889,7 +3892,25 @@ class HashAggregateState final {
                     pair_index_.emplace(pack(pair_order_[g].first, pair_order_[g].second),
                                         static_cast<std::uint32_t>(g));
                 }
+                pair_index_deferred_ = false;
             }
+        }
+
+        // A pair sorted lexicographically (lineitem's {l_orderkey,
+        // l_linenumber}, its primary key) is numbered by comparison, as the
+        // single-int path does: no 128-bit hash, no partitions. Ahead of the
+        // async pair sum, whose per-row records and ordered merge cost
+        // seconds at that key's 60M groups.
+        if (!pair_dense_active_ &&
+            try_discover_sorted<std::pair<std::int64_t, std::int64_t>>(
+                [&](std::size_t row) { return std::pair{key_a_at(row), key_b_at(row)}; }, rows,
+                gids, nullptr, sorted_pair_declined_, pair_index_deferred_, pair_serial_groups_,
+                pair_max_key_, [&](std::size_t n) { pair_order_.resize(n); },
+                [&](std::uint32_t gid, const std::pair<std::int64_t, std::int64_t>& key) {
+                    pair_order_[gid] = key;
+                })) {
+            publish_discovered(agg_entries, rows);
+            return std::nullopt;
         }
 
         if (!pair_dense_active_ && try_async_pair_sum(group_entries, agg_entries, rows)) {
@@ -3921,6 +3942,22 @@ class HashAggregateState final {
             return std::nullopt;
         }
 
+        // Deferred index, as `int_index_deferred_`: while every new pair is
+        // above all pairs seen (lexicographically), it is necessarily new and
+        // no lookup is needed, so a sorted pair key never builds the map. The
+        // first pair that goes backwards builds `pair_index_` from
+        // `pair_order_` once.
+        const auto materialize_pair_index = [&] {
+            pair_index_.reserve(n_groups_);
+            for (std::size_t g = 0; g < n_groups_; ++g) {
+                pair_index_.emplace(pack(pair_order_[g].first, pair_order_[g].second),
+                                    static_cast<std::uint32_t>(g));
+            }
+            pair_index_deferred_ = false;
+        };
+        if (pair_index_deferred_ && n_groups_ != pair_serial_groups_) {
+            materialize_pair_index();
+        }
         PairIntKey prev_key{};
         std::uint32_t prev_gid = std::numeric_limits<std::uint32_t>::max();
         bool have_prev = false;
@@ -3931,7 +3968,27 @@ class HashAggregateState final {
             std::uint32_t gid{};
             if (have_prev && key == prev_key) {
                 gid = prev_gid;
+            } else if (pair_index_deferred_ && n_groups_ != 0 && std::pair{a, b} == pair_max_key_) {
+                // The previous chunk's last group, continued across the boundary.
+                gid = static_cast<std::uint32_t>(n_groups_ - 1);
+                prev_key = key;
+                prev_gid = gid;
+                have_prev = true;
+            } else if (pair_index_deferred_ &&
+                       (n_groups_ == 0 || std::pair{a, b} > pair_max_key_)) {
+                gid = static_cast<std::uint32_t>(n_groups_);
+                pair_order_.emplace_back(a, b);
+                pair_max_key_ = {a, b};
+                ++n_groups_;
+                ++pair_serial_groups_;
+                size_group_arrays();
+                prev_key = key;
+                prev_gid = gid;
+                have_prev = true;
             } else {
+                if (pair_index_deferred_) {
+                    materialize_pair_index();
+                }
                 const auto it = pair_index_.find(key);
                 if (it == pair_index_.end()) {
                     gid = static_cast<std::uint32_t>(n_groups_);
@@ -4540,8 +4597,9 @@ class HashAggregateState final {
     static constexpr std::size_t kSortedIntRangeRows = std::size_t{1} << 16;
     /// Set once a chunk was found not sorted, so later chunks skip the check.
     bool sorted_int_declined_ = false;
+    bool sorted_pair_declined_ = false;
 
-    /// Number a chunk whose Int64 keys never decrease, in parallel, exactly as
+    /// Number a chunk whose keys never decrease, in parallel, exactly as
     /// the serial loop's deferred-index branch would: a group per run, ids in
     /// row order, continuing the previous chunk's last group when the chunk
     /// starts on its key. No hash is computed. Pass 1 checks each range is
@@ -4553,39 +4611,55 @@ class HashAggregateState final {
     /// written, when the chunk is not sorted, too small, the deferred index is
     /// no longer valid, or Discovery may not fan out -- the serial loop and
     /// the hashed paths then run as before.
-    template <typename KeyAt>
-    auto try_discover_sorted_int(const KeyAt& key_at, std::size_t rows, std::uint32_t* gids,
-                                 std::vector<std::size_t>* first_rows) -> bool {
-        if (sorted_int_declined_ || rows < kSortedIntParallelRows || exec_ == nullptr ||
-            on_worker_pool_thread() || !int_index_deferred_ || n_groups_ != int_serial_groups_ ||
+    ///
+    /// Generic over the key: `Key` is any strictly ordered value `key_at`
+    /// returns (an Int64, or a lexicographic pair), and the state passed in is
+    /// that key path's deferred-index state. `resize_order(n)` sizes the
+    /// path's group-key vector for `n` groups and `store(gid, key)` fills it.
+    template <typename Key, typename KeyAt, typename ResizeOrder, typename StoreOrder>
+    auto try_discover_sorted(const KeyAt& key_at, std::size_t rows, std::uint32_t* gids,
+                             std::vector<std::size_t>* first_rows, bool& declined,
+                             bool index_deferred, std::size_t& serial_groups, Key& max_key,
+                             const ResizeOrder& resize_order, const StoreOrder& store) -> bool {
+        if (declined || rows < kSortedIntParallelRows || exec_ == nullptr ||
+            on_worker_pool_thread() || !index_deferred || n_groups_ != serial_groups ||
             partitioned_active_ || owned_mode_ ||
-            par_.discovery.decline != physical::FanOutDecline::None ||
-            par_.discovery.worker_cap < 2) {
+            (par_.discovery.decline != physical::FanOutDecline::None && !discovery_single_core())) {
             return false;
         }
+        // On one core the passes run here, inline: the sorted check still
+        // pays there, because it keeps a distinct-keyed sorted chunk off the
+        // single-core locality partitioning, which hashes every row.
         const std::size_t ranges =
             std::clamp<std::size_t>(rows / kSortedIntRangeRows, 1, par_.discovery.worker_cap * 4);
         const auto range_begin = [&](std::size_t r) { return rows * r / ranges; };
         struct RangeInfo {
-            std::int64_t first = 0;
-            std::int64_t last = 0;
+            Key first{};
+            Key last{};
             std::size_t runs = 0;
         };
         std::vector<RangeInfo> info(ranges);
         std::atomic<bool> unsorted{false};
-        auto& pool = process_worker_pool();
-        const std::size_t workers = std::min(ranges, par_.discovery.worker_cap);
+        const std::size_t workers = std::min(ranges, discovery_workers());
+        const auto run = [&](const auto& body) {
+            if (workers < 2) {
+                body(std::size_t{0});
+                return;
+            }
+            auto batch = process_worker_pool().submit(workers, body);
+            batch.wait();
+        };
         {
             std::atomic<std::size_t> cursor{0};
-            auto batch = pool.submit(workers, [&](std::size_t) {
+            run([&](std::size_t) {
                 for (std::size_t r = cursor.fetch_add(1, std::memory_order_relaxed); r < ranges;
                      r = cursor.fetch_add(1, std::memory_order_relaxed)) {
                     const std::size_t begin = range_begin(r);
                     const std::size_t end = range_begin(r + 1);
-                    std::int64_t prev = key_at(begin);
+                    Key prev = key_at(begin);
                     std::size_t runs = 1;
                     for (std::size_t row = begin + 1; row < end; ++row) {
-                        const std::int64_t key = key_at(row);
+                        const Key key = key_at(row);
                         if (key < prev) {
                             unsorted.store(true, std::memory_order_relaxed);
                             return;
@@ -4599,10 +4673,9 @@ class HashAggregateState final {
                     info[r] = {.first = key_at(begin), .last = prev, .runs = runs};
                 }
             });
-            batch.wait();
         }
         if (unsorted.load(std::memory_order_relaxed)) {
-            sorted_int_declined_ = true;
+            declined = true;
             return false;
         }
         // Join the ranges: each must start at or above where the last ended,
@@ -4616,16 +4689,16 @@ class HashAggregateState final {
             bool continues = false;
             if (r == 0) {
                 if (groups_before != 0) {
-                    if (info[0].first < int_max_key_) {
-                        sorted_int_declined_ = true;
+                    if (info[0].first < max_key) {
+                        declined = true;
                         return false;
                     }
-                    continues = info[0].first == int_max_key_;
+                    continues = info[0].first == max_key;
                     continues_prior = continues;
                 }
             } else {
                 if (info[r].first < info[r - 1].last) {
-                    sorted_int_declined_ = true;
+                    declined = true;
                     return false;
                 }
                 continues = info[r].first == info[r - 1].last;
@@ -4634,16 +4707,16 @@ class HashAggregateState final {
         }
         const std::size_t total = first_gid[ranges];
         n_groups_ = total;
-        int_serial_groups_ = total;
-        int_max_key_ = info[ranges - 1].last;
-        int_order_.resize(total);
+        serial_groups = total;
+        max_key = info[ranges - 1].last;
+        resize_order(total);
         size_group_arrays();
         if (first_rows != nullptr) {
             first_rows->resize(total - groups_before);
         }
         {
             std::atomic<std::size_t> cursor{0};
-            auto batch = pool.submit(workers, [&](std::size_t) {
+            run([&](std::size_t) {
                 for (std::size_t r = cursor.fetch_add(1, std::memory_order_relaxed); r < ranges;
                      r = cursor.fetch_add(1, std::memory_order_relaxed)) {
                     const std::size_t begin = range_begin(r);
@@ -4654,13 +4727,13 @@ class HashAggregateState final {
                         r == 0 ? continues_prior : info[r].first == info[r - 1].last;
                     auto gid = static_cast<std::uint32_t>(first_gid[r] - (continues ? 1 : 0));
                     std::size_t next = first_gid[r];
-                    std::int64_t prev = 0;
+                    Key prev{};
                     for (std::size_t row = begin; row < end; ++row) {
-                        const std::int64_t key = key_at(row);
+                        const Key key = key_at(row);
                         const bool opens = row == begin ? !continues : key != prev;
                         if (opens) {
                             gid = static_cast<std::uint32_t>(next++);
-                            int_order_[gid] = key;
+                            store(gid, key);
                             if (first_rows != nullptr) {
                                 (*first_rows)[gid - groups_before] = row;
                             }
@@ -4670,9 +4743,10 @@ class HashAggregateState final {
                     }
                 }
             });
-            batch.wait();
         }
-        note_partition_fanout();
+        if (workers >= 2) {
+            note_partition_fanout();
+        }
         return true;
     }
 
@@ -9270,6 +9344,12 @@ class HashAggregateState final {
     PackedGroups<PackedKeyEncoder::Packed256, PackedKeyEncoder::PackedWordsHash<4>> packed256_;
     IntKeyKind int_key_kind_b_ = IntKeyKind::Int64;
     robin_hood::unordered_flat_map<PairIntKey, std::uint32_t, PairIntKeyHash> pair_index_;
+    /// As `int_index_deferred_`, for the pair path: while every new pair has
+    /// been above all pairs seen, `pair_index_` stays empty.
+    bool pair_index_deferred_ = true;
+    std::pair<std::int64_t, std::int64_t> pair_max_key_{};
+    /// Groups the serial pair loop (or the sorted numbering) has numbered.
+    std::size_t pair_serial_groups_ = 0;
     /// Same default-init-allocator invariant as `int_order_` above.
     std::vector<std::pair<std::int64_t, std::int64_t>,
                 default_init_allocator<std::pair<std::int64_t, std::int64_t>>>

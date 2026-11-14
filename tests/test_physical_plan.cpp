@@ -12,6 +12,7 @@
 #include <ibex/runtime/pipeline.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
@@ -20,6 +21,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <expected>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -1907,49 +1909,135 @@ TEST_CASE("The hot Int64 sum splits one big chunk into row-range jobs and stays 
     CHECK(discovery->pool_tasks >= parts + 4);  // 4 jobs, not 1
 }
 
-TEST_CASE("Sorted Int64 keys are numbered in parallel exactly as the serial loop does",
+TEST_CASE("Sorted Int64 keys group exactly, serial and parallel, against a hand reference",
           "[physical][breaker][execute]") {
     // Three aggregates keep the hot sum path out, and keys spaced 2 apart keep
-    // the dense path out, so a sorted chunk reaches the parallel sorted
-    // numbering. Runs of 7 cross the ranges' and the 300k-row chunks'
-    // boundaries; in the chunked section the last chunk revisits earlier keys,
-    // so the later paths must pick up the groups the sorted path numbered.
-    // `first(v)` reads each new group's first row.
+    // the dense path out, so a sorted chunk reaches the sorted numbering -- on
+    // one core inline, on eight across the pool. Runs of 7 cross the ranges'
+    // and the 300k-row chunks' boundaries; in the chunked section the last
+    // chunk revisits earlier keys, so the later paths must pick up the groups
+    // the sorted path numbered. `first(v)` reads each new group's first row.
+    // Both runs are checked against a hand-built first-occurrence reference.
     const auto check = [](std::int64_t rows, bool unsorted_tail) {
-        runtime::TableRegistry registry;
         runtime::Table t;
         Column<std::int64_t> k;
         Column<double> v;
+        std::vector<std::int64_t> order;
+        struct Want {
+            std::int64_t count = 0;
+            double sum = 0.0;
+            double first = 0.0;
+        };
+        std::map<std::int64_t, Want> want;
         for (std::int64_t r = 0; r < rows; ++r) {
             const bool tail = unsorted_tail && r >= rows - 300'000;
-            k.push_back(tail ? ((r * 7919) % 50'000) * 2 : (r / 7) * 2);
-            v.push_back(static_cast<double>(r % 101) * 0.25);
+            const std::int64_t key = tail ? ((r * 7919) % 50'000) * 2 : (r / 7) * 2;
+            const double val = static_cast<double>(r % 101) * 0.25;
+            k.push_back(key);
+            v.push_back(val);
+            auto [it, fresh] = want.try_emplace(key);
+            if (fresh) {
+                order.push_back(key);
+                it->second.first = val;
+            }
+            it->second.count += 1;
+            it->second.sum += val;
         }
         t.add_column("k", std::move(k));
         t.add_column("v", std::move(v));
+        runtime::TableRegistry registry;
         registry.emplace("t", t);
         auto ir = require_ir("t[select { s = sum(v), c = count(), f = first(v) }, by k];");
-        runtime::ExecutionContext serial;
-        serial.parallel_threads = 1;
-        runtime::ExecutionContext parallel;
-        parallel.parallel_threads = 8;
-        const auto s = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
-        const auto p = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
-        REQUIRE(s.has_value());
-        REQUIRE(p.has_value());
-        REQUIRE(s->rows() == p->rows());
-        for (const char* name : {"k", "c"}) {
-            const auto& a = std::get<Column<std::int64_t>>(*s->find_entry(name)->column);
-            const auto& b = std::get<Column<std::int64_t>>(*p->find_entry(name)->column);
-            for (std::size_t i = 0; i < s->rows(); ++i) {
-                REQUIRE(a[i] == b[i]);
+        for (const std::size_t threads : {std::size_t{1}, std::size_t{8}}) {
+            runtime::ExecutionContext exec;
+            exec.parallel_threads = threads;
+            const auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+            REQUIRE(out.has_value());
+            REQUIRE(out->rows() == order.size());
+            const auto& ok = std::get<Column<std::int64_t>>(*out->find_entry("k")->column);
+            const auto& oc = std::get<Column<std::int64_t>>(*out->find_entry("c")->column);
+            const auto& os = std::get<Column<double>>(*out->find_entry("s")->column);
+            const auto& of = std::get<Column<double>>(*out->find_entry("f")->column);
+            for (std::size_t i = 0; i < order.size(); ++i) {
+                const auto& w = want.at(order[i]);
+                REQUIRE(ok[i] == order[i]);
+                REQUIRE(oc[i] == w.count);
+                REQUIRE(os[i] == Catch::Approx(w.sum));
+                REQUIRE(of[i] == w.first);
             }
         }
-        for (const char* name : {"s", "f"}) {
-            const auto& a = std::get<Column<double>>(*s->find_entry(name)->column);
-            const auto& b = std::get<Column<double>>(*p->find_entry(name)->column);
-            for (std::size_t i = 0; i < s->rows(); ++i) {
-                REQUIRE(a[i] == b[i]);
+    };
+    SECTION("one chunk") {
+        check(1'200'000, false);
+    }
+    SECTION("300k-row chunks, the last one unsorted") {
+        const char* saved = std::getenv("IBEX_CHUNK_ROWS");
+        const std::optional<std::string> restore =
+            saved == nullptr ? std::nullopt : std::optional<std::string>(saved);
+        runtime::set_env("IBEX_CHUNK_ROWS", "300000");
+        check(1'500'000, true);
+        if (restore.has_value()) {
+            runtime::set_env("IBEX_CHUNK_ROWS", *restore);
+        } else {
+            runtime::unset_env("IBEX_CHUNK_ROWS");
+        }
+    }
+}
+
+TEST_CASE("Sorted Int64 pair keys group exactly, serial and parallel, against a hand reference",
+          "[physical][breaker][execute]") {
+    // {a, b} sorted lexicographically, as lineitem's {l_orderkey,
+    // l_linenumber}: runs of 3 per pair, b cycling 1..4 within each a. Both
+    // the serial loop (now deferring its index while pairs only increase) and
+    // the parallel sorted numbering must give first-occurrence order, counts
+    // and sums equal to a hand-built reference. In the chunked section the last
+    // chunk revisits earlier pairs, so the deferred index must be built from
+    // the groups numbered so far.
+    const auto check = [](std::int64_t rows, bool unsorted_tail) {
+        runtime::Table t;
+        Column<std::int64_t> a;
+        Column<std::int64_t> b;
+        Column<double> v;
+        std::vector<std::pair<std::int64_t, std::int64_t>> order;
+        std::map<std::pair<std::int64_t, std::int64_t>, std::pair<std::int64_t, double>> agg;
+        for (std::int64_t r = 0; r < rows; ++r) {
+            const bool tail = unsorted_tail && r >= rows - 300'000;
+            const std::int64_t run = tail ? (r * 7919) % 40'000 : r / 3;
+            const std::int64_t ka = (run / 4) * 3;
+            const std::int64_t kb = 1 + (run % 4);
+            const double val = static_cast<double>(r % 101) * 0.25;
+            a.push_back(ka);
+            b.push_back(kb);
+            v.push_back(val);
+            auto [it, fresh] = agg.try_emplace({ka, kb}, 0, 0.0);
+            if (fresh) {
+                order.emplace_back(ka, kb);
+            }
+            it->second.first += 1;
+            it->second.second += val;
+        }
+        t.add_column("a", std::move(a));
+        t.add_column("b", std::move(b));
+        t.add_column("v", std::move(v));
+        runtime::TableRegistry registry;
+        registry.emplace("t", t);
+        auto ir = require_ir("t[select { s = sum(v), c = count() }, by { a, b }];");
+        for (const std::size_t threads : {std::size_t{1}, std::size_t{8}}) {
+            runtime::ExecutionContext exec;
+            exec.parallel_threads = threads;
+            const auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+            REQUIRE(out.has_value());
+            REQUIRE(out->rows() == order.size());
+            const auto& oa = std::get<Column<std::int64_t>>(*out->find_entry("a")->column);
+            const auto& ob = std::get<Column<std::int64_t>>(*out->find_entry("b")->column);
+            const auto& oc = std::get<Column<std::int64_t>>(*out->find_entry("c")->column);
+            const auto& os = std::get<Column<double>>(*out->find_entry("s")->column);
+            for (std::size_t i = 0; i < order.size(); ++i) {
+                REQUIRE(oa[i] == order[i].first);
+                REQUIRE(ob[i] == order[i].second);
+                const auto& want = agg.at(order[i]);
+                REQUIRE(oc[i] == want.first);
+                REQUIRE(os[i] == Catch::Approx(want.second));
             }
         }
     };

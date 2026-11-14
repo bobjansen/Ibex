@@ -29,7 +29,20 @@ Checks: >
   -bugprone-branch-clone,
   -cppcoreguidelines-pro-type-union-access,
   -cppcoreguidelines-pro-type-vararg,
-  -misc-use-internal-linkage
+  -misc-use-internal-linkage,
+  -modernize-use-string-view,
+  -bugprone-signed-bitwise
+# bugprone-signed-bitwise (new in clang-tidy 23): of 87 hits, none was a bug.
+# Nearly all were a uint8_t validity byte that C++ promotes to int before a
+# shift (`(bits[i >> 3] >> (i & 7U)) & 1U`), in the hottest bit-reading
+# loops; the rest shifted an unsigned or 128-bit value by a signed amount, or
+# combined 0/1 char flags. Silencing it means a cast on every bit read for
+# identical code.
+# modernize-use-string-view (new in clang-tidy 23): every hit was a cold
+# helper returning a literal (an operator name for generated code, a type
+# name for an error message) whose callers build strings with `+`, which a
+# string_view return breaks before C++26. Following it would wrap every call
+# site in std::string(...) to save nothing measurable.
 # cppcoreguidelines-pro-bounds-avoid-unchecked-container-access and
 # readability-trailing-comma: unknown to the standalone clang-tidy-20/18 apt
 # packages CI uses (excluding them there is a harmless no-op), but real,
@@ -56,8 +69,3 @@ CheckOptions:
   # Prefer the public standard-library header for every standard declaration.
   - key: misc-include-cleaner.IgnoreHeaders
     value: '(^|.*/)bits/.*'
-  # `1U << 0` and `0x01U & x` are flagged because the literal is a signed
-  # int. A non-negative literal cannot carry a sign bit, so only a signed
-  # variable operand is worth a finding.
-  - key: bugprone-signed-bitwise.IgnorePositiveIntegerLiterals
-    value: true

@@ -329,9 +329,10 @@ auto gather_entries(std::span<const GatherJob> jobs, std::size_t total,
     std::vector<ColumnGatherJob> column_jobs;
     column_jobs.reserve(jobs.size());
     for (const auto& job : jobs) {
+        const auto& validity = job.entry->validity;
         column_jobs.push_back({
             .column = job.entry->column.get(),
-            .validity = job.entry->validity.has_value() ? &*job.entry->validity : nullptr,
+            .validity = validity.has_value() ? &*validity : nullptr,
             .idx = job.idx,
             .null_index = job.has_sentinel ? std::optional<std::size_t>{kNull} : std::nullopt,
         });

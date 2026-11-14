@@ -85,6 +85,9 @@ class ColumnView<std::int64_t> {
    public:
     ColumnView(const std::int64_t* data, std::size_t rows, const ValidityBitmap* validity) noexcept
         : wide_(data), rows_(rows), validity_(validity) {}
+    // noexcept holds: Column<int64_t>::data() throws only for compact storage,
+    // and it is called here only when the column is not compact.
+    // NOLINTNEXTLINE(bugprone-exception-escape)
     ColumnView(const Column<std::int64_t>& column, const ValidityBitmap* validity) noexcept
         : wide_(column.is_compact_int32() ? nullptr : column.data()),
           compact_(column.is_compact_int32() ? column.compact_int32_data() : nullptr),

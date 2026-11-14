@@ -77,7 +77,9 @@ struct ScalarArg {
     runtime::ScalarValue value;
 
     template <class T>
-    operator T() const {  // NOLINT(google-explicit-constructor): mirrors a literal argument
+    // Converts implicitly to mirror a literal argument.
+    // NOLINTNEXTLINE(*-explicit-constructor)
+    operator T() const {
         // `std::get_if<T>` is only well-formed for a variant alternative, so
         // dispatch on the target C++ type rather than probing the variant with
         // an arbitrary `T` (e.g. a call site wanting `std::size_t`).

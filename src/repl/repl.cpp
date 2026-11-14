@@ -45,10 +45,8 @@
 #include <array>
 #include <atomic>
 #include <cctype>
-#include <cerrno>
 #include <charconv>
 #include <chrono>
-#include <cmath>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>

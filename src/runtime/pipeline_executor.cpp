@@ -2111,6 +2111,9 @@ class PipelinedScanOperator final : public Operator {
     /// window carries that extra round. A claimed sequence is inside the window
     /// the consumer holds open itself, so its `acquire` cannot park.
     [[nodiscard]] auto run_consumer_unit() -> bool {
+        if (!consumer_worker_.has_value()) {
+            return false;  // only a pipeline with a consumer worker runs units here
+        }
         std::size_t sequence = cursor_.load(std::memory_order_relaxed);
         do {
             if (sequence >= units_.size() ||

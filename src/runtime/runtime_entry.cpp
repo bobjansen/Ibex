@@ -791,7 +791,8 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         // decodes the next ones. Declined -- by the left side, or by a right
         // key that is not Int64 -- the chunks are kept for the ordinary join.
         auto counter = LeftJoinCounter::prepare(join, agg, *left, counted_column, ap.group_source);
-        bool counting = counter.has_value();
+        // Null once counting is declined; non-null only while `counter` holds one.
+        LeftJoinCounter* active = counter.has_value() ? &*counter : nullptr;
         std::vector<Chunk> kept;
         std::optional<Chunk> pending;
         std::size_t chunks = 0;
@@ -808,25 +809,25 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
                 break;
             }
             Chunk chunk = std::move(**next);
-            if (counting && chunks == 0 && !counter->accepts(chunk)) {
-                counting = false;
+            if (active != nullptr && chunks == 0 && !active->accepts(chunk)) {
+                active = nullptr;
             }
             ++chunks;
-            if (!counting) {
+            if (active == nullptr) {
                 kept.push_back(std::move(chunk));
                 continue;
             }
-            if (pending.has_value() && !counter->count(*pending)) {
+            if (pending.has_value() && !active->count(*pending)) {
                 return mid_stream_change();
             }
             pending = std::move(chunk);
         }
-        if (counting) {
-            if (pending.has_value() && !(chunks == 1 ? counter->count_parallel(*pending, &exec)
-                                                     : counter->count(*pending))) {
+        if (active != nullptr) {
+            if (pending.has_value() && !(chunks == 1 ? active->count_parallel(*pending, &exec)
+                                                     : active->count(*pending))) {
                 return mid_stream_change();
             }
-            return make_table_source(counter->finish());
+            return make_table_source(active->finish());
         }
         struct KeptChunks final : Operator {
             std::vector<Chunk> chunks;

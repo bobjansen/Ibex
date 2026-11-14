@@ -42,7 +42,7 @@
 #include <variant>
 #include <vector>
 
-#if defined(__linux__)
+#ifdef __linux__
 #include <fcntl.h>
 #include <linux/landlock.h>
 #include <linux/prctl.h>
@@ -150,7 +150,7 @@ auto read_request(Socket socket) -> std::optional<HttpRequest> {
         if (colon == std::string::npos) {
             continue;
         }
-        auto value = trim(std::string_view(line).substr(colon + 1));
+        const auto value = trim(std::string_view(line).substr(colon + 1));
         request.headers.insert_or_assign(lower(line.substr(0, colon)), std::string(value));
     }
     std::size_t content_length = 0;

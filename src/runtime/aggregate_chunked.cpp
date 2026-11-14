@@ -19,7 +19,6 @@
 #include <array>
 #include <atomic>
 #include <bit>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -8257,8 +8256,9 @@ class HashAggregateState final {
                     } else if (plan_[i].categorical) {
                         // A coded aggregate's codes resolve against the input's
                         // dictionary, which the template shares.
-                        column = cat_agg_coded(i) && cat_agg_template_[i].has_value()
-                                     ? ColumnValue{*cat_agg_template_[i]}
+                        const auto& coded_template = cat_agg_template_[i];
+                        column = cat_agg_coded(i) && coded_template.has_value()
+                                     ? ColumnValue{*coded_template}
                                      : ColumnValue{Column<Categorical>{}};
                     } else {
                         column = Column<std::string>{};

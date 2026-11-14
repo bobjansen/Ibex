@@ -2249,9 +2249,9 @@ auto resolve_validity_operands(const DirectValidityPlan& plan, std::size_t range
                 return std::nullopt;
             }
             operand.data = value_reader(*column) + range_begin;
-            if (value.column->validity.has_value()) {
-                operand.bits = value.column->validity->buffer_data();
-                operand.bit_base = value.column->validity->buffer_offset() + range_begin;
+            if (const auto& validity = value.column->validity; validity.has_value()) {
+                operand.bits = validity->buffer_data();
+                operand.bit_base = validity->buffer_offset() + range_begin;
             }
         }
         operands.push_back(operand);

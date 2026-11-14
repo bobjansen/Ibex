@@ -17,7 +17,6 @@
 #include <array>
 #include <atomic>
 #include <bit>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
